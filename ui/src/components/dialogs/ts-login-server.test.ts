@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginFailureKey } from './ts-login-server';
+import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginFailureKey, tsLoginUsesBackendCredentials } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -203,7 +203,42 @@ describe('移动登录：保存后的重试与安全授权状态', () => {
 it.each(['android', 'windows', 'macos', undefined])('keeps account actions on %s', (os) => {
   expect(supportsTsAccountActions(os)).toBe(true);
 });
-it('guards standalone iOS account actions', () => {
-  expect(supportsTsAccountActions('ios')).toBe(false);
+it('supports iOS account actions through backend retirement', () => {
+  expect(supportsTsAccountActions('ios')).toBe(true);
   expect(supportsTsLoginActions()).toBe(true);
+});
+
+
+describe('explicit retained credential routing and editable candidates', () => {
+  it.each([true, false])('retained record availability=%s uses backend routing without implying authorization', available => {
+    const existing = tsNode({ tailscaleSettings: { retainedAuthKeyAvailable: available, tailscaleCredentialRevision: 'revision-A' } });
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    const plan = planTsLoginSubmit(base({ existing, mode: 'authkey', reuseRetainedAuthKey: true }));
+    expect(plan.server.id).toBe(existing.id);
+    expect(plan.server.tailscaleSettings).toEqual({});
+    expect(existing.tailscaleSettings?.tailscaleCredentialRevision).toBe('revision-A');
+  });
+
+  it('any explicit login with an active-only credential scope uses backend routing, while empty credentials preserve ordinary routing', () => {
+    const existing = tsNode({ tailscaleSettings: { authKey: 'synthetic-active', tailscaleCredentialRevision: 'revision-A' } });
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(tsNode())).toBe(false);
+    expect(tsLoginUsesBackendCredentials(undefined, true)).toBe(true);
+  });
+
+  it('removes a raw retained record and computed metadata from both login modes, without changing the saved record', () => {
+    const raw = { authKey: 'synthetic-active', sourceTag: 'source', retainedAuthKey: { authKey: 'synthetic-retained', controlAuthority: 'https://issuer.example' },
+      retainedAuthKeyAvailable: true, tailscaleCredentialRevision: 'revision-A' };
+    const existing = tsNode({ tailscaleSettings: raw as unknown as ServerConfig['tailscaleSettings'] });
+    for (const mode of ['browser', 'authkey'] as const) {
+      const plan = planTsLoginSubmit(base({ existing, mode, authKey: 'synthetic-new' }));
+      expect(plan.server.tailscaleSettings).toEqual(mode === 'browser' ? { sourceTag: 'source' } : { sourceTag: 'source', authKey: 'synthetic-new' });
+      expect(JSON.stringify(plan.server)).not.toContain('synthetic-retained');
+      expect(JSON.stringify(plan.server)).not.toContain('revision-A');
+    }
+    expect(raw.retainedAuthKey.authKey).toBe('synthetic-retained');
+  });
 });

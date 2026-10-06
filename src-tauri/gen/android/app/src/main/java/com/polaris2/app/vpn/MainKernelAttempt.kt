@@ -26,6 +26,12 @@ internal class MainKernelAttempt<Server>(
 ) {
     /** Created by this attempt, never supplied by a bridge caller or reused after Service recreation. */
     val birthNonce: String = UUID.randomUUID().toString()
+    @Volatile var tailscaleStore: AndroidTailscaleStoreCustody? = null
+        private set
+
+    fun bindTailscaleStore(ledger: AndroidNativeAdmission): AndroidTailscaleStoreCustody = synchronized(operationLock) {
+        tailscaleStore ?: ledger.bindTailscaleStore(checkNotNull(nativeTicket), birthNonce).also { tailscaleStore = it }
+    }
     private val closeLaunched = AtomicBoolean(false)
     /** Native Close joins this generation's Start/Reload before it can release ownership. */
     val operationLock = Any()

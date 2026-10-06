@@ -13,8 +13,10 @@ import { api, unlockApi } from '/src/ipc';
 import { useAppStore } from '/src/store/app-store';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
+import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';
 import { MobileToaster } from '/src/mobile/MobileToaster';
+import { MobileFormHost } from '/src/mobile/forms/MobileFormHost';
 import { startMobileAppWiring } from '/src/mobile/app-wiring';
 import { i18nReady } from '/src/i18n';
 import '/src/styles/tokens.resolved.css';
@@ -47,9 +49,9 @@ api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => {
   if (mode === 'state-read-fail') throw Error('state unavailable');
-  return { 'ts-1': mode === 'state-true' || mode === 'ios-existing' };
+  return { 'ts-1': mode === 'state-true' || mode === 'state-switch' || mode === 'ios-existing' || mode === 'ios-settings' || mode?.startsWith('ios-replace') };
 };
-const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {} };
+const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {}, refreshes: 0, backendSaved: null, request: null };
 api.proxy.start = async () => { test.mainStarts++; };
 api.proxy.stop = async () => { test.mainStops++; };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
@@ -67,13 +69,29 @@ api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.sta
 api.system.openExternal = async url => { test.opens.push(url); };
 api.server.tailscaleLoginPrepare = async () => {
   test.prepares++;
-  if (mode === 'prepare') await new Promise(resolve => { test.releasePrepare = resolve; });
+  if (mode === 'prepare' || mode?.includes('retained-prepare')) await new Promise(resolve => { test.releasePrepare = resolve; });
 };
 api.server.tailscaleLogout = async () => { test.logouts++; };
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
 api.server.tailscaleLogin = async (node, request) => {
   test.starts++;
   test.startRequest = { serverId: node.id, attemptId: request.attemptId };
+  test.request = request;
+  test.candidate = node;
+  if (mode?.includes('retained') && !mode.includes('settings')) {
+    test.backendSaved = { ...node, tailscaleSettings: { ...node.tailscaleSettings, authKey: 'synthetic-activated', retainedAuthKeyAvailable: true, tailscaleCredentialRevision: 'revision-B' } };
+    if (mode.includes('retained-error')) throw { code: 'TAILSCALE_LOGIN_FAILED', message: 'credentialCommitUnknown' };
+    return { started: true };
+  }
+  if (mode?.startsWith('ios-replace') || mode === 'ios-settings') {
+    test.backendSaved = node;
+    test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'stoppingConnection', url: null });
+    await new Promise(resolve => { test.releaseStart = resolve; });
+    if (mode === 'ios-replace-error') throw { code: 'TAILSCALE_LOGIN_FAILED', message: new URLSearchParams(location.search).get('reason') || 'nativeRetirementUnknown' };
+    if (mode === 'ios-replace-permission') throw { code: 'IOS_VPN_PERMISSION_DENIED', message: 'PRIVATE_TOKEN' };
+    if (mode === 'ios-replace-cancel') return { started: false, reason: 'cancelled' };
+    return { started: false, reason: 'inMainCore' };
+  }
   if (mode === 'ios-existing') throw { code: 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED' };
   if (mode === 'ios-pending') {
     test.emit('onTailscaleLoginProgress', { ...test.startRequest, phase: 'preparingConnection' });
@@ -88,14 +106,28 @@ api.server.tailscaleLogin = async (node, request) => {
     configurationPending: mode === 'main-pending' };
   return { started: true };
 };
-const server = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: {} };
+const server = { id: 'ts-1', name: 'Tailscale', protocol: 'tailscale', address: '', port: 0, tailscaleSettings: mode?.includes('retained') ? { retainedAuthKeyAvailable: !mode.includes('mismatch'), tailscaleCredentialRevision: 'revision-A' }
+  : mode?.includes('active-credential') ? { authKey: 'synthetic-active', tailscaleCredentialRevision: 'revision-A' } : {} };
+useStagedConfigStore.setState({ entries: [], enabled: true });
 useAppStore.setState({ servers: [server], config: { servers: [server], subscriptions: [] },
-  refreshProxyStatus: async () => {}, loadConfig: async () => {} });
+  refreshProxyStatus: async () => {}, loadConfig: async () => {
+    test.refreshes++;
+    if (test.backendSaved) useAppStore.setState({ servers: [test.backendSaved], config: { servers: [test.backendSaved], subscriptions: [] } });
+  } });
 api.server.update = async next => {
   test.saves++;
+  (test.updates ||= []).push(next);
+  if (mode?.includes('settings-fail')) throw { message: 'credentialRevisionChanged' };
+  if (next.tailscaleCredentialIntent) {
+    next = { ...next, tailscaleSettings: { ...next.tailscaleSettings } };
+    delete next.tailscaleCredentialIntent; delete next.tailscaleSettings.authKey;
+  }
   if (mode === 'delayed-save') await new Promise(resolve => { test.releaseSave = resolve; });
   useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } });
 };
+if (mode?.includes('settings-staged')) useAppStore.setState({ proxyStatus: { running: true } });
+test.staged = () => useStagedConfigStore.getState().entries;
+test.setRevision = revision => { const current = useAppStore.getState().servers[0]; const next = { ...current, tailscaleSettings: { ...current.tailscaleSettings, tailscaleCredentialRevision: revision } }; useAppStore.setState({ servers: [next], config: { servers: [next], subscriptions: [] } }); };
 const off = startMobileAppWiring(key => key);
 test.emit = (name, payload) => { for (const fn of listeners.get(name) || []) fn(payload); };
 test.attempt = () => useTailscaleLoginProgressStore.getState().attempts['ts-1'];
@@ -105,16 +137,18 @@ test.initiated = () => useAppStore.getState().tailscaleLoginInitiated['ts-1'];
 test.stop = off;
 function Host() {
   const stack = useMobileFormStore(s => s.stack);
+  if (mode?.includes('retained-prepare')) return <MobileFormHost />;
+  if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;
   return stack.map(form => form.kind === 'ts-login'
-    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} /> : null);
+    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch'} /> : null);
 }
-useMobileFormStore.getState().open({kind:'ts-login', serverId:'ts-1'});
+useMobileFormStore.getState().open({kind:mode === 'ios-settings' || mode?.includes('credential-settings') ? 'ts-settings' : 'ts-login', serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
 `;
 const desktopEntry = entry.replace(
   "import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';",
-  "import { TsLoginDialog as TsLoginPanel } from '/src/components/dialogs/TsLoginDialog';\nimport '/src/styles/index.css';",
-);
+  "import { TsLoginDialog as TsLoginPanel } from '/src/components/dialogs/TsLoginDialog';\nimport { TsSettingsDialog as DesktopSettings } from '/src/components/dialogs/TsSettingsDialog';\nimport '/src/styles/index.css';",
+).replace("if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;", "if (mode?.includes('credential-settings')) return <DesktopSettings serverId=\"ts-1\" />; if (mode === 'ios-settings') return <MobileFormHost />;");
 
 let server: ViteDevServer;
 let browser: Browser;
@@ -140,6 +174,314 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
     browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  it.each(['retained', 'android-retained', 'ios-retained'])('%s offers explicit reuse without filling a secret or treating it as authorization', async mode => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=${mode}`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      const reuse = page.getByRole('button', { name: '使用已保存密钥', exact: true });
+      expect(await reuse.getAttribute('aria-pressed')).toBe('false');
+      expect(await page.locator('#mts-authkey').inputValue()).toBe('');
+      await page.locator('.m-form-foot .primary').click();
+      expect(await page.evaluate(() => (window as any).__tsTest.starts)).toBe(0);
+      await reuse.click();
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.refreshes === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { prepares: t.prepares, starts: t.starts, saves: t.saves, logouts: t.logouts, mainStarts: t.mainStarts,
+          request: t.request, candidate: t.candidate.tailscaleSettings };
+      })).toEqual({ prepares: 1, starts: 1, saves: 0, logouts: 0, mainStarts: 0,
+        request: { attemptId: expect.any(String), mode: 'authkey', replaceIdentity: false, reuseRetainedAuthKey: true, expectedCredentialRevision: 'revision-A' }, candidate: {} });
+      expect(await page.getByText('授权已完成', { exact: true }).count()).toBe(0);
+      expect(await page.locator('#mts-authkey').inputValue()).toBe('');
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s sends a new key through the backend without pre-saving even for active-only issuer edits', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=active-credential`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.locator(endpoint === '__ts-login' ? '#mts-authkey' : '#ts-authkey').fill('synthetic-new');
+      await page.locator(endpoint === '__ts-login' ? '#mts-control-url' : '#ts-login-control-url').fill('https://new-issuer.example');
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { saves: t.saves, logouts: t.logouts, revision: t.request.expectedCredentialRevision,
+          key: t.candidate.tailscaleSettings.authKey, issuer: t.candidate.tailscaleSettings.controlUrl, reuse: t.request.reuseRetainedAuthKey };
+      })).toEqual({ saves: 0, logouts: 0, revision: 'revision-A', key: 'synthetic-new', issuer: 'https://new-issuer.example', reuse: false });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s clears explicit reuse when the issuer or entered key changes, and captures the selected revision', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=retained`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      const reuse = page.getByRole('button', { name: '使用已保存密钥', exact: true });
+      const input = page.locator(endpoint === '__ts-login' ? '#mts-authkey' : '#ts-authkey');
+      const issuer = page.locator(endpoint === '__ts-login' ? '#mts-control-url' : '#ts-login-control-url');
+      await reuse.click();
+      await input.fill('synthetic-new');
+      expect(await reuse.getAttribute('aria-pressed')).toBe('false');
+      await reuse.click();
+      expect(await input.inputValue()).toBe('');
+      await issuer.fill('https://other.example');
+      expect(await reuse.count()).toBe(0);
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      expect(await page.evaluate(() => (window as any).__tsTest.starts)).toBe(0);
+      await issuer.fill(''); await reuse.click();
+      await page.evaluate(() => (window as any).__tsTest.setRevision('revision-B'));
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => (window as any).__tsTest.request.expectedCredentialRevision)).toBe('revision-A');
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s keeps clear reachable after logout for an issuer-mismatched retained key, with one confirmed intent', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-mismatch`);
+      const clear = page.getByRole('button', { name: '清除', exact: true });
+      await clear.click();
+      expect(await page.evaluate(() => (window as any).__tsTest.saves)).toBe(0);
+      await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
+      expect(await page.getByText('待清除（保存后生效）', { exact: true }).count()).toBe(1);
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.saves === 1);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { intent: t.updates[0].tailscaleCredentialIntent,
+        metadata: t.updates[0].tailscaleSettings.retainedAuthKeyAvailable, logouts: t.logouts, starts: t.starts }; })).toEqual({
+          intent: { action: 'clear', expectedCredentialRevision: 'revision-A' }, metadata: undefined, logouts: 0, starts: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s stages the exact captured clear token and never refreshes it after a failed save', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-staged`);
+      await page.getByRole('button', { name: '清除', exact: true }).click();
+      await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
+      await page.evaluate(() => (window as any).__tsTest.setRevision('revision-B'));
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.staged().length === 1);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, intent: t.staged()[0].nextValue.tailscaleCredentialIntent,
+        metadata: t.staged()[0].nextValue.tailscaleSettings.retainedAuthKeyAvailable }; })).toEqual({ saves: 0,
+          intent: { action: 'clear', expectedCredentialRevision: 'revision-A' }, metadata: undefined });
+      await page.goto(`${origin}/${endpoint}?mode=retained-credential-settings-fail`);
+      await page.getByRole('button', { name: '清除', exact: true }).click();
+      await page.getByRole('button', { name: '再点一次以清除', exact: true }).click();
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.saves === 1);
+      await page.evaluate(() => (window as any).__tsTest.setRevision('revision-B'));
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.saves === 2);
+      expect(await page.evaluate(() => (window as any).__tsTest.updates.map((n: any) => n.tailscaleCredentialIntent.expectedCredentialRevision))).toEqual(['revision-A', 'revision-A']);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s offers neither reuse nor clear for an empty credential node', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=ordinary`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      expect(await page.getByRole('button', { name: '使用已保存密钥', exact: true }).count()).toBe(0);
+      await page.goto(`${origin}/${endpoint}?mode=credential-settings-empty`);
+      expect(await page.getByRole('button', { name: '清除', exact: true }).count()).toBe(0);
+      expect(await page.getByText('未保存', { exact: true }).count()).toBe(1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('cancel during retained prepare cannot issue a login, and a late prepare cannot revive it', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=retained-prepare`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releasePrepare);
+      await page.getByRole('button', { name: '取消', exact: true }).click();
+      await page.getByRole('button', { name: '放弃', exact: true }).click();
+      await page.evaluate(() => (window as any).__tsTest.releasePrepare());
+      await page.waitForFunction(() => (window as any).__tsTest.cancels.length > 0);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { starts: t.starts, saves: t.saves, refreshes: t.refreshes }; })).toEqual({ starts: 0, saves: 0, refreshes: 0 });
+      expect(await page.locator('#mts-authkey').count()).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s refreshes actual saved activation after an unknown backend result without claiming login', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=retained-error`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.refreshes === 1);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { starts: t.starts, saves: t.saves, cancels: t.cancels.length }; })).toEqual({ starts: 1, saves: 0, cancels: 1 });
+      expect(await page.getByText('授权已完成', { exact: true }).count()).toBe(0);
+      expect(await page.locator(endpoint === '__ts-login' ? '#mts-authkey' : '#ts-authkey').inputValue()).toBe('');
+      expect(await page.locator('body').textContent()).not.toContain('synthetic-activated');
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['__ts-login', '__ts-desktop'])('%s browser login parks an active credential through the same backend request without pre-save', async endpoint => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/${endpoint}?mode=active-credential`);
+      await page.locator(endpoint === '__ts-login' ? '.m-form-foot .primary' : '.dlg-foot .btn.flow').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => { const t = (window as any).__tsTest; return { saves: t.saves, logouts: t.logouts,
+        mode: t.request.mode, revision: t.request.expectedCredentialRevision, replace: t.request.replaceIdentity,
+        authKey: t.candidate.tailscaleSettings.authKey }; })).toEqual({ saves: 0, logouts: 0, mode: 'browser', revision: 'revision-A', replace: false, authKey: undefined });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['browser', 'authkey'])('non-iOS explicit %s switch keeps the original gated logout/save/login flow', async loginMode => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=state-switch`);
+      if (loginMode === 'authkey') {
+        await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+        await page.locator('#mts-authkey').fill('synthetic-test-key');
+      }
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, replace: t.request.replaceIdentity, mode: t.request.mode };
+      })).toEqual({ logouts: 1, replace: true, mode: loginMode });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop iOS consumer keeps a draft edited during the atomic backend request and refreshes once', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=ios-replace`);
+      await page.locator('#ts-login-control-url').fill('https://candidate.example');
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      await page.locator('#ts-login-control-url').fill('https://later-draft.example');
+      await page.evaluate(() => (window as any).__tsTest.releaseStart());
+      await page.waitForFunction(() => (window as any).__tsTest.refreshes === 1);
+      expect(await page.locator('#ts-login-control-url').inputValue()).toBe('https://later-draft.example');
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { saves: t.saves, logouts: t.logouts, starts: t.starts, replace: t.request.replaceIdentity };
+      })).toEqual({ saves: 0, logouts: 0, starts: 1, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['browser', 'authkey'])('iOS explicit %s switch waits for the backend, displays all phases, and refreshes once before completing', async loginMode => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-replace`);
+      if (loginMode === 'authkey') {
+        await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+        await page.locator('#mts-authkey').fill('synthetic-test-key');
+      }
+      await page.locator('#mts-control-url').fill('https://candidate.example');
+      await page.locator('.m-form-foot .primary').click();
+      await page.getByText('正在断开代理连接…', { exact: true }).waitFor();
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { prepares: t.prepares, saves: t.saves, logouts: t.logouts, starts: t.starts, refreshes: t.refreshes, replace: t.request.replaceIdentity, mode: t.request.mode };
+      })).toEqual({ prepares: 1, saves: 0, logouts: 0, starts: 1, refreshes: 0, replace: true, mode: loginMode });
+      for (const [phase, copy] of [['retiringIdentity', '正在退出旧账号…'], ['savingCandidate', '正在保存节点配置…'], ['startingConnection', '正在重新连接代理…']]) {
+        await page.evaluate(phase => {
+          const t = (window as any).__tsTest;
+          t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase, url: null });
+        }, phase);
+        await page.getByRole('status').filter({ hasText: copy }).waitFor();
+      }
+      await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        t.emit('onTailscaleStatus', { serverId: 'ts-1', backendState: 'Running', loggedIn: true, tailscaleIPs: [], peers: [], expired: false });
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, attemptId: 'old-request', phase: 'authorized' });
+      });
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', mainGeneration: 8, identityEpoch: 'fresh', url: null });
+      });
+      await page.getByText('主连接中的该节点已授权；这不代表新保存的认证设置已生效。', { exact: true }).waitFor();
+      expect(await page.getByRole('dialog').count()).toBe(1);
+      await page.evaluate(() => (window as any).__tsTest.releaseStart());
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { refreshes: t.refreshes, cancels: t.cancels.length, mainStarts: t.mainStarts, mainStops: t.mainStops };
+      })).toEqual({ refreshes: 1, cancels: 0, mainStarts: 0, mainStops: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each([
+    ['nativeRetirementUnknown', '无法安全退出旧账号。请重试。'],
+    ['profileBindingUnknown', '无法安全退出旧账号。请重试。'],
+    ['stateRevisionChanged', '登录状态已变更，请重新尝试。'],
+    ['candidateConfigurationChanged', '节点配置已变更，请重新打开登录页面。'],
+  ])('iOS replacement %s refreshes its committed candidate and shows finite localized failure', async (reason, copy) => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-replace-error&reason=${reason}`);
+      await page.locator('#mts-control-url').fill('https://candidate.example');
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      await page.evaluate(() => (window as any).__tsTest.releaseStart());
+      await page.getByText(copy, { exact: false }).first().waitFor();
+      expect(await page.evaluate(() => (window as any).__tsTest.refreshes)).toBe(1);
+      expect(await page.locator('.m-form-foot .primary').isEnabled()).toBe(true);
+      expect(await page.locator('body').innerText()).not.toContain(reason);
+      expect(await page.getByRole('dialog').count()).toBe(1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('cancelled iOS replacement still refreshes after invoke settles, while late authorization cannot restore it', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-replace-cancel`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      await page.locator('.m-form-head .m-form-x').click();
+      await page.getByRole('dialog').waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => (window as any).__tsTest.refreshes)).toBe(0);
+      await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        t.emit('onTailscaleLoginProgress', { ...t.startRequest, phase: 'authorized', mainGeneration: 8, identityEpoch: 'fresh' });
+        t.releaseStart();
+      });
+      await page.waitForFunction(() => (window as any).__tsTest.refreshes === 1);
+      expect(await page.evaluate(() => (window as any).__tsTest.attempt().phase)).toBe('cancelled');
+      expect(await page.locator('.m-toast').filter({ hasText: '授权已完成' }).count()).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('iOS saved account actions stay visible and the actual mobile host passes explicit switch intent', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-settings`);
+      await page.getByRole('button', { name: '切换账号', exact: true }).click();
+      await page.getByRole('dialog').last().locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.releaseStart);
+      expect(await page.evaluate(() => (window as any).__tsTest.request.replaceIdentity)).toBe(true);
+      expect(await page.evaluate(() => (window as any).__tsTest.logouts)).toBe(0);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('iOS independent logout delegates normal Start/Stop to one backend call', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=ios-settings`);
+      await page.getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.getByRole('dialog').last().getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.waitForFunction(() => (window as any).__tsTest.logouts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { starts: t.mainStarts, stops: t.mainStops, refreshes: t.refreshes };
+      })).toEqual({ starts: 0, stops: 0, refreshes: 1 });
+    } finally { await page.close(); }
+  }, 30_000);
 
   it('iOS starts the real login action, shows preparation while invoke waits, and detaches authorized progress without late cancel', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
@@ -180,7 +522,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
       await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
       await page.locator('#mts-authkey').fill('synthetic-test-key');
       await page.locator('.m-form-foot .primary').click();
-      await page.getByText('更换 Auth Key 前需安全清理已有身份；iOS 暂不支持此操作。', { exact: false }).first().waitFor();
+      await page.getByText('更换账号前需要安全退出旧账号。请使用“切换账号”。', { exact: false }).first().waitFor();
       expect(await page.evaluate(() => (window as any).__tsTest.logouts)).toBe(0);
       expect(await page.locator('.m-form-foot .primary').isEnabled()).toBe(true);
     } finally { await page.close(); }

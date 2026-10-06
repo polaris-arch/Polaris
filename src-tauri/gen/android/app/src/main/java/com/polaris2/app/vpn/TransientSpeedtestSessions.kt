@@ -21,10 +21,13 @@ internal class TransientSpeedtestSessions(
         val capabilities = emptySet<AndroidNativeProducer>()
     }
     interface Engine {
+        fun bindTailscaleStore(store: AndroidTailscaleStoreCustody) {}
         fun prepare()
         fun start()
         /** Existing operational Close result; supplemental cleanup proof is separate. */
         fun close()
+        /** Final snapshot/server disposal only after this Entry's pending Start actually leaves. */
+        fun finishClose() {}
         /** Supplemental proof only; false must not turn a successful operational Close into failure. */
         fun cleanupConfirmed(): Boolean = true
     }
@@ -100,6 +103,7 @@ internal class TransientSpeedtestSessions(
             var failure: AndroidNativeFailure? = null
             try {
                 if (!isRevoked(entry)) {
+                    if (nativeAdmission != null && ownerTicket != null) entry.engine.bindTailscaleStore(nativeAdmission.bindTailscaleStore(ownerTicket))
                     if (nativeAdmission != null && !nativeAdmission.enterBirth(checkNotNull(ownerTicket))) {
                         cancelBeforeBirth(ownerTicket)
                         throw nativeAdmission.admissionRejection()
@@ -280,6 +284,9 @@ internal class TransientSpeedtestSessions(
             // Close may cancel a blocked native Start, but cannot settle before
             // that exact worker passes its final possible native acquisition.
             entry.operationFinished.get()
+            runCatching { entry.engine.finishClose() }.onFailure { finalFailure ->
+                if (failure == null) failure = finalFailure else if (failure !== finalFailure) failure!!.addSuppressed(finalFailure)
+            }
             val cleanupConfirmed = runCatching { entry.engine.cleanupConfirmed() }.getOrDefault(false)
             synchronized(lock) {
                 if (failure == null && entry.nativeTicket != null && nativeAdmission != null) {

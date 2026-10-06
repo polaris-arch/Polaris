@@ -442,3 +442,21 @@ fn masque_carries_detour_and_domain_resolver() {
     assert_eq!(ep.detour.as_deref(), Some("SOCKS"));
     assert_eq!(ep.domain_resolver, Some(dial));
 }
+
+#[test]
+fn parked_tailscale_credentials_are_not_main_or_transient_endpoint_input() {
+    let server: ServerConfig = serde_json::from_value(serde_json::json!({
+        "id":"parked", "name":"Parked", "protocol":"tailscale", "tailscaleSettings":{
+            "retainedAuthKey":{"authKey":"builder-retained-secret", "controlAuthority":"https://controlplane.tailscale.com"},
+            "retainedAuthKeyAvailable":true,"tailscaleCredentialRevision":"not-authorization"
+        }
+    })).unwrap();
+    for platform in ["linux", "darwin", "ios", "android"] {
+        let main = build_tailscale_endpoint(&server, "tag", "/fake/ts/parked", platform, None);
+        assert!(main.auth_key.is_none());
+        let emitted = serde_json::to_string(&main).unwrap();
+        assert!(!emitted.contains("builder-retained-secret"));
+        assert!(!emitted.contains("retainedAuthKey"));
+        assert!(!emitted.contains("tailscaleCredentialRevision"));
+    }
+}

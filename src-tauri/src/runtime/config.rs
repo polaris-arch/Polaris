@@ -257,17 +257,230 @@ pub(crate) enum MeshServerIdentityEdit {
 }
 
 fn ts_control_authority(server: &Value) -> Result<String, StoreError> {
-    let settings = server.get("tailscaleSettings");
-    if settings.is_some_and(|value| !value.is_object()) {
-        return Err(StoreError::validation("TS settings are unavailable"));
-    }
-    let url = match settings.and_then(|value| value.get("controlUrl")) {
-        None | Some(Value::Null) => "https://controlplane.tailscale.com",
-        Some(Value::String(url)) if url.is_empty() => "https://controlplane.tailscale.com",
-        Some(Value::String(url)) => url,
-        Some(_) => return Err(StoreError::validation("invalid TS control authority")),
+    polaris_config_engine::user_config::effective_view::tailscale_control_authority(server)
+        .map_err(StoreError::validation)
+}
+
+/// Ordinary snapshots cannot clear a redacted secret or revive an inactive key. Deleted
+/// nodes are deliberately never copied back: credentials live only in their original node.
+fn reconcile_tailscale_credentials(
+    previous: &Value,
+    incoming: &mut Value,
+    trusted_target: Option<&str>,
+) -> Result<(), StoreError> {
+    use polaris_config_engine::user_config::effective_view::{
+        park_tailscale_auth_key, retained_tailscale_auth_key, tailscale_credential_revision,
     };
-    canonical_control_authority(url).map_err(StoreError::validation)
+    let Some(nodes) = incoming.get_mut("servers").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for node in nodes {
+        let id = node.get("id").and_then(Value::as_str).map(str::to_owned);
+        let current: Vec<_> = previous
+            .get("servers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|old| old.get("id").and_then(Value::as_str) == id.as_deref())
+            .collect();
+        let intent = node
+            .as_object_mut()
+            .and_then(|object| object.remove("tailscaleCredentialIntent"));
+        if let Some(settings) = node
+            .get_mut("tailscaleSettings")
+            .and_then(Value::as_object_mut)
+        {
+            settings.remove("retainedAuthKeyAvailable");
+            settings.remove("tailscaleCredentialRevision");
+        }
+        let current = match current.as_slice() {
+            [current] => Some(*current),
+            [] => None,
+            _ => return Err(StoreError::validation("credentialRevisionChanged")),
+        };
+        if let Some(intent) = intent {
+            let object = intent
+                .as_object()
+                .filter(|object| object.len() == 2)
+                .ok_or_else(|| StoreError::validation("invalidCredentialIntent"))?;
+            if object.get("action").and_then(Value::as_str) != Some("clear") {
+                return Err(StoreError::validation("invalidCredentialIntent"));
+            }
+            let expected = object
+                .get("expectedCredentialRevision")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| StoreError::validation("invalidCredentialIntent"))?;
+            let current =
+                current.ok_or_else(|| StoreError::validation("credentialRevisionChanged"))?;
+            if node.get("protocol").and_then(Value::as_str) != Some("tailscale")
+                || current.get("protocol") != node.get("protocol")
+                || current
+                    .get("tailscaleSettings")
+                    .and_then(|s| s.get("sourceTag"))
+                    != node
+                        .get("tailscaleSettings")
+                        .and_then(|s| s.get("sourceTag"))
+                || tailscale_credential_revision(current).as_deref() != Some(expected)
+                || ts_control_authority(current)? != ts_control_authority(node)?
+            {
+                return Err(StoreError::validation("credentialRevisionChanged"));
+            }
+            if let Some(settings) = node
+                .get_mut("tailscaleSettings")
+                .and_then(Value::as_object_mut)
+            {
+                settings.remove("authKey");
+                settings.remove("retainedAuthKey");
+            }
+            continue;
+        }
+        if id.as_deref().is_some_and(|id| Some(id) == trusted_target) {
+            retained_tailscale_auth_key(node).map_err(StoreError::validation)?;
+            continue;
+        }
+        if node.get("protocol").and_then(Value::as_str) != Some("tailscale") {
+            // Changing the original node's purpose removes its credentials. Preserve
+            // unrelated settings, but don't leave a secret with no reachable TS clear UI.
+            // This does not retire SDK state or provide any session-owner evidence.
+            if let Some(previous) = current
+                .filter(|old| old.get("protocol").and_then(Value::as_str) == Some("tailscale"))
+                .and_then(|old| old.get("tailscaleSettings"))
+                .and_then(Value::as_object)
+            {
+                let object = node
+                    .as_object_mut()
+                    .ok_or_else(|| StoreError::validation("invalidCredentialIntent"))?;
+                if object.get("tailscaleSettings").is_some_and(Value::is_null) {
+                    object.remove("tailscaleSettings");
+                }
+                let settings = object
+                    .entry("tailscaleSettings")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| StoreError::validation("invalidCredentialIntent"))?;
+                for (name, value) in previous {
+                    if !matches!(
+                        name.as_str(),
+                        "authKey"
+                            | "retainedAuthKey"
+                            | "retainedAuthKeyAvailable"
+                            | "tailscaleCredentialRevision"
+                    ) {
+                        settings
+                            .entry(name.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+                settings.remove("authKey");
+                settings.remove("retainedAuthKey");
+            }
+            continue;
+        }
+        let authority = ts_control_authority(node)?;
+        if let Some(current) =
+            current.filter(|old| old.get("protocol").and_then(Value::as_str) == Some("tailscale"))
+        {
+            let mut retained_current = current.clone();
+            let current_record =
+                retained_tailscale_auth_key(current).map_err(StoreError::validation)?;
+            let issuer_changed = ts_control_authority(current)? != authority;
+            if issuer_changed {
+                // Even a different incoming ordinary key is not an explicit login at
+                // the new issuer. Retain the actual old key at its actual old issuer.
+                park_tailscale_auth_key(&mut retained_current).map_err(StoreError::validation)?;
+            }
+            let old_settings = retained_current.get("tailscaleSettings");
+            if node.get("tailscaleSettings").is_none_or(Value::is_null) {
+                node.as_object_mut()
+                    .ok_or_else(|| StoreError::validation("invalidCredentialIntent"))?
+                    .insert("tailscaleSettings".into(), serde_json::json!({}));
+            }
+            let Some(settings) = node
+                .get_mut("tailscaleSettings")
+                .and_then(Value::as_object_mut)
+            else {
+                return Err(StoreError::validation("invalidCredentialIntent"));
+            };
+            if let Some(previous) = current.get("tailscaleSettings").and_then(Value::as_object) {
+                use polaris_config_engine::user_config::server_config::TAILSCALE_CANDIDATE_SETTINGS_FIELDS;
+                for (name, value) in previous {
+                    if name == "sourceTag"
+                        || !TAILSCALE_CANDIDATE_SETTINGS_FIELDS.contains(&name.as_str())
+                            && !settings.contains_key(name)
+                    {
+                        settings.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+            let new_key = settings
+                .get("authKey")
+                .and_then(Value::as_str)
+                .filter(|key| !key.trim().is_empty());
+            let old_key = current
+                .get("tailscaleSettings")
+                .and_then(|settings| settings.get("authKey"))
+                .and_then(Value::as_str)
+                .filter(|key| !key.trim().is_empty());
+            if !issuer_changed
+                && (old_key.is_some() || current_record.is_some())
+                && new_key.is_some_and(|key| {
+                    Some(key) != old_key
+                        && current_record
+                            .as_ref()
+                            .map(|record| record.auth_key.as_str())
+                            != Some(key)
+                })
+            {
+                // An ordinary edit can retain a newly entered key for manual login, but
+                // cannot quietly turn that edit into a new automatic credential.
+                settings.insert("retainedAuthKey".into(), serde_json::json!({
+                    "authKey":new_key.expect("different nonempty key"), "controlAuthority":authority
+                }));
+                settings.remove("authKey");
+                continue;
+            }
+            if let Some(record) = old_settings.and_then(|settings| settings.get("retainedAuthKey"))
+            {
+                settings.insert("retainedAuthKey".into(), record.clone());
+                // Preserve only a currently active key, never a stale renderer or
+                // imported snapshot's active field in an already parked node.
+                match old_settings.and_then(|settings| settings.get("authKey")) {
+                    Some(key) if current_record.is_some() => {
+                        settings.insert("authKey".into(), key.clone());
+                    }
+                    _ => {
+                        settings.remove("authKey");
+                    }
+                }
+            } else {
+                settings.remove("retainedAuthKey");
+                // Omission/redaction is not a legacy clear operation either.
+                if let Some(key) = old_settings.and_then(|settings| settings.get("authKey")) {
+                    if settings.get("authKey").is_none_or(|value| {
+                        value.is_null()
+                            || value.as_str().is_some_and(|value| value.trim().is_empty())
+                    }) {
+                        settings.insert("authKey".into(), key.clone());
+                    }
+                }
+            }
+        } else if let Some(record) =
+            retained_tailscale_auth_key(node).map_err(StoreError::validation)?
+        {
+            // Explicit backup imports may establish a new node ID, but an old-issuer
+            // key must not become automatic input at a different imported authority.
+            if record.control_authority != authority {
+                if let Some(settings) = node
+                    .get_mut("tailscaleSettings")
+                    .and_then(Value::as_object_mut)
+                {
+                    settings.remove("authKey");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 未保存草稿对运行态节点选择的最小投影。正文仍只在渲染端；这里不复制配置，只携带自动故障切换
@@ -1801,10 +2014,59 @@ impl ConfigManager {
     /// In particular, an old policy snapshot cannot omit an already enabled
     /// dnsPolicy and thereby silently return managed DNS to legacy behavior.
     fn canonicalize_untrusted_under_write_lock(&self, config: &Value) -> Result<Value, StoreError> {
+        self.canonicalize_with_tailscale_target_under_write_lock(config, None)
+    }
+
+    fn canonicalize_with_tailscale_target_under_write_lock(
+        &self,
+        config: &Value,
+        trusted_target: Option<&str>,
+    ) -> Result<Value, StoreError> {
         let previous = self.raw_disk_for_mesh_under_write_lock()?;
         let mut incoming = config.clone();
+        reconcile_tailscale_credentials(&previous, &mut incoming, trusted_target)?;
         mesh_guard::reconcile_untrusted(&previous, &mut incoming)?;
         ConfigStore::canonicalize_for_save(&incoming)
+    }
+
+    /// Only the original admitted login/logout transaction calls this seam. Full saved
+    /// equality is checked under the original lock; it does not itself provide ownership
+    /// or cancellation proof. Other nodes keep the ordinary preservation policy.
+    pub(crate) fn update_tailscale_credential<R>(
+        &self,
+        expected: &Value,
+        target: &str,
+        action: impl FnOnce(&mut Value) -> Decision<R>,
+    ) -> Result<(R, Option<Value>), StoreError> {
+        deny_inside_projection("update_tailscale_credential");
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = self.load_full_under_write_lock()?;
+        if current != *expected
+            || current
+                .get("servers")
+                .and_then(Value::as_array)
+                .is_none_or(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|node| node.get("id").and_then(Value::as_str) == Some(target))
+                        .count()
+                        != 1
+                })
+        {
+            return Err(StoreError::validation("credentialRevisionChanged"));
+        }
+        match action(&mut current) {
+            Decision::Skip(result) => Ok((result, None)),
+            Decision::Write(result) => {
+                let canonical = self
+                    .canonicalize_with_tailscale_target_under_write_lock(&current, Some(target))?;
+                let saved = self.save_canonical_with_icon_reconcile(canonical, true)?;
+                Ok((result, Some(saved)))
+            }
+        }
     }
 
     fn save_canonical_with_icon_reconcile(

@@ -11,20 +11,41 @@
  * 交付说明）；而 `ensure_server_id`（同文件 :40）只在 id 缺失/空串时才 mint，非空 id 原样保留 →
  * 「渲染端自带 id 落盘」是后端明确支持的契约（其单测名即 `..._keeps_existing`）。
  */
-import type { ServerConfig } from '@/contracts/types';
+import type { ServerConfig, TailscaleSettings, TailscaleCredentialMetadata } from '@/contracts/types';
+import { hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
+
+/** Only call with a new editable copy: retained secrets and view metadata never enter candidates. */
+export function stripTsCredentialMetadata(copy: {
+  -readonly [K in keyof (TailscaleSettings & TailscaleCredentialMetadata)]: (TailscaleSettings & TailscaleCredentialMetadata)[K]
+}): TailscaleSettings {
+  delete copy.retainedAuthKey;
+  delete copy.retainedAuthKeyAvailable;
+  delete copy.tailscaleCredentialRevision;
+  return copy;
+}
 
 /** Login can use the normal main proxy on every platform; identity deletion is a separate capability. */
 export function supportsTsLoginActions(): boolean {
   return true;
 }
 
-/** iOS has the main Packet Tunnel only, with no standalone account session owner. */
-export function supportsTsAccountActions(mobileOs = typeof document === 'undefined'
-  ? undefined : document.documentElement.dataset.mobileOs): boolean {
-  return mobileOs !== 'ios';
+/** Account actions use the backend's platform-specific identity retirement gates. */
+export function supportsTsAccountActions(_mobileOs?: string): boolean {
+  return true;
+}
+
+export function tsLoginUsesBackendReplacement(replaceIdentity: boolean): boolean {
+  return replaceIdentity && typeof document !== 'undefined'
+    && document.documentElement?.dataset?.mobileOs === 'ios';
 }
 
 export type TsLoginMode = 'browser' | 'authkey';
+
+/** Routing only: the backend alone checks canonical issuer and target credential CAS. */
+export function tsLoginUsesBackendCredentials(existing: ServerConfig | undefined, reuseRetainedAuthKey = false): boolean {
+  const revision = existing?.tailscaleSettings?.tailscaleCredentialRevision;
+  return reuseRetainedAuthKey || hasTsRetainedAuthKey(existing) || !!revision;
+}
 
 /**
  * 「等登录地址」的放弃时限，对齐后端瞬态登录核的超时臂
@@ -90,14 +111,8 @@ export interface TsLoginSubmitPlan {
   /** 发起登录前需要的落盘动作。 */
   persist: 'add' | 'update' | 'none';
   /**
-   * 提交前是否必须先退出登录（清 state 目录）。
-   *
-   * **这条是「auth_key 换不上」的根因**：tsnet 手上只要有有效 node key 就不会去用 `auth_key`，
-   * 于是用户填了新 key、提交也成功，登录身份却一动不动。清 state 目录是唯一的解
-   * （`commands/server.rs` 的 `tailscale_logout` 注释：「清 state 目录；保留节点配置/authKey」）。
-   *
-   * 只在「切到 authkey 且该节点确实有 state」时为真：browser 模式本来就是交互登录，
-   * 而没有 state 的节点没什么可退。
+   * Auth Key 提交的旧会话提示；实际操作重新查询存在性，并由后端检查目标身份写入者。
+   * 登出只清目标认证记录，保留 Taildrop 与其他节点的数据。
    */
   requiresLogout: boolean;
 }
@@ -110,6 +125,7 @@ export interface TsLoginSubmitInput {
   name?: string;
   mode: TsLoginMode;
   authKey: string;
+  reuseRetainedAuthKey?: boolean;
   /**
    * 自建控制面地址（headscale 等）。空串 = 官方 controlplane。
    *
@@ -141,7 +157,7 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
   // 绝不 mutate existing（它是 app-store.servers 里的 live 引用）——克隆基础对象 + 克隆 tailscaleSettings，
   // 提交失败不得把 authKey 写脏内存态。
   const server: ServerConfig = existing
-    ? { ...existing, tailscaleSettings: { ...(existing.tailscaleSettings ?? {}) } }
+    ? { ...existing, tailscaleSettings: stripTsCredentialMetadata({ ...(existing.tailscaleSettings ?? {}) }) }
     : ({
         id: mintId(),
         name: name?.trim() || 'Tailscale',
@@ -155,7 +171,7 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
       } as ServerConfig);
   if (existing && name !== undefined) server.name = name.trim();
 
-  if (mode === 'authkey') {
+  if (mode === 'authkey' && !input.reuseRetainedAuthKey) {
     server.tailscaleSettings = {
       ...(server.tailscaleSettings ?? {}),
       authKey: authKey.trim(),
@@ -189,6 +205,10 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
 }
 
 export interface TsLoginExecution {
+  /** iOS switch: the backend owns Stop/retirement/save/Start as one request. */
+  backendReplacement?: boolean;
+  /** Explicit credential actions use the same backend transaction on all platforms. */
+  backendCredentials?: boolean;
   isActive: () => boolean;
   prepare: () => Promise<void>;
   verifyState?: () => Promise<boolean>;
@@ -200,44 +220,75 @@ export interface TsLoginExecution {
   cancel: () => Promise<void>;
 }
 
-/** Save and authorize are separate transactions. Cancellation is checked at every IPC boundary. */
-export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 'handedOff' | 'cancelled' | 'failed'; reason?: string }> {
+const RETIREMENT_REASONS = ['mainCoreChanged', 'cancelled', 'nativeRetirementUnknown',
+  'profileBindingUnknown', 'stateRevisionChanged', 'candidateConfigurationChanged',
+  'retainedAuthKeyUnavailable', 'retainedAuthKeyAuthorityChanged', 'credentialRevisionChanged',
+  'invalidCredentialIntent', 'credentialCommitUnknown'];
+
+/** Only this code's exact finite reason literals are safe to consume from error.message. */
+export function tsLoginErrorReason(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object' || !('code' in error)) return undefined;
+  if (error.code === 'TAILSCALE_LOGIN_FAILED' && 'message' in error && typeof error.message === 'string'
+    && RETIREMENT_REASONS.includes(error.message)) return error.message;
+  if (typeof error.code === 'string' && ['ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED',
+    'IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'IOS_READY_UNKNOWN', 'IOS_START_CANCELLED',
+    'readyUnknown', 'unsavedConfiguration', 'configurationPending', 'superseded', 'targetNotInMain'].includes(error.code)) return error.code;
+  if (error.code === 'TAILSCALE_LOGOUT_MAIN_CORE') return 'mainCoreInUse';
+  return undefined;
+}
+
+/** Empty-credential login saves first; backend-owned actions refresh once after their request settles. */
+export async function executeTsLogin(input: TsLoginExecution): Promise<{ phase: 'handedOff' | 'cancelled' | 'failed'; reason?: string; refreshFailed?: boolean }> {
+  const backendOwned = input.backendReplacement || input.backendCredentials;
   let handedOff = false;
+  let invoked = false;
   let stage = 'authorizationRequestFailed';
-  try {
-    await input.prepare();
-    if (!input.isActive()) return { phase: 'cancelled' };
-    if (input.verifyState) {
-      stage = 'stateQueryFailed';
-      const exists = await input.verifyState();
+  let outcome: { phase: 'handedOff' | 'cancelled' | 'failed'; reason?: string; refreshFailed?: boolean } = { phase: 'cancelled' };
+  const run = async (): Promise<typeof outcome> => {
+    try {
+      await input.prepare();
       if (!input.isActive()) return { phase: 'cancelled' };
-      if (exists) {
-        stage = 'logoutFailed';
-        await input.logout();
+      if (!backendOwned && input.verifyState) {
+        stage = 'stateQueryFailed';
+        const exists = await input.verifyState();
+        if (!input.isActive()) return { phase: 'cancelled' };
+        if (exists) {
+          stage = 'logoutFailed';
+          await input.logout();
+          if (!input.isActive()) return { phase: 'cancelled' };
+        }
+      }
+      if (!backendOwned) {
+        stage = 'saveFailed';
+        await input.save();
+        input.onSaved();
+        if (!input.isActive()) return { phase: 'cancelled' };
+        stage = 'configurationRefreshFailed';
+        await input.refresh();
         if (!input.isActive()) return { phase: 'cancelled' };
       }
+      stage = 'authorizationRequestFailed';
+      invoked = true;
+      const result = await input.start();
+      handedOff = result.started || result.reason === 'inMainCore';
+      if (!input.isActive()) return { phase: 'cancelled' };
+      return { phase: handedOff ? 'handedOff' : 'cancelled' };
+    } catch (error) {
+      return { phase: 'failed', reason: tsLoginErrorReason(error) ?? stage };
     }
-    stage = 'saveFailed';
-    await input.save();
-    input.onSaved();
-    if (!input.isActive()) return { phase: 'cancelled' };
-    stage = 'configurationRefreshFailed';
-    await input.refresh();
-    if (!input.isActive()) return { phase: 'cancelled' };
-    stage = 'authorizationRequestFailed';
-    const result = await input.start();
-    handedOff = result.started || result.reason === 'inMainCore';
-    if (!input.isActive()) return { phase: 'cancelled' };
-    return { phase: handedOff ? 'handedOff' : 'cancelled' };
-  } catch (error) {
-    const code = error && typeof error === 'object' && 'code' in error ? error.code : null;
-    if (typeof code === 'string' && ['ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED',
-      'IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'IOS_READY_UNKNOWN', 'IOS_START_CANCELLED',
-      'readyUnknown', 'unsavedConfiguration', 'configurationPending', 'superseded', 'targetNotInMain'].includes(code)) {
-      return { phase: 'failed', reason: code };
-    }
-    return { phase: 'failed', reason: code === 'TAILSCALE_LOGOUT_MAIN_CORE' ? 'mainCoreInUse' : stage };
+  };
+  try {
+    outcome = await run();
   } finally {
+    if (backendOwned && invoked) {
+      try { await input.refresh(); }
+      catch {
+        outcome = outcome.phase === 'handedOff'
+          ? { phase: 'failed', reason: 'configurationRefreshFailed', refreshFailed: true }
+          : { ...outcome, refreshFailed: true };
+      }
+    }
     if (!handedOff) await input.cancel().catch(() => {});
   }
+  return outcome;
 }

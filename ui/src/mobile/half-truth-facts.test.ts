@@ -310,6 +310,9 @@ const SILENT_TOAST_BASELINE = 0;
  *       → 75（2026-10-06：Home 手动网络 observer 精确取消失败新增一处全局 error。
  *         Home 卸载后仍由既有 MobileToaster 宿主显示；picker-speed.browser.test.ts 的
  *         cancel reject + 离开 Home 负门使用真实宿主证明可见，不将取消记为只读豁免）。
+ *       → 76（同日 TS 切换：TsLoginPanel 的 outcome.refreshFailed 新增一处全局 error。
+ *         它在 stillActive 返回之前发出，面板关闭后也由既有 MobileToaster 承接；
+ *         原宿主/真实注入/装载证明和下方两条移除宿主、移除注入的负对照继续生效）。
  *
  * 🔴 抬这个数的门槛：**必须确认新增的那几处调用真的能到用户眼前**。它今天成立的依据是四条：
  * 宿主已挂（上面第一条断言）＋ 宿主真的调了注入函数（上面第二条）＋ 装配面已证
@@ -323,7 +326,7 @@ const SILENT_TOAST_BASELINE = 0;
  * ——它按整个移动端层叠上下文取材，谁新加一个更高的层就当场红。
  * 🔴 抬这个数之前仍要先过上面那几条，否则就是又写了几处静音反馈还把账做平了。
  */
-const SILENT_TOAST_WITHOUT_HOST = 75;
+const SILENT_TOAST_WITHOUT_HOST = 76;
 
 /* ══════════════════════════ 断言 ══════════════════════════ */
 
@@ -482,6 +485,14 @@ describe('半真文案的事实门', () => {
   });
 
   describe('C 组｜toast 宿主：移动端有了自己的一个（接线后的正面事实 + 归零棘轮）', () => {
+    it('新增 TS 配置刷新失败反馈走既有宿主，且先于关闭面板的返回', () => {
+      const source = stripComments(readFileSync(join(MOBILE_DIR, 'forms/TsLoginPanel.tsx'), 'utf8'));
+      expect(source).toMatch(/if \(outcome\.refreshFailed\) toast\.error\(t\('ts\.loginRefreshFailed'\)\);\s*if \(!stillActive\(\)\) return;/);
+      expect(mobileToastCalls()['mobile/forms/TsLoginPanel.tsx']).toBe(4);
+      expect(toastInjectionSites()).toContain('mobile/MobileToaster.tsx');
+      expect(toastHostInstallSites()).not.toEqual([]);
+    });
+
     it('谓词自检：只有「装了实现」才算注入点，光有卸载腿不算', () => {
       // 正面：真正的注入认得出。
       expect(

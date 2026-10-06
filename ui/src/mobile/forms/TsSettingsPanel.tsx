@@ -1,4 +1,5 @@
-import { supportsTsAccountActions } from '@/components/dialogs/ts-login-server';
+import { supportsTsAccountActions, tsLoginErrorReason, tsLoginUsesBackendReplacement } from '@/components/dialogs/ts-login-server';
+import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
 /**
  * 移动端 **Tailscale 设置表** —— 批 3。节点行上「编辑」一个 tailscale 节点落到这里
  * （`form-store#mobileEditFormFor`），组网接入面上点 Tailscale 且已有节点时也落到这里
@@ -18,7 +19,7 @@ import { supportsTsAccountActions } from '@/components/dialogs/ts-login-server';
  *    直接 panic）。两条都必须拦在**保存这一刻**，光标还在那个输入框旁边。
  *  · **出口候选** —— `#exitNodeOptions`（原样收下全部 peer，筛/排/去重/禁用注记都在那支纯函数里）。
  *  · **登出** —— `api.server.tailscaleLogout` + `lib/staged-config#splitStagedOnly`
- *    （登出清的是磁盘上的 TS state 目录，盘上没有这个节点就没有作用对象）。
+ *    （登出只清目标认证记录，保留收件文件；盘上没有节点时不操作）。
  *
  * # 与 `TsExitPanel` 的分工
  *
@@ -35,7 +36,7 @@ import { useTranslation } from 'react-i18next';
 import { revealElement, useRevealAfterCommit } from '@/components/reveal';
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
-import type { MeshInboundPolicy } from '@/contracts/types';
+import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
 import type { TailscaleStatusPeer } from '@/contracts/tailscale-status';
 import type { FormValue, FormValues, SelectOption } from '@/components/dialogs/field-spec';
 import { TS_ADV_SPEC, tsMainSpec } from '@/components/dialogs/ts-spec';
@@ -47,6 +48,9 @@ import {
   invalidControlUrl,
   invalidTsCidrs,
   peersForTsNode,
+  tsCredentialClearIntent,
+  tsCredentialSource,
+  tsCredentialSaveErrorKey,
 } from '@/components/dialogs/ts-settings-logic';
 import { applyDetour, endpointDetourOptions } from '@/components/dialogs/detour-options';
 import { applyMeshInboundPolicy, meshInboundPolicyError, normalizeMeshInboundPolicy } from '@/components/dialogs/mesh-inbound-policy';
@@ -63,6 +67,8 @@ import { FormSheet } from './FormSheet';
 import { FormGroup } from './FormGroup';
 import { useMobileFormStore } from './form-store';
 import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout } from './ts-logout-flow';
+import { hasTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
+import { useConfirmTwice } from '@/lib/confirm-twice';
 
 /** 分组的呈现顺序与标题键（分区本身来自 `groupTsFields`）。 */
 const TS_GROUPS: ReadonlyArray<readonly [TsFormGroup, string]> = [
@@ -80,6 +86,7 @@ export function TsSettingsPanel({
 }): ReactElement {
   const { t } = useTranslation();
   const accountActionsSupported = supportsTsAccountActions();
+  const isIOS = tsLoginUsesBackendReplacement(true);
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -98,6 +105,11 @@ export function TsSettingsPanel({
      （`meshSingletonConflict` 只剩 WARP 支），按协议取「任意一个」会让编辑第二个节点
      打开/写坏第一个。桌面 `TsSettingsDialog` 同一处同一条改动。 */
   const node = servers.find((s) => s.id === serverId);
+  const credentialNode = tsCredentialSource(node, diskServers);
+  const authKeyStored = hasTsAuthKey(credentialNode);
+  const retainedAuthKeyStored = hasTsRetainedAuthKey(credentialNode);
+  const [credentialClearIntent, setCredentialClearIntent] = useState<ServerConfig['tailscaleCredentialIntent']>(node?.tailscaleCredentialIntent);
+  const { armed, confirmTwice } = useConfirmTwice();
 
   const [peers, setPeers] = useState<readonly TailscaleStatusPeer[]>([]);
   const [connected, setConnected] = useState<boolean | null>(null);
@@ -255,9 +267,10 @@ export function TsSettingsPanel({
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour(
-        { ...node, name: trimmedName, tailscaleSettings: buildTsSettings(node.tailscaleSettings, draft) },
+        { ...node, name: trimmedName, tailscaleSettings: buildTsSettings(node.tailscaleSettings, draft, !!credentialClearIntent) },
         draft.detour,
       );
+      if (credentialClearIntent) next.tailscaleCredentialIntent = credentialClearIntent;
       const bindInterface = String(draft.bindInterface ?? '').trim();
       if (bindInterface) next.bindInterface = bindInterface;
       else delete next.bindInterface;
@@ -279,8 +292,8 @@ export function TsSettingsPanel({
       closeInstance(instanceId);
       toast.success(t('common.saved'));
     } catch (e) {
-      console.error('[mobile-ts-settings] save failed:', e);
-      setNotice({ tone: 'err', text: t('common.saveFailed') });
+      console.error('[mobile-ts-settings] save failed');
+      setNotice({ tone: 'err', text: t(tsCredentialSaveErrorKey(e)) });
     } finally {
       if (hasInstance(instanceId)) setBusy(false);
     }
@@ -304,7 +317,7 @@ export function TsSettingsPanel({
     }
   };
 
-  /** 登出：主核持有该节点时另问一次是否断开，绝不从通用错误推断可以停核。 */
+  /** iOS delegates normal Stop to the backend; other platforms retain their exact-owner confirmation. */
   const requestLogout = (): void => {
     if (!accountActionsSupported) return;
     if (node === undefined) return;
@@ -336,8 +349,9 @@ export function TsSettingsPanel({
             await api.server.tailscaleLogout(serverId);
             await completeLogout(serverId);
           } catch (e) {
-            if (!isMainCoreLogoutError(e)) {
-              setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
+            if (isIOS || !isMainCoreLogoutError(e)) {
+              const reason = tsLoginErrorReason(e);
+              setNotice({ tone: 'err', text: t(reason ? loginFailureReasonKey(reason) : 'nodes.meshTsLogoutFail') });
               return;
             }
             // The native writer gate refused this exact node. Capture the live core before asking
@@ -445,6 +459,21 @@ export function TsSettingsPanel({
             value={meshPolicy} errorKey={meshPolicyError} errorVersion={meshPolicyErrorVersion}
             onChange={(next) => { setMeshPolicy(next); setMeshPolicyError(null); setDirty(true); }} />
 
+          <div className="m-form-row">
+            <span className="m-form-label">{t('ts.authKey')}</span>
+            <p className="m-form-hint" role="status">{t(credentialClearIntent ? 'ts.authKeyClearPending'
+              : authKeyStored ? 'ts.authKeySaved' : retainedAuthKeyStored ? 'ts.authKeyRetained' : 'ts.authKeyNone')}</p>
+            <p className="m-form-hint">{t('ts.authKeyClearHint')}</p>
+            {(authKeyStored || retainedAuthKeyStored) && !credentialClearIntent && (
+              <button type="button" className={`m-form-btn danger${armed === 'ts-authkey-clear' ? ' confirming' : ''}`}
+                disabled={busy || !tsCredentialClearIntent(credentialNode)}
+                onClick={() => confirmTwice('ts-authkey-clear', () => {
+                  const intent = tsCredentialClearIntent(credentialNode);
+                  if (intent) { setCredentialClearIntent(intent); setDirty(true); }
+                })}>{t(armed === 'ts-authkey-clear' ? 'ts.authKeyClearAgain' : 'ts.authKeyClear')}</button>
+            )}
+          </div>
+
           {/* 账号级动作。桌面把它们摆在组网接入面的 Tailscale 卡片上（`MeshJoinDialog` 的
               `actions`）；移动端那张接入面是一列纵向选择，塞不下三颗次动作，故收进这张表的末尾 ——
               Taildrop 与登录入口常驻；只有 native state 存在才给登出动作。
@@ -455,7 +484,6 @@ export function TsSettingsPanel({
               本面板的 union 那一支**必须带 id**（`form-store.ts`），于是「绑在第一个节点上」
               这件事在移动端结构上就不会发生；而每个 Tailscale 节点在节点屏上各有一行、
               「编辑」都落到这张表 ⇒ 每一个节点的收件箱都到得了。完整依据见 `TaildropPanel` 头注。 */}
-          {!accountActionsSupported && <p className="m-form-hint">{t('ts.iosAccountActionsUnavailable')}</p>}
           <div className="m-form-row">
             <span className="m-form-label">{t('ts.fileTransfer')}</span>
             <div className="m-form-inline">
@@ -475,15 +503,16 @@ export function TsSettingsPanel({
           <div className="m-form-row">
             <span className="m-form-label">{t('ts.accountActions')}</span>
             <div className="m-form-inline">
-              <button
+              {hasLoginState === true ? <button
                 type="button"
                 className="m-form-btn"
                 disabled={busy}
-                onClick={() => open({ kind: 'ts-login', serverId })}
+                onClick={() => open({ kind: 'ts-login', serverId, replaceIdentity: true })}
               >
-                {t(!accountActionsSupported ? 'common.edit' : hasLoginState === true ? 'meshJoin.switchAccount' : 'ts.signIn')}
-              </button>
-              {(hasLoginState === true || !accountActionsSupported) && <button
+                {t('meshJoin.switchAccount')}
+              </button> : <button type="button" className="m-form-btn" disabled={busy}
+                onClick={() => open({ kind: 'ts-login', serverId })}>{t('ts.signIn')}</button>}
+              {hasLoginState === true && <button
                 type="button"
                 className="m-form-btn danger"
                 disabled={busy || !accountActionsSupported}

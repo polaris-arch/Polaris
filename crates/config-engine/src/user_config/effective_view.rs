@@ -35,6 +35,7 @@
 //! 放到别处（例如只在某个 command 里补）就会制造 conflict 恒真。
 
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 
 use crate::user_config::system_proxy_bypass::ensure_bypass_lan_list;
 use crate::user_config::tun_config::TunModeConfig;
@@ -57,6 +58,163 @@ pub fn ensure_effective_config(cfg: &mut Value) {
     ensure_bypass_lan_list(cfg);
     ensure_tun_config(cfg);
     ensure_inbound_exclude_cidrs(cfg);
+    project_tailscale_credentials(cfg);
+}
+
+/// The same authority comparison as mesh identity reconciliation, with the existing official
+/// default for an absent, null or empty control URL. No second URL normalization is introduced.
+pub fn tailscale_control_authority(server: &Value) -> Result<String, String> {
+    let settings = server
+        .get("tailscaleSettings")
+        .filter(|value| !value.is_null());
+    if settings.is_some_and(|value| !value.is_object()) {
+        return Err("invalidCredentialIntent".into());
+    }
+    let url = match settings.and_then(|value| value.get("controlUrl")) {
+        None | Some(Value::Null) => "https://controlplane.tailscale.com",
+        Some(Value::String(url)) if url.is_empty() => "https://controlplane.tailscale.com",
+        Some(Value::String(url)) => url,
+        Some(_) => return Err("invalidCredentialIntent".into()),
+    };
+    crate::user_config::mesh_identity_reconcile::canonical_control_authority(url)
+        .map_err(|_| "invalidCredentialIntent".into())
+}
+
+/// Read only this raw node's retained credential. Neither this function nor the view gives
+/// authorization to construct a producer, retire a writer or change the saved credential.
+pub fn retained_tailscale_auth_key(
+    server: &Value,
+) -> Result<Option<crate::user_config::server_config::RetainedTailscaleAuthKey>, String> {
+    let Some(record) = server
+        .get("tailscaleSettings")
+        .and_then(|settings| settings.get("retainedAuthKey"))
+    else {
+        return Ok(None);
+    };
+    let mut record: crate::user_config::server_config::RetainedTailscaleAuthKey =
+        serde_json::from_value(record.clone()).map_err(|_| "invalidCredentialIntent")?;
+    if record.auth_key.trim().is_empty() {
+        return Err("invalidCredentialIntent".into());
+    }
+    record.control_authority =
+        crate::user_config::mesh_identity_reconcile::canonical_control_authority(
+            &record.control_authority,
+        )
+        .map_err(|_| "invalidCredentialIntent")?;
+    Ok(Some(record))
+}
+
+/// Opaque optimistic concurrency token using the existing digest dependency. It binds the
+/// actual raw target, including unknown fields, and is expressly not an ownership proof.
+pub fn tailscale_credential_revision(server: &Value) -> Option<String> {
+    let settings = server.get("tailscaleSettings")?.as_object()?;
+    let active = settings
+        .get("authKey")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty());
+    if !active && !settings.contains_key("retainedAuthKey") {
+        return None;
+    }
+    let mut raw = server.clone();
+    if let Some(node) = raw.as_object_mut() {
+        node.remove("tailscaleCredentialIntent");
+    }
+    if let Some(settings) = raw
+        .get_mut("tailscaleSettings")
+        .and_then(Value::as_object_mut)
+    {
+        settings.remove("retainedAuthKeyAvailable");
+        settings.remove("tailscaleCredentialRevision");
+    }
+    let mut digest = Sha1::new();
+    digest.update(b"polaris-ts-credential-revision-v1\0");
+    digest.update(serde_json::to_vec(&raw).ok()?);
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// Park the actual current active key with its original issuer, preserving all other fields.
+pub fn park_tailscale_auth_key(server: &mut Value) -> Result<(), String> {
+    retained_tailscale_auth_key(server)?;
+    let authority = tailscale_control_authority(server)?;
+    let Some(settings) = server
+        .get_mut("tailscaleSettings")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let key = match settings.get("authKey") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(key)) if key.trim().is_empty() => None,
+        Some(Value::String(key)) => Some(key.clone()),
+        Some(_) => return Err("invalidCredentialIntent".into()),
+    };
+    if let Some(key) = key {
+        settings.insert(
+            "retainedAuthKey".into(),
+            serde_json::json!({"authKey": key, "controlAuthority": authority}),
+        );
+    }
+    settings.remove("authKey");
+    Ok(())
+}
+
+fn project_tailscale_credentials(config: &mut Value) {
+    let Some(nodes) = config.get_mut("servers").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for node in nodes {
+        if let Some(object) = node.as_object_mut() {
+            object.remove("tailscaleCredentialIntent");
+        }
+        if node.get("protocol").and_then(Value::as_str) != Some("tailscale") {
+            // A protocol edit can retain the original node-owned record on disk;
+            // no protocol's frontend projection may expose that record.
+            if let Some(settings) = node
+                .get_mut("tailscaleSettings")
+                .and_then(Value::as_object_mut)
+            {
+                settings.remove("retainedAuthKey");
+                settings.remove("retainedAuthKeyAvailable");
+                settings.remove("tailscaleCredentialRevision");
+            }
+            continue;
+        }
+        let revision = tailscale_credential_revision(node);
+        let retained = node
+            .get("tailscaleSettings")
+            .is_some_and(|settings| settings.get("retainedAuthKey").is_some());
+        let available = retained_tailscale_auth_key(node)
+            .ok()
+            .flatten()
+            .zip(tailscale_control_authority(node).ok())
+            .is_some_and(|(record, authority)| record.control_authority == authority);
+        let Some(settings) = node
+            .get_mut("tailscaleSettings")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        settings.remove("retainedAuthKey");
+        // An already projected document has no raw secret. Keep its exact metadata on the
+        // second projection used by configVersion, rather than hashing a redacted surrogate.
+        if retained {
+            settings.insert("retainedAuthKeyAvailable".into(), Value::Bool(available));
+        }
+        if retained || !settings.contains_key("retainedAuthKeyAvailable") {
+            if let Some(revision) = revision {
+                settings.insert(
+                    "tailscaleCredentialRevision".into(),
+                    Value::String(revision),
+                );
+            }
+        }
+    }
 }
 
 /// `tunConfig` 缺省 → 注入 `TunModeConfig::default()` 的序列化形。

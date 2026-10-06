@@ -45,6 +45,25 @@ use tauri::AppHandle;
 /// Polaris 用 `fs.readdirSync(dir)` 直接读盘；失败安全返 None（对齐 Polaris catch → false）。
 struct StdTailscaleFs;
 
+fn same_auth_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if !after.is_file()
+        || after.file_type().is_symlink()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        before.created().ok() == after.created().ok()
+    }
+}
+
 impl TailscaleStateFs for StdTailscaleFs {
     fn read_dir_names(&self, dir: &Path) -> Option<Vec<String>> {
         std::fs::read_dir(dir)
@@ -404,6 +423,212 @@ impl MeshRuntime {
         std::fs::remove_dir_all(&dir)
     }
 
+    /// Authentication retirement keeps Taildrop, machine identity, other
+    /// profiles, and unknown FileStore entries. Whole-node deletion above is
+    /// reserved for the existing explicit node-deletion journal.
+    pub(crate) fn tailscale_retire_auth_under_gate(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
+        provenance: polaris_mesh::tailscale_state::AuthProjectionProvenance<'_>,
+        sealed_revision: Option<&str>,
+    ) -> std::io::Result<()> {
+        use polaris_store::fs::{durable_atomic_write, random_tmp_suffix};
+        use std::io::Read;
+        const MAX_BYTES: u64 = 4 * 1024 * 1024;
+        let unknown = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Tailscale authentication state is unknown",
+            )
+        };
+        self.login_registry
+            .assert_auth_state_available(server_id, gate, keep)
+            .map_err(std::io::Error::other)?;
+        let directory = self.tailscale_state_dir(server_id)?;
+        let state_root = self.config_dir.join("tailscale");
+        for path in [&state_root, &directory] {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Tailscale state path escaped its configured root",
+                ));
+            }
+        }
+        let config_root = self.config_dir.canonicalize()?;
+        let root = state_root.canonicalize()?;
+        let target = directory.canonicalize()?;
+        if !root.starts_with(&config_root) || target.parent() != Some(root.as_path()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Tailscale state path escaped its configured root",
+            ));
+        }
+        let path = target.join("tailscaled.state");
+        let before = std::fs::symlink_metadata(&path)?;
+        if !before.is_file() || before.file_type().is_symlink() || before.len() > MAX_BYTES {
+            return Err(unknown());
+        }
+        let file = std::fs::File::open(&path)?;
+        let opened = file.metadata()?;
+        if !same_auth_file(&before, &opened) {
+            return Err(unknown());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BYTES
+            || !same_auth_file(&before, &std::fs::symlink_metadata(&path)?)
+        {
+            return Err(unknown());
+        }
+        let revision = polaris_updater::sha256_hex(&bytes);
+        if sealed_revision.is_some_and(|expected| expected != revision) {
+            return Err(unknown());
+        }
+        // A sealed revision without SDK Bound is only an already-retired
+        // no-write candidate. Local PC retirement has no native sealed revision.
+        let require_unchanged = sealed_revision.is_some()
+            && matches!(
+                &provenance,
+                polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences
+            );
+        let projected =
+            polaris_mesh::tailscale_state::project_tailscale_auth_state(&bytes, provenance)
+                .map_err(|_| unknown())?;
+        if require_unchanged && (projected.changed || projected.bytes != bytes) {
+            return Err(unknown());
+        }
+        // Recheck the actual revision immediately before the existing atomic
+        // writer. The caller continuously owns the real TS gate and, on iOS,
+        // the captured action-generation/cancel locks across this commit.
+        let mut rechecked = Vec::new();
+        std::fs::File::open(&path)?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut rechecked)?;
+        if !same_auth_file(&before, &std::fs::symlink_metadata(&path)?)
+            || rechecked != bytes
+            || directory.canonicalize()? != target
+        {
+            return Err(unknown());
+        }
+        if projected.changed {
+            let text = std::str::from_utf8(&projected.bytes).map_err(|_| unknown())?;
+            durable_atomic_write(&path, text, &random_tmp_suffix()).map_err(|_| unknown())?;
+        }
+        Ok(())
+    }
+
+    /// PC/Android closure may find no FileStore at all. This is a scoped no-write
+    /// observation under the actual gate, never an SDK Bound or global NoOwner receipt.
+    pub(crate) fn tailscale_retire_pc_auth_under_gate(
+        &self,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
+    ) -> std::io::Result<()> {
+        self.login_registry
+            .assert_auth_state_available(id, gate, keep)
+            .map_err(std::io::Error::other)?;
+        let directory = self.tailscale_state_dir(id)?;
+        let config_root = self.config_dir.canonicalize()?;
+        for path in [self.config_dir.join("tailscale"), directory.clone()] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_dir()
+                        || metadata.file_type().is_symlink()
+                        || !path.canonicalize()?.starts_with(&config_root)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Tailscale state path escaped its configured root",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match std::fs::symlink_metadata(directory.join("tailscaled.state")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => self.tailscale_retire_auth_under_gate(
+                id,
+                gate,
+                keep,
+                polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences,
+                None,
+            ),
+        }
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn tailscale_retire_android_auth_under_gate(
+        &self,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+        node: &polaris_mesh::tailscale_state::retirement::TailscaleStoreRetirementNode,
+    ) -> std::io::Result<()> {
+        use polaris_mesh::tailscale_state::{
+            retirement::{TailscaleProfileState, TailscaleStateFileState, TailscaleWriterState},
+            AuthProjectionProvenance,
+        };
+        self.login_registry
+            .assert_auth_state_available(id, gate, Some(attempt))
+            .map_err(std::io::Error::other)?;
+        let directory = crate::runtime::tailscale_login_core::canonical_tailscale_claim_directory(
+            &self.tailscale_state_dir(id)?,
+        )
+        .map_err(std::io::Error::other)?;
+        if directory.to_str() != Some(node.state_directory.as_str())
+            || directory.join("tailscaled.state").to_str() != Some(node.state_file.as_str())
+        {
+            return Err(std::io::Error::other("profileBindingUnknown"));
+        }
+        if node.state_file_state == TailscaleStateFileState::Missing {
+            // A sealed Missing fact authorizes only no write. A newly present file
+            // must not fall through to a cached-profile or unsealed projection.
+            return match std::fs::symlink_metadata(&node.state_file) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(std::io::Error::other("stateRevisionChanged")),
+            };
+        }
+        if node.state_file_state != TailscaleStateFileState::Regular {
+            return Err(std::io::Error::other("profileBindingUnknown"));
+        }
+        if node.profile_state == TailscaleProfileState::Bound
+            && node.writer_state != TailscaleWriterState::SealedDrained
+        {
+            return Err(std::io::Error::other("profileBindingUnknown"));
+        }
+        let provenance = if node.profile_state == TailscaleProfileState::Bound {
+            AuthProjectionProvenance::BoundFingerprint(&node.profile_fingerprint)
+        } else {
+            AuthProjectionProvenance::CurrentFileReferences
+        };
+        self.tailscale_retire_auth_under_gate(
+            id,
+            gate,
+            Some(attempt),
+            provenance,
+            Some(&node.state_file_revision),
+        )
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn retire_tailscale_other_attempts_under_gate(
+        &self,
+        id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: &Arc<crate::runtime::tailscale_login_core::Attempt>,
+    ) -> Result<(), String> {
+        self.login_registry
+            .retire_other_attempts_under_state_gate(id, gate, keep)
+            .await
+    }
+
     /// warp 待注销队列路径（供待注销队列 actor 持久化）。
     #[cfg(test)]
     #[must_use]
@@ -622,6 +847,8 @@ impl MeshRuntime {
         proxy: &Arc<crate::runtime::proxy::ProxyRuntime>,
         saved: &serde_json::Value,
         identity_epoch: Option<String>,
+        candidate: &serde_json::Value,
+        action_generation: u64,
     ) -> StartLoginOutcome {
         self.login_registry
             .start_attempt_with_normal_main(
@@ -634,6 +861,8 @@ impl MeshRuntime {
                 proxy,
                 saved,
                 identity_epoch,
+                candidate,
+                action_generation,
             )
             .await
     }
@@ -685,6 +914,15 @@ impl MeshRuntime {
         self.login_registry.assert_main_claims_drained(gate)
     }
 
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    pub(crate) fn tailscale_main_scope_if_token(
+        &self,
+        token: &crate::runtime::tailscale_login_core::MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        self.login_registry.main_scope_if_token(token, gate)
+    }
+
     #[cfg(test)]
     pub(crate) fn poison_tailscale_main_claim_lock_for_test(&self) {
         self.login_registry.poison_main_claim_lock_for_test();
@@ -695,6 +933,9 @@ impl MeshRuntime {
         self.login_registry.main_owns(id, alive)
     }
 
+    // Compatibility fixture for the original guarded auth-only body. Production
+    // now also fences the original saved credential CAS in the entry below.
+    #[cfg(test)]
     pub async fn logout_tailscale_safely(
         &self,
         id: &str,
@@ -703,8 +944,74 @@ impl MeshRuntime {
     ) -> std::io::Result<bool> {
         self.login_registry
             .logout(id, main_alive, keep_attempt, |gate| {
-                self.tailscale_logout_under_gate(id, gate, main_alive())
+                self.tailscale_retire_auth_under_gate(
+                    id,
+                    gate,
+                    None,
+                    polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences,
+                    None,
+                )
             })
+            .await
+    }
+
+    pub(crate) async fn logout_tailscale_with_credentials(
+        &self,
+        id: &str,
+        proxy: &Arc<crate::runtime::proxy::ProxyRuntime>,
+        saved: &serde_json::Value,
+        generation: u64,
+        keep_attempt: Option<&str>,
+    ) -> std::io::Result<bool> {
+        #[cfg(target_os = "android")]
+        {
+            if keep_attempt.is_some() {
+                return Err(std::io::Error::other("Login request ownership changed"));
+            }
+            return self
+                .login_registry
+                .logout_with_android_store(id, proxy, saved, generation)
+                .await
+                .map(|()| true)
+                .map_err(std::io::Error::other);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _lease = proxy
+                .tailscale_action_lease()
+                .map_err(std::io::Error::other)?;
+            self.login_registry
+                .logout(
+                    id,
+                    &|| proxy.tailscale_writer_alive(),
+                    keep_attempt,
+                    |gate| {
+                        proxy
+                            .commit_tailscale_credential(saved, id, generation, None, |current| {
+                                self.tailscale_retire_pc_auth_under_gate(id, gate, None)
+                                    .map_err(|_| "stateRevisionChanged")?;
+                                crate::runtime::tailscale_login_core::park_saved_tailscale_key(
+                                    current, id,
+                                )
+                            })
+                            .map(|_| ())
+                            .map_err(std::io::Error::other)
+                    },
+                )
+                .await
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn logout_tailscale_with_normal_main(
+        &self,
+        id: &str,
+        proxy: &Arc<crate::runtime::proxy::ProxyRuntime>,
+        saved: &serde_json::Value,
+        generation: u64,
+    ) -> Result<(), (String, String)> {
+        self.login_registry
+            .logout_with_normal_main(id, proxy, saved, generation)
             .await
     }
 
@@ -719,6 +1026,16 @@ impl MeshRuntime {
     #[cfg(test)]
     pub(crate) fn login_registry_for_test(&self) -> &LoginCoreRegistry {
         &self.login_registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_login_registry_for_test(
+        config_dir: PathBuf,
+        registry: LoginCoreRegistry,
+    ) -> Self {
+        let mut runtime = Self::new(config_dir);
+        runtime.login_registry = registry;
+        runtime
     }
 
     // ── C5 mesh 出口路由生命周期腿（ProxyRuntime 核生命周期接线）───────────────────────────────

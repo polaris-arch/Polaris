@@ -14,9 +14,13 @@ import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
+# PacketTunnelProvider/TunnelLifecycle pins consume the finite source-only N freeze
+# 0180ce48c0a045c9610d47d64766ee059ccb8315eb192f02d0f868872cedc41c
+# and independent review 9eaec083963c1a86323177cbda07328d010b75bf180c912251f1799f7c126778.
+# Swift/SDK/ABI acceptance remains pending.
 CONSUMERS = {
-    'PacketTunnelProvider.swift': 'c122623edf2923984149314e531c74d8d109e64786b623daed2f6134d062527e',
-    'TunnelLifecycle.swift': 'cd8dac4cd1fdf9b1d2c52d856c29e179023886b364ea24c348d3a385c58b4210',
+    'PacketTunnelProvider.swift': 'ca4ec946df1673d2e562f6ea113256d01acadb473e9dee7dcf9f6f768c3f583b',
+    'TunnelLifecycle.swift': 'aec19390a438b4e2ea2ef46d2681473675d92a1aa112e5dfd416a0366b5810f9',
     'TunnelMonitorSession.swift': '8d20d4a9f2a4a170ef5d553f2e10679993d4236fd409d1d9b9b803c51cae1ed3',
     'TunnelPlatform.swift': '76d8d689e7a59c1fb89cb051cac08e140c0f1196831a700a5bb83541b8865d5b',
 }

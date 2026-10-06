@@ -1255,6 +1255,56 @@ enum ForceRestartSource {
     Selected { intent_generation: u64 },
 }
 
+#[cfg(target_os = "ios")]
+#[derive(Clone)]
+enum IosMainOrigin {
+    LocalStart(tauri_plugin_polaris_ios::StartSessionCustody),
+    Observed(tauri_plugin_polaris_ios::ObservedSessionReceipt),
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Clone)]
+struct IosMainCustody {
+    generation: u64,
+    origin: IosMainOrigin,
+    config_digest: String,
+    main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ready: Option<tauri_plugin_polaris_ios::ReadySessionReceipt>,
+    stopped: Option<Arc<tauri_plugin_polaris_ios::StoppedSessionReceipt>>,
+}
+
+#[cfg(target_os = "ios")]
+impl IosMainCustody {
+    fn request_id(&self) -> &str {
+        match &self.origin {
+            IosMainOrigin::LocalStart(start) => start.request_id(),
+            IosMainOrigin::Observed(observed) => observed.request_id(),
+        }
+    }
+    fn allows_successor(&self) -> bool {
+        self.main_token.is_none()
+            && (self.stopped.is_some()
+                || matches!(&self.origin, IosMainOrigin::LocalStart(start)
+                if start.no_store_terminal().is_some_and(|receipt| receipt.belongs_to(start))))
+    }
+    fn same_origin(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.config_digest == other.config_digest
+            && match (&self.origin, &other.origin) {
+                (IosMainOrigin::LocalStart(a), IosMainOrigin::LocalStart(b)) => {
+                    a.request_id() == b.request_id()
+                        && a.native_generation() == b.native_generation()
+                }
+                (IosMainOrigin::Observed(a), IosMainOrigin::Observed(b)) => {
+                    a.request_id() == b.request_id()
+                        && a.session_id() == b.session_id()
+                        && a.extension_generation() == b.extension_generation()
+                }
+                _ => false,
+            }
+    }
+}
+
 pub struct ProxyRuntime {
     config: Arc<ConfigManager>,
     /// 提权 helper（C6-5 接线）：TUN 模式经它起停 root/SYSTEM 受管核（见 [`should_start_via_helper`](startup::should_start_via_helper)）。
@@ -1271,7 +1321,7 @@ pub struct ProxyRuntime {
     normal_start: Mutex<prerequisite::NormalStarts>,
     ready_main: RwLock<Option<Arc<prerequisite::ReadyMainCore>>>,
     #[cfg(target_os = "ios")]
-    ios_ready_session: RwLock<Option<(u64, tauri_plugin_polaris_ios::ReadySessionReceipt)>>,
+    ios_ready_session: RwLock<Option<IosMainCustody>>,
     /// 生命周期单飞守卫（core-supervisor 既有状态机；起停竞态/世代/pending 全在其中）。
     gate: Arc<LifecycleGate>,
     /// Nonrecoverable authority for this runtime's reserved direct stops.

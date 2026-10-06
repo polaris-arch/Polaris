@@ -1,6 +1,6 @@
 import { validatedTailscaleAuthUrl } from './tailscale-auth-url';
 
-export type TailscaleLoginPhase = 'starting' | 'preparingConnection' | 'waitingForReady' | 'awaitingAuth' | 'mainCore' | 'authorized' | 'failed' | 'timedOut' | 'cancelled';
+export type TailscaleLoginPhase = 'starting' | 'stoppingConnection' | 'retiringIdentity' | 'savingCandidate' | 'startingConnection' | 'preparingConnection' | 'waitingForReady' | 'awaitingAuth' | 'mainCore' | 'authorized' | 'failed' | 'timedOut' | 'cancelled';
 
 export interface TailscaleLoginProgress {
   serverId: string;
@@ -24,7 +24,21 @@ export function progressForLoginRequest(
 
 export function loginAttemptActive(phase: TailscaleLoginPhase): boolean {
   return phase === 'starting' || phase === 'preparingConnection' || phase === 'waitingForReady'
+    || phase === 'stoppingConnection' || phase === 'retiringIdentity' || phase === 'savingCandidate' || phase === 'startingConnection'
     || phase === 'awaitingAuth' || phase === 'mainCore';
+}
+
+/** These phases precede the fresh main binding; they never claim authorization. */
+export function loginConnectionProgressKey(phase: TailscaleLoginPhase | undefined): string | undefined {
+  switch (phase) {
+    case 'stoppingConnection': return 'ts.stoppingConnection';
+    case 'retiringIdentity': return 'ts.retiringIdentity';
+    case 'savingCandidate': return 'ts.savingCandidate';
+    case 'startingConnection': return 'ts.startingConnection';
+    case 'preparingConnection': return 'prerequisite.preparingConnection';
+    case 'waitingForReady': return 'prerequisite.waitingForReady';
+    default: return undefined;
+  }
 }
 
 /** Late URL/terminal events from an old request cannot replace the current request. */
@@ -53,6 +67,11 @@ const REASON_KEYS: Record<string, string> = {
   statusSubscriptionFailed: 'ts.reasonStatusSubscription', statusStreamEnded: 'ts.reasonStatusSubscription',
   processExited: 'ts.reasonProcessExited', authorizationTimedOut: 'ts.reasonTimeout',
   mainCoreChanged: 'ts.reasonMainCoreChanged', mainCoreInUse: 'ts.reasonMainCoreInUse', stateQueryFailed: 'ts.reasonStateQuery',
+  nativeRetirementUnknown: 'ts.reasonIdentityRetirement', profileBindingUnknown: 'ts.reasonIdentityRetirement',
+  stateRevisionChanged: 'ts.reasonSessionChanged', candidateConfigurationChanged: 'ts.reasonConfigurationChanged',
+  retainedAuthKeyUnavailable: 'ts.reasonRetainedKeyUnavailable', retainedAuthKeyAuthorityChanged: 'ts.retainedAuthKeyAuthorityHint',
+  credentialRevisionChanged: 'ts.reasonCredentialChanged', invalidCredentialIntent: 'ts.reasonCredentialIntent',
+  credentialCommitUnknown: 'ts.reasonCredentialCommit',
   saveFailed: 'ts.reasonSave', configurationRefreshFailed: 'ts.reasonRefresh',
   tooManyLogins: 'ts.reasonTooManyLogins', invalidAuthUrl: 'ts.reasonInvalidAuthUrl',
 };

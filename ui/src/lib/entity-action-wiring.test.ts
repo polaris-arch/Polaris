@@ -23,7 +23,8 @@
  * # 扫描要跨行
  *
  * `void api.server\n  .delete(...)` 是本仓真实存在的写法（`NodesScreen` 两处）。按行的正则会漏掉它们
- * —— 漏掉的恰好是本轮唯一走 `revert` 的那条腿。故先归一空白再匹配。
+ * —— 漏掉的恰好是本轮唯一走 `revert` 的那条腿。现复用已有 TS parser 的 CallExpression，
+ * 跨行、泛型调用均保留，`ReturnType<typeof api.server.method>` 则只是类型引用。
  *
  * # 守的是形态不是措辞
  *
@@ -36,6 +37,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { ENTITY_ACTION_TABLE, isBypassedOp, stagedOnlyStrategyOf } from './staged-config';
+import * as ts from '@/test/ts-compiler';
 
 const SRC = fileURLToPath(new URL('..', import.meta.url));
 
@@ -59,6 +61,27 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
 
 /** `\s*` 两处不可省：本仓有 `void api.server` 换行再 `.delete(` 的写法。 */
 const CALL = /\bapi\s*\.\s*(server|rules|subscription)\s*\.\s*(\w+)/g;
+
+/** Count invocations, not `ReturnType<typeof api.server.method>` references. */
+function entityBackendCalls(fileName: string, source: string): string[] {
+  const sf = ts.parseSourceFile(fileName, source);
+  const calls: string[] = [];
+  const walk = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const method = node.expression;
+      const namespace = method.expression;
+      if (ts.isPropertyAccessExpression(namespace) && ts.isIdentifier(namespace.expression)
+        && namespace.expression.text === 'api' && ts.isIdentifier(namespace.name)
+        && ['server', 'rules', 'subscription'].includes(namespace.name.text)
+        && ts.isIdentifier(method.name)) {
+        calls.push(`api.${namespace.name.text}.${method.name.text}`);
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(sf);
+  return calls;
+}
 /** 「这个文件能渲染 staged-only 实体」——判据面的边界。 */
 // Extracted action owners are part of the same staged-only semantic surface even though
 // the screen passes their effective/disk projections as explicit inputs.
@@ -75,15 +98,18 @@ interface Call {
 }
 
 const CALLS: Call[] = [];
+const REFERENCED_METHODS = new Set<string>();
 let scannedFiles = 0;
 let effectiveFiles = 0;
 for (const p of sourceFiles(SRC)) {
   scannedFiles += 1;
-  const src = code(readFileSync(p, 'utf8'));
+  const raw = readFileSync(p, 'utf8');
+  const src = code(raw);
   if (!RENDERS_EFFECTIVE.test(src) && !EXTRACTED_OWNER_PATH.test(p)) continue;
   effectiveFiles += 1;
   const rel = p.slice(SRC.length).split(/[\\/]/).join('/');
-  for (const m of src.matchAll(CALL)) CALLS.push({ file: rel, callee: `api.${m[1]}.${m[2]}` });
+  for (const m of src.matchAll(CALL)) REFERENCED_METHODS.add(`${rel} | api.${m[1]}.${m[2]}`);
+  for (const callee of entityBackendCalls(p, raw)) CALLS.push({ file: rel, callee });
 }
 
 /**
@@ -337,9 +363,9 @@ const SITES: readonly ActionSite[] = [
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
     callee: 'api.server.tailscaleLogin',
-    count: 2,
+    count: 1,
     route: 'no-staged-only-id',
-    why: '仅取磁盘镜像或本次新建的 id：登录对象先保存再使用',
+    why: '仅取磁盘镜像或本次新建的 id：唯一 start 回调交提交计划的节点；非 iOS 先保存，iOS 交同一次后端事务，effective 只取名称。ReturnType 类型引用不是第二次调用',
   },
   {
     file: 'mobile/forms/TsLoginPanel.tsx',
@@ -687,6 +713,27 @@ const SITES: readonly ActionSite[] = [
 const key = (s: { file: string; callee: string }) => `${s.file} | ${s.callee}`;
 
 describe('守卫自检：扫到的确实是源码（防扫空 → 断言恒真）', () => {
+  it('真实调用集合仍覆盖原取材面的全部后端方法', () => {
+    expect([...new Set(CALLS.map(key))].sort()).toEqual([...REFERENCED_METHODS].sort());
+  });
+
+  it('ReturnType、注释与字符串不算调用，跨行和泛型实际 invoke 仍逐处计数', () => {
+    const typedOnly = 'let result: Awaited<ReturnType<typeof api.server.tailscaleLogin>> | undefined;';
+    expect(entityBackendCalls('entity-type-reference.ts', typedOnly)).toEqual([]);
+    const source = `${typedOnly}\n`
+      + '// api.server.tailscaleLogin(server);\n'
+      + 'const hint = "api.server.tailscaleLogin(server)";\n'
+      + 'void api.server\n  .tailscaleLogin(server, { attemptId });\n'
+      + 'void api.server.tailscaleLogin<Result>(server, { attemptId });\n'
+      + 'void api.rules.delete(rule.id);\n';
+    expect(entityBackendCalls('entity-real-invokes.ts', source)).toEqual([
+      'api.server.tailscaleLogin', 'api.server.tailscaleLogin', 'api.rules.delete',
+    ]);
+    expect(entityBackendCalls('entity-invoke-removed.ts', source.replace(
+      'void api.server\n  .tailscaleLogin(server, { attemptId });', '',
+    ))).toEqual(['api.server.tailscaleLogin', 'api.rules.delete']);
+  });
+
   it('测试文件被排除在扫描面外', () => {
     expect(sourceFiles(SRC).some((p) => /\.(test|spec)\.tsx?$/.test(p))).toBe(false);
   });

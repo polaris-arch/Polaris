@@ -1183,6 +1183,13 @@ impl ProxyRuntime {
         // Snapshot under normal_start before any desktop/check/Child/live lock.
         // This is the recorded final admission, not the watch's requested generation.
         let native_producer = self.admitted_native_producer(my_gen)?;
+        let request_attempt = self.normal_start_attempt(my_gen)?;
+        if request_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.cancelled())
+        {
+            return Err(StartError::from("cancelled".to_owned()));
+        }
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
         }
@@ -1738,21 +1745,69 @@ impl ProxyRuntime {
             } else if cfg!(target_os = "ios") {
                 #[cfg(target_os = "ios")]
                 {
-                    // Once submitted, failure/cancellation cannot prove no external writer.
-                    // Retain the 554 main reservation; NE cleanup remains CleanupUnknown.
-                    if self.gate.generation() != my_gen {
+                    let prepare = || {
+                        self.gate.with_current_generation(my_gen, |_live| {
+                            let mut slot = self.ios_ready_session.write().map_err(|_| {
+                                StartError::from("iOS main custody poisoned".to_owned())
+                            })?;
+                            if slot.as_ref().is_some_and(|owner| !owner.allows_successor()) {
+                                return Err(StartError::from("nativeRetirementUnknown".to_owned()));
+                            }
+                            let start =
+                                tauri_plugin_polaris_ios::prepare_start(&gate_config_json, my_gen)
+                                    .map_err(StartError::from)?;
+                            *slot = Some(super::IosMainCustody {
+                                generation: my_gen,
+                                origin: super::IosMainOrigin::LocalStart(start.clone()),
+                                config_digest: polaris_updater::sha256_hex(
+                                    gate_config_json.as_bytes(),
+                                ),
+                                main_token: main_claim_token.clone(),
+                                ready: None,
+                                stopped: None,
+                            });
+                            Ok(start)
+                        })
+                    };
+                    let prepared = match &request_attempt {
+                        Some(attempt) => attempt.while_active(prepare).flatten(),
+                        None => prepare(),
+                    };
+                    let Some(start) = prepared else {
                         return Ok(self.status());
-                    }
+                    };
+                    let start = start?;
+                    // Original native request, full main token/config and callback cell
+                    // are retained before the single native dispatcher can submit.
                     main_reservation.arm_external_start();
-                    match tauri_plugin_polaris_ios::start(&gate_config_json, my_gen).await {
+                    match tauri_plugin_polaris_ios::start_prepared(&start).await {
                         Ok(receipt) => {
                             self.gate.with_current_generation(my_gen, |_live| {
                                 if let Ok(mut ready) = self.ios_ready_session.write() {
-                                    *ready = Some((my_gen, receipt));
+                                    if let Some(owner) = ready
+                                        .as_mut()
+                                        .filter(|owner| owner.request_id() == start.request_id())
+                                    {
+                                        owner.ready = Some(receipt);
+                                    }
                                 }
                             });
                         }
                         Err(msg) => {
+                            if start
+                                .no_store_terminal()
+                                .is_some_and(|receipt| receipt.belongs_to(&start))
+                            {
+                                main_reservation.confirmed_no_external_writer();
+                                if let Ok(mut slot) = self.ios_ready_session.write() {
+                                    if let Some(owner) = slot
+                                        .as_mut()
+                                        .filter(|owner| owner.request_id() == start.request_id())
+                                    {
+                                        owner.main_token = None;
+                                    }
+                                }
+                            }
                             if self.gate.generation() != my_gen {
                                 return Ok(self.status());
                             }

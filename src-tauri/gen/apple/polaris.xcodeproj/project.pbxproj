@@ -247,7 +247,7 @@
 		A348EB7488810BE26EC5DF45 /* local_import_tests.rs */ = {isa = PBXFileReference; path = local_import_tests.rs; sourceTree = "<group>"; };
 		A3672FF51FA4473604608427 /* subscription_create.rs */ = {isa = PBXFileReference; path = subscription_create.rs; sourceTree = "<group>"; };
 		A40ED7778D6F11A2D3238AF7 /* TunnelPlatform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelPlatform.swift; sourceTree = "<group>"; };
-		A49EE178E5F4F9A1806DE8DD /* Libbox.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Libbox.xcframework; path = Frameworks/Libbox.xcframework; sourceTree = "<group>"; };
+		A49EE178E5F4F9A1806DE8DD /* Libbox.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = Libbox.xcframework; path = "$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"; sourceTree = "<absolute>"; };
 		A4C9446586F3A6BB9B5FB4EF /* system_proxy_live_guard.rs */ = {isa = PBXFileReference; path = system_proxy_live_guard.rs; sourceTree = "<group>"; };
 		A4E0F5CC2C6FA921EDEF61DE /* module_boundary.rs */ = {isa = PBXFileReference; path = module_boundary.rs; sourceTree = "<group>"; };
 		A6A1CBC0CC2B8DA8A2EB0FD5 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
@@ -2123,7 +2123,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "test -d \"$SRCROOT/Frameworks/Libbox.xcframework\" || { echo \"error: Run bash scripts/build-libbox-ios.sh before building iOS.\"; exit 1; }\npython3 \"$SRCROOT/../../../scripts/ios-libbox.py\" verify\n";
+			shellScript = "python3 \"$SRCROOT/../../../scripts/ios-libbox.py\" verify --component-for-link \\\n  --generation-root \"${POLARIS_LIBBOX_GENERATION_ROOT:?approved immutable Libbox generation required}\" \\\n  --output-fingerprint \"${POLARIS_LIBBOX_OUTPUT_FINGERPRINT:?approved component fingerprint required}\" \\\n  --receipt-sha256 \"${POLARIS_LIBBOX_RECEIPT_SHA256:?approved receipt SHA256 required}\" \\\n  --build-policy \"${POLARIS_LIBBOX_BUILD_POLICY:?approved M1 policy required}\" \\\n  --build-policy-sha256 \"${POLARIS_LIBBOX_BUILD_POLICY_SHA256:?approved M1 policy SHA256 required}\" \\\n  --tools \"${POLARIS_LIBBOX_TOOLS:?approved tools required}\" \\\n  --tools-sha256 \"${POLARIS_LIBBOX_TOOLS_SHA256:?approved tools SHA256 required}\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -2262,7 +2262,7 @@
 				ENABLE_BITCODE = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"\"Frameworks\"",
+					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -2286,7 +2286,7 @@
 				ENABLE_BITCODE = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
-					"\"Frameworks\"",
+					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (

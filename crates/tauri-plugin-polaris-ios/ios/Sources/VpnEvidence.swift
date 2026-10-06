@@ -53,9 +53,10 @@ final class VpnStartIntent {
     private(set) var revoked = false
     private var terminal = false
     private(set) var submittedIdentity: [String: Any]?
+    private(set) var submissionAttempted = false
     init(_ requestID: String) { self.requestID = requestID }
     var allowsContinuation: Bool { !revoked && !terminal }
-    func submitted(_ identity: [String: Any]) { submittedIdentity = identity }
+    func submitted(_ identity: [String: Any]) { submissionAttempted = true; submittedIdentity = identity }
     func revoke() { revoked = true }
     func mayStop(_ profile: [String: Any]?) -> Bool {
         guard let submittedIdentity else { return false }
@@ -65,6 +66,11 @@ final class VpnStartIntent {
         guard !terminal else { return false }
         terminal = true
         return true
+    }
+    func noStoreTerminal() -> [String: Any]? {
+        guard terminal, !submissionAttempted, submittedIdentity == nil else { return nil }
+        return ["contractVersion": "polaris-ios-native-no-store-v1", "requestID": requestID,
+                "startIntentFinished": true, "submissionAttempted": false, "storeConstruction": "NoStoreConstruction"]
     }
 }
 
@@ -90,7 +96,84 @@ func vpnLiveEvidence(profileIdentity: [String: Any]?, expectedIdentity: [String:
           report["runtimeStopped"] as? Bool == false,
           report["cleanupError"] == nil, report["lastError"] == nil,
           report["uncertainSettingsGeneration"] == nil else { return nil }
-    return vpnSessionEvidence(profileIdentity: profileIdentity, report: report)
+    var result = vpnSessionEvidence(profileIdentity: profileIdentity, report: report)
+    if let scope = vpnTailscaleStoreExport(report: report, configDigest: expectedIdentity["configDigest"] as? String, terminal: false) {
+        result["tailscaleStoreScope"] = scope
+    }
+    return result
+}
+
+private func vpnHex64(_ value: String) -> Bool {
+    value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+}
+
+/// Validate the complete original Go export, never a caller-made single-node proof.
+func vpnTailscaleStoreExport(report: [String: Any], configDigest: String?, terminal: Bool) -> [String: Any]? {
+    guard let configDigest, vpnHex64(configDigest), let raw = report["tailscaleStoreScope"] as? String,
+          raw.utf8.count <= 256 * 1024,
+          let value = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+          Set(value.keys) == Set(["contractVersion", "globalCleanupEvidence", "instances"]),
+          value["contractVersion"] as? String == "polaris-ts-auth-writer-retirement-v1",
+          value["globalCleanupEvidence"] as? String == "CleanupUnknown",
+          let instances = value["instances"] as? [[String: Any]], !instances.isEmpty else { return nil }
+    var nonces = Set<String>()
+    for instance in instances {
+        guard Set(instance.keys) == Set(["runNonce", "configDigest", "terminal", "censusComplete", "nodes"]),
+              let nonce = instance["runNonce"] as? String, vpnHex64(nonce), nonces.insert(nonce).inserted,
+              instance["configDigest"] as? String == configDigest,
+              let state = instance["terminal"] as? String, ["Unknown", "SealedDrained", "NoStoreConstruction"].contains(state),
+              let complete = instance["censusComplete"] as? Bool,
+              let nodes = instance["nodes"] as? [[String: Any]],
+              !terminal || (complete && state != "Unknown") else { return nil }
+        var tags = Set<String>(), directories = Set<String>()
+        var sealed = false
+        for node in nodes {
+            guard Set(node.keys) == Set(["tag", "stateDirectory", "stateFile", "writerState", "stateFileState", "stateFileRevision", "profileState", "profileFingerprint"]),
+                  let tag = node["tag"] as? String, !tag.isEmpty, tags.insert(tag).inserted,
+                  let directory = node["stateDirectory"] as? String, directory.hasPrefix("/"), directory != "/",
+                  !directory.contains("\0"), !directory.hasSuffix("/"), !directory.contains("//"),
+                  !directory.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }),
+                  directories.insert(directory).inserted,
+                  node["stateFile"] as? String == directory + "/tailscaled.state",
+                  let writer = node["writerState"] as? String, ["Unknown", "SealedDrained", "NoStoreConstruction"].contains(writer),
+                  let file = node["stateFileState"] as? String, ["Unknown", "Missing", "Regular"].contains(file),
+                  let revision = node["stateFileRevision"] as? String,
+                  (file == "Regular" ? vpnHex64(revision) : revision.isEmpty),
+                  let profile = node["profileState"] as? String, ["Unknown", "None", "Bound"].contains(profile),
+                  let fingerprint = node["profileFingerprint"] as? String,
+                  (profile == "Bound" ? (vpnHex64(fingerprint) && file == "Regular") : fingerprint.isEmpty),
+                  !terminal || writer != "Unknown" else { return nil }
+            sealed = sealed || writer == "SealedDrained"
+        }
+        if terminal && state != (sealed ? "SealedDrained" : "NoStoreConstruction") { return nil }
+    }
+    return value
+}
+
+/// Only a fresh deferred prepareStop response can carry this field. File snapshots
+/// continue to use vpnSessionEvidence and cannot manufacture scoped retirement.
+func vpnRetirementEvidence(profileIdentity: [String: Any]?, expectedIdentity: [String: Any],
+                           observation: [String: Any], nonce: String, stopRequestID: String,
+                           expectedGeneration: UInt64? = nil) -> [String: Any]? {
+    guard !nonce.isEmpty, !stopRequestID.isEmpty, vpnIdentityMatches(expectedIdentity, profileIdentity),
+          observation["observationNonce"] as? String == nonce,
+          let report = observation["report"] as? [String: Any],
+          vpnIdentityMatches(expectedIdentity, report["identity"] as? [String: Any]),
+          report["operationRequestID"] as? String == stopRequestID,
+          report["lifecycle"] as? String == "stopped", report["runtimeStopped"] as? Bool == true,
+          report["cleanupError"] == nil, report["lastError"] == nil, report["uncertainSettingsGeneration"] == nil,
+          let source = report["stopSourceGeneration"] as? NSNumber, source.uint64Value > 0, source.uint64Value < UInt64.max,
+          let stopped = report["generation"] as? NSNumber, stopped.uint64Value == source.uint64Value + 1,
+          expectedGeneration == nil || expectedGeneration == source.uint64Value,
+          let export = vpnTailscaleStoreExport(report: report, configDigest: expectedIdentity["configDigest"] as? String, terminal: true)
+    else { return nil }
+    var result = vpnSessionEvidence(profileIdentity: profileIdentity, report: report, stopRequestID: stopRequestID)
+    result["tailscaleStoreRetirement"] = ["contractVersion": "polaris-ios-ts-store-retirement-v1",
+        "sessionID": expectedIdentity["sessionID"]!, "startRequestID": expectedIdentity["requestID"]!,
+        "configDigest": expectedIdentity["configDigest"]!, "sourceExtensionGeneration": source,
+        "stopExtensionGeneration": stopped, "stopRequestID": stopRequestID, "observationNonce": nonce,
+        "globalCleanupEvidence": "CleanupUnknown", "storeRetirement": export]
+    return result
 }
 
 /// Only explicit system error receipts classify a denial. A generic NE save

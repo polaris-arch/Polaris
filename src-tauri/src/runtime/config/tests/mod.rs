@@ -3030,3 +3030,232 @@ fn deferred_icon_delete_cancels_when_a_new_id_reuses_the_same_sanitized_path() {
     assert_eq!(calls, 0, "同一落盘 stem 已被新实体复用时不得删图标");
     assert_eq!(summary.cancelled, 1);
 }
+
+fn credential_manager() -> (TestDir, ConfigManager, Value) {
+    let directory = temp_dir("credential-retention");
+    let manager = ConfigManager::new(directory.clone());
+    let mut config = manager.current().unwrap();
+    config["servers"] = serde_json::json!([
+        {"id":"key-node","name":"Key Node","protocol":"tailscale",
+         "tailscaleSettings":{"authKey":"credential-original-fixture","sourceTag":"original-tag","unknown":"keep"}},
+        {"id":"other-node","name":"Other Node","protocol":"tailscale",
+         "tailscaleSettings":{"authKey":"other-credential-fixture"}}
+    ]);
+    manager.save_full(&config).unwrap();
+    let saved = manager.current().unwrap();
+    (directory, manager, saved)
+}
+
+#[test]
+fn ordinary_save_cannot_revive_parked_key_and_preserves_new_inactive_input() {
+    let (_directory, manager, active) = credential_manager();
+    let (_, parked) = manager
+        .update_tailscale_credential(&active, "key-node", |current| {
+            crate::runtime::tailscale_login_core::park_saved_tailscale_key(current, "key-node")
+                .unwrap();
+            Decision::Write(())
+        })
+        .unwrap();
+    let parked = parked.unwrap();
+    let mut stale = active;
+    stale["servers"][0]["name"] = serde_json::json!("Edited");
+    manager.save_full(&stale).unwrap();
+    let saved = manager.current().unwrap();
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["retainedAuthKey"],
+        parked["servers"][0]["tailscaleSettings"]["retainedAuthKey"]
+    );
+    let mut edit = saved.clone();
+    edit["servers"][0]["tailscaleSettings"]["authKey"] = serde_json::json!("new-manual-fixture");
+    manager.save_full(&edit).unwrap();
+    let saved = manager.current().unwrap();
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "new-manual-fixture"
+    );
+    assert_eq!(saved["servers"][1], parked["servers"][1]);
+    let mut no_key = saved.clone();
+    no_key["servers"][0]["tailscaleSettings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("retainedAuthKey");
+    assert_eq!(
+        {
+            manager.save_full(&no_key).unwrap();
+            manager.current().unwrap()["servers"][0].clone()
+        },
+        saved["servers"][0]
+    );
+}
+
+#[test]
+fn explicit_credential_clear_consumes_cas_and_stale_failure_writes_nothing() {
+    use polaris_config_engine::user_config::effective_view::tailscale_credential_revision;
+    let (directory, manager, saved) = credential_manager();
+    let before = std::fs::read(directory.join("config.json")).unwrap();
+    let mut stale = saved.clone();
+    stale["logLevel"] = serde_json::json!("debug");
+    stale["servers"][0]["tailscaleCredentialIntent"] =
+        serde_json::json!({"action":"clear","expectedCredentialRevision":"stale"});
+    assert!(manager.save_full(&stale).is_err());
+    assert_eq!(
+        std::fs::read(directory.join("config.json")).unwrap(),
+        before
+    );
+    assert_eq!(manager.current().unwrap(), saved);
+    let mut clear = saved.clone();
+    clear["servers"][0]["tailscaleCredentialIntent"] = serde_json::json!({"action":"clear",
+        "expectedCredentialRevision":tailscale_credential_revision(&saved["servers"][0]).unwrap()});
+    manager.save_full(&clear).unwrap();
+    let saved = manager.current().unwrap();
+    assert!(saved["servers"][0]
+        .get("tailscaleCredentialIntent")
+        .is_none());
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKey")
+        .is_none());
+    assert_eq!(saved["servers"][1], clear["servers"][1]);
+}
+
+#[test]
+fn ordinary_actual_issuer_change_parks_legacy_key_at_original_authority() {
+    let (_directory, manager, original) = credential_manager();
+    let mut edit = original.clone();
+    edit["servers"][0]["tailscaleSettings"]["controlUrl"] =
+        serde_json::json!("https://new-issuer.invalid/path");
+    edit["servers"][0]["tailscaleSettings"]["authKey"] =
+        serde_json::json!("different-incoming-fixture");
+    manager.save_full(&edit).unwrap();
+    let saved = manager.current().unwrap();
+    let settings = &saved["servers"][0]["tailscaleSettings"];
+    assert!(settings.get("authKey").is_none());
+    assert_eq!(
+        settings["retainedAuthKey"]["authKey"],
+        "credential-original-fixture"
+    );
+    assert_eq!(
+        settings["retainedAuthKey"]["controlAuthority"],
+        "https://controlplane.tailscale.com"
+    );
+    assert_eq!(settings["unknown"], "keep");
+    assert_eq!(saved["servers"][1], original["servers"][1]);
+}
+
+#[test]
+fn removing_all_nodes_drops_owned_credentials_without_orphan_or_secret_journal() {
+    let (directory, manager, saved) = credential_manager();
+    let (_, parked) = manager
+        .update_tailscale_credential(&saved, "key-node", |current| {
+            crate::runtime::tailscale_login_core::park_saved_tailscale_key(current, "key-node")
+                .unwrap();
+            Decision::Write(())
+        })
+        .unwrap();
+    let parked = parked.unwrap();
+    let mut removed = parked.clone();
+    removed["servers"] = serde_json::json!([]);
+    manager
+        .save_full_deferred_cleanup(&parked, &removed)
+        .unwrap();
+    let result = manager.current().unwrap();
+    assert_eq!(result["servers"], serde_json::json!([]));
+    let bytes = std::fs::read_to_string(directory.join("config.json")).unwrap();
+    assert!(!bytes.contains("credential-original-fixture"));
+    assert!(!bytes.contains("other-credential-fixture"));
+    assert!(!bytes.contains("retainedAuthKey"));
+    let journal = std::fs::read_to_string(directory.join(DEFERRED_DELETIONS_FILE)).unwrap();
+    assert!(journal.contains("key-node"));
+    assert!(journal.contains("other-node"));
+    assert!(!journal.contains("credential-original-fixture"));
+    assert!(!journal.contains("other-credential-fixture"));
+    assert!(!journal.contains("retainedAuthKey"));
+    assert!(!journal.contains("authKey"));
+}
+
+#[test]
+fn credential_omission_and_null_do_not_clear_and_new_backup_id_is_not_old_id_locked() {
+    let (_directory, manager, original) = credential_manager();
+    let mut omitted = original.clone();
+    omitted["servers"][0]["tailscaleSettings"] = Value::Null;
+    manager.save_full(&omitted).unwrap();
+    let actual = manager.current().unwrap();
+    assert_eq!(
+        actual["servers"][0]["tailscaleSettings"]["authKey"],
+        "credential-original-fixture"
+    );
+    assert_eq!(
+        actual["servers"][0]["tailscaleSettings"]["sourceTag"],
+        original["servers"][0]["tailscaleSettings"]["sourceTag"]
+    );
+    let (_, parked) = manager
+        .update_tailscale_credential(&actual, "key-node", |current| {
+            crate::runtime::tailscale_login_core::park_saved_tailscale_key(current, "key-node")
+                .unwrap();
+            Decision::Write(())
+        })
+        .unwrap();
+    let parked = parked.unwrap();
+    let mut imported = parked.clone();
+    imported["servers"][0]["id"] = serde_json::json!("new-backup-node");
+    manager.save_full(&imported).unwrap();
+    let actual = manager.current().unwrap();
+    assert_eq!(actual["servers"][0]["id"], "new-backup-node");
+    assert_eq!(
+        actual["servers"][0]["tailscaleSettings"]["retainedAuthKey"],
+        parked["servers"][0]["tailscaleSettings"]["retainedAuthKey"]
+    );
+    assert!(actual["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|node| node["id"] != "key-node"));
+}
+
+#[test]
+fn changing_original_tailscale_protocol_removes_owned_credentials_without_resurrection() {
+    let (directory, manager, saved) = credential_manager();
+    let (_, parked) = manager
+        .update_tailscale_credential(&saved, "key-node", |current| {
+            crate::runtime::tailscale_login_core::park_saved_tailscale_key(current, "key-node")
+                .unwrap();
+            Decision::Write(())
+        })
+        .unwrap();
+    let mut changed = parked.unwrap();
+    changed["servers"][0]["protocol"] = serde_json::json!("socks");
+    changed["servers"][0]["address"] = serde_json::json!("127.0.0.1");
+    changed["servers"][0]["port"] = serde_json::json!(443);
+    changed["servers"][0]["tailscaleSettings"]["authKey"] = serde_json::json!("stale-protocol-key");
+    manager.save_full(&changed).unwrap();
+    let non_ts = manager.current().unwrap();
+    assert!(non_ts["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(non_ts["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKey")
+        .is_none());
+    assert_eq!(non_ts["servers"][0]["tailscaleSettings"]["unknown"], "keep");
+    assert_eq!(non_ts["servers"][1], changed["servers"][1]);
+    let raw = std::fs::read_to_string(directory.join("config.json")).unwrap();
+    assert!(!raw.contains("credential-original-fixture"));
+    assert!(!raw.contains("stale-protocol-key"));
+    let mut back_to_ts = non_ts;
+    back_to_ts["servers"][0]["protocol"] = serde_json::json!("tailscale");
+    manager.save_full(&back_to_ts).unwrap();
+    let actual = manager.current().unwrap();
+    assert!(actual["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(actual["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKey")
+        .is_none());
+}

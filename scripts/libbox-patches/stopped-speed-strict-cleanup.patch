@@ -182,29 +182,111 @@ index 0000000..167565e
 +		t.Fatalf("Close() = %v, want service failure", err)
 +	}
 +}
+diff --git a/adapter/tailscale_state_store.go b/adapter/tailscale_state_store.go
+new file mode 100644
+index 0000000..3a98d11
+--- /dev/null
++++ b/adapter/tailscale_state_store.go
+@@ -0,0 +1,71 @@
++package adapter
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"time"
++)
++
++// TailscaleStoreRunBinding is installed by the original daemon Instance before
++// box construction. It is not a caller-supplied native disposal certificate.
++type TailscaleStoreRunBinding struct {
++	RunNonce     string
++	ConfigDigest string
++}
++
++// TailscaleStoreNode reports only the original endpoint's StateStore writer.
++// No keys, profile preferences, auth key or authorization URL are exported.
++type TailscaleStoreNode struct {
++	Tag                string `json:"tag"`
++	StateDirectory     string `json:"stateDirectory"`
++	StateFile          string `json:"stateFile"`
++	WriterState        string `json:"writerState"`
++	StateFileState     string `json:"stateFileState"`
++	StateFileRevision  string `json:"stateFileRevision"`
++	ProfileState       string `json:"profileState"`
++	ProfileFingerprint string `json:"profileFingerprint"`
++	RunNonce           string `json:"-"`
++	ConfigDigest       string `json:"-"`
++}
++
++type TailscaleStateStoreOwner interface {
++	TailscaleStateStoreScope() TailscaleStoreNode
++	RetireTailscaleStateStore(deadline time.Time) TailscaleStoreNode
++}
++
++// TailscaleStoreConstructionObserver belongs to one original validation call.
++// Registration happens before the guard admits any delegate/read/write. A false
++// result permanently seals that same guard before constructor handoff.
++type TailscaleStoreConstructionObserver struct {
++	Observe func(TailscaleStoreNode, func(time.Time) TailscaleStoreNode) bool
++}
++
++// CanonicalTailscaleStateDirectory resolves existing parents without creating
++// the lazy FileStore directory. Constructor and validation use the same body.
++func CanonicalTailscaleStateDirectory(path string) (string, error) {
++	absolute, err := filepath.Abs(path)
++	if err != nil {
++		return "", err
++	}
++	remaining := []string{}
++	parent := absolute
++	for {
++		canonical, err := filepath.EvalSymlinks(parent)
++		if err == nil {
++			for i := len(remaining) - 1; i >= 0; i-- {
++				canonical = filepath.Join(canonical, remaining[i])
++			}
++			return canonical, nil
++		}
++		if !errors.Is(err, os.ErrNotExist) {
++			return "", err
++		}
++		next := filepath.Dir(parent)
++		if next == parent {
++			return "", err
++		}
++		remaining = append(remaining, filepath.Base(parent))
++		parent = next
++	}
++}
 diff --git a/box.go b/box.go
-index f11c96f..13e86d6 100644
+index f11c96f..7fce121 100644
 --- a/box.go
 +++ b/box.go
-@@ -7,6 +7,7 @@ import (
+@@ -7,6 +7,8 @@ import (
  	"net/http"
  	"os"
  	"runtime/debug"
++	"sync"
 +	"sync/atomic"
  	"time"
  
  	"github.com/sagernet/sing-box/adapter"
-@@ -64,6 +65,9 @@ type Box struct {
+@@ -64,6 +66,13 @@ type Box struct {
  	httpClientService   adapter.LifecycleService
  	internalService     []adapter.LifecycleService
  	done                chan struct{}
++	tsStoreMu           sync.Mutex
++	tsStores            []adapter.Endpoint
++	tsCaptured          bool
++	tsRetirement        []adapter.TailscaleStoreNode
 +	closeStarted        atomic.Bool
 +	closeFinished       chan struct{}
 +	closeResult         error
  }
  
  type Options struct {
-@@ -490,6 +494,7 @@ func New(options Options) (*Box, error) {
+@@ -490,6 +499,7 @@ func New(options Options) (*Box, error) {
  		logger:              logFactory.Logger(),
  		internalService:     internalServices,
  		done:                make(chan struct{}),
@@ -212,7 +294,7 @@ index f11c96f..13e86d6 100644
  	}, nil
  }
  
-@@ -608,12 +613,32 @@ func (s *Box) start() error {
+@@ -608,12 +618,33 @@ func (s *Box) start() error {
  }
  
  func (s *Box) Close() error {
@@ -240,6 +322,7 @@ index f11c96f..13e86d6 100644
 +func (s *Box) finishClose() error {
 +	s.closeResult = E.New("box close did not complete")
 +	defer close(s.closeFinished)
++	s.retireTailscaleStateStores()
 +	s.closeResult = s.close()
 +	return s.closeResult
 +}
@@ -338,8 +421,169 @@ index 0000000..8d2c529
 +		t.Fatal(err)
 +	}
 +}
+diff --git a/box_tailscale_state_store.go b/box_tailscale_state_store.go
+new file mode 100644
+index 0000000..6a69f6b
+--- /dev/null
++++ b/box_tailscale_state_store.go
+@@ -0,0 +1,77 @@
++package box
++
++import (
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"time"
++)
++
++// Capture original final endpoints before manager Close/DisposeConstruction
++// drops its list. The snapshot is part of this Box, not a separate registry.
++func (s *Box) CaptureTailscaleStateStores() []adapter.Endpoint {
++	s.tsStoreMu.Lock()
++	defer s.tsStoreMu.Unlock()
++	if !s.tsCaptured {
++		if s.endpoint != nil {
++			for _, endpoint := range s.endpoint.Endpoints() {
++				if endpoint.Type() == C.TypeTailscale {
++					s.tsStores = append(s.tsStores, endpoint)
++				}
++			}
++		}
++		s.tsCaptured = true
++	}
++	return append([]adapter.Endpoint(nil), s.tsStores...)
++}
++func (s *Box) TailscaleStateStoreScopes() []adapter.TailscaleStoreNode {
++	endpoints := s.CaptureTailscaleStateStores()
++	nodes := make([]adapter.TailscaleStoreNode, 0, len(endpoints))
++	for _, endpoint := range endpoints {
++		node := adapter.TailscaleStoreNode{Tag: endpoint.Tag(), WriterState: "Unknown", StateFileState: "Unknown", ProfileState: "Unknown"}
++		if owner, ok := endpoint.(adapter.TailscaleStateStoreOwner); ok {
++			node = owner.TailscaleStateStoreScope()
++		}
++		nodes = append(nodes, node)
++	}
++	return nodes
++}
++
++func (s *Box) retireTailscaleStateStores() {
++	endpoints := s.CaptureTailscaleStateStores()
++	// A newly inserted TS endpoint is sealed as well, but its extra entry makes
++	// the original daemon census incomplete rather than silently losing it.
++	if s.endpoint != nil {
++		for _, current := range s.endpoint.Endpoints() {
++			if current.Type() != C.TypeTailscale {
++				continue
++			}
++			found := false
++			for _, original := range endpoints {
++				if original == current {
++					found = true
++					break
++				}
++			}
++			if !found {
++				endpoints = append(endpoints, current)
++			}
++		}
++	}
++	deadline := time.Now().Add(5 * time.Second)
++	nodes := make([]adapter.TailscaleStoreNode, 0, len(endpoints))
++	for _, endpoint := range endpoints {
++		node := adapter.TailscaleStoreNode{Tag: endpoint.Tag(), WriterState: "Unknown", StateFileState: "Unknown", ProfileState: "Unknown"}
++		if owner, ok := endpoint.(adapter.TailscaleStateStoreOwner); ok {
++			node = owner.RetireTailscaleStateStore(deadline)
++		}
++		nodes = append(nodes, node)
++	}
++	s.tsStoreMu.Lock()
++	s.tsRetirement = nodes
++	s.tsStoreMu.Unlock()
++}
++func (s *Box) TailscaleStoreRetirement() []adapter.TailscaleStoreNode {
++	s.tsStoreMu.Lock()
++	defer s.tsStoreMu.Unlock()
++	return append([]adapter.TailscaleStoreNode(nil), s.tsRetirement...)
++}
+diff --git a/box_tailscale_state_store_test.go b/box_tailscale_state_store_test.go
+new file mode 100644
+index 0000000..cae20fc
+--- /dev/null
++++ b/box_tailscale_state_store_test.go
+@@ -0,0 +1,72 @@
++package box
++
++import (
++	"context"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"testing"
++	"time"
++)
++
++type retirementEndpoint struct {
++	adapter.Endpoint
++	tag     string
++	retired int
++}
++
++func (*retirementEndpoint) Type() string               { return C.TypeTailscale }
++func (e *retirementEndpoint) Tag() string              { return e.tag }
++func (*retirementEndpoint) DisposeConstruction() error { return nil }
++func (e *retirementEndpoint) TailscaleStateStoreScope() adapter.TailscaleStoreNode {
++	return adapter.TailscaleStoreNode{Tag: e.tag, StateFile: "/original/" + e.tag + "/tailscaled.state", WriterState: "Unknown"}
++}
++func (e *retirementEndpoint) RetireTailscaleStateStore(time.Time) adapter.TailscaleStoreNode {
++	e.retired++
++	node := e.TailscaleStateStoreScope()
++	node.WriterState = "NoStoreConstruction"
++	return node
++}
++func TestTailscaleStoreCensusRetainsOriginalAndSealsLateEndpoint(t *testing.T) {
++	logger := log.NewNOPFactory().Logger()
++	registry := endpoint.NewRegistry()
++	created := map[string]*retirementEndpoint{}
++	endpoint.Register[struct{}](registry, C.TypeTailscale, func(_ context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Endpoint, error) {
++		e := &retirementEndpoint{tag: tag}
++		created[tag] = e
++		return e, nil
++	})
++	manager := endpoint.NewManager(logger, registry)
++	if err := manager.Create(context.Background(), nil, logger, "original", C.TypeTailscale, &struct{}{}); err != nil {
++		t.Fatal(err)
++	}
++	original := created["original"]
++	box := &Box{endpoint: manager}
++	scopes := box.TailscaleStateStoreScopes()
++	if len(scopes) != 1 || scopes[0].Tag != "original" || original.retired != 0 {
++		t.Fatal("readonly capture retired or lost original")
++	}
++	if err := manager.Remove("original"); err != nil {
++		t.Fatal(err)
++	}
++	if err := manager.Create(context.Background(), nil, logger, "replacement", C.TypeTailscale, &struct{}{}); err != nil {
++		t.Fatal(err)
++	}
++	replacement := created["replacement"]
++	box.retireTailscaleStateStores()
++	if original.retired != 1 || replacement.retired != 1 {
++		t.Fatal("original or late writer escaped sealing")
++	}
++	if err := manager.Close(); err != nil {
++		t.Fatal(err)
++	}
++	nodes := box.TailscaleStoreRetirement()
++	if len(nodes) != 2 || nodes[0].Tag != "original" || nodes[1].Tag != "replacement" {
++		t.Fatalf("final census omitted an original writer: %+v", nodes)
++	}
++	nodes[0].WriterState = "mutated"
++	if box.TailscaleStoreRetirement()[0].WriterState != "NoStoreConstruction" {
++		t.Fatal("caller changed immutable snapshot")
++	}
++}
 diff --git a/daemon/instance.go b/daemon/instance.go
-index c55e4ae..4406279 100644
+index c55e4ae..4ff0bb5 100644
 --- a/daemon/instance.go
 +++ b/daemon/instance.go
 @@ -3,6 +3,8 @@ package daemon
@@ -351,25 +595,61 @@ index c55e4ae..4406279 100644
  
  	"github.com/sagernet/sing-box"
  	"github.com/sagernet/sing-box/adapter"
-@@ -37,6 +39,9 @@ type Instance struct {
+@@ -37,6 +39,10 @@ type Instance struct {
  	outboundManager       adapter.OutboundManager
  	endpointManager       adapter.EndpointManager
  	logFactory            log.Factory
++	tailscaleRetirement   *tailscaleRetirementRun
 +	closeStarted          atomic.Bool
 +	closeFinished         chan struct{}
 +	closeResult           error
  }
  
  func (s *StartedService) CheckConfig(ctx context.Context, configContent string) error {
-@@ -123,6 +128,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+@@ -117,13 +123,32 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ 			})
+ 		}
+ 	}
++	if len(s.tailscaleRetirementRuns) >= maxTailscaleRetirementRuns {
++		cancel()
++		return nil, E.New("Tailscale retirement census capacity reached")
++	}
++	retirement, err := newTailscaleRetirementRun(profileContent, options)
++	if err != nil {
++		cancel()
++		return nil, err
++	}
++	s.tailscaleRetirementRuns = append(s.tailscaleRetirementRuns, retirement)
++	ctx = service.ContextWithPtr(ctx, &retirement.binding)
+ 	urlTestHistoryStorage := urltest.NewHistoryStorage()
+ 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
+ 	i := &Instance{
  		ctx:                   ctx,
  		cancel:                cancel,
  		urlTestHistoryStorage: urlTestHistoryStorage,
 +		closeFinished:         make(chan struct{}),
++		tailscaleRetirement:   retirement,
  	}
++	constructed := false
++	defer func() {
++		if !constructed {
++			retirement.freeze(nil, false)
++		}
++	}()
  	boxInstance, err := box.New(box.Options{
  		Context:           ctx,
-@@ -152,6 +158,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ 		Options:           options,
+@@ -133,6 +158,9 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ 		cancel()
+ 		return nil, err
+ 	}
++	constructed = true
++	boxInstance.CaptureTailscaleStateStores()
++	retirement.capture(boxInstance.TailscaleStateStoreScopes())
+ 	i.instance = boxInstance
+ 	i.connectionManager = service.FromContext[adapter.ConnectionManager](ctx)
+ 	i.clashMode = service.PtrFromContext[clashmode.Manager](ctx)
+@@ -152,6 +180,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
  func attachInstance(ctx context.Context) *Instance {
  	return &Instance{
  		ctx:                   ctx,
@@ -377,7 +657,7 @@ index c55e4ae..4406279 100644
  		connectionManager:     service.FromContext[adapter.ConnectionManager](ctx),
  		clashMode:             service.PtrFromContext[clashmode.Manager](ctx),
  		trafficManager:        service.PtrFromContext[trafficcontrol.Manager](ctx),
-@@ -169,13 +176,37 @@ func (i *Instance) Start() error {
+@@ -169,13 +198,40 @@ func (i *Instance) Start() error {
  }
  
  func (i *Instance) Close() error {
@@ -415,11 +695,14 @@ index c55e4ae..4406279 100644
 +		i.urlTestHistoryStorage.Close()
 +	}
 +	i.closeResult = i.instance.CloseWithResult()
++	if i.tailscaleRetirement != nil {
++		i.tailscaleRetirement.freeze(i.instance.TailscaleStoreRetirement(), true)
++	}
  }
  
  func (i *Instance) registerPowerReport(ctx context.Context, reloading bool) {
 diff --git a/daemon/started_service.go b/daemon/started_service.go
-index 13651ed..6255026 100644
+index 13651ed..4e997a3 100644
 --- a/daemon/started_service.go
 +++ b/daemon/started_service.go
 @@ -22,6 +22,7 @@ import (
@@ -430,17 +713,18 @@ index 13651ed..6255026 100644
  	"github.com/sagernet/sing/common/memory"
  	N "github.com/sagernet/sing/common/network"
  	"github.com/sagernet/sing/common/observable"
-@@ -60,6 +61,9 @@ type StartedService struct {
+@@ -60,6 +61,10 @@ type StartedService struct {
  	lifecycleAccess         sync.Mutex
  	serviceAccess           sync.RWMutex
  	closed                  bool
 +	strictCleanup           bool
 +	shutdownRequested       bool
-+	cleanupErr              error // protected by lifecycleAccess; sticky for strict transient hosts
++	cleanupErr              error                     // protected by lifecycleAccess; sticky for strict transient hosts
++	tailscaleRetirementRuns []*tailscaleRetirementRun // original instances, protected by lifecycleAccess
  	startInterrupted        bool
  	serviceStatus           *ServiceStatus
  	serviceStatusSubscriber *observable.Subscriber[*ServiceStatus]
-@@ -83,6 +87,7 @@ type ServiceOptions struct {
+@@ -83,6 +88,7 @@ type ServiceOptions struct {
  	// Platform           adapter.PlatformInterface
  	Handler           PlatformHandler
  	KeepDefaultLogger bool
@@ -448,7 +732,7 @@ index 13651ed..6255026 100644
  	Debug             bool
  	LogMaxLines       int
  	OOMKillerEnabled  bool
-@@ -101,6 +106,7 @@ func NewStartedService(options ServiceOptions) *StartedService {
+@@ -101,6 +107,7 @@ func NewStartedService(options ServiceOptions) *StartedService {
  		// platform:                options.Platform,
  		handler:           options.Handler,
  		keepDefaultLogger: options.KeepDefaultLogger,
@@ -456,7 +740,7 @@ index 13651ed..6255026 100644
  		debug:             options.Debug,
  		logLines:          logRing{maxLines: options.LogMaxLines},
  		oomKillerEnabled:  options.OOMKillerEnabled,
-@@ -250,12 +256,47 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
+@@ -250,12 +257,47 @@ func (s *StartedService) followInstance(ctx context.Context, run func(ctx contex
  	}
  }
  
@@ -505,7 +789,7 @@ index 13651ed..6255026 100644
  		s.serviceAccess.Unlock()
  		return os.ErrClosed
  	}
-@@ -269,8 +310,14 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
+@@ -269,8 +311,14 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
  			oomRecorder.BeginReload()
  			defer oomRecorder.EndReload()
  		}
@@ -521,7 +805,7 @@ index 13651ed..6255026 100644
  		s.serviceAccess.Lock()
  	}
  	s.startInterrupted = false
-@@ -299,16 +346,24 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
+@@ -299,16 +347,24 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
  		s.startInterrupted = false
  		s.instance = nil
  		s.serviceAccess.Unlock()
@@ -548,7 +832,7 @@ index 13651ed..6255026 100644
  		return err
  	}
  	s.startedAt = time.Now()
-@@ -330,6 +385,13 @@ func (s *StartedService) Close() {
+@@ -330,6 +386,13 @@ func (s *StartedService) Close() {
  }
  
  func (s *StartedService) CloseService() error {
@@ -562,7 +846,7 @@ index 13651ed..6255026 100644
  	s.interruptStart()
  	s.lifecycleAccess.Lock()
  	defer s.lifecycleAccess.Unlock()
-@@ -337,19 +399,25 @@ func (s *StartedService) CloseService() error {
+@@ -337,19 +400,25 @@ func (s *StartedService) CloseService() error {
  	instance := s.instance
  	if instance == nil && s.serviceStatus.Status != ServiceStatus_STARTING && s.serviceStatus.Status != ServiceStatus_STARTED {
  		s.serviceAccess.Unlock()
@@ -683,6 +967,368 @@ index 0000000..ac73309
 +		}
 +	}
 +}
+diff --git a/daemon/tailscale_state_store.go b/daemon/tailscale_state_store.go
+new file mode 100644
+index 0000000..b29d2b4
+--- /dev/null
++++ b/daemon/tailscale_state_store.go
+@@ -0,0 +1,127 @@
++package daemon
++
++import (
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"sync"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/format"
++)
++
++const tailscaleStoreRetirementVersion = "polaris-ts-auth-writer-retirement-v1"
++const maxTailscaleRetirementRuns = 256
++
++type tailscaleRetirementInstance struct {
++	RunNonce       string                       `json:"runNonce"`
++	ConfigDigest   string                       `json:"configDigest"`
++	Terminal       string                       `json:"terminal"`
++	CensusComplete bool                         `json:"censusComplete"`
++	Nodes          []adapter.TailscaleStoreNode `json:"nodes"`
++}
++type tailscaleRetirementRun struct {
++	access   sync.Mutex
++	binding  adapter.TailscaleStoreRunBinding
++	expected []string
++	active   []adapter.TailscaleStoreNode
++	final    *tailscaleRetirementInstance
++}
++
++func newTailscaleRetirementRun(content string, options option.Options) (*tailscaleRetirementRun, error) {
++	var nonce [32]byte
++	if _, err := rand.Read(nonce[:]); err != nil {
++		return nil, err
++	}
++	digest := sha256.Sum256([]byte(content))
++	run := &tailscaleRetirementRun{binding: adapter.TailscaleStoreRunBinding{RunNonce: hex.EncodeToString(nonce[:]), ConfigDigest: hex.EncodeToString(digest[:])}}
++	for index, endpoint := range options.Endpoints {
++		if endpoint.Type != C.TypeTailscale {
++			continue
++		}
++		tag := endpoint.Tag
++		if tag == "" {
++			tag = format.ToString(index)
++		}
++		run.expected = append(run.expected, tag)
++	}
++	return run, nil
++}
++func (r *tailscaleRetirementRun) capture(nodes []adapter.TailscaleStoreNode) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	if r.final == nil && r.active == nil {
++		r.active = append([]adapter.TailscaleStoreNode{}, nodes...)
++	}
++}
++func (r *tailscaleRetirementRun) freeze(nodes []adapter.TailscaleStoreNode, constructed bool) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	if r.final != nil {
++		return
++	}
++	result := r.snapshotUnderLock()
++	result.Nodes = append([]adapter.TailscaleStoreNode{}, nodes...)
++	result.CensusComplete = constructed && len(nodes) == len(r.expected)
++	tags, paths := map[string]bool{}, map[string]bool{}
++	expected := map[string]bool{}
++	for _, tag := range r.expected {
++		if expected[tag] {
++			result.CensusComplete = false
++		}
++		expected[tag] = true
++	}
++	anyStore := false
++	for _, node := range nodes {
++		if !expected[node.Tag] || tags[node.Tag] || paths[node.StateFile] || node.StateFile == "" || node.RunNonce != r.binding.RunNonce || node.ConfigDigest != r.binding.ConfigDigest {
++			result.CensusComplete = false
++		}
++		tags[node.Tag] = true
++		paths[node.StateFile] = true
++		if node.WriterState == "SealedDrained" {
++			anyStore = true
++		} else if node.WriterState != "NoStoreConstruction" {
++			result.CensusComplete = false
++		}
++	}
++	if result.CensusComplete {
++		result.Terminal = "NoStoreConstruction"
++		if anyStore {
++			result.Terminal = "SealedDrained"
++		}
++	}
++	r.final = &result
++}
++func (r *tailscaleRetirementRun) snapshotUnderLock() tailscaleRetirementInstance {
++	return tailscaleRetirementInstance{RunNonce: r.binding.RunNonce, ConfigDigest: r.binding.ConfigDigest, Terminal: "Unknown", Nodes: append([]adapter.TailscaleStoreNode{}, r.active...)}
++}
++func (r *tailscaleRetirementRun) snapshot() tailscaleRetirementInstance {
++	r.access.Lock()
++	defer r.access.Unlock()
++	result := r.snapshotUnderLock()
++	if r.final != nil {
++		result = *r.final
++		result.Nodes = append([]adapter.TailscaleStoreNode{}, r.final.Nodes...)
++	}
++	return result
++}
++
++// Export is read-only, includes every retained original run, and never accepts
++// a caller nonce/config/path or promotes ordinary close to a global proof.
++func (s *StartedService) ExportTailscaleStoreRetirement() string {
++	s.lifecycleAccess.Lock()
++	defer s.lifecycleAccess.Unlock()
++	result := struct {
++		ContractVersion       string                        `json:"contractVersion"`
++		GlobalCleanupEvidence string                        `json:"globalCleanupEvidence"`
++		Instances             []tailscaleRetirementInstance `json:"instances"`
++	}{ContractVersion: tailscaleStoreRetirementVersion, GlobalCleanupEvidence: "CleanupUnknown", Instances: []tailscaleRetirementInstance{}}
++	for _, run := range s.tailscaleRetirementRuns {
++		result.Instances = append(result.Instances, run.snapshot())
++	}
++	payload, _ := json.Marshal(result)
++	return string(payload)
++}
+diff --git a/daemon/tailscale_state_store_test.go b/daemon/tailscale_state_store_test.go
+new file mode 100644
+index 0000000..f474836
+--- /dev/null
++++ b/daemon/tailscale_state_store_test.go
+@@ -0,0 +1,223 @@
++package daemon
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	box "github.com/sagernet/sing-box"
++	"github.com/sagernet/sing-box/adapter"
++	boxCertificate "github.com/sagernet/sing-box/adapter/certificate"
++	"github.com/sagernet/sing-box/adapter/endpoint"
++	"github.com/sagernet/sing-box/adapter/inbound"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	boxService "github.com/sagernet/sing-box/adapter/service"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing-box/dns/transport/local"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++)
++
++type retirementTestEndpoint struct {
++	adapter.Endpoint
++	node     adapter.TailscaleStoreNode
++	disposed int
++	retired  int
++}
++
++func (*retirementTestEndpoint) Type() string  { return C.TypeTailscale }
++func (e *retirementTestEndpoint) Tag() string { return e.node.Tag }
++func (*retirementTestEndpoint) Start(adapter.StartStage) error {
++	panic("pure constructor test must not start runtime")
++}
++func (*retirementTestEndpoint) Close() error                                           { panic("unstarted endpoint ordinary Close forbidden") }
++func (e *retirementTestEndpoint) DisposeConstruction() error                           { e.disposed++; return nil }
++func (e *retirementTestEndpoint) TailscaleStateStoreScope() adapter.TailscaleStoreNode { return e.node }
++func (e *retirementTestEndpoint) RetireTailscaleStateStore(time.Time) adapter.TailscaleStoreNode {
++	e.retired++
++	node := e.node
++	node.WriterState = "NoStoreConstruction"
++	node.StateFileState = "Missing"
++	node.ProfileState = "None"
++	return node
++}
++func retirementPureHost(t *testing.T) (*StartedService, *[]*retirementTestEndpoint) {
++	t.Helper()
++	t.Chdir(t.TempDir())
++	dnsRegistry := dns.NewTransportRegistry()
++	local.RegisterTransport(dnsRegistry)
++	endpoints := endpoint.NewRegistry()
++	ctx := box.Context(context.Background(), inbound.NewRegistry(), outbound.NewRegistry(), endpoints, dnsRegistry, boxService.NewRegistry(), boxCertificate.NewRegistry())
++	created := new([]*retirementTestEndpoint)
++	endpoint.Register[struct{}](endpoints, C.TypeTailscale, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ struct{}) (adapter.Endpoint, error) {
++		binding := service.PtrFromContext[adapter.TailscaleStoreRunBinding](ctx)
++		if binding == nil {
++			t.Fatal("guard created before original run binding")
++		}
++		directory := filepath.Join(t.TempDir(), tag)
++		e := &retirementTestEndpoint{node: adapter.TailscaleStoreNode{RunNonce: binding.RunNonce, ConfigDigest: binding.ConfigDigest, Tag: tag, StateDirectory: directory, StateFile: filepath.Join(directory, "tailscaled.state"), WriterState: "Unknown", StateFileState: "Unknown", ProfileState: "Unknown"}}
++		*created = append(*created, e)
++		return e, nil
++	})
++	endpoint.Register[struct{}](endpoints, "test-constructor-failure", func(context.Context, adapter.Router, log.ContextLogger, string, struct{}) (adapter.Endpoint, error) {
++		return nil, errors.New("original partial constructor failure")
++	})
++	host := NewStartedService(ServiceOptions{Context: ctx, StrictCleanup: true, KeepDefaultLogger: true})
++	t.Cleanup(func() { host.Close() })
++	return host, created
++}
++func TestTailscaleStoreActualInstanceUnstartedExportAndRetainedRuns(t *testing.T) {
++	host, created := retirementPureHost(t)
++	content := `{"endpoints":[{"type":"tailscale","tag":"a"},{"type":"tailscale","tag":"b"}]}`
++	for range 2 {
++		host.lifecycleAccess.Lock()
++		instance, err := host.newInstance(context.Background(), content, nil, false)
++		host.lifecycleAccess.Unlock()
++		if err != nil {
++			t.Fatal(err)
++		}
++		active := host.tailscaleRetirementRuns[len(host.tailscaleRetirementRuns)-1].snapshot()
++		digest := sha256.Sum256([]byte(content))
++		if len(active.RunNonce) != 64 || active.ConfigDigest != hex.EncodeToString(digest[:]) || len(active.Nodes) != 2 || active.Terminal != "Unknown" || active.CensusComplete {
++			t.Fatalf("active original metadata invalid: %+v", active)
++		}
++		if active.Nodes[0].StateDirectory == "" || active.Nodes[0].WriterState != "Unknown" {
++			t.Fatal("missing actual active scope")
++		}
++		first := host.ExportTailscaleStoreRetirement()
++		if first != host.ExportTailscaleStoreRetirement() {
++			t.Fatal("readonly export mutated instance")
++		}
++		if err := instance.CloseWithResult(); err != nil {
++			t.Fatal(err)
++		}
++		terminal := instance.tailscaleRetirement.snapshot()
++		if terminal.Terminal != "NoStoreConstruction" || !terminal.CensusComplete || len(terminal.Nodes) != 2 {
++			t.Fatalf("unstarted full census missing: %+v", terminal)
++		}
++		for range 2 {
++			if err := instance.CloseWithResult(); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	if len(*created) != 4 {
++		t.Fatal("unexpected constructor count")
++	}
++	for _, e := range *created {
++		if e.retired != 1 || e.disposed != 1 {
++			t.Fatalf("unstarted lifecycle not covered exactly: %+v", e)
++		}
++	}
++	var export struct {
++		ContractVersion, GlobalCleanupEvidence string
++		Instances                              []tailscaleRetirementInstance
++	}
++	payload := host.ExportTailscaleStoreRetirement()
++	if err := json.Unmarshal([]byte(payload), &export); err != nil {
++		t.Fatal(err)
++	}
++	if export.ContractVersion != tailscaleStoreRetirementVersion || export.GlobalCleanupEvidence != "CleanupUnknown" || len(export.Instances) != 2 {
++		t.Fatalf("lost original run/export boundary: %s", payload)
++	}
++	if export.Instances[0].RunNonce == export.Instances[1].RunNonce {
++		t.Fatal("reload reused original nonce")
++	}
++}
++func TestTailscaleStoreFailedConstructionCannotUpgrade(t *testing.T) {
++	host, _ := retirementPureHost(t)
++	content := `{"endpoints":[{"type":"tailscale","tag":"constructed"},{"type":"test-constructor-failure","tag":"fails"}]}`
++	host.lifecycleAccess.Lock()
++	instance, err := host.newInstance(context.Background(), content, nil, false)
++	host.lifecycleAccess.Unlock()
++	if err == nil || instance != nil {
++		t.Fatal("partial construction did not fail")
++	}
++	if len(host.tailscaleRetirementRuns) != 1 {
++		t.Fatal("partial run silently omitted")
++	}
++	run := host.tailscaleRetirementRuns[0]
++	initial := run.snapshot()
++	if initial.Terminal != "Unknown" || initial.CensusComplete {
++		t.Fatalf("partial constructor promoted: %+v", initial)
++	}
++	run.freeze(nil, true)
++	if !reflect.DeepEqual(initial, run.snapshot()) {
++		t.Fatal("late finalizer upgraded partial construction")
++	}
++}
++func TestTailscaleStoreWrongCensusBindingAndStickyClose(t *testing.T) {
++	options := option.Options{Endpoints: []option.Endpoint{{Type: C.TypeTailscale, Tag: "a"}, {Type: C.TypeTailscale, Tag: "b"}}}
++	for _, kind := range []string{"complete", "missing", "extra", "duplicate-tag", "duplicate-path", "wrong-nonce", "wrong-config", "unknown", "constructor-partial"} {
++		t.Run(kind, func(t *testing.T) {
++			run, err := newTailscaleRetirementRun("actual-profile", options)
++			if err != nil {
++				t.Fatal(err)
++			}
++			nodes := []adapter.TailscaleStoreNode{}
++			for _, tag := range []string{"a", "b"} {
++				nodes = append(nodes, adapter.TailscaleStoreNode{Tag: tag, StateDirectory: "/scope/" + tag, StateFile: "/scope/" + tag + "/tailscaled.state", WriterState: "SealedDrained", RunNonce: run.binding.RunNonce, ConfigDigest: run.binding.ConfigDigest})
++			}
++			constructed := true
++			switch kind {
++			case "missing":
++				nodes = nodes[:1]
++			case "extra":
++				nodes = append(nodes, nodes[0])
++				nodes[2].Tag = "c"
++			case "duplicate-tag":
++				nodes[1].Tag = "a"
++			case "duplicate-path":
++				nodes[1].StateFile = nodes[0].StateFile
++			case "wrong-nonce":
++				nodes[0].RunNonce = "caller-supplied"
++			case "wrong-config":
++				nodes[0].ConfigDigest = "old-config"
++			case "unknown":
++				nodes[0].WriterState = "Unknown"
++			case "constructor-partial":
++				constructed = false
++			}
++			run.freeze(nodes, constructed)
++			result := run.snapshot()
++			if kind == "complete" {
++				if result.Terminal != "SealedDrained" || !result.CensusComplete {
++					t.Fatal("complete census rejected")
++				}
++			} else if result.Terminal != "Unknown" || result.CensusComplete {
++				t.Fatalf("%s accepted: %+v", kind, result)
++			}
++			frozen := run.snapshot()
++			nodes[0].Tag = "mutated"
++			run.freeze(nil, true)
++			if !reflect.DeepEqual(frozen, run.snapshot()) {
++				t.Fatal("terminal overwritten")
++			}
++			failure := errors.New("original operational close failure")
++			host := NewStartedService(ServiceOptions{Context: context.Background(), StrictCleanup: true})
++			defer host.Close()
++			host.cleanupErr = failure
++			host.tailscaleRetirementRuns = []*tailscaleRetirementRun{run}
++			if err := host.CloseService(); !errors.Is(err, failure) {
++				t.Fatal("export cleared sticky close failure", err)
++			}
++			payload := host.ExportTailscaleStoreRetirement()
++			if !strings.Contains(payload, `"globalCleanupEvidence":"CleanupUnknown"`) || strings.Contains(payload, "private") || strings.Contains(payload, "caller-supplied") {
++				t.Fatal("payload boundary invalid", payload)
++			}
++			if err := host.StartOrReloadService(context.Background(), `{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
++				t.Fatal("late start accepted", err)
++			}
++		})
++	}
++}
 diff --git a/dns/transport_manager.go b/dns/transport_manager.go
 index 873cae8..e822231 100644
 --- a/dns/transport_manager.go
@@ -730,7 +1376,7 @@ index 0000000..3247e00
 +	}
 +}
 diff --git a/experimental/libbox/command_server.go b/experimental/libbox/command_server.go
-index 770016a..6f6954a 100644
+index 770016a..712cbf3 100644
 --- a/experimental/libbox/command_server.go
 +++ b/experimental/libbox/command_server.go
 @@ -7,6 +7,7 @@ import (
@@ -957,6 +1603,16 @@ index 770016a..6f6954a 100644
  	if err != nil {
  		return E.Cause(err, "start or reload service")
  	}
+@@ -381,3 +452,9 @@ func (h *platformHandler) WriteDebugMessage(message string) {
+ func (h *platformHandler) ConnectSSHAgent() (int32, error) {
+ 	return (*CommandServer)(h).handler.ConnectSSHAgent()
+ }
++
++// ExportTailscaleStoreRetirement returns scoped original StateStore terminals.
++// It is not a global cleanup or SDK task-quiescence certificate.
++func (s *CommandServer) ExportTailscaleStoreRetirement() string {
++	return s.StartedService.ExportTailscaleStoreRetirement()
++}
 diff --git a/experimental/libbox/command_server_transient_test.go b/experimental/libbox/command_server_transient_test.go
 index 7a9af75..07f6bb0 100644
 --- a/experimental/libbox/command_server_transient_test.go
@@ -1214,4 +1870,968 @@ index 7a9af75..07f6bb0 100644
 +	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); !errors.Is(err, os.ErrClosed) {
 +		t.Fatalf("late start after close = %v, want ErrClosed", err)
 +	}
++}
+diff --git a/experimental/libbox/tailscale_state_store_test.go b/experimental/libbox/tailscale_state_store_test.go
+new file mode 100644
+index 0000000..f1e1074
+--- /dev/null
++++ b/experimental/libbox/tailscale_state_store_test.go
+@@ -0,0 +1,41 @@
++package libbox
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++// Compile the exact gomobile-compatible no-argument method signature.
++var _ interface{ ExportTailscaleStoreRetirement() string } = (*CommandServer)(nil)
++
++func TestTailscaleStoreNativeExportIsReadOnlyWithoutInstance(t *testing.T) {
++	transientTestSetup(t)
++	server, err := NewTransientCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	payload := server.ExportTailscaleStoreRetirement()
++	var document map[string]json.RawMessage
++	if err := json.Unmarshal([]byte(payload), &document); err != nil {
++		t.Fatal(err)
++	}
++	if string(document["contractVersion"]) != `"polaris-ts-auth-writer-retirement-v1"` || string(document["globalCleanupEvidence"]) != `"CleanupUnknown"` || string(document["instances"]) != "[]" {
++		t.Fatalf("invalid ABI document: %s", payload)
++	}
++	if err := server.CloseService(); err != nil {
++		t.Fatal(err)
++	}
++	if after := server.ExportTailscaleStoreRetirement(); after != payload {
++		t.Fatalf("ordinary nil close created evidence: %s", after)
++	}
++	if server.listener != nil || server.grpcServer != nil {
++		t.Fatal("export started native service")
++	}
++}
++
++// The validation extension has one exact, no-argument gomobile getter.
++var _ interface{ GetTailscaleStoreRetirement() string } = (*ConfigValidationResult)(nil)
++
++// Membership is a separate read-only getter on that same validation result.
++var _ interface{ GetTailscaleStoreMembership() string } = (*ConfigValidationResult)(nil)
+diff --git a/protocol/tailscale/endpoint.go b/protocol/tailscale/endpoint.go
+index cfc494f..297395e 100644
+--- a/protocol/tailscale/endpoint.go
++++ b/protocol/tailscale/endpoint.go
+@@ -83,6 +83,7 @@ type Endpoint struct {
+ 	network           adapter.NetworkManager
+ 	platformInterface adapter.PlatformInterface
+ 	detour            string
++	stateStore        *guardedStateStore
+ 	server            *tsnet.Server
+ 	stack             *tun.Go
+ 	returnAccess      sync.Mutex
+@@ -238,6 +239,8 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
+ 		keyAuth:                    options.AuthKey != "",
+ 		onDemand:                   options.OnDemand,
+ 	}
++	tailscaleEndpoint.stateStore = makeStateStore(ctx, tag, stateDirectory)
++	tailscaleEndpoint.server.Store = tailscaleEndpoint.stateStore
+ 	tailscaleEndpoint.server.NetstackHandler = tailscaleEndpoint
+ 	return tailscaleEndpoint, nil
+ }
+@@ -250,6 +253,9 @@ func (t *Endpoint) References() []string {
+ }
+ 
+ func (t *Endpoint) Start(stage adapter.StartStage) error {
++	if t.stateStore != nil && t.stateStore.isSealed() {
++		return os.ErrClosed
++	}
+ 	switch stage {
+ 	case adapter.StartStateInitialize:
+ 		t.server.NetstackMemoryPressure = oomkiller.MemoryPressure(t.ctx)
+@@ -584,7 +590,11 @@ func (t *Endpoint) Logout(ctx context.Context) error {
+ }
+ 
+ func (t *Endpoint) Close() error {
++	retirement := t.RetireTailscaleStateStore(time.Now().Add(stateStoreDrainTimeout))
+ 	var err error
++	if retirement.WriterState == "Unknown" {
++		err = E.New("Tailscale state writer retirement unknown")
++	}
+ 	t.started.Store(false)
+ 	localBackend := t.localBackend.Swap(nil)
+ 	if localBackend != nil {
+@@ -594,7 +604,7 @@ func (t *Endpoint) Close() error {
+ 	common.Close(common.PtrOrNil(t.sshServerInstance))
+ 	t.sshServerInstance = nil
+ 	if t.serverStarted {
+-		err = common.Close(common.PtrOrNil(t.server))
++		err = E.Append(err, common.Close(common.PtrOrNil(t.server)), func(err error) error { return err })
+ 		t.serverStarted = false
+ 	}
+ 	if t.systemTun != nil {
+diff --git a/protocol/tailscale/state_store.go b/protocol/tailscale/state_store.go
+new file mode 100644
+index 0000000..7cd9a60
+--- /dev/null
++++ b/protocol/tailscale/state_store.go
+@@ -0,0 +1,370 @@
++//go:build with_tailscale
++
++package tailscale
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/tailscale/ipn"
++	"github.com/sagernet/tailscale/ipn/store"
++)
++
++const stateStoreDrainTimeout = 5 * time.Second
++const maxStateStoreBytes = 4 << 20
++
++// guardedStateStore owns the only delegate supplied to tsnet.Server.Store.
++// Its lazy factory and every read/write share admission. Seal is permanent,
++// including when construction or a delegate write is blocked or fails.
++type guardedStateStore struct {
++	access           sync.Mutex
++	initAccess       sync.Mutex
++	sealed           bool
++	inflight         int
++	drained          chan struct{}
++	drainedAt        time.Time
++	factoryAttempted bool
++	factoryFailed    bool
++	delegate         ipn.StateStore
++	factory          func() (ipn.StateStore, error)
++	node             adapter.TailscaleStoreNode
++	scopeValid       bool
++	retireOnce       sync.Once
++	terminal         adapter.TailscaleStoreNode
++}
++
++func newGuardedStateStore(ctx context.Context, tag, directory string, factory func() (ipn.StateStore, error)) *guardedStateStore {
++	node := adapter.TailscaleStoreNode{Tag: tag, StateDirectory: directory,
++		StateFile: filepath.Join(directory, "tailscaled.state"), WriterState: "Unknown",
++		StateFileState: "Unknown", ProfileState: "Unknown"}
++	if binding := service.PtrFromContext[adapter.TailscaleStoreRunBinding](ctx); binding != nil {
++		node.RunNonce, node.ConfigDigest = binding.RunNonce, binding.ConfigDigest
++	}
++	canonical, err := canonicalStateDirectory(directory)
++	if err == nil {
++		node.StateDirectory = canonical
++		node.StateFile = filepath.Join(canonical, "tailscaled.state")
++	}
++	guard := &guardedStateStore{node: node, scopeValid: err == nil, factory: factory, drained: make(chan struct{})}
++	if observer := service.PtrFromContext[adapter.TailscaleStoreConstructionObserver](ctx); observer != nil {
++		accepted := false
++		func() {
++			defer func() {
++				if !accepted {
++					guard.seal()
++				}
++			}()
++			if observer.Observe != nil {
++				accepted = observer.Observe(node, func(deadline time.Time) adapter.TailscaleStoreNode {
++					return guard.retire(deadline, nil)
++				})
++			}
++		}()
++	}
++	return guard
++}
++
++// Resolve existing parents without creating the lazy FileStore directory.
++func canonicalStateDirectory(path string) (string, error) {
++	return adapter.CanonicalTailscaleStateDirectory(path)
++}
++
++func (s *guardedStateStore) admit() error {
++	s.access.Lock()
++	defer s.access.Unlock()
++	if s.sealed {
++		return os.ErrClosed
++	}
++	s.inflight++
++	return nil
++}
++func (s *guardedStateStore) release() {
++	s.access.Lock()
++	defer s.access.Unlock()
++	s.inflight--
++	if s.sealed && s.inflight == 0 {
++		s.drainedAt = time.Now()
++		close(s.drained)
++	}
++}
++func (s *guardedStateStore) initialized() (delegate ipn.StateStore, err error) {
++	s.initAccess.Lock()
++	defer s.initAccess.Unlock()
++	if s.delegate != nil {
++		return s.delegate, nil
++	}
++	if s.factoryFailed {
++		return nil, errors.New("Tailscale state store initialization failed")
++	}
++	s.factoryAttempted = true
++	// A panic preserves its original propagation and marks possible construction
++	// Unknown. The caller's defer still releases this initializer's admission.
++	defer func() {
++		if delegate == nil {
++			s.factoryFailed = true
++		}
++	}()
++	canonical, err := canonicalStateDirectory(s.node.StateDirectory)
++	if err != nil || canonical != s.node.StateDirectory || !s.scopeValid {
++		return nil, errors.New("Tailscale state scope changed before initialization")
++	}
++	delegate, err = s.factory()
++	if err != nil || delegate == nil {
++		return nil, errors.New("Tailscale state store initialization failed")
++	}
++	s.delegate = delegate
++	return delegate, nil
++}
++func (s *guardedStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
++	if err := s.admit(); err != nil {
++		return nil, err
++	}
++	defer s.release()
++	delegate, err := s.initialized()
++	if err != nil {
++		return nil, err
++	}
++	return delegate.ReadState(id)
++}
++func (s *guardedStateStore) WriteState(id ipn.StateKey, value []byte) error {
++	if err := s.admit(); err != nil {
++		return err
++	}
++	defer s.release()
++	delegate, err := s.initialized()
++	if err != nil {
++		return err
++	}
++	return delegate.WriteState(id, value)
++}
++func (s *guardedStateStore) isSealed() bool {
++	s.access.Lock()
++	defer s.access.Unlock()
++	return s.sealed
++}
++
++func (s *guardedStateStore) seal() {
++	s.access.Lock()
++	defer s.access.Unlock()
++	if s.sealed {
++		return
++	}
++	s.sealed = true
++	if s.inflight == 0 {
++		s.drainedAt = time.Now()
++		close(s.drained)
++	}
++}
++
++func (s *guardedStateStore) retire(deadline time.Time, profile func() (string, string)) adapter.TailscaleStoreNode {
++	s.retireOnce.Do(func() {
++		result := s.node
++		s.seal()
++		timer := time.NewTimer(max(time.Until(deadline), 0))
++		defer timer.Stop()
++		select {
++		case <-s.drained:
++		case <-timer.C:
++			s.terminal = result
++			return
++		}
++		// Both select cases can be ready when this goroutine resumes. Actual
++		// completion time, not random select choice, bounds the drain proof.
++		s.access.Lock()
++		drainedAt := s.drainedAt
++		s.access.Unlock()
++		if drainedAt.IsZero() || drainedAt.After(deadline) {
++			s.terminal = result
++			return
++		}
++		s.initAccess.Lock()
++		attempted, failed := s.factoryAttempted, s.factoryFailed
++		s.initAccess.Unlock()
++		if !s.scopeValid || failed {
++			s.terminal = result
++			return
++		}
++		if attempted {
++			result.WriterState = "SealedDrained"
++		} else {
++			result.WriterState = "NoStoreConstruction"
++		}
++		type fileWitness struct {
++			content   []byte
++			state     string
++			err       error
++			completed time.Time
++		}
++		fileReady := make(chan fileWitness, 1)
++		go func() {
++			content, state, err := readStateFile(result.StateDirectory, result.StateFile)
++			fileReady <- fileWitness{content, state, err, time.Now()}
++		}()
++		var witness fileWitness
++		select {
++		case witness = <-fileReady:
++		case <-timer.C:
++			s.terminal = result
++			return
++		}
++		if witness.err != nil || witness.completed.After(deadline) {
++			s.terminal = result
++			return
++		}
++		content, fileState := witness.content, witness.state
++		result.StateFileState = fileState
++		if fileState == "Regular" {
++			digest := sha256.Sum256(content)
++			result.StateFileRevision = hex.EncodeToString(digest[:])
++		}
++		if profile == nil {
++			if fileState == "Missing" {
++				result.ProfileState = "None"
++			}
++			s.terminal = result
++			return
++		}
++		// CurrentProfile locks the original backend. A blocked metadata observer is
++		// not a drain certificate, and a late return cannot upgrade this terminal.
++		type reference struct {
++			id, key   string
++			completed time.Time
++		}
++		metadata := make(chan reference, 1)
++		go func() { id, key := profile(); metadata <- reference{id, key, time.Now()} }()
++		select {
++		case current := <-metadata:
++			if current.completed.After(deadline) {
++				break
++			}
++			if fileState == "Regular" && profileMatchesState(content, current.id, current.key) {
++				digest := sha256.Sum256([]byte("polaris-ts-profile-v1\x00" + current.id + "\x00" + current.key))
++				result.ProfileState = "Bound"
++				result.ProfileFingerprint = hex.EncodeToString(digest[:])
++			} else if fileState == "Missing" && current.id == "" && current.key == "" {
++				result.ProfileState = "None"
++			}
++		case <-timer.C:
++		}
++		s.terminal = result
++	})
++	return s.terminal
++}
++
++func readStateFile(directory, path string) ([]byte, string, error) {
++	canonical, err := canonicalStateDirectory(directory)
++	if err != nil || canonical != directory {
++		return nil, "Unknown", errors.New("Tailscale state scope changed")
++	}
++	before, err := os.Lstat(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil, "Missing", nil
++	}
++	if err != nil {
++		return nil, "Unknown", err
++	}
++	if !before.Mode().IsRegular() || before.Size() > maxStateStoreBytes {
++		return nil, "Unknown", errors.New("Tailscale state file is not bounded regular data")
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, "Unknown", err
++	}
++	defer file.Close()
++	opened, err := file.Stat()
++	if err != nil || !os.SameFile(before, opened) {
++		return nil, "Unknown", errors.New("Tailscale state file changed")
++	}
++	content, err := io.ReadAll(io.LimitReader(file, maxStateStoreBytes+1))
++	if err != nil || len(content) > maxStateStoreBytes {
++		return nil, "Unknown", errors.New("Tailscale state file read failed")
++	}
++	after, err := os.Lstat(path)
++	canonicalAfter, canonicalErr := canonicalStateDirectory(directory)
++	if err != nil || canonicalErr != nil || canonicalAfter != directory || !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
++		return nil, "Unknown", errors.New("Tailscale state file changed")
++	}
++	return content, "Regular", nil
++}
++
++func profileMatchesState(content []byte, id, key string) bool {
++	if id == "" || key == "" {
++		return false
++	}
++	var state map[string]string
++	if json.Unmarshal(content, &state) != nil {
++		return false
++	}
++	current, err := base64.StdEncoding.Strict().DecodeString(state["_current-profile"])
++	if err != nil || string(current) != key {
++		return false
++	}
++	profilesBytes, err := base64.StdEncoding.Strict().DecodeString(state["_profiles"])
++	if err != nil {
++		return false
++	}
++	var profiles map[string]struct{ ID, Key string }
++	if json.Unmarshal(profilesBytes, &profiles) != nil {
++		return false
++	}
++	entry, ok := profiles[id]
++	return ok && entry.ID == id && entry.Key == key
++}
++
++// Scope is immutable constructor metadata. Reading it does not create or seal
++// a FileStore and cannot report a positive writer/profile/file terminal.
++func (t *Endpoint) TailscaleStateStoreScope() adapter.TailscaleStoreNode {
++	if t.stateStore == nil {
++		return adapter.TailscaleStoreNode{Tag: t.Tag(), WriterState: "Unknown", StateFileState: "Unknown", ProfileState: "Unknown"}
++	}
++	return t.stateStore.node
++}
++
++func (t *Endpoint) RetireTailscaleStateStore(deadline time.Time) adapter.TailscaleStoreNode {
++	if t.stateStore == nil {
++		return adapter.TailscaleStoreNode{Tag: t.Tag(), WriterState: "Unknown", StateFileState: "Unknown", ProfileState: "Unknown"}
++	}
++	// This original pointer is retained before ordinary Close swaps it away.
++	backend := t.localBackend.Load()
++	var reference func() (string, string)
++	if backend != nil {
++		reference = func() (string, string) {
++			profile := backend.CurrentProfile()
++			if !profile.Valid() {
++				return "", ""
++			}
++			return string(profile.ID()), string(profile.Key())
++		}
++	}
++	return t.stateStore.retire(deadline, reference)
++}
++
++// Construction disposal seals only this known Store. It never calls ordinary
++// runtime Close on an unstarted TUN, server, DNS or SDK task.
++func (t *Endpoint) DisposeConstruction() error {
++	result := t.RetireTailscaleStateStore(time.Now().Add(stateStoreDrainTimeout))
++	if result.WriterState == "Unknown" {
++		return errors.New("Tailscale state writer retirement unknown")
++	}
++	return construction.ErrUnknownDisposal
++}
++
++func makeStateStore(ctx context.Context, tag, directory string) *guardedStateStore {
++	guard := newGuardedStateStore(ctx, tag, directory, nil)
++	guard.factory = func() (ipn.StateStore, error) {
++		return store.NewFileStore(func(string, ...any) {}, guard.node.StateFile)
++	}
++	return guard
++}
+diff --git a/protocol/tailscale/state_store_test.go b/protocol/tailscale/state_store_test.go
+new file mode 100644
+index 0000000..d6cf9ac
+--- /dev/null
++++ b/protocol/tailscale/state_store_test.go
+@@ -0,0 +1,437 @@
++//go:build with_tailscale
++
++package tailscale
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/construction"
++	"github.com/sagernet/sing/service"
++	"github.com/sagernet/tailscale/ipn"
++)
++
++type retirementMockStore struct {
++	writes atomic.Int32
++	write  func() error
++}
++
++func (*retirementMockStore) ReadState(ipn.StateKey) ([]byte, error) { return nil, ipn.ErrStateNotExist }
++func (s *retirementMockStore) WriteState(ipn.StateKey, []byte) error {
++	s.writes.Add(1)
++	if s.write != nil {
++		return s.write()
++	}
++	return nil
++}
++func waitStoreSealed(t *testing.T, s *guardedStateStore) {
++	t.Helper()
++	deadline := time.Now().Add(time.Second)
++	for !s.isSealed() {
++		if time.Now().After(deadline) {
++			t.Fatal("seal was not published")
++		}
++		time.Sleep(time.Millisecond)
++	}
++}
++func TestTailscaleStoreLazyConstructionLeaseAndLateWrites(t *testing.T) {
++	directory := filepath.Join(t.TempDir(), "not-created")
++	entered, release := make(chan struct{}), make(chan struct{})
++	mock := &retirementMockStore{}
++	binding := adapter.TailscaleStoreRunBinding{RunNonce: "original", ConfigDigest: "actual"}
++	ctx := service.ContextWithPtr(context.Background(), &binding)
++	store := newGuardedStateStore(ctx, "target", directory, func() (ipn.StateStore, error) {
++		close(entered)
++		<-release
++		if err := os.Mkdir(directory, 0700); err != nil {
++			return nil, err
++		}
++		// Model NewFileStore's synchronous initial write before its return.
++		if err := os.WriteFile(filepath.Join(directory, "tailscaled.state"), []byte("{}"), 0600); err != nil {
++			return nil, err
++		}
++		return mock, nil
++	})
++	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("eager constructor touched directory: %v", err)
++	}
++	written := make(chan error, 1)
++	go func() { written <- store.WriteState("active", []byte("first")) }()
++	<-entered
++	retired := make(chan adapter.TailscaleStoreNode, 1)
++	go func() { retired <- store.retire(time.Now().Add(time.Second), nil) }()
++	waitStoreSealed(t, store)
++	select {
++	case <-retired:
++		t.Fatal("constructor lease was not drained")
++	default:
++	}
++	if err := store.WriteState("late", nil); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late write = %v", err)
++	}
++	close(release)
++	if err := <-written; err != nil {
++		t.Fatal(err)
++	}
++	node := <-retired
++	if node.WriterState != "SealedDrained" || node.RunNonce != "original" || node.ConfigDigest != "actual" || node.StateFileState != "Regular" {
++		t.Fatalf("original binding/terminal lost: %+v", node)
++	}
++	if mock.writes.Load() != 1 {
++		t.Fatalf("late delegate writes = %d", mock.writes.Load())
++	}
++	if err := store.WriteState("later", nil); !errors.Is(err, os.ErrClosed) {
++		t.Fatal(err)
++	}
++	if again := store.retire(time.Now().Add(time.Second), nil); !reflect.DeepEqual(node, again) {
++		t.Fatal("terminal changed")
++	}
++}
++func TestTailscaleStoreWriteTimeoutStaysUnknownAfterLateCompletion(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	mock := &retirementMockStore{write: func() error { close(entered); <-release; return nil }}
++	store := newGuardedStateStore(context.Background(), "target", t.TempDir(), func() (ipn.StateStore, error) { return mock, nil })
++	written := make(chan error, 1)
++	go func() { written <- store.WriteState("active", nil) }()
++	<-entered
++	node := store.retire(time.Now().Add(20*time.Millisecond), nil)
++	if node.WriterState != "Unknown" {
++		t.Fatalf("blocked write became positive: %+v", node)
++	}
++	close(release)
++	if err := <-written; err != nil {
++		t.Fatal(err)
++	}
++	if again := store.retire(time.Now().Add(time.Second), nil); !reflect.DeepEqual(node, again) {
++		t.Fatal("late completion upgraded Unknown")
++	}
++	if err := store.WriteState("late", nil); !errors.Is(err, os.ErrClosed) {
++		t.Fatal(err)
++	}
++	if mock.writes.Load() != 1 {
++		t.Fatal("late write reached delegate")
++	}
++}
++func TestTailscaleStoreNoConstructionFailureAndPanic(t *testing.T) {
++	t.Run("no-construction", func(t *testing.T) {
++		calls := 0
++		store := newGuardedStateStore(context.Background(), "target", filepath.Join(t.TempDir(), "lazy"), func() (ipn.StateStore, error) { calls++; return &retirementMockStore{}, nil })
++		node := store.retire(time.Now().Add(time.Second), nil)
++		if calls != 0 || node.WriterState != "NoStoreConstruction" || node.StateFileState != "Missing" || node.ProfileState != "None" {
++			t.Fatalf("not exact lazy non-construction: %+v / %d", node, calls)
++		}
++		endpoint := &Endpoint{stateStore: store}
++		if err := endpoint.Start(adapter.StartStateInitialize); !errors.Is(err, os.ErrClosed) {
++			t.Fatalf("Start after seal = %v", err)
++		}
++		// No server/TUN/backend was initialized. Ordinary Close here would panic;
++		// construction disposal must never invoke it or certify wider SDK cleanup.
++		if err := endpoint.DisposeConstruction(); !errors.Is(err, construction.ErrUnknownDisposal) {
++			t.Fatalf("disposal promoted wider resources: %v", err)
++		}
++	})
++	for _, kind := range []string{"failure", "panic"} {
++		t.Run(kind, func(t *testing.T) {
++			directory := t.TempDir()
++			store := newGuardedStateStore(context.Background(), "target", directory, func() (ipn.StateStore, error) {
++				os.WriteFile(filepath.Join(directory, "tailscaled.state"), []byte("partial"), 0600)
++				if kind == "panic" {
++					panic("original constructor panic")
++				}
++				return nil, errors.New("sensitive synthetic constructor failure")
++			})
++			func() {
++				defer func() {
++					r := recover()
++					if kind == "panic" && r != "original constructor panic" {
++						t.Fatalf("panic lost: %v", r)
++					}
++				}()
++				_, err := store.ReadState("any")
++				if kind == "failure" && err == nil {
++					t.Fatal("failed factory accepted")
++				}
++			}()
++			node := store.retire(time.Now().Add(time.Second), nil)
++			if node.WriterState != "Unknown" {
++				t.Fatalf("partial factory certified: %+v", node)
++			}
++			if err := store.WriteState("late", nil); !errors.Is(err, os.ErrClosed) {
++				t.Fatal(err)
++			}
++		})
++	}
++}
++func profileStateBytes(t *testing.T, id, key string) []byte {
++	t.Helper()
++	profiles, err := json.Marshal(map[string]ipn.LoginProfile{id: {ID: ipn.ProfileID(id), Key: ipn.StateKey(key)}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := map[string]string{"_current-profile": base64.StdEncoding.EncodeToString([]byte(key)), "_profiles": base64.StdEncoding.EncodeToString(profiles), "_taildrop-received": base64.StdEncoding.EncodeToString([]byte("keep-user-data"))}
++	content, err := json.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return content
++}
++func TestTailscaleStoreRealFileProfileAndLateObserver(t *testing.T) {
++	for _, kind := range []string{"bound", "failed-write-cache", "late-observer", "no-original-backend"} {
++		t.Run(kind, func(t *testing.T) {
++			directory := t.TempDir()
++			content := profileStateBytes(t, "old-id", "profile-old")
++			if err := os.WriteFile(filepath.Join(directory, "tailscaled.state"), content, 0600); err != nil {
++				t.Fatal(err)
++			}
++			store := newGuardedStateStore(context.Background(), "target", directory, func() (ipn.StateStore, error) {
++				return &retirementMockStore{write: func() error { return errors.New("simulated cache changed but atomic write failed") }}, nil
++			})
++			if err := store.WriteState("profile-new", nil); err == nil {
++				t.Fatal("mock write unexpectedly succeeded")
++			}
++			profile := func() (string, string) { return "old-id", "profile-old" }
++			release := make(chan struct{})
++			returned := make(chan struct{})
++			switch kind {
++			case "failed-write-cache":
++				profile = func() (string, string) { return "new-id", "profile-new" }
++			case "late-observer":
++				profile = func() (string, string) { <-release; close(returned); return "old-id", "profile-old" }
++			case "no-original-backend":
++				profile = nil
++			}
++			deadline := time.Now().Add(time.Second)
++			if kind == "late-observer" {
++				deadline = time.Now().Add(25 * time.Millisecond)
++			}
++			node := store.retire(deadline, profile)
++			if node.WriterState != "SealedDrained" || node.StateFileState != "Regular" {
++				t.Fatalf("store/file facts lost: %+v", node)
++			}
++			digest := sha256.Sum256(content)
++			if node.StateFileRevision != hex.EncodeToString(digest[:]) {
++				t.Fatal("revision did not hash actual file")
++			}
++			if kind == "bound" {
++				// Use actual NUL delimiters, not source-escaped backslash bytes.
++				fingerprint := sha256.Sum256(bytes.Join([][]byte{[]byte("polaris-ts-profile-v1"), []byte("old-id"), []byte("profile-old")}, []byte{0}))
++				if node.ProfileState != "Bound" || node.ProfileFingerprint != hex.EncodeToString(fingerprint[:]) {
++					t.Fatalf("original profile not bound: %+v", node)
++				}
++			} else if node.ProfileState != "Unknown" || node.ProfileFingerprint != "" {
++				t.Fatalf("stale observer/cache certified: %+v", node)
++			}
++			if kind == "late-observer" {
++				close(release)
++				<-returned
++				if again := store.retire(time.Now().Add(time.Second), profile); !reflect.DeepEqual(node, again) {
++					t.Fatal("late metadata upgraded Unknown")
++				}
++			}
++			after, err := os.ReadFile(filepath.Join(directory, "tailscaled.state"))
++			if err != nil || !bytes.Equal(after, content) {
++				t.Fatal("export rewrote target or Taildrop state")
++			}
++		})
++	}
++}
++func TestTailscaleStoreCanonicalFactoryAndUnsafeFile(t *testing.T) {
++	root := t.TempDir()
++	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
++	for _, path := range []string{a, b} {
++		if err := os.Mkdir(path, 0700); err != nil {
++			t.Fatal(err)
++		}
++	}
++	alias := filepath.Join(root, "alias")
++	if err := os.Symlink(a, alias); err != nil {
++		t.Fatal(err)
++	}
++	store := makeStateStore(context.Background(), "target", alias)
++	if err := os.Remove(alias); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(b, alias); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.ReadState("none"); !errors.Is(err, ipn.ErrStateNotExist) {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(a, "tailscaled.state")); err != nil {
++		t.Fatal("factory lost pinned canonical scope", err)
++	}
++	if _, err := os.Stat(filepath.Join(b, "tailscaled.state")); !errors.Is(err, os.ErrNotExist) {
++		t.Fatal("factory wrote retargeted alias", err)
++	}
++	node := store.retire(time.Now().Add(time.Second), nil)
++	if node.StateDirectory != a || node.WriterState != "SealedDrained" {
++		t.Fatalf("canonical scope lost: %+v", node)
++	}
++	for _, kind := range []string{"symlink", "oversize", "directory"} {
++		t.Run(kind, func(t *testing.T) {
++			directory := t.TempDir()
++			path := filepath.Join(directory, "tailscaled.state")
++			switch kind {
++			case "symlink":
++				if err := os.Symlink(filepath.Join(a, "tailscaled.state"), path); err != nil {
++					t.Fatal(err)
++				}
++			case "oversize":
++				file, err := os.Create(path)
++				if err != nil {
++					t.Fatal(err)
++				}
++				if err = file.Truncate(maxStateStoreBytes + 1); err != nil {
++					t.Fatal(err)
++				}
++				file.Close()
++			case "directory":
++				if err := os.Mkdir(path, 0700); err != nil {
++					t.Fatal(err)
++				}
++			}
++			guard := newGuardedStateStore(context.Background(), "target", directory, func() (ipn.StateStore, error) { t.Fatal("unadmitted unsafe file initialized"); return nil, nil })
++			result := guard.retire(time.Now().Add(time.Second), nil)
++			if result.StateFileState != "Unknown" || result.ProfileState != "Unknown" || result.StateFileRevision != "" {
++				t.Fatalf("unsafe data accepted: %+v", result)
++			}
++		})
++	}
++}
++
++// Load through the pinned SDK's real FileStore and LoginProfileView codec.
++// No tsnet server, network observer or real backend is started.
++func TestTailscaleStorePinnedSDKProjectionFixture(t *testing.T) {
++	content, err := os.ReadFile("testdata/synthetic-sealed-state.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	expectedBytes, err := os.ReadFile("testdata/synthetic-sealed-state.expected.json")
++	if err != nil {
++		t.Fatal(err)
++	}
++	var expected struct{ ProfileFingerprint, StateFileRevision string }
++	if err := json.Unmarshal(expectedBytes, &expected); err != nil {
++		t.Fatal(err)
++	}
++	directory := t.TempDir()
++	path := filepath.Join(directory, "tailscaled.state")
++	if err := os.WriteFile(path, content, 0600); err != nil {
++		t.Fatal(err)
++	}
++	guard := makeStateStore(context.Background(), "target", directory)
++	current, err := guard.ReadState(ipn.CurrentProfileStateKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	profilesBytes, err := guard.ReadState(ipn.KnownProfilesStateKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var profiles map[ipn.ProfileID]ipn.LoginProfileView
++	if err := json.Unmarshal(profilesBytes, &profiles); err != nil {
++		t.Fatal(err)
++	}
++	profile := profiles[ipn.ProfileID("a123")]
++	if !profile.Valid() || string(profile.Key()) != string(current) {
++		t.Fatal("fixture does not match real SDK references")
++	}
++	node := guard.retire(time.Now().Add(time.Second), func() (string, string) { return string(profile.ID()), string(profile.Key()) })
++	if node.ProfileState != "Bound" || node.ProfileFingerprint != expected.ProfileFingerprint || node.StateFileRevision != expected.StateFileRevision {
++		t.Fatalf("codec/fingerprint/revision drift: %+v", node)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil || !bytes.Equal(content, after) {
++		t.Fatal("read-only retirement changed synthetic preserved values")
++	}
++}
++
++func TestTailscaleStoreExpiredDeadlineCannotWinReadySelect(t *testing.T) {
++	for range 20 {
++		store := newGuardedStateStore(context.Background(), "target", t.TempDir(), func() (ipn.StateStore, error) { t.Fatal("expired retirement initialized store"); return nil, nil })
++		node := store.retire(time.Now().Add(-time.Millisecond), nil)
++		if node.WriterState != "Unknown" || node.StateFileState != "Unknown" {
++			t.Fatalf("ready drained channel defeated expired deadline: %+v", node)
++		}
++		if err := store.WriteState("late", nil); !errors.Is(err, os.ErrClosed) {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestTailscaleStoreConstructionObserverOriginalGuardAndLateAdmission(t *testing.T) {
++	var captured []func(time.Time) adapter.TailscaleStoreNode
++	var closed bool
++	observer := adapter.TailscaleStoreConstructionObserver{Observe: func(node adapter.TailscaleStoreNode, retire func(time.Time) adapter.TailscaleStoreNode) bool {
++		if closed {
++			return false
++		}
++		if node.RunNonce != "original-observer" || node.ConfigDigest != "actual-input" {
++			t.Fatal("guard lost original context binding")
++		}
++		captured = append(captured, retire)
++		return true
++	}}
++	binding := adapter.TailscaleStoreRunBinding{RunNonce: "original-observer", ConfigDigest: "actual-input"}
++	ctx := service.ContextWithPtr(context.Background(), &binding)
++	ctx = service.ContextWithPtr(ctx, &observer)
++	calls := 0
++	store := newGuardedStateStore(ctx, "target", filepath.Join(t.TempDir(), "lazy"), func() (ipn.StateStore, error) { calls++; return &retirementMockStore{}, nil })
++	if len(captured) != 1 || calls != 0 || store.isSealed() {
++		t.Fatal("observer eagerly constructed or sealed original guard")
++	}
++	closed = true
++	original := captured[0](time.Now().Add(time.Second))
++	if original.WriterState != "NoStoreConstruction" || !store.isSealed() || calls != 0 {
++		t.Fatalf("observer did not retire same original guard: %+v", original)
++	}
++	late := newGuardedStateStore(ctx, "late", filepath.Join(t.TempDir(), "late"), func() (ipn.StateStore, error) { calls++; return &retirementMockStore{}, nil })
++	if !late.isSealed() {
++		t.Fatal("late actual guard returned before permanent seal")
++	}
++	if _, err := late.ReadState("late"); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late read admitted: %v", err)
++	}
++	if err := late.WriteState("late", nil); !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("late write admitted: %v", err)
++	}
++	if calls != 0 || len(captured) != 1 {
++		t.Fatal("late factory or observation was admitted")
++	}
++	if again := late.retire(time.Now().Add(time.Second), nil); again.WriterState != "NoStoreConstruction" {
++		t.Fatalf("late seal could not be retired idempotently: %+v", again)
++	}
++}
++
++func TestTailscaleStoreConstructionObserverPanicRejectsHandoff(t *testing.T) {
++	observer := adapter.TailscaleStoreConstructionObserver{Observe: func(adapter.TailscaleStoreNode, func(time.Time) adapter.TailscaleStoreNode) bool {
++		panic("synthetic observer failure")
++	}}
++	ctx := service.ContextWithPtr(context.Background(), &observer)
++	factoryCalls := 0
++	returned := false
++	func() {
++		defer func() {
++			if recover() == nil {
++				t.Fatal("observer panic swallowed")
++			}
++		}()
++		newGuardedStateStore(ctx, "original", t.TempDir(), func() (ipn.StateStore, error) { factoryCalls++; return &retirementMockStore{}, nil })
++		returned = true
++	}()
++	if returned || factoryCalls != 0 {
++		t.Fatal("panicking observer handed off or admitted a guard")
++	}
++}
+diff --git a/protocol/tailscale/testdata/synthetic-sealed-state.expected.json b/protocol/tailscale/testdata/synthetic-sealed-state.expected.json
+new file mode 100644
+index 0000000..6642a65
+--- /dev/null
++++ b/protocol/tailscale/testdata/synthetic-sealed-state.expected.json
+@@ -0,0 +1,23 @@
++{
++  "schema": "polaris-ts-synthetic-state-fixture-v1",
++  "synthetic": true,
++  "profileId": "a123",
++  "profileKey": "profile-a123",
++  "profileFingerprint": "bf1ff23b84deae9d2dc78f5241586709dbff294a1f8a8c76d61ccac3bf76224d",
++  "stateFileRevision": "cb330f842c694336d53e225db936e7bc0ebc85763c71cbfa1fef8da824c47e03",
++  "projectionRemovesOnly": [
++    "profile-a123",
++    "_profiles.a123"
++  ],
++  "preserveKeys": [
++    "_current-profile",
++    "_profiles",
++    "profile-b456",
++    "_machinekey",
++    "_taildrop-received",
++    "_serve/a123",
++    "ipn-go-bridge",
++    "unknown-user-value"
++  ],
++  "currentPointerPreserved": "profile-a123"
++}
+diff --git a/protocol/tailscale/testdata/synthetic-sealed-state.json b/protocol/tailscale/testdata/synthetic-sealed-state.json
+new file mode 100644
+index 0000000..d0a8edf
+--- /dev/null
++++ b/protocol/tailscale/testdata/synthetic-sealed-state.json
+@@ -0,0 +1,11 @@
++{
++  "_current-profile": "cHJvZmlsZS1hMTIz",
++  "_profiles": "eyJhMTIzIjp7IklEIjoiYTEyMyIsIktleSI6InByb2ZpbGUtYTEyMyIsIk5hbWUiOiJzeW50aGV0aWMtYWN0aXZlIiwiVW5rbm93blByb2ZpbGVGaWVsZCI6eyJrZWVwIjp0cnVlfX0sImI0NTYiOnsiSUQiOiJiNDU2IiwiS2V5IjoicHJvZmlsZS1iNDU2IiwiTmFtZSI6InN5bnRoZXRpYy1oaXN0b3J5In19",
++  "profile-a123": "eyJXYW50UnVubmluZyI6dHJ1ZSwiTG9nZ2VkT3V0IjpmYWxzZX0=",
++  "profile-b456": "eyJXYW50UnVubmluZyI6ZmFsc2V9",
++  "_machinekey": "c3ludGhldGljLXByZXNlcnZlZC1tYWNoaW5lLW1hcmtlcg==",
++  "_taildrop-received": "eyJzeW50aGV0aWMiOiJ1c2VyLW1ldGFkYXRhLXByZXNlcnZlZCJ9",
++  "_serve/a123": "eyJzeW50aGV0aWMiOiJzZXJ2ZS1wcmVzZXJ2ZWQifQ==",
++  "ipn-go-bridge": "eyJzeW50aGV0aWMiOiJsZWdhY3ktcHJlc2VydmVkIn0=",
++  "unknown-user-value": "AP8H"
 +}

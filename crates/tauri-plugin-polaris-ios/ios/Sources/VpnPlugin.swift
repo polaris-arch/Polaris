@@ -6,7 +6,12 @@ import WebKit
 import UIKit
 
 private struct StartArgs: Decodable { let configContent: String; let requestID: String }
-private struct StopArgs: Decodable { let requestID: String }
+private struct StopArgs: Decodable {
+    let requestID: String; let observationNonce: String
+    let expectedStartRequestID: String?; let expectedSessionID: String?
+    let expectedConfigDigest: String?; let expectedExtensionGeneration: UInt64?
+}
+private struct CurrentObserveArgs: Decodable { let observationNonce: String }
 private struct RevokeArgs: Decodable { let expectedStartRequestID: String; let stopRequestID: String }
 private struct ObserveArgs: Decodable {
     let sessionID: String; let requestID: String; let configDigest: String
@@ -31,6 +36,10 @@ private final class VpnOperation {
     var startIntent: VpnStartIntent?
     var observer: NSObjectProtocol?
     var deadline: DispatchWorkItem?
+    var stopArgs: StopArgs?
+    var awaitingStopObservation = false
+    var stopObservation: [String: Any]?
+    var readingStopped = false
     init(_ invoke: Invoke, generation: UInt64, kind: String, requestID: String) {
         self.invoke = invoke; self.generation = generation; self.kind = kind; self.requestID = requestID
     }
@@ -125,7 +134,7 @@ final class VpnPlugin: Plugin {
             if op.kind == "start", let intent = op.startIntent, op.started {
                 self.stopSubmittedStart(intent, stopRequestID: freshVpnRequestID("timeout"))
             }
-            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."))
+            self.finish(op, error: vpnError("StartupFailed: VPN \(kind) timed out; completion and cleanup are unknown. Check system VPN status before retrying."), noStoreEligible: false)
         }
         op.deadline = deadline
         DispatchQueue.main.asyncAfter(deadline: .now() + (kind == "start" ? 40 : 25), execute: deadline)
@@ -199,13 +208,15 @@ final class VpnPlugin: Plugin {
                                             else { throw vpnError("ReadyUnknown: Saved VPN profile changed before start submission") }
                                             self.observe(op, wanted: .connected)
                                             // Register observer before issuing the transition.
+                                            // A throwing submission can still have an OS effect.
+                                            // Mark the original intent before crossing that boundary.
+                                            op.started = true
+                                            op.startIntent?.submitted(expected)
+                                            self.submittedStart = op.startIntent
                                             try manager.connection.startVPNTunnel(options: [
                                                 "sessionID": sessionID as NSString, "requestID": op.requestID as NSString,
                                                 "configContent": args.configContent as NSString
                                             ])
-                                            op.started = true
-                                            op.startIntent?.submitted(expected)
-                                            self.submittedStart = op.startIntent
                                             self.check(op, wanted: .connected, allowInitialDisconnected: true)
                                         } catch {
                                             let message = error.localizedDescription
@@ -225,13 +236,24 @@ final class VpnPlugin: Plugin {
     @objc func stop(_ invoke: Invoke) {
         do {
             let args = try invoke.parseArgs(StopArgs.self)
+            guard !args.requestID.isEmpty, !args.observationNonce.isEmpty else { throw vpnError("Stop observation identity is empty") }
             DispatchQueue.main.async {
                 guard let op = self.begin(invoke, kind: "stop", requestID: args.requestID) else { return }
+                op.stopArgs = args
                 self.loadManager(create: false) { result in
                     guard self.current(op) else { return }
                     do {
-                        guard let manager = try result.get().manager else { self.finish(op, snapshot: try self.snapshot(nil)); return }
+                        guard let manager = try result.get().manager else {
+                            guard args.expectedStartRequestID == nil else { throw vpnError("CleanupUnknown: The original start manager is unavailable") }
+                            self.finish(op, snapshot: try self.snapshot(nil)); return
+                        }
                         op.manager = manager
+                        let values = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+                        guard args.expectedStartRequestID == nil || values?["requestID"] as? String == args.expectedStartRequestID,
+                              args.expectedSessionID == nil || values?["sessionID"] as? String == args.expectedSessionID,
+                              args.expectedConfigDigest == nil || values?["configDigest"] as? String == args.expectedConfigDigest
+                        else { throw vpnError("CleanupUnknown: Stop addresses a different original start session") }
+                        op.identity = values
                         try self.writeStopIntent(op)
                         let status = manager.connection.status
                         if status == .invalid || status == .disconnected { self.finishStopped(op); return }
@@ -333,6 +355,30 @@ final class VpnPlugin: Plugin {
         } catch { invoke.reject(error.localizedDescription) }
     }
 
+    /// Cold hosts may observe an existing actual provider, never create a profile
+    /// or recreate a local MainBirthToken from its saved status file.
+    @objc func observeCurrentSession(_ invoke: Invoke) {
+        do {
+            let args = try invoke.parseArgs(CurrentObserveArgs.self)
+            guard !args.observationNonce.isEmpty else { throw vpnError("ReadyUnknown: Observation nonce is empty") }
+            DispatchQueue.main.async {
+                self.loadManager(create: false) { result in
+                    do {
+                        guard self.operation == nil, let manager = try result.get().manager,
+                              let identity = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
+                              vpnIdentityMatches(identity, identity) else { throw vpnError("ReadyUnknown: No current original manager") }
+                        self.readLiveSession(manager, expectedIdentity: identity, nonce: args.observationNonce) { result in
+                            switch result {
+                            case .success(let snapshot): invoke.resolve(["observationNonce": args.observationNonce, "snapshot": snapshot])
+                            case .failure(let error): invoke.reject(error.localizedDescription)
+                            }
+                        }
+                    } catch { invoke.reject(error.localizedDescription) }
+                }
+            }
+        } catch { invoke.reject(error.localizedDescription) }
+    }
+
     /// A fresh provider response replaces file evidence for ordinary readiness.
     /// Re-check both the loaded profile and its NE status after the response.
     private func readLiveSession(_ manager: NETunnelProviderManager, expectedIdentity: [String: Any],
@@ -373,8 +419,8 @@ final class VpnPlugin: Plugin {
                                       vpnIdentityMatches(expectedIdentity,
                                         (currentManager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration),
                                       self.operation == nil || self.operation?.requestID == (expectedIdentity["requestID"] as? String),
-                                      self.submittedStart?.requestID == (expectedIdentity["requestID"] as? String),
-                                      self.submittedStart?.revoked == false,
+                                      self.submittedStart == nil || (self.submittedStart?.requestID == (expectedIdentity["requestID"] as? String)
+                                        && self.submittedStart?.revoked == false),
                                       self.uncertainReason == nil || (self.uncertainSession != nil && self.uncertainSession != (expectedIdentity["sessionID"] as? String)),
                                       try self.pendingPreferenceIntent() == nil else {
                                     throw vpnError("ReadyUnknown: The current VPN manager changed during observation")
@@ -418,9 +464,21 @@ final class VpnPlugin: Plugin {
         let stop = {
             guard self.current(op), !requested else { return }
             requested = true
-            self.observe(op, wanted: .disconnected)
-            manager.connection.stopVPNTunnel()
-            self.check(op, wanted: .disconnected)
+            // The original two-second fallback must still permit ordinary Stop
+            // when a provider never answers. It supplies no scoped retirement.
+            op.awaitingStopObservation = false
+            self.loadManager(create: false) { result in
+                guard self.current(op) else { return }
+                do {
+                    guard let currentManager = try result.get().manager, let expected = op.identity,
+                          vpnIdentityMatches(expected, (currentManager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                    else { throw vpnError("CleanupUnknown: The current manager changed before Stop") }
+                    op.manager = currentManager
+                    self.observe(op, wanted: .disconnected)
+                    currentManager.connection.stopVPNTunnel()
+                    self.check(op, wanted: .disconnected)
+                } catch { self.finish(op, error: error) }
+            }
         }
         // An unresponsive Go worker must not prevent the user asking NE to stop.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: stop)
@@ -429,11 +487,22 @@ final class VpnPlugin: Plugin {
         var context = values
         context["command"] = "prepareStop"
         context["stopRequestID"] = op.requestID
+        context["observationNonce"] = op.stopArgs?.observationNonce
+        if let expectedGeneration = op.stopArgs?.expectedExtensionGeneration { context["extensionGeneration"] = expectedGeneration }
+        op.awaitingStopObservation = true
         do {
-            try session.sendProviderMessage(JSONSerialization.data(withJSONObject: context)) { _ in
-                DispatchQueue.main.async { stop() }
+            try session.sendProviderMessage(JSONSerialization.data(withJSONObject: context)) { data in
+                DispatchQueue.main.async {
+                    // The callback belongs only to this original operation, even
+                    // after its caller timed out. It cannot finish a successor.
+                    op.stopObservation = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                    op.awaitingStopObservation = false
+                    guard self.current(op) else { return }
+                    stop()
+                    self.check(op, wanted: .disconnected)
+                }
             }
-        } catch { stop() }
+        } catch { op.awaitingStopObservation = false; stop() }
     }
     private func check(_ op: VpnOperation, wanted: NEVPNStatus, allowInitialDisconnected: Bool = false) {
         guard current(op), let manager = op.manager else { return }
@@ -464,6 +533,33 @@ final class VpnPlugin: Plugin {
         }
     }
     private func finishStopped(_ op: VpnOperation) {
+        guard current(op), !op.awaitingStopObservation, !op.readingStopped else { return }
+        if let observation = op.stopObservation, let expected = op.identity, let args = op.stopArgs {
+            op.readingStopped = true
+            loadManager(create: false) { result in
+                guard self.current(op) else { return }
+                do {
+                    guard let manager = try result.get().manager,
+                          manager.connection.status == .disconnected || manager.connection.status == .invalid,
+                          vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration),
+                          observation["observationNonce"] as? String == args.observationNonce,
+                          let report = observation["report"] as? [String: Any],
+                          vpnIdentityMatches(expected, report["identity"] as? [String: Any])
+                    else { throw vpnError("CleanupUnknown: Live Stop observation changed original manager") }
+                    var snapshot: [String: Any] = ["status": manager.connection.status.rawValue,
+                        "running": false, "active": false, "profileExists": true]
+                    let evidence = vpnRetirementEvidence(profileIdentity: expected, expectedIdentity: expected,
+                        observation: observation, nonce: args.observationNonce, stopRequestID: args.requestID,
+                        expectedGeneration: args.expectedExtensionGeneration)
+                        ?? vpnSessionEvidence(profileIdentity: expected, report: report, stopRequestID: args.requestID)
+                    snapshot.merge(evidence) { _, live in live }
+                    if let failure = vpnStopFailure(evidence: snapshot, profileExists: true) { throw vpnError(failure) }
+                    self.uncertainSession = nil; self.uncertainReason = nil
+                    self.finish(op, snapshot: snapshot)
+                } catch { self.finish(op, error: error) }
+            }
+            return
+        }
         do {
             var status = try snapshot(op.manager, stopRequestID: op.requestID, includeHostUncertainty: false)
             if status["runtimeStopped"] as? Bool == true, status["cleanupError"] == nil, status["lastError"] == nil {
@@ -545,14 +641,17 @@ final class VpnPlugin: Plugin {
         return requestID
     }
 
-    private func finish(_ op: VpnOperation, error: Error? = nil, snapshot: [String: Any]? = nil) {
+    private func finish(_ op: VpnOperation, error: Error? = nil, snapshot: [String: Any]? = nil, noStoreEligible: Bool = true) {
         guard operation === op, generation == op.generation, !op.completed else { return }
         op.completed = true
         op.startIntent?.finish()
         operation = nil
         op.deadline?.cancel()
         if let observer = op.observer { NotificationCenter.default.removeObserver(observer) }
-        if let error { op.invoke.reject(error.localizedDescription) }
+        if let error, noStoreEligible, let terminal = op.startIntent?.noStoreTerminal() {
+            op.invoke.resolve(["nativeNoStoreTerminal": terminal, "startError": error.localizedDescription])
+        }
+        else if let error { op.invoke.reject(error.localizedDescription) }
         else { op.invoke.resolve(snapshot ?? ["cleanupEvidence": "CleanupUnknown"]) }
     }
 }

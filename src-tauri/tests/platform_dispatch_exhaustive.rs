@@ -2796,11 +2796,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy.rs",
         "target_os = \"ios\"",
-        5,
+        8,
         IosSide::DiffersRight,
-        "原 IOS_SESSION_ACTIVE 常量，加实际前台/权限错误常量及当前正常启动 native receipt 字段/构造。\
-         iOS 使用自己的 NE 绑定证据，Android 不持有 iOS session receipt；这些普通操作证据\
-         不证明 NE disposal，也不签发 NoOwner，既有 Unknown/清理债不变。",
+        "原 iOS 错误常量/正常 native receipt 槽及构造保留；新增 LocalStart/Observed exactly-one custody 表示与原槽方法。iOS 用自己的原 request/session/config/native 身份，Observed 无外来 MainBirthToken 且未 scoped关闭仍 occupied；Android 保原 JNI producer/booking，不消费 NE 字段。这里区分两端实际 producer 身份，不签 global NoOwner 或实际 iOS 运行验收。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
@@ -2924,10 +2922,10 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/commands/config.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS配置保存延迟资源删除，不以host/NE停止签发NoOwner。"),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "iOS在合法payload后拒绝独立probe构造；Android既有bridge保持，结果不冒充支持或owner清除。"),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS在合法payload后拒绝独立probe构造；Android既有bridge保持，结果不冒充支持或owner清除。"),
-    ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS TS login 接正常主 NE prerequisite 与真实本次 observer；authkey覆写已存身份仍拒绝，logout物理删除仍因Unknown拒绝。cancel只撤本次observer，不停正常连接；PCAndroid独立路径保留。"),
+    ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS普通TS login消费normal NE Ready与本次fresh STATUS；显式replaceIdentity才走同attempt旧Ready→exact Stop→scoped/SDK认证退休→目标CAS→fresh normal Ready，不从缓存存在推replacement意图。单独logout消费旧normal prerequisite并结束停止，保Taildrop且不递归删目录；PC/Android保原独立producer及真实TSgate认证退休。saved AuthKey产品选择、实际iOS编译/运行仍待，普通presentation不提供owner证明。"),
     ("src-tauri/src/commands/speedtest.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS测速先持真实run单飞身份等待正常主 NE prerequisite，再用ticket绑定池/回退I/O；若就绪后已停只退出，绝不构造临时Go owner。PCAndroid临时原路保留。"),
-    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "用户Stop原子claim后、TS gate等待前撤销captured previous generation上界内的精确native pending start，并保留撤销错误；正常Stop终态清ready receipt。任务cancel/timeout不触发Stop，迟Stop不撤更大继任。"),
-    ("src-tauri/src/runtime/proxy/prerequisite.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS正常producer ticket捕获native私有完整session receipt，每次target操作前后fresh observe_session；Android没有iOS NE API且保留自己的桥。ticket只证明普通操作ready，不证明Stop/disposal或NoOwner。"),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS 原用户 Stop 仍撤销 captured previous generation 上界内 native pending start；新增 claimed action 的 exact-current producer cancel 收口，await 原 future 后走同一 normal Stop。superseded Ok(None) 不授权下一 Start，取消不影响已有正常连接的只读 observer；Android 保原 claim/bridge Stop，未伪造 NE 全域清理。"),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "target_os = \"ios\"", 10, IosSide::DiffersRight, "iOS 原 normal ticket/observe_session 保留，新增 saved/candidate 预检、原 managed lease、冷 manager+nonce observe 的同 attempt/G0 登记、旧 Ready exact Stop→完整 scoped writer退休→Bound auth-only或sealed无写幂等→目标CAS。两次 normal birth 均持原 generation/cancel，fresh Ready 才第一次 presentation绑定；Android 保自己的 normal producer，绝不消费 iOS SDK回执或外来token。本批lease/candidate预检已复用原方法供PC/Android，撤两个iOS-only属性并新增hot live Ready helper，11→10仅真实净计数；共享纯helper不扩大writer准入。源码合同不替代实际 iOS 编译/运行。"),
     ("src-tauri/src/runtime/proxy/prerequisite.rs", "all(test, not(target_os = \"ios\"))", 3, IosSide::WithAndroid, "纯trait/mock模块与两个ready-commit fixture accessor只在host测试编译；生产release两移动端同不编译。iOS opaque native receipt不可由host mock伪造，iOS原生状态机/SDK门另由独立收据覆盖，真机验收仍未执行。"),
     ("src-tauri/src/commands/window.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 1, IosSide::WithAndroid, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
     ("src-tauri/src/commands/window.rs", "target_os = \"android\"", 2, IosSide::DiffersRight, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
@@ -2941,13 +2939,28 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/lib.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS插件/共享目录/冷会话只对账；新增桌面退出veto仅桌面，原其它not(android)债仍保留。"),
     ("src-tauri/src/runtime/proxy/pending_changes.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS保留删除journal，不把主App无Child当跨进程资源清理证明。"),
     ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"android\"", 4, IosSide::DiffersRight, "iOS两停核入口委托NE且保留TS claim，cold host/stale只对账；独立Androidbooking原样保留。"),
-    ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS两停核入口委托NE且保留TS claim，cold host/stale只对账；独立Androidbooking原样保留。"),
+    ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"ios\"", 5, IosSide::DiffersRight, "iOS 原两停核入口/冷对账保留，新增 N typed原实例回执转只读全run/node视图；local原token只在原gate与whole claim/full census终态一致时compare-remove，Observed精确session/request/config/extGen同原run/nonces/canonical scope关闭后才允许继任。pre-Ready不伪造Ready，未知仍保原custody；Android原独立booking/JNI准入不变，不授global NoOwner。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "any(target_os = \"android\", target_os = \"ios\")", 4, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 3, IosSide::WithAndroid, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"android\")", 3, IosSide::DiffersUndecided, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的进程端口退役现为所有平台共用，剩余三处分派的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "not(target_os = \"ios\")", 1, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"android\"", 7, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留。管理API的ledger/import三处分派已消除，所有平台同进程禁止主端口跨代复用。"),
     ("src-tauri/src/runtime/proxy/startup.rs", "target_os = \"ios\"", 6, IosSide::DiffersRight, "iOS独立NE start/代次/arm reservation、原生存活与预检构造禁用；desktop check-owner admission及Androidbridge原样保留，共享endpoint/主口的iOS运行证据待验。"),
+    // TS account retirement: exact source-only platform split; runtime/SDK acceptance remains separate.
+    ("src-tauri/src/runtime/mesh.rs", "target_os = \"ios\"", 2, IosSide::DiffersRight, "剩余两个 iOS thin consumer 只接原Arc keeper的实际TSgate退休及正常logout prerequisite；MainBirthToken完整scope helper现由iOS/Android共用；iOS用N原NE/SDK回执，Android原JNI主核/瞬态closure不经这些接口。认证退休保Taildrop与混合FileStore其它值，不mint MeshNoOwner/全域清理证明。"),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "not(target_os = \"ios\")", 1, IosSide::DiffersRight, "非iOS保原 normal Start future await；iOS原producer新增同attempt取消收口并等待原future后exact Stop。Android不调用N/NE停止API，保自己的JNI birth/cancel规则；此行只登记分派差异，不扩TS写权限或managed准入。"),
+    ("src-tauri/src/runtime/proxy/process_supervision.rs", "any(target_os = \"ios\", test)", 7, IosSide::DiffersRight, "两个只读run/node视图、两个索引类型、索引函数与Ready/pre-Ready两个whole-census validator供iOS N consumer，host tests同编完整claim正反例。test=false的release/debug两组均iOS=true Android=false；Android实际booking不用NE/G封闭回执。pure validator不能独自释放token，只有原gate+原issuer/header/scope consumer可compare-remove，未签实际iOS运行。"),
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "not(target_os = \"ios\")", 2, IosSide::DiffersRight, "ordinary非iOS action沿原captured generation，不接iOS冷Stop导致的generation更新；另一个同谓词local位于外层ios-only replacement函数内，Android连整个父函数都不编，不能称两个Android新consumer。iOS路径由exact原Stop的返回更新下一birth绑定，Android原browser/authkey临时producer不变。"),
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "target_os = \"ios\"", 5, IosSide::DiffersRight, "iOS正常logout、原token的whole claim scope、显式replacement dispatch及cold origin更新接原N/G/SDK chain；旧normal Ready→sameattempt Stop/认证退休/CAS→fresh正常Ready与fresh STATUS。原token/actualgate与Bound删除权威分离，sealed unbound只准D changed=false原字节无写；Android保原临时login/CAS入口，未把presentation false当清理证明或宣称设备验收。"),
+    // AuthKey retention: measured platform sites; the shared pure candidate/lease helpers
+    // serve the original transaction; Android rejects new credential transactions
+    // until its original host supplies a scoped writer terminal, without adding proof here.
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "all(test, not(target_os = \"ios\"))", 1, IosSide::WithAndroid, "原registry/mock依赖注入夹具只供host测试核同一个Mesh/Proxy实际gate、原producer和saved CAS。求值器test=false的release/debug两移动端同不编译；不发行iOS NE回执或owner事实。"),
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "not(target_os = \"ios\")", 3, IosSide::DiffersRight, "三个原start_attempt_inner非iOS局部分派保PC/Android独立登录路径；activate_pc_credential现另以非iOS且非Android谓词编译，PC仍原TSgate/Main负门/transient实际closure及captured generation/cancel/CAS。Android实际scoped消费者另列，Unknown仍拒写且empty JNI ACK不证明writer终态；iOS保原normal NE custody/Ready/Stop，不借其它producer提供清理证明。"),
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "三个原normal-main登录局部只服务iOS已有credential scope的同attempt准入：原origin custody/managed lease与TSgate、真实Main负门/其它attempt关闭后，同captured generation/cancel CAS提交实际文档，原normalStart以实际新digest取得Ready。hot Logout只消费原live Ready而不冷起核，cold先停用旧key再同pipeline启动无key保存文档；Android原JNI temporary producer独立保留。该源码登记不签iOS编译、SDK运行、授权成功或NoOwner。"),
+    ("src-tauri/src/runtime/proxy/prerequisite.rs", "any(target_os = \"ios\", test)", 1, IosSide::DiffersRight, "Logout入口使用的纯冷/热判据供iOS真实consumer与host测试；test=false release/debug均iOS=true Android=false，host test inclusion不是平台运行证明。原LocalStart未闭合且ready缺失/未committed两种running值都Unknown，不先Stop后伪cold；已committed live沿原ticket/digest/target校验，Observed冷恢复沿原prepare，公共login/replacement producer不改。"),
+    ("src-tauri/src/runtime/mesh.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "Android Logout分派到同原Main或Login私有custody、完整writer family与同原Entry target reservation后消费严格认证FileStore退休/CAS；Unknown仍零写，不消费ordinary JNI ACK。iOS命令先return原normal NE/G消费者，PC保持原gate/main-negative/actualchild腿；这里只登记源码平台分派，未签实际Android SDK/运行或NoOwner。"),
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "target_os = \"android\"", 2, IosSide::DiffersWrongToday, "新增credential事务在close旧entry/激活之前拒无scoped proof，另一个拒把empty JNI close ACK用于promoted-CAS补偿；逐点两处Android拒绝正确、零FS写/零补偿。相同(file,predicate)旧8站点仍含iOS不适用的桌面独立producer，原组级WrongToday保持，新2仅保守同组计数，并非新增两处iOS运行错误或新架构错误；旧8理由不改，既有iOS正常Main和Androidlegacy login不受此拒绝。真实Androidadapter未交付，守卫不提供NoOwner。"),
     // PC temp native-only slice: preserve the original 21/2 debt subcounts and reasons.
     // The verdict belongs to the whole (file, predicate) group, not each new representation.
     (
@@ -2984,6 +2997,126 @@ const CFG_REGISTRY: &[CfgSite] = &[
         2,
         IosSide::DiffersRight,
         "PC prepared 分流后的 Android spawned 仍调用原进程内 libbox spawner，Android Err 仍执行原 config cleanup；两处保持原 Android 行为，不进入 PC native booking，也不把默认 None/普通 close 当 native fact。iOS 不引用 Android JNI；其独立 temp 由原产品负门拒绝。",
+    ),
+    // Android scoped R/K integration: exact current source census; historical debt groups below remain.
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersRight,
+        "Android真实消费者与host纯FS负门共用同一个认证退休实现，严格actual gate、当前runtime run、canonical file、sealed revision与profile证明；test=false的iOS不编译Android helper，iOS使用原N/G消费者。host test inclusion不是Android运行或NoOwner证明。",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"ios\", target_os = \"android\")",
+        1,
+        IosSide::WithAndroid,
+        "原完整MainBirthToken scope查询helper从iOS扩到Android原Main consumer，body保持原token/actual TSgate关系；release/debug两端同编译，未把观察票或validation借作外来token。",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersRight,
+        "PC原Logout credential腿在Android由原私有scoped Main/Login消费者替代；唯一commands caller在iOS先return原normal-main logout，因此此编译侧并非iOS可达的桌面认证退休路径。Android独立登录/退出不新增VPN前置，ordinary Stop语义不变。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge/tailscale_store.rs",
+        "target_os = \"android\"",
+        15,
+        IosSide::DiffersRight,
+        "新增15个Android原plugin调用/opaque validation与Warm tuple访问、begin/read/close/专用finish入口，仅原Android Entry可签同ticket/nonce/digest/full census。iOS不编译JNI，沿N原NE producer；Complete membership不等于writer terminal，beforeBirth只来自原ID墓碑，Unknown不提供NoOwner。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        "any(target_os = \"ios\", target_os = \"android\")",
+        1,
+        IosSide::WithAndroid,
+        "原stop_for_tailscale_action同captured generation/attempt复用到Android，同一次原Stop实际返回更新generation；superseded Ok(None)仍拒绝。iOS专用native revoke保持内层cfg，两端共同helper不提供额外native退休事实。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/prerequisite.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersRight,
+        "Android当前被选runtime run的node筛选由实际consumer与host pure negatives共用；only original last observed nonce/digest/full canonical scope，不能选历史Bound或validation。test=false生产iOS仍走自己的原scope validator。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/prerequisite.rs",
+        "target_os = \"android\"",
+        8,
+        IosSide::DiffersRight,
+        "Android原Ready实际raw config digest字段/构造与用户目录、目标canonical路径、saved CAS/当前Main Stop及FS薄consumer共8处；只关联原JNI custody，raw digest缺失保Unknown。iOS原N custody/Ready/Stop独立，不消费Android票或以presentation false授权。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "any(target_os = \"android\", test)",
+        1,
+        IosSide::DiffersRight,
+        "complete_scoped_action复用实际Android begin/commit/finish与host异步负门；commit真实成功先记原Attempt exact CAS，finish Unknown保原token。test=false iOS不编译Android action helper，host模拟不签native闭合。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "any(target_os = \"ios\", target_os = \"android\")",
+        1,
+        IosSide::WithAndroid,
+        "原main_scope_if_token同body扩到Android原Main consumer；两端release/debug同编译，必须原token+actual TSgate，scope名单不独立提供writer终态。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "any(target_os = \"ios\", target_os = \"android\", test)",
+        2,
+        IosSide::WithAndroid,
+        "原canonical nearest-existing-ancestor/root containment与claimed original Arc keeper退休helper供iOS及Android真实consumer共用，host只验同body。两端release/debug同编译；不添加新registry、FSM或NoOwner。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(any(target_os = \"ios\", target_os = \"android\"))",
+        1,
+        IosSide::WithAndroid,
+        "activate_pc_credential仅PC原gate/Child退休/CAS；Android新增实际私有Entry scoped consumer，iOS原normal NE consumer分别接自己的入口。两移动端release/debug均不编译PC函数；不是谓词语法换键洗旧债。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        4,
+        IosSide::DiffersWrongToday,
+        "新增四个PC cancellation局部及ordinary非Android Warm参数/校验分派逐点不发行Android native事实；同(file,predicate)组仍含iOS不可用的桌面Tokio独立producer，保持原2+8子计数及理由，新增4仅未闭合组级保守登记，并非四个新增iOS运行错误。iOS产品仍原normal Main入口。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        31,
+        IosSide::DiffersWrongToday,
+        "新增31处Android opaque original Entry元数据、Main/Login current-run选择、全family target action、精确CAS/取消、Cold validation tuple及原唯一launcher Warm接线逐点属于Android真实scoped消费者。相同(file,predicate)旧8+2组仍包含iOS不适用的桌面独立producer，旧理由/判决保持；新31是同组保守计数，不称31个新增iOS运行错误。原nil ACK、validation或membership不签runtime Bound/NoOwner，实际SDK验收另列。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core/attempts.rs",
+        "any(target_os = \"android\", test)",
+        10,
+        IosSide::DiffersRight,
+        "十处Android原Attempt held-action表示、activity/handoff、exact Arc booking/release与占用/prune规则供实际consumer及host负门；只保可恢复原token，不生成native receipt。test=false iOS不编译该slot，沿原自己的custody，host inclusion不授owner或NoOwner。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core/attempts.rs",
+        "any(target_os = \"ios\", target_os = \"android\", test)",
+        1,
+        IosSide::WithAndroid,
+        "原retire_node_except_claimed同original Arc/registry/gate helper扩到Android，与iOS及host测试共用body；两移动端同编译，不按字符串豁免claimed请求。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core/attempts.rs",
+        "not(any(target_os = \"android\", test))",
+        1,
+        IosSide::DiffersRight,
+        "非Android生产只返回无Android held slot；iOS自己的custody不经Android reservation。Android和host tests消费真实booking检查，test=false release/debug明确两端反侧；常量false不声明native无writer。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core/attempts.rs",
+        "target_os = \"android\"",
+        7,
+        IosSide::DiffersRight,
+        "七处原Attempt AndroidStoreCustody槽/构造/getters及Runtime或Warm原私有句柄sum保同Entry可恢复身份；没有新registry/FSM。iOS不持Kotlin私有ticket，缺runtime payload仅保Warm tuple可管理而不能冒签NoConstruction。",
     ),
 ];
 
@@ -3420,12 +3553,27 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// WrongToday 78→94；不声称 opaque 表示自身错误或新增 16 个 iOS 运行错误。
 /// 原 26 行债全部保留，新增两个子计数行：共 28 行、24 个唯一组、119 处；
 /// iOS 正常 Main/拒独立 temp 保持，没有债被还清或重判，未取得 iOS 运行/disposal 证明。
+/// 2026-10-06（TS auth retirement R源码登记）：原守卫实到393→428 / 101→109对，
+/// 新增/增长12种谓词共35站点均为具名iOS/非iOS producer或test可编helper分派；
+/// DiffersRight179→214。原所有判决、28行/24唯一组/119处具名债不变；
+/// 原解析/取材/floor/正反断言不变，source-only登记不签实际iOS/SDK/运行。
+/// AuthKey 本批实际428→438 / 109→110：原纯helper复用撤两种属性、精确新登记与增长。
+/// Android新拒无proof两站点加入旧WrongToday同谓词组，逐点拒绝正确；
+/// 不是两个新iOS运行错误，旧8站点理由/判决保留。债29行/24唯一组/121处，
+/// Right221/Wrong96/WithAndroid72，未将临时Android拒绝签作能力完成。
+/// Android scoped R/K integration: actual 438→519 sites / 110→122 keys. Shared original
+/// Main/Stop/keeper helpers broaden prior iOS-only attributes; their bodies keep the
+/// original token/Arc/generation gates. Android private custody/Warm consumers are separate.
+/// Historical WrongToday groups retain every original row/reason; +4 non-Android and +31
+/// Android group members are conservative group census, not 35 new iOS runtime failures.
+/// Debt is 31 tuple rows / 24 unique groups / 156 sites; no historical debt was repaid.
+/// Source-only registration does not sign Android/iOS SDK execution, global cleanup or NoOwner.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 179),
+    ("DiffersRight", 260),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 94),
-    ("WithAndroid", 71),
+    ("DiffersWrongToday", 131),
+    ("WithAndroid", 79),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3568,12 +3716,27 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "not(target_os = \"android\")",
+        4,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
         8,
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "target_os = \"android\"",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
         8,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        31,
     ),
 ];
 

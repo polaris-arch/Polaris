@@ -97,7 +97,7 @@ export type MobileFormDesc =
   | { kind: 'warp'; edit?: boolean }
   /** Tailscale **登录**表：浏览器登录 / Auth Key 两条腿。带 `serverId` = 给该既有节点换 key /
       换控制面；不带 = 新建（Tailscale 已不是单例，没有 id 时**不猜**，直接走新建路径）。 */
-  | { kind: 'ts-login'; serverId?: string }
+  | { kind: 'ts-login'; serverId?: string; replaceIdentity?: boolean }
   /** Tailscale **设置**表：`ts-spec` 那张 20 余项的表。**必须带 id** —— Tailscale 已不是单例，
       面板自查「任意一个」会让编辑第二个节点打开/写坏第一个。 */
   | { kind: 'ts-settings'; serverId: string }

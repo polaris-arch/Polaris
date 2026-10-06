@@ -101,13 +101,17 @@ internal object TransientSpeedtestHost {
         private var network: TransientLoginNetwork? = null
         private var server: CommandServer? = null
         private var cleanupProof = true
+        private var store: AndroidTailscaleStoreCustody? = null
         private val cleanup = TransientHostCleanup(
             beginResolverClose = { network?.beginResolverClose() },
             closeService = { server?.closeService() },
-            closeServer = { server?.close() },
+            // operationFinished must join before the final whole-run capture/handle release.
+            closeServer = {},
             closeNetwork = { network?.close() },
             resolverUnknown = { cleanupProof = false },
         )
+
+        override fun bindTailscaleStore(store: AndroidTailscaleStoreCustody) { check(this.store == null); this.store = store }
 
         override fun prepare() {
             PolarisApplication.ensureSetup()
@@ -119,10 +123,20 @@ internal object TransientSpeedtestHost {
         }
 
         override fun start() {
-            requireNotNull(server).startOrReloadService(config, OverrideOptions())
+            val original = requireNotNull(server)
+            checkNotNull(store).invoke(config, { AndroidTailscaleStoreCustody.export(original) }) {
+                original.startOrReloadService(config, OverrideOptions())
+            }
         }
 
         override fun close() = cleanup.close()
+
+        override fun finishClose() {
+            val original = server ?: return
+            store?.closed { AndroidTailscaleStoreCustody.export(original) }
+            original.close()
+            server = null
+        }
 
         override fun cleanupConfirmed(): Boolean = cleanupProof
     }

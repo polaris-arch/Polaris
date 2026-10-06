@@ -14,7 +14,7 @@
  *  - `api.server.tailscaleGetStatus` = REAL（`server.rs`：读 `MeshRuntime` 的 STATUS 末帧缓存，`connected`
  *    = 主核是否在跑）→ 核未跑 / 无在册 TS 节点时候选为空 → 优雅降级：下拉仅「无 / 自定义…」，
  *    给「未连接或无可用出口，可手动填写」提示，不空白卡死。
- *  - `api.server.tailscaleLogout` = REAL（清 state 目录）。
+ *  - `api.server.tailscaleLogout` = REAL（只清目标认证记录，保留 Taildrop）。
  *  - 保存经 `api.server.update`（把表单写回该 TS 节点的 tailscaleSettings）。
  *
  * **Auth Key 状态行**（基础页底部）：只呈现「已保存 / 未保存 / 待清除」这一个布尔事实 + 一颗
@@ -30,6 +30,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
+import { tsLoginErrorReason } from './ts-login-server';
+import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
 import { api } from '@/ipc';
 import type { MeshInboundPolicy, ServerConfig } from '@/contracts/types';
@@ -50,6 +52,9 @@ import {
   invalidTsCidrs,
   invalidControlUrl,
   peersForTsNode,
+  tsCredentialClearIntent,
+  tsCredentialSource,
+  tsCredentialSaveErrorKey,
 } from './ts-settings-logic';
 import { applyDetour, endpointDetourOptions } from './detour-options';
 import { TS_ADV_SPEC, tsMainSpec } from './ts-spec';
@@ -62,7 +67,7 @@ import { useDialogStore } from './dialog-store';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { groupTsFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
-import { hasTsAuthKey } from '@/domain/tailscale-conn-state';
+import { hasTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { InfoIcon } from '@/components/InfoIcon';
 import { cn } from '@/lib/utils';
@@ -119,9 +124,10 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
    *  ① 本弹窗**每一项**都是保存才生效；一个动作独走会让同一个界面有两套提交语义；
    *  ② 暂存层开着时（`STAGED_CONFIG_ENABLED` 默认 true）`servers` 的编辑恒走暂存，
    *     所谓「立刻」本来就落不了盘 —— 写成立刻只会让文案撒谎。
-   * 故这里只记意图，真正删键由 `buildTsSettings(..., authKeyCleared)` 在提交时完成。
+   * 故这里只捕获清除意图与原 revision；同次保存/暂存经后端原写锁校验后清除凭据。
    */
-  const [authKeyCleared, setAuthKeyCleared] = useState(false);
+  const [authKeyCleared, setAuthKeyCleared] = useState(!!node?.tailscaleCredentialIntent);
+  const [credentialClearIntent, setCredentialClearIntent] = useState(node?.tailscaleCredentialIntent);
   const { armed, confirmTwice } = useConfirmTwice();
 
   // 出口候选：拉状态快照（核未跑 / 无节点时为空）。connected=false 时静态提示手动填写。
@@ -228,18 +234,23 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
    * 已存 authKey 的**存在性**（布尔，绝不是 key 本身）。判据取 `domain/tailscale-conn-state.ts`
    * 那一份 —— 节点卡的 `key-ready` 档说的就是同一件事，两处不许各判各的。
    */
-  const authKeyStored = hasTsAuthKey(node);
+  const credentialNode = tsCredentialSource(node, diskServers);
+  const authKeyStored = hasTsAuthKey(credentialNode);
+  const retainedAuthKeyStored = hasTsRetainedAuthKey(credentialNode);
 
   /**
    * 清除 Auth Key —— 原地二次点击（与删规则/删节点同一交互类，理由见 `ConfirmDialog` 头注：
    * 破坏性操作不再叠弹窗）。它与「退出登录」是**两件事**，刻意不合并：
-   *  · 退出登录（`handleLogout`）清的是磁盘上的 tsnet state 目录 = 当前这次登录的身份；
+   *  · 退出登录（`handleLogout`）清的是该节点当前认证记录，保留收件文件；
    *  · 清除 Auth Key 清的是 config 里的静态凭据 = 下次认证拿什么去认。
    * 于是清完 key 后本节点**仍然连着**（state 目录里的 node key 照样有效），变的是「state 一旦
    * 失效/被清，就没有能自动重认的凭据了，得重新登录」。这两句正是 `ts.authKeyClearHint` 的内容。
    */
   const requestClearAuthKey = () => {
     confirmTwice(AUTH_KEY_CLEAR_KEY, () => {
+      const intent = tsCredentialClearIntent(credentialNode);
+      if (!intent) return;
+      setCredentialClearIntent(intent);
       setAuthKeyCleared(true);
       setDirty(true); // 与改任何一个字段同权：直接关窗要走「放弃更改？」那条闸门
     });
@@ -281,6 +292,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     try {
       // detour 在顶层，`buildTsSettings` 够不着 —— 单独写回（哨兵 ⇒ 删键）。
       const next = applyDetour({ ...node, tailscaleSettings: buildSettings() }, draft.detour);
+      if (credentialClearIntent) next.tailscaleCredentialIntent = credentialClearIntent;
       next.name = name;
       applyMeshInboundPolicy(next, policy);
       applyOnDemand(next, draft.onDemand);
@@ -302,11 +314,11 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
       await api.server.update(next);
-      void loadConfig(true);
+      await loadConfig(true);
       close();
     } catch (e) {
-      console.error('[TsSettingsDialog] save failed:', e);
-      toast.error(t('common.saveFailed'));
+      console.error('[TsSettingsDialog] save failed');
+      toast.error(t(tsCredentialSaveErrorKey(e)));
     } finally {
       setBusy(false);
     }
@@ -343,8 +355,8 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
     } catch (e) {
       // 登出不是保存 —— 标题取 NodesScreen:696 同一操作已在用的那个键，别套 `common.saveFailed`。
       console.error('[TsSettingsDialog] logout failed:', e);
-      const busy = e && typeof e === 'object' && 'code' in e && e.code === 'TAILSCALE_LOGOUT_MAIN_CORE';
-      toast.error(t(busy ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail'));
+      const reason = tsLoginErrorReason(e);
+      toast.error(t(reason ? loginFailureReasonKey(reason) : 'nodes.meshTsLogoutFail'));
     } finally {
       setBusy(false);
     }
@@ -352,7 +364,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
 
   /**
    * Auth Key 状态行 —— 归**基础**页而非高级：本行存在的理由就是「用户此前无从知道盘上还躺着一把
-   * 长期凭据」（`TsLoginDialog` 的输入框从不回填、退出登录也明说保留 authKey）。把唯一的可见面
+   * 长期凭据」（`TsLoginDialog` 的输入框从不回填、退出登录后保留已停用的 key）。把唯一的可见面
    * 再折进高级页，等于只解决了一半。footer 账号动作按本机 state 是否存在切换登录/退出。
    *
    * ⚠️ 这里渲染的每一样东西都是**布尔派生**：三档状态文案 + 一颗按钮。key 的明文、前缀、后几位、
@@ -370,15 +382,18 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             ? t('ts.authKeyClearPending')
             : authKeyStored
               ? t('ts.authKeySaved')
+              : retainedAuthKeyStored
+                ? t('ts.authKeyRetained')
               : t('ts.authKeyNone')}
         </span>
       </div>
-      {authKeyStored && !authKeyCleared && (
+      {(authKeyStored || retainedAuthKeyStored) && !authKeyCleared && (
         <button
           type="button"
           className={cn('btn ghost', armed === AUTH_KEY_CLEAR_KEY && 'confirming')}
           style={{ color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
           onClick={requestClearAuthKey}
+          disabled={busy || !tsCredentialClearIntent(credentialNode)}
         >
           {armed === AUTH_KEY_CLEAR_KEY ? t('ts.authKeyClearAgain') : t('ts.authKeyClear')}
         </button>
@@ -395,7 +410,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       className="entry-form-dlg"
       footer={
         <>
-          {hasLoginState === true ? <button
+          {hasLoginState === true ? <><button
             type="button"
             className="btn ghost"
             onClick={() => void handleLogout()}
@@ -403,7 +418,10 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
             style={{ marginRight: 'auto', color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
           >
             {t('ts.logout')}
-          </button> : <button
+          </button><button type="button" className="btn ghost" disabled={busy || !node}
+            onClick={() => { if (node) { close(); open({ kind: 'ts-login', serverId: node.id, replaceIdentity: true }); } }}>
+            {t('meshJoin.switchAccount')}
+          </button></> : <button
             type="button"
             className="btn ghost"
             disabled={busy || !node}

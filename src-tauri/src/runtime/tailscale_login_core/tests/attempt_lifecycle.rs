@@ -72,6 +72,9 @@ fn request(id: &str) -> LoginRequest {
     LoginRequest {
         attempt_id: id.into(),
         mode: LoginMode::Browser,
+        replace_identity: false,
+        reuse_retained_auth_key: false,
+        expected_credential_revision: None,
     }
 }
 fn offline() -> MainLoginSnapshot {
@@ -1082,6 +1085,9 @@ async fn authkey_is_in_secure_config_but_not_failed_diagnostic_and_browser_omits
                 LoginRequest {
                     attempt_id: id.into(),
                     mode,
+                    replace_identity: false,
+                    reuse_retained_auth_key: false,
+                    expected_credential_revision: None,
                 },
                 &offline,
                 emitter.clone(),
@@ -1215,7 +1221,10 @@ async fn authkey_replacement_preserves_prepared_request_and_waits_before_delete_
             &ud,
             LoginRequest {
                 attempt_id: "replacement".into(),
-                mode: LoginMode::Authkey
+                mode: LoginMode::Authkey,
+                replace_identity: false,
+                reuse_retained_auth_key: false,
+                expected_credential_revision: None,
             },
             &offline,
             Arc::new(FakeEmitter::default())
@@ -1342,7 +1351,10 @@ async fn main_owner_does_not_authorize_new_credentials_from_old_endpoint() {
             &ud,
             LoginRequest {
                 attempt_id: "new-key".into(),
-                mode: LoginMode::Authkey
+                mode: LoginMode::Authkey,
+                replace_identity: false,
+                reuse_retained_auth_key: false,
+                expected_credential_revision: None,
             },
             &|| MainLoginSnapshot {
                 alive: true,
@@ -2120,4 +2132,1216 @@ async fn transient_running_success_ignores_a_residual_invalid_auth_url() {
         .all(|p| p.2 != "failed"));
     assert!(emitter.captured.lock().unwrap().is_empty());
     std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[tokio::test]
+async fn claimed_retirement_keeper_is_the_original_arc_and_never_waits_on_itself() {
+    let registry = LoginCoreRegistry::production();
+    registry.prepare("target", "own").await.unwrap();
+    registry.prepare("target", "other").await.unwrap();
+    let own = registry.attempts.get("target", "own").unwrap();
+    own.claimed.store(true, Ordering::SeqCst);
+    let other = registry.attempts.get("target", "other").unwrap();
+    let gate = registry.state_gate().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.retire_other_attempts_under_state_gate("target", &gate, &own),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!own.cancelled());
+    assert!(!own.is_finished());
+    assert!(other.cancelled());
+    assert!(other.is_finished());
+    assert!(registry.attempts.get("target", "other").is_err());
+    let foreign = Attempts::default().prepare("target", "own").unwrap();
+    foreign.claimed.store(true, Ordering::SeqCst);
+    assert!(registry
+        .retire_other_attempts_under_state_gate("target", &gate, &foreign)
+        .await
+        .is_err());
+    own.cancel();
+    assert!(registry
+        .retire_other_attempts_under_state_gate("target", &gate, &own)
+        .await
+        .is_err());
+    assert!(
+        !own.is_finished(),
+        "the internal keeper is not marked done by another owner"
+    );
+}
+
+#[cfg(not(target_os = "ios"))]
+struct CredentialFixture {
+    proxy: Arc<ProxyRuntime>,
+    mesh: Arc<crate::runtime::mesh::MeshRuntime>,
+    directory: crate::test_support::TestDir,
+    spawner: Arc<FakeSpawner>,
+    saved: Value,
+    gate: Arc<polaris_core_supervisor::LifecycleGate>,
+}
+
+#[cfg(not(target_os = "ios"))]
+impl CredentialFixture {
+    fn new(active: bool) -> Self {
+        let spawner = fake_spawner(vec![], false, false);
+        Self::with_dependencies(
+            active,
+            spawner.clone(),
+            spawner,
+            Arc::new(FakeChecker { ok: true }),
+        )
+    }
+    fn with_dependencies(
+        active: bool,
+        spawner: Arc<FakeSpawner>,
+        actual_spawner: Arc<dyn LoginCoreSpawner>,
+        checker: Arc<dyn ConfigChecker>,
+    ) -> Self {
+        let registry = LoginCoreRegistry::with_deps(
+            actual_spawner,
+            checker,
+            fake_subscriber(false),
+            Arc::new(|| Ok(PathBuf::from("/fake/sing-box"))),
+            Duration::from_secs(60),
+        );
+        let (proxy, mesh, directory, gate) = ProxyRuntime::credential_fixture_for_test(registry);
+        let manager = proxy.config_for_commit_test();
+        let mut saved = manager.current().unwrap();
+        saved["servers"] = json!([{
+            "id":"ts1", "name":"Credential fixture", "protocol":"tailscale",
+            "tailscaleSettings": {
+                "sourceTag":"credential-tag", "unknown":"keep",
+                "retainedAuthKey":{"authKey":"retained-test-key", "controlAuthority":"https://controlplane.tailscale.com"}
+            }
+        }]);
+        if active {
+            saved["servers"][0]["tailscaleSettings"]["authKey"] = json!("retained-test-key");
+        }
+        manager.save_full(&saved).unwrap();
+        let saved = manager.current().unwrap();
+        Self {
+            proxy,
+            mesh,
+            directory,
+            spawner,
+            saved,
+            gate,
+        }
+    }
+
+    fn registry(&self) -> &LoginCoreRegistry {
+        self.mesh.login_registry_for_test()
+    }
+
+    fn request(&self, id: &str, mode: LoginMode, reuse: bool) -> LoginRequest {
+        LoginRequest {
+            attempt_id: id.into(),
+            mode,
+            replace_identity: true,
+            reuse_retained_auth_key: reuse,
+            expected_credential_revision:
+                polaris_config_engine::user_config::effective_view::tailscale_credential_revision(
+                    &self.saved["servers"][0],
+                ),
+        }
+    }
+
+    async fn start(&self, request: LoginRequest) -> StartLoginOutcome {
+        let mut candidate = self.saved["servers"][0].clone();
+        let settings = candidate["tailscaleSettings"].as_object_mut().unwrap();
+        settings.remove("retainedAuthKey");
+        settings.remove("authKey");
+        let (candidate, backend_owned) =
+            resolve_tailscale_credential_candidate(&self.saved, &candidate, &request).unwrap();
+        assert!(backend_owned);
+        let requested: ServerConfig = serde_json::from_value(candidate.clone()).unwrap();
+        self.registry()
+            .prepare("ts1", &request.attempt_id)
+            .await
+            .unwrap();
+        let generation = self.proxy.core_generation();
+        self.registry()
+            .start_attempt_with_normal_main(
+                &requested,
+                &self.directory,
+                request,
+                &|| {
+                    serde_json::from_value(
+                        self.proxy.config_for_commit_test().current().unwrap()["servers"][0]
+                            .clone(),
+                    )
+                    .map_err(|_| "fixture saved node invalid".into())
+                },
+                &|| MainLoginSnapshot {
+                    generation,
+                    ..Default::default()
+                },
+                Arc::new(FakeEmitter::default()),
+                &self.proxy,
+                &self.saved,
+                None,
+                &candidate,
+                generation,
+            )
+            .await
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn retained_key_reuse_uses_original_gate_saved_cas_and_single_mock_producer() {
+    let fixture = CredentialFixture::new(false);
+    assert!(matches!(
+        fixture
+            .start(fixture.request("reuse", LoginMode::Authkey, true))
+            .await,
+        StartLoginOutcome::Started
+    ));
+    assert_eq!(fixture.spawner.count.load(Ordering::SeqCst), 1);
+    let saved = fixture.proxy.config_for_commit_test().current().unwrap();
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["authKey"],
+        "retained-test-key"
+    );
+    assert_eq!(saved["servers"][0]["tailscaleSettings"]["unknown"], "keep");
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["sourceTag"],
+        "credential-tag"
+    );
+    let generated: Value =
+        serde_json::from_slice(&std::fs::read(sole_login_config(&fixture.directory)).unwrap())
+            .unwrap();
+    let emitted = generated.to_string();
+    assert!(
+        emitted.contains("retained-test-key"),
+        "explicit key request reaches the original endpoint builder"
+    );
+    assert!(!emitted.contains("retainedAuthKey"));
+    assert!(!emitted.contains("tailscaleCredentialRevision"));
+    fixture
+        .registry()
+        .cancel_attempt("ts1", "reuse")
+        .await
+        .unwrap();
+    let cancelled = fixture.proxy.config_for_commit_test().current().unwrap();
+    assert!(cancelled["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        cancelled["servers"][0]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "retained-test-key"
+    );
+    assert!(fixture.spawner.spawned.lock().unwrap()[0]
+        .terminated
+        .load(Ordering::SeqCst));
+    assert!(login_configs(&fixture.directory).is_empty());
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn explicit_browser_with_active_revision_parks_key_before_original_birth() {
+    let fixture = CredentialFixture::new(true);
+    assert!(matches!(
+        fixture
+            .start(fixture.request("browser", LoginMode::Browser, false))
+            .await,
+        StartLoginOutcome::Started
+    ));
+    let saved = fixture.proxy.config_for_commit_test().current().unwrap();
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "retained-test-key"
+    );
+    let emitted = std::fs::read_to_string(sole_login_config(&fixture.directory)).unwrap();
+    assert!(!emitted.contains("retained-test-key"));
+    assert!(!emitted.contains("retainedAuthKey"));
+    fixture
+        .registry()
+        .cancel_attempt("ts1", "browser")
+        .await
+        .unwrap();
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn done_flag_during_real_close_cannot_compensate_or_touch_successor() {
+    let fixture = Arc::new(CredentialFixture::new(false));
+    assert!(matches!(
+        fixture
+            .start(fixture.request("old", LoginMode::Authkey, true))
+            .await,
+        StartLoginOutcome::Started
+    ));
+    let before = fixture.proxy.config_for_commit_test().current().unwrap();
+    let original = fixture.registry().attempts.get("ts1", "old").unwrap();
+    let child = fixture.spawner.spawned.lock().unwrap()[0].clone();
+    let close = Arc::new(tokio::sync::Notify::new());
+    *child.close_gate.lock().unwrap() = Some(close.clone());
+    let cancelling = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.registry().cancel_attempt("ts1", "old").await })
+    };
+    wait_until(|| child.close_started.load(Ordering::SeqCst) > 0).await;
+    // The original guard may have finished presentation before its producer is reaped.
+    // That flag supplies no terminal evidence and cannot write the saved credential.
+    original.finish();
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        before
+    );
+    fixture
+        .registry()
+        .prepare("ts1", "successor")
+        .await
+        .unwrap();
+    close.notify_one();
+    cancelling.await.unwrap().unwrap();
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        before,
+        "even the same key cannot compensate across a new original registry row"
+    );
+    assert!(!fixture
+        .registry()
+        .attempts
+        .get("ts1", "successor")
+        .unwrap()
+        .cancelled());
+    fixture
+        .registry()
+        .cancel_attempt("ts1", "successor")
+        .await
+        .unwrap();
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn exact_closed_child_cannot_compensate_changed_saved_target() {
+    let fixture = Arc::new(CredentialFixture::new(false));
+    assert!(matches!(
+        fixture
+            .start(fixture.request("old", LoginMode::Authkey, true))
+            .await,
+        StartLoginOutcome::Started
+    ));
+    let child = fixture.spawner.spawned.lock().unwrap()[0].clone();
+    let close = Arc::new(tokio::sync::Notify::new());
+    *child.close_gate.lock().unwrap() = Some(close.clone());
+    let cancelling = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.registry().cancel_attempt("ts1", "old").await })
+    };
+    wait_until(|| child.close_started.load(Ordering::SeqCst) > 0).await;
+    let mut edited = fixture.proxy.config_for_commit_test().current().unwrap();
+    edited["servers"][0]["name"] = json!("new saved target revision");
+    fixture
+        .proxy
+        .config_for_commit_test()
+        .save_full(&edited)
+        .unwrap();
+    let edited = fixture.proxy.config_for_commit_test().current().unwrap();
+    close.notify_one();
+    assert_eq!(
+        cancelling.await.unwrap().unwrap_err(),
+        "credentialRevisionChanged"
+    );
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        edited
+    );
+    assert!(child.terminated.load(Ordering::SeqCst));
+}
+
+#[test]
+fn explicit_credential_resolution_never_trusts_metadata_or_changes_issuer_on_reuse() {
+    let saved = json!({"servers":[{"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{
+        "retainedAuthKey":{"authKey":"secret-fixture", "controlAuthority":"https://controlplane.tailscale.com"}
+    }}]});
+    let mut request = request("reuse");
+    request.mode = LoginMode::Authkey;
+    request.reuse_retained_auth_key = true;
+    request.expected_credential_revision =
+        polaris_config_engine::user_config::effective_view::tailscale_credential_revision(
+            &saved["servers"][0],
+        );
+    let mut candidate = json!({"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{}});
+    let (resolved, owned) =
+        resolve_tailscale_credential_candidate(&saved, &candidate, &request).unwrap();
+    assert!(owned);
+    assert_eq!(resolved["tailscaleSettings"]["authKey"], "secret-fixture");
+    candidate["tailscaleSettings"]["controlUrl"] = json!("https://controlplane.tailscale.com/");
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &request).unwrap_err(),
+        "retainedAuthKeyAuthorityChanged"
+    );
+    candidate["tailscaleSettings"]["controlUrl"] = json!("https://controlplane.tailscale.com");
+    candidate["tailscaleSettings"]["authKey"] = json!("unrelated-new-key");
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &request).unwrap_err(),
+        "invalidCredentialIntent"
+    );
+    candidate["tailscaleSettings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("authKey");
+    request.expected_credential_revision = Some("stale-revision".into());
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &request).unwrap_err(),
+        "credentialRevisionChanged"
+    );
+    request.expected_credential_revision = None;
+    candidate["tailscaleSettings"]["retainedAuthKeyAvailable"] = json!(true);
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &request).unwrap_err(),
+        "credentialRevisionChanged"
+    );
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn logout_parks_actual_key_and_retires_only_auth_preserving_taildrop_and_history() {
+    let fixture = CredentialFixture::new(true);
+    let state = fixture.mesh.tailscale_state_dir("ts1").unwrap();
+    std::fs::create_dir_all(state.join("Taildrop")).unwrap();
+    std::fs::write(state.join("Taildrop/user-file"), b"user-content").unwrap();
+    let sealed = polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.json",
+    );
+    std::fs::write(state.join("tailscaled.state"), &sealed).unwrap();
+    let retired = polaris_mesh::tailscale_state::project_tailscale_auth_state(
+        &sealed,
+        polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences,
+    )
+    .unwrap();
+    assert!(fixture
+        .mesh
+        .logout_tailscale_with_credentials(
+            "ts1",
+            &fixture.proxy,
+            &fixture.saved,
+            fixture.proxy.core_generation(),
+            None
+        )
+        .await
+        .unwrap());
+    let saved = fixture.proxy.config_for_commit_test().current().unwrap();
+    assert!(saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        saved["servers"][0]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "retained-test-key"
+    );
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        retired.bytes
+    );
+    assert_eq!(
+        std::fs::read(state.join("Taildrop/user-file")).unwrap(),
+        b"user-content"
+    );
+    assert_eq!(
+        fixture.spawner.count.load(Ordering::SeqCst),
+        0,
+        "standalone PC logout does not birth a producer"
+    );
+    // Repeating Logout still passes the real gate and exact saved CAS; the strict
+    // retired FileStore no-op is not presented as SDK Bound or NoOwner.
+    assert!(fixture
+        .mesh
+        .logout_tailscale_with_credentials(
+            "ts1",
+            &fixture.proxy,
+            &saved,
+            fixture.proxy.core_generation(),
+            None
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        retired.bytes
+    );
+    assert!(
+        matches!(
+            fixture
+                .start(fixture.request("reopen", LoginMode::Authkey, true))
+                .await,
+            StartLoginOutcome::Failed(_)
+        ),
+        "a stale pre-logout saved document cannot relogin"
+    );
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn logout_rejects_main_owner_and_foreign_gate_without_credential_or_file_mutation() {
+    let fixture = CredentialFixture::new(true);
+    let gate = fixture.registry().state_gate().await;
+    let generated = json!({"endpoints":[{"type":"tailscale", "tag":"actual-main",
+        "state_directory":fixture.directory.join("tailscale/ts1")}]});
+    let token =
+        claim_main_for_test(fixture.registry(), &generated, &fixture.directory, &gate).await;
+    drop(gate);
+    assert!(!fixture
+        .mesh
+        .logout_tailscale_with_credentials(
+            "ts1",
+            &fixture.proxy,
+            &fixture.saved,
+            fixture.proxy.core_generation(),
+            None
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        fixture.saved
+    );
+    let foreign = LoginCoreRegistry::production();
+    let foreign_gate = foreign.state_gate().await;
+    assert!(fixture
+        .mesh
+        .tailscale_retire_pc_auth_under_gate("ts1", &foreign_gate, None)
+        .is_err());
+    let gate = fixture.registry().state_gate().await;
+    assert!(fixture
+        .registry()
+        .release_main_states_if_token(&token, &gate)
+        .unwrap());
+}
+
+#[test]
+fn ios_credential_logout_binds_cold_saved_no_key_doc_and_hot_never_falls_back_to_start() {
+    let source = crate::test_support::crate_source("runtime/tailscale_login_core.rs");
+    let logout = source
+        .split("pub(crate) async fn logout_with_normal_main(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) async fn retire_other_attempts_under_state_gate")
+        .next()
+        .unwrap();
+    let cold = logout
+        .split("Ok(None) =>")
+        .nth(1)
+        .unwrap()
+        .split("Err(error) =>")
+        .next()
+        .unwrap();
+    let park = cold.find("park_saved_tailscale_key").unwrap();
+    let bind = cold.find("ActionBinding::new").unwrap();
+    let start = cold.find("await_normal_main").unwrap();
+    assert!(park < bind && bind < start);
+    assert!(cold.contains("&saved"));
+    assert!(cold.contains("for_attempt(generation, Arc::clone(&attempt))"));
+    assert!(cold.contains("Some(&attempt)"));
+    assert!(logout.contains("live_tailscale_main(binding.clone())"));
+    assert!(
+        logout.find("live_tailscale_main(binding.clone())").unwrap()
+            < logout.find("prepare_tailscale_action_origin").unwrap()
+    );
+    assert!(cold.contains("prepare_tailscale_action_origin(generation, &attempt)"));
+    let prerequisite = crate::test_support::crate_source("runtime/proxy/prerequisite.rs");
+    let hot = prerequisite
+        .split("pub(crate) async fn live_tailscale_main(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) async fn retire_tailscale_account")
+        .next()
+        .unwrap();
+    assert!(!hot.contains("await_normal_main"));
+    assert!(hot.contains("ready_main_for_generation"));
+    assert!(hot.contains("validate_ready_main"));
+    assert!(hot.contains("with_current_generation(generation"));
+    assert!(hot.contains("LocalStart(_)"));
+    assert!(hot.contains("owner.ready.is_none() || !committed"));
+    assert!(hot.contains("check_tailscale_logout_cold(running, local_pending)"));
+    let command = crate::test_support::crate_source("commands/server.rs");
+    assert!(command.contains("(cfg!(target_os = \"ios\") || credential_transaction)"));
+    assert!(command.contains("&& !request.replace_identity"));
+    assert!(command.contains("TAILSCALE_IDENTITY_RETIREMENT_REQUIRED"));
+}
+
+#[test]
+fn parked_record_is_not_transient_builder_input_without_explicit_resolution() {
+    let server: ServerConfig = serde_json::from_value(json!({"id":"ts1", "name":"Parked",
+        "protocol":"tailscale", "tailscaleSettings":{"retainedAuthKey":{
+            "authKey":"parked-transient-sentinel", "controlAuthority":"https://controlplane.tailscale.com"}}})).unwrap();
+    let config = build_tailscale_login_config(
+        &server,
+        Path::new("/fake/config"),
+        &TailscaleLoginApiService {
+            port: 9911,
+            secret: "api-fixture".into(),
+        },
+    )
+    .unwrap();
+    let emitted = login_config_to_json(&config).to_string();
+    assert!(!emitted.contains("parked-transient-sentinel"));
+    assert!(!emitted.contains("retainedAuthKey"));
+    assert!(!emitted.contains("auth_key"));
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn default_browser_parks_key_without_retiring_existing_sdk_identity() {
+    let fixture = CredentialFixture::new(true);
+    let state = fixture.mesh.tailscale_state_dir("ts1").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let original = polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.json",
+    );
+    let mut original: Value = serde_json::from_slice(&original).unwrap();
+    // The shared projection fixture omits account Config. Reuse the existing
+    // cached-session fixture's real prefs shape rather than weakening Unknown.
+    original["profile-a123"] = json!("eyJXYW50UnVubmluZyI6ZmFsc2UsIkxvZ2dlZE91dCI6ZmFsc2UsIkNvbmZpZyI6eyJOb2RlSUQiOiJuLWZpeHR1cmUiLCJVc2VyUHJvZmlsZSI6eyJMb2dpbk5hbWUiOiJmaXh0dXJlQGV4YW1wbGUuaW52YWxpZCJ9fX0=");
+    let original = serde_json::to_vec(&original).unwrap();
+    std::fs::write(state.join("tailscaled.state"), &original).unwrap();
+    assert!(
+        polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&original).unwrap()
+    );
+    let mut request = fixture.request("browser-default", LoginMode::Browser, false);
+    request.replace_identity = false;
+    assert!(matches!(
+        fixture.start(request).await,
+        StartLoginOutcome::Started
+    ));
+    let actual = fixture.proxy.config_for_commit_test().current().unwrap();
+    assert!(actual["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert_eq!(
+        actual["servers"][0]["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "retained-test-key"
+    );
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        original
+    );
+    assert!(
+        !std::fs::read_to_string(sole_login_config(&fixture.directory))
+            .unwrap()
+            .contains("retained-test-key")
+    );
+    fixture
+        .registry()
+        .cancel_attempt("ts1", "browser-default")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        original
+    );
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn authkey_without_cached_profile_uses_existing_machine_file_without_auth_projection() {
+    let fixture = CredentialFixture::new(false);
+    let state = fixture.mesh.tailscale_state_dir("ts1").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let machine = br#"{"_machinekey":"bWFjaGluZS1maXh0dXJl"}"#;
+    std::fs::write(state.join("tailscaled.state"), machine).unwrap();
+    assert!(
+        !polaris_mesh::tailscale_state::cached_session_exists_for_presentation(machine).unwrap()
+    );
+    assert!(polaris_mesh::tailscale_state::project_tailscale_auth_state(
+        machine,
+        polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences
+    )
+    .is_err());
+    let mut request = fixture.request("no-profile", LoginMode::Authkey, true);
+    request.replace_identity = false;
+    assert!(matches!(
+        fixture.start(request).await,
+        StartLoginOutcome::Started
+    ));
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        machine
+    );
+    fixture
+        .registry()
+        .cancel_attempt("ts1", "no-profile")
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        machine
+    );
+}
+
+#[cfg(not(target_os = "ios"))]
+struct ReleasableCredentialChecker {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+#[async_trait]
+#[cfg(not(target_os = "ios"))]
+impl ConfigChecker for ReleasableCredentialChecker {
+    async fn check(&self, _: &Path, _: &Path) -> Result<(), String> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn stop_after_credential_cas_before_first_poll_cannot_birth_original_factory() {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let spawner = fake_spawner(vec![], false, false);
+    let fixture = Arc::new(CredentialFixture::with_dependencies(
+        false,
+        spawner.clone(),
+        spawner,
+        Arc::new(ReleasableCredentialChecker {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+    ));
+    let start = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .start(fixture.request("generation-before", LoginMode::Authkey, true))
+                .await
+        })
+    };
+    acquire(&entered).await;
+    assert_eq!(fixture.spawner.count.load(Ordering::SeqCst), 0);
+    let original_generation = fixture.proxy.core_generation();
+    fixture
+        .gate
+        .claim_generation(
+            Some(original_generation),
+            polaris_core_supervisor::LifecycleKind::Stop,
+        )
+        .unwrap();
+    release.add_permits(1);
+    let outcome = start.await.unwrap();
+    let spawned = fixture.spawner.count.load(Ordering::SeqCst);
+    // The RED fixture always reaps an unexpected child before its assertion.
+    if spawned != 0 {
+        let _ = fixture
+            .registry()
+            .cancel_attempt("ts1", "generation-before")
+            .await;
+        assert!(fixture.spawner.spawned.lock().unwrap()[0]
+            .terminated
+            .load(Ordering::SeqCst));
+    }
+    assert!(
+        matches!(outcome, StartLoginOutcome::Cancelled),
+        "a newer Stop must invalidate the original G0 admission"
+    );
+    assert_eq!(spawned, 0);
+    assert!(login_configs(&fixture.directory).is_empty());
+}
+
+#[cfg(not(target_os = "ios"))]
+struct PendingCredentialSpawner {
+    base: Arc<FakeSpawner>,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+#[async_trait]
+#[cfg(not(target_os = "ios"))]
+impl LoginCoreSpawner for PendingCredentialSpawner {
+    async fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        let child = self.base.spawn(request).await?;
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(child)
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn stop_after_pending_birth_joins_exact_child_and_failed_close_retains_custody() {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let base = fake_spawner(vec![], false, false);
+    let fixture = Arc::new(CredentialFixture::with_dependencies(
+        false,
+        base.clone(),
+        Arc::new(PendingCredentialSpawner {
+            base,
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Arc::new(FakeChecker { ok: true }),
+    ));
+    let start = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .start(fixture.request("pending-generation", LoginMode::Authkey, true))
+                .await
+        })
+    };
+    acquire(&entered).await;
+    let child = fixture.spawner.spawned.lock().unwrap()[0].clone();
+    let close = Arc::new(tokio::sync::Notify::new());
+    *child.close_gate.lock().unwrap() = Some(close.clone());
+    child.close_failures.store(1, Ordering::SeqCst);
+    let before = fixture.proxy.config_for_commit_test().current().unwrap();
+    let original = fixture.proxy.core_generation();
+    fixture
+        .gate
+        .claim_generation(Some(original), polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    assert!(
+        !start.is_finished(),
+        "an admitted Pending producer must be joined"
+    );
+    assert!(!child.terminated.load(Ordering::SeqCst));
+    release.add_permits(1);
+    wait_until(|| child.close_started.load(Ordering::SeqCst) > 0).await;
+    assert!(fixture.registry().shared.contains("ts1"));
+    assert_eq!(fixture.spawner.count.load(Ordering::SeqCst), 1);
+    assert!(
+        !start.is_finished(),
+        "cancel waits for the exact returned child"
+    );
+    assert!(!login_configs(&fixture.directory).is_empty());
+    close.notify_one();
+    wait_until(|| {
+        fixture
+            .registry()
+            .shared
+            .guard()
+            .get("ts1")
+            .is_some_and(|entry| matches!(&*entry.closed_rx.borrow(), Some(Err(_))))
+    })
+    .await;
+    // launch still holds the original start gate while awaiting ready. Observe
+    // the exact entry's failed close receipt without trying to acquire that gate.
+    assert!(fixture
+        .registry()
+        .shared
+        .guard()
+        .get("ts1")
+        .is_some_and(|entry| {
+            entry.attempt_id == "pending-generation"
+                && matches!(&*entry.closed_rx.borrow(), Some(Err(_)))
+        }));
+    assert!(fixture.registry().shared.contains("ts1"));
+    assert!(!start.is_finished());
+    assert!(!child.terminated.load(Ordering::SeqCst));
+    assert!(!login_configs(&fixture.directory).is_empty());
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        before
+    );
+    let retry = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.registry().cancel_login("ts1").await })
+    };
+    wait_until(|| child.close_started.load(Ordering::SeqCst) > 1).await;
+    assert!(!retry.is_finished());
+    close.notify_one();
+    assert!(retry.await.unwrap().unwrap());
+    assert!(matches!(start.await.unwrap(), StartLoginOutcome::Cancelled));
+    assert!(child.terminated.load(Ordering::SeqCst));
+    assert!(!fixture.registry().shared.contains("ts1"));
+    assert!(login_configs(&fixture.directory).is_empty());
+    assert_eq!(
+        fixture.proxy.config_for_commit_test().current().unwrap(),
+        before
+    );
+}
+
+#[test]
+fn unscoped_android_close_ack_cannot_admit_new_credential_transaction_or_compensation() {
+    let source = crate::test_support::crate_source("runtime/tailscale_login_core.rs");
+    let activation = source
+        .split("async fn activate_android_credential(")
+        .nth(1)
+        .unwrap()
+        .split("async fn compensate_android_credential(")
+        .next()
+        .unwrap();
+    assert!(
+        activation.find("close_android_tailscale_origin").unwrap()
+            < activation.find("with_android_target_action").unwrap()
+    );
+    assert!(
+        activation.find("retired.retired_export()").unwrap()
+            < activation.find("commit_tailscale_credential").unwrap()
+    );
+    assert!(
+        activation.find("selected_android_auth_node").unwrap()
+            < activation.find("retire_android_tailscale_auth").unwrap()
+    );
+    assert!(activation.contains("if request.replace_identity"));
+    let cancel = source
+        .split("async fn compensate_android_credential(")
+        .nth(1)
+        .unwrap()
+        .split("async fn logout_with_android_store(")
+        .next()
+        .unwrap();
+    assert!(
+        cancel.find("read_login_retirement").unwrap()
+            < cancel.find("commit_tailscale_credential").unwrap()
+    );
+    assert!(cancel.contains("original_credential_row"));
+    assert!(cancel.contains("assert_auth_state_available"));
+    assert!(cancel.contains("with_android_target_action"));
+    assert!(cancel.contains("activation.generation"));
+    let reservation = source
+        .split("async fn with_android_target_action<T>(")
+        .nth(1)
+        .unwrap()
+        .split("async fn close_android_tailscale_origin(")
+        .next()
+        .unwrap();
+    assert!(
+        reservation.find("reserve_android_action").unwrap()
+            < reservation.find("target_action(").unwrap()
+    );
+    assert!(reservation.contains("complete_scoped_action"));
+    assert!(reservation.contains("finish_android_action"));
+    let origin = source
+        .split("async fn close_android_tailscale_origin(")
+        .nth(1)
+        .unwrap()
+        .split("async fn activate_android_credential(")
+        .next()
+        .unwrap();
+    assert!(origin.find("observe_login").unwrap() < origin.find("cancel_matching_login").unwrap());
+    let hot = origin
+        .split("let original = tailscale_store::observe_login(&metadata.0, &metadata.1)")
+        .nth(1)
+        .unwrap();
+    assert!(
+        hot.find("cancel_matching_login").unwrap() < hot.find("read_login_retirement").unwrap()
+    );
+    let mesh = crate::test_support::crate_source("runtime/mesh.rs");
+    let logout = mesh
+        .split("pub(crate) async fn logout_tailscale_with_credentials(")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) async fn logout_tailscale_with_normal_main")
+        .next()
+        .unwrap();
+    assert!(logout.find("logout_with_android_store").unwrap() < logout.find(".logout(").unwrap());
+    assert!(logout.contains("#[cfg(target_os = \"android\")]"));
+}
+
+#[tokio::test]
+async fn scoped_action_finishes_begin_decode_error_without_committing() {
+    let committed = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
+    let result = complete_scoped_action(
+        async { Err::<(), _>("nativeRetirementUnknown".into()) },
+        || {
+            committed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+        || async {
+            finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(result, Err("nativeRetirementUnknown".into()));
+    assert_eq!(committed.load(Ordering::SeqCst), 0);
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn scoped_action_unknown_finish_overrides_commit_and_commit_error_still_finishes() {
+    let committed = AtomicUsize::new(0);
+    let result = complete_scoped_action(
+        async { Ok(()) },
+        || {
+            committed.fetch_add(1, Ordering::SeqCst);
+            Ok("written")
+        },
+        || async { Err("nativeRetirementUnknown".into()) },
+    )
+    .await;
+    assert_eq!(result, Err("nativeRetirementUnknown".into()));
+    assert_eq!(committed.load(Ordering::SeqCst), 1);
+    let finished = AtomicUsize::new(0);
+    let result = complete_scoped_action(
+        async { Ok(()) },
+        || Err::<(), _>("cancelled".into()),
+        || async {
+            finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(result, Err("cancelled".into()));
+    assert_eq!(finished.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(not(target_os = "android"))]
+#[test]
+fn unresolved_native_action_survives_done_and_late_finish_cannot_release_successor() {
+    use crate::runtime::tailscale_login_core::attempts::{
+        AndroidActionActivity, AndroidTargetAction,
+    };
+    let attempts = Attempts::default();
+    let original = attempts.prepare("node", "original").unwrap();
+    let token = Arc::new(AndroidTargetAction {
+        state_file: "/owned/tailscale/node/tailscaled.state".into(),
+        action_id: "original-action".into(),
+        active: AtomicBool::new(true),
+    });
+    original.reserve_android_action(token.clone()).unwrap();
+    assert_eq!(
+        original.android_action().unwrap().unwrap().state_file,
+        token.state_file
+    );
+    assert_eq!(
+        original.android_action().unwrap().unwrap().action_id,
+        "original-action"
+    );
+    assert!(original.reserve_android_action(token.clone()).is_err());
+    original.finish();
+    assert!(attempts.owns_state("node"));
+    assert!(attempts.local_owner_in_use("node").unwrap());
+    assert!(attempts.owns_state_except("node", None).unwrap());
+    assert!(!attempts.owns_state_except("node", Some(&original)).unwrap());
+    drop(AndroidActionActivity(token.clone()));
+    assert!(!token.active.load(Ordering::SeqCst));
+    assert!(original.android_action().unwrap().is_some());
+    for index in 0..512 {
+        attempts.prepare("other", &format!("other-{index}")).ok();
+    }
+    assert!(attempts.original_credential_row("original", &original));
+    original.release_android_action(&token).unwrap();
+    let successor = Arc::new(AndroidTargetAction {
+        state_file: token.state_file.clone(),
+        action_id: "successor-action".into(),
+        active: AtomicBool::new(true),
+    });
+    original.reserve_android_action(successor.clone()).unwrap();
+    assert!(original.release_android_action(&token).is_err());
+    assert!(Arc::ptr_eq(
+        &original.android_action().unwrap().unwrap(),
+        &successor
+    ));
+    original.release_android_action(&successor).unwrap();
+    assert!(!attempts.owns_state("node"));
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[tokio::test]
+async fn committed_credential_cas_and_park_receipts_survive_unknown_finish() {
+    use crate::runtime::tailscale_login_core::attempts::AndroidTargetAction;
+    let fixture = CredentialFixture::new(false);
+    fixture.registry().prepare("ts1", "same-cas").await.unwrap();
+    let attempt = fixture
+        .registry()
+        .prepared_attempt_for_test("ts1", "same-cas");
+    let token = Arc::new(AndroidTargetAction {
+        state_file: "/owned/tailscale/ts1/tailscaled.state".into(),
+        action_id: "same-cas-action".into(),
+        active: AtomicBool::new(true),
+    });
+    attempt.reserve_android_action(token.clone()).unwrap();
+    let generation = fixture.proxy.core_generation();
+    let result = complete_scoped_action(
+        async { Ok(()) },
+        || {
+            let actual = fixture.proxy.commit_tailscale_credential(
+                &fixture.saved,
+                "ts1",
+                generation,
+                Some(&attempt),
+                |current| {
+                    current["servers"][0]["tailscaleSettings"]["authKey"] =
+                        json!("retained-test-key");
+                    Ok(())
+                },
+            )?;
+            attempt.record_credential_activation(&fixture.proxy, actual, generation);
+            Ok(())
+        },
+        || async { Err("nativeRetirementUnknown".into()) },
+    )
+    .await;
+    assert_eq!(result, Err("nativeRetirementUnknown".into()));
+    let activation = attempt.credential_activation().unwrap();
+    assert_eq!(
+        activation.saved,
+        fixture.proxy.config_for_commit_test().current().unwrap()
+    );
+    assert_eq!(activation.generation, generation);
+    assert_eq!(
+        activation.saved["servers"][0]["tailscaleSettings"]["authKey"],
+        "retained-test-key"
+    );
+    attempt.finish();
+    assert!(fixture.registry().attempts.owns_state("ts1"));
+    assert!(Arc::ptr_eq(
+        &attempt.android_action().unwrap().unwrap(),
+        &token
+    ));
+    let result = complete_scoped_action(
+        async { Ok(()) },
+        || {
+            let parked = fixture.proxy.commit_tailscale_credential(
+                &activation.saved,
+                "ts1",
+                generation,
+                None,
+                |current| park_saved_tailscale_key(current, "ts1"),
+            )?;
+            attempt.record_credential_activation(&fixture.proxy, parked, generation);
+            Ok(())
+        },
+        || async { Err("nativeRetirementUnknown".into()) },
+    )
+    .await;
+    assert_eq!(result, Err("nativeRetirementUnknown".into()));
+    let parked = attempt.credential_activation().unwrap();
+    assert_eq!(
+        parked.saved,
+        fixture.proxy.config_for_commit_test().current().unwrap()
+    );
+    assert!(parked.saved["servers"][0]["tailscaleSettings"]
+        .get("authKey")
+        .is_none());
+    assert!(fixture.registry().attempts.owns_state("ts1"));
+    assert!(fixture
+        .proxy
+        .commit_tailscale_credential(&activation.saved, "ts1", generation, None, |current| {
+            park_saved_tailscale_key(current, "ts1")
+        })
+        .is_err());
+    let source = crate::test_support::crate_source("runtime/tailscale_login_core.rs");
+    let activate = source
+        .split("async fn activate_android_credential(")
+        .nth(1)
+        .unwrap()
+        .split("async fn compensate_android_credential(")
+        .next()
+        .unwrap();
+    assert!(
+        activate.find("commit_tailscale_credential").unwrap()
+            < activate.find("record_credential_activation").unwrap()
+    );
+    assert!(
+        activate.find("record_credential_activation").unwrap() < activate.rfind(".await?").unwrap()
+    );
+    let compensate = source
+        .split("async fn compensate_android_credential(")
+        .nth(1)
+        .unwrap()
+        .split("async fn logout_with_android_store(")
+        .next()
+        .unwrap();
+    assert!(compensate.contains("\"Main\" => tailscale_store::read_main_retirement"));
+    assert!(compensate.contains("\"Login\" => tailscale_store::read_login_retirement"));
+    assert!(
+        compensate.find("record_credential_activation").unwrap()
+            < compensate.rfind(".await").unwrap()
+    );
+    assert_eq!(fixture.spawner.count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_warm_action() {
+    let source = crate::test_support::crate_source("runtime/tailscale_login_core.rs");
+    let launch = source
+        .split("async fn launch_attempt(")
+        .nth(1)
+        .unwrap()
+        .split("async fn signal_and_wait_close(")
+        .next()
+        .unwrap();
+    let warm = launch
+        .split("if warm {")
+        .last()
+        .unwrap()
+        .split("if !warm {")
+        .next()
+        .unwrap();
+    assert_eq!(warm.matches("check_config_for_tailscale(").count(), 1);
+    assert!(!warm.contains("self.checker"));
+    assert!(warm.contains("config_path.file_stem()"));
+    assert!(warm.contains("tuple.config_digest() == polaris_updater::sha256_hex(&bytes)"));
+    assert!(warm.contains("tuple.logical_instance_id() == logical_id"));
+    assert!(warm.find("make_warm_tuple").unwrap() < warm.find("reserve_android_action").unwrap());
+    assert!(warm.find("reserve_android_action").unwrap() < warm.find("begin_warm").unwrap());
+    assert!(warm.contains("with_tailscale_credential_birth(generation, attempt"));
+    assert!(launch.find("begin_warm").unwrap() < launch.find("self.spawner.spawn(req)").unwrap());
+    assert_eq!(launch.matches("self.checker.check_for_spawn(").count(), 1);
+    assert!(!launch.contains("spawn_with_android"));
+    assert!(!launch.contains("Uuid"));
+    let factory = source
+        .split("impl LoginCoreSpawner for AndroidLoginCoreSpawner {")
+        .nth(1)
+        .unwrap()
+        .split("impl LoginCoreChild for AndroidLoginCoreChild {")
+        .next()
+        .unwrap();
+    assert!(factory.contains(".file_stem()"));
+    assert_eq!(factory.matches("start_transient_login(").count(), 1);
+    let browser = launch
+        .split("if request.mode == LoginMode::Browser {")
+        .nth(1)
+        .unwrap()
+        .split("// (b)")
+        .next()
+        .unwrap();
+    assert!(browser.contains("ts.auth_key = None"));
+    let close = source
+        .split("async fn close_android_tailscale_origin(")
+        .nth(1)
+        .unwrap()
+        .split("async fn activate_android_credential(")
+        .next()
+        .unwrap();
+    assert!(close.contains("mode: LoginMode::Browser"));
+    assert!(close.contains("Some(&mut activity)"));
+    assert!(close.contains("reservation.held_retirement()?"));
+    assert!(close.contains("attempt.record_android_store(retired.clone())?"));
+    assert!(close.contains("let original = attempt.android_store()?"));
+    assert!(
+        close.contains("original.original().logical_instance_id != tuple.logical_instance_id()")
+    );
+    assert!(close.contains("retired.original() != held_retired.original()"));
+    assert!(!close.contains("start_transient_login("));
+    let action = source
+        .split("async fn with_android_target_action<T>(")
+        .nth(1)
+        .unwrap()
+        .split("async fn close_android_tailscale_origin(")
+        .next()
+        .unwrap();
+    assert!(action.contains("AndroidActionOrigin::Warm(tuple)"));
+    assert!(
+        action.find("held_retirement").unwrap()
+            < action.find("return complete_scoped_action").unwrap()
+    );
+    assert!(action.contains("retired.original() != original.original()"));
+    assert!(
+        action.find("return complete_scoped_action").unwrap()
+            < action.find("target_action(").unwrap()
+    );
+    let finish = source
+        .split("async fn finish_android_action(")
+        .nth(1)
+        .unwrap()
+        .split("async fn with_android_target_action<T>(")
+        .next()
+        .unwrap();
+    assert!(finish.contains("finish_warm(tuple).await.is_err()"));
+    assert!(finish.contains("close_warm(tuple"));
+    assert!(finish.rfind("finish_warm").unwrap() < finish.find("release_android_action").unwrap());
 }

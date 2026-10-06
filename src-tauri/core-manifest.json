@@ -11,21 +11,21 @@
     "win": "3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928"
   },
   "windowsBuild": {
-    "version": "1.15.0-alpha.8.polaris.2",
+    "version": "1.15.0-alpha.8.polaris.3",
     "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
     "sourceSha256": "77aabf518a4464832f6f4792196a8ab9aadadcc616dbbd82327137ce664a5862",
     "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
     "goVersion": "1.25.5",
-    "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
+    "binarySha256": null
   },
   "sourceBuild": {
-    "sourceManifestSha256": "1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a",
+    "sourceManifestSha256": "9f269083f002cc7dea49e5151c4e150e6ba1d26dc173d4601614dd2cb557b7fd",
     "provisionerSha256": "5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b",
-    "sourceReceiptFingerprint": "b0eb6c10e5883b70016d22c0f5aa1f5e95700df1a194fcebba10d1928b06b257",
+    "sourceReceiptFingerprint": "287b3d7a85b777e1a3f379f05171f26ee1e4f96803c1f4aaabe3e8116dc21b54",
     "moduleGraphSha256": "c4f92118f017f76bfe0bed59ffd5517123e9da6e27318e9968f3abb1c0f62512",
-    "patchedSourceTree": "1f6bf34b1e12d6bcef7750453c4eeff7040ca533",
-    "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
-    "version": "1.15.0-alpha.8.polaris.2",
+    "patchedSourceTree": "e6612c102a54fa66505ed4d358f2f673a4579a88",
+    "buildTree": "3b2910bb44c94cf494fc49203071aad195ef7e80",
+    "version": "1.15.0-alpha.8.polaris.3",
     "dependencyModules": [
       "github.com/sagernet/sing-tun",
       "github.com/sagernet/nftables"
@@ -40,7 +40,7 @@
     },
     "platforms": {
       "linux": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "3b2910bb44c94cf494fc49203071aad195ef7e80",
         "patchedModules": {
           "requiredLinked": [
             "github.com/sagernet/sing-tun",
@@ -59,10 +59,10 @@
           ],
           "confirmedAbsent": []
         },
-        "binarySha256": "27e5d7e30dd7cfc8313710341d798296a06840157a5811723e45ba4b12291686"
+        "binarySha256": null
       },
       "win": {
-        "buildTree": "484135e0d95edd95d7c8890a3f0b8ce0dcbe8fed",
+        "buildTree": "b88fd4a4c0b101ec85c14e72e8ca43a37cd69e3f",
         "patchedModules": {
           "requiredLinked": [
             "github.com/sagernet/sing-tun"
@@ -83,10 +83,10 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
+        "binarySha256": null
       },
       "mac-x64": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "3b2910bb44c94cf494fc49203071aad195ef7e80",
         "patchedModules": {
           "requiredLinked": [
             "github.com/sagernet/sing-tun"
@@ -107,10 +107,10 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "fb83ce82ec89bf56c821e623ccf8cbb9a3f36f9e72d66f867381964fe6819d06"
+        "binarySha256": null
       },
       "mac-arm64": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "3b2910bb44c94cf494fc49203071aad195ef7e80",
         "patchedModules": {
           "requiredLinked": [
             "github.com/sagernet/sing-tun"
@@ -131,7 +131,7 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "febe21529e48911e43c078039a0a296ef785ca38b3170e888e939e53248e954d"
+        "binarySha256": null
       }
     },
     "graphScope": "declared-patched-modules",

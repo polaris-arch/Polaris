@@ -1065,7 +1065,6 @@ pub(super) async fn stop_core_with_birth(
 ///
 /// `pub(crate)`：`commands/proxy.rs::kernel_probe_outbound`（custom 协议兼容性探测）在 Android 上
 /// 走同一条腿 —— 两处各问各的，迟早有一处的超时 / 失败折叠跟不上另一处。
-#[cfg(any(target_os = "android", test))]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CheckResponse {
@@ -1073,9 +1072,11 @@ struct CheckResponse {
     error: Option<String>,
     #[serde(default)]
     error_code: Option<String>,
+    #[cfg(any(target_os = "android", test))]
+    #[serde(default)]
+    tailscale_validation_envelope: Option<String>,
 }
 
-#[cfg(any(target_os = "android", test))]
 fn check_response_verdict(response: CheckResponse) -> Result<ConfigCheckVerdict, CapacityClosed> {
     if let Some(error) = CapacityClosed::from_code(response.error_code.as_deref()) {
         return Err(error);
@@ -1095,6 +1096,13 @@ pub(crate) async fn check_config(config_json: &str) -> ConfigCheckVerdict {
 pub(crate) async fn check_config_admitted(
     config_json: &str,
 ) -> Result<ConfigCheckVerdict, CapacityClosed> {
+    match check_config_reply(config_json).await {
+        Ok(response) => check_response_verdict(response),
+        Err(error) => Ok(verdict_from_libbox_check(Err(error))),
+    }
+}
+
+async fn check_config_reply(config_json: &str) -> Result<CheckResponse, String> {
     #[cfg(target_os = "android")]
     {
         // 拥有式载荷的理由同 `start_core`：调用由分离 task 持有到底（见 [`call_with_budget`]）。
@@ -1105,9 +1113,9 @@ pub(crate) async fn check_config_admitted(
         }
         let plugin = match plugin_handle() {
             Ok(p) => p,
-            Err((msg, _)) => return Ok(verdict_from_libbox_check(Err(msg))),
+            Err((msg, _)) => return Err(msg),
         };
-        let result = match call_with_budget::<CheckResponse, _>(
+        match call_with_budget::<CheckResponse, _>(
             plugin,
             "checkConfig",
             CheckArgs {
@@ -1118,23 +1126,20 @@ pub(crate) async fn check_config_admitted(
         )
         .await
         {
-            Ok(r) => return check_response_verdict(r),
+            Ok(r) => Ok(r),
             Err(BridgeCallError::Invoke(e)) => Err(format!("{e}")),
             Err(BridgeCallError::TimedOut) => {
                 Err(format!("checkConfig 超时（>{}s）", CHECK_TIMEOUT.as_secs()))
             }
             Err(BridgeCallError::TaskFailed(e)) => Err(format!("checkConfig 投递腿异常：{e}")),
-        };
-        Ok(verdict_from_libbox_check(result))
+        }
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = config_json;
         // 非 Android 走不到这里（调用点在解析不到核二进制时已经 fail-open 早退）。真走到了也
         // 只是多一条 fail-open 的放行，绝不 panic —— 起核路径上不接受「判据本身把进程搞崩」。
-        Ok(verdict_from_libbox_check(Err(
-            "本平台没有 Android 起核桥".to_string()
-        )))
+        Err("本平台没有 Android 起核桥".to_string())
     }
 }
 
@@ -1911,3 +1916,8 @@ pub(crate) async fn transient_login_running(instance_id: &str) -> Result<bool, S
     .map(|status| status.running)
     .map_err(|_| "Android 独立登录状态不可用".to_owned())
 }
+
+/// Android's original native Entry supplies provenance; these pure decoding
+/// checks never promote ordinary/global close to owner or SDK disposal proof.
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod tailscale_store;

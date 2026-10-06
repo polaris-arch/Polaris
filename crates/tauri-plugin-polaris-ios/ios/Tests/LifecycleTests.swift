@@ -218,6 +218,101 @@ struct LifecycleTests {
         assert(vpnStartFailure(denied, stage: "load").hasPrefix("StartupFailed:"))
         let timeout = NSError(domain: "PolarisVPN", code: 1, userInfo: [NSLocalizedDescriptionKey: "timed out"])
         assert(vpnStartFailure(timeout, stage: "save").hasPrefix("StartupFailed:"))
+        try storeRetirementCases()
         print("iOS lifecycle counterexamples passed: exact live observation, permission attribution, foreground, four pending-start revoke boundaries, late Stop(A)/Start(B), durable preference uncertainty, receipt ordering, sticky close failure, CleanupUnknown")
+    }
+
+    static func storeRetirementCases() throws {
+        let digest = String(repeating: "d", count: 64)
+        let profile: [String: Any] = ["sessionID": "scope-session", "requestID": "scope-start", "configDigest": digest]
+        let identity = TunnelIdentity(sessionID: "scope-session", requestID: "scope-start", configDigest: digest)
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/private/group/ts-a",
+            "stateFile": "/private/group/ts-a/tailscaled.state", "writerState": "SealedDrained",
+            "stateFileState": "Regular", "stateFileRevision": String(repeating: "a", count: 64),
+            "profileState": "Bound", "profileFingerprint": String(repeating: "b", count: 64)]
+        let first: [String: Any] = ["runNonce": String(repeating: "1", count: 64), "configDigest": digest,
+            "terminal": "SealedDrained", "censusComplete": true, "nodes": [node]]
+        let second: [String: Any] = ["runNonce": String(repeating: "2", count: 64), "configDigest": digest,
+            "terminal": "NoStoreConstruction", "censusComplete": true, "nodes": [[String: Any]]()]
+        let export: [String: Any] = ["contractVersion": "polaris-ts-auth-writer-retirement-v1",
+            "globalCleanupEvidence": "CleanupUnknown", "instances": [first, second]]
+        func raw(_ value: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+        }
+        let lifecycle = TunnelLifecycle()
+        let start = try lifecycle.start(identity)
+        assert(lifecycle.complete(start, phase: "running", stopped: false))
+        var received: TunnelObservation?
+        assert(!lifecycle.prepareStop(identity: identity, requestID: "scope-stop", nonce: "scope-nonce",
+            expectedGeneration: start + 1, observation: { received = $0 }))
+        assert(!lifecycle.prepareStop(identity: identity, requestID: "scope-stop", nonce: "",
+            observation: { received = $0 }))
+        assert(lifecycle.prepareStop(identity: identity, requestID: "scope-stop", nonce: "scope-nonce",
+            expectedGeneration: start, observation: {
+                received = $0
+                assert(lifecycle.report().generation == $0.report.generation) // Callback runs outside the original lock.
+            }))
+        assert(received == nil) // prepareStop is not terminal proof or immediate success.
+        assert(!lifecycle.prepareStop(identity: identity, requestID: "other-stop", nonce: "other-nonce", observation: { received = $0 }))
+        do { _ = try lifecycle.reload(); assertionFailure("Reload admitted between exact prepareStop and Stop") } catch {}
+        let stop = lifecycle.stop()!
+        lifecycle.retainTailscaleStoreScope(try raw(export), identity: identity)
+        assert(lifecycle.complete(stop, phase: "stopped", stopped: true))
+        assert(received?.observationNonce == "scope-nonce")
+        let observation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(received!)) as! [String: Any]
+        let result = vpnRetirementEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "scope-nonce", stopRequestID: "scope-stop", expectedGeneration: start)!
+        let wire = result["tailscaleStoreRetirement"] as! [String: Any]
+        assert((wire["storeRetirement"] as! [String: Any])["instances"] as? [[String: Any]] != nil)
+        assert(((wire["storeRetirement"] as! [String: Any])["instances"] as! [[String: Any]]).count == 2)
+        assert(result["cleanupEvidence"] as? String == "CleanupUnknown")
+        for (nonce, request, generation) in [("old-nonce", "scope-stop", start), ("scope-nonce", "old-stop", start),
+            ("scope-nonce", "scope-stop", start + 1)] {
+            assert(vpnRetirementEvidence(profileIdentity: profile, expectedIdentity: profile, observation: observation,
+                nonce: nonce, stopRequestID: request, expectedGeneration: generation) == nil)
+        }
+        var changed = profile; changed["sessionID"] = "other-session"
+        assert(vpnRetirementEvidence(profileIdentity: changed, expectedIdentity: profile, observation: observation,
+            nonce: "scope-nonce", stopRequestID: "scope-stop") == nil)
+        let report = observation["report"] as! [String: Any]
+        assert(vpnSessionEvidence(profileIdentity: profile, report: report, stopRequestID: "scope-stop")["tailscaleStoreRetirement"] == nil)
+        for (field, value) in [("cleanupError", "Close failed"), ("lastError", "timed out"), ("lifecycle", "uncertain")] {
+            var failed = report; failed[field] = value
+            assert(vpnRetirementEvidence(profileIdentity: profile, expectedIdentity: profile,
+                observation: ["observationNonce": "scope-nonce", "report": failed], nonce: "scope-nonce", stopRequestID: "scope-stop") == nil)
+        }
+        var badExports = [[String: Any]]()
+        var empty = export; empty["instances"] = [[String: Any]](); badExports.append(empty)
+        var duplicate = export; duplicate["instances"] = [first, first]; badExports.append(duplicate)
+        var partial = first; partial["censusComplete"] = false
+        var partialExport = export; partialExport["instances"] = [partial, second]; badExports.append(partialExport)
+        for (key, value) in [("stateDirectory", "/private/../ts-a"), ("stateFile", "/wrong/tailscaled.state"),
+            ("writerState", "Unknown"), ("stateFileRevision", "stale"), ("profileFingerprint", "wrong"), ("stateFileState", "Missing")] {
+            var invalid = node; invalid[key] = value
+            var instance = first; instance["nodes"] = [invalid]
+            var candidate = export; candidate["instances"] = [instance, second]; badExports.append(candidate)
+        }
+        for candidate in badExports {
+            var failed = report; failed["tailscaleStoreScope"] = try raw(candidate)
+            assert(vpnTailscaleStoreExport(report: failed, configDigest: digest, terminal: true) == nil)
+        }
+        var activeNode = node
+        activeNode["writerState"] = "Unknown"; activeNode["stateFileState"] = "Unknown"; activeNode["stateFileRevision"] = ""
+        activeNode["profileState"] = "Unknown"; activeNode["profileFingerprint"] = ""
+        var activeInstance = first; activeInstance["terminal"] = "Unknown"; activeInstance["censusComplete"] = false; activeInstance["nodes"] = [activeNode]
+        var activeExport = export; activeExport["instances"] = [activeInstance]
+        var activeReport = report; activeReport["tailscaleStoreScope"] = try raw(activeExport)
+        assert(vpnTailscaleStoreExport(report: activeReport, configDigest: digest, terminal: false) != nil)
+        assert(vpnTailscaleStoreExport(report: activeReport, configDigest: digest, terminal: true) == nil)
+        let preSubmit = VpnStartIntent("permission-denied-start")
+        assert(preSubmit.noStoreTerminal() == nil)
+        assert(preSubmit.finish())
+        assert(preSubmit.noStoreTerminal()?["requestID"] as? String == "permission-denied-start")
+        assert(!preSubmit.allowsContinuation)
+        let attempted = VpnStartIntent("throwing-submission")
+        attempted.submitted(profile) // Must happen before crossing startVPNTunnel, including throws.
+        assert(attempted.finish())
+        assert(attempted.noStoreTerminal() == nil)
+        print("iOS TS Store retirement seam cases passed: deferred original Stop, full two-run census, exact nonce/generation, canonical paths, active Unknown, old-file exclusion, actual non-submission intent")
     }
 }

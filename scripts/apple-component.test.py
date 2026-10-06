@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Finite synthetic C3 predicates and mocked file/process transactions; no tools."""
 import copy
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -703,12 +704,95 @@ def actual_cgo_path_tests(root):
     check(facts(log) == compiled, 'finite mutations failed to restore the valid fixture')
 
 
+def component_cli_tests(root):
+    stage = root / 'stage'; stage.mkdir()
+    f, ios, apple_input, policy = framework_fixture(stage)
+    output = root / 'output'; output.mkdir()
+    paths = {name: root / (name + '.json') for name in ('policy', 'tools', 'source', 'input')}
+    for name, value in [('policy', policy), ('tools', f['tools']), ('source', f['receipt']), ('input', apple_input)]:
+        paths[name].write_text(json.dumps(value))
+    approved = ['--build-policy', str(paths['policy']), '--build-policy-sha256', ios.digest(paths['policy'].read_bytes()),
+                '--tools', str(paths['tools']), '--tools-sha256', ios.digest(paths['tools'].read_bytes())]
+    original = ['--source-receipt', str(paths['source']), '--apple-input', str(paths['input'])]
+    with mock.patch.object(ios, 'component_module', return_value=component), \
+            mock.patch.object(component, 'driver', return_value=ios), \
+            mock.patch.object(ios, 'run', side_effect=AssertionError('CLI executed a compiler')):
+        # Only the explicit first-assembly leg calls the existing assembler;
+        # publication finalizes the same retained bytes without another assembly.
+        pending = copy.deepcopy(policy); pending.update(componentInventory=[], assembly={})
+        paths['source'].write_text(json.dumps({'evidenceScope': 'source-only', 'sourceReceipt': f['receipt']}))
+        paths['policy'].write_text(json.dumps(pending))
+        assembly_approved = approved.copy(); assembly_approved[3] = ios.digest(paths['policy'].read_bytes())
+        with mock.patch.object(component, 'assemble_component', return_value={'stagedGeneration': str(stage), 'published': False}) as assemble, \
+                mock.patch.object(component, 'make_receipt', side_effect=AssertionError('first assembly finalized receipt')), \
+                redirect_stdout(io.StringIO()) as printed:
+            ios.main(['build', '--component', '--phase', 'assemble', *assembly_approved, *original, '--evidence-dir', str(root / 'fresh-evidence')])
+            assemble.assert_called_once_with(apple_input, f['receipt'], pending, f['tools'], root / 'fresh-evidence')
+            check(json.loads(printed.getvalue())['published'] is False, 'first assembly claimed publication')
+        paths['policy'].write_text(json.dumps(policy))
+        paths['source'].write_text(json.dumps(f['receipt']))
+        receipt = component.make_receipt(stage / 'Libbox.xcframework', f['receipt'], apple_input, policy, f['tools'])
+        publish = ['build', '--component', '--phase', 'publish', *approved, *original,
+                   '--staged-generation', str(stage), '--output-root', str(output), '--output-fingerprint', receipt['outputFingerprint']]
+        with mock.patch.object(component, 'assemble_component', side_effect=AssertionError('publication reassembled Framework')), \
+                mock.patch.object(component, 'make_receipt', wraps=component.make_receipt) as make, \
+                mock.patch.object(component, 'publish_component', wraps=component.publish_component) as publisher, \
+                redirect_stdout(io.StringIO()) as printed:
+            ios.main(publish)
+            check(make.call_count == publisher.call_count == 1, 'publication did not reuse original make/publish once')
+            selected = json.loads(printed.getvalue())
+        generation = Path(selected['generationRoot'])
+        receipt_sha = ios.digest(Path(selected['receiptPath']).read_bytes())
+        identity = ['--output-fingerprint', receipt['outputFingerprint'], '--receipt-sha256', receipt_sha]
+        fixed = ['verify', '--component-for-link', '--generation-root', str(generation), *approved, *identity]
+        with redirect_stdout(io.StringIO()) as printed:
+            ios.main(fixed)
+        check(json.loads(printed.getvalue())['finalArtifactAdmission'] is False, 'component claimed final App/appex admission')
+        with mock.patch.object(component.os, 'readlink', wraps=os.readlink) as links, redirect_stdout(io.StringIO()) as printed:
+            ios.main(['resolve-component', '--output-root', str(output), *approved, *identity])
+        check(json.loads(printed.getvalue()) == selected, 'CLI resolver differs from publisher snapshot')
+        check(sum(Path(call.args[0]).name == '.libbox-current' for call in links.call_args_list) == 1,
+              'CLI resolver read current more than once')
+        # An already resolved generation remains pinned even when current changes.
+        current = output / '.libbox-current'; current.unlink(); os.symlink('.libbox-generations/' + 'b' * 64, current)
+        with mock.patch.object(component, 'resolve_component', side_effect=AssertionError('fixed verifier reread current')), redirect_stdout(io.StringIO()):
+            ios.main(fixed)
+        check(generation.name == receipt['outputFingerprint'], 'pinned generation changed after current swap')
+        for action in [fixed + ['--historical'], publish + ['--historical'], publish + ['--offline'], publish + ['/foreign-source'],
+                       ['build', '--phase', 'publish'], ['verify', '--generation-root', str(generation)]]:
+            rejected(lambda: ios.main(action), '')
+        # No bad external approval reaches assembly/copy/publication. Stored
+        # policy/receipt hashes alone never supply the missing expected hash.
+        with mock.patch.object(component, 'assemble_component', side_effect=AssertionError('bad approval assembled')), \
+                mock.patch.object(component, 'publish_component', side_effect=AssertionError('bad approval published')):
+            for flag in ('--build-policy-sha256', '--tools-sha256'):
+                wrong = publish.copy(); wrong[wrong.index(flag) + 1] = '0' * 64
+                rejected(lambda: ios.main(wrong), 'SHA256 differs')
+                missing = publish.copy(); index = missing.index(flag); del missing[index:index + 2]
+                rejected(lambda: ios.main(missing), 'SHA256 required')
+            wrong = publish.copy(); wrong[-1] = '0' * 64
+            rejected(lambda: ios.main(wrong), 'output fingerprint differs')
+            rejected(lambda: ios.main(publish + ['--previous-build-policy', str(paths['policy'])]), 'complete approved previous')
+            rejected(lambda: ios.main(['build', '--component', '--phase', 'assemble', *approved, *original,
+                                      '--evidence-dir', str(root / 'second-assembly')]), 'pending inventory/assembly')
+        for flag, value, reason in [('--output-fingerprint', '0' * 64, 'immutable generation'),
+                                    ('--receipt-sha256', '0' * 64, 'receipt SHA256 differs'),
+                                    ('--generation-root', str(output / '.libbox-current'), 'immutable generation')]:
+            wrong = fixed.copy(); wrong[wrong.index(flag) + 1] = value
+            rejected(lambda: ios.main(wrong), reason)
+        rejected(lambda: ios.main(fixed + ['--framework', str(stage / 'Libbox.xcframework')]), 'fixed generation pair')
+        before = Path(selected['receiptPath']).read_bytes()
+        Path(selected['receiptPath']).write_bytes(before + b'\n')
+        rejected(lambda: ios.main(fixed), 'receipt SHA256 differs')
+        Path(selected['receiptPath']).write_bytes(before)
+
+
 def run_tests():
     with mock.patch.object(component, 'source_candidate', return_value={'candidate': 'a' * 40, 'tree': 'a' * 40}), \
             mock.patch.object(component, 'verify_compiler_inputs'), \
             tempfile.TemporaryDirectory(prefix='polaris-c3-pure-') as name:
         root = Path(name)
-        for folder, action in [('predicate', predicate_tests), ('publication', publication_tests), ('rollback', rollback_tests), ('historical-producer', historical_producer_tests), ('process', process_tests), ('compiler', compiler_tests), ('allowance', allowance_tests)]:
+        for folder, action in [('predicate', predicate_tests), ('publication', publication_tests), ('rollback', rollback_tests), ('historical-producer', historical_producer_tests), ('process', process_tests), ('compiler', compiler_tests), ('allowance', allowance_tests), ('component-cli', component_cli_tests)]:
             path = root / folder; path.mkdir(); action(path)
     with mock.patch.object(component.platform, 'system', return_value='Linux'):
         rejected(lambda: component.observe_component('/checkout', {}, '/go', '/mobile', '/developer', '/evidence'), 'Mac source compiler window')

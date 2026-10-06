@@ -24,10 +24,34 @@ internal object AndroidNativeValidation {
         }
     }
 
+    internal fun enqueueWarm(ledger: AndroidNativeAdmission, owner: AndroidNativeAdmission.Ticket,
+        queue: (() -> Unit) -> Unit, action: (AndroidNativeAdmission.Ticket) -> Unit) {
+        val child = ledger.reserveWarmValidation(owner)
+        try { queue { action(child) } }
+        catch (failure: Throwable) { ledger.cancelBeforeBirth(child); throw failure }
+    }
+
     fun check(ticket: AndroidNativeAdmission.Ticket, config: String) {
+        AndroidNativeAdmissionGate.ledger.checkWarmValidationConfig(ticket, config)
         run(AndroidNativeAdmissionGate.ledger, ticket,
             setup = { PolarisApplication.ensureSetup() },
-            nativeCheck = { Libbox.checkConfig(config) })
+            nativeCheck = {
+                val method = runCatching { Libbox::class.java.getMethod("checkConfigWithResult",
+                    String::class.java, String::class.java, java.lang.Long.TYPE) }.getOrNull()
+                if (method == null) {
+                    // Legacy AAR retains its ordinary validation behavior, without scoped evidence.
+                    Libbox.checkConfig(config)
+                } else {
+                    val result = try { checkNotNull(method.invoke(null, config, ticket.id, 20_000L)) }
+                    catch (failure: java.lang.reflect.InvocationTargetException) { throw failure.targetException }
+                    runCatching {
+                        val scope = AndroidTailscaleValidationScope.capture(ticket.id, config, result)
+                        AndroidNativeAdmissionGate.ledger.attachValidation(ticket, scope)
+                    }
+                    fun field(name: String) = result.javaClass.getMethod(name).invoke(result) as String
+                    if (field("getValidation") != "Accepted") throw IllegalArgumentException(field("getValidationError"))
+                }
+            })
     }
 
     internal fun run(

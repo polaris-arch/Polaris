@@ -6,6 +6,7 @@ license.workspace = true
 links = "tauri-plugin-polaris-ios"
 
 [target.'cfg(target_os = "ios")'.dependencies]
+polaris-mesh = { path = "../mesh" }
 tauri = { version = "2", default-features = false, features = ["wry"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

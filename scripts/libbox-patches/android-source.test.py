@@ -183,9 +183,9 @@ class AndroidSourceFixture(unittest.TestCase):
                         'newStrictCommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface)',
                         'java.lang.String interfaceUpdateListenerIdentity(io.nekohasekai.libbox.InterfaceUpdateListener)',
                         'java.lang.String version()', 'checkConfigWithResult(java.lang.String, java.lang.String, long)', 'ConfigValidationContractVersion = "polaris-validation-v1"']),
-            'CommandServer': 'startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions)',
+            'CommandServer': 'startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions)\npublic native java.lang.String exportTailscaleStoreRetirement();',
             'PlatformInterface': 'void bindInterfaceControl(int, java.lang.String) throws java.lang.Exception',
-            'ConfigValidationResult': '\n'.join('java.lang.String get' + getter + '()' for getter in ['RequestID','ConfigDigest','ContractVersion','Validation','Cleanup','ValidationError','CleanupError']),
+            'ConfigValidationResult': '\n'.join('java.lang.String get' + getter + '()' for getter in ['RequestID','ConfigDigest','ContractVersion','Validation','Cleanup','ValidationError','CleanupError']) + '\npublic native java.lang.String getTailscaleStoreRetirement();\npublic native java.lang.String getTailscaleStoreMembership();',
             'ExchangeContext': '\n'.join(['void errnoCode(int)','void errorCode(int)','void onCancel(io.nekohasekai.libbox.Func)','void rawSuccess(byte[])','void success(java.lang.String)']),
             'LocalDNSTransport': '\n'.join(['void exchange(io.nekohasekai.libbox.ExchangeContext, byte[]) throws java.lang.Exception',
                               'void lookup(io.nekohasekai.libbox.ExchangeContext, java.lang.String, java.lang.String) throws java.lang.Exception','boolean raw()']),
@@ -399,6 +399,66 @@ class AndroidSourceFixture(unittest.TestCase):
             self.artifact(aar, alignment=4096)
             with self.assertRaisesRegex(RuntimeError, '16K'):
                 builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
+
+    def test_scoped_tailscale_java_methods_fresh_and_forged_cache(self):
+        aar, scratch = self.root / 'scoped.aar', self.root / 'scoped-inspection'
+        scratch.mkdir()
+        self.artifact(aar)
+        with patch.object(android, 'provider', return_value=self.shared), patch.object(builder, 'run', side_effect=self.callee):
+            observed = builder.inspect_aar(aar, scratch, self.source, self.core, self.policy, self.tool, self.source_receipt)
+            receipt = {'schema': 'polaris-android-libbox-receipt-v1',
+                       'componentProducerCandidate': self.source['sourceCommit'],
+                       'sourceCommit': self.source['sourceCommit'], 'officialTag': 'v' + self.core['bundledCoreVersion'],
+                       'version': self.core['sourceBuild']['version'], 'sourceReceipt': self.source_receipt,
+                       'androidInput': self.identity, 'linkerFlags': android.linker_flags(self.core, self.shared, self.source_receipt),
+                       'buildVCS': False, 'tests': 'fixture callees only; no actual SDK or native execution',
+                       'validationCleanupContract': {'version': 'polaris-validation-v1', 'constructedBoxCleanup': 'CleanupUnknown', 'exactCleanupEnabled': False},
+                       **observed}
+            receipt['aar']['path'] = 'src-tauri/gen/android/app/libs/libbox.aar'
+            receipt['outputFingerprint'] = android.digest(android.canonical(receipt))
+            builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
+        aar_before, receipt_before = aar.read_bytes(), android.canonical(receipt)
+        methods = [('ConfigValidationResult', 'getTailscaleStoreRetirement'),
+                   ('ConfigValidationResult', 'getTailscaleStoreMembership'),
+                   ('CommandServer', 'exportTailscaleStoreRetirement')]
+        cases = []
+        for name, method in methods:
+            declaration = 'public native java.lang.String ' + method + '();'
+            self.assertIn(declaration, observed['javaInterfaces'][name])
+            for kind, replacement in [('missing', ''),
+                                      ('wrong-return', declaration.replace('java.lang.String', 'void')),
+                                      ('wrong-arity', declaration.replace('()', '(java.lang.String)')),
+                                      ('private', declaration.replace('public', 'private')),
+                                      ('static', declaration.replace('public native', 'public static native')),
+                                      ('qualified-return', declaration.replace('java.lang.String', 'fixture.java.lang.String'))]:
+                cases.append((name, method, kind, observed['javaInterfaces'][name].replace(declaration, replacement),
+                              'Scoped Tailscale Java ABI differs: ' + name + '.' + method))
+        for method in ('getTailscaleStoreRetirement', 'getTailscaleStoreMembership'):
+            setter = 'set' + method[3:]
+            changed = observed['javaInterfaces']['ConfigValidationResult'] + '\npublic native void ' + setter + '(java.lang.String);'
+            cases.append(('ConfigValidationResult', method, 'setter', changed, 'must be read-only'))
+        for name, method, kind, changed, error in cases:
+            forged = copy.deepcopy(receipt)
+            forged['javaInterfaces'][name] = changed
+            forged.pop('outputFingerprint')
+            forged['outputFingerprint'] = android.digest(android.canonical(forged))
+            def wrong_java(args, **kwargs):
+                if '-constants' in args and args[-1] == 'io.nekohasekai.libbox.' + name:
+                    self.calls.append(('builder-callee-stub', args, kwargs.get('cwd')))
+                    return changed
+                return self.callee(args, **kwargs)
+            with patch.object(android, 'provider', return_value=self.shared), patch.object(builder, 'run', side_effect=wrong_java):
+                for leg in ('fresh', 'cache'):
+                    with self.subTest(name=name, method=method, kind=kind, leg=leg):
+                        with self.assertRaisesRegex(RuntimeError, re.escape(error)):
+                            if leg == 'fresh':
+                                builder.inspect_aar(aar, scratch, self.source, self.core, self.policy, self.tool, self.source_receipt)
+                            else:
+                                builder.verify_component(aar, forged, self.source, self.core, self.policy, self.tool, self.identity, scratch)
+            self.assertEqual(aar.read_bytes(), aar_before)
+            self.assertEqual(android.canonical(receipt), receipt_before)
+        self.assertEqual(len(cases), 20)
+        self.assertFalse(any(row[0] == 'builder-callee-stub' and 'bind' in row[1] for row in self.calls))
 
     def test_apk_consumption_preserves_component_candidate(self):
         apk = self.root / 'fixture.apk'
