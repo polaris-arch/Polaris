@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { SpeedTestScheduleLimits } from '@/contracts/speed-test';
 import {
   globalPeriodicSpeedTestEnabled,
+  intervalMinutesToSave,
   parseConcurrency,
   parseIntervalMinutes,
   showsGlobalOffHint,
@@ -44,6 +45,22 @@ describe('周期测速设置项的输入解析', () => {
     expect(parseIntervalMinutes('', undefined)).toBeUndefined();
     expect(parseConcurrency('8.5', undefined)).toBeNull();
     expect(parseIntervalMinutes('abc', undefined)).toBeNull();
+  });
+});
+
+describe('订阅表单写回的周期', () => {
+  it('开关开着：照常校验，填得不对即非法', () => {
+    expect(intervalMinutesToSave(true, '45', 30, LIMITS)).toBe(45);
+    expect(intervalMinutesToSave(true, '', 30, LIMITS)).toBeUndefined();
+    expect(intervalMinutesToSave(true, 'abc', 30, LIMITS)).toBeNull();
+    expect(intervalMinutesToSave(true, '4', undefined, LIMITS)).toBeNull();
+  });
+
+  it('开关关着：输入框不可见，非法文本不拦提交也不写回，保留已保存的值或缺席', () => {
+    expect(intervalMinutesToSave(false, 'abc', 30, LIMITS)).toBe(30);
+    expect(intervalMinutesToSave(false, '4', undefined, LIMITS)).toBeUndefined();
+    expect(intervalMinutesToSave(false, '45', 30, LIMITS)).toBe(45);
+    expect(intervalMinutesToSave(false, '', 30, LIMITS)).toBeUndefined();
   });
 });
 

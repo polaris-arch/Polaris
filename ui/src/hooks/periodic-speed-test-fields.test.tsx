@@ -25,6 +25,7 @@ const LIMITS: NonNullable<SpeedTestScheduleStatus['limits']> = {
 const probe = vi.hoisted(() => ({
   limits: undefined as unknown,
   enable: null as (() => void | Promise<void>) | null,
+  commit: null as (() => unknown) | null,
   patch: vi.fn<(patch: Partial<UserConfig>) => Promise<UserConfig>>(),
 }));
 
@@ -50,6 +51,16 @@ vi.mock('@/mobile/forms/PeriodicGlobalOffHint', async (original) => {
     PeriodicGlobalOffHint: (props: Parameters<typeof real.PeriodicGlobalOffHint>[0]) => {
       probe.enable = props.onEnable;
       return <real.PeriodicGlobalOffHint {...props} />;
+    },
+  };
+});
+vi.mock('@/hooks/use-periodic-speed-test-fields', async (original) => {
+  const real = await original<typeof import('@/hooks/use-periodic-speed-test-fields')>();
+  return {
+    usePeriodicSpeedTestFields: (...args: Parameters<typeof real.usePeriodicSpeedTestFields>) => {
+      const fields = real.usePeriodicSpeedTestFields(...args);
+      probe.commit = fields.commit;
+      return fields;
     },
   };
 });
@@ -88,6 +99,7 @@ const surfaces = {
 beforeEach(() => {
   probe.limits = LIMITS;
   probe.enable = null;
+  probe.commit = null;
   probe.patch.mockReset();
   useStagedConfigStore.setState({ entries: [] });
   Object.assign(useStagedConfigStore.getInitialState(), useStagedConfigStore.getState());
@@ -137,6 +149,18 @@ describe.each(Object.entries(surfaces))('订阅表单的全局关闭提示（%s�
     await vi.waitFor(() => expect(useAppStore.getState().config?.periodicSpeedTestEnabled).toBe(true));
     Object.assign(useAppStore.getInitialState(), useAppStore.getState());
     expect(render()).not.toContain(hint());
+  });
+
+  it('开关关着时周期输入框不可见：里面的非法值不拦提交，写回的仍是已保存的值', () => {
+    // SSR 下没法先开后关再填字；已保存的越界值让输入框的初始文本就是非法的，走的是同一条提交路径。
+    seed({ subscriptions: [{ ...sub(false), speedTestIntervalMinutes: 2 }] });
+    expect(render()).not.toMatch(/id="(msf|sub)-speed-interval"/);
+    expect(probe.commit?.()).toEqual({ periodicSpeedTest: false, speedTestIntervalMinutes: 2 });
+
+    // 开关开着时同一个值照常拦下。
+    seed({ subscriptions: [{ ...sub(true), speedTestIntervalMinutes: 2 }] });
+    expect(render()).toMatch(/id="(msf|sub)-speed-interval"[^>]*value="2"/);
+    expect(probe.commit?.()).toBeNull();
   });
 
   it('周期输入框跟着订阅开关：开着才出现，留空的占位是后端给的缺省周期', () => {

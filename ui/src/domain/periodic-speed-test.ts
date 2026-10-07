@@ -31,6 +31,20 @@ export function parseIntervalMinutes(
   );
 }
 
+/**
+ * 订阅表单要写回的周期。每订阅开关关着时输入框不在界面上，填得不对也没处报错：不拦提交，
+ * 写回已保存的值（没有则缺席），不把非法文本写进去。
+ */
+export function intervalMinutesToSave(
+  enabled: boolean,
+  raw: string,
+  saved: number | undefined,
+  limits: SpeedTestScheduleLimits | undefined,
+): number | undefined | null {
+  const minutes = parseIntervalMinutes(raw, limits);
+  return minutes === null && !enabled ? saved : minutes;
+}
+
 /** 测速并发。留空即自动，存成缺席。范围未知时的处置同上。 */
 export function parseConcurrency(
   raw: string,

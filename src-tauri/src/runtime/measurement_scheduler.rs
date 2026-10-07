@@ -16,10 +16,13 @@
 //! 冻结期间是否前进并不一致）。墙钟被回拨时冻结会漏判一次，后果是一批可能的假失败，由下一轮覆盖。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use futures::FutureExt;
 use polaris_helper_proto::Platform;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Listener, Manager};
@@ -374,6 +377,10 @@ pub(crate) enum SkipReason {
     PoolUnavailable,
     /// 本轮零可测，附预筛分布。
     NothingTestable(BTreeMap<&'static str, usize>),
+    /// 本轮没有目标（都已有当前结果，或都在退避里）。
+    NoTargets,
+    /// 这一轮的任务异常终止，没有回执。
+    Crashed,
 }
 
 impl SkipReason {
@@ -388,6 +395,8 @@ impl SkipReason {
             Self::Frozen => "frozen",
             Self::PoolUnavailable => "poolUnavailable",
             Self::NothingTestable(_) => "nothingTestable",
+            Self::NoTargets => "noTargets",
+            Self::Crashed => "crashed",
         }
     }
 
@@ -561,16 +570,16 @@ impl Planner {
         }
     }
 
-    /// 回到前台（或解冻）后的评估：离开够久则前台代次加一；手机上那会使旧结果不可用于选点，
-    /// 所以立即补测。离开不久、且没有订阅到期时沿用原到期时刻。
+    /// 回到前台（或解冻）后的评估：离开够久则前台代次加一并立即补测。手机上旧结果随代次不可用于
+    /// 选点；桌面休眠醒来后网络多半已变。这一次计入切网补测的最小间隔，紧随其后的网络代次变化
+    /// 不再立刻另发一轮。离开不久、且没有订阅到期时沿用原到期时刻。
     fn returned(&mut self, now: Now, away_ms: u64) {
         if away_ms < AWAY_EPOCH_MS {
             return;
         }
         self.foreground_epoch += 1;
-        if is_mobile(self.platform) {
-            self.due_now(now);
-        }
+        self.last_network_retest = Some(now.mono);
+        self.due_now(now);
     }
 }
 
@@ -605,7 +614,12 @@ impl Planner {
     fn abort(&mut self, cause: AbortCause) -> bool {
         match self.round.as_mut() {
             Some(round) => {
-                round.abort_cause.get_or_insert(cause);
+                // 重置盖过已标而未收尾的成因：那一轮属于旧世代，收尾时不得按旧成因给新计划记账。
+                if cause == AbortCause::Reset {
+                    round.abort_cause = Some(cause);
+                } else {
+                    round.abort_cause.get_or_insert(cause);
+                }
                 true
             }
             None => false,
@@ -720,7 +734,8 @@ impl Planner {
         }
 
         // 计费状态翻转（两侧都已知）：多半是 Wi-Fi 与蜂窝互换，视同切网，立即补测；
-        // 手机上没有网络代次，另把前台代次加一使旧结果作废。
+        // 手机上没有网络代次，另把前台代次加一使旧结果作废。补测与切网共用最小间隔：间隔内的翻转
+        // 记作一次待处理的切网，满间隔后补一轮，来回翻转绕不过降频。
         if let Some(conditions) = input.conditions {
             let flipped = matches!(
                 (self.conditions.metered, conditions.metered),
@@ -732,7 +747,15 @@ impl Planner {
                 if is_mobile(self.platform) {
                     self.foreground_epoch += 1;
                 }
-                self.due_now(now);
+                if self
+                    .last_network_retest
+                    .is_none_or(|last| now.mono.saturating_sub(last) >= NET_RETEST_MIN_GAP_MS)
+                {
+                    self.last_network_retest = Some(now.mono);
+                    self.due_now(now);
+                } else {
+                    self.network_changed_at = Some(now.mono);
+                }
             }
         }
 
@@ -880,8 +903,11 @@ impl Planner {
                         (None, _)
                             if report.measured.is_empty()
                                 && report.unmeasured.is_empty()
-                                && !report.skipped.is_empty() =>
+                                && report.skipped.is_empty() =>
                         {
+                            Some(SkipReason::NoTargets)
+                        }
+                        (None, _) if report.measured.is_empty() && report.unmeasured.is_empty() => {
                             let mut skipped = BTreeMap::new();
                             for (_, reason) in &report.skipped {
                                 *skipped.entry(*reason).or_insert(0) += 1;
@@ -932,16 +958,38 @@ impl Planner {
                             sub.truncated_streak = 0;
                             sub.period_too_short = false;
                             sub.next_due = next_regular(sub);
-                            if !sub
+                            // 完整轮次要有成员真被测到：空轮与成员全被预筛跳过的一轮不算。
+                            let measured = sub
                                 .members
                                 .iter()
-                                .any(|member| report.unmeasured.contains(member))
+                                .any(|member| report.measured.contains_key(member));
+                            if measured
+                                && !sub
+                                    .members
+                                    .iter()
+                                    .any(|member| report.unmeasured.contains(member))
                             {
                                 sub.last_full_round = Some(report.ended_at);
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// 一轮的任务异常终止，没有回执：记下原因，按正常周期排下次到期，不立即重试。
+    pub(crate) fn on_round_crashed(&mut self, now: Now) {
+        let Some(round) = self.round.take() else {
+            return;
+        };
+        if round.abort_cause == Some(AbortCause::Reset) {
+            return;
+        }
+        for id in &round.subs {
+            self.skip(id, now, SkipReason::Crashed);
+            if let Some(sub) = self.subs.get_mut(id) {
+                sub.next_due = round.started_mono + sub.period_ms * round.period_factor;
             }
         }
     }
@@ -1211,6 +1259,16 @@ async fn device_conditions(platform: Platform) -> DeviceConditions {
     }
 }
 
+/// 等一轮跑完。任务 panic 时返回 `None` 而不把 panic 传出去：收尾必须照常发生，否则在飞标记与
+/// 取消槽一直留着，调度器到进程退出都不再发任何一轮。
+async fn settle(round: impl Future<Output = ScheduledRound>) -> Option<ScheduledRound> {
+    let outcome = AssertUnwindSafe(round).catch_unwind().await;
+    if outcome.is_err() {
+        log::error!("周期测速：一轮的任务异常终止");
+    }
+    outcome.ok()
+}
+
 struct Shared {
     planner: Planner,
     /// 在飞一轮的取消槽。
@@ -1392,22 +1450,35 @@ impl MeasurementScheduler {
                 let app = app.clone();
                 let config = config.clone();
                 tauri::async_runtime::spawn(async move {
-                    let outcome = if targets.is_empty() {
-                        // 没有要测的（都已有当前结果，或都在退避里）：按完成收尾。
-                        let at = now_ms();
-                        ScheduledRound::Ran(RoundReport {
-                            started_at: at,
-                            ended_at: at,
-                            ..RoundReport::default()
-                        })
-                    } else {
-                        run_scheduled_round(&app, ledger, &targets, scope, &abort, FREEZE_GAP_MS)
+                    let outcome = settle(async {
+                        if targets.is_empty() {
+                            // 没有要测的（都已有当前结果，或都在退避里）：按完成收尾。
+                            let at = now_ms();
+                            ScheduledRound::Ran(RoundReport {
+                                started_at: at,
+                                ended_at: at,
+                                ..RoundReport::default()
+                            })
+                        } else {
+                            run_scheduled_round(
+                                &app,
+                                ledger,
+                                &targets,
+                                scope,
+                                &abort,
+                                FREEZE_GAP_MS,
+                            )
                             .await
-                    };
+                        }
+                    })
+                    .await;
                     let now = this.now();
                     let mut shared = this.lock();
                     shared.abort = None;
-                    shared.planner.on_round_end(now, &outcome);
+                    match &outcome {
+                        Some(outcome) => shared.planner.on_round_end(now, outcome),
+                        None => shared.planner.on_round_crashed(now),
+                    }
                     let plan = shared.plan.clone();
                     drop(shared);
                     // 每轮收尾时按软上限淘汰一次。

@@ -3,7 +3,7 @@ import type { SpeedTestScheduleLimits } from '@/contracts/speed-test';
 import type { SubscriptionConfig } from '@/contracts/types';
 import {
   globalPeriodicSpeedTestEnabled,
-  parseIntervalMinutes,
+  intervalMinutesToSave,
   showsGlobalOffHint,
 } from '@/domain/periodic-speed-test';
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
@@ -21,7 +21,7 @@ export interface PeriodicSpeedTestFields {
   enablingGlobal: boolean;
   toggle: () => void;
   setInterval: (next: string) => void;
-  /** 校验并给出要写回订阅的两个字段；周期填得不对 → 标红并返回 `null`。 */
+  /** 校验并给出要写回订阅的两个字段；开关开着而周期填得不对 → 标红并返回 `null`。 */
   commit: () => Pick<SubscriptionConfig, 'periodicSpeedTest' | 'speedTestIntervalMinutes'> | null;
   /** 就地打开全局总开关并保存，不要求离开表单去设置页。 */
   enableGlobal: () => Promise<void>;
@@ -57,7 +57,7 @@ export function usePeriodicSpeedTestFields(base: SubscriptionConfig | undefined)
       setIntervalInvalid(false);
     },
     commit: () => {
-      const minutes = parseIntervalMinutes(interval, limits);
+      const minutes = intervalMinutesToSave(checked, interval, base?.speedTestIntervalMinutes, limits);
       if (minutes === null) {
         setIntervalInvalid(true);
         return null;

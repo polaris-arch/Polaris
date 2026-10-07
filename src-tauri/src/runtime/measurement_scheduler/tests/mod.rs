@@ -603,6 +603,78 @@ fn a_new_core_generation_resets_the_schedule() {
 // ── 前后台 ────────────────────────────────────────────────────────────────────
 
 /// Android：离开前台即取消在飞的一轮并进入暂停，一直保持到回前台信号到达。
+/// 一轮已被标成超预算而尚未收尾时核换代（或计划被清空）：重置盖过旧成因，收尾不给新世代记账，
+/// 新世代的首轮照就绪后的约定延迟发出。
+#[test]
+fn a_reset_overrides_an_earlier_abort_cause() {
+    let plan = plan(&[("s1", 30, &["a", "b"])]);
+    let cut = || interrupted(InterruptReason::Cancelled, &["a"], &["b"]);
+    let (mut planner, t0) = started(Platform::Linux, &plan);
+    let over = t0 + ROUND_BUDGET_MAX_MS + 1;
+    assert!(planner.tick(&input(at(over), Some(1), &plan)).abort);
+    planner.tick(&input(at(over + 1_000), Some(2), &plan));
+    planner.on_round_end(at(over + 2_000), &cut());
+    assert!(planner.carry_over.is_empty());
+    assert_eq!(
+        planner.status(at(over + 2_000), true, &plan)["subscriptions"]["s1"]["lastSkip"],
+        Value::Null
+    );
+    let ready = over + 1_000;
+    assert_eq!(
+        planner
+            .tick(&input(at(ready + FIRST_ROUND_DELAY_MS - 1), Some(2), &plan))
+            .start,
+        None
+    );
+    let first = planner
+        .tick(&input(at(ready + FIRST_ROUND_DELAY_MS), Some(2), &plan))
+        .start
+        .expect("新世代的首轮不被旧世代那一轮的成因推迟");
+    assert!(!first.only_missing);
+
+    // 计划被清空同理。
+    let (mut planner, t0) = started(Platform::Linux, &plan);
+    let over = t0 + ROUND_BUDGET_MAX_MS + 1;
+    planner.tick(&input(at(over), Some(1), &plan));
+    planner.tick(&input(at(over + 1_000), Some(1), &BTreeMap::new()));
+    planner.on_round_end(at(over + 2_000), &cut());
+    assert!(planner.carry_over.is_empty());
+}
+
+async fn panicking_round() -> ScheduledRound {
+    panic!("测量层 panic")
+}
+
+/// 一轮的任务 panic：收尾照常发生，在飞标记清掉并记下原因，下一个周期照发。
+#[tokio::test]
+async fn a_crashed_round_task_is_settled_and_the_schedule_continues() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let (mut planner, t0) = started(Platform::Linux, &plan);
+    assert_eq!(settle(panicking_round()).await, None);
+    planner.on_round_crashed(at(t0 + 1_000));
+    assert_eq!(
+        planner.status(at(t0 + 1_000), true, &plan)["subscriptions"]["s1"]["lastSkip"]["reason"],
+        "crashed"
+    );
+    assert_eq!(
+        planner
+            .tick(&input(at(t0 + 30 * MINUTE - 1), Some(1), &plan))
+            .start,
+        None,
+        "不立即重试"
+    );
+    assert!(planner
+        .tick(&input(at(t0 + 30 * MINUTE), Some(1), &plan))
+        .start
+        .is_some());
+
+    // 正常跑完的回执原样带出。
+    assert_eq!(
+        settle(async { ScheduledRound::PoolUnavailable }).await,
+        Some(ScheduledRound::PoolUnavailable)
+    );
+}
+
 #[test]
 fn android_stays_paused_until_resumed() {
     let plan = plan(&[("s1", 30, &["a", "b"])]);
@@ -743,6 +815,54 @@ fn a_tick_gap_is_treated_as_a_freeze() {
         wall: WALL + TICK_ACTIVE_MS * TICK_GAP_FACTOR,
     };
     assert!(!steady.tick(&input(on_time, Some(1), &plan)).abort);
+}
+
+/// 桌面合盖休眠再唤醒：离开够久即立即补一轮，不等原到期时刻；这一次计入切网补测的最小间隔。
+#[test]
+fn a_desktop_wake_from_a_long_sleep_retests_at_once() {
+    let plan = plan(&[("s1", 60, &["a"])]);
+    let on = |now, epoch| TickInput {
+        network_epoch: Some(epoch),
+        ..input(now, Some(1), &plan)
+    };
+    let slept = |away| {
+        let mut planner = Planner::new(Platform::Linux, at(0));
+        planner.tick(&on(at(0), 5));
+        assert!(planner
+            .tick(&on(at(FIRST_ROUND_DELAY_MS), 5))
+            .start
+            .is_some());
+        planner.on_round_end(at(20_000), &completed(&[("a", true)]));
+        assert_eq!(planner.tick(&on(at(25_000), 5)).start, None);
+        let woke = Now {
+            mono: 30_000,
+            wall: WALL + away,
+        };
+        let start = planner.tick(&on(woke, 5)).start;
+        (planner, woke, start)
+    };
+
+    let (_, _, start) = slept(AWAY_EPOCH_MS - 1);
+    assert_eq!(start, None, "离开不久：沿用原到期时刻");
+
+    let (mut planner, woke, start) = slept(AWAY_EPOCH_MS);
+    assert!(!start.expect("唤醒后立即补测").only_missing);
+    let later = |ms| Now {
+        mono: woke.mono + ms,
+        wall: woke.wall,
+    };
+    planner.on_round_end(later(1_000), &completed(&[("a", true)]));
+
+    // 唤醒后网络代次跟着变：稳定了也要等到距这次补测满下限。
+    assert_eq!(planner.tick(&on(later(2_000), 6)).start, None);
+    assert_eq!(
+        planner.tick(&on(later(NET_RETEST_MIN_GAP_MS - 1), 6)).start,
+        None
+    );
+    assert!(planner
+        .tick(&on(later(NET_RETEST_MIN_GAP_MS), 6))
+        .start
+        .is_some());
 }
 
 /// 测量层自己在结果间隔上检出冻结（回执带 `frozen`）时同样记「设备冻结」并只补仍缺的。
@@ -921,6 +1041,48 @@ fn power_save_pauses_and_a_metered_flip_retests() {
         .start
         .is_some());
     assert_eq!(planner.foreground_epoch(), 1);
+}
+
+/// 计费状态来回翻转（弱 Wi-Fi 与蜂窝互换）：补测与切网共用最小间隔，间隔内的翻转并成满间隔后的
+/// 一轮。前台代次照旧每次翻转加一。
+#[test]
+fn metered_flips_share_the_network_retest_gap() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let with = |mono, metered| TickInput {
+        conditions: Some(DeviceConditions {
+            metered,
+            power_save: false,
+        }),
+        ..input(at(mono), Some(1), &plan)
+    };
+    let mut planner = Planner::new(Platform::Android, at(0));
+    planner.tick(&with(0, Metered::No));
+    assert!(planner
+        .tick(&with(FIRST_ROUND_DELAY_MS, Metered::No))
+        .start
+        .is_some());
+    planner.on_round_end(at(FIRST_ROUND_DELAY_MS + 1_000), &completed(&[("a", true)]));
+
+    let first = FIRST_ROUND_DELAY_MS + 60_000;
+    assert!(planner.tick(&with(first, Metered::Yes)).start.is_some());
+    planner.on_round_end(at(first + 1_000), &completed(&[("a", true)]));
+
+    assert_eq!(planner.tick(&with(first + 30_000, Metered::No)).start, None);
+    assert_eq!(
+        planner.tick(&with(first + 60_000, Metered::Yes)).start,
+        None
+    );
+    assert_eq!(planner.foreground_epoch(), 3);
+    assert_eq!(
+        planner
+            .tick(&with(first + NET_RETEST_MIN_GAP_MS - 1, Metered::Yes))
+            .start,
+        None
+    );
+    assert!(planner
+        .tick(&with(first + NET_RETEST_MIN_GAP_MS, Metered::Yes))
+        .start
+        .is_some());
 }
 
 /// 拉设备状况的时机：有订阅到期时（准入前必查）；否则隔一段查一次；一轮在飞或没有计划时不查。
@@ -1172,6 +1334,80 @@ fn rounds_that_measured_nothing_are_recorded_with_a_reason() {
         planner.status(at(t0), true, &plan)["subscriptions"]["s1"]["lastSkip"]["reason"],
         "poolUnavailable"
     );
+}
+
+/// 完整轮次要有成员真被测到：成员全被预筛跳过的订阅、以及没有目标的空轮，都不刷新完整轮次时间，
+/// 逾期照样亮得起来。
+#[test]
+fn only_a_round_that_measured_members_counts_as_a_full_round() {
+    let plan = plan(&[("s1", 30, &["a"]), ("s2", 30, &["x"])]);
+    let (mut planner, t0) = started(Platform::Linux, &plan);
+    let not_in_pool = |id: &str| (id.to_string(), "notInPool");
+    let subs =
+        |planner: &Planner, mono| planner.status(at(mono), true, &plan)["subscriptions"].clone();
+
+    // 合并的一轮：s1 测到了，s2 的成员全被预筛跳过。
+    planner.on_round_end(
+        at(t0 + 1_000),
+        &ScheduledRound::Ran(RoundReport {
+            ended_at: WALL + 1_000,
+            measured: BTreeMap::from([("a".to_string(), true)]),
+            skipped: vec![not_in_pool("x")],
+            ..RoundReport::default()
+        }),
+    );
+    let after = subs(&planner, t0 + 1_000);
+    assert_eq!(after["s1"]["lastFullRoundAt"], WALL + 1_000);
+    assert_eq!(after["s2"]["lastFullRoundAt"], Value::Null);
+
+    // 空轮（没有目标）：单独记原因。
+    let second = t0 + 30 * MINUTE;
+    assert!(planner
+        .tick(&input(at(second), Some(1), &plan))
+        .start
+        .is_some());
+    planner.on_round_end(
+        at(second),
+        &ScheduledRound::Ran(RoundReport {
+            started_at: WALL + 30 * MINUTE,
+            ended_at: WALL + 30 * MINUTE,
+            ..RoundReport::default()
+        }),
+    );
+    let after = subs(&planner, second);
+    assert_eq!(after["s1"]["lastFullRoundAt"], WALL + 1_000);
+    assert_eq!(after["s1"]["lastSkip"]["reason"], "noTargets");
+    assert_eq!(after["s2"]["lastFullRoundAt"], Value::Null);
+
+    // 全部被预筛跳过的一轮。
+    let third = t0 + 60 * MINUTE;
+    assert!(planner
+        .tick(&input(at(third), Some(1), &plan))
+        .start
+        .is_some());
+    planner.on_round_end(
+        at(third),
+        &ScheduledRound::Ran(RoundReport {
+            ended_at: WALL + 60 * MINUTE,
+            skipped: vec![not_in_pool("a"), not_in_pool("x")],
+            ..RoundReport::default()
+        }),
+    );
+    let after = subs(&planner, third);
+    assert_eq!(after["s1"]["lastFullRoundAt"], WALL + 1_000);
+    assert_eq!(after["s2"]["lastFullRoundAt"], Value::Null);
+    assert_eq!(after["s2"]["lastSkip"]["reason"], "nothingTestable");
+
+    // s2 从没有过完整轮次：距就绪超过 3 个周期即逾期。
+    let late = planner.status(
+        Now {
+            mono: third,
+            wall: WALL + OVERDUE_FACTOR * 30 * MINUTE + 1,
+        },
+        true,
+        &plan,
+    );
+    assert_eq!(late["subscriptions"]["s2"]["overdue"], true);
 }
 
 // ── 观测：读时投影 ────────────────────────────────────────────────────────────
