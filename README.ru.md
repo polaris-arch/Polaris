@@ -5,8 +5,8 @@
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · **Русский** · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#установка)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#установка)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
 
@@ -50,6 +50,7 @@
 | macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
 | Windows | `*-win-setup.exe`; портативная сборка — `polaris-portable-*.zip` |
 | Linux | `*.deb` / `*.AppImage` |
+| Android | `*-android-arm64.apk` (только arm64) |
 
 Пакеты не подписываются платным сертификатом подписи кода, поэтому при первом запуске на каждой платформе требуется ручное разрешение.
 
@@ -74,12 +75,15 @@
 
 ## Сборка
 
-Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26) и [Tauri CLI 2](https://v2.tauri.app/).
+Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26), pnpm 11.24.0, Go и [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-node scripts/fetch-core.mjs        # загрузка ядра sing-box (закреплено по SHA256)
-node scripts/fetch-cronet.mjs      # загрузка libcronet
+pnpm --dir ui install --frozen-lockfile   # зависимости фронтенда
+# ядро sing-box: набор для четырёх платформ, собранный из закреплённых исходников и патчей (результат CI-workflow «Desktop Core Sources» для того же коммита)
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+node scripts/fetch-cronet.mjs --platform=linux  # загрузка libcronet.so рядом с ядром Linux
+node scripts/fetch-dashboard.mjs   # загрузка встроенной панели
 tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
@@ -91,7 +95,7 @@ tauri build --config src-tauri/tauri.linux.conf.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 ## Архитектура
@@ -99,16 +103,17 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Главный процесс Tauri 2
-crates/      17 доменных crate (config-engine / core-supervisor / helper / updater / …)
+crates/      18 доменных crate (config-engine / core-supervisor / helper / updater / …)
 resources/   Ядро sing-box + libcronet (загружаются при сборке, в репозитории не хранятся)
 ```
 
-Ядро работает как дочерний процесс-sidecar и управляется через gRPC. TUN и системный прокси обслуживаются привилегированными helper-процессами на всех трёх платформах (macOS / Windows / Linux, целиком на Rust).
+Ядро работает как дочерний процесс-sidecar и управляется через gRPC. Привилегированные операции — запуск ядра для TUN и системный перехват — делегируются helper-процессам на Rust на всех трёх платформах; путь System Proxy, которому helper не нужен, управляется напрямую crate `system-integration` на стороне приложения, он же отвечает за откат.
 
 ## Документация
 
 | Файл | Содержание |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | Текущие слои, транзакции выполнения, DNS / маршрутизация, границы привилегий и критерии разделения больших файлов (только на китайском) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | Сборка, CI, инварианты упаковки, контракт выбора пакета обновлятором |
 | [docs/troubleshooting.ru.md](docs/troubleshooting.ru.md) | Замечания о неподписанных сборках, белый экран / артефакты отрисовки / сбои GPU |
 

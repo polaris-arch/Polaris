@@ -18,7 +18,8 @@ Implementation lands in batches per system design §H (B0 scaffolding → B10 re
 |---|---|---|
 | Rust | stable (edition 2021) | Backend + 18 domain crates under `crates/` (plus `source-probe`, which is dev-only: it appears solely in `[dev-dependencies]` and never in a lib/bin dependency graph) |
 | Node.js | 24+ (CI pins 26) | Frontend build + fetch scripts |
-| pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`) |
+| pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`); the `beforeBuildCommand` of `tauri build` calls `pnpm` directly, so it must be on PATH |
+| Go | `goVersion` in `scripts/libbox-patches/source-manifest.json` | Building the desktop core from source, and reading binary build information when consuming a core bundle |
 | [Tauri CLI 2](https://v2.tauri.app/) | Pinned by `scripts/tauri-cli.version` | `tauri build` packaging with the global CLI |
 
 Install the global CLI from the repository root. The CLI is no longer a `ui/` devDependency; desktop and Android CI install the same pinned version.
@@ -73,25 +74,28 @@ create a second compatibility layer.
 
 The three resource types have distinct provenance and integrity contracts; they must not be described collectively as “official releases plus manifest SHA”.
 
-- `fetch-core` downloads sing-box GitHub Release archives and verifies `coreArchiveSha256`.
+- `fetch-core` does not download upstream Release archives. The desktop core is built natively on each of the four platforms from the sing-box source commit pinned in `scripts/libbox-patches/source-manifest.json` plus this repository's patches (Windows additionally applies `scripts/core-patches/windows-dns-refresh.patch`); its version is `sourceBuild.version` in `core-manifest.json`. The script places the verified four-platform core bundle into `resources/<platform>/`.
 - `fetch-cronet` downloads platform modules from the Go module proxy, then verifies the extracted dynamic library with `cronetLibrarySha256`.
 - `fetch-dashboard` fetches the sing-box `gh-pages` dashboard artifact and **currently has no SHA256 pin**.
 
 All are fetched on demand and never committed. **They must be run before packaging** because the Tauri bundle `resources` field references them. A missing core or Cronet pin is a hard failure: native executable resources are never fetched without verification.
 
 ```bash
-node scripts/fetch-core.mjs       # sing-box cores for four platforms (version = bundledCoreVersion in core-manifest.json; do not re-pin it here)
+# sing-box cores for four platforms: consume the core bundle (version = sourceBuild.version in core-manifest.json; do not re-pin it here)
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
 node scripts/fetch-cronet.mjs     # libcronet (linux/windows only; on macOS it is statically linked into the core)
 node scripts/fetch-dashboard.mjs  # sing-box dashboard (gh-pages artifact)
 ```
 
 Use `node scripts/fetch-cronet.mjs --platform=linux` or `--platform=win` to fetch only the current packaging leg. Versions are always resolved from the `go.mod` of the sing-box tag named by `bundledCoreVersion`; Linux and Windows may use their respective upstream `require` versions. `--check-only` downloads no library, but verifies that the tag is readable, both exact requires exist, and both SHA-256 pins are complete and well-formed.
 
+The core bundle is produced by `.github/workflows/desktop-core.yml`: four native runners (Linux / Windows / macOS x64 / macOS arm64) each run `node scripts/fetch-core.mjs --producer --platform=<linux|win|mac-x64|mac-arm64> --bundle-dir=<dir> --candidate=<commit SHA>`, and `--assemble` then writes `bundle.json` for the combined outputs. `--producer` accepts exactly one platform and never cross-builds. Consumption requires `--candidate` to equal the current `HEAD` with no modified tracked files; even when `--platform` selects a single platform to place, all four binaries and receipts are verified first. A missing bundle or incomplete `sourceBuild` pins is a hard failure: there is no fallback to official Release assets or an old cache.
+
 All three commands above must be run manually: `tauri.conf.json` has **no** `build.beforeBundleCommand`, so `tauri build` does not fetch anything for you. (This section previously described a `beforeBundleCommand` safety net; that key never existed, which made `scripts/verify-dashboard-resources.mjs` an orphan that never ran. The script has been deleted.)
 
 The safety net is now `node scripts/verify-packaging.mjs confs`, which CI runs after the fetch steps and before the Rust build (`.github/workflows/package.yml`). It asserts that every resource path referenced by a conf exists **and has content**: empty directories and zero-byte files both fail the check (existence is not content; a failed fetch or extraction typically leaves exactly those two shapes). It is pure static analysis with no build dependency, so any developer machine can reproduce it.
 
-When upgrading the core, first update `bundledCoreVersion` and its `coreArchiveSha256`, then run `node scripts/fetch-cronet.mjs --check-only`. If upstream `go.mod` changes a Cronet dependency, update only the affected platform's `cronetLibrarySha256`, then re-fetch and verify that platform with `--force --platform=<linux or win>`; never write a second Cronet version into the manifest.
+When upgrading the core, first update `bundledCoreVersion`, `scripts/libbox-patches/source-manifest.json`, and the `sourceBuild` / `windowsBuild` pins in `core-manifest.json` (`coreArchiveSha256` is now kept only for its key set, which enumerates the bundled platforms), then run `node scripts/fetch-cronet.mjs --check-only`. If upstream `go.mod` changes a Cronet dependency, update only the affected platform's `cronetLibrarySha256`, then re-fetch and verify that platform with `--force --platform=<linux or win>`; never write a second Cronet version into the manifest.
 
 ### Producing installers
 
@@ -118,7 +122,8 @@ The portable zip is produced by the Windows leg of `package.yml` from `target/re
 
 ⚠️ **The dmg row is the same story with a different cause**: the `-mac-arm64` / `-mac-x64` arch tag is not produced by Tauri. The `Tag macOS dmg with arch` step in `package.yml` renames `<name>.dmg` to `<name>-<tag>.dmg`, and that step only runs in CI. **Running `tauri build` locally gives you a dmg with Tauri's default name, without the tag.** That tag is a hard requirement of the updater's package-selection contract: `github.rs::find_suitable_update_asset` picks the package by looking for `mac-arm64` / `mac-x64` in the asset name and returns `None` when nothing matches (the "any .dmg" fallback has been removed).
 
-A release contains **exactly one** each of deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip (six platform deliverables in total, plus `SHA256SUMS`), enforced mechanically by `verify-packaging.mjs assets --label release`.
+A release contains **exactly one** each of deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip (six desktop deliverables in total, plus `SHA256SUMS`), enforced mechanically by `verify-packaging.mjs assets --label release`.
+The Android `polaris-<version>-android-arm64.apk` is not one of these four packaging legs: `android.yml` builds and signs it through `scripts/build-android-apk.sh` and uploads it to the same release after the desktop assets have been verified.
 The two Linux forms are likewise "exactly one", not "at least one": the updater's Linux branch takes the first match (`app_image.first()` / `deb.first()` in `github.rs`), so a duplicate makes the choice depend on asset ordering, exactly as with dmg / setup.
 
 #### Per-platform core filtering (`--config` is not optional)
@@ -145,10 +150,14 @@ It was added (2026-08-29) after a batch of stowaways that had **already shipped*
 
 ## Continuous integration
 
-Two workflows divide the work (`.github/workflows/`):
+Six workflows divide the work (`.github/workflows/`):
 
-- **`ci.yml`** — fast gate: `cargo fmt + clippy + build + test` on all three platforms, triggered on every PR and every push to main. Its job is "is the change correct". Setting the three `cargo-test` jobs as required checks is recommended.
-- **`package.yml`** — release engineering: a three-platform matrix running fetch + `tauri build` + artifact upload. Triggered by tags (`v*`), manually, or by changes to packaging-related paths on main. Its job is "can we produce a distributable installer".
+- **`ci.yml`** — fast gate: `cargo fmt + clippy + build + test`, triggered on PRs and pushes to main (a documentation-only push to main does not trigger it). PRs and releases run Linux / Windows / macOS; a push to main runs Linux only. Its job is "is the change correct". Setting the three `cargo-test` jobs as required checks is recommended.
+- **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
+- **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml` (without uploading artifacts), and `android.yml` only for the affected faces.
+- **`desktop-core.yml`** — call-only: four native runners build the desktop core from source and assemble the core bundle.
+- **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. Its job is "can we produce a distributable installer". On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
+- **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; when called for a release it produces the signed APK.
 
 ## Windows installer and WebView2
 

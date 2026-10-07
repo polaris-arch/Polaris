@@ -19,7 +19,8 @@ README 只留「怎么装、怎么用」。
 |---|---|---|
 | Rust | stable（edition 2021） | 后端 + `crates/` 下 18 个域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
 | Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
-| pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`） |
+| pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）；`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
+| Go | `scripts/libbox-patches/source-manifest.json` 的 `goVersion` | 桌面内核源码构建，以及消费内核包时读取二进制构建信息 |
 | [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
 
 在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
@@ -72,7 +73,9 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 三类资源的渠道与完整性合同不同，不能混称为「官方 release + manifest SHA」：
 
-- `fetch-core` 从 sing-box GitHub Release 下载压缩包，以 `coreArchiveSha256` 校验；
+- `fetch-core` 不下载上游 Release 压缩包。桌面内核由 `scripts/libbox-patches/source-manifest.json` 钉扎的 sing-box
+  源码提交加本仓补丁（Windows 另加 `scripts/core-patches/windows-dns-refresh.patch`）在四个平台各自原生构建，
+  版本为 `core-manifest.json` 的 `sourceBuild.version`；脚本把校验过的四平台内核包落到 `resources/<平台>/`；
 - `fetch-cronet` 从 Go module proxy 下载平台模块 zip，解压后以 `cronetLibrarySha256` 校验实际动态库；
 - `fetch-dashboard` 取 sing-box `gh-pages` 面板产物，**当前没有 SHA256 pin**。
 
@@ -80,7 +83,8 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 缺 pin 都会 fail，绝不无校验拉取原生可执行资源。
 
 ```bash
-node scripts/fetch-core.mjs       # sing-box 四平台核（版本 = core-manifest.json 的 bundledCoreVersion，勿在此重复钉）
+# sing-box 四平台核：消费内核包（版本 = core-manifest.json 的 sourceBuild.version，勿在此重复钉）
+node scripts/fetch-core.mjs --bundle-dir=<内核包目录> --candidate="$(git rev-parse HEAD)"
 node scripts/fetch-cronet.mjs     # libcronet（仅 linux/windows；mac 静态编入核心）
 node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 ```
@@ -88,6 +92,12 @@ node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 `node scripts/fetch-cronet.mjs --platform=linux` 或 `--platform=win` 可只拉当前打包腿；版本始终从
 `bundledCoreVersion` 对应 sing-box tag 的 `go.mod` 解析，Linux 与 Windows 可各自使用上游实际 require 的模块版本。
 `--check-only` 不下载库，但会校验 tag 可读、两个精确 require 均存在、以及两平台的 SHA-256 pin 完整且格式有效。
+
+内核包由 `.github/workflows/desktop-core.yml` 产出：Linux / Windows / macOS x64 / macOS arm64 四个原生 runner 各跑
+`node scripts/fetch-core.mjs --producer --platform=<linux|win|mac-x64|mac-arm64> --bundle-dir=<目录> --candidate=<提交 SHA>`，
+汇总后由 `--assemble` 写出 `bundle.json`。`--producer` 只接受恰好一个平台，不做跨平台构建。消费形态要求
+`--candidate` 等于当前 `HEAD` 且工作树没有已跟踪文件的改动；即使用 `--platform` 只落其中一个平台，也会先校验
+全部四份二进制与回执。缺内核包、或 `sourceBuild` 钉扎不完整时直接失败，没有回落到官方 Release 资产或旧缓存的路径。
 
 上面三条都必须手动跑：`tauri.conf.json` **没有** `build.beforeBundleCommand`，
 `tauri build` 不会替你 fetch 任何资源。
@@ -99,7 +109,8 @@ node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 空目录与 0 字节文件一律转红（存在 ≠ 有内容；fetch / 解压失败的典型形态正是留下这两种）。
 任意开发机可复现，纯静态、无构建依赖。
 
-升级核心时，先更新 `bundledCoreVersion` 与对应 `coreArchiveSha256`，再跑
+升级核心时，先更新 `bundledCoreVersion`、`scripts/libbox-patches/source-manifest.json` 与 `core-manifest.json` 的
+`sourceBuild` / `windowsBuild` 钉扎（`coreArchiveSha256` 现只保留其键集合作为随包平台枚举），再跑
 `node scripts/fetch-cronet.mjs --check-only`。若上游 `go.mod` 的 Cronet 依赖变化，只更新受影响平台的
 `cronetLibrarySha256`，最后以 `--force --platform=<linux 或 win>` 重拉并验证该平台库；版本不写回 manifest。
 
@@ -135,8 +146,10 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 `mac-arm64` / `mac-x64` 选包，匹配不到直接返回 `None`（已取消「任意 .dmg」回落）。
 
 一个 release 里 deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip
-**各恰好一个**（共 6 个平台交付物，另含 `SHA256SUMS`），由
+**各恰好一个**（共 6 个桌面交付物，另含 `SHA256SUMS`），由
 `verify-packaging.mjs assets --label release` 机器守住。
+Android 的 `polaris-<版本>-android-arm64.apk` 不在这四条打包腿里：由 `android.yml` 经 `scripts/build-android-apk.sh`
+构建并签名，在桌面资产验过后上传到同一个 release。
 两个 Linux 形态同样是「恰好一个」而非「至少一个」：updater 的 Linux 分支取首个命中
 （`github.rs` 的 `app_image.first()` / `deb.first()`），多一个就和 dmg / setup 一样选谁看资产顺序。
 
@@ -177,12 +190,19 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 
 ## 持续集成
 
-两个 workflow 分工（`.github/workflows/`）：
+六个 workflow 分工（`.github/workflows/`）：
 
-- **`ci.yml`** — 快速门禁：三平台 `cargo fmt + clippy + build + test`，每个 PR / push 到 main 触发。
+- **`ci.yml`** — 快速门禁：`cargo fmt + clippy + build + test`，PR / push 到 main 触发（push 到 main 时纯文档改动不触发）。
+  PR 与发布时跑 Linux / Windows / macOS 三平台，push 到 main 只跑 Linux。
   职责 = 「改动是否正确」。建议把三平台 `cargo-test` 设为 required checks。
-- **`package.yml`** — 发布工程：三平台 matrix 跑 fetch + `tauri build` + 产物上传。
-  触发 = tag（`v*`）/ 手动 / main 改动打包相关路径。职责 = 「能否产出可分发安装包」。
+- **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
+- **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
+  只对受影响的面调用 `desktop-core.yml`、`package.yml`（不上传产物）与 `android.yml`。
+- **`desktop-core.yml`** — 只被调用：四个原生 runner 从源码构建桌面内核并汇总成内核包。
+- **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
+  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。职责 = 「能否产出可分发安装包」。tag 发布时建草稿 release、
+  上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。
+- **`android.yml`** — 只被调用或手动触发：构建 release-profile APK 并做产物级检查；发布调用时产出签名 APK。
 
 ## Windows 安装器与 WebView2
 

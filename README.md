@@ -5,8 +5,8 @@
 **简体中文** · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#安装)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安装)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
 
@@ -50,6 +50,7 @@
 | macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
 | Windows | `*-win-setup.exe`；免安装用 `polaris-portable-*.zip` |
 | Linux | `*.deb` / `*.AppImage` |
+| Android | `*-android-arm64.apk`（仅 arm64） |
 
 安装包当前不做付费代码签名，首次启动需按平台放行。
 
@@ -78,12 +79,15 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 
 ## 构建
 
-需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、[Tauri CLI 2](https://v2.tauri.app/)。
+需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-node scripts/fetch-core.mjs        # 拉 sing-box 内核（SHA256 钉扎）
+pnpm --dir ui install --frozen-lockfile   # 前端依赖
+# sing-box 内核：按钉扎源码与补丁构建的四平台内核包（CI「Desktop Core Sources」工作流对同一提交的产物）
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
 node scripts/fetch-cronet.mjs --platform=linux  # 拉与 Linux 核同目录的 libcronet.so
+node scripts/fetch-dashboard.mjs   # 拉内置面板
 tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
@@ -105,7 +109,7 @@ cd ui && npx pnpm@11.24.0 test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 主进程
-crates/      17 个 domain crate（config-engine / core-supervisor / helper / updater / …）
+crates/      18 个 domain crate（config-engine / core-supervisor / helper / updater / …）
 resources/   sing-box 内核 + libcronet（构建期拉取，不入库）
 ```
 

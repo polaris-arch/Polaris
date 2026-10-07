@@ -5,8 +5,8 @@
 [简体中文](README.md) · [English](README.en.md) · **繁體中文** · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#安裝)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安裝)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
 
@@ -50,6 +50,7 @@
 | macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
 | Windows | `*-win-setup.exe`；免安裝版用 `polaris-portable-*.zip` |
 | Linux | `*.deb` / `*.AppImage` |
+| Android | `*-android-arm64.apk`（僅 arm64） |
 
 安裝檔目前不做付費程式碼簽章，首次啟動需依平台放行。
 
@@ -78,12 +79,15 @@ SmartScreen 提示時選擇「其他資訊」→「仍要執行」。
 
 ## 建置
 
-需要 Rust stable、Node.js 24+（CI 目前使用 Node 26）、[Tauri CLI 2](https://v2.tauri.app/)。
+需要 Rust stable、Node.js 24+（CI 目前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-node scripts/fetch-core.mjs        # 拉取 sing-box 核心（SHA256 釘扎）
-node scripts/fetch-cronet.mjs      # 拉取 libcronet
+pnpm --dir ui install --frozen-lockfile   # 前端相依套件
+# sing-box 核心：依釘扎原始碼與修補檔建置的四平台核心包（CI「Desktop Core Sources」工作流程對同一提交的產物）
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+node scripts/fetch-cronet.mjs --platform=linux  # 拉取與 Linux 核心同目錄的 libcronet.so
+node scripts/fetch-dashboard.mjs   # 拉取內建面板
 tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
@@ -97,7 +101,7 @@ tauri build --config src-tauri/tauri.linux.conf.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 ## 架構
@@ -105,17 +109,18 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 主行程
-crates/      17 個 domain crate（config-engine / core-supervisor / helper / updater / …）
+crates/      18 個 domain crate（config-engine / core-supervisor / helper / updater / …）
 resources/   sing-box 核心 + libcronet（建置期拉取，不入庫）
 ```
 
-核心以 sidecar 子行程執行，經 gRPC 管理面通訊。TUN 與系統代理由三平台特權 helper 承擔
-（macOS / Windows / Linux，全 Rust）。
+核心以 sidecar 子行程執行，經 gRPC 管理面通訊。需要特權的 TUN 起核與系統接管委託三平台
+Rust helper；無需 helper 的 System Proxy 路徑由應用程式側 `system-integration` 直接管理並負責回復。
 
 ## 文件
 
 | 檔案 | 內容 |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | 目前分層、執行交易、DNS/路由、特權邊界與大檔案判定準則 |
 | [docs/build-and-package.md](docs/build-and-package.md) | 建置、CI、打包不變量、更新器選檔契約 |
 | [docs/troubleshooting.zh-TW.md](docs/troubleshooting.zh-TW.md) | 不簽章說明、白畫面 / 花屏 / GPU 當機排障 |
 

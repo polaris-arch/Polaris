@@ -5,8 +5,8 @@
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · **فارسی**
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#نصب)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#نصب)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
 
@@ -56,6 +56,7 @@
 | macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
 | Windows | `*-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-*.zip` |
 | Linux | `*.deb` / `*.AppImage` |
+| Android | `*-android-arm64.apk` (فقط arm64) |
 
 بسته‌ها با گواهی پولی امضای کد امضا نمی‌شوند، بنابراین نخستین اجرا روی هر سکو نیازمند یک گام تأیید دستی است.
 
@@ -85,14 +86,17 @@ xattr -cr /Applications/Polaris.app
 
 ## ساخت
 
-نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26) و [Tauri CLI 2](https://v2.tauri.app/).
+نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26)، pnpm 11.24.0، Go و [Tauri CLI 2](https://v2.tauri.app/).
 
 </div>
 
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-node scripts/fetch-core.mjs        # دریافت هسته sing-box (قفل‌شده با SHA256)
-node scripts/fetch-cronet.mjs      # دریافت libcronet
+pnpm --dir ui install --frozen-lockfile   # وابستگی‌های رابط کاربری
+# هسته sing-box: بسته چهارسکویی ساخته‌شده از کد منبع و وصله‌های قفل‌شده (خروجی workflow «Desktop Core Sources» در CI برای همین commit)
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+node scripts/fetch-cronet.mjs --platform=linux  # دریافت libcronet.so در کنار هسته Linux
+node scripts/fetch-dashboard.mjs   # دریافت پنل داخلی
 tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
@@ -108,7 +112,7 @@ tauri build --config src-tauri/tauri.linux.conf.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 <div dir="rtl">
@@ -120,7 +124,7 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   فرایند اصلی Tauri 2
-crates/      ۱۷ crate دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
+crates/      ۱۸ crate دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
 resources/   هسته sing-box + libcronet (در زمان ساخت دریافت می‌شوند، در مخزن نیستند)
 ```
 
@@ -132,6 +136,7 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 | فایل | محتوا |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | لایه‌بندی فعلی، تراکنش‌های اجرا، DNS / مسیریابی، مرزهای دسترسی ویژه و معیار تفکیک فایل‌های بزرگ (فقط به زبان چینی) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | ساخت، CI، ثابت‌های بسته‌بندی، قرارداد انتخاب بسته توسط به‌روزرسان |
 | [docs/troubleshooting.fa.md](docs/troubleshooting.fa.md) | توضیح نسخه‌های بدون امضا، صفحه سفید / خرابی تصویر / کرش GPU |
 

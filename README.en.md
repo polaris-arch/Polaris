@@ -5,8 +5,8 @@
 [简体中文](README.md) · **English** · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#install)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#install)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
 
@@ -50,6 +50,7 @@ Download the package for your platform from [Releases](https://github.com/polari
 | macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
 | Windows | `*-win-setup.exe`; portable build: `polaris-portable-*.zip` |
 | Linux | `*.deb` / `*.AppImage` |
+| Android | `*-android-arm64.apk` (arm64 only) |
 
 Packages are not signed with a paid code-signing certificate, so the first launch needs a manual approval step on each platform.
 
@@ -74,12 +75,15 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 
 ## Build
 
-Requires Rust stable, Node.js 24+ (CI currently uses Node 26), and [Tauri CLI 2](https://v2.tauri.app/).
+Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-node scripts/fetch-core.mjs        # fetch the sing-box core (SHA256 pinned)
+pnpm --dir ui install --frozen-lockfile   # frontend dependencies
+# sing-box core: the four-platform bundle built from the pinned source and patches (output of the "Desktop Core Sources" CI workflow for the same commit)
+node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
 node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
+node scripts/fetch-dashboard.mjs   # fetch the built-in dashboard
 tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
@@ -91,7 +95,7 @@ Development gates:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 ## Architecture
@@ -99,16 +103,17 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 main process
-crates/      17 domain crates (config-engine / core-supervisor / helper / updater / …)
+crates/      18 domain crates (config-engine / core-supervisor / helper / updater / …)
 resources/   sing-box core + libcronet (fetched at build time, not committed)
 ```
 
-The core runs as a sidecar child process and is managed over a gRPC control plane. TUN and system proxy are handled by privileged helpers on all three platforms (macOS / Windows / Linux, all in Rust).
+The core runs as a sidecar child process and is managed over a gRPC control plane. Privileged work — starting the core for TUN and system takeover — is delegated to the Rust helpers on all three platforms; the System Proxy path, which needs no helper, is managed directly by the app-side `system-integration` crate, which also owns the rollback.
 
 ## Documentation
 
 | File | Contents |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | Current layering, runtime transactions, DNS / routing, privilege boundaries, and the criteria for splitting large files (Chinese only) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | Build, CI, packaging invariants, updater package-selection contract |
 | [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | Unsigned-build notes, white screen / corrupted rendering / GPU crash triage |
 

@@ -36,7 +36,7 @@ Polaris 的 iOS 构建由使用者在自己的 Mac 上完成并自行签名。�
 ## 构建主 App 的前置条件
 
 - Xcode、命令行工具及 iOS SDK；历史 App 使用 Xcode 27.1 / SDK 27.1。六片 Libbox 的历史构建工具链仍固定为下节 27.0；原 App 链接已核验的六片 Framework。当前工程的 default final hook 保持拒绝，须完成 Apple 迁移后才能统一构建。首次构建可先在 Xcode 中接受许可。
-- Node.js 24+、pnpm 11.24.0、Rust、CocoaPods、Go、Python 3；项目已包含生成的 Xcode 工程。修改 `project.yml` 后需要 XcodeGen；不要重新执行 `tauri ios init` 覆盖 Packet Tunnel target。
+- Node.js 24+、pnpm 11.24.0、全局 Tauri CLI（版本见 `scripts/tauri-cli.version`）、Rust、CocoaPods、Go、Python 3；项目已包含生成的 Xcode 工程。修改 `project.yml` 后需要 XcodeGen；不要重新执行 `tauri ios init` 覆盖 Packet Tunnel target。
 - `rustup target add aarch64-apple-ios`。若构建 Apple Silicon 模拟器，再加 `aarch64-apple-ios-sim` 和与 SDK 匹配的 iOS Simulator runtime。
 - 真机安装需要 Apple Developer 付费账号、开发证书、设备注册和对应 provisioning profile。Xcode 登录账号并不自动证明本机已有有效签名身份。
 
@@ -71,7 +71,7 @@ Go 默认下载已由核心 `go.mod` / `go.sum` 锁定并校验的缺失模块�
 cd ui
 pnpm install --frozen-lockfile
 cd ../src-tauri
-../ui/node_modules/.bin/tauri ios build --debug --target aarch64 --no-sign --ci --ignore-version-mismatches
+tauri ios build --debug --target aarch64 --no-sign --ci --ignore-version-mismatches
 cd ..
 python3 scripts/verify-ios-archive.py src-tauri/gen/apple/build/arm64/Polaris.ipa
 ```
