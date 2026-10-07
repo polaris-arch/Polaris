@@ -19,8 +19,9 @@
 //! （见 [`TrustScope`](crate::runtime::env_trust::TrustScope)）。
 //!
 //! **刻意没有第二条判据**：仓内不存在「随包二进制的运行期指纹」可供比对 ——
-//! `core-manifest.json` 的 `coreArchiveSha256` 是**下载压缩包本体**的摘要（`scripts/fetch-core.mjs`
-//! 只在拉取期消费它），不是解压后二进制的摘要；`staged_core_sha_path` 只覆盖更新流程 staged
+//! `core-manifest.json` 的 `coreArchiveSha256` 现在只保留键集合作为随包平台枚举，各平台的
+//! `binarySha256` 为空；构建期核对内核二进制的是产出回执（`resources/.source-receipts/`），
+//! 它不在打进应用的平台目录里，运行期读不到；`staged_core_sha_path` 只覆盖更新流程 staged
 //! 下来的核，覆盖不到随包核。所以「校验二进制哈希」这条判据按字面**不可实现**，别再往这里加，
 //! 也别用别的东西冒充它。
 //!

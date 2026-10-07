@@ -21,7 +21,7 @@ function kernelCoverage(source) {
   assert.doesNotMatch(source, /POLARIS_NO_KERNEL_RUN/, 'CI must retain kernel coverage; only the local gate sets this switch');
 }
 function packageFetchStep(source) {
-  const marker = '      - name: Fetch sing-box core (SHA256-pinned)\n';
+  const marker = '      - name: Consume sing-box core bundle\n';
   const body = job(source, 'package');
   assert.ok(body.includes(marker), 'Package requires its exact source consumption step');
   return body.split(marker)[1].split('\n      - ')[0];
@@ -141,8 +141,8 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
     { ...files, 'release-risk': files['release-risk'].replace(' --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"', '') },
     { ...files, package: files.package.replace('name: ${{ env.CORE_BUNDLE_ARTIFACT }}', 'name: old-source-artifact') },
     { ...files, package: files.package.replace('desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]', 'desktop-core-bundle-$CORE_CANDIDATE" ]') },
-    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n') },
-    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n        shell: pwsh\n') },
+    { ...files, package: files.package.replace('      - name: Consume sing-box core bundle\n        shell: bash\n', '      - name: Consume sing-box core bundle\n') },
+    { ...files, package: files.package.replace('      - name: Consume sing-box core bundle\n        shell: bash\n', '      - name: Consume sing-box core bundle\n        shell: pwsh\n') },
   ]) assert.throws(() => bundles(changed));
   // Exercise the unchanged run line's quoting with actual Bash and a Node argv
   // reporter. This invokes neither the consumer nor any Go/core command.

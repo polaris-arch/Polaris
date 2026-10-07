@@ -3,7 +3,7 @@
 
 This preserves the missing g-source-native-sol61-20260930 fixture against the
 current provider. Default execution skips it without creating repositories or
-calling Go. See docs/development/archive/branch-convergence-20261005/README.md.
+calling Go.
 """
 import hashlib
 import importlib.util

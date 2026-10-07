@@ -35,7 +35,7 @@ test('Package checks all fetched cores before optional runtime gates', () => {
   const yaml = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
   assertWireStep(yaml, { kernelOnly: false });
   const protoc = step(yaml, 'Install protoc (pinned URL + sha256)');
-  const fetch = step(yaml, 'Fetch sing-box core (SHA256-pinned)');
+  const fetch = step(yaml, 'Consume sing-box core bundle');
   const wire = step(yaml, wireStep);
   const optionalRuntime = step(yaml, 'Bundled core dependency fingerprint (sing-tun pin)');
   assert.match(protoc.body, /^        run: node scripts\/fetch-protoc\.mjs$/m);
