@@ -843,6 +843,13 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/runtime/proxy/tests/recovery.rs':
     '桌面-only legacy admission 与 crash recovery 负例属于 cfg(test) 测试目标，不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
+  'src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs':
+    'PC producer 成员封存，暂无运行期消费者（模块带 dead_code 豁免）；Android 没有 temp producer，'
+    + '`member_counts` 的 android 臂恒返 0。Android 目标 cargo check 覆盖条件编译，'
+    + '桌面 cargo test -p polaris --lib 覆盖非 android 臂；APK 构建不执行成员封存。',
+  'src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census/tests/mod.rs':
+    '桌面-only 成员封存与暂停负例属于 cfg(test) 测试目标，不进入 APK；'
+    + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
   'src-tauri/src/runtime/startup_tasks.rs':
     '桌面自动连接在起核前复核 legacy admission，Android 走独立启动接管腿；'
     + '桌面测试覆盖 marker 拒绝，Android 目标 cargo check 覆盖 cfg 编译，APK 构建不执行自动连接。',
