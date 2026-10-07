@@ -787,8 +787,10 @@ impl CheckCustody {
             }
         };
         let run = state.runs.get_mut(&id).expect("admitted validation run");
-        if let CheckTail::PathSnapshot { created, .. } = &mut run.tail {
-            *created = true;
+        match &mut run.tail {
+            CheckTail::PathSnapshot { created, .. } => *created = true,
+            #[cfg(target_os = "linux")]
+            CheckTail::OwnedSealedInputs { .. } => {}
         }
         let copied =
             File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
