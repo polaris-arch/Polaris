@@ -5,7 +5,9 @@ mod linux_tests {
     use crate::test_support::TestDir;
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -341,13 +343,46 @@ mod linux_tests {
         assert!(status.success());
     }
 
+    fn sealed_fixture_binary(path: &str) -> fs::File {
+        use nix::fcntl::{fcntl, FcntlArg, SealFlag};
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        let actual = fs::canonicalize(path).unwrap();
+        let bytes =
+            polaris_core_supervisor::exact_spawn::read_linux_binary_source(&actual).unwrap();
+        let mut file = fs::File::from(
+            memfd_create(
+                "polaris-check-no-network-fixture",
+                MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+            )
+            .unwrap(),
+        );
+        file.write_all(&bytes).unwrap();
+        nix::sys::stat::fchmod(
+            &file,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IXUSR,
+        )
+        .unwrap();
+        fcntl(
+            &file,
+            FcntlArg::F_ADD_SEALS(
+                SealFlag::F_SEAL_WRITE
+                    | SealFlag::F_SEAL_GROW
+                    | SealFlag::F_SEAL_SHRINK
+                    | SealFlag::F_SEAL_SEAL,
+            ),
+        )
+        .unwrap();
+        fs::File::from(rustix::io::fcntl_dupfd_cloexec(&file, 3).unwrap())
+    }
+
     #[tokio::test]
     async fn caller_cancellation_before_and_after_spawn_leaves_no_child() {
         let dir = TestDir::new("polaris-check-cancel-");
         let marker = dir.join("should-not-exist");
-        let mut before = tokio::process::Command::new("sh");
+        let binary = sealed_fixture_binary("/bin/sh");
+        let mut before =
+            tokio::process::Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
         before.arg("-c").arg("touch \"$1\"").arg("sh").arg(&marker);
-        let binary = linux::sealed_config(b"{}").unwrap();
         let config = linux::sealed_config(b"{}").unwrap();
         let (notifier, notified) = tokio::sync::oneshot::channel();
         let never_polled = linux::supervise(
@@ -361,13 +396,17 @@ mod linux_tests {
         assert!(notified.await.is_err());
         assert!(!marker.exists());
 
-        let mut after = tokio::process::Command::new("sleep");
+        let binary = sealed_fixture_binary("/bin/sleep");
+        let mut after =
+            tokio::process::Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
+        // Rust coreutils is a multicall ELF on this host; preserve the original
+        // sleep fixture's argv0. This never alters the strict production profile.
+        after.as_std_mut().arg0("sleep");
         after
             .arg("30")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let binary = linux::sealed_config(b"{}").unwrap();
         let config = linux::sealed_config(b"{}").unwrap();
         let (notifier, notified) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn(linux::supervise(

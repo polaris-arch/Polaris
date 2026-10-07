@@ -400,6 +400,45 @@ class AndroidSourceFixture(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '16K'):
                 builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
 
+    def test_host_libbox_registry_tags_match_file_selection_and_test(self):
+        self.test_real_provider_to_original_tests_bind_and_shared_cache_predicate()
+        expected = ['with_tailscale', 'with_tailscale,with_ccm',
+                    'with_tailscale,with_ocm', 'with_tailscale,with_ccm,with_ocm']
+        calls = [row[1] for row in self.calls if row[0] == 'builder-callee-stub']
+        lists = [args for args in calls if args[1] == 'list' and './experimental/libbox' in args]
+        tests = [args for args in calls if args[1] == 'test' and
+                 any(str(value).endswith('/config_validation_test.go') for value in args)]
+        self.assertEqual(len(lists), 4)
+        self.assertEqual(len(tests), 4)
+        for commands in (lists, tests):
+            self.assertEqual([args[args.index('-tags') + 1] if '-tags' in args else ''
+                              for args in commands], expected)
+        for args in tests:
+            self.assertIn('-race', args)
+            self.assertIn('-ldflags=-checklinkname=0', args)
+            self.assertEqual(args[args.index('-count=1')], '-count=1')
+        ordinary = [args for args in calls if args[1] == 'test' and args not in tests]
+        self.assertEqual(len(ordinary), 3)
+        self.assertTrue(all('-tags' not in args for args in ordinary))
+        bind = next(args for args in calls if 'bind' in args)
+        self.assertEqual(bind[bind.index('-tags') + 1], ','.join(self.source['buildTags']))
+
+    def test_host_libbox_tags_reject_missing_capability_and_unknown_optionals(self):
+        self.assertEqual(builder.libbox_test_tags(self.source), 'with_tailscale')
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ccm,with_ocm'),
+                         'with_tailscale,with_ccm,with_ocm')
+        for tags in ([], ['with_ccm'], ['with_tailscale', 'with_tailscale']):
+            with self.subTest(tags=tags), self.assertRaisesRegex(RuntimeError, 'Tailscale registry capability'):
+                builder.libbox_test_tags({'buildTags': tags})
+        for optional in ('with_quic', 'with_tailscale', 'with_ocm,with_ccm',
+                         'with_ccm,with_ccm', 'with_ccm,', 'with_ccm,with_ocm,with_quic'):
+            with self.subTest(optional=optional), self.assertRaisesRegex(RuntimeError, 'optional registry test profile'):
+                builder.libbox_test_tags(self.source, optional)
+        self.assertNotIn('with_ccm', self.source['buildTags'])
+        self.assertNotIn('with_ocm', self.source['buildTags'])
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ccm'), 'with_tailscale,with_ccm')
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ocm'), 'with_tailscale,with_ocm')
+
     def test_scoped_tailscale_java_methods_fresh_and_forged_cache(self):
         aar, scratch = self.root / 'scoped.aar', self.root / 'scoped-inspection'
         scratch.mkdir()

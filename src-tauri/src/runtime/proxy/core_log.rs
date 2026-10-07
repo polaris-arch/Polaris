@@ -367,6 +367,23 @@ pub(crate) fn pipe_to_log_with_secrets<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    // Ordinary callers keep their detached diagnostic behavior.
+    drop(pipe_to_log_with_secrets_owned(
+        stream, target, fatal, handoff, secrets,
+    ));
+}
+
+/// The same drainer with an owned completion handle for local process-tail custody.
+pub(crate) fn pipe_to_log_with_secrets_owned<R>(
+    stream: R,
+    target: &'static str,
+    fatal: Option<CoreFatalSlot>,
+    handoff: Option<CoreLogHandoff>,
+    secrets: Vec<String>,
+) -> tokio::task::JoinHandle<std::io::Result<()>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         // **按字节读、不用 `lines()`**：`AsyncBufReadExt::lines()` 遇非 UTF-8 字节返回
         // `Err(InvalidData)`，而 `while let Ok(Some(_))` 会把它当成流结束 ⇒ 整条 drain 就此退出、
@@ -380,7 +397,7 @@ pub(crate) fn pipe_to_log_with_secrets<R>(
             match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => break, // EOF
                 Ok(_) => {}
-                Err(_) => break, // 真 I/O 错
+                Err(error) => return Err(error), // 真 I/O 错
             }
             while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
                 buf.pop();
@@ -401,7 +418,8 @@ pub(crate) fn pipe_to_log_with_secrets<R>(
                 g.get_or_insert(kind);
             }
         }
-    });
+        Ok(())
+    })
 }
 
 pub(crate) fn redact_known_process_secrets(raw: &str, secrets: &[String]) -> String {

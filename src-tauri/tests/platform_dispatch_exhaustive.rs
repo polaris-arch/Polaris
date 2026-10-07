@@ -518,6 +518,12 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         "接收 helper 启动凭据前 Mac/Win 必须声明 NativeBirth；Linux 另有 LinuxBirth。Android/iOS/Other 不会进入此桌面 helper 启动路径。",
     ),
 
+    (
+        "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
+        "matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) && !config.proxy_mode_type.effective_on(platform).is_tun() && config.servers.len() == 2 && config.servers.iter().all(|server| server.protocol == Protocol::Tailscale && !polaris_config_engine::builder::endpoint_routes::mesh_uses_system_interface(server) && server.bind_interface.is_none() && server.detour.is_none() && server.custom_settings.is_none() && server.mesh_inbound_policy.is_none()) && config.subscriptions.is_empty() && config.network_interfaces.is_none() && config.network_profiles.is_empty() && polaris_dns_race::plan_upstreams(config.dns_config.as_ref(), config.proxy_mode_type.effective_on(platform)).is_none() && config.singbox_dashboard != Some(true) && raw.get( ).and_then(Value::as_array).is_some_and(|servers| servers.len() == 2 && servers.iter().all(|server|",
+        1,
+        "C1新增完整双TS候选仅限三个桌面userspace且无TUN、系统接口、绑定网卡或DNS sidecar；Android/iOS/Other及新平台明确不满足此有限候选，不影响原normal代理/完整builder能力。该比较只候选准入，不签check/Ready/managed出生或NoOwner。",
+    ),
 ];
 
 // ===================== 判据本体 =====================
@@ -1757,9 +1763,9 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
     ),
     (
         "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
-        "profile: CandidateProfile::DesktopNonTunDirectVlessV1, target_os: deps.platform.clone(), target_arch: deps.arch.clone(), ports: PortsProvenance::ProbedNumbersNotReserved, interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset, dns_sidecar: SubsetApplicability::NotRequiredByValidatedNonTunSubset, check_support: if deps.platform == \"linux\" && deps.arch == \"x86_64\" && plain_tcp",
+        ", target_os: deps.platform.clone(), target_arch: deps.arch.clone(), ports: PortsProvenance::ProbedNumbersNotReserved, interface_binding: SubsetApplicability::NotRequiredByValidatedNonTunSubset, dns_sidecar: SubsetApplicability::NotRequiredByValidatedNonTunSubset, check_support: if !userspace_mesh && deps.platform == \"linux\" && deps.arch == \"x86_64\" && plain_tcp",
         1,
-        "严格候选核检查目前仅支持 Linux x86_64 的 plain TCP 子集；其它平台/架构落 UnsupportedProfile。候选生成已按 effective_on 拒绝移动端 Tun，且 managed_launch_unsupported 保持成立，此元数据不能许可出生。",
+        "严格候选核检查仍只支持 Linux x86_64 plain TCP VLESS子集；新增userspace_mesh即使在Linux也明确Unsupported，不能借原TCP核证明许可双TS。其它平台/架构、Android/iOS/未知平台也Unsupported；候选不是Ready/managed出生，原normal功能与plainTCP形态保留。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
@@ -3118,6 +3124,20 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "七处原Attempt AndroidStoreCustody槽/构造/getters及Runtime或Warm原私有句柄sum保同Entry可恢复身份；没有新registry/FSM。iOS不持Kotlin私有ticket，缺runtime payload仅保Warm tuple可管理而不能冒签NoConstruction。",
     ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "L1原native Binding的Login初始化补两个非Android custody/birth Arc；PC仅由原Tokio工厂附同Child后提供SingleLogin局部事实，iOS正常Main不取得该native出生。相同组原桌面独立producer债未闭合，原2/4/8子计数和理由保留；新2保守组级登记，不签iOS SDK或全局NoOwner。",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        3,
+        IosSide::DiffersWrongToday,
+        "L1原LoginEntry提前booking增两个Android instance/authority空槽，真实native出版块再同Entry填写两字段；Android ordinary spawner不发行PC native birth，保原JNI scoped身份与Unknown。相同组原2/8/31子计数及iOS不可继承桌面producer债原样保留；新3为原家族接线计数，不称三个新增iOS运行错误或签NoOwner。",
+    ),
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3566,13 +3586,15 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// original token/Arc/generation gates. Android private custody/Warm consumers are separate.
 /// Historical WrongToday groups retain every original row/reason; +4 non-Android and +31
 /// Android group members are conservative group census, not 35 new iOS runtime failures.
-/// Debt is 31 tuple rows / 24 unique groups / 156 sites; no historical debt was repaid.
+/// L1 adds two non-Android binding initializers and three Android same-entry publication sites.
+/// These retain the historical group verdicts; they are not five new iOS runtime failures.
+/// Debt is 33 tuple rows / 24 unique groups / 161 sites; no historical debt was repaid.
 /// Source-only registration does not sign Android/iOS SDK execution, global cleanup or NoOwner.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
     ("DiffersRight", 260),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 131),
+    ("DiffersWrongToday", 136),
     ("WithAndroid", 79),
 ];
 
@@ -3716,6 +3738,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "not(target_os = \"android\")",
+        2,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"android\")",
         4,
     ),
     (
@@ -3727,6 +3754,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "target_os = \"android\"",
         2,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        3,
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",

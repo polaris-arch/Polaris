@@ -2926,10 +2926,23 @@ index 0000000..1787098
 +	}
 +}
 diff --git a/box.go b/box.go
-index 13e86d6..60989a9 100644
+index 7fce121..3a1e321 100644
 --- a/box.go
 +++ b/box.go
-@@ -17,6 +17,7 @@ import (
+@@ -2,10 +2,12 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"os"
++	"reflect"
+ 	"runtime/debug"
+ 	"sync"
+ 	"sync/atomic"
+@@ -18,6 +20,7 @@
  	"github.com/sagernet/sing-box/adapter/outbound"
  	boxService "github.com/sagernet/sing-box/adapter/service"
  	"github.com/sagernet/sing-box/common/certificate"
@@ -2937,24 +2950,112 @@ index 13e86d6..60989a9 100644
  	"github.com/sagernet/sing-box/common/dialer"
  	"github.com/sagernet/sing-box/common/httpclient"
  	"github.com/sagernet/sing-box/common/netns"
-@@ -68,6 +69,7 @@ type Box struct {
- 	closeStarted        atomic.Bool
- 	closeFinished       chan struct{}
- 	closeResult         error
-+	constructionCancel  context.CancelFunc
+@@ -35,9 +38,11 @@
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing-box/protocol/direct"
+ 	"github.com/sagernet/sing-box/route"
++	"github.com/sagernet/sing-tun"
+ 	"github.com/sagernet/sing/common"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	F "github.com/sagernet/sing/common/format"
++	"github.com/sagernet/sing/common/logger"
+ 	"github.com/sagernet/sing/common/ntp"
+ 	"github.com/sagernet/sing/service"
+ 	"github.com/sagernet/sing/service/pause"
+@@ -46,33 +51,37 @@
+ var _ adapter.SimpleLifecycle = (*Box)(nil)
+ 
+ type Box struct {
+-	ctx                 context.Context
+-	createdAt           time.Time
+-	debugOptions        option.DebugOptions
+-	debugHTTPServer     *http.Server
+-	logFactory          log.Factory
+-	logger              log.ContextLogger
+-	network             *route.NetworkManager
+-	endpoint            *endpoint.Manager
+-	inbound             *inbound.Manager
+-	outbound            *outbound.Manager
+-	service             *boxService.Manager
+-	certificateProvider *boxCertificate.Manager
+-	dnsTransport        *dns.TransportManager
+-	dnsRouter           *dns.Router
+-	connection          *route.ConnectionManager
+-	router              *route.Router
+-	referenceManager    *route.ReferenceManager
+-	httpClientService   adapter.LifecycleService
+-	internalService     []adapter.LifecycleService
+-	done                chan struct{}
+-	tsStoreMu           sync.Mutex
+-	tsStores            []adapter.Endpoint
+-	tsCaptured          bool
+-	tsRetirement        []adapter.TailscaleStoreNode
+-	closeStarted        atomic.Bool
+-	closeFinished       chan struct{}
+-	closeResult         error
++	ctx                   context.Context
++	createdAt             time.Time
++	debugOptions          option.DebugOptions
++	debugHTTPServer       *http.Server
++	logFactory            log.Factory
++	logger                log.ContextLogger
++	network               *route.NetworkManager
++	endpoint              *endpoint.Manager
++	inbound               *inbound.Manager
++	outbound              *outbound.Manager
++	service               *boxService.Manager
++	certificateProvider   *boxCertificate.Manager
++	dnsTransport          *dns.TransportManager
++	dnsRouter             *dns.Router
++	connection            *route.ConnectionManager
++	router                *route.Router
++	referenceManager      *route.ReferenceManager
++	httpClientService     adapter.LifecycleService
++	internalService       []adapter.LifecycleService
++	done                  chan struct{}
++	tsStoreMu             sync.Mutex
++	tsStores              []adapter.Endpoint
++	tsCaptured            bool
++	tsRetirement          []adapter.TailscaleStoreNode
++	closeStarted          atomic.Bool
++	closeFinished         chan struct{}
++	closeResult           error
++	constructionCancel    context.CancelFunc
++	validationObservation *construction.Observation
++	validationStarted     atomic.Bool
++	validationContext     *validationContext
  }
  
  type Options struct {
-@@ -116,12 +118,66 @@ func Context(
+@@ -80,6 +89,11 @@
+ 	Context                    context.Context
+ 	PlatformLogWriter          log.PlatformWriter
+ 	NetworkNamespaceHolderArgs []string
++	// ObserveValidation is local instrumentation, not disposal authority. Only
++	// the original native validation caller may consume the reviewed facts.
++	ObserveValidation *construction.Observation
++	validationMonitor *boundValidationMonitor
++	validationContext *validationContext
+ }
+ 
+ func Context(
+@@ -121,11 +135,98 @@
  	return ctx
  }
  
-+// ConstructionReport reports observed rollback only. It deliberately carries no
-+// exact-disposal assertion: registry constructors and background tasks remain
-+// outside a complete, reviewed construction audit.
++// ConstructionReport retains original acquisition/rollback facts. Ordinary
++// entries remain unqualified; only the factory-owned native validation entry
++// can consume its private finite member, leaf, monitor and context completion.
 +type ConstructionReport struct {
 +	Attempted    bool
 +	CleanupError error
++	scope        *construction.Scope
++	observation  *construction.Observation
++	profile      bool
++	partialLog   bool
++	instance     *Box
++	monitor      *boundValidationMonitor
++	context      *validationContext
 +}
 +
 +// New preserves prompt error/panic propagation. A failed construction's scope
@@ -2972,22 +3073,37 @@ index 13e86d6..60989a9 100644
 +
 +func newWithConstructionReport(options Options, awaitRollback bool) (instance *Box, err error, report ConstructionReport) {
 +	var scope construction.Scope
++	report.scope, report.observation = &scope, options.ObserveValidation
++	report.monitor, report.context = options.validationMonitor, options.validationContext
++	report.profile = options.validationMonitor != nil && options.ObserveValidation != nil && SupportsBoundValidationProfile(options.Options) && options.PlatformLogWriter == nil && len(options.NetworkNamespaceHolderArgs) == 0
++	if report.profile {
++		_, levelErr := log.ParseLevel(options.Log.Level)
++		report.partialLog = options.Log.Level != "" && levelErr != nil
++	}
 +	ctx := options.Context
 +	if ctx == nil {
 +		ctx = context.Background()
 +	}
 +	ctx, cancel := context.WithCancel(ctx)
++	if options.ObserveValidation != nil {
++		ctx = construction.WithObservation(ctx, options.ObserveValidation)
++	}
 +	options.Context = construction.WithScope(ctx, &scope)
 +	defer func() {
 +		if instance == nil {
 +			cancel()
 +			if awaitRollback {
 +				report.CleanupError = scope.Close()
++				if options.validationContext != nil {
++					options.validationContext.finish()
++				}
 +			} else {
 +				go scope.Close()
 +			}
 +		} else {
 +			instance.constructionCancel = cancel
++			instance.validationObservation = options.ObserveValidation
++			instance.validationContext = options.validationContext
 +			cleanup := scope.TransferAll()
 +			if awaitRollback {
 +				report.CleanupError = cleanup.Close()
@@ -2997,6 +3113,17 @@ index 13e86d6..60989a9 100644
 +		}
 +	}()
 +	instance, err = newBox(options, &scope, &report)
++	report.instance = instance
++	if instance != nil && report.profile {
++		children := instance.outbound.Outbounds()
++		if len(children) != 1 {
++			report.profile = false
++		} else if leaf, ok := children[0].(*direct.Outbound); !ok || !leaf.IsEmpty() || leaf.Tag() != options.Outbounds[0].Tag {
++			report.profile = false
++		} else if !report.observation.BoundLeaf(leaf) {
++			report.profile = false
++		}
++	}
 +	return
 +}
 +
@@ -3005,14 +3132,13 @@ index 13e86d6..60989a9 100644
  	ctx := options.Context
  	if ctx == nil {
  		ctx = context.Background()
- 	}
++	}
 +	if err := ctx.Err(); err != nil {
 +		return nil, err
-+	}
+ 	}
  	ctx = service.ContextWithDefaultRegistry(ctx)
  
- 	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
-@@ -180,6 +236,7 @@ func New(options Options) (*Box, error) {
+@@ -185,6 +286,7 @@
  	if platformInterface != nil {
  		defaultLogWriter = io.Discard
  	}
@@ -3020,7 +3146,7 @@ index 13e86d6..60989a9 100644
  	logFactory, err := log.New(log.Options{
  		Context:        ctx,
  		Options:        common.PtrValueOrDefault(options.Log),
-@@ -191,6 +248,7 @@ func New(options Options) (*Box, error) {
+@@ -196,6 +298,7 @@
  	if err != nil {
  		return nil, E.Cause(err, "create log factory")
  	}
@@ -3028,7 +3154,7 @@ index 13e86d6..60989a9 100644
  	service.MustRegister[log.Factory](ctx, logFactory)
  
  	var internalServices []adapter.LifecycleService
-@@ -204,6 +262,7 @@ func New(options Options) (*Box, error) {
+@@ -209,6 +312,7 @@
  		if err != nil {
  			return nil, err
  		}
@@ -3036,7 +3162,7 @@ index 13e86d6..60989a9 100644
  		service.MustRegister[adapter.CertificateStore](ctx, certificateStore)
  		internalServices = append(internalServices, certificateStore)
  	}
-@@ -211,6 +270,7 @@ func New(options Options) (*Box, error) {
+@@ -216,6 +320,7 @@
  	if err != nil {
  		return nil, err
  	}
@@ -3044,7 +3170,7 @@ index 13e86d6..60989a9 100644
  	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
  	internalServices = append(internalServices, netnsManager)
  	dnsOptions := common.PtrValueOrDefault(options.DNS)
-@@ -220,6 +280,12 @@ func New(options Options) (*Box, error) {
+@@ -225,6 +330,12 @@
  	dnsTransportManager := dns.NewTransportManager(logFactory.NewLogger("dns/transport"), dnsTransportRegistry, outboundManager, dnsOptions.Final)
  	serviceManager := boxService.NewManager(logFactory.NewLogger("service"), serviceRegistry)
  	certificateProviderManager := boxCertificate.NewManager(logFactory.NewLogger("certificate-provider"), certificateProviderRegistry)
@@ -3057,7 +3183,7 @@ index 13e86d6..60989a9 100644
  	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
  	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
  	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
-@@ -230,20 +296,25 @@ func New(options Options) (*Box, error) {
+@@ -235,20 +346,25 @@
  	if err != nil {
  		return nil, E.Cause(err, "initialize DNS router")
  	}
@@ -3083,7 +3209,7 @@ index 13e86d6..60989a9 100644
  	service.MustRegister[adapter.Router](ctx, router)
  	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
  	if err != nil {
-@@ -251,6 +322,7 @@ func New(options Options) (*Box, error) {
+@@ -256,6 +372,7 @@
  	}
  	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
  		trafficManager := trafficcontrol.NewManager()
@@ -3091,7 +3217,7 @@ index 13e86d6..60989a9 100644
  		service.MustRegisterPtr(ctx, trafficManager)
  		router.AppendTracker(trafficManager)
  		internalServices = append(internalServices, trafficManager)
-@@ -259,10 +331,12 @@ func New(options Options) (*Box, error) {
+@@ -264,10 +381,12 @@
  			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
  		}
  		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
@@ -3104,7 +3230,7 @@ index 13e86d6..60989a9 100644
  	internalServices = append(internalServices, referenceManager)
  	ntpOptions := common.PtrValueOrDefault(options.NTP)
  	var timeService *tls.TimeServiceWrapper
-@@ -271,6 +345,9 @@ func New(options Options) (*Box, error) {
+@@ -276,6 +395,9 @@
  		service.MustRegister[ntp.TimeService](ctx, timeService)
  	}
  	for i, transportOptions := range dnsOptions.Servers {
@@ -3114,7 +3240,7 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if transportOptions.Tag != "" {
  			tag = transportOptions.Tag
-@@ -293,6 +370,9 @@ func New(options Options) (*Box, error) {
+@@ -298,6 +420,9 @@
  		return nil, E.Cause(err, "initialize dns router")
  	}
  	for i, endpointOptions := range options.Endpoints {
@@ -3124,7 +3250,7 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if endpointOptions.Tag != "" {
  			tag = endpointOptions.Tag
-@@ -319,6 +399,9 @@ func New(options Options) (*Box, error) {
+@@ -324,6 +449,9 @@
  		}
  	}
  	for i, inboundOptions := range options.Inbounds {
@@ -3134,7 +3260,7 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if inboundOptions.Tag != "" {
  			tag = inboundOptions.Tag
-@@ -338,6 +421,9 @@ func New(options Options) (*Box, error) {
+@@ -343,6 +471,9 @@
  		}
  	}
  	for i, serviceOptions := range options.Services {
@@ -3144,7 +3270,7 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if serviceOptions.Tag != "" {
  			tag = serviceOptions.Tag
-@@ -356,6 +442,9 @@ func New(options Options) (*Box, error) {
+@@ -361,6 +492,9 @@
  		}
  	}
  	for i, outboundOptions := range options.Outbounds {
@@ -3154,8 +3280,19 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if outboundOptions.Tag != "" {
  			tag = outboundOptions.Tag
-@@ -382,6 +471,9 @@ func New(options Options) (*Box, error) {
+@@ -385,8 +519,20 @@
+ 		if err != nil {
+ 			return nil, E.Cause(err, "initialize outbound[", i, "]")
  		}
++		if report.profile {
++			actual, loaded := outboundManager.Outbound(tag)
++			leaf, native := actual.(*direct.Outbound)
++			if !loaded || !native || !leaf.IsEmpty() || leaf.Tag() != tag {
++				report.profile = false
++			} else {
++				report.observation.BindDisposer(leaf)
++			}
++		}
  	}
  	for i, certificateProviderOptions := range options.CertificateProviders {
 +		if err := ctx.Err(); err != nil {
@@ -3164,7 +3301,7 @@ index 13e86d6..60989a9 100644
  		var tag string
  		if certificateProviderOptions.Tag != "" {
  			tag = certificateProviderOptions.Tag
-@@ -431,6 +523,7 @@ func New(options Options) (*Box, error) {
+@@ -436,6 +582,7 @@
  	}
  	if needCacheFile {
  		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
@@ -3172,7 +3309,7 @@ index 13e86d6..60989a9 100644
  		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
  		internalServices = append(internalServices, cacheFile)
  	}
-@@ -439,6 +532,7 @@ func New(options Options) (*Box, error) {
+@@ -444,6 +591,7 @@
  		if err != nil {
  			return nil, E.Cause(err, "create clash-server")
  		}
@@ -3180,7 +3317,7 @@ index 13e86d6..60989a9 100644
  		internalServices = append(internalServices, clashServer)
  	}
  	if needV2RayAPI {
-@@ -446,6 +540,7 @@ func New(options Options) (*Box, error) {
+@@ -451,6 +599,7 @@
  		if err != nil {
  			return nil, E.Cause(err, "create v2ray-server")
  		}
@@ -3188,21 +3325,49 @@ index 13e86d6..60989a9 100644
  		if v2rayServer.StatsService() != nil {
  			router.AppendTracker(v2rayServer.StatsService())
  			internalServices = append(internalServices, v2rayServer)
-@@ -471,9 +566,13 @@ func New(options Options) (*Box, error) {
+@@ -476,8 +625,12 @@
  			Interval:      time.Duration(ntpOptions.Interval),
  			WriteToSystem: ntpOptions.WriteToSystem,
  		})
 +		scope.Add("NTP service", ntpService.Close)
  		timeService.TimeService = ntpService
  		internalServices = append(internalServices, adapter.NewLifecycleService(ntpService, "ntp service"))
- 	}
++	}
 +	if err := ctx.Err(); err != nil {
 +		return nil, err
-+	}
+ 	}
  	return &Box{
  		ctx:                 ctx,
- 		network:             networkManager,
-@@ -638,6 +737,9 @@ func (s *Box) finishClose() error {
+@@ -504,6 +657,10 @@
+ }
+ 
+ func (s *Box) PreStart() error {
++	if s.validationObservation != nil {
++		s.validationStarted.Store(true)
++		s.validationObservation.Invalidate()
++	}
+ 	err := s.preStart()
+ 	if err != nil {
+ 		// TODO: remove catch error
+@@ -523,6 +680,10 @@
+ }
+ 
+ func (s *Box) Start() error {
++	if s.validationObservation != nil {
++		s.validationStarted.Store(true)
++		s.validationObservation.Invalidate()
++	}
+ 	err := s.start()
+ 	if err != nil {
+ 		// TODO: remove catch error
+@@ -640,10 +801,16 @@
+ 	defer close(s.closeFinished)
+ 	s.retireTailscaleStateStores()
+ 	s.closeResult = s.close()
++	if s.validationContext != nil {
++		s.validationContext.finish()
++	}
+ 	return s.closeResult
  }
  
  func (s *Box) close() error {
@@ -3212,7 +3377,7 @@ index 13e86d6..60989a9 100644
  	close(s.done)
  	var err error
  	if s.debugHTTPServer != nil {
-@@ -662,7 +764,7 @@ func (s *Box) close() error {
+@@ -668,7 +835,7 @@
  		{"network", s.network},
  	} {
  		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
@@ -3221,7 +3386,7 @@ index 13e86d6..60989a9 100644
  			return E.Cause(err, "close ", closeItem.name)
  		})
  		done()
-@@ -670,20 +772,20 @@ func (s *Box) close() error {
+@@ -676,20 +843,20 @@
  	if s.httpClientService != nil {
  		s.logger.Trace("close ", s.httpClientService.Name())
  		startTime := time.Now()
@@ -3245,17 +3410,238 @@ index 13e86d6..60989a9 100644
  		return E.Cause(err, "close logger")
  	})
  	done()
+@@ -727,3 +894,217 @@
+ func (s *Box) LogFactory() log.Factory {
+ 	return s.logFactory
+ }
++
++// SupportsBoundValidationProfile bounds the audited native constructor surface.
++// This is eligibility only: options never prove acquisition or disposal.
++func SupportsBoundValidationProfile(options option.Options) bool {
++	if options.Log == nil || options.Log.Disabled || options.Log.Output != "" ||
++		options.Certificate == nil || !reflect.DeepEqual(*options.Certificate, option.CertificateOptions{Store: C.CertificateStoreNone}) ||
++		len(options.Outbounds) != 1 || options.Outbounds[0].Type != C.TypeDirect || options.Outbounds[0].Tag == "" ||
++		options.Route == nil || !reflect.DeepEqual(*options.Route, option.RouteOptions{Final: options.Outbounds[0].Tag}) {
++		return false
++	}
++	directOptions, ok := options.Outbounds[0].Options.(*option.DirectOutboundOptions)
++	if !ok || directOptions == nil || !reflect.DeepEqual(*directOptions, option.DirectOutboundOptions{}) {
++		return false
++	}
++	// Unknown/new fields stay nonzero here and cannot silently join this profile.
++	options.RawMessage, options.CommentsSet, options.Schema = nil, nil, ""
++	options.Log, options.Certificate, options.Outbounds, options.Route = nil, nil, nil, nil
++	return reflect.DeepEqual(options, option.Options{})
++}
++
++// ObservedValidationDisposition consumes the same report, original Scope and
++// exact Box close completion. It is not a receipt for started boxes, custom
++// factories, unrelated scopes, empty members, or an ordinary nil Close.
++func (r ConstructionReport) ObservedValidationDisposition(instance *Box) bool {
++	if !r.profile || !r.Attempted || r.CleanupError != nil || r.scope == nil || r.observation == nil || r.context == nil || r.context.Err() != nil || !r.context.completed() || !r.observation.LeafCompleted() {
++		return false
++	}
++	if instance == nil {
++		return r.instance == nil && r.partialLog && r.scope.ObservedCompletion([]string{"partial log factory"}, false)
++	}
++	if instance != r.instance || instance.validationStarted.Load() || r.monitor == nil || !r.monitor.completed() {
++		return false
++	}
++	select {
++	case <-instance.closeFinished:
++	default:
++		return false
++	}
++	if instance.closeResult != nil {
++		return false
++	}
++	return r.scope.ObservedCompletion([]string{
++		"logger", "certificate store", "network namespace manager", "endpoint manager", "inbound manager", "outbound manager", "DNS transport manager", "service manager", "certificate provider manager", "DNS router", "connection manager", "network manager", "HTTP client manager", "router", "reference manager",
++	}, true)
++}
++
++// validationContext preserves the original worker's cancellation/deadline and
++// deliberately inherits no service/registry/platform values from its caller.
++type validationContext struct {
++	context.Context
++	access    sync.Mutex
++	callbacks []*validationCancellation
++	finishing bool
++	finished  bool
++	late      bool
++	cancel    context.CancelFunc
++}
++
++func (*validationContext) Value(any) any { return nil }
++
++type validationCancellation struct {
++	stop    func() bool
++	done    chan struct{}
++	once    sync.Once
++	stopped bool
++}
++
++func (c *validationCancellation) stopAndJoin() bool {
++	c.once.Do(func() {
++		c.stopped = c.stop()
++		if !c.stopped {
++			<-c.done
++		}
++	})
++	return c.stopped
++}
++
++// WithCancel's original propagation uses this standard AfterFunc adapter rather
++// than acquiring an unobserved fallback goroutine because Value is isolated.
++// A false stop must join the actual original callback return, never merely Done.
++func (c *validationContext) AfterFunc(callback func()) func() bool {
++	entry := &validationCancellation{done: make(chan struct{})}
++	c.access.Lock()
++	if c.finishing {
++		c.late = true
++	}
++	entry.stop = context.AfterFunc(c.Context, func() { defer close(entry.done); callback() })
++	c.callbacks = append(c.callbacks, entry)
++	c.access.Unlock()
++	return entry.stopAndJoin
++}
++func (c *validationContext) finish() {
++	if c.cancel != nil {
++		c.cancel()
++	}
++	c.access.Lock()
++	c.finishing = true
++	entries := append([]*validationCancellation(nil), c.callbacks...)
++	c.access.Unlock()
++	for _, entry := range entries {
++		entry.stopAndJoin()
++	}
++	c.access.Lock()
++	c.finished = true
++	c.access.Unlock()
++}
++func (c *validationContext) completed() bool {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.finished && !c.late
++}
++
++// ConstructAndDisposeBoundValidation retains the qualified Box/report through
++// the original Close. No qualified instance escapes to a caller before its
++// reviewed construction/cleanup facts are consumed.
++func ConstructAndDisposeBoundValidation(options Options, worker *ValidationWorker) (error, error, bool) {
++	instance, validationErr, report := newWithBoundValidationReport(options, worker)
++	if validationErr != nil {
++		return validationErr, report.CleanupError, report.ObservedValidationDisposition(nil)
++	}
++	cleanupErr := errors.Join(report.CleanupError, instance.CloseWithResult())
++	return nil, cleanupErr, report.ObservedValidationDisposition(instance)
++}
++
++// newWithBoundValidationReport owns the finite native factory provenance. It
++// does not execute a supplied factory or platform, and never exposes its private
++// qualification context before the original constructor/cleanup returns.
++func newWithBoundValidationReport(options Options, worker *ValidationWorker) (*Box, error, ConstructionReport) {
++	// Only the original context privately created by this lifetime is admitted.
++	// An arbitrary parent/AfterFunc implementation or wrapper cannot borrow it.
++	if worker == nil || worker.ctx == nil || options.Context != worker.ctx {
++		return nil, construction.ErrUnknownDisposal, ConstructionReport{}
++	}
++	if !SupportsBoundValidationProfile(options.Options) || options.PlatformLogWriter != nil || len(options.NetworkNamespaceHolderArgs) != 0 {
++		return NewWithConstructionReport(options)
++	}
++	parent := worker.ctx
++	nativeOutbound := outbound.NewRegistry()
++	direct.RegisterOutbound(nativeOutbound)
++	controlled := &validationContext{Context: parent}
++	// The propagation owner is established before value wrappers, which do not
++	// preserve AfterFunc as an interface method. Subsequent original WithCancel
++	// children then discover this same standard child through its own Value key.
++	nativeContext, cancel := context.WithCancel(controlled)
++	controlled.cancel = cancel
++	ctx := Context(nativeContext, inbound.NewRegistry(), nativeOutbound, endpoint.NewRegistry(), dns.NewTransportRegistry(), boxService.NewRegistry(), boxCertificate.NewRegistry())
++	monitor := new(boundValidationMonitor)
++	ctx = service.ContextWith[adapter.PlatformInterface](ctx, &boundValidationPlatform{monitor: monitor})
++	options.Context, options.ObserveValidation, options.validationMonitor, options.validationContext = ctx, new(construction.Observation), monitor, controlled
++	return NewWithConstructionReport(options)
++}
++
++// Only these original constructor touchpoints are audited. The embedded nil
++// interfaces deliberately panic on any unexpected method, instead of pretending
++// that an unreviewed platform operation or resource succeeded.
++type boundValidationPlatform struct {
++	adapter.PlatformInterface
++	monitor *boundValidationMonitor
++}
++type boundValidationMonitor struct {
++	tun.DefaultInterfaceMonitor
++	access  sync.Mutex
++	started bool
++	closed  bool
++}
++
++func (p *boundValidationPlatform) UsePlatformDefaultInterfaceMonitor() bool { return true }
++func (p *boundValidationPlatform) CreateDefaultInterfaceMonitor(logger.Logger) tun.DefaultInterfaceMonitor {
++	return p.monitor
++}
++func (p *boundValidationPlatform) UsePlatformNetworkInterfaces() bool      { return false }
++func (p *boundValidationPlatform) Initialize(adapter.NetworkManager) error { return nil }
++func (m *boundValidationMonitor) Start() error {
++	m.access.Lock()
++	m.started = true
++	m.access.Unlock()
++	return os.ErrInvalid
++}
++func (m *boundValidationMonitor) Close() error {
++	m.access.Lock()
++	defer m.access.Unlock()
++	if m.closed {
++		return os.ErrClosed
++	}
++	m.closed = true
++	if m.started {
++		return construction.ErrUnknownDisposal
++	}
++	return nil
++}
++func (m *boundValidationMonitor) completed() bool {
++	m.access.Lock()
++	defer m.access.Unlock()
++	return m.closed && !m.started
++}
++
++// ValidationWorker owns the original standard timer/cancel context. Its private
++// context can neither be supplied nor replaced by an external implementation.
++// This lifetime is construction custody, never a global ownership receipt.
++type ValidationWorker struct {
++	ctx    context.Context
++	cancel context.CancelFunc
++}
++
++func NewValidationWorker(timeout time.Duration) *ValidationWorker {
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	return &ValidationWorker{ctx: ctx, cancel: cancel}
++}
++func (w *ValidationWorker) Context() context.Context { return w.ctx }
++func (w *ValidationWorker) Cancel() {
++	if w.cancel != nil {
++		w.cancel()
++	}
++}
 diff --git a/box_construction_test.go b/box_construction_test.go
 new file mode 100644
-index 0000000..62f118d
+index 0000000..3bc7261
 --- /dev/null
 +++ b/box_construction_test.go
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,542 @@
 +package box
 +
 +import (
 +	"context"
 +	"errors"
++	"io"
++	"os"
++	"reflect"
 +	"strconv"
 +	"testing"
 +	"time"
@@ -3270,6 +3656,10 @@ index 0000000..62f118d
 +	"github.com/sagernet/sing-box/dns"
 +	"github.com/sagernet/sing-box/log"
 +	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/protocol/direct"
++	"github.com/sagernet/sing-tun"
++	"github.com/sagernet/sing/common/logger"
++	"github.com/sagernet/sing/service"
 +)
 +
 +type constructedService struct {
@@ -3466,6 +3856,326 @@ index 0000000..62f118d
 +		})
 +	}
 +}
++
++func TestObservedActualSubscriberCloseAndTransferCannotMintDisposition(t *testing.T) {
++	var scope construction.Scope
++	ctx := construction.WithScope(construction.WithObservation(context.Background(), new(construction.Observation)), &scope)
++	// NewDefaultFactory really acquires the original Subscriber's buffer/done.
++	// Subscribe/Start are intentionally absent: they would enter another lifecycle.
++	factory := log.NewDefaultFactory(ctx, log.Formatter{}, io.Discard, "", nil, false)
++	scope.Add("logger", factory.Close)
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if !scope.ObservedCompletion([]string{"logger"}, false) {
++		t.Fatal("actual Subscriber.Close return lost")
++	}
++	if !errors.Is(factory.Close(), os.ErrClosed) {
++		t.Fatal("first callback did not close the actual original Subscriber")
++	}
++	if (ConstructionReport{Attempted: true, scope: &scope}).ObservedValidationDisposition(nil) {
++		t.Fatal("one real member promoted to full Box disposition")
++	}
++	var transferred construction.Scope
++	construction.WithScope(construction.WithObservation(context.Background(), new(construction.Observation)), &transferred)
++	transferred.Add("logger", func() error { t.Fatal("transferred callback closed without its owner"); return nil })
++	transferred.TransferAll().Close()
++	if transferred.ObservedCompletion([]string{"logger"}, false) {
++		t.Fatal("transfer counted as original completion")
++	}
++}
++
++func TestBoundValidationProfileRejectsUnreviewedMembersAndOptions(t *testing.T) {
++	profile := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	if !SupportsBoundValidationProfile(profile) {
++		t.Fatal("finite profile rejected")
++	}
++	for _, mutate := range []func(*option.Options){
++		func(o *option.Options) { o.Log = &option.LogOptions{Disabled: true} },
++		func(o *option.Options) { o.Log = &option.LogOptions{Output: "unreviewed-file"} },
++		func(o *option.Options) { o.Certificate = &option.CertificateOptions{Store: "system"} },
++		func(o *option.Options) { o.Route = &option.RouteOptions{Final: "direct", AutoDetectInterface: true} },
++		func(o *option.Options) {
++			o.Outbounds = []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{DialerOptions: option.DialerOptions{Detour: "other"}}}}
++		},
++		func(o *option.Options) { o.Services = []option.Service{{Type: "unknown"}} },
++		func(o *option.Options) { o.Experimental = &option.ExperimentalOptions{} },
++		func(o *option.Options) { o.Endpoints = []option.Endpoint{{Type: "tailscale"}} },
++		func(o *option.Options) { o.Inbounds = []option.Inbound{{Type: "tun"}} },
++		func(o *option.Options) { o.Route = nil },
++		func(o *option.Options) { o.Outbounds[0].Options = (*option.DirectOutboundOptions)(nil) },
++	} {
++		copy := profile
++		mutate(&copy)
++		if SupportsBoundValidationProfile(copy) {
++			t.Fatalf("unreviewed profile accepted: %v", reflect.TypeOf(copy))
++		}
++	}
++}
++
++type foreignValidationPlatform struct{ adapter.PlatformInterface }
++type foreignValidationMonitor struct{ tun.DefaultInterfaceMonitor }
++
++func (*foreignValidationPlatform) UsePlatformDefaultInterfaceMonitor() bool { return true }
++func (*foreignValidationPlatform) CreateDefaultInterfaceMonitor(logger.Logger) tun.DefaultInterfaceMonitor {
++	return &foreignValidationMonitor{}
++}
++func (*foreignValidationPlatform) UsePlatformNetworkInterfaces() bool      { return false }
++func (*foreignValidationPlatform) Initialize(adapter.NetworkManager) error { return nil }
++func (*foreignValidationMonitor) Close() error                             { return nil }
++
++func TestObservedCustomFactoryCannotBorrowRealDirectLeaf(t *testing.T) {
++	registry := outbound.NewRegistry()
++	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	defer func() { close(release); <-finished }()
++	outbound.Register[option.DirectOutboundOptions](registry, "direct", func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, opts option.DirectOutboundOptions) (adapter.Outbound, error) {
++		go func() { close(entered); <-release; close(finished) }()
++		return direct.NewOutbound(ctx, router, logger, tag, opts)
++	})
++	ctx := Context(context.Background(), inbound.NewRegistry(), registry, endpoint.NewRegistry(), dns.NewTransportRegistry(), boxService.NewRegistry(), boxCertificate.NewRegistry())
++	ctx = service.ContextWith[adapter.PlatformInterface](ctx, &foreignValidationPlatform{})
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	instance, err, report := NewWithConstructionReport(Options{Context: ctx, Options: options, ObserveValidation: new(construction.Observation)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	<-entered
++	if err := instance.CloseWithResult(); !errors.Is(err, construction.ErrUnknownDisposal) {
++		t.Fatalf("ordinary custom factory must retain unknown disposal: %v", err)
++	}
++	if report.ObservedValidationDisposition(instance) {
++		t.Fatal("custom factory's unregistered live worker disappeared behind real direct type/15 member census")
++	}
++	select {
++	case <-finished:
++		t.Fatal("foreign worker fixture not actually alive")
++	default:
++	}
++}
++
++func TestBoundValidationOriginalFactoriesIsolateForeignContext(t *testing.T) {
++	registry := outbound.NewRegistry()
++	calls := 0
++	outbound.Register[option.DirectOutboundOptions](registry, "direct", func(context.Context, adapter.Router, log.ContextLogger, string, option.DirectOutboundOptions) (adapter.Outbound, error) {
++		calls++
++		panic("foreign factory entered")
++	})
++	parent, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	foreign := Context(parent, inbound.NewRegistry(), registry, endpoint.NewRegistry(), dns.NewTransportRegistry(), boxService.NewRegistry(), boxCertificate.NewRegistry())
++	foreign = service.ContextWith[adapter.PlatformInterface](foreign, (*foreignValidationPlatform)(nil))
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	worker := NewValidationWorker(time.Second)
++	defer worker.Cancel()
++	if _, err, report := newWithBoundValidationReport(Options{Context: foreign, Options: options}, worker); !errors.Is(err, construction.ErrUnknownDisposal) || report.ObservedValidationDisposition(nil) {
++		t.Fatal("foreign context borrowed native lifetime")
++	}
++	instance, err, report := newWithBoundValidationReport(Options{Context: worker.Context(), Options: options}, worker)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(report.context.callbacks) != 1 {
++		t.Fatal("controlled propagation adapter not actually installed before service wrappers")
++	}
++	if calls != 0 || report.ObservedValidationDisposition(instance) {
++		t.Fatal("foreign factory or pre-close promotion")
++	}
++	if err := instance.CloseWithResult(); err != nil {
++		t.Fatal(err)
++	}
++	if !report.ObservedValidationDisposition(instance) {
++		t.Fatal("actual factory-owned 15 members/leaf/monitor completion rejected")
++	}
++	if !errors.Is(instance.logFactory.Close(), os.ErrClosed) {
++		t.Fatal("original native Subscriber not actually closed")
++	}
++	worker.Cancel()
++	if instance.ctx.Err() != context.Canceled {
++		t.Fatal("controlled context detached original worker cancellation")
++	}
++	if (ConstructionReport{Attempted: true, scope: report.scope, observation: report.observation}).ObservedValidationDisposition(instance) {
++		t.Fatal("ordinary recorder gained private factory qualification")
++	}
++	monitor := new(boundValidationMonitor)
++	if monitor.Start() == nil || monitor.Close() == nil || monitor.completed() {
++		t.Fatal("Start or nil Close promoted monitor")
++	}
++	if monitor.Start() == nil || monitor.completed() {
++		t.Fatal("late Start erased sticky Unknown")
++	}
++}
++
++func TestBoundValidationCancellationAndUnexpectedPlatformRemainUnknown(t *testing.T) {
++	parent, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	controlled := &validationContext{Context: parent}
++	if controlled.Done() != parent.Done() {
++		t.Fatal("worker Done detached")
++	}
++	a, okA := controlled.Deadline()
++	b, okB := parent.Deadline()
++	if a != b || okA != okB || controlled.Value("foreign") != nil {
++		t.Fatal("deadline/Value boundary changed")
++	}
++	cancel()
++	if controlled.Err() != context.Canceled {
++		t.Fatal("worker Err detached")
++	}
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	worker := NewValidationWorker(time.Second)
++	worker.Cancel()
++	instance, err, report := newWithBoundValidationReport(Options{Context: worker.Context(), Options: options}, worker)
++	if instance != nil || !errors.Is(err, context.Canceled) || report.ObservedValidationDisposition(instance) {
++		t.Fatal("before-constructor cancellation promoted")
++	}
++	platform := &boundValidationPlatform{monitor: new(boundValidationMonitor)}
++	panicked := false
++	func() { defer func() { panicked = recover() != nil }(); platform.NetworkInterfaces() }()
++	if !panicked {
++		t.Fatal("unreviewed platform method silently succeeded")
++	}
++	monitor := new(boundValidationMonitor)
++	if monitor.Close() != nil || !monitor.completed() || !errors.Is(monitor.Close(), os.ErrClosed) {
++		t.Fatal("monitor first completion or duplicate outcome changed")
++	}
++	if monitor.Start() == nil || monitor.completed() {
++		t.Fatal("late Start promoted terminal")
++	}
++}
++
++func TestBoundValidationContextStopFalseWaitsActualOriginalCallback(t *testing.T) {
++	parent, cancel := context.WithCancel(context.Background())
++	controlled := &validationContext{Context: parent}
++	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	controlled.AfterFunc(func() { close(entered); <-release; close(returned) })
++	cancel()
++	<-entered
++	finished := make(chan struct{})
++	go func() { controlled.finish(); close(finished) }()
++	if controlled.completed() {
++		t.Fatal("parent Done/stop(false) promoted pending callback")
++	}
++	select {
++	case <-finished:
++		t.Fatal("finish did not join actual callback")
++	default:
++	}
++	close(release)
++	<-finished
++	<-returned
++	if !controlled.completed() {
++		t.Fatal("original callback return not consumed")
++	}
++	// A registration after the original completion boundary is sticky Unknown.
++	stopped := controlled.AfterFunc(func() {})
++	stopped()
++	if controlled.completed() {
++		t.Fatal("late callback registration erased from original census")
++	}
++}
++func TestBoundValidationContextSuccessfulStopPreventsCallbackBirth(t *testing.T) {
++	parent, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	controlled := &validationContext{Context: parent}
++	stop := controlled.AfterFunc(func() { t.Error("stopped original callback ran") })
++	if !stop() {
++		t.Fatal("original stop should succeed")
++	}
++	controlled.finish()
++	cancel()
++	if !controlled.completed() {
++		t.Fatal("successful stop lacked original completion")
++	}
++}
++
++func TestBoundValidationContextDeadlineCallbackRemainsPending(t *testing.T) {
++	parent, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
++	defer cancel()
++	controlled := &validationContext{Context: parent}
++	entered, release := make(chan struct{}), make(chan struct{})
++	controlled.AfterFunc(func() { close(entered); <-release })
++	<-entered
++	if controlled.Err() != context.DeadlineExceeded || controlled.completed() {
++		t.Fatal("deadline inferred callback completion")
++	}
++	finished := make(chan struct{})
++	go func() { controlled.finish(); close(finished) }()
++	select {
++	case <-finished:
++		t.Fatal("deadline callback not joined")
++	default:
++	}
++	close(release)
++	<-finished
++	if !controlled.completed() {
++		t.Fatal("actual deadline callback completion missing")
++	}
++}
++
++type foreignAfterFuncContext struct {
++	context.Context
++	calls *int
++}
++
++func (c foreignAfterFuncContext) AfterFunc(func()) func() bool {
++	*c.calls++
++	return func() bool { return true }
++}
++func TestBoundValidationRejectsForeignContextAndAfterFuncLineage(t *testing.T) {
++	worker := NewValidationWorker(time.Second)
++	defer worker.Cancel()
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	calls := 0
++	for _, ctx := range []context.Context{foreignAfterFuncContext{worker.Context(), &calls}, context.WithValue(worker.Context(), "foreign", "value"), context.Background()} {
++		instance, err, report := newWithBoundValidationReport(Options{Context: ctx, Options: options}, worker)
++		if instance != nil || !errors.Is(err, construction.ErrUnknownDisposal) || report.ObservedValidationDisposition(instance) {
++			t.Fatal("foreign/wrapped context lineage promoted")
++		}
++	}
++	if calls != 0 {
++		t.Fatal("unreviewed foreign AfterFunc actually entered")
++	}
++	if _, err, report := newWithBoundValidationReport(Options{Options: options}, new(ValidationWorker)); !errors.Is(err, construction.ErrUnknownDisposal) || report.ObservedValidationDisposition(nil) {
++		t.Fatal("unissued zero lifetime promoted")
++	}
++}
++
++func TestBoundValidationOriginalWorkerCancellationRejectsNewDisposition(t *testing.T) {
++	worker := NewValidationWorker(time.Second)
++	defer worker.Cancel()
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	instance, err, report := newWithBoundValidationReport(Options{Context: worker.Context(), Options: options}, worker)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := instance.CloseWithResult(); err != nil {
++		t.Fatal(err)
++	}
++	if !report.ObservedValidationDisposition(instance) {
++		t.Fatal("original finite completion rejected before cancellation")
++	}
++	worker.Cancel()
++	if report.ObservedValidationDisposition(instance) {
++		t.Fatal("cancelled original worker issued a new disposal proof")
++	}
++}
++
++func TestBoundValidationExportedEntryRetainsQualifiedBoxThroughClose(t *testing.T) {
++	worker := NewValidationWorker(time.Second)
++	defer worker.Cancel()
++	options := option.Options{Log: &option.LogOptions{Level: "error"}, Certificate: &option.CertificateOptions{Store: "none"}, Outbounds: []option.Outbound{{Type: "direct", Tag: "direct", Options: &option.DirectOutboundOptions{}}}, Route: &option.RouteOptions{Final: "direct"}}
++	validationErr, cleanupErr, completed := ConstructAndDisposeBoundValidation(Options{Context: worker.Context(), Options: options}, worker)
++	if validationErr != nil || cleanupErr != nil || !completed {
++		t.Fatalf("factory-owned construct/close = %v / %v / %v", validationErr, cleanupErr, completed)
++	}
++	// The public entry returns no Box/report or callback that could lend the
++	// qualified constructor instance to an unrelated runtime before Close.
++	worker.Cancel()
++	validationErr, _, completed = ConstructAndDisposeBoundValidation(Options{Context: worker.Context(), Options: options}, worker)
++	if !errors.Is(validationErr, context.Canceled) || completed {
++		t.Fatal("expired custody issued new qualification")
++	}
++}
 diff --git a/common/certificate/store.go b/common/certificate/store.go
 index 34871a6..5f34090 100644
 --- a/common/certificate/store.go
@@ -3501,10 +4211,10 @@ index 34871a6..5f34090 100644
  
 diff --git a/common/construction/scope.go b/common/construction/scope.go
 new file mode 100644
-index 0000000..78dfd60
+index 0000000..42973da
 --- /dev/null
 +++ b/common/construction/scope.go
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,456 @@
 +// Package construction tracks resources acquired before a lifecycle owner exists.
 +// Completing this stack is cleanup evidence, not proof of a complete resource audit.
 +package construction
@@ -3518,10 +4228,17 @@ index 0000000..78dfd60
 +)
 +
 +type Scope struct {
-+	access   sync.Mutex
-+	entries  []*Ownership
-+	errors   []error
-+	terminal bool
++	access         sync.Mutex
++	entries        []*Ownership
++	errors         []error
++	terminal       bool
++	observation    *Observation
++	history        []*Ownership
++	children       []*Scope
++	closeCompleted bool
++	closeError     error
++	transferred    bool
++	late           bool
 +	// Factory scopes cannot retain replacement cleanup past publication. Only
 +	// their enclosing construction owner can accept that deferred work.
 +	factory          bool
@@ -3529,12 +4246,15 @@ index 0000000..78dfd60
 +}
 +
 +type Ownership struct {
-+	name      string
-+	cleanup   func() error
-+	owner     *Scope
-+	access    *sync.Mutex
-+	rejection error
-+	residual  bool
++	name        string
++	cleanup     func() error
++	owner       *Scope
++	access      *sync.Mutex
++	rejection   error
++	residual    bool
++	completed   bool
++	result      error
++	transferred bool
 +}
 +
 +// Cleanup owns detached residual disposal, never the published runtime child.
@@ -3577,6 +4297,14 @@ index 0000000..78dfd60
 +		replacementOwner = parent.replacementOwner
 +	}
 +	scope := &Scope{factory: true, replacementOwner: replacementOwner}
++	if parent != nil && parent.observation != nil {
++		parent.access.Lock()
++		if parent.terminal {
++			parent.late = true
++		}
++		parent.children = append(parent.children, scope)
++		parent.access.Unlock()
++	}
 +	return WithScope(ctx, scope), func(published bool) error {
 +		if published {
 +			cleanup := scope.TransferAll()
@@ -3655,6 +4383,7 @@ index 0000000..78dfd60
 +}
 +
 +func WithScope(ctx context.Context, scope *Scope) context.Context {
++	scope.observation, _ = ctx.Value(observationKey{}).(*Observation)
 +	return context.WithValue(ctx, contextKey{}, scope)
 +}
 +
@@ -3684,10 +4413,16 @@ index 0000000..78dfd60
 +	s.access.Lock()
 +	defer s.access.Unlock()
 +	if s.terminal {
++		if s.observation != nil {
++			s.late = true
++		}
 +		return nil
 +	}
 +	entry := &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access}
 +	s.entries = append(s.entries, entry)
++	if s.observation != nil {
++		s.history = append(s.history, entry)
++	}
 +	return entry
 +}
 +
@@ -3695,9 +4430,16 @@ index 0000000..78dfd60
 +	s.access.Lock()
 +	defer s.access.Unlock()
 +	if s.terminal {
++		if s.observation != nil {
++			s.late = true
++		}
 +		return false
 +	}
-+	s.entries = append(s.entries, &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access, residual: true})
++	entry := &Ownership{name: name, cleanup: cleanup, owner: s, access: &s.access, residual: true}
++	s.entries = append(s.entries, entry)
++	if s.observation != nil {
++		s.history = append(s.history, entry)
++	}
 +	return true
 +}
 +
@@ -3720,6 +4462,7 @@ index 0000000..78dfd60
 +		return ErrOwnershipReleased
 +	}
 +	o.cleanup = nil
++	o.transferred = true
 +	return nil
 +}
 +
@@ -3731,7 +4474,11 @@ index 0000000..78dfd60
 +	if cleanup == nil {
 +		return nil
 +	}
-+	return Close(o.name, cleanup)
++	result := Close(o.name, cleanup)
++	o.access.Lock()
++	o.completed, o.result = true, result
++	o.access.Unlock()
++	return result
 +}
 +
 +func RecordError(ctx context.Context, err error) bool {
@@ -3762,7 +4509,11 @@ index 0000000..78dfd60
 +	entries, errs := s.entries, s.errors
 +	s.entries, s.errors = nil, nil
 +	s.access.Unlock()
-+	return (&Cleanup{entries: entries, errors: errs}).Close()
++	result := (&Cleanup{entries: entries, errors: errs}).Close()
++	s.access.Lock()
++	s.closeCompleted, s.closeError = true, result
++	s.access.Unlock()
++	return result
 +}
 +
 +func (s *Scope) DisposePending() error {
@@ -3790,12 +4541,14 @@ index 0000000..78dfd60
 +		return &Cleanup{errors: []error{ErrScopeTerminated}}
 +	}
 +	s.terminal = true
++	s.transferred = true
 +	cleanup := &Cleanup{errors: s.errors}
 +	for _, entry := range s.entries {
 +		if entry.residual {
 +			cleanup.entries = append(cleanup.entries, entry)
 +		} else {
 +			entry.cleanup = nil
++			entry.transferred = true
 +		}
 +	}
 +	s.entries = nil
@@ -3822,6 +4575,101 @@ index 0000000..78dfd60
 +		return fmt.Errorf("close %s: %w", name, err)
 +	}
 +	return nil
++}
++
++// Observation retains the original validation's construction members and actual
++// completion events. It supplies no authority for ordinary runtime ownership.
++// Only the native caller's reviewed factory/profile can qualify these facts.
++type Observation struct {
++	access        sync.Mutex
++	leaf          any
++	leafCompleted bool
++	leafPending   bool
++	leafError     error
++	invalid       bool
++}
++type observationKey struct{}
++
++func WithObservation(ctx context.Context, observation *Observation) context.Context {
++	return context.WithValue(ctx, observationKey{}, observation)
++}
++
++func (o *Observation) BindDisposer(value any) {
++	o.access.Lock()
++	defer o.access.Unlock()
++	if value == nil || o.leaf != nil {
++		o.invalid = true
++		return
++	}
++	o.leaf = value
++}
++
++// DisposeObserved is an instance-bound admission to the reviewed direct leaf's
++// real disposer; an ordinary Direct Close or unbound nil result cannot qualify.
++func DisposeObserved(ctx context.Context, value any, cleanup func() error) error {
++	observation, _ := ctx.Value(observationKey{}).(*Observation)
++	if observation == nil {
++		return ErrUnknownDisposal
++	}
++	observation.access.Lock()
++	if observation.invalid || observation.leaf != value || observation.leafCompleted || observation.leafPending {
++		observation.invalid = true
++		observation.access.Unlock()
++		return ErrUnknownDisposal
++	}
++	// Mark pending before releasing the lock; only the actual return completes it.
++	observation.leafPending = true
++	observation.access.Unlock()
++	result := Close("bound direct leaf", cleanup)
++	observation.access.Lock()
++	observation.leafPending = false
++	observation.leafCompleted, observation.leafError = true, result
++	observation.access.Unlock()
++	return result
++}
++
++func (o *Observation) Invalidate() {
++	o.access.Lock()
++	o.invalid = true
++	o.access.Unlock()
++}
++
++func (s *Scope) ObservedCompletion(names []string, runtimeClosed bool) bool {
++	s.access.Lock()
++	if s.observation == nil || !s.terminal || s.late || len(s.errors) != 0 ||
++		(!s.transferred && (!s.closeCompleted || s.closeError != nil)) || len(s.history) != len(names) {
++		s.access.Unlock()
++		return false
++	}
++	for i, entry := range s.history {
++		if entry.name != names[i] || entry.rejection != nil || entry.result != nil ||
++			(!entry.completed && !(entry.transferred && !entry.residual && runtimeClosed)) {
++			s.access.Unlock()
++			return false
++		}
++	}
++	children := append([]*Scope(nil), s.children...)
++	s.access.Unlock()
++	// The bounded native direct constructor registers no independent factory
++	// members. Unexpected child acquisitions/transfer remain unreviewed.
++	for _, child := range children {
++		if !child.ObservedCompletion(nil, false) {
++			return false
++		}
++	}
++	return true
++}
++
++func (o *Observation) LeafCompleted() bool {
++	o.access.Lock()
++	defer o.access.Unlock()
++	return !o.invalid && !o.leafPending && (o.leaf == nil || o.leafCompleted && o.leafError == nil)
++}
++
++func (o *Observation) BoundLeaf(value any) bool {
++	o.access.Lock()
++	defer o.access.Unlock()
++	return !o.invalid && o.leaf == value
 +}
 diff --git a/common/construction/scope_replacement_test.go b/common/construction/scope_replacement_test.go
 new file mode 100644
@@ -4281,10 +5129,10 @@ index 0000000..dac1482
 +}
 diff --git a/common/construction/scope_test.go b/common/construction/scope_test.go
 new file mode 100644
-index 0000000..16874de
+index 0000000..b8ff4bd
 --- /dev/null
 +++ b/common/construction/scope_test.go
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,178 @@
 +package construction
 +
 +import (
@@ -4358,6 +5206,109 @@ index 0000000..16874de
 +	}
 +	if closed != 1 {
 +		t.Fatalf("internal close count = %d", closed)
++	}
++}
++
++func TestObservedFirstCloseCannotBeReplacedByDuplicateNil(t *testing.T) {
++	observation := new(Observation)
++	var scope Scope
++	WithScope(WithObservation(context.Background(), observation), &scope)
++	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	scope.Add("actual member", func() error { close(entered); <-release; return nil })
++	go func() { scope.Close(); close(finished) }()
++	<-entered
++	if err := scope.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if scope.ObservedCompletion([]string{"actual member"}, false) {
++		t.Fatal("duplicate nil replaced original pending callback")
++	}
++	close(release)
++	<-finished
++	if !scope.ObservedCompletion([]string{"actual member"}, false) {
++		t.Fatal("actual first callback completion not observed")
++	}
++}
++
++func TestObservedTransferResidualAndLateMembership(t *testing.T) {
++	for _, mode := range []string{"transfer", "extra", "error", "panic", "late"} {
++		t.Run(mode, func(t *testing.T) {
++			var scope Scope
++			ctx := WithScope(WithObservation(context.Background(), new(Observation)), &scope)
++			entry := Register(ctx, "member", func() error {
++				if mode == "error" {
++					return errors.New("actual failure")
++				}
++				if mode == "panic" {
++					panic("actual cleanup panic")
++				}
++				return nil
++			})
++			if mode == "transfer" {
++				if err := entry.Transfer(); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "extra" {
++				Register(ctx, "unreviewed", func() error { return nil })
++			}
++			scope.Close()
++			if mode == "late" {
++				late := Register(ctx, "late", func() error { return nil })
++				if late.Err() == nil {
++					t.Fatal("late admitted")
++				}
++				late.Close()
++			}
++			if scope.ObservedCompletion([]string{"member"}, false) {
++				t.Fatal("unobserved or incomplete original disposition promoted")
++			}
++		})
++	}
++	var scope Scope
++	ctx := WithScope(WithObservation(context.Background(), new(Observation)), &scope)
++	child, complete := Begin(ctx)
++	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	Register(child, "actual residual", func() error { close(entered); <-release; return nil })
++	if err := complete(false); err != nil {
++		t.Fatal(err)
++	}
++	go func() { scope.Close(); close(finished) }()
++	<-entered
++	if scope.ObservedCompletion([]string{"failed factory operation"}, false) {
++		t.Fatal("pending residual promoted")
++	}
++	close(release)
++	<-finished
++	// This native profile has no factory acquisitions. Even a drained additional
++	// member remains outside that finite reviewed census.
++	if scope.ObservedCompletion([]string{"failed factory operation"}, false) {
++		t.Fatal("unreviewed child membership erased")
++	}
++}
++
++func TestObservedDisposerPreservesInvalidationAcrossPendingReturn(t *testing.T) {
++	observation := new(Observation)
++	ctx := WithObservation(context.Background(), observation)
++	leaf := new(int)
++	observation.BindDisposer(leaf)
++	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	go func() {
++		DisposeObserved(ctx, leaf, func() error { close(entered); <-release; return nil })
++		close(finished)
++	}()
++	<-entered
++	if observation.LeafCompleted() {
++		t.Fatal("pending leaf counted as completed")
++	}
++	if !errors.Is(DisposeObserved(ctx, leaf, func() error { t.Fatal("duplicate disposed"); return nil }), ErrUnknownDisposal) {
++		t.Fatal("duplicate admission")
++	}
++	observation.Invalidate()
++	close(release)
++	<-finished
++	if observation.LeafCompleted() {
++		t.Fatal("late return erased sticky invalidation")
 +	}
 +}
 diff --git a/daemon/started_service_strict_cleanup_test.go b/daemon/started_service_strict_cleanup_test.go
@@ -5310,10 +6261,10 @@ index 0000000..d102d66
 +}
 diff --git a/experimental/libbox/config_validation.go b/experimental/libbox/config_validation.go
 new file mode 100644
-index 0000000..f84a45b
+index 0000000..b49c62e
 --- /dev/null
 +++ b/experimental/libbox/config_validation.go
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,508 @@
 +package libbox
 +
 +import (
@@ -5344,7 +6295,7 @@ index 0000000..f84a45b
 +// ConfigValidationResult separates config admission from cleanup evidence.
 +// SHA-256 covers the exact UTF-8 config bytes passed to this call. A caller must
 +// match all binding fields and recognized enums before consuming any evidence.
-+// DisposedExact is reserved; this version never emits it for constructed boxes.
++// DisposedExact is limited to the reviewed, original unstarted native profile.
 +type ConfigValidationResult struct {
 +	requestID                string
 +	configDigest             string
@@ -5383,7 +6334,7 @@ index 0000000..f84a45b
 +// callback and never upgrades the returned receipt; late work retains its own
 +// original request binding. Native completion alone is not a disposal proof.
 +func CheckConfigWithResult(configContent string, requestID string, timeoutMillis int64) *ConfigValidationResult {
-+	return checkConfigWithResult(configContent, requestID, timeoutMillis, constructAndDisposeConfig)
++	return checkConfigWithResultRandomMode(configContent, requestID, timeoutMillis, constructAndDisposeConfig, rand.Reader, true)
 +}
 +
 +type configConstructor func(context.Context, option.Options) (error, error)
@@ -5393,6 +6344,12 @@ index 0000000..f84a45b
 +}
 +
 +func checkConfigWithResultRandom(configContent string, requestID string, timeoutMillis int64, construct configConstructor, entropy io.Reader) *ConfigValidationResult {
++	return checkConfigWithResultRandomMode(configContent, requestID, timeoutMillis, construct, entropy, false)
++}
++
++// The injected constructor seam never receives native qualification. Public
++// validation owns its fresh include registries and sole original constructor.
++func checkConfigWithResultRandomMode(configContent string, requestID string, timeoutMillis int64, construct configConstructor, entropy io.Reader, native bool) *ConfigValidationResult {
 +	digest := sha256.Sum256([]byte(configContent))
 +	binding := ConfigValidationResult{
 +		requestID:                requestID,
@@ -5410,7 +6367,19 @@ index 0000000..f84a45b
 +		binding.validationError = "invalid validation request binding or timeout"
 +		return &binding
 +	}
-+	ctx, cancel := context.WithTimeout(baseContext(nil), time.Duration(timeoutMillis)*time.Millisecond)
++	var worker *box.ValidationWorker
++	var ctx context.Context
++	var cancel context.CancelFunc
++	if native {
++		worker = box.NewValidationWorker(time.Duration(timeoutMillis) * time.Millisecond)
++		// The original native base supplies only its fresh service values. The
++		// same privately issued standard lifetime owns Deadline/Done/Err and the
++		// standard cancellation key; no caller context enters this worker.
++		ctx = validationWorkerValues{Context: worker.Context(), values: baseContext(nil)}
++		cancel = worker.Cancel
++	} else {
++		ctx, cancel = context.WithTimeout(baseContext(nil), time.Duration(timeoutMillis)*time.Millisecond)
++	}
 +	defer cancel()
 +	run := &validationTailscaleRun{requestID: binding.requestID, binding: adapter.TailscaleStoreRunBinding{ConfigDigest: binding.configDigest}}
 +	completed := make(chan ConfigValidationResult, 1)
@@ -5452,7 +6421,16 @@ index 0000000..f84a45b
 +		// paths of every enabled constructor have a reviewed disposal proof.
 +		result.cleanup = "CleanupUnknown"
 +		run.prepare(ctx, options)
-+		validationErr, cleanupErr := construct(ctx, options)
++		var validationErr, cleanupErr error
++		var disposedExact bool
++		if native && len(run.binding.RunNonce) == 64 && box.SupportsBoundValidationProfile(options) {
++			validationErr, cleanupErr, disposedExact = constructAndDisposeBoundConfig(options, worker)
++		} else {
++			validationErr, cleanupErr = construct(ctx, options)
++		}
++		if disposedExact && cleanupErr == nil && ctx.Err() == nil {
++			result.cleanup = "DisposedExact"
++		}
 +		if validationErr != nil {
 +			result.validation = "Rejected"
 +			result.validationError = validationErr.Error()
@@ -5467,6 +6445,7 @@ index 0000000..f84a45b
 +		// global disposal error is preserved above, independent of full scopes.
 +		result.tailscaleStoreMembership = run.membershipSnapshot(ctx, validationErr == nil)
 +		if ctx.Err() != nil {
++			result.cleanup = "CleanupUnknown"
 +			result.validation = "InternalFailure"
 +			result.validationError = ctx.Err().Error()
 +			result.tailscaleStoreRetirement = run.unknownSnapshot()
@@ -5475,6 +6454,11 @@ index 0000000..f84a45b
 +	}(binding, ctx)
 +	select {
 +	case result := <-completed:
++		// A completed scoped fact may not gain new authority after its original
++		// worker lifetime expires while the response is being received.
++		if result.cleanup == "DisposedExact" && ctx.Err() != nil {
++			result.cleanup = "CleanupUnknown"
++		}
 +		return &result
 +	case <-ctx.Done():
 +		// Do not read the worker's mutable state, infer quiescence from cancel,
@@ -5769,12 +6753,32 @@ index 0000000..f84a45b
 +	r.membershipCommitted = true
 +	return payload
 +}
++
++// The same native worker exclusively consumes Box's factory-owned finite
++// report. Custom/injected callbacks never enter this qualification path.
++func constructAndDisposeBoundConfig(options option.Options, worker *box.ValidationWorker) (error, error, bool) {
++	return box.ConstructAndDisposeBoundValidation(box.Options{Context: worker.Context(), Options: options}, worker)
++}
++
++// Values are the exact original baseContext(nil), not an external context. Keep
++// the standard lifetime's own private cancellation key authoritative.
++type validationWorkerValues struct {
++	context.Context
++	values context.Context
++}
++
++func (c validationWorkerValues) Value(key any) any {
++	if value := c.Context.Value(key); value != nil {
++		return value
++	}
++	return c.values.Value(key)
++}
 diff --git a/experimental/libbox/config_validation_test.go b/experimental/libbox/config_validation_test.go
 new file mode 100644
-index 0000000..4b34e78
+index 0000000..6d170fc
 --- /dev/null
 +++ b/experimental/libbox/config_validation_test.go
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,920 @@
 +package libbox
 +
 +import (
@@ -6616,6 +7620,83 @@ index 0000000..4b34e78
 +	runs := validationTailscaleDocument(t, result)
 +	if len(runs) != 1 || runs[0].RunNonce != document.RunNonce || !runs[0].CensusComplete || runs[0].Terminal != "NoStoreConstruction" {
 +		t.Fatalf("separate original writer proof changed: %+v", runs)
++	}
++}
++
++const boundValidationProfile = `{"log":{"level":"error"},"certificate":{"store":"none"},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`
++
++func TestValidationBoundNativeProfileActualDisposition(t *testing.T) {
++	result := CheckConfigWithResult(boundValidationProfile, "bound-native", 2000)
++	if result.GetValidation() != "Accepted" || result.GetCleanup() != "DisposedExact" || result.GetCleanupError() != "" {
++		t.Fatalf("actual original bound constructor/disposal = %+v", result)
++	}
++	digest := sha256.Sum256([]byte(boundValidationProfile))
++	if result.GetConfigDigest() != hex.EncodeToString(digest[:]) || result.GetRequestID() != "bound-native" {
++		t.Fatal("original binding changed")
++	}
++	if !strings.Contains(result.GetTailscaleStoreRetirement(), `"globalCleanupEvidence":"CleanupUnknown"`) {
++		t.Fatal("unrelated global TS envelope promoted")
++	}
++}
++
++func TestValidationBoundPartialSubscriberRollbackAndFakeCallback(t *testing.T) {
++	partial := strings.Replace(boundValidationProfile, `"level":"error"`, `"level":"not-a-level"`, 1)
++	result := CheckConfigWithResult(partial, "actual-partial", 2000)
++	if result.GetValidation() != "Rejected" || result.GetCleanup() != "DisposedExact" || result.GetCleanupError() != "" || result.GetValidationError() == "" {
++		t.Fatalf("actual partial log rollback = %+v", result)
++	}
++	for _, config := range []string{boundValidationProfile, partial} {
++		result := checkConfigWithResult(config, "unqualified", 1000, func(context.Context, option.Options) (error, error) { return nil, nil })
++		if result.GetCleanup() != "CleanupUnknown" {
++			t.Fatal("callback nil/eligibility minted proof")
++		}
++	}
++}
++
++func TestValidationBoundNativeBindingUnknownEntropyAndMonitorStart(t *testing.T) {
++	first := CheckConfigWithResult(boundValidationProfile, "first", 2000)
++	second := CheckConfigWithResult(boundValidationProfile, "second", 2000)
++	if first.GetCleanup() != "DisposedExact" || second.GetCleanup() != "DisposedExact" {
++		t.Fatal("actual native profiles failed")
++	}
++	var a, b validationTailscaleMembership
++	json.Unmarshal([]byte(first.GetTailscaleStoreMembership()), &a)
++	json.Unmarshal([]byte(second.GetTailscaleStoreMembership()), &b)
++	if a.RunNonce == b.RunNonce || len(a.RunNonce) != 64 || len(b.RunNonce) != 64 || a.RequestID == b.RequestID || a.ConfigDigest != b.ConfigDigest {
++		t.Fatal("same SHA borrowed invocation binding")
++	}
++	result := checkConfigWithResultRandomMode(boundValidationProfile, "entropy-failure", 2000, constructAndDisposeConfig, strings.NewReader(""), true)
++	if result.GetCleanup() != "CleanupUnknown" {
++		t.Fatal("entropy failure qualified native observation")
++	}
++	ordinary := (*interfaceMonitorStub)(nil)
++	if !errors.Is(ordinary.Close(), os.ErrInvalid) {
++		t.Fatal("ordinary validation stub changed")
++	}
++}
++
++type boundBlockedEntropy struct{ release, returned chan struct{} }
++
++func (r boundBlockedEntropy) Read(p []byte) (int, error) {
++	<-r.release
++	for i := range p {
++		p[i] = byte(i + 1)
++	}
++	close(r.returned)
++	return len(p), nil
++}
++func TestValidationBoundNativeTimeoutCannotUpgradeAfterLateEntropy(t *testing.T) {
++	entropy := boundBlockedEntropy{make(chan struct{}), make(chan struct{})}
++	result := checkConfigWithResultRandomMode(boundValidationProfile, "bound-timeout", 25, constructAndDisposeConfig, entropy, true)
++	if result.GetCleanup() != "CleanupUnknown" || result.GetValidation() != "InternalFailure" {
++		t.Fatalf("timeout=%+v", result)
++	}
++	snapshot := *result
++	close(entropy.release)
++	<-entropy.returned
++	// The old returned value is independent of the late worker's mutable facts.
++	if *result != snapshot || result.GetCleanup() != "CleanupUnknown" {
++		t.Fatal("late native qualification upgraded timed out receipt")
 +	}
 +}
 diff --git a/log/log.go b/log/log.go
@@ -8079,3 +9160,55 @@ index 157ea15..19296c7 100644
 +	s.running.Store(false)
 +	return closeErr
  }
+diff --git a/protocol/direct/disposition.go b/protocol/direct/disposition.go
+new file mode 100644
+index 0000000..907df5f
+--- /dev/null
++++ b/protocol/direct/disposition.go
+@@ -0,0 +1,12 @@
++package direct
++
++import "github.com/sagernet/sing-box/common/construction"
++
++// DisposeConstruction is restricted to the same unstarted native validation
++// leaf admitted by Box. Ordinary Direct Close does not establish a proof.
++func (h *Outbound) DisposeConstruction() error {
++	if !h.isEmpty {
++		return construction.ErrUnknownDisposal
++	}
++	return construction.DisposeObserved(h.ctx, h, h.Close)
++}
+diff --git a/protocol/direct/disposition_test.go b/protocol/direct/disposition_test.go
+new file mode 100644
+index 0000000..47ef402
+--- /dev/null
++++ b/protocol/direct/disposition_test.go
+@@ -0,0 +1,28 @@
++package direct
++
++import (
++	"context"
++	"errors"
++	"github.com/sagernet/sing-box/common/construction"
++	"testing"
++)
++
++func TestConstructionDispositionRequiresExactObservedLeaf(t *testing.T) {
++	h := &Outbound{ctx: context.Background(), isEmpty: true}
++	if h.Close() != nil {
++		t.Fatal("ordinary Close behavior changed")
++	}
++	if !errors.Is(h.DisposeConstruction(), construction.ErrUnknownDisposal) {
++		t.Fatal("unbound ordinary nil Close minted disposal")
++	}
++	observation := new(construction.Observation)
++	h.ctx = construction.WithObservation(context.Background(), observation)
++	other := &Outbound{ctx: h.ctx, isEmpty: true}
++	observation.BindDisposer(other)
++	if !errors.Is(h.DisposeConstruction(), construction.ErrUnknownDisposal) {
++		t.Fatal("different original leaf borrowed admission")
++	}
++	if observation.LeafCompleted() {
++		t.Fatal("wrong leaf promoted")
++	}
++}

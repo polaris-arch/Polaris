@@ -90,7 +90,7 @@ use polaris_mesh::tailscale_login::{
 use polaris_singbox_grpc::{daemon, Endpoint, ReconnectConfig, SingBoxApiClient};
 
 use crate::events::broadcast;
-use crate::runtime::proxy::core_log::pipe_to_log_with_secrets;
+use crate::runtime::proxy::core_log::pipe_to_log_with_secrets_owned;
 #[cfg(not(target_os = "android"))]
 use crate::runtime::proxy::resolve_core_binary;
 #[cfg(unix)]
@@ -393,9 +393,11 @@ pub trait LoginCoreSpawner: Send + Sync {
     }
 }
 
+pub use temp_native::{
+    LocalLoginNativeTerminal, LoginNativeBirthRef, NativeTransientExit, PreparedTempNativeBirth,
+};
 #[cfg(not(target_os = "android"))]
 pub(crate) use temp_native::{LocalTempNativeTerminal, TempNativeBirthRef};
-pub use temp_native::{NativeTransientExit, PreparedTempNativeBirth};
 
 /// Private issuer data lives in the existing transient adapter, not a second registry.
 mod temp_native {
@@ -406,6 +408,7 @@ mod temp_native {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NativeRole {
         Temp,
+        Login,
         #[cfg(all(test, not(target_os = "android")))]
         #[cfg(unix)]
         Foreign,
@@ -413,11 +416,13 @@ mod temp_native {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum NativeScope {
         SingleTempNativeChildV1,
+        SingleLoginNativeChildV1,
         #[cfg(all(test, not(target_os = "android")))]
         #[cfg(unix)]
         Foreign,
     }
     struct Binding {
+        login: Option<(Arc<super::RegistryIdentity>, Arc<()>, u64)>,
         #[cfg(not(target_os = "android"))]
         custody: Arc<()>,
         #[cfg(not(target_os = "android"))]
@@ -435,11 +440,20 @@ mod temp_native {
         member: OnceLock<Arc<()>>,
         status: OnceLock<ExitStatus>,
         retired: AtomicBool,
+        login_terminal: OnceLock<Option<ExitStatus>>,
+        login_child: std::sync::Mutex<Option<super::LoginChildCustody>>,
     }
     /// Dispatch authority is move-only. Its constructors and native issuer are private.
     pub struct PreparedTempNativeBirth(Arc<NativeCell>);
     #[derive(Clone)]
     pub(crate) struct TempNativeBirthRef(Arc<NativeCell>);
+    #[derive(Clone)]
+    pub struct LoginNativeBirthRef(Arc<NativeCell>);
+    /// Same-registry, same-birth local Login terminal. It is not a writer census or Stop lease.
+    pub struct LocalLoginNativeTerminal {
+        _birth: LoginNativeBirthRef,
+        _status: Option<ExitStatus>,
+    }
     pub(super) struct NativeAttachment {
         birth: TempNativeBirthRef,
         member: Arc<()>,
@@ -479,11 +493,36 @@ mod temp_native {
             self.0
                 .binding
                 .set(Binding {
+                    login: None,
                     custody: custody.clone(),
                     birth: birth.clone(),
                 })
                 .map_err(|_| "测速临时核 native birth 禁止重复绑定")?;
             Ok(TempNativeBirthRef(self.0.clone()))
+        }
+        pub(super) fn bind_login(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+        ) -> Result<LoginNativeBirthRef, String> {
+            if self.0.factory_entered.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || self.0.member.get().is_some()
+                || self.0.retired.load(Ordering::SeqCst)
+            {
+                return Err("登录核 native birth 已进入或退休".into());
+            }
+            self.0
+                .binding
+                .set(Binding {
+                    login: Some((registry.clone(), Arc::new(()), epoch)),
+                    #[cfg(not(target_os = "android"))]
+                    custody: Arc::new(()),
+                    #[cfg(not(target_os = "android"))]
+                    birth: Arc::new(()),
+                })
+                .map_err(|_| "登录核 native birth 禁止重复绑定")?;
+            Ok(LoginNativeBirthRef(self.0.clone()))
         }
         pub(super) fn enter_factory(&self) -> Result<(), String> {
             if self.0.binding.get().is_none()
@@ -521,8 +560,28 @@ mod temp_native {
             NativeTransientExit {
                 birth: self.birth.clone(),
                 member: self.member.clone(),
-                role: NativeRole::Temp,
-                scope: NativeScope::SingleTempNativeChildV1,
+                role: if self
+                    .birth
+                    .0
+                    .binding
+                    .get()
+                    .is_some_and(|binding| binding.login.is_some())
+                {
+                    NativeRole::Login
+                } else {
+                    NativeRole::Temp
+                },
+                scope: if self
+                    .birth
+                    .0
+                    .binding
+                    .get()
+                    .is_some_and(|binding| binding.login.is_some())
+                {
+                    NativeScope::SingleLoginNativeChildV1
+                } else {
+                    NativeScope::SingleTempNativeChildV1
+                },
                 status,
             }
         }
@@ -537,8 +596,15 @@ mod temp_native {
                     .member
                     .get()
                     .is_some_and(|member| Arc::ptr_eq(member, &self.member))
-                && self.role == NativeRole::Temp
-                && self.scope == NativeScope::SingleTempNativeChildV1
+                && self.birth.0.binding.get().is_some_and(|binding| {
+                    if binding.login.is_some() {
+                        self.role == NativeRole::Login
+                            && self.scope == NativeScope::SingleLoginNativeChildV1
+                    } else {
+                        self.role == NativeRole::Temp
+                            && self.scope == NativeScope::SingleTempNativeChildV1
+                    }
+                })
                 && self.birth.0.status.get() == Some(&self.status)
         }
         #[cfg(all(test, not(target_os = "android")))]
@@ -563,6 +629,32 @@ mod temp_native {
     }
     #[cfg(not(target_os = "android"))]
     impl TempNativeBirthRef {
+        pub(crate) fn verify_census_dispatch(
+            &self,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<(), String> {
+            let binding = self
+                .0
+                .binding
+                .get()
+                .ok_or("Temp original binding missing")?;
+            if binding.login.is_some()
+                || !Arc::ptr_eq(&binding.custody, custody)
+                || !Arc::ptr_eq(&binding.birth, birth)
+            {
+                return Err("Temp census belongs to a foreign custody/birth".into());
+            }
+            if self.0.factory_entered.load(Ordering::SeqCst)
+                && self.0.member.get().is_none()
+                && self.0.no_child.get().is_none()
+            {
+                Err("original Temp factory has not returned".into())
+            } else {
+                Ok(())
+            }
+        }
+
         #[cfg(all(test, not(target_os = "android")))]
         #[cfg(unix)]
         pub(crate) fn replayed_preparation_for_test(&self) -> PreparedTempNativeBirth {
@@ -579,7 +671,8 @@ mod temp_native {
                 .binding
                 .get()
                 .ok_or("测速临时核 native birth 未绑定")?;
-            if !Arc::ptr_eq(&binding.custody, custody)
+            if binding.login.is_some()
+                || !Arc::ptr_eq(&binding.custody, custody)
                 || !Arc::ptr_eq(&binding.birth, birth)
                 || self.0.retired.load(Ordering::SeqCst)
             {
@@ -635,6 +728,127 @@ mod temp_native {
         }
         pub(crate) fn retire_no_child(&self) {
             self.0.retired.store(true, Ordering::SeqCst);
+        }
+    }
+    impl LoginNativeBirthRef {
+        pub(super) fn publish_child(&self, child: super::LoginChildCustody) {
+            let mut current = self
+                .0
+                .login_child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(current.is_none(), "original Login child published twice");
+            *current = Some(child);
+        }
+        pub(super) fn epoch(&self) -> Result<u64, String> {
+            self.0
+                .binding
+                .get()
+                .and_then(|binding| binding.login.as_ref())
+                .map(|(_, _, epoch)| *epoch)
+                .ok_or_else(|| "登录核 native binding 缺失".into())
+        }
+        pub(super) fn same(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &other.0)
+        }
+        fn validate_binding(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+        ) -> Result<(), String> {
+            let (owner, _, original_epoch) = self
+                .0
+                .binding
+                .get()
+                .and_then(|binding| binding.login.as_ref())
+                .ok_or("登录核 native binding 缺失")?;
+            if !Arc::ptr_eq(owner, registry) || *original_epoch != epoch {
+                return Err("登录核 native 回执不属于原 registry/birth".into());
+            }
+            Ok(())
+        }
+        pub(super) fn verify_census_dispatch(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+        ) -> Result<(), String> {
+            self.validate_binding(registry, epoch)?;
+            if self.0.factory_entered.load(Ordering::SeqCst)
+                && self.0.member.get().is_none()
+                && self.0.no_child.get().is_none()
+            {
+                return Err("original Login factory has not returned".into());
+            }
+            Ok(())
+        }
+
+        pub(super) fn validate_exit(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+            fact: Option<NativeTransientExit>,
+        ) -> Result<NativeTransientExit, String> {
+            self.validate_binding(registry, epoch)?;
+            let fact = fact.ok_or("登录核 native 退出事实缺失")?;
+            if self.0.retired.load(Ordering::SeqCst)
+                || !Arc::ptr_eq(&self.0, &fact.birth.0)
+                || !fact.matches_cell()
+                || fact.role != NativeRole::Login
+                || fact.scope != NativeScope::SingleLoginNativeChildV1
+            {
+                return Err("登录核 native 成员或退出状态不匹配".into());
+            }
+            Ok(fact)
+        }
+        pub(super) fn validate_no_child(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+        ) -> Result<(), String> {
+            self.validate_binding(registry, epoch)?;
+            let entered = self.0.factory_entered.load(Ordering::SeqCst);
+            let returned =
+                matches!(self.0.no_child.get(), Some(NoChildReturn::FactoryReturned)) && entered;
+            let rejected = matches!(
+                self.0.no_child.get(),
+                Some(NoChildReturn::AdmissionRejected)
+            ) && !entered;
+            if self.0.retired.load(Ordering::SeqCst)
+                || (!returned && !rejected)
+                || self.0.member.get().is_some()
+                || self.0.status.get().is_some()
+            {
+                return Err("登录核 native factory 责任尚未确认".into());
+            }
+            Ok(())
+        }
+        pub(super) fn commit_terminal(&self, fact: Option<NativeTransientExit>) {
+            let _ = self.0.login_terminal.set(fact.map(|fact| fact.status));
+            self.0.retired.store(true, Ordering::SeqCst);
+            self.0
+                .login_child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        pub(super) fn terminal(
+            &self,
+            registry: &Arc<super::RegistryIdentity>,
+            epoch: u64,
+        ) -> Result<LocalLoginNativeTerminal, String> {
+            self.validate_binding(registry, epoch)?;
+            let status = *self
+                .0
+                .login_terminal
+                .get()
+                .ok_or("登录核 native/tail terminal 尚未完成")?;
+            if !self.0.retired.load(Ordering::SeqCst) {
+                return Err("登录核 native/tail terminal 尚未提交".into());
+            }
+            Ok(LocalLoginNativeTerminal {
+                _birth: self.clone(),
+                _status: status,
+            })
         }
     }
     #[cfg(not(target_os = "android"))]
@@ -1328,6 +1542,134 @@ impl AuthUrlEmitter for AppHandleEmitter {
 
 // ── 注册表 + 编排 ────────────────────────────────────────────────────────────────────────────
 
+/// Observes the two original log readers; EOF is distinct from an I/O failure or task Drop.
+struct LoginStdioDrain {
+    streams: watch::Sender<[Option<Result<(), String>>; 2]>,
+    tasks: std::sync::OnceLock<tokio::sync::Mutex<[LoginDrainTask; 2]>>,
+}
+impl LoginStdioDrain {
+    fn new() -> Arc<Self> {
+        let (streams, _) = watch::channel([None, None]);
+        Arc::new(Self {
+            streams,
+            tasks: std::sync::OnceLock::new(),
+        })
+    }
+    fn install(&self, handles: [tokio::task::JoinHandle<std::io::Result<()>>; 2]) {
+        let tasks = handles.map(|handle| LoginDrainTask {
+            handle,
+            result: None,
+        });
+        assert!(
+            self.tasks.set(tokio::sync::Mutex::new(tasks)).is_ok(),
+            "original Login drain installed twice"
+        );
+    }
+    fn complete(&self, stream: usize, result: Result<(), String>) {
+        self.streams.send_modify(|streams| {
+            if streams[stream].is_none() {
+                streams[stream] = Some(result);
+            }
+        });
+    }
+    async fn finished(&self) -> Result<(), String> {
+        let mut streams = self.streams.subscribe();
+        {
+            let result = streams
+                .wait_for(|streams| {
+                    streams.iter().any(|stream| matches!(stream, Some(Err(_))))
+                        || streams.iter().all(Option::is_some)
+                })
+                .await
+                .map_err(|_| "登录核 stdio drain 丢失".to_owned())?;
+            for stream in result.iter() {
+                stream
+                    .as_ref()
+                    .ok_or("登录核 stdio EOF 未确认")?
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+            }
+        }
+        let mut tasks = self
+            .tasks
+            .get()
+            .ok_or("登录核 stdio tasks 缺失")?
+            .lock()
+            .await;
+        for task in tasks.iter_mut() {
+            if task.result.is_none() {
+                // Await the original stored handle by borrow; cancellation keeps ownership.
+                let result = match (&mut task.handle).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err("登录核 stdio task I/O 未确认".into()),
+                    Err(_) => Err("登录核 stdio task 未正常完成".into()),
+                };
+                task.result = Some(result);
+            }
+        }
+        for task in tasks.iter() {
+            task.result
+                .as_ref()
+                .ok_or("登录核 stdio task 尚未完成")?
+                .as_ref()
+                .map_err(Clone::clone)?;
+        }
+        Ok(())
+    }
+}
+struct LoginDrainTask {
+    handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    result: Option<Result<(), String>>,
+}
+struct LoginDrainReader<R> {
+    reader: R,
+    drain: Arc<LoginStdioDrain>,
+    stream: usize,
+    completed: bool,
+}
+impl<R> LoginDrainReader<R> {
+    fn new(reader: R, drain: Arc<LoginStdioDrain>, stream: usize) -> Self {
+        Self {
+            reader,
+            drain,
+            stream,
+            completed: false,
+        }
+    }
+}
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LoginDrainReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let remaining = buffer.remaining();
+        let before = buffer.filled().len();
+        let result = std::pin::Pin::new(&mut this.reader).poll_read(context, buffer);
+        let terminal = match &result {
+            std::task::Poll::Ready(Ok(())) if remaining > 0 && buffer.filled().len() == before => {
+                Some(Ok(()))
+            }
+            std::task::Poll::Ready(Err(_)) => Some(Err("登录核 stdio drain I/O 未确认".to_owned())),
+            _ => None,
+        };
+        if let Some(terminal) = terminal {
+            this.completed = true;
+            this.drain.complete(this.stream, terminal);
+        }
+        result
+    }
+}
+impl<R> Drop for LoginDrainReader<R> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.drain
+                .complete(self.stream, Err("登录核 stdio reader 未到 EOF".into()));
+        }
+    }
+}
+
 type LoginChildCustody = Arc<tokio::sync::Mutex<Box<dyn LoginCoreChild>>>;
 
 #[cfg(target_os = "android")]
@@ -1379,6 +1721,9 @@ struct LoginEntry {
     closed_rx: watch::Receiver<Option<Result<(), String>>>,
     /// Synthetic registry-only test entries have no physical child.
     _child: Option<LoginChildCustody>,
+    native: Option<LoginNativeBirthRef>,
+    drain: Option<Arc<LoginStdioDrain>>,
+    config_path: Option<PathBuf>,
     #[cfg(target_os = "android")]
     android_instance: Option<(String, String)>,
     #[cfg(target_os = "android")]
@@ -1388,6 +1733,7 @@ struct LoginEntry {
 /// 注册表共享状态（supervisor 任务与命令层共享）。
 #[derive(Default)]
 struct Shared {
+    identity: Arc<RegistryIdentity>,
     /// serverId → 在飞登录核条目。
     entries: Mutex<HashMap<String, LoginEntry>>,
     /// One physical main-core attempt owns the entire peeled endpoint set.
@@ -1403,6 +1749,7 @@ pub(crate) struct MainBirthToken {
     birth: Arc<()>,
 }
 
+#[derive(Default)]
 struct RegistryIdentity;
 
 impl MainBirthToken {
@@ -1477,6 +1824,57 @@ impl Drop for MainReservation<'_, '_> {
 }
 
 impl Shared {
+    fn retire_login_tail(
+        &self,
+        server_id: &str,
+        epoch: u64,
+        native: &LoginNativeBirthRef,
+        fact: Option<NativeTransientExit>,
+    ) -> Result<(), String> {
+        let mut entries = self.entries.lock().map_err(|_| "登录核注册表不可用")?;
+        let entry = entries
+            .get(server_id)
+            .filter(|entry| entry.epoch == epoch)
+            .ok_or("登录核关闭回执不属于当前代次")?;
+        if !entry
+            .native
+            .as_ref()
+            .is_some_and(|original| original.same(native))
+        {
+            return Err("登录核关闭回执不属于原 birth".into());
+        }
+        if entry._child.is_some() {
+            native.validate_exit(&self.identity, epoch, fact.clone())?;
+            let drain = entry.drain.as_ref().ok_or("登录核 stdio custody 缺失")?;
+            let streams = drain.streams.borrow();
+            for stream in streams.iter() {
+                stream
+                    .as_ref()
+                    .ok_or("登录核 stdio EOF 未确认")?
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+            }
+            let tasks = drain
+                .tasks
+                .get()
+                .ok_or("登录核 stdio tasks 缺失")?
+                .try_lock()
+                .map_err(|_| "登录核 stdio tasks 尚在收束")?;
+            if !tasks.iter().all(|task| matches!(task.result, Some(Ok(())))) {
+                return Err("登录核 stdio tasks 未正常完成".into());
+            }
+        } else {
+            native.validate_no_child(&self.identity, epoch)?;
+        }
+        let config = entry
+            .config_path
+            .as_ref()
+            .ok_or("登录核配置 custody 缺失")?;
+        remove_login_config_confirmed(config)?;
+        native.commit_terminal(fact);
+        entries.remove(server_id);
+        Ok(())
+    }
     fn guard(&self) -> MutexGuard<'_, HashMap<String, LoginEntry>> {
         // 锁只在 insert/remove 的极短临界区持有（绝不跨 await），中毒极不可能；中毒仍恢复内层，不 panic。
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1604,6 +2002,85 @@ pub(crate) enum TsRegistryOwnerState {
     Vacant,
 }
 
+pub(crate) struct LoginProducerCapture<'a> {
+    _gate: tokio::sync::MutexGuard<'a, ()>,
+    view: LoginProducerView,
+}
+
+impl LoginProducerCapture<'_> {
+    pub(crate) fn into_view(self) -> LoginProducerView {
+        self.view
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LoginProducerView {
+    shared: Arc<Shared>,
+    attempts: Vec<Arc<Attempt>>,
+    entries: Vec<LoginProducerMember>,
+}
+
+#[derive(Clone)]
+struct LoginProducerMember {
+    id: String,
+    epoch: u64,
+    native: Option<LoginNativeBirthRef>,
+    child: Option<LoginChildCustody>,
+    closed: watch::Receiver<Option<Result<(), String>>>,
+}
+
+impl LoginProducerView {
+    pub(crate) fn member_count(&self) -> usize {
+        self.attempts.len() + self.entries.len()
+    }
+
+    pub(crate) fn verify_surrender(&self) -> Result<(), String> {
+        let entries = self
+            .shared
+            .entries
+            .lock()
+            .map_err(|_| "Login registry poisoned")?;
+        for attempt in &self.attempts {
+            if attempt.claimed.load(Ordering::SeqCst)
+                && !attempt.is_finished()
+                && !attempt.process_owned.load(Ordering::SeqCst)
+            {
+                return Err("original Login pipeline has not returned to custody".into());
+            }
+        }
+        for member in &self.entries {
+            if let Some(native) = &member.native {
+                native.verify_census_dispatch(&self.shared.identity, member.epoch)?;
+                if native.terminal(&self.shared.identity, member.epoch).is_ok() {
+                    continue;
+                }
+            }
+            let Some(current) = entries
+                .get(&member.id)
+                .filter(|entry| entry.epoch == member.epoch)
+            else {
+                return Err("Login row disappeared without original native/tail terminal".into());
+            };
+            if !match (&member.native, &current.native) {
+                (Some(a), Some(b)) => a.same(b),
+                (None, None) => true,
+                _ => false,
+            } {
+                return Err("Login original native binding changed".into());
+            }
+            let same_child = match (&member.child, &current._child) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => member.native.is_some(),
+                _ => false,
+            };
+            if !same_child || !matches!(&*member.closed.borrow(), None | Some(Ok(()))) {
+                return Err("original Login custody cannot receive the responsibility".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 瞬态登录核生命周期注册表。持有注入的 spawner/checker/binary-resolver（生产真实现，测试 mock）。
 ///
 /// 支撑：kill-on-relogin、超时自动杀、取消、自然退出 reap。与 `ProxyRuntime` 的常驻代理核隔离。
@@ -1655,9 +2132,10 @@ impl LoginCoreRegistry {
         resolve_binary: BinaryResolver,
         timeout: Duration,
     ) -> Self {
+        let shared = Arc::new(Shared::default());
         Self {
-            shared: Arc::new(Shared::default()),
-            identity: Arc::new(RegistryIdentity),
+            identity: shared.identity.clone(),
+            shared,
             spawner,
             checker,
             subscriber,
@@ -1668,6 +2146,15 @@ impl LoginCoreRegistry {
             closing: AtomicBool::new(false),
             attempts: Attempts::default(),
         }
+    }
+
+    /// Consume only this original birth's native wait plus stdio/config tail completion.
+    /// This receipt neither seals registry membership nor proves SDK/OS writer retirement.
+    pub fn login_native_terminal(
+        &self,
+        birth: &LoginNativeBirthRef,
+    ) -> Result<LocalLoginNativeTerminal, String> {
+        birth.terminal(&self.identity, birth.epoch()?)
     }
 
     /// **此刻在飞**的瞬态登录核 pid 快照 —— `ProxyRuntime::cleanup_stale_cores` 的排除表来源。
@@ -1706,6 +2193,9 @@ impl LoginCoreRegistry {
                 cancel_tx,
                 closed_rx,
                 _child: None,
+                native: None,
+                drain: None,
+                config_path: None,
                 #[cfg(target_os = "android")]
                 android_instance: None,
                 #[cfg(target_os = "android")]
@@ -1754,18 +2244,25 @@ impl LoginCoreRegistry {
                     entry.epoch,
                     entry.cancel_tx.clone(),
                     entry.closed_rx.clone(),
+                    entry.native.clone(),
                 )
             })
             .collect();
         // Request every retained birth before waiting for one of them.
-        for (_, _, cancel, _) in &entries {
+        for (_, _, cancel, _, _) in &entries {
             let _ = cancel.send(());
         }
         let mut failure = None;
-        for (id, epoch, cancel, mut closed) in entries {
+        for (id, epoch, cancel, mut closed, native) in entries {
             if !matches!(&*closed.borrow_and_update(), Some(Ok(()))) {
                 if let Err(error) = signal_and_wait_close(cancel, closed).await {
                     failure.get_or_insert(format!("登录核 {id}/{epoch} 退出未确认：{error}"));
+                }
+            }
+            if let Some(native) = native {
+                if let Err(error) = self.login_native_terminal(&native) {
+                    failure
+                        .get_or_insert(format!("登录核 {id}/{epoch} native/tail 未确认：{error}"));
                 }
             }
         }
@@ -1800,19 +2297,30 @@ impl LoginCoreRegistry {
         server_id: &str,
         attempt_id: Option<&str>,
     ) -> Result<bool, String> {
-        let Some((cancel_tx, mut closed)) = self
+        let Some((cancel_tx, mut closed, native)) = self
             .shared
             .guard()
             .get(server_id)
             .filter(|entry| attempt_id.is_none_or(|id| entry.attempt_id == id))
-            .map(|entry| (entry.cancel_tx.clone(), entry.closed_rx.clone()))
+            .map(|entry| {
+                (
+                    entry.cancel_tx.clone(),
+                    entry.closed_rx.clone(),
+                    entry.native.clone(),
+                )
+            })
         else {
             return Ok(false);
         };
-        if matches!(&*closed.borrow_and_update(), Some(Ok(()))) {
-            return Ok(true);
+        let closed = if matches!(&*closed.borrow_and_update(), Some(Ok(()))) {
+            true
+        } else {
+            signal_and_wait_close(cancel_tx, closed).await?
+        };
+        if let Some(native) = native {
+            self.login_native_terminal(&native)?;
         }
-        signal_and_wait_close(cancel_tx, closed).await
+        Ok(closed)
     }
 
     /// A failed native close keeps the state-directory claim, preventing a successor from
@@ -1821,12 +2329,43 @@ impl LoginCoreRegistry {
         self.cancel_login(server_id).await.map(|_| ())
     }
 
+    pub(crate) async fn pc_producer_view(&self) -> Result<LoginProducerCapture<'_>, String> {
+        let gate = self.start_gate.lock().await;
+        let attempts = self.attempts.shutdown_snapshot()?;
+        let entries = self
+            .shared
+            .entries
+            .lock()
+            .map_err(|_| "Login registry poisoned")?
+            .iter()
+            .map(|(id, entry)| LoginProducerMember {
+                id: id.clone(),
+                epoch: entry.epoch,
+                native: entry.native.clone(),
+                child: entry._child.clone(),
+                closed: entry.closed_rx.clone(),
+            })
+            .collect();
+        Ok(LoginProducerCapture {
+            _gate: gate,
+            view: LoginProducerView {
+                shared: Arc::clone(&self.shared),
+                attempts,
+                entries,
+            },
+        })
+    }
+
     pub async fn prepare(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
         let _gate = self.state_gate().await;
         if self.closing.load(Ordering::SeqCst) {
             return Err("Polaris is shutting down".into());
         }
-        self.attempts.prepare(server_id, attempt_id).map(|_| ())
+        polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
+            self.attempts.prepare(server_id, attempt_id)
+        })
+        .map_err(|error| error.to_string())?
+        .map(|_| ())
     }
 
     #[cfg(target_os = "ios")]
@@ -3077,7 +3616,14 @@ impl LoginCoreRegistry {
         } else {
             normal_main
         };
-        if attempt.claimed.swap(true, Ordering::SeqCst) {
+        let claimed =
+            match polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
+                attempt.claimed.swap(true, Ordering::SeqCst)
+            }) {
+                Ok(claimed) => claimed,
+                Err(error) => return StartLoginOutcome::Failed(error.to_string()),
+            };
+        if claimed {
             return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
         }
         let mut request_guard = AttemptGuard(attempt.clone(), false);
@@ -3867,6 +4413,11 @@ impl LoginCoreRegistry {
         if attempt.cancelled() {
             return StartLoginOutcome::Cancelled;
         }
+        if let Err(error) =
+            polaris_core_supervisor::config_gate::assert_check_producer_registration()
+        {
+            return StartLoginOutcome::Failed(error.to_string());
+        }
         if self.attempts.registration_exhausted() {
             return StartLoginOutcome::Failed(attempts::RETIRED_LIMIT_ERROR.into());
         }
@@ -4099,18 +4650,38 @@ impl LoginCoreRegistry {
         .into_iter()
         .flatten()
         .collect();
+        let prepared = self.spawner.prepare_temp_native_birth();
+        let native = match prepared
+            .as_ref()
+            .map(|prepared| prepared.bind_login(&self.identity, epoch))
+            .transpose()
+        {
+            Ok(native) => native,
+            Err(_) => return StartLoginOutcome::Failed("processStartFailed".into()),
+        };
+        let drain = native.as_ref().map(|_| LoginStdioDrain::new());
+        let log_drain = drain.clone().unwrap_or_else(LoginStdioDrain::new);
         let mut req = SpawnRequest::new(
             &binary,
             &config_path,
             StdioPolicy::drain(move |stdout, stderr| {
-                pipe_to_log_with_secrets(
+                let stdout = LoginDrainReader::new(stdout, log_drain.clone(), 0);
+                let stderr = LoginDrainReader::new(stderr, log_drain.clone(), 1);
+                let out = pipe_to_log_with_secrets_owned(
                     stdout,
                     LOGIN_CORE_LOG_TARGET,
                     None,
                     None,
                     secrets.clone(),
                 );
-                pipe_to_log_with_secrets(stderr, LOGIN_CORE_LOG_TARGET, None, None, secrets);
+                let err = pipe_to_log_with_secrets_owned(
+                    stderr,
+                    LOGIN_CORE_LOG_TARGET,
+                    None,
+                    None,
+                    secrets,
+                );
+                log_drain.install([out, err]);
             }),
         );
         req.extra_args = vec!["--disable-color".to_string()];
@@ -4118,15 +4689,47 @@ impl LoginCoreRegistry {
         if self.closing.load(Ordering::SeqCst) {
             return StartLoginOutcome::Cancelled;
         }
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = watch::channel(None);
+        let mut pending_entry = native.as_ref().map(|native| LoginEntry {
+            epoch,
+            attempt_id: request.attempt_id.clone(),
+            pid: None,
+            cancel_tx: cancel_tx.clone(),
+            closed_rx: closed_rx.clone(),
+            _child: None,
+            native: Some(native.clone()),
+            drain: drain.clone(),
+            config_path: Some(config_path.clone()),
+            #[cfg(target_os = "android")]
+            android_instance: None,
+            #[cfg(target_os = "android")]
+            android_authority: None,
+        });
+        let mut book_pending = || {
+            if let Some(entry) = pending_entry.take() {
+                self.shared.insert(server.id.clone(), entry);
+                config_guard.disarm();
+                attempt.process_owned.store(true, Ordering::SeqCst);
+            }
+        };
         let spawned = match producer_origin {
-            None => self.spawner.spawn(req).await,
+            None => {
+                let mut pending = self.spawner.spawn_with_temp_native_birth(req, prepared);
+                std::future::poll_fn(|context| {
+                    book_pending();
+                    pending.as_mut().poll(context)
+                })
+                .await
+            }
             Some((proxy, generation)) => {
-                let mut pending = self.spawner.spawn(req);
+                let mut pending = self.spawner.spawn_with_temp_native_birth(req, prepared);
                 let mut admitted = false;
                 let result = std::future::poll_fn(|context| {
                     if !admitted {
                         let Some(result) =
                             proxy.with_tailscale_credential_birth(generation, attempt, || {
+                                book_pending();
                                 pending.as_mut().poll(context)
                             })
                         else {
@@ -4157,6 +4760,28 @@ impl LoginCoreRegistry {
         let child = match spawned {
             Ok(c) => c,
             Err(error) => {
+                if let Some(native) = native {
+                    let shared = self.shared.clone();
+                    let server_id = server.id.clone();
+                    let attempt = attempt.clone();
+                    let mut cancel_rx = cancel_rx;
+                    tokio::spawn(async move {
+                        loop {
+                            let result = shared.retire_login_tail(&server_id, epoch, &native, None);
+                            let complete = result.is_ok();
+                            closed_tx.send_replace(Some(result));
+                            if complete {
+                                attempt.process_owned.store(false, Ordering::SeqCst);
+                                attempt.finish();
+                                break;
+                            }
+                            tokio::select! {
+                                _ = cancel_rx.recv() => {},
+                                () = tokio::time::sleep(Duration::from_secs(5)) => {},
+                            }
+                        }
+                    });
+                }
                 if let Some(capacity) =
                     crate::runtime::proxy::android_capacity::CapacityClosed::from_spawn(&error)
                 {
@@ -4168,8 +4793,6 @@ impl LoginCoreRegistry {
 
         // Register before the STATUS subscription awaits: a concurrent main-core start can
         // see this child and must wait for its confirmed close.
-        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
-        let (closed_tx, closed_rx) = watch::channel(None);
         let pid = child.pid();
         #[cfg(target_os = "android")]
         let android_instance = child
@@ -4180,21 +4803,47 @@ impl LoginCoreRegistry {
         // No await between a successful spawn and custody publication. The supervisor only
         // borrows this child; dropping its task cannot erase the registry's physical owner.
         let child = Arc::new(tokio::sync::Mutex::new(child));
-        self.shared.insert(
-            server.id.clone(),
-            LoginEntry {
-                epoch,
-                attempt_id: request.attempt_id.clone(),
-                pid,
-                cancel_tx,
-                closed_rx,
-                _child: Some(child.clone()),
-                #[cfg(target_os = "android")]
-                android_instance: android_instance.clone(),
-                #[cfg(target_os = "android")]
-                android_authority,
-            },
-        );
+        if let Some(native) = &native {
+            native.publish_child(child.clone());
+            let mut entries = self.shared.guard();
+            let entry = entries
+                .get_mut(&server.id)
+                .expect("original Login pending entry retained");
+            assert!(
+                entry.epoch == epoch
+                    && entry
+                        .native
+                        .as_ref()
+                        .is_some_and(|original| original.same(native)),
+                "original Login pending birth retained"
+            );
+            entry.pid = pid;
+            entry._child = Some(child.clone());
+            #[cfg(target_os = "android")]
+            {
+                entry.android_instance = android_instance.clone();
+                entry.android_authority = android_authority;
+            }
+        } else {
+            self.shared.insert(
+                server.id.clone(),
+                LoginEntry {
+                    epoch,
+                    attempt_id: request.attempt_id.clone(),
+                    pid,
+                    cancel_tx,
+                    closed_rx,
+                    _child: Some(child.clone()),
+                    native: None,
+                    drain: None,
+                    config_path: None,
+                    #[cfg(target_os = "android")]
+                    android_instance: android_instance.clone(),
+                    #[cfg(target_os = "android")]
+                    android_authority,
+                },
+            );
+        }
         // Shutdown may have observed an empty table while spawn was pending. Publication
         // compensates synchronously for that exact birth before awaiting readiness.
         if self.closing.load(Ordering::SeqCst) {
@@ -4328,6 +4977,37 @@ enum ExitReason {
     InvalidAuthUrl,
 }
 
+async fn finish_login_tail(
+    ctx: &SuperviseCtx,
+    fact: Option<NativeTransientExit>,
+) -> Result<(), String> {
+    let native_tail = {
+        let entries = ctx
+            .shared
+            .entries
+            .lock()
+            .map_err(|_| "登录核注册表不可用")?;
+        let entry = entries
+            .get(&ctx.server_id)
+            .filter(|entry| entry.epoch == ctx.epoch)
+            .ok_or("登录核关闭回执不属于当前代次")?;
+        entry
+            .native
+            .clone()
+            .map(|native| (native, entry.drain.clone()))
+    };
+    if let Some((native, drain)) = native_tail {
+        native.validate_exit(&ctx.shared.identity, ctx.epoch, fact.clone())?;
+        drain.ok_or("登录核 stdio custody 缺失")?.finished().await?;
+        ctx.shared
+            .retire_login_tail(&ctx.server_id, ctx.epoch, &native, fact)
+    } else {
+        remove_login_config(&ctx.config_path);
+        ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
+        Ok(())
+    }
+}
+
 async fn subscribe_and_supervise(
     ctx: SuperviseCtx,
     child: LoginChildCustody,
@@ -4361,7 +5041,10 @@ async fn subscribe_and_supervise(
         Err((phase, reason)) => {
             let mut child = child.lock().await;
             loop {
-                let result = child.close_confirmed().await;
+                let result = match child.close_confirmed().await {
+                    Ok(()) => finish_login_tail(&ctx, child.native_exit()).await,
+                    Err(error) => Err(error),
+                };
                 if result.is_ok() {
                     break;
                 }
@@ -4373,8 +5056,6 @@ async fn subscribe_and_supervise(
                     () = tokio::time::sleep(Duration::from_secs(5)) => {},
                 }
             }
-            remove_login_config(&ctx.config_path);
-            ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
             let _ = ctx.closed_tx.send(Some(Ok(())));
             if !ctx.warm {
                 ctx.emitter
@@ -4493,6 +5174,10 @@ async fn supervise(
         } else {
             child.close_confirmed().await
         };
+        let result = match result {
+            Ok(()) => finish_login_tail(&ctx, child.native_exit()).await,
+            Err(error) => Err(error),
+        };
         if result.is_ok() {
             break;
         }
@@ -4503,10 +5188,7 @@ async fn supervise(
             () = tokio::time::sleep(Duration::from_secs(5)) => {},
         }
     }
-    // 核已收割 → 删掉带 secret 的临时 config。
-    remove_login_config(&ctx.config_path);
-    // reap 后注销（epoch 守卫：不误删 kill-on-relogin 后的新代次表项）。
-    ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
+    // Native close and the original stdio/config tail committed before custody removal.
     let _ = ctx.closed_tx.send(Some(Ok(())));
     let (phase, reason) = match reason {
         ExitReason::LoggedIn => ("authorized", None),
@@ -4524,6 +5206,14 @@ async fn supervise(
 
 /// 删掉本次登录写盘的临时 config（内含一次性管理 API secret）。best-effort：
 /// 已被 kill-on-relogin 的新一代覆写、或早被删掉，都不是问题——本函数只保证「核死了就不留凭据」。
+fn remove_login_config_confirmed(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("登录核配置清理未确认".into()),
+    }
+}
+
 fn remove_login_config(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {

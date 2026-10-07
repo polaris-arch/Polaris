@@ -120,7 +120,9 @@ const POLICY_FORM: &str = "StdioPolicy::";
 /// `.spawn()` 写成不带实参的形态是有意的：`Command::spawn` 不收参数，而 `thread::spawn(closure)` /
 /// `tokio::spawn(fut)` / `spawner.spawn(&req)` 都带实参，写成 `.spawn()` 就不会把线程池和 trait
 /// 调用误当成起进程。
-const CHILD_CREATION_FORMS: &[&str] = &[".spawn()", ".output()"];
+// CheckCustody 的两种输入复用同一个私有同步工厂；其实际 builder.spawn、
+// 同 run 的 Child 交接和此处调用绑定由下方精确接线门另行钉住。
+const CHILD_CREATION_FORMS: &[&str] = &[".spawn()", ".output()", "Self::attach_child("];
 
 /// 自带排空语义的等待形态：并发读两条流直到 EOF，等待与排空是同一个动作。
 ///
@@ -142,6 +144,7 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     "spawn_pipe_drainers",
     "pipe_to_log(",
     "pipe_to_log_with_secrets(",
+    "pipe_to_log_with_secrets_owned(",
     "drain(",
     "lines()",
     // 直接读到 EOF。**这一条今天没有任何生产站点在用**，它在集合里是因为它是 `resolvectl` 那条腿在
@@ -410,13 +413,13 @@ const PRODUCER_CONSUMERS: &[Consumer] = &[
         file: "src-tauri/src/runtime/tailscale_login_core.rs",
         // Prepared attempts moved production spawn assembly here; start_login is a test-only wrapper.
         anchor: "async fn launch_attempt(",
-        drain_form: "pipe_to_log_with_secrets(",
+        drain_form: "pipe_to_log_with_secrets_owned(",
         // 瞬态登录核：整改前这条腿在源码级上是**零门**（计数判据被一行补计数的调用绕过），
         // 而它与临时核共用同一个 spawner、同一份排空实现，缺陷形态完全同构。
         wiring: &[
             "StdioPolicy::drain(move|stdout,stderr|{",
-            "pipe_to_log_with_secrets(stdout,LOGIN_CORE_LOG_TARGET,None,None,secrets.clone(),);",
-            "pipe_to_log_with_secrets(stderr,LOGIN_CORE_LOG_TARGET,None,None,secrets);",
+            "pipe_to_log_with_secrets_owned(stdout,LOGIN_CORE_LOG_TARGET,None,None,secrets.clone(),);",
+            "pipe_to_log_with_secrets_owned(stderr,LOGIN_CORE_LOG_TARGET,None,None,secrets,);",
         ],
     },
 ];
@@ -1114,6 +1117,26 @@ fn check_custody_starts_both_eof_readers_before_return() {
     );
     let spawn = block_of(owner, "fn spawn(");
     let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
+    let factory_call = "Self::attach_child(run,&mutbuilder)";
+    // 此新增形态只登记原 custody 的两条实际调用；不能把同名空 helper
+    // 当作其它站点的 spawn 信用。
+    assert_eq!(owner.masked.matches("Self::attach_child(").count(), 2);
+    assert!(surface
+        .iter()
+        .filter(|scanned| scanned.rel != owner.rel)
+        .all(|scanned| !scanned.masked.contains("Self::attach_child(")));
+    assert_eq!(compact.matches(factory_call).count(), 1);
+    let returned_child = "letchild=run.child.as_mut().expect(";
+    assert_eq!(compact.matches(returned_child).count(), 1);
+    assert!(compact.find(factory_call).unwrap() < compact.find(returned_child).unwrap());
+    let attach = block_of(owner, "fn attach_child(");
+    let attach_compact: String = attach.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(attach_compact.matches("builder.spawn()").count(), 1);
+    assert_eq!(attach_compact.matches("run.child=Some(child);").count(), 1);
+    assert!(
+        attach_compact.find("builder.spawn()").unwrap()
+            < attach_compact.find("run.child=Some(child);").unwrap()
+    );
     for wiring in [
         "letstdout=child.stdout.take();",
         "letstderr=child.stderr.take();",
@@ -1125,6 +1148,7 @@ fn check_custody_starts_both_eof_readers_before_return() {
             1,
             "custody 接线漂移：{wiring}"
         );
+        assert!(compact.find(returned_child).unwrap() < compact.find(wiring).unwrap());
         assert!(compact.find(wiring).unwrap() < compact.find("Ok(Ok((request,output)))").unwrap());
     }
     let read = block_of(owner, "fn read<R:");

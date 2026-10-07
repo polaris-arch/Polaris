@@ -877,6 +877,13 @@ impl MeshRuntime {
             .await
     }
 
+    /// Capture before taking tailscale_state_gate; this uses that original gate once.
+    pub(crate) async fn pc_login_producer_view(
+        &self,
+    ) -> Result<crate::runtime::tailscale_login_core::LoginProducerCapture<'_>, String> {
+        self.login_registry.pc_producer_view().await
+    }
+
     pub async fn tailscale_state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.login_registry.state_gate().await
     }

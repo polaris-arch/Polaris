@@ -7,14 +7,14 @@ use std::future::{poll_fn, Future};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
-use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use super::RawCheck;
 
@@ -58,6 +58,21 @@ pub fn with_check_admission<T>(spawn: impl FnOnce() -> T) -> Result<T, Validatio
     Ok(spawn())
 }
 
+/// Register an original producer under the same cutoff lock. This grants no
+/// native birth: its sole factory still requires full `with_check_admission`.
+/// The closure must not await or recursively enter validation custody.
+pub fn with_check_producer_registration<T>(
+    register: impl FnOnce() -> T,
+) -> Result<T, ValidationLifecycleError> {
+    let state = registry().state.lock().map_err(unknown)?;
+    CheckCustody::admit_registration(&state)?;
+    Ok(register())
+}
+
+pub fn assert_check_producer_registration() -> Result<(), ValidationLifecycleError> {
+    with_check_producer_registration(|| ())
+}
+
 pub async fn settle_check_cleanup() -> Result<(), ValidationLifecycleError> {
     registry().settle_debts().await
 }
@@ -83,8 +98,14 @@ struct OutputCapture {
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
     errors: Mutex<Vec<String>>,
-    done: AtomicUsize,
-    changed: Notify,
+    tasks: Mutex<[CaptureTask; 2]>,
+    join_gate: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct CaptureTask {
+    handle: Option<JoinHandle<Result<(), String>>>,
+    completed: Option<Result<(), String>>,
 }
 
 impl OutputCapture {
@@ -92,10 +113,13 @@ impl OutputCapture {
         self: &Arc<Self>,
         pipe: Option<R>,
         stderr: bool,
-    ) {
+    ) -> Result<(), ValidationLifecycleError> {
         let output = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Some(mut pipe) = pipe {
+        let handle = tokio::spawn(async move {
+            {
+                let Some(mut pipe) = pipe else {
+                    return Err("declared validation pipe is missing".into());
+                };
                 let mut bytes = Vec::new();
                 if let Err(error) = pipe.read_to_end(&mut bytes).await {
                     if let Ok(mut errors) = output.errors.lock() {
@@ -111,19 +135,64 @@ impl OutputCapture {
                     *buffer = bytes;
                 }
             }
-            output.done.fetch_add(1, Ordering::SeqCst);
-            output.changed.notify_waiters();
+            Ok(())
         });
+        let mut tasks = self.tasks.lock().map_err(unknown)?;
+        let task = &mut tasks[usize::from(stderr)];
+        if task.handle.is_some() || task.completed.is_some() {
+            return Err(unknown("validation reader was already registered"));
+        }
+        task.handle = Some(handle);
+        Ok(())
     }
 
-    async fn finished(&self) {
-        loop {
-            let notified = self.changed.notified();
-            if self.done.load(Ordering::SeqCst) == 2 {
-                return;
+    async fn finished(&self) -> Result<(), ValidationLifecycleError> {
+        // Concurrent run/Stop waiters must not overwrite a JoinHandle's waker.
+        // Cancellation releases this gate without moving either owned handle.
+        let _joining = self.join_gate.lock().await;
+        poll_fn(|cx| {
+            let mut tasks = match self.tasks.lock() {
+                Ok(tasks) => tasks,
+                Err(error) => return Poll::Ready(Err(unknown(error))),
+            };
+            let mut pending = false;
+            for task in tasks.iter_mut() {
+                if task.completed.is_none() {
+                    let Some(handle) = task.handle.as_mut() else {
+                        return Poll::Ready(Err(unknown("validation reader was not registered")));
+                    };
+                    match std::pin::Pin::new(handle).poll(cx) {
+                        Poll::Ready(result) => {
+                            task.completed =
+                                Some(result.unwrap_or_else(|error| Err(error.to_string())));
+                            task.handle = None;
+                        }
+                        Poll::Pending => pending = true,
+                    }
+                }
             }
-            notified.await;
+            if pending {
+                return Poll::Pending;
+            }
+            Poll::Ready(Self::validate_tasks(&tasks))
+        })
+        .await
+    }
+
+    fn validate_tasks(tasks: &[CaptureTask; 2]) -> Result<(), ValidationLifecycleError> {
+        for task in tasks {
+            match &task.completed {
+                Some(Ok(())) => {}
+                Some(Err(error)) => return Err(unknown(error)),
+                None => return Err(unknown("validation reader task has not completed")),
+            }
         }
+        Ok(())
+    }
+
+    fn validate_finished(&self) -> Result<(), ValidationLifecycleError> {
+        let tasks = self.tasks.lock().map_err(unknown)?;
+        Self::validate_tasks(&tasks)
     }
 
     fn result(&self, success: bool) -> RawCheck {
@@ -227,13 +296,78 @@ struct LocalValidationNativeTerminal {
     _native_exit: ValidationNativeExited,
 }
 
+// The output policy comes from the concrete factory, never from absent pipes.
+enum CheckTail {
+    PathSnapshot {
+        created: bool,
+        path: PathBuf,
+        output: Arc<OutputCapture>,
+    },
+    #[cfg(target_os = "linux")]
+    OwnedSealedInputs {
+        _binary: File,
+        _config: File,
+        _stdio: NullCheckStdio,
+        command: Option<tokio::process::Command>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+struct NullCheckStdio;
+
+impl CheckTail {
+    fn output(&self) -> Option<Arc<OutputCapture>> {
+        match self {
+            Self::PathSnapshot { output, .. } => Some(Arc::clone(output)),
+            #[cfg(target_os = "linux")]
+            Self::OwnedSealedInputs { .. } => None,
+        }
+    }
+
+    fn validate_finished(&self) -> Result<(), ValidationLifecycleError> {
+        match self {
+            Self::PathSnapshot { output, .. } => output.validate_finished(),
+            #[cfg(target_os = "linux")]
+            Self::OwnedSealedInputs { .. } => Ok(()),
+        }
+    }
+
+    fn retire(&self) -> io::Result<()> {
+        match self {
+            Self::PathSnapshot { created: false, .. } => Ok(()),
+            Self::PathSnapshot { path, .. } => match std::fs::remove_file(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            },
+            #[cfg(target_os = "linux")]
+            Self::OwnedSealedInputs { .. } => Ok(()),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn path_snapshot(&self) -> &PathBuf {
+        match self {
+            Self::PathSnapshot { path, .. } => path,
+            #[cfg(target_os = "linux")]
+            Self::OwnedSealedInputs { .. } => panic!("sealed input has no path snapshot"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct CheckCompletion {
+    terminal: AtomicBool,
+    worker_pending: AtomicBool,
+}
+
 struct CheckRun {
+    completion: Arc<CheckCompletion>,
     request: CheckRequestRef,
     factory: NativeFactoryObservation,
     native_exited: Option<ValidationNativeExited>,
     native_terminal: Option<LocalValidationNativeTerminal>,
     child: Option<Child>,
-    snapshot: PathBuf,
+    tail: CheckTail,
     exit: Option<ExitStatus>,
     debt: bool,
     lost_wait_ownership: bool,
@@ -286,6 +420,7 @@ impl CheckRun {
                 {
                     return Err(unknown("validation native exit binding does not match"));
                 }
+                self.tail.validate_finished()?;
                 // Clone before the last fallible cleanup step; tail failure retains
                 // the original Child, binding and fact for the next attempt.
                 Ok(Some(ValidatedCheckNativeExit(fact.clone())))
@@ -372,6 +507,7 @@ impl Drop for CheckRun {
 struct CheckState {
     closing: bool,
     settling: bool,
+    pause: Option<Arc<()>>,
     runs: BTreeMap<u64, CheckRun>,
 }
 
@@ -404,11 +540,19 @@ impl CheckCustody {
     }
 
     fn admit(state: &CheckState) -> Result<(), ValidationLifecycleError> {
+        Self::admit_registration(state)?;
+        if state.settling || state.runs.values().any(|run| run.debt) {
+            return Err(unknown("a previous validation birth retains cleanup debt"));
+        }
+        Ok(())
+    }
+
+    fn admit_registration(state: &CheckState) -> Result<(), ValidationLifecycleError> {
         if state.closing {
             return Err(ValidationLifecycleError::Closing);
         }
-        if state.settling || state.runs.values().any(|run| run.debt) {
-            return Err(unknown("a previous validation birth retains cleanup debt"));
+        if state.pause.is_some() {
+            return Err(unknown("PC producers are paused"));
         }
         Ok(())
     }
@@ -447,26 +591,43 @@ impl CheckCustody {
         run.request_close().map_err(unknown)
     }
 
+    async fn wait_output(&self, request: &CheckRequestRef) -> Result<(), ValidationLifecycleError> {
+        let output = {
+            let mut state = self.state.lock().map_err(unknown)?;
+            self.run_mut(&mut state, request)?
+                .and_then(|run| run.tail.output())
+        };
+        if let Some(output) = output {
+            output.finished().await?;
+        }
+        Ok(())
+    }
+
     fn retire(&self, request: &CheckRequestRef) -> Result<(), ValidationLifecycleError> {
         let mut state = self.state.lock().map_err(unknown)?;
         let Some(run) = self.run_mut(&mut state, request)? else {
             return Ok(());
         };
-        let validated = run.validate_retirement()?;
-        match std::fs::remove_file(&run.snapshot) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        let validated = match run.validate_retirement() {
+            Ok(validated) => validated,
             Err(error) => {
                 run.debt = true;
-                return Err(unknown(error));
+                return Err(error);
             }
+        };
+        if let Err(error) = run.tail.retire() {
+            run.debt = true;
+            return Err(unknown(error));
         }
         // Snapshot removal above is the LAST fallible step. No new lookup, lock,
         // validation or allocation follows it; commit only this exact run.
         run.native_terminal = validated.map(|validated| LocalValidationNativeTerminal {
             _native_exit: validated.0,
         });
+        let completion = Arc::clone(&run.completion);
+        // Drop the exact owned images before publishing their local terminal.
         state.runs.remove(&request.id);
+        completion.terminal.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -480,11 +641,15 @@ impl CheckCustody {
             self.run_mut(&mut state, request)?
                 .is_some_and(|run| run.child.is_some())
         };
-        if born {
-            tokio::time::timeout(CLEANUP_BUDGET, self.wait_exit(request))
-                .await
-                .map_err(|_| unknown("same Child native wait timed out"))??;
-        }
+        tokio::time::timeout(CLEANUP_BUDGET, async {
+            if born {
+                self.wait_exit(request).await?;
+                self.wait_output(request).await?;
+            }
+            Ok::<_, ValidationLifecycleError>(())
+        })
+        .await
+        .map_err(|_| unknown("same Child native wait/output timed out"))??;
         self.retire(request)
     }
 
@@ -592,17 +757,19 @@ impl CheckCustody {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut destination = match options.open(&snapshot) {
-            Ok(file) => file,
-            Err(error) => return Ok(Err(error.to_string())),
-        };
+        let output = Arc::new(OutputCapture::default());
         let run = CheckRun {
+            completion: Arc::new(CheckCompletion::default()),
             request: request.clone(),
             factory: NativeFactoryObservation::PreFactory,
             native_exited: None,
             native_terminal: None,
             child: None,
-            snapshot: snapshot.clone(),
+            tail: CheckTail::PathSnapshot {
+                created: false,
+                path: snapshot.clone(),
+                output: Arc::clone(&output),
+            },
             exit: None,
             debt: false,
             lost_wait_ownership: false,
@@ -611,7 +778,18 @@ impl CheckCustody {
         // Retain the original admission before entering the synchronous factory.
         // A panic/unreturned factory cannot become no-child from an empty slot.
         state.runs.insert(id, run);
+        let mut destination = match options.open(&snapshot) {
+            Ok(file) => file,
+            Err(error) => {
+                drop(state);
+                self.retire(&request)?;
+                return Ok(Err(error.to_string()));
+            }
+        };
         let run = state.runs.get_mut(&id).expect("admitted validation run");
+        if let CheckTail::PathSnapshot { created, .. } = &mut run.tail {
+            *created = true;
+        }
         let copied =
             File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
         drop(destination);
@@ -632,32 +810,258 @@ impl CheckCustody {
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         builder.creation_flags(0x0800_0000);
+        if let Err(error) = Self::attach_child(run, &mut builder) {
+            drop(state);
+            self.retire(&request)?;
+            return Ok(Err(error));
+        }
+        let child = run.child.as_mut().expect("attached validation Child");
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_drain = output.read(stdout, false);
+        let stderr_drain = output.read(stderr, true);
+        if let Err(error) = stdout_drain.and(stderr_drain) {
+            run.debt = true;
+            return Err(error);
+        }
+        Ok(Ok((request, output)))
+    }
+
+    fn attach_child(
+        run: &mut CheckRun,
+        builder: &mut tokio::process::Command,
+    ) -> Result<(), String> {
         run.factory = NativeFactoryObservation::Entered;
         let child = match builder.spawn() {
             Ok(child) => child,
             Err(error) => {
                 run.debt = true;
                 run.factory = NativeFactoryObservation::ReturnedNoChild;
-                drop(state);
-                self.retire(&request)?;
-                return Ok(Err(error.to_string()));
+                return Err(error.to_string());
             }
         };
         run.child = Some(child);
         run.factory = NativeFactoryObservation::Attached(ValidationNativeMembers {
-            request: request.clone(),
+            request: run.request.clone(),
             birth: Arc::new(ValidationBirthIdentity),
             member: Arc::new(ValidationMemberIdentity),
             role: ValidationRole::Validation,
             scope: ValidationScope::SingleValidationNativeChildV1,
         });
-        let child = run.child.as_mut().expect("attached validation Child");
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let output = Arc::new(OutputCapture::default());
-        output.read(stdout, false);
-        output.read(stderr, true);
-        Ok(Ok((request, output)))
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_owned_sealed(
+        &self,
+        mut command: tokio::process::Command,
+        binary: File,
+        mut config: File,
+        io: Arc<dyn CheckIo>,
+    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+        let mut state = self.state.lock().map_err(unknown)?;
+        Self::admit(&state)?;
+        // These checks establish owned immutable inputs, not a pinned execution
+        // profile. The strict caller alone supplies its exact check argv and pin.
+        let prepared = (|| -> io::Result<File> {
+            validate_sealed_file(&binary)?;
+            validate_sealed_file(&config)?;
+            if binary.as_raw_fd() < 3
+                || command.as_std().get_program()
+                    != std::ffi::OsStr::new(&format!("/proc/self/fd/{}", binary.as_raw_fd()))
+            {
+                return Err(io::Error::other(
+                    "owned executable does not match check command",
+                ));
+            }
+            config.seek(SeekFrom::Start(0))?;
+            rustix::io::fcntl_dupfd_cloexec(&config, 3)
+                .map(File::from)
+                .map_err(io::Error::from)
+        })();
+        let stdin = match prepared {
+            Ok(stdin) => stdin,
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        command
+            .env_clear()
+            .current_dir("/")
+            .stdin(std::process::Stdio::from(stdin))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let id = NEXT_REQUEST.fetch_add(1, Ordering::SeqCst);
+        let request = CheckRequestRef {
+            id,
+            issuer: Arc::clone(&self.issuer),
+            identity: Arc::new(CheckRequestIdentity),
+        };
+        state.runs.insert(
+            id,
+            CheckRun {
+                completion: Arc::new(CheckCompletion {
+                    terminal: AtomicBool::new(false),
+                    worker_pending: AtomicBool::new(true),
+                }),
+                request: request.clone(),
+                factory: NativeFactoryObservation::PreFactory,
+                native_exited: None,
+                native_terminal: None,
+                child: None,
+                tail: CheckTail::OwnedSealedInputs {
+                    _binary: binary,
+                    _config: config,
+                    _stdio: NullCheckStdio,
+                    command: Some(command),
+                },
+                exit: None,
+                debt: false,
+                lost_wait_ownership: false,
+                io,
+            },
+        );
+        Ok(Ok(request))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dispatch_owned_sealed(
+        &self,
+        request: &CheckRequestRef,
+    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
+        let mut state = self.state.lock().map_err(unknown)?;
+        if let Err(error) = Self::admit(&state) {
+            drop(state);
+            self.retire(request)?;
+            return Err(error);
+        }
+        let run = self
+            .run_mut(&mut state, request)?
+            .ok_or_else(|| unknown("queued validation request disappeared"))?;
+        if !matches!(run.factory, NativeFactoryObservation::PreFactory) {
+            return Err(unknown("queued validation request was already dispatched"));
+        }
+        let mut command = match &mut run.tail {
+            CheckTail::OwnedSealedInputs { command, .. } => command
+                .take()
+                .ok_or_else(|| unknown("queued check command already dispatched"))?,
+            _ => return Err(unknown("queued request lacks original owned command")),
+        };
+        if let Err(error) = Self::attach_child(run, &mut command) {
+            drop(command);
+            drop(state);
+            self.retire(request)?;
+            return Ok(Err(error));
+        }
+        Ok(Ok(request.clone()))
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    fn spawn_owned_sealed(
+        &self,
+        command: tokio::process::Command,
+        binary: File,
+        config: File,
+        io: Arc<dyn CheckIo>,
+    ) -> Result<Result<CheckRequestRef, String>, ValidationLifecycleError> {
+        match self.queue_owned_sealed(command, binary, config, io)? {
+            Ok(request) => {
+                let completion =
+                    Arc::clone(&self.state.lock().map_err(unknown)?.runs[&request.id].completion);
+                let result = self.dispatch_owned_sealed(&request);
+                completion.worker_pending.store(false, Ordering::SeqCst);
+                result
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn supervise_owned_sealed(
+        self: &Arc<Self>,
+        command: tokio::process::Command,
+        binary: File,
+        config: File,
+        timeout: Duration,
+        spawned: Option<tokio::sync::oneshot::Sender<u32>>,
+    ) -> Result<RawCheck, ValidationLifecycleError> {
+        let request = match self.queue_owned_sealed(command, binary, config, Arc::new(NativeIo))? {
+            Ok(queued) => queued,
+            Err(error) => return Ok(RawCheck::SpawnFailed(error)),
+        };
+        let completion = {
+            let mut state = self.state.lock().map_err(unknown)?;
+            Arc::clone(
+                &self
+                    .run_mut(&mut state, &request)?
+                    .ok_or_else(|| unknown("queued check missing"))?
+                    .completion,
+            )
+        };
+        let custody = Arc::clone(self);
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        // Only the coordinator is detached. The original registry owns the
+        // Child and both images before the sole synchronous spawn can return.
+        tokio::spawn(async move {
+            let result = async {
+                if let Err(error) = custody.settle_debts().await {
+                    custody.retire(&request)?;
+                    return Err(error);
+                }
+                if tx.is_closed() {
+                    custody.retire(&request)?;
+                    return Ok(RawCheck::SpawnFailed(
+                        "check caller cancelled before birth".into(),
+                    ));
+                }
+                let request = match custody.dispatch_owned_sealed(&request)? {
+                    Ok(request) => request,
+                    Err(error) => return Ok(RawCheck::SpawnFailed(error)),
+                };
+                let mut booking = CheckBooking {
+                    custody: Arc::clone(&custody),
+                    request: request.clone(),
+                    active: true,
+                };
+                if let Some(notify) = spawned {
+                    let mut state = custody.state.lock().map_err(unknown)?;
+                    if let Some(pid) = custody
+                        .run_mut(&mut state, &request)?
+                        .and_then(|run| run.child.as_ref().and_then(Child::id))
+                    {
+                        let _ = notify.send(pid);
+                    }
+                }
+                let raw = tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        custody.close_confirmed(&request).await?;
+                        RawCheck::SpawnFailed("check caller cancelled".into())
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        custody.close_confirmed(&request).await?;
+                        RawCheck::TimedOut { after_secs: timeout.as_secs_f32() }
+                    }
+                    status = custody.wait_exit(&request) => {
+                        let status = status?;
+                        custody.retire(&request)?;
+                        RawCheck::Done {
+                            success: status.success(),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        }
+                    }
+                };
+                booking.active = false;
+                Ok(raw)
+            }
+            .await;
+            completion.worker_pending.store(false, Ordering::SeqCst);
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| unknown("owned check coordinator did not return"))?
     }
 
     async fn run(
@@ -678,7 +1082,7 @@ impl CheckCustody {
         };
         let wait = async {
             let exit = self.wait_exit(&request).await?;
-            output.finished().await;
+            output.finished().await?;
             Ok::<_, ValidationLifecycleError>(output.result(exit.success()))
         };
         let raw = match tokio::time::timeout(timeout, wait).await {
@@ -697,6 +1101,151 @@ impl CheckCustody {
         booking.active = false;
         Ok(raw)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_sealed_file(file: &File) -> io::Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
+    let seals = SealFlag::F_SEAL_WRITE
+        | SealFlag::F_SEAL_GROW
+        | SealFlag::F_SEAL_SHRINK
+        | SealFlag::F_SEAL_SEAL;
+    let actual = fcntl(file, FcntlArg::F_GET_SEALS).map_err(io::Error::from)?;
+    let flags = fcntl(file, FcntlArg::F_GETFD).map_err(io::Error::from)?;
+    if actual & seals.bits() != seals.bits() || flags & nix::libc::FD_CLOEXEC == 0 {
+        return Err(io::Error::other(
+            "owned check input protection is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+/// Retain a check's actual sealed executable/config in the existing validation
+/// custody. This returns only diagnostic RawCheck and local lifecycle errors;
+/// neither the command nor its optional PID notification grants a launch permit.
+#[cfg(target_os = "linux")]
+pub async fn supervise_owned_sealed_check(
+    command: tokio::process::Command,
+    binary: File,
+    config: File,
+    timeout: Duration,
+    spawned: Option<tokio::sync::oneshot::Sender<u32>>,
+) -> Result<RawCheck, ValidationLifecycleError> {
+    registry()
+        .supervise_owned_sealed(command, binary, config, timeout, spawned)
+        .await
+}
+
+/// A same-issuer reversible admission cutoff. Drop deliberately does not reopen it.
+pub struct AdmissionPause {
+    issuer: Arc<ValidationIssuerIdentity>,
+    identity: Arc<()>,
+    members: Vec<(CheckRequestRef, Arc<CheckCompletion>)>,
+}
+
+/// Opaque references to original Check rows, including queued owned images.
+pub struct CheckProducerView {
+    custody: Arc<CheckCustody>,
+    members: Vec<(CheckRequestRef, Arc<CheckCompletion>)>,
+}
+
+impl AdmissionPause {
+    pub fn is_current(&self) -> Result<(), ValidationLifecycleError> {
+        let custody = registry();
+        let state = custody.state.lock().map_err(unknown)?;
+        if Arc::ptr_eq(&custody.issuer, &self.issuer)
+            && state
+                .pause
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &self.identity))
+        {
+            Ok(())
+        } else {
+            Err(unknown("pause does not belong to the current custody"))
+        }
+    }
+
+    pub fn check_members(&self) -> Result<CheckProducerView, ValidationLifecycleError> {
+        self.is_current()?;
+        let custody = registry();
+        Ok(CheckProducerView {
+            custody: Arc::clone(custody),
+            members: self.members.clone(),
+        })
+    }
+
+    pub fn surrender(&self) -> Result<(), ValidationLifecycleError> {
+        self.check_members()?.verify_original_custody()?;
+        let custody = registry();
+        let mut state = custody.state.lock().map_err(unknown)?;
+        if !Arc::ptr_eq(&custody.issuer, &self.issuer)
+            || !state
+                .pause
+                .as_ref()
+                .is_some_and(|id| Arc::ptr_eq(id, &self.identity))
+        {
+            return Err(unknown("foreign or already surrendered pause"));
+        }
+        if state.closing {
+            return Err(ValidationLifecycleError::Closing);
+        }
+        if state.settling {
+            return Err(unknown("original Check settlement has not returned"));
+        }
+        state.pause = None;
+        Ok(())
+    }
+}
+
+impl CheckProducerView {
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn verify_original_custody(&self) -> Result<(), ValidationLifecycleError> {
+        let state = self.custody.state.lock().map_err(unknown)?;
+        for (request, completion) in &self.members {
+            if completion.worker_pending.load(Ordering::SeqCst) {
+                return Err(unknown("original Check coordinator has not returned"));
+            }
+            if let Some(run) = state.runs.get(&request.id) {
+                if !run.request.same(request)
+                    || !Arc::ptr_eq(&run.completion, completion)
+                    || run.debt
+                    || run.lost_wait_ownership
+                    || matches!(run.factory, NativeFactoryObservation::Entered)
+                {
+                    return Err(unknown("original Check dispatch is unresolved"));
+                }
+            } else if !completion.terminal.load(Ordering::SeqCst) {
+                return Err(unknown("Check row disappeared without original retirement"));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn pause_check_producers() -> Result<AdmissionPause, ValidationLifecycleError> {
+    let custody = registry();
+    let mut state = custody.state.try_lock().map_err(unknown)?;
+    if state.closing {
+        return Err(ValidationLifecycleError::Closing);
+    }
+    if state.pause.is_some() {
+        return Err(unknown("PC producers already paused"));
+    }
+    let identity = Arc::new(());
+    let members = state
+        .runs
+        .values()
+        .map(|run| (run.request.clone(), Arc::clone(&run.completion)))
+        .collect();
+    state.pause = Some(Arc::clone(&identity));
+    Ok(AdmissionPause {
+        issuer: Arc::clone(&custody.issuer),
+        identity,
+        members,
+    })
 }
 
 struct CheckBooking {

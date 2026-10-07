@@ -216,11 +216,47 @@ pub(super) struct NormalStart {
 pub(super) struct NormalStarts {
     current: Option<NormalStart>,
     retained: Vec<NormalStart>,
+    pub(super) pause: Option<Arc<super::mesh_apply::pc_owner_census::PcPauseCustody>>,
 }
 
 impl NormalStarts {
     pub(super) fn as_ref(&self) -> Option<&NormalStart> {
         self.current.as_ref()
+    }
+
+    pub(super) fn assert_unpaused(&self) -> Result<(), String> {
+        if self.pause.is_some() {
+            Err("PC producers are paused".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn producer_refs(&self) -> Vec<Arc<ProducerCell>> {
+        self.retained
+            .iter()
+            .map(|start| Arc::clone(&start.identity))
+            .collect()
+    }
+
+    pub(super) fn book_restart(
+        &mut self,
+        domain: Arc<crate::runtime::config::StopRuntimeDomain>,
+        base: u64,
+        claimed: Option<u64>,
+    ) -> Arc<ProducerCell> {
+        let identity = ProducerCell::queued(domain, base);
+        let (completion, _) = watch::channel(claimed.map_or(
+            NormalStartCompletion::Pending(base),
+            NormalStartCompletion::Starting,
+        ));
+        self.retained.push(NormalStart {
+            digest: "restart-dispatch".into(),
+            completion,
+            identity: Arc::clone(&identity),
+            attempt: None,
+        });
+        identity
     }
 
     fn replace(&mut self, start: NormalStart) {
@@ -230,14 +266,17 @@ impl NormalStarts {
     }
 
     fn prune(&mut self) {
-        self.retained
-            .retain(|producer| !producer.identity.reclaimable());
+        self.retained.retain(|producer| {
+            !producer.identity.reclaimable() || producer.identity.has_native_tail()
+        });
     }
 
     fn admitted(&self, generation: u64) -> Option<Arc<ProducerCell>> {
         self.retained
             .iter()
-            .find(|producer| producer.identity.has_generation(generation))
+            .find(|producer| {
+                producer.identity.has_generation(generation) && !producer.identity.reclaimable()
+            })
             .map(|producer| Arc::clone(&producer.identity))
     }
 }
@@ -730,6 +769,11 @@ impl ProxyRuntime {
     pub(crate) fn tailscale_action_lease(
         &self,
     ) -> Result<crate::runtime::config::LegacyStartLease, String> {
+        let starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| "Main admission poisoned")?;
+        starts.assert_unpaused()?;
         self.config
             .lease_legacy_start()
             .map_err(|_| "Managed mesh account retirement requires its managed proof".into())
@@ -801,6 +845,11 @@ impl ProxyRuntime {
         attempt: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
         commit: impl FnOnce(&mut Value) -> Result<(), String>,
     ) -> Result<Value, String> {
+        let starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| "Main admission poisoned")?;
+        starts.assert_unpaused()?;
         let action = || {
             self.gate
                 .with_current_generation(generation, |_| {
@@ -832,6 +881,8 @@ impl ProxyRuntime {
         attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
         poll: impl FnOnce() -> T,
     ) -> Option<T> {
+        let starts = self.normal_start.lock().ok()?;
+        starts.assert_unpaused().ok()?;
         attempt
             .while_active(|| self.gate.with_current_generation(generation, |_| poll()))
             .flatten()
@@ -1189,6 +1240,13 @@ impl ProxyRuntime {
                 None,
             )
         })?;
+        current
+            .assert_unpaused()
+            .and_then(|_| {
+                polaris_core_supervisor::config_gate::assert_check_producer_registration()
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| StartLeg::Finished(Err(StartError::from(e)), None))?;
         let base = self.core_generation();
         if expected.is_some_and(|expected| expected != base) {
             return Err(StartLeg::Superseded);
@@ -1345,6 +1403,9 @@ impl ProxyRuntime {
             .normal_start
             .lock()
             .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))?;
+        current.assert_unpaused().map_err(StartError::from)?;
+        polaris_core_supervisor::config_gate::assert_check_producer_registration()
+            .map_err(|e| StartError::from(e.to_string()))?;
         let attempt = scope.as_ref().map(|(_, attempt)| Arc::clone(attempt));
         let register = || {
             // Capture under the same short lock held by admission/claim/Starting publication.
@@ -1459,6 +1520,45 @@ impl ProxyRuntime {
     }
 
     /// Capture before entering native custody; overwritten admitted A stays discoverable.
+    pub(super) fn restart_dispatch(
+        &self,
+        claimed: Option<u64>,
+    ) -> Result<Arc<ProducerCell>, StartError> {
+        let mut starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| StartError::from("Main admission poisoned".to_owned()))?;
+        let original = claimed.and_then(|generation| starts.retained.iter().find(|start|
+            start.digest == "restart-dispatch" && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation))
+            .map(|start| Arc::clone(&start.identity)));
+        if let Err(error) = starts.assert_unpaused() {
+            // This is the original timer continuation returning, not observer Drop.
+            if let Some(original) = original {
+                original.finish_dispatch();
+            }
+            return Err(StartError::from(error));
+        }
+        if let Some(original) = original {
+            return Ok(original);
+        }
+        polaris_core_supervisor::config_gate::assert_check_producer_registration()
+            .map_err(|e| StartError::from(e.to_string()))?;
+        let base = self.core_generation();
+        Ok(starts.book_restart(Arc::clone(&self.stop_domain), base, claimed))
+    }
+
+    pub(super) fn finish_preclaimed_restart(&self, generation: u64) {
+        if let Ok(starts) = self.normal_start.lock() {
+            for start in &starts.retained {
+                if start.digest == "restart-dispatch"
+                    && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation)
+                {
+                    start.identity.finish_dispatch();
+                }
+            }
+        }
+    }
+
     pub(super) fn admitted_native_producer(
         &self,
         generation: u64,

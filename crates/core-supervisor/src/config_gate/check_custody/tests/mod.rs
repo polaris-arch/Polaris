@@ -5,7 +5,7 @@ use super::*;
 mod unix {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, AtomicUsize};
 
     struct Fixture(PathBuf, PathBuf);
     impl Fixture {
@@ -128,14 +128,14 @@ mod unix {
             assert!(run.child.is_some());
             assert_pending_native(run);
             assert_eq!(
-                std::fs::metadata(&run.snapshot)
+                std::fs::metadata(run.tail.path_snapshot())
                     .unwrap()
                     .permissions()
                     .mode()
                     & 0o777,
                 0o600
             );
-            (run.request.clone(), run.snapshot.clone())
+            (run.request.clone(), run.tail.path_snapshot().clone())
         };
         drop(check);
         std::fs::remove_file(&config).unwrap();
@@ -180,7 +180,8 @@ mod unix {
             .clone();
         assert!(custody.assert_admission().is_err());
         assert!(custody.state.lock().unwrap().runs[&request.id]
-            .snapshot
+            .tail
+            .path_snapshot()
             .exists());
         assert_pending_native(&custody.state.lock().unwrap().runs[&request.id]);
         io.mode.store(0, Ordering::SeqCst);
@@ -219,7 +220,8 @@ mod unix {
         assert_eq!(io.waits.load(Ordering::SeqCst), waits);
         assert_eq!(io.signals.load(Ordering::SeqCst), 0);
         assert!(custody.state.lock().unwrap().runs[&request.id]
-            .snapshot
+            .tail
+            .path_snapshot()
             .exists());
         assert_pending_native(&custody.state.lock().unwrap().runs[&request.id]);
     }
@@ -245,7 +247,8 @@ mod unix {
         );
         assert_eq!(custody.wait_exit(&request).await.unwrap(), fact.status);
         let snapshot = custody.state.lock().unwrap().runs[&request.id]
-            .snapshot
+            .tail
+            .path_snapshot()
             .clone();
         std::fs::remove_file(&snapshot).unwrap();
         std::fs::create_dir(&snapshot).unwrap();
@@ -365,7 +368,12 @@ mod unix {
         {
             let state = custody.state.lock().unwrap();
             let run = &state.runs[&request.id];
-            assert!(run.child.is_some() && run.exit.is_none() && run.debt && run.snapshot.exists());
+            assert!(
+                run.child.is_some()
+                    && run.exit.is_none()
+                    && run.debt
+                    && run.tail.path_snapshot().exists()
+            );
             assert_pending_native(run);
         }
         assert!(custody.assert_admission().is_err());
@@ -420,6 +428,7 @@ mod unix {
             .unwrap()
             .unwrap();
         custody.wait_exit(&request).await.unwrap();
+        custody.wait_output(&request).await.unwrap();
         let poisoned = Arc::clone(&custody);
         assert!(std::thread::spawn(move || {
             let _state = poisoned.state.lock().unwrap();
@@ -432,7 +441,7 @@ mod unix {
         assert!(custody.shutdown().await.is_err());
         let state = custody.state.lock().err().unwrap().into_inner();
         assert!(state.runs[&request.id].child.is_some());
-        assert!(state.runs[&request.id].snapshot.exists());
+        assert!(state.runs[&request.id].tail.path_snapshot().exists());
         cached_native(&state.runs[&request.id], NativeExitSource::PollWait);
         assert!(state.runs[&request.id].native_terminal.is_none());
     }
@@ -479,13 +488,13 @@ mod unix {
             .unwrap();
         assert_pending_native(&custody.state.lock().unwrap().runs[&request.id]);
         assert!(custody.wait_exit(&request).await.unwrap().success());
-        output.finished().await;
+        output.finished().await.unwrap();
         let snapshot = {
             let state = custody.state.lock().unwrap();
             let run = &state.runs[&request.id];
             cached_native(run, NativeExitSource::PollWait);
             assert!(run.validate_retirement().unwrap().is_some());
-            run.snapshot.clone()
+            run.tail.path_snapshot().clone()
         };
         custody.retire(&request).unwrap();
         assert!(!snapshot.exists());
@@ -515,7 +524,7 @@ mod unix {
             .spawn(&fixture.binary(), &fixture.config(), io.clone())
             .unwrap()
             .unwrap();
-        output.finished().await;
+        output.finished().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 custody.request_close(&request).unwrap();
@@ -535,7 +544,7 @@ mod unix {
             let run = &state.runs[&request.id];
             (
                 cached_native(run, NativeExitSource::TryWait),
-                run.snapshot.clone(),
+                run.tail.path_snapshot().clone(),
             )
         };
         assert_eq!(fact.status.code(), Some(7));
@@ -570,6 +579,7 @@ mod unix {
             .unwrap()
             .unwrap();
         custody.wait_exit(&request).await.unwrap();
+        custody.wait_output(&request).await.unwrap();
         let original = cached_native(
             &custody.state.lock().unwrap().runs[&request.id],
             NativeExitSource::PollWait,
@@ -589,7 +599,7 @@ mod unix {
             assert!(custody.request_close(&wrong_request).is_err());
             assert!(custody.retire(&wrong_request).is_err());
             let state = custody.state.lock().unwrap();
-            assert!(state.runs[&request.id].snapshot.exists());
+            assert!(state.runs[&request.id].tail.path_snapshot().exists());
             assert!(state.runs[&request.id].child.is_some());
         }
         assert!(foreign.retire(&request).is_err());
@@ -629,7 +639,7 @@ mod unix {
             );
             let mut state = custody.state.lock().unwrap();
             let run = state.runs.get_mut(&request.id).unwrap();
-            assert!(run.snapshot.exists() && run.child.is_some());
+            assert!(run.tail.path_snapshot().exists() && run.child.is_some());
             assert!(run.native_terminal.is_none());
             run.factory = NativeFactoryObservation::Attached(original.members.clone());
             run.native_exited = Some(original.clone());
@@ -661,10 +671,11 @@ mod unix {
         {
             let state = custody.state.lock().unwrap();
             let run = &state.runs[&partial.id];
-            assert!(run.child.is_some() && run.exit.is_some() && run.snapshot.exists());
+            assert!(run.child.is_some() && run.exit.is_some() && run.tail.path_snapshot().exists());
             assert!(run.debt && run.native_exited.is_none() && run.native_terminal.is_none());
         }
         custody.wait_exit(&request).await.unwrap();
+        custody.wait_output(&request).await.unwrap();
         let (child, fact) = {
             let mut state = custody.state.lock().unwrap();
             let run = state.runs.get_mut(&request.id).unwrap();
@@ -678,14 +689,14 @@ mod unix {
         {
             let mut state = custody.state.lock().unwrap();
             let run = state.runs.get_mut(&request.id).unwrap();
-            assert!(run.snapshot.exists() && run.native_exited.is_none());
+            assert!(run.tail.path_snapshot().exists() && run.native_exited.is_none());
             run.factory = NativeFactoryObservation::Attached(fact.members.clone());
             run.native_exited = Some(fact.clone());
             run.exit = Some(fact.status);
         }
         assert!(custody.retire(&request).is_err());
         let state = custody.state.lock().unwrap();
-        assert!(state.runs[&request.id].snapshot.exists());
+        assert!(state.runs[&request.id].tail.path_snapshot().exists());
         assert!(state.runs[&request.id].native_terminal.is_none());
         drop(child); // Already reaped by the actual native poll, never a fake birth.
     }
@@ -714,5 +725,408 @@ mod unix {
         assert_eq!(io.signals.load(Ordering::SeqCst), 0);
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
         custody.assert_admission().unwrap();
+    }
+
+    fn replace_test_capture(run: &mut CheckRun, replacement: Arc<OutputCapture>) {
+        match &mut run.tail {
+            CheckTail::PathSnapshot { output, .. } => *output = replacement,
+            #[cfg(target_os = "linux")]
+            CheckTail::OwnedSealedInputs { .. } => {
+                panic!("ordinary negative fixture needs its path tail")
+            }
+        }
+    }
+
+    struct EofReader(Option<tokio::sync::oneshot::Sender<()>>);
+    impl AsyncRead for EofReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(eof) = self.0.take() {
+                let _ = eof.send(());
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eof_before_task_return_and_cancelled_join_keep_original_tail_and_request() {
+        let fixture = Fixture::new("exit 0");
+        let custody = Arc::new(CheckCustody::default());
+        let (request, original) = custody
+            .spawn(&fixture.binary(), &fixture.config(), Arc::new(NativeIo))
+            .unwrap()
+            .unwrap();
+        custody.wait_exit(&request).await.unwrap();
+        original.finished().await.unwrap();
+        let output = Arc::new(OutputCapture::default());
+        // Exercise the very same read_to_end/buffer-assignment task body. This
+        // private negative tail fixture does not claim real process I/O failure.
+        let blocked = Arc::clone(&output);
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _buffer = blocked.stdout.lock().unwrap();
+            let _ = locked.send(());
+            released.recv().unwrap();
+        });
+        acquired.await.unwrap();
+        let (eof, observed) = tokio::sync::oneshot::channel();
+        output.read(Some(EofReader(Some(eof))), false).unwrap();
+        output.read(Some(tokio::io::empty()), true).unwrap();
+        observed.await.unwrap();
+        {
+            let mut state = custody.state.lock().unwrap();
+            replace_test_capture(
+                state.runs.get_mut(&request.id).unwrap(),
+                Arc::clone(&output),
+            );
+        }
+        let mut joining = Box::pin(output.finished());
+        assert!(poll_fn(|cx| Poll::Ready(joining.as_mut().poll(cx).is_pending())).await);
+        let mut successor = Box::pin(output.finished());
+        assert!(poll_fn(|cx| Poll::Ready(successor.as_mut().poll(cx).is_pending())).await);
+        drop(joining);
+        assert!(output.tasks.lock().unwrap()[0].handle.is_some());
+        assert!(custody.retire(&request).is_err());
+        {
+            let state = custody.state.lock().unwrap();
+            let run = &state.runs[&request.id];
+            assert!(run.tail.path_snapshot().exists() && run.child.is_some() && run.debt);
+            assert!(run.native_terminal.is_none());
+            cached_native(run, NativeExitSource::PollWait);
+        }
+        assert!(custody.assert_admission().is_err());
+        release.send(()).unwrap();
+        owner.join().unwrap();
+        successor.await.unwrap();
+        output.finished().await.unwrap();
+        custody.retire(&request).unwrap();
+        custody.assert_admission().unwrap();
+    }
+
+    struct FailingReader(bool);
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            assert!(!self.0, "reader task panic fixture");
+            Poll::Ready(Err(io::Error::other("reader I/O failure fixture")))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_error_keeps_diagnostic_mapping_but_panic_abort_and_missing_reader_keep_custody() {
+        let output = Arc::new(OutputCapture::default());
+        output.read(Some(FailingReader(false)), false).unwrap();
+        output.read(Some(tokio::io::empty()), true).unwrap();
+        output.finished().await.unwrap();
+        assert!(matches!(output.result(true), RawCheck::OutputFailed(_)));
+        output.validate_finished().unwrap();
+        for case in 0..3 {
+            let fixture = Fixture::new("exit 0");
+            let custody = Arc::new(CheckCustody::default());
+            let (request, original) = custody
+                .spawn(&fixture.binary(), &fixture.config(), Arc::new(NativeIo))
+                .unwrap()
+                .unwrap();
+            custody.wait_exit(&request).await.unwrap();
+            original.finished().await.unwrap();
+            let output = Arc::new(OutputCapture::default());
+            if case == 0 {
+                output.read(Some(FailingReader(true)), false).unwrap();
+            } else if case == 1 {
+                let (_writer, reader) = tokio::io::duplex(8);
+                output.read(Some(reader), false).unwrap();
+                output.tasks.lock().unwrap()[0]
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                    .abort();
+            } else {
+                output.read(None::<tokio::io::Empty>, false).unwrap();
+            }
+            output.read(Some(tokio::io::empty()), true).unwrap();
+            assert!(output.finished().await.is_err());
+            {
+                let mut state = custody.state.lock().unwrap();
+                replace_test_capture(state.runs.get_mut(&request.id).unwrap(), output);
+            }
+            assert!(custody.retire(&request).is_err());
+            assert!(custody.close_confirmed(&request).await.is_err());
+            assert!(custody.assert_admission().is_err());
+            let state = custody.state.lock().unwrap();
+            let run = &state.runs[&request.id];
+            assert!(run.child.is_some() && run.tail.path_snapshot().exists());
+            assert!(run.native_terminal.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_fixture(program: &str, args: &[&str]) -> (tokio::process::Command, File, File) {
+        use nix::fcntl::{fcntl, FcntlArg, SealFlag};
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let image = |bytes: &[u8], executable: bool| {
+            let mut file = File::from(
+                memfd_create(
+                    "polaris-check-owned-fixture",
+                    MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+                )
+                .unwrap(),
+            );
+            file.write_all(bytes).unwrap();
+            if executable {
+                nix::sys::stat::fchmod(
+                    &file,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IXUSR,
+                )
+                .unwrap();
+            }
+            fcntl(
+                &file,
+                FcntlArg::F_ADD_SEALS(
+                    SealFlag::F_SEAL_WRITE
+                        | SealFlag::F_SEAL_GROW
+                        | SealFlag::F_SEAL_SHRINK
+                        | SealFlag::F_SEAL_SEAL,
+                ),
+            )
+            .unwrap();
+            file
+        };
+        let binary = image(&std::fs::read(program).unwrap(), true);
+        let config = image(b"{\"owned-check-fixture\":true}", false);
+        let mut command =
+            tokio::process::Command::new(format!("/proc/self/fd/{}", binary.as_raw_fd()));
+        use std::os::unix::process::CommandExt;
+        command
+            .as_std_mut()
+            .arg0(Path::new(program).file_name().unwrap());
+        command.args(args);
+        (command, binary, config)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_sealed_factory_publishes_original_child_files_and_native_terminal() {
+        use std::os::fd::AsRawFd;
+        let custody = Arc::new(CheckCustody::default());
+        let (command, binary, config) = owned_fixture("/bin/true", &[]);
+        let binary_fd = binary.as_raw_fd();
+        let config_fd = config.as_raw_fd();
+        let request = custody
+            .spawn_owned_sealed(command, binary, config, Arc::new(NativeIo))
+            .unwrap()
+            .unwrap();
+        {
+            let state = custody.state.lock().unwrap();
+            let run = &state.runs[&request.id];
+            assert_pending_native(run);
+            let CheckTail::OwnedSealedInputs {
+                _binary, _config, ..
+            } = &run.tail
+            else {
+                panic!("owned inputs cannot become a path snapshot")
+            };
+            assert_eq!(_binary.as_raw_fd(), binary_fd);
+            assert_eq!(_config.as_raw_fd(), config_fd);
+            validate_sealed_file(_binary).unwrap();
+            validate_sealed_file(_config).unwrap();
+            assert!(run.child.as_ref().unwrap().stdout.is_none());
+            assert!(run.child.as_ref().unwrap().stderr.is_none());
+            assert!(run.tail.output().is_none());
+            assert!(run.validate_retirement().is_err());
+        }
+        assert!(custody.wait_exit(&request).await.unwrap().success());
+        cached_native(
+            &custody.state.lock().unwrap().runs[&request.id],
+            NativeExitSource::PollWait,
+        );
+        custody.retire(&request).unwrap();
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        custody.assert_admission().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_sealed_timeout_and_shutdown_use_the_same_central_admission_and_reap() {
+        let custody = Arc::new(CheckCustody::default());
+        let (command, binary, config) = owned_fixture("/bin/sleep", &["30"]);
+        assert!(matches!(
+            custody
+                .supervise_owned_sealed(command, binary, config, Duration::ZERO, None)
+                .await
+                .unwrap(),
+            RawCheck::TimedOut { .. }
+        ));
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let (command, binary, config) = owned_fixture("/bin/sleep", &["30"]);
+        let request = custody
+            .spawn_owned_sealed(command, binary, config, Arc::new(NativeIo))
+            .unwrap()
+            .unwrap();
+        let pid = custody.state.lock().unwrap().runs[&request.id]
+            .child
+            .as_ref()
+            .unwrap()
+            .id()
+            .unwrap();
+        custody.shutdown().await.unwrap();
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let (command, binary, config) = owned_fixture("/bin/true", &[]);
+        assert!(matches!(
+            custody.spawn_owned_sealed(command, binary, config, Arc::new(NativeIo)),
+            Err(ValidationLifecycleError::Closing)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn owned_sealed_incomplete_protection_foreign_command_and_binding_never_retire_as_null_proof(
+    ) {
+        let custody = Arc::new(CheckCustody::default());
+        let (command, binary, _config) = owned_fixture("/bin/true", &[]);
+        let unsealed = File::from(
+            nix::sys::memfd::memfd_create(
+                "polaris-check-unsealed",
+                nix::sys::memfd::MFdFlags::MFD_CLOEXEC
+                    | nix::sys::memfd::MFdFlags::MFD_ALLOW_SEALING,
+            )
+            .unwrap(),
+        );
+        assert!(custody
+            .spawn_owned_sealed(command, binary, unsealed, Arc::new(NativeIo))
+            .unwrap()
+            .is_err());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let (_, binary, config) = owned_fixture("/bin/true", &[]);
+        assert!(custody
+            .spawn_owned_sealed(
+                tokio::process::Command::new("/bin/true"),
+                binary,
+                config,
+                Arc::new(NativeIo)
+            )
+            .unwrap()
+            .is_err());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let (command, binary, config) = owned_fixture("/bin/true", &[]);
+        let request = custody
+            .spawn_owned_sealed(command, binary, config, Arc::new(NativeIo))
+            .unwrap()
+            .unwrap();
+        custody.wait_exit(&request).await.unwrap();
+        let original = cached_native(
+            &custody.state.lock().unwrap().runs[&request.id],
+            NativeExitSource::PollWait,
+        );
+        let foreign = CheckRequestRef {
+            identity: Arc::new(CheckRequestIdentity),
+            ..request.clone()
+        };
+        assert!(custody.retire(&foreign).is_err());
+        {
+            let mut state = custody.state.lock().unwrap();
+            let run = state.runs.get_mut(&request.id).unwrap();
+            run.native_exited.as_mut().unwrap().members.role = ValidationRole::Foreign;
+        }
+        assert!(custody.retire(&request).is_err());
+        assert!(custody.assert_admission().is_err());
+        {
+            let mut state = custody.state.lock().unwrap();
+            let run = state.runs.get_mut(&request.id).unwrap();
+            assert!(run.child.is_some() && matches!(run.tail, CheckTail::OwnedSealedInputs { .. }));
+            assert!(run.native_terminal.is_none());
+            run.native_exited = Some(original);
+        }
+        custody.close_confirmed(&request).await.unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn f1_queued_owned_images_are_in_original_runs_before_dispatch_and_pause() {
+        use std::os::fd::AsRawFd;
+        let custody = Arc::new(CheckCustody::default());
+        let (command, binary, config) = owned_fixture("/bin/true", &[]);
+        let binary_fd = binary.as_raw_fd();
+        let config_fd = config.as_raw_fd();
+        let request = custody
+            .queue_owned_sealed(command, binary, config, Arc::new(NativeIo))
+            .unwrap()
+            .unwrap();
+        let completion = {
+            let state = custody.state.lock().unwrap();
+            let original = &state.runs[&request.id];
+            assert!(matches!(
+                original.factory,
+                NativeFactoryObservation::PreFactory
+            ));
+            assert!(original.child.is_none());
+            let CheckTail::OwnedSealedInputs {
+                _binary, _config, ..
+            } = &original.tail
+            else {
+                panic!("missing original owned images")
+            };
+            assert_eq!(_binary.as_raw_fd(), binary_fd);
+            assert_eq!(_config.as_raw_fd(), config_fd);
+            Arc::clone(&original.completion)
+        };
+        let view = CheckProducerView {
+            custody: Arc::clone(&custody),
+            members: vec![(request.clone(), Arc::clone(&completion))],
+        };
+        custody.state.lock().unwrap().pause = Some(Arc::new(()));
+        assert!(custody.assert_admission().is_err());
+        assert!(custody.dispatch_owned_sealed(&request).is_err());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        assert!(completion.terminal.load(Ordering::SeqCst));
+        assert!(
+            view.verify_original_custody().is_err(),
+            "coordinator return cannot be inferred from empty runs"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn f1_actual_queued_coordinator_keeps_images_visible_and_retires_on_cutoff() {
+        let custody = Arc::new(CheckCustody::default());
+        let (command, binary, config) = owned_fixture("/bin/true", &[]);
+        let future =
+            custody.supervise_owned_sealed(command, binary, config, Duration::from_secs(1), None);
+        tokio::pin!(future);
+        poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let view = {
+            let mut state = custody.state.lock().unwrap();
+            assert_eq!(state.runs.len(), 1);
+            let run = state.runs.values().next().unwrap();
+            assert!(run.child.is_none());
+            assert!(matches!(
+                &run.tail,
+                CheckTail::OwnedSealedInputs {
+                    command: Some(_),
+                    ..
+                }
+            ));
+            let members = vec![(run.request.clone(), Arc::clone(&run.completion))];
+            state.pause = Some(Arc::new(()));
+            CheckProducerView {
+                custody: Arc::clone(&custody),
+                members,
+            }
+        };
+        assert!(view.verify_original_custody().is_err());
+        assert!(future.await.is_err());
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        view.verify_original_custody().unwrap();
     }
 }

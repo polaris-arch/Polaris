@@ -454,7 +454,7 @@ fn core_log_relay_applies_privacy_floor_per_frame_and_guards_reset_history() {
 fn pipe_to_log_yields_forwarding_on_handoff_but_never_yields_fatal_classification() {
     let src = module_code("runtime/proxy");
     let start = src
-        .find("pub(crate) fn pipe_to_log_with_secrets<R>(")
+        .find("pub(crate) fn pipe_to_log_with_secrets_owned<R>(")
         .expect("锚点 `pub(crate) fn pipe_to_log_with_secrets<R>(` 消失，源码型守卫已失去判据");
     let body = &src[start..];
     let body = &body[..body.find("\n}\n").expect("pipe_to_log 函数体没闭合")];

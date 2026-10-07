@@ -81,9 +81,10 @@ SmartScreen 提示時選擇「其他資訊」→「仍要執行」。
 需要 Rust stable、Node.js 24+（CI 目前使用 Node 26）、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 node scripts/fetch-core.mjs        # 拉取 sing-box 核心（SHA256 釘扎）
 node scripts/fetch-cronet.mjs      # 拉取 libcronet
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 核心不入庫，打包前必須拉取。平台 `--config` 不可省：缺了會打出**沒有核心的安裝檔**，且建置期零錯誤，

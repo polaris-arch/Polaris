@@ -52,6 +52,107 @@ impl From<ClosureError> for MaterializeError {
 pub(crate) struct MaterializedEmission {
     pub emission: ManagedMeshEmission,
     pub closure: ValidatedClosure,
+    /// Relocated legacy config used by the sole D1 emitter, not another builder.
+    pub source_config: SingBoxConfig,
+}
+
+/// Local files captured once before plan compilation. Their values are owned;
+/// their source paths remain mutable and do not constitute a runtime lease.
+#[derive(Debug)]
+pub(crate) struct OwnedRuleSources {
+    sources: Vec<OwnedRuleSource>,
+    rule_sets_sha256: String,
+}
+
+#[derive(Debug)]
+struct OwnedRuleSource {
+    path: PathBuf,
+    identity: FileSnapshot,
+    directories: Vec<(PathBuf, FileSnapshot)>,
+    bytes: Vec<u8>,
+}
+
+impl OwnedRuleSources {
+    pub(crate) fn bytes_at(&self, path: &str) -> Option<&[u8]> {
+        self.sources
+            .iter()
+            .find(|source| source.path == Path::new(path))
+            .map(|source| source.bytes.as_slice())
+    }
+
+    pub(crate) fn verify_sources_unchanged(&self) -> Result<(), MaterializeError> {
+        for source in &self.sources {
+            let current =
+                FileSnapshot::path(&source.path).map_err(|_| MaterializeError::SourceChanged)?;
+            if current.is_reparse()
+                || !current.is_file()
+                || !source.identity.same_snapshot(&current)
+            {
+                return Err(MaterializeError::SourceChanged);
+            }
+            for (path, before) in &source.directories {
+                let after =
+                    FileSnapshot::path(path).map_err(|_| MaterializeError::SourceChanged)?;
+                if after.is_reparse() || !after.is_dir() || !before.same_identity(&after) {
+                    return Err(MaterializeError::SourceChanged);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn capture_local_rule_sets(
+    config: &SingBoxConfig,
+    trusted_source_roots: &[PathBuf],
+) -> Result<OwnedRuleSources, MaterializeError> {
+    validate_source_roots(trusted_source_roots)?;
+    let rules = config
+        .route
+        .as_ref()
+        .ok_or(MaterializeError::Emission)?
+        .rule_set
+        .as_deref()
+        .unwrap_or_default();
+    if rules.len() > MAX_FILES {
+        return Err(MaterializeError::ResourceBudget);
+    }
+    let mut tags = BTreeSet::new();
+    let mut sources = Vec::with_capacity(rules.len());
+    let mut total = 0usize;
+    for rule in rules {
+        if !tags.insert(&rule.tag) {
+            return Err(MaterializeError::DuplicateRuleSetTag);
+        }
+        if rule.type_field != "local"
+            || !matches!(rule.format.as_str(), "source" | "binary")
+            || rule.url.is_some()
+        {
+            return Err(MaterializeError::UnsupportedRuleSet);
+        }
+        let path = PathBuf::from(
+            rule.path
+                .as_deref()
+                .ok_or(MaterializeError::UnsupportedRuleSet)?,
+        );
+        let source = read_trusted_source(&path, trusted_source_roots)?;
+        total = total
+            .checked_add(source.bytes.len())
+            .ok_or(MaterializeError::ResourceBudget)?;
+        if total > MAX_TOTAL_BYTES {
+            return Err(MaterializeError::ResourceBudget);
+        }
+        sources.push(source);
+    }
+    let owned = OwnedRuleSources {
+        sources,
+        rule_sets_sha256: sha256(
+            &serde_json::to_vec(&config.route.as_ref().unwrap().rule_set)
+                .map_err(|_| MaterializeError::Emission)?,
+        ),
+    };
+    owned.verify_sources_unchanged()?;
+    Ok(owned)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -101,7 +202,10 @@ fn open_source(path: &Path) -> Result<File, MaterializeError> {
     }
 }
 
-fn read_trusted_source(path: &Path, roots: &[PathBuf]) -> Result<Vec<u8>, MaterializeError> {
+fn read_trusted_source(
+    path: &Path,
+    roots: &[PathBuf],
+) -> Result<OwnedRuleSource, MaterializeError> {
     read_trusted_source_after_lstat(path, roots, || {})
 }
 
@@ -109,7 +213,7 @@ fn read_trusted_source_after_lstat(
     path: &Path,
     roots: &[PathBuf],
     after_lstat: impl FnOnce(),
-) -> Result<Vec<u8>, MaterializeError> {
+) -> Result<OwnedRuleSource, MaterializeError> {
     if !path.is_absolute() {
         return Err(MaterializeError::UntrustedRuleSource);
     }
@@ -168,13 +272,18 @@ fn read_trusted_source_after_lstat(
         {
             return Err(MaterializeError::SourceChanged);
         }
-        for (dir, before) in directories {
-            let after = FileSnapshot::path(&dir).map_err(|_| MaterializeError::SourceChanged)?;
+        for (dir, before) in &directories {
+            let after = FileSnapshot::path(dir).map_err(|_| MaterializeError::SourceChanged)?;
             if after.is_reparse() || !after.is_dir() || !before.same_identity(&after) {
                 return Err(MaterializeError::SourceChanged);
             }
         }
-        return Ok(bytes);
+        return Ok(OwnedRuleSource {
+            path: current,
+            identity: metadata,
+            directories,
+            bytes,
+        });
     }
     Err(MaterializeError::UntrustedRuleSource)
 }
@@ -199,51 +308,26 @@ pub(crate) fn materialize_local_rule_sets(
     {
         return Err(MaterializeError::SnapshotMismatch);
     }
-    validate_source_roots(trusted_source_roots)?;
-    let (root, _) = artifact_paths(data_dir, &plan.plan_id)
-        .map_err(|_| MaterializeError::UntrustedRuleSource)?;
-    let mut legacy = raw_legacy.clone();
-    let rule_sets = legacy
-        .route
-        .as_mut()
-        .ok_or(MaterializeError::Emission)?
-        .rule_set
-        .as_mut();
-    let mut payloads = Vec::new();
-    let mut total = 0usize;
-    let mut tags = BTreeSet::new();
-    if let Some(rule_sets) = rule_sets {
-        if rule_sets.len() > MAX_FILES {
-            return Err(MaterializeError::ResourceBudget);
-        }
-        for (index, rule_set) in rule_sets.iter_mut().enumerate() {
-            if !tags.insert(rule_set.tag.clone()) {
-                return Err(MaterializeError::DuplicateRuleSetTag);
-            }
-            let extension = match (rule_set.type_field.as_str(), rule_set.format.as_str()) {
-                ("local", "source") if rule_set.url.is_none() => "json",
-                ("local", "binary") if rule_set.url.is_none() => "srs",
-                _ => return Err(MaterializeError::UnsupportedRuleSet),
-            };
-            let path = rule_set
-                .path
-                .as_deref()
-                .ok_or(MaterializeError::UnsupportedRuleSet)?;
-            let bytes = read_trusted_source(Path::new(path), trusted_source_roots)?;
-            total = total
-                .checked_add(bytes.len())
-                .ok_or(MaterializeError::ResourceBudget)?;
-            if total > MAX_TOTAL_BYTES {
-                return Err(MaterializeError::ResourceBudget);
-            }
-            let relative_path = format!("rules/rs-{index:04}.{extension}");
-            rule_set.path = Some(root.join(&relative_path).to_string_lossy().into_owned());
-            payloads.push(RulePayload {
-                relative_path,
-                bytes,
-            });
-        }
+    let owned = capture_local_rule_sets(raw_legacy, trusted_source_roots)?;
+    materialize_owned_rule_sets(data_dir, plan, input, raw_legacy, &owned)
+}
+
+/// Relocation consumes exactly the captured bytes used for candidate evidence.
+/// No file is reread and no shared file, cache or artifact directory is written.
+pub(crate) fn materialize_owned_rule_sets(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    input: &ManagedMeshPlanInput,
+    raw_legacy: &SingBoxConfig,
+    owned: &OwnedRuleSources,
+) -> Result<MaterializedEmission, MaterializeError> {
+    if compile_managed_mesh_plan(input.clone()).map_err(|_| MaterializeError::SnapshotMismatch)?
+        != *plan
+    {
+        return Err(MaterializeError::SnapshotMismatch);
     }
+    owned.verify_sources_unchanged()?;
+    let (legacy, payloads) = relocate_owned_rule_sets(data_dir, plan, raw_legacy, owned)?;
     let emission =
         emit_managed_mesh_config(&legacy, input, plan).map_err(|_| MaterializeError::Emission)?;
     let digest = plan_digest(plan).map_err(|_| MaterializeError::Emission)?;
@@ -287,7 +371,64 @@ pub(crate) fn materialize_local_rule_sets(
         &expected,
         payloads,
     )?;
-    Ok(MaterializedEmission { emission, closure })
+    Ok(MaterializedEmission {
+        emission,
+        closure,
+        source_config: legacy,
+    })
+}
+
+/// Pure reconstruction from already owned values, also used by candidate
+/// consistency validation. It does not probe the current source pathname.
+pub(crate) fn relocate_owned_rule_sets(
+    data_dir: &Path,
+    plan: &ManagedMeshRoutePlan,
+    raw_legacy: &SingBoxConfig,
+    owned: &OwnedRuleSources,
+) -> Result<(SingBoxConfig, Vec<RulePayload>), MaterializeError> {
+    let raw_rules = &raw_legacy
+        .route
+        .as_ref()
+        .ok_or(MaterializeError::Emission)?
+        .rule_set;
+    if sha256(&serde_json::to_vec(raw_rules).map_err(|_| MaterializeError::Emission)?)
+        != owned.rule_sets_sha256
+    {
+        return Err(MaterializeError::SnapshotMismatch);
+    }
+    let (root, _) = artifact_paths(data_dir, &plan.plan_id)
+        .map_err(|_| MaterializeError::UntrustedRuleSource)?;
+    let mut legacy = raw_legacy.clone();
+    let rules = legacy
+        .route
+        .as_mut()
+        .ok_or(MaterializeError::Emission)?
+        .rule_set
+        .as_mut();
+    let mut payloads = Vec::new();
+    let rule_count = rules.as_ref().map_or(0, |rules| rules.len());
+    if rule_count != owned.sources.len() {
+        return Err(MaterializeError::SnapshotMismatch);
+    }
+    if let Some(rules) = rules {
+        for (index, (rule, source)) in rules.iter_mut().zip(&owned.sources).enumerate() {
+            if rule.path.as_deref().map(Path::new) != Some(source.path.as_path()) {
+                return Err(MaterializeError::SnapshotMismatch);
+            }
+            let extension = match (rule.type_field.as_str(), rule.format.as_str()) {
+                ("local", "source") if rule.url.is_none() => "json",
+                ("local", "binary") if rule.url.is_none() => "srs",
+                _ => return Err(MaterializeError::UnsupportedRuleSet),
+            };
+            let relative_path = format!("rules/rs-{index:04}.{extension}");
+            rule.path = Some(root.join(&relative_path).to_string_lossy().into_owned());
+            payloads.push(RulePayload {
+                relative_path,
+                bytes: source.bytes.clone(),
+            });
+        }
+    }
+    Ok((legacy, payloads))
 }
 
 #[cfg(test)]

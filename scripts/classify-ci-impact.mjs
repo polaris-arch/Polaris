@@ -727,21 +727,14 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       'fetch-protoc.mjs 解 zip 用的共享模块（extract-zip / fetch-stamp），改坏它与改坏 fetch-protoc 后果逐字相同。'
       + '按目录整取，理由同 CORE_PATH_PREFIXES：逐文件枚举会让下一个抽出来的共享模块又落表外。',
   },
-  // ── 本腿真正**执行**的那个 Tauri CLI 的版本真值（2026-09-05）──
+  'scripts/tauri-cli.version': {
+    why: '桌面与 Android 构建使用的全局 Tauri CLI 精确版本；CLI 改动可能改变资源与原生库铺设，须跑 APK 门。',
+  },
   'ui/package.json': {
-    why:
-      '本腿 S11 跑的是 `./ui/node_modules/.bin/tauri android build`（android.yml 里那一行；'
-      + '`git grep` 全仓确认 `tauri android build` 只此一处，四条桌面腿走的是 tauri-action，'
-      + '一个字节都察觉不到 android 侧的铺设回归）。而本文件的 `"@tauri-apps/cli": "^2"` 是 caret 范围 ——'
-      + '「装哪一版 CLI」的语义就写在这里。那个 CLI 正是「把 bundle.resources 铺成 assets/_up_/」'
-      + '与「把 `.so` 铺进 jniLibs」的唯一实现者，换一版就能同时翻掉 S11 的四条正面断言与 verify-apk 的'
-      + '判据 ①②④。本文件此前只在 SHARED_PACKAGE_PATHS（桌面面）⇒ android=false。',
+    why: 'Android beforeBuildCommand 编译前端；依赖或构建命令变化会改变 APK 内的 UI 产物。',
   },
   'ui/pnpm-lock.yaml': {
-    why:
-      '同 ui/package.json 的另一半，且是更承重的一半：本腿 `pnpm install --frozen-lockfile` 之后'
-      + '真正落盘的 CLI 版本由锁文件决定，caret 范围只是上界。改锁文件（升 @tauri-apps/cli）而'
-      + '本腿不跑 = 换掉了铺设实现却没有任何门量过它。',
+    why: 'Android 前端通过 pnpm install --frozen-lockfile 安装；锁文件决定实际打进 APK 的前端依赖。',
   },
 });
 
@@ -1069,6 +1062,7 @@ const SHARED_PACKAGE_PATHS = new Set([
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
+  'scripts/tauri-cli.version',
   'ui/package.json',
   'ui/pnpm-lock.yaml',
 ]);

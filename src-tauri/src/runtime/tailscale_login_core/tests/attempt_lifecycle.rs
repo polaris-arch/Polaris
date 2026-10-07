@@ -611,6 +611,9 @@ async fn local_owner_fact_does_not_infer_vacancy_from_missing_pid_or_retained_cl
             cancel_tx,
             closed_rx,
             _child: None,
+            native: None,
+            drain: None,
+            config_path: None,
         },
     );
     let gate = reg.state_gate().await;
@@ -3279,7 +3282,12 @@ fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_wa
     assert!(warm.find("make_warm_tuple").unwrap() < warm.find("reserve_android_action").unwrap());
     assert!(warm.find("reserve_android_action").unwrap() < warm.find("begin_warm").unwrap());
     assert!(warm.contains("with_tailscale_credential_birth(generation, attempt"));
-    assert!(launch.find("begin_warm").unwrap() < launch.find("self.spawner.spawn(req)").unwrap());
+    assert!(
+        launch.find("begin_warm").unwrap()
+            < launch
+                .find("self.spawner.spawn_with_temp_native_birth(req")
+                .unwrap()
+    );
     assert_eq!(launch.matches("self.checker.check_for_spawn(").count(), 1);
     assert!(!launch.contains("spawn_with_android"));
     assert!(!launch.contains("Uuid"));
@@ -3344,4 +3352,65 @@ fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_wa
     assert!(finish.contains("finish_warm(tuple).await.is_err()"));
     assert!(finish.contains("close_warm(tuple"));
     assert!(finish.rfind("finish_warm").unwrap() < finish.find("release_android_action").unwrap());
+}
+
+#[tokio::test]
+async fn f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects() {
+    const MARKER: &str = "POLARIS_F1_LOGIN_PREPARED_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let test = format!(
+            "{}::f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    let spawner = fake_spawner(vec![], false, false);
+    let reg = reg_with(
+        spawner.clone(),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    reg.prepare("ts1", "f1-original").await.unwrap();
+    let original = reg.attempts.get("ts1", "f1-original").unwrap();
+    let capture = reg.pc_producer_view().await.unwrap();
+    let pause = polaris_core_supervisor::config_gate::pause_check_producers().unwrap();
+    let view = capture.into_view();
+    assert_eq!(view.member_count(), 1);
+    assert!(Arc::ptr_eq(&view.attempts[0], &original));
+    assert!(reg.prepare("ts1", "f1-late").await.is_err());
+    let ud = temp_ud();
+    let server = ts_server("ts1", "myts");
+    assert!(matches!(
+        reg.start_attempt(
+            &server,
+            &ud,
+            request("f1-original"),
+            &offline,
+            Arc::new(FakeEmitter::default())
+        )
+        .await,
+        StartLoginOutcome::Failed(_)
+    ));
+    assert!(
+        !original.claimed.load(Ordering::SeqCst),
+        "pause cannot move credential-before-claim boundary"
+    );
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    assert!(login_configs(&ud).is_empty());
+    view.verify_surrender().unwrap();
+    pause.surrender().unwrap();
+    reg.prepare("ts1", "f1-next").await.unwrap();
+    std::fs::remove_dir_all(ud).unwrap();
 }

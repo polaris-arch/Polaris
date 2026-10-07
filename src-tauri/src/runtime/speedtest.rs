@@ -815,8 +815,125 @@ impl Drop for TempCorePidGuard {
 struct PcTempCoreCustody {
     admission: tokio::sync::Mutex<()>,
     birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
+    producers: Mutex<Vec<Arc<PcTempBatchProducer>>>,
+    retired_births: Mutex<Vec<Arc<PcTempCoreBirth>>>,
     closing: AtomicBool,
     identity: Arc<()>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct PcTempBatchProducer {
+    finished: AtomicBool,
+    cancelled: AtomicBool,
+    factory_started: AtomicBool,
+    birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcTempBatchDispatch(Arc<PcTempBatchProducer>);
+
+#[cfg(not(target_os = "android"))]
+impl Drop for PcTempBatchDispatch {
+    fn drop(&mut self) {
+        if !self.0.finished.load(Ordering::SeqCst) {
+            self.0.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) struct TempProducerView {
+    custody: Arc<PcTempCoreCustody>,
+    producers: Vec<Arc<PcTempBatchProducer>>,
+    births: Vec<Arc<PcTempCoreBirth>>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl TempProducerView {
+    pub(crate) fn member_count(&self) -> usize {
+        self.producers.len() + self.births.len()
+    }
+
+    pub(crate) fn verify_surrender(&self) -> Result<(), String> {
+        let current = self.custody.current()?;
+        let retired = self
+            .custody
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?;
+        for producer in &self.producers {
+            if !producer.finished.load(Ordering::SeqCst) {
+                if !producer.cancelled.load(Ordering::SeqCst) {
+                    return Err("original Temp batch dispatch has not returned".into());
+                }
+                if producer.factory_started.load(Ordering::SeqCst) {
+                    let birth = producer
+                        .birth
+                        .lock()
+                        .map_err(|_| "Temp batch birth binding poisoned")?
+                        .clone()
+                        .ok_or("cancelled unqualified Temp factory remains unknown")?;
+                    let native = birth
+                        .native
+                        .as_ref()
+                        .ok_or("cancelled legacy Temp factory remains unknown")?;
+                    native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
+                    if !birth.retired.load(Ordering::SeqCst)
+                        && birth
+                            .child
+                            .try_lock()
+                            .map_err(|_| "Temp child dispatch unresolved")?
+                            .is_none()
+                    {
+                        return Err(
+                            "cancelled Temp dispatch has not returned a physical Child".into()
+                        );
+                    }
+                }
+                // This original Rust body was dropped before factory, or its private
+                // factory returned to the retained exact birth. Uncovered tails stay typed.
+            }
+        }
+        let mut births = self.births.clone();
+        for producer in &self.producers {
+            if let Some(birth) = producer
+                .birth
+                .lock()
+                .map_err(|_| "Temp batch birth binding poisoned")?
+                .clone()
+            {
+                births.push(birth);
+            }
+        }
+        for birth in &births {
+            if !current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, birth))
+                && !retired.iter().any(|owner| Arc::ptr_eq(owner, birth))
+            {
+                return Err("original Temp birth responsibility disappeared".into());
+            }
+            if let Some(native) = &birth.native {
+                native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
+            } else if birth.retired.load(Ordering::SeqCst) {
+                // Legacy native-only close carries explicit uncovered tails, never full terminal.
+            } else if birth
+                .child
+                .try_lock()
+                .map_err(|_| "Temp child dispatch unresolved")?
+                .is_none()
+            {
+                return Err("legacy Temp factory return is not known".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn pc_temp_producer_view() -> Result<TempProducerView, String> {
+    PC_TEMP_CORE_CUSTODY.producer_view()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -861,6 +978,28 @@ static PC_TEMP_CORE_CUSTODY: LazyLock<Arc<PcTempCoreCustody>> =
 
 #[cfg(not(target_os = "android"))]
 impl PcTempCoreCustody {
+    fn producer_view(self: &Arc<Self>) -> Result<TempProducerView, String> {
+        let custody = Arc::clone(self);
+        let producers = custody
+            .producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .clone();
+        let mut births = custody
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?
+            .clone();
+        if let Some(current) = custody.current()? {
+            births.push(current);
+        }
+        Ok(TempProducerView {
+            custody,
+            producers,
+            births,
+        })
+    }
+
     fn current(&self) -> Result<Option<Arc<PcTempCoreBirth>>, String> {
         self.birth
             .lock()
@@ -914,6 +1053,21 @@ impl PcTempCoreCustody {
         });
         // Admission remains held from the initial empty-slot check through publication.
         // No other path can install a successor before this synchronous assignment.
+        if let Some(producer) = self
+            .producers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .filter(|producer| {
+                !producer.finished.load(Ordering::SeqCst)
+                    && !producer.cancelled.load(Ordering::SeqCst)
+            })
+        {
+            *producer
+                .birth
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&birth));
+        }
         *self.birth.lock().unwrap_or_else(PoisonError::into_inner) = Some(birth.clone());
         // Shutdown may have observed an empty slot immediately before spawn returned.
         // Publish first, then compensate for that lost notification under the closing fence.
@@ -953,6 +1107,25 @@ impl PcTempCoreCustody {
             identity,
             native: Some(native),
         });
+        if let Some(producer) = self
+            .producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .last()
+            .filter(|producer| {
+                !producer.finished.load(Ordering::SeqCst)
+                    && !producer.cancelled.load(Ordering::SeqCst)
+            })
+        {
+            let mut original = producer
+                .birth
+                .lock()
+                .map_err(|_| "Temp batch birth binding poisoned")?;
+            if original.is_some() {
+                return Err("Temp batch already owns an original birth".into());
+            }
+            *original = Some(Arc::clone(&birth));
+        }
         *current = Some(birth.clone());
         Ok(PcCustodiedChild {
             custody: self.clone(),
@@ -1001,11 +1174,16 @@ impl PcTempCoreCustody {
                 return Err("测速临时核没有 native factory 返回事实".into());
             }
         };
+        let mut retired_births = self
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?;
         // Every fallible lock/validation and sealed-reference clone precedes this commit.
         // File cleanup retains its ordinary best-effort diagnostic policy, outside native scope.
         retire_temp_config(&birth.config_path, birth.keep_config);
         pid_guard.pid_guard.take();
         current.take();
+        retired_births.push(Arc::clone(birth));
         if let Some(validated) = validated {
             pid_guard.native_terminal = Some(validated.retire());
         } else if let Some(native) = &birth.native {
@@ -1105,16 +1283,22 @@ impl LoginCoreChild for PcCustodiedChild {
         }
     }
     async fn close_confirmed(&mut self) -> Result<(), String> {
-        let mut child = self.birth.child.lock().await;
+        let mut owned_child = self.birth.child.lock().await;
         if self.birth.retired.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let child = child
+        let child = owned_child
             .as_mut()
             .ok_or("测速临时核 native factory 责任尚未确认")?;
         child.close_confirmed().await?;
         self.custody
-            .retire(&self.birth, PcTempRetirement::Close(child.native_exit()))
+            .retire(&self.birth, PcTempRetirement::Close(child.native_exit()))?;
+        // Keep the private native Child's cached facts on the same original birth.
+        // Legacy close ACKs retain uncovered tails, while preserving their old release.
+        if self.birth.native.is_none() {
+            owned_child.take();
+        }
+        Ok(())
     }
 }
 
@@ -2666,6 +2850,50 @@ impl TempCoreSession {
         #[cfg(not(target_os = "android"))]
         let _admission = deps.pc_custody.admission.lock().await;
         #[cfg(not(target_os = "android"))]
+        let dispatch =
+            match polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
+                let producer = Arc::new(PcTempBatchProducer::default());
+                deps.pc_custody
+                    .producers
+                    .lock()
+                    .map_err(|_| "Temp producer custody poisoned".to_owned())?
+                    .push(Arc::clone(&producer));
+                Ok::<_, String>(PcTempBatchDispatch(producer))
+            }) {
+                Ok(Ok(dispatch)) => dispatch,
+                Ok(Err(error)) => return BatchOutcome::CleanupUnknown(error),
+                Err(error) => return BatchOutcome::CleanupUnknown(error.to_string()),
+            };
+        let result = Self::run_admitted_batch(
+            deps,
+            nodes,
+            superseded,
+            measure,
+            emit,
+            progress,
+            #[cfg(not(target_os = "android"))]
+            &dispatch.0,
+        )
+        .await;
+        #[cfg(not(target_os = "android"))]
+        dispatch.0.finished.store(true, Ordering::SeqCst);
+        result
+    }
+
+    async fn run_admitted_batch<Meas, MeasFut>(
+        deps: &TempCoreDeps,
+        nodes: &[TempNode],
+        superseded: &(dyn Fn() -> bool + Sync),
+        measure: Meas,
+        emit: &mut (dyn FnMut(&str, Value) + Send),
+        progress: &mut RoundProgress,
+        #[cfg(not(target_os = "android"))] producer: &Arc<PcTempBatchProducer>,
+    ) -> BatchOutcome
+    where
+        Meas: Fn(u16) -> MeasFut,
+        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+    {
+        #[cfg(not(target_os = "android"))]
         {
             if deps.pc_custody.closing.load(Ordering::SeqCst) {
                 return BatchOutcome::CleanupUnknown("应用退出中，测速临时核禁止重新启动".into());
@@ -2837,24 +3065,27 @@ impl TempCoreSession {
         #[cfg(not(target_os = "android"))]
         let native_bound = prepared.is_some();
         #[cfg(not(target_os = "android"))]
-        let spawned = match prepared {
-            Some(prepared) => {
-                let booked =
-                    match deps
-                        .pc_custody
-                        .book_native(&prepared, config_path.clone(), keep_config)
-                    {
+        let spawned = {
+            producer.factory_started.store(true, Ordering::SeqCst);
+            match prepared {
+                Some(prepared) => {
+                    let booked = match deps.pc_custody.book_native(
+                        &prepared,
+                        config_path.clone(),
+                        keep_config,
+                    ) {
                         Ok(booked) => booked,
                         Err(detail) => return BatchOutcome::CleanupUnknown(detail),
                     };
-                // The original slot takes config responsibility before any factory await/effect.
-                config_guard.armed = false;
-                booked
-                    .dispatch_native(deps.spawner.as_ref(), req, prepared)
-                    .await
-                    .map(|child| Box::new(child) as Box<dyn LoginCoreChild>)
+                    // The original slot takes config responsibility before any factory await/effect.
+                    config_guard.armed = false;
+                    booked
+                        .dispatch_native(deps.spawner.as_ref(), req, prepared)
+                        .await
+                        .map(|child| Box::new(child) as Box<dyn LoginCoreChild>)
+                }
+                None => deps.spawner.spawn(req).await,
             }
-            None => deps.spawner.spawn(req).await,
         };
         #[cfg(target_os = "android")]
         let spawned = deps.spawner.spawn(req).await;

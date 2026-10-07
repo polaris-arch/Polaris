@@ -385,6 +385,14 @@ jobs:
       - name: Install UI dependencies
         run: pnpm --dir ui install --frozen-lockfile
 
+      - name: Install global Tauri CLI (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat scripts/tauri-cli.version)"
+          npm install -g "@tauri-apps/cli@$version"
+          [ "$(tauri --version)" = "tauri-cli $version" ]
+
       # ── Rust toolchain（2026-08-17：不再经 dtolnay/rust-toolchain@stable，判据同 ci.yml 那段）──
       # 三个 runner 镜像都自带 rustup 1.29。复刻被替掉那个 composite action 的全部副作用：
       # `rustup toolchain install <tc> --profile minimal [--target …] --no-self-update`、
@@ -826,6 +834,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tauriScript: tauri
           args: ${{ matrix.tauri_args }}
 
       # Tauri 2.11 / linuxdeploy 会把 Ubuntu 22.04 的 libwayland-* 一并塞进 AppImage；在

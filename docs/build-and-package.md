@@ -20,7 +20,14 @@ README 只留「怎么装、怎么用」。
 | Rust | stable（edition 2021） | 后端 + `crates/` 下 18 个域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
 | Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
 | pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`） |
-| [Tauri CLI 2](https://v2.tauri.app/) | 2.x | `cargo tauri build` 打包（随 `ui/` devDep 装） |
+| [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
+
+在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
+
+```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+tauri --version
+```
 
 ### 系统依赖
 
@@ -83,7 +90,7 @@ node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 `--check-only` 不下载库，但会校验 tag 可读、两个精确 require 均存在、以及两平台的 SHA-256 pin 完整且格式有效。
 
 上面三条都必须手动跑：`tauri.conf.json` **没有** `build.beforeBundleCommand`，
-`cargo tauri build` 不会替你 fetch 任何资源。
+`tauri build` 不会替你 fetch 任何资源。
 （此前本节描述过一套 `beforeBundleCommand` 兜底，实际那个键从未存在，
 `scripts/verify-dashboard-resources.mjs` 因此是永不执行的孤儿脚本——已删除。）
 
@@ -102,10 +109,10 @@ node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 # 1) 拉资产（见上）
 # 2) 前端构建 + Rust 编译 + 安装包（Tauri CLI 自动编排 beforeBuildCommand）
 #    从**仓库根**跑，并显式传本平台的 config（见下方「按平台筛内核」）
-cargo tauri build --config src-tauri/tauri.linux.conf.json          # Linux
-cargo tauri build --config src-tauri/tauri.windows.conf.json        # Windows
-cargo tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
-cargo tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
+tauri build --config src-tauri/tauri.linux.conf.json          # Linux
+tauri build --config src-tauri/tauri.windows.conf.json        # Windows
+tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
+tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
 ```
 
 产物落在**仓库根**的 `target/release/bundle/`（本仓是 cargo workspace，workspace 根在仓库根，
@@ -119,11 +126,11 @@ cargo tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-a
 | Windows | `polaris-portable-*.zip` | 免安装绿色版（解压即用，自带 `resources/` + `portable.marker` 形态标记） |
 
 portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `resources/` 额外打 zip，
-本地单跑上面那条 `cargo tauri build` 不会有。
+本地单跑上面那条 `tauri build` 不会有。
 
 ⚠️ **dmg 那行同理，但成因不同**：`-mac-arm64` / `-mac-x64` 这个 arch tag 不是 Tauri 产出的，
 是 `package.yml` 的 `Tag macOS dmg with arch` 步把 `<名>.dmg` 重命名成 `<名>-<tag>.dmg` 加上的
-（该步只在 CI 跑）。**本地跑 `cargo tauri build` 拿到的是 Tauri 默认名的 dmg，不带 tag。**
+（该步只在 CI 跑）。**本地跑 `tauri build` 拿到的是 Tauri 默认名的 dmg，不带 tag。**
 这个 tag 是更新器选包契约的硬要求：`github.rs::find_suitable_update_asset` 按资产名里的
 `mac-arm64` / `mac-x64` 选包，匹配不到直接返回 `None`（已取消「任意 .dmg」回落）。
 
@@ -144,7 +151,7 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
   包里没有内核、bundler 照常出包，只在用户机器上 `resolve_core_binary → Err` 才暴露。显式
   `--config` 下同样的改名会得到 `failed to read configuration file` 硬失败。
   （macOS 那份原名 `tauri.macos.conf.json` 会被隐式合并，实为 arm64 专用 ⇒ 在 Intel Mac 上裸
-  `cargo tauri build` 会打进 arm64 内核；已改名为 `tauri.macos-arm64.conf.json` 消除该隐式默认。）
+  `tauri build` 会打进 arm64 内核；已改名为 `tauri.macos-arm64.conf.json` 消除该隐式默认。）
 
 这些不变量由 `node scripts/verify-packaging.mjs confs` 机器守住（CI 每次打包前跑，本机可直接复现）；
 构建后再由 `payload` / `assets` 两个模式断言产物里恰好一份本平台内核、且产物名满足更新器选包契约。

@@ -146,6 +146,9 @@ async fn warm_uses_original_close_supervisor_without_status_or_completing_accoun
                 cancel_tx: cancel_tx.clone(),
                 closed_rx: closed_rx.clone(),
                 _child: Some(child.clone()),
+                native: None,
+                drain: None,
+                config_path: None,
                 #[cfg(target_os = "android")]
                 android_instance: None,
                 #[cfg(target_os = "android")]
@@ -731,4 +734,566 @@ fn lazy_tailscale_claim_rejects_symlink_root_escape() {
     std::fs::create_dir_all(root.join("outside")).unwrap();
     std::os::unix::fs::symlink(root.join("outside"), root.join("config/tailscale")).unwrap();
     assert!(canonical_tailscale_claim_directory(&root.join("config/tailscale/srv-1")).is_err());
+}
+
+/// Probes the real production factory, not an injected native acceptance issuer.
+struct NativeBookingSpawner {
+    shared: Mutex<Option<Arc<Shared>>>,
+    births: Mutex<Vec<LoginNativeBirthRef>>,
+    configs: Mutex<Vec<PathBuf>>,
+    generic_error: bool,
+    panic_drain: bool,
+}
+#[async_trait]
+impl LoginCoreSpawner for NativeBookingSpawner {
+    async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        TokioLoginCoreSpawner.spawn(req).await
+    }
+    fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
+        TokioLoginCoreSpawner.prepare_temp_native_birth()
+    }
+    async fn spawn_with_temp_native_birth(
+        &self,
+        mut req: SpawnRequest,
+        prepared: Option<PreparedTempNativeBirth>,
+    ) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        assert!(prepared.is_some(), "production Login is Some-bound");
+        {
+            let shared = self.shared.lock().unwrap().as_ref().unwrap().clone();
+            let entries = shared.guard();
+            let entry = entries.get("ts1").expect("book before factory");
+            assert!(entry._child.is_none());
+            assert!(entry.pid.is_none());
+            assert!(entry.config_path.as_ref().unwrap().exists());
+            assert!(entry.drain.is_some());
+            self.configs
+                .lock()
+                .unwrap()
+                .push(entry.config_path.clone().unwrap());
+            self.births
+                .lock()
+                .unwrap()
+                .push(entry.native.clone().unwrap());
+        }
+        if self.generic_error {
+            return Err(SpawnError::Spawn {
+                bin: req.binary,
+                source: std::io::Error::other("generic dyn error is not factory evidence"),
+            });
+        }
+        if self.panic_drain {
+            req.stdio = StdioPolicy::drain(|_, _| panic!("owned factory drain panic"));
+        }
+        TokioLoginCoreSpawner
+            .spawn_with_temp_native_birth(req, prepared)
+            .await
+    }
+}
+fn native_booking_registry(
+    binary: PathBuf,
+    generic_error: bool,
+    panic_drain: bool,
+) -> (
+    Arc<LoginCoreRegistry>,
+    Arc<NativeBookingSpawner>,
+    Arc<FakeStatusSubscriber>,
+) {
+    let spawner = Arc::new(NativeBookingSpawner {
+        shared: Mutex::new(None),
+        births: Mutex::new(Vec::new()),
+        configs: Mutex::new(Vec::new()),
+        generic_error,
+        panic_drain,
+    });
+    let subscriber = fake_subscriber(false);
+    let registry = Arc::new(LoginCoreRegistry::with_deps(
+        spawner.clone(),
+        Arc::new(FakeChecker { ok: true }),
+        subscriber.clone(),
+        Arc::new(move || Ok(binary.clone())),
+        Duration::from_secs(60),
+    ));
+    *spawner.shared.lock().unwrap() = Some(registry.shared.clone());
+    (registry, spawner, subscriber)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_login_registry_books_some_before_factory_and_consumes_native_task_config_terminal() {
+    let dir = crate::test_support::TestDir::new("polaris-login-native-terminal-");
+    let binary = crate::test_support::write_sleeping_probe(dir.path(), &dir.join("witness"));
+    std::fs::write(&binary, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    let (registry, spawner, subscriber) = native_booking_registry(binary, false, false);
+    let emitter = started(&registry, dir.path(), &ts_server("ts1", "myts")).await;
+    let birth = spawner.births.lock().unwrap()[0].clone();
+    let child = registry.shared.guard()["ts1"]._child.clone().unwrap();
+    assert!(registry.login_native_terminal(&birth).is_err());
+    assert!(birth
+        .validate_exit(&registry.identity, birth.epoch().unwrap(), None)
+        .is_err());
+    assert_eq!(spawner.births.lock().unwrap().len(), 1);
+    subscriber.push(0, frame(TAILSCALE_LOGIN_ENDPOINT_TAG, "Running", ""));
+    wait_until(|| !registry.shared.contains("ts1")).await;
+    registry.login_native_terminal(&birth).unwrap();
+    assert!(!spawner.configs.lock().unwrap()[0].exists());
+    let fact = child
+        .lock()
+        .await
+        .native_exit()
+        .expect("same original Child waited");
+    assert!(fact.matches_cell());
+    assert!(birth
+        .terminal(&Arc::new(RegistryIdentity), birth.epoch().unwrap())
+        .is_err());
+    assert!(birth
+        .terminal(&registry.identity, birth.epoch().unwrap() + 1)
+        .is_err());
+    assert_eq!(
+        emitter.progress.lock().unwrap().last().unwrap().2,
+        "authorized"
+    );
+}
+
+#[tokio::test]
+async fn generic_dyn_spawn_error_preserves_original_pending_booking_and_config() {
+    let dir = crate::test_support::TestDir::new("polaris-login-native-dyn-error-");
+    let (registry, spawner, _) = native_booking_registry(dir.join("unused-binary"), true, false);
+    let result = registry
+        .start_login(
+            &ts_server("ts1", "myts"),
+            dir.path(),
+            false,
+            None,
+            0,
+            Arc::new(FakeEmitter::default()),
+        )
+        .await;
+    assert!(matches!(result, StartLoginOutcome::Failed(reason) if reason == "processStartFailed"));
+    let birth = spawner.births.lock().unwrap()[0].clone();
+    wait_until(|| registry.shared.guard()["ts1"].closed_rx.borrow().is_some()).await;
+    assert!(registry.login_native_terminal(&birth).is_err());
+    assert!(registry.cancel_login("ts1").await.is_err());
+    assert!(registry.shared.contains("ts1"));
+    assert!(sole_login_config(dir.path()).exists());
+    assert!(birth
+        .validate_no_child(&registry.identity, birth.epoch().unwrap())
+        .is_err());
+}
+
+#[tokio::test]
+async fn sole_factory_spawn_error_proves_no_child_only_after_original_config_cleanup() {
+    let dir = crate::test_support::TestDir::new("polaris-login-native-no-child-");
+    let (registry, spawner, _) =
+        native_booking_registry(dir.join("nonexistent-owned-binary"), false, false);
+    let result = registry
+        .start_login(
+            &ts_server("ts1", "myts"),
+            dir.path(),
+            false,
+            None,
+            0,
+            Arc::new(FakeEmitter::default()),
+        )
+        .await;
+    assert!(matches!(result, StartLoginOutcome::Failed(reason) if reason == "processStartFailed"));
+    let birth = spawner.births.lock().unwrap()[0].clone();
+    wait_until(|| !registry.shared.contains("ts1")).await;
+    registry.login_native_terminal(&birth).unwrap();
+    assert!(!spawner.configs.lock().unwrap()[0].exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_factory_drain_panic_and_lost_launcher_do_not_release_pending_login() {
+    // A real factory panic permanently poisons the process-wide admission gate. Keep that
+    // strong assertion in an exact no-network child test, without poisoning unrelated tests.
+    const CHILD: &str = "POLARIS_L1_FACTORY_PANIC_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tailscale_login_core::tests::process_exit::real_factory_drain_panic_and_lost_launcher_do_not_release_pending_login",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "owned panic child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    let dir = crate::test_support::TestDir::new("polaris-login-native-panic-");
+    let binary = crate::test_support::write_sleeping_probe(dir.path(), &dir.join("witness"));
+    let (registry, spawner, _) = native_booking_registry(binary, false, true);
+    let original = registry.clone();
+    let path = dir.path().to_owned();
+    let task = tokio::spawn(async move {
+        original
+            .start_login(
+                &ts_server("ts1", "myts"),
+                &path,
+                false,
+                None,
+                0,
+                Arc::new(FakeEmitter::default()),
+            )
+            .await
+    });
+    assert!(matches!(task.await, Err(error) if error.is_panic()));
+    let birth = spawner.births.lock().unwrap()[0].clone();
+    assert!(registry.login_native_terminal(&birth).is_err());
+    assert!(registry.cancel_login("ts1").await.is_err());
+    assert!(registry.shared.contains("ts1"));
+    assert!(sole_login_config(dir.path()).exists());
+    assert!(birth
+        .validate_no_child(&registry.identity, birth.epoch().unwrap())
+        .is_err());
+}
+
+#[cfg(unix)]
+async fn native_login_fixture(
+    fatal: Option<crate::runtime::proxy::core_log::CoreFatalSlot>,
+) -> (
+    crate::test_support::TestDir,
+    Arc<Shared>,
+    LoginNativeBirthRef,
+    LoginChildCustody,
+    Arc<LoginStdioDrain>,
+    PathBuf,
+) {
+    let dir = crate::test_support::TestDir::new("polaris-login-native-tail-");
+    let binary = crate::test_support::write_sleeping_probe(dir.path(), &dir.join("witness"));
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nprintf 'FATAL[0000] missing monitor for auto DHCP' >&2\nexit 0\n",
+    )
+    .unwrap();
+    let config = dir.join("original-config.json");
+    std::fs::write(&config, b"{}").unwrap();
+    let shared = Arc::new(Shared::default());
+    let prepared = TokioLoginCoreSpawner.prepare_temp_native_birth().unwrap();
+    let native = prepared.bind_login(&shared.identity, 23).unwrap();
+    let drain = LoginStdioDrain::new();
+    let original_drain = drain.clone();
+    let req = SpawnRequest::new(
+        binary,
+        &config,
+        StdioPolicy::drain(move |stdout, stderr| {
+            let out = pipe_to_log_with_secrets_owned(
+                LoginDrainReader::new(stdout, original_drain.clone(), 0),
+                LOGIN_CORE_LOG_TARGET,
+                None,
+                None,
+                Vec::new(),
+            );
+            let err = pipe_to_log_with_secrets_owned(
+                LoginDrainReader::new(stderr, original_drain.clone(), 1),
+                LOGIN_CORE_LOG_TARGET,
+                fatal,
+                None,
+                Vec::new(),
+            );
+            original_drain.install([out, err]);
+        }),
+    );
+    let (cancel_tx, _) = mpsc::unbounded_channel();
+    let (_, closed_rx) = watch::channel(None);
+    shared.insert(
+        "ts1".into(),
+        LoginEntry {
+            epoch: 23,
+            attempt_id: "actual-owned-native-tail".into(),
+            pid: None,
+            cancel_tx,
+            closed_rx,
+            _child: None,
+            native: Some(native.clone()),
+            drain: Some(drain.clone()),
+            config_path: Some(config.clone()),
+            #[cfg(target_os = "android")]
+            android_instance: None,
+            #[cfg(target_os = "android")]
+            android_authority: None,
+        },
+    );
+    let child = Arc::new(tokio::sync::Mutex::new(
+        TokioLoginCoreSpawner
+            .spawn_with_temp_native_birth(req, Some(prepared))
+            .await
+            .unwrap(),
+    ));
+    native.publish_child(child.clone());
+    shared.guard().get_mut("ts1").unwrap()._child = Some(child.clone());
+    child.lock().await.wait_result().await.unwrap();
+    (dir, shared, native, child, drain, config)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_line_eof_cannot_retire_while_original_drainer_task_tail_is_blocked() {
+    let fatal = Arc::new(Mutex::new(None));
+    let blocking = fatal.clone();
+    let (release, unblock) = std::sync::mpsc::channel();
+    let (locked, ready) = oneshot::channel();
+    let owner = std::thread::spawn(move || {
+        let _lock = blocking.lock().unwrap();
+        locked.send(()).unwrap();
+        let _ = unblock.recv();
+    });
+    ready.await.unwrap();
+    let (_dir, shared, native, child, drain, config) =
+        native_login_fixture(Some(fatal.clone())).await;
+    wait_until(|| {
+        drain
+            .streams
+            .borrow()
+            .iter()
+            .all(|stream| matches!(stream, Some(Ok(()))))
+    })
+    .await;
+    let fact = child.lock().await.native_exit();
+    assert!(shared
+        .retire_login_tail("ts1", 23, &native, fact.clone())
+        .is_err());
+    assert!(native.terminal(&shared.identity, 23).is_err());
+    assert!(shared.contains("ts1"));
+    assert!(config.exists());
+    // EOF was observed inside read_until; the final no-newline FATAL still owns this task.
+    assert!(drain
+        .tasks
+        .get()
+        .unwrap()
+        .try_lock()
+        .unwrap()
+        .iter()
+        .any(|task| !task.handle.is_finished()));
+    let original_drain = drain.clone();
+    let joining = tokio::spawn(async move { original_drain.finished().await });
+    wait_until(|| drain.tasks.get().unwrap().try_lock().is_err()).await;
+    joining.abort();
+    assert!(joining.await.unwrap_err().is_cancelled());
+    assert!(native.terminal(&shared.identity, 23).is_err());
+    assert!(shared
+        .retire_login_tail("ts1", 23, &native, fact.clone())
+        .is_err());
+    release.send(()).unwrap();
+    owner.join().unwrap();
+    drain.finished().await.unwrap();
+    assert_eq!(
+        *fatal.lock().unwrap(),
+        Some(crate::runtime::proxy::core_log::CoreFatalKind::DhcpMonitorMissing)
+    );
+    shared.retire_login_tail("ts1", 23, &native, fact).unwrap();
+    native.terminal(&shared.identity, 23).unwrap();
+    assert!(!config.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_wait_and_task_join_still_preserve_custody_on_config_cleanup_failure() {
+    let (_dir, shared, native, child, drain, config) = native_login_fixture(None).await;
+    drain.finished().await.unwrap();
+    let fact = child.lock().await.native_exit().unwrap();
+    let saved_config = config.with_extension("original");
+    std::fs::rename(&config, &saved_config).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    assert!(shared
+        .retire_login_tail("ts1", 23, &native, Some(fact.clone()))
+        .is_err());
+    assert!(native.terminal(&shared.identity, 23).is_err());
+    assert!(shared.guard()["ts1"]._child.is_some());
+    std::fs::remove_dir(&config).unwrap();
+    std::fs::rename(&saved_config, &config).unwrap();
+    // Retry consumes the same immutable native wait and cached original join results.
+    drain.finished().await.unwrap();
+    shared
+        .retire_login_tail("ts1", 23, &native, Some(fact))
+        .unwrap();
+    native.terminal(&shared.identity, 23).unwrap();
+    assert!(!config.exists());
+}
+
+#[cfg(not(target_os = "android"))]
+#[cfg(unix)]
+#[tokio::test]
+async fn login_native_issuer_rejects_foreign_registry_birth_role_scope_status_and_temp_receipt() {
+    let (_dir, shared, native, child, drain, _config) = native_login_fixture(None).await;
+    drain.finished().await.unwrap();
+    let fact = child.lock().await.native_exit().unwrap();
+    let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("crates/core-supervisor/src/config_gate/check_custody/tests/fixtures/exit-seven.sh");
+    let temp_owner = Arc::new(());
+    let temp_birth = Arc::new(());
+    let prepared = TokioLoginCoreSpawner.prepare_temp_native_birth().unwrap();
+    let temp = prepared.bind(&temp_owner, &temp_birth).unwrap();
+    let req = SpawnRequest::new(
+        binary,
+        PathBuf::from("unused-owned-config"),
+        StdioPolicy::drain(|stdout, stderr| {
+            drop(pipe_to_log_with_secrets_owned(
+                stdout,
+                LOGIN_CORE_LOG_TARGET,
+                None,
+                None,
+                Vec::new(),
+            ));
+            drop(pipe_to_log_with_secrets_owned(
+                stderr,
+                LOGIN_CORE_LOG_TARGET,
+                None,
+                None,
+                Vec::new(),
+            ));
+        }),
+    );
+    let mut other = TokioLoginCoreSpawner
+        .spawn_with_temp_native_birth(req, Some(prepared))
+        .await
+        .unwrap();
+    other.wait_result().await.unwrap();
+    let foreign = other.native_exit().unwrap();
+    assert_ne!(fact.status_for_test(), foreign.status_for_test());
+    assert!(native
+        .validate_exit(&Arc::new(RegistryIdentity), 23, Some(fact.clone()))
+        .is_err());
+    assert!(native
+        .validate_exit(&shared.identity, 24, Some(fact.clone()))
+        .is_err());
+    assert!(native
+        .validate_exit(&shared.identity, 23, Some(foreign.clone()))
+        .is_err());
+    assert!(temp
+        .validate_exit(Some(fact.clone()), &temp_owner, &temp_birth)
+        .is_err());
+    for fault in ["member", "role", "scope", "status"] {
+        assert!(
+            native
+                .validate_exit(
+                    &shared.identity,
+                    23,
+                    Some(fact.corrupted_for_test(fault, &foreign))
+                )
+                .is_err(),
+            "{fault}"
+        );
+    }
+    let foreign_login = TokioLoginCoreSpawner
+        .prepare_temp_native_birth()
+        .unwrap()
+        .bind_login(&shared.identity, 23)
+        .unwrap();
+    assert!(foreign_login
+        .validate_exit(&shared.identity, 23, Some(fact.clone()))
+        .is_err());
+    shared
+        .retire_login_tail("ts1", 24, &native, Some(fact.clone()))
+        .unwrap_err();
+    shared
+        .retire_login_tail("ts1", 23, &foreign_login, Some(fact.clone()))
+        .unwrap_err();
+    assert!(shared.contains("ts1"));
+    shared
+        .retire_login_tail("ts1", 23, &native, Some(fact))
+        .unwrap();
+}
+
+struct ErrorLoginReader;
+impl tokio::io::AsyncRead for ErrorLoginReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("owned reader failure")))
+    }
+}
+#[tokio::test]
+async fn login_drain_io_error_early_drop_and_panicked_task_are_never_normal_tail_completion() {
+    for reader in [false, true] {
+        let drain = LoginStdioDrain::new();
+        let out = pipe_to_log_with_secrets_owned(
+            LoginDrainReader::new(tokio::io::empty(), drain.clone(), 0),
+            LOGIN_CORE_LOG_TARGET,
+            None,
+            None,
+            Vec::new(),
+        );
+        let err = if reader {
+            pipe_to_log_with_secrets_owned(
+                LoginDrainReader::new(ErrorLoginReader, drain.clone(), 1),
+                LOGIN_CORE_LOG_TARGET,
+                None,
+                None,
+                Vec::new(),
+            )
+        } else {
+            let reader = LoginDrainReader::new(tokio::io::empty(), drain.clone(), 1);
+            tokio::spawn(async move {
+                drop(reader);
+                Ok(())
+            })
+        };
+        drain.install([out, err]);
+        assert!(drain.finished().await.is_err());
+    }
+    let drain = LoginStdioDrain::new();
+    drain.complete(0, Ok(()));
+    drain.complete(1, Ok(()));
+    let out = tokio::spawn(async {
+        if std::hint::black_box(true) {
+            panic!("task completion is not successful EOF");
+        }
+        Ok(())
+    });
+    let err = tokio::spawn(async { Ok(()) });
+    drain.install([out, err]);
+    assert!(drain.finished().await.is_err());
+    assert!(
+        drain.finished().await.is_err(),
+        "cached JoinError never upgrades on retry"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn equal_presented_pid_and_forged_close_watch_cannot_substitute_a_new_child_birth() {
+    let (_dir, shared, native, child, drain, config) = native_login_fixture(None).await;
+    let (_other_dir, other_shared, _other_native, other_child, other_drain, _other_config) =
+        native_login_fixture(None).await;
+    drain.finished().await.unwrap();
+    other_drain.finished().await.unwrap();
+    let original = child.lock().await.native_exit().unwrap();
+    let successor = other_child.lock().await.native_exit().unwrap();
+    // Negative presentation input: two real, separately-issued native facts projected onto
+    // one numeric PID, as after reuse. Neither a PID nor an ordinary watch is the issuer.
+    let (_, forged) = watch::channel(Some(Ok(())));
+    {
+        let mut entries = shared.guard();
+        let entry = entries.get_mut("ts1").unwrap();
+        entry.pid = Some(4242);
+        entry.closed_rx = forged;
+    }
+    other_shared.guard().get_mut("ts1").unwrap().pid = Some(4242);
+    assert_eq!(shared.pids(), other_shared.pids());
+    assert!(matches!(
+        &*shared.guard()["ts1"].closed_rx.borrow(),
+        Some(Ok(()))
+    ));
+    assert!(native.terminal(&shared.identity, 23).is_err());
+    assert!(shared
+        .retire_login_tail("ts1", 23, &native, Some(successor))
+        .is_err());
+    assert!(shared.contains("ts1"));
+    assert!(config.exists());
+    shared
+        .retire_login_tail("ts1", 23, &native, Some(original))
+        .unwrap();
 }

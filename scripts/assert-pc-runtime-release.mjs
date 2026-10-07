@@ -12,28 +12,31 @@ import { canonical, DESKTOP_TARGETS, digest, requireGraph, validateSourceManifes
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Historical reviewed backend anchor, not a commit claiming the later Go inputs.
 const reviewedCandidate = '123259cb4ee0eef484368e34d8ea7211d39964b6';
-// This closure includes the previously accepted shared Go TS writer delta and
-// the accepted validation retirement and target-membership deltas. The latest
-// implementation/review hashes below identify the final Membership record.
+// This closure inherits the accepted TS retirement and target-membership deltas.
+// The latest implementation/review hashes identify the finite G1 unstarted
+// validation disposition source record; its construction patch is checked by
+// the original complete manifest/patch loop below.
+// Membership implementation 317f0dbe99b89bc018cfe9af7dfc0a0d2536d166566b1ff6a512d5285c2f9c67,
+// review 26e53101a2510edaf9038e3e5d75b1e982ffcada2a540ede0c38a57971005553.
 // Retirement implementation 6ee4c9f0fa982dc5cc691e6fc7babd3c78b174a799d62b64ce6cce296c7eb9e3,
 // review f09f2f6a6a602d3e650980881abba1fb7ed85d6c072419f8a13936b2895ef846.
 // Earlier shared Go review 3579c1d6e782ff53142a60ac5c279fa9ed263bdc9147eaf406b8a7088eaa27ba
-// remains the base anchor. None of these records is a new candidate commit,
+// remains the base anchor. These records do not claim a new candidate commit,
 // native acceptance or global ownership clearance.
 const reviewedSourceIncrement = Object.freeze({
-  scope: 'finite-ts-store-writer-retirement-source-only',
-  implementationSha256: '317f0dbe99b89bc018cfe9af7dfc0a0d2536d166566b1ff6a512d5285c2f9c67',
-  independentReviewSha256: '26e53101a2510edaf9038e3e5d75b1e982ffcada2a540ede0c38a57971005553',
+  scope: 'finite-ts-store-and-unstarted-validation-source-only',
+  implementationSha256: 'daaa1ca96138b3df13ccafae33bc6183ba483eeafcb5371921e1f4d07b2c88c7',
+  independentReviewSha256: '156d8c345c73ae929a77112f566ad3dbe72b76be354a6b7e7dd736520246c841',
   sourcePatchSha256: '839cfff957264aec8d4a85bb9e4efd272c4cfc6ad08de5eeb33d4c8f8c6e55b5',
-  sourceManifestSha256: '9f269083f002cc7dea49e5151c4e150e6ba1d26dc173d4601614dd2cb557b7fd',
-  sourceReceiptFingerprint: '287b3d7a85b777e1a3f379f05171f26ee1e4f96803c1f4aaabe3e8116dc21b54',
+  sourceManifestSha256: 'a556cacbdf5a55f342604ceb82fdf40ab7df1d6bdf3f79239e8ba4eba33ec897',
+  sourceReceiptFingerprint: 'f82cd8aa2ff67e909e23e17c4da94619552abd88ec4d066e82324a9174fd7483',
 });
 // Canonical inputs bind these accepted finite deltas and the unchanged backend graph,
 // plus the original Windows overlay replay and internal .polaris.3 version.
 // Source-only pins do not claim newly compiled output. Only five binary
 // output pins are excluded: the existing all-four consumer verifies actual
 // producer outputs for the current candidate/run/attempt, rather than old pins.
-const reviewedInputsSha256 = '09ebeea39925eb302f70d1cafbbd4eb6b6e5a63c1ebb3e4d05b8125e26ba53dc';
+const reviewedInputsSha256 = '3f3339ee03559fec8249ae0459a43941526a6d701e7e104c9b366471a2607a1b';
 const readRepository = (relative) => readFileSync(join(root, relative));
 
 export function assertSourceFirstRelease(read = readRepository) {

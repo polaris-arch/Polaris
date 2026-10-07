@@ -375,3 +375,175 @@ async fn inflight_cap_drops_excess_without_upstream_fanout() {
         DnsResponseClass::Hit
     );
 }
+
+#[tokio::test]
+async fn stop_join_waits_for_query_return_and_cancelled_wait_keeps_original_task() {
+    struct HeldQuery {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        returned: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl UpstreamQuery for HeldQuery {
+        async fn query(&self, _: &ResolveUpstream, _: &[u8]) -> Result<Vec<u8>, String> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.returned.store(true, Ordering::SeqCst);
+            Err("fixture returned".to_owned())
+        }
+    }
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let returned = Arc::new(AtomicBool::new(false));
+    let srv = NodeDnsRaceServer::start(
+        resolve_upstreams(&["ali".to_string()], &[]),
+        Arc::new(HeldQuery {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            returned: Arc::clone(&returned),
+        }),
+        DEFAULT_RACE_BUDGET,
+        None,
+        Arc::new(DecoySet::builtin()),
+    )
+    .await
+    .unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(
+            &encode_dns_query("held.example.com", TYPE_A, 1),
+            ("127.0.0.1", srv.port()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    {
+        let join = srv.stop_and_join();
+        tokio::pin!(join);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut join)
+            .await
+            .is_err());
+    }
+    assert!(!returned.load(Ordering::SeqCst));
+    assert!(
+        srv.task.lock().await.handle.is_some(),
+        "cancelled observer must retain original handle"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), srv.stop_and_join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        returned.load(Ordering::SeqCst),
+        "join cannot replace actual query return with abort"
+    );
+    assert!(srv.task.lock().await.handle.is_none());
+    srv.stop_and_join().await.unwrap();
+    assert!(!srv.is_listening());
+}
+
+#[tokio::test]
+async fn query_panic_is_sticky_and_cannot_become_successful_drain() {
+    struct PanicQuery(Arc<Notify>);
+    #[async_trait]
+    impl UpstreamQuery for PanicQuery {
+        async fn query(&self, _: &ResolveUpstream, _: &[u8]) -> Result<Vec<u8>, String> {
+            self.0.notify_one();
+            panic!("query fixture panic")
+        }
+    }
+    let entered = Arc::new(Notify::new());
+    let srv = NodeDnsRaceServer::start(
+        resolve_upstreams(&["ali".to_string()], &[]),
+        Arc::new(PanicQuery(Arc::clone(&entered))),
+        DEFAULT_RACE_BUDGET,
+        None,
+        Arc::new(DecoySet::builtin()),
+    )
+    .await
+    .unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(
+            &encode_dns_query("panic.example.com", TYPE_A, 1),
+            ("127.0.0.1", srv.port()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let error = srv.stop_and_join().await.unwrap_err();
+    assert!(matches!(error, DnsRaceDrainError::QueryTask(_)));
+    assert_eq!(srv.stop_and_join().await.unwrap_err(), error);
+}
+
+#[tokio::test]
+async fn drain_waits_for_every_admitted_query_not_only_the_first_return() {
+    struct HeldQueries {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        returned: Arc<Semaphore>,
+    }
+    #[async_trait]
+    impl UpstreamQuery for HeldQueries {
+        async fn query(&self, _: &ResolveUpstream, _: &[u8]) -> Result<Vec<u8>, String> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.returned.add_permits(1);
+            Err("fixture returned".to_owned())
+        }
+    }
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let returned = Arc::new(Semaphore::new(0));
+    let srv = NodeDnsRaceServer::start(
+        resolve_upstreams(&["ali".to_string()], &[]),
+        Arc::new(HeldQueries {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            returned: Arc::clone(&returned),
+        }),
+        DEFAULT_RACE_BUDGET,
+        None,
+        Arc::new(DecoySet::builtin()),
+    )
+    .await
+    .unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for id in [1, 2] {
+        client
+            .send_to(
+                &encode_dns_query("held.example.com", TYPE_A, id),
+                ("127.0.0.1", srv.port()),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire_many(2))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    srv.stop();
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), returned.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), srv.stop_and_join())
+            .await
+            .is_err()
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), srv.stop_and_join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current_socket(&srv.slot).is_none());
+}

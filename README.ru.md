@@ -77,9 +77,10 @@
 Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26) и [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 node scripts/fetch-core.mjs        # загрузка ядра sing-box (закреплено по SHA256)
 node scripts/fetch-cronet.mjs      # загрузка libcronet
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 Ядро не хранится в репозитории и должно быть загружено перед сборкой пакета. Платформенный `--config` обязателен: без него получится **пакет без ядра**, причём во время сборки не будет ни одной ошибки — сбой проявится только во время работы. Полное описание, разделение задач в CI и контракт выбора пакета для установщика Windows и обновлятора — в [Сборка и упаковка](docs/build-and-package.en.md).

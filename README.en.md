@@ -77,9 +77,10 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 Requires Rust stable, Node.js 24+ (CI currently uses Node 26), and [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 node scripts/fetch-core.mjs        # fetch the sing-box core (SHA256 pinned)
 node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 The core is not committed and must be fetched before packaging. The per-platform `--config` is not optional: omitting it produces **a package with no core**, with zero build-time errors — the failure only surfaces at runtime. Full details, CI division of labor, and the Windows installer / updater package-selection contract are in [Build and Package](docs/build-and-package.en.md).

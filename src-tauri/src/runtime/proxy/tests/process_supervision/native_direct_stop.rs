@@ -1061,3 +1061,101 @@ async fn unbound_fixture_native_wait_issues_no_typed_birth_fact() {
         .unwrap();
     assert!(slot.is_empty());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn f1_original_main_membership_survives_stop_generation_and_explicit_surrender() {
+    const MARKER: &str = "POLARIS_F1_MAIN_PAUSE_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let test = format!(
+            "{}::f1_original_main_membership_survives_stop_generation_and_explicit_surrender",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    use crate::runtime::proxy::mesh_apply::pc_owner_census::TailObligation;
+    let (rt, dir, identity, _token, _pid) = live_main_run("f1-original-main-positive").await;
+    let generation = rt.core_generation();
+    let pause = rt.pause_pc_producers(generation).await.unwrap();
+    let observer = pause.clone();
+    let membership = pause.seal(&rt).unwrap();
+    assert!(membership.member_counts().0 > 0);
+    assert!(membership
+        .main_native_phases()
+        .iter()
+        .any(|(_, phases)| phases == &[ATTACHED]));
+    assert!(membership
+        .tail_obligations()
+        .contains(&TailObligation::MainDetachedLogTasks));
+    assert!(membership
+        .tail_obligations()
+        .contains(&TailObligation::TempConfigBestEffort));
+    let (foreign, _foreign_dir) = test_runtime();
+    assert!(pause.surrender(&foreign).is_err());
+    drop(observer);
+    assert!(rt.normal_start_completion(serde_json::Value::Null).is_err());
+    assert!(matches!(
+        rt.restart_guarded_outcome(serde_json::Value::Null, Some(generation))
+            .await,
+        super::super::super::lifecycle::RestartLeg::Finished(Err(_), _)
+    ));
+    assert_eq!(
+        rt.core_generation(),
+        generation,
+        "late restart cannot take the Stop leg"
+    );
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    let displaced = rt.child.lock().unwrap().take_running_for_test().unwrap();
+    assert!(
+        pause.surrender(&rt).is_err(),
+        "attached metadata cannot replace physical original custody"
+    );
+    rt.child.lock().unwrap().install_running_for_test(displaced);
+    // Exercise the original ordinary Stop generation authority without OS teardown.
+    let stopped = rt
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    assert_ne!(stopped, generation);
+    assert!(membership.assert_fresh(&rt).is_err());
+    assert!(pause.seal(&rt).is_err());
+    let gate = rt.mesh.tailscale_state_gate().await;
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    drop(gate);
+    assert!(membership
+        .main_native_phases()
+        .iter()
+        .any(|(_, phases)| phases == &[RETIRED]));
+    assert!(membership
+        .tail_obligations()
+        .contains(&TailObligation::MainDetachedLogTasks));
+    pause.surrender(&rt).unwrap();
+    assert!(
+        pause.surrender(&rt).is_err(),
+        "same lease cannot release twice"
+    );
+    assert!(
+        membership.assert_fresh(&rt).is_err(),
+        "surrender grants no fresh census"
+    );
+    let (_new_run, _new_token, _new_pid) =
+        protected_main_run(&rt, &dir, "f1-original-main-positive").await;
+    let gate = rt.mesh.tailscale_state_gate().await;
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    drop(gate);
+    let exit_pause = rt.pause_pc_producers(rt.core_generation()).await.unwrap();
+    rt.begin_shutdown().unwrap();
+    assert!(exit_pause.surrender(&rt).is_err());
+    assert!(*rt.desktop_shutdown.lock().unwrap());
+}

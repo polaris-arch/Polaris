@@ -626,7 +626,7 @@ impl ProxyRuntime {
         // publication are one synchronous section. A later pending producer wins before
         // any spawn, while a Stop that claimed first cannot be undone by queued dispatch.
         let (explicit_generation, requested_generation) = {
-            let _normal_claim_guard = if let Some(claim) = completion {
+            let _normal_claim_guard = {
                 let guard = match self.normal_start.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -638,12 +638,15 @@ impl ProxyRuntime {
                         )
                     }
                 };
-                if !claim.owns(guard.as_ref()) || self.gate.generation() != claim.expected {
+                if let Err(error) = guard.assert_unpaused() {
+                    return StartLeg::Finished(Err(StartError::from(error)), None);
+                }
+                if completion.is_some_and(|claim| {
+                    !claim.owns(guard.as_ref()) || self.gate.generation() != claim.expected
+                }) {
                     return StartLeg::Superseded;
                 }
-                Some(guard)
-            } else {
-                None
+                guard
             };
             // Explicit starts take ownership before their first await. This preserves the order of
             // two start requests (the later one wins), and lets a later stop supersede an earlier
@@ -755,6 +758,14 @@ impl ProxyRuntime {
         if self.gate.generation() != requested_generation {
             return StartLeg::Superseded;
         }
+        if let Err(error) = self
+            .normal_start
+            .lock()
+            .map_err(|_| "Main admission poisoned".to_owned())
+            .and_then(|starts| starts.assert_unpaused())
+        {
+            return StartLeg::Finished(Err(StartError::from(error)), None);
+        }
         // Another start can install a Child while this request awaits the TS
         // gate. Recheck custody before stale sweeping, deferred deletion, or
         // start_inner's sidecar preflight. The gate stays held through spawn.
@@ -795,7 +806,7 @@ impl ProxyRuntime {
             }
             generation
         } else {
-            let _normal_claim_guard = if let Some(claim) = completion {
+            let _normal_claim_guard = {
                 let guard = match self.normal_start.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -807,12 +818,13 @@ impl ProxyRuntime {
                         )
                     }
                 };
-                if !claim.owns(guard.as_ref()) {
+                if let Err(error) = guard.assert_unpaused() {
+                    return StartLeg::Finished(Err(StartError::from(error)), None);
+                }
+                if completion.is_some_and(|claim| !claim.owns(guard.as_ref())) {
                     return StartLeg::Superseded;
                 }
-                Some(guard)
-            } else {
-                None
+                guard
             };
             let _crash = self.crash_lock();
             let closing = match self.desktop_shutdown.lock() {
@@ -1309,7 +1321,20 @@ impl ProxyRuntime {
         config: Value,
         claim: StopClaim<'_>,
     ) -> RestartLeg {
-        let leg = self.restart_inner(config, claim).await;
+        let claimed = match &claim {
+            StopClaim::AlreadyClaimed(generation)
+            | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+            StopClaim::Request(_) => None,
+        };
+        let leg = match self.restart_dispatch(claimed) {
+            Ok(producer) => {
+                let leg = self.restart_inner(config, claim).await;
+                producer.finish_dispatch();
+                self.prune_normal_producers();
+                leg
+            }
+            Err(error) => RestartLeg::Finished(Err(error), claimed),
+        };
         // finish 恒执行。最新 owner 若为 Stop，旧 restart 归零时须按停止终态丢弃 pending；
         // 若为新显式 Start，则保留其 pending 排空。判定与 end 在 gate 同一把锁内。
         match leg {
@@ -1352,6 +1377,18 @@ impl ProxyRuntime {
         let claim = if cfg!(target_os = "android") {
             claim
         } else {
+            let starts = match self.normal_start.lock() {
+                Ok(starts) => starts,
+                Err(_) => {
+                    return RestartLeg::Finished(
+                        Err(StartError::from("Main admission poisoned".to_owned())),
+                        None,
+                    )
+                }
+            };
+            if let Err(error) = starts.assert_unpaused() {
+                return RestartLeg::Finished(Err(StartError::from(error)), None);
+            }
             let _crash = self.crash_lock();
             let closing = match self.desktop_shutdown.lock() {
                 Ok(closing) => closing,
@@ -1555,6 +1592,7 @@ impl ProxyRuntime {
                                     Some(c) => c,
                                     None => {
                                         log::warn!("去抖重启：无可用配置 → 放弃");
+                                        me.finish_preclaimed_restart(claimed_generation);
                                         me.apply_lifecycle_end(
                                             me.gate.end_restart_after(Some(claimed_generation)),
                                             LifecycleKind::Restart,
@@ -1585,6 +1623,9 @@ impl ProxyRuntime {
         scheduled_generation: u64,
         ticket: u64,
     ) -> Option<(Option<Value>, u64, Option<LegacyStartLease>)> {
+        let mut starts = self.normal_start.lock().ok()?;
+        starts.assert_unpaused().ok()?;
+        polaris_core_supervisor::config_gate::assert_check_producer_registration().ok()?;
         // Keep exit admission and the generation claim indivisible. A late timer must
         // never supersede the shutdown generation, even if it passed an earlier check.
         let _admission = if cfg!(target_os = "android") {
@@ -1634,6 +1675,11 @@ impl ProxyRuntime {
             let generation = self
                 .gate
                 .try_begin_restart(scheduled_generation, force_id)?;
+            starts.book_restart(
+                Arc::clone(&self.stop_domain),
+                scheduled_generation,
+                Some(generation),
+            );
             self.gen_changed.notify_waiters();
             if force_id.is_some() {
                 *pending = None;

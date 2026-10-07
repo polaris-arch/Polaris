@@ -3484,6 +3484,35 @@ impl ProxyRuntime {
         true
     }
 
+    /// Capture the ordinary startup value inputs once for an unpublished
+    /// candidate. Port numbers are probes, not reservations. This method does
+    /// not start a sidecar, write rules, generate twice or invoke a kernel gate.
+    pub(super) fn generate_candidate_deps(
+        &self,
+        config: &UserConfig,
+        raw: &Value,
+    ) -> Result<GenerateConfigDeps, String> {
+        let control_port = control_api_port(config);
+        let ports = self.resolve_start_ports(config, control_port)?;
+        let mut deps = self.generate_deps(
+            ports.api,
+            ports.update_in,
+            ports.subscription_update_in,
+            ports.probe_proxy,
+            &ports.probe_pool,
+            raw,
+            false,
+        );
+        deps.network_canary_port = self.resolve_network_canary_port(
+            config,
+            control_port,
+            ports.api,
+            ports.update_in,
+            ports.subscription_update_in,
+        );
+        Ok(deps)
+    }
+
     /// 装配 [`GenerateConfigDeps`]（上游侧所有 `this.*` 实例态的真值注入）。
     ///
     /// **边界（未接线的轴一律取保守值，非静默省略）**：

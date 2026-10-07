@@ -204,94 +204,42 @@ mod linux {
         Ok((File::from(high_fd), opened))
     }
 
-    async fn reap_after_kill(child: &mut tokio::process::Child) -> Result<(), CandidateCheckError> {
-        let _ = child.start_kill();
-        // Even if kill reports that the process already exited, wait owns the
-        // status and reaps it. No successful check can flow through this path.
-        match child.wait().await {
-            Ok(_) => Ok(()),
-            Err(_) if child.try_wait().ok().flatten().is_some() => Ok(()),
-            Err(_) => Err(CandidateCheckError::CleanupUncertain),
-        }
-    }
-
     pub(super) async fn run_check(
         binary: File,
         config: File,
         timeout: Duration,
     ) -> Result<(), CandidateCheckError> {
         let binary_path = format!("/proc/self/fd/{}", binary.as_raw_fd());
-        // Atomic CLOEXEC duplication matters while unrelated app children may
-        // spawn concurrently; only Command's fd-0 mapping becomes inheritable.
-        let child_stdin = rustix::io::fcntl_dupfd_cloexec(&config, 3)
-            .map(File::from)
-            .map_err(|_| CandidateCheckError::Unsupported)?;
         let mut command = Command::new(binary_path);
         command
             .args(["--disable-color", "check", "-c", "/proc/self/fd/0"])
             .env_clear()
             .current_dir("/")
-            .stdin(Stdio::from(child_stdin))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         supervise(command, binary, config, timeout, None).await
     }
 
-    /// The sole asynchronous owner of the check Child and both sealed files.
-    /// The optional PID notification is used only by cancellation tests; it
-    /// never changes the production check profile or returns readiness.
+    /// The original central CheckCustody owns the Child and sealed files. The
+    /// optional notification is diagnostic only; it never grants readiness.
     pub(super) async fn supervise(
-        mut command: Command,
+        command: Command,
         binary: File,
         config: File,
         timeout: Duration,
         spawned: Option<oneshot::Sender<u32>>,
     ) -> Result<(), CandidateCheckError> {
-        command.kill_on_drop(true);
-        // The detached owner retains both sealed images and the Child even if
-        // its caller is cancelled. A dropped receiver requests kill+reap.
-        let (mut tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let _binary = binary;
-            let _config = config;
-            if tx.is_closed() {
-                return;
+        use polaris_core_supervisor::config_gate::{supervise_owned_sealed_check, RawCheck};
+        match supervise_owned_sealed_check(command, binary, config, timeout, spawned).await {
+            Ok(RawCheck::Done { success: true, .. }) => Ok(()),
+            Ok(RawCheck::Done { .. } | RawCheck::OutputFailed(_)) => {
+                Err(CandidateCheckError::CheckFailed)
             }
-            let mut child = match command.spawn() {
-                Ok(child) => child,
-                Err(_) => {
-                    let _ = tx.send(Err(CandidateCheckError::Unsupported));
-                    return;
-                }
-            };
-            if let (Some(notify), Some(pid)) = (spawned, child.id()) {
-                let _ = notify.send(pid);
-            }
-            let result = tokio::select! {
-                biased;
-                _ = tx.closed() => {
-                    match reap_after_kill(&mut child).await {
-                        Ok(()) => Err(CandidateCheckError::CheckFailed),
-                        Err(error) => Err(error),
-                    }
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    match reap_after_kill(&mut child).await {
-                        Ok(()) => Err(CandidateCheckError::TimedOut),
-                        Err(error) => Err(error),
-                    }
-                }
-                status = child.wait() => {
-                    match status {
-                        Ok(status) if status.success() => Ok(()),
-                        _ => Err(CandidateCheckError::CheckFailed),
-                    }
-                }
-            };
-            let _ = tx.send(result);
-        });
-        rx.await.unwrap_or(Err(CandidateCheckError::CheckFailed))
+            Ok(RawCheck::TimedOut { .. }) => Err(CandidateCheckError::TimedOut),
+            Ok(RawCheck::SpawnFailed(_)) => Err(CandidateCheckError::Unsupported),
+            Err(_) => Err(CandidateCheckError::CleanupUncertain),
+        }
     }
 
     pub(super) async fn check(

@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::decoy::DecoySet;
 use crate::query::MAX_DNS_UDP_BYTES;
@@ -75,7 +75,7 @@ fn set_socket(slot: &SockSlot, sock: Option<Arc<UdpSocket>>) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = sock;
 }
 
-/// 运行中的竞速 sidecar 句柄。`drop` 即停（不留孤儿 socket / 任务）。
+/// 运行中的竞速 sidecar 句柄。`drop` 请求停止；实际任务返回须由 [`Self::stop_and_join`] 观察。
 pub struct NodeDnsRaceServer {
     /// 首次绑到的端口 —— **烧进 sing-box config 的就是它**，运行期恒定不变。
     port: u16,
@@ -89,7 +89,31 @@ pub struct NodeDnsRaceServer {
     /// 调用方注册的死亡回调（与 watchdog 手里那份是同一只）。句柄上留一份**只为自证接线**，
     /// 见 [`Self::dead_callback`]；运行期的触发权仍只在 watchdog。
     on_dead: Option<OnRaceServerDead>,
-    task: JoinHandle<()>,
+    stop_signal: Arc<Notify>,
+    task: AsyncMutex<ServeTask>,
+}
+
+/// 原收发任务或其原 query 子任务没有正常返回，不能把停止请求当作成功 drain。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRaceDrainError {
+    QueryTask(String),
+    ServeTask(String),
+}
+
+impl std::fmt::Display for DnsRaceDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryTask(error) => write!(f, "DNS query task: {error}"),
+            Self::ServeTask(error) => write!(f, "DNS serve task: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DnsRaceDrainError {}
+
+struct ServeTask {
+    handle: Option<JoinHandle<Result<(), DnsRaceDrainError>>>,
+    completion: Option<Result<(), DnsRaceDrainError>>,
 }
 
 /// 手写 `Debug`：`on_dead` 是 `dyn Fn` 无法 derive，且回调本体也不该进日志 —— 只暴露「装没装」。
@@ -143,6 +167,7 @@ impl NodeDnsRaceServer {
         let port = sock.local_addr()?.port();
         let live_port = Arc::new(AtomicU16::new(port));
         let closing = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(Notify::new());
         let slot: SockSlot = Arc::new(Mutex::new(Some(sock)));
         let task = tokio::spawn(serve(ServeCtx {
             slot: Arc::clone(&slot),
@@ -152,6 +177,7 @@ impl NodeDnsRaceServer {
             limiter: Arc::new(Semaphore::new(max_inflight)),
             dropped: AtomicU64::new(0),
             decoys,
+            stop_signal: Arc::clone(&stop_signal),
             watchdog: Watchdog {
                 port,
                 live_port: Arc::clone(&live_port),
@@ -166,7 +192,11 @@ impl NodeDnsRaceServer {
             closing,
             slot,
             on_dead,
-            task,
+            stop_signal,
+            task: AsyncMutex::new(ServeTask {
+                handle: Some(task),
+                completion: None,
+            }),
         })
     }
 
@@ -197,13 +227,35 @@ impl NodeDnsRaceServer {
         self.on_dead.clone()
     }
 
-    /// 主动停止（幂等）。置 `closing` 让 watchdog 不复活，**清空 socket 槽**（端口即刻释放，不必等
-    /// 在飞回包腿收尾），再 abort 收发任务。
+    /// 主动请求停止（幂等）。清空 socket 槽并唤醒原收发任务；在飞 query 仍由原任务收口。
+    /// 此同步方法不证明任务已经返回。
     pub fn stop(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.live_port.store(0, Ordering::SeqCst);
         set_socket(&self.slot, None);
-        self.task.abort();
+        self.stop_signal.notify_one();
+    }
+
+    /// 观察原收发任务及全部已接纳 query 的实际返回。
+    /// 取消本次 await 不移走 handle；后继调用继续 join 同一只任务。
+    pub async fn stop_and_join(&self) -> Result<(), DnsRaceDrainError> {
+        self.stop();
+        let mut task = self.task.lock().await;
+        if let Some(completion) = &task.completion {
+            return completion.clone();
+        }
+        let completion = match task.handle.as_mut() {
+            Some(handle) => match handle.await {
+                Ok(completion) => completion,
+                Err(error) => Err(DnsRaceDrainError::ServeTask(error.to_string())),
+            },
+            None => Err(DnsRaceDrainError::ServeTask(
+                "missing original task".to_owned(),
+            )),
+        };
+        task.handle = None;
+        task.completion = Some(completion.clone());
+        completion
     }
 }
 
@@ -292,6 +344,7 @@ struct ServeCtx {
     /// POISONED 判定用的 decoy 段集（调用方注入，默认内置；见 [`DecoySet`] 模块文档）。
     /// `Arc` 而非按值：每个在飞 query 腿都要借它，克隆 Vec 会按包数放大。
     decoys: Arc<DecoySet>,
+    stop_signal: Arc<Notify>,
     watchdog: Watchdog,
 }
 
@@ -300,18 +353,32 @@ struct ServeCtx {
 /// 外层每轮 = 「一只活着的 socket 的生命周期」；内层跑正常收发，遇非瞬态错即跳出去走重建腿。
 /// 这么分层是为了让「旧 socket 的最后一份引用在 bind 之前离开作用域」成为结构性事实：
 /// `sock` 是内层循环唯一持有者，跳出内层后被交给 [`Watchdog::recover`] 消耗掉。
-async fn serve(ctx: ServeCtx) {
+async fn serve(ctx: ServeCtx) -> Result<(), DnsRaceDrainError> {
     let mut buf = vec![0u8; MAX_DNS_UDP_BYTES];
-    loop {
+    let mut queries = JoinSet::new();
+    let mut query_error = None;
+    'serving: loop {
         if ctx.watchdog.closing.load(Ordering::SeqCst) {
-            return;
+            break;
         }
         let Some(sock) = current_socket(&ctx.slot) else {
-            return; // 槽被 stop 清空 = 已停
+            break; // 槽被 stop 清空 = 已停
         };
         let hard_err = loop {
-            match sock.recv_from(&mut buf).await {
+            let received = tokio::select! {
+                biased;
+                _ = ctx.stop_signal.notified() => break 'serving,
+                joined = queries.join_next(), if !queries.is_empty() => {
+                    record_query_return(joined, &mut query_error);
+                    continue;
+                }
+                received = sock.recv_from(&mut buf) => received,
+            };
+            match received {
                 Ok((n, peer)) => {
+                    if ctx.watchdog.closing.load(Ordering::SeqCst) {
+                        break 'serving;
+                    }
                     // 在飞封顶：拿不到令牌就丢弃本包（内核会自然重试），**绝不**放行到上游齐射。
                     let Ok(permit) = Arc::clone(&ctx.limiter).try_acquire_owned() else {
                         let seen = ctx.dropped.fetch_add(1, Ordering::Relaxed);
@@ -327,7 +394,7 @@ async fn serve(ctx: ServeCtx) {
                     let msg = buf[..n].to_vec();
                     // 每个 query 独立任务：一个慢上游不得阻塞后续 query 的收取
                     // （内核会并发问多个节点域名，串行化 = 竞速优势被自己吃掉）。
-                    tokio::spawn(handle_one(
+                    queries.spawn(handle_one(
                         permit,
                         Arc::clone(&ctx.slot),
                         msg,
@@ -342,7 +409,7 @@ async fn serve(ctx: ServeCtx) {
                 }
                 Err(e) if ctx.watchdog.closing.load(Ordering::SeqCst) => {
                     log::debug!("[dns-race] 停止中的 socket 错误，忽略: {e}");
-                    return;
+                    break 'serving;
                 }
                 Err(e) if is_transient_recv_error(&e) => {
                     log::debug!("[dns-race] 瞬态收包错误，继续: {e}");
@@ -354,9 +421,30 @@ async fn serve(ctx: ServeCtx) {
             "[dns-race] socket 故障，尝试按原端口 {} 重建: {hard_err}",
             ctx.watchdog.port
         );
-        if ctx.watchdog.recover(&ctx.slot, sock).await.is_none() {
-            return;
+        let recovered = tokio::select! {
+            biased;
+            _ = ctx.stop_signal.notified() => None,
+            recovered = ctx.watchdog.recover(&ctx.slot, sock) => recovered,
+        };
+        if recovered.is_none() {
+            break;
         }
+    }
+    // stop 可能与 watchdog 本轮 bind 交错；收发任务退出后不再有 producer 能回填槽。
+    set_socket(&ctx.slot, None);
+    ctx.watchdog.live_port.store(0, Ordering::SeqCst);
+    while let Some(joined) = queries.join_next().await {
+        record_query_return(Some(joined), &mut query_error);
+    }
+    query_error.map_or(Ok(()), Err)
+}
+
+fn record_query_return(
+    joined: Option<Result<(), tokio::task::JoinError>>,
+    error: &mut Option<DnsRaceDrainError>,
+) {
+    if let Some(Err(join_error)) = joined {
+        error.get_or_insert_with(|| DnsRaceDrainError::QueryTask(join_error.to_string()));
     }
 }
 

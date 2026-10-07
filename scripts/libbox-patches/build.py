@@ -36,6 +36,16 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def libbox_test_tags(manifest, optional=''):
+    # Explicit libbox tests construct real Tailscale endpoints through include.
+    # Keep this host registry capability separate from SDK/native feature tags.
+    required = [tag for tag in manifest['buildTags'] if tag == 'with_tailscale']
+    require(required == ['with_tailscale'], 'Host libbox tests require the pinned Tailscale registry capability')
+    require(optional in ('', 'with_ccm', 'with_ocm', 'with_ccm,with_ocm'),
+            'Unknown optional registry test profile')
+    return ','.join(required + (optional.split(',') if optional else []))
+
+
 def elf_loads(data):
     require(data[:4] == b'\x7fELF' and data[5] == 1, 'Expected little-endian ELF')
     is64 = data[4] == 2
@@ -227,6 +237,7 @@ def main():
         for expression in re.findall(r'(?m)^\s*sharedTags = append\(sharedTags, ([^\n]+)\)', tag_source):
             upstream_tags.extend(re.findall(r'"([^"\n]+)"', expression))
         require(upstream_tags == manifest['buildTags'], 'Android feature tags differ from upstream source')
+        host_tags = libbox_test_tags(manifest)
         # Test the patched close chain as real package behavior before binding.
         # The libbox tests remain explicit because unrelated upstream tests may
         # require extra modules outside this pinned offline build.
@@ -236,8 +247,8 @@ def main():
              './common/certificate', './log', './route', './dns', './service/api',
              './service/ssmapi', './service/ccm', './service/ocm'], cwd=checkout, env=env)
         run([str(go), 'test', '-race', '-count=1', './experimental/clashmode'], cwd=checkout, env=env)
-        files = run([str(go), 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-        run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', *files,
+        files = run([str(go), 'list', '-tags', host_tags, '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
+        run([str(go), 'test', '-tags', host_tags, '-race', '-ldflags=-checklinkname=0', '-count=1', *files,
              str(checkout / 'experimental/libbox/command_server_transient_test.go'),
              str(checkout / 'experimental/libbox/interface_binding_test.go'),
              str(checkout / 'experimental/libbox/config_validation_test.go'),
@@ -247,7 +258,8 @@ def main():
              str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')], cwd=checkout, env=env)
         # Optional registry services must preserve existing usage files with
         # either tag independently and with both real implementations present.
-        for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
+        for optional in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
+            tags = libbox_test_tags(manifest, optional)
             tagged_files = run([str(go), 'list', '-tags', tags, '-f',
                                 '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}',
                                 './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
@@ -256,7 +268,7 @@ def main():
                             str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
                             str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go'),
                             str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')]
-            if tags == 'with_ccm,with_ocm':
+            if optional == 'with_ccm,with_ocm':
                 tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
             run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',
                  '-count=1', *tagged_files, *tagged_tests], cwd=checkout, env=env)

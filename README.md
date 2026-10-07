@@ -81,9 +81,10 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 node scripts/fetch-core.mjs        # 拉 sing-box 内核（SHA256 钉扎）
 node scripts/fetch-cronet.mjs --platform=linux  # 拉与 Linux 核同目录的 libcronet.so
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 内核不入库，打包前必须拉。平台 `--config` 不可省：缺了会打出**没有内核的包**，且构建期零报错，

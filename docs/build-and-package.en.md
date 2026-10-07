@@ -19,7 +19,14 @@ Implementation lands in batches per system design §H (B0 scaffolding → B10 re
 | Rust | stable (edition 2021) | Backend + 18 domain crates under `crates/` (plus `source-probe`, which is dev-only: it appears solely in `[dev-dependencies]` and never in a lib/bin dependency graph) |
 | Node.js | 24+ (CI pins 26) | Frontend build + fetch scripts |
 | pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`) |
-| [Tauri CLI 2](https://v2.tauri.app/) | 2.x | `cargo tauri build` packaging (installed as a `ui/` devDependency) |
+| [Tauri CLI 2](https://v2.tauri.app/) | Pinned by `scripts/tauri-cli.version` | `tauri build` packaging with the global CLI |
+
+Install the global CLI from the repository root. The CLI is no longer a `ui/` devDependency; desktop and Android CI install the same pinned version.
+
+```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+tauri --version
+```
 
 ### System dependencies
 
@@ -80,7 +87,7 @@ node scripts/fetch-dashboard.mjs  # sing-box dashboard (gh-pages artifact)
 
 Use `node scripts/fetch-cronet.mjs --platform=linux` or `--platform=win` to fetch only the current packaging leg. Versions are always resolved from the `go.mod` of the sing-box tag named by `bundledCoreVersion`; Linux and Windows may use their respective upstream `require` versions. `--check-only` downloads no library, but verifies that the tag is readable, both exact requires exist, and both SHA-256 pins are complete and well-formed.
 
-All three commands above must be run manually: `tauri.conf.json` has **no** `build.beforeBundleCommand`, so `cargo tauri build` does not fetch anything for you. (This section previously described a `beforeBundleCommand` safety net; that key never existed, which made `scripts/verify-dashboard-resources.mjs` an orphan that never ran. The script has been deleted.)
+All three commands above must be run manually: `tauri.conf.json` has **no** `build.beforeBundleCommand`, so `tauri build` does not fetch anything for you. (This section previously described a `beforeBundleCommand` safety net; that key never existed, which made `scripts/verify-dashboard-resources.mjs` an orphan that never ran. The script has been deleted.)
 
 The safety net is now `node scripts/verify-packaging.mjs confs`, which CI runs after the fetch steps and before the Rust build (`.github/workflows/package.yml`). It asserts that every resource path referenced by a conf exists **and has content**: empty directories and zero-byte files both fail the check (existence is not content; a failed fetch or extraction typically leaves exactly those two shapes). It is pure static analysis with no build dependency, so any developer machine can reproduce it.
 
@@ -92,10 +99,10 @@ When upgrading the core, first update `bundledCoreVersion` and its `coreArchiveS
 # 1) Fetch assets (see above)
 # 2) Frontend build + Rust compile + installer (Tauri CLI orchestrates beforeBuildCommand)
 #    Run from the **repository root** and pass this platform's config explicitly (see "Per-platform core filtering")
-cargo tauri build --config src-tauri/tauri.linux.conf.json          # Linux
-cargo tauri build --config src-tauri/tauri.windows.conf.json        # Windows
-cargo tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
-cargo tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
+tauri build --config src-tauri/tauri.linux.conf.json          # Linux
+tauri build --config src-tauri/tauri.windows.conf.json        # Windows
+tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
+tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
 ```
 
 Artifacts land in `target/release/bundle/` at the **repository root** (this repo is a cargo workspace whose root is the repository root, so **not** `src-tauri/target/`). When `--target <triple>` is passed, they go one level deeper: `target/<triple>/release/bundle/`.
@@ -107,9 +114,9 @@ Artifacts land in `target/release/bundle/` at the **repository root** (this repo
 | Windows | `*-win-setup.exe` | NSIS installer (WebView2 downloadBootstrapper, Runtime not embedded) |
 | Windows | `polaris-portable-*.zip` | Portable build (extract and run; ships its own `resources/` plus a `portable.marker` form marker) |
 
-The portable zip is produced by the Windows leg of `package.yml` from `target/release/polaris.exe` plus `resources/`; running the `cargo tauri build` command above locally does not produce it.
+The portable zip is produced by the Windows leg of `package.yml` from `target/release/polaris.exe` plus `resources/`; running the `tauri build` command above locally does not produce it.
 
-⚠️ **The dmg row is the same story with a different cause**: the `-mac-arm64` / `-mac-x64` arch tag is not produced by Tauri. The `Tag macOS dmg with arch` step in `package.yml` renames `<name>.dmg` to `<name>-<tag>.dmg`, and that step only runs in CI. **Running `cargo tauri build` locally gives you a dmg with Tauri's default name, without the tag.** That tag is a hard requirement of the updater's package-selection contract: `github.rs::find_suitable_update_asset` picks the package by looking for `mac-arm64` / `mac-x64` in the asset name and returns `None` when nothing matches (the "any .dmg" fallback has been removed).
+⚠️ **The dmg row is the same story with a different cause**: the `-mac-arm64` / `-mac-x64` arch tag is not produced by Tauri. The `Tag macOS dmg with arch` step in `package.yml` renames `<name>.dmg` to `<name>-<tag>.dmg`, and that step only runs in CI. **Running `tauri build` locally gives you a dmg with Tauri's default name, without the tag.** That tag is a hard requirement of the updater's package-selection contract: `github.rs::find_suitable_update_asset` picks the package by looking for `mac-arm64` / `mac-x64` in the asset name and returns `None` when nothing matches (the "any .dmg" fallback has been removed).
 
 A release contains **exactly one** each of deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip (six platform deliverables in total, plus `SHA256SUMS`), enforced mechanically by `verify-packaging.mjs assets --label release`.
 The two Linux forms are likewise "exactly one", not "at least one": the updater's Linux branch takes the first match (`app_image.first()` / `deb.first()` in `github.rs`), so a duplicate makes the choice depend on asset ordering, exactly as with dmg / setup.
@@ -121,7 +128,7 @@ The two Linux forms are likewise "exactly one", not "at least one": the updater'
 - Bundling all four cores would add roughly 210 MB of dead weight to every package (at runtime only one is selected, by `env::consts::OS/ARCH`).
 - Merging follows RFC 7396, where **arrays are replaced wholesale rather than merged**, so any shared resource added to the base config must be mirrored into all four files — otherwise all four packages silently lose it.
 - **Do not rely on Tauri's implicit per-platform-name merging**: implicit merging only recognizes fixed file names, so renaming a file silently stops the merge. The package then ships without a core, the bundler still succeeds, and the failure only surfaces on the user's machine as `resolve_core_binary → Err`. With an explicit `--config`, the same rename produces a hard `failed to read configuration file`.
-  (The macOS file was originally named `tauri.macos.conf.json`, which would be merged implicitly even though it is arm64-specific — meaning a bare `cargo tauri build` on an Intel Mac would bundle the arm64 core. It has been renamed to `tauri.macos-arm64.conf.json` to remove that implicit default.)
+  (The macOS file was originally named `tauri.macos.conf.json`, which would be merged implicitly even though it is arm64-specific — meaning a bare `tauri build` on an Intel Mac would bundle the arm64 core. It has been renamed to `tauri.macos-arm64.conf.json` to remove that implicit default.)
 
 These invariants are enforced mechanically by `node scripts/verify-packaging.mjs confs` (run in CI before every packaging job, reproducible locally). After the build, the `payload` and `assets` modes assert that the artifact contains exactly one core for its own platform and that the artifact name satisfies the updater's package-selection contract.
 

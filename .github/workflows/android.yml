@@ -7,7 +7,7 @@ name: Android
 # 面 A（本机实测的构建面，见 `polaris-android-first-apk-2026-09-04.md`）：
 #   NDK 交叉编译 aarch64-linux-android → JDK 21 跑 AGP 8.11 → gradle assemble；
 #   `libbox.aar` 117 MiB 且 **gitignored**，须由固定 Go/gomobile/JDK/NDK 与 sing-box 源码现建；
-#   Android 构建由 scripts/build-android-apk.sh 统一选择 Rust NDK 并调用仓内 Tauri CLI。
+#   Android 构建由 scripts/build-android-apk.sh 统一选择 Rust NDK 并调用全局 Tauri CLI。
 # 面 B（GitHub runner 能给什么）：
 #   预装 Android SDK / cmdline-tools / 多版本 JDK / Go；NDK 预装但版本随镜像漂；
 #   `actions/cache` 按「内核版本 × builder/manifest/patch 哈希」缓存 AAR 与构建收据。
@@ -164,6 +164,14 @@ jobs:
       - name: Install UI dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile
+
+      - name: Install global Tauri CLI (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat scripts/tauri-cli.version)"
+          npm install -g "@tauri-apps/cli@$version"
+          [ "$(tauri --version)" = "tauri-cli $version" ]
 
       - name: Install Rust stable + android target
         shell: bash
@@ -599,6 +607,14 @@ jobs:
       - name: Install UI dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile
+
+      - name: Install global Tauri CLI (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat scripts/tauri-cli.version)"
+          npm install -g "@tauri-apps/cli@$version"
+          [ "$(tauri --version)" = "tauri-cli $version" ]
 
       - name: Install Rust stable + android target
         shell: bash

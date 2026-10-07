@@ -90,9 +90,10 @@ xattr -cr /Applications/Polaris.app
 </div>
 
 ```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 node scripts/fetch-core.mjs        # دریافت هسته sing-box (قفل‌شده با SHA256)
 node scripts/fetch-cronet.mjs      # دریافت libcronet
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 <div dir="rtl">

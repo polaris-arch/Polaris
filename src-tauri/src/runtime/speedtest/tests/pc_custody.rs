@@ -1482,3 +1482,81 @@ async fn central_admission_rejection_is_pre_factory_no_child_in_isolated_worker(
     assert!(!birth.config_path.exists());
     cleanup(&h.dir);
 }
+
+#[tokio::test]
+async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
+    const MARKER: &str = "POLARIS_F1_TEMP_WAITER_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let test = format!(
+            "{}::f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    let ports = Arc::new(AtomicUsize::new(0));
+    h.deps.allocate_ports = {
+        let calls = Arc::clone(&ports);
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            vec![20001, 20002, 20003]
+        })
+    };
+    let admission = h.deps.pc_custody.admission.lock().await;
+    let nodes = three_nodes();
+    let mut emit = |_: &str, _: Value| {};
+    let future = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |_| std::future::ready(Some(1)),
+        &mut emit,
+    );
+    tokio::pin!(future);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let pause = polaris_core_supervisor::config_gate::pause_check_producers().unwrap();
+    drop(admission);
+    assert!(matches!(future.await, TempCoreOutcome::CleanupUnknown(_)));
+    assert_eq!(ports.load(Ordering::SeqCst), 0);
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    assert!(h.deps.pc_custody.producers.lock().unwrap().is_empty());
+    pause.surrender().unwrap();
+    assert!(matches!(
+        TempCoreSession::run(
+            &h.deps,
+            &nodes,
+            &|| false,
+            |_| std::future::ready(Some(1)),
+            &mut |_, _| {}
+        )
+        .await,
+        TempCoreOutcome::Ran { .. }
+    ));
+    let view = h.deps.pc_custody.producer_view().unwrap();
+    assert!(
+        view.member_count() >= 2,
+        "original admitted producer and retired native-only birth remain visible"
+    );
+    assert!(
+        view.births.iter().all(|birth| birth.native.is_none()),
+        "ordinary mock close cannot mint native proof"
+    );
+    view.verify_surrender().unwrap();
+    cleanup(&h.dir);
+}

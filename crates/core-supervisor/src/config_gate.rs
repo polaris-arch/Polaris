@@ -55,9 +55,12 @@ use std::path::Path;
 use std::time::Duration;
 
 mod check_custody;
+#[cfg(target_os = "linux")]
+pub use check_custody::supervise_owned_sealed_check;
 pub use check_custody::{
-    assert_check_admission, begin_check_shutdown, settle_check_cleanup, shutdown_checks_for_exit,
-    with_check_admission, ValidationLifecycleError,
+    assert_check_admission, assert_check_producer_registration, begin_check_shutdown,
+    pause_check_producers, settle_check_cleanup, shutdown_checks_for_exit, with_check_admission,
+    with_check_producer_registration, AdmissionPause, CheckProducerView, ValidationLifecycleError,
 };
 
 /// 单次 `sing-box check` 的超时。

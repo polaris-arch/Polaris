@@ -15,14 +15,15 @@ next to this file as LICENSE.
   - 桌面 sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
         （代理内核，以独立 sidecar 子进程运行）
-        桌面源码修复构建：1.15.0-alpha.8.polaris.2（Linux、Windows、macOS x64 / arm64）
+        桌面源码修复构建：1.15.0-alpha.8.polaris.3（Linux、Windows、macOS x64 / arm64）
         固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
-        共同 source manifest SHA-256：1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a
-        共享补丁与依赖源码指引：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
-        固定共享补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/libbox-patches
-        Windows 修复构建：1.15.0-alpha.8.polaris.2（共同修复加 DNS-only 变更缓存刷新）
+        共同 source manifest SHA-256：a556cacbdf5a55f342604ceb82fdf40ab7df1d6bdf3f79239e8ba4eba33ec897
+        共享补丁与依赖源码获取位置（动态 main；按共同 manifest 与补丁摘要核对）：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
+        已发布共享补丁基线（不含本轮 G1 增量）：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/libbox-patches
+        当前构建以随仓 manifest、9+2 补丁摘要与实际 source/build tree 锁定；最终固定提交由外部来源收据提供。
+        Windows 修复构建：1.15.0-alpha.8.polaris.3（共同修复加 DNS-only 变更缓存刷新）
         Windows 附加补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
-        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/core-patches
+        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/core-patches
         构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8

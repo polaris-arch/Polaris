@@ -59,7 +59,7 @@
     },
     {
       "file": "construction-validation.patch",
-      "sha256": "6730a5d42eca14543719418ff75361e808af12d01792e196837d8bad669d67ae"
+      "sha256": "b38b7b7665f4f545382437fefe893790cd0e2cb747c5084f1dfdc5e84c14b9e0"
     },
     {
       "file": "dns-cancellation-lifecycle.patch",
