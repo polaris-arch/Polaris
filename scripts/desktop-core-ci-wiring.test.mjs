@@ -49,6 +49,8 @@ function bundles(source) {
   const assemble = job(source['desktop-core'], 'assemble');
   const preflight = job(source['release-risk'], 'preflight');
   const packageJob = job(source.package, 'package');
+  // The host-independent wire gate consumes the same exact bundle in its own job.
+  const wireJob = job(source.package, 'core_wire');
   assert.match(producer, /name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.platform \}\}/);
   assert.match(producer, /path: \$\{\{ runner.temp \}\}\/desktop-core-bundle\n/, 'upload bundle root retains platform directories');
   assert.match(assemble, /needs: produce/);
@@ -60,7 +62,7 @@ function bundles(source) {
   assert.match(source['desktop-core'], /CORE_RUN_ID: \$\{\{ github.run_id \}\}/);
   assert.match(source['desktop-core'], /CORE_RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}/);
   assert.match(assemble, /name: \$\{\{ steps.bundle.outputs.artifact_name \}\}/);
-  for (const body of [assemble, preflight, packageJob]) {
+  for (const body of [assemble, preflight, packageJob, wireJob]) {
     assert.match(body, /actions\/download-artifact@v8/);
     assert.doesNotMatch(body, /^\s+(?:run-id|github-token|repository):/m, 'artifact download must remain within this run');
     assert.match(body, /go-version: \$\{\{ steps.(?:go-pin|core-go).outputs.version \}\}/);
@@ -79,28 +81,43 @@ function bundles(source) {
   assert.match(job(source.package, 'setup'), /CORE_RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}/);
   assert.match(packageJob, /CORE_BUNDLE_ARTIFACT: \$\{\{ inputs.core_bundle_artifact \|\| needs.desktop_core.outputs.artifact_name \}\}/);
   assert.match(packageJob, /name: \$\{\{ env.CORE_BUNDLE_ARTIFACT \}\}/);
+  assert.match(wireJob, /CORE_BUNDLE_ARTIFACT: \$\{\{ inputs.core_bundle_artifact \|\| needs.desktop_core.outputs.artifact_name \}\}/);
+  assert.match(wireJob, /name: \$\{\{ env.CORE_BUNDLE_ARTIFACT \}\}/);
+  assert.match(wireJob, /ref: \$\{\{ needs.setup.outputs.candidate \}\}/);
+  assert.match(wireJob, /CORE_CANDIDATE: \$\{\{ needs.setup.outputs.candidate \}\}/);
   const fetch = packageFetchStep(source.package);
   assert.match(fetch, /^        shell: bash$/m, 'Windows consumption must expand the declared environment with Bash');
   assert.match(fetch, /^        run: node scripts\/fetch-core.mjs --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"$/m);
 }
-function packageAllows(source, setup, core, provided) {
-  const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, 'package'));
-  assert.ok(block, 'package needs explicit reusable-source skip allowlist');
+// `always` is deliberately not supplied: an expression that still calls always()
+// throws here. always() keeps an in-flight installer leg alive after its run is
+// cancelled (GitHub re-evaluates `if` on cancellation), which is what made a
+// superseded Release Risk run hold its concurrency group to the end.
+function jobAllows(source, name, setup, core, provided, runCancelled = false) {
+  const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, name));
+  assert.ok(block, `${name} needs explicit reusable-source skip allowlist`);
   const expression = block[1].split('\n').map((line) => line.trim()).join(' ');
   // The actual allowlist is a boolean expression shared by JS and Actions.
   // Only immutable status/input dictionaries are supplied; no workflow is run.
-  return Boolean(Function('needs', 'inputs', 'always', `return (${expression});`)(
+  return Boolean(Function('needs', 'inputs', 'cancelled', `return (${expression});`)(
     { setup: { result: setup }, desktop_core: { result: core } },
-    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => true));
+    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => runCancelled));
 }
 function checkAllowlist(source) {
   assert.match(job(source, 'desktop_core'), /if: inputs.core_bundle_artifact == ''/);
-  for (const [setup, core, provided, allowed] of [
-    ['success', 'success', false, true], ['success', 'skipped', true, true],
-    ['success', 'skipped', false, false], ['success', 'failure', true, false],
-    ['success', 'cancelled', true, false], ['failure', 'success', false, false],
-    ['cancelled', 'skipped', true, false], ['skipped', 'success', false, false],
-  ]) assert.equal(packageAllows(source, setup, core, provided), allowed, `${setup}/${core}/provided=${provided}`);
+  // Installer legs and the single wire job share one allowlist.
+  for (const name of ['package', 'core_wire']) {
+    for (const [setup, core, provided, allowed] of [
+      ['success', 'success', false, true], ['success', 'skipped', true, true],
+      ['success', 'skipped', false, false], ['success', 'failure', true, false],
+      ['success', 'cancelled', true, false], ['failure', 'success', false, false],
+      ['cancelled', 'skipped', true, false], ['skipped', 'success', false, false],
+    ]) {
+      assert.equal(jobAllows(source, name, setup, core, provided), allowed, `${name}: ${setup}/${core}/provided=${provided}`);
+      // A cancelled run stops the job on every row, including the two allowed ones.
+      assert.equal(jobAllows(source, name, setup, core, provided, true), false, `${name}: cancelled run ${setup}/${core}/provided=${provided}`);
+    }
+  }
 }
 
 test('four source producers use exact native hosts, source Go pin and real Darwin SDK', () => {
@@ -160,7 +177,17 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
 test('Package reuses the provided bundle without a second producer and rejects failed or cancelled source jobs', () => {
   checkAllowlist(files.package);
   assert.throws(() => checkAllowlist(files.package.replace("needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'")));
+  assert.throws(() => checkAllowlist(files.package.replaceAll(" && inputs.core_bundle_artifact != ''", '')));
+  // Each job is held to the allowlist on its own: weakening only one of the two must fail.
   assert.throws(() => checkAllowlist(files.package.replace(" && inputs.core_bundle_artifact != ''", '')));
+  assert.throws(() => checkAllowlist(files.package.replace(
+    /(\n  core_wire:\n[\s\S]*?)needs\.desktop_core\.result == 'success'/, "$1needs.desktop_core.result != 'failure'")));
+  // Restoring always() on either job must fail, not silently pass.
+  assert.throws(() => checkAllowlist(files.package.replace('!cancelled() && needs.setup.result', 'always() && needs.setup.result')));
+  assert.throws(() => checkAllowlist(files.package.replace(
+    /(\n  core_wire:\n[\s\S]*?)!cancelled\(\) && needs\.setup\.result/, '$1always() && needs.setup.result')));
+  // A status function that ignores cancellation in a different spelling fails the cancelled rows.
+  assert.throws(() => checkAllowlist(files.package.replace('!cancelled() && needs.setup.result', '(cancelled() || !cancelled()) && needs.setup.result')));
 });
 
 test('new desktop source workflow and pure wiring contracts trigger all four desktop consumers', () => {

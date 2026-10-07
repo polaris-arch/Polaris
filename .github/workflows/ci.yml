@@ -1,17 +1,42 @@
 name: CI
 
-# B0 验证门禁：Rust 单链（fmt + clippy + build + test），无 Go 工具链（§D.1 day-1 全 Rust）。
+# B0 验证门禁：Rust 链（fmt + clippy + rustdoc + 跨目标检查 + build + test），无 Go 工具链（§D.1 day-1 全 Rust）。
 # 职责 = 「改动是否正确」，快速反馈。打包（出安装包）拆到 package.yml（B10 发布工程批补）。
+#
+# ── 并行拓扑（2026-10-07）：一条串行链拆成三个并行 job ──
+#   · `lint`  （矩阵）fmt + clippy；Linux 腿另跑 rustdoc 与 Cronet 来源解析
+#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy + Android 影响面 dep-info 对差 + 豁免反腐烂
+#   · `test`  （矩阵）build + test
+# 拆之前 ubuntu 单腿实测（run 37642138266）：缓存 52s、clippy 66s、rustdoc 105s、Build 150s、
+# Cross-check 120s，再加 dep-info 对差与 `cargo test --workspace`，全部串行，墙钟 10 分钟以上；
+# 排在最后的 test 要等前面全部跑完才开始，前面任何一步红了它就**一次都不跑**（上面那次 run
+# 正是这样：Cross-check 红 ⇒ Test skipped，一次 run 只看得见第一个失败）。
+#
+# 为什么拆开不损失编译复用（判据是 cargo 的指纹，不是直觉）：clippy（经 clippy-driver wrapper，
+# 只出 metadata）、交叉 target 的 check 单元（各在 `target/<triple>/` 下）、build/test（dev 构型
+# 全量 codegen）三类产物的指纹本来就互不共享 —— 串在一个 job 里时它们也是各编各的，只是排着队。
+# 真正共享产物的两对仍放在同一个 job：Build 与 Test（同一批 rlib）、交叉 clippy 与紧随的
+# android `cargo check`（同一批 android check 单元）。
+#
+# 代价（如实记）：
+#   · 每个 job 各付一次环境准备（checkout / Node / rustup / 缓存恢复 / apt / protoc，ubuntu 约 1.5–2 分钟），
+#     总 runner 分钟数上升；公开仓标准 runner 不计额度，换的是墙钟。
+#   · Rust 缓存由一份变三份（键各自独立，见各 job 的 `Setup Rust cache`）。仓库缓存总额度有上限，
+#     超出后按最久未用淘汰；若观察到缓存频繁 miss，先查这里。
+#   · 全矩阵事件下 windows / macos 各起两个 job（lint、test），两边都要冷编同一批 C 依赖。
 #
 # ── 反馈架构（2026-08-26 按公开仓实况更新）──
 #    标准 GitHub-hosted runner 对公开仓不计分钟额度；仍需控制等待、并发与无信息量重跑。
 #    此前每次 push main = 3-OS CI + 4 平台 Package 并行，反馈噪声与 artifact 体积都过高。
-#   · push main（调试热路径）：只跑 ubuntu-22.04 单腿 —— 最便宜、最快反馈；
+#   · push main（调试热路径）：矩阵 job 只跑 ubuntu-22.04 一条腿 —— 最便宜、最快反馈；
 #   · pull_request / workflow_dispatch / 被 package.yml workflow_call（发布）：完整 3-OS 矩阵；
 #   · 发布质量不降级：tag 发布经 package.yml 的 `ci` gate job 调回本 workflow 跑满 3-OS，
 #     CI 不绿不发布（见 package.yml jobs.release）。2026-09-04 起打包腿与本门**并行**开跑：
 #     门拦的是 release job，不是 package job —— 门红时安装包会被构建出来但发不出去。
-# main 应开 ruleset，把三平台本 job、UI 与 release risk gate 设为 required checks。
+# main 应开 ruleset，把本 workflow 的 `fmt + clippy (<os>)`、`build + test (<os>)` 三平台各一条与
+# `cross-target clippy + android face`，连同 UI 与 release risk gate 设为 required checks。
+# ⚠️ 2026-10-07 拆分改了 check 名（原 `fmt + clippy + test (<os>)` 不再存在）：已按旧名配过
+#    required checks 的话必须同步改，否则那条 check 永远 Pending。
 on:
   push:
     branches: [main]
@@ -64,8 +89,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
-  lint-and-test:
-    name: fmt + clippy + test (${{ matrix.os }})
+  # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══
+  lint:
+    name: fmt + clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       # 为什么不改成 fail-fast: true 缩短失败反馈（2026-07-31 复核，**这条别优化掉**）：
@@ -134,7 +160,7 @@ jobs:
       #     漏掉会静默改变增量编译行为与缓存体积，属于「删掉也不报错」的那类回归，故必须带上
       #   · CARGO_TERM_COLOR=always（仅当未设置）
       #   · 打印 `rustc -Vv`
-      # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓两处 rust-cache 都没引用）、
+      # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓各处 rust-cache 都没引用）、
       # 显式导出 `CARGO_HOME`（不设时 rust-cache 自己回落到同一个 ~/.cargo）、
       # 「rustup 缺失就下载安装」（三镜像都自带；真缺了应该红，不该静默补装掩盖镜像变更）。
       #
@@ -152,8 +178,15 @@ jobs:
           cargo fmt --version
           cargo clippy --version
 
+      # 三个 job 的缓存键各自独立（`key` 追加在 rust-cache 的默认键之后），互不恢复、互不覆盖：
+      # 三者的 `target/` 内容不同（clippy metadata / 交叉 target 的 check 单元 / dev 全量 codegen），
+      # 共用一个键时谁最后跑完谁覆盖，另外两个 job 下次恢复到的就是别人的产物 —— 等于次次冷编。
+      # 显式写键而不依赖默认键里的 job id：本 workflow 还会被 package.yml 以 workflow_call 复用，
+      # 键里只留本文件自己写下的字面量，才谈得上稳定。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
 
       # 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）、Windows NASM（喂 btls-sys
       # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除本步
@@ -163,7 +196,8 @@ jobs:
       #
       # ── protoc：钉扎常量与版本依据的唯一真值在 scripts/fetch-protoc.mjs（2026-08-18，CI-4）──
       # 此前「固定版本 + 四平台 URL + sha256」在本文件与 package.yml 各内联一份、靠对拍测试防漂；
-      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联两份，对拍照旧）。
+      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联：本文件 lint / test 两个
+      # job 各一份 + package.yml 一份，三份对拍照旧）。
       # 版本为什么是 35.1、为什么升版本零行为差、sha256 从哪来、被替掉的 arduino/setup-protoc@v3
       # 两个外部失效点 —— 全部在脚本头注，改版本先读它。sha 校验走 node createHash、解压走
       # lib/extract-zip.mjs（三平台 CI 已绿），与 shell 是 bash 还是 pwsh 彻底解耦。
@@ -176,7 +210,7 @@ jobs:
       # `github.com/ilammy/setup-nasm/raw/mirror/...` 取 nasm-<ver>-win64.zip（取不到再退 www.nasm.us）、
       # 解出 nasm.exe/ndisasm.exe、addPath —— **全程零校验**（一个 hash 都没有）。
       # 版本取 nasm.us 官方 releasebuilds 当前最新稳定版 3.02；实际下载 win64 zip 后计算 sha256，
-      # 与 package.yml 同常量对拍。
+      # 与本文件 test job、package.yml 的同名步同常量对拍。
       # 代价说清楚：镜像那条腿去掉了，现在只有 www.nasm.us 一个源（本机实测那个 GitHub 镜像
       # 当时正好也在 429，拿不到字节 ⇒ 无法核对它的 sha256，不写未验证的常量进来）。
       # curl 带重试兜瞬时抖动；真下不来会红，不会静默跳过。
@@ -285,8 +319,85 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links"
         run: cargo doc --no-deps --workspace --bins --lib --document-private-items
 
-      - name: Build
-        run: cargo build --workspace --verbose
+  # ══ 检查类之二：交叉 target clippy + Android 影响面 dep-info 对差 + 豁免反腐烂（仅 ubuntu）══
+  #
+  # 这三步原本以 `if: runner.os == 'Linux'` 挂在矩阵 job 的 ubuntu 腿上；独立成 job 后直接钉
+  # `runs-on: ubuntu-22.04`，步级的 Linux 条件随之去掉（在这里它恒真，留着只是噪声）。
+  #
+  # job 级 `if` 只为保住手动 dispatch 的单平台语义（见上方 `on.workflow_dispatch.inputs.os`）：
+  # 选了 windows-2022 / macos-14 时，原先这三步因 `runner.os != 'Linux'` 不跑，现在等价地整个
+  # job 不起。其余一切入口（push / PR / merge queue / package.yml 的 workflow_call / dispatch 选
+  # all 或 ubuntu-22.04）本条件恒真。`os != ''` 那一项与矩阵表达式同源：package.yml 的
+  # workflow_dispatch 经 workflow_call 传进来的 payload 没有 `os`，空串必须落到「跑」这一侧。
+  # 判据由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 逐入口求值钉住（含反向对照）。
+  cross:
+    name: cross-target clippy + android face
+    if: >-
+      !(github.event_name == 'workflow_dispatch'
+        && github.event.inputs.os != ''
+        && github.event.inputs.os != 'all'
+        && github.event.inputs.os != 'ubuntu-22.04')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 与 lint job 同口径钉 Node 26；本 job 的 dep-info 对差步要跑 `scripts/check-android-only-face.mjs`。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # 判据与逐条理由见 lint job 同名步上方那段。本 job 只要 clippy 这一个组件（不跑 fmt）。
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal \
+            --component clippy --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+          cargo clippy --version
+
+      # 键独立的理由见 lint job 同名步。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cross
+
+      # protoc：singbox-grpc 的 build.rs 在每个 target 上都要它。钉扎真值与版本依据见 lint job 同名步。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # 断言的理由见 lint job 同名步：安装步静默 no-op 时，这里因 `set -u` 取不到期望值而直接红。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+
+      # 交叉 target 那几格用不到 webkit/gtk；要它的是 dep-info 对差步的 **host 侧**
+      # `cargo check --workspace`（含 src-tauri，Linux 上经 Tauri 拉进 webkit/gtk 的 -sys crate）。
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。本 job 两处会编到
+      # src-tauri（android 上的 `cargo check -p polaris` 与 dep-info 对差的两侧）。
+      - name: Create resource placeholder dirs (tauri build.rs 路径校验)
+        shell: bash
+        run: |
+          for d in dashboard linux win mac-arm64 mac-x64; do
+            mkdir -p "resources/$d" && touch "resources/$d/.keep"
+          done
 
       # 平台特定代码在 Linux 腿上的**唯一**检出通道（2026-08-09 新增）。
       #
@@ -317,9 +428,9 @@ jobs:
       # 剩下的全是纯 Rust；android 这边我们**要**覆盖 wreq 那条 C 依赖链，所以真的需要一套工具链。
       #
       # 🔴 **不写 GITHUB_PATH**：NDK 的 bin 目录里有 `clang` / `ld.lld` / `llvm-*`，进了 job 级 PATH
-      #    会影响同 job 后面 Build / Test 两步的**宿主**编译。只导出目录，由用它的两步各自局部前置。
+      #    会影响同 job 后面 dep-info 对差步里 **host 侧** `cargo check --workspace` 的宿主编译。
+      #    只导出目录，由用它的几步各自局部前置。
       - name: Resolve Android NDK
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -354,7 +465,6 @@ jobs:
           echo "NDK: $ndk"
 
       - name: Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -453,7 +563,8 @@ jobs:
       # rustc 解析的是真模块图，字符串里的文本结构上就进不来）。射程与已知上限见那个脚本的头注。
       #
       # 🔴 两侧选择器必须**逐字对称**，都是 `cargo check --workspace`（lib + bins）：
-      #  · 不能拿上面的 `cargo clippy --workspace --all-targets` 当 host 侧省钱（那是零额外编译）——
+      #  · 不能拿 lint job 的 `cargo clippy --workspace --all-targets` 的编译面当 host 侧（那看上去
+      #    是现成的一份 host 编译面）——
       #    host 侧一旦更宽，`#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 的 test
       #    单元、从差集里掉出去，方向是 **fail-open**（门说全绿而实际漏了）。这个 pattern 仓里真的
       #    在用：`src-tauri/src/runtime/stats/source.rs` 的三个通道常量就是这么写的。
@@ -462,8 +573,9 @@ jobs:
       #
       # 成本：android 侧接近零 —— 上一步的 `cargo check --target aarch64-linux-android -p polaris`
       # 已把 20 个成员里 19 个的 check 单元编热，本步只多一个 `polaris-source-probe`。host 侧是本
-      # 方案**唯一**的实质代价：check 单元与本 job 已有的 clippy（走 clippy-driver wrapper）、
-      # build（出 rlib）、test（test 构型）指纹都不共享，是一趟真的增量编译。若哪天它进不了每个 PR
+      # 方案**唯一**的实质代价：check 单元与 lint job 的 clippy（走 clippy-driver wrapper）、test job
+      # 的 build（出 rlib）与 test（test 构型）指纹都不共享，是一趟真的编译（2026-10-07 拆成并行
+      # job 之前同样不共享，拆分没有让它变贵）。若哪天它进不了每个 PR
       # 的关键路径，退路是加 `github.event_name != 'pull_request'`（与下一步「豁免反腐烂」同一取舍）：
       # 代价是延迟到合入后一次 run 才发现，不是漏检。
       #
@@ -471,7 +583,6 @@ jobs:
       # **之前**产出的（rustc 对有类型错误的代码照样写出正确 `.d`），「.d 是对的」与「代码编得过」
       # 是两件事 —— 两条 cargo 的 rc 必须真的拦住这一步，故 errexit 全程有效。
       - name: Android impact face must be registered (dep-info 对差)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -483,7 +594,7 @@ jobs:
       # 只在非 PR 事件上跑：两个被豁免的包都在 build script 阶段就失败，成本低但不为零，
       # 而豁免腐烂最多延迟到合入后一次 run 被发现，不值得给每个 PR 加时。
       - name: Cross-target exemptions must still be necessary
-        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -uo pipefail
@@ -500,6 +611,119 @@ jobs:
             done
           done
           exit $rot
+
+  # ══ 构建加测试类：build + test（矩阵）══
+  #
+  # 与 lint job 并行开跑：此前 Test 排在串行链的最后，前面任何一步红了它就不跑。
+  # Build 与 Test 留在同一个 job：`cargo test` 复用 `cargo build` 出的依赖 rlib，拆开就是编两遍。
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 维持 false 的理由见 lint job 的同名字段（那段别优化掉；两个矩阵 job 取同一判据）。
+      fail-fast: false
+      matrix:
+        # 与 lint job 的矩阵表达式**逐字相同**（事件条件矩阵 + dispatch 单平台分支，逐条理由写在那边）。
+        # 两份必须一起改：只改一份，同一事件下「lint 跑了哪些平台」与「test 跑了哪些平台」就分家了。
+        # 逐字相等由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住。
+        os: >-
+          ${{ (github.event_name == 'workflow_dispatch'
+              && github.event.inputs.os != ''
+              && github.event.inputs.os != 'all')
+              && fromJSON(format('["{0}"]', github.event.inputs.os))
+              || ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+                  && fromJSON('["ubuntu-22.04"]')
+                  || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 与 lint job 同口径钉 Node 26（测试会读仓库脚本；不借 runner 镜像的浮动预装版本）。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      # protoc / NASM：钉扎真值、版本依据与「活步，勿删」的实证都在 lint job 同名步上方。
+      # NASM 常量现在全仓三处内联（本文件 lint / test 两处 + package.yml 一处），必须同时改；
+      # 三处逐字相等由 `ui/src/contracts/workflow-toolchain-pin-parity.test.ts` 对拍。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      - name: Install NASM (Windows — pinned URL + sha256)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NASM_VERSION: '3.02'
+        run: |
+          set -euo pipefail
+          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
+            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
+          echo "${sha256}  ${zip}" | sha256sum -c -
+          rm -rf "${tmp}/nasm-${NASM_VERSION}"
+          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
+          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
+          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
+          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+
+      # 断言的理由与写法同 lint job 同名步。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+          if [ "$RUNNER_OS" = 'Windows' ]; then
+            echo "nasm → $(command -v nasm)"
+            got="$(nasm -v)"
+            case "$got" in
+              "NASM version ${NASM_EXPECT} "*) ;;
+              *) echo "::error::nasm on PATH is '$got', expected NASM version ${NASM_EXPECT}"; exit 1 ;;
+            esac
+          fi
+
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。
+      - name: Create resource placeholder dirs (tauri build.rs 路径校验)
+        shell: bash
+        run: |
+          for d in dashboard linux win mac-arm64 mac-x64; do
+            mkdir -p "resources/$d" && touch "resources/$d/.keep"
+          done
+
+      - name: Build
+        run: cargo build --workspace --verbose
 
       - name: Test
         # `--no-fail-fast`（2026-08-05）：默认行为是**某个 crate 挂了就不再跑后面的 crate**，

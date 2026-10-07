@@ -61,7 +61,12 @@ function requirePackagePolicy(yaml) {
 
 function requireCandidateSources(candidate) {
   assert.match(candidate, /^    needs: \[setup, desktop_core\]$/m);
-  assert.match(candidate, /^    if: >-\n      always\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)$/m);
+  // The source allowlist is unchanged and still matched in full. Only the status
+  // function differs: `!cancelled()` (2026-10-07) lets a superseded run stop its
+  // in-flight installer legs, whereas `always()` kept them running to the end.
+  // Both disable default skip propagation, which is what this allowlist relies on.
+  assert.doesNotMatch(candidate, /^      always\(\)/m, 'installer legs must stay cancellable');
+  assert.match(candidate, /^    if: >-\n      !cancelled\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)$/m);
 }
 
 function requireRiskPolicy(yaml) {

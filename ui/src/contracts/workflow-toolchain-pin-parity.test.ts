@@ -13,10 +13,12 @@
  * - protoc（脚本侧）：`ASSETS` 表恰 4 条、每条带 64 位 sha256；版本常量唯一；
  *   校验走 `createHash` 且比对不符会抛；`PROTOC_EXPECT` 仍经 `GITHUB_ENV` 导出
  *   （断言步的期望值来源，丢了它断言步拿不到期望）；
- * - NASM：两文件 `NASM_VERSION` 与 sha256 一致，且条数固定——两边一起删空也是「相等」，
- *   固定条数让删空转红；
- * - 两文件 NASM 步的 sha256 是真在校验（`sha256sum -c`）而不是摆着看；装配步不靠
- *   `command -v` 探测选工具；装完仍有 PATH 断言步（`[ "$got" = "$PROTOC_EXPECT" ]`）。
+ * - NASM：全部内联副本的 `NASM_VERSION` 与 sha256 一致，且**每个文件的副本数固定**——一起删空
+ *   也是「相等」，固定条数让删空转红。2026-10-07 `ci.yml` 拆成并行 job 后副本数是
+ *   ci.yml 2（lint / test 两个矩阵 job 各自要在 Windows 上编 btls-sys）+ package.yml 1；
+ * - 每一份 NASM 副本的 sha256 都真在校验（`sha256sum -c` 的条数 = 副本数）而不是摆着看；
+ *   装配步不靠 `command -v` 探测选工具；**每一处**装 protoc 的地方后面都有 PATH 断言
+ *   （`[ "$got" = "$PROTOC_EXPECT" ]` 的条数 = `run: node scripts/fetch-protoc.mjs` 的条数）。
  *
  * # 这门抓不到什么（别当成「工具链钉扎都验过了」）
  * - **sha256 对不对**：只保证两处相同 / 表内形齐。两处一起写错，本门全绿；
@@ -35,6 +37,21 @@ const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
 const WORKFLOWS = ['ci.yml', 'package.yml'] as const;
 const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as const;
+
+/**
+ * 每个 workflow 里「自己 checkout + 自己装 Node」的 job 数。写死是本意：多一个少一个都要有人过目。
+ *
+ * 2026-10-07 两处变化，都是 job 数变了、每个 job 仍各钉一份：
+ *   · ci.yml 1 → 3：串行单 job 拆成 lint / cross / test 三个并行 job；
+ *   · package.yml 3 → 4：新增 core_wire job（wire 契约从每条打包腿各跑一次收成只跑一次）。
+ */
+const NODE_JOBS = [
+  ['ci.yml', 3], ['ui.yml', 1], ['package.yml', 4], ['release-risk.yml', 3],
+] as const;
+const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
+
+/** 每个 workflow 里 NASM 内联副本的份数（见文件头「NASM」条）。 */
+const NASM_COPIES = { 'ci.yml': 2, 'package.yml': 1 } as const;
 
 /** protoc 官方 release 覆盖的平台数（`process.platform-process.arch` → 资产名）。 */
 const PROTOC_PLATFORM_ROWS = 4;
@@ -66,16 +83,10 @@ describe('CI 工具链钉扎守门', () => {
     const nodeVersions = [...all.matchAll(/node-version:\s*['"]?(\d+)/g)]
       .map((m) => m[1])
       .sort();
-    expect(nodeVersions, 'CI / UI / Package / Release Risk 都必须显式钉 Node 26').toEqual([
-      '26',
-      '26',
-      '26',
-      '26',
-      '26',
-      '26',
-      '26',
-      '26',
-    ]);
+    // 条数 = 四个 workflow 里各自装 Node 的 job 数之和（逐文件的数在下面那张表里，这里是总账）。
+    expect(nodeVersions, 'CI / UI / Package / Release Risk 都必须显式钉 Node 26').toEqual(
+      Array(NODE_JOBS_TOTAL).fill('26'),
+    );
     expect(readFileSync(join(REPO_ROOT, '.nvmrc'), 'utf8').trim()).toBe('26');
     const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, 'ui/package.json'), 'utf8')) as {
       engines?: { node?: string };
@@ -83,17 +94,15 @@ describe('CI 工具链钉扎守门', () => {
     expect(packageJson.engines?.node).toBe('>=24');
 
     // 各桌面 source producer、草稿与汇总保有独立 checkout / Node；不能以总数相等掩盖某腿缺失。
-    for (const [workflow, count] of [
-      ['ci.yml', 1], ['ui.yml', 1], ['package.yml', 3], ['release-risk.yml', 3],
-    ] as const) {
+    for (const [workflow, count] of NODE_JOBS) {
       const source = read(workflow);
       expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(count);
       expect(source.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(count);
       expect([...source.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
         .toEqual(Array(count).fill('26'));
     }
-    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(8);
-    expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(8);
+    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(NODE_JOBS_TOTAL);
+    expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(NODE_JOBS_TOTAL);
     expect(all).not.toMatch(/actions\/(?:checkout|setup-node)@v[1-6]\b/);
     expect(read('package.yml')).toContain('actions/upload-artifact@v7');
     expect(read('package.yml')).toContain('actions/download-artifact@v8');
@@ -184,26 +193,32 @@ describe('CI 工具链钉扎守门', () => {
     ).toBe(true);
   });
 
-  it('NASM 版本与 sha256 两处一致', () => {
-    const ciVer = envPin(sources['ci.yml'], 'NASM_VERSION');
-    const pkgVer = envPin(sources['package.yml'], 'NASM_VERSION');
-    expect(ciVer).toHaveLength(1);
-    expect(pkgVer).toHaveLength(1);
-    expect(pkgVer[0], 'ci.yml 与 package.yml 的 NASM 版本不同').toBe(ciVer[0]);
-
-    const ciSha = standaloneShaPins(sources['ci.yml']);
-    const pkgSha = standaloneShaPins(sources['package.yml']);
-    expect(ciSha, 'ci.yml 应恰有 1 条独立 sha256（NASM）').toHaveLength(1);
-    expect(pkgSha, 'package.yml 应恰有 1 条独立 sha256（NASM）').toHaveLength(1);
-    expect(pkgSha, 'ci.yml 与 package.yml 的 NASM sha256 漂移了').toEqual(ciSha);
+  it('NASM 版本与 sha256 在全部内联副本之间一致，且每个文件的副本数固定', () => {
+    const versions: string[] = [];
+    const shas: string[] = [];
+    for (const workflow of WORKFLOWS) {
+      const ver = envPin(sources[workflow], 'NASM_VERSION');
+      const sha = standaloneShaPins(sources[workflow]);
+      // 份数固定：删掉一份（那个 job 的 Windows 腿从此用不上钉扎的 NASM）或悄悄多抄一份都红。
+      expect(ver, `${workflow} 的 NASM_VERSION 份数不对`).toHaveLength(NASM_COPIES[workflow]);
+      expect(sha, `${workflow} 的独立 sha256（NASM）份数不对`).toHaveLength(NASM_COPIES[workflow]);
+      versions.push(...ver);
+      shas.push(...sha);
+    }
+    // 取材面自检：一份都没读到时「全部相等」恒真。
+    expect(versions.length).toBe(NASM_COPIES['ci.yml'] + NASM_COPIES['package.yml']);
+    expect(new Set(versions).size, `NASM 版本在各副本之间漂移了：${versions.join(' / ')}`).toBe(1);
+    expect(new Set(shas).size, `NASM sha256 在各副本之间漂移了：${shas.join(' / ')}`).toBe(1);
   });
 
-  it.each(WORKFLOWS)('%s 里 NASM 的 sha256 是真在校验，不是摆着看', (workflow) => {
+  it.each(WORKFLOWS)('%s 里每一份 NASM 的 sha256 都真在校验，不是摆着看', (workflow) => {
     const src = sources[workflow];
+    // 按份数判而不是按「文件里有没有」：ci.yml 现在有两份，只留一条校验命令时
+    // `includes` 照样为真，而另一份的常量就成了摆设。
     expect(
-      src.includes('sha256sum -c -'),
-      `${workflow} 里找不到 sha256sum 校验命令 —— NASM 常量还在，校验没了`
-    ).toBe(true);
+      src.match(/^\s*echo "\$\{sha256\}  \$\{zip\}" \| sha256sum -c -$/gm) ?? [],
+      `${workflow} 里 NASM 的 sha256sum 校验命令条数与副本数不符 —— 有常量还在、校验没了的副本`
+    ).toHaveLength(NASM_COPIES[workflow]);
   });
 
   // `scripts/lib/extract-zip.mjs` 头注那条 🔴：解压器/校验器**按平台写死，不写「先试 A 失败退 B」**
@@ -222,12 +237,18 @@ describe('CI 工具链钉扎守门', () => {
     }
   });
 
-  it.each(WORKFLOWS)('%s 装完仍断言 PATH 上解析到的就是钉扎的那份', (workflow) => {
+  it.each(WORKFLOWS)('%s 每一处装 protoc 之后都断言 PATH 上解析到的就是钉扎的那份', (workflow) => {
     const src = sources[workflow];
+    const installs = src.match(/^ *run: node scripts\/fetch-protoc\.mjs\s*$/gm) ?? [];
     // 匹配断言里**真正的比较**，不是步骤名：只 grep 步骤名的话，把 run 块掏空、名字留着照样绿。
+    const asserts = src.match(/^\s*\[ "\$got" = "\$PROTOC_EXPECT" \] \|\| \{$/gm) ?? [];
+    expect(installs.length, `${workflow} 里一处 protoc 安装都没读到 —— 取材面塌了`).toBeGreaterThan(0);
+    // 按条数配对而不是按「文件里有没有」：装 protoc 的 job 变多之后，只要还剩一条断言
+    // `includes` 就为真，其余 job 的安装步变成静默 no-op 也没人知道。
     expect(
-      src.includes('[ "$got" = "$PROTOC_EXPECT" ]'),
-      `${workflow} 丢了 protoc 的 PATH 断言 —— 安装步变成静默 no-op 也没人知道`
-    ).toBe(true);
+      asserts.length,
+      `${workflow} 有 ${installs.length} 处装 protoc，却只有 ${asserts.length} 条 PATH 断言 —— ` +
+        '某个 job 的安装步变成静默 no-op 也没人知道'
+    ).toBe(installs.length);
   });
 });

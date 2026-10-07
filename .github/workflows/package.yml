@@ -53,6 +53,7 @@ on:
           - macos-x64
   # 供 release-risk.yml 按受影响平台复用。自动门只验证产物，不上传 artifact；
   # tag / 本 workflow 的手动 dispatch 仍保持完整内核门与上传语义。
+  # 2026-10-07 起自动门另传 `light_build: true`：打包腿用轻量构型（见下方该输入的注释）。
   workflow_call:
     inputs:
       platform:
@@ -87,6 +88,14 @@ on:
         type: string
         required: false
         default: ''
+      # 风险门专用的轻量构建开关（2026-10-07）。true ⇒ 打包腿不做 fat LTO、并行 codegen，
+      # 产物**不是可分发物**（不上传、不进 release）。只有 release-risk.yml 传 true；
+      # tag push 与本 workflow 的手动 dispatch 都没有这个输入 ⇒ 恒为 false ⇒ 发行构型一字不动。
+      # 机制、取舍与 fail-closed 条件见 package job 的 `Select installer build weight` 步。
+      light_build:
+        type: boolean
+        required: false
+        default: false
 
 # 最小权限：打包 job 只读仓库（tauri-action 未传 tagName ⇒ 不碰 release API）；
 # release 写权限只发给发布 DAG 的三个写入 job（job 级 permissions 覆盖本块）。
@@ -301,10 +310,21 @@ jobs:
     #    在 package job 内无法消除：要读 ci/ui 的 result 就必须把它们写进 needs，而 needs 即等待。
     #
     # setup 必须 success。source job 仅在已有同 run/attempt bundle 输入时允许 skipped；
-    # 显式 always() 消除复用依赖的默认 skip 传播，failure/cancelled 仍一律拒绝。
+    # 显式写状态函数以消除复用依赖的默认 skip 传播，failure/cancelled 仍一律拒绝。
+    #
+    # 🔴 状态函数是 `!cancelled()`，**不是** `always()`（2026-10-07 改，实测的缺陷）：
+    #    取消一次 run 时，GitHub 会对**在途** job 重新求值 `if`，仍为真的 job 不会被取消。
+    #    `always()` 恒真 ⇒ 打包腿对取消免疫 —— release-risk 的并发组早就写着「新提交取消旧跑」，
+    #    但旧跑的四条打包腿照样跑到底，新跑在并发组里 pending 到它们结束。
+    #    实证：Release Risk run 37638779024 在 15:05:29 被新 push 顶替，四条腿仍跑到 15:13:43
+    #    才结束，新跑 37642139456 到 15:16:43 才起步（白等 11 分钟，旧 tip 的结果无人消费）。
+    #    `!cancelled()` 同样是状态函数（同样关掉默认的 skip 传播，本条的本意不变），
+    #    而取消时求值为假 ⇒ 在途打包腿立即停。
+    #    只改本 job：发布 DAG 的 `release_desktop` / `release` 仍是 `always()`，它们只在 v* tag 上
+    #    可达，而 tag ref 的并发组从不取消在途（见文件头 concurrency 段）。
     needs: [setup, desktop_core]
     if: >-
-      always() && needs.setup.result == 'success'
+      !cancelled() && needs.setup.result == 'success'
       && (needs.desktop_core.result == 'success'
         || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
     # W24：helper 与 app 分两次 cargo build，但必须共享同一份构建身份。放 job 级而非某一步，
@@ -320,6 +340,9 @@ jobs:
       # event_name 仍是 workflow_dispatch，须用它显式传入的 skip_quality_gates 区分调用侧。
       POLARIS_RUN_KERNEL_GATES: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.run_kernel_gates) && '1' || '0' }}
       POLARIS_UPLOAD_ARTIFACTS: ${{ (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && !inputs.skip_quality_gates) || inputs.upload_artifacts) && '1' || '0' }}
+      # 轻量构建只认调用方显式传入的 true；tag push / 本 workflow 手动 dispatch 没有该输入 ⇒ '0'。
+      # 它与上面两个开关的组合由 `Select installer build weight` 步 fail-closed 校验。
+      POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
     runs-on: ${{ matrix.os }}
     strategy:
       # fail-fast: false 保留（2026-07-31 复核，判据同 ci.yml 那条，别单独优化掉一个）：
@@ -417,6 +440,77 @@ jobs:
           [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
 
+      # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-07）──
+      #
+      # 背景（实测，Release Risk run 37638779024，Rust 缓存命中）：`Build installers` 一步
+      # linux 589s / windows 971s / macos-arm64 962s，占打包腿墙钟的六到七成。缓存命中仍这么慢，
+      # 是因为根 `Cargo.toml` 的 `lto = "fat"` + `codegen-units = 1` 把全部 crate 的 bitcode 在
+      # 链接期合成一个单线程优化单元 —— 这一段不可缓存，改一行代码就整段重来。
+      # 而风险门要回答的是「这个改动会不会让安装包**打不出来 / 装出来缺东西**」，不是「发行二进制
+      # 够不够小」；后者的判据是 tag 上的发行构建本身。
+      #
+      # 做法：仅当调用方传 `light_build: true` 时，经 cargo 的环境变量覆盖把 release profile 的
+      # 两个键改成 `lto = "off"`、`codegen-units = 16`（cargo release 的默认并行度）。
+      # `strip = "symbols"`、`debug-assertions`、`panic` 等其余键一概不碰。
+      #   [选 环境变量覆盖：profile 名仍是 release ⇒ 输出目录仍是 `target/**/release/`，下面十几步
+      #    按路径取产物的校验一行不用改；build.rs 里 `PROFILE == "release"` 的三道硬门
+      #    （随包 geo 数据、wire 契约、孤儿核）照常生效；发行路径上这一步什么都不写 ⇒ cargo 读到的
+      #    就是 Cargo.toml 原样，与改动前逐项相同]
+      #   [不选 新增 `[profile.release-risk] inherits = "release"`：cargo 会把产物放到
+      #    `target/**/release-risk/`，bundle / staging / exe 的每一条路径都要按构型参数化，
+      #    且 tauri CLI 对自定义 profile 的 bundle 落点在本机无法验证 —— 为一个不出货的产物改动
+      #    十几道门的取材路径，风险与收益不成比例]
+      #
+      # 🔴 这是一条**绕开源码门的新路径**，所以自己带闸：`release_escape_hatches.rs` 的
+      #    `release_profile_must_enable_lto_without_panic_abort` 只读 `Cargo.toml`，环境变量覆盖
+      #    它看不见。故本步 fail-closed 三条，任一命中即红：
+      #      ① 进入本步时环境里已有任何 `CARGO_PROFILE_*`（不管是谁设的）—— 发行路径也查；
+      #      ② 轻量构型落在 tag ref 上（tag = 发布语义）；
+      #      ③ 轻量构型同时要上传 artifact（轻量产物不得离开 runner）。
+      #    另由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住：全部 workflow 里
+      #    `CARGO_PROFILE_` 只允许出现在本步、只允许这两个键，并把本步脚本按各入口真跑一遍。
+      #
+      # 轻量构型下各产物校验是否仍成立（逐条看过，2026-10-07）：
+      #   · D7 路径脱敏 / PKG-3 静态 CRT —— 来自 rustflags，与 LTO 无关，成立；
+      #   · payload / inventory / conf 不变量 / AppImage 加固 / dmg 引导与 ad-hoc 封印 /
+      #     便携 zip 内容 / 资产命名 —— 判的是「文件在不在、是不是这一份」，成立；
+      #   · 体积门（U2）—— 轻量二进制**更大**，故它在风险门上是偏严的上界：轻量过门 ⇒ 发行必过门；
+      #     轻量撞门时先看余量再判（定标时实测最大 122.58 MiB，上限 200 MiB）。**发行体积的真值
+      #     只在 tag / 手动全量的发行构建上量得到**，风险门不再提供这个数；
+      #   · `strip = "symbols"` 未被覆盖，符号表照剥。
+      # 风险门从此**不验**的一件事：fat LTO 链接本身能否成功。它只在发行构建上暴露。
+      #
+      # 位置必须在 `Setup Rust cache` 之前：两种构型的依赖产物指纹不同，缓存键靠下面那步的
+      # `-light` 后缀分开；本步写进 GITHUB_ENV 的变量同时也落进 rust-cache 的环境哈希。
+      - name: Select installer build weight (release profile vs risk-gate light)
+        shell: bash
+        run: |
+          set -euo pipefail
+          leaked="$(env | grep '^CARGO_PROFILE_' || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::环境里已有 cargo profile 覆盖，拒绝构建（它们会静默改写发行构型）："
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+          case "$POLARIS_LIGHT_BUILD" in
+            0)
+              echo "构建权重：发行构型（Cargo.toml 的 [profile.release] 原样，无任何环境变量覆盖）"
+              exit 0 ;;
+            1) ;;
+            *) echo "::error::POLARIS_LIGHT_BUILD 取值非法：'$POLARIS_LIGHT_BUILD'"; exit 1 ;;
+          esac
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;
+          esac
+          [ "$POLARIS_UPLOAD_ARTIFACTS" = 0 ] || {
+            echo "::error::轻量构型不得上传 artifact（POLARIS_UPLOAD_ARTIFACTS=$POLARIS_UPLOAD_ARTIFACTS）：它不是可分发物"; exit 1; }
+          {
+            echo 'CARGO_PROFILE_RELEASE_LTO=off'
+            echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'
+          } >> "$GITHUB_ENV"
+          echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）构建，只用于验证打包链；产物不是可分发物，不上传、不进 release。"
+          printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. These installers verify the packaging chain only; they are not distributable and are never uploaded or released.' >> "$GITHUB_STEP_SUMMARY"
+
       # ── D7 门：发行产物路径脱敏（2026-08-30）──
       # 发行二进制里嵌了构建机绝对路径（Rust `file!()` + BoringSSL 等 C 依赖的 `__FILE__`），
       # 泄露 CI runner 的 $CARGO_HOME 与检出目录。
@@ -477,11 +571,17 @@ jobs:
       # rust-cache 默认键 = job_id + toolchain + 环境哈希，**不含 matrix**。两个 mac job 的 job_id
       # 同为 `package`、runner 与 toolchain 也相同 ⇒ 同键：互相 restore 对方的 target/ 并在 save 上
       # 竞争。正确性无碍（cargo 按 triple 分目录）但白白拉取/覆盖，且缓存命中难排查。用 label 分开。
+      #
+      # 轻量构型再加 `-light` 后缀（2026-10-07）：两种构型的依赖产物不通用（fat LTO 要依赖带 bitcode，
+      # 轻量不要），共用一个键就是互相覆盖、两边都冷编。发行构型的键仍是裸 label，与改动前逐字相同。
+      # ⚠️ 随之而来的代价：此前 main 上的风险门打包腿与 tag 发行构建同构型，tag 构建能恢复到
+      #    main 留下的缓存；现在 main 上只剩 `-light` 缓存 ⇒ **tag 发行构建基本是冷编**
+      #    （发行路径本身一字未改，只是不再有同构型的热缓存可借）。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          key: ${{ matrix.label }}
+          key: ${{ matrix.label }}${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
 
       # ── Linux 系统依赖（WebKitGTK 4.1 栈）── Tauri 2 打包必需，GitHub ubuntu-22.04 需补装。
       - name: Install Linux system dependencies
@@ -570,12 +670,9 @@ jobs:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
 
-      # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
-      # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。
-      - name: Bundled core gRPC wire contract (all platforms)
-        env:
-          POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
+      # 四平台 wire descriptor 对拍（`Bundled core gRPC wire contract`）不在本腿：它与宿主平台无关，
+      # 2026-10-07 起由下面的 `core_wire` job 全 workflow 只跑一次（依据见该 job 头注）。
+      # 本腿仍在 `Build installers` 里经 singbox-grpc 的 release build.rs 对盘上每一份核各对拍一遍。
 
       # 依赖指纹门：随包核里 sing-tun 的版本一动就红。
       #
@@ -584,7 +681,7 @@ jobs:
       # `sing-box check` 照样 rc=0、单测全绿，而用户侧是「能上网但分流失效」。
       # 判据刻意取「依赖版本」而非「那个默认值」本身——二进制里读不到默认值（符号表被剥），
       # 且判据独立于被检查的值，是 28f5d46 修 cronet go.mod 对拍时立下的同一条。
-      # 与上一步同挂本腿同理由（ci.yml 不拉核，在那边加就是永不会红的假门）。
+      # 挂本腿的理由：ci.yml 不拉核，在那边加就是永不会红的假门。
       # 删掉本步会让 core_dep_fingerprint 的 `ci_step_still_wired` 转红（它 grep 本文件）。
       - name: Bundled core dependency fingerprint (sing-tun pin)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
@@ -600,7 +697,7 @@ jobs:
       # check 照样 rc=0、单测全绿），于是差集变成什么样换核之后无人知晓。本步把它变成「换核即自曝」。
       # 判据是内核那一侧的形状（`sing-box schema` 的 $defs 属性路径清单，按协议分支分域），
       # **不**断言差集为零 —— 差集本来就不该是零。红 ≠ 有 bug，红 = 该看一眼了。
-      # 与上两步同挂本腿同理由（ci.yml 不拉核，在那边加就是永不会红的假门）。
+      # 与上一步同挂本腿同理由（ci.yml 不拉核，在那边加就是永不会红的假门）。
       # 删掉本步会让 core_schema_surface 的 `ci_step_still_wired` 转红（它 grep 本文件）。
       - name: Bundled core config schema surface (drift tripwire)
         if: env.POLARIS_RUN_KERNEL_GATES == '1'
@@ -1296,6 +1393,113 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ══ 四平台 wire 契约：与宿主平台无关，全 workflow 只跑一次（2026-10-07）══
+  #
+  # 此前 `Bundled core gRPC wire contract (all platforms)` 挂在每条打包腿上：四条腿各付一次
+  # `cargo test` 冷编（实测 linux 120s / windows 134s / macos-arm64 152s），量的却是同一件事。
+  #
+  # 判「与宿主无关」的依据（读实现得到，不是从名字推的）：
+  #   · 判据本体 `proto_wire_check::check_core_against_proto` 是对核二进制的**纯字节扫描**
+  #     （抠出 protoc-gen-go 嵌进 .rodata 的 FileDescriptorProto 与 vendored proto 对拍），
+  #     不启动任何核；`crates/singbox-grpc/proto_wire_check.rs` 与测试里没有 `cfg(target_os)`、
+  #     没有 `std::env::consts`、不起子进程 —— 同样的字节在任何宿主上给出同样的结论；
+  #   · 覆盖轴来自 `src-tauri/core-manifest.json`（四个平台全查），不来自宿主；
+  #   · 输入是本次 run 那一份四平台核 bundle：每条打包腿下到的是同一个 artifact，且
+  #     `fetch-core.mjs` 在落盘前逐份校验二进制与回执 ⇒ 四条腿盘上的四份核字节相同。
+  #   于是四条腿各跑一遍 = 同一函数、同一输入算四次。
+  #
+  # 没有因此丢掉的两件事：
+  #   · 「本腿盘上的核就是被对拍的那份」—— 每条打包腿的 `Build installers` 仍经 singbox-grpc
+  #     的 release build.rs（`assert_proto_matches_bundled_core`）对盘上每一份核各对拍一遍；
+  #   · 「缺平台必须红」（REQUIRE 语义）—— 本 job 保留 `POLARIS_REQUIRE_KERNEL_GATE=1`，且本 job
+  #     不受 `POLARIS_RUN_KERNEL_GATES` 控制（release-risk 复用时照跑）。
+  #
+  # 接线：`if` 与 package job 是同一套 bundle 可用性 allowlist（desktop_core 在复用 bundle 时是
+  # skipped，不显式写状态函数本 job 会被默认语义一并跳过）；`release_desktop` 把本 job 列进 needs
+  # 并要求 success ⇒ wire 契约不成立时安装包照样构建，但写不进 release 草稿。release-risk.yml 那侧
+  # 读的是整个复用调用的 result，本 job 红即那条腿红。
+  core_wire:
+    name: bundled core gRPC wire contract
+    needs: [setup, desktop_core]
+    if: >-
+      !cancelled() && needs.setup.result == 'success'
+      && (needs.desktop_core.result == 'success'
+        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
+    runs-on: ubuntu-22.04
+    env:
+      CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
+      CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.setup.outputs.candidate }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # 口径同 package job 的同名步（不装组件；判据见 ci.yml 那段）。
+      - name: Install Rust stable (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      # 独立键：本 job 只编 polaris-singbox-grpc 的测试构型，与打包腿的 release 产物无交集。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: core-wire
+
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # 断言的理由同 package job 同名步：安装步静默 no-op 时，这里因 `set -u` 取不到期望值而直接红。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+
+      - name: Read Windows core toolchain pin
+        id: core-go
+        shell: bash
+        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.core-go.outputs.version }}
+          cache: false
+
+      - name: Download exact candidate core bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.CORE_BUNDLE_ARTIFACT }}
+          path: ${{ runner.temp }}/desktop-core-bundle
+
+      # 不传 --platform = 四平台全量消费并逐份校验，与打包腿同一条命令。
+      - name: Consume sing-box core bundle
+        shell: bash
+        env:
+          CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
+        run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+
+      # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
+      # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。
+      - name: Bundled core gRPC wire contract (all platforms)
+        env:
+          POLARIS_REQUIRE_KERNEL_GATE: '1'
+        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
+
   # ══ 发布第一段 ══ 把四个桌面 job 的产物按命名契约汇进**同一个 draft release**。
   #
   # 🔴 为什么这一步不可省：`find_suitable_update_asset` 全靠 **release 资产名** 选包，而
@@ -1332,13 +1536,17 @@ jobs:
     # setup 与 ci/ui 并行、ubuntu 1x，不加长关键路径。
     #
     # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**草稿写入仍必须等门**。
-    needs: [setup, ci, ui, package]
-    # 五条闸门，缺一不可：
+    # 2026-10-07：core_wire 同理列入 —— wire 契约从打包腿内的一步变成并行 job 后，「契约不成立
+    # 就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里显式接回。
+    needs: [setup, ci, ui, package, core_wire]
+    # 六条闸门，缺一不可：
     #   · `always()` —— **必需的，不是保险**：两门在单平台 dispatch、以及 release-risk.yml 以
     #     `skip_quality_gates: true` 复用本 workflow 时都是 `skipped`，而默认 needs 语义把 skipped
     #     当作「未满足」⇒ 本 job 会被整个跳过，等于该发的 release 不发。
     #   · `needs.package.result == 'success'` —— 见上面 ③：always() 关掉了默认的「needs 全绿」，
     #     必须显式写回，否则打包腿挂了也照发。
+    #   · `needs.core_wire.result == 'success'` —— 同上一条的理由；只收 success：本 job 在任何
+    #     能走到发布的入口上都必跑（它没有「按设计跳过」的形态），skipped / cancelled 一律不放行。
     #   · 两门的 allowlist，只放行 success / skipped：success = 全量发布门真跑且绿，
     #     skipped = 按设计复用调用侧门禁。必须用 allowlist，**不能写 `!= 'failure'`** ——
     #     cancelled（手动取消、并发顶替、超时收尾）也满足「不等于 failure」，会在门尚未完成时
@@ -1354,6 +1562,7 @@ jobs:
       && startsWith(github.ref, 'refs/tags/v')
       && needs.setup.outputs.full == 'true'
       && needs.package.result == 'success'
+      && needs.core_wire.result == 'success'
       && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
       && (needs.ui.result == 'success' || needs.ui.result == 'skipped')
     runs-on: ubuntu-22.04

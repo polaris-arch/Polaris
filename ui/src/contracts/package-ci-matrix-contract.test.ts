@@ -8,13 +8,14 @@
  */
 
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFile, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { runInNewContext } from 'node:vm';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -60,6 +61,66 @@ function executable(block: string): string {
     .join('\n');
 }
 
+/** job 级 `if: >-` 折叠块压成一行；喂进来的必须是 `executable()` 剥过注释的 job 块。 */
+function foldedJobIf(job: string, name: string): string {
+  const match = /^ {4}if: >-\n((?: {6}.*\n)+)/m.exec(job);
+  if (!match) throw new Error(`job '${name}' 没有折叠形态的 job 级 if —— 取材面塌了，本门此刻没有判据`);
+  return match[1].split('\n').map((line) => line.trim()).filter(Boolean).join(' ');
+}
+
+/** 矩阵 job 的 `os: >-` 表达式（去掉 `${{ }}` 外壳、压成一行）。 */
+function matrixOsExpression(job: string, name: string): string {
+  const match = /^ {8}os: >-\n((?: {10}.*\n)+)/m.exec(job);
+  if (!match) throw new Error(`job '${name}' 没有 \`os: >-\` 矩阵表达式 —— 取材面塌了，本门此刻没有判据`);
+  const flat = match[1].split('\n').map((line) => line.trim()).filter(Boolean).join(' ');
+  const inner = /^\$\{\{ (.+) \}\}$/.exec(flat);
+  if (!inner) throw new Error(`job '${name}' 的矩阵表达式不是单个 \${{ }} —— 求值器喂不进去`);
+  return inner[1];
+}
+
+/**
+ * 用 JS 求值一条 Actions 表达式。两者在这里用到的子集上同构（`==` / `!=` / `&&` / `||` / `!`，
+ * 且 `&&` / `||` 都返回操作数本身），只差一处：Actions 把**缺失的属性**当 null 并在比较时
+ * 强转成 `''`，JS 里它是 undefined 且 `undefined != ''` 为真。故调用方对「没有这个输入」
+ * 一律显式传 `''`，那正是 Actions 那一侧比较时看到的值。
+ */
+function evaluateActions(expression: string, github: { event_name: string; ref: string; os: string }): unknown {
+  return runInNewContext(expression, {
+    github: { event_name: github.event_name, ref: github.ref, event: { inputs: { os: github.os } } },
+    fromJSON: (text: string) => JSON.parse(text),
+    format: (template: string, value: string) => template.replace('{0}', value),
+  });
+}
+
+/** 本仓 ci.yml 会遇到的全部入口（`os` 列：没有该输入的事件按 Actions 语义记作 ''）。 */
+const CI_ENTRIES = [
+  { label: 'push main', event_name: 'push', ref: 'refs/heads/main', os: '' },
+  { label: 'pull_request', event_name: 'pull_request', ref: 'refs/pull/7/merge', os: '' },
+  { label: 'merge_group', event_name: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/pr-7', os: '' },
+  { label: 'tag push 经 package.yml workflow_call', event_name: 'push', ref: 'refs/tags/v1.0.0', os: '' },
+  { label: 'package.yml 手动 dispatch 经 workflow_call（payload 无 os）', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: '' },
+  { label: 'ci dispatch os=all', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'all' },
+  { label: 'ci dispatch os=ubuntu-22.04', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'ubuntu-22.04' },
+  { label: 'ci dispatch os=windows-2022', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'windows-2022' },
+  { label: 'ci dispatch os=macos-14', event_name: 'workflow_dispatch', ref: 'refs/heads/main', os: 'macos-14' },
+] as const;
+
+/**
+ * 「四处远端 digest 裁判」那组用例的两个限时。
+ *
+ * 每条用例真起一个 bash，里面再起 1–3 次 `gh api`（打本机回环上的夹具），脚本自己的重试 sleep 已被
+ * 桩掉。本机空载实测单条 90–650ms。此前子进程限时 3500ms + SIGKILL：远端 runner 上整套 vitest
+ * 并行跑时（三百多个测试文件抢 4 个核，gh 是个冷启动的 Go 二进制）偶发超过它，子进程被杀、
+ * `status` 为 null，用例红 —— 红的是机器负载，不是被测脚本。
+ *
+ * 20s 约为本机最慢实测的 30 倍：负载抖动撞不到；真挂住（gh 等不到回环夹具的响应）仍会在 20s
+ * 被 SIGKILL 并以 status=null 判红，不会无限等。限时保留、只是不再贴着正常耗时。
+ * 用例自身的限时必须**大于**子进程限时：vitest 默认 5000ms，若它先到，报出来的是一句没有
+ * stdout / stderr 的 `Test timed out`，子进程到底卡在哪就看不到了。
+ */
+const DIGEST_GUARD_CHILD_TIMEOUT_MS = 20_000;
+const DIGEST_GUARD_TEST_TIMEOUT_MS = 30_000;
+
 describe('package 全平台前置 CI 的矩阵输入', () => {
   it('空 os 必须回到完整矩阵，只有显式非 all 的 os 才能走单平台', () => {
     const ci = workflow('ci.yml');
@@ -68,6 +129,129 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(ci).toContain(`fromJSON(format('["{0}"]', github.event.inputs.os))`);
     expect(ci).toContain(`fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')`);
+
+    // 2026-10-07 拆成并行 job 后矩阵表达式有两份（lint / test）。上面三条 `toContain` 对「只改坏
+    // 其中一份」是瞎的（另一份照样喂饱它们），故按 job 取出来逐字比，并把表达式真的求值一遍：
+    // 字面量在不在 ≠ 表达式算出来对不对。
+    const lint = matrixOsExpression(executable(jobBlock(ci, 'lint')), 'lint');
+    const test = matrixOsExpression(executable(jobBlock(ci, 'test')), 'test');
+    expect(test, 'lint 与 test 两个矩阵 job 的 os 表达式不再逐字相同 —— 同一事件下两边跑的平台分家了').toBe(lint);
+    const all = ['ubuntu-22.04', 'windows-2022', 'macos-14'];
+    const expected: Record<(typeof CI_ENTRIES)[number]['label'], string[]> = {
+      'push main': ['ubuntu-22.04'],
+      pull_request: all,
+      merge_group: all,
+      'tag push 经 package.yml workflow_call': all,
+      // run 32357370395 的真实失败形态：这一格若算出 [""]，job 永久 pending。
+      'package.yml 手动 dispatch 经 workflow_call（payload 无 os）': all,
+      'ci dispatch os=all': all,
+      'ci dispatch os=ubuntu-22.04': ['ubuntu-22.04'],
+      'ci dispatch os=windows-2022': ['windows-2022'],
+      'ci dispatch os=macos-14': ['macos-14'],
+    };
+    for (const entry of CI_ENTRIES) {
+      expect(evaluateActions(lint, entry), entry.label).toEqual(expected[entry.label]);
+    }
+  });
+
+  it('ci.yml 三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且没有任何一个 job 能被静默关掉', () => {
+    // 背景：2026-10-07 之前交叉 clippy / Android dep-info 对差 / 豁免反腐烂是矩阵 job 里
+    // `if: runner.os == 'Linux'` 的三步 —— 「ubuntu 腿在跑」⇔「这三步在跑」由构造保证。
+    // 独立成 `cross` job 后这个等价关系要靠 job 级 `if` 维持，而 android-impact-coverage-contract
+    // 的 D2 / D4 只查**步级** `if` / continue-on-error：job 级写一个 `if: false` 它们全绿。
+    // 本条补的就是这条新路径。
+    const ci = workflow('ci.yml');
+    const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
+    expect(jobs, 'ci.yml 的 job 集合变了 —— 新 job 要有人过目：它的缓存键、它能不能被关掉').toEqual([
+      'lint', 'cross', 'test',
+    ]);
+
+    const lint = executable(jobBlock(ci, 'lint'));
+    const cross = executable(jobBlock(ci, 'cross'));
+    const test = executable(jobBlock(ci, 'test'));
+
+    // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属三步都在 cross）。
+    const home: [string, string][] = [
+      ['- name: Check formatting', 'lint'],
+      ['- name: Clippy (deny warnings)', 'lint'],
+      ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
+      ['- name: Resolve core-owned Cronet dependencies', 'lint'],
+      ['- name: Cross-check platform targets', 'cross'],
+      ['- name: Android impact face must be registered', 'cross'],
+      ['- name: Cross-target exemptions must still be necessary', 'cross'],
+      ['- name: Build\n', 'test'],
+      ['- name: Test\n', 'test'],
+    ];
+    const blocks = { lint, cross, test };
+    for (const [needle, owner] of home) {
+      for (const [name, block] of Object.entries(blocks)) {
+        expect(block.includes(needle), `「${needle.trim()}」应只在 ${owner} job 里（现在查的是 ${name}）`)
+          .toBe(name === owner);
+      }
+    }
+
+    // ② 矩阵 job 没有 job 级 if / continue-on-error；cross 只有那一条 dispatch 单平台条件。
+    for (const [name, block] of [['lint', lint], ['test', test]] as const) {
+      expect(block, `${name} job 出现了 job 级 if —— 它可以被整个关掉而步级判据全绿`).not.toMatch(/^ {4}if:/m);
+      expect(block).toMatch(/^ {4}runs-on: \$\{\{ matrix\.os \}\}$/m);
+    }
+    for (const [name, block] of Object.entries(blocks)) {
+      expect(block, `${name} job 挂了 continue-on-error —— 红了也不拦合入`).not.toMatch(/^ {4}continue-on-error:/m);
+    }
+    expect(cross).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
+
+    // ③ cross 的 job 级 if 逐入口求值：它跑 ⇔ 同一入口下矩阵里有 ubuntu 腿（与拆分前逐格等价）。
+    const crossIf = foldedJobIf(cross, 'cross');
+    const matrix = matrixOsExpression(lint, 'lint');
+    let ran = 0;
+    let skipped = 0;
+    for (const entry of CI_ENTRIES) {
+      const hasUbuntuLeg = (evaluateActions(matrix, entry) as string[]).includes('ubuntu-22.04');
+      const runs = evaluateActions(crossIf, entry);
+      expect(typeof runs, `${entry.label}: cross 的 if 没有求出布尔值`).toBe('boolean');
+      expect(runs, `${entry.label}: cross job 是否运行，必须等于该入口下是否存在 ubuntu 腿`).toBe(hasUbuntuLeg);
+      if (runs) ran += 1; else skipped += 1;
+    }
+    // 反向对照：两种结论都真的出现过（否则「相等」可以被两边同时恒真 / 恒假满足）。
+    expect(ran).toBe(7);
+    expect(skipped).toBe(2);
+    // 求值器自身的牙：把条件改成常量假，必须被上面那套逐入口比对判红。
+    expect(evaluateActions('!(true)', CI_ENTRIES[0])).toBe(false);
+
+    // ④ 豁免反腐烂步的 PR 排除原样保留（去掉的只是在 ubuntu 专属 job 里恒真的 runner.os 那一半）。
+    expect(cross).toContain(
+      "- name: Cross-target exemptions must still be necessary\n        if: github.event_name != 'pull_request'\n",
+    );
+  });
+
+  it('Rust 缓存键：每个 job 恰一个 rust-cache，键各自独立且是稳定字面量', () => {
+    // 三个 job 的 target/ 内容互不通用（clippy metadata / 交叉 check 单元 / dev 全量 codegen）。
+    // 共用键 = 谁最后跑完谁覆盖，另外两个下次恢复到的是别人的产物 —— 等于次次冷编。
+    const keysOf = (block: string) =>
+      [...block.matchAll(/uses: Swatinem\/rust-cache@v2\n {8}with:\n(?: {10}.*\n)*? {10}key: (.+)\n/g)].map((m) => m[1]);
+    const ci = workflow('ci.yml');
+    const ciKeys = ['lint', 'cross', 'test'].map((name) => {
+      const block = executable(jobBlock(ci, name));
+      expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);
+      const keys = keysOf(block);
+      expect(keys, `${name} job 的 rust-cache 没有显式 key`).toHaveLength(1);
+      return keys[0];
+    });
+    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且三者互不相同。
+    expect(ciKeys).toEqual(['lint', 'cross', 'test']);
+    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这三个 job 的 rust-cache').toHaveLength(3);
+
+    const pkg = workflow('package.yml');
+    const pkgKeys = keysOf(executable(jobBlock(pkg, 'package')));
+    const wireKeys = keysOf(executable(jobBlock(pkg, 'core_wire')));
+    // 发行构型的键仍是裸 label（与 2026-10-07 之前逐字相同）；轻量构型只多一个后缀。
+    expect(pkgKeys).toEqual(["${{ matrix.label }}${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}"]);
+    expect(wireKeys).toEqual(['core-wire']);
+    expect(executable(pkg).match(/uses: Swatinem\/rust-cache@v2/g) ?? []).toHaveLength(2);
+    const suffix = (light: string) =>
+      runInNewContext("env.POLARIS_LIGHT_BUILD == '1' && '-light' || ''", { env: { POLARIS_LIGHT_BUILD: light } });
+    expect(suffix('0')).toBe('');
+    expect(suffix('1')).toBe('-light');
   });
 
   it('package 的 dispatch 输入确实只有 platform，并复用 ci.yml 作全平台门', () => {
@@ -113,7 +297,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(release, '剥注释没生效 —— 块里仍有整行注释').not.toMatch(/^\s*#/m);
 
     // 判据挂在第一次 release mutation 上（桌面草稿 job）；门未过时连草稿都不写。
-    expect(release).toContain("needs: [setup, ci, ui, package]");
+    // 2026-10-07：needs 多了 core_wire —— wire 契约从打包腿内的一步变成并行 job，
+    // 「契约不成立就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里接回（见下）。
+    expect(release).toContain("needs: [setup, ci, ui, package, core_wire]");
     expect(release).toContain(
       "needs.ci.result == 'success' || needs.ci.result == 'skipped'",
     );
@@ -127,6 +313,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       release,
       'release 的 if 里加了 always() 却没显式要求 package 成功 —— 打包腿全挂也会发布',
     ).toContain("needs.package.result == 'success'");
+    // wire job 同理，且只收 success：它没有「按设计跳过」的形态（凡能走到发布的入口它都必跑）。
+    expect(
+      release,
+      'release 的 if 没有显式要求 core_wire 成功 —— wire 契约不成立也会发布',
+    ).toContain("needs.core_wire.result == 'success'");
+    expect(release).not.toContain("needs.core_wire.result == 'skipped'");
+    expect(pkg).not.toContain("needs.core_wire.result != 'failure'");
 
     // cancelled 也满足「不等于 failure」：全文范围内都不许出现这种放行式判据。
     expect(pkg).not.toContain("needs.ci.result != 'failure'");
@@ -146,6 +339,14 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(pkgJob).toContain("needs.setup.result == 'success'");
     expect(pkgJob).toContain("needs.desktop_core.result == 'success'");
     expect(pkgJob).toContain("needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''");
+    // 状态函数必须是 `!cancelled()`：`always()` 恒真，run 被取消时在途打包腿不会停，
+    // 旧提交的四条腿会把并发组占到跑完（Release Risk run 37638779024 实证，见 package.yml 注释）。
+    // 完整真值表（含取消态）在 scripts/desktop-core-ci-wiring.test.mjs 里按表达式求值。
+    for (const [name, block] of [['package', pkgJob], ['core_wire', executable(jobBlock(pkg, 'core_wire'))]] as const) {
+      const condition = foldedJobIf(block, name);
+      expect(condition.startsWith('!cancelled() && '), `${name} 的 if 不以 !cancelled() 起头：${condition}`).toBe(true);
+      expect(condition, `${name} 的 if 里出现了 always() —— 它对取消免疫`).not.toContain('always()');
+    }
     // needs 即等待。package 一旦能读到 needs.ci/needs.ui，就说明它在等两门，并行拓扑已被推翻。
     expect(
       pkgJob,
@@ -517,18 +718,22 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
           api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
           expected_sha: sha, android_asset: 'polaris-1.0.0-android-arm64.apk', tag: 'v1.0.0' },
         encoding: 'utf8',
-        timeout: 3500,
+        timeout: DIGEST_GUARD_CHILD_TIMEOUT_MS,
         killSignal: 'SIGKILL',
         signal: controller.signal,
-      }).then(({ stdout, stderr }) => ({ status: 0, stdout, stderr }),
-        (error: { code: number; stdout: string; stderr: string }) =>
-          ({ status: error.code, stdout: error.stdout, stderr: error.stderr }));
-      expect(result.status, `guard ${index}, case ${caseIndex}: ${result.stdout}${result.stderr}`).toBe(expectedStatus);
+      }).then(({ stdout, stderr }) => ({ status: 0, signal: null as string | null, stdout, stderr }),
+        (error: { code: number | null; signal: string | null; stdout: string; stderr: string }) =>
+          ({ status: error.code, signal: error.signal, stdout: error.stdout, stderr: error.stderr }));
+      // 被限时杀掉时 status 是 null、signal 是 SIGKILL：把它写进失败文案，免得读成「脚本判错了」。
+      expect(
+        result.status,
+        `guard ${index}, case ${caseIndex} (signal=${result.signal}): ${result.stdout}${result.stderr}`,
+      ).toBe(expectedStatus);
       expect(requests).toBeGreaterThan(before);
     } finally {
       await dispose();
     }
-  });
+  }, DIGEST_GUARD_TEST_TIMEOUT_MS);
 
   it('最终清单包含从草稿回读的 APK，并与远端完整资产集合双向对账后才公开', () => {
     const release = executable(jobBlock(workflow('package.yml'), 'release'));
@@ -580,5 +785,186 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(promote.indexOf('diff -u "$expected" "$actual"')).toBeLessThan(
       promote.indexOf('gh release edit "$TAG"'),
     );
+  });
+});
+
+describe('风险门轻量构型：只在 release-risk 路径生效，发行构型一字不动', () => {
+  const STEP = 'Select installer build weight (release profile vs risk-gate light)';
+  const ALLOWED = ['CARGO_PROFILE_RELEASE_CODEGEN_UNITS', 'CARGO_PROFILE_RELEASE_LTO'];
+
+  /** 取出那一步的 shell 脚本本体（去掉 YAML 的 10 格缩进）。 */
+  function weightScript(pkg: string): string {
+    const step = stepBlock(jobBlock(pkg, 'package'), STEP);
+    const runAt = step.indexOf('\n        run: |\n');
+    if (runAt < 0) throw new Error('构建权重步没有 run 块 —— 取材面塌了');
+    // 只取 run 块本体：遇到第一行缩进不足 10 格的非空行即止。不截的话，下一步上方的整段
+    // YAML 注释（缩进 6 格）会被 `slice(10)` 削成裸词当命令执行。
+    const body: string[] = [];
+    for (const line of step.slice(runAt + '\n        run: |\n'.length).split('\n')) {
+      if (line.trim() !== '' && !line.startsWith(' '.repeat(10))) break;
+      body.push(line.slice(10));
+    }
+    return body.join('\n');
+  }
+
+  /** 按给定入口真跑一遍那段脚本，返回退出码与它写进 GITHUB_ENV 的内容。 */
+  function runWeight(script: string, env: Record<string, string>) {
+    const dir = mkdtempSync(join(tmpdir(), 'polaris-build-weight-'));
+    try {
+      const githubEnv = join(dir, 'github-env');
+      const summary = join(dir, 'summary');
+      writeFileSync(githubEnv, '');
+      writeFileSync(summary, '');
+      // 从宿主环境里剔掉任何 CARGO_PROFILE_*：脚本的第一道闸就是查它，宿主恰好设了会让每条用例都红。
+      const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('CARGO_PROFILE_')));
+      const result = spawnSync('bash', ['-c', script], {
+        env: { ...base, GITHUB_ENV: githubEnv, GITHUB_STEP_SUMMARY: summary, ...env },
+        encoding: 'utf8',
+      });
+      return { status: result.status, output: result.stdout + result.stderr, written: readFileSync(githubEnv, 'utf8') };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const LIGHT = 'CARGO_PROFILE_RELEASE_LTO=off\nCARGO_PROFILE_RELEASE_CODEGEN_UNITS=16\n';
+  const branch = 'refs/heads/main';
+  const tag = 'refs/tags/v1.0.0';
+
+  /** 整张入口表。任何一格不符即抛 —— 下面的变异对照靠它抛。 */
+  function checkWeight(script: string) {
+    const cases: [string, Record<string, string>, number, string][] = [
+      // 发行路径：什么都不写，cargo 读到的就是 Cargo.toml 原样。
+      ['tag 发布', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: tag, POLARIS_UPLOAD_ARTIFACTS: '1' }, 0, ''],
+      ['手动全量打包', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '1' }, 0, ''],
+      // 不上传 ≠ 轻量：只有开关本身能选中轻量构型（这一格同时是「发行分支不再提前返回」变异的判据）。
+      ['复用但未要求轻量', { POLARIS_LIGHT_BUILD: '0', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '0' }, 0, ''],
+      // 风险门：恰好两个键。
+      ['release-risk 复用', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '0' }, 0, LIGHT],
+      // fail-closed 三条。
+      ['轻量落在 tag 上', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: tag, POLARIS_UPLOAD_ARTIFACTS: '0' }, 1, ''],
+      ['轻量却要上传', { POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '1' }, 1, ''],
+      ['发行路径上环境里已有 profile 覆盖', {
+        POLARIS_LIGHT_BUILD: '0', GITHUB_REF: tag, POLARIS_UPLOAD_ARTIFACTS: '1',
+        CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true',
+      }, 1, ''],
+      ['风险门上环境里已有别的 profile 覆盖', {
+        POLARIS_LIGHT_BUILD: '1', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '0',
+        CARGO_PROFILE_RELEASE_PANIC: 'abort',
+      }, 1, ''],
+      // 开关取值只认 0 / 1：空串（变量没接上）与 'true' 都不得被当成「发行构型」放过去。
+      ['开关没接上', { POLARIS_LIGHT_BUILD: '', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '0' }, 1, ''],
+      ['开关写成 true', { POLARIS_LIGHT_BUILD: 'true', GITHUB_REF: branch, POLARIS_UPLOAD_ARTIFACTS: '0' }, 1, ''],
+    ];
+    for (const [name, env, status, written] of cases) {
+      const actual = runWeight(script, env);
+      if (actual.status !== status || actual.written !== written) {
+        throw new Error(
+          `${name}: 期望 rc=${status} 且写入 ${JSON.stringify(written)}，` +
+            `实为 rc=${actual.status} 写入 ${JSON.stringify(actual.written)}\n${actual.output}`,
+        );
+      }
+    }
+  }
+
+  it('构建权重步按各入口真跑：发行路径零写入，风险门恰写两个键，三条 fail-closed 都咬得住', () => {
+    const script = weightScript(workflow('package.yml'));
+    // 切片自检：拿到的是脚本本体，且没有把下一步卷进来。
+    expect(script).toContain('set -euo pipefail');
+    expect(script).not.toContain('- name:');
+    expect(script, '切片把下一步上方的注释卷进来了').not.toContain('D7');
+    expect(script.trimEnd().endsWith('>> "$GITHUB_STEP_SUMMARY"'), '切片没有落在脚本最后一行').toBe(true);
+    checkWeight(script);
+
+    // 变异对照：把每一道闸各拆一次，整张表必须红（否则上面的绿没有信息量）。
+    const mutations: [string, string, string][] = [
+      ['拆掉 tag 闸', 'refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;', 'refs/tags/*) ;;'],
+      ['拆掉上传闸', '[ "$POLARIS_UPLOAD_ARTIFACTS" = 0 ] || {', 'true || {'],
+      ['拆掉环境泄漏闸', 'if [ -n "$leaked" ]; then', 'if false; then'],
+      ['非法取值落到发行构型', "*) echo \"::error::POLARIS_LIGHT_BUILD 取值非法：'$POLARIS_LIGHT_BUILD'\"; exit 1 ;;", '*) exit 0 ;;'],
+      ['发行分支不再提前返回（会一路走到写覆盖）', 'exit 0 ;;', ';;'],
+      ['多写一个键', "  echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'\n", "  echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'\n  echo 'CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true'\n"],
+    ];
+    for (const [name, from, to] of mutations) {
+      const mutated = script.replace(from, to);
+      expect(mutated, `变异「${name}」没打上 —— 针与脚本原文不符，这条对照是空的`).not.toBe(script);
+      expect(() => checkWeight(mutated), `变异「${name}」没有让入口表转红`).toThrow();
+    }
+  });
+
+  it('开关只认调用方显式传入的 true，且全仓只有 release-risk 的打包腿在传', () => {
+    const pkg = workflow('package.yml');
+    const pkgJob = executable(jobBlock(pkg, 'package'));
+    const match = pkgJob.match(/^ {6}POLARIS_LIGHT_BUILD: \$\{\{ (.+) \}\}$/m);
+    expect(match, 'package job 缺 POLARIS_LIGHT_BUILD 表达式').not.toBeNull();
+    const evaluate = (inputs: Record<string, unknown>) => runInNewContext(match![1], { inputs });
+    // tag push 与本 workflow 的手动 dispatch 都没有这个输入。
+    expect(evaluate({})).toBe('0');
+    expect(evaluate({ platform: 'all' })).toBe('0');
+    expect(evaluate({ light_build: false })).toBe('0');
+    expect(evaluate({ light_build: true })).toBe('1');
+    expect(pkgJob.match(/^\s+POLARIS_LIGHT_BUILD:/gm) ?? [], 'step 不得另行覆盖构建权重开关').toHaveLength(1);
+
+    // 输入只在 workflow_call 上声明、缺省 false；手动 dispatch 入口没有它（手动 = 发行语义）。
+    const dispatch = pkg.slice(pkg.indexOf('\n  workflow_dispatch:\n'), pkg.indexOf('\n  workflow_call:\n'));
+    expect(dispatch.length).toBeGreaterThan(50);
+    expect(executable(dispatch)).not.toContain('light_build');
+    expect(executable(pkg)).toContain(
+      '      light_build:\n        type: boolean\n        required: false\n        default: false\n',
+    );
+
+    // 传 true 的调用点全仓恰一处，就在 release-risk 的打包腿上，且与「不上传」成对。
+    const all = readdirSync(join(REPO_ROOT, '.github/workflows'))
+      .filter((name) => /\.ya?ml$/.test(name))
+      .map((name) => executable(workflow(name)));
+    expect(all.length, '工作流目录一个文件都没读到 —— 取材面塌了').toBeGreaterThan(4);
+    expect(all.join('\n').match(/light_build:\s*true/g) ?? []).toHaveLength(1);
+    const riskPackage = executable(jobBlock(workflow('release-risk.yml'), 'package'));
+    expect(riskPackage).toContain('uses: ./.github/workflows/package.yml');
+    expect(riskPackage).toContain('light_build: true');
+    expect(riskPackage).toContain('upload_artifacts: false');
+  });
+
+  it('cargo profile 的环境变量覆盖只有这一处入口，且排在缓存与两次构建之前', () => {
+    // 这是一条绕开 `release_escape_hatches.rs` 的路径：那边的发行构型断言（lto = "fat" /
+    // codegen-units = 1 / 不得开 debug-assertions / 不得 panic = "abort"）只读 Cargo.toml，
+    // 而 `CARGO_PROFILE_RELEASE_*` 环境变量能改写其中任何一条且不动任何文件。
+    // 故把入口钉死：全部 workflow 里只有构建权重步提到它，且只有这两个键。
+    const names = readdirSync(join(REPO_ROOT, '.github/workflows')).filter((name) => /\.ya?ml$/.test(name));
+    expect(names).toContain('package.yml');
+    expect(names).toContain('android.yml');
+    const pattern = /CARGO_PROFILE_[A-Z][A-Z_]*/g;
+    for (const name of names) {
+      const hits = executable(workflow(name)).match(pattern) ?? [];
+      if (name === 'package.yml') {
+        expect([...new Set(hits)].sort(), 'package.yml 里出现了两个放行键之外的 profile 覆盖').toEqual(ALLOWED);
+      } else {
+        expect(hits, `${name} 出现了 cargo profile 环境变量覆盖 —— 发行构型的源码门看不见它`).toEqual([]);
+      }
+    }
+    const pkg = workflow('package.yml');
+    const pkgJob = executable(jobBlock(pkg, 'package'));
+    const step = executable(stepBlock(jobBlock(pkg, 'package'), STEP));
+    const count = (text: string) => (text.match(/CARGO_PROFILE_/g) ?? []).length;
+    expect(count(step), '构建权重步里一处 CARGO_PROFILE_ 都没有 —— 取材面塌了').toBeGreaterThan(2);
+    expect(count(executable(pkg)), 'CARGO_PROFILE_ 出现在构建权重步之外').toBe(count(step));
+    // cargo 的 config 文件同样能写 [profile.*]，与环境变量是同一类旁路。
+    const cargoConfig = executable(readFileSync(join(REPO_ROOT, '.cargo/config.toml'), 'utf8'));
+    expect(cargoConfig).toContain('[target.x86_64-pc-windows-msvc]');
+    expect(cargoConfig, '.cargo/config.toml 出现了 [profile.*] —— 它会改写发行构型而 Cargo.toml 一字不动')
+      .not.toMatch(/^\s*\[profile[.\]]/m);
+
+    // 顺序：权重先定，再恢复缓存（键靠它分开），再编 helper 与 app（两次 cargo 构建同吃一份构型）。
+    const at = (needle: string) => {
+      const index = pkgJob.indexOf(needle);
+      expect(index, `package job 里找不到「${needle}」`).toBeGreaterThanOrEqual(0);
+      return index;
+    };
+    const weight = at(`- name: ${STEP}\n`);
+    expect(weight).toBeLessThan(at('- name: Setup Rust cache\n'));
+    expect(at('- name: Setup Rust cache\n')).toBeLessThan(at('- name: Build and stage privileged helper\n'));
+    expect(at('- name: Build and stage privileged helper\n')).toBeLessThan(at('- name: Build installers\n'));
+    // 这一步自己不能被关掉：没有步级 if / continue-on-error（发行路径上它是「环境里没有覆盖」的唯一检查）。
+    expect(step).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
   });
 });

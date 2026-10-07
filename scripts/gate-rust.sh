@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# gate-rust.sh —— .github/workflows/ci.yml 里 Rust 门（lint-and-test job）的本机镜像。
+# gate-rust.sh —— .github/workflows/ci.yml 里 Rust 门（lint / cross / test 三个并行 job）的本机镜像。
+# CI 侧 2026-10-07 起并行跑；本机仍按下面的顺序串行跑同一批命令，判据逐字相同（对拍见
+# scripts/gate-rust-ci-parity.test.mjs，它按步骤名取材，不依赖步骤住在哪个 job）。
 #
 # 起因（2026-09-02）：本机手跑门时用的命令比 CI 弱，本机全绿但取材面比 CI 窄——
 # 具体漏了 clippy 的 `--workspace`/`RUSTFLAGS="-D warnings"`，doc 门漏了

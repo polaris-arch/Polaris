@@ -194,6 +194,55 @@ esac
     expect(pkg).toContain("if: env.POLARIS_UPLOAD_ARTIFACTS == '1'");
   });
 
+  it('并发组：同一 PR / 分支上新提交取消旧运行，merge queue 不取消，且被取消的腿里没有写 release 的任务', () => {
+    // 旧判据（隐含在 YAML 里，此前无门）：PR 与 main 取消在途。新判据是它的超集：除 merge queue
+    // 外一律取消（多出手动 dispatch）。逐事件求值，不是只看字面量在不在。
+    const match = risk.match(
+      /^concurrency:\n  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}\n/m,
+    );
+    expect(match, 'release-risk.yml 缺顶层 concurrency 段').not.toBeNull();
+    expect(match![1]).toBe(
+      'release-risk-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}',
+    );
+    const cancels = (eventName: string, ref: string) =>
+      runInNewContext(match![2], { github: { event_name: eventName, ref } });
+    expect(cancels('pull_request', 'refs/pull/7/merge')).toBe(true);
+    expect(cancels('push', 'refs/heads/main')).toBe(true);
+    expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(true);
+    // 队列里的每一组都必须跑完才能出结论。
+    expect(cancels('merge_group', 'refs/heads/gh-readonly-queue/main/pr-7')).toBe(false);
+
+    // 取消只有在被取消的 run 里没有副作用任务时才安全。三条各自成立才算数：
+    // ① 本 workflow 没有 tag 触发；
+    const triggers = risk.slice(risk.indexOf('\non:\n'), risk.indexOf('\npermissions:\n'));
+    expect(triggers.length).toBeGreaterThan(40);
+    expect(triggers).not.toMatch(/^\s+tags:/m);
+    expect(triggers).not.toContain('release:');
+    // ② package.yml 里第一次写 release 的 job 只在 v* tag 上可达，后两段经 needs 链继承它；
+    const executable = (block: string) => block.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+    const desktop = executable(jobSection(pkg, 'release_desktop', 'package.yml'));
+    expect(desktop).toContain("&& startsWith(github.ref, 'refs/tags/v')");
+    expect(executable(jobSection(pkg, 'android_release', 'package.yml'))).toContain('needs: release_desktop');
+    const finalStart = pkg.indexOf('\n  release:\n');
+    expect(finalStart).toBeGreaterThan(0);
+    const finalJob = executable(pkg.slice(finalStart));
+    expect(finalJob).toContain('needs: [release_desktop, android_release]');
+    expect(finalJob).toContain("needs.release_desktop.result == 'success'");
+    // 写 release 的命令只出现在这三个 job 里（package / core_wire 等构建腿一条都没有）。
+    for (const name of ['setup', 'package', 'core_wire'] as const) {
+      expect(executable(jobSection(pkg, name, 'package.yml')), `package.yml 的 ${name} job 出现了 release 写操作`)
+        .not.toMatch(/gh release (?:create|upload|edit|delete)/);
+    }
+    // ③ 本 workflow 调 android.yml 时不传 publish_release（写 release 的 release-apk 因此不可达）。
+    const androidJob = executable(jobSection(risk, 'android', 'release-risk.yml'));
+    expect(androidJob).toContain('uses: ./.github/workflows/android.yml');
+    expect(androidJob).not.toContain('publish_release');
+    // 安装包不上传、且是轻量构型（不是可分发物）。
+    const pkgJob = executable(jobSection(risk, 'package', 'release-risk.yml'));
+    expect(pkgJob).toContain('upload_artifacts: false');
+    expect(pkgJob).toContain('light_build: true');
+  });
+
   it('Android 复用调用 job 满足嵌套发布 job 的权限上限', () => {
     const androidJob = jobSection(risk, 'android', 'release-risk.yml');
     expect(androidJob).toContain('uses: ./.github/workflows/android.yml');

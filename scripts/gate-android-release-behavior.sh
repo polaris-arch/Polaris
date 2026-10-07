@@ -113,7 +113,7 @@
 #
 #   JAVA_HOME=<JDK 21> ANDROID_HOME=<Android SDK> bash scripts/gate-android-release-behavior.sh
 #
-# 判据要 Android SDK，故 `ci.yml` 的 lint-and-test 腿跑不了它（那条腿只有 Rust 工具链）。
+# 判据要 Android SDK，故 `ci.yml` 的 Rust 各 job（lint / cross / test）跑不了它（那里只有 Rust 工具链）。
 # 它挂在 `.github/workflows/android.yml` 的 `apk` job —— 那条腿本来就要装 SDK/NDK 并铺
 # `tauri android build` 的生成物，而本裁判的取材面（三份 `.pro` 里有两份是生成物）恰好要求
 # 生成物在场。挂在 `release-smoke` 是错的：那条腿默认不跑，而这些判据必须每次都说话。

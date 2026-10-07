@@ -632,7 +632,7 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       'release 路径的**行为**裁判：跑 gradle 配置期，断言零凭据必红、逃生门只认命令行实参、'
       + 'R8 在 release 任务图里恰好一次而 debug 里零次、AGP 手里那份 proguardFiles 清单三份都在。'
       + '此前这些判据全是「build.gradle.kts 里含某串」，实测 24 种变异下一条不红而行为已经变了 ⇒ '
-      + '这条腿是它们今天唯一的观测面（判据要 Android SDK，ci.yml 的 lint-and-test 跑不了）。',
+      + '这条腿是它们今天唯一的观测面（判据要 Android SDK，ci.yml 的 lint / cross / test 都跑不了）。',
   },
   'scripts/assert-r8-evidence.mjs': {
     why:

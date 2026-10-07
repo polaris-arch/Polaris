@@ -15,9 +15,31 @@ on:
 permissions:
   contents: read
 
+# 同一 PR / 同一分支上，新提交取消旧提交的在途运行（2026-10-07 复核并收口）。
+#
+# 🔴 此前「新一批 pending 到旧一批结束」的成因**不在本段**：本段早就对 PR 与 main 写了取消。
+#    真正让取消落空的是 package.yml 的 package job 用 `always()` 作状态函数 —— 取消时 GitHub 对在途
+#    job 重新求值 `if`，恒真的不取消，四条打包腿（各 14–25 分钟）照跑到底，新跑在本并发组里干等。
+#    已在那边改成 `!cancelled()`（实证与 run 号写在该 job 的 `if` 上方）。只改本段修不了那个现象。
+#
+# 本段的改动只有一处：手动 dispatch 也纳入取消（原先只有 PR 与 main）。同一分支上再次 dispatch，
+# 旧跑验的是已被取代的提交，没有消费者。
+# merge queue 不取消：组键是 merge group 自己的 head_sha，每组唯一，本来就不会撞；显式排除是为了
+# 不让这条语义依赖「键恰好唯一」—— 队列里的每一组都必须跑完才能出结论。
+#
+# 取消不会打断任何有副作用的任务（逐条核过）：
+#   · 本 workflow 的触发面是 PR / merge queue / main push / 分支上的手动 dispatch，没有 tag；
+#     手动入口遇到非 branch ref 在 classify 当场红，后面的腿一条都不起。
+#   · package.yml 里写 release 的三个 job（release_desktop / android_release / release）都要求
+#     `startsWith(github.ref, 'refs/tags/v')`（后两者经 needs 链继承），在上述 ref 上恒不可达；
+#   · android.yml 里唯一写 release 的 `release-apk` 只在 `publish_release` 为真时跑，全仓只有
+#     package.yml 的 tag 发布段传 true；
+#   · 轻量构型的安装包不上传（`upload_artifacts: false`）；会留下的只有内核源码 bundle 与
+#     Android mapping 这两类 artifact（7 天保留期，按 run 隔离，被取消的 run 留下半套无消费者）。
+# 发布（tag）走的是 package.yml 自己的并发组，那里 tag ref 从不取消在途，与本段无关。
 concurrency:
   group: release-risk-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
 
 jobs:
   pc_runtime_release_policy:
@@ -189,6 +211,9 @@ jobs:
         run: node scripts/fetch-protoc.mjs
 
       # 只读四平台 core descriptor，不启动 sing-box；REQUIRE 仅作用于本步。
+      # 判据与宿主无关，全 workflow 跑一次即可：package.yml 那侧自 2026-10-07 起也只在它的
+      # `core_wire` job 里跑一次（不再每条打包腿各跑一遍）。本步保留，覆盖「命中内核但没有
+      # 任何打包腿被选中」的情形，并且排在打包之前先给出归因更窄的失败。
       - name: Bundled core gRPC wire contract (all platforms)
         if: needs.classify.outputs.kernel == 'true'
         env:
@@ -236,6 +261,11 @@ jobs:
       skip_quality_gates: true
       run_kernel_gates: false
       upload_artifacts: false
+      # 轻量构型（不做 fat LTO、并行 codegen）：风险门验的是「打包链通不通、包里齐不齐」，
+      # 不是发行二进制的体积。产物不是可分发物；与 `upload_artifacts: false` 必须成对出现
+      # （package.yml 的 `Select installer build weight` 步对「轻量 + 上传」当场红）。
+      # 风险门因此**不再验** fat LTO 链接本身，那只在 tag / 手动全量的发行构建上暴露。
+      light_build: true
       core_candidate: ${{ needs.classify.outputs.candidate }}
       core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
     secrets: inherit
