@@ -95,6 +95,7 @@ npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # وابستگی‌های رابط کاربری
 # هسته sing-box: بسته چهارسکویی ساخته‌شده از کد منبع و وصله‌های قفل‌شده (خروجی workflow «Desktop Core Sources» در CI برای همین commit)
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+# روش دریافت بستهٔ هسته یا ساخت هسته فقط برای سکوی فعلی: docs/build-and-package.en.md، بخش "Two ways to obtain the core bundle"
 node scripts/fetch-cronet.mjs --platform=linux  # دریافت libcronet.so در کنار هسته Linux
 node scripts/fetch-dashboard.mjs   # دریافت پنل داخلی
 tauri build --config src-tauri/tauri.linux.conf.json
@@ -130,7 +131,7 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 <div dir="rtl">
 
-هسته به‌صورت یک فرایند فرزند sidecar اجرا می‌شود و از طریق صفحه مدیریت gRPC کنترل می‌گردد. TUN و پروکسی سیستمی را helperهای دارای دسترسی ویژه در هر سه سکو بر عهده دارند (macOS / Windows / Linux، همگی با Rust).
+هسته به‌صورت یک فرایند فرزند sidecar اجرا می‌شود و از طریق صفحه مدیریت gRPC کنترل می‌گردد. کارهای نیازمند دسترسی ویژه — راه‌اندازی هسته برای TUN و تصاحب سیستم — در هر سه سکو (macOS / Windows / Linux) به helperهای نوشته‌شده با Rust سپرده می‌شود؛ مسیر پروکسی سیستمی که به helper نیاز ندارد، مستقیماً توسط crate ‏`system-integration` در سمت برنامه مدیریت می‌شود و بازگردانی تنظیمات نیز بر عهده همان است.
 
 ## مستندات
 

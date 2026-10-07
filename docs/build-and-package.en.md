@@ -91,6 +91,25 @@ Use `node scripts/fetch-cronet.mjs --platform=linux` or `--platform=win` to fetc
 
 The core bundle is produced by `.github/workflows/desktop-core.yml`: four native runners (Linux / Windows / macOS x64 / macOS arm64) each run `node scripts/fetch-core.mjs --producer --platform=<linux|win|mac-x64|mac-arm64> --bundle-dir=<dir> --candidate=<commit SHA>`, and `--assemble` then writes `bundle.json` for the combined outputs. `--producer` accepts exactly one platform and never cross-builds. Consumption requires `--candidate` to equal the current `HEAD` with no modified tracked files; even when `--platform` selects a single platform to place, all four binaries and receipts are verified first. A missing bundle or incomplete `sourceBuild` pins is a hard failure: there is no fallback to official Release assets or an old cache.
 
+#### Two ways to obtain the core bundle
+
+**The full four-platform bundle (for packaging and releases).** `desktop-core.yml` can only be called by other workflows. In a repository you control (or a fork), trigger `release-risk.yml` or `package.yml` manually; both call `desktop-core.yml`. When the run finishes, download the artifact named `desktop-core-bundle-<commit SHA>-<run id>-<run attempt>`; the extracted directory is the `--bundle-dir`. Artifacts are kept for 7 days and are only valid for the commit that produced them.
+
+```bash
+gh run download <run id> --name 'desktop-core-bundle-<commit SHA>-<run id>-<run attempt>' --dir <core-bundle-dir>
+```
+
+**Only the core for the host platform (for local development).** Without a four-platform bundle you can produce just the host platform's core and place it in the resource directory by hand. This path skips the four-platform consistency checks; use it for local development and debugging only, never for release packages.
+
+```bash
+# Requires Go (goVersion in source-manifest.json), Python 3, git, and access to github.com for the upstream source
+# HEAD must equal --candidate and the working tree must have no modified tracked files
+node scripts/fetch-core.mjs --producer --platform=linux --bundle-dir=<dir> --candidate="$(git rev-parse HEAD)"
+mkdir -p resources/linux && cp <dir>/linux/sing-box resources/linux/sing-box
+```
+
+`--platform` is one of `linux`, `win`, `mac-x64`, `mac-arm64` and must match the host (there is no cross-platform build); on Windows the file is `sing-box.exe`. If the installed Go is not the version the manifest requires, set `GOTOOLCHAIN=go<version>` to let Go fetch the matching toolchain.
+
 All three commands above must be run manually: `tauri.conf.json` has **no** `build.beforeBundleCommand`, so `tauri build` does not fetch anything for you. (This section previously described a `beforeBundleCommand` safety net; that key never existed, which made `scripts/verify-dashboard-resources.mjs` an orphan that never ran. The script has been deleted.)
 
 The safety net is now `node scripts/verify-packaging.mjs confs`, which CI runs after the fetch steps and before the Rust build (`.github/workflows/package.yml`). It asserts that every resource path referenced by a conf exists **and has content**: empty directories and zero-byte files both fail the check (existence is not content; a failed fetch or extraction typically leaves exactly those two shapes). It is pure static analysis with no build dependency, so any developer machine can reproduce it.

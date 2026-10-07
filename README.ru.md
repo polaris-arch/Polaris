@@ -82,6 +82,7 @@ npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # зависимости фронтенда
 # ядро sing-box: набор для четырёх платформ, собранный из закреплённых исходников и патчей (результат CI-workflow «Desktop Core Sources» для того же коммита)
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+# Как получить пакет ядра или собрать ядро только для своей платформы: docs/build-and-package.en.md, раздел "Two ways to obtain the core bundle"
 node scripts/fetch-cronet.mjs --platform=linux  # загрузка libcronet.so рядом с ядром Linux
 node scripts/fetch-dashboard.mjs   # загрузка встроенной панели
 tauri build --config src-tauri/tauri.linux.conf.json

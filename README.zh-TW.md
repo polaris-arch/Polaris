@@ -86,6 +86,7 @@ npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # 前端相依套件
 # sing-box 核心：依釘扎原始碼與修補檔建置的四平台核心包（CI「Desktop Core Sources」工作流程對同一提交的產物）
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+# 核心包如何取得、以及只建置本機平台核心的做法，見 docs/build-and-package.md「获取内核包的两种方式」
 node scripts/fetch-cronet.mjs --platform=linux  # 拉取與 Linux 核心同目錄的 libcronet.so
 node scripts/fetch-dashboard.mjs   # 拉取內建面板
 tauri build --config src-tauri/tauri.linux.conf.json

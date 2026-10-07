@@ -82,6 +82,7 @@ npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # frontend dependencies
 # sing-box core: the four-platform bundle built from the pinned source and patches (output of the "Desktop Core Sources" CI workflow for the same commit)
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+# How to obtain the bundle, or build only the host platform's core: docs/build-and-package.en.md, "Two ways to obtain the core bundle"
 node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
 node scripts/fetch-dashboard.mjs   # fetch the built-in dashboard
 tauri build --config src-tauri/tauri.linux.conf.json

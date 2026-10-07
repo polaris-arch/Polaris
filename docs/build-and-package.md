@@ -99,6 +99,30 @@ node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 `--candidate` 等于当前 `HEAD` 且工作树没有已跟踪文件的改动；即使用 `--platform` 只落其中一个平台，也会先校验
 全部四份二进制与回执。缺内核包、或 `sourceBuild` 钉扎不完整时直接失败，没有回落到官方 Release 资产或旧缓存的路径。
 
+#### 获取内核包的两种方式
+
+**完整的四平台包（打包与发布用）。** `desktop-core.yml` 只能被其它 workflow 调用。在自己有权限的仓库（或 fork）里手动触发
+`release-risk.yml` 或 `package.yml`，它们会调用 `desktop-core.yml`；运行结束后下载名为
+`desktop-core-bundle-<提交 SHA>-<运行号>-<重试次数>` 的产物，解压出的目录就是 `--bundle-dir`。产物保留 7 天，
+且只对产出它的那个提交有效。
+
+```bash
+gh run download <运行号> --name 'desktop-core-bundle-<提交 SHA>-<运行号>-<重试次数>' --dir <内核包目录>
+```
+
+**只构建本机平台的核（本地开发用）。** 没有四平台包时，可以在本机只产出当前平台的核，再手动放到资源目录。
+这条路径跳过了四平台包的一致性校验，只用于本地开发与调试，不能用来打发布包。
+
+```bash
+# 需要 Go（source-manifest.json 的 goVersion）、Python 3、git，并能访问 github.com 取上游源码
+# HEAD 必须等于 --candidate，且工作树没有已跟踪文件的改动
+node scripts/fetch-core.mjs --producer --platform=linux --bundle-dir=<目录> --candidate="$(git rev-parse HEAD)"
+mkdir -p resources/linux && cp <目录>/linux/sing-box resources/linux/sing-box
+```
+
+`--platform` 取 `linux`、`win`、`mac-x64`、`mac-arm64` 之一，必须与本机一致（不做跨平台构建）；Windows 的文件名是
+`sing-box.exe`。本机若装的不是清单要求的 Go 版本，可设 `GOTOOLCHAIN=go<版本>` 让 Go 自行取用对应工具链。
+
 上面三条都必须手动跑：`tauri.conf.json` **没有** `build.beforeBundleCommand`，
 `tauri build` 不会替你 fetch 任何资源。
 （此前本节描述过一套 `beforeBundleCommand` 兜底，实际那个键从未存在，

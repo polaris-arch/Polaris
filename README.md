@@ -86,6 +86,7 @@ npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # 前端依赖
 # sing-box 内核：按钉扎源码与补丁构建的四平台内核包（CI「Desktop Core Sources」工作流对同一提交的产物）
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
+# 内核包怎么获取、以及只构建本机平台内核的做法，见 docs/build-and-package.md「获取内核包的两种方式」
 node scripts/fetch-cronet.mjs --platform=linux  # 拉与 Linux 核同目录的 libcronet.so
 node scripts/fetch-dashboard.mjs   # 拉内置面板
 tauri build --config src-tauri/tauri.linux.conf.json

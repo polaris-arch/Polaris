@@ -8,12 +8,16 @@ That provider is owned outside this desktop slice. Existing eight Go patches
 and the shared source manifest are unchanged here. Unfrozen consumer patches
 and dependency pins are not imported.
 
-`sourceBuild` in `src-tauri/core-manifest.json` deliberately has null pins.
-`fetch-core.mjs` rejects this state before any clone/build/resource write,
-including with `--force`. Old official archive hashes, old Windows output hashes,
-fetch stamps and existing binaries cannot substitute for the new graph. The
-historical `coreArchiveSha256` keys and `windowsBuild` are retained for current
-platform/runtime contracts; they are not proof of a new patched build.
+`sourceBuild` in `src-tauri/core-manifest.json` pins the source manifest, the
+provisioner, the patched source tree, the build tree, the module graph and each
+platform's build tree. `fetch-core.mjs` rejects an incomplete set of pins before
+any clone/build/resource write, including with `--force`. Old official archive
+hashes, old Windows output hashes, fetch stamps and existing binaries cannot
+substitute for the graph. The per-platform `binarySha256` fields and
+`windowsBuild.binarySha256` are null: output digests are only required where the
+caller asks for them, and the consumed binaries are bound through the producer
+receipts instead. The historical `coreArchiveSha256` keys are retained only as
+the list of bundled platforms; they are not proof of a patched build.
 
 `windows-dns-refresh.patch` changes only Windows system DNS cache invalidation:
 configuration reads recheck adapter DNS at most once per second, even when the
@@ -127,19 +131,17 @@ and may use the same reviewed NFT omission. These example paths are synthetic,
 not production transport pins. The selected platform policy is bound in
 `platformInputFingerprint` and its BuildID; changing it rejects older platform
 receipts while preserving the provider's common fingerprint and complete graph.
-Final dependency/transport input pins remain null pending joint
-freeze. The final binary receipt records all linked module rows, preserves the
+The final binary receipt records all linked module rows, preserves the
 common receipt fingerprint as `sourceFingerprint`, and adds the final platform
 inputs as `platformInputFingerprint`. Its platform BuildID is checked separately from the
 provider's common BuildID contract, so the Windows overlay cannot be mistaken
 for the common pre-overlay build tree.
 
-The current workflows still call `fetch-core.mjs` without a candidate bundle and
-are intentionally blocked by missing graph pins. Their existing four-binary wire,
-dependency and build-face gates are unchanged. Coordinated native four-producer
-jobs and exact-candidate artifact transport are pending; no CI topology, source
-provenance authentication, real desktop source binary or package execution is
-claimed by these fixtures. The runtime baseline uses a common source version
+`desktop-core.yml` runs one native producer per platform, assembles the four
+outputs into a candidate bundle and uploads it; `package.yml` and
+`release-risk.yml` download that exact bundle and call `fetch-core.mjs` with
+`--bundle-dir` and `--candidate`. The fixtures in this directory claim no source
+provenance authentication. The runtime baseline uses a common source version
 only when all frozen input fields are complete; null/partial input keeps the
 existing baseline and Android version behavior. Packaging uses actual consumed
 source receipts/digests for frozen inputs, retaining the old Windows hash check
