@@ -74,3 +74,10 @@ src-tauri/gen/schemas/
 # `~/docs/polaris/design/mobile-kit/`，仓内不再有 design/；本行作为守卫保留，
 # 防止设计产物重新落回仓内。**不要因为「目录不存在了」就删掉它。**
 /design/
+
+# 本地调试与验收工具：只在本机使用，不入库
+/scripts/pc-owner-stop-acceptance-*/
+/scripts/pc-mac-masque-next-observation-*/
+/scripts/pc-lan-debug-*/
+/scripts/debug-pc-echo-driver-*/
+/scripts/ios-simulator-acceptance/

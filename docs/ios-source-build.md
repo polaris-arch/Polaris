@@ -80,7 +80,7 @@ python3 scripts/verify-ios-archive.py src-tauri/gen/apple/build/arm64/Polaris.ip
 
 对已有历史 IPA，仅可显式执行 `python3 scripts/verify-ios-archive.py --historical <旧IPA路径>` 的结构核验。这个结果是 structure-only；当前没有最终 source receipt 到静态链接 IPA 的证据验证实现。
 
-Apple Silicon 模拟器可将目标换成 `--target aarch64-sim`。当前 Tauri CLI 2.11.4 将可用 Simulator runtime 与 SDK 版本比较；若使用 SDK27.1 而仅安装 27.0 runtime，普通 CLI 归档会提前失败。可启动 `tauri ios build --debug --target aarch64-sim --no-sign --ci --ignore-version-mismatches --open` 保持该 options server 活动，随后由 Xcode 对实际已安装的 27.0 目标执行无签名 build；测试记录必须绑定实际 SDK/runtime，不能据此声称 27.1/Duo runtime 已验。`--ignore-version-mismatches` 仅处理当前固定 OS 插件 JS/Rust 版本提示，不放宽源码或 Framework 哈希验证。安装实际 App 后，用 [独立 XCUITest 工程](../scripts/ios-simulator-acceptance/README.md) 检查五个页面、可触达导航、横竖屏布局和重新启动。模拟器可验收其实际支持的行为；签名和设备专属行为另外验证，UI 测试不能证明 VPN 流量或资源归属。
+Apple Silicon 模拟器可将目标换成 `--target aarch64-sim`。当前 Tauri CLI 2.11.4 将可用 Simulator runtime 与 SDK 版本比较；若使用 SDK27.1 而仅安装 27.0 runtime，普通 CLI 归档会提前失败。可启动 `tauri ios build --debug --target aarch64-sim --no-sign --ci --ignore-version-mismatches --open` 保持该 options server 活动，随后由 Xcode 对实际已安装的 27.0 目标执行无签名 build；测试记录必须绑定实际 SDK/runtime，不能据此声称 27.1/Duo runtime 已验。`--ignore-version-mismatches` 仅处理当前固定 OS 插件 JS/Rust 版本提示，不放宽源码或 Framework 哈希验证。安装实际 App 后，用独立 XCUITest 工程（只在本机保留，不入库）检查五个页面、可触达导航、横竖屏布局和重新启动。模拟器可验收其实际支持的行为；签名和设备专属行为另外验证，UI 测试不能证明 VPN 流量或资源归属。
 
 若重复模拟器构建在最后一步报 `failed to rename app ... Directory not empty`，先将 `build/arm64-sim/Polaris.app` 移到自己的备份目录，再重跑同一构建命令。修改 Swift 源文件后重新生成工程；若同步源码副本，须在同步完成后生成，避免旧 `project.pbxproj` 覆盖新源文件登记。
 

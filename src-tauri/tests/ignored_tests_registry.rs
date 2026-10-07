@@ -14,7 +14,7 @@
 //!    改名/删了，条目成了下一个真违规的免死金牌）；源码里有而表里没有 = 新增未登记。
 //! 3. **类别受控**（[`Class`]），且**理由串必须与类别自洽**（见 [`Class::reason_must_mention`]）
 //!    —— 否则类别只是装饰，随手写个理由就能把测试塞进任意类别。
-//! 4. **跑法必须指得到真文档**：`docs/ignored-tests.md` 必须存在，且**逐个测试名**在里面能找到
+//! 4. **跑法必须指得到真文档**：`src-tauri/tests/ignored-tests.md` 必须存在，且**逐个测试名**在里面能找到
 //!    对应的执行段落。这治的是本门建立时发现的那个硬伤 —— 全仓 `grep -- --ignored` 零命中、
 //!    `POLARIS_SINGBOX_PATH` 零命中：12 条真核测试写好了、编得过、**一次都没被执行过**。
 //!
@@ -281,7 +281,7 @@ const REGISTRY: &[Entry] = &[
 ];
 
 /// 跑法文档。本门断言它存在，且每个登记的测试名都能在里面找到。
-const RUNBOOK: &str = "docs/ignored-tests.md";
+const RUNBOOK: &str = "src-tauri/tests/ignored-tests.md";
 
 // ============================================================================
 // 扫描
@@ -629,7 +629,7 @@ fn class_matches_the_stated_reason() {
 /// 12 条真核测试写好了、编得过、**一次都没被执行过**。`#[ignore]` 的形态没错（它不冒充通过），
 /// 错的是没有任何地方写着「谁在什么条件下跑它」。这条把那份说明钉成必需品。
 ///
-/// **变异探针**：删掉 `docs/ignored-tests.md` 里任一测试名 ⇒ 本条转红并点名它。
+/// **变异探针**：删掉 `src-tauri/tests/ignored-tests.md` 里任一测试名 ⇒ 本条转红并点名它。
 #[test]
 fn runbook_covers_every_registered_test() {
     let root = workspace_root();
