@@ -43,7 +43,12 @@ pub use error::StoreError;
 pub use fs::{atomic_write_plan, AtomicWritePlan, ConfigFs, StdFs};
 pub use migrate::{migrate_all, MigrationDelta};
 pub use privacy_lock::{PrivacyPasswordHash, ScryptParams};
-pub use sanitize::sanitize_config;
+pub use sanitize::{
+    sanitize_config, speed_test_slot_cap, PERIODIC_SPEED_TEST_ENABLED_DEFAULT,
+    PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT, SPEED_TEST_CONCURRENCY_MIN,
+    SPEED_TEST_INTERVAL_MINUTES, SPEED_TEST_INTERVAL_MINUTES_DEFAULT,
+    SPEED_TEST_METERED_POLICY_DEFAULT,
+};
 pub use store::{
     corrupt_backup_stamp, default_config, finalize_config, prune_corrupt_backups, ConfigStore,
     LoadResult,

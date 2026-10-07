@@ -17,6 +17,7 @@ use super::core_log::{
 use super::dns_takeover::{dns_takeover_enabled, system_dns_takeover_active};
 use super::lifecycle::{now_ms, sleep_unless_superseded_on};
 use super::platform_contracts::{enumerate_own_lan_cidrs, platform_tag};
+use super::probe_pool_size;
 use super::process_supervision::{pid_alive, DirectCoreSlot, HelperStartToken, HelperStopPermit};
 use super::route_replan::{
     classify_tun_adapter_leg, inferred_binding_replan_needed, interface_availability,
@@ -24,7 +25,6 @@ use super::route_replan::{
     InterfaceFingerprint, RuntimeBindingState, TunAdapterObservation, TunAdapterVerdict,
 };
 use super::tunnel_conflict::own_tunnel_interfaces;
-use super::PROBE_POOL_SIZE;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 use super::{HELPER_GATE_ABORTED_MSG, HELPER_NOT_INSTALLED_MSG, TUN_ADAPTER_MISSING_MSG};
 use std::collections::{BTreeMap, BTreeSet};
@@ -428,6 +428,27 @@ impl FreePortProvider for PortProviderExcluding {
         let port = FreePortProvider::try_allocate(&TokioPortProvider)?;
         (port != self.excluded).then_some(port)
     }
+}
+
+/// 槽位上限拿不到那么多端口时退到的池大小（槽位上限按平台取值之前的固定值）。
+const PROBE_POOL_FALLBACK_SIZE: usize = 16;
+
+/// 申请「出口探针口 + 测速池」共 `slots + 1` 个互异回环口。整批申请是「任何一个拿不到就全部放弃」，
+/// 槽位上限越高越容易撞上；所以按上限失败时再按 [`PROBE_POOL_FALLBACK_SIZE`] 要一次，仍失败才是空池。
+pub(super) fn allocate_probe_ports<P: FreePortProvider>(
+    allocator: &PortAllocator<P>,
+    exclusions: &PortExclusions,
+    slots: usize,
+) -> Vec<u16> {
+    let ports = allocator.resolve_distinct_free_ports(exclusions, slots + 1);
+    if !ports.is_empty() || slots <= PROBE_POOL_FALLBACK_SIZE {
+        return ports;
+    }
+    let ports = allocator.resolve_distinct_free_ports(exclusions, PROBE_POOL_FALLBACK_SIZE + 1);
+    if !ports.is_empty() {
+        log::warn!("测速池按 {slots} 个槽申请端口失败，降到 {PROBE_POOL_FALLBACK_SIZE} 个槽");
+    }
+    ports
 }
 
 /// 网络场景 canary 入站只听 UDP：候选口按 **UDP** 可绑来取（TCP 口空闲说明不了 UDP 口空闲），
@@ -3320,16 +3341,19 @@ impl ProxyRuntime {
             socks: subscription_update_in_port,
             ..subscription_excl
         };
-        let mut probe_ports = PortAllocator::new(PortProviderExcluding {
-            excluded: update_in_port,
-        })
-        .resolve_distinct_free_ports(&pool_excl, PROBE_POOL_SIZE + 1);
+        let mut probe_ports = allocate_probe_ports(
+            &PortAllocator::new(PortProviderExcluding {
+                excluded: update_in_port,
+            }),
+            &pool_excl,
+            probe_pool_size(),
+        );
         let probe_proxy_port = (!probe_ports.is_empty()).then(|| probe_ports.remove(0));
         let pool_ports = probe_ports;
         if probe_proxy_port.is_none() {
             log::warn!(
                 "代理出口探针 + 测速池共 {} 个端口分配失败 → 自动故障探测停用、测速回退活跃出口",
-                PROBE_POOL_SIZE + 1
+                PROBE_POOL_FALLBACK_SIZE + 1
             );
         }
         Ok(StartPorts {

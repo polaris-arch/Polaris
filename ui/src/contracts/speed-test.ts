@@ -182,3 +182,69 @@ export interface SpeedTestDonePayload {
    */
   reason?: SpeedTestInterruptReason;
 }
+
+/** 周期测速设置项的取值范围与缺省值。由后端给出：并发上限随平台不同，界面不自己写死。 */
+export interface SpeedTestScheduleLimits {
+  concurrencyMin: number;
+  /** 本设备的并发上限。 */
+  concurrencyMax: number;
+  intervalMinutesMin: number;
+  intervalMinutesMax: number;
+  intervalMinutesDefault: number;
+  /** 全局总开关的缺省值。 */
+  enabledDefault: boolean;
+  /** 每订阅「周期测速」开关的缺省值。 */
+  subscriptionDefault: boolean;
+  meteredPolicyDefault: 'reduced' | 'pause' | 'normal';
+}
+
+/** 计划里一个订阅的状态。计划没建起来时只有 `periodMinutes` 与 `blockedBy`。 */
+export interface SpeedTestScheduleSubscription {
+  periodMinutes: number;
+  /**
+   * 订阅里开着、却没有进计划的原因（与顶层 `reason` 同一组取值）：`userDisabled` 是被全局总开关
+   * 关闭，`platformNotEnabled` 是本平台未启用，`coreNotRunning` 是代理未运行。
+   */
+  blockedBy?: string;
+  /** 最近一次覆盖该订阅全部可测节点、且以完成收尾的一轮的结束时刻（Unix 毫秒）。 */
+  lastFullRoundAt?: number | null;
+  lastRound?: {
+    run: string;
+    startedAt: number;
+    endedAt: number;
+    ok: number;
+    failed: number;
+    unmeasured: number;
+    skipped: Record<string, number>;
+  } | null;
+  /** 最近一次到期而未执行的时刻与原因。 */
+  lastSkip?: { at: number; reason: string; holder?: string; skipped?: Record<string, number> } | null;
+  nextDueAt?: number;
+  periodTooShort?: boolean;
+  /** 读时投影：距上次完整轮次已超过周期的 3 倍。 */
+  overdue?: boolean;
+}
+
+/**
+ * 周期测速的计划状态（`speed_test_schedule_status` 的返回，也是 `event:speedTestSchedule` 的载荷；
+ * 单一真值在后端 `runtime/measurement_scheduler.rs`）。
+ */
+export interface SpeedTestScheduleStatus {
+  state: 'disabled' | 'waiting' | 'running' | 'paused';
+  /**
+   * `disabled` 时：`switchedOff` / `userDisabled` / `platformNotEnabled` / `coreNotRunning` /
+   * `noSubscription`；`paused` 时：`background` / `metered` / `powerSave`；其余为 `null`。
+   */
+  reason: string | null;
+  subscriptions?: Record<string, SpeedTestScheduleSubscription>;
+  /** 上一轮开始时的并发，以及那一轮内是否因本机侧报错减半过。 */
+  concurrency?: { width: number; halved: boolean } | null;
+  /** 当前网络的计费状态。`unavailable` 是「识别不了」，按照常处理，不等于非计费。 */
+  metered?: 'metered' | 'unmetered' | 'unavailable';
+  /** 生效的计费网络策略。`metered` 为 `metered` 且本项为 `reduced` 即正在降频（周期乘 4）。 */
+  meteredPolicy?: 'reduced' | 'pause' | 'normal';
+  lastTickAt?: number;
+  /** 读时投影：代理在运行、应用在前台，而调度器很久没有走过一拍。 */
+  stalled: boolean;
+  limits?: SpeedTestScheduleLimits;
+}

@@ -148,6 +148,36 @@ pub(crate) async fn bindable_interfaces() -> Result<Vec<BindableInterface>, Stri
     })
 }
 
+/// 周期测速每轮准入前查的设备状况。
+#[cfg(target_os = "android")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeviceConditions {
+    /// 活动网络是否计费。VPN 自身声明为非计费并跟随底层网络，所以这是底层网络的计费状态。
+    pub metered: bool,
+    /// 系统是否处于省电模式。
+    pub power_save: bool,
+}
+
+/// 只读查询：活动网络是否计费、是否处于省电模式。这两个状态只有系统 API 给得出。
+#[cfg(target_os = "android")]
+pub(crate) async fn device_conditions() -> Result<DeviceConditions, String> {
+    let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+    call_with_budget::<DeviceConditions, _>(
+        plugin,
+        "deviceConditions",
+        (),
+        LOCAL_STATE_TIMEOUT,
+        None,
+    )
+    .await
+    .map_err(|error| match error {
+        BridgeCallError::Invoke(_) => "Android device conditions query failed".to_owned(),
+        BridgeCallError::TimedOut => "Android device conditions query timed out".to_owned(),
+        BridgeCallError::TaskFailed(_) => "Android device conditions query unavailable".to_owned(),
+    })
+}
+
 /// 🔴 **六档超时的相对大小是判据的一部分，编译期就挡住**。
 ///
 /// `authStatus` 只是一次 binder 往返（最短），`installApk` 是本地调用 + 一次 startActivity，

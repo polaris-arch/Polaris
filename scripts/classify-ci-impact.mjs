@@ -881,6 +881,13 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     'Android 从 Application 预先提取的 bundled-geo 目录播种规则；Rust 单测覆盖路径映射与播种，'
     + '交叉 check 覆盖 Android 条件编译。APK 腿只打包 28 个资源，不运行播种；资产完整性由'
     + ' Kotlin BundledRules 与 verify-apk 各自检查，设备实测验证最终文件。',
+  'src-tauri/src/runtime/measurement_scheduler.rs':
+    '周期测速调度器。唯一的 android cfg 是 `android_conditions` 的一对腿：android 腿只把设备状况'
+    + '（活动网络是否计费、是否省电）的查询转给 `android_bridge::device_conditions` 并折成三态，'
+    + '非 android 腿返回「不可得」。调度、裁决与状态投影都是与平台无关的纯逻辑，由宿主 `cargo test` 覆盖；'
+    + 'android 腿的编译面落在 `cargo check --target aarch64-linux-android -p polaris`，'
+    + '命令名与回包字段的跨语言面由 check-android-bridge.mjs 对拍。APK 腿只打包不运行，不为它新增判据；'
+    + '真机上的计费识别与离开前台即暂停属于设备验收项。',
   'src-tauri/src/runtime/proxy/android_bridge.rs':
     'Android 起停核桥（Rust → Kotlin plugin）的 Rust 半边，35 处 android cfg（2026-09-06 由 27 增至 35：'
     + 'W-09b 已装应用枚举与 W-21 交系统安装器各带来一条命令腿 + 超时常量 + 非 Android 桩）。改它只改 '

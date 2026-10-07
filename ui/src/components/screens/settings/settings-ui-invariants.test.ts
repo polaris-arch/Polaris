@@ -60,7 +60,7 @@ describe('Settings UI 使用统一组件与语义分组', () => {
   it('静态字段说明统一进入信息提示，常驻 desc 只保留动态上下文', () => {
     const allowedDescCounts: Record<string, number> = {
       'SettingsGeneral.tsx': 1, // 密码已设置/未设置
-      'SettingsNetwork.tsx': 3, // WebRTC 当前模式限制 + 当前本地代理端口 + 网卡枚举失败
+      'SettingsNetwork.tsx': 4, // WebRTC 当前模式限制 + 当前本地代理端口 + 网卡枚举失败 + 本设备的测速并发上限（随平台不同，由后端给出）
       'SettingsTun.tsx': 1, // IPv6 与 FakeIP 当前组合风险 + 修复动作
     };
     for (const { name, source } of settingScreens) {
@@ -78,6 +78,7 @@ describe('Settings UI 使用统一组件与语义分组', () => {
     expect(network).toContain('webrtcDisabled ?');
     expect(network).toContain("tipHttpPort', { port: mixedPort }");
     expect(network).toContain('interfaces.failed ?');
+    expect(network).toContain("? t('settings.network.speedTestConcurrencyMax', { max: speedLimits.concurrencyMax })");
     expect(tun).toContain('showIpv6Hint ?');
   });
 

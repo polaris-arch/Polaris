@@ -39,11 +39,11 @@ fn proxy_submodules_only_reach_back_for_whitelisted_facade_items() {
         "HELPER_NOT_INSTALLED_MSG",
         "HELPER_GATE_ABORTED_MSG",
         "TUN_ADAPTER_MISSING_MSG",
-        // **永久面项**（非过渡，B9 引入）：`PROBE_POOL_SIZE` 按 §A.3 的 `336-343` 行与
+        // **永久面项**（非过渡，B9 引入）：`probe_pool_size` 按 §A.3 的 `336-343` 行与
         // `CoreBuildEnv` / `SpeedProbeTargets` 同属 façade 的 speedtest 契约面（`runtime::speedtest`
         // 经 `crate::runtime::proxy::` 取用），不随 `startup` 外移；其起核侧消费者
         // `start_inner` 的探测池端口分配只能回掏。删除条件：§A.3 该行被推翻之日。
-        "PROBE_POOL_SIZE",
+        "probe_pool_size",
         // **永久面项**（非过渡）：`TUN_ROUTE_NOT_CAPTURED_MSG` 是 §C 例外① 钉死在 façade 的五条
         // `*_MSG` 兜底文案之一（与 `pub mod code` 同锚，四条跨语言门以它们为判据），永不外移；
         // 其唯一消费者 `route_replan::verify_tun_route_captured` 只能回掏。故本项没有删除条件 ——

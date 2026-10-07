@@ -88,6 +88,8 @@ pub enum TunnelError {
     /// 响应体排不干净（声明了 `Connection: close` / 没有可判定的长度 / 超
     /// [`MAX_WARMUP_BODY_BYTES`]）⇒ 这条连接不能再承载下一次请求。
     NotReusable,
+    /// 连不上本机代理口本身（被拒 / 句柄或临时端口耗尽）：故障在本机一侧，与被测节点无关。
+    Local,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -551,7 +553,7 @@ pub async fn open_tunnel(
     let io = |_| TunnelError::Transport;
     let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
-        .map_err(io)?;
+        .map_err(|_| TunnelError::Local)?;
     // 关 Nagle：小请求的 TTFB 不该被 delayed-ACK / 合包拖慢（上游 `socket.setNoDelay(true)`）。
     let _ = sock.set_nodelay(true);
 

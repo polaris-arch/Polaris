@@ -1323,3 +1323,34 @@ fn explicit_backup_retains_node_owned_inactive_credential_and_replace_drops_old_
     assert!(!summary.contains("legal-backup-sentinel"));
     assert!(!summary.contains("retainedAuthKey"));
 }
+
+/// 周期测速的五个键经备份导出再恢复后逐字段相同：逐订阅的两个随订阅对象整体带出，
+/// 顶层的三个属于通用设置。
+#[test]
+fn periodic_speed_test_settings_survive_export_and_restore() {
+    let source = json!({
+        "servers": [],
+        "subscriptions": [
+            { "id": "s1", "name": "one", "url": "https://a.example/x",
+              "periodicSpeedTest": true, "speedTestIntervalMinutes": 45 },
+            { "id": "s2", "name": "two", "url": "https://b.example/x",
+              "periodicSpeedTest": false },
+        ],
+        "periodicSpeedTestEnabled": false,
+        "speedTestConcurrency": 8,
+        "speedTestMeteredPolicy": "pause",
+    });
+    let selected = [C::Subscriptions, C::GeneralSettings];
+    let exported = pick_categories(&source, &selected);
+    let empty = json!({ "servers": [], "subscriptions": [] });
+    let mut restored = merge_categories(&empty, &exported, &selected).config;
+    crate::sanitize::sanitize_value_in_place_pub(&mut restored);
+    for key in [
+        "subscriptions",
+        "periodicSpeedTestEnabled",
+        "speedTestConcurrency",
+        "speedTestMeteredPolicy",
+    ] {
+        assert_eq!(restored[key], source[key], "{key}");
+    }
+}

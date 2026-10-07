@@ -67,6 +67,7 @@ export const IPC_CHANNELS = {
   SERVER_DELETE: 'server_delete',
   SERVER_DELETE_BATCH: 'server_delete_batch',
   SERVER_SPEED_TEST: 'server_speed_test',
+  SPEED_TEST_SCHEDULE_STATUS: 'speed_test_schedule_status', // 周期测速的计划状态（只读）
   WARP_REGISTER: 'warp_register', // Cloudflare WARP 设备注册 → 生成 WireGuard 草稿
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
@@ -327,6 +328,8 @@ export const IPC_CHANNELS = {
   // ——invoke 返回值只有发起方那个 JS 堆拿得到，这正是「断开后进度 toast 还要等十几秒才转中断」的根因。
   // `pending` = 本轮没拿到值的节点 id，中断态 toast 的「继续」按它续测。详见 contracts/speed-test.ts。
   EVENT_SPEED_TEST_DONE: 'event:speedTestDone',
+  // 周期测速的计划状态：状态或其原因变化、以及每轮收尾时发一次，载荷与状态命令的返回同形。
+  EVENT_SPEED_TEST_SCHEDULE: 'event:speedTestSchedule',
   EVENT_TAILSCALE_AUTH_URL: 'event:tailscaleAuthUrl', // Tailscale 节点需交互登录：核日志抓出的登录 URL（瞬态核路径）
   EVENT_TAILSCALE_LOGIN_PROGRESS: 'event:tailscaleLoginProgress',
   EVENT_TAILSCALE_STATUS: 'event:tailscaleStatus', // sing-box 1.14 管理 API 推送的 Tailscale 节点真实态（backendState/loggedIn/authURL/IP/过期）

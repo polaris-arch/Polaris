@@ -202,6 +202,10 @@ pub mod channel {
     /// （重启纳入 / 应用更改 / 去登录），混进续测集合只会让「继续」原地再失败一次。
     pub const EVENT_SPEED_TEST_DONE: &str = "event:speedTestDone";
 
+    /// 周期测速的计划状态（载荷与状态命令 `speed_test_schedule_status` 的返回同形）。状态或其原因
+    /// 变化、以及每轮收尾时发一次。独立通道：周期一轮自己只发逐节点结果，不占上面三个通道的形态。
+    pub const EVENT_SPEED_TEST_SCHEDULE: &str = "event:speedTestSchedule";
+
     // Tailscale
     pub const EVENT_TAILSCALE_AUTH_URL: &str = "event:tailscaleAuthUrl";
     pub const EVENT_TAILSCALE_LOGIN_PROGRESS: &str = "event:tailscaleLoginProgress";

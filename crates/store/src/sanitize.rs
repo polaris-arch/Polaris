@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+use polaris_config_engine::builder::Platform;
 use serde_json::{Map, Value};
 
 /// 解析结果：成功得到清洗后的 Value（可直接 into 强类型），或结构错误。
@@ -105,6 +106,7 @@ fn sanitize_value_in_place(value: &mut Value) {
         "autoUpdateSubscriptionOnStart",
         "ruleResourceAutoUpdate",
         "autoPrivacyMode",
+        "periodicSpeedTestEnabled",
     ] {
         bool_or_remove(obj, key);
     }
@@ -137,6 +139,16 @@ fn sanitize_value_in_place(value: &mut Value) {
     update_channel_or_remove(obj, "coreUpdateChannel");
     // appUpdateChannel：与内核通道同一值域；缺省 stable，存量用户行为不变。
     update_channel_or_remove(obj, "appUpdateChannel");
+    // 测速并发：`"auto"` 或 4 到本平台上限的整数，其余删除（回落自动）。上限随平台不同，
+    // 所以一份在桌面设为 48 的配置拿到手机上会被清成自动。
+    speed_test_concurrency_or_remove(obj, Platform::current());
+    // 计费网络下的周期测速：三态，非法值删除（回落降频）。
+    if obj
+        .get("speedTestMeteredPolicy")
+        .is_some_and(|v| !matches!(v.as_str(), Some("pause" | "reduced" | "normal")))
+    {
+        obj.remove("speedTestMeteredPolicy");
+    }
 
     // ── 对象字段：非对象删除 ─────────────────────────────────────
     // tunConfig / dnsConfig / regionRouting / builtinGeoMeta
@@ -256,6 +268,48 @@ fn update_channel_or_remove(obj: &mut Map<String, Value>, key: &str) {
     }
 }
 
+/// 探针池的槽位上限，也是「测速并发」可填的最大值。槽位在起核时一次建好，实际并发在上限内
+/// 每轮另定。全部改回 16 即回到改动前的池大小。
+#[must_use]
+pub const fn speed_test_slot_cap(platform: Platform) -> usize {
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => 64,
+        Platform::Android => 32,
+        Platform::Ios | Platform::Other => 16,
+    }
+}
+
+/// 周期测速的全局总开关缺省值。关掉后任何订阅都不建周期计划。
+pub const PERIODIC_SPEED_TEST_ENABLED_DEFAULT: bool = true;
+
+/// 逐订阅「周期测速」开关的缺省值。读取侧、类型默认与测试都从这一处取，改默认只动这里。
+pub const PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT: bool = false;
+
+/// 计费网络下周期测速的缺省行为：`reduced`（周期乘 4）。另两个取值是 `pause` 与 `normal`。
+pub const SPEED_TEST_METERED_POLICY_DEFAULT: &str = "reduced";
+
+/// 逐订阅测速周期留空时的取值（分钟）。
+pub const SPEED_TEST_INTERVAL_MINUTES_DEFAULT: u64 = 30;
+
+/// 「测速并发」可填的最小值。
+pub const SPEED_TEST_CONCURRENCY_MIN: u64 = 4;
+
+/// 逐订阅测速周期（分钟）的取值范围。
+pub const SPEED_TEST_INTERVAL_MINUTES: std::ops::RangeInclusive<u64> = 5..=360;
+
+fn speed_test_concurrency_or_remove(obj: &mut Map<String, Value>, platform: Platform) {
+    let ok = match obj.get("speedTestConcurrency") {
+        None => return,
+        Some(Value::String(s)) => s == "auto",
+        Some(v) => v.as_u64().is_some_and(|n| {
+            (SPEED_TEST_CONCURRENCY_MIN..=speed_test_slot_cap(platform) as u64).contains(&n)
+        }),
+    };
+    if !ok {
+        obj.remove("speedTestConcurrency");
+    }
+}
+
 /// 非对象 → 删除键。
 fn object_or_remove(obj: &mut Map<String, Value>, key: &str) {
     if let Some(v) = obj.get(key) {
@@ -367,6 +421,14 @@ fn sanitize_subscriptions(obj: &mut Map<String, Value>) {
             let mut sub = s;
             if let Some(map) = sub.as_object_mut() {
                 string_or_remove(map, "proxyBindInterface", true, true);
+                bool_or_remove(map, "periodicSpeedTest");
+                // 越界的周期删除而不是钳到边界：钳位会让用户以为自己填的值在生效。
+                if map.get("speedTestIntervalMinutes").is_some_and(|v| {
+                    !v.as_u64()
+                        .is_some_and(|n| SPEED_TEST_INTERVAL_MINUTES.contains(&n))
+                }) {
+                    map.remove("speedTestIntervalMinutes");
+                }
             }
             kept.push(sub);
         }

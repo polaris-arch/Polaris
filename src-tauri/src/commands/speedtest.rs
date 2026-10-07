@@ -57,7 +57,7 @@
 //! （`speed_probe_targets()` 在 `pool_ports` 空时返 `None`），属 `runtime/proxy.rs` 的只读面扩张，不在本批
 //! 射程。该腿本身是端口分配失败才走的降级路径（极少见），故按已知有界残留登记，不静默。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -83,12 +83,14 @@ use polaris_config_engine::user_config::proxy_ports::control_api_port;
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::LogLevel;
 use polaris_core_supervisor::PortExclusions;
+use polaris_helper_proto::Platform;
 use polaris_net_stack::subscription::server_fingerprint;
 
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
 };
 use crate::response::ApiResponse;
+use crate::runtime::measurement_ledger::{self, MeasurementLedger};
 use crate::runtime::proxy::{
     ActionBinding, ActionRequirement, LocalHttpProxy, NormalMainAction, ProxyRuntime,
     ReadyMainTicket, SpeedProbeTargets,
@@ -219,13 +221,16 @@ pub(crate) enum FailKind {
     HttpStatus(u16),
     /// 被拒：热切 RPC 没成功，或预热后的连接不可复用。
     Rejected,
+    /// 本机侧：连不上本机的探针入站口（被拒 / 句柄或临时端口耗尽）。不是节点的负面证据。
+    /// 只在分波编排里被识别；对外仍报 `transport`，事件的取值集合不变。
+    Local,
 }
 
 impl FailKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
-            Self::Transport => "transport",
+            Self::Transport | Self::Local => "transport",
             Self::HttpStatus(_) => "http_status",
             Self::Rejected => "rejected",
         }
@@ -251,6 +256,29 @@ impl MeasureFailure {
             TunnelError::Transport => FailKind::Transport,
             TunnelError::ConnectStatus(code) => FailKind::HttpStatus(code),
             TunnelError::NotReusable => FailKind::Rejected,
+            TunnelError::Local => FailKind::Local,
+        };
+        Self { phase, kind }
+    }
+
+    /// [`to_json`](Self::to_json) 的逆：账本入账时从盖过章的载荷读回阶段与成因。
+    fn from_json(failure: &Value) -> Self {
+        let phase = match failure["phase"].as_str() {
+            Some("select") => FailPhase::Select,
+            Some("connect") => FailPhase::Connect,
+            Some("warmup") => FailPhase::Warmup,
+            _ => FailPhase::Measure,
+        };
+        let kind = match failure["kind"].as_str() {
+            Some("timeout") => FailKind::Timeout,
+            Some("rejected") => FailKind::Rejected,
+            Some("http_status") => FailKind::HttpStatus(
+                failure["httpStatus"]
+                    .as_u64()
+                    .and_then(|code| u16::try_from(code).ok())
+                    .unwrap_or_default(),
+            ),
+            _ => FailKind::Transport,
         };
         Self { phase, kind }
     }
@@ -295,15 +323,14 @@ pub(crate) enum SpeedTestOrigin {
     Manual,
     /// 后台自动故障切换。
     Failover,
-    /// 周期计划。本层只定它的优先级与事件形态，发起方不在本层。
-    #[allow(dead_code)]
+    /// 周期计划。发起方是 [`crate::runtime::measurement_scheduler`]。
     Schedule,
     /// 出口 IP 探测成功后的伴测。不占单飞闸。
     Companion,
 }
 
 impl SpeedTestOrigin {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "manual",
             Self::Failover => "failover",
@@ -447,6 +474,8 @@ pub(crate) struct RunEvents {
     failures: BTreeMap<String, usize>,
     /// 失败节点的前几个 id（汇总行的样本）。
     failed_samples: Vec<String>,
+    /// 逐节点结果盖章后入的那本账。
+    ledger: &'static MeasurementLedger,
 }
 
 impl RunEvents {
@@ -483,7 +512,14 @@ impl RunEvents {
             ok: 0,
             failures: BTreeMap::new(),
             failed_samples: Vec::new(),
+            ledger: measurement_ledger::global(),
         }
+    }
+
+    /// 换一本账（周期一轮由调度器传入它读的那一本；测试传各自独立的）。
+    pub(crate) fn with_ledger(mut self, ledger: &'static MeasurementLedger) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// 登记起测前即知不该测的节点数（按原因），只进汇总日志。
@@ -531,6 +567,16 @@ impl RunEvents {
                 }
             } else {
                 self.ok += 1;
+            }
+            // 入账旁路：盖章之后、出口之前。出口是空闭包的来源（故障切换）也因此不会漏。
+            if let Some(node_id) = payload["serverId"].as_str() {
+                let measured = match payload["latency"].as_u64() {
+                    Some(ms) if !payload["failure"].is_object() => {
+                        Ok(u32::try_from(ms).unwrap_or(u32::MAX))
+                    }
+                    _ => Err(MeasureFailure::from_json(&payload["failure"])),
+                };
+                self.ledger.record(node_id, measured, identity.clone());
             }
             payload["identity"] = identity.to_json();
         } else {
@@ -728,6 +774,15 @@ impl SpeedTestGate {
             }
             released.await;
         }
+    }
+
+    /// 此刻持闸的来源。只用于在被拒之后说明「被谁占着」：与随后的释放之间没有同步。
+    fn holder(&self) -> Option<SpeedTestOrigin> {
+        self.holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(origin, _)| *origin)
     }
 }
 
@@ -1823,6 +1878,7 @@ pub async fn server_speed_test(
             &targets,
             &requested,
             &url,
+            configured_concurrency(&config, Platform::current()),
             &prefilter,
             &run_id,
             ticket.as_ref(),
@@ -2078,6 +2134,7 @@ async fn run_pool_speed_test(
     targets: &SpeedProbeTargets,
     requested: &[String],
     url: &str,
+    concurrency: usize,
     prefilter: &PoolPrefilter<'_>,
     run_id: &str,
     ticket: Option<&ReadyMainTicket>,
@@ -2085,7 +2142,6 @@ async fn run_pool_speed_test(
     cancel: &SpeedTestCancel,
     done: &mut Option<Value>,
 ) -> ApiResponse<Value> {
-    let k = targets.pool_ports.len();
     let PoolPartition {
         testable: pool_testable,
         not_in_pool,
@@ -2112,7 +2168,10 @@ async fn run_pool_speed_test(
     }
 
     let total = pool_testable.len();
-    let waves = plan_waves(&pool_testable, k);
+    let waves = plan_waves(
+        &pool_testable,
+        wave_width(concurrency, targets.pool_ports.len(), total),
+    );
 
     // §15.11 让位（超代）基准：本轮归属的核世代。三检查点均以它比对（见 [`drive_pool_waves`]）。
     let gen0 = proxy.core_generation();
@@ -2247,7 +2306,15 @@ pub(crate) async fn probe_runtime_candidates(
     let Some(guard) = SpeedTestGuard::acquire(SpeedTestOrigin::Failover).await else {
         return RuntimeProbeBatch::Busy;
     };
-    let waves = plan_waves(candidates, targets.pool_ports.len());
+    // 本腿的调用方不带配置，波宽取自动值；与手动、周期两腿一样不超过池端口数。
+    let waves = plan_waves(
+        candidates,
+        wave_width(
+            auto_concurrency(Platform::current()),
+            targets.pool_ports.len(),
+            candidates.len(),
+        ),
+    );
     if waves.is_empty() {
         return RuntimeProbeBatch::Completed(BTreeMap::new());
     }
@@ -2308,6 +2375,362 @@ pub(crate) async fn probe_runtime_candidates(
     RuntimeProbeBatch::Completed(measured)
 }
 
+/// 「测速并发」取自动时的值：桌面 32，手机 16。全部改回 16 即回到改动前的波宽。
+const fn auto_concurrency(platform: Platform) -> usize {
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => 32,
+        Platform::Android | Platform::Ios | Platform::Other => 16,
+    }
+}
+
+/// 配置里的「测速并发」：4 到本平台槽位上限的整数；缺省、`"auto"` 或越界值都取自动。
+/// 它是原始配置的顶层键，不进内核配置，改它不重启内核。
+pub(crate) fn configured_concurrency(config: &Value, platform: Platform) -> usize {
+    let allowed = polaris_store::SPEED_TEST_CONCURRENCY_MIN
+        ..=polaris_store::speed_test_slot_cap(platform) as u64;
+    config
+        .get("speedTestConcurrency")
+        .and_then(Value::as_u64)
+        .filter(|n| allowed.contains(n))
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(auto_concurrency(platform))
+}
+
+/// 本轮的波宽：实际并发不超过池端口数（槽位上限在起核时定），也不必超过本轮可测节点数。
+/// 分波只用前 `波宽` 个槽。
+pub(crate) const fn wave_width(concurrency: usize, pool_ports: usize, testable: usize) -> usize {
+    let width = if concurrency < pool_ports {
+        concurrency
+    } else {
+        pool_ports
+    };
+    if width < testable {
+        width
+    } else {
+        testable
+    }
+}
+
+/// 调度器取消在飞的周期一轮用的槽。取消句柄要到准入之后才有；早于准入的取消请求先记在这里，
+/// 准入时兑现。
+#[derive(Default)]
+pub(crate) struct RoundAbort {
+    requested: AtomicBool,
+    cancel: Mutex<Option<SpeedTestCancel>>,
+}
+
+impl RoundAbort {
+    /// 取消这一轮（成因「被取消」；为什么取消由调度器自己记）。
+    pub(crate) fn abort(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        if let Some(cancel) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            cancel.cancel(InterruptReason::Cancelled);
+        }
+    }
+
+    fn arm(&self, cancel: &SpeedTestCancel) {
+        *self.cancel.lock().unwrap_or_else(PoisonError::into_inner) = Some(cancel.clone());
+        if self.requested.load(Ordering::SeqCst) {
+            cancel.cancel(InterruptReason::Cancelled);
+        }
+    }
+}
+
+/// 周期一轮的结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScheduledRound {
+    /// 闸被同级或更高优先级的来源占着（附占用方；查的那一刻已释放则为 `None`）。
+    /// 没有任何节点被测，也没有任何节点被记成失败。
+    Busy(Option<SpeedTestOrigin>),
+    /// 探针池不可用（起核时端口没分到）。
+    PoolUnavailable,
+    Ran(RoundReport),
+}
+
+/// 周期一轮跑过之后的回执。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RoundReport {
+    pub(crate) run: String,
+    /// 准入时刻与收尾时刻（Unix 毫秒）。
+    pub(crate) started_at: u64,
+    pub(crate) ended_at: u64,
+    /// 已入账的节点：`true` 为测出了值，`false` 为真测了没通。
+    pub(crate) measured: BTreeMap<String, bool>,
+    /// 可测但本轮没有结果的节点（被中断、跨网络变化、本机侧故障、冻结后丢弃），按目标顺序。
+    pub(crate) unmeasured: Vec<String>,
+    /// 起测前被预筛跳过的节点及原因。
+    pub(crate) skipped: Vec<(String, &'static str)>,
+    /// 中断成因；完成收尾为 `None`。
+    pub(crate) interrupted: Option<InterruptReason>,
+    /// 是否检出了设备冻结（相邻两条结果的墙钟间隔超过阈值）。
+    pub(crate) frozen: bool,
+    /// 本轮开始时的波宽，以及本轮内是否因本机侧报错减半过。
+    pub(crate) width: usize,
+    pub(crate) halved: bool,
+}
+
+/// 周期一轮在准入时定下、整轮固定的取材。
+pub(crate) struct ScheduledRoundInput<'a> {
+    /// 有序目标（排序由调度器定；分波按这个顺序切块）。
+    pub(crate) targets: &'a [String],
+    pub(crate) scope: String,
+    pub(crate) url: &'a str,
+    pub(crate) id_to_tag: &'a BTreeMap<String, String>,
+    pub(crate) dirty: &'a BTreeSet<String>,
+    pub(crate) ts_pending: &'a BTreeSet<String>,
+    pub(crate) pool_ports: &'a [u16],
+    pub(crate) concurrency: usize,
+    pub(crate) instance: CoreInstance,
+    pub(crate) config_digest: Option<String>,
+    pub(crate) fingerprints: BTreeMap<String, String>,
+}
+
+/// 周期一轮的注入面：闸、运行号序列、账本、取消槽、墙钟与冻结阈值。
+pub(crate) struct ScheduledRoundDeps<'a> {
+    pub(crate) gate: &'a SpeedTestGate,
+    pub(crate) sequence: &'a AtomicU64,
+    pub(crate) ledger: &'static MeasurementLedger,
+    pub(crate) abort: &'a RoundAbort,
+    pub(crate) wall_clock: &'a (dyn Fn() -> u64 + Sync),
+    /// 相邻两条结果的墙钟间隔超过它即判设备冻结；取 `u64::MAX` 即关掉这条判据。
+    pub(crate) freeze_gap_ms: u64,
+}
+
+/// **周期一轮的编排核**（热切 / 测量 / 事件出口全部注入，不碰宿主网络）。
+///
+/// 与手动、故障切换共用同一套准入、分波、让位与发布口，不设旁路：
+/// - 以周期来源抢闸，抢不到即返回「忙」，不测任何节点；
+/// - 波前预筛与手动测速同一个函数，跳过的节点登记进账本；
+/// - 事件只经 [`RunEvents`] 盖章后发出，所以外面只看得到逐节点结果，顶层没有 `runId`；
+/// - 冻结判据接在盖章**之前**：被丢弃的结果既不发出也不入账。
+pub(crate) async fn drive_scheduled_round<Sel, SelFut, Meas, MeasFut>(
+    input: ScheduledRoundInput<'_>,
+    deps: &ScheduledRoundDeps<'_>,
+    superseded: &(dyn Fn() -> bool + Sync),
+    network_epoch: &(dyn Fn() -> Option<u64> + Sync),
+    select_slot: Sel,
+    measure: Meas,
+    out: &mut (dyn FnMut(&str, Value) + Send),
+) -> ScheduledRound
+where
+    Sel: Fn(usize, String) -> SelFut,
+    SelFut: Future<Output = bool>,
+    Meas: Fn(u16) -> MeasFut,
+    MeasFut: Future<Output = Measured> + Send + 'static,
+{
+    let Some(guard) = deps.gate.acquire(SpeedTestOrigin::Schedule).await else {
+        return ScheduledRound::Busy(deps.gate.holder());
+    };
+    deps.abort.arm(guard.cancel());
+    let started_at = (deps.wall_clock)();
+
+    let partition = partition_pool(
+        input.targets,
+        input.id_to_tag,
+        input.dirty,
+        input.ts_pending,
+    );
+    let skipped: Vec<(String, &'static str)> = [
+        (&partition.not_in_pool, "notInPool"),
+        (&partition.dirty, "dirty"),
+        (&partition.ts_not_ready, "tsNotReady"),
+    ]
+    .into_iter()
+    .flat_map(|(ids, reason)| ids.iter().map(move |id| (id.clone(), reason)))
+    .collect();
+    deps.ledger.set_skipped(input.targets, &skipped);
+
+    let width = wave_width(
+        input.concurrency,
+        input.pool_ports.len(),
+        partition.testable.len(),
+    );
+    let mut report = RoundReport {
+        started_at,
+        ended_at: started_at,
+        skipped,
+        width,
+        ..RoundReport::default()
+    };
+    let waves = plan_waves(&partition.testable, width);
+    // 本轮零可测：不领运行号，没有任何节点被测。
+    if waves.is_empty() {
+        return ScheduledRound::Ran(report);
+    }
+    let Some(run_id) = next_speed_test_run_id(deps.sequence) else {
+        return ScheduledRound::Ran(report);
+    };
+
+    let request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Schedule,
+        targets: input.targets.to_vec(),
+        scope: Some(input.scope),
+        path: MeasurePath::Candidate,
+        url: input.url.to_string(),
+    };
+    let mut events = RunEvents::new(
+        &run_id,
+        &request,
+        input.instance,
+        input.config_digest,
+        input.fingerprints,
+        None,
+    )
+    .with_skipped(vec![
+        ("notInPool", partition.not_in_pool.len()),
+        ("dirty", partition.dirty.len()),
+        ("tsNotReady", partition.ts_not_ready.len()),
+    ])
+    .with_ledger(deps.ledger);
+
+    let mut trace = WaveTrace::default();
+    let mut admitted: BTreeMap<String, bool> = BTreeMap::new();
+    let mut frozen = false;
+    let (_, reason) = {
+        let mut stamped = events.sink(out);
+        let mut last_event = started_at;
+        // 冻结判据：只看逐节点结果之间的墙钟间隔（首条与准入时刻比）。进程被系统冻结后，在飞的
+        // 测量解冻时会表现为超时；照常记账就是把一批好节点记成失败。
+        let mut gated = |event: &str, payload: Value| {
+            if event == EVENT_SPEED_TEST_RESULT {
+                let now = (deps.wall_clock)();
+                if frozen || now.saturating_sub(last_event) > deps.freeze_gap_ms {
+                    if !frozen {
+                        log::warn!(
+                            "周期测速：相邻两条结果相隔 {}ms，判定设备冻结，丢弃其后的结果并取消本轮",
+                            now.saturating_sub(last_event)
+                        );
+                        frozen = true;
+                        guard.cancel().cancel(InterruptReason::Cancelled);
+                    }
+                    return;
+                }
+                last_event = now;
+                if let Some(id) = payload["serverId"].as_str() {
+                    admitted.insert(id.to_string(), payload["latency"].as_i64() >= Some(0));
+                }
+            }
+            stamped(event, payload);
+        };
+        drive_pool_waves_traced(
+            &waves,
+            partition.testable.len(),
+            superseded,
+            guard.cancel(),
+            network_epoch,
+            select_slot,
+            measure,
+            &mut gated,
+            input.pool_ports,
+            &mut trace,
+        )
+        .await
+    };
+    report.run = run_id;
+    report.ended_at = (deps.wall_clock)();
+    report.unmeasured = partition
+        .testable
+        .iter()
+        .map(|(id, _)| id)
+        .filter(|id| !admitted.contains_key(*id))
+        .cloned()
+        .collect();
+    report.measured = admitted;
+    report.interrupted = reason;
+    report.frozen = frozen;
+    report.halved = trace.halved;
+    drop(guard);
+    ScheduledRound::Ran(report)
+}
+
+/// 周期一轮的生产入口：取材（运行核的池、配置、波前预筛的两个注入集）后交给
+/// [`drive_scheduled_round`]。逐节点结果经 `AppHandle` 发给前端；不持票据，不启动代理。
+pub(crate) async fn run_scheduled_round(
+    app: &AppHandle,
+    ledger: &'static MeasurementLedger,
+    targets: &[String],
+    scope: String,
+    abort: &RoundAbort,
+    freeze_gap_ms: u64,
+) -> ScheduledRound {
+    let proxy = Arc::clone(&app.state::<AppRuntime>().proxy);
+    // 取值都在 await 之前：`State` 不跨 await 持有。
+    let (probe, config, dirty, ts_pending) = {
+        let state = app.state::<AppRuntime>();
+        let (Some(probe), Ok(config)) = (proxy.speed_probe_targets(), state.config().current())
+        else {
+            return ScheduledRound::PoolUnavailable;
+        };
+        let dirty = partition_dirty(
+            targets,
+            &probe.fingerprints,
+            &current_server_fingerprints(&config),
+        );
+        let ts_pending = partition_ts_not_ready(targets, &tailscale_server_ids(&config), &|id| {
+            ts_node_ready(state.mesh().ts_status_event(id).as_ref())
+        });
+        (probe, config, dirty, ts_pending)
+    };
+    let url = resolve_speed_test_url(&config);
+    let gen0 = proxy.core_generation();
+    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    let input = ScheduledRoundInput {
+        targets,
+        scope,
+        url: &url,
+        id_to_tag: &probe.id_to_tag,
+        dirty: &dirty,
+        ts_pending: &ts_pending,
+        pool_ports: &probe.pool_ports,
+        concurrency: configured_concurrency(&config, Platform::current()),
+        instance: CoreInstance::Main {
+            generation: gen0,
+            start_time: proxy.status().start_time,
+        },
+        config_digest: proxy.ready_main_emission_digest(gen0),
+        fingerprints: probe.fingerprints.clone(),
+    };
+    let deps = ScheduledRoundDeps {
+        gate: &SPEED_TEST_GATE,
+        sequence: &SPEED_TEST_RUN_SEQUENCE,
+        ledger,
+        abort,
+        wall_clock: &crate::runtime::subscription_scheduler::now_ms,
+        freeze_gap_ms,
+    };
+    drive_scheduled_round(
+        input,
+        &deps,
+        &superseded,
+        &|| proxy.network_epoch(),
+        |slot, tag: String| {
+            let proxy = Arc::clone(&proxy);
+            async move { proxy.probe_select_slot(slot, &tag).await }
+        },
+        |port| {
+            let url = url.clone();
+            // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
+            let auth = probe.auth.clone();
+            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
+        },
+        &mut |event, payload| {
+            let _ = app.emit(event, payload);
+        },
+    )
+    .await
+}
+
+/// 周期测速的计划状态（只读；字段见 [`crate::runtime::measurement_scheduler`]）。
+#[tauri::command]
+pub fn speed_test_schedule_status(app: AppHandle) -> ApiResponse<Value> {
+    ApiResponse::ok(crate::runtime::measurement_scheduler::status(&app))
+}
+
 /// **§15.11 让位判据**（纯逻辑，对齐 上游 `SpeedTestService.ts:706` 的 `superseded()`）。
 ///
 /// 两条腿的**析取**，缺一不可：
@@ -2340,11 +2763,12 @@ const fn is_superseded(gen_now: u64, gen0: u64, running: bool) -> bool {
 /// 时丢弃的只是**尚未回来**的那些在飞值，而不是整波。这**正是 上游的语义**（`:751` 的超代检查也在
 /// worker 体内、`report()` 之前），且诚实性根基不动：跃迁后回来的值一律丢弃、绝不写假 -1。
 ///
-/// # 终态事件的唯一出口就在本函数
+/// # 终态事件的唯一出口
 ///
-/// 内核 [`drive_pool_waves_inner`] 有 4 个 `return`（让位三检查点 + 正常收尾），本薄壳把它们收成一个
-/// 出口再发 [`EVENT_SPEED_TEST_DONE`] ⇒ 「中断了却没发终态」在结构上写不出来。载荷含未测集合
-/// （续测输入），判据见 [`emit_speed_test_done`]。
+/// 内核 [`drive_pool_waves_inner`] 有 4 个 `return`（让位三检查点 + 正常收尾），薄壳
+/// [`drive_pool_waves_traced`] 把它们收成一个出口再发 [`EVENT_SPEED_TEST_DONE`] ⇒ 「中断了却没发
+/// 终态」在结构上写不出来。载荷含未测集合（续测输入），判据见 [`emit_speed_test_done`]。
+/// 本函数是它面向手动与故障切换两条腿的入口：中断成因折成 `outcome` 字符串。
 #[allow(clippy::too_many_arguments)]
 async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
     waves: &[Vec<SlotAssignment>],
@@ -2357,6 +2781,50 @@ async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
     emit: &mut (dyn FnMut(&str, Value) + Send),
     pool_ports: &[u16],
 ) -> (serde_json::Map<String, Value>, &'static str)
+where
+    Sel: Fn(usize, String) -> SelFut,
+    SelFut: Future<Output = bool>,
+    Meas: Fn(u16) -> MeasFut,
+    MeasFut: Future<Output = Measured> + Send + 'static,
+{
+    let (results, reason) = drive_pool_waves_traced(
+        waves,
+        total,
+        superseded,
+        cancel,
+        network_epoch,
+        select_slot,
+        measure,
+        emit,
+        pool_ports,
+        &mut WaveTrace::default(),
+    )
+    .await;
+    (results, outcome_of(reason))
+}
+
+/// 一轮分波里发生过、但不进结果的事。
+#[derive(Debug, Default)]
+pub(crate) struct WaveTrace {
+    /// 本轮内波宽是否因本机侧报错减半过。
+    pub(crate) halved: bool,
+}
+
+/// [`drive_pool_waves`] 的本体：多带一个 [`WaveTrace`]，并把中断成因原样交回（而不是折成
+/// `outcome` 字符串）。终态事件仍在这里单点发出。
+#[allow(clippy::too_many_arguments)]
+async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
+    waves: &[Vec<SlotAssignment>],
+    total: usize,
+    superseded: &(dyn Fn() -> bool + Sync),
+    cancel: &SpeedTestCancel,
+    network_epoch: &(dyn Fn() -> Option<u64> + Sync),
+    select_slot: Sel,
+    measure: Meas,
+    emit: &mut (dyn FnMut(&str, Value) + Send),
+    pool_ports: &[u16],
+    trace: &mut WaveTrace,
+) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
@@ -2376,12 +2844,22 @@ where
         measure,
         emit,
         pool_ports,
+        LOCAL_SIDE_HALVING,
+        trace,
     )
     .await;
-    let outcome = outcome_of(reason);
-    emit_speed_test_done(emit, outcome, &results, &intended, reason);
-    (results, outcome)
+    emit_speed_test_done(emit, outcome_of(reason), &results, &intended, reason);
+    (results, reason)
 }
+
+/// 连不上本机探针口时是否把它当作本机侧故障处理：该节点本轮不记失败、排回队尾重测一次，
+/// 其后各波的宽度减半（不低于 [`MIN_WAVE_WIDTH`]，本轮内只降不升）。
+///
+/// `false`：沿用旧行为，按传输错记账、波宽不变。回退 = 改这个常量后重新出包；两种取值各有单测。
+const LOCAL_SIDE_HALVING: bool = true;
+
+/// 波宽减半的下限。
+const MIN_WAVE_WIDTH: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
@@ -2394,6 +2872,8 @@ async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
     measure: Meas,
     emit: &mut (dyn FnMut(&str, Value) + Send),
     pool_ports: &[u16],
+    local_side_halving: bool,
+    trace: &mut WaveTrace,
 ) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
@@ -2405,7 +2885,24 @@ where
     let mut tested = 0usize;
     let mut ok = 0usize;
 
-    for wave in waves {
+    // 传入的分波是起始计划：每波开头按**当前**波宽从剩余目标里取，槽 = 波内位次。波宽不变时
+    // 取出来的就是传入的那几波；本机侧报错后波宽减半，剩余目标按新宽度重切。
+    let mut width = waves.iter().map(Vec::len).max().unwrap_or(0);
+    let mut queue: VecDeque<(String, String)> = waves
+        .iter()
+        .flatten()
+        .map(|a| (a.node_id.clone(), a.tag.clone()))
+        .collect();
+    // 因本机侧报错排回过队尾的节点：每个只重排一次，再撞就让它缺席。
+    let mut requeued: BTreeSet<String> = BTreeSet::new();
+
+    while !queue.is_empty() {
+        let wave: Vec<SlotAssignment> = queue
+            .drain(..width.min(queue.len()))
+            .enumerate()
+            .map(|(slot, (node_id, tag))| SlotAssignment { slot, node_id, tag })
+            .collect();
+        let mut local_side_error = false;
         // ── 让位①（波首）：核跃迁/崩溃/已取消 → 停发新波 ──
         if let Some(reason) = interrupted(cancel, superseded) {
             return (results, Some(reason));
@@ -2489,6 +2986,17 @@ where
                 log::info!("测速期间网络发生变化，节点 {id} 本轮记为未测");
                 continue;
             }
+            // 连不上本机探针口 ⇒ 故障在本机一侧，不是这个节点的负面证据：不落账，排回队尾。
+            if local_side_halving && measured.is_err_and(|failure| failure.kind == FailKind::Local)
+            {
+                local_side_error = true;
+                if requeued.insert(id.clone()) {
+                    if let Some(a) = wave.iter().find(|a| a.node_id == id) {
+                        queue.push_back((id, a.tag.clone()));
+                    }
+                }
+                continue;
+            }
             record_measured(
                 &mut results,
                 &mut tested,
@@ -2499,6 +3007,14 @@ where
                 epoch,
                 total,
             );
+        }
+        if local_side_error {
+            let narrowed = (width / 2).max(MIN_WAVE_WIDTH).min(width);
+            log::warn!(
+                "测速：连接本机探针口失败，波宽由 {width} 减到 {narrowed}（本轮内不再回升，受影响节点不记失败）"
+            );
+            trace.halved |= narrowed < width;
+            width = narrowed;
         }
     }
 
@@ -2864,12 +3380,11 @@ fn companion_result_payload(
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  结果的消费判据（纯函数）：按什么键存、新旧怎么比、算不算当前、能不能进选点。
-//  Rust 侧的结果账本与前端 store 共用这一套；账本本身都是内存态，随进程一起清空。
-//  本层只交付判据，账本实例与选点入口不在本层 —— 故生产构型下这一节暂无调用方。
+//  Rust 侧的结果账本（`runtime::measurement_ledger`）与前端 store 共用这一套；账本本身都是
+//  内存态，随进程一起清空。
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// 结果的存放键：节点、路径、URL 摘要、口径。路径或 URL 不同的结果互不覆盖。
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResultKey {
     pub(crate) node_id: String,
@@ -2878,7 +3393,6 @@ pub(crate) struct ResultKey {
     pub(crate) metric: &'static str,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn result_key(node_id: &str, identity: &ResultIdentity) -> ResultKey {
     ResultKey {
         node_id: node_id.to_string(),
@@ -2889,7 +3403,6 @@ pub(crate) fn result_key(node_id: &str, identity: &ResultIdentity) -> ResultKey 
 }
 
 /// 同一个键下，新来的结果是否该取代已有的：只接受运行号更大的；运行号相同时只接受序号更大的。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn supersedes_stored(
     incoming: &ResultIdentity,
     stored: Option<&ResultIdentity>,
@@ -2898,7 +3411,6 @@ pub(crate) fn supersedes_stored(
 }
 
 /// 判一条结果是否仍然「当前」时的对照面（由消费方在判的那一刻取）。
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CurrentState<'a> {
     /// 当前主核世代；核不在运行时为 `None`。
@@ -2910,7 +3422,6 @@ pub(crate) struct CurrentState<'a> {
 }
 
 /// 一条结果不再当前的原因。过期结果可保留用于显示，不得用于选点。
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaleReason {
     /// 测出它的主核已换代，或核已不在运行。
@@ -2925,7 +3436,6 @@ pub(crate) enum StaleReason {
 ///
 /// 「未连接测量」的结果不参与实例比对（它本来就不属于任何主核世代，永远只用于显示）。
 /// 网络代次任一方未知时不能据此判定，新鲜度只能靠时间上限。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn stale_reason(
     identity: &ResultIdentity,
     current: &CurrentState<'_>,
@@ -2948,7 +3458,6 @@ pub(crate) fn stale_reason(
 
 /// 一条结果能否进自动选点的候选：测出了值、路径为 `candidate`、经运行中的主核测得、且仍然当前。
 /// `system` 路径与「未连接测量」的结果在这里被结构性排除。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_selectable(
     measured: &Measured,
     identity: &ResultIdentity,

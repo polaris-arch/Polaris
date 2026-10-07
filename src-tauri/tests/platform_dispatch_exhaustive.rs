@@ -2400,13 +2400,14 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/lib.rs",
         "mobile",
-        4,
+        5,
         IosSide::WithAndroid,
         "🔵 **移动端装载面**：`window_config.url = \"mobile.html\"`、`mobile_entry_point`、\
          移动端托盘缺席。这一格是 `builder/inbounds.rs` 里 `strict_route` 那条 iOS 判据的\
          **依据本身** —— 「Android 与 iOS 共用同一份移动端 UI」正是靠前三处成立的\
          （`mobile = ios | android`）。第四处是主窗 `WindowEvent::Resumed` 的前台补更挂钩，\
-         两个平台都调用同一个规则资源调度器。四处均同侧。",
+         两个平台都调用同一个规则资源调度器。第五处是主窗 `WindowEvent::Suspended`：把「离开前台」\
+         转给周期测速调度器（`Resumed` 那一臂同时转给它）。五处均同侧。",
     ),
     (
         "src-tauri/src/runtime/rule_resource_scheduler.rs",
@@ -2833,6 +2834,48 @@ const CFG_REGISTRY: &[CfgSite] = &[
         3,
         IosSide::DiffersRight,
         "新增三个 Android debug command/probe JNI 调用点仅属于 Android 插件；iOS 不可复用 Java 宿主，保持该支不编译。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersRight,
+        "周期测速的设备状况查询（应答结构 + `deviceConditions` 命令腿）：活动网络是否计费、是否省电，\
+         走 Android 的 `ConnectivityManager` / `PowerManager`。iOS 不编译它是对的：对应物是 App 侧\
+         插件里的路径属性与低电量模式查询，要的是另一条桥，而且 iOS 的周期计划在那条桥就位前整体关闭。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "`android_conditions` 的真实腿：经 Android 桥拉设备状况。只在 `Platform::Android` 臂被调用；\
+         iOS 走自己的臂（今天如实返回「不可得」），不经过这个函数。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersRight,
+        "`android_conditions` 的非 Android 桩，返回「不可得」。它只为让 `Platform::Android` 臂在别的\
+         目标上编得过，运行期不可达；iOS 落这一侧不改变行为（iOS 臂本来就不调它）。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "mobile",
+        1,
+        IosSide::WithAndroid,
+        "调度器的前后台入口（`on_suspended` / `on_resumed`）只在移动端编译：信号来自主窗的\
+         `WindowEvent::Suspended` / `Resumed`。两个平台同侧；两者对「离开前台」的处置不同\
+         （Android 进入暂停、iOS 只作打断加静默期），那条分叉在 `Planner::on_suspended` 的穷举 match 里。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "not(mobile)",
+        1,
+        IosSide::WithAndroid,
+        "`cfg_attr(not(mobile), allow(dead_code))`：状态机的前后台处置在桌面构型里没有调用方\
+         （桌面不按前后台判定）。iOS 与 Android 同在 `mobile` 一侧，两者都真的调用它。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_capacity.rs",
@@ -3621,12 +3664,14 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// zero-count leg (Right) and two non-Android Temp-view sites registered as a new debt group.
 /// Debt is 35 tuple rows / 25 unique groups / 173 sites; no historical debt was repaid.
 /// Source-only registration does not sign Android/iOS SDK execution, global cleanup or NoOwner.
+/// 周期测速调度器：Android 设备状况查询 +4 处 Right（桥两处、调度器的真实腿与桩各一处），
+/// 移动端前后台入口 +3 处 WithAndroid（lib.rs 的 `Suspended` 臂、调度器两处）。两个债格子没动。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 261),
+    ("DiffersRight", 265),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 148),
-    ("WithAndroid", 83),
+    ("WithAndroid", 86),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

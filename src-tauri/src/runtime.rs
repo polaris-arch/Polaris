@@ -29,6 +29,8 @@ pub mod geo_seed;
 pub mod helper;
 pub mod http;
 pub mod management_api;
+pub(crate) mod measurement_ledger;
+pub mod measurement_scheduler;
 pub mod mesh;
 /// pending `modified`（全维）与测速 dirty（5 维）两条判据的单点定义 + 包含关系不变式。
 pub mod node_fingerprints;

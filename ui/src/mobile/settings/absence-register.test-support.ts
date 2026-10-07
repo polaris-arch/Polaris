@@ -1077,7 +1077,8 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     'ipv6-swt', 'le-bypass', 'mac-filter-list', 'mac-filter-mode', 'main-session-via-proxy-swt',
     'mgmt-block', 'mixed-port-input', 'neighbor-domain-list', 'race-doh-count', 'race-ups',
     'res-auto-swt', 'set-graphics', 'set-hwaccel', 'set-lan-gateway', 'set-mac-filter',
-    'set-window-effects', 'speed-test-url-input', 'term-env', 'tun-anchor-tx', 'tun-mtu',
+    'set-window-effects', 'speed-test-concurrency-input', 'speed-test-metered-seg',
+    'speed-test-url-input', 'term-env', 'tun-anchor-tx', 'tun-mtu',
     'tun-nat-type', 'webrtc-note', 'webrtc-row', 'webrtc-seg',
   ],
 };

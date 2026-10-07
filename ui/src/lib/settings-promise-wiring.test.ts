@@ -303,6 +303,27 @@ interface PromiseRow {
  */
 const REGISTRY: readonly PromiseRow[] = [
   {
+    snippet: '应用运行期间按周期测速；应用被系统暂停后，回来时自动补测',
+    evidence: {
+      kind: 'anchors',
+      items: [
+        // 总开关由调度器每拍读；关着时一轮都不发。
+        { file: 'src-tauri/src/runtime/measurement_scheduler.rs', needle: '.get("periodicSpeedTestEnabled")' },
+        // 回来后的补测评估（离开够久即作废旧结果并立即发一轮）。
+        { file: 'src-tauri/src/runtime/measurement_scheduler.rs', needle: 'fn returned(&mut self, now: Now, away_ms: u64)' },
+      ],
+    },
+  },
+  {
+    snippet: '并发过高可能把可用节点误判为超时',
+    // 说明行，不是「自动做某事」的承诺；它描述的那个设置项由测速准入处读取。
+    evidence: {
+      kind: 'anchor',
+      file: 'src-tauri/src/commands/speedtest.rs',
+      needle: '.get("speedTestConcurrency")',
+    },
+  },
+  {
     snippet: '下次打开时还原上次的窗口布局',
     evidence: { kind: 'config-key', key: 'rememberWindowSize' },
   },

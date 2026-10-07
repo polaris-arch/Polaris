@@ -3902,3 +3902,147 @@ fn lan_resolver_flows_from_controller_into_generated_dependencies() {
     assert_eq!(deps.lan_resolver_for_dns.as_deref(), Some("192.168.42.1"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// 循环发出 `distinct` 个互异端口的桩：要的口数超过它就必然撞上已选端口。
+struct CyclingPorts {
+    distinct: u16,
+    next: std::sync::atomic::AtomicU16,
+}
+
+impl polaris_core_supervisor::port_bookkeeping::FreePortProvider for CyclingPorts {
+    fn try_allocate(&self) -> Option<u16> {
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        Some(30_000 + n % self.distinct)
+    }
+}
+
+/// 探针池的端口申请：按槽位上限要得到就用上限；要不到降到 16 个槽再要一次；仍要不到才是空池。
+/// 上限本身不高于 16 时没有可降的一级。
+#[test]
+fn probe_pool_allocation_falls_back_to_sixteen_slots_before_giving_up() {
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let allocate = |distinct, slots| {
+        allocate_probe_ports(
+            &PortAllocator::new(CyclingPorts {
+                distinct,
+                next: std::sync::atomic::AtomicU16::new(0),
+            }),
+            &excluded,
+            slots,
+        )
+        .len()
+    };
+    assert_eq!(allocate(200, 64), 65, "出口探针口 + 64 个槽");
+    assert_eq!(allocate(30, 64), 17, "只有 30 个口可用：降到 16 个槽");
+    assert_eq!(allocate(10, 64), 0, "连 17 个也凑不齐：空池");
+    assert_eq!(allocate(30, 32), 17);
+    assert_eq!(allocate(10, 16), 0, "上限就是 16：不重试");
+    assert_eq!(allocate(200, 16), 17);
+}
+
+fn probe_pool_generate_deps(slots: u16) -> polaris_config_engine::builder::GenerateConfigDeps {
+    polaris_config_engine::builder::GenerateConfigDeps {
+        platform: "linux".into(),
+        arch: "x64".into(),
+        race_server_port: 0,
+        probe_direct_port: None,
+        probe_proxy_port: Some(39_000),
+        debug_probe_mixed_udp: false,
+        update_in_port: None,
+        subscription_update_in_port: None,
+        loopback_auth: None,
+        probe_pool_ports: (0..slots).map(|k| 40_000 + k).collect(),
+        lan_resolver_for_dns: None,
+        race_upstream_ips: vec![],
+        race_upstream_ports: vec![],
+        has_cronet: true,
+        cronet_copy_failed: false,
+        has_management_api: false,
+        privacy_mode: false,
+        log_level: polaris_config_engine::user_config::LogLevel::Info,
+        disable_log_file: false,
+        dashboard_serve_dir: None,
+        tailscale_api_port: 15490,
+        cache_path: "/fake/cache.db".into(),
+        log_file_path: None,
+        runtime_rules_dir: "/fake/runtime-rules".into(),
+        rule_resources_path: "/fake/rule-resources".into(),
+        custom_rules_dir: "/fake/custom-rules".into(),
+        tailnet_rules_dir: "/fake/tailnet-rules".into(),
+        tailscale_state_dir_prefix: "/fake/ts".into(),
+        observed_tailnet_addresses: Default::default(),
+        is_valid_srs_fn: |_| true,
+        own_lan_cidrs: vec![],
+        log: |_, _| {},
+        on_degraded: || {},
+        system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
+        network_canary_port: None,
+    }
+}
+
+/// 把生成的配置里属于探针池的条目摘出来按类计数，返回（各类条数，摘掉之后的配置）。
+fn split_probe_pool(config: serde_json::Value) -> ([usize; 5], serde_json::Value) {
+    fn slot_of<'a>(value: &'a serde_json::Value, key: &str, prefix: &str) -> Option<&'a str> {
+        let text = match &value[key] {
+            serde_json::Value::String(text) => text.as_str(),
+            serde_json::Value::Array(items) if items.len() == 1 => items[0].as_str()?,
+            _ => return None,
+        };
+        text.strip_prefix(prefix)
+            .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    }
+    let mut config = config;
+    let mut counts = [0usize; 5];
+    let mut strip = |pointer: &str, index: usize, key: &str, prefix: &str| {
+        let items = config
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap_or_else(|| panic!("生成的配置里没有 {pointer}"));
+        let before = items.len();
+        items.retain(|item| slot_of(item, key, prefix).is_none());
+        counts[index] = before - items.len();
+    };
+    strip("/inbounds", 0, "tag", "probe-in-");
+    strip("/route/rules", 1, "outbound", "probe-selector-");
+    strip("/outbounds", 2, "tag", "probe-selector-");
+    strip("/dns/servers", 3, "tag", "dns-probe-exit-");
+    strip("/dns/rules", 4, "server", "dns-probe-exit-");
+    (counts, config)
+}
+
+/// 配置生成器对槽位数没有写死的假设：上限 64 时探针入站、钉死路由、选择器、DNS 服务器、DNS 规则
+/// 各 64 个，其余部分与上限 16 时逐字节相同。
+#[test]
+fn sixty_four_probe_slots_only_add_probe_pool_entries_to_the_config() {
+    let user: polaris_config_engine::user_config::app_config::UserConfig =
+        serde_json::from_value(serde_json::json!({
+            "proxyMode": "smart", "proxyModeType": "systemProxy", "mixedPort": 17890,
+            "selectedServerId": "n1",
+            "servers": [
+                { "id": "n1", "name": "n1", "protocol": "shadowsocks", "address": "192.0.2.1",
+                  "port": 8388, "password": "p", "method": "aes-128-gcm" },
+                { "id": "n2", "name": "n2", "protocol": "shadowsocks", "address": "192.0.2.2",
+                  "port": 8388, "password": "p", "method": "aes-128-gcm" },
+            ],
+        }))
+        .expect("夹具配置可解析");
+    let generate = |slots| {
+        let outcome = polaris_config_engine::builder::generate_sing_box_config_with_report(
+            &user,
+            &BTreeMap::new(),
+            &probe_pool_generate_deps(slots),
+        )
+        .expect("夹具配置可生成");
+        split_probe_pool(serde_json::to_value(&outcome.config).unwrap())
+    };
+    let (sixteen, rest_of_sixteen) = generate(16);
+    let (sixty_four, rest_of_sixty_four) = generate(64);
+    assert_eq!(sixteen, [16; 5]);
+    assert_eq!(sixty_four, [64; 5]);
+    assert_eq!(
+        serde_json::to_string(&rest_of_sixty_four).unwrap(),
+        serde_json::to_string(&rest_of_sixteen).unwrap(),
+        "探针池之外的部分不随槽位数变化"
+    );
+}

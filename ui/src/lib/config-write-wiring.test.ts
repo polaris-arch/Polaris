@@ -373,6 +373,12 @@ const SITES: readonly Site[] = [
 
   // ── W-b：通用 config 写 ──
   {
+    file: 'hooks/use-periodic-speed-test-fields.ts',
+    callee: 'saveConfig(',
+    route: 'direct',
+    why: 'W-0/Class A：订阅表单里「开启全局周期测速」的就地操作，只写 periodicSpeedTestEnabled。它是原始配置的顶层键（∉ UserConfig），调度器下一拍即读到，不需要重启内核，也就没有可暂存的东西',
+  },
+  {
     file: 'components/screens/home/HomeScreen.tsx',
     callee: 'saveConfig(',
     route: 'direct',

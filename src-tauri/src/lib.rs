@@ -871,6 +871,15 @@ pub fn run() {
             rule_res_scheduler.start(app.handle().clone());
             app.manage(rule_res_scheduler);
 
+            // ── 周期测速调度器（按订阅的周期，在代理运行期间对其节点发周期来源的测速）──
+            // 进程级单例，自己按拍读核世代与配置，不挂在起核流程上。先 manage 再启动：
+            // 拍循环与状态命令都经 State 找它。
+            let measurement_scheduler = std::sync::Arc::new(
+                runtime::measurement_scheduler::MeasurementScheduler::new(),
+            );
+            app.manage(measurement_scheduler.clone());
+            measurement_scheduler.start(app.handle().clone());
+
             // ── 内核自动更新调度器（启动 30s + 6h 巡检 + 24h due + 代理停止后 5s 落位）──
             // 装法与上面两个调度器同构。**30s 启动延迟刻意最靠后**：错开 startup_tasks 的
             // 2s 自动连接 / 3s 出口 IP / 5s App 更新检查 / 6s 内核基线 / 7s helper 可升级，
@@ -1261,6 +1270,7 @@ pub fn run() {
             manual_network_check_cancel,
             // ── 测速（server:speedTest）──
             server_speed_test,
+            speed_test_schedule_status,
             // ── 更新（version + app update + core update）──
             version_get_info,
             update_check,
@@ -1362,6 +1372,24 @@ pub fn run() {
                 .try_state::<Arc<runtime::rule_resource_scheduler::RuleResourceScheduler>>()
             {
                 scheduler.on_resume(app_handle.clone());
+            }
+            if let Some(scheduler) =
+                app_handle.try_state::<Arc<runtime::measurement_scheduler::MeasurementScheduler>>()
+            {
+                scheduler.on_resumed();
+            }
+        }
+        // Android onPause / iOS willResignActive：周期测速不在后台继续，在飞的一轮立即取消。
+        #[cfg(mobile)]
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Suspended,
+            ..
+        } if label == "main" => {
+            if let Some(scheduler) =
+                app_handle.try_state::<Arc<runtime::measurement_scheduler::MeasurementScheduler>>()
+            {
+                scheduler.on_suspended();
             }
         }
         // macOS：点 dock 图标（NSApplicationDelegate applicationShouldHandleReopen）→ RunEvent::Reopen。

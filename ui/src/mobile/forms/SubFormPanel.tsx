@@ -40,8 +40,10 @@ import {
 } from '@/store/subscription-create-operation-store';
 import { isSubscriptionUrl } from '@/components/dialogs/sub-url';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { usePeriodicSpeedTestFields } from '@/hooks/use-periodic-speed-test-fields';
 import { MobileSelect } from '../MobileSelect';
 import { FormSheet } from './FormSheet';
+import { PeriodicGlobalOffHint } from './PeriodicGlobalOffHint';
 import { openMobileSubscriptionCreateRecovery, useMobileFormStore } from './form-store';
 
 /** 各阶段的文案键 —— 逐字同桌面 `SubscriptionCreateTaskDialog#PHASE_KEY`。 */
@@ -109,6 +111,7 @@ export function SubFormPanel({
   );
   const [viaProxy, setViaProxy] = useState(base?.updateViaProxy ?? false);
   const [proxyBindInterface, setProxyBindInterface] = useState(base?.proxyBindInterface ?? '');
+  const periodic = usePeriodicSpeedTestFields(base);
   const interfaces = useNetworkInterfaces();
   const interfaceOptions = buildNetworkInterfaceChoices(interfaces.items, proxyBindInterface, {
     defaultLabel: t('sub.bindInterfaceInherit'),
@@ -241,7 +244,8 @@ export function SubFormPanel({
     const urlBad = !isSubscriptionUrl(url);
     setErrName(nameEmpty);
     setErrUrl(urlBad);
-    if (nameEmpty || urlBad) return;
+    const periodicFields = periodic.commit();
+    if (nameEmpty || urlBad || periodicFields === null) return;
 
     setBusy(true);
     try {
@@ -254,6 +258,7 @@ export function SubFormPanel({
           userAgent: ua.trim() === '' ? undefined : ua.trim(),
           updateViaProxy: viaProxy,
           proxyBindInterface: proxyBindInterface || undefined,
+          ...periodicFields,
         };
         // 编辑只写 config（对齐桌面：edit 不自动拉取）。
         await api.subscription.update(next);
@@ -272,6 +277,7 @@ export function SubFormPanel({
         userAgent: ua.trim() === '' ? undefined : ua.trim(),
         updateViaProxy: viaProxy,
         proxyBindInterface: proxyBindInterface || undefined,
+        ...periodicFields,
       });
       /* 不在这里关表：终态由上面那条 effect 处置（成功才关，失败留在原地显详情）。 */
     } catch (e) {
@@ -442,6 +448,72 @@ export function SubFormPanel({
         <p className="m-form-hint" id="msf-interface-hint">{t('sub.bindInterfaceHint')}</p>
         {interfaces.failed && <p className="m-form-err">{t('settings.network.interfaceListFailed')}</p>}
       </div>
+
+      {/* 周期测速：每订阅一个开关，周期输入框跟着它。全局总开关关着时开关照常可拨、照常保存，
+          只是多一行说明与就地打开全局开关的按钮（常驻行，不用 tooltip）。 */}
+      <div className="m-form-row m-form-switch">
+        <div className="m-form-switch-tx">
+          <span className="m-form-label" id="msf-periodic-l">
+            {t('sub.periodicSpeedTest')}
+          </span>
+          <p className="m-form-hint">{t('sub.periodicSpeedTestHint')}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={periodic.checked}
+          aria-labelledby="msf-periodic-l"
+          className={`m-form-swt${periodic.checked ? ' on' : ''}`}
+          onClick={() => {
+            periodic.toggle();
+            setDirty(true);
+          }}
+        />
+      </div>
+      {periodic.showGlobalOff && (
+        <PeriodicGlobalOffHint
+          busy={periodic.enablingGlobal}
+          onEnable={() => {
+            periodic.enableGlobal().catch((e) => {
+              console.error('[mobile-sub-form] enable periodic speed test failed:', e);
+              setNotice({ tone: 'err', text: t('common.saveFailed') });
+            });
+          }}
+        />
+      )}
+      {periodic.checked && (
+        <div className="m-form-row">
+          <label className="m-form-label" htmlFor="msf-speed-interval">
+            {t('sub.speedTestInterval')}
+            <span className="m-form-opt">{t('common.optional')}</span>
+          </label>
+          <input
+            id="msf-speed-interval"
+            className="m-form-input"
+            inputMode="numeric"
+            value={periodic.interval}
+            aria-invalid={periodic.intervalInvalid || undefined}
+            placeholder={periodic.limits ? String(periodic.limits.intervalMinutesDefault) : undefined}
+            onChange={(e) => {
+              periodic.setInterval(e.target.value);
+              setDirty(true);
+            }}
+          />
+          {periodic.limits && (
+            <p className={periodic.intervalInvalid ? 'm-form-err' : 'm-form-hint'}>
+              {t('sub.speedTestIntervalRange', {
+                min: periodic.limits.intervalMinutesMin,
+                max: periodic.limits.intervalMinutesMax,
+                default: periodic.limits.intervalMinutesDefault,
+              })}
+            </p>
+          )}
+          {periodic.intervalInvalid && !periodic.limits && (
+            <p className="m-form-err">{t('sub.speedTestIntervalInvalid')}</p>
+          )}
+          <p className="m-form-hint">{t('sub.speedTestIntervalHint')}</p>
+        </div>
+      )}
 
       <button
         type="button"

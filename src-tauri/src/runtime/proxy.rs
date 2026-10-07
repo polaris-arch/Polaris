@@ -251,13 +251,18 @@ use polaris_platform_events::RuntimeBindingPlan;
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
 use crate::runtime::vpn_status::{OpenConnectStatusEvent, OpenVpnStatusEvent};
 
-/// **§15 主核测速探测池槽数 K**（上游 `shared/speed-test.ts PROBE_POOL_SIZE`，单一真值）。
+/// **§15 主核测速探测池槽数 K**（上游 `shared/speed-test.ts PROBE_POOL_SIZE`）。
 ///
 /// 起核时分配 K 个空闲回环端口注入 `probe_pool_ports` → config-engine 据此建 K 个 `probe-in-k`（http 入站）
 /// `probe-selector-k`（成员=全量 nodeTags）、`probe-in-k→probe-selector-k` 路由、`dns-probe-exit-k`。
 /// 测速时按波经 gRPC `select_outbound` 把各槽热切到被测节点、经 `probe-in-k` 端口量 warm-TTFB（同核单会话，
-/// 结构性消除 WG/WARP 双会话超时）。K=16 对齐 上游；**分配失败 → 空池（回退当前活跃出口测速）**，`=0` 为回滚锚点。
-const PROBE_POOL_SIZE: usize = 16;
+/// 结构性消除 WG/WARP 双会话超时）。**分配失败 → 空池（回退当前活跃出口测速）**，`=0` 为回滚锚点。
+///
+/// 这是槽位**上限**，起核时定、按平台取值（[`polaris_store::speed_test_slot_cap`]：桌面 64、
+/// Android 32、iOS 16）；每轮实际用几个槽由测速侧在上限内另定。
+fn probe_pool_size() -> usize {
+    polaris_store::speed_test_slot_cap(polaris_helper_proto::Platform::current())
+}
 
 /// sing-box 运行态快照（上游 `ProxyStatus` 镜像，序列化字段名与前端一致）。
 ///

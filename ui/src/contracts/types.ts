@@ -217,6 +217,8 @@ export type UdpNatType = 'fullCone' | 'restrictedCone' | 'portRestrictedCone';
 // 订阅配置
 // ============================================================================
 
+export type SpeedTestMeteredPolicy = 'reduced' | 'pause' | 'normal';
+
 export interface SubscriptionConfig {
   id: string;
   name: string;
@@ -239,6 +241,10 @@ export interface SubscriptionConfig {
   updateViaProxy?: boolean;
   /** 订阅节点的代理内核物理出口网卡；缺省继承全局代理出口。 */
   proxyBindInterface?: string;
+  /** 是否对该订阅的节点按周期测速。缺省值由后端给出（计划状态的 `limits.subscriptionDefault`）。 */
+  periodicSpeedTest?: boolean;
+  /** 该订阅的测速周期（分钟）。缺省即后端的缺省周期；范围同见计划状态的 `limits`。 */
+  speedTestIntervalMinutes?: number;
   // 订阅流量/到期信息（从 Subscription-UserInfo header 解析）
   userInfo?: {
     upload?: number; // 已上传字节
@@ -744,6 +750,12 @@ export interface UserConfig {
   // 节点测速端点 URL（经各节点代理 GET 量 TTFB）。默认 generate_204（见 contracts/speed-test）；用户可自配，兼容 http/https。
   // 非法值由 SpeedTestService 经 resolveSpeedTestTarget 回落默认，不阻断测速。
   speedTestUrl?: string;
+  /** 周期测速的全局总开关。关掉后任何订阅都不建周期计划；手动测速与故障切换不受影响。 */
+  periodicSpeedTestEnabled?: boolean;
+  /** 测速并发：缺省或 `'auto'` 为自动，否则是 4 到本设备上限的整数（上限随平台不同，由后端给出）。 */
+  speedTestConcurrency?: 'auto' | number;
+  /** 计费网络下的周期测速：降频（周期乘 4）/ 暂停 / 照常。缺省由后端给出。 */
+  speedTestMeteredPolicy?: SpeedTestMeteredPolicy;
   // fake-ip-filter 默认清单（NTP/STUN/Captive 等在 FakeIP 下会坏的域名 → 真实解析）。默认开（undefined/true=开），仅 false=关。
   fakeIpFilter?: boolean;
   // FakeIP 例外域名清单（用户可编辑）：undefined=用内置默认（DEFAULT_FAKEIP_FILTER_DOMAINS，与历史字节一致）；

@@ -4,15 +4,18 @@ package com.polaris2.app.vpn
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -252,6 +255,25 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.resolve(JSObject().put("interfaces", JSONArray(rows.map(::bindableInterface))))
                 }
                 .onFailure { invoke.reject("Android network interface enumeration failed", "NETWORK_INTERFACE_LIST_FAILED") }
+        }.start()
+    }
+
+    /**
+     * 周期测速每轮准入前查一次：活动网络是否计费、系统是否处于省电模式。只读，不改任何状态。
+     * VPN 自身声明为非计费并跟随底层网络，所以 `isActiveNetworkMetered` 反映的是底层网络。
+     */
+    @Command
+    fun deviceConditions(invoke: Invoke) {
+        Thread {
+            runCatching {
+                val connectivity = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val power = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+                JSObject()
+                    .put("metered", connectivity.isActiveNetworkMetered)
+                    .put("powerSave", power.isPowerSaveMode)
+            }
+                .onSuccess { invoke.resolve(it) }
+                .onFailure { invoke.reject("Android device conditions query failed", "DEVICE_CONDITIONS_FAILED") }
         }.start()
     }
 

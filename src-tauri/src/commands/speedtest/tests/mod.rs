@@ -2532,7 +2532,10 @@ fn pool_leg_wires_ts_prefilter_before_running_waves() {
         .find("ts_node_ready(state.mesh().ts_status_event(")
         .expect("就绪判据必须读 mesh 的 TS 状态**活态**末帧，而非任何静态/缓存假设");
     let run = compact
-        .find("run_pool_speed_test(&app,&proxy,&targets,&requested,&url,&prefilter,&run_id")
+        .find(
+            "run_pool_speed_test(&app,&proxy,&targets,&requested,&url,\
+             configured_concurrency(&config,Platform::current()),&prefilter,&run_id",
+        )
         .expect("预筛结果必须作为入参传进分波编排——不传等于算了不用");
     assert!(
         prefilter < run && ready_probe < run,
@@ -2568,7 +2571,10 @@ fn pool_leg_wires_dirty_prefilter_before_running_waves() {
         .find("partition_dirty(&requested,&targets.fingerprints,&current_fingerprints)")
         .expect("池路径必须现场算 dirty 集：「旧」= 起核快照指纹，「新」= 当前配置指纹");
     let run = compact
-        .find("run_pool_speed_test(&app,&proxy,&targets,&requested,&url,&prefilter,&run_id")
+        .find(
+            "run_pool_speed_test(&app,&proxy,&targets,&requested,&url,\
+             configured_concurrency(&config,Platform::current()),&prefilter,&run_id",
+        )
         .expect("预筛结果必须作为入参传进分波编排——不传等于算了不用");
     assert!(
         prefilter < run,
@@ -3740,4 +3746,592 @@ fn production_entries_wire_origin_instance_cancel_and_terminal() {
     .collect();
     assert_eq!(occurrences(&whole, "SpeedTestCancel::default()"), 1);
     assert_eq!(occurrences(&whole, "app.emit(EVENT_SPEED_TEST_DONE,"), 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  周期一轮：准入、事件形态、冻结判据、波宽与本机侧减半。
+// ══════════════════════════════════════════════════════════════════════════════
+
+use crate::events::channel::EVENT_SPEED_TEST_RESULT;
+
+/// 周期一轮的测试台：独立的闸、运行号序列与账本，墙钟由测试拨。
+struct ScheduleBench {
+    gate: &'static SpeedTestGate,
+    sequence: AtomicU64,
+    ledger: &'static MeasurementLedger,
+    abort: RoundAbort,
+    clock: Arc<AtomicU64>,
+    id_to_tag: BTreeMap<String, String>,
+    none: BTreeSet<String>,
+    ports: Vec<u16>,
+}
+
+impl ScheduleBench {
+    /// `nodes` 个在池节点（`n0`、`n1`…），`ports` 个池端口（从 10000 起）。
+    fn new(nodes: usize, ports: u16) -> Self {
+        Self {
+            gate: Box::leak(Box::new(SpeedTestGate::new())),
+            sequence: AtomicU64::new(0),
+            ledger: Box::leak(Box::new(MeasurementLedger::new())),
+            abort: RoundAbort::default(),
+            clock: Arc::new(AtomicU64::new(1_000_000)),
+            id_to_tag: (0..nodes)
+                .map(|n| (format!("n{n}"), format!("tag-n{n}")))
+                .collect(),
+            none: BTreeSet::new(),
+            ports: (0..ports).map(|k| 10_000 + k).collect(),
+        }
+    }
+
+    fn targets(&self, nodes: usize) -> Vec<String> {
+        (0..nodes).map(|n| format!("n{n}")).collect()
+    }
+
+    /// 跑一轮。`measure` 按池端口给结果；事件经盖章出口收集。
+    async fn run<Sel, SelFut, Meas, MeasFut>(
+        &self,
+        targets: &[String],
+        concurrency: usize,
+        select: Sel,
+        measure: Meas,
+        collected: &mut Vec<(String, Value)>,
+    ) -> ScheduledRound
+    where
+        Sel: Fn(usize, String) -> SelFut,
+        SelFut: Future<Output = bool>,
+        Meas: Fn(u16) -> MeasFut,
+        MeasFut: Future<Output = Measured> + Send + 'static,
+    {
+        let clock = Arc::clone(&self.clock);
+        drive_scheduled_round(
+            ScheduledRoundInput {
+                targets,
+                scope: "s1,s2".to_string(),
+                url: DEFAULT_SPEED_TEST_URL,
+                id_to_tag: &self.id_to_tag,
+                dirty: &self.none,
+                ts_pending: &self.none,
+                pool_ports: &self.ports,
+                concurrency,
+                instance: main_instance(),
+                config_digest: None,
+                fingerprints: BTreeMap::new(),
+            },
+            &ScheduledRoundDeps {
+                gate: self.gate,
+                sequence: &self.sequence,
+                ledger: self.ledger,
+                abort: &self.abort,
+                wall_clock: &move || clock.load(Ordering::SeqCst),
+                freeze_gap_ms: 15_000,
+            },
+            &superseded_at(0),
+            &|| None,
+            select,
+            measure,
+            &mut |event, payload| collected.push((event.to_string(), payload)),
+        )
+        .await
+    }
+
+    fn url_digest() -> String {
+        polaris_updater::sha256_hex(DEFAULT_SPEED_TEST_URL.as_bytes())
+    }
+}
+
+fn ran(round: ScheduledRound) -> RoundReport {
+    match round {
+        ScheduledRound::Ran(report) => report,
+        other => panic!("这一轮应当跑过：{other:?}"),
+    }
+}
+
+/// 周期一轮经生产发布口发出的事件只有逐节点结果：顶层没有 `runId`，没有进度与终态事件。
+/// 顶层带 `runId` 会被前端当成一轮前台任务（弹进度提示、挡住下一次手动测速）。
+/// **变异锁**：把这一轮的来源写成手动 → 本条转红。
+#[tokio::test]
+async fn a_scheduled_round_publishes_only_per_node_results() {
+    let bench = ScheduleBench::new(3, 2);
+    // 请求里另有一个不在运行核里的节点：起测前跳过，不出现在任何事件里。
+    let mut targets = bench.targets(3);
+    targets.push("ghost".to_string());
+    let mut collected = Vec::new();
+    let report = ran(bench
+        .run(
+            &targets,
+            16,
+            |_, _| async { true },
+            |port| async move {
+                if port == 10_000 {
+                    Err(TIMED_OUT)
+                } else {
+                    Ok(120_u32)
+                }
+            },
+            &mut collected,
+        )
+        .await);
+
+    assert_eq!(collected.len(), 3, "三个可测节点各一条结果，别无其它事件");
+    for (event, payload) in &collected {
+        assert_eq!(event, EVENT_SPEED_TEST_RESULT);
+        assert!(
+            payload.get("runId").is_none(),
+            "顶层不得带 runId：{payload}"
+        );
+        assert!(payload.get("measurementContext").is_none());
+        assert_eq!(payload["identity"]["origin"], "schedule");
+        assert_eq!(payload["identity"]["scope"], "s1,s2");
+        assert_eq!(payload["identity"]["run"], "1");
+    }
+    assert_eq!(report.interrupted, None);
+    assert_eq!(report.measured.len(), 3);
+    assert_eq!(report.measured.values().filter(|ok| **ok).count(), 1);
+    assert!(report.unmeasured.is_empty());
+    assert_eq!(report.skipped, vec![("ghost".to_string(), "notInPool")]);
+    assert_eq!(report.width, 2, "波宽不超过池端口数");
+    // 结果由发布口入账；被预筛跳过的节点登记了原因。
+    assert_eq!(bench.ledger.len(), 3);
+    assert!(bench
+        .ledger
+        .candidate_entry("ghost", &ScheduleBench::url_digest())
+        .is_none());
+    assert!(bench.gate.holder().is_none(), "收尾后闸已释放");
+}
+
+/// 周期一轮持闸时发起手动请求：周期一轮以「被抢占」收尾，已测部分留在账本，没测到的节点
+/// 不记失败；手动请求随后拿到闸。
+#[tokio::test]
+async fn a_manual_request_preempts_a_scheduled_round() {
+    let bench = ScheduleBench::new(2, 2);
+    let targets = bench.targets(2);
+    let first_result = Arc::new(Notify::new());
+    let mut collected = Vec::new();
+    let round = bench.run(
+        &targets,
+        16,
+        |_, _| async { true },
+        |port| {
+            let first_result = Arc::clone(&first_result);
+            async move {
+                if port == 10_000 {
+                    first_result.notify_one();
+                    Ok(120_u32)
+                } else {
+                    std::future::pending::<Measured>().await
+                }
+            }
+        },
+        &mut collected,
+    );
+    let manual = async {
+        first_result.notified().await;
+        tokio::task::yield_now().await;
+        bench.gate.acquire(SpeedTestOrigin::Manual).await
+    };
+    let (round, manual) = tokio::join!(round, manual);
+    let report = ran(round);
+    assert_eq!(report.interrupted, Some(InterruptReason::Preempted));
+    assert_eq!(report.measured, BTreeMap::from([("n0".to_string(), true)]));
+    assert_eq!(report.unmeasured, vec!["n1".to_string()]);
+    assert!(manual.is_some(), "周期一轮收口后手动请求拿到闸");
+    assert_eq!(collected.len(), 1, "被抢占的一轮同样不发终态事件");
+    let digest = ScheduleBench::url_digest();
+    assert!(bench.ledger.candidate_entry("n0", &digest).is_some());
+    assert!(
+        bench.ledger.candidate_entry("n1", &digest).is_none(),
+        "没测到的节点不入账，更不记失败"
+    );
+}
+
+/// 手动持闸时周期到期：返回「忙」并带占用方；不热切、不测量、不发事件、不入账。
+#[tokio::test]
+async fn a_scheduled_round_finds_the_gate_busy_and_measures_nothing() {
+    let bench = ScheduleBench::new(2, 2);
+    let _manual = bench.gate.acquire(SpeedTestOrigin::Manual).await.unwrap();
+    let touched = AtomicBool::new(false);
+    let mut collected = Vec::new();
+    let round = bench
+        .run(
+            &bench.targets(2),
+            16,
+            |_, _| {
+                touched.store(true, Ordering::SeqCst);
+                async { true }
+            },
+            |_| async { Ok(1_u32) },
+            &mut collected,
+        )
+        .await;
+    assert_eq!(round, ScheduledRound::Busy(Some(SpeedTestOrigin::Manual)));
+    assert!(!touched.load(Ordering::SeqCst));
+    assert!(collected.is_empty());
+    assert_eq!(bench.ledger.len(), 0, "没有任何节点被记成失败");
+    assert_eq!(
+        bench.sequence.load(Ordering::SeqCst),
+        0,
+        "被拒的一轮不领运行号"
+    );
+}
+
+/// 冻结判据：相邻两条结果的墙钟间隔 14 秒照常入账；16 秒时该条及其后全部丢弃，本轮取消，
+/// 回执标「冻结」，没有任何节点被记成失败。间隔阈值取无穷大即关掉这条判据。
+#[tokio::test]
+async fn a_gap_between_results_over_the_threshold_discards_the_rest_as_frozen() {
+    for (freeze_gap_ms, frozen) in [(15_000_u64, true), (u64::MAX, false)] {
+        // K=1：逐个测，间隔由每次测量拨墙钟决定。
+        let bench = ScheduleBench::new(4, 1);
+        let targets = bench.targets(4);
+        let step = AtomicU64::new(0);
+        let clock = Arc::clone(&bench.clock);
+        let wall = Arc::clone(&bench.clock);
+        let mut collected: Vec<(String, Value)> = Vec::new();
+        let round = drive_scheduled_round(
+            ScheduledRoundInput {
+                targets: &targets,
+                scope: "s1".to_string(),
+                url: DEFAULT_SPEED_TEST_URL,
+                id_to_tag: &bench.id_to_tag,
+                dirty: &bench.none,
+                ts_pending: &bench.none,
+                pool_ports: &bench.ports,
+                concurrency: 16,
+                instance: main_instance(),
+                config_digest: None,
+                fingerprints: BTreeMap::new(),
+            },
+            &ScheduledRoundDeps {
+                gate: bench.gate,
+                sequence: &bench.sequence,
+                ledger: bench.ledger,
+                abort: &bench.abort,
+                wall_clock: &move || wall.load(Ordering::SeqCst),
+                freeze_gap_ms,
+            },
+            &superseded_at(0),
+            &|| None,
+            |_, _| async { true },
+            |_| {
+                // 第一个节点耗时 14 秒出值；第二个 16 秒后才回来，而且是超时（解冻后的典型表现）。
+                let (elapsed, measured) = match step.fetch_add(1, Ordering::SeqCst) {
+                    0 => (14_000, Ok(120_u32)),
+                    1 => (16_000, Err(TIMED_OUT)),
+                    _ => (1_000, Ok(90_u32)),
+                };
+                let clock = Arc::clone(&clock);
+                async move {
+                    clock.fetch_add(elapsed, Ordering::SeqCst);
+                    measured
+                }
+            },
+            &mut |event, payload| collected.push((event.to_string(), payload)),
+        )
+        .await;
+        let report = ran(round);
+        assert_eq!(report.frozen, frozen, "阈值 {freeze_gap_ms}");
+        let digest = ScheduleBench::url_digest();
+        if frozen {
+            assert_eq!(report.interrupted, Some(InterruptReason::Cancelled));
+            assert_eq!(report.measured, BTreeMap::from([("n0".to_string(), true)]));
+            assert_eq!(report.unmeasured, bench.targets(4)[1..].to_vec());
+            assert_eq!(collected.len(), 1, "16 秒那条及其后的都不发");
+            assert!(
+                bench.ledger.candidate_entry("n1", &digest).is_none(),
+                "冻结期间的超时不入账"
+            );
+        } else {
+            assert_eq!(report.interrupted, None);
+            assert_eq!(report.measured.len(), 4);
+            assert_eq!(
+                bench
+                    .ledger
+                    .candidate_entry("n1", &digest)
+                    .unwrap()
+                    .measured,
+                Err(TIMED_OUT)
+            );
+        }
+    }
+}
+
+/// 调度器在准入之前就要求取消（离开前台正好撞上起一轮）：准入时兑现，不测任何节点。
+#[tokio::test]
+async fn an_abort_requested_before_admission_is_honoured() {
+    let bench = ScheduleBench::new(2, 2);
+    bench.abort.abort();
+    let mut collected = Vec::new();
+    let report = ran(bench
+        .run(
+            &bench.targets(2),
+            16,
+            |_, _| async { true },
+            |_| async { Ok(1_u32) },
+            &mut collected,
+        )
+        .await);
+    assert_eq!(report.interrupted, Some(InterruptReason::Cancelled));
+    assert!(report.measured.is_empty() && collected.is_empty());
+    assert_eq!(report.unmeasured, bench.targets(2));
+}
+
+/// 波宽：实际并发 8、池端口 64 时，任何一波不超过 8 个节点，且只用前 8 个槽。
+#[tokio::test]
+async fn the_wave_width_is_the_actual_concurrency_not_the_pool_size() {
+    let bench = ScheduleBench::new(20, 64);
+    let slots = Mutex::new(BTreeSet::new());
+    let ports = Arc::new(Mutex::new(BTreeSet::new()));
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let peak = Arc::new(AtomicU64::new(0));
+    let mut collected = Vec::new();
+    let report = ran(bench
+        .run(
+            &bench.targets(20),
+            8,
+            |slot, _| {
+                slots.lock().unwrap().insert(slot);
+                async { true }
+            },
+            |port| {
+                let (ports, in_flight, peak) = (
+                    Arc::clone(&ports),
+                    Arc::clone(&in_flight),
+                    Arc::clone(&peak),
+                );
+                async move {
+                    ports.lock().unwrap().insert(port);
+                    peak.fetch_max(
+                        in_flight.fetch_add(1, Ordering::SeqCst) + 1,
+                        Ordering::SeqCst,
+                    );
+                    tokio::task::yield_now().await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(100_u32)
+                }
+            },
+            &mut collected,
+        )
+        .await);
+    assert_eq!(report.width, 8);
+    assert_eq!(report.measured.len(), 20);
+    assert_eq!(*slots.lock().unwrap(), (0..8).collect());
+    assert_eq!(*ports.lock().unwrap(), (10_000..10_008).collect());
+    assert!(peak.load(Ordering::SeqCst) <= 8, "同时在飞的测量不超过波宽");
+}
+
+/// 波宽取值表：实际并发、池端口数、可测节点数三者取小。
+#[test]
+fn wave_width_is_the_smallest_of_concurrency_pool_and_targets() {
+    for (concurrency, pool, testable, expected) in [
+        (8, 64, 300, 8),
+        (32, 16, 300, 16),
+        (32, 64, 5, 5),
+        (32, 0, 300, 0),
+        (32, 64, 0, 0),
+    ] {
+        assert_eq!(
+            wave_width(concurrency, pool, testable),
+            expected,
+            "{concurrency}/{pool}/{testable}"
+        );
+    }
+}
+
+/// 「测速并发」：自动取桌面 32、手机 16；手填 4 到本平台槽位上限的整数；越界、非整数都回落自动。
+/// 一份在桌面设为 48 的配置拿到手机上按自动处理。
+#[test]
+fn configured_concurrency_falls_back_to_auto_outside_the_platform_range() {
+    use polaris_helper_proto::Platform;
+    let of = |value: Value, platform| {
+        configured_concurrency(&json!({ "speedTestConcurrency": value }), platform)
+    };
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        assert_eq!(configured_concurrency(&json!({}), platform), 32);
+        assert_eq!(of(json!("auto"), platform), 32);
+        assert_eq!(of(json!(4), platform), 4);
+        assert_eq!(of(json!(64), platform), 64);
+        assert_eq!(of(json!(3), platform), 32);
+        assert_eq!(of(json!(65), platform), 32);
+        assert_eq!(of(json!(8.5), platform), 32);
+    }
+    assert_eq!(configured_concurrency(&json!({}), Platform::Android), 16);
+    assert_eq!(of(json!(32), Platform::Android), 32);
+    assert_eq!(of(json!(48), Platform::Android), 16);
+    assert_eq!(of(json!(16), Platform::Ios), 16);
+    assert_eq!(of(json!(17), Platform::Ios), 16);
+}
+
+/// 跑一轮八槽十二节点的分波，第一个被测的节点第一次连本机探针口被拒。返回
+/// （结果，各波用到的最大槽序，是否减半过）。
+async fn waves_with_one_local_refusal(
+    local_side_halving: bool,
+) -> (serde_json::Map<String, Value>, Vec<usize>, bool) {
+    let testable: Vec<(String, String)> = (0..12)
+        .map(|n| (format!("n{n}"), format!("tag-n{n}")))
+        .collect();
+    let ports: Vec<u16> = (10_000..10_008).collect();
+    let refused = Arc::new(AtomicBool::new(false));
+    // 每波的热切先于测量：记下每波见到的最大槽序。
+    let widest: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let mut trace = WaveTrace::default();
+    let (results, reason) = drive_pool_waves_inner(
+        &plan_waves(&testable, 8),
+        12,
+        &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
+        |slot, _| {
+            let mut widest = widest.lock().unwrap();
+            if slot == 0 {
+                widest.push(0);
+            } else if let Some(last) = widest.last_mut() {
+                *last = (*last).max(slot);
+            }
+            async { true }
+        },
+        |port| {
+            let refused = Arc::clone(&refused);
+            async move {
+                if port == 10_000 && !refused.swap(true, Ordering::SeqCst) {
+                    Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local))
+                } else {
+                    Ok(100_u32)
+                }
+            }
+        },
+        &mut |_, _| {},
+        &ports,
+        local_side_halving,
+        &mut trace,
+    )
+    .await;
+    assert_eq!(reason, None);
+    let widest = widest.into_inner().unwrap();
+    (results, widest, trace.halved)
+}
+
+/// 本机侧报错（连本机探针口被拒）：该节点不记失败、排回队尾重测，其后各波宽度减半，本轮内不回升。
+#[tokio::test]
+async fn a_local_side_error_halves_the_wave_width_and_spares_the_node() {
+    let (results, widest, halved) = waves_with_one_local_refusal(true).await;
+    assert!(halved);
+    assert_eq!(
+        widest,
+        vec![7, 3, 0],
+        "第一波 8 槽；减半后一波 4 槽；被拒的节点排在最后重测"
+    );
+    assert_eq!(results.len(), 12);
+    assert!(
+        results.values().all(|latency| latency == &json!(100)),
+        "没有任何节点被记成失败：{results:?}"
+    );
+}
+
+/// 回退开关关掉：本机侧错误按传输错记账，波宽不变。
+#[tokio::test]
+async fn with_local_side_halving_off_the_error_is_a_transport_failure() {
+    let (results, widest, halved) = waves_with_one_local_refusal(false).await;
+    assert!(!halved);
+    assert_eq!(widest, vec![7, 3]);
+    assert_eq!(results["n0"], json!(-1));
+    assert_eq!(results.len(), 12);
+    assert_eq!(
+        speed_test_result_payload(
+            "n0",
+            &Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local)),
+            None
+        )["failure"]["kind"],
+        "transport",
+        "对外的取值集合不变"
+    );
+    const { assert!(LOCAL_SIDE_HALVING, "出包取值") };
+}
+
+/// 减半不低于 4；已经在下限上的波宽不再变，也不算减半过。同一个节点只重排一次。
+#[tokio::test]
+async fn halving_stops_at_the_floor_and_a_node_is_requeued_once() {
+    // 起始 6：第一波 6 个，减到 4；被拒的两个节点排在最后一波，其中第一个已重排过、再撞即缺席。
+    // 起始 4：已在下限上，各波都是 4 个。
+    for (width, expected, halved) in [(6, vec![5, 3, 1], true), (4, vec![3, 3, 3, 0], false)] {
+        let testable: Vec<(String, String)> = (0..10)
+            .map(|n| (format!("n{n}"), format!("tag-n{n}")))
+            .collect();
+        let ports: Vec<u16> = (10_000..10_008).collect();
+        let widest: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let mut trace = WaveTrace::default();
+        let (results, _) = drive_pool_waves_inner(
+            &plan_waves(&testable, width),
+            10,
+            &superseded_at(0),
+            &SpeedTestCancel::default(),
+            &|| None,
+            |slot, _| {
+                let mut widest = widest.lock().unwrap();
+                if slot == 0 {
+                    widest.push(0);
+                } else if let Some(last) = widest.last_mut() {
+                    *last = (*last).max(slot);
+                }
+                async { true }
+            },
+            // 槽 0 的口一直连不上：每波排在槽 0 的那个节点都受影响。
+            |port| async move {
+                if port == 10_000 {
+                    Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local))
+                } else {
+                    Ok(100_u32)
+                }
+            },
+            &mut |_, _| {},
+            &ports,
+            true,
+            &mut trace,
+        )
+        .await;
+        let widest = widest.into_inner().unwrap();
+        assert_eq!(widest, expected, "起始波宽 {width}");
+        assert_eq!(trace.halved, halved, "起始波宽 {width}");
+        assert!(widest.iter().skip(1).all(|slot| *slot < MIN_WAVE_WIDTH));
+        assert!(
+            results.values().all(|latency| latency == &json!(100)),
+            "连不上本机口的节点缺席，不记 -1"
+        );
+        assert!(results.len() < 10, "反复撞上的节点最终缺席，队列会排空");
+    }
+}
+
+/// 入账旁路接在盖章之后、出口之前：出口是空闭包的故障切换来源同样入账；
+/// 失败的阶段与成因能从载荷原样读回。
+#[test]
+fn every_stamped_result_enters_the_ledger_regardless_of_the_outlet() {
+    let ledger: &'static MeasurementLedger = Box::leak(Box::new(MeasurementLedger::new()));
+    let mut events = pool_events(SpeedTestOrigin::Failover).with_ledger(ledger);
+    let failure = MeasureFailure::new(FailPhase::Warmup, FailKind::HttpStatus(403));
+    {
+        let mut sink = events.sink(|_, _| {});
+        sink(
+            EVENT_SPEED_TEST_RESULT,
+            speed_test_result_payload("a", &Ok(120), Some(5)),
+        );
+        sink(
+            EVENT_SPEED_TEST_RESULT,
+            speed_test_result_payload("b", &Err(failure), Some(5)),
+        );
+    }
+    let digest = ScheduleBench::url_digest();
+    let a = ledger.candidate_entry("a", &digest).unwrap();
+    assert_eq!(a.measured, Ok(120));
+    assert_eq!(a.identity.origin, SpeedTestOrigin::Failover);
+    assert_eq!(a.identity.node_fingerprint.as_deref(), Some("fp-a"));
+    assert_eq!(a.identity.network_epoch, Some(5));
+    assert_eq!(
+        ledger.candidate_entry("b", &digest).unwrap().measured,
+        Err(failure)
+    );
+    for failure in [
+        MeasureFailure::new(FailPhase::Select, FailKind::Rejected),
+        MeasureFailure::new(FailPhase::Connect, FailKind::Transport),
+        MeasureFailure::new(FailPhase::Measure, FailKind::Timeout),
+    ] {
+        assert_eq!(MeasureFailure::from_json(&failure.to_json()), failure);
+    }
 }

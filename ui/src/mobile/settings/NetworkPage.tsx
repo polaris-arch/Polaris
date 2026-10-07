@@ -28,6 +28,9 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
+import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
+import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
+import type { SpeedTestMeteredPolicy } from '@/contracts/types';
 import { MobileSelect, MobileSwitch, MobileTextInput, SettingsGroup, SettingsRow } from './SettingsChrome';
 import type { MobileSettingsPageProps } from './settings-pages';
 
@@ -60,6 +63,23 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
     setSpeedUrl((cur) => (cur !== seeded.current ? cur : next));
     seeded.current = next;
   }, [config.speedTestUrl]);
+
+  /* 周期测速的三个全局项。取值范围与缺省值由后端给出（并发上限随平台不同），不在前端另写一份：
+     拿到之前计费策略不选中任何一档、并发不显示上限。 */
+  const speedLimits = useSpeedTestSchedule()?.limits;
+  const savedConcurrency =
+    typeof config.speedTestConcurrency === 'number' ? config.speedTestConcurrency : undefined;
+  const [concurrency, setConcurrency] = useState(String(savedConcurrency ?? ''));
+  const [concurrencyInvalid, setConcurrencyInvalid] = useState(false);
+  useEffect(() => {
+    setConcurrency(String(savedConcurrency ?? ''));
+  }, [savedConcurrency]);
+  function commitConcurrency(): void {
+    const next = parseConcurrency(concurrency, speedLimits);
+    setConcurrencyInvalid(next === null);
+    if (next === null || next === savedConcurrency) return;
+    commit('speed-test-concurrency', update({ speedTestConcurrency: next }));
+  }
 
   /** 行 id 由调用点**逐字给**，不由 `kind` 拼出来：拼出来的 id 判据面扫不到（模板串不是字面量），
    *  而「这一行的写失败挂在哪一行上」正是要能被逐条对拍的东西。 */
@@ -260,6 +280,69 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
                 if (speedUrlInvalid) setSpeedUrlInvalid(false);
               }}
               onCommit={commitSpeedTestUrl}
+            />
+          }
+        />
+        {toggleRow(
+          'periodic-speed-test',
+          'settings.network.periodicSpeedTest',
+          'settings.network.periodicSpeedTestDesc',
+          globalPeriodicSpeedTestEnabled(config.periodicSpeedTestEnabled, speedLimits),
+          (v) => update({ periodicSpeedTestEnabled: v }),
+        )}
+        <SettingsRow
+          id="speed-test-metered-policy"
+          label={t('settings.network.meteredPolicy')}
+          desc={t('settings.network.meteredPolicyDesc')}
+          control={
+            <MobileSelect
+              value={config.speedTestMeteredPolicy ?? speedLimits?.meteredPolicyDefault ?? ''}
+              ariaLabel={t('settings.network.meteredPolicy')}
+              onChange={(v) =>
+                commit(
+                  'speed-test-metered-policy',
+                  update({ speedTestMeteredPolicy: v as SpeedTestMeteredPolicy }),
+                )
+              }
+            >
+              <option value="reduced">{t('settings.network.meteredReduced')}</option>
+              <option value="pause">{t('settings.network.meteredPause')}</option>
+              <option value="normal">{t('settings.network.meteredNormal')}</option>
+            </MobileSelect>
+          }
+        />
+        <SettingsRow
+          stacked
+          id="speed-test-concurrency"
+          label={t('settings.network.speedTestConcurrency')}
+          desc={t('settings.network.speedTestConcurrencyDesc')}
+          hint={
+            speedLimits
+              ? t('settings.network.speedTestConcurrencyMax', { max: speedLimits.concurrencyMax })
+              : undefined
+          }
+          problem={
+            !concurrencyInvalid
+              ? undefined
+              : speedLimits
+                ? t('settings.network.speedTestConcurrencyInvalid', {
+                    min: speedLimits.concurrencyMin,
+                    max: speedLimits.concurrencyMax,
+                  })
+                : t('sub.speedTestIntervalInvalid')
+          }
+          control={
+            <MobileTextInput
+              inputMode="numeric"
+              value={concurrency}
+              invalid={concurrencyInvalid}
+              placeholder={t('settings.network.speedTestConcurrencyAuto')}
+              ariaLabel={t('settings.network.speedTestConcurrency')}
+              onChange={(v) => {
+                setConcurrency(v);
+                if (concurrencyInvalid) setConcurrencyInvalid(false);
+              }}
+              onCommit={commitConcurrency}
             />
           }
         />

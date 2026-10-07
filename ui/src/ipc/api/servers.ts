@@ -4,7 +4,7 @@ import type { ServerConfig } from '../../contracts/types';
 import type { WarpWireGuardDraft } from '../../domain/warp';
 import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
-import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload } from '../../contracts/speed-test';
+import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload, SpeedTestScheduleStatus } from '../../contracts/speed-test';
 import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 
 // ============================================================================
@@ -197,5 +197,15 @@ export const serverApi = {
    */
   onSpeedTestDone(listener: (data: SpeedTestDonePayload) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_DONE, listener);
+  },
+
+  /** 周期测速的计划状态（只读）：四态与原因、逐订阅的上次完整轮次、设置项的取值范围。 */
+  async speedTestScheduleStatus(): Promise<SpeedTestScheduleStatus> {
+    return invoke(IPC_CHANNELS.SPEED_TEST_SCHEDULE_STATUS);
+  },
+
+  /** 计划状态变化（状态或其原因变了、一轮刚收尾）。 */
+  onSpeedTestSchedule(listener: (data: SpeedTestScheduleStatus) => void): () => void {
+    return listen(IPC_CHANNELS.EVENT_SPEED_TEST_SCHEDULE, listener);
   },
 };

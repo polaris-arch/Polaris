@@ -375,6 +375,8 @@ const EXPECTED_SWITCHES: Record<MobileSettingsPageId, readonly string[]> = {
     'interrupt-on-switch',
     'restart-on-node-change',
     'main-session-via-proxy',
+    // 周期测速的全局总开关（2026-10-08）：五个平台同一项，执行侧是后端的周期测速调度器。
+    'periodic-speed-test',
   ],
   // race 档在夹具里是「单上游」⇒ 竞速池那三颗不渲染（⑫ 另有一份 race 开着的夹具逐值对拍）。
   dns: ['fake-ip', 'takeover-system-dns', 'optimistic-cache', 'fakeip-filter', 'block-browser-doh'],
@@ -1713,6 +1715,9 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'direct-interface',
       'proxy-interface',
       'speed-test-url',
+      'periodic-speed-test',
+      'speed-test-metered-policy',
+      'speed-test-concurrency',
       'block-quic',
       'webrtc-leak',
       'tls-fragment',
