@@ -323,9 +323,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ndk="${ANDROID_NDK_LATEST_HOME:-}"
-          [ -n "$ndk" ] || {
-            echo "::error::runner 未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）—— 镜像变了；"
+          # 🔴 不取镜像的「最新 NDK」：2026-10 镜像把它换成 NDK 30 稳定版，`btls-sys` 的 bindgen 同样炸在
+          #    `Unversioned target triples are not supported`。与 android.yml 共用同一份已验版本，缺则安装。
+          ndk_version="$(cat scripts/android-rust-ndk.version)"
+          ndk="${ANDROID_HOME:-}/ndk/$ndk_version"
+          if [ ! -f "$ndk/source.properties" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
+          fi
+          [ -f "$ndk/source.properties" ] || {
+            echo "::error::Android NDK 未安装：$ndk"
             echo "::error::Cross-check 的 aarch64-linux-android 腿要它编 zstd-sys / btls-sys，先确认再改本步"
             exit 1; }
           bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
