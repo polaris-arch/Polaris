@@ -213,12 +213,23 @@ jobs:
       # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
       #
       # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
+      # libbox 的缓存键含 JDK 17 的整目录哈希（工具身份的一部分）。取镜像预装的那份时，镜像每换一版
+      # 小版本就变、键就变；新旧镜像并存期间两次 run 各落一版，缓存来回失效，每次多编 13 分钟
+      # （2026-10-07 实证：镜像 20260927 与 20261004 上算出两把不同的键，其余输入逐项相同）。
+      # 所以 JDK 17 与 Go、NDK 一样钉确切版本；本步会把 JAVA_HOME_17_X64 指向它，下一步原样消费。
+      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法），缓存随之重建一次。
+      - name: Pin libbox JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17.0.20+101'
+
       - name: Resolve JDK / Android SDK / NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          # ── JDK：两个用途、两个版本（以 JAVA_HOME_<主版本>_X64 暴露）：21 取镜像预装，17 由上一步钉版 ──
           #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
           #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
           #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
@@ -656,12 +667,23 @@ jobs:
       # ══ 工具链解析：Gradle JDK 从 runner 取；Rust/libbox NDK 从入库版本与 manifest 取 ══
       #
       # 不回落到 runner 默认 NDK：Rust 与 libbox 各自有已验工具链，缺席即失败。
+      # libbox 的缓存键含 JDK 17 的整目录哈希（工具身份的一部分）。取镜像预装的那份时，镜像每换一版
+      # 小版本就变、键就变；新旧镜像并存期间两次 run 各落一版，缓存来回失效，每次多编 13 分钟
+      # （2026-10-07 实证：镜像 20260927 与 20261004 上算出两把不同的键，其余输入逐项相同）。
+      # 所以 JDK 17 与 Go、NDK 一样钉确切版本；本步会把 JAVA_HOME_17_X64 指向它，下一步原样消费。
+      # 升级 = 改这里两处的版本号（Adoptium 的 semver 写法），缓存随之重建一次。
+      - name: Pin libbox JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17.0.20+101'
+
       - name: Resolve JDK / Android SDK / NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          # ── JDK：两个用途、两个版本，都取镜像预装的那份（以 JAVA_HOME_<主版本>_X64 暴露）──
+          # ── JDK：两个用途、两个版本（以 JAVA_HOME_<主版本>_X64 暴露）：21 取镜像预装，17 由上一步钉版 ──
           #   · Gradle / AGP 8.11 → JDK 21（AGP 支持 17–21，本机实测面就是 21）
           #   · scripts/build-libbox.sh → **必须 openjdk 17**（其坑①：上游 build_libbox 的 main.go
           #     逐串匹配 "openjdk 17"，21 会 FATAL；那个版本约束管的是 gomobile 生成 Java 源后的
