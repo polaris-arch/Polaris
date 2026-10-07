@@ -34,7 +34,7 @@ permissions:
 #     `startsWith(github.ref, 'refs/tags/v')`（后两者经 needs 链继承），在上述 ref 上恒不可达；
 #   · android.yml 里唯一写 release 的 `release-apk` 只在 `publish_release` 为真时跑，全仓只有
 #     package.yml 的 tag 发布段传 true；
-#   · 轻量构型的安装包不上传（`upload_artifacts: false`）；会留下的只有内核源码 bundle 与
+#   · 轻量构型的安装包不上传（`upload_artifacts: false`），轻量构型的 APK 同样不上传；会留下的只有内核源码 bundle 与
 #     Android mapping 这两类 artifact（7 天保留期，按 run 隔离，被取消的 run 留下半套无消费者）。
 # 发布（tag）走的是 package.yml 自己的并发组，那里 tag ref 从不取消在途，与本段无关。
 concurrency:
@@ -286,6 +286,13 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/android.yml
+    with:
+      # 轻量构型（Rust 侧不做 fat LTO、并行 codegen），与上面打包腿同一开关、同一取值。本腿验的是
+      # R8 证据 / 资源 / 原生库 / 16 KiB，没有一条取决于 Rust 的优化强度（逐条核对写在 android.yml
+      # 的 `release_check` 头注）。不传 `publish_release`：轻量 + 发布在被调方当场红。
+      # 风险门因此**不再验** Android 上的 fat LTO 链接本身，那只在 tag 的签名发布腿与手动 dispatch
+      # android.yml（发行构型）上暴露。
+      light_build: true
 
   gate:
     name: release risk gate

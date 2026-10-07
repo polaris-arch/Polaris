@@ -237,6 +237,8 @@ esac
     const androidJob = executable(jobSection(risk, 'android', 'release-risk.yml'));
     expect(androidJob).toContain('uses: ./.github/workflows/android.yml');
     expect(androidJob).not.toContain('publish_release');
+    // Android 腿同样是轻量构型（2026-10-08）：被调方对「轻量 + 发布」当场红，故这两条必须同时成立。
+    expect(androidJob).toMatch(/\n {4}with:\n {6}light_build: true\n/);
     // 安装包不上传、且是轻量构型（不是可分发物）。
     const pkgJob = executable(jobSection(risk, 'package', 'release-risk.yml'));
     expect(pkgJob).toContain('upload_artifacts: false');

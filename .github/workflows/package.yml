@@ -468,7 +468,9 @@ jobs:
       #      ② 轻量构型落在 tag ref 上（tag = 发布语义）；
       #      ③ 轻量构型同时要上传 artifact（轻量产物不得离开 runner）。
       #    另由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住：全部 workflow 里
-      #    `CARGO_PROFILE_` 只允许出现在本步、只允许这两个键，并把本步脚本按各入口真跑一遍。
+      #    `CARGO_PROFILE_` 只允许出现在本步与 android.yml 的同形步（`Select APK build weight`，
+      #    2026-10-08 起）、只允许这两个键、两处键值逐字相等，并把两处脚本按各入口真跑一遍。
+      #    两处脚本除第三条闸与提示文案外逐行相同 —— 改这里的判定骨架必须同步改那边，门会红着提醒。
       #
       # 轻量构型下各产物校验是否仍成立（逐条看过，2026-10-07）：
       #   · D7 路径脱敏 / PKG-3 静态 CRT —— 来自 rustflags，与 LTO 无关，成立；

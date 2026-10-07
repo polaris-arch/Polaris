@@ -39,9 +39,25 @@ name: Android
 # `publish_release=true`：package.yml 的 tag 发布 DAG 在桌面草稿资产验过后调用 `release-apk`，构建
 # 正式签名 Release APK，校验签名证书与 base applicationId，并只把这一个 APK 上传到同 tag 草稿。
 # 四项签名 secret 已在仓库侧配置；值始终只经 `secrets.*` 注入，不进入 workflow 文本或构建日志。
+#
+# ── 构建权重（2026-10-08）：profile 名恒为 release，但 Rust 侧有两种权重 ──
+# `light_build=true`（全仓只有 release-risk 传）：验证腿用轻量构型编 Rust（不做 fat LTO、并行
+# codegen），与 package.yml 的桌面打包腿同一机制、同一取值。签名发布腿与任何 tag 路径恒为发行构型。
+# 手动 dispatch 没有这个输入 ⇒ 发行构型：它是**发 tag 之前在 Android 上预验 fat LTO 链接的唯一入口**。
+# 决策记录与逐条核对见 `release_check` job 头注的「构建权重」一节。
 on:
   workflow_call:
     inputs:
+      # 风险门专用的轻量构建开关（2026-10-08）。true ⇒ 验证腿的 Rust 侧不做 fat LTO、并行 codegen，
+      # 产物**不是可分发物**（APK 本来就不上传，也不进 release）。只有 release-risk.yml 传 true；
+      # package.yml 的 tag 发布段只传 publish_release，手动 dispatch 没有任何输入 ⇒ 恒为 false。
+      # 与发布输入（`publish_release` 为真）同传会在 `Select APK build weight` 步当场红。
+      # （这里刻意不写出「键: true」的字面形态：契约门按原文数全仓传发布的调用点，注释也算。）
+      light_build:
+        description: 风险门轻量构型（lto=off、codegen-units=16）；不得与 publish_release 同传
+        type: boolean
+        required: false
+        default: false
       publish_release:
         description: 把**签名的** release APK 发成 GitHub release 资产（需要四个签名 secret）
         type: boolean
@@ -80,6 +96,12 @@ permissions:
 # Shared provider imports are source reads; do not write Python bytecode into the App checkout.
 env:
   PYTHONDONTWRITEBYTECODE: '1'
+  # 构建权重的两个开关放在 workflow 级而不是某个 job：两个 job 的前置步骤逐字相同（⑦ 对拍），
+  # 其中 `Select APK build weight` 步与 rust-cache 的键都读它们；放 job 级就得写两份、会漂。
+  # 轻量构建只认调用方显式传入的 true；手动 dispatch 与 tag 发布调用都没有它 ⇒ '0'。
+  # 两者的组合由 `Select APK build weight` 步 fail-closed 校验（轻量 + 发布 ⇒ 当场红）。
+  POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
+  POLARIS_PUBLISH_RELEASE: ${{ inputs.publish_release && '1' || '0' }}
 
 # 判据与 ci.yml / ui.yml 一致：调用方名称进并发组，Android 与 Release Risk 内的复用互不取消。
 concurrency:
@@ -125,6 +147,52 @@ jobs:
   # GitHub Actions 没有 job 内的 step 复用，只能复制。两份会漂 ⇒ 由
   # `src-tauri/tests/android_release_signing_wiring.rs` 的 ⑦ 逐字对拍
   # （射程：`- uses: actions/checkout@v7` 起，到 `libbox.aar 必须在位` 步止）。
+  #
+  # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
+  #
+  # 背景（Release Risk 上的实测）：本腿墙钟 18–30 分钟，其中 `Build unsigned release-profile
+  # validation APK` 一步约 9–11 分钟。那一步每次都 `cargo clean -p polaris` 后重编应用 crate，而根
+  # `Cargo.toml` 的 `lto = "fat"` + `codegen-units = 1` 把全部 crate 的 bitcode 在链接期合成一个
+  # 单线程优化单元 —— 这一段不可缓存，rust-cache 命中也整段重来。
+  # 而本腿要回答的三件事（上面 ①②③：R8 吃进了什么 / mapping 保全 / APK 实际内容）没有一件
+  # 取决于 Rust 侧的优化强度。
+  #
+  # 做法与 package.yml 的 `Select installer build weight` 步**同一机制、同一取值**：仅当调用方传
+  # `light_build: true` 时，向 GITHUB_ENV 写 `CARGO_PROFILE_RELEASE_LTO=off` 与
+  # `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`；`strip`、`debug-assertions`、`panic` 等其余键不碰。
+  #   [选 环境变量覆盖：profile 名仍是 release ⇒ 产物仍在 `target/aarch64-linux-android/release/`，
+  #    下面按路径取 SO 的断言、`Finished … release … profile` 那根针、gradle 的 `arm64Release`
+  #    变体与 R8 一行不用改；选型的另一半理由（不选自定义 profile）见 package.yml 那一步的头注]
+  #   [不选 只跳过 Rust 重编 / 复用缓存里的旧 SO：本腿的前提是「SO 来自本次 checkout」
+  #    （`-nt "$marker"` 与 `source=$(git rev-parse HEAD)` 守着），复用旧 SO 等于把这条前提拆掉]
+  #
+  # 🔴 这是一条**绕开源码门的新路径**（`release_escape_hatches.rs` 只读 `Cargo.toml`，环境变量
+  #    覆盖它看不见），所以那一步自己带闸，fail-closed 三条，任一命中即红：
+  #      ① 进入该步时环境里已有任何 `CARGO_PROFILE_*`（不管是谁设的）—— 发布腿也查；
+  #      ② 轻量构型落在 tag ref 上（tag = 发布语义）；
+  #      ③ 轻量构型与 `publish_release` 同传（轻量产物不得被签名、不得进 release）。
+  #    `release-apk` 只在 `publish_release` 为真时跑 ⇒ 在那条腿上「轻量」必然撞 ③，写入不可达。
+  #    另由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住：`CARGO_PROFILE_` 在全部
+  #    workflow 里只许出现在两处构建权重步、只许这两个键；两处写入的键值逐字相等；两处脚本除第三条
+  #    闸与提示文案外逐行相同；并把脚本按各入口真跑一遍。
+  #
+  # 轻量构型下本腿各判据是否仍成立（逐条看过，2026-10-08）：
+  #   · 16 KiB 页对齐 —— 来自 `src-tauri/build.rs` 的 `-Wl,-z,max-page-size=16384` 链接参数
+  #     （libbox.so / libc++_shared.so 不经 cargo），与 LTO 无关，成立；
+  #   · 符号剥离 —— `strip = "symbols"` 未被覆盖，`.cargo/config.toml` 的 `-C strip=debuginfo` 与
+  #     gradle 的 release native strip 任务都不看 LTO；`verify-apk.mjs` 按 ELF 节区判，成立；
+  #   · `.so` 存在性 / jniLibs 指向本次 SO / 许可文本 / 随包 data —— 判「文件在不在、是不是这一份」，成立；
+  #   · R8（mapping / usage / seeds / configuration、`assert-r8-evidence.mjs`、wry keep 对拍）——
+  #     输入是 Java/Kotlin 字节码与 keep 规则，Rust 构型不在其输入里，成立；
+  #   · `release 构建行为裁判` —— gradle 配置期事实（`--dry-run` 任务图与 `printPolarisReleaseFacts`），
+  #     不调 cargo，成立；
+  #   · libbox 收据（`verify-receipt.py --apk`）—— 判 libbox 来源与随包一致性，成立；
+  #   · 体积 —— Android 侧**没有体积上限门**（`verify-apk.mjs` 刻意按节区与死字节比值判，理由在其
+  #     判据 ⑥ 的注释）。末步打印的 APK 字节数在轻量构型下**偏大，不是发行体积**，该步已标注构型。
+  # 风险门从此**不验**的一件事：Android target 上 fat LTO 链接本身能否成功、以及 fat LTO 产物的
+  # 运行期形态。本腿的三条既定目的里没有它，但它此前是本腿顺带覆盖的；现在只在两处暴露：
+  # tag 上的 `release-apk`（同一组产物判据在签名包上原样再跑一遍），与手动 dispatch 本 workflow
+  # （无输入 ⇒ 发行构型）。故发 tag 前若动过 Rust 依赖 / 链接参数，先手动 dispatch 一次本 workflow。
   release_check:
     name: 未分发 release-profile 产物验证
     # 发布调用由 signed job 覆盖同一组产物判据，不并行构建 unsigned APK。
@@ -183,13 +251,55 @@ jobs:
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
 
-      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
+      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
+      # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
+      # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
+      # 本步随前置步骤在两个 job 里逐字复制（⑦ 对拍），这里只留指针。
+      # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
+      # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
+      - name: Select APK build weight (release profile vs risk-gate light)
+        shell: bash
+        run: |
+          set -euo pipefail
+          leaked="$(env | grep '^CARGO_PROFILE_' || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::环境里已有 cargo profile 覆盖，拒绝构建（它们会静默改写发行构型）："
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+          case "$POLARIS_LIGHT_BUILD" in
+            0)
+              echo "构建权重：发行构型（Cargo.toml 的 [profile.release] 原样，无任何环境变量覆盖）"
+              exit 0 ;;
+            1) ;;
+            *) echo "::error::POLARIS_LIGHT_BUILD 取值非法：'$POLARIS_LIGHT_BUILD'"; exit 1 ;;
+          esac
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;
+          esac
+          [ "$POLARIS_PUBLISH_RELEASE" = 0 ] || {
+            echo "::error::轻量构型不得用于签名发布（POLARIS_PUBLISH_RELEASE=$POLARIS_PUBLISH_RELEASE）：它不是可分发物"; exit 1; }
+          {
+            echo 'CARGO_PROFILE_RELEASE_LTO=off'
+            echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'
+          } >> "$GITHUB_ENV"
+          echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）编 Rust，只用于验证 release-profile 产物链；APK 不是可分发物，不签名、不上传、不进 release。"
+          printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. This APK verifies the release-profile artifact chain only; it is not distributable and is never signed, uploaded or released.' >> "$GITHUB_STEP_SUMMARY"
+
+      # key 用固定串而不是 matrix：本 workflow 每个 job 只有一个 target，
       # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      #
+      # 轻量构型再加 `-light` 后缀（2026-10-08，与 package.yml 同一写法）：两种构型的依赖产物不通用
+      # （fat LTO 要依赖带 bitcode，轻量不要），同一个 job 上手动 dispatch（发行）与风险门（轻量）
+      # 共用一个键就是互相覆盖。发行构型的键仍是 `android-aarch64`，与改动前逐字相同。
+      # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
+      # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          key: android-aarch64
+          key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
 
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
@@ -500,7 +610,8 @@ jobs:
             echo "::error::$apk 不在 —— 逃生门那条「文件名带 -unsigned 后缀」的契约变了，先确认再改判据"
             ls -R src-tauri/gen/android/app/build/outputs/apk || true
             exit 1; }
-          echo "release(unsigned, runner-only) = $(stat -c%s "$apk") 字节"
+          # 轻量构型下 Rust SO 偏大：这个数只在发行构型（手动 dispatch）上才是发行体积的近似。
+          echo "release(unsigned, runner-only, light_build=$POLARIS_LIGHT_BUILD) = $(stat -c%s "$apk") 字节"
 
   # ══════════════════════════════════════════════════════════════════════════════
   # release 资产腿 —— 把**签名的** release APK 发成 GitHub release 资产
@@ -637,13 +748,55 @@ jobs:
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
           rustc -Vv
 
-      # key 用固定串而不是 matrix：本 workflow 只有这一个 job、一个 target，
+      # ── 构建权重：发行构型 vs 风险门轻量构型（2026-10-08）──
+      # 与 package.yml 的 `Select installer build weight` 步同一机制、同一取值、同一段判定骨架
+      # （两处由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 对拍，不许各自漂移）。
+      # 决策记录、三条 fail-closed、轻量构型下各判据是否仍成立，写在 `release_check` job 的头注；
+      # 本步随前置步骤在两个 job 里逐字复制（⑦ 对拍），这里只留指针。
+      # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
+      # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
+      - name: Select APK build weight (release profile vs risk-gate light)
+        shell: bash
+        run: |
+          set -euo pipefail
+          leaked="$(env | grep '^CARGO_PROFILE_' || true)"
+          if [ -n "$leaked" ]; then
+            echo "::error::环境里已有 cargo profile 覆盖，拒绝构建（它们会静默改写发行构型）："
+            printf '%s\n' "$leaked"
+            exit 1
+          fi
+          case "$POLARIS_LIGHT_BUILD" in
+            0)
+              echo "构建权重：发行构型（Cargo.toml 的 [profile.release] 原样，无任何环境变量覆盖）"
+              exit 0 ;;
+            1) ;;
+            *) echo "::error::POLARIS_LIGHT_BUILD 取值非法：'$POLARIS_LIGHT_BUILD'"; exit 1 ;;
+          esac
+          case "$GITHUB_REF" in
+            refs/tags/*) echo "::error::轻量构型不得用于 tag（$GITHUB_REF）：tag 上的产物是发布物"; exit 1 ;;
+          esac
+          [ "$POLARIS_PUBLISH_RELEASE" = 0 ] || {
+            echo "::error::轻量构型不得用于签名发布（POLARIS_PUBLISH_RELEASE=$POLARIS_PUBLISH_RELEASE）：它不是可分发物"; exit 1; }
+          {
+            echo 'CARGO_PROFILE_RELEASE_LTO=off'
+            echo 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16'
+          } >> "$GITHUB_ENV"
+          echo "::notice title=Risk-gate light build::本腿用轻量构型（lto=off, codegen-units=16）编 Rust，只用于验证 release-profile 产物链；APK 不是可分发物，不签名、不上传、不进 release。"
+          printf '%s\n' '**Risk-gate light build**: lto=off, codegen-units=16. This APK verifies the release-profile artifact chain only; it is not distributable and is never signed, uploaded or released.' >> "$GITHUB_STEP_SUMMARY"
+
+      # key 用固定串而不是 matrix：本 workflow 每个 job 只有一个 target，
       # 与 package.yml 那边「两个 mac job 同 job_id 会撞键」的成因不同。
+      #
+      # 轻量构型再加 `-light` 后缀（2026-10-08，与 package.yml 同一写法）：两种构型的依赖产物不通用
+      # （fat LTO 要依赖带 bitcode，轻量不要），同一个 job 上手动 dispatch（发行）与风险门（轻量）
+      # 共用一个键就是互相覆盖。发行构型的键仍是 `android-aarch64`，与改动前逐字相同。
+      # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
+      # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          key: android-aarch64
+          key: android-aarch64${{ env.POLARIS_LIGHT_BUILD == '1' && '-light' || '' }}
 
       # `crates/singbox-grpc` 的 build.rs 在**所有** target 上都要 protoc（它是 app crate 的依赖，
       # 不按平台 cfg 掉）。与 package.yml / ci.yml 用同一个钉扎脚本，版本真值只有那一份。
