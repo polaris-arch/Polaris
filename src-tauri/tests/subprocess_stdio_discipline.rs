@@ -155,6 +155,9 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     // CheckCustody 的两条流由 OutputCapture::read 立即起独立 read_to_end 任务。
     // 精确接线与真实读体由 check_custody_starts_both_eof_readers_before_return 钉住。
     "output.read(",
+    // StdCommandRunner 的两条流各交给一个 CommandReader，起线程跑原来那个读到 EOF 的 `drain`。
+    // 精确接线与真实读体由 std_command_runner_starts_both_eof_readers_before_it_waits 钉住。
+    "CommandReader::start(",
 ];
 
 /// 「带着两条未排空管道的 child」这件事在**类型**上的全部落点。
@@ -307,10 +310,12 @@ const PIPED_SITES: &[PipedSite] = &[
     // ── crates/system-integration ──
     PipedSite {
         file: "crates/system-integration/src/exec.rs",
-        anchor: "impl CommandRunner for StdCommandRunner {",
+        // 起进程与取管道搬进了固有方法 `run_observed`；`CommandRunner::run` 只剩把它的结果折回
+        // 旧返回形态的一行，自己不再开管道。
+        anchor: "impl StdCommandRunner {",
         kind: SiteKind::Sink,
         // 本仓最早把「先轮询后读会死锁」写进文档的地方，也是 300 KB 灌满行为门的被测对象。
-        drain_forms: &["drain("],
+        drain_forms: &["CommandReader::start("],
     },
     // ── src-tauri（GUI 宿主进程）──
     //
@@ -398,9 +403,10 @@ const PRODUCER_CONSUMERS: &[Consumer] = &[
     Consumer {
         file: "src-tauri/src/runtime/speedtest.rs",
         // 锚点在**批级**入口：T1-R1 分批之后 `TempCoreSession::run` 变成轮级薄壳（切批 + 心跳 +
-        // 唯一终态），起核那一段连同 spawn 请求的构造留在 `run_batch` —— 分批**没有**新开第二条
-        // spawn 路径，它仍然是全 app 唯一那份 `SpawnRequest` 装配。
-        anchor: "async fn run_batch<Meas, MeasFut>(",
+        // 唯一终态），`run_batch` 再缩成准入与登记，起核那一段连同 spawn 请求的构造落在
+        // `run_admitted_batch` —— 两次拆分都**没有**新开第二条 spawn 路径，它仍然是全 app 唯一那份
+        // `SpawnRequest` 装配。
+        anchor: "async fn run_admitted_batch<Meas, MeasFut>(",
         drain_form: "pipe_to_log(",
         // 测速临时核：本轮根因所在的那条腿。target 必须是它自己的，`fatal`/`handoff` 都没有。
         wiring: &[
@@ -1156,6 +1162,49 @@ fn check_custody_starts_both_eof_readers_before_return() {
     assert!(
         read.contains("pipe.read_to_end("),
         "读任务必须将真实 pipe 读到 EOF"
+    );
+}
+
+/// `CommandReader::start(` 进了 [`KNOWN_DRAIN_FORMS`]，而它只是一个名字：这里钉住它背后确实是
+/// 「两条流各起一个线程读到 EOF，且早于第一次等待」。少了这条，把 `start` 的线程体换成别的东西、
+/// 或只接一条流，[`every_piped_site_is_registered_and_drains_before_it_waits`] 都照绿。
+#[test]
+fn std_command_runner_starts_both_eof_readers_before_it_waits() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, "crates/system-integration/src/exec.rs");
+    // 这个形态只给它自己的家记信用；别处出现同名 helper 不能借它的名字过门。
+    assert!(surface
+        .iter()
+        .filter(|scanned| scanned.rel != owner.rel)
+        .all(|scanned| !scanned.masked.contains("CommandReader::start(")));
+    let run = block_of(owner, "impl StdCommandRunner {");
+    let compact: String = run.chars().filter(|c| !c.is_whitespace()).collect();
+    let first_wait = first_of(&compact, WAIT_FORMS).expect("轮询等待必须还在这个块里");
+    for wiring in [
+        "letstdout=CommandReader::start(child.stdout.take());",
+        "letstderr=CommandReader::start(child.stderr.take());",
+    ] {
+        assert_eq!(
+            compact.matches(wiring).count(),
+            1,
+            "runner 接线漂移：{wiring}"
+        );
+        assert!(
+            compact.find(wiring).unwrap() < first_wait,
+            "排空必须早于第一次等待：{wiring}"
+        );
+    }
+    let reader = block_of(owner, "impl CommandReader {");
+    let reader_compact: String = reader.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        reader_compact.contains("std::thread::Builder::new().spawn(move||drain(pipe))"),
+        "reader 必须立即起线程跑 `drain`"
+    );
+    let drain = block_of(owner, "fn drain(");
+    assert!(
+        drain.contains("pipe.read_to_end("),
+        "读线程必须把真实 pipe 读到 EOF"
     );
 }
 

@@ -135,7 +135,8 @@ const GUARDED: &[Guarded] = &[
     // ---- 另外三个 crate：与本 crate 无共同依赖，各自持等价实现 ----
     Guarded {
         file: "crates/system-integration/src/exec.rs",
-        anchor: "impl CommandRunner for StdCommandRunner {",
+        // 构造点搬进了固有方法 `run_observed`；`CommandRunner::run` 只转调它，不再有 `Command::new(`。
+        anchor: "impl StdCommandRunner {",
         suppressor: "creation_flags(CREATE_NO_WINDOW)",
         self_check: "Command::new(",
         window: 20,
@@ -444,7 +445,6 @@ fn only_one_production_site_spawns_sing_box_check() {
         "/proc/self/fd/",
         ".env_clear()",
         ".current_dir(\"/\")",
-        ".stdin(Stdio::from(child_stdin))",
         ".stdout(Stdio::null())",
         ".stderr(Stdio::null())",
         ".kill_on_drop(true)",
@@ -453,6 +453,42 @@ fn only_one_production_site_spawns_sing_box_check() {
         assert!(
             run.contains(required),
             "Linux-only protected check 失去严格构造条件：{required}"
+        );
+    }
+    // fd 0 的接线不在 `run_check` 里了：sealed config 的原子 CLOEXEC 复制与 `.stdin(…)` 随 Child 的
+    // 保管一起搬进了 CheckCustody 的入队处。沿「run_check → supervise → 入队」逐跳钉住，中间任何
+    // 一跳改道，上面那串 argv 里的 `/proc/self/fd/0` 就指向一个没人接的 fd。
+    let relay = braced_block(module, "pub(super) async fn supervise(");
+    assert!(
+        relay.contains(
+            "supervise_owned_sealed_check(command, binary, config, timeout, spawned).await"
+        ),
+        "Linux-only protected check 不再把命令与两份 sealed 输入交给 CheckCustody"
+    );
+    let home = strip_comments(&read(HOME));
+    for (anchor, required) in [
+        (
+            "pub async fn supervise_owned_sealed_check(",
+            ".supervise_owned_sealed(command, binary, config, timeout, spawned)",
+        ),
+        (
+            "async fn supervise_owned_sealed(",
+            "self.queue_owned_sealed(command, binary, config, Arc::new(NativeIo))",
+        ),
+        ("fn queue_owned_sealed(", "validate_sealed_file(&binary)?"),
+        ("fn queue_owned_sealed(", "validate_sealed_file(&config)?"),
+        (
+            "fn queue_owned_sealed(",
+            "rustix::io::fcntl_dupfd_cloexec(&config, 3)",
+        ),
+        (
+            "fn queue_owned_sealed(",
+            ".stdin(std::process::Stdio::from(stdin))",
+        ),
+    ] {
+        assert!(
+            braced_block(&home, anchor).contains(required),
+            "Linux-only protected check 在 `{anchor}` 失去严格构造条件：{required}"
         );
     }
 }

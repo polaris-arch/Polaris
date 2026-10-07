@@ -70,7 +70,13 @@ const WRITE_FORMS: [&str; 14] = [
 ///
 /// 每条都必须命中至少一个探针；命中 0 次 ⇒ 它守的东西已经没了，条目本身会变成将来某个真违规的
 /// 免死金牌，故当场红。
-const REGISTRY: [(&str, &str, &str); 12] = [
+const REGISTRY: [(&str, &str, &str); 13] = [
+    (
+        "test_support.rs",
+        "ran_in_isolated_worker",
+        "只在测试构型下编译（`cfg(all(test, unix))`）：拿测试二进制自己的路径把同一条测试再起一遍。\
+         不读不写安装目录，release 产物里没有这段代码。",
+    ),
     (
         "commands/updater/app_update.rs",
         "update_check",

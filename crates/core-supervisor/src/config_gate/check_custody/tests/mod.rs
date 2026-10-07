@@ -320,6 +320,55 @@ mod unix {
         ));
     }
 
+    #[test]
+    fn closing_admits_metadata_registration_but_not_the_full_guard_and_pause_refuses_both() {
+        let custody = CheckCustody::default();
+        custody.begin_shutdown().unwrap();
+        {
+            let state = custody.state.lock().unwrap();
+            CheckCustody::admit_registration(&state).unwrap();
+            assert_eq!(
+                CheckCustody::admit(&state),
+                Err(ValidationLifecycleError::Closing)
+            );
+        }
+        let paused = CheckCustody::default();
+        paused.state.lock().unwrap().pause = Some(Arc::new(()));
+        let state = paused.state.lock().unwrap();
+        assert!(CheckCustody::admit_registration(&state).is_err());
+        assert!(CheckCustody::admit(&state).is_err());
+    }
+
+    // Probabilistic on the failing side only: a published pulse is caught when the
+    // admitting thread lands inside it; without a pulse this cannot fail.
+    #[test]
+    fn empty_settlement_never_publishes_settling_to_a_concurrent_full_admission() {
+        let custody = Arc::new(CheckCustody::default());
+        let done = Arc::new(AtomicBool::new(false));
+        let admitter = std::thread::spawn({
+            let (custody, done) = (Arc::clone(&custody), Arc::clone(&done));
+            move || {
+                let mut refused = 0_usize;
+                while !done.load(Ordering::SeqCst) {
+                    refused += usize::from(custody.assert_admission().is_err());
+                }
+                refused
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for _ in 0..200_000 {
+                custody.settle_debts().await.unwrap();
+            }
+        });
+        done.store(true, Ordering::SeqCst);
+        assert_eq!(admitter.join().unwrap(), 0);
+        assert!(!custody.state.lock().unwrap().settling);
+    }
+
     #[tokio::test]
     async fn old_request_cleanup_cannot_clear_a_new_birth_and_no_child_spawn_failure_retires_copy()
     {

@@ -60,6 +60,8 @@ pub fn with_check_admission<T>(spawn: impl FnOnce() -> T) -> Result<T, Validatio
 
 /// Register an original producer under the same cutoff lock. This grants no
 /// native birth: its sole factory still requires full `with_check_admission`.
+/// Global closing does not refuse it, so original responsibility stays recorded
+/// while that factory is refused; a central pause still does.
 /// The closure must not await or recursively enter validation custody.
 pub fn with_check_producer_registration<T>(
     register: impl FnOnce() -> T,
@@ -540,6 +542,10 @@ impl CheckCustody {
     }
 
     fn admit(state: &CheckState) -> Result<(), ValidationLifecycleError> {
+        // Registration no longer carries the closing cutoff; the full guard keeps it here.
+        if state.closing {
+            return Err(ValidationLifecycleError::Closing);
+        }
         Self::admit_registration(state)?;
         if state.settling || state.runs.values().any(|run| run.debt) {
             return Err(unknown("a previous validation birth retains cleanup debt"));
@@ -548,9 +554,6 @@ impl CheckCustody {
     }
 
     fn admit_registration(state: &CheckState) -> Result<(), ValidationLifecycleError> {
-        if state.closing {
-            return Err(ValidationLifecycleError::Closing);
-        }
         if state.pause.is_some() {
             return Err(unknown("PC producers are paused"));
         }
@@ -690,13 +693,19 @@ impl CheckCustody {
             if state.closing {
                 return Err(ValidationLifecycleError::Closing);
             }
-            state.settling = true;
-            state
+            let requests: Vec<_> = state
                 .runs
                 .values()
                 .filter(|run| run.debt)
                 .map(|run| run.request.clone())
-                .collect()
+                .collect();
+            if requests.is_empty() {
+                // Nothing to settle: answer under this same lock and never publish
+                // `settling`, which would refuse an unrelated full admission meanwhile.
+                return Self::admit(&state);
+            }
+            state.settling = true;
+            requests
         };
         let booking = SettlementBooking(self);
         self.drain_requests(requests).await?;

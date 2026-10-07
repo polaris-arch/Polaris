@@ -2597,10 +2597,22 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
 #[test]
 fn temp_core_wires_both_streams_into_its_own_target_at_spawn_time() {
     let src = crate_code("runtime/speedtest.rs");
-    // 锚点是**批级**那个入口（T1-R1 分批之后 `run` 变成轮级薄壳，spawn 请求的构造留在 `run_batch`）。
-    let body = crate::commands::guard_scan::impl_method_body(
+    // 锚点是**批级已准入**那一段：`run_batch` 现在只剩「让位 + 准入锁 + 登记本批」的薄壳，spawn
+    // 请求的构造随其余批体搬进了 `run_admitted_batch`。取材面跟着被守的那几行走，不跟着函数名走。
+    let shell = crate::commands::guard_scan::impl_method_body(
         &src,
         "    async fn run_batch<Meas, MeasFut>(",
+    );
+    assert!(
+        shell.contains("Self::run_admitted_batch(")
+            && !shell.contains("SpawnRequest")
+            && !shell.contains("StdioPolicy"),
+        "`run_batch` 必须仍把本批交给 `run_admitted_batch`，且自己不装配 spawn 请求 —— \
+         否则下面的判据钉在一段生产上不走的代码上，或漏掉第二份装配"
+    );
+    let body = crate::commands::guard_scan::impl_method_body(
+        &src,
+        "    async fn run_admitted_batch<Meas, MeasFut>(",
     );
     // 自检：封顶真的生效（切片里不得混进同 impl 的其它方法）。
     assert!(
@@ -3286,7 +3298,8 @@ async fn oversized_batch_is_refused_before_spawning_and_says_why() {
 fn the_oversize_refusal_logs_the_numbers_it_refused_on() {
     let body = crate::commands::guard_scan::impl_method_body(
         &module_code("runtime/speedtest"),
-        "    async fn run_batch<Meas, MeasFut>(",
+        // 规模门随批体搬进了 `run_admitted_batch`（`run_batch` 只剩准入与登记）。
+        "    async fn run_admitted_batch<Meas, MeasFut>(",
     );
     let at_err = body
         .find("Err(budget)")

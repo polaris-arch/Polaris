@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use super::super::{run_probe_check, ProbeCheck};
-use crate::test_support::{write_sleeping_probe, TestDir};
+use crate::test_support::{ran_in_isolated_worker, write_sleeping_probe, TestDir};
 
 /// **正向对照**：探针在预算内跑完 ⇒ 判 `Supported`，且见证文件真的出现。
 ///
@@ -23,6 +23,12 @@ use crate::test_support::{write_sleeping_probe, TestDir};
 /// 那样断言恒真、零信息量。
 #[tokio::test]
 async fn supported_and_lets_the_child_finish_when_it_fits_the_budget() {
+    if ran_in_isolated_worker(
+        module_path!(),
+        "supported_and_lets_the_child_finish_when_it_fits_the_budget",
+    ) {
+        return;
+    }
     let dir = TestDir::new("polaris-probe-check-ok-");
     let witness = dir.path().join("ran.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
@@ -49,6 +55,12 @@ async fn supported_and_lets_the_child_finish_when_it_fits_the_budget() {
 /// 正确得到 CleanupUnknown，不能用它假造成功退出。此探针睡10秒，超过真实8秒预算。
 #[tokio::test]
 async fn timing_out_is_indeterminate_and_kills_the_child() {
+    if ran_in_isolated_worker(
+        module_path!(),
+        "timing_out_is_indeterminate_and_kills_the_child",
+    ) {
+        return;
+    }
     let dir = TestDir::new("polaris-probe-check-timeout-");
     let witness = dir.path().join("killed.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);

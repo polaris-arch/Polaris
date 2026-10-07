@@ -297,5 +297,39 @@ pub(crate) fn write_sleeping_probe(dir: &Path, witness: &Path) -> PathBuf {
     script
 }
 
+/// 把一条真起 `sing-box check` 探针的测试原样放进**独占子进程**里跑；返回 `true` 表示本进程是
+/// 父进程、子进程已跑完并通过。`module` 传调用处的 `module_path!()`，`name` 传测试函数名。
+///
+/// 这些测试经 `run_check_raw` 记进**进程级**那本 check 账，与同进程里并行的原生起核测试共用同一道
+/// 完整准入。超时那几条在「请求关闭 → 原生 wait → 两个读端返回 → 快照清理」之间背的是**真债**
+/// （探针的 `sleep` 继承着管道，读端要等它睡完才 EOF），这段时间里完整准入按设计一律拒绝 ——
+/// 旁边那些直接起核的测试于是成批拿到 cleanup debt。债是对的，要隔开的是账本：不串行、不另造
+/// 测试专用账本、不绕准入，子进程里跑的仍是调用处逐字未动的测试体。
+///
+/// 子进程必须**恰好跑了这一条且通过**：`--exact` 过滤成 0 条时退出码同样是 0，只看退出码会把
+/// 「什么都没跑」当成通过。
+#[cfg(all(test, unix))]
+pub(crate) fn ran_in_isolated_worker(module: &str, name: &str) -> bool {
+    const MARKER: &str = "POLARIS_ISOLATED_CHECK_WORKER";
+    let test = format!("{}::{name}", module.split_once("::").unwrap().1);
+    if std::env::var(MARKER).is_ok_and(|bound| bound == test) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture"])
+        .env(MARKER, &test)
+        .env("POLARIS_NO_KERNEL_RUN", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed"),
+        "独占子进程没有恰好跑过 `{test}`（{}）：\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests;

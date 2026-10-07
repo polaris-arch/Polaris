@@ -3138,6 +3138,34 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersWrongToday,
         "L1原LoginEntry提前booking增两个Android instance/authority空槽，真实native出版块再同Entry填写两字段；Android ordinary spawner不发行PC native birth，保原JNI scoped身份与Unknown。相同组原2/8/31子计数及iOS不可继承桌面producer债原样保留；新3为原家族接线计数，不称三个新增iOS运行错误或签NoOwner。",
     ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        10,
+        IosSide::DiffersWrongToday,
+        "F1给PC Temp补原producer登记：PcTempBatchProducer/Dispatch及其Drop、TempProducerView与impl、pc_temp_producer_view六处定义，run_batch的登记/传参/finished三处与run_admitted_batch的producer形参。同谓词组仍含iOS不适用的桌面Child起核/收割链，原21/8子计数和理由保留；新10保守组级登记，不是十个新增iOS运行错误。iOS产品入口仍拒独立temp，这些metadata不授出生、退出或NoOwner证明。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        4,
+        IosSide::WithAndroid,
+        "pause_pc_producers、original_members、seal、surrender四个PC producer暂停/普查/交还入口只在桌面编译；两移动端同不编译，无法取得PcPauseBorrow或封存成员。该普查只登记原责任，不签NoOwner、StopLease或managed出生。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
+        "not(target_os = \"android\")",
+        2,
+        IosSide::DiffersWrongToday,
+        "OriginalMembers的temp字段与member_counts的Temp计数随speedtest.rs里TempProducerView的可见性写成非Android；iOS因此编进桌面Temp producer视图，而它没有独立temp核，应与Android同答。今天不可达：唯一构造点original_members仅桌面编译。改成与四个入口同谓词须先有iOS编译面取收据，登记为债而不凭推断改写。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "member_counts在Android上Temp成员恒报0：Android测速走进程内libbox，没有PC Temp custody可普查。iOS不编此腿；它错误继承桌面Temp视图的事实在同文件not(android)条目单独登记为债。",
+    ),
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3588,14 +3616,17 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// Android group members are conservative group census, not 35 new iOS runtime failures.
 /// L1 adds two non-Android binding initializers and three Android same-entry publication sites.
 /// These retain the historical group verdicts; they are not five new iOS runtime failures.
-/// Debt is 33 tuple rows / 24 unique groups / 161 sites; no historical debt was repaid.
+/// F1 producer census: speedtest.rs adds ten non-Android producer-registration sites to its
+/// historical group; pc_owner_census.rs adds four desktop-only entries (WithAndroid), one Android
+/// zero-count leg (Right) and two non-Android Temp-view sites registered as a new debt group.
+/// Debt is 35 tuple rows / 25 unique groups / 173 sites; no historical debt was repaid.
 /// Source-only registration does not sign Android/iOS SDK execution, global cleanup or NoOwner.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
-    ("DiffersRight", 260),
+    ("DiffersRight", 261),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 136),
-    ("WithAndroid", 79),
+    ("DiffersWrongToday", 148),
+    ("WithAndroid", 83),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3676,6 +3707,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         7,
     ),
     (
+        "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",
+        "not(target_os = \"android\")",
+        2,
+    ),
+    (
         "src-tauri/src/runtime/proxy/process_supervision/direct_stop.rs",
         "target_os = \"android\"",
         3,
@@ -3689,6 +3725,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/speedtest.rs",
         "not(target_os = \"android\")",
         8,
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(target_os = \"android\")",
+        10,
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",

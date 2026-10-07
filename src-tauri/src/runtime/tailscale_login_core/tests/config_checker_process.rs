@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::{ConfigChecker, SingBoxConfigChecker};
-use crate::test_support::{write_sleeping_probe, TestDir, PROBE_SLEEP_MILLIS};
+use crate::test_support::{
+    ran_in_isolated_worker, write_sleeping_probe, TestDir, PROBE_SLEEP_MILLIS,
+};
 
 fn config_fixture(dir: &Path) -> PathBuf {
     let config = dir.join("config.json");
@@ -45,6 +47,12 @@ fn config_fixture(dir: &Path) -> PathBuf {
 /// 这条腿从来就写不出文件」—— 那样断言恒真、零信息量。
 #[tokio::test]
 async fn accepts_and_lets_the_child_finish_when_it_fits_the_budget() {
+    if ran_in_isolated_worker(
+        module_path!(),
+        "accepts_and_lets_the_child_finish_when_it_fits_the_budget",
+    ) {
+        return;
+    }
     let dir = TestDir::new("polaris-login-cfgcheck-ok-");
     let witness = dir.path().join("ran.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
@@ -71,6 +79,12 @@ async fn accepts_and_lets_the_child_finish_when_it_fits_the_budget() {
 /// 完成。不能让虚时再次跳过收割预算，也不能把 CleanupUnknown 当成已确认的超时诊断。
 #[tokio::test(start_paused = true)]
 async fn times_out_instead_of_hanging_and_kills_the_child() {
+    if ran_in_isolated_worker(
+        module_path!(),
+        "times_out_instead_of_hanging_and_kills_the_child",
+    ) {
+        return;
+    }
     let dir = TestDir::new("polaris-login-cfgcheck-timeout-");
     let witness = dir.path().join("killed.txt");
     let probe = write_sleeping_probe(dir.path(), &witness);
