@@ -22,6 +22,19 @@ internal enum class AndroidNativeProducer(val wireName: String) {
 }
 
 /** Build-time wiring manifest. A producer is listed only after all its entry and close paths are tested. */
+// Android 的 org.json 没有 `JSONObject.similar`（那是 JVM 单测依赖 org.json:json 才有的方法），
+// 结构相等在这里自己判：键集相同、逐值相等，数值按大小比（1 与 1.0 相等）。
+private fun sameJson(left: Any?, right: Any?): Boolean = when {
+    left is JSONObject && right is JSONObject ->
+        left.length() == right.length() &&
+            left.keys().asSequence().all { right.has(it) && sameJson(left.get(it), right.get(it)) }
+    left is JSONArray && right is JSONArray ->
+        left.length() == right.length() && (0 until left.length()).all { sameJson(left.get(it), right.get(it)) }
+    left is Number && right is Number ->
+        java.math.BigDecimal(left.toString()).compareTo(java.math.BigDecimal(right.toString())) == 0
+    else -> left == right
+}
+
 internal object AndroidNativeCoverage {
     const val PROTOCOL_VERSION = 1
     val requiredProducers = AndroidNativeProducer.entries.map(AndroidNativeProducer::wireName).toSet()
@@ -353,7 +366,7 @@ internal class AndroidNativeAdmission(
         check(binding.getString("contractVersion") == "polaris-android-validation-custody-v1" && binding.getString("processNonce") == processNonce)
         val original = checkNotNull(entries[binding.getString("nativeTicketId")])
         check(original.ticket.kind == Kind.CheckConfig && original.state == State.ValidationCleanupUnknown)
-        check(checkNotNull(original.validation).wire().similar(binding.getJSONObject("validation")))
+        check(sameJson(checkNotNull(original.validation).wire(), binding.getJSONObject("validation")))
         return original
     }
 
@@ -362,7 +375,7 @@ internal class AndroidNativeAdmission(
         validationBindingLocked(binding)
         val ticket = checkNotNull(usedOwners[Kind.Login to tuple.getString("logicalInstanceId")])
         val owner = checkNotNull(entries[ticket.id]); val warm = checkNotNull(owner.warm)
-        check(warm.tuple.similar(tuple) && owner.ticket == ticket)
+        check(sameJson(warm.tuple, tuple) && owner.ticket == ticket)
         return owner
     }
 
