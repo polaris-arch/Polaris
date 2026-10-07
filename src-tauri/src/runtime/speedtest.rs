@@ -80,6 +80,7 @@ use polaris_core_supervisor::{
     CORE_STARTUP_PER_NODE_US,
 };
 
+use crate::commands::speedtest::{speed_test_result_payload, Measured, SpeedTestCancel};
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
 };
@@ -196,7 +197,7 @@ const TEMP_CORE_READY_TIMEOUT_FLOOR_MS: u64 = 10_000;
 /// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::is_alive` 接住
 /// （本模块传的是 `pid == 0 || pid_alive(pid)`，进程一没就停等）；用户中途点「连接」由
 /// `is_superseded` 接住（命中即停等 + 杀核）。剩下的那种僵核形态确实**没有取消按钮**
-/// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_IN_FLIGHT`）在此期间挡住
+/// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_GATE`）在此期间挡住
 /// 一切后续测速请求 ⇒ 上限必须有限，且不能定得太大。
 ///
 /// # ⚠️ T1-R1（分批）之后：这条腿**在生产路径上已经不可达**，但它不是死代码
@@ -645,7 +646,7 @@ const TEMP_CORE_READY_POLL_MS: u64 = 200;
 /// 有 ≥16 个死节点），那两处一个都醒不过来 —— supersede 信号出现后临时核（及其**已建立的 WG/WARP
 /// 会话**）还要活满一整个测量超时。Linux/macOS 靠主核 `start()` 入口的 stale sweep 顺带杀掉——那是
 /// **副作用缓解、不是设计保证**；Windows 无 sweep（`scan_running_cores` 恒返空）⇒ 全程重叠。
-/// 故按本间隔独立轮询（`timeout(poll, join_next())`，**不依赖任何测量返回**），命中即 `abort_all` +
+/// 故按本间隔独立轮询（`timeout(poll, join_next())`，**不依赖任何测量返回**），命中即中止并收回在飞任务（`JoinSet::shutdown`）+
 /// 立即返回（调用方紧接着 `terminate()`）。
 const TEMP_CORE_SUPERSEDE_POLL_MS: u64 = 200;
 
@@ -1489,7 +1490,7 @@ pub fn plan_temp_core_with_bindings(
 /// 缺席节点的**按原因汇总**日志（唯一出口，[`plan_temp_core_with_bindings`] 收尾调一次）。
 ///
 /// 全量列 id 在 116 节点的订阅上是一行几 KB，而排查只需要「是不是集中在某一类」——故只报两类计数
-/// 加前 5 个带原因的样本，与 [`log_speed_test_summary`] 的取样口径同源。
+/// 加前 5 个带原因的样本，与每轮汇总行的取样口径同源。
 ///
 /// 级别取 `warn`：真机常态 `logLevel=info`（`warn` 及以上才落盘的场景另说），而「某些节点每轮都不
 /// 被测」正是用户会来问、且此前磁盘上零线索的那一类。
@@ -1933,9 +1934,9 @@ pub const fn is_temp_core_superseded(
 /// 只排除 control/http/mixed，会抢走主核尚未 bind 的口 ⇒ 主核起核 FATAL。所以「主核来了就立刻停」
 /// 不是优化，是**正确性**。三个检查点覆盖全程，缺一即静默重叠：
 ///
-/// 1. **发新活之前**（每轮补位一次）：主核已起 → 停发新活 + `abort_all` 已在飞的，未测节点缺席。
+/// 1. **发新活之前**（每轮补位一次）：主核已起 → 停发新活 + 中止并收回已在飞的（`JoinSet::shutdown`），未测节点缺席。
 ///    这条替代了旧的「批首」检查，粒度**更细**：旧的是每 K 个节点一次，现在是每次补位一次。
-/// 2. **在飞轮询**（每 [`TEMP_CORE_SUPERSEDE_POLL_MS`] 一次）：命中即 `abort_all` + 立刻返回。
+/// 2. **在飞轮询**（每 [`TEMP_CORE_SUPERSEDE_POLL_MS`] 一次）：命中即中止并收回在飞任务后返回（不等它们各自测完）。
 ///    **这条是唯一不依赖任何测量返回的腿** —— 窗口里 16 个全挂死（真机上就是 16 个不可达节点）时，
 ///    上面两条都醒不过来，只有它按间隔醒。批屏障时代它挂在「批内」，现在挂在整轮，覆盖面只增不减：
 ///    以前批与批之间那一小段没有轮询（靠批首查兜），现在全程都在轮询窗口里。
@@ -2034,10 +2035,10 @@ impl RoundProgress {
         self.tested
     }
 
-    /// 落一个节点的账（[`record_measured`] 专用；`Some` 计进 `ok`）。
-    fn record(&mut self, latency: Option<u32>) {
+    /// 落一个节点的账（[`record_measured`] 专用；测出值的计进 `ok`）。
+    fn record(&mut self, measured: &Measured) {
         self.tested += 1;
-        if latency.is_some() {
+        if measured.is_ok() {
             self.ok += 1;
         }
     }
@@ -2098,7 +2099,7 @@ pub async fn drive_temp_core_measures<Meas, MeasFut>(
 ) -> (serde_json::Map<String, Value>, &'static str)
 where
     Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Option<u32>> + Send + 'static,
+    MeasFut: Future<Output = Measured> + Send + 'static,
 {
     // `results` 由**本薄壳**持有：内核的每一条中断腿（含 `select!` 的核退出臂）都要能把「已落账的那些」
     // 交出来，而返回值持有的话，中断臂那一刻还没有返回值可交。
@@ -2142,7 +2143,7 @@ async fn drive_temp_core_measures_inner<Meas, MeasFut>(
 ) -> Option<InterruptReason>
 where
     Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Option<u32>> + Send + 'static,
+    MeasFut: Future<Output = Measured> + Send + 'static,
 {
     // `total` 是**本批**的调度上界（`nodes`/`ports` 逐位 1:1，多出的一侧不测）——它只管这个循环该
     // 派多少活。事件里那个 `total` 是**轮**级的，由 [`RoundProgress`] 持有，两者不是一回事：
@@ -2161,7 +2162,7 @@ where
         if next < total {
             // ── 让位①（发新活之前）：主核已起/已跃迁 → 停发新活 + 中止在飞，未测节点缺席 ──
             if superseded() {
-                set.abort_all();
+                set.shutdown().await;
                 return Some(InterruptReason::Superseded);
             }
             // 补位：起手补满窗口，此后回来一个补一个。
@@ -2201,7 +2202,7 @@ where
         let joined = tokio::select! {
             biased;
             () = &mut watch.exited => {
-                set.abort_all();
+                set.shutdown().await;
                 log::error!(
                     "测速临时核异常退出：pid={}，已出值 {}/{total}，检测到退出之后未出值的节点本轮缺席；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                     watch.pid,
@@ -2214,13 +2215,13 @@ where
         match joined {
             // 窗口已空且无待发（上面刚补过位）⇒ 全部收尾。
             Ok(None) => break,
-            Ok(Some(Ok((id, latency)))) => {
+            Ok(Some(Ok((id, measured)))) => {
                 // ── 让位③（每节点测完即查）──
                 if superseded() {
-                    set.abort_all();
+                    set.shutdown().await;
                     return Some(InterruptReason::Superseded);
                 }
-                if latency.is_some() {
+                if measured.is_ok() {
                     failure_streak = 0;
                 } else {
                     // ── 落账前对核再探一次（`biased` 的兜底）──
@@ -2237,7 +2238,7 @@ where
                     })
                     .await;
                     if exited_now {
-                        set.abort_all();
+                        set.shutdown().await;
                         log::error!(
                             "测速临时核已退出（落账前复查命中）：pid={}，已出值 {}/{total}，含本次在内的未出值节点一律缺席；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                             watch.pid,
@@ -2247,7 +2248,7 @@ where
                     }
                     failure_streak += 1;
                 }
-                record_measured(results, progress, emit, &id, latency);
+                record_measured(results, progress, emit, &id, &measured);
 
                 // ── A3 腿二（核**不再接受连接**）：连败满一窗 → 对 `ports[0]` 复探一次 ──
                 //
@@ -2267,7 +2268,7 @@ where
                         .await
                         .unwrap_or(false);
                     if !responding {
-                        set.abort_all();
+                        set.shutdown().await;
                         log::error!(
                             "测速临时核连续 {TEMP_CORE_STALL_STREAK} 个节点判 -1 且复探 127.0.0.1:{port} 无响应：pid={}，已出值 {}/{total}，本轮就地终止（检测到之后未出值的节点一律缺席；此前那一整窗的 -1 同样可能是核致的，见 `InterruptReason::CoreUnresponsive` 的射程说明）；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                             watch.pid,
@@ -2282,7 +2283,7 @@ where
             // ── 让位②（在飞轮询）：**不依赖任何测量返回**，窗口全挂死时也照样醒 ──
             Err(_elapsed) => {
                 if superseded() {
-                    set.abort_all();
+                    set.shutdown().await;
                     return Some(InterruptReason::Superseded);
                 }
             }
@@ -2297,28 +2298,29 @@ where
 /// 与主核池路径 [`crate::commands::speedtest`] 的同名函数逐字同义 —— 两条腿的事件形状必须一致，
 /// 前端 `use-latency-store` / `NodesScreen` 只有一套消费逻辑。
 ///
-/// `latency == None` ⇒ 记 -1（**真实**不可测：超时 / 传输错）。「让位未测」的节点根本不会走到这里。
+/// 失败 ⇒ 记 -1（**真实**不可测，阶段与成因随事件带出）。「让位未测」的节点根本不会走到这里。
+/// 网络代次在本腿恒为未知：它只在主核运行期间计数。
 fn record_measured(
     results: &mut serde_json::Map<String, Value>,
     progress: &mut RoundProgress,
     emit: &mut (dyn FnMut(&str, Value) + Send),
     node_id: &str,
-    latency: Option<u32>,
+    measured: &Measured,
 ) {
-    let latency_val = latency.map_or(-1_i64, i64::from);
-    if latency.is_none() {
-        log::debug!(
-            "临时核测速未取得有效延迟：nodeId={node_id}（可能为冷建链/复用请求超时、传输错误或测速端点非 2xx）"
-        );
+    if let Err(failure) = measured {
+        log::debug!("临时核测速未取得有效延迟：nodeId={node_id} {failure:?}");
     }
-    results.insert(node_id.to_string(), json!(latency_val));
+    results.insert(
+        node_id.to_string(),
+        json!(measured.map_or(-1_i64, i64::from)),
+    );
     emit(
         EVENT_SPEED_TEST_RESULT,
-        json!({ "serverId": node_id, "latency": latency_val }),
+        speed_test_result_payload(node_id, measured, None),
     );
     // 计数与口径都由**轮**级的账持有（跨批累加、`total` 恒全局）：批级计数一旦出到事件里，
     // 前端会在每批测完那一帧收口（判据见 [`RoundProgress`]）。
-    progress.record(latency);
+    progress.record(measured);
     progress.emit_progress(emit);
 }
 
@@ -2361,6 +2363,10 @@ pub enum InterruptReason {
     /// 「核不再 listen / 已消失」那一类，抓不到「listen 着但线程全堵住」那一类；后者的证据由 A1 的
     /// 排空腿从根上消掉（那才是那条形态的根治），本腿是兜底而非替代。
     CoreUnresponsive,
+    /// 本轮经取消句柄被取消（[`SpeedTestCancel`]）。未出值的节点缺席，处置与让位相同。
+    Cancelled,
+    /// 更高优先级的请求到来，本轮被取消以让出单飞闸。不是节点失败。
+    Preempted,
 }
 
 impl InterruptReason {
@@ -2371,11 +2377,13 @@ impl InterruptReason {
             Self::Superseded => "superseded",
             Self::CoreExited => "core_exited",
             Self::CoreUnresponsive => "core_unresponsive",
+            Self::Cancelled => "cancelled",
+            Self::Preempted => "preempted",
         }
     }
 }
 
-/// 一轮测速的结果口径三分（供 [`log_speed_test_summary`]；纯函数，可单测）。
+/// 一轮测速的结果口径三分（纯函数，可单测）。
 ///
 /// **`-1` 与「缺席」是两件不同的事，混起来就没法排查**：
 /// - `ok`：真测出了值（毫秒 ≥ 0）；
@@ -2427,48 +2435,6 @@ impl SpeedTestSummary {
     }
 }
 
-/// 一轮测速的**结果级**日志（唯一出口，三条腿共用 —— 挂在 [`emit_speed_test_done`] 里）。
-///
-/// # 这条补的是什么洞
-///
-/// 本链此前**零结果级日志**：机器上只有「测速临时核已 spawn：126 个节点」和「已回收：
-/// outcome=completed」两行，中间什么都没有。陈先生 2026-08-02 报「全部测速全部显示 -1，跟实际不符」
-/// 时，磁盘上拿不出任何东西能分辨三种完全不同的成因 ——
-/// ① 网络真的全失败；② 本轮被让位/中断（节点根本没测，前端把**缺席**画成了 `-1`）；
-/// ③ 少数失败但 UI 全渲染成 `-1`。`latency` 又不落 `config.json`（纯渲染端 map），
-/// 事后无从复盘。汇总一行即可把三者分开。
-///
-/// 失败样本只带前 5 个 id：全量在 126 节点时是一行几 KB 的日志，而排查只需要「是不是集中在某一类」。
-fn log_speed_test_summary(
-    outcome: &str,
-    results: &serde_json::Map<String, Value>,
-    intended: &[String],
-    pending: &[&String],
-    reason: Option<InterruptReason>,
-) {
-    let s = summarize_speed_test(results, intended, pending.len(), reason);
-    let samples: Vec<&str> = results
-        .iter()
-        .filter(|(_, v)| !v.as_i64().is_some_and(|ms| ms >= 0))
-        .map(|(k, _)| k.as_str())
-        .take(5)
-        .collect();
-    let tail = if samples.is_empty() {
-        String::new()
-    } else {
-        format!("；失败样本 {}", samples.join(", "))
-    };
-    // 缺席成因进汇总行：此前这里只写「未测（让位或中断）N」，而那个「或」正是排查时要分开的那一刀。
-    let why = s.absent_reason.map_or("", InterruptReason::as_str);
-    log::info!(
-        "测速一轮完成：outcome={outcome}，reason={why}，请求 {}，成功 {}，超时/失败 {}，未测 {}{tail}",
-        intended.len(),
-        s.ok,
-        s.failed,
-        s.absent
-    );
-}
-
 /// 一轮测速的**终态事件**（[`EVENT_SPEED_TEST_DONE`]）——三条腿各自在**唯一出口**调一次。
 ///
 /// # 为什么放在这里、并且只有一个调用点/腿
@@ -2499,7 +2465,8 @@ pub fn emit_speed_test_done(
         .iter()
         .filter(|id| !results.contains_key(id.as_str()))
         .collect();
-    log_speed_test_summary(outcome, results, intended, &pending, reason);
+    // 口径自检（成功 + 失败 + 未测 = 请求数）留在这里；每轮汇总行由该轮的事件发布口出。
+    let _ = summarize_speed_test(results, intended, pending.len(), reason);
     let mut payload = json!({
         "outcome": outcome,
         "tested": results.len(),
@@ -2548,6 +2515,8 @@ pub struct TempCoreDeps {
     /// 生产恒 `None` 是本改动的**要点本身**：门是规模的函数，不再是一个常数。任何把它写成
     /// `Some(<定值>)` 的改动都会被 `production_ready_gate_is_scale_derived_not_a_constant` 拦下。
     pub ready_timeout_override_ms: Option<u64>,
+    /// 本轮运行的取消句柄。并入让位判据：命中后的处置与让位相同，只是终态的中断成因不同。
+    pub cancel: SpeedTestCancel,
 }
 
 impl TempCoreDeps {
@@ -2576,7 +2545,15 @@ impl TempCoreDeps {
             }),
             log_level,
             ready_timeout_override_ms: None,
+            cancel: SpeedTestCancel::default(),
         }
+    }
+
+    /// 换上本轮运行的取消句柄（命令层在准入后调）。
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: SpeedTestCancel) -> Self {
+        self.cancel = cancel;
+        self
     }
 }
 
@@ -2640,6 +2617,28 @@ enum BatchOutcome {
     Superseded,
 }
 
+/// 轮出口的 outcome 与成因，**由同一处决定**（纯函数）。
+///
+/// 取消并入了让位判据：检查点只知道「该停了」，分不出是让位还是取消，所以检查点记下让位、而取消
+/// 句柄已置位时，成因以句柄为准。除此之外句柄不参与——一轮已经测完才被置位的取消不能把它改写成
+/// 「completed 却带成因」，核退出 / 核无响应也不被取消盖掉（那是排查线索）。
+fn round_exit(
+    interrupt: Option<InterruptReason>,
+    cancel: Option<InterruptReason>,
+    failed_batches: usize,
+) -> (&'static str, Option<InterruptReason>) {
+    let reason = match (interrupt, cancel) {
+        (Some(InterruptReason::Superseded), Some(cancel)) => Some(cancel),
+        (interrupt, _) => interrupt,
+    };
+    let outcome = if reason.is_some() || failed_batches > 0 {
+        "interrupted"
+    } else {
+        "completed"
+    };
+    (outcome, reason)
+}
+
 /// 一次临时核测速会话：分批 → 每批（起核 → 就绪门 → 编排 → **无条件**收尾）→ 一条终态事件。
 pub struct TempCoreSession;
 
@@ -2700,7 +2699,7 @@ impl TempCoreSession {
     ) -> TempCoreOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         if nodes.is_empty() {
             return TempCoreOutcome::Ran {
@@ -2708,6 +2707,10 @@ impl TempCoreSession {
                 outcome: "completed",
             };
         }
+        // 取消并入让位判据：起核前、在飞轮询、每节点测完这几处检查点因此都认它，
+        // 命中后同样停发新活、收掉在飞任务、按无条件收尾路径关核。
+        let superseded: &(dyn Fn() -> bool + Sync) =
+            &|| deps.cancel.reason().is_some() || superseded();
 
         let intended: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let mut progress = RoundProgress::new(nodes.len());
@@ -2806,12 +2809,8 @@ impl TempCoreSession {
             };
         }
         // 一批都没起成功时不发终态（同分批之前）；只要测过就必须发，且载荷是**轮**级口径。
-        let outcome = if progress.reason().is_some() || failed_batches > 0 {
-            "interrupted"
-        } else {
-            "completed"
-        };
-        emit_speed_test_done(emit, outcome, &results, &intended, progress.reason());
+        let (outcome, reason) = round_exit(progress.reason(), deps.cancel.reason(), failed_batches);
+        emit_speed_test_done(emit, outcome, &results, &intended, reason);
         TempCoreOutcome::Ran { results, outcome }
     }
 
@@ -2837,7 +2836,7 @@ impl TempCoreSession {
     ) -> BatchOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         if nodes.is_empty() {
             return BatchOutcome::Ran(serde_json::Map::new());
@@ -2891,7 +2890,7 @@ impl TempCoreSession {
     ) -> BatchOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         #[cfg(not(target_os = "android"))]
         {
@@ -3161,7 +3160,7 @@ impl TempCoreSession {
     ) -> BatchOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         let pid = child.pid().unwrap_or(0);
         // Desktop's persistent birth already owns its exclusion token. Android keeps its

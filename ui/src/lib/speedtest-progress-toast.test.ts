@@ -28,6 +28,7 @@ import {
   type SpeedTestProgress,
   type SpeedTestToastDeps,
 } from './speedtest-progress-toast';
+import type { SpeedTestInterruptReason } from '../contracts/speed-test';
 import {
   maskRustCommentsAndStrings,
   moduleSource,
@@ -498,10 +499,11 @@ describe('中断后的恢复动作：继续剩余 / 重测原范围 / 关闭', (
     expect(reduceSpeedTestDone({ live: false, tested: 0, total: 0 }, done()).intent).toBeNull();
   });
 
-  it('🔴 中断成因换的是**标题**，动作集合三档完全相同', () => {
+  it('🔴 中断成因换的是**标题**，动作集合各档完全相同', () => {
     /*
-     * 三种成因下用户能做的事一样（继续剩余 / 重新测速 / 关闭），差别只在「接下来该去看哪儿」：
-     * `superseded` 是主核接管了，另两档是本机测速核出事了、日志页里有它的行。
+     * 各种成因下用户能做的事一样（继续剩余 / 重新测速 / 关闭），差别只在「接下来该去看哪儿」：
+     * `superseded` 是主核接管了，核退出与核无响应是本机测速核出事了、日志页里有它的行，
+     * 取消与被抢占是这一轮被叫停了。
      *
      * 变异锁：把 `INTERRUPT_MSG_KEY` 里任一条改回通用键 → 对应那条 msgKey 断言转红；
      * 让某一档少挂一个动作 → actions 相等断言转红。
@@ -515,8 +517,10 @@ describe('中断后的恢复动作：继续剩余 / 重测原范围 / 关闭', (
       superseded: 'nodes.speedTestInterrupted',
       core_exited: 'nodes.speedTestCoreExited',
       core_unresponsive: 'nodes.speedTestCoreUnresponsive',
+      cancelled: 'nodes.speedTestCancelled',
+      preempted: 'nodes.speedTestPreempted',
     };
-    const actionsOf = (reason?: 'superseded' | 'core_exited' | 'core_unresponsive') =>
+    const actionsOf = (reason?: SpeedTestInterruptReason) =>
       reduceSpeedTestDone(
         base,
         done({ serverIds: ['a', 'b', 'c'], pending: ['b', 'c'], reason })
@@ -527,7 +531,7 @@ describe('中断后的恢复动作：继续剩余 / 重测原范围 / 关闭', (
 
     const reference = actionsOf('superseded');
     for (const [reason, key] of Object.entries(wanted)) {
-      const intent = actionsOf(reason as 'superseded');
+      const intent = actionsOf(reason as SpeedTestInterruptReason);
       expect(intent?.msgKey, `${reason} 的标题键`).toBe(key);
       expect(intent?.descKey).toBe('nodes.speedTestInterruptedSummary');
       expect(intent?.dismissLabelKey).toBe('nodes.speedTestDismiss');
@@ -560,6 +564,9 @@ describe('测速 Toast 文案在五语种都存在（本模块的键绕过了可
     // 中断成因分档文案（后端 `InterruptReason` 的另两档）。
     'nodes.speedTestCoreExited',
     'nodes.speedTestCoreUnresponsive',
+    // 取消与被抢占两档。
+    'nodes.speedTestCancelled',
+    'nodes.speedTestPreempted',
     // 恢复动作与关闭入口——五语同批补齐，故 ru/fa 的 MISSING_KEY_DEBT 不动。
     'nodes.speedTestResume',
     'nodes.speedTestRetry',
@@ -618,8 +625,14 @@ describe('测速 Toast 文案在五语种都存在（本模块的键绕过了可
         }
       ).intent
     );
-    // 三档中断成因各走一遍：漏掉任一档，它的文案键就不会进 `used`，下面的集合相等断言转红。
-    for (const reason of ['superseded', 'core_exited', 'core_unresponsive'] as const) {
+    // 各档中断成因各走一遍：漏掉任一档，它的文案键就不会进 `used`，下面的集合相等断言转红。
+    for (const reason of [
+      'superseded',
+      'core_exited',
+      'core_unresponsive',
+      'cancelled',
+      'preempted',
+    ] as const) {
       collect(
         reduceSpeedTestDone(
           { live: true, tested: 1, total: 5 },

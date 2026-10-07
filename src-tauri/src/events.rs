@@ -165,6 +165,17 @@ pub mod channel {
     // 故能力契约 L131 的「托盘测速结果**合并非替换**」这条要求**已由逐节点通道结构性满足**，汇总通道在这个
     // 架构里没有承担任何独有语义：补它等于给同一事实造第二个真值源（两条通道谁先到、谁覆盖谁），删它则
     // 零行为变化。两端皆零 emit / 零订阅，保留只会诱导后人为「对齐 上游」重造假接线。
+    //
+    // 三个通道的既有字段与取值不变；下列都是**新增的可选字段**（旧消费方不读它们）：
+    //  - 逐节点结果：`status`（`ok` / `failed`）、`failure`（`{phase, kind, httpStatus?}`，仅失败时）、
+    //    `identity`（身份块：运行号、序号、来源、路径、口径、URL 摘要、已连接/未连接、核实例、
+    //    配置摘要、节点指纹、网络代次、出结果时刻）；
+    //  - 进度与终态：`seq`。一轮内三类事件共用一个严格递增的序号，终态带最后一个；
+    //  - 终态的 `reason` 多两个取值：`cancelled` / `preempted`（前端的联合类型尚未收这两项）。
+    //
+    // **只有手动发起的前台运行**才在事件顶层带 `runId`、才发进度与终态。其余来源（周期计划、出口伴测）
+    // 只发逐节点结果，运行号放在 `identity.run`：既有消费方把「顶层有 `runId`」当作「这是一轮前台任务」。
+    // 盖章的单一出口是 `commands::speedtest::RunEvents`。
     pub const EVENT_SPEED_TEST_RESULT: &str = "event:speedTestResult";
     pub const EVENT_SPEED_TEST_PROGRESS: &str = "event:speedTestProgress";
     /// **一轮测速的终态**（`{outcome,tested,total,serverIds:[serverId],pending:[serverId]}`）。

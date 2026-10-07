@@ -72,6 +72,24 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// 单次 socket 读的块大小（响应头场景足够大，不必按页调优）。
 const READ_CHUNK: usize = 8 * 1024;
 
+/// 预热那次响应的**响应体**消费上界：超过即判「连接不可复用」。
+///
+/// 与 [`MAX_HEAD_BYTES`] 取同一个数（估算值，无实测依据）。默认端点回 204、没有响应体，碰不到这条；
+/// 受它约束的只有自配测速 URL。
+const MAX_WARMUP_BODY_BYTES: usize = 64 * 1024;
+
+/// 隧道上一步 I/O 的失败种类（阶段由调用方按「它当时在做哪一步」给出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelError {
+    /// 传输错 / 对端过早关闭 / 响应头畸形 / 超 [`MAX_HEAD_BYTES`]。
+    Transport,
+    /// 本机代理以非 2xx 拒绝建隧道（典型 502 = 出站拨不通，407 = 凭据不对），附状态码。
+    ConnectStatus(u16),
+    /// 响应体排不干净（声明了 `Connection: close` / 没有可判定的长度 / 超
+    /// [`MAX_WARMUP_BODY_BYTES`]）⇒ 这条连接不能再承载下一次请求。
+    NotReusable,
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  ① 纯逻辑：测速目标解析 + HTTP 报文编解码（无 I/O，全部可离线单测）
 // ══════════════════════════════════════════════════════════════════════════════
@@ -189,14 +207,19 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// 那比虚高更危险：一个坏节点会因为假的超低延迟被排到最前面。上游 对同一个坑有逐字相同的处置
 /// （`SpeedTestService.ts:1310-1315`）。
 ///
-/// 残余本身若含字面量 `HTTP/` 仍会误判 —— 这是 上游 同款的**已知有界残留**：默认端点是 204（规范无
-/// body），自配端点才可能有 body，且要恰好在残余里出现 `HTTP/` 才命中。要根治需按 `Content-Length` /
-/// chunked 精确排空第一次响应体，那是在测速路径上塞半个 HTTP 客户端，与收益不成比例。
+/// 残余本身若含字面量 `HTTP/` 仍会误判。预热那次的响应体现由 [`WarmTunnel::drain_body`] 按
+/// `Content-Length` / chunked 排空，排不干净即判预热失败；调用方关掉那一步时，这条退回 上游 同款的
+/// **已知有界残留**（默认端点是 204、规范无 body，自配端点才可能命中）。锚定本身两种情况下都保留。
 fn find_response_head(buf: &[u8]) -> Option<&[u8]> {
+    let (start, end) = response_head_range(buf)?;
+    Some(&buf[start..end])
+}
+
+/// [`find_response_head`] 的下标版：`(头起点, 头终点)`，终点之后就是响应体已读到的部分。
+fn response_head_range(buf: &[u8]) -> Option<(usize, usize)> {
     let anchor = find_subslice(buf, b"HTTP/")?;
-    let rest = &buf[anchor..];
-    let end = find_subslice(rest, b"\r\n\r\n")?;
-    Some(&rest[..end + 4])
+    let end = find_subslice(&buf[anchor..], b"\r\n\r\n")?;
+    Some((anchor, anchor + end + 4))
 }
 
 /// 从响应头（**自状态行起**）解析 3 位状态码。解析不出 → `None`。
@@ -245,8 +268,108 @@ fn parse_http_status_code(head: &[u8]) -> Option<u16> {
 ///
 /// 非 2xx（3xx 重定向 / 4xx 如 CF-Workers 节点对 cp.cloudflare 的 403 / 5xx）判失败 —— 堵住
 /// 「错误页被当成功记 TTFB」（上游 issue #154 ③）。
-fn is_acceptable_status(code: u16) -> bool {
+pub(crate) fn is_acceptable_status(code: u16) -> bool {
     (200..=299).contains(&code)
+}
+
+/// 一次响应的响应体定界方式（RFC 9112 §6.3 里测速用得到的那几条）。
+#[derive(Debug, PartialEq, Eq)]
+enum BodyFraming {
+    /// 没有响应体（1xx / 204 / 304）。
+    Empty,
+    /// `Content-Length` 字节。
+    Length(usize),
+    /// `Transfer-Encoding: chunked`。
+    Chunked,
+    /// 读完这次响应后连接不能复用：对端声明了 `Connection: close`，或响应体只能靠关连接定界。
+    NotReusable,
+}
+
+/// 从响应头（自状态行起）判响应体的定界方式。
+fn body_framing(head: &[u8]) -> BodyFraming {
+    let mut length = None;
+    let mut chunked = false;
+    for line in head.split(|b| *b == b'\n').skip(1) {
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+        let Ok(value) = std::str::from_utf8(&line[colon + 1..]) else {
+            continue;
+        };
+        let mut tokens = value.split(',').map(str::trim);
+        let name = &line[..colon];
+        if name.eq_ignore_ascii_case(b"connection") {
+            if tokens.any(|t| t.eq_ignore_ascii_case("close")) {
+                return BodyFraming::NotReusable;
+            }
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            chunked = tokens.any(|t| t.eq_ignore_ascii_case("chunked"));
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            // 解析不出的长度不猜：猜错一个字节，下一次响应的头就会被当成这一次的响应体吃掉。
+            let Ok(n) = value.trim().parse::<usize>() else {
+                return BodyFraming::NotReusable;
+            };
+            length = Some(n);
+        }
+    }
+    if matches!(parse_http_status_code(head), Some(100..=199 | 204 | 304)) {
+        return BodyFraming::Empty;
+    }
+    if chunked {
+        return BodyFraming::Chunked;
+    }
+    length.map_or(BodyFraming::NotReusable, BodyFraming::Length)
+}
+
+/// chunked 响应体的扫描结果。
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkScan {
+    /// 已收齐（含末块与 trailer 之后的空行）。
+    Done,
+    /// 还要再读。
+    More,
+    /// 畸形，或单块就已超过 [`MAX_WARMUP_BODY_BYTES`]。
+    Bad,
+}
+
+/// 扫一段 chunked 响应体（自头部结尾之后起）是否已收齐。
+fn scan_chunked(body: &[u8]) -> ChunkScan {
+    let mut pos = 0;
+    loop {
+        let Some(line_len) = find_subslice(&body[pos..], b"\r\n") else {
+            return ChunkScan::More;
+        };
+        // 块长之后可带 `;ext`，不解释。
+        let size = body[pos..pos + line_len]
+            .split(|b| *b == b';')
+            .next()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| usize::from_str_radix(hex.trim(), 16).ok());
+        let Some(size) = size.filter(|n| *n <= MAX_WARMUP_BODY_BYTES) else {
+            return ChunkScan::Bad;
+        };
+        pos += line_len + 2;
+        if size == 0 {
+            // 末块之后是零到多行 trailer，以空行收尾。
+            loop {
+                let Some(line_len) = find_subslice(&body[pos..], b"\r\n") else {
+                    return ChunkScan::More;
+                };
+                pos += line_len + 2;
+                if line_len == 0 {
+                    return ChunkScan::Done;
+                }
+            }
+        }
+        let next = pos + size + 2;
+        if body.len() < next {
+            return ChunkScan::More;
+        }
+        if &body[pos + size..next] != b"\r\n" {
+            return ChunkScan::Bad;
+        }
+        pos = next;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -263,7 +386,8 @@ pub trait WarmTunnel {
     /// 在隧道上发一次 GET，读到「**响应头收齐**」为止（不等 body —— 那才是 TTFB 的定义，
     /// 与 mihomo `client.Do` 收齐响应头即返回同口径）。
     ///
-    /// 返回 `Some(是否 2xx)`；`None` = 传输错 / 对端过早关闭 / 响应头畸形 / 超 [`MAX_HEAD_BYTES`]。
+    /// 返回响应的状态码（**含非 2xx**，是否可接受由调用方用 [`is_acceptable_status`] 判）；
+    /// `Err` = 传输错 / 对端过早关闭 / 响应头畸形 / 超 [`MAX_HEAD_BYTES`]。
     ///
     /// # 调用两次的判据（见模块文档②，有 sing 源码为证）
     ///
@@ -273,7 +397,13 @@ pub trait WarmTunnel {
     ///
     /// 第二次的增量成本：隧道已建、TLS 已握手，只是在一条就绪 socket 上多一个请求往返（≈1 RTT），
     /// 且与第一次共用同一个 8s 总预算，不放大不可达节点的封顶耗时。
-    fn get(&mut self) -> impl Future<Output = Option<bool>> + Send;
+    fn get(&mut self) -> impl Future<Output = Result<u16, TunnelError>> + Send;
+
+    /// 把**刚收齐响应头的那一次**响应的响应体消费完，使下一次 `get()` 面对的是一条干净的连接。
+    ///
+    /// 只给预热那次用：计时那次只量到响应头收齐，不读响应体。消费量以 [`MAX_WARMUP_BODY_BYTES`]
+    /// 为界；排不干净（见 [`TunnelError::NotReusable`]）即报错，由调用方判预热失败。
+    fn drain_body(&mut self) -> impl Future<Output = Result<(), TunnelError>> + Send;
 }
 
 /// 隧道上的 HTTP/1.1 请求-响应循环（明文 socket 与隧道内 TLS 流共用同一份实现）。
@@ -299,15 +429,55 @@ impl<S> WarmTunnel for TunnelConn<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    async fn get(&mut self) -> Option<bool> {
+    async fn get(&mut self) -> Result<u16, TunnelError> {
         // **整段清空**（不是只切掉上一次的响应头）：上一次响应的 body 残余绝不含本次响应数据
         // —— 本次请求下一行才发出去。只切响应头会让自配「非 204 带 body」端点的 body（含空行）
         // 污染本次判定、把值塌成 ≈0ms。对齐 上游 `SpeedTestService.ts:1302-1307`。
         self.buf.clear();
-        self.conn.write_all(&self.request).await.ok()?;
-        self.conn.flush().await.ok()?;
-        let code = read_response_status(&mut self.conn, &mut self.buf).await?;
-        Some(is_acceptable_status(code))
+        let sent = async {
+            self.conn.write_all(&self.request).await?;
+            self.conn.flush().await
+        };
+        sent.await.map_err(|_| TunnelError::Transport)?;
+        read_response_status(&mut self.conn, &mut self.buf)
+            .await
+            .ok_or(TunnelError::Transport)
+    }
+
+    async fn drain_body(&mut self) -> Result<(), TunnelError> {
+        // `get()` 刚返回 `Ok` ⇒ 缓冲里必有一个收齐的响应头；取不到即按传输错处理，不押注调用序。
+        let (start, end) = response_head_range(&self.buf).ok_or(TunnelError::Transport)?;
+        let framing = body_framing(&self.buf[start..end]);
+        let mut chunk = [0u8; READ_CHUNK];
+        loop {
+            let body = &self.buf[end..];
+            match framing {
+                BodyFraming::Empty => return Ok(()),
+                BodyFraming::NotReusable => return Err(TunnelError::NotReusable),
+                BodyFraming::Length(n) if n > MAX_WARMUP_BODY_BYTES => {
+                    return Err(TunnelError::NotReusable)
+                }
+                BodyFraming::Length(n) if body.len() >= n => return Ok(()),
+                BodyFraming::Length(_) => {}
+                BodyFraming::Chunked => match scan_chunked(body) {
+                    ChunkScan::Done => return Ok(()),
+                    ChunkScan::Bad => return Err(TunnelError::NotReusable),
+                    ChunkScan::More if body.len() > MAX_WARMUP_BODY_BYTES => {
+                        return Err(TunnelError::NotReusable)
+                    }
+                    ChunkScan::More => {}
+                },
+            }
+            let n = self
+                .conn
+                .read(&mut chunk)
+                .await
+                .map_err(|_| TunnelError::Transport)?;
+            if n == 0 {
+                return Err(TunnelError::Transport); // 对端在响应体收齐前关闭
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
     }
 }
 
@@ -321,10 +491,17 @@ pub enum SpeedTestTunnel {
 }
 
 impl WarmTunnel for SpeedTestTunnel {
-    async fn get(&mut self) -> Option<bool> {
+    async fn get(&mut self) -> Result<u16, TunnelError> {
         match self {
             Self::Plain(c) => c.get().await,
             Self::Tls(c) => c.get().await,
+        }
+    }
+
+    async fn drain_body(&mut self) -> Result<(), TunnelError> {
+        match self {
+            Self::Plain(c) => c.drain_body().await,
+            Self::Tls(c) => c.drain_body().await,
         }
     }
 }
@@ -370,34 +547,42 @@ pub async fn open_tunnel(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     target: &SpeedTestTarget,
-) -> Option<SpeedTestTunnel> {
-    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.ok()?;
+) -> Result<SpeedTestTunnel, TunnelError> {
+    let io = |_| TunnelError::Transport;
+    let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .map_err(io)?;
     // 关 Nagle：小请求的 TTFB 不该被 delayed-ACK / 合包拖慢（上游 `socket.setNoDelay(true)`）。
     let _ = sock.set_nodelay(true);
 
     sock.write_all(target.connect_request(auth).as_bytes())
         .await
-        .ok()?;
-    sock.flush().await.ok()?;
+        .map_err(io)?;
+    sock.flush().await.map_err(io)?;
 
     let mut buf = Vec::new();
-    let code = read_response_status(&mut sock, &mut buf).await?;
+    let code = read_response_status(&mut sock, &mut buf)
+        .await
+        .ok_or(TunnelError::Transport)?;
     if !is_acceptable_status(code) {
         // 代理拒绝建隧道（典型 502 = 出站拨不通）→ 该节点本轮不可测，上层记 -1。
-        return None;
+        return Err(TunnelError::ConnectStatus(code));
     }
     // 200 之后缓冲里的任何残余都是代理抢发的非请求数据（sing 的 CONNECT 腿写完 200 就交棒，
     // 不会再写）→ 与 上游 一致地丢弃（node 的 'connect' 事件同样把 `head` 参数弃之不用）。
 
     if target.https {
-        let connector = tokio_rustls::TlsConnector::from(tls_client_config()?);
+        let config = tls_client_config().ok_or(TunnelError::Transport)?;
         let server_name = rustls::pki_types::ServerName::try_from(target.sni_host())
-            .ok()?
+            .map_err(|_| TunnelError::Transport)?
             .to_owned();
-        let tls = connector.connect(server_name, sock).await.ok()?;
-        return Some(SpeedTestTunnel::Tls(Box::new(TunnelConn::new(tls, target))));
+        let tls = tokio_rustls::TlsConnector::from(config)
+            .connect(server_name, sock)
+            .await
+            .map_err(io)?;
+        return Ok(SpeedTestTunnel::Tls(Box::new(TunnelConn::new(tls, target))));
     }
-    Some(SpeedTestTunnel::Plain(TunnelConn::new(sock, target)))
+    Ok(SpeedTestTunnel::Plain(TunnelConn::new(sock, target)))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -522,14 +707,15 @@ pub(crate) mod mock_proxy {
         pub(crate) delay: Duration,
         /// 原样写回的响应字节（含状态行与 `\r\n\r\n`）。
         pub(crate) raw: &'static str,
+        /// 写完 `raw` 之后停一拍再写的后半段：让响应跨过客户端的读边界分两段到达。
+        pub(crate) tail: Option<&'static str>,
+        /// 写完之后直接关连接（响应体没给够就断）。
+        pub(crate) hang_up: bool,
     }
 
     impl GetReply {
         pub(crate) fn ok() -> Self {
-            Self {
-                delay: Duration::ZERO,
-                raw: "HTTP/1.1 204 No Content\r\n\r\n",
-            }
+            Self::raw("HTTP/1.1 204 No Content\r\n\r\n")
         }
         pub(crate) fn delayed(ms: u64) -> Self {
             Self {
@@ -541,9 +727,27 @@ pub(crate) mod mock_proxy {
             Self {
                 delay: Duration::ZERO,
                 raw,
+                tail: None,
+                hang_up: false,
+            }
+        }
+        /// 分两段到达：先写 `head`，停一拍，再写 `tail`。
+        pub(crate) fn split(head: &'static str, tail: &'static str) -> Self {
+            Self {
+                tail: Some(tail),
+                ..Self::raw(head)
+            }
+        }
+        pub(crate) fn hanging_up(self) -> Self {
+            Self {
+                hang_up: true,
+                ..self
             }
         }
     }
+
+    /// 两段之间停多久：远大于回环上一次读写的往返，客户端必然先读完前半段。
+    const SPLIT_PAUSE: Duration = Duration::from_millis(50);
 
     /// mock 代理脚本。
     pub(crate) struct Script {
@@ -637,6 +841,15 @@ pub(crate) mod mock_proxy {
                     tokio::time::sleep(reply.delay).await;
                 }
                 if sock.write_all(reply.raw.as_bytes()).await.is_err() {
+                    return;
+                }
+                if let Some(tail) = reply.tail {
+                    tokio::time::sleep(SPLIT_PAUSE).await;
+                    if sock.write_all(tail.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                if reply.hang_up {
                     return;
                 }
             }

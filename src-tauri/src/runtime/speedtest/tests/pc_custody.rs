@@ -144,7 +144,7 @@ impl Script {
                 &h.deps,
                 &three_nodes(),
                 &|| false,
-                |_| std::future::pending::<Option<u32>>(),
+                |_| std::future::pending::<Measured>(),
                 &mut |_, _| {},
             )
             .await
@@ -761,7 +761,7 @@ async fn actual_native_production_batches_retire_exit_zero_and_seven_and_admit_s
                 &h.deps,
                 &three_nodes(),
                 &|| false,
-                |_| std::future::pending::<Option<u32>>(),
+                |_| std::future::pending::<Measured>(),
                 &mut |event, payload| events.push((event.to_owned(), payload)),
             )
             .await;
@@ -1520,7 +1520,7 @@ async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
         &h.deps,
         &nodes,
         &|| false,
-        |_| std::future::ready(Some(1)),
+        |_| std::future::ready(Ok(1)),
         &mut emit,
     );
     tokio::pin!(future);
@@ -1542,7 +1542,7 @@ async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
             &h.deps,
             &nodes,
             &|| false,
-            |_| std::future::ready(Some(1)),
+            |_| std::future::ready(Ok(1)),
             &mut |_, _| {}
         )
         .await,

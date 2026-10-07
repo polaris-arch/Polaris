@@ -1855,6 +1855,8 @@
     "speedTestTooManyNaive": "Слишком много узлов naive выбрано для одного ядра теста скорости: каждому узлу naive нужен свой сетевой движок, и ядро запускает их по очереди. За один раз — не более примерно {{max}}; выберите меньше узлов naive и тестируйте партиями.",
     "speedTestCoreExited": "Ядро теста скорости завершилось",
     "speedTestCoreUnresponsive": "Ядро теста скорости не отвечает",
+    "speedTestCancelled": "Тест скорости отменён",
+    "speedTestPreempted": "Тест скорости прерван другим тестом",
     "speedTestNotApplicable": "Тест недоступен",
     "speedTestInterruptedSummary": "Проверено {{tested}}/{{total}} узлов; остальные сохранили прежние значения",
     "speedTestResume": "Продолжить оставшиеся",

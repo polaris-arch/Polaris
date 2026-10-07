@@ -1855,6 +1855,8 @@
     "speedTestTooManyNaive": "تعداد نودهای naive انتخاب‌شده برای یک هستهٔ تست سرعت بیش از حد است: هر نود naive به موتور شبکهٔ جداگانه نیاز دارد و هسته آن‌ها را یکی‌یکی راه‌اندازی می‌کند. هر بار حداکثر حدود {{max}} عدد؛ نودهای naive کمتری انتخاب کنید و تست را در چند دسته انجام دهید.",
     "speedTestCoreExited": "هستهٔ تست سرعت خارج شد",
     "speedTestCoreUnresponsive": "هستهٔ تست سرعت پاسخ نمی‌دهد",
+    "speedTestCancelled": "تست سرعت لغو شد",
+    "speedTestPreempted": "تست سرعت با تست دیگری متوقف شد",
     "speedTestNotApplicable": "قابل تست نیست",
     "speedTestInterruptedSummary": "{{tested}}/{{total}} نود کامل شد؛ بقیه مقدار قبلی را نگه داشتند",
     "speedTestResume": "ادامهٔ موارد باقی‌مانده",

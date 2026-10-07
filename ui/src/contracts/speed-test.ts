@@ -34,8 +34,62 @@ export type SpeedTestOutcome = 'completed' | 'interrupted';
  * - `core_exited`：本机的测速临时核在测量途中自己退出了。下一步是**看日志页 `sing-box` 来源里
  *   那段 `speedtest-core` 的行**（后端已把临时核的 stdout/stderr 排空进日志）。
  * - `core_unresponsive`：核还活着但已不再接受连接（连败满一窗后复探失败）。同上。
+ * - `cancelled`：本轮经取消句柄被取消。未测的节点缺席，可续测。
+ * - `preempted`：本轮被更高优先级的测速抢占。同上。
  */
-export type SpeedTestInterruptReason = 'superseded' | 'core_exited' | 'core_unresponsive';
+export type SpeedTestInterruptReason =
+  | 'superseded'
+  | 'core_exited'
+  | 'core_unresponsive'
+  | 'cancelled'
+  | 'preempted';
+
+/** 单节点失败时所处的阶段：热切、建隧道、预热（第一次 GET）、计时（第二次 GET）。 */
+export type SpeedTestFailurePhase = 'select' | 'connect' | 'warmup' | 'measure';
+
+/** 单节点失败的成因。`rejected` = 热切没成功，或预热后的连接不可复用。 */
+export type SpeedTestFailureKind = 'timeout' | 'transport' | 'http_status' | 'rejected';
+
+/** 「真的测了，没有通过」的阶段与成因（`latency === -1` 时随结果事件带出）。 */
+export interface SpeedTestFailure {
+  phase: SpeedTestFailurePhase;
+  kind: SpeedTestFailureKind;
+  /** 仅 `kind === 'http_status'` 时有。 */
+  httpStatus?: number;
+}
+
+/** 承载这次测量的核。`temp` 即「未连接测量」，不带世代。 */
+export type SpeedTestInstance =
+  | { kind: 'main'; generation: number; startTime: number | null }
+  | { kind: 'temp' };
+
+/**
+ * 逐节点结果的身份块（后端 `commands/speedtest.rs::ResultIdentity`）。与 `measurementContext` 并存。
+ *
+ * 值为 `null` 的字段语义是「未知 / 不适用」，不是「未变」：`networkEpoch` 在移动端恒为 `null`。
+ */
+export interface SpeedTestResultIdentity {
+  /** 运行号，十进制字符串，与顶层 `runId` 同一序列。 */
+  run: string;
+  /** 本轮内的事件序号（结果、进度、终态共用一个计数，严格递增）。 */
+  seq: number;
+  origin: 'manual' | 'failover' | 'schedule' | 'companion';
+  /** 调用方自带的不透明标签，原样回显。 */
+  scope: string | null;
+  /** `candidate` = 只测指定节点；`system` = 经本机代理入站，走用户的完整路由与 DNS。 */
+  path: 'candidate' | 'system';
+  metric: 'warm_ttfb_v1';
+  /** 测速 URL 的 sha256（不出原文）。 */
+  urlDigest: string;
+  /** `disconnected` = 经停止态临时核测得（未连接测量）。 */
+  context: 'connected' | 'disconnected';
+  instance: SpeedTestInstance;
+  configDigest: string | null;
+  nodeFingerprint: string | null;
+  networkEpoch: number | null;
+  /** 后端出结果那一刻的 Unix 毫秒。 */
+  measuredAt: number;
+}
 
 /** Emitted by the ready producer, before target measurement starts. */
 export interface SpeedTestMeasurementContext {
@@ -47,6 +101,8 @@ export interface SpeedTestMeasurementContext {
 
 export interface SpeedTestCountProgress {
   runId?: string;
+  /** 本轮内的事件序号；旧后端没有。 */
+  seq?: number;
   tested: number;
   ok: number;
   total: number;
@@ -58,9 +114,13 @@ export type SpeedTestProgressPayload = SpeedTestCountProgress
   | { runId: string; phase: 'measuring'; measurementContext: SpeedTestMeasurementContext };
 
 export interface SpeedTestResultPayload {
+  /** 只有手动发起的前台运行才带；被动结果（出口伴测等）的运行号在 `identity.run`。 */
   runId?: string;
   serverId: string;
   latency: number;
+  status?: 'ok' | 'failed';
+  failure?: SpeedTestFailure;
+  identity?: SpeedTestResultIdentity;
   measurementContext?: SpeedTestMeasurementContext | null;
 }
 
@@ -104,6 +164,8 @@ export interface SpeedTestInvokeResult {
  */
 export interface SpeedTestDonePayload {
   runId?: string;
+  /** 本轮最后一个事件序号；旧后端没有。 */
+  seq?: number;
   measurementContext?: SpeedTestMeasurementContext | null;
   outcome: SpeedTestOutcome;
   /** 已出值的节点数（含真实 -1）。 */

@@ -2151,6 +2151,8 @@
     "speedTestTooManyNaive": "本輪選取的 naive 節點太多，單一測速核心帶不動：每個 naive 節點都要單獨啟動一個網路引擎，且由核心逐個串列啟動。一次最多約 {{max}} 個，請減少本輪 naive 節點後分批測速。",
     "speedTestCoreExited": "測速核心已結束",
     "speedTestCoreUnresponsive": "測速核心無回應",
+    "speedTestCancelled": "測速已取消",
+    "speedTestPreempted": "測速已被另一輪測速打斷",
     "speedTestNotApplicable": "不支援測速",
     "speedTestInterruptedSummary": "已完成 {{tested}}/{{total}} 節點，其餘保留原值",
     "speedTestResume": "繼續剩餘",

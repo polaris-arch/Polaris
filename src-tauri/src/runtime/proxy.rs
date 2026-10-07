@@ -1505,6 +1505,9 @@ pub struct ProxyRuntime {
     /// 本进程 tailnet 文件成功写入/失败尝试的单调代；变更后不再宣称 startupReady。
     tailnet_file_write_epoch: AtomicU64,
     tailnet_file_write_lock: Mutex<()>,
+    /// 网络代次：每处置一次去抖后的网络变化自增一次（见 `network_monitor`）。
+    /// 只读面是 [`Self::network_epoch`]。
+    network_epoch: AtomicU64,
     /// 系统代理 controller + marker 生命周期 + residual 会话门闩的唯一 owner。
     /// 同步 OS 操作的 blocking 隔离与幂等门控全部收敛在 `proxy/system_takeover.rs`。
     system_proxy: SystemProxyTakeover,
@@ -1746,6 +1749,7 @@ impl ProxyRuntime {
             observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),
+            network_epoch: AtomicU64::new(0),
             tailnet_file_write_lock: Mutex::new(()),
             system_proxy: SystemProxyTakeover::new(proxy_clearer),
             tunnel_conflicts: RwLock::new(tunnel_conflict::TunnelConflictSnapshot::NotProbed),
@@ -1824,6 +1828,17 @@ impl ProxyRuntime {
             // modified），与测速「新」一侧的 5 维公式不同 ⇒ 恒不等 ⇒ 全员恒 dirty、整个波前恒被免测。
             fingerprints: snap.dirty_fingerprints,
         })
+    }
+
+    /// 当前网络代次。`None` = **未知**（不是「未变」）。
+    ///
+    /// 只有起了通用网络变化 watcher 的平台才有来源；Android / iOS 的网络变化由原生侧直接喂给进程内
+    /// libbox、没有推到 Rust 的腿，故恒为 `None`。测速侧用它判「一次测量有没有跨过网络变化」；
+    /// 让本函数恒返 `None` 即关掉那条判据。
+    #[must_use]
+    pub fn network_epoch(&self) -> Option<u64> {
+        cfg!(any(target_os = "macos", target_os = "linux", windows))
+            .then(|| self.network_epoch.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// 运行核回环探针/更新入站的一次性凭据（Android：本次起核生成；桌面 / 未运行：`None`）。

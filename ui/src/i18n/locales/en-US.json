@@ -2151,6 +2151,8 @@
     "speedTestTooManyNaive": "Too many naive nodes selected for one speed-test core: each naive node needs its own network engine and the core starts them one by one. Test at most about {{max}} at a time — select fewer naive nodes and run the test in batches.",
     "speedTestCoreExited": "Speed-test core exited",
     "speedTestCoreUnresponsive": "Speed-test core stopped responding",
+    "speedTestCancelled": "Speed test cancelled",
+    "speedTestPreempted": "Speed test interrupted by another test",
     "speedTestNotApplicable": "Not testable",
     "speedTestInterruptedSummary": "Completed {{tested}}/{{total}} nodes; the rest keep prior values",
     "speedTestResume": "Resume remaining",

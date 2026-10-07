@@ -1725,6 +1725,17 @@ impl ProxyRuntime {
         Ok(Some(ticket))
     }
 
+    /// 起核就绪时捕获的**已发射配置**摘要（只读）。只在就绪凭据仍属于 `generation` 那一代核时
+    /// 给出：换代之后旧摘要不得被当成新核的。
+    pub(crate) fn ready_main_emission_digest(&self, generation: u64) -> Option<String> {
+        self.ready_main
+            .read()
+            .ok()?
+            .as_ref()
+            .filter(|core| core.generation == generation)
+            .map(|core| core.emission_digest.clone())
+    }
+
     pub(crate) fn check_ready_main(
         &self,
         ticket: &ReadyMainTicket,

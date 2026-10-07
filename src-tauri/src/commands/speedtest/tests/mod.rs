@@ -35,7 +35,7 @@ fn normal_main_speed_holds_real_run_identity_before_permission_and_rereads_after
         "pub async fn server_speed_test(",
     );
     let ready = body.find("proxy.await_normal_main(binding).await").unwrap();
-    assert!(body.find("SpeedTestGuard::acquire()").unwrap() < ready);
+    assert!(body.find("SpeedTestGuard::acquire(").unwrap() < ready);
     assert!(body.find("next_speed_test_run_id(").unwrap() < ready);
     let measurement = &body[ready..];
     assert!(
@@ -246,19 +246,19 @@ fn all_server_ids_tolerates_missing_or_malformed() {
 
 // ── 单飞闸（去重）────────────────────────────────────────────────────────────
 
-/// 抢占后二次抢占被拒；释放后可再抢——去重的核心不变式。打断（compare_exchange 写反 / Drop 不复位）
-/// → 本测转红：那等于「并发不拦」或「测一次后永久熄火」。本测用全局 static，仅本测触碰该 flag（其余
-/// 测速测走 plan_speed_test/all_server_ids 纯函数，不碰 flag），无并行干扰。
-#[test]
-fn speed_test_guard_is_single_flight() {
-    let g1 = SpeedTestGuard::acquire();
+/// 抢占后二次抢占被拒；释放后可再抢——去重的核心不变式。打断（占用不登记 / Drop 不复位）
+/// → 本测转红：那等于「并发不拦」或「测一次后永久熄火」。用本地的闸实例，不碰进程级那一个。
+#[tokio::test]
+async fn speed_test_guard_is_single_flight() {
+    let gate = SpeedTestGate::new();
+    let g1 = gate.acquire(SpeedTestOrigin::Manual).await;
     assert!(g1.is_some(), "闸空应可抢占");
     assert!(
-        SpeedTestGuard::acquire().is_none(),
+        gate.acquire(SpeedTestOrigin::Manual).await.is_none(),
         "已被占用应拒绝并发抢占"
     );
     drop(g1);
-    let g2 = SpeedTestGuard::acquire();
+    let g2 = gate.acquire(SpeedTestOrigin::Manual).await;
     assert!(g2.is_some(), "释放后应可再次抢占");
     drop(g2);
 }
@@ -1024,8 +1024,10 @@ async fn drive_waves_completes_when_never_superseded() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1044,8 +1046,10 @@ async fn drive_waves_records_genuine_select_failure_as_minus_one() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |slot, _| async move { slot != 0 }, // 槽 0 热切失败
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1063,8 +1067,10 @@ async fn drive_waves_interrupts_at_wave_head() {
         &two_waves(),
         3,
         &superseded_at(1),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1082,8 +1088,10 @@ async fn drive_waves_interrupts_after_select_without_faking_minus_one() {
         &two_waves(),
         3,
         &superseded_at(2),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { false }, // 超代导致的热切失败
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1104,8 +1112,10 @@ async fn drive_waves_discards_in_flight_measurements_after_transition() {
         &two_waves(),
         3,
         &superseded_at(3),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(999_u32) }, // 跨代量出来的值
+        |_| async { Ok(999_u32) }, // 跨代量出来的值
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1127,8 +1137,10 @@ async fn drive_waves_keeps_measured_prefix_on_later_interruption() {
         &two_waves(),
         3,
         &superseded_at(5), // 第一波（波首+热切后+两节点）四次检查过后，第二波波首命中
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |_, _| {},
         &[10000, 10001],
     )
@@ -1179,8 +1191,10 @@ async fn done_event_pending_is_intended_minus_measured() {
         &two_waves(),
         3,
         &superseded_at(5), // 同上：第二波波首命中
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |ev, payload| events.push((ev.to_string(), payload)),
         &[10000, 10001],
     )
@@ -1212,8 +1226,10 @@ async fn done_event_on_a_completed_round_has_no_pending() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |ev, payload| events.push((ev.to_string(), payload)),
         &[10000, 10001],
     )
@@ -1239,12 +1255,14 @@ async fn a_genuine_minus_one_is_not_pending() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
         |port| async move {
             if port == 10000 {
-                None // 真实超时 → -1
+                Err(TIMED_OUT) // 真实超时 → -1
             } else {
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
         &mut |ev, payload| events.push((ev.to_string(), payload)),
@@ -1270,8 +1288,10 @@ async fn drive_waves_emits_result_and_progress_per_node() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
-        |_| async { Some(120_u32) },
+        |_| async { Ok(120_u32) },
         &mut |ev, _| events.push(ev.to_string()),
         &[10000, 10001],
     )
@@ -1309,6 +1329,8 @@ async fn drive_waves_reports_each_node_as_soon_as_it_finishes() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true },
         move |port| {
             let mlog = std::sync::Arc::clone(&mlog);
@@ -1318,7 +1340,7 @@ async fn drive_waves_reports_each_node_as_soon_as_it_finishes() {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     mlog.lock().unwrap().push("b-measured".to_string());
                 }
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
         &mut |ev, payload| {
@@ -1361,12 +1383,14 @@ async fn drive_waves_progress_counter_is_strictly_monotonic() {
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         |_, _| async { true }, // 全部热切成功
         |port| async move {
             if port == 10000 {
-                None // 真实超时 → -1，不计入 ok
+                Err(TIMED_OUT) // 真实超时 → -1，不计入 ok
             } else {
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
         &mut |ev, payload| {
@@ -1405,6 +1429,8 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
         &two_waves(),
         3,
         &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
         move |_, tag: String| {
             let slog = std::sync::Arc::clone(&slog);
             async move {
@@ -1419,7 +1445,7 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
                 tokio::time::sleep(Duration::from_millis(if port == 10000 { 20 } else { 200 }))
                     .await;
                 mlog.lock().unwrap().push(format!("m-end:{port}"));
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
         &mut |_, _| {},
@@ -1487,7 +1513,7 @@ impl FakeTunnel {
 }
 
 impl WarmTunnel for FakeTunnel {
-    fn get(&mut self) -> impl std::future::Future<Output = Option<bool>> + Send {
+    fn get(&mut self) -> impl std::future::Future<Output = Result<u16, TunnelError>> + Send {
         let d = self
             .steps
             .get(self.calls)
@@ -1499,8 +1525,12 @@ impl WarmTunnel for FakeTunnel {
         }
         async move {
             tokio::time::sleep(d).await;
-            Some(true)
+            Ok(204)
         }
+    }
+
+    async fn drain_body(&mut self) -> Result<(), TunnelError> {
+        Ok(())
     }
 }
 
@@ -1513,14 +1543,21 @@ fn budgets() -> (Duration, Duration) {
 }
 
 /// 立刻建成、每次 `get()` 都返回固定值的假隧道（非 2xx / 传输错两条腿用）。
-struct ConstTunnel(Option<bool>);
+struct ConstTunnel(Result<u16, TunnelError>);
 
 impl WarmTunnel for ConstTunnel {
-    fn get(&mut self) -> impl std::future::Future<Output = Option<bool>> + Send {
+    fn get(&mut self) -> impl std::future::Future<Output = Result<u16, TunnelError>> + Send {
         let v = self.0;
         async move { v }
     }
+
+    async fn drain_body(&mut self) -> Result<(), TunnelError> {
+        Ok(())
+    }
 }
+
+/// 测量闭包的「真实超时」夹具。
+const TIMED_OUT: MeasureFailure = MeasureFailure::new(FailPhase::Measure, FailKind::Timeout);
 
 /// 🔴 **两段各有各的预算**（本条**取代**了旧的 `warm_and_measured_share_one_total_timeout`）。
 ///
@@ -1538,9 +1575,9 @@ impl WarmTunnel for ConstTunnel {
 #[tokio::test(start_paused = true)]
 async fn cold_and_reuse_phases_have_independent_budgets() {
     let (cold, reuse) = budgets();
-    let out = measure_warm_ttfb(cold, reuse, async { Some(FakeTunnel::new(&[5, 3])) }).await;
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(FakeTunnel::new(&[5, 3])) }).await;
     assert!(
-        out.is_some(),
+        out.is_ok(),
         "GET1 5s（≤冷 6s）+ GET2 3s（≤复用 4s）= 合计 8s：两段各自都不超预算 → 必须出值。\
              拿到 None 说明两段又被合成了一个总预算"
     );
@@ -1555,9 +1592,10 @@ async fn cold_and_reuse_phases_have_independent_budgets() {
 #[tokio::test(start_paused = true)]
 async fn the_reuse_phase_has_its_own_smaller_budget() {
     let (cold, reuse) = budgets();
-    let out = measure_warm_ttfb(cold, reuse, async { Some(FakeTunnel::new(&[1, 5])) }).await;
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(FakeTunnel::new(&[1, 5])) }).await;
     assert_eq!(
-        out, None,
+        out,
+        Err(TIMED_OUT),
         "GET2 5s 超出复用预算 4s → 必须判超时（拿到值说明第二段没有自己的预算，或用了冷段那份 6s）"
     );
 }
@@ -1581,13 +1619,22 @@ async fn a_cold_phase_timeout_never_sends_the_second_get() {
         let seen = std::sync::Arc::clone(&seen);
         measure_warm_ttfb(cold, reuse, async move {
             // GET1 睡 7s > 冷预算 6s ⇒ 冷段超时。
-            Some(FakeTunnel::counted(&[7, 1], &seen))
+            Ok(FakeTunnel::counted(&[7, 1], &seen))
         })
         .await
     };
     let spent = t0.elapsed();
 
-    assert_eq!(out, None, "冷建链超时 → 必须判超时");
+    assert_eq!(
+        out,
+        Err(MeasureFailure::new(FailPhase::Warmup, FailKind::Timeout)),
+        "冷建链超时 → 必须判超时，且成因写明是预热那一步超时"
+    );
+    assert_eq!(
+        spent,
+        Duration::from_millis(SPEED_TEST_COLD_TIMEOUT_MS),
+        "假时钟下，冷段超时的耗时恰为冷预算"
+    );
     assert_eq!(
         seen.load(Ordering::Relaxed),
         1,
@@ -1616,11 +1663,12 @@ async fn opening_the_tunnel_spends_the_cold_budget() {
     let t0 = Instant::now();
     let out = measure_warm_ttfb(cold, reuse, async {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        Some(FakeTunnel::new(&[2, 1]))
+        Ok(FakeTunnel::new(&[2, 1]))
     })
     .await;
     assert_eq!(
-        out, None,
+        out,
+        Err(MeasureFailure::new(FailPhase::Warmup, FailKind::Timeout)),
         "建隧道 5s + GET1 2s 超出冷预算 6s → 必须判超时（建隧道不得在计时器之外）"
     );
     assert!(
@@ -1633,8 +1681,8 @@ async fn opening_the_tunnel_spends_the_cold_budget() {
 #[tokio::test(start_paused = true)]
 async fn two_gets_within_both_budgets_still_yield_a_value() {
     let (cold, reuse) = budgets();
-    let out = measure_warm_ttfb(cold, reuse, async { Some(FakeTunnel::new(&[3, 3])) }).await;
-    assert!(out.is_some(), "GET1 3s（≤6s）+ GET2 3s（≤4s）→ 必须出值");
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(FakeTunnel::new(&[3, 3])) }).await;
+    assert!(out.is_ok(), "GET1 3s（≤6s）+ GET2 3s（≤4s）→ 必须出值");
 }
 
 /// 🔴 **计的是第二次 GET，不是第一次**（假时钟版；线级版见 `speedtest_tunnel` 的 mock 代理门）。
@@ -1647,7 +1695,7 @@ async fn two_gets_within_both_budgets_still_yield_a_value() {
 #[tokio::test(start_paused = true)]
 async fn measured_value_is_the_second_get_alone() {
     let (cold, reuse) = budgets();
-    let out = measure_warm_ttfb(cold, reuse, async { Some(FakeTunnel::new(&[3, 1])) })
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(FakeTunnel::new(&[3, 1])) })
         .await
         .expect("3s + 1s 在两段预算内，应出值");
     assert!(
@@ -1657,29 +1705,41 @@ async fn measured_value_is_the_second_get_alone() {
     );
 }
 
-/// 非 2xx 与传输错都不计（`is_success` 语义随重构原样保留，绝不伪造数值）。
+/// 非 2xx 与传输错都不计（绝不伪造数值）。两次 GET 都回同一个值 ⇒ 失败落在先发的预热那一次。
 #[tokio::test]
 async fn non_success_status_and_transport_error_are_not_counted() {
     let (cold, reuse) = budgets();
     assert_eq!(
-        measure_warm_ttfb(cold, reuse, async { Some(ConstTunnel(Some(false))) }).await,
-        None,
+        measure_warm_ttfb(cold, reuse, async { Ok(ConstTunnel(Ok(403))) }).await,
+        Err(MeasureFailure::new(
+            FailPhase::Warmup,
+            FailKind::HttpStatus(403)
+        )),
         "非 2xx 不计"
     );
     assert_eq!(
-        measure_warm_ttfb(cold, reuse, async { Some(ConstTunnel(None)) }).await,
-        None,
+        measure_warm_ttfb(cold, reuse, async {
+            Ok(ConstTunnel(Err(TunnelError::Transport)))
+        })
+        .await,
+        Err(MeasureFailure::new(FailPhase::Warmup, FailKind::Transport)),
         "传输错不计"
     );
 }
 
-/// 隧道**建不起来**（CONNECT 失败 / 非 2xx / TLS 握手失败）→ `None`，绝不伪造数值。
+/// 隧道**建不起来**（CONNECT 失败 / 非 2xx / TLS 握手失败）→ 失败，绝不伪造数值。
 #[tokio::test]
 async fn a_tunnel_that_never_opens_yields_none() {
     let (cold, reuse) = budgets();
     assert_eq!(
-        measure_warm_ttfb(cold, reuse, async { Option::<ConstTunnel>::None }).await,
-        None
+        measure_warm_ttfb(cold, reuse, async {
+            Err::<ConstTunnel, _>(TunnelError::ConnectStatus(502))
+        })
+        .await,
+        Err(MeasureFailure::new(
+            FailPhase::Connect,
+            FailKind::HttpStatus(502)
+        ))
     );
 }
 
@@ -1741,7 +1801,7 @@ async fn production_measurement_entrypoint_speaks_connect_on_the_wire() {
     .await;
 
     let out = measure_via_local_proxy(port, None, DEFAULT_SPEED_TEST_URL).await;
-    assert!(out.is_some(), "mock 代理按脚本回 204，生产入口应出值");
+    assert!(out.is_ok(), "mock 代理按脚本回 204，生产入口应出值");
 
     let lines = observed.lock().unwrap().request_lines.clone();
     assert_eq!(
@@ -1810,7 +1870,9 @@ async fn fallback_completes_when_never_superseded() {
     let (results, outcome) = drive_fallback_measure(
         "srv-active",
         &superseded_at(0),
-        || async { Some(88_u32) },
+        &SpeedTestCancel::default(),
+        &|| None,
+        || async { Ok(88_u32) },
         &mut |ev, _| events.push(ev.to_string()),
     )
     .await;
@@ -1841,7 +1903,9 @@ async fn fallback_records_genuine_timeout_as_minus_one() {
     let (results, outcome) = drive_fallback_measure(
         "srv-active",
         &superseded_at(0),
-        || async { None }, // 真实超时/传输错
+        &SpeedTestCancel::default(),
+        &|| None,
+        || async { Err(TIMED_OUT) }, // 真实超时/传输错
         &mut |_, _| {},
     )
     .await;
@@ -1875,7 +1939,9 @@ async fn fallback_interrupts_and_omits_node_when_superseded_mid_measure() {
     let (results, outcome) = drive_fallback_measure(
         "srv-active",
         &superseded_at(1), // 第 1 次询问（= measure 之后那次）即超代
-        || async { Some(88_u32) },
+        &SpeedTestCancel::default(),
+        &|| None,
+        || async { Ok(88_u32) },
         &mut |ev, payload| events.push((ev.to_string(), payload)),
     )
     .await;
@@ -1919,7 +1985,9 @@ async fn fallback_superseded_failure_is_absent_not_minus_one() {
     let (results, outcome) = drive_fallback_measure(
         "srv-active",
         &superseded_at(1),
-        || async { None },
+        &SpeedTestCancel::default(),
+        &|| None,
+        || async { Err(TIMED_OUT) },
         &mut |_, _| {},
     )
     .await;
@@ -2077,17 +2145,25 @@ fn temp_core_leg_is_gated_on_main_core_absent_and_after_the_single_flight_latch(
         "pub async fn server_speed_test(",
     );
     let latch = body
-        .find("SpeedTestGuard::acquire()")
+        .find("SpeedTestGuard::acquire(")
         .expect("单飞闸锚点消失，守卫已失去判据");
     let gate = body
         .find("if !status.running {")
         .expect("临时核腿必须**只**在主核未运行时进（主核在跑时起第二个核 = 双会话事故）");
     let call = body
-        .find("run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id)")
+        .find("run_temp_core_speed_test(")
         .expect("临时核腿必须真被调用——不调等于这条能力不存在");
     assert!(
         latch < gate && gate < call,
         "序必须是「抢单飞闸 → 判主核未跑 → 起临时核」：闸在后 ⇒ 跨窗口连点能同时起两个临时核"
+    );
+    // 调用被格式化成多行后，入参改在去空白的函数体上钉：本轮的取消句柄必须真的传进去。
+    let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        compact.contains(
+            "run_temp_core_speed_test(&app,&state,&config,server_ids,&run_id,guard.cancel(),&mutdone,)"
+        ),
+        "临时核腿的入参须是本次请求的配置、节点集、运行号与取消句柄"
     );
 }
 
@@ -2208,7 +2284,7 @@ fn starting_main_core_is_treated_as_occupied_before_the_temp_core_leg() {
              `!status.running` 这个入口条件根本看不见它",
     );
     let call = body
-        .find("run_temp_core_speed_test(&app, &state, &config, server_ids, &run_id)")
+        .find("run_temp_core_speed_test(")
         .expect("临时核腿必须真被调用——不调等于这条能力不存在");
     assert!(
         gate < call,
@@ -2591,4 +2667,1077 @@ fn run_identity_is_monotonic_string_and_tag_preserves_existing_event_fields() {
         }
     }
     assert!(next_speed_test_run_id(&AtomicU64::new(u64::MAX)).is_none());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 预热（GET1）的处理规则：返回值必须过检查，响应体须在计时前排干净。
+// 两个回退常量的**两种取值**各有一条：严格取值经生产入口 `measure_warm_ttfb`（即常量本身），
+// 旧行为取值经 `measure_warm_ttfb_with` 显式传 `false`。把常量改回 `false`（= 丢弃 GET1 的返回值）
+// → 严格那几条转红。
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 按脚本逐次应答 `get()` 的假隧道；`get()` 与 `drain_body()` 的调用次数暴露到函数外。
+struct ScriptTunnel {
+    replies: Vec<Result<u16, TunnelError>>,
+    drain: Result<(), TunnelError>,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+    drains: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// `(get 次数, drain 次数)` 的观测面。
+type TunnelCalls = (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+fn script_tunnel(
+    replies: &[Result<u16, TunnelError>],
+    drain: Result<(), TunnelError>,
+) -> (ScriptTunnel, TunnelCalls) {
+    let calls: TunnelCalls = Default::default();
+    let tunnel = ScriptTunnel {
+        replies: replies.to_vec(),
+        drain,
+        gets: Arc::clone(&calls.0),
+        drains: Arc::clone(&calls.1),
+    };
+    (tunnel, calls)
+}
+
+impl WarmTunnel for ScriptTunnel {
+    async fn get(&mut self) -> Result<u16, TunnelError> {
+        let n = self.gets.fetch_add(1, Ordering::SeqCst);
+        self.replies[n]
+    }
+
+    async fn drain_body(&mut self) -> Result<(), TunnelError> {
+        self.drains.fetch_add(1, Ordering::SeqCst);
+        self.drain
+    }
+}
+
+fn failure(phase: FailPhase, kind: FailKind) -> Measured {
+    Err(MeasureFailure::new(phase, kind))
+}
+
+/// GET1 传输错（而 GET2 本会 2xx）：失败、阶段为预热、成因为传输错，且 `get()` 恰好一次。
+#[tokio::test]
+async fn warmup_transport_error_fails_the_node_without_a_second_get() {
+    let (cold, reuse) = budgets();
+    let (tunnel, (gets, _)) = script_tunnel(&[Err(TunnelError::Transport), Ok(204)], Ok(()));
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(tunnel) }).await;
+    assert_eq!(out, failure(FailPhase::Warmup, FailKind::Transport));
+    assert_eq!(gets.load(Ordering::SeqCst), 1, "预热失败后不得再发 GET2");
+}
+
+/// GET1 非 2xx（而 GET2 本会 2xx）：失败、阶段为预热、成因为状态码并附该码，`get()` 恰好一次。
+#[tokio::test]
+async fn warmup_non_2xx_fails_the_node_with_its_status_code() {
+    let (cold, reuse) = budgets();
+    let (tunnel, (gets, _)) = script_tunnel(&[Ok(403), Ok(204)], Ok(()));
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(tunnel) }).await;
+    assert_eq!(out, failure(FailPhase::Warmup, FailKind::HttpStatus(403)));
+    assert_eq!(gets.load(Ordering::SeqCst), 1, "预热失败后不得再发 GET2");
+}
+
+/// 预热检查取「沿用旧行为」：GET1 的传输错与非 2xx 都被丢弃，GET2 照发并出值。
+#[tokio::test]
+async fn legacy_warmup_setting_discards_the_first_get_result() {
+    let (cold, reuse) = budgets();
+    for first in [Err(TunnelError::Transport), Ok(403)] {
+        let (tunnel, (gets, drains)) = script_tunnel(&[first, Ok(204)], Ok(()));
+        let out = measure_warm_ttfb_with(false, true, cold, reuse, async { Ok(tunnel) }).await;
+        assert!(
+            out.is_ok(),
+            "旧行为：GET1 {first:?} 不阻止出值，实得 {out:?}"
+        );
+        assert_eq!(gets.load(Ordering::SeqCst), 2, "旧行为：GET2 照发");
+        assert_eq!(
+            drains.load(Ordering::SeqCst),
+            usize::from(first.is_ok()),
+            "没拿到响应头的那次没有响应体可排"
+        );
+    }
+}
+
+/// 预热响应体排不干净（连接不可复用）：失败、阶段为预热、成因为被拒，且不发 GET2。
+#[tokio::test]
+async fn warmup_body_that_cannot_be_drained_fails_the_node() {
+    let (cold, reuse) = budgets();
+    let (tunnel, (gets, drains)) =
+        script_tunnel(&[Ok(200), Ok(200)], Err(TunnelError::NotReusable));
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(tunnel) }).await;
+    assert_eq!(out, failure(FailPhase::Warmup, FailKind::Rejected));
+    assert_eq!(drains.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        1,
+        "连接不可复用时不得再发 GET2"
+    );
+}
+
+/// 响应体消费取「沿用旧行为」：根本不去排，GET2 照发并出值。
+#[tokio::test]
+async fn legacy_body_setting_never_drains() {
+    let (cold, reuse) = budgets();
+    let (tunnel, (gets, drains)) =
+        script_tunnel(&[Ok(200), Ok(200)], Err(TunnelError::NotReusable));
+    let out = measure_warm_ttfb_with(true, false, cold, reuse, async { Ok(tunnel) }).await;
+    assert!(out.is_ok(), "旧行为：不排响应体，实得 {out:?}");
+    assert_eq!(drains.load(Ordering::SeqCst), 0);
+    assert_eq!(gets.load(Ordering::SeqCst), 2);
+}
+
+/// 排响应体的耗时计入冷段：它卡住时在冷预算处判预热超时，不顺延到复用段。
+#[tokio::test(start_paused = true)]
+async fn draining_the_warmup_body_spends_the_cold_budget() {
+    struct StuckDrain;
+    impl WarmTunnel for StuckDrain {
+        async fn get(&mut self) -> Result<u16, TunnelError> {
+            Ok(200)
+        }
+        async fn drain_body(&mut self) -> Result<(), TunnelError> {
+            std::future::pending().await
+        }
+    }
+    let (cold, reuse) = budgets();
+    let t0 = Instant::now();
+    let out = measure_warm_ttfb(cold, reuse, async { Ok(StuckDrain) }).await;
+    assert_eq!(out, failure(FailPhase::Warmup, FailKind::Timeout));
+    assert_eq!(t0.elapsed(), cold);
+}
+
+/// 冷段超时卡在**建隧道**那一步时，阶段记为建链（与卡在预热分开）。
+#[tokio::test(start_paused = true)]
+async fn a_cold_timeout_while_opening_is_reported_as_connect() {
+    let (cold, reuse) = budgets();
+    let t0 = Instant::now();
+    let out = measure_warm_ttfb(cold, reuse, async {
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        Ok(FakeTunnel::new(&[0, 0]))
+    })
+    .await;
+    assert_eq!(out, failure(FailPhase::Connect, FailKind::Timeout));
+    assert_eq!(t0.elapsed(), cold, "不可达节点的耗时恰为冷预算");
+}
+
+/// GET2 的三种失败：阶段都是计时，成因各自正确。超时那一种见
+/// `the_reuse_phase_has_its_own_smaller_budget`。
+#[tokio::test]
+async fn measure_phase_failures_carry_their_cause() {
+    let (cold, reuse) = budgets();
+    for (second, kind) in [
+        (Ok(503), FailKind::HttpStatus(503)),
+        (Err(TunnelError::Transport), FailKind::Transport),
+    ] {
+        let (tunnel, (gets, _)) = script_tunnel(&[Ok(204), second], Ok(()));
+        let out = measure_warm_ttfb(cold, reuse, async { Ok(tunnel) }).await;
+        assert_eq!(out, failure(FailPhase::Measure, kind));
+        assert_eq!(gets.load(Ordering::SeqCst), 2);
+    }
+}
+
+/// 失败结果不带毫秒数：`latency` 恒为 -1，载荷里除阶段与成因外没有任何耗时。
+#[test]
+fn a_failed_result_carries_cause_but_no_milliseconds() {
+    let payload = speed_test_result_payload(
+        "n",
+        &failure(FailPhase::Warmup, FailKind::HttpStatus(403)),
+        Some(4),
+    );
+    assert_eq!(
+        payload,
+        json!({
+            "serverId": "n",
+            "latency": -1,
+            "status": "failed",
+            "failure": { "phase": "warmup", "kind": "http_status", "httpStatus": 403 },
+            "identity": { "networkEpoch": 4 },
+        })
+    );
+    let timed_out = speed_test_result_payload("n", &Err(TIMED_OUT), None);
+    assert_eq!(
+        timed_out["failure"],
+        json!({ "phase": "measure", "kind": "timeout" }),
+        "非状态码成因不带 httpStatus"
+    );
+    let ok = speed_test_result_payload("n", &Ok(120), None);
+    assert_eq!(ok["latency"], json!(120));
+    assert_eq!(ok["status"], json!("ok"));
+    assert!(ok.get("failure").is_none());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 身份块、序号与流的形态（经生产同一个盖章出口 `RunEvents::sink` 收集事件）。
+// ══════════════════════════════════════════════════════════════════════════
+
+const IDENTITY_KEYS: [&str; 13] = [
+    "run",
+    "seq",
+    "origin",
+    "scope",
+    "path",
+    "metric",
+    "urlDigest",
+    "context",
+    "instance",
+    "configDigest",
+    "nodeFingerprint",
+    "networkEpoch",
+    "measuredAt",
+];
+
+fn request(origin: SpeedTestOrigin, path: MeasurePath, targets: &[&str]) -> SpeedTestRequest {
+    SpeedTestRequest {
+        origin,
+        targets: ids(targets),
+        scope: None,
+        path,
+        url: DEFAULT_SPEED_TEST_URL.to_string(),
+    }
+}
+
+fn main_instance() -> CoreInstance {
+    CoreInstance::Main {
+        generation: 7,
+        start_time: Some(100),
+    }
+}
+
+fn pool_events(origin: SpeedTestOrigin) -> RunEvents {
+    RunEvents::new(
+        "41",
+        &request(origin, MeasurePath::Candidate, &["a", "b", "c"]),
+        main_instance(),
+        Some("cfg-digest".to_string()),
+        fp_map(&[("a", "fp-a"), ("b", "fp-b"), ("c", "fp-c")]),
+        None,
+    )
+}
+
+/// 跑一轮三节点的池路径，事件经盖章出口收集。
+async fn collect_pool_round(events: &mut RunEvents) -> Vec<(String, Value)> {
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    drive_pool_waves(
+        &two_waves(),
+        3,
+        &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| Some(5),
+        |_, _| async { true },
+        |port| async move {
+            if port == 10000 {
+                Err(TIMED_OUT)
+            } else {
+                Ok(120_u32)
+            }
+        },
+        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &[10000, 10001],
+    )
+    .await;
+    collected
+}
+
+fn result_events(collected: &[(String, Value)]) -> Vec<&Value> {
+    collected
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_RESULT)
+        .map(|(_, p)| p)
+        .collect()
+}
+
+fn assert_identity_complete(payload: &Value) {
+    let identity = payload["identity"]
+        .as_object()
+        .unwrap_or_else(|| panic!("逐节点结果必须带身份块：{payload}"));
+    for key in IDENTITY_KEYS {
+        assert!(identity.contains_key(key), "身份块缺 {key}：{payload}");
+    }
+    assert_eq!(identity.len(), IDENTITY_KEYS.len(), "身份块多出未登记的键");
+    assert_eq!(identity["metric"], json!("warm_ttfb_v1"));
+    assert!(identity["measuredAt"].as_u64().is_some_and(|ms| ms > 0));
+}
+
+/// 池路径：每条逐节点结果都带齐身份块，标 `connected` / `candidate`，手动运行顶层有 `runId`。
+#[tokio::test]
+async fn pool_results_carry_a_complete_connected_identity() {
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let collected = collect_pool_round(&mut events).await;
+    let results = result_events(&collected);
+    assert_eq!(results.len(), 3);
+    for payload in results {
+        assert_identity_complete(payload);
+        let identity = &payload["identity"];
+        assert_eq!(payload["runId"], json!("41"), "手动运行顶层带 runId");
+        assert_eq!(identity["run"], json!("41"));
+        assert_eq!(identity["origin"], json!("manual"));
+        assert_eq!(identity["path"], json!("candidate"));
+        assert_eq!(identity["context"], json!("connected"));
+        assert_eq!(
+            identity["instance"],
+            json!({ "kind": "main", "generation": 7, "startTime": 100 })
+        );
+        assert_eq!(identity["configDigest"], json!("cfg-digest"));
+        assert_eq!(identity["networkEpoch"], json!(5));
+        let id = payload["serverId"].as_str().unwrap();
+        assert_eq!(identity["nodeFingerprint"], json!(format!("fp-{id}")));
+        assert_eq!(
+            identity["urlDigest"],
+            json!(polaris_updater::sha256_hex(
+                DEFAULT_SPEED_TEST_URL.as_bytes()
+            )),
+            "只出摘要"
+        );
+        assert!(
+            !payload.to_string().contains("gstatic"),
+            "事件里不得出现测速 URL 原文"
+        );
+    }
+}
+
+/// 回退腿：身份块齐全，路径记 `system`，节点指纹留空（读不到起核快照）。
+#[tokio::test]
+async fn fallback_result_carries_a_system_path_identity() {
+    let mut events = RunEvents::new(
+        "42",
+        &request(
+            SpeedTestOrigin::Manual,
+            MeasurePath::System,
+            &["srv-active"],
+        ),
+        main_instance(),
+        None,
+        BTreeMap::new(),
+        None,
+    );
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    drive_fallback_measure(
+        "srv-active",
+        &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| None,
+        || async { Ok(88_u32) },
+        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+    )
+    .await;
+    let results = result_events(&collected);
+    assert_eq!(results.len(), 1);
+    assert_identity_complete(results[0]);
+    let identity = &results[0]["identity"];
+    assert_eq!(results[0]["runId"], json!("42"));
+    assert_eq!(identity["path"], json!("system"));
+    assert_eq!(identity["context"], json!("connected"));
+    assert_eq!(identity["nodeFingerprint"], Value::Null);
+    assert_eq!(identity["networkEpoch"], Value::Null, "未知就是 null");
+}
+
+/// 出口伴测：身份块齐全、运行号在身份块里，事件顶层**不带** `runId`，既有两个字段原样。
+#[test]
+fn companion_result_has_identity_but_no_top_level_run_id() {
+    let payload = companion_result_payload(
+        "43",
+        &request(SpeedTestOrigin::Companion, MeasurePath::System, &["srv"]),
+        main_instance(),
+        Some("cfg-digest".to_string()),
+        "srv",
+        66,
+        Some(2),
+    )
+    .expect("伴测成功腿必须产出一条结果");
+    assert_identity_complete(&payload);
+    assert!(
+        payload.get("runId").is_none(),
+        "被动结果顶层不带 runId：{payload}"
+    );
+    assert_eq!(payload["serverId"], json!("srv"));
+    assert_eq!(payload["latency"], json!(66));
+    let identity = &payload["identity"];
+    assert_eq!(identity["run"], json!("43"));
+    assert_eq!(identity["origin"], json!("companion"));
+    assert_eq!(identity["path"], json!("system"));
+    assert_eq!(identity["context"], json!("connected"));
+    assert_eq!(identity["networkEpoch"], json!(2));
+}
+
+/// 非手动来源只发逐节点结果：进度与终态被盖章出口丢弃，结果顶层不带 `runId`。
+#[tokio::test]
+async fn non_manual_runs_emit_results_only() {
+    let mut events = pool_events(SpeedTestOrigin::Schedule);
+    let collected = collect_pool_round(&mut events).await;
+    assert_eq!(collected.len(), 3, "只该有三条逐节点结果：{collected:?}");
+    for (event, payload) in &collected {
+        assert_eq!(event, EVENT_SPEED_TEST_RESULT);
+        assert!(payload.get("runId").is_none());
+        assert_eq!(payload["identity"]["run"], json!("41"));
+        assert_eq!(payload["identity"]["origin"], json!("schedule"));
+    }
+}
+
+/// 既有字段不变：去掉本次新增的可选键后，三类事件的载荷与改动前逐字相同。
+#[tokio::test]
+async fn existing_event_fields_are_unchanged_under_the_new_keys() {
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let collected = collect_pool_round(&mut events).await;
+    let legacy: Vec<(String, Value)> = collected
+        .into_iter()
+        .map(|(event, mut payload)| {
+            let object = payload.as_object_mut().unwrap();
+            for added in ["identity", "status", "failure", "seq"] {
+                object.remove(added);
+            }
+            (event, payload)
+        })
+        .collect();
+    let event = |name: &str, payload: Value| (name.to_string(), payload);
+    assert_eq!(
+        legacy,
+        vec![
+            // 第一波：槽 0（a）立刻失败，槽 1（b）出值；逐节点一对 result + progress。
+            event(
+                EVENT_SPEED_TEST_RESULT,
+                json!({"serverId":"a","latency":-1,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_PROGRESS,
+                json!({"tested":1,"ok":0,"total":3,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_RESULT,
+                json!({"serverId":"b","latency":120,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_PROGRESS,
+                json!({"tested":2,"ok":1,"total":3,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_RESULT,
+                json!({"serverId":"c","latency":-1,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_PROGRESS,
+                json!({"tested":3,"ok":1,"total":3,"runId":"41"})
+            ),
+            event(
+                EVENT_SPEED_TEST_DONE,
+                json!({"outcome":"completed","tested":3,"total":3,
+                    "serverIds":["a","b","c"],"pending":[],"runId":"41"})
+            ),
+        ]
+    );
+}
+
+fn seq_of(event: &str, payload: &Value) -> u64 {
+    let seq = if event == EVENT_SPEED_TEST_RESULT {
+        &payload["identity"]["seq"]
+    } else {
+        &payload["seq"]
+    };
+    seq.as_u64()
+        .unwrap_or_else(|| panic!("{event} 缺序号：{payload}"))
+}
+
+/// 序号：一轮内全部事件严格递增，终态带的就是实际最后一个；终态之后不再有事件。
+#[tokio::test]
+async fn sequence_numbers_increase_strictly_and_the_terminal_event_is_last() {
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let collected = collect_pool_round(&mut events).await;
+    let seqs: Vec<u64> = collected.iter().map(|(ev, p)| seq_of(ev, p)).collect();
+    assert_eq!(seqs, (1..=7).collect::<Vec<u64>>(), "三类事件共用一个计数");
+    let (last_event, last_payload) = collected.last().unwrap();
+    assert_eq!(last_event, EVENT_SPEED_TEST_DONE);
+    assert_eq!(seq_of(last_event, last_payload), 7);
+    for late in [
+        EVENT_SPEED_TEST_PROGRESS,
+        EVENT_SPEED_TEST_RESULT,
+        EVENT_SPEED_TEST_DONE,
+    ] {
+        assert!(
+            events
+                .stamp(late, json!({"serverId":"a","latency":1}))
+                .is_none(),
+            "终态之后 {late} 不得再发"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 取消、收口、抢占、网络代次。
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 永不返回的测量任务；析构时计数（证明任务真的结束了，而不只是被请求中止）。
+struct CountsDrop(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for CountsDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 取消：不等在飞测量走完，终态成因为「被取消」；未出值的节点缺席（没有 -1）；
+/// 终态发出那一刻在飞任务已全部析构；终态之后没有事件。
+#[tokio::test(start_paused = true)]
+async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
+    let cancel = SpeedTestCancel::default();
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_at_done = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let t0 = Instant::now();
+
+    let waves = two_waves();
+    let run = async {
+        drive_pool_waves(
+            &waves,
+            3,
+            &superseded_at(0),
+            &cancel,
+            &|| None,
+            |_, _| async { true },
+            |port| {
+                let guard = CountsDrop(Arc::clone(&dropped));
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    if port == 10000 {
+                        return Ok(120_u32); // a 在取消之前出值
+                    }
+                    let _guard = guard;
+                    std::future::pending::<Measured>().await // b 永不返回
+                }
+            },
+            &mut events.sink(|ev, payload| {
+                if ev == EVENT_SPEED_TEST_DONE {
+                    dropped_at_done.store(dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                if ev == EVENT_SPEED_TEST_RESULT {
+                    published.fetch_add(1, Ordering::SeqCst);
+                }
+                collected.push((ev.to_string(), payload));
+            }),
+            &[10000, 10001],
+        )
+        .await
+    };
+    let trigger = async {
+        // 等 a 的结果已发布、b 已在飞，再取消。
+        while started.load(Ordering::SeqCst) < 2 || published.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel(InterruptReason::Cancelled);
+    };
+    let ((results, outcome), ()) = tokio::join!(run, trigger);
+
+    assert_eq!(outcome, "interrupted");
+    assert_eq!(
+        t0.elapsed(),
+        Duration::ZERO,
+        "取消不得等任何计时器：在飞测量的 6s / 10s 一毫秒都没走"
+    );
+    assert_eq!(
+        results.keys().collect::<Vec<_>>(),
+        ["a"],
+        "未出值的节点缺席"
+    );
+    assert_eq!(results["a"], json!(120), "结果里没有 -1");
+    assert_eq!(
+        dropped_at_done.load(Ordering::SeqCst),
+        2,
+        "终态发出时，本波两个测量任务（含那个永不返回的）都已析构"
+    );
+    drop(events);
+    let (last_event, done) = collected.last().unwrap();
+    assert_eq!(last_event, EVENT_SPEED_TEST_DONE, "终态之后没有事件");
+    assert_eq!(done["reason"], json!("cancelled"));
+    assert_eq!(done["pending"], json!(["b", "c"]));
+    assert_eq!(result_events(&collected).len(), 1);
+}
+
+/// 取消句柄：成因只认第一次；`cancelled()` 对已取消的句柄立即返回。
+#[tokio::test]
+async fn cancel_handle_keeps_its_first_reason() {
+    let cancel = SpeedTestCancel::default();
+    assert_eq!(cancel.reason(), None);
+    cancel.cancel(InterruptReason::Preempted);
+    cancel.cancel(InterruptReason::Cancelled);
+    assert_eq!(cancel.reason(), Some(InterruptReason::Preempted));
+    assert_eq!(cancel.clone().cancelled().await, InterruptReason::Preempted);
+}
+
+/// 回退腿同样与取消竞速：在飞测量永不返回时，取消命中即以「被取消」收尾，节点缺席。
+#[tokio::test]
+async fn fallback_cancel_omits_the_node() {
+    let cancel = SpeedTestCancel::default();
+    cancel.cancel(InterruptReason::Cancelled);
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let (results, outcome) = drive_fallback_measure(
+        "srv-active",
+        &superseded_at(0),
+        &cancel,
+        &|| None,
+        std::future::pending::<Measured>,
+        &mut |ev, payload| collected.push((ev.to_string(), payload)),
+    )
+    .await;
+    assert_eq!(outcome, "interrupted");
+    assert!(results.is_empty());
+    let done = sole_done_payload(&collected);
+    assert_eq!(done["reason"], json!("cancelled"));
+    assert_eq!(done["pending"], json!(["srv-active"]));
+    assert_eq!(collected.len(), 1, "只有终态，没有逐节点事件");
+}
+
+/// 抢占：低优先级一轮持闸时手动请求到来 → 前者以「被抢占」收尾并释放，后者**随后**才拿到闸；
+/// 同级与更低的请求立即得到「忙」。
+#[tokio::test]
+async fn a_manual_request_preempts_a_lower_priority_run_and_waits_for_it() {
+    let gate = SpeedTestGate::new();
+    let order = Mutex::new(Vec::<&str>::new());
+    let low = gate
+        .acquire(SpeedTestOrigin::Failover)
+        .await
+        .expect("闸空应可占用");
+    assert!(
+        gate.acquire(SpeedTestOrigin::Failover).await.is_none(),
+        "同级请求立即得到「忙」"
+    );
+    assert!(
+        gate.acquire(SpeedTestOrigin::Schedule).await.is_none(),
+        "更低的请求立即得到「忙」"
+    );
+    assert_eq!(low.cancel().reason(), None, "被拒的请求不得取消持有者");
+
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let waves = two_waves();
+    let low_run = async {
+        // 持闸的一轮：测量永不返回，只能靠被抢占收口。
+        let (_, outcome) = drive_pool_waves(
+            &waves,
+            3,
+            &superseded_at(0),
+            low.cancel(),
+            &|| None,
+            |_, _| async { true },
+            |_| std::future::pending::<Measured>(),
+            &mut |ev, payload| collected.push((ev.to_string(), payload)),
+            &[10000, 10001],
+        )
+        .await;
+        order.lock().unwrap().push("low finished");
+        drop(low);
+        outcome
+    };
+    let high = async {
+        let guard = gate.acquire(SpeedTestOrigin::Manual).await;
+        order.lock().unwrap().push("high admitted");
+        guard
+    };
+    let (outcome, high_guard) = tokio::join!(low_run, high);
+
+    assert_eq!(outcome, "interrupted");
+    assert_eq!(sole_done_payload(&collected)["reason"], json!("preempted"));
+    assert!(collected
+        .iter()
+        .all(|(ev, _)| ev != EVENT_SPEED_TEST_RESULT));
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["low finished", "high admitted"],
+        "请求方必须等被抢占的一轮收口之后才开始"
+    );
+    let high_guard = high_guard.expect("被抢占的一轮释放后，手动请求必须拿到闸");
+    assert!(
+        gate.acquire(SpeedTestOrigin::Manual).await.is_none(),
+        "手动对手动仍是「忙」"
+    );
+    assert_eq!(high_guard.cancel().reason(), None, "同级请求不得取消持有者");
+}
+
+/// 优先级次序：手动 > 故障切换 > 周期计划。
+#[test]
+fn origin_priority_is_manual_over_failover_over_schedule() {
+    assert!(SpeedTestOrigin::Manual.priority() > SpeedTestOrigin::Failover.priority());
+    assert!(SpeedTestOrigin::Failover.priority() > SpeedTestOrigin::Schedule.priority());
+}
+
+/// 网络代次：某节点测量期间代次自增 → 只有它记为未测（缺席，不是 -1），整轮继续，
+/// 其后节点的身份块带新代次。
+#[tokio::test]
+async fn a_network_change_voids_only_the_measurement_that_straddles_it() {
+    let epoch = Arc::new(AtomicU64::new(3));
+    // K=1：逐个测，免得同波的另一个节点也跨过这次变化。
+    let waves = plan_waves(&pairs(&[("a", "tag-a"), ("b", "tag-b"), ("c", "tag-c")]), 1);
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let first = AtomicBool::new(true);
+    let (results, outcome) = drive_pool_waves(
+        &waves,
+        3,
+        &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| Some(epoch.load(Ordering::SeqCst)),
+        |_, _| async { true },
+        |_| {
+            let bump = first.swap(false, Ordering::SeqCst);
+            let epoch = Arc::clone(&epoch);
+            async move {
+                if bump {
+                    epoch.fetch_add(1, Ordering::SeqCst); // a 在飞时网络变了
+                }
+                Ok(120_u32)
+            }
+        },
+        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &[10000],
+    )
+    .await;
+
+    assert_eq!(outcome, "completed", "整轮继续，不是中断");
+    assert_eq!(
+        results.keys().collect::<Vec<_>>(),
+        ["b", "c"],
+        "跨代次的节点缺席"
+    );
+    let results = result_events(&collected);
+    assert_eq!(results.len(), 2);
+    for payload in results {
+        assert_eq!(payload["identity"]["networkEpoch"], json!(4), "带新代次");
+    }
+    let (_, done) = collected.last().unwrap();
+    assert_eq!(done["pending"], json!(["a"]), "未测的进 pending，不写 -1");
+    assert!(done.get("reason").is_none());
+}
+
+/// 代次比较：只有两侧都已知且不同才算变了。
+#[test]
+fn network_epoch_change_needs_both_sides_known() {
+    assert!(network_epoch_changed(Some(1), Some(2)));
+    assert!(!network_epoch_changed(Some(1), Some(1)));
+    assert!(!network_epoch_changed(None, Some(2)));
+    assert!(!network_epoch_changed(Some(1), None));
+    assert!(!network_epoch_changed(None, None));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 结果的消费判据：存放键、新旧、当前性、可选点。
+// ══════════════════════════════════════════════════════════════════════════
+
+fn identity(run: u64, seq: u64) -> ResultIdentity {
+    ResultIdentity {
+        run,
+        seq,
+        origin: SpeedTestOrigin::Manual,
+        scope: None,
+        path: MeasurePath::Candidate,
+        url_digest: "url-1".to_string(),
+        instance: main_instance(),
+        config_digest: None,
+        node_fingerprint: Some("fp".to_string()),
+        network_epoch: Some(5),
+        measured_at: 1,
+    }
+}
+
+const CURRENT: CurrentState<'static> = CurrentState {
+    main_generation: Some(7),
+    node_fingerprint: Some("fp"),
+    network_epoch: Some(5),
+};
+
+/// 存放键：路径或 URL 摘要不同的结果互不覆盖；同节点同路径同 URL 是同一个键。
+#[test]
+fn results_are_keyed_by_node_path_url_and_metric() {
+    let base = identity(1, 1);
+    let key = result_key("n", &base);
+    assert_eq!(key, result_key("n", &identity(9, 9)), "运行号不进键");
+    assert_eq!(key.metric, "warm_ttfb_v1");
+    assert_ne!(key, result_key("other", &base));
+    let other_url = ResultIdentity {
+        url_digest: "url-2".to_string(),
+        ..base.clone()
+    };
+    assert_ne!(key, result_key("n", &other_url), "不同 URL 摘要互不覆盖");
+    let system = ResultIdentity {
+        path: MeasurePath::System,
+        ..base
+    };
+    assert_ne!(key, result_key("n", &system), "不同路径互不覆盖");
+}
+
+/// 新旧：只接受运行号更大的；运行号相同时只接受序号更大的。
+#[test]
+fn only_a_newer_run_or_sequence_replaces_a_stored_result() {
+    let stored = identity(5, 3);
+    for (run, seq, accepted) in [
+        (4, 9, false), // 旧运行号被拒
+        (5, 2, false),
+        (5, 3, false), // 同一条不重复接受
+        (5, 4, true),
+        (6, 1, true),
+    ] {
+        assert_eq!(
+            supersedes_stored(&identity(run, seq), Some(&stored)),
+            accepted,
+            "run={run} seq={seq}"
+        );
+    }
+    assert!(supersedes_stored(&identity(1, 1), None), "空位直接接受");
+}
+
+/// 当前性与可选点的表：每行改一个维度。
+#[test]
+fn staleness_and_selectability_table() {
+    let ok: Measured = Ok(120);
+    let fresh = identity(1, 1);
+    assert_eq!(stale_reason(&fresh, &CURRENT), None);
+    assert!(is_selectable(&ok, &fresh, &CURRENT));
+
+    // 世代不符 / 核已不在运行 → 过期。
+    for main_generation in [Some(8), None] {
+        let current = CurrentState {
+            main_generation,
+            ..CURRENT
+        };
+        assert_eq!(stale_reason(&fresh, &current), Some(StaleReason::Instance));
+        assert!(!is_selectable(&ok, &fresh, &current));
+    }
+
+    // 节点参数改过 / 节点已不在配置里 → 过期。
+    for node_fingerprint in [Some("fp-edited"), None] {
+        let current = CurrentState {
+            node_fingerprint,
+            ..CURRENT
+        };
+        assert_eq!(
+            stale_reason(&fresh, &current),
+            Some(StaleReason::NodeFingerprint)
+        );
+        assert!(!is_selectable(&ok, &fresh, &current));
+    }
+
+    // 网络代次：两侧都已知且不同 → 过期；任一方未知 → 不据此判过期。
+    let moved = CurrentState {
+        network_epoch: Some(6),
+        ..CURRENT
+    };
+    assert_eq!(
+        stale_reason(&fresh, &moved),
+        Some(StaleReason::NetworkEpoch)
+    );
+    assert!(!is_selectable(&ok, &fresh, &moved));
+    let unknown_now = CurrentState {
+        network_epoch: None,
+        ..CURRENT
+    };
+    assert_eq!(stale_reason(&fresh, &unknown_now), None);
+    let unknown_then = ResultIdentity {
+        network_epoch: None,
+        ..fresh.clone()
+    };
+    assert_eq!(stale_reason(&unknown_then, &moved), None);
+    assert!(is_selectable(&ok, &unknown_then, &moved));
+
+    // 「未连接测量」：不按世代判过期，但永不可选。
+    let disconnected = ResultIdentity {
+        instance: CoreInstance::Temp,
+        ..fresh.clone()
+    };
+    assert_eq!(stale_reason(&disconnected, &CURRENT), None);
+    assert!(!is_selectable(&ok, &disconnected, &CURRENT));
+
+    // `system` 路径永不可选。
+    let system = ResultIdentity {
+        path: MeasurePath::System,
+        ..fresh.clone()
+    };
+    assert!(!is_selectable(&ok, &system, &CURRENT));
+
+    // 失败的结果不可选。
+    assert!(!is_selectable(&Err(TIMED_OUT), &fresh, &CURRENT));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 收尾、终态与闸的次序、生产接线。
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 非手动来源走完一轮：进度与终态不向外发，但**照样收尾**——汇总行出了，终态之后再来的结果被丢弃。
+/// 把收尾挪回来源过滤之后 → 汇总为空、迟到的结果照发，两条断言都转红。
+#[tokio::test]
+async fn a_non_manual_round_still_finishes_and_summarises() {
+    let mut events = pool_events(SpeedTestOrigin::Schedule);
+    assert!(events.summary.is_none(), "对照：一轮开始前没有汇总");
+    let collected = collect_pool_round(&mut events).await;
+    assert_eq!(collected.len(), 3, "对照：三条逐节点结果确实发了");
+
+    let line = events
+        .summary
+        .clone()
+        .expect("终态不向外发，也必须走到汇总出口");
+    assert!(
+        line.starts_with(
+            "测速一轮完成：run=41 origin=schedule context=connected outcome=completed reason=- \
+             请求 3 可测 3 成功 1 失败 2 {\"measure/timeout\": 2} 起测前跳过 [] 未测 0 耗时 "
+        ),
+        "汇总行：{line}"
+    );
+    assert!(line.ends_with("ms；失败样本 a, c"), "汇总行：{line}");
+
+    let late = speed_test_result_payload("c", &Ok(1), Some(5));
+    assert_eq!(
+        events.stamp(EVENT_SPEED_TEST_RESULT, late),
+        None,
+        "终态之后不再放行任何事件"
+    );
+}
+
+/// 手动来源走的是同一个汇总出口，且一轮只出这一行。
+#[tokio::test]
+async fn a_manual_round_summarises_through_the_same_exit() {
+    let mut events = pool_events(SpeedTestOrigin::Manual);
+    collect_pool_round(&mut events).await;
+    let line = events.summary.expect("手动一轮必须有汇总");
+    assert!(
+        line.starts_with("测速一轮完成：run=41 origin=manual context=connected outcome=completed "),
+        "汇总行：{line}"
+    );
+}
+
+/// **终态发出时单飞闸已经释放**：在终态的处理器里立刻再发起一次手动测速，必须拿到闸。
+/// 把 `release_then_emit` 里的两步对调 → 处理器里拿到的是「忙」，转红。
+#[tokio::test]
+async fn the_gate_is_already_free_when_the_terminal_event_goes_out() {
+    use futures::FutureExt;
+
+    let gate = SpeedTestGate::new();
+    let guard = gate
+        .acquire(SpeedTestOrigin::Manual)
+        .await
+        .expect("闸空应可占用");
+    assert!(
+        gate.acquire(SpeedTestOrigin::Manual).await.is_none(),
+        "对照：持闸期间再发起得到「忙」"
+    );
+
+    let mut seen: Vec<(Value, bool)> = Vec::new();
+    release_then_emit(guard, Some(json!({"outcome": "completed"})), |done| {
+        let again = gate
+            .acquire(SpeedTestOrigin::Manual)
+            .now_or_never()
+            .flatten();
+        seen.push((done, again.is_some()));
+    });
+    assert_eq!(seen, vec![(json!({"outcome": "completed"}), true)]);
+
+    // 没有终态可发（腿在起测前就返回了）时，闸照样释放。
+    let guard = gate
+        .acquire(SpeedTestOrigin::Manual)
+        .await
+        .expect("上一轮已释放");
+    release_then_emit(guard, None, |_| panic!("没有终态就不该发"));
+    assert!(gate.acquire(SpeedTestOrigin::Manual).await.is_some());
+}
+
+/// 取一个顶层函数的函数体：先把注释与字符串内容抹掉，再切片，再去空白（调用被格式化成多行后
+/// 入参仍可整段比对）。
+fn compact_production_fn(signature: &str) -> String {
+    let masked = polaris_source_probe::mask_comments_and_strings(
+        &crate::test_support::crate_source("commands/speedtest.rs"),
+    );
+    crate::commands::guard_scan::top_level_fn_body(&masked, signature)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// 🔵 **接线守卫**：四个生产入口各自的来源、实例、路径、取消句柄与终态出口。
+///
+/// 身份块与准入的行为测试喂的都是测试自己构造的运行身份与本地的闸，下面这些写错不会让它们转红：
+/// 临时核腿标成主核实例（停止态结果被当成「已连接」），两处准入的来源互换（手动可被后台抢占），
+/// 后台探测另起一个取消句柄（手动请求要等它自然跑完），某条腿绕过扣发直接把终态发出去。
+#[test]
+fn production_entries_wire_origin_instance_cancel_and_terminal() {
+    let temp = compact_production_fn("async fn run_temp_core_speed_test(");
+    let pool = compact_production_fn("async fn run_pool_speed_test(");
+    let manual = compact_production_fn("pub async fn server_speed_test(");
+    let failover = compact_production_fn("pub(crate) async fn probe_runtime_candidates(");
+
+    // 切点自检：每个切片恰含一处运行身份构造，且带着只属于该函数的锚点（切歪了会多出或缺失）。
+    for (name, body, own) in [
+        ("临时核腿", &temp, "TempCoreSession::run("),
+        ("池路径", &pool, "zero_testable_envelope("),
+        ("命令入口", &manual, "plan_speed_test("),
+        ("后台探测", &failover, "RuntimeProbeBatch::Busy;"),
+    ] {
+        assert_eq!(occurrences(body, "RunEvents::new("), 1, "{name}：切片不对");
+        assert_eq!(
+            occurrences(body, own),
+            1,
+            "{name}：切片不含自己的锚点 {own}"
+        );
+    }
+
+    // 临时核腿：手动来源、临时核实例（不带世代与配置摘要）、取消句柄进依赖、终态扣发。
+    assert!(temp.contains("origin:SpeedTestOrigin::Manual,"));
+    assert!(temp.contains("RunEvents::new(run_id,&request,CoreInstance::Temp,None,"));
+    assert_eq!(occurrences(&temp, "CoreInstance::Main"), 0);
+    assert!(temp.contains("deps.with_cancel(cancel.clone())"));
+    assert!(temp.contains("&mutevents.sink(hold_terminal(app,done)),"));
+
+    // 池路径：手动来源、候选路径、主核实例取本轮的世代基准与该世代的配置摘要。
+    assert!(pool.contains("origin:SpeedTestOrigin::Manual,"));
+    assert!(pool.contains("path:MeasurePath::Candidate,"));
+    assert!(pool.contains(
+        "RunEvents::new(run_id,&request,CoreInstance::Main{generation:gen0,\
+         start_time:proxy.status().start_time,},proxy.ready_main_emission_digest(gen0),\
+         targets.fingerprints.clone(),"
+    ));
+    assert_eq!(occurrences(&pool, "CoreInstance::Temp"), 0);
+    assert!(pool.contains("&superseded,cancel,&||proxy.network_epoch(),"));
+    assert!(pool.contains("&mutevents.sink(hold_terminal(app,done)),"));
+
+    // 命令入口：以手动来源准入；回退腿走 system 路径、主核实例；三条腿的终态都在放闸之后发。
+    assert_eq!(occurrences(&manual, "SpeedTestGuard::acquire("), 1);
+    assert!(manual.contains("SpeedTestGuard::acquire(SpeedTestOrigin::Manual).await"));
+    assert!(manual.contains("origin:SpeedTestOrigin::Manual,"));
+    assert!(manual.contains("path:MeasurePath::System,"));
+    assert!(manual.contains(
+        "RunEvents::new(&run_id,&request,CoreInstance::Main{generation:gen0,\
+         start_time:status.start_time,},proxy.ready_main_emission_digest(gen0),"
+    ));
+    assert_eq!(occurrences(&manual, "CoreInstance::Temp"), 0);
+    assert!(manual.contains("&superseded,guard.cancel(),&||proxy.network_epoch(),"));
+    assert!(manual.contains("context.as_ref(),guard.cancel(),&mutdone,)"));
+    assert!(manual.contains("&mutevents.sink(hold_terminal(&app,&mutdone)),"));
+    assert_eq!(
+        occurrences(&manual, "release_then_emit(guard,done,emit_done);"),
+        3,
+        "三条腿各一处：先放闸再发终态"
+    );
+    assert_eq!(
+        occurrences(&manual, "app.emit(EVENT_SPEED_TEST_DONE,"),
+        1,
+        "终态只经放闸之后的那一个出口发"
+    );
+
+    // 后台探测：以故障切换来源准入，测量用的是准入时发的那个取消句柄，不向外发事件。
+    assert_eq!(occurrences(&failover, "SpeedTestGuard::acquire("), 1);
+    assert!(failover.contains("SpeedTestGuard::acquire(SpeedTestOrigin::Failover).await"));
+    assert!(failover.contains("origin:SpeedTestOrigin::Failover,"));
+    assert!(failover.contains("&superseded,guard.cancel(),&||None,"));
+    assert!(failover.contains("&mutevents.sink(|_,_|{}),"));
+    assert_eq!(occurrences(&failover, "app.emit("), 0);
+
+    // 整份生产源码：取消句柄只在准入处新建一次，终态事件只有命令入口那一处直接发。
+    let whole: String = polaris_source_probe::mask_comments_and_strings(
+        &crate::test_support::crate_source("commands/speedtest.rs"),
+    )
+    .chars()
+    .filter(|ch| !ch.is_whitespace())
+    .collect();
+    assert_eq!(occurrences(&whole, "SpeedTestCancel::default()"), 1);
+    assert_eq!(occurrences(&whole, "app.emit(EVENT_SPEED_TEST_DONE,"), 1);
 }

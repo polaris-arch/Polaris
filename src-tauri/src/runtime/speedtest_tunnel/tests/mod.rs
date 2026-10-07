@@ -183,6 +183,15 @@ fn http_target() -> SpeedTestTarget {
 /// 测的是**线级报文形态与 socket 生命周期**，不测分段边界（那条在 `commands::speedtest` 的假时钟门里
 /// ——真 socket 与假时钟不能共存）。故这里两段注入同一个值，语义等价于原来的单一 `total`。
 async fn measure(port: u16, target: &SpeedTestTarget, budget: Duration) -> Option<u32> {
+    measure_detailed(port, target, budget).await.ok()
+}
+
+/// 同 [`measure`]，但保留失败的阶段与成因。
+async fn measure_detailed(
+    port: u16,
+    target: &SpeedTestTarget,
+    budget: Duration,
+) -> crate::commands::speedtest::Measured {
     crate::commands::speedtest::measure_warm_ttfb(budget, budget, open_tunnel(port, None, target))
         .await
 }
@@ -385,4 +394,223 @@ fn dangerous_tls_verifier_stays_in_this_module() {
         "不校验证书的 TLS verifier 只允许出现在测速隧道模块（其它链路要信任内容）。越界:\n{}",
         offenders.join("\n")
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 预热响应体的有界消费：定界判据（纯逻辑）+ 线级行为（回环 mock 代理）。
+// ══════════════════════════════════════════════════════════════════════════
+
+/// 响应体定界：没有响应体 / 定长 / chunked / 不可复用四种，头名与取值大小写不敏感。
+#[test]
+fn body_framing_follows_status_and_headers() {
+    for (head, expected) in [
+        ("HTTP/1.1 204 No Content\r\n\r\n", BodyFraming::Empty),
+        (
+            "HTTP/1.1 304 Not Modified\r\nETag: x\r\n\r\n",
+            BodyFraming::Empty,
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            BodyFraming::Length(5),
+        ),
+        (
+            "HTTP/1.1 200 OK\r\ncontent-length:0\r\n\r\n",
+            BodyFraming::Length(0),
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n",
+            BodyFraming::Chunked,
+        ),
+        // 没有可判定的长度：响应体只能靠关连接定界。
+        (
+            "HTTP/1.1 200 OK\r\nServer: x\r\n\r\n",
+            BodyFraming::NotReusable,
+        ),
+        // 对端声明要关连接：有长度也不可复用，204 也一样。
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: Close\r\n\r\n",
+            BodyFraming::NotReusable,
+        ),
+        (
+            "HTTP/1.1 204 No Content\r\nConnection: keep-alive, close\r\n\r\n",
+            BodyFraming::NotReusable,
+        ),
+        // 解析不出的长度不猜。
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: five\r\n\r\n",
+            BodyFraming::NotReusable,
+        ),
+    ] {
+        assert_eq!(body_framing(head.as_bytes()), expected, "{head:?}");
+    }
+}
+
+/// chunked 扫描：收齐 / 还要再读 / 畸形或单块超界。
+#[test]
+fn chunked_scan_distinguishes_done_more_and_bad() {
+    for (body, expected) in [
+        ("5\r\nhello\r\n0\r\n\r\n", ChunkScan::Done),
+        (
+            "5;ext=1\r\nhello\r\n0\r\nTrailer: x\r\n\r\n",
+            ChunkScan::Done,
+        ),
+        ("0\r\n\r\n", ChunkScan::Done),
+        ("", ChunkScan::More),
+        ("5\r\nhel", ChunkScan::More),
+        ("5\r\nhello\r\n", ChunkScan::More),
+        ("5\r\nhello\r\n0\r\n", ChunkScan::More), // 末块之后的空行还没到
+        ("zz\r\n", ChunkScan::Bad),
+        ("5\r\nhelloXX0\r\n\r\n", ChunkScan::Bad), // 块数据之后不是 CRLF
+        ("10001\r\n", ChunkScan::Bad),             // 单块 65537 字节，超过上界
+    ] {
+        assert_eq!(scan_chunked(body.as_bytes()), expected, "{body:?}");
+    }
+}
+
+fn warmup_failure(
+    kind: crate::commands::speedtest::FailKind,
+) -> crate::commands::speedtest::Measured {
+    Err(crate::commands::speedtest::MeasureFailure::new(
+        crate::commands::speedtest::FailPhase::Warmup,
+        kind,
+    ))
+}
+
+/// 预热响应带响应体（定长与 chunked 各一）：排干净之后再计时，照常出值。
+/// 响应体里故意放一个完整的假响应头 —— 不排的话，第二次的判定会锚到它上面。
+#[tokio::test]
+async fn warmup_body_is_drained_before_the_measured_get() {
+    for first in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nHTTP/1.1 500 X\r\n\r\n.",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nHTTP/1.1 500 X\r\n\r\n\r\n0\r\n\r\n",
+    ] {
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets: vec![GetReply::raw(first), GetReply::ok()],
+        })
+        .await;
+        let out = measure_detailed(port, &http_target(), Duration::from_secs(5)).await;
+        assert!(out.is_ok(), "响应体可排干净时应出值，实得 {out:?}（{first:?}）");
+        assert_eq!(observed.lock().unwrap().request_lines.len(), 3);
+    }
+}
+
+/// 预热响应的**响应头与响应体分段到达**：排空的读循环必须把后到的那段读完，再发第二次 GET。
+///
+/// 后半段里放一个完整的假响应头，并且它到得比第二次 GET 的真响应早。不排（或没读完就返回）的话，
+/// 第二次 GET 的判定会落在这个假头上，得到计时阶段的 500 —— 关掉排空，本测转红。
+/// 三种切法：定长体整段后到；chunked 的块长行被读边界切开；chunked 的块数据被切开。
+#[tokio::test]
+async fn a_warmup_body_arriving_in_a_later_segment_is_drained() {
+    for (head, tail) in [
+        (
+            "HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n",
+            "HTTP/1.1 500 X\r\n\r\n.",
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1",
+            "2\r\nHTTP/1.1 500 X\r\n\r\n\r\n0\r\n\r\n",
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nHT",
+            "TP/1.1 500 X\r\n\r\n\r\n0\r\n\r\n",
+        ),
+    ] {
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets: vec![GetReply::split(head, tail), GetReply::ok()],
+        })
+        .await;
+        let out = measure_detailed(port, &http_target(), Duration::from_secs(5)).await;
+        assert!(
+            out.is_ok(),
+            "后到的响应体应被排干净，实得 {out:?}（{head:?}）"
+        );
+        assert_eq!(observed.lock().unwrap().request_lines.len(), 3);
+    }
+}
+
+/// 响应体没给够对端就关了连接：预热阶段的传输错，不发第二次 GET。
+#[tokio::test]
+async fn a_peer_closing_mid_body_is_a_warmup_transport_error() {
+    let (port, observed) = spawn_mock_proxy(Script {
+        connect_reply: Some(OK_204),
+        gets: vec![
+            GetReply::split("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", "def").hanging_up(),
+        ],
+    })
+    .await;
+    let out = measure_detailed(port, &http_target(), Duration::from_secs(5)).await;
+    assert_eq!(
+        out,
+        warmup_failure(crate::commands::speedtest::FailKind::Transport)
+    );
+    assert_eq!(observed.lock().unwrap().request_lines.len(), 2);
+}
+
+/// 响应体迟迟不来：在冷段预算处以预热超时收口，不无限等。
+#[tokio::test]
+async fn a_body_that_never_arrives_times_out_in_the_warmup_phase() {
+    let (port, observed) = spawn_mock_proxy(Script {
+        connect_reply: Some(OK_204),
+        gets: vec![GetReply::raw(
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+        )],
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let out = measure_detailed(port, &http_target(), Duration::from_millis(300)).await;
+    assert_eq!(
+        out,
+        warmup_failure(crate::commands::speedtest::FailKind::Timeout)
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(observed.lock().unwrap().request_lines.len(), 2);
+}
+
+/// 预热响应的连接不可复用（声明关连接 / 没有可判定的长度 / 超过上界）：判预热失败，
+/// 且**不发第二次 GET**。
+#[tokio::test]
+async fn an_unreusable_warmup_response_fails_without_a_second_get() {
+    for first in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        "HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody until close",
+        "HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n",
+    ] {
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets: vec![GetReply::raw(first), GetReply::ok()],
+        })
+        .await;
+        let out = measure_detailed(port, &http_target(), Duration::from_secs(5)).await;
+        assert_eq!(
+            out,
+            warmup_failure(crate::commands::speedtest::FailKind::Rejected),
+            "{first:?}"
+        );
+        assert_eq!(
+            observed.lock().unwrap().request_lines.len(),
+            2,
+            "CONNECT + 一次 GET；预热失败后不得再发"
+        );
+    }
+}
+
+/// 预热那次回非 2xx：判预热失败并带出状态码，不发第二次 GET。
+#[tokio::test]
+async fn a_non_2xx_warmup_fails_with_its_status_on_the_wire() {
+    let (port, observed) = spawn_mock_proxy(Script {
+        connect_reply: Some(OK_204),
+        gets: vec![
+            GetReply::raw("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"),
+            GetReply::ok(),
+        ],
+    })
+    .await;
+    let out = measure_detailed(port, &http_target(), Duration::from_secs(5)).await;
+    assert_eq!(
+        out,
+        warmup_failure(crate::commands::speedtest::FailKind::HttpStatus(403))
+    );
+    assert_eq!(observed.lock().unwrap().request_lines.len(), 2);
 }
