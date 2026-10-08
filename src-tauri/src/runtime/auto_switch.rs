@@ -404,6 +404,64 @@ pub fn decide_tick(input: TickInput) -> TickAction {
     }
 }
 
+/// 一个候选在一轮真实代理链探测里的结局。
+///
+/// 「读回不符被跳过」与「没通」分开：前者是读回判定量到的不是这个节点，数值与失败都不属于它。
+/// 其余拿不到值的情形（本机探针口连不上、测量任务异常）与引入读回之前一样算没通。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateProbe {
+    /// 测出了延迟（毫秒）。
+    Measured(u32),
+    /// 真测了，没通。
+    Failed,
+    /// 读回判定量到的不是它，被「强制」档跳过：本轮没有属于它的结果。
+    MismatchSkipped,
+}
+
+/// 一轮候选探测的裁定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// 有可用候选，取延迟最低的。
+    Best(CandidateLatency),
+    /// 每个候选都真测了，没有一个通。
+    AllFailed,
+    /// 没有测出可用候选，但有 `mismatch_skipped` 个候选因读回不符被跳过：不能据此说它们不可用。
+    Inconclusive { mismatch_skipped: usize },
+}
+
+/// 由逐候选的结局裁定这一轮（纯函数）。`candidates` 是 `(id, name)`，按候选原序；表里没有的
+/// 候选按没通算。
+#[must_use]
+pub fn judge_probes(
+    candidates: &[(String, String)],
+    probes: &BTreeMap<String, CandidateProbe>,
+) -> ProbeVerdict {
+    let outcome = |id: &str| probes.get(id).copied().unwrap_or(CandidateProbe::Failed);
+    let measured: Vec<CandidateLatency> = candidates
+        .iter()
+        .filter_map(|(id, name)| match outcome(id) {
+            CandidateProbe::Measured(ms) => Some(CandidateLatency {
+                id: id.clone(),
+                name: name.clone(),
+                latency_ms: Some(ms),
+            }),
+            CandidateProbe::Failed | CandidateProbe::MismatchSkipped => None,
+        })
+        .collect();
+    if let Some(best) = select_best_candidate(&measured) {
+        return ProbeVerdict::Best(best.clone());
+    }
+    let mismatch_skipped = candidates
+        .iter()
+        .filter(|(id, _)| outcome(id) == CandidateProbe::MismatchSkipped)
+        .count();
+    if mismatch_skipped > 0 {
+        ProbeVerdict::Inconclusive { mismatch_skipped }
+    } else {
+        ProbeVerdict::AllFailed
+    }
+}
+
 /// 候选节点及其测得延迟（上游 `{ server, latency }`）。`latency_ms=None` = 不可达。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateLatency {

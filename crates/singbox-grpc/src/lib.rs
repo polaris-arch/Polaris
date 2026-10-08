@@ -82,6 +82,17 @@ pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 只取首帧（reset 全量），间隔实际不影响结果。
 const SNAPSHOT_INTERVAL_NS: i64 = 1_000_000_000;
 
+/// 单会话 Connection 事件流的单帧解码上限：64 MiB（tonic 默认是 4 MiB）。
+///
+/// 这条流的首帧躲不开全量：内核的 `SubscribeConnections` 进循环前无条件发一帧「全部活动连接 +
+/// 保留的已关闭连接」，请求里只有一个 `interval` 字段，没有「只要新增」的选项
+/// （`daemon/started_service.go` 的 `SubscribeConnections` / `buildInitialConnectionState`）。
+/// 已关闭连接内核封顶 1000 条（`common/trafficcontrol/manager.go` 的 `closedConnectionsLimit`），
+/// 活动连接没有上限。单条记录的大头是规则描述、域名与进程路径，按 0.5 KiB 估，默认的 4 MiB 只够
+/// 约 8000 条，重度使用下首帧会被拒、整条流报错；64 MiB 够约 13 万条，同时仍是一个有界值，
+/// 回环上一个异常的对端不能让本进程无限分配。
+pub const CONNECTION_EVENTS_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// sing-box 管理 API 端点描述（host + port）。本地端点 → h2c（明文 HTTP/2）。
 #[derive(Clone, Debug)]
 pub struct Endpoint {
@@ -347,6 +358,43 @@ impl SingBoxApiClient {
             Ok(r) => r,
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
+    }
+
+    /// 订阅 Connection 事件流的**单会话**版本：不自动重连，流断即结束。
+    ///
+    /// 给必须绑定在同一个核实例上的读取用：[`Self::subscribe_connections`] 断开后会重建，重建出来的
+    /// 流可能已经连到换代后的核。首帧是全量（活动连接加内核保留的已关闭连接），其后的新增与关闭
+    /// 即时推送；`interval_ns` 只管流量增量帧的节奏。建流带 [`SNAPSHOT_TIMEOUT`] 兜底。
+    ///
+    /// 单帧解码上限取 [`CONNECTION_EVENTS_MAX_FRAME_BYTES`]（理由见该常量）。
+    pub async fn connection_events_once(
+        &self,
+        interval_ns: i64,
+    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+        let mut c = self
+            .client()
+            .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
+        let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
+            interval: interval_ns,
+        }));
+        match tokio::time::timeout(SNAPSHOT_TIMEOUT, c.subscribe_connections(req)).await {
+            Ok(stream) => Ok(stream?.into_inner()),
+            Err(_) => Err(ClientError::SnapshotTimeout),
+        }
+    }
+
+    /// 连到 `endpoint` 并开一条单会话的 Connection 事件流（[`Self::connection_events_once`]）。
+    ///
+    /// 只用调用方给的端点与 secret，不读任何运行态：流属于调用方指定的那个核，核换代后它自己结束。
+    pub async fn connection_events_at(
+        endpoint: Endpoint,
+        secret: impl Into<String>,
+        interval_ns: i64,
+    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+        Self::connect(endpoint, secret)
+            .await?
+            .connection_events_once(interval_ns)
+            .await
     }
 
     /// 取各出站 group 的**运行期选择**快照（`SubscribeGroups` 首帧），带 [`SNAPSHOT_TIMEOUT`] 兜底。

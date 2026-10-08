@@ -76,8 +76,11 @@ export interface SpeedTestResultIdentity {
   origin: 'manual' | 'failover' | 'schedule' | 'companion';
   /** 调用方自带的不透明标签，原样回显。 */
   scope: string | null;
-  /** `candidate` = 只测指定节点；`system` = 经本机代理入站，走用户的完整路由与 DNS。 */
-  path: 'candidate' | 'system';
+  /**
+   * `candidate` = 只测指定节点；`system` = 经本机代理入站，走用户的完整路由与 DNS；
+   * `selected` = 钉到当前选中的出口、不经用户规则（没有 `mixed-in` 入站的平台上的回退测量与出口伴测）。
+   */
+  path: 'candidate' | 'system' | 'selected';
   metric: 'warm_ttfb_v1';
   /** 测速 URL 的 sha256（不出原文）。 */
   urlDigest: string;
@@ -89,6 +92,46 @@ export interface SpeedTestResultIdentity {
   networkEpoch: number | null;
   /** 后端出结果那一刻的 Unix 毫秒。 */
   measuredAt: number;
+}
+
+/**
+ * 这条测量连接在内核里实际受的路由策略：`slot_pin` 钉到探针槽，`node_pin` 钉到临时核里的节点，
+ * `selected_pin` 钉到当前选中的出口，`user_route` 不钉、走用户的全部规则。
+ */
+export type SpeedTestRoutePolicy = 'slot_pin' | 'node_pin' | 'selected_pin' | 'user_route';
+
+/**
+ * 读回的结论：`confirmed` 承载出站就是请求的节点；`mismatch` 不是；`unverified` 限时内没读到；
+ * `static` 由配置结构保证、没有运行期对账（临时核）；`observed` 没有指定节点、读到了实际承载者。
+ */
+export type SpeedTestBindingVerdict = 'confirmed' | 'mismatch' | 'unverified' | 'static' | 'observed';
+
+/**
+ * 逐节点结果的 `binding` 块（后端 `commands/speedtest.rs::Binding`）：请求的是谁、实际由谁承载。
+ * 全部字段可选。读回只到叶子出站为止：它内部的前置链、实际拨到的远端地址、拨号成败与 DNS 路径都读不到。
+ */
+export interface SpeedTestResultBinding {
+  policy?: SpeedTestRoutePolicy;
+  /** 请求的节点在运行核里的 tag；没有指定节点的测量没有这一项。 */
+  requestedTag?: string;
+  requestedKind?: 'outbound' | 'endpoint';
+  /** 读回关闭时没有这一项及其后各项。 */
+  verdict?: SpeedTestBindingVerdict;
+  /** 结论的依据：内核的连接记录、生成配置的结构，或没有依据。 */
+  source?: 'connection' | 'config' | 'none';
+  /** 实际承载这条连接的叶子出站。 */
+  carriedBy?: { tag: string; type: string };
+  /** 出站链，从叶子到路由选中的出站。 */
+  chain?: string[];
+  /** 命中的路由规则描述；没有命中任何规则时为空串。 */
+  rule?: string;
+  /** 这条规则在用户配置里的名字（起核时的映射里有才带）。 */
+  ruleName?: string;
+  /** 承载出站自带的前置出站 tag。来自生成配置，不是读回。 */
+  staticDetour?: string;
+  /** 目的地址与嗅探域名的 sha256（不出原文）。 */
+  destinationDigest?: string;
+  domainDigest?: string;
 }
 
 /** Emitted by the ready producer, before target measurement starts. */
@@ -121,6 +164,7 @@ export interface SpeedTestResultPayload {
   status?: 'ok' | 'failed';
   failure?: SpeedTestFailure;
   identity?: SpeedTestResultIdentity;
+  binding?: SpeedTestResultBinding;
   measurementContext?: SpeedTestMeasurementContext | null;
 }
 

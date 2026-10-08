@@ -1319,11 +1319,7 @@ impl ProxyRuntime {
                 .map_err(|error| StartError::from(error.to_string()))?,
             targets: final_targets(effective, emitted),
             status: status.clone(),
-            api_secret: saved
-                .get("clashApiSecret")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            api_secret: crate::runtime::management_api::clash_api_secret_in(saved),
             probe_ports: self
                 .speed_probe_targets()
                 .map(|targets| targets.pool_ports)

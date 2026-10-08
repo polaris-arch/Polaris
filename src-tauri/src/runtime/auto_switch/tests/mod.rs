@@ -1046,7 +1046,7 @@ fn probe_all_failed_early_exit_reports_with_the_same_code_and_latch() {
         "两处共用同一份文案常量，防措辞漂移（一处说得对、另一处还留着「或重启代理」这种空操作建议）",
     );
     let probe_exit = body
-        .find("select_best_candidate(&measured)")
+        .find("ProbeVerdict::AllFailed => {")
         .expect("探测早退锚点：本门若因改名找不到它，必须转红而不是静默放行");
     let tail = &body[probe_exit..];
     assert!(
@@ -1054,5 +1054,72 @@ fn probe_all_failed_early_exit_reports_with_the_same_code_and_latch() {
             && tail.contains("machine.claim_restart_blocked_report()")
             && tail.contains("code::AUTO_SWITCH_NEEDS_RESTART"),
         "探测全败的早退必须带上报：判据 `needs_restart > 0` + 同一个锁存 + 同一个码",
+    );
+}
+
+// ── judge_probes：读回不符被跳过与没通分开裁定 ──
+
+#[test]
+fn probe_verdict_separates_mismatch_skipped_from_failed() {
+    use CandidateProbe::{Failed, Measured, MismatchSkipped};
+    let named = |ids: &[&str]| -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| ((*id).to_string(), format!("name-{id}")))
+            .collect()
+    };
+    let probes = |list: &[(&str, CandidateProbe)]| -> BTreeMap<String, CandidateProbe> {
+        list.iter()
+            .map(|(id, probe)| ((*id).to_string(), *probe))
+            .collect()
+    };
+    // 有测出值的：取最低；并列取候选原序靠前的。被跳过与没通的都不参选。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b", "c", "d"]),
+            &probes(&[
+                ("a", Failed),
+                ("b", Measured(90)),
+                ("c", Measured(40)),
+                ("d", MismatchSkipped)
+            ])
+        ),
+        ProbeVerdict::Best(cand("c", Some(40)))
+    );
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b"]),
+            &probes(&[("a", Measured(40)), ("b", Measured(40))])
+        ),
+        ProbeVerdict::Best(cand("a", Some(40)))
+    );
+    // 全部没通。表里没有的候选（没拿到任何结果）与引入读回之前一样按没通算。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b"]),
+            &probes(&[("a", Failed), ("b", Failed)])
+        ),
+        ProbeVerdict::AllFailed
+    );
+    assert_eq!(
+        judge_probes(&named(&["a", "b", "c"]), &probes(&[("a", Failed)])),
+        ProbeVerdict::AllFailed
+    );
+    assert_eq!(
+        judge_probes(&named(&[]), &probes(&[])),
+        ProbeVerdict::AllFailed
+    );
+    // 有因读回不符被跳过的：不下「全部不可用」的结论。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b", "c"]),
+            &probes(&[
+                ("a", Failed),
+                ("b", MismatchSkipped),
+                ("c", MismatchSkipped)
+            ])
+        ),
+        ProbeVerdict::Inconclusive {
+            mismatch_skipped: 2
+        }
     );
 }

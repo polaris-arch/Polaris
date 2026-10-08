@@ -4046,3 +4046,218 @@ fn sixty_four_probe_slots_only_add_probe_pool_entries_to_the_config() {
         "探针池之外的部分不随槽位数变化"
     );
 }
+
+/// 一轮测速的读回流连哪个管理端点：持票据时恒是票据里的那一个（端口与 secret 都是），哪怕当前
+/// 运行态已经换了端口与 secret；没有票据时才取此刻运行核的。
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn readback_endpoint_stays_on_the_ticket_when_the_runtime_moves_on() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
+    let _server =
+        SelectorRpcServer::start(listener, "saved-secret", SelectorRpcCalls::default()).await;
+    let (runtime, _directory) = test_runtime();
+    let mut saved = two_node_config(7890, "node-a");
+    saved["clashApiSecret"] = serde_json::json!("saved-secret");
+    runtime.config.save_full(&saved).unwrap();
+    let (ticket, _emitted) = ticket_at_mock_rpc(&runtime, bound_port).await;
+    assert_eq!(
+        runtime.readback_endpoint(None),
+        Some((bound_port, "saved-secret".to_string())),
+        "对照：票据生成那一刻两者相同"
+    );
+
+    // 运行态换了端口与 secret（核换代）。
+    runtime.status.write().unwrap().clash_api_port = 30_202;
+    saved["clashApiSecret"] = serde_json::json!("next-secret");
+    runtime.config.save_full(&saved).unwrap();
+    assert_eq!(
+        runtime.readback_endpoint(Some(&ticket)),
+        Some((bound_port, "saved-secret".to_string()))
+    );
+    assert_eq!(
+        runtime.readback_endpoint(None),
+        Some((30_202, "next-secret".to_string()))
+    );
+    assert_eq!(
+        runtime.management_endpoint(),
+        runtime.readback_endpoint(None)
+    );
+
+    // 核停了：没有票据就没有端点；票据里的那一个不受影响。
+    runtime.status.write().unwrap().running = false;
+    assert_eq!(runtime.readback_endpoint(None), None);
+    assert!(runtime.readback_endpoint(Some(&ticket)).is_some());
+}
+
+/// 起核快照从**生成产物**里带出 endpoint 归类与各 tag 的前置出站，测速的静态取材原样读到它们
+/// 与规则名映射。
+#[cfg(not(target_os = "ios"))]
+#[test]
+fn switch_snapshot_carries_endpoint_tags_and_static_detours() {
+    let (runtime, _directory) = test_runtime();
+    let saved = two_node_config(7890, "node-a");
+    runtime.config.save_full(&saved).unwrap();
+    let effective: UserConfig = serde_json::from_value(saved.clone()).unwrap();
+    let deps = runtime.generate_deps(30_101, 0, 0, None, &[20_010], &saved, false);
+    let emitted = polaris_config_engine::builder::generate_sing_box_config(
+        &effective,
+        &BTreeMap::new(),
+        &deps,
+    )
+    .unwrap();
+    let baseline = ProxyRuntime::build_switch_snapshot(&effective, &emitted, &deps);
+    assert!(
+        baseline.endpoint_tags.is_empty(),
+        "对照：两个 ss 节点都不是 endpoint"
+    );
+    assert!(
+        baseline.static_detours.is_empty(),
+        "对照：没有节点带前置出站"
+    );
+
+    // 在产物上加一个带前置出站的 endpoint，并给 Node A 挂一个前置出站。
+    let mut raw = serde_json::to_value(&emitted).unwrap();
+    raw["endpoints"] = serde_json::json!([
+        { "type": "wireguard", "tag": "WG", "detour": "Node B" }
+    ]);
+    let node_a = raw["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| outbound["tag"] == "Node A")
+        .expect("产物里有 Node A");
+    node_a["detour"] = serde_json::json!("front");
+    let shaped = serde_json::from_value(raw).unwrap();
+    let mut snapshot = ProxyRuntime::build_switch_snapshot(&effective, &shaped, &deps);
+    assert_eq!(snapshot.endpoint_tags, BTreeSet::from(["WG".to_string()]));
+    assert_eq!(
+        snapshot.static_detours,
+        BTreeMap::from([
+            ("Node A".to_string(), "front".to_string()),
+            ("WG".to_string(), "Node B".to_string()),
+        ])
+    );
+
+    assert_eq!(
+        runtime.speed_binding_context(),
+        SpeedBindingContext::default(),
+        "没有快照 → 空"
+    );
+    snapshot.named_rule_by_raw.insert(
+        "domain=example.com => route(Node A)".to_string(),
+        polaris_stats_engine::RuleIdentity {
+            id: "rule-1".to_string(),
+            name: "我的规则".to_string(),
+        },
+    );
+    *runtime.switch_snapshot.write().unwrap() = Some(snapshot);
+    let context = runtime.speed_binding_context();
+    assert_eq!(context.endpoint_tags, BTreeSet::from(["WG".to_string()]));
+    assert_eq!(
+        context.static_detours.get("Node A").map(String::as_str),
+        Some("front")
+    );
+    assert_eq!(
+        context.rule_names,
+        BTreeMap::from([(
+            "domain=example.com => route(Node A)".to_string(),
+            "我的规则".to_string()
+        )])
+    );
+}
+
+/// 🔵 **源门**：管理 API secret 的读取点全部登记在案。取材面是运行时与命令层的全部生产源码，
+/// 两种读法都算：按键名读原始配置 JSON（字符串字面量），与读类型化配置上的同名字段。
+///
+/// 多出一处未登记的读取点、或某一处的次数变了，都转红：新读法要么并到单点上，要么带着
+/// 「取值源为什么不同」的理由登记进来。
+#[test]
+fn the_management_secret_has_a_single_reader() {
+    /// (路径, 字面量次数, 字段读取次数, 理由)
+    const READERS: &[(&str, usize, usize, &str)] = &[
+        (
+            "commands/config.rs",
+            5,
+            0,
+            "secret 的生成与回填方：读它是为了判断要不要生成，另有后端独写键的名单，都不是取来用。",
+        ),
+        (
+            "commands/server.rs",
+            0,
+            1,
+            "Tailscale 登录核的快照：读的是运行核**起核时**的那份配置（`running_config_snapshot`），\
+             登录核要连的是正在跑的那个核；当前已保存的配置在改了 secret 未重启时与它不同。",
+        ),
+        (
+            "runtime/management_api.rs",
+            1,
+            0,
+            "从原始配置 JSON 取这个键的单点。",
+        ),
+        (
+            "runtime/proxy/startup.rs",
+            0,
+            1,
+            "起核流程确认网格模式：读的是**正在起**的这份配置，此刻它还不是任何已提交的运行态。",
+        ),
+    ];
+    /// 类型化字段的读取：`.clash_api_secret` 后面不跟 `(`（那是同名方法的调用）。
+    fn field_reads(code: &str) -> usize {
+        code.match_indices(".clash_api_secret")
+            .filter(|(at, needle)| {
+                let rest = &code[at + needle.len()..];
+                let next = rest.chars().find(|ch| !ch.is_whitespace());
+                !rest.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                    && next != Some('(')
+            })
+            .count()
+    }
+    let mut found: Vec<(String, usize, usize)> = ["runtime", "commands"]
+        .into_iter()
+        .flat_map(|dir| {
+            crate::test_support::module_files(dir)
+                .into_iter()
+                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+        })
+        .filter_map(|(path, source)| {
+            let code = polaris_source_probe::mask_comments(&source);
+            let literals = code.matches("\"clashApiSecret\"").count();
+            let fields = field_reads(&code);
+            (literals + fields > 0).then_some((path, literals, fields))
+        })
+        .collect();
+    found.sort();
+    let registered: Vec<(String, usize, usize)> = READERS
+        .iter()
+        .map(|(path, literals, fields, _)| ((*path).to_string(), *literals, *fields))
+        .collect();
+    assert_eq!(found, registered, "管理 API secret 的读取点与登记不符");
+
+    // 切点自检：字段读取的判法认得出读取、认得出方法调用不是读取。
+    assert_eq!(field_reads("c.clash_api_secret.clone()"), 1);
+    assert_eq!(
+        field_reads("user_config.clash_api_secret\n    .as_deref()"),
+        1
+    );
+    assert_eq!(field_reads("self.clash_api_secret()"), 0);
+    assert_eq!(field_reads("x.clash_api_secret_in(saved)"), 0);
+
+    // 端点取法的单点：命令层不再自己拼端点。
+    let endpoints: Vec<String> = ["runtime", "commands"]
+        .into_iter()
+        .flat_map(|dir| {
+            crate::test_support::module_files(dir)
+                .into_iter()
+                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+        })
+        .filter(|(_, source)| {
+            polaris_source_probe::mask_comments(source).contains("fn management_endpoint(")
+        })
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        endpoints,
+        vec!["runtime/proxy/management_api.rs".to_string()]
+    );
+}

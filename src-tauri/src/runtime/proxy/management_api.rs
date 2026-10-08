@@ -11,7 +11,7 @@ use polaris_config_engine::user_config::app_config::UserConfig;
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 use serde_json::Value;
 
-use crate::runtime::management_api::GrpcManagementApi;
+use crate::runtime::management_api::{current_clash_api_secret, GrpcManagementApi};
 
 use super::ProxyRuntime;
 
@@ -44,25 +44,35 @@ impl ProxyRuntime {
         }
     }
 
+    /// 运行核的管理端点（端口与 secret）。核未运行或端口未解析 → `None`。
+    ///
+    /// 与 [`management_api`](Self::management_api) 取的是同一组值：测速的读回流与探针换选因此连到
+    /// 同一个端点。
+    pub(crate) fn management_endpoint(&self) -> Option<(u16, String)> {
+        let status = self.status();
+        (status.running && status.clash_api_port != 0)
+            .then(|| (status.clash_api_port, self.clash_api_secret()))
+    }
+
+    /// 一轮测速的读回流要连的管理端点：持票据的运行用票据里的那一个（与它的探针换选同一个），
+    /// 其余用此刻运行核的那一个。票据在手时不读当前运行态：核换代后流不会跟到新核上。
+    pub(crate) fn readback_endpoint(
+        &self,
+        ticket: Option<&super::ReadyMainTicket>,
+    ) -> Option<(u16, String)> {
+        match ticket {
+            Some(ticket) => Some((ticket.api_port(), ticket.api_secret().to_owned())),
+            None => self.management_endpoint(),
+        }
+    }
+
     /// 管理 API 的 Bearer secret（`clashApiSecret`，缺失/空 → 空串免认证）。热切换与 TS STATUS relay 共用。
     ///
-    /// **必须走 `with_current` 投影，不得用 `current()`**：后者恒 clone **整份**用户配置（含全部
-    /// `servers` 与规则，`runtime/config.rs:181-189` 明写），而本方法只要一个字符串字段。调用链是
-    /// `probe_select_slot → hot_switch_selector → management_api → 本方法` —— **测速一轮 = N 次整份配置
-    /// 深拷贝**（200 节点级配置下不是小数目），此外所有热切节点的路径都付这笔账。
-    ///
-    /// 闭包内禁忌（持读锁，禁再调 `ConfigManager` 任何方法）在此满足：只读一个字符串字段、无 I/O、
-    /// 无回调。debug 构型下该禁忌由 `ReentrancyProbe` 有牙。
+    /// 取法单点在 [`current_clash_api_secret`]（走 `with_current` 投影，不 clone 整份配置）。调用链是
+    /// `probe_select_slot → hot_switch_selector → management_api → 本方法` —— 测速一轮调 N 次，
+    /// 所有热切节点的路径也都经过这里。
     pub(super) fn clash_api_secret(&self) -> String {
-        self.config
-            .with_current(|c| {
-                c.get("clashApiSecret")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+        current_clash_api_secret(&self.config)
     }
 
     /// 某个节点在**当前运行核**里的管理 API 落点：`(端口, secret, 该节点的 endpoint tag)`。
@@ -120,16 +130,7 @@ impl ProxyRuntime {
         if !s.running || s.clash_api_port == 0 {
             return serde_json::json!({ "ok": false, "url": "", "apiUrl": "", "secret": "" });
         }
-        let secret = self
-            .config
-            .current()
-            .ok()
-            .and_then(|c| {
-                c.get("clashApiSecret")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        let secret = self.clash_api_secret();
         serde_json::json!({
             "ok": true,
             "url": format!("http://127.0.0.1:{}/dashboard/", s.clash_api_port),

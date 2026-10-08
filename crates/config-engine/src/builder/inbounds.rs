@@ -168,7 +168,7 @@ pub fn build_inbounds(
     if emits_mixed_inbound(platform) {
         inbounds.push(Inbound {
             type_field: "mixed".into(),
-            tag: "mixed-in".into(),
+            tag: crate::builder::helpers::MIXED_INBOUND_TAG.into(),
             listen: Some(listen_addr.into()),
             listen_port: Some(local_proxy_port(config)),
             network: None,
@@ -221,7 +221,11 @@ pub fn build_inbounds(
             inbounds.push(http_loopback("probe-direct-in", dp, users.clone()));
         }
         if let Some(pp) = deps.probe_proxy_port {
-            let mut probe = http_loopback("probe-proxy-in", pp, users.clone());
+            let mut probe = http_loopback(
+                crate::builder::helpers::PROBE_PROXY_INBOUND_TAG,
+                pp,
+                users.clone(),
+            );
             // Same authenticated tag/selector and HTTP behavior; SOCKS5 adds UDP only in Debug.
             if cfg!(debug_assertions) && deps.platform == "android" && deps.debug_probe_mixed_udp {
                 probe.type_field = "mixed".into();

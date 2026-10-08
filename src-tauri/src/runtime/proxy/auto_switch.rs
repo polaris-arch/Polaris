@@ -24,10 +24,10 @@ use crate::commands::speedtest::{
     RuntimeProbeBatch,
 };
 use crate::runtime::auto_switch::{
-    decide_tick, plan_runtime_candidates, select_best_candidate, switch_blocked_by_restart,
-    switch_payload, AutoSwitchMachine, CandidateLatency, HeartbeatOutcome, RuntimeCandidate,
-    RuntimeCandidatePlan, SwitchGate, TickAction, TickInput, CONNECTIVITY_TIMEOUT_MS,
-    CONNECTIVITY_URLS, HEARTBEAT_INTERVAL_MS,
+    decide_tick, judge_probes, plan_runtime_candidates, switch_blocked_by_restart, switch_payload,
+    AutoSwitchMachine, HeartbeatOutcome, ProbeVerdict, RuntimeCandidate, RuntimeCandidatePlan,
+    SwitchGate, TickAction, TickInput, CONNECTIVITY_TIMEOUT_MS, CONNECTIVITY_URLS,
+    HEARTBEAT_INTERVAL_MS,
 };
 use crate::runtime::config::Decision;
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
@@ -868,8 +868,8 @@ impl ProxyRuntime {
             .map(|candidate| (candidate.id.clone(), candidate.tag.clone()))
             .collect();
         let url = resolve_speed_test_url(&config);
-        let latencies = match probe_runtime_candidates(self, &targets, &probe_input, &url).await {
-            RuntimeProbeBatch::Completed(latencies) => latencies,
+        let probes = match probe_runtime_candidates(self, &targets, &probe_input, &url).await {
+            RuntimeProbeBatch::Completed(probes) => probes,
             RuntimeProbeBatch::Busy => {
                 log::info!("自动故障切换：用户测速正在占用 probe pool → 本轮让位");
                 return false;
@@ -882,31 +882,41 @@ impl ProxyRuntime {
         if self.core_generation() != generation || !self.core_running() {
             return false;
         }
-        let measured: Vec<CandidateLatency> = candidate_plan
+        let named: Vec<(String, String)> = candidate_plan
             .candidates
             .iter()
-            .map(|candidate| CandidateLatency {
-                id: candidate.id.clone(),
-                name: candidate.name.clone(),
-                latency_ms: latencies.get(&candidate.id).copied().flatten(),
-            })
+            .map(|candidate| (candidate.id.clone(), candidate.name.clone()))
             .collect();
 
-        let Some(best) = select_best_candidate(&measured) else {
-            log::warn!("所有运行态 clean 候选均未通过真实代理链探测，无法自动切换");
-            // 与「候选被剃光」那条**同码同锁存**：对用户而言两种现场的可行动性完全相同 —— 有
-            // `needs_restart` 个节点本来能救场，只是被切换门挡在探测之外，而他无从得知。
-            // 区分项仍只有 `needs_restart > 0` 这一条，故不会因为「探测全败」本身多报一条
-            // （那件事用户下不了手，只该进日志）。
-            if candidate_plan.needs_restart > 0 && machine.claim_restart_blocked_report() {
-                self.set_nonfatal_error(RESTART_BLOCKED_MESSAGE, code::AUTO_SWITCH_NEEDS_RESTART);
+        let best = match judge_probes(&named, &probes) {
+            ProbeVerdict::Best(best) => best,
+            // 有候选因读回不符被跳过（只在读回的「强制」档下出现）：量到的不是它，不能据此说它
+            // 不可用，故不下「全部不可用」的结论，也不走那条结论的后续（重启受阻上报）。
+            ProbeVerdict::Inconclusive { mismatch_skipped } => {
+                log::info!(
+                    "自动故障切换：没有测出可用候选，另有 {mismatch_skipped} 个候选因读回不符被跳过 → 本轮不下结论"
+                );
+                return false;
             }
-            return false;
+            ProbeVerdict::AllFailed => {
+                log::warn!("所有运行态 clean 候选均未通过真实代理链探测，无法自动切换");
+                // 与「候选被剃光」那条**同码同锁存**：对用户而言两种现场的可行动性完全相同 —— 有
+                // `needs_restart` 个节点本来能救场，只是被切换门挡在探测之外，而他无从得知。
+                // 区分项仍只有 `needs_restart > 0` 这一条，故不会因为「探测全败」本身多报一条
+                // （那件事用户下不了手，只该进日志）。
+                if candidate_plan.needs_restart > 0 && machine.claim_restart_blocked_report() {
+                    self.set_nonfatal_error(
+                        RESTART_BLOCKED_MESSAGE,
+                        code::AUTO_SWITCH_NEEDS_RESTART,
+                    );
+                }
+                return false;
+            }
         };
         let best_latency = best.latency_ms.unwrap_or(0);
         log::info!("选中最优节点: {} ({best_latency}ms)", best.name);
 
-        let Some(payload) = switch_payload(best, reason) else {
+        let Some(payload) = switch_payload(&best, reason) else {
             log::warn!("自动换节点：候选缺少有效延迟 → 跳过");
             return false;
         };

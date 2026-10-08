@@ -545,10 +545,14 @@ async fn read_response_status<S: AsyncRead + Unpin>(
 /// `tokio::spawn`，超时只会丢掉 join handle 而**任务仍在跑**，socket 挂在运行时里直到自己结束 ——
 /// 这正是 上游 注释点名的那个坑（「持有所有已建立句柄，finish 时统一 destroy；大订阅并发 32 时累积」），
 /// Rust 侧靠「不 spawn + drop 兜底」达成同一效果。门：`timeout_closes_the_socket_not_leaks_it`。
+///
+/// socket 一连上本机代理口、**还没写出任何字节**时，把它的本机源端口交给 `announce`。代理要读到
+/// CONNECT 才会为这条连接建记录，所以 `announce` 恒早于那条记录。
 pub async fn open_tunnel(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     target: &SpeedTestTarget,
+    announce: &(dyn Fn(u16) + Sync),
 ) -> Result<SpeedTestTunnel, TunnelError> {
     let io = |_| TunnelError::Transport;
     let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
@@ -556,6 +560,9 @@ pub async fn open_tunnel(
         .map_err(|_| TunnelError::Local)?;
     // 关 Nagle：小请求的 TTFB 不该被 delayed-ACK / 合包拖慢（上游 `socket.setNoDelay(true)`）。
     let _ = sock.set_nodelay(true);
+    if let Ok(local) = sock.local_addr() {
+        announce(local.port());
+    }
 
     sock.write_all(target.connect_request(auth).as_bytes())
         .await
@@ -768,6 +775,8 @@ pub(crate) mod mock_proxy {
         pub(crate) first_tunnel_bytes: Vec<u8>,
         /// 服务端在脚本跑完后读到 EOF（= 客户端把 socket 关了）。
         pub(crate) saw_client_close: bool,
+        /// 服务端看到的对端端口（= 客户端 socket 的本机源端口）。
+        pub(crate) peer_port: Option<u16>,
     }
 
     /// 起一个回环 mock 代理，返回 `(端口, 观测面)`。
@@ -779,9 +788,10 @@ pub(crate) mod mock_proxy {
         let observed = Arc::new(Mutex::new(Observed::default()));
         let sink = observed.clone();
         tokio::spawn(async move {
-            let Ok((mut sock, _)) = listener.accept().await else {
+            let Ok((mut sock, peer)) = listener.accept().await else {
                 return;
             };
+            sink.lock().unwrap().peer_port = Some(peer.port());
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
 

@@ -328,6 +328,7 @@ fn proxy_reachability_reports_only_observed_probe_state() {
     let local = crate::runtime::proxy::LocalHttpProxy {
         port: 7890,
         auth: None,
+        inbound: crate::runtime::proxy::LocalInbound::Mixed,
     };
     let stopped = ProxyStatus::default();
     assert_eq!(
@@ -365,6 +366,7 @@ fn proxy_reachability_does_not_depend_on_mixed_port() {
     let probe = crate::runtime::proxy::LocalHttpProxy {
         port: 31002,
         auth: None,
+        inbound: crate::runtime::proxy::LocalInbound::ProbeProxy,
     };
     assert_eq!(
         proxy_reachability(&android_like, Some(&probe), &Value::Null),

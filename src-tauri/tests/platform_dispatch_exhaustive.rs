@@ -2518,7 +2518,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/stats/source.rs",
         "not(target_os = \"android\")",
-        13,
+        12,
         IosSide::DiffersWrongToday,
         "🔴 上一条的孪生侧，含 `use polaris_singbox_grpc::{…}` 这条**导入**。\
          iOS 落这一侧 ⇒ 编译期就会把整套 gRPC 客户端拖进 iOS 编译单元。同上，本批不改。",
@@ -3666,7 +3666,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
     ("DiffersRight", 265),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 149),
+    ("DiffersWrongToday", 148),
     ("WithAndroid", 86),
 ];
 
@@ -3805,7 +3805,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/stats/source.rs",
         "not(target_os = \"android\")",
-        13,
+        12,
     ),
     (
         "src-tauri/src/runtime/stats/source.rs",

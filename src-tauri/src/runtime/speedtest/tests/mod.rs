@@ -4700,3 +4700,60 @@ fn round_exit_keeps_outcome_and_reason_in_step() {
         );
     }
 }
+
+/// 临时核腿的每条结果都带 `binding` 块：策略 `node_pin`、结论 `static`、依据 `config`，请求的是
+/// 该节点在临时核里的 tag；失败的结果同样带。临时核没有运行期读回，绑定只由配置结构保证。
+#[tokio::test]
+async fn temp_core_results_carry_a_static_node_pin_binding() {
+    let mut nodes = three_nodes();
+    nodes[1].is_endpoint = true;
+    // 第三个节点在临时核配置里带前置出站（ShadowTLS 外层那一类）。
+    nodes[2].node = json!({ "detour": "shadow-outer" });
+    let mut events: Vec<(String, Value)> = Vec::new();
+    let (results, outcome) = drive_round_of_one_batch(
+        &nodes,
+        &[1, 2, 3],
+        8,
+        &superseded_at(0),
+        &mut healthy_watch(),
+        |port| async move {
+            if port == 3 {
+                Err(TIMED_OUT)
+            } else {
+                Ok(120_u32)
+            }
+        },
+        &mut |ev, payload| events.push((ev.to_string(), payload)),
+    )
+    .await;
+    assert_eq!(outcome, "completed");
+    assert_eq!(results.len(), 3);
+    let bindings: BTreeMap<String, Value> = events
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_RESULT)
+        .map(|(_, payload)| {
+            (
+                payload["serverId"].as_str().unwrap().to_string(),
+                payload["binding"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(bindings.len(), 3, "三条结果各一个 binding 块：{events:?}");
+    for (node, (kind, detour)) in nodes.iter().zip([
+        ("outbound", None),
+        ("endpoint", None),
+        ("outbound", Some("shadow-outer")),
+    ]) {
+        let mut expected = json!({
+            "policy": "node_pin",
+            "requestedTag": node.tag,
+            "requestedKind": kind,
+            "verdict": "static",
+            "source": "config",
+        });
+        if let Some(detour) = detour {
+            expected["staticDetour"] = json!(detour);
+        }
+        assert_eq!(bindings[&node.id], expected, "{}", node.id);
+    }
+}

@@ -26,7 +26,10 @@ fn actual_ingress(config: &str, digest: &str) -> Option<DebugCoreProbeIngress> {
         .get("inbounds")?
         .as_array()?
         .iter()
-        .filter(|inbound| inbound.get("tag").and_then(|v| v.as_str()) == Some("probe-proxy-in"));
+        .filter(|inbound| {
+            inbound.get("tag").and_then(|v| v.as_str())
+                == Some(polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG)
+        });
     let inbound = inbounds.next()?;
     if inbounds.next().is_some() || inbound.get("listen")?.as_str()? != "127.0.0.1" {
         return None;

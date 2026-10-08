@@ -80,7 +80,7 @@ use polaris_core_supervisor::{
     CORE_STARTUP_PER_NODE_US,
 };
 
-use crate::commands::speedtest::{speed_test_result_payload, Measured, SpeedTestCancel};
+use crate::commands::speedtest::{result_payload_with_binding, Binding, Measured, SpeedTestCancel};
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
 };
@@ -2248,7 +2248,15 @@ where
                     }
                     failure_streak += 1;
                 }
-                record_measured(results, progress, emit, &id, &measured);
+                // 临时核没有运行期读回：绑定由「逐节点入站钉到该节点出站」的配置结构保证。
+                let binding = nodes.iter().find(|node| node.id == id).map(|node| {
+                    Binding::static_node_pin(
+                        &node.tag,
+                        node.is_endpoint,
+                        node.node.get("detour").and_then(Value::as_str),
+                    )
+                });
+                record_measured(results, progress, emit, &id, &measured, binding.as_ref());
 
                 // ── A3 腿二（核**不再接受连接**）：连败满一窗 → 对 `ports[0]` 复探一次 ──
                 //
@@ -2306,6 +2314,7 @@ fn record_measured(
     emit: &mut (dyn FnMut(&str, Value) + Send),
     node_id: &str,
     measured: &Measured,
+    binding: Option<&Binding>,
 ) {
     if let Err(failure) = measured {
         log::debug!("临时核测速未取得有效延迟：nodeId={node_id} {failure:?}");
@@ -2316,7 +2325,7 @@ fn record_measured(
     );
     emit(
         EVENT_SPEED_TEST_RESULT,
-        speed_test_result_payload(node_id, measured, None),
+        result_payload_with_binding(node_id, measured, None, binding),
     );
     // 计数与口径都由**轮**级的账持有（跨批累加、`total` 恒全局）：批级计数一旦出到事件里，
     // 前端会在每批测完那一帧收口（判据见 [`RoundProgress`]）。

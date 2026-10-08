@@ -36,6 +36,7 @@ fn ticket() -> ReadyMainTicket {
         local_http_proxy: Some(LocalHttpProxy {
             port: 9878,
             auth: None,
+            inbound: crate::runtime::proxy::LocalInbound::Mixed,
         }),
         committed: AtomicBool::new(true),
     });

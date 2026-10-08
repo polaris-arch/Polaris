@@ -20,6 +20,7 @@ fn identity(run: u64, seq: u64, measured_at: u64) -> ResultIdentity {
         node_fingerprint: Some("fp".to_string()),
         network_epoch: Some(3),
         measured_at,
+        binding: None,
     }
 }
 
@@ -400,4 +401,151 @@ fn a_round_covers_a_subscription_only_once_every_testable_member_has_a_result() 
     assert!(!ledger
         .candidates(&members, &context(&fps, 20_000, Some(1)))
         .covers_all_testable());
+}
+
+/// 主核探针槽与停止态临时核的结果各占一个键，读取时取两者中较新的一条：断开后用临时核测过，
+/// 读到的是「未连接测量」；再连上测过，读到的又是主核那条。
+#[test]
+fn main_and_temp_results_keep_separate_keys_and_the_newer_one_is_read() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a"]);
+    let temp = |run| ResultIdentity {
+        instance: CoreInstance::Temp,
+        ..identity(run, 1, 10_000)
+    };
+    ledger.record("a", Ok(120), identity(1, 1, 10_000));
+    ledger.record("a", Ok(60), temp(2));
+    assert_eq!(ledger.len(), 2, "两条互不覆盖");
+    let read = ledger.candidates(&ids(&["a"]), &context(&fps, 20_000, None));
+    assert_eq!(exclusion_of(&read, "a"), Exclusion::Disconnected);
+    assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(60));
+
+    ledger.record("a", Ok(90), identity(3, 1, 10_000));
+    let read = ledger.candidates(&ids(&["a"]), &context(&fps, 20_000, None));
+    assert_eq!(read.selectable.len(), 1);
+    assert_eq!(read.selectable[0].latency_ms, 90);
+    assert_eq!(read.unverified, ids(&["a"]), "没有读回的结果可选，但被计数");
+}
+
+/// 读回的结论随记录读出：不符的测出了值也不可选（原因单列，不并进「非候选路径」）；证实的不计入
+/// 未验证；钉到选中出口的结果与走用户规则的一样，不是候选。
+#[test]
+fn binding_verdicts_are_read_back_with_the_entry() {
+    let ledger = MeasurementLedger::new();
+    let with = |seq, binding| ResultIdentity {
+        binding: Some(binding),
+        ..identity(1, seq, 10_000)
+    };
+    ledger.record("confirmed", Ok(10), with(1, BindingVerdict::Confirmed));
+    ledger.record("unverified", Ok(20), with(2, BindingVerdict::Unverified));
+    ledger.record("mismatch", Ok(30), with(3, BindingVerdict::Mismatch));
+    ledger.record(
+        "selected",
+        Ok(40),
+        ResultIdentity {
+            path: MeasurePath::Selected,
+            ..identity(1, 4, 10_000)
+        },
+    );
+    let all = ids(&["confirmed", "unverified", "mismatch", "selected"]);
+    let fps = fingerprints(&["confirmed", "unverified", "mismatch", "selected"]);
+    let read = ledger.candidates(&all, &context(&fps, 20_000, None));
+    assert_eq!(
+        read.selectable
+            .iter()
+            .map(|candidate| candidate.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["confirmed", "unverified"]
+    );
+    assert_eq!(read.unverified, ids(&["unverified"]));
+    assert_eq!(exclusion_of(&read, "mismatch"), Exclusion::BindingMismatch);
+    assert_eq!(exclusion_of(&read, "selected"), Exclusion::NonCandidatePath);
+    assert!(
+        ledger
+            .current_results(&all, &context(&fps, 20_000, None))
+            .contains("mismatch"),
+        "读回不符的节点有当前结果，不算欠测"
+    );
+}
+
+/// 键里加了路由策略之后，一个节点在两个测速 URL 下最多有六条（主核探针槽、停止态临时核、回退腿
+/// 或伴测各一，乘以两个 URL）。软上限仍是节点数的 4 倍：超出的两条按淘汰顺序去掉——先是旧 URL
+/// 下已过新鲜期的，再是最旧的；当前 URL 下主核探针槽那条（选点用的）留着。
+#[test]
+fn the_soft_cap_holds_with_the_wider_key_space() {
+    let ledger = MeasurementLedger::new();
+    let at = |run, measured_at, url: &str, path, instance| ResultIdentity {
+        url_digest: url.to_string(),
+        path,
+        instance,
+        ..identity(run, 1, measured_at)
+    };
+    let main = CoreInstance::Main {
+        generation: 7,
+        start_time: None,
+    };
+    // 旧 URL 下三条（都已过新鲜期），当前 URL 下三条。
+    ledger.record(
+        "a",
+        Ok(1),
+        at(1, 100, "old-url", MeasurePath::Candidate, main),
+    );
+    ledger.record(
+        "a",
+        Ok(1),
+        at(
+            2,
+            200,
+            "old-url",
+            MeasurePath::Candidate,
+            CoreInstance::Temp,
+        ),
+    );
+    ledger.record("a", Ok(1), at(3, 300, "old-url", MeasurePath::System, main));
+    ledger.record(
+        "a",
+        Ok(1),
+        at(
+            4,
+            9_000_000,
+            URL,
+            MeasurePath::Candidate,
+            CoreInstance::Temp,
+        ),
+    );
+    ledger.record("a", Ok(1), at(5, 9_000_100, URL, MeasurePath::System, main));
+    ledger.record(
+        "a",
+        Ok(42),
+        at(6, 9_000_200, URL, MeasurePath::Candidate, main),
+    );
+    assert_eq!(ledger.len(), 6, "六个键互不覆盖");
+
+    let nodes: BTreeSet<String> = ids(&["a"]).into_iter().collect();
+    let evicted = ledger.evict(&EvictContext {
+        nodes: &nodes,
+        url_digest: URL,
+        now_ms: 9_000_300,
+        freshness_cap_ms: &|_| CAP_MS,
+    });
+    assert_eq!(evicted, 2);
+    assert_eq!(ledger.len(), 4, "软上限 = 1 个节点 × 4");
+    let left: Vec<(String, u64)> = {
+        let inner = ledger.lock();
+        inner
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.url_digest.clone(), entry.identity.run))
+            .collect()
+    };
+    assert_eq!(
+        left.iter().filter(|(url, _)| url == URL).count(),
+        3,
+        "当前 URL 下的三条都留着：{left:?}"
+    );
+    assert!(
+        left.contains(&("old-url".to_string(), 3)),
+        "旧 URL 下只剩最新的那条：{left:?}"
+    );
+    assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(42));
 }

@@ -472,7 +472,7 @@ pub fn logs_unsubscribe(window: WebviewWindow, subscription_id: String) -> ApiRe
 #[tauri::command]
 pub async fn logs_clear(state: State<'_, AppRuntime>) -> Result<ApiResponse<()>, ()> {
     crate::logging::clear();
-    if let Ok((port, secret)) = crate::commands::proxy::management_endpoint(&state) {
+    if let Some((port, secret)) = state.proxy().management_endpoint() {
         match polaris_singbox_grpc::SingBoxApiClient::connect(
             polaris_singbox_grpc::Endpoint::new("127.0.0.1", port),
             secret,
@@ -564,8 +564,10 @@ pub fn logs_set_diagnostic(enabled: bool) -> ApiResponse<bool> {
 /// 一份「用来给别人做根因判断」的报告头部，比在 UI 上说危害更大。
 /// 两条腿共用一个取值点，才谈得上不会再次分叉。
 async fn read_runtime_log_level(state: &State<'_, AppRuntime>) -> Result<String, &'static str> {
-    let (port, secret) =
-        crate::commands::proxy::management_endpoint(state).map_err(|_| REASON_NOT_RUNNING)?;
+    let (port, secret) = state
+        .proxy()
+        .management_endpoint()
+        .ok_or(REASON_NOT_RUNNING)?;
     let client = match polaris_singbox_grpc::SingBoxApiClient::connect(
         polaris_singbox_grpc::Endpoint::new("127.0.0.1", port),
         secret,

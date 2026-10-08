@@ -131,6 +131,10 @@ pub(super) struct SwitchSnapshot {
     pub(super) rule_target: BTreeMap<String, RuleTargetEntry>,
     /// 起核时真实 route 产物可证明的 raw 条件→用户名称；热切/暂存不改写。
     pub(super) named_rule_by_raw: BTreeMap<String, RuleIdentity>,
+    /// 生成产物里落在 `endpoints[]` 的 tag（测速 `binding` 块的请求种类取材）。
+    pub(super) endpoint_tags: BTreeSet<String>,
+    /// 生成产物里带前置出站的 tag → 它的 `detour`（测速 `binding` 块的 `staticDetour` 取材）。
+    pub(super) static_detours: BTreeMap<String, String>,
     /// id → **全维**指纹（[`modified_fingerprint`]，上游 `runningServersFingerprint`，:672）。
     ///
     /// 两个消费面，同一个问题的两种问法：
@@ -985,6 +989,25 @@ impl ProxyRuntime {
             id_to_tag,
             rule_target,
             named_rule_by_raw,
+            endpoint_tags: singbox_config
+                .endpoints
+                .iter()
+                .flatten()
+                .map(|endpoint| endpoint.tag.clone())
+                .collect(),
+            static_detours: singbox_config
+                .outbounds
+                .iter()
+                .map(|outbound| (&outbound.tag, &outbound.detour))
+                .chain(
+                    singbox_config
+                        .endpoints
+                        .iter()
+                        .flatten()
+                        .map(|endpoint| (&endpoint.tag, &endpoint.detour)),
+                )
+                .filter_map(|(tag, detour)| Some((tag.clone(), detour.clone()?)))
+                .collect(),
             fingerprints,
             dirty_fingerprints,
             // §15：与运行核 config 同源（deps.probe_pool_ports 正是本次 generate 注入的池端口）→ 快照即池真值。

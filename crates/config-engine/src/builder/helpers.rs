@@ -22,8 +22,16 @@ pub const RESERVED_OUTBOUND_TAGS: &[&str] = &[
     "block",
     "direct-loopback",
     "probe-direct-in",
-    "probe-proxy-in",
+    PROBE_PROXY_INBOUND_TAG,
 ];
+
+/// 用户流量的本机混合入站 tag。不钉死，走用户的全部路由规则与 DNS 规则。
+///
+/// **单一真值**：生成端建入站用它；App 侧按入站 tag 在内核的连接记录里认连接时引用同一个常量。
+pub const MIXED_INBOUND_TAG: &str = "mixed-in";
+
+/// 出口探针入站 tag。被路由钉到 `proxy-selector`。单一真值，理由同 [`MIXED_INBOUND_TAG`]。
+pub const PROBE_PROXY_INBOUND_TAG: &str = "probe-proxy-in";
 
 /// 主核测速探测池入站 tag 前缀（§15，`probe-in-{k}`）。
 ///

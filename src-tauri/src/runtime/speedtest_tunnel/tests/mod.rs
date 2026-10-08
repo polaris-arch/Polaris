@@ -192,8 +192,12 @@ async fn measure_detailed(
     target: &SpeedTestTarget,
     budget: Duration,
 ) -> crate::commands::speedtest::Measured {
-    crate::commands::speedtest::measure_warm_ttfb(budget, budget, open_tunnel(port, None, target))
-        .await
+    crate::commands::speedtest::measure_warm_ttfb(
+        budget,
+        budget,
+        open_tunnel(port, None, target, &|_| {}),
+    )
+    .await
 }
 
 /// 🔴 **结构事实门**：本腿说的是 CONNECT + origin-form GET，不是 absolute-form。
@@ -613,4 +617,34 @@ async fn a_non_2xx_warmup_fails_with_its_status_on_the_wire() {
         warmup_failure(crate::commands::speedtest::FailKind::HttpStatus(403))
     );
     assert_eq!(observed.lock().unwrap().request_lines.len(), 2);
+}
+
+/// 源端口在 socket 连上代理口、**还没发出任何字节**时交给 `announce`：那一刻代理还没收到 CONNECT。
+/// 交出去的就是代理一侧看到的对端端口，且只交一次。
+///
+/// 多线程运行时：`announce` 里那段阻塞等待期间，代理任务要能在另一个线程上跑 —— 单线程下它根本
+/// 没机会读，「没看到请求行」就成了恒真。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_source_port_is_announced_before_any_byte_is_sent() {
+    let (port, observed) = spawn_mock_proxy(Script {
+        connect_reply: Some(OK_204),
+        gets: vec![],
+    })
+    .await;
+    let announced = std::sync::Mutex::new(Vec::new());
+    let _tunnel = open_tunnel(port, None, &http_target(), &|source_port| {
+        // 回环上给代理留足读到 CONNECT 的时间：字节若已发出，这里一定看得到请求行。
+        std::thread::sleep(Duration::from_millis(50));
+        let seen_requests = observed.lock().unwrap().request_lines.len();
+        announced.lock().unwrap().push((source_port, seen_requests));
+    })
+    .await
+    .expect("隧道建成");
+    let peer_port = observed.lock().unwrap().peer_port.expect("代理接到了连接");
+    assert_eq!(*announced.lock().unwrap(), vec![(peer_port, 0)]);
+    assert_eq!(
+        observed.lock().unwrap().request_lines.len(),
+        1,
+        "对照：登记之后 CONNECT 确实发出去了"
+    );
 }

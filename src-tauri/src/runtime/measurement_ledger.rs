@@ -16,14 +16,19 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use tokio::sync::Notify;
 
 use crate::commands::speedtest::{
-    is_selectable, result_key, stale_reason, supersedes_stored, CoreInstance, CurrentState,
-    MeasureFailure, MeasurePath, Measured, ResultIdentity, ResultKey, SpeedTestOrigin, StaleReason,
+    is_selectable, result_key, stale_reason, supersedes_stored, BindingVerdict, CoreInstance,
+    CurrentState, MeasureFailure, MeasurePath, Measured, ResultIdentity, ResultKey,
+    SpeedTestOrigin, StaleReason,
 };
 
 /// 条数硬上限。按每条约 300 字节估，合计约 2.5MB。
 const HARD_CAP: usize = 8192;
 
-/// 软上限相对当前配置节点数的倍数：两条路径乘以至多两个测速 URL。
+/// 软上限相对当前配置节点数的倍数。
+///
+/// 一个节点在一个测速 URL 下至多三个键：主核探针槽、停止态临时核，以及本平台的回退腿与出口
+/// 伴测那一个（走用户规则或钉到选中出口，二者不会同时出现）；后者只有选中过的节点才有。换过
+/// 测速 URL 的再乘二。4 不保证全留：超出时按淘汰顺序先去旧 URL 下已过新鲜期的，再去最旧的。
 const SOFT_CAP_PER_NODE: usize = 4;
 
 /// 账本里的一条记录：某个存放键下最新的那一次测量。
@@ -62,6 +67,8 @@ pub(crate) enum Exclusion {
     Skipped(&'static str),
     /// 只有经本机代理入站测得的结果。
     NonCandidatePath,
+    /// 测出了值，但读回判定承载它的不是这个节点。
+    BindingMismatch,
     /// 只有停止态临时核测得的结果。
     Disconnected,
 }
@@ -80,6 +87,9 @@ pub(crate) struct Candidate {
 pub(crate) struct Candidates {
     pub(crate) selectable: Vec<Candidate>,
     pub(crate) excluded: Vec<(String, Exclusion)>,
+    /// `selectable` 里承载出站没有被读回证实的节点（读回未验证、或那一轮没有读回）。
+    /// 它们照常可选，这里只计数。
+    pub(crate) unverified: Vec<String>,
 }
 
 /// 读取时的对照面，由读取方在读的那一刻取。账本不缓存任何判定结果。
@@ -115,7 +125,10 @@ impl Candidates {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn covers_all_testable(&self) -> bool {
         self.excluded.iter().all(|(_, exclusion)| {
-            matches!(exclusion, Exclusion::Failed { .. } | Exclusion::Skipped(_))
+            matches!(
+                exclusion,
+                Exclusion::Failed { .. } | Exclusion::Skipped(_) | Exclusion::BindingMismatch
+            )
         })
     }
 }
@@ -299,14 +312,20 @@ impl MeasurementLedger {
         let mut out = Candidates::default();
         for id in node_ids {
             match classify(&inner, id, context) {
-                Ok(candidate) => out.selectable.push(candidate),
+                Ok((candidate, verdict)) => {
+                    if verdict != Some(BindingVerdict::Confirmed) {
+                        out.unverified.push(id.clone());
+                    }
+                    out.selectable.push(candidate);
+                }
                 Err(exclusion) => out.excluded.push((id.clone(), exclusion)),
             }
         }
         out
     }
 
-    /// `node_ids` 里已有当前结果的节点：测出了值，或确实测过而没通。过期、未测、被跳过的不算。
+    /// `node_ids` 里已有当前结果的节点：测出了值（含读回不符的），或确实测过而没通。
+    /// 过期、未测、被跳过的不算。
     pub(crate) fn current_results(
         &self,
         node_ids: &[String],
@@ -315,6 +334,7 @@ impl MeasurementLedger {
         let Candidates {
             selectable,
             excluded,
+            ..
         } = self.candidates(node_ids, context);
         selectable
             .into_iter()
@@ -322,7 +342,12 @@ impl MeasurementLedger {
             .chain(
                 excluded
                     .into_iter()
-                    .filter(|(_, exclusion)| matches!(exclusion, Exclusion::Failed { .. }))
+                    .filter(|(_, exclusion)| {
+                        matches!(
+                            exclusion,
+                            Exclusion::Failed { .. } | Exclusion::BindingMismatch
+                        )
+                    })
                     .map(|(id, _)| id),
             )
             .collect()
@@ -330,15 +355,7 @@ impl MeasurementLedger {
 
     /// 某个节点在候选路径、当前测速 URL 下的记录（排序与退避的取材面）。
     pub(crate) fn candidate_entry(&self, node_id: &str, url_digest: &str) -> Option<LedgerEntry> {
-        self.lock()
-            .entries
-            .iter()
-            .find(|(key, _)| {
-                key.node_id == node_id
-                    && key.path == MeasurePath::Candidate
-                    && key.url_digest == url_digest
-            })
-            .map(|(_, entry)| entry.clone())
+        latest_candidate(&self.lock().entries, node_id, url_digest).cloned()
     }
 
     /// 被拒的入账次数（运行号或序号不比已有记录新）。
@@ -381,20 +398,40 @@ fn ledger_stale(
     None
 }
 
+/// 某个节点在候选路径、给定测速 URL 下最新的一条记录。
+///
+/// 主核探针槽与停止态临时核的结果各占一个键（路由策略不同），这里取两者中较新的那条：
+/// 「先连着测过、断开后又用临时核测了一次」读到的是后者。
+fn latest_candidate<'a>(
+    entries: &'a BTreeMap<ResultKey, LedgerEntry>,
+    node_id: &str,
+    url_digest: &str,
+) -> Option<&'a LedgerEntry> {
+    entries
+        .iter()
+        .filter(|(key, _)| {
+            key.node_id == node_id
+                && key.path == MeasurePath::Candidate
+                && key.url_digest == url_digest
+        })
+        .map(|(_, entry)| entry)
+        .max_by_key(|entry| (entry.identity.run, entry.identity.seq))
+}
+
 fn classify(
     inner: &Inner,
     node_id: &str,
     context: &ReadContext<'_>,
-) -> Result<Candidate, Exclusion> {
-    let of_path = |path: MeasurePath| {
-        inner.entries.iter().find(|(key, _)| {
-            key.node_id == node_id && key.path == path && key.url_digest == context.url_digest
-        })
-    };
-    let Some((_, entry)) = of_path(MeasurePath::Candidate) else {
+) -> Result<(Candidate, Option<BindingVerdict>), Exclusion> {
+    let Some(entry) = latest_candidate(&inner.entries, node_id, context.url_digest) else {
+        let other_path = inner.entries.keys().any(|key| {
+            key.node_id == node_id
+                && key.path != MeasurePath::Candidate
+                && key.url_digest == context.url_digest
+        });
         return Err(match inner.skipped.get(node_id) {
             Some(reason) => Exclusion::Skipped(reason),
-            None if of_path(MeasurePath::System).is_some() => Exclusion::NonCandidatePath,
+            None if other_path => Exclusion::NonCandidatePath,
             None => Exclusion::NeverMeasured,
         });
     };
@@ -410,13 +447,17 @@ fn classify(
         network_epoch: context.network_epoch,
     };
     match entry.measured {
-        Ok(latency_ms) if is_selectable(&entry.measured, &entry.identity, &current) => {
-            Ok(Candidate {
+        Ok(latency_ms) if is_selectable(&entry.measured, &entry.identity, &current) => Ok((
+            Candidate {
                 node_id: node_id.to_string(),
                 latency_ms,
                 measured_at: entry.identity.measured_at,
                 run: entry.identity.run,
-            })
+            },
+            entry.identity.binding,
+        )),
+        Ok(_) if entry.identity.binding == Some(BindingVerdict::Mismatch) => {
+            Err(Exclusion::BindingMismatch)
         }
         Ok(_) => Err(Exclusion::NonCandidatePath),
         Err(failure) => Err(Exclusion::Failed {

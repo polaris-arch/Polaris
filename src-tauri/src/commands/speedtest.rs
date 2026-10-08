@@ -75,6 +75,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Notify;
 
+use polaris_config_engine::builder::helpers::probe_pool_inbound_tag;
 use polaris_config_engine::builder::level_to_string;
 use polaris_config_engine::builder::outbounds::effective_proxy_bind_interface;
 use polaris_config_engine::singbox::InboundUser;
@@ -85,15 +86,17 @@ use polaris_config_engine::user_config::LogLevel;
 use polaris_core_supervisor::PortExclusions;
 use polaris_helper_proto::Platform;
 use polaris_net_stack::subscription::server_fingerprint;
+use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
 
 use crate::events::channel::{
     EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
 };
 use crate::response::ApiResponse;
+use crate::runtime::auto_switch::CandidateProbe;
 use crate::runtime::measurement_ledger::{self, MeasurementLedger};
 use crate::runtime::proxy::{
-    ActionBinding, ActionRequirement, LocalHttpProxy, NormalMainAction, ProxyRuntime,
-    ReadyMainTicket, SpeedProbeTargets,
+    ActionBinding, ActionRequirement, LocalHttpProxy, LocalInbound, NormalMainAction, ProxyRuntime,
+    ReadyMainTicket, SpeedBindingContext, SpeedProbeTargets,
 };
 use crate::runtime::speedtest::{
     emit_speed_test_done, is_temp_core_superseded, plan_temp_core_with_bindings, InterruptReason,
@@ -104,6 +107,10 @@ use crate::runtime::speedtest_tunnel::{
 };
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
 use crate::runtime::AppRuntime;
+
+mod witness;
+
+pub(crate) use witness::{BindingWitness, ConnRecord, NoWitness, StreamWitness, WatchedInbounds};
 
 /// Polaris 直连哨兵（`shared/direct-selection.ts DIRECT_SERVER_ID`；对齐 `commands/server.rs` 的本地定义）。
 const DIRECT_SERVER_ID: &str = "__direct__";
@@ -316,6 +323,37 @@ pub(crate) fn speed_test_result_payload(
     payload
 }
 
+/// 一次测量连同它在本机一侧的源端口。源端口是读回见证在内核连接记录里认出这条连接的键；
+/// 不经真实 socket 的测量（单测、临时核腿）没有它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Probed {
+    pub(crate) measured: Measured,
+    pub(crate) source_port: Option<u16>,
+}
+
+impl From<Measured> for Probed {
+    fn from(measured: Measured) -> Self {
+        Self {
+            measured,
+            source_port: None,
+        }
+    }
+}
+
+/// [`speed_test_result_payload`] 加上 `binding` 块（新增的可选字段，旧消费方不读）。
+pub(crate) fn result_payload_with_binding(
+    node_id: &str,
+    measured: &Measured,
+    network_epoch: Option<u64>,
+    binding: Option<&Binding>,
+) -> Value {
+    let mut payload = speed_test_result_payload(node_id, measured, network_epoch);
+    if let Some(binding) = binding {
+        payload["binding"] = binding.to_json();
+    }
+    payload
+}
+
 /// 一轮测速的发起来源。决定准入优先级与事件形态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpeedTestOrigin {
@@ -351,13 +389,16 @@ impl SpeedTestOrigin {
     }
 }
 
-/// 测量路径。
+/// 测量路径：这次测量想回答什么问题。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MeasurePath {
     /// 经探针槽或临时核的逐节点入站，只测指定节点。
     Candidate,
-    /// 经本机代理入站，走用户的完整路由与 DNS（回退腿、出口伴测）。
+    /// 经 `mixed-in`，走用户的完整路由与 DNS（有 `mixed-in` 的平台上的回退腿、出口伴测）。
     System,
+    /// 经 `probe-proxy-in`，钉到用户当前选中的出口、不经用户规则（没有 `mixed-in` 的平台上的
+    /// 回退腿、出口伴测）。
+    Selected,
 }
 
 impl MeasurePath {
@@ -365,7 +406,417 @@ impl MeasurePath {
         match self {
             Self::Candidate => "candidate",
             Self::System => "system",
+            Self::Selected => "selected",
         }
+    }
+
+    /// 回退腿与出口伴测的路径由它们实际用的入站决定：有没有钉死规则，标注就是哪一个。
+    pub(crate) const fn of_local_inbound(inbound: LocalInbound) -> Self {
+        match inbound {
+            LocalInbound::Mixed => Self::System,
+            LocalInbound::ProbeProxy => Self::Selected,
+        }
+    }
+}
+
+/// 一条测量连接在内核里实际受的路由策略。
+///
+/// 它由路径与承载的核派生，不单独存放：路径是 `system` 而策略不是「走用户规则」的组合因此
+/// 构造不出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RoutePolicy {
+    /// 探针槽入站，钉到探针 selector。用户规则不参与。
+    SlotPin,
+    /// 临时核的逐节点入站，钉到节点出站。
+    NodePin,
+    /// `probe-proxy-in`，钉到用户当前选中的出口。用户规则不参与。
+    SelectedPin,
+    /// `mixed-in`，不钉，走用户的全部路由规则与 DNS 规则。
+    UserRoute,
+}
+
+impl RoutePolicy {
+    pub(crate) const fn of(path: MeasurePath, instance: CoreInstance) -> Self {
+        match (path, instance) {
+            (MeasurePath::Candidate, CoreInstance::Main { .. }) => Self::SlotPin,
+            (MeasurePath::Candidate, CoreInstance::Temp) => Self::NodePin,
+            (MeasurePath::Selected, _) => Self::SelectedPin,
+            (MeasurePath::System, _) => Self::UserRoute,
+        }
+    }
+
+    /// 本机代理入站上的测量受的策略：只看入站，与哪个核无关。
+    pub(crate) const fn of_local_inbound(inbound: LocalInbound) -> Self {
+        match inbound {
+            LocalInbound::Mixed => Self::UserRoute,
+            LocalInbound::ProbeProxy => Self::SelectedPin,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SlotPin => "slot_pin",
+            Self::NodePin => "node_pin",
+            Self::SelectedPin => "selected_pin",
+            Self::UserRoute => "user_route",
+        }
+    }
+}
+
+/// 读回的结论：内核为这条测量连接选定并用于拨号的出站，与请求的是不是同一个。
+///
+/// 它只到叶子出站对象为止。叶子内部的前置链、节点域名解析到的地址、实际拨到的远端、拨号成败，
+/// 以及目标域名经哪条 DNS 规则解析，都读不到，不在这个结论里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingVerdict {
+    /// 读到了记录，叶子出站就是请求的节点。
+    Confirmed,
+    /// 读到了记录，叶子出站不是请求的节点：量到的不是它。
+    Mismatch,
+    /// 限时内没有读到记录（流没建起来、中途断开、超过等待上限，或内核没有连接跟踪）。
+    /// 保证与读回引入之前相同：换选 RPC 返回了成功。
+    Unverified,
+    /// 临时核：绑定由生成配置的钉死规则保证，没有运行期对账。
+    Static,
+    /// 没有指定节点的测量（系统路径、选中出口）：读到了实际承载者，无所谓符不符。
+    Observed,
+}
+
+impl BindingVerdict {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Mismatch => "mismatch",
+            Self::Unverified => "unverified",
+            Self::Static => "static",
+            Self::Observed => "observed",
+        }
+    }
+
+    /// [`as_str`](Self::as_str) 的逆：盖章时从载荷读回。
+    fn parse(verdict: &str) -> Option<Self> {
+        [
+            Self::Confirmed,
+            Self::Mismatch,
+            Self::Unverified,
+            Self::Static,
+            Self::Observed,
+        ]
+        .into_iter()
+        .find(|candidate| candidate.as_str() == verdict)
+    }
+}
+
+/// 读回判定（纯函数）。`requested` 是请求的节点 tag，没有指定节点的测量传 `None`；
+/// `carried_by` 是连接记录里的叶子出站 tag，没读到记录传 `None`。
+pub(crate) fn judge_binding(requested: Option<&str>, carried_by: Option<&str>) -> BindingVerdict {
+    match (requested, carried_by) {
+        (_, None) => BindingVerdict::Unverified,
+        (None, Some(_)) => BindingVerdict::Observed,
+        (Some(requested), Some(leaf)) if requested == leaf => BindingVerdict::Confirmed,
+        (Some(_), Some(_)) => BindingVerdict::Mismatch,
+    }
+}
+
+/// 请求的节点在运行核里是普通出站还是 endpoint。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+    Outbound,
+    Endpoint,
+}
+
+/// 逐节点结果的 `binding` 块：这条测量连接受什么策略约束、请求的是谁、实际由谁承载。
+/// 与身份块并列，全部字段可选。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub(crate) policy: RoutePolicy,
+    /// 请求的节点 tag；没有指定节点的测量为 `None`。
+    pub(crate) requested_tag: Option<String>,
+    pub(crate) requested_kind: Option<NodeKind>,
+    /// 读回的结论。`None` = 读回关闭，块里只有上面三项。
+    pub(crate) verdict: Option<BindingVerdict>,
+    /// 连接记录；没读到为 `None`。
+    pub(crate) record: Option<ConnRecord>,
+    /// 承载出站（没读到时取请求的节点）自带的前置出站 tag。来自生成配置，不是读回。
+    pub(crate) static_detour: Option<String>,
+    /// 命中的规则在用户配置里的名字（起核时的映射里有才带）。
+    pub(crate) rule_name: Option<String>,
+}
+
+impl Binding {
+    /// 临时核腿：没有运行期读回，绑定由配置结构保证。`detour` 是该节点在临时核配置里的前置出站。
+    pub(crate) fn static_node_pin(tag: &str, is_endpoint: bool, detour: Option<&str>) -> Self {
+        Self {
+            static_detour: detour.map(str::to_string),
+            rule_name: None,
+            policy: RoutePolicy::NodePin,
+            requested_tag: Some(tag.to_string()),
+            requested_kind: Some(if is_endpoint {
+                NodeKind::Endpoint
+            } else {
+                NodeKind::Outbound
+            }),
+            verdict: Some(BindingVerdict::Static),
+            record: None,
+        }
+    }
+
+    /// 叶子出站 tag（读到了记录才有）。
+    fn carried_by(&self) -> Option<&str> {
+        self.record.as_ref().map(|record| record.outbound.as_str())
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        let mut block = json!({ "policy": self.policy.as_str() });
+        if let Some(tag) = &self.requested_tag {
+            block["requestedTag"] = json!(tag);
+        }
+        if let Some(kind) = self.requested_kind {
+            block["requestedKind"] = json!(match kind {
+                NodeKind::Outbound => "outbound",
+                NodeKind::Endpoint => "endpoint",
+            });
+        }
+        let Some(verdict) = self.verdict else {
+            return block;
+        };
+        if let Some(detour) = &self.static_detour {
+            block["staticDetour"] = json!(detour);
+        }
+        block["verdict"] = json!(verdict.as_str());
+        block["source"] = json!(match (verdict, &self.record) {
+            (BindingVerdict::Static, _) => "config",
+            (_, Some(_)) => "connection",
+            (_, None) => "none",
+        });
+        if let Some(record) = &self.record {
+            block["carriedBy"] = json!({ "tag": record.outbound, "type": record.outbound_type });
+            block["chain"] = json!(record.chain);
+            block["rule"] = json!(record.rule);
+            if let Some(name) = &self.rule_name {
+                block["ruleName"] = json!(name);
+            }
+            // 目的地址与嗅探域名是测速 URL 的主机名，自配 URL 可能带令牌：事件里只出摘要。
+            block["destinationDigest"] =
+                json!(polaris_updater::sha256_hex(record.destination.as_bytes()));
+            block["domainDigest"] = json!(polaris_updater::sha256_hex(record.domain.as_bytes()));
+        }
+        block
+    }
+}
+
+/// 读回的档位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadbackMode {
+    /// 不建流，`binding` 块只出策略与请求的节点。
+    Off,
+    /// 建流、出完整的 `binding` 块；读回不符只记日志，结果照常发布。
+    Observe,
+    /// 读回不符的节点本次记为未测（缺席），不出数值、不记 -1。
+    Enforce,
+}
+
+/// 生效的读回档位。回退 = 改这个常量后重新出包；三档各有单测。
+///
+/// 首发取「只观测」：读回通道在移动端的可用性与事件时延都还没有真机数据。
+///
+/// 「强制」档下读回不符的节点是「没测」不是「没通」：各腿都按缺席处理，故障切换腿把它报成
+/// [`CandidateProbe::MismatchSkipped`]，不进失败分支。
+const BINDING_READBACK: ReadbackMode = ReadbackMode::Observe;
+
+/// 走用户规则的测量（`system` 路径）的结果记在谁名下。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemAttribution {
+    /// 沿用旧行为：一律记在当前选中节点名下。
+    SelectedNode,
+    /// 读到了叶子出站而它不是选中节点时，结果归属「系统路径」本身，不写任何节点的延迟。
+    /// 没读到（流没建起来、限时内没到、流已断）时按旧行为记在选中节点名下：读回通道出故障
+    /// 不该让这条测量失效。
+    LeafMatch,
+}
+
+/// 生效的系统路径归属口径。回退 = 改这个常量后重新出包；两种取值各有单测。
+/// 读回关闭时读不到叶子出站，按旧行为处理。
+const SYSTEM_PATH_ATTRIBUTION: SystemAttribution = SystemAttribution::LeafMatch;
+
+/// 「系统路径」这个对象在结果里的 id。归属它的结果只入账、不向外发事件：既有界面按 `serverId`
+/// 写节点延迟，而它不是节点。
+pub(crate) const SYSTEM_PATH_ID: &str = "__system_path__";
+
+/// 走本机代理入站的一次测量，结果该不该记在选中节点名下（纯函数）。
+///
+/// 钉到选中出口的入站量到的就是选中出口，恒记在它名下。走用户规则的入站可能被规则分流到别处，
+/// 所以要看读回的叶子出站：读到了且不是选中节点才不记；没读到时照旧记（`binding` 块标
+/// `unverified`）。选中节点不在起核快照里（没有 tag）而读到了叶子，算读到且不等。
+pub(crate) fn system_result_belongs_to_node(
+    policy: RoutePolicy,
+    mode: ReadbackMode,
+    attribution: SystemAttribution,
+    carried_by: Option<&str>,
+    selected_tag: Option<&str>,
+) -> bool {
+    policy != RoutePolicy::UserRoute
+        || mode == ReadbackMode::Off
+        || attribution == SystemAttribution::SelectedNode
+        || carried_by.is_none_or(|leaf| Some(leaf) == selected_tag)
+}
+
+/// 一轮运行的读回上下文：见证、档位、节点归类与计数。克隆共享同一份。
+#[derive(Clone)]
+pub(crate) struct Readback {
+    witness: Arc<dyn BindingWitness>,
+    mode: ReadbackMode,
+    /// 起核产物里的静态取材：哪些 tag 是 endpoint、各 tag 的前置出站、规则名映射。
+    context: Arc<SpeedBindingContext>,
+    /// 各结论的次数，按 [`BindingVerdict`] 的声明顺序（不含 `static`）。
+    tally: Arc<[AtomicU64; 4]>,
+}
+
+impl Readback {
+    pub(crate) fn new(
+        mode: ReadbackMode,
+        witness: Arc<dyn BindingWitness>,
+        context: SpeedBindingContext,
+    ) -> Self {
+        Self {
+            witness,
+            mode,
+            context: Arc::new(context),
+            tally: Arc::default(),
+        }
+    }
+
+    /// 不做读回。
+    #[cfg(test)]
+    pub(crate) fn off() -> Self {
+        Self::new(
+            ReadbackMode::Off,
+            Arc::new(NoWitness),
+            SpeedBindingContext::default(),
+        )
+    }
+
+    /// 生产入口：按档位在给定的管理端点上开一条见证流。建流在后台进行，不阻塞准入；
+    /// 建不起来不拒绝本轮，本轮结果的承载出站一律记为未验证。
+    ///
+    /// `watched` 是本腿的测量连接会经过的入站：别的入站上的连接不进对账。
+    fn open(
+        mode: ReadbackMode,
+        endpoint: Option<(u16, String)>,
+        context: SpeedBindingContext,
+        watched: WatchedInbounds,
+    ) -> Self {
+        if mode == ReadbackMode::Off {
+            return Self::new(mode, Arc::new(NoWitness), context);
+        }
+        let witness = StreamWitness::spawn(async move {
+            let (port, secret) = endpoint.ok_or_else(|| "管理端点未就绪".to_string())?;
+            SingBoxApiClient::connection_events_at(
+                Endpoint::new("127.0.0.1", port),
+                secret,
+                witness::CONNECTION_EVENTS_INTERVAL_NS,
+            )
+            .await
+            .map(|frames| witness::record_stream(frames, watched))
+            .map_err(|error| error.to_string())
+        });
+        Self::new(mode, Arc::new(witness), context)
+    }
+
+    fn kind_of(&self, tag: &str) -> NodeKind {
+        if self.context.endpoint_tags.contains(tag) {
+            NodeKind::Endpoint
+        } else {
+            NodeKind::Outbound
+        }
+    }
+
+    /// 等见证流建立（限时）。只有一次测量的腿在起测前调：流晚于测量建立时，这条测量连接只能靠
+    /// 首帧里的存量补上。
+    async fn ready(&self) {
+        if self.mode != ReadbackMode::Off {
+            self.witness.ready().await;
+        }
+    }
+
+    /// 登记一条刚连上 `inbound` 入站口的测量连接（见 [`BindingWitness::expect`]）。
+    fn expect(&self, inbound: &str, source_port: u16) {
+        if self.mode != ReadbackMode::Off {
+            self.witness.expect(inbound, source_port);
+        }
+    }
+
+    /// 取一条测量连接的记录。没有源端口（连接没建起来）即没有记录可查。
+    async fn lookup(&self, inbound: &str, source_port: Option<u16>) -> Option<ConnRecord> {
+        match source_port {
+            Some(port) if self.mode != ReadbackMode::Off => {
+                self.witness.lookup(inbound, port).await
+            }
+            _ => None,
+        }
+    }
+
+    /// 给一次测量出 `binding` 块并计数。`requested` 是请求的节点 tag；没有指定节点的测量传 `None`。
+    fn bind(
+        &self,
+        policy: RoutePolicy,
+        requested: Option<&str>,
+        record: Option<ConnRecord>,
+    ) -> Binding {
+        let verdict = (self.mode != ReadbackMode::Off).then(|| {
+            judge_binding(
+                requested,
+                record.as_ref().map(|record| record.outbound.as_str()),
+            )
+        });
+        let slot = match verdict {
+            Some(BindingVerdict::Confirmed) => Some(0),
+            Some(BindingVerdict::Mismatch) => Some(1),
+            Some(BindingVerdict::Unverified) => Some(2),
+            Some(BindingVerdict::Observed) => Some(3),
+            Some(BindingVerdict::Static) | None => None,
+        };
+        if let Some(slot) = slot {
+            self.tally[slot].fetch_add(1, Ordering::AcqRel);
+        }
+        // 前置出站是承载者自己的配置：读到了取叶子的，没读到取请求节点的。
+        let carrier = record
+            .as_ref()
+            .map(|record| record.outbound.as_str())
+            .or(requested);
+        Binding {
+            policy,
+            requested_tag: requested.map(str::to_string),
+            requested_kind: requested.map(|tag| self.kind_of(tag)),
+            verdict,
+            static_detour: carrier.and_then(|tag| self.context.static_detours.get(tag).cloned()),
+            rule_name: record
+                .as_ref()
+                .and_then(|record| self.context.rule_names.get(&record.rule).cloned()),
+            record,
+        }
+    }
+
+    /// 关闭见证流并等它结束。终态事件必须在这之后发。
+    async fn close(&self) {
+        self.witness.close().await;
+    }
+
+    /// 汇总行里的读回一段；读回关闭时为空。
+    fn summary(&self) -> String {
+        if self.mode == ReadbackMode::Off {
+            return String::new();
+        }
+        let count = |slot: usize| self.tally[slot].load(Ordering::Acquire);
+        format!(
+            " 读回 confirmed {} mismatch {} unverified {} observed {} 流 {} 最长等待 {}ms",
+            count(0),
+            count(1),
+            count(2),
+            count(3),
+            self.witness.state().as_str(),
+            self.witness.max_wait_ms(),
+        )
     }
 }
 
@@ -414,6 +865,8 @@ pub(crate) struct ResultIdentity {
     pub(crate) network_epoch: Option<u64>,
     /// 后端出结果那一刻的 Unix 毫秒。
     pub(crate) measured_at: u64,
+    /// 读回的结论（取自结果的 `binding` 块）；没有读回为 `None`。不进身份块的 JSON。
+    pub(crate) binding: Option<BindingVerdict>,
 }
 
 impl ResultIdentity {
@@ -476,6 +929,12 @@ pub(crate) struct RunEvents {
     failed_samples: Vec<String>,
     /// 逐节点结果盖章后入的那本账。
     ledger: &'static MeasurementLedger,
+    /// 本轮的读回上下文（汇总行取它的计数与流状态）。
+    readback: Option<Readback>,
+    /// 绑定由配置结构保证的结果条数（临时核腿）。
+    static_bound: usize,
+    /// 归属「系统路径」的结果条数。它们不是节点的结果，不进成功与失败数。
+    system_path: usize,
 }
 
 impl RunEvents {
@@ -503,6 +962,7 @@ impl RunEvents {
                 node_fingerprint: None,
                 network_epoch: None,
                 measured_at: 0,
+                binding: None,
             },
             fingerprints,
             requested: request.targets.len(),
@@ -513,7 +973,16 @@ impl RunEvents {
             failures: BTreeMap::new(),
             failed_samples: Vec::new(),
             ledger: measurement_ledger::global(),
+            readback: None,
+            static_bound: 0,
+            system_path: 0,
         }
+    }
+
+    /// 接上本轮的读回上下文。
+    fn with_readback(mut self, readback: &Readback) -> Self {
+        self.readback = Some(readback.clone());
+        self
     }
 
     /// 换一本账（周期一轮由调度器传入它读的那一本；测试传各自独立的）。
@@ -551,10 +1020,19 @@ impl RunEvents {
                 .and_then(|id| self.fingerprints.get(id))
                 .cloned();
             identity.network_epoch = payload["identity"]["networkEpoch"].as_u64();
+            identity.binding = payload["binding"]["verdict"]
+                .as_str()
+                .and_then(BindingVerdict::parse);
+            if identity.binding == Some(BindingVerdict::Static) {
+                self.static_bound += 1;
+            }
             identity.measured_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-            if payload["failure"].is_object() {
+            let system_path = payload["serverId"] == SYSTEM_PATH_ID;
+            if system_path {
+                self.system_path += 1;
+            } else if payload["failure"].is_object() {
                 let label = format!(
                     "{}/{}",
                     payload["failure"]["phase"].as_str().unwrap_or_default(),
@@ -579,6 +1057,10 @@ impl RunEvents {
                 self.ledger.record(node_id, measured, identity.clone());
             }
             payload["identity"] = identity.to_json();
+            // 归属「系统路径」的结果到此为止：已入账，不向外发（见 [`SYSTEM_PATH_ID`]）。
+            if system_path {
+                return None;
+            }
         } else {
             payload["seq"] = json!(self.identity.seq);
         }
@@ -616,8 +1098,19 @@ impl RunEvents {
         } else {
             format!("；失败样本 {}", self.failed_samples.join(", "))
         };
+        let mut readback = self
+            .readback
+            .as_ref()
+            .map(Readback::summary)
+            .unwrap_or_default();
+        if self.static_bound > 0 {
+            readback.push_str(&format!(" 读回 static {}", self.static_bound));
+        }
+        if self.system_path > 0 {
+            readback.push_str(&format!(" 系统路径 {}", self.system_path));
+        }
         format!(
-            "测速一轮完成：run={} origin={} context={context} outcome={} reason={} 请求 {} 可测 {} 成功 {} 失败 {} {:?} 起测前跳过 {:?} 未测 {} 耗时 {}ms{tail}",
+            "测速一轮完成：run={} origin={} context={context} outcome={} reason={} 请求 {} 可测 {} 成功 {} 失败 {} {:?} 起测前跳过 {:?} 未测 {} 耗时 {}ms{readback}{tail}",
             self.run_id,
             self.identity.origin.as_str(),
             done["outcome"].as_str().unwrap_or("-"),
@@ -1626,11 +2119,15 @@ async fn run_temp_core_speed_test(
             async move {
                 #[cfg(target_os = "android")]
                 {
-                    measure_via_local_proxy(port, Some(&auth), &url).await
+                    measure_via_local_proxy(port, Some(&auth), &url, &|_| {})
+                        .await
+                        .measured
                 }
                 #[cfg(not(target_os = "android"))]
                 {
-                    measure_via_local_proxy(port, None, &url).await
+                    measure_via_local_proxy(port, None, &url, &|_| {})
+                        .await
+                        .measured
                 }
             }
         },
@@ -1872,6 +2369,14 @@ pub async fn server_speed_test(
             ts_pending: &ts_pending,
             ts_reasons: &ts_reasons,
         };
+        let open_readback = || {
+            Readback::open(
+                BINDING_READBACK,
+                proxy.readback_endpoint(ticket.as_ref()),
+                proxy.speed_binding_context(),
+                WatchedInbounds::ProbePool,
+            )
+        };
         let response = run_pool_speed_test(
             &app,
             &proxy,
@@ -1885,6 +2390,7 @@ pub async fn server_speed_test(
             context.as_ref(),
             guard.cancel(),
             &mut done,
+            &open_readback,
         )
         .await;
         release_then_emit(guard, done, emit_done);
@@ -1944,15 +2450,23 @@ pub async fn server_speed_test(
             "代理核在运行但本地代理端口缺失（端口分配失败），本层无从测速：重启内核后重试",
         ));
     };
-    // 本腿经本机代理入站出网（走用户的完整路由与 DNS）⇒ 路径记 `system`。池未注入时读不到起核
+    // 本腿经本机代理入站出网。路径由实际用的入站定：`mixed-in` 走用户的完整路由与 DNS，记
+    // `system`；`probe-proxy-in` 钉到选中出口、不经用户规则，记 `selected`。池未注入时读不到起核
     // 指纹快照（见模块文档「已知残留」）⇒ 节点指纹留空。
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,
         targets: server_ids.unwrap_or(all),
         scope: None,
-        path: MeasurePath::System,
+        path: MeasurePath::of_local_inbound(local_proxy.inbound),
         url: url.clone(),
     };
+    let readback = Readback::open(
+        BINDING_READBACK,
+        proxy.readback_endpoint(ticket.as_ref()),
+        proxy.speed_binding_context(),
+        WatchedInbounds::One(local_proxy.inbound.tag()),
+    );
+    let selected_tag = proxy.management_target_for(&active).map(|(_, _, tag)| tag);
     let mut events = RunEvents::new(
         &run_id,
         &request,
@@ -1964,7 +2478,8 @@ pub async fn server_speed_test(
         BTreeMap::new(),
         context.clone(),
     )
-    .with_skipped(vec![("notInPool", skipped.len())]);
+    .with_skipped(vec![("notInPool", skipped.len())])
+    .with_readback(&readback);
     let (results, outcome) = drive_fallback_measure(
         &active,
         &superseded,
@@ -1979,12 +2494,26 @@ pub async fn server_speed_test(
                     }
                 },
                 &invalid,
-                || measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &url),
+                || {
+                    measure_inbound(
+                        &readback,
+                        local_proxy.inbound.tag(),
+                        local_proxy.port,
+                        local_proxy.auth.as_ref(),
+                        &url,
+                    )
+                },
             )
             .await
-            .unwrap_or(BINDING_LOST)
+            .unwrap_or(BINDING_LOST.into())
         },
         &mut events.sink(hold_terminal(&app, &mut done)),
+        &SystemProbe {
+            inbound: local_proxy.inbound,
+            selected_tag: selected_tag.as_deref(),
+            readback: &readback,
+            attribution: SYSTEM_PATH_ATTRIBUTION,
+        },
     )
     .await;
     release_then_emit(guard, done, emit_done);
@@ -2031,15 +2560,25 @@ async fn drive_fallback_measure<Meas, MeasFut>(
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     measure: Meas,
     emit: &mut (dyn FnMut(&str, Value) + Send),
+    probe: &SystemProbe<'_>,
 ) -> (serde_json::Map<String, Value>, &'static str)
 where
     Meas: FnOnce() -> MeasFut,
-    MeasFut: Future<Output = Measured>,
+    MeasFut: Future<Output = Probed>,
 {
     let intended = [active.to_string()];
-    let (results, reason) =
-        drive_fallback_measure_inner(active, superseded, cancel, network_epoch, measure, emit)
-            .await;
+    let (results, reason) = drive_fallback_measure_inner(
+        active,
+        superseded,
+        cancel,
+        network_epoch,
+        measure,
+        emit,
+        probe,
+    )
+    .await;
+    // 终态发出之前，读回用的连接事件流已经关闭。
+    probe.readback.close().await;
     let outcome = outcome_of(reason);
     emit_speed_test_done(emit, outcome, &results, &intended, reason);
     (results, outcome)
@@ -2073,18 +2612,19 @@ async fn drive_fallback_measure_inner<Meas, MeasFut>(
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     measure: Meas,
     emit: &mut (dyn FnMut(&str, Value) + Send),
+    probe: &SystemProbe<'_>,
 ) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
 where
     Meas: FnOnce() -> MeasFut,
-    MeasFut: Future<Output = Measured>,
+    MeasFut: Future<Output = Probed>,
 {
     let epoch0 = network_epoch();
     // 经本机混合端口真实测速：warm-TTFB（两次 GET 计第二次，对齐 mihomo unified-delay）。
     // 与取消竞速：取消命中即丢掉在飞的测量（本函数不 spawn，丢 future 即关 socket），不等它测完。
-    let measured = tokio::select! {
+    let (measured, record) = tokio::select! {
         biased;
         reason = cancel.cancelled() => return (serde_json::Map::new(), Some(reason)),
-        measured = measure() => measured,
+        measured = measure_system(probe, measure) => measured,
     };
 
     // ── 让位（测量后）：在飞期间核跃迁/崩溃 ⇒ 在飞值量的是新核/已死核的出站 → 丢弃并略过该节点 ──
@@ -2095,6 +2635,21 @@ where
     let epoch = network_epoch();
     if network_epoch_changed(epoch0, epoch) {
         log::info!("测速期间网络发生变化，节点 {active} 本轮记为未测");
+        return (serde_json::Map::new(), None);
+    }
+
+    let binding = probe.bind(record);
+    // 走用户规则的测量可能被规则分流到别处：叶子出站不是选中节点时，这个值不属于它。
+    // 结果归属「系统路径」本身（只入账），选中节点本轮缺席。
+    if !probe.belongs_to_node(&binding) {
+        log::info!(
+            "系统路径测量未经由选中节点 {active}（实际承载 {}），结果不记入该节点",
+            binding.carried_by().unwrap_or("未读到")
+        );
+        emit(
+            EVENT_SPEED_TEST_RESULT,
+            result_payload_with_binding(SYSTEM_PATH_ID, &measured, epoch, Some(&binding)),
+        );
         return (serde_json::Map::new(), None);
     }
 
@@ -2110,8 +2665,36 @@ where
         &measured,
         epoch,
         1,
+        Some(&binding),
     );
     (results, None)
+}
+
+/// 回退腿与出口伴测共用的取材：经哪个本机入站测、选中节点在运行核里的 tag、读回与归属口径。
+pub(crate) struct SystemProbe<'a> {
+    pub(crate) inbound: LocalInbound,
+    /// 选中节点在运行核里的 tag；它不在起核快照里时为 `None`。
+    pub(crate) selected_tag: Option<&'a str>,
+    pub(crate) readback: &'a Readback,
+    pub(crate) attribution: SystemAttribution,
+}
+
+impl SystemProbe<'_> {
+    /// 这类测量不指定节点：读回只有「读到了」与「没读到」。
+    fn bind(&self, record: Option<ConnRecord>) -> Binding {
+        self.readback
+            .bind(RoutePolicy::of_local_inbound(self.inbound), None, record)
+    }
+
+    fn belongs_to_node(&self, binding: &Binding) -> bool {
+        system_result_belongs_to_node(
+            binding.policy,
+            self.readback.mode,
+            self.attribution,
+            binding.carried_by(),
+            self.selected_tag,
+        )
+    }
 }
 
 /// **§15 主核探测池分波测速**（`server_speed_test` 池就绪腿；对齐 上游 `SpeedTestService.testServersViaMainCore`）。
@@ -2141,6 +2724,7 @@ async fn run_pool_speed_test(
     context: Option<&Value>,
     cancel: &SpeedTestCancel,
     done: &mut Option<Value>,
+    open_readback: &(dyn Fn() -> Readback + Sync),
 ) -> ApiResponse<Value> {
     let PoolPartition {
         testable: pool_testable,
@@ -2167,6 +2751,8 @@ async fn run_pool_speed_test(
         return ApiResponse::err_with_code(msg, code);
     }
 
+    // 零可测已在上面早退：到这里才建读回流。
+    let readback = &open_readback();
     let total = pool_testable.len();
     let waves = plan_waves(
         &pool_testable,
@@ -2204,7 +2790,8 @@ async fn run_pool_speed_test(
         ("notInPool", not_in_pool.len()),
         ("dirty", dirty.len()),
         ("tsNotReady", ts_not_ready.len()),
-    ]);
+    ])
+    .with_readback(readback);
 
     let (results, outcome) = drive_pool_waves(
         &waves,
@@ -2234,13 +2821,14 @@ async fn run_pool_speed_test(
                 .unwrap_or(false)
             }
         },
-        |port| {
+        |slot, port| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
             let runtime = Arc::clone(proxy);
             let ticket = ticket.cloned();
             let invalid = Arc::clone(&invalid);
+            let readback = readback.clone();
             async move {
                 bound_speed_io(
                     || async {
@@ -2250,14 +2838,15 @@ async fn run_pool_speed_test(
                         }
                     },
                     &invalid,
-                    || measure_via_local_proxy(port, auth.as_ref(), &url),
+                    || measure_slot(&readback, slot, port, auth.as_ref(), &url),
                 )
                 .await
-                .unwrap_or(BINDING_LOST)
+                .unwrap_or(BINDING_LOST.into())
             }
         },
         &mut events.sink(hold_terminal(app, done)),
         targets.pool_ports.as_slice(),
+        readback,
     )
     .await;
 
@@ -2289,7 +2878,7 @@ async fn run_pool_speed_test(
 pub(crate) enum RuntimeProbeBatch {
     Busy,
     Interrupted,
-    Completed(BTreeMap<String, Option<u32>>),
+    Completed(BTreeMap<String, CandidateProbe>),
 }
 
 /// 经当前运行核的 K 槽 probe pool 对一组 `(serverId, outboundTag)` 做真实协议链探测。
@@ -2329,6 +2918,12 @@ pub(crate) async fn probe_runtime_candidates(
         url: url.to_string(),
     };
     let run_id = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE).unwrap_or_default();
+    let readback = Readback::open(
+        BINDING_READBACK,
+        proxy.management_endpoint(),
+        proxy.speed_binding_context(),
+        WatchedInbounds::ProbePool,
+    );
     let mut events = RunEvents::new(
         &run_id,
         &request,
@@ -2339,40 +2934,91 @@ pub(crate) async fn probe_runtime_candidates(
         proxy.ready_main_emission_digest(gen0),
         targets.fingerprints.clone(),
         None,
-    );
-    let (raw, outcome) = drive_pool_waves(
+    )
+    .with_readback(&readback);
+    let mut sink = events.sink(|_, _| {});
+    drive_runtime_probe(
+        candidates,
         &waves,
-        candidates.len(),
         &superseded,
         guard.cancel(),
-        // 本腿的返回类型分不出「没测」与「没通」（缺席即 `None`），故不按网络代次作废单个节点：
-        // 代次恒报未知，行为与引入代次之前相同。
-        &|| None,
         |slot, tag: String| async move { proxy.probe_select_slot(slot, &tag).await },
-        |port| {
+        |slot, port| {
             let url = url.to_string();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = targets.auth.clone();
-            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
+            let readback = readback.clone();
+            async move { measure_slot(&readback, slot, port, auth.as_ref(), &url).await }
         },
-        &mut events.sink(|_, _| {}),
+        &mut sink,
         targets.pool_ports.as_slice(),
+        &readback,
+    )
+    .await
+}
+
+/// 故障切换腿的编排核（热切、测量、事件出口全部注入）：跑一轮分波，把结果折成逐候选的结局。
+#[allow(clippy::too_many_arguments)]
+async fn drive_runtime_probe<Sel, SelFut, Meas, MeasFut>(
+    candidates: &[(String, String)],
+    waves: &[Vec<SlotAssignment>],
+    superseded: &(dyn Fn() -> bool + Sync),
+    cancel: &SpeedTestCancel,
+    select_slot: Sel,
+    measure: Meas,
+    emit: &mut (dyn FnMut(&str, Value) + Send),
+    pool_ports: &[u16],
+    readback: &Readback,
+) -> RuntimeProbeBatch
+where
+    Sel: Fn(usize, String) -> SelFut,
+    SelFut: Future<Output = bool>,
+    Meas: Fn(usize, u16) -> MeasFut,
+    MeasFut: Future<Output = Probed> + Send + 'static,
+{
+    let mut trace = WaveTrace::default();
+    let (raw, reason) = drive_pool_waves_traced(
+        waves,
+        candidates.len(),
+        superseded,
+        cancel,
+        // 本腿不按网络代次作废单个节点：代次恒报未知，行为与引入代次之前相同。
+        &|| None,
+        select_slot,
+        measure,
+        emit,
+        pool_ports,
+        &mut trace,
+        readback,
     )
     .await;
-    if outcome == "interrupted" {
+    if reason.is_some() {
         return RuntimeProbeBatch::Interrupted;
     }
-    let measured = candidates
+    RuntimeProbeBatch::Completed(candidate_probes(candidates, &raw, &trace.mismatch_skipped))
+}
+
+/// 把一轮分波的结果折成逐候选的结局（纯函数）：出了值的是测得；记了 -1 的是真测了没通；
+/// 不在结果里的，**只有因读回不符被跳过的才算「没测」**，其余缺席（本机探针口连不上、测量任务
+/// 异常）与引入读回之前一样按没通计 —— 故障切换的后续判定因此在「只观测」档下与之前逐条相同。
+pub(crate) fn candidate_probes(
+    candidates: &[(String, String)],
+    raw: &serde_json::Map<String, Value>,
+    mismatch_skipped: &BTreeSet<String>,
+) -> BTreeMap<String, CandidateProbe> {
+    candidates
         .iter()
         .map(|(id, _)| {
-            let latency = raw
-                .get(id)
-                .and_then(Value::as_i64)
-                .and_then(|value| u32::try_from(value).ok());
-            (id.clone(), latency)
+            let probe = match raw.get(id).and_then(Value::as_i64) {
+                Some(value) => {
+                    u32::try_from(value).map_or(CandidateProbe::Failed, CandidateProbe::Measured)
+                }
+                None if mismatch_skipped.contains(id) => CandidateProbe::MismatchSkipped,
+                None => CandidateProbe::Failed,
+            };
+            (id.clone(), probe)
         })
-        .collect();
-    RuntimeProbeBatch::Completed(measured)
+        .collect()
 }
 
 /// 「测速并发」取自动时的值：桌面 32，手机 16。全部改回 16 即回到改动前的波宽。
@@ -2499,6 +3145,8 @@ pub(crate) struct ScheduledRoundDeps<'a> {
     pub(crate) wall_clock: &'a (dyn Fn() -> u64 + Sync),
     /// 相邻两条结果的墙钟间隔超过它即判设备冻结；取 `u64::MAX` 即关掉这条判据。
     pub(crate) freeze_gap_ms: u64,
+    /// 开本轮的读回上下文。确认有可测目标、领到运行号之后才调：没拿到闸或零可测的一轮不建流。
+    pub(crate) open_readback: &'a (dyn Fn() -> Readback + Sync),
 }
 
 /// **周期一轮的编排核**（热切 / 测量 / 事件出口全部注入，不碰宿主网络）。
@@ -2520,8 +3168,8 @@ pub(crate) async fn drive_scheduled_round<Sel, SelFut, Meas, MeasFut>(
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Measured> + Send + 'static,
+    Meas: Fn(usize, u16) -> MeasFut,
+    MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let Some(guard) = deps.gate.acquire(SpeedTestOrigin::Schedule).await else {
         return ScheduledRound::Busy(deps.gate.holder());
@@ -2565,6 +3213,8 @@ where
     let Some(run_id) = next_speed_test_run_id(deps.sequence) else {
         return ScheduledRound::Ran(report);
     };
+    // 有可测目标、领到了运行号，才建读回流。
+    let readback = (deps.open_readback)();
 
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Schedule,
@@ -2586,7 +3236,8 @@ where
         ("dirty", partition.dirty.len()),
         ("tsNotReady", partition.ts_not_ready.len()),
     ])
-    .with_ledger(deps.ledger);
+    .with_ledger(deps.ledger)
+    .with_readback(&readback);
 
     let mut trace = WaveTrace::default();
     let mut admitted: BTreeMap<String, bool> = BTreeMap::new();
@@ -2628,6 +3279,7 @@ where
             &mut gated,
             input.pool_ports,
             &mut trace,
+            &readback,
         )
         .await
     };
@@ -2679,6 +3331,20 @@ pub(crate) async fn run_scheduled_round(
     let url = resolve_speed_test_url(&config);
     let gen0 = proxy.core_generation();
     let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    // 读回流在准入之后才开；测量闭包从这里取同一份去登记自己的连接。
+    let round_readback: std::sync::OnceLock<Readback> = std::sync::OnceLock::new();
+    let open_readback = || {
+        round_readback
+            .get_or_init(|| {
+                Readback::open(
+                    BINDING_READBACK,
+                    proxy.management_endpoint(),
+                    proxy.speed_binding_context(),
+                    WatchedInbounds::ProbePool,
+                )
+            })
+            .clone()
+    };
     let input = ScheduledRoundInput {
         targets,
         scope,
@@ -2702,6 +3368,7 @@ pub(crate) async fn run_scheduled_round(
         abort,
         wall_clock: &crate::runtime::subscription_scheduler::now_ms,
         freeze_gap_ms,
+        open_readback: &open_readback,
     };
     drive_scheduled_round(
         input,
@@ -2712,11 +3379,20 @@ pub(crate) async fn run_scheduled_round(
             let proxy = Arc::clone(&proxy);
             async move { proxy.probe_select_slot(slot, &tag).await }
         },
-        |port| {
+        |slot, port| {
             let url = url.clone();
             // `probe-in-k` 的凭据与池端口同源同刻（`SpeedProbeTargets::auth`；桌面 `None`）。
             let auth = probe.auth.clone();
-            async move { measure_via_local_proxy(port, auth.as_ref(), &url).await }
+            let readback = round_readback.get().cloned();
+            async move {
+                match readback {
+                    Some(readback) => {
+                        measure_slot(&readback, slot, port, auth.as_ref(), &url).await
+                    }
+                    // 测量只在准入之后发起，那时读回已开；取不到就照测，读回落成未验证。
+                    None => measure_via_local_proxy(port, auth.as_ref(), &url, &|_| {}).await,
+                }
+            }
         },
         &mut |event, payload| {
             let _ = app.emit(event, payload);
@@ -2780,12 +3456,13 @@ async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
     measure: Meas,
     emit: &mut (dyn FnMut(&str, Value) + Send),
     pool_ports: &[u16],
+    readback: &Readback,
 ) -> (serde_json::Map<String, Value>, &'static str)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Measured> + Send + 'static,
+    Meas: Fn(usize, u16) -> MeasFut,
+    MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let (results, reason) = drive_pool_waves_traced(
         waves,
@@ -2798,6 +3475,7 @@ where
         emit,
         pool_ports,
         &mut WaveTrace::default(),
+        readback,
     )
     .await;
     (results, outcome_of(reason))
@@ -2808,6 +3486,9 @@ where
 pub(crate) struct WaveTrace {
     /// 本轮内波宽是否因本机侧报错减半过。
     pub(crate) halved: bool,
+    /// 因读回不符被「强制」档跳过的节点。它们缺席的原因是「量到的不是它」，与其余缺席
+    /// （本机侧故障、测量任务异常、跨网络变化）不同。
+    pub(crate) mismatch_skipped: BTreeSet<String>,
 }
 
 /// [`drive_pool_waves`] 的本体：多带一个 [`WaveTrace`]，并把中断成因原样交回（而不是折成
@@ -2824,12 +3505,13 @@ async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
     emit: &mut (dyn FnMut(&str, Value) + Send),
     pool_ports: &[u16],
     trace: &mut WaveTrace,
+    readback: &Readback,
 ) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Measured> + Send + 'static,
+    Meas: Fn(usize, u16) -> MeasFut,
+    MeasFut: Future<Output = Probed> + Send + 'static,
 {
     // 本腿「已裁定要测」的集合 = 分波后的全部槽位节点（`plan_waves` 就是按可测集分的波，
     // 故这里恒等于波前预筛后的 `pool_testable`，无第二真值源）。
@@ -2846,8 +3528,11 @@ where
         pool_ports,
         LOCAL_SIDE_HALVING,
         trace,
+        readback,
     )
     .await;
+    // 终态发出之前，读回用的连接事件流已经关闭。
+    readback.close().await;
     emit_speed_test_done(emit, outcome_of(reason), &results, &intended, reason);
     (results, reason)
 }
@@ -2874,12 +3559,13 @@ async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
     pool_ports: &[u16],
     local_side_halving: bool,
     trace: &mut WaveTrace,
+    readback: &Readback,
 ) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
-    Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Measured> + Send + 'static,
+    Meas: Fn(usize, u16) -> MeasFut,
+    MeasFut: Future<Output = Probed> + Send + 'static,
 {
     let mut results = serde_json::Map::new();
     let mut tested = 0usize;
@@ -2938,6 +3624,8 @@ where
                     &Err(MeasureFailure::new(FailPhase::Select, FailKind::Rejected)),
                     network_epoch(),
                     total,
+                    // 换选没成功，没有测量连接可读回。
+                    Some(&readback.bind(RoutePolicy::SlotPin, Some(&a.tag), None)),
                 );
             }
         }
@@ -2950,11 +3638,22 @@ where
                 continue;
             }
             let port = pool_ports[a.slot]; // slot < k = pool_ports.len()（plan_waves 保证）
-            let node_id = a.node_id.clone();
-            let fut = measure(port);
+            let assignment = a.clone();
+            let fut = measure(a.slot, port);
             // 起测那一刻的网络代次：测完再取一次，两刻不同即这个值跨了一次网络变化。
             let epoch0 = network_epoch();
-            set.spawn(async move { (node_id, epoch0, fut.await) });
+            let readback = readback.clone();
+            set.spawn(async move {
+                let Probed {
+                    measured,
+                    source_port,
+                } = fut.await;
+                // 读回在出值之后：等待不计入测量值；各节点在自己的任务里等，不拖住同波的其他节点。
+                let record = readback
+                    .lookup(&probe_pool_inbound_tag(assignment.slot), source_port)
+                    .await;
+                (assignment, epoch0, measured, record)
+            });
         }
         loop {
             // 与取消竞速：窗口里的节点全挂死时，取消也不必等它们各自走完 6s / 10s。
@@ -2970,9 +3669,10 @@ where
             };
             let Some(res) = joined else { break };
             // JoinError（panic）→ 该节点无数值，缺席，绝不补 -1。
-            let Ok((id, epoch0, measured)) = res else {
+            let Ok((assignment, epoch0, measured, record)) = res else {
                 continue;
             };
+            let id = assignment.node_id;
             // ── 让位③（**每节点**测完即查）：在飞期间跃迁 ⇒ 丢弃这一个及其后的在飞值
             //    （量的是新核/已死核，非本轮出口）。已回填的节点是跃迁前量到的真值，保留。
             if let Some(reason) = interrupted(cancel, superseded) {
@@ -2997,6 +3697,23 @@ where
                 }
                 continue;
             }
+            let binding = readback.bind(RoutePolicy::SlotPin, Some(&assignment.tag), record);
+            if binding.verdict == Some(BindingVerdict::Mismatch) {
+                log::warn!(
+                    "测速读回不符：槽 {} 请求 {}，实际承载 {}，出站链 {:?}",
+                    assignment.slot,
+                    assignment.tag,
+                    binding.carried_by().unwrap_or_default(),
+                    binding.record.as_ref().map(|record| &record.chain),
+                );
+                // 量到的不是这个节点：数值不属于它，也不是它的负面证据 ⇒ 缺席（原因
+                // binding_mismatch），整轮继续。
+                if readback.mode == ReadbackMode::Enforce {
+                    log::info!("节点 {id} 本轮记为未测：binding_mismatch");
+                    trace.mismatch_skipped.insert(id);
+                    continue;
+                }
+            }
             record_measured(
                 &mut results,
                 &mut tested,
@@ -3006,6 +3723,7 @@ where
                 &measured,
                 epoch,
                 total,
+                Some(&binding),
             );
         }
         if local_side_error {
@@ -3035,6 +3753,7 @@ fn record_measured(
     measured: &Measured,
     network_epoch: Option<u64>,
     total: usize,
+    binding: Option<&Binding>,
 ) {
     if let Err(failure) = measured {
         log::debug!(
@@ -3049,7 +3768,7 @@ fn record_measured(
     );
     emit(
         EVENT_SPEED_TEST_RESULT,
-        speed_test_result_payload(node_id, measured, network_epoch),
+        result_payload_with_binding(node_id, measured, network_epoch, binding),
     );
     *tested += 1;
     if measured.is_ok() {
@@ -3206,19 +3925,96 @@ async fn measure_warm_ttfb_with<T: WarmTunnel>(
 ///
 /// `auth`：该入站要求的凭据（Android 主核的 `probe-in-k` / `probe-proxy-in`：本次起核的一次性凭据；
 /// 桌面主核与临时核：`None`，那些入站零认证）。必填参数：每个调用点在编译期回答「我拿的是哪一份」。
+///
+/// 返回值连同这条隧道在本机一侧的源端口（读回见证的对账键）。`announce` 在隧道 socket 连上、
+/// 尚未发出任何字节时拿到它（向见证登记用）；返回值里的就是那一刻交出去的同一个端口，**隧道
+/// 随后没建成也带出**：登记过的连接必须有人去查或撤销，否则登记项会留到轮末。
 async fn measure_via_local_proxy(
     proxy_port: u16,
     auth: Option<&InboundUser>,
     url: &str,
-) -> Measured {
-    let target = SpeedTestTarget::parse(url)
-        .ok_or(MeasureFailure::new(FailPhase::Connect, FailKind::Rejected))?;
-    measure_warm_ttfb(
+    announce: &(dyn Fn(u16) + Sync),
+) -> Probed {
+    let Some(target) = SpeedTestTarget::parse(url) else {
+        return Err(MeasureFailure::new(FailPhase::Connect, FailKind::Rejected)).into();
+    };
+    let announced = Mutex::new(None);
+    let measured = measure_warm_ttfb(
         Duration::from_millis(SPEED_TEST_COLD_TIMEOUT_MS),
         Duration::from_millis(SPEED_TEST_REUSE_TIMEOUT_MS),
-        open_tunnel(proxy_port, auth, &target),
+        open_tunnel(proxy_port, auth, &target, &|source_port| {
+            *announced.lock().unwrap_or_else(PoisonError::into_inner) = Some(source_port);
+            announce(source_port);
+        }),
     )
+    .await;
+    Probed {
+        measured,
+        source_port: announced
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+    }
+}
+
+/// 经 `inbound` 入站测一次；隧道 socket 一连上就向见证登记这条连接。
+async fn measure_inbound(
+    readback: &Readback,
+    inbound: &str,
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    url: &str,
+) -> Probed {
+    measure_via_local_proxy(proxy_port, auth, url, &|source_port| {
+        readback.expect(inbound, source_port);
+    })
     .await
+}
+
+/// 池腿的一次测量：登记在第 `slot` 槽的入站名下。槽号由驱动函数给，它随后按同一个槽去查。
+async fn measure_slot(
+    readback: &Readback,
+    slot: usize,
+    port: u16,
+    auth: Option<&InboundUser>,
+    url: &str,
+) -> Probed {
+    measure_inbound(readback, &probe_pool_inbound_tag(slot), port, auth, url).await
+}
+
+/// 回退腿与出口伴测共用的一次测量：先限时等见证流建立，再测，出值之后读回。
+/// 两段等待都在测量之外，不计入测量值。
+async fn measure_system<Meas, MeasFut>(
+    probe: &SystemProbe<'_>,
+    measure: Meas,
+) -> (Measured, Option<ConnRecord>)
+where
+    Meas: FnOnce() -> MeasFut,
+    MeasFut: Future<Output = Probed>,
+{
+    probe.readback.ready().await;
+    let Probed {
+        measured,
+        source_port,
+    } = measure().await;
+    let record = probe
+        .readback
+        .lookup(probe.inbound.tag(), source_port)
+        .await;
+    (measured, record)
+}
+
+/// 出口伴测的测量：只有这一次，读完即关流并等它结束，结果在那之后才发。
+async fn companion_measure<Meas, MeasFut>(
+    probe: &SystemProbe<'_>,
+    measure: Meas,
+) -> (Measured, Option<ConnRecord>)
+where
+    Meas: FnOnce() -> MeasFut,
+    MeasFut: Future<Output = Probed>,
+{
+    let measured = measure_system(probe, measure).await;
+    probe.readback.close().await;
+    measured
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3301,11 +4097,17 @@ pub(crate) fn spawn_warm_rtt_probe(
         origin: SpeedTestOrigin::Companion,
         targets: vec![active_id.clone()],
         scope: None,
-        path: MeasurePath::System,
+        path: MeasurePath::of_local_inbound(local_proxy.inbound),
         url: resolve_speed_test_url(config),
     };
     let app = app.clone();
     let proxy = Arc::clone(&app.state::<AppRuntime>().proxy);
+    // 读回的取材同样在 await 之前：管理端点与选中节点的 tag 属于开测那一刻的主核。
+    let endpoint = proxy.management_endpoint();
+    let binding_context = proxy.speed_binding_context();
+    let selected_tag = proxy
+        .management_target_for(&active_id)
+        .map(|(_, _, tag)| tag);
     // 身份基准同样在 await 之前取：世代、起核时刻、配置摘要属于**开测那一刻**的主核。
     let generation = proxy.core_generation();
     let instance = CoreInstance::Main {
@@ -3315,10 +4117,30 @@ pub(crate) fn spawn_warm_rtt_probe(
     let config_digest = proxy.ready_main_emission_digest(generation);
     tauri::async_runtime::spawn(async move {
         let network_epoch0 = proxy.network_epoch();
+        let readback = Readback::open(
+            BINDING_READBACK,
+            endpoint,
+            binding_context,
+            WatchedInbounds::One(local_proxy.inbound.tag()),
+        );
+        let probe = SystemProbe {
+            inbound: local_proxy.inbound,
+            selected_tag: selected_tag.as_deref(),
+            readback: &readback,
+            attribution: SYSTEM_PATH_ATTRIBUTION,
+        };
+        let (measured, record) = companion_measure(&probe, || {
+            measure_inbound(
+                &readback,
+                local_proxy.inbound.tag(),
+                local_proxy.port,
+                local_proxy.auth.as_ref(),
+                &request.url,
+            )
+        })
+        .await;
         // 失败 → 不 emit（保留旧徽标、绝不伪造 -1）；成功 → 广播让 UI 延迟徽标自动刷新。
-        if let Ok(latency) =
-            measure_via_local_proxy(local_proxy.port, local_proxy.auth.as_ref(), &request.url).await
-        {
+        if let Ok(latency) = measured {
             // 🔵 **emit 前复查出口 IP 探测上下文**：`active_id` 取自**开探时刻**的 config 快照，而本
             // 测量是异步的（秒级）。测量期间起停 / 热切会换掉出口，此刻的 `latency` 量的是**新**出口，
             // 写进 `active_id` 就是把新节点的 RTT 记到旧节点头上 —— 而延迟徽标是用户选节点的依据，
@@ -3344,6 +4166,8 @@ pub(crate) fn spawn_warm_rtt_probe(
                 &active_id,
                 latency,
                 network_epoch,
+                &probe,
+                record,
             );
             if let Some(payload) = payload {
                 let _ = app.emit(EVENT_SPEED_TEST_RESULT, payload);
@@ -3352,8 +4176,12 @@ pub(crate) fn spawn_warm_rtt_probe(
     });
 }
 
-/// 伴测那一条结果事件的载荷（纯函数，可单测）：既有的 `serverId` / `latency` 加身份块，
+/// 伴测那一条结果事件的载荷（可单测）：既有的 `serverId` / `latency` 加身份块与 `binding` 块，
 /// 顶层不带 `runId`。
+///
+/// 走用户规则的伴测被规则分流到别处时（叶子出站不是选中节点），结果归属「系统路径」本身：
+/// 照常入账，但返回 `None`，不写任何节点的延迟。
+#[allow(clippy::too_many_arguments)]
 fn companion_result_payload(
     run_id: &str,
     request: &SpeedTestRequest,
@@ -3362,7 +4190,19 @@ fn companion_result_payload(
     active_id: &str,
     latency: u32,
     network_epoch: Option<u64>,
+    probe: &SystemProbe<'_>,
+    record: Option<ConnRecord>,
 ) -> Option<Value> {
+    let binding = probe.bind(record);
+    let owner = if probe.belongs_to_node(&binding) {
+        active_id
+    } else {
+        log::info!(
+            "出口伴测未经由选中节点 {active_id}（实际承载 {}），结果不记入该节点",
+            binding.carried_by().unwrap_or("未读到")
+        );
+        SYSTEM_PATH_ID
+    };
     // 池未必在（伴测不依赖探针池）⇒ 与回退腿同一条残留：读不到起核指纹快照，节点指纹留空。
     RunEvents::new(
         run_id,
@@ -3374,7 +4214,7 @@ fn companion_result_payload(
     )
     .stamp(
         EVENT_SPEED_TEST_RESULT,
-        speed_test_result_payload(active_id, &Ok(latency), network_epoch),
+        result_payload_with_binding(owner, &Ok(latency), network_epoch, Some(&binding)),
     )
 }
 
@@ -3384,11 +4224,12 @@ fn companion_result_payload(
 //  内存态，随进程一起清空。
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// 结果的存放键：节点、路径、URL 摘要、口径。路径或 URL 不同的结果互不覆盖。
+/// 结果的存放键：节点、路径、路由策略、URL 摘要、口径。其中任何一项不同的结果互不覆盖。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResultKey {
     pub(crate) node_id: String,
     pub(crate) path: MeasurePath,
+    pub(crate) policy: RoutePolicy,
     pub(crate) url_digest: String,
     pub(crate) metric: &'static str,
 }
@@ -3397,6 +4238,7 @@ pub(crate) fn result_key(node_id: &str, identity: &ResultIdentity) -> ResultKey 
     ResultKey {
         node_id: node_id.to_string(),
         path: identity.path,
+        policy: RoutePolicy::of(identity.path, identity.instance),
         url_digest: identity.url_digest.clone(),
         metric: SPEED_TEST_METRIC,
     }
@@ -3456,16 +4298,21 @@ pub(crate) fn stale_reason(
     None
 }
 
-/// 一条结果能否进自动选点的候选：测出了值、路径为 `candidate`、经运行中的主核测得、且仍然当前。
-/// `system` 路径与「未连接测量」的结果在这里被结构性排除。
+/// 一条结果能否进自动选点的候选：测出了值、经运行中主核的探针槽测得、读回没有判不符、且仍然
+/// 当前。走用户规则、钉到选中出口与「未连接测量」的结果在这里被结构性排除。
+///
+/// 读回未验证的结果仍可选：它的保证与读回引入之前相同。条数见 [`RunEvents`] 的汇总行。
+///
+/// 读回不符的结果**在任何档位下都不可选**。「只观测」档不改变的是结果的状态：数值照常发布、
+/// 照常显示，在账本里算「有当前结果」；但选点判据不取它。「强制」档下这类结果根本不产生。
 pub(crate) fn is_selectable(
     measured: &Measured,
     identity: &ResultIdentity,
     current: &CurrentState<'_>,
 ) -> bool {
     measured.is_ok()
-        && identity.path == MeasurePath::Candidate
-        && matches!(identity.instance, CoreInstance::Main { .. })
+        && RoutePolicy::of(identity.path, identity.instance) == RoutePolicy::SlotPin
+        && identity.binding != Some(BindingVerdict::Mismatch)
         && stale_reason(identity, current).is_none()
 }
 

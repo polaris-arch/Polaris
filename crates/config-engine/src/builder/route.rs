@@ -409,7 +409,9 @@ pub fn build_route_config_with_report(
     }
     if deps.probe_proxy_port.is_some() {
         rules.push(RouteRule {
-            inbound: Some(OneOrMany::Many(vec!["probe-proxy-in".to_string()])),
+            inbound: Some(OneOrMany::Many(vec![
+                crate::builder::helpers::PROBE_PROXY_INBOUND_TAG.to_string(),
+            ])),
             action: Some("route".to_string()),
             outbound: Some(selected_server_tag.to_string()),
             ..empty_matcher()

@@ -215,7 +215,8 @@ fn runtime_local_http_proxy_follows_the_running_snapshot() {
         rt.local_http_proxy(),
         Some(LocalHttpProxy {
             port: 31002,
-            auth: Some(auth.clone())
+            auth: Some(auth.clone()),
+            inbound: LocalInbound::ProbeProxy,
         })
     );
     assert_eq!(rt.loopback_auth(), Some(auth));
@@ -226,7 +227,8 @@ fn runtime_local_http_proxy_follows_the_running_snapshot() {
         rt.local_http_proxy(),
         Some(LocalHttpProxy {
             port: 7890,
-            auth: None
+            auth: None,
+            inbound: LocalInbound::Mixed,
         })
     );
 }
@@ -295,6 +297,8 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
     ("via_local_proxy", 1),
     ("via_local_socks_proxy", 1),
     ("measure_via_local_proxy", 1),
+    ("measure_inbound", 3),
+    ("measure_slot", 3),
     ("open_tunnel", 1),
     ("probe_through_proxy", 1),
     ("probe_proxy_connectivity", 1),
@@ -303,7 +307,7 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
 /// 允许凭据实参为字面 `None` 的生产调用点：(路径, 折叠空白后的调用原文, 理由)。
 const NONE_AUTH_ALLOWED: &[(&str, &str, &str)] = &[(
     "src-tauri/src/commands/speedtest.rs",
-    "measure_via_local_proxy(port, None, &url)",
+    "measure_via_local_proxy(port, None, &url, &|_| {})",
     "临时核腿：临时核自建的 `in-<tag>` 入站零认证（`build_temp_core_config`），且临时核只在桌面跑\
      （Android 核在进程内，没有可 spawn 的临时核二进制）。",
 )];

@@ -1184,6 +1184,28 @@ pub struct LocalHttpProxy {
     pub port: u16,
     /// 该入站要求的凭据；`mixed-in` 恒零认证 ⇒ 恒 `None`。
     pub auth: Option<InboundUser>,
+    /// 取到的是哪一个入站。两者在内核里受的路由策略不同，测速据此标注结果。
+    pub inbound: LocalInbound,
+}
+
+/// [`LocalHttpProxy`] 背后的入站。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalInbound {
+    /// `mixed-in`：不钉死，走用户的全部路由规则与 DNS 规则。
+    Mixed,
+    /// `probe-proxy-in`：被路由钉到 `proxy-selector`，用户规则不参与。
+    ProbeProxy,
+}
+
+impl LocalInbound {
+    /// 该入站在运行核里的 tag。
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Mixed => polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG,
+            Self::ProbeProxy => polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG,
+        }
+    }
 }
 
 /// 选「经本机 http 代理入站出网」用哪个口（**纯函数**，单测与对拍门的取材点）。
@@ -1205,6 +1227,7 @@ pub fn select_local_http_proxy(
         return Some(LocalHttpProxy {
             port: mixed_port,
             auth: None,
+            inbound: LocalInbound::Mixed,
         });
     }
     probe_proxy_port
@@ -1212,7 +1235,20 @@ pub fn select_local_http_proxy(
         .map(|port| LocalHttpProxy {
             port,
             auth: loopback_auth,
+            inbound: LocalInbound::ProbeProxy,
         })
+}
+
+/// 测速结果 `binding` 块的静态取材（[`ProxyRuntime::speed_binding_context`] 产出）：全部来自
+/// **起核那一刻的生成产物**，不从当前磁盘配置重算。不依赖探针池，池未注入时同样有值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeedBindingContext {
+    /// 落在 `endpoints[]` 的 tag。
+    pub endpoint_tags: std::collections::BTreeSet<String>,
+    /// 带前置出站的 tag → 它的 `detour`。
+    pub static_detours: BTreeMap<String, String>,
+    /// 内核的规则描述 → 用户给规则起的名字。
+    pub rule_names: BTreeMap<String, String>,
 }
 
 /// **§15**：主核测速探测池目标（[`ProxyRuntime::speed_probe_targets`] 产出，`server_speed_test` 消费）。
@@ -1833,6 +1869,26 @@ impl ProxyRuntime {
             // modified），与测速「新」一侧的 5 维公式不同 ⇒ 恒不等 ⇒ 全员恒 dirty、整个波前恒被免测。
             fingerprints: snap.dirty_fingerprints,
         })
+    }
+
+    /// 测速 `binding` 块的静态取材。核未运行或没有快照 → 空。
+    #[must_use]
+    pub fn speed_binding_context(&self) -> SpeedBindingContext {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|snap| SpeedBindingContext {
+                    endpoint_tags: snap.endpoint_tags.clone(),
+                    static_detours: snap.static_detours.clone(),
+                    rule_names: snap
+                        .named_rule_by_raw
+                        .iter()
+                        .map(|(raw, rule)| (raw.clone(), rule.name.clone()))
+                        .collect(),
+                })
+            })
+            .unwrap_or_default()
     }
 
     /// 当前网络代次。`None` = **未知**（不是「未变」）。

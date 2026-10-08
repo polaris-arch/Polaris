@@ -2114,6 +2114,8 @@ fn mark_running_with_snapshot(rt: &ProxyRuntime, cfg: &Value) {
         id_to_tag,
         rule_target: BTreeMap::new(),
         named_rule_by_raw: BTreeMap::new(),
+        endpoint_tags: BTreeSet::new(),
+        static_detours: BTreeMap::new(),
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
         probe_pool_ports: vec![],
@@ -5157,9 +5159,18 @@ async fn spawn_runs_attestation_after_continuation() {
 /// **变异锁**：把 `with_current` 换回 `.current()` → 两条断言全红。
 #[test]
 fn clash_api_secret_projects_instead_of_deep_copying_the_config() {
-    let body = method_body(
+    // 取法的单点已收到 `runtime/management_api.rs`；本方法只委托给它，守卫跟到取法所在处。
+    let delegate = method_body(
         &module_code("runtime/proxy"),
         "    pub(super) fn clash_api_secret(&self) -> String {",
+    );
+    assert!(
+        delegate.contains("current_clash_api_secret(&self.config)"),
+        "运行时的 secret 必须经唯一的取法单点"
+    );
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate::test_support::crate_code("runtime/management_api.rs"),
+        "pub(crate) fn current_clash_api_secret(",
     );
     assert!(
         body.contains("with_current"),

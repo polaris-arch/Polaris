@@ -2063,7 +2063,9 @@ pub fn build_dns_config(
                 type_field: None,
                 action: Some("route".into()),
                 server: Some("dns-probe-exit-proxy".into()),
-                inbound: Some(OneOrMany::Many(vec!["probe-proxy-in".into()])),
+                inbound: Some(OneOrMany::Many(vec![
+                    crate::builder::helpers::PROBE_PROXY_INBOUND_TAG.into(),
+                ])),
                 disable_cache: Some(true),
                 rewrite_ttl: None,
                 ..Default::default()

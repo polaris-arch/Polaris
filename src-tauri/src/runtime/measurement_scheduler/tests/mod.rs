@@ -1311,6 +1311,7 @@ fn a_new_generation_or_network_forgives_failures_so_the_retest_covers_backed_off
             node_fingerprint: None,
             network_epoch: Some(5),
             measured_at: WALL,
+            binding: None,
         };
         ledger.record("good", Ok(50), identity(1));
         for run in 1..=u64::from(BACKOFF_AFTER_FAILURES) {

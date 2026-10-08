@@ -683,6 +683,7 @@ fn loopback_credential_debug_redacts_the_password() {
     let proxy = crate::runtime::proxy::LocalHttpProxy {
         port: 31002,
         auth: Some(user.clone()),
+        inbound: crate::runtime::proxy::LocalInbound::ProbeProxy,
     };
     let dbg = format!("{proxy:?}");
     assert!(

@@ -28,6 +28,34 @@ use std::future::Future;
 use std::pin::Pin;
 
 use polaris_singbox_grpc::{ClientError, SingBoxApiClient};
+use serde_json::Value;
+
+use crate::runtime::config::ConfigManager;
+
+/// 管理 API 的 Bearer secret 在一份配置里的取法（`clashApiSecret`；缺失 → 空串免认证）。
+///
+/// 从**原始配置 JSON** 里取这个键的唯一一处：运行核的各条管理 API 客户端、统计流、dashboard
+/// 连接信息与就绪票据都经这里。各读各的，迟早有一份忘了跟上。
+///
+/// 另有两处读的是**类型化配置**上的同名字段，取值源不同、不经这里：Tailscale 登录核的快照读
+/// 运行核起核时的那份配置（`commands/server.rs`），起核流程确认网格模式时读正在起的那份配置
+/// （`runtime/proxy/startup.rs`）。三处都登记在源门 `the_management_secret_has_a_single_reader` 里，
+/// 多出第四处即红。
+pub(crate) fn clash_api_secret_in(config: &Value) -> String {
+    config
+        .get("clashApiSecret")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// 当前已提交配置里的管理 API secret（读不到配置 → 空串）。
+///
+/// 走 `with_current` 投影而不是 `current()`：后者恒 clone 整份用户配置，而这里只要一个字符串。
+/// 闭包内只读一个字段、无 I/O、不回调 `ConfigManager`。
+pub(crate) fn current_clash_api_secret(config: &ConfigManager) -> String {
+    config.with_current(clash_api_secret_in).unwrap_or_default()
+}
 use polaris_switch_engine::{ConnectionSnapshot, ManagementApi, ManagementError};
 
 /// [`ManagementApi`] 的 gRPC 生产实现。

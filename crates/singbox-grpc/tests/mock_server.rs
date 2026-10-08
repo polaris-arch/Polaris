@@ -41,6 +41,9 @@ const SECRET: &str = "test-secret-123";
 /// 免得重连把订阅计数搅成不确定值。
 const NO_RECONNECT: Duration = Duration::from_secs(3600);
 
+/// `SubscribeConnections` 的逐帧脚本。
+type ConnectionScript = Vec<Result<ConnectionEvents, Status>>;
+
 /// mock server 状态：记录收到的调用 + 可配置的流行为。
 #[derive(Default)]
 struct MockState {
@@ -77,6 +80,13 @@ struct MockState {
     openconnect_cancels: Arc<std::sync::Mutex<Vec<daemon::OpenConnectAuthChallengeCancel>>>,
     openvpn_submissions: Arc<std::sync::Mutex<Vec<daemon::OpenVpnChallengeSubmission>>>,
     openvpn_cancels: Arc<std::sync::Mutex<Vec<daemon::OpenVpnChallengeCancel>>>,
+    /// `SubscribeConnections` 逐帧回放的脚本（`None` = 沿用下面按 interval 决定的单帧行为）。
+    /// 脚本放完后流保持打开，直到客户端退订；脚本里的 `Err` 即流中途报错。
+    connection_script: Arc<std::sync::Mutex<Option<ConnectionScript>>>,
+    /// `SubscribeConnections` 被订阅的次数。
+    connection_calls: Arc<AtomicU64>,
+    /// 为真时 `SubscribeConnections` 永不应答（核卡死）。
+    connection_hang: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct MockService {
@@ -451,7 +461,24 @@ impl StartedService for MockService {
         req: Request<SubscribeConnectionsRequest>,
     ) -> Result<Response<Self::SubscribeConnectionsStream>, Status> {
         check_auth(&req, &self.secret)?;
+        self.state.connection_calls.fetch_add(1, Ordering::Relaxed);
+        if self.state.connection_hang.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
         let (tx, rx) = tokio::sync::mpsc::channel(4);
+        if let Some(script) = self.state.connection_script.lock().unwrap().clone() {
+            tokio::spawn(async move {
+                for frame in script {
+                    let failed = frame.is_err();
+                    if tx.send(frame).await.is_err() || failed {
+                        return;
+                    }
+                }
+                // 真核的流不会自己结束：等客户端退订。
+                tx.closed().await;
+            });
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
         let reset = req.get_ref().interval != 0; // interval!=0 → 首帧带 reset
         tokio::spawn(async move {
             if reset {
@@ -1562,4 +1589,215 @@ async fn taildrop_inbox_snapshot_is_empty_not_an_error_for_an_unknown_tag() {
     assert!(inbox.files.is_empty());
     assert!(inbox.receiving.is_empty());
     assert_eq!(inbox.endpoint_tag, "", "空帧不带 tag");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  单会话 Connection 事件流（`connection_events_at` / `connection_events_once`）。
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn scripted_conn(id: &str, inbound: &str, source: &str, closed_at: i64) -> ConnectionEvent {
+    ConnectionEvent {
+        r#type: ConnectionEventType::New as i32,
+        id: id.into(),
+        connection: Some(Connection {
+            id: id.into(),
+            inbound: inbound.into(),
+            source: source.into(),
+            outbound: "leaf".into(),
+            closed_at,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+async fn events_at(
+    addr: SocketAddr,
+    secret: &str,
+) -> Result<tonic::Streaming<ConnectionEvents>, polaris_singbox_grpc::ClientError> {
+    SingBoxApiClient::connection_events_at(
+        Endpoint::new("127.0.0.1", addr.port()),
+        secret,
+        60_000_000_000,
+    )
+    .await
+}
+
+/// 首帧（全量，含已关闭的存量）、其后的新增帧、带连接体的关闭帧都按序原样到达；脚本放完后流
+/// 保持打开，不自己结束。
+#[tokio::test]
+async fn connection_events_at_delivers_first_frame_new_events_and_close_frames() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    *state.connection_script.lock().unwrap() = Some(vec![
+        Ok(ConnectionEvents {
+            events: vec![
+                scripted_conn("live", "probe-in-0", "127.0.0.1:40001", 0),
+                scripted_conn(
+                    "history",
+                    "probe-in-0",
+                    "127.0.0.1:40002",
+                    1_700_000_000_000,
+                ),
+            ],
+            reset: true,
+        }),
+        Ok(ConnectionEvents {
+            events: vec![scripted_conn("fresh", "probe-in-1", "127.0.0.1:40003", 0)],
+            reset: false,
+        }),
+        // 真核的关闭事件带完整的连接体，且体上的 `closedAt` 与事件的相同
+        // （`daemon/started_service.go` 的 `applyConnectionEvent`）。
+        Ok(ConnectionEvents {
+            events: vec![ConnectionEvent {
+                r#type: ConnectionEventType::Closed as i32,
+                closed_at: 1_700_000_000_500,
+                ..scripted_conn("live", "probe-in-0", "127.0.0.1:40001", 1_700_000_000_500)
+            }],
+            reset: false,
+        }),
+    ]);
+    let mut stream = events_at(addr, SECRET).await.expect("建流");
+
+    let first = stream.message().await.unwrap().expect("首帧");
+    assert!(first.reset);
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|event| {
+                let conn = event.connection.as_ref().unwrap();
+                (conn.id.as_str(), conn.source.as_str(), conn.closed_at)
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("live", "127.0.0.1:40001", 0),
+            ("history", "127.0.0.1:40002", 1_700_000_000_000)
+        ]
+    );
+    let second = stream.message().await.unwrap().expect("新增帧");
+    assert!(!second.reset);
+    assert_eq!(
+        second.events[0].connection.as_ref().unwrap().inbound,
+        "probe-in-1"
+    );
+    let third = stream.message().await.unwrap().expect("关闭帧");
+    assert_eq!(third.events[0].r#type, ConnectionEventType::Closed as i32);
+    assert_eq!(third.events[0].closed_at, 1_700_000_000_500);
+    let closed = third.events[0].connection.as_ref().expect("关闭帧带连接体");
+    assert_eq!(
+        (
+            closed.inbound.as_str(),
+            closed.source.as_str(),
+            closed.closed_at
+        ),
+        ("probe-in-0", "127.0.0.1:40001", 1_700_000_000_500)
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.message())
+            .await
+            .is_err(),
+        "没有新事件时流保持打开，不自己结束"
+    );
+    assert_eq!(state.connection_calls.load(Ordering::Relaxed), 1);
+}
+
+/// 流中途报错：错误的状态码与消息原样交给调用方，之后流结束；**不重连**（订阅次数恒为 1）。
+#[tokio::test]
+async fn connection_events_at_surfaces_a_mid_stream_error_and_never_reconnects() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    *state.connection_script.lock().unwrap() = Some(vec![
+        Ok(ConnectionEvents {
+            events: vec![scripted_conn("live", "probe-in-0", "127.0.0.1:40001", 0)],
+            reset: true,
+        }),
+        Err(Status::unavailable("core is restarting")),
+    ]);
+    let mut stream = events_at(addr, SECRET).await.expect("建流");
+    assert!(stream.message().await.unwrap().is_some());
+    let error = stream.message().await.expect_err("第二帧是错误");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "core is restarting");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        state.connection_calls.load(Ordering::Relaxed),
+        1,
+        "单会话流断了就是断了"
+    );
+}
+
+/// 订阅迟迟不应答（核卡死）：建流在兜底时限到期时报超时，不无限挂起。
+#[tokio::test]
+async fn connection_events_at_times_out_when_the_subscription_never_answers() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    state.connection_hang.store(true, Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let error = events_at(addr, SECRET).await.expect_err("应超时");
+    assert!(
+        matches!(error, polaris_singbox_grpc::ClientError::SnapshotTimeout),
+        "{error}"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= polaris_singbox_grpc::SNAPSHOT_TIMEOUT
+            && waited < polaris_singbox_grpc::SNAPSHOT_TIMEOUT + Duration::from_secs(2),
+        "等了 {waited:?}"
+    );
+}
+
+/// secret 不对：建流即被拒，不产出流。端口上没有服务端：同样是建流失败。
+#[tokio::test]
+async fn connection_events_at_fails_on_a_wrong_secret_or_a_dead_port() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let error = events_at(addr, "wrong").await.expect_err("secret 不对");
+    assert!(
+        matches!(
+            &error,
+            polaris_singbox_grpc::ClientError::Status(status)
+                if status.code() == tonic::Code::Unauthenticated
+        ),
+        "{error}"
+    );
+    assert_eq!(state.connection_calls.load(Ordering::Relaxed), 0);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = listener.local_addr().unwrap();
+    drop(listener);
+    assert!(events_at(dead, SECRET).await.is_err(), "端口上没有服务端");
+}
+
+/// 首帧大于 tonic 默认的 4 MiB 解码上限时，这条流照样解得开。对照：同一个服务端、同一帧，走默认
+/// 上限的一次性快照读法被拒 —— 证明这一帧确实越过了默认上限。
+#[tokio::test]
+async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let rule = "r".repeat(1024);
+    let events: Vec<ConnectionEvent> = (0..6000)
+        .map(|n| {
+            let mut event = scripted_conn(&format!("c{n}"), "mixed-in", "127.0.0.1:1", 0);
+            event.connection.as_mut().unwrap().rule = rule.clone();
+            event
+        })
+        .collect();
+    *state.connection_script.lock().unwrap() = Some(vec![Ok(ConnectionEvents {
+        events,
+        reset: true,
+    })]);
+
+    let mut stream = events_at(addr, SECRET).await.expect("建流");
+    let first = stream
+        .message()
+        .await
+        .expect("大首帧必须解得开")
+        .expect("首帧");
+    assert_eq!(first.events.len(), 6000);
+
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let default_limit = client.first_connection_snapshot().await;
+    assert!(
+        default_limit.is_err(),
+        "对照：这一帧超过了默认解码上限，默认读法应被拒"
+    );
 }
