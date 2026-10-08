@@ -1001,7 +1001,8 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expectSliceIsTheScript(script, 'D7');
     checkWeight(script);
     expectMutationsBite(script, DESKTOP.guard, checkWeight);
-  });
+    // 逐入口、逐变异起 bash 子进程；与全量并行时超过默认的 5s。
+  }, 30_000);
 
   it('Android 两个 job 的构建权重步各自真跑：签名发布零写入，验证腿只在风险门写两个键，三条 fail-closed 都咬得住', () => {
     const android = workflow(ANDROID.file);
@@ -1016,7 +1017,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     const steps = ANDROID.jobs.map((job) => stepBlock(jobBlock(android, job), ANDROID.step));
     expect(steps[0].length).toBeGreaterThan(800);
     expect(steps[1]).toBe(steps[0]);
-  });
+  }, 30_000);
 
   it('桌面与 Android 两处是同一段判定：骨架逐行相同，写入的键值逐字相等', () => {
     const desktop = weightScript(workflow(DESKTOP.file), 'package', DESKTOP.step);
