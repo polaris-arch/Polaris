@@ -14,6 +14,16 @@ describe('Mesh Join Tailscale 登出', () => {
     expect(setLoginState).not.toHaveBeenCalled();
   });
 
+  it('遗留登录进程未退出时显示专用原因，保留登录态', async () => {
+    const error = { code: 'TAILSCALE_LOGOUT_STALE_LOGIN_CORE' };
+    const setLoginState = vi.fn();
+
+    const result = await performMeshTsLogout('ts-one', async () => { throw error; }, setLoginState);
+
+    expect(result).toEqual({ ok: false, noticeKey: 'ts.reasonStaleLoginCore', error });
+    expect(setLoginState).not.toHaveBeenCalled();
+  });
+
   it('普通错误仍显示登出失败，保留登录态', async () => {
     const error = { code: 'OTHER_FAILURE' };
     const logout = vi.fn(async () => { throw error; });

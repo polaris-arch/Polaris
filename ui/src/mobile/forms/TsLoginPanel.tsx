@@ -15,11 +15,12 @@ import {
   planTsLoginSubmit,
   supportsTsLoginActions,
   tsAccountActionsUseNormalMain,
+  tsBackendLeavesProxyStopped,
   tsLoginUsesBackendReplacement,
   tsLoginUsesBackendCredentials,
   type TsLoginMode,
 } from '@/components/dialogs/ts-login-server';
-import { tsNodeHeldByRunningCore } from '@/components/dialogs/ts-logout-flow';
+import { tsNodeHoldByRunningCore } from '@/components/dialogs/ts-logout-flow';
 import type { ServerConfig } from '@/contracts/types';
 import { controlUrlReject } from '@/domain/control-url';
 import { groupServersBySubscription } from '@/domain/server-grouping';
@@ -325,22 +326,33 @@ export function TsLoginPanel({
       return;
     }
     setErrControl(null);
-    // Android's backend stops a proxy that holds this node and leaves it stopped. Say so
-    // before calling it; an unreadable status is not proof of a holder.
-    if (backendReplacement && !isIOS && !stopNoticed && submissionBase) {
+    // Android's backend stops a proxy that holds this node for every backend-owned request
+    // (an account switch, or signing in with a stored or new key) and leaves it stopped.
+    // Say so before calling it unless the proxy provably does not hold the node.
+    const backendOwnedRequest = backendReplacement
+      || tsLoginUsesBackendCredentials(submissionBase, reuseRetainedAuthKey);
+    if (backendOwnedRequest && tsBackendLeavesProxyStopped() && !stopNoticed && submissionBase) {
       const heldId = submissionBase.id;
       setSubmitting(true);
-      const held = await api.server.tailscaleGetStatus()
-        .then((snap) => tsNodeHeldByRunningCore(snap, heldId), () => false);
+      const [proxy, snapshot] = await Promise.all([
+        api.proxy.getStatus().catch(() => null),
+        api.server.tailscaleGetStatus().catch(() => null),
+      ]);
+      const hold = tsNodeHoldByRunningCore(proxy, snapshot, heldId);
       if (!hasInstance(instanceId)) return;
       setSubmitting(false);
-      if (held) {
+      if (hold !== 'notHeld') {
+        const copy = replaceIdentity
+          ? { title: 'ts.switchStopTitle', held: 'ts.switchStopMessage',
+            unsure: 'ts.switchStopUnsureMessage', confirm: 'ts.switchStopConfirm' }
+          : { title: 'ts.loginStopTitle', held: 'ts.loginStopMessage',
+            unsure: 'ts.loginStopUnsureMessage', confirm: 'ts.loginStopConfirm' };
         const noticeId = open({
           kind: 'confirm',
           payload: {
-            title: t('ts.switchStopTitle'),
-            message: t('ts.switchStopMessage'),
-            confirmLabel: t('ts.switchStopConfirm'),
+            title: t(copy.title),
+            message: t(hold === 'held' ? copy.held : copy.unsure),
+            confirmLabel: t(copy.confirm),
             danger: true,
             onConfirm: async () => {
               closeInstance(noticeId);

@@ -1181,19 +1181,24 @@ pub async fn tailscale_logout(
             ));
         }
         Err(error) => {
-            let code = if error.kind() == std::io::ErrorKind::InvalidInput {
-                "TAILSCALE_LOGOUT_INVALID_SERVER_ID"
-            } else {
-                "TAILSCALE_LOGOUT_FAILED"
-            };
             return Ok(ApiResponse::err_with_code(
                 "Cannot clear Tailscale state",
-                code,
+                tailscale_logout_error_code(error.kind()),
             ));
         }
     }
     // Compatibility response field: a running owner is rejected above, so success never needs restart.
     Ok(ApiResponse::ok(json!({ "runningNeedsRestart": false })))
+}
+
+/// The renderer shows a specific message for each code; the error text never reaches it.
+fn tailscale_logout_error_code(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::InvalidInput => "TAILSCALE_LOGOUT_INVALID_SERVER_ID",
+        // A login core left by an earlier run still writes this node's state.
+        std::io::ErrorKind::ResourceBusy => "TAILSCALE_LOGOUT_STALE_LOGIN_CORE",
+        _ => "TAILSCALE_LOGOUT_FAILED",
+    }
 }
 
 /// 默认查物理 state 目录，供认证密钥替换前清理；`cached_session_only` 仅供 UI 展示

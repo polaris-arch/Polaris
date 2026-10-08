@@ -129,22 +129,42 @@ pub(super) fn stale_login_core_pids(
         .collect()
 }
 
-/// Terminate leftover login cores and confirm they are gone. A pid is signalled again only
-/// while a fresh scan still shows the same exact argv under it.
+/// A leftover is this user's own process. One that another user started is neither ended nor
+/// a reason to refuse; an owner that cannot be read is treated the same way.
+pub(super) fn owned_by_this_user(owner: Option<u32>, me: Option<u32>) -> bool {
+    matches!((owner, me), (Some(owner), Some(me)) if owner == me)
+}
+
+/// Process table access for the sweep; fakes replace all three in tests.
+pub(super) struct StaleSweepIo<'a> {
+    pub(super) scan: &'a (dyn Fn() -> Vec<CoreProcess> + Send + Sync),
+    pub(super) owner: &'a (dyn Fn(u32) -> Option<u32> + Send + Sync),
+    pub(super) signal: &'a (dyn Fn(u32, Signal) + Send + Sync),
+}
+
+/// Terminate this user's leftover login cores and confirm they are gone. A pid is signalled
+/// again only while a fresh scan still shows the same exact argv and owner under it.
 pub(super) async fn sweep_stale_login_cores(
-    scan: &(dyn Fn() -> Vec<CoreProcess> + Send + Sync),
-    signal: &(dyn Fn(u32, Signal) + Send + Sync),
+    io: &StaleSweepIo<'_>,
+    me: Option<u32>,
     grace: Duration,
     binary: &Path,
     config_dir: &Path,
     inflight: &[u32],
 ) -> Result<usize, String> {
-    let victims = stale_login_core_pids(&scan(), binary, config_dir, inflight);
+    let (scan, signal) = (io.scan, io.signal);
+    let select = || -> Vec<u32> {
+        stale_login_core_pids(&scan(), binary, config_dir, inflight)
+            .into_iter()
+            .filter(|pid| owned_by_this_user((io.owner)(*pid), me))
+            .collect()
+    };
+    let victims = select();
     if victims.is_empty() {
         return Ok(0);
     }
     let remaining = || -> Vec<u32> {
-        stale_login_core_pids(&scan(), binary, config_dir, inflight)
+        select()
             .into_iter()
             .filter(|pid| victims.contains(pid))
             .collect()
@@ -196,8 +216,12 @@ impl StaleLoginCoreSweeper for ProcessStaleLoginSweeper {
         #[cfg(not(unix))]
         let signal = |_: u32, _: Signal| {};
         sweep_stale_login_cores(
-            &polaris_core_supervisor::scan_running_cores,
-            &signal,
+            &StaleSweepIo {
+                scan: &polaris_core_supervisor::scan_running_cores,
+                owner: &polaris_core_supervisor::process_owner_uid,
+                signal: &signal,
+            },
+            polaris_core_supervisor::process_owner_uid(std::process::id()),
             STALE_LOGIN_KILL_GRACE,
             binary,
             &self.config_dir,

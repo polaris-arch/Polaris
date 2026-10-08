@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { captureMainCoreOwner, isMainCoreLogoutError, sameRunningCore, stopOwnedCore, stopOwnedCoreThenLogout, tsNodeHeldByRunningCore } from './ts-logout-flow';
+import { captureMainCoreOwner, isMainCoreLogoutError, sameRunningCore, stopOwnedCore, stopOwnedCoreThenLogout, tsNodeHoldByRunningCore } from './ts-logout-flow';
 
 const running = { running: true, pid: 123, startTime: 456 };
 const stopped = { running: false };
@@ -90,12 +90,33 @@ describe('mobile Tailscale logout with a main-core owner', () => {
 describe('shared pre-notice helpers for a node held by the running core', () => {
   const status = (serverId: string) => ({ serverId });
 
-  it('only a live status stream that lists the node counts as held', () => {
-    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [status('ts-b'), status('ts-a')] }, 'ts-a')).toBe(true);
-    // A stopped core keeps its last frames as a stale cache; that is not a holder.
-    expect(tsNodeHeldByRunningCore({ connected: false, statuses: [status('ts-a')] }, 'ts-a')).toBe(false);
-    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [status('ts-b')] }, 'ts-a')).toBe(false);
-    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [] }, 'ts-a')).toBe(false);
+  const live = (...ids: string[]) => ({ connected: true, statuses: ids.map(status) });
+
+  it('skips the notice only on positive proof that the proxy does not hold the node', () => {
+    // Certain: the proxy is neither running nor starting, whatever a late status read says.
+    expect(tsNodeHoldByRunningCore(stopped, live('ts-a'), 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(stopped, null, 'ts-a')).toBe('notHeld');
+    // Certain: this run's status frame has arrived and does not list the node.
+    expect(tsNodeHoldByRunningCore(running, live('ts-b'), 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(null, live('ts-b'), 'ts-a')).toBe('notHeld');
+  });
+
+  it('a live frame that lists the node is a holder', () => {
+    expect(tsNodeHoldByRunningCore(running, live('ts-b', 'ts-a'), 'ts-a')).toBe('held');
+    expect(tsNodeHoldByRunningCore(null, live('ts-a'), 'ts-a')).toBe('held');
+  });
+
+  it('a failed read, a stream that is not live and a missing first frame are never "not held"', () => {
+    // Both reads failed.
+    expect(tsNodeHoldByRunningCore(null, null, 'ts-a')).toBe('unknown');
+    // The proxy runs but its status read failed, or the stream is reconnecting (stale cache).
+    expect(tsNodeHoldByRunningCore(running, null, 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore(running, { connected: false, statuses: [status('ts-b')] }, 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore(null, { connected: false, statuses: [] }, 'ts-a')).toBe('unknown');
+    // The proxy runs (or is still starting) and no frame of this run has arrived yet.
+    expect(tsNodeHoldByRunningCore(running, live(), 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore({ running: false, starting: true }, live(), 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore({ running: false, starting: true }, null, 'ts-a')).toBe('unknown');
   });
 
   it('captures an owner only for a run that can be named again later', () => {

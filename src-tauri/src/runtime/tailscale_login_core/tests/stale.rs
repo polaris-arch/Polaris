@@ -2,8 +2,9 @@
 //! the signal function are fakes, and the only files touched live in a per-test directory.
 
 use super::super::stale::{
-    is_stale_login_core, login_config_identity, stale_login_config_names, stale_login_core_pids,
-    sweep_stale_login_cores, StaleLoginCoreSweeper, STALE_LOGIN_CORE_ALIVE,
+    is_stale_login_core, login_config_identity, owned_by_this_user, stale_login_config_names,
+    stale_login_core_pids, sweep_stale_login_cores, StaleLoginCoreSweeper, StaleSweepIo,
+    STALE_LOGIN_CORE_ALIVE,
 };
 use super::*;
 use polaris_core_supervisor::{CoreProcess, Signal};
@@ -160,14 +161,23 @@ fn registered_children_are_never_stale_login_core_pids() {
 struct FakeProcesses {
     scans: Mutex<Vec<Vec<CoreProcess>>>,
     signals: Mutex<Vec<(u32, Signal)>>,
+    /// pid → owner; a pid that is absent runs as this user ([`ME`]).
+    owners: HashMap<u32, Option<u32>>,
 }
+
+const ME: u32 = 1000;
 
 impl FakeProcesses {
     fn new(scans: Vec<Vec<CoreProcess>>) -> Self {
         Self {
             scans: Mutex::new(scans),
             signals: Mutex::new(Vec::new()),
+            owners: HashMap::new(),
         }
+    }
+    fn owned(mut self, pid: u32, owner: Option<u32>) -> Self {
+        self.owners.insert(pid, owner);
+        self
     }
     fn scan(&self) -> Vec<CoreProcess> {
         let mut scans = self.scans.lock().unwrap();
@@ -179,8 +189,12 @@ impl FakeProcesses {
     }
     async fn sweep(&self, inflight: &[u32]) -> Result<usize, String> {
         sweep_stale_login_cores(
-            &|| self.scan(),
-            &|pid, signal| self.signals.lock().unwrap().push((pid, signal)),
+            &StaleSweepIo {
+                scan: &|| self.scan(),
+                owner: &|pid| self.owners.get(&pid).copied().unwrap_or(Some(ME)),
+                signal: &|pid, signal| self.signals.lock().unwrap().push((pid, signal)),
+            },
+            Some(ME),
             Duration::ZERO,
             Path::new(BINARY),
             Path::new(CONFIG_DIR),
@@ -248,6 +262,33 @@ async fn sweep_reports_a_leftover_that_survives_both_signals() {
         processes.signals(),
         vec![(10, Signal::Sigterm), (10, Signal::Sigkill)]
     );
+}
+
+#[test]
+fn only_a_process_of_this_user_with_a_readable_owner_is_ours() {
+    assert!(owned_by_this_user(Some(1000), Some(1000)));
+    assert!(!owned_by_this_user(Some(0), Some(1000)));
+    assert!(!owned_by_this_user(Some(1001), Some(1000)));
+    assert!(!owned_by_this_user(None, Some(1000)));
+    assert!(!owned_by_this_user(Some(1000), None));
+    assert!(!owned_by_this_user(None, None));
+}
+
+#[tokio::test]
+async fn another_users_same_shaped_core_is_neither_signalled_nor_a_reason_to_refuse() {
+    // pid 10 is root's, pid 11's owner cannot be read; neither ever exits. pid 12 is ours.
+    let processes = FakeProcesses::new(vec![
+        vec![login_core(10), login_core(11), login_core(12)],
+        vec![login_core(10), login_core(11)],
+    ])
+    .owned(10, Some(0))
+    .owned(11, None);
+    assert_eq!(processes.sweep(&[]).await, Ok(1));
+    assert_eq!(processes.signals(), vec![(12, Signal::Sigterm)]);
+
+    let foreign_only = FakeProcesses::new(vec![vec![login_core(10)]]).owned(10, Some(0));
+    assert_eq!(foreign_only.sweep(&[]).await, Ok(0));
+    assert!(foreign_only.signals().is_empty());
 }
 
 /// Records what the registry knew when it asked for the sweep.
@@ -354,6 +395,7 @@ async fn logout_is_refused_while_a_leftover_core_survives() {
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), STALE_LOGIN_CORE_ALIVE);
+    assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
     assert_eq!(sweeper.calls.lock().unwrap().len(), 1);
 }
 

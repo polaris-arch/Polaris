@@ -3,6 +3,8 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { useAppStore } from '@/store/app-store';
 import { useDialogStore } from './dialog-store';
+import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
+import { tsLoginErrorReason } from './ts-login-server';
 import { captureMainCoreOwner, stopOwnedCoreThenLogout } from './ts-logout-flow';
 
 /**
@@ -40,8 +42,10 @@ export async function confirmStopThenTsLogout(
         if (result.kind === 'loggedOut') onLoggedOut();
         else if (result.kind === 'changed') toast.info(t('ts.logoutStopChanged'));
         else if (result.kind === 'stopFailed') toast.error(t('ts.logoutStopFailed'));
-        else toast.error(t(result.code === 'TAILSCALE_LOGOUT_MAIN_CORE'
-          ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail'));
+        else {
+          const reason = tsLoginErrorReason({ code: result.code });
+          toast.error(t(reason ? loginFailureReasonKey(reason) : 'nodes.meshTsLogoutFail'));
+        }
       },
     },
   });

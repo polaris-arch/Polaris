@@ -55,4 +55,6 @@ pub use spawner::{
     ChildStream, SingBoxSpawner, SpawnError, SpawnRequest, SpawnedChild, StdioPolicy, StdioSink,
     TokioSpawner,
 };
-pub use stale_core::{is_our_core, is_our_core_raw, scan_running_cores, stale_pids, CoreProcess};
+pub use stale_core::{
+    is_our_core, is_our_core_raw, process_owner_uid, scan_running_cores, stale_pids, CoreProcess,
+};

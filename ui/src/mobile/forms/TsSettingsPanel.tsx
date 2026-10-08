@@ -66,7 +66,7 @@ import { MeshInboundPolicyFields } from './MeshInboundPolicyFields';
 import { FormSheet } from './FormSheet';
 import { FormGroup } from './FormGroup';
 import { useMobileFormStore } from './form-store';
-import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout, tsNodeHeldByRunningCore } from '@/components/dialogs/ts-logout-flow';
+import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout, tsNodeHoldByRunningCore } from '@/components/dialogs/ts-logout-flow';
 import { hasTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 
@@ -406,16 +406,19 @@ export function TsSettingsPanel({
             return;
           }
           // The mobile backend stops a proxy that holds this node and leaves it stopped.
-          // Say so before calling it; an unreadable status is not proof of a holder.
-          const held = await api.server.tailscaleGetStatus()
-            .then((snap) => tsNodeHeldByRunningCore(snap, serverId), () => false);
+          // Say so before calling it unless the proxy provably does not hold the node.
+          const [proxy, snapshot] = await Promise.all([
+            api.proxy.getStatus().catch(() => null),
+            api.server.tailscaleGetStatus().catch(() => null),
+          ]);
+          const hold = tsNodeHoldByRunningCore(proxy, snapshot, serverId);
           if (!hasInstance(instanceId)) return;
-          if (held) {
+          if (hold !== 'notHeld') {
             const stopNoticeId = open({
               kind: 'confirm',
               payload: {
                 title: t('ts.logoutStopTitle'),
-                message: t('ts.logoutStopMessage'),
+                message: t(hold === 'held' ? 'ts.logoutStopMessage' : 'ts.logoutStopUnsureMessage'),
                 confirmLabel: t('ts.logoutStopConfirm'),
                 danger: true,
                 onConfirm: async () => {

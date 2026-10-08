@@ -188,6 +188,59 @@ async fn legacy_helper_ack_keeps_main_birth_and_backend_custody() {
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
 }
 
+/// The desktop "stop, then log out" flow calls logout as soon as Stop returns. Stop releases
+/// the main claim before it returns, so that logout is admitted without waiting.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confirmed_stop_releases_the_main_claim_before_it_returns_so_logout_is_admitted() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    let pid = 7124;
+    let hex = "ffeeddccbbaa99887766554433221100";
+    let (rt, _dir, _frames) = birth_daemon_runtime([format!("OK birth-stopped {pid} {hex}\n")]);
+    let registry = rt.mesh.login_registry_for_test();
+    let admitted = || async {
+        registry
+            .logout(
+                "stop-then-logout",
+                &|| rt.tailscale_writer_alive(),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let state = rt.mesh.tailscale_state_dir("stop-then-logout").unwrap();
+        let token = rt.mesh.mint_tailscale_main_birth();
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+                &gate,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        let attempt = rt
+            .register_helper_start_backend_with_main(Some(token))
+            .unwrap();
+        HelperStartCompletion::for_test(&rt, attempt)
+            .publish(&Ok(HelperStartResult::BirthStarted(exact_helper_target(
+                pid, hex,
+            ))))
+            .unwrap();
+        reservation.arm_external_start();
+    }
+    assert!(!admitted().await, "the running main core holds the node");
+    {
+        let gate = rt.mesh.tailscale_state_gate().await;
+        rt.kill_core_and_release_main(&gate).await.unwrap();
+    }
+    assert!(admitted().await, "logout right after the confirmed Stop");
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn exact_helper_main_mismatch_retains_custody_then_retries_production_birth_transport() {

@@ -42,16 +42,18 @@ const control=window.__tsLogoutTest={
   },
 };
 systemApi.listNetworkInterfaces=async()=>[];
-api.server.tailscaleGetStatus=async()=>mode==='held'?{connected:true,statuses:[{serverId:'ts-1',backendState:'Running',loggedIn:true,expired:false,peers:[],tailscaleIPs:[],canShareFiles:false,waitingFileCount:0,receivingFileCount:0,unreadFileCount:0}]}:{connected:false,statuses:[]};
+// The fixture proxy is running. Outside 'held'/'unknown' its live frame lists another node only,
+// which is positive proof that it does not hold ts-1.
+api.server.tailscaleGetStatus=async()=>{if(mode==='unknown')throw Error('status unavailable');return {connected:true,statuses:[{serverId:mode==='held'?'ts-1':'other',backendState:'Running',loggedIn:true,expired:false,peers:[],tailscaleIPs:[],canShareFiles:false,waitingFileCount:0,receivingFileCount:0,unreadFileCount:0}]};};
 api.server.tailscaleStateExists=async()=>({'ts-1':state});
-api.server.tailscaleLogout=async()=>{control.logouts++;if(mode!=='success'&&mode!=='held')throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
+api.server.tailscaleLogout=async()=>{control.logouts++;if(mode!=='success'&&mode!=='held'&&mode!=='unknown')throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
 api.server.tailscaleLoginPrepare=async()=>{};
 api.server.tailscaleLoginProgress=async()=>null;
 api.server.tailscaleLoginCancel=async()=>{};
 api.server.tailscaleLogin=async(server)=>{control.started.push(server);return {started:true};};
 api.server.update=async(server)=>{useAppStore.setState({servers:[server],config:{servers:[server],subscriptions:[]}});};
 api.proxy.getStatus=async()=>({running:true,starting:false,pid:321,startTime:1});
-useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'||mode==='held'?'other':'ts-1',loadConfig:async()=>{}});
+useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'||mode==='held'||mode==='unknown'?'other':'ts-1',loadConfig:async()=>{}});
 useMobileFormStore.getState().open({kind:'ts-settings',serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><MobileFormHost/></main>);
 `;
@@ -114,6 +116,20 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
       await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
       await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
       expect(await page.evaluate(() => (window as any).__tsLogoutTest.state())).toBe(false);
+    } finally { await page.close(); }
+  }, 45_000);
+
+  it('an unreadable status still asks before the backend is called, without claiming a holder', async () => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
+    page.setDefaultTimeout(6_000);
+    try {
+      await page.goto(origin + '/__ts-logout?mode=unknown');
+      await page.getByRole('dialog', { name: 'Tailscale 设置' }).getByRole('button', { name: '退出登录' }).click();
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      await page.getByRole('dialog', { name: '断开连接并退出登录？' }).getByText('暂时无法确认').waitFor();
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.logouts)).toBe(0);
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
     } finally { await page.close(); }
   }, 45_000);
 

@@ -542,3 +542,20 @@ fn tailcat_keypair_rejects_malformed_private_key_without_echoing_it() {
         assert!(!err.contains(bad), "错误文案不得回显私钥：{err}");
     }
 }
+
+#[test]
+fn tailscale_logout_reports_a_leftover_login_core_under_its_own_code() {
+    use std::io::ErrorKind;
+    assert_eq!(
+        tailscale_logout_error_code(ErrorKind::ResourceBusy),
+        "TAILSCALE_LOGOUT_STALE_LOGIN_CORE"
+    );
+    assert_eq!(
+        tailscale_logout_error_code(ErrorKind::InvalidInput),
+        "TAILSCALE_LOGOUT_INVALID_SERVER_ID"
+    );
+    assert_eq!(
+        tailscale_logout_error_code(ErrorKind::Other),
+        "TAILSCALE_LOGOUT_FAILED"
+    );
+}

@@ -2551,6 +2551,19 @@ fn keyless_identity_replacement_enters_the_backend_transaction_only_where_the_ba
         "credentialRevisionChanged"
     );
 
+    // A node that does hold a key has a revision. Where the backend owns the replacement, a
+    // request that does not echo that revision is refused: the flag never stands in for the CAS.
+    let keyed_saved = json!({"servers":[{"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{
+        "authKey":"stored-fixture"
+    }}]});
+    let mut blind = request("switch-blind");
+    blind.replace_identity = true;
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&keyed_saved, &candidate, &blind, true)
+            .unwrap_err(),
+        "credentialRevisionChanged"
+    );
+
     // Replacing with a new key on such a node still parks that key for compensation.
     let mut keyed = request("switch-key");
     keyed.replace_identity = true;

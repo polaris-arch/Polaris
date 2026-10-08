@@ -33,9 +33,11 @@ describe('account actions say the proxy will be disconnected before it happens',
   it('mobile logout checks the holder and asks again before the backend call', () => {
     const confirm = slice(read('../../mobile/forms/TsSettingsPanel.tsx'),
       "title: t('ts.logout'),", "title={t('ts.settingsTitle')}");
-    before(confirm, 'tsNodeHeldByRunningCore(snap, serverId)', 'if (held) {');
-    before(confirm, 'if (held) {', "title: t('ts.logoutStopTitle'),");
-    before(confirm, "message: t('ts.logoutStopMessage'),", 'await logoutNow();');
+    // Both reads feed the verdict, a failed read becomes null, and only 'notHeld' skips the notice.
+    before(confirm, 'api.proxy.getStatus().catch(() => null)', 'tsNodeHoldByRunningCore(proxy, snapshot, serverId)');
+    before(confirm, 'api.server.tailscaleGetStatus().catch(() => null)', 'tsNodeHoldByRunningCore(proxy, snapshot, serverId)');
+    before(confirm, "if (hold !== 'notHeld') {", "title: t('ts.logoutStopTitle'),");
+    before(confirm, "message: t(hold === 'held' ? 'ts.logoutStopMessage' : 'ts.logoutStopUnsureMessage'),", 'await logoutNow();');
     // The stopped-iOS sentence rides on the first confirmation.
     expect(confirm).toContain("'ts.logoutStartsConnectionNote'");
   });
@@ -49,9 +51,16 @@ describe('account actions say the proxy will be disconnected before it happens',
   it('mobile account switch asks before submitting where the backend leaves the proxy stopped', () => {
     const submit = slice(read('../../mobile/forms/TsLoginPanel.tsx'),
       'const submit = async (stopNoticed = false)', 'await executeTsLogin(');
-    before(submit, 'backendReplacement && !isIOS && !stopNoticed', 'tsNodeHeldByRunningCore(snap, heldId)');
-    before(submit, "title: t('ts.switchStopTitle'),", 'await submit(true);');
-    before(submit, 'await submit(true);', 'tsLoginUsesBackendCredentials(submissionBase');
+    // Every backend-owned request stops a holding proxy on Android, not only an account switch.
+    before(submit, '|| tsLoginUsesBackendCredentials(submissionBase, reuseRetainedAuthKey);',
+      'backendOwnedRequest && tsBackendLeavesProxyStopped() && !stopNoticed');
+    before(submit, 'api.proxy.getStatus().catch(() => null)', 'tsNodeHoldByRunningCore(proxy, snapshot, heldId)');
+    before(submit, 'api.server.tailscaleGetStatus().catch(() => null)', 'tsNodeHoldByRunningCore(proxy, snapshot, heldId)');
+    before(submit, "if (hold !== 'notHeld') {", 'title: t(copy.title),');
+    before(submit, "message: t(hold === 'held' ? copy.held : copy.unsure),", 'await submit(true);');
+    before(submit, 'await submit(true);', 'const submissionRevision');
+    for (const key of ['ts.switchStopUnsureMessage', 'ts.loginStopTitle', 'ts.loginStopMessage',
+      'ts.loginStopUnsureMessage', 'ts.loginStopConfirm']) expect(submit).toContain(`'${key}'`);
   });
 
   it('desktop account switch offers to stop the holding run and submits again', () => {

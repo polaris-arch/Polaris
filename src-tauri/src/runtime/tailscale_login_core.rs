@@ -2129,7 +2129,8 @@ pub struct LoginCoreRegistry {
     checker: Arc<dyn ConfigChecker>,
     subscriber: Arc<dyn LoginStatusSubscriber>,
     resolve_binary: BinaryResolver,
-    /// Absent in fixtures and on platforms whose login core is not a separate process.
+    /// Absent only in fixtures. The runtime installs it on every platform; where the login core
+    /// is not a separate process the process scan is empty and the sweep finds nothing.
     stale_sweeper: Option<Arc<dyn StaleLoginCoreSweeper>>,
     timeout: Duration,
     epoch: AtomicU64,
@@ -3184,9 +3185,10 @@ impl LoginCoreRegistry {
                 "Only a prepared login request may be preserved",
             ));
         }
+        // A distinct kind: the command layer reports this refusal under its own code.
         self.sweep_stale_login_cores()
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|reason| std::io::Error::new(std::io::ErrorKind::ResourceBusy, reason))?;
         if keep_attempt.is_none() {
             self.retire_attempts_under_state_gate(server_id, &_gate)
                 .await
@@ -3854,7 +3856,13 @@ impl LoginCoreRegistry {
                 },
             )
             .await
-            .map_err(|_| "credentialCommitUnknown".to_owned())?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::ResourceBusy {
+                    stale::STALE_LOGIN_CORE_ALIVE.to_owned()
+                } else {
+                    "credentialCommitUnknown".to_owned()
+                }
+            })?;
         if !retired {
             log::info!(
                 target: LOGIN_CORE_LOG_TARGET,

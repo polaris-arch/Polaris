@@ -145,8 +145,10 @@ pub fn parse_ps_output(stdout: &str) -> Vec<CoreProcess> {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn scan_running_cores() -> Vec<CoreProcess> {
+    // A terminal inherited on stdin would let `ps` clip the args column to its width.
     let Ok(out) = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,args="])
+        .stdin(std::process::Stdio::null())
         .output()
     else {
         return Vec::new();
@@ -160,6 +162,51 @@ pub fn scan_running_cores() -> Vec<CoreProcess> {
 #[must_use]
 pub fn scan_running_cores() -> Vec<CoreProcess> {
     Vec::new()
+}
+
+/// Effective uid from `/proc/<pid>/status` (`Uid:` lists real, effective, saved, filesystem).
+#[cfg(any(target_os = "linux", test))]
+#[must_use]
+pub fn parse_proc_status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// `ps -o uid= -p <pid>` output → uid. Anything but one number is unknown.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub fn parse_ps_uid(stdout: &str) -> Option<u32> {
+    stdout.trim().parse().ok()
+}
+
+/// The user a process runs as; `None` when it cannot be read. Callers that end processes by
+/// identity use it to leave another user's processes alone. Not used by the main-core sweep.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn process_owner_uid(pid: u32) -> Option<u32> {
+    parse_proc_status_uid(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process_owner_uid(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "uid=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_ps_uid(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn process_owner_uid(_pid: u32) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]

@@ -4,7 +4,8 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginErrorReason, tsLoginFailureKey, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
+import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
+import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsBackendLeavesProxyStopped, tsLoginErrorReason, tsLoginFailureKey, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -257,6 +258,8 @@ describe('account switch routing by platform', () => {
     onPlatform(mobileOs);
     expect(tsLoginUsesBackendReplacement(true)).toBe(replacement);
     expect(tsAccountActionsUseNormalMain()).toBe(normalMain);
+    // Only Android stops the holding proxy itself and leaves it stopped.
+    expect(tsBackendLeavesProxyStopped()).toBe(mobileOs === 'android');
     // An ordinary sign-in is never a replacement, whatever the platform.
     expect(tsLoginUsesBackendReplacement(false)).toBe(false);
   });
@@ -271,5 +274,16 @@ describe('account switch routing by platform', () => {
     expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGOUT_MAIN_CORE' })).toBe('mainCoreInUse');
     expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGIN_FAILED', message: 'mainCoreInUse' })).toBe('mainCoreInUse');
     expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-private' })).toBeUndefined();
+  });
+
+  it('a leftover login process has its own message on both the login and the logout leg', () => {
+    for (const error of [
+      { code: 'TAILSCALE_LOGIN_FAILED', message: 'staleLoginCoreAlive' },
+      { code: 'TAILSCALE_LOGOUT_STALE_LOGIN_CORE', message: 'Cannot clear Tailscale state' },
+    ]) {
+      expect(loginFailureReasonKey(tsLoginErrorReason(error))).toBe('ts.reasonStaleLoginCore');
+    }
+    // The generic logout failure stays generic.
+    expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGOUT_FAILED' })).toBeUndefined();
   });
 });

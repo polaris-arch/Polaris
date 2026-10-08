@@ -30,7 +30,7 @@ import '/src/mobile/connections/connections-redesign.css';
 await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
 if (mode?.startsWith('ios')) document.documentElement.dataset.mobileOs = 'ios';
-if (mode?.startsWith('android-switch')) document.documentElement.dataset.mobileOs = 'android';
+if (mode?.startsWith('android-switch') || mode === 'android-stop-retained') document.documentElement.dataset.mobileOs = 'android';
 const heldDesktop = mode === 'desktop-switch-held' || mode === 'credential-settings-logout-held';
 const listeners = new Map();
 const on = name => fn => { const set = listeners.get(name) || new Set(); listeners.set(name, set); set.add(fn); return () => set.delete(fn); };
@@ -58,6 +58,10 @@ const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, pr
 api.proxy.start = async () => { test.mainStarts++; };
 api.proxy.stop = async () => { test.mainStops++; };
 if (heldDesktop) api.proxy.getStatus = async () => test.mainStops === 0 ? { running: true, starting: false, pid: 9, startTime: 5 } : { running: false };
+// A stopped proxy is positive proof that nothing holds the node: no notice in these modes.
+if (mode === 'android-switch' || mode === 'ios-settings') api.proxy.getStatus = async () => ({ running: false, starting: false });
+if (mode === 'android-switch-held' || mode === 'android-stop-retained') api.proxy.getStatus = async () => ({ running: true, starting: false, pid: 9, startTime: 5 });
+if (mode === 'android-switch-unknown') api.proxy.getStatus = async () => { throw new Error('proxy status unavailable'); };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   test.progressQueries.push([serverId,attemptId]);
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
@@ -65,7 +69,8 @@ api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.receipts[attemptId]) return test.receipts[attemptId];
   return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
 };
-api.server.tailscaleGetStatus = async () => (mode?.startsWith('main') && test.starts > 0) || mode === 'android-switch-held'
+api.server.tailscaleGetStatus = async () => mode === 'android-switch-unknown' ? Promise.reject(new Error('status unavailable'))
+  : (mode?.startsWith('main') && test.starts > 0) || mode === 'android-switch-held' || mode === 'android-stop-retained'
   ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
       expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
       waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0 }] }
@@ -394,6 +399,44 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         const t = (window as any).__tsTest;
         return { logouts: t.logouts, mainStops: t.mainStops, replace: t.request.replaceIdentity };
       })).toEqual({ logouts: 0, mainStops: 0, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android asks before a switch even when neither status can be read, without claiming a holder', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch-unknown`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, unsure: t.topConfirm().message.startsWith('暂时无法确认'),
+          keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'), starts: t.starts };
+      })).toEqual({ title: '断开连接并切换账号？', unsure: true, keepsDisconnected: true, starts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android asks before signing in with the stored key stops the proxy holding the node', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-stop-retained`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          prepares: t.prepares, starts: t.starts };
+      })).toEqual({ title: '断开连接并登录？', keepsDisconnected: true, prepares: 0, starts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { replace: t.request.replaceIdentity, reuse: t.request.reuseRetainedAuthKey, mainStops: t.mainStops };
+      })).toEqual({ replace: false, reuse: true, mainStops: 0 });
     } finally { await page.close(); }
   }, 30_000);
 

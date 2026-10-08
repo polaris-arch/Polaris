@@ -155,3 +155,19 @@ fn raw_leg_excludes_currently_managed_pid() {
         "受管 pid 必须被排除，raw 腿不得绕过 exclude"
     );
 }
+
+#[test]
+fn proc_status_uid_is_the_effective_one_and_unknown_when_malformed() {
+    let status = "Name:\tsing-box\nPid:\t42\nUid:\t1000\t1001\t1000\t1000\nGid:\t7\t7\t7\t7\n";
+    assert_eq!(parse_proc_status_uid(status), Some(1001));
+    assert_eq!(parse_proc_status_uid("Name:\tx\nGid:\t7\t7\t7\t7\n"), None);
+    assert_eq!(parse_proc_status_uid("Uid:\t1000\n"), None);
+    assert_eq!(parse_proc_status_uid("Uid:\troot\troot\n"), None);
+}
+
+#[test]
+fn ps_uid_output_is_one_number_or_unknown() {
+    assert_eq!(parse_ps_uid("  501\n"), Some(501));
+    assert_eq!(parse_ps_uid(""), None);
+    assert_eq!(parse_ps_uid("501 502\n"), None);
+}
