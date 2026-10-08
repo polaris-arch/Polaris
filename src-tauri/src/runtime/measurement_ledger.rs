@@ -33,7 +33,7 @@ pub(crate) struct LedgerEntry {
     pub(crate) identity: ResultIdentity,
     /// 入账那一刻的前台代次。
     pub(crate) foreground_epoch: u64,
-    /// 到这一条为止的连续失败次数（成功即归零；手动测过即从头数）。
+    /// 到这一条为止的连续失败次数（成功即归零；手动测过即从头数；换核世代或切网时清零）。
     pub(crate) consecutive_failures: u32,
     /// 这个键最近一次成功的时刻（Unix 毫秒）。
     pub(crate) last_ok_at: Option<u64>,
@@ -246,6 +246,21 @@ impl MeasurementLedger {
         drop(inner);
         self.bump();
         true
+    }
+
+    /// 把全部记录的连续失败数清零（换核世代或切网之后：此前的失败不再是节点在当前网络下的
+    /// 证据）。结果本身不动。
+    pub(crate) fn forgive_failures(&self) {
+        let mut inner = self.lock();
+        let mut forgiven = false;
+        for entry in inner.entries.values_mut() {
+            forgiven |= entry.consecutive_failures != 0;
+            entry.consecutive_failures = 0;
+        }
+        drop(inner);
+        if forgiven {
+            self.bump();
+        }
     }
 
     /// 登记一轮起测前被预筛跳过的节点。`members` 是这一轮的全部目标：它们旧的跳过标记先清掉。

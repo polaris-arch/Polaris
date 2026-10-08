@@ -26,6 +26,9 @@ fn plan(subs: &[(&str, u64, &[&str])]) -> BTreeMap<String, SubPlan> {
         .collect()
 }
 
+/// 不关心连续失败数的用例共用的空账本。
+static NO_LEDGER: MeasurementLedger = MeasurementLedger::new();
+
 fn input(now: Now, generation: Option<u64>, plan: &BTreeMap<String, SubPlan>) -> TickInput<'_> {
     TickInput {
         now,
@@ -35,6 +38,7 @@ fn input(now: Now, generation: Option<u64>, plan: &BTreeMap<String, SubPlan>) ->
         network_epoch: None,
         conditions: None,
         policy: MeteredPolicy::Reduced,
+        ledger: &NO_LEDGER,
     }
 }
 
@@ -1132,6 +1136,13 @@ fn network_manager_metered_property_maps_to_three_states() {
     }
 }
 
+#[test]
+fn a_native_answer_maps_to_three_states() {
+    assert_eq!(metered_of(Some(true)), Metered::Yes);
+    assert_eq!(metered_of(Some(false)), Metered::No);
+    assert_eq!(metered_of(None), Metered::Unavailable);
+}
+
 // ── 排序、退避、时间预算 ──────────────────────────────────────────────────────
 
 fn view_of<'a>(
@@ -1240,6 +1251,140 @@ fn a_node_failing_three_rounds_is_tested_every_fourth_round() {
         "成功后每轮都测"
     );
     assert!(skips.is_empty());
+}
+
+/// 换核世代、切网、计费翻转、久离返回之后，补测轮要测到此前在退避里的节点：这些事件把账本的
+/// 连续失败数清零。没有这些事件时，下一个周期轮照旧跳过退避中的节点。
+#[test]
+fn a_new_generation_or_network_forgives_failures_so_the_retest_covers_backed_off_nodes() {
+    use crate::commands::speedtest::{
+        CoreInstance, FailKind, FailPhase, MeasureFailure, MeasurePath, ResultIdentity,
+    };
+
+    let plan = plan(&[("s1", 60, &["good", "bad"])]);
+    let first_round = FIRST_ROUND_DELAY_MS;
+    let idle = first_round + 100_000;
+    // 一拍：(时刻, 核世代, 网络代次, 计费状态)。返回这一拍若发了一轮，它的目标。
+    let tick = |planner: &mut Planner,
+                ledger: &MeasurementLedger,
+                now: Now,
+                generation: u64,
+                epoch: u64,
+                metered: Metered| {
+        let start = planner
+            .tick(&TickInput {
+                network_epoch: Some(epoch),
+                conditions: Some(DeviceConditions {
+                    metered,
+                    power_save: false,
+                }),
+                ledger,
+                ..input(now, Some(generation), &plan)
+            })
+            .start?;
+        let view = LedgerView::new(&Value::Null, Some(generation), Some(epoch), Platform::Linux);
+        Some(planner.round_targets(&start, None, &|id| view.entry(ledger, id), &BTreeSet::new()))
+    };
+    // 首轮跑完后，`bad` 已连续失败 3 轮（进了退避），`good` 是通的。
+    let backed_off = || {
+        let ledger = MeasurementLedger::new();
+        let mut planner = Planner::new(Platform::Linux, at(0));
+        assert_eq!(tick(&mut planner, &ledger, at(0), 1, 5, Metered::No), None);
+        assert_eq!(
+            tick(&mut planner, &ledger, at(first_round), 1, 5, Metered::No),
+            Some(ids(&["good", "bad"]))
+        );
+        let url_digest =
+            polaris_updater::sha256_hex(resolve_speed_test_url(&Value::Null).as_bytes());
+        let identity = |run| ResultIdentity {
+            run,
+            seq: 1,
+            origin: SpeedTestOrigin::Schedule,
+            scope: None,
+            path: MeasurePath::Candidate,
+            url_digest: url_digest.clone(),
+            instance: CoreInstance::Main {
+                generation: 1,
+                start_time: None,
+            },
+            config_digest: None,
+            node_fingerprint: None,
+            network_epoch: Some(5),
+            measured_at: WALL,
+        };
+        ledger.record("good", Ok(50), identity(1));
+        for run in 1..=u64::from(BACKOFF_AFTER_FAILURES) {
+            ledger.record(
+                "bad",
+                Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
+                identity(run),
+            );
+        }
+        planner.on_round_end(
+            at(first_round + 5_000),
+            &completed(&[("good", true), ("bad", false)]),
+        );
+        assert_eq!(
+            tick(&mut planner, &ledger, at(idle), 1, 5, Metered::No),
+            None
+        );
+        (planner, ledger)
+    };
+    let all = Some(ids(&["good", "bad"]));
+
+    // 对照：没有事件，下一个周期轮不测 `bad`。
+    let (mut planner, ledger) = backed_off();
+    let next_period = at(first_round + 60 * MINUTE);
+    assert_eq!(
+        tick(&mut planner, &ledger, next_period, 1, 5, Metered::No),
+        Some(ids(&["good"]))
+    );
+
+    // 网络代次变化：稳定后的补测轮。
+    let (mut planner, ledger) = backed_off();
+    assert_eq!(
+        tick(&mut planner, &ledger, at(idle + 5_000), 1, 6, Metered::No),
+        None
+    );
+    let settled = at(idle + 5_000 + NET_SETTLE_MS);
+    assert_eq!(
+        tick(&mut planner, &ledger, settled, 1, 6, Metered::No),
+        all,
+        "切网"
+    );
+
+    // 换核世代：新世代的首轮。
+    let (mut planner, ledger) = backed_off();
+    assert_eq!(
+        tick(&mut planner, &ledger, at(idle + 5_000), 2, 5, Metered::No),
+        None
+    );
+    let first_of_new = at(idle + 5_000 + FIRST_ROUND_DELAY_MS);
+    assert_eq!(
+        tick(&mut planner, &ledger, first_of_new, 2, 5, Metered::No),
+        all,
+        "换核世代"
+    );
+
+    // 计费状态翻转：当拍补测。
+    let (mut planner, ledger) = backed_off();
+    assert_eq!(
+        tick(&mut planner, &ledger, at(idle + 5_000), 1, 5, Metered::Yes),
+        all,
+        "计费翻转"
+    );
+
+    // 久离返回（桌面休眠醒来）：当拍补测。
+    let (mut planner, ledger) = backed_off();
+    let woke = Now {
+        mono: idle + 5_000,
+        wall: WALL + AWAY_EPOCH_MS,
+    };
+    assert_eq!(
+        tick(&mut planner, &ledger, woke, 1, 5, Metered::No),
+        all,
+        "久离返回"
+    );
 }
 
 /// 时间预算：取周期的一半与 10 分钟中较小者。超出即取消本轮，没测到的节点下一轮排在最前；

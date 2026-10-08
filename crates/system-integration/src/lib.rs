@@ -10,6 +10,7 @@
 //! - [`dns_watcher`]：DNS 接口热插拔 watcher（纯逻辑，事件源 trait 注入）+ `should_reconcile_dns`。
 //! - [`dns_route_events`]：macOS `route -n monitor` 输出行判定（纯函数）。
 //! - [`dns_flush`]：OS DNS 缓存刷新命令构造（三平台）。
+//! - [`network_cost`]：当前联网是否计费（Windows / macOS 的只读系统查询 + 纯折算）。
 //!
 //! ## 移植纪律
 //!
@@ -18,7 +19,7 @@
 //!    SystemConfiguration 原生事务：编译期隔离在 `macos_proxy`，生产构造才启用，测试指定 Mac 仍走 mock。
 //! 2. **marker 纯逻辑**：marker 写/读/崩溃恢复判定是纯逻辑，FS 经 `trait MarkerFs` 注入。
 //! 3. **维度7 #8 必须可测**：崩溃后 marker 残留 → 重启清除（mock FS + 状态机）。
-//! 4. 默认 `deny(unsafe_code)`；仅 `macos_proxy` 的具体 ABI item 局部放开，每个调用写明安全依据。
+//! 4. 默认 `deny(unsafe_code)`；仅 `macos_proxy` 与 `network_cost` 的具体 ABI item 局部放开，每个调用写明安全依据。
 //! 5. 命令构造（argv / registry 行 / gsettings 元组）与输出解析全是纯函数，跨平台可单测。
 //!
 //! ## 平台真差异 / 假差异分界（接线时的判据）
@@ -44,6 +45,7 @@ pub mod exec;
 pub mod linux_resolved;
 #[cfg(target_os = "macos")]
 mod macos_proxy;
+pub mod network_cost;
 pub mod proxy;
 pub mod proxy_ops;
 pub mod route_ops;

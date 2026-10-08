@@ -473,6 +473,8 @@ pub(crate) struct TickInput<'a> {
     /// 这一拍刚拉到的设备状况；没拉则沿用上一次的。
     pub(crate) conditions: Option<DeviceConditions>,
     pub(crate) policy: MeteredPolicy,
+    /// 换核世代或切网时，这本账里的连续失败数清零。
+    pub(crate) ledger: &'a MeasurementLedger,
 }
 
 /// 一拍的输出。
@@ -509,6 +511,8 @@ pub(crate) struct Planner {
     carry_over: Vec<String>,
     /// 退避中的节点已经跳过的轮数。
     backoff_skips: BTreeMap<String, u32>,
+    /// 出过换核世代或切网（含视同切网的计费翻转、久离返回）而账本的连续失败数还没清零。
+    forgive_failures: bool,
     verdict: Verdict,
     /// 最近一拍生效的计费网络策略。
     policy: MeteredPolicy,
@@ -543,6 +547,7 @@ impl Planner {
             round: None,
             carry_over: Vec::new(),
             backoff_skips: BTreeMap::new(),
+            forgive_failures: false,
             verdict: Verdict::Idle(Idle::CoreNotRunning),
             policy: MeteredPolicy::parse(None),
             last_width: None,
@@ -578,6 +583,7 @@ impl Planner {
             return;
         }
         self.foreground_epoch += 1;
+        self.forgive_failures = true;
         self.last_network_retest = Some(now.mono);
         self.due_now(now);
     }
@@ -666,6 +672,7 @@ impl Planner {
             self.subs.clear();
             self.carry_over.clear();
             self.backoff_skips.clear();
+            self.forgive_failures = true;
             self.network_epoch = input.network_epoch;
             self.network_changed_at = None;
             if generation.is_some() {
@@ -719,6 +726,7 @@ impl Planner {
         if let (Some(seen), Some(current)) = (self.network_epoch, input.network_epoch) {
             if seen != current {
                 self.network_changed_at = Some(now.mono);
+                self.forgive_failures = true;
             }
         }
         self.network_epoch = input.network_epoch;
@@ -744,6 +752,7 @@ impl Planner {
             self.conditions = conditions;
             self.conditions_at = Some(now.mono);
             if flipped {
+                self.forgive_failures = true;
                 if is_mobile(self.platform) {
                     self.foreground_epoch += 1;
                 }
@@ -757,6 +766,12 @@ impl Planner {
                     self.network_changed_at = Some(now.mono);
                 }
             }
+        }
+
+        // 换核世代或切网之后，此前的连续失败不再作数：清零，否则断网期间进了退避的节点在补测轮
+        // 里一个也排不上。先于本拍可能发起的一轮，排目标时读到的已是清零后的计数。
+        if std::mem::take(&mut self.forgive_failures) {
+            input.ledger.forgive_failures();
         }
 
         // 一轮超出时间预算即取消，没测到的节点轮转到下一轮最前。
@@ -1138,8 +1153,8 @@ pub(crate) struct EntryView {
 /// 当前选中的节点；上一轮被截断没测到的；本核世代还没有结果的；上次成功的（测量时刻从旧到新）；
 /// 上次失败的。上次失败的集中到最后几波，免得每一波都被一个不可达节点拖到超时。
 ///
-/// 退避：连续失败达到阈值的节点，此后每跳过若干轮才测一次；成功或被手动测过后连续失败数归零，
-/// 即恢复每轮都测。`only_missing` 给出时是补发：已有当前结果的节点不重测，退避计数不动。
+/// 退避：连续失败达到阈值的节点，此后每跳过若干轮才测一次；成功、被手动测过、换核世代或切网后
+/// 连续失败数归零，即恢复每轮都测。`only_missing` 给出时是补发：已有当前结果的节点不重测，退避计数不动。
 pub(crate) fn order_targets(
     members: &[String],
     selected: Option<&str>,
@@ -1218,6 +1233,25 @@ async fn linux_metered() -> Metered {
     }
 }
 
+/// 系统原生查询的回答（`None` 是不可得）→ 三态。
+pub(crate) const fn metered_of(answer: Option<bool>) -> Metered {
+    match answer {
+        Some(true) => Metered::Yes,
+        Some(false) => Metered::No,
+        None => Metered::Unavailable,
+    }
+}
+
+/// Windows 与 macOS：问系统的联网成本接口。查询会阻塞，放到阻塞线程上并限时；超时或任务异常
+/// 一律「不可得」。
+async fn native_metered() -> Metered {
+    let query = tokio::task::spawn_blocking(polaris_system_integration::network_cost::metered);
+    match tokio::time::timeout(Duration::from_secs(3), query).await {
+        Ok(Ok(answer)) => metered_of(answer),
+        _ => Metered::Unavailable,
+    }
+}
+
 #[cfg(target_os = "android")]
 async fn android_conditions() -> DeviceConditions {
     match crate::runtime::proxy::android_bridge::device_conditions().await {
@@ -1249,10 +1283,10 @@ async fn device_conditions(platform: Platform) -> DeviceConditions {
             metered: linux_metered().await,
             power_save: false,
         },
-        // 系统的网络成本接口要经 WinRT / COM，现有依赖里没有它们的绑定。
-        Platform::Win => DeviceConditions::UNAVAILABLE,
-        // 路径监视器的回调是 block，现有的直接依赖里没有 block 的绑定。
-        Platform::Mac => DeviceConditions::UNAVAILABLE,
+        Platform::Win | Platform::Mac => DeviceConditions {
+            metered: native_metered().await,
+            power_save: false,
+        },
         // 原生侧的查询尚未就位（本平台的计划也还没有启用）。
         Platform::Ios => DeviceConditions::UNAVAILABLE,
         Platform::Other => DeviceConditions::UNAVAILABLE,
@@ -1413,6 +1447,7 @@ impl MeasurementScheduler {
                     policy: MeteredPolicy::parse(
                         config.get("speedTestMeteredPolicy").and_then(Value::as_str),
                     ),
+                    ledger,
                 });
                 ledger.set_foreground_epoch(planner.foreground_epoch());
                 if output.abort {

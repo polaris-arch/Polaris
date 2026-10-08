@@ -253,6 +253,40 @@ fn consecutive_failures_reset_on_success_or_a_manual_run() {
     );
 }
 
+/// 清零连续失败数：全部记录归零并通知读取方，结果本身与最近成功时刻不动；此后的失败从 1 数起。
+/// 没有可清的即不改版本。
+#[test]
+fn forgiving_failures_zeroes_every_count_and_keeps_the_results() {
+    let ledger = MeasurementLedger::new();
+    let failures = |id: &str| {
+        ledger
+            .candidate_entry(id, URL)
+            .unwrap()
+            .consecutive_failures
+    };
+    ledger.record("a", Ok(100), identity(1, 1, 1));
+    for run in 2..=4 {
+        ledger.record("a", Err(TIMED_OUT), identity(run, 1, run));
+        ledger.record("b", Err(TIMED_OUT), identity(run, 2, run));
+    }
+    assert_eq!((failures("a"), failures("b")), (3, 3));
+
+    let before = ledger.version();
+    ledger.forgive_failures();
+    assert_eq!((failures("a"), failures("b")), (0, 0));
+    assert_eq!(ledger.version(), before + 1);
+    let entry = ledger.candidate_entry("a", URL).unwrap();
+    assert_eq!(
+        (entry.measured, entry.last_ok_at),
+        (Err(TIMED_OUT), Some(1))
+    );
+
+    ledger.forgive_failures();
+    assert_eq!(ledger.version(), before + 1, "没有可清的：版本不动");
+    ledger.record("a", Err(TIMED_OUT), identity(5, 1, 5));
+    assert_eq!(failures("a"), 1);
+}
+
 /// 已有当前结果的节点 = 测出了值的 + 真测了没通的；过期、被跳过、从未测过的都不算。
 #[test]
 fn current_results_exclude_stale_skipped_and_unmeasured_nodes() {

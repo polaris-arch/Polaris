@@ -3389,6 +3389,7 @@ dependencies = [
 name = "polaris-system-integration"
 version = "1.0.0"
 dependencies = [
+ "block2",
  "log",
  "plist",
  "polaris-config-engine",
@@ -3398,6 +3399,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "windows",
 ]
 
 [[package]]
