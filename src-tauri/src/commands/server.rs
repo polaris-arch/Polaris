@@ -1172,10 +1172,13 @@ pub async fn tailscale_logout(
     {
         Ok(true) => {}
         Ok(false) => {
+            log::info!(
+                "Tailscale 登出被拒：主连接正持有节点 {server_id:?}（TAILSCALE_LOGOUT_MAIN_CORE）"
+            );
             return Ok(ApiResponse::err_with_code(
                 "Stop the main connection before signing this node out",
                 "TAILSCALE_LOGOUT_MAIN_CORE",
-            ))
+            ));
         }
         Err(error) => {
             let code = if error.kind() == std::io::ErrorKind::InvalidInput {

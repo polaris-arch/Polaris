@@ -205,12 +205,16 @@ impl MeshRuntime {
         let manager = MeshExitRouteManager::new(op, LogExitRouteLog, Platform::current());
         // 取消令牌由状态机自持，此处取同一个 Arc 的锁外句柄（不是第二份状态）。
         let exit_route_cancel = manager.cancel_handle();
+        // A login core left by a killed host process still writes its node's state directory.
+        let login_registry = LoginCoreRegistry::production().with_stale_login_sweeper(Arc::new(
+            crate::runtime::tailscale_login_core::ProcessStaleLoginSweeper::new(config_dir.clone()),
+        ));
         Self {
             config_dir,
             warp_queue_path,
             warp_queue_lock: Mutex::new(()),
             warp_queue_changed: tokio::sync::Notify::new(),
-            login_registry: LoginCoreRegistry::production(),
+            login_registry,
             exit_route: AsyncMutex::new(manager),
             exit_route_cancel,
             #[cfg(test)]

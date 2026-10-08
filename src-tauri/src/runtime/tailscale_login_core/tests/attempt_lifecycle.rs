@@ -2505,6 +2505,68 @@ fn explicit_credential_resolution_never_trusts_metadata_or_changes_issuer_on_reu
     );
 }
 
+#[test]
+fn keyless_identity_replacement_enters_the_backend_transaction_only_where_the_backend_owns_it() {
+    // A node that has only ever signed in through the browser: no key, no retained record,
+    // therefore no credential revision for the renderer to echo.
+    let saved = json!({"servers":[{"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{}}]});
+    let candidate = json!({"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{}});
+    let mut switch = request("switch");
+    switch.replace_identity = true;
+
+    let (resolved, owned) =
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, true).unwrap();
+    assert!(
+        owned,
+        "the backend that retires identities itself must own this request"
+    );
+    assert_eq!(resolved["id"], "ts1");
+    assert!(resolved["tailscaleSettings"].get("authKey").is_none());
+    assert!(uses_credential_transaction(&resolved, &switch, true));
+
+    // Where the renderer orchestrates logout, save and login, the same request stays untouched.
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, false).unwrap(),
+        (candidate.clone(), false)
+    );
+    assert!(!uses_credential_transaction(&candidate, &switch, false));
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &switch)
+            .unwrap()
+            .1,
+        cfg!(target_os = "android")
+    );
+
+    // An ordinary sign-in of the same node is never a transaction, and a stale revision claim
+    // is still refused instead of being waved through by the replacement flag.
+    let plain = request("plain");
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &plain, true).unwrap(),
+        (candidate.clone(), false)
+    );
+    assert!(!uses_credential_transaction(&candidate, &plain, true));
+    switch.expected_credential_revision = Some("stale-revision".into());
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, true).unwrap_err(),
+        "credentialRevisionChanged"
+    );
+
+    // Replacing with a new key on such a node still parks that key for compensation.
+    let mut keyed = request("switch-key");
+    keyed.replace_identity = true;
+    keyed.mode = LoginMode::Authkey;
+    let with_key =
+        json!({"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{"authKey":"new-fixture"}});
+    let (resolved, owned) =
+        resolve_tailscale_credential_candidate_for(&saved, &with_key, &keyed, true).unwrap();
+    assert!(owned);
+    assert_eq!(resolved["tailscaleSettings"]["authKey"], "new-fixture");
+    assert_eq!(
+        resolved["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "new-fixture"
+    );
+}
+
 #[cfg(not(target_os = "ios"))]
 #[tokio::test]
 async fn logout_parks_actual_key_and_retires_only_auth_preserving_taildrop_and_history() {

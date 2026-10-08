@@ -12,6 +12,7 @@ import { createRoot } from 'react-dom/client';
 import { api, unlockApi } from '/src/ipc';
 import { useAppStore } from '/src/store/app-store';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
+import { useDialogStore } from '/src/components/dialogs/dialog-store';
 import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';
@@ -29,6 +30,8 @@ import '/src/mobile/connections/connections-redesign.css';
 await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
 if (mode?.startsWith('ios')) document.documentElement.dataset.mobileOs = 'ios';
+if (mode?.startsWith('android-switch')) document.documentElement.dataset.mobileOs = 'android';
+const heldDesktop = mode === 'desktop-switch-held' || mode === 'credential-settings-logout-held';
 const listeners = new Map();
 const on = name => fn => { const set = listeners.get(name) || new Set(); listeners.set(name, set); set.add(fn); return () => set.delete(fn); };
 const bus = (domain, names) => { for (const name of names) api[domain][name] = on(name); };
@@ -49,11 +52,12 @@ api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => {
   if (mode === 'state-read-fail') throw Error('state unavailable');
-  return { 'ts-1': mode === 'state-true' || mode === 'state-switch' || mode === 'ios-existing' || mode === 'ios-settings' || mode?.startsWith('ios-replace') };
+  return { 'ts-1': mode === 'state-true' || mode === 'state-switch' || mode === 'ios-existing' || mode === 'ios-settings' || mode?.startsWith('ios-replace') || mode?.startsWith('android-switch') || heldDesktop };
 };
 const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {}, refreshes: 0, backendSaved: null, request: null };
 api.proxy.start = async () => { test.mainStarts++; };
 api.proxy.stop = async () => { test.mainStops++; };
+if (heldDesktop) api.proxy.getStatus = async () => test.mainStops === 0 ? { running: true, starting: false, pid: 9, startTime: 5 } : { running: false };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   test.progressQueries.push([serverId,attemptId]);
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
@@ -61,7 +65,7 @@ api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.receipts[attemptId]) return test.receipts[attemptId];
   return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
 };
-api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
+api.server.tailscaleGetStatus = async () => (mode?.startsWith('main') && test.starts > 0) || mode === 'android-switch-held'
   ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
       expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
       waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0 }] }
@@ -71,7 +75,10 @@ api.server.tailscaleLoginPrepare = async () => {
   test.prepares++;
   if (mode === 'prepare' || mode?.includes('retained-prepare')) await new Promise(resolve => { test.releasePrepare = resolve; });
 };
-api.server.tailscaleLogout = async () => { test.logouts++; };
+api.server.tailscaleLogout = async () => {
+  if (heldDesktop && test.mainStops === 0) throw { code: 'TAILSCALE_LOGOUT_MAIN_CORE' };
+  test.logouts++;
+};
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
 api.server.tailscaleLogin = async (node, request) => {
   test.starts++;
@@ -135,12 +142,13 @@ test.begin = id => useTailscaleLoginProgressStore.getState().begin('ts-1', id);
 test.authUrl = () => useAppStore.getState().tailscaleAuthUrls['ts-1'];
 test.initiated = () => useAppStore.getState().tailscaleLoginInitiated['ts-1'];
 test.stop = off;
+test.topConfirm = () => { const entry = (heldDesktop ? useDialogStore : useMobileFormStore).getState().stack.at(-1); return entry?.kind === 'confirm' ? entry.payload : null; };
 function Host() {
   const stack = useMobileFormStore(s => s.stack);
   if (mode?.includes('retained-prepare')) return <MobileFormHost />;
   if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;
   return stack.map(form => form.kind === 'ts-login'
-    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch'} /> : null);
+    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch' || mode?.startsWith('android-switch') || mode === 'desktop-switch-held'} /> : null);
 }
 useMobileFormStore.getState().open({kind:mode === 'ios-settings' || mode?.includes('credential-settings') ? 'ts-settings' : 'ts-login', serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
@@ -352,6 +360,80 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         const t = (window as any).__tsTest;
         return { logouts: t.logouts, replace: t.request.replaceIdentity, mode: t.request.mode };
       })).toEqual({ logouts: 1, replace: true, mode: loginMode });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android switches a browser-only node through one backend request, never a renderer logout', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, saves: t.saves, replace: t.request.replaceIdentity, mode: t.request.mode,
+          revision: t.request.expectedCredentialRevision ?? null, noticed: !!t.topConfirm() };
+      })).toEqual({ logouts: 0, saves: 0, replace: true, mode: 'browser', revision: null, noticed: false });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android says the proxy will stay disconnected before a switch stops the proxy holding the node', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch-held`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          prepares: t.prepares, starts: t.starts, logouts: t.logouts };
+      })).toEqual({ title: '断开连接并切换账号？', keepsDisconnected: true, prepares: 0, starts: 0, logouts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, mainStops: t.mainStops, replace: t.request.replaceIdentity };
+      })).toEqual({ logouts: 0, mainStops: 0, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop offers to stop the proxy that holds the node, then switches and leaves it stopped', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=desktop-switch-held`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          starts: t.starts, logouts: t.logouts, mainStops: t.mainStops };
+      })).toEqual({ title: '断开连接并切换账号？', keepsDisconnected: true, starts: 0, logouts: 0, mainStops: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, mainStops: t.mainStops, mainStarts: t.mainStarts, replace: t.request.replaceIdentity };
+      })).toEqual({ logouts: 1, mainStops: 1, mainStarts: 0, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop settings logout asks before stopping the proxy that holds the node, then logs out', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=credential-settings-logout-held`);
+      await page.getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          logouts: t.logouts, mainStops: t.mainStops };
+      })).toEqual({ title: '断开连接并退出登录？', keepsDisconnected: true, logouts: 0, mainStops: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.logouts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { mainStops: t.mainStops, mainStarts: t.mainStarts };
+      })).toEqual({ mainStops: 1, mainStarts: 0 });
     } finally { await page.close(); }
   }, 30_000);
 

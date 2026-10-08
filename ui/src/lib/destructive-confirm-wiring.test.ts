@@ -300,8 +300,13 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     'components/dialogs/use-subscription-create-dialog-operation.ts': 1,
     // renderer 重建的可见任务用同一条取消语义，独立 surface 也必须纳入清册。
     'components/dialogs/SubscriptionCreateTaskDialog.tsx': 1,
-    'components/dialogs/TsLoginDialog.tsx': 1,
+    // 脏表单放弃 + 主连接持有该节点时换号前的告知。后者不能原地确认：它要说明的是**另一个对象**
+    // 的后果（代理会被断开且保持断开、登录完成后需手动重连），按钮翻红再点一次说不出这段话。
+    'components/dialogs/TsLoginDialog.tsx': 2,
     'components/dialogs/TsSettingsDialog.tsx': 1,
+    // 桌面两个登出入口（TS 设置弹窗、组网卡）共用的一处：主连接持有该节点时，确认「断开代理并
+    // 退出登录、代理保持断开」。理由同上：后果落在代理连接上，需成段说明。
+    'components/dialogs/ts-logout-confirm.ts': 1,
     'components/dialogs/WarpDialog.tsx': 1,
     'components/dialogs/WgDialog.tsx': 1,
     'components/dialogs/dialog-store.ts': 1, // union 的类型声明，非调用点
@@ -333,8 +338,10 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     // 后者走 `node-deletion#removeWarpNode`，确认由本面板经 `confirm:` 那个 deps 开，
     // 故两颗共用**一处** `open({ kind: 'confirm' …})`（它就是那个 deps 的实现）。
     'mobile/forms/WarpPanel.tsx': 2,
-    'mobile/forms/TsLoginPanel.tsx': 1, // 脏表单放弃
-    'mobile/forms/TsSettingsPanel.tsx': 3, // 脏表单放弃 + 退出登录 + 主核持有时明确确认断开再退出
+    'mobile/forms/TsLoginPanel.tsx': 2, // 脏表单放弃 + 换号会断开持有该节点的代理且不重连时的事前告知
+    // 脏表单放弃 + 退出登录 + 调用后端之前告知「会断开持有该节点的代理并保持断开」
+    // + 后端拒绝（主核持有）时明确确认断开再退出
+    'mobile/forms/TsSettingsPanel.tsx': 4,
     'mobile/forms/SubFormPanel.tsx': 2, // 脏表单放弃 + 恢复面「取消添加」（ζ 批 A8，同桌面 SubscriptionCreateTaskDialog 那一处）
     // Taildrop 收件箱（批 16）：删一个待处理文件 —— 破坏性，叠一层确认面板。
     // 本面板**没有**脏表单放弃那一处：它不是一张表单，关掉不丢任何草稿。

@@ -64,6 +64,8 @@ import { useStagingActive } from '@/store/use-staging-active';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { editRoute } from '@/lib/staged-config';
 import { useDialogStore } from './dialog-store';
+import { confirmStopThenTsLogout } from './ts-logout-confirm';
+import { isMainCoreLogoutError } from './ts-logout-flow';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { groupTsFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -342,17 +344,27 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       );
       return;
     }
-    setBusy(true);
-    try {
-      await api.server.tailscaleLogout(node.id);
+    const loggedOut = () => {
       const store = useAppStore.getState();
       store.setTailscaleLoginState(node.id, false);
       store.setTailscaleAuthUrl(node.id, null);
       store.setTailscaleLoginInitiated(node.id, false);
       store.clearTailscaleStatus(node.id);
       void loadConfig(true);
-      close();
+      // The confirmed path finishes later; close this dialog only if it is still the top one.
+      const { stack } = useDialogStore.getState();
+      const top = stack[stack.length - 1];
+      if (top?.kind === 'ts-settings' && top.serverId === node.id) close();
+    };
+    setBusy(true);
+    try {
+      await api.server.tailscaleLogout(node.id);
+      loggedOut();
     } catch (e) {
+      if (isMainCoreLogoutError(e)) {
+        await confirmStopThenTsLogout(node.id, t, loggedOut);
+        return;
+      }
       // 登出不是保存 —— 标题取 NodesScreen:696 同一操作已在用的那个键，别套 `common.saveFailed`。
       console.error('[TsSettingsDialog] logout failed:', e);
       const reason = tsLoginErrorReason(e);

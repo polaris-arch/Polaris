@@ -34,6 +34,7 @@ const control=window.__tsLogoutTest={
   state:()=>state,
   selected:()=>useAppStore.getState().selectedServerId,
   started:[],
+  logouts:0,
   authorize:()=>{
     state=true;
     const attempt=useTailscaleLoginProgressStore.getState().attempts['ts-1'];
@@ -41,16 +42,16 @@ const control=window.__tsLogoutTest={
   },
 };
 systemApi.listNetworkInterfaces=async()=>[];
-api.server.tailscaleGetStatus=async()=>({connected:false,statuses:[]});
+api.server.tailscaleGetStatus=async()=>mode==='held'?{connected:true,statuses:[{serverId:'ts-1',backendState:'Running',loggedIn:true,expired:false,peers:[],tailscaleIPs:[],canShareFiles:false,waitingFileCount:0,receivingFileCount:0,unreadFileCount:0}]}:{connected:false,statuses:[]};
 api.server.tailscaleStateExists=async()=>({'ts-1':state});
-api.server.tailscaleLogout=async()=>{if(mode!=='success')throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
+api.server.tailscaleLogout=async()=>{control.logouts++;if(mode!=='success'&&mode!=='held')throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
 api.server.tailscaleLoginPrepare=async()=>{};
 api.server.tailscaleLoginProgress=async()=>null;
 api.server.tailscaleLoginCancel=async()=>{};
 api.server.tailscaleLogin=async(server)=>{control.started.push(server);return {started:true};};
 api.server.update=async(server)=>{useAppStore.setState({servers:[server],config:{servers:[server],subscriptions:[]}});};
 api.proxy.getStatus=async()=>({running:true,starting:false,pid:321,startTime:1});
-useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'?'other':'ts-1',loadConfig:async()=>{}});
+useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'||mode==='held'?'other':'ts-1',loadConfig:async()=>{}});
 useMobileFormStore.getState().open({kind:'ts-settings',serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><MobileFormHost/></main>);
 `;
@@ -99,6 +100,23 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
     } finally { await page.close(); }
   }, 45_000);
 
+  it('a node held by the running proxy asks again before the backend is called', async () => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
+    page.setDefaultTimeout(6_000);
+    try {
+      await page.goto(origin + '/__ts-logout?mode=held');
+      await page.getByRole('dialog', { name: 'Tailscale 设置' }).getByRole('button', { name: '退出登录' }).click();
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      // The mobile backend would disconnect the proxy itself: the notice must come first.
+      await page.getByRole('dialog', { name: '断开连接并退出登录？' }).getByText('代理会保持断开').waitFor();
+      expect(await page.evaluate(() => ({ stack: (window as any).__tsLogoutTest.stack(),
+        logouts: (window as any).__tsLogoutTest.logouts }))).toEqual({ stack: ['ts-settings', 'confirm'], logouts: 0 });
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.state())).toBe(false);
+    } finally { await page.close(); }
+  }, 45_000);
+
   it('after logout shows Login and can explicitly authorize an unselected official node', async () => {
     const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
     page.setDefaultTimeout(6_000);
@@ -107,6 +125,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
       const settings = page.getByRole('dialog', { name: 'Tailscale 设置' });
       await settings.getByRole('button', { name: '退出登录' }).click();
       await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      // No running proxy holds the node: one confirmation, one backend call, no second notice.
+      await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
       expect(await page.evaluate(() => (window as any).__tsLogoutTest.state())).toBe(false);
       await page.evaluate(() => (window as any).__tsLogoutTest.openSettings());
       await settings.getByRole('button', { name: '登录', exact: true }).waitFor();

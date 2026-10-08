@@ -71,9 +71,11 @@ use tauri::AppHandle;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod attempts;
+mod stale;
 pub(crate) use attempts::Attempt;
 use attempts::{AttemptGuard, Attempts};
 pub use attempts::{LoginMode, LoginProgressReceipt, LoginRequest};
+pub use stale::{ProcessStaleLoginSweeper, StaleLoginCoreSweeper};
 
 #[cfg(test)]
 use polaris_config_engine::user_config::app_config::UserConfig;
@@ -100,12 +102,30 @@ use crate::runtime::proxy::{
 };
 use crate::runtime::tailscale_status::decode_tailscale_status;
 
+/// Android retires a replaced identity inside the backend transaction even when the node has
+/// no stored key: its logout entry never preserves a renderer-owned login request.
+const BACKEND_IDENTITY_REPLACEMENT: bool = cfg!(target_os = "android");
+
 /// Resolve an explicit credential action from this one current raw node. Renderer metadata
 /// and omitted secrets never supply a key or authorize retirement. This is pure preflight.
 pub(crate) fn resolve_tailscale_credential_candidate(
     saved: &serde_json::Value,
     candidate: &serde_json::Value,
     request: &LoginRequest,
+) -> Result<(serde_json::Value, bool), String> {
+    resolve_tailscale_credential_candidate_for(
+        saved,
+        candidate,
+        request,
+        BACKEND_IDENTITY_REPLACEMENT,
+    )
+}
+
+fn resolve_tailscale_credential_candidate_for(
+    saved: &serde_json::Value,
+    candidate: &serde_json::Value,
+    request: &LoginRequest,
+    backend_replacement: bool,
 ) -> Result<(serde_json::Value, bool), String> {
     use polaris_config_engine::user_config::effective_view::{
         park_tailscale_auth_key, retained_tailscale_auth_key, tailscale_control_authority,
@@ -129,14 +149,18 @@ pub(crate) fn resolve_tailscale_credential_candidate(
     let current_authority = tailscale_control_authority(current)?;
     let candidate_authority = tailscale_control_authority(candidate)?;
     let revision = tailscale_credential_revision(current);
-    let backend_owned = request.reuse_retained_auth_key
+    let replacement = backend_replacement && request.replace_identity;
+    let backend_owned = replacement
+        || request.reuse_retained_auth_key
         || record.is_some()
         || request.expected_credential_revision.is_some()
         || revision.is_some() && current_authority != candidate_authority;
     if !backend_owned {
         return Ok((candidate.clone(), false));
     }
-    if request.expected_credential_revision.as_deref() != revision.as_deref() || revision.is_none()
+    // A node without any stored key has no revision; only a replacement may proceed without one.
+    if request.expected_credential_revision.as_deref() != revision.as_deref()
+        || revision.is_none() && !replacement
     {
         return Err("credentialRevisionChanged".into());
     }
@@ -198,6 +222,20 @@ pub(crate) fn resolve_tailscale_credential_candidate(
         ProxyRuntime::merged_tailscale_candidate(saved, &candidate)?,
         true,
     ))
+}
+
+/// Whether a normal-main login request is a credential transaction on a platform with one.
+fn uses_credential_transaction(
+    candidate: &serde_json::Value,
+    request: &LoginRequest,
+    backend_replacement: bool,
+) -> bool {
+    candidate
+        .get("tailscaleSettings")
+        .is_some_and(|settings| settings.get("retainedAuthKey").is_some())
+        || request.reuse_retained_auth_key
+        || request.mode == LoginMode::Authkey && request.expected_credential_revision.is_some()
+        || backend_replacement && request.replace_identity
 }
 
 pub(crate) fn park_saved_tailscale_key(
@@ -2091,6 +2129,8 @@ pub struct LoginCoreRegistry {
     checker: Arc<dyn ConfigChecker>,
     subscriber: Arc<dyn LoginStatusSubscriber>,
     resolve_binary: BinaryResolver,
+    /// Absent in fixtures and on platforms whose login core is not a separate process.
+    stale_sweeper: Option<Arc<dyn StaleLoginCoreSweeper>>,
     timeout: Duration,
     epoch: AtomicU64,
     /// 串行化「检查旧代 → 起核 → 注册」事务，防同一 server 的并发 IPC 各自都看见空表，
@@ -2140,11 +2180,48 @@ impl LoginCoreRegistry {
             checker,
             subscriber,
             resolve_binary,
+            stale_sweeper: None,
             timeout,
             epoch: AtomicU64::new(1),
             start_gate: tokio::sync::Mutex::new(()),
             closing: AtomicBool::new(false),
             attempts: Attempts::default(),
+        }
+    }
+
+    /// Install the sweep that ends login cores left behind by a host process that died.
+    #[must_use]
+    pub fn with_stale_login_sweeper(mut self, sweeper: Arc<dyn StaleLoginCoreSweeper>) -> Self {
+        self.stale_sweeper = Some(sweeper);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_stale_login_sweeper(&self) -> bool {
+        self.stale_sweeper.is_some()
+    }
+
+    /// A leftover login core is an unregistered writer of a node's state directory. End it
+    /// before admitting a new login core or rewriting authentication; refuse while it lives.
+    /// The caller holds the state gate, so the registered children cannot change underneath.
+    async fn sweep_stale_login_cores(&self) -> Result<(), String> {
+        let Some(sweeper) = &self.stale_sweeper else {
+            return Ok(());
+        };
+        let Ok(binary) = (self.resolve_binary)() else {
+            log::debug!(target: LOGIN_CORE_LOG_TARGET, "遗留登录核清扫：未解析到核二进制，未执行");
+            return Ok(());
+        };
+        match sweeper.sweep(&binary, &self.shared.pids()).await {
+            Ok(0) => Ok(()),
+            Ok(ended) => {
+                log::warn!(target: LOGIN_CORE_LOG_TARGET, "遗留登录核清扫：已结束 {ended} 个上次遗留的登录核");
+                Ok(())
+            }
+            Err(reason) => {
+                log::warn!(target: LOGIN_CORE_LOG_TARGET, "遗留登录核清扫：{reason}，拒绝本次准入");
+                Err(reason)
+            }
         }
     }
 
@@ -3107,6 +3184,9 @@ impl LoginCoreRegistry {
                 "Only a prepared login request may be preserved",
             ));
         }
+        self.sweep_stale_login_cores()
+            .await
+            .map_err(std::io::Error::other)?;
         if keep_attempt.is_none() {
             self.retire_attempts_under_state_gate(server_id, &_gate)
                 .await
@@ -3544,13 +3624,7 @@ impl LoginCoreRegistry {
             .map(|normal| (normal.proxy, normal.action_generation));
         #[cfg(not(target_os = "ios"))]
         let credential_transaction = normal_main.as_ref().is_some_and(|normal| {
-            normal
-                .candidate
-                .get("tailscaleSettings")
-                .is_some_and(|settings| settings.get("retainedAuthKey").is_some())
-                || request.reuse_retained_auth_key
-                || request.mode == LoginMode::Authkey
-                    && request.expected_credential_revision.is_some()
+            uses_credential_transaction(normal.candidate, &request, BACKEND_IDENTITY_REPLACEMENT)
         });
         #[cfg(not(target_os = "ios"))]
         let _credential_lease = if credential_transaction {
@@ -3782,6 +3856,11 @@ impl LoginCoreRegistry {
             .await
             .map_err(|_| "credentialCommitUnknown".to_owned())?;
         if !retired {
+            log::info!(
+                target: LOGIN_CORE_LOG_TARGET,
+                "Tailscale 切换账号被拒：主连接正持有节点 {:?}（mainCoreInUse）",
+                requested.id
+            );
             return Err("mainCoreInUse".into());
         }
         Ok(())
@@ -4464,6 +4543,9 @@ impl LoginCoreRegistry {
         if !self.shared.can_start(&server.id) {
             return StartLoginOutcome::Failed("tooManyLogins".into());
         }
+        if let Err(reason) = self.sweep_stale_login_cores().await {
+            return StartLoginOutcome::Failed(reason);
+        }
         let mut server = server.clone();
         if request.mode == LoginMode::Browser {
             if let Some(ts) = server.tailscale_settings.as_mut() {
@@ -4524,14 +4606,20 @@ impl LoginCoreRegistry {
             Err(_) => return StartLoginOutcome::Failed("invalidNode".into()),
         };
         let json_cfg = login_config_to_json(&cfg);
-        let config_path = user_data.join(format!(
-            "tailscale-login-{}-{epoch}.json",
-            sanitize_id(&server.id)
-        ));
+        let config_path = login_config_path(user_data, &server.id, epoch);
         let bytes = match serde_json::to_vec_pretty(&json_cfg) {
             Ok(b) => b,
             Err(_) => return StartLoginOutcome::Failed("configWriteFailed".into()),
         };
+        // A config left by a killed host process would collide with this process's restarted
+        // epoch numbering. Every registered login's config is excluded by its exact path.
+        let live_configs: Vec<PathBuf> = self
+            .shared
+            .guard()
+            .iter()
+            .map(|(id, entry)| login_config_path(user_data, id, entry.epoch))
+            .collect();
+        stale::sweep_stale_login_configs(user_data, &live_configs);
         // Independent authorization also works before the primary core has ever initialized its files.
         if create_login_parent(user_data)
             .and_then(|()| write_login_config_secure(&config_path, &bytes))
@@ -5327,6 +5415,14 @@ fn apply_status_frame(
         }
     }
     Ok(state)
+}
+
+/// One login epoch's temporary config. The epoch makes each file single-owner.
+fn login_config_path(user_data: &Path, server_id: &str, epoch: u64) -> PathBuf {
+    user_data.join(format!(
+        "tailscale-login-{}-{epoch}.json",
+        sanitize_id(server_id)
+    ))
 }
 
 /// server id → 安全文件名片段（防路径穿越；非字母数字/-/_ 归一为 `_`）。

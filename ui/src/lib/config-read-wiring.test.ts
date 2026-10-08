@@ -422,6 +422,20 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '与后端对账：保存后按 id 从磁盘镜像读回名称，确认它确实落盘；不能用 effective 暂存值冒充保存成功',
   },
   {
+    file: 'components/dialogs/TsLoginDialog.tsx',
+    shape: 'useAppStore.getState().servers.some',
+    count: 1,
+    surface: 'operation',
+    why: '主连接持有该节点时用户确认断开后、停核前复核该节点仍在磁盘镜像中；确认等待期间节点可能被删除，随后的换号按 id 寻址后端，effective 暂存集合不能证明后端仍有对象（同 TsSettingsPanel 那条）。',
+  },
+  {
+    file: 'components/dialogs/ts-logout-confirm.ts',
+    shape: 'useAppStore.getState().servers.some',
+    count: 1,
+    surface: 'operation',
+    why: '桌面主连接持有该节点时用户确认断开后的第二次按 id 登出前复核该节点仍在磁盘镜像中；确认等待期间节点可能被删除，effective 暂存集合不能证明后端仍有对象（与 TsSettingsPanel 那条逐字同一件事）。',
+  },
+  {
     file: 'components/dialogs/VpnAuthDialog.tsx',
     shape: 'useAppStore((state)=>state.servers.find((server)=>server.id=…',
     count: 1,

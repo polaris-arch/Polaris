@@ -14,10 +14,12 @@ import {
   nextTsNodeName,
   planTsLoginSubmit,
   supportsTsLoginActions,
+  tsAccountActionsUseNormalMain,
   tsLoginUsesBackendReplacement,
   tsLoginUsesBackendCredentials,
   type TsLoginMode,
 } from '@/components/dialogs/ts-login-server';
+import { tsNodeHeldByRunningCore } from '@/components/dialogs/ts-logout-flow';
 import type { ServerConfig } from '@/contracts/types';
 import { controlUrlReject } from '@/domain/control-url';
 import { groupServersBySubscription } from '@/domain/server-grouping';
@@ -44,7 +46,7 @@ export function TsLoginPanel({
   const accountActionsSupported = supportsTsAccountActions();
   const loginActionsSupported = supportsTsLoginActions();
   const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
-  const isIOS = tsLoginUsesBackendReplacement(true);
+  const isIOS = tsAccountActionsUseNormalMain();
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -302,7 +304,7 @@ export function TsLoginPanel({
     });
   };
 
-  const submit = async (): Promise<void> => {
+  const submit = async (stopNoticed = false): Promise<void> => {
     if (submitting) return;
     const submissionBase = savedServer ?? existingTs;
     const submittedName = !nameEdited && !submissionBase ? nextTsNodeName(meshNames) : name.trim();
@@ -323,6 +325,32 @@ export function TsLoginPanel({
       return;
     }
     setErrControl(null);
+    // Android's backend stops a proxy that holds this node and leaves it stopped. Say so
+    // before calling it; an unreadable status is not proof of a holder.
+    if (backendReplacement && !isIOS && !stopNoticed && submissionBase) {
+      const heldId = submissionBase.id;
+      setSubmitting(true);
+      const held = await api.server.tailscaleGetStatus()
+        .then((snap) => tsNodeHeldByRunningCore(snap, heldId), () => false);
+      if (!hasInstance(instanceId)) return;
+      setSubmitting(false);
+      if (held) {
+        const noticeId = open({
+          kind: 'confirm',
+          payload: {
+            title: t('ts.switchStopTitle'),
+            message: t('ts.switchStopMessage'),
+            confirmLabel: t('ts.switchStopConfirm'),
+            danger: true,
+            onConfirm: async () => {
+              closeInstance(noticeId);
+              if (hasInstance(instanceId)) await submit(true);
+            },
+          },
+        });
+        return;
+      }
+    }
     const submissionRevision = editRevisionRef.current;
     const backendCredentials = tsLoginUsesBackendCredentials(submissionBase, reuseRetainedAuthKey);
     const backendOwned = backendReplacement || backendCredentials;
@@ -584,7 +612,7 @@ export function TsLoginPanel({
         </div>
       )}
 
-      {backendReplacement && <p className="m-form-hint">{t('ts.switchAccountNote')}</p>}
+      {backendReplacement && isIOS && <p className="m-form-hint">{t('ts.switchAccountNote')}</p>}
       {(mode === 'browser' || progress !== undefined) && (progress?.phase === 'authorized' ? (
         <p className="m-form-hint">{t('ts.loginMainCoreAuthorized')}</p>
       ) : authUrl !== null ? (

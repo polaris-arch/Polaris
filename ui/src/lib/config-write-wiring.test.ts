@@ -574,6 +574,12 @@ const SITES: readonly Site[] = [
     why: 'W-3：清 tailscale state 目录不可逆（BYPASS_TABLE 的 deleteTailscaleNode 同族）',
   },
   {
+    file: 'components/dialogs/ts-logout-confirm.ts',
+    callee: 'api.server.tailscaleLogout(',
+    route: 'direct',
+    why: 'W-3：主连接持有该节点时用户确认断开后的第二次登出，与 TsSettingsDialog / NodesScreen 的第一次登出同一动作、同样不可逆；两个调用点都已先过 splitStagedOnly 前置拦截',
+  },
+  {
     file: 'components/dialogs/TsLoginDialog.tsx',
     callee: 'api.server.tailscaleLogout(',
     route: 'direct',

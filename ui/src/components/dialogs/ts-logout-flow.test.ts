@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout } from './ts-logout-flow';
+import { captureMainCoreOwner, isMainCoreLogoutError, sameRunningCore, stopOwnedCore, stopOwnedCoreThenLogout, tsNodeHeldByRunningCore } from './ts-logout-flow';
 
 const running = { running: true, pid: 123, startTime: 456 };
 const stopped = { running: false };
@@ -84,5 +84,45 @@ describe('mobile Tailscale logout with a main-core owner', () => {
     });
     expect(refused.stop).toHaveBeenCalledOnce();
     expect(refused.logout).toHaveBeenCalledOnce();
+  });
+});
+
+describe('shared pre-notice helpers for a node held by the running core', () => {
+  const status = (serverId: string) => ({ serverId });
+
+  it('only a live status stream that lists the node counts as held', () => {
+    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [status('ts-b'), status('ts-a')] }, 'ts-a')).toBe(true);
+    // A stopped core keeps its last frames as a stale cache; that is not a holder.
+    expect(tsNodeHeldByRunningCore({ connected: false, statuses: [status('ts-a')] }, 'ts-a')).toBe(false);
+    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [status('ts-b')] }, 'ts-a')).toBe(false);
+    expect(tsNodeHeldByRunningCore({ connected: true, statuses: [] }, 'ts-a')).toBe(false);
+  });
+
+  it('captures an owner only for a run that can be named again later', () => {
+    expect(captureMainCoreOwner('ts-a', 'other-node', running)).toEqual(owner);
+    expect(captureMainCoreOwner('ts-a', 'other-node', null)).toBeNull();
+    expect(captureMainCoreOwner('ts-a', 'other-node', stopped)).toBeNull();
+    expect(captureMainCoreOwner('ts-a', 'other-node', { running: true, pid: 123 })).toBeNull();
+    expect(captureMainCoreOwner('ts-a', 'other-node', { ...running, starting: true })).toBeNull();
+  });
+
+  it('stops exactly the captured run and nothing else', async () => {
+    const same = fixture();
+    expect(await stopOwnedCore(owner, same.io)).toBe('stopped');
+    expect(same.stop).toHaveBeenCalledOnce();
+
+    const replaced = fixture();
+    replaced.setStatus({ ...running, startTime: 789 });
+    expect(await stopOwnedCore(owner, replaced.io)).toBe('changed');
+    expect(replaced.stop).not.toHaveBeenCalled();
+
+    const reselected = fixture();
+    reselected.setSelected('new-node');
+    expect(await stopOwnedCore(owner, reselected.io)).toBe('changed');
+    expect(reselected.stop).not.toHaveBeenCalled();
+
+    const stillRunning = fixture();
+    stillRunning.stop.mockImplementationOnce(async () => {});
+    expect(await stopOwnedCore(owner, stillRunning.io)).toBe('stopFailed');
   });
 });

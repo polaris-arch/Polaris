@@ -11,7 +11,8 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
-import { executeTsLogin, nextTsNodeName, planTsLoginSubmit, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
+import { executeTsLogin, nextTsNodeName, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
+import { captureMainCoreOwner, stopOwnedCore } from './ts-logout-flow';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
 import { controlUrlReject } from '@/domain/control-url';
@@ -31,7 +32,7 @@ function TsIcon() {
 export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?: string; replaceIdentity?: boolean }) {
   const { t } = useTranslation();
   const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
-  const isIOS = tsLoginUsesBackendReplacement(true);
+  const isIOS = tsAccountActionsUseNormalMain();
   const open = useDialogStore((s) => s.open);
   const close = useDialogStore((s) => s.close);
   const servers = useAppStore((s) => s.servers);
@@ -189,6 +190,36 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
     });
   };
 
+  // The desktop backend refuses to replace an account while the running proxy holds the node.
+  // Offer to stop exactly that run, then submit again; the proxy is left stopped.
+  const submitRef = useRef<() => Promise<void>>(async () => {});
+  const askStopThenRetry = async (id: string) => {
+    const owner = captureMainCoreOwner(id, useAppStore.getState().selectedServerId,
+      await api.proxy.getStatus().catch(() => null));
+    if (!owner) return;
+    open({
+      kind: 'confirm',
+      payload: {
+        title: t('ts.switchStopTitle'),
+        message: t('ts.switchStopMessage'),
+        confirmLabel: t('ts.switchStopConfirm'),
+        danger: true,
+        onConfirm: async () => {
+          close();
+          const stopped = await stopOwnedCore(owner, {
+            selectedId: () => useAppStore.getState().selectedServerId,
+            serverPresent: (serverId) => useAppStore.getState().servers.some((s) => s.id === serverId),
+            status: () => api.proxy.getStatus(),
+            stop: () => useAppStore.getState().stopProxy(),
+          });
+          if (stopped === 'stopped') await submitRef.current();
+          else if (stopped === 'changed') toast.info(t('ts.switchStopChanged'));
+          else toast.error(t('ts.switchStopFailed'));
+        },
+      },
+    });
+  };
+
   const handleSubmit = async () => {
     const submittedName = !nameEdited && !existingTs ? nextTsNodeName(meshNames) : name.trim();
     if (!submittedName) {
@@ -295,7 +326,10 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
       }
       setSubmitting(false);
     }
+    if (outcome.phase === 'failed' && outcome.reason === 'mainCoreInUse' && !isIOS
+      && activeRequest.current?.attemptId === request.attemptId) void askStopThenRetry(server.id);
   };
+  submitRef.current = handleSubmit;
 
   const copyAuthUrl = async () => {
     try {
@@ -383,7 +417,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
       </div>
 
       {saved && <div className="card-sub" role="status">{t('ts.nodeSaved')}</div>}
-      {backendReplacement && <div className="card-sub">{t('ts.switchAccountNote')}</div>}
+      {backendReplacement && isIOS && <div className="card-sub">{t('ts.switchAccountNote')}</div>}
       {loginConnectionProgressKey(progress?.phase) && <div className="card-sub" role="status">{t(loginConnectionProgressKey(progress?.phase)!)}</div>}
       {progress?.phase === 'authorized' && <div className="card-sub" role="status">{t('ts.authorizationComplete')}</div>}
       {progress?.phase === 'mainCore' && <div className="card-sub" role="status">{t(progress.reason === 'configurationPending' ? 'ts.loginInMainCoreNeedsRestart' : 'ts.mainCoreAwaitingAuthorization')}</div>}

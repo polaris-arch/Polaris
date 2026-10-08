@@ -3004,6 +3004,8 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/runtime/proxy/prerequisite.rs", "any(target_os = \"ios\", test)", 1, IosSide::DiffersRight, "Logout入口使用的纯冷/热判据供iOS真实consumer与host测试；test=false release/debug均iOS=true Android=false，host test inclusion不是平台运行证明。原LocalStart未闭合且ready缺失/未committed两种running值都Unknown，不先Stop后伪cold；已committed live沿原ticket/digest/target校验，Observed冷恢复沿原prepare，公共login/replacement producer不改。"),
     ("src-tauri/src/runtime/mesh.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "Android Logout分派到同原Main或Login私有custody、完整writer family与同原Entry target reservation后消费严格认证FileStore退休/CAS；Unknown仍零写，不消费ordinary JNI ACK。iOS命令先return原normal NE/G消费者，PC保持原gate/main-negative/actualchild腿；这里只登记源码平台分派，未签实际Android SDK/运行或NoOwner。"),
     ("src-tauri/src/runtime/tailscale_login_core.rs", "target_os = \"android\"", 2, IosSide::DiffersWrongToday, "新增credential事务在close旧entry/激活之前拒无scoped proof，另一个拒把empty JNI close ACK用于promoted-CAS补偿；逐点两处Android拒绝正确、零FS写/零补偿。相同(file,predicate)旧8站点仍含iOS不适用的桌面独立producer，原组级WrongToday保持，新2仅保守同组计数，并非新增两处iOS运行错误或新架构错误；旧8理由不改，既有iOS正常Main和Androidlegacy login不受此拒绝。真实Androidadapter未交付，守卫不提供NoOwner。"),
+    // Keyless account switch: one const decides whether the backend transaction owns identity replacement.
+    ("src-tauri/src/runtime/tailscale_login_core.rs", "target_os = \"android\"", 1, IosSide::DiffersWrongToday, "BACKEND_IDENTITY_REPLACEMENT 常量一处：Android 的登出入口拒绝保留渲染端登录请求，故无已存 key 的节点换号也进后端 credential 事务。iOS 取 false 是对的——它的换号由自己的 normal-main replacement 分派承接，不经此常量；桌面取 false 保留前端编排腿。逐点正确，仅随同 (file,predicate) 组保守沿用组级 WrongToday 标签，不是新增 iOS 运行错误；Android 实机路径未验收。"),
     // PC temp native-only slice: preserve the original 21/2 debt subcounts and reasons.
     // The verdict belongs to the whole (file, predicate) group, not each new representation.
     (
@@ -3664,7 +3666,7 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 24),
     ("DiffersRight", 265),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 148),
+    ("DiffersWrongToday", 149),
     ("WithAndroid", 86),
 ];
 
@@ -3829,6 +3831,11 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "src-tauri/src/runtime/tailscale_login_core.rs",
         "not(target_os = \"android\")",
         8,
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"android\"",
+        1,
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",

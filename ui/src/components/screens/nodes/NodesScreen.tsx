@@ -56,6 +56,8 @@ import { useNodeSubscriptionActions } from './use-node-subscription-actions';
 import { useNodeDeletion } from './use-node-deletion';
 import { useNodeActions } from './use-node-actions';
 import { performMeshTsLogout } from './mesh-ts-logout';
+import { confirmStopThenTsLogout } from '@/components/dialogs/ts-logout-confirm';
+import { isMainCoreLogoutError } from '@/components/dialogs/ts-logout-flow';
 import type { NodesListSortKey } from './nodes-list-projection';
 import { useNodesRenderWindow } from './use-nodes-render-window';
 import { NodesHeader } from './NodesHeader';
@@ -473,7 +475,12 @@ export function NodesScreen() {
         setTailscaleLoginState,
       );
       if (result.ok) toast.success(t(result.noticeKey));
-      else {
+      else if (isMainCoreLogoutError(result.error)) {
+        await confirmStopThenTsLogout(node.id, t, () => {
+          setTailscaleLoginState(node.id, false);
+          toast.success(t('nodes.meshTsLogoutOk'));
+        });
+      } else {
         console.error('[NodesScreen] tailscale logout failed:', result.error);
         toast.error(t(result.noticeKey));
       }
