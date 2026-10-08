@@ -733,13 +733,6 @@ fn handle_start<P, S, D, SD>(
         let _ = conn.write_line("ERR log-path-denied");
         return;
     }
-    if let Err(error) = deps.spawner.validate_start_environment() {
-        let _ = conn.write_line(&format!(
-            "ERR {}",
-            single_line_wire_detail(&error.to_string())
-        ));
-        return;
-    }
     let birth = if exact {
         match mint_birth_token() {
             Ok(token) => Some(token),

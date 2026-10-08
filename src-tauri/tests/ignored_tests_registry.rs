@@ -49,9 +49,6 @@ enum Class {
     LiveHostState,
     /// 根本不是测试，是打印工具。用 `#[ignore]` 只为不进默认门。
     NotAGate,
-    /// 需要 root 的隔离私有文件系统门；只写临时目录，不操作真实 claims 或网络。
-    /// 与 LiveHostState 不同：权限是真实前提，被测布局始终由夹具拥有。
-    PrivilegedPrivateFs,
     /// 被父测试以精确过滤器起出的私有子测试进程，不是可独立验收的门。
     /// 与 NotAGate 打印工具不同：它是父门负责输入、身份与收尾的执行夹具。
     PrivateChildFixture,
@@ -68,8 +65,7 @@ impl Class {
             Class::PublicNetwork => &["公网"],
             Class::LiveHostState => &["route", "proxy"],
             Class::NotAGate => &["非门"],
-            Class::PrivilegedPrivateFs => &["root-only"],
-            Class::PrivateChildFixture => &["private child fixture", "isolated root peer UID gate"],
+            Class::PrivateChildFixture => &["private child fixture"],
         }
     }
 
@@ -79,7 +75,6 @@ impl Class {
             Class::PublicNetwork => "PublicNetwork",
             Class::LiveHostState => "LiveHostState",
             Class::NotAGate => "NotAGate",
-            Class::PrivilegedPrivateFs => "PrivilegedPrivateFs",
             Class::PrivateChildFixture => "PrivateChildFixture",
         }
     }
@@ -192,7 +187,7 @@ const REGISTRY: &[Entry] = &[
         test: "inventory",
         class: Class::NotAGate,
     },
-    // 新增私有 root/子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
+    // 新增私有子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
     Entry {
         file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
         test: "no_network_fixture",
@@ -201,76 +196,6 @@ const REGISTRY: &[Entry] = &[
     Entry {
         file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
         test: "unrelated_no_network_fixture",
-        class: Class::PrivateChildFixture,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_provision_publishes_exact_v2_without_rewriting_existing_claims",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_old_private_or_partial_layout_is_never_repaired",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_concurrent_initializers_only_accept_the_completed_layout",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_existing_wrong_base_modes_and_owner_are_refused",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_symlink_and_untrusted_parent_are_refused",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_marker_bytes_links_mode_owner_and_allocator_size_are_strict",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_marker_and_allocator_replacements_do_not_rebind_old_fds",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_base_and_parent_replacements_are_detected",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_symlink_and_fifo_marker_never_block_or_publish",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_publication_sync_errors_survive_statically_valid_reopen",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_successful_handoff_keeps_the_original_deployment_fds",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_fresh_held_base_replacement_with_moved_files_is_not_published",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_peer_uids_with_original_ambient_caps_share_the_sticky_store",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "uid_worker",
         class: Class::PrivateChildFixture,
     },
     Entry {
@@ -559,8 +484,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        35,
-        "默认不跑的测试数从 35 变成了 {} —— 这不是自动放行的事：\
+        21,
+        "默认不跑的测试数从 21 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );
@@ -611,7 +536,6 @@ fn class_matches_the_stated_reason() {
         Class::PublicNetwork,
         Class::LiveHostState,
         Class::NotAGate,
-        Class::PrivilegedPrivateFs,
         Class::PrivateChildFixture,
     ] {
         assert!(

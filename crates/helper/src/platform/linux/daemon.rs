@@ -87,12 +87,6 @@ pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> ExitCode {
 
 /// async 主体（socket serve + 信号收割器 + 退出兜底）。
 async fn async_main(cfg: ServerConfig) -> ExitCode {
-    // A failed deployment blocks only new core births. Keep the helper control
-    // plane available so an existing native birth can still be stopped.
-    let claims_provision = super::claims::provision();
-    if let Err(error) = &claims_provision {
-        eprintln!("polaris-helper (linux): claims deployment unavailable: {error}");
-    }
     // main.go: MkdirAll 0755 + 删旧 socket + Listen(unix) + Chmod 0666（std 同步 bind）。
     let std_listener = match prepare_socket(&cfg) {
         Ok(l) => l,
@@ -123,7 +117,7 @@ async fn async_main(cfg: ServerConfig) -> ExitCode {
     }
 
     // C6-2：建跨连接共享服务（单一 HandlerState + AmbientCapsSpawner），accept 到即 dispatch。
-    let server = ConnServer::with_claims_provision(&cfg, claims_provision);
+    let server = ConnServer::new(&cfg);
 
     // main.go: SIGTERM/SIGINT 收割器。async 下把 Go 的「reaper goroutine + main accept 循环」折叠进
     // 单 select 循环 —— 收到信号 break 出循环走退出兜底，语义等价（更省一个通道）。

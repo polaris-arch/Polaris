@@ -151,6 +151,39 @@ fn pinned_log_path_rejects_directory_owned_by_another_uid() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+/// The production spawner has no shared-filesystem precondition: its first
+/// refusal is the per-request log directory check, which fails here before any
+/// fork, so no child or slot is created.
+#[test]
+fn production_spawn_reaches_log_pinning_without_a_deployment_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let wrong_uid = uid.checked_add(1).unwrap_or(uid.saturating_sub(1));
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let request = SpawnCoreRequest {
+        birth: None,
+        binary: dir.path().join("sing-box"),
+        config: dir.path().join("cfg.json"),
+        log: Some(dir.path().join("core.log")),
+        fwd: false,
+        parent_pid: None,
+        uid: wrong_uid,
+        gid: wrong_uid,
+        groups: Vec::new(),
+    };
+    let Err(SpawnError::Spawn { detail }) = spawner.spawn(&request) else {
+        panic!("a log directory owned by another uid must refuse the spawn");
+    };
+    assert!(detail.starts_with("secure log path: "), "got {detail}");
+    assert!(
+        detail.contains("not owned by the authenticated uid"),
+        "got {detail}"
+    );
+    assert!(spawner.slots.lock().unwrap().is_empty());
+    assert!(state.lock().unwrap().child.is_none());
+}
+
 #[test]
 fn ss_lookup_returns_none_when_ss_missing() {
     // ss 可能未装（best-effort，Go 同样容忍）。

@@ -498,9 +498,6 @@ impl ReapGroup {
 ///
 /// 持共享 [`HandlerState`]（收割/看护线程清 child）+ 在途 child 槽（terminate 按 pid 查）+ reapWG。
 pub struct AmbientCapsSpawner {
-    // Pin once for this helper lifetime. A valid-looking replacement cannot be
-    // adopted by an older helper; failed initialization never blocks Stop.
-    claims: Result<super::claims::ClaimsDeployment, String>,
     state: Arc<Mutex<HandlerState>>,
     /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
@@ -557,21 +554,9 @@ impl<R: Read> Read for PinnedReader<R> {
 }
 
 impl AmbientCapsSpawner {
-    #[cfg(test)]
     #[must_use]
     pub fn new(state: Arc<Mutex<HandlerState>>) -> Self {
-        Self::with_claims_provision(
-            state,
-            Err(std::io::Error::other("test deployment not initialized")),
-        )
-    }
-
-    fn with_claims_provision(
-        state: Arc<Mutex<HandlerState>>,
-        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
-    ) -> Self {
         Self {
-            claims: claims_provision.map_err(|error| error.to_string()),
             state,
             slots: Arc::new(Mutex::new(Vec::new())),
             tombstones: Arc::new(Mutex::new(VecDeque::new())),
@@ -708,16 +693,6 @@ impl AmbientCapsSpawner {
 }
 
 impl CoreSpawner for AmbientCapsSpawner {
-    fn validate_start_environment(&self) -> Result<(), SpawnError> {
-        self.claims
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|deployment| deployment.validate().map_err(|error| error.to_string()))
-            .map_err(|detail| SpawnError::Spawn {
-                detail: format!("claims deployment unavailable: {detail}"),
-            })
-    }
-
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.scan_start_admission(current_running)
     }
@@ -782,7 +757,6 @@ impl CoreSpawner for AmbientCapsSpawner {
     }
 
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
-        self.validate_start_environment()?;
         let pinned_log = req
             .log
             .as_deref()
@@ -1124,28 +1098,10 @@ pub struct ConnServer {
 
 impl ConnServer {
     /// 由 [`ServerConfig`] 建服务（单一共享 state + spawner）。
-    #[cfg(test)]
     #[must_use]
     pub fn new(cfg: &ServerConfig) -> Arc<Self> {
-        Self::with_claims_provision(
-            cfg,
-            Err(std::io::Error::other("test deployment not initialized")),
-        )
-    }
-
-    /// Consume this startup's exact provisioning result, retaining successful
-    /// original FDs or the failure for the whole helper lifetime. Never reopen
-    /// a statically valid directory to erase a provisioning error.
-    #[must_use]
-    pub fn with_claims_provision(
-        cfg: &ServerConfig,
-        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
-    ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(HandlerState::new()));
-        let spawner = Arc::new(AmbientCapsSpawner::with_claims_provision(
-            Arc::clone(&state),
-            claims_provision,
-        ));
+        let spawner = Arc::new(AmbientCapsSpawner::new(Arc::clone(&state)));
         Arc::new(Self {
             state,
             spawner,
@@ -1157,11 +1113,6 @@ impl ConnServer {
             limiter: ConnLimiter::new(MAX_CONCURRENT_CONNECTIONS),
             limit_log: LogThrottle::new(ACCEPT_LOG_INTERVAL),
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn validate_start_environment_for_test(&self) -> Result<(), SpawnError> {
-        self.spawner.validate_start_environment()
     }
 
     /// 处理一个连接（Go: `go handle(conn)`）。捕获 SO_PEERCRED → 转 std 阻塞流（5s 读超时）→

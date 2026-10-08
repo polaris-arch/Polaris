@@ -13,14 +13,13 @@
 
 ---
 
-## 六个类别
+## 五个类别
 
 | 类别 | 为什么默认不跑 | 谁来跑 |
 |---|---|---|
 | **RealCore** | 需要 `POLARIS_SINGBOX_PATH` 指向**真实的 sing-box 二进制**，会真起进程、真占端口 | 真机验收环节，人在场 |
 | **PublicNetwork** | 需要公网连通性。CI 与本机开发环境都不保证，且本仓禁止在默认门里碰网络 | 手动，确认网络可用时 |
 | **LiveHostState** | 会读或**改写宿主机的真实状态**（路由表 / 系统代理）。跑错机器会把开发机的网络配置改掉 | 专用测试机，人在场 |
-| **PrivilegedPrivateFs** | 需要 root，只写测试独占的临时目录与子进程 UID，拒绝操作真实 claims 或网络 | 隔离 Linux 验证环境，按父门过滤器执行 |
 | **PrivateChildFixture** | 由父测试供给私有输入与身份，不能作为独立门运行 | 仅由父门以精确过滤器调用并收尾 |
 | **NotAGate** | 根本不是测试，是打印工具（如逃生门清单）。用 `#[ignore]` 只是为了不进默认门 | 需要那份清单时随手跑 |
 
@@ -76,7 +75,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（35 条）
+## 完整清单（21 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
@@ -103,20 +102,6 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `inventory` | `src-tauri/tests/release_escape_hatches.rs` | NotAGate |
 | `no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
 | `unrelated_no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
-| `root_provision_publishes_exact_v2_without_rewriting_existing_claims` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_old_private_or_partial_layout_is_never_repaired` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_concurrent_initializers_only_accept_the_completed_layout` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_existing_wrong_base_modes_and_owner_are_refused` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_symlink_and_untrusted_parent_are_refused` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_marker_bytes_links_mode_owner_and_allocator_size_are_strict` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_marker_and_allocator_replacements_do_not_rebind_old_fds` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_base_and_parent_replacements_are_detected` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_symlink_and_fifo_marker_never_block_or_publish` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_publication_sync_errors_survive_statically_valid_reopen` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_successful_handoff_keeps_the_original_deployment_fds` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_fresh_held_base_replacement_with_moved_files_is_not_published` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `root_peer_uids_with_original_ambient_caps_share_the_sticky_store` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
-| `uid_worker` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivateChildFixture |
 | `native_core_lists_and_switches_the_two_compiled_modes` | `crates/singbox-grpc/tests/native_clash_mode.rs` | RealCore |
 
 ---
@@ -132,14 +117,6 @@ POLARIS_NO_KERNEL_RUN=1 cargo test -p polaris-core-supervisor exact_spawn::tests
 `unrelated_no_network_fixture` 是普通 `Command` 启动的独立子可执行夹具，不打开或关闭受保护 FD。父门以 `--exact --ignored --nocapture exact_spawn::tests::unrelated_no_network_fixture` 调用它，在两秒内收到真实用户态 READY 后扫描其 FD，并在观察或断言失败前 kill/wait。
 默认运行的 `unrelated_child_does_not_inherit_protected_images` 保留 FD 隔离断言；`deliberately_passed_protected_stdin_is_detected_after_userland_ready` 保留真实继承 FD 的反向对照。不要独立调用这个会等待父门收尾的子夹具，也不要把它的 ignored 数当成安全门退出默认覆盖。
 
-Linux claims 的 13 条 `root_*` 门需要 root，创建 `/var/tmp/polaris-claims-h-*` 独占目录；不写 `/run/polaris-sing-tun-claims`，不改网络。只在隔离 Linux 验证环境中用 root 身份执行父门：
-
-```bash
-POLARIS_NO_KERNEL_RUN=1 cargo test -p polaris-helper platform::linux::claims::tests::root_ -- --ignored --test-threads=1
-```
-
-`uid_worker` 只由 `root_peer_uids_with_original_ambient_caps_share_the_sticky_store` 起出的子测试进程执行；父门负责私有目录、环境、UID 与收尾，不单独运行 worker。
-
 `native_core_lists_and_switches_the_two_compiled_modes` 是真实核 gRPC 契约，使用相同的 `kernel_run_or_skip` / `with_run` 双重守卫。经授权的真核验证才执行下面命令；本次源码修复未执行真核验收：
 
 ```bash
@@ -148,4 +125,4 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 35 条。Linux claims 与 exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 21 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
