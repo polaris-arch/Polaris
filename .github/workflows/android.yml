@@ -468,7 +468,7 @@ jobs:
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
           df -h / | tail -1
-          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          mapfile -t module_sources < <(python3 -c 'import json,os; [print(value) for value in json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))]')
           bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
 
           # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
@@ -965,7 +965,7 @@ jobs:
           (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
           mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
           df -h / | tail -1
-          mapfile -t module_sources < <(python3 -c 'import json,os; print("\n".join(json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))))')
+          mapfile -t module_sources < <(python3 -c 'import json,os; [print(value) for value in json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))]')
           bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
 
           # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存

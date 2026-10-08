@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { ALL_PACKAGE_PLATFORMS, classifyImpact } from './classify-ci-impact.mjs';
-import { assertSourceFirstRelease } from './assert-pc-runtime-release.mjs';
+import { createHash } from 'node:crypto';
+import { assertOwnershipChainAbsent, assertSourceFirstRelease, OWNERSHIP_CHAIN_PATCHES } from './assert-pc-runtime-release.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(root, 'scripts/assert-pc-runtime-release.mjs');
@@ -145,7 +146,9 @@ test('only reviewed source inputs are eligible, without native or ownership clea
     (manifest) => { manifest.sourceBuild.platforms.win.buildTree = 'a'.repeat(40); },
     (manifest) => { manifest.sourceBuild.transportPins['golang.org/x/sys'] = 'v0.48.0'; },
     (manifest) => { delete manifest.sourceBuild.platforms['mac-arm64']; },
-    (manifest) => { manifest.sourceBuild.platforms.linux.patchedModules.allowedAbsent.push('github.com/sagernet/sing-tun'); },
+    ...['linux', 'win', 'mac-x64', 'mac-arm64'].map((key) => (manifest) => {
+      manifest.sourceBuild.platforms[key].patchedModules.allowedAbsent.push('example.com/absent');
+    }),
     (manifest) => { manifest.windowsBuild.patchSha256 = 'a'.repeat(64); },
     (manifest) => {
       manifest.sourceBuild.version = manifest.sourceBuild.version.replace(/\d+$/, (suffix) => String(Number(suffix) + 1));
@@ -159,6 +162,70 @@ test('only reviewed source inputs are eligible, without native or ownership clea
     manifest.windowsBuild.binarySha256 = null;
     for (const platform of Object.values(manifest.sourceBuild.platforms)) platform.binarySha256 = null;
   })));
+});
+
+test('ownership chain inputs are rejected by name, not as a digest drift', () => {
+  const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  // Rebind the manifest to the changed source so no file digest differs.
+  const withSource = (mutateSource, mutateManifest = () => {}) => {
+    const changed = JSON.parse(inputs.get(sourcePath));
+    mutateSource(changed);
+    const bytes = Buffer.from(JSON.stringify(changed));
+    const manifest = JSON.parse(inputs.get(manifestPath));
+    manifest.sourceBuild.sourceManifestSha256 = sha(bytes);
+    mutateManifest(manifest);
+    return fixtureRead(new Map([[sourcePath, bytes], [manifestPath, Buffer.from(JSON.stringify(manifest))]]));
+  };
+  const patchBytes = (file) => readFileSync(join(root, 'scripts/libbox-patches', file));
+  // Unchanged rebinding reaches the reviewed-input digest, so the helper is live.
+  assert.throws(() => assertSourceFirstRelease(withSource((changed) => { changed.goVersion = '1.25.6'; })),
+    /Source inputs differ from the reviewed release policy/);
+  assert.deepEqual([...OWNERSHIP_CHAIN_PATCHES].sort(), ['nftables-owned-transactions.patch',
+    'sing-tun-owned-native.patch', 'tun-owner-consumer.patch']);
+  assert.throws(() => assertSourceFirstRelease(withSource((changed) => {
+    changed.patches.push({ file: 'tun-owner-consumer.patch', sha256: sha(patchBytes('tun-owner-consumer.patch')) });
+  })), /Ownership chain policy: retired patch listed/);
+  // The retained files stay on disk; each name is refused in the ordered list.
+  for (const file of OWNERSHIP_CHAIN_PATCHES) {
+    assert.throws(() => assertSourceFirstRelease(withSource((changed) => {
+      changed.patches.push({ file, sha256: sha(patchBytes(file)) });
+    })), /Ownership chain policy: retired patch listed/, file);
+  }
+  const module = 'example.com/patched';
+  const declare = (manifest) => {
+    manifest.sourceBuild.dependencyModules.push(module);
+    for (const platform of Object.values(manifest.sourceBuild.platforms)) platform.patchedModules.requiredLinked.push(module);
+  };
+  const dependency = { name: 'patched', module, sourceURL: 'https://github.com/example/patched.git',
+    upstreamVersion: 'v1.0.0', upstreamCommit: '1'.repeat(40), patchFile: 'sing-tun-owned-native.patch',
+    patchSha256: sha(patchBytes('sing-tun-owned-native.patch')), patchedTree: '2'.repeat(40) };
+  for (const read of [
+    withSource((changed) => { changed.dependencyPatches.push(dependency); }, declare),
+    withSource((changed) => { changed.dependencyPatches.push(dependency); }),
+    manifestRead(declare),
+  ]) assert.throws(() => assertSourceFirstRelease(read), /Ownership chain policy: dependency patches must be empty/);
+  assert.throws(() => assertSourceFirstRelease(manifestRead((manifest) => {
+    manifest.sourceBuild.graphScope = 'declared-patched-modules';
+  })), /Ownership chain policy: graph scope must be core-source-only/);
+
+  // Each clause alone, on otherwise accepted inputs.
+  const spec = () => JSON.parse(inputs.get(manifestPath)).sourceBuild;
+  const accepted = () => JSON.parse(inputs.get(sourcePath));
+  assertOwnershipChainAbsent(spec(), accepted());
+  for (const field of ['requiredLinked', 'allowedAbsent']) {
+    for (const key of ['linux', 'win', 'mac-x64', 'mac-arm64']) {
+      const changed = spec();
+      changed.platforms[key].patchedModules[field].push(module);
+      assert.throws(() => assertOwnershipChainAbsent(changed, accepted()),
+        /Ownership chain policy: platform patched modules must be empty/, `${key} ${field}`);
+    }
+  }
+  for (const mutate of [(changed) => { delete changed.dependencyPatches; },
+    (changed) => { changed.dependencyPatches = null; }]) {
+    const changed = accepted();
+    mutate(changed);
+    assert.throws(() => assertOwnershipChainAbsent(spec(), changed), /dependency patches must be empty/);
+  }
 });
 
 test('arguments, skip flags and claimed receipts cannot bypass source checks or grant native clearance', () => {

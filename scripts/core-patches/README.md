@@ -86,10 +86,13 @@ Git, Python compatible with the frozen provider, and the pinned Go toolchain are
 required. Provider module-cache/toolchain prerequisites remain part of its
 separate contract; failure is propagated and cannot fall back to stock sources.
 
-The source receipt must explicitly declare `graphScope = declared-patched-modules`
-and `sourceGraphState = dependencies-patched`, with the exact sorted declared
-paths in `moduleGraphQueries`. Its `moduleGraph` and `moduleGraphSha256` cover
-those patched modules, not the full linked graph. The provider separately binds
+The source receipt must explicitly declare its scope. With dependency patches it
+is `graphScope = declared-patched-modules` and `sourceGraphState =
+dependencies-patched`; with none (the current manifest) it is `graphScope =
+core-source-only` and `sourceGraphState = source-only`, and either mismatch
+rejects. `moduleGraphQueries` holds the exact sorted declared paths. Its
+`moduleGraph` and `moduleGraphSha256` cover those patched modules (an empty list
+and its digest when none are declared), not the full linked graph. The provider separately binds
 the full generated main files as `mainGoModSha256` and `mainGoSumSha256`.
 It does not query or emit transport pins. Desktop `sourceBuild.transportPins`
 is a separate inventory map from module path to exact MVS version. Every
@@ -99,24 +102,24 @@ is a separate inventory map from module path to exact MVS version. Every
 `transportModules.confirmedAbsent` cover exactly the transport inventory.
 Missing fields, duplicates, overlaps, omitted inventory entries, unknown entries
 or extra policy fields reject the input freeze in both JS and the Rust updater.
-Every patched module must link by default, including sing-tun on all four
-platforms and nftables on Linux. Only the reviewed Windows/macOS NFT omission
-may be explicitly frozen in `allowedAbsent`; this records permission for the
-confirmed platform nonparticipation, not proof of a particular binary's absence.
-If NFT actually links there, its exact upstream version and local patched
-replacement are still required. A transport module in `requiredLinked` must be
-present with its exact MVS version; one in `confirmedAbsent` must be absent.
-Present non-patched transports cannot use replacements.
+Every declared patched module must link on every platform with its exact upstream
+version and local patched replacement: `allowedAbsent` must be empty. A linked
+module carrying any replacement row must be a declared patched module. The
+current manifest declares none, so `dependencyModules` and both `patchedModules`
+arrays are empty and a binary with any replacement is refused. A transport
+module in `requiredLinked` must be present with its exact MVS version; one in
+`confirmedAbsent` must be absent. Present non-patched transports cannot use
+replacements.
 
-For example, with a common patched inventory containing sing-tun and nftables,
+For example, with a common patched inventory containing `example.com/patched`,
 and a transport inventory containing `example.com/transport` and
 `example.com/linux-transport`, the Windows policy is:
 
 ```json
 {
   "patchedModules": {
-    "requiredLinked": ["github.com/sagernet/sing-tun"],
-    "allowedAbsent": ["github.com/sagernet/nftables"]
+    "requiredLinked": ["example.com/patched"],
+    "allowedAbsent": []
   },
   "transportModules": {
     "requiredLinked": ["example.com/transport"],
@@ -125,9 +128,9 @@ and a transport inventory containing `example.com/transport` and
 }
 ```
 
-The Linux policy puts both patched and both transport modules in `requiredLinked`
-with empty absence arrays. macOS freezes its own actual transport participation
-and may use the same reviewed NFT omission. These example paths are synthetic,
+The Linux policy puts the patched and both transport modules in `requiredLinked`
+with empty absence arrays. macOS freezes its own actual transport participation.
+These example paths are synthetic,
 not production transport pins. The selected platform policy is bound in
 `platformInputFingerprint` and its BuildID; changing it rejects older platform
 receipts while preserving the provider's common fingerprint and complete graph.

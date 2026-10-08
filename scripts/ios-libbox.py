@@ -82,7 +82,8 @@ def final_preflight():
                 and all(helper.match('[0-9a-f]{40}', spec.get(key)) for key in ('patchedSourceTree', 'buildTree')),
                 'complete common source pins required')
         require(helper.match(re.escape(core['bundledCoreVersion']) + r'\.polaris\.[1-9][0-9]*', spec.get('version'))
-                and spec.get('graphScope') == 'declared-patched-modules', 'common source version/scope differs')
+                and spec.get('graphScope') == ('declared-patched-modules' if spec.get('dependencyModules') else 'core-source-only'),
+                'common source version/scope differs')
         require(helper.file_hash(SHARED_MANIFEST) == spec['sourceManifestSha256']
                 and helper.file_hash(PROVIDER) == spec['provisionerSha256'], 'shared manifest/provider hash differs')
         require(set(policy) == {'schema', 'evidenceScope', 'sourceHelperSha256', 'commonSource',
@@ -97,11 +98,11 @@ def final_preflight():
         patches, dependencies = shared['patches'], shared['dependencyPatches']
         require(isinstance(patches, list) and patches and len({p['file'] for p in patches}) == len(patches),
                 'invalid ordered common patch inventory')
-        require(isinstance(dependencies, list) and dependencies
+        require(isinstance(dependencies, list)
                 and len({d['name'] for d in dependencies}) == len(dependencies)
                 and len({d['module'] for d in dependencies}) == len(dependencies), 'invalid dependency inventory')
         inventory, transport = spec['dependencyModules'], spec['transportPins']
-        require(isinstance(inventory, list) and inventory and len(set(inventory)) == len(inventory)
+        require(isinstance(inventory, list) and len(set(inventory)) == len(inventory)
                 and sorted(d['module'] for d in dependencies) == sorted(inventory), 'common dependency inventory differs')
         require(isinstance(transport, dict) and transport and all(helper.match('[A-Za-z0-9._/-]+', module)
                 and helper.match('v[0-9A-Za-z.+-]+', version) for module, version in transport.items()),

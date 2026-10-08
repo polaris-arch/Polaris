@@ -17,7 +17,6 @@ ABIS = {'arm64-v8a': ('arm64', 2, 183, {'GOARM64': 'v8.0'}),
         'armeabi-v7a': ('arm', 1, 40, {'GOARM': '7'}),
         'x86': ('386', 1, 3, {'GO386': 'sse2'}),
         'x86_64': ('amd64', 2, 62, {'GOAMD64': 'v1'})}
-REQUIRED_PATCHED = ['github.com/sagernet/sing-tun', 'github.com/sagernet/nftables']
 
 
 def require(condition, message):
@@ -70,13 +69,13 @@ def admit():
             'Patched Android version is not frozen')
     inventory = spec.get('dependencyModules')
     transport = spec.get('transportPins')
-    require(isinstance(inventory, list) and inventory and len(set(inventory)) == len(inventory)
+    require(isinstance(inventory, list) and len(set(inventory)) == len(inventory)
             and all(match('[A-Za-z0-9._/-]+', item) for item in inventory), 'Patched inventory is not frozen')
     require(isinstance(transport, dict) and transport and all(match('[A-Za-z0-9._/-]+', module)
             and match('v[0-9A-Za-z.+-]+', version) for module, version in transport.items()), 'Transport pins are not frozen')
     require(set(spec.get('platforms', {})) == {'linux', 'win', 'mac-x64', 'mac-arm64'}, 'Desktop target inventory changed')
     dependencies = source.get('dependencyPatches')
-    require(isinstance(dependencies, list) and dependencies, 'Patched dependency graph is not frozen')
+    require(isinstance(dependencies, list), 'Patched dependency graph is not frozen')
     require(sorted(item['module'] for item in dependencies) == sorted(inventory)
             and len({item['name'] for item in dependencies}) == len(dependencies), 'Dependency inventory differs')
     for dep in dependencies:
@@ -95,8 +94,9 @@ def admit():
         expected = patch.get('sha256', patch.get('patchSha256'))
         require(match('[a-z0-9-]+\\.patch', filename) and match('[0-9a-f]{64}', expected)
                 and file_hash(PATCH_DIR / filename) == expected, 'Ordered patch hash differs')
-    require(policy.get('schema') == 'polaris-android-source-policy-v1' and policy.get('requiredPatchedModules') == REQUIRED_PATCHED,
-            'Unsupported Android source policy')
+    require(policy.get('schema') == 'polaris-android-source-policy-v1' and isinstance(policy.get('requiredPatchedModules'), list)
+            and len(set(policy['requiredPatchedModules'])) == len(policy['requiredPatchedModules'])
+            and set(policy['requiredPatchedModules']) == set(inventory), 'Unsupported Android source policy')
     sdk = policy.get('sdkBootclasspath', {})
     require(match('android-[1-9][0-9]*', sdk.get('platform')) and match('[0-9a-f]{64}', sdk.get('androidJarSha256')), 'SDK bootclasspath pin missing')
     require(sorted(source['abis']) == sorted(ABIS) and len(source['abis']) == 4 and set(policy.get('abis', {})) == set(ABIS), 'Four Android ABIs required')
@@ -106,7 +106,7 @@ def admit():
                 == dict(goos='android', goarch=arch, cgo='1', architecture=architecture, elfClass=elf_class, elfMachine=machine), 'Android ABI policy differs')
         partition(target.get('patchedModules'), inventory, 'allowedAbsent')
         partition(target.get('transportModules'), list(transport), 'confirmedAbsent')
-        require(set(REQUIRED_PATCHED) <= set(target['patchedModules']['requiredLinked']), 'Android sing-tun/nftables must link in every ABI')
+        require(not target['patchedModules']['allowedAbsent'], 'Android patched modules must link in every ABI')
     return source, core, policy
 
 
@@ -119,8 +119,9 @@ def provider():
 
 def validate_source_receipt(receipt, source, core):
     spec = core['sourceBuild']
-    require(receipt.get('schema') == 'polaris-core-source-v1' and receipt.get('sourceGraphState') == 'dependencies-patched'
-            and receipt.get('graphScope') == 'declared-patched-modules', 'Shared receipt scope differs')
+    scope = ('dependencies-patched', 'declared-patched-modules') if source['dependencyPatches'] else ('source-only', 'core-source-only')
+    require(receipt.get('schema') == 'polaris-core-source-v1'
+            and (receipt.get('sourceGraphState'), receipt.get('graphScope')) == scope, 'Shared receipt scope differs')
     queries = sorted(dep['module'] for dep in source['dependencyPatches'])
     require(receipt.get('moduleGraphQueries') == queries and sorted(item['Path'] for item in receipt.get('moduleGraph', [])) == queries,
             'Shared receipt declared queries differ')

@@ -4,7 +4,7 @@
 
 当前 iOS 源码由 `c8f57984..1490dabf` 的 18 片独立增量移植到 `0713990a`，并按当前主线适配退出、重启和独立配置检查的入口。主 App 退出或重启保留系统 Packet Tunnel，不经过桌面四类 owner 的 drain 或签发清理证明；桌面检查准入继续生效，iOS 只跳过未提供承载的独立构造检查。
 
-本目录的 iOS Libbox manifest 仍是历史六片 / gomobile v0.1.12 / SDK 27.0 基线。当前共享主线已包含九片补丁及 sing-tun/nftables 依赖固定；后三片与依赖尚未迁移到 iOS 构建输入。因此六片 Framework 只能作为历史开发缓存，不是当前统一源码的最终核心产物。必须完成整组 Apple 来源、补丁、依赖与导出 ABI 核验后，再更新 iOS manifest 并统一重建 Framework/App。当前合流只收纳源码，不产生新的 App、Framework、签名、NE 流量或设备验收收据。
+本目录的 iOS Libbox manifest 仍是历史六片 / gomobile v0.1.12 / SDK 27.0 基线。当前共享主线为八片补丁，不对依赖模块打补丁；后两片尚未迁移到 iOS 构建输入。因此六片 Framework 只能作为历史开发缓存，不是当前统一源码的最终核心产物。必须完成整组 Apple 来源、补丁与导出 ABI 核验后，再更新 iOS manifest 并统一重建 Framework/App。当前合流只收纳源码，不产生新的 App、Framework、签名、NE 流量或设备验收收据。
 
 有限独立审查已确认旧六片 Go monitor 可通过已进入的 Swift 回调，在 reload 后触达共享 wrapper 的新 manager。主线 `default-monitor-isolation.patch` 提供 manager/state 隔离、seal/admission 与 native listener identity；Apple 尚未消费该片。Swift close 忽略 listener 的事实存在，但独立的迟到 Close(A) 破坏 B 路径尚未证明，不能靠代理对象地址或一次 generation 检查代替完整迁移。
 

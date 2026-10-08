@@ -32,7 +32,6 @@ const same = (left, right) => canonical(left) === canonical(right);
 const isSha = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const isTree = (value) => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const isModule = (value) => typeof value === 'string' && /^[a-zA-Z0-9._/-]+$/.test(value);
-const NFT_MODULE = 'github.com/sagernet/nftables';
 
 function isModulePartition(policy, inventory, absentField) {
   if (!policy || !same(Object.keys(policy).sort(), ['requiredLinked', absentField].sort())) return false;
@@ -47,9 +46,8 @@ function isModulePartition(policy, inventory, absentField) {
 function hasPlatformModulePolicy(spec, key) {
   const platform = spec.platforms?.[key];
   return isModulePartition(platform?.patchedModules, spec.dependencyModules, 'allowedAbsent')
-    // Only the reviewed non-Linux NFT omission is allowed. Every other patched
-    // module (including sing-tun) must link on every target.
-    && platform.patchedModules.allowedAbsent.every((module) => key !== 'linux' && module === NFT_MODULE)
+    // Every declared patched module must link on every target.
+    && platform.patchedModules.allowedAbsent.length === 0
     && isModulePartition(platform.transportModules, Object.keys(spec.transportPins ?? {}), 'confirmedAbsent');
 }
 
@@ -59,7 +57,7 @@ export function validateSourcePins(manifest, key, outputsRequired = true) {
   const frozen = spec && ['sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
     'moduleGraphSha256'].every((field) => isSha(spec[field]))
     && isTree(spec.patchedSourceTree) && isTree(spec.buildTree)
-    && Array.isArray(spec.dependencyModules) && spec.dependencyModules.length > 0
+    && Array.isArray(spec.dependencyModules)
     && spec.dependencyModules.every(isModule)
     && new Set(spec.dependencyModules).size === spec.dependencyModules.length
     && spec.transportPins && typeof spec.transportPins === 'object' && !Array.isArray(spec.transportPins)
@@ -98,7 +96,7 @@ export function validateSourceManifest(source, spec) {
     /^[a-z0-9-]+\.patch$/.test(patch.file ?? '') && isSha(patch.sha256)), 'Invalid core patch inventory');
   requireGraph(new Set(source.patches.map((patch) => patch.file)).size === source.patches.length, 'Duplicate core patch');
   const dependencies = source.dependencyPatches;
-  requireGraph(Array.isArray(dependencies) && dependencies.length > 0, 'Patched dependency graph is not frozen');
+  requireGraph(Array.isArray(dependencies), 'Patched dependency graph is not frozen');
   requireGraph(same(dependencies.map((dep) => dep.module).sort(), [...spec.dependencyModules].sort()), 'Patched module inventory differs');
   requireGraph(new Set(dependencies.map((dep) => dep.name)).size === dependencies.length, 'Duplicate dependency directory');
   for (const dep of dependencies) {
@@ -112,7 +110,9 @@ export function validateSourceManifest(source, spec) {
 
 export function validateSourceReceipt(receipt, source, spec) {
   requireGraph(receipt?.schema === 'polaris-core-source-v1', 'Unsupported source receipt schema');
-  requireGraph(receipt.graphScope === 'declared-patched-modules' && receipt.sourceGraphState === 'dependencies-patched',
+  const [graphScope, sourceGraphState] = source.dependencyPatches.length > 0
+    ? ['declared-patched-modules', 'dependencies-patched'] : ['core-source-only', 'source-only'];
+  requireGraph(receipt.graphScope === graphScope && receipt.sourceGraphState === sourceGraphState,
     'Unsupported/unfrozen module graph scope; not a full linked graph proof');
   const queries = source.dependencyPatches.map((dep) => dep.module).sort();
   requireGraph(same(receipt.moduleGraphQueries, queries)
@@ -213,6 +213,10 @@ export function validateBuildInfo(raw, source, key, spec) {
     if (!source.dependencyPatches.some((dep) => dep.module === module)) {
       requireGraph(!actual.replacement, `Unreviewed embedded transport replacement: ${module}`);
     }
+  }
+  // Any linked module carrying a replacement row must be a declared dependency.
+  for (const [module, actual] of facts.modules) {
+    requireGraph(!actual.replacement || spec.dependencyModules.includes(module), `Undeclared embedded module replacement: ${module}`);
   }
   return facts;
 }

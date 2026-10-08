@@ -15,24 +15,36 @@ fn bundled_core_version_parses_from_embedded_manifest() {
         v.starts_with(|c: char| c.is_ascii_digit()),
         "基线应是版本号，实得: {v}"
     );
+    // 上面两条分辨不出基线回落（回落值同样非空）。嵌入清单必须被认作冻结清单。
+    let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
+    let source = &manifest["sourceBuild"];
+    let expected = source["version"].as_str().expect("sourceBuild.version");
+    assert_eq!(
+        frozen_source_build_version(source, manifest["bundledCoreVersion"].as_str().unwrap()),
+        Some(expected),
+        "嵌入的 core-manifest 未被认作冻结清单，随包基线会回落"
+    );
 }
 
+const PATCHED_FIXTURE: [&str; 3] = [
+    "example.com/patched",
+    "example.com/second",
+    "example.com/tiny",
+];
+
 fn source_baseline_fixture() -> serde_json::Value {
-    let patched = [
-        "github.com/sagernet/sing-tun",
-        "github.com/sagernet/nftables",
-        "example.com/tiny",
-    ];
+    source_baseline_fixture_with(&PATCHED_FIXTURE)
+}
+
+fn source_baseline_fixture_with(patched: &[&str]) -> serde_json::Value {
     let platforms: serde_json::Map<String, serde_json::Value> = ["linux", "win", "mac-x64", "mac-arm64"]
         .into_iter()
         .map(|key| {
-            let required: Vec<_> = patched.iter().filter(|module| key == "linux" || **module != "github.com/sagernet/nftables").collect();
-            let absent: Vec<_> = patched.iter().filter(|module| key != "linux" && **module == "github.com/sagernet/nftables").collect();
             let transport_required = if key == "linux" { vec!["example.com/transport", "example.com/linux-transport"] }
                 else { vec!["example.com/transport"] };
             let transport_absent = if key == "linux" { vec![] } else { vec!["example.com/linux-transport"] };
             (key.to_owned(), serde_json::json!({ "buildTree": "1".repeat(40), "binarySha256": null,
-                "patchedModules": { "requiredLinked": required, "allowedAbsent": absent },
+                "patchedModules": { "requiredLinked": patched, "allowedAbsent": [] },
                 "transportModules": { "requiredLinked": transport_required, "confirmedAbsent": transport_absent } }))
         }).collect();
     serde_json::json!({ "bundledCoreVersion": "1.0.0", "windowsBuild": { "version": "1.0.0.polaris.1" },
@@ -46,17 +58,20 @@ fn source_baseline_fixture() -> serde_json::Value {
 
 #[test]
 fn frozen_source_baseline_covers_all_desktops_without_changing_android() {
-    let raw = source_baseline_fixture().to_string();
-    for windows in [false, true] {
+    // 依赖补丁为空的清单同样是冻结清单。
+    for fixture in [source_baseline_fixture(), source_baseline_fixture_with(&[])] {
+        let raw = fixture.to_string();
+        for windows in [false, true] {
+            assert_eq!(
+                bundled_core_version_from_manifest(&raw, windows, false).unwrap(),
+                "1.0.0.polaris.2"
+            );
+        }
         assert_eq!(
-            bundled_core_version_from_manifest(&raw, windows, false).unwrap(),
-            "1.0.0.polaris.2"
+            bundled_core_version_from_manifest(&raw, false, true).unwrap(),
+            "1.0.0"
         );
     }
-    assert_eq!(
-        bundled_core_version_from_manifest(&raw, false, true).unwrap(),
-        "1.0.0"
-    );
 }
 
 #[test]
@@ -141,31 +156,23 @@ fn malformed_source_input_identity_is_not_a_frozen_baseline() {
         for (field, policy) in [
             (
                 "patchedModules",
-                serde_json::json!({ "requiredLinked": ["github.com/sagernet/sing-tun", "github.com/sagernet/sing-tun", "example.com/tiny"], "allowedAbsent": ["github.com/sagernet/nftables"] }),
+                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/patched", "example.com/second", "example.com/tiny"], "allowedAbsent": [] }),
             ),
             (
                 "patchedModules",
-                serde_json::json!({ "requiredLinked": ["github.com/sagernet/sing-tun", "example.com/tiny"], "allowedAbsent": ["github.com/sagernet/nftables", "github.com/sagernet/sing-tun"] }),
+                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/tiny"], "allowedAbsent": ["example.com/second", "example.com/patched"] }),
             ),
             (
                 "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/tiny", "github.com/sagernet/nftables"], "allowedAbsent": [] }),
+                serde_json::json!({ "requiredLinked": ["example.com/tiny", "example.com/second"], "allowedAbsent": [] }),
             ),
             (
                 "patchedModules",
-                serde_json::json!({ "requiredLinked": ["example.com/tiny", "github.com/sagernet/nftables"], "allowedAbsent": ["github.com/sagernet/sing-tun"] }),
+                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/second", "example.com/tiny", "unknown/module"], "allowedAbsent": [] }),
             ),
             (
                 "patchedModules",
-                serde_json::json!({ "requiredLinked": ["github.com/sagernet/sing-tun", "github.com/sagernet/nftables"], "allowedAbsent": ["example.com/tiny"] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["github.com/sagernet/sing-tun", "example.com/tiny"], "allowedAbsent": ["github.com/sagernet/nftables", "unknown/module"] }),
-            ),
-            (
-                "patchedModules",
-                serde_json::json!({ "requiredLinked": ["github.com/sagernet/sing-tun", "example.com/tiny", "github.com/sagernet/nftables"], "allowedAbsent": [], "allowUnknownMissing": true }),
+                serde_json::json!({ "requiredLinked": ["example.com/patched", "example.com/tiny", "example.com/second"], "allowedAbsent": [], "allowUnknownMissing": true }),
             ),
             (
                 "transportModules",
@@ -199,13 +206,23 @@ fn malformed_source_input_identity_is_not_a_frozen_baseline() {
             }
         }
     }
-    let mut fixture = source_baseline_fixture();
-    fixture["sourceBuild"]["platforms"]["linux"]["patchedModules"] = serde_json::json!({
-        "requiredLinked": ["github.com/sagernet/sing-tun", "example.com/tiny"], "allowedAbsent": ["github.com/sagernet/nftables"] });
-    assert_eq!(
-        bundled_core_version_from_manifest(&fixture.to_string(), false, false).unwrap(),
-        "1.0.0"
-    );
+    // 分区完整、不相交，仅因 allowedAbsent 非空：任一平台、任一模块都回落。
+    for key in ["linux", "win", "mac-x64", "mac-arm64"] {
+        for absent in PATCHED_FIXTURE {
+            let required: Vec<_> = PATCHED_FIXTURE
+                .into_iter()
+                .filter(|module| *module != absent)
+                .collect();
+            let mut fixture = source_baseline_fixture();
+            fixture["sourceBuild"]["platforms"][key]["patchedModules"] =
+                serde_json::json!({ "requiredLinked": required, "allowedAbsent": [absent] });
+            assert_eq!(
+                bundled_core_version_from_manifest(&fixture.to_string(), false, false).unwrap(),
+                "1.0.0",
+                "{key} {absent}"
+            );
+        }
+    }
 }
 
 #[test]

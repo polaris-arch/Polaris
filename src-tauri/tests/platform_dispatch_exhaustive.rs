@@ -1767,12 +1767,6 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
         1,
         "严格候选核检查仍只支持 Linux x86_64 plain TCP VLESS子集；新增userspace_mesh即使在Linux也明确Unsupported，不能借原TCP核证明许可双TS。其它平台/架构、Android/iOS/未知平台也Unsupported；候选不是Ready/managed出生，原normal功能与plainTCP形态保留。",
     ),
-    (
-        "src-tauri/src/runtime/updater.rs",
-        "if allowed_absent .iter() .any(|module| key == \"linux\" || *module != \"github.com/sagernet/nftables\")",
-        1,
-        "core-manifest 补丁模块分区：Linux 不允许 nftables 缺席，其它已有目标可缺 Linux 专属模块。key 来自闭集清单目标；未知平台不会由该判断生成新核资源或运行能力。",
-    ),
 
 ];
 

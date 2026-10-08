@@ -1,19 +1,16 @@
 {
   "schema": "polaris-apple-source-policy-v1",
   "evidenceScope": "source-inputs-only",
-  "sourceHelperSha256": "f41b7ea2ba57301d8810b940e2c5788735d2d851788463ee42babef40e622e1a",
+  "sourceHelperSha256": "9f7d8fd5143ee04d2157991f92d190ada48b15e1ad866bb99084e2f938cf0d13",
   "commonSource": {
-    "sourceManifestSha256": "a556cacbdf5a55f342604ceb82fdf40ab7df1d6bdf3f79239e8ba4eba33ec897",
-    "provisionerSha256": "5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b",
-    "sourceReceiptFingerprint": "f82cd8aa2ff67e909e23e17c4da94619552abd88ec4d066e82324a9174fd7483",
-    "moduleGraphSha256": "c4f92118f017f76bfe0bed59ffd5517123e9da6e27318e9968f3abb1c0f62512",
-    "patchedSourceTree": "f7d9f65790c9aac5044a75d6c19fc8e1f59f91c6",
-    "buildTree": "de8e12577431fc8d3bc10730ad39e7d253647fea",
-    "version": "1.15.0-alpha.8.polaris.3",
-    "dependencyModules": [
-      "github.com/sagernet/sing-tun",
-      "github.com/sagernet/nftables"
-    ],
+    "sourceManifestSha256": "d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec",
+    "provisionerSha256": "a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d",
+    "sourceReceiptFingerprint": "151aa5ab53084a25a80f571bf6281b7cd18eb429a1548ad9cafaeba044eecafe",
+    "moduleGraphSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "patchedSourceTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
+    "buildTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
+    "version": "1.15.0-alpha.8.polaris.4",
+    "dependencyModules": [],
     "transportPins": {
       "github.com/mdlayher/netlink": "v1.11.2",
       "github.com/mdlayher/socket": "v0.6.0",
@@ -22,8 +19,8 @@
       "golang.org/x/net": "v0.57.0",
       "golang.org/x/sync": "v0.22.0"
     },
-    "graphScope": "declared-patched-modules",
-    "mainGoModSha256": "b46717b2476acfc3f497d48f466993f644e29f32213a27932a956241b9f68f5f",
+    "graphScope": "core-source-only",
+    "mainGoModSha256": "44f8313894387dd4576ec8839ab2bb74307748e378d79863be778f05abdeaa5c",
     "mainGoSumSha256": "b0b62e1b51d268a1c569bf0ec39b72debb9683036d4913edfd8dee073db3a64f"
   },
   "binding": {
@@ -88,10 +85,7 @@
     }
   },
   "moduleInventory": {
-    "patched": [
-      "github.com/sagernet/sing-tun",
-      "github.com/sagernet/nftables"
-    ],
+    "patched": [],
     "transport": [
       "github.com/mdlayher/netlink",
       "github.com/mdlayher/socket",

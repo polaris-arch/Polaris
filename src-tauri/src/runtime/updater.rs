@@ -155,9 +155,6 @@ fn frozen_source_build_version<'a>(
             return None;
         }
     }
-    if unique.is_empty() {
-        return None;
-    }
     let transport = source["transportPins"].as_object()?;
     if transport.is_empty() {
         return None;
@@ -185,10 +182,7 @@ fn frozen_source_build_version<'a>(
         }
         let allowed_absent =
             module_partition(&platform["patchedModules"], &unique, "allowedAbsent")?;
-        if allowed_absent
-            .iter()
-            .any(|module| key == "linux" || *module != "github.com/sagernet/nftables")
-        {
+        if !allowed_absent.is_empty() {
             return None;
         }
         module_partition(

@@ -79,13 +79,27 @@ def fat(first, second):
     return header + first + bytes(offset2 - offset1 - len(first)) + second
 
 
-def fixture():
+def declare_dependencies(source, core):
+    """Fixture-only declarations: the committed manifest patches no dependency module."""
+    source['dependencyPatches'] = [{'name': name, 'module': 'example.com/' + name, 'upstreamVersion': 'v1.0.0',
+                                    'sourceURL': 'https://github.com/example/' + name, 'upstreamCommit': '2' * 40,
+                                    'patchFile': name + '.patch', 'patchSha256': '3' * 64, 'patchedTree': '4' * 40,
+                                    'candidateCommit': '5' * 40} for name in ('patched', 'second')]
+    core['sourceBuild'].update(dependencyModules=[dep['module'] for dep in source['dependencyPatches']],
+                               graphScope='declared-patched-modules')
+
+
+def fixture(declared=True):
     helper = carrier.source_helpers()
     root = Path(__file__).parent.parent
     source = json.loads((root / 'scripts/libbox-patches/source-manifest.json').read_bytes())
     core = json.loads((root / 'src-tauri/core-manifest.json').read_bytes())
-    receipt = {'schema': 'polaris-core-source-v1', 'sourceGraphState': 'dependencies-patched',
-        'graphScope': 'declared-patched-modules', 'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
+    if declared:
+        declare_dependencies(source, core)
+    receipt = {'schema': 'polaris-core-source-v1',
+        'sourceGraphState': 'dependencies-patched' if source['dependencyPatches'] else 'source-only',
+        'graphScope': 'declared-patched-modules' if source['dependencyPatches'] else 'core-source-only',
+        'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
         'sourceCommit': source['sourceCommit'], 'sourceURL': 'https://github.com/SagerNet/sing-box',
         'upstreamTree': '1' * 40, 'patches': source['patches'],
         'dependencies': [{**d, 'upstreamTree': '1' * 40, 'replacement': './polaris-dependencies/' + d['name']}
@@ -314,7 +328,7 @@ def run_tests():
     receipt = copy.deepcopy(f['receipt']); receipt['fingerprint'] = '0' * 64
     rejected(lambda: inspect(base, receipt=receipt), 'receipt fingerprint')
     # Rule checks cannot be bypassed by updating synthetic expected facts too.
-    for raw, reason in ((f['raw'][device].replace('./polaris-dependencies/sing-tun', './foreign'), 'patched module provenance'),
+    for raw, reason in ((f['raw'][device].replace('./polaris-dependencies/patched', './foreign'), 'patched module provenance'),
                         (f['raw'][device] + 'dep\tforeign/module\tv1.0.0\n=>\t./foreign\n', 'undeclared module replacement')):
         p = copy.deepcopy(f['policy'])
         p['targets'][device]['buildInfo'] = helper.parse_build_info('section: go1.25.5\n' + ''.join('\t' + r + '\n' for r in raw.splitlines()))
@@ -427,6 +441,24 @@ def run_tests():
         member = row['goCarriers'][0]['memberIdentity']
         check(locus['buildInfo']['containerOffset'] == row['sliceOffset'] + member['payloadOffset'] + locus['buildInfo']['offset'], 'absolute BuildInfo locus')
         check(two[locus['buildID']['containerOffset']:].startswith(carrier.ID_START), 'absolute compiler ID locus')
+    # The committed declaration (no patched dependency) is accepted as it is,
+    # and any replacement row in such a carrier is refused.
+    actual = fixture(declared=False)
+    check(actual['source']['dependencyPatches'] == [] and actual['core']['sourceBuild']['dependencyModules'] == []
+          and actual['receipt']['graphScope'] == 'core-source-only' and '=>' not in actual['raw'][device], 'committed empty graph fixture')
+    def inspect_actual(data, target, policy=None):
+        return carrier.inspect_carrier(data, [target], actual['receipt'], actual['source'], actual['core'],
+                                       actual['policy'] if policy is None else policy, actual['tools'])
+    for target in carrier.TARGETS:
+        for data in (actual['objects'][target], actual['archives'][target]):
+            row = positive(lambda data=data, target=target: inspect_actual(data, target))['targets'][target]
+            check(row['goCarriers'][0]['buildID'] == actual['id'], 'committed graph provider identity mismatch')
+    raw = actual['raw'][device] + 'dep\tgithub.com/sagernet/sing-tun\tv1.0.0\n=>\t./polaris-dependencies/sing-tun\t(devel)\t\n'
+    p = copy.deepcopy(actual['policy'])
+    p['targets'][device]['buildInfo'] = helper.parse_build_info('section: go1.25.5\n' + ''.join('\t' + r + '\n' for r in raw.splitlines()))
+    rejected(lambda: inspect_actual(mach_object(device, inline(raw), actual['id']), device, p), 'undeclared module replacement')
+    p = copy.deepcopy(actual['policy']); p['targets'][device]['patchedModules']['allowedAbsent'].append('example.com/patched')
+    rejected(lambda: inspect_actual(actual['objects'][device], device, p), 'partition inventory')
     print(f'{count} Apple carrier unit cases passed; no Framework or App built.')
     return count
 

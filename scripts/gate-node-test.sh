@@ -98,7 +98,10 @@ fi
 #   217 → 223（2026-10-01）6 条 native source workflow/candidate/bundle/reuse/impact 纯接线合同。
 #   真实 tiny Go buildInfo 用显式 opt-in 单独执行，不借其 skip 数满足下限。
 #   223 → 231（2026-10-05）8 条 ZIP 压缩／静态符号／运行元数据与 libbox 来源原字节合同。
-if [ "$pass" -lt 231 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 231）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+#   231 → 241（2026-10-08）按实测通过数重定（242 条：241 过，1 条为上面那条显式 opt-in 的跳过）。
+#           本次发布策略加 1 条（归属链输入按名字拒）、desktop source graph 删 1 条（非 Linux 的
+#           nftables 缺席例外已不存在）。
+if [ "$pass" -lt 241 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 241）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

@@ -4,10 +4,7 @@
     "platform": "android-36",
     "androidJarSha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"
   },
-  "requiredPatchedModules": [
-    "github.com/sagernet/sing-tun",
-    "github.com/sagernet/nftables"
-  ],
+  "requiredPatchedModules": [],
   "abis": {
     "arm64-v8a": {
       "goos": "android",
@@ -19,10 +16,7 @@
       "elfClass": 2,
       "elfMachine": 183,
       "patchedModules": {
-        "requiredLinked": [
-          "github.com/sagernet/sing-tun",
-          "github.com/sagernet/nftables"
-        ],
+        "requiredLinked": [],
         "allowedAbsent": []
       },
       "transportModules": {
@@ -47,10 +41,7 @@
       "elfClass": 1,
       "elfMachine": 40,
       "patchedModules": {
-        "requiredLinked": [
-          "github.com/sagernet/sing-tun",
-          "github.com/sagernet/nftables"
-        ],
+        "requiredLinked": [],
         "allowedAbsent": []
       },
       "transportModules": {
@@ -75,10 +66,7 @@
       "elfClass": 1,
       "elfMachine": 3,
       "patchedModules": {
-        "requiredLinked": [
-          "github.com/sagernet/sing-tun",
-          "github.com/sagernet/nftables"
-        ],
+        "requiredLinked": [],
         "allowedAbsent": []
       },
       "transportModules": {
@@ -103,10 +91,7 @@
       "elfClass": 2,
       "elfMachine": 62,
       "patchedModules": {
-        "requiredLinked": [
-          "github.com/sagernet/sing-tun",
-          "github.com/sagernet/nftables"
-        ],
+        "requiredLinked": [],
         "allowedAbsent": []
       },
       "transportModules": {

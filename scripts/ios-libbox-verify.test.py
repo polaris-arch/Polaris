@@ -194,7 +194,8 @@ def preflight_tests():
     no_side_effects(actions, 'Apple final artifact evidence not implemented')
     manifest, version = builder.inputs(historical=True)
     shared, core, policy = builder.final_preflight()
-    assert len(shared['patches']) == 9 and len(shared['dependencyPatches']) == 2
+    assert len(shared['patches']) == 8 and shared['dependencyPatches'] == []
+    assert core['sourceBuild']['dependencyModules'] == [] and policy['moduleInventory']['patched'] == []
     assert policy['evidenceScope'] == 'source-inputs-only'
     assert policy['binding']['gomobileVersion'] == 'v0.1.12' != shared['gomobileVersion']
     with ExitStack() as stack:
@@ -233,6 +234,7 @@ def preflight_tests():
                                        ('evidenceScope', 'final', 'policy scope'),
                                        ('sourceHelperSha256', '0' * 64, 'helper hash'),
                                        ('moduleInventory', {'patched': [], 'transport': []}, 'module inventory'),
+                                       ('moduleInventory', {**policy['moduleInventory'], 'patched': ['example.com/patched']}, 'module inventory'),
                                        ('unresolvedArtifactEvidence', [], 'artifact evidence requirements')]:
             bad = copy.deepcopy(policy)
             bad[field] = value
@@ -262,7 +264,9 @@ def preflight_tests():
         with mock.patch.object(builder, 'SHARED_MANIFEST', shared_path):
             for field, value in [('patches', shared['patches'][:-1]),
                                  ('patches', list(reversed(shared['patches']))),
-                                 ('dependencyPatches', []), ('sourceCommit', '0' * 40)]:
+                                 ('dependencyPatches', [{'name': 'patched', 'module': 'example.com/patched'}]),
+                                 ('sourceCommit', '0' * 40)]:
+                assert value != shared[field]
                 changed = copy.deepcopy(shared)
                 changed[field] = value
                 shared_path.write_text(json.dumps(changed))
@@ -274,59 +278,80 @@ def preflight_tests():
         # The production preparation entry calls the real shared-provider API.
         # Stub execution proves dispatch/arguments and receipt checks, never real source replay.
         helper = builder.source_helpers()
-        receipt = {'schema': 'polaris-core-source-v1', 'sourceGraphState': 'dependencies-patched',
-                   'graphScope': 'declared-patched-modules', 'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
-                   'sourceCommit': shared['sourceCommit'], 'sourceURL': 'https://github.com/SagerNet/sing-box',
-                   'upstreamTree': '1' * 40, 'patches': shared['patches'],
-                   'dependencies': [{**dep, 'upstreamTree': '1' * 40, 'replacement': './polaris-dependencies/' + dep['name']}
-                                    for dep in shared['dependencyPatches']],
-                   'moduleGraph': [{'Path': dep['module'], 'Version': dep['upstreamVersion'],
-                                    'Replace': {'Path': './polaris-dependencies/' + dep['name']}}
-                                   for dep in shared['dependencyPatches']]}
-        for field in ('sourceManifestSha256', 'provisionerSha256', 'patchedSourceTree', 'buildTree', 'mainGoModSha256', 'mainGoSumSha256'):
-            receipt[field] = core['sourceBuild'][field]
-        receipt['moduleGraphSha256'] = helper.digest(helper.canonical(receipt['moduleGraph']))
-        receipt['fingerprint'] = helper.digest(helper.canonical(receipt))
-        synthetic_core = copy.deepcopy(core)
-        for field in ('sourceReceiptFingerprint', 'moduleGraphSha256'):
-            synthetic_core['sourceBuild'][field] = receipt['fingerprint' if field == 'sourceReceiptFingerprint' else field]
-        helper.validate_source_receipt(receipt, shared, synthetic_core)
-        repositories, arguments = {}, []
-        for dep in shared['dependencyPatches']:
-            repo = root / ('objects-' + dep['name'])
-            (repo / '.git').mkdir(parents=True)
-            repositories[dep['module']] = repo.resolve()
-            arguments.append(dep['module'] + '=' + str(repo))
+        # The committed declaration has no dependency; a synthetic one keeps the
+        # retained explicit-repository mechanism under the same refusals.
+        declared = copy.deepcopy(shared)
+        declared['dependencyPatches'] = [{'name': name, 'module': 'example.com/' + name, 'upstreamVersion': 'v1.0.0',
+                                          'sourceURL': 'https://github.com/example/' + name, 'upstreamCommit': '2' * 40,
+                                          'patchFile': name + '.patch', 'patchSha256': '3' * 64, 'patchedTree': '4' * 40}
+                                         for name in ('patched', 'second')]
         go = root / 'fixture-go-never-executed'
         go.write_bytes(b'fixture only')
-        source_repo, checkout = root / 'source-objects', root / 'fresh-checkout'
-        provider = SimpleNamespace(provision=mock.Mock(return_value=receipt))
-        verify_checkout = mock.Mock()
-        reused = SimpleNamespace(module_sources=helper.module_sources, provider=lambda: provider,
-                                 validate_source_receipt=helper.validate_source_receipt, verify_checkout=verify_checkout)
-        with mock.patch.object(builder, 'source_helpers', return_value=reused), \
-                mock.patch.object(builder, 'final_preflight', return_value=(shared, synthetic_core, policy)), \
-                mock.patch.object(builder, 'run', side_effect=AssertionError('Fixture executed a tool')):
-            produced = builder.provision_source(source_repo, checkout, arguments, go)
-            assert produced == receipt
-            provider.provision.assert_called_once_with(builder.SHARED_MANIFEST, source_repo, checkout, repositories, go)
-            verify_checkout.assert_called_once_with(checkout, receipt, provider)
-            count += 1
-            for bad_map in [[], arguments[:-1], arguments + arguments[:1], ['foreign/module=' + str(source_repo)]]:
+        for label, declaration in (('committed', shared), ('declared', declared)):
+            dependencies = declaration['dependencyPatches']
+            receipt = {'schema': 'polaris-core-source-v1',
+                       'sourceGraphState': 'dependencies-patched' if dependencies else 'source-only',
+                       'graphScope': 'declared-patched-modules' if dependencies else 'core-source-only',
+                       'moduleGraphQueries': sorted(dep['module'] for dep in dependencies),
+                       'sourceCommit': shared['sourceCommit'], 'sourceURL': 'https://github.com/SagerNet/sing-box',
+                       'upstreamTree': '1' * 40, 'patches': shared['patches'],
+                       'dependencies': [{**dep, 'upstreamTree': '1' * 40, 'replacement': './polaris-dependencies/' + dep['name']}
+                                        for dep in dependencies],
+                       'moduleGraph': [{'Path': dep['module'], 'Version': dep['upstreamVersion'],
+                                        'Replace': {'Path': './polaris-dependencies/' + dep['name']}}
+                                       for dep in dependencies]}
+            for field in ('sourceManifestSha256', 'provisionerSha256', 'patchedSourceTree', 'buildTree', 'mainGoModSha256', 'mainGoSumSha256'):
+                receipt[field] = core['sourceBuild'][field]
+            receipt['moduleGraphSha256'] = helper.digest(helper.canonical(receipt['moduleGraph']))
+            receipt['fingerprint'] = helper.digest(helper.canonical(receipt))
+            synthetic_core = copy.deepcopy(core)
+            synthetic_core['sourceBuild'].update(sourceReceiptFingerprint=receipt['fingerprint'], moduleGraphSha256=receipt['moduleGraphSha256'],
+                                                 graphScope=receipt['graphScope'], dependencyModules=[dep['module'] for dep in dependencies])
+            if not dependencies:
+                assert all(synthetic_core['sourceBuild'][key] == core['sourceBuild'][key] for key in
+                           ('moduleGraphSha256', 'graphScope', 'dependencyModules')), 'committed pins already describe the empty graph'
+            helper.validate_source_receipt(receipt, declaration, synthetic_core)
+            for field, value in [('graphScope', 'core-source-only' if dependencies else 'declared-patched-modules'),
+                                 ('sourceGraphState', 'source-only' if dependencies else 'dependencies-patched')]:
+                rejected(lambda: helper.validate_source_receipt({**receipt, field: value}, declaration, synthetic_core), 'scope')
+                count += 1
+            repositories, arguments = {}, []
+            for dep in dependencies:
+                repo = root / ('objects-' + dep['name'])
+                (repo / '.git').mkdir(parents=True)
+                repositories[dep['module']] = repo.resolve()
+                arguments.append(dep['module'] + '=' + str(repo))
+            source_repo, checkout = root / ('source-objects-' + label), root / ('fresh-checkout-' + label)
+            (source_repo / '.git').mkdir(parents=True)
+            provider = SimpleNamespace(provision=mock.Mock(return_value=receipt))
+            verify_checkout = mock.Mock()
+            reused = SimpleNamespace(module_sources=helper.module_sources, provider=lambda: provider,
+                                     validate_source_receipt=helper.validate_source_receipt, verify_checkout=verify_checkout)
+            with mock.patch.object(builder, 'source_helpers', return_value=reused), \
+                    mock.patch.object(builder, 'final_preflight', return_value=(declaration, synthetic_core, policy)), \
+                    mock.patch.object(builder, 'run', side_effect=AssertionError('Fixture executed a tool')):
+                produced = builder.provision_source(source_repo, checkout, arguments, go)
+                assert produced == receipt
+                provider.provision.assert_called_once_with(builder.SHARED_MANIFEST, source_repo, checkout, repositories, go)
+                verify_checkout.assert_called_once_with(checkout, receipt, provider)
+                count += 1
+                foreign = ['foreign/module=' + str(source_repo)]
+                bad_maps = [[], arguments[:-1], arguments + arguments[:1], foreign] if dependencies else [foreign]
+                for bad_map in bad_maps:
+                    before = provider.provision.call_count
+                    rejected(lambda: builder.provision_source(source_repo, checkout, bad_map, go), 'module')
+                    assert provider.provision.call_count == before
+                    count += 1
                 before = provider.provision.call_count
-                rejected(lambda: builder.provision_source(source_repo, checkout, bad_map, go), 'module')
+                rejected(lambda: builder.provision_source(source_repo, checkout, arguments, None), 'pinned Go executable')
                 assert provider.provision.call_count == before
                 count += 1
-            before = provider.provision.call_count
-            rejected(lambda: builder.provision_source(source_repo, checkout, arguments, None), 'pinned Go executable')
-            assert provider.provision.call_count == before
-            count += 1
-            forged = copy.deepcopy(receipt)
-            forged['fingerprint'] = '0' * 64
-            provider.provision.return_value = forged
-            rejected(lambda: builder.provision_source(source_repo, checkout, arguments, go), 'fingerprint')
-            assert verify_checkout.call_count == 1
-            count += 1
+                forged = copy.deepcopy(receipt)
+                forged['fingerprint'] = '0' * 64
+                provider.provision.return_value = forged
+                rejected(lambda: builder.provision_source(source_repo, checkout, arguments, go), 'fingerprint')
+                assert verify_checkout.call_count == 1
+                count += 1
         patch_copy = root / 'patches'
         shutil.copytree(builder.PATCH_DIR, patch_copy)
         patch = patch_copy / 'construction-validation.patch'

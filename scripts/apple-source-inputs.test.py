@@ -107,8 +107,13 @@ var appleModuleMapTmpl = template.Must(template.New("iosmmap").Parse(`framework 
 }`))'''
 
 
-def graph_fixture(root):
+def graph_fixture(root, declared=True):
     shared, core, policy = builder.final_preflight()
+    if declared:
+        # Fixture-only declarations: the committed manifest patches no dependency module.
+        shared['dependencyPatches'] = [{'name': name, 'module': 'example.com/' + name, 'upstreamVersion': 'v1.0.0'}
+                                       for name in ('patched', 'second')]
+        core['sourceBuild']['dependencyModules'] = [dep['module'] for dep in shared['dependencyPatches']]
     checkout, cache, goroot, out = [root / name for name in ('checkout', 'module-cache', 'goroot', 'ios')]
     generated = checkout / 'build/ios-arm64/Libbox'
     for path in (checkout, cache, goroot, out, generated):
@@ -248,7 +253,7 @@ def observer_mocks(root, failure=None):
             mock.patch.object(collector.shutil, 'copytree', side_effect=copied_tree), \
             mock.patch.object(helper, 'validate_source_receipt'), mock.patch.object(helper, 'provider', return_value=object()), \
             mock.patch.object(helper, 'verify_checkout', side_effect=verified_checkout) as verify:
-        action = lambda: collector.collect(builder.final_preflight, lambda: helper, fixture.checkout, fixture.receipt,
+        action = lambda: collector.collect(lambda: (fixture.shared, fixture.core, fixture.policy), lambda: helper, fixture.checkout, fixture.receipt,
                                            Path(tools['go']['path']), mobile, developer, evidence)
         if failure == 'copy':
             caught = None
@@ -449,6 +454,15 @@ def pure_tests():
         absent[1]['Imports'].remove(removed)
         result = inspect_fixture(fixture, absent)
         check(len(result['patchedModules']['allowedAbsent']) == 1 and result['absenceEvidence'][removed.rsplit('/', 1)[0]]['graphFingerprint'] == result['graphFingerprint'], 'absence binds complete target graph/source selection')
+        # The committed declaration (no patched dependency) is accepted as it is;
+        # any replaced module in that graph is refused.
+        actual = graph_fixture(root / 'committed', declared=False)
+        check(actual.shared['dependencyPatches'] == [] and actual.core['sourceBuild']['dependencyModules'] == [], 'committed empty declaration')
+        observed = inspect_fixture(actual)
+        check(observed['patchedModules'] == {'requiredLinked': [], 'allowedAbsent': []}
+              and len(observed['transportModules']['requiredLinked']) == 6, 'committed 0+6 graph fixture')
+        bad = copy.deepcopy(actual.rows);bad[2]['Module']['Replace'] = {'Path': './polaris-dependencies/sing-tun'}
+        rejected(lambda: inspect_fixture(actual, bad), 'unexpected module replacement')
         mutations = []
         for field in ('Error', 'DepsErrors', 'Incomplete'):
             bad = copy.deepcopy(fixture.rows);bad[1][field] = {'Err': 'mock compile/load error'};mutations.append((bad, 'graph has errors'))
