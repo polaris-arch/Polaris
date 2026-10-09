@@ -4,13 +4,16 @@
 
 mod support;
 
+#[path = "mesh_inbound_runtime/diagnostics.rs"]
+mod diagnostics;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,8 +53,22 @@ fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+#[derive(Default)]
+struct ListenerDiagnostics {
+    replies: AtomicUsize,
+    // Keep one error, not an unbounded event log across policy cases.
+    last_error: Mutex<Option<String>>,
+}
+impl ListenerDiagnostics {
+    fn record(&self, stage: &str, error: std::io::Error) {
+        *self.last_error.lock().unwrap() = Some(format!("{stage}: {error}"));
+    }
+}
+
 struct Listener {
     port: u16,
+    address: SocketAddr,
+    diagnostics: Arc<ListenerDiagnostics>,
     hits: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -60,7 +77,10 @@ impl Listener {
     fn tcp_on(ipv6: bool) -> Self {
         let socket = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
         socket.set_nonblocking(true).unwrap();
-        let port = socket.local_addr().unwrap().port();
+        let address = socket.local_addr().unwrap();
+        let port = address.port();
+        let diagnostics = Arc::new(ListenerDiagnostics::default());
+        let worker_diagnostics = diagnostics.clone();
         let hits = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (hits_clone, stop_clone) = (hits.clone(), stop.clone());
@@ -69,21 +89,36 @@ impl Listener {
                 match socket.accept() {
                     Ok((mut stream, _)) => {
                         hits_clone.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        if let Err(error) =
+                            stream.set_read_timeout(Some(Duration::from_millis(500)))
+                        {
+                            worker_diagnostics.record("tcp set_read_timeout", error);
+                        }
                         let mut byte = [0u8; 1];
-                        if stream.read_exact(&mut byte).is_ok() {
-                            let _ = stream.write_all(&byte);
+                        match stream.read_exact(&mut byte) {
+                            Ok(()) => match stream.write_all(&byte) {
+                                Ok(()) => {
+                                    worker_diagnostics.replies.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(error) => worker_diagnostics.record("tcp write", error),
+                            },
+                            Err(error) => worker_diagnostics.record("tcp read", error),
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        worker_diagnostics.record("tcp accept", error);
+                        break;
+                    }
                 }
             }
         });
         Self {
             port,
+            address,
+            diagnostics,
             hits,
             stop,
             worker: Some(worker),
@@ -97,7 +132,10 @@ impl Listener {
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
-        let port = socket.local_addr().unwrap().port();
+        let address = socket.local_addr().unwrap();
+        let port = address.port();
+        let diagnostics = Arc::new(ListenerDiagnostics::default());
+        let worker_diagnostics = diagnostics.clone();
         let hits = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (hits_clone, stop_clone) = (hits.clone(), stop.clone());
@@ -112,19 +150,29 @@ impl Listener {
                         } else {
                             buf[..n].to_vec()
                         };
-                        let _ = socket.send_to(&response, peer);
+                        match socket.send_to(&response, peer) {
+                            Ok(_) => {
+                                worker_diagnostics.replies.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => worker_diagnostics.record("udp send", error),
+                        }
                     }
                     Err(e)
                         if matches!(
                             e.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) => {}
-                    Err(_) => break,
+                    Err(error) => {
+                        worker_diagnostics.record("udp recv", error);
+                        break;
+                    }
                 }
             }
         });
         Self {
             port,
+            address,
+            diagnostics,
             hits,
             stop,
             worker: Some(worker),
@@ -132,6 +180,16 @@ impl Listener {
     }
     fn count(&self) -> usize {
         self.hits.load(Ordering::Relaxed)
+    }
+    fn diagnostic(&self) -> String {
+        format!(
+            "address={} accepted={} replies={} worker_finished={} last_error={:?}",
+            self.address,
+            self.count(),
+            self.diagnostics.replies.load(Ordering::Relaxed),
+            self.worker.as_ref().is_none_or(JoinHandle::is_finished),
+            self.diagnostics.last_error.lock().unwrap()
+        )
     }
 }
 impl Drop for Listener {
@@ -374,15 +432,50 @@ fn run(core: &Path, config: &Path, temp: &TempDir) -> Running {
         .unwrap();
     Running { child, log }
 }
-fn tcp(port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&local(port), Duration::from_millis(600))
-    else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
-    stream.write_all(&[0x59]).is_ok() && {
+fn tcp_probe(port: u16) -> Result<(), String> {
+    let started = Instant::now();
+    let result = (|| {
+        let mut stream = TcpStream::connect_timeout(&local(port), Duration::from_millis(600))
+            .map_err(|error| format!("connect: {error}"))?;
+        let timeout_error = stream
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .err();
+        stream
+            .write_all(&[0x59])
+            .map_err(|error| format!("write: {error}"))?;
         let mut echoed = [0u8; 1];
-        stream.read_exact(&mut echoed).is_ok() && echoed == [0x59]
+        stream
+            .read_exact(&mut echoed)
+            .map_err(|error| format!("read: {error}; set_read_timeout_error={timeout_error:?}"))?;
+        if echoed == [0x59] {
+            Ok(())
+        } else {
+            Err(format!("echo mismatch: {echoed:?}"))
+        }
+    })();
+    result.map_err(|error| {
+        format!(
+            "relay={} elapsed={:?} {error}",
+            local(port),
+            started.elapsed()
+        )
+    })
+}
+fn tcp(port: u16) -> bool {
+    tcp_probe(port).is_ok()
+}
+fn eventually_tcp(port: u16) -> Result<(), String> {
+    let mut last_error = "no probe attempt completed".to_string();
+    if eventually(|| match tcp_probe(port) {
+        Ok(()) => true,
+        Err(error) => {
+            last_error = error;
+            false
+        }
+    }) {
+        Ok(())
+    } else {
+        Err(last_error)
     }
 }
 fn udp(port: u16, packet: &[u8]) -> Option<Vec<u8>> {
@@ -520,11 +613,13 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         let a_path = write_config(&a_temp, &a);
         let mut a_core = run(core, &a_path, &a_temp);
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
+        let forward_tcp = eventually_tcp(a_out_tcp);
         assert!(
-            eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP unavailable: A={} / B={}",
+            forward_tcp.is_ok(),
+            "{family}/{label}: A→B TCP unavailable: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
-            b_core.log()
+            b_core.log(),
+            b_tcp.diagnostic()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
@@ -625,11 +720,13 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         }
         let before_forward_tcp = b_tcp.count();
         let before_forward_udp = b_udp.count();
+        let forward_tcp = eventually_tcp(a_out_tcp);
         assert!(
-            eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}",
+            forward_tcp.is_ok(),
+            "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
-            b_core.log()
+            b_core.log(),
+            b_tcp.diagnostic()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
@@ -915,12 +1012,14 @@ fn masque_family(core: &Path, ipv6: bool) {
             b_core.log()
         );
         // A→B 正向 TCP/UDP 每轮都成功；它们的回包同时证明 A 策略没有切断已建流。
+        let forward_tcp = eventually_tcp(a_out_tcp);
         assert!(
-            eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP unavailable: {} / {} / {}",
+            forward_tcp.is_ok(),
+            "{family}/{label}: A→B TCP unavailable: {} / {} / {}; probe={forward_tcp:?}; listener={}",
             server_core.log(),
             a_core.log(),
-            b_core.log()
+            b_core.log(),
+            b_tcp.diagnostic()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
@@ -1021,11 +1120,13 @@ fn masque_family(core: &Path, ipv6: bool) {
         }
         let before_forward_tcp = b_tcp.count();
         let before_forward_udp = b_udp.count();
+        let forward_tcp = eventually_tcp(a_out_tcp);
         assert!(
-            eventually(|| tcp(a_out_tcp)),
-            "{family}/{label}: A→B TCP died after MASQUE ingress checks: {} / {}",
+            forward_tcp.is_ok(),
+            "{family}/{label}: A→B TCP died after MASQUE ingress checks: {} / {}; probe={forward_tcp:?}; listener={}",
             server_core.log(),
-            a_core.log()
+            a_core.log(),
+            b_tcp.diagnostic()
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
