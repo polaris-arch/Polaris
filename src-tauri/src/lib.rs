@@ -1348,6 +1348,8 @@ pub fn run() {
             backup_get_info,
             diagnostic_export,
             debug_android_batch_qa,
+            debug_android_transient_close_timeout,
+            debug_android_transient_close_targets,
             auto_start_set,
             auto_start_get_status,
             ipinfo_get,

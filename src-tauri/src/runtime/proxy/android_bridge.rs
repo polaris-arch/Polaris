@@ -748,6 +748,78 @@ where
     }
 }
 
+/// Read only the finite current engine identities needed to arm a debug close timeout.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) async fn debug_transient_close_targets() -> Result<serde_json::Value, String> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct DebugTransientCloseTarget {
+        target_kind: String,
+        instance_id: String,
+        target_token: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DebugTransientCloseTargetsResponse {
+        targets: Vec<DebugTransientCloseTarget>,
+    }
+    let plugin =
+        plugin_handle().map_err(|_| "Transient close timeout targets unavailable".to_owned())?;
+    let reply = call_with_budget::<DebugTransientCloseTargetsResponse, _>(
+        plugin,
+        "debugTransientCloseTargets",
+        (),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map_err(|_| "Transient close timeout targets unavailable".to_owned())?;
+    if reply.targets.len() > 9 {
+        return Err("Transient close timeout targets unavailable".to_owned());
+    }
+    serde_json::to_value(reply.targets)
+        .map_err(|_| "Transient close timeout targets unavailable".to_owned())
+}
+
+/// Arms one current engine; only an App process restart clears an uncertain arm or blocked Close.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) async fn debug_transient_close_timeout(
+    target_kind: String,
+    instance_id: String,
+    target_token: String,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DebugTransientCloseTimeoutPayload {
+        target_kind: String,
+        instance_id: String,
+        target_token: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct DebugTransientCloseTimeoutResponse {
+        state: String,
+    }
+    let plugin =
+        plugin_handle().map_err(|_| "Transient close timeout bridge unavailable".to_owned())?;
+    let reply = call_with_budget::<DebugTransientCloseTimeoutResponse, _>(
+        plugin,
+        "debugTransientCloseTimeout",
+        DebugTransientCloseTimeoutPayload {
+            target_kind,
+            instance_id,
+            target_token,
+        },
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map_err(|_| "Transient close timeout arm unconfirmed; restart the App process".to_owned())?;
+    if reply.state != "armedUntilProcessRestart" {
+        return Err("Transient close timeout arm unconfirmed; restart the App process".to_owned());
+    }
+    Ok(reply.state)
+}
+
 /// Debug 报告使用相同的保活调用器；失败不影响代理生命周期。
 #[cfg(all(target_os = "android", debug_assertions))]
 pub(crate) async fn debug_batch_qa(

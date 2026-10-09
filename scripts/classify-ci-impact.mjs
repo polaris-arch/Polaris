@@ -799,6 +799,10 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
     + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'
     + 'APK 构建不会执行 socket、SDK snapshot、OEM guardian 或独立 peer 验收。',
+  'src-tauri/src/commands/android_transient_close_qa.rs':
+    'ACC-01 临时内核关闭超时调试命令；仅 android+debug_assertions 调用现有 plugin 桥，release/desktop 为 disabled stub。'
+    + 'ci.yml 的 aarch64-linux-android cargo check 覆盖 Android debug cfg 类型；check-android-bridge.mjs A17 '
+    + '核对命令、实例发现与注入接线。APK release 构建不执行 debug 注入，也不能证明实际 8 秒让位或重启恢复。',
   'src-tauri/src/runtime/updater.rs':
     'Frozen desktop sourceBuild selects the compiled desktop baseline only; the Android branch keeps bundledCoreVersion unchanged. '
     + 'cargo check --target aarch64-linux-android -p polaris type-checks that branch, while host updater/tests exercises explicit Android '

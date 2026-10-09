@@ -496,6 +496,7 @@ pub(crate) mod guard_scan {
 }
 
 pub mod android_batch_qa;
+pub mod android_transient_close_qa;
 pub mod config;
 pub mod helper;
 pub mod icon;
@@ -516,6 +517,7 @@ pub mod vpn;
 pub mod window;
 
 pub use android_batch_qa::*;
+pub use android_transient_close_qa::*;
 pub use config::*;
 pub use helper::*;
 pub use icon::*;

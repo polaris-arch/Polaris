@@ -2769,6 +2769,20 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     // 2026-10-01：对齐出生/退出托管与 Android 调试桥的真实新增点。
     (
+        "src-tauri/src/commands/android_transient_close_qa.rs",
+        "all(target_os = \"android\", debug_assertions)",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "ACC-01关闭超时注入只在Debug Android调用精确实例的JNI调试桥；iOS没有此宿主。",
+    ),
+    (
+        "src-tauri/src/commands/android_transient_close_qa.rs",
+        "not(all(target_os = \"android\", debug_assertions))",
+        2,
+        IosSide::DiffersOnlyInDebug,
+        "ACC-01非Debug Android命令只返回disabled，不创建资源。",
+    ),
+    (
         "src-tauri/src/commands/android_batch_qa.rs",
         "all(target_os = \"android\", debug_assertions)",
         1,
@@ -2811,9 +2825,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
         "all(target_os = \"android\", debug_assertions)",
-        4,
+        6,
         IosSide::DiffersOnlyInDebug,
-        "新增四处 JNI debug command/core probe 实现只在 Debug Android 存在；iOS 无该插件，release 两端均无调试入口。",
+        "JNI debug command/core probe及ACC-01关闭超时注入只在Debug Android存在；iOS无该插件，release两端均无调试入口。",
     ),
     (
         "src-tauri/src/runtime/proxy/android_bridge.rs",
@@ -3670,7 +3684,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 周期测速调度器：Android 设备状况查询 +4 处 Right（桥两处、调度器的真实腿与桩各一处），
 /// 移动端前后台入口 +3 处 WithAndroid（lib.rs 的 `Suspended` 臂、调度器两处）。两个债格子没动。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
-    ("DiffersOnlyInDebug", 24),
+    ("DiffersOnlyInDebug", 30),
     ("DiffersRight", 265),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 148),

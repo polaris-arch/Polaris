@@ -27,7 +27,7 @@ internal object TransientLoginHost {
         schedule = { delay, action -> timer.schedule(action, delay, TimeUnit.MILLISECONDS); Unit },
         parseDirectories = ::stateDirectories,
         requireSupported = SystemEndpointGuard::requireSupported,
-        createEngine = { _, config, directories, close -> LibboxEngine(config, directories, close) },
+        createEngine = { id, config, directories, close -> LibboxEngine(id, config, directories, close) },
         logFailure = { stage, failure, reason ->
             Log.w("PolarisLogin", "transient failure stage=$stage type=${failure.javaClass.simpleName} reason=$reason")
         },
@@ -53,8 +53,9 @@ internal object TransientLoginHost {
         }.toSet()
     }
 
-    private class LibboxEngine(config: String, private val stateDirectories: Set<String>,
+    private class LibboxEngine(id: String, config: String, private val stateDirectories: Set<String>,
         private val requestClose: () -> Unit) : TransientLoginHostState.Engine {
+        private val closeTimeout = DebugTransientCloseTimeout.process.Target("login", id)
         private var config: String? = config
         private var server: CommandServer? = null
         private var network: TransientLoginNetwork? = null
@@ -62,7 +63,7 @@ internal object TransientLoginHost {
         private var store: AndroidTailscaleStoreCustody? = null
         private val cleanup = TransientHostCleanup(
             beginResolverClose = { network?.beginResolverClose() },
-            closeService = { server?.let { server ->
+            closeService = { closeTimeout.beforeClose(); server?.let { server ->
                 try { server.closeService() }
                 finally { store?.closed { AndroidTailscaleStoreCustody.export(server) } }
             } },
@@ -108,6 +109,7 @@ internal object TransientLoginHost {
                 checkNotNull(store).invoke(checkNotNull(config), { AndroidTailscaleStoreCustody.export(original) }) {
                     original.startOrReloadService(checkNotNull(config), OverrideOptions())
                 }
+                closeTimeout.started()
             }
             finally { config = null }
         }

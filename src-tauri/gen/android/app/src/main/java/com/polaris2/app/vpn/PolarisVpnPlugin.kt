@@ -68,6 +68,13 @@ class DebugBatchQaArgs {
 }
 
 @InvokeArg
+class DebugTransientCloseTimeoutArgs {
+    lateinit var targetKind: String
+    lateinit var instanceId: String
+    lateinit var targetToken: String
+}
+
+@InvokeArg
 class MainStartArgs {
     lateinit var configContent: String
     lateinit var runId: String
@@ -331,6 +338,32 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun transientSpeedtestStatus(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
         invoke.resolve(JSObject().put("state", TransientSpeedtestHost.status(args.instanceId)))
+    }
+
+    @Command
+    fun debugTransientCloseTargets(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
+        try {
+            val targets = JSArray()
+            for ((kind, id, token) in DebugTransientCloseTimeout.process.currentTargets()) {
+                targets.put(debugTransientCloseTarget(kind, id, token))
+            }
+            invoke.resolve(JSObject().put("targets", targets))
+        } catch (_: Throwable) { invoke.reject("Transient close timeout targets unavailable") }
+    }
+
+    private fun debugTransientCloseTarget(kind: String, id: String, token: String): JSObject {
+        return JSObject().put("targetKind", kind).put("instanceId", id).put("targetToken", token)
+    }
+
+    @Command
+    fun debugTransientCloseTimeout(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
+        try {
+            val args = invoke.parseArgs(DebugTransientCloseTimeoutArgs::class.java)
+            DebugTransientCloseTimeout.process.arm(args.targetKind, args.instanceId, args.targetToken)
+            invoke.resolve(JSObject().put("state", "armedUntilProcessRestart"))
+        } catch (_: Throwable) { invoke.reject("Transient close timeout target unavailable; restart the App process if already armed") }
     }
 
     @Command

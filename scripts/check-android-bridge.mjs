@@ -1502,6 +1502,65 @@ a14SelfCheck();
     fail('A16 session seal must erase known pure credential records before arbitrary original Close');
 }
 
+// A17: ACC-01 fault code is compiled only from the debug source set; hooks preserve real cleanup.
+{
+  const command = stripComments(readFileSync(join(RUST_SRC, 'commands/android_transient_close_qa.rs'), 'utf8'));
+  const plugin = kotlinCommands.get('debugTransientCloseTimeout')?.body ?? '';
+  const guard = plugin.indexOf('if (!BuildConfig.DEBUG)');
+  const parse = plugin.indexOf('invoke.parseArgs(DebugTransientCloseTimeoutArgs::class.java)');
+  if (guard < 0 || parse <= guard || !plugin.slice(guard, parse).includes('return') ||
+      !plugin.includes('DebugTransientCloseTimeout.process.arm(args.targetKind, args.instanceId, args.targetToken)') ||
+      !plugin.includes('armedUntilProcessRestart')) fail('A17 Release must reject before parsing/arming the exact transient target');
+  const discover = kotlinCommands.get('debugTransientCloseTargets')?.body ?? '';
+  const discoverGuard = discover.indexOf('if (!BuildConfig.DEBUG)');
+  const snapshot = discover.indexOf('DebugTransientCloseTimeout.process.currentTargets()');
+  if (discoverGuard < 0 || snapshot <= discoverGuard || !discover.slice(discoverGuard, snapshot).includes('return') ||
+      !discover.includes('targets.put(debugTransientCloseTarget(kind, id, token))') ||
+      !discover.includes('invoke.resolve(JSObject().put("targets", targets))'))
+    fail('A17 Target discovery must reject Release before reading a current registry snapshot');
+  if (!command.includes('#[cfg(all(target_os = "android", debug_assertions))]') ||
+      !command.includes('#[cfg(not(all(target_os = "android", debug_assertions)))]') ||
+      !command.includes('Debug transient close timeout is disabled') ||
+      !/matches!\(\s*target_kind\.as_str\(\),\s*"speedtest"\s*\|\s*"login"\s*\)/.test(command) || !command.includes('instance_id.len() > 256') ||
+      !command.includes('b.is_ascii_alphanumeric() || b"._:-".contains(&b)') ||
+      !command.includes('target_token.len() != 16') ||
+      !command.includes("b.is_ascii_digit() || (b'a'..=b'f').contains(&b)")) fail('A17 Rust finite debug profile or disabled stub missing');
+  const relative = 'java/com/polaris2/app/vpn/DebugTransientCloseTimeout.kt';
+  const debug = stripComments(readFileSync(join(KOTLIN_SRC, '../../debug', relative), 'utf8'));
+  const release = stripComments(readFileSync(join(KOTLIN_SRC, '../../release', relative), 'utf8'));
+  const currentTargets = kotlinFnBody(debug, 'currentTargets') ?? '';
+  if (!currentTargets.includes('Triple(key.first, key.second, target.token)') ||
+      !currentTargets.includes('.sortedWith(') ||
+      /running\[|\.(remove|clear|put)\(|armed\s*=|\.started\(|\.beforeClose\(|java\.io|config|password/.test(currentTargets) ||
+      !release.includes('fun currentTargets(): List<Triple<String, String, String>> = error("Debug transient close timeout is disabled")'))
+    fail('A17 Target discovery must be read-only minimum identity metadata and disabled in Release');
+  const arm = kotlinFnBody(debug, 'arm') ?? '';
+  const tokenCheck = arm.indexOf('check(target.token == token)');
+  if (!debug.includes('private val nextToken = AtomicLong(1)') ||
+      !debug.includes("nextToken.getAndUpdate { Math.incrementExact(it) }.toString(16).padStart(16, '0')") ||
+      tokenCheck < 0 || arm.indexOf('armed = target') <= tokenCheck)
+    fail('A17 Discovery token must identify one Target without reuse and stale tokens must not consume the arm');
+  if (!debug.includes('armed === this') || !debug.includes('running[key] === this') ||
+      !debug.includes('check(armed == null)') || !debug.includes('if (!closing)') ||
+      !debug.includes('processLifetime.await()') || !debug.includes('catch (_: InterruptedException) { continue }') ||
+      /fun\s+(reset|release|disarm)|\.countDown\(|java\.io|android\.content|AndroidNativeAdmission|config|password|auth_key/.test(debug))
+    fail('A17 Fault must retain one exact engine until process death without owner/receipt/config mutation');
+  if (!release.includes('fun started() = Unit') || !release.includes('fun beforeClose() = Unit') ||
+      !release.includes('error("Debug transient close timeout is disabled")') ||
+      /CountDownLatch|AtomicLong|mutableMapOf|var\s|java\.io|AndroidNativeAdmission/.test(release)) fail('A17 Release source must have no fault state or waiting implementation');
+  for (const [file, kind] of [['TransientSpeedtestHost.kt', 'speedtest'], ['TransientLoginHost.kt', 'login']]) {
+    const host = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn', file), 'utf8'));
+    if (!host.includes(`DebugTransientCloseTimeout.process.Target("${kind}", id)`) ||
+        !/closeService\s*=\s*\{\s*closeTimeout\.beforeClose\(\);\s*server\?\./.test(host) ||
+        !/original\.startOrReloadService\([\s\S]*?\}\s*closeTimeout\.started\(\)/.test(host))
+      fail(`A17 ${file} must register actual successful native Start and block inside real closeService cleanup`);
+  }
+  const sessions = stripComments(readFileSync(join(KOTLIN_SRC, 'com/polaris2/app/vpn/TransientSpeedtestSessions.kt'), 'utf8'));
+  if (!sessions.includes('closeTimeoutMillis: Long = 8_000') ||
+      !sessions.includes('previous.closed.get(closeTimeoutMillis, TimeUnit.MILLISECONDS)') ||
+      !sessions.includes('Android 临时测速 cleanupUnknown：主核启动已拒绝')) fail('A17 Existing 8-second speedtest main-admission path changed');
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 if (failures.length > 0) {
   console.error('✗ check-android-bridge：Rust ⇄ Kotlin 起停核桥契约不一致\n');
