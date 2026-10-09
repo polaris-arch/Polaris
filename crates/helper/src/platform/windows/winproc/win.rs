@@ -17,7 +17,6 @@ use crate::platform::windows::selfuninstall::self_uninstall_cmd_line;
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
@@ -100,14 +99,6 @@ struct MibTcp6RowOwnerPid {
 
 /// STILL_ACTIVE（`winproc.go:141`，GetExitCodeProcess 的活跃码 = 259）。
 const STILL_ACTIVE_CODE: u32 = 259;
-
-/// 钉住 [`crate::platform::windows::logic::CREATE_NO_WINDOW`] 里硬编码的位值 == `windows-sys` 常量。
-///
-/// 同 `service::win` 对 `logic::pipe_open_mode` 的断言：纯逻辑层要在 Linux 上可单测，就不能引
-/// `windows-sys`；镜像值与真值的一致性交给这条 windows-only 编译期断言，两边一动即编不过。
-const _: () = {
-    assert!(crate::platform::windows::logic::CREATE_NO_WINDOW == CREATE_NO_WINDOW);
-};
 
 /// 受管核的进程句柄与随之读到的身份（D2/D3）。
 ///
@@ -843,67 +834,14 @@ impl ProcOps for WinProcOps {
         log::warn!("spawn_self_uninstall completed (ok={ok})");
     }
 
-    fn flush_dns(&self) -> Result<(), String> {
-        // D4：SYSTEM 下跑 ipconfig /flushdns。命令构造与结果判据都在 `logic`（Linux 可测），
-        // 本腿只负责执行 + 自捕两条流。**不能用共用的 `system-integration::exec`**：它只把 stderr
-        // 带进错误串，而 ipconfig 的失败文字在 stdout —— 那份全局格式被按串解析的消费方依赖，
-        // 改它射程远大于收益，故此处局部自捕。
-        let cmd = crate::platform::windows::logic::flush_dns_command(
-            std::env::var("SystemRoot").ok().as_deref(),
-        );
-        let mut child = std::process::Command::new(&cmd.program)
-            .args(&cmd.args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(cmd.creation_flags)
-            .spawn()
-            .map_err(|e| format!("{} 启动失败: {e}", cmd.program))?;
-        // 两条流各起一个读线程，**先于任何等待**（本仓纪律：先排空再等 —— 反过来就是子进程写满
-        // 管道等父进程读、父进程等子进程退出那个死锁）。此前这里是 `.output()`：排空是对的，
-        // 但它**没有上界** —— ipconfig 卡在 DNS Client 服务上时，这条连接线程与它占的那个管道实例
-        // 被一起扣到 ipconfig 自己返回为止（取值理由见 `logic::FLUSH_DNS_TIMEOUT_MS`）。
-        let mut out_pipe = child.stdout.take();
-        let mut err_pipe = child.stderr.take();
-        let out_reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = out_pipe.as_mut() {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        });
-        let err_reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = err_pipe.as_mut() {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        });
-        // 有界等待**进程句柄**；到点硬杀 —— 杀掉之后两条管道立刻 EOF，两个读线程随即收工，
-        // 故超时腿既不泄漏线程也不留孤儿。
-        // SAFETY: 句柄由 `child` 持有，本调用期间必然有效；WaitForSingleObject 只读它、不关它。
-        let timed_out = unsafe {
-            WaitForSingleObject(
-                child.as_raw_handle().cast(),
-                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
-            )
-        } != WAIT_OBJECT_0;
-        if timed_out {
-            let _ = child.kill();
-        }
-        let status = child.wait();
-        let stdout = out_reader.join().unwrap_or_default();
-        let stderr = err_reader.join().unwrap_or_default();
-        if timed_out {
-            return Err(crate::platform::windows::logic::flush_dns_timeout_error(
-                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
-            ));
-        }
-        crate::platform::windows::logic::flush_dns_result(
-            status.ok().and_then(|s| s.code()),
-            &stdout,
-            &stderr,
-        )
+    fn flush_dns(
+        &self,
+        admission: &crate::platform::windows::ops::DnsFlushAdmission,
+    ) -> Result<(), String> {
+        let pending = admission.launch(polaris_system_integration::windows_dns::begin_flush)?;
+        pending.wait(std::time::Duration::from_millis(u64::from(
+            crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
+        )))
     }
 
     fn enable_ip_forwarding(&self) {

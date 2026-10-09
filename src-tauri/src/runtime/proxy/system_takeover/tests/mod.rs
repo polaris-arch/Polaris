@@ -97,3 +97,52 @@ fn android_never_clears_system_proxy_between_restarts() {
         Platform::Linux
     ));
 }
+
+struct EnableCounter(Arc<AtomicU64>);
+impl SystemProxyClearer for EnableCounter {
+    fn ensure_cleared(&mut self) -> bool {
+        false
+    }
+    fn detect_foreign_proxy(&self) -> Option<String> {
+        None
+    }
+    fn enable_system_proxy(&mut self, _: &ProxyEnableRequest) -> Result<(), String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn recover_from_marker(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn enable_queued_before_query_cannot_write_after_cancellation_reopens_admission() {
+    let count = Arc::new(AtomicU64::new(0));
+    let takeover = SystemProxyTakeover::new(Box::new(EnableCounter(count.clone())));
+    let request = ProxyEnableRequest {
+        address: "127.0.0.1".into(),
+        http_port: 7890,
+        socks_port: 7890,
+        bypass_list: vec![],
+    };
+    let controller = takeover.controller.clone();
+    let guard = controller.lock().unwrap();
+    let mut enable = std::pin::pin!(takeover.enable(request.clone(), None));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(enable.as_mut(), &mut cx).is_pending());
+    let query = takeover.begin_session_query();
+    assert!(takeover.cancel_session_query(query));
+    drop(guard);
+    assert!(enable.await.unwrap().is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    takeover
+        .enable(request.clone(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let current = takeover.begin_session_query();
+    assert!(takeover.enable(request, None).await.unwrap().is_err());
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(takeover.cancel_session_query(current));
+}

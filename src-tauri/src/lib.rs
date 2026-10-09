@@ -38,6 +38,8 @@ mod idle_lightweight;
 mod logging;
 mod response;
 mod runtime;
+#[cfg(any(windows, test))]
+mod session_restore;
 mod startup;
 #[cfg(test)]
 mod test_support;
@@ -45,6 +47,8 @@ mod tray;
 mod window_health;
 #[cfg(windows)]
 mod windows_file_id;
+#[cfg(windows)]
+mod windows_session_end;
 #[cfg(target_os = "windows")]
 mod windows_single_instance;
 
@@ -850,6 +854,8 @@ pub fn run() {
             app.manage(RestartState(AtomicBool::new(false)));
             // 正常退出准备可失败重试；Ready 持锁到实际退出提交，防止并发重复提交。
             app.manage(exit_lifecycle::ExitCleanupState::default());
+            #[cfg(windows)]
+            windows_session_end::install(app.handle())?;
             // 托盘运行期状态（自绘浮层去抖 + 轻量重建时的待导航目标；Linux 虽不建浮层仍要后者）。
             app.manage(tray::TrayOverlay::default());
             // 同步托盘 warm 偏好。必须在 TrayOverlay manage 后执行；缺省 true，待托盘创建成功后后台预建。
@@ -1420,6 +1426,8 @@ pub fn run() {
         // 平台直接终止无法 veto；只 best effort，未确认关闭绝不写 clean marker。
         tauri::RunEvent::Exit => {
             exit_lifecycle::final_exit_best_effort(app_handle);
+            #[cfg(windows)]
+            windows_session_end::destroy(app_handle);
         }
         _ => {}
     });

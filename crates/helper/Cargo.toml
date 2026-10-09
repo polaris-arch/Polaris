@@ -13,8 +13,8 @@ repository.workspace = true
 #   1. 求并集（sha2/hex/thiserror/log/tokio/nix/windows-sys/tempfile 全部来自被合并的 crate）；
 #   2. 统一 nix 版本：合并前 linux=0.29 / mac=0.31，单一 Cargo.toml 里两个 0.x 无法共存
 #      （semver 不兼容且同名同 feature 集），且无版本特定 API 依赖，故统一取新的 0.31。
-# 当前另有一条 macOS-only 的 workspace 依赖 `polaris-system-integration`：root helper 复用 App
-# 侧同一份 SystemConfiguration 事务实现，避免特权侧再复制一套代理快照/恢复语义；它不是第三方依赖。
+# macOS/Windows 另复用 workspace 内的 `polaris-system-integration`：分别共享
+# SystemConfiguration 代理事务和Windows原生DNS缓存/会话查询；它不是新增第三方包。
 #
 # 【依赖隔离硬约束】平台专用依赖必须 target-specific —— 合并前三个 Cargo.toml 天然隔离了这点，
 # 平铺进普通 [dependencies] 会导致编 Linux 时把 windows-sys 一起拉进来（合并新增的回归风险）。
@@ -92,6 +92,7 @@ windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }
+polaris-system-integration = { path = "../system-integration" }
 
 [dev-dependencies]
 # tempfile = core_install / token / launchd / core_installer 单测的临时目录。

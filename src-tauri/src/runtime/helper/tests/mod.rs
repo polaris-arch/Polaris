@@ -1300,3 +1300,17 @@ fn install_core_textual_replies_are_classified_without_probe() {
     );
     assert_eq!(run.connects, 1);
 }
+
+#[test]
+fn windows_cache_request_never_selects_the_old_helpers_console_command() {
+    let request = flush_dns_request(Platform::Win);
+    assert_eq!(request, Request::WindowsFlushDnsNative);
+    let raw = String::from_utf8(polaris_helper_proto::codec::encode(
+        Platform::Win,
+        "fixture-token",
+        &request,
+    ))
+    .unwrap();
+    assert_eq!(raw.lines().nth(1), Some("flush-dns-native"));
+    assert_eq!(flush_dns_request(Platform::Mac), Request::FlushDns);
+}

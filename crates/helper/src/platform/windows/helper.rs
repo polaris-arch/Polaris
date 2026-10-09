@@ -66,6 +66,7 @@ pub struct WinHelper<T, P, N> {
     /// 只管 install-core 的互斥：装核不持 `child_mu`（见 `handle_install_core`），而管道最多
     /// 4 路并发 —— 不串行的话两次安装会互相覆盖对方的 `.new` 与备份。
     install_mu: Mutex<()>,
+    dns_admission: crate::platform::windows::ops::DnsFlushAdmission,
     token: T,
     /// `Arc<P>`：父死看护的 `on_parent_dead` 闭包（后台线程）须持 proc 收割 child，故需共享所有权。
     proc: Arc<P>,
@@ -184,6 +185,7 @@ where
         Self {
             child_mu: Arc::new(Mutex::new(ChildState::default())),
             install_mu: Mutex::new(()),
+            dns_admission: crate::platform::windows::ops::DnsFlushAdmission::default(),
             token,
             proc: Arc::new(proc),
             net,
@@ -347,9 +349,9 @@ where
             Request::RouteAdd(rp) => self.handle_route(&rp.iface, &rp.cidrs, false),
             Request::RouteDel(rp) => self.handle_route(&rp.iface, &rp.cidrs, true),
             Request::IfaceMetric { iface, metric } => self.handle_iface_metric(&iface, metric),
-            // D4：Windows 也刷 DNS 缓存。此前并在下方 `ERR unknown` 分支里 —— app 侧 Medium IL 跑
-            // ipconfig 该机 rc=1（需提权），停核后 FakeIP 记录留在系统缓存里继续命中。
-            Request::FlushDns => self.handle_flush_dns(),
+            // Both tokens enter the native API. New apps use the distinct capability token,
+            // so an old installed helper can never execute its subprocess implementation.
+            Request::FlushDns | Request::WindowsFlushDnsNative => self.handle_flush_dns(),
             // P4：Windows 也落受保护内核目录（此前只有 mac/linux 有这个 chokepoint，win 落 ERR unknown，
             // helper 以 LocalSystem 直接 exec 用户可写路径下的 sing-box.exe）。
             Request::InstallCore(p) => self.handle_install_core(&p),
@@ -372,13 +374,13 @@ where
 
     /// Flush the OS DNS cache through the SYSTEM helper.
     fn handle_flush_dns(&self) -> HandleOutcome {
-        match self.proc.flush_dns() {
+        match self.proc.flush_dns(&self.dns_admission) {
             Ok(()) => HandleOutcome::Respond(Response::Ok(ResponseKind::FlushDns(
                 polaris_helper_proto::FlushDns::Flushed,
             ))),
             Err(detail) => {
                 HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
-                    polaris_helper_proto::ErrorCode::Ipconfig,
+                    polaris_helper_proto::ErrorCode::DnsCache,
                     detail,
                 )))
             }
@@ -600,6 +602,13 @@ where
     }
 
     fn handle_cleanup(&self, uninstall: bool) -> HandleOutcome {
+        if uninstall {
+            if let Err(error) = self.dns_admission.close() {
+                // Optional cache admission stays closed on poison; it must not
+                // prevent native core drain or fabricate an uninstall receipt.
+                log::error!("helper uninstall DNS admission diagnostic: {error}");
+            }
+        }
         let Ok(mut state) = self.child_mu.lock() else {
             return native_busy();
         };
@@ -763,7 +772,8 @@ where
 
     /// Permanently fence native Start under the same lock as spawn/publication.
     pub fn begin_shutdown(&self) -> Result<(), String> {
-        match self.child_mu.lock() {
+        let dns_result = self.dns_admission.close();
+        let core_result = match self.child_mu.lock() {
             Ok(mut state) => {
                 state.closing = true;
                 Ok(())
@@ -773,13 +783,18 @@ where
                 poison.into_inner().closing = true;
                 Err("helper child custody lock poisoned".into())
             }
-        }
+        };
+        core_result.and(dns_result)
     }
 
     /// One bounded native close attempt. Err retains both registries and the logger tail;
     /// normal service/console exit must retry or remain alive rather than discard custody.
     pub fn reap_child_on_exit(&self) -> Result<(), String> {
-        self.begin_shutdown()?;
+        if let Err(error) = self.begin_shutdown() {
+            // DNS admission can be poisoned independently of native custody.
+            // Keep DNS closed, but still attempt the original core's real drain.
+            log::error!("helper shutdown admission diagnostic: {error}");
+        }
         let mut state = self
             .child_mu
             .lock()

@@ -67,6 +67,8 @@ pub mod mac {
 
 /// Windows 专属命令（移植自 `helper-win/helper.go`）。
 pub mod win {
+    /// Native DNS API only. Old helpers reject instead of entering their ipconfig leg.
+    pub const FLUSH_DNS_NATIVE: &str = "flush-dns-native";
     /// `OK uninstalling`（自卸载：收割 child → 派生 SYSTEM 旁路停删 SCM 服务 + 删 supportDir 含 helper.exe 自身；
     /// 零 UAC 主路径，`helper-win/helper.go:276-294`）。
     pub const UNINSTALL: &str = "uninstall";

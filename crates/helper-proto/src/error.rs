@@ -67,6 +67,8 @@ pub enum ErrorCode {
     /// 日志与按串分流的消费方分不清是哪条腿；更重要的是**不能折成 `ERR unknown`** —— 那是「旧 helper
     /// 不认识这条命令」的语义，app 据此回退用户级刷新，把真失败伪装成能力缺失就再也看不见了。
     Ipconfig,
+    /// Native Windows resolver-cache operation failed or exceeded its caller budget.
+    DnsCache,
     /// `ERR resolved-dns <err>` —— Linux resolved 接管、读回自证或回滚失败。
     ResolvedDns,
     /// `ERR system-proxy <err>` —— macOS SystemConfiguration 原生代理事务失败。
@@ -122,6 +124,7 @@ impl ErrorCode {
             "start" => Self::Start,
             "dscacheutil" => Self::Dscacheutil,
             "ipconfig" => Self::Ipconfig,
+            "dns-cache" => Self::DnsCache,
             "resolved-dns" => Self::ResolvedDns,
             "system-proxy" => Self::SystemProxy,
             "set-metric" => Self::SetMetric,
@@ -156,6 +159,7 @@ impl ErrorCode {
             Self::Start => "start",
             Self::Dscacheutil => "dscacheutil",
             Self::Ipconfig => "ipconfig",
+            Self::DnsCache => "dns-cache",
             Self::ResolvedDns => "resolved-dns",
             Self::SystemProxy => "system-proxy",
             Self::SetMetric => "set-metric",

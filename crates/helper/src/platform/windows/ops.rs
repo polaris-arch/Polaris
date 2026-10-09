@@ -17,6 +17,36 @@ use crate::platform::windows::coreacl::ObjectSecurity;
 use crate::platform::windows::logic::{self, ListenEntry};
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartTiming};
 
+/// Serialize optional native DNS worker creation with helper shutdown.
+/// The mutex is never held while waiting for the native cache call.
+#[derive(Default)]
+pub struct DnsFlushAdmission(std::sync::Mutex<bool>);
+
+impl DnsFlushAdmission {
+    pub fn close(&self) -> Result<(), String> {
+        match self.0.lock() {
+            Ok(mut closed) => {
+                *closed = true;
+                Ok(())
+            }
+            Err(poison) => {
+                *poison.into_inner() = true;
+                Err("DNS flush admission poisoned".into())
+            }
+        }
+    }
+
+    pub fn launch<T>(&self, spawn: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let closed = self.0.lock().map_err(|_| "DNS flush admission poisoned")?;
+        if *closed {
+            return Err("helper shutting down; DNS flush not launched".into());
+        }
+        let result = spawn();
+        drop(closed);
+        result
+    }
+}
+
 /// Windows helper 已创建的核心及其关键路径耗时。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreStart {
@@ -142,11 +172,9 @@ pub trait ProcOps: Send + Sync {
     /// 复用，读到的必是同一个进程；按 pid 现开句柄则可能读到复用者，那正是本条要消除的假象。
     fn managed_identity(&self, pid: u32) -> ManagedIdentity;
 
-    /// 以 SYSTEM 刷系统 DNS 缓存（D4）：跑 `ipconfig /flushdns`。
-    ///
-    /// 成功 `Ok(())`；失败 `Err(<合并 stdout+stderr 的诊断串>)` —— ipconfig 把错误文字写在 stdout，
-    /// 故本腿局部自捕两条流（判据见 [`logic::flush_dns_result`]），不改共用 exec 的全局错误格式。
-    fn flush_dns(&self) -> Result<(), String>;
+    /// Optional native resolver-cache operation as SYSTEM. No console child is created.
+    /// Admission covers worker creation; the caller has a bounded wait, not cancellation.
+    fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String>;
 
     /// 开 IP 转发（`winproc.go:414-427` `enableIPForwarding`）。
     ///
@@ -428,7 +456,7 @@ impl MockProcOps {
         };
     }
 
-    /// 预设 `flush_dns` 失败（模拟 ipconfig 非零退出；串即 helper 侧自捕的 stdout+stderr）。
+    /// 预设 `flush_dns` 失败（模拟原生 DNS API 失败；保留诊断原因）。
     pub fn set_flush_dns_error(&self, detail: &str) {
         *self.inner.flush_dns_error.lock().unwrap() = Some(detail.to_owned());
     }
@@ -704,14 +732,16 @@ impl ProcOps for MockProcOps {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn flush_dns(&self) -> Result<(), String> {
-        self.inner
-            .flush_dns_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match self.inner.flush_dns_error.lock().unwrap().clone() {
-            Some(detail) => Err(detail),
-            None => Ok(()),
-        }
+    fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String> {
+        admission.launch(|| {
+            self.inner
+                .flush_dns_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.inner.flush_dns_error.lock().unwrap().clone() {
+                Some(detail) => Err(detail),
+                None => Ok(()),
+            }
+        })
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {

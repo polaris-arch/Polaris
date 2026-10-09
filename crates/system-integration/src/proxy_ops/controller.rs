@@ -433,6 +433,10 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 None => self.ops.clear_proxy()?,
             }
             *restored_os = true;
+        } else {
+            // A previous native restore may have succeeded before its consumer
+            // notification failed. Preserve retry authority until notification settles.
+            self.ops.confirm_proxy_settings_changed()?;
         }
         self.clear_legacy_marker(&marker)?;
         self.original = None;
@@ -474,6 +478,7 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 let current = self.ops.capture_transaction_snapshot()?;
                 match self.ops.snapshot_relation(applied, original, &current) {
                     ProxySnapshotRelation::Exact => {
+                        self.ops.confirm_proxy_settings_changed()?;
                         self.advance_current_phase(
                             txn_id,
                             ProxyMarkerPhase::Restoring,

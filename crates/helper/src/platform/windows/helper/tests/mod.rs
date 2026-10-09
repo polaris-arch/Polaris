@@ -1447,6 +1447,32 @@ fn status_without_identity_falls_back_to_the_old_wire() {
 
 // ===== D4 flush-dns =====
 
+#[test]
+fn shutdown_fences_queued_dns_flush_without_claiming_it_flushed() {
+    let proc_ops = MockProcOps::new();
+    let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
+    h.begin_shutdown().unwrap();
+    let HandleOutcome::Respond(Response::Err(error)) = h.handle("real-token", Request::FlushDns)
+    else {
+        panic!("shutdown must reject DNS work");
+    };
+    assert_eq!(error.code, polaris_helper_proto::ErrorCode::DnsCache);
+    assert!(error.detail.contains("shutting down"));
+    assert_eq!(proc_ops.flush_dns_calls(), 0);
+}
+
+#[test]
+fn ordinary_cleanup_keeps_dns_flush_available() {
+    let proc_ops = MockProcOps::new();
+    let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
+    let _ = h.handle("real-token", Request::Cleanup);
+    assert!(matches!(
+        h.handle("real-token", Request::FlushDns),
+        HandleOutcome::Respond(Response::Ok(ResponseKind::FlushDns(_)))
+    ));
+    assert_eq!(proc_ops.flush_dns_calls(), 1);
+}
+
 /// flush-dns 成功 → `OK flushed`，且真的调到了 ProcOps 那条腿（不是分派层自己回了个 OK）。
 #[test]
 fn flush_dns_reports_flushed_and_calls_the_ops_leg() {
@@ -1462,22 +1488,19 @@ fn flush_dns_reports_flushed_and_calls_the_ops_leg() {
     assert_eq!(proc_ops.flush_dns_calls(), 1);
 }
 
-/// flush-dns 失败 → `ERR ipconfig <detail>`，detail 原样带回 helper 侧自捕的 stdout 文本。
-///
-/// 「报错路径日志非空」是本条的验收点：ipconfig 的失败文字只在 stdout，若沿用共用 exec 的
-/// 「只带 stderr」格式，这里会得到一条空 detail —— 失败了却说不出为什么。
+/// Native cache failure preserves its diagnostic and is never reported as a missing capability.
 #[test]
-fn flush_dns_failure_carries_the_captured_stdout() {
+fn flush_dns_failure_preserves_native_error() {
     let proc_ops = MockProcOps::new();
     proc_ops.set_flush_dns_error(
-        "ipconfig /flushdns exit 1: Could not flush the DNS Resolver Cache: Function failed during execution.",
+        "native DNS cache flush failed: Could not flush the DNS Resolver Cache: Function failed during execution.",
     );
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
     let out = h.handle("real-token", Request::FlushDns);
     let HandleOutcome::Respond(Response::Err(e)) = out else {
         panic!("{out:?}");
     };
-    assert_eq!(e.code, polaris_helper_proto::ErrorCode::Ipconfig);
+    assert_eq!(e.code, polaris_helper_proto::ErrorCode::DnsCache);
     assert!(
         e.detail.contains("Could not flush the DNS Resolver Cache"),
         "错误串丢了 stdout：{}",
@@ -1486,4 +1509,21 @@ fn flush_dns_failure_carries_the_captured_stdout() {
     // 反向对照：绝不折成 `ERR unknown` —— 那是「旧 helper 不认识这条命令」，app 会当能力缺失。
     assert_ne!(e.code, polaris_helper_proto::ErrorCode::Unknown);
     assert_eq!(proc_ops.flush_dns_calls(), 1);
+}
+
+#[test]
+fn new_native_cache_wire_command_is_authenticated_and_reaches_the_native_ops_once() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    for (token, expected_calls) in [("wrong-token", 0), ("real-token", 1)] {
+        let raw = String::from_utf8(polaris_helper_proto::codec::encode(
+            Platform::Win,
+            token,
+            &Request::WindowsFlushDnsNative,
+        ))
+        .unwrap();
+        let reply = h.handle_frame(&raw);
+        assert_eq!(reply.line.starts_with("OK flushed"), expected_calls == 1);
+        assert_eq!(ops.flush_dns_calls(), expected_calls);
+    }
 }

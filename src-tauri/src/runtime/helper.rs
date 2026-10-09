@@ -1457,7 +1457,8 @@ impl HelperRuntime {
                 };
             }
         };
-        match client.send_with_timeout(&Request::FlushDns, HELPER_FLUSH_TIMEOUT) {
+        let request = flush_dns_request(self.platform());
+        match client.send_with_timeout(&request, HELPER_FLUSH_TIMEOUT) {
             Ok(Response::Ok(ResponseKind::FlushDns(FlushDns::Flushed))) => HelperFlushResult {
                 ok: true,
                 partial: None,
@@ -1485,6 +1486,15 @@ impl HelperRuntime {
                 partial: None,
                 error: Some(format!("helper flush-dns 通信失败：{e}")),
             },
+        }
+    }
+}
+
+fn flush_dns_request(platform: Platform) -> Request {
+    match platform {
+        Platform::Win => Request::WindowsFlushDnsNative,
+        Platform::Mac | Platform::Linux | Platform::Android | Platform::Ios | Platform::Other => {
+            Request::FlushDns
         }
     }
 }

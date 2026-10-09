@@ -15,9 +15,10 @@ thiserror = "2"
 log = "0.4"
 plist = "1"
 
-# 两条都只供 `network_cost` 读系统的联网成本，且都已在依赖图里（Cargo.lock 不新增包）。
+# 既有依赖用于network_cost；Windows UI/LibraryLoader另供会话查询与原生DNS缓存。
+# 均已在依赖图中，Cargo.lock不新增包。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Networking_Connectivity"] }
+windows = { version = "0.61", features = ["Networking_Connectivity", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

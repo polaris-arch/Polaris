@@ -184,18 +184,9 @@ pub fn windows_clear_quic_command(netsh_exe: &str) -> Command {
 ///
 /// 调用前提：`original.enabled && original.has_any_proxy()`（否则该走 [`windows_disable_commands`]）。
 pub fn windows_restore_commands(reg_exe: &str, original: &SystemProxyStatus) -> Vec<Command> {
-    let mut parts = Vec::new();
-    if let Some(p) = &original.http_proxy {
-        parts.push(format!("http={p}"));
-    }
-    if let Some(p) = &original.https_proxy {
-        parts.push(format!("https={p}"));
-    }
-    if let Some(p) = &original.socks_proxy {
-        parts.push(format!("socks={p}"));
-    }
+    let server = windows_restore_server_value(original);
     let mut cmds = Vec::new();
-    if !parts.is_empty() {
+    if !server.is_empty() {
         cmds.push(Command::new(
             reg_exe,
             [
@@ -206,7 +197,7 @@ pub fn windows_restore_commands(reg_exe: &str, original: &SystemProxyStatus) -> 
                 "/t",
                 "REG_SZ",
                 "/d",
-                &parts.join(";"),
+                &server,
                 "/f",
             ],
         ));
@@ -227,6 +218,22 @@ pub fn windows_restore_commands(reg_exe: &str, original: &SystemProxyStatus) -> 
         ],
     ));
     cmds
+}
+
+/// The legacy marker has a projection, not an exact registry snapshot.
+/// Keep its existing value semantics shared by native restore and CLI fallback.
+pub(super) fn windows_restore_server_value(original: &SystemProxyStatus) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = &original.http_proxy {
+        parts.push(format!("http={p}"));
+    }
+    if let Some(p) = &original.https_proxy {
+        parts.push(format!("https={p}"));
+    }
+    if let Some(p) = &original.socks_proxy {
+        parts.push(format!("socks={p}"));
+    }
+    parts.join(";")
 }
 
 /// Windows 读代理状态命令：`reg query <path> /v <value>`。

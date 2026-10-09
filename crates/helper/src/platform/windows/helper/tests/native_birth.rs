@@ -38,6 +38,69 @@ fn stop(
 }
 
 #[test]
+fn poisoned_dns_admission_does_not_skip_or_fake_native_drain() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let target = start(&h, false);
+    let admission = &h.dns_admission;
+    let _ = std::panic::catch_unwind(|| {
+        let _: Result<(), String> = admission.launch(|| panic!("injected DNS spawn panic"));
+    });
+    ops.set_native_stop(NativeChildPoll::Running);
+    assert!(h.reap_child_on_exit().is_err());
+    assert_eq!(ops.native_stop_calls(), 1);
+    assert_eq!(
+        h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
+        target
+    );
+    assert!(!ops.native_custody_empty());
+
+    ops.set_native_stop(NativeChildPoll::Exited);
+    h.reap_child_on_exit().unwrap();
+    assert_eq!(ops.native_stop_calls(), 2);
+    assert!(h.child_mu.lock().unwrap().native.is_none());
+    assert!(ops.native_custody_empty());
+    assert!(matches!(
+        h.handle("real-token", Request::FlushDns),
+        HandleOutcome::Respond(Response::Err(_))
+    ));
+    assert_eq!(ops.flush_dns_calls(), 0);
+}
+
+#[test]
+fn poisoned_dns_admission_cannot_skip_uninstall_drain_or_discard_live_custody() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let target = start(&h, false);
+    let _ = std::panic::catch_unwind(|| {
+        let _: Result<(), String> = h
+            .dns_admission
+            .launch(|| panic!("DNS worker fixture panic"));
+    });
+    ops.set_native_stop(NativeChildPoll::Running);
+    assert!(matches!(
+        h.handle("real-token", Request::Uninstall),
+        HandleOutcome::Respond(Response::Err(_))
+    ));
+    assert_eq!(ops.native_stop_calls(), 1);
+    assert_eq!(
+        h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
+        target
+    );
+    assert!(!ops.native_custody_empty());
+    assert_eq!(ops.snapshot().spawn_uninstall_calls, 0);
+    ops.set_native_stop(NativeChildPoll::Exited);
+    assert!(matches!(
+        h.handle("real-token", Request::Uninstall),
+        HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling))
+    ));
+    assert_eq!(ops.native_stop_calls(), 2);
+    assert!(ops.native_custody_empty());
+    assert_eq!(ops.snapshot().spawn_uninstall_calls, 1);
+    assert!(h.dns_admission.launch(|| Ok(())).is_err());
+}
+
+#[test]
 fn legacy_start_is_rejected_before_forwarding_or_process_creation() {
     let ops = MockProcOps::new();
     let h = make_helper(ops.clone(), MockNetTableOps::new());

@@ -36,7 +36,7 @@ use super::windows::{
     parse_win_proxy_enable, parse_win_proxy_server, windows_clear_quic_command,
     windows_disable_commands, windows_enable_commands, windows_enable_values,
     windows_query_command, windows_registry_projection, windows_restore_commands,
-    WINDOWS_QUIC_CLEANUP_TIMEOUT,
+    windows_restore_server_value, WINDOWS_QUIC_CLEANUP_TIMEOUT,
 };
 use super::PROXY_EXEC_TIMEOUT;
 use crate::error::SystemIntegrationError;
@@ -89,6 +89,13 @@ pub trait SystemProxyOps {
     /// 用于 `ensure_cleared` 门控 2 与 `detect_foreign_proxy`。**不要**拿它做 enable 前的原始快照
     /// 捕获，那条走 [`capture_original_status`](Self::capture_original_status)（口径不同，见其文档）。
     fn get_proxy_status(&self) -> Result<SystemProxyStatus, SystemIntegrationError>;
+
+    /// Confirm consumers reload already-restored settings before dropping retry
+    /// authority. Windows notification failure must not become success on retry
+    /// merely because registry values already equal the original snapshot.
+    fn confirm_proxy_settings_changed(&self) -> Result<(), SystemIntegrationError> {
+        Ok(())
+    }
 
     /// 读 **enable 前的原始代理快照**（disable 时回写的真值来源）。
     ///
@@ -379,6 +386,19 @@ impl<R: CommandRunner> SystemProxyOpsImpl<R> {
         self.runner
             .run(cmd, timeout)
             .map_err(SystemIntegrationError::proxy)
+    }
+
+    /// Legacy firewall migration is optional; never create its console child during
+    /// this App's session end. Startup prewarm remains the regular migration path.
+    fn cleanup_windows_quic_best_effort(&self) {
+        #[cfg(windows)]
+        if crate::windows_session::is_ending() {
+            return;
+        }
+        let _ = self.run_with_timeout(
+            &windows_clear_quic_command(&self.netsh_exe),
+            WINDOWS_QUIC_CLEANUP_TIMEOUT,
+        );
     }
 
     /// 逐条跑；任一失败即返回（enable 的 argv 序列是整体，半套=坏状态）。
@@ -695,6 +715,17 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
         }
     }
 
+    fn confirm_proxy_settings_changed(&self) -> Result<(), SystemIntegrationError> {
+        match self.platform {
+            Platform::Win => self.notify_windows_proxy_changed(),
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other => Ok(()),
+        }
+    }
+
     fn get_proxy_status(&self) -> Result<SystemProxyStatus, SystemIntegrationError> {
         #[cfg(target_os = "macos")]
         if self.uses_native_macos() {
@@ -702,6 +733,12 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
         }
         match self.platform {
             Platform::Win => {
+                if let Some(writer) = &self.windows_registry_writer {
+                    return writer
+                        .capture()
+                        .map(|snapshot| windows_registry_projection(&snapshot))
+                        .map_err(SystemIntegrationError::from);
+                }
                 // ProxyEnable 未启用 → 直接 disabled（上游 getProxyStatus 早退）。
                 let Ok(enable_out) = self.run(&windows_query_command(&self.reg_exe, "ProxyEnable"))
                 else {
@@ -891,10 +928,23 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
             Platform::Win => {
                 // 禁用时务必先清 QUIC 规则（上游 disableProxy 首行）。best-effort：清不掉不阻断禁用
                 // —— 关代理是断网防线，不能被一条防火墙规则清理失败拖住。
-                let _ = self.run_with_timeout(
-                    &windows_clear_quic_command(&self.netsh_exe),
-                    WINDOWS_QUIC_CLEANUP_TIMEOUT,
-                );
+                self.cleanup_windows_quic_best_effort();
+                if let Some(writer) = &self.windows_registry_writer {
+                    let mut snapshot = writer.capture().map_err(SystemIntegrationError::from)?;
+                    snapshot.proxy_enable =
+                        crate::proxy::WindowsRegistryDwordValue::PresentValue(0);
+                    writer
+                        .restore(&snapshot)
+                        .map_err(SystemIntegrationError::from)?;
+                    if writer.capture().map_err(SystemIntegrationError::from)? != snapshot {
+                        return Err(SystemIntegrationError::proxy(
+                            "Windows proxy disable read-back mismatch",
+                        ));
+                    }
+                    return writer
+                        .notify_settings_changed()
+                        .map_err(SystemIntegrationError::from);
+                }
                 self.run(&windows_disable_commands(&self.reg_exe))?;
                 self.notify_windows_proxy_changed()
             }
@@ -929,10 +979,26 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
         }
         match self.platform {
             Platform::Win => {
-                let _ = self.run_with_timeout(
-                    &windows_clear_quic_command(&self.netsh_exe),
-                    WINDOWS_QUIC_CLEANUP_TIMEOUT,
-                );
+                self.cleanup_windows_quic_best_effort();
+                if let Some(writer) = &self.windows_registry_writer {
+                    let mut snapshot = writer.capture().map_err(SystemIntegrationError::from)?;
+                    snapshot.proxy_server = crate::proxy::WindowsRegistryStringValue::PresentValue(
+                        windows_restore_server_value(original),
+                    );
+                    snapshot.proxy_enable =
+                        crate::proxy::WindowsRegistryDwordValue::PresentValue(1);
+                    writer
+                        .restore(&snapshot)
+                        .map_err(SystemIntegrationError::from)?;
+                    if writer.capture().map_err(SystemIntegrationError::from)? != snapshot {
+                        return Err(SystemIntegrationError::proxy(
+                            "Windows legacy proxy restore read-back mismatch",
+                        ));
+                    }
+                    return writer
+                        .notify_settings_changed()
+                        .map_err(SystemIntegrationError::from);
+                }
                 // 回写原始 ProxyServer 串 + ProxyEnable=1。
                 self.run_all(&windows_restore_commands(&self.reg_exe, original))?;
                 self.notify_windows_proxy_changed()
@@ -1254,13 +1320,15 @@ impl<R: CommandRunner> SystemProxyOps for SystemProxyOpsImpl<R> {
                 if &actual != expected {
                     return Err(ownership_lost("Windows", "restore", "expected current"));
                 }
-                let _ = self.run_with_timeout(
-                    &windows_clear_quic_command(&self.netsh_exe),
-                    WINDOWS_QUIC_CLEANUP_TIMEOUT,
-                );
+                self.cleanup_windows_quic_best_effort();
                 writer
                     .restore(snapshot)
                     .map_err(SystemIntegrationError::from)?;
+                if writer.capture().map_err(SystemIntegrationError::from)? != *snapshot {
+                    return Err(SystemIntegrationError::proxy(
+                        "Windows exact proxy restore read-back mismatch",
+                    ));
+                }
                 writer
                     .notify_settings_changed()
                     .map_err(SystemIntegrationError::from)

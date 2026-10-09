@@ -119,6 +119,9 @@
     "debugReportBusy": "正在生成报告…",
     "debugReportHint": "报告包含设备信息、近期日志和脱敏配置，请检查后再分享。",
     "debugReportDone": "已打开系统分享菜单，请选择接收方。",
-    "debugReportFailed": "生成或分享失败，请重试或连接 ADB 采集日志。"
+    "debugReportFailed": "生成或分享失败，请重试或连接 ADB 采集日志。",
+    "sessionProxyPending": "系统代理尚未恢复，关机后可能无法联网。请取消关机后在 Polaris 中重试退出。",
+    "sessionCancelled": "关机已取消，代理已停止。需要时可重新连接。",
+    "sessionCancelFailed": "关机已取消，但代理停止尚未确认。请在 Polaris 中重试停止代理。"
   }
 }

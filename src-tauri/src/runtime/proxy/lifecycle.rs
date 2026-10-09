@@ -500,8 +500,7 @@ impl ProxyRuntime {
             self.mesh
                 .assert_tailscale_main_claims_drained(&state_gate)?;
         }
-        self.clear_system_proxy().await;
-        Ok(())
+        self.restore_system_proxy_for_exit().await
     }
 
     /// 启动 sing-box（上游 `proxy:start`）。
@@ -586,7 +585,7 @@ impl ProxyRuntime {
     ) -> StartLeg {
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
-                Ok(closing) if *closing => {
+                Ok(closing) if *closing || self.system_proxy.session_query_active() => {
                     return StartLeg::Finished(
                         Err(StartError::from("proxy is shutting down".to_owned())),
                         None,
@@ -674,7 +673,7 @@ impl ProxyRuntime {
                             )
                         }
                     };
-                    if *closing {
+                    if *closing || self.system_proxy.session_query_active() {
                         return StartLeg::Finished(
                             Err(StartError::from("proxy is shutting down".to_owned())),
                             None,
@@ -838,7 +837,7 @@ impl ProxyRuntime {
                     )
                 }
             };
-            if *closing {
+            if *closing || self.system_proxy.session_query_active() {
                 return StartLeg::Finished(
                     Err(StartError::from("proxy is shutting down".to_owned())),
                     None,
@@ -943,6 +942,15 @@ impl ProxyRuntime {
     /// （见该方法的换代守卫）。此时系统代理**属接管方**——清它就是把新会话刚设好的代理抹掉、
     /// 用户全网走直连。故这条收口也一并让位，由接管方自己的终态负责。
     pub async fn stop(self: &Arc<Self>) -> Result<(), String> {
+        self.stop_with_confirmation(false).await
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) async fn stop_for_session_cancel(self: &Arc<Self>) -> Result<(), String> {
+        self.stop_with_confirmation(true).await
+    }
+
+    async fn stop_with_confirmation(self: &Arc<Self>, require_commit: bool) -> Result<(), String> {
         // Stop claims before its first await, paired with explicit start's claim/reset under
         // the same short lock. A newer start can then supersede this stop without its late
         // teardown touching the new session. Pass the owned token through: no second bump.
@@ -962,11 +970,13 @@ impl ProxyRuntime {
             generation,
         )
         .await;
-        if self
+        let committed = self
             .stop_inner(StopClaim::AlreadyClaimed(generation))
-            .await?
-            .is_some()
-        {
+            .await?;
+        if require_commit && committed != Some(generation) {
+            return Err("session-cancel proxy stop was superseded; completion unconfirmed".into());
+        }
+        if committed.is_some() {
             // Stop 完成后旧核已不存在，已保存删除的保护对象随之消失：此刻就是与 Apply/冷启动同级的
             // 安全提交点。只消费后端 journal，**绝不**触碰渲染端尚未保存的 staged 条目。
             self.process_deferred_config_deletions().await;
@@ -1258,7 +1268,7 @@ impl ProxyRuntime {
     ) -> RestartLeg {
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
-                Ok(closing) if *closing => {
+                Ok(closing) if *closing || self.system_proxy.session_query_active() => {
                     return RestartLeg::Finished(
                         Err(StartError::from("proxy is shutting down".to_owned())),
                         None,
@@ -1406,7 +1416,7 @@ impl ProxyRuntime {
                 | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
                 StopClaim::Request(_) => None,
             };
-            if *closing {
+            if *closing || self.system_proxy.session_query_active() {
                 return RestartLeg::Finished(
                     Err(StartError::from("proxy is shutting down".to_owned())),
                     owned,
@@ -1632,7 +1642,7 @@ impl ProxyRuntime {
             None
         } else {
             let closing = self.desktop_shutdown.lock().ok()?;
-            if *closing {
+            if *closing || self.system_proxy.session_query_active() {
                 return None;
             }
             Some(closing)

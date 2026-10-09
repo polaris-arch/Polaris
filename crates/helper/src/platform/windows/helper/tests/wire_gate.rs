@@ -98,6 +98,7 @@ request_samples! {
         gateway_ipv4: "192.168.1.1".to_owned(),
     },
     FlushDns => Request::FlushDns,
+    WindowsFlushDnsNative => Request::WindowsFlushDnsNative,
     MacProxyTransaction => Request::MacProxyTransaction {
         payload_hex: "7b7d".to_owned(),
     },

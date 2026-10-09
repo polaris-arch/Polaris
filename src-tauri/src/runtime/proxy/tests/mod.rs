@@ -39,6 +39,7 @@ mod exit_ip_wiring_guard;
 mod android_probe_loan;
 mod android_takeover;
 mod core_log;
+mod exit_proxy_restore;
 mod hot_switch;
 mod lifecycle;
 mod login_fallback;
@@ -148,6 +149,23 @@ fn sweep_stale_test_dirs() {
 fn fresh_test_dir() -> TestDir {
     sweep_stale_test_dirs();
     TestDir::new(TEST_DIR_PREFIX)
+}
+
+pub(in crate::runtime::proxy) struct TestDnsFlushExec;
+
+impl polaris_system_integration::dns_flush::FlushExec for TestDnsFlushExec {
+    fn windows_flush(&self, _timeout: std::time::Duration) -> Result<(), String> {
+        Ok(())
+    }
+    fn exec(
+        &self,
+        _cmd: &polaris_system_integration::dns_flush::FlushCommand,
+        _timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        // Runtime behavior tests simulate a successful flush; command construction,
+        // rejection and failures are covered with injected execs in system-integration.
+        Ok(())
+    }
 }
 
 /// 系统代理清理收口 mock：只**记录调用次数**，不触碰宿主系统代理（本机硬约束：绝不真跑

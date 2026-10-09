@@ -119,6 +119,9 @@
     "debugReportBusy": "Preparing report…",
     "debugReportHint": "Includes device details, recent logs, and redacted configuration. Review before sharing.",
     "debugReportDone": "Share sheet opened. Choose a recipient.",
-    "debugReportFailed": "Could not prepare or share the report. Retry or collect logs via ADB."
+    "debugReportFailed": "Could not prepare or share the report. Retry or collect logs via ADB.",
+    "sessionProxyPending": "System proxy restoration is unconfirmed. Cancel shutdown and retry exiting Polaris to avoid connection problems.",
+    "sessionCancelled": "Shutdown was cancelled. The proxy has stopped; you can reconnect when needed.",
+    "sessionCancelFailed": "Shutdown was cancelled, but proxy shutdown is unconfirmed. Retry stopping the proxy in Polaris."
   }
 }

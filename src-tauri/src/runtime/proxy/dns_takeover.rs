@@ -242,7 +242,7 @@ impl ProxyRuntime {
     /// 会话期假 IP 停核后仍命中 → 直连撞墙，反向同理）。
     ///
     /// **真机门**：真刷宿主 DNS 缓存**触碰宿主**（本机 Linux 会真跑 `resolvectl`）——故仅在**真跑 app** 时发生，
-    /// 单测/gate 不触发（本方法只被 start/stop 生命周期调，不被测试直调）。
+    /// 单测也会走 start/stop；测试执行器只记录语义结果，绝不执行宿主命令。
     pub(super) fn flush_os_dns_cache_best_effort(self: &Arc<Self>, context: &'static str) {
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -254,7 +254,16 @@ impl ProxyRuntime {
             // 取 token 在位这条**零副作用**的判据而非 `status().ready`，理由见
             // [`HelperRuntime::client_token_present`]。
             let helper_ready = this.helper.client_token_present();
+            #[cfg(not(test))]
             let flushed = polaris_system_integration::production_flush_os_dns_cache(
+                Some(&helper_flush),
+                helper_ready,
+                &mut |m| log::info!("[dns-flush:{context}] {m}"),
+            );
+            #[cfg(test)]
+            let flushed = polaris_system_integration::dns_flush::flush_os_dns_cache(
+                Platform::current(),
+                &super::tests::TestDnsFlushExec,
                 Some(&helper_flush),
                 helper_ready,
                 &mut |m| log::info!("[dns-flush:{context}] {m}"),

@@ -215,6 +215,21 @@ fn exit_requested_preserves_c16_then_vetoes_unprepared_exit_without_business_shu
 }
 
 #[test]
+fn final_platform_exit_fences_dns_before_drain_but_normal_quit_keeps_its_flush() {
+    let source = crate_code("exit_lifecycle.rs");
+    let final_exit = top_level_fn_body(&source, "pub(crate) fn final_exit_best_effort(");
+    let committed = final_exit.find("if exit_is_committed(app)").unwrap();
+    let early_return = final_exit[committed..].find("return;").unwrap() + committed;
+    let fence = final_exit
+        .find("windows_session::begin_final_exit()")
+        .unwrap();
+    let drain = final_exit.find("prepare_desktop_exit(app)").unwrap();
+    assert!(committed < early_return && early_return < fence && fence < drain);
+    let prepare = top_level_fn_body(&source, "pub(crate) async fn prepare_desktop_exit(");
+    assert!(!prepare.contains("begin_final_exit"));
+}
+
+#[test]
 fn only_ready_commit_owns_irreversible_shutdown_marker_and_restart_request() {
     let source = crate_code("exit_lifecycle.rs");
     let prepare = top_level_fn_body(&source, "pub(crate) async fn prepare_desktop_exit(");

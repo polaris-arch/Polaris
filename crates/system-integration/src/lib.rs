@@ -52,6 +52,10 @@ pub mod route_ops;
 pub mod route_probe;
 #[cfg(test)]
 mod test_support;
+#[cfg(any(windows, test))]
+pub mod windows_dns;
+#[cfg(windows)]
+pub mod windows_session;
 
 pub use exec::{Command, CommandOutput, CommandRunner, StdCommandRunner};
 pub use proxy::{StdMarkerFs, SystemProxyStatus};
@@ -181,7 +185,7 @@ pub fn production_flush_os_dns_cache(
 ) -> bool {
     dns_flush::flush_os_dns_cache(
         polaris_helper_proto::Platform::current(),
-        &StdCommandRunner,
+        &dns_flush::ProductionFlushExec,
         helper_flush,
         helper_ready,
         on_warn,

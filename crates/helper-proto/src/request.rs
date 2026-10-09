@@ -239,6 +239,8 @@ pub enum Request {
     DefaultRestore { gateway_ipv4: String },
     /// `flush-dns`（mac proto v9，无参数行）。
     FlushDns,
+    /// Windows native DNS cache API; separate capability excludes old subprocess helpers.
+    WindowsFlushDnsNative,
     /// macOS：`system-proxy-transaction <hex-json>`。兼容 proto v1 的能力扩展；旧 helper
     /// 返回 `ERR unknown`，客户端可在零系统修改时安全回落既有 networksetup 路径。
     MacProxyTransaction { payload_hex: String },
@@ -280,6 +282,7 @@ impl Request {
             Self::LinuxDnsRevert { .. } => command::linux::RESOLVED_DNS_REVERT,
             Self::DefaultRestore { .. } => command::mac::DEFAULT_RESTORE,
             Self::FlushDns => command::mac::FLUSH_DNS,
+            Self::WindowsFlushDnsNative => command::win::FLUSH_DNS_NATIVE,
             Self::MacProxyTransaction { .. } => command::mac::SYSTEM_PROXY_TRANSACTION,
             Self::MacProxyCompareTransaction { .. } => {
                 command::mac::SYSTEM_PROXY_COMPARE_TRANSACTION
@@ -303,6 +306,7 @@ impl Request {
             | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
+            | Self::WindowsFlushDnsNative
             | Self::MacProxyCompareCapability
             | Self::Uninstall => {
                 // 无参数行

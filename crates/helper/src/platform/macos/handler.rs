@@ -431,6 +431,7 @@ pub fn dispatch_from_peer(
         | Request::LinuxDnsSet(_)
         | Request::LinuxDnsRevert { .. }
         | Request::IfaceMetric { .. }
+        | Request::WindowsFlushDnsNative
         | Request::Uninstall => Response::Err(ProtoError::new(ErrorCode::Unknown)),
         // FreePort 已在上方早返回；此处不可达（穷尽性兜底）
         Request::FreePort { .. } => unreachable!("freeport handled above"),
