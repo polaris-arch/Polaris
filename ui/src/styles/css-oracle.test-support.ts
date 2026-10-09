@@ -1312,7 +1312,12 @@ export interface SampledPoint {
   bodyAttrs: Record<string, string>;
 }
 
+let coldMeasureReported = false;
+
 async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Measured> {
+  const reportCold = !coldMeasureReported;
+  coldMeasureReported = true;
+  const began = performance.now();
   if ((input.ctx === undefined) === (input.css === undefined))
     throw new Error('裁判必须显式给 `ctx`（desktop/mobile/tray/popup）**或** `css`（内存链），二选一。');
   if (asks.length === 0) throw new Error('一条都没问 —— 空判据。');
@@ -1323,8 +1328,9 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     input.css !== undefined
       ? input.css.map((css, i) => ({ file: `<memory>#${i}`, css }))
       : await cssChain(input.ctx);
-
+  const cssReady = performance.now();
   const c = await conn();
+  const connected = performance.now();
   const vp = {
     width: input.viewport?.width ?? DEFAULT_VIEWPORT.width,
     height: input.viewport?.height ?? DEFAULT_VIEWPORT.height,
@@ -1386,6 +1392,7 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   })()`;
   const html = buildDocument(input, chain);
   const { targetId } = (await c.send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
+  const targetReady = performance.now();
   let raw: RawResult;
   try {
     const { sessionId } = (await c.send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
@@ -1411,7 +1418,15 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     raw = JSON.parse(String(evaluated.result?.value)) as RawResult;
   } finally {
     // This request alone owns the page. Browser shutdown still drains every in-flight measure.
+    const closeBegan = performance.now();
     const closed = await c.send('Target.closeTarget', { targetId });
+    if (reportCold) console.log('[css-oracle] cold measure stages (ms):', {
+      css: Math.round(cssReady - began),
+      connection: Math.round(connected - cssReady),
+      target: Math.round(targetReady - connected),
+      measurement: Math.round(closeBegan - targetReady),
+      close: Math.round(performance.now() - closeBegan),
+    });
     if (closed.success !== true) throw new Error('CSS 裁判没有关闭本次度量的页面。');
   }
 

@@ -107,7 +107,9 @@ jobs:
           node scripts/gen-third-party-licenses.mjs --check
 
       - name: Test
-        run: pnpm exec vitest run --exclude 'src/lib/prototype-confirm-parity.test.ts'
+        # Each worker can cold-compile CSS and launch Chromium. Bound that
+        # concurrency so fixture startup stays within its existing 30s budget.
+        run: pnpm exec vitest run --maxWorkers=2 --exclude 'src/lib/prototype-confirm-parity.test.ts'
 
       - name: Browser form round trip (mock IPC, no app or core)
         run: |
