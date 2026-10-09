@@ -47,10 +47,10 @@
 
 | Платформа | Файл |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`; портативная сборка — `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
-| Android | `*-android-arm64.apk` (только arm64) |
+| macOS | `Polaris_1.0.0_aarch64-mac.dmg` / `Polaris_1.0.0_x64-mac.dmg` |
+| Windows | `Polaris_1.0.0_x64-win-setup.exe`; портативная сборка — `Polaris_1.0.0_x64-win-Portable.zip` |
+| Linux | `Polaris_1.0.0_amd64-linux.deb` / `Polaris_1.0.0_amd64-linux.AppImage` |
+| Android | `Polaris_1.0.0_arm64-v8a-android.apk` / `Polaris_1.0.0_armeabi-v7a-android.apk` / `Polaris_1.0.0_universal-android.apk` (universal: только ARMv8/ARMv7) |
 
 Пакеты не подписываются платным сертификатом подписи кода, поэтому при первом запуске на каждой платформе требуется ручное разрешение.
 

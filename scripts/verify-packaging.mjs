@@ -34,18 +34,19 @@
  *     Windows 契约尤其脆，且**按形态分成两条互不相交的规则**：
  *       - installed → `.exe` 且名含 `win`。Tauri NSIS 默认名 `Polaris_<ver>_x64-setup.exe`
  *         **不含 win** ⇒ 不改名的话 Windows 用户永远收不到更新且静默。
- *       - loose（便携）→ `polaris-portable-*.zip`。便携产物是 zip，结构性进不了上面那条 `.exe`
+ *       - loose（便携）→ `Polaris_<版本>_x64-win-Portable.zip`。便携产物是 zip，结构性进不了上面那条 `.exe`
  *         过滤；此前两个形态共用同一候选集 ⇒ 便携用户恒被发 NSIS 安装器（#72 形态错配本体，
  *         2026-07-22 修）。故这里两条规则各自断言，只镜像一半就等于没守住便携形态。
- *     `--label release` 是**聚合口径**（四 job 产物汇进同一 release 后跑）：断言两个架构的 dmg
+ *     `--label release` 是**桌面聚合口径**（四 job 产物汇进同一 release 后跑）：断言两个架构的 dmg
  *     各恰一个 + win setup 恰一个 + 便携 zip 恰一个 + linux 双形态各恰一个（6 个平台交付物，
  *     聚合 release 另含 SHA256SUMS），
  *     且便携候选与安装态候选不相交。per-job 口径断言「不得出现另一架构」，
  *     聚合侧两架构本就都在，故必须分开，不能复用。
+ *     `--label release-all` 在最终发布聚合时再要求三种 Android APK，完整九件资产与 SHA256SUMS 恰等。
  *
  *     assets 模式除命名外还有**两道内容门**（射程都只覆盖 updater 会真正命中的那些资产）：
  *       - **体积门（U2）**：`> MAX_UPDATE_ASSET_BYTES` 即红。见该常量文档；
- *       - **摘要门（U3）**：`--label release` 下 `SHA256SUMS` 缺失、格式坏、覆盖面对不上或
+ *       - **摘要门（U3）**：`--label release` / `release-all` 下 `SHA256SUMS` 缺失、格式坏、覆盖面对不上或
  *         逐条摘要不符即红。见 [`checkSha256Sums`]。
  *     `--names-only` 供**发布后**那一遍用：那时喂进来的是按真实资产名造的**同名空文件**
  *     （不回下 ~600 MB 真产物），体积与摘要在其上不可判定，故显式跳过并在输出里如实标注 ——
@@ -70,6 +71,7 @@ import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 
@@ -1126,6 +1128,7 @@ function checkLinuxAppImagePostprocess(workflow) {
  *  - 两条 `--label release` 调用必须都在（少一条 = 有一遍没跑，或者判据认不出它了 ⇒ 红）；
  *  - 上传前那条（`--dir …/dist-release`）**不得**带 `--names-only`；
  *  - 发布后那条（`--dir "$outdir"`，喂的是同名空文件）**必须**带；
+ *  - 两条 `--label release-all` 调用都读 `dist-release` 真产物，**不得**带 `--names-only`；
  *  - 全 workflow 里带 `--names-only` 的调用**恰好一条** —— 防它蔓延到 per-job 三条腿。
  *
  * 认不出（重命名了 `$outdir`、改了目录形态）一律判红：判据取不到时装作通过，等于把这条纪律删掉。
@@ -1141,7 +1144,7 @@ function checkNamesOnlyDiscipline(workflow) {
     .split('\n')
     .map(stripYamlComment)
     .filter((l) => l.includes('verify-packaging.mjs') && l.includes('assets --label'));
-  const release = calls.filter((l) => l.includes('--label release'));
+  const release = calls.filter((l) => /--label release(?:\s|$)/.test(l));
   if (release.length !== 2) {
     fail(
       `.github/workflows/package.yml: 应恰有 2 条 \`assets --label release\` 调用（上传前全口径 + 发布后仅命名），` +
@@ -1171,6 +1174,13 @@ function checkNamesOnlyDiscipline(workflow) {
     fail(
       `.github/workflows/package.yml: 发布后那条 release 口径缺 \`--names-only\` —— ` +
         `那一遍喂的是同名空文件，会拿 0 字节去比摘要，得到一片与真实状态无关的恒红。`
+    );
+  }
+  const complete = calls.filter((l) => /--label release-all(?:\s|$)/.test(l));
+  if (complete.length !== 2 || complete.some((l) => !/--dir dist-release(?:\s|$)/.test(l) || l.includes('--names-only'))) {
+    fail(
+      '.github/workflows/package.yml: 两条 release-all 完整发布检查必须读 dist-release 真产物，' +
+        '且不得带 --names-only（生成最终清单后一次、公开前再一次）。'
     );
   }
   const withFlag = calls.filter((l) => l.includes('--names-only'));
@@ -2093,24 +2103,24 @@ function checkLinuxAppImageRuntime(rootDir) {
  * 与 `crates/updater/src/github.rs::find_suitable_update_asset` 同口径（**大小写敏感**）。
  *
  * Windows 侧那个函数按形态分两条**互不相交**的规则，故这里也是两个函数，别只镜像一半：
- *  - [`updaterWindowsCandidates`] ← installed 形态（`.exe` 且名含 `win`）；
- *  - [`updaterPortableCandidates`] ← loose 形态（`polaris-portable-` 前缀 + `.zip`）。
+ *  - [`updaterWindowsCandidates`] ← installed 形态（`Polaris_版本_x64-win-setup.exe`）；
+ *  - [`updaterPortableCandidates`] ← loose 形态（`Polaris_` 前缀 + `_x64-win-Portable.zip` 后缀）。
  *
  * 只镜像 installed 那条正是本轮修掉的缺陷得以长期存活的原因之一：便携形态在 release 里
  * 有没有可选的产物，此前**没有任何断言按 updater 的口径**去问。
  */
 function updaterWindowsCandidates(names) {
-  return names.filter((n) => n.endsWith('.exe') && n.includes('win'));
+  return names.filter((n) => assetMatches(n, 'x64-win-setup.exe'));
 }
-/** loose（便携）形态的候选集 = `github.rs` 的 `PORTABLE_ZIP_PREFIX` + `.zip`，逐字同口径。 */
+/** loose（便携）形态的候选集 = `github.rs` 的 `PORTABLE_ZIP_SUFFIX`，逐字同口径。 */
 function updaterPortableCandidates(names) {
-  return names.filter((n) => n.startsWith('polaris-portable-') && n.endsWith('.zip'));
+  return names.filter((n) => assetMatches(n, 'x64-win-Portable.zip'));
 }
 function updaterMacCandidates(names, archTag) {
-  return names.filter((n) => n.includes(archTag) && n.endsWith('.dmg'));
+  return names.filter((n) => assetMatches(n, archTag === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'));
 }
 /**
- * Linux 两形态的候选集 = `github.rs` 的 Linux 分支（`app_image.first()` / `deb.first()`），逐字同口径。
+ * Linux 两形态的候选集与 `github.rs` 同口径：规范命名的 amd64 deb / AppImage。
  *
  * 抽成函数而不是内联过滤：内联过的地方有**四处**（per-job 体积门、release 体积门、release 命名断言、
  * per-job `linux` 命名分支的 deb / AppImage 两条），与 mac/win 靠共享函数自动跟随选包规则不同，
@@ -2118,7 +2128,7 @@ function updaterMacCandidates(names, archTag) {
  * @param {string[]} names @param {'.deb'|'.AppImage'} [ext] 只要某一形态时传，缺省两形态都算
  */
 function updaterLinuxCandidates(names, ext) {
-  return names.filter((n) => (ext ? n.endsWith(ext) : n.endsWith('.deb') || n.endsWith('.AppImage')));
+  return names.filter((n) => (ext ? assetMatches(n, `amd64-linux${ext}`) : assetMatches(n, 'amd64-linux.deb') || assetMatches(n, 'amd64-linux.AppImage')));
 }
 
 // ───────────── U2：updater 目标资产的体积门 ─────────────
@@ -2143,7 +2153,7 @@ function updaterLinuxCandidates(names, ext) {
  * | `*-mac-arm64.dmg` | 54,232,313（12 份留存里的最大值） | 51.72 | 本地 `/tmp/polaris-mac*` CI 产物 |
  * | `*-mac-x64.dmg`   | 51,102,510 | 48.73 | run 30990315709（记录在 vault `~/docs/polaris/design/polaris-windows-packaging-first-green-2026-08-05.md`，**不在本仓**） |
  * | `*-win-setup.exe` | 39,015,611 | 37.21 | run 31659532293 |
- * | `polaris-portable-*.zip` | 53,347,731 | 50.88 | run 31659532293 |
+ * | `Polaris_<版本>_x64-win-Portable.zip` | 53,347,731 | 50.88 | run 31659532293 |
  * | `*_amd64.deb`     | —（字节未记录） | 53.42 | run 32109475236 |
  *
  * 取 **200 MiB ≈ 实测最大值（122.58 MiB，linux AppImage）的 1.63 倍**：
@@ -2205,7 +2215,7 @@ const MEASURED_MAX_UPDATE_ASSET_BYTES = 128_530_936;
  *   （此前打在仓库根，本 job 量不到它，只有 tag 时的聚合口径量得到 —— 超限要等四条腿的构建
  *   成本全付完才发现）。射程里有它就必须有人保证它在场，故 windows 分支同时断言它恰有一个，
  *   否则体积门会变成一条恒为空的断言。
- * - `linux` 腿两形态都算：per-job 口径只断言「各至少一个」，故这里也不假设恰好一个。
+ * - `linux` 腿两形态都算：per-job 与聚合口径都要求各恰好一个。
  */
 function updaterTargetNames(label, names) {
   switch (label) {
@@ -2217,7 +2227,9 @@ function updaterTargetNames(label, names) {
     case 'linux':
       return updaterLinuxCandidates(names);
     case 'release':
+    case 'release-all':
       return [
+        ...(label === 'release-all' ? names.filter((n) => ['arm64-v8a', 'armeabi-v7a', 'universal'].some((abi) => assetMatches(n, `${abi}-android.apk`))) : []),
         ...updaterMacCandidates(names, 'mac-arm64'),
         ...updaterMacCandidates(names, 'mac-x64'),
         ...updaterWindowsCandidates(names),
@@ -2368,6 +2380,15 @@ function checkAssets(label, dir, namesOnly = false) {
   const paths = walk2(abs);
   const names = paths.map((p) => basename(p));
   const pathOf = (n) => paths.find((p) => basename(p) === n);
+  // Pin version, spelling and inventory together; old-name copies and unregistered assets fail closed.
+  const version = JSON.parse(readFileSync(join(SRC_TAURI, 'tauri.conf.json'), 'utf8')).version;
+  const expected = assetNames(version, label);
+  const published = label.startsWith('release') ? names.filter((name) => name !== SHA256SUMS_NAME)
+    : names.filter((name) => /\.(?:exe|zip|dmg|deb|AppImage|apk)$/.test(name));
+  const missing = expected.filter((name) => !published.includes(name));
+  const extra = published.filter((name) => !expected.includes(name));
+  if (missing.length || extra.length) fail(`正式资产命名/集合不符：missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`);
+
   if (names.length === 0) {
     fail(`assets 模式：${abs} 下没有任何文件`);
     return;
@@ -2394,7 +2415,7 @@ function checkAssets(label, dir, namesOnly = false) {
     );
     return;
   }
-  if (label === 'release') {
+  if (label === 'release' || label === 'release-all') {
     const dupeAssets = dupesOf(names);
     if (dupeAssets.length > 0) {
       fail(
@@ -2409,7 +2430,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const cands = updaterWindowsCandidates(names);
     if (cands.length !== 1) {
       fail(
-        `Windows updater 契约：应恰有 1 个「.exe 且名含 win」的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+        `Windows updater 契约：应恰有 1 个「Polaris_版本_x64-win-setup.exe」的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
           `  0 个 ⇒ find_suitable_update_asset 恒返回 None，用户永远收不到更新且静默；\n` +
           `  >1 个 ⇒ 选哪个取决于 release 资产顺序，不确定。\n` +
           `  全部产物：${JSON.stringify(names)}`
@@ -2427,7 +2448,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const portable = updaterPortableCandidates(names);
     if (portable.length !== 1) {
       fail(
-        `Windows updater 契约：dist-win/ 下 \`polaris-portable-*.zip\`（loose 形态唯一候选）应恰有 1 个，` +
+        `Windows updater 契约：dist-win/ 下 \`Polaris_<版本>_x64-win-Portable.zip\`（loose 形态唯一候选）应恰有 1 个，` +
           `实为 ${portable.length} 个 ${JSON.stringify(portable)}。\n` +
           `  0 个 ⇒ 便携产物没进本 job 的资产目录（多半是被打回仓库根）⇒ 本腿的体积门空转；\n` +
           `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。\n` +
@@ -2440,7 +2461,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const cands = updaterMacCandidates(names, mine);
     if (cands.length !== 1) {
       fail(
-        `macOS updater 契约：应恰有 1 个名含 '${mine}' 的 .dmg，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+        `macOS updater 契约：应恰有 1 个 '${mine === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'}' 后缀的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
           `  0 个 ⇒ find_suitable_update_asset 对该架构恒返回 None，该架构用户永远收不到更新且静默\n` +
           `        （2026-07-21 起已取消「任意 .dmg」回落：宁可不更新，也不发错架构包）。\n` +
           `  >1 个 ⇒ 选哪个取决于 release 资产顺序，不确定。\n` +
@@ -2449,10 +2470,10 @@ function checkAssets(label, dir, namesOnly = false) {
     }
     const wrong = updaterMacCandidates(names, other);
     if (wrong.length !== 0) {
-      fail(`macOS updater 契约：本 job 不应产出名含 '${other}' 的 dmg，实为 ${JSON.stringify(wrong)}`);
+      fail(`macOS updater 契约：本 job 不应产出另一架构 '${other}' 的 dmg，实为 ${JSON.stringify(wrong)}`);
     }
     if (cands.length === 1 && wrong.length === 0) note(`assets：${label} → updater 唯一命中 '${cands[0]}'`);
-  } else if (label === 'release') {
+  } else if (label === 'release' || label === 'release-all') {
     // 本分支自己的错误计数起点：末尾那句 note 只能在**本分支**没报错时打。
     // 读模块全局 `errors.length === 0` 今天碰巧对（release 是最后一项），
     // 一旦有别的检查排在它前面就静默失效。
@@ -2465,7 +2486,7 @@ function checkAssets(label, dir, namesOnly = false) {
       const cands = updaterMacCandidates(names, archTag);
       if (cands.length !== 1) {
         fail(
-          `release 契约：名含 '${archTag}' 的 .dmg 应恰有 1 个，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+          `release 契约：'${archTag === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'}' 后缀的产物应恰有 1 个，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
             `  0 个 ⇒ 该架构用户 find_suitable_update_asset 恒 None，永远收不到更新且静默；\n` +
             `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。`
         );
@@ -2474,7 +2495,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const win = updaterWindowsCandidates(names);
     if (win.length !== 1) {
       fail(
-        `release 契约：「.exe 且名含 win」应恰有 1 个，实为 ${win.length} 个 ${JSON.stringify(win)}。\n` +
+        `release 契约：「Polaris_版本_x64-win-setup.exe」应恰有 1 个，实为 ${win.length} 个 ${JSON.stringify(win)}。\n` +
           `  0 个 ⇒ Windows 安装态选不到更新；>1 个 ⇒ updater 取首个命中，选谁取决于资产顺序。`
       );
     } else if (!win[0].includes('setup')) {
@@ -2511,7 +2532,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const portable = updaterPortableCandidates(names);
     if (portable.length !== 1) {
       fail(
-        `release 契约：\`polaris-portable-*.zip\`（免安装绿色版 = updater loose 形态的唯一候选）应恰有 1 个，` +
+        `release 契约：\`Polaris_<版本>_x64-win-Portable.zip\`（免安装绿色版 = updater loose 形态的唯一候选）应恰有 1 个，` +
           `实为 ${portable.length} 个 ${JSON.stringify(portable)}。\n` +
           `  0 个 ⇒ 便携用户恒收不到更新（github.rs 的 Windows loose 分支无回落，返回 None）；\n` +
           `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。`
@@ -2556,7 +2577,7 @@ function checkAssets(label, dir, namesOnly = false) {
   // 摘要门只挂**聚合口径**：`SHA256SUMS` 是四个 job 的产物汇进 dist-release 之后才生成的
   // （一个 release 一份，按资产名索引），per-job 目录里结构性不存在它 —— 在那儿断言它必然恒红。
   // `--names-only` 下仍验它**在场**（那一层用空文件也判得了），只跳过内容比对。
-  if (label === 'release') checkSha256Sums(names, pathOf, namesOnly);
+  if (label === 'release' || label === 'release-all') checkSha256Sums(names, pathOf, namesOnly);
 }
 
 /**

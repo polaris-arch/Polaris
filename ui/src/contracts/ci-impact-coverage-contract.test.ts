@@ -345,6 +345,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'scripts/gate-android-release-behavior.sh',
       'scripts/gate-node-test.sh',
       'scripts/postprocess-appimage.mjs',
+      'scripts/release-assets.mjs',
       'scripts/verify-apk.mjs',
       'scripts/verify-packaging.mjs',
       'scripts/verify-wry-keep-rules.mjs',

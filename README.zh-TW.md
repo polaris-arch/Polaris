@@ -47,10 +47,10 @@
 
 | 平台 | 檔案 |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`；免安裝版用 `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
-| Android | `*-android-arm64.apk`（僅 arm64） |
+| macOS | `Polaris_1.0.0_aarch64-mac.dmg` / `Polaris_1.0.0_x64-mac.dmg` |
+| Windows | `Polaris_1.0.0_x64-win-setup.exe`；免安裝版用 `Polaris_1.0.0_x64-win-Portable.zip` |
+| Linux | `Polaris_1.0.0_amd64-linux.deb` / `Polaris_1.0.0_amd64-linux.AppImage` |
+| Android | `Polaris_1.0.0_arm64-v8a-android.apk` / `Polaris_1.0.0_armeabi-v7a-android.apk` / `Polaris_1.0.0_universal-android.apk`（universal 僅含 ARMv8/ARMv7） |
 
 安裝檔目前不做付費程式碼簽章，首次啟動需依平台放行。
 

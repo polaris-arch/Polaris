@@ -40,6 +40,7 @@ required_tests=(
   # Desktop source graph predicates may not disappear from the host fixture gate.
   scripts/build-desktop-core.test.mjs
   scripts/desktop-core-ci-wiring.test.mjs
+  scripts/release-assets.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -101,7 +102,8 @@ fi
 #   231 → 241（2026-10-08）按实测通过数重定（242 条：241 过，1 条为上面那条显式 opt-in 的跳过）。
 #           本次发布策略加 1 条（归属链输入按名字拒）、desktop source graph 删 1 条（非 Linux 的
 #           nftables 缺席例外已不存在）。
-if [ "$pass" -lt 241 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 241）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+#   241 → 249（PKG-01）8 条发布命名/ABI闭合/固定已验签摘要与完整清单变异合同。
+if [ "$pass" -lt 249 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 249）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

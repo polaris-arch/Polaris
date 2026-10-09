@@ -477,12 +477,12 @@ describe('消费面守卫 —— 确认框不得在组件里裸用', () => {
  * ──────────────────────────────────────────────────────────────────────────── */
 
 describe('isPortableZipUpdate —— 便携 zip ⇔ 真形态错配的分流判据', () => {
-  it('产出侧口径的便携包判真（前缀 polaris-portable- + .zip）', () => {
-    expect(isPortableZipUpdate('C:\\Users\\me\\AppData\\Local\\polaris\\updates\\polaris-portable-1.2.3.zip')).toBe(true);
+  it('产出侧口径的便携包判真（Polaris_版本_x64-win-Portable.zip）', () => {
+    expect(isPortableZipUpdate('C:\\Users\\me\\AppData\\Local\\polaris\\updates\\Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
     // 纯 POSIX 分隔符也要切（开发机/测试注入的路径）。
-    expect(isPortableZipUpdate('/home/me/.cache/polaris/updates/polaris-portable-1.2.3.zip')).toBe(true);
+    expect(isPortableZipUpdate('/home/me/.cache/polaris/updates/Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
     // 裸文件名（无目录段）——`split().pop()` 分支。
-    expect(isPortableZipUpdate('polaris-portable-1.2.3.zip')).toBe(true);
+    expect(isPortableZipUpdate('Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
   });
 
   it('其余四种安装件一律判假（它们走 classify_installer，根本到不了本分流）', () => {
@@ -495,7 +495,8 @@ describe('isPortableZipUpdate —— 便携 zip ⇔ 真形态错配的分流判�
 
   it('别的 zip 判假 —— 判据是前缀+后缀，不是「凡 zip 皆便携」', () => {
     // 只看 `.zip` 会把这些也说成便携版，然后对用户描述一个不成立的场景。
-    expect(isPortableZipUpdate('/c/updates/polaris-portable.zip')).toBe(false); // 缺尾部连字符 → 不是产出侧命名
+    expect(isPortableZipUpdate('/c/updates/polaris-portable-1.2.3.zip')).toBe(false);
+    expect(isPortableZipUpdate('/c/updates/Polaris_1.2.3_x64-win-portable.zip')).toBe(false); // 缺尾部连字符 → 不是产出侧命名
     expect(isPortableZipUpdate('/c/updates/sing-box-1.9.0-windows-amd64.zip')).toBe(false);
     expect(isPortableZipUpdate('/c/updates/geosite.zip')).toBe(false);
     // 前缀对但后缀不对（将来若出别的便携产物形态，也不该套用「解压覆盖」这套说明）。

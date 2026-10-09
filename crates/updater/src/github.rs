@@ -34,34 +34,35 @@ pub const APP_UPDATE_REPO: (&str, &str) = ("polaris-arch", "Polaris");
 /// 内核（sing-box）更新源仓库 `(owner, repo)`（= 上游 `core-downloader.ts` 的 `SagerNet/sing-box`）。
 pub const CORE_UPDATE_REPO: (&str, &str) = ("SagerNet", "sing-box");
 
-/// Windows 便携版 release 资产的文件名前缀（完整形态 `polaris-portable-<label>.zip`）。
-///
-/// **跨文件命名契约的单点定义**，三处必须一致，改一处就要改全部：
-///  1. 产出侧 `.github/workflows/package.yml` 的 `Build Windows portable zip` 步；
-///  2. 选包侧 [`find_suitable_update_asset`] 的 Windows loose 分支（本模块）；
-///  3. 断言侧 `scripts/verify-packaging.mjs` 的 `updaterPortableCandidates`。
-///
-/// 大小写敏感：`package.yml` 产的是字面小写名，三侧同口径才守得住真正会被选中的那个资产。
-pub const PORTABLE_ZIP_PREFIX: &str = "polaris-portable-";
+/// Public release asset suffixes; producers and packaging gates use the same contract.
+pub const PORTABLE_ZIP_SUFFIX: &str = "x64-win-Portable.zip";
+pub const ANDROID_APK_SUFFIX: &str = "arm64-v8a-android.apk";
+pub const ANDROID_ARMV7_APK_SUFFIX: &str = "armeabi-v7a-android.apk";
+pub const ANDROID_UNIVERSAL_APK_SUFFIX: &str = "universal-android.apk";
 
-/// Android release APK 资产名的**尾缀契约**（完整形态 `polaris-<版本>-android-arm64.apk`）。
-///
-/// **跨文件命名契约的单点定义**，两处必须一致，改一处就要改另一处：
-///  1. 产出侧 `.github/workflows/android.yml` 的 `release-apk` job（它把 gradle 出的
-///     `app-arm64-release.apk` 改名成这个形态再作为 release 资产上传）；
-///  2. 选包侧 [`find_suitable_update_asset`] 的 Android 分支（本模块）。
-///
-/// 两侧由 `tests::the_ci_asset_name_is_exactly_what_the_selector_picks` 逐字对拍（写成纯代码体
-/// 而**不是** intra-doc 链接：那个模块挂 `#[cfg(test)]`，rustdoc 不编译它 ⇒ 链接解析不到，
-/// 而 ci.yml 的 doc 门带 `-D rustdoc::broken-intra-doc-links`，写成链接会让整条 doc 门红）：
-/// 那条测试从 workflow 原文里把资产名表达式取出来，展开成一个真实文件名，喂进本函数 ——
-/// 命名契约漂一个字符，选包器就选不中，而**故障形态是「Android 上永远查不到更新」**
-/// （`AppUpdateCheck::NoUpdate`，一句话都不说），正是本仓反复在抓的那种静默。
-///
-/// 为什么**只有 arm64**：`.github/workflows/android.yml` 只交叉编译 `aarch64-linux-android`
-/// 一个 target（`assembleArm64*`）。x86_64 是模拟器形态，不发资产 —— 故本模块对
-/// 非 [`AssetArch::Arm64`] 的 Android 恒返 `None`，而不是回落到一个不存在的包。
-pub const ANDROID_APK_SUFFIX: &str = "-android-arm64.apk";
+fn release_asset_matches(name: &str, suffix: &str) -> bool {
+    let Some(version) = name
+        .strip_prefix("Polaris_")
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .and_then(|rest| rest.strip_suffix('_'))
+    else {
+        return false;
+    };
+    let (core, prerelease) = version
+        .split_once('-')
+        .map_or((version, None), |(core, pre)| (core, Some(pre)));
+    let parts: Vec<_> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && prerelease.is_none_or(|pre| {
+            !pre.is_empty()
+                && pre
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        })
+}
 
 /// 构造 GitHub releases API URL（= 上游 `https://api.github.com/repos/${owner}/${repo}/releases`）。
 #[must_use]
@@ -80,18 +81,19 @@ pub enum AssetPlatform {
     /// Android（上游没有这一态：上游 是桌面 Electron 应用）。
     ///
     /// 它与三个桌面态有两处**结构性**差别，两处都在本模块里落成了分支，别按对称性「顺手统一」：
-    ///  · **只有 arm64 有资产**（见 [`ANDROID_APK_SUFFIX`]）：x86_64 是模拟器形态，不发包；
+    ///  · **只发布 ARMv8 / ARMv7**；x86 / x86_64 不发包，也不进入 universal；
     ///  · **没有可换的内核**：核是随 APK 打进去的进程内 `libbox.aar`，故
     ///    [`find_suitable_singbox_asset`] 在这一态上恒 `None`（那条腿真正的闸在
     ///    `commands/updater/core_update.rs` 的 Android 早退，本模块这一格是第二道）。
     Android,
 }
 
-/// 目标架构（对齐 上游 `process.arch` 关心的 `x64`/`arm64`；其余归 [`Other`](AssetArch::Other)）。
+/// 目标架构（`x64` / `arm64` / `armv7`；其余归 [`Other`](AssetArch::Other)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetArch {
     X64,
     Arm64,
+    Armv7,
     Other,
 }
 
@@ -111,12 +113,13 @@ impl AssetPlatform {
 }
 
 impl AssetArch {
-    /// 从 `std::env::consts::ARCH` 映射（`x86_64` → X64、`aarch64` → Arm64，其余 → Other）。
+    /// 从 `std::env::consts::ARCH` 映射（`x86_64` → X64、`aarch64` → Arm64、`arm` → Armv7，其余 → Other）。
     #[must_use]
     pub fn from_arch(arch: &str) -> Self {
         match arch {
             "x86_64" => Self::X64,
             "aarch64" => Self::Arm64,
+            "arm" => Self::Armv7,
             _ => Self::Other,
         }
     }
@@ -298,7 +301,7 @@ pub fn check_app_update(
 ///
 /// 这一档今天**真的会发生**在 Android 上：APK 资产是 2026-09-13 才开始发的
 /// （`.github/workflows/android.yml` 的 `release-apk` job），在那之前的每一个 release 都没有
-/// `*-android-arm64.apk`。所以 `update_check` 的 Android 腿在拿到 `NoUpdate` 之后会再问一次本函数：
+/// `Polaris_<version>_<ABI>-android.apk`。所以 `update_check` 的 Android 腿在拿到 `NoUpdate` 之后会再问一次本函数：
 /// 它说有 ⇒ 如实报「有新版本」，只是没有可下载的资产，用户出口退回**打开发布页**。
 ///
 /// # 产出的 [`AppUpdateInfo`] 三个资产字段是**空的，且必须如实为空**
@@ -448,58 +451,18 @@ fn app_update_info_for_release(
     })
 }
 
-// ── App 安装包资产选择（移植 update-asset.findSuitableUpdateAsset，逐字保留）──────────
+// ── App 安装包资产选择（正式发布命名合同）──────────
 
 /// 从 release 资产里挑适配 `(platform, arch, loose_form)` 的 **App 安装包**。
 ///
 /// 移植自 `update-asset.findSuitableUpdateAsset`（#72：每平台 loose/installed 双形态须按**当前运行
 /// 形态**选对应包，否则错配——便携被发 NSIS setup 会装出多余副本）：
-///  - Windows：**两条互不相交的规则**（见下）——loose→`polaris-portable-*.zip`（无则 `None`）/
-///    installed→`.exe` 且名含 `win`（setup → 非 portable → 首个）。
-///  - macOS：按架构 `mac-arm64`/`mac-x64` 的 `.dmg`；**无则 `None`，不回落任意 `.dmg`**
-///    （分架构单出后回落 = 发错架构包，见 macOS 分支注释；`.app` 恒 loose，不分形态）。
-///  - Linux：loose→`.AppImage`（无则 `.deb`）/ installed→`.deb`（无则 `.AppImage`）。
-///  - Android：**仅 arm64**，名字以 [`ANDROID_APK_SUFFIX`] 结尾的 `.apk`；其余架构与无命中一律 `None`
-///    （不回落，理由同 macOS：资产名带架构判别位，选错就是发一个装不上的包）。
+///  - Windows x64: installed setup or Portable ZIP, selected by run form.
+///  - macOS: exact x64 / aarch64 DMG; no cross-architecture fallback.
+///  - Linux amd64: prefer AppImage for loose form, deb for installed form.
+///  - Android: ARMv8 / ARMv7 native split, then ARM-only universal; other architectures return None.
 ///
-/// ## Windows 为什么按形态分成两条**独立**规则（2026-07-22 修 #72 形态错配本体）
-///
-/// 本仓 Windows 的两件交付物分属**两个不相交的命名空间**（核对于 `package.yml` 的实际产物名）：
-///
-/// | 形态 | 产物 | 谁选它 |
-/// |---|---|---|
-/// | installed | `*-win-setup.exe`（NSIS downloadBootstrapper） | `.exe` 且名含 `win` |
-/// | loose | `polaris-portable-*.zip`（`Compress-Archive` 打的免安装 zip） | `polaris-portable-` 前缀 + `.zip` |
-///
-/// 便携产物是 **zip**，结构性进不了「`.exe` 且名含 `win`」这道过滤。此前 loose 分支与 installed
-/// 分支**共用**那个候选集，于是 `find(is_portable)` 空 → `find(!is_setup)` 空 → `first()`
-/// **无条件命中 NSIS setup**：便携用户被发安装器，装出与便携副本并存的第二份程序
-/// （配置目录 / 自启项 / 内核资源各一套）—— 正是本函数头部自称要防的 #72 形态错配本体。
-///
-/// 现改为 loose 走自己的规则，且**无回落**：选不到即 `None`（= 无更新）。理由与 macOS 那条同源
-/// ——**宁可不更新，也不发错形态包**。回落到安装器不是「降级但可用」，而是制造第二份安装。
-///
-/// 两条规则的判据不相交（`.zip` vs `.exe`），故各自无歧义，`.exe && contains("win")`
-/// 这条命名契约**一字未动**。
-///
-/// ## 为什么 Windows / Linux 的 installed 侧仍保留回落（别按对称性「顺手修」）
-///
-/// macOS 取消回落跨的是**架构**：release 缺一份 dmg 时把 arm64 包发给 Intel 用户 = 装了也跑不起来。
-/// Windows / Linux 在本仓 CI matrix 里各只有**一个** target（`x86_64-pc-windows-msvc` /
-/// `x86_64-unknown-linux-gnu`），资产名里根本没有架构判别位 ⇒ 回落绝不会发错架构。
-/// 将来 Windows/Linux 真出 arm64 包时，本结论失效，须回来按 macOS 同法处理。
-///
-/// Linux 的 loose↔installed 回落**保留**：`.deb` 与 `.AppImage` 同 release 都在（`package.yml` 的
-/// assets 断言机守着两者皆存），两者都是**单文件安装件**、下游 `decide_install_plan` 认得，
-/// 回落跨形态是降级但可用，正是 #72 要保的 上游 行为。Windows 的 zip↔exe 不同：zip 不是安装件，
-/// 反向回落（安装态拿 zip）无意义，正向回落（便携拿 exe）就是缺陷本身，故两侧都不回落。
-///
-/// ## 便携更新的下游：**交系统，不自动替换**（如实登记，别读成全自动）
-///
-/// 选中的 `.zip` 走到 `runtime::update_install::classify_installer` 时**不被识别**
-/// （它只认 `.exe/.dmg/.appimage/.deb`）⇒ `InstallReject::UnknownAsset` ⇒ command 层回退
-/// `shell.open` 打开该 zip，由用户自行解压覆盖。这是**有意的诚实降级**：便携用户拿到的是
-/// 正确形态的产物，且绝不会有 NSIS 在背后装出第二份。自动解压替换需引 zip 解压依赖，未做。
+/// All names use `Polaris_<version>_<architecture>-<platform>[-<form>].ext`.
 #[must_use]
 pub fn find_suitable_update_asset(
     assets: &[GithubAsset],
@@ -507,78 +470,53 @@ pub fn find_suitable_update_asset(
     arch: AssetArch,
     loose_form: bool,
 ) -> Option<&GithubAsset> {
-    match platform {
-        AssetPlatform::Windows => {
+    let suffix = match (platform, arch) {
+        (AssetPlatform::Windows, AssetArch::X64) => {
             if loose_form {
-                // 便携(loose)：**独立规则、无回落**。判据与 `verify-packaging.mjs` 的
-                // `updaterPortableCandidates` 逐字同口径（大小写敏感，同 `package.yml` 里
-                // `polaris-portable-${BUILD_LABEL}.zip` 的字面产物名）——两侧判据一旦不一致，
-                // 那道断言守的就不是选包器真正会选的东西。
-                return assets
-                    .iter()
-                    .find(|a| a.name.starts_with(PORTABLE_ZIP_PREFIX) && a.name.ends_with(".zip"));
-            }
-            // 安装态口径：`.exe` 且名含 'win'（大小写敏感，与 上游 一致）。
-            let win_exe: Vec<&GithubAsset> = assets
-                .iter()
-                .filter(|a| a.name.ends_with(".exe") && a.name.contains("win"))
-                .collect();
-            if win_exe.is_empty() {
-                return None;
-            }
-            let is_portable = |a: &GithubAsset| a.name.to_lowercase().contains("portable");
-            let is_setup = |a: &GithubAsset| a.name.to_lowercase().contains("setup");
-            // 安装(NSIS)：setup → 非 portable → 首个。
-            win_exe
-                .iter()
-                .copied()
-                .find(|a| is_setup(a))
-                .or_else(|| win_exe.iter().copied().find(|a| !is_portable(a)))
-                .or_else(|| win_exe.first().copied())
-        }
-        AssetPlatform::Macos => {
-            let arch_pattern = if arch == AssetArch::Arm64 {
-                "mac-arm64"
+                PORTABLE_ZIP_SUFFIX
             } else {
-                "mac-x64"
+                "x64-win-setup.exe"
+            }
+        }
+        (AssetPlatform::Macos, AssetArch::Arm64) => "aarch64-mac.dmg",
+        (AssetPlatform::Macos, AssetArch::X64) => "x64-mac.dmg",
+        (AssetPlatform::Linux, AssetArch::X64) => {
+            let preferred = if loose_form {
+                "amd64-linux.AppImage"
+            } else {
+                "amd64-linux.deb"
             };
-            // **无回落**（2026-07-21 用户裁定）：分架构单出后，「任意 .dmg」回落会在 release 缺
-            // 一份（某个 mac job 挂掉）时把另一架构的包发给用户 —— arm64 包在 Intel 上根本执行
-            // 不了，x64 包在 Apple Silicon 上走 Rosetta 且内核错配。宁可不更新，也不发错架构。
-            // 返回 None ⇒ check_app_update 走 AppUpdateCheck::NoUpdate（= 上游「未找到适合当前
-            // 平台的安装包」），不是报错。
-            assets
-                .iter()
-                .find(|a| a.name.contains(arch_pattern) && a.name.ends_with(".dmg"))
-        }
-        AssetPlatform::Android => {
-            // **无回落**，理由与 macOS 那条同源：资产名里带着架构判别位，选错就是发一个
-            // 装不上的包。且这里比 macOS 更严 —— 非 arm64 的 Android（x86_64 模拟器）
-            // release 上**根本没有**对应资产，回落任意 `.apk` 会把 arm64 包发给模拟器。
-            //
-            // `loose_form` 在这一态上**不参与**：Android 应用只有一种形态（由系统包管理器装的），
-            // 没有「便携 vs 安装态」这个轴（同 `runtime::update_install::detect_run_form` 的 Android 那条）。
-            if arch != AssetArch::Arm64 {
-                return None;
-            }
-            assets.iter().find(|a| a.name.ends_with(ANDROID_APK_SUFFIX))
-        }
-        AssetPlatform::Linux => {
-            let app_image: Vec<&GithubAsset> = assets
-                .iter()
-                .filter(|a| a.name.ends_with(".AppImage"))
-                .collect();
-            let deb: Vec<&GithubAsset> =
-                assets.iter().filter(|a| a.name.ends_with(".deb")).collect();
-            if loose_form {
-                // AppImage(loose)：AppImage → .deb。
-                app_image.first().copied().or_else(|| deb.first().copied())
+            let fallback = if loose_form {
+                "amd64-linux.deb"
             } else {
-                // deb 安装：.deb → AppImage。
-                deb.first().copied().or_else(|| app_image.first().copied())
-            }
+                "amd64-linux.AppImage"
+            };
+            return assets
+                .iter()
+                .find(|a| release_asset_matches(&a.name, preferred))
+                .or_else(|| {
+                    assets
+                        .iter()
+                        .find(|a| release_asset_matches(&a.name, fallback))
+                });
         }
-    }
+        (AssetPlatform::Android, AssetArch::Arm64) => ANDROID_APK_SUFFIX,
+        (AssetPlatform::Android, AssetArch::Armv7) => ANDROID_ARMV7_APK_SUFFIX,
+        _ => return None,
+    };
+    // Prefer the native split; ARM-only universal is a valid fallback for either ARM ABI.
+    assets
+        .iter()
+        .find(|a| release_asset_matches(&a.name, suffix))
+        .or_else(|| {
+            (platform == AssetPlatform::Android)
+                .then(|| {
+                    assets
+                        .iter()
+                        .find(|a| release_asset_matches(&a.name, ANDROID_UNIVERSAL_APK_SUFFIX))
+                })
+                .flatten()
+        })
 }
 
 // ── 内核资产选择（移植 singbox-asset.findSuitableSingboxAsset，逐字保留）──────────────
@@ -617,6 +555,7 @@ pub fn find_suitable_singbox_asset(
     let arch_keyword = match arch {
         AssetArch::X64 => "amd64",
         AssetArch::Arm64 => "arm64",
+        AssetArch::Armv7 => "armv7",
         AssetArch::Other => "",
     };
 

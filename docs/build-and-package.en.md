@@ -132,18 +132,47 @@ Artifacts land in `target/release/bundle/` at the **repository root** (this repo
 
 | Platform | Artifact | Form |
 |---|---|---|
-| Linux | `*.deb` / `*.AppImage` | deb package + AppImage (single file, no install) |
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` | **One per architecture** (no universal build any more, unsigned). ⚠️ These are **release asset names**, not local artifact names — see below |
-| Windows | `*-win-setup.exe` | NSIS installer (WebView2 downloadBootstrapper, Runtime not embedded) |
-| Windows | `polaris-portable-*.zip` | Portable build (extract and run; ships its own `resources/` plus a `portable.marker` form marker) |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` | deb package + AppImage (single file, no install) |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` | **One per architecture** (no universal build any more, unsigned). ⚠️ These are **release asset names**, not local artifact names — see below |
+| Windows | `Polaris_<version>_x64-win-setup.exe` | NSIS installer (WebView2 downloadBootstrapper, Runtime not embedded) |
+| Windows | `Polaris_<version>_x64-win-Portable.zip` | Portable build (extract and run; ships its own `resources/` plus a `portable.marker` form marker) |
 
 The portable zip is produced by the Windows leg of `package.yml` from `target/release/polaris.exe` plus `resources/`; running the `tauri build` command above locally does not produce it.
 
-⚠️ **The dmg row is the same story with a different cause**: the `-mac-arm64` / `-mac-x64` arch tag is not produced by Tauri. The `Tag macOS dmg with arch` step in `package.yml` renames `<name>.dmg` to `<name>-<tag>.dmg`, and that step only runs in CI. **Running `tauri build` locally gives you a dmg with Tauri's default name, without the tag.** That tag is a hard requirement of the updater's package-selection contract: `github.rs::find_suitable_update_asset` picks the package by looking for `mac-arm64` / `mac-x64` in the asset name and returns `None` when nothing matches (the "any .dmg" fallback has been removed).
+Public names follow `Polaris_<version>_<architecture>-<platform>[-<form>].<extension>`.
+`package.yml` normalizes macOS, Linux and Windows names before artifact verification. Local `tauri build`
+still produces Tauri's default names. Versions come from `src-tauri/tauri.conf.json`, never a CI run label.
+The desktop draft requires six assets. The complete release requires those six, the three Android APKs
+below, and `SHA256SUMS`. `scripts/release-assets.mjs` defines the names and inventory;
+`verify-packaging.mjs assets --label release-all` checks the full set, version, size and every checksum.
+Old-name copies and extra files are rejected.
 
-A release contains **exactly one** each of deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip (six desktop deliverables in total, plus `SHA256SUMS`), enforced mechanically by `verify-packaging.mjs assets --label release`.
-The Android `polaris-<version>-android-arm64.apk` is not one of these four packaging legs: `android.yml` builds and signs it through `scripts/build-android-apk.sh` and uploads it to the same release after the desktop assets have been verified.
-The two Linux forms are likewise "exactly one", not "at least one": the updater's Linux branch takes the first match (`app_image.first()` / `deb.first()` in `github.rs`), so a duplicate makes the choice depend on asset ordering, exactly as with dmg / setup.
+### Android signed release
+
+| ABI | Public name |
+|---|---|
+| ARMv8 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| ARMv8 + ARMv7 | `Polaris_<version>_universal-android.apk` |
+
+After desktop draft checks, `android.yml` builds three signed release APKs:
+
+```bash
+bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+```
+
+These build `arm64Release` / `armRelease` and `universalRelease`. Every flavor uses the full Rust release
+configuration, R8, resource shrinking, compressed native libraries and safe stripping on copied native
+outputs. Both commands target only `arm64-v8a` and `armeabi-v7a`; release JNI packaging also excludes
+x86/x86_64 libraries without widening either split flavor's ABI set. Universal contains both ARM ABIs.
+Debug development builds retain emulator ABIs. Each APK is checked for manifest versions/application ID,
+its exact actual ABI set, each ELF's architecture/symbols/compression, R8 evidence, source AAR bytes and
+the pinned official signing certificate. Missing signing credentials fail closed. Unsigned light risk-gate
+APKs cannot be released. The combined manifest binds draft downloads to the Android job's fixed verified
+SHA values; the full remote digest set is checked again immediately before publication.
+There is no iOS release asset. Actual builds, signatures, package sizes and installation remain candidate
+release acceptance work.
 
 #### Per-platform core filtering (`--config` is not optional)
 
@@ -190,7 +219,7 @@ Six workflows divide the work (`.github/workflows/`):
 
 ## Windows installer and WebView2
 
-Tauri 2 depends on the WebView2 Runtime. Windows ships a single **`*-win-setup.exe`** using `downloadBootstrapper` from `tauri.conf.json`: ordinary Windows 10/11 usually has it preinstalled, and when it is missing the installer fetches Microsoft's Runtime online. Polaris neither embeds nor mirrors the WebView2 Runtime, and does not maintain a second Windows installer.
+Tauri 2 depends on the WebView2 Runtime. Windows ships a single **`Polaris_<version>_x64-win-setup.exe`** using `downloadBootstrapper` from `tauri.conf.json`: ordinary Windows 10/11 usually has it preinstalled, and when it is missing the installer fetches Microsoft's Runtime online. Polaris neither embeds nor mirrors the WebView2 Runtime, and does not maintain a second Windows installer.
 
 Users on stripped-down / LTSC images or portable setups that lack the Runtime need to install [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) from Microsoft first. A fully offline device could not download Polaris or fetch a subscription either, so the release pipeline no longer maintains a second installer and its verification workflow for that case.
 
@@ -198,8 +227,8 @@ The naming is not arbitrary. On Windows the updater (`crates/updater/src/github.
 
 | Runtime form | Selection criteria | Match |
 |---|---|---|
-| Installed (via NSIS) | `.exe` whose name contains `win` | `*-win-setup.exe` |
-| Portable (run from an extracted zip) | `polaris-portable-` prefix + `.zip` | `polaris-portable-*.zip` |
+| Installed (via NSIS) | `Polaris_` prefix + `_x64-win-setup.exe` suffix | `Polaris_<version>_x64-win-setup.exe` |
+| Portable (run from an extracted zip) | `Polaris_` prefix + `_x64-win-Portable.zip` suffix | `Polaris_<version>_x64-win-Portable.zip` |
 
 Hence the installer carries `win` explicitly and the portable build is a zip, placing them in disjoint namespaces so each rule is unambiguous. The "exactly one" guarantees are enforced mechanically in CI by `verify-packaging.mjs assets`.
 

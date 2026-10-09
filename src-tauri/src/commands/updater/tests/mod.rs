@@ -1879,9 +1879,9 @@ fn the_no_download_path_never_claims_a_download() {
 fn app_update_channel_selects_the_expected_release_line() {
     const RELEASES: &str = r#"[
           {"tag_name":"v0.3.0-beta.1","prerelease":true,"published_at":"2024-06-01T00:00:00Z",
-           "assets":[{"name":"Polaris-0.3.0-mac-arm64.dmg","browser_download_url":"https://x/beta","size":1}]},
+           "assets":[{"name":"Polaris_0.3.0-beta.1_aarch64-mac.dmg","browser_download_url":"https://x/beta","size":1}]},
           {"tag_name":"v0.2.0","prerelease":false,"published_at":"2024-05-01T00:00:00Z",
-           "assets":[{"name":"Polaris-0.2.0-mac-arm64.dmg","browser_download_url":"https://x/stable","size":1}]}
+           "assets":[{"name":"Polaris_0.2.0_aarch64-mac.dmg","browser_download_url":"https://x/stable","size":1}]}
         ]"#;
     let pick = |include_pre: bool| match check_app_update(
         RELEASES,
@@ -3027,14 +3027,14 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
 /// 而这一族恰恰是「改一个字符 ⇒ Android 上永远查不到更新，且一句错都不报」的那种静默故障。
 #[test]
 fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
-    // ① App 资产腿：Android 是一个正经变体，且**只有 arm64**有包。
+    // ① App 资产腿：Android 的 ARMv8 原生包可选；模拟器架构不可回落到 ARM 包。
     assert_eq!(
         AssetPlatform::from_os("android"),
         Some(AssetPlatform::Android),
         "Android 从 AssetPlatform 里消失了 —— 移动端的「检查更新」会退回结构性恒答「已是最新」"
     );
     let apk = polaris_updater::github::GithubAsset {
-        name: "polaris-9.9.9-android-arm64.apk".to_string(),
+        name: "Polaris_9.9.9_arm64-v8a-android.apk".to_string(),
         browser_download_url: "https://x/apk".to_string(),
         size: 210,
         digest: None,
@@ -3057,7 +3057,7 @@ fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
             false
         )
         .is_none(),
-        "x86_64（模拟器）也选出了包 —— 本仓只交叉编译 aarch64，发过去的必然装不上"
+        "x86_64（模拟器）也选出了包 —— 正式发布只含 ARMv8/ARMv7，发过去的必然装不上"
     );
 
     // ② 内核腿：Android 上**没有可换的内核**，这一条不许随 ① 一起松掉。

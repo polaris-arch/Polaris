@@ -530,7 +530,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const verifier = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/verify-receipt.py'), 'utf8');
     const consumption = verifier.slice(verifier.indexOf('def consumption('), verifier.indexOf('\ndef main('));
     expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/assert-r8-evidence.mjs'), str(r8)], cwd=ROOT)");
-    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', abi], cwd=ROOT)");
+    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', item], cwd=ROOT)");
     const beforePackage = consumption.slice(0, consumption.indexOf('    with zipfile.ZipFile('));
     expect(beforePackage).not.toMatch(/^\s*try:/m);
     expect(consumption).not.toMatch(/^\s*except\b/m);
@@ -576,16 +576,19 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(publish).toContain('[ "$actual_id" != "$expected_id" ]');
     expect(publish).toContain('run: bash scripts/gate-android-release-behavior.sh');
     expect(publish).toContain(
-      'run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+      'node scripts/assert-r8-evidence.mjs "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"',
     );
+    expect(publish).toContain('for flavor in arm64 arm universal; do');
     expect(publish).toContain('name: android-release-mapping');
     expect(publish).toContain(
-      'node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a',
+      'node scripts/release-assets.mjs abis "$RUNNER_TEMP/$asset_name" "$abi"',
     );
     expect(publish).toContain(
-      'python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+      '--apk "$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk" --abi "$abi"',
     );
-    expect(publish).toContain('expected_sha="${{ steps.asset.outputs.sha256 }}"');
+    expect(publish).toContain("digests='${{ steps.asset.outputs.digests }}'");
+    expect(publish).toContain('signed_apks: ${{ steps.asset.outputs.digests }}');
+    expect(publish).toContain('for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do');
     expect(publish).toContain('[ "$actual_sha" != "sha256:$expected_sha" ]');
     expect(publish).toContain(
       'signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}',
@@ -625,13 +628,24 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         const tools = join(fixture, 'sdk/build-tools/36.0.0');
         const output = join(fixture, 'github-output');
         mkdirSync(apkDir, { recursive: true });
+        mkdirSync(join(fixture, 'scripts'));
+        writeFileSync(join(fixture, 'scripts/release-assets.mjs'), readFileSync(join(REPO_ROOT, 'scripts/release-assets.mjs')));
         mkdirSync(tools, { recursive: true });
         writeFileSync(join(app, 'build.gradle.kts'), 'android { compileSdk = 36 }\n');
         if (properties !== null) {
           writeFileSync(join(app, 'tauri.properties'), properties);
         }
-        const bytes = 'synthetic APK bytes; no Android build';
-        writeFileSync(join(apkDir, 'app-arm64-release.apk'), bytes);
+        // Real ZIP inventory with inert fixture members; no Android compiler or APK execution.
+        for (const [flavor, abis] of [['arm64', ['arm64-v8a']], ['arm', ['armeabi-v7a']],
+          ['universal', ['arm64-v8a', 'armeabi-v7a']]] as const) {
+          const directory = join(app, `build/outputs/apk/${flavor}/release`);
+          mkdirSync(directory, { recursive: true });
+          const made = spawnSync('python3', ['-c',
+            'import sys,json,zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z:\n for abi in json.loads(sys.argv[2]):\n  for lib in ["libbox.so", "libpolaris_lib.so", "libc++_shared.so"]: z.writestr("lib/"+abi+"/"+lib, "inert fixture")',
+            join(directory, `app-${flavor}-release.apk`), JSON.stringify(abis)]);
+          expect(made.status).toBe(0);
+        }
+        const bytes = readFileSync(join(apkDir, 'app-arm64-release.apk'));
         // Only the real asset step's metadata input is synthetic. No SDK or APK
         // command runs; the shell probe returns the manifest fixture verbatim.
         const aapt2 = join(tools, 'aapt2');
@@ -648,11 +662,11 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
           encoding: 'utf8',
         });
         expect(result.status, result.stdout + result.stderr).toBe(expected);
-        const renamed = join(fixture, 'polaris-1.0.0-android-arm64.apk');
+        const renamed = join(fixture, 'Polaris_1.0.0_arm64-v8a-android.apk');
         expect(existsSync(renamed)).toBe(expected === 0);
         if (expected === 0) {
-          expect(readFileSync(renamed, 'utf8')).toBe(bytes);
-          expect(readFileSync(output, 'utf8')).toContain('name=polaris-1.0.0-android-arm64.apk\n');
+          expect(readFileSync(renamed)).toEqual(bytes);
+          expect(readFileSync(output, 'utf8')).toContain('name=Polaris_1.0.0_arm64-v8a-android.apk\n');
         } else {
           expect(existsSync(output)).toBe(false);
         }
@@ -672,7 +686,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const combined = stepBlock(release, 'Verify combined asset set and digests');
     const promote = stepBlock(release, 'Promote release to public');
     const guards = [
-      android.slice(android.indexOf("          row=''")),
+      android.slice(android.indexOf("          row=''"), android.indexOf('          done < <')),
       desktop.slice(desktop.indexOf('          raw_all=')),
       combined.slice(combined.indexOf('          raw="$(mktemp)"')),
       promote.slice(promote.indexOf('          raw="$(mktemp)"'), promote.indexOf('          gh release edit')),
@@ -707,7 +721,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       const address = server.address();
       if (address === null || typeof address === 'string') throw new Error('REST fixture has no TCP port');
-      const name = index === 0 ? 'polaris-1.0.0-android-arm64.apk' : 'polaris-1.0.0-linux-x64.AppImage';
+      const name = index === 0 ? 'Polaris_1.0.0_arm64-v8a-android.apk' : 'Polaris_1.0.0_amd64-linux.AppImage';
       const good = { name, digest: `sha256:${sha}`, state: 'uploaded' };
       const [responseAssets, expectedStatus] = ([
         [[good], 0],
@@ -732,7 +746,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         env: { ...process.env, GH_TOKEN: 'localhost-fixture-not-a-secret',
           GH_CONFIG_DIR: fixture, TMPDIR: fixture, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1',
           api_url: `http://127.0.0.1:${address.port}/release`, name, expected,
-          expected_sha: sha, android_asset: 'polaris-1.0.0-android-arm64.apk', tag: 'v1.0.0' },
+          expected_sha: sha, android_asset: 'Polaris_1.0.0_arm64-v8a-android.apk', tag: 'v1.0.0' },
         encoding: 'utf8',
         timeout: DIGEST_GUARD_CHILD_TIMEOUT_MS,
         killSignal: 'SIGKILL',
@@ -771,15 +785,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(verifyAt).toBeLessThan(promoteAt);
     expect(remoteTagRefetchAt).toBeGreaterThan(verifyAt);
     expect(remoteTagRefetchAt).toBeLessThan(publishCommandAt);
-    expect(release).toContain('android_asset=polaris-${tag#v}-android-arm64.apk');
+    expect(release).toContain('node scripts/verify-packaging.mjs assets --label release-all --dir dist-release');
     expect(promote).toContain(
-      'VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}',
+      'VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}',
     );
-    expect(promote).toContain(
-      'ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}',
-    );
-    expect(release).toContain('[ "$downloaded_sha" = "$VERIFIED_ANDROID_SHA256" ]');
-    expect(release).toContain('[ "$manifest_rows" != "$VERIFIED_ANDROID_SHA256" ]');
+    expect(promote).toContain('node scripts/release-assets.mjs android-digests "${TAG#v}" "$VERIFIED_ANDROID_APKS" "$sums"');
+    expect(release).toContain('[ "$downloaded_sha" = "$verified_sha" ]');
+    expect(release).toContain('node scripts/release-assets.mjs android-digests "${TAG#v}" "$VERIFIED_ANDROID_APKS" dist-release/SHA256SUMS');
     expect(release).toContain('find . -type f ! -name SHA256SUMS');
     expect(release).toContain("cat \"$sums\"");
     expect(release).toContain(

@@ -1172,7 +1172,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     );
     assert!(
         publish_job.contains(
-            "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"
+            "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \\\n"
         ),
         "{ANDROID_WORKFLOW}：`release-apk` 里没有那条**不带逃生门**的 Tauri 构建行 —— \
          发布腿要么没在构建 release，要么已经改成了别的形态，先来这里说清楚。"
@@ -1391,10 +1391,9 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
          job 跑；两条路径各一，任何一次 workflow 调用都不能失去这道配置期观测面。",
     ),
     (
-        "        run: node scripts/assert-r8-evidence.mjs \
-         src-tauri/gen/android/app/build/outputs/mapping/arm64Release",
+        "            node scripts/assert-r8-evidence.mjs \"src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release\"",
         1,
-        "signed release 的独立 run 行必须以将要上传的那次构建的 configuration.txt / seeds.txt 为证据。",
+        "signed release 的三个 flavor 必须逐个使用本次构建的 R8 证据，且不得吞掉失败。",
     ),
     (
         "          node scripts/assert-r8-evidence.mjs \
@@ -1404,7 +1403,7 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
          两条 release 路径各执行一次，失败退出码都必须传给 workflow。",
     ),
     (
-        "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
+        "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \\",
         1,
         "发布腿必须走未带 unsigned 逃生门的正常 Tauri release 构建。",
     ),

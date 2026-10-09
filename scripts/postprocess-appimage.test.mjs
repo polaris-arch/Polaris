@@ -372,7 +372,7 @@ test('Linux payload CLI rejects same-size substituted core bytes in a previously
   renameSync(appDir, packedDir);
   mkdirSync(join(root, 'scripts'));
   mkdirSync(join(root, 'src-tauri'));
-  for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs']) {
+  for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
   }
   cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });

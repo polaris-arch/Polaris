@@ -52,7 +52,8 @@ pub use github::{
     check_app_update, check_app_update_release_only, find_suitable_singbox_asset,
     find_suitable_update_asset, github_releases_api_url, parse_asset_digest,
     resolve_current_app_release, strip_v, AppUpdateCheck, AppUpdateInfo, AssetArch, AssetPlatform,
-    GithubAsset, GithubRelease, ANDROID_APK_SUFFIX, APP_UPDATE_REPO, CORE_UPDATE_REPO,
+    GithubAsset, GithubRelease, ANDROID_APK_SUFFIX, ANDROID_ARMV7_APK_SUFFIX,
+    ANDROID_UNIVERSAL_APK_SUFFIX, APP_UPDATE_REPO, CORE_UPDATE_REPO,
 };
 pub use manifest::{AssetSelector, ManifestError, VersionManifest, VersionManifestEntry};
 pub use popup::{

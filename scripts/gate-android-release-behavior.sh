@@ -444,6 +444,14 @@ echo "══ ⑤ release 任务图里 R8 恰好跑一次 ══"
 expect_count "minifyArm64ReleaseWithR8 在任务图里" "$WORK/2-hatch.log" "minifyArm64ReleaseWithR8" 1
 expect_has "任务图确实是 release 那条（取材自检）" "$WORK/2-hatch.log" ":app:assembleArm64Release"
 
+echo "══ ⑤b ARMv7 与 universal 同走完整 release/R8 任务图 ══"
+gradle_run "$WORK/5b-arm-flavors.log" ./gradlew --offline --no-daemon \
+  :app:assembleArmRelease :app:assembleUniversalRelease --dry-run \
+  -PpolarisAllowUnsigned=true -PtargetList=aarch64,armv7 -ParchList=arm64,arm -PabiList=arm64-v8a,armeabi-v7a
+expect_rc "ARMv7/universal release 任务图可解析" 0
+expect_count "ARMv7 的 R8 在图中恰好一次" "$WORK/5b-arm-flavors.log" "minifyArmReleaseWithR8" 1
+expect_count "universal 的 R8 在图中恰好一次" "$WORK/5b-arm-flavors.log" "minifyUniversalReleaseWithR8" 1
+
 echo "══ ②b 命令行来源的正向对照：这条路确实把开关送到了逃生门手里 ══"
 gradle_run "$WORK/2b-facts.log" "${FACTS[@]}" -PpolarisAllowUnsigned=true
 expect_rc "事实任务跑得动" 0
@@ -506,6 +514,12 @@ gradle_run "$WORK/7-facts.log" "${FACTS[@]}"
 expect_rc "事实任务跑得动" 0
 expect_has "逃生门默认关闭" "$WORK/7-facts.log" "hatchOpen	false"
 expect_has "命令行属性表为空（默认态自检）" "$WORK/7-facts.log" "hatchCmdlineKeys	<none>"
+expect_has "release 资源裁剪已开启" "$WORK/7-facts.log" $'POLARIS_FACT\treleaseShrinkResources\ttrue'
+for variant in arm64Release armRelease universalRelease; do
+  expect_has "$variant 排除 x86/x86_64 原生库" "$WORK/7-facts.log" \
+    $'POLARIS_FACT\treleaseJniExcludes\t'"$variant"$'\t**/x86/*.so,**/x86_64/*.so'
+done
+
 
 # 把 AGP 手里那份清单原样取下来（每行一个绝对路径），下面按**集合**判，不按份数判。
 #

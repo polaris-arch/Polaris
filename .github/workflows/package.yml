@@ -198,8 +198,8 @@ jobs:
           all='[
             {"os":"ubuntu-22.04","rust_target":"x86_64-unknown-linux-gnu","label":"linux","tauri_args":"--config src-tauri/tauri.linux.conf.json"},
             {"os":"windows-2022","rust_target":"x86_64-pc-windows-msvc","label":"windows","tauri_args":"--config src-tauri/tauri.windows.conf.json"},
-            {"os":"macos-14","rust_target":"aarch64-apple-darwin","label":"macos-arm64","mac_arch_tag":"mac-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
-            {"os":"macos-14","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","mac_arch_tag":"mac-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
+            {"os":"macos-14","rust_target":"aarch64-apple-darwin","label":"macos-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
+            {"os":"macos-14","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
           ]'
           # 注：linux/windows/macos-arm64 三条**不带** rust_targets_extra 键，与原 YAML 逐字对齐 ——
           # 引用一个不存在的 matrix 键得到空串，和原来一样（rust-toolchain 的 targets: '' = 不装额外 target）。
@@ -1052,6 +1052,19 @@ jobs:
       # deb 与 AppImage 各自对应 updater 的 installed / loose 形态，掉任一个该形态就选不到包。
       # 同一步还跑**体积门**（U2）：射程恰为 updater 会命中的那些资产，上限见 verify-packaging.mjs
       # 的 MAX_UPDATE_ASSET_BYTES。挂在这里而不是新开 job —— 目标资产在这一步已经解析出来了。
+      - name: Normalize Linux release asset names
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          for ext in deb AppImage; do
+            mapfile -t files < <(find target/release/bundle -type f -name "*.$ext")
+            [ "${#files[@]}" -eq 1 ] || { echo "::error::expected exactly one $ext"; exit 1; }
+            destination="$(dirname "${files[0]}")/Polaris_${version}_amd64-linux.$ext"
+            [ "${files[0]}" = "$destination" ] || mv "${files[0]}" "$destination"
+          done
+
       - name: Verify Linux update-asset naming and size contract
         if: runner.os == 'Linux'
         shell: bash
@@ -1216,34 +1229,24 @@ jobs:
           [ "$checked" -gt 0 ] || { echo "::error::没有 dmg 被开箱验证"; exit 1; }
           echo "已开箱验证 $checked 个 dmg"
 
-      # ── mac dmg 打架构标记（更新器契约，**不可省**）──
-      # crates/updater/src/github.rs::find_suitable_update_asset（macOS 分支）按资产名是否含
-      # `mac-arm64` / `mac-x64` 选包，**匹配不到直接返回 None**（2026-07-21 起取消「任意 .dmg」
-      # 回落：分架构后回落 = 给用户发另一架构的包，arm64 包在 Intel 上根本执行不了）。
-      # Tauri 默认 dmg 名是 `Polaris_{version}_aarch64.dmg` / `Polaris_{version}_x64.dmg`，**都不含**上述 tag
-      # （`_x64` ≠ `mac-x64`）⇒ 若不改名，双架构 release 里两个 dmg 谁都匹配不上，两个架构的用户
-      # 全部**静默收不到更新**。universal 时代只有一个 dmg 故无所谓，分架构后这条契约变成硬要求。
-      - name: Tag macOS dmg with arch
+      # Canonical public names carry the architecture once, before the platform.
+      - name: Normalize macOS release asset name
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           bundle_dir="target/${{ matrix.rust_target }}/release/bundle/dmg"
-          [ -d "$bundle_dir" ] || { echo "::error::dmg bundle dir not found: $bundle_dir"; exit 1; }
+          version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          case '${{ matrix.label }}' in
+            macos-arm64) arch=aarch64 ;;
+            macos-x64) arch=x64 ;;
+            *) exit 1 ;;
+          esac
           shopt -s nullglob
-          # 计数口径是「**结果**上带 tag 的 dmg 数」，不是「本次改名了几个」——
-          # 脏工作区（self-hosted / 重跑）里 dmg 可能已带 tag，那是**正确状态**，
-          # 旧写法 continue 让 renamed 停在 0 而误报 `no dmg to tag`。
-          tagged=0
-          for dmg in "$bundle_dir"/*.dmg; do
-            case "$(basename "$dmg")" in
-              *${{ matrix.mac_arch_tag }}*) tagged=$((tagged + 1)); continue ;;
-            esac
-            mv "$dmg" "$bundle_dir/$(basename "$dmg" .dmg)-${{ matrix.mac_arch_tag }}.dmg"
-            tagged=$((tagged + 1))
-          done
-          [ "$tagged" -gt 0 ] || { echo "::error::no dmg in $bundle_dir"; exit 1; }
-          ls -la "$bundle_dir"
+          files=("$bundle_dir"/*.dmg)
+          [ "${#files[@]}" -eq 1 ] || { echo "::error::expected exactly one dmg"; exit 1; }
+          destination="$bundle_dir/Polaris_${version}_${arch}-mac.dmg"
+          [ "${files[0]}" = "$destination" ] || mv "${files[0]}" "$destination"
 
       # 产物命名 ↔ updater 选包规则的机器断言（与 github.rs::find_suitable_update_asset 同口径）：
       # 本 job 的 dmg 必须恰好命中本架构、且不得出现另一架构 tag。改名步一旦失效即红。
@@ -1272,7 +1275,8 @@ jobs:
           $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           if (-not $setup) { throw "no *-setup.exe in target/release/bundle/nsis" }
           New-Item -ItemType Directory -Force dist-win | Out-Null
-          $name = $setup.Name -replace '-setup\.exe$', '-win-setup.exe'
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $name = "Polaris_${version}_x64-win-setup.exe"
           Move-Item $setup.FullName "dist-win/$name"
           Write-Host "installer -> dist-win/$name"
 
@@ -1284,7 +1288,7 @@ jobs:
       # 🔴 **`portable.marker` 不是装饰**（2026-07-22，修 #72 形态错配本体）：
       #    应用靠「exe 同级有没有这个文件」判自己是不是便携形态
       #    （`src-tauri/src/commands/updater::is_portable_layout`），进而决定检查更新时
-      #    该拿 `polaris-portable-*.zip` 还是 NSIS 安装器。
+      #    该拿 `Polaris_<版本>_x64-win-Portable.zip` 还是 NSIS 安装器。
       #    此前判据读的是 `PORTABLE_EXECUTABLE_DIR` —— **electron-builder 便携目标特有**的注入
       #    （它的便携版是自解压 stub，由 stub 设该变量）。本步打的是纯 zip、**没有任何 stub**
       #    ⇒ 该 env 恒不存在 ⇒ 便携用户恒被判成安装态、被推安装器，装出与便携副本并存的
@@ -1324,7 +1328,8 @@ jobs:
           # 打进 dist-win/ 而不是仓库根：便携 zip 是 updater 的 loose 形态**唯一候选**，
           # 放进本 job 的资产目录后，它的命名与体积在**本 job**就被 assets 门量到；留在仓库根的话
           # 那两条断言只有 tag 时的聚合口径量得到 —— 超限要等四条腿的构建成本全付完才发现。
-          Compress-Archive -Path "$staging/*" -DestinationPath "dist-win/polaris-portable-${{ env.BUILD_LABEL }}.zip" -Force
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          Compress-Archive -Path "$staging/*" -DestinationPath "dist-win/Polaris_${version}_x64-win-Portable.zip" -Force
 
       # 便携标记与许可文本必须真的在 zip 里 —— 开包核验**产物本身**，不是核验上一步的脚本文本。
       # 缺 marker ⇒ 便携用户恒被推安装器（#72 形态错配本体复发）；缺许可文本 ⇒ 许可证违规。
@@ -1334,7 +1339,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "dist-win/polaris-portable-${{ env.BUILD_LABEL }}.zip"
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $zip = "dist-win/Polaris_${version}_x64-win-Portable.zip"
           $probe = "portable-probe"
           if (Test-Path $probe) { Remove-Item $probe -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $probe -Force
@@ -1391,7 +1397,7 @@ jobs:
             target/release/bundle/**/*.AppImage
             target/*/release/bundle/**/*.dmg
             dist-win/*.exe
-            dist-win/polaris-portable-*.zip
+            dist-win/Polaris_*-win-Portable.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -1738,7 +1744,7 @@ jobs:
           echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
           # --clobber：同名资产覆盖而非追加 `.1` 后缀。追加会让 release 里出现
-          # `*-mac-arm64.dmg` 与 `*-mac-arm64.dmg.1` 两个命中，updater 选谁看顺序。
+          # `Polaris_<version>_aarch64-mac.dmg` 与其 `.1` 副本 两个命中，updater 选谁看顺序。
           verify_remote_tag
           release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft)"
           if [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
@@ -1787,6 +1793,9 @@ jobs:
           echo "draft release $tag 实际资产："
           cat published-names.txt
           while IFS= read -r name; do
+            case "$name" in
+              "Polaris_${tag#v}_arm64-v8a-android.apk"|"Polaris_${tag#v}_armeabi-v7a-android.apk"|"Polaris_${tag#v}_universal-android.apk") continue ;;
+            esac
             : > "$outdir/$name"
           done < published-names.txt
           node "$GITHUB_WORKSPACE/scripts/verify-packaging.mjs" assets --label release --dir "$outdir" --names-only
@@ -1816,7 +1825,6 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          android_asset="polaris-${tag#v}-android-arm64.apk"
           sums="$GITHUB_WORKSPACE/dist-release/SHA256SUMS"
           [ -s "$sums" ] || { echo "::error::$sums 不存在或为空 —— 生成步骤与本步之间有人动过它"; exit 1; }
 
@@ -1857,7 +1865,7 @@ jobs:
             gh api "$api_url" --jq '.assets[] | "\(.digest // "MISSING")\t\(.state // "unknown")\t\(.name)"' > "$raw_all"
             # 失败后的草稿重跑可能带着上一轮已上传的 APK。它此刻仍不可见，且下一段 Android job
             # 会用本次 commit 的签名 APK 覆盖；桌面阶段只校验自己的资产，最终阶段再对全量精确对账。
-            awk -F'\t' -v apk="$android_asset" '$3 != apk' "$raw_all" > "$raw"
+            awk -F'\t' -v version="${tag#v}" '$3 != "Polaris_" version "_arm64-v8a-android.apk" && $3 != "Polaris_" version "_armeabi-v7a-android.apk" && $3 != "Polaris_" version "_universal-android.apk"' "$raw_all" > "$raw"
             pending="$(awk -F'\t' '$1 == "MISSING" || $2 != "uploaded"' "$raw")"
             [ -z "$pending" ] && break
             [ "$attempt" -eq 3 ] && break
@@ -1948,7 +1956,6 @@ jobs:
           fi
           echo "::notice::release targetCommitish=$target_commitish（仅诊断；SHA 由远端 peeled tag 对拍）"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "android_asset=polaris-${tag#v}-android-arm64.apk" >> "$GITHUB_OUTPUT"
 
       - name: Download desktop artifacts
         uses: actions/download-artifact@v8
@@ -1960,28 +1967,29 @@ jobs:
       # APK 来自上一段已验签名/开箱/远端 digest 的 job。再从 draft 下载一次，确保最终清单按
       # GitHub 实际保存的字节生成；同时必须与 Android job 回传的**固定已验签 SHA**一致，不能把
       # 下载时才看到的新字节现算进清单，否则并发 --clobber 能把另一只 APK 偷换成新的“期望”。
-      - name: Download signed APK from draft release
+      - name: Download signed APKs from draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release_identity.outputs.tag }}
-          ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}
-          VERIFIED_ANDROID_ASSET: ${{ needs.android_release.outputs.signed_apk_name }}
-          VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}
+          VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}
         run: |
           set -euo pipefail
-          [ -n "$VERIFIED_ANDROID_SHA256" ] && [ "$ANDROID_ASSET" = "$VERIFIED_ANDROID_ASSET" ] || {
-            echo "::error::Android reusable workflow 没回传预期的已验签 APK 身份"; exit 1; }
           mkdir -p dist-release/android
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "$ANDROID_ASSET" --dir dist-release/android
-          apk="dist-release/android/$ANDROID_ASSET"
-          [ -s "$apk" ] || { echo "::error::草稿里没有非空签名 APK：$ANDROID_ASSET"; exit 1; }
-          [ "$(find dist-release -type f -name "$ANDROID_ASSET" | wc -l)" -eq 1 ] || {
-            echo "::error::签名 APK 在汇总目录里不是恰好一份：$ANDROID_ASSET"; exit 1; }
-          downloaded_sha="$(sha256sum "$apk" | cut -d' ' -f1)"
-          [ "$downloaded_sha" = "$VERIFIED_ANDROID_SHA256" ] || {
-            echo "::error::草稿 APK 已被替换：downloaded=$downloaded_sha verified=$VERIFIED_ANDROID_SHA256"; exit 1; }
+          # Validate the complete fixed map before consuming any draft bytes.
+          jq -er 'to_entries[] | "\(.value)  \(.key)"' <<<"$VERIFIED_ANDROID_APKS" > "$RUNNER_TEMP/verified-android-sums"
+          node scripts/release-assets.mjs android-digests "${TAG#v}" "$VERIFIED_ANDROID_APKS" "$RUNNER_TEMP/verified-android-sums"
+          while IFS=$'\t' read -r name verified_sha; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$name" --dir dist-release/android
+            apk="dist-release/android/$name"
+            [ -s "$apk" ] || { echo "::error::missing signed APK: $name"; exit 1; }
+            [ "$(find dist-release -type f -name "$name" | wc -l)" -eq 1 ] || {
+              echo "::error::duplicate APK basename: $name"; exit 1; }
+            downloaded_sha="$(sha256sum "$apk" | cut -d' ' -f1)"
+            [ "$downloaded_sha" = "$verified_sha" ] || {
+              echo "::error::draft APK differs from verified bytes: $name"; exit 1; }
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<<"$VERIFIED_ANDROID_APKS")
 
       - name: Generate combined SHA256SUMS
         shell: bash
@@ -1998,6 +2006,14 @@ jobs:
           mv "$sums" SHA256SUMS
           chmod 644 SHA256SUMS
           cat SHA256SUMS
+
+      - name: Verify complete release asset contract
+        env:
+          TAG: ${{ steps.release_identity.outputs.tag }}
+          VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}
+        run: |
+          node scripts/release-assets.mjs android-digests "${TAG#v}" "$VERIFIED_ANDROID_APKS" dist-release/SHA256SUMS
+          node scripts/verify-packaging.mjs assets --label release-all --dir dist-release
 
       - name: Upload combined SHA256SUMS
         shell: bash
@@ -2063,8 +2079,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release_identity.outputs.tag }}
-          ANDROID_ASSET: ${{ steps.release_identity.outputs.android_asset }}
-          VERIFIED_ANDROID_SHA256: ${{ needs.android_release.outputs.signed_apk_sha256 }}
+          VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}
         run: |
           set -euo pipefail
           node scripts/assert-pc-runtime-release.mjs
@@ -2084,11 +2099,8 @@ jobs:
           # APK 那一行还必须等于 Android job 回传的固定已验签 SHA，绝不现场信任新 APK 重算期望。
           sums="$GITHUB_WORKSPACE/dist-release/SHA256SUMS"
           [ -s "$sums" ] || { echo "::error::公开前本地 SHA256SUMS 丢失"; exit 1; }
-          manifest_rows="$(awk -v name="$ANDROID_ASSET" '$2 == name {print $1}' "$sums")"
-          if [ "$(printf '%s\n' "$manifest_rows" | sed '/^$/d' | wc -l)" -ne 1 ] || \
-             [ "$manifest_rows" != "$VERIFIED_ANDROID_SHA256" ]; then
-            echo "::error::最终清单里的 APK SHA 不是 Android job 已验签的固定 SHA"; exit 1
-          fi
+          node scripts/release-assets.mjs android-digests "${TAG#v}" "$VERIFIED_ANDROID_APKS" "$sums"
+          node scripts/verify-packaging.mjs assets --label release-all --dir dist-release
           expected="$(mktemp)"
           {
             cat "$sums"

@@ -155,27 +155,44 @@ tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-d
 
 | 平台 | 产物 | 形态 |
 |---|---|---|
-| Linux | `*.deb` / `*.AppImage` | deb 包 + AppImage（单文件免装） |
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` | **分架构单出**（不再出 universal，未签名）。⚠️ 这是 **release 资产名**，不是本地产物名 —— 见下 |
-| Windows | `*-win-setup.exe` | NSIS 安装器（WebView2 downloadBootstrapper，不内嵌 Runtime） |
-| Windows | `polaris-portable-*.zip` | 免安装绿色版（解压即用，自带 `resources/` + `portable.marker` 形态标记） |
+| Linux | `Polaris_<版本>_amd64-linux.deb` / `Polaris_<版本>_amd64-linux.AppImage` | deb 包 + AppImage（单文件免装） |
+| macOS | `Polaris_<版本>_aarch64-mac.dmg` / `Polaris_<版本>_x64-mac.dmg` | **分架构单出**（不再出 universal，未签名）。⚠️ 这是 **release 资产名**，不是本地产物名 —— 见下 |
+| Windows | `Polaris_<版本>_x64-win-setup.exe` | NSIS 安装器（WebView2 downloadBootstrapper，不内嵌 Runtime） |
+| Windows | `Polaris_<版本>_x64-win-Portable.zip` | 免安装绿色版（解压即用，自带 `resources/` + `portable.marker` 形态标记） |
 
 portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `resources/` 额外打 zip，
 本地单跑上面那条 `tauri build` 不会有。
 
-⚠️ **dmg 那行同理，但成因不同**：`-mac-arm64` / `-mac-x64` 这个 arch tag 不是 Tauri 产出的，
-是 `package.yml` 的 `Tag macOS dmg with arch` 步把 `<名>.dmg` 重命名成 `<名>-<tag>.dmg` 加上的
-（该步只在 CI 跑）。**本地跑 `tauri build` 拿到的是 Tauri 默认名的 dmg，不带 tag。**
-这个 tag 是更新器选包契约的硬要求：`github.rs::find_suitable_update_asset` 按资产名里的
-`mac-arm64` / `mac-x64` 选包，匹配不到直接返回 `None`（已取消「任意 .dmg」回落）。
+正式发布文件名统一为 `Polaris_<版本>_<架构>-<平台>[-<形态>].<扩展名>`。
+`package.yml` 在产物校验前规范化 macOS、Linux 与 Windows 的文件名；本地单跑 `tauri build`
+仍得到 Tauri 默认文件名。版本来自 `src-tauri/tauri.conf.json`，不使用 CI 运行标签代替版本。
+桌面草稿先核六份资产；最终发布必须包含六份桌面资产、下列三份 Android APK 与 `SHA256SUMS`。
+`scripts/release-assets.mjs` 定义命名及集合，`verify-packaging.mjs assets --label release-all`
+核对完整集合、版本、体积与逐项摘要，旧名副本与额外文件均拒绝。
 
-一个 release 里 deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip
-**各恰好一个**（共 6 个桌面交付物，另含 `SHA256SUMS`），由
-`verify-packaging.mjs assets --label release` 机器守住。
-Android 的 `polaris-<版本>-android-arm64.apk` 不在这四条打包腿里：由 `android.yml` 经 `scripts/build-android-apk.sh`
-构建并签名，在桌面资产验过后上传到同一个 release。
-两个 Linux 形态同样是「恰好一个」而非「至少一个」：updater 的 Linux 分支取首个命中
-（`github.rs` 的 `app_image.first()` / `deb.first()`），多一个就和 dmg / setup 一样选谁看资产顺序。
+### Android 正式 release
+
+| ABI | 发布名 |
+|---|---|
+| ARMv8 | `Polaris_<版本>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<版本>_armeabi-v7a-android.apk` |
+| ARMv8 + ARMv7 | `Polaris_<版本>_universal-android.apk` |
+
+`android.yml` 在桌面草稿通过后构建三个正式签名 APK：
+
+```bash
+bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+```
+
+两次调用分别产出 `arm64Release` / `armRelease` 与 `universalRelease`；全部使用完整 Rust release
+构型、R8、资源裁剪、压缩 native libraries 与复制后的原生库安全剥符号。两条命令只构建
+`arm64-v8a` 和 `armeabi-v7a`；release JNI 打包再排除 x86/x86_64 库，保留各 split 自己的 ABI 集合。
+universal 包含两个 ARM ABI；debug 开发构型保留模拟器 ABI。
+三个包逐一核 manifest 版本/应用 ID、真实 ABI 集合、每份 ELF 的架构/符号/压缩方式、R8 证据、
+内核 AAR 来源原字节与正式签名证书 pin。任何签名凭据缺失即失败；风险门的未签名轻量包不能发布。
+最终清单使用从草稿回读且与 Android job 固定已验签 SHA 对拍的字节，公开紧前再核完整远端 digest。
+本轮不产出 iOS release 包。三份 APK 的实际构建、签名、体积与安装验收须由候选发布验证。
 
 #### 按平台筛内核（`--config` 不可省）
 
@@ -245,7 +262,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 
 ## Windows 安装器与 WebView2
 
-Tauri 2 依赖 WebView2 Runtime。Windows 只发布一个 **`*-win-setup.exe`**，使用
+Tauri 2 依赖 WebView2 Runtime。Windows 只发布一个 **`Polaris_<版本>_x64-win-setup.exe`**，使用
 `tauri.conf.json` 的 `downloadBootstrapper`：普通 Win10/11 通常已预装，缺失时安装器联网获取微软
 Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套 Windows 安装包。
 
@@ -258,8 +275,8 @@ Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套
 
 | 运行形态 | 选包判据 | 命中 |
 |---|---|---|
-| 安装态（NSIS 装的） | `.exe` 且名含 `win` | `*-win-setup.exe` |
-| 便携（解压 zip 跑的） | `polaris-portable-` 前缀 + `.zip` | `polaris-portable-*.zip` |
+| 安装态（NSIS 装的） | `Polaris_` 前缀 + `_x64-win-setup.exe` 后缀 | `Polaris_<版本>_x64-win-setup.exe` |
+| 便携（解压 zip 跑的） | `Polaris_` 前缀 + `_x64-win-Portable.zip` 后缀 | `Polaris_<版本>_x64-win-Portable.zip` |
 
 故安装器显式带 `win`，便携版是 zip，与 `.exe` 分属不相交的命名空间，两条规则各自无歧义。
 这些「恰好一个」由 `verify-packaging.mjs assets` 在 CI 里机器守住。

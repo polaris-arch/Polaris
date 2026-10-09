@@ -37,7 +37,7 @@ name: Android
 # 不上传为 Actions artifact，也不进入 GitHub Release。Debug 仅用于开发者本地真机功能 QA，CI 不构建。
 #
 # `publish_release=true`：package.yml 的 tag 发布 DAG 在桌面草稿资产验过后调用 `release-apk`，构建
-# 正式签名 Release APK，校验签名证书与 base applicationId，并只把这一个 APK 上传到同 tag 草稿。
+# 正式签名 Release APK，校验签名证书与 base applicationId，并把三份 ARM release APK 上传到同 tag 草稿。
 # 四项签名 secret 已在仓库侧配置；值始终只经 `secrets.*` 注入，不进入 workflow 文本或构建日志。
 #
 # ── 构建权重（2026-10-08）：profile 名恒为 release，但 Rust 侧有两种权重 ──
@@ -67,6 +67,9 @@ on:
         type: string
         default: ''
     outputs:
+      signed_apks:
+        description: 已验签且远端 digest 对拍成功的三份 APK，资产名到 SHA-256 的 JSON 对象
+        value: ${{ jobs.release-apk.outputs.signed_apks }}
       signed_apk_name:
         description: 已验签且远端 digest 对拍成功的 Release APK 资产名
         value: ${{ jobs.release-apk.outputs.signed_apk_name }}
@@ -245,7 +248,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
           rustup default stable
           echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
@@ -652,6 +655,7 @@ jobs:
     permissions:
       contents: write
     outputs:
+      signed_apks: ${{ steps.asset.outputs.digests }}
       signed_apk_name: ${{ steps.asset.outputs.name }}
       signed_apk_sha256: ${{ steps.asset.outputs.sha256 }}
 
@@ -742,7 +746,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-linux-android,armv7-linux-androideabi
           rustup default stable
           echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
           echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
@@ -1068,14 +1072,19 @@ jobs:
           POLARIS_KEY_ALIAS: ${{ secrets.POLARIS_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \
+          # Split APKs and the ARM-only universal are separate AGP flavors, all with full release settings.
+          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \
+            --config src-tauri/tauri.android.conf.json
+          bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci \
             --config src-tauri/tauri.android.conf.json
 
-          jni=src-tauri/gen/android/app/src/main/jniLibs/arm64-v8a
-          up=src-tauri/gen/android/app/src/main/assets/_up_
-          for f in "$jni/libpolaris_lib.so" "$jni/libc++_shared.so"; do
-            [ -e "$f" ] || { echo "::error::$f 没铺出来 —— 交叉编译或 symlink 那一步真的失败了"; exit 1; }
+          for abi in arm64-v8a armeabi-v7a; do
+            jni="src-tauri/gen/android/app/src/main/jniLibs/$abi"
+            for library in libpolaris_lib.so libc++_shared.so; do
+              [ -e "$jni/$library" ] || { echo "::error::$jni/$library missing"; exit 1; }
+            done
           done
+          up=src-tauri/gen/android/app/src/main/assets/_up_
           for f in LICENSE NOTICE THIRD-PARTY-LICENSES.md; do
             [ -s "$up/$f" ] || { echo "::error::$up/$f 没铺出来 —— bundle.resources 没生效"; exit 1; }
           done
@@ -1097,15 +1106,19 @@ jobs:
         with:
           name: android-release-mapping
           path: |
-            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/mapping.txt
-            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/usage.txt
-            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/seeds.txt
-            src-tauri/gen/android/app/build/outputs/mapping/arm64Release/configuration.txt
+            src-tauri/gen/android/app/build/outputs/mapping/*Release/mapping.txt
+            src-tauri/gen/android/app/build/outputs/mapping/*Release/usage.txt
+            src-tauri/gen/android/app/build/outputs/mapping/*Release/seeds.txt
+            src-tauri/gen/android/app/build/outputs/mapping/*Release/configuration.txt
           if-no-files-found: error
           retention-days: 90
 
       - name: R8 吃进了什么 / 保住了什么（发布包产物级证据）
-        run: node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+        run: |
+          set -euo pipefail
+          for flavor in arm64 arm universal; do
+            node scripts/assert-r8-evidence.mjs "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
+          done
 
       # 用后即删，且**无论成败**：assemble 失败时密钥库同样要走，不能留在 runner 的工作区里。
       - name: 删掉 runner 上的密钥库
@@ -1122,11 +1135,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          built=src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release.apk
-          [ -s "$built" ] || {
-            echo "::error::$built 不在。gradle 出的若是 app-arm64-release-unsigned.apk，说明签名根本没接上 —— 那个包装不上，绝不发。"
-            ls -R src-tauri/gen/android/app/build/outputs/apk || true
-            exit 1; }
           props=src-tauri/gen/android/app/tauri.properties
           [ -s "$props" ] || { echo "::error::$props 不在 —— 版本号的真值源没铺出来"; exit 1; }
           expected_version=$(sed -n 's/^tauri\.android\.versionName=//p' "$props")
@@ -1136,27 +1144,36 @@ jobs:
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           aapt2="$ANDROID_HOME/build-tools/${compile_sdk}.0.0/aapt2"
           [ -x "$aapt2" ] || { echo "::error::找不到 aapt2：$aapt2"; exit 1; }
-          badging="$("$aapt2" dump badging "$built")"
-          version=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p")
-          version_code=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p")
-          if [ -z "$version" ] || [[ ! "$version_code" =~ ^[1-9][0-9]*$ ]] || \
-             [ "$version" != "$expected_version" ] || [ "$version_code" != "$expected_version_code" ]; then
-            echo "::error::APK manifest versionName/versionCode 与 $props 不一致或不可读取（APK=$version/$version_code，Gradle=$expected_version/$expected_version_code）"
-            exit 1
-          fi
-          tag="${{ steps.release_identity.outputs.tag }}"
-          [ "$tag" = "v$version" ] || {
-            echo "::error::tag（$tag）与包里的版本（$version）对不上 —— 发出去的资产会与它的名字说两件事"
-            exit 1; }
-          asset_name="polaris-${version}-android-arm64.apk"
-          cp "$built" "$RUNNER_TEMP/$asset_name"
-          {
-            echo "asset=$RUNNER_TEMP/$asset_name"
-            echo "name=$asset_name"
-            echo "sha256=$(sha256sum "$RUNNER_TEMP/$asset_name" | cut -d' ' -f1)"
-            echo "tag=$tag"
-          } >> "$GITHUB_OUTPUT"
-          echo "资产：$asset_name（$(stat -c%s "$RUNNER_TEMP/$asset_name") 字节）"
+          digests='{}'
+          for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do
+            flavor="${pair%%:*}"
+            abi="${pair#*:}"
+            built="src-tauri/gen/android/app/build/outputs/apk/$flavor/release/app-$flavor-release.apk"
+            [ -s "$built" ] || { echo "::error::signed release APK missing: $built"; exit 1; }
+            badging="$("$aapt2" dump badging "$built")"
+            version=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p")
+            version_code=$(printf '%s\n' "$badging" | sed -n "s/^package: .* versionCode='\([^']*\)'.*/\1/p")
+            if [ -z "$version" ] || [[ ! "$version_code" =~ ^[1-9][0-9]*$ ]] || \
+               [ "$version" != "$expected_version" ] || [ "$version_code" != "$expected_version_code" ]; then
+              echo "::error::APK manifest versionName/versionCode differs from $props"; exit 1
+            fi
+            tag="${{ steps.release_identity.outputs.tag }}"
+            [ "$tag" = "v$version" ] || { echo "::error::tag differs from APK version"; exit 1; }
+            asset_name="Polaris_${version}_${abi}-android.apk"
+            cp "$built" "$RUNNER_TEMP/$asset_name"
+            node scripts/release-assets.mjs abis "$RUNNER_TEMP/$asset_name" "$abi"
+            sha="$(sha256sum "$RUNNER_TEMP/$asset_name" | cut -d' ' -f1)"
+            digests="$(jq -c --arg name "$asset_name" --arg sha "$sha" '. + {($name): $sha}' <<<"$digests")"
+            if [ "$abi" = arm64-v8a ]; then
+              {
+                echo "asset=$RUNNER_TEMP/$asset_name"
+                echo "name=$asset_name"
+                echo "sha256=$sha"
+              } >> "$GITHUB_OUTPUT"
+            fi
+          done
+          echo "digests=$digests" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       # 文件名带 release 不等于真的有 APK Signature Scheme；签过也不等于用了正式发布证书。
       # 同时对拍 manifest package = Android base identifier，防 release 误带任何非正式后缀。
@@ -1171,33 +1188,41 @@ jobs:
           aapt2="$ANDROID_HOME/build-tools/${compile_sdk}.0.0/aapt2"
           [ -x "$apksigner" ] || { echo "::error::找不到 apksigner：$apksigner"; exit 1; }
           [ -x "$aapt2" ] || { echo "::error::找不到 aapt2：$aapt2"; exit 1; }
-          asset="${{ steps.asset.outputs.asset }}"
+          while IFS= read -r name; do
+            asset="$RUNNER_TEMP/$name"
+            signature_report="$("$apksigner" verify --verbose --print-certs "$asset")"
+            printf '%s\n' "$signature_report"
+            mapfile -t certs < <(printf '%s\n' "$signature_report" | \
+              sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' | \
+              tr -d ':' | tr '[:upper:]' '[:lower:]')
+            if [ "${#certs[@]}" -ne 1 ] || [ "${certs[0]:-}" != "$POLARIS_RELEASE_CERT_SHA256" ]; then
+              echo "::error::APK 签名证书不是本次 release keystore/alias 的精确证书"
+              exit 1
+            fi
 
-          signature_report="$("$apksigner" verify --verbose --print-certs "$asset")"
-          printf '%s\n' "$signature_report"
-          mapfile -t certs < <(printf '%s\n' "$signature_report" | \
-            sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' | \
-            tr -d ':' | tr '[:upper:]' '[:lower:]')
-          if [ "${#certs[@]}" -ne 1 ] || [ "${certs[0]:-}" != "$POLARIS_RELEASE_CERT_SHA256" ]; then
-            echo "::error::APK 签名证书不是本次 release keystore/alias 的精确证书"
-            exit 1
-          fi
-
-          expected_id="$(node -p 'require("./src-tauri/tauri.android.conf.json").identifier')"
-          actual_id="$("$aapt2" dump badging "$asset" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
-          if [ -z "$expected_id" ] || [ "$actual_id" != "$expected_id" ]; then
-            echo "::error::release APK package ID 不等于 Android base identifier：actual=$actual_id expected=$expected_id"
-            exit 1
-          fi
-          echo "release APK package ID 与正式发布证书均已精确对拍"
+            expected_id="$(node -p 'require("./src-tauri/tauri.android.conf.json").identifier')"
+            actual_id="$("$aapt2" dump badging "$asset" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n1)"
+            if [ -z "$expected_id" ] || [ "$actual_id" != "$expected_id" ]; then
+              echo "::error::release APK package ID 不等于 Android base identifier：actual=$actual_id expected=$expected_id"
+              exit 1
+            fi
+            echo "release APK package ID 与正式发布证书均已精确对拍"
+          done < <(jq -r 'keys[]' <<<'${{ steps.asset.outputs.digests }}')
 
       # ══ 发之前先开箱：构建成功 ≠ 包里有东西 ══
       # 与未分发 release-profile 腿同一份判据（资源有没有静默逃逸 / 死字节 / cronet-naive 在不在 / 符号剥没剥 /
       # 出厂权限集）。发布包上少这一步，就是把「全绿但产物是垃圾」那四条已实证通路直接送给用户。
       - name: 开箱验（产物级判据）
         run: |
-          node scripts/verify-apk.mjs ${{ steps.asset.outputs.asset }} --abi arm64-v8a
-          python3 scripts/libbox-patches/verify-receipt.py --apk ${{ steps.asset.outputs.asset }} --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+          set -euo pipefail
+          version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
+          for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do
+            flavor="${pair%%:*}"
+            abi="${pair#*:}"
+            python3 scripts/libbox-patches/verify-receipt.py \
+              --apk "$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk" --abi "$abi" \
+              --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
+          done
 
       - name: 上传成 release 资产
         shell: bash
@@ -1206,40 +1231,41 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.asset.outputs.tag }}"
-          asset="${{ steps.asset.outputs.asset }}"
-          name="${{ steps.asset.outputs.name }}"
-          expected_sha="${{ steps.asset.outputs.sha256 }}"
+          digests='${{ steps.asset.outputs.digests }}'
+          while IFS=$'\t' read -r name expected_sha; do
+            asset="$RUNNER_TEMP/$name"
 
-          # 构建很久，mutation 紧前重新抓远端 peeled tag，并复核 release tag/draft。
-          git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
-          remote_tag_sha="$(git rev-list -n 1 "$tag")"
-          release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
-          if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
-             [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
-             [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
-            echo "::error::tag/release 身份漂移，拒绝上传 APK（tagSha=$remote_tag_sha）"; exit 1
-          fi
-          echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
-          gh release upload "$tag" "$asset" \
-            --clobber --repo "$GITHUB_REPOSITORY"
+            # 构建很久，mutation 紧前重新抓远端 peeled tag，并复核 release tag/draft。
+            git fetch --force --depth=1 origin "+refs/tags/$tag:refs/tags/$tag"
+            remote_tag_sha="$(git rev-list -n 1 "$tag")"
+            release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,targetCommitish)"
+            if [ "$remote_tag_sha" != "$GITHUB_SHA" ] || \
+               [ "$(jq -r .tagName <<<"$release_json")" != "$tag" ] || \
+               [ "$(jq -r .isDraft <<<"$release_json")" != "true" ]; then
+              echo "::error::tag/release 身份漂移，拒绝上传 APK（tagSha=$remote_tag_sha）"; exit 1
+            fi
+            echo "::notice::release targetCommitish=$(jq -r .targetCommitish <<<"$release_json")（仅诊断）"
+            gh release upload "$tag" "$asset" \
+              --clobber --repo "$GITHUB_REPOSITORY"
 
-          api_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json apiUrl,isDraft \
-            --jq 'select(.isDraft == true) | .apiUrl')"
-          [ -n "$api_url" ] || { echo "::error::APK 上传后 release 已不是草稿或取不到 apiUrl"; exit 1; }
-          row=''
-          for attempt in 1 2 3; do
-            row="$(gh api "$api_url" --jq ".assets[] | select(.name == \"$name\") | [(.digest // \"MISSING\"), (.state // \"unknown\"), .name] | @tsv")"
-            [ "$(printf '%s' "$row" | awk -F'\t' '{print $1}')" = "sha256:$expected_sha" ] && \
-              [ "$(printf '%s' "$row" | awk -F'\t' '{print $2}')" = "uploaded" ] && break
-            [ "$attempt" -eq 3 ] && break
-            sleep 5
-          done
-          actual_sha="$(printf '%s' "$row" | awk -F'\t' '{print $1}')"
-          state="$(printf '%s' "$row" | awk -F'\t' '{print $2}')"
-          actual_name="$(printf '%s' "$row" | awk -F'\t' '{print $3}')"
-          if [ "$actual_name" != "$name" ] || [ "$state" != "uploaded" ] || \
-             [ "$actual_sha" != "sha256:$expected_sha" ]; then
-            echo "::error::远端 APK 未落定或 digest 与本地签名 APK 不符：$row"
-            exit 1
-          fi
-          echo "签名 APK 已上传到草稿，GitHub digest 与本地 sha256 相符"
+            api_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json apiUrl,isDraft \
+              --jq 'select(.isDraft == true) | .apiUrl')"
+            [ -n "$api_url" ] || { echo "::error::APK 上传后 release 已不是草稿或取不到 apiUrl"; exit 1; }
+            row=''
+            for attempt in 1 2 3; do
+              row="$(gh api "$api_url" --jq ".assets[] | select(.name == \"$name\") | [(.digest // \"MISSING\"), (.state // \"unknown\"), .name] | @tsv")"
+              [ "$(printf '%s' "$row" | awk -F'\t' '{print $1}')" = "sha256:$expected_sha" ] && \
+                [ "$(printf '%s' "$row" | awk -F'\t' '{print $2}')" = "uploaded" ] && break
+              [ "$attempt" -eq 3 ] && break
+              sleep 5
+            done
+            actual_sha="$(printf '%s' "$row" | awk -F'\t' '{print $1}')"
+            state="$(printf '%s' "$row" | awk -F'\t' '{print $2}')"
+            actual_name="$(printf '%s' "$row" | awk -F'\t' '{print $3}')"
+            if [ "$actual_name" != "$name" ] || [ "$state" != "uploaded" ] || \
+               [ "$actual_sha" != "sha256:$expected_sha" ]; then
+              echo "::error::远端 APK 未落定或 digest 与本地签名 APK 不符：$row"
+              exit 1
+            fi
+            echo "签名 APK 已上传到草稿，GitHub digest 与本地 sha256 相符"
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<<"$digests")

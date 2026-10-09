@@ -172,7 +172,8 @@ android {
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
-            packaging {                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
+            packaging {
+                jniLibs.keepDebugSymbols.add("*/arm64-v8a/*.so")
                 jniLibs.keepDebugSymbols.add("*/armeabi-v7a/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86/*.so")
                 jniLibs.keepDebugSymbols.add("*/x86_64/*.so")
@@ -180,6 +181,7 @@ android {
         }
         getByName("release") {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 *(proguardRuleFiles + getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toTypedArray()
@@ -217,6 +219,9 @@ android {
 }
 
 androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { variant ->
+    // Build-type ABI filters are unioned with flavor filters by AGP and would widen split APKs.
+    // Keep each flavor's own ABI set; exclude emulator libraries from every release variant.
+    variant.packaging.jniLibs.excludes.addAll(listOf("**/x86/*.so", "**/x86_64/*.so"))
     // AGP 8.11's producer uses --strip-unneeded and retains C++ global static symbols.
     // MERGED_NATIVE_LIBS is read-only in this AGP API; attach to the actual strip producer,
     // whose declared output is an independent copy consumed by APK packaging.

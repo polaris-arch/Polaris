@@ -547,10 +547,9 @@ export function createOnceGate(): () => boolean {
 
 /**
  * 便携版更新包的文件名口径 —— 与产出侧**逐字同口径**：
- * `crates/updater/src/github.rs::PORTABLE_ZIP_PREFIX` + `.zip`（`scripts/verify-packaging.mjs`
+ * `crates/updater/src/github.rs::PORTABLE_ZIP_SUFFIX`（`scripts/verify-packaging.mjs`
  * 的 `updaterPortableCandidates` 也是同一份字面量）。三处任一改名，都要一起改。
  */
-const PORTABLE_ZIP_PREFIX = 'polaris-portable-';
 
 /**
  * 已下载的更新包是否是 **Windows 便携版 zip**（⇒ 后端结构性装不了它，只能交系统 + 用户手动替换）。
@@ -558,7 +557,7 @@ const PORTABLE_ZIP_PREFIX = 'polaris-portable-';
  * # 为什么 UI 必须把它与「形态错配」分开呈现
  *
  * 便携用户走的是**正确**路径，不是出错路径：`find_suitable_update_asset` 的 loose 分支只选
- * `polaris-portable-*.zip`（无回落，宁可不更新也不发安装器）。该 zip 走到
+ * `Polaris_<版本>_x64-win-Portable.zip`（无回落，宁可不更新也不发安装器）。该 zip 走到
  * `runtime/update_install.rs::classify_installer` 时不被识别（只认 `.exe/.dmg/.appimage/.deb`）
  * ⇒ `InstallReject::UnknownAsset` ⇒ command 层 `shell.open` 交系统，返
  * `{ ok:false, reason:"form-mismatch" }`。
@@ -577,7 +576,7 @@ const PORTABLE_ZIP_PREFIX = 'polaris-portable-';
 export function isPortableZipUpdate(downloadedPath: string | null | undefined): boolean {
   if (!downloadedPath) return false;
   const base = downloadedPath.split(/[\\/]/).pop() ?? '';
-  return base.startsWith(PORTABLE_ZIP_PREFIX) && base.endsWith('.zip');
+  return /^Polaris_\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?_x64-win-Portable\.zip$/.test(base);
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

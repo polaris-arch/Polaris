@@ -38,7 +38,7 @@ fn check_app_update_threads_digest_into_sha256_but_tolerates_absence() {
     let hex = "b".repeat(64);
     let json = format!(
         r#"[{{"tag_name":"v2.0.0","published_at":"2024-05-01T00:00:00Z","assets":[
-                {{"name":"polaris_2.0.0_amd64.deb","browser_download_url":"https://x/d","size":9,
+                {{"name":"Polaris_2.0.0_amd64-linux.deb","browser_download_url":"https://x/d","size":9,
                   "digest":"sha256:{hex}"}}]}}]"#
     );
     let r = check_app_update(
@@ -58,7 +58,7 @@ fn check_app_update_threads_digest_into_sha256_but_tolerates_absence() {
 
     // 旧 release 无 digest → sha256=None，但**仍然报有更新**（缺摘要不阻断更新）。
     let json = r#"[{"tag_name":"v2.0.0","published_at":"2024-05-01T00:00:00Z","assets":[
-            {"name":"polaris_2.0.0_amd64.deb","browser_download_url":"https://x/d","size":9}]}]"#;
+            {"name":"Polaris_2.0.0_amd64-linux.deb","browser_download_url":"https://x/d","size":9}]}]"#;
     let r = check_app_update(
         json,
         "1.0.0",
@@ -79,7 +79,7 @@ fn check_app_update_threads_digest_into_sha256_but_tolerates_absence() {
 fn asset_digest_is_optional_and_parses_when_present() {
     // 旧 release 无 digest 字段 → 必须解析成功（缺摘要不是错误，回落 Content-Length 校验）。
     let no_digest = r#"[{"tag_name":"v2.0.0","published_at":"2024-05-01T00:00:00Z",
-            "assets":[{"name":"polaris_2.0.0_amd64.deb","browser_download_url":"https://x/d","size":1}]}]"#;
+            "assets":[{"name":"Polaris_2.0.0_amd64-linux.deb","browser_download_url":"https://x/d","size":1}]}]"#;
     let rs: Vec<GithubRelease> = serde_json::from_str(no_digest).unwrap();
     assert_eq!(rs[0].assets[0].digest, None);
 
@@ -107,11 +107,11 @@ fn source_repo_constants_are_the_polaris_and_sagernet_repos() {
     );
     // 便携资产前缀是三处（package.yml 产出 / 本模块选包 / verify-packaging.mjs 断言）
     // 共用的命名契约，改它必须三处同改，故在此钉死字面值。
-    assert_eq!(PORTABLE_ZIP_PREFIX, "polaris-portable-");
+    assert_eq!(PORTABLE_ZIP_SUFFIX, "x64-win-Portable.zip");
     // Android APK 的尾缀同理，两处（android.yml 的 `release-apk` job 产出 / 本模块选包）
     // 共用；下面 `the_ci_asset_name_is_exactly_what_the_selector_picks` 从 workflow 原文
     // 反向对拍一次，这里只钉本侧的字面值。
-    assert_eq!(ANDROID_APK_SUFFIX, "-android-arm64.apk");
+    assert_eq!(ANDROID_APK_SUFFIX, "arm64-v8a-android.apk");
 }
 
 #[test]
@@ -142,11 +142,11 @@ fn platform_and_arch_mapping_from_std_env_consts() {
 fn release_assets() -> Vec<GithubAsset> {
     vec![
         asset("Polaris_0.2.0_x64-win-setup.exe", 100),
-        asset("polaris-portable-v0.2.0.zip", 90),
-        asset("Polaris_0.2.0_aarch64-mac-arm64.dmg", 110),
-        asset("Polaris_0.2.0_x64-mac-x64.dmg", 111),
-        asset("polaris_0.2.0_amd64.deb", 80),
-        asset("Polaris_0.2.0_amd64.AppImage", 81),
+        asset("Polaris_0.2.0_x64-win-Portable.zip", 90),
+        asset("Polaris_0.2.0_aarch64-mac.dmg", 110),
+        asset("Polaris_0.2.0_x64-mac.dmg", 111),
+        asset("Polaris_0.2.0_amd64-linux.deb", 80),
+        asset("Polaris_0.2.0_amd64-linux.AppImage", 81),
     ]
 }
 
@@ -163,9 +163,9 @@ fn update_asset_windows_loose_picks_portable_zip_never_an_installer() {
 
     // ① 便携形态：拿到 zip，**不是** setup。
     let loose = find_suitable_update_asset(&assets, AssetPlatform::Windows, AssetArch::X64, true)
-        .expect("便携形态必须能选到 polaris-portable-*.zip");
+        .expect("便携形态必须能选到 Polaris_<版本>_x64-win-Portable.zip");
     assert_eq!(
-        loose.name, "polaris-portable-v0.2.0.zip",
+        loose.name, "Polaris_0.2.0_x64-win-Portable.zip",
         "便携用户拿到安装器 = #72 形态错配本体（装出与便携副本并存的第二份程序）"
     );
 
@@ -198,7 +198,7 @@ fn update_asset_windows_loose_picks_portable_zip_never_an_installer() {
     );
 
     // ⑥ `--clobber` 失效产生的 `.zip.1` 重复资产不得被选中（判据是 `ends_with`，不是 `contains`）。
-    let clobber_dupe = vec![asset("polaris-portable-v0.2.0.zip.1", 90)];
+    let clobber_dupe = vec![asset("Polaris_0.2.0_x64-win-Portable.zip.1", 90)];
     assert!(
         find_suitable_update_asset(&clobber_dupe, AssetPlatform::Windows, AssetArch::X64, true)
             .is_none(),
@@ -210,7 +210,7 @@ fn update_asset_windows_loose_picks_portable_zip_never_an_installer() {
 fn update_asset_windows_none_when_no_win_exe() {
     let assets = vec![
         asset("Polaris-0.2.0.dmg", 100),
-        asset("Polaris-0.2.0.AppImage", 100),
+        asset("Polaris_0.2.0_amd64-linux.AppImage", 100),
     ];
     assert!(
         find_suitable_update_asset(&assets, AssetPlatform::Windows, AssetArch::X64, false)
@@ -229,35 +229,34 @@ fn update_asset_other_platforms_unaffected_by_windows_portable_rule() {
     let assets = release_assets();
     let arm =
         find_suitable_update_asset(&assets, AssetPlatform::Macos, AssetArch::Arm64, true).unwrap();
-    assert_eq!(arm.name, "Polaris_0.2.0_aarch64-mac-arm64.dmg");
+    assert_eq!(arm.name, "Polaris_0.2.0_aarch64-mac.dmg");
     let x64 =
         find_suitable_update_asset(&assets, AssetPlatform::Macos, AssetArch::X64, false).unwrap();
-    assert_eq!(x64.name, "Polaris_0.2.0_x64-mac-x64.dmg");
+    assert_eq!(x64.name, "Polaris_0.2.0_x64-mac.dmg");
     let loose_linux =
         find_suitable_update_asset(&assets, AssetPlatform::Linux, AssetArch::X64, true).unwrap();
-    assert_eq!(loose_linux.name, "Polaris_0.2.0_amd64.AppImage");
+    assert_eq!(loose_linux.name, "Polaris_0.2.0_amd64-linux.AppImage");
     let inst_linux =
         find_suitable_update_asset(&assets, AssetPlatform::Linux, AssetArch::X64, false).unwrap();
-    assert_eq!(inst_linux.name, "polaris_0.2.0_amd64.deb");
+    assert_eq!(inst_linux.name, "Polaris_0.2.0_amd64-linux.deb");
 }
 
 /// 正常路径：双 dmg 齐全时两个架构各自命中，互不交叉。
 ///
-/// 名字用 CI 真实产出（`package.yml` 的 `Tag macOS dmg with arch` 步：Tauri 默认名
-/// `Polaris_<ver>_<triple-arch>.dmg` 追加 `-<mac_arch_tag>`），避免测试用理想化名字
-/// 通过、真产物名不通过。注意 arm64 那份名里含 `aarch64`、x64 那份含 `x64`。
+/// 名字用 `package.yml` 的 `Normalize macOS release asset name` 真正产出的命名，
+/// 避免测试用理想化名字通过、真产物名不通过。
 #[test]
 fn update_asset_macos_picks_own_arch_dmg_when_both_present() {
     let assets = vec![
-        asset("Polaris_0.2.0_aarch64-mac-arm64.dmg", 100),
-        asset("Polaris_0.2.0_x64-mac-x64.dmg", 100),
+        asset("Polaris_0.2.0_aarch64-mac.dmg", 100),
+        asset("Polaris_0.2.0_x64-mac.dmg", 100),
     ];
     let arm =
         find_suitable_update_asset(&assets, AssetPlatform::Macos, AssetArch::Arm64, false).unwrap();
-    assert_eq!(arm.name, "Polaris_0.2.0_aarch64-mac-arm64.dmg");
+    assert_eq!(arm.name, "Polaris_0.2.0_aarch64-mac.dmg");
     let x64 =
         find_suitable_update_asset(&assets, AssetPlatform::Macos, AssetArch::X64, false).unwrap();
-    assert_eq!(x64.name, "Polaris_0.2.0_x64-mac-x64.dmg");
+    assert_eq!(x64.name, "Polaris_0.2.0_x64-mac.dmg");
     // 形态（loose_form）不参与 macOS 选包：两个形态选到同一份。
     assert_eq!(
         find_suitable_update_asset(&assets, AssetPlatform::Macos, AssetArch::Arm64, true)
@@ -276,14 +275,14 @@ fn update_asset_macos_picks_own_arch_dmg_when_both_present() {
 #[test]
 fn update_asset_macos_returns_none_rather_than_cross_arch_dmg() {
     // 只剩 arm64 → x64 请求返回 None（不得拿到 arm64 包）。
-    let only_arm = vec![asset("Polaris_0.2.0_aarch64-mac-arm64.dmg", 100)];
+    let only_arm = vec![asset("Polaris_0.2.0_aarch64-mac.dmg", 100)];
     assert!(
         find_suitable_update_asset(&only_arm, AssetPlatform::Macos, AssetArch::X64, false)
             .is_none(),
         "x64 请求在只有 arm64 dmg 时必须返回 None，不得回落跨架构包"
     );
     // 只剩 x64 → arm64 请求返回 None（对称方向）。
-    let only_x64 = vec![asset("Polaris_0.2.0_x64-mac-x64.dmg", 100)];
+    let only_x64 = vec![asset("Polaris_0.2.0_x64-mac.dmg", 100)];
     assert!(
         find_suitable_update_asset(&only_x64, AssetPlatform::Macos, AssetArch::Arm64, false)
             .is_none(),
@@ -304,8 +303,8 @@ fn update_asset_macos_returns_none_rather_than_cross_arch_dmg() {
 #[test]
 fn update_asset_linux_loose_picks_appimage_installed_picks_deb() {
     let assets = vec![
-        asset("polaris_0.2.0_amd64.deb", 100),
-        asset("Polaris-0.2.0.AppImage", 90),
+        asset("Polaris_0.2.0_amd64-linux.deb", 100),
+        asset("Polaris_0.2.0_amd64-linux.AppImage", 90),
     ];
     assert!(
         find_suitable_update_asset(&assets, AssetPlatform::Linux, AssetArch::X64, true)
@@ -320,7 +319,7 @@ fn update_asset_linux_loose_picks_appimage_installed_picks_deb() {
             .ends_with(".deb")
     );
     // installed 但只有 AppImage → 回落 AppImage。
-    let only_img = vec![asset("Polaris-0.2.0.AppImage", 90)];
+    let only_img = vec![asset("Polaris_0.2.0_amd64-linux.AppImage", 90)];
     assert!(
         find_suitable_update_asset(&only_img, AssetPlatform::Linux, AssetArch::X64, false)
             .unwrap()
@@ -376,9 +375,9 @@ fn sample_releases_json() -> String {
             "prerelease": false,
             "published_at": "2024-05-01T12:00:00Z",
             "assets": [
-              {"name": "Polaris-0.2.0-mac-arm64.dmg", "browser_download_url": "https://x/mac", "size": 12345},
-              {"name": "Polaris-Setup-0.2.0-win-x64.exe", "browser_download_url": "https://x/win", "size": 999},
-              {"name": "polaris_0.2.0_amd64.deb", "browser_download_url": "https://x/deb", "size": 555}
+              {"name": "Polaris_0.2.0_aarch64-mac.dmg", "browser_download_url": "https://x/mac", "size": 12345},
+              {"name": "Polaris_0.2.0_x64-win-setup.exe", "browser_download_url": "https://x/win", "size": 999},
+              {"name": "Polaris_0.2.0_amd64-linux.deb", "browser_download_url": "https://x/deb", "size": 555}
             ]
           },
           {
@@ -417,7 +416,7 @@ fn check_app_update_returns_available_with_faithful_fields() {
             assert_eq!(info.file_size, 12345);
             assert_eq!(info.published_at, "2024-05-01T12:00:00Z");
             assert!(!info.is_prerelease);
-            assert_eq!(info.file_name, "Polaris-0.2.0-mac-arm64.dmg");
+            assert_eq!(info.file_name, "Polaris_0.2.0_aarch64-mac.dmg");
         }
         AppUpdateCheck::NoUpdate => panic!("应发现 0.2.0 更新"),
     }
@@ -521,9 +520,9 @@ fn check_app_update_skipped_version_is_no_update() {
 fn check_app_update_prerelease_filtered_unless_included() {
     let json = r#"[
           {"tag_name":"v0.3.0-beta.1","prerelease":true,"published_at":"2024-06-01T00:00:00Z",
-           "assets":[{"name":"Polaris-0.3.0-mac-arm64.dmg","browser_download_url":"https://x/beta","size":1}]},
+           "assets":[{"name":"Polaris_0.3.0_aarch64-mac.dmg","browser_download_url":"https://x/beta","size":1}]},
           {"tag_name":"v0.2.0","prerelease":false,"published_at":"2024-05-01T00:00:00Z",
-           "assets":[{"name":"Polaris-0.2.0-mac-arm64.dmg","browser_download_url":"https://x/stable","size":1}]}
+           "assets":[{"name":"Polaris_0.2.0_aarch64-mac.dmg","browser_download_url":"https://x/stable","size":1}]}
         ]"#;
     // include_prerelease=false → beta 被过滤，最新正式 = 0.2.0。
     let stable = check_app_update(
@@ -570,7 +569,7 @@ fn check_app_update_no_suitable_asset_is_no_update() {
     assert!(matches!(r, AppUpdateCheck::Available(_)));
 
     let mac_only = r#"[{"tag_name":"v0.2.0","prerelease":false,"published_at":"2024-05-01T00:00:00Z",
-          "assets":[{"name":"Polaris-0.2.0-mac-arm64.dmg","browser_download_url":"https://x/mac","size":1}]}]"#;
+          "assets":[{"name":"Polaris_0.2.0_aarch64-mac.dmg","browser_download_url":"https://x/mac","size":1}]}]"#;
     let none = check_app_update(
         mac_only,
         "0.1.0",
@@ -593,7 +592,7 @@ fn check_app_update_windows_loose_form_yields_portable_zip() {
     let json = r#"[{"tag_name":"v0.2.0","prerelease":false,"published_at":"2024-05-01T00:00:00Z",
           "assets":[
             {"name":"Polaris_0.2.0_x64-win-setup.exe","browser_download_url":"https://x/win","size":1},
-            {"name":"polaris-portable-v0.2.0.zip","browser_download_url":"https://x/zip","size":3}]}]"#;
+            {"name":"Polaris_0.2.0_x64-win-Portable.zip","browser_download_url":"https://x/zip","size":3}]}]"#;
 
     let loose = check_app_update(
         json,
@@ -608,7 +607,7 @@ fn check_app_update_windows_loose_form_yields_portable_zip() {
     let AppUpdateCheck::Available(info) = loose else {
         panic!("便携形态应发现更新（便携 zip 在 release 里）");
     };
-    assert_eq!(info.file_name, "polaris-portable-v0.2.0.zip");
+    assert_eq!(info.file_name, "Polaris_0.2.0_x64-win-Portable.zip");
     assert_eq!(info.download_url, "https://x/zip");
 
     // 安装形态在同一份 release 上仍拿 bootstrapper。
@@ -687,7 +686,7 @@ fn check_app_update_empty_releases_is_no_update() {
 fn desktop_only_release_json() -> String {
     r#"[{"tag_name":"v9.9.9","name":"Polaris 9.9.9","body":"notes","prerelease":false,
           "published_at":"2026-09-01T00:00:00Z","assets":[
-            {"name":"Polaris-9.9.9-win-setup.exe","browser_download_url":"https://x/win","size":7}]}]"#
+            {"name":"Polaris_9.9.9_x64-win-setup.exe","browser_download_url":"https://x/win","size":7}]}]"#
         .to_string()
 }
 
@@ -776,18 +775,18 @@ fn check_app_update_release_only_shares_the_first_four_gates() {
 /// 一个**同时带桌面与 Android 资产**的 release 资产集。
 ///
 /// APK 名取的是 `.github/workflows/android.yml` 的 `release-apk` job 真会产出的那个形态
-/// （`polaris-<版本>-android-arm64.apk`），不是理想化名字 —— 同一条纪律见
+/// （`Polaris_<版本>_arm64-v8a-android.apk`），不是理想化名字 —— 同一条纪律见
 /// [`release_assets`] 的 🔴：在虚构输入上绿的选包测试挡不住真产物上的错配。
 fn release_assets_with_apk() -> Vec<GithubAsset> {
     let mut assets = release_assets();
-    assets.push(asset("polaris-0.2.0-android-arm64.apk", 210));
+    assets.push(asset("Polaris_0.2.0_arm64-v8a-android.apk", 210));
     assets
 }
 
-/// Android 只在 **arm64** 上有包；`loose_form` 在这一态上不参与。
+/// 本夹具含 ARMv8 原生包；`loose_form` 在 Android 态上不参与。
 ///
 /// 变异探针（每条各覆盖一条独立逃逸路径）：
-///  - 去掉 `arch != Arm64` 那道闸 ⇒ ③ 转红（x86_64 模拟器会拿到 arm64 包）；
+///  - 放开非 ARM 架构闸 ⇒ ③ 转红（x86_64 模拟器会拿到 arm64 包）；
 ///  - 把 `ends_with(ANDROID_APK_SUFFIX)` 换成 `ends_with(".apk")` ⇒ ④ 转红（拿到别的架构包）；
 ///  - 给 Android 分支补任何一级回落（`.or_else(|| assets.first())`）⇒ ⑤ 转红。
 #[test]
@@ -798,7 +797,7 @@ fn update_asset_android_picks_the_arm64_apk_and_nothing_else() {
     let picked =
         find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Arm64, false)
             .expect("arm64 Android 必须选得到 APK");
-    assert_eq!(picked.name, "polaris-0.2.0-android-arm64.apk");
+    assert_eq!(picked.name, "Polaris_0.2.0_arm64-v8a-android.apk");
 
     // ② `loose_form` 不参与：Android 应用只有一种形态（由系统包管理器装的）。
     let loose = find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Arm64, true)
@@ -809,7 +808,7 @@ fn update_asset_android_picks_the_arm64_apk_and_nothing_else() {
     assert!(
         find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::X64, false)
             .is_none(),
-        "x86_64 Android 上选出了包 —— 本仓只交叉编译 aarch64，发给模拟器的必然是装不上的东西"
+        "x86_64 Android 上选出了包 —— 正式发布只含 ARMv8/ARMv7，发给模拟器的必然装不上"
     );
     assert!(
         find_suitable_update_asset(&assets, AssetPlatform::Android, AssetArch::Other, false)
@@ -894,7 +893,7 @@ fn the_ci_asset_name_is_exactly_what_the_selector_picks() {
             )
         });
     assert_eq!(
-        line, "asset_name=\"polaris-${version}-android-arm64.apk\"",
+        line, "asset_name=\"Polaris_${version}_${abi}-android.apk\"",
         "{WORKFLOW}：资产名的产出侧变了。它与 `ANDROID_APK_SUFFIX` 是同一条契约的两端，\
          漂一个字符的后果不是报错，是 Android 上永远查不到更新。"
     );
@@ -903,8 +902,9 @@ fn the_ci_asset_name_is_exactly_what_the_selector_picks() {
     let name = line
         .trim_start_matches("asset_name=")
         .trim_matches('"')
-        .replace("${version}", "9.9.9");
-    assert_eq!(name, "polaris-9.9.9-android-arm64.apk");
+        .replace("${version}", "9.9.9")
+        .replace("${abi}", "arm64-v8a");
+    assert_eq!(name, "Polaris_9.9.9_arm64-v8a-android.apk");
 
     // 消费侧：真的选包器必须选中它。
     let assets = vec![asset(&name, 210)];
@@ -916,7 +916,7 @@ fn the_ci_asset_name_is_exactly_what_the_selector_picks() {
     assert_eq!(picked.name, name);
 
     // 反向对照：把契约后缀改掉一个字符，选包器就该选不中（证明上面那条不是恒真）。
-    let drifted = vec![asset(&name.replace("arm64", "aarch64"), 210)];
+    let drifted = vec![asset(&name.replace("arm64-v8a", "aarch64"), 210)];
     assert!(
         find_suitable_update_asset(&drifted, AssetPlatform::Android, AssetArch::Arm64, false)
             .is_none(),
@@ -932,7 +932,7 @@ fn the_ci_asset_name_is_exactly_what_the_selector_picks() {
 fn check_app_update_android_end_to_end_with_and_without_an_apk_asset() {
     let with_apk = r#"[{"tag_name":"v9.9.9","name":"Polaris 9.9.9","body":"notes","prerelease":false,
           "published_at":"2026-09-01T00:00:00Z","assets":[
-            {"name":"polaris-9.9.9-android-arm64.apk","browser_download_url":"https://x/apk",
+            {"name":"Polaris_9.9.9_arm64-v8a-android.apk","browser_download_url":"https://x/apk",
              "size":210,"digest":"sha256:c3d4e5f6a7b8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a"}]}]"#;
     let r = check_app_update(
         with_apk,
@@ -947,7 +947,7 @@ fn check_app_update_android_end_to_end_with_and_without_an_apk_asset() {
     let AppUpdateCheck::Available(info) = r else {
         panic!("有 APK 资产却报了「已是最新」");
     };
-    assert_eq!(info.file_name, "polaris-9.9.9-android-arm64.apk");
+    assert_eq!(info.file_name, "Polaris_9.9.9_arm64-v8a-android.apk");
     assert_eq!(info.download_url, "https://x/apk");
     assert_eq!(info.file_size, 210);
     // 摘要必须一路穿到底：下载腿的强校验判据就是它（没有它这一档只剩 Content-Length）。
@@ -979,4 +979,148 @@ fn check_app_update_android_end_to_end_with_and_without_an_apk_asset() {
     };
     assert_eq!(fallback.version, "v9.9.9");
     assert_eq!(fallback.download_url, "");
+}
+
+#[test]
+fn android_armv7_native_split_precedes_universal_and_emulators_never_match() {
+    assert_eq!(AssetArch::from_arch("arm"), AssetArch::Armv7);
+    let assets = vec![
+        asset("Polaris_1.0.0_universal-android.apk", 300),
+        asset("Polaris_1.0.0_armeabi-v7a-android.apk", 100),
+        asset("Polaris_1.0.0_arm64-v8a-android.apk", 200),
+    ];
+    for (arch, expected) in [
+        (AssetArch::Armv7, "Polaris_1.0.0_armeabi-v7a-android.apk"),
+        (AssetArch::Arm64, "Polaris_1.0.0_arm64-v8a-android.apk"),
+    ] {
+        assert_eq!(
+            find_suitable_update_asset(&assets, AssetPlatform::Android, arch, false)
+                .unwrap()
+                .name,
+            expected
+        );
+        assert_eq!(
+            find_suitable_update_asset(&assets[..1], AssetPlatform::Android, arch, false)
+                .unwrap()
+                .name,
+            assets[0].name
+        );
+    }
+    for arch in [AssetArch::X64, AssetArch::Other] {
+        assert!(find_suitable_update_asset(&assets, AssetPlatform::Android, arch, false).is_none());
+    }
+}
+
+#[test]
+fn every_actual_public_name_from_the_producer_contract_is_selectable() {
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/release-assets.mjs");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .args(["names", "9.9.9", "release-all"])
+        .output()
+        .expect("run read-only public-name generator");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let names = String::from_utf8(output.stdout).unwrap();
+    let assets: Vec<_> = names.lines().map(|name| asset(name, 100)).collect();
+    assert_eq!(assets.len(), 9);
+    for (platform, arch, loose, suffix) in [
+        (
+            AssetPlatform::Windows,
+            AssetArch::X64,
+            false,
+            "x64-win-setup.exe",
+        ),
+        (
+            AssetPlatform::Windows,
+            AssetArch::X64,
+            true,
+            "x64-win-Portable.zip",
+        ),
+        (AssetPlatform::Macos, AssetArch::X64, false, "x64-mac.dmg"),
+        (
+            AssetPlatform::Macos,
+            AssetArch::Arm64,
+            false,
+            "aarch64-mac.dmg",
+        ),
+        (
+            AssetPlatform::Linux,
+            AssetArch::X64,
+            false,
+            "amd64-linux.deb",
+        ),
+        (
+            AssetPlatform::Linux,
+            AssetArch::X64,
+            true,
+            "amd64-linux.AppImage",
+        ),
+        (
+            AssetPlatform::Android,
+            AssetArch::Arm64,
+            false,
+            "arm64-v8a-android.apk",
+        ),
+        (
+            AssetPlatform::Android,
+            AssetArch::Armv7,
+            false,
+            "armeabi-v7a-android.apk",
+        ),
+    ] {
+        let picked = find_suitable_update_asset(&assets, platform, arch, loose).unwrap();
+        assert_eq!(picked.name, format!("Polaris_9.9.9_{suffix}"));
+    }
+}
+
+#[test]
+fn old_public_names_and_malformed_version_names_are_not_upgrade_candidates() {
+    for (name, platform, arch, loose) in [
+        (
+            "polaris-portable-v1.0.0.zip",
+            AssetPlatform::Windows,
+            AssetArch::X64,
+            true,
+        ),
+        (
+            "Polaris_1.0.0_x64-mac-x64.dmg",
+            AssetPlatform::Macos,
+            AssetArch::X64,
+            false,
+        ),
+        (
+            "Polaris_1.0.0_amd64.deb",
+            AssetPlatform::Linux,
+            AssetArch::X64,
+            false,
+        ),
+        (
+            "polaris-1.0.0-android-arm64.apk",
+            AssetPlatform::Android,
+            AssetArch::Arm64,
+            false,
+        ),
+        (
+            "Polaris__arm64-v8a-android.apk",
+            AssetPlatform::Android,
+            AssetArch::Arm64,
+            false,
+        ),
+        (
+            "Polaris_1.0.0_x64-win-portable.zip",
+            AssetPlatform::Windows,
+            AssetArch::X64,
+            true,
+        ),
+    ] {
+        assert!(
+            find_suitable_update_asset(&[asset(name, 100)], platform, arch, loose).is_none(),
+            "{name}"
+        );
+    }
 }

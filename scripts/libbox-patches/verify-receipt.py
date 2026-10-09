@@ -21,29 +21,33 @@ android = builder.android
 
 def consumption(apk, abi, r8, receipt, receipt_path):
     """Bind actual package bytes to its clean App candidate without relabeling its component."""
-    builder.require(abi in android.ABIS, 'Unknown APK ABI')
+    selected = ['arm64-v8a', 'armeabi-v7a'] if abi == 'universal' else [abi]
+    builder.require(all(item in android.ABIS for item in selected), 'Unknown APK ABI')
     builder.require(json.loads(receipt_path.read_bytes()) == receipt, 'Component receipt changed before APK consumption')
     current = android.candidate(builder.run)
-    builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', abi], cwd=ROOT)
+    builder.run(['node', str(ROOT / 'scripts/release-assets.mjs'), 'abis', str(apk), abi], cwd=ROOT)
+    for item in selected:
+        builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', item], cwd=ROOT)
     builder.run(['node', str(ROOT / 'scripts/assert-r8-evidence.mjs'), str(r8)], cwd=ROOT)
     with zipfile.ZipFile(apk) as package:
         builder.require(len(package.namelist()) == len(set(package.namelist())), 'Duplicate APK entries')
         embedded = {name.split('/')[1]: android.digest(package.read(name)) for name in package.namelist()
                     if name.startswith('lib/') and name.endswith('/libbox.so')}
-        builder.require(set(embedded) == {abi}, 'APK selected libbox ABI differs')
-        builder.require(embedded[abi] == receipt['nativeLibraries'][f'jni/{abi}/libbox.so']['sha256'], 'APK embedded libbox differs from verified AAR')
+        builder.require(set(embedded) == set(selected), 'APK selected libbox ABI differs')
+        for item in selected:
+            builder.require(embedded[item] == receipt['nativeLibraries'][f'jni/{item}/libbox.so']['sha256'], 'APK embedded libbox differs from verified AAR')
     builder.require(android.candidate(builder.run) == current, 'App candidate changed during APK verification')
     builder.require(json.loads(receipt_path.read_bytes()) == receipt, 'Component receipt changed during APK verification')
-    facts = {'schema': 'polaris-android-source-consumption-v1', 'currentAppCandidate': current,
+    facts = {'schema': 'polaris-android-source-consumption-v2', 'currentAppCandidate': current,
              'componentProducerCandidate': receipt['componentProducerCandidate'],
              'componentReceiptSha256': android.file_hash(receipt_path),
              'androidInputFingerprint': receipt['androidInput']['fingerprint'],
              'sourceReceiptFingerprint': receipt['sourceReceipt']['fingerprint'],
-             'aarSha256': receipt['aar']['sha256'], 'selectedABI': abi, 'embeddedLibboxSha256': embedded[abi],
+             'aarSha256': receipt['aar']['sha256'], 'selectedABIs': selected, 'embeddedLibboxSha256': embedded,
              'apk': {'sha256': android.file_hash(apk), 'bytes': apk.stat().st_size},
              'r8Evidence': android.directory_identity(r8),
              'verifiers': {name: android.file_hash(ROOT / 'scripts' / name)
-                           for name in ('verify-apk.mjs', 'assert-r8-evidence.mjs')}}
+                           for name in ('verify-apk.mjs', 'assert-r8-evidence.mjs', 'release-assets.mjs')}}
     facts['fingerprint'] = android.digest(android.canonical(facts))
     destination = Path(str(apk) + '.source-consumption.json')
     staged = Path(str(destination) + '.tmp')

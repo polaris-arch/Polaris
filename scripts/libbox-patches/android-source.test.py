@@ -606,7 +606,7 @@ class AndroidSourceFixture(unittest.TestCase):
         receipt_path = self.patches / 'build-receipt.json'
         receipt_path.write_text(json.dumps(receipt))
         original = receipt_path.read_bytes()
-        for file in ('verify-apk.mjs','assert-r8-evidence.mjs'):
+        for file in ('verify-apk.mjs','assert-r8-evidence.mjs','release-assets.mjs'):
             (self.app / 'scripts' / file).write_text('fixture verifier identity')
         calls = []
         with patch.object(verifier.android, 'candidate', return_value='a' * 40), patch.object(verifier.builder, 'run', side_effect=lambda args, **kwargs: calls.append(args)):
@@ -615,15 +615,53 @@ class AndroidSourceFixture(unittest.TestCase):
             self.assertEqual(facts['componentProducerCandidate'], 'b' * 40)
             self.assertEqual(facts['apk']['sha256'], android.file_hash(apk))
             self.assertEqual(facts['componentReceiptSha256'], android.file_hash(receipt_path))
-            self.assertEqual(len(calls), 2)
-            self.assertTrue(calls[0][1].endswith('verify-apk.mjs'))
-            self.assertTrue(calls[1][1].endswith('assert-r8-evidence.mjs'))
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(calls[0][1].endswith('release-assets.mjs'))
+            self.assertTrue(calls[1][1].endswith('verify-apk.mjs'))
+            self.assertTrue(calls[2][1].endswith('assert-r8-evidence.mjs'))
             self.assertEqual(receipt_path.read_bytes(), original)
             with zipfile.ZipFile(apk, 'w') as package:
                 package.writestr('lib/arm64-v8a/libbox.so', b'stock replacement')
             with self.assertRaisesRegex(RuntimeError, 'embedded libbox differs'):
                 verifier.consumption(apk, 'arm64-v8a', r8, receipt, receipt_path)
         self.assertEqual(receipt_path.read_bytes(), original)
+
+    def test_universal_consumption_binds_both_aar_abis_and_rejects_extra_or_replaced_library(self):
+        apk = self.root / 'universal.apk'
+        r8 = self.root / 'r8'
+        r8.mkdir()
+        (r8 / 'mapping.txt').write_text('fixture R8 evidence')
+        native = {'arm64-v8a': b'fixture arm64 libbox', 'armeabi-v7a': b'fixture armv7 libbox'}
+        receipt = {'componentProducerCandidate': 'b' * 40, 'androidInput': {'fingerprint': 'c' * 64},
+                   'sourceReceipt': {'fingerprint': 'd' * 64}, 'aar': {'sha256': 'e' * 64},
+                   'nativeLibraries': {f'jni/{abi}/libbox.so': {'sha256': android.digest(data)} for abi, data in native.items()}}
+        receipt_path = self.patches / 'build-receipt.json'
+        receipt_path.write_text(json.dumps(receipt))
+        for file in ('verify-apk.mjs', 'assert-r8-evidence.mjs', 'release-assets.mjs'):
+            (self.app / 'scripts' / file).write_text('fixture verifier identity')
+        def package(values):
+            with zipfile.ZipFile(apk, 'w') as archive:
+                for abi, data in values.items():
+                    archive.writestr(f'lib/{abi}/libbox.so', data)
+        calls = []
+        with patch.object(verifier.android, 'candidate', return_value='a' * 40), patch.object(verifier.builder, 'run', side_effect=lambda args, **kwargs: calls.append(args)):
+            package(native)
+            facts = verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            self.assertEqual(facts['selectedABIs'], ['arm64-v8a', 'armeabi-v7a'])
+            self.assertEqual(facts['embeddedLibboxSha256'], {abi: android.digest(data) for abi, data in native.items()})
+            self.assertEqual([call[-1] for call in calls[1:3]], ['arm64-v8a', 'armeabi-v7a'])
+            for abi in native:
+                changed = dict(native)
+                changed[abi] = b'replacement'
+                package(changed)
+                with self.assertRaisesRegex(RuntimeError, 'embedded libbox differs'):
+                    verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            package({**native, 'x86_64': b'forbidden'})
+            with self.assertRaisesRegex(RuntimeError, 'selected libbox ABI differs'):
+                verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            package({'arm64-v8a': native['arm64-v8a']})
+            with self.assertRaisesRegex(RuntimeError, 'selected libbox ABI differs'):
+                verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
 
     def test_publish_failure_preserves_original_pair(self):
         output, receipt_output, aar = self.root / 'output.aar', self.root / 'receipt.json', self.root / 'fresh.aar'

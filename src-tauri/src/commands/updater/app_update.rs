@@ -516,7 +516,7 @@ fn release_only_response(
 /// **失败语义**（B5 反伪造）：网络/SSRF/超时/非 2xx → `success:false`（前端 error 态显因），**绝不**
 /// 把失败伪装成「已是最新」；无更新 / 无适配资产 / 已跳过 → `{ hasUpdate:false }`（诚实无更新）。
 ///
-/// **Android**：与桌面同样先走 `check_app_update`（选 `*-android-arm64.apk` 资产）。选不到时
+/// **Android**：与桌面同样先走 `check_app_update`（选 `Polaris_<版本>_<ABI>-android.apk` 资产）。选不到时
 /// **不当作「已是最新」**，而是再问一次 `check_app_update_release_only`（只比版本、不选资产）：
 /// 报「有新版本」但三个资产字段如实为空 ⇒ 前端只画「打开发布页」，不画「下载」。
 /// 这一档今天真的会发生 —— APK 资产是 2026-09-13 才开始发的（`.github/workflows/android.yml`
@@ -537,7 +537,7 @@ pub async fn update_check(
     // 🔴 **「选不到资产」绝不等于「已是最新」**（2026-09-06 立，2026-09-13 随 Android 出 APK 复核）：
     // 最早这里对 `from_os` 返 `None` 的平台直接 `return Ok(hasUpdate:false)`，于是 Android 上
     // 「检查更新」**结构性恒答「已是最新」**，连一次请求都不发。现在 Android 是 `AssetPlatform`
-    // 的一个正经变体（选 `*-android-arm64.apk`），但那条教训原样适用于**没有 APK 的那些 release**：
+    // 的一个正经变体（选 `Polaris_<版本>_<ABI>-android.apk`），但那条教训原样适用于**没有 APK 的那些 release**：
     // 资产腿说 `NoUpdate` 之后必须再问一次「到底有没有比当前新的 release」，见下面的 Android 分支。
     //
     // `None` 今天只剩「本仓根本不为它发包的平台」（iOS、各 BSD……）：那些平台上整条自更新腿
@@ -601,7 +601,7 @@ pub async fn update_check(
         // ── Android：资产腿说「没有」时，再问一次「到底有没有新版本」───────────────────
         //
         // 两条腿共用前四道闸（`newer_release_then`），故它们只可能在**资产选择**这一步上分歧：
-        // 「有比当前新的 release，但那个 release 没发 `*-android-arm64.apk`」。
+        // 「有比当前新的 release，但那个 release 没发 `Polaris_<版本>_<ABI>-android.apk`」。
         // 这一档如实报 `hasUpdate:true` + 三个空资产字段 ⇒ 前端按 `downloadUrl` 非空才画
         // 「下载」，于是用户看到的是「有新版本 · 打开发布页」，而不是一句假的「已是最新」。
         //

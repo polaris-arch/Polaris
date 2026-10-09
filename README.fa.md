@@ -53,10 +53,10 @@
 
 | سکو | فایل |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
-| Android | `*-android-arm64.apk` (فقط arm64) |
+| macOS | `Polaris_1.0.0_aarch64-mac.dmg` / `Polaris_1.0.0_x64-mac.dmg` |
+| Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `Polaris_1.0.0_x64-win-Portable.zip` |
+| Linux | `Polaris_1.0.0_amd64-linux.deb` / `Polaris_1.0.0_amd64-linux.AppImage` |
+| Android | `Polaris_1.0.0_arm64-v8a-android.apk` / `Polaris_1.0.0_armeabi-v7a-android.apk` / `Polaris_1.0.0_universal-android.apk` (universal: فقط ARMv8/ARMv7) |
 
 بسته‌ها با گواهی پولی امضای کد امضا نمی‌شوند، بنابراین نخستین اجرا روی هر سکو نیازمند یک گام تأیید دستی است.
 
