@@ -427,6 +427,9 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     + '将来若又出现「被打包脚本读取的源码常量」，必须重新单列 —— '
     + 'ui/src/contracts/ci-impact-coverage-contract.test.ts 会按 verify-packaging 的实际读取面反向校验。',
   'src-tauri/src/runtime.rs': APP_LOGIC('runtime 模块根'),
+  'src-tauri/src/session_restore.rs': APP_LOGIC(
+    '结束会话恢复回执的有界等待与迟到交接；同名子目录仅含 cfg(test) 回归，不改变包结构、资产或随包核契约',
+  ),
   'src-tauri/src/startup.rs': APP_LOGIC('启动编排'),
   'src-tauri/src/test_support.rs': APP_LOGIC('测试夹具（cfg(test) 面）'),
   'src-tauri/src/tests/':
@@ -437,6 +440,9 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/tray.rs': APP_LOGIC('托盘窗口'),
   'src-tauri/src/window_health.rs': APP_LOGIC('主窗白屏自愈'),
   'src-tauri/src/windows_single_instance.rs': APP_LOGIC('Windows 单实例'),
+  'src-tauri/src/windows_session_end.rs':
+    'Windows 结束会话的隐藏窗口与系统代理恢复编排，仅在 Windows 编译进 App，不改变包结构、资产或随包核契约；'
+    + 'Windows GNU 交叉检查与 Windows 原生 CI 覆盖编译，平台中立回归覆盖回执及锁竞争；真实会话消息仍待设备验收。',
   'src-tauri/src/windows_file_id.rs':
     'Windows 文件身份读取只影响运行期 stop/run 引用判定，不改变安装包结构、包内资产或随包核契约；'
     + 'Windows GNU 交叉检查与 Windows CI 测试覆盖该平台编译及纯判定逻辑。',
