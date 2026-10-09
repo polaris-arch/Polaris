@@ -517,6 +517,28 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         1,
         "接收 helper 启动凭据前 Mac/Win 必须声明 NativeBirth；Linux 另有 LinuxBirth。Android/iOS/Other 不会进入此桌面 helper 启动路径。",
     ),
+    (
+        "crates/helper/src/platform/linux/core_installer.rs",
+        "let received = receive_src( Path::new(src_dir), want_hash, Platform::Linux, Some(owner_uid), SRC_LIMITS, )",
+        1,
+        "不是分派：linux helper 的 install-core 入口把**自己的平台**作为实参交给共用的收文件函数，\
+         由它决定白名单里的两个文件名（`core_payload`，对 `Platform` 穷举 match）。本模块只在 \
+         linux 上编译，别的平台走不到这一行。",
+    ),
+    (
+        "crates/helper/src/platform/macos/handler.rs",
+        "let installed = install_core_files( core_dir, src_dir, &params.want_hash, Platform::Mac, peer_uid, )",
+        1,
+        "不是分派：macOS helper 的 install-core 入口把自己的平台作为实参交给共用安装函数（同上）。\
+         macOS 没有配套库，白名单只有核文件名。别的平台各有自己的入口，不经这一行。",
+    ),
+    (
+        "crates/helper/src/platform/windows/helper.rs",
+        "let installed = install_core_files( &core_dir, Path::new(&p.src_dir), &p.want_hash, Platform::Win, owner_uid, )",
+        1,
+        "不是分派：Windows helper 的 install-core 入口把自己的平台作为实参交给共用安装函数（同上），\
+         白名单为 `sing-box.exe` + `libcronet.dll`。别的平台各有自己的入口，不经这一行。",
+    ),
 
     (
         "src-tauri/src/runtime/proxy/mesh_apply/candidate.rs",
@@ -1647,21 +1669,6 @@ const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
         1,
         "同 `commands/misc/logs.rs` 那条，逐字同形（诊断包与备份文件各自需要 Node 口径平台串）。未\
          知平台原样透传。",
-    ),
-    (
-        "src-tauri/src/runtime/core_paths.rs",
-        "\"windows\" => Some(\"libcronet.dll\"), \"linux\" => Some(\"libcronet.so\"), _ => None,",
-        1,
-        "未知平台 → `None` = 「本平台没有 cronet 动态 sidecar」。与 macOS 同臂（macOS 静态编入）。\
-         诚实：未知平台既没有随包动态库，也不知道它的动态库扩展名，返 None 让上层按「无 sidecar」\
-         处理。",
-    ),
-    (
-        "src-tauri/src/runtime/core_paths.rs",
-        "if os == \"windows\"",
-        1,
-        "未知平台 → `sing-box`（无 `.exe` 后缀）。正确：`.exe` 后缀是 Windows 独有的可执行文件约定\
-         ，类 unix 与未知平台一律无后缀。",
     ),
     (
         "src-tauri/src/runtime/proxy/platform_contracts.rs",

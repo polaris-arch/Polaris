@@ -6557,6 +6557,10 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
 
 /// 生产的开流入口：没有管理端点、端点上没有服务端，都只是这条流建不起来（状态「失败」），不报错、
 /// 不阻塞；「关闭」档根本不建流。
+///
+/// 「不阻塞」与「失败」是两件事，分开断言：等待以 [`READBACK_OPEN_WAIT_MS`] 为限，而对一个没人
+/// 监听的回环端口，拒连多久才报回来由系统定（Windows 要先重发几次 SYN），可以晚于这个上限；
+/// 再晚也晚不过客户端自己的拨号时限。
 #[tokio::test]
 async fn opening_the_readback_never_fails_the_round() {
     let unbound = {
@@ -6570,7 +6574,26 @@ async fn opening_the_readback_never_fails_the_round() {
             SpeedBindingContext::default(),
             WatchedInbounds::ProbePool,
         );
+        let started = std::time::Instant::now();
         readback.ready().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(READBACK_OPEN_WAIT_MS + 1_000),
+            "起测前的等待以上限为界：{endpoint:?} 等了 {:?}",
+            started.elapsed()
+        );
+        if endpoint.is_none() {
+            // 没有端点不涉及任何网络动作：等待一返回就已经是失败。
+            assert_eq!(readback.witness.state(), WitnessState::Failed);
+        }
+        let settle = std::time::Instant::now()
+            + polaris_singbox_grpc::CONNECT_TIMEOUT
+            + Duration::from_secs(1);
+        while readback.witness.state() == WitnessState::Connecting
+            && std::time::Instant::now() < settle
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 在关流之前就得是失败：关流会把还在建的流记成失败，那样下面的断言就什么也没验。
         assert_eq!(
             readback.witness.state(),
             WitnessState::Failed,

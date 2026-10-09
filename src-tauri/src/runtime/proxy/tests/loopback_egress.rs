@@ -286,9 +286,9 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "crates/singbox-grpc/src/h2c.rs",
-        "call",
+        "connect_h2c",
         None,
-        "管理 API gRPC 传输（带 secret 的管理口，不是代理入站）",
+        "管理 API gRPC 传输的生产拨号器（带 secret 的管理口，不是代理入站）",
     ),
 ];
 

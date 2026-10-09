@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use super::super::{ConfigChecker, SingBoxConfigChecker};
 use crate::test_support::{
-    ran_in_isolated_worker, write_sleeping_probe, TestDir, PROBE_SLEEP_MILLIS,
+    ran_in_isolated_worker, sleeping_probe_script, write_executable_stand_in, write_sleeping_probe,
+    TestDir, PROBE_SLEEP_MILLIS,
 };
 
 fn config_fixture(dir: &Path) -> PathBuf {
@@ -87,19 +88,15 @@ async fn times_out_instead_of_hanging_and_kills_the_child() {
     }
     let dir = TestDir::new("polaris-login-cfgcheck-timeout-");
     let witness = dir.path().join("killed.txt");
-    let probe = write_sleeping_probe(dir.path(), &witness);
+    let probe = dir.path().join("sleeping-probe.sh");
     let config = config_fixture(dir.path());
     let started = dir.path().join("started.txt");
-    let script = std::fs::read_to_string(&probe).unwrap();
-    std::fs::write(
+    let script = sleeping_probe_script(&witness);
+    let (shebang, body) = script.split_once('\n').unwrap();
+    write_executable_stand_in(
         &probe,
-        script.replacen(
-            "#!/bin/sh\n",
-            &format!("#!/bin/sh\n: > '{}'\n", started.display()),
-            1,
-        ),
-    )
-    .unwrap();
+        format!("{shebang}\n: > '{}'\n{body}", started.display()),
+    );
 
     let check = tokio::spawn(async move { SingBoxConfigChecker.check(&probe, &config).await });
     let start_deadline = std::time::Instant::now() + Duration::from_secs(2);

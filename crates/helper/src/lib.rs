@@ -16,7 +16,7 @@
 //! ## 共用层（顶层模块，无 cfg）
 //!
 //! - [`core_install`]：内核 sha256 校验 + 逐文件原子安装 + 清残留。mac/linux 核心流程逐字同，
-//!   平台差异（mac xattr/codesign、linux 保守 lib*.so 清理）由各平台模块在调用前后加 hook。
+//!   平台差异（mac xattr/codesign、linux 按目录 fd 的清理）由各平台模块在调用前后加 hook。
 //! - [`line_io`]：行协议读写原语（trim `\r\n` / 写行 + flush），泛型于 `std::io::{BufRead, Write}`。
 //!   mac/linux 共用；**win 走裸 Win32 `HANDLE` 整帧读，是真差异**，不用本模块。
 //! - [`token`]：socket 鉴权 token 读写 + **常量时间比对**。mac/win 逐字同 → 单一真值。

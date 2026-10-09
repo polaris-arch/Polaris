@@ -491,17 +491,14 @@ fn bad_config() -> Value {
 /// 立退型假核则让闸门收到一个假的「配置无效」。二者都不是被测行为，是假核没跟上真核的契约。
 #[cfg(unix)]
 fn write_fake_core(dir: &std::path::Path, name: &str, run_body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
     // 按**整条 argv** 找 `check`，不按位置：闸门发的是 `--disable-color check -c <path>`
     // （`check` 在 `$2`），而 spawn 发的是 `run -c <path>`。写死 `$1` 会漏掉前者（实测：漏了就等于
     // 假核对 check 走 run 的语义，常驻型假核把闸门吊到超时）。
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &p,
         format!("#!/bin/sh\ncase \" $* \" in *\" check \"*) exit 0;; esac\n{run_body}\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     p
 }
 
@@ -1112,10 +1109,9 @@ fn flush_ready_runtime() -> (Arc<ProxyRuntime>, TestDir, u64) {
 /// 「第一次 vs 之后」靠**落盘 marker** 记状态：闸门每轮都是一个**全新子进程**，进程内变量存不住。
 #[cfg(unix)]
 fn write_fake_checking_core(dir: &std::path::Path, reject_index: usize) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join("fake-checking-sing-box");
     let marker = dir.join("gate-check-seen").to_string_lossy().into_owned();
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &p,
         format!(
             "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
@@ -1125,19 +1121,16 @@ fn write_fake_checking_core(dir: &std::path::Path, reject_index: usize) -> PathB
                  unknown outbound type: zzz' >&2\n\
                  exit 1;;\nesac\nexit 1\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     p
 }
 
 /// 恒接受 `check` 的假核，并把真实进程启动次数累计到文件。
 #[cfg(unix)]
 fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let binary = dir.join("fake-accepting-sing-box");
     let counter = dir.join("gate-check-count");
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &binary,
         format!(
             "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
@@ -1145,8 +1138,6 @@ fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
                  n=$((n + 1))\nprintf '%s\\n' \"$n\" > {counter}\nexit 0;;\nesac\nexit 1\n",
             counter = counter.to_string_lossy()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (binary, counter)
 }

@@ -1037,7 +1037,12 @@ umask 077\n\
 	mkdir -p /Library/PrivilegedHelperTools \"$SUPPORT\"\n\
 # umask 077 会把新建目录设成 700 → 普通用户 app 无法穿越连 socket(EACCES)。目录须 755 可穿越\n\
 # （socket 内部仍靠 token 鉴权 + token 文件 600 保护）。\n\
+# chmod / chown 对最后一级会跟随符号链接，而父目录对 admin 组可写：先确认它是个真目录再动。\n\
+if [ -L \"$SUPPORT\" ] || [ ! -d \"$SUPPORT\" ]; then echo \"polaris-helper: refusing $SUPPORT: not a real directory\" >&2; exit 1; fi\n\
 chmod 755 /Library/PrivilegedHelperTools \"$SUPPORT\"\n\
+# 支持目录的属主显式归 root：它的父目录 /Library/Application Support 对 admin 组可写，\n\
+# 目录可能早就被别人建好了 —— 属主不是 root 的话，里面的 token、socket、受管核目录的名字都能被换掉。\n\
+chown -h root:wheel \"$SUPPORT\"\n\
 	printf '%s' {token} > \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
 chown root:wheel \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"; chmod 600 \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
 COREDIR={core_dir}\n\
@@ -1209,6 +1214,23 @@ WantedBy=multi-user.target\n",
 /// 会先落地成 0644 再被 chmod 收紧（存在可读瞬窗）。故创建走 `(umask 077; touch …)` 子壳
 /// ——**不依赖**继承来的 umask，新建即 0600；随后的 `chmod 0600` 负责把既存的宽权限文件
 /// （老版本装出来的 0644）收紧，两者缺一不可。子壳只圈 touch，不影响脚本其余步骤的 umask。
+///
+/// 🔴 **脚本开头 `umask 022`，且三个目录的属主与权限显式定**：`mkdir -p` 的创建模式是
+/// `0777 & ~umask`，脚本经 pkexec 跑、umask 继承自调用环境 —— 宽松的 umask 会把
+/// `/usr/local/lib/polaris` 建成组可写乃至人人可写，而 helper 二进制与受管核目录都在它下面
+/// （对目录有写权就能把里面的名字换掉，不需要对文件本身有写权）。`chown`/`chmod` 不放在
+/// 「新建时」的分支里：老版本装出来的、已经是宽权限的目录也要在这里纠正。
+///
+/// 三个目录都经 `secure_dir` 一个一个处置，**先验后改**：`chown`/`chmod` 对路径最后一级会跟随
+/// 符号链接，而 Debian 系的 `/usr/local/lib` 对 `staff` 组可写 —— 那里的人可以抢先把我们的目录名
+/// 做成一个指向别处的链接，让 root 去改别处的属主与权限。故建完先看它是不是一个真目录，
+/// 不是就退出、什么都不改；`chown` 另带 `-h`。安装目录验过之后才去建它下面的受管核目录。
+///
+/// 受管核目录里**既有的内容**也要过一遍：目录权限曾经过宽的话，里面的核或配套库可能早被换过，
+/// 而播种只在核缺失时发生，换过的东西会一直留着。凡不是 root 所有、或组与其他人可写、或不是
+/// 常规文件的直接子项一律删掉（`find` 不跟随链接，`rm` 删的是链接本身），再按原逻辑播种。
+/// 不改成每次无条件重播：留下来的只可能是 root 所有、别人写不动的常规文件，其内容是否就是
+/// 现役核由起核前的 sha256 对账负责；无条件重播则会在随包核读不到时把整个安装打断。
 fn build_linux_install_script(paths: &InstallPaths, params: &InstallParams) -> String {
     let helper_dest = paths.binary.to_string_lossy();
     let core_dir = paths.core_dir.to_string_lossy();
@@ -1226,22 +1248,33 @@ fn build_linux_install_script(paths: &InstallPaths, params: &InstallParams) -> S
         |d| d.join("libcronet.so").to_string_lossy().into_owned(),
     );
     let unit = build_linux_unit(paths);
+    // INSTALL_DIR = helper 二进制父目录（/usr/local/lib/polaris），受管核目录也在它下面。
+    let install_dir = paths
+        .binary
+        .parent()
+        .map_or_else(|| paths.binary.clone(), Path::to_path_buf);
 
     format!(
         "#!/bin/sh\n\
 	set -eu\n\
+	umask 022\n\
 	DEST={dest}\n\
 	UNIT={unit_path}\n\
 	SERVICE={service}\n\
-	mkdir -p {core_dir}\n\
-	chown root:root {core_dir}\n\
-chmod 0755 {core_dir}\n\
+	secure_dir() {{\n\
+	  mkdir -p \"$1\"\n\
+	  if [ -L \"$1\" ] || [ ! -d \"$1\" ]; then echo \"polaris-helper: refusing $1: not a real directory\" >&2; exit 1; fi\n\
+	  chown -h root:root \"$1\"\n\
+	  chmod 0755 \"$1\"\n\
+	}}\n\
+	secure_dir {install_dir}\n\
+	secure_dir {core_dir}\n\
+	find {core_dir} -mindepth 1 -maxdepth 1 \\( ! -type f -o ! -user root -o -perm /022 \\) -exec rm -rf -- {{}} +\n\
 if [ ! -x {core_bin} ]; then\n\
   install -o root -g root -m 0755 {bundled_core} {core_bin}\n\
   [ -f {bundled_cronet} ] && install -o root -g root -m 0755 {bundled_cronet} {core_dir_cronet} || true\n\
 fi\n\
-mkdir -p {state_dir}\n\
-chmod 0755 {state_dir}\n\
+	secure_dir {state_dir}\n\
 	(umask 077; touch {authfile})\n\
 	chmod 0600 {authfile}\n\
 	grep -qxF '{uid}' {authfile} || printf '%s\\n' '{uid}' >> {authfile}\n\
@@ -1333,6 +1366,7 @@ chmod 0755 {state_dir}\n\
 	echo polaris-helper-install-ok\n",
         src = shell_quote(&src),
         dest = shell_quote(&helper_dest),
+        install_dir = shell_quote(&install_dir.to_string_lossy()),
         core_dir = shell_quote(&core_dir),
         core_bin = shell_quote(&core_bin),
         bundled_core = shell_quote(&bundled_core),

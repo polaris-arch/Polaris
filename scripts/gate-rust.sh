@@ -34,8 +34,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# --with-cross：额外跑 ci.yml 里那三条**只在 Linux 跑、且需要联网**的门（两条跨目标 clippy /
-# 豁免反腐烂，加一条 Android 影响面 dep-info 对差）。
+# --with-cross：额外跑 ci.yml 里那四条**只在 Linux 跑、且需要联网**的门（两条跨目标 clippy /
+# 豁免反腐烂，一条随仓路径源零诊断，加一条 Android 影响面 dep-info 对差）。
 # 默认关闭的理由不是它们不重要，恰恰相反——它们守的是本机根本不编译的代码
 # （`#[cfg(windows)]` / `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "ios")]` 块里的错误
 # 在本机编译取材面之外），以及只在 android 编译面上才看得见的那半张登记表。
@@ -50,8 +50,9 @@ for arg in "$@"; do
 用法: scripts/gate-rust.sh [--with-cross]
 
   默认        跑 ci.yml 的 5 条常规 Rust 门（不联网）
-  --with-cross 额外跑三条要 android 目标 / NDK 的门：对 ci.yml 跨目标步骤登记的每个目标跑
-               clippy；用 dep-info 对差查 Android 影响面登记表完备不完备；检查
+  --with-cross 额外跑四条要交叉目标 / NDK 的门：对 ci.yml 跨目标步骤登记的每个目标跑
+               clippy；随仓路径源（vendor/）在这些目标上零诊断；用 dep-info 对差查 Android
+               影响面登记表完备不完备；检查
                scripts/cross-target-exempt.json 的豁免有没有腐烂。目标清单见下方 cross-clippy
                门本体（**本用法文本里刻意不重复三元组字面量**：gate-rust-ci-parity 的对拍门按
                整份文件抠三元组，写在这里会让「循环没跟上 ci.yml」的漂移照样判绿）。
@@ -204,6 +205,11 @@ if [ "$WITH_CROSS" = 1 ]; then
     # 一行都编不到。ios 这条腿今天守住的是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓已验」。
     PATH="$NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
   '
+  # ── ci.yml「Vendored path sources stay diagnostic-free」的本机镜像 ──
+  # 判据本体在被调脚本里，两侧调的是同一条命令（gate-rust-ci-parity.test.mjs 逐字对拍，并把这里的
+  # 目标清单与上面 cross-clippy 的清单钉成同一份）。排在 cross-clippy 之后：目标由那一格
+  # `rustup target add`。
+  run_gate cross-vendored bash scripts/check-vendored-path-sources.sh x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
   # ── ci.yml「Android impact face must be registered (dep-info 对差)」的本机镜像 ──
   #
   # 它守的是：`ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 android.yml 的**唯一**

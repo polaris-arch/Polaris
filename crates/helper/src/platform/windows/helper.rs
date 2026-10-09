@@ -19,6 +19,7 @@ use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME_WI
 use crate::platform::windows::coreacl;
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
+use polaris_helper_proto::Platform;
 mod native_birth;
 use crate::token::{is_authed_constant_time, TokenStore};
 use native_birth::{stop_locked, NativeCustody};
@@ -62,6 +63,9 @@ pub struct WinHelper<T, P, N> {
     /// `Arc<Mutex<..>>`：child 状态须在**父死看护后台线程**（W15）与管道命令线程间共享（Go 的
     /// 包级 `mu`/`child` 全局，goroutine 直接引用；Rust 用 Arc 共享所有权）。
     child_mu: Arc<Mutex<ChildState>>,
+    /// 只管 install-core 的互斥：装核不持 `child_mu`（见 `handle_install_core`），而管道最多
+    /// 4 路并发 —— 不串行的话两次安装会互相覆盖对方的 `.new` 与备份。
+    install_mu: Mutex<()>,
     token: T,
     /// `Arc<P>`：父死看护的 `on_parent_dead` 闭包（后台线程）须持 proc 收割 child，故需共享所有权。
     proc: Arc<P>,
@@ -179,6 +183,7 @@ where
     ) -> Self {
         Self {
             child_mu: Arc::new(Mutex::new(ChildState::default())),
+            install_mu: Mutex::new(()),
             token,
             proc: Arc::new(proc),
             net,
@@ -415,6 +420,11 @@ where
         if busy {
             return HandleOutcome::Respond(InstallResult::Busy.to_response());
         }
+        // 安装之间串行（毒化的锁照用：它不保护任何内存状态，只排队）。
+        let _installing = self
+            .install_mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // S5：落盘前复核落盘目标本身（**不是** exec 面）。放宽即回 `ERR coredir-acl-weakened` 且
         // 一个字节都不写 —— 见 [`Self::install_core_acl_gate`]。判活闸在前：`ERR busy` 是更具体的
         // 前置条件，且核在跑时 rename 本就必失败。
@@ -422,12 +432,20 @@ where
             return HandleOutcome::Respond(Response::Err(err));
         }
         let core_dir = self.derived_core_dir();
-        match install_core_files(
+        // Windows 这条腿不判源文件属主（本批不取管道对端身份）。本模块在非 Windows 上只为单测
+        // 编译，那时底下走的是 unix 那条腿，给它当前进程的 uid。
+        #[cfg(windows)]
+        let owner_uid = None;
+        #[cfg(not(windows))]
+        let owner_uid = Some(nix::unistd::Uid::current().as_raw());
+        let installed = install_core_files(
             &core_dir,
             Path::new(&p.src_dir),
             &p.want_hash,
-            SINGBOX_BIN_NAME_WIN,
-        ) {
+            Platform::Win,
+            owner_uid,
+        );
+        match installed {
             Ok(_) => HandleOutcome::Respond(Response::Ok(ResponseKind::Installed)),
             Err(e) => HandleOutcome::Respond(e.to_response()),
         }

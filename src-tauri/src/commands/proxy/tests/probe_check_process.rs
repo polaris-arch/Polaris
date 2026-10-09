@@ -15,7 +15,9 @@
 use std::time::Duration;
 
 use super::super::{run_probe_check, ProbeCheck};
-use crate::test_support::{ran_in_isolated_worker, write_sleeping_probe, TestDir};
+use crate::test_support::{
+    ran_in_isolated_worker, write_executable_stand_in, write_sleeping_probe, TestDir,
+};
 
 /// **正向对照**：探针在预算内跑完 ⇒ 判 `Supported`，且见证文件真的出现。
 ///
@@ -63,12 +65,11 @@ async fn timing_out_is_indeterminate_and_kills_the_child() {
     }
     let dir = TestDir::new("polaris-probe-check-timeout-");
     let witness = dir.path().join("killed.txt");
-    let probe = write_sleeping_probe(dir.path(), &witness);
-    std::fs::write(
+    let probe = dir.path().join("sleeping-probe.sh");
+    write_executable_stand_in(
         &probe,
         format!("#!/bin/sh\nsleep 10\n: > '{}'\n", witness.display()),
-    )
-    .unwrap();
+    );
 
     let config = dir.path().join("probe.json");
     std::fs::write(&config, b"{}").unwrap();

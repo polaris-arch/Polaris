@@ -171,7 +171,17 @@ It was added (2026-08-29) after a batch of stowaways that had **already shipped*
 
 Six workflows divide the work (`.github/workflows/`):
 
-- **`ci.yml`** — fast gate: `cargo fmt + clippy + build + test`, triggered on PRs and pushes to main (a documentation-only push to main does not trigger it). PRs and releases run Linux / Windows / macOS; a push to main runs Linux only. Its job is "is the change correct". Setting the three `cargo-test` jobs as required checks is recommended.
+- **`ci.yml`** — the Rust gate; its job is "is the change correct". Three parallel jobs:
+  - `fmt + clippy (<os>)`: formatting and clippy (`-D warnings`); the Linux leg also runs rustdoc and resolves the Cronet sources.
+  - `cross-target clippy + android face` (Linux only): clippy for the four cross targets (Windows / macOS / Android / iOS), a check that the vendored third-party copies under `vendor/` produce no diagnostics on those targets, and checks of the Android impact registry and the cross-target exemption table. Packages with C dependencies are exempt on some targets (see `scripts/cross-target-exempt.json`), so this job does not replace the native legs.
+  - `build + test (<os>)`: `cargo build` and `cargo test`.
+
+  Triggers and platforms:
+  - A push to `main` runs only the Linux native tests plus the cross-target clippy (a documentation-only push does not trigger it).
+  - The Windows and macOS native lint and tests run on pull requests, on manual dispatch, and for releases (a release calls this workflow from `package.yml` and is not published unless all three platforms pass).
+  - A change that touches platform-specific branches must have the three platforms dispatched manually before it lands: `gh workflow run ci.yml --ref <branch>`; add `-f os=windows-2022` or `-f os=macos-14` to confirm a single platform. A direct push to `main` does not run those two platforms, so a failure on a native leg stays unseen until the next manual dispatch or release.
+
+  The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`); `scripts/gate-rust-ci-parity.test.mjs` keeps it in step with `ci.yml`. Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
 - **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml` (without uploading artifacts), and `android.yml` only for the affected faces.
 - **`desktop-core.yml`** — call-only: four native runners build the desktop core from source and assemble the core bundle.

@@ -283,18 +283,67 @@ pub(crate) const PROBE_SLEEP_MILLIS: u64 = 400;
 /// 探针**完全忽略 argv**：调用方发的是固定的一串参数，脚本一个都不需要读。
 #[cfg(unix)]
 pub(crate) fn write_sleeping_probe(dir: &Path, witness: &Path) -> PathBuf {
+    let script = dir.join("sleeping-probe.sh");
+    write_executable_stand_in(&script, sleeping_probe_script(witness));
+    script
+}
+
+/// [`write_sleeping_probe`] 的脚本正文。要在探针里再插一行的测试取它改写后自己落盘，
+/// 不得先落盘再覆写（覆写同样会在本进程里开出写句柄，见 [`write_executable_stand_in`]）。
+#[cfg(unix)]
+pub(crate) fn sleeping_probe_script(witness: &Path) -> String {
+    let seconds = PROBE_SLEEP_MILLIS as f64 / 1000.0;
+    format!("#!/bin/sh\nsleep {seconds}\n: > '{}'\n", witness.display())
+}
+
+/// 落一个**随后要被直接执行**的替身文件（0o755）。测试里凡是「写出一个文件再把它当程序起」
+/// 都必须走这里，`src-tauri/tests/executable_stand_in_discipline.rs` 在源码层面强制。
+///
+/// # 它消除的竞态
+///
+/// `execve` 对一个**仍有写句柄开着**的文件返回 `ETXTBSY`。「写完、关掉、再执行」在单线程里
+/// 没有问题，但测试进程是多线程的：本线程持有写句柄的那一小段时间里，别的测试线程若正好
+/// `fork` 出子进程，那个子进程会**继承**这枚写句柄，直到它自己 `exec`（`O_CLOEXEC` 这时才
+/// 生效）或退出为止。本线程随后关掉自己的那一份并去执行文件，内核看到的写句柄计数仍不为零。
+/// 这扇窗与本线程做了什么无关，只取决于旁边的线程何时 `fork`，所以表现为高负载下的偶发失败。
+///
+/// # 为什么这样写就没有了
+///
+/// 目标文件的写句柄从头到尾**只存在于一个专门起的 `cp` 子进程里**：本进程把内容写进旁边的
+/// 暂存文件（它从不被执行，有没有人继承它的写句柄都无所谓），再让 `cp` 去打开、写入、关闭
+/// 目标文件。本进程从未打开过目标文件，于是旁边的线程无论何时 `fork`，都没有它的写句柄可以
+/// 继承；`cp` 自己不是多线程的，它退出（下面 `status` 等到）时写句柄计数归零，此后再没有人
+/// 以写方式打开它。加执行位用的是按路径的 `chmod`，不开文件。
+///
+/// 不是重试：重试只是把撞窗的概率再乘一次，而且会把「替身真的起不来」也一并吞掉。
+///
+/// # 平台
+///
+/// 只有 unix 一版。替身是 shell 脚本，调用点本就全部 `#[cfg(unix)]`；`cp` 与这些脚本里用到的
+/// `sleep` / `touch` 一样从 `PATH` 取，没有引入新的前提。macOS 的 `execve` 同样返回
+/// `ETXTBSY`，机制与修法一致。Windows 没有这类调用点：那里的对应故障是「映像文件正被占用」，
+/// 而 std 打开的句柄默认不可继承，别的线程起子进程带不走它。
+///
+/// 已有内容的可执行文件（例如把真核复制到另一路径）同样走这里：读出字节再交给它，
+/// 不要用 `std::fs::copy` —— 那也是在本进程里开目标文件的写句柄。
+#[cfg(unix)]
+pub(crate) fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>) {
     use std::os::unix::fs::PermissionsExt;
 
-    let script = dir.join("sleeping-probe.sh");
-    let seconds = PROBE_SLEEP_MILLIS as f64 / 1000.0;
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nsleep {seconds}\n: > '{}'\n", witness.display()),
-    )
-    .expect("探针脚本必须可写");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("探针脚本必须可加执行位");
-    script
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".staged");
+    let staged = PathBuf::from(staged);
+    std::fs::write(&staged, contents).expect("替身暂存文件必须可写");
+    let status = std::process::Command::new("cp")
+        .arg(&staged)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("替身写入子进程必须起得来");
+    assert!(status.success(), "替身写入子进程失败：{status}");
+    std::fs::remove_file(&staged).expect("替身暂存文件必须可删");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("替身必须可加执行位");
 }
 
 /// 把一条真起 `sing-box check` 探针的测试原样放进**独占子进程**里跑；返回 `true` 表示本进程是

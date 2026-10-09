@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::{module_code, TestDir};
+use polaris_helper_proto::Platform;
 
 // ── promote_names（allowlist）──
 
@@ -16,14 +17,16 @@ fn promote_names_keeps_core_and_cronet_only() {
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
-    let got = promote_names(&entries, "sing-box");
+    // 白名单是各平台的精确名：linux 只带 `libcronet.so`，别的 `libcronet.*` 不带
+    // （helper 见到会拒掉整个请求）。
     assert_eq!(
-        got,
-        vec![
-            "libcronet.dylib".to_owned(),
-            "libcronet.so".to_owned(),
-            "sing-box".to_owned()
-        ]
+        promote_names(&entries, Platform::Linux),
+        vec!["libcronet.so".to_owned(), "sing-box".to_owned()]
+    );
+    // macOS 没有配套库。
+    assert_eq!(
+        promote_names(&entries, Platform::Mac),
+        vec!["sing-box".to_owned()]
     );
 }
 
@@ -39,7 +42,7 @@ fn promote_names_excludes_backup_and_marker() {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-    let got = promote_names(&entries, "sing-box");
+    let got = promote_names(&entries, Platform::Linux);
     assert!(
         !got.iter().any(|n| n.ends_with(".bak")),
         "备份文件绝不能进受保护核目录，实得 {got:?}"
@@ -57,8 +60,16 @@ fn promote_names_windows_filename() {
         .map(|s| (*s).to_owned())
         .collect();
     assert_eq!(
-        promote_names(&entries, "sing-box.exe"),
+        promote_names(&entries, Platform::Win),
         vec!["sing-box.exe".to_owned()]
+    );
+    let with_sidecars: Vec<String> = ["sing-box.exe", "libcronet.dll", "libcronet.so"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(
+        promote_names(&with_sidecars, Platform::Win),
+        vec!["libcronet.dll".to_owned(), "sing-box.exe".to_owned()]
     );
 }
 
@@ -105,49 +116,84 @@ fn sidecar_payload_match_requires_the_same_names_and_bytes() {
     let src = TestDir::new("polaris-core-promote-test-");
     let dest = TestDir::new("polaris-core-promote-test-");
     assert!(
-        sidecar_payload_matches(src.path(), dest.path()),
+        sidecar_payload_matches(src.path(), dest.path(), Platform::Linux),
         "macOS 两边均无动态库是合法稳态"
     );
 
     std::fs::write(src.path().join("libcronet.so"), b"CRONET-A").unwrap();
     assert!(
-        !sidecar_payload_matches(src.path(), dest.path()),
+        !sidecar_payload_matches(src.path(), dest.path(), Platform::Linux),
         "源有而受保护目录缺失必须判漂移"
     );
 
     std::fs::write(dest.path().join("libcronet.so"), b"CRONET-A").unwrap();
-    assert!(sidecar_payload_matches(src.path(), dest.path()));
+    assert!(sidecar_payload_matches(
+        src.path(),
+        dest.path(),
+        Platform::Linux
+    ));
 
     std::fs::write(dest.path().join("libcronet.so"), b"CRONET-B").unwrap();
     assert!(
-        !sidecar_payload_matches(src.path(), dest.path()),
+        !sidecar_payload_matches(src.path(), dest.path(), Platform::Linux),
         "同名不同 ABI/内容必须判漂移"
     );
 
     std::fs::write(dest.path().join("libcronet.so"), b"CRONET-A").unwrap();
     std::fs::write(dest.path().join("libcronet.legacy"), b"STALE").unwrap();
     assert!(
-        !sidecar_payload_matches(src.path(), dest.path()),
+        !sidecar_payload_matches(src.path(), dest.path(), Platform::Linux),
         "受保护目录多出旧 sidecar 也要经 helper prune"
     );
+
+    // 多出来的不必长得像配套库：核以外的任何常规文件都算漂移（上次被打断留下的临时件、
+    // 不该在那儿的东西），都得靠一次提升后的清理对齐。
+    std::fs::remove_file(dest.path().join("libcronet.legacy")).unwrap();
+    assert!(sidecar_payload_matches(
+        src.path(),
+        dest.path(),
+        Platform::Linux
+    ));
+    for stray in ["sing-box.new", "sing-box.bak", "anything.else"] {
+        std::fs::write(dest.path().join(stray), b"X").unwrap();
+        assert!(
+            !sidecar_payload_matches(src.path(), dest.path(), Platform::Linux),
+            "{stray}"
+        );
+        std::fs::remove_file(dest.path().join(stray)).unwrap();
+    }
+    // 核本身、子目录不算「多出来的」。
+    std::fs::write(dest.path().join("sing-box"), b"CORE").unwrap();
+    std::fs::create_dir(dest.path().join("subdir")).unwrap();
+    assert!(sidecar_payload_matches(
+        src.path(),
+        dest.path(),
+        Platform::Linux
+    ));
 }
 
 #[test]
 fn payload_stamp_is_stable_until_core_or_sidecar_identity_changes() {
     let payload = TestDir::new("polaris-core-promote-test-");
     std::fs::write(payload.path().join("sing-box"), b"CORE").unwrap();
-    let first = payload_stamp(payload.path(), "sing-box").unwrap();
-    assert_eq!(payload_stamp(payload.path(), "sing-box").unwrap(), first);
+    let first = payload_stamp(payload.path(), Platform::Linux).unwrap();
+    assert_eq!(
+        payload_stamp(payload.path(), Platform::Linux).unwrap(),
+        first
+    );
 
     std::fs::write(payload.path().join("libcronet.so"), b"CRONET").unwrap();
-    assert_ne!(payload_stamp(payload.path(), "sing-box").unwrap(), first);
+    assert_ne!(
+        payload_stamp(payload.path(), Platform::Linux).unwrap(),
+        first
+    );
 }
 
 #[test]
 fn payload_stamp_requires_the_core_file() {
     let payload = TestDir::new("polaris-core-promote-test-");
     std::fs::write(payload.path().join("libcronet.so"), b"CRONET").unwrap();
-    assert!(payload_stamp(payload.path(), "sing-box").is_err());
+    assert!(payload_stamp(payload.path(), Platform::Linux).is_err());
 }
 
 /// 受保护核目录只有 mac / linux / win 有。
@@ -286,15 +332,18 @@ fn attest_unobservable_is_neither_pass_nor_alarm() {
 // ── 暂存腿（真 FS，tempdir，无网络无提权）──
 
 #[test]
-fn stage_promote_dir_links_only_allowlisted_files() {
+fn stage_promote_dir_copies_only_allowlisted_files() {
     let src = TestDir::new("polaris-core-promote-test-");
     let staged = TestDir::new("polaris-core-promote-test-");
     std::fs::write(src.path().join("sing-box"), b"CORE").unwrap();
     std::fs::write(src.path().join("sing-box.bak"), b"OLDCORE").unwrap();
     std::fs::write(src.path().join(".core-seed.json"), b"{}").unwrap();
     std::fs::write(src.path().join("libcronet.so"), b"CRONET").unwrap();
+    // 前缀对、但 helper 不收的名字：带上它 helper 会拒掉整个请求。
+    std::fs::write(src.path().join("libcronet.so copy"), b"COPY").unwrap();
+    std::fs::write(src.path().join("libcronet.so.119"), b"VERSIONED").unwrap();
 
-    let names = promote_names(&list_file_names(src.path()), "sing-box");
+    let names = promote_names(&list_file_names(src.path()), Platform::Linux);
     let dest = staged.path().join(CORE_PROMOTE_DIR_NAME);
     stage_promote_dir(src.path(), &dest, &names).unwrap();
 
@@ -302,6 +351,63 @@ fn stage_promote_dir_links_only_allowlisted_files() {
     got.sort();
     assert_eq!(got, vec!["libcronet.so".to_owned(), "sing-box".to_owned()]);
     assert_eq!(std::fs::read(dest.join("sing-box")).unwrap(), b"CORE");
+}
+
+/// 暂存出来的目录必须是 helper **肯收**的形状，逐条对应 helper 的判据：单链接（不是硬链接）、
+/// 组与其他人不可写（不随 umask）、交出去的路径上没有符号链接。
+///
+/// 直接拿 helper 的收文件函数来判，不在这里另写一份「helper 会怎么判」。源目录故意摆成
+/// 最容易出错的样子：文件与目录都组可写，且经一个符号链接到达。
+#[cfg(unix)]
+#[test]
+fn staged_promote_dir_is_accepted_by_the_helper_receive_leg() {
+    use polaris_helper::core_install::{install_core_files, sha256_hex};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let src = TestDir::new("polaris-core-promote-test-");
+    let staged = TestDir::new("polaris-core-promote-test-");
+    let protected = TestDir::new("polaris-core-promote-test-");
+    for (name, data) in [
+        ("sing-box", &b"CORE"[..]),
+        ("sing-box.bak", b"OLDCORE"),
+        ("libcronet.so", b"CRONET"),
+    ] {
+        std::fs::write(src.path().join(name), data).unwrap();
+        std::fs::set_permissions(
+            src.path().join(name),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+    }
+    // 配置目录经符号链接到达（`/home` 指向别处、点文件管理器建的链接）。
+    let link = staged.path().join("config-link");
+    let real = staged.path().join("config-real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let names = promote_names(&list_file_names(src.path()), Platform::Linux);
+    let install_src =
+        stage_promote_dir(src.path(), &link.join(CORE_PROMOTE_DIR_NAME), &names).unwrap();
+
+    // 调用者 = 本进程；取一个由本进程新建的**别的**目录的属主，不拿被测目录自己的。
+    let me = std::fs::metadata(protected.path()).unwrap().uid();
+    let installed = install_core_files(
+        protected.path(),
+        &install_src,
+        &sha256_hex(b"CORE"),
+        Platform::Linux,
+        Some(me),
+    )
+    .unwrap();
+    assert_eq!(installed, names);
+    assert_eq!(
+        std::fs::read(protected.path().join("sing-box")).unwrap(),
+        b"CORE"
+    );
+    assert_eq!(
+        std::fs::read(protected.path().join("libcronet.so")).unwrap(),
+        b"CRONET"
+    );
 }
 
 /// 暂存目录**先清后建**：上一轮残留不得混入下一次提升。
@@ -316,7 +422,7 @@ fn stage_promote_dir_wipes_stale_residue() {
     std::fs::create_dir_all(&dest).unwrap();
     std::fs::write(dest.join("libcronet.so"), b"STALE").unwrap();
 
-    let names = promote_names(&list_file_names(src.path()), "sing-box");
+    let names = promote_names(&list_file_names(src.path()), Platform::Linux);
     stage_promote_dir(src.path(), &dest, &names).unwrap();
     assert_eq!(
         list_file_names(&dest),

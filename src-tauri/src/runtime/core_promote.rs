@@ -33,23 +33,15 @@
 //!
 //! 源是用户可写文件，落点是 root 目录 —— 这不是新增攻击面：helper 侧 `install-core` 只写**锁定的**
 //! `coredir`（不接受任意目标路径），且**读全字节进内存做 sha256 校验后再落盘**（堵 TOCTOU，
-//! `core_install.rs:15-16`）。提权面的收益在**执行时**：root exec 的是 root 拥有的文件，
+//! 见 `core_install.rs` 模块文档「安全约束」）。提权面的收益在**执行时**：root exec 的是 root 拥有的文件，
 //! 用户此后改不动它。
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use polaris_helper_proto::Platform;
+use polaris_helper_proto::{core_payload, Platform};
 
 use crate::runtime::core_paths::core_filename_for;
-
-/// 随核一并进受保护目录的**配套库前缀**（naive 出站的 cronet）。
-///
-/// 受保护核目录是 helper `install-core` 的**独占**领地：它落盘后会把 `src_dir` 里没有的文件
-/// **全部删掉**（`core_install::prune_extra_files`，移植自 `helper.go:179-192`）。linux 安装脚本
-/// 会随核播种 `libcronet.so`（`manager.rs:879-880`），若提升时只带 `sing-box`，那个 cronet 会被
-/// prune 顺手删掉 ⇒ naive 出站静默失效。故 allowlist 必须带上它。
-pub use crate::runtime::core_paths::CORE_SIDECAR_PREFIX;
 
 /// 暂存目录名（`<config_dir>/core-promote/`）：喂给 `install-core` 的**干净** `src_dir`。
 ///
@@ -100,8 +92,9 @@ struct PayloadFileStamp {
 /// # Errors
 ///
 /// 核心文件不存在、目录枚举/元数据/时间读取失败时返回错误；调用方必须把错误视作 cache miss。
-pub(crate) fn payload_stamp(dir: &Path, core_filename: &str) -> Result<PayloadStamp, String> {
-    let names = promote_names(&list_file_names(dir), core_filename);
+pub(crate) fn payload_stamp(dir: &Path, platform: Platform) -> Result<PayloadStamp, String> {
+    let core_filename = core_payload::core_filename(platform);
+    let names = promote_names(&list_file_names(dir), platform);
     if !names.iter().any(|name| name == core_filename) {
         return Err(format!(
             "核 payload 缺少 {core_filename}: {}",
@@ -153,11 +146,19 @@ pub(crate) fn payload_stamp(dir: &Path, core_filename: &str) -> Result<PayloadSt
 ///
 /// allowlist 而非 denylist：核目录内容由 helper 侧 prune 独占对齐，宁可漏带一个未知配套
 /// （表现为该配套失效，可查），也不能把 `.bak` / 簿记 / 临时文件搬进 root 目录。
+///
+/// 配套库（naive 出站的 cronet）**必须带上**：受保护核目录是 helper
+/// `install-core` 的独占领地，它落盘后会把 `src_dir` 里没有的文件全部删掉；安装脚本随核播种过
+/// `libcronet.so`，提升时只带 `sing-box` 的话那个 cronet 会被顺手清掉 ⇒ naive 出站静默失效。
+///
+/// 判据与 helper 收文件用的是**同一个函数**（[`polaris_helper_proto::core_payload`]，各平台的
+/// 精确文件名唯一真值也在那里）：helper 见到白名单外的名字会拒掉整个请求，这里多带一个它不认的
+/// 名字 = 这次提升必败。
 #[must_use]
-pub fn promote_names(entries: &[String], core_filename: &str) -> Vec<String> {
+pub fn promote_names(entries: &[String], platform: Platform) -> Vec<String> {
     let mut names: Vec<String> = entries
         .iter()
-        .filter(|n| n.as_str() == core_filename || n.starts_with(CORE_SIDECAR_PREFIX))
+        .filter(|n| core_payload::name_allowed(n, platform))
         .cloned()
         .collect();
     names.sort();
@@ -195,24 +196,36 @@ pub fn decide_promote(
     }
 }
 
-/// 两个核目录的 Cronet sidecar 是否逐文件同形同内容。
+/// 受保护核目录里核以外的内容，是否恰为源目录里的配套库（同名、同内容、不多不少）。
 ///
-/// 比较**文件名集合 + SHA256**：源有而目标缺、目标残留源没有的旧库、同名但内容不同，三种都必须
-/// 触发一次 `install-core`。两边都没有 sidecar（macOS 静态集成）则相等、稳态零动作。
+/// 源侧只认该平台的配套库精确名；受保护目录侧则把**核以外的每一个常规文件**都算进来 ——
+/// 源有而目标缺、同名但内容不同、目标里多出任何别的文件（旧版配套、上次被打断留下的临时件、
+/// 不该在那儿的东西），三种都必须触发一次 `install-core`，由 helper 落盘后的清理对齐。
+/// 两边都没有（macOS 静态集成）则相等、稳态零动作。
 #[must_use]
-pub fn sidecar_payload_matches(src_dir: &Path, dest_dir: &Path) -> bool {
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = list_file_names(dir)
-            .into_iter()
-            .filter(|name| name.starts_with(CORE_SIDECAR_PREFIX))
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    }
+pub fn sidecar_payload_matches(src_dir: &Path, dest_dir: &Path, platform: Platform) -> bool {
+    let mut src_names: Vec<String> = list_file_names(src_dir)
+        .into_iter()
+        .filter(|name| core_payload::is_sidecar_name(name, platform))
+        .collect();
+    src_names.sort();
+    src_names.dedup();
 
-    let src_names = names(src_dir);
-    if src_names != names(dest_dir) {
+    // 只数常规文件：linux helper 的清理不碰符号链接与子目录，把它们算进来会让这里永远对不上、
+    // 每次起核都白推一遍核。
+    let mut dest_extra: Vec<String> = std::fs::read_dir(dest_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name != core_payload::core_filename(platform))
+                .collect()
+        })
+        .unwrap_or_default();
+    dest_extra.sort();
+
+    if src_names != dest_extra {
         return false;
     }
     src_names.iter().all(|name| {
@@ -433,28 +446,35 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(polaris_updater::verify::sha256_hex(&bytes))
 }
 
-/// 把现役核 + 配套准备进一个**干净的暂存目录**，返回该目录路径。
+/// 把现役核 + 配套准备进一个**干净的暂存目录**，返回**交给 helper 的那个路径**。
 ///
-/// 优先 `hard_link`（同一文件系统内零拷贝——现役核 80MB 量级，每次提升都真拷一遍是白烧 I/O），
-/// 失败回落 `copy`（跨设备 / 文件系统不支持硬链）。目录**先清后建**，杜绝上一轮残留混入。
+/// 暂存出来的形状必须是 helper 肯收的（判据在 helper 侧 `core_install`，下面三条逐条对应）：
+///
+/// - 一律 `copy`，**不用 `hard_link`**：helper 只收链接数为 1 的常规文件（多一个链接就无从判断
+///   那个 inode 是不是别人的文件被链进了用户目录），硬链出来的暂存件链接数为 2，会被整单拒掉。
+///   代价是每次提升多拷一遍核（80MB 量级）；提升只在现役核与受保护核不一致时发生，不在稳态
+///   热路径上。
+/// - unix 上显式定权限（目录 0755、文件 0644）：helper 要求源目录与文件属调用者所有且**组与其他人
+///   不可写**，而 `umask 002`（不少发行版的默认）下新建目录是 0775。
+/// - unix 上返回 `canonicalize` 过的路径：Linux helper 打开源目录时不穿越任何符号链接，
+///   配置目录路径上只要有一级是链接（`/home` 指向别处、点文件管理器建的链接）就会被拒。
+///
+/// 目录**先清后建**，杜绝上一轮残留混入。
 ///
 /// # Errors
 ///
-/// 建目录 / 枚举源目录 / 链接与复制 全失败。
+/// 建目录 / 复制 / 定权限 / 解析真实路径失败。
 pub fn stage_promote_dir(
     src_dir: &Path,
     staged_dir: &Path,
     names: &[String],
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     // 先清后建：残留文件会被 install-core 一并搬进受保护目录。
     let _ = std::fs::remove_dir_all(staged_dir);
     std::fs::create_dir_all(staged_dir)
         .map_err(|e| format!("建内核提升暂存目录失败 {}: {e}", staged_dir.display()))?;
     for name in names {
         let (from, to) = (src_dir.join(name), staged_dir.join(name));
-        if std::fs::hard_link(&from, &to).is_ok() {
-            continue;
-        }
         std::fs::copy(&from, &to).map_err(|e| {
             format!(
                 "暂存内核文件失败 {} → {}: {e}",
@@ -462,8 +482,24 @@ pub fn stage_promote_dir(
                 to.display()
             )
         })?;
+        #[cfg(unix)]
+        set_mode(&to, 0o644)?;
     }
-    Ok(())
+    #[cfg(unix)]
+    {
+        set_mode(staged_dir, 0o755)?;
+        std::fs::canonicalize(staged_dir)
+            .map_err(|e| format!("解析暂存目录真实路径失败 {}: {e}", staged_dir.display()))
+    }
+    #[cfg(not(unix))]
+    Ok(staged_dir.to_path_buf())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("设置暂存件权限失败 {}: {e}", path.display()))
 }
 
 /// 列目录的文件名（非目录项）。读失败 → 空清单（调用方据此判「没得挑」）。

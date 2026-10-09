@@ -955,6 +955,139 @@ fn linux_install_script_has_all_steps() {
     assert!(s.contains("echo polaris-helper-install-ok"));
 }
 
+/// Linux 安装脚本由 root 新建或接管的目录：创建模式不随调用方 umask；每个目录**先验是不是
+/// 真目录、再定属主与权限**（`chown`/`chmod` 会跟随最后一级的符号链接，而 `/usr/local/lib` 在
+/// Debian 系对 staff 组可写）；对已存在的目录同样处置。
+///
+/// 判据从脚本自身取材：全脚本只许有一条 `mkdir -p`，且它在 `secure_dir` 里 —— 新增一个绕开
+/// `secure_dir` 的 `mkdir -p`，这里就红。
+#[test]
+fn linux_install_script_fixes_umask_and_directory_ownership() {
+    let paths = InstallPaths::linux();
+    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
+    let script = build_linux_install_script(&paths, &p);
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    let at = |needle: &str| lines.iter().position(|l| *l == needle);
+
+    // umask 是第一条有副作用的语句（只排在 shebang 与 `set -eu` 之后）。
+    assert_eq!(&lines[..3], ["#!/bin/sh", "set -eu", "umask 022"]);
+    // 脚本级 umask 恰这一条；另一处只在圈住 touch 的子壳里。
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("umask ")).count(),
+        1,
+        "脚本级 umask 被改写过"
+    );
+
+    // `secure_dir`：建 → 验（链接或非目录即退出）→ chown -h → chmod，顺序与内容逐行钉死。
+    let body = at("secure_dir() {").expect("缺 secure_dir");
+    assert_eq!(
+        &lines[body..body + 6],
+        [
+            "secure_dir() {",
+            "mkdir -p \"$1\"",
+            "if [ -L \"$1\" ] || [ ! -d \"$1\" ]; then echo \"polaris-helper: refusing $1: not a real directory\" >&2; exit 1; fi",
+            "chown -h root:root \"$1\"",
+            "chmod 0755 \"$1\"",
+            "}",
+        ]
+    );
+    // 所有目录都走它：全脚本只有函数里那一条 mkdir，也没有别的对目录的 chown / chmod 0755。
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("mkdir ")).count(),
+        1,
+        "有绕开 secure_dir 的 mkdir"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("chmod 0755 "))
+            .count(),
+        1,
+        "有绕开 secure_dir 的 chmod 0755"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("chown root:root '")),
+        "有不带 -h、直接对固定路径的 chown"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("chmod ") && (l.contains(" 0775 ") || l.contains(" 0777 "))),
+        "脚本里出现了组可写/人人可写的 chmod"
+    );
+
+    // 三个目录各一次，绝对值写死；安装目录先于它下面的受管核目录；都在动任何别的东西之前。
+    let install_dir = at("secure_dir '/usr/local/lib/polaris'").expect("缺安装目录");
+    let core_dir = at("secure_dir '/usr/local/lib/polaris/core'").expect("缺受管核目录");
+    let state_dir = at("secure_dir '/var/lib/polaris'").expect("缺状态目录");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("secure_dir '"))
+            .count(),
+        3
+    );
+    assert!(body < install_dir && install_dir < core_dir, "父目录须先验");
+    let seed_guard = at("if [ ! -x '/usr/local/lib/polaris/core/sing-box' ]; then").unwrap();
+    let authfile = at("(umask 077; touch '/var/lib/polaris/authorized-uids')").unwrap();
+    assert!(core_dir < seed_guard, "受管核目录须在播种之前处置");
+    assert!(state_dir < authfile, "状态目录须在建 authfile 之前处置");
+}
+
+/// 受管核目录里既有的内容：不属 root、或组与其他人可写、或不是常规文件的直接子项，在播种之前
+/// 一律删掉 —— 目录权限曾经过宽时被换进去的东西不会因为「核已存在」而一直留着。
+#[test]
+fn linux_install_script_purges_untrusted_entries_from_the_core_dir_before_seeding() {
+    let paths = InstallPaths::linux();
+    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
+    let script = build_linux_install_script(&paths, &p);
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    let at = |needle: &str| lines.iter().position(|l| *l == needle);
+
+    // 逐字钉死：只看直接子项（-mindepth 1 -maxdepth 1）、三个条件是「或」、find 不带 -L。
+    let purge = at(
+        "find '/usr/local/lib/polaris/core' -mindepth 1 -maxdepth 1 \\( ! -type f -o ! -user root -o -perm /022 \\) -exec rm -rf -- {} +",
+    )
+    .expect("缺受管核目录的清理");
+    let core_dir = at("secure_dir '/usr/local/lib/polaris/core'").unwrap();
+    let seed_guard = at("if [ ! -x '/usr/local/lib/polaris/core/sing-box' ]; then").unwrap();
+    assert!(
+        core_dir < purge && purge < seed_guard,
+        "清理须在确认目录是真目录之后、播种判断之前"
+    );
+    // 清理对象只有受管核目录这一处。
+    assert_eq!(lines.iter().filter(|l| l.starts_with("find ")).count(), 1);
+}
+
+/// macOS 安装脚本：支持目录先确认是真目录，再定权限与属主（`chown -h`），都发生在写 token 之前。
+#[test]
+fn mac_install_script_takes_ownership_of_the_support_dir() {
+    let paths = InstallPaths::mac();
+    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
+    let script = build_mac_install_script(&paths, &p, "TOKEN123");
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    assert_eq!(&lines[..3], ["#!/bin/bash", "set -e", "umask 077"]);
+    let at = |needle: &str| lines.iter().position(|l| *l == needle);
+    let mkdir = at("mkdir -p /Library/PrivilegedHelperTools \"$SUPPORT\"").expect("缺 mkdir");
+    let check = at(
+        "if [ -L \"$SUPPORT\" ] || [ ! -d \"$SUPPORT\" ]; then echo \"polaris-helper: refusing $SUPPORT: not a real directory\" >&2; exit 1; fi",
+    )
+    .expect("缺支持目录的真目录检查");
+    let chmod = at("chmod 755 /Library/PrivilegedHelperTools \"$SUPPORT\"").expect("缺 chmod");
+    let chown = at("chown -h root:wheel \"$SUPPORT\"").expect("缺支持目录的 chown -h");
+    let token = at("printf '%s' 'TOKEN123' > \"$SUPPORT/helper.token\"").expect("缺写 token");
+    assert!(
+        mkdir < check && check < chmod && chmod < chown && chown < token,
+        "顺序须为：建 → 验 → chmod → chown → 写 token"
+    );
+    assert!(
+        !lines.contains(&"chown root:wheel \"$SUPPORT\""),
+        "支持目录的 chown 不带 -h"
+    );
+    // 受管核目录原有的那条仍在。
+    assert!(lines.contains(&"chown root:wheel \"$COREDIR\"; chmod 755 \"$COREDIR\""));
+}
+
 #[test]
 fn linux_helper_upgrade_is_transactional_and_verifies_the_running_inode() {
     let paths = InstallPaths::linux();

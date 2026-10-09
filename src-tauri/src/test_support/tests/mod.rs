@@ -280,3 +280,53 @@ fn a_tests_directory_stays_out_of_the_scan_surface_on_a_copy() {
         "`tests/` 的内容混进了生产扫描面 —— 基于它的否定型断言会被测试夹具顶红/顶绿"
     );
 }
+
+/// 🔴 [`write_executable_stand_in`] 落下的替身，在别的线程不停 `fork` 时也必须每次都起得来。
+///
+/// 旁边那些线程就是全量测试里「别的用例正好在 `fork`」的浓缩版。把落盘换回「本进程
+/// `std::fs::write` + 加执行位」，本条在同样的轮数里稳定撞出十几次
+/// `Text file busy (os error 26)`。
+///
+/// 并发度与轮数都有上界：子进程只是 `sh -c :`，不碰网络、不留状态。
+#[cfg(unix)]
+#[test]
+fn executable_stand_in_always_starts_while_other_threads_fork() {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const FORKING_THREADS: usize = 4;
+    const ROUNDS: usize = 100;
+
+    let dir = TestDir::new("polaris-stand-in-race-");
+    let stop = AtomicBool::new(false);
+    let mut failures = Vec::new();
+    std::thread::scope(|scope| {
+        for _ in 0..FORKING_THREADS {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("/bin/sh")
+                        .args(["-c", ":"])
+                        .stdin(Stdio::null())
+                        .status();
+                }
+            });
+        }
+        for round in 0..ROUNDS {
+            let stand_in = dir.join(format!("stand-in-{round}"));
+            write_executable_stand_in(&stand_in, "#!/bin/sh\nexit 0\n");
+            match Command::new(&stand_in).stdin(Stdio::null()).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => failures.push(format!("第 {round} 轮：{status}")),
+                Err(error) => failures.push(format!("第 {round} 轮：{error}")),
+            }
+        }
+        // 先收齐结果再断言：在这里 panic 会让上面那些线程永远等不到停止信号。
+        stop.store(true, Ordering::Relaxed);
+    });
+    assert!(
+        failures.is_empty(),
+        "替身没能每次都起来（共 {} 次）：\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}

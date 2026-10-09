@@ -2760,7 +2760,8 @@ impl ProxyRuntime {
         let staged_dir = self.config.join(promote::CORE_PROMOTE_DIR_NAME);
         let helper = Arc::clone(&self.helper);
         let active_core = active_core.to_path_buf();
-        let core_filename = crate::runtime::core_paths::core_filename().to_owned();
+        // 与上面的 `dest` 同口径：文件名按**宿主** OS 取。
+        let platform = polaris_helper_proto::Platform::current();
         let cache = Arc::clone(&self.protected_core_cache);
         let started = std::time::Instant::now();
 
@@ -2794,9 +2795,8 @@ impl ProxyRuntime {
             }
             // 首次完整对账通过后，同一会话内只做廉价 metadata 对账。两侧必须同时可观测且与缓存
             // 完全一致才命中；任一读取失败/变化都清缓存并回到 SHA256，不把“观测不到”当“没变化”。
-            let active_before = promote::payload_stamp(&src_dir, &core_filename)?;
-            let protected_before =
-                promote::payload_stamp(&protected_payload_dir, &core_filename).ok();
+            let active_before = promote::payload_stamp(&src_dir, platform)?;
+            let protected_before = promote::payload_stamp(&protected_payload_dir, platform).ok();
             let cache_hit = cache.lock().ok().is_some_and(|cached| {
                 protected_core_cache_hit(cached.as_ref(), &active_before, protected_before.as_ref())
             });
@@ -2812,15 +2812,15 @@ impl ProxyRuntime {
             let dest_hash = promote::sha256_file(&dest).ok();
             // 核同版但 Cronet 缺失/漂移也必须推：Linux helper 真正执行的是 root 受保护目录，
             // 只比 sing-box hash 会让旧安装永久缺 libcronet.so，Naive/H3 继续报依赖缺失。
-            let sidecars_match = promote::sidecar_payload_matches(&src_dir, &protected_payload_dir);
+            let sidecars_match =
+                promote::sidecar_payload_matches(&src_dir, &protected_payload_dir, platform);
             if promote::decide_promote(&src_hash, dest_hash.as_deref(), sidecars_match)
                 == promote::PromoteDecision::UpToDate
             {
                 // 只在完整 hash 前后两侧身份均稳定时记缓存。若校验过程中刚好发生换核，当前轮仍沿用
                 // 既有 hash 结论，但下一次连接必须重验，绝不能把竞态后的 metadata 误记成已验证。
-                let active_after = promote::payload_stamp(&src_dir, &core_filename)?;
-                let protected_after =
-                    promote::payload_stamp(&protected_payload_dir, &core_filename)?;
+                let active_after = promote::payload_stamp(&src_dir, platform)?;
+                let protected_after = promote::payload_stamp(&protected_payload_dir, platform)?;
                 if active_before == active_after
                     && protected_before.as_ref() == Some(&protected_after)
                 {
@@ -2833,20 +2833,20 @@ impl ProxyRuntime {
                 }
                 return Ok(ProtectedCoreReconcileOutcome::Verified);
             }
-            let names = promote::promote_names(&promote::list_file_names(&src_dir), &core_filename);
+            let names = promote::promote_names(&promote::list_file_names(&src_dir), platform);
             if names.is_empty() {
                 return Err(format!("现役核目录没有可提升的文件：{}", src_dir.display()));
             }
-            promote::stage_promote_dir(&src_dir, &staged_dir, &names)?;
+            let install_src = promote::stage_promote_dir(&src_dir, &staged_dir, &names)?;
             // 🔴 身份必须在**发 install-core 之前**探。事后再探会把「回 ERR unknown 的那个
             // helper」与「此刻在管道那头的 helper」混为一谈：UAC 重装是秒级操作，两者之间完全
             // 可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒ 本会话内永久跳过对账，而新
             // helper 其实支持。反过来（探完才换代）只会让记号挂在旧身份上 ⇒ 下次探到新身份即
             // 失效、重试 —— 方向是安全的。成本与 install-core 本身同量级下可忽略（一次 ping）。
             let build_before = helper.helper_build_probe();
-            let r = helper.install_core(&staged_dir, &src_hash);
-            // 暂存目录用完即清（硬链不占额外空间，但留着会让下一轮的"先清后建"多做一次 I/O，
-            // 且用户目录里躺一个 80MB 影子核容易被误读为"又一份核"）。
+            let r = helper.install_core(&install_src, &src_hash);
+            // 暂存目录用完即清（它是现役核的一份完整副本：留着白占 80MB，
+            // 且用户目录里躺一个影子核容易被误读为"又一份核"）。
             let _ = std::fs::remove_dir_all(&staged_dir);
             // 提升成功也不立即把 metadata 当作“完整对账通过”：helper 对核心做了 hash 校验，但 sidecar
             // 复制没有独立摘要。下一次连接完整验一次后再进入热路径，避免扩大信任假设。

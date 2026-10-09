@@ -1185,6 +1185,71 @@ fn install_core_bad_args_for_short_hash() {
     assert_eq!(conn.writes(), vec!["ERR bad-args"]);
 }
 
+/// install-core 用的是**这条连接上已鉴权的对端 uid**：源目录属谁，谁才装得进去。
+///
+/// 三个对端各发同一帧：文件属主本人 → 装入；另一个 uid → 拒；root → 也拒（root 对端在鉴权门上
+/// 恒放行，但这里比的是「源文件是不是对端自己的」，不因为对端是 root 就替它读别人的目录）。
+#[test]
+fn install_core_requires_the_sources_to_belong_to_the_authenticated_peer() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, auth, core_dir) = setup_env();
+    let self_uid = nix::unistd::getuid().as_raw();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("sing-box"), b"new core").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(src.join("sing-box"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let hash = crate::core_install::sha256_hex(b"new core");
+    let src_s = src.to_string_lossy().into_owned();
+
+    let peer = StaticPeerCred::new(self_uid, self_uid);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = no_op_fwd();
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    // 直调 `dispatch_locked`：非 root 对端过不了本文件造的 authfile（理由见 `setup_env`）。
+    let run = |uid: u32| {
+        let mut state = HandlerState::new();
+        let mut conn = MockConn::new(vec![&src_s, &hash]);
+        let cred = PeerCred { uid, gid: uid };
+        dispatch_locked(&mut state, &deps, &cred, lcmd::INSTALL_CORE, &mut conn);
+        conn.writes()
+    };
+
+    for other in [self_uid + 1, 0] {
+        if other == self_uid {
+            continue; // 以 root 跑测试时 0 就是自己。
+        }
+        assert_eq!(
+            run(other),
+            vec!["ERR readdir not owned by the caller"],
+            "对端 uid={other}"
+        );
+        assert_eq!(
+            std::fs::read(core_dir.join("sing-box")).unwrap(),
+            b"#!bin\nfake sing-box",
+            "被拒的请求动了受管核"
+        );
+    }
+
+    assert_eq!(run(self_uid), vec!["OK installed"]);
+    assert_eq!(
+        std::fs::read(core_dir.join("sing-box")).unwrap(),
+        b"new core"
+    );
+}
+
 // ===== start =====
 
 #[test]

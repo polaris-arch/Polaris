@@ -35,11 +35,12 @@ log = "0.4"
 # ===== macOS 专用 =====
 # nix = sysctl/syscall 的安全封装（移植自 Go `syscall.SYS___SYSCTL` / `proc_starttime_darwin.go`）。
 # forbid(unsafe_code) 下替代裸 unsafe syscall。
-# features: fs = 日志 openat(O_NOFOLLOW) 对象固定；process/signal = proc_start 的 kill(0) syscall；
+# features: fs = 日志 openat(O_NOFOLLOW) 对象固定；dir = install-core 按目录 fd 枚举源目录；
+# process/signal = proc_start 的 kill(0) syscall；socket = getpeereid 取对端 uid（install-core 的属主判据）；
 # user = Uid::current()（handler uid()，Go `os.Getuid()` 等价，替代 nix 0.31 feature-gated 的 getuid）。
 # 仅 platform::macos 的 #[cfg(target_os = "macos")] 门内代码使用 —— 编 linux/windows 时不参与解析。
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { version = "0.31", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.31", features = ["dir", "fs", "process", "signal", "socket", "user"] }
 polaris-system-integration = { path = "../system-integration" }
 
 # ===== Linux 专用 =====
@@ -48,11 +49,12 @@ polaris-system-integration = { path = "../system-integration" }
 # nix = kill(2)（freeport）+ getuid/setuid/setgid/setgroups/getgrouplist/User（auth + L10 降权拉核）的
 #   safe wrapper（deny(unsafe_code) 下替代 libc unsafe FFI；features user 覆盖 set*id/User/getgrouplist）。
 #   fs 仅让 Unix 日志对象攻击回归可在 Linux 单元测试编译；普通 Linux helper 不消费该模块。
+#   dir = install-core 按目录 fd 枚举源目录、清理受管目录（openat/fstatat/unlinkat 相对该 fd）。
 # caps = L10 AmbientCaps 拉核（securebits::set_keepcaps + raise Inheritable/Ambient；对照 Go
 #   SysProcAttr.AmbientCaps）。Capability::X.index() 与 Go L16 常量一致（BIND_SERVICE=10/ADMIN=12/RAW=13）。
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
-nix = { version = "0.31", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.31", features = ["dir", "fs", "process", "signal", "user"] }
 caps = "0.5"
 
 # ===== Windows 专用 =====
@@ -86,6 +88,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_Rras",
     "Win32_Networking_WinSock",
+    # install-core 相对目录句柄打开源文件（NtCreateFile + OBJECT_ATTRIBUTES.RootDirectory）。
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
 ] }
 
 [dev-dependencies]

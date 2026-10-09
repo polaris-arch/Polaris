@@ -821,8 +821,8 @@ fn native_booking_registry(
 #[tokio::test]
 async fn real_login_registry_books_some_before_factory_and_consumes_native_task_config_terminal() {
     let dir = crate::test_support::TestDir::new("polaris-login-native-terminal-");
-    let binary = crate::test_support::write_sleeping_probe(dir.path(), &dir.join("witness"));
-    std::fs::write(&binary, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    let binary = dir.join("sleeping-probe.sh");
+    crate::test_support::write_executable_stand_in(&binary, "#!/bin/sh\nexec sleep 60\n");
     let (registry, spawner, subscriber) = native_booking_registry(binary, false, false);
     let emitter = started(&registry, dir.path(), &ts_server("ts1", "myts")).await;
     let birth = spawner.births.lock().unwrap()[0].clone();
@@ -968,12 +968,11 @@ async fn native_login_fixture(
     PathBuf,
 ) {
     let dir = crate::test_support::TestDir::new("polaris-login-native-tail-");
-    let binary = crate::test_support::write_sleeping_probe(dir.path(), &dir.join("witness"));
-    std::fs::write(
+    let binary = dir.join("sleeping-probe.sh");
+    crate::test_support::write_executable_stand_in(
         &binary,
         "#!/bin/sh\nprintf 'FATAL[0000] missing monitor for auto DHCP' >&2\nexit 0\n",
-    )
-    .unwrap();
+    );
     let config = dir.join("original-config.json");
     std::fs::write(&config, b"{}").unwrap();
     let shared = Arc::new(Shared::default());

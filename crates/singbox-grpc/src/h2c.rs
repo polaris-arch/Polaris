@@ -10,7 +10,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::net::TcpStream;
 use tonic::transport::Channel;
 use tower_service::Service;
 // 与 `reconnect.rs` 同一理由换 `log` 门面：本仓只给 `log` 接了 sink（`src-tauri/src/logging.rs`），
@@ -18,22 +20,42 @@ use tower_service::Service;
 // 又要逐文件确认一次。
 use log::debug;
 
+type DialFuture = Pin<Box<dyn Future<Output = std::io::Result<TcpStream>> + Send>>;
+
+/// 把 `host:port` 拨成一条 TCP 连接。生产只有 [`TcpStream::connect`] 一种；做成可替换的值，
+/// 是为了让「对端对 SYN 毫无响应」这种不出回环就造不出来的情形也有用例。
+pub(crate) type Dialer = Arc<dyn Fn(String) -> DialFuture + Send + Sync>;
+
 /// 连接到 sing-box 管理 API（h2c，明文 HTTP/2）。
 ///
 /// `target` = `host:port`（裸 IPv6 字面量已方括号包裹）。返回一条 **lazy** tonic Channel——
 /// 不立即建连，首个 RPC 时才握 TCP + h2。复用同 channel 的所有 RPC 走同一条 h2 连接。
 pub(crate) async fn connect_h2c(target: &str) -> Result<Channel, tonic::transport::Error> {
+    connect_h2c_with(target, Arc::new(|addr| Box::pin(TcpStream::connect(addr))))
+}
+
+/// [`connect_h2c`] 的本体：拨号器可注入。
+pub(crate) fn connect_h2c_with(
+    target: &str,
+    dial: Dialer,
+) -> Result<Channel, tonic::transport::Error> {
     // tonic 0.14：from_shared 接收 Into<Bytes>（字符串即可）。h2c = `http://` scheme（明文）。
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{target}"))?
         // 关键：用自定义 TCP 连接器覆盖默认 TLS 连接器；tonic 内部跑 h2 明文握手（prior knowledge）。
-        .connect_with_connector_lazy(TcpConnector);
+        .connect_with_connector_lazy(TcpConnector { dial });
     Ok(endpoint)
 }
 
 /// 明文 TCP 连接器：把 `http://host:port` Uri 解析出 host:port，TCP connect，返回字节流。
 /// tonic 自行在其上跑 hyper h2 明文握手。
+///
+/// 拨号以 [`crate::CONNECT_TIMEOUT`] 为限。lazy channel 的拨号发生在 tonic 的 `poll_ready` 里，
+/// 请求上的 deadline 只从 `call` 起算、管不到这一段；不在这里设限，拨号要多久就全看系统
+/// （对端丢弃 SYN 时是分钟级的重传），其间这条 channel 上的每个调用都排在它后面。
 #[derive(Clone)]
-struct TcpConnector;
+struct TcpConnector {
+    dial: Dialer,
+}
 
 impl Service<http::Uri> for TcpConnector {
     type Response = hyper_util::rt::TokioIo<tokio::net::TcpStream>;
@@ -46,6 +68,7 @@ impl Service<http::Uri> for TcpConnector {
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let dial = Arc::clone(&self.dial);
         Box::pin(async move {
             let host = uri
                 .host()
@@ -56,9 +79,16 @@ impl Service<http::Uri> for TcpConnector {
             let addr = format!("{host}:{port}");
 
             debug!("h2c：TCP 拨号 {addr}");
-            let tcp = tokio::net::TcpStream::connect(&addr)
-                .await
-                .map_err(|e| io(&format!("h2c TCP connect {addr}: {e}")))?;
+            let limit = crate::CONNECT_TIMEOUT;
+            let tcp = match tokio::time::timeout(limit, dial(addr.clone())).await {
+                Ok(dialed) => dialed.map_err(|e| io(&format!("h2c TCP connect {addr}: {e}")))?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("h2c TCP connect {addr}: no answer within {limit:?}"),
+                    ))
+                }
+            };
             // TokioIo 适配 tokio AsyncRead/Write → hyper rt::Read/Write（tonic 要求）。
             Ok(hyper_util::rt::TokioIo::new(tcp))
         })
@@ -68,3 +98,6 @@ impl Service<http::Uri> for TcpConnector {
 fn io(msg: &str) -> std::io::Error {
     std::io::Error::other(msg)
 }
+
+#[cfg(test)]
+mod tests;

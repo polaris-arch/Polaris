@@ -75,6 +75,19 @@ fn make_win_src_dir(sb: &[u8]) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sing-box.exe"), sb).unwrap();
     std::fs::write(dir.path().join("libcronet.dll"), b"cronet payload").unwrap();
+    // 本模块在非 Windows 上跑的是 unix 那条收文件腿，它要求源目录与文件组与其他人不可写；
+    // 权限显式定，不随测试环境的 umask 漂。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (path, mode) in [
+            (dir.path().to_path_buf(), 0o755),
+            (dir.path().join("sing-box.exe"), 0o644),
+            (dir.path().join("libcronet.dll"), 0o644),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
     (dir, crate::core_install::sha256_hex(sb))
 }
 

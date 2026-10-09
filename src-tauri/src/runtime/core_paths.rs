@@ -38,6 +38,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use polaris_helper_proto::{core_payload, Platform};
 use polaris_updater::core_build::{classify_core_build, ComparableVersion};
 use polaris_updater::{decide_core_override, extract_version_token};
 use serde::{Deserialize, Serialize};
@@ -48,11 +49,6 @@ pub const CORE_UPDATE_DIR_NAME: &str = "core_update";
 pub const CORE_STAGED_DIR_NAME: &str = "core-staged";
 /// 备份侧车后缀（= 上游 `<core>.bak`）。
 pub const CORE_BACKUP_SUFFIX: &str = "bak";
-/// 随核同行的动态库前缀（当前为 NaiveProxy 的 cronet）。
-///
-/// `core_promote` 的 allowlist 与本模块的播种逻辑共用这一真值，避免一边认 `libcronet.*`、
-/// 另一边另写文件名后漂移。
-pub const CORE_SIDECAR_PREFIX: &str = "libcronet.";
 /// 播种簿记文件名。
 pub const CORE_SEED_MARKER: &str = ".core-seed.json";
 
@@ -79,11 +75,8 @@ pub fn base_dir() -> Option<&'static Path> {
 /// 平台核文件名（纯函数：`os` 取 `std::env::consts::OS` 的口径）。
 #[must_use]
 pub fn core_filename_for(os: &str) -> &'static str {
-    if os == "windows" {
-        "sing-box.exe"
-    } else {
-        "sing-box"
-    }
+    // 真值在 `polaris-helper-proto`：helper 收文件的白名单读的是同一份。
+    core_payload::core_filename(Platform::parse(os))
 }
 
 /// 本平台核文件名。
@@ -97,11 +90,7 @@ pub fn core_filename() -> &'static str {
 /// macOS 的 cronet 已静态编入随包核，因此没有动态 sidecar。
 #[must_use]
 pub fn core_sidecar_filename_for(os: &str) -> Option<&'static str> {
-    match os {
-        "windows" => Some("libcronet.dll"),
-        "linux" => Some("libcronet.so"),
-        _ => None,
-    }
+    core_payload::sidecar_filename(Platform::parse(os))
 }
 
 /// 与指定核心同行的 NaiveProxy 动态库路径。

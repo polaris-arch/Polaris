@@ -354,13 +354,17 @@ async fn retired_primary_api_mock_rpc_witness_blocks_lazy_selector_from_successo
     tokio::time::timeout(Duration::from_secs(2), resume_rpc.wait())
         .await
         .unwrap();
-    assert!(
-        !tokio::time::timeout(Duration::from_secs(2), stale.join_next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-    );
+    // The obsolete RPC dials a port nobody listens on any more. How soon the host
+    // reports that refusal varies (Windows retransmits the SYN first), but the call
+    // as a whole, dial included, is bound by the client's unary deadline.
+    assert!(!tokio::time::timeout(
+        polaris_singbox_grpc::UNARY_DEADLINE + Duration::from_secs(1),
+        stale.join_next()
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap());
     assert!(
         writes_b.lock().unwrap().is_empty(),
         "an obsolete lazy RPC must never mutate successor B"
@@ -3221,9 +3225,16 @@ fn protected_core_cache_requires_both_unchanged_payloads() {
     std::fs::write(active_dir.join("sing-box"), b"CORE").unwrap();
     std::fs::write(protected_dir.join("sing-box"), b"CORE").unwrap();
 
-    let active = crate::runtime::core_promote::payload_stamp(&active_dir, "sing-box").unwrap();
-    let protected =
-        crate::runtime::core_promote::payload_stamp(&protected_dir, "sing-box").unwrap();
+    let active = crate::runtime::core_promote::payload_stamp(
+        &active_dir,
+        polaris_helper_proto::Platform::Linux,
+    )
+    .unwrap();
+    let protected = crate::runtime::core_promote::payload_stamp(
+        &protected_dir,
+        polaris_helper_proto::Platform::Linux,
+    )
+    .unwrap();
     let cached = ProtectedCoreCacheRecord {
         active: active.clone(),
         protected: protected.clone(),
@@ -3236,8 +3247,11 @@ fn protected_core_cache_requires_both_unchanged_payloads() {
     assert!(!protected_core_cache_hit(Some(&cached), &active, None));
 
     std::fs::write(active_dir.join("libcronet.so"), b"CRONET").unwrap();
-    let changed_active =
-        crate::runtime::core_promote::payload_stamp(&active_dir, "sing-box").unwrap();
+    let changed_active = crate::runtime::core_promote::payload_stamp(
+        &active_dir,
+        polaris_helper_proto::Platform::Linux,
+    )
+    .unwrap();
     assert!(!protected_core_cache_hit(
         Some(&cached),
         &changed_active,

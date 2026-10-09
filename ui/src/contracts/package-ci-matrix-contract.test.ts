@@ -170,13 +170,14 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const cross = executable(jobBlock(ci, 'cross'));
     const test = executable(jobBlock(ci, 'test'));
 
-    // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属三步都在 cross）。
+    // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属四步都在 cross）。
     const home: [string, string][] = [
       ['- name: Check formatting', 'lint'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
       ['- name: Resolve core-owned Cronet dependencies', 'lint'],
       ['- name: Cross-check platform targets', 'cross'],
+      ['- name: Vendored path sources stay diagnostic-free', 'cross'],
       ['- name: Android impact face must be registered', 'cross'],
       ['- name: Cross-target exemptions must still be necessary', 'cross'],
       ['- name: Build\n', 'test'],

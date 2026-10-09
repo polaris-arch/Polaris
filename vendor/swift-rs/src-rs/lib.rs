@@ -1,5 +1,9 @@
 //! Call Swift functions from Rust with ease!
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// Polaris: local addition, not upstream. Cargo caps lints for registry crates but not
+// for a `[patch]` path source, so `-D warnings` would judge this third-party code by
+// whatever the newest toolchain warns about. Restore the cap that 1.0.7 from crates.io had.
+#![allow(warnings)]
 
 mod autorelease;
 mod swift;

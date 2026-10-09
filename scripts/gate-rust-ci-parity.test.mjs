@@ -199,6 +199,41 @@ test('跨目标门覆盖的目标三元组，ci.yml 与 gate-rust.sh 一致', ()
 });
 
 /**
+ * 「随仓路径源零诊断」门：两侧调的是**同一条命令**，且它的目标清单就是跨目标门的那一份。
+ *
+ * 这一步在 ci.yml 里不直接出现 `cargo`（cargo 在被调脚本里），所以下面那条按「跑 cargo 的步骤」
+ * 取材的完备性断言看不见它 —— 不在这里单独钉，CI 侧删掉这一步或本机侧漏掉镜像都不会有任何东西变红。
+ * 目标清单写在两侧的调用行里而不在脚本里：钉成与跨目标门同一份，新增一个交叉目标时这一步不会落下。
+ */
+const VENDORED_STEP = 'Vendored path sources stay diagnostic-free';
+
+test(`「${VENDORED_STEP}」门：ci.yml 与 gate-rust.sh 逐字调同一条命令，目标清单同跨目标门`, () => {
+  const { ci, sh } = loadStripped();
+  const ciCommand = extractRunCommand(extractCiStepBlock(ci, VENDORED_STEP), `ci.yml "${VENDORED_STEP}"`);
+  const shLine = sh.split('\n').map((l) => l.trim()).find((l) => l.startsWith('run_gate cross-vendored '));
+  assert.ok(shLine, 'gate-rust.sh 里找不到 "run_gate cross-vendored …" 这一行');
+  assert.equal(shLine.slice('run_gate cross-vendored '.length), ciCommand, '命令本身不一致（ci.yml → gate-rust.sh）');
+
+  assert.ok(
+    ciCommand.startsWith('bash scripts/check-vendored-path-sources.sh '),
+    `这一步调的不是那份脚本：${ciCommand}`
+  );
+  const crossTriples = targetTriples(extractCiStepBlock(ci, MIRRORED_BUT_NOT_VERBATIM[0]));
+  assert.ok(crossTriples.length > 0, '跨目标门里一个三元组都没抠到 —— 下面的比对恒真');
+  assert.deepEqual(
+    targetTriples(ciCommand),
+    crossTriples,
+    '随仓路径源门的目标清单与跨目标门不是同一份 —— 新增的交叉目标在这一步被落下了'
+  );
+
+  // 脚本自己不许再带一份清单，也必须真的在数诊断（而不是只看 cargo 的退出码）。
+  const script = stripComments(readFileSync(join(ROOT, 'scripts/check-vendored-path-sources.sh'), 'utf8'));
+  assert.deepEqual(targetTriples(script.replace(/aarch64-linux-android\b/g, '')), [], '脚本里出现了写死的目标三元组');
+  assert.ok(script.includes('--message-format=json >'), '脚本没有把 cargo 的 JSON 诊断流落盘');
+  assert.ok(script.includes('.reason == "compiler-message" and .package_id == $id'), '脚本没有按包 id 数诊断');
+});
+
+/**
  * 「Android 影响面 dep-info 对差」门的**实质**两侧一致。
  *
  * 这条门抓的是：`ANDROID_IMPACT_SCOPES` 是 android.yml 的唯一触发面，新增 Android 专属源文件

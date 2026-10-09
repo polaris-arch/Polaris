@@ -555,8 +555,11 @@ impl ProxyRuntime {
             .last()
             .filter(|run| run.config_digest == actual_digest)
             .ok_or("profileBindingUnknown")?;
-        let file = std::path::Path::new(directory).join("tailscaled.state");
-        let file = file.to_str().ok_or("profileBindingUnknown")?;
+        // The scope strings follow the export's own grammar, which
+        // `validate_observed_runs` has just enforced as `<directory>/tailscaled.state`.
+        // Joining through the host path type would spell the separator differently
+        // wherever this selection is exercised off-device.
+        let file = format!("{directory}/tailscaled.state");
         let selected: Vec<_> = current
             .scopes
             .iter()

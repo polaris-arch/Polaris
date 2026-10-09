@@ -216,9 +216,24 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 
 六个 workflow 分工（`.github/workflows/`）：
 
-- **`ci.yml`** — 快速门禁：`cargo fmt + clippy + build + test`，PR / push 到 main 触发（push 到 main 时纯文档改动不触发）。
-  PR 与发布时跑 Linux / Windows / macOS 三平台，push 到 main 只跑 Linux。
-  职责 = 「改动是否正确」。建议把三平台 `cargo-test` 设为 required checks。
+- **`ci.yml`** — Rust 门禁，职责 = 「改动是否正确」。三个并行 job：
+  - `fmt + clippy (<os>)`：格式与 clippy（`-D warnings`）；Linux 腿另跑 rustdoc 与 Cronet 来源解析。
+  - `cross-target clippy + android face`（只在 Linux）：对 Windows / macOS / Android / iOS 四个交叉目标跑
+    clippy，检查 `vendor/` 下随仓第三方副本在这些目标上零诊断，并核对 Android 影响面登记表与交叉豁免表。
+    带 C 依赖的包在部分目标上被豁免（见 `scripts/cross-target-exempt.json`），它不能代替原生腿。
+  - `build + test (<os>)`：`cargo build` 与 `cargo test`。
+
+  触发与平台：
+  - 推送 `main` 只跑 Linux 原生测试加交叉 clippy（纯文档改动不触发）。
+  - Windows 与 macOS 原生 lint 与测试在 pull_request、手动触发、发布时跑（发布经 `package.yml` 调用，
+    三平台不绿不发布）。
+  - 含平台分支的改动合入前须手动触发三平台：`gh workflow run ci.yml --ref <分支>`；只确认一个平台时加
+    `-f os=windows-2022` 或 `-f os=macos-14`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
+    手动触发或发布时才会出现。
+
+  本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条），与 `ci.yml` 由
+  `scripts/gate-rust-ci-parity.test.mjs` 对拍。建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)`
+  与 `cross-target clippy + android face` 设为 required checks。
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
   只对受影响的面调用 `desktop-core.yml`、`package.yml`（不上传产物）与 `android.yml`。

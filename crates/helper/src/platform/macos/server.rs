@@ -23,7 +23,7 @@
 //! 0666 是为让普通用户 app 能连；远程不可达（unix socket 仅本机）。
 
 use crate::line_io::{read_line_trimmed_bounded, write_line, BoundedLineError};
-use crate::platform::macos::handler::{dispatch, MacConfig, MacServices};
+use crate::platform::macos::handler::{dispatch_from_peer, MacConfig, MacServices};
 use polaris_helper_proto::request::{InstallCoreParams, RouteParams, StartParams};
 use polaris_helper_proto::{parse_stop_pid, Request};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -273,10 +273,23 @@ pub fn terminate_needs_kill(exited: bool) -> bool {
 /// 生产 serve 传 `Some(&command_mu)`；单线程测试传 `None`（无锁）。
 pub fn process_connection<R: Read, W: Write>(
     reader: R,
+    writer: W,
+    services: &dyn MacServices,
+    config: &MacConfig,
+    command_mu: Option<&Mutex<()>>,
+) -> ConnOutcome {
+    process_connection_from_peer(reader, writer, services, config, command_mu, None)
+}
+
+/// [`process_connection`] 加上对端 uid（生产 serve 在 accept 后用 `getpeereid` 取，取不到传
+/// `None`）。只有 install-core 消费它，语义见 [`dispatch_from_peer`]。
+pub fn process_connection_from_peer<R: Read, W: Write>(
+    reader: R,
     mut writer: W,
     services: &dyn MacServices,
     config: &MacConfig,
     command_mu: Option<&Mutex<()>>,
+    peer_uid: Option<u32>,
 ) -> ConnOutcome {
     let mut buf = BufReader::new(reader);
     // helper.go:403-404: token 行 + command 行（锁前读，与 Go 一致）
@@ -336,7 +349,7 @@ pub fn process_connection<R: Read, W: Write>(
             return write_response(&mut writer, &resp);
         }
     };
-    let resp = dispatch(services, config, &token, &req);
+    let resp = dispatch_from_peer(services, config, &token, &req, peer_uid);
     write_response(&mut writer, &resp)
 }
 
@@ -804,12 +817,18 @@ mod sys {
                             Ok(w) => w,
                             Err(_) => return,
                         };
-                        let _ = process_connection(
+                        // 对端 uid 由内核给出（`LOCAL_PEERCRED`）。token 仍是鉴权边界；uid 只用来
+                        // 约束 install-core 的源文件属主。
+                        let peer_uid = nix::unistd::getpeereid(&s)
+                            .ok()
+                            .map(|(uid, _gid)| uid.as_raw());
+                        let _ = process_connection_from_peer(
                             s,
                             writer,
                             svc.as_ref(),
                             svc.config(),
                             Some(svc.command_mu()),
+                            peer_uid,
                         );
                     });
                 }

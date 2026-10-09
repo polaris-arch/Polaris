@@ -42,7 +42,8 @@ use polaris_helper_proto::response::{
     StartTiming, Status, Stop,
 };
 use polaris_helper_proto::{
-    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Request, Response,
+    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request,
+    Response,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -241,6 +242,21 @@ pub fn dispatch(
     token: &str,
     req: &Request,
 ) -> Response {
+    dispatch_from_peer(services, config, token, req, None)
+}
+
+/// [`dispatch`] 加上对端 uid（`getpeereid`，由 socket 层在 accept 后取）。
+///
+/// 只有 install-core 消费它：源目录与其中文件必须属对端所有。`None` = 没取到 ⇒ install-core
+/// 一律不收（其余命令不受影响）。生产的 socket 层恒走本函数；[`dispatch`] 是不带对端身份的
+/// 入口，留给不涉及 install-core 的调用方。
+pub fn dispatch_from_peer(
+    services: &dyn MacServices,
+    config: &MacConfig,
+    token: &str,
+    req: &Request,
+    peer_uid: Option<u32>,
+) -> Response {
     // helper.go:405-408: token 鉴权（首道边界）
     let stored = services.token_store().token_value();
     if !matches!(check_token(token, &stored), TokenCheck::Authed) {
@@ -404,7 +420,7 @@ pub fn dispatch(
         }
         Request::InstallCore(params) => {
             // helper.go:580-585
-            handle_install_core(services.runner(), config, params)
+            handle_install_core(services.runner(), config, params, peer_uid)
         }
         // 以下命令不属于 mac helper 谱系（LinuxStart/IfaceMetric/Uninstall）
         Request::LinuxStart(_)
@@ -562,11 +578,19 @@ fn handle_install_core(
     runner: &dyn CommandRunner,
     config: &MacConfig,
     params: &InstallCoreParams,
+    peer_uid: Option<u32>,
 ) -> Response {
     let core_dir = Path::new(&config.core_dir);
     let src_dir = Path::new(&params.src_dir);
     // helper.go:133-198: 文件操作
-    match install_core_files(core_dir, src_dir, &params.want_hash, SINGBOX_BIN_NAME) {
+    let installed = install_core_files(
+        core_dir,
+        src_dir,
+        &params.want_hash,
+        Platform::Mac,
+        peer_uid,
+    );
+    match installed {
         Ok(_) => {
             // helper.go:194-196: mac 专属 —— 清 quarantine + adhoc 签名 sing-box
             let core_dir_str = config.core_dir.as_str();

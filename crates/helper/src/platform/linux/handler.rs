@@ -225,7 +225,7 @@ fn dispatch_locked<P, S, D, SD>(
         cmd::CLEANUP => handle_cleanup(state, deps, cred, conn),
         cmd::FREEPORT => handle_freeport(deps, cred, conn),
         // install-core 是 linux 专属命令名（lcmd::INSTALL_CORE == "install-core"）。
-        lcmd::INSTALL_CORE => handle_install_core(deps, conn),
+        lcmd::INSTALL_CORE => handle_install_core(deps, cred, conn),
         cmd::START | lcmd::START_REAP_SAFE => handle_start(state, deps, cred, conn, false),
         _ => {
             let _ = conn.write_line("ERR unknown");
@@ -548,8 +548,11 @@ fn handle_freeport<P, S, D, SD>(
 }
 
 /// install-core（:396-399）：校验 sha256 + 原子写入 coreDir。
-fn handle_install_core<P, S, D, SD>(deps: &HandlerDeps<'_, P, S, D, SD>, conn: &mut impl Conn)
-where
+fn handle_install_core<P, S, D, SD>(
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    cred: &PeerCred,
+    conn: &mut impl Conn,
+) where
     P: PeerCredProvider,
     S: CoreSpawner,
     D: FreePortDeps,
@@ -558,7 +561,9 @@ where
     // :397-398: 读 srcDir 行 + wantHash 行。
     let src = conn.read_line();
     let want_hash = conn.read_line();
-    let outcome: InstallResult = install_core(deps.core_dir, src.trim(), want_hash.trim());
+    // 源目录与其中文件必须属已鉴权的对端所有：高权限进程只替调用者读它自己的东西。
+    let outcome: InstallResult =
+        install_core(deps.core_dir, src.trim(), want_hash.trim(), cred.uid);
     let _ = conn.write_line(&outcome.to_wire_line());
 }
 

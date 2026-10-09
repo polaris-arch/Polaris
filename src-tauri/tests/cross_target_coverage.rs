@@ -320,3 +320,102 @@ fn ios_bridge_exemption_cannot_expand_targets_even_below_budget() {
         );
     }
 }
+
+// ── 随仓第三方副本（`[patch]` 的路径源）不在上面那张派生清单里 ──
+//
+// 派生清单取的是 workspace 成员；`[patch]` 指向的路径源不是成员，但 Cargo 只给注册表与 git 来源
+// 的依赖加 lint 上限，路径源一律按本仓代码对待 —— `RUSTFLAGS="-D warnings"` 会用最新工具链新增的
+// lint 去审它。而这类依赖往往只在某一个平台的依赖图里（swift-rs 只在 macOS 宿主的构建依赖与 iOS
+// 目标里），Linux 腿的图里根本没有它，要到原生腿才红。本门守的是每份这样的副本都自带上限。
+
+/// 清单里某一节（表头逐字给出）之内、某个键（`path` / `build`）的全部字符串取值。
+fn manifest_strings_in(manifest: &str, header: &str, key: &str) -> Vec<String> {
+    let needle = format!("{key} = \"");
+    let mut inside = false;
+    let mut found = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            inside = line == header;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let rest = match line.strip_prefix(&needle) {
+            Some(rest) => Some(rest),
+            None => line.split_once(&format!(" {needle}")).map(|(_, rest)| rest),
+        };
+        if let Some(rest) = rest {
+            if let Some((path, _)) = rest.split_once('"') {
+                found.push(path.to_owned());
+            }
+        }
+    }
+    found
+}
+
+/// 源文件是否以 crate 级属性的形式带着 lint 上限（注释里提到的不算）。
+fn carries_lint_cap(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "#![allow(warnings)]")
+}
+
+#[test]
+fn manifest_path_extraction_and_lint_cap_detection_bite() {
+    let manifest = "[workspace]\nexclude = [\"vendor/a\"]\n\n# [patch.crates-io]\n# c = { path = \"vendor/c\" }\n[patch.crates-io]\na = { path = \"vendor/a\" }\nb = { git = \"https://example.invalid/b\" }\n\n[profile.release]\npath = \"not-a-patch\"\n";
+    assert_eq!(
+        manifest_strings_in(manifest, "[patch.crates-io]", "path"),
+        vec!["vendor/a".to_owned()]
+    );
+    assert!(manifest_strings_in(manifest, "[lib]", "path").is_empty());
+    let package = "[package]\nname = \"a\"\nrebuild = \"no\"\nbuild = \"src/gen.rs\"\n[lib]\npath = \"src/a.rs\"\n";
+    assert_eq!(
+        manifest_strings_in(package, "[package]", "build"),
+        vec!["src/gen.rs".to_owned()]
+    );
+    assert_eq!(
+        manifest_strings_in(package, "[lib]", "path"),
+        vec!["src/a.rs".to_owned()]
+    );
+    assert!(carries_lint_cap("//! docs\n#![allow(warnings)]\nmod a;\n"));
+    assert!(!carries_lint_cap(
+        "//! docs\n// #![allow(warnings)]\nmod a;\n"
+    ));
+    assert!(!carries_lint_cap(
+        "#![allow(dead_code)]\n#[allow(warnings)]\nmod a;\n"
+    ));
+}
+
+#[test]
+fn vendored_path_patches_carry_their_own_lint_cap() {
+    for vendored in manifest_strings_in(&read("Cargo.toml"), "[patch.crates-io]", "path") {
+        let manifest = read(&format!("{vendored}/Cargo.toml"));
+        let lib = manifest_strings_in(&manifest, "[lib]", "path")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "src/lib.rs".to_owned());
+        // 构建脚本是另一个 crate 根，上限要各带各的：清单点名的那个，否则是约定位置的 `build.rs`。
+        let build = manifest_strings_in(&manifest, "[package]", "build")
+            .into_iter()
+            .next()
+            .or_else(|| {
+                repo_root()
+                    .join(&vendored)
+                    .join("build.rs")
+                    .is_file()
+                    .then(|| "build.rs".to_owned())
+            });
+        for root in std::iter::once(lib).chain(build) {
+            assert!(
+                carries_lint_cap(&read(&format!("{vendored}/{root}"))),
+                "{vendored}/{root} 没有 crate 级 `#![allow(warnings)]`：路径源不享受 Cargo 给注册表依赖的 \
+                 lint 上限，原生腿的 `-D warnings` 会直接审这份第三方代码"
+            );
+        }
+    }
+}

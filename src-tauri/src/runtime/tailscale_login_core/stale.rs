@@ -99,11 +99,13 @@ pub(super) fn is_stale_login_core(process: &CoreProcess, binary: &Path, config_d
                 .is_some_and(|name| login_config_identity(name).is_some());
     }
     // `ps` joins argv with spaces and both paths may contain spaces, so match the exact prefix.
+    // A raw line only ever comes from macOS `ps`, so the separator after the config directory
+    // is that line's `/`, not whatever the compiling host uses.
     let prefix = format!("{} run -c {}", binary.display(), config_dir.display());
     let Some(rest) = process
         .raw
         .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_prefix(std::path::MAIN_SEPARATOR))
+        .and_then(|rest| rest.strip_prefix('/'))
     else {
         return false;
     };

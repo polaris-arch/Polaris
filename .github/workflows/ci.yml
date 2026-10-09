@@ -5,7 +5,8 @@ name: CI
 #
 # ── 并行拓扑（2026-10-07）：一条串行链拆成三个并行 job ──
 #   · `lint`  （矩阵）fmt + clippy；Linux 腿另跑 rustdoc 与 Cronet 来源解析
-#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy + Android 影响面 dep-info 对差 + 豁免反腐烂
+#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy + 随仓路径源零诊断 + Android 影响面 dep-info 对差
+#     + 豁免反腐烂
 #   · `test`  （矩阵）build + test
 # 拆之前 ubuntu 单腿实测（run 37642138266）：缓存 52s、clippy 66s、rustdoc 105s、Build 150s、
 # Cross-check 120s，再加 dep-info 对差与 `cargo test --workspace`，全部串行，墙钟 10 分钟以上；
@@ -548,6 +549,19 @@ jobs:
           #    ⇒ src-tauri 那 12 处穷举 match 的 iOS 臂在非 macOS runner 上一行都编不到。ios 这条腿守住的
           #    是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓 iOS 面已验」。
           PATH="$ANDROID_NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
+
+      # ── 随仓第三方副本（`[patch]` 的路径源）不在上一步的派生清单里（2026-10-08）──
+      #
+      # 上一步的覆盖面取自 workspace 成员；`vendor/` 下的路径源不是成员，却同样不享受 Cargo 给
+      # 注册表依赖的 lint 上限 —— 原生腿的 `RUSTFLAGS="-D warnings"` 会直接审它。实证（run
+      # 37760266821）：`vendor/swift-rs` 在 macos-14 的 clippy 步红了两条上游原文里的 lint，而它只在
+      # macOS 宿主的构建依赖与 iOS 目标的依赖图里，Linux 腿此前一行都编不到。
+      #
+      # 判据、对象怎么派生、射程与已知上限（`build` 特性那一段这里编不到）全在脚本头注，本处不复述。
+      # 目标清单与上一步逐字相同：两处、连同 scripts/gate-rust.sh 的镜像，由
+      # scripts/gate-rust-ci-parity.test.mjs 对拍。排在上一步之后，是因为目标由上一步 `rustup target add`。
+      - name: Vendored path sources stay diagnostic-free
+        run: bash scripts/check-vendored-path-sources.sh x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
 
       # ── Android 影响面的**产物级**完备性门（2026-09-05）──
       #

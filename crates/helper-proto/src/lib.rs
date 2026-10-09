@@ -105,6 +105,66 @@ pub mod windows_helper {
     pub const DEFAULT_SUPPORT_DIR: &str = r"C:\ProgramData\Polaris";
 }
 
+/// 受保护核目录的文件名白名单跨 crate 契约。
+///
+/// app 侧按它挑要提升的文件、helper 侧按它决定收不收：两侧判据不同源时，app 暂存进去一个
+/// helper 不认的名字，helper 拒掉的是**整个请求**（不是跳过那一个文件）⇒ 受保护核停在旧版且
+/// 每次起核重试。放在这里的理由同 [`windows_helper`]：本 crate 无 cfg、两侧都已依赖。
+///
+/// 白名单是**精确名**，不是前缀：发布产物里核与配套库各只有一个固定名字（打包侧的落位名见
+/// `scripts/lib/cronet-contract.mjs`，验包侧见 `scripts/verify-packaging.mjs`），没有带版本后缀
+/// 的变体。前缀匹配会放进 `libcronet.dll.` 这类名字 —— Windows 对非 `\\?\` 路径剥尾点，
+/// 装入的名字与记下的名字不一致，随后被清理当成多余文件删掉。
+pub mod core_payload {
+    use crate::Platform;
+
+    /// 类 unix 平台的核文件名。
+    pub const UNIX_CORE_FILENAME: &str = "sing-box";
+    /// Windows 的核文件名（PE 必须带 `.exe`，否则 `CreateProcessW` 找不到）。
+    pub const WIN_CORE_FILENAME: &str = "sing-box.exe";
+    /// linux 的 cronet 配套库文件名。
+    pub const LINUX_SIDECAR_FILENAME: &str = "libcronet.so";
+    /// Windows 的 cronet 配套库文件名。
+    pub const WIN_SIDECAR_FILENAME: &str = "libcronet.dll";
+
+    /// 平台核文件名。
+    #[must_use]
+    pub const fn core_filename(platform: Platform) -> &'static str {
+        match platform {
+            Platform::Win => WIN_CORE_FILENAME,
+            Platform::Mac
+            | Platform::Linux
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other => UNIX_CORE_FILENAME,
+        }
+    }
+
+    /// 平台随核同行的 NaiveProxy 动态库文件名。
+    ///
+    /// macOS 的 cronet 静态编入随包核，没有配套库；移动端的核不是磁盘上的可执行文件。
+    #[must_use]
+    pub const fn sidecar_filename(platform: Platform) -> Option<&'static str> {
+        match platform {
+            Platform::Linux => Some(LINUX_SIDECAR_FILENAME),
+            Platform::Win => Some(WIN_SIDECAR_FILENAME),
+            Platform::Mac | Platform::Android | Platform::Ios | Platform::Other => None,
+        }
+    }
+
+    /// `name` 是否为该平台的配套库文件名。
+    #[must_use]
+    pub fn is_sidecar_name(name: &str, platform: Platform) -> bool {
+        sidecar_filename(platform) == Some(name)
+    }
+
+    /// `name` 是否可进该平台的受保护核目录：恰为核文件名或配套库文件名。
+    #[must_use]
+    pub fn name_allowed(name: &str, platform: Platform) -> bool {
+        name == core_filename(platform) || is_sidecar_name(name, platform)
+    }
+}
+
 /// 协议版本（**三平台统一**，单一常量）。
 pub mod proto_version {
     /// 当前 wire 协议版本，mac/win/linux 共用。

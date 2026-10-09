@@ -1168,7 +1168,10 @@ async fn native_shutdown_during_dispatch_notifies_same_booked_birth_before_publi
     assert!(!shutdown.is_finished());
     release.add_permits(1);
     let (outcome, _) = running.await.unwrap();
-    assert!(matches!(outcome, TempCoreOutcome::Superseded));
+    assert!(
+        matches!(outcome, TempCoreOutcome::Superseded),
+        "关核期间的派发应被取代，实得 {outcome:?}"
+    );
     shutdown.await.unwrap().unwrap();
     assert!(h.deps.pc_custody.current().unwrap().is_none());
     assert!(birth.has_native_terminal());

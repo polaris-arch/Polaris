@@ -146,10 +146,8 @@ fn native_fixture_request(
     dir: &TestDir,
     stdio: polaris_core_supervisor::StdioPolicy,
 ) -> polaris_core_supervisor::SpawnRequest {
-    use std::os::unix::fs::PermissionsExt;
     let binary = dir.join("native-child-fixture.sh");
-    std::fs::write(&binary, "#!/bin/sh\nexec sleep 30\n").unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_executable_stand_in(&binary, "#!/bin/sh\nexec sleep 30\n");
     polaris_core_supervisor::SpawnRequest::new(
         binary,
         dir.join("ignored-native-fixture-config"),
@@ -947,7 +945,10 @@ async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_
                     .await
                     .unwrap()
                     .unwrap();
-                panic!("isolated native Drain panic fixture timed out");
+                panic!(
+                    "isolated native Drain panic fixture timed out: {}",
+                    std::fs::read_to_string(&output_path).unwrap_or_default()
+                );
             }
         };
         let output = std::fs::read_to_string(output_path).unwrap();
@@ -977,15 +978,17 @@ async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_
     .unwrap();
     let generation = rt.core_generation();
     let producer = rt.admitted_native_producer(generation).unwrap().unwrap();
-    // /bin/true exits immediately; the permitted stand-in never launches a core.
+    // `true` exits immediately; the permitted stand-in never launches a core.
+    // Resolved through PATH like the `sleep` custody stand-in: `/bin/true` does
+    // not exist on macOS, where a failed spawn returns before Drain is invoked.
     let request = polaris_core_supervisor::SpawnRequest::new(
-        "/bin/true",
+        "true",
         "/unused-fixture-config",
         polaris_core_supervisor::StdioPolicy::drain(|_stdout, _stderr| {
             panic!("fixture synchronous Drain panic")
         }),
     );
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.spawn_direct_native(
             Some(&producer),
             generation,
@@ -997,8 +1000,13 @@ async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_
             None,
             || {},
         )
-    }))
-    .is_err());
+    }));
+    // A returned value means Drain never ran, so the spawn itself is what failed.
+    assert!(
+        dispatched.is_err(),
+        "stand-in must spawn so the Drain callback can unwind; dispatch returned {:?}",
+        dispatched.map(|result| result.map(|run| run.map(|(pid, _)| pid)))
+    );
     assert_eq!(
         producer.observation().3,
         vec![FACTORY_ENTERED],

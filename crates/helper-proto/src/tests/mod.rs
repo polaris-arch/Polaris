@@ -59,6 +59,72 @@ fn windows_helper_rendezvous_is_pinned() {
     );
 }
 
+/// 受保护核目录的文件名白名单：每个平台只有核与配套库两个**精确名**。字面量写死在这里：
+/// 它们同时是打包脚本落位的文件名、安装脚本播种的文件名。
+#[test]
+fn core_payload_names_are_exact_per_platform() {
+    use core_payload::{core_filename, is_sidecar_name, name_allowed, sidecar_filename};
+
+    assert_eq!(core_filename(Platform::Linux), "sing-box");
+    assert_eq!(core_filename(Platform::Mac), "sing-box");
+    assert_eq!(core_filename(Platform::Win), "sing-box.exe");
+    assert_eq!(sidecar_filename(Platform::Linux), Some("libcronet.so"));
+    assert_eq!(sidecar_filename(Platform::Win), Some("libcronet.dll"));
+    assert_eq!(sidecar_filename(Platform::Mac), None);
+    for platform in [Platform::Android, Platform::Ios, Platform::Other] {
+        assert_eq!(sidecar_filename(platform), None, "{platform:?}");
+    }
+
+    for platform in Platform::ALL.iter().copied() {
+        assert!(name_allowed(core_filename(platform), platform));
+        if let Some(sidecar) = sidecar_filename(platform) {
+            assert!(name_allowed(sidecar, platform));
+            assert!(is_sidecar_name(sidecar, platform));
+        }
+        // 核文件名不是配套库名。
+        assert!(!is_sidecar_name(core_filename(platform), platform));
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "libcronet",
+            "libcronet.",
+            "libcronet.so.",
+            "libcronet.dll.",
+            "libcronet.so.119",
+            "libcronet.dylib",
+            ".libcronet.so",
+            ".sing-box",
+            "sing-box.",
+            "sing-box.exe.",
+            "sing-box.bak",
+            "sing-box.new",
+            "LIBCRONET.so",
+            "libcronet..so",
+            "libcronet.so/..",
+            "libcronet.a/b",
+            r"libcronet.a\b",
+            "../libcronet.so",
+            "libcronet.dll:stream",
+            "libcronet.so copy",
+            "libcronet.so\n",
+            "libcronet.s\u{f6}",
+            ".core-seed.json",
+        ] {
+            assert!(!name_allowed(bad, platform), "{bad:?} on {platform:?}");
+            assert!(!is_sidecar_name(bad, platform), "{bad:?} on {platform:?}");
+        }
+    }
+
+    // 别的平台的名字在本平台就是白名单外的名字。
+    assert!(!name_allowed("sing-box.exe", Platform::Linux));
+    assert!(!name_allowed("sing-box", Platform::Win));
+    assert!(!name_allowed("libcronet.dll", Platform::Linux));
+    assert!(!name_allowed("libcronet.so", Platform::Win));
+    assert!(!name_allowed("libcronet.so", Platform::Mac));
+}
+
 #[test]
 fn build_identity_is_a_single_safe_wire_token() {
     assert!(build_identity::is_wire_safe(build_identity::current()));

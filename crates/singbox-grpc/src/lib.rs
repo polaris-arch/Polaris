@@ -72,7 +72,22 @@ use tonic::Request;
 /// unary 调用 deadline：对齐 上游 `UNARY_DEADLINE_MS`（2000ms）。
 /// 核启动中（TCP accept 但 StartedService 方法尚未 serve）或 wedged 时 gRPC 永不返回 →
 /// UI Close/Close-All 按钮永久 spinner；2s deadline 保证必 settle（DEADLINE_EXCEEDED）。
+///
+/// 它管的是**整次调用**：从调用方发起，到拿到应答或错误，含 lazy channel 的拨号。两层各管一段：
+/// - 请求上的 `grpc-timeout`（`Request::set_timeout`）：tonic 在 channel 就绪**之后**才起算，
+///   同时把期限告知服务端；它管不到拨号。
+/// - `within_unary_deadline`：从发起起算的本地时钟，把拨号也算在内。
+///
+/// 拨号本身另以 [`CONNECT_TIMEOUT`] 为限（不分摊本期限：连得上时应答仍有完整的 2s）。
 pub const UNARY_DEADLINE: Duration = Duration::from_millis(2000);
+
+/// 单次 TCP 拨号的上限，对经本 crate 的每条 channel 生效（unary、快照、各条流的建流与重连）。
+///
+/// 端点恒是本机回环，连得上时拨号是亚毫秒级的；到这个时限还没连上，等同于连不上，报
+/// `Unavailable`，与对端拒连同一类。取 [`UNARY_DEADLINE`] 的一半：没人监听而系统又迟迟不报拒连时
+/// （Windows 对回环拒连要重发 SYN，约 2s 才报回），调用在期限之内就以「连不上」收场，而不是恰好
+/// 压在期限上、报成哪一种错误全凭先后。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// 连接首帧快照兜底超时：对齐 上游 `closeOldNodeConnectionsAfterHotSwitch` 的
 /// `guard = setTimeout(..., 3000)`。首帧不来 → 放弃断连（宁可漏关，不泄漏订阅、不阻断已成功的热切换）。
@@ -132,6 +147,31 @@ pub struct SingBoxApiClient {
     secret: Option<String>,
 }
 
+/// 把一次 unary 调用收在 [`UNARY_DEADLINE`] 之内，从发起起算。
+///
+/// 到期一律报 `DeadlineExceeded`。tonic 自己那只按 `grpc-timeout` 走的本地时钟到期时报的是
+/// `Cancelled`，两只时钟取同一个期限、谁先被看见不确定，所以「已到期限的 `Cancelled`」也归到这里
+/// —— 调用方看到的到期只有一种说法。
+async fn within_unary_deadline<T>(
+    call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, ClientError> {
+    let expired = || {
+        ClientError::Status(tonic::Status::deadline_exceeded(format!(
+            "no answer from the management API within {UNARY_DEADLINE:?}"
+        )))
+    };
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(UNARY_DEADLINE, call).await {
+        Err(_) => Err(expired()),
+        Ok(Err(status))
+            if status.code() == tonic::Code::Cancelled && started.elapsed() >= UNARY_DEADLINE =>
+        {
+            Err(expired())
+        }
+        Ok(answer) => Ok(answer?),
+    }
+}
+
 impl SingBoxApiClient {
     /// 连接端点（h2c，明文 HTTP/2）。`secret` 空串 → 免认证；否则 per-call 注入 Bearer。
     pub async fn connect(
@@ -185,7 +225,7 @@ impl SingBoxApiClient {
             outbound_tag: member_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.select_outbound(req).await?;
+        within_unary_deadline(c.select_outbound(req)).await?;
         Ok(())
     }
 
@@ -195,7 +235,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::ClashMode { mode: mode.into() }));
         req.set_timeout(UNARY_DEADLINE);
-        c.set_clash_mode(req).await?;
+        within_unary_deadline(c.set_clash_mode(req)).await?;
         Ok(())
     }
 
@@ -203,7 +243,9 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        Ok(c.get_clash_mode_status(req).await?.into_inner())
+        Ok(within_unary_deadline(c.get_clash_mode_status(req))
+            .await?
+            .into_inner())
     }
 
     /// Tailscale：热重设出口节点（不重启核）。按 `endpoint_tag` 定位具体 tailscale 端点，
@@ -220,7 +262,7 @@ impl SingBoxApiClient {
             stable_id: stable_id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.set_tailscale_exit_node(req).await?;
+        within_unary_deadline(c.set_tailscale_exit_node(req)).await?;
         Ok(())
     }
 
@@ -232,7 +274,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        c.submit_open_connect_auth_response(req).await?;
+        within_unary_deadline(c.submit_open_connect_auth_response(req)).await?;
         Ok(())
     }
 
@@ -244,7 +286,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_open_connect_auth_challenge(req).await?;
+        within_unary_deadline(c.cancel_open_connect_auth_challenge(req)).await?;
         Ok(())
     }
 
@@ -256,7 +298,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        c.submit_open_vpn_challenge_response(req).await?;
+        within_unary_deadline(c.submit_open_vpn_challenge_response(req)).await?;
         Ok(())
     }
 
@@ -268,7 +310,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_open_vpn_challenge(req).await?;
+        within_unary_deadline(c.cancel_open_vpn_challenge(req)).await?;
         Ok(())
     }
 
@@ -279,7 +321,7 @@ impl SingBoxApiClient {
             id: id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.close_connection(req).await?;
+        within_unary_deadline(c.close_connection(req)).await?;
         Ok(())
     }
 
@@ -293,7 +335,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        c.close_all_connections(req).await?;
+        within_unary_deadline(c.close_all_connections(req)).await?;
         Ok(())
     }
 
@@ -318,7 +360,9 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        let resp = c.get_default_log_level(req).await?.into_inner();
+        let resp = within_unary_deadline(c.get_default_log_level(req))
+            .await?
+            .into_inner();
         // prost 对未知枚举值回落 default(=PANIC)，那会把「上游加了新级别」伪装成「核在 panic 级」。
         // 故用 try_from 自己判：识别不出就报错，由调用方呈现成「未知」——不猜。
         daemon::LogLevel::try_from(resp.level).map_err(|_| {
@@ -479,7 +523,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        c.clear_logs(req).await?;
+        within_unary_deadline(c.clear_logs(req)).await?;
         Ok(())
     }
 
@@ -582,7 +626,7 @@ impl SingBoxApiClient {
             endpoint_tag: endpoint_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.mark_taildrop_inbox_read(req).await?;
+        within_unary_deadline(c.mark_taildrop_inbox_read(req)).await?;
         Ok(())
     }
 
@@ -598,7 +642,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.delete_taildrop_file(req).await?;
+        within_unary_deadline(c.delete_taildrop_file(req)).await?;
         Ok(())
     }
 
@@ -619,7 +663,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_taildrop_receiving(req).await?;
+        within_unary_deadline(c.cancel_taildrop_receiving(req)).await?;
         Ok(())
     }
 
@@ -782,7 +826,8 @@ impl TaildropSendOutput {
     }
 }
 
-/// 客户端错误：连接失败 / tonic Status（含 Unauthenticated=16 / DeadlineExceeded=4）。
+/// 客户端错误：连接失败 / tonic Status（含 Unauthenticated=16 / DeadlineExceeded=4 /
+/// Unavailable=14：拨号被拒或超过 [`CONNECT_TIMEOUT`]）。
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("transport error connecting to sing-box management API: {0}")]

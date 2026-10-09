@@ -1154,7 +1154,14 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
 
     // ── 「非本 app」sing-box：复制核到异路径再起 → 路径不同 → 绝不该被误杀 ──
     let foreign_bin = dir.join("foreign-sing-box");
-    std::fs::copy(&core, &foreign_bin).expect("复制核到异路径（std::fs::copy 保留可执行位）");
+    #[cfg(unix)]
+    crate::test_support::write_executable_stand_in(
+        &foreign_bin,
+        std::fs::read(&core).expect("读出核以复制到异路径"),
+    );
+    // Windows 没有共用的落替身办法（那里没有 fork 继承写句柄这回事），照旧直接复制。
+    #[cfg(not(unix))]
+    std::fs::copy(&core, &foreign_bin).expect("复制核到异路径");
     let foreign_cfg = dir.join("foreign.json");
     write_bare_singbox_config(&foreign_cfg, free_port());
     let mut foreign = tokio::process::Command::from(crate::runtime::kernel_run::with_run(
@@ -3278,14 +3285,26 @@ fn local_native_birth_and_terminal_facts_follow_actual_production_edges() {
     );
 }
 
+/// The census judges `directory` and `file` with the host path type, so the fixture
+/// spells them as the host does: absolute here, and joined by the host separator.
+fn writer_node_fixture(tag: &str, terminal: bool) -> WriterNodeScope {
+    let directory = std::env::temp_dir().join("polaris-writer-census").join(tag);
+    assert!(directory.is_absolute());
+    WriterNodeScope {
+        tag: tag.into(),
+        directory: directory.to_str().unwrap().to_owned(),
+        file: directory
+            .join("tailscaled.state")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        terminal,
+    }
+}
+
 #[test]
 fn writer_retirement_requires_every_original_run_and_node() {
-    let node = |tag: &str| WriterNodeScope {
-        tag: tag.into(),
-        directory: format!("/private/state/{tag}"),
-        file: format!("/private/state/{tag}/tailscaled.state"),
-        terminal: false,
-    };
+    let node = |tag: &str| writer_node_fixture(tag, false);
     let original = vec![
         WriterRunScope {
             nonce: "a".repeat(64),
@@ -3341,7 +3360,7 @@ fn writer_retirement_requires_every_original_run_and_node() {
                 bad[0].digest = "3".repeat(64);
             }
             7 => {
-                bad[0].nodes[0].directory = "/private/other".into();
+                bad[0].nodes[0].directory = writer_node_fixture("elsewhere", true).directory;
             }
             _ => {
                 bad.push(bad[0].clone());
@@ -3359,12 +3378,7 @@ fn writer_retirement_requires_every_original_run_and_node() {
 
 #[test]
 fn pre_ready_retirement_uses_original_full_claim_without_a_ready_baseline() {
-    let node = |tag: &str| WriterNodeScope {
-        tag: tag.into(),
-        directory: format!("/private/state/{tag}"),
-        file: format!("/private/state/{tag}/tailscaled.state"),
-        terminal: true,
-    };
+    let node = |tag: &str| writer_node_fixture(tag, true);
     let retired = vec![WriterRunScope {
         nonce: "a".repeat(64),
         digest: "1".repeat(64),
@@ -3395,7 +3409,7 @@ fn pre_ready_retirement_uses_original_full_claim_without_a_ready_baseline() {
                 bad.push(historic);
             }
             6 => bad.push(bad[0].clone()),
-            7 => bad[0].nodes[0].file = "/private/other/tailscaled.state".into(),
+            7 => bad[0].nodes[0].file = writer_node_fixture("elsewhere", true).file,
             _ => bad[0].nodes[0].directory = "relative/path".into(),
         }
         assert!(

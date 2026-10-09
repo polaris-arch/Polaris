@@ -3217,8 +3217,13 @@ impl TempCoreSession {
             },
             &ready_deps,
         );
+        // `biased`：关核请求先于就绪结果判定。`select!` 默认随机挑先轮询的分支，而就绪探测
+        // 可能在第一次轮询时就已完成（探测跑在阻塞线程池里，线程被抢占一下就够）——
+        // 那时一个**起核途中就已被要求关闭**的批会有一半概率被当成就绪，走进测量再被打断，
+        // 结局从 `Superseded` 变成一条空的 `Ran`。
         #[cfg(not(target_os = "android"))]
         let ready = tokio::select! {
+            biased;
             () = deps.pc_custody.close_requested() => CoreReadyOutcome::Superseded,
             ready = ready => ready,
         };

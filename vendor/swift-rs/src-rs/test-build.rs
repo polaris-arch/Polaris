@@ -1,6 +1,9 @@
 //! Build script for swift-rs that is a no-op for normal builds, but can be enabled
 //! to include test swift library based on env var `TEST_SWIFT_RS=true` with the
 //! `build` feature being enabled.
+// Polaris: local addition, not upstream. Same lint cap as `lib.rs`, for the same reason:
+// a build script of a path source is compiled under the workspace's `-D warnings` too.
+#![allow(warnings)]
 
 #[cfg(feature = "build")]
 mod build;

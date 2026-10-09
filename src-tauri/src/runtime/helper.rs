@@ -184,7 +184,7 @@ pub enum HelperBuildProbe {
 ///
 /// 治的是纯性能坑：旧 Windows helper 对 `install-core` 回 `ERR unknown`，而受保护核对账的缓存
 /// 只在 `UpToDate` 分支写 ⇒ 那条腿一个缓存都不记，于是**每次起核**都完整跑两个 80MB 的 sha256 +
-/// 硬链一次暂存目录，最后换回同一句 warn。
+/// 复制一次暂存目录，最后换回同一句 warn。
 ///
 /// **只是性能，不改安全语义**：命中时的行为与跑完一整轮失败完全一致——warn 一句、继续起核
 /// （spec §3.5 兼容矩阵：加固未生效时降级回本批前的现状，不 brick、不误报）。
@@ -1284,7 +1284,7 @@ impl HelperRuntime {
     /// 探一次已装 helper 自报的**构建身份**（一次 `Ping`，无副作用）。
     ///
     /// 只服务 [`install-core 能力缓存`](crate::runtime::proxy) 的失效键：一次 ping 是微秒级管道
-    /// 往返，而它挡掉的是两次 80MB sha256 + 一次暂存目录硬链。不复用
+    /// 往返，而它挡掉的是两次 80MB sha256 + 一次暂存目录复制。不复用
     /// [`Self::status`]——那条会走 `status_with_recovery`（探不到就去拉服务），对每次起核都跑的
     /// 热路径太重，且会把「探测」变成「有副作用的动作」。
     pub(crate) fn helper_build_probe(&self) -> HelperBuildProbe {

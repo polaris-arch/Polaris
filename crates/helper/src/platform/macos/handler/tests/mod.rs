@@ -823,6 +823,18 @@ fn install_core_success_runs_xattr_and_codesign() {
     let src = tempfile::tempdir().unwrap();
     let sb = b"fake sing-box";
     std::fs::write(src.path().join("sing-box"), sb).unwrap();
+    // 本模块的测试三平台都编；属主判据只在 unix 那条收文件腿上（Windows 宿主上跑的是另一条腿，
+    // 不看对端 uid）。权限显式定：源目录与文件须组与其他人不可写，不随测试环境的 umask 漂。
+    #[cfg(unix)]
+    let me = {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [src.path().to_path_buf(), src.path().join("sing-box")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Some(nix::unistd::Uid::current().as_raw())
+    };
+    #[cfg(not(unix))]
+    let me: Option<u32> = None;
     let mut h = Sha256::new();
     h.update(sb);
     let hash = hex::encode(h.finalize());
@@ -834,16 +846,30 @@ fn install_core_success_runs_xattr_and_codesign() {
     let mut cfg2 = cfg.clone();
     cfg2.core_dir = core_tmp.path().to_string_lossy().into_owned();
 
-    let resp = dispatch(
-        &svc,
-        &cfg2,
-        "t",
-        &Request::InstallCore(InstallCoreParams {
-            src_dir: src.path().to_string_lossy().into_owned(),
-            want_hash: hash,
-        }),
-    );
+    let req = Request::InstallCore(InstallCoreParams {
+        src_dir: src.path().to_string_lossy().into_owned(),
+        want_hash: hash,
+    });
+
+    // 对端身份没取到：不收。源文件不属对端所有：不收。两种都不落盘、不跑签名。
+    #[cfg(unix)]
+    {
+        for peer in [None, me.map(|uid| uid + 1)] {
+            let resp = dispatch_from_peer(&svc, &cfg2, "t", &req, peer);
+            assert!(
+                matches!(&resp, Response::Err(e) if e.code == ErrorCode::Other),
+                "peer={peer:?} → {resp:?}"
+            );
+            assert!(!core_tmp.path().join("sing-box").exists(), "peer={peer:?}");
+        }
+        assert!(svc.calls().is_empty(), "被拒的请求不该跑 xattr/codesign");
+        // 不带对端身份的入口等价于 `None`。
+        assert!(matches!(dispatch(&svc, &cfg2, "t", &req), Response::Err(_)));
+    }
+
+    let resp = dispatch_from_peer(&svc, &cfg2, "t", &req, me);
     assert!(matches!(resp, Response::Ok(ResponseKind::Installed)));
+    assert_eq!(std::fs::read(core_tmp.path().join("sing-box")).unwrap(), sb);
     // 验证 xattr + codesign 被调
     let calls = svc.calls();
     assert!(calls.iter().any(|(p, _)| p == "/usr/bin/xattr"));
