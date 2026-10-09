@@ -367,12 +367,30 @@ fn the_period_falls_back_to_the_default_and_bounds_freshness() {
         );
     }
     let plan = plan(&[("fast", 5, &["a"]), ("slow", 120, &["b"])]);
-    assert_eq!(freshness_cap_ms(&plan, "a"), 10 * MINUTE, "下限 10 分钟");
-    assert_eq!(freshness_cap_ms(&plan, "b"), 240 * MINUTE);
     assert_eq!(
-        freshness_cap_ms(&plan, "manual-only"),
+        freshness_cap_ms(&plan, "a", 1, 0),
+        10 * MINUTE,
+        "下限 10 分钟"
+    );
+    assert_eq!(freshness_cap_ms(&plan, "b", 1, 0), 240 * MINUTE);
+    assert_eq!(
+        freshness_cap_ms(&plan, "manual-only", 1, 0),
         60 * MINUTE,
         "不属于任何计划内订阅的节点按缺省周期算"
+    );
+    // 上限跟着实际测量间隔走：降频时乘降频倍数，退避中的节点再乘退避的轮数。
+    assert_eq!(
+        freshness_cap_ms(&plan, "b", METERED_REDUCED_FACTOR, 0),
+        240 * MINUTE * METERED_REDUCED_FACTOR
+    );
+    assert_eq!(
+        freshness_cap_ms(&plan, "b", 1, BACKOFF_AFTER_FAILURES - 1),
+        240 * MINUTE,
+        "还没进退避的失败不放宽"
+    );
+    assert_eq!(
+        freshness_cap_ms(&plan, "b", 1, BACKOFF_AFTER_FAILURES),
+        240 * MINUTE * u64::from(BACKOFF_SKIP_ROUNDS + 1)
     );
 }
 
@@ -1629,4 +1647,537 @@ fn status_carries_the_platform_cap_and_the_subscription_default() {
         assert_eq!(limits["meteredPolicyDefault"], "reduced");
         assert_eq!(status["metered"], "unavailable");
     }
+}
+
+// ── 新鲜期上限与实际测量间隔 ──────────────────────────────────────────────────
+
+/// 一个核世代里按周期推进的一组轮次：每轮按 [`order_targets`] 的真实排序与退避取目标，把结果
+/// 入账；在相邻两轮之间每分钟读一次账本。返回 (读了多少次, 其中多少次 `stale` 判为真)。
+///
+/// `interval_factor` 是相邻两轮相隔几个周期（计费降频时为 [`METERED_REDUCED_FACTOR`]），
+/// `period_factor` 是这些轮次期间调度器同步给账本的降频倍数（结果入账时带上它）。
+fn sample_between_rounds(
+    period_minutes: u64,
+    interval_factor: u64,
+    rounds: u64,
+    outcome: &dyn Fn(&str) -> bool,
+    period_factor: u64,
+    stale: &dyn Fn(&measurement_ledger::Candidates) -> bool,
+) -> (u64, u64) {
+    use crate::commands::speedtest::{
+        CoreInstance, FailKind, FailPhase, MeasureFailure, MeasurePath, ResultIdentity,
+    };
+
+    let members = ids(&["good", "bad"]);
+    let plan = plan(&[("s1", period_minutes, &["good", "bad"])]);
+    let view = LedgerView::new(&Value::Null, Some(1), None, Platform::Linux);
+    let ledger = MeasurementLedger::new();
+    ledger.set_period_factor(period_factor);
+    let fingerprints = BTreeMap::new();
+    let interval = period_minutes * interval_factor * MINUTE;
+    let mut skips = BTreeMap::new();
+    let (mut reads, mut stale_reads) = (0, 0);
+    for round in 0..rounds {
+        let started = WALL + round * interval;
+        let targets = order_targets(
+            &members,
+            None,
+            &[],
+            &|id| view.entry(&ledger, id),
+            None,
+            &mut skips,
+        );
+        for (seq, id) in targets.iter().enumerate() {
+            let measured = if outcome(id) {
+                Ok(80)
+            } else {
+                Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout))
+            };
+            ledger.record(
+                id,
+                measured,
+                ResultIdentity {
+                    run: round + 1,
+                    seq: seq as u64,
+                    origin: SpeedTestOrigin::Schedule,
+                    scope: None,
+                    path: MeasurePath::Candidate,
+                    url_digest: view.url_digest.clone(),
+                    instance: CoreInstance::Main {
+                        generation: 1,
+                        start_time: None,
+                    },
+                    config_digest: None,
+                    node_fingerprint: None,
+                    network_epoch: None,
+                    measured_at: started,
+                    binding: None,
+                },
+            );
+        }
+        for minute in 1..interval / MINUTE {
+            let read = ledger.candidates(
+                &members,
+                &ReadContext {
+                    main_generation: Some(1),
+                    fingerprints: &fingerprints,
+                    network_epoch: None,
+                    url_digest: &view.url_digest,
+                    now_ms: started + minute * MINUTE,
+                    foreground_epoch: None,
+                    freshness_cap_ms: &|id, entry| entry_freshness_cap_ms(&plan, id, entry),
+                },
+            );
+            reads += 1;
+            stale_reads += u64::from(stale(&read));
+        }
+    }
+    (reads, stale_reads)
+}
+
+/// 计费网络降频时每 4 个周期测一轮：两轮之间，上一轮测出的结果一直可用于选点。
+#[test]
+fn results_stay_selectable_between_rounds_under_metered_reduction() {
+    let (reads, expired) = sample_between_rounds(
+        30,
+        METERED_REDUCED_FACTOR,
+        4,
+        &|_| true,
+        METERED_REDUCED_FACTOR,
+        &|read| read.selectable.len() != 2,
+    );
+    assert_eq!(
+        expired, 0,
+        "降频期间读了 {reads} 次账本，其中 {expired} 次有节点已不可选"
+    );
+}
+
+/// 订阅里有一个长期不可达的节点：它进入退避后每 4 轮才测一次，其间这组节点仍算被完整覆盖
+/// （它的失败记录仍是当前结果，不因为调度器自己安排的跳测而变成「过期」）。
+#[test]
+fn a_backed_off_node_stays_covered_between_its_spaced_out_tests() {
+    let (reads, uncovered) = sample_between_rounds(30, 1, 12, &|id| id == "good", 1, &|read| {
+        !read.covers_all_testable()
+    });
+    assert_eq!(
+        uncovered, 0,
+        "读了 {reads} 次账本，其中 {uncovered} 次这组节点被判为没有完整覆盖"
+    );
+}
+
+/// 降频倍数只有一个来源：准入时定下一轮的到期间隔与读取时放宽新鲜期上限用的是同一个值。
+#[test]
+fn the_period_factor_follows_the_metered_state_and_policy() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    for (metered, policy, factor) in [
+        (Metered::Yes, MeteredPolicy::Reduced, METERED_REDUCED_FACTOR),
+        (Metered::Yes, MeteredPolicy::Normal, 1),
+        (Metered::No, MeteredPolicy::Reduced, 1),
+        (Metered::Unavailable, MeteredPolicy::Reduced, 1),
+    ] {
+        let mut planner = Planner::new(Platform::Linux, at(0));
+        planner.tick(&TickInput {
+            conditions: Some(DeviceConditions {
+                metered,
+                power_save: false,
+            }),
+            policy,
+            ..input(at(0), Some(1), &plan)
+        });
+        assert_eq!(planner.period_factor(), factor, "{metered:?} {policy:?}");
+    }
+}
+
+/// 给自动选点的读数：一轮收尾后该订阅带上轮次序号；被抢占的一轮不算收尾；被时间预算截断的算。
+/// 序号不随核世代清零，订阅的序号随计划重建清空。
+#[test]
+fn a_concluded_round_is_reported_with_a_serial_that_survives_generations() {
+    let plan = plan(&[("s1", 30, &["a", "b"])]);
+    let (mut planner, first) = started(Platform::Linux, &plan);
+    let signals = planner.signals();
+    assert_eq!(signals.round_serial, 0);
+    assert_eq!(signals.subscriptions["s1"], (None, None));
+    assert!(signals.foreground);
+
+    planner.on_round_end(
+        at(first + 1_000),
+        &interrupted(InterruptReason::Preempted, &["a"], &["b"]),
+    );
+    assert_eq!(
+        planner.signals().subscriptions["s1"],
+        (None, Some("preempted")),
+        "被抢占的一轮还要补发，不算收尾"
+    );
+
+    let resend = first + 1_000 + PREEMPT_RESEND_MS;
+    assert!(planner
+        .tick(&input(at(resend), Some(1), &plan))
+        .start
+        .is_some());
+    planner.on_round_end(at(resend + 1_000), &completed(&[("b", true)]));
+    let signals = planner.signals();
+    assert_eq!(signals.round_serial, 1);
+    assert_eq!(signals.subscriptions["s1"].0, Some(1));
+
+    // 被时间预算截断的一轮也算收尾。
+    let second = resend + 30 * MINUTE;
+    assert!(planner
+        .tick(&input(at(second), Some(1), &plan))
+        .start
+        .is_some());
+    let over_budget = second + ROUND_BUDGET_MAX_MS + 1;
+    assert!(planner.tick(&input(at(over_budget), Some(1), &plan)).abort);
+    planner.on_round_end(
+        at(over_budget),
+        &interrupted(InterruptReason::Cancelled, &["a"], &["b"]),
+    );
+    assert_eq!(planner.signals().subscriptions["s1"].0, Some(2));
+
+    // 换核世代：计划重建，订阅的序号清空；总序号不回退。
+    planner.tick(&input(at(over_budget + 1_000), Some(2), &plan));
+    let signals = planner.signals();
+    assert_eq!(signals.round_serial, 2);
+    assert_eq!(signals.subscriptions["s1"].0, None);
+}
+
+/// 全局总开关关着时，读数里带着未启用的原因；手机离开前台后读数随之翻转。
+#[test]
+fn signals_carry_why_the_plan_is_not_running() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let mut planner = Planner::new(Platform::Android, at(0));
+    planner.tick(&TickInput {
+        user_enabled: false,
+        ..input(at(0), Some(1), &plan)
+    });
+    assert_eq!(planner.signals().blocked_by(), Some("userDisabled"));
+
+    let (mut planner, _) = started(Platform::Android, &plan);
+    assert_eq!(planner.signals().blocked_by(), None);
+    planner.on_suspended(at(FIRST_ROUND_DELAY_MS + 1));
+    assert!(!planner.signals().foreground);
+    planner.on_resumed(at(FIRST_ROUND_DELAY_MS + 2));
+    assert!(planner.signals().foreground);
+}
+
+/// 自动选择意图进计划：意图指向订阅甲且甲的周期测速为关时，甲进入计划；意图清空后退出。
+/// 总开关关着或本平台未开放时意图不生效，甲不进计划。全局周期测速总开关关闭时，计划里有甲
+/// 也不进入运行态。
+#[test]
+fn an_effective_auto_intent_puts_its_subscription_in_the_plan() {
+    use crate::runtime::auto_select::{effective_subscription, Switches};
+
+    let mut config = json!({
+        "subscriptions": [{ "id": "a", "periodicSpeedTest": false }],
+        "servers": [{ "id": "n1", "subscriptionId": "a" }],
+        "selectionIntent": polaris_store::selection_intent_auto("a"),
+    });
+    let planned = |config: &Value, switches: Switches, platform: Platform| {
+        let intent = effective_subscription(config, switches, platform)
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        plan_subscriptions(config, &intent)
+    };
+    let on = Switches::PRODUCTION;
+    let with_intent = planned(&config, on, Platform::Linux);
+    assert_eq!(with_intent, plan(&[("a", 30, &["n1"])]));
+    assert!(planned(&config, on, Platform::Ios).is_empty(), "iOS 未开放");
+    let off = Switches {
+        master: false,
+        ..on
+    };
+    assert!(
+        planned(&config, off, Platform::Linux).is_empty(),
+        "总开关关着"
+    );
+
+    // 全局周期测速总开关一票否决：有计划也不运行。
+    let mut planner = Planner::new(Platform::Linux, at(0));
+    for mono in [0, FIRST_ROUND_DELAY_MS] {
+        let out = planner.tick(&TickInput {
+            user_enabled: false,
+            ..input(at(mono), Some(1), &with_intent)
+        });
+        assert_eq!(out.start, None);
+    }
+    assert_eq!(planner.signals().verdict, Verdict::Idle(Idle::UserDisabled));
+    let (planner, _) = started(Platform::Linux, &with_intent);
+    assert_eq!(planner.signals().verdict, Verdict::Running);
+
+    config.as_object_mut().unwrap().remove("selectionIntent");
+    assert!(
+        planned(&config, on, Platform::Linux).is_empty(),
+        "意图清空后退出计划"
+    );
+}
+
+/// 接线（源码级）：调度器建计划时的意图集合取自配置里生效的自动意图，不是空集。
+#[test]
+fn the_run_loop_reads_the_auto_intent_from_the_config() {
+    let source = crate::test_support::crate_code("runtime/measurement_scheduler.rs");
+    assert!(source.contains("auto_select::effective_subscription("));
+    assert!(source.contains("self.lock().plan = effective_plan(&config, platform)"));
+    assert!(source.contains("plan_subscriptions(config, &auto_intent)"));
+    assert!(source.contains("let output = planner.tick_and_sync_ledger(&TickInput {"));
+    assert!(!source.contains("plan_subscriptions(&config, &BTreeSet::new())"));
+}
+
+// ── 降频倍数随结果入账；计费状态经「不可得」的迁移 ──────────────────────────────
+
+/// 一条结果的身份块（世代 1，候选路径），测量的墙钟时刻由调用方给。
+fn measured(run: u64, measured_at: u64) -> crate::commands::speedtest::ResultIdentity {
+    use crate::commands::speedtest::{CoreInstance, MeasurePath, ResultIdentity};
+    ResultIdentity {
+        run,
+        seq: 1,
+        origin: SpeedTestOrigin::Schedule,
+        scope: None,
+        path: MeasurePath::Candidate,
+        url_digest: LedgerView::new(&Value::Null, Some(1), None, Platform::Linux).url_digest,
+        instance: CoreInstance::Main {
+            generation: 1,
+            start_time: None,
+        },
+        config_digest: None,
+        node_fingerprint: None,
+        network_epoch: None,
+        measured_at,
+        binding: None,
+    }
+}
+
+/// 节点 `a` 此刻还能不能用于选点。
+fn selectable_at(
+    ledger: &MeasurementLedger,
+    plan: &BTreeMap<String, SubPlan>,
+    foreground_epoch: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    let view = LedgerView::new(&Value::Null, Some(1), None, Platform::Linux);
+    let fingerprints = BTreeMap::new();
+    !ledger
+        .candidates(
+            &ids(&["a"]),
+            &ReadContext {
+                main_generation: Some(1),
+                fingerprints: &fingerprints,
+                network_epoch: None,
+                url_digest: &view.url_digest,
+                now_ms,
+                foreground_epoch,
+                freshness_cap_ms: &|id, entry| entry_freshness_cap_ms(plan, id, entry),
+            },
+        )
+        .selectable
+        .is_empty()
+}
+
+/// 一条结果的新鲜期在它入账时就定下。非计费时测得的结果按 2 个周期过期；此后降频倍数变成 4，
+/// 这条已过期的结果不会重新变新鲜。反过来，降频时测得的结果保有 8 个周期，倍数回到 1 之后也
+/// 不被提前判过期（下一轮还排在 4 个周期之后时，这段时间不会没有数据）。
+#[test]
+fn a_result_keeps_the_freshness_it_was_measured_with() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let period = 30 * MINUTE;
+
+    let ledger = MeasurementLedger::new();
+    ledger.record("a", Ok(80), measured(1, WALL));
+    assert!(selectable_at(&ledger, &plan, None, WALL + 2 * period));
+    assert!(!selectable_at(&ledger, &plan, None, WALL + 2 * period + 1));
+    ledger.set_period_factor(METERED_REDUCED_FACTOR);
+    for periods in [3, 5, 8] {
+        assert!(
+            !selectable_at(&ledger, &plan, None, WALL + periods * period),
+            "倍数变大之后，{periods} 个周期前按 1 倍测得的结果不复活"
+        );
+    }
+    // 倍数变大之后新入账的结果才带上新的上限。
+    ledger.record("a", Ok(80), measured(2, WALL + 8 * period));
+    assert!(selectable_at(&ledger, &plan, None, WALL + 16 * period));
+    assert!(!selectable_at(&ledger, &plan, None, WALL + 16 * period + 1));
+    // 倍数回到 1：那条按 4 倍测得的结果不被提前判过期。
+    ledger.set_period_factor(1);
+    assert!(selectable_at(&ledger, &plan, None, WALL + 15 * period));
+}
+
+/// 手机上从 Wi-Fi 换到蜂窝，中间有一段读不到计费状态：否 → 不可得 → 是。它与直接的 否 → 是
+/// 一样是翻转：前台代次加一（Wi-Fi 下测得的结果不再可用于选点），连续失败清零，当拍补测。
+/// 没有这一条时，旧结果会带着变宽的上限在蜂窝下继续参与选点，首轮锁存也会凭它立刻成立。
+#[test]
+fn a_metered_change_through_unavailable_is_still_a_flip() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let period = 30 * MINUTE;
+    let ledger = MeasurementLedger::new();
+    let mut planner = Planner::new(Platform::Android, at(0));
+    let tick = |planner: &mut Planner, mono, metered| {
+        let out = planner.tick(&TickInput {
+            conditions: Some(DeviceConditions {
+                metered,
+                power_save: false,
+            }),
+            ledger: &ledger,
+            ..input(at(mono), Some(1), &plan)
+        });
+        ledger.set_foreground_epoch(planner.foreground_epoch());
+        ledger.set_period_factor(planner.period_factor());
+        out
+    };
+    tick(&mut planner, 0, Metered::No);
+    assert!(tick(&mut planner, FIRST_ROUND_DELAY_MS, Metered::No)
+        .start
+        .is_some());
+    ledger.record("a", Ok(80), measured(1, WALL));
+    planner.on_round_end(at(FIRST_ROUND_DELAY_MS + 1_000), &completed(&[("a", true)]));
+    let epoch_on_wifi = planner.foreground_epoch();
+    assert!(selectable_at(
+        &ledger,
+        &plan,
+        Some(epoch_on_wifi),
+        WALL + period
+    ));
+
+    // Wi-Fi 断开：计费状态读不到。还不是翻转，什么都不变。
+    let lost = FIRST_ROUND_DELAY_MS + 10 * MINUTE;
+    assert_eq!(tick(&mut planner, lost, Metered::Unavailable).start, None);
+    assert_eq!(planner.foreground_epoch(), epoch_on_wifi);
+    // 蜂窝接上：与上一次已知的取值相反 → 翻转。
+    let start = tick(&mut planner, lost + MINUTE, Metered::Yes).start;
+    assert!(start.is_some(), "当拍补测");
+    assert_eq!(planner.foreground_epoch(), epoch_on_wifi + 1);
+    assert_eq!(planner.period_factor(), METERED_REDUCED_FACTOR);
+    // Wi-Fi 下测得的那条结果：无论过去多久、倍数是几，都不再可用于选点。
+    for elapsed in [period, 3 * period, 7 * period] {
+        assert!(!selectable_at(
+            &ledger,
+            &plan,
+            Some(planner.foreground_epoch()),
+            WALL + elapsed
+        ));
+    }
+
+    // 对照：不可得 → 同一个已知取值，不是翻转。
+    let mut planner = Planner::new(Platform::Android, at(0));
+    tick(&mut planner, 0, Metered::Yes);
+    tick(&mut planner, 1_000, Metered::Unavailable);
+    tick(&mut planner, 2_000, Metered::Yes);
+    assert_eq!(planner.foreground_epoch(), 0);
+    // 从未知起步的第一次已知取值也不是翻转。
+    let mut planner = Planner::new(Platform::Android, at(0));
+    tick(&mut planner, 0, Metered::Unavailable);
+    tick(&mut planner, 1_000, Metered::Yes);
+    assert_eq!(planner.foreground_epoch(), 0);
+}
+
+/// 计费状态从「是」变成「不可得」：降频解除（按照常处理）。下一轮不留在 4 倍周期之外 ——
+/// 到期时刻随之收回到一个周期之内；降频时测得的结果仍按它入账时的 8 个周期算，中间没有
+/// 「结果已过期而下一轮还没到」的空窗。
+#[test]
+fn leaving_reduction_through_unavailable_leaves_no_gap_without_data() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let period = 30 * MINUTE;
+    let ledger = MeasurementLedger::new();
+    let mut planner = Planner::new(Platform::Linux, at(0));
+    let tick = |planner: &mut Planner, mono, metered| {
+        let out = planner.tick(&TickInput {
+            conditions: Some(DeviceConditions {
+                metered,
+                power_save: false,
+            }),
+            ledger: &ledger,
+            ..input(at(mono), Some(1), &plan)
+        });
+        ledger.set_period_factor(planner.period_factor());
+        out
+    };
+    tick(&mut planner, 0, Metered::Yes);
+    let first = FIRST_ROUND_DELAY_MS;
+    assert!(tick(&mut planner, first, Metered::Yes).start.is_some());
+    ledger.record("a", Ok(80), measured(1, WALL));
+    planner.on_round_end(at(first + 1_000), &completed(&[("a", true)]));
+    let due_of = |planner: &Planner, mono| {
+        planner.status(at(mono), true, &plan)["subscriptions"]["s1"]["nextDueAt"]
+            .as_u64()
+            .unwrap()
+            - WALL
+            + mono
+    };
+    assert_eq!(
+        due_of(&planner, first + 1_000),
+        first + METERED_REDUCED_FACTOR * period,
+        "降频：下一轮在 4 个周期之后"
+    );
+
+    // 半个周期后计费状态变成不可得。两拍之内到期时刻收回。
+    let lost = first + period / 2;
+    tick(&mut planner, lost, Metered::Unavailable);
+    tick(&mut planner, lost + TICK_ACTIVE_MS, Metered::Unavailable);
+    let due = due_of(&planner, lost + TICK_ACTIVE_MS);
+    assert!(
+        due <= lost + TICK_ACTIVE_MS + period,
+        "到期时刻不留在 4 倍周期之外：{due}"
+    );
+    // 从结果入账到下一轮到期，这条结果一直可用于选点。
+    let elapsed_until_due = due - first;
+    assert!(selectable_at(
+        &ledger,
+        &plan,
+        None,
+        WALL + elapsed_until_due
+    ));
+    assert!(
+        selectable_at(&ledger, &plan, None, WALL + 2 * period + 1),
+        "按入账时的倍数算，不因倍数回到 1 而在 2 个周期处过期"
+    );
+    assert!(tick(&mut planner, due, Metered::Unavailable)
+        .start
+        .is_some());
+}
+
+#[test]
+fn production_plan_reads_the_effective_intent_and_respects_the_platform_gate() {
+    let mut config = json!({
+        "selectionIntent": polaris_store::selection_intent_auto("sub"),
+        "subscriptions": [{ "id": "sub", "periodicSpeedTest": false }],
+        "servers": [{ "id": "node", "subscriptionId": "sub" }],
+    });
+    assert_eq!(
+        effective_plan(&config, Platform::Linux),
+        plan(&[("sub", 30, &["node"])])
+    );
+    assert!(effective_plan(&config, Platform::Ios).is_empty());
+    config.as_object_mut().unwrap().remove("selectionIntent");
+    assert!(effective_plan(&config, Platform::Linux).is_empty());
+}
+
+#[test]
+fn production_tick_synchronizes_reduced_factor_before_receipts_are_recorded() {
+    let ledger = MeasurementLedger::new();
+    let plan = plan(&[("s1", 30, &["a", "b"])]);
+    let mut planner = Planner::new(Platform::Android, at(0));
+    let url = measured(1, WALL).url_digest;
+    for (run, node, metered, expected) in [(1, "a", Metered::Yes, 4), (2, "b", Metered::No, 1)] {
+        planner.tick_and_sync_ledger(&TickInput {
+            now: at(run * 60_000),
+            user_enabled: true,
+            generation: Some(1),
+            plan: &plan,
+            network_epoch: None,
+            conditions: Some(DeviceConditions {
+                metered,
+                power_save: false,
+            }),
+            policy: MeteredPolicy::Reduced,
+            ledger: &ledger,
+        });
+        assert!(ledger.record_at(node, Ok(20), measured(run, WALL), run * 60_000));
+        assert_eq!(
+            ledger.candidate_entry(node, &url).unwrap().period_factor,
+            expected
+        );
+    }
+    assert_eq!(
+        ledger.candidate_entry("a", &url).unwrap().period_factor,
+        4,
+        "already recorded reduced receipts must keep their original freshness factor"
+    );
 }

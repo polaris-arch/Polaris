@@ -44,8 +44,9 @@ pub use fs::{atomic_write_plan, AtomicWritePlan, ConfigFs, StdFs};
 pub use migrate::{migrate_all, MigrationDelta};
 pub use privacy_lock::{PrivacyPasswordHash, ScryptParams};
 pub use sanitize::{
-    sanitize_config, speed_test_slot_cap, PERIODIC_SPEED_TEST_ENABLED_DEFAULT,
-    PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT, SPEED_TEST_CONCURRENCY_MIN,
+    sanitize_config, selection_intent_auto, selection_intent_subscription,
+    selection_intent_unrecognized, speed_test_slot_cap, PERIODIC_SPEED_TEST_ENABLED_DEFAULT,
+    PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT, SELECTION_INTENT_KEY, SPEED_TEST_CONCURRENCY_MIN,
     SPEED_TEST_INTERVAL_MINUTES, SPEED_TEST_INTERVAL_MINUTES_DEFAULT,
     SPEED_TEST_METERED_POLICY_DEFAULT,
 };

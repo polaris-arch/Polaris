@@ -68,6 +68,9 @@ export const IPC_CHANNELS = {
   SERVER_DELETE_BATCH: 'server_delete_batch',
   SERVER_SPEED_TEST: 'server_speed_test',
   SPEED_TEST_SCHEDULE_STATUS: 'speed_test_schedule_status', // 周期测速的计划状态（只读）
+  AUTO_SELECT_ENABLE: 'auto_select_enable', // 把选择意图置为「自动选择（该订阅）」；清掉只需点任一节点
+  AUTO_SELECT_SWITCH_NOW: 'auto_select_switch_now', // 自动意图下按共享裁决请求换点（允许重启内核）
+  AUTO_SELECT_STATUS: 'auto_select_status', // 选择状态（只读）
   WARP_REGISTER: 'warp_register', // Cloudflare WARP 设备注册 → 生成 WireGuard 草稿
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
@@ -310,6 +313,7 @@ export const IPC_CHANNELS = {
   EVENT_CORE_BASELINE_WARNING: 'event:coreBaselineWarning', // 非官方核 ≤ 随包基线：启动 reconcile 发兼容风险提醒
   EVENT_HELPER_UPGRADEABLE: 'event:helperUpgradeable', // 提权 helper proto < 期望（如属主根治 v6）：启动后发，渲染端 toast 引导升级
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
+  EVENT_AUTO_SELECT_STATUS: 'event:autoSelectStatus', // 选择状态变化，载荷与状态命令的返回同形
   EVENT_PROXY_PENDING_CHANGES: 'event:proxyPendingChanges', // R2 待应用差集 PUSH：switch_mode 末尾推 {added, modified, removed}（与 pull 同构）；待应用操作条数据源
   EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
   EVENT_NETWORK_PROFILE_MATCH_CHANGED: 'event:networkProfileMatchChanged', // 网络场景命中态变更（无载荷，收到即重拉 NETWORK_PROFILE_RESOLVED_SOURCES）

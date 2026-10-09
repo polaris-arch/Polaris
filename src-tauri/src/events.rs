@@ -141,6 +141,8 @@ pub mod channel {
 
     // 自动换节点
     pub const EVENT_AUTO_NODE_SWITCHED: &str = "event:autoNodeSwitched";
+    /// 自动选择的选择状态（载荷与状态命令 `auto_select_status` 的返回同形）。状态变化时发一次。
+    pub const EVENT_AUTO_SELECT_STATUS: &str = "event:autoSelectStatus";
 
     // IP 信息
     pub const EVENT_IP_INFO_UPDATED: &str = "event:ipInfoUpdated";

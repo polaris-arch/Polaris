@@ -1277,6 +1277,37 @@ impl SpeedTestGate {
             .as_ref()
             .map(|(origin, _)| *origin)
     }
+
+    /// 等到闸空出来为止。不占闸，也不取消持有者。
+    async fn idle(&self) {
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            // 先登记再看状态，理由同 [`acquire`](Self::acquire)。
+            released.as_mut().enable();
+            if self.holder().is_none() {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    async fn data_settled(&self, ledger: &measurement_ledger::MeasurementLedger, seen: u64) {
+        ledger.changed_since(seen).await;
+        self.idle().await;
+    }
+}
+
+/// 单飞闸上此刻有没有一轮在飞、是谁发起的（只读）。自动选点据此不拿一轮中途的半份数据选点。
+pub(crate) fn speed_test_in_flight() -> Option<SpeedTestOrigin> {
+    SPEED_TEST_GATE.holder()
+}
+
+/// Wait for new results and for the actual producer to release its single-flight gate.
+pub(crate) async fn speed_test_data_settled(seen: u64) {
+    SPEED_TEST_GATE
+        .data_settled(measurement_ledger::global(), seen)
+        .await;
 }
 
 /// RAII 单飞守卫：`acquire` 抢占，`drop` 释放——覆盖 early return / `await` 取消 / panic 展开，

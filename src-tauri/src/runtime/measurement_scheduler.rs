@@ -35,10 +35,12 @@ use crate::commands::speedtest::{
 use crate::events::channel::{
     EVENT_CONFIG_CHANGED, EVENT_PROXY_STARTED, EVENT_SPEED_TEST_SCHEDULE,
 };
-use crate::runtime::measurement_ledger::{self, EvictContext, MeasurementLedger, ReadContext};
+use crate::runtime::measurement_ledger::{
+    self, EvictContext, LedgerEntry, MeasurementLedger, ReadContext,
+};
 use crate::runtime::speedtest::InterruptReason;
 use crate::runtime::subscription_scheduler::now_ms;
-use crate::runtime::AppRuntime;
+use crate::runtime::{auto_select, AppRuntime};
 
 /// 调度器总开关。`false`：不发起任何一轮，状态恒为未启用（结果入账照常，无行为影响）。
 /// 回退 = 改这个常量后重新出包；两种取值各有单测。
@@ -77,11 +79,11 @@ const METERED_REDUCED_FACTOR: u64 = 4;
 const ROUND_BUDGET_MAX_MS: u64 = 10 * 60_000;
 /// 到期时刻相差不超过合并窗的订阅并入同一轮：周期的十分之一，至多这么久。
 const MERGE_WINDOW_MAX_MS: u64 = 3 * 60_000;
-/// 新鲜期上限：周期的 2 倍，不低于这个值。
+/// 新鲜期上限：节点实际测量间隔的 2 倍，不低于这个值。
 const FRESHNESS_FLOOR_MS: u64 = 10 * 60_000;
 /// 连续这么多轮失败的节点进入退避：此后每跳过这么多轮测一次。
-const BACKOFF_AFTER_FAILURES: u32 = 3;
-const BACKOFF_SKIP_ROUNDS: u32 = 3;
+pub(crate) const BACKOFF_AFTER_FAILURES: u32 = 3;
+pub(crate) const BACKOFF_SKIP_ROUNDS: u32 = 3;
 /// 连续这么多轮被时间预算截断即置「周期过短」。
 const SHORT_PERIOD_STREAK: u8 = 3;
 /// 读状态时：距上次完整轮次超过周期的这么多倍即逾期。
@@ -169,7 +171,7 @@ pub(crate) enum Idle {
 }
 
 impl Idle {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::SwitchedOff => "switchedOff",
             Self::UserDisabled => "userDisabled",
@@ -189,7 +191,7 @@ pub(crate) enum Pause {
 }
 
 impl Pause {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Background => "background",
             Self::Metered => "metered",
@@ -277,7 +279,7 @@ pub(crate) const fn platform_enabled(platform: Platform) -> bool {
 }
 
 /// 只有手机按前后台判定；桌面以「进程活着且未休眠」为准。
-const fn is_mobile(platform: Platform) -> bool {
+pub(crate) const fn is_mobile(platform: Platform) -> bool {
     match platform {
         Platform::Android | Platform::Ios => true,
         Platform::Mac | Platform::Win | Platform::Linux | Platform::Other => false,
@@ -341,9 +343,22 @@ pub(crate) fn plan_subscriptions(
         .collect()
 }
 
-/// 节点的新鲜期上限：所属订阅周期的 2 倍，不低于 10 分钟。不属于任何计划内订阅的节点
-/// （只被手动测过）按缺省周期算。
-pub(crate) fn freshness_cap_ms(plan: &BTreeMap<String, SubPlan>, node_id: &str) -> u64 {
+/// 节点的新鲜期上限：它实际测量间隔的 2 倍，不低于 10 分钟。
+///
+/// 实际测量间隔是所属订阅的周期，再乘上调度器自己安排的两种拉长：计费网络降频时每
+/// [`METERED_REDUCED_FACTOR`] 个周期才发一轮（`period_factor`，取那条结果**入账时**的倍数，记在
+/// 账本条目上：一条结果的新鲜期在它产生时就定下，此后倍数变大不会让已过期的结果重新变新鲜）；
+/// 连续失败达到退避门槛的节点每 `BACKOFF_SKIP_ROUNDS + 1` 轮才测一次（`consecutive_failures`
+/// 是那条记录的连续失败次数）。上限若不跟着放宽，结果会在调度器按计划不去测它的那段时间里
+/// 过期：降频期间约一半时间没有可选点，退避中的节点约一半时间被读成「没有当前结果」。
+///
+/// 不属于任何计划内订阅的节点（只被手动测过）按缺省周期算。
+pub(crate) fn freshness_cap_ms(
+    plan: &BTreeMap<String, SubPlan>,
+    node_id: &str,
+    period_factor: u64,
+    consecutive_failures: u32,
+) -> u64 {
     let period = plan
         .values()
         .find(|sub| sub.members.iter().any(|member| member == node_id))
@@ -351,7 +366,26 @@ pub(crate) fn freshness_cap_ms(plan: &BTreeMap<String, SubPlan>, node_id: &str) 
             polaris_store::SPEED_TEST_INTERVAL_MINUTES_DEFAULT * 60_000,
             |sub| sub.period_ms,
         );
-    (period * 2).max(FRESHNESS_FLOOR_MS)
+    let backoff = if consecutive_failures >= BACKOFF_AFTER_FAILURES {
+        u64::from(BACKOFF_SKIP_ROUNDS) + 1
+    } else {
+        1
+    };
+    (period * period_factor * backoff * 2).max(FRESHNESS_FLOOR_MS)
+}
+
+/// 账本里一条记录的新鲜期上限：降频倍数与连续失败次数都取自这条记录本身。
+pub(crate) fn entry_freshness_cap_ms(
+    plan: &BTreeMap<String, SubPlan>,
+    node_id: &str,
+    entry: &LedgerEntry,
+) -> u64 {
+    freshness_cap_ms(
+        plan,
+        node_id,
+        entry.period_factor,
+        entry.consecutive_failures,
+    )
 }
 
 /// 用户是否开着周期测速的全局总开关。
@@ -439,6 +473,8 @@ struct SubState {
     skip_logged: Option<SkipReason>,
     truncated_streak: u8,
     period_too_short: bool,
+    /// 本订阅最近一次收尾的一轮的序号（见 [`Planner::round_serial`]）。
+    last_round_serial: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +542,8 @@ pub(crate) struct Planner {
     last_network_retest: Option<u64>,
     conditions: DeviceConditions,
     conditions_at: Option<u64>,
+    /// 最近一次**已知**的计费状态（是 / 否）。中间隔着「不可得」的迁移也据它判翻转。
+    last_known_metered: Option<bool>,
     round: Option<ActiveRound>,
     /// 上一轮被时间预算截断时没测到的节点：下一轮排在最前。
     carry_over: Vec<String>,
@@ -518,6 +556,64 @@ pub(crate) struct Planner {
     policy: MeteredPolicy,
     /// 上一轮开始时的波宽，以及那一轮内是否减半过。
     last_width: Option<(usize, bool)>,
+    /// 已收尾的轮次数（进程内单调，不随核世代清零）。一轮算收尾：测完了、被时间预算截断、
+    /// 没有目标、或零可测；被抢占、被离开前台或冻结打断的不算，它们还要补发。
+    round_serial: u64,
+}
+
+/// 调度器给自动选点读的几个量（见 [`signals`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Signals {
+    /// 手机是否在前台；桌面恒为真。
+    pub(crate) foreground: bool,
+    /// 最近一拍的裁决：计划没在执行时，原因在这里。
+    pub(crate) verdict: Verdict,
+    /// 已收尾的轮次数。
+    pub(crate) round_serial: u64,
+    /// 逐订阅：最近一次收尾的一轮的序号，与最近一次到期未执行的原因。
+    pub(crate) subscriptions: BTreeMap<String, (Option<u64>, Option<&'static str>)>,
+}
+
+impl Signals {
+    pub(crate) const fn idle() -> Self {
+        Self {
+            foreground: true,
+            verdict: Verdict::Idle(Idle::CoreNotRunning),
+            round_serial: 0,
+            subscriptions: BTreeMap::new(),
+        }
+    }
+}
+
+impl Signals {
+    /// 周期计划没在执行的原因（未启用或暂停）；在执行时为 `None`。
+    pub(crate) const fn blocked_by(&self) -> Option<&'static str> {
+        match self.verdict {
+            Verdict::Idle(idle) => Some(idle.as_str()),
+            Verdict::Paused(pause) => Some(pause.as_str()),
+            Verdict::Running | Verdict::Waiting | Verdict::Start => None,
+        }
+    }
+}
+
+static SIGNALS: Mutex<Signals> = Mutex::new(Signals::idle());
+
+/// 调度器最近一拍对外公布的读数。调度器没启动时是初值：在前台、不降频、没有任何一轮。
+pub(crate) fn signals() -> Signals {
+    SIGNALS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Resolve the production intent before building the subscription plan.
+fn effective_plan(config: &Value, platform: Platform) -> BTreeMap<String, SubPlan> {
+    let auto_intent =
+        auto_select::effective_subscription(config, auto_select::Switches::PRODUCTION, platform)
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+    plan_subscriptions(config, &auto_intent)
 }
 
 impl Planner {
@@ -544,6 +640,7 @@ impl Planner {
             last_network_retest: None,
             conditions: DeviceConditions::UNAVAILABLE,
             conditions_at: None,
+            last_known_metered: None,
             round: None,
             carry_over: Vec::new(),
             backoff_skips: BTreeMap::new(),
@@ -551,6 +648,41 @@ impl Planner {
             verdict: Verdict::Idle(Idle::CoreNotRunning),
             policy: MeteredPolicy::parse(None),
             last_width: None,
+            round_serial: 0,
+        }
+    }
+
+    /// 当前的降频倍数：计费网络且策略为降频时每 [`METERED_REDUCED_FACTOR`] 个周期发一轮。
+    /// 准入时定下一轮的到期间隔；同步给账本后，此后入账的结果带着它定各自的新鲜期上限。
+    pub(crate) const fn period_factor(&self) -> u64 {
+        if matches!(self.conditions.metered, Metered::Yes)
+            && matches!(self.policy, MeteredPolicy::Reduced)
+        {
+            METERED_REDUCED_FACTOR
+        } else {
+            1
+        }
+    }
+
+    /// 给自动选点读的几个量。
+    pub(crate) fn signals(&self) -> Signals {
+        Signals {
+            foreground: self.foreground,
+            verdict: self.verdict,
+            round_serial: self.round_serial,
+            subscriptions: self
+                .subs
+                .iter()
+                .map(|(id, sub)| {
+                    (
+                        id.clone(),
+                        (
+                            sub.last_round_serial,
+                            sub.last_skip.as_ref().map(|(_, reason)| reason.as_str()),
+                        ),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -644,6 +776,15 @@ impl Planner {
         sub.last_skip = Some((now.wall, reason));
     }
 
+    /// Publish admission conditions to subsequent measurement receipts in the
+    /// same production step as planning, so reduced rounds retain their factor.
+    fn tick_and_sync_ledger(&mut self, input: &TickInput<'_>) -> TickOutput {
+        let output = self.tick(input);
+        input.ledger.set_foreground_epoch(self.foreground_epoch());
+        input.ledger.set_period_factor(self.period_factor());
+        output
+    }
+
     /// **一拍**：推进状态机，返回要外壳做的事。
     pub(crate) fn tick(&mut self, input: &TickInput<'_>) -> TickOutput {
         let now = input.now;
@@ -703,6 +844,7 @@ impl Planner {
         // 计划每拍现算：订阅的开关与周期读自原始配置，不重启内核，下一拍生效。
         if self.generation.is_some() {
             self.subs.retain(|id, _| input.plan.contains_key(id));
+            let period_factor = self.period_factor();
             let first_due = (self.ready.mono + FIRST_ROUND_DELAY_MS).max(now.mono);
             for (id, plan) in input.plan {
                 let sub = self.subs.entry(id.clone()).or_insert_with(|| SubState {
@@ -712,9 +854,8 @@ impl Planner {
                 sub.period_ms = plan.period_ms;
                 sub.members.clone_from(&plan.members);
                 // 周期被改短时不必等旧的到期时刻。
-                sub.next_due = sub
-                    .next_due
-                    .min(now.mono + plan.period_ms * METERED_REDUCED_FACTOR);
+                // 降频解除（含计费状态变成不可得）时同理：到期时刻不留在 4 倍周期之外。
+                sub.next_due = sub.next_due.min(now.mono + plan.period_ms * period_factor);
             }
             if self.subs.is_empty() {
                 out.abort |= self.abort(AbortCause::Reset);
@@ -741,14 +882,22 @@ impl Planner {
             self.due_now(now);
         }
 
-        // 计费状态翻转（两侧都已知）：多半是 Wi-Fi 与蜂窝互换，视同切网，立即补测；
+        // 计费状态翻转：这一次已知的取值与上一次已知的取值相反（中间隔着「不可得」也算，手机上
+        // Wi-Fi 断开到蜂窝接上之间常有一段读不到）。多半是 Wi-Fi 与蜂窝互换，视同切网，立即补测；
         // 手机上没有网络代次，另把前台代次加一使旧结果作废。补测与切网共用最小间隔：间隔内的翻转
         // 记作一次待处理的切网，满间隔后补一轮，来回翻转绕不过降频。
         if let Some(conditions) = input.conditions {
-            let flipped = matches!(
-                (self.conditions.metered, conditions.metered),
-                (Metered::Yes, Metered::No) | (Metered::No, Metered::Yes)
-            );
+            let known = match conditions.metered {
+                Metered::Yes => Some(true),
+                Metered::No => Some(false),
+                Metered::Unavailable => None,
+            };
+            let flipped = known.is_some()
+                && self.last_known_metered.is_some()
+                && known != self.last_known_metered;
+            if known.is_some() {
+                self.last_known_metered = known;
+            }
             self.conditions = conditions;
             self.conditions_at = Some(now.mono);
             if flipped {
@@ -824,8 +973,6 @@ impl Planner {
                     .min()
                     .unwrap_or(ROUND_BUDGET_MAX_MS)
                     .min(ROUND_BUDGET_MAX_MS);
-                let reduced = matches!(self.conditions.metered, Metered::Yes)
-                    && matches!(input.policy, MeteredPolicy::Reduced);
                 for id in &subs {
                     if let Some(sub) = self.subs.get_mut(id) {
                         if sub.skip_logged.take().is_some() {
@@ -837,7 +984,7 @@ impl Planner {
                     subs: subs.clone(),
                     started_mono: now.mono,
                     budget_ms,
-                    period_factor: if reduced { METERED_REDUCED_FACTOR } else { 1 },
+                    period_factor: self.period_factor(),
                     abort_cause: None,
                 });
                 out.start = Some(RoundStart {
@@ -932,6 +1079,20 @@ impl Planner {
                         (None, _) => None,
                     }
                 };
+                // 这一轮算不算收尾（首轮完成的判据之一）：被抢占或被打断的还要补发，不算。
+                if matches!(
+                    skip,
+                    None | Some(
+                        SkipReason::Budget | SkipReason::NoTargets | SkipReason::NothingTestable(_)
+                    )
+                ) {
+                    self.round_serial += 1;
+                    for id in &round.subs {
+                        if let Some(sub) = self.subs.get_mut(id) {
+                            sub.last_round_serial = Some(self.round_serial);
+                        }
+                    }
+                }
                 // 被时间预算截断：没测到的节点下一轮排在最前。
                 if skip == Some(SkipReason::Budget) {
                     self.carry_over.clone_from(&report.unmeasured);
@@ -1390,6 +1551,7 @@ impl MeasurementScheduler {
                 abort.abort();
             }
         }
+        publish(&shared.planner);
         drop(shared);
         self.wake.notify_one();
     }
@@ -1397,7 +1559,10 @@ impl MeasurementScheduler {
     /// 应用回到前台。
     pub fn on_resumed(&self) {
         let now = self.now();
-        self.lock().planner.on_resumed(now);
+        let mut shared = self.lock();
+        shared.planner.on_resumed(now);
+        publish(&shared.planner);
+        drop(shared);
         self.wake.notify_one();
     }
 }
@@ -1420,8 +1585,8 @@ impl MeasurementScheduler {
                     if let Ok(current) = state.config().current() {
                         config = current;
                         config_at = Some(now.mono);
-                        // 自动选择意图的只读访问口尚不存在：指向集合恒为空。
-                        self.lock().plan = plan_subscriptions(&config, &BTreeSet::new());
+                        // 被自动选择意图指向的订阅即使没开周期测速也进计划。
+                        self.lock().plan = effective_plan(&config, platform);
                     }
                 }
                 (
@@ -1437,7 +1602,7 @@ impl MeasurementScheduler {
             let (output, targets) = {
                 let mut shared = self.lock();
                 let Shared { planner, plan, .. } = &mut *shared;
-                let output = planner.tick(&TickInput {
+                let output = planner.tick_and_sync_ledger(&TickInput {
                     now: self.now(),
                     user_enabled: user_enabled(&config),
                     generation,
@@ -1449,7 +1614,7 @@ impl MeasurementScheduler {
                     ),
                     ledger,
                 });
-                ledger.set_foreground_epoch(planner.foreground_epoch());
+                publish(planner);
                 if output.abort {
                     if let Some(abort) = shared.abort.as_ref() {
                         abort.abort();
@@ -1458,7 +1623,8 @@ impl MeasurementScheduler {
                 let targets = output.start.as_ref().map(|start| {
                     let context = LedgerView::new(&config, generation, network_epoch, platform);
                     let Shared { planner, plan, .. } = &mut *shared;
-                    let cap = |id: &str| freshness_cap_ms(plan, id);
+                    let cap =
+                        |id: &str, entry: &LedgerEntry| entry_freshness_cap_ms(plan, id, entry);
                     let current = ledger.current_results(
                         &start
                             .subs
@@ -1514,6 +1680,7 @@ impl MeasurementScheduler {
                         Some(outcome) => shared.planner.on_round_end(now, outcome),
                         None => shared.planner.on_round_crashed(now),
                     }
+                    publish(&shared.planner);
                     let plan = shared.plan.clone();
                     drop(shared);
                     // 每轮收尾时按软上限淘汰一次。
@@ -1523,7 +1690,7 @@ impl MeasurementScheduler {
                             resolve_speed_test_url(&config).as_bytes(),
                         ),
                         now_ms: now.wall,
-                        freshness_cap_ms: &|id| freshness_cap_ms(&plan, id),
+                        freshness_cap_ms: &|id, entry| entry_freshness_cap_ms(&plan, id, entry),
                     });
                     this.announce(&app, true);
                     this.wake.notify_one();
@@ -1553,17 +1720,23 @@ impl MeasurementScheduler {
     }
 }
 
-/// 读账本要用的对照面（由一份配置快照与当前运行态现算）。
-struct LedgerView {
+/// 把状态机的读数公布给 [`signals`] 的读取方。
+fn publish(planner: &Planner) {
+    *SIGNALS.lock().unwrap_or_else(PoisonError::into_inner) = planner.signals();
+}
+
+/// 读账本要用的对照面（由一份配置快照与当前运行态现算）。调度器与自动选点共用这一份：
+/// 一条结果还能不能用于选点，只有这一套判据。
+pub(crate) struct LedgerView {
     generation: Option<u64>,
     fingerprints: BTreeMap<String, String>,
     network_epoch: Option<u64>,
-    url_digest: String,
+    pub(crate) url_digest: String,
     mobile: bool,
 }
 
 impl LedgerView {
-    fn new(
+    pub(crate) fn new(
         config: &Value,
         generation: Option<u64>,
         network_epoch: Option<u64>,
@@ -1578,9 +1751,14 @@ impl LedgerView {
         }
     }
 
-    fn read<'a>(
+    /// 当前配置里逐节点的参数指纹。
+    pub(crate) const fn fingerprints(&self) -> &BTreeMap<String, String> {
+        &self.fingerprints
+    }
+
+    pub(crate) fn read<'a>(
         &'a self,
-        freshness_cap_ms: &'a dyn Fn(&str) -> u64,
+        freshness_cap_ms: &'a dyn Fn(&str, &LedgerEntry) -> u64,
         ledger: &MeasurementLedger,
         now_ms: u64,
     ) -> ReadContext<'a> {
@@ -1595,7 +1773,7 @@ impl LedgerView {
         }
     }
 
-    fn entry(&self, ledger: &MeasurementLedger, node_id: &str) -> Option<EntryView> {
+    pub(crate) fn entry(&self, ledger: &MeasurementLedger, node_id: &str) -> Option<EntryView> {
         let entry = ledger.candidate_entry(node_id, &self.url_digest)?;
         Some(EntryView {
             this_generation: matches!(

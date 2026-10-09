@@ -6,6 +6,7 @@ import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
 import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload, SpeedTestScheduleStatus } from '../../contracts/speed-test';
 import type { ServerSwitchReceipt } from '../../contracts/server-switch';
+import type { AutoSelectReceipt, AutoSelectStatus } from '../../contracts/auto-select';
 
 // ============================================================================
 // serverApi
@@ -207,5 +208,32 @@ export const serverApi = {
   /** 计划状态变化（状态或其原因变了、一轮刚收尾）。 */
   onSpeedTestSchedule(listener: (data: SpeedTestScheduleStatus) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_SCHEDULE, listener);
+  },
+
+  /**
+   * 把选择意图置为「自动选择（该订阅）」。当前出口在订阅外且有可选数据时完成首次落点；
+   * 否则只写意图，后续按共享裁决评估，不因启用而替换订阅内出口。被拒时信封带 `AUTO_SELECT_*` 稳定码
+   * （本平台未开放、订阅不存在、订阅为空）。清掉意图不需要命令：点任一节点即回到手动。
+   */
+  async autoSelectEnable(subscriptionId: string): Promise<AutoSelectReceipt> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_ENABLE, { subscriptionId });
+  },
+
+  /**
+   * 自动意图下按共享裁决请求换点，保留连胜、驻留和限频条件；意图保留。用于需要重启时由用户
+   * 显式发起：与手动点节点同级，允许重启内核。
+   */
+  async autoSelectSwitchNow(): Promise<AutoSelectReceipt> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_SWITCH_NOW);
+  },
+
+  /** 选择状态（只读）：意图、实际出口、模式与原因、上次换点、最近一次评估、自曝标记。 */
+  async autoSelectStatus(): Promise<AutoSelectStatus> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_STATUS);
+  },
+
+  /** 选择状态变化。 */
+  onAutoSelectStatus(listener: (data: AutoSelectStatus) => void): () => void {
+    return listen(IPC_CHANNELS.EVENT_AUTO_SELECT_STATUS, listener);
   },
 };

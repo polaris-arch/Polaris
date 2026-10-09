@@ -132,7 +132,7 @@ impl NodeCategory {
 ///   （spec §7 / D12，见 [`pick_categories`] / [`merge_categories`]）。
 /// - `selectedServerId` 跟节点走、不随通用设置导入；导入节点后若失效，[`merge_categories`] 末尾主动归零
 ///   （[`crate::validate::validate_config`] 对失效 selectedServerId 是 **Err、非归零**，不兜底会令整份导入失败）。
-const DATA_FIELDS: [&str; 21] = [
+const DATA_FIELDS: [&str; 22] = [
     "servers",
     "subscriptions",
     "customRules",
@@ -153,6 +153,8 @@ const DATA_FIELDS: [&str; 21] = [
     "appRulesSeeded",
     "customAppPresets",
     "selectedServerId",
+    // 选择意图与 `selectedServerId` 同归类：不导出、不随通用设置导入；导入后指向的订阅已不在即移除。
+    crate::sanitize::SELECTION_INTENT_KEY,
     // Portable backup-only policy; never part of live config/generalSettings.
     "meshRouting",
 ];
@@ -817,6 +819,10 @@ pub fn merge_categories(
         if !id.is_empty() && !is_sentinel_selection(Some(&id)) && !still_exists {
             set(&mut result, "selectedServerId", Value::Null);
         }
+    }
+    // 选择意图跟着走：导入订阅类后它指向的订阅可能已被整类替换掉。
+    if let Some(object) = result.as_object_mut() {
+        crate::sanitize::sanitize_selection_intent(object);
     }
 
     MergeOutcome {

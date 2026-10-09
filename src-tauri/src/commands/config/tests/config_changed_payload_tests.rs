@@ -90,12 +90,12 @@ const CONSUMER_FLOOR: usize = 3;
 fn emit_site_carries_no_config_content() {
     let broadcast_body = top_level_fn_body(
         &crate_code("commands/config.rs"),
-        "pub(crate) fn broadcast_config_changed_with(",
+        "pub(crate) fn broadcast_config_changed_with_completion<F>(",
     );
     // 切点自检①：扫到的确实是那个生产函数体。
     assert!(
         broadcast_body.contains("strip_privacy_secrets(&mut cfg)"),
-        "扫到的不是 broadcast_config_changed_with 的函数体 —— 守卫已失去判据"
+        "扫到的不是 broadcast_config_changed_with_completion 的函数体 —— 守卫已失去判据"
     );
     assert!(
         broadcast_body.contains("emit_config_changed_signal(app)"),

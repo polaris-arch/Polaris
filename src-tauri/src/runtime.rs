@@ -16,6 +16,7 @@
 //! 注：各运行时的访问器（dir / path / platform / config 等）为后续 actor 批次（crash-recovery /
 //! stats-worker / mesh-warp）预留注入点；当前仅 command 层用到子集，`dead_code` 全模块放行。
 
+pub(crate) mod auto_select;
 pub mod auto_switch;
 pub mod config;
 pub mod core_paths;

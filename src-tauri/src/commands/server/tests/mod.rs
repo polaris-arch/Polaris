@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::auto_select::Hold;
 use crate::runtime::config::ConfigManager;
 use crate::test_support::{crate_code, TestDir};
 
@@ -42,8 +43,9 @@ fn server_switch_core_updates_selection_and_mru_in_one_write() {
     let mgr = ConfigManager::new(dir.clone());
     seed_switch_nodes(&mgr);
 
-    let (cfg, changed, intent) =
+    let (cfg, changed, intent, intent_cleared) =
         server_switch_core(&mgr, "n-b", |_| Ok(()), || 7).expect("切换应成功");
+    assert!(!intent_cleared, "本来就是手动意图：没有清掉什么");
     assert!(changed);
     assert_eq!(intent, 7);
     assert_eq!(cfg["selectedServerId"], json!("n-b"));
@@ -56,7 +58,7 @@ fn server_switch_block_is_a_sentinel_and_does_not_enter_recent_nodes() {
     let dir = temp_dir("switch-block-sentinel");
     let mgr = ConfigManager::new(dir.clone());
     seed_switch_nodes(&mgr);
-    let (saved, changed, intent) = server_switch_core(&mgr, BLOCK_SERVER_ID, |_| Ok(()), || 8)
+    let (saved, changed, intent, _) = server_switch_core(&mgr, BLOCK_SERVER_ID, |_| Ok(()), || 8)
         .expect("smart-mode block selection should be saved");
     assert!(changed);
     assert_eq!(intent, 8);
@@ -558,4 +560,330 @@ fn tailscale_logout_reports_a_leftover_login_core_under_its_own_code() {
         tailscale_logout_error_code(ErrorKind::Other),
         "TAILSCALE_LOGOUT_FAILED"
     );
+}
+
+// ── 自动选择：选择意图的写入规则 ──────────────────────────────────────────────
+//
+// 这里只守落盘的规则与被拒的原因。落点往哪落由裁决决定，相关用例在
+// `runtime/proxy/tests/hot_switch/auto_select.rs`：那里的裁决是真的、账本读数也是真的。
+
+/// 订阅 `sub` 含 `n-b`、`n-c`，`n-a` 是自建节点；当前出口是 `n-a`。
+fn seed_subscription(mgr: &ConfigManager) {
+    seed_switch_nodes(mgr);
+    let mut cfg = mgr.load_full().unwrap();
+    cfg["subscriptions"] = json!([
+        { "id": "sub", "name": "S", "url": "https://a.example/x" },
+        { "id": "empty", "name": "E", "url": "https://b.example/x" },
+    ]);
+    cfg["servers"][1]["subscriptionId"] = json!("sub");
+    cfg["servers"][2]["subscriptionId"] = json!("sub");
+    mgr.save_full(&cfg).unwrap();
+}
+
+fn intent_of(cfg: &Value) -> Option<&str> {
+    polaris_store::selection_intent_subscription(cfg)
+}
+
+/// 裁决没有给出落点（核不在运行时就是这样）。
+fn no_target(_: &Value, _: &str) -> Decision {
+    Decision::NotEvaluated(Gate::CoreNotRunning)
+}
+
+fn enable(mgr: &ConfigManager) {
+    auto_select_enable_core(mgr, "sub", None, no_target, |_| Ok(()), || 1).expect("置为自动");
+}
+
+/// 用户点任一节点、直连或阻断：意图清回手动，实际出口为所选，两者在同一次写里完成。
+/// 盘上留着本版本不认识的意图时同样清掉：用户刚做了一次明确的手动选择。
+#[test]
+fn a_manual_selection_clears_the_auto_intent_in_the_same_write() {
+    for target in ["n-b", "n-a", DIRECT_SERVER_ID, BLOCK_SERVER_ID] {
+        let dir = temp_dir("switch-clears-intent");
+        let mgr = ConfigManager::new(dir.clone());
+        seed_subscription(&mgr);
+        enable(&mgr);
+        assert_eq!(intent_of(&mgr.load_full().unwrap()), Some("sub"));
+        let writes_before = mgr.load_full().unwrap();
+
+        let (saved, _, _, intent_cleared) =
+            server_switch_core(&mgr, target, |_| Ok(()), || 2).expect("手动选择");
+        assert!(intent_cleared, "{target}");
+        assert_eq!(intent_of(&saved), None, "{target}");
+        assert_eq!(saved["selectedServerId"], target);
+        let persisted = mgr.load_full().unwrap();
+        assert_eq!(intent_of(&persisted), None);
+        assert_eq!(persisted["selectedServerId"], target);
+        assert_ne!(persisted, writes_before);
+    }
+    let dir = temp_dir("switch-clears-unrecognized-intent");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+    let mut cfg = mgr.load_full().unwrap();
+    cfg["selectionIntent"] = json!({ "mode": "auto", "scope": "global" });
+    mgr.save_full(&cfg).unwrap();
+    assert!(polaris_store::selection_intent_unrecognized(
+        &mgr.load_full().unwrap()
+    ));
+    let (saved, _, _, intent_cleared) =
+        server_switch_core(&mgr, "n-b", |_| Ok(()), || 2).expect("手动选择");
+    assert!(intent_cleared);
+    assert!(saved.get("selectionIntent").is_none());
+}
+
+/// 被拒的手动选择（节点不存在、网卡不可用）不落盘：意图原样保留。
+#[test]
+fn a_rejected_manual_selection_leaves_the_intent_alone() {
+    let dir = temp_dir("switch-rejected-keeps-intent");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+    enable(&mgr);
+    let before = mgr.load_full().unwrap();
+    assert!(server_switch_core(&mgr, "missing", |_| Ok(()), || 2).is_err());
+    assert!(server_switch_core(&mgr, "n-b", |_| Err("down".into()), || 2).is_err());
+    assert_eq!(mgr.load_full().unwrap(), before);
+    assert_eq!(intent_of(&before), Some("sub"));
+}
+
+fn first_placement(target: &'static str) -> impl FnOnce(&Value, &str) -> Decision {
+    move |_, _| Decision::Switch {
+        target: target.to_string(),
+        latency_ms: 80,
+        cause: Cause::FirstPlacement,
+    }
+}
+
+/// 点「自动选择」的落盘规则：裁决没有落点时只写意图、出口不动，也不做候选校验、不取 selector
+/// 所有权；裁决给出首次落点时在同一次写里换过去。裁决给的是别的换点原因（当前出口已在订阅内
+/// 才会有）时不动出口：点「自动选择」只做首次落点。
+#[test]
+fn enabling_auto_writes_the_intent_and_places_only_a_first_placement() {
+    let dir = temp_dir("auto-enable");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+
+    let (saved, placement) = auto_select_enable_core(
+        &mgr,
+        "sub",
+        None,
+        |_, subscription| {
+            assert_eq!(subscription, "sub");
+            Decision::Hold(Hold::NoCandidates)
+        },
+        |_| panic!("没有落点就没有候选校验"),
+        || panic!("没有落点就不取 selector 所有权"),
+    )
+    .expect("只写意图");
+    assert_eq!(placement, None);
+    assert_eq!(intent_of(&saved), Some("sub"));
+    assert_eq!(saved["selectedServerId"], "n-a", "出口不动");
+
+    for cause in [Cause::Better, Cause::CurrentFailed, Cause::Requested] {
+        let (saved, placement) = auto_select_enable_core(
+            &mgr,
+            "sub",
+            None,
+            |_, _| Decision::Switch {
+                target: "n-c".to_string(),
+                latency_ms: 80,
+                cause,
+            },
+            |_| panic!("不是首次落点就不落点"),
+            || panic!("不是首次落点就不取 selector 所有权"),
+        )
+        .unwrap();
+        assert_eq!(placement, None, "{cause:?}");
+        assert_eq!(saved["selectedServerId"], "n-a", "{cause:?}");
+    }
+
+    let (saved, placement) =
+        auto_select_enable_core(&mgr, "sub", None, first_placement("n-c"), |_| Ok(()), || 9)
+            .expect("写意图并落点");
+    assert_eq!(
+        placement,
+        Some(Placement {
+            from: Some("n-a".to_string()),
+            to: "n-c".to_string(),
+            latency_ms: 80,
+            cause: Cause::FirstPlacement,
+            exit_changed: true,
+            intent_generation: 9,
+        })
+    );
+    assert_eq!(intent_of(&saved), Some("sub"));
+    assert_eq!(saved["selectedServerId"], "n-c");
+    assert!(saved.get("recentServerIds").is_none());
+    assert_eq!(mgr.load_full().unwrap(), saved);
+}
+
+/// 落点过不了选择校验：这次写只带意图，不带改了一半的出口，也不取 selector 所有权。
+#[test]
+fn a_placement_that_fails_validation_still_writes_the_intent_only() {
+    let dir = temp_dir("auto-enable-placement-rejected");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+    let (saved, placement) = auto_select_enable_core(
+        &mgr,
+        "sub",
+        None,
+        first_placement("n-c"),
+        |_| Err("OUTBOUND_INTERFACE_UNAVAILABLE".into()),
+        || panic!("被拒的落点不得取得 selector 所有权"),
+    )
+    .unwrap();
+    assert_eq!(placement, None);
+    assert_eq!(intent_of(&saved), Some("sub"));
+    assert_eq!(saved["selectedServerId"], "n-a");
+}
+
+/// 设置意图被拒的各种原因，各带稳定码；被拒时什么都不写，也不问裁决。本平台未开放（iOS）与
+/// 总开关关闭先于一切。
+#[test]
+fn enabling_auto_is_refused_with_a_stable_code_and_writes_nothing() {
+    let dir = temp_dir("auto-enable-refused");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+    let before = mgr.load_full().unwrap();
+    let refused = |subscription: &str, closed: Option<Gate>| {
+        auto_select_enable_core(
+            &mgr,
+            subscription,
+            closed,
+            |_, _| panic!("被拒时不问裁决"),
+            |_| Ok(()),
+            || 1,
+        )
+        .expect_err("应被拒")
+    };
+    for (error, expected, code) in [
+        (
+            refused("sub", Some(Gate::PlatformNotOpen)),
+            AutoSelectError::PlatformNotOpen,
+            "AUTO_SELECT_PLATFORM_NOT_OPEN",
+        ),
+        (
+            refused("sub", Some(Gate::SwitchedOff)),
+            AutoSelectError::SwitchedOff,
+            "AUTO_SELECT_SWITCHED_OFF",
+        ),
+        (
+            refused("missing", None),
+            AutoSelectError::SubscriptionNotFound,
+            "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND",
+        ),
+        (
+            refused("empty", None),
+            AutoSelectError::SubscriptionEmpty,
+            "AUTO_SELECT_SUBSCRIPTION_EMPTY",
+        ),
+    ] {
+        assert_eq!(error, expected);
+        assert_eq!(error.code(), code);
+        assert_eq!(mgr.load_full().unwrap(), before, "{code}");
+    }
+    // 平台闸取自运行时：iOS 关，其余开。
+    assert_eq!(
+        auto_select::closed(
+            auto_select::Switches::PRODUCTION,
+            polaris_helper_proto::Platform::Ios
+        ),
+        Some(Gate::PlatformNotOpen)
+    );
+}
+
+/// 「立即切换」的落盘规则：裁决给出落点才换，意图保留；裁决没有落点（不换，或没评估）时拒绝
+/// 并带上裁决的原因，不动出口。意图是手动、总开关或平台关着时拒绝且不问裁决。
+#[test]
+fn switch_now_moves_the_exit_only_to_the_decided_target_and_keeps_the_intent() {
+    let dir = temp_dir("auto-switch-now");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_subscription(&mgr);
+    assert_eq!(
+        auto_select_switch_now_core(
+            &mgr,
+            None,
+            |_, _| panic!("手动意图下不问裁决"),
+            |_| Ok(()),
+            || 5
+        )
+        .unwrap_err(),
+        AutoSelectError::NotAuto
+    );
+    enable(&mgr);
+    let before = mgr.load_full().unwrap();
+    assert_eq!(
+        auto_select_switch_now_core(
+            &mgr,
+            Some(Gate::PlatformNotOpen),
+            |_, _| panic!("被拒时不问裁决"),
+            |_| Ok(()),
+            || 5
+        )
+        .unwrap_err(),
+        AutoSelectError::PlatformNotOpen
+    );
+    for (decision, reason) in [
+        (Decision::Hold(Hold::Settled), "settled"),
+        (Decision::Hold(Hold::NoCandidates), "noCandidates"),
+        (
+            Decision::Hold(Hold::Pending(auto_select::Lacking::Streak)),
+            "challengerPending",
+        ),
+        (
+            Decision::NotEvaluated(Gate::CoreNotRunning),
+            "coreNotRunning",
+        ),
+    ] {
+        let error = auto_select_switch_now_core(
+            &mgr,
+            None,
+            |_, subscription| {
+                assert_eq!(subscription, "sub");
+                decision
+            },
+            |_| panic!("没有落点就没有候选校验"),
+            || panic!("没有落点就不取 selector 所有权"),
+        )
+        .unwrap_err();
+        assert_eq!(error, AutoSelectError::NoTarget(reason));
+        assert_eq!(error.code(), "AUTO_SELECT_NO_TARGET");
+        assert_eq!(mgr.load_full().unwrap(), before, "{reason}：不动出口");
+    }
+
+    let (saved, placement) = auto_select_switch_now_core(
+        &mgr,
+        None,
+        |_, _| Decision::Switch {
+            target: "n-b".to_string(),
+            latency_ms: 60,
+            cause: Cause::Better,
+        },
+        |_| Ok(()),
+        || 5,
+    )
+    .expect("立即切换");
+    assert_eq!(
+        (
+            placement.to.as_str(),
+            placement.cause,
+            placement.intent_generation
+        ),
+        ("n-b", Cause::Better, 5)
+    );
+    assert_eq!(saved["selectedServerId"], "n-b");
+    assert_eq!(
+        intent_of(&saved),
+        Some("sub"),
+        "显式的立即切换不是手动选择：意图保留"
+    );
+    // 落点过不了选择校验：拒绝，带对应的码，不动出口。
+    let error = auto_select_switch_now_core(
+        &mgr,
+        None,
+        first_placement("n-c"),
+        |_| Err("down".into()),
+        || panic!("被拒的落点不得取得 selector 所有权"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), code::OUTBOUND_INTERFACE_UNAVAILABLE);
+    assert_eq!(mgr.load_full().unwrap()["selectedServerId"], "n-b");
 }

@@ -178,6 +178,8 @@ fn sanitize_value_in_place(value: &mut Value) {
     // ── 嵌套：逐节点 / 逐订阅 / 逐规则清洗 ─────────────────────────
     sanitize_servers(obj);
     sanitize_subscriptions(obj);
+    // 订阅清洗之后再判：意图指向的订阅必须在清洗后的订阅表里。
+    sanitize_selection_intent(obj);
     sanitize_network_interfaces(obj);
     sanitize_custom_rules(obj);
     sanitize_policy_rules(obj);
@@ -405,6 +407,93 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
         kept.push(server);
     }
     *servers = kept;
+}
+
+/// 选择意图的顶层键。缺席即手动选择；自动选择时存 `{ mode, scope, subscriptionId }`。
+/// `selectedServerId` 始终是实际出口，自动选择下即当前胜出节点。
+pub const SELECTION_INTENT_KEY: &str = "selectionIntent";
+
+/// 自动选择意图指向的订阅 id。键缺席、形状损坏或本版本不认识时为 `None`。
+///
+/// 读取与清洗共用这一套解析。本版本认识的形状只有一种：`mode == "auto"`、
+/// `scope == "subscription"`、`subscriptionId` 为非空字符串。
+#[must_use]
+pub fn selection_intent_subscription(config: &Value) -> Option<&str> {
+    match classify_selection_intent(config.get(SELECTION_INTENT_KEY)?) {
+        IntentShape::Subscription(id) => Some(id),
+        IntentShape::Unrecognized | IntentShape::Broken => None,
+    }
+}
+
+/// 配置里是否存着一个结构完好、但本版本不认识的选择意图（更新的版本写的模式或作用域）。
+/// 它原样留在盘上，本版本不据它做任何事；读状态时如实报出。
+#[must_use]
+pub fn selection_intent_unrecognized(config: &Value) -> bool {
+    config
+        .get(SELECTION_INTENT_KEY)
+        .is_some_and(|intent| classify_selection_intent(intent) == IntentShape::Unrecognized)
+}
+
+/// 意图键的值属于哪一种形状。
+#[derive(Debug, PartialEq, Eq)]
+enum IntentShape<'a> {
+    /// 本版本认识：自动选择，作用域是一个订阅。
+    Subscription(&'a str),
+    /// 结构完好（对象，`mode` 与 `scope` 都是非空字符串），但取值本版本不认识。
+    Unrecognized,
+    /// 损坏：不是对象、缺 `mode` 或 `scope`、类型不对，或认识的形状缺了它必需的字段。
+    Broken,
+}
+
+fn classify_selection_intent(intent: &Value) -> IntentShape<'_> {
+    let field = |name: &str| {
+        intent
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(mode), Some(scope)) = (field("mode"), field("scope")) else {
+        return IntentShape::Broken;
+    };
+    if mode != "auto" || scope != "subscription" {
+        return IntentShape::Unrecognized;
+    }
+    field("subscriptionId").map_or(IntentShape::Broken, IntentShape::Subscription)
+}
+
+/// 自动选择意图的规范形（写入方只经这里造值）。
+#[must_use]
+pub fn selection_intent_auto(subscription_id: &str) -> Value {
+    serde_json::json!({
+        "mode": "auto",
+        "scope": "subscription",
+        "subscriptionId": subscription_id,
+    })
+}
+
+/// 选择意图的清洗：
+/// - 形状损坏 → 移除（回到手动选择）；
+/// - 本版本认识、但指向的订阅不在订阅表里 → 移除；
+/// - 结构完好而取值本版本不认识 → **原样保留**。它多半是更新的版本写的（新的模式或作用域）：
+///   在这里删掉，用户回到新版本时意图就丢了。本版本读取时按不生效处理。
+pub(crate) fn sanitize_selection_intent(obj: &mut Map<String, Value>) {
+    let Some(intent) = obj.get(SELECTION_INTENT_KEY) else {
+        return;
+    };
+    let keep = match classify_selection_intent(intent) {
+        IntentShape::Subscription(id) => obj
+            .get("subscriptions")
+            .and_then(Value::as_array)
+            .is_some_and(|subs| {
+                subs.iter()
+                    .any(|sub| sub.get("id").and_then(Value::as_str) == Some(id))
+            }),
+        IntentShape::Unrecognized => true,
+        IntentShape::Broken => false,
+    };
+    if !keep {
+        obj.remove(SELECTION_INTENT_KEY);
+    }
 }
 
 /// 逐订阅清洗（subscriptions[]）：缺 id/name/url → 剔除。

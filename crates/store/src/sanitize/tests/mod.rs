@@ -358,3 +358,83 @@ fn periodic_speed_test_settings_are_removed_not_clamped_when_invalid() {
     assert_eq!(SPEED_TEST_INTERVAL_MINUTES_DEFAULT, 30);
     assert!(SPEED_TEST_INTERVAL_MINUTES.contains(&SPEED_TEST_INTERVAL_MINUTES_DEFAULT));
 }
+
+/// 选择意图的清洗：形状损坏、或本版本认识但指向的订阅不存在 → 移除；本版本认识且订阅存在 →
+/// 原样保留；结构完好而取值本版本不认识（更新的版本写的模式或作用域）→ 原样保留，读取时不生效。
+/// 订阅本身被清洗掉（缺必填字段）时，指向它的意图一并移除。
+#[test]
+fn the_selection_intent_is_removed_when_broken_or_dangling_and_kept_otherwise() {
+    let cleaned = |intent: Value| {
+        let config = json!({
+            "subscriptions": [
+                { "id": "sub", "name": "n", "url": "https://a.example/x" },
+                { "id": "broken" },
+            ],
+            "selectionIntent": intent,
+        })
+        .to_string();
+        sanitize_config(&config).unwrap()
+    };
+    let valid = crate::selection_intent_auto("sub");
+    assert_eq!(
+        valid,
+        json!({ "mode": "auto", "scope": "subscription", "subscriptionId": "sub" })
+    );
+    let kept = cleaned(valid.clone());
+    assert_eq!(kept["selectionIntent"], valid, "合法时原样保留");
+    assert_eq!(crate::selection_intent_subscription(&kept), Some("sub"));
+    assert!(!crate::selection_intent_unrecognized(&kept));
+
+    // 损坏或悬空：移除。
+    for bad in [
+        crate::selection_intent_auto("missing"),
+        crate::selection_intent_auto("broken"),
+        crate::selection_intent_auto(""),
+        json!({ "mode": "auto", "subscriptionId": "sub" }),
+        json!({ "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "auto", "scope": "subscription", "subscriptionId": 7 }),
+        json!({ "mode": "auto", "scope": "subscription" }),
+        json!({ "mode": 1, "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "auto", "scope": ["subscription"], "subscriptionId": "sub" }),
+        json!({ "mode": "", "scope": "subscription", "subscriptionId": "sub" }),
+        json!({}),
+        json!("sub"),
+        json!(["sub"]),
+        json!(true),
+        Value::Null,
+    ] {
+        let result = cleaned(bad.clone());
+        assert!(result.get("selectionIntent").is_none(), "{bad} 应被移除");
+        assert_eq!(crate::selection_intent_subscription(&result), None);
+        assert!(!crate::selection_intent_unrecognized(&result));
+        assert_eq!(result["subscriptions"][0]["id"], "sub", "只丢意图这一个键");
+    }
+
+    // 结构完好而取值不认识：原样保留（连同本版本不认识的附加字段），读取时不生效。
+    // 此前 `scope: "global"` 在这里被移除；那样的话，用户从加了全局作用域的新版本回到本版本
+    // 再回去，意图就丢了。
+    for unknown in [
+        json!({ "mode": "auto", "scope": "global" }),
+        json!({ "mode": "auto", "scope": "global", "subscriptionId": "missing", "extra": [1] }),
+        json!({ "mode": "pinned", "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "manual", "scope": "subscription", "subscriptionId": "sub" }),
+    ] {
+        let result = cleaned(unknown.clone());
+        assert_eq!(result["selectionIntent"], unknown, "{unknown} 应原样保留");
+        assert_eq!(
+            crate::selection_intent_subscription(&result),
+            None,
+            "不生效"
+        );
+        assert!(crate::selection_intent_unrecognized(&result));
+    }
+
+    // 没有订阅表时本版本认识的意图是悬空的；没有意图键时什么都不做。
+    let no_subscriptions =
+        sanitize_config(&json!({ "selectionIntent": valid }).to_string()).unwrap();
+    assert!(no_subscriptions.get("selectionIntent").is_none());
+    assert!(sanitize_config("{}")
+        .unwrap()
+        .get("selectionIntent")
+        .is_none());
+}

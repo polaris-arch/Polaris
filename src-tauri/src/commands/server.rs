@@ -7,6 +7,8 @@
 //! - `server:delete` → [`server_delete`]
 //! - `server:deleteBatch` → [`server_delete_batch`]
 //! - `server:switch` → [`server_switch`]
+//! - `auto_select_enable` / `auto_select_switch_now` / `auto_select_status` → 自动选择的意图、
+//!   立即切换与状态
 //! - `server:generateUrl` → [`server_generate_url`]（config-engine ProtocolParser 等价）
 //! - `tailcat_keypair` → [`tailcat_keypair`]（Tailcat 客户端密钥对：生成 / 由私钥推导公钥）
 //! - `warp:register` / `warp:applyLicense` → [`warp_register`] / [`warp_apply_license`]（mesh crate）
@@ -14,6 +16,8 @@
 //!
 //! 节点 CRUD 经 config 的 load/save（servers 数组原地改 + 原子写）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
+
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -27,8 +31,10 @@ use polaris_mesh::warp_http::RegisterOptions;
 
 use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::response::{ok_void, ApiResponse};
-use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::{code, SwitchOutcome};
+use crate::runtime::auto_select::{self, Cause, Decision, Gate, Leg, SwitchRecord};
+use crate::runtime::config::{ConfigManager, Decision as ConfigDecision};
+use crate::runtime::proxy::{code, ProxyRuntime, SwitchOutcome};
+use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::tailscale_login_core::StartLoginOutcome;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
@@ -76,13 +82,13 @@ fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, Strin
     let (result, saved) = config
         .update(|cfg| {
             let Some(servers) = cfg.get("servers").and_then(Value::as_array) else {
-                return Decision::Skip(Err("节点列表不可用".to_string()));
+                return ConfigDecision::Skip(Err("节点列表不可用".to_string()));
             };
             if let Some(existing) = servers.iter().find(|node| node["id"].as_str() == Some(id)) {
                 return if normalized_add_server(existing.clone()).as_ref() == Ok(&server) {
-                    Decision::Skip(Ok(cfg.clone()))
+                    ConfigDecision::Skip(Ok(cfg.clone()))
                 } else {
-                    Decision::Skip(Err("节点标识已存在且内容不同".to_string()))
+                    ConfigDecision::Skip(Err("节点标识已存在且内容不同".to_string()))
                 };
             }
             // 检查集合级清洗约束；仅在副本上验证，不把清洗后的集合写回旧节点。
@@ -91,16 +97,16 @@ fn server_add_core(config: &ConfigManager, server: Value) -> Result<Value, Strin
             let cleaned =
                 match polaris_store::sanitize_config(&json!({"servers": proposed}).to_string()) {
                     Ok(cleaned) => cleaned,
-                    Err(_) => return Decision::Skip(Err("新增节点校验失败".to_string())),
+                    Err(_) => return ConfigDecision::Skip(Err("新增节点校验失败".to_string())),
                 };
             if !cleaned["servers"]
                 .as_array()
                 .is_some_and(|nodes| nodes.iter().any(|node| node["id"].as_str() == Some(id)))
             {
-                return Decision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
+                return ConfigDecision::Skip(Err("新增节点与现有节点配置冲突".to_string()));
             }
             cfg["servers"].as_array_mut().unwrap().push(server.clone());
-            Decision::Write(Ok(Value::Null))
+            ConfigDecision::Write(Ok(Value::Null))
         })
         .map_err(|e| format!("{e}"))?;
     result.map(|unchanged| saved.unwrap_or(unchanged))
@@ -173,7 +179,7 @@ fn server_add_bulk_core(
                     obj.insert("servers".to_string(), Value::Array(init));
                 }
             }
-            Decision::Write(())
+            ConfigDecision::Write(())
         })
         .map_err(|e| format!("{e}"))?;
     Ok((
@@ -234,9 +240,9 @@ pub fn server_update(
             })
             .is_some();
         if found {
-            Decision::Write(Ok(()))
+            ConfigDecision::Write(Ok(()))
         } else {
-            Decision::Skip(Err(format!("服务器不存在: {id}")))
+            ConfigDecision::Skip(Err(format!("服务器不存在: {id}")))
         }
     }) {
         Ok((Ok(()), Some(cfg))) => {
@@ -312,12 +318,12 @@ pub fn server_delete(
                     .map(|idx| arr.remove(idx))
             });
         let Some(_removed) = removed else {
-            return Decision::Skip(Err(format!("服务器不存在: {server_id}")));
+            return ConfigDecision::Skip(Err(format!("服务器不存在: {server_id}")));
         };
         let was_selected = old_selected.as_deref() == Some(&server_id);
         apply_selection_fallback(cfg, was_selected, fallback_selected_id.as_deref());
         prune_recent_server_ids_to_existing(cfg);
-        Decision::Write(Ok(old_selected))
+        ConfigDecision::Write(Ok(old_selected))
     });
     match result {
         Ok((Ok(old_selected), Some(cfg))) => {
@@ -372,14 +378,14 @@ pub fn server_delete_batch(
             None => Vec::new(),
         };
         if removed.is_empty() {
-            return Decision::Skip((old_selected, 0u32));
+            return ConfigDecision::Skip((old_selected, 0u32));
         }
         let selected_in_set = old_selected
             .as_deref()
             .is_some_and(|sid| id_set.contains(sid));
         apply_selection_fallback(cfg, selected_in_set, fallback_selected_id.as_deref());
         prune_recent_server_ids_to_existing(cfg);
-        Decision::Write((old_selected, u32::try_from(removed.len()).unwrap_or(0)))
+        ConfigDecision::Write((old_selected, u32::try_from(removed.len()).unwrap_or(0)))
     });
     match result {
         Ok(((_old_selected, 0), None)) => ApiResponse::ok(0u32),
@@ -406,8 +412,9 @@ pub fn server_delete_batch(
 /// `st.mru = [name, ...st.mru.filter(x=>x!==name)].slice(0,3)` 同款语义）：去重后插入队首，上限 3
 /// （与原型的 `.slice(0,3)` 对齐，前端再叠加「当前节点置顶」渲染，见 TrayMenu.tsx recentItems）。
 ///
-/// 只在真实节点切换（[`server_switch`]）时调用；直连哨兵切换走 `config_save` 全量保存，不经此路径 ——
-/// 与原型 `pickDirectExit` 不碰 `st.mru` 对齐。存量配置无 `recentServerIds` 字段 → 视作空历史，非结构错误。
+/// 只在用户选真实节点时调用。选直连、阻断同样经 [`server_switch`]（界面与托盘选任何出口都只走
+/// 这一条命令），只是哨兵不进这份历史 —— 与原型 `pickDirectExit` 不碰 `st.mru` 对齐。自动选择的
+/// 落点是系统代选，也不进。存量配置无 `recentServerIds` 字段 → 视作空历史，非结构错误。
 fn push_recent_server_id(obj: &mut Map<String, Value>, server_id: &str) {
     let mut recent: Vec<String> = obj
         .get("recentServerIds")
@@ -464,7 +471,7 @@ pub(crate) fn prune_recent_server_ids_to_existing(cfg: &mut Value) {
 /// [`ConfigManager::update`] 把「验证节点 → 取旧出口 → 改选中/MRU → 落盘」圈成一个动作，
 /// 否则两个请求都基于同一份旧配置写回，较慢者会覆盖较新的选择与 MRU。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ServerSwitchError {
+pub(crate) enum ServerSwitchError {
     InterfaceUnavailable(String),
     Other(String),
 }
@@ -477,78 +484,87 @@ impl std::fmt::Display for ServerSwitchError {
     }
 }
 
-fn server_switch_core<F>(
+/// 把出口选到 `server_id`：校验目标 → 改 `selectedServerId` → 取得 selector 所有权。在调用方的
+/// 配置写事务里对 `cfg` 就地操作；返回 `Err` 时调用方须放弃这次写（`cfg` 可能已被改了一半）。
+///
+/// 显式选择的三个入口共用它：用户点节点（[`server_switch_core`]，随后清选择意图）、用户点某订阅
+/// 的「自动选择」时的首次落点、「立即切换」（后两个保留自动意图，见 [`auto_select_enable_core`] /
+/// [`auto_select_switch_now_core`]）。返回（出口是否真变, selector 意图代次）。
+fn select_in_place(
+    cfg: &mut Value,
+    server_id: &str,
+    validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
+    register_intent: impl FnOnce() -> u64,
+) -> Result<(bool, u64), ServerSwitchError> {
+    let exists = cfg
+        .get("servers")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|s| s.get("id").and_then(Value::as_str) == Some(server_id))
+        });
+    if !exists && server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
+        return Err(ServerSwitchError::Other(format!(
+            "服务器不存在: {server_id}"
+        )));
+    }
+    // A7：出口节点 identity 是否真变（用于切换后作废旧出口的解锁缓存）。取覆盖前的旧值比对。
+    let exit_changed = selected_exit_changed(
+        cfg.get("selectedServerId").and_then(Value::as_str),
+        Some(server_id),
+    );
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert("selectedServerId".to_string(), json!(server_id));
+    }
+    let candidate = serde_json::from_value::<UserConfig>(cfg.clone()).map_err(|error| {
+        ServerSwitchError::Other(format!("配置解析失败（UserConfig）: {error}"))
+    })?;
+    // Block is emitted as reject routes, not as a selector member. A running
+    // direct-mode core cannot honor a saved block selection.
+    if server_id == BLOCK_SERVER_ID && candidate.proxy_mode == ProxyMode::Direct {
+        return Err(ServerSwitchError::Other(
+            "直连模式下不能选择阻断".to_string(),
+        ));
+    }
+    validate_candidate(&candidate).map_err(ServerSwitchError::InterfaceUnavailable)?;
+    // 必须在 ConfigManager 的写事务内取得 selector 所有权：若先写 D、解锁后才 bump，auto
+    // rollback 可在间隙内看到“D 仍等于候选”并覆盖一次同目标的用户新意图。
+    Ok((exit_changed, register_intent()))
+}
+
+/// `server:switch` 的落盘：出口选到 `server_id`，并把选择意图清回手动（用户点了节点、直连或阻断，
+/// 即退出自动选择；再次点某订阅的「自动选择」才恢复）。两件事在同一次写里完成。
+///
+/// 返回（已落盘配置, 出口是否真变, selector 意图代次, 是否清掉了一个自动意图）。
+pub(crate) fn server_switch_core<F>(
     config: &ConfigManager,
     server_id: &str,
     validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
     register_intent: F,
-) -> Result<(Value, bool, u64), ServerSwitchError>
+) -> Result<(Value, bool, u64, bool), ServerSwitchError>
 where
     F: FnOnce() -> u64,
 {
-    let mut validate_candidate = Some(validate_candidate);
-    let mut register_intent = Some(register_intent);
-    let (exit_changed, saved) = config
+    let (outcome, saved) = config
         .update(|cfg| {
-            let exists = cfg
-                .get("servers")
-                .and_then(Value::as_array)
-                .is_some_and(|arr| {
-                    arr.iter()
-                        .any(|s| s.get("id").and_then(Value::as_str) == Some(server_id))
-                });
-            if !exists && server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
-                return Decision::Skip(Err(ServerSwitchError::Other(format!(
-                    "服务器不存在: {server_id}"
-                ))));
-            }
-            // A7：出口节点 identity 是否真变（用于切换后作废旧出口的解锁缓存）。取覆盖前的旧值比对。
-            let exit_changed = selected_exit_changed(
-                cfg.get("selectedServerId").and_then(Value::as_str),
-                Some(server_id),
-            );
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.insert("selectedServerId".to_string(), json!(server_id));
-            }
-            let candidate = match serde_json::from_value::<UserConfig>(cfg.clone()) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    return Decision::Skip(Err(ServerSwitchError::Other(format!(
-                        "配置解析失败（UserConfig）: {error}"
-                    ))));
-                }
-            };
-            // Block is emitted as reject routes, not as a selector member. A running
-            // direct-mode core cannot honor a saved block selection.
-            if server_id == BLOCK_SERVER_ID && candidate.proxy_mode == ProxyMode::Direct {
-                return Decision::Skip(Err(ServerSwitchError::Other(
-                    "直连模式下不能选择阻断".to_string(),
-                )));
-            }
-            if let Err(message) =
-                validate_candidate
-                    .take()
-                    .expect("server_switch 的候选校验只能执行一次")(&candidate)
-            {
-                return Decision::Skip(Err(ServerSwitchError::InterfaceUnavailable(message)));
-            }
-            // 必须在 ConfigManager 的写事务内取得 selector 所有权：若先写 D、解锁后才 bump，auto
-            // rollback 可在间隙内看到“D 仍等于候选”并覆盖一次同目标的用户新意图。
-            let intent_generation = register_intent
-                .take()
-                .expect("server_switch 的 Write 腿只能执行一次")(
-            );
+            let (exit_changed, intent_generation) =
+                match select_in_place(cfg, server_id, validate_candidate, register_intent) {
+                    Ok(selected) => selected,
+                    Err(error) => return ConfigDecision::Skip(Err(error)),
+                };
+            let mut intent_cleared = false;
             if let Some(obj) = cfg.as_object_mut() {
                 if server_id != DIRECT_SERVER_ID && server_id != BLOCK_SERVER_ID {
                     push_recent_server_id(obj, server_id);
                 }
+                intent_cleared = obj.remove(polaris_store::SELECTION_INTENT_KEY).is_some();
             }
-            Decision::Write(Ok((exit_changed, intent_generation)))
+            ConfigDecision::Write(Ok((exit_changed, intent_generation, intent_cleared)))
         })
         .map_err(|e| ServerSwitchError::Other(format!("{e}")))?;
-    let (exit_changed, intent_generation) = exit_changed?;
+    let (exit_changed, intent_generation, intent_cleared) = outcome?;
     let cfg = saved.expect("server_switch 的 Write 腿必须返回已落盘配置");
-    Ok((cfg, exit_changed, intent_generation))
+    Ok((cfg, exit_changed, intent_generation, intent_cleared))
 }
 
 /// 保存选择与实际运行态分开回执；只有严格读回才报告 applied。
@@ -603,7 +619,11 @@ pub async fn server_switch(
         },
         || state.proxy().register_selector_intent(),
     ) {
-        Ok((_cfg, _exit_changed, intent_generation)) => {
+        Ok((_cfg, _exit_changed, intent_generation, intent_cleared)) => {
+            if intent_cleared {
+                log::info!("自动选择：用户手动选了出口，意图回到手动");
+                state.proxy().auto_select_disarmed();
+            }
             // 只发磁盘变更信号：显式选择在下方等待受限 R 投影的结果，不能再让普通广播
             // 后台把完整 D（含此前保存未 Apply 的 DNS/规则）送入运行核。
             emit_config_changed_signal(&app);
@@ -632,6 +652,408 @@ pub async fn server_switch(
         )),
         Err(ServerSwitchError::Other(message)) => Ok(ApiResponse::err(message)),
     }
+}
+
+// ════════════════ 自动选择：设置意图、立即切换、读状态 ════════════════
+
+/// 设置意图与立即切换被拒的原因。`code` 是给界面判别的稳定码，文案由界面按码给。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutoSelectError {
+    /// 源码里的总开关关着。
+    SwitchedOff,
+    /// 本平台暂未开放。
+    PlatformNotOpen,
+    SubscriptionNotFound,
+    /// 订阅里没有节点。
+    SubscriptionEmpty,
+    /// 意图不是自动选择（「立即切换」只在自动意图下有意义）。
+    NotAuto,
+    /// 裁决此刻没有给出落点：出口已是该订阅里该在的那一个，或订阅里没有可换的候选。
+    /// 附裁决给的原因（与状态里的原因同一套取值）。
+    NoTarget(&'static str),
+    Switch(ServerSwitchError),
+}
+
+impl AutoSelectError {
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::SwitchedOff => "AUTO_SELECT_SWITCHED_OFF",
+            Self::PlatformNotOpen => "AUTO_SELECT_PLATFORM_NOT_OPEN",
+            Self::SubscriptionNotFound => "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND",
+            Self::SubscriptionEmpty => "AUTO_SELECT_SUBSCRIPTION_EMPTY",
+            Self::NotAuto => "AUTO_SELECT_NOT_AUTO",
+            Self::NoTarget(_) => "AUTO_SELECT_NO_TARGET",
+            Self::Switch(ServerSwitchError::InterfaceUnavailable(_)) => {
+                code::OUTBOUND_INTERFACE_UNAVAILABLE
+            }
+            Self::Switch(ServerSwitchError::Other(_)) => CODE_AUTO_SELECT_SWITCH_FAILED,
+        }
+    }
+}
+
+/// 落点已落盘、而运行侧没有换成时的稳定码。
+const CODE_AUTO_SELECT_SWITCH_FAILED: &str = "AUTO_SELECT_SWITCH_FAILED";
+
+impl std::fmt::Display for AutoSelectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SwitchedOff => f.write_str("自动选择已停用"),
+            Self::PlatformNotOpen => f.write_str("本平台暂未开放自动选择"),
+            Self::SubscriptionNotFound => f.write_str("订阅不存在"),
+            Self::SubscriptionEmpty => f.write_str("订阅里没有节点"),
+            Self::NotAuto => f.write_str("当前不是自动选择"),
+            Self::NoTarget(reason) => write!(f, "此刻没有需要切换到的节点（{reason}）"),
+            Self::Switch(error) => error.fmt(f),
+        }
+    }
+}
+
+/// 自动选择的显式路径在写事务里落下的一次出口变更。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub(crate) from: Option<String>,
+    pub(crate) to: String,
+    pub(crate) latency_ms: u32,
+    pub(crate) cause: Cause,
+    pub(crate) exit_changed: bool,
+    pub(crate) intent_generation: u64,
+}
+
+fn closed_error(closed: Option<Gate>) -> Result<(), AutoSelectError> {
+    match closed {
+        Some(Gate::PlatformNotOpen) => Err(AutoSelectError::PlatformNotOpen),
+        Some(_) => Err(AutoSelectError::SwitchedOff),
+        None => Ok(()),
+    }
+}
+
+fn selected_of(cfg: &Value) -> Option<String> {
+    cfg.get("selectedServerId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// 用户点某订阅的「自动选择」：把意图置为自动（该订阅）。
+///
+/// 出口只在一种情形下随之变动：**当前出口不属于该订阅**，且裁决给出了首次落点 —— 那时在同一次
+/// 写里把出口换过去（显式操作，与手动点节点同级：允许整核重启）。当前出口已是该订阅的成员时
+/// 只写意图、不动出口：它是不是该换，由后台按连胜、驻留那一套去判，不在用户点一下的时候凭
+/// 一次读数把出口换掉；反复点也不会让出口动。
+///
+/// `closed`：自动选择在这里不可用的原因。`decide(cfg, 订阅)`：显式路径的裁决，与后台择优是
+/// 同一个函数。落点过不了选择校验（如绑定的网卡不可用）时不落点、只写意图。
+pub(crate) fn auto_select_enable_core(
+    config: &ConfigManager,
+    subscription_id: &str,
+    closed: Option<Gate>,
+    decide: impl FnOnce(&Value, &str) -> Decision,
+    validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
+    register_intent: impl FnOnce() -> u64,
+) -> Result<(Value, Option<Placement>), AutoSelectError> {
+    closed_error(closed)?;
+    let (outcome, saved) = config
+        .update(|cfg| {
+            let exists = cfg
+                .get("subscriptions")
+                .and_then(Value::as_array)
+                .is_some_and(|subs| {
+                    subs.iter()
+                        .any(|sub| sub.get("id").and_then(Value::as_str) == Some(subscription_id))
+                });
+            if !exists {
+                return ConfigDecision::Skip(Err(AutoSelectError::SubscriptionNotFound));
+            }
+            if auto_select::subscription_members(cfg, subscription_id).is_empty() {
+                return ConfigDecision::Skip(Err(AutoSelectError::SubscriptionEmpty));
+            }
+            let from = selected_of(cfg);
+            let mut placement = None;
+            // 只认首次落点：别的换点原因都意味着当前出口已在订阅内，这里不动它。
+            if let Decision::Switch {
+                target,
+                latency_ms,
+                cause: cause @ Cause::FirstPlacement,
+            } = decide(cfg, subscription_id)
+            {
+                // 在副本上落点：过不了校验时这次写只带意图，不带改了一半的出口。
+                let mut placed = cfg.clone();
+                match select_in_place(&mut placed, &target, validate_candidate, register_intent) {
+                    Ok((exit_changed, intent_generation)) => {
+                        *cfg = placed;
+                        placement = Some(Placement {
+                            from,
+                            to: target,
+                            latency_ms,
+                            cause,
+                            exit_changed,
+                            intent_generation,
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!("自动选择：首次落点未通过选择校验（{error}），只写入意图");
+                    }
+                }
+            }
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.insert(
+                    polaris_store::SELECTION_INTENT_KEY.to_string(),
+                    polaris_store::selection_intent_auto(subscription_id),
+                );
+            }
+            ConfigDecision::Write(Ok(placement))
+        })
+        .map_err(|e| AutoSelectError::Switch(ServerSwitchError::Other(format!("{e}"))))?;
+    let placement = outcome?;
+    Ok((
+        saved.expect("auto_select_enable 的 Write 腿必须返回已落盘配置"),
+        placement,
+    ))
+}
+
+/// 「立即切换」：自动意图下，把出口换到裁决此刻认定的落点，意图保留。
+///
+/// 它是给「后台换不了、要用户确认才能换」的情形用的（典型的是候选切过去须整核重启，后台不
+/// 重启）：由用户显式发起，走与手动点节点同级的路径。目标是裁决给的 —— 当前出口不在订阅内、
+/// 当前出口测速失败或没有新鲜结果，或当前出口已连续几轮被明显胜过。裁决没有给出落点时拒绝且
+/// 不动出口：它从不把出口换到一个并不更好的节点上。
+pub(crate) fn auto_select_switch_now_core(
+    config: &ConfigManager,
+    closed: Option<Gate>,
+    decide: impl FnOnce(&Value, &str) -> Decision,
+    validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
+    register_intent: impl FnOnce() -> u64,
+) -> Result<(Value, Placement), AutoSelectError> {
+    closed_error(closed)?;
+    let (outcome, saved) = config
+        .update(|cfg| {
+            let Some(subscription) =
+                polaris_store::selection_intent_subscription(cfg).map(str::to_string)
+            else {
+                return ConfigDecision::Skip(Err(AutoSelectError::NotAuto));
+            };
+            let from = selected_of(cfg);
+            let (target, latency_ms, cause) = match decide(cfg, &subscription) {
+                Decision::Switch {
+                    target,
+                    latency_ms,
+                    cause,
+                } => (target, latency_ms, cause),
+                Decision::Hold(hold) => {
+                    return ConfigDecision::Skip(Err(AutoSelectError::NoTarget(hold.as_str())));
+                }
+                Decision::NotEvaluated(gate) => {
+                    return ConfigDecision::Skip(Err(AutoSelectError::NoTarget(gate.as_str())));
+                }
+            };
+            match select_in_place(cfg, &target, validate_candidate, register_intent) {
+                Ok((exit_changed, intent_generation)) => ConfigDecision::Write(Ok(Placement {
+                    from,
+                    to: target,
+                    latency_ms,
+                    cause,
+                    exit_changed,
+                    intent_generation,
+                })),
+                Err(error) => ConfigDecision::Skip(Err(AutoSelectError::Switch(error))),
+            }
+        })
+        .map_err(|e| AutoSelectError::Switch(ServerSwitchError::Other(format!("{e}"))))?;
+    let placement = outcome?;
+    Ok((
+        saved.expect("auto_select_switch_now 的 Write 腿必须返回已落盘配置"),
+        placement,
+    ))
+}
+
+/// 设置意图与立即切换的回执。命令返回成功即表示写入已落盘：`intent_applied` 为真时意图此刻是
+/// 自动选择。落点另列：它的运行侧可能没换成（`placement.status` 为 `failed`，带稳定码），那时
+/// 意图仍然已生效，出口留给后台或下一次显式操作。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSelectReceipt {
+    intent_applied: bool,
+    placement: Option<AutoSelectPlacement>,
+    status: auto_select::Status,
+}
+
+/// 一次落点的结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AutoSelectPlacement {
+    server_id: String,
+    /// 与手动选节点的回执同一套取值（`applied` / `pending` / `restarting` / `notRunning` /
+    /// `deferred` / `superseded`），另加 `failed`：出口已落盘，运行侧没有换成。
+    status: &'static str,
+    /// `deferred` 时的原因；`failed` 时是稳定码 `AUTO_SELECT_SWITCH_FAILED`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// `failed` 时的诊断信息。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn node_name(cfg: &Value, id: &str) -> Option<String> {
+    cfg.get("servers")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|server| server.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|server| server.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// 显式路径落点之后的运行侧一半：等受限的运行态投影（可能重启），并把这次换点记进选择状态。
+/// 运行侧没换成时不报错返回：出口与意图都已落盘，结果如实写在落点里。
+async fn finish_placement(
+    app: &AppHandle,
+    state: &State<'_, AppRuntime>,
+    saved: &Value,
+    placement: Placement,
+) -> AutoSelectPlacement {
+    emit_config_changed_signal(app);
+    finish_placement_core(&state.proxy, saved, placement).await
+}
+
+/// Keep the runtime receipt and bookkeeping together, independently of the IPC shell.
+/// Saving a selection alone must not consume dwell or better-switch rate limits.
+pub(crate) async fn finish_placement_core(
+    proxy: &Arc<ProxyRuntime>,
+    saved: &Value,
+    placement: Placement,
+) -> AutoSelectPlacement {
+    let starting_generation = proxy.core_generation();
+    let server_id = placement.to.clone();
+    let outcome = proxy
+        .switch_selected_server_if_current(&server_id, placement.intent_generation)
+        .await;
+    match outcome {
+        Ok(outcome) => {
+            let receipt = ServerSwitchReceipt::from_outcome(proxy.settle_selected_switch_receipt(
+                outcome,
+                starting_generation,
+                placement.intent_generation,
+            ));
+            if placement.exit_changed && matches!(receipt.status, "applied" | "restarting") {
+                proxy.auto_select_record(SwitchRecord {
+                    at: now_ms(),
+                    leg: Leg::Select,
+                    cause: placement.cause,
+                    from_name: placement
+                        .from
+                        .as_deref()
+                        .and_then(|id| node_name(saved, id)),
+                    from_id: placement.from,
+                    to_name: node_name(saved, &server_id).unwrap_or_else(|| server_id.clone()),
+                    to_id: server_id.clone(),
+                    from_latency_ms: None,
+                    to_latency_ms: Some(placement.latency_ms),
+                    unverified: None,
+                });
+            }
+            AutoSelectPlacement {
+                server_id,
+                status: receipt.status,
+                reason: receipt.reason,
+                error: None,
+            }
+        }
+        Err(error) => {
+            log::warn!("自动选择：落点 {server_id} 已落盘，运行侧没有换成：{error}");
+            AutoSelectPlacement {
+                server_id,
+                status: "failed",
+                reason: Some(CODE_AUTO_SELECT_SWITCH_FAILED),
+                error: Some(error),
+            }
+        }
+    }
+}
+
+/// 设置选择意图为「自动选择（该订阅）」。清除意图不需要命令：点任一节点即回到手动。
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri IPC command owns its deserialized payload across the call"
+)]
+#[tauri::command]
+pub async fn auto_select_enable(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    subscription_id: String,
+) -> Result<ApiResponse<AutoSelectReceipt>, ()> {
+    let written = auto_select_enable_core(
+        state.config(),
+        &subscription_id,
+        state.proxy().auto_select_closed(),
+        |cfg, subscription| state.proxy().auto_select_explicit(cfg, subscription),
+        |candidate| {
+            state
+                .proxy()
+                .validate_selected_server_candidate_blocking(candidate)
+        },
+        || state.proxy().register_selector_intent(),
+    );
+    let (saved, placement) = match written {
+        Ok(written) => written,
+        Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
+    };
+    log::info!(
+        "自动选择：意图置为自动（订阅 {subscription_id}），{}",
+        if placement.is_some() {
+            "当前出口不在该订阅内，立即落点"
+        } else {
+            "出口不动"
+        }
+    );
+    // 先重置选择状态并唤醒评估，再等落点的运行侧结果：落点可能要等一次整核重启。
+    state.proxy().auto_select_armed();
+    let placement = match placement {
+        Some(placement) => Some(finish_placement(&app, &state, &saved, placement).await),
+        None => {
+            emit_config_changed_signal(&app);
+            None
+        }
+    };
+    Ok(ApiResponse::ok(AutoSelectReceipt {
+        intent_applied: true,
+        placement,
+        status: state.proxy().auto_select_status(),
+    }))
+}
+
+/// 自动意图下立即把出口换到裁决此刻认定的落点（允许整核重启），意图保留。没有落点时拒绝。
+#[tauri::command]
+pub async fn auto_select_switch_now(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+) -> Result<ApiResponse<AutoSelectReceipt>, ()> {
+    let written = auto_select_switch_now_core(
+        state.config(),
+        state.proxy().auto_select_closed(),
+        |cfg, subscription| state.proxy().auto_select_explicit(cfg, subscription),
+        |candidate| {
+            state
+                .proxy()
+                .validate_selected_server_candidate_blocking(candidate)
+        },
+        || state.proxy().register_selector_intent(),
+    );
+    let (saved, placement) = match written {
+        Ok(written) => written,
+        Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
+    };
+    let placement = finish_placement(&app, &state, &saved, placement).await;
+    Ok(ApiResponse::ok(AutoSelectReceipt {
+        intent_applied: true,
+        placement: Some(placement),
+        status: state.proxy().auto_select_status(),
+    }))
+}
+
+/// 选择状态（只读）：意图、实际出口、模式与原因、上次换点、最近一次评估、自曝标记。
+/// 状态变化时同形的载荷经 `event:autoSelectStatus` 推送。
+#[tauri::command]
+pub fn auto_select_status(state: State<'_, AppRuntime>) -> ApiResponse<auto_select::Status> {
+    ApiResponse::ok(state.proxy().auto_select_status())
 }
 
 /// 上游 `SERVER_GENERATE_URL`：节点 → 真实 share URL（`ProtocolParser.generateUrl` 等价）。

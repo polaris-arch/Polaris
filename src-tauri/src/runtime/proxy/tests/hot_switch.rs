@@ -2,6 +2,8 @@ use super::*;
 use polaris_config_engine::builder::mesh_mode::DASHBOARD_SELECTOR;
 use polaris_config_engine::user_config::dns_constants::BLOCK_SERVER_ID;
 
+mod auto_select;
+
 fn explicit_selection_fixture() -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
     let (rt, dir) = test_runtime();
     let running = two_node_config(7891, "node-a");
@@ -2273,6 +2275,7 @@ async fn auto_failover_hot_switch_preserves_saved_but_unapplied_config() {
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -2350,6 +2353,7 @@ async fn auto_failover_cannot_commit_a_split_ts_to_ordinary_selector_only() {
             "ts-mesh",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -2386,6 +2390,7 @@ async fn auto_failover_selector_failure_rolls_back_without_restart() {
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -2449,6 +2454,7 @@ async fn auto_failover_does_not_rollback_new_same_target_user_intent() {
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -2497,6 +2503,7 @@ async fn superseded_auto_put_forces_reassert_even_when_new_config_equals_old_run
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await,
@@ -2557,6 +2564,7 @@ async fn auto_failover_double_failure_enters_recoverable_selector_reconciliation
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &failed_api,
         )
         .await;
@@ -2634,6 +2642,7 @@ async fn auto_failover_rolls_back_when_candidate_changes_during_selector_put() {
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -3066,6 +3075,7 @@ async fn dropped_candidate_is_exactly_what_the_commit_transaction_refuses() {
             "node-a",
             &candidate,
             &fingerprint,
+            None,
             &api,
         )
         .await;
@@ -4210,7 +4220,13 @@ async fn real_core_auto_failover_attests_without_applying_saved_debt() {
         .expect("candidate fingerprint");
 
     let outcome = rt
-        .auto_hot_switch_transaction(rt.core_generation(), "node-a", &candidate, &fingerprint)
+        .auto_hot_switch_transaction(
+            rt.core_generation(),
+            "node-a",
+            &candidate,
+            &fingerprint,
+            None,
+        )
         .await;
     assert_eq!(outcome, AutoHotSwitchOutcome::Applied);
     assert_eq!(rt.status().pid, pid, "自动 failover 必须保持真实核 PID");

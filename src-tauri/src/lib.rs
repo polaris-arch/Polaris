@@ -1277,6 +1277,10 @@ pub fn run() {
             // ── 测速（server:speedTest）──
             server_speed_test,
             speed_test_schedule_status,
+            // ── 自动选择（意图 / 立即切换 / 状态）──
+            auto_select_enable,
+            auto_select_switch_now,
+            auto_select_status,
             // ── 更新（version + app update + core update）──
             version_get_info,
             update_check,

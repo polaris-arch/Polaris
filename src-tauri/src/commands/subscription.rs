@@ -30,15 +30,17 @@ use polaris_net_stack::subscription::default_subscription_user_agent;
 use polaris_net_stack::subscription::{Conditional, ProviderFetchError, SubscriptionParseLimits};
 use polaris_net_stack::subscription_error::SubscriptionErrorKind;
 
-use crate::commands::config::broadcast_config_changed;
+use crate::commands::config::{broadcast_config_changed, broadcast_config_changed_with_completion};
 use crate::commands::picked_file::{
     classify, file_name_of, open_picked_for_read, PickedTarget, PluginFiles,
 };
 use crate::events::{broadcast, channel::EVENT_SUBSCRIPTION_UPDATE_PROGRESS};
 use crate::i18n::{key, t};
 use crate::response::{ok_void, ApiResponse};
+use crate::runtime::auto_select::{Cause, Leg, SwitchRecord};
 use crate::runtime::config::Decision;
 use crate::runtime::http::{HttpRuntime, SystemDnsLookup};
+use crate::runtime::proxy::{ProxyRuntime, SwitchOutcome};
 use crate::runtime::subscription_parse::SubscriptionParseExecutor;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
@@ -240,6 +242,12 @@ fn apply_subscription_delete(cfg: &mut Value, subscription_id: &str) -> Result<(
     if let Some(arr) = cfg.get_mut("servers").and_then(Value::as_array_mut) {
         arr.retain(|s| s.get("subscriptionId").and_then(Value::as_str) != Some(subscription_id));
     }
+    // 自动选择意图指向被删的订阅 → 清回手动，不留悬空意图。
+    if polaris_store::selection_intent_subscription(cfg) == Some(subscription_id) {
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.remove(polaris_store::SELECTION_INTENT_KEY);
+        }
+    }
     // 选中被删 → 置 direct 哨兵（订阅删除路径：直连终态，对齐 上游 删订阅 null→direct 语义，
     // 但用哨兵避开 generate 对裸 null 的 `Selected server not found` 回归）。
     let selected_gone = cfg
@@ -280,12 +288,18 @@ pub fn subscription_delete(
             .get("selectedServerId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let intent_pointed_here =
+            polaris_store::selection_intent_subscription(cfg) == Some(subscription_id.as_str());
         if apply_subscription_delete(cfg, &subscription_id).is_err() {
             return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
         }
-        Decision::Write(Ok(old_selected))
+        Decision::Write(Ok((old_selected, intent_pointed_here)))
     }) {
-        Ok((Ok(old_selected), Some(cfg))) => {
+        Ok((Ok((old_selected, intent_cleared)), Some(cfg))) => {
+            if intent_cleared {
+                log::info!("自动选择：意图指向的订阅 {subscription_id} 已删除，意图回到手动");
+                state.proxy().auto_select_disarmed();
+            }
             broadcast_config_changed(&app, &cfg);
             // A7：删订阅令选中节点从列表消失 → selectedServerId 变 null = 出口变 → 作废旧出口解锁探测缓存
             // （否则解锁角标最长陈旧 30min）。选中不属该订阅（仍存活）→ 出口不动、不失效。
@@ -797,6 +811,14 @@ async fn perform_subscription_update_inner(
             &outcome.failed_providers,
         );
         let content_changed = recon.added > 0 || recon.updated > 0 || recon.deleted > 0;
+        // 自动选择意图下，这次刷新删掉了当前胜出节点：对账给出的兜底出口不分订阅，这里改取意图
+        // 指向的订阅里仍存在且未改动的最优候选；没有则沿用兜底（状态里会标出出口不在订阅内）。
+        prefer_auto_exit_after_removal(cfg, old_selected.as_deref(), |cfg| {
+            state
+                .proxy()
+                .auto_select_fallback(cfg)
+                .map(|candidate| candidate.node_id)
+        });
 
         // 6) 元数据回写到 sub 记录（lastUpdated + userInfo + 验证器 + hasProviders）。
         write_sub_metadata(
@@ -842,7 +864,11 @@ async fn perform_subscription_update_inner(
     }
 
     // 8) 内容变 / partial → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
-    broadcast_config_changed(app, &cfg);
+    let record_config = cfg.clone();
+    let record_from = old_selected.clone();
+    broadcast_config_changed_with_completion(app, &cfg, false, move |proxy, outcome| {
+        record_auto_exit_after_removal(proxy, &record_config, record_from.as_deref(), outcome);
+    });
     if selected_exit_changed(
         old_selected.as_deref(),
         cfg.get("selectedServerId").and_then(Value::as_str),
@@ -1106,6 +1132,96 @@ fn node_content_eq(left: &Value, right: &Value) -> bool {
                 })
         }
         _ => left == right,
+    }
+}
+
+/// 订阅刷新删掉当前出口之后的改选，自动选择意图下的那一步：`old_selected` 已不在 `cfg.servers`
+/// 里（对账刚把出口换成了不分订阅的兜底）时，改取 `preferred(cfg)` 给出的节点 —— 意图指向的
+/// 订阅里仍存在且未改动的最优候选。`preferred` 给不出、或给出的节点不在配置里，则保留兜底。
+/// 返回改选到的节点 id。意图本身不动：这是系统代选，不是用户的选择。
+fn prefer_auto_exit_after_removal(
+    cfg: &mut Value,
+    old_selected: Option<&str>,
+    preferred: impl FnOnce(&Value) -> Option<String>,
+) -> Option<String> {
+    let exists = |cfg: &Value, id: &str| {
+        cfg.get("servers")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server.get("id").and_then(Value::as_str) == Some(id))
+            })
+    };
+    let old = old_selected.filter(|id| !id.is_empty() && !is_direct_selection(Some(id)))?;
+    if exists(cfg, old) || cfg.get("selectedServerId").and_then(Value::as_str) == Some(old) {
+        return None;
+    }
+    let preferred = preferred(cfg).filter(|id| exists(cfg, id))?;
+    cfg.as_object_mut()?
+        .insert("selectedServerId".to_string(), json!(preferred));
+    Some(preferred)
+}
+
+/// 订阅刷新改了出口、而自动选择意图在：把这次系统代选记进选择状态（落在订阅内记一次换点；
+/// 落在订阅外不记，状态读取时会标出出口不在订阅内）。意图是手动时什么都不做。
+pub(crate) fn record_auto_exit_after_removal(
+    proxy: &ProxyRuntime,
+    cfg: &Value,
+    old_selected: Option<&str>,
+    outcome: Option<SwitchOutcome>,
+) {
+    let Some(subscription) = polaris_store::selection_intent_subscription(cfg) else {
+        return;
+    };
+    let new_selected = cfg.get("selectedServerId").and_then(Value::as_str);
+    if !selected_exit_changed(old_selected, new_selected) {
+        return;
+    }
+    // A stopped, stale, queued, deferred or failed Apply did not move the live exit.
+    // NoOp/Unchanged did not perform a new switch either.
+    if !matches!(
+        outcome,
+        Some(SwitchOutcome::HotSwitched | SwitchOutcome::Restarting)
+    ) {
+        proxy.auto_select_announce();
+        return;
+    }
+    let landed = new_selected.and_then(|id| {
+        cfg.get("servers")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|server| server.get("id").and_then(Value::as_str) == Some(id))
+            .filter(|server| {
+                server.get("subscriptionId").and_then(Value::as_str) == Some(subscription)
+            })
+            .map(|server| {
+                let name = server.get("name").and_then(Value::as_str).unwrap_or(id);
+                (id.to_string(), name.to_string())
+            })
+    });
+    match landed {
+        Some((to_id, to_name)) => {
+            log::info!("自动选择：订阅刷新删掉了胜出节点，改选同订阅的 {to_name}");
+            proxy.auto_select_record(SwitchRecord {
+                at: crate::runtime::subscription_scheduler::now_ms(),
+                leg: Leg::Select,
+                cause: Cause::WinnerRemoved,
+                from_id: old_selected.map(str::to_string),
+                from_name: None,
+                to_id,
+                to_name,
+                from_latency_ms: None,
+                to_latency_ms: None,
+                unverified: None,
+            });
+        }
+        None => {
+            log::warn!(
+                "自动选择：订阅刷新删掉了胜出节点，订阅 {subscription} 里没有可用候选，出口沿用兜底"
+            );
+            proxy.auto_select_announce();
+        }
     }
 }
 

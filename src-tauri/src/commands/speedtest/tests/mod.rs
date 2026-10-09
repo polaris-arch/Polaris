@@ -294,6 +294,71 @@ async fn speed_test_guard_is_single_flight() {
     drop(g2);
 }
 
+#[tokio::test]
+async fn production_data_settled_waits_for_new_results_and_the_real_gate_release() {
+    use futures::FutureExt;
+    let gate = SpeedTestGate::new();
+    let ledger = measurement_ledger::MeasurementLedger::new();
+    let guard = gate.acquire(SpeedTestOrigin::Manual).await.unwrap();
+    let wait = gate.data_settled(&ledger, ledger.version());
+    tokio::pin!(wait);
+    assert!(wait.as_mut().now_or_never().is_none(), "no results yet");
+    ledger.record(
+        "settled",
+        Ok(1),
+        ResultIdentity {
+            run: 1,
+            seq: 1,
+            origin: SpeedTestOrigin::Manual,
+            scope: None,
+            path: MeasurePath::Candidate,
+            url_digest: "settled-test".into(),
+            instance: CoreInstance::Temp,
+            config_digest: None,
+            node_fingerprint: None,
+            network_epoch: None,
+            measured_at: 1,
+            binding: None,
+        },
+    );
+    assert!(
+        wait.as_mut().now_or_never().is_none(),
+        "partial results must wait for producer drain"
+    );
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .unwrap();
+
+    let wait = gate.data_settled(&ledger, ledger.version());
+    tokio::pin!(wait);
+    assert!(
+        wait.as_mut().now_or_never().is_none(),
+        "idle alone is not new data"
+    );
+    ledger.record(
+        "settled",
+        Ok(2),
+        ResultIdentity {
+            run: 2,
+            seq: 1,
+            origin: SpeedTestOrigin::Manual,
+            scope: None,
+            path: MeasurePath::Candidate,
+            url_digest: "settled-test".into(),
+            instance: CoreInstance::Temp,
+            config_digest: None,
+            node_fingerprint: None,
+            network_epoch: None,
+            measured_at: 2,
+            binding: None,
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .unwrap();
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // §15 探测池分波编排纯逻辑：partition_pool（分区）+ plan_waves（分波）。
 // 真测量走真核=真机门；此处只钉分波/分区/槽绑定的确定性（变异转红面）。
@@ -4642,7 +4707,7 @@ fn ledger_view<'a>(fps: &'a BTreeMap<String, String>) -> measurement_ledger::Rea
         ),
         now_ms: u64::MAX,
         foreground_epoch: None,
-        freshness_cap_ms: &|_| u64::MAX,
+        freshness_cap_ms: &|_, _| u64::MAX,
     }
 }
 

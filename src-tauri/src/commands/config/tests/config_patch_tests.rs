@@ -199,12 +199,23 @@ fn staged_full_save_never_blindly_clears_the_backend_marker() {
 
 #[test]
 fn config_broadcast_routes_through_the_persisted_stale_guard() {
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("commands/config.rs"),
+    let source = crate_code("commands/config.rs");
+    let wrapper = crate::commands::guard_scan::top_level_fn_body(
+        &source,
         "pub(crate) fn broadcast_config_changed_with(",
     );
+    assert!(wrapper.contains("broadcast_config_changed_with_completion("));
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub(crate) fn broadcast_config_changed_with_completion<F>(",
+    );
+    let core = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub(crate) async fn apply_config_broadcast_core<F, C>(",
+    );
     assert!(
-        body.contains("switch_persisted_config_if_current(")
+        body.contains("apply_config_broadcast_core(")
+            && core.contains("switch_persisted_config_if_current(")
             && body.contains("intent_generation,")
             && body.contains("move |current|"),
         "配置广播不得直调 switch_mode_with；否则乱序 task 可把运行核退回旧快照"
@@ -214,8 +225,15 @@ fn config_broadcast_routes_through_the_persisted_stale_guard() {
         "App 日志/原生主题投影也必须在同一过期广播闸门之后"
     );
     assert!(
-        !body.contains("proxy.switch_mode_with("),
+        !body.contains("proxy.switch_mode_with(") && !core.contains("proxy.switch_mode_with("),
         "旧入口会跳过磁盘真值复核"
+    );
+    let apply = core.find(".await").unwrap();
+    let settle = core.find("settle_selected_switch_receipt(").unwrap();
+    let completion = core.find("completion(proxy, accepted)").unwrap();
+    assert!(
+        apply < settle && settle < completion,
+        "completion must follow actual Apply and current receipt settlement"
     );
 }
 

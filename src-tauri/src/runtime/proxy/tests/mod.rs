@@ -721,6 +721,7 @@ struct RecordingErrorEmitter {
     openvpn_status: OpenVpnStatusEvents,
     mesh_login_fallback: MeshLoginFallbackEvents,
     auto_node_switched: AutoNodeSwitchedEvents,
+    auto_select_status: Arc<Mutex<Vec<Value>>>,
     config_changed: Arc<std::sync::atomic::AtomicUsize>,
     unlock_invalidations: UnlockInvalidations,
     exit_ip_refreshes: ExitIpRefreshes,
@@ -789,6 +790,9 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
             .lock()
             .unwrap()
             .push(payload.clone());
+    }
+    fn emit_auto_select_status(&self, status: &Value) {
+        self.auto_select_status.lock().unwrap().push(status.clone());
     }
     fn emit_config_changed(&self) {
         self.config_changed.fetch_add(1, Ordering::SeqCst);

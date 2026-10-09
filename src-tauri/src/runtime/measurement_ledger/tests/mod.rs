@@ -49,7 +49,7 @@ fn context<'a>(
         url_digest: URL,
         now_ms,
         foreground_epoch,
-        freshness_cap_ms: &|_| CAP_MS,
+        freshness_cap_ms: &|_, _| CAP_MS,
     }
 }
 
@@ -60,6 +60,54 @@ fn exclusion_of(candidates: &Candidates, id: &str) -> Exclusion {
         .find(|(node, _)| node == id)
         .map(|(_, exclusion)| exclusion.clone())
         .unwrap_or_else(|| panic!("{id} 不在被排除的列表里：{candidates:?}"))
+}
+
+#[test]
+fn a_wall_clock_rollback_expires_candidates_and_old_url_eviction_together() {
+    let ledger = MeasurementLedger::new();
+    ledger.record_at("a", Ok(25), identity(1, 1, CAP_MS * 2), 100);
+    let fps = fingerprints(&["a"]);
+    let nodes = ids(&["a"]);
+    let rolled_back = ledger.candidates(&nodes, &context(&fps, CAP_MS * 2 - 1, None));
+    assert_eq!(
+        exclusion_of(&rolled_back, "a"),
+        Exclusion::Stale(LedgerStale::Expired)
+    );
+    assert!(ledger
+        .candidates(&nodes, &context(&fps, CAP_MS * 2, None))
+        .excluded
+        .is_empty());
+    assert!(ledger
+        .candidates(&nodes, &context(&fps, CAP_MS * 3, None))
+        .excluded
+        .is_empty());
+    assert_eq!(
+        exclusion_of(
+            &ledger.candidates(&nodes, &context(&fps, CAP_MS * 3 + 1, None)),
+            "a"
+        ),
+        Exclusion::Stale(LedgerStale::Expired)
+    );
+
+    // Both have another URL; rollback-invalidated data takes priority over
+    // an older but still fresh entry when the soft-cap eviction ranks them.
+    let mut future = identity(2, 1, CAP_MS * 2);
+    future.url_digest = "future-url".into();
+    ledger.record_at("a", Ok(10), future, 200);
+    let mut fresh = identity(3, 1, CAP_MS);
+    fresh.url_digest = "fresh-url".into();
+    ledger.record_at("a", Ok(20), fresh, 300);
+    let inner = ledger.lock();
+    let order = eviction_order(
+        &inner.entries,
+        &EvictContext {
+            nodes: &BTreeSet::from(["a".to_string()]),
+            url_digest: URL,
+            now_ms: CAP_MS,
+            freshness_cap_ms: &|_, _| CAP_MS,
+        },
+    );
+    assert_eq!(order[0].url_digest, "future-url");
 }
 
 /// 入账：运行号更大的取代已有记录；更旧的被拒并计数，已有记录原样保留。
@@ -101,7 +149,7 @@ async fn the_version_advances_on_every_accepted_record() {
 #[test]
 fn reading_classifies_every_node_with_a_reason() {
     let ledger = MeasurementLedger::new();
-    ledger.record("ok", Ok(120), identity(1, 1, 10_000));
+    ledger.record_at("ok", Ok(120), identity(1, 1, 10_000), 42);
     ledger.record("failed", Err(TIMED_OUT), identity(1, 2, 10_000));
     ledger.record(
         "system",
@@ -130,6 +178,7 @@ fn reading_classifies_every_node_with_a_reason() {
             node_id: "ok".to_string(),
             latency_ms: 120,
             measured_at: 10_000,
+            measured_mono: 42,
             run: 1,
         }],
         "停止态与 system 路径的结果不进可选点"
@@ -319,7 +368,7 @@ fn eviction_follows_the_documented_order() {
         nodes: &nodes,
         url_digest: URL,
         now_ms: 9_000_000,
-        freshness_cap_ms: &|_| CAP_MS,
+        freshness_cap_ms: &|_, _| CAP_MS,
     };
     let order: Vec<(String, String, u64)> = {
         let inner = ledger.lock();
@@ -526,7 +575,7 @@ fn the_soft_cap_holds_with_the_wider_key_space() {
         nodes: &nodes,
         url_digest: URL,
         now_ms: 9_000_300,
-        freshness_cap_ms: &|_| CAP_MS,
+        freshness_cap_ms: &|_, _| CAP_MS,
     });
     assert_eq!(evicted, 2);
     assert_eq!(ledger.len(), 4, "软上限 = 1 个节点 × 4");
@@ -548,4 +597,38 @@ fn the_soft_cap_holds_with_the_wider_key_space() {
         "旧 URL 下只剩最新的那条：{left:?}"
     );
     assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(42));
+}
+
+/// 入账时记下两样此后不变的东西：单调时刻，与那一刻的降频倍数。倍数此后再变，已入账的记录
+/// 不跟着变；新入账的记录带新值。
+#[test]
+fn an_entry_keeps_the_monotonic_time_and_period_factor_it_was_recorded_with() {
+    let ledger = MeasurementLedger::new();
+    ledger.record_at("a", Ok(1), identity(1, 1, 0), 1_000);
+    ledger.set_period_factor(4);
+    ledger.record_at("b", Ok(1), identity(1, 2, 0), 2_000);
+    let entry = |id: &str| ledger.candidate_entry(id, URL).unwrap();
+    assert_eq!(
+        (entry("a").recorded_mono, entry("a").period_factor),
+        (1_000, 1)
+    );
+    assert_eq!(
+        (entry("b").recorded_mono, entry("b").period_factor),
+        (2_000, 4)
+    );
+    // 上限由读取方按记录本身折算：同一份读取，两条记录各用各的倍数。
+    let fps = fingerprints(&["a", "b"]);
+    let read = ledger.candidates(
+        &ids(&["a", "b"]),
+        &ReadContext {
+            freshness_cap_ms: &|_, entry| 100 * entry.period_factor,
+            ..context(&fps, 300, None)
+        },
+    );
+    let selectable: Vec<&str> = read.selectable.iter().map(|c| c.node_id.as_str()).collect();
+    assert_eq!(selectable, ["b"], "a 按 1 倍已过期，b 按 4 倍仍新鲜");
+    assert_eq!(read.selectable[0].measured_mono, 2_000);
+    ledger.set_period_factor(0);
+    ledger.record_at("c", Ok(1), identity(1, 3, 0), 3_000);
+    assert_eq!(entry("c").period_factor, 1, "倍数不低于 1");
 }

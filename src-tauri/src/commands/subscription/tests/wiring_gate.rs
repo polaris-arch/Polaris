@@ -89,13 +89,15 @@ fn update_defers_removed_node_assets_until_the_restart_boundary() {
         .find("state.config().update_deferred_cleanup(|cfg|")
         .expect("订阅对账必须在延迟删除事务中原子完成");
     let broadcast = body
-        .find("broadcast_config_changed(app, &cfg)")
+        .find("broadcast_config_changed_with_completion(app, &cfg, false,")
         .expect("内容变化后的热切换广播仍须存在");
     assert!(
         journal < broadcast,
         "删除意图须先持久化，随后广播才能触发旧核退出与安全消费"
     );
     assert!(body.contains("reconcile_subscription_servers("));
+    assert!(body.contains("record_auto_exit_after_removal(proxy, &record_config, record_from.as_deref(), outcome)"),
+        "refresh bookkeeping must consume the completed broadcast receipt");
 }
 
 #[test]

@@ -767,3 +767,101 @@ fn subscription_refresh_reselects_selected_signals_exit_change() {
         "选中 id 未变 → 出口不变（不失效）"
     );
 }
+
+// ── 自动选择意图：删订阅清意图；刷新删掉胜出节点时先取同订阅候选 ─────────────────
+
+fn auto_cfg(selected: &str) -> Value {
+    json!({
+        "selectedServerId": selected,
+        "selectionIntent": polaris_store::selection_intent_auto("sub1"),
+        "subscriptions": [{ "id": "sub1" }, { "id": "sub2" }],
+        "servers": [
+            { "id": "n1", "subscriptionId": "sub1" },
+            { "id": "n2", "subscriptionId": "sub1" },
+            { "id": "m1", "subscriptionId": "sub2" }
+        ]
+    })
+}
+
+/// 删除意图指向的订阅：意图清回手动。删别的订阅：意图原样保留。
+#[test]
+fn deleting_the_subscription_an_auto_intent_points_at_clears_the_intent() {
+    let mut cfg = auto_cfg("n1");
+    apply_subscription_delete(&mut cfg, "sub1").unwrap();
+    assert!(cfg.get("selectionIntent").is_none());
+    assert_eq!(cfg["selectedServerId"], json!("__direct__"));
+
+    let mut cfg = auto_cfg("n1");
+    apply_subscription_delete(&mut cfg, "sub2").unwrap();
+    assert_eq!(
+        polaris_store::selection_intent_subscription(&cfg),
+        Some("sub1")
+    );
+    assert_eq!(cfg["selectedServerId"], json!("n1"));
+}
+
+/// 刷新删掉了胜出节点、对账已把出口换成兜底：有同订阅候选时新出口取它；没有（或给出的节点
+/// 已不在配置里）时沿用兜底。意图不动。出口没被删、或对账没改出口时什么都不做。
+#[test]
+fn a_removed_winner_is_replaced_by_a_candidate_of_the_same_subscription_first() {
+    // 对账之后的形态：`n1` 已被删，出口被兜底到别的订阅的 `m1`。
+    let after_reconcile = || {
+        let mut cfg = auto_cfg("m1");
+        cfg["servers"].as_array_mut().unwrap().remove(0);
+        cfg
+    };
+    let intent =
+        |cfg: &Value| polaris_store::selection_intent_subscription(cfg).map(str::to_string);
+
+    let mut cfg = after_reconcile();
+    assert_eq!(
+        prefer_auto_exit_after_removal(&mut cfg, Some("n1"), |_| Some("n2".to_string())),
+        Some("n2".to_string())
+    );
+    assert_eq!(cfg["selectedServerId"], json!("n2"));
+    assert_eq!(intent(&cfg).as_deref(), Some("sub1"));
+
+    for preferred in [None, Some("gone".to_string())] {
+        let mut cfg = after_reconcile();
+        assert_eq!(
+            prefer_auto_exit_after_removal(&mut cfg, Some("n1"), |_| preferred.clone()),
+            None
+        );
+        assert_eq!(cfg["selectedServerId"], json!("m1"), "沿用现有兜底");
+        assert_eq!(intent(&cfg).as_deref(), Some("sub1"));
+    }
+
+    // 出口还在：不问候选。
+    let mut cfg = auto_cfg("n1");
+    assert_eq!(
+        prefer_auto_exit_after_removal(&mut cfg, Some("n1"), |_| panic!("出口没被删")),
+        None
+    );
+    assert_eq!(cfg["selectedServerId"], json!("n1"));
+    // 原先选的是直连或未选：不是「胜出节点被删」。
+    for old in [Some("__direct__"), Some(""), None] {
+        let mut cfg = after_reconcile();
+        assert_eq!(
+            prefer_auto_exit_after_removal(&mut cfg, old, |_| panic!("不适用")),
+            None
+        );
+    }
+}
+
+/// 接线（源码级）：刷新的写事务在对账之后做这一步改选，候选取自运行时的自动选择；
+/// 新建订阅的那条路径不做（新订阅里不可能有当前出口）。
+#[test]
+fn the_refresh_transaction_prefers_the_auto_candidate_after_reconciling() {
+    let source = crate::test_support::crate_code("commands/subscription.rs");
+    let reconcile = source
+        .find("let recon = reconcile_subscription_servers(\n            cfg,")
+        .expect("刷新事务里的对账锚点");
+    let prefer = source[reconcile..]
+        .find("prefer_auto_exit_after_removal(cfg, old_selected.as_deref(), |cfg| {")
+        .expect("对账之后必须有自动选择的改选");
+    assert!(source[reconcile + prefer..].contains(".auto_select_fallback(cfg)"));
+    assert!(
+        !crate::test_support::crate_code("commands/subscription/create.rs")
+            .contains("prefer_auto_exit_after_removal")
+    );
+}

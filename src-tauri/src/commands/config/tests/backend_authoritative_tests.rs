@@ -291,3 +291,62 @@ fn missing_current_config_is_a_noop() {
     assert!(incoming.get("recentServerIds").is_none());
     assert_eq!(incoming["logLevel"], json!("info"), "非白名单键不受影响");
 }
+
+/// 选择意图是后端权威字段：全量保存与补丁带来的值一律以盘上为准。前端携带的旧快照冲不掉盘上的
+/// 自动意图，也造不出一个盘上没有的意图；其余字段的改动照常落盘。
+#[test]
+fn a_frontend_save_or_patch_can_neither_wipe_nor_forge_the_selection_intent() {
+    let dir = temp_dir("selection-intent");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut seeded = mgr.load_full().unwrap();
+    seeded["subscriptions"] = json!([{ "id": "sub", "name": "S", "url": "https://a.example/x" }]);
+    mgr.save_full(&seeded).unwrap();
+    let without_intent = mgr.load_full().unwrap();
+    let intent = polaris_store::selection_intent_auto("sub");
+
+    // 后端置上意图之后，前端提交那份不带意图的旧快照。
+    let mut with_intent = without_intent.clone();
+    with_intent["selectionIntent"] = intent.clone();
+    mgr.save_full(&with_intent).unwrap();
+    let mut stale = without_intent.clone();
+    stale["logLevel"] = json!("debug");
+    config_save_core(&mgr, &mut stale, None, false).expect("save");
+    let on_disk = mgr.load_full().unwrap();
+    assert_eq!(on_disk["selectionIntent"], intent, "旧快照冲不掉意图");
+    assert_eq!(on_disk["logLevel"], json!("debug"));
+
+    // 补丁同理：改别的键不动意图，直接补一个意图键也不生效。
+    let mut patch = serde_json::Map::new();
+    patch.insert("logLevel".into(), json!("warn"));
+    patch.insert("selectionIntent".into(), Value::Null);
+    config_patch_core(&mgr, patch).expect("patch");
+    assert_eq!(mgr.load_full().unwrap()["selectionIntent"], intent);
+
+    // 盘上是手动意图时，前端带来的意图键被丢弃。
+    mgr.save_full(&without_intent).unwrap();
+    let mut forged = without_intent.clone();
+    forged["selectionIntent"] = intent.clone();
+    config_save_core(&mgr, &mut forged, None, false).expect("save");
+    assert!(mgr.load_full().unwrap().get("selectionIntent").is_none());
+    let mut patch = serde_json::Map::new();
+    patch.insert("selectionIntent".into(), intent);
+    config_patch_core(&mgr, patch).expect("patch");
+    assert!(mgr.load_full().unwrap().get("selectionIntent").is_none());
+
+    assert!(BACKEND_AUTHORITATIVE_KEYS.contains(&polaris_store::SELECTION_INTENT_KEY));
+}
+
+/// 全量保存删掉了意图指向的订阅：意图随保存前的清洗一并移除，不留悬空意图。
+#[test]
+fn a_save_that_drops_the_subscription_drops_the_intent_with_it() {
+    let dir = temp_dir("selection-intent-dangling");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut cfg = mgr.load_full().unwrap();
+    cfg["subscriptions"] = json!([{ "id": "sub", "name": "S", "url": "https://a.example/x" }]);
+    cfg["selectionIntent"] = polaris_store::selection_intent_auto("sub");
+    mgr.save_full(&cfg).unwrap();
+    let mut without_subscription = mgr.load_full().unwrap();
+    without_subscription["subscriptions"] = json!([]);
+    config_save_core(&mgr, &mut without_subscription, None, false).expect("save");
+    assert!(mgr.load_full().unwrap().get("selectionIntent").is_none());
+}

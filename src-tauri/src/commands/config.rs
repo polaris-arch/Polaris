@@ -31,7 +31,7 @@ use crate::events::channel::{
 };
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::StagedClassification;
+use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
     selected_exit_changed, BroadcastSink, UnlockEventSink, UnlockRuntime,
 };
@@ -1145,7 +1145,7 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
 ///
 /// `appRulesSeeded` 同样**不收**：它在 `polaris_store::backup` 的 `DATA_FIELDS` 里，随 appRules 类
 /// 被备份导入合法写入 ⇒ 所有权有争议，不满足「零写入权」。
-const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
+const BACKEND_AUTHORITATIVE_KEYS: [&str; 5] = [
     // 托盘「节点·最近」MRU。只由 `server_switch` 写；ui 全仓仅 TrayMenu 读。
     "recentServerIds",
     // 内置 geo 元数据（随包）。只由 geo seed 写；ui 全仓零读零写。
@@ -1153,6 +1153,10 @@ const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
     // 仅专用后端 revision-CAS mutation 可以修改；普通全量保存/patch/导入按盘上真值镜像。
     polaris_store::mesh_guard::POLICY_KEY,
     polaris_store::mesh_guard::STATE_KEY,
+    // 选择意图（自动选择）。只由 `commands/server.rs` 的三处显式选择写：点节点清掉，点某订阅的
+    // 「自动选择」置上。前端零写入权：全量保存与补丁带来的值一律以盘上为准，既冲不掉、也造不出
+    // 一个意图；指向的订阅被删掉时由保存前的清洗移除。
+    polaris_store::SELECTION_INTENT_KEY,
     // 曾有第三项 `diagnosticCapture`（诊断采集态）。整条机制已删除（核日志改由 `SubscribeLog` 全级别
     // 送达、级别筛在客户端，不再需要「临时把核提级到 debug」的会话），故该键不再是任何人的权威字段。
     // 旧配置里的残留由 `polaris_store::migrate::migrate_diagnostic_capture` 还原级别后清除。
@@ -1724,6 +1728,18 @@ pub(crate) fn broadcast_config_changed_with(
     new_value: &Value,
     defer_restart: bool,
 ) {
+    broadcast_config_changed_with_completion(app, new_value, defer_restart, |_, _| {});
+}
+
+/// Completion is tied to the accepted runtime receipt, never to saving or spawning Apply.
+pub(crate) fn broadcast_config_changed_with_completion<F>(
+    app: &AppHandle,
+    new_value: &Value,
+    defer_restart: bool,
+    completion: F,
+) where
+    F: FnOnce(&std::sync::Arc<ProxyRuntime>, Option<SwitchOutcome>) + Send + 'static,
+{
     // F29 defense-in-depth：隐私密码（legacy 明文 + salted hash）绝不经**任何**前端可见路径下发。
     // 本事件已不带载荷（见下），故这份剥离服务的是**入核**那一份 —— `cfg` 一路 move 进
     // `switch_mode_with`；剥在源头，将来谁把它接回某条前端可见路径也带不出 hash。
@@ -1747,21 +1763,41 @@ pub(crate) fn broadcast_config_changed_with(
         let intent_generation = proxy.register_selector_intent();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = proxy
-                .switch_persisted_config_if_current(
-                    cfg,
-                    defer_restart,
-                    intent_generation,
-                    move |current| {
-                        apply_process_config_projections(&app, current);
-                    },
-                )
-                .await;
+            apply_config_broadcast_core(
+                &proxy,
+                cfg,
+                defer_restart,
+                intent_generation,
+                move |current| apply_process_config_projections(&app, current),
+                completion,
+            )
+            .await;
         });
     } else {
         // 早期启动/单测没有 AppRuntime，无法做磁盘版本复核；保留历史的 best-effort 投影行为。
         apply_process_config_projections(app, &cfg);
     }
+}
+
+/// The production broadcast task and behavior tests share the actual Apply/settle boundary.
+pub(crate) async fn apply_config_broadcast_core<F, C>(
+    proxy: &std::sync::Arc<ProxyRuntime>,
+    cfg: Value,
+    defer_restart: bool,
+    intent_generation: u64,
+    on_current: F,
+    completion: C,
+) where
+    F: FnOnce(&Value) + Send,
+    C: FnOnce(&std::sync::Arc<ProxyRuntime>, Option<SwitchOutcome>) + Send,
+{
+    let starting_generation = proxy.core_generation();
+    let outcome = proxy
+        .switch_persisted_config_if_current(cfg, defer_restart, intent_generation, on_current)
+        .await;
+    let accepted =
+        proxy.settle_selected_switch_receipt(outcome, starting_generation, intent_generation);
+    completion(proxy, accepted);
 }
 
 #[cfg(test)]

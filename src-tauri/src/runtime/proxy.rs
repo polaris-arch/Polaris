@@ -695,6 +695,9 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// lib.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_auto_node_switched(&self, payload: &AutoNodeSwitchedPayload);
 
+    /// 选择状态变了（`event:autoSelectStatus`，载荷与状态命令 `auto_select_status` 的返回同形）。
+    fn emit_auto_select_status(&self, status: &serde_json::Value);
+
     /// 只发“磁盘配置/运行投影需重拉”信号，不再次进入普通 config switch 流水线。用于 selector
     /// 双不自证后的受限对账完成通知；若走普通广播会把 D 中未 Apply 的其它字段夹带入核。
     fn emit_config_changed(&self);
@@ -928,6 +931,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             &self.app,
             crate::events::channel::EVENT_AUTO_NODE_SWITCHED,
             payload,
+        );
+    }
+
+    fn emit_auto_select_status(&self, status: &serde_json::Value) {
+        crate::events::broadcast(
+            &self.app,
+            crate::events::channel::EVENT_AUTO_SELECT_STATUS,
+            status,
         );
     }
 
@@ -1346,6 +1357,11 @@ impl IosMainCustody {
     }
 }
 
+/// 进程内的单调毫秒（换点冷却、驻留、账本入账共用的时钟）。
+pub(crate) fn mono_now_ms() -> u64 {
+    lifecycle::monotonic_now_ms()
+}
+
 pub struct ProxyRuntime {
     config: Arc<ConfigManager>,
     /// 提权 helper（C6-5 接线）：TUN 模式经它起停 root/SYSTEM 受管核（见 [`should_start_via_helper`](startup::should_start_via_helper)）。
@@ -1437,6 +1453,12 @@ pub struct ProxyRuntime {
     /// selector 意图代次、强制重申脏位与后台单飞交接的唯一 owner。
     /// 它与 `switch_serial` 正交：前者给出跨 await 的所有权事实，后者仍串行真实入核 I/O。
     selector_reconcile: Arc<SelectorReconcileOwner>,
+    /// 自动选点的状态槽：决策记忆、上次换点、最近一次评估。进程级，不随核世代清空，不落盘。
+    auto_select: std::sync::Mutex<crate::runtime::auto_select::Slot>,
+    /// 唤醒心跳任务立即评估一次（意图刚被写入时）。
+    auto_select_wake: tokio::sync::Notify,
+    /// 最近一次发给前端的选择状态摘要。取状态、比对、发射都在这把锁里：并发播报先后有序。
+    auto_select_announced: std::sync::Mutex<Option<String>>,
     /// 「保存不重启」欠下的账：本次运行核起来之后，是否发生过被 `defer_restart` 降级的结构性变更。
     ///
     /// # 为什么是一个记账标记而不是现算的差集
@@ -1774,6 +1796,9 @@ impl ProxyRuntime {
             switch_seq: AtomicU64::new(1),
             switch_serial: AsyncMutex::new(()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
+            auto_select: std::sync::Mutex::default(),
+            auto_select_wake: tokio::sync::Notify::new(),
+            auto_select_announced: std::sync::Mutex::default(),
             restart_deferred: AtomicBool::new(false),
             netenv_dhcp_suppressed: AtomicBool::new(false),
             network_canary: Arc::default(),

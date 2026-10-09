@@ -1,3 +1,4 @@
+import type { SelectionIntent } from './auto-select';
 import type {
   NaiveSettings,
   Hysteria2Settings,
@@ -586,6 +587,9 @@ export interface UserConfig {
   // `st.mru`）。由 server_switch 写入（src-tauri/src/commands/server.rs push_recent_server_id）；
   // undefined=旧配置/从未切换过，视作空历史。
   recentServerIds?: string[];
+  // 选择意图：缺席即手动；自动选择时由后端置上（`auto_select_enable`），点任一节点时由后端清掉。
+  // 界面只读：全量保存与补丁带上的值一律被后端以盘上为准覆盖。`selectedServerId` 始终是实际出口。
+  selectionIntent?: SelectionIntent;
 
   // 代理模式
   proxyMode: ProxyMode;

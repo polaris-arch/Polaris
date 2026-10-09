@@ -2,6 +2,7 @@ import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent } from '../../contracts/types';
 import type { TailscaleStatusEvent } from '../../contracts/tailscale-status';
+import type { AutoNodeSwitchedPayload } from '../../contracts/auto-select';
 import type { TailscaleLoginProgress } from '../../domain/tailscale-login-progress';
 
 // ============================================================================
@@ -111,9 +112,7 @@ export const proxyApi = {
     return listen(IPC_CHANNELS.EVENT_PROXY_ERROR, listener);
   },
 
-  onAutoNodeSwitched(
-    listener: (data: { reason: string; newServerName: string; latency: number }) => void
-  ): () => void {
+  onAutoNodeSwitched(listener: (data: AutoNodeSwitchedPayload) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_AUTO_NODE_SWITCHED, listener);
   },
 

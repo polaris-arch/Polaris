@@ -1354,3 +1354,49 @@ fn periodic_speed_test_settings_survive_export_and_restore() {
         assert_eq!(restored[key], source[key], "{key}");
     }
 }
+
+/// 选择意图的归类跟随 `selectedServerId`：不导出、不随通用设置导入。带意图的配置导出全部类别
+/// 再恢复到自身，逐字段相同；恢复到别处时意图不被带过去；导入把意图指向的订阅整类替换掉之后，
+/// 意图被移除。
+#[test]
+fn the_selection_intent_follows_the_selected_server_through_backup() {
+    let intent = crate::selection_intent_auto("s1");
+    let source = json!({
+        "servers": [{ "id": "n1", "subscriptionId": "s1" }],
+        "subscriptions": [{ "id": "s1", "name": "one", "url": "https://a.example/x" }],
+        "selectedServerId": "n1",
+        "selectionIntent": intent,
+        "logLevel": "info",
+    });
+    let exported = pick_categories(&source, &BACKUP_CATEGORIES);
+    assert!(
+        exported.get("selectionIntent").is_none(),
+        "意图不进备份文件"
+    );
+    assert!(exported.get("selectedServerId").is_none());
+
+    let restored = merge_categories(&source, &exported, &BACKUP_CATEGORIES).config;
+    assert_eq!(restored, source, "导出再恢复到自身逐字段相同");
+
+    // 恢复到另一份配置：对方的意图（这里是手动）不被备份改写。
+    let elsewhere = json!({ "servers": [], "subscriptions": [], "selectedServerId": null });
+    let merged = merge_categories(&elsewhere, &exported, &BACKUP_CATEGORIES).config;
+    assert!(merged.get("selectionIntent").is_none());
+
+    // 导入别处的订阅类，把本机意图指向的订阅整类替换掉：意图移除，选中节点归零。
+    let foreign = json!({
+        "servers": [{ "id": "x1", "subscriptionId": "sx" }],
+        "subscriptions": [{ "id": "sx", "name": "x", "url": "https://x.example/x" }],
+    });
+    let replaced = merge_categories(&source, &foreign, &[C::Subscriptions]).config;
+    assert!(replaced.get("selectionIntent").is_none());
+    assert_eq!(replaced["selectedServerId"], Value::Null);
+    // 对照：只导入通用设置，订阅还在，意图保留。
+    let general = merge_categories(
+        &source,
+        &json!({ "logLevel": "debug" }),
+        &[C::GeneralSettings],
+    );
+    assert_eq!(general.config["selectionIntent"], source["selectionIntent"]);
+    assert_eq!(general.config["logLevel"], "debug");
+}

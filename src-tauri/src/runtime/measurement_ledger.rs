@@ -42,6 +42,16 @@ pub(crate) struct LedgerEntry {
     pub(crate) consecutive_failures: u32,
     /// 这个键最近一次成功的时刻（Unix 毫秒）。
     pub(crate) last_ok_at: Option<u64>,
+    /// 入账那一刻的单调毫秒（[`mono_now_ms`]）。墙钟会被回拨或前拨；需要比「相隔多久」的地方用它。
+    pub(crate) recorded_mono: u64,
+    /// 入账那一刻周期测速的降频倍数。一条结果的新鲜期在它产生时就定下：此后倍数再变，
+    /// 已入账的结果不跟着变宽或变窄。
+    pub(crate) period_factor: u64,
+}
+
+/// 进程内的单调毫秒。账本入账与自动选点的裁决共用这一个时钟。
+pub(crate) fn mono_now_ms() -> u64 {
+    crate::runtime::proxy::mono_now_ms()
 }
 
 /// 一条结果不再可用于选点的原因。前一项来自测量层的三条身份判据，后两项只属于账本。
@@ -79,6 +89,8 @@ pub(crate) struct Candidate {
     pub(crate) node_id: String,
     pub(crate) latency_ms: u32,
     pub(crate) measured_at: u64,
+    /// 入账那一刻的单调毫秒。
+    pub(crate) measured_mono: u64,
     pub(crate) run: u64,
 }
 
@@ -105,8 +117,9 @@ pub(crate) struct ReadContext<'a> {
     pub(crate) now_ms: u64,
     /// 当前前台代次。桌面传 `None`：桌面有网络代次，不靠它。
     pub(crate) foreground_epoch: Option<u64>,
-    /// 逐节点的新鲜期上限（毫秒）。
-    pub(crate) freshness_cap_ms: &'a dyn Fn(&str) -> u64,
+    /// 逐节点的新鲜期上限（毫秒）。第二个参数是那条记录：上限取决于它入账时的降频倍数与它的
+    /// 连续失败次数（进了退避的节点测得更稀），由读取方折算。
+    pub(crate) freshness_cap_ms: &'a dyn Fn(&str, &LedgerEntry) -> u64,
 }
 
 /// 淘汰时的对照面。
@@ -115,14 +128,13 @@ pub(crate) struct EvictContext<'a> {
     pub(crate) nodes: &'a BTreeSet<String>,
     pub(crate) url_digest: &'a str,
     pub(crate) now_ms: u64,
-    pub(crate) freshness_cap_ms: &'a dyn Fn(&str) -> u64,
+    pub(crate) freshness_cap_ms: &'a dyn Fn(&str, &LedgerEntry) -> u64,
 }
 
 impl Candidates {
     /// 这组节点是否已被一轮完整覆盖：每个可测的节点都有当前结果（测出了值，或真测了没通）。
     /// 起测前被预筛跳过的不算欠账；从未测过、已过期、只有非候选结果的都算没覆盖。
     /// 「首轮是否完成」的判据：被抢占后为否，补发完成后为是。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn covers_all_testable(&self) -> bool {
         self.excluded.iter().all(|(_, exclusion)| {
             matches!(
@@ -147,6 +159,7 @@ pub(crate) struct MeasurementLedger {
     version: AtomicU64,
     changed: Notify,
     foreground_epoch: AtomicU64,
+    period_factor: AtomicU64,
 }
 
 static LEDGER: MeasurementLedger = MeasurementLedger::new();
@@ -167,6 +180,7 @@ impl MeasurementLedger {
             version: AtomicU64::new(0),
             changed: Notify::const_new(),
             foreground_epoch: AtomicU64::new(0),
+            period_factor: AtomicU64::new(1),
         }
     }
 
@@ -180,13 +194,11 @@ impl MeasurementLedger {
     }
 
     /// 账本版本：每次入账或淘汰后加一。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
 
     /// 等到版本越过 `seen` 为止，返回新版本。消费方据此重新评估，不必轮询。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn changed_since(&self, seen: u64) -> u64 {
         loop {
             let notified = self.changed.notified();
@@ -210,12 +222,28 @@ impl MeasurementLedger {
         self.foreground_epoch.store(epoch, Ordering::Release);
     }
 
+    /// 调度器把当前的降频倍数同步过来；此后入账的结果带上它。
+    pub(crate) fn set_period_factor(&self, factor: u64) {
+        self.period_factor.store(factor.max(1), Ordering::Release);
+    }
+
     /// 入账一条盖过章的逐节点结果。返回是否取代了已有记录。
     pub(crate) fn record(
         &self,
         node_id: &str,
         measured: Measured,
         identity: ResultIdentity,
+    ) -> bool {
+        self.record_at(node_id, measured, identity, mono_now_ms())
+    }
+
+    /// [`record`](Self::record) 的本体，入账的单调时刻由调用方给（单测注入时钟）。
+    pub(crate) fn record_at(
+        &self,
+        node_id: &str,
+        measured: Measured,
+        identity: ResultIdentity,
+        recorded_mono: u64,
     ) -> bool {
         let key = result_key(node_id, &identity);
         let mut inner = self.lock();
@@ -240,6 +268,8 @@ impl MeasurementLedger {
                 stored.and_then(|entry| entry.last_ok_at)
             },
             foreground_epoch: self.foreground_epoch(),
+            recorded_mono,
+            period_factor: self.period_factor.load(Ordering::Acquire),
             measured,
             identity,
         };
@@ -384,9 +414,11 @@ fn ledger_stale(
     if let Some(reason) = stale_reason(&entry.identity, &current) {
         return Some(LedgerStale::Identity(reason));
     }
-    if context.now_ms.saturating_sub(entry.identity.measured_at)
-        > (context.freshness_cap_ms)(node_id)
-    {
+    if expired_at(
+        context.now_ms,
+        entry.identity.measured_at,
+        (context.freshness_cap_ms)(node_id, entry),
+    ) {
         return Some(LedgerStale::Expired);
     }
     if context
@@ -452,6 +484,7 @@ fn classify(
                 node_id: node_id.to_string(),
                 latency_ms,
                 measured_at: entry.identity.measured_at,
+                measured_mono: entry.recorded_mono,
                 run: entry.identity.run,
             },
             entry.identity.binding,
@@ -480,8 +513,11 @@ fn eviction_order(
             let class = if !context.nodes.contains(&key.node_id) {
                 0
             } else if key.url_digest != context.url_digest
-                && context.now_ms.saturating_sub(measured_at)
-                    > (context.freshness_cap_ms)(&key.node_id)
+                && expired_at(
+                    context.now_ms,
+                    measured_at,
+                    (context.freshness_cap_ms)(&key.node_id, entry),
+                )
             {
                 1
             } else {
@@ -492,6 +528,14 @@ fn eviction_order(
         .collect();
     ranked.sort();
     ranked.into_iter().map(|(_, _, key)| key.clone()).collect()
+}
+
+/// A wall-clock rollback cannot make a measurement from the future fresh.
+/// Reading and eviction use the same boundary, including the exact TTL edge.
+fn expired_at(now_ms: u64, measured_at: u64, cap_ms: u64) -> bool {
+    now_ms
+        .checked_sub(measured_at)
+        .is_none_or(|age| age > cap_ms)
 }
 
 #[cfg(test)]
