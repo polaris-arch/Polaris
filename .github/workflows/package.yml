@@ -650,10 +650,10 @@ jobs:
       # ── 资产就位（供应链防护核心）──
       # 内核不下载：消费本提交对应的四平台内核包，四份二进制与回执全部校验后才落盘。
       # 其余 fetch 脚本缺 pin 即 fail（绝不无校验拉可执行资源）。
-      - name: Read Windows core toolchain pin
+      - name: Read pinned source Go version
         id: core-go
         shell: bash
-        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -1501,10 +1501,10 @@ jobs:
           [ "$got" = "$PROTOC_EXPECT" ] || {
             echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
 
-      - name: Read Windows core toolchain pin
+      - name: Read pinned source Go version
         id: core-go
         shell: bash
-        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:

@@ -163,10 +163,10 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Read Windows core toolchain pin
+      - name: Read pinned source Go version
         id: core-go
         shell: bash
-        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:

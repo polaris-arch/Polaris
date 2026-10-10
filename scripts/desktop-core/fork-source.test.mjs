@@ -1,6 +1,6 @@
 // Tiny local Git objects and a fake compiler prove contract wiring, never a kernel verdict.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -207,6 +207,46 @@ test('desktop Go pin reads the selected desktop manifest, rejects mobile role an
     f.source.role = 'desktop'; refresh(f);
     delete f.manifest.sourceBuild.sourceManifestSha256;
     assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /SHA-256/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('actual five workflow Go pin commands reject wrong source bytes, mobile role and missing pin', () => {
+  const commands = ['desktop-core', 'package', 'release-risk'].flatMap((name) =>
+    readFileSync(join(repo, '.github/workflows', `${name}.yml`), 'utf8').split('\n')
+      .filter((line) => line.includes('run: node') && line.includes('version='))
+      .map((line) => line.trim().slice('run: '.length)));
+  assert.equal(commands.length, 5);
+  const f = fixture();
+  try {
+    copyFileSync(join(repo, 'scripts/desktop-core/source-graph.mjs'), join(f.root, 'scripts/desktop-core/source-graph.mjs'));
+    write(join(f.root, 'scripts/libbox-patches/source-manifest.json'), JSON.stringify({ goVersion: '1.26.0', role: 'mobile' }));
+    const selected = join(f.root, 'scripts/desktop-core/source-manifest.json');
+    const output = join(f.root, 'github-output');
+    const runCommands = (accepted, message) => {
+      write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(f.manifest));
+      for (const command of commands) {
+        write(output, '');
+        const result = spawnSync('bash', ['-c', command], {
+          cwd: f.root, encoding: 'utf8', env: { ...process.env, GITHUB_OUTPUT: output },
+        });
+        if (accepted) {
+          assert.equal(result.status, 0, result.stderr);
+          assert.equal(readFileSync(output, 'utf8'), 'version=1.25.5\n');
+        } else {
+          assert.notEqual(result.status, 0);
+          assert.match(result.stderr, message);
+          assert.equal(readFileSync(output, 'utf8'), '', 'rejected selection must not emit a usable Go version');
+        }
+      }
+    };
+    runCommands(true);
+    write(selected, JSON.stringify({ ...f.source, goVersion: '1.26.0' }));
+    runCommands(false, /SHA-256/);
+    f.source.role = 'mobile'; refresh(f);
+    runCommands(false, /role/);
+    f.source.role = 'desktop'; refresh(f);
+    delete f.manifest.sourceBuild.sourceManifestSha256;
+    runCommands(false, /SHA-256/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

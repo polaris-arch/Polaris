@@ -152,6 +152,28 @@ test('four source producers use exact native hosts, source Go pin and real Darwi
   assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
 });
 
+test('all five producer and consumer Go setup steps select the pinned desktop source', () => {
+  const scopes = [
+    ['desktop-core', 'produce'], ['desktop-core', 'assemble'],
+    ['release-risk', 'preflight'], ['package', 'package'], ['package', 'core_wire'],
+  ];
+  const requireSelection = (body) => {
+    const pins = body.split('\n').filter((line) => line.includes('run: node') && line.includes('version='));
+    assert.equal(pins.length, 1, 'each source job has exactly one Go pin command');
+    assert.match(pins[0], /desktopSourceGoVersion\(process.cwd\(\), JSON.parse\(readFileSync\("src-tauri\/core-manifest.json"/);
+    assert.doesNotMatch(pins[0], /windowsBuild|libbox-patches|ios|gomobile/);
+    assert.ok(body.indexOf(pins[0]) < body.indexOf('uses: actions/setup-go@v6'));
+  };
+  for (const [workflow, name] of scopes) {
+    const body = job(files[workflow], name);
+    requireSelection(body);
+    for (const replacement of ['mobileGoVersion', 'windowsBuildGoVersion']) {
+      assert.throws(() => requireSelection(body.replace('desktopSourceGoVersion(process.cwd(),', `${replacement}(process.cwd(),`)), `${workflow}/${name}`);
+    }
+    assert.throws(() => requireSelection(body.replace(/^.*run: node.*version=.*\n/m, '')), `${workflow}/${name}: missing selection`);
+  }
+});
+
 test('candidate checkout and App/helper identity follow PR head instead of a default merge or old source', () => {
   candidates(files);
   assert.throws(() => candidates({ ...files, 'desktop-core': files['desktop-core'].replace('ref: ${{ inputs.candidate }}', 'ref: ${{ github.sha }}') }));
