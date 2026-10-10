@@ -114,11 +114,13 @@ fn failure_is_generation_bound_and_guard_catches_early_return() {
     o.fail_start(2);
     assert!(o.lock().pending.is_none());
 }
-fn blocked() -> (
+type BlockedFixture = (
     Arc<Observer>,
     Arc<(Mutex<bool>, Condvar)>,
     mpsc::Receiver<()>,
-) {
+);
+
+fn blocked() -> BlockedFixture {
     let (o, _, _) = fixture();
     let mut o = Arc::try_unwrap(o).ok().unwrap();
     let collector = o.collector.clone();

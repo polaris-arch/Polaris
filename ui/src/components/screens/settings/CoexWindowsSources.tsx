@@ -1,18 +1,25 @@
 /** Source-local Windows observations. No interface join or safety verdict. */
 import { useState, type ReactNode } from 'react';
+import { revealElement, revealOnToggle, useRevealAfterCommit } from '@/components/reveal';
 import type { Fact } from '@/contracts/coex-snapshot';
 import type { CoexWindowsSnapshot, WindowsReference, WindowsSource, WindowsRoute } from '@/contracts/coex-windows';
 type Text = (key: string) => string;
 function Field<T>({ label, value, show, t }: { label: string; value: Fact<T>; show: (v: T) => ReactNode; t: Text }) {
   return <div className="card-sub"><b>{label}: </b>{value.status === 'known' ? show(value.value) : <>
-    <span>{t('settings.coex.unknown')}</span><details><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
+    <span>{t('settings.coex.unknown')}</span><details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
   </>}</div>;
 }
 function Source<T>({ id, label, value, show, t }: { id: string; label: string; value: WindowsSource<T>; show: (v: T) => ReactNode; t: Text }) {
   const [open, setOpen] = useState(false); const [page, setPage] = useState(0);
+  const scheduleReveal = useRevealAfterCommit();
   const count = value.rows.status === 'known' ? value.rows.value.length : 0;
   const current = Math.min(page, Math.max(0, Math.ceil(count / 20) - 1)); const start = current * 20;
-  return <details data-coex-source={id} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+  return <details data-coex-source={id} open={open} onToggle={(event) => {
+    const details = event.currentTarget;
+    // Row content mounts with open: measure only after React commits it.
+    scheduleReveal(details.open ? () => revealElement(details) : null);
+    setOpen(details.open);
+  }}>
     <summary>{label}</summary>{open && <>
       <Field label={t('settings.coex.completeness')} value={value.complete} t={t} show={(v) => t(v ? 'settings.coex.true' : 'settings.coex.false')} />
       <Field label={t('settings.coex.compartment')} value={value.compartment} t={t} show={(v) => <span className="mono">{v}</span>} />
@@ -45,7 +52,7 @@ export function CoexWindowsSources({ snapshot, t }: { snapshot: CoexWindowsSnaps
     <Field label={t('settings.coex.interfaceMetric')} value={v.interfaceMetric} show={text} t={t} />
   </>;
   return <div data-coex-facts data-coex-windows>
-    <div className="card-sub">{t('settings.coex.platform')}: <span className="mono">win32</span></div>
+    <div className="card-sub">{t('settings.coex.platform')}: <span className="mono">{snapshot.platform}</span></div>
     <div className="card-sub">{t('settings.coex.windowsHint')}</div>
     <Field label={t('settings.coex.observation')} value={snapshot.observation} t={t} show={(v) => <>{t('settings.coex.elapsed')}: {v.elapsedMillis} · {t('settings.coex.atomic')}: {t('settings.coex.false')}</>} />
     <Field label={t('settings.coex.cleanup')} value={snapshot.commandCleanup} t={t} show={() => null} />

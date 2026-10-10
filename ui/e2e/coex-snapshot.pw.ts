@@ -122,3 +122,32 @@ test('equal-revision late get response cannot overwrite a committed terminal eve
   await expect(card(page)).not.toContainText(en.settings.coex.latest);
   await expect(card(page).getByRole('alert')).toHaveCount(0);
 });
+
+test('bottom Windows source reveals committed content in its actual scroll container', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 480 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await reply(page, 'windowsUnavailable');
+  const source = card(page).locator('[data-coex-source="ras"]');
+  await expect(source).toBeVisible();
+  await source.evaluate(element => element.scrollIntoView({ block: 'end' }));
+  const measure = () => source.evaluate(element => {
+    let scroller = element.parentElement;
+    while (scroller && !(['auto', 'scroll'].includes(getComputedStyle(scroller).overflowY) && scroller.scrollHeight > scroller.clientHeight)) scroller = scroller.parentElement;
+    if (!scroller) throw new Error('actual Windows source has no scrollable ancestor');
+    const container = scroller.getBoundingClientRect();
+    const content = element.getBoundingClientRect();
+    return { top: content.top, bottom: content.bottom, containerTop: container.top, containerBottom: container.bottom, fields: element.querySelectorAll(':scope > .card-sub').length };
+  });
+  const before = await measure();
+  expect(before.fields).toBe(0);
+  expect(before.top).toBeGreaterThan(before.containerTop + 100);
+  expect(before.bottom).toBeGreaterThan(before.containerBottom - 45);
+  expect(before.bottom).toBeLessThanOrEqual(before.containerBottom + 1);
+  await source.locator(':scope > summary').click();
+  await expect.poll(async () => (await measure()).fields).toBe(4);
+  await expect.poll(async () => {
+    const rect = await measure();
+    return rect.bottom <= rect.containerBottom + 1 && rect.top >= rect.containerTop - 1;
+  }).toBe(true);
+  expect((await commands(page)).map(c => c.command)).toEqual(['coex_runtime_get_state']);
+});

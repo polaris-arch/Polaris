@@ -22,7 +22,7 @@
     "sourceSha256": {
       "crates/system-integration/src/coexistence/windows.rs": "d0b56f3887a013683359c19d174a530782a32b188c4975db57fec41248aa7a90",
       "crates/system-integration/src/windows_coex.rs": "298e57dbc1eb4509ee2d3ab7834fce47754741150a7d990923032ad30de4e19e",
-      "crates/system-integration/src/windows_coex/native.rs": "deb8f42df1d93e9c7e31ee966495e68c6f172b28678b3e1bc915a7bce88f1c5b",
+      "crates/system-integration/src/windows_coex/native.rs": "37850b2f44441d42a72eafb2ce2d69da20914f6f12fc03393efebe021caf3d6e",
       "src-tauri/src/commands/coexistence_snapshot.rs": "8415766265c51972da7aac5cc38fd17811703c64dd2fe9f8e439955752455a4b"
     }
   },

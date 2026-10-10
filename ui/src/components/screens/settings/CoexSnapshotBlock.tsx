@@ -6,6 +6,7 @@ import { api } from '@/ipc';
 import { CoexSnapshotDecodeError, type CoexSnapshot, type Fact } from '@/contracts/coex-snapshot';
 import { SetBlock } from './Primitives';
 import { CoexWindowsSources } from './CoexWindowsSources';
+import { revealOnToggle } from '@/components/reveal';
 
 type Text = (key: string) => string;
 type Pages = { addresses: number; routes: number; policyRules: number };
@@ -27,7 +28,7 @@ export function renderCoexFacts(
       <b>{label}: </b>
       {value.status === 'known' ? show(value.value) : <>
         <span>{t('settings.coex.unknown')}</span>
-        <details><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
+        <details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{value.reason}</span></details>
       </>}
     </div>
   );
@@ -65,7 +66,7 @@ export function renderCoexFacts(
     {fact(t('settings.coex.interfaces'), snapshot.objects, (objects) => <>
       <span>{t('settings.coex.total')}: {objects.length}</span>
       {objects.length === 0 && <div>{t('settings.coex.observedEmpty')}</div>}
-      {objects.map((object, index) => <details key={index} open={expanded === index} data-coex-interface>
+      {objects.map((object, index) => <details key={index} open={expanded === index} data-coex-interface onToggle={revealOnToggle}>
         <summary onClick={(event) => { event.preventDefault(); select(expanded === index ? null : index); }}>
           <span className="mono">{object.interface}</span>
         </summary>
@@ -181,10 +182,10 @@ export function CoexSnapshotBlock() {
         {state && state.activity !== 'idle' ? ` · ${t('settings.coex.busy')}` : null}
         {state?.pending.status === 'known' ? ` · ${t('settings.coex.queued')}` : null}
       </div>
-      {state?.reason.status === 'known' && state.freshness !== 'latest' && <details className="card-sub"><summary>{t('settings.coex.reason')}</summary>{t(`settings.coex.runtimeReasons.${state.reason.value.code}`)}</details>}
+      {state?.reason.status === 'known' && state.freshness !== 'latest' && <details className="card-sub" onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary>{t(`settings.coex.runtimeReasons.${state.reason.value.code}`)}</details>}
       {error && <div className="card-sub" role="alert">
         {error.malformed ? t('settings.coex.malformed') : t('settings.coex.failed')}
-        <details><summary>{t('settings.coex.reason')}</summary><span className="mono">{error.detail}</span></details>
+        <details onToggle={revealOnToggle}><summary>{t('settings.coex.reason')}</summary><span className="mono">{error.detail}</span></details>
       </div>}
       {snapshot && renderCoexFacts(snapshot, (key) => t(key), expanded, pages,
         (index) => { setExpanded(index); setPages(FIRST_PAGES); },

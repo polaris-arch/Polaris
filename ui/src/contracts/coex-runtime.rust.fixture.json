@@ -96,7 +96,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791663320120",
+            "endedAtUnixMillis": "1791666291717",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -117,7 +117,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791663320120"
+            "startedAtUnixMillis": "1791666291717"
           },
           "reportRevision": "7",
           "snapshot": {
@@ -229,7 +229,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791663320120",
+            "endedAtUnixMillis": "1791666291717",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -250,7 +250,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791663320120"
+            "startedAtUnixMillis": "1791666291717"
           },
           "reportRevision": "7",
           "snapshot": {
@@ -394,7 +394,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791663320123",
+            "endedAtUnixMillis": "1791666291720",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -415,7 +415,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791663320122"
+            "startedAtUnixMillis": "1791666291720"
           },
           "reportRevision": "5",
           "snapshot": {
@@ -614,7 +614,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791663320123",
+            "endedAtUnixMillis": "1791666291722",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -635,7 +635,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791663320123"
+            "startedAtUnixMillis": "1791666291722"
           },
           "reportRevision": "5",
           "snapshot": {
@@ -782,7 +782,7 @@
     "base": "9e3e4a92b484c2c7ae7baeee35791160fccb816e",
     "sourceSha256": {
       "src-tauri/src/runtime/proxy/coex_observer.rs": "fcb6b5da4966184b0f5f9b5065f1d09a453446f95a77b9c50bfb329965b05ca1",
-      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "14872b380301b68f76d94cca8f26a5eb56baafaa67811c6f0012ecfc2a876693",
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "2d7b11267c033301be5b11c53f2a684e70dc7e2a544c01130b09d5a03b4b112e",
       "src-tauri/src/runtime/proxy.rs": "a5ef608728b2c6bdf6831f4f5b8672d49a8ddf84ce69e731d54e2f602064ef1c",
       "src-tauri/src/runtime/proxy/lifecycle.rs": "c7f2777ac3713c4bcb3cb8aa20b373f3af547709ae063d0bc57a57b2f8fe75d5",
       "src-tauri/src/runtime/proxy/startup.rs": "02986ed718dc197f55bc31888ef5a56173dc280dfb2ecfe4efe34509ef523139",

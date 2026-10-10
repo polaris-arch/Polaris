@@ -157,6 +157,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     { file: 'ui/src/mobile/settings/MobileSettings.test.tsx', mustContain: '⑩ 写失败必须可见' },
   ],
   actions: [
+    { id: 'CoexWindowsSources.tsx|k:settings.coex.displayed+settings.coex.next+settings.coex.observedEmpty+settings.coex.previous+settings.coex.rows+settings.coex.total', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 来源行与分页总览；当前移动端 provider 返回 unavailable/Unknown，未挂载桌面来源 UI，不是永久 OS 能力结论。' },
     { id: 'CoexWindowsSources.tsx|k:settings.coex.previous', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
     { id: 'CoexWindowsSources.tsx|k:settings.coex.next', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
 
@@ -1004,6 +1005,39 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     },
     /* ── 桌面「多 VPN 兼容」批（2026-09-12 合入 main）新加的两块只读报告 ───────────── */
     {
+      id: 'CoexWindowsSources',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 五来源只读报告壳；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
+      id: 'Field',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 来源局部事实/Unknown 原因行；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
+      id: 'Source',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 单来源展开与分页块；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
       id: 'CoexSnapshotBlock',
       disposition: {
         kind: 'platform-absent',
@@ -1075,10 +1109,12 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   ],
 
   /**
-   * 桌面设置屏的具名数据槽基线（69 个）。**变更探测器，不是对差面**。
+   * 桌面设置屏的具名数据槽基线（74 个）。**变更探测器，不是对差面**。
    * 桌面加一行带 id 的设置槽 ⇒ 这条不等 ⇒ 红 ⇒ 逼一次「移动端要不要有」的显式决定。
    */
   slotBaseline: [
+    // Windows 五来源槽与上面 Source/Field 的当前 provider 缺席登记同属一批。
+    'adapters', 'addresses', 'ras', 'routes4', 'routes6',
     'app-update-card', 'auto-dl-swt', 'backup-block', 'backup-master',
     'browser-doh-list', 'browser-doh-swt', 'bypass-lan-swt', 'cidr-bypass-off-note', 'cidr-list',
     'control-port-input', 'core-info-card', 'disable-log-file-swt', 'dns-bootstrap-row',
