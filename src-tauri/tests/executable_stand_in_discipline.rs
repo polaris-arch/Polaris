@@ -55,7 +55,7 @@ enum Kind {
 }
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
-const REGISTERED: [(&str, Kind, usize, &str); 23] = [
+const REGISTERED: [(&str, Kind, usize, &str); 26] = [
     (
         HELPER_FILE,
         Kind::ExecBit,
@@ -155,14 +155,32 @@ const REGISTERED: [(&str, Kind, usize, &str); 23] = [
     (
         "src-tauri/src/runtime/proxy/tests/process_supervision.rs",
         Kind::Copy,
-        1,
-        "非 unix 腿：那里没有 fork 继承写句柄，unix 腿走共用办法",
+        2,
+        "两处均为非 unix 腿：无 fork 继承写句柄；Unix 的本 app/异路径副本均走共用办法",
     ),
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",
         Kind::Shebang,
+        2,
+        "两项分别只验路径解析/可执行权限，均不启动该文件；权限用例只读取元数据",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tests/startup.rs",
+        Kind::ExecBit,
         1,
-        "只验路径解析，文件没有执行位、从不执行",
+        "只切换 755/700/544 验 ensure_core_executable 的元数据判据，从不执行该文件",
+    ),
+    (
+        "crates/core-supervisor/tests/windows_process.rs",
+        Kind::Copy,
+        1,
+        "整文件 cfg(windows)：复制 argv_probe 以验证真实命令行，仅 Windows 执行，无 Unix fork 写句柄继承",
+    ),
+    (
+        "crates/windows-cleaner/src/windows/tests/mod.rs",
+        Kind::Copy,
+        1,
+        "Windows SEC_IMAGE 夹具：当前 PE 副本仅创建/映射 image section，从不启动或执行映像代码",
     ),
     (
         "src-tauri/src/runtime/speedtest/tests/mod.rs",

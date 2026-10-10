@@ -185,9 +185,17 @@ fn auto_download_skips_assets_that_could_never_be_installed_here() {
         None
     )
     .is_ok());
-    // Windows 便携版：便携压缩包可交付（手动覆盖那条腿）⇒ 会后台下载；安装器装不到便携目录
-    // ⇒ 不下。
+    // Windows 便携版只认发布侧固定命名（手动覆盖那条腿）；带 portable 的任意 ZIP 不会被猜成资产。
+    // 安装器装不到便携目录 ⇒ 不下。
     let portable = std::path::Path::new("D:\\Tools\\Polaris\\polaris.exe");
+    assert!(auto_download_applicable(
+        "windows",
+        "Polaris_1.2.3_x64-win-Portable.zip",
+        portable,
+        None,
+        Some(portable)
+    )
+    .is_ok());
     assert!(auto_download_applicable(
         "windows",
         "polaris-portable-1.2.3.zip",
@@ -195,7 +203,7 @@ fn auto_download_skips_assets_that_could_never_be_installed_here() {
         None,
         Some(portable)
     )
-    .is_ok());
+    .is_err());
     assert!(auto_download_applicable(
         "windows",
         "Polaris-Setup-1.2.3.exe",

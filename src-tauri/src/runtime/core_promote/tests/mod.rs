@@ -537,7 +537,7 @@ fn core_binary_attestation_surfaces_via_nonfatal_error_channel() {
              只打日志等于用户看不到"
     );
     assert!(
-        body.contains("attestation_disposition(&attestation, via_helper)"),
+        body.contains("match attestation_disposition(&attestation)"),
         "处置必须走 attestation_disposition（它以 CoreBinaryAttestation::is_alarm 为告警的单一真值，\
              见 `attestation_disposition_keeps_is_alarm_as_the_alarm_truth`），别在此处另写一套分支"
     );

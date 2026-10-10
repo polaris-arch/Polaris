@@ -160,6 +160,24 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
     (
+        "crates/helper-client/src/manager.rs",
+        "if self.platform == Platform::Win",
+        1,
+        "只有 Windows 卸载走固定 native cleaner；Android/iOS/Other 不进此臂，runtime supported 已拒绝其桌面 helper 路径；未来平台不会借 Windows 提权清扫。",
+    ),
+    (
+        "crates/helper-client/src/manager.rs",
+        "#[cfg(not(windows))] return Err(ManagerError::UnsupportedPlatform(Platform::Win))",
+        1,
+        "这是错误载荷的固定平台标签：非 Windows 编译目标不得执行 Windows cleaner；未来平台同样显式 Unsupported，不能获得 Windows 清扫能力。",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Win) && code == 3",
+        1,
+        "只有 Windows cleaner exit 3 表达 partial；Android/iOS/Other 与未来平台不进此臂，保留各自失败分类，无桌面 helper 支持者仍被 supported 拒绝。",
+    ),
+    (
         "crates/helper/src/platform/windows/mod.rs",
         "pub const PLATFORM: polaris_helper_proto::Platform = polaris_helper_proto::Platform::Win",
         1,
@@ -1422,6 +1440,12 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    (
+        "src-tauri/src/runtime/uninstall.rs",
+        "if self.os != \"windows\" && !self.helper.installed()",
+        1,
+        "缺服务仍需清扫仅适用于 Windows 固定 native cleaner；其它系统未安装 helper 时 skip，Android/iOS/未知平台在此前 supported 判据明确 Unsupported，不能借此删除目录。",
+    ),
     (
         "crates/updater/src/github.rs",
         "\"windows\" => Some(Self::Windows), \"macos\" => Some(Self::Macos), \"linux\" => Some(Self::Linux), \"android\" => Some(Self::Android), _ => None,",

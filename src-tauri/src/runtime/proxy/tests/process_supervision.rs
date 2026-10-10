@@ -1523,7 +1523,13 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     let core_home = dir.join("orphan-core");
     std::fs::create_dir_all(&core_home).expect("建孤儿核目录");
     let core = core_home.join(core_filename);
-    std::fs::copy(&real_core, &core).expect("复制核（std::fs::copy 保留可执行位）");
+    #[cfg(unix)]
+    crate::test_support::write_executable_stand_in(
+        &core,
+        std::fs::read(&real_core).expect("读出核以复制到孤儿路径"),
+    );
+    #[cfg(not(unix))]
+    std::fs::copy(&real_core, &core).expect("复制核（非 Unix 无 fork 写句柄继承）");
     assert!(core.is_absolute(), "判据要求程序是绝对路径");
 
     // ── 孤儿①（本 app）：直接 spawn，不经 ProxyRuntime → 成孤儿 ──
