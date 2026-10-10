@@ -1408,7 +1408,8 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
     const at = WIRING_RAW.indexOf('const onPickSentinel');
     const body = WIRING_RAW.slice(at, WIRING_RAW.indexOf('const onSetRouting', at));
     expect(body).toContain("if (kind === 'block' && blockDisabledReason !== null) return");
-    expect(body).toContain('if (id === selectedServerId)');
+    expect(body).toContain('const config = useAppStore.getState().config;');
+    expect(body).toContain('if (config && config.selectionIntent === undefined && id === config.selectedServerId)');
     expect(body).toContain('switchServer(id)');
     expect(body).toContain("kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock'");
     expect(body).not.toContain('update({ selectedServerId: id })');
