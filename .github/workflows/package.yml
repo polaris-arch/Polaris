@@ -198,8 +198,8 @@ jobs:
           all='[
             {"os":"ubuntu-22.04","rust_target":"x86_64-unknown-linux-gnu","label":"linux","tauri_args":"--config src-tauri/tauri.linux.conf.json"},
             {"os":"windows-2022","rust_target":"x86_64-pc-windows-msvc","label":"windows","tauri_args":"--config src-tauri/tauri.windows.conf.json"},
-            {"os":"macos-14","rust_target":"aarch64-apple-darwin","label":"macos-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
-            {"os":"macos-14","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
+            {"os":"macos-14","rust_target":"aarch64-apple-darwin","label":"macos-arm64","mac_arch_tag":"mac-arm64","tauri_args":"--target aarch64-apple-darwin --config src-tauri/tauri.macos-arm64.conf.json"},
+            {"os":"macos-14","rust_target":"x86_64-apple-darwin","rust_targets_extra":"x86_64-apple-darwin","label":"macos-x64","mac_arch_tag":"mac-x64","tauri_args":"--target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json"}
           ]'
           # 注：linux/windows/macos-arm64 三条**不带** rust_targets_extra 键，与原 YAML 逐字对齐 ——
           # 引用一个不存在的 matrix 键得到空串，和原来一样（rust-toolchain 的 targets: '' = 不装额外 target）。
