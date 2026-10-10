@@ -200,10 +200,10 @@ def core_probe(core, library, key, expected_sha):
 
 
 def observe_unsigned_windows(path):
-    code = r'''$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $args[0];
-if ($s.Status -ne 'NotSigned') { throw "expected explicit unsigned distribution state: $($s.Status)" }
-@{status=$s.Status.ToString(); signerThumbprint=$null} | ConvertTo-Json -Compress'''
-    return json.loads(subprocess.check_output(['pwsh', '-NoProfile', '-NonInteractive', '-Command', code, str(path)], timeout=30))
+    # Fixed source file and argv transport: a payload path is never shell source.
+    script = Path(__file__).with_name('observe-unsigned-windows.ps1')
+    return json.loads(subprocess.check_output(['pwsh', '-NoProfile', '-NonInteractive',
+                      '-File', str(script), '-Path', str(path)], timeout=30))
 
 
 def prove(root, key, core, library):

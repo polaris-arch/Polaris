@@ -165,6 +165,9 @@ jobs:
     name: four native source producers
     needs: classify
     if: needs.classify.outputs.preflight == 'true' || needs.classify.outputs.native_validation == 'true'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/desktop-core.yml
     with:
       candidate: ${{ needs.classify.outputs.candidate }}
@@ -176,6 +179,7 @@ jobs:
     if: needs.classify.outputs.native_validation == 'true'
     permissions:
       contents: write # reusable publishing DAG declaration; branch guard keeps it unreachable
+      actions: read # ceiling for nested desktop-core assembler; no new write grant
     uses: ./.github/workflows/package.yml
     with:
       platforms: '["linux","windows"]'
@@ -295,6 +299,7 @@ jobs:
     # 权限只给这一个复用 job；被调 workflow 的构建 job 仍由其顶层 permissions 收窄为 contents: read。
     permissions:
       contents: write
+      actions: read
     uses: ./.github/workflows/package.yml
     with:
       platforms: ${{ needs.classify.outputs.platforms }}

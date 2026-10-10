@@ -116,6 +116,9 @@ jobs:
   assemble:
     name: verify four source artifacts
     needs: produce
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-22.04
     outputs:
       artifact_name: ${{ steps.bundle.outputs.artifact_name }}

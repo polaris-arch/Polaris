@@ -6,6 +6,7 @@ import stat
 import struct
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -29,6 +30,41 @@ ENV = {'POLARIS_NATIVE_PAYLOAD_VALIDATION': '1', 'GITHUB_ACTIONS': 'true', 'GITH
 
 
 class NativeContract(unittest.TestCase):
+    def test_signature_uses_fixed_file_and_literal_path_argv(self):
+        path = r'C:\inert payload with spaces\unsigned payload.exe'
+        with patch.object(native.subprocess, 'check_output', return_value=b'{"status":"NotSigned","signerThumbprint":null}') as call:
+            self.assertEqual(native.observe_unsigned_windows(path)['status'], 'NotSigned')
+            args = call.call_args.args[0]
+            self.assertEqual(args, ['pwsh', '-NoProfile', '-NonInteractive', '-File',
+                str(ROOT / 'scripts/observe-unsigned-windows.ps1'), '-Path', path])
+            self.assertNotIn('-Command', args)
+        script = (ROOT / 'scripts/observe-unsigned-windows.ps1').read_text()
+        self.assertIn('[string]$Path', script)
+        self.assertIn('Get-AuthenticodeSignature -LiteralPath $Path', script)
+        self.assertNotIn('$args', script)
+
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('pwsh'), 'native PowerShell inert PE path proof requires Windows')
+    def test_native_powershell_reads_inert_unsigned_pe_with_spaces(self):
+        # A valid PE header with no entry point/code. Never execute or load it.
+        data = bytearray(1024); data[:2] = b'MZ'; struct.pack_into('<I', data, 0x3c, 0x80)
+        data[0x80:0x84] = b'PE\0\0'
+        struct.pack_into('<HHIIIHH', data, 0x84, 0x8664, 1, 0, 0, 0, 240, 0x22)
+        opt = 0x98; struct.pack_into('<H', data, opt, 0x20b)
+        struct.pack_into('<Q', data, opt + 24, 0x140000000)
+        struct.pack_into('<II', data, opt + 32, 4096, 512)
+        struct.pack_into('<II', data, opt + 56, 8192, 512)
+        struct.pack_into('<HH', data, opt + 68, 3, 0x140)
+        struct.pack_into('<I', data, opt + 108, 16)
+        sec = opt + 240; data[sec:sec + 8] = b'.text\0\0\0'
+        struct.pack_into('<IIII', data, sec + 8, 1, 4096, 512, 512)
+        struct.pack_into('<I', data, sec + 36, 0x60000020)
+        with tempfile.TemporaryDirectory(prefix='polaris inert PE with spaces ') as tmp:
+            path = Path(tmp) / 'unsigned inert payload.exe'; path.write_bytes(data)
+            before = native.sha(path)
+            observed = native.observe_unsigned_windows(path)
+            self.assertEqual(observed, {'status': 'NotSigned', 'signerThumbprint': None})
+            self.assertEqual(native.sha(path), before)
+
     def test_exact_native_ci_contract(self):
         for key, system in [('linux', 'Linux'), ('win', 'Windows')]:
             self.assertEqual(native.ci_context(key, ENV, system, 'AMD64')['candidate'], 'c' * 40)
@@ -93,6 +129,14 @@ class NativeContract(unittest.TestCase):
             root = Path(tmp)
             for index, members in enumerate([
                 [('..//escaped', b'x')], [('C:/absolute', b'x')], [('x\\bad', b'x')],
+                [('./polaris.exe', b'first'), ('polaris.exe', b'second')],
+                [('resources//win/sing-box.exe', b'first'), ('resources/win/sing-box.exe', b'second')],
+                [('polaris.exe.', b'first'), ('polaris.exe', b'second')],
+                [('polaris.exe ', b'first'), ('polaris.exe', b'second')],
+                [('resources./win/sing-box.exe', b'first')], [('resources /win/sing-box.exe', b'first')],
+                [('resources', b'file'), ('resources/win/libcronet.dll', b'library')],
+                [('CON.exe', b'device')], [('x/NUL', b'device')],
+                [('e\u0301.dll', b'non-NFC')],
                 [('polaris.exe', b'x'), ('POLARIS.EXE', b'y')], [('link', b'target', stat.S_IFLNK | 0o777)],
             ]):
                 archive = root / f'{index}.zip'; dest = root / f'dest{index}'; dest.mkdir()
@@ -103,6 +147,13 @@ class NativeContract(unittest.TestCase):
                         z.writestr(info, content)
                 with self.assertRaises(ValueError): final.extract_zip(archive, dest)
                 self.assertEqual(list(dest.iterdir()), [])
+
+    def test_windows_zip_normalized_keys_and_directory_aliases(self):
+        self.assertEqual(final.windows_zip_key('Resources/Win/CORE.exe', False), 'resources/win/core.exe')
+        self.assertEqual(final.windows_zip_key('resources/win/', True), 'resources/win')
+        for name in ['./polaris.exe', 'resources//win/core.exe', 'polaris.exe.', 'polaris.exe ',
+                     'resources /core.exe', 'file:stream', 'CON.exe', 'LPT1.txt', 'COM¹.exe', 'a/../b']:
+            with self.subTest(name=name), self.assertRaises(ValueError): final.windows_zip_key(name, False)
 
     def test_final_zip_opens_members_and_requires_marker_and_licenses(self):
         with tempfile.TemporaryDirectory() as tmp:

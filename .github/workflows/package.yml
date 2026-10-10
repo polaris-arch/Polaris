@@ -310,6 +310,9 @@ jobs:
     name: four native source producers
     needs: setup
     if: inputs.core_bundle_artifact == ''
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/desktop-core.yml
     with:
       candidate: ${{ needs.setup.outputs.candidate }}

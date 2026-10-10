@@ -8,6 +8,8 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 import struct
+import re
+import unicodedata
 import subprocess
 import tempfile
 import zipfile
@@ -30,18 +32,39 @@ def payload_files(directory, key):
     return core, lib
 
 
+def windows_zip_key(name, is_directory):
+    # ZIP paths are canonical POSIX names, then compared with Windows aliases.
+    # Reject first: extractall otherwise normalizes dot/repeated separators and
+    # Windows trims trailing dots/spaces, allowing overwrite before counting.
+    require(isinstance(name, str) and name and '\\' not in name and ':' not in name
+            and not name.startswith('/'), 'unsafe ZIP member')
+    path = name[:-1] if is_directory and name.endswith('/') else name
+    parts = path.split('/')
+    require(parts and all(part and part not in ['.', '..'] for part in parts)
+            and name == '/'.join(parts) + ('/' if is_directory else ''), 'non-canonical ZIP path')
+    for part in parts:
+        require(part == part.rstrip(' .') and not any(ord(c) < 32 for c in part)
+                and not any(c in '<>"|?*' for c in part)
+                and unicodedata.normalize('NFC', part) == part, 'Windows ZIP path alias')
+        base = part.split('.', 1)[0].upper()
+        require(not re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])', base), 'Windows ZIP device name')
+    return '/'.join(part.casefold() for part in parts)
+
+
 def extract_zip(archive, destination):
     with zipfile.ZipFile(archive) as z:
-        names = set()
+        members = {}; implied_directories = set()
         for member in z.infolist():
-            name = member.filename
-            p = PurePosixPath(name)
             mode = member.external_attr >> 16
-            require(name not in names and not p.is_absolute() and '..' not in p.parts
-                    and '\\' not in name and ':' not in name and not stat.S_ISLNK(mode), 'unsafe ZIP member')
-            names.add(name)
-        # Windows rejects canonical-name aliases before extraction.
-        require(len({name.lower() for name in names}) == len(names), 'ZIP case alias collision')
+            require(not stat.S_ISLNK(mode), 'unsafe ZIP symlink')
+            # orig_filename retains an embedded NUL that ZipInfo.filename trims.
+            require(member.orig_filename == member.filename and '\0' not in member.orig_filename, 'ZIP NUL name')
+            key = windows_zip_key(member.filename, member.is_dir())
+            require(key not in members, 'ZIP normalized alias collision')
+            members[key] = member.is_dir()
+            implied_directories.update('/'.join(key.split('/')[:i]) for i in range(1, len(key.split('/'))))
+        require(all(members.get(key, True) for key in implied_directories), 'ZIP file/directory alias collision')
+        # All path and collision checks finish before the first member is written.
         z.extractall(destination)
     require((destination / 'portable.marker').is_file() and (destination / 'polaris.exe').is_file(), 'final ZIP marker/app missing')
     for name in ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']:
