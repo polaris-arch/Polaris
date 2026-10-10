@@ -31,7 +31,7 @@ function reader(bytes) {
     range(at, end - at);
     const zero = bytes.indexOf(0, at);
     demand(zero >= at && zero < end, 'unterminated binary string');
-    const value = bytes.subarray(at, zero).toString('ascii');
+    const value = bytes.subarray(at, zero).toString('latin1');
     demand(value.length > 0 && /^[\x21-\x7e]+$/.test(value), 'invalid binary string');
     return value;
   };
@@ -43,6 +43,26 @@ function inspectElf(bytes) {
   r.range(0, 64);
   demand(bytes.subarray(0, 4).equals(Buffer.from([0x7f, 69, 76, 70])) && bytes[4] === 2 && bytes[5] === 1
     && bytes[6] === 1 && r.u32(20) === 1 && r.u16(16) === 3 && r.u16(18) === 62, 'expected ELF64 little-endian x86-64 shared library');
+  const programOffset = r.u64(32), programCount = r.u16(56);
+  demand(r.u16(54) === 56 && programCount > 0, 'missing ELF program headers');
+  r.range(programOffset, programCount * 56);
+  const programs = Array.from({ length: programCount }, (_, i) => {
+    const at = programOffset + i * 56;
+    const program = { type: r.u32(at), flags: r.u32(at + 4), offset: r.u64(at + 8), address: r.u64(at + 16), size: r.u64(at + 32), memorySize: r.u64(at + 40) };
+    r.range(program.offset, program.size); demand(program.memorySize >= program.size, 'ELF segment memory smaller than file');
+    return program;
+  });
+  const loads = programs.filter((p) => p.type === 1);
+  demand(loads.length > 0, 'missing ELF PT_LOAD');
+  const mappedFile = (address, length, executable = false) => {
+    const found = loads.filter((p) => address >= p.address && address - p.address <= p.size - length);
+    demand(found.length === 1 && (!executable || (found[0].flags & 1)), 'ELF address lacks unique file-backed executable/load mapping');
+    const at = found[0].offset + address - found[0].address; r.range(at, length); return at;
+  };
+  const dynamicPrograms = programs.filter((p) => p.type === 2);
+  demand(dynamicPrograms.length === 1, 'expected one ELF PT_DYNAMIC');
+  const loaderDynamic = dynamicPrograms[0];
+  demand(mappedFile(loaderDynamic.address, loaderDynamic.size) === loaderDynamic.offset, 'PT_DYNAMIC disagrees with PT_LOAD mapping');
   const offset = r.u64(40), count = r.u16(60);
   demand(r.u16(58) === 64 && count > 0, 'missing ELF section table');
   r.range(offset, count * 64);
@@ -61,23 +81,34 @@ function inspectElf(bytes) {
   };
   const dynamic = one(6), dynString = strings(dynamic);
   demand(dynamic.entrySize === 16 && dynamic.size % 16 === 0, 'malformed ELF dynamic table');
+  demand(dynamic.offset === loaderDynamic.offset && dynamic.address === loaderDynamic.address && dynamic.size === loaderDynamic.size, 'section dynamic table differs from loader PT_DYNAMIC');
+  const bindings = new Map();
   const dependencies = []; let terminated = false;
-  for (let at = dynamic.offset; at < dynamic.offset + dynamic.size; at += 16) {
+  for (let at = loaderDynamic.offset; at < dynamic.offset + dynamic.size; at += 16) {
     const tag = r.u64(at), value = r.u64(at + 8);
     if (tag === 0) { terminated = true; break; }
     if (tag === 1) dependencies.push(dynString(value));
+    if ([5, 6, 10, 11].includes(tag)) { demand(!bindings.has(tag), 'duplicate ELF loader table binding'); bindings.set(tag, value); }
     demand(tag !== 15 && tag !== 29, 'RPATH/RUNPATH transform not permitted by canonical-byte policy');
   }
   demand(terminated, 'unterminated ELF dynamic table');
   const sym = one(11), symString = strings(sym);
   demand(sym.entrySize === 24 && sym.size % 24 === 0, 'malformed ELF dynsym');
+  const str = sections[dynamic.link];
+  demand(sym.link === dynamic.link && bindings.get(5) === str.address && bindings.get(10) === str.size
+    && mappedFile(str.address, str.size) === str.offset, 'DT_STRTAB/STRSZ differs from section string table');
+  demand(bindings.get(6) === sym.address && bindings.get(11) === sym.entrySize
+    && mappedFile(sym.address, sym.size) === sym.offset, 'DT_SYMTAB/SYMENT differs from section symbol table');
   const exports = new Set();
   for (let at = sym.offset; at < sym.offset + sym.size; at += 24) {
     const name = r.u32(at), info = bytes[at + 4], visibility = bytes[at + 5] & 3, index = r.u16(at + 6);
     const section = sections[index], address = r.u64(at + 8);
     if (name && (info >> 4 === 1 || info >> 4 === 2) && (info & 15) === 2 && (visibility === 0 || visibility === 3)
         && index !== 0 && section && section.type !== 8 && (section.flags & 4)
-        && address >= section.address && address < section.address + section.size) exports.add(symString(name));
+        && address >= section.address && address < section.address + section.size) {
+      demand(mappedFile(address, 1, true) === section.offset + address - section.address, 'symbol section differs from executable PT_LOAD');
+      exports.add(symString(name));
+    }
   }
   return { format: 'ELF64', architecture: 'amd64', dependencies, exports };
 }
@@ -85,9 +116,9 @@ function inspectElf(bytes) {
 function inspectPe(bytes) {
   const r = reader(bytes);
   r.range(0, 64);
-  demand(bytes.toString('ascii', 0, 2) === 'MZ', 'expected DOS/PE header');
+  demand(bytes.subarray(0, 2).equals(Buffer.from([0x4d, 0x5a])), 'expected DOS/PE header');
   const pe = r.u32(60); r.range(pe, 24);
-  demand(bytes.toString('ascii', pe, pe + 4) === 'PE\0\0' && r.u16(pe + 4) === 0x8664
+  demand(bytes.subarray(pe, pe + 4).equals(Buffer.from([0x50, 0x45, 0, 0])) && r.u16(pe + 4) === 0x8664
     && (r.u16(pe + 22) & 0x2000), 'expected PE AMD64 DLL');
   const optional = pe + 24, size = r.u16(pe + 20), count = r.u16(pe + 6);
   r.range(optional, size);
@@ -114,8 +145,10 @@ function inspectPe(bytes) {
   const nameTable = locate(r.u32(exp + 32), names * 4).at;
   const ordinals = locate(r.u32(exp + 36), names * 2).at;
   const exports = new Set();
+  let previousName = null;
   for (let i = 0; i < names; i++) {
     const name = string(r.u32(nameTable + i * 4)), ordinal = r.u16(ordinals + i * 2);
+    demand(previousName === null || previousName < name, 'PE export name table is not strictly sorted'); previousName = name;
     demand(ordinal < functions, 'PE export ordinal outside table');
     const address = r.u32(addresses + ordinal * 4);
     if (address && !(address >= expAddress && address < expAddress + expSize) && locate(address).section.executable) exports.add(name);

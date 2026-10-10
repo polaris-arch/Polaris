@@ -9,11 +9,13 @@ import { CRONET_REQUIRED_EXPORTS, inspectCronetBytes, verifyCronetPayload } from
 
 // Inert, structured file fixtures shared by the CLI/SquashFS tests. Never executed.
 export function cronetFixture(platform, options = {}) {
-  const names = CRONET_REQUIRED_EXPORTS.filter((name) => name !== options.missingExport);
+  const names = CRONET_REQUIRED_EXPORTS.filter((name) => name !== options.missingExport).sort();
+  if (options.unsortedNames) [names[0], names[1]] = [names[1], names[0]];
   const bytes = Buffer.alloc(platform === 'linux' ? 0xc00 : 0x1400);
   if (platform === 'linux') {
     bytes.set([0x7f, 69, 76, 70, 2, 1, 1]);
     bytes.writeUInt16LE(3, 16); bytes.writeUInt16LE(options.machine ?? 62, 18); bytes.writeUInt32LE(1, 20);
+    bytes.writeBigUInt64LE(64n, 32); bytes.writeUInt16LE(56, 54); bytes.writeUInt16LE(3, 56);
     bytes.writeBigUInt64LE(0xa00n, 40); bytes.writeUInt16LE(64, 52); bytes.writeUInt16LE(64, 58); bytes.writeUInt16LE(6, 60);
     let str = 0x301;
     const strings = [options.dependency ?? 'libc.so.6', ...names];
@@ -24,10 +26,19 @@ export function cronetFixture(platform, options = {}) {
       bytes.writeBigUInt64LE(BigInt(offset), at + 24); bytes.writeBigUInt64LE(BigInt(size), at + 32); bytes.writeUInt32LE(link, at + 40); bytes.writeBigUInt64LE(BigInt(entry), at + 56);
     };
     section(1, 1, 0x200, 32, { flags: 6, address: 0x1000 });
-    section(2, 3, 0x300, str - 0x300);
-    section(3, 6, 0x900, 32, { link: 2, entry: 16 });
+    section(2, 3, 0x300, str - 0x300, { address: 0x2000 });
+    section(3, 6, 0x900, 96, { link: 2, entry: 16, address: 0x2600 });
     bytes.writeBigUInt64LE(1n, 0x900); bytes.writeBigUInt64LE(BigInt(indices[0]), 0x908);
-    section(4, 11, 0x600, (names.length + 1) * 24, { link: 2, entry: 24 });
+    section(4, 11, 0x600, (names.length + 1) * 24, { link: 2, entry: 24, address: 0x2300 });
+    for (const [i, tag, value] of [[1, 5, 0x2000], [2, 10, str - 0x300], [3, 6, 0x2300], [4, 11, 24]]) {
+      bytes.writeBigUInt64LE(BigInt(tag), 0x900 + i * 16); bytes.writeBigUInt64LE(BigInt(value), 0x908 + i * 16);
+    }
+    const program = (i, type, flags, offset, address, size) => {
+      const at = 64 + i * 56; bytes.writeUInt32LE(type, at); bytes.writeUInt32LE(flags, at + 4);
+      bytes.writeBigUInt64LE(BigInt(offset), at + 8); bytes.writeBigUInt64LE(BigInt(address), at + 16);
+      bytes.writeBigUInt64LE(BigInt(size), at + 32); bytes.writeBigUInt64LE(BigInt(size), at + 40);
+    };
+    program(0, 1, 5, 0x200, 0x1000, 32); program(1, 1, 6, 0x300, 0x2000, 0x660); program(2, 2, 6, 0x900, 0x2600, 96);
     names.forEach((_, i) => {
       const at = 0x600 + (i + 1) * 24;
       bytes.writeUInt32LE(indices[i + 1], at); bytes[at + 4] = options.exportMode === 'data' ? 0x11 : 0x12;
@@ -81,6 +92,37 @@ if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
       ['data/string bait instead of defined function', { exportMode: 'data' }],
       ...(platform === 'linux' ? [['undefined function', { exportMode: 'undefined' }], ['hidden function', { exportMode: 'hidden' }], ['rpath mutation', { rpath: true }]] : [['forwarded export', { exportMode: 'forwarded' }]]),
     ]) test(`${platform}: rejects ${label}`, () => assert.throws(() => inspectCronetBytes(cronetFixture(platform, options), platform)));
+    for (const name of ['Cronet_Engine_Create', platform === 'linux' ? 'libc.so.6' : 'KERNEL32.dll']) {
+      test(`${platform}: rejects high-bit byte alias in ${name}`, () => {
+        const bytes = cronetFixture(platform), at = bytes.indexOf(Buffer.from(name + '\0'));
+        assert.ok(at >= 0); bytes[at] |= 0x80;
+        assert.throws(() => inspectCronetBytes(bytes, platform));
+      });
+    }
+    if (platform === 'win') {
+      for (const at of [0, 1, 0x80, 0x81]) test(`PE rejects high-bit magic alias at ${at}`, () => {
+        const bytes = cronetFixture('win'); bytes[at] |= 0x80;
+        assert.throws(() => inspectCronetBytes(bytes, 'win'));
+      });
+      test('PE rejects unsorted export name table used by loader binary search', () => {
+        assert.throws(() => inspectCronetBytes(cronetFixture('win', { unsortedNames: true }), 'win'));
+      });
+    } else {
+      for (const fault of ['missing program headers', 'missing LOAD', 'non-executable LOAD', 'conflicting PT_DYNAMIC', 'conflicting DT_STRTAB', 'conflicting DT_SYMTAB', 'conflicting DT_STRSZ', 'section-only executable symbol']) {
+        test(`ELF rejects loader/section inconsistency: ${fault}`, () => {
+          const bytes = cronetFixture('linux');
+          if (fault === 'missing program headers') bytes.writeUInt16LE(0, 56);
+          if (fault === 'missing LOAD') { bytes.writeUInt32LE(0, 64); bytes.writeUInt32LE(0, 120); }
+          if (fault === 'non-executable LOAD') bytes.writeUInt32LE(4, 68);
+          if (fault === 'conflicting PT_DYNAMIC') bytes.writeBigUInt64LE(0x910n, 176 + 8);
+          if (fault === 'conflicting DT_STRTAB') bytes.writeBigUInt64LE(0x2001n, 0x918);
+          if (fault === 'conflicting DT_SYMTAB') bytes.writeBigUInt64LE(0x2301n, 0x938);
+          if (fault === 'conflicting DT_STRSZ') bytes.writeBigUInt64LE(1n, 0x928);
+          if (fault === 'section-only executable symbol') { bytes.writeBigUInt64LE(0x3000n, 0xa00 + 64 + 16); for (let i = 1; i <= CRONET_REQUIRED_EXPORTS.length; i++) bytes.writeBigUInt64LE(BigInt(0x3000 + i), 0x600 + i * 24 + 8); }
+          assert.throws(() => inspectCronetBytes(bytes, 'linux'));
+        });
+      }
+    }
     test(`${platform}: truncated/malformed ranges fail closed`, () => {
       const bytes = cronetFixture(platform);
       for (const length of [0, 63, 100, bytes.length / 2]) assert.throws(() => inspectCronetBytes(bytes.subarray(0, length), platform));
