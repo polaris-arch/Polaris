@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 
+import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+
 import { APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
 
 // 判据与修复同源：`appImageRuntimeViolations` 由 postprocess-appimage.mjs 导出、被
@@ -227,6 +229,7 @@ test('CLI repairs both hook layouts and reaches repack only after the runtime co
     mkdirSync(join(root, 'scripts'));
     const script = join(root, 'scripts/postprocess-appimage.mjs');
     copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
+    cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
     // The plugin is a fixture, but its output is a real SquashFS behind a dummy
     // runtime header. The verifier never executes that header or the core.
     const tool = join(root, 'fixture-output-plugin');
@@ -249,7 +252,11 @@ function seedCoreFixture(root, appDir) {
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(source, 'verified-core-seed', { mode: 0o755 });
   writeFileSync(target, 'linuxdeploy-changed-core', { mode: 0o700 });
-  writeFileSync(join(dirname(target), 'libcronet.so'), 'bundled-cronet', { mode: 0o755 });
+  const cronet = cronetFixture('linux');
+  writeFileSync(join(dirname(source), 'libcronet.so'), cronet, { mode: 0o755 });
+  writeFileSync(join(dirname(target), 'libcronet.so'), cronet, { mode: 0o755 });
+  mkdirSync(join(root, 'src-tauri'), { recursive: true });
+  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(fixtureManifest(cronet)));
   return { source, target };
 }
 
@@ -258,7 +265,7 @@ function fixtureOutputPlugin(tamper = false) {
 const fs = require('node:fs');
 const cp = require('node:child_process');
 const dir = process.argv[2].slice('--appdir='.length);
-${tamper ? `fs.writeFileSync(require('node:path').join(dir, ${JSON.stringify(APPIMAGE_CORE_MEMBER)}), 'untrusted-core-xxx');` : ''}
+${tamper === 'cronet' ? `const target = require('node:path').join(dir, ${JSON.stringify(dirname(APPIMAGE_CORE_MEMBER) + '/libcronet.so')}); const bytes = fs.readFileSync(target); bytes[0x210] ^= 1; fs.writeFileSync(target, bytes);` : tamper ? `fs.writeFileSync(require('node:path').join(dir, ${JSON.stringify(APPIMAGE_CORE_MEMBER)}), 'untrusted-core-xxx');` : ''}
 const squash = process.env.LDAI_OUTPUT + '.squashfs';
 cp.execFileSync('mksquashfs', [dir, squash, '-noappend', '-processors', '1', '-no-progress'], {stdio:'ignore'});
 fs.writeFileSync(process.env.LDAI_OUTPUT, Buffer.concat([Buffer.alloc(1024*1024, 7), fs.readFileSync(squash)]));
@@ -333,7 +340,7 @@ for (const fault of ['same-size wrong SHA', 'wrong mode', 'core symlink', 'missi
   });
 }
 
-test('CLI refuses a repacker changing core bytes and leaves the previous artifact intact', (t) => {
+for (const component of ['core', 'cronet']) test(`CLI refuses a repacker changing ${component} bytes and leaves the previous artifact intact`, (t) => {
   const { root, appDir } = coreFixture(t);
   const graphical = makeAppDir({ waylandLibs: [], gioExtra: [], gioModuleDir: [BUNDLED_GIO] });
   t.after(() => rmSync(graphical, { recursive: true, force: true }));
@@ -342,19 +349,20 @@ test('CLI refuses a repacker changing core bytes and leaves the previous artifac
   mkdirSync(join(root, 'scripts'));
   const script = join(root, 'scripts/postprocess-appimage.mjs');
   copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
+  cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
   const artifact = join(root, 'Polaris.AppImage');
   writeFileSync(artifact, 'previous-artifact');
   const tool = join(root, 'fixture-output-plugin');
-  writeFileSync(tool, fixtureOutputPlugin(true), { mode: 0o700 });
+  writeFileSync(tool, fixtureOutputPlugin(component === 'cronet' ? 'cronet' : true), { mode: 0o700 });
   assert.throws(() => execFileSync(process.execPath, [script, '--root', root, '--tool', tool, '--arch', 'x86_64'], { stdio: 'pipe' }), /AppImage 实际成员 SHA\/权限不符/);
   assert.equal(readFileSync(artifact, 'utf8'), 'previous-artifact');
 });
 
-test('Linux payload CLI rejects same-size substituted core bytes in a previously passing bundle', (t) => {
+function linuxPayloadFixture(t) {
   const { root, appDir } = coreFixture(t);
   restoreCoreSeed(appDir, root);
   writeFileSync(join(root, 'resources/linux/polaris-helper'), 'helper');
-  writeFileSync(join(root, 'resources/linux/libcronet.so'), 'bundled-cronet');
+  // The canonical structured Cronet seed and pin were installed by coreFixture.
   copyFileSync(join(root, 'resources/linux/polaris-helper'), join(dirname(join(appDir, APPIMAGE_CORE_MEMBER)), 'polaris-helper'));
   const graphical = makeAppDir({ waylandLibs: [], gioExtra: [], gioModuleDir: [BUNDLED_GIO] });
   t.after(() => rmSync(graphical, { recursive: true, force: true }));
@@ -371,20 +379,75 @@ test('Linux payload CLI rejects same-size substituted core bytes in a previously
   const packedDir = join(bundle, 'appimage/Polaris.AppDir');
   renameSync(appDir, packedDir);
   mkdirSync(join(root, 'scripts'));
-  mkdirSync(join(root, 'src-tauri'));
+  mkdirSync(join(root, 'src-tauri'), { recursive: true });
   for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
   }
   cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
   // verify-packaging.mjs 静态 import `./lib/` 下的判据模块；只拷入口不拷它们，CLI 在模块解析期就退出。
   cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
-  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: { linux: 'fixture' } }));
+  writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ ...fixtureManifest(cronetFixture('linux')), coreArchiveSha256: { linux: 'fixture' } }));
   writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'Polaris' }));
   const args = [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'linux', '--root', bundle];
+  return { root, args, target: join(packedDir, APPIMAGE_CORE_MEMBER) };
+}
+
+test('Linux payload CLI rejects same-size substituted core bytes in a previously passing bundle', (t) => {
+  const { args, target } = linuxPayloadFixture(t);
   execFileSync(process.execPath, args, { stdio: 'pipe' });
-  const target = join(packedDir, APPIMAGE_CORE_MEMBER);
   const beforeSize = statSync(target).size;
   writeFileSync(target, 'untrusted-core-xxx');
   assert.equal(statSync(target).size, beforeSize);
   assert.throws(() => execFileSync(process.execPath, args, { stdio: 'pipe' }), /Linux 随包原核 SHA-256\/权限与源不符/);
 });
+
+for (const fault of ['same-size substitution', 'different size same GNU Build ID', 'wrong source SHA', 'symlink']) {
+  test(`actual Linux AppImage payload CLI rejects Cronet ${fault}`, (t) => {
+    const { root, args, target } = linuxPayloadFixture(t);
+    execFileSync(process.execPath, args, { stdio: 'pipe' });
+    const cronet = join(dirname(target), 'libcronet.so'), source = join(root, 'resources/linux/libcronet.so');
+    const bytes = readFileSync(cronet), changed = Buffer.from(bytes); changed[0x210] ^= 1;
+    if (fault === 'same-size substitution') { writeFileSync(cronet, changed); assert.equal(statSync(cronet).size, bytes.length); }
+    if (fault === 'different size same GNU Build ID') {
+      const id = execFileSync('readelf', ['-n', source], { encoding: 'utf8' }).match(/Build ID: ([a-f0-9]+)/)?.[1];
+      assert.ok(id); writeFileSync(cronet, Buffer.concat([changed, Buffer.from('appended mutation')]));
+      assert.equal(execFileSync('readelf', ['-n', cronet], { encoding: 'utf8' }).match(/Build ID: ([a-f0-9]+)/)?.[1], id);
+      assert.notEqual(statSync(cronet).size, bytes.length);
+    }
+    if (fault === 'wrong source SHA') { writeFileSync(source, changed); writeFileSync(cronet, changed); }
+    if (fault === 'symlink') { rmSync(cronet); symlinkSync(source, cronet); }
+    assert.throws(() => execFileSync(process.execPath, args, { stdio: 'pipe' }), /Cronet source\/final content or static ABI mismatch/);
+  });
+}
+
+test('AppImage restores Cronet from the pinned canonical seed, never trusts linuxdeploy output', (t) => {
+  const { root, appDir, source } = coreFixture(t);
+  const target = join(appDir, dirname(APPIMAGE_CORE_MEMBER), 'libcronet.so');
+  const canonical = readFileSync(join(dirname(source), 'libcronet.so'));
+  const changed = Buffer.from(canonical); changed[0x210] ^= 1;
+  writeFileSync(target, changed);
+  const linked = join(root, 'previous-cronet-hardlink'); linkSync(target, linked);
+  const expected = restoreCoreSeed(appDir, root);
+  assert.deepEqual(readFileSync(target), canonical);
+  assert.deepEqual(readFileSync(linked), changed);
+  const hash = expected[dirname(APPIMAGE_CORE_MEMBER) + '/libcronet.so'].sha256;
+  assert.equal(hash, fixtureManifest(canonical).cronetLibrarySha256.linux);
+  verifyAppImageMembers(packFixture(root, appDir), expected);
+  writeFileSync(target, changed);
+  assert.throws(() => verifyAppImageMembers(packFixture(root, appDir), expected), /SHA\/权限不符/);
+});
+
+for (const fault of ['wrong source SHA', 'missing pin', 'source Cronet symlink', 'target Cronet symlink', 'duplicate Cronet']) {
+  test(`AppImage source Cronet authority fails closed: ${fault}`, (t) => {
+    const { root, appDir, source } = coreFixture(t);
+    const originalCore = readFileSync(join(appDir, APPIMAGE_CORE_MEMBER));
+    const cronetSource = join(dirname(source), 'libcronet.so');
+    const cronetTarget = join(appDir, dirname(APPIMAGE_CORE_MEMBER), 'libcronet.so');
+    if (fault === 'wrong source SHA') { const bytes = readFileSync(cronetSource); bytes[0x210] ^= 1; writeFileSync(cronetSource, bytes); }
+    if (fault === 'missing pin') writeFileSync(join(root, 'src-tauri/core-manifest.json'), '{}');
+    if (fault.endsWith('symlink')) { const path = fault.startsWith('source') ? cronetSource : cronetTarget; renameSync(path, path + '.real'); symlinkSync(path + '.real', path); }
+    if (fault === 'duplicate Cronet') writeFileSync(join(appDir, 'libcronet.so'), 'unexpected-cronet');
+    assert.throws(() => restoreCoreSeed(appDir, root));
+    assert.deepEqual(readFileSync(join(appDir, APPIMAGE_CORE_MEMBER)), originalCore, 'validate both inputs before replacing either');
+  });
+}

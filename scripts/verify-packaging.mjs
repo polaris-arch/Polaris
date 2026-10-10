@@ -22,7 +22,8 @@
  *     构建后：`--root` 收 **bundle 根**（`target/release/bundle`，传了 --target 时
  *     `target/<triple>/release/bundle`），对该 label 的**每个 bundle target 各自**断言
  *     「恰含本平台那一份内核、且字节大小与源 `resources/<平台>/` 一致」。
- *     Linux 原核额外要求 SHA/权限完全一致；AppImage 实际成员的同一契约由 postprocess 重封后校验。
+ *     Linux 原核与两动态 Cronet 库要求完整 SHA/权限一致；Cronet 还须匹配 manifest pin及静态 ABI。
+ *     AppImage 实际成员的同一契约由 postprocess 重封后校验。
  *     ⚠️ 不可指向 `target/release`：那里的 `_up_/resources/` 是 **cargo build script 的 staging copy**，
  *        与 bundler 有没有把内核铺进包无关，打在它上面等于没有门（详见 BUNDLE_TREES 注释）。
  *     ⚠️ windows 腿是**例外**：NSIS 把资源从源路径直接编进 .exe，bundle 侧无副本可扫，
@@ -71,6 +72,7 @@ import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
@@ -2065,7 +2067,7 @@ function checkPayload(label, root) {
       // linuxdeploy 合法改写 rpath（本机 1-alpha-20251107-1 实测：helper 1222440B → 1230912B，
       // sha 变，**GNU Build ID 前后同值**）。故体积失配时，appimage 侧用 Build ID 作「合法改写」
       // 的豁免证据（同 ⇒ 绿）；任一侧读不出 Build ID 或不同 ⇒ 红。**不把 Build ID 当普适判据**：
-      // Linux sing-box 是随包原字节种子（postprocess 恢复 linuxdeploy 加工前的源），
+      // Linux sing-box 与 Cronet 是随包原字节种子（postprocess 恢复已核源），
       // 必须独立比 SHA/权限，不能用相同体积或 Build ID 豁免替代内容身份。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
@@ -2083,6 +2085,16 @@ function checkPayload(label, root) {
         if (!existsSync(src)) {
           fail(`${scope.name}: 产物里有 ${p}，但源 ${src} 不存在 —— 完整性无从比对（前置缺失判红，不跳过）`);
           continue;
+        }
+        if (family.what === 'Cronet sidecar') {
+          try {
+            const name = expected === 'linux' ? 'libcronet.so' : 'libcronet.dll';
+            if (basename(p) !== name) throw new Error(`wrong Cronet filename for ${expected}: ${basename(p)}`);
+            verifyCronetPayload(src, p, expected, readJson(join(SRC_TAURI, 'core-manifest.json')));
+          } catch (error) {
+            fail(`${scope.name}: Cronet source/final content or static ABI mismatch: ${error.message}`);
+          }
+          continue; // no size / GNU Build ID exemption for Cronet
         }
         if (label === 'linux' && family.what === 'sing-box') {
           if (!lstatSync(p).isFile() || !lstatSync(src).isFile()
@@ -2120,14 +2132,14 @@ function checkPayload(label, root) {
   if (trees.length > 0) {
     note(
       `payload：${label} → 产物验证，${scopes.map((s) => s.name).join(' + ')} 各自命中 ${expected} 的 ` +
-        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核 SHA/权限一致；其余体积一致或 appimage ELF Build ID 豁免' : '体积与源一致'}）`
+        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核及 Cronet 固定 SHA/权限、Cronet 静态 ABI 一致；其余体积一致或 appimage ELF Build ID 豁免' : label === 'windows' ? 'Cronet 固定 SHA/权限及静态 ABI 一致；其余体积一致' : '体积与源一致'}）`
     );
   } else {
     // 如实标注，不冒充产物验证：NSIS 把资源从**源路径**直接编进 .exe，bundle 侧没有可扫的副本，
     // 故这条腿只能证明「cargo 侧 staging 恰好只有本平台那几份且体积对」，证明不了安装器内容。
     note(
       `payload：${label} → **staging 检查**（不是产物验证）：扫的是 cargo build 铺的 ${root}/_up_/resources/，` +
-        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且体积与源一致。` +
+        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且 Cronet 固定 SHA/权限及静态 ABI 一致、其余体积与源一致。` +
         `NSIS 从源路径直接编译资源进 .exe，bundle 侧无副本可扫 ⇒ ` +
         `「安装器内容是否含这些二进制」在本仓无自动门，由 Windows 真机安装验证覆盖。`
     );
