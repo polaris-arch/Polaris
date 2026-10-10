@@ -17,18 +17,22 @@ import { api } from '/src/ipc';
 import i18n, { i18nReady } from '/src/i18n';
 import zhCN from '/src/i18n/locales/zh-CN.json';
 await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
-const mobile=new URLSearchParams(location.search).get('mobile')==='1';
+const params=new URLSearchParams(location.search);
+const mobile=params.get('mobile')==='1';
 if(mobile){await import('/src/styles/tokens.resolved.css');await import('/src/mobile/mobile.css');await import('/src/mobile/redesign.css');}
 else await import('/src/styles/index.css');
 const initial=${JSON.stringify(statusFixture())};
 const servers=['a','b'].map(id=>({id:'node-'+id,name:'Fixture '+id,protocol:'socks',address:'fixture.invalid',port:1,subscriptionId:'sub-a'}));
 let config={selectedServerId:'node-a',proxyMode:'smart',servers,subscriptions:[{id:'sub-a',name:'Subscription A',url:'https://fixture.invalid'}],selectionIntent:{mode:'auto',scope:'subscription',subscriptionId:'sub-a'}};
-let listener; const callbacks=[],jobs=[];
-const f=window.__status={reads:0,writes:0,offs:0,offThrows:false,callbacks,jobs,
- resolve(patch={},index=0){jobs[index].resolve({...structuredClone(initial),...patch});},
+const callbacks=[],jobs=[],registrations=[];let backend=structuredClone(initial);let callbackId=0;const handlers=new Map();
+const f=window.__status={reads:0,writes:0,offs:0,offThrows:false,callbacks,jobs,registrations,registrationCalls:0,holdReady:params.get('registration')==='hold',failRegistration:params.get('registration')==='fail',
+ ready(index=0){const r=registrations[index];r.registered=true;r.resolve(r.id);},
+ failReady(index=0){registrations[index].reject(Error('registration rejected'));},
+ active(){return registrations.filter(r=>r.registered).length;},
+ resolve(patch={},index=0){jobs[index].resolve({success:true,data:{...jobs[index].snapshot,...patch}});},
  reject(index=0){jobs[index].reject(Error('snapshot failed'));},
- event(patch={}){listener?.({...structuredClone(initial),...patch});},
- stale(patch={}){callbacks[0]?.({...structuredClone(initial),...patch});},
+ event(patch={}){backend={...structuredClone(initial),...patch};for(const r of registrations)if(r.registered)handlers.get(r.handler)?.({payload:backend});},
+ stale(patch={}){callbacks[0]?.({payload:{...structuredClone(initial),...patch}});},
  publish(patch){config={...config,...patch};useAppStore.setState({config,servers:config.servers,selectedServerId:config.selectedServerId});},
  manual(){config={...config};delete config.selectionIntent;f.publish(config);},
  draft(){useStagedConfigStore.setState({enabled:true,hydrated:true,baseline:config,entries:[{id:'draft',kind:'setting',entityPath:['selectionIntent'],nextValue:undefined,label:'draft'}]});},
@@ -36,8 +40,29 @@ const f=window.__status={reads:0,writes:0,offs:0,offThrows:false,callbacks,jobs,
  remount(){app=createRoot(document.getElementById('root'));render();},
  state(){return structuredClone(useAppStore.getState().config);},
 };
-api.server.autoSelectStatus=()=>{f.reads++;return new Promise((resolve,reject)=>jobs.push({resolve,reject}));};
-api.server.onAutoSelectStatus=fn=>{listener=fn;callbacks.push(fn);return()=>{f.offs++;if(f.offThrows)throw Error('detach failed');if(listener===fn)listener=null;};};
+// Use the real server API, ipc-client listen/listenReady and Tauri event wrapper.
+// Only native IPC is replaced, so registration remains genuinely asynchronous.
+window.__TAURI_INTERNALS__={
+ transformCallback(fn){const id=++callbackId;handlers.set(id,fn);return id;},
+ invoke(cmd,args){
+  if(cmd==='plugin:event|listen'&&args.event==='event:autoSelectStatus'){
+   f.registrationCalls++;callbacks.push(handlers.get(args.handler));
+   return new Promise((resolve,reject)=>{
+    const r={id:f.registrationCalls,handler:args.handler,resolve,reject,registered:false};registrations.push(r);
+    if(f.failRegistration){f.failRegistration=false;reject(Error('registration rejected'));}
+    else if(!f.holdReady){r.registered=true;resolve(r.id);}
+   });
+  }
+  if(cmd==='plugin:event|unlisten')return Promise.resolve();
+  if(cmd==='auto_select_status'){f.reads++;return new Promise((resolve,reject)=>jobs.push({resolve,reject,snapshot:structuredClone(backend)}));}
+  return Promise.resolve({success:true});
+ },
+};
+window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(event,id){
+ if(event!=='event:autoSelectStatus')return;
+ f.offs++;if(f.offThrows)throw Error('detach failed');
+ const r=registrations.find(r=>r.id===id);if(r)r.registered=false;
+}};
 api.server.autoSelectEnable=async()=>{f.writes++;throw Error('unexpected enable');};
 api.server.autoSelectSwitchNow=async()=>{f.writes++;throw Error('unexpected switch');};
 api.server.switch=async()=>{f.writes++;throw Error('unexpected manual switch');};
@@ -50,13 +75,14 @@ let server: ViteDevServer;
 let browser: Browser;
 let origin: string;
 const panel = (page: Page) => page.locator('[data-auto-select-status]');
-const data = (page: Page) => page.evaluate(() => { const f=(window as any).__status;return {reads:f.reads,writes:f.writes,offs:f.offs,config:f.state()}; });
-async function open(mobile: boolean) {
+const data = (page: Page) => page.evaluate(() => { const f=(window as any).__status;return {reads:f.reads,writes:f.writes,offs:f.offs,registrations:f.registrationCalls,active:f.active(),config:f.state()}; });
+async function open(mobile: boolean, registration?: 'hold' | 'fail') {
   const page = await browser.newPage({ viewport: { width: mobile ? 390 : 1100, height: 844 } });
   page.setDefaultTimeout(7000);
-  await page.goto(`${origin}/__status?mobile=${mobile ? 1 : 0}`);
+  await page.goto(`${origin}/__status?mobile=${mobile ? 1 : 0}&registration=${registration ?? ''}`);
   await panel(page).waitFor();
-  await page.waitForFunction(() => (window as any).__status?.reads === 1);
+  await page.waitForFunction(() => (window as any).__status?.registrationCalls === 1);
+  if (!registration) await page.waitForFunction(() => (window as any).__status?.reads === 1);
   return page;
 }
 
@@ -81,6 +107,111 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('Auto status mounted s
 
   for (const mobile of [false, true]) {
     const screen = mobile ? 'mobile' : 'desktop';
+    it(`${screen}: ready registration gates the first snapshot across a lost background event`, async () => {
+      const page = await open(mobile, 'hold');
+      try {
+        expect((await data(page)).reads).toBe(0);
+        await page.evaluate(() => (window as any).__status.event({mode:'notEvaluated',reason:'background'}));
+        expect(await panel(page).textContent()).not.toContain('没有被明显更优');
+        await page.evaluate(() => (window as any).__status.ready());
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        await page.evaluate(() => (window as any).__status.resolve());
+        await expect.poll(() => panel(page).textContent()).toContain('不在前台');
+        await page.evaluate(() => (window as any).__status.event({mode:'commitFailed',reason:'commitFailed'}));
+        await expect.poll(() => panel(page).textContent()).toContain('换点未完成');
+        expect((await data(page)).active).toBe(1);
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: delayed registration keeps rapid refresh single-flight and reads a lost commit failure`, async () => {
+      const page = await open(mobile, 'hold');
+      try {
+        await panel(page).locator('button').evaluate(el => {for(let i=0;i<8;i++)(el as HTMLButtonElement).click();});
+        expect((await data(page)).registrations).toBe(1);expect((await data(page)).reads).toBe(0);
+        await page.evaluate(() => {const f=(window as any).__status;f.event({mode:'commitFailed',reason:'commitFailed'});f.ready();});
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        await page.evaluate(() => (window as any).__status.resolve());
+        await expect.poll(() => panel(page).textContent()).toContain('换点未完成');
+        expect(await panel(page).textContent()).not.toContain('没有被明显更优');
+        expect((await data(page)).active).toBe(1);
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: registration failure is visible and rapid retry registers exactly once`, async () => {
+      const page = await open(mobile, 'fail');
+      try {
+        await expect.poll(() => panel(page).textContent()).toContain('读取状态失败');
+        expect((await data(page)).reads).toBe(0);
+        expect((await data(page)).active).toBe(0);
+        await page.evaluate(() => (window as any).__status.event({mode:'notEvaluated',reason:'background'}));
+        await panel(page).locator('button').evaluate(el => {for(let i=0;i<8;i++)(el as HTMLButtonElement).click();});
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        expect((await data(page)).registrations).toBe(2);
+        expect((await data(page)).active).toBe(1);
+        await page.evaluate(() => {const f=(window as any).__status;f.stale({mode:'settled',reason:'settled'});f.resolve();});
+        await expect.poll(() => panel(page).textContent()).toContain('不在前台');
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: failed retry also remains retryable without a snapshot or listener`, async () => {
+      const page = await open(mobile, 'fail');
+      try {
+        await expect.poll(() => panel(page).textContent()).toContain('读取状态失败');
+        await page.evaluate(() => (window as any).__status.failRegistration=true);
+        await panel(page).locator('button').click();
+        await expect.poll(async () => (await data(page)).registrations).toBe(2);
+        await expect.poll(() => panel(page).textContent()).toContain('读取状态失败');
+        expect((await data(page)).reads).toBe(0);expect((await data(page)).active).toBe(0);
+        await panel(page).locator('button').click();
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        expect((await data(page)).registrations).toBe(3);
+        await page.evaluate(() => (window as any).__status.resolve());
+        await expect.poll(() => panel(page).textContent()).toContain('没有被明显更优');
+        expect((await data(page)).active).toBe(1);
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: old effect late ready detaches without reading or reviving its event`, async () => {
+      const page = await open(mobile, 'hold');
+      try {
+        await page.evaluate(() => (window as any).__status.publish({subscriptions:[{id:'sub-b',name:'Subscription B'}],selectionIntent:{mode:'auto',scope:'subscription',subscriptionId:'sub-b'}}));
+        await expect.poll(async () => (await data(page)).registrations).toBe(2);
+        await page.evaluate(() => (window as any).__status.ready(0));
+        await expect.poll(async () => (await data(page)).offs).toBe(1);
+        expect((await data(page)).reads).toBe(0);expect((await data(page)).active).toBe(0);
+        await page.evaluate(() => {const f=(window as any).__status;f.stale({mode:'commitFailed',reason:'commitFailed'});f.ready(1);});
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        await page.evaluate(() => (window as any).__status.resolve({intent:{mode:'auto',scope:'subscription',subscriptionId:'sub-b'}}));
+        await expect.poll(() => panel(page).textContent()).toContain('Subscription B');
+        expect((await data(page)).active).toBe(1);
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: late ready after unmount immediately detaches and cannot fetch`, async () => {
+      const page = await open(mobile, 'hold');
+      try {
+        await page.evaluate(() => {const f=(window as any).__status;f.unmount();f.ready();});
+        await expect.poll(async () => (await data(page)).offs).toBe(1);
+        expect((await data(page)).reads).toBe(0);expect((await data(page)).active).toBe(0);
+        await page.evaluate(() => (window as any).__status.stale({mode:'commitFailed',reason:'commitFailed'}));
+        expect(await panel(page).count()).toBe(0);
+      } finally { await page.close(); }
+    });
+
+    it(`${screen}: late registration rejection after unmount cannot poison a remounted session`, async () => {
+      const page = await open(mobile, 'hold');
+      try {
+        await page.evaluate(() => {const f=(window as any).__status;f.unmount();f.remount();});
+        await expect.poll(async () => (await data(page)).registrations).toBe(2);
+        await page.evaluate(() => {const f=(window as any).__status;f.failReady(0);f.ready(1);});
+        await expect.poll(async () => (await data(page)).reads).toBe(1);
+        await page.evaluate(() => (window as any).__status.resolve());
+        await expect.poll(() => panel(page).textContent()).toContain('没有被明显更优');
+        expect(await panel(page).textContent()).not.toContain('读取状态失败');
+        expect((await data(page)).active).toBe(1);
+      } finally { await page.close(); }
+    });
+
     it(`${screen}: snapshot shows backend rate/exclusion and never writes intent or exit`, async () => {
       const page = await open(mobile);
       try {

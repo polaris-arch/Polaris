@@ -26,34 +26,61 @@ export function useAutoSelectStatus(config: UserConfig | null) {
     const publish = (next: AutoSelectStatusState) => {
       if (active) setState({ ...next, context: config });
     };
-    const load = () => {
-      // React has not necessarily rendered a disabled button before the next click.
+    let off: (() => void) | null = null;
+    let registrationAttempt = 0;
+    const detach = (unsubscribe: () => void) => {
+      const failed = (error: unknown) => console.error('[autoSelectStatus] unsubscribe failed:', error);
+      try { void Promise.resolve(unsubscribe()).catch(failed); } catch (error) { failed(error); }
+    };
+    const load = async () => {
+      // Guard both registration and the snapshot before React disables the button.
       if (!active || pending) return;
       pending = true;
-      const revision = eventRevision;
       publish({ report: null, loading: true, failed: false });
-      void api.server.autoSelectStatus().then((report) => {
-        if (!report?.intent) throw new TypeError();
-        if (active && revision === eventRevision) publish({ report, loading: false, failed: false });
-      }).catch(() => {
-        if (active && revision === eventRevision) publish({ report: null, loading: false, failed: true });
-      }).finally(() => {
+      try {
+        if (!off) {
+          const attempt = ++registrationAttempt;
+          let unsubscribe: () => void;
+          try {
+            unsubscribe = await api.server.onAutoSelectStatusReady((report) => {
+              if (!active || attempt !== registrationAttempt) return;
+              eventRevision += 1;
+              publish({ report, loading: pending, failed: false });
+            });
+          } catch {
+            // A failed registration may still deliver a queued callback.
+            registrationAttempt += 1;
+            publish({ report: null, loading: false, failed: true });
+            return;
+          }
+          if (!active) {
+            detach(unsubscribe);
+            return;
+          }
+          off = unsubscribe;
+        }
+        // Read only after registration, closing the initial event delivery gap.
+        const revision = eventRevision;
+        try {
+          const report = await api.server.autoSelectStatus();
+          if (!report?.intent) throw new TypeError();
+          if (active && revision === eventRevision) publish({ report, loading: false, failed: false });
+        } catch {
+          if (active && revision === eventRevision) publish({ report: null, loading: false, failed: true });
+        }
+      } finally {
         pending = false;
-        if (active && revision !== eventRevision) setState(previous => ({ ...previous, loading: false }));
-      });
+        if (active) setState(previous => ({ ...previous, loading: false }));
+      }
     };
-    const off = api.server.onAutoSelectStatus((report) => {
-      if (!active) return;
-      eventRevision += 1;
-      publish({ report, loading: pending, failed: false });
-    });
-    refreshRef.current = load;
-    load();
+    refreshRef.current = () => { void load(); };
+    void load();
     return () => {
       // Invalidate before detaching: a failed detach must not revive this session.
       active = false;
+      registrationAttempt += 1;
       refreshRef.current = null;
-      try { off(); } catch (error) { console.error('[autoSelectStatus] unsubscribe failed:', error); }
+      if (off) detach(off);
     };
   }, [config, enabled]);
 
