@@ -22,7 +22,18 @@ impl CommandRunner for FixtureRunner {
         })
     }
 }
-fn fixture(r4: Value, r6: Value, p4: Value, p6: Value) -> FixtureRunner {
+fn fixture(mut r4: Value, mut r6: Value, p4: Value, p6: Value) -> FixtureRunner {
+    // Model the collector's -j -d -N wire shape even for the older routing cases.
+    // Explicit textual/malformed types in compatibility/negative cases stay intact.
+    for family in [&mut r4, &mut r6] {
+        if let Some(rows) = family.as_array_mut() {
+            for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+                row.entry("type").or_insert(json!("1"));
+                row.entry("flags").or_insert(json!([]));
+                row.entry("scope").or_insert(json!("0"));
+            }
+        }
+    }
     FixtureRunner {
         outputs: vec![
             Ok(json!([{"ifname":"vpn0","linkinfo":{"info_kind":"tun"}}]).to_string()),
@@ -233,10 +244,17 @@ fn early_global_policy_requires_same_table_family_and_interface() {
             (policy, json!([]))
         };
         let report = reports(&fixture(split(json!(100), json!(100)), json!([]), p4, p6)).remove(0);
-        assert_eq!(
-            predicate(&report, Rule::EntryCannotBePreserved),
-            &Fact::Known(table == 100 && !v6)
-        );
+        if table == 100 && !v6 {
+            assert!(matches!(
+                predicate(&report, Rule::EntryCannotBePreserved),
+                Fact::Unknown(_)
+            ));
+        } else {
+            assert_eq!(
+                predicate(&report, Rule::EntryCannotBePreserved),
+                &Fact::Known(false)
+            );
+        }
     }
 }
 #[test]
@@ -387,10 +405,15 @@ fn before_tun_policy_signature_never_borrows_priority_without_object_link() {
             json!([{"priority":9000,"src":"all","table":table}]),
             json!([]),
         );
-        assert_eq!(
-            predicate(&reports(&f)[0], Rule::OtherTunProxy),
-            &Fact::Known(table == 100)
-        );
+        let report = reports(&f).remove(0);
+        if table == 100 {
+            assert!(matches!(
+                predicate(&report, Rule::OtherTunProxy),
+                Fact::Unknown(_)
+            ));
+        } else {
+            assert_eq!(predicate(&report, Rule::OtherTunProxy), &Fact::Known(false));
+        }
     }
 }
 #[test]
@@ -499,4 +522,270 @@ fn runtime_evidence_does_not_claim_a_before_tun_proxy_signature() {
         predicate(&reports[0], Rule::OtherTunProxy),
         Fact::Unknown(_)
     ));
+}
+
+// Review regressions: synthetic rows shaped by the exact -j -d -N argv.
+// Numeric strings are emitted by iproute2 rtm_map.c when numeric is enabled.
+#[test]
+fn detailed_numeric_unicast_routes_are_parsed_for_both_families() {
+    let f = fixture(
+        json!([{"type":"1","dst":"default","gateway":"10.8.0.1", "dev":"vpn0",
+        "table":"100","protocol":"186","scope":"0","metric":100,"flags":[]}]),
+        json!([{"type":"1","dst":"default","gateway":"2001:db8::1","dev":"vpn0",
+        "table":"100","protocol":"186","scope":"0","metric":100,"flags":[]}]),
+        json!([]),
+        json!([]),
+    );
+    let obj = object(&f);
+    let Fact::Known(routes) = obj.routes else {
+        panic!("-N RTN_UNICAST strings must not make routes Unknown")
+    };
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().all(|r| r.table == Fact::Known(Some(100))
+        && r.role == Fact::Known(RouteRole::CoverageDeclaration)));
+}
+#[test]
+fn detailed_numeric_local_and_terminal_routes_match_textual_forms() {
+    for (numeric, textual) in [
+        ("1", "unicast"),
+        ("2", "local"),
+        ("3", "broadcast"),
+        ("6", "blackhole"),
+        ("7", "unreachable"),
+        ("8", "prohibit"),
+        ("9", "throw"),
+    ] {
+        let input = |kind| {
+            json!([{"type":kind,"dst":"192.0.2.0/24","dev":"vpn0",
+            "table":"100","protocol":"186","scope":"0","flags":[]}])
+        };
+        let a = object(&fixture(input(numeric), json!([]), json!([]), json!([]))).routes;
+        let b = object(&fixture(input(textual), json!([]), json!([]), json!([]))).routes;
+        assert_eq!(a, b, "numeric type {numeric} must agree with {textual}");
+        assert!(matches!(a, Fact::Known(_)));
+    }
+}
+fn competition(priority: u32) -> FixtureRunner {
+    let mut f = fixture(
+        json!([
+            {"type":"unicast","dst":"default","dev":"eth0","table":100,"metric":10,"flags":[]},
+            {"type":"unicast","dst":"default","dev":"vpn0","table":100,"metric":100,"flags":[]}
+        ]),
+        json!([]),
+        json!([{"priority":priority,"src":"all","table":100}]),
+        json!([]),
+    );
+    f.outputs[0] = Ok(json!([{"ifname":"eth0","link_type":"ether"},
+        {"ifname":"vpn0","linkinfo":{"info_kind":"tun"}}])
+    .to_string());
+    f.outputs[1] = Ok(json!([
+        {"ifname":"eth0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24}]},
+        {"ifname":"vpn0","addr_info":[{"family":"inet","local":"10.8.0.2","prefixlen":24}]}
+    ])
+    .to_string());
+    f
+}
+fn assert_unproved_selection(priority: u32, rule: Rule) {
+    let f = competition(priority);
+    let Fact::Known(objects) = collect_linux(&f).objects else {
+        panic!()
+    };
+    let vpn = objects.iter().find(|o| o.interface == "vpn0").unwrap();
+    let Fact::Known(rules) = &vpn.policy_rules else {
+        panic!()
+    };
+    let report = reports(&competition(priority))
+        .into_iter()
+        .find(|r| r.interface == "vpn0")
+        .unwrap();
+    println!("competing defaults eth0 metric10/vpn0 metric100: priority={priority}, applies={:?}, predicate={:?}, decision={:?}",
+        rules[0].applies_to_object,predicate(&report,rule),report.decision);
+    assert!(
+        matches!(rules[0].applies_to_object, Fact::Unknown(_)),
+        "table membership is not object route selection"
+    );
+    assert!(matches!(predicate(&report, rule), Fact::Unknown(_)));
+    assert!(matches!(report.decision, Fact::Unknown(_)));
+}
+#[test]
+fn competing_default_does_not_establish_proxy_signature() {
+    assert_unproved_selection(9000, Rule::OtherTunProxy);
+}
+#[test]
+fn competing_default_does_not_establish_early_policy_entry_loss() {
+    assert_unproved_selection(100, Rule::EntryCannotBePreserved);
+}
+#[test]
+fn enumeration_limits_fail_closed_without_truncation() {
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[0] = Ok(json!((0..129)
+        .map(|n| json!({"ifname":format!("if{n}")}))
+        .collect::<Vec<_>>())
+    .to_string());
+    assert!(
+        matches!(collect_linux(&f).objects, Fact::Unknown(_)),
+        "link row cap must reject whole enumeration"
+    );
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[2] = Ok(format!("[]{}", " ".repeat(1024 * 1024)));
+    assert!(
+        matches!(object(&f).routes, Fact::Unknown(_)),
+        "source byte cap must reject whole enumeration"
+    );
+    let routes = json!((0..4097)
+        .map(|_| json!({"type":"blackhole","dst":"192.0.2.0/24"}))
+        .collect::<Vec<_>>());
+    assert!(
+        matches!(
+            object(&fixture(routes, json!([]), json!([]), json!([]))).routes,
+            Fact::Unknown(_)
+        ),
+        "route row cap must reject whole enumeration"
+    );
+    let policies = json!((0..257)
+        .map(|n| json!({"priority":n,"src":"all","table":100}))
+        .collect::<Vec<_>>());
+    assert!(
+        matches!(
+            object(&fixture(json!([]), json!([]), policies, json!([]))).policy_rules,
+            Fact::Unknown(_)
+        ),
+        "rule row cap must reject whole enumeration"
+    );
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[1] = Ok(json!([{"ifname":"vpn0","addr_info":(0..257).map(|_|json!({"family":"inet","local":"10.8.0.2","prefixlen":24})).collect::<Vec<_>>()}]).to_string());
+    assert!(
+        matches!(object(&f).addresses, Fact::Unknown(_)),
+        "nested address cap must reject whole object addresses"
+    );
+}
+
+#[test]
+fn numeric_terminal_routes_without_dev_are_empty_but_unattributed_unicast_is_unknown() {
+    for numeric in ["6", "7", "8", "9"] {
+        let route = json!([{"type":numeric,"dst":"192.0.2.0/24","table":"100","protocol":"4","scope":"0","flags":[]}]);
+        assert_eq!(
+            object(&fixture(route, json!([]), json!([]), json!([]))).routes,
+            Fact::Known(vec![])
+        );
+    }
+    for numeric in ["1", "2", "3", "0", "4", "5", "10", "11", "999"] {
+        let route = json!([{"type":numeric,"dst":"192.0.2.0/24","table":"100","protocol":"4","scope":"0","flags":[]}]);
+        assert!(
+            matches!(
+                object(&fixture(route, json!([]), json!([]), json!([]))).routes,
+                Fact::Unknown(_)
+            ),
+            "unattributed/unsupported RTN {numeric}"
+        );
+    }
+    for numeric in ["0", "4", "5", "10", "11", "999"] {
+        let route =
+            json!([{"type":numeric,"dst":"192.0.2.0/24","dev":"vpn0","table":"100","flags":[]}]);
+        assert!(matches!(
+            object(&fixture(route, json!([]), json!([]), json!([]))).routes,
+            Fact::Unknown(_)
+        ));
+    }
+}
+#[test]
+fn numeric_route_competition_stays_unknown_after_type_parsing_succeeds() {
+    let mut f = competition(9000);
+    let mut routes: Value = serde_json::from_str(f.outputs[2].as_ref().unwrap()).unwrap();
+    for row in routes.as_array_mut().unwrap() {
+        row["type"] = json!("1");
+        row["table"] = json!("100");
+    }
+    f.outputs[2] = Ok(routes.to_string());
+    let report = reports(&f)
+        .into_iter()
+        .find(|r| r.interface == "vpn0")
+        .unwrap();
+    assert_eq!(report.coverage.ipv4, Fact::Known(true));
+    assert!(matches!(
+        predicate(&report, Rule::OtherTunProxy),
+        Fact::Unknown(_)
+    ));
+    assert!(matches!(report.decision, Fact::Unknown(_)));
+}
+#[test]
+fn source_byte_limit_applies_to_all_six_outputs() {
+    for source in 0..6 {
+        let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+        f.outputs[source] = Ok(format!("[]{}", " ".repeat(MAX_SOURCE_BYTES)));
+        let facts = collect_linux(&f);
+        if source == 0 {
+            let Fact::Unknown(reason) = facts.objects else {
+                panic!("oversize links accepted")
+            };
+            assert!(reason.contains("byte limit exceeded"));
+        } else {
+            let Fact::Known(objects) = facts.objects else {
+                panic!()
+            };
+            let object = &objects[0];
+            let reason = match source {
+                1 => match &object.addresses {
+                    Fact::Unknown(r) => r,
+                    _ => panic!(),
+                },
+                2 | 3 => match &object.routes {
+                    Fact::Unknown(r) => r,
+                    _ => panic!(),
+                },
+                4 | 5 => match &object.policy_rules {
+                    Fact::Unknown(r) => r,
+                    _ => panic!(),
+                },
+                _ => unreachable!(),
+            };
+            assert!(reason.contains("byte limit exceeded"));
+        }
+    }
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[2] = Ok(format!("[]{}", " ".repeat(MAX_SOURCE_BYTES - 2)));
+    assert_eq!(object(&f).routes, Fact::Known(vec![]));
+}
+#[test]
+fn row_and_nested_address_limit_boundaries_are_inclusive() {
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[0] = Ok(json!((0..MAX_INTERFACE_ROWS)
+        .map(|n| json!({"ifname":format!("if{n}")}))
+        .collect::<Vec<_>>())
+    .to_string());
+    let Fact::Known(objects) = collect_linux(&f).objects else {
+        panic!("interface boundary rejected")
+    };
+    assert_eq!(objects.len(), MAX_INTERFACE_ROWS);
+    let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+    f.outputs[1] = Ok(json!((0..MAX_INTERFACE_ROWS + 1)
+        .map(|n| json!({"ifname":format!("if{n}"),"addr_info":[]}))
+        .collect::<Vec<_>>())
+    .to_string());
+    let Fact::Unknown(reason) = object(&f).addresses else {
+        panic!("address rows above cap accepted")
+    };
+    assert!(reason.contains("row limit exceeded"));
+    for (count, accepted) in [(MAX_ROUTE_ROWS, true), (MAX_ROUTE_ROWS + 1, false)] {
+        let routes = json!((0..count)
+            .map(|_| json!({"type":"6","dst":"192.0.2.0/24"}))
+            .collect::<Vec<_>>());
+        let obj = object(&fixture(routes, json!([]), json!([]), json!([])));
+        assert_eq!(matches!(obj.routes, Fact::Known(_)), accepted);
+    }
+    for (count, accepted) in [(MAX_POLICY_ROWS, true), (MAX_POLICY_ROWS + 1, false)] {
+        let rules = json!((0..count)
+            .map(|n| json!({"priority":n,"src":"all","table":"100"}))
+            .collect::<Vec<_>>());
+        let obj = object(&fixture(json!([]), json!([]), json!([]), rules));
+        assert_eq!(matches!(obj.policy_rules, Fact::Known(_)), accepted);
+    }
+    for (count, accepted) in [
+        (MAX_INTERFACE_ADDRESSES, true),
+        (MAX_INTERFACE_ADDRESSES + 1, false),
+    ] {
+        let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
+        f.outputs[1] = Ok(json!([{"ifname":"vpn0","addr_info":(0..count).map(|_|json!({"family":"inet","local":"10.8.0.2","prefixlen":24})).collect::<Vec<_>>()}]).to_string());
+        assert_eq!(matches!(object(&f).addresses, Fact::Known(_)), accepted);
+    }
 }

@@ -6,11 +6,71 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-type Rows = Vec<Map<String, Value>>;
+use super::{
+    MAX_INTERFACE_ADDRESSES, MAX_INTERFACE_ROWS, MAX_POLICY_ROWS, MAX_ROUTE_ROWS, MAX_SOURCE_BYTES,
+};
 
-fn rows(source: &str, output: Result<String, String>) -> Result<Rows, String> {
+type Rows = Vec<Map<String, Value>>;
+type IndexedRows = BTreeMap<String, Rows>;
+
+fn rows(source: &str, output: Result<String, String>, max_rows: usize) -> Result<Rows, String> {
     let raw = output.map_err(|e| format!("{source}: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("{source}: invalid JSON enumeration: {e}"))
+    if raw.len() > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "{source}: JSON byte limit exceeded ({MAX_SOURCE_BYTES})"
+        ));
+    }
+    let parsed: Rows = serde_json::from_str(&raw)
+        .map_err(|e| format!("{source}: invalid JSON enumeration: {e}"))?;
+    if parsed.len() > max_rows {
+        return Err(format!("{source}: JSON row limit exceeded ({max_rows})"));
+    }
+    Ok(parsed)
+}
+
+fn index_rows(rows: Rows, key: &str) -> Result<IndexedRows, String> {
+    let mut indexed = BTreeMap::new();
+    for row in rows {
+        let name = text(&row, key)?.to_string();
+        indexed.entry(name).or_insert_with(Vec::new).push(row);
+    }
+    Ok(indexed)
+}
+
+/// iproute2 emits RTN names or numeric strings with -N (rtm_map.c); Linux UAPI IDs.
+/// Only already-supported route types gain numeric equivalents; other types fail closed.
+fn route_kind(row: &Map<String, Value>) -> Result<&str, String> {
+    match row.get("type") {
+        None => Ok("unicast"),
+        Some(value) => match value.as_str().ok_or("invalid route type")? {
+            "1" | "unicast" => Ok("unicast"),
+            "2" | "local" => Ok("local"),
+            "3" | "broadcast" => Ok("broadcast"),
+            "6" | "blackhole" => Ok("blackhole"),
+            "7" | "unreachable" => Ok("unreachable"),
+            "8" | "prohibit" => Ok("prohibit"),
+            "9" | "throw" => Ok("throw"),
+            _ => Err("unsupported route type".into()),
+        },
+    }
+}
+
+fn index_routes(rows: Rows) -> Result<IndexedRows, String> {
+    let mut attributed = Vec::new();
+    for row in rows {
+        // Do not treat the first next hop as the whole route's interface.
+        if row.contains_key("nexthops") || row.contains_key("nhid") {
+            return Err("multipath/nexthop-ID route attribution unsupported".into());
+        }
+        if matches!(
+            route_kind(&row)?,
+            "blackhole" | "unreachable" | "prohibit" | "throw"
+        ) {
+            continue; // terminal routes have no outbound device
+        }
+        attributed.push(row);
+    }
+    index_rows(attributed, "dev")
 }
 
 fn text<'a>(row: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
@@ -84,6 +144,13 @@ fn addresses(rows: &Rows, interface: &str) -> Result<Vec<InterfaceAddress>, Stri
             .get("addr_info")
             .and_then(Value::as_array)
             .ok_or("addr_info missing/invalid")?;
+        if info.len() > MAX_INTERFACE_ADDRESSES
+            || result.len() + info.len() > MAX_INTERFACE_ADDRESSES
+        {
+            return Err(format!(
+                "interface address limit exceeded ({MAX_INTERFACE_ADDRESSES})"
+            ));
+        }
         for item in info {
             let item = item.as_object().ok_or("invalid address row")?;
             let family = match text(item, "family")? {
@@ -119,10 +186,7 @@ fn routes(rows: &Rows, interface: &str, family: AddressFamily) -> Result<Vec<Rou
         if row.contains_key("nexthops") || row.contains_key("nhid") {
             return Err("multipath/nexthop-ID route attribution unsupported".into());
         }
-        let kind = match row.get("type") {
-            None => "unicast",
-            Some(value) => value.as_str().ok_or("invalid route type")?,
-        };
+        let kind = route_kind(row)?;
         if matches!(kind, "blackhole" | "unreachable" | "prohibit" | "throw") {
             continue;
         }
@@ -300,6 +364,33 @@ fn rules(
     family: AddressFamily,
     routes: &Fact<Vec<RouteFact>>,
 ) -> Result<Vec<PolicyRuleFact>, String> {
+    // Compute table presence once per object/family, not by rescanning routes for
+    // every policy row. Presence can prove absence, never actual FIB selection:
+    // same-prefix/metric competitors and earlier RPDB rules are not represented here.
+    let mut present_tables = BTreeSet::new();
+    let mut uncertain = false;
+    match routes {
+        Fact::Unknown(_) => uncertain = true,
+        Fact::Known(routes) => {
+            for route in routes {
+                let is_v4 = route
+                    .prefix
+                    .split('/')
+                    .next()
+                    .and_then(|p| p.parse::<IpAddr>().ok())
+                    .is_some_and(|p| p.is_ipv4());
+                if is_v4 != (family == AddressFamily::V4) {
+                    continue;
+                }
+                match (&route.table, &route.scope) {
+                    (Fact::Known(Some(table)), Fact::Known(RouteScope::Global)) => {
+                        present_tables.insert(*table);
+                    }
+                    _ => uncertain = true,
+                }
+            }
+        }
+    }
     rows.iter()
         .map(|row| {
             let priority = row
@@ -308,37 +399,12 @@ fn rules(
                 .ok_or("priority missing/invalid")?;
             let lookup = table(row);
             let selector = selectors(row, family);
-            let applies = match (&lookup, &selector, routes) {
-                (
-                    Fact::Known(Some(t)),
-                    Fact::Known(PolicySelectorScope::Global),
-                    Fact::Known(routes),
-                ) => {
-                    let mut uncertain = false;
-                    let mut hit = false;
-                    for route in routes {
-                        // Explicitly preserve family: route.prefix has already been validated.
-                        let is_v4 = route
-                            .prefix
-                            .split('/')
-                            .next()
-                            .and_then(|p| p.parse::<IpAddr>().ok())
-                            .is_some_and(|p| p.is_ipv4());
-                        if is_v4 != (family == AddressFamily::V4) {
-                            continue;
-                        }
-                        match (&route.table, &route.scope) {
-                            (Fact::Known(Some(table)), Fact::Known(RouteScope::Global))
-                                if t == table =>
-                            {
-                                hit = true
-                            }
-                            (Fact::Unknown(_), _) | (_, Fact::Unknown(_)) => uncertain = true,
-                            _ => {}
-                        }
-                    }
-                    if hit {
-                        Fact::Known(true)
+            let applies = match (&lookup, &selector) {
+                (Fact::Known(Some(table)), Fact::Known(PolicySelectorScope::Global)) => {
+                    if present_tables.contains(table) {
+                        Fact::Unknown(
+                            "route table membership does not prove selected object path".into(),
+                        )
                     } else if uncertain {
                         Fact::Unknown("route/table association unresolved".into())
                     } else {
@@ -375,16 +441,17 @@ pub(super) fn assemble(
     p4: Result<String, String>,
     p6: Result<String, String>,
 ) -> Fact<Vec<ObjectFacts>> {
-    let links = match rows("ip link", links) {
+    let links = match rows("ip link", links, MAX_INTERFACE_ROWS) {
         Ok(v) => v,
         Err(e) => return Fact::Unknown(e),
     };
-    let addr = rows("ip address", addr);
-    let r4 = rows("ip -4 route table all", r4);
-    let r6 = rows("ip -6 route table all", r6);
-    let p4 = rows("ip -4 rule", p4);
-    let p6 = rows("ip -6 rule", p6);
+    let addr = rows("ip address", addr, MAX_INTERFACE_ROWS).and_then(|r| index_rows(r, "ifname"));
+    let r4 = rows("ip -4 route table all", r4, MAX_ROUTE_ROWS).and_then(index_routes);
+    let r6 = rows("ip -6 route table all", r6, MAX_ROUTE_ROWS).and_then(index_routes);
+    let p4 = rows("ip -4 rule", p4, MAX_POLICY_ROWS);
+    let p6 = rows("ip -6 rule", p6, MAX_POLICY_ROWS);
     let mut objects = BTreeMap::new();
+    let empty = Vec::new();
     for link in links {
         let name = match text(&link, "ifname") {
             Ok(v) => v.to_string(),
@@ -410,13 +477,11 @@ pub(super) fn assemble(
         let route_result = r4
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|r| routes(r, &name, AddressFamily::V4))
+            .and_then(|r| routes(r.get(&name).unwrap_or(&empty), &name, AddressFamily::V4))
             .and_then(|mut result| {
-                result.extend(
-                    r6.as_ref()
-                        .map_err(Clone::clone)
-                        .and_then(|r| routes(r, &name, AddressFamily::V6))?,
-                );
+                result.extend(r6.as_ref().map_err(Clone::clone).and_then(|r| {
+                    routes(r.get(&name).unwrap_or(&empty), &name, AddressFamily::V6)
+                })?);
                 Ok(result)
             });
         let route_facts = fact(route_result, "routes");
@@ -441,7 +506,7 @@ pub(super) fn assemble(
                 addresses: fact(
                     addr.as_ref()
                         .map_err(Clone::clone)
-                        .and_then(|r| addresses(r, &name)),
+                        .and_then(|r| addresses(r.get(&name).unwrap_or(&empty), &name)),
                     "addresses",
                 ),
                 routes: route_facts,

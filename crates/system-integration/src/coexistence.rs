@@ -18,6 +18,17 @@ use std::time::Duration;
 
 mod linux;
 
+/// Maximum UTF-8 JSON bytes accepted per completed command output (not a read cap).
+pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+/// Maximum rows in each link/address interface enumeration.
+pub const MAX_INTERFACE_ROWS: usize = 128;
+/// Maximum route rows per address family.
+pub const MAX_ROUTE_ROWS: usize = 4096;
+/// Maximum policy rows per address family; assembled for at most 128 interfaces.
+pub const MAX_POLICY_ROWS: usize = 256;
+/// Maximum actual addresses per interface, including duplicate enumeration rows.
+pub const MAX_INTERFACE_ADDRESSES: usize = 256;
+
 /// Unknown enumeration must not be represented as an empty object list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxFacts {
@@ -48,7 +59,10 @@ impl LinuxFacts {
     }
 }
 
-/// Six bounded read-only queries, through the existing command seam. `-d` forces
+/// Six sequential read-only queries, each requesting a two-second runner timeout.
+/// The existing runner's process cleanup/readers and parsing are not a twelve-second
+/// total deadline. Source byte limits below apply AFTER the runner returns: they bound
+/// decoding/assembly, not the legacy runner's stdout buffering. `-d` forces
 /// main-table attribution into route JSON; `-N` requests numeric table identifiers.
 /// Older/unsupported iproute2 or permissions failures remain Unknown; no fallback
 /// to main-only text output. Sources: iproute2 ip/iproute.c, ip/iprule.c, ip/ipaddress.c.
