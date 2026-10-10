@@ -4,7 +4,9 @@
 //! reprobes, notify, persist repair history, or project exits. Collection is sequential
 //! and read-only; callers must offload it when running in an async context. Enumeration
 //! is not atomic: no phase, own-interface attribution or stable identity is inferred.
-//! Fixture tests validate parsing and classifier wiring, not real devices.
+//! Geometric coverage candidates have Unknown roles: this slice supplies no RPDB/FIB
+//! reachability witness, even without observed competitors. Actual addresses and
+//! independent resource claims remain available. Fixtures are not device acceptance.
 
 #![forbid(unsafe_code)]
 

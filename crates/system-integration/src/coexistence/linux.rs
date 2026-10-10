@@ -13,36 +13,6 @@ use super::{
 type Rows = Vec<Map<String, Value>>;
 type IndexedRows = BTreeMap<String, Rows>;
 
-/// Preserve competition facts BEFORE partitioning by interface. Built separately
-/// for each family; never borrow another family's or table's route as a witness.
-struct IndexedRoutes {
-    by_interface: IndexedRows,
-    table_interfaces: BTreeMap<u32, BTreeSet<String>>,
-    unknown_table_interfaces: BTreeSet<String>,
-    terminal_tables: BTreeSet<u32>,
-    unknown_terminal_table: bool,
-}
-
-impl IndexedRoutes {
-    fn coverage_selection_unproved(&self, table: &Fact<Option<u32>>, interface: &str) -> bool {
-        let other = |names: &BTreeSet<String>| names.iter().any(|name| name != interface);
-        match table {
-            Fact::Known(Some(table)) => {
-                self.table_interfaces.get(table).is_some_and(other)
-                    || other(&self.unknown_table_interfaces)
-                    || self.terminal_tables.contains(table)
-                    || self.unknown_terminal_table
-            }
-            _ => {
-                self.table_interfaces.values().any(other)
-                    || other(&self.unknown_table_interfaces)
-                    || !self.terminal_tables.is_empty()
-                    || self.unknown_terminal_table
-            }
-        }
-    }
-}
-
 fn rows(source: &str, output: Result<String, String>, max_rows: usize) -> Result<Rows, String> {
     let raw = output.map_err(|e| format!("{source}: {e}"))?;
     if raw.len() > MAX_SOURCE_BYTES {
@@ -85,49 +55,22 @@ fn route_kind(row: &Map<String, Value>) -> Result<&str, String> {
     }
 }
 
-fn index_routes(rows: Rows) -> Result<IndexedRoutes, String> {
-    let mut indexed = IndexedRoutes {
-        by_interface: BTreeMap::new(),
-        table_interfaces: BTreeMap::new(),
-        unknown_table_interfaces: BTreeSet::new(),
-        terminal_tables: BTreeSet::new(),
-        unknown_terminal_table: false,
-    };
+fn index_routes(rows: Rows) -> Result<IndexedRows, String> {
+    let mut attributed = Vec::new();
     for row in rows {
-        // Do not treat the first next hop as the whole route's interface.
+        // No unique object association for ECMP/nexthop-ID paths.
         if row.contains_key("nexthops") || row.contains_key("nhid") {
             return Err("multipath/nexthop-ID route attribution unsupported".into());
         }
-        let kind = route_kind(&row)?;
-        if matches!(kind, "blackhole" | "unreachable" | "prohibit" | "throw") {
-            // No outbound device, but a competing terminal route can still stop a
-            // table from proving an object's complete selected-path coverage.
-            match table(&row) {
-                Fact::Known(Some(table)) => {
-                    indexed.terminal_tables.insert(table);
-                }
-                _ => indexed.unknown_terminal_table = true,
-            }
-            continue;
+        if matches!(
+            route_kind(&row)?,
+            "blackhole" | "unreachable" | "prohibit" | "throw"
+        ) {
+            continue; // no outbound device or object resource claim
         }
-        let interface = text(&row, "dev")?.to_string();
-        if kind == "unicast" {
-            match table(&row) {
-                Fact::Known(Some(table)) => {
-                    indexed
-                        .table_interfaces
-                        .entry(table)
-                        .or_default()
-                        .insert(interface.clone());
-                }
-                _ => {
-                    indexed.unknown_table_interfaces.insert(interface.clone());
-                }
-            }
-        }
-        indexed.by_interface.entry(interface).or_default().push(row);
+        attributed.push(row);
     }
-    Ok(indexed)
+    index_rows(attributed, "dev")
 }
 
 fn text<'a>(row: &'a Map<String, Value>, key: &str) -> Result<&'a str, String> {
@@ -236,12 +179,12 @@ fn addresses(rows: &Rows, interface: &str) -> Result<Vec<InterfaceAddress>, Stri
 }
 
 fn routes(
-    indexed: &IndexedRoutes,
+    indexed: &IndexedRows,
     interface: &str,
     family: AddressFamily,
 ) -> Result<Vec<RouteFact>, String> {
     let mut result = Vec::new();
-    for row in indexed.by_interface.get(interface).into_iter().flatten() {
+    for row in indexed.get(interface).into_iter().flatten() {
         // Multipath/nexthop-ID routes cannot establish a unique object link. Never
         // attribute the first next hop to the entire route or silently drop evidence.
         if row.contains_key("nexthops") || row.contains_key("nhid") {
@@ -283,9 +226,10 @@ fn routes(
             role: Fact::Known(RouteRole::ResourceClaim),
         });
     }
-    // Build a complete witness within ONE table/family/interface. CIDR intervals
-    // are nested or disjoint, so widest-first at each start excludes extra resource
-    // claims from the witness. A /0 never makes its nested business routes harmless.
+    // Identify geometric coverage CANDIDATES within ONE table/family/interface.
+    // This is not an RPDB/FIB reachability witness. Widest-first at each start
+    // leaves nested independent business routes as resource claims; a /0 cannot
+    // make those claims harmless merely by containing them.
     let mut by_table: BTreeMap<u32, Vec<(u128, u128, String)>> = BTreeMap::new();
     let max = match family {
         AddressFamily::V4 => u128::from(u32::MAX),
@@ -319,7 +263,7 @@ fn routes(
                 .push((start, start | tail, route.prefix.clone()));
         }
     }
-    let mut witnesses = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
     for (table, mut intervals) in by_table {
         intervals.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
         let mut next = 0;
@@ -340,28 +284,17 @@ fn routes(
             next = end + 1;
         }
         if complete {
-            witnesses.extend(members);
+            candidates.extend(members);
         }
     }
     for route in &mut result {
-        let witnessed = matches!(&route.table, Fact::Known(Some(t)) if witnesses.contains(&(*t, route.prefix.clone())));
-        if route.prefix.ends_with("/0") || witnessed {
-            route.role = Fact::Known(RouteRole::CoverageDeclaration);
+        let candidate = matches!(&route.table, Fact::Known(Some(t)) if candidates.contains(&(*t, route.prefix.clone())));
+        if route.prefix.ends_with("/0") || candidate {
+            route.role = Fact::Unknown(
+                "candidate prefix coverage has no RPDB/FIB reachability witness".into(),
+            );
         } else if route.prefix.ends_with("/1") {
-            route.role = Fact::Unknown("split coverage lacks same-table/family witness".into());
-        }
-    }
-    // Coverage declarations alone are not proof that this object's routes win
-    // the table lookup. Without full FIB evaluation, any other unicast interface
-    // or terminal path in this table is conservative Unknown (metrics are not
-    // guessed). This also prevents classifier's direct main-table split branch
-    // from bypassing the policy-rule association guard.
-    for route in &mut result {
-        if route.role == Fact::Known(RouteRole::CoverageDeclaration)
-            && indexed.coverage_selection_unproved(&route.table, interface)
-        {
-            route.role =
-                Fact::Unknown("competing table paths leave coverage selection unproved".into());
+            route.role = Fact::Unknown("split coverage lacks same-table/family candidate".into());
         }
     }
     Ok(result)

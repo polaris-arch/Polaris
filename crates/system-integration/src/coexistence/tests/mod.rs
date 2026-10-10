@@ -172,7 +172,7 @@ fn incomplete_address_snapshot_is_not_known_empty() {
     }
 }
 #[test]
-fn full_coverage_is_not_resource_collision_but_additional_route_is() {
+fn candidate_coverage_is_unknown_but_additional_resource_claim_is_independent() {
     let report = reports(&fixture(
         split(json!(254), json!(254)),
         json!([]),
@@ -180,14 +180,14 @@ fn full_coverage_is_not_resource_collision_but_additional_route_is() {
         json!([]),
     ))
     .remove(0);
-    assert_eq!(
+    assert!(matches!(
         predicate(&report, Rule::AddressCollision),
-        &Fact::Known(false)
-    );
-    assert_eq!(
+        Fact::Unknown(_)
+    ));
+    assert!(matches!(
         predicate(&report, Rule::EntryCannotBePreserved),
-        &Fact::Known(true)
-    );
+        Fact::Unknown(_)
+    ));
     let mut r = split(json!(254), json!(254));
     r.as_array_mut()
         .unwrap()
@@ -232,7 +232,7 @@ fn default_route_retains_table_unknown_and_does_not_guess_main() {
         panic!()
     };
     assert!(matches!(r[0].table, Fact::Unknown(_)));
-    assert_eq!(r[0].role, Fact::Known(RouteRole::CoverageDeclaration));
+    assert!(matches!(r[0].role, Fact::Unknown(_)));
 }
 #[test]
 fn early_global_policy_requires_same_table_family_and_interface() {
@@ -348,7 +348,7 @@ fn ecmp_nhid_malformed_and_wrong_family_routes_remain_unknown() {
     }
 }
 #[test]
-fn ipv6_coverage_and_named_builtin_tables_are_supported() {
+fn ipv6_candidates_preserve_named_builtin_tables_without_selected_coverage() {
     let f = fixture(
         json!([]),
         json!([{"dst":"::/1","dev":"vpn0","table":"main"},
@@ -356,16 +356,35 @@ fn ipv6_coverage_and_named_builtin_tables_are_supported() {
         json!([]),
         json!([]),
     );
+    let Fact::Known(routes) = object(&fixture(
+        json!([]),
+        json!([{"dst":"::/1","dev":"vpn0","table":"main"},
+            {"dst":"8000::/1","dev":"vpn0","table":"main"}]),
+        json!([]),
+        json!([]),
+    ))
+    .routes
+    else {
+        panic!()
+    };
+    assert_eq!(
+        routes.iter().map(|r| r.prefix.as_str()).collect::<Vec<_>>(),
+        vec!["::/1", "8000::/1"]
+    );
+    assert!(routes.iter().all(|r| r.table == Fact::Known(Some(254))
+        && r.scope == Fact::Known(RouteScope::Global)
+        && matches!(r.role, Fact::Unknown(_))));
     let report = reports(&f).remove(0);
-    assert_eq!(report.coverage.ipv6, Fact::Known(true));
+    assert!(matches!(report.coverage.ipv6, Fact::Unknown(_)));
+    // IPv6 candidates do not overlap the fixture's IPv4-only protected ranges.
     assert_eq!(
         predicate(&report, Rule::AddressCollision),
         &Fact::Known(false)
     );
-    assert_eq!(
+    assert!(matches!(
         predicate(&report, Rule::EntryCannotBePreserved),
-        &Fact::Known(true)
-    );
+        Fact::Unknown(_)
+    ));
 }
 #[test]
 fn own_attribution_and_phase_are_caller_evidence() {
@@ -435,11 +454,11 @@ fn arbitrary_complete_split_keeps_nested_business_routes_as_resources() {
         {"dst":"192.0.0.0/2","dev":"vpn0","table":254}]);
     let f = fixture(routes.clone(), json!([]), json!([]), json!([]));
     let report = reports(&f).remove(0);
-    assert_eq!(report.coverage.ipv4, Fact::Known(true));
-    assert_eq!(
+    assert!(matches!(report.coverage.ipv4, Fact::Unknown(_)));
+    assert!(matches!(
         predicate(&report, Rule::AddressCollision),
-        &Fact::Known(false)
-    );
+        Fact::Unknown(_)
+    ));
     routes
         .as_array_mut()
         .unwrap()
@@ -469,10 +488,10 @@ fn default_does_not_bless_nested_resource_route_or_merge_duplicate_halves() {
         .unwrap()
         .push(json!({"dst":"128.0.0.0/1","dev":"vpn0","table":254}));
     let f = fixture(r, json!([]), json!([]), json!([]));
-    assert_eq!(
+    assert!(matches!(
         predicate(&reports(&f)[0], Rule::AddressCollision),
-        &Fact::Known(false)
-    );
+        Fact::Unknown(_)
+    ));
 }
 
 #[test]
@@ -542,7 +561,8 @@ fn detailed_numeric_unicast_routes_are_parsed_for_both_families() {
     };
     assert_eq!(routes.len(), 2);
     assert!(routes.iter().all(|r| r.table == Fact::Known(Some(100))
-        && r.role == Fact::Known(RouteRole::CoverageDeclaration)));
+        && r.scope == Fact::Known(RouteScope::Global)
+        && matches!(r.role, Fact::Unknown(_))));
 }
 #[test]
 fn detailed_numeric_local_and_terminal_routes_match_textual_forms() {
@@ -854,7 +874,7 @@ fn main_split_competing_v6_coverage_does_not_establish_entry_loss() {
 }
 
 #[test]
-fn main_split_coverage_does_not_borrow_other_table_competition() {
+fn main_split_needs_reachability_proof_even_without_same_table_competition() {
     for v6 in [false, true] {
         let report = reports(&main_split_competition(v6, 100))
             .into_iter()
@@ -865,15 +885,15 @@ fn main_split_coverage_does_not_borrow_other_table_competition() {
         } else {
             &report.coverage.ipv4
         };
-        assert_eq!(coverage, &Fact::Known(true));
-        assert_eq!(
+        assert!(matches!(coverage, Fact::Unknown(_)));
+        assert!(matches!(
             predicate(&report, Rule::EntryCannotBePreserved),
-            &Fact::Known(true)
-        );
+            Fact::Unknown(_)
+        ));
     }
 }
 #[test]
-fn main_split_coverage_does_not_borrow_other_family_competition() {
+fn main_split_needs_reachability_proof_even_without_same_family_competition() {
     let mut f = main_split_competition(false, 254);
     f.outputs[2] = Ok(json!([
         {"type":"1","dst":"0.0.0.0/1","dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]},
@@ -885,11 +905,11 @@ fn main_split_coverage_does_not_borrow_other_family_competition() {
         .into_iter()
         .find(|r| r.interface == "vpn0")
         .unwrap();
-    assert_eq!(report.coverage.ipv4, Fact::Known(true));
-    assert_eq!(
+    assert!(matches!(report.coverage.ipv4, Fact::Unknown(_)));
+    assert!(matches!(
         predicate(&report, Rule::EntryCannotBePreserved),
-        &Fact::Known(true)
-    );
+        Fact::Unknown(_)
+    ));
 }
 #[test]
 fn same_table_terminal_path_or_unknown_table_path_leaves_coverage_unproved() {
@@ -912,4 +932,139 @@ fn same_table_terminal_path_or_unknown_table_path_leaves_coverage_unproved() {
         ));
         assert!(matches!(report.decision, Fact::Unknown(_)));
     }
+}
+fn cross_table_shadow(v6: bool) -> FixtureRunner {
+    let mut f = main_split_competition(v6, 100);
+    let prefixes = if v6 {
+        ["::/1", "8000::/1"]
+    } else {
+        ["0.0.0.0/1", "128.0.0.0/1"]
+    };
+    let rows = json!([
+        {"type":"1","dst":"default","dev":"eth0","table":"100","metric":10,"scope":"0","flags":[]},
+        {"type":"1","dst":prefixes[0],"dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]},
+        {"type":"1","dst":prefixes[1],"dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]}]);
+    let policy = json!([{"priority":100,"src":"all","table":"100"},
+        {"priority":32766,"src":"all","table":"254"}]);
+    f.outputs[if v6 { 3 } else { 2 }] = Ok(rows.to_string());
+    f.outputs[if v6 { 5 } else { 4 }] = Ok(policy.to_string());
+    f
+}
+fn assert_cross_table_shadow_unknown(v6: bool) {
+    let report = reports(&cross_table_shadow(v6))
+        .into_iter()
+        .find(|r| r.interface == "vpn0")
+        .unwrap();
+    let coverage = if v6 {
+        &report.coverage.ipv6
+    } else {
+        &report.coverage.ipv4
+    };
+    println!("RPDB table100 default shadows main254 vpn0 split: v6={v6}, coverage={coverage:?}, entry={:?}, decision={:?}",
+        predicate(&report,Rule::EntryCannotBePreserved),report.decision);
+    assert!(matches!(coverage, Fact::Unknown(_)));
+    assert!(matches!(
+        predicate(&report, Rule::EntryCannotBePreserved),
+        Fact::Unknown(_)
+    ));
+    assert!(matches!(report.decision, Fact::Unknown(_)));
+}
+#[test]
+fn rpdb_cross_table_v4_shadow_does_not_establish_selected_coverage() {
+    assert_cross_table_shadow_unknown(false);
+}
+#[test]
+fn rpdb_cross_table_v6_shadow_does_not_establish_selected_coverage() {
+    assert_cross_table_shadow_unknown(true);
+}
+
+#[test]
+fn coverage_candidates_stay_unknown_when_policy_is_unreadable_or_unrecognized() {
+    for v6 in [false, true] {
+        for policy in [
+            Err("permission denied".into()),
+            Ok("not json".into()),
+            Ok(
+                json!([{"priority":100,"src":"all","table":"100","future_selector":true}])
+                    .to_string(),
+            ),
+        ] {
+            let mut f = cross_table_shadow(v6);
+            f.outputs[if v6 { 5 } else { 4 }] = policy;
+            let report = reports(&f)
+                .into_iter()
+                .find(|r| r.interface == "vpn0")
+                .unwrap();
+            let coverage = if v6 {
+                &report.coverage.ipv6
+            } else {
+                &report.coverage.ipv4
+            };
+            assert!(matches!(coverage, Fact::Unknown(_)));
+            assert!(matches!(
+                predicate(&report, Rule::EntryCannotBePreserved),
+                Fact::Unknown(_)
+            ));
+            assert!(matches!(report.decision, Fact::Unknown(_)));
+        }
+    }
+}
+#[test]
+fn uncontested_coverage_candidates_do_not_erase_addresses_or_resource_claims() {
+    for routes in [
+        split(json!(254), json!(254)),
+        json!([{"dst":"default","dev":"vpn0","table":"254"}]),
+    ] {
+        let f = fixture(routes, json!([]), json!([]), json!([]));
+        let obj = object(&f);
+        let Fact::Known(routes) = &obj.routes else {
+            panic!()
+        };
+        assert!(routes.iter().all(|r| r.table == Fact::Known(Some(254))
+            && r.scope == Fact::Known(RouteScope::Global)
+            && matches!(r.role, Fact::Unknown(_))));
+        let Fact::Known(addresses) = &obj.addresses else {
+            panic!()
+        };
+        assert_eq!(addresses[0].address.to_string(), "10.8.0.2");
+        assert_eq!(addresses[0].prefix_len, 24);
+    }
+    let mut routes = split(json!(254), json!(254));
+    routes
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"dst":"198.18.42.0/24","dev":"vpn0","table":"254"}));
+    let obj = object(&fixture(routes.clone(), json!([]), json!([]), json!([])));
+    let Fact::Known(facts) = obj.routes else {
+        panic!()
+    };
+    assert_eq!(
+        facts
+            .iter()
+            .find(|r| r.prefix == "198.18.42.0/24")
+            .unwrap()
+            .role,
+        Fact::Known(RouteRole::ResourceClaim)
+    );
+    let report = reports(&fixture(routes, json!([]), json!([]), json!([]))).remove(0);
+    assert_eq!(
+        predicate(&report, Rule::AddressCollision),
+        &Fact::Known(true)
+    );
+    assert!(matches!(report.decision, Fact::Known(Some(_))));
+    // A supplied interface address is independently decisive, even with unknown coverage.
+    let mut f = fixture(
+        split(json!(254), json!(254)),
+        json!([]),
+        json!([]),
+        json!([]),
+    );
+    f.outputs[1] = Ok(json!([{"ifname":"vpn0","addr_info":[{"family":"inet","local":"198.18.0.1","prefixlen":16}]}]).to_string());
+    let report = reports(&f).remove(0);
+    assert_eq!(predicate(&report, Rule::OtherTunProxy), &Fact::Known(true));
+    assert_eq!(
+        predicate(&report, Rule::AddressCollision),
+        &Fact::Known(true)
+    );
+    assert!(matches!(report.decision, Fact::Known(Some(_))));
 }
