@@ -31,6 +31,7 @@ describe('COEX v1 strict observation boundary', () => {
       ['src-tauri/src/commands/coexistence_snapshot', rustFixture.producer.backendSourceSha256],
       ['crates/config-engine/src/builder/coexistence', rustFixture.producer.typesSourceSha256],
       ['crates/system-integration/src/coexistence/linux', rustFixture.producer.collectorSourceSha256],
+      ['crates/system-integration/src/coexistence/macos', rustFixture.producer.macosSourceSha256],
     ]) expect(createHash('sha256').update(moduleSource(module)).digest('hex'), module).toBe(hash);
     for (const wire of Object.values(rustFixture.snapshots)) expect(decodeCoexSnapshot(wire)).toEqual(wire);
     const v = decodeCoexSnapshot(rustFixture.snapshots.optionShapes); const row = objects(v)[0];
@@ -182,7 +183,7 @@ describe('COEX v1 strict observation boundary', () => {
     }
     const platforms = [...body('platform_tag').matchAll(/Platform::\w+ => "([^"]+)"/g)].map((m) => m[1]);
     expect(platforms.sort()).toEqual(['linux', 'darwin', 'win32', 'android', 'ios', 'other'].sort());
-    expect(body('collect_request')).toContain('if platform != Platform::Linux {');
+    expect(body('collect_request')).toContain('if !matches!(platform, Platform::Linux | Platform::Mac) {');
     expect(body('collect_request')).toContain('production COEX snapshot collector unavailable on this platform');
   });
 });

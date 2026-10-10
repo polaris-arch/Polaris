@@ -97,7 +97,9 @@ for (const platform of ['darwin', 'win32'] as const) {
       data.platform = platform; data.objects = unknown; data.observation = unknown; data.commandCleanup = unknown;
       c.reply({ success: true, data });
     }, platform);
-    await expect(card(page)).toContainText(en.settings.coex.sourceUnavailable);
+    if (platform === 'win32') await expect(card(page)).toContainText(en.settings.coex.sourceUnavailable);
+    else await expect(card(page)).not.toContainText(en.settings.coex.sourceUnavailable);
+    await expect(card(page)).toContainText('production source unavailable');
     await expect(card(page)).toContainText(en.settings.coex.unknown);
     await expect(card(page)).not.toContainText(en.settings.coex.observedEmpty);
     await expect(card(page).locator('[data-coex-interface]')).toHaveCount(0);
@@ -175,7 +177,7 @@ test('all five loaded locales display the mounted card and Unknown without trans
 });
 
 
-for (const [name, wire] of Object.entries(rustFixture.snapshots)) {
+for (const [name, wire] of Object.entries(rustFixture.snapshots).filter(([name]) => name === 'linuxCollector' || name === 'optionShapes')) {
   test(`actual Rust serializer ${name} crosses mounted wrapper and renders numeric/null table facts`, async ({ page }) => {
     await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click();
     await page.evaluate((data) => window.__coexHarness!.reply({ success: true, data }), wire);
@@ -190,5 +192,42 @@ for (const [name, wire] of Object.entries(rustFixture.snapshots)) {
       await expect(card(page)).toContainText('table source unreadable');
     }
     expect(await calls(page)).toHaveLength(1);
+  });
+}
+
+for (const name of ['macosCollector', 'macosPartialSources', 'macosUnknownScope'] as const) {
+  test(`actual Rust macOS ${name} crosses mounted wrapper without platform-absence or selection inference`, async ({ page }, testInfo) => {
+    await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click();
+    await page.evaluate((name) => {
+      const control = window.__coexHarness!;
+      control.reply({ success: true, data: control.serializedFixture(name) });
+    }, name);
+    await expect(card(page).getByRole('alert')).toHaveCount(0);
+    await expect(card(page)).toContainText('darwin');
+    await expect(card(page)).not.toContainText(en.settings.coex.sourceUnavailable);
+    await card(page).locator('summary').filter({ hasText: name === 'macosCollector' ? 'en0' : 'wire-mac0' }).click();
+    await expect(card(page)).toContainText(en.settings.coex.unknown);
+    await expect(card(page).locator('.good, .success, .safe')).toHaveCount(0);
+    if (name === 'macosCollector') {
+      await expect(card(page)).toContainText('192.168.10.142/24');
+      await expect(card(page)).toContainText(en.settings.coex.noTableNumber);
+      await expect(card(page)).toContainText('route role and selection not established');
+    } else if (name === 'macosPartialSources') {
+      await expect(card(page)).toContainText('10.77.2.9/24');
+      await expect(card(page)).toContainText('injected IPv6 permission denied');
+    } else {
+      await expect(card(page)).toContainText('non-contiguous IPv4 mask');
+      await expect(card(page)).toContainText('printed flags may truncate');
+      await expect(card(page)).toContainText(en.settings.coex.noTableNumber);
+    }
+    expect(await calls(page)).toHaveLength(1);
+    // Element screenshots extend outside the scroll container's visible clip.
+    // Save actual viewports after scrolling the facts into view.
+    if (name === 'macosCollector') {
+      await card(page).getByText('192.168.10.142/24', { exact: false }).scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath('coex-macos-addresses.png') });
+      await card(page).getByText(en.settings.coex.noTableNumber, { exact: false }).first().scrollIntoViewIfNeeded();
+    }
+    await page.screenshot({ path: testInfo.outputPath(`coex-${name}.png`) });
   });
 }

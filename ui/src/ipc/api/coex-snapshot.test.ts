@@ -46,4 +46,15 @@ describe('actual system wrapper through IPC envelope decoder', () => {
     await expect(systemApi.coexReadonlySnapshot()).rejects.toBeInstanceOf(CoexSnapshotDecodeError);
     expect(transport).not.toHaveBeenCalled();
   });
+  it('retains macOS partial-source Unknown through the registered no-argument wrapper', async () => {
+    transport.mockResolvedValueOnce({ success: true, data: rustFixture.snapshots.macosPartialSources });
+    const wire = await systemApi.coexReadonlySnapshot();
+    expect(wire.platform).toBe('darwin');
+    if (wire.objects.status !== 'known') throw Error('fixture roster unavailable');
+    expect(wire.objects.value[0].addresses.status).toBe('known');
+    expect(wire.objects.value[0].routes.status).toBe('unknown');
+    expect(wire.classification.status).toBe('unknown');
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+
 });

@@ -1,15 +1,237 @@
-//! Bounded decoding of existing `netstat -rn -f inet/inet6` captures.
+//! Read-only macOS fact collection and bounded decoding of existing captures.
 //!
 //! Retains rows that the legacy advisory probe drops (including I-scoped defaults).
 //! Observations do not establish coverage, selected egress, resource role, tunnel
-//! identity, addresses, or a complete ObjectFacts snapshot. A future assembly must
-//! supply Unknown for roles without independent evidence. No OS command is run here.
+//! identity or route selection. The collector queries both families and an interface
+//! roster; missing evidence remains Unknown. This is a manual diagnostics provider,
+//! not runtime reprobe, classifier, notification or egress projection.
 
-use super::{MAX_ROUTE_ROWS, MAX_SOURCE_BYTES};
+use super::{MAX_INTERFACE_ADDRESSES, MAX_INTERFACE_ROWS, MAX_ROUTE_ROWS, MAX_SOURCE_BYTES};
+use crate::exec::{Command, CommandRunner};
 use crate::route_probe::expand_netstat_destination;
-use polaris_config_engine::builder::coexistence::{AddressFamily, Fact, RouteScope};
+use polaris_config_engine::builder::coexistence::{
+    AddressFamily, Fact, InterfaceAddress, ObjectFacts, RouteFact, RouteScope,
+};
 use polaris_config_engine::user_config::cidr::normalize_cidr;
-use std::net::IpAddr;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
+
+/// Three sequential read-only queries through the caller's runner. Two seconds is
+/// the requested operation budget PER command, not a total deadline or pipe-memory
+/// cap. The snapshot IPC supplies its original observed-command custody runner.
+/// No fallback, host mutation, own-interface inference or automatic retry.
+///
+/// `ifconfig -a` supplies the roster and actual host addresses. Route association
+/// requires its exact printed interface. Even an observed point-to-point flag is
+/// not a proof of VPN identity, coverage or selected egress.
+pub fn collect_macos(runner: &impl CommandRunner) -> Fact<Vec<ObjectFacts>> {
+    let read = |program: &str, args: &[&str]| {
+        runner
+            .run(
+                &Command::new(program, args.iter().copied()),
+                Duration::from_secs(2),
+            )
+            .map(|output| output.stdout)
+    };
+    let routes4 =
+        parse_route_observations(read("netstat", &["-rn", "-f", "inet"]), AddressFamily::V4);
+    let routes6 =
+        parse_route_observations(read("netstat", &["-rn", "-f", "inet6"]), AddressFamily::V6);
+    let interfaces = read("ifconfig", &["-a"]).and_then(decode_interfaces);
+    let mut objects = match interfaces {
+        Ok(objects) => objects,
+        Err(reason) => return Fact::Unknown(format!("macOS ifconfig roster: {reason}")),
+    };
+    let routes = match (routes4, routes6) {
+        (Fact::Known(mut v4), Fact::Known(v6)) => {
+            v4.extend(v6);
+            if v4.iter().any(|row| !objects.contains_key(&row.interface)) {
+                Fact::Unknown(
+                    "route interface absent from ifconfig roster; non-atomic observations".into(),
+                )
+            } else {
+                Fact::Known(v4)
+            }
+        }
+        (Fact::Unknown(reason), _) | (_, Fact::Unknown(reason)) => Fact::Unknown(reason),
+    };
+    for object in objects.values_mut() {
+        object.routes = match &routes {
+            Fact::Known(rows) => Fact::Known(
+                rows.iter()
+                    .filter(|row| row.interface == object.interface)
+                    .map(|row| RouteFact {
+                        prefix: row.prefix.clone(),
+                        table: Fact::Known(None),
+                        scope: row.scope.clone(),
+                        role: Fact::Unknown(
+                            "route role and selection not established by netstat".into(),
+                        ),
+                    })
+                    .collect(),
+            ),
+            Fact::Unknown(reason) => Fact::Unknown(reason.clone()),
+        };
+    }
+    Fact::Known(objects.into_values().collect())
+}
+
+fn valid_interface(name: &str) -> bool {
+    name.chars().any(|c| c.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+}
+
+// A complete roster is never obtained from the legacy best-effort flags parser:
+// malformed top-level rows, duplicates and missing headers must not be skipped.
+// Nested bridge member lines stay in their parent block. Unknown address evidence
+// fails only that interface's address field, never replaces it with a partial list.
+fn decode_interfaces(raw: String) -> Result<BTreeMap<String, ObjectFacts>, String> {
+    if raw.len() > MAX_SOURCE_BYTES {
+        return Err("source exceeds byte limit".into());
+    }
+    let mut objects = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut address_count = 0usize;
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) {
+            let (name, rest) = line
+                .split_once(':')
+                .ok_or_else(|| format!("malformed interface header at line {}", index + 1))?;
+            let flag = rest
+                .split_whitespace()
+                .next()
+                .and_then(|token| token.strip_prefix("flags="));
+            let valid_flags =
+                flag.and_then(|v| v.split_once('<'))
+                    .is_some_and(|(number, letters)| {
+                        !number.is_empty()
+                            && number.bytes().all(|b| b.is_ascii_hexdigit())
+                            && letters.strip_suffix('>').is_some_and(|v| {
+                                v.is_empty()
+                                    || v.split(',').all(|f| {
+                                        !f.is_empty()
+                                            && f.bytes()
+                                                .all(|b| b.is_ascii_uppercase() || b == b'_')
+                                    })
+                            })
+                    });
+            if !valid_interface(name) || !valid_flags {
+                return Err(format!("malformed interface header at line {}", index + 1));
+            }
+            if objects.contains_key(name) {
+                return Err("duplicate interface header".into());
+            }
+            if objects.len() == MAX_INTERFACE_ROWS {
+                return Err("source exceeds interface limit".into());
+            }
+            current = Some(name.to_string());
+            address_count = 0;
+            objects.insert(
+                name.to_string(),
+                ObjectFacts {
+                    interface: name.to_string(),
+                    tunnel: Fact::Unknown("interface flags do not establish VPN identity".into()),
+                    virtualization: Fact::Unknown("virtualization not established".into()),
+                    addresses: Fact::Known(Vec::new()),
+                    routes: Fact::Unknown("routes not assembled".into()),
+                    policy_rules: Fact::Unknown("macOS policy source not observed".into()),
+                    stable_identity: Fact::Unknown("stable repair identity not established".into()),
+                },
+            );
+        } else {
+            let name = current
+                .as_ref()
+                .ok_or("interface continuation before header")?;
+            let tokens: Vec<_> = line.split_whitespace().collect();
+            if !matches!(tokens.first(), Some(&"inet" | &"inet6")) {
+                continue;
+            }
+            address_count += 1;
+            let object = objects.get_mut(name).ok_or("interface block unavailable")?;
+            if address_count > MAX_INTERFACE_ADDRESSES {
+                object.addresses = Fact::Unknown("macOS interface exceeds address limit".into());
+                continue;
+            }
+            match decode_address(&tokens, name) {
+                Ok(address) => {
+                    if let Fact::Known(rows) = &mut object.addresses {
+                        rows.push(address);
+                    }
+                }
+                Err(reason) => {
+                    object.addresses = Fact::Unknown(format!(
+                        "macOS {name} address at line {}: {reason}",
+                        index + 1
+                    ))
+                }
+            }
+        }
+    }
+    if objects.is_empty() {
+        return Err("missing interface headers".into());
+    }
+    Ok(objects)
+}
+
+fn decode_address(tokens: &[&str], interface: &str) -> Result<InterfaceAddress, String> {
+    let token = tokens.get(1).ok_or("missing host address")?;
+    let (address, zone) = token
+        .split_once('%')
+        .map_or((*token, None), |(ip, zone)| (ip, Some(zone)));
+    if zone.is_some_and(|zone| zone != interface) {
+        return Err("address zone differs from interface".into());
+    }
+    let address: IpAddr = address.parse().map_err(|_| "invalid host address")?;
+    let field = |key| {
+        let positions: Vec<_> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| (*v == key).then_some(i))
+            .collect();
+        match positions.as_slice() {
+            [i] => tokens.get(i + 1).copied().ok_or("missing prefix value"),
+            _ => Err("missing or duplicate prefix field"),
+        }
+    };
+    let prefix_len = match (tokens[0], address) {
+        ("inet", IpAddr::V4(_)) if zone.is_none() => {
+            let mask = field("netmask")?;
+            let number = if let Some(hex) = mask.strip_prefix("0x") {
+                if hex.len() != 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("invalid IPv4 mask".into());
+                }
+                u32::from_str_radix(hex, 16).map_err(|_| "invalid IPv4 mask")?
+            } else {
+                u32::from(mask.parse::<Ipv4Addr>().map_err(|_| "invalid IPv4 mask")?)
+            };
+            if number.leading_ones() + number.trailing_zeros() != 32 {
+                return Err("non-contiguous IPv4 mask".into());
+            }
+            u8::try_from(number.leading_ones()).map_err(|_| "invalid IPv4 prefix")?
+        }
+        ("inet6", IpAddr::V6(_)) => {
+            let bits = field("prefixlen")?;
+            if bits.is_empty() || !bits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid IPv6 prefix".into());
+            }
+            bits.parse::<u8>()
+                .ok()
+                .filter(|bits| *bits <= 128)
+                .ok_or("invalid IPv6 prefix")?
+        }
+        _ => return Err("host address family differs from source".into()),
+    };
+    Ok(InterfaceAddress {
+        address,
+        prefix_len,
+    })
+}
 
 /// One observed row, attributed only to its printed interface and supplied family.
 #[derive(Debug, Clone, PartialEq, Eq)]

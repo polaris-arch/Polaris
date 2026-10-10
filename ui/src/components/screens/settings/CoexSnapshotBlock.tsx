@@ -48,7 +48,7 @@ export function renderCoexFacts(
     });
   return <div data-coex-facts>
     <div className="card-sub">{t('settings.coex.platform')}: <span className="mono">{snapshot.platform}</span></div>
-    {snapshot.platform !== 'linux' && <div className="card-sub">{t('settings.coex.sourceUnavailable')}</div>}
+    {!['linux', 'darwin'].includes(snapshot.platform) && <div className="card-sub">{t('settings.coex.sourceUnavailable')}</div>}
     {fact(t('settings.coex.observation'), snapshot.observation, (value) => <>
       {t('settings.coex.elapsed')}: {value.elapsedMillis} · {t('settings.coex.atomic')}: {boolean(value.atomic)}
     </>)}

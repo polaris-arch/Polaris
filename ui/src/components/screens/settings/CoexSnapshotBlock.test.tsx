@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import en from '@/i18n/locales/en-US.json';
-import type { CoexSnapshot } from '@/contracts/coex-snapshot';
+import { decodeCoexSnapshot, type CoexSnapshot } from '@/contracts/coex-snapshot';
+import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
 const t = (key: string) => {
   let value: unknown = en;
   for (const part of key.split('.')) value = (value as Record<string, unknown>)[part];
@@ -64,4 +65,21 @@ describe('COEX fact projection on the actual settings surface', () => {
     const html = render(v); for (const raw of ['254', '100', 'ipv6', 'fwmark 0x8', 'role unresolved', 'association unresolved']) expect(html).toContain(raw);
     expect(html).toContain(en.settings.coex.classification);
   });
+  it('renders the actual Rust-generated macOS provider without a false source-unavailable label', () => {
+    const wire = decodeCoexSnapshot(rustFixture.snapshots.macosCollector);
+    const index = wire.objects.status === 'known' ? wire.objects.value.findIndex((o) => o.interface === 'en0') : -1;
+    expect(index).toBeGreaterThanOrEqual(0);
+    const html = render(wire, index);
+    expect(html).toContain('darwin'); expect(html).toContain('192.168.10.142/24');
+    expect(html).toContain(en.settings.coex.noTableNumber);
+    expect(html).not.toContain(en.settings.coex.sourceUnavailable);
+    expect(html).not.toContain('class="good"');
+  });
+  it('macOS admission/source failures remain Unknown without claiming the provider is unconnected', () => {
+    const v = fixture(); v.platform = 'darwin'; v.objects = unknown('snapshot worker busy'); v.observation = unknown('unavailable');
+    const html = render(v);
+    expect(html).toContain('snapshot worker busy'); expect(html).not.toContain(en.settings.coex.sourceUnavailable);
+    expect(html).not.toContain(en.settings.coex.observedEmpty);
+  });
+
 });

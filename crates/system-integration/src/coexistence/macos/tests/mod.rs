@@ -284,3 +284,270 @@ fn printed_flag_width_cannot_prove_absence_of_late_interface_scope_bit() {
         }
     }
 }
+
+use crate::exec::{Command, CommandOutput, CommandRunner};
+use std::sync::Mutex;
+
+struct MacFixtureRunner {
+    outputs: [Result<String, String>; 3],
+    calls: Mutex<Vec<(Command, Duration)>>,
+}
+impl CommandRunner for MacFixtureRunner {
+    fn run(&self, command: &Command, budget: Duration) -> Result<CommandOutput, String> {
+        let mut calls = self.calls.lock().unwrap();
+        let index = calls.len();
+        calls.push((command.clone(), budget));
+        self.outputs[index].clone().map(|stdout| CommandOutput {
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+fn provider(outputs: [Result<String, String>; 3]) -> Fact<Vec<ObjectFacts>> {
+    collect_macos(&MacFixtureRunner {
+        outputs,
+        calls: Mutex::default(),
+    })
+}
+fn fixture_inputs(file: &str) -> [Result<String, String>; 3] {
+    let suffix = if file.contains("route-get") || file.contains("parallels") {
+        "_NETSTAT"
+    } else {
+        ""
+    };
+    [
+        Ok(section(file, &format!("V4{suffix}"))),
+        Ok(section(file, &format!("V6{suffix}"))),
+        if file == FIXTURES[0] {
+            Err("historical capture has no ifconfig source".into())
+        } else {
+            Ok(section(
+                file,
+                if suffix.is_empty() {
+                    "IFCONFIG"
+                } else {
+                    "IFCONFIG_FLAGS"
+                },
+            ))
+        },
+    ]
+}
+fn object_rows(facts: Fact<Vec<ObjectFacts>>) -> Vec<ObjectFacts> {
+    let Fact::Known(objects) = facts else {
+        panic!("expected known roster: {facts:?}")
+    };
+    objects
+}
+fn empty_routes() -> [Result<String, String>; 3] {
+    [
+        Ok(HEADER.into()),
+        Ok(HEADER.into()),
+        Ok("vpn0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n".into()),
+    ]
+}
+#[test]
+fn provider_uses_only_three_exact_readonly_queries_and_two_second_operation_budgets() {
+    let runner = MacFixtureRunner {
+        outputs: empty_routes(),
+        calls: Mutex::default(),
+    };
+    let objects = object_rows(collect_macos(&runner));
+    assert_eq!(
+        runner.calls.into_inner().unwrap(),
+        vec![
+            (
+                Command::new("netstat", ["-rn", "-f", "inet"]),
+                Duration::from_secs(2)
+            ),
+            (
+                Command::new("netstat", ["-rn", "-f", "inet6"]),
+                Duration::from_secs(2)
+            ),
+            (Command::new("ifconfig", ["-a"]), Duration::from_secs(2)),
+        ]
+    );
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].addresses, Fact::Known(vec![]));
+    assert_eq!(objects[0].routes, Fact::Known(vec![]));
+    assert!(matches!(objects[0].tunnel, Fact::Unknown(_)));
+    assert!(matches!(objects[0].policy_rules, Fact::Unknown(_)));
+}
+#[test]
+fn provider_reads_actual_existing_rosters_and_retains_all_routes_without_selection_claims() {
+    assert!(matches!(
+        provider(fixture_inputs(FIXTURES[0])),
+        Fact::Unknown(_)
+    ));
+    for file in &FIXTURES[1..] {
+        let objects = object_rows(provider(fixture_inputs(file)));
+        let rows: Vec<_> = [AddressFamily::V4, AddressFamily::V6]
+            .into_iter()
+            .flat_map(|family| capture_rows(file, family))
+            .collect();
+        let mut route_count = 0;
+        for object in &objects {
+            assert!(
+                matches!(object.tunnel, Fact::Unknown(_)),
+                "{file} {}",
+                object.interface
+            );
+            assert!(matches!(object.virtualization, Fact::Unknown(_)));
+            assert!(matches!(object.policy_rules, Fact::Unknown(_)));
+            assert!(matches!(object.stable_identity, Fact::Unknown(_)));
+            let Fact::Known(routes) = &object.routes else {
+                panic!("{file}: {} {:?}", object.interface, object.routes)
+            };
+            let expected: Vec<_> = rows
+                .iter()
+                .filter(|r| r.interface == object.interface)
+                .collect();
+            assert_eq!(routes.len(), expected.len(), "{file} {}", object.interface);
+            for (actual, raw) in routes.iter().zip(expected) {
+                assert_eq!(actual.prefix, raw.prefix);
+                assert_eq!(actual.scope, raw.scope);
+                assert_eq!(actual.table, Fact::Known(None));
+                assert!(matches!(actual.role, Fact::Unknown(_)));
+            }
+            route_count += routes.len();
+            assert!(
+                matches!(object.addresses, Fact::Known(_)),
+                "{file} {} {:?}",
+                object.interface,
+                object.addresses
+            );
+        }
+        assert_eq!(route_count, rows.len());
+        let physical = objects.iter().find(|o| o.interface == "en0").unwrap();
+        let Fact::Known(addresses) = &physical.addresses else {
+            unreachable!()
+        };
+        assert!(addresses.iter().any(
+            |a| a.address == "192.168.10.142".parse::<IpAddr>().unwrap() && a.prefix_len == 24
+        ));
+        assert!(!objects.iter().any(|o| o.interface == "member"));
+        let inactive = objects.iter().find(|o| o.interface == "stf0").unwrap();
+        assert_eq!(inactive.addresses, Fact::Known(vec![]));
+    }
+}
+#[test]
+fn address_rows_keep_host_bits_peer_local_addresses_and_explicit_ipv6_zone() {
+    let mut input = empty_routes();
+    input[2] = Ok("vpn0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n\tinet 10.77.2.9 --> 10.77.2.1 netmask 0xffffff00\n\tinet 192.168.4.99 netmask 255.255.255.0 broadcast 192.168.4.255\n\tinet6 fe80::abcd%vpn0 prefixlen 64 scopeid 0x9\n\tinet6 fd00::9 prefixlen 128\n".into());
+    let objects = object_rows(provider(input));
+    let Fact::Known(rows) = &objects[0].addresses else {
+        panic!("{:?}", objects[0])
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|a| (a.address.to_string(), a.prefix_len))
+            .collect::<Vec<_>>(),
+        vec![
+            ("10.77.2.9".into(), 24),
+            ("192.168.4.99".into(), 24),
+            ("fe80::abcd".into(), 64),
+            ("fd00::9".into(), 128)
+        ]
+    );
+}
+#[test]
+fn incomplete_or_invalid_roster_is_unknown_never_a_partial_or_empty_object_list() {
+    for raw in [
+        "",
+        "\tinet 10.8.0.2 netmask 0xffffff00\n",
+        "vpn0: flags=bad mtu 1280\n",
+        "vpn0: flags=0<> mtu 1280\nmalformed\n",
+        "vpn0: flags=0<> mtu 1280\nvpn0: flags=0<> mtu 1280\n",
+        "member: en1 flags=3<LEARNING,DISCOVER>\n",
+    ] {
+        let mut input = empty_routes();
+        input[2] = Ok(raw.into());
+        assert!(matches!(provider(input), Fact::Unknown(_)), "{raw}");
+    }
+    for error in ["permission denied", "operation timed out", "not spawned"] {
+        let mut input = empty_routes();
+        input[2] = Err(error.into());
+        let Fact::Unknown(reason) = provider(input) else {
+            panic!("error became known")
+        };
+        assert!(reason.contains(error));
+    }
+}
+#[test]
+fn malformed_address_fails_its_whole_field_without_erasing_other_interface_or_route_facts() {
+    for row in [
+        "inet 10.8.0.2",
+        "inet 10.8.0.2 netmask 0xff00ff00",
+        "inet 10.8.0.2 netmask 0xffff",
+        "inet ::1 netmask 0xffffffff",
+        "inet6 10.8.0.2 prefixlen 24",
+        "inet6 ::1 prefixlen 129",
+        "inet6 ::1 prefixlen 1 prefixlen 2",
+        "inet6 fe80::1%other prefixlen 64",
+        "inet6 fe80::1%vpn0%extra prefixlen 64",
+        "inet 10.8.0.2 netmask 0xffffff00 netmask 0xffffffff",
+    ] {
+        let mut input = empty_routes();
+        input[2] = Ok(format!("vpn0: flags=0<> mtu 1280\n\tinet 10.8.0.9 netmask 0xffffff00\n\t{row}\n\tinet 10.8.0.10 netmask 0xffffff00\nother: flags=0<> mtu 1280\n\tinet 10.9.0.3 netmask 0xffffff00\n"));
+        let objects = object_rows(provider(input));
+        assert!(
+            matches!(
+                objects
+                    .iter()
+                    .find(|o| o.interface == "vpn0")
+                    .unwrap()
+                    .addresses,
+                Fact::Unknown(_)
+            ),
+            "{row}"
+        );
+        let other = objects.iter().find(|o| o.interface == "other").unwrap();
+        assert!(matches!(other.addresses, Fact::Known(_)));
+        assert_eq!(other.routes, Fact::Known(vec![]));
+    }
+}
+#[test]
+fn route_failure_or_unmatched_interface_never_borrows_other_family_or_object_evidence() {
+    for bad in [
+        Err("IPv6 permission denied".into()),
+        Ok("garbled".into()),
+        Ok(format!("{HEADER}::/0 link#2 UCSI missing0\n")),
+    ] {
+        let mut input = empty_routes();
+        input[0] = Ok(format!(
+            "{HEADER}0/1 link#2 UCS vpn0\n128/1 link#2 UCS vpn0\n"
+        ));
+        input[1] = bad;
+        let objects = object_rows(provider(input));
+        assert!(matches!(objects[0].routes, Fact::Unknown(_)));
+        assert_eq!(objects[0].addresses, Fact::Known(vec![]));
+    }
+    let mut input = empty_routes();
+    input[0] = Ok(format!("{HEADER}0/1 link#2 UCS vpn0\n"));
+    input[1] = Ok(format!("{HEADER}::/0 link#3 UCSI other\n"));
+    input[2] = Ok("vpn0: flags=0<> mtu 1280\nother: flags=0<> mtu 1280\n".into());
+    let objects = object_rows(provider(input));
+    assert_eq!(objects.len(), 2);
+    assert!(objects
+        .iter()
+        .all(|o| matches!(&o.routes, Fact::Known(rows) if rows.len()==1)));
+}
+#[test]
+fn provider_limits_fail_closed_without_truncating_roster_or_address_list() {
+    let mut input = empty_routes();
+    input[2] = Ok("x".repeat(MAX_SOURCE_BYTES + 1));
+    assert!(matches!(provider(input), Fact::Unknown(_)));
+    let mut input = empty_routes();
+    input[2] = Ok((0..=MAX_INTERFACE_ROWS)
+        .map(|i| format!("if{i}: flags=0<> mtu 1280\n"))
+        .collect());
+    assert!(matches!(provider(input), Fact::Unknown(_)));
+    let mut input = empty_routes();
+    input[2] = Ok(format!(
+        "vpn0: flags=0<> mtu 1280\n{}",
+        "\tinet 10.8.0.9 netmask 0xffffff00\n".repeat(MAX_INTERFACE_ADDRESSES + 1)
+    ));
+    assert!(matches!(
+        object_rows(provider(input))[0].addresses,
+        Fact::Unknown(_)
+    ));
+}

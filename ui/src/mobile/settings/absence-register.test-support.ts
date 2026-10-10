@@ -316,7 +316,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'CoexSnapshotBlock.tsx|k:settings.coex.previous',
       disposition: {
         kind: 'platform-absent',
-        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac) {' },
       },
       note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
@@ -325,7 +325,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'CoexSnapshotBlock.tsx|k:settings.coex.next',
       disposition: {
         kind: 'platform-absent',
-        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac) {' },
       },
       note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
@@ -334,7 +334,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'CoexSnapshotBlock.tsx|f:preventDefault',
       disposition: {
         kind: 'platform-absent',
-        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac) {' },
       },
       note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
@@ -343,7 +343,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'CoexSnapshotBlock.tsx|k:settings.coex.collect+settings.coex.loading+settings.coex.retry',
       disposition: {
         kind: 'platform-absent',
-        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac) {' },
       },
       note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
@@ -1006,7 +1006,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'platform-absent',
         evidence: {
           file: 'src-tauri/src/commands/coexistence_snapshot.rs',
-          mustContain: 'if platform != Platform::Linux {',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac) {',
         },
       },
       note: '当前 COEX 采集源未接入移动端，返回 unavailable/Unknown；本片明确不挂桌面专用命令。' +

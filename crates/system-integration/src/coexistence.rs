@@ -1,7 +1,7 @@
 //! COEX fact collection, separate from the legacy advisory route probe.
 //!
-//! Linux has an iproute2 collector; macOS has a pure route decoder and Windows
-//! has pure injected-input validation. Neither decoder/validator reads the host.
+//! Linux has an iproute2 collector; macOS has a three-command read-only collector
+//! and route decoder; Windows has pure injected-input validation without a provider.
 //! These slices do not schedule runtime reprobes, notify, persist repair history,
 //! or project exits. Collection is sequential
 //! and read-only; callers must offload it when running in an async context. Enumeration
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 mod linux;
 
-/// Pure macOS route observations; no host queries or selected-egress claims.
+/// macOS read-only collection and observations; no selected-egress claims.
 pub mod macos;
 
 /// Pure injected Windows observations; no production source or selected-egress claims.

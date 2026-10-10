@@ -1,6 +1,6 @@
 {
   "producer": {
-    "backendSourceSha256": "68559f976d48511e8d4339e4d45552822b94cbfe6d9ce62af1f1774c5084f1c3",
+    "backendSourceSha256": "0c2305c557d2095c244eb15943d13739891f03419410e3abb035876cfe0ceb8c",
     "collectorSourceSha256": "334c54d0d1e138f214fe6d41599bb95df38fb7cd553ce9be4e9c03d1043b7b07",
     "copiedFunctions": [
       "fact_wire",
@@ -9,10 +9,13 @@
       "platform_tag",
       "snapshot_wire"
     ],
-    "copiedFunctionsSha256": "5d3e017142577970ca238c001dc66cd9a06b37713f27d0abf1163eb7cd87bf53",
-    "frozenBackendHead": "73551cc34519110113967d4d6619b424d0688ada",
+    "copiedFunctionsSha256": "13c58cbe2913c5b0bb1c2cff6dab370360c9228fcab947296b8ce9d78c8f99aa",
     "kind": "Rust-generated fixture; no host or native IPC sampling",
-    "method": "Production collect_linux with injected fixture runner; exact production fact_wire/object_wire/snapshot_wire functions compiled unchanged against actual crate types. Option-shapes case explicitly supplies typed synthetic table values to the same serializer.",
+    "macosCapture": "macos-p101-routes-ts-on-2026-09-12.txt",
+    "macosCaptureSha256": "ecad16eb60f8464b41e5a8cf9a8c57107b7ecba8fa3ff96d579d1855e9ee66ff",
+    "macosSourceSha256": "037fdbab673ead96d3eb49b7f5bb31bd257d112394ce7b78e384bb7abcd374e5",
+    "method": "Production collect_linux and collect_macos with injected fixed source runners; exact production fact_wire/object_wire/snapshot_wire functions compiled unchanged against actual crate types. Mac collector sample consumes existing sanitized capture; partial and unknown-scope cases are synthetic failures, option-shapes supplies typed synthetic tables. No native source invoked.",
+    "signedBase": "199544118e34a6e32f76b8506a301b486e7ed8d7",
     "typesSourceSha256": "e84a24f5f66a77cdf4082346a70cf7fc810d66af3f94f6460da2007cf2bda2c2"
   },
   "snapshots": {
@@ -162,6 +165,4465 @@
         }
       },
       "platform": "linux",
+      "schemaVersion": 1
+    },
+    "macosCollector": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "status": "known",
+        "value": "noRetainedSnapshotCommand"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "status": "known",
+        "value": [
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "anpi0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "anpi1",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "anpi2",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "ap1",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::cf96:175a:b9a3:773e",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "awdl0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "bridge0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::5c5a:3a4c:f6e7:1531",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "192.168.10.142",
+                  "prefixLen": 24
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:4d84:736d:a238:c6f6",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:11b9:9023:de65:a7c8",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:bb74:4d6f:1e0f:2757",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:40bd:927e:22ef:1536",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:c6d6:48aa:e0f:29ea",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:5bc7:b9ca:d002:74dd",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:e6d:23af:f4b4:5bbd",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:bc35:d302:d15d:7f3e",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:bc35:d302:d15d:7f3e",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:4bd5:7dfa:719c:fcbc",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:4bd5:7dfa:719c:fcbc",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:4bd5:7dfa:719c:fcbc",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:6ec3:5258:a940:6d1d",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:6ec3:5258:a940:6d1d",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:6ec3:5258:a940:6d1d",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:72ea:7628:a850:b80a",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:72ea:7628:a850:b80a",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:72ea:7628:a850:b80a",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:108:e4b:1c21:b564",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "d114:342:b8da:6d8e:108:e4b:1c21:b564",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e::818",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "9757:a50f:cf73:9c4e:108:e4b:1c21:b564",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "aded:14a8:b9be:ee8b:ec4f:e627:1d3f:7fce",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "en0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "0.0.0.0/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "169.254.0.0/16",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.0/24",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.1/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.1/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.99/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.105/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.106/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.107/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.108/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.109/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.111/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.112/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.114/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.116/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.119/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.121/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.127/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.131/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.133/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.139/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.141/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.142/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.143/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.146/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.147/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.160/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.170/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.186/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.188/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.190/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.191/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.201/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.202/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.206/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.208/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.212/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.213/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.214/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.215/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.216/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.218/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.222/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.229/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.231/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.235/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.236/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.237/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.249/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "224.0.0.0/4",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "224.0.0.251/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "239.255.255.250/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "255.255.255.255/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee80::/60",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b::1/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b::7f5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:490:8939:fd4c:73b4/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:342:21c1:b6d2:8ff7/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:1d9b:ecf1:7302:124d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:6e4b:a2e2:e5f:4bfd/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:abd9:af40:8d2c:a218/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c40::/60",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e::1/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e::7f5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:1b7:c7bf:e9f1:bd2d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:6837:d002:9474:1ec5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:5889:cfde:b3f3:1cd5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:322f:44e5:6965:51e0/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:399d:d269:186d:dc95/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:aeb0:3710:9fb5:e832/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:11ee:da70:4eff:91ae/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:8fcf:94ad:2d37:2363/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:2f9f:4d11:e174:e2de/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:5d01::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d00::/56",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e::1/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e::7f5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:96a5:d023:56e3:1e63/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:e5db:75b:1634:7447/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:9f2d:e9c9:f567:c9b6/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:611e:7bb6:8b3b:3a2b/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:1974:5bd6:6a39:d38d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::7fd:1819:1bc5:9967/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::4c8:6baf:1cd8:8798/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::1746:94ca:edf3:b388/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::4f71:12b1:f806:1381/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::cbad:eb0e:16e2:760f/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::6dae:6012:14df:9ed5/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en1",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en2",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en3",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en4",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en5",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "en6",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "gif0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::cf96:175a:b9a3:773e",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "llw0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "127.0.0.1",
+                  "prefixLen": 8
+                },
+                {
+                  "address": "::1",
+                  "prefixLen": 128
+                },
+                {
+                  "address": "fe80::1",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "lo0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "127.0.0.0/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "127.0.0.1/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "192.168.10.142/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "::1/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:108:e4b:1c21:b564/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:11b9:9023:de65:a7c8/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:4bd5:7dfa:719c:fcbc/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:6ec3:5258:a940:6d1d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:ec4f:e627:1d3f:7fce/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:5bc7:b9ca:d002:74dd/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:72ea:7628:a850:b80a/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "aded:14a8:b9be:ee8b:40bd:927e:22ef:1536/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e::818/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:108:e4b:1c21:b564/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:4d84:736d:a238:c6f6/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:4bd5:7dfa:719c:fcbc/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:6ec3:5258:a940:6d1d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:c6d6:48aa:e0f:29ea/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:bc35:d302:d15d:7f3e/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:72ea:7628:a850:b80a/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "9757:a50f:cf73:9c4e:bb74:4d6f:1e0f:2757/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:e6d:23af:f4b4:5bbd/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:108:e4b:1c21:b564/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:4bd5:7dfa:719c:fcbc/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:6ec3:5258:a940:6d1d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:bc35:d302:d15d:7f3e/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "d114:342:b8da:6d8e:72ea:7628:a850:b80a/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fd7a:115c:a1e0::d3/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::1/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::5c5a:3a4c:f6e7:1531/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::cf96:175a:b9a3:773e/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::cf96:175a:b9a3:773e/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::2fe5:3b81:bad1:be1c/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::8b03:d0c:1f89:5550/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::8433:10d0:de0f:3f3d/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::764f:9a0:6d5b:2ea/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::7c4a:fd53:105e:d3/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::f14a:6751:840d:5527/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::b5fe:5c32:14c5:1efc/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::db11:96a:cbf8:1949/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::15d0:72c7:6c59:a236/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "stf0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::2fe5:3b81:bad1:be1c",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::8b03:d0c:1f89:5550",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun1",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "utun10",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::15d0:72c7:6c59:a236",
+                  "prefixLen": 64
+                },
+                {
+                  "address": "32.0.0.30",
+                  "prefixLen": 32
+                },
+                {
+                  "address": "fd7a:115c:a1e0::d3",
+                  "prefixLen": 48
+                }
+              ]
+            },
+            "interface": "utun11",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "0.0.0.0/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.1/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.2/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.3/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.4/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.5/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.7/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.8/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.9/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.10/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.12/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.13/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.14/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.15/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.17/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.19/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.20/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.21/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.23/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.24/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.25/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.26/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.27/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.28/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.29/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "32.0.0.30/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "100.100.100.100/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "224.0.0.0/4",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "255.255.255.255/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fd7a:115c:a1e0::/48",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fd7a:115c:a1e0::16/128",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::8433:10d0:de0f:3f3d",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun2",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::764f:9a0:6d5b:2ea",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun3",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::7c4a:fd53:105e:d3",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun4",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::f14a:6751:840d:5527",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun5",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::b5fe:5c32:14c5:1efc",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun6",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "fe80::db11:96a:cbf8:1949",
+                  "prefixLen": 64
+                }
+              ]
+            },
+            "interface": "utun7",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "::/0",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "fe80::/64",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff00::/8",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff01::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "ff02::/32",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "interfaceScoped"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "utun8",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          },
+          {
+            "addresses": {
+              "status": "known",
+              "value": []
+            },
+            "interface": "utun9",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": []
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          }
+        ]
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "darwin",
+      "schemaVersion": 1
+    },
+    "macosPartialSources": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "status": "known",
+        "value": "noRetainedSnapshotCommand"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "status": "known",
+        "value": [
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "10.77.2.9",
+                  "prefixLen": 24
+                }
+              ]
+            },
+            "interface": "wire-mac0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "reason": "macOS netstat V6: injected IPv6 permission denied",
+              "status": "unknown"
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          }
+        ]
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "darwin",
+      "schemaVersion": 1
+    },
+    "macosUnknownScope": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "status": "known",
+        "value": "noRetainedSnapshotCommand"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "status": "known",
+        "value": [
+          {
+            "addresses": {
+              "reason": "macOS wire-mac0 address at line 2: non-contiguous IPv4 mask",
+              "status": "unknown"
+            },
+            "interface": "wire-mac0",
+            "policyRules": {
+              "reason": "macOS policy source not observed",
+              "status": "unknown"
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "0.0.0.0/1",
+                  "role": {
+                    "reason": "route role and selection not established by netstat",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "printed flags may truncate the interface-scope bit",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "reason": "stable repair identity not established",
+              "status": "unknown"
+            },
+            "tunnel": {
+              "reason": "interface flags do not establish VPN identity",
+              "status": "unknown"
+            },
+            "virtualization": {
+              "reason": "virtualization not established",
+              "status": "unknown"
+            }
+          }
+        ]
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "darwin",
       "schemaVersion": 1
     },
     "optionShapes": {

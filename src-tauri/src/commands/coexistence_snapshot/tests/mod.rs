@@ -1,4 +1,4 @@
-//! Injected command ownership and synthetic ip JSON only. No native start call.
+//! Injected command ownership, macOS captures and synthetic failures only. No native start call.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Condvar;
@@ -24,7 +24,7 @@ struct FixtureSource {
 
 impl FixtureSource {
     fn new(outputs: Vec<Result<String, String>>) -> Self {
-        assert_eq!(outputs.len(), 6);
+        assert!(matches!(outputs.len(), 3 | 6));
         Self {
             outputs: Arc::new(outputs),
             calls: Arc::default(),
@@ -33,6 +33,22 @@ impl FixtureSource {
 
     fn empty() -> Self {
         Self::new(vec![Ok("[]".into()); 6])
+    }
+
+    fn for_platform(platform: Platform) -> Self {
+        if platform == Platform::Mac {
+            Self::macos()
+        } else {
+            Self::empty()
+        }
+    }
+
+    fn macos() -> Self {
+        Self::new(vec![
+            Ok("Destination Gateway Flags Netif Expire\n0/1 link#9 UCS vpn0\n128/1 link#9 UCS vpn0\n".into()),
+            Ok("Destination Gateway Flags Netif Expire\n::/0 link#9 UCSI vpn0\n".into()),
+            Ok("vpn0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n\tinet 10.77.2.9 netmask 0xffffff00\n\tinet6 fe80::abcd%vpn0 prefixlen 64 scopeid 0x9\n".into()),
+        ])
     }
 
     fn with_links(routes4: Value, routes6: Value, rules4: Value, rules6: Value) -> Self {
@@ -193,7 +209,6 @@ async fn unknown_route_source_keeps_independent_address_evidence() {
 #[tokio::test]
 async fn unsupported_platforms_and_denied_windows_have_zero_source_calls() {
     for platform in [
-        Platform::Mac,
         Platform::Win,
         Platform::Other,
         Platform::Android,
@@ -244,27 +259,29 @@ async fn allowed_main_window_returns_existing_api_envelope_with_explicit_unknown
 
 #[tokio::test]
 async fn contended_worker_lock_returns_unknown_without_waiting_or_starting_queries() {
-    let service = Arc::new(SnapshotService::default());
-    let worker_service = Arc::clone(&service);
-    let (started, receiver) = tokio::sync::oneshot::channel();
-    let (release, release_receiver) = std::sync::mpsc::channel();
-    let holder = std::thread::spawn(move || {
-        let _slot = worker_service.slot.lock().unwrap();
-        started.send(()).unwrap();
-        let _ = release_receiver.recv_timeout(Duration::from_secs(2));
-    });
-    receiver.await.unwrap();
-    let source = FixtureSource::empty();
-    let calls = Arc::clone(&source.calls);
-    let response = collect_request(service, Platform::Linux, source).await;
-    // Release even before assertions so a regression does not strand the fixture holder.
-    release.send(()).unwrap();
-    holder.join().unwrap();
-    assert!(response.data.unwrap()["objects"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("busy"));
-    assert!(calls.lock().unwrap().is_empty());
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let worker_service = Arc::clone(&service);
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _slot = worker_service.slot.lock().unwrap();
+            started.send(()).unwrap();
+            let _ = release_receiver.recv_timeout(Duration::from_secs(2));
+        });
+        receiver.await.unwrap();
+        let source = FixtureSource::for_platform(platform);
+        let calls = Arc::clone(&source.calls);
+        let response = collect_request(service, platform, source).await;
+        // Release even before assertions so a regression does not strand the fixture holder.
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(response.data.unwrap()["objects"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("busy"));
+        assert!(calls.lock().unwrap().is_empty());
+    }
 }
 
 struct RetainedOwner {
@@ -352,117 +369,126 @@ impl ObservationSource for RetainedSource {
 
 #[tokio::test]
 async fn retained_original_owner_blocks_remaining_queries_and_reentry_until_observed_closed() {
-    let service = Arc::new(SnapshotService::default());
-    let source = RetainedSource::new();
-    let calls = Arc::clone(&source.calls);
-    let closed = Arc::clone(&source.closed);
-    let polls = Arc::clone(&source.polls);
-    let drops = Arc::clone(&source.drops);
-    let first = collect_request(Arc::clone(&service), Platform::Linux, source)
-        .await
-        .data
-        .unwrap();
-    assert_eq!(first["objects"]["status"], "unknown");
-    assert_eq!(first["commandCleanup"]["status"], "unknown");
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    let fresh = FixtureSource::empty();
-    let fresh_calls = Arc::clone(&fresh.calls);
-    let second = collect_request(Arc::clone(&service), Platform::Linux, fresh.clone())
-        .await
-        .data
-        .unwrap();
-    assert_eq!(second["objects"]["status"], "unknown");
-    assert!(fresh_calls.lock().unwrap().is_empty());
-    assert_eq!(polls.load(Ordering::SeqCst), 2);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    closed.store(true, Ordering::SeqCst);
-    let third = collect_request(service, Platform::Linux, fresh)
-        .await
-        .data
-        .unwrap();
-    assert_eq!(third["objects"]["status"], "known");
-    assert_eq!(fresh_calls.lock().unwrap().len(), 6);
-    assert_eq!(polls.load(Ordering::SeqCst), 3);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let source = RetainedSource::new();
+        let calls = Arc::clone(&source.calls);
+        let closed = Arc::clone(&source.closed);
+        let polls = Arc::clone(&source.polls);
+        let drops = Arc::clone(&source.drops);
+        let first = collect_request(Arc::clone(&service), platform, source)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(first["objects"]["status"], "unknown");
+        assert_eq!(first["commandCleanup"]["status"], "unknown");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let fresh = FixtureSource::for_platform(platform);
+        let fresh_calls = Arc::clone(&fresh.calls);
+        let second = collect_request(Arc::clone(&service), platform, fresh.clone())
+            .await
+            .data
+            .unwrap();
+        assert_eq!(second["objects"]["status"], "unknown");
+        assert!(fresh_calls.lock().unwrap().is_empty());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        closed.store(true, Ordering::SeqCst);
+        let third = collect_request(service, platform, fresh)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(third["objects"]["status"], "known");
+        assert_eq!(
+            fresh_calls.lock().unwrap().len(),
+            if platform == Platform::Mac { 3 } else { 6 }
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
 async fn cancel_ipc_waiter_keeps_worker_admission_then_retains_original_owner() {
-    let service = Arc::new(SnapshotService::default());
-    let mut source = RetainedSource::new();
-    let (started, receiver) = tokio::sync::oneshot::channel();
-    *source.started.lock().unwrap() = Some(started);
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    source.release = Some(Arc::clone(&release));
-    let drops = Arc::clone(&source.drops);
-    let source_calls = Arc::clone(&source.calls);
-    let worker_service = Arc::clone(&service);
-    let waiter =
-        tokio::spawn(async move { collect_request(worker_service, Platform::Linux, source).await });
-    tokio::time::timeout(Duration::from_secs(2), receiver)
-        .await
-        .unwrap()
-        .unwrap();
-    waiter.abort();
-    assert!(waiter.await.unwrap_err().is_cancelled());
-    let fresh = FixtureSource::empty();
-    let calls = Arc::clone(&fresh.calls);
-    let busy = collect_request(Arc::clone(&service), Platform::Linux, fresh.clone())
-        .await
-        .data
-        .unwrap();
-    assert!(busy["objects"]["reason"].as_str().unwrap().contains("busy"));
-    assert!(calls.lock().unwrap().is_empty());
-    *release.0.lock().unwrap() = true;
-    release.1.notify_one();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !service.lock_worker().busy {
-                break;
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let mut source = RetainedSource::new();
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        *source.started.lock().unwrap() = Some(started);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        source.release = Some(Arc::clone(&release));
+        let drops = Arc::clone(&source.drops);
+        let source_calls = Arc::clone(&source.calls);
+        let worker_service = Arc::clone(&service);
+        let waiter =
+            tokio::spawn(async move { collect_request(worker_service, platform, source).await });
+        tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let fresh = FixtureSource::for_platform(platform);
+        let calls = Arc::clone(&fresh.calls);
+        let busy = collect_request(Arc::clone(&service), platform, fresh.clone())
+            .await
+            .data
+            .unwrap();
+        assert!(busy["objects"]["reason"].as_str().unwrap().contains("busy"));
+        assert!(calls.lock().unwrap().is_empty());
+        *release.0.lock().unwrap() = true;
+        release.1.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !service.lock_worker().busy {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(service.lock_worker().pending.is_some());
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    let retained = collect_request(Arc::clone(&service), Platform::Linux, fresh)
+        })
         .await
-        .data
         .unwrap();
-    assert_eq!(retained["commandCleanup"]["status"], "unknown");
-    assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(service.lock_worker().pending.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let retained = collect_request(Arc::clone(&service), platform, fresh)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(retained["commandCleanup"]["status"], "unknown");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
 async fn worker_panic_preserves_stored_owner_and_quarantines_instead_of_clearing_busy_only() {
-    let service = Arc::new(SnapshotService::default());
-    let mut source = RetainedSource::new();
-    source.panic_on_poll = true;
-    let drops = Arc::clone(&source.drops);
-    let response = collect_request(Arc::clone(&service), Platform::Linux, source)
-        .await
-        .data
-        .unwrap();
-    assert!(response["objects"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("join failed"));
-    assert!(service.lock_worker().pending.is_some());
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    let fresh = FixtureSource::empty();
-    let calls = Arc::clone(&fresh.calls);
-    let blocked = collect_request(Arc::clone(&service), Platform::Linux, fresh)
-        .await
-        .data
-        .unwrap();
-    assert_eq!(blocked["objects"]["status"], "unknown");
-    assert!(calls.lock().unwrap().is_empty());
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let mut source = RetainedSource::new();
+        source.panic_on_poll = true;
+        let drops = Arc::clone(&source.drops);
+        let response = collect_request(Arc::clone(&service), platform, source)
+            .await
+            .data
+            .unwrap();
+        assert!(response["objects"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("join failed"));
+        assert!(service.lock_worker().pending.is_some());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let fresh = FixtureSource::for_platform(platform);
+        let calls = Arc::clone(&fresh.calls);
+        let blocked = collect_request(Arc::clone(&service), platform, fresh)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(blocked["objects"]["status"], "unknown");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
 }
 
 struct SpawnFailure;
@@ -474,19 +500,21 @@ impl ObservationSource for SpawnFailure {
 
 #[tokio::test]
 async fn spawn_failure_is_unknown_without_fabricating_objects_or_holding_unspawned_owner() {
-    let service = Arc::new(SnapshotService::default());
-    let value = collect_request(Arc::clone(&service), Platform::Linux, SpawnFailure)
-        .await
-        .data
-        .unwrap();
-    assert_eq!(value["objects"]["status"], "unknown");
-    assert!(service.lock_worker().pending.is_none());
-    let fresh = collect_request(service, Platform::Linux, FixtureSource::empty())
-        .await
-        .data
-        .unwrap();
-    assert_eq!(fresh["objects"]["status"], "known");
-    assert_context_unknown(&fresh);
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let value = collect_request(Arc::clone(&service), platform, SpawnFailure)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(value["objects"]["status"], "unknown");
+        assert!(service.lock_worker().pending.is_none());
+        let fresh = collect_request(service, platform, FixtureSource::for_platform(platform))
+            .await
+            .data
+            .unwrap();
+        assert_eq!(fresh["objects"]["status"], "known");
+        assert_context_unknown(&fresh);
+    }
 }
 
 struct InvalidOwnership;
@@ -498,34 +526,36 @@ impl ObservationSource for InvalidOwnership {
 
 #[tokio::test]
 async fn unavailable_ownership_and_poisoned_admission_fail_closed() {
-    let service = Arc::new(SnapshotService::default());
-    let value = collect_request(Arc::clone(&service), Platform::Linux, InvalidOwnership)
-        .await
-        .data
-        .unwrap();
-    assert_eq!(value["objects"]["status"], "unknown");
-    let fresh = FixtureSource::empty();
-    let calls = Arc::clone(&fresh.calls);
-    collect_request(service, Platform::Linux, fresh).await;
-    assert!(calls.lock().unwrap().is_empty());
-    let poisoned = Arc::new(SnapshotService::default());
-    let poison_ref = Arc::clone(&poisoned);
-    assert!(std::panic::catch_unwind(move || {
-        let _lock = poison_ref.slot.lock().unwrap();
-        panic!("injected state poison");
-    })
-    .is_err());
-    let fresh = FixtureSource::empty();
-    let calls = Arc::clone(&fresh.calls);
-    let value = collect_request(poisoned, Platform::Linux, fresh)
-        .await
-        .data
-        .unwrap();
-    assert!(value["objects"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("poisoned"));
-    assert!(calls.lock().unwrap().is_empty());
+    for platform in [Platform::Linux, Platform::Mac] {
+        let service = Arc::new(SnapshotService::default());
+        let value = collect_request(Arc::clone(&service), platform, InvalidOwnership)
+            .await
+            .data
+            .unwrap();
+        assert_eq!(value["objects"]["status"], "unknown");
+        let fresh = FixtureSource::for_platform(platform);
+        let calls = Arc::clone(&fresh.calls);
+        collect_request(service, platform, fresh).await;
+        assert!(calls.lock().unwrap().is_empty());
+        let poisoned = Arc::new(SnapshotService::default());
+        let poison_ref = Arc::clone(&poisoned);
+        assert!(std::panic::catch_unwind(move || {
+            let _lock = poison_ref.slot.lock().unwrap();
+            panic!("injected state poison");
+        })
+        .is_err());
+        let fresh = FixtureSource::for_platform(platform);
+        let calls = Arc::clone(&fresh.calls);
+        let value = collect_request(poisoned, platform, fresh)
+            .await
+            .data
+            .unwrap();
+        assert!(value["objects"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("poisoned"));
+        assert!(calls.lock().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -543,10 +573,13 @@ fn registration_and_native_observed_custody_path_are_anchored_to_actual_entry() 
         request.find("!allowed_window(label)").unwrap() < request.find("collect_request(").unwrap()
     );
     let collect = top_level_fn_body(&source, "async fn collect_request<S:");
-    assert!(collect
-        .contains("tokio::task::spawn_blocking(move || collect_blocking(admission, source))"));
+    assert!(collect.contains(
+        "tokio::task::spawn_blocking(move || collect_blocking(admission, platform, source))"
+    ));
     let worker = top_level_fn_body(&source, "fn collect_blocking<S:");
-    assert!(worker.contains("collect_linux(&SnapshotRunner"));
+    assert!(worker.contains("let runner = SnapshotRunner"));
+    assert!(worker.contains("Platform::Linux => collect_linux(&runner).objects"));
+    assert!(worker.contains("Platform::Mac => collect_macos(&runner)"));
     assert!(worker.find("snapshot_wire(").unwrap() < worker.find("admission.finish()").unwrap());
     assert!(source.contains("StdCommandRunner.run_observed(command, timeout)"));
     assert!(source.contains("observed.into_pending()"));
@@ -573,4 +606,77 @@ fn registration_and_native_observed_custody_path_are_anchored_to_actual_entry() 
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn macos_main_entry_uses_exact_argv_and_actual_object_serializer_without_classification() {
+    let source = FixtureSource::macos();
+    let calls = Arc::clone(&source.calls);
+    let response = request_for_window(Arc::default(), Platform::Mac, source, "main").await;
+    assert!(response.success);
+    let value = response.data.unwrap();
+    assert_eq!(value["platform"], "darwin");
+    assert_eq!(value["observation"]["value"]["atomic"], false);
+    assert_eq!(
+        value["commandCleanup"]["value"],
+        "noRetainedSnapshotCommand"
+    );
+    let object = &value["objects"]["value"][0];
+    assert_eq!(object["interface"], "vpn0");
+    assert_eq!(object["addresses"]["value"][0]["address"], "10.77.2.9");
+    assert_eq!(object["addresses"]["value"][1]["address"], "fe80::abcd");
+    let rows = object["routes"]["value"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row["table"], json!({"status":"known","value":null}));
+        assert_eq!(row["role"]["status"], "unknown");
+    }
+    assert_eq!(rows[2]["scope"]["value"], "interfaceScoped");
+    for field in ["tunnel", "virtualization", "policyRules", "stableIdentity"] {
+        assert_eq!(object[field]["status"], "unknown");
+    }
+    assert_context_unknown(&value);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            (
+                Command::new("netstat", ["-rn", "-f", "inet"]),
+                Duration::from_secs(2)
+            ),
+            (
+                Command::new("netstat", ["-rn", "-f", "inet6"]),
+                Duration::from_secs(2)
+            ),
+            (Command::new("ifconfig", ["-a"]), Duration::from_secs(2)),
+        ]
+    );
+}
+#[tokio::test]
+async fn macos_route_failures_keep_actual_addresses_unknown_roster_never_becomes_empty() {
+    for position in 0..3 {
+        let mut source = FixtureSource::macos();
+        Arc::make_mut(&mut source.outputs)[position] =
+            Err("injected source permission denied".into());
+        let value = collect_request(Arc::default(), Platform::Mac, source)
+            .await
+            .data
+            .unwrap();
+        if position == 2 {
+            assert_eq!(value["objects"]["status"], "unknown");
+        } else {
+            let object = &value["objects"]["value"][0];
+            assert_eq!(object["addresses"]["status"], "known");
+            assert_eq!(object["routes"]["status"], "unknown");
+            assert!(object["routes"].get("value").is_none());
+        }
+        assert_context_unknown(&value);
+    }
+    let source = FixtureSource::macos();
+    let calls = Arc::clone(&source.calls);
+    assert!(
+        !request_for_window(Arc::default(), Platform::Mac, source, "tray")
+            .await
+            .success
+    );
+    assert!(calls.lock().unwrap().is_empty());
 }

@@ -1,6 +1,6 @@
 //! Explicit, read-only COEX diagnostics. No lifecycle publication or classification.
 //!
-//! Linux is the only production collector here. Missing session provenance stays
+//! Linux and macOS have production collectors here. Missing session provenance stays
 //! Unknown; this entry does not replace the legacy advisory report. Source limits
 //! apply after command output returns, not to pipe allocation or total elapsed time.
 
@@ -11,7 +11,7 @@ use polaris_config_engine::builder::coexistence::{
     AddressFamily, Fact, ObjectFacts, PolicySelectorScope, RouteRole, RouteScope,
 };
 use polaris_helper_proto::Platform;
-use polaris_system_integration::coexistence::collect_linux;
+use polaris_system_integration::coexistence::{collect_linux, macos::collect_macos};
 use polaris_system_integration::exec::{
     Command, CommandCleanup, CommandOutput, CommandRunner, PendingCommand, StdCommandRunner,
 };
@@ -318,21 +318,31 @@ fn unavailable_wire(platform: Platform, reason: String) -> Value {
     )
 }
 
-fn collect_blocking<S: ObservationSource>(admission: Admission, source: S) -> Value {
+fn collect_blocking<S: ObservationSource>(
+    admission: Admission,
+    platform: Platform,
+    source: S,
+) -> Value {
     let started = Instant::now();
     let objects = match admission.service.observe_retained() {
         Ok(()) => {
-            collect_linux(&SnapshotRunner {
+            let runner = SnapshotRunner {
                 service: &admission.service,
                 source: &source,
-            })
-            .objects
+            };
+            match platform {
+                Platform::Linux => collect_linux(&runner).objects,
+                Platform::Mac => collect_macos(&runner),
+                _ => Fact::Unknown(
+                    "production COEX snapshot collector unavailable on this platform".into(),
+                ),
+            }
         }
         Err(error) => Fact::Unknown(error),
     };
     let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let snapshot = snapshot_wire(
-        Platform::Linux,
+        platform,
         objects,
         json!({ "status": "known", "value": { "elapsedMillis": elapsed, "atomic": false } }),
         admission.cleanup_outcome(),
@@ -347,7 +357,7 @@ async fn collect_request<S: ObservationSource>(
     platform: Platform,
     source: S,
 ) -> ApiResponse<Value> {
-    if platform != Platform::Linux {
+    if !matches!(platform, Platform::Linux | Platform::Mac) {
         return ApiResponse::ok(unavailable_wire(
             platform,
             "production COEX snapshot collector unavailable on this platform".into(),
@@ -359,7 +369,7 @@ async fn collect_request<S: ObservationSource>(
     };
     // The closure, not the IPC waiter/JoinHandle, owns admission and custody.
     // Dropping a waiter does not cancel spawn_blocking or enable another worker.
-    match tokio::task::spawn_blocking(move || collect_blocking(admission, source)).await {
+    match tokio::task::spawn_blocking(move || collect_blocking(admission, platform, source)).await {
         Ok(snapshot) => ApiResponse::ok(snapshot),
         Err(error) => ApiResponse::ok(unavailable_wire(
             platform,
