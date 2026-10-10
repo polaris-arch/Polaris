@@ -24,6 +24,54 @@ describe('actual Rust Windows v2 wire boundary', () => {
     expect(wire.sources.ras.rows.value[1].interface.status).toBe('unknown');
     expect(JSON.stringify(wire)).not.toContain('12025550123');
   });
+  it('retains actual Rust IPv4-mapped IPv6 address, nextHop and normalized prefix without changing family or scope', () => {
+    const v = decodeCoexSnapshot(fixture.snapshots.mappedV6);
+    if (v.schemaVersion !== 2 || v.sources.addresses.rows.status !== 'known' || v.sources.routes6.rows.status !== 'known') throw Error('fixture');
+    const address = v.sources.addresses.rows.value[1]; const route = v.sources.routes6.rows.value[0];
+    expect(address.family).toBe('ipv6'); expect(address.address).toBe('::ffff:192.0.2.9'); expect(address.scopeId).toEqual(known(42));
+    expect(route.family).toBe('ipv6'); expect(route.prefix).toBe('::ffff:c000:200/120');
+    expect(route.nextHop).toEqual(known('::ffff:192.0.2.1')); expect(route.nextHopScopeId).toEqual(known(42));
+  });
+  it('retains the equivalent IPv4-tail prefix spelling from the actual Rust serializer-only seam', () => {
+    const v = decodeCoexSnapshot(fixture.snapshots.mappedV6WireSpelling);
+    if (v.schemaVersion !== 2 || v.sources.routes6.rows.status !== 'known') throw Error('fixture');
+    expect(v.sources.routes6.rows.value[0].family).toBe('ipv6'); expect(v.sources.routes6.rows.value[0].prefix).toBe('::ffff:192.0.2.0/120');
+  });
+  it.each(['::ffff:192.0.2.1', '::192.0.2.1', '1:2:3:4:5:6:192.0.2.1', '1:2:3:4:5::192.0.2.1'])('accepts a valid final IPv4 tail as IPv6: %s', (address) => {
+    const v = clone(); v.sources.addresses.rows.value[1].address = address;
+    expect(decodeCoexSnapshot(v)).toEqual(v);
+  });
+  it.each(['::ffff:192.0.2.256', '::ffff:192.00.2.1', '::ffff:192.0.2', '::ffff:192.0.2.1.5',
+    '::ffff:+192.0.2.1', '::ffff:192.0.2.1:1', '::ffff:192.0.2.1%42', ':::ffff:192.0.2.1',
+    '1:2:3:4:5:192.0.2.1', '1:2:3:4:5:6:7:192.0.2.1', '1:2:3:4:5:6::192.0.2.1',
+    '1::2::192.0.2.1'])('rejects an invalid IPv4-tailed IPv6 in address/nextHop/prefix: %s', (address) => {
+    for (const field of ['address', 'nextHop', 'prefix']) {
+      const v = clone();
+      if (field === 'address') v.sources.addresses.rows.value[1].address = address;
+      else if (field === 'nextHop') v.sources.routes6.rows.value[0].nextHop.value = address;
+      else v.sources.routes6.rows.value[0].prefix = address + '/120';
+      expect(() => decodeCoexSnapshot(v), field).toThrow(CoexSnapshotDecodeError);
+    }
+  });
+  it('retains four independent sources when actual Rust wire degrades only an oversized legal address source', () => {
+    const v = decodeCoexSnapshot(fixture.snapshots.oversizedSource); if (v.schemaVersion !== 2) throw Error('fixture');
+    expect(v.sources.addresses.rows.status).toBe('unknown'); expect(v.sources.addresses.complete.status).toBe('unknown');
+    expect(v.sources.addresses.error).toEqual(known('Windows source wire byte limit exceeded'));
+    for (const key of ['adapters', 'routes4', 'routes6', 'ras'] as const) expect(v.sources[key].rows.status).toBe('known');
+  });
+  it('applies the same precise 8 MiB source JSON budget, independently of field and row budgets', () => {
+    // Synthetic wire-size boundary only; not a provider or device fixture.
+    const v = clone(); const source = v.sources.addresses;
+    source.rows.value = Array.from({ length: 16000 }, () => structuredClone(source.rows.value[1]));
+    const limit = 8 * 1024 * 1024; const bytes = () => new TextEncoder().encode(JSON.stringify(source)).length;
+    const remaining = limit - bytes(); expect(remaining).toBeGreaterThan(0);
+    const extra = Math.floor(remaining / source.rows.value.length);
+    for (const row of source.rows.value) row.interface.alias.value += 'x'.repeat(extra);
+    source.rows.value[0].interface.alias.value += 'x'.repeat(limit - bytes());
+    expect(bytes()).toBe(limit); expect(decodeCoexSnapshot(v)).toEqual(v);
+    source.rows.value[0].interface.alias.value += 'x'; expect(bytes()).toBe(limit + 1);
+    expect(() => decodeCoexSnapshot(v)).toThrow(CoexSnapshotDecodeError);
+  });
   it('keeps an independent IPv6 error and known empty rows without claiming absence or classification', () => {
     const v = decodeCoexSnapshot(fixture.snapshots.partial);
     if (v.schemaVersion !== 2) throw Error('fixture');

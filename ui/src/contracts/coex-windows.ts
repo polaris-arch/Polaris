@@ -32,10 +32,28 @@ export function decodeCoexWindows(input: unknown, invalid: () => never): CoexWin
   };
   const luid: Decode<string> = (v) => { const value = text(v); return /^[1-9][0-9]{0,19}$/.test(value) && BigInt(value) <= 0xffffffffffffffffn ? value : invalid(); };
   const reference = (v: unknown, adapter = false): WindowsReference => { const o = fields(v, ['alias', 'luid', 'ifIndex']); return { alias: fact(text)(o.alias), luid: fact(luid)(o.luid), ifIndex: adapter ? unknown(o.ifIndex) : fact((x) => { const index = number()(x); return index > 0 ? index : invalid(); })(o.ifIndex) }; };
+  const validV4 = (value: string): boolean => {
+    const parts = value.split('.');
+    return parts.length === 4 && parts.every((p) => /^(0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255);
+  };
   const bareAddress = (v: unknown, f: 'ipv4' | 'ipv6'): string => {
     const value = text(v); if (value.includes('%')) return invalid();
-    if (f === 'ipv4') { const parts = value.split('.'); if (parts.length !== 4 || parts.some((p) => !/^(0|[1-9][0-9]{0,2})$/.test(p) || Number(p) > 255)) return invalid(); }
-    else { if (!/^[0-9a-f:]+$/i.test(value) || !value.includes(':') || value.includes(':::') || (value.startsWith(':') && !value.startsWith('::')) || (value.endsWith(':') && !value.endsWith('::'))) return invalid(); const groups = value.split(':').filter(Boolean); if (groups.length > 8 || groups.some((g) => g.length > 4) || (value.match(/::/g)?.length ?? 0) > 1 || (value.includes('::') ? groups.length >= 8 : groups.length !== 8)) return invalid(); }
+    if (f === 'ipv4') { if (!validV4(value)) return invalid(); }
+    else {
+      // A final IPv4 tail occupies exactly two IPv6 groups. Preserve its original
+      // address text and family; scope remains a separate fact.
+      const parts = value.split(':'); const tail = parts[parts.length - 1];
+      if (tail.includes('.')) {
+        if (parts.length < 2 || !validV4(tail)) return invalid();
+        parts.splice(parts.length - 1, 1, 'ffff', 'ffff');
+      }
+      const groupsText = parts.join(':');
+      if (!/^[0-9a-f:]+$/i.test(groupsText) || !groupsText.includes(':') || groupsText.includes(':::') ||
+        (groupsText.startsWith(':') && !groupsText.startsWith('::')) || (groupsText.endsWith(':') && !groupsText.endsWith('::'))) return invalid();
+      const groups = parts.filter(Boolean);
+      if (groups.length > 8 || groups.some((g) => g.length > 4) || (groupsText.match(/::/g)?.length ?? 0) > 1 ||
+        (groupsText.includes('::') ? groups.length >= 8 : groups.length !== 8)) return invalid();
+    }
     return value;
   };
   const source = <T,>(v: unknown, row: Decode<T>, max: number): WindowsSource<T> => {

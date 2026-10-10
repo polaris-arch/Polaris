@@ -21,6 +21,24 @@ describe('actual system wrapper through IPC envelope decoder', () => {
     expect(transport).toHaveBeenCalledTimes(1);
     expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
   });
+  it.each(['mappedV6', 'mappedV6WireSpelling'] as const)('retains Rust-serialized %s address/nextHop/prefix and scopes through the real wrapper', async (name) => {
+    transport.mockResolvedValueOnce({ success: true, data: windowsFixture.snapshots[name] });
+    const v = await systemApi.coexReadonlySnapshot();
+    if (v.schemaVersion !== 2 || v.sources.addresses.rows.status !== 'known' || v.sources.routes6.rows.status !== 'known') throw Error('fixture');
+    const address = v.sources.addresses.rows.value[1]; const route = v.sources.routes6.rows.value[0];
+    expect(address.family).toBe('ipv6'); expect(address.address).toBe('::ffff:192.0.2.9'); expect(address.scopeId).toEqual({ status: 'known', value: 42 });
+    expect(route.family).toBe('ipv6'); expect(route.prefix).toBe(name === 'mappedV6' ? '::ffff:c000:200/120' : '::ffff:192.0.2.0/120');
+    expect(route.nextHop).toEqual({ status: 'known', value: '::ffff:192.0.2.1' }); expect(route.nextHopScopeId).toEqual({ status: 'known', value: 42 });
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {}); expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('preserves one wire-budget Unknown and the other four actual Rust sources through the wrapper', async () => {
+    transport.mockResolvedValueOnce({ success: true, data: windowsFixture.snapshots.oversizedSource });
+    const v = await systemApi.coexReadonlySnapshot(); if (v.schemaVersion !== 2) throw Error('fixture');
+    expect(v.sources.addresses.rows.status).toBe('unknown');
+    expect(v.sources.addresses.error).toEqual({ status: 'known', value: 'Windows source wire byte limit exceeded' });
+    for (const key of ['adapters', 'routes4', 'routes6', 'ras'] as const) expect(v.sources[key].rows.status).toBe('known');
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
   it('invokes the registered no-argument command once and unwraps once', async () => {
     transport.mockResolvedValue({ success: true, data: snapshot });
     expect(await systemApi.coexReadonlySnapshot()).toEqual(snapshot);

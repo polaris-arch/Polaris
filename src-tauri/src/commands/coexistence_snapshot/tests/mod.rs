@@ -869,3 +869,92 @@ async fn retained_process_owner_blocks_windows_native_queries_until_observed_clo
     assert_eq!(native_calls.load(Ordering::SeqCst), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn windows_wire_source_byte_budget_accepts_exact_limit_and_degrades_one_byte_over() {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let source = Fact::Known(ReadRows {
+        rows: vec![()],
+        complete: Fact::Unknown("scope missing".into()),
+        compartment: Fact::Unknown("scope missing".into()),
+        error: Fact::Known(None),
+    });
+    let overhead = serde_json::to_vec(&windows_source_wire(&source, |_| json!("")))
+        .unwrap()
+        .len();
+    let payload = "x".repeat(LIMIT - overhead);
+    let exact = windows_source_wire(&source, |_| json!(payload));
+    assert_eq!(serde_json::to_vec(&exact).unwrap().len(), LIMIT);
+    assert_eq!(exact["rows"]["status"], "known");
+    let overflow = windows_source_wire(&source, |_| json!(payload.clone() + "x"));
+    assert_eq!(overflow["rows"]["status"], "unknown");
+    assert_eq!(overflow["complete"]["status"], "unknown");
+    assert_eq!(overflow["compartment"]["status"], "unknown");
+    assert!(overflow["error"]["value"]
+        .as_str()
+        .unwrap()
+        .contains("wire byte limit"));
+}
+
+#[test]
+fn legal_maximum_address_rows_over_wire_budget_keep_other_four_sources() {
+    let scope = |rows| {
+        Fact::Known(ReadRows {
+            rows,
+            complete: Fact::Unknown("scope missing".into()),
+            compartment: Fact::Unknown("scope missing".into()),
+            error: Fact::Known(None),
+        })
+    };
+    let mut input = windows_unavailable("source unavailable");
+    input.adapters = Fact::Known(ReadRows {
+        rows: vec![],
+        complete: Fact::Unknown("scope missing".into()),
+        compartment: Fact::Unknown("scope missing".into()),
+        error: Fact::Known(None),
+    });
+    input.routes4 = Fact::Known(ReadRows {
+        rows: vec![],
+        complete: Fact::Unknown("scope missing".into()),
+        compartment: Fact::Unknown("scope missing".into()),
+        error: Fact::Known(None),
+    });
+    input.routes6 = input.routes4.clone();
+    input.ras = Fact::Known(ReadRows {
+        rows: vec![],
+        complete: Fact::Unknown("scope missing".into()),
+        compartment: Fact::Unknown("scope missing".into()),
+        error: Fact::Known(None),
+    });
+    input.addresses = scope(
+        (0..128u32)
+            .flat_map(|index| {
+                (0..256).map(move |_| WindowsAddressObservation {
+                    interface: WindowsInterfaceRef {
+                        alias: Fact::Known(format!("fixture-adapter-{index:03}")),
+                        luid: Fact::Known(u64::MAX - u64::from(index)),
+                        if_index: Fact::Known(index + 1),
+                    },
+                    family: AddressFamily::V6,
+                    address: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
+                    prefix_len: Fact::Known(128),
+                    scope_id: Fact::Known(42),
+                })
+            })
+            .collect(),
+    );
+    let validated = validate_windows_input(input);
+    let Fact::Known(addresses) = &validated.addresses else {
+        panic!("fixture must pass the actual model row/string budgets")
+    };
+    assert_eq!(addresses.rows.len(), 128 * 256);
+    let wire = windows_snapshot_wire(&validated, unknown_wire("injected source only"));
+    assert_eq!(wire["sources"]["addresses"]["rows"]["status"], "unknown");
+    assert!(wire["sources"]["addresses"]["error"]["value"]
+        .as_str()
+        .unwrap()
+        .contains("wire byte limit"));
+    for name in ["adapters", "routes4", "routes6", "ras"] {
+        assert_eq!(wire["sources"][name]["rows"]["status"], "known");
+    }
+}

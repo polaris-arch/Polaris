@@ -335,18 +335,29 @@ fn windows_ref_wire(reference: &WindowsInterfaceRef) -> Value {
 }
 
 fn windows_source_wire<T>(source: &Fact<ReadRows<T>>, row: impl Fn(&T) -> Value) -> Value {
-    match source {
+    // Compact JSON bytes of the whole source envelope, matching the UI source
+    // budget. This limits wire output after projection, not native allocation.
+    const MAX_WIRE_BYTES: usize = 8 * 1024 * 1024;
+    let unavailable = |reason: &str| {
+        json!({
+            "rows":unknown_wire(reason),"complete":unknown_wire("source completeness unavailable"),
+            "compartment":unknown_wire("source compartment unavailable"),
+            "error":{"status":"known","value":reason},
+        })
+    };
+    let wire = match source {
         Fact::Known(source) => json!({
             "rows": {"status":"known", "value":source.rows.iter().map(row).collect::<Vec<_>>()},
             "complete": fact_wire(&source.complete, |v| json!(v)),
             "compartment": fact_wire(&source.compartment, |v| json!(v)),
             "error": fact_wire(&source.error, |v| json!(v)),
         }),
-        Fact::Unknown(reason) => json!({
-            "rows":unknown_wire(reason),"complete":unknown_wire("source completeness unavailable"),
-            "compartment":unknown_wire("source compartment unavailable"),
-            "error":{"status":"known","value":reason},
-        }),
+        Fact::Unknown(reason) => unavailable(reason),
+    };
+    if serde_json::to_vec(&wire).map_or(true, |bytes| bytes.len() > MAX_WIRE_BYTES) {
+        unavailable("Windows source wire byte limit exceeded")
+    } else {
+        wire
     }
 }
 
