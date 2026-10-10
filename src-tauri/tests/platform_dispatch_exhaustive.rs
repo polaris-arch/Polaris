@@ -2989,6 +2989,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/updater.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "既有 bundled_core_version_from_manifest 的 cfg!(ios) 只传递版本身份分派：iOS 为 true，跳过 desktopSourceBuild 并保留原 legacy/mobile 解析；Android 为 false，但在 android 早退先返回原 bundled 版本，桌面才可进入 desktopSourceBuild。只登记此既有资源身份隔离，不新增 iOS 更新/核功能，不代表 iOS 编译或设备验收。",
+    ),
+    (
+        "src-tauri/src/runtime/updater.rs",
         "any(target_os = \"android\", target_os = \"ios\")",
         1,
         IosSide::WithAndroid,
@@ -3701,9 +3708,11 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 目录腿与 `lib.rs` 的播种 / 调度器装配共 6 处 WrongToday 随被守代码一起消失（债不是被改判，
 /// 是对象没了）；`lib.rs` 新增 2 处 `desktop`、`updater.rs` 新增 1 处「Android 或 iOS」（均 WithAndroid）。
 /// 债的具名清单随之 36 行 / 174 处 → 32 行 / 168 处。
+/// 2026-10-11: 补登记 updater.rs 既有 cfg!(ios) 一处资源版本身份隔离；
+/// Right 265→266 仅补漏计数，全部历史债标签/具名清单保持原样，无 iOS 功能或设备签收。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
-    ("DiffersRight", 265),
+    ("DiffersRight", 266),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 142),
     ("WithAndroid", 89),
