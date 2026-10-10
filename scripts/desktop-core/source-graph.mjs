@@ -51,9 +51,20 @@ function hasPlatformModulePolicy(spec, key) {
     && isModulePartition(platform.transportModules, Object.keys(spec.transportPins ?? {}), 'confirmedAbsent');
 }
 
+// Activation belongs to the reviewed App manifest. No branch-head/default-URL fallback.
+export function isForkSource(spec) {
+  requireGraph(spec?.sourceMode === undefined || spec.sourceMode === 'fork-commit-v1', 'Unsupported desktop source mode');
+  return spec?.sourceMode === 'fork-commit-v1';
+}
+export const desktopSourceManifestPath = (spec) => isForkSource(spec)
+  ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
+export const desktopOverlays = (spec, key, overlaySha256) => isForkSource(spec) || key !== 'win'
+  ? [] : [{ file: 'windows-dns-refresh.patch', sha256: overlaySha256 }];
+
 export function validateSourcePins(manifest, key, outputsRequired = true) {
   requireGraph(Object.hasOwn(DESKTOP_TARGETS, key), `Unknown desktop core target: ${key}`);
   const spec = manifest.sourceBuild;
+  requireGraph(!isForkSource(spec) || manifest.windowsBuild === undefined, 'Fork source cannot retain an App Windows overlay contract');
   const frozen = spec && ['sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
     'moduleGraphSha256'].every((field) => isSha(spec[field]))
     && isTree(spec.patchedSourceTree) && isTree(spec.buildTree)
@@ -81,7 +92,7 @@ export function frozenSourceVersion(manifest) {
 export function platformSourceIdentity(receipt, source, spec, key, overlaySha256) {
   const target = DESKTOP_TARGETS[key];
   const facts = { sourceReceiptFingerprint: receipt.fingerprint, buildTree: spec.platforms[key].buildTree,
-    overlays: key === 'win' ? [{ file: 'windows-dns-refresh.patch', sha256: overlaySha256 }] : [],
+    overlays: desktopOverlays(spec, key, overlaySha256),
     version: spec.version, goVersion: source.goVersion, platform: key, transportPins: spec.transportPins,
     patchedModules: spec.platforms[key].patchedModules, transportModules: spec.platforms[key].transportModules,
     goos: target.goos, goarch: target.goarch, cgo: target.cgo, tags: expectedTags(key) };
@@ -92,6 +103,29 @@ export function platformSourceIdentity(receipt, source, spec, key, overlaySha256
 
 export function validateSourceManifest(source, spec) {
   requireGraph(isTree(source.sourceCommit) && /^\d+\.\d+\.\d+$/.test(source.goVersion ?? ''), 'Invalid source/toolchain pin');
+  if (isForkSource(spec)) {
+    requireGraph(source.schema === 'polaris-desktop-fork-source-v1' && source.role === 'desktop'
+      && source.sourceURL === 'https://github.com/polaris-arch/sing-box', 'Desktop fork repository/schema/role differs');
+    const version = /^(.*)\.polaris\.[1-9][0-9]*$/.exec(spec.version ?? '')?.[1];
+    requireGraph(version && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
+      && typeof source.sourceTag === 'string' && source.sourceTag.startsWith(`polaris-${source.upstreamTag}-`)
+      && /^[1-9][0-9]*$/.test(source.sourceTag.slice(`polaris-${source.upstreamTag}-`.length))
+      && isTree(source.sourceTagObject), 'Immutable fork tag/upstream pins missing or inconsistent');
+    requireGraph(isTree(source.sourceTree) && source.sourceTree === spec.patchedSourceTree
+      && source.sourceTree === spec.buildTree
+      && Object.values(spec.platforms ?? {}).every((platform) => platform.buildTree === source.sourceTree),
+    'Desktop fork commit tree must be shared by all four targets; mobile/overlay trees cannot substitute');
+    requireGraph(Array.isArray(source.patches) && source.patches.length === 0
+      && Array.isArray(source.dependencyPatches) && source.dependencyPatches.length === 0
+      && Array.isArray(spec.dependencyModules) && spec.dependencyModules.length === 0,
+    'Fork source must not replay App patches or dependency overlays');
+    return [];
+  }
+  requireGraph(source.schema === undefined && source.role === undefined && source.sourceTag === undefined
+    && source.sourceTagObject === undefined && source.sourceTree === undefined && source.upstreamTag === undefined
+    && source.upstreamCommit === undefined
+    && (source.sourceURL === undefined || source.sourceURL === 'https://github.com/SagerNet/sing-box'),
+  'Fork inputs require explicit desktop fork source mode');
   requireGraph(Array.isArray(source.patches) && source.patches.length > 0 && source.patches.every((patch) =>
     /^[a-z0-9-]+\.patch$/.test(patch.file ?? '') && isSha(patch.sha256)), 'Invalid core patch inventory');
   requireGraph(new Set(source.patches.map((patch) => patch.file)).size === source.patches.length, 'Duplicate core patch');
@@ -109,7 +143,9 @@ export function validateSourceManifest(source, spec) {
 }
 
 export function validateSourceReceipt(receipt, source, spec) {
+  validateSourceManifest(source, spec);
   requireGraph(receipt?.schema === 'polaris-core-source-v1', 'Unsupported source receipt schema');
+  if (isForkSource(spec)) requireGraph(receipt.upstreamTree === source.sourceTree, 'Fork receipt commit tree differs');
   const [graphScope, sourceGraphState] = source.dependencyPatches.length > 0
     ? ['declared-patched-modules', 'dependencies-patched'] : ['core-source-only', 'source-only'];
   requireGraph(receipt.graphScope === graphScope && receipt.sourceGraphState === sourceGraphState,

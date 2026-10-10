@@ -5,7 +5,7 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSy
   writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  desktopSourceManifestPath, desktopOverlays, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
 export const coreFilename = (key) => key === 'win' ? 'sing-box.exe' : 'sing-box';
 const receiptPath = (directory, key) => join(directory, key, `${coreFilename(key)}.source-receipt.json`);
@@ -36,7 +36,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
   'Consumer candidate checkout differs or has tracked modifications');
   requireGraph(keys.length > 0 && new Set(keys).size === keys.length
     && keys.every((key) => Object.hasOwn(DESKTOP_TARGETS, key)), 'Invalid selected desktop targets');
-  const sourceManifest = join(root, 'scripts/libbox-patches/source-manifest.json');
+  const sourceManifest = join(root, desktopSourceManifestPath(spec));
   verifyHash(sourceManifest, spec.sourceManifestSha256);
   verifyHash(join(root, 'scripts/core-source-provision.py'), spec.provisionerSha256);
   const source = readJson(sourceManifest);
@@ -55,9 +55,8 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
     const receipt = readJson(receiptFile);
     const { fingerprint, ...facts } = receipt;
     const target = DESKTOP_TARGETS[key];
-    const overlays = key === 'win'
-      ? [{ file: 'windows-dns-refresh.patch', sha256: manifest.windowsBuild?.patchSha256 }] : [];
-    if (key === 'win') verifyHash(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlays[0].sha256);
+    const overlays = desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256);
+    if (overlays.length) verifyHash(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlays[0].sha256);
     requireGraph(receipt.schema === 'polaris-desktop-core-v1' && receipt.candidate === candidate
       && receipt.platform === key && receipt.version === spec.version && receipt.binarySha256 === item.binarySha256
       && receipt.buildTree === spec.platforms[key].buildTree && fingerprint === digest(canonical(facts))
@@ -112,7 +111,7 @@ export function verifyPackagedSource(root, manifest, key, binary) {
     && /^[a-f0-9]{40}$/.test(inventory.candidate ?? '') && receipt.candidate === inventory.candidate,
   'Packaging source bundle candidate/inventory differs');
   verifyHash(join(root, 'resources/.source-receipts', `${key}.json`), inventory.platforms[key].receiptSha256);
-  const sourceManifest = join(root, 'scripts/libbox-patches/source-manifest.json');
+  const sourceManifest = join(root, desktopSourceManifestPath(spec));
   verifyHash(sourceManifest, spec.sourceManifestSha256);
   verifyHash(join(root, 'scripts/core-source-provision.py'), spec.provisionerSha256);
   const source = readJson(sourceManifest);
@@ -122,6 +121,7 @@ export function verifyPackagedSource(root, manifest, key, binary) {
   requireGraph(receipt.schema === 'polaris-desktop-core-v1' && receipt.platform === key
     && receipt.version === spec.version && receipt.buildTree === spec.platforms[key].buildTree
     && receipt.binarySha256 === inventory.platforms[key].binarySha256
+    && canonical(receipt.overlays) === canonical(desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256))
     && receipt.sourceFingerprint === identity.sourceFingerprint && receipt.buildID === identity.buildID
     && receipt.platformInputFingerprint === identity.platformInputFingerprint
     && receipt.mainGoModSha256 === receipt.sourceReceipt?.mainGoModSha256

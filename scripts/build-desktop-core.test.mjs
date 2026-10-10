@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+// Keep FK-A cases inside the existing scripts/*.test.mjs CI collection.
+import './desktop-core/fork-source.test.mjs';
 import { buildDesktopCore, produceDesktopCore } from './desktop-core/build-core.mjs';
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './desktop-core/bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, frozenSourceVersion, platformSourceIdentity,
@@ -702,7 +704,7 @@ test('shared source provider and desktop-only producers retain explicit platform
   assert.equal(sharedImpact.android, true, provider);
   assert.deepEqual(androidRegistrationOf(provider), { key: provider, table: 'ANDROID_IMPACT_SCOPES' });
   for (const path of ['scripts/build-desktop-core.test.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/build-core.mjs', 'scripts/desktop-core/bundle.mjs']) {
+    'scripts/desktop-core/build-core.mjs', 'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/fork-source.test.mjs']) {
     const impact = classifyImpact([path]);
     assert.equal(impact.kernel, true, path);
     assert.equal(impact.platforms.length, 4, path);

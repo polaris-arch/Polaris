@@ -5,9 +5,8 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSy
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  desktopSourceManifestPath, desktopOverlays, isForkSource, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
-const SOURCE_MANIFEST = 'scripts/libbox-patches/source-manifest.json';
 const PROVISIONER = 'scripts/core-source-provision.py';
 const sourceText = (value) => String(value).trim();
 
@@ -17,7 +16,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
   // Incomplete pins fail before mkdir, network, cache inspection or execution.
   const spec = validateSourcePins(manifest, key, !production.producer);
   requireGraph(/^[a-f0-9]{40}$/.test(production.candidate ?? ''), 'Explicit candidate source SHA required');
-  const sourceManifest = join(root, SOURCE_MANIFEST);
+  const sourceManifest = join(root, desktopSourceManifestPath(spec));
   const provisioner = join(root, PROVISIONER);
   verifyHash(sourceManifest, spec.sourceManifestSha256);
   verifyHash(provisioner, spec.provisionerSha256);
@@ -25,7 +24,8 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
   const dependencies = validateSourceManifest(source, spec);
   for (const patch of source.patches) verifyHash(join(dirname(sourceManifest), patch.file), patch.sha256);
   for (const dep of dependencies) verifyHash(join(dirname(sourceManifest), dep.patchFile), dep.patchSha256);
-  const overlay = key === 'win' ? join(root, 'scripts/core-patches/windows-dns-refresh.patch') : undefined;
+  const fork = isForkSource(spec);
+  const overlay = !fork && key === 'win' ? join(root, 'scripts/core-patches/windows-dns-refresh.patch') : undefined;
   if (overlay) {
     requireGraph(manifest.windowsBuild?.sourceCommit === source.sourceCommit
       && manifest.windowsBuild.goVersion === source.goVersion && manifest.windowsBuild.version === spec.version
@@ -62,7 +62,30 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       requireGraph(capture('git', ['-C', repository, 'rev-parse', 'refs/heads/polaris-source']) === commit, 'Fetched upstream source ref differs');
       return repository;
     };
-    const repository = fetch('https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
+    const repository = fetch(fork ? source.sourceURL + '.git' : 'https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
+    if (fork) {
+      // Resolve both named tags from the declared fork, not the checkout or a moving branch.
+      for (const tag of [source.sourceTag, source.upstreamTag]) {
+        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', source.sourceURL + '.git',
+          `refs/tags/${tag}:refs/tags/${tag}`], options);
+      }
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}`]) === source.sourceTagObject
+        && capture('git', ['-C', repository, 'cat-file', '-t', `refs/tags/${source.sourceTag}`]) === 'tag',
+      'Fork consumption tag object differs or is not annotated');
+      // These annotation fields bind the selected role to the pinned tag object.
+      // The remaining annotation carries the reviewed queue; no segment is inferred from HEAD.
+      const annotation = capture('git', ['-C', repository, 'for-each-ref', '--format=%(contents)', `refs/tags/${source.sourceTag}`]).split(/\r?\n/);
+      for (const [field, expected] of [['Role', source.role], ['Upstream-Tag', source.upstreamTag], ['Upstream-Commit', source.upstreamCommit]]) {
+        const values = annotation.filter((line) => line.startsWith(`${field}:`));
+        requireGraph(values.length === 1 && values[0] === `${field}: ${expected}`, 'Fork consumption tag annotation role/baseline differs');
+      }
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}^{commit}`]) === source.sourceCommit,
+        'Fork consumption tag/commit differs');
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.upstreamTag}^{commit}`]) === source.upstreamCommit,
+        'Fork upstream baseline tag/commit differs');
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `${source.sourceCommit}^{tree}`]) === source.sourceTree,
+        'Fork source commit/tree differs');
+    }
     const args = [provisioner, '--manifest', sourceManifest, '--source', repository,
       '--checkout', join(work, 'checkout'), '--go', go];
     for (const dep of dependencies) {
@@ -111,7 +134,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     const tags = [...new Set([...preset.split(','), ...(target.cgo === '0' ? ['with_purego'] : [])])].sort();
     requireGraph(canonical(tags) === canonical(expectedTags(key)), 'Upstream feature tag preset differs; review required, do not drop features');
     const flags = readFileSync(join(checkout, 'release/LDFLAGS'), 'utf8').trim();
-    if (overlay) {
+    if (key === 'win') {
       run(go, process.platform === 'win32'
         ? ['test', '-mod=readonly', '-count=20', './dns/transport/local/systemconfig']
         : ['test', '-mod=readonly', '-c', '-o', join(work, 'systemconfig.test.exe'), './dns/transport/local/systemconfig'], buildOptions);
@@ -133,7 +156,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     verifyCompilerInputs();
     const platformReceipt = { schema: 'polaris-desktop-core-v1', candidate: production.candidate, platform: key,
       ...identity, linkedModules: Object.fromEntries(linked.modules),
-      sourceReceipt: receipt, buildTree, overlays: overlay ? [{ file: 'windows-dns-refresh.patch', sha256: manifest.windowsBuild.patchSha256 }] : [],
+      sourceReceipt: receipt, buildTree, overlays: desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256),
       mainGoModSha256: receipt.mainGoModSha256,
       mainGoSumSha256: receipt.mainGoSumSha256,
       version: spec.version, binarySha256,
