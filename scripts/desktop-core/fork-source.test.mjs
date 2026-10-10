@@ -13,29 +13,38 @@ import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, desktopSourceManifest
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const candidate = 'c'.repeat(40);
-const forkURL = 'https://github.com/polaris-arch/sing-box';
+const forkURL = 'https://github.com/polaris-arch/polaris-box';
+const upstreamURL = 'https://github.com/SagerNet/sing-box.git';
 const write = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
 const json = (path) => JSON.parse(readFileSync(path));
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'polaris-fork-contract-'));
   try {
+    const upstreamRepository = join(root, 'upstream-objects');
+    mkdirSync(upstreamRepository);
+    git(upstreamRepository, 'init', '--quiet');
+    write(join(upstreamRepository, 'go.mod'), 'module example.com/fork-fixture\n\ngo 1.25.5\n');
+    write(join(upstreamRepository, 'go.sum'), '');
+    // Match alpha.11: the shared default no longer includes gvisor.
+    write(join(upstreamRepository, 'release/DEFAULT_BUILD_TAGS'), expectedTags('mac-x64').filter((tag) => tag !== 'with_gvisor').join(','));
+    write(join(upstreamRepository, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), expectedTags('win').join(','));
+    write(join(upstreamRepository, 'release/LDFLAGS'), '-checklinkname=0');
+    git(upstreamRepository, 'add', '-A');
+    git(upstreamRepository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'synthetic upstream only');
+    git(upstreamRepository, 'tag', 'v1.0.0');
+    const upstreamCommit = git(upstreamRepository, 'rev-parse', 'HEAD');
     const repository = join(root, 'objects');
-    mkdirSync(repository);
-    git(repository, 'init', '--quiet');
-    write(join(repository, 'go.mod'), 'module example.com/fork-fixture\n\ngo 1.25.5\n');
-    write(join(repository, 'go.sum'), '');
-    write(join(repository, 'release/DEFAULT_BUILD_TAGS'), expectedTags('mac-x64').join(','));
-    write(join(repository, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), expectedTags('win').join(','));
-    write(join(repository, 'release/LDFLAGS'), '-checklinkname=0');
+    git(root, 'clone', '--quiet', '--no-hardlinks', upstreamRepository, repository);
+    git(repository, 'tag', '-d', 'v1.0.0');
+    write(join(repository, 'fork-fixture.txt'), 'synthetic reviewed desktop change\n');
     git(repository, 'add', '-A');
-    git(repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'synthetic source only');
-    git(repository, 'tag', 'v1.0.0');
-    git(repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'tag', '-a', 'polaris-v1.0.0-1', '-m', `Synthetic desktop fixture; no release capability\n\nRole: desktop\nUpstream-Tag: v1.0.0\nUpstream-Commit: ${git(repository, 'rev-parse', 'HEAD')}\nQueue: synthetic fixture only`);
+    git(repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'synthetic fork only');
+    git(repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'tag', '-a', 'polaris-v1.0.0-1', '-m', `Synthetic desktop fixture; no release capability\n\nRole: desktop\nUpstream-Tag: v1.0.0\nUpstream-Commit: ${upstreamCommit}\nQueue: synthetic fixture only`);
     const source = { schema: 'polaris-desktop-fork-source-v1', role: 'desktop', sourceURL: forkURL,
       sourceCommit: git(repository, 'rev-parse', 'HEAD'), sourceTree: git(repository, 'rev-parse', 'HEAD^{tree}'),
       sourceTag: 'polaris-v1.0.0-1', sourceTagObject: git(repository, 'rev-parse', 'refs/tags/polaris-v1.0.0-1'),
-      upstreamTag: 'v1.0.0', upstreamCommit: git(repository, 'rev-parse', 'HEAD'),
+      upstreamTag: 'v1.0.0', upstreamCommit,
       goVersion: '1.25.5', patches: [], dependencyPatches: [] };
     const sourcePath = join(root, 'scripts/desktop-core/source-manifest.json');
     write(sourcePath, JSON.stringify(source));
@@ -52,7 +61,7 @@ function fixture() {
         patchedModules: { requiredLinked: [], allowedAbsent: [] },
         transportModules: { requiredLinked: ['example.com/transport'], confirmedAbsent: [] }, binarySha256: null }])) };
     const manifest = { bundledCoreVersion: '1.0.0', sourceBuild: spec };
-    return { root, repository, source, receipt, manifest };
+    return { root, repository, upstreamRepository, source, receipt, manifest };
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
 }
 function metadata(key, file) {
@@ -74,7 +83,8 @@ function runner(f, key, mutate = {}) {
       if (args[2] === 'cat-file' && mutate.tagType) return mutate.tagType;
       if (args[2] === 'for-each-ref' && mutate.annotation !== undefined) return mutate.annotation;
       // A fixed test transport maps the declared URL to tiny local objects; no network.
-      const localArgs = args.map((arg) => arg === forkURL + '.git' ? f.repository : arg);
+      const localArgs = args.map((arg) => arg === forkURL + '.git' ? f.repository
+        : arg === upstreamURL ? f.upstreamRepository : arg);
       return execFileSync(command, localArgs, { ...options, encoding: 'utf8', stdio: 'pipe' });
     }
     if (args[0]?.endsWith('core-source-provision.py')) {
@@ -113,7 +123,10 @@ test('fork contract rejects wrong repository, role, pins, overlays and shared mo
   const f = fixture();
   try {
     const cases = [
-      ['URL', (s) => { s.sourceURL = 'https://github.com/SagerNet/sing-box'; }],
+      ...['https://github.com/SagerNet/sing-box', 'https://github.com/polaris-arch/sing-box',
+        forkURL + '.git', forkURL + '/', 'https://github.com/other/polaris-box',
+        'https://github.com/polaris-arch/polaris-box-other'].map((url) =>
+        [`URL ${url}`, (s) => { s.sourceURL = url; }]),
       ['role', (s) => { s.role = 'mobile'; }],
       ['schema', (s) => { s.schema = 'unknown'; }],
       ['branch head', (s) => { s.sourceTag = 'polaris-main'; }],
@@ -169,11 +182,23 @@ test('all four fork producers, bundle consumer and packaging use the same pinned
   const f = fixture();
   try {
     const bundle = join(f.root, 'bundle');
+    assert.equal(git(f.repository, 'tag', '--list', f.source.upstreamTag), '', 'fork carries no upstream tag');
+    assert.equal(git(f.upstreamRepository, 'tag', '--list', f.source.sourceTag), '', 'upstream carries no fork tag');
+    assert.notEqual(f.source.sourceCommit, f.source.upstreamCommit);
     for (const key of Object.keys(DESKTOP_TARGETS)) {
       const r = runner(f, key);
       const receipt = produceDesktopCore(f.root, f.manifest, key, join(bundle, key, coreFilename(key)), candidate, r.run);
       assert.deepEqual(receipt.overlays, []);
       assert.equal(receipt.sourceReceipt.sourceURL, forkURL);
+      const fetches = r.calls.filter(({ command, args }) => command === 'git' && args[2] === 'fetch');
+      assert.deepEqual(fetches.map(({ args }) => args.slice(3)), [
+        ['--depth=1', forkURL + '.git', `${f.source.sourceCommit}:refs/heads/polaris-source`],
+        ['--depth=1', '--no-tags', forkURL + '.git', `refs/tags/${f.source.sourceTag}:refs/tags/${f.source.sourceTag}`],
+        ['--depth=1', '--no-tags', upstreamURL, `refs/tags/${f.source.upstreamTag}:refs/tags/${f.source.upstreamTag}`],
+      ]);
+      const build = r.calls.find(({ args }) => args[0] === 'build');
+      assert.deepEqual(build.args[build.args.indexOf('-tags') + 1].split(','), expectedTags(key));
+      assert.deepEqual(receipt.tags, expectedTags(key));
       assert.equal(r.calls.some((call) => call.args.includes('apply')), false);
       assert.equal(r.calls.filter((call) => call.args.includes('test')).length, key === 'win' ? 1 : 0);
     }

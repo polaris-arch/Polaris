@@ -172,7 +172,7 @@ export function validateSourceManifest(source, spec) {
   requireGraph(isTree(source.sourceCommit) && /^\d+\.\d+\.\d+$/.test(source.goVersion ?? ''), 'Invalid source/toolchain pin');
   if (isForkSource(spec)) {
     requireGraph(source.schema === 'polaris-desktop-fork-source-v1' && source.role === 'desktop'
-      && source.sourceURL === 'https://github.com/polaris-arch/sing-box', 'Desktop fork repository/schema/role differs');
+      && source.sourceURL === 'https://github.com/polaris-arch/polaris-box', 'Desktop fork repository/schema/role differs');
     const version = /^(.*)\.polaris\.[1-9][0-9]*$/.exec(spec.version ?? '')?.[1];
     requireGraph(version && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
       && typeof source.sourceTag === 'string' && source.sourceTag.startsWith(`polaris-${source.upstreamTag}-`)

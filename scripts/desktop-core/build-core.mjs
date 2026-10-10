@@ -66,9 +66,12 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     };
     const repository = fetch(fork ? source.sourceURL + '.git' : 'https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
     if (fork) {
-      // Resolve both named tags from the declared fork, not the checkout or a moving branch.
-      for (const tag of [source.sourceTag, source.upstreamTag]) {
-        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', source.sourceURL + '.git',
+      // Resolve the consumption tag from the fork and the baseline tag from its
+      // upstream. The fork need not mirror upstream tags; both identities are
+      // still checked against the frozen manifest below, never a moving branch.
+      for (const [tag, url] of [[source.sourceTag, source.sourceURL + '.git'],
+        [source.upstreamTag, 'https://github.com/SagerNet/sing-box.git']]) {
+        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', url,
           `refs/tags/${tag}:refs/tags/${tag}`], options);
       }
       requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}`]) === source.sourceTagObject
@@ -133,7 +136,9 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     };
     verifyCompilerInputs();
     const preset = readFileSync(join(checkout, 'release', key === 'win' ? 'DEFAULT_BUILD_TAGS_WINDOWS' : 'DEFAULT_BUILD_TAGS'), 'utf8').trim();
-    const tags = [...new Set([...preset.split(','), ...(target.cgo === '0' ? ['with_purego'] : [])])].sort();
+    // alpha.11 moved gvisor out of the default preset. Keep the explicit
+    // Linux/Mac capability and CGO-free additions, then reject any other drift.
+    const tags = [...new Set([...preset.split(','), ...target.extras])].sort();
     requireGraph(canonical(tags) === canonical(expectedTags(key)), 'Upstream feature tag preset differs; review required, do not drop features');
     const flags = readFileSync(join(checkout, 'release/LDFLAGS'), 'utf8').trim();
     if (key === 'win') {

@@ -123,8 +123,8 @@ function stub(f, key, change = {}) {
     if (args[0]?.endsWith('core-source-provision.py')) {
       const checkout = args[args.indexOf('--checkout') + 1];
       write(join(checkout, '.polaris-source-receipt.json'), JSON.stringify(change.receipt ?? f.receipt));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), expectedTags('mac-arm64').join(','));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), expectedTags('win').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), change.preset ?? expectedTags('mac-arm64').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), change.windowsPreset ?? expectedTags('win').join(','));
       write(join(checkout, 'release/LDFLAGS'), '-checklinkname=0');
       write(join(checkout, 'go.mod'), 'synthetic full main go.mod');
       write(join(checkout, 'go.sum'), 'synthetic full main go.sum');
@@ -259,6 +259,43 @@ test('all four targets retain the existing platform feature and CGO faces', () =
           && query[1] === args[1] && query[2] === 'rev-parse').map(({ args: query }) => query[3]),
         [`${commit}^{commit}`, 'refs/heads/polaris-source']);
       }
+    }
+  } finally { f.dispose(); }
+});
+
+test('alpha.11 platform additions retain gvisor without accepting unrelated preset drift', () => {
+  const f = fixture();
+  const preset = expectedTags('mac-arm64').filter((tag) => tag !== 'with_gvisor');
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const dest = join(f.root, key, 'alpha11-core');
+      const change = { preset: preset.join(',') };
+      const s = stub(f, key, change);
+      const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, s.run);
+      const build = s.calls.find(({ args }) => args[0] === 'build');
+      assert.deepEqual(build.args[build.args.indexOf('-tags') + 1].split(','), expectedTags(key));
+      assert.deepEqual(receipt.tags, expectedTags(key));
+      assert.equal(receipt.tags.includes('with_gvisor'), key !== 'win');
+      const selectedPreset = key === 'win' ? expectedTags('win') : preset;
+      for (const bad of [selectedPreset.filter((tag) => tag !== 'with_quic'), [...selectedPreset, 'with_unreviewed'],
+        ...(key === 'win' ? [[...selectedPreset, 'with_gvisor']] : [])]) {
+        const r = stub(f, key, { ...change, [key === 'win' ? 'windowsPreset' : 'preset']: bad.join(',') });
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate, r.run), /feature tag preset differs/);
+        assert.equal(r.calls.some(({ args }) => args[0] === 'build'), false);
+        assert.equal(readFileSync(dest, 'utf8'), `synthetic binary ${key}`, 'rejection preserves the prior output');
+      }
+    }
+  } finally { f.dispose(); }
+});
+
+test('missing embedded gvisor rejects Linux and both Mac producer and consumer faces', () => {
+  const f = fixture();
+  try {
+    for (const key of ['linux', 'mac-x64', 'mac-arm64']) {
+      const tags = expectedTags(key);
+      assert.ok(tags.includes('with_gvisor'));
+      const raw = metadata(key).replace(`-tags=${tags.join(',')}`, `-tags=${tags.filter((tag) => tag !== 'with_gvisor').join(',')}`);
+      rejectProducerAndConsumerMetadata(f, key, raw, /Embedded feature tags differ/);
     }
   } finally { f.dispose(); }
 });
