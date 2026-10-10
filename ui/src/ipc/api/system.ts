@@ -1,3 +1,4 @@
+import { decodeCoexSnapshot, type CoexSnapshot } from '../../contracts/coex-snapshot';
 import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type {
@@ -64,6 +65,10 @@ export const systemBackupApi = {
 // ============================================================================
 
 export const systemApi = {
+  /** Explicit read-only snapshot. Unknown and unavailable are not empty enumeration. */
+  async coexReadonlySnapshot(): Promise<CoexSnapshot> {
+    return decodeCoexSnapshot(await invoke<unknown>(IPC_CHANNELS.COEX_READONLY_SNAPSHOT));
+  },
   /** 枚举当前系统进程（聚合去重，供进程规则快速选择）。 */
   async listProcesses(): Promise<SystemProcessInfo[]> {
     return invoke(IPC_CHANNELS.SYSTEM_LIST_PROCESSES);

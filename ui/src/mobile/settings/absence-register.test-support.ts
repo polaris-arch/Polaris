@@ -312,6 +312,42 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '⚠️ 检查那条腿的重试仍是同一颗检查按钮再点一次（`k:settings.about.checkUpdate#3`，失败态不禁用）。',
     },
 
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.previous',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+      },
+      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.next',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+      },
+      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|f:preventDefault',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+      },
+      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.collect+settings.coex.loading+settings.coex.retry',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if platform != Platform::Linux {' },
+      },
+      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
     /* ── TUN 组网网段报告：手动刷新与加载反馈 ─────────────────────────────── */
     {
       id: 'MeshRouteEvidenceBlock.tsx|k:common.refresh',
@@ -964,6 +1000,18 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '复制图标（这一屏只有终端环境变量块用它）。随上一块同判（2026-09-25 改判）；单独登记是因为块面按组件名成条，它哪天被别处复用时这条会自己变成僵尸、当场红。',
     },
     /* ── 桌面「多 VPN 兼容」批（2026-09-12 合入 main）新加的两块只读报告 ───────────── */
+    {
+      id: 'CoexSnapshotBlock',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if platform != Platform::Linux {',
+        },
+      },
+      note: '当前 COEX 采集源未接入移动端，返回 unavailable/Unknown；本片明确不挂桌面专用命令。' +
+        '这是当前 provider 状态，不是永久 OS 能力结论；不伪装空表或安全，源接入时须重审此登记。',
+    },
     {
       id: 'TunnelConflictBlock',
       disposition: {

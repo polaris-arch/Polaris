@@ -9,14 +9,55 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { mockIPC } from '@tauri-apps/api/mocks';
-import { i18nReady } from './src/i18n';
+import { i18nReady, syncLanguageChoice } from './src/i18n';
 import './src/styles/index.css';
 import App from './src/App';
 import { DEMO_CONFIG, DEMO_SERVERS } from './harness-fixture';
+import type { CoexSnapshot } from './src/contracts/coex-snapshot';
 import { TOPOLOGY_OTHERS_KEY, type ConnectionsAggregate } from './src/contracts/types';
 
 // 交互验证不能把配置夹具当只读快照：DNS 资源的增删改都经 config_save 整份回写，
 // 随后的 config_get 必须读到新值，否则受控表单会被旧夹具立即覆盖。
+// Opt-in COEX browser fixture only. The mounted App still uses the real API wrapper,
+// ipc-client envelope decoder and card. This never exercises native Rust collection.
+const coexFixtureEnabled = new URLSearchParams(window.location.search).has('coex-snapshot-fixture');
+const known = <T,>(value: T): { status: 'known'; value: T } => ({ status: 'known', value });
+const unknown = (reason: string): { status: 'unknown'; reason: string } => ({ status: 'unknown', reason });
+function coexFixture(): CoexSnapshot {
+  return {
+    schemaVersion: 1, platform: 'linux', observation: known({ elapsedMillis: 17, atomic: false }),
+    commandCleanup: known('noRetainedSnapshotCommand'),
+    context: { observationPhase: unknown('fixture phase unavailable'), ownInterfaces: unknown('fixture attribution unavailable'),
+      criteria: unknown('fixture criteria unavailable'), repairHistory: unknown('fixture history unavailable') },
+    classification: unknown('fixture classification not performed'),
+    objects: known([{
+      interface: 'fixture-tun0', tunnel: known(true), virtualization: unknown('fixture link kind unavailable'),
+      stableIdentity: known(null), addresses: known([{ address: '10.77.2.9', prefixLen: 24 }]),
+      routes: known([{ prefix: '0.0.0.0/1', table: known('100'), scope: known('global'), role: unknown('fixture role unverified') }]),
+      policyRules: known([{ priority: 120, lookupTable: known('100'), addressFamily: known('ipv4'),
+        selectorScope: known({ kind: 'limited', selector: 'from 10.77.2.0/24' }), appliesToObject: unknown('fixture association unverified') }]),
+    }]),
+  };
+}
+const coexPending: Array<{ resolve: (value: unknown) => void; reject: (reason: Error) => void }> = [];
+const coexControl = {
+  calls: [] as Array<{ command: string; payload: unknown }>,
+  fixture: coexFixture,
+  setLanguage: (language: string) => syncLanguageChoice(language),
+  reply: (value: unknown) => {
+    const pending = coexPending.shift();
+    if (!pending) throw new Error('No pending fixture request');
+    pending.resolve(value);
+  },
+  reject: (message: string) => {
+    const pending = coexPending.shift();
+    if (!pending) throw new Error('No pending fixture request');
+    pending.reject(new Error(message));
+  },
+};
+declare global { interface Window { __coexHarness?: typeof coexControl } }
+if (coexFixtureEnabled) window.__coexHarness = coexControl;
+
 let demoConfig = structuredClone(DEMO_CONFIG);
 const meshIngressFixture = new URLSearchParams(window.location.search).has('mesh-inbound-fixture');
 const meshIngressStorageKey = 'polaris-harness-mesh-inbound';
@@ -81,6 +122,12 @@ function demoTopology(payload: unknown): ConnectionsAggregate {
 }
 
 mockIPC((cmd, payload) => {
+  if (coexFixtureEnabled) {
+    coexControl.calls.push({ command: cmd, payload });
+    if (cmd === 'coex_readonly_snapshot') {
+      return new Promise<unknown>((resolve, reject) => coexPending.push({ resolve, reject }));
+    }
+  }
   switch (cmd) {
     case 'config_get': return Promise.resolve(demoConfig);
     case 'config_save': {
@@ -112,13 +159,13 @@ mockIPC((cmd, payload) => {
     // 资源库/添加应用两个弹窗读 `catalog.items.filter` 时炸在 undefined 上。
     case 'rule_resources_get_catalog': return Promise.resolve({ items: [], fetchedAt: null, source: 'builtin' });
     case 'proxy_get_status': return Promise.resolve(
-      meshIngressFixture ? { running: false } : { running: true, startTime: Date.now() - 300_000 },
+      meshIngressFixture || coexFixtureEnabled ? { running: false } : { running: true, startTime: Date.now() - 300_000 },
     );
     case 'stats_subscribe': return Promise.resolve(null);
     case 'stats_unsubscribe': return Promise.resolve(null);
     case 'stats_project_topology': return Promise.resolve(demoTopology(payload));
     case 'renderer_log': return Promise.resolve(null);
-    case 'plugin:os|platform': return Promise.resolve('macos');
+    case 'plugin:os|platform': return Promise.resolve(coexFixtureEnabled ? 'linux' : 'macos');
     default: return Promise.resolve(null);
   }
 }, { shouldMockEvents: true }); // 开事件模拟：verify 脚本用 emit() 喂 EVENT_CONNECTIONS_AGGREGATE 等推送事件
