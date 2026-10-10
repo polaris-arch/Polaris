@@ -565,7 +565,9 @@ export function MobileHomeScreen(): ReactElement {
 
   const onUseAsExit = useCallback(
     (server: ServerConfig) => {
-      if (server.id === selectedServerId) {
+      // Only a known manual selection may skip the authoritative switch/readback.
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && server.id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
@@ -581,7 +583,7 @@ export function MobileHomeScreen(): ReactElement {
         setPickerOpen(false);
       });
     },
-    [runWrite, switchServer, selectedServerId, t],
+    [runWrite, switchServer, t],
   );
 
   /** Sentinel exits use the same authoritative switch receipt as real nodes. */
@@ -589,7 +591,8 @@ export function MobileHomeScreen(): ReactElement {
     (kind: 'direct' | 'block') => {
       if (kind === 'block' && blockDisabledReason !== null) return;
       const id = kind === 'direct' ? DIRECT_SERVER_ID : BLOCK_SERVER_ID;
-      if (id === selectedServerId) {
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
@@ -605,7 +608,7 @@ export function MobileHomeScreen(): ReactElement {
         setPickerOpen(false);
       });
     },
-    [blockDisabledReason, selectedServerId, runWrite, switchServer, t],
+    [blockDisabledReason, runWrite, switchServer, t],
   );
 
   const onSetRouting = useCallback(

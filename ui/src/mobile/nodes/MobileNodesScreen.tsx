@@ -261,7 +261,9 @@ export function MobileNodesScreen(): ReactElement {
   /** 切出口共用 store 写腿；只有后端收据为 applied 才报告已生效。 */
   const onUseAsExit = useCallback(
     (row: NodeRowVM) => {
-      if (row.server.id === selectedServerId) return;
+      // Read disk state at click time; staged edits cannot decide whether Auto exits.
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && row.server.id === config.selectedServerId) return;
       void runWrite(
         async () => {
           const receipt = await switchServer(row.server.id);
@@ -275,7 +277,7 @@ export function MobileNodesScreen(): ReactElement {
         (err) => serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t),
       );
     },
-    [runWrite, switchServer, selectedServerId, t],
+    [runWrite, switchServer, t],
   );
 
   /** 一轮测速。射程由调用方按复用的谓词算好；本函数只管发、落库、报结局。 */
