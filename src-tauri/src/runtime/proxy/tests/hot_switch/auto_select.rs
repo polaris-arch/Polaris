@@ -1912,6 +1912,16 @@ fn production_refresh_fallback_uses_current_receipts_and_surviving_members() {
         rt.auto_select_fallback(&saved).unwrap().node_id,
         "me04-refresh-fast"
     );
+    rt.auto_select_note_failover(
+        Some(30 * MINUTE),
+        failover_record("me04-refresh-fast", "node-a"),
+        crate::runtime::proxy::lifecycle::monotonic_now_ms(),
+    );
+    assert_eq!(
+        rt.auto_select_fallback(&saved).unwrap().node_id,
+        "me04-refresh-slow",
+        "the live production wrapper must consume the bar, not only the injected seam"
+    );
     let mut refreshed = saved;
     refreshed["servers"]
         .as_array_mut()
@@ -1923,4 +1933,276 @@ fn production_refresh_fallback_uses_current_receipts_and_surviving_members() {
     );
     refreshed.as_object_mut().unwrap().remove("selectionIntent");
     assert!(rt.auto_select_fallback(&refreshed).is_none());
+}
+
+// Refresh uses the same production entry, with only the ledger and clocks injected.
+fn refresh_fixture() -> (Arc<ProxyRuntime>, TestDir, Value, MeasurementLedger) {
+    let (rt, dir) = test_runtime_on(Platform::Linux);
+    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
+    let ledger = MeasurementLedger::new();
+    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+    (rt, dir, cfg, ledger)
+}
+
+fn refresh_receipts(
+    rt: &ProxyRuntime,
+    cfg: &Value,
+    ledger: &MeasurementLedger,
+    run: u64,
+    results: &[(&str, u32)],
+) {
+    let fingerprints = crate::commands::speedtest::current_server_fingerprints(cfg);
+    for (node, latency) in results {
+        let mut receipt = identity(rt, cfg, run);
+        receipt.node_fingerprint = fingerprints.get(*node).cloned();
+        assert!(ledger.record_at(node, Ok(*latency), receipt, MONO));
+    }
+}
+
+#[test]
+fn refresh_fallback_prefers_unbarred_eligible_nodes_and_restores_them_at_expiry() {
+    let (rt, _dir, cfg, ledger) = refresh_fixture();
+    let period = 30 * MINUTE;
+    rt.auto_select_note_failover(Some(period), failover_record("node-c", "node-a"), MONO);
+    let end = MONO + 4 * period;
+    for at in [MONO, end - 1] {
+        assert_eq!(
+            rt.auto_select_fallback_from(&cfg, &readings_at(&ledger, at))
+                .unwrap()
+                .node_id,
+            "node-b",
+            "the fresh fastest node is barred, so prefer the fresh slower node"
+        );
+    }
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings_at(&ledger, end))
+            .unwrap()
+            .node_id,
+        "node-c",
+        "the bar uses the injected monotonic clock, independently of receipt freshness"
+    );
+    assert_eq!(
+        rt.config.current().unwrap(),
+        cfg,
+        "fallback must not write config or intent"
+    );
+    let slot = rt.auto_select.lock().unwrap();
+    assert_eq!((slot.failover_switches, slot.select_switches), (1, 0));
+    assert_eq!(slot.last_switch.as_ref().unwrap().to_id.as_str(), "node-a");
+}
+
+#[test]
+fn refresh_fallback_rescues_a_barred_node_only_when_other_nodes_are_ineligible() {
+    for other in ["deleted", "expired", "changed", "failed", "unmeasured"] {
+        let (rt, _dir, mut cfg, ledger) = refresh_fixture();
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        match other {
+            "deleted" => cfg["servers"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|node| node["id"] != "node-b"),
+            "changed" => cfg["servers"][1]["port"] = serde_json::json!(19001),
+            "expired" => {
+                let mut old = identity(&rt, &cfg, 2);
+                old.measured_at = WALL - 61 * MINUTE;
+                assert!(ledger.record_at("node-b", Ok(1), old, MONO));
+            }
+            "failed" => {
+                assert!(ledger.record_at(
+                    "node-b",
+                    Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
+                    identity(&rt, &cfg, 2),
+                    MONO
+                ));
+            }
+            "unmeasured" => {
+                cfg["servers"][1]["id"] = serde_json::json!("never-measured");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+                .unwrap()
+                .node_id,
+            "node-c",
+            "{other}: no eligible unbarred node remains"
+        );
+    }
+}
+
+#[test]
+fn refresh_fallback_never_rescues_an_ineligible_barred_node() {
+    for invalid in [
+        "expired",
+        "changed",
+        "deleted",
+        "generation",
+        "stopped",
+        "mismatch",
+        "disconnected",
+    ] {
+        let (rt, _dir, mut cfg, ledger) = refresh_fixture();
+        cfg["servers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|node| node["id"] != "node-b");
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        match invalid {
+            "expired" => {
+                let mut old = identity(&rt, &cfg, 2);
+                old.measured_at = WALL - 61 * MINUTE;
+                assert!(ledger.record_at("node-c", Ok(1), old, MONO));
+            }
+            "changed" => cfg["servers"][1]["port"] = serde_json::json!(19002),
+            "deleted" => cfg["servers"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|node| node["id"] != "node-c"),
+            "generation" => {
+                rt.gate.bump_generation();
+            }
+            "stopped" => rt.status.write().unwrap().running = false,
+            "mismatch" | "disconnected" => {
+                let mut bad = identity(&rt, &cfg, 2);
+                if invalid == "mismatch" {
+                    bad.binding = Some(BindingVerdict::Mismatch);
+                } else {
+                    bad.instance = CoreInstance::Temp;
+                }
+                assert!(ledger.record_at("node-c", Ok(1), bad, MONO));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            rt.auto_select_fallback_from(&cfg, &readings(&ledger)),
+            None,
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn refresh_fallback_does_not_cross_subscriptions_even_when_only_barred_members_remain() {
+    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
+    cfg["servers"][0]["subscriptionId"] = serde_json::json!("other");
+    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-a", 1)]);
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-b"
+    );
+    cfg["servers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|node| node["id"] != "node-b");
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-c"
+    );
+    cfg["servers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|node| node["id"] != "node-c");
+    assert_eq!(rt.auto_select_fallback_from(&cfg, &readings(&ledger)), None);
+}
+
+#[test]
+fn refresh_fallback_requires_an_effective_subscription_intent_and_open_platform() {
+    let (rt, _dir, cfg, ledger) = refresh_fixture();
+    for invalid in ["manual", "missing", "empty", "all", "malformed"] {
+        let mut config = cfg.clone();
+        match invalid {
+            "manual" => {
+                config.as_object_mut().unwrap().remove("selectionIntent");
+            }
+            "missing" => config["selectionIntent"] = polaris_store::selection_intent_auto("absent"),
+            "empty" => config["selectionIntent"] = polaris_store::selection_intent_auto("other"),
+            "all" => config["selectionIntent"] = serde_json::json!({"mode":"auto","scope":"all"}),
+            "malformed" => config["selectionIntent"] = serde_json::json!(true),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            rt.auto_select_fallback_from(&config, &readings(&ledger)),
+            None,
+            "{invalid}"
+        );
+    }
+    let (ios, _dir) = test_runtime_on(Platform::Ios);
+    let config = running(&ios, &cfg);
+    assert_eq!(
+        ios.auto_select_fallback_from(&config, &readings(&ledger)),
+        None
+    );
+}
+
+#[test]
+fn refresh_fallback_aligns_existing_epoch_before_reading_the_bar() {
+    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
+    rt.auto_select_fallback_from(&cfg, &readings(&ledger));
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    rt.gate.bump_generation();
+    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-b",
+        "the existing epoch contract retains the bar across a core generation change"
+    );
+    cfg["selectionIntent"] = polaris_store::selection_intent_auto("other");
+    cfg["servers"][1]["subscriptionId"] = serde_json::json!("other");
+    cfg["servers"][2]["subscriptionId"] = serde_json::json!("other");
+    refresh_receipts(&rt, &cfg, &ledger, 3, &[("node-b", 80), ("node-c", 20)]);
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-c"
+    );
+    assert!(
+        rt.auto_select
+            .lock()
+            .unwrap()
+            .memory
+            .barred(MONO)
+            .is_empty(),
+        "bar belongs to the previous subscription"
+    );
+}
+
+#[test]
+fn refresh_fallback_after_current_deletion_keeps_same_tier_latency_and_tie_order() {
+    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
+    cfg["servers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|node| node["id"] != "node-a");
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-c"
+    );
+    for id in ["node-b", "node-c"] {
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record(id, "node-a"), MONO);
+    }
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-c",
+        "all eligible members barred: rescue the fastest"
+    );
+    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 20), ("node-c", 20)]);
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
+            .unwrap()
+            .node_id,
+        "node-b",
+        "tie order remains configuration order"
+    );
 }

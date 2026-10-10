@@ -1496,25 +1496,48 @@ impl ProxyRuntime {
         auto_select::decide(&facts, &mut self.auto_select_slot().memory)
     }
 
-    /// 订阅刷新删掉当前出口时的改选：自动选择意图生效则给出意图指向的订阅里此刻延迟最小的
-    /// 可选点（仍存在且未改动的才有当前结果）。这是系统在出口已不存在时的代选，不经择优的迟滞。
+    /// 订阅刷新删掉当前出口时的改选：在意图指向的订阅里，优先未屏蔽的最低延迟可选点
+    /// （仍存在且未改动的才有当前结果）。仅无可选未屏蔽成员时救援屏蔽成员；不经择优的迟滞。
     pub(crate) fn auto_select_fallback(&self, config: &Value) -> Option<Candidate> {
-        let subscription = auto_select::effective_subscription(
-            config,
-            Switches::PRODUCTION,
-            self.helper.platform(),
-        )?;
+        self.auto_select_fallback_from(config, &SelectReadings::live())
+    }
+
+    pub(super) fn auto_select_fallback_from(
+        &self,
+        config: &Value,
+        readings: &SelectReadings<'_>,
+    ) -> Option<Candidate> {
+        let platform = self.helper.platform();
+        let subscription =
+            auto_select::effective_subscription(config, Switches::PRODUCTION, platform)?;
+        let generation = self.core_running().then(|| self.core_generation())?;
+        let network_epoch = self.network_epoch();
         let auto = AutoView::of(
             config,
             subscription,
-            self.core_running().then(|| self.core_generation()),
-            self.network_epoch(),
-            self.helper.platform(),
+            Some(generation),
+            network_epoch,
+            platform,
         );
-        let read = auto.read(&auto.members, &SelectReadings::live());
-        auto_select::rank(&read.selectable)
-            .first()
-            .map(|best| (*best).clone())
+        let read = auto.read(&auto.members, readings);
+        let ranked = auto_select::rank(&read.selectable);
+        let mut slot = self.auto_select_slot();
+        slot.memory.observe_epoch(
+            &Epoch {
+                subscription: auto.subscription.clone(),
+                generation,
+                network_epoch,
+                foreground_epoch: measurement_scheduler::is_mobile(platform)
+                    .then(|| readings.ledger.foreground_epoch()),
+            },
+            readings.signals.round_serial,
+        );
+        ranked
+            .iter()
+            .copied()
+            .find(|candidate| !slot.memory.is_barred(&candidate.node_id, readings.now))
+            .or_else(|| ranked.first().copied())
+            .cloned()
     }
 
     /// 每个核世代开始时一行：意图、订阅、成员数与两个回退开关的取值。
