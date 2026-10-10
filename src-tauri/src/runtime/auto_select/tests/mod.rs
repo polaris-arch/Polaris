@@ -2239,3 +2239,130 @@ fn the_slot_counts_switches_per_leg_and_forgets_only_scoped_state_on_leave() {
     );
     assert!(!slot.leave(), "没有残留时如实说没有");
 }
+
+// S5-EPOCH: bar observations are independent of S1's existing selection scope.
+fn bar_epoch(network_epoch: Option<u64>, foreground_epoch: Option<u64>) -> Epoch {
+    Epoch {
+        subscription: "sub".to_string(),
+        generation: 1,
+        network_epoch,
+        foreground_epoch,
+    }
+}
+
+#[test]
+fn s5_epoch_foreground_preserves_bar_but_resets_existing_s1_scope() {
+    let intent = auto();
+    let epoch = bar_epoch(None, Some(1));
+    let mut memory = Memory::default();
+    memory.observe_context(&epoch, 0, 4);
+    round(
+        &intent,
+        &mut memory,
+        &[candidate("ch", 100, 1, T0 - 5 * MINUTE)],
+        T0 - 5 * MINUTE,
+    );
+    assert_eq!(memory.streak().map(|s| s.wins), Some(1));
+    assert!(memory.latch_first_round(true, None));
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_context(
+        &Epoch {
+            foreground_epoch: Some(2),
+            ..epoch
+        },
+        9,
+        4,
+    );
+    assert!(memory.is_barred("flaky", T0));
+    assert_eq!(memory.streak(), None);
+    assert!(!memory.latch_first_round(false, Some(9)));
+    assert!(memory.latch_first_round(false, Some(10)));
+}
+
+#[test]
+fn s5_epoch_unknown_network_keeps_anchor_and_first_known_only_sets_baseline() {
+    for initial in [None, Some(7)] {
+        let mut memory = Memory::default();
+        memory.observe_context(&bar_epoch(initial, Some(1)), 0, 0);
+        memory.bar("flaky", T0, 30 * MINUTE);
+        for network in [None, Some(7), None, Some(7)] {
+            memory.observe_context(&bar_epoch(network, Some(2)), 1, 0);
+            assert!(memory.is_barred("flaky", T0), "{initial:?} -> {network:?}");
+        }
+        // A confirmed network change clears even across a core change, with no new foreground epoch.
+        memory.observe_context(
+            &Epoch {
+                generation: 2,
+                ..bar_epoch(Some(8), Some(2))
+            },
+            2,
+            0,
+        );
+        assert!(!memory.is_barred("flaky", T0));
+        memory.bar("new", T0, 30 * MINUTE);
+        memory.observe_context(&bar_epoch(Some(8), Some(2)), 2, 0);
+        assert!(memory.is_barred("new", T0));
+    }
+}
+
+#[test]
+fn s5_epoch_cost_sequence_is_monotonic_consumed_once_and_does_not_reset_desktop_s1() {
+    let intent = auto();
+    let epoch = bar_epoch(Some(7), None);
+    let mut memory = Memory::default();
+    memory.observe_context(&epoch, 0, 5);
+    round(
+        &intent,
+        &mut memory,
+        &[candidate("ch", 100, 1, T0 - 5 * MINUTE)],
+        T0 - 5 * MINUTE,
+    );
+    assert!(memory.latch_first_round(true, None));
+    let streak = memory.streak().cloned();
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_context(&epoch, 9, 7); // Two observed flips, even when the final cost is unchanged.
+    assert!(!memory.is_barred("flaky", T0));
+    assert_eq!(memory.streak().cloned(), streak);
+    assert!(memory.latch_first_round(false, None));
+    memory.bar("new", T0, 30 * MINUTE);
+    for sequence in [7, 5, 6, 7] {
+        memory.observe_context(&epoch, 10, sequence);
+        assert!(memory.is_barred("new", T0));
+    }
+    memory.observe_context(&epoch, 11, 8);
+    assert!(!memory.is_barred("new", T0));
+}
+
+#[test]
+fn s5_epoch_subscription_leave_and_rearm_reset_bar_observation_baselines() {
+    for leave in [false, true] {
+        let mut memory = Memory::default();
+        let epoch = bar_epoch(Some(9), Some(1));
+        memory.observe_context(&epoch, 0, 30);
+        memory.bar("old", T0, 30 * MINUTE);
+        let next = if leave {
+            memory.leave();
+            epoch
+        } else {
+            Epoch {
+                subscription: "other".to_string(),
+                ..epoch
+            }
+        };
+        // A new scope establishes its own baselines, including a lower cost reading.
+        memory.observe_context(&next, 1, 2);
+        assert!(memory.barred(T0).is_empty());
+        memory.bar("new", T0, 30 * MINUTE);
+        memory.observe_context(&next, 1, 2);
+        assert!(memory.is_barred("new", T0));
+        memory.observe_context(&next, 1, 3);
+        assert!(!memory.is_barred("new", T0));
+    }
+    let mut memory = Memory::default();
+    memory.bar("existing", T0, 30 * MINUTE);
+    memory.observe_context(&bar_epoch(Some(8), None), 0, 40);
+    assert!(
+        memory.is_barred("existing", T0),
+        "first consumption is not a historical change"
+    );
+}

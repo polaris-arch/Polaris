@@ -512,6 +512,13 @@ pub(crate) struct Epoch {
     pub(crate) foreground_epoch: Option<u64>,
 }
 
+/// 故障排除的观测锚点，与择优的四字段有效范围分开。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BarContext {
+    known_network_epoch: Option<u64>,
+    metered_change_epoch: Option<u64>,
+}
+
 /// [`decide`] 的跨次状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Memory {
@@ -528,16 +535,34 @@ pub(crate) struct Memory {
     commit_failures: u32,
     /// 被故障腿换走的节点 → 排除到何时（单调毫秒）。
     barred: BTreeMap<String, u64>,
+    bar_context: BarContext,
 }
 
 impl Memory {
     /// 对齐有效范围。范围变了即清连胜与首轮锁存；驻留与限频不随它清（它们约束的是换点的频度，
     /// 换核世代不该让频度约束归零）。
     ///
-    /// 提交的连续失败随核世代清：失败多半出在这一个核的管理面上。故障后的排除随网络（网络代次，
-    /// 手机上是前台代次）与订阅清，不随核世代清：节点的连通性故障多半与所在网络有关，换了网络
-    /// 值得重新看；而重启内核不会让一个不通的节点变通。
+    /// 提交连续失败随核世代清；故障排除只随订阅与确证的网络 / 计费变化清。
+    /// 前台代次仍使连胜与首轮锁存失效，但不代表网络变化。
     pub(crate) fn observe_epoch(&mut self, epoch: &Epoch, round_serial: u64) {
+        if self
+            .epoch
+            .as_ref()
+            .is_some_and(|previous| previous.subscription != epoch.subscription)
+        {
+            self.barred.clear();
+            self.bar_context = BarContext::default();
+        }
+        if let Some(network) = epoch.network_epoch {
+            if self
+                .bar_context
+                .known_network_epoch
+                .is_some_and(|previous| previous != network)
+            {
+                self.barred.clear();
+            }
+            self.bar_context.known_network_epoch = Some(network);
+        }
         let Some(previous) = self.epoch.as_ref() else {
             self.enter(epoch, round_serial);
             return;
@@ -548,13 +573,26 @@ impl Memory {
         if previous.generation != epoch.generation {
             self.commit_failures = 0;
         }
-        if previous.subscription != epoch.subscription
-            || previous.network_epoch != epoch.network_epoch
-            || previous.foreground_epoch != epoch.foreground_epoch
-        {
-            self.barred.clear();
-        }
         self.enter(epoch, round_serial);
+    }
+
+    /// 三条生产消费路径共同对齐。首次计费读数只立基线；旧读数不能倒退水位，
+    /// 清除时立即推进水位，避免重复消费同一变化后误清新建的排除。
+    pub(crate) fn observe_context(
+        &mut self,
+        epoch: &Epoch,
+        round_serial: u64,
+        metered_change_epoch: u64,
+    ) {
+        self.observe_epoch(epoch, round_serial);
+        match self.bar_context.metered_change_epoch {
+            Some(previous) if metered_change_epoch > previous => {
+                self.barred.clear();
+                self.bar_context.metered_change_epoch = Some(metered_change_epoch);
+            }
+            None => self.bar_context.metered_change_epoch = Some(metered_change_epoch),
+            Some(_) => {}
+        }
     }
 
     fn enter(&mut self, epoch: &Epoch, round_serial: u64) {
@@ -571,6 +609,7 @@ impl Memory {
         self.streak = None;
         self.commit_failures = 0;
         self.barred.clear();
+        self.bar_context = BarContext::default();
     }
 
     /// 首轮是否完成，满足任一即成立并在当前范围内锁存：账本对订阅成员给出「每个可测的节点都有

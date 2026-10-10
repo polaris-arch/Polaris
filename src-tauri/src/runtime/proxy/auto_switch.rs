@@ -1381,7 +1381,7 @@ impl ProxyRuntime {
         let signals = &readings.signals;
         let first_round_done = {
             let mut slot = self.auto_select_slot();
-            slot.memory.observe_epoch(
+            slot.memory.observe_context(
                 &Epoch {
                     subscription: auto.subscription.clone(),
                     generation,
@@ -1390,6 +1390,7 @@ impl ProxyRuntime {
                         .then(|| readings.ledger.foreground_epoch()),
                 },
                 signals.round_serial,
+                signals.metered_change_epoch,
             );
             slot.memory.latch_first_round(
                 read.covers_all_testable(),
@@ -1515,7 +1516,7 @@ impl ProxyRuntime {
         let read = auto.read(&auto.members, readings);
         let ranked = auto_select::rank(&read.selectable);
         let mut slot = self.auto_select_slot();
-        slot.memory.observe_epoch(
+        slot.memory.observe_context(
             &Epoch {
                 subscription: auto.subscription.clone(),
                 generation,
@@ -1524,6 +1525,7 @@ impl ProxyRuntime {
                     .then(|| readings.ledger.foreground_epoch()),
             },
             readings.signals.round_serial,
+            readings.signals.metered_change_epoch,
         );
         ranked
             .iter()
@@ -1548,7 +1550,7 @@ impl ProxyRuntime {
         };
         let network_epoch = self.network_epoch();
         let mut slot = self.auto_select_slot();
-        slot.memory.observe_epoch(
+        slot.memory.observe_context(
             &Epoch {
                 subscription: subscription.to_string(),
                 generation,
@@ -1557,6 +1559,7 @@ impl ProxyRuntime {
                     .then(|| readings.ledger.foreground_epoch()),
             },
             readings.signals.round_serial,
+            readings.signals.metered_change_epoch,
         );
         slot.memory
             .barred(readings.now)

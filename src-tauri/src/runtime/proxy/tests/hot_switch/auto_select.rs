@@ -2716,3 +2716,119 @@ async fn failover_fallback_empty_candidates_or_missing_failure_receipts_do_not_p
         assert_eq!(calls, expected, "{invalid}");
     }
 }
+
+// Invoke the actual three runtime consumers; only readings/ledger/time are injected.
+async fn consume_bar_context(
+    rt: &Arc<ProxyRuntime>,
+    cfg: &Value,
+    reads: &SelectReadings<'_>,
+    entry: usize,
+) {
+    match entry {
+        0 => {
+            assess(rt, reads, None).await;
+        }
+        1 => {
+            rt.auto_select_fallback_from(cfg, reads);
+        }
+        2 => {
+            rt.auto_select_failover_barred_from(cfg, rt.core_generation(), reads);
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn runtime_barred(rt: &ProxyRuntime, id: &str) -> bool {
+    rt.auto_select.lock().unwrap().memory.is_barred(id, MONO)
+}
+
+#[tokio::test]
+async fn s5_epoch_all_runtime_consumers_preserve_foreground_bars_and_consume_cost_once() {
+    for platform in [Platform::Linux, Platform::Android] {
+        for entry in 0..3 {
+            let (rt, _dir) = test_runtime_on(platform);
+            let cfg = running(&rt, &auto_config("node-a", Some("sub")));
+            let ledger = MeasurementLedger::new();
+            refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+            let mut reads = readings(&ledger);
+            reads.signals.metered_change_epoch = 5;
+            consume_bar_context(&rt, &cfg, &reads, entry).await;
+            rt.auto_select_note_failover(
+                Some(30 * MINUTE),
+                failover_record("node-c", "node-a"),
+                MONO,
+            );
+            ledger.set_foreground_epoch(1);
+            consume_bar_context(&rt, &cfg, &reads, entry).await;
+            assert!(
+                runtime_barred(&rt, "node-c"),
+                "{platform:?}, entry={entry}: resume is not a network change"
+            );
+            reads.signals.metered_change_epoch = 7;
+            consume_bar_context(&rt, &cfg, &reads, entry).await;
+            assert!(
+                !runtime_barred(&rt, "node-c"),
+                "{platform:?}, entry={entry}: observed cost round trip clears"
+            );
+            rt.auto_select_note_failover(
+                Some(30 * MINUTE),
+                failover_record("node-c", "node-a"),
+                MONO,
+            );
+            for sequence in [7, 5, 6, 7] {
+                reads.signals.metered_change_epoch = sequence;
+                consume_bar_context(&rt, &cfg, &reads, entry).await;
+                assert!(runtime_barred(&rt, "node-c"), "{platform:?}, entry={entry}: stale/duplicate {sequence} cannot clear a new bar");
+            }
+            rt.gate.bump_generation();
+            reads.signals.metered_change_epoch = 8;
+            consume_bar_context(&rt, &cfg, &reads, entry).await;
+            assert!(
+                !runtime_barred(&rt, "node-c"),
+                "{platform:?}, entry={entry}: confirmed flip survives core change"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn s5_epoch_facts_and_refresh_still_require_fresh_foreground_receipts() {
+    let (rt, _dir) = test_runtime_on(Platform::Android);
+    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
+    let ledger = MeasurementLedger::new();
+    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+    let reads = readings(&ledger);
+    assert!(assess(&rt, &reads, None).await.is_some());
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    ledger.set_foreground_epoch(1);
+    assert!(assess(&rt, &reads, None).await.is_none());
+    assert_eq!(
+        last_decision(&rt),
+        Decision::NotEvaluated(Gate::WaitingFirstRound)
+    );
+    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
+    assert!(runtime_barred(&rt, "node-c"));
+    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
+    assert!(assess(&rt, &reads, None).await.is_some());
+    assert_eq!(
+        rt.auto_select_fallback_from(&cfg, &reads).unwrap().node_id,
+        "node-b"
+    );
+    assert!(runtime_barred(&rt, "node-c"));
+}
+
+#[tokio::test]
+async fn s5_epoch_each_runtime_consumer_uses_confirmed_desktop_network_change() {
+    for entry in 0..3 {
+        let (rt, _dir, cfg, ledger) = refresh_fixture();
+        let reads = readings(&ledger);
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        rt.gate.bump_generation();
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(runtime_barred(&rt, "node-c"));
+        rt.network_epoch.fetch_add(1, Ordering::SeqCst);
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(!runtime_barred(&rt, "node-c"), "entry={entry}");
+    }
+}

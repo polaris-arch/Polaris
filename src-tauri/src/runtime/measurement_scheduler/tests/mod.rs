@@ -2181,3 +2181,115 @@ fn production_tick_synchronizes_reduced_factor_before_receipts_are_recorded() {
         "already recorded reduced receipts must keep their original freshness factor"
     );
 }
+
+#[test]
+fn s5_epoch_metered_sequence_counts_known_flips_across_unknown_and_core_generations() {
+    for platform in [Platform::Linux, Platform::Android] {
+        let mut planner = Planner::new(platform, at(0));
+        planner.platform_enabled = true;
+        let plan = plan(&[("s1", 30, &["a"])]);
+        let steps = [
+            (Some(1), Metered::Unavailable, 0),
+            (Some(1), Metered::No, 0),
+            (Some(1), Metered::No, 0),
+            (Some(1), Metered::Unavailable, 0),
+            (Some(2), Metered::Yes, 1),
+            (Some(2), Metered::Yes, 1),
+            (None, Metered::Unavailable, 1),
+            (Some(3), Metered::No, 2),
+        ];
+        for (index, (generation, metered, expected)) in steps.into_iter().enumerate() {
+            planner.tick(&TickInput {
+                conditions: Some(DeviceConditions {
+                    metered,
+                    power_save: index % 2 == 0,
+                }),
+                ..input(at(index as u64 * 100), generation, &plan)
+            });
+            assert_eq!(
+                planner.signals().metered_change_epoch,
+                expected,
+                "{platform:?}, step {index}"
+            );
+            assert_eq!(
+                planner.foreground_epoch(),
+                if is_mobile(platform) { expected } else { 0 }
+            );
+        }
+    }
+}
+
+#[test]
+fn s5_epoch_metered_round_trip_is_recorded_inside_retest_throttle_and_published() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let mut planner = Planner::new(Platform::Android, at(0));
+    planner.platform_enabled = true;
+    let ledger = MeasurementLedger::new();
+    for (time, metered, expected) in [
+        (0, Metered::No, 0),
+        (100, Metered::Yes, 1),
+        (200, Metered::No, 2),
+    ] {
+        let tick = TickInput {
+            conditions: Some(DeviceConditions {
+                metered,
+                power_save: false,
+            }),
+            ledger: &ledger,
+            ..input(at(time), Some(1), &plan)
+        };
+        planner.tick_and_sync_ledger(&tick);
+        assert_eq!(planner.signals().metered_change_epoch, expected);
+        assert_eq!(ledger.foreground_epoch(), expected);
+    }
+    assert_eq!(
+        planner.last_network_retest,
+        Some(100),
+        "the second flip does not bypass retest throttling"
+    );
+    assert_eq!(planner.network_changed_at, Some(200));
+    assert_eq!(
+        planner.conditions.metered,
+        Metered::No,
+        "round trip returns to the same final cost"
+    );
+}
+
+#[test]
+fn s5_epoch_resume_and_freeze_preserve_cost_sequence_and_existing_foreground_freshness() {
+    for freeze in [false, true] {
+        for away in [AWAY_EPOCH_MS - 1, AWAY_EPOCH_MS + 1] {
+            let mut planner = Planner::new(Platform::Android, at(0));
+            planner.platform_enabled = true;
+            let plan = plan(&[("s1", 30, &["a"])]);
+            let ledger = MeasurementLedger::new();
+            planner.tick_and_sync_ledger(&TickInput {
+                ledger: &ledger,
+                conditions: Some(DeviceConditions {
+                    metered: Metered::No,
+                    power_save: false,
+                }),
+                ..input(at(0), Some(1), &plan)
+            });
+            let next = Now {
+                mono: away,
+                wall: WALL + away,
+            };
+            if !freeze {
+                planner.on_suspended(at(0));
+                planner.on_resumed(next);
+            }
+            planner.tick_and_sync_ledger(&TickInput {
+                ledger: &ledger,
+                ..input(next, Some(1), &plan)
+            });
+            assert_eq!(planner.signals().metered_change_epoch, 0);
+            assert_eq!(
+                ledger.foreground_epoch(),
+                // With both notifications, existing resume and tick-gap paths each advance foreground.
+                u64::from(away >= AWAY_EPOCH_MS) * if freeze { 1 } else { 2 },
+                "freeze={freeze}, away={away}"
+            );
+        }
+    }
+}

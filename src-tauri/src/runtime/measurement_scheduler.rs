@@ -544,6 +544,8 @@ pub(crate) struct Planner {
     conditions_at: Option<u64>,
     /// 最近一次**已知**的计费状态（是 / 否）。中间隔着「不可得」的迁移也据它判翻转。
     last_known_metered: Option<bool>,
+    /// 已观测的已知计费翻转序号：只供故障排除消费，不改变择优有效范围。
+    metered_change_epoch: u64,
     round: Option<ActiveRound>,
     /// 上一轮被时间预算截断时没测到的节点：下一轮排在最前。
     carry_over: Vec<String>,
@@ -570,6 +572,8 @@ pub(crate) struct Signals {
     pub(crate) verdict: Verdict,
     /// 已收尾的轮次数。
     pub(crate) round_serial: u64,
+    /// 进程内单调的已知计费翻转序号，不随核世代或前台变化清零。
+    pub(crate) metered_change_epoch: u64,
     /// 逐订阅：最近一次收尾的一轮的序号，与最近一次到期未执行的原因。
     pub(crate) subscriptions: BTreeMap<String, (Option<u64>, Option<&'static str>)>,
 }
@@ -580,6 +584,7 @@ impl Signals {
             foreground: true,
             verdict: Verdict::Idle(Idle::CoreNotRunning),
             round_serial: 0,
+            metered_change_epoch: 0,
             subscriptions: BTreeMap::new(),
         }
     }
@@ -641,6 +646,7 @@ impl Planner {
             conditions: DeviceConditions::UNAVAILABLE,
             conditions_at: None,
             last_known_metered: None,
+            metered_change_epoch: 0,
             round: None,
             carry_over: Vec::new(),
             backoff_skips: BTreeMap::new(),
@@ -670,6 +676,7 @@ impl Planner {
             foreground: self.foreground,
             verdict: self.verdict,
             round_serial: self.round_serial,
+            metered_change_epoch: self.metered_change_epoch,
             subscriptions: self
                 .subs
                 .iter()
@@ -901,6 +908,8 @@ impl Planner {
             self.conditions = conditions;
             self.conditions_at = Some(now.mono);
             if flipped {
+                // 先记录事实，再判断补测节流；间隔内来回翻转也不能丢失。
+                self.metered_change_epoch = self.metered_change_epoch.saturating_add(1);
                 self.forgive_failures = true;
                 if is_mobile(self.platform) {
                     self.foreground_epoch += 1;
