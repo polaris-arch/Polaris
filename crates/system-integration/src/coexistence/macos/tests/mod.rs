@@ -429,6 +429,104 @@ fn provider_reads_actual_existing_rosters_and_retains_all_routes_without_selecti
         assert_eq!(inactive.addresses, Fact::Known(vec![]));
     }
 }
+// LINK variants are injected into an existing complete sanitized capture, not
+// newly collected device evidence. Their IFF bits change only header validity;
+// neither link flags nor the POINTOPOINT flag establish object classification.
+fn capture_with_link_flag(flag: &str, bit: u32) -> [Result<String, String>; 3] {
+    let mut inputs = fixture_inputs(FIXTURES[2]);
+    let roster = inputs[2].as_mut().unwrap();
+    let header = roster
+        .lines()
+        .find(|line| line.starts_with("en0:"))
+        .unwrap();
+    let token = header.split_whitespace().nth(1).unwrap();
+    let (number, names) = token
+        .strip_prefix("flags=")
+        .unwrap()
+        .split_once('<')
+        .unwrap();
+    let names = names.strip_suffix('>').unwrap();
+    let bits = u32::from_str_radix(number, 16).unwrap() | bit;
+    let replacement = header.replacen(token, &format!("flags={bits:x}<{names},{flag}>"), 1);
+    *roster = roster.replacen(header, &replacement, 1);
+    assert!(roster
+        .lines()
+        .find(|line| line.starts_with("en0:"))
+        .unwrap()
+        .contains(flag));
+    inputs
+}
+#[test]
+fn roster_accepts_ascii_digit_link_flags_without_classification_evidence() {
+    let baseline = decode_interfaces(fixture_inputs(FIXTURES[2])[2].clone().unwrap()).unwrap();
+    for (flag, bit) in [("LINK0", 0x1000), ("LINK1", 0x2000), ("LINK2", 0x4000)] {
+        let roster =
+            decode_interfaces(capture_with_link_flag(flag, bit)[2].clone().unwrap()).unwrap();
+        assert_eq!(
+            roster, baseline,
+            "{flag}: independent roster/address facts changed"
+        );
+        assert!(matches!(roster["en0"].tunnel, Fact::Unknown(_)));
+        assert!(matches!(roster["en0"].virtualization, Fact::Unknown(_)));
+    }
+}
+#[test]
+fn roster_flag_names_still_reject_non_ascii_lowercase_punctuation_and_empty_tokens() {
+    for flag in [
+        "Link0",
+        "LINK-0",
+        "LINK.0",
+        "LINK+0",
+        "LINK０",
+        "UP,,LINK0",
+        ",LINK0",
+        "LINK0,",
+    ] {
+        assert!(
+            decode_interfaces(format!("en0: flags=9863<{flag}> mtu 1500\n")).is_err(),
+            "{flag}"
+        );
+    }
+}
+fn assert_provider_preserves_capture_with_link_flag(flag: &str, bit: u32) {
+    let baseline = object_rows(provider(fixture_inputs(FIXTURES[2])));
+    let observed = object_rows(provider(capture_with_link_flag(flag, bit)));
+    assert_eq!(
+        observed, baseline,
+        "{flag}: complete provider facts changed"
+    );
+    assert_eq!(observed.len(), 29);
+    let routes: usize = observed
+        .iter()
+        .map(|o| match &o.routes {
+            Fact::Known(rows) => rows.len(),
+            Fact::Unknown(reason) => panic!("{flag}: {} lost routes: {reason}", o.interface),
+        })
+        .sum();
+    assert_eq!(routes, 219);
+    let physical = observed.iter().find(|o| o.interface == "en0").unwrap();
+    assert!(
+        matches!(&physical.addresses, Fact::Known(rows) if rows.iter().any(|a|
+        a.address == "192.168.10.142".parse::<IpAddr>().unwrap() && a.prefix_len == 24))
+    );
+    assert!(observed
+        .iter()
+        .all(|o| matches!(o.tunnel, Fact::Unknown(_))
+            && matches!(o.virtualization, Fact::Unknown(_))));
+}
+#[test]
+fn provider_link0_preserves_complete_capture_roster_addresses_and_routes() {
+    assert_provider_preserves_capture_with_link_flag("LINK0", 0x1000);
+}
+#[test]
+fn provider_link1_preserves_complete_capture_roster_addresses_and_routes() {
+    assert_provider_preserves_capture_with_link_flag("LINK1", 0x2000);
+}
+#[test]
+fn provider_link2_preserves_complete_capture_roster_addresses_and_routes() {
+    assert_provider_preserves_capture_with_link_flag("LINK2", 0x4000);
+}
+
 #[test]
 fn address_rows_keep_host_bits_peer_local_addresses_and_explicit_ipv6_zone() {
     let mut input = empty_routes();

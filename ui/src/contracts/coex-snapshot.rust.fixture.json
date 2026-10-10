@@ -13,7 +13,7 @@
     "kind": "Rust-generated fixture; no host or native IPC sampling",
     "macosCapture": "macos-p101-routes-ts-on-2026-09-12.txt",
     "macosCaptureSha256": "ecad16eb60f8464b41e5a8cf9a8c57107b7ecba8fa3ff96d579d1855e9ee66ff",
-    "macosSourceSha256": "037fdbab673ead96d3eb49b7f5bb31bd257d112394ce7b78e384bb7abcd374e5",
+    "macosSourceSha256": "21e9de9c1e507d0935b6da8dc709fe51c555c034024e56dd01726dffafdf2859",
     "method": "Production collect_linux and collect_macos with injected fixed source runners; exact production fact_wire/object_wire/snapshot_wire functions compiled unchanged against actual crate types. Mac collector sample consumes existing sanitized capture; partial and unknown-scope cases are synthetic failures, option-shapes supplies typed synthetic tables. No native source invoked.",
     "signedBase": "199544118e34a6e32f76b8506a301b486e7ed8d7",
     "typesSourceSha256": "e84a24f5f66a77cdf4082346a70cf7fc810d66af3f94f6460da2007cf2bda2c2"

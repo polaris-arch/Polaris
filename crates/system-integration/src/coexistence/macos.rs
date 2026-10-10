@@ -116,8 +116,11 @@ fn decode_interfaces(raw: String) -> Result<BTreeMap<String, ObjectFacts>, Strin
                                 v.is_empty()
                                     || v.split(',').all(|f| {
                                         !f.is_empty()
-                                            && f.bytes()
-                                                .all(|b| b.is_ascii_uppercase() || b == b'_')
+                                            && f.bytes().all(|b| {
+                                                b.is_ascii_uppercase()
+                                                    || b.is_ascii_digit()
+                                                    || b == b'_'
+                                            })
                                     })
                             })
                     });
