@@ -333,6 +333,9 @@ export const IPC_CHANNELS = {
   EVENT_MESH_LOGIN_FALLBACK: 'event:meshLoginFallback', // 缺陷1 登录期出口让位：选中 TS 出口未就绪→默认路由让位直连(engaged=true)/就绪后切回(engaged=false)，渲染端据此提示（payload={engaged,serverName?}）
   EVENT_SYSTEM_PROXY_RESIDUAL: 'event:systemProxyResidual', // TUN 启动后检测到无 marker 的系统代理残留（非 Polaris 设的）→ 一次性提示
   SYSTEM_LIST_NETWORK_INTERFACES: 'system_list_network_interfaces',
+  COEX_RUNTIME_GET_STATE: 'coex_runtime_get_state',
+  COEX_RUNTIME_REFRESH: 'coex_runtime_refresh',
+  EVENT_COEX_RUNTIME_STATE: 'event:coexRuntimeState',
   COEX_READONLY_SNAPSHOT: 'coex_readonly_snapshot',
 
   // 界面语言不再经此反向同步：改走 config.language 单一真值源（主进程直接读 config，见 config-engine）。

@@ -561,8 +561,15 @@ fn registration_and_native_observed_custody_path_are_anchored_to_actual_entry() 
     assert!(command.contains("request_for_window("));
     assert!(command.contains("window.label()"));
     assert!(command.contains("NativeSource"));
-    assert!(command.contains("static SERVICE: OnceLock<Arc<SnapshotService>>"));
-    assert!(command.contains("SERVICE.get_or_init"));
+    assert!(command.contains("shared_service()"));
+    assert_eq!(
+        source
+            .matches("static SERVICE: OnceLock<Arc<SnapshotService>>")
+            .count(),
+        1
+    );
+    let shared = top_level_fn_body(&source, "pub(crate) fn shared_service(");
+    assert!(shared.contains("SERVICE.get_or_init"));
     let request = top_level_fn_body(&source, "async fn request_for_window<S:");
     assert!(
         request.find("!allowed_window(label)").unwrap() < request.find("collect_request(").unwrap()
@@ -572,20 +579,34 @@ fn registration_and_native_observed_custody_path_are_anchored_to_actual_entry() 
         "tokio::task::spawn_blocking(move || collect_blocking(admission, platform, source))"
     ));
     let worker = top_level_fn_body(&source, "fn collect_blocking<S:");
-    assert!(worker.contains("let runner = SnapshotRunner"));
-    assert!(worker.contains("Platform::Linux => collect_linux(&runner).objects"));
-    assert!(worker.contains("Platform::Mac => collect_macos(&runner)"));
-    assert!(worker.find("snapshot_wire(").unwrap() < worker.find("admission.finish()").unwrap());
+    assert!(
+        worker
+            .find("collect_admitted(&admission, platform, source)")
+            .unwrap()
+            < worker.find("admission.finish()").unwrap()
+    );
+    let admitted = top_level_fn_body(&source, "pub(crate) fn collect_admitted<S:");
+    assert!(admitted.contains("let runner = SnapshotRunner"));
+    assert!(admitted.contains("Platform::Linux => collect_linux(&runner).objects"));
+    assert!(admitted.contains("Platform::Mac => collect_macos(&runner)"));
+    assert!(admitted.contains("snapshot_wire("));
+    assert!(!admitted.contains("admission.finish()"));
     assert!(source.contains("StdCommandRunner.run_observed(command, timeout)"));
     assert!(source.contains("observed.into_pending()"));
     let modules = crate::test_support::crate_source("commands.rs");
     assert_eq!(modules.matches("pub mod coexistence_snapshot;").count(), 1);
     assert_eq!(
-        modules
-            .matches("pub use coexistence_snapshot::coex_readonly_snapshot;")
-            .count(),
+        modules.matches("pub use coexistence_snapshot::{").count(),
         1
     );
+    let exports = modules
+        .split_once("pub use coexistence_snapshot::{")
+        .unwrap()
+        .1
+        .split_once("};")
+        .unwrap()
+        .0;
+    assert_eq!(exports.matches("coex_readonly_snapshot").count(), 1);
     let lib = crate::test_support::crate_source("lib.rs");
     let handler = lib
         .split_once(".invoke_handler(tauri::generate_handler![")

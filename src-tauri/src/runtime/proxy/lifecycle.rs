@@ -407,13 +407,19 @@ impl ProxyRuntime {
     )]
     pub(super) fn bump_generation(&self) -> u64 {
         let g = self.gate.bump_generation();
+        self.coex.invalidate_generation(g);
         self.gen_changed.notify_waiters();
         g
     }
 
-    fn claim_generation(&self, expected: Option<u64>, kind: LifecycleKind) -> Option<u64> {
+    pub(super) fn claim_generation(
+        &self,
+        expected: Option<u64>,
+        kind: LifecycleKind,
+    ) -> Option<u64> {
         let generation = self.gate.claim_generation(expected, kind);
-        if generation.is_some() {
+        if let Some(generation) = generation {
+            self.coex.claim(generation, kind == LifecycleKind::Start);
             self.gen_changed.notify_waiters();
         }
         generation
@@ -726,6 +732,8 @@ impl ProxyRuntime {
         let t_start_request = std::time::Instant::now();
         // 后台网络任务须等整个起核事务稳定。TUN 成功腿会在 selector 校正/flush 任务里先接棒一个
         // 新 guard，再由本 guard 退场，因此计数不会在两段之间短暂归零、放进一条注定被 RST 的请求。
+        let coex_attempt =
+            super::coex_observer::StartAttempt::new(Arc::clone(&self.coex), requested_generation);
         let _network_settle = self.network_settle.begin("proxy-start");
         // 起核在飞标记（`ProxyStatus::starting` 的源）：**置于所有早退腿之前**，覆盖整条起核腿——
         // stale 清扫本身就能停数秒（真机事故里正是它撞上杀不动的 root 孤儿），那段时间用户看到的是
@@ -844,6 +852,7 @@ impl ProxyRuntime {
             }
             generation
         };
+        coex_attempt.generation.set(my_gen);
         if !self.core_running() {
             self.process_deferred_config_deletions_under_gate(&_tailscale_gate);
         }
@@ -880,6 +889,7 @@ impl ProxyRuntime {
                 // 与 stopped 腿同一配对纪律：差集与生命周期描述同一次终态跃迁，必须相邻发布。
                 self.push_pending_changes();
                 self.push_lifecycle(&ProxyLifecycleEvent::ready());
+                self.coex_committed_ready(my_gen);
             });
         }
         // **起核失败的唯一广播点**（`event:proxyLifecycle{phase:'failed'}`）。挂这里而不是各失败腿，
@@ -895,6 +905,7 @@ impl ProxyRuntime {
         // sidecar），误做会伤到接管方；发一条事件不破坏任何东西，而接管方随后自己的 ready/failed
         // 会后发覆盖。漏发才是更坏的失效（条永远停在转圈），故取「宁可多发一条可被覆盖的」。
         if let Err(e) = &r {
+            self.coex.fail_start(my_gen);
             self.push_lifecycle(&ProxyLifecycleEvent::failed(e));
         }
         let terminal_settle_ms = t_terminal_settle.elapsed().as_millis();

@@ -31,6 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// 与 `polaris-ipc-channels.ts`（B6 前端移植）保持同名，前端 `listen(EVENT_PROXY_STARTED, ...)` 直连。
 /// 这些是「事件推送」单向通道（区别于 `command_*` 双向 invoke），语义不变式见 Polaris ipc-channels.ts 注释。
 pub mod channel {
+    pub const EVENT_COEX_RUNTIME_STATE: &str = "event:coexRuntimeState";
     // 代理生命周期
     pub const EVENT_PROXY_STARTED: &str = "event:proxyStarted";
     pub const EVENT_PROXY_STOPPED: &str = "event:proxyStopped";

@@ -23,7 +23,7 @@
       "crates/system-integration/src/coexistence/windows.rs": "d0b56f3887a013683359c19d174a530782a32b188c4975db57fec41248aa7a90",
       "crates/system-integration/src/windows_coex.rs": "298e57dbc1eb4509ee2d3ab7834fce47754741150a7d990923032ad30de4e19e",
       "crates/system-integration/src/windows_coex/native.rs": "deb8f42df1d93e9c7e31ee966495e68c6f172b28678b3e1bc915a7bce88f1c5b",
-      "src-tauri/src/commands/coexistence_snapshot.rs": "0c1a20ef2ca0690544b419697e6033b8219734d085a9f4b686116739ef272a1e"
+      "src-tauri/src/commands/coexistence_snapshot.rs": "0afbb08b347b06cff33a6099f678263ccc8fc646ffb73a86f7a6a5f67b6cf4b0"
     }
   },
   "snapshots": {

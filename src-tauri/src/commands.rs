@@ -519,7 +519,9 @@ pub mod window;
 
 pub use android_batch_qa::*;
 pub use android_transient_close_qa::*;
-pub use coexistence_snapshot::coex_readonly_snapshot;
+pub use coexistence_snapshot::{
+    coex_readonly_snapshot, coex_runtime_get_state, coex_runtime_refresh,
+};
 pub use config::*;
 pub use helper::*;
 pub use icon::*;

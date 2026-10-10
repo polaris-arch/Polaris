@@ -2335,9 +2335,7 @@ impl ProxyRuntime {
                 &deps,
             ));
         }
-        if let Ok(mut g) = self.current_config.write() {
-            *g = Some(config.clone());
-        }
+        self.commit_coex_current_config(config.clone());
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
         // continuously through readiness; releasing and re-reserving here opens a takeover gap.
         if let Ok(mut snap) = self.startup_snapshot.write() {
@@ -2597,6 +2595,7 @@ impl ProxyRuntime {
         // DNS 热插拔重灌仍由 handle_network_change → dns_reconcile_should_run 独立门控。
         // watcher 只消费别名：Windows 订阅按别名解 LUID，macOS/Linux 按别名做文本匹配。
         self.spawn_network_watcher(
+            my_gen,
             managed_tun_interface
                 .as_ref()
                 .and_then(ExitInterfaceId::alias)

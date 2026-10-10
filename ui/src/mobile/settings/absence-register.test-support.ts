@@ -321,7 +321,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'platform-absent',
         evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
       },
-      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
     },
     {
@@ -330,7 +330,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'platform-absent',
         evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
       },
-      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
     },
     {
@@ -339,7 +339,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'platform-absent',
         evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
       },
-      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
     },
     {
@@ -348,7 +348,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'platform-absent',
         evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
       },
-      note: '只读快照卡的手动采集/重试、折叠或显示分页动作。当前移动端采集源未接入，不挂卡、不调用桌面命令；' +
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
         '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
     },
     /* ── TUN 组网网段报告：手动刷新与加载反馈 ─────────────────────────────── */
@@ -1012,7 +1012,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
           mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
         },
       },
-      note: '当前 COEX 采集源未接入移动端，返回 unavailable/Unknown；本片明确不挂桌面专用命令。' +
+      note: '当前 COEX 原 watcher 和采集源未接入移动端，返回 unavailable/Unknown；本片不挂桌面 get-state/事件/刷新命令。' +
         '这是当前 provider 状态，不是永久 OS 能力结论；不伪装空表或安全，源接入时须重审此登记。',
     },
     {

@@ -1,4 +1,4 @@
-//! Explicit, read-only COEX diagnostics. No lifecycle publication or classification.
+//! Read-only COEX acquisition shared by legacy diagnostics and runtime visibility.
 //!
 //! Linux and macOS have production collectors here. Missing session provenance stays
 //! Unknown; this entry does not replace the legacy advisory report. Source limits
@@ -24,7 +24,7 @@ use polaris_system_integration::coexistence::windows::*;
 const CLEANUP_OBSERVATION: Duration = Duration::from_millis(25);
 
 /// Private ownership seam. Tests inject ownership outcomes, never native proof.
-trait CommandCustody: Send {
+pub(crate) trait CommandCustody: Send {
     fn poll_cleanup(&mut self, budget: Duration) -> CommandCleanup;
     fn operation(&self) -> Option<Result<CommandOutput, String>>;
 }
@@ -39,26 +39,34 @@ impl CommandCustody for PendingCommand {
     }
 }
 
-enum StartedCommand {
+pub(crate) enum StartedCommand {
     NotSpawned(String),
     OwnershipUnavailable(String),
     Owned(Box<dyn CommandCustody>),
 }
 
-trait ObservationSource: Send + 'static {
+pub(crate) trait ObservationSource: Send + 'static {
     fn start(&self, command: &Command, timeout: Duration) -> StartedCommand;
     fn windows_facts(&self) -> WindowsFactInput {
         windows_unavailable("Windows source not supplied")
     }
 }
 
-struct NativeSource;
+pub(crate) struct NativeSource;
 
 impl ObservationSource for NativeSource {
     fn windows_facts(&self) -> WindowsFactInput {
-        collect_windows(&polaris_system_integration::windows_coex::NativeWindowsSource)
+        // Unit-test runtimes can reach Ready; they must never query the host implicitly.
+        if cfg!(test) {
+            windows_unavailable("native COEX queries disabled in unit tests")
+        } else {
+            collect_windows(&polaris_system_integration::windows_coex::NativeWindowsSource)
+        }
     }
     fn start(&self, command: &Command, timeout: Duration) -> StartedCommand {
+        if cfg!(test) {
+            return StartedCommand::NotSpawned("native COEX queries disabled in unit tests".into());
+        }
         let observed = StdCommandRunner.run_observed(command, timeout);
         // An original PendingCommand is transferred intact, not reconstructed from
         // a PID, error string, mock acknowledgement, or the legacy run result.
@@ -87,7 +95,7 @@ struct SnapshotSlot {
 }
 
 #[derive(Default)]
-struct SnapshotService {
+pub(crate) struct SnapshotService {
     slot: Mutex<SnapshotSlot>,
 }
 
@@ -104,7 +112,7 @@ impl SnapshotService {
     }
 
     // Never wait on a blocking worker's mutex in the async command path.
-    fn admit(self: &Arc<Self>) -> Result<Admission, String> {
+    pub(crate) fn admit(self: &Arc<Self>) -> Result<Admission, String> {
         let mut slot = match self.slot.try_lock() {
             Ok(slot) => slot,
             Err(TryLockError::WouldBlock) => return Err("snapshot worker busy".into()),
@@ -190,7 +198,7 @@ impl SnapshotService {
     }
 }
 
-struct Admission {
+pub(crate) struct Admission {
     service: Arc<SnapshotService>,
     recorded: bool,
 }
@@ -208,7 +216,7 @@ impl Admission {
         }
     }
 
-    fn finish(mut self) {
+    pub(crate) fn finish(mut self) {
         self.service.lock_worker().busy = false;
         self.recorded = true;
     }
@@ -419,6 +427,16 @@ fn collect_blocking<S: ObservationSource>(
     platform: Platform,
     source: S,
 ) -> Value {
+    let result = collect_admitted(&admission, platform, source);
+    admission.finish();
+    result
+}
+
+pub(crate) fn collect_admitted<S: ObservationSource>(
+    admission: &Admission,
+    platform: Platform,
+    source: S,
+) -> Value {
     let started = Instant::now();
     if platform == Platform::Win {
         let input = match admission.service.observe_retained() {
@@ -431,7 +449,6 @@ fn collect_blocking<S: ObservationSource>(
             &input,
             json!({"status":"known","value":{"elapsedMillis":elapsed,"atomic":false}}),
         );
-        admission.finish();
         return result;
     }
     let objects = match admission.service.observe_retained() {
@@ -443,9 +460,11 @@ fn collect_blocking<S: ObservationSource>(
             match platform {
                 Platform::Linux => collect_linux(&runner).objects,
                 Platform::Mac => collect_macos(&runner),
-                _ => Fact::Unknown(
-                    "production COEX snapshot collector unavailable on this platform".into(),
-                ),
+                Platform::Win | Platform::Android | Platform::Ios | Platform::Other => {
+                    Fact::Unknown(
+                        "production COEX snapshot collector unavailable on this platform".into(),
+                    )
+                }
             }
         }
         Err(error) => Fact::Unknown(error),
@@ -458,7 +477,6 @@ fn collect_blocking<S: ObservationSource>(
         admission.cleanup_outcome(),
     );
     // Keep admission until projection is complete as well as native work.
-    admission.finish();
     snapshot
 }
 
@@ -512,14 +530,54 @@ async fn request_for_window<S: ObservationSource>(
 /// to the main window. No new plugin capability, helper privilege or renderer argv.
 #[tauri::command]
 pub async fn coex_readonly_snapshot(window: tauri::WebviewWindow) -> ApiResponse<Value> {
-    static SERVICE: OnceLock<Arc<SnapshotService>> = OnceLock::new();
     request_for_window(
-        Arc::clone(SERVICE.get_or_init(|| Arc::new(SnapshotService::default()))),
+        shared_service(),
         Platform::current(),
         NativeSource,
         window.label(),
     )
     .await
+}
+
+static SERVICE: OnceLock<Arc<SnapshotService>> = OnceLock::new();
+
+pub(crate) fn shared_service() -> Arc<SnapshotService> {
+    Arc::clone(SERVICE.get_or_init(|| Arc::new(SnapshotService::default())))
+}
+
+#[tauri::command]
+pub fn coex_runtime_get_state(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::runtime::AppRuntime>,
+) -> ApiResponse<Value> {
+    if !allowed_window(window.label()) {
+        return ApiResponse::err_with_code(
+            "COEX state requires the main window",
+            "coex_window_denied",
+        );
+    }
+    ApiResponse::ok(state.proxy.coex_state())
+}
+
+#[tauri::command]
+pub fn coex_runtime_refresh(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::runtime::AppRuntime>,
+    expected_report_revision: String,
+) -> ApiResponse<Value> {
+    if !allowed_window(window.label()) {
+        return ApiResponse::err_with_code(
+            "COEX refresh requires the main window",
+            "coex_window_denied",
+        );
+    }
+    let Ok(revision) = expected_report_revision.parse::<u64>() else {
+        return ApiResponse::err_with_code("Invalid COEX revision", "coex_revision_invalid");
+    };
+    if revision.to_string() != expected_report_revision {
+        return ApiResponse::err_with_code("Invalid COEX revision", "coex_revision_invalid");
+    }
+    ApiResponse::ok(state.proxy.coex_refresh(revision))
 }
 
 #[cfg(test)]

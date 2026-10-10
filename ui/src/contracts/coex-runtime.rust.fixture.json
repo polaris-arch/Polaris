@@ -1,0 +1,755 @@
+{
+  "provenance": "Actual Observer hooks, original admitted Linux fixture collector, actual runtime serializer; no native API/core/IPC device",
+  "states": {
+    "crashed": {
+      "activity": "idle",
+      "binding": {
+        "configGeneration": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "3"
+        },
+        "lifecyclePhase": "crashed",
+        "networkEpoch": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        },
+        "sessionId": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        }
+      },
+      "freshness": "unavailable",
+      "pending": {
+        "reason": "no pending request",
+        "status": "unknown"
+      },
+      "reason": {
+        "status": "known",
+        "value": {
+          "code": "lifecycleChanged",
+          "detail": "lifecycleChanged"
+        }
+      },
+      "report": {
+        "reason": "no current session report",
+        "status": "unknown"
+      },
+      "reportRevision": "9",
+      "schemaVersion": 1
+    },
+    "latest": {
+      "activity": "idle",
+      "binding": {
+        "configGeneration": {
+          "status": "known",
+          "value": "1"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "3"
+        },
+        "lifecyclePhase": "ready",
+        "networkEpoch": {
+          "status": "known",
+          "value": "0"
+        },
+        "sessionId": {
+          "status": "known",
+          "value": "3"
+        }
+      },
+      "freshness": "latest",
+      "pending": {
+        "reason": "no pending request",
+        "status": "unknown"
+      },
+      "reason": {
+        "reason": "no unavailable reason",
+        "status": "unknown"
+      },
+      "report": {
+        "status": "known",
+        "value": {
+          "acquisition": {
+            "atomic": false,
+            "endBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "3"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "3"
+              }
+            },
+            "endedAtMonotonicMillis": "0",
+            "endedAtUnixMillis": "1791661652544",
+            "startBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "3"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "3"
+              }
+            },
+            "startedAtMonotonicMillis": "0",
+            "startedAtUnixMillis": "1791661652544"
+          },
+          "reportRevision": "7",
+          "snapshot": {
+            "classification": {
+              "reason": "session provenance not supplied; classification not performed",
+              "status": "unknown"
+            },
+            "commandCleanup": {
+              "status": "known",
+              "value": "noRetainedSnapshotCommand"
+            },
+            "context": {
+              "criteria": {
+                "reason": "immutable emitted conflict criteria not supplied",
+                "status": "unknown"
+              },
+              "observationPhase": {
+                "reason": "immutable observation phase not supplied",
+                "status": "unknown"
+              },
+              "ownInterfaces": {
+                "reason": "complete session TUN and own mesh attribution not supplied",
+                "status": "unknown"
+              },
+              "repairHistory": {
+                "reason": "verified repair history not supplied",
+                "status": "unknown"
+              }
+            },
+            "objects": {
+              "status": "known",
+              "value": []
+            },
+            "observation": {
+              "status": "known",
+              "value": {
+                "atomic": false,
+                "elapsedMillis": 0
+              }
+            },
+            "platform": "linux",
+            "schemaVersion": 1
+          }
+        }
+      },
+      "reportRevision": "7",
+      "schemaVersion": 1
+    },
+    "staleBusy": {
+      "activity": "pending",
+      "binding": {
+        "configGeneration": {
+          "status": "known",
+          "value": "1"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "3"
+        },
+        "lifecyclePhase": "ready",
+        "networkEpoch": {
+          "status": "known",
+          "value": "1"
+        },
+        "sessionId": {
+          "status": "known",
+          "value": "3"
+        }
+      },
+      "freshness": "stale",
+      "pending": {
+        "status": "known",
+        "value": {
+          "expiresAtMonotonicMillis": "10000",
+          "manualRequested": false,
+          "requestedAtMonotonicMillis": "0",
+          "trigger": "network"
+        }
+      },
+      "reason": {
+        "status": "known",
+        "value": {
+          "code": "networkChanged",
+          "detail": "networkChanged"
+        }
+      },
+      "report": {
+        "status": "known",
+        "value": {
+          "acquisition": {
+            "atomic": false,
+            "endBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "3"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "3"
+              }
+            },
+            "endedAtMonotonicMillis": "0",
+            "endedAtUnixMillis": "1791661652544",
+            "startBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "3"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "3"
+              }
+            },
+            "startedAtMonotonicMillis": "0",
+            "startedAtUnixMillis": "1791661652544"
+          },
+          "reportRevision": "7",
+          "snapshot": {
+            "classification": {
+              "reason": "session provenance not supplied; classification not performed",
+              "status": "unknown"
+            },
+            "commandCleanup": {
+              "status": "known",
+              "value": "noRetainedSnapshotCommand"
+            },
+            "context": {
+              "criteria": {
+                "reason": "immutable emitted conflict criteria not supplied",
+                "status": "unknown"
+              },
+              "observationPhase": {
+                "reason": "immutable observation phase not supplied",
+                "status": "unknown"
+              },
+              "ownInterfaces": {
+                "reason": "complete session TUN and own mesh attribution not supplied",
+                "status": "unknown"
+              },
+              "repairHistory": {
+                "reason": "verified repair history not supplied",
+                "status": "unknown"
+              }
+            },
+            "objects": {
+              "status": "known",
+              "value": []
+            },
+            "observation": {
+              "status": "known",
+              "value": {
+                "atomic": false,
+                "elapsedMillis": 0
+              }
+            },
+            "platform": "linux",
+            "schemaVersion": 1
+          }
+        }
+      },
+      "reportRevision": "8",
+      "schemaVersion": 1
+    },
+    "windowsPartial": {
+      "activity": "idle",
+      "binding": {
+        "configGeneration": {
+          "status": "known",
+          "value": "1"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "5"
+        },
+        "lifecyclePhase": "ready",
+        "networkEpoch": {
+          "status": "known",
+          "value": "0"
+        },
+        "sessionId": {
+          "status": "known",
+          "value": "5"
+        }
+      },
+      "freshness": "latest",
+      "pending": {
+        "reason": "no pending request",
+        "status": "unknown"
+      },
+      "reason": {
+        "reason": "no unavailable reason",
+        "status": "unknown"
+      },
+      "report": {
+        "status": "known",
+        "value": {
+          "acquisition": {
+            "atomic": false,
+            "endBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "5"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "5"
+              }
+            },
+            "endedAtMonotonicMillis": "0",
+            "endedAtUnixMillis": "1791661652547",
+            "startBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "5"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "5"
+              }
+            },
+            "startedAtMonotonicMillis": "0",
+            "startedAtUnixMillis": "1791661652547"
+          },
+          "reportRevision": "5",
+          "snapshot": {
+            "classification": {
+              "reason": "session provenance not supplied; classification not performed",
+              "status": "unknown"
+            },
+            "commandCleanup": {
+              "reason": "native API queries provide no process-custody cleanup receipt",
+              "status": "unknown"
+            },
+            "context": {
+              "criteria": {
+                "reason": "immutable emitted conflict criteria not supplied",
+                "status": "unknown"
+              },
+              "observationPhase": {
+                "reason": "immutable observation phase not supplied",
+                "status": "unknown"
+              },
+              "ownInterfaces": {
+                "reason": "complete session TUN and own mesh attribution not supplied",
+                "status": "unknown"
+              },
+              "repairHistory": {
+                "reason": "verified repair history not supplied",
+                "status": "unknown"
+              }
+            },
+            "objects": {
+              "reason": "Windows sources do not establish joined ObjectFacts",
+              "status": "unknown"
+            },
+            "observation": {
+              "status": "known",
+              "value": {
+                "atomic": false,
+                "elapsedMillis": 0
+              }
+            },
+            "platform": "win32",
+            "schemaVersion": 2,
+            "sources": {
+              "adapters": {
+                "compartment": {
+                  "reason": "fixture compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "fixture completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": null
+                },
+                "rows": {
+                  "status": "known",
+                  "value": []
+                }
+              },
+              "addresses": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "ras": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "routes4": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "routes6": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reportRevision": "5",
+      "schemaVersion": 1
+    },
+    "windowsUnavailable": {
+      "activity": "idle",
+      "binding": {
+        "configGeneration": {
+          "status": "known",
+          "value": "1"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "5"
+        },
+        "lifecyclePhase": "ready",
+        "networkEpoch": {
+          "status": "known",
+          "value": "0"
+        },
+        "sessionId": {
+          "status": "known",
+          "value": "5"
+        }
+      },
+      "freshness": "unavailable",
+      "pending": {
+        "reason": "no pending request",
+        "status": "unknown"
+      },
+      "reason": {
+        "status": "known",
+        "value": {
+          "code": "sourceUnavailable",
+          "detail": "sourceUnavailable"
+        }
+      },
+      "report": {
+        "status": "known",
+        "value": {
+          "acquisition": {
+            "atomic": false,
+            "endBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "5"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "5"
+              }
+            },
+            "endedAtMonotonicMillis": "0",
+            "endedAtUnixMillis": "1791661652548",
+            "startBinding": {
+              "configGeneration": {
+                "status": "known",
+                "value": "1"
+              },
+              "lifecycleGeneration": {
+                "status": "known",
+                "value": "5"
+              },
+              "lifecyclePhase": "ready",
+              "networkEpoch": {
+                "status": "known",
+                "value": "0"
+              },
+              "sessionId": {
+                "status": "known",
+                "value": "5"
+              }
+            },
+            "startedAtMonotonicMillis": "0",
+            "startedAtUnixMillis": "1791661652548"
+          },
+          "reportRevision": "5",
+          "snapshot": {
+            "classification": {
+              "reason": "session provenance not supplied; classification not performed",
+              "status": "unknown"
+            },
+            "commandCleanup": {
+              "reason": "native API queries provide no process-custody cleanup receipt",
+              "status": "unknown"
+            },
+            "context": {
+              "criteria": {
+                "reason": "immutable emitted conflict criteria not supplied",
+                "status": "unknown"
+              },
+              "observationPhase": {
+                "reason": "immutable observation phase not supplied",
+                "status": "unknown"
+              },
+              "ownInterfaces": {
+                "reason": "complete session TUN and own mesh attribution not supplied",
+                "status": "unknown"
+              },
+              "repairHistory": {
+                "reason": "verified repair history not supplied",
+                "status": "unknown"
+              }
+            },
+            "objects": {
+              "reason": "Windows sources do not establish joined ObjectFacts",
+              "status": "unknown"
+            },
+            "observation": {
+              "status": "known",
+              "value": {
+                "atomic": false,
+                "elapsedMillis": 0
+              }
+            },
+            "platform": "win32",
+            "schemaVersion": 2,
+            "sources": {
+              "adapters": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "addresses": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "ras": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "routes4": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              },
+              "routes6": {
+                "compartment": {
+                  "reason": "source compartment unavailable",
+                  "status": "unknown"
+                },
+                "complete": {
+                  "reason": "source completeness unavailable",
+                  "status": "unknown"
+                },
+                "error": {
+                  "status": "known",
+                  "value": "fixture permission unavailable"
+                },
+                "rows": {
+                  "reason": "fixture permission unavailable",
+                  "status": "unknown"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reportRevision": "5",
+      "schemaVersion": 1
+    }
+  },
+  "producer": {
+    "method": "Original Observer hooks and SnapshotService/collect_admitted/serializer executed in unit tests with fixed source injection. Export path explicitly supplied. No host/native API/core/IPC device.",
+    "base": "9e3e4a92b484c2c7ae7baeee35791160fccb816e",
+    "sourceSha256": {
+      "src-tauri/src/runtime/proxy/coex_observer.rs": "2e7d13332470b2962aaa1ab6801ae47d0ceeef13d8414f8bd6c8d227ad85a2cf",
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "b4b20aa588e139e878e7f8c7731f1a11e1d7c765a974c42cfb97723e27bd0ef1",
+      "src-tauri/src/runtime/proxy.rs": "a5ef608728b2c6bdf6831f4f5b8672d49a8ddf84ce69e731d54e2f602064ef1c",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "4e166dbe3407884818480b9eb541c4f969e2f5d009b80501a36dada48593ce5c",
+      "src-tauri/src/runtime/proxy/startup.rs": "02986ed718dc197f55bc31888ef5a56173dc280dfb2ecfe4efe34509ef523139",
+      "src-tauri/src/runtime/proxy/hot_switch.rs": "e880675ecb78a330b2c8d66e7807a13de8abcf808b40e02fdadb4ce1145c2cd5",
+      "src-tauri/src/runtime/proxy/recovery.rs": "114bfa398e3c2bbf93b46c6b352ce6f63c424dfa1720b685b66b7190626e028d",
+      "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",
+      "src-tauri/src/commands/coexistence_snapshot.rs": "0afbb08b347b06cff33a6099f678263ccc8fc646ffb73a86f7a6a5f67b6cf4b0"
+    }
+  }
+}

@@ -47,26 +47,43 @@ impl ProxyRuntime {
     /// [`Self::handle_network_change`] 在那里不会被调。依赖它的网络场景命中态在 Android 上**只靠 canary
     /// 周期探测**翻转（上界 = `network_canary::CANARY_PROBE_INTERVAL` + 一次查询超时），不会先被置为「未知」；
     /// 该兜底由 `network_canary/tests` 的 `periodic_probe_alone_flips_match_within_one_interval` 钉住。
-    pub(super) fn spawn_network_watcher(self: &Arc<Self>, managed_tun_interface: Option<String>) {
+    pub(super) fn spawn_network_watcher(
+        self: &Arc<Self>,
+        generation: u64,
+        managed_tun_interface: Option<String>,
+    ) {
         if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             return;
         }
-        let this = Arc::clone(self);
-        let handle =
-            tokio::spawn(async move { this.network_watcher_loop(managed_tun_interface).await });
-        if let Ok(mut g) = self.network_watcher.lock() {
-            if let Some(old) = g.replace(handle) {
-                old.abort(); // 幂等：替换前停旧；Unix kill_on_drop 杀旧子进程，Windows Drop 注销回调。
+        // The existing task handle and its receipt token are installed under one custody lock.
+        // A poisoned slot must never create an unowned additional monitor.
+        if let Ok(mut slot) = self.network_watcher.lock() {
+            let Some(token) = self.coex.begin_watcher(generation) else {
+                return;
+            };
+            if let Some(old) = slot.take() {
+                old.abort();
             }
+            let this = Arc::clone(self);
+            let task = tokio::spawn(async move {
+                this.network_watcher_loop(generation, token, managed_tun_interface)
+                    .await
+            });
+            *slot = Some(task);
+        } else {
+            self.coex.watcher_unavailable();
         }
     }
 
-    /// 停通用网络变化 watcher（停核 / 崩溃复位调）。
+    /// Stop the original watcher owner; its late receipts cannot enter a replacement.
     pub(super) fn stop_network_watcher(&self) {
-        if let Ok(mut g) = self.network_watcher.lock() {
-            if let Some(h) = g.take() {
-                h.abort();
+        if let Ok(mut slot) = self.network_watcher.lock() {
+            self.coex.watcher_unavailable();
+            if let Some(owner) = slot.take() {
+                owner.abort();
             }
+        } else {
+            self.coex.watcher_unavailable();
         }
     }
 
@@ -169,17 +186,23 @@ impl ProxyRuntime {
     /// 并有离线单测；此处 async 子进程驱动用 `tokio` 原生去抖（`BufReader::lines` 已按行切分 → 无需其行缓冲；
     /// 其借用闭包设计 `!Send`、不宜跨 await 持有于长驻任务）。macOS 分类仍复用该 crate 的纯函数。
     ///
-    async fn network_watcher_loop(self: Arc<Self>, managed_tun_interface: Option<String>) {
+    async fn network_watcher_loop(
+        self: Arc<Self>,
+        generation: u64,
+        token: u64,
+        managed_tun_interface: Option<String>,
+    ) {
         let mut consecutive_failures = 0u32;
         loop {
             let started = std::time::Instant::now();
             let error = match self
-                .network_watcher_once(managed_tun_interface.as_deref())
+                .network_watcher_once(generation, token, managed_tun_interface.as_deref())
                 .await
             {
                 Ok(()) => "事件源意外结束".to_owned(),
                 Err(error) => error,
             };
+            self.coex.watcher(generation, token, false);
             consecutive_failures = if started.elapsed() >= Duration::from_secs(60) {
                 1
             } else {
@@ -196,6 +219,8 @@ impl ProxyRuntime {
 
     async fn network_watcher_once(
         self: &Arc<Self>,
+        generation: u64,
+        token: u64,
         managed_tun_interface: Option<&str>,
     ) -> Result<(), String> {
         #[cfg(windows)]
@@ -203,6 +228,7 @@ impl ProxyRuntime {
             let (subscription, mut events) =
                 crate::runtime::windows_network_change::subscribe(managed_tun_interface)
                     .map_err(|error| format!("订阅 Windows 接口/路由变化失败：{error}"))?;
+            self.coex.watcher(generation, token, true);
             let debounce = std::time::Duration::from_millis(NETWORK_WATCHER_DEBOUNCE_MS);
             let mut deadline: Option<tokio::time::Instant> = None;
             loop {
@@ -214,7 +240,7 @@ impl ProxyRuntime {
                 };
                 tokio::select! {
                     event = events.recv() => match event {
-                        Some(()) => deadline = Some(tokio::time::Instant::now() + debounce),
+                        Some(()) => { self.coex_network_receipt(generation, token); deadline = Some(tokio::time::Instant::now() + debounce); },
                         None => return Err("Windows IP 接口事件流已关闭".to_owned()),
                     },
                     () = debounce_elapsed => {
@@ -234,15 +260,22 @@ impl ProxyRuntime {
         }
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        return self.route_network_watcher_once(managed_tun_interface).await;
+        return self
+            .route_network_watcher_once(generation, token, managed_tun_interface)
+            .await;
 
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-        Ok(())
+        {
+            let _ = (generation, token);
+            Ok(())
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     async fn route_network_watcher_once(
         self: &Arc<Self>,
+        generation: u64,
+        token: u64,
         managed_tun_interface: Option<&str>,
     ) -> Result<(), String> {
         use std::process::Stdio;
@@ -267,6 +300,7 @@ impl ProxyRuntime {
             .take()
             .ok_or_else(|| format!("`{program}` 未提供 stdout"))?;
         let mut lines = BufReader::new(stdout).lines();
+        self.coex.watcher(generation, token, true);
         let debounce = std::time::Duration::from_millis(NETWORK_WATCHER_DEBOUNCE_MS);
         let mut deadline: Option<tokio::time::Instant> = None;
         let mut pending_impact = NetworkChangeImpact::default();
@@ -300,6 +334,7 @@ impl ProxyRuntime {
                             pending_impact.merge(impact);
                         }
                         if update.observed_event {
+                            self.coex_network_receipt(generation, token);
                             deadline = Some(tokio::time::Instant::now() + debounce);
                         }
                     }

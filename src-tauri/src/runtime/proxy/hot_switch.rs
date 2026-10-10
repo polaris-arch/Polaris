@@ -1414,9 +1414,7 @@ impl ProxyRuntime {
         let (decision, new_cfg) = match self.classify_switch(&new_config, defer_restart) {
             ClassifiedSwitch::NotRunning => {
                 if scope == SwitchApplyScope::Full {
-                    if let Ok(mut g) = self.current_config.write() {
-                        *g = Some(new_config);
-                    }
+                    self.commit_coex_current_config(new_config);
                     self.process_deferred_config_deletions().await;
                     self.selector_reconcile.clear_required();
                 }
@@ -1450,8 +1448,8 @@ impl ProxyRuntime {
                     ) {
                         return SwitchOutcome::Pending;
                     }
-                } else if let Ok(mut g) = self.current_config.write() {
-                    *g = Some(new_config.clone());
+                } else {
+                    self.commit_coex_current_config(new_config.clone());
                 }
                 self.reassert_if_selector_reconcile_required_locked(
                     &new_config,
@@ -2286,9 +2284,7 @@ impl ProxyRuntime {
     /// 待决 force-restart，其快照仍是**旧** cfg → timer 到点会把核重启回旧节点，把刚热切的结果吃掉。
     /// 故必须把快照**值**刷新到 newConfig，同时**保留 force-restart 意图与 id**（不清空、不换号）。
     pub(super) fn commit_applied(&self, new_config: &Value) {
-        if let Ok(mut g) = self.current_config.write() {
-            *g = Some(new_config.clone());
-        }
+        self.commit_coex_current_config(new_config.clone());
         if let Ok(mut g) = self.pending_force_restart.write() {
             if let Some((id, _, _)) = g.take() {
                 *g = Some((id, new_config.clone(), super::ForceRestartSource::Full));
@@ -2299,9 +2295,7 @@ impl ProxyRuntime {
     /// 显式选择只提交运行态投影。已排程的用户 Apply 快照保留全部获授权字段，
     /// 只将其 selectedServerId 刷到最新选择，不能被较窄的 R 投影整份覆盖。
     fn commit_selected_projection(self: &Arc<Self>, projected: &Value, intent_generation: u64) {
-        if let Ok(mut current) = self.current_config.write() {
-            *current = Some(projected.clone());
-        }
+        self.commit_coex_current_config(projected.clone());
         if let Some(selected) = projected.get("selectedServerId").cloned() {
             if let Ok(mut pending) = self.pending_force_restart.write() {
                 if let Some((id, config, source)) = pending.as_mut() {

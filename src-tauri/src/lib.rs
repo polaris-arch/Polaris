@@ -1241,6 +1241,8 @@ pub fn run() {
             system_list_processes,
             system_list_network_interfaces,
             coex_readonly_snapshot,
+            coex_runtime_get_state,
+            coex_runtime_refresh,
             // Android 专属：进程名选择器在 Android 上的对应物（applicationId）。
             system_list_installed_apps,
             // Android 专属：系统自动备份开关（PolarisBackupAgent 的运行期闸门，默认关）。

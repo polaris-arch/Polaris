@@ -1,4 +1,5 @@
-/** Explicit observations only. No automatic collection, classifier or network writer. */
+import { CoexRuntimeDecodeError, type CoexRuntimeState } from '@/contracts/coex-runtime';
+/** Read-only runtime observations. Lifecycle phase never supplies classifier evidence. */
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
@@ -94,52 +95,66 @@ export function renderCoexFacts(
 
 export function CoexSnapshotBlock() {
   const { t } = useTranslation();
-  const [snapshot, setSnapshot] = useState<CoexSnapshot | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [state, setState] = useState<CoexRuntimeState | null>(null);
   const [error, setError] = useState<{ malformed: boolean; detail: string } | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [pages, setPages] = useState(FIRST_PAGES);
+  const revision = useRef<bigint>(BigInt(-1));
+  const alive = useRef(false);
   const inFlight = useRef(false);
   const epoch = useRef(0);
-  const alive = useRef(false);
+  const accept = (next: CoexRuntimeState) => {
+    if (!alive.current || BigInt(next.reportRevision) < revision.current) return;
+    revision.current = BigInt(next.reportRevision);
+    setState(next); setError(null);
+  };
+  const fail = (failure: unknown) => { if (alive.current) setError({ malformed: failure instanceof CoexRuntimeDecodeError || failure instanceof CoexSnapshotDecodeError, detail: failure instanceof Error ? failure.message : String(failure) }); };
   useEffect(() => {
     alive.current = true;
-    return () => { alive.current = false; epoch.current += 1; };
+    const mount = ++epoch.current;
+    let off: (() => void) | null = null;
+    void (async () => {
+      try {
+        const registered = await api.system.onCoexRuntimeState(accept, fail);
+        if (!alive.current || epoch.current !== mount) { registered(); return; }
+        off = registered;
+        const beforeGet = revision.current;
+        try {
+          const initial = await api.system.coexRuntimeGetState();
+          if (epoch.current === mount) accept(initial);
+        } catch (failure) { if (epoch.current === mount && revision.current === beforeGet) fail(failure); }
+      } catch (failure) { if (epoch.current === mount) fail(failure); }
+    })();
+    return () => { alive.current = false; epoch.current++; off?.(); };
   }, []);
   const collect = async () => {
     if (inFlight.current) return;
     inFlight.current = true;
-    const attempt = ++epoch.current;
-    setSnapshot(null);
-    setError(null);
-    setExpanded(null);
-    setPages(FIRST_PAGES);
-    setLoading(true);
+    const mount = epoch.current;
+    const beforeRequest = revision.current;
+    setExpanded(null); setPages(FIRST_PAGES);
     try {
-      const result = await api.system.coexReadonlySnapshot();
-      if (alive.current && epoch.current === attempt) setSnapshot(result);
-    } catch (failure) {
-      if (alive.current && epoch.current === attempt) setError({
-        malformed: failure instanceof CoexSnapshotDecodeError,
-        detail: failure instanceof Error ? failure.message : String(failure),
-      });
-    } finally {
-      // UI disposal never cancels the Rust worker or releases native custody.
-      if (epoch.current === attempt) {
-        inFlight.current = false;
-        if (alive.current) setLoading(false);
-      }
-    }
+      // A failed initial state is retried without manufacturing a revision or starting capture on mount.
+      const current = state ?? await api.system.coexRuntimeGetState();
+      const next = await api.system.coexRuntimeRefresh(current.reportRevision);
+      if (epoch.current === mount) accept(next);
+    } catch (failure) { if (epoch.current === mount && revision.current === beforeRequest) fail(failure); }
+    finally { inFlight.current = false; }
   };
+  const snapshot = state?.report.status === 'known' ? state.report.value.snapshot : null;
+  const loading = state?.activity === 'running' || state?.activity === 'runningWithPending';
   return <section data-coex-snapshot aria-label={t('settings.coex.title')} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
     <SetBlock header={t('settings.coex.title')}>
       <div className="card-sub">{t('settings.coex.hint')}</div>
-      <button type="button" className="btn ghost sm" onClick={() => { void collect(); }} disabled={loading}>
+      <button type="button" className="btn ghost sm" onClick={() => { void collect(); }} disabled={!state && !error}>
         {loading ? t('settings.coex.loading') : error || snapshot?.schemaVersion === 2 ? t('settings.coex.retry') : t('settings.coex.collect')}
       </button>
       <div className="card-sub" role="status" aria-live="polite">
-        {loading ? t('settings.coex.pending') : !snapshot && !error ? t('settings.coex.notCollected') : null}
+        {error ? t('settings.coex.unavailable') : state ? t(`settings.coex.${state.freshness}`) : t('settings.coex.notCollected')}
+        {state && state.activity !== 'idle' ? ` · ${t('settings.coex.busy')}` : null}
+        {state?.pending.status === 'known' ? ` · ${t('settings.coex.queued')}` : null}
       </div>
+      {state?.reason.status === 'known' && state.freshness !== 'latest' && <details className="card-sub"><summary>{t('settings.coex.reason')}</summary>{t(`settings.coex.runtimeReasons.${state.reason.value.code}`)}</details>}
       {error && <div className="card-sub" role="alert">
         {error.malformed ? t('settings.coex.malformed') : t('settings.coex.failed')}
         <details><summary>{t('settings.coex.reason')}</summary><span className="mono">{error.detail}</span></details>

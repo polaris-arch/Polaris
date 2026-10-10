@@ -1,5 +1,6 @@
+import { decodeCoexRuntimeState, type CoexRuntimeState } from '../../contracts/coex-runtime';
 import { decodeCoexSnapshot, type CoexSnapshot } from '../../contracts/coex-snapshot';
-import { invoke, listen } from '../ipc-client';
+import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type {
   HelperStatus,
@@ -65,6 +66,13 @@ export const systemBackupApi = {
 // ============================================================================
 
 export const systemApi = {
+  async coexRuntimeGetState(): Promise<CoexRuntimeState> { return decodeCoexRuntimeState(await invoke(IPC_CHANNELS.COEX_RUNTIME_GET_STATE)); },
+  async coexRuntimeRefresh(expectedReportRevision: string): Promise<CoexRuntimeState> { return decodeCoexRuntimeState(await invoke(IPC_CHANNELS.COEX_RUNTIME_REFRESH, { expectedReportRevision })); },
+  async onCoexRuntimeState(listener: (state: CoexRuntimeState) => void, onError: (error: unknown) => void): Promise<() => void> {
+    return listenReady<unknown>(IPC_CHANNELS.EVENT_COEX_RUNTIME_STATE, value => {
+      try { listener(decodeCoexRuntimeState(value)); } catch (error) { onError(error); }
+    });
+  },
   /** Explicit read-only snapshot. Unknown and unavailable are not empty enumeration. */
   async coexReadonlySnapshot(): Promise<CoexSnapshot> {
     return decodeCoexSnapshot(await invoke<unknown>(IPC_CHANNELS.COEX_READONLY_SNAPSHOT));

@@ -1,9 +1,12 @@
+import runtimeFixture from '@/contracts/coex-runtime.rust.fixture.json';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { CoexSnapshotDecodeError } from '@/contracts/coex-snapshot';
 import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
 import windowsFixture from '@/contracts/coex-windows.rust.fixture.json';
 const transport = vi.hoisted(() => vi.fn());
+const eventTransport = vi.hoisted(() => vi.fn());
+vi.mock('@tauri-apps/api/event', () => ({ listen: eventTransport }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: transport }));
 const { systemApi } = await import('./system');
 const { IpcError } = await import('../ipc-client');
@@ -82,4 +85,30 @@ describe('actual system wrapper through IPC envelope decoder', () => {
     expect(transport).toHaveBeenCalledTimes(1);
   });
 
+});
+
+describe('actual runtime state wrapper and existing listenReady transport', () => {
+  beforeEach(() => { transport.mockReset(); eventTransport.mockReset(); vi.stubGlobal('window', { __TAURI_INTERNALS__: {} }); });
+  afterEach(() => vi.unstubAllGlobals());
+  it.each(Object.entries(runtimeFixture.states))('decodes generated %s through real envelope exactly once', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire }); expect(await systemApi.coexRuntimeGetState()).toEqual(wire);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_RUNTIME_GET_STATE, {});
+  });
+  it('manual refresh carries only expected revision and returns immediate state', async () => {
+    const wire = runtimeFixture.states.staleBusy; transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexRuntimeRefresh('7')).toEqual(wire); expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_RUNTIME_REFRESH, { expectedReportRevision: '7' });
+  });
+  it('uses real listenReady acknowledgement and same strict event decoder', async () => {
+    let resolve: (off: () => void) => void = () => {}; let callback: (event: { payload: unknown }) => void = () => {};
+    eventTransport.mockImplementation((_event, cb) => { callback = cb; return new Promise<() => void>(r => { resolve = r; }); });
+    const accept = vi.fn(); const error = vi.fn(); const off = vi.fn(); let registered = false;
+    const registration = systemApi.onCoexRuntimeState(accept, error).then(value => { registered = true; return value; });
+    await Promise.resolve(); expect(registered).toBe(false); callback({ payload: runtimeFixture.states.latest }); expect(accept).toHaveBeenCalledWith(runtimeFixture.states.latest);
+    callback({ payload: { ...runtimeFixture.states.latest, reportRevision: 1 } }); expect(error).toHaveBeenCalledTimes(1); expect(accept).toHaveBeenCalledTimes(1);
+    resolve(off); (await registration)(); expect(off).toHaveBeenCalledTimes(1); expect(transport).not.toHaveBeenCalled();
+  });
+  it('rejects denied-window state and invalid returned envelope', async () => {
+    transport.mockResolvedValueOnce({ success: false, code: 'coex_window_denied', error: 'main window required' }); await expect(systemApi.coexRuntimeGetState()).rejects.toBeInstanceOf(IpcError);
+    transport.mockResolvedValueOnce({ success: true, data: { reportRevision: 1 } }); await expect(systemApi.coexRuntimeGetState()).rejects.toThrow();
+  });
 });

@@ -159,6 +159,15 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("src-tauri/src/commands/coexistence_snapshot.rs",
+     "if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)", 1,
+     "COEX source admission supports only current desktop collectors; Android/iOS/Other explicitly unavailable, never empty/safe."),
+    ("src-tauri/src/commands/coexistence_snapshot.rs", "if platform == Platform::Win", 2,
+     "Windows wire and native DTO branch are separate from Unix process receipts. Android/iOS/Other never receive Windows scope/completeness or custody proof."),
+    ("src-tauri/src/commands/coexistence_snapshot.rs",
+     "let mut value = snapshot_wire( Platform::Win, Fact::Unknown( .into()), observation, Fact::Unknown( .into()), )", 1,
+     "Windows diagnostic wire explicitly preserves unknown objects/classification/command cleanup. Other platforms cannot borrow these Windows observations."),
+
     (
         "crates/config-engine/src/builder/coexistence.rs",
         "let entry = if input.platform == Platform::Linux && !input.criteria.tun_addresses.is_empty()",
