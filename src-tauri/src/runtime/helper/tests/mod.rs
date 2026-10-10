@@ -223,14 +223,25 @@ fn linux_exact_capability_probe_is_read_only_and_old_helper_fails_before_start()
         (b"OK birth-status empty\n".to_vec(), true),
         (b"ERR unknown\n".to_vec(), false),
         (b"OK stopped\n".to_vec(), false),
+        // 新助手认识探测命令、但这一次没答上来：带尾文的 `ERR unknown` 不是「助手太旧」。
+        (b"ERR unknown birth-custody-unidentified\n".to_vec(), false),
+        (
+            b"ERR unknown poisoned lock: another task failed inside\n".to_vec(),
+            false,
+        ),
+        (b"ERR unauthorized\n".to_vec(), false),
     ] {
+        let unknown_command = wire == b"ERR unknown\n";
         let (client, connects, frames) = stop_test_client_with_frames(
             Platform::Linux,
             vec![polaris_helper_client::MockStream::with_response(wire)],
         );
+        let probed = require_linux_birth_capability_with_client(&client);
+        assert_eq!(probed.is_ok(), capable);
+        // 只有「不认识这条命令」的确定回答算助手太旧；别的不通过只是此刻不可用。
         assert_eq!(
-            require_linux_birth_capability_with_client(&client).is_ok(),
-            capable
+            matches!(probed, Err(BirthCapabilityError::HelperOutdated(_))),
+            unknown_command
         );
         assert_eq!(connects.load(Ordering::SeqCst), 1);
         assert_eq!(*frames.lock().unwrap(), ["status-birth-safe\n".to_owned()]);
@@ -254,6 +265,10 @@ fn native_platform_capability_and_stop_require_their_own_exact_receipt_family() 
             ("OK stopped", false),
             ("OK birth-status empty", false),
             ("ERR unknown", false),
+            // Windows 收到行数不足的帧、协议层折进来的任意错误：都带尾文，都不是「助手太旧」。
+            ("ERR unknown bad-frame", false),
+            ("ERR unknown pipe closed before reply", false),
+            ("ERR auth", false),
         ] {
             let (client, _, frames) = stop_test_client_with_frames(
                 platform,
@@ -261,9 +276,13 @@ fn native_platform_capability_and_stop_require_their_own_exact_receipt_family() 
                     format!("{wire}\n").into_bytes(),
                 )],
             );
+            let probed = require_native_birth_capability_with_client(&client);
+            assert_eq!(probed.is_ok(), capable);
+            // 同上：`ERR unknown` 才是「助手太旧」；应答了别的协议族、custody 未清都不是。
             assert_eq!(
-                require_native_birth_capability_with_client(&client).is_ok(),
-                capable
+                matches!(probed, Err(BirthCapabilityError::HelperOutdated(_))),
+                wire == "ERR unknown",
+                "{wire}"
             );
             assert_eq!(*frames.lock().unwrap(), ["TOK\nstatus-native-birth-safe\n"]);
         }
@@ -418,6 +437,70 @@ fn old_linux_helper_start_refusal_has_an_upgrade_path() {
     );
     assert!(error.contains("已拒绝起核"), "{error}");
     assert!(error.contains("升级或修复"), "{error}");
+    // 带尾文的 `ERR unknown` 是这一次的故障，不引导用户去升级助手。
+    let error = format_helper_mutation_error(
+        Platform::Linux,
+        "起核",
+        &polaris_helper_proto::Error::with_detail(
+            polaris_helper_proto::ErrorCode::Unknown,
+            "poisoned lock",
+        ),
+    );
+    assert!(!error.contains("升级或修复"), "{error}");
+    assert!(error.contains("poisoned lock"), "{error}");
+}
+
+/// 🔴 只有**裸的** `ERR unknown` 说明助手不认识这条命令；每一种来源各钉一行。
+///
+/// 左列是服务端实际写出的那一行（Linux `dispatch_locked` / `handle` / `handle_birth_status`，
+/// macOS `server.rs` 的解码失败臂，Windows `handle_frame`，`core_install::to_response`，以及
+/// 协议层的 `From<Box<dyn Error>>`），各自在 helper 侧另有用例钉住字面。
+///
+/// **变异探针**：把判据退回只比错误码 ⇒ 带尾文的五行全部转红。
+#[test]
+fn only_a_bare_unknown_reply_means_the_helper_lacks_the_command() {
+    for (wire, lacks_command, source) in [
+        ("ERR unknown", true, "三平台：命令名不在解码表 / 分派表里"),
+        ("ERR unknown ", true, "尾随空白不算尾文"),
+        (
+            "ERR unknown poisoned lock: another task failed inside",
+            false,
+            "Linux：处理器的状态锁中毒",
+        ),
+        (
+            "ERR unknown birth-custody-unidentified",
+            false,
+            "Linux：状态探测遇到认不出归属的 custody",
+        ),
+        ("ERR unknown bad-frame", false, "Windows：帧行数不足"),
+        (
+            "ERR unknown install-result",
+            false,
+            "install-core：结果行解析不出",
+        ),
+        (
+            "ERR unknown connection reset by peer",
+            false,
+            "协议层把任意错误折成 unknown",
+        ),
+        ("ERR auth", false, "别的错误码"),
+        ("ERR bad-args", false, "别的错误码"),
+    ] {
+        let error = polaris_helper_proto::Error::parse(wire).expect("ERR 行");
+        assert_eq!(
+            is_unknown_command_reply(&error),
+            lacks_command,
+            "{source}：{wire}"
+        );
+    }
+    // 协议层的折叠确实带尾文（否则上面那一行钉的是一个不存在的形态）。
+    let folded: polaris_helper_proto::Error =
+        (Box::<dyn std::error::Error + Send + Sync>::from("connection reset by peer")).into();
+    assert_eq!(
+        folded.to_wire_line(),
+        "ERR unknown connection reset by peer"
+    );
+    assert!(!is_unknown_command_reply(&folded));
 }
 
 #[test]
@@ -748,6 +831,7 @@ fn action_result_serializes_stable_code_diagnostic_and_status() {
 fn helper_action_error_codes_serialize_as_frontend_contract() {
     let cases = [
         (HelperActionErrorCode::Cancelled, "cancelled"),
+        (HelperActionErrorCode::PartialCleanup, "partialCleanup"),
         (
             HelperActionErrorCode::AuthorizationUnavailable,
             "authorizationUnavailable",
@@ -1299,6 +1383,18 @@ fn install_core_textual_replies_are_classified_without_probe() {
         run.result
     );
     assert_eq!(run.connects, 1);
+
+    // 带尾文的 `ERR unknown`：助手认识 install-core，是这一次没成，不记「能力缺失」。
+    let run = run_install_core(
+        Platform::Win,
+        vec![replying("ERR unknown install-result\n")],
+    );
+    assert!(
+        matches!(run.result, Err(InstallCoreError::Failed(_))),
+        "{:?}",
+        run.result
+    );
+    assert_eq!(run.connects, 1);
 }
 
 #[test]
@@ -1313,4 +1409,28 @@ fn windows_cache_request_never_selects_the_old_helpers_console_command() {
     .unwrap();
     assert_eq!(raw.lines().nth(1), Some("flush-dns-native"));
     assert_eq!(flush_dns_request(Platform::Mac), Request::FlushDns);
+}
+
+#[test]
+fn native_partial_cleanup_is_only_an_uninstall_failure_code() {
+    assert_eq!(
+        uninstall_failure_code(Platform::Win, 3),
+        HelperActionErrorCode::PartialCleanup
+    );
+    assert_eq!(
+        escalation_failure_code(Platform::Win, 3),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Win, 2),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Linux, 3),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Linux, 127),
+        HelperActionErrorCode::AuthorizationUnavailable
+    );
 }

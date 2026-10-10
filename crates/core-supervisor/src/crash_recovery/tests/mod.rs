@@ -69,57 +69,6 @@ fn give_up_when_disabled() {
 }
 
 #[test]
-fn give_up_when_suppressed_during_core_update_window() {
-    // :5893 核心更新待验证窗口内禁止自动重启。
-    let cfg = CrashRecoveryConfig {
-        auto_restart_suppressed: true,
-        ..CrashRecoveryConfig::default()
-    };
-    let mut m = CrashRecoveryMachine::new(cfg);
-    let r = m.attempt_crash(NOW, 1);
-    assert_eq!(r, AutoRestartOutcome::GiveUp);
-}
-
-/// ⚠️ 上面那条测试**绕过了写入口**（直接造 `auto_restart_suppressed: true` 的 config），
-/// 所以在「全仓没有任何生产代码能置起这个位」的整段时期里它照样绿 —— 它验的是判据，
-/// 不是「这条腿真的能被打开」。本条走 [`CrashRecoveryMachine::set_auto_restart_suppressed`]
-/// 这个真实写入口，且验来回两个方向。
-#[test]
-fn suppression_toggles_through_the_real_setter() {
-    // 每次崩溃后必须把在途重启腿收尾（post_backoff + post_start），否则 `is_restarting`
-    // 仍为真，下一次 attempt_crash 会先命中幂等去重返回 Dedup、**根本到不了**
-    // should_auto_restart —— 抑制位是否生效就无从断言。
-    fn crash_and_settle(m: &mut CrashRecoveryMachine) -> AutoRestartOutcome {
-        let outcome = m.attempt_crash(NOW, 1);
-        if let AutoRestartOutcome::Attempt { generation, .. } = outcome {
-            assert!(matches!(m.post_backoff(generation, 1), RestartFate::Start));
-            let _ = m.post_start(false);
-        }
-        outcome
-    }
-
-    let mut m = CrashRecoveryMachine::default();
-    assert!(!m.auto_restart_suppressed(), "默认不抑制");
-    assert!(
-        matches!(crash_and_settle(&mut m), AutoRestartOutcome::Attempt { .. }),
-        "未抑制时崩溃应走自愈重启"
-    );
-
-    // 置起 → 下一次崩溃必须 GiveUp（不再退避空转 3 次把首次失败信号淹掉）。
-    m.set_auto_restart_suppressed(true);
-    assert!(m.auto_restart_suppressed());
-    assert_eq!(crash_and_settle(&mut m), AutoRestartOutcome::GiveUp);
-
-    // 撤下 → 自愈能力必须完整回来（回滚回去的老核要照常受崩溃保护）。
-    m.set_auto_restart_suppressed(false);
-    assert!(!m.auto_restart_suppressed());
-    assert!(
-        matches!(crash_and_settle(&mut m), AutoRestartOutcome::Attempt { .. }),
-        "撤下抑制后自愈必须恢复，否则回滚回去的老核将失去崩溃保护"
-    );
-}
-
-#[test]
 fn max_restart_count_enforced_across_attempts() {
     // #5：达 MAX_RESTART_COUNT=3 后 GiveUp。
     let mut m = CrashRecoveryMachine::default();

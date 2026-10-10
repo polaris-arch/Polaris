@@ -7,7 +7,6 @@
 //! | trait | 所有者 crate | 本模块适配点 |
 //! |---|---|---|
 //! | [`polaris_net_stack::safe_redirect::HttpClient`] | net-stack（`safe_redirect.rs`） | [`HttpRuntime`]（manual redirect + 流式限长） |
-//! | [`UpdateDownloader`] | updater（`traits.rs`） | [`CoreDownloader`]（**唯一**下载适配器） |
 //! | ~~`UnlockHttp`~~ | unlock（`http.rs`） | **已迁出** → `polaris-unlock-transport`（wreq 指纹伪装，见适配③处注释） |
 //! | [`WarpHttp`] | mesh（`warp_http.rs`） | [`HttpRuntime`]（json/status 双语义） |
 //! | [`DohPost`](polaris_dns_race::DohPost) | dns-race（`query.rs`） | [`HttpRuntime`]（C11 节点域名竞速的 DoH 上游） |
@@ -18,10 +17,10 @@
 //! # 编排不在这里（上游 双份编排的病根）
 //!
 //! 上游的 `core-downloader.ts` 与 `UpdateService.ts` 各写了约 170 行同构下载编排，两文件注释
-//! 互指重复。Rust 侧编排**已经各归其位**：updater 守 staged 周期、net-stack 守 SSRF + 逐跳重定向。
-//! 故本模块**只有传输**，且把 `UpdateDownloader` doc 划给「实现侧」的那几件事
-//! （停滞看门狗 / 镜像回退 / 403 限流分类 / 16MiB 闸 / 15s 超时 / Content-Length 完整性）
-//! **全部收在 [`CoreDownloader`] 这一个适配器里** —— 订阅路径的 [`polaris_net_stack::safe_redirect::HttpClient`] 适配器不得复制它们。
+//! 互指重复。Rust 侧编排**各归其位**：net-stack 守 SSRF + 逐跳重定向，应用安装包的下载细节
+//! （停滞看门狗 / 镜像回退 / 403 限流分类 / 体积闸 / 15s 超时 / Content-Length 完整性）
+//! **全部收在 [`CoreDownloader`] 这一个适配器里** —— 订阅路径的
+//! [`polaris_net_stack::safe_redirect::HttpClient`] 适配器不得复制它们。
 //!
 //! # rustls provider：一个「编译过 ≠ 能跑」的陷阱（实证）
 //!
@@ -41,7 +40,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use polaris_config_engine::singbox::InboundUser;
 use polaris_mesh::warp_http::{WarpHttp, WarpHttpMethod, WarpHttpRequest, WarpHttpResponse};
-use polaris_updater::traits::{DownloadError, UpdateDownloader};
+use polaris_updater::traits::DownloadError;
 
 // ── 传输层常量（单点定义，各消费族不得自造第二份）───────────────────────────────
 
@@ -64,19 +63,8 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`CoreDownloader`] 构造时的**缺省**体积闸（16 MiB）。
 ///
-/// # 它只是缺省值，**不是任何一条生产腿的闸**
-///
-/// 三条生产腿的闸全部由调用方按腿注入（[`CoreDownloader::with_max_bytes`]）：
-/// 两条内核腿按 GitHub 资产声明体积派生、封顶 128 MiB
-/// （`commands::updater::core_update::core_update_size_limit`），
-/// App 安装包腿按清单声明体积派生、封顶 512 MiB。
-///
-/// 曾经两条内核腿逐字传它 —— 那是个 **P0**：sing-box 官方归档全部 26 MiB 以上，
-/// 每一次在线换核都会被 [`CoreDownloader`] 那个 `open_download_response` 的 Content-Length
-/// 预检早拒；之所以一直没暴露，只因随包内核版本恰好等于官方最新、`is_newer` 恒 false。
-/// 谁再想把某条腿改回传它，先量一眼上游今天的资产体积。
-///
-/// `pub(crate)`：内核腿的门要拿它作**反向对照**（证明真实资产体积在这个闸下无一过得去）。
+/// 它只是缺省值，**不是生产腿的闸**：应用安装包腿按清单声明体积派生、封顶 512 MiB，经
+/// [`CoreDownloader::with_max_bytes`] 注入。
 pub(crate) const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// 下载路径的重定向上限（GitHub release 资产必然 302 到 objects.githubusercontent.com）。
@@ -181,7 +169,7 @@ pub struct HttpRuntime {
     /// 的 Cloudflare WAF 按 TLS 指纹判「自动化」→ **1020/403**。此 client 用 rustls 现有能力收窄 ClientHello
     /// 形态、对齐 上游 `WarpService` 的 node-`https`（TLS1.2 pin + HTTP/1.1）规避。见 [`build_warp_client`]。
     ///
-    /// **仅** [`warp_send`] 用 —— 订阅拉取 / 内核下载 / 解锁 / 更新等其它消费族继续走共享 `client`（它们不面对 CF WAF，
+    /// **仅** [`warp_send`] 用 —— 订阅拉取 / 解锁 / 更新等其它消费族继续走共享 `client`（它们不面对 CF WAF，
     /// 且钉 TLS1.2 会牺牲这些路径本可用的 TLS1.3/h2）。隔离由 `warp_send(self.warp_client()?, ..)` 单点保证。
     ///
     /// # 为什么**惰性**（`OnceLock` 而非构造期就建）
@@ -414,7 +402,7 @@ pub fn proxy_authorization_line(auth: Option<&InboundUser>) -> String {
 // ── C19：更新链路「经代理」决策（上游 `shared/update-proxy.ts` 1:1 移植）────────────────
 //
 // **msvp 是生成无关**：不进 config-engine 生成侧，只在**运行期 HTTP 抓取处**决定「走 update-in socks 口
-// vs 直连」。消费者 = UpdateNetwork（App/内核更新检查+下载）/ icon-protocol（图标远端代理）/ RuleResource
+// vs 直连」。消费者 = UpdateNetwork（App 更新检查+下载）/ icon-protocol（图标远端代理）/ RuleResource
 // （规则资源下载）。**订阅走独立 `subscriptionProxyPolicy`，不经此**（见 `commands/subscription.rs`）。
 
 /// 更新链路「经代理」生效求值（单一真值）。上游 `resolveMainSessionViaProxy`。
@@ -500,7 +488,7 @@ impl std::fmt::Display for BodyReadError {
 /// 下载进度回调：`(已收字节, Content-Length)`。`None` = 服务端没给长度 ⇒ **算不出百分比**
 /// （调用方须保持 indeterminate，不许拿已收字节瞎凑一个分母）。
 ///
-/// `Send + Sync`：回调在 [`CoreDownloader::download_inner`] spawn 出的 tokio task 里跑，
+/// `Send + Sync`：回调在 [`CoreDownloader::try_candidates`] spawn 出的 tokio task 里跑，
 /// 而调用方在 blocking 线程等结果 —— 跨线程边界。
 pub type DownloadProgressFn = dyn Fn(u64, Option<u64>) + Send + Sync;
 
@@ -512,23 +500,6 @@ async fn read_body_capped(
     resp: &mut reqwest::Response,
     max: Option<usize>,
     stall: Duration,
-) -> Result<Vec<u8>, BodyReadError> {
-    read_body_capped_with_progress(resp, max, stall, None, None).await
-}
-
-/// [`read_body_capped`] + 逐 chunk 进度回调。
-///
-/// 独立成函数（而非给 `read_body_capped` 加参数）是为让订阅 / WARP 两条不需要进度的调用点
-/// 保持零改动、零成本：它们仍走上面那个三参版本。
-///
-/// `expected` 由调用方从 `Content-Length` 注入（本函数不重读 header）——回调要的分母与
-/// 下载侧做完整性比对用的是**同一个值**，各读一次必然漂移。
-async fn read_body_capped_with_progress(
-    resp: &mut reqwest::Response,
-    max: Option<usize>,
-    stall: Duration,
-    expected: Option<u64>,
-    on_progress: Option<&DownloadProgressFn>,
 ) -> Result<Vec<u8>, BodyReadError> {
     let mut buf = Vec::new();
     loop {
@@ -549,31 +520,23 @@ async fn read_body_capped_with_progress(
                     }
                 }
                 buf.extend_from_slice(&chunk);
-                if let Some(cb) = on_progress {
-                    cb(buf.len() as u64, expected);
-                }
             }
         }
     }
 }
 
-/// [`read_body_capped_with_progress`] 的**落盘版姊妹函数**：字节直接进 `sink`，不在内存里攒。
+/// [`read_body_capped`] 的**落盘版姊妹函数**：字节直接进 `sink`，不在内存里攒，另带逐 chunk
+/// 进度回调。服务应用安装包的流式下载。
 ///
-/// # 为什么是姊妹函数而不是就地改造
-///
-/// 上面那个是 App 腿与内核腿**唯一共用**的字节累积点。把它改成泛型/多一个 sink 参数，等于让
-/// 两条内核腿（手动换核 / 自动换核）跟着换一条代码路径 —— 而它们的语义一个字都不该变。
-/// 故上面那份**原样保留**给内核腿与订阅腿，本函数只服务流式落盘的 App 腿。
-///
-/// 三项语义与上面**逐字对齐**（漂了就是两条腿的失败面分叉）：
+/// 与内存版对齐的三项语义（漂了就是两条读法的失败面分叉）：
 ///  - 停滞看门狗：`tokio::time::timeout(stall, resp.chunk())`，**每个 chunk 单独计时**；
-///  - 进度回调时机：每个 chunk **落定之后**以累计 `received` + 同一个 `expected` 触发；
 ///  - 超限判定：`已收 + 本 chunk > limit` 即 [`BodyReadError::TooLarge`] 并**中断连接**
-///    （drop `resp`），绝不把已写出的部分当成功 —— 落盘版由调用方负责删残件。
+///    （drop `resp`），绝不把已写出的部分当成功 —— 由调用方负责删残件；
+///  - 进度回调时机：每个 chunk **落定之后**以累计 `received` + 调用方注入的 `expected`
+///    （`Content-Length`，与完整性比对用同一个值）触发。
 ///
-/// 唯一新增的失败形态是 [`BodyReadError::Sink`]（写盘失败），它**不能**折叠进
-/// [`BodyReadError::Io`]：后者在已知 Content-Length 时会被还原成
-/// [`DownloadError::Incomplete`]，而磁盘满不是「下载不完整」。
+/// 写盘失败是 [`BodyReadError::Sink`]，它**不能**折叠进 [`BodyReadError::Io`]：后者在已知
+/// Content-Length 时会被还原成 [`DownloadError::Incomplete`]，而磁盘满不是「下载不完整」。
 ///
 /// 返回累计写出的字节数（内存版返回 `Vec` 的位置）。
 async fn read_body_to_sink_with_progress(
@@ -640,11 +603,11 @@ async fn read_body_truncating(
     }
 }
 
-// ── 适配 ②：updater UpdateDownloader（**唯一**下载适配器）────────────────────
+// ── 适配 ②：应用安装包下载（**唯一**下载适配器）──────────────────────────────
 
 /// GitHub 域名表（镜像回退的判定面）。
 ///
-/// **注意**：审计 §C9 裁决 gh-proxy 的 URL 重写（5 域名表 + `applyGhProxy`）应归 net-stack
+/// **注意**：审计 §C9 裁决 gh-proxy 的 URL 重写（5 域名表 + 前缀拼接）应归 net-stack
 /// 纯函数模块，消费方为本适配器。那个模块**尚未落地**（全仓 grep 零命中）。`ghProxyPrefix` 现经通用
 /// config 保存路径落盘（`update({ghProxyPrefix})` → config_save）。故此处**只做最小可用的镜像前缀拼接**，且刻意不建第二份 5 域名表 ——
 /// §A3 血证：`RuleResourceManager` 曾有 2 份 `GITHUB_HOSTS` 副本漂移，令三级兜底自相矛盾。
@@ -682,9 +645,7 @@ fn classify_download_status(status: u16, headers: &[(String, String)]) -> Option
     Some(DownloadError::HttpStatus(status))
 }
 
-/// body 读取失败 → 下载错误的**唯一**映射（两个消费端共用，避免失败分类在两条腿上分叉）。
-///
-/// 逐条与形参化之前的 `download_once` 内联 match 一致：
+/// body 读取失败 → 下载错误的**唯一**映射：
 ///  - `Stalled` → [`DownloadError::Stalled`]（看门狗间隔，非请求超时）；
 ///  - `TooLarge` → [`DownloadError::Other`]（带上限数字）；
 ///  - `Io` + 已知 Content-Length → [`DownloadError::Incomplete`]。hyper 会先于我们发现
@@ -720,15 +681,14 @@ fn map_body_error(e: BodyReadError, expected: Option<u64>) -> DownloadError {
 ///
 /// 覆盖「连接干净关闭但字节偏少/偏多」的情形（[`map_body_error`] 的 `Io` 分支覆盖「连接异常断」）。
 ///
-/// **三个消费端共用同一条判据**（各写一份 ⇒ 某条腿会少一道完整性门）：
-///  1. 内存腿传 `bytes.len()` vs `Content-Length`；
-///  2. 落盘腿传实际写出的字节数 vs `Content-Length`；
-///  3. App 更新腿（`commands/updater.rs` 的 `check_declared_size`）传实收字节 vs
-///     **发布清单声明的 `fileSize`**。第 3 条与前两条的信任根不同：`Content-Length` 是
+/// **两个消费端共用同一条判据**（各写一份 ⇒ 某一处会少一道完整性门）：
+///  1. 下载适配器传实际写出的字节数 vs `Content-Length`；
+///  2. App 更新命令（`commands/updater.rs` 的 `check_declared_size`）传实收字节 vs
+///     **发布清单声明的 `fileSize`**。两者的信任根不同：`Content-Length` 是
 ///     「撒谎方自己给的数」，对撒谎方零约束；`fileSize` 来自 GitHub release 清单，
 ///     镜像/中间人改不动它。故它是无摘要腿（旧 release）唯一有牙的等值判据。
 ///
-/// `pub(crate)`：第 3 个消费端在 `commands/` 层，但判据不该因此复制一份。
+/// `pub(crate)`：第 2 个消费端在 `commands/` 层，但判据不该因此复制一份。
 pub(crate) fn check_content_length(
     received: u64,
     expected: Option<u64>,
@@ -789,8 +749,8 @@ impl HashingSink {
     /// `Write::flush` 是 **no-op**（`File` 无用户态缓冲）—— 即这一句在生产路径上什么都没做，
     /// 它守的是「将来有人在中间塞一层带缓冲的包装」。**且本类型全程没有 `sync_all`**：
     /// 字节只到 page cache，随后的 rename 先于数据持久化落地，断电后 dest 可能是半截文件，
-    /// 而 `update_install` 只做 `is_file()`、不复核摘要。这条**不是本批引入的回归**
-    /// （旧的 `atomic_replace` 同样无 fsync），故此处只如实标注、不擅自加 fsync。
+    /// 而 `update_install` 只做 `is_file()`、不复核摘要。这条**不是流式落盘引入的回归**
+    /// （此前整包写入的落位同样无 fsync），故此处只如实标注、不擅自加 fsync。
     ///
     /// 返回累计字节数是为让调用方与**网络侧**独立维护的 `received` 互校：两个数分别回答
     /// 「网络收了多少」与「sink 真吃下多少」，对不上就说明摘要算在了一份与盘上不同的内容上。
@@ -814,27 +774,23 @@ impl std::io::Write for HashingSink {
     }
 }
 
-/// **唯一**的下载适配器（= `UpdateDownloader` 的生产实现，取代 `UnavailableDownloader`）。
+/// **唯一**的下载适配器：重定向跟随 / UA / Content-Length 完整性 / 停滞看门狗 / 镜像回退 /
+/// 体积闸 / 15s 响应超时全部收口于此。**订阅路径不得复制这些**（那正是 上游 双份编排的成因）。
 ///
-/// 收口 `UpdateDownloader` doc 划给「实现侧」的全部细节：重定向跟随 / UA /
-/// Content-Length 完整性 / 停滞看门狗 / 镜像回退 / 16MiB 闸 / 15s 响应超时。
-/// **订阅路径不得复制这些**（那正是 上游 双份编排的成因）。
+/// # 同步入口的 async 桥
 ///
-/// # sync trait 的 async 桥
+/// [`Self::download_to_sink_with_progress`] 是**同步**签名，而 reqwest 是 async。桥法：把 future
+/// `spawn` 到 tokio runtime，同步线程 `recv` 等结果。
 ///
-/// `UpdateDownloader::download` 是**同步**签名（staged 周期整条是同步纯逻辑），而 reqwest 是
-/// async。桥法：把 future `spawn` 到 tokio runtime，同步线程 `recv` 等结果。
-///
-/// **调用方必须在 blocking 线程上调**（`spawn_blocking` / 非 async command）：
-/// 在 async 上下文里直接调会阻塞 executor 线程。Tauri 的同步 command 跑在**主线程**上 ——
-/// 15s 下载会冻 UI，故消费该适配器的 command 一律 `async fn` + `spawn_blocking`。
+/// **调用方必须在 blocking 线程上调**（`spawn_blocking`）：在 async 上下文里直接调会阻塞
+/// executor 线程，Tauri 的同步 command 跑在**主线程**上 —— 下载会冻 UI。
 ///
 /// # 为什么 `derive(Clone)` 而不是手抄一个克隆器
 ///
 /// [`Self::try_candidates`] 要把一份自身移进 spawn 出去的 task（`&self` 借用不能跨 spawn）。
 /// 原先那份手写的 `for_task` 逐字段抄一遍，四个字段全是 `Clone` —— 手抄版的唯一「能力」
-/// 是**漏抄新字段而编译得过**：`max_bytes` 形参化那次就差点漏掉，漏了的话 App 腿会静默地
-/// 拿 16 MiB 内存闸去下几十 MiB 的安装包。派生版漏字段直接编译不过。
+/// 是**漏抄新字段而编译得过**：`max_bytes` 形参化那次就差点漏掉，漏了的话下载会静默地
+/// 拿 16 MiB 缺省闸去下几十 MiB 的安装包。
 #[derive(Clone)]
 pub struct CoreDownloader {
     http: Arc<HttpRuntime>,
@@ -849,8 +805,7 @@ pub struct CoreDownloader {
 impl CoreDownloader {
     /// 新建。`handle` 须是活着的 tokio runtime handle（command 层 `Handle::current()`）。
     ///
-    /// 体积闸默认取 [`MAX_DOWNLOAD_BYTES`]；**三条生产腿全部**显式
-    /// [`Self::with_max_bytes`] 覆盖（那个缺省值容不下今天任何一个官方资产）。
+    /// 体积闸默认取 [`MAX_DOWNLOAD_BYTES`]；生产调用点显式 [`Self::with_max_bytes`] 覆盖。
     #[must_use]
     pub fn new(http: Arc<HttpRuntime>, handle: tokio::runtime::Handle) -> Self {
         Self {
@@ -870,11 +825,8 @@ impl CoreDownloader {
 
     /// 覆盖单次下载的体积硬闸。
     ///
-    /// **闸值属于「这一腿下多大的东西」，不属于传输层**：内核腿把整包收进内存（`Vec<u8>`）
-    /// ⇒ 闸是**内存**闸；App 安装包腿流式落盘 ⇒ 内存不随包体积长，它的闸管的是盘。
-    /// 两条腿各自按「服务端声明的体积」注入，再各自封在自己那个上限之下（128 MiB / 512 MiB）——
-    /// 两个上限约束的是不同的物理资源，合并成一个常量必然是「要么卡死大安装包、
-    /// 要么给换核腿开一个 OOM 口子」二选一。
+    /// **闸值属于「这一次下多大的东西」，不属于传输层**：安装包流式落盘，内存不随包体积长，
+    /// 闸管的是盘；调用方按「服务端声明的体积」注入并封顶。
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes;
@@ -893,12 +845,6 @@ impl CoreDownloader {
 
     /// 请求 + 跟随重定向 + 状态分类 + Content-Length 预检；返回**就绪待读**的响应与期望字节数。
     ///
-    /// # 为什么抽出来
-    ///
-    /// 两个消费端（[`Self::download_once`] 整包入内存 / [`Self::download_once_to_sink`] 流式落盘）
-    /// 在「读 body」之前要做的事**一模一样**：重定向跟随（GitHub 资产必然 302）、非 http/https 拒绝、
-    /// 403 限流分类、超上限早拒。复制第二份必然漂移 —— 上游 `core-downloader.ts` 与
-    /// `UpdateService.ts` 两份同构编排就是前车之鉴（见模块文档）。
     async fn open_download_response(
         &self,
         url: &str,
@@ -962,32 +908,7 @@ impl CoreDownloader {
         )))
     }
 
-    /// 真实下载一个 URL 到内存（含重定向跟随 + 完整性 + 看门狗 + 可选逐 chunk 进度）。
-    async fn download_once(
-        &self,
-        url: &str,
-        on_progress: Option<&DownloadProgressFn>,
-    ) -> Result<Vec<u8>, DownloadError> {
-        let (mut resp, expected) = self.open_download_response(url).await?;
-        // 流式读 + 停滞看门狗 + 硬闸（content-length 可缺失/撒谎 → 读取侧必须再拦一次）。
-        let bytes = read_body_capped_with_progress(
-            &mut resp,
-            Some(self.max_bytes),
-            STALL_TIMEOUT,
-            expected,
-            on_progress,
-        )
-        .await
-        .map_err(|e| map_body_error(e, expected))?;
-        check_content_length(bytes.len() as u64, expected)?;
-        Ok(bytes)
-    }
-
     /// 真实下载一个 URL **直接写进 `sink`**（字节不在内存里攒）。
-    ///
-    /// 与 [`Self::download_once`] 共用 [`Self::open_download_response`]（重定向 / 状态分类 /
-    /// 预检）、[`map_body_error`]（失败分类）与 [`check_content_length`]（完整性）——
-    /// **没有第二份平行编排**。差别只有一处：body 走 [`read_body_to_sink_with_progress`]。
     ///
     /// 返回实际写出的字节数。**失败时 sink 里可能已有部分内容**（本函数不知道 sink 是什么，
     /// 清理残件是调用方的责任）。
@@ -1012,36 +933,9 @@ impl CoreDownloader {
         Ok(received)
     }
 
-    /// 同步下载 **+ 逐 chunk 进度回调**（见类型文档「sync trait 的 async 桥」：须在 blocking 线程调用）。
-    ///
-    /// [`UpdateDownloader::download`] 的签名是 trait 定的（无进度参数），故细粒度进度只能走这条
-    /// 固有方法。二者共用 [`Self::download_inner`] —— **不复制第二份镜像回退/重定向编排**。
-    ///
-    /// **当前无生产调用点**（如实登记，2026-08-16 全仓反查：定义 + 一条单测，无第三处）——
-    /// App 安装包腿改流式落盘后已换走 [`Self::download_to_sink_with_progress`]，两条内核腿走
-    /// 无进度的 trait 方法。保留为「内存腿 + 进度」的**成对 API**，理由有二：
-    ///  1. 它与 [`Self::download_to_sink_with_progress`] 是同一条 `read_body_*_with_progress`
-    ///     语义的两个形态，流式腿那条门（`streaming_download_reports_progress_like_the_memory_leg`）
-    ///     声称「与内存腿同时机同分母」，删掉这一半就没有参照物了；
-    ///  2. 删它要连带把 `download_inner` / `read_body_capped_with_progress` 的进度参数一并摘掉，
-    ///     那是动内核腿的代码路径 —— 收益（少一个未调用的 pub 方法）与半径不成比例。
-    ///
-    /// 回调在每个 chunk 到达时触发，可能高频（几百次）；**限频归调用方**（发 IPC 前按整数百分比
-    /// 去重），此处不替调用方决定节流策略。镜像回退时回调会从新候选的 0 重新开始 —— 这是真值
-    /// （确实在重下），调用方若不想让进度条倒退需自行取 max。
-    #[cfg(test)]
-    pub fn download_with_progress(
-        &self,
-        url: &str,
-        on_progress: Arc<DownloadProgressFn>,
-    ) -> Result<Vec<u8>, DownloadError> {
-        self.download_inner(url, Some(on_progress))
-    }
-
     /// 下载编排**单点**：候选列表（原址→镜像）逐个试，首个成功即返；全败返最后一个错。
     ///
-    /// 泛型化是为让内存腿与流式落盘腿共用**同一条**候选编排 —— 「镜像何时回退、失败如何记账、
-    /// runtime 关掉怎么算」各写一份必然漂移。`attempt` 收到的是一份可移进 task 的
+    /// `attempt` 收到的是一份可移进 task 的
     /// `self.clone()`（`&self` 借用不能跨 spawn）与该次候选 URL。
     fn try_candidates<T, F, Fut>(&self, url: &str, attempt: F) -> Result<T, DownloadError>
     where
@@ -1074,24 +968,10 @@ impl CoreDownloader {
         Err(last.unwrap_or_else(|| DownloadError::Other("无可用下载地址".into())))
     }
 
-    /// 整包入内存的下载（[`UpdateDownloader::download`] 与 `Self::download_with_progress` 共用）。
-    fn download_inner(
-        &self,
-        url: &str,
-        on_progress: Option<Arc<DownloadProgressFn>>,
-    ) -> Result<Vec<u8>, DownloadError> {
-        self.try_candidates(url, move |dl, cand| {
-            let cb = on_progress.clone();
-            async move { dl.download_once(&cand, cb.as_deref()).await }
-        })
-    }
-
-    /// **流式落盘**下载 + 逐 chunk 进度 + 增量 sha256（见类型文档「sync trait 的 async 桥」：
+    /// **流式落盘**下载 + 逐 chunk 进度 + 增量 sha256（见类型文档「同步入口的 async 桥」：
     /// 须在 blocking 线程调用）。
     ///
-    /// 与 `Self::download_with_progress` 的差别只有「字节去哪」：那条把整包攒进 `Vec<u8>`
-    /// （内存峰值 = 包体积），本条把每个 chunk 直接写进 `new_sink()` 给出的句柄，
-    /// 内存占用与包体积**解耦**。摘要随写一遍算完（[`HashingSink`]），故校验不需要再读一遍。
+    /// 每个 chunk 直接写进 `new_sink()` 给出的句柄，内存占用与包体积**解耦**。摘要随写一遍算完（[`HashingSink`]），故校验不需要再读一遍。
     ///
     /// `new_sink` 是**工厂**不是句柄：镜像回退换候选重下时要拿一个截断过的干净句柄，
     /// 否则第二次的字节会接在第一次的残料后面（长度对不上、摘要也对不上）。
@@ -1100,8 +980,7 @@ impl CoreDownloader {
     ///
     /// # Errors
     ///
-    /// 除 `Self::download_with_progress` 的全部失败形态外，多一条建句柄/写盘失败
-    /// （[`DownloadError::Io`]，**不冒充** `Incomplete`）。
+    /// 网络侧的全部失败形态，外加建句柄/写盘失败（[`DownloadError::Io`]，**不冒充** `Incomplete`）。
     pub fn download_to_sink_with_progress(
         &self,
         url: &str,
@@ -1134,14 +1013,6 @@ impl CoreDownloader {
     }
 }
 
-impl UpdateDownloader for CoreDownloader {
-    /// 同步下载（见类型文档「sync trait 的 async 桥」：**须在 blocking 线程调用**）。
-    /// 需要进度的调用点走固有方法 `CoreDownloader::download_with_progress`。
-    fn download(&self, url: &str) -> Result<Vec<u8>, DownloadError> {
-        self.download_inner(url, None)
-    }
-}
-
 // ── 适配 ③（已迁出）：unlock UnlockHttp ───────────────────────────────────────
 //
 // **解锁检测的传输层已迁到独立 crate `polaris-unlock-transport`**（`wreq` + Chrome 131 指纹伪装）。
@@ -1150,7 +1021,7 @@ impl UpdateDownloader for CoreDownloader {
 // 这正是本文件 `warp_client` 文档记录过的同一类问题。解锁面对通用 CF 边缘，只能上真指纹伪装。
 //
 // **本文件（reqwest + rustls）刻意不再实现 `UnlockHttp`**：指纹客户端与 BoringSSL 构建链的
-// 爆炸半径被限制在那一个 crate 内，订阅拉取 / 内核下载 / WARP 注册**继续走这里**，不受影响。
+// 爆炸半径被限制在那一个 crate 内，订阅拉取 / 安装包下载 / WARP 注册**继续走这里**，不受影响。
 // 若此处再加回一个 `impl UnlockHttp for HttpRuntime`，就等于给解锁检测开了一条绕过指纹伪装的后门。
 
 // ── 适配 ④：mesh WarpHttp ─────────────────────────────────────────────────────

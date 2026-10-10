@@ -9,12 +9,16 @@
 # 字段配置；需要深度定制时再经 installerHooks / template 注入。
 #
 # === installerHooks（2026-08-05 起启用）===
-# `nsis-hooks.nsh` 实现三条窄钩子：`NSIS_HOOK_PREINSTALL` 在复制新文件前删除旧安装包遗留的
+# `nsis-hooks.nsh` 实现四条窄钩子。`NSIS_HOOK_PREINSTALL` 与 `NSIS_HOOK_PREUNINSTALL` 在动安装目录的
+# 文件之前，先让主程序退出，再结束映像路径恰为 `$INSTDIR` 之内两处已知位置的 `sing-box.exe`（内核直接
+# 从安装目录运行，活着的内核会占住自己的映像文件；判据是完整映像路径，不按进程名结束；应用侧另有
+# 作业对象在主程序退出时结束内核，这里是兜底）。`NSIS_HOOK_PREINSTALL`
+# 随后在复制新文件前删除旧安装包遗留的
 # `$INSTDIR\resources`（当前权威资源在 `$INSTDIR\_up_\resources`）；`NSIS_HOOK_POSTINSTALL` 在安装成功后
 # 删除仅属于 portable zip 的 `$INSTDIR\portable.marker`，避免覆盖便携目录时把 NSIS 安装版继续误判为
 # 便携版；`NSIS_HOOK_POSTUNINSTALL` 在真卸载（非 `/UPDATE`）时提权清理运行期外置的 `PolarisHelper`
 # 服务与 `C:\ProgramData\Polaris`。后两样不在 NSIS 安装清单里，默认卸载器管不到，不补则控制面板
-# 卸载后残留孤儿 LocalSystem 服务。用户数据不在三条钩子范围内 —— Tauri 模板自带的「删除应用数据」
+# 卸载后残留孤儿 LocalSystem 服务。用户数据不在这些钩子范围内 —— Tauri 模板自带的「删除应用数据」
 # 复选框已覆盖 `%APPDATA%\com.polaris.app` 与
 # `%LOCALAPPDATA%\com.polaris.app`。
 #

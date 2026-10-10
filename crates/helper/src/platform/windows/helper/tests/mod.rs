@@ -524,29 +524,23 @@ fn cleanup_reaps_child_and_kills_all_singbox() {
 // ===== uninstall =====
 
 #[test]
-fn uninstall_spawns_self_uninstall_and_signals_exit() {
+fn uninstall_requires_bundled_uac_without_spawning_or_closing_helper() {
     let proc_ops = MockProcOps::new();
     let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
-    let snap_before = proc_ops.snapshot();
+    let before = proc_ops.snapshot();
     let out = h.handle("real-token", Request::Uninstall);
     match out {
-        HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling)) => {}
-        other => panic!("expected UninstallAndExit, got {other:?}"),
+        HandleOutcome::Respond(Response::Err(e)) => {
+            assert!(e.detail.contains("native-cleaner-uac-required"));
+        }
+        other => panic!("expected explicit UAC fallback, got {other:?}"),
     }
-    let snap_after = proc_ops.snapshot();
     assert_eq!(
-        snap_after.spawn_uninstall_calls,
-        snap_before.spawn_uninstall_calls + 1
+        proc_ops.snapshot().spawn_uninstall_calls,
+        before.spawn_uninstall_calls
     );
-    // spawn 参数传了 service_name + support_dir
-    let args = proc_ops.last_spawn_args();
-    assert_eq!(
-        args,
-        Some((
-            "PolarisHelper".to_owned(),
-            r"C:\ProgramData\Polaris".to_owned()
-        ))
-    );
+    assert!(!h.child_mu.lock().unwrap().closing);
+    assert!(h.dns_admission.launch(|| Ok(())).is_ok());
 }
 
 // ===== freeport =====
@@ -1526,4 +1520,15 @@ fn new_native_cache_wire_command_is_authenticated_and_reaches_the_native_ops_onc
         assert_eq!(reply.line.starts_with("OK flushed"), expected_calls == 1);
         assert_eq!(ops.flush_dns_calls(), expected_calls);
     }
+}
+
+#[test]
+fn uninstall_launch_failure_does_not_exit_or_report_uninstalling() {
+    let proc_ops = MockProcOps::new();
+    proc_ops.set_uninstall_error("missing fixed cleaner");
+    let h = make_helper(proc_ops, MockNetTableOps::new());
+    assert!(matches!(
+        h.handle("real-token", Request::Uninstall),
+        HandleOutcome::Respond(Response::Err(_))
+    ));
 }

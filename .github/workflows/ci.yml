@@ -659,6 +659,10 @@ jobs:
           node-version: '26'
 
       # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
+      - name: Windows installer cleanup fixtures (native PowerShell)
+        if: runner.os == 'Windows'
+        run: node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs
+
       - name: Install Rust toolchain (preinstalled rustup)
         shell: bash
         run: |

@@ -1091,8 +1091,8 @@ pub trait LoginStatusSubscriber: Send + Sync {
 /// **等待收割**，子进程照常活着。而瞬态核（登录核 / 测速临时核）的 kill 全靠调用方显式
 /// [`terminate`](LoginCoreChild::terminate) —— 只要 future 在 `spawn` 与 `terminate` 之间被丢弃或
 /// panic 展开，就留下一个持续持有回环端口（测速临时核是 N 个）+ WG/WARP peer 会话的**孤儿
-/// sing-box**，且用户完全看不见。兜底 sweep 只在下次起主核时跑，Windows 更是恒 no-op
-/// （`core-supervisor/src/stale_core.rs` 的 `scan_running_cores` 在非 Linux/macOS 返空）。
+/// sing-box**，且用户完全看不见。兜底 sweep 只在下次起主核时跑（Windows 的作业对象只管
+/// 「主程序消失」，句柄被丢弃而主程序还活着时它不出手）。
 ///
 /// 用 Drop 守卫而非 `Command::kill_on_drop(true)`：后者必须设在 **spawn 之前**的 `Command` 上，
 /// 而 spawn 收口在 `core-supervisor` 的 `TokioSpawner`（主核与瞬态核共用，主核**不能**跟着 app

@@ -216,6 +216,7 @@ export const IPC_CHANNELS = {
 
   // 更新管理
   UPDATE_CHECK: 'update_check',
+  UPDATE_CLEAR_PORTABLE_HANDOFF: 'update_clear_portable_handoff',
   UPDATE_DOWNLOAD: 'update_download',
   // 回读最后一帧 update:progress。更新卡的状态在组件本地，只订阅事件的话组件重挂载后就对在途/已完成的
   // 下载一无所知（下完了的那一帧永不再来）⇒ 挂载时补一次回读。
@@ -226,16 +227,8 @@ export const IPC_CHANNELS = {
   // App 更新弹窗（独立 mini 更新窗）：主进程 → 弹窗推状态载荷；弹窗 → 主进程回传按钮/关闭动作。
   UPDATE_POPUP_ACTION: 'update_popup_action',
 
-  // 核心管理
-  CORE_UPDATE_CHECK: 'core_update_check',
-  CORE_UPDATE_RUN: 'core_update_run',
+  // 内核只读信息
   CORE_GET_VERSION_INFO: 'core_get_version_info',
-  CORE_ROLLBACK: 'core_rollback',
-  CORE_REPLACE_MANUAL: 'core_replace_manual',
-  CORE_UPDATE_GET_AUTO_STATUS: 'core_update_get_auto_status', // 内核自动更新状态（lastCheckAt/staged/跨带提示）
-  CORE_UPDATE_APPLY_STAGED: 'core_update_apply_staged', // 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）
-  CORE_UPDATE_ACK_VERSION_CHANGE: 'core_update_ack_version_change', // banner 展示版本变更通知后 ack 清除 pendingChangeNotice（show→ack，弹一次非每启）
-  CORE_RESET_FACTORY: 'core_reset_factory', // B6：把内核恢复为随 App 出厂的版本
   APP_UNINSTALL_ALL: 'app_uninstall_all', // B6：完全卸载 Polaris（提权 helper / 受保护目录内核 / 用户配置 / 应用本体）
 
   // Shell 操作
@@ -271,8 +264,8 @@ export const IPC_CHANNELS = {
   // **与上面两条的分工**：那两条的发射点在后端**命令层**，后端自驱的核起停（去抖重启 /
   // 「立即应用」/ drain 排空 / 崩溃自愈）一个都不发 —— 这正是「点了立即应用，核真重启了、
   // 条上仍显示立即应用」的成因。本通道由 `runtime/proxy.rs` 在**真状态跃迁点**发，
-  // 覆盖全部路径。上面两条**保留不动**（后端两个 scheduler 仍听它们：订阅补更会真联网、
-  // 换核会排队，收口过去等于每次内部重启都多跑一遍）。
+  // 覆盖全部路径。上面两条**保留不动**（后端的订阅调度器仍听它们：订阅补更会真联网，
+  // 收口过去等于每次内部重启都多跑一遍）。
   EVENT_PROXY_LIFECYCLE: 'event:proxyLifecycle',
   // 无载荷：payload 恒为 {}，本文件三个订阅方（App.tsx / TrayMenu.tsx / use-config.ts）全部丢弃，
   // 详见后端 commands/config.rs::broadcast_config_changed_with 与其调用点守卫。
@@ -308,9 +301,6 @@ export const IPC_CHANNELS = {
   EVENT_TRAY_OPEN_SCREEN: 'event:trayOpenScreen',
   EVENT_ENTER_PRIVACY_MODE: 'event:enterPrivacyMode',
   EVENT_EXIT_PRIVACY_MODE: 'event:exitPrivacyMode', // 退出隐私模式（解锁/idle 计时复位）
-  EVENT_CORE_VERSION_CHANGED: 'event:coreVersionChanged',
-  EVENT_CORE_AUTO_UPDATE_STATUS: 'event:coreAutoUpdateStatus', // 内核自动更新状态变更（staged 待生效 / 跨带提示）
-  EVENT_CORE_BASELINE_WARNING: 'event:coreBaselineWarning', // 非官方核 ≤ 随包基线：启动 reconcile 发兼容风险提醒
   EVENT_HELPER_UPGRADEABLE: 'event:helperUpgradeable', // 提权 helper proto < 期望（如属主根治 v6）：启动后发，渲染端 toast 引导升级
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
   EVENT_AUTO_SELECT_STATUS: 'event:autoSelectStatus', // 选择状态变化，载荷与状态命令的返回同形

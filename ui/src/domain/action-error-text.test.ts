@@ -18,6 +18,10 @@ describe('structured action error text', () => {
     );
   });
 
+  it('partial cleanup stays separate from success or cancellation', () => {
+    expect(helperActionErrorText('partialCleanup', t)).toBe('translated:helper.actionError.partialCleanup');
+  });
+
   it('unknown or future backup codes use a safe localized fallback', () => {
     expect(backupErrorText(undefined, t)).toBe('translated:backupImport.error.unknown');
     expect(backupErrorText('futureCode' as never, t)).toBe('translated:backupImport.error.unknown');

@@ -281,6 +281,62 @@ fn a_tests_directory_stays_out_of_the_scan_surface_on_a_copy() {
     );
 }
 
+// ── method_body ──
+
+/// **守卫的守卫**：证明 [`method_body`] 真的截在方法自己的括号上。
+///
+/// 没有这条，「我按括号配对封了顶」只是一句注释。
+#[test]
+fn method_body_stops_at_the_methods_own_brace() {
+    let src = "impl X {\n    fn target(&self) {\n        if a { inside(); }\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(src, "fn target(");
+    assert!(body.contains("inside()"), "必须包含被守方法自己的函数体");
+    assert!(
+        !body.contains("outside()"),
+        "**封顶失效**：切到了同一个 impl 的后续方法 → 守卫可被「删这里、加那里」骗过"
+    );
+
+    // 字符串里的花括号（`format!("{x}")` 之类）不得计入深度。
+    let with_fmt = "impl X {\n    fn target(&self) {\n        log(\"a {b} c }\");\n        tail();\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(with_fmt, "fn target(");
+    assert!(
+        body.contains("tail()"),
+        "字符串字面量里的右花括号被误当作方法结束"
+    );
+    assert!(!body.contains("outside()"));
+
+    // 行注释里的花括号同理。
+    let with_comment = "impl X {\n    fn target(&self) {\n        // } 这不是结束\n        tail();\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(with_comment, "fn target(");
+    assert!(body.contains("tail()"));
+    assert!(!body.contains("outside()"));
+
+    // 🔴 **剥注释**：跳过注释里的花括号只决定「切到哪」，不决定「切出来的文本喂谁」。
+    // 消费者全是 `contains` / `find` / `count()` 型判据，注释里的同名文本会替生产调用点作证。
+    let fed_by_comment =
+        "impl X {\n    fn target(&self) {\n        real_call();\n        // real_call() 只出现在整行注释里\n    }\n}\n";
+    assert_eq!(
+        method_body(fed_by_comment, "fn target(")
+            .matches("real_call()")
+            .count(),
+        1,
+        "整行注释里的锚点文本必须被剥掉，否则 `count()==N` 类判据可被注释充数"
+    );
+    let only_comment =
+        "impl X {\n    fn target(&self) {\n        // real_call() 被删了，只剩这行注释\n    }\n}\n";
+    assert!(
+        !method_body(only_comment, "fn target(").contains("real_call()"),
+        "**假绿**：生产调用点删光、只剩注释时，正面 `contains` 必须转红"
+    );
+}
+
+/// 锚点消失必须 panic（转红），而不是返回空切片让断言恒真。
+#[test]
+#[should_panic(expected = "锚点消失")]
+fn missing_anchor_panics_instead_of_silently_passing() {
+    method_body("fn other() {\n}\n", "fn nonexistent(");
+}
+
 /// 🔴 [`write_executable_stand_in`] 落下的替身，在别的线程不停 `fork` 时也必须每次都起得来。
 ///
 /// 旁边那些线程就是全量测试里「别的用例正好在 `fork`」的浓缩版。把落盘换回「本进程

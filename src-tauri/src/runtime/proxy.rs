@@ -76,8 +76,8 @@ mod tunnel_conflict;
 mod unlock_refresh;
 
 pub(crate) use core_binary::{
-    bundle_resource_candidates, bundle_resource_roots, core_binary_env_override, dev_manifest_dir,
-    first_existing_bundle_candidate, resolve_bundled_core_binary, resolve_core_binary,
+    bundle_resource_candidates, dev_manifest_dir, first_existing_bundle_candidate,
+    resolve_core_binary,
 };
 // B9 跟随面：`resolve_dashboard_serve_dir` 的**唯一**消费者是 `start_inner`，本批随它进
 // `startup.rs`（改走 `super::core_binary::` 直取）⇒ façade 侧再导出零命中。§B.3 把它列进「必须
@@ -372,6 +372,9 @@ pub mod code {
     pub const AUTO_RESTART_FAILED: &str = "AUTO_RESTART_FAILED";
     /// TUN 经提权 helper 起核，但 helper 未安装（起核前置校验拦截）——「权限/环境」轴。控制流位置可
     /// 诚实断言（判定点直接读到 helper 未装），非猜 message；渲染端据此引导去「设置 › Helper」安装。
+    ///
+    /// 「装着但太旧、起不了核」也落本码（`startup::birth_capability_error_code`）：助手对起核前的
+    /// 能力探测明确回了「不认识这条命令」。用户要做的是同一件事（去同一页装 / 升级），重试同样无用。
     pub const HELPER_NOT_INSTALLED: &str = "HELPER_NOT_INSTALLED";
     /// **Android**：起核被拒是因为用户没给 VPN 授权（`VpnService.prepare()` 返回非 null）
     /// ——「权限/环境」轴。控制流位置可诚实断言：判定点是 Kotlin 侧起核前的那次 `prepare()`，
@@ -388,7 +391,7 @@ pub mod code {
     /// **为什么必须是一个诚实终态而不是继续起核**：活着的孤儿核一直独占 `cache.db`，此时起任何新核
     /// 都会 `initialize cache-file: timeout` 而失败，且**连切回 systemProxy 模式也起不来**。若在此静默
     /// 放行，用户看到的是一串莫名其妙的启动失败、无从下手；报出本码才能指向真正的动作
-    /// （装/修 helper，或手动 `sudo kill` 掉残留 pid）。控制流位置可诚实断言（清扫腿直接观察到
+    /// （装/修 helper，或手动结束残留 pid）。控制流位置可诚实断言（清扫腿直接观察到
     /// 「杀过了、仍存活、且提权腿不可用」），非猜 message。
     pub const ROOT_ORPHAN_BLOCKED: &str = "ROOT_ORPHAN_BLOCKED";
     /// **A1**：核已就绪，但把 OS 系统代理指向本地 mixed 入站失败（`networksetup`/`gsettings`/`reg` 报错）
@@ -407,7 +410,7 @@ pub mod code {
     /// 实际默认出口，与用户落盘的 `selectedServerId` 对账（见 [`attest_effective_exit`](super::startup::attest_effective_exit)）。
     /// 非终态（核在跑），同走 `set_nonfatal_error`。这是「用户以为走代理、实则明文直连」的唯一告警通道。
     pub const EXIT_MISMATCH: &str = "EXIT_MISMATCH";
-    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「换核没生效」轴。
+    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「提权助手里的内核与本应用不配套」轴。
     ///
     /// 与 [`EXIT_MISMATCH`] 的判据形态**刻意相反**：那一条是纯静态对账（两个输入都源自「意图」），
     /// 本条只吃**事实**——`running` 取自内核对该 pid 的记账（linux `/proc/<pid>/exe`、mac `ps -o comm=`），
@@ -417,6 +420,25 @@ pub mod code {
     ///
     /// 非终态（核确在跑，只是版本不对），同走 `set_nonfatal_error`。
     pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
+    /// **提权助手里的内核与本应用不配套，或确认不了配套**：TUN 模式由提权助手以 root / SYSTEM 执行
+    /// 它受保护目录里的内核，那份内核必须就是本应用随包的那一份。两处判定落本码：
+    ///
+    /// - 起核前（`startup::protected_core_verdict`）：受保护核对账没有得到「逐字节一致」的结论
+    ///   —— 助手不接受装核命令，或对账这一次失败。**确认不了即拒绝**，不带着一份来历不明的内核起核。
+    /// - 起核后（内核自证）：助手实际执行的文件自报的版本与随包内核不同 ⇒ 停核。
+    ///
+    /// 终态（核没起，或已被停掉）。用户的下一步是到「设置 › Helper」重装或升级提权助手；非 TUN
+    /// 模式不经提权助手，不受影响。单列一个码而不落进 [`STARTUP_FAILED`]：后者引导用户去查服务器
+    /// 配置，指错了方向。
+    ///
+    /// 与 [`CORE_BINARY_MISMATCH`] 的分工：那一条是核仍在运行时的告警（版本读不出，或对账的是
+    /// 应用直起的核）；本码是拒绝运行。
+    pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
+    /// **随包内核不可执行**：安装包里的内核文件没有可执行权限，应用直起内核前即拒绝。
+    ///
+    /// 终态（核没起）。单列一个码而不落进 [`STARTUP_FAILED`]：成因是安装包损坏或被改过权限，
+    /// 重试无用，要给用户的动作是重新安装；笼统的「启动失败」指不出这一步。
+    pub const CORE_NOT_EXECUTABLE: &str = "CORE_NOT_EXECUTABLE";
     /// **规则资源缺失**：本次生成有 rule_set tag 因本地 `.srs` 缺失/损坏被 fail-closed 剪枝
     /// ——「分流规则整段没了」轴。控制流位置可诚实断言（剪枝点直接交回悬空 tag 清单，见
     /// `RouteConfigOutcome::pruned_rule_set_tags`），非猜 message；**资源齐全时该清单恒空 ⇒ 不发 = 零噪音**。
@@ -522,8 +544,11 @@ pub mod code {
 /// [`code::HELPER_NOT_INSTALLED`] 的用户可见兜底文案（zh）。command 前置拦截与 runtime preflight
 /// 共用同一串 → 「点连接」与「托盘/自动连接」两路给出一致提示。渲染端另有 i18n key
 /// (`errors.helperNotInstalled*`) 覆写多语，此常量为无 emitter / 极早期失败时的兜底。
+///
+/// 本码也表示「装着但太旧」（见 [`code::HELPER_NOT_INSTALLED`]），故文案两种情形都要说到，动作
+/// 也是两个：安装，或升级。
 pub const HELPER_NOT_INSTALLED_MSG: &str =
-    "TUN 模式需要提权 helper，但 helper 尚未安装。请到「设置 › Helper」安装后重试。";
+    "TUN 模式需要提权 helper，但 helper 尚未安装或版本过旧。请到「设置 › Helper」安装或升级后重试。";
 
 /// [`code::HELPER_GATE_ABORTED`] 的用户可见兜底文案（zh）。渲染端另有 i18n key
 /// (`errors.helperGateAborted`) 覆写多语，此常量为无 emitter / 极早期失败时的兜底。
@@ -1529,8 +1554,7 @@ pub struct ProxyRuntime {
     ///
     /// [`run_helper_gate`](Self::run_helper_gate) 是**每次 TUN 起核**都要跑的汇流点（托盘切模式 /
     /// 启动自动连接 / switchMode 去抖重启 / 崩溃自愈重启），而「可升级」是一条**一次性告知**、
-    /// 不是状态推送。不去重就是「每次重启弹一次原生模态」，比它要修的缺陷坏得多
-    /// （语义同 `startup_tasks::BASELINE_WARNED`）。
+    /// 不是状态推送。不去重就是「每次重启弹一次原生模态」，比它要修的缺陷坏得多。
     ///
     /// **挂在运行时实例上而不是写成 `static`**：生产进程里 `AppRuntime` 只造一个 `ProxyRuntime`
     /// （`runtime.rs` 的 `AppRuntime::new`），两者在生产上完全等价；而 `static` 在单测里是
@@ -1651,7 +1675,7 @@ pub struct ProxyRuntime {
     /// 起核用的核二进制路径覆盖（**仅单测置位**，同 `stale_sweep_disabled` 的先例；生产恒 `None`）。
     ///
     /// 「起核可取消」的门必须有个**真能 spawn 的**假核（起来就死 / 起来但永不就绪），否则退避中断与
-    /// 孤儿收割都测不到。唯一的现成注入点 `POLARIS_SINGBOX_PATH` 是**进程级**的：并发跑的其它单测会
+    /// 孤儿收割都测不到。唯一的现成注入点（开发态的内核路径环境超驰）是**进程级**的：并发跑的其它单测会
     /// 读到它（`runtime::updater` 那条 `core_binary_path().is_none()` 就被这样打红过），等于把测试间
     /// 耦合做成 flaky 源。故改用 per-runtime 覆盖 —— 作用域随实例，绝不外溢到别的测试。
     #[cfg(test)]
@@ -1660,6 +1684,10 @@ pub struct ProxyRuntime {
     #[cfg(test)]
     metadata_validation_admission:
         Mutex<Option<Result<(), polaris_core_supervisor::ValidationLifecycleError>>>,
+    /// 受保护核对账结论的桩（**仅单测置位**；生产没有这个字段）。经替身 helper 起核的用例没有
+    /// 受保护核目录可对账，由测试工厂置成「已确认」；验配套闸本身的用例把它清掉走真对账。
+    #[cfg(test)]
+    protected_core_verdict_fixture: Mutex<Option<startup::ProtectedCoreVerdict>>,
     /// 管理 API PUT 的落点桩（**仅单测置位**，同 `core_binary_override` 的先例；生产恒 `None`）。
     ///
     /// 生产的 PUT 出口是 [`ProxyRuntime::management_api`] → 真 gRPC；单测里核不起、`clash_api_port` 为 0
@@ -1836,6 +1864,8 @@ impl ProxyRuntime {
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
             metadata_validation_admission: Mutex::new(None),
+            #[cfg(test)]
+            protected_core_verdict_fixture: Mutex::new(None),
             #[cfg(test)]
             management_api_stub: Mutex::new(None),
         }

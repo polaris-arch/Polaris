@@ -465,7 +465,7 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
     ),
     (
         "src-tauri/src/runtime/helper.rs",
-        "if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) && error.code == polaris_helper_proto::ErrorCode::Unknown",
+        "if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) && is_unknown_command_reply(error)",
         1,
         "Unknown 只在现有三个桌面 helper 上转成协议升级提示；Android/iOS/Other 仍保留原错误，不能假称安装新 helper 就能支持其运行模型。",
     ),
@@ -2390,9 +2390,11 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/lib.rs",
         "desktop",
-        8,
+        10,
         IosSide::WithAndroid,
-        "桌面专属插件与窗口装配（single-instance / autostart / 托盘锚点 / 窗口铬…）。\
+        "桌面专属插件与窗口装配（single-instance / autostart / 托盘锚点 / 窗口铬…），\
+         以及两处只对独立内核可执行文件成立的启动步骤（清理旧版本内核残留目录、把随包内核\
+         路径注入版本读取）：移动端的内核在进程内，没有这两件事的对象。\
          两个移动平台同侧。**其中 single-instance 那条的既有理由只写了 Android**\
          （「应用默认单进程 + tun fd 由 VpnService.prepare() 仲裁」）；iOS 的等价物是\
          「系统本就不允许同一 app 起第二个进程实例」+「`NEVPNManager` 侧的隧道单例」，\
@@ -2611,30 +2613,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "Android 从 ConnectivityManager 桥取可绑定接口；iOS 没有该 Android 插件，\
          不编译此腿是对的。iOS 当前改走 getifaddrs，覆盖范围另列待验证。",
-    ),
-    (
-        "src-tauri/src/commands/updater/core_update.rs",
-        "not(target_os = \"android\")",
-        1,
-        IosSide::DiffersWrongToday,
-        "换核事务拿桌面 legacy lease；Android 无可替换核文件故跳过。iOS 核同样在\
-         扩展进程内，没有可由应用替换的独立核二进制，现有非 Android 换核链不适用。",
-    ),
-    (
-        "src-tauri/src/commands/updater/shared.rs",
-        "not(target_os = \"android\")",
-        2,
-        IosSide::DiffersWrongToday,
-        "导入 core_paths 并解析可写核目录；iOS 随 app 扩展分发 libbox，\
-         同样没有桌面可换的独立核文件，当前落桌面侧不成立。",
-    ),
-    (
-        "src-tauri/src/commands/updater/shared.rs",
-        "target_os = \"android\"",
-        1,
-        IosSide::DiffersWrongToday,
-        "Android 诚实拒绝独立核文件替换；iOS 也应拒绝，但当前落入非 Android\
-         的磁盘内核路径，需接 iOS 原生发行模型。",
     ),
 
     (
@@ -2979,6 +2957,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "core-manifest 的 Android resolver 标志选择 libbox 资源事实，iOS 不应借 Android 资源；未支持目标不因此获得核资源或更新能力。",
     ),
+    (
+        "src-tauri/src/runtime/updater.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "桌面补丁集标识只对桌面内核成立：Android 与 iOS 的内核各走各的补丁队列，两个移动平台都不返回它。",
+    ),
 
     // iOS source port on main071: measured cfg sites, NE-preserving host exits.
     ("crates/tauri-plugin-polaris-ios/src/lib.rs", "any(target_os = \"ios\", test)", 1, IosSide::DiffersRight, "iOS原生插件/代次状态独立于Android JNI；host tests仅编纯状态，NE cleanup仍Unknown。"),
@@ -2999,7 +2984,6 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/exit_lifecycle.rs", "target_os = \"android\"", 3, IosSide::DiffersRight, "desktop prepare/commit拒绝两移动平台；iOS quit/final-exit保NE，不生成clean/NoOwner收据；Android原cleanup不变。"),
     ("src-tauri/src/exit_lifecycle.rs", "target_os = \"ios\"", 2, IosSide::DiffersRight, "desktop prepare/commit拒绝两移动平台；iOS quit/final-exit保NE，不生成clean/NoOwner收据；Android原cleanup不变。"),
     ("src-tauri/src/lib.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 1, IosSide::WithAndroid, "iOS插件/共享目录/冷会话只对账；新增桌面退出veto仅桌面，原其它not(android)债仍保留。"),
-    ("src-tauri/src/lib.rs", "not(target_os = \"android\")", 2, IosSide::DiffersWrongToday, "iOS插件/共享目录/冷会话只对账；新增桌面退出veto仅桌面，原其它not(android)债仍保留。"),
     ("src-tauri/src/lib.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS插件/共享目录/冷会话只对账；新增桌面退出veto仅桌面，原其它not(android)债仍保留。"),
     ("src-tauri/src/runtime/proxy/pending_changes.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS保留删除journal，不把主App无Child当跨进程资源清理证明。"),
     ("src-tauri/src/runtime/proxy/process_supervision.rs", "target_os = \"android\"", 4, IosSide::DiffersRight, "iOS两停核入口委托NE且保留TS claim，cold host/stale只对账；独立Androidbooking原样保留。"),
@@ -3683,12 +3667,16 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// Source-only registration does not sign Android/iOS SDK execution, global cleanup or NoOwner.
 /// 周期测速调度器：Android 设备状况查询 +4 处 Right（桥两处、调度器的真实腿与桩各一处），
 /// 移动端前后台入口 +3 处 WithAndroid（lib.rs 的 `Suspended` 臂、调度器两处）。两个债格子没动。
+/// 应用内内核更新整体删除：`commands/updater/core_update.rs`、`commands/updater/shared.rs` 的内核
+/// 目录腿与 `lib.rs` 的播种 / 调度器装配共 6 处 WrongToday 随被守代码一起消失（债不是被改判，
+/// 是对象没了）；`lib.rs` 新增 2 处 `desktop`、`updater.rs` 新增 1 处「Android 或 iOS」（均 WithAndroid）。
+/// 债的具名清单随之 36 行 / 174 处 → 32 行 / 168 处。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     ("DiffersRight", 265),
     ("DiffersUndecided", 25),
-    ("DiffersWrongToday", 148),
-    ("WithAndroid", 86),
+    ("DiffersWrongToday", 142),
+    ("WithAndroid", 89),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3727,22 +3715,6 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
         "not(target_os = \"android\")",
         2,
     ),
-    (
-        "src-tauri/src/commands/updater/core_update.rs",
-        "not(target_os = \"android\")",
-        1,
-    ),
-    (
-        "src-tauri/src/commands/updater/shared.rs",
-        "not(target_os = \"android\")",
-        2,
-    ),
-    (
-        "src-tauri/src/commands/updater/shared.rs",
-        "target_os = \"android\"",
-        1,
-    ),
-    ("src-tauri/src/lib.rs", "not(target_os = \"android\")", 2),
     (
         "src-tauri/src/runtime/geo_seed.rs",
         "not(target_os = \"android\")",

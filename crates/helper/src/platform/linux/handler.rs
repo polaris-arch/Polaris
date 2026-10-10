@@ -327,8 +327,10 @@ fn handle_birth_status<P, S, D, SD>(
             target: Some(target),
             ..
         } => LinuxBirthStatus::Unknown { target },
+        // 带尾文：裸的 `ERR unknown` 在客户端眼里是「这个 helper 不认识本命令」，而这里是认识
+        // 命令、只是手里的 custody 认不出归属。
         BirthAdmission::Blocked { target: None, .. } => {
-            let _ = conn.write_line("ERR unknown");
+            let _ = conn.write_line("ERR unknown birth-custody-unidentified");
             return;
         }
     };

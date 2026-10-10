@@ -1,57 +1,13 @@
-//! sing-box / app 版本解析的单一权威（移植自 上游 `shared/version.ts`）。
-//!
-//! 上游 `version.ts` 注释记录的历史问题：配置生成层曾用 `parseFloat("1." + minor)` 判断版本带，
-//! 把 minor 当小数 —— `"1.9"` → 1.9 被误判为 > 1.13，`"1.20"` → 1.2 被误判为 < 1.13。
-//! 核心更新层早已用整数编码避开该坑。本模块把 Polaris 两处散落的版本逻辑（CoreUpdateService.compareVersions
-//! + UpdateService.isNewerVersion）统一到这里的纯函数，与 上游 `compareSemver` 行为逐字一致。
-//!
-//! 锚点：`src/shared/version.ts` 全文。
+//! 版本比较的单一权威：[`compare_semver`]（完整 semver 优先级，含 prerelease）。
 
 use thiserror::Error;
 
-/// 版本解析/比较失败（目前仅「空版本」属于硬错误；不可解析的段在 [`compare_semver`] 中按 0 计而非报错，
-/// 与 上游 `parseInt(p, 10) || 0` 同口径）。
+/// 版本比较失败（仅「空版本」属于硬错误；不可解析的段在 [`compare_semver`] 中按 0 计而非报错）。
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ParseVersionError {
-    /// 版本字符串为空（上游 `encodeMajorMinor` 对 `""` 返回 NaN；此处显式报错以便调用方区分）。
+    /// 版本字符串为空。
     #[error("empty version string")]
     Empty,
-}
-
-/// 把版本字符串编码为可比较整数 `major * 1000 + minor`。
-///
-/// 移植自 `version.ts:encodeMajorMinor`：
-///   - `"1.20.3"` → 1020
-///   - `"v1.13.13"` → 1013
-///   - `"1.9.0"` → 1009
-///
-/// 容忍前导 `v` 与任意后缀（`-beta` / `+naive` 等）。无法解析返回 [`None`]（对齐 Polaris 的 NaN 语义，
-/// 失败安全：调用方据此跳过比较，而非把 NaN 当成可比较值）。
-#[must_use]
-pub fn encode_major_minor(version: &str) -> Option<u32> {
-    // 对齐 上游 `/^v?(\d+)\.(\d+)/`：前导可选 v，后跟「数字.数字」，忽略之后一切。
-    let s = version.trim();
-    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
-    let mut parts = s.split('.');
-    let major = parts.next()?.parse::<u32>().ok()?;
-    let minor = parts.next()?.parse::<u32>().ok()?;
-    major.checked_mul(1000)?.checked_add(minor)
-}
-
-/// 两版本是否同 `major.minor`（兼容版本带内）。
-///
-/// 移植自 `version.ts:sameMajorMinor`：
-///   - `"1.13.13"` vs `"1.13.14"` → true
-///   - `"1.13.x"` vs `"1.14.x"` → false
-///
-/// 任一无法解析（含 `"未知"`）→ [`None`] → 调用方按失败安全处理（Polaris 原义：内核自动更新跨带硬闸
-/// 宁可不更，绝不误判同带跨 minor 落位）。返回 [`Option`] 而非 Polaris 的 `false`：让调用方显式区分
-/// 「确认不同带」与「无法判定」。
-#[must_use]
-pub fn same_major_minor(a: &str, b: &str) -> Option<bool> {
-    let ea = encode_major_minor(a)?;
-    let eb = encode_major_minor(b)?;
-    Some(ea == eb)
 }
 
 /// 解析出主版本段数组与 prerelease 段数组（build `+...` 直接丢弃，不参与比较）。
@@ -175,18 +131,6 @@ pub fn compare_semver(a: &str, b: &str) -> Result<i32, ParseVersionError> {
         Ordering::Greater => 1,
         Ordering::Less => -1,
     })
-}
-
-/// 「a 是否比 b 新」（= 上游 `UpdateService.isNewerVersion` / `CoreUpdateService.compareVersions` > 0 的薄包装）。
-///
-/// 不可解析（空串等）按 [`ParseVersionError`] 透传，调用方可据此按失败安全处理（Polaris 原实现 `compareSemver`
-/// 对非空串恒返回数值；此处仅对空串报错，其余与 Polaris 完全一致）。
-///
-/// # Errors
-///
-/// 透传 [`compare_semver`] 的错误。
-pub fn is_newer(a: &str, b: &str) -> Result<bool, ParseVersionError> {
-    Ok(compare_semver(a, b)? > 0)
 }
 
 #[cfg(test)]

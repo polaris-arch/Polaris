@@ -28,7 +28,8 @@
 //!
 //! | 平台 | 上游 | 本模块 |
 //! |---|---|---|
-//! | Windows 便携/NSIS | `buildWindowsUpdateVbs`（UTF-16LE+BOM 的 `.vbs`，`wscript` 无窗口跑） | [`build_install_script`] → [`ScriptSpec`] |
+//! | Windows NSIS | `buildWindowsUpdateVbs`（UTF-16LE+BOM 的 `.vbs`，`wscript` 无窗口跑） | [`build_install_script`] → [`ScriptSpec`] |
+//! | Windows 便携 | 上游便携版是单个自解压 exe，脚本把新 exe 拷进原目录 | **本仓便携版是 zip**（`Polaris_<version>_x64-win-Portable.zip`），没有脚本腿：[`InstallPlatform::WindowsPortable`] 由 command 层停核 → 打开压缩包与程序目录 → 退出，用户在应用退出后覆盖解压 |
 //! | macOS | `buildMacUpdateScript`（`hdiutil attach` → `ditto` 暂存 → mv-swap 原子替换 → `xattr -dr`） | 同上 |
 //! | Linux AppImage | `buildLinuxAppImageScript`（覆盖 `$APPIMAGE` + chmod +x） | 同上 |
 //! | Linux deb | `buildLinuxDebScript`（`pkexec apt-get install`） | 同上 |
@@ -61,6 +62,19 @@ pub enum InstallerKind {
     Deb,
     /// Android 安装包。**它不走脚本腿** —— 落地方式是交系统安装器，见 [`InstallPlatform::Android`]。
     Apk,
+    /// Windows 便携版压缩包（`Polaris_<version>_x64-win-Portable.zip`）。**它不走脚本腿**，见
+    /// [`InstallPlatform::WindowsPortable`]。
+    PortableZip,
+}
+
+/// 文件名是否是 Windows 便携版压缩包。
+///
+/// 判据与选包侧 `polaris_updater::github::find_suitable_update_asset` 的 loose 分支逐字同口径
+/// （[`portable_zip_version`](polaris_updater::github::portable_zip_version) 的正式版本名 + 便携后缀，
+/// **大小写敏感**）：选包侧选得出来的名字这里必须认得，别的 zip（内核包、规则包）一律不认。
+#[must_use]
+pub fn is_portable_zip_name(file_name: &str) -> bool {
+    polaris_updater::github::portable_zip_version(file_name).is_some()
 }
 
 /// 由资产文件名判定形态（**纯函数**）。无法识别 → `None`。
@@ -68,6 +82,9 @@ pub enum InstallerKind {
 /// 大小写：`.AppImage` 是官方命名（驼峰），但用户重命名/镜像改名很常见 → 一律按小写比较。
 #[must_use]
 pub fn classify_installer(file_name: &str) -> Option<InstallerKind> {
+    if is_portable_zip_name(file_name) {
+        return Some(InstallerKind::PortableZip);
+    }
     let lower = file_name.to_ascii_lowercase();
     if lower.ends_with(".exe") {
         Some(InstallerKind::WinExe)
@@ -131,10 +148,15 @@ pub fn detect_run_form(
 
 // ── 安装计划 ────────────────────────────────────────────────────────────────
 
-/// 安装路径（平台 × 形态的笛卡儿积收敛后的五种真实执行路径）。
+/// 安装路径（平台 × 形态的笛卡儿积收敛后的六种真实执行路径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallPlatform {
-    /// Windows 便携：把新版本名文件移入原目录 + 删旧版本名。
+    /// Windows 便携（zip）：**不生成脚本**。command 层过退出准备门（停核）之后，用系统处理器
+    /// 打开压缩包与程序目录并退出应用，由用户在应用退出后把压缩包内容覆盖解压进去。
+    ///
+    /// 不做自动解压替换：那需要一段在主程序退出后独立运行、逐项换入并能回滚的脚本，而它替换的是
+    /// 用户自己放置、权限与占用情况都不可预知的目录。手动覆盖的前提只有一条——覆盖时应用与内核
+    /// 都已退出——这条由 command 层的次序保证。
     WindowsPortable,
     /// Windows 安装态：跑 NSIS setup 原位升级。
     WindowsSetup,
@@ -164,10 +186,8 @@ pub struct InstallPlan {
     pub installer_path: PathBuf,
     /// 当前应用可执行文件路径（重启用）。
     pub exe_path: PathBuf,
-    /// Windows 便携：原便携 exe 路径（被覆盖的目标）。
-    pub portable_target: Option<PathBuf>,
-    /// Windows 便携：新版本名文件在原目录的落点（保留 release 的带版本号命名）。
-    pub portable_new_path: Option<PathBuf>,
+    /// Windows 便携：程序所在目录（用户把压缩包内容覆盖解压进去的目标）。
+    pub portable_dir: Option<PathBuf>,
     /// macOS：`.app` 包路径；`None` = 定位不到 → 回退 `open` DMG 手动拖拽。
     pub app_bundle_path: Option<PathBuf>,
     /// Linux AppImage：`$APPIMAGE` 原位路径。
@@ -190,6 +210,25 @@ pub enum InstallReject {
     UnknownAsset { file_name: String },
 }
 
+impl InstallReject {
+    /// 被拒之后是否把安装件交给系统默认处理器打开。
+    ///
+    /// 唯一不交的一格：**便携形态拿到 Windows 安装程序**。系统对 `.exe` 的「打开」就是运行它，
+    /// 结果是在别处装出第二份程序，而用户正在用的这一份原样没动 —— 那正是判成错配要避免的事。
+    /// 其余错配（如 AppImage 运行拿到 `.deb`）交出去只是让系统的包管理器界面接手，由用户决定。
+    ///
+    /// 判据只看资产形态与运行形态，不看平台名：`.exe` 安装程序只在 Windows 上有意义，别的平台
+    /// 的便携形态拿到它，同样没有理由去运行。
+    #[must_use]
+    pub fn hands_to_system(&self) -> bool {
+        !matches!(
+            self,
+            Self::FormMismatch { installer, form: RunForm::Loose, .. }
+                if classify_installer(installer) == Some(InstallerKind::WinExe)
+        )
+    }
+}
+
 /// 从可执行路径推导 `.app` 包路径（**纯函数**，= 上游 `macAppBundleFromExe`）。
 ///
 /// `/Applications/Polaris.app/Contents/MacOS/polaris` → `/Applications/Polaris.app`；不匹配返 `None`。
@@ -206,6 +245,27 @@ pub fn mac_app_bundle_from_exe(exe_path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(bundle))
 }
 
+/// 路径串的父目录（**纯字符串运算**，`\` 与 `/` 都当分隔符）。
+///
+/// 不用 `Path::parent`：它按**宿主**的分隔符切，Unix 宿主上 `C:\Apps\Polaris\polaris.exe` 整串是
+/// 一个文件名，`parent()` 给出空串。本函数与宿主无关，故 Windows 形态的路径在任何宿主上都得到
+/// 同一个答案。盘符根与 Unix 根保留结尾分隔符（`C:\polaris.exe` → `C:\`）；没有目录段返 `None`。
+#[must_use]
+pub fn parent_dir_of(path: &str) -> Option<&str> {
+    let idx = path.rfind(['\\', '/'])?;
+    let head = &path[..idx];
+    if head.is_empty() || head.ends_with(':') {
+        return Some(&path[..=idx]);
+    }
+    Some(head)
+}
+
+/// 路径串的末段文件名（**纯字符串运算**，`\\` 与 `/` 都当分隔符；与 [`parent_dir_of`] 成对）。
+#[must_use]
+pub fn file_name_of(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
 /// 安装计划决策（**纯函数**：全部环境真值由参数注入 → 三平台真值表可在 Linux 上单测）。
 ///
 /// # Errors
@@ -220,10 +280,9 @@ pub fn decide_install_plan(
     appimage_env: Option<&Path>,
     portable_exe: Option<&Path>,
 ) -> Result<InstallPlan, InstallReject> {
-    let file_name = installer_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // 文件名按字符串取（理由同 [`parent_dir_of`]）：`Path::file_name` 在 Unix 宿主上把整条
+    // Windows 路径当成一个文件名，前缀判据会因此失配。
+    let file_name = file_name_of(&installer_path.to_string_lossy()).to_string();
     let Some(kind) = classify_installer(&file_name) else {
         return Err(InstallReject::UnknownAsset { file_name });
     };
@@ -237,31 +296,34 @@ pub fn decide_install_plan(
         platform,
         installer_path: installer_path.to_path_buf(),
         exe_path: exe_path.to_path_buf(),
-        portable_target: None,
-        portable_new_path: None,
+        portable_dir: None,
         app_bundle_path: None,
         appimage_target: None,
     };
 
     match (os, kind) {
         ("windows", InstallerKind::WinExe) => {
-            if run_form == RunForm::Loose {
-                // 便携：新版本名文件落在**原 exe 所在目录**（保留 release 的带版本号命名）。
-                let target = portable_exe
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| exe_path.to_path_buf());
-                let new_path = target
-                    .parent()
-                    .map(|d| d.join(&file_name))
-                    .unwrap_or_else(|| target.clone());
-                Ok(InstallPlan {
-                    portable_target: Some(target),
-                    portable_new_path: Some(new_path),
-                    ..base(InstallPlatform::WindowsPortable)
-                })
-            } else {
-                Ok(base(InstallPlatform::WindowsSetup))
+            // 便携运行形态拿到安装器属错配：跑它会在别处装出第二份程序，而不是更新这一份。
+            if run_form != RunForm::Installed {
+                return Err(mismatch());
             }
+            Ok(base(InstallPlatform::WindowsSetup))
+        }
+        ("windows", InstallerKind::PortableZip) => {
+            // 安装态拿到便携压缩包同样是错配：安装目录不该被手动覆盖。
+            if run_form != RunForm::Loose {
+                return Err(mismatch());
+            }
+            // 程序目录取自便携 exe 路径；推不出来就不猜，按错配回退。
+            let Some(dir) = portable_exe
+                .and_then(|exe| parent_dir_of(&exe.to_string_lossy()).map(PathBuf::from))
+            else {
+                return Err(mismatch());
+            };
+            Ok(InstallPlan {
+                portable_dir: Some(dir),
+                ..base(InstallPlatform::WindowsPortable)
+            })
         }
         ("macos", InstallerKind::Dmg) => Ok(InstallPlan {
             app_bundle_path: mac_app_bundle_from_exe(exe_path),
@@ -313,6 +375,11 @@ pub enum InstallAdvisory {
     ///
     /// 脚本会自动 `xattr -dr com.apple.quarantine` 清除；**万一失败**要告诉用户「右键 → 打开」。
     MacosGatekeeper,
+    /// Windows 便携：没有安装程序，更新要用户自己把压缩包覆盖解压到程序目录。
+    ///
+    /// 告知的内容是「接下来应用会停核并退出，请在它退出之后再覆盖」。它同样必须在停核之前给出：
+    /// 用户不继续即真 no-op，连接不受影响。
+    PortableManualReplace,
 }
 
 /// 该计划是否需要安装前告知用户（**纯函数**）。
@@ -331,9 +398,8 @@ pub fn install_advisory(plan: &InstallPlan) -> Option<InstallAdvisory> {
         // 是该承诺的真值源）。取消 UAC 时安装不会发生，而此时代理已被停掉 —— 与 `DebElevation`
         // 那条注释指出的是同一个坏态，deb 腿靠「先弹告知再停代理」规避。
         // 届时改法是五语文案（新增一条 advisory 或扩写现有 message）+ 跑 ui 门。
-        InstallPlatform::WindowsPortable | InstallPlatform::WindowsSetup => {
-            Some(InstallAdvisory::WindowsSmartScreen)
-        }
+        InstallPlatform::WindowsSetup => Some(InstallAdvisory::WindowsSmartScreen),
+        InstallPlatform::WindowsPortable => Some(InstallAdvisory::PortableManualReplace),
         InstallPlatform::Macos => Some(InstallAdvisory::MacosGatekeeper),
         // AppImage 原位覆盖：无签名校验、无提权，装完直接跑 → 无需额外告知。
         InstallPlatform::LinuxAppImage => None,
@@ -363,6 +429,7 @@ impl InstallAdvisory {
             Self::DebElevation => "debElevation",
             Self::WindowsSmartScreen => "windowsSmartScreen",
             Self::MacosGatekeeper => "macosGatekeeper",
+            Self::PortableManualReplace => "portableManualReplace",
         }
     }
 }
@@ -394,12 +461,6 @@ pub fn vbs_path(s: &str) -> String {
     s.replace('\\', r"\\")
 }
 
-/// VBS 字符串字面量：双引号双写（= 上游 `vbsStr`）。
-#[must_use]
-pub fn vbs_str(s: &str) -> String {
-    s.replace('"', "\"\"")
-}
-
 /// UTF-16LE + BOM 编码（**Windows `.vbs` 必须**）。
 ///
 /// # 为什么非它不可（上游的血泪注释，`UpdateService.ts:354-356`）
@@ -416,44 +477,25 @@ pub fn utf16le_with_bom(s: &str) -> Vec<u8> {
     out
 }
 
-/// 脚本里的用户可见文案（**由 command 层按 locale 注入**；Rust 侧不建 i18n 框架）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallTexts {
-    /// Windows 便携覆盖失败时的 MsgBox 提示。
-    pub portable_manual_replace: String,
-    /// 产品名（MsgBox 标题）。
-    pub product: String,
-}
-
-impl Default for InstallTexts {
-    fn default() -> Self {
-        Self {
-            portable_manual_replace:
-                "Polaris could not replace the portable executable. The new version was downloaded to the path below — please replace it manually:"
-                    .to_string(),
-            product: "Polaris".to_string(),
-        }
-    }
-}
-
 /// 按计划生成安装脚本（**纯函数**：同一 plan 恒得同一字节序列，可快照断言）。
 ///
 /// # 为什么返回 `Option`
 ///
 /// [`InstallPlatform::Android`] 上**没有脚本这个东西**：落地方式是把 APK 交给系统安装器
 /// （`android_bridge::hand_apk_to_system_installer`），一行 shell 都不跑。
+/// [`InstallPlatform::WindowsPortable`] 同样没有：落地方式是用户手动覆盖解压。
 ///
 /// 三种写法里选了 `Option`：`unreachable!()` 会把一个「本该在上游被分流掉」的接线错误变成
 /// 安装路径上的 panic；造一个假的空 `ScriptSpec` 会让调用方 `spawn` 一个空脚本、拿到 rc=0、
 /// 然后如实汇报「安装脚本已起」——一次**静默的**假成功。`None` 是唯一一种让调用方**必须**
 /// 写下「那这里怎么办」的形状。
 #[must_use]
-pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> Option<ScriptSpec> {
+pub fn build_install_script(plan: &InstallPlan) -> Option<ScriptSpec> {
     match plan.platform {
-        // 交系统安装器那条腿在 command 层就早退了，走不到这里。真走到了也不许瞎造一个脚本。
-        InstallPlatform::Android => None,
-        InstallPlatform::WindowsPortable | InstallPlatform::WindowsSetup => {
-            let text = build_windows_vbs(plan, texts);
+        // 这两条腿在 command 层各有各的落地方式，不经脚本。真走到这里也不许瞎造一个脚本。
+        InstallPlatform::Android | InstallPlatform::WindowsPortable => None,
+        InstallPlatform::WindowsSetup => {
+            let text = build_windows_setup_vbs(plan);
             Some(ScriptSpec {
                 file_name: "polaris-update.vbs".to_string(),
                 bytes: utf16le_with_bom(&text),
@@ -482,82 +524,24 @@ pub fn build_install_script(plan: &InstallPlan, texts: &InstallTexts) -> Option<
     }
 }
 
-/// Windows 更新 VBS（移植 `buildWindowsUpdateVbs`）。行分隔符是 `\r\n`（wscript 要求）。
-fn build_windows_vbs(plan: &InstallPlan, texts: &InstallTexts) -> String {
-    let src_raw = plan.installer_path.to_string_lossy().into_owned();
-    let src = vbs_path(&src_raw);
-
-    let Some(old_exe_p) = plan.portable_target.as_ref() else {
-        // NSIS 安装态：跑 setup 原位升级 + 删自身。
-        return [
-            windows_exit_wait(std::process::id()),
-            // 🔴 `/UPDATE`，**不是 上游的 `--updated`**（2026-08-05 修）：`--updated` 是
-            // **electron-builder** 的约定（它的模板里由 `${isUpdated}` 消费），换到 Tauri 后不成立。
-            // Tauri 的 NSIS 模板解析的是 `/UPDATE`（tauri-cli 2.11.4 内嵌模板逐字：
-            // `${GetOptions} $CMDLINE "/UPDATE" $UpdateMode`，安装器与卸载器双侧各一处），
-            // 且 `$UpdateMode` 有真实语义：
-            //   · `${If} $UpdateMode = 1 → Goto reinst_done` —— 跳过「卸载旧版 / 重装」选择页
-            //   · `${If} $UpdateMode <> 1` 才装 WebView2 —— 升级时不重跑 WebView2 安装
-            //   · 卸载器侧三处 `${If} $UpdateMode <> 1` 清理闸 —— 升级时不做整卸清理
-            // `${GetOptions}` 匹配不到只置 error flag、`$UpdateMode` 停在 0 ⇒ 传错 flag 不会报错，
-            // 而是**静默降级成全新安装模式**。
-            format!("WshShell.Run \"\"\"{src}\"\" /UPDATE\", 1, False"),
-            "Set fso = CreateObject(\"Scripting.FileSystemObject\")".to_string(),
-            "fso.DeleteFile WScript.ScriptFullName, True".to_string(),
-        ]
-        .join("\r\n");
-    };
-
-    let old_exe = vbs_path(&old_exe_p.to_string_lossy());
-    let new_exe = vbs_path(
-        &plan
-            .portable_new_path
-            .as_ref()
-            .unwrap_or(old_exe_p)
-            .to_string_lossy(),
-    );
-    let msg = vbs_str(&texts.portable_manual_replace);
-    let product = vbs_str(&texts.product);
-    // MsgBox 展示用**单**反斜杠原路径（双写路径给文件操作「容忍」用，直接展示/粘贴资源管理器不友好）。
-    let src_display = vbs_str(&src_raw);
-
+/// Windows 安装态更新 VBS（移植 `buildWindowsUpdateVbs` 的安装器那一半）：等旧进程退出 → 跑 NSIS
+/// setup 原位升级 → 删自身。行分隔符是 `\r\n`（wscript 要求）。
+fn build_windows_setup_vbs(plan: &InstallPlan) -> String {
+    let src = vbs_path(&plan.installer_path.to_string_lossy());
     [
         windows_exit_wait(std::process::id()),
+        // 🔴 `/UPDATE`，**不是 上游的 `--updated`**（2026-08-05 修）：`--updated` 是
+        // **electron-builder** 的约定（它的模板里由 `${isUpdated}` 消费），换到 Tauri 后不成立。
+        // Tauri 的 NSIS 模板解析的是 `/UPDATE`（tauri-cli 2.11.4 内嵌模板逐字：
+        // `${GetOptions} $CMDLINE "/UPDATE" $UpdateMode`，安装器与卸载器双侧各一处），
+        // 且 `$UpdateMode` 有真实语义：
+        //   · `${If} $UpdateMode = 1 → Goto reinst_done` —— 跳过「卸载旧版 / 重装」选择页
+        //   · `${If} $UpdateMode <> 1` 才装 WebView2 —— 升级时不重跑 WebView2 安装
+        //   · 卸载器侧三处 `${If} $UpdateMode <> 1` 清理闸 —— 升级时不做整卸清理
+        // `${GetOptions}` 匹配不到只置 error flag、`$UpdateMode` 停在 0 ⇒ 传错 flag 不会报错，
+        // 而是**静默降级成全新安装模式**。
+        format!("WshShell.Run \"\"\"{src}\"\" /UPDATE\", 1, False"),
         "Set fso = CreateObject(\"Scripting.FileSystemObject\")".to_string(),
-        format!("src = \"{src}\""),
-        format!("oldExe = \"{old_exe}\""),
-        format!("newExe = \"{new_exe}\""),
-        "On Error Resume Next".to_string(),
-        // 清上次残留 .old（新旧两路径都清）。
-        "If fso.FileExists(newExe & \".old\") Then fso.DeleteFile newExe & \".old\", True"
-            .to_string(),
-        "If fso.FileExists(oldExe & \".old\") Then fso.DeleteFile oldExe & \".old\", True"
-            .to_string(),
-        "Err.Clear".to_string(),
-        // 新版本名文件若已存在（重装同版本/残留被锁）→ rename 挪开腾出原名。
-        "If fso.FileExists(newExe) Then fso.MoveFile newExe, newExe & \".old\"".to_string(),
-        "Err.Clear".to_string(),
-        "fso.CopyFile src, newExe, True".to_string(),
-        "If Err.Number = 0 Then".to_string(),
-        "  Err.Clear".to_string(),
-        // 删旧版本名文件：被 stub 锁 → DeleteFile 失败则 rename 到 .old，下次启动清。
-        "  If LCase(oldExe) <> LCase(newExe) Then".to_string(),
-        "    fso.DeleteFile oldExe, True".to_string(),
-        "    If Err.Number <> 0 Then".to_string(),
-        "      Err.Clear".to_string(),
-        "      fso.MoveFile oldExe, oldExe & \".old\"".to_string(),
-        "    End If".to_string(),
-        "  End If".to_string(),
-        "  Err.Clear".to_string(),
-        "  WshShell.Run \"\"\"\" & newExe & \"\"\"\", 1, False".to_string(),
-        "  fso.DeleteFile src, True".to_string(),
-        "Else".to_string(),
-        // 写新名失败（原目录只读）→ **不静默**：跑临时新版 + 明确提示手动替换。
-        "  Err.Clear".to_string(),
-        "  WshShell.Run \"\"\"\" & src & \"\"\"\", 1, False".to_string(),
-        format!("  MsgBox \"{msg}\" & vbCrLf & \"{src_display}\", 48, \"{product}\""),
-        "End If".to_string(),
-        "On Error Goto 0".to_string(),
         "fso.DeleteFile WScript.ScriptFullName, True".to_string(),
     ]
     .join("\r\n")

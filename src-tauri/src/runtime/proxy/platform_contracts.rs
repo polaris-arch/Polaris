@@ -207,11 +207,6 @@ pub(crate) fn platform_tag() -> &'static str {
     }
 }
 
-/// 解析 sing-box 二进制路径。
-///
-/// 顺序：`POLARIS_SINGBOX_PATH` 环境变量（开发/测试逃生门）→ 可执行文件同级 `resources/<平台>/`
-/// （打包态，fetch-core.mjs 的落地处）→ 仓内 `resources/<平台>/`（开发态）。
-///
 /// 内核平台子目录候选（**必须与 `fetch-core.mjs` 的落地目录逐字一致**：linux / win / mac-arm64 / mac-x64）。
 ///
 /// 抽成纯函数是为了钉住一个真机 bug：此前 macOS 硬编码 "mac"，而 fetch-core 落 "mac-arm64"/"mac-x64"

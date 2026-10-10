@@ -1,9 +1,9 @@
-//! 核二进制解析 owner：随包资源候选布局、开发树 manifest 目录、现役核三级优先级解析、
+//! 核二进制解析 owner：随包资源候选布局、开发树 manifest 目录、现役核解析、
 //! sing-box 官方面板 serve 目录。
 //!
-//! 纯自由函数，零 [`super::ProxyRuntime`] 状态依赖（L0，`proxy` 依赖拓扑的叶）。7 个符号被
-//! `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` / `updater.rs` / `core_paths.rs` /
-//! `geo_seed.rs` / `env_trust.rs` / `commands/misc/dashboard.rs`），façade 必须 `pub(crate) use` 再导出。
+//! 纯自由函数，零 [`super::ProxyRuntime`] 状态依赖（L0，`proxy` 依赖拓扑的叶）。符号被
+//! `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` / `geo_seed.rs` /
+//! `commands/misc/dashboard.rs` / `lib.rs`），façade 必须 `pub(crate) use` 再导出。
 
 use std::path::{Path, PathBuf};
 
@@ -52,11 +52,7 @@ pub(crate) fn bundle_resource_candidates(
 }
 
 /// [`bundle_resource_candidates`] 的**前缀腿**：随包资源目录本身（不含平台子目录与文件名）。
-///
-/// 抽出来是因为它有第二个消费者：`runtime/env_trust` 的可信来源判据要拿这些目录当 containment
-/// 的根。两处各写一份布局的代价是确定的 —— 一边认 `_up_/resources`、另一边漏掉它之后，
-/// 「随包核解析得到」与「随包核被判可信」会在同一台机器上给出相反的答案。
-pub(crate) fn bundle_resource_roots(
+fn bundle_resource_roots(
     exe_dir: Option<&std::path::Path>,
     dev_manifest_dir: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
@@ -127,64 +123,48 @@ pub(crate) fn first_existing_bundle_candidate(candidates: &[PathBuf]) -> Option<
     candidates.iter().find(|path| path.is_file()).cloned()
 }
 
-/// 内核路径的**环境逃生门腿**：[`resolve_core_binary`] 第 1 级与
-/// [`UpdaterRuntime::new`](crate::runtime::updater::UpdaterRuntime::new) 的**唯一**共用实现。
+/// 内核路径的开发态超驰。**只在 debug / test 构型编译**；release 构型里这个函数不存在，
+/// 发行包对进程环境里的任何内核路径变量都不读取。
+#[cfg(any(debug_assertions, test))]
+/// 读 `POLARIS_SINGBOX_PATH`：命中即用，指向不存在的文件即 `Err`（不静默回落）。
 ///
-/// # 为什么必须是一份而不是两份（根因）
-///
-/// 这条腿此前有两份：本函数所在的解析链一份、`updater.rs` 里 `UpdaterRuntime::new` 一份 ——
-/// 后者旁边还写着「完整解析仍归 proxy.rs 单一真值」，而那句话当时并不成立（它自己又读了一次
-/// 同一个环境变量）。两份实现意味着给逃生门加信任级时只改一处就会留下另一条仍能把任意二进制
-/// 喂给 `Command::new(..).arg("version")` 的腿，且那句注释还会让 review 以为已经覆盖全。
-/// 塌成一份之后，「信任级判据」与「稳定错误码」对两个调用方按构造同一。
-///
-/// 两个调用方的差别只剩**怎么处理 `Err`**（开发态逃生门指向不存在的文件）：起核腿把它冒泡成
-/// 失败（不静默回落 PATH），版本探测腿把它当「无探测目标」。这是真实的契约差异，不是重复实现。
-///
-/// 语义（构型分流 / containment 判据 / 稳定错误码）全在
-/// [`crate::runtime::env_trust`]，本函数只负责把名字与信任级绑到一起。
-pub(crate) fn core_binary_env_override() -> Result<Option<PathBuf>, String> {
-    crate::runtime::env_trust::adopt_trusted_env_path(
-        "POLARIS_SINGBOX_PATH",
-        // 名字必须以**字面量**留在 `env::var(` 调用处：`release_escape_hatches` 的探测器①靠这个
-        // 形态清点发行包里的逃生门，提成常量它就读不出名字了。
-        std::env::var("POLARIS_SINGBOX_PATH").ok(),
-        crate::runtime::env_trust::TrustScope::AppDataOrBundle,
-    )
+/// 为什么 release 不保留「路径须落在可信目录内」那一档：应用应当运行与本应用版本配套的
+/// 内核，而「路径在某个目录里」不等于「内容配套」。能让发行包换一个内核文件的入口，只要
+/// 存在，就是绕开配套约束的入口。`tests/release_escape_hatches.rs` 钉着 release 侧零读取。
+fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
+    let Ok(raw) = std::env::var("POLARIS_SINGBOX_PATH") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(raw);
+    if path.is_file() {
+        Ok(Some(path))
+    } else {
+        Err(format!(
+            "POLARIS_SINGBOX_PATH 指向的文件不存在：{}",
+            path.display()
+        ))
+    }
 }
 
-/// 现役核解析（三级优先级）：
-///  1. `POLARIS_SINGBOX_PATH` 环境逃生门（[`core_binary_env_override`]）——**开发态**是原样的
-///     第一优先级（指向不存在的文件即 Err，不静默回落）；**release** 侧路径须过可信来源判据，
-///     不过即记 `ENV_PATH_UNTRUSTED` 并回落第 2/3 级；
-///  2. **可写现役核** `<config_dir>/core_update/sing-box[.exe]`（换核/回滚的落位目标，见
-///     [`crate::runtime::core_paths`]）——存在即用；
-///  3. 随包出厂核（bundle 种子，[`resolve_bundled_core_binary`]）。
+/// 应用侧的内核解析：只认随包核（[`resolve_bundled_core_binary`]）。
 ///
-/// 第 2 级是「可写现役核 + 随包种子」模型的读侧（移植 上游 `ResourceManager.getSingBoxPath`）：
-/// 缺失即回落种子 ⇒ **首启/迁移永不 brick**。核基目录未注入时（单测/子进程）第 2 级恒 miss，
-/// 行为与接线前逐字一致。
+/// debug / test 构型在它之前多一级开发态超驰（见 `dev_core_binary_override`，release 不编译）。
+/// 用户配置目录、`PATH`、配置字段都不参与解析。本函数给出的是路径；那个路径上的文件是否
+/// 仍是出厂内容、经提权助手运行时实际执行的是哪一份，不由本函数保证。
 ///
 /// 找不到 → Err（**不静默回落 PATH**：误起系统里别的 sing-box 比起不来更糟）。
 pub(crate) fn resolve_core_binary() -> Result<PathBuf, String> {
-    if let Some(core) = core_binary_env_override()? {
-        return Ok(core);
-    }
-
-    // 可写现役核优先（换核/回滚/reset-factory 全部落位于此）。
-    if let Some(p) = crate::runtime::core_paths::writable_core_path() {
-        if p.is_file() {
-            return Ok(p);
+    #[cfg(any(debug_assertions, test))]
+    {
+        if let Some(core) = dev_core_binary_override()? {
+            return Ok(core);
         }
     }
-
     resolve_bundled_core_binary()
 }
 
-/// **随包出厂核**（bundle 种子）：绕过环境逃生门与可写核层，只解析打进安装包的资源。
-///
-/// 这是 reset-factory / reseed 的**源**——它们要的恰是「出厂那一份」，而非现役核。
-pub(crate) fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
+/// 随包核：只解析打进安装包的资源目录。
+fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
     let filename = if cfg!(windows) {
         "sing-box.exe"
     } else {
@@ -203,13 +183,38 @@ pub(crate) fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
         return Ok(core);
     }
     Err(format!(
-        "未找到 sing-box 二进制（尝试过：{}）。开发态可设 POLARIS_SINGBOX_PATH，或跑 `node scripts/fetch-core.mjs`。",
+        "未找到 sing-box 二进制（尝试过：{}）。开发态请先跑 `node scripts/fetch-core.mjs`。",
         candidates
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(" | ")
     ))
+}
+
+/// 内核文件是否可执行（Unix：任一可执行位；其它平台没有这个概念，恒 `Ok`）。
+///
+/// 内核直接从安装包里执行，应用不改写安装包内的文件，所以权限位不对时这里只报告、不修复。
+///
+/// # Errors
+///
+/// 读不到文件元数据，或文件没有任何可执行位。
+pub(crate) fn ensure_core_executable(core: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(core)
+            .map_err(|e| format!("读取内核文件属性失败 {}: {e}", core.display()))?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "安装包内的内核文件没有可执行权限，无法启动：{}。请重新安装应用。",
+                core.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = core;
+    Ok(())
 }
 
 /// sing-box 官方面板运行时下载覆盖目录名（`<config_dir>/singbox-dashboard`）。

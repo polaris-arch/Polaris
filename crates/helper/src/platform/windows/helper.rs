@@ -58,7 +58,7 @@ struct ChildState {
 /// - `net`：网络表操作（freeport）。
 /// - `singbox_bin`：安装时锁定的 sing-box 路径（Go `singboxBin`）。
 /// - `conf_dir`：允许的配置目录（Go `confDir`）。
-/// - `service_name` / `support_dir`：自卸载旁路参数（Go `serviceName` / `supportDir`）。
+/// - `support_dir`：受保护核目录；卸载只使用 cleaner 的固定 OS 范围。
 pub struct WinHelper<T, P, N> {
     /// `Arc<Mutex<..>>`：child 状态须在**父死看护后台线程**（W15）与管道命令线程间共享（Go 的
     /// 包级 `mu`/`child` 全局，goroutine 直接引用；Rust 用 Arc 共享所有权）。
@@ -73,7 +73,6 @@ pub struct WinHelper<T, P, N> {
     net: N,
     singbox_bin: String,
     conf_dir: String,
-    service_name: String,
     support_dir: String,
 }
 
@@ -141,12 +140,26 @@ impl FrameReply {
     }
 }
 
-/// `ERR unknown\n`（帧不合法 / 已鉴权但命令解不出，两条腿同一行）。
+/// `ERR unknown\n`：已鉴权但命令解不出。**必须是裸的一行** —— 客户端据此判「这个 helper 不认识
+/// 该命令」，带了尾文就不算。
 fn unknown_line() -> String {
     format!(
         "{}\n",
         Response::Err(polaris_helper_proto::Error::new(
             polaris_helper_proto::ErrorCode::Unknown
+        ))
+        .to_wire_line()
+    )
+}
+
+/// `ERR unknown bad-frame\n`：帧行数不足，连 token 与命令都凑不齐。带尾文，与上面那一行分开：
+/// 这不是「不认识命令」，客户端不得据此判 helper 过旧。
+fn bad_frame_line() -> String {
+    format!(
+        "{}\n",
+        Response::Err(polaris_helper_proto::Error::with_detail(
+            polaris_helper_proto::ErrorCode::Unknown,
+            "bad-frame",
         ))
         .to_wire_line()
     )
@@ -179,7 +192,7 @@ where
         net: N,
         singbox_bin: impl Into<String>,
         conf_dir: impl Into<String>,
-        service_name: impl Into<String>,
+        _service_name: impl Into<String>,
         support_dir: impl Into<String>,
     ) -> Self {
         Self {
@@ -191,7 +204,6 @@ where
             net,
             singbox_bin: singbox_bin.into(),
             conf_dir: conf_dir.into(),
-            service_name: service_name.into(),
             support_dir: support_dir.into(),
         }
     }
@@ -220,7 +232,7 @@ where
     /// `service/win.rs` 的 `handle_connection` 只负责读帧与把 [`FrameReply`] 写出去；顺序判据全在
     /// 这里，好让它在 Linux 上有门可跑。顺序：
     ///
-    /// 1. 帧行数不足（连 token/命令都没有）⇒ `ERR unknown` + [`FlushMode::NoWait`]（对端连身份都没报）。
+    /// 1. 帧行数不足（连 token/命令都没有）⇒ `ERR unknown bad-frame` + [`FlushMode::NoWait`]（对端连身份都没报）。
     /// 2. **先验 token** ⇒ 不合法回 `ERR auth` + `NoWait`，**不看命令**：对已知 / 未知 / 参数解不出的
     ///    命令一律同一行，未鉴权对端探测不出 helper 认识哪些命令。
     /// 3. 已鉴权而命令解不出 ⇒ `ERR unknown` + [`FlushMode::WaitPeer`]：收件人已证明身份，这行必须
@@ -230,7 +242,7 @@ where
     #[must_use]
     pub fn handle_frame(&self, raw: &str) -> FrameReply {
         let Some(frame) = logic::split_frame(raw) else {
-            return FrameReply::no_wait(unknown_line());
+            return FrameReply::no_wait(bad_frame_line());
         };
         if !self.is_authed(frame.token) {
             return FrameReply::from_outcome(HandleOutcome::AuthFailed);
@@ -333,8 +345,13 @@ where
                     ))),
                 }
             }
-            Request::Cleanup => self.handle_cleanup(false),
-            Request::Uninstall => self.handle_cleanup(true),
+            Request::Cleanup => self.handle_cleanup(),
+            Request::Uninstall => {
+                HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+                    polaris_helper_proto::ErrorCode::Other,
+                    "native-cleaner-uac-required; use bundled cleaner UAC fallback",
+                )))
+            }
             Request::Start(_) => {
                 HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
                     polaris_helper_proto::ErrorCode::Start,
@@ -601,20 +618,10 @@ where
         Path::new(&self.support_dir).join("core")
     }
 
-    fn handle_cleanup(&self, uninstall: bool) -> HandleOutcome {
-        if uninstall {
-            if let Err(error) = self.dns_admission.close() {
-                // Optional cache admission stays closed on poison; it must not
-                // prevent native core drain or fabricate an uninstall receipt.
-                log::error!("helper uninstall DNS admission diagnostic: {error}");
-            }
-        }
+    fn handle_cleanup(&self) -> HandleOutcome {
         let Ok(mut state) = self.child_mu.lock() else {
             return native_busy();
         };
-        if uninstall {
-            state.closing = true;
-        }
         if let Some(native) = &state.native {
             let target = native.target;
             if !matches!(
@@ -633,13 +640,7 @@ where
         // Keep ChildState locked through raw legacy cleanup: a new native Start
         // cannot publish between removal and the external-image sweep.
         let _ = self.proc.kill_all_singbox(&self.singbox_bin);
-        if uninstall {
-            self.proc
-                .spawn_self_uninstall(&self.service_name, &self.support_dir);
-            HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling))
-        } else {
-            HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
-        }
+        HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
     }
 
     /// 返回仍存活的受管核 pid；确定已死时原子清除陈旧记账。

@@ -13,7 +13,6 @@ use crate::platform::windows::logic::{
 };
 use crate::platform::windows::ops::NativeChildPoll;
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
-use crate::platform::windows::selfuninstall::self_uninstall_cmd_line;
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -65,10 +64,9 @@ use windows_sys::Win32::System::Registry::{
     REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-    TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-    DETACHED_PROCESS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE, STARTUPINFOW,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 
 /// IPv4 TCP owner PID 行（`winproc.go:259-266` `MIB_TCPROW_OWNER_PID`）。
@@ -788,50 +786,8 @@ impl ProcOps for WinProcOps {
         });
     }
 
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str) {
-        // winproc.go:233-245 spawnSelfUninstall：CreateProcessW(cmd.exe, CmdLine 原样下发,
-        // DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)。旁路须比 helper 活得久（不 assignToJob、继承 SYSTEM token）。
-        let cmd_line = self_uninstall_cmd_line(service_name, support_dir);
-        let cmd_exe = std::env::var_os("ComSpec").unwrap_or_else(|| {
-            let root =
-                std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
-            // clippy useless_conversion：root 已是 OsString，无需再 OsString::from。
-            let mut p = root;
-            p.push("\\System32\\cmd.exe");
-            p
-        });
-        let app_w = wide_null(&cmd_exe);
-        let mut cmd_w = wide_null(OsString::from(cmd_line));
-        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: CreateProcessW(cmd.exe, CmdLine 原样)。DETACHED_PROCESS → 无 console、不随 helper 退出被收。
-        // CREATE_NEW_PROCESS_GROUP → 旁路独立进程组。不 assignToJob → 不受 KILL_ON_JOB_CLOSE 连坐。
-        // 继承 helper 的 SYSTEM token（子进程默认继承父 token）→ 有权 sc delete / 删 ProgramData。
-        // lpApplicationName 用绝对 cmd.exe 路径（不依赖 SYSTEM 服务的 %PATH%）。
-        let ok = unsafe {
-            CreateProcessW(
-                app_w.as_ptr(),
-                cmd_w.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                FALSE,
-                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                std::ptr::null(),
-                std::ptr::null(),
-                &si,
-                &mut pi,
-            )
-        };
-        if ok != 0 {
-            // SAFETY: 关句柄（不 Wait —— 旁路须比 helper 活得久，Go: 不 Wait，winproc.go:244）。
-            unsafe {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-        }
-        // best-effort：失败只记 log（Go: _ = c.Start()）。
-        log::warn!("spawn_self_uninstall completed (ok={ok})");
+    fn spawn_self_uninstall(&self) -> Result<(), String> {
+        Err("native-cleaner-uac-required; use bundled cleaner UAC fallback".to_owned())
     }
 
     fn flush_dns(

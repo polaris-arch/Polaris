@@ -16,13 +16,13 @@ fn parse_asset_digest_accepts_only_wellformed_sha256() {
         parse_asset_digest(&format!("sha256:{hex}")),
         Some(hex.clone())
     );
-    // 大写规范化为小写（便于簿记比对；verify_bytes 本身大小写不敏感）。
+    // 大写规范化为小写（便于簿记比对；verify_hex_digest 本身大小写不敏感）。
     assert_eq!(
         parse_asset_digest(&format!("sha256:{}", "AB".repeat(32))),
         Some("ab".repeat(32))
     );
     // **逃逸用例**：长度不对 / 非 hex / 换算法 / 无前缀 / 空 → 一律 None。
-    // 若被当成 sha256 传给 verify_bytes，会把「拿不到可用摘要」伪装成「校验失败」。
+    // 若被当成 sha256 传给 verify_hex_digest，会把「拿不到可用摘要」伪装成「校验失败」。
     assert_eq!(parse_asset_digest("sha256:abcd"), None);
     assert_eq!(
         parse_asset_digest(&format!("sha256:{}", "z".repeat(64))),
@@ -97,10 +97,9 @@ fn asset_digest_is_optional_and_parses_when_present() {
 // ── 更新源常量 / URL ──────────────────────────────────────────────────────
 
 #[test]
-fn source_repo_constants_are_the_polaris_and_sagernet_repos() {
+fn source_repo_constant_is_the_polaris_repo() {
     // 更新源仓库是全链路的锚：改错 = 检查更新指向错误的 repo（拉不到或拉到别人的 release）。
     assert_eq!(APP_UPDATE_REPO, ("polaris-arch", "Polaris"));
-    assert_eq!(CORE_UPDATE_REPO, ("SagerNet", "sing-box"));
     assert_eq!(
         github_releases_api_url("polaris-arch", "Polaris"),
         "https://api.github.com/repos/polaris-arch/Polaris/releases"
@@ -326,41 +325,6 @@ fn update_asset_linux_loose_picks_appimage_installed_picks_deb() {
             .name
             .ends_with(".AppImage")
     );
-}
-
-// ── 内核资产选择真值表（findSuitableSingboxAsset）─────────────────────────
-
-#[test]
-fn singbox_asset_matches_platform_arch_and_prefers_naive() {
-    let assets = vec![
-        asset("sing-box-1.14.0-linux-amd64.tar.gz", 10),
-        asset("sing-box-1.14.0-linux-amd64-with-naive.tar.gz", 12),
-        asset("sing-box-1.14.0-linux-amd64-legacy.tar.gz", 9),
-        asset("sing-box-1.14.0-darwin-arm64.tar.gz", 10),
-    ];
-    // linux/amd64 + with-naive 优先。
-    let picked =
-        find_suitable_singbox_asset(&assets, AssetPlatform::Linux, AssetArch::X64).unwrap();
-    assert!(picked.name.contains("with-naive"));
-}
-
-#[test]
-fn singbox_asset_non_legacy_then_first_when_no_naive() {
-    let assets = vec![
-        asset("sing-box-1.14.0-windows-amd64-legacy.zip", 9),
-        asset("sing-box-1.14.0-windows-amd64.zip", 10),
-    ];
-    // 无 naive → 非 legacy 优先。
-    let picked =
-        find_suitable_singbox_asset(&assets, AssetPlatform::Windows, AssetArch::X64).unwrap();
-    assert!(!picked.name.contains("legacy"));
-}
-
-#[test]
-fn singbox_asset_none_when_no_platform_match() {
-    let assets = vec![asset("sing-box-1.14.0-darwin-arm64.tar.gz", 10)];
-    // 找 windows/amd64 → 无命中。
-    assert!(find_suitable_singbox_asset(&assets, AssetPlatform::Windows, AssetArch::X64).is_none());
 }
 
 // ── App 检查全链路（check_app_update）─────────────────────────────────────
@@ -836,28 +800,6 @@ fn update_asset_android_picks_the_arm64_apk_and_nothing_else() {
         )
         .is_none(),
         "没有 APK 却选出了东西 —— 那会让下载腿去下一个 .exe/.dmg"
-    );
-}
-
-/// Android 上**没有可换的内核**：核是随 APK 打进去的进程内 `libbox.aar`。
-///
-/// 正面对照在同一条里：桌面三态仍然选得出来 —— 否则「Android 返 None」这句话可能只是因为
-/// `find_suitable_singbox_asset` 整个塌了（那时本条拿一个坏掉的判据冒充一条成立的结论）。
-#[test]
-fn singbox_asset_is_always_none_on_android_even_when_the_release_has_one() {
-    // SagerNet 确实发 android 构建；本仓一个字节都不消费它（消费了就是去替换一个不存在的文件）。
-    let assets = vec![
-        asset("sing-box-1.14.0-android-arm64.tar.gz", 10),
-        asset("sing-box-1.14.0-linux-arm64.tar.gz", 11),
-    ];
-    assert!(
-        find_suitable_singbox_asset(&assets, AssetPlatform::Android, AssetArch::Arm64).is_none(),
-        "Android 选出了内核资产 —— 那条腿的落点是一个可替换的可执行文件，这个形态下不存在"
-    );
-    // 正面对照：同一份资产集在 Linux 上选得出来。
-    assert!(
-        find_suitable_singbox_asset(&assets, AssetPlatform::Linux, AssetArch::Arm64).is_some(),
-        "对照塌了：这份样本本该能选出 linux/arm64 内核"
     );
 }
 

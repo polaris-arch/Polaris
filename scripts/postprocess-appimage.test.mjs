@@ -376,6 +376,8 @@ test('Linux payload CLI rejects same-size substituted core bytes in a previously
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));
   }
   cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
+  // verify-packaging.mjs 静态 import `./lib/` 下的判据模块；只拷入口不拷它们，CLI 在模块解析期就退出。
+  cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify({ coreArchiveSha256: { linux: 'fixture' } }));
   writeFileSync(join(root, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'Polaris' }));
   const args = [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'linux', '--root', bundle];

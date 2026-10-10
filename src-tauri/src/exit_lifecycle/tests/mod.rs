@@ -353,10 +353,10 @@ fn updater_must_prepare_before_detached_spawn_with_no_running_shortcut() {
         .unwrap();
     let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
     let spawn = body
-        .find("update_install::spawn_detached_script(&dir, &spec)")
+        .find("update_install::spawn_detached_script(&dir, spec)")
         .unwrap();
     let commit = body.find("commit_desktop_exit(").unwrap();
     assert!(android < prepare && prepare < spawn && spawn < commit);
     assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
-    assert!(body[prepare..spawn].contains("return Ok(ApiResponse::err("));
+    assert!(body[prepare..spawn].contains("return Ok(ApiResponse::err_with_code("));
 }

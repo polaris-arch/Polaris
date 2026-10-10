@@ -431,106 +431,14 @@ export function subscriptionAutoUpdateStatus(config: {
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * #16 CoreVersionBanner 状态机
- * ──────────────────────────────────────────────────────────────────────────── */
-
-/** `core_get_version_info` 返回体里本横幅关心的子集。 */
-export interface CoreVersionInfoLike {
-  hasBackup: boolean;
-  pendingChangeNotice?: { previousVersion: string; currentVersion: string } | null;
-}
-
-/** `EVENT_CORE_VERSION_CHANGED` 事件载荷（当前全仓零发射点，见下方 shouldAck 注释）。 */
-export interface CoreVersionChangedPayload {
-  previousVersion: string;
-  currentVersion: string;
-  hasBackup: boolean;
-}
-
-export interface CoreBannerNotice {
-  previousVersion: string;
-  currentVersion: string;
-  hasBackup: boolean;
-}
-
-export interface CoreBannerState {
-  /** 横幅是否渲染。 */
-  visible: boolean;
-  /** 横幅正文所需的版本号；不可见时为 null。 */
-  notice: CoreBannerNotice | null;
-  /**
-   * 是否渲染「回滚」按钮。对齐 上游：仅 `hasBackup` 为真才渲染。
-   *
-   * 后端 `core_get_version_info` 现读**真实** `.bak` 状态（换核链路已接线，备份由任何一次换核产生），
-   * 故本字段不再恒 false。
-   */
-  showRollback: boolean;
-  /**
-   * 「手动换核」按钮是否禁用。
-   *
-   * `core_replace_manual` **已接线**（零提权，落位于 `<config_dir>/core_update/`）⇒ 恒 `false`。
-   * 保留该字段是为了让「按钮可用性」仍由这一个纯函数单点决定（而非散落在组件里），
-   * 将来若出现新的禁用条件（如换核进行中）在此收口。
-   */
-  manualReplaceDisabled: boolean;
-  /**
-   * 是否应调 `core_update_ack_version_change` 清持久通知（show→ack，弹一次而非每启）。
-   * 与 `dismissed` 无关：ack 的是后端持久态，用户是否关掉横幅不影响。
-   */
-  shouldAck: boolean;
-  /** 正文文案 key 后缀：有备份 changedDesc / 无备份 noBackupDesc（对齐 上游）。 */
-  descKey: 'changedDesc' | 'noBackupDesc';
-}
-
-/**
- * 横幅状态机。事件载荷优先于挂载快照（事件是「刚发生」的即时推送，快照是持久通知）。
- *
- * `manualReplaceDisabled`（换核已接线 → 恒 false）与 `showRollback`（由 `hasBackup` 决定）都是对
- * 后端真实能力的如实反映，不是可配置项，故不接受入参覆写。
- */
-export function coreBannerState(input: {
-  versionInfo?: CoreVersionInfoLike | null;
-  eventPayload?: CoreVersionChangedPayload | null;
-  dismissed: boolean;
-}): CoreBannerState {
-  const { versionInfo, eventPayload, dismissed } = input;
-
-  let notice: CoreBannerNotice | null = null;
-  if (eventPayload) {
-    notice = {
-      previousVersion: eventPayload.previousVersion,
-      currentVersion: eventPayload.currentVersion,
-      hasBackup: eventPayload.hasBackup,
-    };
-  } else if (versionInfo?.pendingChangeNotice) {
-    notice = {
-      previousVersion: versionInfo.pendingChangeNotice.previousVersion,
-      currentVersion: versionInfo.pendingChangeNotice.currentVersion,
-      hasBackup: versionInfo.hasBackup,
-    };
-  }
-
-  const visible = notice !== null && !dismissed;
-  return {
-    visible,
-    notice: visible ? notice : null,
-    showRollback: visible && notice!.hasBackup,
-    manualReplaceDisabled: false,
-    shouldAck: notice !== null,
-    descKey: notice?.hasBackup ? 'changedDesc' : 'noBackupDesc',
-  };
-}
-
-/* ────────────────────────────────────────────────────────────────────────────
- * #17 每会话一次去重闸门
+ * 每会话一次去重闸门
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /**
  * 「每会话一次」闸门工厂：首次调用返 true（放行），此后恒 false。
  *
  * 抽成工厂而非直接写模块级 `let`，是为了让去重语义可被单测直接锁死（模块级变量跨用例污染，
- * 且第二次调用返 false 这条正是最容易在重构中丢掉的行为）。消费方在模块顶层建单例即等价于
- * 上游的 `let coreBaselineWarnedThisSession = false`。
+ * 且第二次调用返 false 这条正是最容易在重构中丢掉的行为）。消费方在模块顶层建单例。
  */
 export function createOnceGate(): () => boolean {
   let fired = false;
@@ -542,44 +450,7 @@ export function createOnceGate(): () => boolean {
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
- * 便携版更新：「已下载，待手动替换」不是「更新失败」
- * ──────────────────────────────────────────────────────────────────────────── */
 
-/**
- * 便携版更新包的文件名口径 —— 与产出侧**逐字同口径**：
- * `crates/updater/src/github.rs::PORTABLE_ZIP_SUFFIX`（`scripts/verify-packaging.mjs`
- * 的 `updaterPortableCandidates` 也是同一份字面量）。三处任一改名，都要一起改。
- */
-
-/**
- * 已下载的更新包是否是 **Windows 便携版 zip**（⇒ 后端结构性装不了它，只能交系统 + 用户手动替换）。
- *
- * # 为什么 UI 必须把它与「形态错配」分开呈现
- *
- * 便携用户走的是**正确**路径，不是出错路径：`find_suitable_update_asset` 的 loose 分支只选
- * `Polaris_<版本>_x64-win-Portable.zip`（无回落，宁可不更新也不发安装器）。该 zip 走到
- * `runtime/update_install.rs::classify_installer` 时不被识别（只认 `.exe/.dmg/.appimage/.deb`）
- * ⇒ `InstallReject::UnknownAsset` ⇒ command 层 `shell.open` 交系统，返
- * `{ ok:false, reason:"form-mismatch" }`。
- *
- * `ok:false` 对调用方是**准确**的（确实一次安装都没执行，不改它）；但 UI 若把这条原样渲染成
- * error 态的「更新失败」，用户读到的是一次失败 —— 事实是**包已经下好了，只差手动解压覆盖**。
- * 两者的下一步动作完全不同（重试 vs 去解压），故必须分流。
- *
- * # 判据为什么是「前缀 + 后缀」而不是只看 `.zip`
- *
- * 只看 `.zip` 会把将来任何别的 zip 资产也说成便携版。收紧到产出侧口径后，判据失配的
- * **失败方向是回落到通用的形态错配文案** —— 保守、且不会对用户编一个不成立的场景。
- *
- * 路径分隔符 `/` `\` 都切：落点由后端拼（Windows 上是 `\`），而本函数跑在同一个 UI 里。
- */
-export function isPortableZipUpdate(downloadedPath: string | null | undefined): boolean {
-  if (!downloadedPath) return false;
-  const base = downloadedPath.split(/[\\/]/).pop() ?? '';
-  return /^Polaris_\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?_x64-win-Portable\.zip$/.test(base);
-}
-
-/* ────────────────────────────────────────────────────────────────────────────
  * 更新包的摘要校验状态：「这版有没有摘要」与「这次下载校没校」是**两件事**
  * ──────────────────────────────────────────────────────────────────────────── */
 
@@ -624,6 +495,29 @@ export function releaseShipsDigest(
 
 /** 一次 `update_download` 回包的摘要校验结果。`unknown` ≠ `unverified`，成因见下。 */
 export type AppDownloadIntegrity = 'verified' | 'unverified' | 'unknown';
+
+/**
+ * 安装调用失败时取哪一句（按后端信封里的错误码）。
+ *
+ * `installRestartRequired`（= Rust `INSTALL_RESTART_REQUIRED`）：安装前的退出准备一开始，起核准入
+ * 就在本次运行内永久关上了；此后任何一步失败，应用还开着却再也起不了代理，用户只能重启应用。
+ * 其余失败发生在那之前（更新包不见了等），仍是原来那句。
+ */
+/**
+ * 形态错配时取哪一句：交给系统打开了，与没有打开（系统打不开，或便携版拿到的是安装程序、
+ * 后端不交），是两件事，不能都说成「已交由系统处理」。
+ */
+export function formMismatchKey(handedToSystem: boolean | undefined): string {
+  return handedToSystem
+    ? 'settings.update.formMismatch'
+    : 'settings.update.formMismatchNotOpened';
+}
+
+export function installFailureKey(code: string | undefined): string {
+  return code === 'installRestartRequired'
+    ? 'settings.update.installRestartRequired'
+    : 'settings.update.downloadInterrupted';
+}
 
 /**
  * 从 `updateApi.download()` 的回包读出摘要校验**结果**（下载之后才存在的事实）。
@@ -706,9 +600,6 @@ export function progressResetsIntegrity(status: UpdateProgress['status']): boole
  * 前端按码取键。桌面更新卡与移动端更新页是同一批码的两个消费点 —— 各写一份的下场是措辞与
  * 兜底规则各自漂，而漂了**不会红**（两侧都只是「显示了一句话」）。
  *
- * `HTTP_BACKEND_UNAVAILABLE` 那一条是历史信封码（`CODE_HTTP_UNAVAILABLE`），与 U1 码表里的
- * `backendUnavailable` 是同一件事的两个名字，在这里归一。
- *
  * 取不到对应文案时回落 `settings.update.downloadInterrupted`：i18next 在缺键时把**键本身**
  * 原样返回，直接显示出来就是一串开发者信息（元规则 #5）。判据是 `t(key) !== key`。
  *
@@ -720,9 +611,15 @@ export function appUpdateErrText(
   _detail: string | null | undefined,
   t: (k: string) => string,
 ): string {
-  const code = rawCode === 'HTTP_BACKEND_UNAVAILABLE' ? 'backendUnavailable' : rawCode;
-  const body = code ? t(`settings.update.err.${code}`) : '';
-  return body && body !== `settings.update.err.${code}`
+  // Clearing a local reminder is not a download/progress wire error.
+  if (rawCode === 'portableReminderClearFailed') {
+    const body = t('settings.update.portableReminderClearFailed');
+    return body && body !== 'settings.update.portableReminderClearFailed'
+      ? body
+      : t('settings.update.downloadInterrupted');
+  }
+  const body = rawCode ? t(`settings.update.err.${rawCode}`) : '';
+  return body && body !== `settings.update.err.${rawCode}`
     ? body
     : t('settings.update.downloadInterrupted');
 }

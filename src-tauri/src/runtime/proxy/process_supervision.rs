@@ -30,13 +30,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use polaris_core_supervisor::{scan_running_cores, stale_pids, Signal};
+use polaris_core_supervisor::{scan_running_cores, stale_cores, CoreProcess, Signal, StaleCores};
 use tokio::process::Child;
+
+use polaris_helper_proto::Platform;
 
 use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
 use crate::runtime::win_console::no_console_window;
 
-use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
 
@@ -969,6 +970,8 @@ impl ProxyRuntime {
     /// 「读不到实跑 exe」判 [`Unobservable`](crate::runtime::core_promote::CoreBinaryAttestation::Unobservable)：只落 warn，
     /// **绝不写成「自证通过」**（没观测到 ≠ 观测到没问题）。
     ///
+    /// 版本首行只作运行期诊断，经助手起核也不因版本字符串停核；清单身份与内容校验另守起核准入。
+    ///
     /// [`CoreBinaryAttestation::VersionUnreadable`]: crate::runtime::core_promote::CoreBinaryAttestation::VersionUnreadable
     pub(super) fn spawn_running_core_binary_attestation(
         self: &Arc<Self>,
@@ -988,17 +991,15 @@ impl ProxyRuntime {
         });
     }
 
-    async fn attest_running_core_binary(&self, pid: u32, expected: &Path, my_gen: u64) {
-        use crate::runtime::core_promote::{attest_core_binary, CoreBinaryAttestation};
+    async fn attest_running_core_binary(self: &Arc<Self>, pid: u32, expected: &Path, my_gen: u64) {
+        use crate::runtime::core_promote::attest_core_binary;
 
         let expected = expected.to_path_buf();
+        let via_helper = self.core_via_helper.load(Ordering::SeqCst);
         // D2：Windows 上 `running_exe_path` 恒 None（Medium IL app 读不了 SYSTEM child），自证因此
         // 恒判「未能进行」。helper 在权限边界另一侧、且持着受管核的句柄，它 status 回传的 `image=`
         // 就是同一个事实。只在**经 helper 起核**时取这条腿：直起腿本地就读得到，不必多一次 IPC。
-        let helper = self
-            .core_via_helper
-            .load(Ordering::SeqCst)
-            .then(|| Arc::clone(&self.helper));
+        let helper = via_helper.then(|| Arc::clone(&self.helper));
         // 观测腿全是阻塞 syscall / 子进程 / 同步 IPC → spawn_blocking。
         let attestation = tokio::task::spawn_blocking(move || {
             let running = running_exe_path(pid)
@@ -1031,15 +1032,14 @@ impl ProxyRuntime {
             );
             return;
         }
-        if attestation.is_alarm() {
-            // 非终态：核确在跑，只是版本不对 → 保留 running/pid/端口，只落错误两轴 + 广播事件。
-            self.set_nonfatal_error(&attestation.user_message(), code::CORE_BINARY_MISMATCH);
-            return;
-        }
-        match attestation {
+        match attestation_disposition(&attestation) {
+            // 非终态：核确在跑，只是版本对不上或读不出 → 保留 running/pid/端口，只落错误两轴 + 广播事件。
+            AttestationDisposition::Alarm => {
+                self.set_nonfatal_error(&attestation.user_message(), code::CORE_BINARY_MISMATCH);
+            }
             // 「没观测到」既不是通过也不是错误：只留痕，绝不说「通过」。
-            CoreBinaryAttestation::Unobservable => log::warn!("{}", attestation.user_message()),
-            _ => log::info!("{}", attestation.user_message()),
+            AttestationDisposition::Unobserved => log::warn!("{}", attestation.user_message()),
+            AttestationDisposition::Pass => log::info!("{}", attestation.user_message()),
         }
     }
 
@@ -1299,11 +1299,21 @@ impl ProxyRuntime {
     /// **起核前**的 stale-core 清扫：杀掉遗留的**本 app** 孤儿核。跑在**每一次** `start()` 上
     /// （不是只在 app 启动期一次；孤儿也来自本会话中途失败的起核，见 `stale_sweep_disabled` 字段文档）。
     ///
-    /// **安全第一性**（本任务核心）：只杀 cmdline 精确匹配 `resolve_core_binary()` 路径 + `run` 的进程
-    /// （core-supervisor [`stale_pids`]），并排除 [`sweep_exclusions`](Self::sweep_exclusions) 给出的
-    /// 「不是孤儿」的那些 pid（当前受管主核 + 在飞测速临时核 + 在飞 Tailscale 登录核）。
-    /// **绝不 `pkill sing-box`**——用户机器上
-    /// 可能装有无关的 sing-box。解析不到核二进制 / 非 Linux（扫描返空）→ 静默跳过（fail-closed，不误杀）。
+    /// **安全第一性**：只杀命令行形如 `<…/核文件名> run -c <本 app 配置目录>/<x>.json`、且属主是
+    /// 本用户或 root / SYSTEM 的进程（core-supervisor [`stale_cores`]，判据与理由见
+    /// `polaris_core_supervisor::stale_core` 模块文档），并排除
+    /// [`sweep_exclusions`](Self::sweep_exclusions) 给出的「不是孤儿」的那些 pid
+    /// （当前受管主核 + 在飞测速临时核 + 在飞 Tailscale 登录核）。**绝不 `pkill sing-box`**——用户
+    /// 机器上可能装有无关的 sing-box。形状相同但属主是别人的进程不是本 app 的：只留一行日志，
+    /// 不结束、不升级、不阻断起核（[`sweep_scanned_cores`](Self::sweep_scanned_cores)）。
+    ///
+    /// 判据**不看核二进制住在哪**：安装位置跨会话不稳定（AppImage 挂载点、macOS 转移运行时、
+    /// 升级换目录），而配置目录稳定。于是上一会话在另一个路径上留下的孤儿、上一版模型留在用户
+    /// 目录里的孤儿、提权助手起的那一份，都认得出来。扫描返空的平台（移动端）→ 无事可做。
+    ///
+    /// Windows 上主程序直起的核另有作业对象兜着（主程序一消失内核就结束它们，见
+    /// `polaris_core_supervisor::job_object`），本清扫收的是那之外的：起核与纳入作业之间的窗口、
+    /// 没能纳入作业的那几次，以及读得到命令行的提权助手遗留核。
     pub(super) async fn cleanup_stale_cores(&self) -> Result<(), StartError> {
         // 实跑计数：置于所有早退腿之前 —— 计的是「清扫这条腿被走到几次」，而非「杀掉几个孤儿」。
         self.stale_sweep_runs.fetch_add(1, Ordering::SeqCst);
@@ -1325,47 +1335,90 @@ impl ProxyRuntime {
                 .require_idle()
                 .map_err(|error| StartError::coded(error, error_code));
         }
-        let binary = match resolve_core_binary() {
-            Ok(b) => b,
-            Err(e) => {
-                log::debug!("stale 清扫：未解析到核二进制（{e}）→ 跳过");
-                return Ok(());
-            }
-        };
-        // **不 canonicalize**：spawner 用 `resolve_core_binary()` 的**字面**路径起核（`Command::new`），
-        // /proc 里的 argv[0] 即那个字面路径；两次会话同一 resolve 逻辑 → 字面一致即可匹配。规范化反而会
-        // 与含 symlink/`..` 的字面 argv[0] 失配、漏杀自己的孤儿（与 上游 pgrep 用字面 singboxPath 同源）。
         let candidates = scan_running_cores();
         // 排除表（受管主核 + 两种在飞瞬态核）**必须读在扫描之后**，顺序契约见 `sweep_exclusions`。
-        let victims = stale_pids(&candidates, &binary, &self.sweep_exclusions());
+        let exclude = self.sweep_exclusions();
+        self.sweep_scanned_cores(candidates, &exclude, &NativeStaleCoreIo)
+            .await
+    }
+
+    /// [`cleanup_stale_cores`](Self::cleanup_stale_cores) 扫描之后的全部动作：按形状与属主选出清扫
+    /// 对象 → 结束 → 复核 → 杀不动的升级到提权清扫。
+    ///
+    /// 扫描结果与对进程动手的两个原语（[`StaleCoreIo`]）都由调用方给，所以整条判定链 ——
+    /// 包括「别的用户的同形进程不阻断起核」—— 可以用构造的候选验，不起进程、不发信号。
+    /// 返回成功只表示已确认属主的清扫对象已处理；归属未知者单列留痕，不是全局无孤儿证明。
+    pub(super) async fn sweep_scanned_cores(
+        &self,
+        candidates: Vec<CoreProcess>,
+        exclude: &[u32],
+        io: &dyn StaleCoreIo,
+    ) -> Result<(), StartError> {
+        let config_dir = self.config.dir();
+        let core_filename = crate::runtime::core_paths::core_filename();
+        // 命令行读不准的内核进程判不了归属：不清它，但必须留痕，否则「清扫失效」与「没有孤儿」
+        // 在日志里长得一样。
+        let unreadable = polaris_core_supervisor::unreadable_core_rows(&candidates, core_filename);
+        if unreadable > 0 {
+            log::warn!(
+                "stale 清扫：有 {unreadable} 个内核进程的命令行含无法还原的字节（非 UTF-8 或被 \
+                 进程表转义），无法判定是否属于本应用，未清理；若随后起核报端口或 TUN 被占用，\
+                 多半是它们"
+            );
+        }
+        let StaleCores {
+            sweep: victims,
+            foreign,
+            unknown,
+        } = stale_cores(&candidates, core_filename, config_dir, exclude);
+        // 其余候选到此用完。Windows 上每个候选都留着一把进程句柄，不带着它们过下面的等待。
+        drop(candidates);
+        if !foreign.is_empty() {
+            log::warn!(
+                "stale 清扫：{} 个进程的命令行与本应用的内核同形（运行着 {} 下的配置），但属主不是\
+                 当前用户也不是 root / SYSTEM：{foreign:?}。它们不是本应用起的，\
+                 未清理，起核继续",
+                foreign.len(),
+                config_dir.display()
+            );
+        }
+        if !unknown.is_empty() {
+            log::warn!(
+                "stale 清扫：{} 个同形进程的属主无法确认：{unknown:?}。未清理，归属仍未决，\
+                 不将它们记为其他用户或已清扫；保留既有起核行为",
+                unknown.len()
+            );
+        }
         if victims.is_empty() {
             return Ok(());
         }
+        let pids = |cores: &[CoreProcess]| cores.iter().map(|core| core.pid).collect::<Vec<_>>();
+        let victim_pids = pids(&victims);
         log::warn!(
-            "发现 {} 个上次遗留的孤儿核（本 app 二进制 {}），清理：{victims:?}",
+            "发现 {} 个上次遗留的孤儿核（运行着 {} 下的配置），清理：{victim_pids:?}",
             victims.len(),
-            binary.display()
+            config_dir.display()
         );
         // SIGTERM → 宽限 → SIGKILL 存活者（对齐 上游 killOrphanedProcessesLinux）。
-        for pid in &victims {
-            send_signal(*pid, Signal::Sigterm);
+        for victim in &victims {
+            io.end(victim, Signal::Sigterm);
         }
         tokio::time::sleep(STALE_KILL_GRACE).await;
-        for pid in &victims {
-            if pid_alive(*pid) {
-                log::warn!("孤儿核 pid={pid} 宽限期未退 → SIGKILL");
-                send_signal(*pid, Signal::Sigkill);
+        for victim in &victims {
+            if io.alive(victim) {
+                log::warn!("孤儿核 pid={} 宽限期未退 → SIGKILL", victim.pid);
+                io.end(victim, Signal::Sigkill);
             }
         }
-        // **T3 二次确认**：SIGKILL 后仍存活 = 用户态根本杀不动（`send_signal` 对 root 进程收 EPERM 且
-        // 被 `let _ =` 吞掉，**杀失败与杀成功在调用处无从区分**）。故只能靠再探一次活来判定。
+        // **T3 二次确认**：SIGKILL 后仍存活 = 用户态根本杀不动（结束 root / SYSTEM 的进程被系统
+        // 拒绝，而结束原语不回报成败）。故只能靠再探一次活来判定。
         tokio::time::sleep(STALE_KILL_GRACE).await;
-        let survivors: Vec<u32> = victims.iter().copied().filter(|p| pid_alive(*p)).collect();
+        let survivors: Vec<CoreProcess> = victims.into_iter().filter(|v| io.alive(v)).collect();
         if survivors.is_empty() {
-            log::info!("孤儿核清理完成：{victims:?}");
+            log::info!("孤儿核清理完成：{victim_pids:?}");
             return Ok(());
         }
-        self.escalate_root_orphans(&survivors).await
+        self.escalate_root_orphans(&survivors, io).await
     }
 
     /// A cold host has no running configuration to adopt. Preserve the NE session
@@ -1426,9 +1479,9 @@ impl ProxyRuntime {
     ///
     /// # 为什么这两种瞬态核都必须在这里
     ///
-    /// 临时核的 argv 是 `<resolve_core_binary()> run -c <临时配置> --disable-color`
-    /// （`SpawnRequest::argv` + `speedtest.rs` 的 `extra_args`）—— 与主核**同一个**二进制路径 + `run`
-    /// token ⇒ [`is_our_core`](polaris_core_supervisor::is_our_core) 必然命中：它在候选集里长得跟
+    /// 临时核的 argv 是 `<resolve_core_binary()> run -c <配置目录>/<临时配置> --disable-color`
+    /// （`SpawnRequest::argv` + `speedtest.rs` 的 `extra_args`）—— 与主核同形：核文件名 + `run -c` +
+    /// 本 app 配置目录下的一份 `.json` ⇒ [`is_our_core`](polaris_core_supervisor::is_our_core) 必然命中：它在候选集里长得跟
     /// 「上次会话遗留的孤儿」一模一样，而清扫这条腿跑在**每一次** `start()` 上（不是只在 app 启动期，
     /// 见 `lifecycle.rs` 的调用点）。于是「测速到一半点连接 / 开 TUN」这条用户日常操作序列必然撞上：
     ///
@@ -1439,7 +1492,7 @@ impl ProxyRuntime {
     ///
     /// **Tailscale 瞬态登录核是同一个缺陷的姊妹腿**（`tailscale_login_core.rs` 的模块文档早就把它
     /// 登记在案、当时以「需要 mesh↔proxy 反向耦合」为由未修）：它同样走
-    /// [`resolve_core_binary`] + `SpawnRequest`，argv 逐字同形。用户序列是「点了 Tailscale 登录、
+    /// [`resolve_core_binary`](super::core_binary::resolve_core_binary) + `SpawnRequest`，argv 逐字同形。用户序列是「点了 Tailscale 登录、
     /// 正等着扫码，顺手去开 TUN」⇒ 登录核被掐死、登录 URL 作废，前端只看到「登录没反应」。
     /// 耦合方向本来就是现成的：`self.mesh` 已在手，`MeshRuntime` 已持有 `LoginCoreRegistry`，
     /// 缺的只是注册表里的 pid 字段（本批补上）。
@@ -1487,9 +1540,14 @@ impl ProxyRuntime {
     /// 活着的 root 孤儿一直独占 `<userData>/cache.db`，此时起任何新核都会
     /// `initialize cache-file: timeout`，**连切回 systemProxy 模式也起不来**——继续放行只会让用户撞上
     /// 一串无从归因的启动失败。报 [`code::ROOT_ORPHAN_BLOCKED`] 才指得出真正的动作。
-    async fn escalate_root_orphans(&self, survivors: &[u32]) -> Result<(), StartError> {
+    async fn escalate_root_orphans(
+        &self,
+        orphans: &[CoreProcess],
+        io: &dyn StaleCoreIo,
+    ) -> Result<(), StartError> {
+        let survivors: Vec<u32> = orphans.iter().map(|orphan| orphan.pid).collect();
         log::warn!(
-            "{} 个孤儿核用户态杀不动（root 所有，EPERM）：{survivors:?} → 尝试经 helper 提权清扫",
+            "{} 个孤儿核用户态杀不动（root / SYSTEM 所有）：{survivors:?} → 尝试经 helper 提权清扫",
             survivors.len()
         );
         // helper 未装 → 无提权腿，直接落终态（不假装尝试过）。
@@ -1507,10 +1565,10 @@ impl ProxyRuntime {
             {
                 Ok(Ok(())) => {
                     tokio::time::sleep(STALE_KILL_GRACE).await;
-                    let still: Vec<u32> = survivors
+                    let still: Vec<u32> = orphans
                         .iter()
-                        .copied()
-                        .filter(|p| pid_alive(*p))
+                        .filter(|orphan| io.alive(orphan))
+                        .map(|orphan| orphan.pid)
                         .collect();
                     if still.is_empty() {
                         log::info!("经 helper 提权清扫已清掉 root 孤儿核：{survivors:?}");
@@ -1528,15 +1586,106 @@ impl ProxyRuntime {
         let msg = format!(
             "上次遗留的 sing-box 核（pid {survivors:?}）以管理员权限运行且无法清理，\
              它占用着内核缓存文件，任何模式都无法启动。请安装/修复 Helper 后重试，\
-             或手动执行：sudo kill -9 {}",
-            survivors
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
+             或{}",
+            manual_orphan_kill_hint(self.helper.platform(), &survivors)
         );
         self.set_error(&msg, code::ROOT_ORPHAN_BLOCKED);
         Err(StartError::coded(msg, code::ROOT_ORPHAN_BLOCKED))
+    }
+}
+
+/// 内核自证的结论怎么处置（纯函数的结果）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AttestationDisposition {
+    /// 实跑的就是期望的那一份（同一文件，或版本相同）。
+    Pass,
+    /// 没观测到：只留痕。
+    Unobserved,
+    /// 核照常运行，落非终态告警。
+    Alarm,
+}
+
+/// 自证结论 → 运行期诊断（纯函数）。
+///
+/// 安装设计稿末尾裁定第 6 条：版本首行与清单的一致性由发布门保证，运行期只作诊断。
+/// 它不能替代受保护内容校验或清单身份比对，也不能单凭字符串差异中止正在运行的代理。
+pub(super) fn attestation_disposition(
+    attestation: &crate::runtime::core_promote::CoreBinaryAttestation,
+) -> AttestationDisposition {
+    use crate::runtime::core_promote::CoreBinaryAttestation as Attestation;
+    match attestation {
+        _ if attestation.is_alarm() => AttestationDisposition::Alarm,
+        Attestation::Unobservable => AttestationDisposition::Unobserved,
+        _ => AttestationDisposition::Pass,
+    }
+}
+
+/// 清不掉的提权孤儿核：给用户的手动收拾办法（按平台，纯函数）。
+///
+/// Windows 上没有 `sudo` 也没有 `kill`：要在管理员终端里用系统自带的 `taskkill`，每个 pid 各带
+/// 一个 `/PID`。
+pub(super) fn manual_orphan_kill_hint(platform: Platform, pids: &[u32]) -> String {
+    let join = |prefix: &str| {
+        pids.iter()
+            .map(|pid| format!("{prefix}{pid}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match platform {
+        Platform::Win => {
+            format!(
+                "在「以管理员身份运行」的终端里执行：taskkill /F {}",
+                join("/PID ")
+            )
+        }
+        // 移动端与未知平台没有可扫的核进程，走不到这里；写进 Unix 一侧只为穷举。
+        Platform::Linux | Platform::Mac | Platform::Android | Platform::Ios | Platform::Other => {
+            format!("手动执行：sudo kill -9 {}", join(""))
+        }
+    }
+}
+
+/// 清扫对一个候选进程做的两件事。生产实现每个平台一份（[`NativeStaleCoreIo`]）；单测换成记录桩，
+/// 不起进程、不发信号。
+pub(super) trait StaleCoreIo: Send + Sync {
+    /// 请它结束。不回报成败：结束不了的（root / SYSTEM 的进程）由随后的 [`alive`](Self::alive) 看出来。
+    fn end(&self, process: &CoreProcess, signal: Signal);
+    /// 它是否还在。
+    fn alive(&self, process: &CoreProcess) -> bool;
+}
+
+pub(super) struct NativeStaleCoreIo;
+
+/// Unix：按 pid 发信号、按 pid 探活。
+#[cfg(unix)]
+impl StaleCoreIo for NativeStaleCoreIo {
+    fn end(&self, process: &CoreProcess, signal: Signal) {
+        send_signal(process.pid, signal);
+    }
+
+    fn alive(&self, process: &CoreProcess) -> bool {
+        pid_alive(process.pid)
+    }
+}
+
+/// Windows：没有信号，两级都是「结束这一个进程」，认的是扫描时留住的那把句柄而不是 pid。
+///
+/// 此前是 `taskkill /PID <n> /F /T`，三处都不对：按号码结束，宽限期里 pid 被复用就杀到别的进程；
+/// `/T` 连带结束它的整棵子进程树；`taskkill` 不带路径，系统先在本程序所在目录里找它。现在结束
+/// 之前复核创建时间（`ProcessHold::terminate`），只结束这一个，不起任何外部程序。
+///
+/// 候选没带句柄（不是扫描出来的）时不结束它，探活退回按 pid。
+#[cfg(windows)]
+impl StaleCoreIo for NativeStaleCoreIo {
+    fn end(&self, process: &CoreProcess, _signal: Signal) {
+        let _ = process.hold.terminate();
+    }
+
+    fn alive(&self, process: &CoreProcess) -> bool {
+        process
+            .hold
+            .is_running()
+            .unwrap_or_else(|| pid_alive(process.pid))
     }
 }
 
@@ -1612,8 +1761,7 @@ fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
 /// [`running_exe_path`] 的 macOS 实现：`ps -p <pid> -o comm=`（无 `/proc`）。
 #[cfg(target_os = "macos")]
 fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
+    let out = polaris_core_supervisor::macos_ps::command(&["-p", &pid.to_string(), "-o", "comm="])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1672,19 +1820,6 @@ pub(crate) fn send_signal(pid: u32, sig: Signal) {
     if let Some(p) = checked_pid(pid) {
         let _ = kill(p, nix_sig);
     }
-}
-
-/// windows 无 POSIX 信号：两级均退化为 `taskkill /F /T`（对齐 上游 Windows 停核路径）。
-/// **未在本机验证**（本批真机验证限 Linux）。
-#[cfg(windows)]
-pub(crate) fn send_signal(pid: u32, _sig: Signal) {
-    let _ = no_console_window(std::process::Command::new("taskkill").args([
-        "/PID",
-        &pid.to_string(),
-        "/F",
-        "/T",
-    ]))
-    .output();
 }
 
 /// `u32` pid → `nix::Pid`，**只放行真实单进程 pid**（`1..=i32::MAX`），否则 `None`。
@@ -1771,10 +1906,10 @@ fn process_identity_impl(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn process_identity_impl(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
-        .ok()?;
+    let out =
+        polaris_core_supervisor::macos_ps::command(&["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
     if !out.status.success() {
         return None;
     }

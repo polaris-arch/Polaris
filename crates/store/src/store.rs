@@ -380,7 +380,6 @@ pub fn default_config() -> Value {
         "appRulesSeeded": true,
         "appRoutingEnabled": false,
         "appUpdateChannel": "stable",
-        "coreUpdateChannel": "stable",
         "ruleResourceAutoUpdate": true,
         "ruleResourceUpdateIntervalHours": 12,
         "fakeIpFilter": true,

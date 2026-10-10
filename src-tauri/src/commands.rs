@@ -12,7 +12,7 @@
 //! - `mesh`：mesh 节点（tailscale + warp 状态）
 //! - [`unlock`]：解锁检测（unlock:run/get）
 //! - [`speedtest`]：测速（server:speedTest）
-//! - [`updater`]：App / 内核更新（update:* / core-update:*）
+//! - [`updater`]：App 更新与内核信息（update:* / core_get_version_info）
 //! - [`window`]：窗口控制（window:minimize/maximizeToggle/close + app 排序）
 //! - [`misc`]：杂项（logs/version/shell/backup/diagnostic/autostart/ipinfo/singbox-dashboard）
 //!

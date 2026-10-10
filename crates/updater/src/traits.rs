@@ -1,16 +1,8 @@
-//! 下载/FS trait 抽象（移植纪律：测试 mock，不在本 crate 触碰宿主网络/FS）。
+//! 下载错误类型 + FS trait 抽象（不在本 crate 触碰宿主网络/FS）。
 //!
-//! Polaris 的网络获取（`CoreDownloader.downloadFile` / `UpdateService.downloadFile`）和文件操作
-//! （`CoreUpdateService.installCoreFromDir` / `backupCurrentCore` / `restoreBackup`）都直接耦合
-//! Electron `net.request` / Node `fs`，无法在纯逻辑层单测。本 crate 把它们抽象为两个 trait：
-//!
-//! - [`UpdateDownloader`]：`download(url) -> bytes`（+ 失败/镜像/超时细节由实现封装）。
-//!   生产实现（不在本 crate）注入真实 HTTP；测试注入 `MemoryDownload`（测试替身）内存 map。
-//! - [`UpdateFs`]：staged 暂存目录 + 目标目录的文件读写 + 原子 rename。
-//!   生产实现注入真实 std::fs；测试注入 `MockFs`（测试替身，in-memory 或 tempfile）。
-//!
-//! 关键：trait 返回 [`Result`] 而非 panic，让 staged 周期能把下载/FS 失败转成 [`StagedUpdateError`](crate::staged::StagedUpdateError)
-//! 走 Error 态重试，对齐 Polaris handleError → error 态重试循环。
+//! - [`DownloadError`]：下载失败的统一形状。下载本身由宿主实现
+//!   （`src-tauri/src/runtime/http.rs` 的 `CoreDownloader`），本 crate 只定义错误类型。
+//! - [`UpdateFs`]：下载目录的文件读写 + 原子 rename。生产实现包 std::fs；测试注入 `MockFs`。
 
 use std::path::{Path, PathBuf};
 
@@ -31,134 +23,9 @@ pub enum DownloadError {
     /// 网络/IO 错误（= Polaris request 'error' / response 'error'）。
     #[error("download io error: {0}")]
     Io(#[from] std::io::Error),
-    /// **下载后端根本未接线**（见 [`UnavailableDownloader`]；生产已注入 `CoreDownloader`，本变体
-    /// 现只在纯逻辑层测试与 trait 契约上出现）。
-    ///
-    /// 与其余变体的语义区别是**关键**的：其余变体表示「试过了、失败了」（网络抖动/限流/校验不过 →
-    /// 可重试）；本变体表示「压根没试，因为没有后端」（重试无意义，必须先接 HTTP 栈）。
-    /// 宿主层据此映射结构化错误码 `HTTP_BACKEND_UNAVAILABLE`，让 UI 能区分
-    /// 「功能未接线」与「下载失败」——**绝不可折叠进 [`DownloadError::Other`]**，
-    /// 那会让「未接线」伪装成一次普通的失败重试，正是 §N4「绿灯空功能」的形态。
-    #[error("download backend unavailable: {0}")]
-    BackendUnavailable(String),
     /// 其它（如 mirror 全部失败、URL 非法）。
     #[error("download error: {0}")]
     Other(String),
-}
-
-/// 下载 trait：把 URL 解析为字节序列（移植自 `CoreDownloader.downloadFile` / `UpdateService.downloadFile`）。
-///
-/// 实现负责：
-///   - HTTP GET + 重定向跟随 + User-Agent（上游 `APP_USER_AGENT`）
-///   - Content-Length 完整性校验（上游 `parseExpectedBytes`）
-///   - 停滞看门狗（上游 `createIdleTimeout`，30s 无数据 abort）
-///   - GitHub 镜像回退（上游 `ghMirrorUrl`，失败自动换镜像重试一次）
-///
-/// 本 trait 只暴露 `download` 一个方法，让纯逻辑层不关心上述细节；实现可注入真实 HTTP 客户端或测试 mock。
-pub trait UpdateDownloader {
-    /// 下载 `url` 指向的全部字节。失败返回 [`DownloadError`]（由调用方转 [`StagedUpdateError`](crate::staged::StagedUpdateError)）。
-    ///
-    /// 返回 `Vec<u8>` 而非写文件：让 staged 周期在校验前把字节留在内存（SHA256 校验纯函数化），
-    /// 校验通过再交 [`UpdateFs`] 落盘，避免「下完即写盘、校验失败再删残件」的来回（Polaris 原实现写 temp
-    /// 文件再 unlink，本 crate 简化为内存流转）。
-    fn download(&self, url: &str) -> Result<Vec<u8>, DownloadError>;
-}
-
-/// 内存下载器（测试 mock）：URL → 字节的静态 map。
-///
-/// 不触碰网络。查不到 key 返回 [`DownloadError::Other`]。用于 staged 周期单测注入。
-#[cfg(test)]
-#[derive(Debug, Default, Clone)]
-pub struct MemoryDownload {
-    entries: std::collections::HashMap<String, Vec<u8>>,
-}
-
-#[cfg(test)]
-impl MemoryDownload {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 插入一条 URL → 字节映射。
-    #[must_use]
-    pub fn with(mut self, url: impl Into<String>, bytes: Vec<u8>) -> Self {
-        self.entries.insert(url.into(), bytes);
-        self
-    }
-
-    /// 插入映射（可变引用版，便于批量构建）。
-    pub fn insert(&mut self, url: impl Into<String>, bytes: Vec<u8>) {
-        self.entries.insert(url.into(), bytes);
-    }
-}
-
-#[cfg(test)]
-impl UpdateDownloader for MemoryDownload {
-    fn download(&self, url: &str) -> Result<Vec<u8>, DownloadError> {
-        self.entries
-            .get(url)
-            .cloned()
-            .ok_or_else(|| DownloadError::Other(format!("mock: no entry for {url}")))
-    }
-}
-
-/// **永远失败**的下载器 —— 标记「本仓尚无 HTTP/TLS 后端」这一事实，而非一个「HTTP 下载器」。
-///
-/// # 为什么改名（原 `HttpDownload`，2026-07-16）
-///
-/// 原类型名为 `HttpDownload`、文档写「真实 HTTP 下载器的薄占位实现」，但 `download()` **无条件返回错误**。
-/// 这是 §K7.1 点名的「组合面无门」的教科书形态，且比 `spawner.rs` 的 argv bug 更隐蔽：
-///
-/// - 名字读起来像一个可用的 HTTP 客户端 → 宿主层 `HttpDownload::new()` 装上，编译过、类型对；
-/// - 全部单测注入 `MemoryDownload`（测试替身） → **mock 全绿**；
-/// - **生产路径第一次真下载必失败**，且失败信息是泛化的 `Other(...)`，与「网络抖动」难以区分
-///   → 上层大概率当成可重试的网络错误，无限重试一个永不成功的调用。
-///
-/// 「有测试」与「测到了生产路径」是两件事。改名 + 专用错误变体让这个事实在**每个调用点**都刺眼，
-/// 而不是藏在一句文档注释里。
-///
-/// # 本仓为什么没有 HTTP 后端（实证，2026-07-16）
-///
-/// # HTTP 栈已落地 —— 本类型不再是生产路径（2026-07-29 订正）
-///
-/// 本段原记「整个 workspace 不存在任何 TLS 栈」（`cargo tree -i reqwest` 空、`rustls` 未引、
-/// 唯一的 `hyper 1` 来自 `polaris-singbox-grpc` 且是明文 h2c，够不到 `https://api.github.com`），
-/// 那是**依赖决策待用户拍板期间**的状态，**已过时**：宿主已引
-/// `reqwest 0.13`（`rustls-no-provider` + `socks`）+ `rustls 0.23`（`ring` provider），
-/// 生产实现是 `src-tauri/src/runtime/http.rs` 的 `CoreDownloader`（15s 超时 / OOM 闸 / 限流分类 /
-/// 镜像回退 / 完整性校验 / idle 看门狗俱全，带端到端单测），并已在注入点取代本类型。
-///
-/// 故 [`DownloadError::BackendUnavailable`] 在**生产不可达**；本类型保留的价值只剩两条：
-/// ① 纯逻辑层单测的零 I/O 替身；② 让「没有后端」在类型层面仍与「试过了、失败了」可区分——
-/// 这条语义边界不能因为当前有后端就折叠掉（见下方 `impl` 注与
-/// `unavailable_downloader_reports_backend_unavailable_not_generic_failure`）。
-///
-/// 注意 **Rust 侧只实现一次**：上游的 `core-downloader.ts` 与 `UpdateService.ts` 各写了一份
-/// 约 170 行的同构编排，两文件注释互指重复，勿把两份一起搬。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UnavailableDownloader;
-
-impl UnavailableDownloader {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-
-    /// 结构化错误码：宿主层把它原样放进 `ApiResponse.code`，供 UI 区分
-    /// 「功能未接线」（本码）与「下载失败」（其余）。
-    pub const CODE: &'static str = "HTTP_BACKEND_UNAVAILABLE";
-}
-
-impl UpdateDownloader for UnavailableDownloader {
-    fn download(&self, _url: &str) -> Result<Vec<u8>, DownloadError> {
-        // 专用变体（非 Other）：调用方**必须**能把「没有后端」与「下载失败」分开处理。
-        Err(DownloadError::BackendUnavailable(
-            "未注入真实下载后端（占位 UnavailableDownloader）；\
-             生产装配应注入 src-tauri runtime::http::CoreDownloader"
-                .into(),
-        ))
-    }
 }
 
 /// FS trait：staged 暂存 + 目标落位 + 原子 rename（移植自 `CoreUpdateService.installCoreFromDir`
@@ -220,7 +87,7 @@ pub trait UpdateFs {
     /// 原子 rename：`from` → `to`（同目录 rename 为原子 syscall，覆盖 `to`）。
     /// = 上游 `fs.renameSync(tmp, dest)`（staged-rename 落位的最后一步）。
     ///
-    /// 失败时调用方（[`atomic_replace`](crate::verify::atomic_replace)）负责删 `from` 残件。
+    /// 失败时调用方（[`promote_staged`](crate::verify::promote_staged)）负责删 `from` 残件。
     fn rename(&self, from: &Path, to: &Path) -> Result<(), std::io::Error>;
 
     /// 删除文件（不存在则 no-op，对齐 上游 `if (fs.existsSync(p)) fs.unlinkSync(p)`）。= 上游 `fs.unlinkSync`。

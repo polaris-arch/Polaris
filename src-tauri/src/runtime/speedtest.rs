@@ -645,7 +645,7 @@ const TEMP_CORE_READY_POLL_MS: u64 = 200;
 /// 只在「发新活之前 / 每节点测完」两处查是不够的：窗口里的节点**全部不可达**时（真机上就是订阅里
 /// 有 ≥16 个死节点），那两处一个都醒不过来 —— supersede 信号出现后临时核（及其**已建立的 WG/WARP
 /// 会话**）还要活满一整个测量超时。Linux/macOS 靠主核 `start()` 入口的 stale sweep 顺带杀掉——那是
-/// **副作用缓解、不是设计保证**；Windows 无 sweep（`scan_running_cores` 恒返空）⇒ 全程重叠。
+/// **副作用缓解、不是设计保证**（在飞的临时核在清扫的排除表里，本就不该指望它被杀）。
 /// 故按本间隔独立轮询（`timeout(poll, join_next())`，**不依赖任何测量返回**），命中即中止并收回在飞任务（`JoinSet::shutdown`）+
 /// 立即返回（调用方紧接着 `terminate()`）。
 const TEMP_CORE_SUPERSEDE_POLL_MS: u64 = 200;
@@ -683,9 +683,8 @@ const TEMP_CORE_LAST_CONFIG_NAME: &str = "speedtest-core.last.json";
 /// 临时核 child 由本模块的会话 future 独占持有，`TokioLoginCoreChild` 的 Drop 守卫只覆盖「future 被
 /// 丢弃 / panic 展开」。**应用退出**走的是 `RunEvent::ExitRequested → run_exit_cleanup → 进程退出`，
 /// 在飞的 tokio task **根本不会被 drop** ⇒ 临时核不随父进程死，留下一个持续持有 N 个回环端口 +
-/// WG/WARP peer 会话的孤儿 sing-box。而兜底 sweep 只在**下次** `start()` 才跑，且 Windows 的
-/// `scan_running_cores` 恒返空（`core-supervisor/src/stale_core.rs`：`tasklist` 不输出命令行，无从
-/// 施加「只杀本 app 起的核」判据）⇒ **Windows 孤儿永不被清**。
+/// WG/WARP peer 会话的孤儿 sing-box。而兜底 sweep 只在**下次** `start()` 才跑。Windows 上另有
+/// 作业对象：主程序一消失，内核就结束它直起的全部核（`polaris_core_supervisor::job_object`）。
 ///
 /// PC shutdown requests its retained birth and waits for native close. Android keeps its
 /// existing shutdown path; PID snapshots alone supply no cleanup receipt on either platform.

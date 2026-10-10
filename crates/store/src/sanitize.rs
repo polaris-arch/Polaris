@@ -135,9 +135,15 @@ fn sanitize_value_in_place(value: &mut Value) {
     string_or_remove(obj, "speedTestUrl", false, false);
     // subscriptionProxyPolicy：三态，非法值删除（回落 follow）
     policy_or_remove(obj, "subscriptionProxyPolicy");
-    // coreUpdateChannel：二态，非法值删除（回落 stable = 只看正式版，与改动前行为一致）
-    update_channel_or_remove(obj, "coreUpdateChannel");
-    // appUpdateChannel：与内核通道同一值域；缺省 stable，存量用户行为不变。
+    // 已退役的内核更新设置：应用内不再更新内核，旧配置里留下的键一律删掉，不随配置继续流转。
+    for key in [
+        "autoUpdateCore",
+        "coreUpdateChannel",
+        "restrictCoreUpdateToCompatibleMinor",
+    ] {
+        obj.remove(key);
+    }
+    // appUpdateChannel：二态（stable / prerelease），非法值删除；缺省 stable。
     update_channel_or_remove(obj, "appUpdateChannel");
     // 测速并发：`"auto"` 或 4 到本平台上限的整数，其余删除（回落自动）。上限随平台不同，
     // 所以一份在桌面设为 48 的配置拿到手机上会被清成自动。

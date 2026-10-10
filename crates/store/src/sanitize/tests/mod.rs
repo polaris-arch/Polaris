@@ -112,17 +112,31 @@ fn bool_field_bad_removed() {
 }
 
 #[test]
-fn update_channels_share_the_stable_prerelease_value_domain() {
-    let valid =
-        sanitize_config(r#"{"appUpdateChannel":"prerelease","coreUpdateChannel":"stable"}"#)
-            .unwrap();
+fn app_update_channel_accepts_only_stable_or_prerelease() {
+    let valid = sanitize_config(r#"{"appUpdateChannel":"prerelease"}"#).unwrap();
     assert_eq!(valid["appUpdateChannel"], "prerelease");
-    assert_eq!(valid["coreUpdateChannel"], "stable");
 
-    let invalid =
-        sanitize_config(r#"{"appUpdateChannel":"nightly","coreUpdateChannel":true}"#).unwrap();
+    let invalid = sanitize_config(r#"{"appUpdateChannel":"nightly"}"#).unwrap();
     assert!(invalid.get("appUpdateChannel").is_none());
-    assert!(invalid.get("coreUpdateChannel").is_none());
+}
+
+/// 旧配置里的内核更新设置无论取值是否合法都被删掉；相邻的应用更新通道不受牵连。
+#[test]
+fn retired_core_update_settings_are_dropped() {
+    let v = sanitize_config(
+        r#"{"autoUpdateCore":true,"coreUpdateChannel":"stable",
+            "restrictCoreUpdateToCompatibleMinor":false,"appUpdateChannel":"stable"}"#,
+    )
+    .unwrap();
+    let obj = v.as_object().unwrap();
+    for key in [
+        "autoUpdateCore",
+        "coreUpdateChannel",
+        "restrictCoreUpdateToCompatibleMinor",
+    ] {
+        assert!(!obj.contains_key(key), "{key} 应被删除");
+    }
+    assert_eq!(obj["appUpdateChannel"], "stable");
 }
 
 #[test]

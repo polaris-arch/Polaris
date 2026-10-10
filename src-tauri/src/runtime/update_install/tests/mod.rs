@@ -7,10 +7,11 @@ fn p(s: &str) -> PathBuf {
 /// 「这个 plan 必须真的产出脚本」的测试侧断言口。
 ///
 /// **不写 `.unwrap()`**：`build_install_script` 返 `None` 只可能来自 [`InstallPlatform::Android`]
-/// （交系统安装器，本来就没有脚本）。下面这批用例喂的全是脚本腿，拿到 `None` 说明分派被改坏了，
+/// （交系统安装器）与 [`InstallPlatform::WindowsPortable`]（用户手动覆盖），两者本来就没有脚本。
+/// 下面这批用例喂的全是脚本腿，拿到 `None` 说明分派被改坏了，
 /// 而 `called Option::unwrap() on a None value` 一个字都说不出来 —— 报错要点名是哪个平台掉了。
-fn script_of(plan: &InstallPlan, texts: &InstallTexts) -> ScriptSpec {
-    build_install_script(plan, texts)
+fn script_of(plan: &InstallPlan) -> ScriptSpec {
+    build_install_script(plan)
         .unwrap_or_else(|| panic!("{:?} 应当有脚本腿，却拿到 None", plan.platform))
 }
 
@@ -89,43 +90,215 @@ fn mac_app_bundle_from_exe_matches_only_real_bundle_layout() {
 
 // ── 安装计划真值表（含跨形态错配逃逸用例）──
 
+/// Windows 形态的样本路径一律用**反斜杠**：计划决策对路径只做字符串运算（[`parent_dir_of`] /
+/// [`file_name_of`]），故同一批断言在 Linux、macOS、Windows 宿主上给出同一个答案。
+const WIN_PORTABLE_EXE: &str = "D:\\Tools\\Polaris\\polaris.exe";
+const WIN_PORTABLE_ZIP: &str =
+    "C:\\Users\\u\\AppData\\Local\\Polaris\\updates\\Polaris_1.2.3_x64-win-Portable.zip";
+const WIN_SETUP_EXE: &str =
+    "C:\\Users\\u\\AppData\\Local\\Polaris\\updates\\polaris-1.2.3-win-setup.exe";
+
+fn dir_text(plan: &InstallPlan) -> Option<String> {
+    plan.portable_dir
+        .as_ref()
+        .map(|d| d.to_string_lossy().into_owned())
+}
+
 #[test]
-fn plan_windows_portable_vs_setup() {
-    // ⚠️ 本测试跑在 Linux gate 上，而 `Path::parent` 的分隔符语义是**编译目标平台**的
-    // （Linux 上 `C:\App\x.exe` 是单个组件，parent 为空）。故这里用 `/` 分隔——Windows API
-    // 同样接受正斜杠，且这样断言的是「新包落在原 exe 同目录」这条真正的业务规则，
-    // 而不是宿主平台的分隔符解析。反斜杠路径的真实拆分属真机门（§8.3）。
+fn path_string_helpers_do_not_depend_on_the_host_separator() {
+    for (path, parent, name) in [
+        (WIN_PORTABLE_EXE, Some("D:\\Tools\\Polaris"), "polaris.exe"),
+        (
+            "D:/Tools/Polaris/polaris.exe",
+            Some("D:/Tools/Polaris"),
+            "polaris.exe",
+        ),
+        // 盘符根：保留结尾分隔符（`D:` 单独拿去打开是「D 盘的当前目录」，不是根）。
+        ("D:\\polaris.exe", Some("D:\\"), "polaris.exe"),
+        (
+            "\\\\nas\\share\\Polaris\\polaris.exe",
+            Some("\\\\nas\\share\\Polaris"),
+            "polaris.exe",
+        ),
+        ("/opt/polaris/polaris", Some("/opt/polaris"), "polaris"),
+        ("/polaris", Some("/"), "polaris"),
+        // 没有目录段：不猜。
+        ("polaris.exe", None, "polaris.exe"),
+        ("", None, ""),
+    ] {
+        assert_eq!(parent_dir_of(path), parent, "parent_dir_of({path:?})");
+        assert_eq!(file_name_of(path), name, "file_name_of({path:?})");
+    }
+}
+
+#[test]
+fn portable_zip_is_recognised_by_the_packaging_name_only() {
+    assert_eq!(
+        classify_installer("Polaris_1.2.3_x64-win-Portable.zip"),
+        Some(InstallerKind::PortableZip)
+    );
+    assert_eq!(
+        classify_installer("Polaris_0.9.0-beta.1_x64-win-Portable.zip"),
+        Some(InstallerKind::PortableZip)
+    );
+    // 与选包侧同口径（正式版本名 + 便携后缀，大小写敏感）：别的 zip 一律不认，不许被当成便携包去「覆盖解压」。
+    for other in [
+        "polaris-portable.zip",
+        "polaris-portable-1.2.3.zip",
+        "Polaris_1.2.3_x64-win-portable.zip",
+        "Polaris_1.2.3_arm64-win-Portable.zip",
+        "Polaris_invalid_x64-win-Portable.zip",
+        "Polaris-Portable-1.2.3.zip",
+        "polaris-portable-1.2.3.7z",
+        "Polaris_1.2.3_x64-win-Portable.zip.sha256",
+        "sing-box-1.12.0-windows-amd64.zip",
+        "geosite.zip",
+    ] {
+        assert_eq!(classify_installer(other), None, "{other}");
+    }
+    // 名字里带 portable 的 exe 仍是 exe（不是便携压缩包）。
+    assert_eq!(
+        classify_installer("polaris-portable-1.2.3.exe"),
+        Some(InstallerKind::WinExe)
+    );
+}
+
+/// 选包侧真实发布资产必须走停核/退出准备后的手动覆盖计划，而不是 UnknownAsset 交系统。
+#[test]
+fn published_portable_asset_routes_from_selection_to_manual_handoff() {
+    use polaris_updater::{find_suitable_update_asset, AssetArch, AssetPlatform, GithubAsset};
+    for name in [
+        "Polaris_1.2.3_x64-win-Portable.zip",
+        "Polaris_1.2.3-beta.1_x64-win-Portable.zip",
+    ] {
+        let assets = [GithubAsset {
+            name: name.into(),
+            browser_download_url: String::new(),
+            size: 0,
+            digest: None,
+        }];
+        let selected =
+            find_suitable_update_asset(&assets, AssetPlatform::Windows, AssetArch::X64, true)
+                .expect("正式便携发布资产必须能被选中");
+        assert_eq!(
+            polaris_updater::github::portable_zip_version(&selected.name),
+            Some(if name.contains("beta") {
+                "1.2.3-beta.1"
+            } else {
+                "1.2.3"
+            }),
+            "交接记录的目标版本必须来自同一正式发布命名合同",
+        );
+        let exe = Path::new(WIN_PORTABLE_EXE);
+        let archive = PathBuf::from(format!("C:\\Temp\\{}", selected.name));
+        let plan = decide_install_plan("windows", RunForm::Loose, &archive, exe, None, Some(exe))
+            .expect("选中的正式便携资产不得落入 UnknownAsset");
+        assert_eq!(plan.platform, InstallPlatform::WindowsPortable);
+        assert_eq!(plan.portable_dir, Some(p("D:\\Tools\\Polaris")));
+        assert_eq!(
+            install_advisory(&plan),
+            Some(InstallAdvisory::PortableManualReplace)
+        );
+        assert!(build_install_script(&plan).is_none());
+    }
+}
+
+#[test]
+fn plan_windows_portable_zip_is_a_manual_replace_into_the_program_dir() {
+    let exe = Path::new(WIN_PORTABLE_EXE);
     let plan = decide_install_plan(
         "windows",
         RunForm::Loose,
-        Path::new("C:/Temp/Polaris-1.2-win-portable.exe"),
-        Path::new("C:/App/Polaris-1.1-win-portable.exe"),
+        Path::new(WIN_PORTABLE_ZIP),
+        exe,
         None,
-        Some(Path::new("C:/App/Polaris-1.1-win-portable.exe")),
+        Some(exe),
     )
-    .unwrap();
+    .expect("便携运行形态 + 便携压缩包必须有计划");
     assert_eq!(plan.platform, InstallPlatform::WindowsPortable);
+    // 覆盖目标是**程序所在目录**（不是空串、不是整条 exe 路径）。
+    assert_eq!(dir_text(&plan).as_deref(), Some("D:\\Tools\\Polaris"));
+    assert_eq!(plan.installer_path, p(WIN_PORTABLE_ZIP));
+    // 这条腿没有脚本，且必须先告知。
+    assert!(build_install_script(&plan).is_none());
     assert_eq!(
-        plan.portable_target,
-        Some(p("C:/App/Polaris-1.1-win-portable.exe"))
-    );
-    // 新版本名文件落在**原目录**，保留 release 的带版本号命名。
-    assert_eq!(
-        plan.portable_new_path,
-        Some(p("C:/App/Polaris-1.2-win-portable.exe"))
+        install_advisory(&plan),
+        Some(InstallAdvisory::PortableManualReplace)
     );
 
+    // 正斜杠写法同一结论。
+    let exe = Path::new("D:/Tools/Polaris/polaris.exe");
+    let plan = decide_install_plan(
+        "windows",
+        RunForm::Loose,
+        Path::new("C:/Temp/Polaris_1.2.3_x64-win-Portable.zip"),
+        exe,
+        None,
+        Some(exe),
+    )
+    .unwrap();
+    assert_eq!(dir_text(&plan).as_deref(), Some("D:/Tools/Polaris"));
+}
+
+#[test]
+fn plan_windows_setup_is_for_the_installed_form_only() {
     let plan = decide_install_plan(
         "windows",
         RunForm::Installed,
-        Path::new("C:/Temp/Polaris-1.2-win-setup.exe"),
-        Path::new("C:/Program Files/Polaris/polaris.exe"),
+        Path::new(WIN_SETUP_EXE),
+        Path::new("C:\\Users\\u\\AppData\\Local\\Polaris\\polaris.exe"),
         None,
         None,
     )
     .unwrap();
     assert_eq!(plan.platform, InstallPlatform::WindowsSetup);
-    assert!(plan.portable_target.is_none());
+    assert!(plan.portable_dir.is_none());
+    assert!(build_install_script(&plan).is_some());
+}
+
+/// Windows 两种形态与两种资产的四格里，只有对角线两格有计划。
+///
+/// 另外两格都是错配：便携运行拿到安装器（跑它会在别处装出第二份程序），安装态拿到便携压缩包
+/// （安装目录不该被手动覆盖）。便携形态下推不出程序目录时同样不猜。
+#[test]
+fn plan_windows_rejects_the_off_diagonal_form_and_asset_pairs() {
+    let exe = Path::new(WIN_PORTABLE_EXE);
+    for (form, asset, portable) in [
+        (RunForm::Loose, WIN_SETUP_EXE, Some(exe)),
+        (RunForm::Installed, WIN_PORTABLE_ZIP, None),
+        // 形态与证据自相矛盾 / 没有目录段：推不出覆盖目标。
+        (RunForm::Loose, WIN_PORTABLE_ZIP, None),
+        (
+            RunForm::Loose,
+            WIN_PORTABLE_ZIP,
+            Some(Path::new("polaris.exe")),
+        ),
+    ] {
+        assert!(
+            matches!(
+                decide_install_plan("windows", form, Path::new(asset), exe, None, portable),
+                Err(InstallReject::FormMismatch { .. })
+            ),
+            "{form:?} + {asset} + {portable:?} 必须判错配"
+        );
+    }
+    // 别的系统拿到便携压缩包：没有任何腿能处理它。
+    for os in ["linux", "macos", "android"] {
+        assert!(
+            matches!(
+                decide_install_plan(
+                    os,
+                    RunForm::Loose,
+                    Path::new("/tmp/Polaris_1.2.3_x64-win-Portable.zip"),
+                    Path::new("/usr/bin/polaris"),
+                    Some(Path::new("/home/u/Polaris.AppImage")),
+                    None,
+                ),
+                Err(InstallReject::FormMismatch { .. })
+            ),
+            "{os} 上的便携压缩包必须判错配"
+        );
+    }
 }
 
 #[test]
@@ -275,8 +448,7 @@ fn plan_of(platform: InstallPlatform) -> InstallPlan {
         platform,
         installer_path: p("/tmp/x"),
         exe_path: p("/usr/bin/polaris"),
-        portable_target: None,
-        portable_new_path: None,
+        portable_dir: None,
         app_bundle_path: Some(p("/Applications/Polaris.app")),
         appimage_target: Some(p("/home/u/P.AppImage")),
     }
@@ -293,9 +465,10 @@ fn advisory_is_required_wherever_os_will_block_or_prompt() {
         install_advisory(&plan_of(InstallPlatform::WindowsSetup)),
         Some(InstallAdvisory::WindowsSmartScreen)
     );
+    // 便携：没有安装器可被 SmartScreen 拦；要告知的是「应用会先停核并退出，退出后再覆盖」。
     assert_eq!(
         install_advisory(&plan_of(InstallPlatform::WindowsPortable)),
-        Some(InstallAdvisory::WindowsSmartScreen)
+        Some(InstallAdvisory::PortableManualReplace)
     );
     // deb：polkit 提权框（= 上游 confirmDebElevation），必须在停代理**之前**确认。
     assert_eq!(
@@ -311,16 +484,22 @@ fn advisory_is_required_wherever_os_will_block_or_prompt() {
 
 #[test]
 fn advisory_keys_are_distinct_and_stable() {
-    // key 是前端 i18n 的契约面；三者必须互不相同（撞 key = 弹错说明）。
+    // key 是前端 i18n 的契约面；四者必须互不相同（撞 key = 弹错说明）。
     let keys = [
         InstallAdvisory::DebElevation.key(),
         InstallAdvisory::WindowsSmartScreen.key(),
         InstallAdvisory::MacosGatekeeper.key(),
+        InstallAdvisory::PortableManualReplace.key(),
     ];
     let mut sorted = keys.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 3, "advisory key 必须互不相同");
+    assert_eq!(sorted.len(), 4, "advisory key 必须互不相同");
+    // 前端按这个字面量分流到「手动覆盖」那张卡，改名即两端失配。
+    assert_eq!(
+        InstallAdvisory::PortableManualReplace.key(),
+        "portableManualReplace"
+    );
 }
 
 // ── 脚本生成 ──
@@ -330,11 +509,10 @@ fn windows_vbs_is_utf16le_with_bom() {
     // **变异防线**：若 utf16le_with_bom 退化成 `s.into_bytes()`（UTF-8），中文用户名路径会被
     // wscript 按系统代码页解释 → 找不到文件 → 更新静默失败。
     let plan = InstallPlan {
-        portable_target: Some(p("C:\\用户\\Polaris.exe")),
-        portable_new_path: Some(p("C:\\用户\\Polaris-1.2.exe")),
-        ..plan_of(InstallPlatform::WindowsPortable)
+        installer_path: p("C:\\用户\\更新\\polaris-1.2-win-setup.exe"),
+        ..plan_of(InstallPlatform::WindowsSetup)
     };
-    let spec = script_of(&plan, &InstallTexts::default());
+    let spec = script_of(&plan);
     assert_eq!(
         &spec.bytes[..2],
         &[0xFF, 0xFE],
@@ -356,22 +534,15 @@ fn windows_vbs_is_utf16le_with_bom() {
         .collect();
     let text = String::from_utf16(&units).unwrap();
     assert!(
-        text.contains("C:\\\\用户\\\\Polaris.exe"),
+        text.contains("C:\\\\用户\\\\更新\\\\polaris-1.2-win-setup.exe"),
         "路径反斜杠须双写"
     );
     assert!(text.contains("\r\n"), "VBS 行分隔符须是 CRLF");
-    assert!(
-        text.contains("MsgBox"),
-        "覆盖失败必须提示用户手动替换，不得静默"
-    );
 }
 
 #[test]
 fn windows_setup_script_passes_update_flag() {
-    let spec = script_of(
-        &plan_of(InstallPlatform::WindowsSetup),
-        &InstallTexts::default(),
-    );
+    let spec = script_of(&plan_of(InstallPlatform::WindowsSetup));
     let units: Vec<u16> = spec.bytes[2..]
         .as_chunks::<2>()
         .0
@@ -394,7 +565,7 @@ fn windows_setup_script_passes_update_flag() {
 fn mac_script_must_clear_quarantine_and_resign_adhoc() {
     // **变异验证（用户点名）**：删掉 quarantine 清除步骤 → 本测试必须转红。
     // ad-hoc 签名下不清 quarantine = 用户点了更新、装完打不开（最差体验）。
-    let spec = script_of(&plan_of(InstallPlatform::Macos), &InstallTexts::default());
+    let spec = script_of(&plan_of(InstallPlatform::Macos));
     let s = String::from_utf8(spec.bytes).unwrap();
     assert!(
         s.contains("xattr -dr com.apple.quarantine \"$DEST\""),
@@ -429,7 +600,7 @@ fn mac_script_must_clear_quarantine_and_resign_adhoc() {
 /// 而调用方已经向前端回了 success。
 #[test]
 fn mac_script_success_branch_keys_on_stage_not_bak() {
-    let spec = script_of(&plan_of(InstallPlatform::Macos), &InstallTexts::default());
+    let spec = script_of(&plan_of(InstallPlatform::Macos));
     let s = String::from_utf8(spec.bytes).unwrap();
 
     assert!(
@@ -482,7 +653,7 @@ fn mac_script_falls_back_to_open_dmg_without_bundle() {
         app_bundle_path: None,
         ..plan_of(InstallPlatform::Macos)
     };
-    let s = String::from_utf8(script_of(&plan, &InstallTexts::default()).bytes).unwrap();
+    let s = String::from_utf8(script_of(&plan).bytes).unwrap();
     assert!(s.contains("open '/tmp/x'"));
     // 定位不到 bundle 时**绝不**瞎猜路径去 mv。
     assert!(!s.contains("mv "), "定位不到 .app 时不得做任何替换");
@@ -490,25 +661,11 @@ fn mac_script_falls_back_to_open_dmg_without_bundle() {
 
 #[test]
 fn linux_scripts_match_form() {
-    let s = String::from_utf8(
-        script_of(
-            &plan_of(InstallPlatform::LinuxAppImage),
-            &InstallTexts::default(),
-        )
-        .bytes,
-    )
-    .unwrap();
+    let s = String::from_utf8(script_of(&plan_of(InstallPlatform::LinuxAppImage)).bytes).unwrap();
     assert!(s.contains("chmod +x \"$DEST\""), "覆盖后必须补执行位");
     assert!(!s.contains("pkexec"), "AppImage 路径绝不提权");
 
-    let s = String::from_utf8(
-        script_of(
-            &plan_of(InstallPlatform::LinuxDeb),
-            &InstallTexts::default(),
-        )
-        .bytes,
-    )
-    .unwrap();
+    let s = String::from_utf8(script_of(&plan_of(InstallPlatform::LinuxDeb)).bytes).unwrap();
     assert!(
         s.contains("pkexec apt-get install"),
         "deb 须走 apt 原位升级"
@@ -531,7 +688,7 @@ fn sh_quote_neutralizes_injection() {
         installer_path: p("/tmp/x';touch /tmp/pwned;'"),
         ..plan_of(InstallPlatform::LinuxDeb)
     };
-    let s = String::from_utf8(script_of(&plan, &InstallTexts::default()).bytes).unwrap();
+    let s = String::from_utf8(script_of(&plan).bytes).unwrap();
     assert!(
         !s.contains("DEB='/tmp/x';touch"),
         "单引号必须被转义，不得逃出字面量"
@@ -555,8 +712,8 @@ fn utf16le_with_bom_roundtrips_non_ascii() {
 fn script_generation_is_deterministic() {
     // 快照断言的前提：同一 plan 恒得同一字节（脚本里不得掺时间戳/随机数；$$ 是 shell 运行期取的）。
     let plan = plan_of(InstallPlatform::Macos);
-    let a = script_of(&plan, &InstallTexts::default());
-    let b = script_of(&plan, &InstallTexts::default());
+    let a = script_of(&plan);
+    let b = script_of(&plan);
     assert_eq!(a, b);
 }
 
@@ -600,9 +757,8 @@ fn android_apk_plans_the_system_installer_regardless_of_run_form() {
         )
         .expect("android + .apk 必须有计划");
         assert_eq!(plan.platform, InstallPlatform::Android, "form={form:?}");
-        // 五条脚本腿的字段一个都不该被填 —— 填了说明有人在按桌面的形状想这条腿。
-        assert_eq!(plan.portable_target, None);
-        assert_eq!(plan.portable_new_path, None);
+        // 桌面各腿的字段一个都不该被填 —— 填了说明有人在按桌面的形状想这条腿。
+        assert_eq!(plan.portable_dir, None);
         assert_eq!(plan.app_bundle_path, None);
         assert_eq!(plan.appimage_target, None);
     }
@@ -657,20 +813,23 @@ fn apk_and_desktop_assets_never_cross_over() {
 #[test]
 fn android_has_no_install_script() {
     assert!(
-        build_install_script(&plan_of(InstallPlatform::Android), &InstallTexts::default())
-            .is_none(),
+        build_install_script(&plan_of(InstallPlatform::Android)).is_none(),
         "Android 走的是系统安装器，不许凭空造一个脚本出来"
     );
-    // 正面对照：另外五种必须**都**有脚本 —— 否则「返 None」这条断言可能是因为函数整个塌了。
+    // Windows 便携同样没有脚本腿（用户手动覆盖）；凭空造一个出来的后果与上面相同。
+    assert!(
+        build_install_script(&plan_of(InstallPlatform::WindowsPortable)).is_none(),
+        "Windows 便携走的是手动覆盖，不许凭空造一个脚本出来"
+    );
+    // 正面对照：另外四种必须**都**有脚本 —— 否则「返 None」这条断言可能是因为函数整个塌了。
     for platform in [
-        InstallPlatform::WindowsPortable,
         InstallPlatform::WindowsSetup,
         InstallPlatform::Macos,
         InstallPlatform::LinuxAppImage,
         InstallPlatform::LinuxDeb,
     ] {
         assert!(
-            build_install_script(&plan_of(platform), &InstallTexts::default()).is_some(),
+            build_install_script(&plan_of(platform)).is_some(),
             "{platform:?} 必须仍有脚本腿"
         );
     }
@@ -721,36 +880,32 @@ fn windows_install_requires_successful_synchronous_native_process_wait() {
         .flat_map(u16::to_le_bytes)
         .collect();
     let encoded = crate::runtime::mesh::base64_encode(&bytes);
-    for platform in [
-        InstallPlatform::WindowsPortable,
-        InstallPlatform::WindowsSetup,
+    let platform = InstallPlatform::WindowsSetup;
+    let text = build_windows_setup_vbs(&plan_of(platform));
+    assert!(text.contains(&format!(
+        "-NoProfile -NonInteractive -EncodedCommand {encoded}"
+    )));
+    assert!(text.contains("%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
+    let synchronous = text.find("WshShell.Run(waitCommand, 0, True)").unwrap();
+    let refusal = text
+        .find("If waitError <> 0 Or waitResult <> 0 Then WScript.Quit 1")
+        .unwrap();
+    assert!(synchronous < refusal);
+    assert!(text[synchronous..refusal].contains("waitError = Err.Number"));
+    for effect in [
+        "fso.CopyFile",
+        "fso.MoveFile",
+        "fso.DeleteFile",
+        "WshShell.Run \"",
     ] {
-        let text = build_windows_vbs(&plan_of(platform), &InstallTexts::default());
-        assert!(text.contains(&format!(
-            "-NoProfile -NonInteractive -EncodedCommand {encoded}"
-        )));
-        assert!(text.contains("%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
-        let synchronous = text.find("WshShell.Run(waitCommand, 0, True)").unwrap();
-        let refusal = text
-            .find("If waitError <> 0 Or waitResult <> 0 Then WScript.Quit 1")
-            .unwrap();
-        assert!(synchronous < refusal);
-        assert!(text[synchronous..refusal].contains("waitError = Err.Number"));
-        for effect in [
-            "fso.CopyFile",
-            "fso.MoveFile",
-            "fso.DeleteFile",
-            "WshShell.Run \"",
-        ] {
-            if let Some(index) = text.find(effect) {
-                assert!(
-                    refusal < index,
-                    "{platform:?}: {effect} precedes exit proof"
-                );
-            }
+        if let Some(index) = text.find(effect) {
+            assert!(
+                refusal < index,
+                "{platform:?}: {effect} precedes exit proof"
+            );
         }
-        assert!(!text.contains("WScript.Sleep"));
     }
+    assert!(!text.contains("WScript.Sleep"));
 }
 
 #[test]
@@ -764,7 +919,7 @@ fn all_unix_install_paths_wait_before_any_install_or_open() {
             ..plan_of(InstallPlatform::Macos)
         },
     ] {
-        let text = String::from_utf8(script_of(&plan, &InstallTexts::default()).bytes).unwrap();
+        let text = String::from_utf8(script_of(&plan).bytes).unwrap();
         assert!(text.starts_with(&format!("#!/bin/bash\n{UNIX_EXIT_WAIT}\n")));
         assert_eq!(text.matches(UNIX_EXIT_WAIT).count(), 1);
         assert!(!text.contains("sleep 2"));
@@ -947,5 +1102,47 @@ mod lifetime_wait {
             "no fallible publication may close the successful writer"
         );
         assert!(!success.contains("drop(lifetime_writer)"));
+    }
+}
+
+/// 被拒之后交不交系统：只有「Windows 便携形态拿到安装程序」不交 —— 系统对 `.exe` 的打开就是
+/// 运行它，会在别处装出第二份程序。
+///
+/// **变异探针**：让 `hands_to_system` 恒真 ⇒ 首条转红；恒假 ⇒ 后四条转红。
+#[test]
+fn a_portable_install_never_hands_an_installer_to_the_system() {
+    let mismatch = |installer: &str, os: &str, form| InstallReject::FormMismatch {
+        installer: installer.to_owned(),
+        os: os.to_owned(),
+        form,
+    };
+    assert!(!mismatch("Polaris_1.2.3_x64-setup.exe", "windows", RunForm::Loose).hands_to_system());
+    // 这一格就是 `decide_install_plan` 对便携形态 + 安装程序给出的那个拒绝。
+    let rejected = decide_install_plan(
+        "windows",
+        RunForm::Loose,
+        Path::new(r"C:\Cache\updates\Polaris_1.2.3_x64-setup.exe"),
+        Path::new(r"D:\Polaris\polaris.exe"),
+        None,
+        Some(Path::new(r"D:\Polaris\polaris.exe")),
+    )
+    .expect_err("便携形态拿到安装程序是错配");
+    assert!(!rejected.hands_to_system(), "{rejected:?}");
+
+    for handed in [
+        // 安装态拿到便携压缩包：打开只是让系统的压缩包查看器接手。
+        mismatch(
+            "Polaris_1.2.3_x64-win-Portable.zip",
+            "windows",
+            RunForm::Installed,
+        ),
+        // AppImage 运行拿到 `.deb`：交给系统的包管理器界面，由用户决定（不自动提权安装）。
+        mismatch("polaris_1.2.3_amd64.deb", "linux", RunForm::Loose),
+        mismatch("Polaris-1.2.3.AppImage", "linux", RunForm::Installed),
+        InstallReject::UnknownAsset {
+            file_name: "notes.txt".to_owned(),
+        },
+    ] {
+        assert!(handed.hands_to_system(), "{handed:?}");
     }
 }

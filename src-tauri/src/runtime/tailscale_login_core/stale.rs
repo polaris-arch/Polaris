@@ -1,7 +1,7 @@
 //! Leftovers of a login core whose host process died: its secret-bearing temporary config and,
 //! on desktop, the detached child itself. Both are identified only by this app's own exact
-//! artifacts: the fixed config file name inside the app config directory, and a child whose
-//! argv is this app's core binary running exactly such a config. Nothing is matched by name.
+//! artifacts: the fixed config file name inside the app config directory, and a child that is
+//! a core running exactly such a config. Nothing is matched by process name alone.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -84,36 +84,20 @@ pub(super) fn sweep_stale_login_configs(dir: &Path, live: &[PathBuf]) -> usize {
     removed
 }
 
-/// Whether this process is a login core this app spawned: argv is exactly
-/// `<our binary> run -c <config dir>/tailscale-login-<id>-<epoch>.json ...`.
+/// Whether this process is a login core this app spawned: its command line is
+/// `<any absolute path named like our core> run -c <config dir>/tailscale-login-<id>-<epoch>.json ...`.
+///
+/// Only the file name of `binary` is used. Where the core binary lives is not stable between
+/// sessions (AppImage mount point, macOS translocation, reinstall), so a leftover from an
+/// earlier session would never match a full-path comparison; the config directory is stable
+/// and private to this user's app. The shape test is the main-core sweep's
+/// ([`polaris_core_supervisor::app_run_config_name`]).
 pub(super) fn is_stale_login_core(process: &CoreProcess, binary: &Path, config_dir: &Path) -> bool {
-    if let [program, run, flag, config, ..] = process.cmdline.as_slice() {
-        let config = Path::new(config);
-        return Path::new(program) == binary
-            && run == "run"
-            && flag == "-c"
-            && config.parent() == Some(config_dir)
-            && config
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| login_config_identity(name).is_some());
-    }
-    // `ps` joins argv with spaces and both paths may contain spaces, so match the exact prefix.
-    // A raw line only ever comes from macOS `ps`, so the separator after the config directory
-    // is that line's `/`, not whatever the compiling host uses.
-    let prefix = format!("{} run -c {}", binary.display(), config_dir.display());
-    let Some(rest) = process
-        .raw
-        .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_prefix('/'))
-    else {
+    let Some(core_filename) = binary.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    let Some(end) = rest.find(LOGIN_CONFIG_SUFFIX) else {
-        return false;
-    };
-    let (name, tail) = rest.split_at(end + LOGIN_CONFIG_SUFFIX.len());
-    login_config_identity(name).is_some() && (tail.is_empty() || tail.starts_with(' '))
+    polaris_core_supervisor::app_run_config_name(process, core_filename, config_dir)
+        .is_some_and(|name| login_config_identity(name).is_some())
 }
 
 /// Pids of leftover login cores, never one of this registry's own registered children.
@@ -197,8 +181,10 @@ pub trait StaleLoginCoreSweeper: Send + Sync {
     async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String>;
 }
 
-/// Production sweeper. The process scan is empty on platforms without one, so nothing is
-/// signalled there and a leftover login core survives until the user ends it.
+/// Production sweeper. Nothing is signalled where the process scan is empty (mobile) or where
+/// a process owner cannot be read (Windows: `process_owner_uid` is `None`, so no candidate
+/// counts as this user's). A leftover login core there is ended by the main-core sweep on the
+/// next start, which matches any `.json` config in the app config directory.
 pub struct ProcessStaleLoginSweeper {
     config_dir: PathBuf,
 }

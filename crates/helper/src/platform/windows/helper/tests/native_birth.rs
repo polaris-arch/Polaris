@@ -68,36 +68,24 @@ fn poisoned_dns_admission_does_not_skip_or_fake_native_drain() {
 }
 
 #[test]
-fn poisoned_dns_admission_cannot_skip_uninstall_drain_or_discard_live_custody() {
+fn system_uninstall_defers_to_uac_without_detaching_or_draining_live_custody() {
     let ops = MockProcOps::new();
     let h = make_helper(ops.clone(), MockNetTableOps::new());
     let target = start(&h, false);
-    let _ = std::panic::catch_unwind(|| {
-        let _: Result<(), String> = h
-            .dns_admission
-            .launch(|| panic!("DNS worker fixture panic"));
-    });
-    ops.set_native_stop(NativeChildPoll::Running);
-    assert!(matches!(
-        h.handle("real-token", Request::Uninstall),
-        HandleOutcome::Respond(Response::Err(_))
-    ));
-    assert_eq!(ops.native_stop_calls(), 1);
-    assert_eq!(
-        h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
-        target
-    );
-    assert!(!ops.native_custody_empty());
-    assert_eq!(ops.snapshot().spawn_uninstall_calls, 0);
-    ops.set_native_stop(NativeChildPoll::Exited);
-    assert!(matches!(
-        h.handle("real-token", Request::Uninstall),
-        HandleOutcome::UninstallAndExit(Response::Ok(ResponseKind::Uninstalling))
-    ));
-    assert_eq!(ops.native_stop_calls(), 2);
-    assert!(ops.native_custody_empty());
-    assert_eq!(ops.snapshot().spawn_uninstall_calls, 1);
-    assert!(h.dns_admission.launch(|| Ok(())).is_err());
+    for poll in [NativeChildPoll::Running, NativeChildPoll::Exited] {
+        ops.set_native_stop(poll);
+        assert!(matches!(
+            h.handle("real-token", Request::Uninstall),
+            HandleOutcome::Respond(Response::Err(_))
+        ));
+        assert_eq!(
+            h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
+            target
+        );
+        assert_eq!(ops.native_stop_calls(), 0);
+        assert_eq!(ops.snapshot().spawn_uninstall_calls, 0);
+        assert!(!h.child_mu.lock().unwrap().closing);
+    }
 }
 
 #[test]

@@ -160,42 +160,21 @@ const ALLOWED: &[Entry] = &[
 ///
 /// `validator` 不是文档而是**判据**：[`validated_read_sites_must_call_their_validator`] 会去
 /// 读取点所在的函数体里找这个串，找不到当场红。这一条是本类别与「一句承诺」的全部差别。
-const VALIDATED: &[Validated] = &[
-    Validated {
-        name: "POLARIS_SINGBOX_PATH",
-        validator: "adopt_trusted_env_path(",
-        reason: "【L1 喂代码执行链】喂给谁：`runtime/proxy/core_binary.rs::core_binary_env_override` —— 它是\
-                 `resolve_core_binary`（内核二进制解析链第 1 级）与 `UpdaterRuntime::new`\
-                 （版本双读法的探测目标）的**唯一**共用实现；解析出来的路径会被 spawn 成活核，\
-                 并经 `HelperRuntime::install_params` 作为 `bundled_core` / `--singbox` 播进\
-                 root 受管核目录。最坏能做什么（若无判据）：把 app 拉起的 sing-box 换成任意可\
-                 执行文件，以 app 身份 + 代理配置运行。\
-                 由哪个函数校验：`runtime/env_trust::adopt_trusted_env_path`，\
-                 `TrustScope::AppDataOrBundle`（canonicalize 后须落在 app 自有数据目录或随包\
-                 资源目录之内；目录穿越 / symlink / junction 逃逸、路径不存在、canonicalize\
-                 失败一律不过）。\
-                 不通过时怎么办：**不采纳**，记 `ENV_PATH_UNTRUSTED`（`log::warn`，带 path 与\
-                 roots）并回落既有优先级（可写现役核 → 随包种子）—— 绝不静默，也绝不因为逃生门\
-                 越界就让 app 起不来。\
-                 debug / test 构型不受本判据影响（`cfg!(any(debug_assertions, test))`）：逃生门\
-                 仍是原样的第一优先级，本地开发与全部 `#[ignore]` 真机验证逐字不变。",
-    },
-    Validated {
-        name: "POLARIS_HELPER_PATH",
-        validator: "adopt_trusted_env_path(",
-        reason: "【L2 喂提权安装链】喂给谁：`runtime/helper.rs::resolve_helper_binary` → \
+const VALIDATED: &[Validated] = &[Validated {
+    name: "POLARIS_HELPER_PATH",
+    validator: "adopt_trusted_env_path(",
+    reason: "【喂提权安装链】喂给谁：`runtime/helper.rs::resolve_helper_binary` → \
                  `install_params.src_binary` → 提权安装链，该文件随后被以管理员 / root 权限装成\
                  系统服务（systemd unit / launchd plist / Windows 服务）。最坏能做什么（若无\
                  判据）：把任意二进制喂进提权安装链，得到一个开机自启的 root 级常驻进程 —— \
-                 比 L1 更硬（L1 拿 app 权限，L2 拿系统权限）。\
-                 由哪个函数校验：同一个 `adopt_trusted_env_path`，但 scope 是\
-                 `TrustScope::AppDataOnly` —— 比 L1 严一档，**随包资源目录也不接受**。\
+                 \
+                 由哪个函数校验：`runtime/env_trust::adopt_trusted_env_path` —— canonicalize \
+                 后须落在 app 自有数据目录之内，**随包资源目录也不接受**。\
                  随包 helper 本就由兜底腿解析得到，逃生门再指一次只多一个入口、不多一分能力。\
                  不通过时怎么办：不采纳，记 `ENV_PATH_UNTRUSTED` 并回落随包 helper 兜底腿；\
                  兜底腿也找不到就是既有的「二进制缺失」早返（**不触发提权**）。\
                  debug / test 构型同样不受影响：helper 的本地迭代仍靠它装自编产物。",
-    },
-];
+}];
 
 /// 临时清单：**已知违规**，下一批修。
 ///
@@ -207,10 +186,13 @@ const VALIDATED: &[Validated] = &[
 ///
 /// # 当前为空 —— 以及上一版本条目里那句**错的**「修完就删掉」
 ///
-/// L1 `POLARIS_SINGBOX_PATH` 与 L2 `POLARIS_HELPER_PATH` 曾登记在这里，条目末尾写着
+/// `POLARIS_HELPER_PATH` 曾登记在这里，条目末尾写着
 /// 「修完之后 release 侧不再读它 ⇒ 命中 0 次 ⇒ 删掉本条」。**那个前提是错的**：信任级修复
-/// 并没有让 release 侧停止读这两个变量，只是给读到的路径加了一道可信来源判据。它们因此
+/// 并没有让 release 侧停止读它，只是给读到的路径加了一道可信来源判据。它因此
 /// 移进了 [`VALIDATED`]（release 可读 + 必须过校验），而不是消失。
+///
+/// 内核路径那个变量走的是另一条路：它在 release 构型里**完全不读**，四张清单都不登记，
+/// 由 [`core_path_env_override_is_dev_only`] 单独钉着。
 ///
 /// 这条经验值得留在这里：给一个逃生门「修复」不等于「删除」。判断一条 PENDING 该往哪去，
 /// 要看修完之后 **release 侧还读不读它**，而不是看有没有人动过那段代码。
@@ -1128,9 +1110,9 @@ fn release_reachable_env_reads_are_all_registered() {
 /// [`PENDING_TRUST_GATE`] 的条目在下一批修完后正是靠这一条自动转红，把清理逼出来。
 /// 命中多次 = 一条豁免覆盖了它没打算覆盖的地方（今天只会由「两表登记了同一个名字」造成）。
 ///
-/// **变异探针**：删掉 `PENDING_TRUST_GATE` 里 `POLARIS_SINGBOX_PATH` 那条
+/// **变异探针**：删掉 `VALIDATED` 里 `POLARIS_HELPER_PATH` 那条
 /// ⇒ [`release_reachable_env_reads_are_all_registered`] 转红点名它的全部 release 侧读取点；
-/// 把 `POLARIS_SINGBOX_PATH` 同时写进 `ALLOWED` ⇒ 本条以「命中 2 次」转红。
+/// 把 `POLARIS_HELPER_PATH` 同时写进 `ALLOWED` ⇒ 本条以「命中 2 次」转红。
 #[test]
 fn registry_entries_must_all_match_exactly_once() {
     let scan = scan();
@@ -1178,10 +1160,9 @@ fn registry_entries_must_all_match_exactly_once() {
 /// 注释里写一句 `adopt_trusted_env_path(...)` 不算数（被剥掉了）；
 /// 隔壁函数里调了也不算数（不在同一层函数体内）。
 ///
-/// **变异探针**：把 `runtime/proxy/core_binary.rs::core_binary_env_override` 里的
-/// `adopt_trusted_env_path(..)` 换回裸的 `std::env::var("POLARIS_SINGBOX_PATH")` 解析
-/// ⇒ 本条转红并点名 `src-tauri/src/runtime/proxy/core_binary.rs:<行号> · POLARIS_SINGBOX_PATH`；
-/// 对 `runtime/helper.rs::resolve_helper_binary` 做同样的事 ⇒ 点名 L2 那条腿。
+/// **变异探针**：把 `runtime/helper.rs::resolve_helper_binary` 里的
+/// `adopt_trusted_env_path(..)` 换回裸的 `std::env::var("POLARIS_HELPER_PATH")` 解析
+/// ⇒ 本条转红并点名 `src-tauri/src/runtime/helper.rs:<行号> · POLARIS_HELPER_PATH`。
 #[test]
 fn validated_read_sites_must_call_their_validator() {
     let scan = scan();
@@ -1239,6 +1220,67 @@ fn validated_read_sites_must_call_their_validator() {
          本门在 `src-tauri/tests/release_escape_hatches.rs`。",
         missing.len(),
         missing.join("\n")
+    );
+}
+
+/// 内核路径的环境超驰变量名（不在任何一张清单里）。
+const CORE_PATH_ENV: &str = "POLARIS_SINGBOX_PATH";
+
+/// 🔴 **内核路径的环境超驰只存在于 debug / test 构型**：release 构型零读取。
+///
+/// 应用应当运行与本应用版本配套的内核。「路径落在某个可信目录内」不等于「内容配套」，
+/// 所以这个变量在 release 里没有「校验后采纳」这一档 —— 不读，也不登记进任何一张清单。
+///
+/// 三条判据，缺一条都留得下缝：
+///
+/// 1. **探测器①**：release 侧没有任何 `env::var*("…")` 读取点叫这个名字；
+/// 2. **探测器②**：release 构型会编译的文本（代码 + 注释 + 字面量）里**根本不出现**这个名字 ——
+///    堵 `const H: &str = "…"; env::var(H)` 这类间接读取。代价是 release 侧的注释与报错文案
+///    也不能点它的名，要讲就讲「内核路径的开发态超驰」；
+/// 3. **正面对照**：生产源码里确有一处读取点叫这个名字，且它被判成「release 不编译」。
+///    没有这一条，前两条在「读取点整体换了写法、两个探测器都看不见它」时照样全绿。
+///
+/// **变异探针**：把 `runtime/proxy/core_binary.rs::dev_core_binary_override` 上的
+/// `#[cfg(any(debug_assertions, test))]` 删掉，或把那个 `cfg` 改成 `cfg(unix)` ⇒ 第 1、2 条转红；
+/// 把读取点的字面量提成 release 侧的 `const` ⇒ 第 2、3 条转红。
+#[test]
+fn core_path_env_override_is_dev_only() {
+    let name = CORE_PATH_ENV;
+    let scan = scan();
+
+    let release_reads = scan.release_reads();
+    assert!(
+        !release_reads.contains_key(name),
+        "`{name}` 在 release 构型下可读：\n{}\n\n\
+         发行包不得从进程环境接受内核路径。读取点必须整个罩在\
+         `#[cfg(any(debug_assertions, test))]` 之内。",
+        describe(release_reads.get(name).map_or(&[][..], Vec::as_slice))
+    );
+
+    assert!(
+        !scan.names.contains_key(name),
+        "`{name}` 出现在 release 构型会编译的文本里：{:?}\n\
+         注释、报错文案、常量都算：名字一旦留在 release 侧，「零读取」就只剩调用形态这一道判据，\
+         而间接读取恰好逃得过它。",
+        scan.names.get(name)
+    );
+
+    let dev_only: Vec<&Hit> = scan
+        .hits
+        .iter()
+        .filter(|hit| hit.name == name && !hit.release && hit.file.contains("/src/"))
+        .filter(|hit| !hit.file.contains("/tests/"))
+        .collect();
+    assert_eq!(
+        dev_only.len(),
+        1,
+        "生产源码里应恰有一处 `{name}` 读取点且被判成 release 不编译，实得：\n{}\n\
+         0 处 = 读取点换了写法，上面两条断言正在对着空集成立；多处 = 开发态超驰长出了第二条腿。",
+        describe(&dev_only)
+    );
+    assert_eq!(
+        dev_only[0].file, "src-tauri/src/runtime/proxy/core_binary.rs",
+        "开发态超驰的读取点应只在内核解析的单点里"
     );
 }
 
@@ -1649,7 +1691,7 @@ fn assert_feature_gate_read_off(found: &BTreeMap<String, bool>) {
 const FN_SCOPE_FIXTURE: &str = r####"
 fn guarded() {
     let _ = std::env::var("POLARIS_FIXTURE_GUARDED");
-    let _ = adopt_trusted_env_path("POLARIS_FIXTURE_GUARDED", None, TrustScope::AppDataOnly);
+    let _ = adopt_trusted_env_path("POLARIS_FIXTURE_GUARDED", None);
 }
 
 fn bare() {
@@ -1663,7 +1705,7 @@ impl Thing {
             let _ = std::env::var("POLARIS_FIXTURE_INNER");
         }
         inner();
-        let _ = adopt_trusted_env_path("POLARIS_FIXTURE_OUTER", None, TrustScope::AppDataOnly);
+        let _ = adopt_trusted_env_path("POLARIS_FIXTURE_OUTER", None);
         Ok(())
     }
 }
@@ -1925,8 +1967,8 @@ fn release_profiles_must_not_enable_debug_assertions() {
         offenders.is_empty(),
         "以下 release 构型打开了 `debug-assertions`：\n{}\n\
          这会让 `runtime/env_trust.rs::dev_build()` 的 `cfg!(any(debug_assertions, test))` \
-         在**发行包里恒真** ⇒ POLARIS_SINGBOX_PATH / POLARIS_HELPER_PATH 的信任级校验整条失效，\
-         逃生门退回裸信任。要在 release 保留断言，先把 `dev_build()` 的判据换成不依赖它的东西\
+         在**发行包里恒真** ⇒ POLARIS_HELPER_PATH 的信任级校验整条失效，逃生门退回裸信任；\
+         内核路径的开发态超驰（`cfg(any(debug_assertions, test))`）也会被编进发行包。要在 release 保留断言，先把 `dev_build()` 的判据换成不依赖它的东西\
          （例如构建期注入的显式标记），再改 profile。",
         offenders.join("\n")
     );

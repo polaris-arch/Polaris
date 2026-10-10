@@ -39,16 +39,6 @@ import { retainItemsById, retainRecordKeys } from './retain-entities';
 type ProxyMode = UserConfig['proxyMode'];
 
 /**
- * 可用的内核更新（常驻入口数据源）。放 store 使 CoreManagementCard 卸载后入口仍留存。
- */
-export interface AvailableCoreUpdate {
-  latestVersion: string;
-  downloadUrl: string;
-  /** 是否跨当前 minor 带；true 时 UI 用警告色 + 风险文案。 */
-  crossBand?: boolean;
-}
-
-/**
  * 解锁检测显示态：提到 store 使其跨首页组件卸载存活（切导航离开 → 卸载但检测态留存，切回直接展示不重跑）。
  */
 export interface UnlockDisplayState {
@@ -169,9 +159,6 @@ export interface AppState {
   // ── helper（macOS 提权）──
   helperStatus: HelperStatus | null;
 
-  // ── 可用更新 ──
-  availableCoreUpdate: AvailableCoreUpdate | null;
-
   // ── 隐私模式 ──
   privacyMode: boolean;
 
@@ -263,7 +250,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   invalidNodes: [],
 
   helperStatus: null,
-  availableCoreUpdate: null,
   privacyMode: false,
   tailscaleStatuses: {},
   serverPageAction: null,
@@ -679,7 +665,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       pendingChanges: EMPTY_PENDING,
       invalidNodes: [],
       helperStatus: null,
-      availableCoreUpdate: null,
       privacyMode: false,
       // 原始帧只在核跑着时有意义（reset 语义 = 回到「什么都不知道」），清掉即回落到
       // 「无帧 → 出口告警不据陈旧帧下认证/离线结论」。

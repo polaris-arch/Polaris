@@ -121,8 +121,8 @@ export default function AppUpdateBanner() {
         size="sm"
         className="aub-dismiss"
         onClick={() => markAppVersionDismissed(version)}
-        data-tip={t('settings.coreVersion.dismiss')}
-        aria-label={t('settings.coreVersion.dismiss')}
+        data-tip={t('settings.update.bannerDismiss')}
+        aria-label={t('settings.update.bannerDismiss')}
       >
         <svg viewBox="0 0 24 24" width={14} fill="none" stroke="currentColor" strokeWidth={1.8}>
           <path d="M18 6 6 18M6 6l12 12" />

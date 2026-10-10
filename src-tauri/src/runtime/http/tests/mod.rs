@@ -749,130 +749,8 @@ fn no_gh_proxy_configured_means_no_mirror_candidate() {
 
 // ── 下载适配器：真 socket 门 ─────────────────────────────────────────────
 
-#[test]
-fn download_follows_redirect_and_returns_bytes() {
-    // 下载路径**必须**自己跟随 30x（GitHub 资产必然 302 到 objects.githubusercontent.com），
-    // 因为 client 全局关了 redirect。若把 `open_download_response` 的 30x 分支删掉 → 本测试转红
-    // （U1 把重定向跟随从 `download_once` 抽进了两条腿共用的 `open_download_response`，
-    //  故锚点是后者 —— 与下方 `streaming_download_follows_redirects_and_hashes_while_writing`
-    //  的措辞对齐）。
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let addr = spawn_server(vec![
-        // 首跳 302 → 同 server 的 /asset
-        b"HTTP/1.1 302 Found\r\nLocation: /asset\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            .to_vec(),
-        http_response("200 OK", &[], b"CORE-BYTES"),
-    ]);
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
-    // 在 blocking 线程上调（契约：download 是同步桥）。
-    let bytes = std::thread::spawn(move || dl.download(&format!("http://{addr}/start")))
-        .join()
-        .unwrap()
-        .expect("下载应成功");
-    assert_eq!(bytes, b"CORE-BYTES");
-}
-
-/// 🟡 **进度回调必须真被逐 chunk 调用，且带上 Content-Length 分母**。
-///
-/// 此前 `CoreDownloader::download` 只返 `Vec<u8>`，`update_download` 因此只能发
-/// `downloading(0%)` / `downloaded(100%)` 两点，进度条整段 indeterminate。
-///
-/// **变异锁**：把 `read_body_capped_with_progress` 里的 `cb(...)` 删掉、或把 `expected`
-/// 换成 `None` 传下去 ⇒ 本条转红。
-#[test]
-fn download_with_progress_reports_received_and_total() {
-    use std::sync::Mutex as StdMutex;
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let body = vec![b'z'; 3000];
-    let total = body.len() as u64;
-    let addr = spawn_server(vec![http_response("200 OK", &[], &body)]);
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
-
-    /// 一次进度回调的观测记录：`(已收字节, Content-Length)`。
-    type ProgressLog = Arc<StdMutex<Vec<(u64, Option<u64>)>>>;
-    let seen: ProgressLog = Arc::new(StdMutex::new(Vec::new()));
-    let sink = seen.clone();
-    let cb: Arc<DownloadProgressFn> = Arc::new(move |received, expected| {
-        sink.lock().unwrap().push((received, expected));
-    });
-
-    let bytes =
-        std::thread::spawn(move || dl.download_with_progress(&format!("http://{addr}/asset"), cb))
-            .join()
-            .unwrap()
-            .expect("下载应成功");
-    assert_eq!(bytes.len(), body.len());
-
-    let seen = seen.lock().unwrap();
-    assert!(!seen.is_empty(), "进度回调一次都没触发 = 进度腿是死的");
-    assert_eq!(
-        seen.last().copied(),
-        Some((total, Some(total))),
-        "末次回调须是 (总字节, Content-Length)——分母缺失则百分比算不出来"
-    );
-    // 单调不减（received 是累计值，不是增量）。
-    assert!(
-        seen.windows(2).all(|w| w[0].0 <= w[1].0),
-        "received 必须是累计值：{seen:?}"
-    );
-}
-
-#[test]
-fn download_without_progress_still_works_trait_path_unchanged() {
-    // 门：加进度腿不得改变既有 trait 路径的行为（staged 周期走的就是它）。
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let addr = spawn_server(vec![http_response("200 OK", &[], b"PLAIN")]);
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
-    let bytes = std::thread::spawn(move || dl.download(&format!("http://{addr}/x")))
-        .join()
-        .unwrap()
-        .expect("无进度回调路径应照常成功");
-    assert_eq!(bytes, b"PLAIN");
-}
-
-#[test]
-fn download_incomplete_body_is_reported_not_silently_accepted() {
-    // Content-Length 撒谎（说 100，实给 5）→ 必须报 Incomplete，**不得**把半截字节当成功返回
-    // （半截核二进制过了 SHA256 校验才被发现 = 白下一次；更糟的是若没校验就落位）。
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        if let Ok((mut sock, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf);
-            let _ = sock.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
-            );
-            let _ = sock.flush();
-        }
-    });
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
-    let err = std::thread::spawn(move || dl.download(&format!("http://{addr}/x")))
-        .join()
-        .unwrap()
-        .expect_err("Content-Length 不符必须报错");
-    assert!(
-        matches!(
-            err,
-            DownloadError::Incomplete {
-                received: 5,
-                expected: 100
-            }
-        ),
-        "应报 Incomplete{{received:5,expected:100}}，实得: {err:?}"
-    );
-}
-
-// ── 流式落盘腿（U1）───────────────────────────────────────────────────────
-//
 // 全部走本文件既有的**回环** mock server（`spawn_server`，见其上方注释：stdlib TcpListener
-// 绑 127.0.0.1，不触碰宿主网络），与内存腿的门同形态。
+// 绑 127.0.0.1，不触碰宿主网络）。
 
 /// 收进内存的假 sink（测试用）：验「写进去的字节 == 服务端发的字节」。
 #[derive(Clone, Default)]
@@ -907,7 +785,22 @@ impl std::io::Write for FailingSink {
     }
 }
 
-/// 🟡 **流式腿必须与内存腿走同一条编排：重定向照跟、字节一个不少、摘要边写边算。**
+/// 在 blocking 线程上把 `url` 流式下载进一个内存 sink，返回落下的字节。
+fn download_bytes(dl: CoreDownloader, url: String) -> Result<Vec<u8>, DownloadError> {
+    let sink = MemSink::default();
+    let sink_for_factory = sink.clone();
+    let factory: Arc<DownloadSinkFactory> =
+        Arc::new(move || Ok(Box::new(sink_for_factory.clone())));
+    let noop: Arc<DownloadProgressFn> = Arc::new(|_, _| {});
+    std::thread::spawn(move || dl.download_to_sink_with_progress(&url, factory, noop))
+        .join()
+        .unwrap()?;
+    let bytes = sink.0.lock().unwrap().clone();
+    Ok(bytes)
+}
+
+/// 🟡 **下载必须自己跟随 30x（client 全局关了 redirect，GitHub 资产必然 302）：重定向照跟、
+/// 字节一个不少、摘要边写边算。**
 ///
 /// **变异探针**：把 `download_once_to_sink` 里的 `open_download_response` 换成一份
 /// 自己复制的请求逻辑（漏掉 30x 分支）⇒ 本条转红。
@@ -949,13 +842,13 @@ fn streaming_download_follows_redirects_and_hashes_while_writing() {
     );
 }
 
-/// 🟡 **进度回调在流式腿上必须与内存腿同时机同分母。**
+/// 🟡 **进度回调必须真被逐 chunk 调用，且带上 Content-Length 分母。**
 ///
-/// 前端契约零改动的前提就是这条：回调仍在每个 chunk 到达时以 `(累计已收, Content-Length)` 触发。
+/// 回调在每个 chunk 到达时以 `(累计已收, Content-Length)` 触发；分母缺失则前端只能 indeterminate。
 ///
 /// **变异探针**：把 sink 版循环里的 `cb(...)` 删掉、或把 `expected` 换成 `None` ⇒ 转红。
 #[test]
-fn streaming_download_reports_progress_like_the_memory_leg() {
+fn streaming_download_reports_received_and_total() {
     use std::sync::Mutex as StdMutex;
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -965,7 +858,7 @@ fn streaming_download_reports_progress_like_the_memory_leg() {
     let http = Arc::new(HttpRuntime::new().unwrap());
     let dl = CoreDownloader::new(http, rt.handle().clone());
 
-    /// 一次进度回调的观测记录：`(已收字节, Content-Length)`（同内存腿那条门）。
+    /// 一次进度回调的观测记录：`(已收字节, Content-Length)`。
     type ProgressLog = Arc<StdMutex<Vec<(u64, Option<u64>)>>>;
     let seen: ProgressLog = Arc::new(StdMutex::new(Vec::new()));
     let log = seen.clone();
@@ -1156,10 +1049,10 @@ fn mirror_fallback_rewrites_the_sink_from_scratch() {
     );
 }
 
-/// 🟡 **流式腿的读侧超限：与内存腿同一条判定，且已写出的部分绝不算成功。**
+/// 🟡 **读侧超限：超过闸值即中断，且已写出的部分绝不算成功。**
 ///
 /// 刻意**不给 Content-Length** ⇒ `open_download_response` 的预检不参与，只剩
-/// [`read_body_to_sink_with_progress`] 的读侧闸 —— 那正是内存腿有门、流式腿此前没门的一格。
+/// [`read_body_to_sink_with_progress`] 的读侧闸。
 ///
 /// **变异探针**：删掉 sink 版循环里的 `if received + chunk.len() > limit` 判定 ⇒ 转红。
 #[test]
@@ -1194,7 +1087,7 @@ fn streaming_leg_rejects_an_oversized_body_on_the_read_side_too() {
     );
 }
 
-/// 🟡 **流式腿的停滞看门狗：与内存腿同一条判定，且已写出的部分绝不算成功。**
+/// 🟡 **停滞看门狗：每个 chunk 单独计时，且已写出的部分绝不算成功。**
 ///
 /// 走**直调**而非端到端：`STALL_TIMEOUT` 是 30s 常量，端到端跑要等半分钟；
 /// 而 [`read_body_to_sink_with_progress`] 的 `stall` 本就是形参，直调即可注入 150ms。
@@ -1253,7 +1146,7 @@ async fn streaming_leg_reports_a_stall_without_accepting_the_partial_write() {
         4,
         "停滞前已写出的字节留在 sink 里（清残件是调用方的责任），但结论必须是失败"
     );
-    // 与内存腿共用同一条映射（`DownloadError::Stalled`，不是 Incomplete）。
+    // 映射是 `DownloadError::Stalled`，不是 Incomplete。
     assert!(matches!(
         map_body_error(err, Some(100)),
         DownloadError::Stalled(_)
@@ -1261,18 +1154,16 @@ async fn streaming_leg_reports_a_stall_without_accepting_the_partial_write() {
     hold.store(false, Ordering::Relaxed);
 }
 
-/// 🟡 **三处体积闸都是「严格大于才拒」——恰好等于上限的包必须放行。**
+/// 🟡 **两处体积闸都是「严格大于才拒」——恰好等于上限的包必须放行。**
 ///
-/// 三处判定（Content-Length 预检 / 内存腿读侧 / 流式腿读侧）今日全用 `>`，但**此前无任何测试
-/// 钉住边界**：现有的门一律拿 `limit + 1` 去撞，把任一处改成 `>=` 全套仍绿。
+/// 两处判定（Content-Length 预检 / 读侧累计）全用 `>`。只拿 `limit + 1` 去撞的门钉不住边界：
+/// 把任一处改成 `>=` 那些门仍绿。
 ///
-/// 本条现在**是 App 腿的地基**（2026-08-17 订正：原写「App 腿的闸值是『声明值 + 裕度』」，
-/// 那个裕度已删）。`commands/updater::app_update_size_limit` 现在让闸值**恰好等于**
-/// 清单声明的 `fileSize`，删裕度不卡正常包的**全部理由**就是这三处的严格大于语义 ——
-/// 任一处改成 `>=`，一个大小正好等于声明值的正常安装包就会被拒，且失败长得像
-/// 「服务端给多了」。两边互引，口径必须一致。
+/// 本条是 App 更新的地基：`commands/updater::app_update_size_limit` 让闸值**恰好等于**清单声明
+/// 的 `fileSize`，不卡正常包的**全部理由**就是这两处的严格大于语义 —— 任一处改成 `>=`，一个大小
+/// 正好等于声明值的正常安装包就会被拒，且失败长得像「服务端给多了」。两边互引，口径必须一致。
 ///
-/// **变异探针**：把三处任一的 `>` 改成 `>=` ⇒ 对应那一段转红。
+/// **变异探针**：把两处任一的 `>` 改成 `>=` ⇒ 对应那一段转红。
 #[test]
 fn size_limit_boundary_admits_a_body_of_exactly_the_limit() {
     const LIMIT: usize = 2048;
@@ -1283,25 +1174,13 @@ fn size_limit_boundary_admits_a_body_of_exactly_the_limit() {
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
     let dl = CoreDownloader::new(http, rt.handle().clone()).with_max_bytes(LIMIT);
-    let bytes = std::thread::spawn(move || dl.download(&format!("http://{addr}/exact")))
-        .join()
-        .unwrap()
+    let bytes = download_bytes(dl, format!("http://{addr}/exact"))
         .expect("Content-Length 恰好等于闸值不得被预检拒掉");
     assert_eq!(bytes.len(), LIMIT);
 
-    // ② 内存腿读侧：`buf.len() + chunk.len() > limit`。无 Content-Length ⇒ 预检不参与。
+    // ② 读侧：`received + chunk.len() > limit`。无 Content-Length ⇒ 预检不参与。
     let mut raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
     raw.extend_from_slice(&payload);
-    let addr2 = spawn_server(vec![raw.clone()]);
-    let http2 = Arc::new(HttpRuntime::new().unwrap());
-    let dl2 = CoreDownloader::new(http2, rt.handle().clone()).with_max_bytes(LIMIT);
-    let bytes2 = std::thread::spawn(move || dl2.download(&format!("http://{addr2}/exact")))
-        .join()
-        .unwrap()
-        .expect("读侧累计恰好等于闸值不得被拒（内存腿）");
-    assert_eq!(bytes2.len(), LIMIT);
-
-    // ③ 流式腿读侧：`received + chunk.len() > limit`，同上。
     let addr3 = spawn_server(vec![raw]);
     let http3 = Arc::new(HttpRuntime::new().unwrap());
     let dl3 = CoreDownloader::new(http3, rt.handle().clone()).with_max_bytes(LIMIT);
@@ -1315,12 +1194,12 @@ fn size_limit_boundary_admits_a_body_of_exactly_the_limit() {
     })
     .join()
     .unwrap()
-    .expect("读侧累计恰好等于闸值不得被拒（流式腿）");
+    .expect("读侧累计恰好等于闸值不得被拒");
     assert_eq!(out.bytes, LIMIT as u64);
     assert_eq!(sink.0.lock().unwrap().len(), LIMIT);
 }
 
-/// 🟡 **体积闸是**形参**：内核腿的 16MiB 与 App 腿的清单闸互不干扰。**
+/// 🟡 **体积闸是**形参**：生效的是调用方注入的值，不是全局缺省常量。**
 ///
 /// **变异探针**：把 `open_download_response` 里的 `self.max_bytes` 改回常量
 /// `MAX_DOWNLOAD_BYTES` ⇒ 第一条断言转红（一个 1KiB 的闸拦不住 2KiB 的响应）。
@@ -1333,10 +1212,7 @@ fn per_leg_size_limit_is_honoured_not_the_global_constant() {
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
     let tight = CoreDownloader::new(http, rt.handle().clone()).with_max_bytes(1024);
-    let err = std::thread::spawn(move || tight.download(&format!("http://{addr}/asset")))
-        .join()
-        .unwrap()
-        .expect_err("超本腿闸值必须早拒");
+    let err = download_bytes(tight, format!("http://{addr}/asset")).expect_err("超闸值必须早拒");
     assert!(format!("{err}").contains("超过上限"), "实得: {err}");
 
     // ② 闸放宽到远超全局常量 → 同一份响应照常通过（证明常量已不再是硬编码的天花板）。
@@ -1344,16 +1220,13 @@ fn per_leg_size_limit_is_honoured_not_the_global_constant() {
     let http2 = Arc::new(HttpRuntime::new().unwrap());
     let loose =
         CoreDownloader::new(http2, rt.handle().clone()).with_max_bytes(MAX_DOWNLOAD_BYTES * 8);
-    let bytes = std::thread::spawn(move || loose.download(&format!("http://{addr2}/asset")))
-        .join()
-        .unwrap()
-        .expect("闸放宽后应成功");
+    let bytes = download_bytes(loose, format!("http://{addr2}/asset")).expect("闸放宽后应成功");
     assert_eq!(bytes.len(), payload.len());
 }
 
-/// 失败分类映射是纯函数，两个消费端共用同一条 —— 逐条钉住。
+/// 失败分类映射是纯函数 —— 逐条钉住。
 #[test]
-fn body_error_maps_to_the_same_download_error_for_both_legs() {
+fn body_error_maps_to_download_error() {
     assert!(matches!(
         map_body_error(BodyReadError::Stalled, Some(10)),
         DownloadError::Stalled(_)
@@ -1398,7 +1271,7 @@ fn body_error_maps_to_the_same_download_error_for_both_legs() {
 }
 
 #[test]
-fn content_length_check_is_shared_by_both_legs() {
+fn content_length_check_rejects_any_mismatch() {
     assert!(check_content_length(100, Some(100)).is_ok());
     assert!(check_content_length(100, None).is_ok(), "长度未知即不判");
     assert!(matches!(
@@ -1433,153 +1306,8 @@ fn download_rejects_oversized_content_length_before_reading_body() {
     });
     let http = Arc::new(HttpRuntime::new().unwrap());
     let dl = CoreDownloader::new(http, rt.handle().clone());
-    let err = std::thread::spawn(move || dl.download(&format!("http://{addr}/big")))
-        .join()
-        .unwrap()
-        .expect_err("超 16MiB 必须早拒");
+    let err = download_bytes(dl, format!("http://{addr}/big")).expect_err("超缺省闸必须早拒");
     assert!(format!("{err}").contains("超过上限"), "实得: {err}");
-}
-
-// ── 换核链路：下载半程的生产组合面门 ─────────────────────────────────────
-//
-// §K7.1 纪律 + updater 批的等待项：真 CoreDownloader（真 reqwest）**真被注入**
-// CoreStagedUpdater → 真下载 → 真 SHA256 校验 → 真落位。
-// **未覆盖**（如实登记）：真机换核落位到受保护核目录需 helper 特权写 + ProxyRuntime 停起协同，
-// 本机不验（破坏宿主）。本门只证「下载半程」在生产路径上真能跑通，不冒充全链闭环。
-
-#[test]
-fn core_swap_download_half_real_downloader_injected_into_staged_updater() {
-    use polaris_updater::manifest::VersionManifestEntry;
-    use polaris_updater::staged::{
-        ApplyOutcome, CoreStagedUpdater, MemoryStateStore, StagedConfig,
-    };
-    use polaris_updater::traits::StdFs;
-    use polaris_updater::verify::sha256_hex_lower;
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    // 真核字节（内容任意，关键是 SHA256 真校验）。
-    let core_bytes = b"POLARIS-FAKE-CORE-BINARY-BYTES".to_vec();
-    let sha = sha256_hex_lower(&core_bytes);
-
-    // 真回环 server 服核字节。
-    let body = core_bytes.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        if let Ok((mut sock, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf);
-            let mut resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .into_bytes();
-            resp.extend_from_slice(&body);
-            let _ = sock.write_all(&resp);
-            let _ = sock.flush();
-        }
-    });
-
-    let dest = std::env::temp_dir().join(format!("polaris-coreswap-gate-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dest);
-
-    let entry = VersionManifestEntry {
-        version: "9.9.9".into(), // 远新于 current → 过版本闸
-        url: format!("http://{addr}/sing-box.zip"),
-        sha256: Some(sha),
-        prerelease: false,
-        notes: String::new(),
-    };
-
-    // ── 真 CoreDownloader 注入 CoreStagedUpdater ──
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let downloader = CoreDownloader::new(http, rt.handle().clone());
-    let fs = StdFs;
-    let store = MemoryStateStore::default();
-    let mut cfg = StagedConfig::new(&dest);
-    cfg.restrict_band = false; // 手动路径允许跨带（本门测的是下载+校验+落位，非带闸）
-
-    // apply 是同步（内部 download 会 spawn 到 rt.handle 并阻塞等）——须在 blocking 线程调，
-    // 不能占用 rt 的 worker。
-    let dest2 = dest.clone();
-    let outcome = std::thread::spawn(move || {
-        let updater = CoreStagedUpdater::new(&downloader, &fs, &store, cfg);
-        updater.apply(&entry, "1.0.0", "sing-box")
-    })
-    .join()
-    .unwrap()
-    .expect("下载半程应成功（真 socket 收字节 + SHA256 校验过 + 落位）");
-
-    assert_eq!(
-        outcome,
-        ApplyOutcome::Applied,
-        "真下载器注入后，下载→校验→落位应 Applied"
-    );
-    // 真落位物：dest/sing-box 存在且字节 = 我们服的真核字节。
-    let landed = std::fs::read(dest2.join("sing-box")).expect("落位的核应可读");
-    assert_eq!(landed, core_bytes, "落位字节须与下载字节逐字节相同");
-    let _ = std::fs::remove_dir_all(&dest2);
-}
-
-#[test]
-fn core_swap_download_half_sha256_mismatch_is_rejected_not_landed() {
-    // 变异/安全门：manifest 的 sha256 与真下载字节不符（中间人篡改形态）→ 必须拒绝落位。
-    // 证明「下载成功」不等于「盲信落位」——SHA256 校验真的在生产下载路径后面把关。
-    use polaris_updater::manifest::VersionManifestEntry;
-    use polaris_updater::staged::{CoreStagedUpdater, MemoryStateStore, StagedConfig};
-    use polaris_updater::traits::StdFs;
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let body = b"REAL-BYTES".to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        if let Ok((mut sock, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf);
-            let mut resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .into_bytes();
-            resp.extend_from_slice(&body);
-            let _ = sock.write_all(&resp);
-            let _ = sock.flush();
-        }
-    });
-
-    let dest =
-        std::env::temp_dir().join(format!("polaris-coreswap-mismatch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dest);
-    let entry = VersionManifestEntry {
-        version: "9.9.9".into(),
-        url: format!("http://{addr}/sing-box.zip"),
-        // 故意给错 hash（64 个 a）。
-        sha256: Some("a".repeat(64)),
-        prerelease: false,
-        notes: String::new(),
-    };
-    let http = Arc::new(HttpRuntime::new().unwrap());
-    let downloader = CoreDownloader::new(http, rt.handle().clone());
-    let fs = StdFs;
-    let store = MemoryStateStore::default();
-    let mut cfg = StagedConfig::new(&dest);
-    cfg.restrict_band = false;
-
-    let dest2 = dest.clone();
-    let res = std::thread::spawn(move || {
-        let updater = CoreStagedUpdater::new(&downloader, &fs, &store, cfg);
-        updater.apply(&entry, "1.0.0", "sing-box")
-    })
-    .join()
-    .unwrap();
-
-    assert!(res.is_err(), "SHA256 不符必须报错，不得落位");
-    assert!(
-        !dest2.join("sing-box").exists(),
-        "校验失败时核**不得**落到 dest（否则坏核入库）"
-    );
-    let _ = std::fs::remove_dir_all(&dest2);
 }
 
 // ── UnlockHttp 契约门（已迁出）───────────────────────────────────────────

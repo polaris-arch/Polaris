@@ -347,3 +347,11 @@ test('未登记 scope 与 --full 都把 Android 腿 fail-closed 为真', () => {
   assert.equal(classifyImpact(['src-tauri/__not_registered__.json']).android, true);
   assert.equal(classifyImpact([], { forceFull: true }).android, true);
 });
+
+test('fixed native cleaner requires Windows package validation without a real kernel', () => {
+  const result = classifyImpact(['crates/windows-cleaner/src/windows.rs']);
+  assert.equal(result.kernel, false);
+  assert.deepEqual(result.platforms, ['windows']);
+  assert.equal(result.hasPackage, true);
+  assert.deepEqual(result.unregisteredScopes, []);
+});

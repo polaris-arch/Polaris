@@ -11,7 +11,7 @@
  * 漏掉的：既没接、也没登记、也没有任何门看得见。
  *
  * 两个面各答一半，缺一不可：
- *  · `controls` 答「这一屏有哪些动作」（复制 / 清理 / 重试 / 安装助手 / 换核 …）；
+ *  · `controls` 答「这一屏有哪些动作」（复制 / 清理 / 重试 / 安装助手 …）；
  *  · `config-fields` 答「它能改哪些配置」——那是设置屏特有的能力面，`<Switch>` / `<Select>` /
  *    `<TextInput>` 这些原语本身在 `controls` 面上只是三条原语登记，数不出它们各自改的是哪一格。
  *
@@ -34,7 +34,7 @@
  * # 这张表让哪些事第一次可见
  *
  * · **配置字段面**：桌面写的字段里，一批是平台上真的没有那个对象（托盘 / 窗口几何 /
- *   窗口特效 / 内核独立更新），一批是裁定明确要求不提供（管理 API 那一族，含那条计算键）。
+ *   窗口特效），一批是裁定明确要求不提供（管理 API 那一族，含那条计算键）。
  *   🔴 **2026-09-13 这一轮把「真的欠着」那一栏清了四条，靠的是补证据、不是改措辞**：
  *   `bypassLAN` / `bypassLANList`（生成侧只在 `platform == "win32"` 那一支消费，android 臂恒空）、
  *   `hardwareAcceleration`（逃生门三条臂各挂 `#[cfg(target_os)]`，Android 上函数体不编译）、
@@ -56,12 +56,6 @@
  *   逐条理由见各自的 `note`。
  */
 import type { ScreenParityRegister } from '../parity-registry.test-support';
-
-/** 核随应用打包（`libbox.aar`）⇒ 没有「独立于应用的内核」这个对象可更新。三条内核更新字段共用。 */
-const CORE_IS_BUNDLED = {
-  file: 'src-tauri/gen/android/app/build.gradle.kts',
-  mustContain: 'implementation(files("libs/libbox.aar"))',
-} as const;
 
 /**
  * 托盘：`tauri::tray` / `tauri::menu` 在 mobile target 上整个不存在，故凡直接消费它们的项都挂
@@ -188,6 +182,22 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '「移动端更新页只有一行说明」在接线那天就已经为假。',
     },
     {
+      id: 'AppUpdateCard.tsx|k:settings.update.portableClearAndCheck',
+      disposition: {
+        kind: 'platform-absent',
+        // 与同一张卡上的「退出并打开文件夹」同锚：这张卡只在后端回 Windows 便携形态那条告知时才出现。
+        evidence: {
+          file: 'src-tauri/src/runtime/update_install.rs',
+          mustContain:
+            'InstallPlatform::WindowsPortable => Some(InstallAdvisory::PortableManualReplace),',
+        },
+      },
+      note:
+        'Windows 便携版手动卡的显式清除提示动作：独立 IPC 持久清除成功后再检查更新；' +
+        '普通检查与后台启动检查不会放弃交接记录，清除写失败保留原卡和重试。' +
+        '这张卡在 Android 上不存在，理由同 portableQuitAndOpen。',
+    },
+    {
       id: 'AppUpdateCard.tsx|k:settings.about.checkUpdate#2',
       disposition: {
         kind: 'ported',
@@ -197,7 +207,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         },
       },
       note:
-        '检查更新的第二个渲染位（桌面在失败态下重新出现的那一颗）。移动端不按状态换按钮：同一颗 ' +
+        '检查更新的第二个固定文案渲染位（桌面失败态下重新出现的那一颗）。移动端不按状态换按钮：同一颗 ' +
         '`app-update` 按钮恒在，在 `checking` 或安装授权在途时禁用 ⇒ 失败之后它照样点得动，桌面那两个渲染位在 ' +
         '移动端是同一颗。锚指向检查与安装授权的互斥判据，防止安装在途重复检查。',
     },
@@ -236,6 +246,22 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '不停代理、不退应用）。故移动端这颗叫「安装」而不是「重启并安装」，' +
         '`MobileSettings.test.tsx ⑥` 正面钉着桌面那四句话不许出现在这一屏上。' +
         '交付的五种结局各有各的码（`REASON_*`），逐码一句话，取文在 `app-update-install.ts`。',
+    },
+    {
+      id: 'AppUpdateCard.tsx|k:settings.update.portableQuitAndOpen',
+      disposition: {
+        kind: 'platform-absent',
+        // 锚指安装计划里只属于 Windows 便携形态的那一条告知：这颗按钮只在后端回这条告知时才出现。
+        evidence: {
+          file: 'src-tauri/src/runtime/update_install.rs',
+          mustContain:
+            'InstallPlatform::WindowsPortable => Some(InstallAdvisory::PortableManualReplace),',
+        },
+      },
+      note:
+        '退出并打开文件夹。只属于 Windows 便携版（zip）：那条腿没有安装程序，应用停核、打开压缩包与' +
+        '程序所在文件夹后退出，由用户手动覆盖解压。Android 的安装交给系统安装器，没有「程序所在文件夹」' +
+        '这个对象，也不需要退出应用。',
     },
     {
       id: 'AppUpdateCard.tsx|k:settings.update.bannerSkip',
@@ -283,7 +309,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '外面还套着 `updateInfo &&`）—— **2026-09-13（批 15）随下载腿一起接上**：移动端不另起一颗按钮，' +
         '同一颗下载按钮在 `dl.phase === \'error\'` 时改写成「重试」，对象与桌面逐字相同（同一个 ' +
         '`updateApi.download(target)`）。锚指的是那条改写判据 —— 它要是变成恒显「下载」，本条当场失配。' +
-        '⚠️ 检查那条腿的重试仍是同一颗检查按钮再点一次（`k:settings.about.checkUpdate#2`，失败态不禁用）。',
+        '⚠️ 检查那条腿的重试仍是同一颗检查按钮再点一次（`k:settings.about.checkUpdate#3`，失败态不禁用）。',
     },
 
     /* ── TUN 组网网段报告：手动刷新与加载反馈 ─────────────────────────────── */
@@ -333,54 +359,6 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       },
       note: '收起或重新查看应用检查、下载及重装进度；只改变展示，后台任务与重复操作保护保持。',
     },
-    {
-      id: 'CoreUpdateCard.tsx|f:progressView',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: 'Android 内核随应用更新，进度由同页应用更新的收起/查看入口承接，不存在独立换核任务。',
-    },
-
-    /* ── 内核更新卡 / 版本横幅（核随 APK 打包，整族没有对象）────────────────── */
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.coreManagement.checkCoreUpdate',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '检查内核更新。Android 上核是随 APK 打进去的 `libbox.aar`（进程内 .so），没有「独立于应用的内核」这个对象可检查。',
-    },
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.coreManagement.updateNow',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '立即更新内核。同上：换内核 = 装新版应用。',
-    },
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.coreManagement.applyNow',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '应用已下载的内核（`core_swap` 原子替换）。这条腿的对象是一个可替换的可执行文件，Android 上不存在。',
-    },
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.coreManagement.manualSwap',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '手动换核（自选一个 sing-box 二进制换上去）。同上：Android 上没有可替换的可执行文件。',
-    },
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.core.noBackup+settings.core.rollbackConfirm+settings.coreManagement.rollback',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '回滚到上一版内核（依赖换核时留下的备份）。没有换核就没有备份，也没有可回滚的对象。',
-    },
-    {
-      id: 'CoreUpdateCard.tsx|k:settings.coreManagement.resetFactory',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '恢复出厂内核（丢掉全部换核痕迹回到随包版本）。同族，同样没有对象。',
-    },
-    {
-      id: 'CoreVersionBanner.tsx|k:settings.core.swapFailedShort+settings.coreManagement.manualSwap',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '换核失败横幅上的「手动换核」补救键。没有换核这条腿，就没有它要报的那个事件。',
-    },
-    {
-      id: 'CoreVersionBanner.tsx|k:settings.coreVersion.dismiss',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '关掉内核版本变更横幅。没有独立换核这条腿，就没有它要报的那个事件。',
-    },
-
     /* ── 通用清单编辑器（五处复用；整块的处置见 blocks 面 ListEditor 一条）────── */
     {
       id: 'ListEditor.tsx|f:add',
@@ -777,22 +755,6 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       },
       note: '窗口特效（mac vibrancy / Windows Mica）。它是建窗期的 per-platform 窗口铬，Android 上没有可加特效的窗口铬这一层。',
     },
-    {
-      id: 'field:autoUpdateCore',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '自动更新内核。Android 上核是随 APK 打进去的 `libbox.aar`（进程内 .so，不是可执行文件），桌面那套 `core_swap` 原子替换在这个形态下没有对象 —— 换内核 = 装新版应用。',
-    },
-    {
-      id: 'field:coreUpdateChannel',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '内核更新通道（稳定 / 预发布）。没有独立的内核更新，就没有通道可选。',
-    },
-    {
-      id: 'field:restrictCoreUpdateToCompatibleMinor',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '内核更新限制在兼容小版本内。同上，它约束的那条更新腿不存在。',
-    },
-
     /* ── 裁定要求不提供（3 条，管理 API 那一族）───────────────────────────── */
     {
       id: 'field:allowLan',
@@ -917,7 +879,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: { file: 'ui/src/mobile/settings/settings-pages.ts', mustContain: "update: 'settings.nav.update'" },
       },
-      note: '更新页。页在，但桌面那两张更新卡在移动端都不是可操作卡 —— 逐张的处置见下面 AppUpdateCard / CoreUpdateCard 两条。',
+      note: '更新页。页在；桌面这一页上两张非子页的卡（AppUpdateCard / CoreInfoCard）逐张的处置见下面两条。',
     },
     {
       id: 'SettingsBackup',
@@ -961,14 +923,16 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '一族）—— 不是这张卡没移植。',
     },
     {
-      id: 'CoreUpdateCard',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '内核更新卡（分级更新 / 回滚 / 恢复出厂）。核随 APK 打包，这张卡的三件事在这个形态下都没有对象。',
-    },
-    {
-      id: 'CoreVersionBanner',
-      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
-      note: '内核版本变更横幅（换核之后提示重启生效）。没有独立换核这条腿，就没有它要报的那个事件。',
+      id: 'CoreInfoCard',
+      disposition: {
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/settings/AboutPage.tsx', mustContain: '` · sing-box ${info.coreVersion}`' },
+      },
+      note:
+        '内核只读信息卡（随包内核自报版本 / 清单声明版本 / 补丁集标识）。移动端的落点是关于页那一行里的 ' +
+        '`sing-box <版本>`（`version_get_info` 的 `coreVersion`）；清单声明版本与补丁集标识这两格移动端' +
+        '不显示 —— Android 上内核是随 APK 链进应用进程的 libbox，没有独立的内核文件，也没有助手目录里的' +
+        '副本，补丁集标识在移动端恒为空。',
     },
     {
       id: 'ListEditor',
@@ -1064,9 +1028,9 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
    * 桌面加一行带 id 的设置槽 ⇒ 这条不等 ⇒ 红 ⇒ 逼一次「移动端要不要有」的显式决定。
    */
   slotBaseline: [
-    'app-update-card', 'auto-core-swt', 'auto-dl-swt', 'backup-block', 'backup-master',
+    'app-update-card', 'auto-dl-swt', 'backup-block', 'backup-master',
     'browser-doh-list', 'browser-doh-swt', 'bypass-lan-swt', 'cidr-bypass-off-note', 'cidr-list',
-    'control-port-input', 'core-ver-banner', 'disable-log-file-swt', 'dns-bootstrap-row',
+    'control-port-input', 'core-info-card', 'disable-log-file-swt', 'dns-bootstrap-row',
     'dns-connection-resolution', 'dns-custom-list', 'dns-input-domestic', 'dns-input-remote',
     'dns-optimistic-swt', 'dns-preset-domestic', 'dns-preset-remote', 'dns-single-resolver',
     'dns-timeout-input', 'fakeip-filter-list', 'fakeip-filter-swt', 'fakeip-swt',

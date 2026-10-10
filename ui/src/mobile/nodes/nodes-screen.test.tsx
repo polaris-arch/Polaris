@@ -2828,7 +2828,7 @@ describe('⑯-b 核停时行动作面里有「连接」，且文案与首页不�
     expect(zh, '理由文案又指回首页了').not.toContain('首页');
     expect(zh, '理由文案不再是在说「核没跑」').toMatch(/未运行/);
     // 自检：同一套读法对着一个已知含「首页」的键确实报得出来（否则上面那条否定断言没有信息量）。
-    expect(String(copy('zh-CN', 'settings.coreVersion.sameVersionGoManage'))).toContain('请到');
+    expect(String(copy('zh-CN', 'home.nativeReconnectRequired'))).toContain('首页');
   });
 });
 

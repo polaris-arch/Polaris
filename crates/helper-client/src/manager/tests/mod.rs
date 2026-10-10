@@ -1277,11 +1277,6 @@ fn win_install_script_targets_the_same_paths_status_probes() {
         script.contains(&format!("New-Service -Name {}", paths.service_label)),
         "安装脚本注册的服务名与状态探测用的不一致"
     );
-    // 卸载脚本也得指同一个服务，否则卸不干净、下次装撞 1072。
-    assert!(
-        build_win_uninstall_script().contains(&format!("delete {}", paths.service_label)),
-        "卸载脚本删的服务名与状态探测不一致"
-    );
 }
 
 #[test]
@@ -1617,7 +1612,13 @@ fn win_install_script_writes_each_dacl_in_one_call_and_owns_by_administrators() 
         "取材面自检失败：只取到 {} 条 icacls 行（应 ≥7）",
         icacls.len()
     );
-    for obj in ["$support", "$coreDir", "$tokenFile", "$helperDst"] {
+    for obj in [
+        "$support",
+        "$coreDir",
+        "$tokenFile",
+        "$helperDst",
+        "$cleanerDst",
+    ] {
         assert!(
             icacls.iter().any(|l| l.contains(obj)),
             "取材面自检失败：没有一条 icacls 打在 {obj} 上"
@@ -1637,8 +1638,8 @@ fn win_install_script_writes_each_dacl_in_one_call_and_owns_by_administrators() 
         .collect();
     assert_eq!(
         inherit.len(),
-        3,
-        "去继承的对象应恰好是 $support / $coreDir / $helperDst 三个，实得 {inherit:?}"
+        4,
+        "去继承的对象应恰好是 $support / $coreDir / $helperDst / $cleanerDst 四个，实得 {inherit:?}"
     );
     assert_eq!(
         inherit, grant,
@@ -1663,8 +1664,8 @@ fn win_install_script_writes_each_dacl_in_one_call_and_owns_by_administrators() 
         .collect();
     assert_eq!(
         setowner.len(),
-        4,
-        "四个受保护对象（$support/$coreDir/$tokenFile/$helperDst）都要显式 /setowner，实得 {setowner:?}"
+        5,
+        "五个受保护对象（$support/$coreDir/$tokenFile/$helperDst/$cleanerDst）都要显式 /setowner，实得 {setowner:?}"
     );
     for line in &setowner {
         assert!(
@@ -1913,16 +1914,6 @@ fn uninstall_scripts_remove_service_and_files() {
     let lin = build_linux_uninstall_script(&InstallPaths::linux());
     assert!(lin.contains("systemctl disable --now polaris-helper.service"));
     assert!(lin.contains("rm -rf '/usr/local/lib/polaris' '/var/lib/polaris' '/run/polaris'"));
-    let win = build_win_uninstall_script();
-    assert!(win.contains("& $sc delete PolarisHelper"));
-    assert!(win.contains("& $sc stop PolarisHelper"));
-    // 同 install 的病根牙（最强形）：单引号包任何 $ 引用的调用即病；本脚本 EAP=
-    // SilentlyContinue，病发时静默什么都不卸——「卸载点了没反应」的隐性形态。
-    assert!(
-        !win.contains("& '$"),
-        "win 卸载脚本出现单引号包 $ 引用的调用——静默不卸的必死形态"
-    );
-    assert!(win.contains(r"Remove-Item -Recurse -Force -Path 'C:\ProgramData\Polaris'"));
 }
 
 // ── install()/uninstall() 端到端（提权接线 + 落盘 + 清理）──
@@ -2310,4 +2301,34 @@ fn win_install_script_seeds_cronet_from_the_bundled_core_directory() {
     );
     // 反向：绝不能退化成相对路径的裸名（`Test-Path` 相对当前目录 ⇒ 静默不播种）。
     assert!(!script.contains("$bundledSidecar = 'libcronet.dll'"));
+}
+
+#[test]
+fn windows_cleaner_install_is_fixed_protected_and_transactional() {
+    let script = build_win_install_script(
+        &InstallPaths::win(),
+        &install_params(
+            PathBuf::from("/x"),
+            PathBuf::from(r"C:\app\polaris-helper.exe"),
+        ),
+        "TOKEN",
+    );
+    for needle in [
+        r"$cleanerSrc = 'C:\app\polaris-cleaner.exe'",
+        r"$cleanerDst = 'C:\ProgramData\Polaris\polaris-cleaner.exe'",
+        "$hadCleaner = Test-Path -LiteralPath $cleanerDst",
+        "Copy-Item -LiteralPath $cleanerDst -Destination $cleanerBackup -Force",
+        "Copy-Item -LiteralPath $cleanerBackup -Destination $cleanerDst -Force",
+        "Remove-Item -Force -Path $cleanerDst -ErrorAction SilentlyContinue",
+    ] {
+        assert!(script.contains(needle), "{needle}");
+    }
+    assert!(
+        script.find("bundled native cleaner missing").unwrap() < script.find("& $sc stop").unwrap()
+    );
+    assert!(script.find("$hadCleaner").unwrap() < script.find("try {").unwrap());
+    assert!(
+        script.find("& $icacls $cleanerDst /setowner").unwrap()
+            < script.find("New-Service -Name").unwrap()
+    );
 }

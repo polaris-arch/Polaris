@@ -91,7 +91,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `real_core_crash_feeds_diagnostic_restart_axis` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore |
 | `real_core_intentional_stop_does_not_restart` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore |
 | `real_core_crash_loop_gives_up_without_infinite_restart` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore（含 2+5+15s 退避） |
-| `real_core_stale_cleanup_kills_own_orphan_spares_foreign` | `src-tauri/src/runtime/proxy/tests/process_supervision.rs` | RealCore |
+| `real_core_stale_cleanup_kills_own_orphan_spares_foreign` | `src-tauri/src/runtime/proxy/tests/process_supervision.rs` | RealCore（判据改为按运行配置归属后未实跑） |
 | `real_core_accepts_bound_shadow_tls_temp_config` | `src-tauri/src/runtime/speedtest/tests/mod.rs` | RealCore（另需 `POLARIS_TEST_INTERFACE`） |
 | `real_core_aggregate_relay_emits_real_frames` | `src-tauri/src/runtime/stats/tests/real_core_tests.rs` | RealCore |
 | `real_https_get_handshakes_and_returns_body` | `src-tauri/src/runtime/http/tests/mod.rs` | PublicNetwork |

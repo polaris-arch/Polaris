@@ -200,3 +200,111 @@ describe('消费面守卫 —— 发起方必须认领', () => {
     expect(CALL.test(stripComments('const s = "/*"; await startProxy(); const e = "*/";'))).toBe(true);
   });
 });
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 两条出口成对守卫
+ *
+ * 事件腿对一个码写了 `if (isProxyStartClaimed()) return;`，等于承诺「认领期内由发起方的 await 腿报」。
+ * 那个承诺只有在 await 腿真的为同一个码写了分支时才成立：否则认领期内两条腿都不出专属文案，
+ * 用户看到的是通用的「启动失败，请检查服务器配置」。反过来，await 腿报了而事件腿不让位 ⇒ 一次
+ * 失败两条提示。故两张表按码对拍，新增一个让位的码时缺任一半都红。
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** 事件腿里「认领期内让位」的码：顶层 `if (data.errorCode === …) {` 段内出现 `isProxyStartClaimed()`。 */
+function claimGatedCodes(routingSource: string): string[] {
+  const code = stripComments(routingSource);
+  return code
+    .split('\n  if (data.errorCode ===')
+    .slice(1)
+    .filter((segment) => segment.includes('isProxyStartClaimed()'))
+    .flatMap((segment) => {
+      const condition = segment.slice(0, segment.indexOf('{'));
+      return [...condition.matchAll(/'([A-Z][A-Z0-9_]*)'/g)].map((m) => m[1]!);
+    });
+}
+
+/** Home 连接按钮 await 腿（起核认领点之后的 catch，到通用兜底为止）里专门处理的码。 */
+function homeAwaitLeg(homeSource: string): string | null {
+  const code = stripComments(homeSource);
+  const from = code.indexOf('withProxyStartClaim(() => startProxy())');
+  const to = code.indexOf("t('errors.startupFailed')", from);
+  return from < 0 || to < 0 ? null : code.slice(from, to);
+}
+
+describe('两条出口成对守卫 —— 事件腿让位的码，await 腿必须自己报', () => {
+  /** 事件腿让位、而桌面 Home 的 await 腿结构上收不到的码（逐条写清为什么）。 */
+  const NOT_ON_DESKTOP_HOME: Record<string, string> = {
+    // 只由 Android 原生账本发出；移动端发起方走 `runWrite` 自己的失败回显。
+    ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED: 'Android 专有',
+  };
+
+  async function sources(): Promise<{ routing: string; home: string }> {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    return {
+      routing: fs.readFileSync(path.join(root, 'domain', 'proxy-error-routing.ts'), 'utf8'),
+      home: fs.readFileSync(
+        path.join(root, 'components', 'screens', 'home', 'HomeScreen.tsx'),
+        'utf8',
+      ),
+    };
+  }
+
+  it('取材自检：两个切片都非空，且合成样本上分得清让位与不让位', async () => {
+    const { routing, home } = await sources();
+    expect(claimGatedCodes(routing).length).toBeGreaterThanOrEqual(4);
+    expect(homeAwaitLeg(home)?.length ?? 0).toBeGreaterThan(200);
+    const sample = [
+      'function f() {',
+      "  if (data.errorCode === 'A_CODE' || data.errorCode === 'B_CODE') {",
+      '    if (isProxyStartClaimed()) return;',
+      '  }',
+      "  if (data.errorCode === 'C_CODE') {",
+      '    toast.error(x);',
+      '  }',
+      "  // if (data.errorCode === 'D_CODE') { if (isProxyStartClaimed()) return; }",
+      '}',
+    ].join('\n');
+    expect(claimGatedCodes(sample)).toEqual(['A_CODE', 'B_CODE']);
+    expect(homeAwaitLeg('const x = 1;')).toBeNull();
+  });
+
+  it('事件腿让位的每个码，Home 的 await 腿都有专属分支', async () => {
+    const { routing, home } = await sources();
+    const leg = homeAwaitLeg(home)!;
+    const gated = claimGatedCodes(routing);
+    expect(gated).toContain('CORE_NOT_EXECUTABLE');
+    expect(gated).toContain('HELPER_CORE_MISMATCH');
+    const unhandled = gated.filter(
+      (c) => !(c in NOT_ON_DESKTOP_HOME) && !leg.includes(`code === ProxyErrorCode.${c}`),
+    );
+    expect(
+      unhandled,
+      '事件腿在认领期内对这些码让位，Home 的 await 腿却没有分支 —— 认领期内用户只会看到通用的启动失败',
+    ).toEqual([]);
+    // 豁免表不得陈旧：点名的码必须确实仍在让位集合里。
+    expect(Object.keys(NOT_ON_DESKTOP_HOME).filter((c) => !gated.includes(c))).toEqual([]);
+  });
+
+  it('HELPER_CORE_MISMATCH：await 腿报的是本码专属文案并就此返回，不落到通用兜底', async () => {
+    const { home } = await sources();
+    const leg = homeAwaitLeg(home)!;
+    const at = leg.indexOf('code === ProxyErrorCode.HELPER_CORE_MISMATCH');
+    expect(at).toBeGreaterThanOrEqual(0);
+    const branch = leg.slice(at, leg.indexOf('return;', at) + 'return;'.length);
+    expect(branch).toContain("toast.error(t('errors.helperCoreMismatch'))");
+    expect(branch.match(/toast\./g)?.length).toBe(1);
+  });
+
+  it('CORE_NOT_EXECUTABLE：await 腿报的是本码专属文案并就此返回，不落到通用兜底', async () => {
+    const { home } = await sources();
+    const leg = homeAwaitLeg(home)!;
+    const at = leg.indexOf('code === ProxyErrorCode.CORE_NOT_EXECUTABLE');
+    expect(at).toBeGreaterThanOrEqual(0);
+    const branch = leg.slice(at, leg.indexOf('return;', at) + 'return;'.length);
+    expect(branch).toContain("toast.error(t('errors.coreNotExecutable'))");
+    expect(branch.match(/toast\./g)?.length).toBe(1);
+  });
+});

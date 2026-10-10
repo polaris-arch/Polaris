@@ -769,30 +769,10 @@ export interface UserConfig {
   blockBrowserDoh?: boolean;
   /** 被拦的 DoH 端点域名清单（domain_suffix 语义）。未编辑=undefined → 用内置起点。 */
   browserDohList?: string[];
-  // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
-  // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
-  restrictCoreUpdateToCompatibleMinor?: boolean;
-  // 内核自动更新总开关（默认 false；读取端 === true 判定，不进 createDefaultConfig）。开启后调度器周期检查、
-  // 仅在「同 major.minor 兼容版本带内」（如 1.13.x→1.13.y）自动下载+预检+落位；跨 minor 一律不自动，仅提示。
-  // 落位永远只在代理进程不存在时发生（运行中暂存 staged，延到停止/启动/用户点立即应用），绝不静默断流。
-  autoUpdateCore?: boolean;
-  /**
-   * sing-box 内核更新通道。缺省 / 非法值均按 `'stable'`（= 本字段引入前写死的行为）。
-   *
-   * `'prerelease'` 才把 GitHub 上 `prerelease=true` 的 release（sing-box 的 alpha/beta/rc）纳入候选。
-   * **不按 alpha/beta/rc 再细分**：GitHub 只给一个布尔，档次仅存在于 tag 文本里，靠字符串猜档
-   * 会在上游改命名的那天静默失效。
-   *
-   * 与 `restrictCoreUpdateToCompatibleMinor` **正交**：本字段决定「看不看预发布」，那个决定
-   * 「跨不跨 minor」。开了预发布不会顺带放开跨带闸。
-   */
-  coreUpdateChannel?: 'stable' | 'prerelease';
   /** Polaris 应用更新通道；缺省稳定版，`prerelease` 才纳入 GitHub 预发布。 */
   appUpdateChannel?: 'stable' | 'prerelease';
-  // **App**（非内核）更新的自动下载开关（默认 false；读取端 === true 判定）。开启后「检查到新版本」应在后台
-  // 自动 update_download，就绪后提示安装。与 `autoUpdateCore` 是两件事：那个管 sing-box 内核二进制的换核，
-  // 这个管 Polaris 自身安装包的下载 —— 此前 UI 把「发现新版本时自动下载」错绑到 autoUpdateCore，
-  // 用户拨的是内核开关却以为在管 App 下载（语义错位，本批拆开）。
+  // 应用更新的自动下载开关（默认 false；读取端 === true 判定）。开启后「检查到新版本」应在后台
+  // 自动 update_download，就绪后提示安装。
   // 后端由 startup_tasks::should_auto_download_update 读取，并在自动检查命中新版本后启动后台下载。
   autoDownloadUpdate?: boolean;
   /** @deprecated 已迁移至 customRules（processName+direct）；仅保留兼容旧配置，ConfigManager 启动时清空迁移。 */

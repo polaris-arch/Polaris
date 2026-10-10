@@ -56,15 +56,8 @@ import {
 import { openTrackedSubscriptionCreateRecovery } from './store/subscription-create-recovery';
 
 /**
- * #17 内核基线警告的「每会话一次」闸门。**必须是模块级单例**——挂在组件内（useRef/state）会随
- * App 重挂（轻量模式返回 / window 重建）复位，等于没去重。同 上游的模块级
- * `let coreBaselineWarnedThisSession = false`。
- */
-const coreBaselineWarnGate = createOnceGate();
-
-/**
- * 「提权助手可升级」提示的每会话一次闸门。**必须是模块级单例**（同 `coreBaselineWarnGate` 的理由：
- * 挂在组件内的 `useRef`/`state` 会随 App 重挂 —— 轻量模式返回 / window 重建 —— 复位，等于没去重）。
+ * 「提权助手可升级」提示的每会话一次闸门。**必须是模块级单例**：挂在组件内的 `useRef`/`state`
+ * 会随 App 重挂 —— 轻量模式返回 / window 重建 —— 复位，等于没去重。
  *
  * 本腿尤其需要它：触发源有**两个**（后端事件 + 挂载回读），二者必然重叠，没有闸门就是同一件事
  * 弹两条 toast。
@@ -677,21 +670,6 @@ export default function App() {
     const off = api.proxy.onSystemProxyResidual(({ proxy }) =>
       toast.warning(t('proxy.systemProxyResidualDesc', { proxy }))
     );
-    return off;
-  }, [t]);
-
-  // #17 非官方核 ≤ 随包基线 → 兼容风险警告（对齐 上游 use-native-events.ts::handleCoreBaselineWarning）。
-  // **每会话一次**：启动期发射，若不去重则轻量模式返回/window 重建重挂 App 时会重复唠叨（同上方
-  // systemProxyResidual 的每会话一次模式）。去重闸门用模块级单例 `coreBaselineWarnGate`（见文件顶部），
-  // 等价于 上游的 `let coreBaselineWarnedThisSession`，但工厂形态可被单测锁死「第 2 次返 false」。
-  // 发射端由并行后端批补上（启动期检测非官方核 ≤ 随包基线时发，payload {current, bundled, kind}）。
-  // Polaris 的 toast.warning 是单串签名（无 sonner 的 options 对象）→ 标题与详情合成一条，
-  // 直接用带 {{current}}/{{bundled}} 插值的 coreBaselineWarnDesc（同 systemProxyResidualDesc 的用法）。
-  useEffect(() => {
-    const off = api.proxy.onCoreBaselineWarning(({ current, bundled }) => {
-      if (!coreBaselineWarnGate()) return;
-      toast.warning(t('settings.advanced.coreBaselineWarnDesc', { current, bundled }));
-    });
     return off;
   }, [t]);
 

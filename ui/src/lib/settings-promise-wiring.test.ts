@@ -99,7 +99,7 @@ function resolveT(expr: string): string {
 function collectDescs(): DescHit[] {
   const out: DescHit[] = [];
   for (const f of readdirSync(SETTINGS_DIR).filter((n) =>
-    /^Settings.*\.tsx$/.test(n) || ['AppUpdateCard.tsx', 'CoreUpdateCard.tsx'].includes(n),
+    /^Settings.*\.tsx$/.test(n) || ['AppUpdateCard.tsx', 'CoreInfoCard.tsx'].includes(n),
   )) {
     const src = code(readFileSync(join(SETTINGS_DIR, f), 'utf8'));
     const re = /(?:desc|tip)=(?:"([^"]*)"|\{t\('([^']+)'(?:,\s*'([^']*)')?[\s\S]*?\}|\{([^}]*)\})/g;
@@ -506,14 +506,6 @@ const REGISTRY: readonly PromiseRow[] = [
   {
     snippet: '启动时检查到新版本即在后台下载安装包',
     evidence: { kind: 'config-key', key: 'autoDownloadUpdate' },
-  },
-  {
-    snippet: '每天后台检查一次内核更新',
-    evidence: { kind: 'config-key', key: 'autoUpdateCore' },
-  },
-  {
-    snippet: '自动更新时跳过',
-    evidence: { kind: 'config-key', key: 'restrictCoreUpdateToCompatibleMinor' },
   },
   {
     snippet: 'Polaris 启动时检查并在需要时补更',

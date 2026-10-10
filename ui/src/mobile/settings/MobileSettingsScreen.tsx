@@ -441,13 +441,13 @@ export function SettingsRoot({
             desc={t('mobileSettings.update.entryDesc')}
             onOpen={() => onOpen('update')}
           />
-          {/* 「忽略」= 桌面横幅那颗关闭按钮（同一条键 `settings.coreVersion.dismiss`）：
+          {/* 「忽略」= 桌面横幅那颗关闭按钮（同一条键 `settings.update.bannerDismiss`）：
               **本会话**闭嘴，不写后端（跨会话仍提示）。与桌面相邻的「跳过此版本」语义强度差一个
               数量级 —— 那一颗是持久的，移动端只给这一颗弱的：强的那颗要在能读到版本说明的地方
               才说得清，而这里只是一行入口。 */}
           <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '8px' }}>
             <MobileButton onClick={() => markAppVersionDismissed(appUpdate)}>
-              {t('settings.coreVersion.dismiss')}
+              {t('settings.update.bannerDismiss')}
             </MobileButton>
           </div>
         </SettingsGroup>

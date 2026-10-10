@@ -111,97 +111,6 @@ fn auto_check_update_defaults_to_true() {
     ));
 }
 
-// ── should_warn_core_baseline ─────────────────────────────────────────────
-const BUNDLED: &str = "1.13.13";
-
-#[test]
-fn baseline_warning_never_for_official_core() {
-    // 官方核无论版本高低都不提醒。
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Official,
-        "1.0.0",
-        BUNDLED
-    ));
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Official,
-        BUNDLED,
-        BUNDLED
-    ));
-}
-
-#[test]
-fn baseline_warning_for_fork_at_or_below_bundled() {
-    // fork 主版本低于基线 → 提醒。
-    assert!(should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "1.12.8-reF1nd",
-        BUNDLED
-    ));
-    // fork 与基线同主版本（带 fork 尾段 → 规范化后是 prerelease，序低于正式版）→ 提醒。
-    assert!(should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "1.13.13-reF1nd",
-        BUNDLED
-    ));
-}
-
-#[test]
-fn baseline_warning_not_for_fork_above_bundled() {
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "1.14.0-reF1nd",
-        BUNDLED
-    ));
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "2.0.0-nekolsd",
-        BUNDLED
-    ));
-}
-
-#[test]
-fn baseline_warning_for_unknown_equal_to_bundled() {
-    // unknown 且恰等基线 → 提醒（`<=` 含等号）。
-    assert!(should_warn_core_baseline(
-        CoreBuildKind::Unknown,
-        BUNDLED,
-        BUNDLED
-    ));
-}
-
-#[test]
-fn baseline_warning_suppressed_on_unparsable_versions() {
-    // 版本串不可解析 → 一律不提醒（compare_semver 会把它当 0.0.0 判「远低于基线」→ 误报）。
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Unknown,
-        "garbage-output",
-        BUNDLED
-    ));
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Unknown,
-        "",
-        BUNDLED
-    ));
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "sing-box",
-        BUNDLED
-    ));
-    // 基线侧不可解析（理论上不该发生）同样不提醒。
-    assert!(!should_warn_core_baseline(
-        CoreBuildKind::Fork,
-        "1.0.0",
-        "not-a-version"
-    ));
-}
-
-#[test]
-fn kind_label_maps_fork_and_unknown() {
-    assert_eq!(kind_label(CoreBuildKind::Fork), "fork");
-    assert_eq!(kind_label(CoreBuildKind::Unknown), "unknown");
-}
-
-// ── should_auto_download_update ───────────────────────────────────────────
 #[test]
 fn auto_download_defaults_to_off_and_needs_explicit_true() {
     assert!(
@@ -276,6 +185,25 @@ fn auto_download_skips_assets_that_could_never_be_installed_here() {
         None
     )
     .is_ok());
+    // Windows 便携版：便携压缩包可交付（手动覆盖那条腿）⇒ 会后台下载；安装器装不到便携目录
+    // ⇒ 不下。
+    let portable = std::path::Path::new("D:\\Tools\\Polaris\\polaris.exe");
+    assert!(auto_download_applicable(
+        "windows",
+        "polaris-portable-1.2.3.zip",
+        portable,
+        None,
+        Some(portable)
+    )
+    .is_ok());
+    assert!(auto_download_applicable(
+        "windows",
+        "Polaris-Setup-1.2.3.exe",
+        portable,
+        None,
+        Some(portable)
+    )
+    .is_err());
 }
 
 // ── should_notify_helper_upgradeable ──────────────────────────────────────
@@ -308,20 +236,19 @@ fn helper_upgradeable_notified_only_when_installed_and_upgradeable() {
     );
 }
 
-/// 🟡 **五条启动腿必须各占各的时刻**——本文件自己立的错峰约定（见 `CORE_BASELINE_DELAY_MS`
-/// 「错开上面 2s/5s 两个高峰」），此前出口 IP 首探与自动连接双双 2s、正面违反。
+/// 🟡 **四条启动腿必须各占各的时刻**——本文件自己立的错峰约定，此前出口 IP 首探与自动连接
+/// 双双 2s、正面违反。
 ///
 /// 撞点的后果不止是启动瞬间的资源峰值：自动连接会起核，起核腿随即排一发 4s 后的重探，与同刻起跑
 /// 的首探腿形成竞态（落地顺序另由 `commands::misc` 的世代闸兜底，但两条腿本就不该同刻发车）。
 ///
-/// **变异锁**：把 `EXIT_IP_PROBE_DELAY_MS` 改回 `2_000`、或把 helper 探测排到 6s → 本条转红。
+/// **变异锁**：把 `EXIT_IP_PROBE_DELAY_MS` 改回 `2_000`、或把 helper 探测排到 5s → 本条转红。
 #[test]
 fn startup_leg_delays_are_all_distinct() {
     let delays = [
         ("自动连接", AUTO_CONNECT_DELAY_MS),
         ("出口 IP 首探", EXIT_IP_PROBE_DELAY_MS),
         ("自动检查更新", AUTO_CHECK_UPDATE_DELAY_MS),
-        ("内核基线提醒", CORE_BASELINE_DELAY_MS),
         ("helper 可升级探测", HELPER_UPGRADEABLE_DELAY_MS),
     ];
     for (i, (name_a, a)) in delays.iter().enumerate() {

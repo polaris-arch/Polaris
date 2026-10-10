@@ -1,6 +1,6 @@
-import { invoke, invokeScalar, listen } from '../ipc-client';
+import { invoke, listen } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { CoreBuildKind } from '../../domain/core-build';
+import type { CoreVersionInfo } from '../../contracts/types/update';
 
 export interface VersionInfo {
   debugReportAvailable?: boolean;
@@ -13,6 +13,11 @@ export interface VersionInfo {
   platform: string;
   arch: string;
   osVersion: string;
+  /**
+   * Windows 便携版上次手动交接的压缩包位置。completionUnverified 表示应用无法确认
+   * 是否覆盖（包括同版本修复），不能据此报告未完成或已安装。仅显式清除提示会放弃此记录；后台和普通检查保留它。
+   */
+  pendingPortableUpdate?: { archive: string; completionUnverified?: boolean };
 }
 
 // ============================================================================
@@ -82,12 +87,18 @@ export interface UpdateProgressManifest extends Omit<UpdateInfo, 'releaseNotes' 
 /**
  * 安装前必须告知用户的事项（后端 `update_install::InstallAdvisory` 的 key）。
  *
- * 三者都是「OS 会拦一道，用户需要知道怎么点」——**应用内消不掉的必须提前讲清楚**：
+ * 前三者都是「OS 会拦一道，用户需要知道怎么点」——**应用内消不掉的必须提前讲清楚**：
  *  - `macosGatekeeper`：ad-hoc 签名 → 安装脚本会自动清 quarantine；万一失败需右键「打开」
  *  - `windowsSmartScreen`：无 Authenticode → 「更多信息 → 仍要运行」
  *  - `debElevation`：即将弹 polkit 提权框（取消即真 no-op，不会留下「代理被停但没更新」的坏态）
+ *
+ * 第四个不是 OS 拦截，而是「这条腿没有安装程序」：
+ *  - `portableManualReplace`：Windows 便携版（zip）。更新要用户自己把压缩包覆盖解压到程序目录；
+ *    回包同时带 `programDir`。确认后后端先停核、打开压缩包与程序目录，再退出应用。
+ *    它不走通用确认框，而是落在更新卡的 `manual` 态（见 `use-app-update.ts`）。
  */
-export type InstallAdvisory = 'macosGatekeeper' | 'windowsSmartScreen' | 'debElevation';
+export type DialogInstallAdvisory = 'macosGatekeeper' | 'windowsSmartScreen' | 'debElevation';
+export type InstallAdvisory = DialogInstallAdvisory | 'portableManualReplace';
 
 /**
  * Android 交系统安装器那条腿的失败原因码（后端原样转述 Kotlin 侧的 `REASON_*` 常量）。
@@ -117,7 +128,12 @@ export interface UpdateInstallResult {
   /** true = 需要先向用户展示 advisory 说明，确认后再带 confirmed:true 重调。 */
   needConfirm?: boolean;
   advisory?: InstallAdvisory;
-  /** 形态错配 → 已回退交系统打开（**不强制 root 安装**）。 */
+  /** 仅随 `advisory: 'portableManualReplace'`：程序所在目录（用户覆盖解压的目标）。 */
+  programDir?: string;
+  /**
+   * 形态错配时是否已回退交系统打开（**不强制 root 安装**）。`false` = 没有打开：系统打不开，
+   * 或便携版拿到的是安装程序（交出去就是运行它，后端不交）。
+   */
   handedToSystem?: boolean;
   /**
    * **Android 专有**：包已交给系统安装器，本进程还活着在等用户在系统 UI 上确认。
@@ -180,6 +196,10 @@ export interface UpdateProgress {
 }
 
 export const updateApi = {
+  /** Explicit reminder dismissal, independent of the network check outcome. */
+  async clearPortableHandoff(): Promise<void> {
+    return invoke(IPC_CHANNELS.UPDATE_CLEAR_PORTABLE_HANDOFF);
+  },
   async check(
     options: { includePrerelease?: boolean; includeCurrent?: boolean } = {},
   ): Promise<UpdateCheckResult> {
@@ -258,146 +278,11 @@ export const updateApi = {
 };
 
 // ============================================================================
-// coreUpdateApi —— 内核（sing-box）更新
+// coreApi —— 内核（sing-box）只读信息
 // ============================================================================
 
-/** 换核类命令的统一返回（`core_update_run` / `rollback` / `replaceManual` / `resetFactory` 共用）。 */
-export interface CoreSwapResult {
-  ok: boolean;
-  result?: 'applied' | 'deferred' | 'noop';
-  corePath?: string;
-  hasBackup?: boolean;
-  previousVersion?: string;
-  currentVersion?: string;
-  /** 换核前代理在跑 → 换完已自动重启。 */
-  restarted?: boolean;
-  /** 跨大版本带被自动更新硬闸拦下（手动换核可绕过）。 */
-  crossBand?: boolean;
-  latestVersion?: string;
-}
-
-export const coreUpdateApi = {
-  async check(): Promise<{
-    hasUpdate: boolean;
-    currentVersion: string;
-    currentVersionLine?: string;
-    latestVersion?: string;
-    downloadUrl?: string;
-    assetName?: string;
-    /** GitHub asset digest 解析出的期望 sha256（旧 release 可能缺）。 */
-    sha256?: string | null;
-    releaseNotes?: string;
-    /** latestVersion 是否跨当前 minor 带；true 时 UI 标注跨大版本风险。 */
-    crossBand?: boolean;
-    error?: string;
-  }> {
-    return invoke(IPC_CHANNELS.CORE_UPDATE_CHECK);
-  },
-
-  /**
-   * 下载并换核。传 downloadUrl 直接换；不传则后端自查一次。
-   *
-   * 返回结构化结果（**非 boolean**）：布尔会把 deferred/noop 折叠成「失败」，
-   * 让「跨带被闸拦下」和「真失败」在 UI 上无从区分。
-   */
-  async update(downloadUrl?: string): Promise<CoreSwapResult> {
-    // Polaris 原直接传裸 string；Tauri 需对象，底层包 { value }。
-    return invokeScalar<CoreSwapResult>(IPC_CHANNELS.CORE_UPDATE_RUN, downloadUrl ?? '');
-  },
-
-  async getVersionInfo(): Promise<{
-    currentVersion: string;
-    bundledVersion: string;
-    /**
-     * 备份版本号。**恒为 null**：读它需执行 `<bak> version`（跑内核二进制），属真机腿。
-     * `hasBackup` 已足以驱动「回滚」按钮；此处如实返 null 而非拿现役核版本冒充。
-     */
-    backupVersion: string | null;
-    hasBackup: boolean;
-    build: 'official' | 'fork' | 'unknown';
-    pendingChangeNotice?: { previousVersion: string; currentVersion: string } | null;
-  }> {
+export const coreApi = {
+  async getVersionInfo(): Promise<CoreVersionInfo> {
     return invoke(IPC_CHANNELS.CORE_GET_VERSION_INFO);
-  },
-
-  /** banner 展示版本变更通知后 ack 清除持久 pendingChangeNotice。 */
-  async ackVersionChange(): Promise<void> {
-    return invoke(IPC_CHANNELS.CORE_UPDATE_ACK_VERSION_CHANGE);
-  },
-
-  async rollback(): Promise<CoreSwapResult> {
-    return invoke(IPC_CHANNELS.CORE_ROLLBACK);
-  },
-
-  onVersionChanged(
-    listener: (data: {
-      previousVersion: string;
-      currentVersion: string;
-      hasBackup: boolean;
-    }) => void
-  ): () => void {
-    return listen(IPC_CHANNELS.EVENT_CORE_VERSION_CHANGED, listener);
-  },
-
-  /**
-   * 手动替换核心。无参：弹文件选择器 + 预检；传 { filePath, force:true }：跳过确认直接换。
-   */
-  async replaceManual(opts?: {
-    filePath?: string;
-    force?: boolean;
-  }): Promise<
-    | (CoreSwapResult & { ok: true; build?: CoreBuildKind })
-    | {
-        ok: false;
-        /** 用户在系统文件选择器里取消 —— 正常流程，不是错误，UI 不得弹红。 */
-        cancelled?: boolean;
-        needConfirm?: boolean;
-        sameVersion?: string;
-        baselineOverride?: boolean;
-        uploadVersion?: string;
-        bundledVersion?: string;
-        filePath?: string;
-        error?: string;
-      }
-  > {
-    return invoke(IPC_CHANNELS.CORE_REPLACE_MANUAL, opts);
-  },
-
-  /** 重置内核到随应用出厂的版本（不备份、清残留备份）。 */
-  async resetFactory(): Promise<CoreSwapResult & { error?: string }> {
-    return invoke(IPC_CHANNELS.CORE_RESET_FACTORY);
-  },
-
-  async getAutoStatus(): Promise<{
-    /** 后端如实返 null（该开关的读取归 config 域，不在此猜 false）。 */
-    autoUpdateCore: boolean | null;
-    lastCheckAt: number | null;
-    staged: { version: string; dir: string; stagedAt: string } | null;
-    crossBandNotifiedVersion: string | null;
-  }> {
-    return invoke(IPC_CHANNELS.CORE_UPDATE_GET_AUTO_STATUS);
-  },
-
-  /**
-   * 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）。
-   *
-   * 返回**五态对象**而非布尔：`discarded`（staged 已不领先/文件缺失）、`deferred`、`failed`
-   * 各有不同处置，折叠成布尔会让 UI 把三者都误报成「已应用」（上游 修 M1 的原因）。
-   */
-  async applyStaged(): Promise<{
-    result: 'applied' | 'discarded' | 'deferred' | 'failed' | 'noop';
-    error?: string;
-  }> {
-    return invoke(IPC_CHANNELS.CORE_UPDATE_APPLY_STAGED);
-  },
-
-  onAutoStatusChanged(
-    listener: (data: {
-      lastCheckAt: number | null;
-      staged: { version: string; stagedAt: string } | null;
-      crossBandLatest: string | null;
-    }) => void
-  ): () => void {
-    return listen(IPC_CHANNELS.EVENT_CORE_AUTO_UPDATE_STATUS, listener);
   },
 };

@@ -7,7 +7,7 @@
  * 一侧单方面加/改码，用户看到的都会是**裸码串或回落文案**（静默劣化，不红）。本门把四个
  * 真值源钉成一张表：
  *
- *  - Rust：`crates/updater/src/popup.rs` 里 `wire()` 的 match 臂（剥不出 11 条 ⇒ 红）；
+ *  - Rust：`crates/updater/src/popup.rs` 里 `wire()` 的 match 臂（剥不出 10 条 ⇒ 红）；
  *  - TS：`contracts/types/update.ts` 的 `UpdateErrWire` 联合（与 Rust 逐字相等）;
  *  - 主表：五语种 `settings.update.err.*` 键集 = Rust 集；
  *  - 辅表：五语种 `updatePopup.err.*` 键集 = Rust 集（多一条少一条都红——多 = 死键，
@@ -32,7 +32,7 @@ function read(rel: string): string {
   return readFileSync(join(REPO_ROOT, rel), 'utf8');
 }
 
-/** Rust `wire()` 臂 → 码集（`Self::X => "code",` 形态；取不到 11 条 ⇒ 后面的断言红）。 */
+/** Rust `wire()` 臂 → 码集（`Self::X => "code",` 形态；取不到 10 条 ⇒ 后面的断言红）。 */
 function rustWireCodes(): Set<string> {
   const src = read('crates/updater/src/popup.rs');
   const at = src.indexOf('pub const fn wire(self)');
@@ -60,10 +60,10 @@ function localeKeys(rel: string, section: string): Set<string> {
 }
 
 describe('U1 错误码契约：Rust 码表 ↔ TS 联合 ↔ 两张 i18n 表 × 五语种', () => {
-  it('Rust wire() 与 TS UpdateErrWire 逐字相等，且量级守恒（≥11）', () => {
+  it('Rust wire() 与 TS UpdateErrWire 逐字相等，且量级守恒（≥10）', () => {
     const rust = rustWireCodes();
     const ts = tsWireCodes();
-    expect(rust.size, 'wire() 臂解析塌了（剥不出码表）').toBeGreaterThanOrEqual(11);
+    expect(rust.size, 'wire() 臂解析塌了（剥不出码表）').toBeGreaterThanOrEqual(10);
     expect([...ts].sort(), 'TS 联合与 Rust 码表漂移 —— 协议两侧单方面改了').toEqual([
       ...rust,
     ].sort());

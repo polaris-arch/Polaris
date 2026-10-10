@@ -555,7 +555,7 @@ fn catalog_leg_cannot_short_circuit_the_resource_leg() {
 /// （即挪到 `lock_inner(&self.inner)` 之后）⇒ 本条转红。
 #[test]
 fn catalog_refresh_reads_disk_before_taking_the_lock() {
-    use crate::runtime::core_update_scheduler::method_scan::method_body;
+    use crate::test_support::method_body;
     let src = crate_code("runtime/rule_resource_scheduler.rs");
     let body = method_body(&src, "    async fn refresh_catalog_if_due(");
     let read_at = body

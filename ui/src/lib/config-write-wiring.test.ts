@@ -337,7 +337,6 @@ const SITES: readonly Site[] = [
       'components/screens/settings/SettingsTun.tsx',
       'components/screens/settings/SettingsUpdate.tsx',
       'components/screens/settings/AppUpdateCard.tsx',
-      'components/screens/settings/CoreUpdateCard.tsx',
       'components/dialogs/DnsResourceDialog.tsx',
       'components/screens/rules/DnsPolicyWorkspace.tsx',
       'components/screens/rules/NetworkProfilePanel.tsx',

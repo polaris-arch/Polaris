@@ -12,7 +12,7 @@
  * 真实 app 只有一个当前平台，不需要「切换看别的平台」，故不搬。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { helperApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
@@ -30,6 +30,7 @@ type HelperState =
   | 'unsupported'
   | 'installed'
   | 'none'
+  | 'cleanup-pending'
   | 'installing'
   | 'needs-upgrade'
   | 'needs-btm'
@@ -40,9 +41,10 @@ type HelperState =
  * null 出现在「首帧还没拉到」与「getStatus 失败」两种情况，把它们说成「本平台不支持」是编造事实
  * ——每个用户进这一页的第一帧都会看到一句关于自己系统的假话。
  */
-function deriveState(s: HelperStatus | null): HelperState {
+function deriveState(s: HelperStatus | null, cleanupPending = false): HelperState {
   if (!s) return 'checking';
   if (!s.supported) return 'unsupported';
+  if (cleanupPending) return 'cleanup-pending';
   if (s.upgradeable) return 'needs-upgrade';
   // backgroundDisabled（macOS BTM 登录项被禁）比 needsRepair 更具体，需先判（contract: runtime.ts:167）。
   if (s.backgroundDisabled) return 'needs-btm';
@@ -59,6 +61,7 @@ export default function SettingsHelper() {
   const [status, setStatus] = useState<HelperStatus | null>(null);
   const [state, setState] = useState<HelperState>('checking');
   const [busy, setBusy] = useState(false);
+  const cleanupPending = useRef(false);
   const { armed, confirmTwice } = useConfirmTwice();
   const confirmingUninstall = armed === UNINSTALL_KEY;
 
@@ -67,7 +70,7 @@ export default function SettingsHelper() {
       .getStatus()
       .then((s) => {
         setStatus(s);
-        setState(deriveState(s));
+        setState(deriveState(s, cleanupPending.current));
       })
       // 失败时停在 'checking'（不谎报成 unsupported/none）——该态自带「重新检测」按钮，是可恢复的
       // 死角而非死路。挂载即弹 toast 会在后端未就绪的正常启动窗口里制造噪音，故只记 console。
@@ -80,7 +83,7 @@ export default function SettingsHelper() {
         .getStatus()
         .then((s) => {
           setStatus(s);
-          setState(deriveState(s));
+          setState(deriveState(s, cleanupPending.current));
         })
         .catch(() => undefined);
     });
@@ -101,8 +104,9 @@ export default function SettingsHelper() {
     setBusy(true);
     try {
       const r = await helperApi.install();
+      if (r.success) cleanupPending.current = false;
       setStatus(r.status);
-      setState(deriveState(r.status));
+      setState(deriveState(r.status, cleanupPending.current));
       // W10：Rust 侧把所有失败（用户取消/脚本失败/二进制缺失）都装进 success:false 的 ok 应答——
       // 不在这里读出来，任何失败都是零反馈的「点击安装无反应」。信封不 reject，catch 永远等不到它。
       if (!r.success) {
@@ -129,8 +133,10 @@ export default function SettingsHelper() {
         setBusy(true);
         try {
           const r = await helperApi.uninstall();
+          if (r.success) cleanupPending.current = false;
+          else if (r.errorCode === 'partialCleanup') cleanupPending.current = true;
           setStatus(r.status);
-          setState(deriveState(r.status));
+          setState(deriveState(r.status, cleanupPending.current));
           // W10 同族：卸载的失败/取消同样装在信封里，不读就是「点了没反应」。
           if (!r.success) {
             toast.error(t('helper.uninstallFail'), helperActionErrorText(r.errorCode, t));
@@ -151,7 +157,7 @@ export default function SettingsHelper() {
     try {
       const s = await helperApi.getStatus(true);
       setStatus(s);
-      setState(deriveState(s));
+      setState(deriveState(s, cleanupPending.current));
     } catch (err) {
       console.error('[SettingsHelper] recheck failed:', err);
       reportFailure(t('helper.statusCheckFail'));
@@ -174,6 +180,24 @@ export default function SettingsHelper() {
       // 剪贴板 API 不可用（非安全上下文）：静默兜底
     }
   }
+
+  // A disappeared SCM service does not prove the protected support tree is clean.
+  // Keep the same explicit-confirmation cleanup action in both recovery and none
+  // states, including after reopening this page; status refresh cannot erase it.
+  const uninstallButton = (
+    <Button
+      variant="ghost"
+      size="sm"
+      className={confirmingUninstall ? 'confirming' : undefined}
+      onClick={uninstall}
+      disabled={busy}
+      style={{ color: 'hsl(var(--err))' }}
+    >
+      <span>
+        {confirmingUninstall ? t('helper.uninstallConfirmAgain') : t('helper.uninstall')}
+      </span>
+    </Button>
+  );
 
   return (
     <section className="screen" data-sec="helper">
@@ -225,33 +249,23 @@ export default function SettingsHelper() {
             </div>
           )}
 
-          {state === 'installed' && (
-            <div className="helper-state" data-s="installed">
+          {(state === 'installed' || state === 'cleanup-pending') && (
+            <div className="helper-state" data-s={state}>
               <div className="hc-status">
-                <Dot variant="ok" />
-                <b>{t('helper.statusInstalled')}</b>
-                <Pill variant="ok" style={{ marginLeft: 'auto' }}>
-                  {t('helper.protocolVersion', { version: status?.version ?? 3 })}
-                </Pill>
+                <Dot variant={state === 'cleanup-pending' ? 'err' : 'ok'} />
+                <b>{t(state === 'cleanup-pending' ? 'helper.uninstallFail' : 'helper.statusInstalled')}</b>
+                {state === 'installed' && (
+                  <Pill variant="ok" style={{ marginLeft: 'auto' }}>
+                    {t('helper.protocolVersion', { version: status?.version ?? 3 })}
+                  </Pill>
+                )}
               </div>
-              <div className="card-sub">{t('helper.installedDesc')}</div>
+              <div className="card-sub">{t(state === 'cleanup-pending' ? 'helper.actionError.partialCleanup' : 'helper.installedDesc')}</div>
               <div style={{ display: 'flex', gap: 9, marginTop: 14, flexWrap: 'wrap' }}>
                 <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}>
                   <span>{t('helper.recheck')}</span>
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className={confirmingUninstall ? 'confirming' : undefined}
-                  onClick={uninstall}
-                  disabled={busy}
-                  style={{ color: 'hsl(var(--err))' }}
-                >
-                  {/* 确认态换 `<span>` 文案（原型 confirmTwice 就是换 span 的 textContent）。 */}
-                  <span>
-                    {confirmingUninstall ? t('helper.uninstallConfirmAgain') : t('helper.uninstall')}
-                  </span>
-                </Button>
+                {uninstallButton}
               </div>
             </div>
           )}
@@ -279,6 +293,7 @@ export default function SettingsHelper() {
                 </svg>
                 <span>{t('helper.installAction')}</span>
               </Button>
+              {uninstallButton}
             </div>
           )}
 

@@ -510,17 +510,8 @@ impl ProxyRuntime {
                     if self.gate.generation() != expected_generation {
                         return;
                     }
-                    // GiveUp 有两种成因，文案必须分开：换核验证窗口下这是**第一次**崩溃，
-                    // 报「已达自愈上限（3 次/60s）」是字面为假。这条 message 是诊断载荷，
-                    // 会进脱敏日志成为下次排查的起点；UI 只消费结构化码的本地化文案。
-                    // 码沿用 `AUTO_RESTART_FAILED`（我们确实放弃了自动重启），不新增码：
-                    // 新码要同步前端 `ProxyErrorCode` 与 5 份 locale，而这里的信息差在文案不在分类。
-                    let msg = if self.crash_lock().auto_restart_suppressed() {
-                        "新内核首次运行即异常退出（换核验证窗口内不自动重启）→ 将尝试回滚到原内核"
-                            .to_string()
-                    } else {
-                        "sing-box 反复崩溃，已达自愈上限（3 次/60s）→ 放弃自动重启".to_string()
-                    };
+                    let msg =
+                        "sing-box 反复崩溃，已达自愈上限（3 次/60s）→ 放弃自动重启".to_string();
                     log::error!("{msg}");
                     self.set_error_if_current(expected_generation, &msg, code::AUTO_RESTART_FAILED);
                     return;
@@ -666,7 +657,12 @@ impl ProxyRuntime {
     /// Commit a terminal error in report -> status -> generation lock order.
     /// The publication guard keeps later claims behind the synchronous event,
     /// but inner/report/status guards are gone before event listeners run.
-    fn set_error_if_current(&self, expected_generation: u64, msg: &str, error_code: &str) {
+    pub(super) fn set_error_if_current(
+        &self,
+        expected_generation: u64,
+        msg: &str,
+        error_code: &str,
+    ) {
         let _publication = self.gate.lock_generation_publication();
         let mut route = self
             .mesh_route_run

@@ -599,6 +599,18 @@ export function HomeScreen() {
         );
         return;
       }
+      // 随包内核文件缺少可执行权限 → 起核前即被拒绝。同样不能落到下面那句「请检查服务器配置」：
+      // 与服务器配置无关，下一步是重新安装应用。
+      if (code === ProxyErrorCode.CORE_NOT_EXECUTABLE) {
+        toast.error(t('errors.coreNotExecutable'));
+        return;
+      }
+      // 确认不了提权助手里的内核与本应用配套 → 拒绝以 TUN 起核。下一步是重装或升级助手，
+      // 同样与服务器配置无关。
+      if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
+        toast.error(t('errors.helperCoreMismatch'));
+        return;
+      }
       toast.error(
         action === 'stop' ? t('home.stopProxyFailed') : t('errors.startupFailed'),
       );

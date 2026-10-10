@@ -15,6 +15,7 @@ thiserror = "2"
 log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+polaris-windows-cleaner = { path = "../windows-cleaner" }
 # Windows 命名管道客户端必须与 helper 服务端使用同一组同步 Win32 原语；std::fs::File
 # 在真机上会把 start 响应额外拖住数秒。依赖面只覆盖句柄生命周期与文件 IO。
 windows-sys = { version = "0.61", features = [

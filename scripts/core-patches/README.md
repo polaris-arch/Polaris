@@ -179,9 +179,78 @@ freeze remains in force.
 
 The `.polaris.N` suffix follows the upstream prerelease number so normal
 version ordering remains correct: alpha.8 < alpha.8.polaris.1 < alpha.9.
-Polaris builds update with the app. Official online core updates (including
-already staged downloads) cannot replace them. Explicit manual imports stay
-available and retain the existing manual-core protection.
+Polaris builds update with the app: the app executes the core that ships inside
+its installation package and has no in-app entry for updating, importing,
+uploading or rolling back a core. Core directories left in the user
+configuration directory by earlier versions are removed at startup and are
+never executed.
+
+To run a self-built core in the app:
+
+- Place it in `resources/<platform>/` (`linux`, `win`, `mac-arm64` or
+  `mac-x64`) and build the package with that platform's `--config`. The
+  packaged app resolves the core only from its bundled resources. This is
+  for local packaging: the CI packaging gates compare the packaged core with
+  the pinned source build.
+- In a debug build only, point `POLARIS_SINGBOX_PATH` at the binary. Release
+  builds do not read this variable at all.
+
+The app resolves the core by path. It does not verify at runtime that the file
+found there is the build that matches the app version, so replacing files
+inside an installed package is unsupported and unchecked.
+
+## macOS code signature of the bundled core
+
+Packaging never signs or otherwise rewrites the core. On the macOS legs
+`scripts/macos-nested-code.sh` only checks the `sing-box` inside the app
+bundle, before the bundle seal and again in the final dmg:
+
+- it must be byte-identical to `resources/mac-<arch>/sing-box`, the file whose
+  hash the source receipt records;
+- its own code signature must pass `codesign --verify --strict`. One exception:
+  a thin x86_64 core that `codesign` reports as not signed at all is accepted
+  and logged as a notice, because Intel macOS does not require a signature to
+  execute a Mach-O. A signature that is present but invalid fails on every
+  architecture, and an unsigned arm64 (or universal) core fails.
+
+A core that fails these checks fails packaging. The fix belongs to the step
+that produces the core, not to packaging.
+
+Current state, with what each statement rests on:
+
+- Both macOS cores are built natively with CGO (`macos-15` for arm64,
+  `macos-15-intel` for x64, `.github/workflows/desktop-core.yml`), so the final
+  link is done by the Apple linker. `scripts/desktop-core/build-core.mjs` runs
+  no `strip`, `lipo` or `codesign` after `go build`; artifact transport is
+  checked by hash, so the packaged bytes are the linker's output.
+- The Apple linker ad-hoc signs arm64 output by default. This is toolchain
+  behavior, not something this repository asserts at build time. Indirect
+  evidence: the kernel gates in `package.yml` execute
+  `resources/mac-arm64/sing-box` directly on an arm64 runner, which an
+  unsigned arm64 binary cannot do.
+- Whether the x64 core carries a signature has not been observed. The same
+  linker does not sign x86_64 output by default, so it is expected to be
+  unsigned; that is the case the exception above covers.
+
+Prerequisite for the core supply task (not implemented here):
+
+- Where: the macOS producers in `buildDesktopCore`
+  (`scripts/desktop-core/build-core.mjs`), after `go build` and the buildID
+  check, before `binarySha256` is computed. Signing changes the file, so it
+  has to happen before the hash that every later step compares against.
+- On what: the `sing-box` output for `mac-arm64` and `mac-x64`.
+- What: on arm64, run `codesign --verify --strict` and fail the producer when
+  it does not pass. On x64, either keep the binary unsigned (the exception
+  stays) or ad-hoc sign it with `codesign --sign - --timestamp=none` so both
+  architectures meet one rule and the exception can be removed.
+- Verifiable output: a field in the platform receipt recording the signature
+  state the producer observed (for example signed or unsigned, and the
+  `CDHash` printed by `codesign -dvvv`), covered by the receipt fingerprint.
+  Packaging can then compare the bundled core's `CDHash` with the receipt
+  instead of relying on the architecture exception.
+
+Signing at that step changes the binary hash, so the pinned output hashes and
+the receipts of both macOS platforms change with it.
 
 Any future pin must follow the combined L/N/R/I/C source freeze and native
 four-platform builds. Do not reuse an old output hash or remove the Windows

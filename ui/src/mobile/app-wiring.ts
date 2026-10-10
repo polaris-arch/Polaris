@@ -50,7 +50,7 @@ import { subscribeMobileSpeedTestProgress } from './use-mobile-speed-test';
  * | 测速**进度** | **已接** | 窗口级 runId 会话 store 消费 PROGRESS/DONE；跨页保留，计数仅取真实事件与回执。桌面 sticky toast 不复用。 |
  * | 测速**结果**事件（`subscribeMobileSpeedTestProgress`） | **已接** | Rust 在出口 IP 探测成功后自动 fire-and-forget 伴测活跃节点；它没有页面级 await 返回值。必须在窗口生命周期持续接事件，切页仍更新同一 latency store。手动批量仍以 invoke 返回兜底。 |
  * | 助手可升级（`handleHelperUpgradeable`） | 不接 | 提权助手是桌面对象，Android 上没有这条腿 |
- * | 系统代理残留 / 非官方核基线警告 | 不接 | 前者同 `useSystemProxyLivePolling`（无系统代理这个对象）；后者的发射点是桌面换核路径，移动端不随包第二个核 |
+ * | 系统代理残留 | 不接 | 同 `useSystemProxyLivePolling`（无系统代理这个对象） |
  * | 无效节点（`onInvalidNodes`） | **已接**（2026-09-13，批 18） | ⚠️ 这一行**曾经**写着「不接」，理由是「移动端节点屏没有『标灰无效节点』这一格呈现（`setInvalidNodes` 在移动可达面上零读点）」—— 那句话是假的：`nodes/MobileNodesScreen.tsx` 一直在读 `invalidNodes` 并拿它算 `invalidNodeIndex`，`nodes/NodesScreenView.tsx` 也一直把理由渲染成常驻 `.mn-note`。真实形态是 W-23 那一档：**读点在、写入方一个都没有** ⇒「这个节点已失效」那一格恒不出现，不是坏了，是永远不会亮。这条账 2026-09-06 记在 `feed-register.test-support.ts` 的 `useAppStore.invalidNodes` 上，本批销掉 |
  * | 出口 IP（`onIpInfoUpdated` + peek） | **已接** | Rust 在起核后排程长热身检测；移动端在 app 级持续接事件，切页也不丢终态。手动按钮才调用 force |
  * | 解锁检测三条订阅 + 冷水合 | **已接** | Rust 的 invalidate 会去抖自跑；app 级持续接 progress / updated / invalidated，切页也不丢终态 |

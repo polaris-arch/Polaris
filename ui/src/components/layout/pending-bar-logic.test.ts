@@ -151,6 +151,10 @@ describe('isRestartFailureCode（哪些 proxyError 算「这次立即应用没�
     expect(isRestartFailureCode('PROCESS_EXITED')).toBe(true);
     expect(isRestartFailureCode('STARTUP_FAILED')).toBe(true);
     expect(isRestartFailureCode('TUN_ROUTE_NOT_CAPTURED')).toBe(true);
+    // 随包内核文件缺少可执行权限：起核前即被拒绝，核没有起来。
+    expect(isRestartFailureCode('CORE_NOT_EXECUTABLE')).toBe(true);
+    // 提权助手里的内核不配套：起核前被拒绝，或起核后被停掉 —— 核都不在跑。
+    expect(isRestartFailureCode('HELPER_CORE_MISMATCH')).toBe(true);
     expect(isRestartFailureCode('SOME_CODE_ADDED_NEXT_YEAR')).toBe(true);
     expect(isRestartFailureCode(undefined)).toBe(true);
   });

@@ -12,7 +12,6 @@ fn sha256_known_vectors() {
     assert_eq!(sha256_hex(b""), EMPTY_SHA);
     assert_eq!(sha256_hex(b"hello"), HELLO_SHA);
     // 大小写：hex::encode 恒输出小写。
-    assert_eq!(sha256_hex(b"hello"), sha256_hex_lower(b"hello"));
     assert!(sha256_hex(b"hello")
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
@@ -27,36 +26,48 @@ fn is_valid_sha256_hex_variants() {
     assert!(!is_valid_sha256_hex(&"a".repeat(63))); // 63 字符
 }
 
+/// 「真算出来的摘要」喂进单点判据：匹配 / 大小写 / 不符。
 #[test]
-fn verify_bytes_match_case_insensitive() {
+fn computed_digest_match_is_case_insensitive() {
+    let actual = sha256_hex(b"hello");
     // 匹配（小写期望）。
-    assert!(verify_bytes(b"hello", HELLO_SHA).is_ok());
-    // 匹配（大写期望——对齐 Polaris strings.EqualFold 大小写不敏感）。
-    assert!(verify_bytes(b"hello", &HELLO_SHA.to_uppercase()).is_ok());
-    // 不匹配。
-    let err = verify_bytes(b"hello", EMPTY_SHA).unwrap_err();
-    assert!(matches!(err, VerifyError::HashMismatch { .. }));
+    assert!(verify_hex_digest(&actual, HELLO_SHA).is_ok());
+    // 匹配（大写期望——大小写不敏感）。
+    assert!(verify_hex_digest(&actual, &HELLO_SHA.to_uppercase()).is_ok());
+    // 不匹配：载荷须带齐期望值与实际值。
+    assert_eq!(
+        verify_hex_digest(&actual, EMPTY_SHA),
+        Err(VerifyError::HashMismatch {
+            expected: EMPTY_SHA.to_string(),
+            actual: HELLO_SHA.to_string(),
+        })
+    );
 }
 
 #[test]
-fn verify_bytes_invalid_expected() {
+fn invalid_expected_hash_is_rejected_before_comparison() {
+    let actual = sha256_hex(b"hello");
     // 非 64 字符 hex。
-    let err = verify_bytes(b"hello", "abc").unwrap_err();
-    assert_eq!(err, VerifyError::InvalidExpectedHash(3));
+    assert_eq!(
+        verify_hex_digest(&actual, "abc"),
+        Err(VerifyError::InvalidExpectedHash(3))
+    );
     // 非 hex（64 字符但含 z）。
-    let err = verify_bytes(b"hello", &"z".repeat(64)).unwrap_err();
-    assert_eq!(err, VerifyError::InvalidExpectedHash(64));
+    assert_eq!(
+        verify_hex_digest(&actual, &"z".repeat(64)),
+        Err(VerifyError::InvalidExpectedHash(64))
+    );
 }
 
 /// 🟡 **摘要判定是单点，且两个变体必须可分辨（二者处置相反）。**
 ///
 /// 生产的 `update_download` 腿此前手搓 `!is_valid_sha256_hex(..) || !eq_ignore_ascii_case(..)`，
 /// 把「发布方 digest 写坏了」与「包被截断/篡改」压成一个 bool ⇒ 用户被引导去反复重下一个
-/// 永远不会好的包。本条钉住：判据分变体，且三个入口结论**逐字一致**。
+/// 永远不会好的包。本条钉住：判据分变体，且流式入口与单点结论**逐字一致**。
 ///
 /// **变异探针**：删掉 [`verify_hex_digest`] 的 `InvalidExpectedHash` 早退（非法 hex 落进
-/// `eq_ignore_ascii_case` → 报成 HashMismatch）⇒ 第 1 条转红；把 [`verify_bytes`] 或
-/// [`Sha256Stream::verify`] 任一改回自己手搓比较 ⇒ 一致性断言转红。
+/// `eq_ignore_ascii_case` → 报成 HashMismatch）⇒ 第 1 条转红；把
+/// [`Sha256Stream::verify`] 改回自己手搓比较 ⇒ 一致性断言转红。
 #[test]
 fn digest_verdict_is_single_sourced_and_splits_by_variant() {
     // 格式非法 ≠ 摘要不符。
@@ -73,9 +84,8 @@ fn digest_verdict_is_single_sourced_and_splits_by_variant() {
     assert!(verify_hex_digest(&HELLO_SHA.to_uppercase(), HELLO_SHA).is_ok());
     assert!(verify_hex_digest(HELLO_SHA, &HELLO_SHA.to_uppercase()).is_ok());
 
-    // 三个入口的结论（含错误变体与其载荷）必须逐字相同。
+    // 流式入口与单点的结论（含错误变体与其载荷）必须逐字相同。
     for expected in [HELLO_SHA, EMPTY_SHA, "not-a-hash"] {
-        let by_bytes = verify_bytes(b"hello", expected);
         let by_stream = {
             let mut s = Sha256Stream::new();
             s.update(b"hello");
@@ -83,28 +93,15 @@ fn digest_verdict_is_single_sourced_and_splits_by_variant() {
         };
         let by_hex = verify_hex_digest(HELLO_SHA, expected);
         assert_eq!(
-            by_bytes, by_hex,
-            "verify_bytes 与单点判据分叉了（expected={expected}）"
-        );
-        assert_eq!(
             by_stream, by_hex,
             "Sha256Stream::verify 与单点判据分叉了（expected={expected}）"
         );
     }
 }
 
-#[test]
-fn verify_hex_only_format() {
-    assert!(verify_hex(HELLO_SHA).is_ok());
-    assert_eq!(
-        verify_hex("abc").unwrap_err(),
-        VerifyError::InvalidExpectedHash(3)
-    );
-}
-
 /// 增量 hash 与整包 hash **必须**给出同一个摘要，且与分片方式无关。
 ///
-/// 这是流式腿敢换掉 `verify_bytes` 的全部依据：分片一变结论就变的话，
+/// 这是流式腿不必把整包攒进内存再算摘要的全部依据：分片一变结论就变的话，
 /// 「本地算出来的摘要」与「发布方公布的摘要」永远对不上，且只在真机大包上才暴露。
 #[test]
 fn incremental_sha256_equals_one_shot_for_any_chunking() {
@@ -125,21 +122,27 @@ fn incremental_sha256_equals_one_shot_for_any_chunking() {
     assert_eq!(Sha256Stream::new().finish(), EMPTY_SHA);
 }
 
-/// `Sha256Stream::verify` 与 `verify_bytes` 的判定必须逐字一致（含错误变体）。
+/// `Sha256Stream::verify` 的判定：匹配 / 大小写 / 不符（载荷逐字）/ 期望值非法。
 #[test]
-fn stream_verify_matches_verify_bytes_semantics() {
+fn stream_verify_semantics() {
     let mut ok = Sha256Stream::new();
     ok.update(b"hel");
     ok.update(b"lo");
     assert!(ok.verify(HELLO_SHA).is_ok());
-    // 大小写不敏感（对齐 verify_bytes 的 eq_ignore_ascii_case）。
+    // 大小写不敏感。
     let mut upper = Sha256Stream::new();
     upper.update(b"hello");
     assert!(upper.verify(&HELLO_SHA.to_uppercase()).is_ok());
-    // 不符 → HashMismatch，且 actual 与 verify_bytes 算出的一致。
+    // 不符 → HashMismatch，且 actual 是喂入字节的真实摘要。
     let mut bad = Sha256Stream::new();
     bad.update(b"hello");
-    assert_eq!(bad.verify(EMPTY_SHA), verify_bytes(b"hello", EMPTY_SHA));
+    assert_eq!(
+        bad.verify(EMPTY_SHA),
+        Err(VerifyError::HashMismatch {
+            expected: EMPTY_SHA.to_string(),
+            actual: HELLO_SHA.to_string(),
+        })
+    );
     // 期望 hex 格式非法 → InvalidExpectedHash（**不能**降级成「没校验」放行）。
     let mut invalid = Sha256Stream::new();
     invalid.update(b"hello");
@@ -212,34 +215,17 @@ fn promote_staged_cleans_the_tmp_when_rename_fails() {
     );
 }
 
-#[test]
-fn atomic_replace_single() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let fs = StdFs;
-    let dest = fs.join(tmpdir.path(), "core.bin");
-
-    // 首次替换：dest 不存在 → 写 tmp → rename 成功。
-    atomic_replace(&fs, &dest, b"new-content").unwrap();
-    assert_eq!(fs.read(&dest).unwrap(), b"new-content");
-    // tmp 不残留（tmp 名带唯一后缀，故按「目录里只剩 dest」断言，而不是猜某个具体 tmp 名）。
-    assert_eq!(
-        fs.list_files(tmpdir.path()).unwrap(),
-        vec!["core.bin".to_string()]
-    );
-
-    // 二次替换：dest 已存在 → 原子覆盖。
-    atomic_replace(&fs, &dest, b"v2").unwrap();
-    assert_eq!(fs.read(&dest).unwrap(), b"v2");
-    assert_eq!(
-        fs.list_files(tmpdir.path()).unwrap(),
-        vec!["core.bin".to_string()]
-    );
+/// 生产落位的两步：写进 [`tmp_name`] 给的唯一临时名，再 [`promote_staged`] 提升。
+fn write_then_promote(fs: &dyn UpdateFs, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_name(dest);
+    fs.write(&tmp, bytes)?;
+    promote_staged(fs, &tmp, dest)
 }
 
 /// 🟡 **变异锁：tmp 名必须每次调用都不同。**
 ///
 /// 把 [`tmp_name`] 改回固定的 `{dest}.polaris-new` ⇒ 本条转红。它是
-/// [`concurrent_atomic_replace_never_yields_a_torn_dest`] 的判据来源：并发写同一个 tmp 才是撕裂的成因。
+/// [`concurrent_landing_never_yields_a_torn_dest`] 的判据来源：并发写同一个 tmp 才是撕裂的成因。
 #[test]
 fn tmp_name_is_unique_per_call() {
     let dest = Path::new("/tmp/whatever/core.bin");
@@ -266,7 +252,7 @@ fn tmp_name_is_unique_per_call() {
 ///
 /// **变异探针**：把 `tmp_name` 改回固定名 ⇒ 读侧断言（dest 内容必须是某一方的完整载荷）转红。
 #[test]
-fn concurrent_atomic_replace_never_yields_a_torn_dest() {
+fn concurrent_landing_never_yields_a_torn_dest() {
     let tmpdir = tempfile::tempdir().unwrap();
     let dest = StdFs.join(tmpdir.path(), "update.pkg");
     // 三份**长度各异**的载荷：撕裂一定表现为「长度对不上任何一份」或「内容混杂」。
@@ -274,7 +260,7 @@ fn concurrent_atomic_replace_never_yields_a_torn_dest() {
         .map(|i| vec![b'a' + i; 4096 * (usize::from(i) + 1)])
         .collect();
     // 先落一份合法内容，读侧从第一拍起就有东西可读。
-    atomic_replace(&StdFs, &dest, &payloads[0]).unwrap();
+    write_then_promote(&StdFs, &dest, &payloads[0]).unwrap();
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut writers = Vec::new();
@@ -282,7 +268,7 @@ fn concurrent_atomic_replace_never_yields_a_torn_dest() {
         let dest = dest.clone();
         writers.push(std::thread::spawn(move || {
             for _ in 0..60 {
-                atomic_replace(&StdFs, &dest, &p).unwrap();
+                write_then_promote(&StdFs, &dest, &p).unwrap();
             }
         }));
     }
@@ -313,47 +299,4 @@ fn concurrent_atomic_replace_never_yields_a_torn_dest() {
         StdFs.list_files(tmpdir.path()).unwrap(),
         vec!["update.pkg".to_string()]
     );
-}
-
-#[test]
-fn atomic_replace_multi_all_or_nothing() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let fs = StdFs;
-    let dest_dir = fs.join(tmpdir.path(), "target");
-    fs.create_dir_all(&dest_dir).unwrap();
-
-    let entries = vec![
-        ("sing-box".to_string(), b"bin-content".to_vec()),
-        ("libcronet.so".to_string(), b"lib-content".to_vec()),
-    ];
-    atomic_replace_multi(&fs, &dest_dir, &entries).unwrap();
-
-    // 两个文件都就位，无 tmp 残件。
-    assert_eq!(
-        fs.read(&fs.join(&dest_dir, "sing-box")).unwrap(),
-        b"bin-content"
-    );
-    assert_eq!(
-        fs.read(&fs.join(&dest_dir, "libcronet.so")).unwrap(),
-        b"lib-content"
-    );
-    let files = fs.list_files(&dest_dir).unwrap();
-    assert_eq!(
-        files,
-        vec!["libcronet.so".to_string(), "sing-box".to_string()]
-    );
-}
-
-#[test]
-fn atomic_replace_multi_overwrites_existing() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let fs = StdFs;
-    let dest_dir = fs.join(tmpdir.path(), "target");
-    fs.create_dir_all(&dest_dir).unwrap();
-    // 预置旧文件。
-    fs.write(&fs.join(&dest_dir, "sing-box"), b"old").unwrap();
-
-    let entries = vec![("sing-box".to_string(), b"new".to_vec())];
-    atomic_replace_multi(&fs, &dest_dir, &entries).unwrap();
-    assert_eq!(fs.read(&fs.join(&dest_dir, "sing-box")).unwrap(), b"new");
 }

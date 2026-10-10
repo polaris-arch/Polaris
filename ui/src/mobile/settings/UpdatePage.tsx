@@ -3,19 +3,13 @@
  *
  * # 应用更新卡按平台分叉（IA §4.5）
  *
- * 桌面有两张独立的卡：应用（`AppUpdateCard`）与内核（`CoreUpdateCard`，带分级更新、回滚、恢复出厂）。
- * 移动端只显示应用更新。内核更新没有独立于 APK 的对象：
+ * 桌面这一页有两张卡：应用更新（`AppUpdateCard`）与内核只读信息（`CoreInfoCard`）。
+ * 移动端这一页只有应用更新；内核版本那一格在关于页（`AboutPage.tsx` 的 `sing-box <版本>`）。
  *
- *  · **内核**：移动端内核不是 sidecar 子进程，而是随应用进程载入的 libbox。
- *
- *    🔴 **形态不是「未定」，是「随应用一起更新」（2026-09-06 改正）**：libbox 以 `libs/libbox.aar`
- *    打进 APK（`src-tauri/gen/android/app/build.gradle.kts:226 implementation(files("libs/libbox.aar"))`），
- *    核在 Android 上是**进程内 `.so`** 而非可执行文件（`src-tauri/src/lib.rs:635-641` 与
- *    `runtime/proxy/process_supervision.rs:128 if cfg!(target_os = "android")`），
- *    `runtime/proxy/android_bridge.rs` 整模块 `#[cfg(target_os = "android")]`。
- *    ⇒ 桌面那套 `core_swap`（`<core>.bak` 原子替换可执行文件）在这个形态下**没有对象**：
- *    换内核 = 装一个新版本的应用。独立内核更新行即使只显示“内置”，也在可操作的更新卡里
- *    暗示另一条能力；移动端直接不显示它，应用 APK 更新保持原样。
+ *  · **内核**：移动端内核不是 sidecar 子进程，而是随应用进程载入的 libbox —— 以 `libs/libbox.aar`
+ *    打进 APK（`src-tauri/gen/android/app/build.gradle.kts` 的 `implementation(files("libs/libbox.aar"))`），
+ *    是**进程内 `.so`** 而非可执行文件；`runtime/proxy/android_bridge.rs` 整模块
+ *    `#[cfg(target_os = "android")]`。两个平台上内核都只随应用版本走，没有独立于应用的内核更新。
  *  · **应用**：Android 走 GitHub Releases 的 APK 分发。**2026-09-06（W-19）接上检查 + 显示 +
  *    打开发布页；2026-09-13（批 15）接上下载 → 交系统安装器那一跳**，四件事齐：
  *    检查 / 下载 / 交系统安装器 / 重装当前版本，外加「自动下载新版本」那一格。
@@ -46,8 +40,8 @@
  *    **不是**「待接线」：版本号读不到是一个**运行期**状态，不是一条没接的腿。此前那颗
  *    `mobileSettings.pending` 芯片把两件事说成了一件，那条键随之无消费点，已整条删掉。
  *
- * 未受影响的是 GitHub 代理与自定义域名（`SettingsUpdate.tsx:81-128`）：它们服务的是**规则资源下载**，
- * 不是内核，两个平台都照常保留。订阅与规则资源的自动更新档同理。
+ * GitHub 代理与自定义域名（桌面在 `SettingsUpdate.tsx`）两个平台都保留：在移动端它们服务的是
+ * **规则资源下载**。订阅与规则资源的自动更新档同理。
  */
 
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactElement } from 'react';

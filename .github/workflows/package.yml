@@ -918,6 +918,10 @@ jobs:
           mkdir -p "resources/$res_dir"
           cp "$src" "resources/$res_dir/$bin"
           ls -l "resources/$res_dir/$bin"
+          if [ "${{ matrix.label }}" = windows ]; then
+            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner --target "${{ matrix.rust_target }}"
+            cp "target/${{ matrix.rust_target }}/release/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
+          fi
 
       # ── 构建 ──
       # tauri build 自动跑 beforeBuildCommand（pnpm --dir ../ui build）→ 编 Rust → 产安装包。
@@ -962,7 +966,7 @@ jobs:
           rc=0
           # ⚠️ windows 腿的 tauri_args 不带 --target（mac 腿才带）⇒ polaris.exe 在宿主位
           # target/release/；helper 步虽带 --target 但只编 helper。两路径勿混。
-          for exe in "target/release/polaris.exe" "resources/win/polaris-helper.exe"; do
+          for exe in "target/release/polaris.exe" "resources/win/polaris-helper.exe" "resources/win/polaris-cleaner.exe"; do
             if [ ! -f "$exe" ]; then
               echo "::error::待检产物不存在：$exe（构建产物路径变了？门需同步）"
               rc=1
@@ -1090,6 +1094,8 @@ jobs:
         run: |
           set -euo pipefail
           bundle_dir="target/${{ matrix.rust_target }}/release/bundle/dmg"
+          # 本腿打进包的那份源内核（`Consume sing-box core bundle` 落盘、已对过回执哈希）。
+          core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"
           guide="packaging/macos-dmg-open-guide.txt"
           guide_name="README First.txt"
           guide_x=330
@@ -1148,6 +1154,13 @@ jobs:
               echo "::error::$(basename "$dmg") 应恰含一个 app，实为 ${#apps[@]} 个"
               exit 1
             }
+            # 内核与 helper 住在 Contents/Resources 下，应用直接执行包内这一份内核。它们各自的签名
+            # 不由下面那次 bundle 封印作证（Resources 下的文件按资源封哈希），故先逐个判定：
+            #   · 内核只校验、绝不改写 —— 必须与本次取用的源内核逐字节相同，且签名有效（没有签名的
+            #     纯 x86_64 内核放行并留 notice）；验不过即失败，不在打包时补签；
+            #   · polaris-helper 是本仓产物，验不过的在这里 ad-hoc 补签并点名。
+            # 必须排在 bundle 封印**之前**：helper 补签改了文件字节，封印要封的是改后的哈希。
+            bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"
             codesign --force --deep --sign - --timestamp=none "${apps[0]}"
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"
             detach_retry "$mnt"
@@ -1167,6 +1180,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle_dir="target/${{ matrix.rust_target }}/release/bundle/dmg"
+          core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"
           guide_name="README First.txt"
           guide_x=330
           guide_y=330
@@ -1181,6 +1195,15 @@ jobs:
             if [ "${#apps[@]}" -ne 1 ] || ! codesign --verify --deep --strict --verbose=2 "${apps[0]}"; then
               hdiutil detach "$mnt" -quiet || true
               echo "::error::$(basename "$dmg") 内 app 未通过最终 bundle seal 严格校验"
+              exit 1
+            fi
+            # 最终只读镜像里的内核与 helper 逐个判定（verify 模式不改任何字节）。bundle 级校验通过
+            # 不等于这两个文件自身有有效签名，而 arm64 上内核签名无效 = 一执行就被系统终止。
+            # 同一步还断言镜像里的内核与源内核逐字节相同：上一步的 bundle 封印与 dmg 往返转换都排在
+            # 封印前那次判定之后，只有这里看得到它们有没有改写内核。
+            if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then
+              hdiutil detach "$mnt" -quiet || true
+              echo "::error::$(basename "$dmg") 内 Contents/Resources 下的内核/helper 未通过逐个判定"
               exit 1
             fi
             if [ ! -f "$mnt/$guide_name" ]; then

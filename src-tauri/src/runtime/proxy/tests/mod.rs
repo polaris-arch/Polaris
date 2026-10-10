@@ -6,6 +6,18 @@ use super::*;
 use super::process_supervision::*;
 use super::recovery::*;
 
+/// Windows 上测试结束**自己起的**进程用（模拟核崩溃）。生产没有按 pid 结束进程的原语：清扫认的是
+/// 扫描时留住的句柄，这里也经它走。
+#[cfg(windows)]
+fn send_signal(pid: u32, signal: polaris_core_supervisor::Signal) {
+    if let Some(process) = polaris_core_supervisor::scan_running_cores()
+        .into_iter()
+        .find(|process| process.pid == pid)
+    {
+        NativeStaleCoreIo.end(&process, signal);
+    }
+}
+
 /// 🔴 **出口 IP 重探腿与 unlock 失效腿必须成对**——起核 / 停核 / 热切三点，一个都不许漏。
 ///
 /// # 为什么必须是源码扫描，而不是行为测试
@@ -304,6 +316,10 @@ fn test_runtime_in_on(dir: PathBuf, helper: HelperRuntime) -> Arc<ProxyRuntime> 
     // This factory supplies no native core. Metadata calls own their admission fixture;
     // a supplied binary still selects the original native settlement/check path.
     *rt.metadata_validation_admission.lock().unwrap() = Some(Ok(()));
+    // 本工厂也没有受保护核目录可对账：经替身 helper 起核的用例关心的是 custody 与协议，
+    // 配套闸另有专门的用例（它们把这个桩清掉，走真对账）。
+    *rt.protected_core_verdict_fixture.lock().unwrap() =
+        Some(super::startup::ProtectedCoreVerdict::Confirmed);
     rt
 }
 

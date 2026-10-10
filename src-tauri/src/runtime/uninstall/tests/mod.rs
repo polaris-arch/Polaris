@@ -1037,3 +1037,24 @@ fn report_serializes_the_frontend_contract() {
     assert_eq!(steps[6]["outcome"]["kind"], "unsupported");
     assert_eq!(steps[6]["outcome"]["detail"], "便携版");
 }
+
+#[test]
+fn missing_windows_service_still_enters_fixed_native_cleanup() {
+    let helper = FakeHelper {
+        installed: false,
+        ..FakeHelper::ready()
+    };
+    let autostart = FakeAutostart::off();
+    let ops = SystemUninstallOps {
+        helper: &helper,
+        autostart: &autostart,
+        os: "windows",
+        config_dir: PathBuf::from("/unused/polaris"),
+        cache_updates_dir: None,
+        bundle_identifier: "com.polaris.app".to_owned(),
+        exe: None,
+        appimage: None,
+    };
+    assert!(matches!(ops.uninstall_helper(), StepOutcome::Done { .. }));
+    assert_eq!(helper.calls.load(Ordering::SeqCst), 1);
+}

@@ -152,7 +152,8 @@ pub struct HelperStatusSnapshot {
 /// 一句措辞就静默失效。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallCoreError {
-    /// helper 回 `ERR unknown`：不认识 install-core（旧 Windows helper 的常态，见 spec §3.5 兼容矩阵）。
+    /// helper 回不带尾文的 `ERR unknown`：不认识 install-core（旧 Windows helper 的常态，见 spec
+    /// §3.5 兼容矩阵）。判据见 [`is_unknown_command_reply`]。
     Unsupported,
     /// 其它失败，串是给日志看的诊断。
     Failed(String),
@@ -205,6 +206,7 @@ pub struct InstallCoreUnsupportedRecord {
 pub enum HelperActionErrorCode {
     Cancelled,
     AuthorizationUnavailable,
+    PartialCleanup,
     ProxyRunning,
     Unsupported,
     MissingAsset,
@@ -219,6 +221,15 @@ const fn escalation_failure_code(platform: Platform, code: i32) -> HelperActionE
         HelperActionErrorCode::AuthorizationUnavailable
     } else {
         HelperActionErrorCode::Failed
+    }
+}
+
+/// The native Windows uninstaller reports partial completion explicitly.
+const fn uninstall_failure_code(platform: Platform, code: i32) -> HelperActionErrorCode {
+    if matches!(platform, Platform::Win) && code == 3 {
+        HelperActionErrorCode::PartialCleanup
+    } else {
+        escalation_failure_code(platform, code)
     }
 }
 
@@ -948,7 +959,7 @@ impl HelperRuntime {
             Ok(EscalationOutcome::Failed { stderr, code }) => {
                 log::warn!("helper uninstall command failed (exit {code}): {stderr}");
                 self.action_failed(
-                    escalation_failure_code(self.platform, code),
+                    uninstall_failure_code(self.platform, code),
                     "helper uninstaller exited unsuccessfully",
                 )
             }
@@ -966,7 +977,7 @@ impl HelperRuntime {
     fn install_params(&self) -> Result<InstallParams, String> {
         let src_binary = resolve_helper_binary()?;
         // 三平台同构：安装脚本用它**播种**受保护核目录（仅在目标缺失时）。名叫 bundled 实为
-        // `resolve_core_binary()` = **现役核**（环境覆盖 → core_update → 随包种子），如实登记在
+        // `resolve_core_binary()` = **现役核**（即随包核；debug / test 构型可被开发态超驰替换），如实登记在
         // `InstallParams::bundled_core` 的字段文档里。
         // win 的 `--singbox` 不再从这里取：P4 起由 `InstallPaths::win().core_dir` 派生受保护路径。
         let bundled_core = crate::runtime::proxy::resolve_core_binary()?;
@@ -998,7 +1009,7 @@ impl HelperRuntime {
     /// 参数留着就是在邀请下一个调用方再次误以为「我传什么它就跑什么」，故**删掉**：
     /// 想让 helper 跑新核只有一条路 —— [`install_core`](Self::install_core) 换掉锁定路径的**内容**。
     /// linux 分支据此改传[受保护核路径](Self::protected_core_dir_path)（即 helper 真会跑的那个），
-    /// 而非 app 侧可写核路径 —— 后者必被 helper 判 `core-path-denied`。
+    /// 而非 app 侧解析出的随包核路径 —— 后者必被 helper 判 `core-path-denied`。
     ///
     /// **真机门**：真起 root 受管核 + 建 TUN。`fwd` = allowLan（开 IP 转发），`ppid` = app pid（父死看护）。
     pub fn start_core(
@@ -1221,20 +1232,24 @@ impl HelperRuntime {
     /// Probe support before any Linux helper Start reservation is armed. This
     /// status request is read-only; an old helper's ERR unknown must remain a
     /// recoverable upgrade error, not an unconfirmed possible child birth.
-    pub(crate) fn require_linux_birth_capability(&self) -> Result<(), String> {
+    pub(crate) fn require_linux_birth_capability(&self) -> Result<(), BirthCapabilityError> {
         if self.platform != Platform::Linux {
             return Ok(());
         }
-        let client = self.build_client()?;
+        let client = self
+            .build_client()
+            .map_err(BirthCapabilityError::Unavailable)?;
         require_linux_birth_capability_with_client(&client)
     }
 
     /// Read-only native capability; called before a Mac/Windows external birth is armed.
-    pub(crate) fn require_native_birth_capability(&self) -> Result<(), String> {
+    pub(crate) fn require_native_birth_capability(&self) -> Result<(), BirthCapabilityError> {
         if !matches!(self.platform, Platform::Mac | Platform::Win) {
             return Ok(());
         }
-        let client = self.build_client()?;
+        let client = self
+            .build_client()
+            .map_err(BirthCapabilityError::Unavailable)?;
         require_native_birth_capability_with_client(&client)
     }
 
@@ -1247,8 +1262,15 @@ impl HelperRuntime {
     /// 哪个文件」由这一个真值保证同步。
     ///
     /// **存量未迁移的例外**：升级到 P4 helper 之前装好的服务，其 SCM ImagePath 仍指着旧的
-    /// app 侧路径。那种机器上本方法返回的目录是「将来会生效」的那个，不是此刻 helper 实际 exec
-    /// 的那个；helper 侧的 ACL 自检因此刻意按 `singbox_bin` 的父目录取材（见 `coreacl`）。
+    /// app 侧路径（`<配置根>\core_update\sing-box.exe`）。那种机器上本方法返回的目录是「将来会
+    /// 生效」的那个，不是此刻 helper 实际 exec 的那个；helper 侧的 ACL 自检因此刻意按
+    /// `singbox_bin` 的父目录取材（见 `coreacl`）。
+    ///
+    /// 那个旧路径如今已不存在：配置根下的 `core_update/` 在应用启动时被清掉
+    /// （`core_paths::remove_legacy_core_state`）。这不会变成一次指不出原因的起核失败 ——
+    /// 那一代 helper 早于 native birth 协议，起核前的只读能力探测
+    /// （`require_native_birth_capability`）先得到 `ERR unknown`，按
+    /// `BirthCapabilityError::HelperOutdated` 引导用户去升级 / 重装助手，根本走不到 exec。
     #[must_use]
     pub fn protected_core_dir_path(&self) -> PathBuf {
         InstallPaths::for_platform(self.platform).core_dir
@@ -1256,8 +1278,8 @@ impl HelperRuntime {
 
     /// 经 helper 把暂存目录里的核 root 写入受保护核目录（`install-core`）。
     ///
-    /// **这是「换核对 TUN 提权路径生效」的唯一通道**：mac/win 的 `start` 不带核路径、linux 的会被
-    /// 强制校验成锁定路径，故新核只能靠本命令**换掉那个锁定路径的内容**（路径不变 ⇒ helper 无需重启）。
+    /// **这是让提权助手拿到本应用配套内核的通道**：mac/win 的 `start` 不带核路径、linux 的会被
+    /// 强制校验成锁定路径，故应用升级后的新内核只能靠本命令**换掉那个锁定路径的内容**（路径不变 ⇒ helper 无需重启）。
     /// 移植自 上游 `HelperManager.installCore`（`HelperManager.ts:421-430`）——helper 侧
     /// （[`polaris_helper::core_install::install_core_files`]）在 Polaris 移植时就已完整落地，
     /// 缺的一直是本方法这条 app 侧调用边。
@@ -1612,11 +1634,9 @@ fn install_core_response(resp: Response) -> Result<(), InstallCoreError> {
         Response::Ok(other) => Err(InstallCoreError::Failed(format!(
             "helper 装核返回非预期响应：{other:?}"
         ))),
-        // `ERR unknown` = 这个 helper 压根不认识 install-core（旧 Windows helper 的常态）。
+        // 裸 `ERR unknown` = 这个 helper 压根不认识 install-core（旧 Windows helper 的常态）。
         // 与「这次装核失败了」分开：前者重试一万次也是同一个结果，后者可能下次就好了。
-        Response::Err(e) if e.code == polaris_helper_proto::ErrorCode::Unknown => {
-            Err(InstallCoreError::Unsupported)
-        }
+        Response::Err(e) if is_unknown_command_reply(&e) => Err(InstallCoreError::Unsupported),
         Response::Err(e) => Err(InstallCoreError::Failed(format!("helper 装核失败：{e}"))),
     }
 }
@@ -1629,9 +1649,7 @@ fn confirm_install_core_unsupported(client: &HelperClient) -> Result<(), Install
     });
     match client.send(&probe) {
         Err(ClientError::EmptyResponse) => Err(InstallCoreError::Unsupported),
-        Ok(Response::Err(e)) if e.code == polaris_helper_proto::ErrorCode::Unknown => {
-            Err(InstallCoreError::Unsupported)
-        }
+        Ok(Response::Err(e)) if is_unknown_command_reply(&e) => Err(InstallCoreError::Unsupported),
         Ok(resp) => Err(InstallCoreError::Failed(format!(
             "helper 装核连接写出后 0 字节即断开；复核帧得到应答 {resp:?} ⇒ helper 认识 \
              install-core，按本次偶发故障处理"
@@ -1838,7 +1856,7 @@ fn format_helper_mutation_error(
     error: &polaris_helper_proto::Error,
 ) -> String {
     if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)
-        && error.code == polaris_helper_proto::ErrorCode::Unknown
+        && is_unknown_command_reply(error)
     {
         return format!(
             "已安装的 helper 不支持原生 birth 安全协议，已拒绝{operation}；请升级或修复 helper"
@@ -1860,33 +1878,98 @@ fn sleep_within_stop_budget(
     Ok(())
 }
 
-fn require_linux_birth_capability_with_client(client: &HelperClient) -> Result<(), String> {
-    if client.platform() != Platform::Linux {
-        return Err("exact birth capability probe requires Linux".to_owned());
-    }
-    match client.send_with_timeout(&Request::LinuxStatusBirth, Duration::from_millis(1500)) {
-        Ok(Response::Ok(ResponseKind::LinuxBirthStatus(_))) => Ok(()),
-        Ok(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Unknown => Err(
-            "已安装的 Linux helper 不支持 exact birth 安全协议；请升级或修复 helper 后重试"
-                .to_owned(),
-        ),
-        Ok(Response::Err(error)) => Err(format!("Linux helper exact birth 能力探测失败：{error}")),
-        Ok(Response::Ok(other)) => Err(format!(
-            "Linux helper exact birth 能力探测返回非预期响应：{other:?}"
-        )),
-        Err(error) => Err(format!(
-            "Linux helper exact birth 能力探测通信失败：{error}"
-        )),
+/// 应答是否是「不认识这条命令」：**不带尾文**的裸 `ERR unknown`。
+///
+/// 只比错误码不够。`unknown` 这个码在 wire 上有两种来源，只有第一种说明助手太旧：
+///
+/// - 命令名不在解码表或分派表里。三个平台的服务端此时写的都是裸的一行 `ERR unknown`
+///   （Linux `dispatch_locked` 的兜底臂；macOS `decode_request` 报未知命令；Windows
+///   `parse_request` 解不出）。
+/// - 认识命令、但这一次出了别的事，带着尾文：Linux 处理器的锁中毒（`ERR unknown <锁错误>`）、
+///   Linux 状态探测遇到认不出归属的 custody（`ERR unknown birth-custody-unidentified`）、
+///   Windows 收到行数不足的帧（`ERR unknown bad-frame`），以及协议层把任意错误折成的
+///   `ERR unknown <原文>`（`polaris_helper_proto::Error` 的 `From<Box<dyn Error>>`）。
+///
+/// 把第二种也当成「助手太旧」会让用户去重装一个没问题的助手，崩溃自愈也据此收手。
+pub(crate) fn is_unknown_command_reply(error: &polaris_helper_proto::Error) -> bool {
+    error.code == polaris_helper_proto::ErrorCode::Unknown && error.detail.trim().is_empty()
+}
+
+/// 起核前只读能力探测没通过的两种性质。
+///
+/// 分开是因为用户下一步要做的事不同：[`HelperOutdated`](Self::HelperOutdated) 重试多少次都一样，
+/// 要去升级 / 重装提权助手；[`Unavailable`](Self::Unavailable) 可能只是这一刻不通。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BirthCapabilityError {
+    /// 已装的助手对探测命令回了裸 `ERR unknown`：它早于本应用起核所用的协议。
+    ///
+    /// 这是「不认识这条命令」的**确定**回答，不是通信失败 —— 只有它能诚实地断言「助手太旧」
+    /// （判据见 [`is_unknown_command_reply`]）。
+    HelperOutdated(String),
+    /// 其余：通信失败、既有 custody 未清、非预期应答、带尾文的 `ERR unknown`。
+    Unavailable(String),
+}
+
+impl BirthCapabilityError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::HelperOutdated(message) | Self::Unavailable(message) => message,
+        }
     }
 }
 
-fn require_native_birth_capability_with_client(client: &HelperClient) -> Result<(), String> {
-    match client.send_with_timeout(&Request::NativeStatusBirth, Duration::from_millis(1500)) {
-        Ok(Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Empty | NativeBirthStatus::Running { .. }))) => Ok(()),
-        Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => Err(format!("helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试")),
-        result => Err(format!(
-            "已安装的 helper 未提供 native birth 安全能力；请升级或修复 helper 后重试：{result:?}"
+fn require_linux_birth_capability_with_client(
+    client: &HelperClient,
+) -> Result<(), BirthCapabilityError> {
+    use BirthCapabilityError::{HelperOutdated, Unavailable};
+    if client.platform() != Platform::Linux {
+        return Err(Unavailable(
+            "exact birth capability probe requires Linux".to_owned(),
+        ));
+    }
+    match client.send_with_timeout(&Request::LinuxStatusBirth, Duration::from_millis(1500)) {
+        Ok(Response::Ok(ResponseKind::LinuxBirthStatus(_))) => Ok(()),
+        Ok(Response::Err(error)) if is_unknown_command_reply(&error) => Err(HelperOutdated(
+            "已安装的 Linux helper 不支持 exact birth 安全协议；请升级或修复 helper 后重试"
+                .to_owned(),
         )),
+        Ok(Response::Err(error)) => Err(Unavailable(format!(
+            "Linux helper exact birth 能力探测失败：{error}"
+        ))),
+        Ok(Response::Ok(other)) => Err(Unavailable(format!(
+            "Linux helper exact birth 能力探测返回非预期响应：{other:?}"
+        ))),
+        Err(error) => Err(Unavailable(format!(
+            "Linux helper exact birth 能力探测通信失败：{error}"
+        ))),
+    }
+}
+
+fn require_native_birth_capability_with_client(
+    client: &HelperClient,
+) -> Result<(), BirthCapabilityError> {
+    use BirthCapabilityError::{HelperOutdated, Unavailable};
+    // 三条不通过的腿共用同一句开头，日志里据此一眼认出是这道门。
+    let unsupported = |detail: &dyn std::fmt::Debug| {
+        format!(
+            "已安装的 helper 未提供 native birth 安全能力；请升级或修复 helper 后重试：{detail:?}"
+        )
+    };
+    match client.send_with_timeout(&Request::NativeStatusBirth, Duration::from_millis(1500)) {
+        Ok(Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Empty | NativeBirthStatus::Running { .. },
+        ))) => Ok(()),
+        Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => Err(Unavailable(format!(
+            "helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试"
+        ))),
+        Ok(Response::Err(error)) if is_unknown_command_reply(&error) => {
+            Err(HelperOutdated(unsupported(&error)))
+        }
+        // 认识探测命令、但这一次没答上来（带尾文的 `ERR unknown`、别的错误码）：不是能力缺失。
+        Ok(Response::Err(error)) => Err(Unavailable(format!(
+            "helper native birth 能力探测失败：{error}"
+        ))),
+        result => Err(Unavailable(unsupported(&result))),
     }
 }
 
@@ -2077,9 +2160,8 @@ fn current_uid() -> u32 {
 ///
 /// # 信任级（L2：本函数的产物直接喂**提权安装链**）
 ///
-/// `POLARIS_HELPER_PATH` 逃生门在 **release** 侧只认
-/// [`TrustScope::AppDataOnly`](crate::runtime::env_trust::TrustScope::AppDataOnly) ——
-/// 比内核那条（L1）严一档，随包资源目录也不接受。理由是后果不同：这个路径随后被以
+/// `POLARIS_HELPER_PATH` 逃生门在 **release** 侧只认 app 自有数据目录
+/// （[`crate::runtime::env_trust`]），随包资源目录也不接受。理由是后果：这个路径随后被以
 /// 管理员 / root 权限装成系统服务（systemd unit / launchd plist / Windows 服务），
 /// 得到的是一个开机自启的 root 级常驻进程；而随包 helper 本就由下面的兜底腿解析得到，
 /// 逃生门再指一次只会多一个入口、不多一分能力。
@@ -2095,7 +2177,6 @@ fn resolve_helper_binary() -> Result<PathBuf, String> {
         "POLARIS_HELPER_PATH",
         // 名字必须以**字面量**留在 `env::var(` 调用处（见 `release_escape_hatches` 探测器①）。
         std::env::var("POLARIS_HELPER_PATH").ok(),
-        crate::runtime::env_trust::TrustScope::AppDataOnly,
     )? {
         return Ok(helper);
     }

@@ -35,7 +35,7 @@ mod real_core_tests;
 
 /// impl 内方法的源码切片工具（`guard_scan::top_level_fn_body` 只认列 0 的右花括号，
 /// 对 impl 里的方法会一路切到整个 impl 结束 → 守卫可被「删这里、加那里」骗过）。
-use crate::runtime::core_update_scheduler::method_scan::method_body;
+use crate::test_support::method_body;
 // 取材面 = **模块** `runtime/stats`（`runtime/stats.rs` 根文件 + `runtime/stats/**` 递归，
 // 剔除 `tests/`）。`stats.rs` 正在按域拆成 `stats/{gate,projection,subscription,relay}.rs`，
 // 写死单文件锚点会在拆分那天把取材面砍成门面一份：下面 10 处里的切片锚点会 panic（体面），

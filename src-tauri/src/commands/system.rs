@@ -159,18 +159,14 @@ pub(crate) fn list_network_interfaces_blocking() -> Vec<NetworkInterfaceInfo> {
     }
 }
 
-/// macOS 进程枚举命令：只给 `ps` 子进程注入 UTF-8 locale，避免非 UTF-8 会话下应用名被替换或截断。
-/// 不修改 Polaris 进程环境，也不把 locale 能力扩散到通用 [`Command`] 抽象。
+/// macOS 进程枚举命令：只给 `ps` 子进程注入 UTF-8 locale，避免非 UTF-8 会话下应用名被转义或截断。
+/// 不修改 Polaris 进程环境。程序与 locale 前缀取自
+/// [`polaris_core_supervisor::macos_ps`]（全仓 `ps` 调用的唯一写法）。
 fn macos_ps_command() -> Command {
+    let ps = polaris_core_supervisor::macos_ps::ARGV_PREFIX;
     Command::new(
-        "/usr/bin/env",
-        [
-            "LC_ALL=en_US.UTF-8",
-            "LANG=en_US.UTF-8",
-            "/bin/ps",
-            "-axo",
-            "comm=",
-        ],
+        polaris_core_supervisor::macos_ps::PROGRAM,
+        [ps[0], ps[1], ps[2], "-axo", "comm="],
     )
 }
 

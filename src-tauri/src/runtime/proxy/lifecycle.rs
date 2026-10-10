@@ -314,18 +314,6 @@ impl ProxyRuntime {
         Ok(())
     }
 
-    /// 置「换核验证窗口」抑制位（上游 `setAutoRestartSuppressed`）。
-    ///
-    /// 窗口内核**意外退出不自动重启**：让首次失败立刻上报，而不是在坏核上退避空转 3 次 ——
-    /// 空转会把「新核有问题」这个信号淹掉，而那正是换核验证唯一要采集的信息。
-    ///
-    /// 唯一调用方是换核验证守护腿（`commands::updater` 的 `arm_core_validation`），
-    /// 置起与撤下成对；撤下后老核照常受崩溃自愈保护。判据本体在
-    /// [`CrashRecoveryMachine::should_auto_restart`](polaris_core_supervisor::CrashRecoveryMachine::should_auto_restart)。
-    pub fn set_auto_restart_suppressed(&self, suppressed: bool) {
-        self.crash_lock().set_auto_restart_suppressed(suppressed);
-    }
-
     /// 当前状态快照（上游 `proxy:getStatus`）。
     ///
     /// `uptime` 在此**现算**（`now - start_time`，秒）而非读存储值：存储的 uptime 写于起核那一刻，

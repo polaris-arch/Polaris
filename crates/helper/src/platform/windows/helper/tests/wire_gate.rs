@@ -277,7 +277,10 @@ fn authed_unknown_command_is_delivered_with_wait_peer() {
     }
 }
 
-/// 帧行数不足（连 token/命令都凑不齐）维持现状：`ERR unknown` + NoWait。
+/// 帧行数不足（连 token/命令都凑不齐）：`ERR unknown bad-frame` + NoWait。
+///
+/// 带尾文是为了与「已鉴权而命令未知」的裸 `ERR unknown` 分开 —— 客户端只把裸的那一行当作
+/// 「helper 不认识这条命令」。
 #[test]
 fn short_frame_keeps_the_no_wait_unknown_reply() {
     let h = make_helper_defaults();
@@ -285,7 +288,7 @@ fn short_frame_keeps_the_no_wait_unknown_reply() {
         assert_eq!(
             h.handle_frame(raw),
             FrameReply {
-                line: "ERR unknown\n".to_owned(),
+                line: "ERR unknown bad-frame\n".to_owned(),
                 flush: FlushMode::NoWait,
                 exit_after: false,
             },
@@ -294,7 +297,7 @@ fn short_frame_keeps_the_no_wait_unknown_reply() {
     }
 }
 
-/// 正面：已鉴权的已知命令照常分派、WaitPeer；uninstall 带上自退标志（其余不带）。
+/// 已鉴权命令照常分派；SYSTEM uninstall 明确要求 bundled UAC 且不自退。
 #[test]
 fn authed_known_commands_are_dispatched_with_wait_peer() {
     let h = make_helper_defaults();
@@ -305,9 +308,15 @@ fn authed_known_commands_are_dispatched_with_wait_peer() {
     assert!(!ping.exit_after);
 
     let uninstall = make_helper_defaults().handle_frame("real-token\nuninstall\n");
-    assert_eq!(uninstall.line, "OK uninstalling\n");
+    assert_eq!(
+        uninstall.line,
+        "ERR native-cleaner-uac-required; use bundled cleaner UAC fallback\n"
+    );
     assert_eq!(uninstall.flush, FlushMode::WaitPeer);
-    assert!(uninstall.exit_after, "uninstall 必须让 service 层自退");
+    assert!(
+        !uninstall.exit_after,
+        "UAC fallback 必须由调用方同步完成，不能先退出 helper"
+    );
 }
 
 /// 生产的 `handle_connection` 真的走 `handle_frame`，且没有第二条自己切行 / 解码 / 分派的旁路。

@@ -52,7 +52,7 @@ Polaris 存在三个不可混同的真值：
 
 ## 代理运行时
 
-`ProxyRuntime` 保留为跨领域事务 façade。它负责起停、换核、受控重启、配置世代、真实
+`ProxyRuntime` 保留为跨领域事务 façade。它负责起停、受控重启、配置世代、真实
 selector 切换事务和运行快照提交。以下独立 owner 已从根文件中分离：
 
 - `runtime/proxy/system_takeover.rs`：系统代理接管、恢复快照、marker 和残留检测。
@@ -124,8 +124,9 @@ WebView 生产 CSP 的脚本源仅为 `self`，不允许 inline script 或 `unsa
 `switch_serial`、start commit/stop reset 或 helper/marker 等待边界，不属于本轮的安全重构。
 
 设置更新页同样按 owner 拆分：`SettingsUpdate` 只编排卡片与共享设置，`use-app-update` / `AppUpdateCard`
-拥有应用更新状态机和呈现，`use-core-update` / `CoreUpdateCard` 拥有内核更新状态机和呈现。下载进度订阅、
-安装期包快照和回滚确认仍由各自 hook 持有，不把异步事务重新散回页面组件。
+拥有应用更新状态机和呈现，`CoreInfoCard` 只读展示内核信息（现役版本、配套版本、补丁集标识）。
+内核随应用安装包发布，应用内不提供更新、上传或回滚内核的入口。下载进度订阅与安装期包快照仍由
+`use-app-update` 持有，不把异步事务重新散回页面组件。
 App 更新通道的前端归一化位于 `domain/app-update-channel`，宿主侧候选策略位于
 `commands/updater/app_update_policy`；两者只解释持久配置，下载、校验和安装仍由既有 App 更新 owner 单点完成。
 

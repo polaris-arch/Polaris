@@ -160,11 +160,9 @@ pub trait ProcOps: Send + Sync {
     /// 本方法封装「对指定 pid 的收割序列」，宽限窗口由实现决定（生产 = 2s，测试可缩短）。
     fn reap_child(&self, pid: u32);
 
-    /// 派生自卸载旁路 cmd（`winproc.go:233-245` `spawnSelfUninstall`）。
-    ///
-    /// best-effort：失败只记日志（Go `_ = c.Start()`）。旁路须比 helper 活得久（DETACHED_PROCESS、
-    /// 不 assignToJob、继承 SYSTEM token）。
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str);
+    /// Launch a fixed native cleaner; success only acknowledges worker creation.
+    /// Failure must keep the helper alive so the app can use bundled UAC fallback.
+    fn spawn_self_uninstall(&self) -> Result<(), String>;
 
     /// 受管核的进程身份（D2/D3）：`pid` 是当前受管核时返回其 created/image，否则全 `None`。
     ///
@@ -297,8 +295,7 @@ struct MockProcOpsInner {
     pub start_error: std::sync::Mutex<Option<std::io::Error>>,
     /// 最近一次 `reap_child` 的 pid（断言用）。
     pub last_reaped_pid: std::sync::atomic::AtomicU32,
-    /// 最近一次 `spawn_self_uninstall` 的参数（断言用）。
-    pub last_spawn_args: std::sync::Mutex<Option<(String, String)>>,
+    pub uninstall_error: std::sync::Mutex<Option<String>>,
     /// `apply_route` 累计调用次数（W9 netsh route 断言用）。
     pub route_calls: std::sync::atomic::AtomicUsize,
     /// 最近一次 `apply_route` 的参数（iface, cidr, del）（断言用）。
@@ -442,10 +439,8 @@ impl MockProcOps {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 最近一次 `spawn_self_uninstall` 的参数（测试断言）。
-    #[must_use]
-    pub fn last_spawn_args(&self) -> Option<(String, String)> {
-        self.inner.last_spawn_args.lock().unwrap().clone()
+    pub fn set_uninstall_error(&self, error: &str) {
+        *self.inner.uninstall_error.lock().unwrap() = Some(error.to_owned());
     }
 
     /// 预设受管核身份（D2/D3；`start_singbox` 之后按新 pid 生效）。
@@ -718,12 +713,16 @@ impl ProcOps for MockProcOps {
             .store(pid, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str) {
+    fn spawn_self_uninstall(&self) -> Result<(), String> {
         self.inner
             .spawn_uninstall_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self.inner.last_spawn_args.lock().unwrap() =
-            Some((service_name.to_owned(), support_dir.to_owned()));
+        self.inner
+            .uninstall_error
+            .lock()
+            .unwrap()
+            .clone()
+            .map_or(Ok(()), Err)
     }
 
     fn enable_ip_forwarding(&self) {

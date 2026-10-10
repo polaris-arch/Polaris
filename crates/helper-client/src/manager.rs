@@ -592,18 +592,16 @@ pub struct InstallParams {
     pub src_binary: PathBuf,
     /// 安装脚本用来**播种**受保护核目录的源文件（三平台同构；P4 起含 win）。
     ///
-    /// # ⚠️ 字段名名不副实（如实登记，别照名字写代码）
+    /// 唯一的生产装配点（`src-tauri/src/runtime/helper.rs::install_params`）传的是
+    /// `crate::runtime::proxy::resolve_core_binary()`：发行构型下它只解析打进安装包的资源目录，
+    /// 即随包核；用户配置目录、`PATH`、配置字段都不参与。debug / test 构型在它之前多一级开发态
+    /// 环境变量超驰（release 不编译）。
     ///
-    /// 名字读作「随包核」，但唯一的生产装配点
-    /// （`src-tauri/src/runtime/helper.rs::install_params`）传的是
-    /// `crate::runtime::proxy::resolve_core_binary()` —— 那是**现役核**：优先级为
-    /// 环境覆盖 → `<config>/core_update/sing-box[.exe]`（用户可写）→ 最后才是随包种子。
-    /// 也就是说播下去的可能是用户换过的核，而不是安装包里那一份。
-    ///
-    /// 这是刻意与 mac/linux 保持同构，安全上**不构成信任锚点**：面 K 开着时 app 本体同样在
-    /// 用户可写域，改随包核与改现役核对同账户攻击者是同一道门。真要的是内容鉴权（spec §2.6），
-    /// 不是换一个 seed 源。播种只在目标不存在时发生，随后的内容对账由起核前的
-    /// `reconcile_protected_core` → `install-core`（带 sha256 校验）负责。
+    /// 这个源文件在安全上**不构成信任锚点**：安装包本体若落在用户可写位置（Windows 的
+    /// `installMode: currentUser`、AppImage、便携版），随包核同样可被同账户进程改写。真要的是
+    /// 内容鉴权，不是换一个 seed 源。播种只在目标不存在时发生，随后的内容对账由起核前的
+    /// `reconcile_protected_core` → `install-core`（带 sha256 校验）负责，对账给不出一致结论时
+    /// 应用拒绝经提权助手起核。
     ///
     /// 上游: `resourceManager.getBundledSingBoxPath()`。
     pub bundled_core: PathBuf,
@@ -665,16 +663,39 @@ impl HelperManager {
 
     /// 卸载 helper（全流程，移植自三平台 `uninstall()` 的提权路径）。
     ///
-    /// 生成 root 卸载脚本（bootout/disable + 删描述符/二进制/受保护目录）→ 提权跑 → 清 app 侧 token。
+    /// mac/Linux 生成固定卸载脚本；Windows 直接请求 bundled native cleaner UAC，
+    /// 不依赖已安装 helper、其版本或 app 配置目录脚本。仅完整成功清 app 侧 token。
     /// 返回 [`EscalationOutcome`]。
     ///
-    /// **win 零 UAC 优化**（管道自卸载）见 [`pipe_self_uninstall`](Self::pipe_self_uninstall) ——
-    /// 调用方可先试它、失败再回退本方法（对齐 WindowsServiceHelper.ts:361 的「先管道后提权」）。
+    /// 管道自卸 [`pipe_self_uninstall`](Self::pipe_self_uninstall) 仅表示已启动，
+    /// 不证明 SCM/目录清理完成。用户主动卸载使用本方法获得最终 native exit outcome。
     pub fn uninstall(
         &self,
         script_dir: &Path,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
+        if self.platform == Platform::Win {
+            #[cfg(windows)]
+            {
+                let outcome = match polaris_windows_cleaner::launch_bundle() {
+                    polaris_windows_cleaner::Outcome::Success => EscalationOutcome::Success,
+                    polaris_windows_cleaner::Outcome::Cancelled => EscalationOutcome::Cancelled,
+                    outcome => EscalationOutcome::Failed {
+                        stderr: format!(
+                            "native cleaner {:?}; service/tree cleanup is not confirmed complete",
+                            outcome
+                        ),
+                        code: outcome.code(),
+                    },
+                };
+                if outcome == EscalationOutcome::Success {
+                    self.clear_token();
+                }
+                return Ok(outcome);
+            }
+            #[cfg(not(windows))]
+            return Err(ManagerError::UnsupportedPlatform(Platform::Win));
+        }
         let script = self.build_uninstall_script();
         // uninstall 脚本不依赖 InstallParams 的其它字段，仅需 script_dir 落盘。
         let params = InstallParams {
@@ -686,18 +707,18 @@ impl HelperManager {
         };
         let outcome =
             self.run_privileged_script(&params, self.uninstall_script_name(), &script, executor)?;
-        // 卸载成功/取消都清 app 侧 token（重装会重生成；取消时清了也无害——未装态 token 无意义）。
+        // 只有完整成功清 app 侧 token，取消/partial 保留以支持重试。
         if matches!(outcome, EscalationOutcome::Success) {
             self.clear_token();
         }
         Ok(outcome)
     }
 
-    /// win 零 UAC 管道自卸载（移植 WindowsServiceHelper.ts:371-390）：经就绪 helper 发 `uninstall`，
-    /// helper 以 SYSTEM 收割 child + 派生旁路自停删服务 + 删 ProgramData（见 daemon W11/W12）。
-    ///
-    /// 返回 `true` = helper 回 `OK`（自卸载已启动，调用方随后轮询服务消失）；`false` = 管道不可用/非 OK
-    /// （调用方回退 [`uninstall`](Self::uninstall) 提权兜底）。仅 win 有 `uninstall` 命令，其余平台恒 `false`。
+    /// Legacy Windows IPC probe. Current helper replies with an explicit
+    /// bundled-cleaner/UAC-fallback error and never starts SYSTEM self-removal.
+    /// `true` only records an older helper's OK acknowledgment, not completion;
+    /// callers need the synchronous [`uninstall`](Self::uninstall) result.
+    /// There is no production callsite using this probe as an uninstall receipt.
     #[must_use]
     pub fn pipe_self_uninstall(&self, client: &HelperClient) -> bool {
         if self.platform != Platform::Win {
@@ -758,7 +779,7 @@ impl HelperManager {
             Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
                 build_linux_uninstall_script(&self.paths)
             }
-            Platform::Win => build_win_uninstall_script(),
+            Platform::Win => unreachable!("Windows uninstall is a fixed native operation"),
         }
     }
 
@@ -779,9 +800,9 @@ impl HelperManager {
         }
     }
 
-    const fn uninstall_script_name(&self) -> &'static str {
+    fn uninstall_script_name(&self) -> &'static str {
         match self.platform {
-            Platform::Win => "polaris-helper-uninstall.ps1",
+            Platform::Win => unreachable!("Windows uninstall does not write a script"),
             // iOS 同上一函数：不可达占位，与 `build_uninstall_script` 的臂逐值同形。
             Platform::Mac
             | Platform::Linux
@@ -1424,6 +1445,15 @@ echo polaris-helper-uninstall-ok\n",
 fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token: &str) -> String {
     let support = WIN_SUPPORT_DIR;
     let exe = params.src_binary.to_string_lossy();
+    let cleaner_src = params
+        .src_binary
+        .to_string_lossy()
+        .rsplit_once(['\\', '/'])
+        .map_or_else(
+            || "polaris-cleaner.exe".to_owned(),
+            |(dir, _)| format!(r"{dir}\polaris-cleaner.exe"),
+        );
+    let cleaner_dst = format!(r"{support}\polaris-cleaner.exe");
     // helperDst = SUPPORT\WIN_HELPER_EXE —— **不从 src_binary 现算 basename**：落点必须与
     // `InstallPaths::win().binary` 同源，否则状态探测查一个地方、脚本装到另一个地方（这正是
     // Windows 上 `is_installed` 曾恒 false 的成因）。接线由
@@ -1434,6 +1464,7 @@ fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token:
     let token_file = format!(r"{support}\{HELPER_TOKEN_FILENAME}");
     let helper_backup = format!(r"{support}\{WIN_HELPER_EXE}.rollback");
     let token_backup = format!(r"{support}\{HELPER_TOKEN_FILENAME}.rollback");
+    let cleaner_backup = format!(r"{support}\polaris-cleaner.exe.rollback");
     // ★S（P4）：`--singbox` 由 `paths.core_dir` 派生的**受保护**路径，不再取 `params` 里那个
     // app 侧用户可写核 —— 安装脚本与 app 侧 `protected_core_dir_path()` 的唯一来源是
     // `InstallPaths::win().core_dir`；helper 自检（`coreacl`）查的目录由它自己从 `--support`
@@ -1504,6 +1535,9 @@ fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token:
 $support = '{support_q}'\n\
 $tokenFile = '{token_file_q}'\n\
 $helperSrc = '{exe_q}'\n\
+$cleanerSrc = '{cleaner_src_q}'\n\
+$cleanerDst = '{cleaner_dst_q}'\n\
+$cleanerBackup = '{cleaner_backup_q}'\n\
 $helperDst = '{helper_dst_q}'\n\
 $helperBackup = '{helper_backup_q}'\n\
 $tokenBackup = '{token_backup_q}'\n\
@@ -1513,6 +1547,7 @@ $coreBin = '{core_bin_q}'\n\
 $coreSidecar = '{core_sidecar_q}'\n\
 $bundledCore = '{bundled_core_q}'\n\
 $bundledSidecar = '{bundled_sidecar_q}'\n\
+if (-not (Test-Path -LiteralPath $cleanerSrc -PathType Leaf)) {{ throw \"bundled native cleaner missing\" }}\n\
 New-Item -ItemType Directory -Force -Path $support | Out-Null\n\
 # ★面 I（必改2）：先取所有权再改 DACL。普通用户可在 C:\\ProgramData 下直建子目录并成\n\
 # CREATOR OWNER 拿完全控制——owner 隐含 WRITE_DAC，不中和的话下面 /inheritance:r + /grant:r\n\
@@ -1567,9 +1602,11 @@ $oldStartMode = if ($serviceExisted) {{ $oldService.StartMode }} else {{ $null }
 $oldWasRunning = $serviceExisted -and $oldService.State -eq 'Running'\n\
 $hadHelper = Test-Path -LiteralPath $helperDst\n\
 $hadToken = Test-Path -LiteralPath $tokenFile\n\
-Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinue\n\
+$hadCleaner = Test-Path -LiteralPath $cleanerDst\n\
+Remove-Item -Force -Path $helperBackup,$tokenBackup,$cleanerBackup -ErrorAction SilentlyContinue\n\
 if ($hadHelper) {{ Copy-Item -LiteralPath $helperDst -Destination $helperBackup -Force }}\n\
 if ($hadToken) {{ Copy-Item -LiteralPath $tokenFile -Destination $tokenBackup -Force }}\n\
+if ($hadCleaner) {{ Copy-Item -LiteralPath $cleanerDst -Destination $cleanerBackup -Force }}\n\
 try {{\n\
 # 先删残留旧 token 再写（旧 Admin 只读会拒 Set-Content 覆盖；经目录 FILE_DELETE_CHILD 删旧不受其自身 DACL 阻挡）。\n\
 Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue\n\
@@ -1585,7 +1622,8 @@ while ((Get-Service -Name {service} -ErrorAction SilentlyContinue) -and (Get-Dat
 # 外置复制（退避重试兜解锁窗口竞态）。\n\
 $copied = $false\n\
 for ($i = 0; $i -lt 10 -and -not $copied; $i++) {{\n\
-  try {{ Copy-Item -LiteralPath $helperSrc -Destination $helperDst -Force; $copied = $true }}\n\
+  try {{ Copy-Item -LiteralPath $helperSrc -Destination $helperDst -Force\n\
+Copy-Item -LiteralPath $cleanerSrc -Destination $cleanerDst -Force; $copied = $true }}\n\
   catch {{ Start-Sleep -Milliseconds 300 }}\n\
 }}\n\
 if (-not $copied) {{ throw \"复制 helper.exe 到 ProgramData 失败（旧服务二进制可能仍被占用，请稍后重试或重启后再装）\" }}\n\
@@ -1594,6 +1632,10 @@ if (-not $copied) {{ throw \"复制 helper.exe 到 ProgramData 失败（旧服�
 if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
 & $icacls $helperDst /inheritance:r /grant:r \"{sid_system}:(F)\" \"{sid_admins}:(F)\" | Out-Null\n\
 if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
+& $icacls $cleanerDst /setowner \"{sid_owner}\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"native cleaner owner failed\" }}\n\
+& $icacls $cleanerDst /inheritance:r /grant:r \"{sid_system}:(F)\" \"{sid_admins}:(F)\" | Out-Null\n\
+if ($LASTEXITCODE -ne 0) {{ throw \"native cleaner DACL failed\" }}\n\
 # New-Service 退避重试（1072 窗口）：BinaryPathName 单一字符串直达 CreateService；默认 LocalSystem；Automatic 开机自启。\n\
 $created = $false\n\
 $lastErr = $null\n\
@@ -1618,7 +1660,7 @@ if ($LASTEXITCODE -ne 0) {{ throw \"sc failure 自愈配置失败（退出码 $L
 & $sc start {service} | Out-Null\n\
 if ($LASTEXITCODE -ne 0) {{ throw \"sc start helper service failed\" }}\n\
 # commit：新服务已成功首启，旧文件才失去回滚价值。\n\
-Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinue\n\
+Remove-Item -Force -Path $helperBackup,$tokenBackup,$cleanerBackup -ErrorAction SilentlyContinue\n\
 }} catch {{\n\
   $installError = $_\n\
   $ErrorActionPreference = 'SilentlyContinue'\n\
@@ -1636,6 +1678,11 @@ Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinu
   }} elseif (-not $hadToken) {{\n\
     Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue\n\
   }}\n\
+  if ($hadCleaner -and (Test-Path -LiteralPath $cleanerBackup)) {{\n\
+    Copy-Item -LiteralPath $cleanerBackup -Destination $cleanerDst -Force\n\
+  }} elseif (-not $hadCleaner) {{\n\
+    Remove-Item -Force -Path $cleanerDst -ErrorAction SilentlyContinue\n\
+  }}\n\
   if ($serviceExisted) {{\n\
     $oldStartType = switch ($oldStartMode) {{ 'Disabled' {{ 'Disabled' }} 'Manual' {{ 'Manual' }} default {{ 'Automatic' }} }}\n\
     New-Service -Name {service} -BinaryPathName $oldBinPath -StartupType $oldStartType | Out-Null\n\
@@ -1650,6 +1697,9 @@ Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinu
         support_q = ps_quote(support),
         token_file_q = ps_quote(&token_file),
         exe_q = ps_quote(&exe),
+        cleaner_src_q = ps_quote(&cleaner_src),
+        cleaner_dst_q = ps_quote(&cleaner_dst),
+        cleaner_backup_q = ps_quote(&cleaner_backup),
         helper_dst_q = ps_quote(&helper_dst),
         helper_backup_q = ps_quote(&helper_backup),
         token_backup_q = ps_quote(&token_backup),
@@ -1667,24 +1717,6 @@ Remove-Item -Force -Path $helperBackup,$tokenBackup -ErrorAction SilentlyContinu
         icacls = icacls,
         sc = sc,
         service = WIN_SERVICE_NAME,
-    )
-}
-
-/// win 卸载脚本（PowerShell）。忠实迁自 WindowsServiceHelper.ts:510-517。
-/// $env: 同 install 走双引号变量 + 裸调用（单引号字面量病 2026-08-19 一并修；本脚本
-/// EAP=SilentlyContinue，病发时静默什么都不卸——「卸载点了没反应」的隐性形态）。
-fn build_win_uninstall_script() -> String {
-    let sc = r#"$sc = "$env:SystemRoot\System32\sc.exe""#;
-    format!(
-        "$ErrorActionPreference = 'SilentlyContinue'\n\
-{sc}\n\
-& $sc stop {service} 2>$null | Out-Null\n\
-Start-Sleep -Milliseconds 300\n\
-& $sc delete {service} 2>$null | Out-Null\n\
-Remove-Item -Recurse -Force -Path '{support_q}' -ErrorAction SilentlyContinue\n",
-        sc = sc,
-        service = WIN_SERVICE_NAME,
-        support_q = ps_quote(WIN_SUPPORT_DIR),
     )
 }
 

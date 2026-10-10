@@ -185,7 +185,6 @@ pub(crate) fn reconcile_tray_visual(
 /// | 用户主动断开 | `STOPPED` | ✅ |
 /// | 核异常退出 / 自动重启失败 | 仅 `ERROR` | ❌ 停在实心 |
 /// | `proxy_restart` 失败（核已停） | **零 emit** | ❌ 停在实心 |
-/// | updater 换核前停核 | **零 emit** | ❌ 停在实心 |
 /// | 休眠唤醒后失效 | **零 emit** | ❌ |
 ///
 /// 回读真值把问题收敛回「当下核在不在跑」这一个可直接观测的事实（`ProxyRuntime::status().running`，

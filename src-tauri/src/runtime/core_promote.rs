@@ -1,37 +1,23 @@
-//! 受保护核提升 + 起核后「实跑二进制」自证（换核在 TUN 提权路径上真正生效的两块）。
+//! 受保护核提升 + 起核后「实跑二进制」自证。
 //!
-//! # 为什么必须有这个模块（第一性）
+//! # 为什么必须有这个模块
 //!
-//! `core_paths` / `core_swap` 的「可写现役核 + 随包种子」模型解决的是**app 直起**那条腿：
-//! 换核写 `<config_dir>/core_update/sing-box`，`resolve_core_binary()` 读同一路径 ⇒ 写=读=执行，
-//! 免提权且自洽。
+//! 应用直起内核时执行的就是随包核。但 **TUN 提权路径不走那个文件**：mac/win 的 `start` 协议
+//! **不带核路径**，helper 恒执行自己启动时 `--singbox` 锁定的那一个；linux 带路径但 helper 强制
+//! 它 == 锁定的 `coredir/sing-box`，否则 `ERR core-path-denied`。那是**安全边界**，不能松绑 ——
+//! 「持 token 就能让 root 跑任意二进制」比跑旧核严重得多。
 //!
-//! 但 **TUN 提权路径根本不走那个文件**：mac/win 的 `start` 协议**不带核路径**，helper 恒执行自己
-//! 启动时 `--singbox` 锁定的那一个（`crates/helper/src/platform/macos/handler.rs:51`「防写任意路径」/
-//! `daemon.rs:44` 从 flag 取；linux 带路径但 helper 强制它 == 锁定的 `coredir/sing-box`，否则
-//! `ERR core-path-denied`，`platform/linux/handler.rs:350`）。那是**安全边界**，不能为了换核去松绑
-//! ——「持 token 就能让 root 跑任意二进制」比跑旧核严重得多。
+//! 于是让提权路径跑到本应用配套内核的做法是：**把随包核推进受保护目录**，让「helper 锁定的那个
+//! 路径」的**内容**与随包核一致。路径不变 ⇒ helper 无需重启即在下次 `start` 时 exec 到它。
 //!
-//! 于是唯一正确的做法与 上游 一致：**把新核推进受保护目录**，让「helper 锁定的那个路径」的**内容**变新。
-//! 路径不变 ⇒ helper 无需重启即在下次 `start` 时 exec 到新核（helper 每次 `start` 现 spawn，不持句柄）。
-//! 这条腿在 上游 里是 `HelperManager.installCore` → Go `installCore`（`helper/helper.go:127-198`），
-//! Polaris 移植时 **helper 侧全实现了**（[`polaris_helper::core_install`] + `Request::InstallCore`），
-//! **app 侧从未调用** —— 缺的就是这一环。
+//! # 提升的时机：每次经 helper 起核前对账
 //!
-//! # 提升的时机：每次经 helper 起核前对账，而非「换核成功后推一次」
-//!
-//! 上游 在换核成功后立刻 `installCore`。那样只覆盖「换核」这一个触发点，而受保护核会因
-//! **至少三条**别的路径与现役核漂移：
-//!  1. **app 升级重播种**（`core_paths` 的 reseed：随包基线变新 → 重写 `core_update/`）——p101 实测正是这条；
-//!  2. **helper 装得比核晚 / 装完再换核**；
-//!  3. 回滚 / reset-factory / 手动上传替换。
-//!
-//! 故本模块把它做成**起核前的幂等对账**（hash 相同即零动作），覆盖「helper 已在跑」这个常态，
-//! 而不是挂在某一个变更事件上。
+//! 受保护核会因应用升级（安装包带来新内核）、helper 装得比核晚等路径与随包核漂移，故做成
+//! **起核前的幂等对账**（hash 相同即零动作），而不是挂在某一个变更事件上。
 //!
 //! # 安全模型（与 上游 同）
 //!
-//! 源是用户可写文件，落点是 root 目录 —— 这不是新增攻击面：helper 侧 `install-core` 只写**锁定的**
+//! 源是应用解析出的随包核，落点是 root 目录：helper 侧 `install-core` 只写**锁定的**
 //! `coredir`（不接受任意目标路径），且**读全字节进内存做 sha256 校验后再落盘**（堵 TOCTOU，
 //! 见 `core_install.rs` 模块文档「安全约束」）。提权面的收益在**执行时**：root exec 的是 root 拥有的文件，
 //! 用户此后改不动它。
@@ -45,9 +31,8 @@ use crate::runtime::core_paths::core_filename_for;
 
 /// 暂存目录名（`<config_dir>/core-promote/`）：喂给 `install-core` 的**干净** `src_dir`。
 ///
-/// **为什么不能直接把 `core_update/` 当 src_dir**：那个目录还住着 `.core-seed.json`（播种簿记）
-/// 与 `sing-box.bak`（回滚备份，与核同样 80MB）。`install-core` 会把 src_dir 里**每一个非目录文件**
-/// 都复制进受保护目录 ⇒ 簿记与备份一起被搬进 root 目录（既无意义又白占 80MB）。
+/// **为什么不直接把随包资源目录当 src_dir**：`install-core` 会把 src_dir 里**每一个非目录文件**
+/// 都复制进受保护目录，而资源目录里还有 helper 等别的文件。
 pub const CORE_PROMOTE_DIR_NAME: &str = "core-promote";
 
 /// 现役/受保护核 payload 的廉价文件身份快照。
@@ -305,7 +290,7 @@ pub enum CoreBinaryAttestation {
     /// 路径不同，且至少一侧版本读不出来 ⇒ **无法确认跑的是期望的核**。
     ///
     /// 判**告警**而非放行：既然实跑的是一个我们没直接挑的文件，"读不出它是什么" 与 "读出来不对"
-    /// 对用户是同一件事——都不能宣称换核已生效。
+    /// 对用户是同一件事——都不能宣称跑的是配套内核。
     VersionUnreadable {
         /// 实跑二进制路径。
         running: PathBuf,
@@ -345,8 +330,8 @@ impl CoreBinaryAttestation {
                 expected_version,
             } => format!(
                 "内核版本不一致：实际运行的是 {}（{running_version}），\
-                 而本次期望的是 {expected_version}。换核未对提权内核生效——\
-                 请重装提权助手，或在设置里重新执行一次内核更新。",
+                 而本应用配套的是 {expected_version}。提权助手里的内核与本应用不配套——\
+                 请重装提权助手。",
                 running.display()
             ),
             Self::VersionUnreadable {
@@ -355,7 +340,7 @@ impl CoreBinaryAttestation {
                 expected_version,
             } => format!(
                 "内核版本无法确认：实际运行的是 {}（版本读数「{}」），本次期望「{}」。\
-                 无法确认换核已生效。",
+                 无法确认运行的是本应用配套的内核。",
                 running.display(),
                 if running_version.is_empty() {
                     "读不到"

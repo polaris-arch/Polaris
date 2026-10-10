@@ -94,8 +94,6 @@ pub enum UpdateErrCode {
     CacheDirFailed,
     /// 下载本身失败（网络层）。
     DownloadFailed,
-    /// 下载后端不可用（与「网络失败」必须可区分：重试后者有意义、修前者没意义）。
-    BackendUnavailable,
     /// 下载任务异常终止（join 层面的 panic/取消，非网络错误）。
     DownloadTaskFailed,
     /// 已收字节数与清单声明不符（可能被截断或掉包）。
@@ -119,7 +117,6 @@ impl UpdateErrCode {
             Self::DigestFieldInvalid => "digestFieldInvalid",
             Self::CacheDirFailed => "cacheDirFailed",
             Self::DownloadFailed => "downloadFailed",
-            Self::BackendUnavailable => "backendUnavailable",
             Self::DownloadTaskFailed => "downloadTaskFailed",
             Self::SizeMismatch => "sizeMismatch",
             Self::DigestHexInvalid => "digestHexInvalid",
@@ -138,7 +135,6 @@ impl UpdateErrCode {
             Self::DigestFieldInvalid => "release digest field is malformed (retry won't help)",
             Self::CacheDirFailed => "failed to resolve or create the update cache dir",
             Self::DownloadFailed => "failed to download the update package",
-            Self::BackendUnavailable => "download backend unavailable",
             Self::DownloadTaskFailed => "download task terminated abnormally",
             Self::SizeMismatch => "package size does not match the release manifest",
             Self::DigestHexInvalid => "release sha256 is not valid hex (retry won't help)",

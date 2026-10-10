@@ -16,15 +16,15 @@ fn argv(pid: u32, args: &[&str]) -> CoreProcess {
     CoreProcess {
         pid,
         cmdline: args.iter().map(|arg| (*arg).to_owned()).collect(),
-        raw: String::new(),
+        ..CoreProcess::default()
     }
 }
 
 fn raw(pid: u32, line: &str) -> CoreProcess {
     CoreProcess {
         pid,
-        cmdline: Vec::new(),
         raw: line.to_owned(),
+        ..CoreProcess::default()
     }
 }
 
@@ -97,6 +97,26 @@ fn only_this_apps_login_core_argv_is_a_stale_login_core() {
         Path::new("/Users/u/Library/Application Support/polaris"),
     ));
     let config = "/home/u/.config/polaris/tailscale-login-ts1-3.json";
+    // Where the core binary lives does not matter: a leftover from an earlier session ran from
+    // another mount point or install directory, yet it runs this app's own login config.
+    for program in [
+        "/tmp/.mount_PolarisOld/usr/lib/Polaris/_up_/resources/linux/sing-box",
+        "/home/u/.config/polaris/core_update/sing-box",
+        "/usr/bin/sing-box",
+    ] {
+        assert!(
+            is_stale_login_core(&argv(20, &[program, "run", "-c", config]), binary, dir),
+            "{program}"
+        );
+    }
+    assert!(is_stale_login_core(
+        &raw(
+            21,
+            "/opt/elsewhere/sing-box run -c /home/u/.config/polaris/tailscale-login-ts1-3.json"
+        ),
+        binary,
+        dir
+    ));
     for (why, process) in [
         (
             "the main core of this app",
@@ -107,8 +127,16 @@ fn only_this_apps_login_core_argv_is_a_stale_login_core() {
             argv(4, &[BINARY, "run", "-c", "/home/u/.config/polaris/speedtest-1.json"]),
         ),
         (
-            "a system sing-box running a same-named config",
-            argv(5, &["/usr/bin/sing-box", "run", "-c", config]),
+            "a system sing-box running a same-named config of its own",
+            argv(5, &["/usr/bin/sing-box", "run", "-c", "/etc/sing-box/tailscale-login-ts1-3.json"]),
+        ),
+        (
+            "a program that is not named like the core",
+            argv(14, &["/usr/bin/not-sing-box", "run", "-c", config]),
+        ),
+        (
+            "a core named by a relative path",
+            argv(15, &["sing-box", "run", "-c", config]),
         ),
         (
             "our binary with a login-shaped config in another directory",
@@ -127,8 +155,8 @@ fn only_this_apps_login_core_argv_is_a_stale_login_core() {
             argv(9, &["/bin/sh", BINARY, "run", "-c", config]),
         ),
         (
-            "a raw line for another binary",
-            raw(10, "/usr/bin/sing-box run -c /home/u/.config/polaris/tailscale-login-ts1-3.json"),
+            "a raw line for a program that is not named like the core",
+            raw(10, "/usr/bin/sing-box-wrapper run -c /home/u/.config/polaris/tailscale-login-ts1-3.json"),
         ),
         (
             "a raw line for a sibling directory with the same prefix",

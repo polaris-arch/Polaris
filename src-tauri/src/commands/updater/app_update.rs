@@ -21,7 +21,6 @@ use polaris_updater::popup::{
     NO_UPDATE_AUTO_CLOSE_MS,
 };
 use polaris_updater::state::PopupPhase;
-use polaris_updater::traits::UnavailableDownloader;
 
 // ── 宿主指针宽度绊线（非 64 位直接编不过）────────────────────────────────────────
 //
@@ -48,28 +47,8 @@ compile_error!(
 pub(crate) const MAX_GITHUB_JSON_BYTES: usize = 16 * 1024 * 1024;
 
 /// GitHub API 拉取**逐跳**超时（连接 + 读取，每跳各算一次）；= 上游 `fetchReleases` 的 15s 兜底
-/// （防连接被静默吞永不 settle）。**注意它不是请求级上限** —— 见 [`CORE_CHECK_TOTAL_TIMEOUT_MS`]。
+/// （防连接被静默吞永不 settle）。**注意它不是请求级上限**：`safe_redirect_fetch` 最多 5 跳，逐跳叠加。
 pub(crate) const GITHUB_FETCH_TIMEOUT_MS: u64 = 15_000;
-
-/// 内核更新检查的**请求级总超时**（契约要求的 20s 整体兜底）。
-///
-/// 逐跳的 [`GITHUB_FETCH_TIMEOUT_MS`] 管不住多跳叠加（`safe_redirect_fetch` 最多 5 跳 ⇒ 最坏 90s），
-/// 故在 [`core_update_check`](super::core_update::core_update_check) 外面再包一层整体 `timeout`。
-pub(crate) const CORE_CHECK_TOTAL_TIMEOUT_MS: u64 = 20_000;
-
-/// 结构化错误码：下载后端不可用（仅在 [`UnavailableDownloader`] 真被注入时才可能出现；
-/// 生产注入的是 [`CoreDownloader`](crate::runtime::http::CoreDownloader)，故此码现只作为 trait 契约的映射目标保留）。
-pub(crate) const CODE_HTTP_UNAVAILABLE: &str = UnavailableDownloader::CODE;
-// `CODE_CORE_SWAP_UNWIRED`（"CORE_SWAP_NOT_WIRED"）随 `app_uninstall_all` 接线一并删除：
-// 它是本文件最后一个「未接线」错误码，留着就是个没有生产调用方的死常量。
-/// 结构化错误码：无可回滚的备份。
-pub(crate) const CODE_NO_BACKUP: &str = "NO_CORE_BACKUP";
-/// 结构化错误码：活核为第三方 fork，在线更新被硬闸拦下。
-pub(crate) const CODE_FORK_BLOCKED: &str = "CORE_FORK_BLOCKED";
-/// 结构化错误码：核基目录未注入（`init_base_dir` 未跑；理论上只在异常启动路径出现）。
-pub(crate) const CODE_CORE_DIR_UNAVAILABLE: &str = "CORE_DIR_UNAVAILABLE";
-/// 结构化错误码：检查更新**整体超时**（≠ 网络失败：重试大概率还是超时，UI 应引导配置加速）。
-pub(crate) const CODE_CHECK_TIMEOUT: &str = "UPDATE_CHECK_TIMEOUT";
 
 /// 一帧 App 更新进度**及其随行事实**。
 ///
@@ -415,6 +394,16 @@ pub(super) fn download_progress_emitter(
     })
 }
 
+/// Explicitly discard the portable handoff reminder. Never deletes the ZIP
+/// or claims installation success; background/check commands do not call this.
+#[tauri::command]
+pub fn update_clear_portable_handoff(state: State<'_, AppRuntime>) -> ApiResponse<()> {
+    match state.updater().clear_portable_handoff() {
+        Ok(()) => ok_void(),
+        Err(error) => ApiResponse::err_with_code(error, "portableReminderClearFailed"),
+    }
+}
+
 /// 上游 `VERSION_GET_INFO`：版本信息（app + core 版本）。
 ///
 /// ✅ **已接线**：app 版本取自 Tauri `package_info`；core 版本经 `UpdaterRuntime` 双读法的**展示读法**
@@ -426,13 +415,35 @@ pub(super) fn download_progress_emitter(
 #[tauri::command]
 pub fn version_get_info(app: AppHandle, state: State<'_, AppRuntime>) -> ApiResponse<Value> {
     let u = state.updater();
-    ApiResponse::ok(json!({
-        "appVersion": app.package_info().version.to_string(),
+    let app_version = app.package_info().version.to_string();
+    let mut body = json!({
+        "appVersion": app_version,
         "coreVersion": u.read_core_version(),
         "coreBaseline": u.bundled_core_version(),
         "debugReportAvailable": cfg!(all(target_os = "android", debug_assertions)),
-    }))
+    });
+    // 恢复手动交接记录；同版本修复不能从版本号证明完成，必须给出未确认语义。
+    if let Some(pending) = u.state().pending_portable_update {
+        if let Some(status) =
+            pending.handoff_status(&app_version, Path::new(&pending.archive).is_file())
+        {
+            body["pendingPortableUpdate"] = json!({
+                "archive": pending.archive,
+                "completionUnverified": status == crate::runtime::updater::PortableHandoffStatus::CompletionUnverified,
+            });
+        } else if let Err(error) = u.mutate_state(|s| s.pending_portable_update = None) {
+            log::warn!("清除已失效的便携版更新记录失败: {error}");
+        }
+    }
+    ApiResponse::ok(body)
 }
+
+/// [`update_install()`] 在退出准备门之后失败时的错误码（渲染端按它取文案）。
+///
+/// 退出准备门一进去就把起核准入永久关上（`ProxyRuntime::begin_shutdown`），门后任何一步失败，
+/// 应用都还开着却再也起不了代理。用户的下一步只有一个：重启应用再重试。此前这几条腿回的是
+/// 无码错误，渲染端只能显示一句与现场无关的「下载中断」。
+pub(super) const INSTALL_RESTART_REQUIRED: &str = "installRestartRequired";
 
 // ── App 更新 ──
 
@@ -468,7 +479,8 @@ pub(crate) fn is_portable_layout(exe_path: &std::path::Path) -> bool {
         .is_some_and(|dir| dir.join(PORTABLE_MARKER).is_file())
 }
 
-/// 已成功 detached 的安装脚本才可消费 Ready 并提交退出；spawn 失败保留准备态供重试。
+/// 交付成功（安装脚本已 detached，或便携腿的压缩包与程序目录已打开）才可消费 Ready 并提交退出；
+/// 交付失败保留准备态供重试。
 pub(super) fn complete_detached_install<T, E>(
     detached_spawn: Result<T, E>,
     commit: impl FnOnce() -> Result<(), E>,
@@ -476,6 +488,75 @@ pub(super) fn complete_detached_install<T, E>(
     let detached = detached_spawn?;
     commit()?;
     Ok(detached)
+}
+
+/// 「需要先告知用户」的回包（**纯函数**）。
+///
+/// 便携腿额外带 `programDir`：那条告知要把「覆盖到哪个文件夹」写给用户看，而前端自己拿不到
+/// 程序所在目录。其余腿没有这个对象，不带该键。
+pub(super) fn confirm_request(
+    plan: &update_install::InstallPlan,
+    advisory: update_install::InstallAdvisory,
+) -> Value {
+    let mut body = json!({
+        "ok": false,
+        "needConfirm": true,
+        "advisory": advisory.key(),
+    });
+    if let Some(dir) = plan.portable_dir.as_ref() {
+        body["programDir"] = Value::String(dir.to_string_lossy().into_owned());
+    }
+    body
+}
+
+/// 便携腿的交付：用系统处理器打开更新压缩包与程序所在目录，供用户在应用退出后覆盖解压。
+///
+/// **只许在退出准备门成功之后调用**（调用点次序由 `tests` 里的守卫钉住）：窗口一打开用户就可能
+/// 开始拖文件，那一刻内核必须已经停下。任一个打不开都算交付失败，调用方据此不提交退出。
+fn open_portable_update(app: &AppHandle, archive: &Path, program_dir: &Path) -> Result<(), String> {
+    #[allow(deprecated)]
+    let shell = app.shell();
+    #[allow(deprecated)]
+    shell
+        .open(archive.to_string_lossy(), None)
+        .map_err(|e| format!("打开更新压缩包失败 {}: {e}", archive.display()))?;
+    #[allow(deprecated)]
+    shell
+        .open(program_dir.to_string_lossy(), None)
+        .map_err(|e| format!("打开程序所在目录失败 {}: {e}", program_dir.display()))?;
+    Ok(())
+}
+
+/// 便携腿退出前：把压缩包位置与程序目录写进日志，并存入更新状态文件。
+///
+/// 存不进去不阻断退出 —— 日志里那一行仍在；阻断的话用户连文件夹都已经打开了，应用却不退。
+fn remember_portable_update(
+    app: &AppHandle,
+    state: &AppRuntime,
+    archive: &Path,
+    program_dir: &Path,
+) {
+    let record = crate::runtime::updater::PendingPortableUpdate {
+        archive: archive.to_string_lossy().into_owned(),
+        program_dir: program_dir.to_string_lossy().into_owned(),
+        from_version: app.package_info().version.to_string(),
+        target_version: archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(polaris_updater::github::portable_zip_version)
+            .map(str::to_owned),
+    };
+    log::info!(
+        "便携版手动更新：压缩包 {}，程序所在目录 {}；应用退出后把压缩包内容覆盖解压到该目录",
+        record.archive,
+        record.program_dir
+    );
+    if let Err(error) = state
+        .updater()
+        .mutate_state(|s| s.pending_portable_update = Some(record))
+    {
+        log::warn!("便携版更新记录未能保存（重开应用后更新卡不会显示这两个位置）: {error}");
+    }
 }
 
 /// 「只比版本、不选资产」那条腿的**回包**（两个调用点共用）。
@@ -531,6 +612,9 @@ pub async fn update_check(
 ) -> Result<ApiResponse<Value>, ()> {
     let include_pre = include_prerelease.unwrap_or(false);
     let include_current = include_current.unwrap_or(false);
+
+    // Checks are observational, including startup/tray/popup callers. Only
+    // update_clear_portable_handoff may discard a retained manual handoff.
 
     // 平台/架构：宿主真值注入纯逻辑。
     //
@@ -783,8 +867,7 @@ pub(super) struct ExpectedDigest {
 ///     - `SHA256SUMS` 是同一个 release 里的另一个**资产**，URL 与安装包同 host。
 ///
 ///     这不是权衡，是**结构性**的：镜像回落的判定面 `GITHUB_ASSET_HOSTS`
-///     （`runtime/http.rs`）与前端的 `GH_HOSTS`（`ui/src/domain/gh-proxy.ts`）两侧独立实现、
-///     **都显式排除 `api.github.com`** ⇒ API 腿结构性走不到 gh-proxy；而 `SHA256SUMS` 命中
+///     （`runtime/http.rs`）**不含 `api.github.com`** ⇒ API 腿结构性走不到 gh-proxy；而 `SHA256SUMS` 命中
 ///     `is_github_asset` ⇒ 真启用镜像时它会**跟安装包一起经同一个代理**。即恰恰在「启用代理、
 ///     信任面最大」的那个场景里，asset `digest` 的价值最高而 `SHA256SUMS` 的价值归零。
 ///
@@ -926,9 +1009,8 @@ pub(super) fn check_declared_size(
 
 /// 流式下载的**部分写入残件**（tmp）的所有权凭证：**drop 即删**，落位成功才 [`Self::disarm`]。
 ///
-/// 形态照 [`ExtractWorkDir`](super::core_update::ExtractWorkDir)（本文件既有的 RAII 清理守卫）：构造即持有、`Drop` 里尽力清、
-/// 清理失败只记日志。差别只有一个 —— 本守卫多一个「解除」出口，因为落位成功后那个文件
-/// **已经变成 dest 了**，再删就是把刚下好的包删掉。
+/// RAII 清理守卫：构造即持有、`Drop` 里尽力清、清理失败只记日志；另有一个「解除」出口，
+/// 因为落位成功后那个文件**已经变成 dest 了**，再删就是把刚下好的包删掉。
 ///
 /// # 为什么是类型，不是「数一数清理调用」的守卫
 ///
@@ -1086,8 +1168,7 @@ pub(super) fn is_orphan_tmp_name(name: &str) -> bool {
 /// 关 App」周期必留一个几十 MiB 的孤儿，而全仓唯一会碰这个目录的回收点是**完全卸载**
 /// （`app_uninstall_all`）—— 长期累积到 GB 级。
 ///
-/// 注意 `verify::tmp_name` 文档里那条「换核暂存目录每次 stage 整目录重建会一并清掉」的兜底
-/// **只对换核腿成立**：App 更新落在 `<cache>/updates/`，没有任何整目录重建（该注释已一并订正）。
+/// App 更新落在 `<cache>/updates/`，没有任何整目录重建会顺带清掉它们。
 ///
 /// # 匹配面是**命名族**，不是「本次资产名」（2026-08-17 订正）
 ///
@@ -1171,9 +1252,8 @@ pub(super) fn sweep_orphan_downloads(
 /// bool，但「只需要 bool」不是各写一份比较逻辑的理由：分叉只会在「大小写敏不敏感」
 /// 这类地方发生，且只在真机大包上暴露。
 ///
-/// 前置的 [`is_valid_sha256_hex`](polaris_updater::verify::is_valid_sha256_hex) 早退**保留**，
-/// 理由与 `verify_bytes` 里那句「先验格式再算摘要」相同：期望值本身非法时，不该为一个必然
-/// 返 false 的判定，白读一遍几十 MiB 的文件算流式摘要。
+/// 前置的 [`is_valid_sha256_hex`](polaris_updater::verify::is_valid_sha256_hex) 早退**保留**：
+/// 期望值本身非法时，不该为一个必然返 false 的判定，白读一遍几十 MiB 的文件算流式摘要。
 pub(super) fn cached_download_is_reusable(dest: &Path, expected_sha: Option<&str>) -> bool {
     let Some(sha) = expected_sha.map(str::trim).filter(|s| !s.is_empty()) else {
         return false;
@@ -1220,8 +1300,7 @@ pub(super) fn cached_download_is_reusable(dest: &Path, expected_sha: Option<&str
 ///
 /// **体积闸**：按 `updateInfo.fileSize` 声明值注入（**无裕度**，成因见 [`app_update_size_limit`]），
 /// 并封在 [`APP_UPDATE_MAX_BYTES`] 之下；声明缺失/为 0 时直接取该上限。
-/// **不**再与两条内核腿共用 16 MiB 内存闸 —— 那个闸的语义是「别把堆撑爆」，对流式落盘腿既无必要
-/// 也卡不住正常安装包。
+/// 下载器的 16 MiB 缺省闸容不下正常安装包，故必须显式注入。
 ///
 /// **完整性**（三级，由强到弱，**逐级都在**）：
 ///  1. 有期望摘要（[`resolve_expected_digest`]，当前只有 GitHub asset `digest`；随包 `SHA256SUMS`
@@ -1397,26 +1476,11 @@ pub async fn update_download(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            // 「后端未接线」与「下载失败」**必须**可区分（trait 契约；生产注入的是 CoreDownloader，
-            // 故这条实际不可达，但映射保留——折叠进泛化失败会让上层无限重试一个永不成功的调用）。
-            // 信封 code 保留既有的 CODE_HTTP_UNAVAILABLE（上游契约），事件/弹窗走 U1 码表。
             let detail = e.to_string();
-            return Ok(match e {
-                polaris_updater::traits::DownloadError::BackendUnavailable(_) => {
-                    emit(ProgressStage::Failed(UpdateErr::with_detail(
-                        UpdateErrCode::BackendUnavailable,
-                        &detail,
-                    )));
-                    ApiResponse::err_with_code(
-                        format!("{}: {detail}", UpdateErrCode::BackendUnavailable.en()),
-                        CODE_HTTP_UNAVAILABLE,
-                    )
-                }
-                _ => fail(UpdateErr::with_detail(
-                    UpdateErrCode::DownloadFailed,
-                    &detail,
-                )),
-            });
+            return Ok(fail(UpdateErr::with_detail(
+                UpdateErrCode::DownloadFailed,
+                &detail,
+            )));
         }
         Err(e) => {
             let detail = e.to_string();
@@ -1516,6 +1580,9 @@ pub async fn update_request_install_permission() -> Result<ApiResponse<Value>, (
 
 /// 上游 `UPDATE_INSTALL`：安装已下载的更新包（生成平台脚本 → 停代理 → detached 起脚本 → 退出应用）。
 ///
+/// Windows 便携版没有脚本腿：停代理 → 打开压缩包与程序目录 → 退出应用，由用户在应用退出后覆盖解压。
+/// 两种交付共用同一道退出准备门与同一个提交点。
+///
 /// ✅ **已接线**。决策全在纯函数 [`update_install::decide_install_plan`] /
 /// [`update_install::build_install_script`]（真值表 + 快照单测），本 command 只做薄编排。
 ///
@@ -1535,7 +1602,7 @@ pub async fn update_request_install_permission() -> Result<ApiResponse<Value>, (
 #[tauri::command]
 pub async fn update_install(
     app: AppHandle,
-    _state: State<'_, AppRuntime>,
+    state: State<'_, AppRuntime>,
     file_path: String,
     confirmed: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
@@ -1569,9 +1636,16 @@ pub async fn update_install(
         Ok(p) => p,
         Err(reject) => {
             // 形态错配 / 不认识的资产 → **交系统处理**（不强制 root、不瞎猜脚本）。
-            log::warn!("安装计划被拒（{reject:?}）：回退交系统打开");
-            #[allow(deprecated)]
-            let opened = app.shell().open(installer.to_string_lossy(), None).is_ok();
+            // 便携形态拿到安装程序是例外：交出去就是运行它，只报错（见 `hands_to_system`）。
+            let opened = if reject.hands_to_system() {
+                log::warn!("安装计划被拒（{reject:?}）：回退交系统打开");
+                #[allow(deprecated)]
+                let opened = app.shell().open(installer.to_string_lossy(), None).is_ok();
+                opened
+            } else {
+                log::warn!("安装计划被拒（{reject:?}）：便携版不运行安装程序，未打开");
+                false
+            };
             return Ok(ApiResponse::ok(json!({
                 "ok": false,
                 "handedToSystem": opened,
@@ -1584,11 +1658,7 @@ pub async fn update_install(
     // ── 安装前告知（ad-hoc 签名 / 提权）——未确认一律早退，**此刻还没碰代理**。
     if let Some(advisory) = update_install::install_advisory(&plan) {
         if confirmed != Some(true) {
-            return Ok(ApiResponse::ok(json!({
-                "ok": false,
-                "needConfirm": true,
-                "advisory": advisory.key(),
-            })));
+            return Ok(ApiResponse::ok(confirm_request(&plan, advisory)));
         }
     }
 
@@ -1641,45 +1711,62 @@ pub async fn update_install(
         );
     }
 
-    let texts = update_install::InstallTexts::default();
-    // `None` 只可能来自 Android，而它在上面已经整条早退。真走到这里说明分流被改坏了 ——
-    // 如实报错，绝不 spawn 一个空脚本再汇报「安装脚本已起」（那是一次静默的假成功）。
-    let Some(spec) = update_install::build_install_script(&plan, &texts) else {
+    // 交付方式二选一：有脚本的腿起脚本；便携腿没有脚本，交给用户手动覆盖。
+    // 两者都拿不出来只可能是分流被改坏了（Android 在上面已整条早退）—— 如实报错，
+    // 绝不 spawn 一个空脚本再汇报「安装脚本已起」（那是一次静默的假成功）。
+    let spec = update_install::build_install_script(&plan);
+    if spec.is_none() && plan.portable_dir.is_none() {
         return Ok(ApiResponse::err(format!(
-            "本平台没有脚本安装腿（{:?}）—— 它本该在上面被分流到别的落地方式",
+            "本平台没有可用的安装交付方式（{:?}）—— 它本该在上面被分流到别的落地方式",
             plan.platform
         )));
-    };
+    }
 
-    // 所有 Start admission 同步关闭，主核/登录核/测速核/check 全部确认收口，才能启动安装脚本。
+    // 所有 Start admission 同步关闭，主核/登录核/测速核/check 全部确认收口，才能交付。
     // 不用 status.running 作为捷径：起核中、Unknown 与独立临时 owner 都必须经过同一准备门。
+    // 便携腿同样先过这道门：内核就在程序目录里运行，它不停下，覆盖解压会因文件被占用而只换掉一部分。
     let ready = match crate::exit_lifecycle::prepare_desktop_exit(&app).await {
         Ok(ready) => ready,
         Err(error) => {
             log::error!("安装前退出准备失败: {error}");
-            return Ok(ApiResponse::err(
-                "后台连接尚未确认关闭，应用保持运行，请重试安装",
+            return Ok(ApiResponse::err_with_code(
+                "后台连接尚未确认关闭，且本次运行已不能再启动代理；请重启应用后重试安装",
+                INSTALL_RESTART_REQUIRED,
             ));
         }
     };
 
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map(|d| d.join("updates"))
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let detached_spawn = update_install::spawn_detached_script(&dir, &spec);
-    if detached_spawn.is_ok() {
-        log::info!("安装脚本已起（{:?}），应用即将退出", plan.platform);
+    let delivered = match (spec.as_ref(), plan.portable_dir.as_deref()) {
+        (Some(spec), _) => {
+            let dir = app
+                .path()
+                .app_cache_dir()
+                .map(|d| d.join("updates"))
+                .unwrap_or_else(|_| std::env::temp_dir());
+            update_install::spawn_detached_script(&dir, spec).map(|_| ())
+        }
+        (None, Some(program_dir)) => open_portable_update(&app, &installer, program_dir),
+        (None, None) => Err("没有可用的安装交付方式".to_string()),
+    };
+    if delivered.is_ok() {
+        log::info!("更新已交付（{:?}），应用即将退出", plan.platform);
+        // 便携腿：应用一退，写着这两个位置的卡片就没了，而「打开」只是向系统发起、弹没弹出来
+        // 这边看不出。位置写进日志，并留一条记录供重开应用后的更新卡取回。
+        if let Some(program_dir) = plan.portable_dir.as_deref() {
+            remember_portable_update(&app, &state, &installer, program_dir);
+        }
     }
-    if let Err(e) = complete_detached_install(detached_spawn, || {
+    if let Err(e) = complete_detached_install(delivered, || {
         crate::exit_lifecycle::commit_desktop_exit(
             &app,
             ready,
             crate::exit_lifecycle::ExitKind::Quit,
         )
     }) {
-        return Ok(ApiResponse::err(format!("启动安装脚本失败: {e}")));
+        return Ok(ApiResponse::err_with_code(
+            format!("交付更新失败，且本次运行已不能再启动代理；请重启应用后重试: {e}"),
+            INSTALL_RESTART_REQUIRED,
+        ));
     }
     Ok(ApiResponse::ok(json!({ "ok": true, "success": true })))
 }
@@ -1735,7 +1822,7 @@ pub(super) const RELEASES_LIST_URL: &str = "https://github.com/polaris-arch/Pola
 ///
 /// 传入的 `version` 取自 [`AppUpdateInfo::version`](polaris_updater::github::AppUpdateInfo) /
 /// 弹窗 `UpdatePopupState.version`，两者都保留**原始 tag（已含 `v`）**。此处仍先
-/// `trim_start_matches('v')` 再补一次前缀（= [`core_update_check_inner`](super::core_update::core_update_check_inner) 同一行代码的写法）——
+/// `trim_start_matches('v')` 再补一次前缀——
 /// 防止调用方将来改传裸 semver 时把 URL 拼成 `vv0.1.0`，函数对两种输入形态都幂等。
 ///
 /// `version` 为空/仅空白 → 回落 [`RELEASES_LIST_URL`]：拼一个大概率 404 的直达链接不如给用户一个
@@ -1839,7 +1926,7 @@ pub(super) fn reconcile_recheck(advertised: Option<&str>, rechecked: &str) -> Re
 /// `Close` 在每个阶段均合法，陈旧的渲染阶段也不能阻止用户关窗。
 /// 旧 `Cancel` 动作保留兼容，但仅收起界面；渲染端明确显示「后台继续」。
 /// `CoreDownloader` 无取消令牌。关窗后下载继续原子落盘，设置页订阅与快照照常可查看；
-/// 本命令不表示下载已取消，也不会打断安装或换核。
+/// 本命令不表示下载已取消，也不会打断安装。
 #[tauri::command]
 pub async fn update_popup_action(
     app: AppHandle,

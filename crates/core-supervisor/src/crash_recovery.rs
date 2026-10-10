@@ -45,8 +45,6 @@ pub struct CrashRecoveryConfig {
     pub cooldown: Duration,
     /// 是否允许自动重启（autoRestartEnabled，shouldAutoRestart 前置）。
     pub auto_restart_enabled: bool,
-    /// 核心更新待验证窗口内抑制自动重启（autoRestartSuppressed，:5893）。
-    pub auto_restart_suppressed: bool,
 }
 
 impl Default for CrashRecoveryConfig {
@@ -55,7 +53,6 @@ impl Default for CrashRecoveryConfig {
             max_restart_count: MAX_RESTART_COUNT,
             cooldown: RESTART_COOLDOWN,
             auto_restart_enabled: true,
-            auto_restart_suppressed: false,
         }
     }
 }
@@ -172,32 +169,13 @@ impl CrashRecoveryMachine {
         self.auto_restart_aborted = false;
     }
 
-    /// 读 `autoRestartSuppressed`（换核验证窗口）。
-    #[must_use]
-    pub fn auto_restart_suppressed(&self) -> bool {
-        self.cfg.auto_restart_suppressed
-    }
-
-    /// 置 `autoRestartSuppressed`（上游 `setAutoRestartSuppressed`，:5893 的**写侧**）。
-    ///
-    /// 🔴 **这是本字段唯一的生产写入口**（2026-08-05 补）。在此之前 `auto_restart_suppressed` 只有
-    /// 默认值 `false`、[`should_auto_restart`](Self::should_auto_restart) 里的判据、以及一条直接构造
-    /// config 的单测 —— 也就是「机制移植了、接线没接」：全仓没有任何生产代码能把它置 true，
-    /// 那条单测却照样绿（它绕过了写入口，直接造了个 `auto_restart_suppressed: true` 的 config）。
-    ///
-    /// 语义：窗口内核**意外退出不自动重启**，让首次失败立刻上报，而不是在坏核上退避空转 3 次 ——
-    /// 空转会把「新核有问题」这个信号淹掉，正是换核验证最需要的那一条信息。
-    pub fn set_auto_restart_suppressed(&mut self, suppressed: bool) {
-        self.cfg.auto_restart_suppressed = suppressed;
-    }
-
     /// shouldAutoRestart（:5888）。`now_ms` 为当前进程的单调时钟刻度。
     ///
-    /// - auto_restart 关 / 抑制窗口 → false。
+    /// - auto_restart 关 → false。
     /// - 距上次重启超冷却 → 复位 restart_count=0。
     /// - restart_count >= max → false。
     pub fn should_auto_restart(&mut self, now_ms: u64) -> bool {
-        if !self.cfg.auto_restart_enabled || self.cfg.auto_restart_suppressed {
+        if !self.cfg.auto_restart_enabled {
             return false;
         }
         // 冷却后复位（:5900）。

@@ -65,7 +65,6 @@ const ERR_TEXT: Record<string, string> = {
   digestFieldInvalid: t('updatePopup.errDigestFieldInvalid'),
   cacheDirFailed: t('updatePopup.errCacheDirFailed'),
   downloadFailed: t('updatePopup.errDownloadFailed'),
-  backendUnavailable: t('updatePopup.errBackendUnavailable'),
   downloadTaskFailed: t('updatePopup.errDownloadTaskFailed'),
   sizeMismatch: t('updatePopup.errSizeMismatch'),
   digestHexInvalid: t('updatePopup.errDigestHexInvalid'),

@@ -2,9 +2,9 @@
 //!
 //! # 根因（为什么需要这一层）
 //!
-//! `POLARIS_SINGBOX_PATH` / `POLARIS_HELPER_PATH` 这类「用环境变量指一个可执行文件」的逃生门，
+//! `POLARIS_HELPER_PATH` 这类「用环境变量指一个可执行文件」的逃生门，
 //! 问题不在「有一个环境变量」，而在：**同一段路径解析逻辑同时服务两种信任级**——
-//! 开发机上它回答「我这次想跑哪个核」，用户机上它回答「这台机器上唯一可信的那个核在哪」。
+//! 开发机上它回答「我这次想装哪个 helper」，用户机上它回答「这台机器上唯一可信的那个 helper 在哪」。
 //! 前者必须让人插队，后者必须谁都不能插队。两者共用一条判据、且环境变量还排在优先级链首时，
 //! **开发便利就以「发行包里的第一优先级」的形态出厂**：任何能给本进程设环境变量的上下文
 //! （被劫持的启动器 / `.desktop` 文件 / 登录脚本 / 父进程）都能改写 app 的代码执行链，
@@ -15,15 +15,12 @@
 //!
 //! # 判据（唯一一条：canonical containment）
 //!
-//! release 构型下，逃生门给出的路径 canonicalize 之后必须落在**可信来源根**之内
-//! （见 [`TrustScope`](crate::runtime::env_trust::TrustScope)）。
+//! release 构型下，逃生门给出的路径 canonicalize 之后必须落在**可信来源根**之内：只认 app 自有
+//! 数据目录。随包资源目录不在其中 —— 随包 helper 本就由 `resolve_helper_binary` 的兜底腿解析
+//! 得到，逃生门再指一次只是多一个入口。
 //!
-//! **刻意没有第二条判据**：仓内不存在「随包二进制的运行期指纹」可供比对 ——
-//! `core-manifest.json` 的 `coreArchiveSha256` 现在只保留键集合作为随包平台枚举，各平台的
-//! `binarySha256` 为空；构建期核对内核二进制的是产出回执（`resources/.source-receipts/`），
-//! 它不在打进应用的平台目录里，运行期读不到；`staged_core_sha_path` 只覆盖更新流程 staged
-//! 下来的核，覆盖不到随包核。所以「校验二进制哈希」这条判据按字面**不可实现**，别再往这里加，
-//! 也别用别的东西冒充它。
+//! 内核路径不走本模块：发行包对内核路径的环境变量**完全不读**（见
+//! `runtime/proxy/core_binary.rs`），那里没有「校验后采纳」这一档。
 //!
 //! # 构型分流
 //!
@@ -38,8 +35,7 @@
 //!
 //! # 这条判据到底买到了什么（安全论证）
 //!
-//! containment 通过之后，逃生门能指向的位置只剩「app 自有数据目录」与「随包资源目录」，
-//! 而能往这两处写文件的人本来就能直接替换 `core_update/sing-box` 或包内资源。也就是说：
+//! containment 通过之后，逃生门能指向的位置只剩 app 自有数据目录。
 //! **环境变量不再是一条独立的能力**，它降级成「在已经有写权限的地方再指一次路」。
 //! 这才是本模块的收益，不是「让路径看起来更规范」。
 
@@ -52,19 +48,6 @@ use std::path::{Path, PathBuf};
 /// 的失败（app 照常起核、照常装 helper），而是一条**取证线索**：真机验收时「为什么没用我指的
 /// 核」必须能从日志一眼判定，否则这个安全修复就变成一次难查的行为改变。
 pub(crate) const CODE_ENV_PATH_UNTRUSTED: &str = "ENV_PATH_UNTRUSTED";
-
-/// 可信来源面。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TrustScope {
-    /// **L1（喂代码执行链）**：app 自有数据目录 ∪ 随包资源目录。
-    AppDataOrBundle,
-    /// **L2（喂提权安装链）**：只认 app 自有数据目录。
-    ///
-    /// 比 L1 严一档，因为后果不同：L1 拿到的是 app 权限，L2 拿到的是一个开机自启的 root 级
-    /// 常驻进程。随包资源目录在 L2 这里也没有存在价值 —— 随包 helper 本就由
-    /// `resolve_helper_binary` 的兜底腿解析得到，逃生门再指一次只是多一个入口。
-    AppDataOnly,
-}
 
 /// 一次逃生门判定的结果。
 ///
@@ -103,9 +86,8 @@ const fn dev_build() -> bool {
 pub(crate) fn adopt_trusted_env_path(
     var: &str,
     raw: Option<String>,
-    scope: TrustScope,
 ) -> Result<Option<PathBuf>, String> {
-    let roots = trusted_roots(scope);
+    let roots = trusted_roots();
     match classify(var, raw.as_deref(), dev_build(), &roots)? {
         EnvPathVerdict::Unset => Ok(None),
         EnvPathVerdict::Accepted(path) => Ok(Some(path)),
@@ -182,25 +164,16 @@ fn contained_in_trusted_roots(path: &Path, roots: &[PathBuf]) -> Option<PathBuf>
         .then_some(target)
 }
 
-/// 本进程的可信来源根（顺序无关，判据是「落在其中任一个之内」）。
-fn trusted_roots(scope: TrustScope) -> Vec<PathBuf> {
-    // app 自有数据目录 = `core_paths` 的基目录（`lib.rs` 启动期注入的 `<app_config_dir>/polaris`，
-    // 注入点排在 `AppRuntime::new` 之前）。未注入（单测 / 子进程 / 异常启动路径）⇒ 这一根缺席，
-    // containment 只会更严、不会更松。
-    let mut roots: Vec<PathBuf> = crate::runtime::core_paths::base_dir()
+/// 本进程的可信来源根：app 自有数据目录。
+///
+/// 即 `core_paths` 的基目录（`lib.rs` 启动期注入的 `<app_config_dir>/polaris`，注入点排在
+/// `AppRuntime::new` 之前）。未注入（单测 / 子进程 / 异常启动路径）⇒ 没有根，containment 只会
+/// 更严、不会更松。
+fn trusted_roots() -> Vec<PathBuf> {
+    crate::runtime::core_paths::base_dir()
         .map(Path::to_path_buf)
         .into_iter()
-        .collect();
-    if scope == TrustScope::AppDataOrBundle {
-        // 随包资源根与候选文件表**共用同一份布局真值**（`bundle_resource_candidates` 也走它），
-        // 免得一边认 `_up_/resources`、另一边漏掉它之后两处慢慢漂开。
-        let exe = std::env::current_exe().ok();
-        roots.extend(crate::runtime::proxy::bundle_resource_roots(
-            exe.as_deref().and_then(Path::parent),
-            crate::runtime::proxy::dev_manifest_dir(),
-        ));
-    }
-    roots
+        .collect()
 }
 
 #[cfg(test)]

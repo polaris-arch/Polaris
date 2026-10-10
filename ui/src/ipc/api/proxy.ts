@@ -176,11 +176,4 @@ export const proxyApi = {
   onSystemProxyResidual(listener: (data: { proxy: string }) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_SYSTEM_PROXY_RESIDUAL, listener);
   },
-
-  /** #40：非官方核 ≤ 随包基线 → 兼容风险提醒。 */
-  onCoreBaselineWarning(
-    listener: (data: { current: string; bundled: string; kind: string }) => void
-  ): () => void {
-    return listen(IPC_CHANNELS.EVENT_CORE_BASELINE_WARNING, listener);
-  },
 };

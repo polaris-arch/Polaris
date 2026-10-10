@@ -592,7 +592,8 @@ fn hidden_legacy_custody_never_reports_exact_empty_or_spawns() {
         lcmd::STATUS_BIRTH_SAFE,
         &mut status,
     );
-    assert_eq!(status.writes(), ["ERR unknown"]);
+    // 带尾文，与「不认识这条命令」的裸 `ERR unknown` 区分开（客户端据裸形判 helper 过旧）。
+    assert_eq!(status.writes(), ["ERR unknown birth-custody-unidentified"]);
     let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
     dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
     assert_eq!(

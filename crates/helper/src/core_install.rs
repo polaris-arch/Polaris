@@ -154,7 +154,8 @@ impl InstallResult {
     /// 必漏一边。收敛前先出过逐 variant 的等价收据（11/11 逐字相同，含 detail），不是直接替换。
     ///
     /// 非 `Installed` 的 `to_wire_line` 恒以 `"ERR "` 开头 ⇒ `parse` 必 `Some`。真解析不出来说明
-    /// `to_wire_line` 换了形态，那时诚实回 `unknown`（失败向关），不能假装装好了。
+    /// `to_wire_line` 换了形态，那时诚实回 `unknown`（失败向关），不能假装装好了。带尾文：裸的
+    /// `ERR unknown` 在客户端眼里是「这个 helper 不认识 install-core」。
     #[must_use]
     pub fn to_response(&self) -> polaris_helper_proto::Response {
         use polaris_helper_proto::{Error as ProtoError, ErrorCode, Response, ResponseKind};
@@ -162,7 +163,12 @@ impl InstallResult {
             return Response::Ok(ResponseKind::Installed);
         }
         ProtoError::parse(&self.to_wire_line()).map_or_else(
-            || Response::Err(ProtoError::new(ErrorCode::Unknown)),
+            || {
+                Response::Err(ProtoError::with_detail(
+                    ErrorCode::Unknown,
+                    "install-result",
+                ))
+            },
             Response::Err,
         )
     }

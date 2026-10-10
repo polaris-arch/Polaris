@@ -69,6 +69,13 @@ import { proxyErrorText } from './proxy-error-text';
  *   有人 await 时又落到 HomeScreen 的「检查服务器配置」通用兜底——对残留进程这码是错的指引）。
  *   用户文案走 `errors.rootOrphanBlocked`；具体 pid 与 helper/OS 原文留日志诊断。
  *   toast.error + 桌面通知（窗口常已收进托盘）。
+ * - **随包内核不可执行腿**（CORE_NOT_EXECUTABLE）：起核前即被拒绝，核**未起**（终态）。与上一条同为
+ *   后端**双出口**、同一套处置（刷连接态 + 认领闸门去重 + toast.error + 桌面通知）；文案走
+ *   `errors.coreNotExecutable`（下一步是重新安装应用，与服务器配置无关）。
+ * - **提权助手内核不配套腿**（HELPER_CORE_MISMATCH）：确认不了提权助手里的内核就是本应用配套的
+ *   那一份 → 拒绝以 TUN 起核；或起核后自证发现助手实跑的版本不同 → 已停核。两种都是核**不在跑**
+ *   （终态），处置同上一条；文案走 `errors.helperCoreMismatch`（下一步是到「设置 › Helper」重装或
+ *   升级助手）。起核后停核那一种没有任何 await 腿在等，只有这里会报。
  * - 其余码（如 STARTUP_FAILED）：忽略。它必然伴随某次 proxy.start 的 reject，发起方（Home 连接按钮）
  *   自己会 toast，此处重报 = 同一次失败弹两遍。
  */
@@ -205,5 +212,35 @@ export function handleProxyErrorEvent(
     // 具体 pid 留日志；可见面只给本地化的处置指引。
     toast.error(proxyErrorText(data, t));
     void notifyDesktop(t('notify.rootOrphanBlocked.title'), t('notify.rootOrphanBlocked.body'));
+    return;
+  }
+
+  // 随包内核文件缺少可执行权限：起核前即被拒绝，核**未起**（终态）⇒ 必须 refreshProxyStatus。
+  // 后端同样是**双出口**（`set_error` 发事件 + `proxy_start` 把码带回让 start reject），处置与上一支
+  // 逐条相同：认领期内让位给发起方的 await 腿（Home 连接按钮自己报 `errors.coreNotExecutable`），
+  // 无人认领（托盘 / 启动自动连接 / switchMode 去抖重启）时由这里报。此前这里**没有这一支**：
+  // 那些入口撞上它时落到函数末尾被静默丢弃，用户一个字都看不到。
+  if (data.errorCode === 'CORE_NOT_EXECUTABLE') {
+    void refreshProxyStatus();
+    if (isProxyStartClaimed()) return;
+    toast.error(proxyErrorText(data, t));
+    void notifyDesktop(
+      t('notify.coreNotExecutable.title'),
+      t('notify.coreNotExecutable.body')
+    );
+    return;
+  }
+
+  // 提权助手里的内核与本应用不配套（或确认不了）：起核前被拒绝，或起核后被自证停掉 —— 两种都是
+  // 核**不在跑**（终态）⇒ 必须 refreshProxyStatus。起核前那一种是后端**双出口**，处置与上一支逐条
+  // 相同（认领期内让位给发起方的 await 腿）；起核后停核那一种发生在后台，没有人 await，只有这里报。
+  if (data.errorCode === 'HELPER_CORE_MISMATCH') {
+    void refreshProxyStatus();
+    if (isProxyStartClaimed()) return;
+    toast.error(proxyErrorText(data, t));
+    void notifyDesktop(
+      t('notify.helperCoreMismatch.title'),
+      t('notify.helperCoreMismatch.body')
+    );
   }
 }

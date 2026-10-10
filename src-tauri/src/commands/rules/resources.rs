@@ -54,12 +54,11 @@ const RULE_RESOURCE_TIMEOUT_MS: u64 = 30_000;
 /// 可经 gh 镜像加速的 GitHub 域名表。
 ///
 /// **与 `runtime/http.rs::GITHUB_ASSET_HOSTS` 的关系**：那张 2 域名表是 updater 专用的**release 资产**
-/// 判定面（核下载只经 `github.com` / `objects.githubusercontent.com`），本表是 gh-proxy 的通用判定面
-/// （5 域，与前端 `ui/src/domain/gh-proxy.ts` `GH_HOSTS` 同表 —— 两侧对「哪些地址值得加速」必须同口径，
-/// 否则设置页说加速、后端不加速）。规则资源恰恰只走 `raw.githubusercontent.com`，**不在** updater 那张表里，
+/// 判定面（安装包下载只经 `github.com` / `objects.githubusercontent.com`），本表是 gh-proxy 的通用判定面
+/// （5 域；是「哪些地址值得加速」在本仓的唯一一张表）。规则资源恰恰只走 `raw.githubusercontent.com`，**不在** updater 那张表里，
 /// 所以不能直接复用它。
 ///
-/// DESIGN-REVIEW(gh-proxy-single-source)：审计 §C9 裁决「5 域名表 + applyGhProxy」应落 net-stack 纯函数
+/// DESIGN-REVIEW(gh-proxy-single-source)：审计 §C9 裁决「5 域名表 + 前缀拼接」应落 net-stack 纯函数
 /// 模块，由 http.rs 与本文件共同消费（同一待办亦登记在 `runtime/http.rs` 的 `GITHUB_ASSET_HOSTS` 文档上）。net-stack 不在本批改动面内，故本表
 /// 暂落此处；模块落地后本表与 `is_github_asset` 一并改为调它。**拼接口径刻意与 `CoreDownloader::candidates`
 /// 逐字一致**（`prefix.trim_end_matches('/')` + `/` + 完整原 URL），不另立一套。
@@ -303,8 +302,8 @@ async fn fetch_catalog_json_once<H: HttpClient, L: DnsLookup>(
 /// 带 gh 加速的清单拉取：**复用下载腿那一套**（[`apply_gh_proxy`] + 失败回退原址），不另立一份判定。
 ///
 /// 现状诚实登记：`GH_PROXY_HOSTS` 是 5 域表、**不含 `api.github.com`**，故对本函数实际请求的 trees API
-/// 地址而言这是一次**文档化的空转**（`ui/src/domain/gh-proxy.ts:56` 与 上游 `shared/gh-proxy.ts:58`
-/// 都明写「api.github.com 不在 GH_HOSTS，Trees API 刷新不走加速」——gh-proxy 类镜像普遍只代理
+/// 地址而言这是一次**文档化的空转**（上游 `shared/gh-proxy.ts:58`
+/// 明写「api.github.com 不在 GH_HOSTS，Trees API 刷新不走加速」——gh-proxy 类镜像普遍只代理
 /// raw/releases/archive，不代理 API）。仍然走这条腿而不是直接裸调，是为了**只有一个加速决策点**：
 /// 哪天那张表补上 `api.github.com`（前后端两侧同步改），清单刷新自动吃上，不需要再改本文件。
 async fn fetch_catalog_json<H: HttpClient, L: DnsLookup>(
@@ -1360,7 +1359,7 @@ struct ResourcePlan {
     /// 为什么与 `url` 分开而不是就地改写 `url`：`url` 会被持久化成 `sourceUrl`，把镜像址写进去就等于
     /// 把「当前这台加速器」焊死进配置 —— 用户改 / 清 `ghProxyPrefix` 之后，重下载仍走旧镜像，设置项形同
     /// 虚设；镜像停服还会变成永久坏源。对齐 上游 `RuleResourceManager.fetchSrsToFile`
-    /// （`applyGhProxy` 只作用于本次请求，登记的 `sourceUrl` 恒为原址）。
+    /// （加速前缀只作用于本次请求，登记的 `sourceUrl` 恒为原址）。
     fetch_url: String,
     file_name: String,
     format: RuleResourceFormat,

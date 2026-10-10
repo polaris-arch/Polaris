@@ -161,7 +161,7 @@ pub(crate) use polaris_source_probe::mask_html_comments;
 /// 是消失。要按符号扫时用 `polaris_source_probe::mask_comments_and_strings`。
 ///
 /// 切片型取材器（[`crate::commands::guard_scan::top_level_fn_body`] /
-/// `impl_method_body` / `method_scan::method_body`）内部还会再剥一道整行注释，幂等无副作用；
+/// `impl_method_body` / [`method_body`]）内部还会再剥一道整行注释，幂等无副作用；
 /// 但它们**只**剥整行，故喂它们的取材仍应先过这里，行尾/块注释才有人管。
 pub(crate) fn module_code(dir_rel: &str) -> String {
     literal_face(&module_source(dir_rel))
@@ -378,6 +378,82 @@ pub(crate) fn ran_in_isolated_worker(module: &str, name: &str) -> bool {
         String::from_utf8_lossy(&output.stderr)
     );
     true
+}
+
+/// 按花括号配对取**方法体**（`impl` 块里的方法也截得准）。
+///
+/// [`crate::commands::guard_scan::top_level_fn_body`] 只认**列 0** 的 `\n}\n` 作结束锚 —— 对
+/// `impl` 块里的方法不成立：切片会一路吃到整个 `impl` 结束，把后续所有方法都囊括进来，于是
+/// 「把被守的调用从这个方法删掉、在同一个 impl 的下一个方法里加一句」就能骗过顺序守卫。
+/// 本函数精确截到该方法**自己**的闭合括号，并跳过字符串字面量与 `//` 行注释（否则
+/// `format!("{x}")`、注释里的括号都会算进深度）。
+///
+/// **已知边界**：不处理块注释 `/* */` 与裸字符字面量 `'{'`（本仓被守的几个函数体里都没有）。
+///
+/// 取方法体源码（从签名锚点起，到与签名后第一个 `{` 配对的 `}` 止，含两端），
+/// **整行注释已剥**（与 `commands::guard_scan::{top_level_fn_body, impl_method_body}` 同口径）。
+///
+/// 锚点缺失 / 括号不配对一律 panic —— 守卫**失去判据时必须转红**，而不是静默退化成
+/// 「扫了个空串、断言恒真」。
+///
+/// # 为什么必须剥注释（本函数此前只在**配对深度**上跳过注释，返回的文本仍含注释）
+///
+/// 跳过注释里的花括号只解决「切到哪里」，不解决「切出来的文本喂谁」。消费者全是
+/// `contains` / `find` / `matches().count()` 型判据 ⇒ 方法体内注释里的同名文本会**替生产
+/// 调用点作证**：实测 `runtime/stats/gate.rs::spawn_visibility_refresh` 的体内注释写着
+/// 「主线程调用时 `run_on_main_thread` 内联执行该闭包」，把生产的
+/// `app.run_on_main_thread(...)` 整段删掉，`stats/tests/mod.rs` 那条正面断言照样绿。
+///
+/// 剥法与 [`crate::commands::guard_scan::strip_line_comments`] 共用一份实现（整行注释换成
+/// 空行，保留行数与行序）⇒ `find()` 比大小的顺序断言语义不变。行尾注释不剥，理由见那边的
+/// doc（要剥就得先分辨字符串字面量里的 `//`）。
+///
+/// 返回 `String` 而非 `&'a str`：剥注释必然产生新串。调用点全是取完即断言，无借用需求。
+pub(crate) fn method_body(src: &str, signature: &str) -> String {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("锚点消失，守卫已失去判据: {signature}"));
+    let rest = &src[start..];
+    let open = rest
+        .find('{')
+        .unwrap_or_else(|| panic!("{signature} 之后找不到左花括号（守卫已失去判据）"));
+    // 逐字节扫：UTF-8 续字节恒 >= 0x80，绝不会与下面这几个 ASCII 记号相等，故按字节比较安全。
+    let bytes = rest.as_bytes();
+    let (mut depth, mut i) = (0usize, open);
+    let (mut in_str, mut in_line_comment) = (false, false);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_line_comment {
+            if c == b'\n' {
+                in_line_comment = false;
+            }
+        } else if in_str {
+            match c {
+                b'\\' => i += 1, // 跳过被转义的那个字节
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    in_line_comment = true;
+                    i += 1;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // `}` 是单字节 ASCII ⇒ i+1 必是 char 边界
+                        return crate::commands::guard_scan::strip_line_comments(&rest[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    panic!("{signature} 的花括号不配对（守卫已失去判据）")
 }
 
 #[cfg(test)]

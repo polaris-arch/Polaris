@@ -503,27 +503,11 @@
 #s-home > .pending-bar{ flex:none; height:auto; overflow:visible; margin-bottom:14px; padding:9px 13px;
   border:1px solid hsl(var(--warn)/0.4); border-radius:var(--r); }
 
-/* ───── SETTINGS：内核版本变更横幅（CoreVersionBanner）。上游 用的 `.app-update-banner`/`.aub-ic`/`.aub-tx`
-   本仓 CSS 里不存在（prototype.css / components.css 是禁区不可改），故在此以最小样式补一族独立 class，
-   调色沿用既有 --warn 语义 token（版本变更 = 警示），布局对齐同页 `.core-ver` 行（图标 + 文本 + 右侧动作）。───── */
-.core-ver-banner{ display:flex; align-items:flex-start; gap:10px; margin-bottom:16px; padding:11px 13px;
-  border:1px solid hsl(var(--warn)/0.35); border-radius:var(--r); background:hsl(var(--warn-weak)); }
-.core-ver-banner .cvb-ic{ flex:none; display:grid; place-items:center; width:22px; height:22px; border-radius:999px;
-  background:hsl(var(--warn)); color:hsl(var(--surface)); }
-.core-ver-banner .cvb-ic svg{ width:13px; }
-.core-ver-banner .cvb-tx{ flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
-.core-ver-banner .cvb-tx b{ font-size:12.5px; font-weight:600; color:hsl(var(--warn)); }
-.core-ver-banner .cvb-tx span{ font-size:11.5px; line-height:1.6; color:hsl(var(--fg-dim)); }
-/* 无备份可回滚的诚实说明：比正文再弱一级，避免与主文案抢注意力。 */
-.core-ver-banner .cvb-note{ color:hsl(var(--fg-faint)); }
-.core-ver-banner .btn{ flex:none; }
-/* dismiss 是纯图标按钮，收窄内边距使其呈方形，不占正文宽度。 */
-.core-ver-banner .cvb-dismiss{ padding-left:7px; padding-right:7px; }
-
-/* ───── LAYOUT：常驻应用更新横幅（AppUpdateBanner）。类名沿用 上游的 `.app-update-banner`/`.aub-*`
-   （上一族注释里点名过的那套），布局逐条镜像 `.core-ver-banner`，只改三处，各有理由：
-     · 调色走 --flow 而非 --warn：有新版本是**信息**不是警示，用警示色会与「内核版本变更」这类
-       真需要注意的横幅争同一个视觉权重；
+/* ───── LAYOUT：常驻应用更新横幅（AppUpdateBanner）。类名沿用 上游的 `.app-update-banner`/`.aub-*`；
+   这族 class 在 prototype.css / components.css（禁区不可改）里不存在，故在此以最小样式补齐
+   （图标 + 文本 + 右侧动作）。三处取舍各有理由：
+     · 调色走 --flow 而非 --warn：有新版本是**信息**不是警示，用警示色会与真需要注意的横幅
+       争同一个视觉权重；
      · 挂在 `.main` 的 flex 列里（`.main-scroll` 之外）⇒ 必须 `flex:none`，否则会被 flex 拉伸；
        横向外边距对齐 `.screen` 的 `--sp-6` 内边距，使它与下方内容左右对齐（不能靠 .screen 的 padding，
        本元素不在 .screen 里）；
@@ -538,5 +522,5 @@
 .app-update-banner .aub-tx b{ font-size:12.5px; font-weight:600; color:hsl(var(--flow)); }
 .app-update-banner .aub-tx span{ font-size:11.5px; line-height:1.6; color:hsl(var(--fg-dim)); }
 .app-update-banner .btn{ flex:none; }
-/* dismiss 是纯图标按钮，收窄内边距使其呈方形（同 .cvb-dismiss）。 */
+/* dismiss 是纯图标按钮，收窄内边距使其呈方形，不占正文宽度。 */
 .app-update-banner .aub-dismiss{ padding-left:7px; padding-right:7px; }

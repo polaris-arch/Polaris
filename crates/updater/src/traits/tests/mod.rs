@@ -1,45 +1,6 @@
 use super::*;
 
 #[test]
-fn memory_download_hit_and_miss() {
-    let dl = MemoryDownload::new().with("https://a/rel", vec![1, 2, 3]);
-    assert_eq!(dl.download("https://a/rel").unwrap(), vec![1, 2, 3]);
-    let err = dl.download("https://missing").unwrap_err();
-    assert!(matches!(err, DownloadError::Other(_)));
-}
-
-#[test]
-fn unavailable_downloader_reports_backend_unavailable_not_generic_failure() {
-    // 反伪造 + §K7.1：这个占位**必须**用专用变体报「没有后端」，而不是泛化的 Other(...)。
-    // 若折叠进 Other，上层会把「HTTP 栈根本没接」当成一次可重试的网络失败 → 无限重试永不成功的调用。
-    let dl = UnavailableDownloader::new();
-    let err = dl.download("https://anywhere").unwrap_err();
-    assert!(
-        matches!(err, DownloadError::BackendUnavailable(_)),
-        "占位下载器必须报 BackendUnavailable（可映射 HTTP_BACKEND_UNAVAILABLE），实得: {err:?}"
-    );
-    assert_eq!(UnavailableDownloader::CODE, "HTTP_BACKEND_UNAVAILABLE");
-}
-
-#[test]
-fn backend_unavailable_is_distinguishable_from_retryable_failures() {
-    // 钉住语义边界：BackendUnavailable（不可重试，需接线）vs 其余（试过了、可重试）。
-    let unavailable = DownloadError::BackendUnavailable("no tls".into());
-    let retryable = [
-        DownloadError::HttpStatus(403),
-        DownloadError::Stalled(30_000),
-        DownloadError::Other("mirror exhausted".into()),
-    ];
-    assert!(matches!(unavailable, DownloadError::BackendUnavailable(_)));
-    for e in retryable {
-        assert!(
-            !matches!(e, DownloadError::BackendUnavailable(_)),
-            "可重试失败不得被当成「后端未接线」: {e:?}"
-        );
-    }
-}
-
-#[test]
 fn std_fs_roundtrip() {
     let tmpdir = tempfile::tempdir().unwrap();
     let fs = StdFs;

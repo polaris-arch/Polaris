@@ -40,17 +40,18 @@ pub mod daemon {
 mod h2c;
 mod reconnect;
 
-// vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被三处 `include!`**：
-// `build.rs`（release 硬门，随包核）、`tests/bundled_core_wire.rs`（开发机 + 无核的机制自验）、
-// 以及这里（**运行期**：换核前对拍用户即将换上的那份非随包核）。
+// vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被多处 `include!`**：
+// `build.rs`（release 硬门，对拍随包核）、`tests/` 下的 wire 测试（开发机 + 无核的机制自验）、
+// 以及这里（把吃字节的判据作为库 API 再导出）。
 //
-// 为什么运行期也要一份：前两处的取材面都是 `resources/*/sing-box` 这四条路径，而**在线换核与
-// 用户自带 fork 会让非随包核跑起来** —— 那条路径此前无任何 wire 对拍，正是 2026-08-05 那类
-// 「字段号漂一位 ⇒ 整条流静默死掉」在本仓仍然敞着的一格。
+// 应用执行的内核只从安装包的资源目录解析，没有在线换核、也没有导入自带内核的入口，所以运行期
+// 没有「即将换上的另一份内核」需要对拍，本库也不在运行期主动对拍任何内核；随包核的对拍发生在
+// 构建期（`build.rs`）。这里保留的 [`proto_wire_check::verdict_for_core_bytes`] 只回答一件事：
+// 给定的这份字节，其 wire 形状与 vendored proto 是否一致。它不回答这份内核是否与应用版本配套。
 //
-// 不做成 `mod`：`build.rs` 不能依赖它正在构建的这个 crate，而三处必须共用同一份判据与符号表。
+// 不做成 `mod`：`build.rs` 不能依赖它正在构建的这个 crate，而各处必须共用同一份判据与符号表。
 // 模块里的 `repo_root()` / `bundled_cores()` 依赖 `CARGO_MANIFEST_DIR`（构建期常量），
-// 运行期无意义 —— 运行期只用 [`proto_wire_check::verdict_for_core_bytes`]（吃字节，不碰路径）。
+// 运行期无意义；库 API 只再导出吃字节、不碰路径的那一个。
 include!("../proto_wire_check.rs");
 
 pub use proto_wire_check::{verdict_for_core_bytes, WireVerdict};

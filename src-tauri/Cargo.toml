@@ -168,7 +168,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
-# test-utils = 取 polaris-updater 的跨 crate 测试替身（MockFs / MockFailOp / MemoryStateStore）。
+# test-utils = 取 polaris-updater 的跨 crate 测试替身（MockFs / MockFailOp）。
 # 只在 dev-dependency 上开：resolver = "2" 下 `cargo build --workspace` / 打包不会带上它。
 polaris-updater = { path = "../crates/updater", features = ["test-utils"] }
 # test-utils = 取 polaris-helper-client 的 MockStream（runtime/helper.rs 的 cfg(test) 用）。

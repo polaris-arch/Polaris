@@ -73,7 +73,7 @@ export interface NodeCardProps {
    * `undefined` = 正常。空串 = 被剔但后端没给原因（仍要置灰，tooltip 走兜底文案）。
    *
    * 对齐 上游 `server-card.tsx:103-104`：**只把名称降透明度 + 挂 tooltip，不禁用点击**——
-   * 剔除是会话内语义（每次启动重判、换核可能复活），锁死交互反而让用户没法改配置来修它。
+   * 剔除是会话内语义（每次启动重判、内核随应用升级后可能复活），锁死交互反而让用户没法改配置来修它。
    */
   invalidReason?: string;
   /**

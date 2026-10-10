@@ -32,6 +32,8 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   SYSTEM_DNS_TAKEOVER_FAILED: 'errors.systemDnsTakeoverFailed',
   EXIT_MISMATCH: 'home.proxyMisdirected',
   CORE_BINARY_MISMATCH: 'errors.coreBinaryMismatch',
+  CORE_NOT_EXECUTABLE: 'errors.coreNotExecutable',
+  HELPER_CORE_MISMATCH: 'errors.helperCoreMismatch',
   RULE_RESOURCES_MISSING: 'home.ruleResourcesMissing',
   NETWORK_PROFILE_RULES_PRUNED: 'home.networkProfileRulesPruned',
   AUTO_SWITCH_NEEDS_RESTART: 'errors.autoSwitchNeedsRestart',

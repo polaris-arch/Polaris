@@ -440,8 +440,6 @@ pub mod key {
     pub const NATIVE_CONFIG_PICK_TITLE: &str = "native.configPickTitle";
     /// 配置文件过滤器显示名。
     pub const NATIVE_CONFIG_FILE_TYPE: &str = "native.configFileType";
-    /// 手动替换内核：打开框标题。
-    pub const NATIVE_CORE_PICK_TITLE: &str = "native.corePickTitle";
     /// 「所有文件」过滤器显示名。
     pub const NATIVE_ALL_FILES: &str = "native.allFiles";
     /// Taildrop 取件：保存框标题。

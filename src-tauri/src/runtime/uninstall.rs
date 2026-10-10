@@ -17,14 +17,14 @@
 //! |---|------|---------------------|
 //! | 0 | [停核](UninstallStep::StopCore) | 受管核跑着 TUN 时删 helper，核就成了用户态杀不动的 root 孤儿 + 全网断（判据复用 [`decide_uninstall_preflight`](super::helper::decide_uninstall_preflight)） |
 //! | 1 | [取消开机自启](UninstallStep::Autostart) | 全链**最便宜、最可逆、零提权**的一步，排最前 ⇒ 失败时一个字节都还没删。放最后则意味着「什么都删完了才发现登录项摘不掉」，而系统此后每次登录都会去拉一个已不存在的可执行文件 |
-//! | 2 | [卸 helper](UninstallStep::Helper) | 必须**早于**删用户配置：[`HelperRuntime::uninstall`](crate::runtime::helper::HelperRuntime::uninstall) 把提权脚本写进**配置目录**（`manager.uninstall(&self.dir, …)`）、并从那里读 app 侧 token。先删配置 ⇒ 提权脚本没地方落、token 没得读 ⇒ helper 永远卸不掉 |
-//! | 3 | [删用户配置](UninstallStep::UserConfig) | 含**可写内核** `core_update/`、日志 `logs/`、图标缓存 `icons/`、`update-state.json`（受保护目录里那份 root 核由第 2 步的提权脚本删）。放在 helper 之后见上一行 |
+//! | 2 | [卸 helper](UninstallStep::Helper) | 必须**早于**删用户配置：[`HelperRuntime::uninstall`](crate::runtime::helper::HelperRuntime::uninstall) 在 mac/Linux 把固定提权脚本写进**配置目录**，Windows 则直接运行 bundled native cleaner；完整成功后清 app 侧 token。先删配置会破坏重试所需状态 |
+//! | 3 | [删用户配置](UninstallStep::UserConfig) | 含日志 `logs/`、图标缓存 `icons/`、`update-state.json`（受保护目录里那份 root 核由第 2 步的提权脚本删）。放在 helper 之后见上一行 |
 //! | 4 | [删更新缓存](UninstallStep::CacheDir) | `app_cache_dir()/updates`（下载的安装包）**在配置目录之外**，删配置带不走 —— 漏掉就是卸载完还剩几百 MB |
 //! | 5 | [清 Preferences 域](UninstallStep::Preferences) | macOS `~/Library/Preferences/<identifier>.plist`（[`crate::app_language`] 写的 `AppleLanguages`）**在配置目录之外**。排在这里而不是更早：本进程仍在跑，AppKit 退出前还可能往同一个域写窗口状态等键，越晚清窗口越小（**不能保证零回写**，如实记）。仍在删应用本体之前 —— 那一步之后就没有代码可执行了 |
 //! | 6 | [删应用本体](UninstallStep::AppBundle) | 必须**最后**：它是当前正在跑的这个进程的载体。先删它，后面几步就没有代码可执行了 |
 //!
 //! 「属于 Polaris 的落盘位置」是逐处对过的：`logs/`、`icons/`、`rule-resource/`、`rules/`、
-//! `singbox-dashboard/`、`core_update/`、`core-staged/`、`config.json`、`update-state.json`、
+//! `singbox-dashboard/`、`config.json`、`update-state.json`、
 //! `helper-client.token` **全在配置目录内**（第 3 步一并带走）；配置目录**之外**只有三处 ——
 //! 开机自启登录项（第 1 步）、更新包缓存（第 4 步）、macOS 的应用 Preferences 域（第 5 步），
 //! 故它们各占一个独立步骤。
@@ -685,7 +685,7 @@ pub fn run_uninstall(ops: &dyn UninstallOps, stop_core: StepOutcome) -> Uninstal
 pub trait HelperUninstallOps {
     /// 本平台是否有提权 helper 实现。
     fn supported(&self) -> bool;
-    /// 是否已安装（未装则整步跳过，不该为此白弹一次提权框）。
+    /// 是否已安装；Windows 不能据 SCM 缺失推断支持目录无残留。
     fn installed(&self) -> bool;
     /// 真卸载（弹一次提权框）。
     fn uninstall(&self) -> Result<(), String>;
@@ -827,11 +827,13 @@ impl<H: HelperUninstallOps, A: AutostartOps> UninstallOps for SystemUninstallOps
         if !self.helper.supported() {
             return StepOutcome::unsupported("当前平台没有提权助手实现");
         }
-        if !self.helper.installed() {
+        if self.os != "windows" && !self.helper.installed() {
             return StepOutcome::skipped(
                 "提权助手未安装，无需卸载（受保护目录中也不会有受管内核）",
             );
         }
+        // On Windows the fixed native cleaner is the authoritative absence /
+        // cleanup check. Missing or old helper must not bypass residual cleanup.
         match self.helper.uninstall() {
             Ok(()) => StepOutcome::done(format!(
                 "已卸载提权助手，并一并清除受保护目录中的内核（{}）",
@@ -850,7 +852,7 @@ impl<H: HelperUninstallOps, A: AutostartOps> UninstallOps for SystemUninstallOps
             Err(r) => StepOutcome::failed(format!("拒绝删除 {}：{}", dir.display(), r.reason())),
             Ok(()) => match std::fs::remove_dir_all(dir) {
                 Ok(()) => StepOutcome::done(format!(
-                    "已删除用户配置目录 {}（config.json / 订阅 / 规则 / 可写内核 core_update）",
+                    "已删除用户配置目录 {}（config.json / 订阅 / 规则）",
                     dir.display()
                 )),
                 Err(e) => StepOutcome::failed(format!("删除 {} 失败：{e}", dir.display())),

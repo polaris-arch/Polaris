@@ -51,7 +51,8 @@ import {
 } from '@/components/screens/settings/settings-dns-logic';
 import zhCN from '@/i18n/locales/zh-CN.json';
 
-import { maskRustComments } from '@/contracts/rust-source.test-support';
+import { crateRootSource, maskRustComments } from '@/contracts/rust-source.test-support';
+import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { AboutPage, narrowVersionInfo } from './AboutPage';
 import { BackupPage } from './BackupPage';
 import { DisplayPage } from './DisplayPage';
@@ -3634,15 +3635,91 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
         at('if include_current => match resolve_current_app_release('),
       '两条臂的守卫在 Android 上同时成立，顺序反了「重装当前版本」就没有对象了',
     ).toBe(true);
-    // 同一份源码里的第二条跨语言事实：内核腿在 Android 上**零网络**早退
-    //（`AssetPlatform` 多了一态之后，少这一条就会开始真的去打 SagerNet 的 releases API）。
-    const core = maskRustComments(
-      readFileSync(join(REPO, 'src-tauri/src/commands/updater/core_update.rs'), 'utf8'),
-    );
+  });
+
+  /*
+   * 第二条跨语言事实：应用内没有任何「更新 / 上传 / 回滚内核」的命令，Android 上也就不存在
+   * 「去查内核 release」这次请求。
+   *
+   * 前身的判据是「`core_update.rs` 这个文件不存在」—— 模块换个文件名回来仍绿。命令能不能被前端
+   * 调到，取决于两张表：Rust 侧 `generate_handler![]` 的注册集，与前端 `IPC_CHANNELS` 的值集。
+   * 故改为直接问这两张表：名字里带 `core` 这一节的命令，各自**恰好只有** `core_get_version_info`
+   * （只读的版本信息）。按「节」匹配而不是按 `core_` 前缀：`update_core_check` 这类把 `core`
+   * 放在中间的名字同样在射程内。
+   *
+   * 射程边界（如实登记）：一条名字里完全不带 `core` 的命令（如 `kernel_swap`）不在本条判据内。
+   */
+  it('🔴 跨语言：注册表与通道表里带 core 的命令恰好只有只读的 core_get_version_info', () => {
+    const CORE_SEGMENT = /(?:^|_)core(?:_|$)/;
+    const ALLOWED = ['core_get_version_info'];
+    // ⓪ 自检：谓词认得出前缀形态与中缀形态，也不误伤无关名字。
+    expect(CORE_SEGMENT.test('core_update_check')).toBe(true);
+    expect(CORE_SEGMENT.test('update_core_check')).toBe(true);
+    expect(CORE_SEGMENT.test('score_get')).toBe(false);
+
+    // Rust 侧：crate 根（main.rs + lib.rs）里那一块 `generate_handler![]`，注释先剥掉。
+    // 判定写成吃文本的函数：同一个函数既判真文件，也判下面那份「注入了一条内核命令」的反向对照。
+    const HANDLER_BLOCK = /\.invoke_handler\s*\(\s*tauri::generate_handler!\s*\[([\s\S]*?)\]\s*\)/;
+    const registeredCommands = (crateRoot: string): string[] | null => {
+      const block = HANDLER_BLOCK.exec(crateRoot)?.[1];
+      if (!block) return null;
+      return block
+        .split(',')
+        .map((entry) => entry.trim().replace(/^#\[[^\]]+\]\s*/, ''))
+        .filter(Boolean)
+        .map((entry) => entry.split('::').slice(-1)[0]!)
+        .filter((name) => /^[a-z][a-z0-9_]*$/.test(name));
+    };
+    const coreCommands = (names: string[]): string[] =>
+      names.filter((name) => CORE_SEGMENT.test(name)).sort();
+
+    const root = maskRustComments(crateRootSource('src-tauri/src'));
+    const registered = registeredCommands(root);
+    expect(registered, 'crate 根的 generate_handler![] 解析不到 —— 判据面塌了').not.toBeNull();
+    // 取材面自检：清单量级在、且确实读到了与内核无关的已知命令。
+    expect(registered!.length, '注册表只解析出零星几条 —— 解析器塌了').toBeGreaterThan(80);
+    for (const known of ['update_check', 'update_download', 'config_get']) {
+      expect(registered, `注册表里读不到已知命令 \`${known}\` —— 取材面不对`).toContain(known);
+    }
     expect(
-      core.includes('Some(AssetPlatform::Android) | None => {'),
-      '内核更新检查在 Android 上不再早退 —— 那是一次纯浪费的网络请求，结果恒为「没有适配资产」',
-    ).toBe(true);
+      coreCommands(registered!),
+      'Rust 注册表里出现了 core_get_version_info 之外的内核命令 —— 应用内又有了动内核的入口；' +
+        '若它是「检查内核更新」，Android 上那条零网络早退必须一并恢复并重新钉住',
+    ).toEqual(ALLOWED);
+
+    // 反向对照（常驻）：往**真文件的文本**里多注册一条内核命令，同一个判定必须不再等于期望集合。
+    // 三种写法各注入一次：裸名、带模块路径、`core` 在中间。真文件本身不动。
+    const inject = (entry: string): string =>
+      root.replace(HANDLER_BLOCK, (whole: string, block: string) =>
+        whole.replace(block, () => `\n${entry},${block}`),
+      );
+    for (const [entry, name] of [
+      ['core_anything', 'core_anything'],
+      ['commands::updater::core_anything', 'core_anything'],
+      ['commands::update_core_check', 'update_core_check'],
+    ] as const) {
+      const mutated = inject(entry);
+      expect(mutated, `注入 \`${entry}\` 没有改动文本 —— 反向对照是空跑`).not.toBe(root);
+      const seen = registeredCommands(mutated);
+      expect(seen, `注入 \`${entry}\` 后注册表解析不到`).not.toBeNull();
+      expect(seen!.length, `注入 \`${entry}\` 后条数应恰好多一条`).toBe(registered!.length + 1);
+      expect(
+        coreCommands(seen!),
+        `注册表多了一条 \`${entry}\`，判定却没有察觉 —— Rust 这一侧的判据没有牙`,
+      ).toEqual([...ALLOWED, name].sort());
+      expect(coreCommands(seen!)).not.toEqual(ALLOWED);
+    }
+
+    // 前端侧：`IPC_CHANNELS` 的值集（渲染端能发出去的全部命令名）。
+    const channels = Object.values(IPC_CHANNELS) as string[];
+    expect(channels.length, 'IPC_CHANNELS 读到的值太少 —— 取材面不对').toBeGreaterThan(100);
+    for (const known of ['update_check', 'update_download', 'config_get']) {
+      expect(channels, `IPC_CHANNELS 里读不到已知命令 \`${known}\``).toContain(known);
+    }
+    expect(
+      channels.filter((name) => CORE_SEGMENT.test(name)).sort(),
+      'IPC_CHANNELS 里出现了 core_get_version_info 之外的内核命令',
+    ).toEqual(ALLOWED);
   });
 
   /** 收尾：本组除了那条正向对照，一次都没碰过真的 `updateApi.check`（见探针那段头注）。 */

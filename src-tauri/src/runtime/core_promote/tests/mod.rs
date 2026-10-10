@@ -456,7 +456,7 @@ fn sha256_file_matches_known_vector() {
 /// 取 `proxy.rs` 里某方法的**自身**函数体（按花括号配对精确截断，不会漏到同 impl 的下一个方法）。
 fn proxy_method(sig: &str) -> String {
     let src = module_code("runtime/proxy");
-    crate::runtime::core_update_scheduler::method_scan::method_body(&src, sig)
+    crate::test_support::method_body(&src, sig)
 }
 
 /// 🔴 **门：经 helper 起核前必须先对账受保护核，且必须在 IPC 之前。**
@@ -537,8 +537,9 @@ fn core_binary_attestation_surfaces_via_nonfatal_error_channel() {
              只打日志等于用户看不到"
     );
     assert!(
-        body.contains("is_alarm()"),
-        "告警判定必须走 CoreBinaryAttestation::is_alarm（单一真值），别在此处另写一套分支"
+        body.contains("attestation_disposition(&attestation, via_helper)"),
+        "处置必须走 attestation_disposition（它以 CoreBinaryAttestation::is_alarm 为告警的单一真值，\
+             见 `attestation_disposition_keeps_is_alarm_as_the_alarm_truth`），别在此处另写一套分支"
     );
 }
 

@@ -10,6 +10,7 @@ export function helperActionErrorText(
   switch (code) {
     case 'cancelled': return t('helper.actionError.cancelled');
     case 'authorizationUnavailable': return t('helper.actionError.authorizationUnavailable');
+    case 'partialCleanup': return t('helper.actionError.partialCleanup');
     case 'proxyRunning': return t('helper.actionError.proxyRunning');
     case 'unsupported': return t('helper.actionError.unsupported');
     case 'missingAsset': return t('helper.actionError.missingAsset');

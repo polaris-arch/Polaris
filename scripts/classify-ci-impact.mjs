@@ -165,6 +165,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     platforms: Object.freeze(['linux']),
     why: 'helper 的 linux 平台实现，只改 linux 那份二进制。',
   },
+  'crates/windows-cleaner/': {
+    kernel: false,
+    platforms: ['windows'],
+    why: '随 Windows 包分发/NSIS 嵌入的固定 native cleaner；SCM/支持目录卸载需要 Windows 原生与安装器验证，不执行真实网络内核。',
+  },
   'crates/helper/src/platform/windows/': {
     kernel: false,
     platforms: Object.freeze(['windows']),
@@ -193,7 +198,7 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
   'src-tauri/core-manifest.json': {
     kernel: true,
     platforms: ALL,
-    why: '随包核版本与资产钉扎的唯一真值：既换核（内核门）又换包内资产（四平台）。',
+    why: '随包核版本与资产钉扎的唯一真值：既动内核（内核门）又动包内资产（四平台）。',
   },
   'src-tauri/Cargo.toml': {
     kernel: false,
@@ -804,7 +809,7 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'ci.yml 的 aarch64-linux-android cargo check 覆盖 Android debug cfg 类型；check-android-bridge.mjs A17 '
     + '核对命令、实例发现与注入接线。APK release 构建不执行 debug 注入，也不能证明实际 8 秒让位或重启恢复。',
   'src-tauri/src/runtime/updater.rs':
-    'Frozen desktop sourceBuild selects the compiled desktop baseline only; the Android branch keeps bundledCoreVersion unchanged. '
+    'Frozen desktop sourceBuild selects the compiled desktop baseline and patch-set id only; the Android branch keeps bundledCoreVersion unchanged; Android and iOS report no desktop patch set. '
     + 'cargo check --target aarch64-linux-android -p polaris type-checks that branch, while host updater/tests exercises explicit Android '
     + 'baseline compatibility and incomplete-source negatives. No JNI, APK resource, Android updater flow or on-device cleanup is verified by this change.',
   'scripts/fetch-core.mjs':
@@ -842,9 +847,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/commands/subscription.rs':
     'Android 本地订阅导入选择器不带扩展过滤，由正文解析继续校验格式和大小；'
     + 'Android 目标 cargo check 覆盖条件编译，APK 构建不执行选择器或验证 SAF 可见性。',
-  'src-tauri/src/commands/updater/core_update.rs':
-    '非 Android 的核心换代在旧核可停期间持有 legacy admission lease；Android 走独立的随包核更新路径。'
-    + '桌面生命周期测试覆盖 lease，Android 目标 cargo check 覆盖 cfg 分支；APK 构建不执行更新事务。',
   'src-tauri/src/runtime/proxy/lifecycle.rs':
     'Android 不申请桌面 managed marker 的 legacy lease，起停仍经 Android 核桥；'
     + 'Android 目标 cargo check 覆盖条件编译，桌面 lifecycle 单测覆盖 lease 准入，'
@@ -892,9 +894,6 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/commands/updater/app_update.rs':
     'version_get_info 的 debugReportAvailable 是 Android Debug 构型标志，仅改变 IPC 载荷；'
     + '两侧编译与 UI 契约覆盖字段，APK 腿不会执行命令或验证构型语义。',
-  'src-tauri/src/commands/updater/shared.rs':
-    'Android 内核随 APK 分发，此处拒绝独立可写核心目录；目标编译检查覆盖 cfg 分支，'
-    + 'APK 腿不执行更新命令，真实拒绝行为仍由 Android 端回归检查。',
   'src-tauri/src/runtime/geo_seed.rs':
     'Android 从 Application 预先提取的 bundled-geo 目录播种规则；Rust 单测覆盖路径映射与播种，'
     + '交叉 check 覆盖 Android 条件编译。APK 腿只打包 28 个资源，不运行播种；资产完整性由'
@@ -1094,6 +1093,12 @@ const SHARED_PACKAGE_PATHS = new Set([
   // 它挂了整条打包链就编不出 singbox-grpc。2026-08-30 前它不在任何表里 = 同一 fail-open。
   'scripts/fetch-protoc.mjs',
   'scripts/verify-packaging.mjs',
+  // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
+  // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 列为必需测试。
+  'scripts/macos-nested-code.sh',
+  'scripts/macos-nested-code.test.mjs',
+  'scripts/nsis-core-sweep.test.mjs',
+  'scripts/nsis-helper-cleanup.test.mjs',
   'scripts/tauri-cli.version',
   'ui/package.json',
   'ui/pnpm-lock.yaml',

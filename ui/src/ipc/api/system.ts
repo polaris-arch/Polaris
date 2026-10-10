@@ -11,6 +11,7 @@ import type {
 export type HelperActionErrorCode =
   | 'cancelled'
   | 'authorizationUnavailable'
+  | 'partialCleanup'
   | 'proxyRunning'
   | 'unsupported'
   | 'missingAsset'

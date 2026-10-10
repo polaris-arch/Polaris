@@ -1344,7 +1344,6 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
     ['subscribeLatencyEvents', '移动端由 subscribeMobileSpeedTestProgress 同时接主动轮次与被动 warm RTT：旧 runId 不落延迟；原桌面无轮次门订阅不重复挂。应用级实际 RTT/退订行为见本文件末尾'],
     ['onOpenConnectStatus', 'OpenConnect 增量在移动端零消费者：节点屏的 `deriveMeshTunnelHealth` 只读 `openVpn`，首帧快照那一跳已经把 `openConnect` 落进 store 了'],
     ['onSystemProxyResidual', '移动端接管方式恒为 TUN，系统代理这个对象在 Android 上不存在'],
-    ['onCoreBaselineWarning', '发射点是桌面换核路径，移动端不随包第二个核'],
     ['subscribeSpeedTestProgressToast', '移动端通过runId会话store与行内进度消费同样事件；不重复显示桌面的sticky toast'],
     // ── 2026-09-06 第二次扩面抓出来的七条：它们不长成订阅的样子，此前整条掉在取材面外 ──
     ['useSystemProxyLivePolling', '移动端接管方式恒为 TUN（`MobileHomeScreen.MOBILE_TAKEOVER`），systemProxy 档在 Android 上连入站都不发；那条轮询每轮 exec `networksetup`/`gsettings`/`reg`，在这里既无对象也无消费者'],

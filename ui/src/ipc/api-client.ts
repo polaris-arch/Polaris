@@ -33,7 +33,7 @@ import { rulesApi, ruleResourcesApi, iconApi } from './api/rules';
 import { logsApi, diagnosticApi } from './api/logs';
 import { statsApi, connectionsApi } from './api/stats';
 import { autoStartApi, systemApi, systemBackupApi, windowApi, helperApi, appApi } from './api/system';
-import { versionApi, updateApi, coreUpdateApi } from './api/updater';
+import { versionApi, updateApi, coreApi } from './api/updater';
 import { subscriptionApi, localImportApi, backupApi } from './api/subscriptions';
 import { ipInfoApi } from './api/ip-info';
 import { networkProfileApi } from './api/network-profiles';
@@ -75,7 +75,7 @@ export const api = {
   ipInfo: ipInfoApi,
   version: versionApi,
   update: updateApi,
-  coreUpdate: coreUpdateApi,
+  core: coreApi,
   subscription: subscriptionApi,
   localImport: localImportApi,
   backup: backupApi,

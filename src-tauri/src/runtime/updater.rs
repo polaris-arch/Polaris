@@ -1,59 +1,44 @@
 //! 更新运行时：把 `polaris-updater` 纯逻辑 crate 装配为持有真实 I/O 的运行时实例。
 //!
 //! 装配内容：
-//!  - **随包内核基线**（`core-manifest.json` 的 `bundledCoreVersion`，编译期嵌入）。
-//!  - **活核版本双读法**（[`UpdaterRuntime::read_core_version_line`] / [`UpdaterRuntime::read_core_version`]）
-//!    —— **两者失败语义刻意不对称**，见下方「双读法陷阱」。
-//!  - **更新状态持久化**（`update-state.json`，原子写 tmp+rename）。
+//!  - **随包内核清单**（`core-manifest.json`，编译期嵌入）：配套内核版本与补丁集标识。
+//!  - **现役内核版本双读法**（[`UpdaterRuntime::read_core_version_line`] /
+//!    [`UpdaterRuntime::read_core_version`]）—— 两者失败语义刻意不对称，见下。
+//!  - **应用更新状态持久化**（`update-state.json`，原子写 tmp+rename）。
 //!  - **mini 更新弹窗会话**（`updater::popup::PopupSession` + Tauri 窗口 transport）。
 //!
-//! # 双读法陷阱（Polaris issue #150 review F1，**移植时必须保留的不对称**）
+//! 内核本身不在这里更新：应用只从安装包解析内核，应用内没有更换内核的入口。
 //!
-//! 上游 `ProxyManager` 有两个读活核版本的函数，失败语义**故意相反**：
+//! # 双读法的不对称
 //!
 //! | 函数 | 探测失败时 | 用途 |
 //! |---|---|---|
-//! | `getCoreVersion`（`ProxyManager.ts:2889-2916`） | **回落随包基线** | 展示 / 一般比较 |
-//! | `getCoreVersionLine`（`:2944-2956`） | **返回 `''`** | **reseed 生效校验专用** |
+//! | `read_core_version` | **回落配套版本** | 关于页那一格展示 |
+//! | `read_core_version_line` | **返回 `""`** | 需要区分「读到了」与「读不到」的地方（内核信息卡） |
 //!
-//! 陷阱：一次 spawn 失败在 `getCoreVersion` 眼里长得**和「活核就是随包版本」一模一样**。
-//! 若用它校验 reseed，「重读失败」会被回落值伪装成「换核成功」→ 版本闸门误放行 → 带旧核硬跑退回死循环。
-//! 故 `classify_reseed_result` 的 `line_after` **只能**来自「失败置空」的读法。
-//! 本模块用两个函数名 + 文档 + 单测（`core_version_readers_are_asymmetric`）把该不对称钉死。
+//! 一次 spawn 失败在 `read_core_version` 眼里长得和「现役内核就是配套版本」一模一样，所以任何
+//! 要把读数当证据用的地方只能用失败置空的那一个。单测 `core_version_readers_are_asymmetric`
+//! 钉着这条不对称。
 //!
-//! # 边界声明（2026-07-18 立，2026-07-29 复核订正）
+//! # 核二进制路径
 //!
-//! 1. **更新链路已全段接线**（此前本条记「检查侧/安装侧仍不可达、前端检查入口仍禁用」，**已过时**）：
-//!    传输 `runtime/http.rs`（reqwest+rustls + `CoreDownloader`，带端到端单测）；检查侧
-//!    `crates/updater/src/github.rs`（release JSON→manifest 转换 + 平台资产选择 + `APP_UPDATE_REPO`
-//!    / `CORE_UPDATE_REPO` 常量）已移植；前端 `SettingsUpdate.tsx` 的检查按钮是活的
-//!    （`checkUpdate` → `update_check` → `update_download` → `update_install` 三段齐）。
-//!    `updater::traits::UnavailableDownloader` 现**只作为 trait 契约的映射目标存在**，生产注入的是
-//!    `CoreDownloader` ⇒ `HTTP_BACKEND_UNAVAILABLE` 在生产不可达（见 `commands/updater.rs:88`）。
-//! 2. **核二进制路径解析的单一真值是 [`crate::runtime::proxy::resolve_core_binary`]**（`pub(crate)`）。
-//!    本模块**刻意不复制第二份**（§A3 教训：`RuleResourceManager` 曾有 2 域的 `GITHUB_HOSTS` 本地副本
-//!    与 `gh-proxy.ts` 的 5 域漂移，令三级兜底自相矛盾）。走**注入**：[`UpdaterRuntime::with_core_binary`]，
-//!    注入点 `lib.rs:1293`（此前本条记「待编排者提为 `pub(crate)` 并注入」，该待办**已完成**）。
-//!    未注入时（异常启动路径）版本读取如实返回「未知」/空串，**不猜、不谎报**。
+//! 解析的单一真值是 [`crate::runtime::proxy::resolve_core_binary`]，本模块不复制第二份，经
+//! [`UpdaterRuntime::with_core_binary`] 由 `lib.rs` 启动期注入。未注入时版本读取如实返回空串，
+//! 不猜、不谎报。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use polaris_updater::core_build::{classify_core_build, CoreBuildKind};
-#[cfg(test)]
-use polaris_updater::core_build::{ComparableVersion, CoreOverrideDecision};
-#[cfg(test)]
-use polaris_updater::decide_core_override;
 use polaris_updater::extract_version_token;
 use polaris_updater::popup::{PopupSession, UpdatePopupState};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::update_popup::TauriPopupTransport;
 
-/// `core-manifest.json` 的编译期嵌入（= 上游 `import coreManifest from '../shared/core-manifest.json'`）。
+/// `core-manifest.json` 的编译期嵌入。
 ///
-/// `bundledCoreVersion` 是**构建期生成**的常量（随包核版本 = 基线），故编译期嵌入语义正确，
+/// 清单是**构建期生成**的常量（随包内核的版本与来源），故编译期嵌入语义正确，
 /// 且免去运行期 resource 路径解析的一整类失败。
 const CORE_MANIFEST_JSON: &str = include_str!("../../core-manifest.json");
 
@@ -73,9 +58,9 @@ struct WindowsBuild {
     version: String,
 }
 
-/// 解析编译期嵌入的 `core-manifest.json`，取随包基线版本。
+/// 解析编译期嵌入的 `core-manifest.json`，取配套内核版本。
 ///
-/// 解析失败 → 回落空串（调用方据此跳过基线比较；**不 panic**：清单损坏不该让整个 App 起不来）。
+/// 解析失败 → 回落空串（**不 panic**：清单损坏不该让整个 App 起不来）。
 fn bundled_core_version() -> String {
     bundled_core_version_from_manifest(
         CORE_MANIFEST_JSON,
@@ -83,9 +68,25 @@ fn bundled_core_version() -> String {
         cfg!(target_os = "android"),
     )
     .unwrap_or_else(|e| {
-        log::error!("core-manifest.json 解析失败 {e}：基线比较将跳过");
+        log::error!("core-manifest.json 解析失败 {e}：配套内核版本未知");
         String::new()
     })
+}
+
+/// **桌面**补丁集标识：清单 `sourceBuild.patchedSourceTree`（打完桌面补丁队列后的源码树哈希）。
+///
+/// 只在清单被认作冻结清单时给出（与 [`bundled_core_version_from_manifest`] 取 `sourceBuild.version`
+/// 用同一个判据 [`frozen_source_build_version`]）：清单不完整时版本回落到上游基线，那时再给一个
+/// 补丁集标识等于为一个没被确认的构建背书。移动端（Android、iOS）的内核各走各的补丁队列，
+/// 不来自这份桌面源码清单，恒 `None`。
+fn bundled_core_patch_set_from_manifest(raw: &str, mobile: bool) -> Option<String> {
+    if mobile {
+        return None;
+    }
+    let manifest = serde_json::from_str::<CoreManifest>(raw).ok()?;
+    let source = manifest.source_build.as_ref()?;
+    frozen_source_build_version(source, &manifest.bundled_core_version)?;
+    source["patchedSourceTree"].as_str().map(str::to_owned)
 }
 
 // Match the desktop JS inputs-only gate. Output hashes are first computed by
@@ -231,56 +232,82 @@ fn bundled_core_version_from_manifest(
 
 /// 持久化的更新状态（`<config_dir>/update-state.json`）。
 ///
-/// 移植自 上游 `core-update-state.json`（`core-update-state-store.ts:13-25`）+ App 更新的 skipped 版本。
-/// 合并为一个文件：Polaris 分两处（`CoreUpdateStateStore` 与 `UpdateService` 各自持久化），
-/// 但二者都是「更新域的用户可见状态」，同生命周期、同读写时机 —— 分文件只是上游的历史产物，无收益。
+/// 旧版本在同一文件里还写过内核自动更新的字段（暂存记录、跨带提示、版本变更通知）；读取时
+/// 它们被忽略，下一次写回即从盘上消失。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UpdateStateFile {
     /// 用户「跳过此版本」的 App 版本号（= 上游 `UPDATE_SKIP`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
-    /// 上次检查更新时间（epoch ms；= 上游 `lastCheckAt`）。
+    /// Windows 便携版：应用为了让用户手动覆盖而退出时留下的那两个位置。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_check_at: Option<u64>,
-    /// 已暂存待落位的内核版本（= 上游 `staged`）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staged: Option<StagedRecord>,
-    /// 已提示过的跨带版本（= 上游 `crossBandNotifiedVersion`，一次性提示）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cross_band_notified_version: Option<String>,
-    /// 版本变更通知（show→ack；= 上游 `pendingChangeNotice`）。
-    ///
-    /// 「弹一次非每启」：换核成功时写入，UI banner 展示后调 `core:ackVersionChange` 清除。
-    /// Polaris 用它取代了旧的「last-known-version !== current」推断式判定 —— 后者每次启动都重弹。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_change_notice: Option<PendingChangeNotice>,
+    pub pending_portable_update: Option<PendingPortableUpdate>,
 }
 
-/// staged 暂存记录（= 上游 `StagedCoreInfo`）。
+/// 便携版手动交接的两个位置及来源/目标版本；记录不等于安装完成证据。
+///
+/// 应用退出之后，写着这两个路径的那张卡片就不在了；而系统「打开文件夹」是否真的弹出了窗口，
+/// 应用这边看不出来。留下这条记录，用户重开应用时卡片回到原处。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StagedRecord {
-    pub version: String,
-    pub dir: String,
-    pub staged_at: String,
+pub struct PendingPortableUpdate {
+    /// 更新压缩包的位置。
+    pub archive: String,
+    /// 程序所在目录（覆盖解压的目标）。
+    pub program_dir: String,
+    /// 留下记录时正在运行的应用版本。
+    pub from_version: String,
+    /// 正式资产名中的目标版本；旧记录缺此字段时，完成情况保持未确认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
 }
 
-/// 版本变更通知（= 上游 `pendingChangeNotice`）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingChangeNotice {
-    pub previous_version: String,
-    pub current_version: String,
+/// 重启后能观察到的交接状态；没有「已安装」结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableHandoffStatus {
+    AwaitingTargetVersion,
+    CompletionUnverified,
+}
+
+impl PendingPortableUpdate {
+    /// 目标版本已运行或压缩包不可继续使用时，不恢复交接卡。
+    /// 同版本修复、旧记录和意外版本变化均无法证明是否覆盖，保持「完成未确认」。
+    #[must_use]
+    pub fn handoff_status(
+        &self,
+        running_version: &str,
+        archive_exists: bool,
+    ) -> Option<PortableHandoffStatus> {
+        if !archive_exists {
+            return None;
+        }
+        match self.target_version.as_deref() {
+            Some(target) if target == running_version && target != self.from_version => None,
+            Some(target) if target != self.from_version && running_version == self.from_version => {
+                Some(PortableHandoffStatus::AwaitingTargetVersion)
+            }
+            _ => Some(PortableHandoffStatus::CompletionUnverified),
+        }
+    }
+}
+
+impl UpdateStateFile {
+    /// 用户显式重新检查时清除交接提示；不改安装状态，不删除压缩包。
+    pub fn clear_portable_handoff(&mut self) {
+        self.pending_portable_update = None;
+    }
 }
 
 /// 更新运行时。
 pub struct UpdaterRuntime {
     /// 状态文件路径（`<config_dir>/update-state.json`）。
     state_path: PathBuf,
-    /// 随包内核基线版本（编译期自 `core-manifest.json`）。
+    /// 配套内核版本（编译期自 `core-manifest.json`）。
     bundled_core_version: String,
-    /// 核二进制路径（**注入**；None = 未注入，版本读取如实报未知，见模块文档边界 2）。
+    /// 补丁集标识（见 [`bundled_core_patch_set_from_manifest`]）。
+    bundled_core_patch_set: Option<String>,
+    /// 核二进制路径（**注入**；None = 未注入，版本读取如实报未知）。
     core_binary: Mutex<Option<PathBuf>>,
     /// mini 更新弹窗会话（None = 弹窗未开）。
     popup: Mutex<Option<PopupSession<TauriPopupTransport>>>,
@@ -311,45 +338,43 @@ impl UpdaterRuntime {
         Self {
             state_path,
             bundled_core_version: bundled_core_version(),
-            // 环境逃生门（POLARIS_SINGBOX_PATH）**不在这里读**：解析、信任级判定与稳定错误码
-            // 全归 `proxy::core_binary_env_override` 一份实现。此前这里自己又读了一次同一个
-            // 环境变量 —— 那是 L1 的第二条腿，只修 `resolve_core_binary` 会把它漏在原地，
-            // 而旁边那句「完整解析仍归 proxy.rs 单一真值」会让 review 以为已经覆盖全。
-            // `Err`（开发态逃生门指向不存在的文件）在版本探测腿的语义里 = 无探测目标 → None，
-            // 与信任级引入前的 `.filter(|p| p.is_file())` 逐字一致。
-            core_binary: Mutex::new(
-                crate::runtime::proxy::core_binary_env_override()
-                    .ok()
-                    .flatten(),
+            bundled_core_patch_set: bundled_core_patch_set_from_manifest(
+                CORE_MANIFEST_JSON,
+                cfg!(any(target_os = "android", target_os = "ios")),
             ),
+            // 路径解析归 `proxy::resolve_core_binary` 一份实现，`lib.rs` 启动期经
+            // `with_core_binary` 注入；这里不自己找。
+            core_binary: Mutex::new(None),
             popup: Mutex::new(None),
             last_progress: Mutex::new(None),
             state: Mutex::new(state),
         }
     }
 
-    /// 注入核二进制路径（见模块文档边界 2：单一真值在 `proxy.rs`，此处只接收）。
+    /// 注入核二进制路径（单一真值在 `proxy.rs`，此处只接收）。
     pub fn with_core_binary(&self, path: PathBuf) {
         if let Ok(mut g) = self.core_binary.lock() {
             *g = Some(path);
         }
     }
 
-    /// 随包内核基线版本（= 上游 `coreManifest.bundledCoreVersion`）。
+    /// 配套内核版本：本应用版本随包的那个内核构建。
     #[must_use]
     pub fn bundled_core_version(&self) -> &str {
         &self.bundled_core_version
     }
 
+    /// 桌面补丁集标识（移动端、清单不含或未被认作冻结清单 → `None`）。
+    #[must_use]
+    pub fn bundled_core_patch_set(&self) -> Option<&str> {
+        self.bundled_core_patch_set.as_deref()
+    }
+
     // ── 活核版本双读法（**不对称失败语义**，见模块文档「双读法陷阱」）──
 
-    /// 读活核 `sing-box version` 的**原始第一行**；**探测失败返回空串**。
+    /// 读现役内核 `sing-box version` 的**原始第一行**；**探测失败返回空串**。
     ///
-    /// = 上游 `ProxyManager.getCoreVersionLine`（`:2944-2956`）。
-    ///
-    /// **这是 [`polaris_updater::classify_reseed_result`] 唯一合法的入参来源**：失败置空 →
-    /// `classify_core_build` 视为 `unknown` → reseed 判「未生效」（诚实失败）。
-    /// **绝不回落随包基线** —— 那会把「重读失败」伪装成「换核成功」。
+    /// 绝不回落配套版本 —— 那会把「读不到」伪装成「就是配套版本」。
     #[must_use]
     pub fn read_core_version_line(&self) -> String {
         let Some(bin) = self.core_binary_path() else {
@@ -377,46 +402,19 @@ impl UpdaterRuntime {
         }
     }
 
-    /// 读活核版本 token；**探测失败回落随包基线**。
+    /// 读现役内核版本 token；**探测失败回落配套版本**。
     ///
-    /// = 上游 `ProxyManager.getCoreVersion`（`:2889-2916`，`catch` 分支返回
-    /// `coreManifest.bundledCoreVersion`）。
-    ///
-    /// # ⚠️ 绝不可用于 reseed 生效校验
-    ///
-    /// 回落语义使「探测失败」与「活核就是随包版本」不可区分。校验换核是否真生效**必须**用
-    /// [`Self::read_core_version_line`]。本函数仅供展示 / 一般比较。
+    /// 回落语义使「探测失败」与「现役内核就是配套版本」不可区分，故本函数只供展示；要把读数
+    /// 当证据用的地方必须用 [`Self::read_core_version_line`]。
     #[must_use]
     pub fn read_core_version(&self) -> String {
         let line = self.read_core_version_line();
         let tok = extract_version_token(&line);
         if tok.is_empty() {
-            // 回落基线（**刻意**与上游一致的陷阱语义；调用点须自觉，见文档）。
+            // 回落配套版本（调用点须自觉，见文档）。
             return self.bundled_core_version.clone();
         }
         tok
-    }
-
-    /// 活核构建来源判定（= 上游 `getCoreBuild`，`CoreUpdateService.ts:1090`）。
-    ///
-    /// 喂的是**原始版本行**（含 fork 后缀）——`classify_core_build` 要的正是它。
-    #[must_use]
-    pub fn core_build_kind(&self) -> CoreBuildKind {
-        classify_core_build(&self.read_core_version_line())
-    }
-
-    /// 核覆盖决策（= 上游 `decideCoreOverride`）。
-    ///
-    /// 第 2 参数经 [`ComparableVersion::normalize`] 规范化 —— 由类型强制，B-2 整类 bug 在此不可达
-    /// （见 `updater::core_build` 模块文档）。
-    #[cfg(test)]
-    #[must_use]
-    pub fn decide_core_override_for(&self, core_version_raw: &str) -> CoreOverrideDecision {
-        decide_core_override(
-            self.core_build_kind(),
-            &ComparableVersion::normalize(core_version_raw),
-            &self.bundled_core_version,
-        )
     }
 
     fn core_binary_path(&self) -> Option<PathBuf> {
@@ -437,15 +435,33 @@ impl UpdaterRuntime {
     ///
     /// 落盘失败（磁盘满/权限）。**内存态已更新**（对齐上游 best-effort：落盘失败不回滚内存）。
     pub fn mutate_state<F: FnOnce(&mut UpdateStateFile)>(&self, f: F) -> Result<(), String> {
-        let snapshot = {
-            let mut g = self
-                .state
-                .lock()
-                .map_err(|e| format!("state 锁中毒: {e}"))?;
-            f(&mut g);
-            g.clone()
-        };
-        save_state_file(&self.state_path, &snapshot)
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|e| format!("state 锁中毒: {e}"))?;
+        f(&mut g);
+        // 串行落盘，避免较旧快照在提示清除后重新覆盖状态文件。
+        save_state_file(&self.state_path, &g)
+    }
+
+    /// 显式清除便携版提示：落盘成功后才更新内存；不删除 ZIP 或宣称安装成功。
+    ///
+    /// # Errors
+    ///
+    /// 锁或落盘失败时保留原内存记录，调用方须向用户报告失败。
+    pub fn clear_portable_handoff(&self) -> Result<(), String> {
+        let mut g = self
+            .state
+            .lock()
+            .map_err(|e| format!("state 锁中毒: {e}"))?;
+        if g.pending_portable_update.is_none() {
+            return Ok(());
+        }
+        let mut next = g.clone();
+        next.clear_portable_handoff();
+        save_state_file(&self.state_path, &next)?;
+        *g = next;
+        Ok(())
     }
 
     // ── 弹窗会话 ──

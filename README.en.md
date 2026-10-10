@@ -26,7 +26,7 @@
 | Mesh | WireGuard · Tailscale · WARP; OpenConnect / OpenVPN also count once they declare internal subnets |
 | DNS | FakeIP · DoH / DoT · Resolver racing · IPv6 strategy · Leak protection |
 | Diagnostics | Connection topology · Live logs · Node speed tests · Streaming and AI unlock detection |
-| Operations | Subscription management · Online core updates · Config backup and restore · Privacy lock · Tray residency |
+| Operations | Subscription management · Config backup and restore · Privacy lock · Tray residency |
 | App updates | Stable / Testing channels · Re-download the current version · Installer digest verification |
 | Memory optimization | Releases the main WebView after the UI stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
 

@@ -603,6 +603,21 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(run).toBeDefined();
     const good = "package: name='com.polaris2.app' versionCode='1000000' versionName='1.0.0' platformBuildVersionName='16'";
     const goodProps = 'tauri.android.versionName=1.0.0\ntauri.android.versionCode=1000000\n';
+    // APK contents are identical across metadata/error cases. Generate the
+    // three real ZIP inventories once; every case still executes the actual
+    // asset script against its own files, manifest probe and Gradle metadata.
+    const zipSeed = mkdtempSync(join(tmpdir(), 'polaris-android-zip-seed-'));
+    onTestFinished(() => rmSync(zipSeed, { recursive: true, force: true }));
+    const apkFixtures = new Map<string, Buffer>();
+    for (const [flavor, abis] of [['arm64', ['arm64-v8a']], ['arm', ['armeabi-v7a']],
+      ['universal', ['arm64-v8a', 'armeabi-v7a']]] as const) {
+      const path = join(zipSeed, `${flavor}.apk`);
+      const made = spawnSync('python3', ['-c',
+        'import sys,json,zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z:\n for abi in json.loads(sys.argv[2]):\n  for lib in ["libbox.so", "libpolaris_lib.so", "libc++_shared.so"]: z.writestr("lib/"+abi+"/"+lib, "inert fixture")',
+        path, JSON.stringify(abis)]);
+      expect(made.status).toBe(0);
+      apkFixtures.set(flavor, readFileSync(path));
+    }
     for (const [badging, properties, tag, aaptExit, expected] of [
       [good, goodProps, 'v1.0.0', 0, 0],
       [good.replace("versionName='1.0.0'", "versionName='0.9.0'"), goodProps, 'v1.0.0', 0, 1],
@@ -635,15 +650,10 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         if (properties !== null) {
           writeFileSync(join(app, 'tauri.properties'), properties);
         }
-        // Real ZIP inventory with inert fixture members; no Android compiler or APK execution.
-        for (const [flavor, abis] of [['arm64', ['arm64-v8a']], ['arm', ['armeabi-v7a']],
-          ['universal', ['arm64-v8a', 'armeabi-v7a']]] as const) {
+        for (const [flavor, bytes] of apkFixtures) {
           const directory = join(app, `build/outputs/apk/${flavor}/release`);
           mkdirSync(directory, { recursive: true });
-          const made = spawnSync('python3', ['-c',
-            'import sys,json,zipfile\nwith zipfile.ZipFile(sys.argv[1], "w") as z:\n for abi in json.loads(sys.argv[2]):\n  for lib in ["libbox.so", "libpolaris_lib.so", "libc++_shared.so"]: z.writestr("lib/"+abi+"/"+lib, "inert fixture")',
-            join(directory, `app-${flavor}-release.apk`), JSON.stringify(abis)]);
-          expect(made.status).toBe(0);
+          writeFileSync(join(directory, `app-${flavor}-release.apk`), bytes);
         }
         const bytes = readFileSync(join(apkDir, 'app-arm64-release.apk'));
         // Only the real asset step's metadata input is synthetic. No SDK or APK

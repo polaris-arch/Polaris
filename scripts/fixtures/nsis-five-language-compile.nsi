@@ -6,6 +6,12 @@ Unicode true
 
 Name "Polaris NSIS language contract"
 Var UpdateMode
+
+; 两条 PRE 钩子会展开 Tauri 模板 `utils.nsh` 里的主程序检查宏；本探针不带模板，给一个同名同参的空桩。
+!define MAINBINARYNAME "polaris"
+!define PRODUCTNAME "Polaris"
+!macro CheckIfAppIsRunning executablePath productName
+!macroend
 !ifdef OUTFILE
   OutFile "${OUTFILE}"
 !else
@@ -34,5 +40,6 @@ Section
 SectionEnd
 
 Section "Uninstall"
+  !insertmacro NSIS_HOOK_PREUNINSTALL
   !insertmacro NSIS_HOOK_POSTUNINSTALL
 SectionEnd

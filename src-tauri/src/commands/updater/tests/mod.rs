@@ -1,10 +1,10 @@
 use super::*;
-use super::{app_update::*, core_update::*};
+use super::{app_update::*, core_info::core_version_info};
 
 use std::sync::Arc;
 
-use crate::runtime::core_paths;
-use crate::test_support::{crate_code, module_code, repo_file, TestDir};
+use crate::test_support::{module_code, repo_file, TestDir};
+
 use polaris_updater::github::{check_app_update, AppUpdateCheck, AssetArch, AssetPlatform};
 use polaris_updater::popup::{UpdateErr, UpdateErrCode};
 use polaris_updater::state::PopupPhase;
@@ -117,336 +117,52 @@ fn releases_url_for_missing_version_falls_back_to_list_page() {
     );
 }
 
-// ── 「绝不主动断流」硬不变量（H1）─────────────────────────────────────────
+// ── 内核信息（只读）──────────────────────────────────────────────────────
 
-/// 🟡 **变异锁：自动路径 + 代理在跑 ⇒ 必须拦下。**
-///
-/// **变异探针**：把 [`swap_blocked_by_no_interrupt`] 改成恒 false / 只看 `interrupt` /
-/// 只看 `was_running` ⇒ 逐条转红。
+/// 载荷只有三格，且随包内核自报版本取自原始版本行（保留补丁集后缀）。
 #[test]
-fn no_interrupt_invariant_truth_table() {
-    assert!(
-        swap_blocked_by_no_interrupt(SwapInterrupt::Forbidden, true),
-        "自动路径遇到运行中的代理 → 必须放弃换核（绝不无同意断流）"
-    );
-    assert!(
-        !swap_blocked_by_no_interrupt(SwapInterrupt::Forbidden, false),
-        "代理没跑 → 自动路径照常落位（这是唯一的安全窗口，不能一并堵死）"
-    );
-    assert!(
-        !swap_blocked_by_no_interrupt(SwapInterrupt::Allowed, true),
-        "用户亲手点的换核 → 允许停/起核，否则「立即应用」永远应用不了"
-    );
-    assert!(!swap_blocked_by_no_interrupt(SwapInterrupt::Allowed, false));
-}
-
-/// 🟡 **调用点守卫：不断流判定必须夹在「读 `was_running`」与「`proxy.stop()`」之间。**
-///
-/// 判定放在别处（比如只留在调度器里）就会重新撑开 TOCTOU 窗口：从调度器判 `running == false`
-/// 到这里真 stop，中间隔着读簿记 + 读几十 MB 暂存核 + sha 复核，用户点一下连接就断流了。
-///
-/// **变异探针**：删掉 `swap_blocked_by_no_interrupt(` / 把它挪到 `proxy.stop()` 之后 /
-/// 在判定与 stop 之间插入一个 `.await` ⇒ 逐条转红。
-#[test]
-fn no_interrupt_check_precedes_any_proxy_stop() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn swap_core_with_restart(");
-    let read_at = body
-        .find("proxy.status().running")
-        .expect("锚点消失：守卫已失去判据");
-    let gate_at = body
-        .find("swap_blocked_by_no_interrupt(")
-        .expect("不断流硬不变量的校验被删了 —— 自动换核会在用户未同意时停掉正在跑的代理");
-    // 找 `proxy.stop().await`（带 await）而非裸 `proxy.stop()`：后者在本函数的注释里也出现。
-    let stop_at = body
-        .find("proxy.stop().await")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-        read_at < gate_at && gate_at < stop_at,
-        "顺序必须是 读 was_running → 判定 → stop（实得 {read_at} / {gate_at} / {stop_at}）"
-    );
-    // 判定与 stop 之间不得有 await：有的话 `was_running` 就又是一张过期快照了。
-    assert!(
-        !body[gate_at..stop_at].contains(".await"),
-        "判定与 proxy.stop() 之间出现了 await —— TOCTOU 窗口被重新撑开"
+fn core_version_info_reports_probe_bundled_and_patch_set() {
+    let tree = "208f43bb64c3be80ffb10228a426186a7c2cba58";
+    assert_eq!(
+        core_version_info(
+            "sing-box version 1.15.0-alpha.8.polaris.4",
+            "1.15.0-alpha.8.polaris.4",
+            Some(tree),
+        ),
+        json!({
+            "packagedVersion": "1.15.0-alpha.8.polaris.4",
+            "bundledVersion": "1.15.0-alpha.8.polaris.4",
+            "patchSet": tree,
+        })
     );
 }
 
-/// 🟡 **不变量：空核绝不落位（落位 0 字节的核 = 直接 brick，起核必失败）。**
+/// 读不到随包内核版本时那一格是空串，**不**拿清单声明的版本顶上；补丁集缺席是 `null`。
 ///
-/// 三条读字节的腿都必须在把字节交给 `swap_core_with_restart` 之前拒绝空文件。
-///
-/// **为什么这道门长在这里**：此前这条不变量的唯一书面证据是
-/// `core_swap::install_core_from_file` 的单测 —— 而那个函数**没有任何生产调用点**
-/// （2026-08-09 全仓反查：定义 + 它自己两条单测，无第三处）。删它时若顺手把测试一并删掉，
-/// 不变量就一处都不剩了；故把门搬到**活路径**上。删函数不该连带删掉它守着的东西。
-///
-/// 顺带补齐：回滚腿此前**没有**这道校验（`.bak` 由非空字节产出，空只会来自外部截断），
-/// 而后果与另两条腿完全相同。
-///
-/// **变异探针**：任一腿的 `Ok(b) if !b.is_empty()` 退回 `Ok(b)` ⇒ 该腿转红。
+/// **变异探针**：把 `core_get_version_info` 的取材换成 `read_core_version()`（探测失败回落
+/// 配套版本）⇒ 下面那条调用点守卫转红。
 #[test]
-fn empty_core_bytes_never_reach_the_swap() {
-    for leg in [
-        "pub async fn core_replace_manual(",
-        "pub async fn core_reset_factory(",
-        "pub async fn core_rollback(",
-    ] {
-        let body = crate::commands::guard_scan::top_level_fn_body(src(), leg);
-        let guard_at = body.find("Ok(b) if !b.is_empty()").unwrap_or_else(|| {
-            panic!("{leg} 少了空文件校验 —— 0 字节的核会被落位，起核必失败且旧核已被覆盖")
-        });
-        let swap_at = body
-            .find("swap_core_with_restart(")
-            .unwrap_or_else(|| panic!("{leg} 锚点消失：守卫已失去判据"));
-        assert!(
-            guard_at < swap_at,
-            "{leg} 的空文件校验必须早于落位（实得 校验={guard_at} / 落位={swap_at}）"
-        );
-    }
-}
+fn core_version_info_never_substitutes_the_bundled_version_for_a_failed_probe() {
+    let info = core_version_info("", "1.15.0-alpha.8.polaris.4", None);
+    assert_eq!(info["packagedVersion"], "");
+    assert_eq!(info["bundledVersion"], "1.15.0-alpha.8.polaris.4");
+    assert_eq!(info["patchSet"], Value::Null);
 
-/// 🟡 **调用点守卫：wire 契约对拍必须在换核路径上、且早于停核与落盘。**
-///
-/// `verdict_for_core_bytes` 的单测测的是**判据本身**；判据再对，不被调用就什么也守不到 ——
-/// 而这条路径（在线换核 / 用户自带 fork）恰恰是 `build.rs` 那道 release 硬门够不着的一格
-/// （它只看 `resources/*/sing-box` 四条路径）。故此处立源码级守卫。
-///
-/// 顺序判据不是形式主义：拦在 `proxy.stop()` 之前 ⇒ 拒绝时用户的代理毫发无损；
-/// 拦在 `install_core_bytes(` 之前 ⇒ 不会先把一份注定要拒的核落到盘上。
-///
-/// **变异探针**：删掉调用 / 把它挪到 `proxy.stop().await` 之后 / 挪到 `install_core_bytes(`
-/// 之后 ⇒ 逐条转红。
-#[test]
-fn wire_contract_check_precedes_stop_and_install() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn swap_core_with_restart(");
-    let check_at = body
-        .find("verdict_for_core_bytes(core_bytes)")
-        .expect("换核路径没有对拍 wire 契约 —— 非随包核的字段号漂移会让管理 API 整条流静默死掉");
-    let stop_at = body
-        .find("proxy.stop().await")
-        .expect("锚点消失：守卫已失去判据");
-    let install_at = body
-        .find("install_core_bytes(")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-        check_at < stop_at && check_at < install_at,
-        "对拍必须早于停核与落盘（实得 对拍={check_at} / stop={stop_at} / 落盘={install_at}）"
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate::test_support::crate_code("commands/updater/core_info.rs"),
+        "pub async fn core_get_version_info(",
     );
-    // 只有 Mismatch 一档拦。判据不能只查「两个分支名在不在」—— 那样把 Unobservable 分支体
-    // 改成 return 也照样绿（写第一版时正是这个形态，变异编译不过才暴露出来）。
-    // 故直接查 **Unobservable 分支体里不得有 return**。
-    let unobs_at = body
-        .find("WireVerdict::Unobservable(")
-        .expect("Unobservable 分支没了 —— 取不到判据时会走进拒绝档");
-    let mismatch_at = body
-        .find("WireVerdict::Mismatch(")
-        .expect("Mismatch 分支没了 —— 真正该拦的那一档没人拦");
+    assert!(body.contains("read_core_version_line()"));
     assert!(
-        unobs_at < mismatch_at,
-        "分支顺序变了，下面这段取不准 Unobservable 的分支体"
+        body.contains("spawn_blocking"),
+        "读版本要起子进程，不得回到主线程同步执行"
     );
     assert!(
-        !body[unobs_at..mismatch_at].contains("return"),
-        "Unobservable 分支里出现了 return —— 把「没观测到」当成「观测到有问题」，\
-             一次读失败就会剥夺用户装自己那份核的能力"
-    );
-    // 回滚必须豁免：`core_rollback` 走的是同一条编排，在这里拦住等于把用户困在坏核上
-    // （回滚的触发场景恰恰是「新核不可用」）。
-    let exempt_at = body
-        .find("SwapSource::Rollback")
-        .expect("回滚豁免没了 —— 备份核若对不上号，用户将无路可退");
-    assert!(
-        exempt_at < check_at,
-        "回滚豁免必须在对拍之前生效（实得 豁免={exempt_at} / 对拍={check_at}）"
-    );
-}
-
-/// 🟡 **调用点守卫：换核成功后必须挂上稳定观察窗，且挂在起核之后。**
-///
-/// 观察窗是 上游 `armPendingValidation` + `startStabilityWatch` 的对等物，补的是同步验证闩
-/// 看不见的那一类失败：新核**起得来**、几十秒后才崩。删掉 `arm_core_validation(` 这一行，
-/// 全仓没有任何其它测试会红 —— 判据（`core_validation`）的单测测的是判据本身，
-/// 而这条腿一旦不被调用，判据再对也不会被执行到。故此处立源码级守卫。
-///
-/// **变异探针**：删掉 `arm_core_validation(` / 把它挪到 `proxy.start(` 之前 /
-/// 去掉 `swap.backed_up` 前置 ⇒ 逐条转红。
-#[test]
-fn stability_watch_is_armed_after_a_successful_restart() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn swap_core_with_restart(");
-    let arm_at = body.find("arm_core_validation(").expect(
-        "换核后的稳定观察窗没被挂上 —— 新核「起得来、几十秒后崩」将无人回滚，\
-             备份原样躺在盘上，用户得自己发现并手动回滚",
-    );
-    // 起核在前：没起过核就没有「首次运行」可观察。
-    let start_at = body.find("proxy.start(").expect("锚点消失：守卫已失去判据");
-    assert!(
-        start_at < arm_at,
-        "观察窗必须挂在起核之后（实得 start={start_at} / arm={arm_at}）"
-    );
-    // 两个前置条件必须与 arm 同处一个判定：漏掉 backed_up 会在无备份时白挂一个
-    // 「观察到失败也回滚不了」的窗口，且窗口内抑制了自愈重启 = 纯的负收益。
-    let gate = &body[..arm_at];
-    let cond_at = gate
-        .rfind("if was_running && swap.backed_up")
-        .expect("观察窗的前置条件（was_running + backed_up）被改了或删了");
-    let between = gate[cond_at..].lines().count();
-    assert!(
-        between <= 3,
-        "前置条件与 arm 调用之间隔了 {between} 行 —— 守卫已无法确认二者仍是同一个判定"
-    );
-}
-
-/// 🟡 **调用点守卫：簿记回写必须接在验证闩之后，且喂的是「探测失败返空」那个读法。**
-///
-/// 纯逻辑由 `core_swap::marker_rewrite_line` 的真值表锁；这里锁**接线**——
-/// 逻辑再对，没人调它就等于没修。三条各锁一个真实退化：
-///  1. 回写整段被删 ⇒ 空簿记原样回归 ⇒ 从设置页更新过内核的机器被永久钉住（静默）。
-///  2. 回写挪到验证闩**之前** ⇒ 闩内失败会 `rollback_core` 把盘上换回旧核，而此刻已按
-///     「新核」的实读写过簿记 ⇒ 簿记记的是新版本、盘上是旧核，判据与实况反向。
-///  3. 喂 `read_core_version()` 而非 `read_core_version_line()` ⇒ 探测失败时它**回落随包
-///     基线**，于是「读不出版本」被伪装成「版本就是基线」写进簿记 ⇒ 后续升级判同版不播种。
-///
-/// **变异探针**：删 `rewrite_marker_from_probe(` / 把它挪到 `if let Some(c) = config` 之前 /
-/// 把 `read_core_version_line()` 改成 `read_core_version()` ⇒ 逐条转红。
-#[test]
-fn marker_rewrite_is_wired_after_verify_latch_with_nonfallback_read() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn swap_core_with_restart(");
-    let latch_at = body
-        .find("proxy.start(c.clone()).await")
-        .expect("锚点消失：守卫已失去判据（验证闩变形了）");
-    let rewrite_at = body.find("rewrite_marker_from_probe(").expect(
-        "换核后的簿记回写被删了 —— 声明值为空的两条主路径（core_update_run 前端传 \
-             downloadUrl / core_rollback 传 \"\"）会写空簿记，这个核从此不再被随包基线重播种",
-    );
-    assert!(
-        latch_at < rewrite_at,
-        "簿记回写必须在验证闩之后（实得 latch={latch_at} / rewrite={rewrite_at}）：\
-             闩内失败会回滚成旧核，闩前回写会把新核版本写到旧核的簿记上"
-    );
-    // 取材必须是「探测失败返空串」那个读法。`read_core_version(` 是 `read_core_version_line(`
-    // 的前缀，故先把带 `_line` 的出现全部剔掉再找裸的，避免自己骗自己。
-    let probe_seg = &body[..rewrite_at];
-    assert!(
-        probe_seg.contains("read_core_version_line()"),
-        "簿记回写的取材必须是 read_core_version_line()（探测失败返空串）"
-    );
-    assert!(
-        !probe_seg
+        !body
             .replace("read_core_version_line()", "")
             .contains("read_core_version()"),
-        "回写取材段出现了 read_core_version() —— 它探测失败会回落随包基线，\
-             把「读不到」写成「就是基线」"
+        "内核信息卡的随包内核自报版本取自会回落清单声明版本的读法 —— 读不到会被显示成「就是清单声明的版本」"
     );
-}
-
-/// 🟡 **调用点守卫：自动落位入口必须传 `Forbidden`，手动入口必须传 `Allowed`。**
-#[test]
-fn auto_entry_forbids_interruption_manual_entry_allows_it() {
-    let auto = crate::commands::guard_scan::top_level_fn_body(
-        src(),
-        "pub(crate) async fn core_update_apply_staged_auto(",
-    );
-    assert!(
-        auto.contains("SwapInterrupt::Forbidden"),
-        "自动落位入口必须是「绝不断流」档"
-    );
-    let manual = crate::commands::guard_scan::top_level_fn_body(
-        src(),
-        "pub async fn core_update_apply_staged(",
-    );
-    assert!(
-        manual.contains("SwapInterrupt::Allowed"),
-        "用户点「立即应用」必须允许停/起核，否则该按钮永远无效"
-    );
-}
-
-/// 🟡 **调用点守卫：`deferred` 绝不清 staged。**
-///
-/// `deferred` 的信封是 `success: true`（它是一次合法的「本轮不落位」，不是错误），
-/// 落在 `resp.success` 那条分支上就会把一个字节都没换的轮次当成功、把已下好的核删掉。
-///
-/// **变异探针**：删掉 `swap_result_code(&resp) == Some("deferred")` 那段早退 /
-/// 把它挪到 `if resp.success` 之后 ⇒ 转红。
-#[test]
-fn deferred_outcome_never_clears_staged() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn apply_staged_inner(");
-    let deferred_at = body
-        .find(r#"swap_result_code(&resp) == Some("deferred")"#)
-        .expect("deferred 分支被删了 —— 自动路径被拦下时会把已下好的 staged 核误删");
-    let success_at = body
-        .find("if resp.success {")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(
-        deferred_at < success_at,
-        "deferred 早退必须在 `resp.success` 分支**之前**（deferred 的信封正是 success:true）"
-    );
-}
-
-// ── 暂存核完整性复核（L9）────────────────────────────────────────────────
-
-#[test]
-fn check_staged_integrity_truth_table() {
-    let core = b"fake-sing-box";
-    let good = polaris_updater::verify::sha256_hex(core);
-    assert_eq!(
-        check_staged_integrity(core, Some(&good)),
-        StagedIntegrity::Ok
-    );
-    // 大小写不敏感（verify_bytes 的既有语义）。
-    assert_eq!(
-        check_staged_integrity(core, Some(&good.to_uppercase())),
-        StagedIntegrity::Ok
-    );
-    // 字节被改（位腐 / 篡改）→ 必须拦。
-    assert_eq!(
-        check_staged_integrity(b"tampered", Some(&good)),
-        StagedIntegrity::Mismatch
-    );
-    // 旁挂文件本身坏了（非法 hex）→ 同目录的核不可信 → 也拦。
-    assert_eq!(
-        check_staged_integrity(core, Some("not-a-hash")),
-        StagedIntegrity::Mismatch
-    );
-    // 无记录 / 空记录（旧版本 App 暂存的核、或旁挂文件写了一半）→ 放行，不倒退。
-    assert_eq!(
-        check_staged_integrity(core, None),
-        StagedIntegrity::Unrecorded
-    );
-    assert_eq!(
-        check_staged_integrity(core, Some("  \n")),
-        StagedIntegrity::Unrecorded
-    );
-}
-
-/// 旁挂文件必须与被校验的核**同目录**（`stage` 重建目录时一起被清掉 ⇒ 不会错配）。
-#[test]
-fn staged_sha_sidecar_sits_next_to_the_core() {
-    let dir = std::path::Path::new("/some/core-staged");
-    let p = staged_core_sha_path(dir);
-    assert_eq!(p.parent(), Some(dir), "摘要必须与核同目录");
-    assert_eq!(
-        p.file_name().unwrap().to_string_lossy(),
-        format!("{}.sha256", core_paths::core_filename())
-    );
-}
-
-/// 🟡 **调用点守卫：完整性复核必须发生在换核之前。**
-#[test]
-fn staged_integrity_is_checked_before_the_swap() {
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(src(), "async fn apply_staged_inner(");
-    let check_at = body.find("check_staged_integrity(").expect(
-        "暂存核完整性复核被删了 —— 位腐/篡改的核会被原样换入（起核闩拦不住「起得来但行为坏」）",
-    );
-    let swap_at = body
-        .find("swap_core_with_restart(")
-        .expect("锚点消失：守卫已失去判据");
-    assert!(check_at < swap_at, "复核必须在换核**之前**");
 }
 
 // ── 下载单飞（H2）───────────────────────────────────────────────────────
@@ -1145,33 +861,23 @@ fn the_partial_tmp_is_owned_by_an_raii_guard_not_by_counted_cleanup_calls() {
 /// 按**计数**锁而不是逐条锁：新增任何一条失败早退却忘了配一发 error 事件，
 /// 两个计数立刻对不上 ⇒ 转红。
 ///
-/// # 计数用**前缀** `ApiResponse::err`（2026-08-16 订正）
+/// # 计数用**前缀** `ApiResponse::err`
 ///
-/// 前身数的是 `ApiResponse::err(` —— 它**不匹配** `ApiResponse::err_with_code(`（`err` 后面是
-/// `_` 不是 `(`），于是新增一条带 code 的早退时守卫全盲。改成前缀后，代价是
-/// BackendUnavailable 那条分支（一个 `match` 里两个 `ApiResponse::err*` **共用同一发**
-/// error 事件）会被多数一次；把它作为**具名常数**扣掉，而不是把 `err_with_code` 排除在
-/// 计数之外 —— 后者等于把射程重新缩回去。
+/// 数 `ApiResponse::err(` 会**漏掉** `ApiResponse::err_with_code(`（`err` 后面是 `_` 不是 `(`），
+/// 新增一条带 code 的早退时守卫全盲；故按前缀数。今天函数体内没有「一条早退里两个信封共用
+/// 一发 error 事件」的分支，两个计数须**逐一相等**。
 #[test]
 fn every_failure_path_emits_an_error_progress_event() {
-    /// 「一条早退里出现两个 `ApiResponse::err*`、但只发一发 error 事件」的已知分支数。
-    /// U1 起为 0：`BackendUnavailable` 分支改为自带一发 emit（与信封配对），其余早退
-    /// 全部经 `fail` 闭包（emit + 信封在同一函数体内，结构性配对）。
-    const SHARED_ERR_BRANCHES: usize = 0;
-
     let body =
         crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_download(");
     let errors = body.matches("ApiResponse::err").count();
     let emits = body.matches("emit(ProgressStage::Failed(").count();
     assert!(errors > 0, "锚点消失：守卫已失去判据");
     assert_eq!(
-        errors,
-        emits + SHARED_ERR_BRANCHES,
-        "失败信封 {errors} 处、error 进度事件 {emits} 发（另计 {SHARED_ERR_BRANCHES} 处共用分支）\
-             —— 对不上的那条会让弹窗永远转圈"
+        errors, emits,
+        "失败信封 {errors} 处、error 进度事件 {emits} 发 —— 对不上的那条会让弹窗永远转圈"
     );
-    // U1 后带 code 的信封是**常态**（fail 闭包 + Backend 分支各一），不再逐个数；
-    // 配对改由结构保证：fail 闭包体内必须 emit 与 err_with_code 同体。
+    // 配对由结构保证：全部早退经 fail 闭包，其体内 emit 与 err_with_code 同体。
     assert!(
         body.contains("let fail = |e: UpdateErr<'_>|"),
         "fail 统一出口被改形 —— 它体内 emit+信封的配对是本守卫的前提"
@@ -2245,55 +1951,6 @@ fn recheck_failures_settle_the_popup_without_broadcasting() {
     );
 }
 
-// ── 解归档工作目录（M7）─────────────────────────────────────────────────
-
-/// 🟡 **变异锁：并发的解归档腿必须各占各的工作目录，且退出即自清。**
-///
-/// 固定名 `core-staged/extract` 时，调度器的自动下载腿与用户点的 `core_update_run` 会互相
-/// `rm -rf` / 覆盖，一方可能读到**对方**的核字节并以自己的版本号 stage/换入。
-///
-/// **变异探针**：把 [`ExtractWorkDir::create`] 的唯一后缀去掉 ⇒ 「路径互不相同」转红；
-/// 删掉 `Drop` 实现 ⇒ 「退出即自清」转红。
-#[test]
-fn extract_work_dirs_are_unique_and_self_cleaning() {
-    let base = scratch("extract");
-    let paths: Vec<std::path::PathBuf> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let base = base.clone();
-                s.spawn(move || {
-                    let w = ExtractWorkDir::create(&base).unwrap();
-                    let p = w.path().to_path_buf();
-                    // 还持着守卫时目录必须存在（并发的另一条腿不得把它删掉）。
-                    assert!(p.is_dir(), "工作目录被别人删了：{}", p.display());
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    assert!(p.is_dir(), "并发期间工作目录被 rm 掉了：{}", p.display());
-                    p
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let unique: std::collections::HashSet<_> = paths.iter().collect();
-    assert_eq!(
-        unique.len(),
-        paths.len(),
-        "并发的解归档腿拿到了同一个工作目录"
-    );
-    for p in &paths {
-        assert!(!p.exists(), "守卫 drop 后必须清掉工作目录：{}", p.display());
-        assert_eq!(
-            p.parent(),
-            Some(core_paths::staged_dir_in(&base).as_path()),
-            "工作目录必须落在 core-staged 下（不污染现役核目录）"
-        );
-    }
-    std::fs::remove_dir_all(&base).unwrap();
-}
-
-/// 便携形态判定：**有标记 = loose，无标记 = installed**。
-///
 /// 这条是修复的另一半。修好选包器却让本函数恒返回 `false`（旧实现读的
 /// `PORTABLE_EXECUTABLE_DIR` 在本仓恒不存在），便携用户照样被推安装器 ——
 /// 变异探针：把判据改回任何一个 env 读取 ⇒ 「有标记」那条转红。
@@ -2486,60 +2143,6 @@ fn popup_only_follows_progress_it_was_put_into_by_the_user() {
     assert!(should_mirror_to_popup(PopupPhase::Progress));
 }
 
-// ── 请求级总超时 ─────────────────────────────────────────────────────────
-
-/// 🟡 **总超时必须严格小于「逐跳超时 × 最大跳数」，否则它不是兜底而是装饰。**
-///
-/// `safe_redirect_fetch` 最多跟 5 跳（`max_redirects: Some(5)`），逐跳 15s ⇒ 最坏 90s。
-/// 契约要求 20s 整体兜底。**变异探针**：把总超时调到 ≥ 90s ⇒ 本条转红。
-#[test]
-fn core_check_total_timeout_actually_caps_multi_hop_worst_case() {
-    const MAX_HOPS: u64 = 5 + 1; // 5 次重定向 + 最终一跳
-    assert_eq!(CORE_CHECK_TOTAL_TIMEOUT_MS, 20_000, "契约要求 20s");
-    // 读进局部再断言：clippy 的 assertions-on-constants 不许直接比较两个常量，
-    // 但这两个值本来就是**编译期契约**，比的就是它们。
-    let (total, per_hop) = (CORE_CHECK_TOTAL_TIMEOUT_MS, GITHUB_FETCH_TIMEOUT_MS);
-    assert!(
-        total < per_hop * MAX_HOPS,
-        "总超时 {total}ms 没有比逐跳叠加的最坏值 {}ms 更紧 —— 它就没在兜任何底",
-        per_hop * MAX_HOPS
-    );
-    // 超时码必须与其它失败码可区分（处置不同：超时该引导配加速，网络失败该重试）。
-    for other in [
-        CODE_HTTP_UNAVAILABLE,
-        CODE_NO_BACKUP,
-        CODE_FORK_BLOCKED,
-        CODE_CORE_DIR_UNAVAILABLE,
-    ] {
-        assert_ne!(CODE_CHECK_TIMEOUT, other);
-    }
-}
-
-/// 🟡 **调用点守卫**：`core_update_check` 必须被总超时包着。
-///
-/// 纯单测测不到（命令持 `State<'_, AppRuntime>`，且真超时要 20s 挂钟）。
-/// **变异探针**：把 `tokio::time::timeout(...)` 从命令体里删掉 ⇒ 本条转红。
-#[test]
-fn core_update_check_is_wrapped_in_a_total_timeout() {
-    let core_update_rs = crate_code("commands/updater/core_update.rs");
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &core_update_rs,
-        "pub async fn core_update_check(",
-    );
-    assert!(
-        body.contains("tokio::time::timeout"),
-        "总超时被摘掉了 —— 逐跳 15s × 6 跳可跑到 90s，契约要求 20s 兜底"
-    );
-    assert!(
-        body.contains("CORE_CHECK_TOTAL_TIMEOUT_MS"),
-        "超时时长必须取自具名常量（写死字面量会与常量/测试漂移）"
-    );
-    assert!(
-        body.contains("CODE_CHECK_TIMEOUT"),
-        "超时必须返回可辨识错误码，不得折叠进泛化网络失败"
-    );
-}
-
 // ── W8：「跳过此版本」存的与比的必须同口径 ─────────────────────────────
 
 /// 🟡 **存储口径本体 = trim + strip_v，与比较侧同形。**
@@ -2604,12 +2207,12 @@ fn skipped_version_write_points_all_go_through_the_normalizer() {
     ] {
         collect_skip_writes(std::path::Path::new(&root), &root, &mut writes);
     }
-    // 今天的构成：生产 2（update_skip / PopupAction::Skip）+ 测试与 doc 示例 10
-    // （本文件 8、runtime/updater.rs 测试 2）。任何**新增**命中——生产第三写点、新测试写
+    // 今天的构成：生产 2（update_skip / PopupAction::Skip）+ 测试与 doc 示例 11
+    // （本文件 8、runtime/updater.rs 测试 3）。任何**新增**命中——生产第三写点、新测试写
     // state、doc 示例串——都先红：红了就过目定性，属生产写点必须过 stored_skip_version
     // 并两处体内断言，其余 bump 常量登记。（常量自己就咬过一次：helper 头注里的示例串
     // 让首版钉 11 立刻红，正是「全响无哑」的实证。）
-    const PINNED_TOTAL: usize = 12;
+    const PINNED_TOTAL: usize = 13;
     let total: usize = writes.iter().map(|(_, n)| n).sum();
     let locations = writes
         .iter()
@@ -2722,12 +2325,14 @@ fn update_install_delegates_detached_spawn_to_completion_helper() {
         crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
     let prepare = body.find("prepare_desktop_exit(&app).await").unwrap();
     let spawn = body
-        .find("let detached_spawn = update_install::spawn_detached_script(&dir, &spec);")
+        .find("update_install::spawn_detached_script(&dir, spec).map(|_| ())")
         .unwrap();
     let complete = body
-        .find("complete_detached_install(detached_spawn, || {")
+        .find("complete_detached_install(delivered, || {")
         .unwrap();
     assert!(prepare < spawn && spawn < complete);
+    assert_eq!(body.matches("prepare_desktop_exit(").count(), 1);
+    assert_eq!(body.matches("spawn_detached_script(").count(), 1);
     assert_eq!(body.matches("complete_detached_install(").count(), 1);
     assert!(body[complete..].contains("commit_desktop_exit("));
     assert!(!body.contains("app.state::<QuitState>()") && !body.contains("app.exit(0)"));
@@ -2948,7 +2553,7 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
         .find("crate::exit_lifecycle::prepare_desktop_exit(&app).await")
         .expect("严格退出准备门不见了 —— 本条次序判据失去了它要比的另一端");
     let script = body
-        .find("update_install::build_install_script(&plan, &texts)")
+        .find("update_install::build_install_script(&plan)")
         .expect("建脚本那一步不见了 —— 本条次序判据失去了它要比的另一端");
 
     assert!(
@@ -2963,7 +2568,7 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
 
     // 早退必须是真的早退（`return`），不是算完一个值又往下走。
     let detach = body
-        .find("update_install::spawn_detached_script(&dir, &spec)")
+        .find("update_install::spawn_detached_script(&dir, spec)")
         .expect("安装器启动不见了");
     assert!(prepare < detach, "安装器必须等待严格退出准备成功");
     let branch = &body[android..prepare];
@@ -3000,23 +2605,246 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
     );
 }
 
+// ── Windows 便携版：停核先于交付，交付成功才退出 ─────────────────────────────
+
+fn portable_plan() -> crate::runtime::update_install::InstallPlan {
+    // 反斜杠样本：计划决策对路径只做字符串运算，故本条在任何宿主上给出同一个答案。
+    let exe = std::path::Path::new("D:\\Tools\\Polaris\\polaris.exe");
+    crate::runtime::update_install::decide_install_plan(
+        "windows",
+        crate::runtime::update_install::RunForm::Loose,
+        std::path::Path::new("C:\\Cache\\updates\\Polaris_1.2.3_x64-win-Portable.zip"),
+        exe,
+        None,
+        Some(exe),
+    )
+    .expect("便携运行形态 + 便携压缩包必须有计划")
+}
+
+/// 便携腿的「先告知」回包带着程序所在目录；别的腿不带这个键。
+///
+/// 前端拿不到程序目录，而那条告知要把「覆盖到哪个文件夹」写给用户看 —— 少了这个键，
+/// 说明里那一处就是空的。
+#[test]
+fn confirm_request_carries_the_program_dir_only_for_the_portable_leg() {
+    let plan = portable_plan();
+    let advisory =
+        crate::runtime::update_install::install_advisory(&plan).expect("便携腿必须先告知");
+    assert_eq!(
+        confirm_request(&plan, advisory),
+        json!({
+            "ok": false,
+            "needConfirm": true,
+            "advisory": "portableManualReplace",
+            "programDir": "D:\\Tools\\Polaris",
+        })
+    );
+
+    let setup = crate::runtime::update_install::decide_install_plan(
+        "windows",
+        crate::runtime::update_install::RunForm::Installed,
+        std::path::Path::new("C:\\Cache\\updates\\polaris-1.2.3-win-setup.exe"),
+        std::path::Path::new("C:\\Apps\\Polaris\\polaris.exe"),
+        None,
+        None,
+    )
+    .unwrap();
+    let advisory = crate::runtime::update_install::install_advisory(&setup).unwrap();
+    assert_eq!(
+        confirm_request(&setup, advisory),
+        json!({ "ok": false, "needConfirm": true, "advisory": "windowsSmartScreen" })
+    );
+}
+
+/// 🔴 **便携腿：内核必须先停，压缩包与程序目录才许打开；打开成功才许退出。**
+///
+/// 内核直接从程序目录运行并占用自己的映像文件。窗口一打开用户就可能开始覆盖解压 —— 那一刻
+/// 内核若还在跑，被占用的文件会被跳过，目录里就是新旧混装。故次序是
+/// 「告知 → 退出准备门（停核）→ 打开 → 提交退出」，这里按调用点位置钉住。
+///
+/// 控制流位置在单测里构造不出两端（`AppHandle` / `State`），故扫源码，理由同
+/// `update_install_delegates_detached_spawn_to_completion_helper`。
+///
+/// 变异：把 `open_portable_update(` 那次调用挪到 `prepare_desktop_exit` 之前 ⇒ 本条红。
+#[test]
+fn update_install_stops_the_core_before_opening_the_portable_archive() {
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
+
+    let confirm = body
+        .find("return Ok(ApiResponse::ok(confirm_request(&plan, advisory)));")
+        .expect("未确认即早退那一步不见了");
+    let prepare = body
+        .find("crate::exit_lifecycle::prepare_desktop_exit(&app).await")
+        .expect("严格退出准备门不见了");
+    let open = body
+        .find("open_portable_update(&app, &installer, program_dir)")
+        .expect("便携腿的交付调用不见了");
+    let complete = body
+        .find("complete_detached_install(delivered, || {")
+        .expect("交付后的提交点不见了");
+    let commit = body
+        .find("crate::exit_lifecycle::commit_desktop_exit(")
+        .expect("退出提交不见了");
+
+    assert!(
+        confirm < prepare,
+        "未确认时不许碰内核：用户不继续即真 no-op"
+    );
+    assert!(
+        prepare < open,
+        "停核必须先于打开压缩包与程序目录 —— 反过来用户会在内核仍占用文件时开始覆盖"
+    );
+    assert!(
+        open < complete && complete < commit,
+        "打开成功才许提交退出：打不开就退出，用户连该覆盖到哪都看不到"
+    );
+    assert_eq!(
+        body.matches("open_portable_update(").count(),
+        1,
+        "便携交付只许有这一个调用点（多出来的那个不受上面的次序约束）"
+    );
+    // 准备门失败必须整条 return，不许落下去照样打开；且带着「需重启应用」的码
+    // （准备门一进去起核准入就永久关上了，见 `INSTALL_RESTART_REQUIRED`）。
+    let gate = &body[prepare..open];
+    assert!(
+        gate.contains("Err(error) =>") && gate.contains("return Ok(ApiResponse::err_with_code("),
+        "退出准备失败时必须早退，不能带着还在运行的内核继续交付"
+    );
+    assert!(
+        gate.contains("INSTALL_RESTART_REQUIRED"),
+        "退出准备失败的回包必须带「需重启应用」的码"
+    );
+    // 准备门之后的每一个失败出口都带这个码：门后没有无码的 `ApiResponse::err(`。
+    let after_gate = &body[prepare..];
+    assert!(
+        !after_gate.contains("ApiResponse::err("),
+        "准备门之后出现了无码错误：渲染端分不出它与「下载中断」"
+    );
+    assert_eq!(
+        after_gate.matches("INSTALL_RESTART_REQUIRED").count(),
+        2,
+        "准备失败、交付或提交失败，两个出口各带一次"
+    );
+    // 两个位置在打开之后、提交退出之前留底（日志 + 更新状态文件）。
+    let remember = body
+        .find("remember_portable_update(&app, &state, &installer, program_dir)")
+        .expect("便携腿退出前没有留下压缩包位置与程序目录");
+    assert!(
+        open < remember && remember < commit,
+        "留底必须在交付之后、提交退出之前：早了记的是一次没发生的交付，晚了进程已经没了"
+    );
+
+    // 函数体里别的 `.open(` 只剩形态错配那条回退（在出计划之前、与本腿无关）。
+    // 多出一处就是一条绕开准备门的打开。
+    let opens: Vec<usize> = body.match_indices(".open(").map(|(i, _)| i).collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "update_install 体内的 `.open(` 应只有形态错配回退那一处"
+    );
+    let reject = body.find("Err(reject) => {").expect("形态错配回退不见了");
+    let advisory = body
+        .find("update_install::install_advisory(&plan)")
+        .expect("安装前告知判定不见了");
+    assert!(reject < opens[0] && opens[0] < advisory);
+    // 那一处打开受 `hands_to_system` 把守：便携形态拿到安装程序时不交系统（交出去就是运行它）。
+    let guard = body[reject..opens[0]]
+        .find("if reject.hands_to_system() {")
+        .expect("形态错配回退没有先问 `hands_to_system`");
+    assert!(
+        !body[reject + guard..opens[0]].contains("} else {"),
+        "`.open(` 必须在 `hands_to_system()` 为真的那一支里"
+    );
+
+    // 交付函数本身只做「打开」：两处打开都在，且它不自己停核、不自己退出。
+    let handoff = crate::commands::guard_scan::top_level_fn_body(src(), "fn open_portable_update(");
+    assert_eq!(
+        handoff.matches(".open(").count(),
+        2,
+        "压缩包与程序目录各打开一次"
+    );
+    assert!(handoff.contains("archive.to_string_lossy()"));
+    assert!(handoff.contains("program_dir.to_string_lossy()"));
+    for forbidden in ["prepare_desktop_exit", "commit_desktop_exit", "app.exit("] {
+        assert!(
+            !handoff.contains(forbidden),
+            "交付函数里不该出现 `{forbidden}`"
+        );
+    }
+    // 整个模块里它只被 `update_install` 调用（定义 1 处 + 调用 1 处）。
+    assert_eq!(src().matches("open_portable_update(").count(), 2);
+}
+
+/// 留底函数本身：两个位置都进日志，记录带上当下的应用版本，存不进去不阻断。
+#[test]
+fn portable_update_record_logs_both_locations_and_never_blocks_the_exit() {
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "fn remember_portable_update(");
+    assert!(
+        body.contains("log::info!(")
+            && body.contains("record.archive")
+            && body.contains("record.program_dir"),
+        "压缩包位置与程序目录必须写进日志：{body}"
+    );
+    assert!(body.contains("from_version: app.package_info().version.to_string()"));
+    assert!(body.contains("s.pending_portable_update = Some(record)"));
+    assert!(
+        !body.contains("return Err") && !body.contains('?'),
+        "保存失败只留痕，不让退出停在半路"
+    );
+}
+
+/// 码的字面是跨语言协议：渲染端 `settings-logic.ts` 的 `installFailureKey` 按它取
+/// `settings.update.installRestartRequired`。
+#[test]
+fn install_restart_required_code_is_the_wire_contract() {
+    assert_eq!(INSTALL_RESTART_REQUIRED, "installRestartRequired");
+    let hook = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ui/src/components/screens/settings/settings-logic.ts"),
+    )
+    .expect("读渲染端取文逻辑");
+    assert!(
+        hook.contains("code === 'installRestartRequired'"),
+        "渲染端没有按这个码分支"
+    );
+}
+
+/// 便携腿的交付复用同一个提交闸：打不开 ⇒ 不退出；打开了 ⇒ 恰好提交一次。
+#[test]
+fn portable_handoff_failure_never_commits_the_exit() {
+    let commits = std::cell::Cell::new(0_u32);
+    let failed: Result<(), String> =
+        complete_detached_install(Err("打开程序所在目录失败".to_string()), || {
+            commits.set(commits.get() + 1);
+            Ok(())
+        });
+    assert!(failed.is_err());
+    assert_eq!(commits.get(), 0);
+    let delivered: Result<(), String> = complete_detached_install(Ok(()), || {
+        commits.set(commits.get() + 1);
+        Ok(())
+    });
+    assert_eq!(delivered, Ok(()));
+    assert_eq!(commits.get(), 1);
+}
+
 /// 🔴 **Android 自更新资产：从「如实登记的缺口」变成「接上了，并且被钉住」**（2026-09-13）。
 ///
 /// # 这条断言的历史
 ///
 /// 它上一版叫 `android_has_no_update_asset_selector_yet_and_that_is_registered`，钉的是
 /// 「今天 `AssetPlatform::from_os("android")` 返 `None`」这个事实，并在文档里列了一张
-/// 「谁把它填上，谁要一起做的四件事」的解锁清单。那张清单本批逐条做完了：
+/// 「谁把它填上，谁要一起做的事」的解锁清单。其中与应用更新有关的几条已逐条做完：
 ///
 ///  1. **release 真的出 APK** —— `.github/workflows/android.yml` 的 `release-apk` job
 ///     （签名构建 + 开箱验 + 上传成 release 资产）。⚠️ 它要的四个签名 secret 在仓外，
 ///     且今天没有任何调用方传 `publish_release: true` ⇒ **这条腿还一次都没跑过**。
 ///     这不是「做完了」，是「代码侧接好了、外部前置还欠着」——两者必须分得清。
-///  2. **内核更新那一格答过题** —— `find_suitable_singbox_asset` 的 Android 臂恒 `None`，
-///     且 `core_update_check_inner` 在 Android 上零网络早退（下面 ② 逐条核对）。
-///  3. **`decide_install_plan("android", …, ".apk")`** —— `runtime::update_install::tests::
+///  2. **`decide_install_plan("android", …, ".apk")`** —— `runtime::update_install::tests::
 ///     android_apk_plans_the_system_installer_regardless_of_run_form` 已在。
-///  4. **前端那半** —— `ui/src/ipc/api/updater.ts` 的 `UpdateInstallResult` 现在带
+///  3. **前端那半** —— `ui/src/ipc/api/updater.ts` 的 `UpdateInstallResult` 现在带
 ///     `awaitingSystemInstaller`，`ui/src/mobile/settings/UpdatePage.tsx` 画出了下载→交系统
 ///     安装器那一跳，五个 `REASON_*` 码各有各的文案（判据在
 ///     `ui/src/mobile/settings/app-update-install.test.ts`）。
@@ -3026,8 +2854,8 @@ fn update_install_hands_android_off_before_touching_the_proxy_or_scripts() {
 /// 一条只会在「被填上那天」响一次的断言，填上之后如果只是删掉，等于把这一族的观测面清零 ——
 /// 而这一族恰恰是「改一个字符 ⇒ Android 上永远查不到更新，且一句错都不报」的那种静默故障。
 #[test]
-fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
-    // ① App 资产腿：Android 的 ARMv8 原生包可选；模拟器架构不可回落到 ARM 包。
+fn android_update_assets_are_wired() {
+    // ① App 资产腿：Android 是一个正经变体，ARMv8 原生包可选；模拟器架构不可回落到 ARM 包。
     assert_eq!(
         AssetPlatform::from_os("android"),
         Some(AssetPlatform::Android),
@@ -3060,42 +2888,6 @@ fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
         "x86_64（模拟器）也选出了包 —— 正式发布只含 ARMv8/ARMv7，发过去的必然装不上"
     );
 
-    // ② 内核腿：Android 上**没有可换的内核**，这一条不许随 ① 一起松掉。
-    //
-    // 命令层那道早退是零网络的（`core_update_check_inner` 的 Android 臂），源码级核对；
-    // 纯函数那道是第二闸，行为级核对。两道都在，才没有「新调用方绕过早退」的缝。
-    let core_src = polaris_source_probe::crate_source!("commands/updater/core_update.rs");
-    assert!(
-        core_src.contains("Some(AssetPlatform::Android) | None => {"),
-        "core_update_check_inner 的 Android 早退没了 —— Android 上「检查内核更新」会开始真的\
-         去打 SagerNet 的 releases API，而结果恒为「没有适配资产」"
-    );
-    // SagerNet 确实发 android 构建；本仓一个字节都不消费它。样本里同时放一份 linux/arm64，
-    // 供下面那条正面对照用 —— 只有 android 那一份的话，「Linux 也选不出」会被误读成本条塌了。
-    let singbox = [
-        polaris_updater::github::GithubAsset {
-            name: "sing-box-1.14.0-android-arm64.tar.gz".to_string(),
-            browser_download_url: "https://x/core-android".to_string(),
-            size: 10,
-            digest: None,
-        },
-        polaris_updater::github::GithubAsset {
-            name: "sing-box-1.14.0-linux-arm64.tar.gz".to_string(),
-            browser_download_url: "https://x/core-linux".to_string(),
-            size: 11,
-            digest: None,
-        },
-    ];
-    assert!(
-        polaris_updater::github::find_suitable_singbox_asset(
-            &singbox,
-            AssetPlatform::Android,
-            AssetArch::Arm64
-        )
-        .is_none(),
-        "Android 选出了内核资产 —— 换核那条腿的落点是一个可替换的可执行文件，这个形态下不存在"
-    );
-
     // 正面对照：三个桌面平台仍然认得出来 —— 否则上面那些 `is_none()` 可能只是因为
     // 选包器整个塌了（那时本条拿一个坏掉的判据冒充一条成立的结论）。
     for os in ["windows", "macos", "linux"] {
@@ -3104,13 +2896,4 @@ fn android_update_assets_are_wired_and_the_core_leg_stays_answered() {
             "{os} 也认不出来了 —— from_os 塌了，本条的每一条否定断言都不成立"
         );
     }
-    assert!(
-        polaris_updater::github::find_suitable_singbox_asset(
-            &singbox,
-            AssetPlatform::Linux,
-            AssetArch::Arm64
-        )
-        .is_some(),
-        "对照塌了：这份样本本该能选出 linux/arm64 内核"
-    );
 }

@@ -18,8 +18,7 @@
 //! `ProxyErrorEmitter::emit_mesh_login_fallback` 发，前端 `App.tsx` 订阅 → toast）**
 //! 与 **`EVENT_AUTO_NODE_SWITCHED`（C3 自动换节点，`runtime/proxy::do_switch_io` 经
 //! `ProxyErrorEmitter::emit_auto_node_switched` 发，前端订阅由 W1-ui 批接）**（runtime 层）
-//! 与 **`EVENT_CORE_AUTO_UPDATE_STATUS`（内核自动更新状态，`runtime/core_update_scheduler.rs` 在
-//! 检查完成 / 跨带提示 / 暂存 / 落位四个时刻发）** 与 **`EVENT_HELPER_UPGRADEABLE`
+//! 与 **`EVENT_HELPER_UPGRADEABLE`
 //! （启动 T+7s 探测，`runtime/startup_tasks.rs::spawn_helper_upgradeable_probe` 发）**。
 
 #![forbid(unsafe_code)]
@@ -48,10 +47,10 @@ pub mod channel {
     /// `EVENT_PROXY_STARTED`/`STOPPED` 的发射点在**命令层**（`commands/proxy.rs` 的
     /// proxy_start/stop/restart）—— 后端**自驱**的核起停（去抖重启 /「立即应用」/ drain 排空 /
     /// 崩溃自愈）一个都不发。把它们收口到 runtime 状态跃迁点确实更正确，但代价不可接受：
-    /// `subscription_scheduler` 听 `proxyStarted` 会**真联网**做订阅补更、`core_update_scheduler`
-    /// 听 `proxyStopped` 会排换核 —— 收口后每次内部重启都多跑一遍这两件事。
+    /// `subscription_scheduler` 听 `proxyStarted` 会**真联网**做订阅补更 —— 收口后每次内部重启
+    /// 都多跑一遍。
     ///
-    /// 故新开一条**只给 UI 的**通道：那两条与两个 scheduler 的语义一字不动，本通道由
+    /// 故新开一条**只给 UI 的**通道：那两条与 scheduler 的语义一字不动，本通道由
     /// `runtime/proxy.rs` 在真状态跃迁点发，订阅方仅待应用操作条 + 连接态显示。
     /// **托盘刻意不订阅**（托盘图标语汇另有待拍板项，不捆进来）。
     pub const EVENT_PROXY_LIFECYCLE: &str = "event:proxyLifecycle";
@@ -130,11 +129,6 @@ pub mod channel {
     //  · 唯一发射点 = `tray::tray_show_main` + 原生兜底菜单的「打开设置」项。
     // 想加第二个目标屏 → 必须同时改白名单 + 补 `tray/tests/mod.rs` 的白名单单测，成本落在该落的地方。
     pub const EVENT_TRAY_OPEN_SCREEN: &str = "event:trayOpenScreen";
-
-    // 内核版本 / 自动更新状态
-    pub const EVENT_CORE_VERSION_CHANGED: &str = "event:coreVersionChanged";
-    pub const EVENT_CORE_AUTO_UPDATE_STATUS: &str = "event:coreAutoUpdateStatus";
-    pub const EVENT_CORE_BASELINE_WARNING: &str = "event:coreBaselineWarning";
 
     // helper 可升级
     pub const EVENT_HELPER_UPGRADEABLE: &str = "event:helperUpgradeable";

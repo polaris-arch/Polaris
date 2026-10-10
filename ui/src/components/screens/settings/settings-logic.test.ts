@@ -22,9 +22,7 @@ import {
   isManualInterval,
   ruleResourceAutoStatus,
   subscriptionAutoUpdateStatus,
-  coreBannerState,
   createOnceGate,
-  isPortableZipUpdate,
   showsHardwareAccelRow,
   languageDescKey,
   windowEffectsDescKey,
@@ -38,6 +36,9 @@ import {
   MAX_LISTEN_PORT,
   releaseShipsDigest,
   appDownloadIntegrity,
+  appUpdateErrText,
+  formMismatchKey,
+  installFailureKey,
   progressResetsIntegrity,
   updateCardPatch,
   type ProgressDrivenState,
@@ -219,97 +220,7 @@ describe('ruleResourceAutoStatus —— 开关开 ≠ 真会刷新', () => {
   });
 });
 
-describe('#16 coreBannerState —— 横幅状态机', () => {
-  const NOTICE = { previousVersion: '1.10.0', currentVersion: '1.11.3' };
-
-  it('无 pendingChangeNotice → 不可见、不 ack（当前后端真实状态：换核链路是桩，无生产者）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: false, pendingChangeNotice: null },
-      dismissed: false,
-    });
-    expect(s.visible).toBe(false);
-    expect(s.shouldAck).toBe(false);
-    expect(s.notice).toBeNull();
-  });
-
-  it('versionInfo 为 null（拉取失败）→ 不可见、不 ack', () => {
-    expect(coreBannerState({ versionInfo: null, dismissed: false })).toMatchObject({
-      visible: false,
-      shouldAck: false,
-    });
-  });
-
-  it('有 pendingChangeNotice → 可见 + shouldAck（show→ack，弹一次非每启）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: false, pendingChangeNotice: NOTICE },
-      dismissed: false,
-    });
-    expect(s.visible).toBe(true);
-    expect(s.shouldAck).toBe(true);
-    expect(s.notice).toEqual({ ...NOTICE, hasBackup: false });
-  });
-
-  it('hasBackup=false（后端硬编码值）→ 不显示回滚按钮 + 走 noBackupDesc 文案', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: false, pendingChangeNotice: NOTICE },
-      dismissed: false,
-    });
-    expect(s.showRollback).toBe(false);
-    expect(s.descKey).toBe('noBackupDesc');
-  });
-
-  it('hasBackup=true → 显示回滚按钮 + 走 changedDesc 文案（后端现读真实 .bak 状态）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: true, pendingChangeNotice: NOTICE },
-      dismissed: false,
-    });
-    expect(s.showRollback).toBe(true);
-    expect(s.descKey).toBe('changedDesc');
-  });
-
-  it('手动换核可用——core_replace_manual 已接线（零提权，落位于用户可写核目录）', () => {
-    expect(
-      coreBannerState({
-        versionInfo: { hasBackup: true, pendingChangeNotice: NOTICE },
-        dismissed: false,
-      }).manualReplaceDisabled,
-    ).toBe(false);
-  });
-
-  it('dismissed → 不可见（且不再显示回滚），但 shouldAck 不受影响（ack 的是后端持久态）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: true, pendingChangeNotice: NOTICE },
-      dismissed: true,
-    });
-    expect(s.visible).toBe(false);
-    expect(s.showRollback).toBe(false);
-    expect(s.notice).toBeNull();
-    expect(s.shouldAck).toBe(true);
-  });
-
-  it('事件到达 → 重新可见（组件收事件时复位 dismissed，此处以 dismissed:false 表达）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: false, pendingChangeNotice: null },
-      eventPayload: { ...NOTICE, hasBackup: false },
-      dismissed: false,
-    });
-    expect(s.visible).toBe(true);
-    expect(s.shouldAck).toBe(true);
-    expect(s.notice).toEqual({ ...NOTICE, hasBackup: false });
-  });
-
-  it('事件载荷优先于挂载快照（事件是刚发生的即时推送）', () => {
-    const s = coreBannerState({
-      versionInfo: { hasBackup: false, pendingChangeNotice: NOTICE },
-      eventPayload: { previousVersion: '2.0.0', currentVersion: '2.1.0', hasBackup: true },
-      dismissed: false,
-    });
-    expect(s.notice).toEqual({ previousVersion: '2.0.0', currentVersion: '2.1.0', hasBackup: true });
-    expect(s.showRollback).toBe(true);
-  });
-});
-
-describe('#17 createOnceGate —— 每会话一次去重', () => {
+describe('createOnceGate —— 每会话一次去重', () => {
   it('首次调用放行', () => {
     expect(createOnceGate()()).toBe(true);
   });
@@ -473,107 +384,219 @@ describe('消费面守卫 —— 确认框不得在组件里裸用', () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────────
- * 便携版更新：「已下载，需手动替换」不得被渲染成「更新失败」
+ * 便携版更新：先说明、再由用户按下「退出并打开文件夹」，应用退出后才覆盖
+ *
+ * 后端对便携包回 `{ needConfirm, advisory: 'portableManualReplace', programDir }`（此刻内核未动）；
+ * 用户在 manual 卡上按下按钮后才带 `confirmed` 重调，后端停核 → 打开压缩包与程序目录 → 退出。
+ * 文件名判据住在后端（`runtime/update_install.rs::is_portable_zip_name`，与选包侧同一个常量），
+ * 前端不再另写一份。
  * ──────────────────────────────────────────────────────────────────────────── */
 
-describe('isPortableZipUpdate —— 便携 zip ⇔ 真形态错配的分流判据', () => {
-  it('产出侧口径的便携包判真（Polaris_版本_x64-win-Portable.zip）', () => {
-    expect(isPortableZipUpdate('C:\\Users\\me\\AppData\\Local\\polaris\\updates\\Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
-    // 纯 POSIX 分隔符也要切（开发机/测试注入的路径）。
-    expect(isPortableZipUpdate('/home/me/.cache/polaris/updates/Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
-    // 裸文件名（无目录段）——`split().pop()` 分支。
-    expect(isPortableZipUpdate('Polaris_1.2.3_x64-win-Portable.zip')).toBe(true);
-  });
+const PORTABLE_LOCALES = ['zh-CN', 'en-US', 'zh-TW', 'ru', 'fa'] as const;
 
-  it('其余四种安装件一律判假（它们走 classify_installer，根本到不了本分流）', () => {
-    // 这四个后缀就是 `runtime/update_install.rs::classify_installer` 认得的全集。
-    expect(isPortableZipUpdate('/c/updates/polaris-1.2.3-win-setup.exe')).toBe(false);
-    expect(isPortableZipUpdate('/c/updates/polaris-1.2.3-mac-arm64.dmg')).toBe(false);
-    expect(isPortableZipUpdate('/c/updates/polaris-1.2.3.AppImage')).toBe(false);
-    expect(isPortableZipUpdate('/c/updates/polaris_1.2.3_amd64.deb')).toBe(false);
-  });
-
-  it('别的 zip 判假 —— 判据是前缀+后缀，不是「凡 zip 皆便携」', () => {
-    // 只看 `.zip` 会把这些也说成便携版，然后对用户描述一个不成立的场景。
-    expect(isPortableZipUpdate('/c/updates/polaris-portable-1.2.3.zip')).toBe(false);
-    expect(isPortableZipUpdate('/c/updates/Polaris_1.2.3_x64-win-portable.zip')).toBe(false); // 缺尾部连字符 → 不是产出侧命名
-    expect(isPortableZipUpdate('/c/updates/sing-box-1.9.0-windows-amd64.zip')).toBe(false);
-    expect(isPortableZipUpdate('/c/updates/geosite.zip')).toBe(false);
-    // 前缀对但后缀不对（将来若出别的便携产物形态，也不该套用「解压覆盖」这套说明）。
-    expect(isPortableZipUpdate('/c/updates/polaris-portable-1.2.3.7z')).toBe(false);
-    // 前缀必须在**文件名**上而不是路径中段。
-    expect(isPortableZipUpdate('/c/polaris-portable-cache/geosite.zip')).toBe(false);
-  });
-
-  it('空值/空串判假（尚未下载时不得误判成便携交接）', () => {
-    expect(isPortableZipUpdate(null)).toBe(false);
-    expect(isPortableZipUpdate(undefined)).toBe(false);
-    expect(isPortableZipUpdate('')).toBe(false);
-  });
-});
-
-describe('便携交接文案：消费面 + 内容守卫', () => {
+describe('便携交接：消费面 + 五语文案守卫', () => {
   async function paths() {
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const settingsDir = path.dirname(fileURLToPath(import.meta.url));
-    // settings → screens → components → src → ui → <repo root>
-    const repoRoot = path.resolve(settingsDir, '../../../../..');
+    // settings → screens → components → src
+    const srcRoot = path.resolve(settingsDir, '../../..');
     return {
-      path,
       appUpdateHook: path.join(settingsDir, 'use-app-update.ts'),
-      zhCN: path.join(repoRoot, 'ui/src/i18n/locales/zh-CN.json'),
+      locale: (name: string) => path.join(srcRoot, 'i18n/locales', `${name}.json`),
     };
   }
 
-  it('取材自检：两处源文件都真读到了非空内容', async () => {
+  async function updateTexts(name: string) {
+    const fs = await import('node:fs');
+    const p = await paths();
+    const all = JSON.parse(fs.readFileSync(p.locale(name), 'utf8')) as {
+      settings: { update: Record<string, unknown> };
+    };
+    return all.settings.update;
+  }
+
+  it('取材自检：hook 与五份语言文件都真读到了非空内容', async () => {
     // 没有这条，路径漂走会让下面所有断言在空串上「恰好」通过 = 假绿。
     const fs = await import('node:fs');
     const p = await paths();
-    for (const f of [p.appUpdateHook, p.zhCN]) {
+    for (const f of [p.appUpdateHook, ...PORTABLE_LOCALES.map(p.locale)]) {
       expect(fs.existsSync(f), `取材文件不存在：${f}`).toBe(true);
       expect(fs.readFileSync(f, 'utf8').length).toBeGreaterThan(500);
     }
   });
 
-  it('组件直接消费 isPortableZipUpdate，且便携分支落在 manual 态而非 error 态', async () => {
-    // 纯函数测对了也证明不了组件在用它（node 环境渲染不了组件）——这条钉的是接线本身。
-    const fs = await import('node:fs');
-    const p = await paths();
-    const tsx = fs.readFileSync(p.appUpdateHook, 'utf8');
-    expect(tsx.includes('isPortableZipUpdate'), '组件必须消费该判据，不得并行复刻').toBe(true);
-    // 终态改由 `settleInstall(next, …)` 统一落地（态 + 随行事实同批），故判据从「有没有
-    // `setUs('manual')` 这个字面量」改为「便携那条腿 settle 到的是 manual，且排在形态错配
-    // 那条 error 腿之前」——守的东西一个字没变，只是终态的写法收敛了。
-    const portableAt = tsx.search(/isPortableZipUpdate\(/);
-    const manualAt = tsx.search(/settleInstall\(\s*'manual'/);
-    const mismatchAt = tsx.search(/settleInstall\(\s*'error',\s*t\('settings\.update\.formMismatch'\)/);
-    expect(manualAt, '便携交接必须落 manual 态').toBeGreaterThan(portableAt);
-    expect(mismatchAt, '形态错配那条腿必须仍落 error 态').toBeGreaterThan(manualAt);
-    expect(
-      tsx.includes('settings.update.portableManualReplace'),
-      '便携交接必须走 portableManualReplace 文案',
-    ).toBe(true);
-    // 回退方向：真形态错配仍走原文案 + error 态，两条腿都在。
-    expect(tsx.includes('settings.update.formMismatch')).toBe(true);
+  it('便携告知落 manual 态并带上两个位置，且排在通用确认框之前；形态错配仍落 error 态', async () => {
+    // 纯函数测对了也证明不了组件在用它（node 环境跑不了 hook 的状态迁移）——这条钉的是接线本身。
+    const src = await readTsx();
+    const portableAt = src.indexOf("if (result.advisory === 'portableManualReplace')");
+    const manualAt = src.search(/settleInstall\(\s*'manual'/);
+    const dialogAt = src.indexOf('openDialog({', portableAt);
+    const mismatchAt = src.search(
+      /settleInstall\(\s*'error',\s*t\(formMismatchKey\(result\.handedToSystem\)\)/,
+    );
+    expect(portableAt, '便携告知的分支不见了').toBeGreaterThan(-1);
+    expect(manualAt, '便携告知必须落 manual 态').toBeGreaterThan(portableAt);
+    expect(dialogAt, '便携分支必须先于通用确认框（那一支按 advisory 名取一组本条没有的键）').toBeGreaterThan(manualAt);
+    expect(mismatchAt, '形态错配那条腿必须仍落 error 态').toBeGreaterThan(dialogAt);
+
+    const branch = src.slice(portableAt, dialogAt);
+    expect(branch).toContain("t('settings.update.portableManualReplace', {");
+    expect(branch, '压缩包位置必须进文案').toContain('path: subj.path');
+    expect(branch, '程序所在目录必须取自后端回包').toContain('dir: result.programDir');
+    expect(branch, '落 manual 后必须就此返回，不许再落进确认框').toContain('return;');
+    // 只是展示说明，这一步不许带 confirmed 重调（那会在用户读到说明之前就停核退出）。
+    expect(branch).not.toContain('installUpdate(');
+    expect(branch).not.toContain('updateApi.install(');
+
+    // 形态错配那一支不再按文件名另分一条 manual：便携包走的是上面那条告知，不是错配。
+    const mismatch = src.slice(src.indexOf('result.handedToSystem ||'), mismatchAt);
+    expect(mismatch).not.toContain("'manual'");
+    expect(src).not.toContain('isPortableZipUpdate');
   });
 
-  it('文案必须说清三件事：下载到哪 / 手动解压覆盖 / 别双击安装', async () => {
-    // 后端返 `ok:false`（准确：没执行安装），UI 若只说「失败」，用户读到的是坏消息而不是**下一步动作**。
-    // 缺任何一条，用户都会卡住：不知道包在哪 / 不知道要自己解压 / 去找不存在的安装程序。
-    const fs = await import('node:fs');
-    const p = await paths();
-    const zh = JSON.parse(fs.readFileSync(p.zhCN, 'utf8')) as {
-      settings: { update: { portableManualReplace?: string } };
-    };
-    const msg = zh.settings.update.portableManualReplace ?? '';
-    expect(msg, 'zh-CN 缺 portableManualReplace').toBeTruthy();
-    expect(msg, '必须带 {{path}} 插值，否则用户不知道包下到哪了').toContain('{{path}}');
-    expect(msg, '必须说明要手动解压覆盖').toMatch(/解压/);
-    expect(msg, '必须说明要覆盖到当前程序目录').toMatch(/覆盖/);
-    expect(msg, '必须明说别双击安装（便携版没有安装程序）').toMatch(/请勿双击安装|不要双击安装/);
-    // 反向：不得再把它描述成一次失败（这正是本次要修的误读）。
-    expect(msg, '便携交接不是失败，文案里不得出现「失败」').not.toMatch(/失败/);
+  it('manual 卡把说明与「退出并打开文件夹」放在一起，按钮带 confirmed 重调', async () => {
+    const src = await readTsx();
+    const manual = stateBlock(src, 'manual');
+    expect(manual, '说明正文必须渲染在卡上').toContain('{errMsg}');
+    expect(manual, '说明分行（两个位置各占一行）').toContain("whiteSpace: 'pre-line'");
+    expect(manual).toContain("t('settings.update.portableQuitAndOpen')");
+    expect(manual, '按钮必须带 confirmed=true 重调安装').toContain('installUpdate(true)');
+    // 对照：downloaded 卡的入口不带 confirmed —— 否则所有平台的安装前告知都被跳过。
+    const downloaded = stateBlock(src, 'downloaded');
+    expect(downloaded).toContain('installUpdate()');
+    expect(downloaded).not.toContain('installUpdate(true)');
+  });
+
+  /**
+   * 安装调用失败的取文：后端在退出准备门之后的失败带 `installRestartRequired`，那时起核准入已在
+   * 本次运行内永久关上，文案必须让用户去重启应用；其余失败仍是原来那句。
+   *
+   * **变异探针**：让 `installFailureKey` 恒返回 `downloadInterrupted` ⇒ 首条转红；把抛错腿改回
+   * 写死的 `t('settings.update.downloadInterrupted')` ⇒ 接线那条转红。
+   */
+  it('安装失败按后端错误码取文：需重启应用的那一类不再显示成「下载中断」', async () => {
+    expect(installFailureKey('installRestartRequired')).toBe('settings.update.installRestartRequired');
+    expect(installFailureKey(undefined)).toBe('settings.update.downloadInterrupted');
+    expect(installFailureKey('somethingElse')).toBe('settings.update.downloadInterrupted');
+    const src = await readTsx();
+    const catchAt = src.indexOf("console.error('[update] install failed:', error);");
+    expect(catchAt, '安装抛错腿不见了').toBeGreaterThan(-1);
+    expect(src.slice(catchAt, catchAt + 240)).toContain(
+      "settleInstall('error', t(installFailureKey((error as { code?: string }).code)), subj);",
+    );
+  });
+
+  it('形态错配取文：交给系统打开了与没有打开是两句', () => {
+    expect(formMismatchKey(true)).toBe('settings.update.formMismatch');
+    expect(formMismatchKey(false)).toBe('settings.update.formMismatchNotOpened');
+    expect(formMismatchKey(undefined)).toBe('settings.update.formMismatchNotOpened');
+  });
+
+  it.each(PORTABLE_LOCALES)('%s：需重启应用与未打开两句文案都在，且与相邻那句不同', async (name) => {
+    const update = await updateTexts(name);
+    for (const key of ['installRestartRequired', 'formMismatchNotOpened'] as const) {
+      const text = update[key];
+      expect(typeof text === 'string' && text.trim().length > 20, `${name} 缺 ${key}`).toBe(true);
+    }
+    expect(update.installRestartRequired).not.toBe(update.downloadInterrupted);
+    expect(update.formMismatchNotOpened).not.toBe(update.formMismatch);
+  });
+
+  it('zh-CN：需重启应用那句写明了动作', async () => {
+    const update = await updateTexts('zh-CN');
+    expect(update.installRestartRequired).toContain('请重启应用后重试');
+  });
+
+  /**
+   * 「退出并打开文件夹」会停核并退出应用：调用在飞时第二次点击不得再发一遍。
+   *
+   * 去重认的是 ref（同一次渲染里的两次点击读到同一个状态快照，状态拦不住第二次），置灰用的是
+   * 状态；两者都在卡片按钮的入口 `startInstall` 里，`installUpdate` 本体不碰它们。
+   *
+   * **变异探针**：把钩子的返回改回 `installUpdate,`（绕开入口）⇒ 首条转红；删掉 ref 判定 ⇒ 第二条转红。
+   */
+  it('卡片按钮的安装入口带在飞去重，两颗安装按钮在飞时置灰', async () => {
+    const src = await readTsx();
+    expect(src, '钩子必须把带去重的入口交给卡片').toContain('installUpdate: startInstall,');
+    const entryAt = src.indexOf('async function startInstall(');
+    expect(entryAt, '找不到带去重的安装入口').toBeGreaterThan(-1);
+    const entry = src.slice(entryAt, src.indexOf('function settleInstall('));
+    const guardAt = entry.indexOf('if (installInFlight.current) return;');
+    const markAt = entry.indexOf('installInFlight.current = true;');
+    const callAt = entry.indexOf('await installUpdate(confirmed);');
+    expect(guardAt, '入口没有在飞判定').toBeGreaterThan(-1);
+    expect(markAt).toBeGreaterThan(guardAt);
+    expect(callAt, '判定与置位必须先于真正的安装调用').toBeGreaterThan(markAt);
+    expect(entry.slice(callAt), '调用落定后必须复位，否则按钮永远点不了').toContain(
+      'installInFlight.current = false;',
+    );
+    for (const state of ['manual', 'downloaded'] as const) {
+      const block = stateBlock(src, state);
+      const buttonAt = block.indexOf('installUpdate(');
+      expect(buttonAt, `${state} 卡没有安装按钮`).toBeGreaterThan(-1);
+      const open = block.lastIndexOf('<Button', buttonAt);
+      expect(block.slice(open, buttonAt), `${state} 卡的安装按钮在飞时没有置灰`).toContain(
+        state === 'manual' ? 'disabled={installing || clearingPortable}' : 'disabled={installing}',
+      );
+    }
+  });
+
+  /**
+   * 便携版退出后重开应用：卡片回到「手动覆盖」那一步，靠的是版本信息里带回的压缩包位置。
+   * 恢复走未确认的安装调用（后端只回告知），所以两个位置仍由上面那条便携告知腿写到屏上。
+   */
+  it('重开应用后凭留下的压缩包位置回到 manual 卡，且只在卡片空闲时接手', async () => {
+    const src = await readTsx();
+    expect(src).toContain('setPendingPortable(info.pendingPortableUpdate);');
+    const at = src.indexOf('if (!pendingPortable || us !== ');
+    expect(at, '恢复那一步不见了').toBeGreaterThan(-1);
+    const effect = src.slice(at, src.indexOf('}, [pendingPortable, us]);', at));
+    expect(effect).toContain("us !== 'idle'");
+    expect(effect, '接手一次即止').toContain('setPendingPortable(undefined);');
+    expect(effect, '必须走未确认的安装调用').toMatch(
+      /void installUpdate\(false, \{ path: pendingPortable\.archive, info: null, integrity: 'unknown', completionUnverified: pendingPortable\.completionUnverified \}\);/,
+    );
+    // 普通检查保留记录；只由显式放弃动作清除。
+    const check = src.slice(src.indexOf('async function checkUpdate('), src.indexOf('async function discardPortableAndCheck('));
+    expect(check).not.toContain('setPendingPortable(undefined);');
+    const discard = src.slice(src.indexOf('async function discardPortableAndCheck('), src.indexOf('async function reinstallCurrent('));
+    expect(discard).toContain('await updateApi.clearPortableHandoff();');
+    expect(discard).toContain('setPendingPortable(undefined);');
+  });
+
+  it.each(PORTABLE_LOCALES)('%s：说明带两个位置的插值，按钮文案在', async (name) => {
+    const update = await updateTexts(name);
+    const msg = update.portableManualReplace;
+    const button = update.portableQuitAndOpen;
+    expect(typeof msg === 'string' && msg.length > 80, `${name} 缺 portableManualReplace`).toBe(true);
+    expect(typeof button === 'string' && button.trim().length > 0, `${name} 缺 portableQuitAndOpen`).toBe(true);
+    const text = msg as string;
+    expect(text, '必须带 {{path}}，否则用户不知道包下到哪了').toContain('{{path}}');
+    expect(text, '必须带 {{dir}}，否则用户不知道该覆盖到哪').toContain('{{dir}}');
+    // 两个位置各占一行（长路径挤在句子中间读不出来）。
+    expect(text).toMatch(/\n[^\n]*\{\{path\}\}\n[^\n]*\{\{dir\}\}\n/);
+    expect(text, '说明里要点名那颗按钮，且与按钮文案逐字一致').toContain(button as string);
+    expect(text, '要提到保留标记文件').toContain('portable.marker');
+    expect([...text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]).sort()).toEqual(['dir', 'path']);
+  });
+
+  it('zh-CN / en-US 文案说清：手动解压覆盖、先退出再覆盖、别双击安装，且不说成失败', async () => {
+    // 缺任何一条用户都会卡住：不知道要自己解压 / 在应用还开着时就覆盖 / 去找不存在的安装程序。
+    const zh = (await updateTexts('zh-CN')).portableManualReplace as string;
+    expect(zh, '必须说明要手动解压覆盖').toMatch(/解压/);
+    expect(zh, '必须说明要覆盖到程序所在文件夹').toMatch(/覆盖/);
+    expect(zh, '必须说明先退出再覆盖').toMatch(/退出后再覆盖/);
+    expect(zh, '必须说明应用会先停内核').toMatch(/停止内核/);
+    expect(zh, '必须明说别双击安装（便携版没有安装程序）').toMatch(/请勿双击安装|不要双击安装/);
+    expect(zh, '便携交接不是失败，文案里不得出现「失败」').not.toMatch(/失败/);
+
+    const en = (await updateTexts('en-US')).portableManualReplace as string;
+    expect(en).toMatch(/extract/i);
+    expect(en).toMatch(/only after Polaris has quit/);
+    expect(en).toMatch(/stops the core/);
+    expect(en).toMatch(/do not double-click/i);
+    expect(en).not.toMatch(/fail/i);
   });
 });
 
@@ -1795,7 +1818,7 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
    * 现在改判它真正该判的那件事：**快照表达式出现在第一个 `await` 之前**（那正是逐字行判不出的
    * 性质），形状怎么写随意。
    *
-   * **变异探针**：把 `isPortableZipUpdate(subj.path)` 改回 `isPortableZipUpdate(downloadedPath)`
+   * **变异探针**：把便携说明里的 `path: subj.path` 改回 `path: downloadedPath ?? ''`
    * ⇒ ②转红；把快照那几行挪到第一个 `await` 之后 ⇒ ①转红；把 `installUpdate(true, subj)` 的第二个
    * 实参去掉 ⇒ ③转红；把某处 `settleInstall(...)` 拆回 `setUs(...) + setErrMsg(...)` ⇒ ④转红；
    * `InstallSubject` 加一个字段而 `settleInstall` 不写它 ⇒ ⑤转红。
@@ -1953,7 +1976,10 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
 
     // 组件 state 名 → setter 名（本门唯一的「名字表」，从 useState 声明派生）。
     const stateOfSetter = new Map(
-      [...src.matchAll(/const \[(\w+), (set\w+)\] = useState/g)].map((m) => [m[2], m[1]]),
+      // Reminder clearing is independent IO coordination, not an install/package fact.
+      // Its busy guard and durable-success ordering are executed by portable-handoff-check.test.ts.
+      [...src.matchAll(/const \[(\w+), (set\w+)\] = useState/g)]
+        .filter((m) => m[1] !== 'clearingPortable').map((m) => [m[2], m[1]]),
     );
     expect(stateOfSetter.size, '解析不到组件 state —— 取材器失效').toBeGreaterThan(5);
     const pinned = new Set(
@@ -2089,5 +2115,23 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
         `${loc} 的说明未点名 alpha / beta / rc`,
       ).toMatch(/alpha/i);
     }
+  });
+});
+
+
+describe('appUpdateErrText local reminder failure', () => {
+  it('uses the local reminder namespace without expanding the download wire contract', () => {
+    const keys: string[] = [];
+    const text = appUpdateErrText('portableReminderClearFailed', null, (key) => {
+      keys.push(key);
+      return 'reminder retained';
+    });
+    expect(text).toBe('reminder retained');
+    expect(keys).toEqual(['settings.update.portableReminderClearFailed']);
+  });
+
+  it('keeps the existing fallback when the local translation is unavailable', () => {
+    expect(appUpdateErrText('portableReminderClearFailed', null, (key) => key))
+      .toBe('settings.update.downloadInterrupted');
   });
 });

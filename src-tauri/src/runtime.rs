@@ -21,10 +21,7 @@ pub mod auto_switch;
 pub mod config;
 pub mod core_paths;
 pub mod core_promote;
-pub mod core_swap;
-pub mod core_update_scheduler;
-pub mod core_validation;
-/// 路径型环境逃生门的信任级判定单点（`POLARIS_SINGBOX_PATH` / `POLARIS_HELPER_PATH`）。
+/// 路径型环境逃生门的信任级判定单点（`POLARIS_HELPER_PATH`）。
 pub(crate) mod env_trust;
 pub mod geo_seed;
 pub mod helper;
@@ -93,7 +90,7 @@ pub struct AppRuntime {
     pub stats: Arc<StatsRelay>,
     pub helper: Arc<HelperRuntime>,
     pub mesh: Arc<MeshRuntime>,
-    /// 更新运行时（App 自更新 + 内核更新 + mini 弹窗会话）。
+    /// 更新运行时（App 自更新 + 内核版本读取 + mini 弹窗会话）。
     pub updater: Arc<UpdaterRuntime>,
     /// 传输层单点：**全 App 唯一**的真实 HTTP/TLS 客户端（见 `runtime/http.rs`）。
     /// 订阅拉取 / 内核下载 / 解锁检测 / WARP 全部经它注入既有窄 trait。

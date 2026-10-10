@@ -476,6 +476,88 @@ fn resolve_core_binary_env_override_accepts_real_file() {
     let _ = std::fs::remove_file(&f);
 }
 
+/// 内核文件的可执行位：没有任何可执行位即拒，带上「重新安装」这个动作；有即放行；文件不在
+/// 也是 Err（由前一步的解析兜住，这里不把「读不到」当成「可执行」）。
+///
+/// **变异探针**：把 `ensure_core_executable` 的判据改成恒 `Ok` ⇒ 第 1、3 条转红。
+#[cfg(unix)]
+#[test]
+fn core_without_any_exec_bit_is_refused_before_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::TestDir::new("polaris-core-exec-bit-");
+    let core = dir.join("sing-box");
+    std::fs::write(&core, b"#!/bin/sh\n").unwrap();
+
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let refused = super::core_binary::ensure_core_executable(&core).unwrap_err();
+    assert!(refused.contains("没有可执行权限"), "{refused}");
+    assert!(refused.contains("重新安装"), "{refused}");
+
+    for mode in [0o755, 0o700, 0o544] {
+        std::fs::set_permissions(&core, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            super::core_binary::ensure_core_executable(&core).is_ok(),
+            "{mode:o}"
+        );
+    }
+    assert!(super::core_binary::ensure_core_executable(&dir.join("missing")).is_err());
+}
+
+/// 调用点守卫：应用直起腿在 spawn 之前过可执行位检查，且失败落专用码而非笼统的启动失败。
+#[test]
+fn direct_start_checks_the_exec_bit_and_reports_a_dedicated_code() {
+    let src = crate::test_support::crate_code("runtime/proxy/startup.rs");
+    let check = src
+        .find("ensure_core_executable(&binary)")
+        .expect("起核路径不再检查内核可执行位");
+    let spawn = src[check..]
+        .find("spawn_core_via_helper(")
+        .or_else(|| src[check..].find(".spawn("))
+        .expect("检查之后找不到起核调用 —— 守卫已失去判据");
+    let between = &src[check..check + spawn];
+    assert!(
+        between.contains("code::CORE_NOT_EXECUTABLE"),
+        "可执行位检查失败必须落 CORE_NOT_EXECUTABLE"
+    );
+    assert_eq!(
+        src.matches("StartError::coded(msg, code::CORE_NOT_EXECUTABLE)")
+            .count(),
+        1
+    );
+    // 两个出口都在，且事件在前：托盘 / 自动连接没有人等这次调用的结果，只有 `set_error` 广播的
+    // `event:proxyError` 到得了用户；发起方在等时，前端按「认领」去重，不是后端少发一个。
+    let event = between
+        .find("self.set_error(&msg, code::CORE_NOT_EXECUTABLE)")
+        .expect("可执行位检查失败必须经 set_error 广播，否则无人等待的入口一个字都看不到");
+    let reject = between
+        .find("return Err(StartError::coded(msg, code::CORE_NOT_EXECUTABLE))")
+        .expect("可执行位检查失败必须把同一个码带回给发起方");
+    assert!(event < reject);
+}
+
+/// 起核前能力探测没通过时落哪个码：只有「助手明确不认识探测命令」才导向装 / 升级助手的引导。
+///
+/// **变异探针**：把 `HelperOutdated` 也映射成 `STARTUP_FAILED` ⇒ 第一条转红（用户看到的是
+/// 「检查服务器配置」）；把 `Unavailable` 映射成 `HELPER_NOT_INSTALLED` ⇒ 第二条转红
+/// （一次通信抖动就让崩溃自愈当成终态收手）。
+#[test]
+fn an_outdated_helper_is_reported_as_a_helper_problem_not_a_generic_start_failure() {
+    use crate::runtime::helper::BirthCapabilityError;
+    assert_eq!(
+        birth_capability_error_code(&BirthCapabilityError::HelperOutdated("x".into())),
+        code::HELPER_NOT_INSTALLED
+    );
+    assert_eq!(
+        birth_capability_error_code(&BirthCapabilityError::Unavailable("x".into())),
+        code::STARTUP_FAILED
+    );
+    // 落的码必须是崩溃自愈认的终态：太旧的助手重试多少轮都一样。
+    assert!(is_unrecoverable_restart_error(&StartError::coded(
+        "x",
+        birth_capability_error_code(&BirthCapabilityError::HelperOutdated("x".into())),
+    )));
+}
+
 /// **门：单测态起核只认注入的假核**（本门存在的理由见 [`ProxyRuntime::core_binary_for_start`]
 /// 的 cfg(test) 版文档——单测漏出真 sing-box 进程的那个坑）。
 ///
@@ -1490,7 +1572,9 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     let r = rt
         .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await;
-    let error = r.expect_err("无 helper daemon → 起核必失败（不静默直起）");
+    let error = r
+        .expect_err("无 helper daemon → 起核必失败（不静默直起）")
+        .message;
     assert!(
         error.starts_with("helper 起核通信失败："),
         "必须抵达所测的起核通信失败分支：{error}"
@@ -1501,6 +1585,119 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     );
     assert!(rt.pid.lock().unwrap().is_none(), "未知结果不得伪造 pid");
     assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// 对账结果 → 配套结论：只有拿到内容哈希证据的三种结果算确认，其余一律确认不了。
+///
+/// **变异探针**：把 `InstallCoreUnsupported` 归进确认 ⇒ 第四、五条转红；把 `Err` 归进确认 ⇒
+/// 末条转红。
+#[test]
+fn protected_core_is_confirmed_only_by_a_content_hash_result() {
+    use ProtectedCoreReconcileOutcome as Outcome;
+    for confirmed in [
+        Outcome::Verified,
+        Outcome::Cached,
+        Outcome::Promoted("ab".repeat(32)),
+    ] {
+        assert_eq!(
+            protected_core_verdict(Ok(&confirmed)),
+            ProtectedCoreVerdict::Confirmed,
+            "{confirmed:?}"
+        );
+    }
+    for from_cache in [false, true] {
+        assert!(
+            matches!(
+                protected_core_verdict(Ok(&Outcome::InstallCoreUnsupported { from_cache })),
+                ProtectedCoreVerdict::Unconfirmed(_)
+            ),
+            "助手不认装核命令 ⇒ 它手里的内核换不成随包的（from_cache={from_cache}）"
+        );
+    }
+    assert_eq!(
+        protected_core_verdict(Err("helper 装核失败：ERR hash-mismatch")),
+        ProtectedCoreVerdict::Unconfirmed("helper 装核失败：ERR hash-mismatch".to_owned())
+    );
+}
+
+/// 🔴 **配套闸**：确认不了提权助手将要执行的是随包内核 ⇒ 拒绝起核，落专用码，**一帧起核请求
+/// 都不发**。
+///
+/// 走真对账（把测试工厂置的桩清掉）：随包核路径不存在 ⇒ 对账第一步就读不到现役核 ⇒ 确认不了。
+/// 此前这条腿只告警，随后照常向助手发起核请求，由 root / SYSTEM 执行受保护目录里现有的那份。
+///
+/// 替身 helper 的通信恒失败；本条断言的是**根本没走到通信**（没有 helper route、没有 Start
+/// custody），所以红绿与通信替身无关。
+///
+/// **变异探针**：把 `spawn_core_via_helper` 里的配套闸删掉（忽略对账结论）⇒ 走到起核通信 ⇒
+/// 错误码不再是 `HELPER_CORE_MISMATCH`、且留下了 helper route ⇒ 转红。
+#[tokio::test]
+async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
+    let (rt, dir) = test_runtime_on(Platform::Linux);
+    *rt.protected_core_verdict_fixture.lock().unwrap() = None;
+    let cfg_path = dir.join("singbox-runtime.json");
+    std::fs::write(&cfg_path, "{}").unwrap();
+    let binary = dir.join("bundle-that-is-not-there").join("sing-box");
+    let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
+    let my_gen = rt.gate.generation();
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    let error = rt
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+        .await
+        .expect_err("确认不了配套 ⇒ 必须拒绝");
+    assert_eq!(error.code, Some(code::HELPER_CORE_MISMATCH), "{error}");
+    assert!(
+        error.message.contains("设置 › Helper") && error.message.contains("重新安装或升级"),
+        "诊断文案须带可执行的下一步：{error}"
+    );
+    assert!(
+        !rt.child.lock().unwrap().has_helper_start(),
+        "不得建立 Start custody：起核请求根本不该发出"
+    );
+    assert!(rt.pid.lock().unwrap().is_none());
+
+    // 正面对照：同一条腿、同一个替身，结论换成「已确认」⇒ 走到起核通信（替身恒失败）。
+    // 没有这一半，上面的红绿可能只是因为这条腿本来就走不通。
+    *rt.protected_core_verdict_fixture.lock().unwrap() = Some(ProtectedCoreVerdict::Confirmed);
+    let error = rt
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+        .await
+        .expect_err("替身 helper 不可连接");
+    assert_eq!(error.code, None, "{error}");
+    assert!(
+        error.message.starts_with("helper 起核通信失败："),
+        "{error}"
+    );
+    assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// 配套闸的码经起核汇流点原样出栈：`spawn_core_via_helper` 的失败不再一律折成 `STARTUP_FAILED`。
+#[test]
+fn helper_start_failure_keeps_its_own_code_at_the_start_leg() {
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(super) async fn start_inner(",
+    );
+    let at = body
+        .find(".spawn_core_via_helper(")
+        .expect("切点自检：起核汇流点里应有经 helper 起核的调用");
+    let leg = &body[at..];
+    let leg = &leg[..leg.find("} else {").expect("helper 腿的结尾")];
+    assert!(
+        leg.contains("let error_code = e.code.unwrap_or(code::STARTUP_FAILED);")
+            && leg.contains("self.set_error(&e.message, error_code);")
+            && leg.contains("StartError::coded(e.message, error_code)"),
+        "失败码必须取自这一次的错误，状态与返回值落同一个码：{leg}"
+    );
 }
 
 /// Mac/Win 的只读能力门失败发生在 Start custody 建立前；同一个通信替身不得被当作已发 Start。
@@ -1527,7 +1724,8 @@ async fn helper_start_native_capability_failure_keeps_route_unarmed() {
         let error = rt
             .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
             .await
-            .expect_err("未连接 helper → native capability 不可确认");
+            .expect_err("未连接 helper → native capability 不可确认")
+            .message;
         assert!(
             error.contains("已安装的 helper 未提供 native birth 安全能力"),
             "必须抵达 native capability 拒绝分支：{error}"
@@ -3865,7 +4063,7 @@ fn start_inner_feeds_wait_ready_the_scale_derived_budget() {
 fn install_core_capability_note_uses_the_identity_probed_before_the_call() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    async fn reconcile_protected_core(&self, active_core: &Path) {",
+        "    async fn reconcile_protected_core(",
     );
     // 切点自检：切出来的确实是那个方法（含它的两个锚点），否则下面全是空断言。
     let install_at = body

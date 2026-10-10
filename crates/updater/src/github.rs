@@ -9,17 +9,13 @@
 //!   （吃已拉回的 JSON 字节，宿主注入 HTTP），可 mock 单测。
 //! - `update-asset.findSuitableUpdateAsset`（`update-asset.ts`，52 行）：App 安装包资产选择
 //!   （每平台 loose/installed 双形态消歧，#72）→ [`find_suitable_update_asset`]。
-//! - `singbox-asset.findSuitableSingboxAsset`（`singbox-asset.ts`，62 行）：内核资产选择
-//!   （平台/架构关键词 + with-naive/full 优先）→ [`find_suitable_singbox_asset`]。
-//! - 更新源仓库常量（上游 `UpdateService.ts:43-44` `GITHUB_OWNER/GITHUB_REPO`；
-//!   `core-downloader.ts:69` `SagerNet/sing-box`）→ [`APP_UPDATE_REPO`] / [`CORE_UPDATE_REPO`]。
+//! - 更新源仓库常量 → [`APP_UPDATE_REPO`]。
 //!
 //! ## 为什么平台/架构是**参数**而非读 `process`
 //!
 //! 与 上游的 `findSuitable*` 同纪律：平台/架构由调用方注入（上游 传 `process.platform/arch`，
 //! 本仓宿主传 `std::env::consts::OS/ARCH` 经 [`AssetPlatform::from_os`] / [`AssetArch::from_arch`]
-//! 映射）。如此本函数**不读全局态**，可用平台真值表全覆盖单测。这也是 `manifest.rs` 早先
-//! `AssetSelector` trait 的意图落地版——具体规则移进本模块（纯函数，参数注入），不再需要宿主注入 trait。
+//! 映射）。如此本函数**不读全局态**，可用平台真值表全覆盖单测。
 
 use serde::{Deserialize, Serialize};
 
@@ -30,9 +26,6 @@ use crate::version::compare_semver;
 
 /// App 自更新源仓库 `(owner, repo)`（= 上游 `GITHUB_OWNER/GITHUB_REPO` 的 Polaris 对应）。
 pub const APP_UPDATE_REPO: (&str, &str) = ("polaris-arch", "Polaris");
-
-/// 内核（sing-box）更新源仓库 `(owner, repo)`（= 上游 `core-downloader.ts` 的 `SagerNet/sing-box`）。
-pub const CORE_UPDATE_REPO: (&str, &str) = ("SagerNet", "sing-box");
 
 /// Public release asset suffixes; producers and packaging gates use the same contract.
 pub const PORTABLE_ZIP_SUFFIX: &str = "x64-win-Portable.zip";
@@ -64,6 +57,18 @@ fn release_asset_matches(name: &str, suffix: &str) -> bool {
         })
 }
 
+/// 正式 Windows 便携资产的版本；与选包侧复用同一个发布命名判据。
+/// 安装计划和重启后的手动交接记录不得再使用旧 `polaris-portable-` 前缀。
+#[must_use]
+pub fn portable_zip_version(name: &str) -> Option<&str> {
+    if !release_asset_matches(name, PORTABLE_ZIP_SUFFIX) {
+        return None;
+    }
+    name.strip_prefix("Polaris_")?
+        .strip_suffix(PORTABLE_ZIP_SUFFIX)?
+        .strip_suffix('_')
+}
+
 /// 构造 GitHub releases API URL（= 上游 `https://api.github.com/repos/${owner}/${repo}/releases`）。
 #[must_use]
 pub fn github_releases_api_url(owner: &str, repo: &str) -> String {
@@ -80,11 +85,7 @@ pub enum AssetPlatform {
     Linux,
     /// Android（上游没有这一态：上游 是桌面 Electron 应用）。
     ///
-    /// 它与三个桌面态有两处**结构性**差别，两处都在本模块里落成了分支，别按对称性「顺手统一」：
-    ///  · **只发布 ARMv8 / ARMv7**；x86 / x86_64 不发包，也不进入 universal；
-    ///  · **没有可换的内核**：核是随 APK 打进去的进程内 `libbox.aar`，故
-    ///    [`find_suitable_singbox_asset`] 在这一态上恒 `None`（那条腿真正的闸在
-    ///    `commands/updater/core_update.rs` 的 Android 早退，本模块这一格是第二道）。
+    /// 只发布 ARMv8 / ARMv7；x86 / x86_64 不发包，也不进入 universal。
     Android,
 }
 
@@ -212,7 +213,7 @@ pub enum AppUpdateCheck {
 /// GitHub release asset 的 `digest` 字段 → 裸 sha256 hex（**纯函数**）。
 ///
 /// GitHub 返回形如 `sha256:ab12…`。非 sha256 算法（未来若加 blake3 之类）一律返 `None`
-/// —— **绝不把不认识的摘要当 sha256 喂进 [`verify_bytes`](crate::verify::verify_bytes)**：
+/// —— **绝不把不认识的摘要当 sha256 喂进 [`verify_hex_digest`](crate::verify::verify_hex_digest)**：
 /// 那会必然 mismatch，把「本地不支持该摘要算法」伪装成「下载件被篡改」，成因错位。
 #[must_use]
 pub fn parse_asset_digest(digest: &str) -> Option<String> {
@@ -463,6 +464,7 @@ fn app_update_info_for_release(
 ///  - Android: ARMv8 / ARMv7 native split, then ARM-only universal; other architectures return None.
 ///
 /// All names use `Polaris_<version>_<architecture>-<platform>[-<form>].ext`.
+/// Windows portable zip 由下游生成手动覆盖计划：确认后停核、打开压缩包与程序目录并退出；不自动替换。
 #[must_use]
 pub fn find_suitable_update_asset(
     assets: &[GithubAsset],
@@ -520,76 +522,6 @@ pub fn find_suitable_update_asset(
 }
 
 // ── 内核资产选择（移植 singbox-asset.findSuitableSingboxAsset，逐字保留）──────────────
-
-/// 从 release 资产里挑适配 `(platform, arch)` 的 **sing-box 内核**构建。
-///
-/// 移植自 `singbox-asset.findSuitableSingboxAsset`：
-///  1. 平台关键词（windows/darwin/linux）+ 架构关键词（amd64/arm64）+ 后缀（平台默认 ext 或 `.zip`）过滤；
-///  2. 命中集合内按优先级取：① 含 `with-naive`/`full`（带 naive 出站）② 非 `legacy` ③ 首个命中。
-///
-/// 架构为 [`Other`](AssetArch::Other) 时架构关键词为空串（`contains("")` 恒真，= 上游 `archKeyword=''`
-/// 时 `.includes('')` 恒真），即不按架构过滤。无任何命中返回 `None`。
-#[must_use]
-pub fn find_suitable_singbox_asset(
-    assets: &[GithubAsset],
-    platform: AssetPlatform,
-    arch: AssetArch,
-) -> Option<&GithubAsset> {
-    let (keyword, ext) = match platform {
-        AssetPlatform::Windows => ("windows", ".zip"),
-        AssetPlatform::Macos => ("darwin", ".tar.gz"),
-        AssetPlatform::Linux => ("linux", ".tar.gz"),
-        // Android：**这一态没有可选的内核资产，且这不是「今天还没发」**。
-        //
-        // 核在 Android 上是随 APK 打进去的进程内 `libbox.aar`（`build.gradle.kts` 的
-        // `implementation(files("libs/libbox.aar"))`），不是一个可替换的可执行文件 ——
-        // 桌面那套 `core_swap`（`<core>.bak` 原子替换）在这个形态下没有对象：换内核 = 装新版应用。
-        // SagerNet 确实发 android 构建，但那是给命令行用的裸二进制，本仓一个字节都不消费它；
-        // 真选中一个反而会让「下载 → 换核 → 重启」那条腿去替换一个不存在的文件。
-        //
-        // 🔴 这一格是**第二道**闸，不是唯一那道：真正该早退的地方是
-        // `commands/updater/core_update.rs` 的 Android 分支（零网络就答完）。留这一格是因为
-        // 本函数是 `pub`，将来任何新调用方不经那条早退也拿不到错的资产。
-        AssetPlatform::Android => return None,
-    };
-    let arch_keyword = match arch {
-        AssetArch::X64 => "amd64",
-        AssetArch::Arm64 => "arm64",
-        AssetArch::Armv7 => "armv7",
-        AssetArch::Other => "",
-    };
-
-    let filtered: Vec<&GithubAsset> = assets
-        .iter()
-        .filter(|a| {
-            let lower = a.name.to_lowercase();
-            lower.contains(keyword)
-                && lower.contains(arch_keyword)
-                && (a.name.ends_with(ext) || a.name.ends_with(".zip"))
-        })
-        .collect();
-    if filtered.is_empty() {
-        return None;
-    }
-
-    // 1. with-naive / full 优先。
-    if let Some(a) = filtered.iter().copied().find(|a| {
-        let lower = a.name.to_lowercase();
-        lower.contains("with-naive") || lower.contains("full")
-    }) {
-        return Some(a);
-    }
-    // 2. 非 legacy。
-    if let Some(a) = filtered
-        .iter()
-        .copied()
-        .find(|a| !a.name.to_lowercase().contains("legacy"))
-    {
-        return Some(a);
-    }
-    // 3. 首个命中。
-    filtered.first().copied()
-}
 
 #[cfg(test)]
 mod tests;

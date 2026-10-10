@@ -275,6 +275,50 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     expect(isProxyErrorCode('ROOT_ORPHAN_BLOCKED')).toBe(true);
   });
 
+  // ── 随包内核不可执行腿（此前事件腿**没有分支**：无人 await 的入口撞上它是静默丢弃） ──
+
+  it('CORE_NOT_EXECUTABLE → 刷连接态 + 本地化 error toast + 桌面通知（诊断 message 不上屏）', () => {
+    handleProxyErrorEvent(
+      { errorCode: 'CORE_NOT_EXECUTABLE', message: '内核文件没有可执行权限: /opt/app/resources/linux/sing-box' },
+      { t, refreshProxyStatus }
+    );
+    // 核未起（终态）→ 必须刷，否则 UI 停在假「已连接」。
+    expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock).toHaveBeenCalledWith('errors.coreNotExecutable');
+    expect(notifyDesktopMock).toHaveBeenCalledTimes(1);
+    expect(notifyDesktopMock).toHaveBeenCalledWith(
+      'notify.coreNotExecutable.title',
+      'notify.coreNotExecutable.body'
+    );
+  });
+
+  it("isProxyErrorCode('CORE_NOT_EXECUTABLE') === true（否则 await 腿拿到的 err.code 会被判为脏值丢弃）", () => {
+    expect(isProxyErrorCode('CORE_NOT_EXECUTABLE')).toBe(true);
+  });
+
+  // ── 提权助手内核不配套腿：起核前被拒绝，或起核后被自证停掉（后一种没有任何 await 腿在等） ──
+
+  it('HELPER_CORE_MISMATCH → 刷连接态 + 本地化 error toast + 桌面通知（诊断 message 不上屏）', () => {
+    handleProxyErrorEvent(
+      {
+        errorCode: 'HELPER_CORE_MISMATCH',
+        message: '无法确认提权助手将要运行的内核就是本应用配套的内核，已拒绝以 TUN 模式启动：helper 装核失败',
+      },
+      { t, refreshProxyStatus }
+    );
+    // 核不在跑（终态）→ 必须刷，否则 UI 停在假「已连接」。
+    expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock.mock.calls).toEqual([['errors.helperCoreMismatch']]);
+    expect(notifyDesktopMock.mock.calls).toEqual([
+      ['notify.helperCoreMismatch.title', 'notify.helperCoreMismatch.body'],
+    ]);
+  });
+
+  it("isProxyErrorCode('HELPER_CORE_MISMATCH') === true", () => {
+    expect(isProxyErrorCode('HELPER_CORE_MISMATCH')).toBe(true);
+  });
+
   // ── 与发起方（Home 连接按钮）的去重：认领闸门 ─────────────────────────────
   //
   // 这三码（HELPER 两码 + ROOT_ORPHAN_BLOCKED）是后端**双出口**（emit 事件 + 让 api.proxy.start
@@ -305,7 +349,13 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       expect(notifyDesktopMock).not.toHaveBeenCalled();
     });
 
-    it.each(['HELPER_GATE_ABORTED', 'HELPER_NOT_INSTALLED', 'ROOT_ORPHAN_BLOCKED'])(
+    it.each([
+      'HELPER_GATE_ABORTED',
+      'HELPER_NOT_INSTALLED',
+      'ROOT_ORPHAN_BLOCKED',
+      'CORE_NOT_EXECUTABLE',
+      'HELPER_CORE_MISMATCH',
+    ])(
       '%s：认领期内仍必须刷连接态（await 腿并不刷，漏刷则 UI 停在假「已连接」）',
       async (errorCode) => {
         await claimFailedStart();
@@ -321,7 +371,33 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       expect(notifyDesktopMock).not.toHaveBeenCalled();
     });
 
-    // 认领的射程仅限提权门两码 + ROOT_ORPHAN_BLOCKED。若把认领判定提到函数顶部（或扩到其它码），
+    // 发起方（Home 连接按钮）的 await 腿自己报 `errors.coreNotExecutable`；事件腿此刻再报就是
+    // 同一次失败两条提示。两种到达顺序都要让位：事件先于 reject 到（认领在飞）与晚于 reject 到（宽限尾巴）。
+    it('CORE_NOT_EXECUTABLE：事件晚于 reject 到达 → 事件腿零提示且不发桌面通知', async () => {
+      await claimFailedStart();
+      handleProxyErrorEvent({ errorCode: 'CORE_NOT_EXECUTABLE' }, { t, refreshProxyStatus });
+      expect(toastErrorMock).not.toHaveBeenCalled();
+      expect(notifyDesktopMock).not.toHaveBeenCalled();
+    });
+
+    it('HELPER_CORE_MISMATCH：认领期内事件腿零提示且不发桌面通知（否则与 await 腿双报）', async () => {
+      await claimFailedStart();
+      handleProxyErrorEvent({ errorCode: 'HELPER_CORE_MISMATCH' }, { t, refreshProxyStatus });
+      expect(toastErrorMock).not.toHaveBeenCalled();
+      expect(notifyDesktopMock).not.toHaveBeenCalled();
+    });
+
+    it('CORE_NOT_EXECUTABLE：事件先于 reject 到达（起核仍在飞）→ 事件腿零提示，仍刷连接态', async () => {
+      await withProxyStartClaim(async () => {
+        handleProxyErrorEvent({ errorCode: 'CORE_NOT_EXECUTABLE' }, { t, refreshProxyStatus });
+        throw new Error('core not executable');
+      }).catch(() => {});
+      expect(toastErrorMock).not.toHaveBeenCalled();
+      expect(notifyDesktopMock).not.toHaveBeenCalled();
+      expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    });
+
+    // 认领的射程仅限上面点名的那几码。若把认领判定提到函数顶部（或扩到其它码），
     // 一次连接按钮点击就会顺带吞掉这 2s 内任何来源的崩溃/出口误导告警 —— 凭空制造静默。
     it('认领不外溢：认领期内的崩溃腿照常报（PROCESS_EXITED）', async () => {
       await claimFailedStart();
@@ -368,6 +444,17 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
         'notify.rootOrphanBlocked.title',
         'notify.rootOrphanBlocked.body'
       );
+    });
+
+    // 托盘 / 启动自动连接 / 去抖重启发起的起核没有 Home 那条 await 腿 ⇒ 这里是唯一的送达路径，
+    // 且恰好一条（toast 与桌面通知各一次，文案是本码专属键，不是通用的「启动失败」）。
+    it('CORE_NOT_EXECUTABLE：仍出恰好一条 error toast + 桌面通知，不得静默', () => {
+      handleProxyErrorEvent({ errorCode: 'CORE_NOT_EXECUTABLE' }, { t, refreshProxyStatus });
+      expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+      expect(toastErrorMock.mock.calls).toEqual([['errors.coreNotExecutable']]);
+      expect(notifyDesktopMock.mock.calls).toEqual([
+        ['notify.coreNotExecutable.title', 'notify.coreNotExecutable.body'],
+      ]);
     });
 
     it('认领过期后恢复上报（认领不得长期挂住，否则后续托盘失败被永久吞掉）', async () => {

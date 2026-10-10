@@ -75,7 +75,7 @@ export enum ProxyErrorCode {
   SYSTEM_PROXY_FAILED = 'SYSTEM_PROXY_FAILED', // 核心已起但系统代理 networksetup/reg 设置失败（非终态提示）
   SYSTEM_DNS_TAKEOVER_FAILED = 'SYSTEM_DNS_TAKEOVER_FAILED', // Linux 核已起但 systemd-resolved 未接到 Polaris TUN（非终态、显式 DNS 降级提示）
   EXIT_MISMATCH = 'EXIT_MISMATCH', // 核在跑但实际生效出口 ≠ 用户选中节点（静默直连风险，非终态；见 runtime/proxy::attest_effective_exit）
-  CORE_BINARY_MISMATCH = 'CORE_BINARY_MISMATCH', // 核在跑但实际执行的二进制 ≠ 本次期望的核（换核没生效，非终态；见 runtime/proxy::process_supervision 的内核自证）
+  CORE_BINARY_MISMATCH = 'CORE_BINARY_MISMATCH', // 核在跑但实际执行的二进制 ≠ 本次期望的核（非终态；见 runtime/proxy::process_supervision 的内核自证）
   RULE_RESOURCES_MISSING = 'RULE_RESOURCES_MISSING', // 核在跑但本地 .srs 缺失/损坏 → 引用它的分流规则被 fail-closed 剪枝（分流降级、未命中规则兜底走代理而非静默直连，非终态；见 runtime/proxy::warn_pruned_rule_resources 与 App.tsx 能力降级腿注释的两个例外）
   NETWORK_PROFILE_RULES_PRUNED = 'NETWORK_PROFILE_RULES_PRUNED', // 核在跑但部分网络场景规则本次未生成（场景失效/探测源本机不可用/R4 剔除 dhcp）或可能永不命中（dhcp 源只写 IPv6 地址段）（非终态；见 runtime/proxy::warn_network_profile_rules）
   AUTO_SWITCH_NEEDS_RESTART = 'AUTO_SWITCH_NEEDS_RESTART', // 自动故障切换已触发、候选也规划出来了，但每个候选都要整核重启 → 这轮一个都没探（非终态；见 runtime/auto_switch::switch_blocked_by_restart）
@@ -83,6 +83,8 @@ export enum ProxyErrorCode {
   MESH_INBOUND_SYSTEM_INTERFACE = 'MESH_INBOUND_SYSTEM_INTERFACE', // Explicit userspace ingress policy cannot cover an effective System interface
   OUTBOUND_INTERFACE_UNAVAILABLE = 'OUTBOUND_INTERFACE_UNAVAILABLE', // 配置绑定的物理出口不存在或 down：起核 fail-closed；热切换保留旧运行配置并进入待应用态，绝不静默回落到系统默认出口
   BINARY_NOT_EXECUTABLE = 'BINARY_NOT_EXECUTABLE', // 退出码 126
+  CORE_NOT_EXECUTABLE = 'CORE_NOT_EXECUTABLE', // 随包内核文件缺少可执行权限：起核前即拒绝（终态，核没有起来）→ 引导重新安装应用
+  HELPER_CORE_MISMATCH = 'HELPER_CORE_MISMATCH', // 确认不了提权助手里的内核就是本应用配套的那一份（起核前对账不通过），或起核后自证发现助手实跑的版本不同而停核（终态）→ 引导到「设置 › Helper」重装或升级助手
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127
   CRONET_LIB_MISSING = 'CRONET_LIB_MISSING', // 'cronet: library not found' / dlopen 失败（naive 出站缺/坏 libcronet → 整核 FATAL，自愈冷路径触发）
   HELPER_NOT_INSTALLED = 'HELPER_NOT_INSTALLED', // TUN 需提权 helper 但未安装、且引导门内也没能装上 → 渲染端引导去「设置 › Helper」，不抛裸 socket ENOENT
@@ -101,7 +103,6 @@ export enum ProxyErrorCode {
   AUTO_RESTART_FAILED = 'AUTO_RESTART_FAILED', // 自动重启失败达上限
   RESTART_LIMIT_REACHED = 'RESTART_LIMIT_REACHED', // 健康检查发现死亡且重启耗尽
   STOP_AUTH_CANCELLED = 'STOP_AUTH_CANCELLED', // 停止时用户取消提权授权、进程仍在运行（非终态）
-  CORE_UPDATE_IN_PROGRESS = 'CORE_UPDATE_IN_PROGRESS', // 内核二进制替换窗口中，手动 start/restart/switchMode 被拒（瞬态，非终态）
   UNKNOWN = 'UNKNOWN',
 }
 
@@ -122,7 +123,7 @@ export interface ProxyErrorEvent {
 
 /**
  * 启动前配置校验 gate 剔除的非法节点（坏节点拖垮 sing-box 整体启动 FATAL → 启动前 check 剔除）。
- * 仅会话内存语义：每次启动重判，换核自动复活；reason 区分「直接被 check 标中」/「detour 级联剔除」。
+ * 仅会话内存语义：每次启动重判，内核随应用升级后自动复活；reason 区分「直接被 check 标中」/「detour 级联剔除」。
  * 经 EVENT_PROXY_INVALID_NODES 推送渲染端，节点列表据此标灰 + tooltip（不禁用点击）。
  */
 export interface InvalidNodeInfo {
@@ -340,7 +341,7 @@ export interface TrafficStats {
   /**
    * 累计上行字节，口径 = **本次核启动至今单调累加**（内核 `trafficManager` 的只增计数器）。
    *
-   * 单调只在**一条核生命线内**成立：停核 / 换核 / 换节点重启核之后从 0 重新开始，届时会看到它
+   * 单调只在**一条核生命线内**成立：停核 / 换节点重启核之后从 0 重新开始，届时会看到它
    * 「变小」——那不是回退，是新的一条生命线。要展示「历史总用量」得自己在前端跨生命线累加，
    * 别把本字段当那个用。
    */

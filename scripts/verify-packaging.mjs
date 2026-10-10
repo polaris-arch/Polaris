@@ -71,6 +71,8 @@ import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
+import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
@@ -1413,7 +1415,7 @@ function checkWindowsInstallMode(base) {
   }
 }
 
-/** Windows NSIS 三条自定义钩子的静态契约（安装前清 legacy；安装后归一形态；卸载后清 helper）。 */
+/** Windows NSIS 四条自定义钩子的静态契约（安装/卸载前结束本目录内核；安装前清 legacy；安装后归一形态；卸载后清 helper）。 */
 function checkWindowsInstallerHooks(base) {
   const errorsBefore = errors.length;
   checkWindowsNsisLocalization(base);
@@ -1454,8 +1456,9 @@ function checkWindowsInstallerHooks(base) {
     }
   }
   const selectorCalls = source.match(/!insertmacro PolarisSelectLang\s+\$R8/g) ?? [];
-  if (selectorCalls.length !== 4) {
-    fail(`nsis-hooks.nsh: 四处安装/卸载进度文案都必须经五语选择宏，实为 ${selectorCalls.length} 处`);
+  // 5 处进度文案 + native 卸载腿的 4 类失败提示；普通权限服务/目录探测已移除。
+  if (selectorCalls.length !== 9) {
+    fail(`nsis-hooks.nsh: 九处安装/卸载文案都必须经五语选择宏，实为 ${selectorCalls.length} 处`);
   }
   const pre = nsisHookBody(source, 'NSIS_HOOK_PREINSTALL');
   if (pre === null) {
@@ -1491,8 +1494,18 @@ function checkWindowsInstallerHooks(base) {
     fail('nsis-hooks.nsh: 缺既有 NSIS_HOOK_POSTUNINSTALL（真卸载会遗留外置 helper）');
   }
   checkWindowsHookPrivilegeBoundary(source);
+  // 内核从安装目录运行 ⇒ 安装/卸载动文件前必须先结束映像在本目录内的内核，且判据是路径不是进程名。
+  // 判据本体与它的反向对照在 `lib/nsis-core-sweep.mjs` / `nsis-core-sweep.test.mjs`。
+  for (const violation of nsisCoreSweepViolations(source)) {
+    fail(`nsis-hooks.nsh 内核清扫门：${violation}`);
+  }
+  // 卸载腿的提权清理：脚本随命令行进入提权进程（不落盘）、删除前逐项校验、退出码被消费。
+  // 判据本体与它的反向对照在 `lib/nsis-helper-cleanup.mjs` / `nsis-helper-cleanup.test.mjs`。
+  for (const violation of nsisHelperCleanupViolations(source)) {
+    fail(`nsis-hooks.nsh 提权清理门：${violation}`);
+  }
   if (errors.length === errorsBefore) {
-    note('Windows NSIS：English/简中/繁中/Russian/Farsi，系统预选+语言选择器；安装前清 legacy resources；安装后清 portable marker；真卸载后清外置 helper');
+    note('Windows NSIS：English/简中/繁中/Russian/Farsi，系统预选+语言选择器；安装/卸载前先让主程序退出、再按映像路径结束本安装目录内的内核；安装前清 legacy resources；安装后清 portable marker；真卸载后清外置 helper');
   }
 }
 
@@ -1523,8 +1536,8 @@ function checkWindowsInstallerHooks(base) {
  * 2. 代码面不得出现 `$LOCALAPPDATA`。NSIS 把该常量在 **all 上下文**下映射到
  *    `CSIDL_COMMON_APPDATA`（实证 NSIS `Source/build.cpp` 的 `m_ShellConstants.add`）⇒ 在 all 上下文里
  *    写 `$LOCALAPPDATA\Polaris` 得到的是 `C:\ProgramData\Polaris`，正是 helper 的受保护目录。
- *    本文件**现在就有一段跑在 all 上下文里**（POSTUNINSTALL 的 `SetShellVarContext all`），
- *    按 per-user 直觉写这个常量，删掉的是 helper 而不是旧副本。
+ *    currentUser 当前不切到 all；仍禁止在此钩子消费该用户路径常量，以免未来改安装上下文时
+ *    按 per-user 直觉写的常量被解析为 helper 受保护目录。
  * 3. 代码面不得出现 `UninstallString`。读它只有一个用途 —— 去跑旧版自带的卸载器；而那个 exe 躺在
  *    用户可写目录里 ⇒ 以管理员身份执行一个攻击者可替换的二进制。
  *
@@ -1555,7 +1568,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
     '!macro NSIS_HOOK_PREINSTALL',
     '!macro NSIS_HOOK_POSTINSTALL',
     '!macro NSIS_HOOK_POSTUNINSTALL',
-    'SetShellVarContext all',
+    'InitPluginsDir',
   ]) {
     if (!face.includes(anchor)) {
       fail(`nsis-hooks.nsh 提权边界门：代码面缺锚点 ${JSON.stringify(anchor)} —— 剥注释把代码也剥掉了，本门恒绿`);
@@ -1587,7 +1600,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
   // ③ per-user 路径常量：all 上下文下 $LOCALAPPDATA 就是 ProgramData。
   if (face.includes('$LOCALAPPDATA')) {
     fail(
-      `nsis-hooks.nsh 提权边界门：代码面出现 $LOCALAPPDATA。本文件运行在 SetShellVarContext all 下，` +
+      `nsis-hooks.nsh 提权边界门：代码面出现 $LOCALAPPDATA。若安装上下文切到 all，` +
         `NSIS 把它映射到 CSIDL_COMMON_APPDATA ⇒ 取到的是 C:\\ProgramData（helper 的受保护目录），` +
         `不是用户的 %LOCALAPPDATA%。确需 per-user 路径的话要显式切上下文并在此登记理由。`
     );
@@ -1626,6 +1639,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
  * 那里管**塞没塞进去**。
  */
 function checkMacOpenGuide() {
+  const errorsBefore = errors.length;
   const guidePath = join(ROOT, 'packaging', 'macos-dmg-open-guide.txt');
   if (!existsSync(guidePath)) {
     fail(`packaging/macos-dmg-open-guide.txt 不存在 —— dmg 内附引导那一步会直接失败`);
@@ -1693,7 +1707,55 @@ function checkMacOpenGuide() {
   if (verifyCount !== 2) {
     fail(`package.yml 的 app strict verify 应恰好 2 次（封印后 + 最终 dmg 开箱），实为 ${verifyCount} 次`);
   }
-  note('macOS dmg：首次打开引导一致，且最终 app bundle 已封印并经开箱 strict verify');
+  // 内核与 helper 在 Contents/Resources 下，bundle 封印不替它们各自的签名作证 ⇒ 逐个判定必须
+  // 两处都在：封印前（seal：内核只校验，helper 可补签）与最终 dmg 开箱（verify，只读）。seal 必须排在
+  // bundle 封印之前 —— 反过来的话 helper 补签改掉的字节会让刚封好的资源哈希失配。两处都必须把本腿的
+  // 源内核交给脚本：脚本据此断言包内内核与它逐字节相同（打包链没有改写内核）。脚本本体的控制流由
+  // `macos-nested-code.test.mjs` 持有。
+  const CORE_REF = 'core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"';
+  const NESTED_SEAL = 'bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"';
+  const NESTED_VERIFY = 'if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then';
+  const nestedCalls = pkg.split('scripts/macos-nested-code.sh').length - 1;
+  const nestedSealCount = pkg.split(NESTED_SEAL).length - 1;
+  const nestedVerifyCount = pkg.split(NESTED_VERIFY).length - 1;
+  if (nestedSealCount !== 1) {
+    fail(`package.yml 封印前的内核/helper 逐个判定（seal，带源内核）应恰好 1 次，实为 ${nestedSealCount} 次`);
+  } else if (signCount === 1 && pkg.indexOf(NESTED_SEAL) > pkg.indexOf(SIGN)) {
+    fail('package.yml 的内核/helper 逐个判定（seal）排在 bundle 封印之后 —— helper 补签会让已封的资源哈希失配');
+  }
+  if (nestedVerifyCount !== 1) {
+    fail(`package.yml 最终 dmg 开箱的内核/helper 逐个判定（verify，带源内核）应恰好 1 次，实为 ${nestedVerifyCount} 次`);
+  } else if (signCount === 1 && pkg.indexOf(NESTED_VERIFY) < pkg.indexOf(SIGN)) {
+    fail('package.yml 的内核/helper 逐个判定（verify）排在 bundle 封印之前 —— 它验的不是最终产物');
+  }
+  // 不带源内核的第三种调用形态会绕开「逐字节相同」那条断言。
+  if (nestedCalls !== 2) {
+    fail(`package.yml 对 macos-nested-code.sh 的调用应恰好 2 处（seal + verify），实为 ${nestedCalls} 处`);
+  }
+  const coreRefCount = pkg.split(CORE_REF).length - 1;
+  if (coreRefCount !== 2) {
+    fail(`package.yml 应在封印与开箱两步各定义一次源内核路径 ${CORE_REF}，实为 ${coreRefCount} 次`);
+  }
+  // `mac_arch_tag` 被当成 resources 下的平台目录名用 ⇒ 它必须等于该腿登记的内核目录。
+  const macLegs = (parseMatrixInclude(pkg) ?? []).filter((leg) => String(leg.label).startsWith('macos-'));
+  if (macLegs.length === 0) {
+    fail('package.yml 的平台矩阵里一条 macOS 腿都没解析到 —— 源内核路径无从核对');
+  }
+  for (const leg of macLegs) {
+    if (leg.mac_arch_tag !== LABEL_TO_CORE[leg.label]) {
+      fail(
+        `package.yml matrix 腿 '${leg.label}' 的 mac_arch_tag=${JSON.stringify(leg.mac_arch_tag)} ` +
+          `≠ 内核目录 ${JSON.stringify(LABEL_TO_CORE[leg.label])} —— 逐个判定会拿错源内核`
+      );
+    }
+  }
+  if (!existsSync(join(ROOT, 'scripts/macos-nested-code.sh'))) {
+    fail('scripts/macos-nested-code.sh 不存在 —— package.yml 调用的逐个验签脚本缺失');
+  }
+  // 有违反就不打这句「成立」：否则失败输出里会并存一句字面为假的 ok。
+  if (errors.length === errorsBefore) {
+    note('macOS dmg：首次打开引导一致，最终 app bundle 已封印并经开箱 strict verify；包内内核/helper 封印前与开箱各逐个判定一次（内核只校验并与源内核逐字节比对）');
+  }
 }
 
 // ───────────────────────── 模式 2：构建产物载荷 ─────────────────────────
@@ -1724,6 +1786,12 @@ const PAYLOAD_FAMILIES = [
     consequence:
       '用户机器上 resolve_helper_binary → Err ⇒ 特权 helper 装不上（TUN / 路由 / DNS 接管整条不可用），' +
       'app 仍能启动，故不装 TUN 试一次发现不了',
+  },
+  {
+    what: 'polaris-cleaner',
+    names: new Set(['polaris-cleaner.exe']),
+    requiredLabels: new Set(['windows']),
+    consequence: 'Native helper removal / embedded NSIS fallback unavailable',
   },
   {
     what: 'Cronet sidecar',
@@ -2857,6 +2925,15 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: 'macOS bundler 自己铺进 Contents/Resources/ 的 app 图标（来自 bundle.icon，不经 bundle.resources），只有 mac 那两棵树里有。',
     },
   ];
+  if (label === 'windows') {
+    rules.push({
+      id: 'native-cleaner',
+      re: /^_up_\/resources\/win\/polaris-cleaner\.exe$/,
+      min: 1,
+      max: 1,
+      why: 'Windows 固定 native cleaner：manager 卸载与 NSIS 嵌入 payload 同源，缺失时 helper 缺失/旧版的 UAC 卸载兜底无法完成；只允许这一精确文件，不放行其他 exe。',
+    });
+  }
   // Cronet 只随 linux/windows 出货（macOS 已静态集成）：mac 侧多一份 libcronet 就是纯死重，
   // 故那两个 label **不登记这条规则** ⇒ 真出现了会以「未登记」判红，而不是被一条宽规则放行。
   if (label === 'linux' || label === 'windows') {

@@ -1750,10 +1750,9 @@ describe('浅色 --warn / --ok / --dn 的文字对比度，与深色 .btn.danger
    * 修法与逐值推导见 `index.css` 的「浅色语义色下调」段与「深色 .btn.danger 换墨色」段。
    *
    * **门槛为什么一律 4.5（查过用法才定的，不是默认值）**：这三个 token 当文字的落点全部是
-   * 10~12.5px（`.pill` 10.5 / `.nd-cap` 10 / `.warn-line` 11 / `.statusbar` 11.5 / `.log-view` 12 /
-   * `.core-ver-banner .cvb-tx b` 12.5 …），`.btn.danger` 是 12.5px/660 —— 没有一处够得上 AA 的
+   * 10~12.5px（`.pill` 10.5 / `.nd-cap` 10 / `.warn-line` 11 / `.statusbar` 11.5 / `.log-view` 12 …），`.btn.danger` 是 12.5px/660 —— 没有一处够得上 AA 的
    * 大字例外（≥18.66px bold 或 ≥24px）。它们当**色点/描边/进度条/开关轨/图标**的那些用法
-   * （`.dot.*` `.lat-*` `.swt.indet` `.sub-usage .bar>i` `.pb-ic`/`.cvb-ic` 的 13px svg、
+   * （`.dot.*` `.lat-*` `.swt.indet` `.sub-usage .bar>i` `.pb-ic` 的 13px svg、
    * `.connect-btn.busy` 的 22px svg）走 WCAG 1.4.11 的 3:1，**不在本门**。
    *
    * 花名册怎么来的（与浅色 `--err` 那道门的口径差异，别当成抄的）：

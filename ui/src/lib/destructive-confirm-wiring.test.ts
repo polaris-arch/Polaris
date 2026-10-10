@@ -61,8 +61,6 @@ const ANCHORS = [
   'components/screens/resources/ResourcesScreen.tsx',
   'components/screens/app-policy/AppPolicyScreen.tsx',
   'components/dialogs/RuleDialog.tsx',
-  'components/screens/settings/use-core-update.ts',
-  'components/screens/settings/CoreUpdateCard.tsx',
 ] as const;
 
 if (FILES.length < 100) {
@@ -207,17 +205,6 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     });
   }
 
-  it('内核更新 owner 持有原地二次确认，呈现卡消费同一武装态（原型 :4075 core-rollback）', () => {
-    const owner = code(get('components/screens/settings/use-core-update.ts'));
-    const card = code(get('components/screens/settings/CoreUpdateCard.tsx'));
-    expect(owner, '状态 owner 没有消费共用确认实现').toContain("from '@/lib/confirm-twice'");
-    expect(owner).toMatch(/useConfirmTwice\(\)/);
-    expect(owner, '回滚必须经 confirmTwice 武装').toMatch(/confirmTwice\(CORE_ROLLBACK_KEY/);
-    expect(card, '武装态没有传到按钮，首次点击会没有可见反馈').toMatch(
-      /armed === CORE_ROLLBACK_KEY && 'confirming'/,
-    );
-  });
-
   /**
    * 武装态必须**真的渲染出来** —— 只调 `confirmTwice` 而按钮不挂 `.confirming`，用户点第一下
    * 得到的是「毫无反应」，2.6s 内再点一下东西就没了：那不是闸门，是延时地雷。
@@ -235,13 +222,9 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     // 规则行内删除：状态在 RulesScreen（单槽），翻红在 RuleItem —— 两段都要钉，只钉一头就留下
     // 「state 有了但没传下去」或「传下去了但没挂 class」两种隐形闸门（同 NodesScreen / NodeCard 那对）。
     ['components/screens/rules/RuleItem.tsx', /cn\('nd-a err', deleteConfirming && 'confirming'\)/],
-    [
-      'components/screens/settings/CoreUpdateCard.tsx',
-      /armed === CORE_ROLLBACK_KEY && 'confirming'/,
-    ],
   ] as const;
 
-  it('本批 7 处武装态都挂上了 `.confirming`（不留隐形闸门）', () => {
+  it('登记的 6 处武装态都挂上了 `.confirming`（不留隐形闸门）', () => {
     const offenders = ARMED_RENDER.filter(([rel, re]) => !re.test(code(get(rel)))).map(
       ([rel, re]) => `${rel} :: ${re.source}`,
     );
@@ -275,8 +258,7 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
    * ✅ **上一轮登记的 4 条债务已于 2026-07-29 第二批清零**（`res-del` / `geo-reset` / `app-remove` /
    * `rule-del-dlg` 全部改为原地二次点击）⇒ ResourcesScreen 与 AppPolicyScreen 整份出表，
    * RuleDialog 由 2 降到 1（剩下的那处是「放弃更改？」脏态确认，非破坏性操作）。
-   * 同批把 3 处**确认整个缺席**的补上（`reset-pending` / `geo-reset` / `core-rollback`），
-   * 其中 `core-rollback` 落在 SettingsUpdate，它的 3 处弹窗都与回滚无关，故计数不变。
+   * 同批把 2 处**确认整个缺席**的补上（`reset-pending` / `geo-reset`）。
    *
    * NodesScreen 余下的 2 处（删订阅 `requestSubDelete` / 注销 WARP `removeWarpNode`）**不是**债务：
    * 原型里没有对应的 confirmTwice 调用点，属本仓自加的确认，维持弹窗。
@@ -319,7 +301,6 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     // 清理系统代理会改系统级网络状态，且用户明确要求二次确认；需要成段说明风险，不适合原地双击。
     'components/screens/settings/SettingsNetwork.tsx': 1,
     'components/screens/settings/use-app-update.ts': 1,
-    'components/screens/settings/use-core-update.ts': 2,
     'components/screens/settings/use-config.ts': 1,
     /*
      * ── 移动端（2026-09-06 批 2：表单宿主 + 节点面）──────────────────────────────

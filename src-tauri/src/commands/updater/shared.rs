@@ -1,51 +1,19 @@
-//! App/Core 更新命令共用的窄原语。
+//! App 更新命令共用的窄原语。
 
-use super::{CODE_CORE_DIR_UNAVAILABLE, GITHUB_FETCH_TIMEOUT_MS, MAX_GITHUB_JSON_BYTES};
-use crate::response::ApiResponse;
-#[cfg(not(target_os = "android"))]
-use crate::runtime::core_paths;
+use super::{GITHUB_FETCH_TIMEOUT_MS, MAX_GITHUB_JSON_BYTES};
 use crate::runtime::http::{app_user_agent, CoreDownloader, SystemDnsLookup};
 use crate::runtime::AppRuntime;
 use polaris_net_stack::safe_redirect::{safe_redirect_fetch, SafeRedirectFetchOptions};
 use polaris_updater::github::github_releases_api_url;
 
-pub(crate) fn core_base_dir<T>() -> Result<&'static std::path::Path, ApiResponse<T>> {
-    #[cfg(target_os = "android")]
-    return Err(ApiResponse::err(
-        "Android 内核随 APK 更新，没有可替换的独立内核文件",
-    ));
-
-    #[cfg(not(target_os = "android"))]
-    core_paths::base_dir().ok_or_else(|| {
-        ApiResponse::err_with_code(
-            "内核可写目录未初始化（应用启动期 core_paths::init_base_dir 未执行）",
-            CODE_CORE_DIR_UNAVAILABLE,
-        )
-    })
-}
-
 /// 构造生产下载器（真实 HTTP + 用户配置的 gh 加速前缀）。
 ///
 /// gh 前缀取自通用 config（`ghProxyPrefix`）；读不到就空串 = 不用镜像（**只回退，不改写原址优先**）。
 ///
-/// `pub(crate)`：内核自动更新调度器（`runtime/core_update_scheduler.rs`）复用**同一个**构造入口 ——
-/// 各建一份必然在 gh 前缀读法上漂移。
-///
-/// # `max_bytes` 为什么是形参
-///
-/// 三条生产腿的体积闸**语义不同**，且**上限各自成立**：两条内核腿把整包收进 `Vec<u8>` 再解归档
-/// ⇒ 闸是**内存闸**，按 GitHub 声明的资产体积注入、封顶 128 MiB
-/// （见 [`core_update_size_limit`](super::core_update::core_update_size_limit)）；App 安装包腿
-/// 流式落盘 ⇒ 内存不随包体积长，闸只管「别把盘写满」，封顶 512 MiB
-/// （见 [`app_update_size_limit`](super::app_update::app_update_size_limit)）。
-/// 两个上限不可合并成一个常量：一个约束的是堆，另一个约束的是盘。
-///
-/// [`crate::runtime::http::MAX_DOWNLOAD_BYTES`]（16 MiB）只剩
-/// [`CoreDownloader`] 的构造默认这一个身份 —— 官方
-/// sing-box 资产全部 26 MiB 以上，任何一条内核腿传它都等于「在线换核恒被预检早拒」。
-///
-/// 选形参而非「再开一个构造入口」：gh 前缀读法只该有一份。两个入口意味着有一天 App 腿
-/// 读不到用户配的镜像前缀，而没有任何测试会发现。
+/// `max_bytes` 由调用方按「清单声明的体积」注入并封顶（见
+/// [`app_update_size_limit`](super::app_update::app_update_size_limit)）：安装包流式落盘，这道闸
+/// 管的是「别把盘写满」。[`crate::runtime::http::MAX_DOWNLOAD_BYTES`]（16 MiB）只是
+/// [`CoreDownloader`] 的构造缺省值，容不下安装包。
 pub(crate) fn updater_downloader(state: &AppRuntime, max_bytes: usize) -> CoreDownloader {
     let prefix = state
         .config()

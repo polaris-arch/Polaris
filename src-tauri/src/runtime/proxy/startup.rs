@@ -553,7 +553,7 @@ pub(super) fn install_core_unsupported_cache_hit(
 }
 
 #[derive(Debug)]
-enum ProtectedCoreReconcileOutcome {
+pub(super) enum ProtectedCoreReconcileOutcome {
     Cached,
     Verified,
     Promoted(String),
@@ -563,6 +563,52 @@ enum ProtectedCoreReconcileOutcome {
     InstallCoreUnsupported {
         from_cache: bool,
     },
+}
+
+/// 受保护核对账之后，能不能确认「提权助手将要执行的内核就是本应用随包的那一份」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProtectedCoreVerdict {
+    /// 逐字节一致。
+    Confirmed,
+    /// 确认不了；串是给日志与诊断看的原因。
+    Unconfirmed(String),
+}
+
+/// 对账结果 → 配套结论（纯函数）。
+///
+/// 判据是对账本身拿到的证据，都是内容哈希，不是版本串：
+/// - `Verified`：应用自己读两侧文件，内核的 sha256 相等、同目录的附属库逐个相等；
+/// - `Cached`：本会话已得到过上一条，且此后两侧文件的元数据都没变；
+/// - `Promoted`：助手刚把随包内核装进受保护目录，装入前它自己复算过 sha256。
+///
+/// 其余一律确认不了：助手不认识装核命令（它手里那份内核换不成随包的）、对账这一次失败
+/// （通信、读文件、哈希不符、磁盘）、对账任务没跑完。**确认不了即拒绝** —— 不再是「告警后照常
+/// 起核、让 root / SYSTEM 执行一份来历不明的内核」。
+pub(super) fn protected_core_verdict(
+    outcome: Result<&ProtectedCoreReconcileOutcome, &str>,
+) -> ProtectedCoreVerdict {
+    match outcome {
+        Ok(
+            ProtectedCoreReconcileOutcome::Cached
+            | ProtectedCoreReconcileOutcome::Verified
+            | ProtectedCoreReconcileOutcome::Promoted(_),
+        ) => ProtectedCoreVerdict::Confirmed,
+        Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { .. }) => {
+            ProtectedCoreVerdict::Unconfirmed(
+                "已安装的提权助手不接受本应用的配套内核（不支持装核命令）".to_owned(),
+            )
+        }
+        Err(error) => ProtectedCoreVerdict::Unconfirmed((*error).to_owned()),
+    }
+}
+
+/// [`code::HELPER_CORE_MISMATCH`] 的诊断文案（zh）；渲染端按稳定码取 i18n 键
+/// `errors.helperCoreMismatch`，本串进日志与无 emitter 时的状态。
+pub(super) fn helper_core_mismatch_message(why: &str) -> String {
+    format!(
+        "无法确认提权助手将要运行的内核就是本应用配套的内核，已拒绝以 TUN 模式启动：{why}。\
+         请到「设置 › Helper」重新安装或升级提权助手后重试。"
+    )
 }
 
 pub(super) fn attestation_commit_allowed(
@@ -735,6 +781,25 @@ pub(super) fn should_prompt_helper_upgrade(
     status: &HelperStatusSnapshot,
 ) -> bool {
     should_start_via_helper(mode, platform) && status.installed && status.upgradeable
+}
+
+/// 起核前能力探测没通过时落哪个码（纯函数）。
+///
+/// 已装的助手明确不认识探测命令 = 它太旧，这台机器上经助手起核不可能成功。用户要做的与
+/// 「没装」是同一件事（去「设置 › Helper」装 / 升级），重试同样无用，故落
+/// [`code::HELPER_NOT_INSTALLED`]：渲染端据它给出指向助手设置页的引导，崩溃自愈据它立即收手。
+/// 落 [`code::STARTUP_FAILED`] 的话用户看到的是「检查服务器配置」，指错了方向。
+///
+/// 其余情形（通信失败、既有 custody 未清）断言不了「助手太旧」，仍是笼统的启动失败。
+pub(super) fn birth_capability_error_code(
+    error: &crate::runtime::helper::BirthCapabilityError,
+) -> &'static str {
+    match error {
+        crate::runtime::helper::BirthCapabilityError::HelperOutdated(_) => {
+            code::HELPER_NOT_INSTALLED
+        }
+        crate::runtime::helper::BirthCapabilityError::Unavailable(_) => code::STARTUP_FAILED,
+    }
 }
 
 /// 一次性闸门的**领取**动作：`true` = 本次领到（可以做那件只做一次的事），`false` = 已被领走。
@@ -1280,9 +1345,11 @@ impl ProxyRuntime {
             if self.gate.generation() != my_gen {
                 return Ok(self.status());
             }
-            if let Err(message) = capability {
-                self.set_error(&message, code::STARTUP_FAILED);
-                return Err(StartError::coded(message, code::STARTUP_FAILED));
+            if let Err(error) = capability {
+                let error_code = birth_capability_error_code(&error);
+                let message = error.into_message();
+                self.set_error(&message, error_code);
+                return Err(StartError::coded(message, error_code));
             }
         }
         let helper_gate_ms = t_helper_gate.elapsed().as_millis();
@@ -1663,7 +1730,20 @@ impl ProxyRuntime {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let binary = binary_res?;
+            let binary = {
+                let binary = binary_res?;
+                // 应用直起时执行的就是安装包里的这个文件，没有任何一步会再给它补可执行位。
+                // 经提权助手起核时执行的是助手目录里的副本，这个文件的权限位不决定成败，故不拦。
+                if !via_helper {
+                    if let Err(msg) = super::core_binary::ensure_core_executable(&binary) {
+                        // `set_error` 自己记日志、落状态并广播 `event:proxyError`；下面的 `Err` 是给
+                        // 等着这次调用结果的发起方的。两个出口都要：托盘与自动连接没有人在等结果。
+                        self.set_error(&msg, code::CORE_NOT_EXECUTABLE);
+                        return Err(StartError::coded(msg, code::CORE_NOT_EXECUTABLE));
+                    }
+                }
+                binary
+            };
             // C5：起核前快照 utun 基线（每尝试；macOS 时序 diff 锚点）——须在核创建 TS 内核接口**前**。
             let t_mesh_baseline = std::time::Instant::now();
             self.mesh.exit_route_snapshot_baseline().await;
@@ -1861,9 +1941,12 @@ impl ProxyRuntime {
                     Ok(Some(pid)) => pid,
                     Ok(None) => return Ok(self.status()),
                     // helper 起核失败 = R27.3 已决策终态（前端 SettingsHelper 引导先装 helper），**不重试**。
+                    // 码随这一次的失败出栈：配套闸落 `HELPER_CORE_MISMATCH`，其余没有专属码的
+                    // 一律是笼统的启动失败。
                     Err(e) => {
-                        self.set_error(&e, code::STARTUP_FAILED);
-                        return Err(StartError::coded(e, code::STARTUP_FAILED));
+                        let error_code = e.code.unwrap_or(code::STARTUP_FAILED);
+                        self.set_error(&e.message, error_code);
+                        return Err(StartError::coded(e.message, error_code));
                     }
                 }
             } else {
@@ -2595,7 +2678,7 @@ impl ProxyRuntime {
         user_config: &UserConfig,
         my_gen: u64,
         main_reservation: &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<Option<u32>, StartError> {
         polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())?;
         // 让位早退（与直起临界区的「持锁判世代」同义；helper 核无本地 child 锁可持，靠世代 + 标记守）。
         if self.gate.generation() != my_gen {
@@ -2606,17 +2689,25 @@ impl ProxyRuntime {
             let helper = Arc::clone(&self.helper);
             tokio::task::spawn_blocking(move || helper.require_native_birth_capability())
                 .await
-                .map_err(|error| {
-                    format!("helper native birth capability task failed: {error}")
-                })??;
+                .map_err(|error| format!("helper native birth capability task failed: {error}"))?
+                .map_err(crate::runtime::helper::BirthCapabilityError::into_message)?;
             if self.gate.generation() != my_gen {
                 return Ok(None);
             }
         }
-        // **受保护核对账**（换核在本条腿上真正生效的唯一途径）：helper 只会 exec 它安装期锁定的那个
-        // 路径，故必须先把现役核的**内容**推进去。幂等——hash 相同即零动作、零 IPC。
+        // **受保护核对账**：helper 只会 exec 它安装期锁定的那个路径，故必须先把现役核（随包核）的
+        // **内容**推进去 —— 应用升级后受保护目录里还是上一版的内核。幂等——hash 相同即零动作、零 IPC。
         // 放在置 `core_via_helper` 标记与 IPC 之前：此刻还没有受管核，失败也不产生孤儿。
-        self.reconcile_protected_core(binary).await;
+        //
+        // **配套闸**：对账给不出「逐字节一致」就到此为止，不发起核请求。
+        if let ProtectedCoreVerdict::Unconfirmed(why) =
+            self.reconcile_protected_core(binary).await?
+        {
+            return Err(StartError::coded(
+                helper_core_mismatch_message(&why),
+                code::HELPER_CORE_MISMATCH,
+            ));
+        }
         // The lease can reject before any helper operation is queued.
         let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
         // Fence and helper flag publish under the same Child mutex.
@@ -2626,7 +2717,9 @@ impl ProxyRuntime {
                 .lock()
                 .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
             if *closing || self.gate.generation() != my_gen {
-                return Err("proxy is shutting down or helper Start was superseded".into());
+                return Err("proxy is shutting down or helper Start was superseded"
+                    .to_owned()
+                    .into());
             }
             polaris_core_supervisor::with_check_admission(|| {
                 let attempt =
@@ -2670,20 +2763,23 @@ impl ProxyRuntime {
             Ok(HelperStartResult::BirthAlready(target)) => {
                 return Err(format!(
                     "helper exact birth 已有受管核 {target:?}；本次配置未获启动证明，保留既有 custody"
-                ));
+                )
+                .into());
             }
             Ok(HelperStartResult::NotAdmitted(blocker)) => {
                 return Err(format!(
                     "helper 起核未获准：此前受管核 pid={} 仍处于 {blocker:?} custody",
                     blocker.pid()
-                ));
+                )
+                .into());
             }
             Ok(HelperStartResult::BirthNotAdmitted { target, pending }) => {
                 return Err(format!(
                     "helper exact birth 起核未获准：既有 custody={target:?} pending={pending}"
-                ));
+                )
+                .into());
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let pid = target.pid();
         // The blocking worker already published pid under Child→pid, even if
@@ -2705,7 +2801,7 @@ impl ProxyRuntime {
             // Native exit and reservation compare-remove committed together.
             // The helper backend remains sticky; no platform NoOwner was proved.
             let _ = confirmed_stopped;
-            return Err(message);
+            return Err(message.into());
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
         Ok(Some(pid))
@@ -2713,46 +2809,58 @@ impl ProxyRuntime {
 
     /// **受保护核对账**：把现役核推进 helper 锁定的受保护核目录（幂等；内容相同则零动作）。
     ///
-    /// # 为什么在**每次**经 helper 起核前做，而不是「换核成功后推一次」
+    /// # 为什么在**每次**经 helper 起核前做
     ///
-    /// 受保护核与现役核至少有四条独立的漂移路径，挂在换核事件上只能堵住第一条：
-    ///  1. 在线换核 / 手动上传 / 回滚 / reset-factory；
-    ///  2. **app 升级触发的重播种**（`core_paths` 的 reseed 写新随包基线进 `core_update/`）——
-    ///     p101 实测正是这条：2026-07-30 12:46 重播种到 1.14.0-beta.3，而受保护核停在 7-29 装 helper
-    ///     时播下的 1.14.0-alpha.45；
-    ///  3. helper 装得比核晚（安装脚本的播种被 `if [ ! -x "$COREDIR/sing-box" ]` 守着，**已存在就不覆盖**，
+    /// 受保护核与现役核（随包核）有三条独立的漂移路径：
+    ///  1. **应用升级**：安装包带来新内核，受保护目录里还是上一版；
+    ///  2. helper 装得比核晚（安装脚本的播种被 `if [ ! -x "$COREDIR/sing-box" ]` 守着，**已存在就不覆盖**，
     ///     故重装 helper 也修不好已漂移的受保护核）；
-    ///  4. 用户换机器/迁移配置目录。
+    ///  3. 用户换机器/迁移配置目录。
     ///
-    /// 起核前对账把这四条一次性收口，且天然覆盖「helper 早就在跑」这个常态（不需要重启 helper：
+    /// 起核前对账把这三条一次性收口，且天然覆盖「helper 早就在跑」这个常态（不需要重启 helper：
     /// 路径不变、内容变新，helper 每次 `start` 现 spawn）。
     ///
-    /// # 失败处置：只告警不阻断 —— 判定权交给下游的**事实**自证
+    /// # 失败处置：确认不了配套即拒绝起核
     ///
-    /// 本方法失败（IPC 挂了 / hash 不符 / 磁盘满）**不**中止起核：此刻核还没起，中止只会把
-    /// 「版本可能旧」升级成「彻底连不上」。真正该不该向用户报警，由起核后的
-    /// [`attest_running_core_binary`](Self::attest_running_core_binary) 按**实跑二进制**判 ——
-    /// 提升失败但受保护核本来就已是新版（例如上一轮已推成功）时，报警才是噪音。
-    /// 这是刻意的分工：**本方法是机制，自证是判据**。
+    /// 提权助手以 root / SYSTEM 执行受保护目录里的那份内核，而那份内核必须就是本应用随包的
+    /// 一份。本方法是唯一能在**起核之前**回答这个问题的地方：它手里有两侧文件的内容哈希
+    /// （[`protected_core_verdict`] 列了哪些结果算确认）。给不出「逐字节一致」时返回
+    /// [`ProtectedCoreVerdict::Unconfirmed`]，调用方据此落 [`code::HELPER_CORE_MISMATCH`]、不发
+    /// 起核请求。此前这里只告警、照常起核，于是受保护目录里留着旧版本推入的内核时，对账失败或
+    /// 助手不认装核命令都会让它被原样执行。
     ///
-    /// ⚠️ **但在 Windows 的存量机器上那个判据并不存在**（如实登记，别把它当兜底）：
-    /// `running_exe_path` 在 Windows 上恒 `None`（Medium IL 的 app 读不了 SYSTEM child），
-    /// 自证的第二条腿靠 D2 的 helper `status` 回传 `image=` —— 而**旧 helper 没有这个字段**。
-    /// 于是「旧 helper + Windows」这一格里自证恒落 `Unobservable`：只 warn，不报警、不判失败。
-    /// 那正是本方法失败时最需要判据的那一格（旧 helper 也是 `ERR unknown` 的那一格）。
-    /// helper 升级到本批之后这条腿才真的在；在此之前，Windows 上现场只有日志。
-    async fn reconcile_protected_core(&self, active_core: &Path) {
+    /// 起核后的 [`attest_running_core_binary`](Self::attest_running_core_binary) 是第二道：它问的
+    /// 是另一件事（助手**实际**执行的是哪个文件、那个文件自报什么版本），本方法通过不代表它不必
+    /// 跑 —— 助手真正锁定的路径与应用以为的那个对不上时，只有它看得见。
+    ///
+    /// # Errors
+    ///
+    /// 对账尚未开始就被 Child custody 拒绝：与内核配不配套无关，按普通启动失败上报。
+    async fn reconcile_protected_core(
+        &self,
+        active_core: &Path,
+    ) -> Result<ProtectedCoreVerdict, String> {
         use crate::runtime::core_promote as promote;
 
+        #[cfg(test)]
+        if let Some(verdict) = self
+            .protected_core_verdict_fixture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Ok(verdict);
+        }
         if !promote::platform_has_protected_core(self.helper.platform()) {
-            return; // 当前三平台恒假不成立；留着是给「新增平台没有受保护目录」一条早退。
+            // 当前三平台恒假不成立；留着是给「新增平台没有受保护目录」一条早退：那里没有第二份
+            // 内核，也就没有配不配套的问题。
+            return Ok(ProtectedCoreVerdict::Confirmed);
         }
         let Some(src_dir) = active_core.parent().map(Path::to_path_buf) else {
-            log::warn!(
-                "现役核路径无父目录，跳过受保护核对账：{}",
+            return Ok(ProtectedCoreVerdict::Unconfirmed(format!(
+                "现役核路径无父目录，无法对账：{}",
                 active_core.display()
-            );
-            return;
+            )));
         };
         let core_dir = self.helper.protected_core_dir_path();
         let dest = promote::protected_core_path_in(&core_dir, std::env::consts::OS);
@@ -2769,8 +2877,7 @@ impl ProxyRuntime {
         // start. Register before queuing the blocking task, including a task
         // whose async caller is cancelled before the IPC returns.
         if let Err(error) = self.register_helper_backend() {
-            log::warn!("受保护核对账被 Child custody 拒绝：{error}");
-            return;
+            return Err(format!("受保护核对账被 Child custody 拒绝：{error}"));
         }
 
         // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
@@ -2866,6 +2973,12 @@ impl ProxyRuntime {
         .await;
 
         let elapsed_ms = started.elapsed().as_millis();
+        let join_error = outcome.as_ref().err().map(ToString::to_string);
+        let verdict = protected_core_verdict(match &outcome {
+            Ok(Ok(reconciled)) => Ok(reconciled),
+            Ok(Err(error)) => Err(error.as_str()),
+            Err(_) => Err(join_error.as_deref().unwrap_or_default()),
+        });
         match outcome {
             Ok(Ok(ProtectedCoreReconcileOutcome::Cached)) => {
                 log::info!("受保护核元数据缓存命中 → 跳过重复 SHA256（{elapsed_ms}ms）")
@@ -2879,30 +2992,26 @@ impl ProxyRuntime {
                 core_dir.display()
             ),
             // 「没执行」必须自曝：命中与首次撞上分两句，否则「能力探测根本没跑」与「跑了且命中」
-            // 在日志里长得一样。行为与本批前完全一致——warn 一句、继续起核（spec §3.5）。
+            // 在日志里长得一样。
             Ok(Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache })) => {
                 if from_cache {
                     log::warn!(
                         "已装 helper 不支持 install-core（能力缓存命中，{elapsed_ms}ms）→ 跳过受保护核对账；\
-                         helper 升级后自动重试，本次仍按 helper 锁定的核起（加固未生效）"
+                         它手里的内核换不成本应用配套的，拒绝经它起核；helper 升级后自动重试"
                     );
                 } else {
                     log::warn!(
                         "已装 helper 不支持 install-core（ERR unknown，{elapsed_ms}ms）→ 记下能力缺失，\
-                         本会话内不再重复推送；起核继续（加固未生效，等 helper 升级）"
+                         本会话内不再重复推送；它手里的内核换不成本应用配套的，拒绝经它起核"
                     );
                 }
             }
-            // 只警告不中止：判据在下游的实跑自证（见方法文档）。**Windows + 旧 helper 这一格
-            // 没有那个判据**（`running_exe_path` 恒 None，第二腿要的 `image=` 旧 helper 不带）
-            // ⇒ 自证恒 `Unobservable`，现场只剩这一行 warn。
-            Ok(Err(e)) => log::warn!(
-                "受保护核提升失败（{elapsed_ms}ms；起核继续，由起核后自证判定是否告警）：{e}"
-            ),
+            Ok(Err(e)) => log::warn!("受保护核对账失败（{elapsed_ms}ms），拒绝经 helper 起核：{e}"),
             Err(e) => {
-                log::warn!("受保护核提升任务 join 失败（{elapsed_ms}ms；起核继续）：{e}")
+                log::warn!("受保护核对账任务 join 失败（{elapsed_ms}ms），拒绝经 helper 起核：{e}")
             }
         }
+        Ok(verdict)
     }
 
     /// **规则资源缺失** → 用户可见信号（`RULE_RESOURCES_MISSING`）。
@@ -3996,8 +4105,8 @@ impl ProxyRuntime {
 
     /// 本次实际要启动的核心旁是否有 cronet 动态库。
     ///
-    /// 必须与 [`Self::core_binary_for_start`] 同源：环境覆盖、可写核、随包核三条优先级任一变化时，
-    /// 依赖探测都跟着实际 spawn 路径走，不能再固定查配置目录根部。
+    /// 必须与 [`Self::core_binary_for_start`] 同源：依赖探测跟着实际 spawn 路径走，
+    /// 不能固定查某个目录。
     pub(super) fn cronet_lib_exists_for_start(&self) -> bool {
         self.core_binary_for_start()
             .ok()

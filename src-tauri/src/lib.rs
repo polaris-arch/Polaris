@@ -773,10 +773,12 @@ pub fn run() {
             // `create_main_window` 内按同源 raw config 重算（特效关时**不** apply，避免与逃生门叠加合成负担）。
             graphics_compat::apply_hardware_acceleration_escape(hardware_acceleration_disabled);
 
-            // ── 可写现役核基目录注入（**必须早于任何起核路径**）──
-            // `resolve_core_binary()` 是自由函数（无 AppHandle），故基目录经进程级 OnceLock 注入。
-            // 未注入时它恒回落随包种子 —— 行为安全，但换核/回滚会报 CORE_DIR_UNAVAILABLE。
+            // ── 配置根目录注入（供无 AppHandle 的自由函数取用）──
             runtime::core_paths::init_base_dir(config_dir.clone());
+            // 旧版本曾把内核放在配置根下的可写目录里（在线更新 / 手动上传 / 回滚备份）。应用现在
+            // 只从安装包解析内核，那些目录不再被读取；启动即清，免得来源不明的内核继续躺在用户盘上。
+            #[cfg(desktop)]
+            runtime::core_paths::remove_legacy_core_state(&config_dir);
 
             // ── 内置 geo 规则集播种（调用点 1/2：应用启动；对齐 上游 `index.ts:1834`）──
             // 不种 → `<userData>/rules` 恒空 → route builder 一个 rule_set 都不注入 → 全部 geo 规则被
@@ -809,20 +811,12 @@ pub fn run() {
                 });
             }
 
-            // ── 版本感知 reseed：随包核 → 可写现役核（幂等；**失败不 fatal**）──
-            // 失败即回落随包种子照常起核（`resolve_core_binary` 第 3 级）⇒ 首启/迁移永不 brick。
-            // 覆盖判据是纯函数 `decide_reseed`（fork/unknown/更新的核**绝不覆盖**），见 core_paths。
-            // Android executes the packaged libbox through JNI; it has no standalone core to seed.
-            #[cfg(not(target_os = "android"))]
-            match runtime::core_paths::ensure_writable_core(
-                app_runtime.updater().bundled_core_version(),
-            ) {
-                Ok(p) => {
-                    // 把现役核路径注入 UpdaterRuntime（版本双读法的探测目标；此前只认
-                    // POLARIS_SINGBOX_PATH，导致非开发态恒报「未知版本」）。
-                    app_runtime.updater().with_core_binary(p);
-                }
-                Err(e) => log::warn!("可写现役核播种失败（{e}）：回落随包核，换核功能将不可用"),
+            // 把现役内核路径注入 UpdaterRuntime（版本读取的探测目标）。Android / iOS 的内核不是
+            // 独立可执行文件，没有可探测的对象。
+            #[cfg(desktop)]
+            match runtime::proxy::resolve_core_binary() {
+                Ok(core) => app_runtime.updater().with_core_binary(core),
+                Err(e) => log::warn!("未解析到随包内核，版本读取将报未知：{e}"),
             }
             // ── C1 启动期系统代理崩溃恢复 ──
             // 上次若带系统代理退出却未清（崩溃/强杀/panic → marker 残留），早期清掉「仍指向上个已死端口的
@@ -885,20 +879,6 @@ pub fn run() {
             );
             app.manage(measurement_scheduler.clone());
             measurement_scheduler.start(app.handle().clone());
-
-            // ── 内核自动更新调度器（启动 30s + 6h 巡检 + 24h due + 代理停止后 5s 落位）──
-            // 装法与上面两个调度器同构。**30s 启动延迟刻意最靠后**：错开 startup_tasks 的
-            // 2s 自动连接 / 3s 出口 IP / 5s App 更新检查 / 6s 内核基线 / 7s helper 可升级，
-            // 以及订阅 8s、规则资源 12s（= 上游 `CoreUpdateScheduler.STARTUP_DELAY_MS` 的原始理由）。
-            // 它是唯一会**替换内核二进制**的后台腿，总开关 `autoUpdateCore` **缺省关**；
-            // 落位只在代理未运行时发生（绝不主动断流），跨带只提示不自动更新。
-            #[cfg(not(target_os = "android"))]
-            {
-                let core_update_scheduler =
-                    std::sync::Arc::new(runtime::core_update_scheduler::CoreUpdateScheduler::new());
-                core_update_scheduler.start(app.handle().clone());
-                app.manage(core_update_scheduler);
-            }
 
             // ── 自动轻量模式窗口驻留巡检（隐藏 / 最小化 10 分钟，30s 一拍）──
             // 计时**必须在主进程**：原实现挂在主窗 renderer 里，等于让那个正要被回收的 webview
@@ -1281,9 +1261,10 @@ pub fn run() {
             auto_select_enable,
             auto_select_switch_now,
             auto_select_status,
-            // ── 更新（version + app update + core update）──
+            // ── 更新（version + app update）与内核信息 ──
             version_get_info,
             update_check,
+            update_clear_portable_handoff,
             update_download,
             // 更新卡重挂载后回读最后一帧进度（切页/窗口重建后不再退回 idle）。
             update_get_progress,
@@ -1296,15 +1277,7 @@ pub fn run() {
             update_open_releases,
             update_popup_action,
             update_popup_show,
-            core_update_check,
-            core_update_run,
             core_get_version_info,
-            core_rollback,
-            core_replace_manual,
-            core_update_get_auto_status,
-            core_update_apply_staged,
-            core_update_ack_version_change,
-            core_reset_factory,
             app_uninstall_all,
             // ── 窗口控制（window:* + app + renderer/fatal）──
             window_minimize,

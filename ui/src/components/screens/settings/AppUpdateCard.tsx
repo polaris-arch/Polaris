@@ -42,6 +42,10 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
     receivedBytes,
     errMsg,
     downloadIntegrity,
+    installing,
+    manualCompletionUnverified,
+    clearingPortable,
+    discardPortableAndCheck,
     checkUpdate,
     reinstallCurrent,
     skipVersion,
@@ -209,7 +213,12 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             {downloadUnverified && (
               <Pill variant="warn">{t('settings.update.digestMissingTag')}</Pill>
             )}
-            <Button variant="flow" size="sm" onClick={() => void installUpdate()}>
+            <Button
+              variant="flow"
+              size="sm"
+              disabled={installing}
+              onClick={() => void installUpdate()}
+            >
               <span>{t('settings.update.restartAndInstall')}</span>
             </Button>
           </div>
@@ -221,7 +230,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
           <div className="core-ver">
             <Dot variant="ok" />
             <div style={{ flex: 1 }}>
-              <b>{t('settings.update.downloadedManual')}</b>{' '}
+              <b>{t(manualCompletionUnverified ? 'settings.update.portableCompletionUnknown' : 'settings.update.downloadedManual')}</b>{' '}
               <span className="cv-tag">{updateInfo?.version}</span>
               {updateInfo?.isPrerelease && (
                 <>
@@ -229,7 +238,9 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
                   <Pill variant="warn">{t('settings.update.prereleaseTag')}</Pill>
                 </>
               )}
-              <CardSub style={{ lineHeight: 1.7, wordBreak: 'break-all' }}>{errMsg}</CardSub>
+              <CardSub style={{ lineHeight: 1.7, wordBreak: 'break-all', whiteSpace: 'pre-line' }}>
+                {errMsg}
+              </CardSub>
               {downloadUnverified && (
                 <CardSub style={{ marginTop: 4, lineHeight: 1.7 }}>
                   {t('settings.update.digestMissingAfter')}
@@ -239,6 +250,18 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             {downloadUnverified && (
               <Pill variant="warn">{t('settings.update.digestMissingTag')}</Pill>
             )}
+            <Button variant="ghost" size="sm" disabled={installing || clearingPortable} onClick={discardPortableAndCheck}>
+              <span>{t('settings.update.portableClearAndCheck')}</span>
+            </Button>
+            {/* 这一下会停核并退出应用：调用在飞时置灰，不让第二次点击再发一遍。 */}
+            <Button
+              variant="flow"
+              size="sm"
+              disabled={installing || clearingPortable}
+              onClick={() => void installUpdate(true)}
+            >
+              <span>{t('settings.update.portableQuitAndOpen')}</span>
+            </Button>
           </div>
         </div>
       )}

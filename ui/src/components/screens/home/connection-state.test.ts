@@ -302,11 +302,10 @@ describe('hasTerminalProxyError', () => {
     expect(hasTerminalProxyError({ running: false, errorCode: undefined })).toBe(false);
   });
 
-  it('中性取消/更新拒绝只保留即时反馈，不污染常驻状态', () => {
+  it('中性取消只保留即时反馈，不污染常驻状态', () => {
     for (const errorCode of [
       ProxyErrorCode.HELPER_GATE_ABORTED,
       ProxyErrorCode.STOP_AUTH_CANCELLED,
-      ProxyErrorCode.CORE_UPDATE_IN_PROGRESS,
     ]) {
       expect(hasTerminalProxyError({ running: false, errorCode })).toBe(false);
     }

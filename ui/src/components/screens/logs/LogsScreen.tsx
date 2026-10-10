@@ -402,7 +402,7 @@ export function LogsScreen() {
    * 核内级别只在**起核那一刻**定下（生成配置时注入）。`event:proxyLifecycle`
    * 在 ready / stopped / failed 真跃迁点发出，收到即重读，消除「核已重启但徽标还旧」的 0—5s 人为滞后。
    *
-   * 5s 轮询仍保留为事件丢失/非标准换核的兜底；本屏卸载即停，不留后台轮询。
+   * 5s 轮询仍保留为事件丢失/非标准重启路径的兜底；本屏卸载即停，不留后台轮询。
    */
   useEffect(() => {
     void refreshRuntimeLevel();
