@@ -53,6 +53,24 @@ function hasPlatformModulePolicy(spec, key) {
     && isModulePartition(platform.transportModules, Object.keys(spec.transportPins ?? {}), 'confirmedAbsent');
 }
 
+// A present desktop block is an explicit contract, including null. Only an
+// absent key selects the historical graph, which mobile still owns unchanged.
+export const hasDesktopSource = (manifest) => Object.hasOwn(manifest, 'desktopSourceBuild');
+export function desktopSourceSpec(manifest) {
+  if (!hasDesktopSource(manifest)) {
+    requireGraph(manifest.sourceBuild?.sourceMode === undefined, 'Legacy sourceBuild cannot activate a desktop fork');
+    return manifest.sourceBuild;
+  }
+  const spec = manifest.desktopSourceBuild;
+  requireGraph(spec && typeof spec === 'object' && !Array.isArray(spec)
+    && spec.sourceMode === 'fork-commit-v1'
+    && typeof spec.upstreamVersion === 'string' && /^[0-9][0-9A-Za-z.+-]*$/.test(spec.upstreamVersion),
+  'Explicit desktopSourceBuild object/fork mode/upstreamVersion required');
+  return spec;
+}
+export const desktopSourceBaseline = (manifest) => hasDesktopSource(manifest)
+  ? desktopSourceSpec(manifest).upstreamVersion : manifest.bundledCoreVersion;
+
 // Activation belongs to the reviewed App manifest. No branch-head/default-URL fallback.
 export function isForkSource(spec) {
   requireGraph(spec?.sourceMode === undefined || spec.sourceMode === 'fork-commit-v1', 'Unsupported desktop source mode');
@@ -61,7 +79,7 @@ export function isForkSource(spec) {
 export const desktopSourceManifestPath = (spec) => isForkSource(spec)
   ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
 export function desktopSourceGoVersion(root, manifest) {
-  const spec = manifest.sourceBuild;
+  const spec = validateSourcePins(manifest, 'linux', false);
   const path = join(root, desktopSourceManifestPath(spec));
   verifyHash(path, spec.sourceManifestSha256);
   const source = JSON.parse(readFileSync(path, 'utf8'));
@@ -130,7 +148,8 @@ export const desktopOverlays = (spec, key, overlaySha256) => isForkSource(spec) 
 
 export function validateSourcePins(manifest, key, outputsRequired = true) {
   requireGraph(Object.hasOwn(DESKTOP_TARGETS, key), `Unknown desktop core target: ${key}`);
-  const spec = manifest.sourceBuild;
+  const spec = desktopSourceSpec(manifest);
+  const baseline = desktopSourceBaseline(manifest);
   requireGraph(!isForkSource(spec) || manifest.windowsBuild === undefined, 'Fork source cannot retain an App Windows overlay contract');
   const frozen = spec && ['sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
     'moduleGraphSha256'].every((field) => isSha(spec[field]))
@@ -141,12 +160,16 @@ export function validateSourcePins(manifest, key, outputsRequired = true) {
     && spec.transportPins && typeof spec.transportPins === 'object' && !Array.isArray(spec.transportPins)
     && Object.keys(spec.transportPins).length > 0 && Object.entries(spec.transportPins).every(([module, version]) =>
       isModule(module) && typeof version === 'string' && /^v[0-9A-Za-z.+-]+$/.test(version))
-    && typeof spec.version === 'string' && spec.version.startsWith(`${manifest.bundledCoreVersion}.polaris.`)
-    && /^[1-9][0-9]*$/.test(spec.version.slice(`${manifest.bundledCoreVersion}.polaris.`.length))
+    && typeof spec.version === 'string' && spec.version.startsWith(`${baseline}.polaris.`)
+    && /^[1-9][0-9]*$/.test(spec.version.slice(`${baseline}.polaris.`.length))
     && same(Object.keys(spec.platforms ?? {}).sort(), Object.keys(DESKTOP_TARGETS).sort())
     && Object.entries(spec.platforms).every(([platformKey, platform]) => isTree(platform?.buildTree)
       && hasPlatformModulePolicy(spec, platformKey)
-      && (!outputsRequired || isSha(platform.binarySha256)));
+      && (!outputsRequired || isSha(platform.binarySha256)))
+    && (!hasDesktopSource(manifest) || isSha(spec.mainGoModSha256) && isSha(spec.mainGoSumSha256)
+      && spec.graphScope === 'core-source-only' && spec.dependencyModules.length === 0
+      && spec.buildTree === spec.patchedSourceTree
+      && Object.values(spec.platforms).every((platform) => platform.buildTree === spec.buildTree));
   requireGraph(frozen, `Desktop source graph is not frozen: combined source/dependency/receipt${outputsRequired ? ' and four output' : ' input'} pins are required; official assets and old cached cores cannot substitute`);
   return spec;
 }
@@ -174,7 +197,7 @@ export function validateSourceManifest(source, spec) {
     requireGraph(source.schema === 'polaris-desktop-fork-source-v1' && source.role === 'desktop'
       && source.sourceURL === 'https://github.com/polaris-arch/polaris-box', 'Desktop fork repository/schema/role differs');
     const version = /^(.*)\.polaris\.[1-9][0-9]*$/.exec(spec.version ?? '')?.[1];
-    requireGraph(version && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
+    requireGraph(version && version === spec.upstreamVersion && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
       && typeof source.sourceTag === 'string' && source.sourceTag.startsWith(`polaris-${source.upstreamTag}-`)
       && /^[1-9][0-9]*$/.test(source.sourceTag.slice(`polaris-${source.upstreamTag}-`.length))
       && isTree(source.sourceTagObject), 'Immutable fork tag/upstream pins missing or inconsistent');
@@ -212,7 +235,9 @@ export function validateSourceManifest(source, spec) {
 export function validateSourceReceipt(receipt, source, spec) {
   validateSourceManifest(source, spec);
   requireGraph(receipt?.schema === 'polaris-core-source-v1', 'Unsupported source receipt schema');
-  if (isForkSource(spec)) requireGraph(receipt.upstreamTree === source.sourceTree, 'Fork receipt commit tree differs');
+  if (isForkSource(spec)) requireGraph(receipt.upstreamTree === source.sourceTree
+    && receipt.mainGoModSha256 === spec.mainGoModSha256 && receipt.mainGoSumSha256 === spec.mainGoSumSha256,
+  'Fork receipt commit tree/full main manifests differ');
   const [graphScope, sourceGraphState] = source.dependencyPatches.length > 0
     ? ['declared-patched-modules', 'dependencies-patched'] : ['core-source-only', 'source-only'];
   requireGraph(receipt.graphScope === graphScope && receipt.sourceGraphState === sourceGraphState,
@@ -331,4 +356,39 @@ export function buildInfoFingerprint(raw) {
   return digest(canonical({ goVersion: facts.goVersion,
     modules: [...facts.modules.entries()].sort(([a], [b]) => a.localeCompare(b)),
     settings: [...facts.settings.entries()].sort(([a], [b]) => a.localeCompare(b)) }));
+}
+
+// Section-local corresponding-source guidance cannot be supplied by another
+// platform's text. Legacy NOTICE retains its existing policy in the CLI.
+export function validateForkNotice(notice, manifest, source, mobile) {
+  const spec = validateSourcePins(manifest, 'linux', false);
+  validateSourceManifest(source, spec);
+  const block = (label) => {
+    const lines = notice.split(/\r?\n/);
+    const starts = lines.flatMap((line, index) => line.startsWith(`  - ${label} `) ? [index] : []);
+    requireGraph(starts.length === 1, `NOTICE: unique ${label} section required`);
+    const end = lines.findIndex((line, index) => index > starts[0] && line.startsWith('  - '));
+    return lines.slice(starts[0], end < 0 ? lines.length : end).map((line) => line.trim());
+  };
+  const exact = (lines, expected) => {
+    const label = expected.slice(0, expected.indexOf('：') + 1);
+    requireGraph(lines.filter((line) => line.startsWith(label)).length === 1 && lines.includes(expected),
+      `NOTICE: section-local identity missing/duplicated: ${expected}`);
+  };
+  const desktop = block('桌面 sing-box');
+  requireGraph(desktop[0] === `- 桌面 sing-box v${spec.upstreamVersion} (GPLv3) — ${source.sourceURL}`,
+    'NOTICE: desktop baseline/repository differs');
+  for (const line of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/${source.upstreamTag}`,
+    `桌面源码修复构建：${spec.version}`, `固定源码：${source.sourceURL}/tree/${source.sourceCommit}`,
+    `固定消费标签：${source.sourceURL}/tree/${source.sourceTag}`, `消费标签对象：${source.sourceTagObject}`,
+    `共同 source manifest SHA-256：${spec.sourceManifestSha256}`]) exact(desktop, line);
+  for (const [label, identity] of [['Android libbox 基线', mobile.android], ['Apple libbox 基线', mobile.apple]]) {
+    requireGraph(isTree(identity?.sourceCommit) && isSha(identity.manifestSha256), 'NOTICE: mobile source identity missing');
+    const lines = block(label);
+    requireGraph(lines[0] === `- ${label} v${manifest.bundledCoreVersion} (GPLv3) — https://github.com/SagerNet/sing-box`,
+      `NOTICE: ${label} baseline differs`);
+    for (const line of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/v${manifest.bundledCoreVersion}`,
+      `固定源码：https://github.com/SagerNet/sing-box/tree/${identity.sourceCommit}`,
+      `source manifest SHA-256：${identity.manifestSha256}`]) exact(lines, line);
+  }
 }

@@ -902,3 +902,19 @@ test('consumer rejects a selected artifact changed after all inspections but bef
     assert.equal(existsSync(join(f.root, 'resources/mac-x64/sing-box')), false);
   } finally { f.dispose(); }
 });
+
+
+test('legacy source remains selected only when desktopSourceBuild is absent', () => {
+  const f = fixture([]);
+  try {
+    assert.equal(validateSourcePins(f.manifest, 'linux', false), f.manifest.sourceBuild);
+    const baseline = frozenSourceVersion(f.manifest);
+    assert.ok(baseline);
+    for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+      const manifest = { ...f.manifest, desktopSourceBuild: invalid };
+      assert.equal(frozenSourceVersion(manifest), undefined);
+      for (const key of Object.keys(DESKTOP_TARGETS)) assert.throws(() => validateSourcePins(manifest, key, false));
+    }
+    assert.equal(frozenSourceVersion(f.manifest), baseline);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});

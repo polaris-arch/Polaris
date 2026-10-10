@@ -1,7 +1,7 @@
 // Tiny local Git objects and a fake compiler prove contract wiring, never a kernel verdict.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import test from 'node:test';
 import { produceDesktopCore } from './build-core.mjs';
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, desktopSourceManifestPath, digest, expectedTags,
-  platformSourceIdentity, desktopSourceGoVersion, observeMacCodeSignature, validateMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt } from './source-graph.mjs';
+  platformSourceIdentity, desktopSourceGoVersion, observeMacCodeSignature, validateMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, validateForkNotice } from './source-graph.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const candidate = 'c'.repeat(40);
@@ -53,14 +53,16 @@ function fixture() {
     copyFileSync(join(repo, 'scripts/core-source-provision.py'), provider);
     const receipt = JSON.parse(execFileSync('python3', ['-B', provider, '--manifest', sourcePath,
       '--source', repository, '--checkout', join(root, 'initial-checkout')], { encoding: 'utf8', stdio: 'pipe' }));
-    const spec = { sourceMode: 'fork-commit-v1', sourceManifestSha256: receipt.sourceManifestSha256,
+    const spec = { sourceMode: 'fork-commit-v1', upstreamVersion: '1.0.0', graphScope: 'core-source-only',
+      mainGoModSha256: receipt.mainGoModSha256, mainGoSumSha256: receipt.mainGoSumSha256, sourceManifestSha256: receipt.sourceManifestSha256,
       provisionerSha256: receipt.provisionerSha256, sourceReceiptFingerprint: receipt.fingerprint,
       moduleGraphSha256: receipt.moduleGraphSha256, patchedSourceTree: source.sourceTree, buildTree: source.sourceTree,
       version: '1.0.0.polaris.1', dependencyModules: [], transportPins: { 'example.com/transport': 'v1.0.0' },
       platforms: Object.fromEntries(Object.keys(DESKTOP_TARGETS).map((key) => [key, { buildTree: source.sourceTree,
         patchedModules: { requiredLinked: [], allowedAbsent: [] },
         transportModules: { requiredLinked: ['example.com/transport'], confirmedAbsent: [] }, binarySha256: null }])) };
-    const manifest = { bundledCoreVersion: '1.0.0', sourceBuild: spec };
+    const manifest = { ...json(join(repo, 'src-tauri/core-manifest.json')), desktopSourceBuild: spec };
+    delete manifest.windowsBuild;
     return { root, repository, upstreamRepository, source, receipt, manifest };
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }
 }
@@ -95,7 +97,7 @@ function runner(f, key, mutate = {}) {
     if (args[0] === 'version' && args[1] === '-m') return metadata(key, args[2]);
     if (args[0] === 'tool' && args[1] === 'buildid') {
       const receipt = existsSync(`${args[2]}.source-receipt.json`) ? json(`${args[2]}.source-receipt.json`).sourceReceipt : f.receipt;
-      return platformSourceIdentity(receipt, f.source, f.manifest.sourceBuild, key).buildID;
+      return platformSourceIdentity(receipt, f.source, f.manifest.desktopSourceBuild, key).buildID;
     }
     if (args[0] === 'build') { write(args[args.indexOf('-o') + 1], `synthetic ${key}`); return ''; }
     if (args[0] === 'test') return ''; // Unit-test command wiring only; no Windows test executable runs.
@@ -106,7 +108,7 @@ function runner(f, key, mutate = {}) {
 function refresh(f) {
   const raw = JSON.stringify(f.source);
   write(join(f.root, 'scripts/desktop-core/source-manifest.json'), raw);
-  f.manifest.sourceBuild.sourceManifestSha256 = digest(raw);
+  f.manifest.desktopSourceBuild.sourceManifestSha256 = digest(raw);
 }
 
 // Legacy manifests/provider remain byte-pinned; this batch cannot activate production consumption.
@@ -144,9 +146,9 @@ test('fork contract rejects wrong repository, role, pins, overlays and shared mo
     ];
     assert.throws(() => validateSourcePins({ ...f.manifest, windowsBuild: {} }, 'linux', false), /Windows overlay/);
     for (const [name, mutate] of cases) {
-      const source = structuredClone(f.source), spec = structuredClone(f.manifest.sourceBuild);
+      const source = structuredClone(f.source), spec = structuredClone(f.manifest.desktopSourceBuild);
       mutate(source, spec);
-      const attempt = { ...f, source, manifest: { ...f.manifest, sourceBuild: spec } };
+      const attempt = { ...f, source, manifest: { ...f.manifest, desktopSourceBuild: spec } };
       refresh(attempt);
       const r = runner(attempt, 'linux');
       assert.throws(() => produceDesktopCore(f.root, attempt.manifest, 'linux', join(f.root, 'rejected'), candidate, r.run), undefined, name);
@@ -214,7 +216,7 @@ test('all four fork producers, bundle consumer and packaging use the same pinned
     bad.upstreamTree = 'e'.repeat(40);
     const { fingerprint, ...facts } = bad;
     bad.fingerprint = digest(canonical(facts));
-    assert.throws(() => validateSourceReceipt(bad, f.source, { ...f.manifest.sourceBuild, sourceReceiptFingerprint: bad.fingerprint }), /commit tree/);
+    assert.throws(() => validateSourceReceipt(bad, f.source, { ...f.manifest.desktopSourceBuild, sourceReceiptFingerprint: bad.fingerprint }), /commit tree/);
     assert.equal(buildInfoFingerprint(metadata('linux', 'a')), buildInfoFingerprint(metadata('linux', 'b')));
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -230,8 +232,8 @@ test('desktop Go pin reads the selected desktop manifest, rejects mobile role an
     f.source.role = 'mobile'; refresh(f);
     assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /role/);
     f.source.role = 'desktop'; refresh(f);
-    delete f.manifest.sourceBuild.sourceManifestSha256;
-    assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /SHA-256/);
+    delete f.manifest.desktopSourceBuild.sourceManifestSha256;
+    assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /not frozen/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -270,8 +272,8 @@ test('actual five workflow Go pin commands reject wrong source bytes, mobile rol
     f.source.role = 'mobile'; refresh(f);
     runCommands(false, /role/);
     f.source.role = 'desktop'; refresh(f);
-    delete f.manifest.sourceBuild.sourceManifestSha256;
-    runCommands(false, /SHA-256/);
+    delete f.manifest.desktopSourceBuild.sourceManifestSha256;
+    runCommands(false, /not frozen/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -293,4 +295,85 @@ test('Mac observation requires strict success/unique CDHash or the precise thin 
   assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-x64', () => ({ status: null, error: Error('missing tool') })), /Cannot inspect/);
   assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-arm64', (_command, args) => ({ status: 0, stderr:
     args[0] === '--display' ? `CDHash=${'a'.repeat(40)}\nCDHash=${'b'.repeat(40)}\n` : '' })), /unique actual/);
+});
+
+
+test('present desktop block is fail-closed at every producer before any command', () => {
+  const f = fixture();
+  try {
+    const mobile = canonical(f.manifest.sourceBuild);
+    for (const invalid of [null, [], 'bad', {}, { ...f.manifest.desktopSourceBuild, sourceMode: undefined },
+      { ...f.manifest.desktopSourceBuild, upstreamVersion: undefined }, f.manifest.sourceBuild,
+      { ...f.manifest.desktopSourceBuild, mainGoModSha256: null }]) {
+      const manifest = { ...f.manifest, desktopSourceBuild: invalid };
+      for (const key of Object.keys(DESKTOP_TARGETS)) {
+        const r = runner(f, key);
+        assert.throws(() => produceDesktopCore(f.root, manifest, key, join(f.root, 'reject', key), candidate, r.run));
+        assert.equal(r.calls.length, 0, key);
+        assert.equal(existsSync(join(f.root, 'reject', key)), false);
+      }
+    }
+    assert.equal(canonical(f.manifest.sourceBuild), mobile);
+    for (const key of Object.keys(DESKTOP_TARGETS)) assert.equal(validateSourcePins(f.manifest, key, false), f.manifest.desktopSourceBuild);
+    const legacy = { ...f.manifest }; delete legacy.desktopSourceBuild;
+    assert.equal(validateSourcePins(legacy, 'linux', false), f.manifest.sourceBuild);
+    const swap = { ...legacy, sourceBuild: f.manifest.desktopSourceBuild };
+    assert.throws(() => validateSourcePins(swap, 'linux', false), /Legacy/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('packaging CLI rejects a present invalid desktop block in all four modes', () => {
+  const f = fixture();
+  try {
+    cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
+    const path = join(f.root, 'src-tauri/core-manifest.json');
+    for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+      write(path, JSON.stringify({ ...f.manifest, desktopSourceBuild: invalid }));
+      for (const mode of ['confs', 'payload', 'assets', 'inventory']) {
+        const result = spawnSync(process.execPath, [join(f.root, 'scripts/verify-packaging.mjs'), mode], { encoding: 'utf8', cwd: f.root });
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, /Desktop source admission failed/);
+        assert.doesNotMatch(result.stdout, /全部不变量成立/);
+      }
+    }
+    // Equal-sized staging bytes cannot replace a mandatory D source receipt.
+    write(path, JSON.stringify(f.manifest));
+    write(join(f.root, 'resources/win/sing-box.exe'), 'synthetic equal-size core');
+    write(join(f.root, 'staging/_up_/resources/win/sing-box.exe'), 'synthetic equal-size core');
+    const result = spawnSync(process.execPath, [join(f.root, 'scripts/verify-packaging.mjs'),
+      'payload', '--label', 'windows', '--root', 'staging'], { encoding: 'utf8', cwd: f.root });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /frozen source artifact\/receipt mismatch:.*source-receipts.*win\.json/);
+    assert.doesNotMatch(result.stdout, /全部不变量成立/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('fork NOTICE binds desktop, Android and Apple corresponding sources inside their own sections', () => {
+  const f = fixture();
+  try {
+    const spec = f.manifest.desktopSourceBuild;
+    const mobile = { android: { sourceCommit: 'a'.repeat(40), manifestSha256: 'b'.repeat(64) },
+      apple: { sourceCommit: 'c'.repeat(40), manifestSha256: 'd'.repeat(64) } };
+    const desktop = `  - 桌面 sing-box v${spec.upstreamVersion} (GPLv3) — ${f.source.sourceURL}\n`
+      + [`上游基线源码：https://github.com/SagerNet/sing-box/tree/${f.source.upstreamTag}`,
+        `桌面源码修复构建：${spec.version}`, `固定源码：${f.source.sourceURL}/tree/${f.source.sourceCommit}`,
+        `固定消费标签：${f.source.sourceURL}/tree/${f.source.sourceTag}`, `消费标签对象：${f.source.sourceTagObject}`,
+        `共同 source manifest SHA-256：${spec.sourceManifestSha256}`].map((line) => `    ${line}\n`).join('');
+    const section = (label, identity) => `  - ${label} v${f.manifest.bundledCoreVersion} (GPLv3) — https://github.com/SagerNet/sing-box\n`
+      + [`上游基线源码：https://github.com/SagerNet/sing-box/tree/v${f.manifest.bundledCoreVersion}`,
+        `固定源码：https://github.com/SagerNet/sing-box/tree/${identity.sourceCommit}`,
+        `source manifest SHA-256：${identity.manifestSha256}`].map((line) => `    ${line}\n`).join('');
+    const android = section('Android libbox 基线', mobile.android);
+    const apple = section('Apple libbox 基线', mobile.apple);
+    const notice = desktop + android + apple;
+    validateForkNotice(notice, f.manifest, f.source, mobile);
+    const fixed = `    固定源码：${f.source.sourceURL}/tree/${f.source.sourceCommit}\n`;
+    const invalid = [desktop.replace(fixed, '') + android + fixed + apple,
+      desktop + android.replace(mobile.android.sourceCommit, mobile.apple.sourceCommit) + apple,
+      desktop + android + apple.replace(mobile.apple.manifestSha256, mobile.android.manifestSha256),
+      notice + apple, notice.replace(spec.version, f.manifest.sourceBuild.version),
+      notice.replace(spec.sourceManifestSha256, mobile.android.manifestSha256),
+      desktop + `    固定源码：https://github.com/SagerNet/sing-box/tree/${mobile.android.sourceCommit}\n` + android + apple];
+    for (const text of invalid) assert.throws(() => validateForkNotice(text, f.manifest, f.source, mobile), /NOTICE/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

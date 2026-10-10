@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, DESKTOP_TARGETS, digest, requireGraph, validateSourceManifest,
-  validateSourcePins } from './desktop-core/source-graph.mjs';
+  validateSourcePins, hasDesktopSource, desktopSourceManifestPath } from './desktop-core/source-graph.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Historical reviewed backend anchor, not a commit claiming the later Go inputs.
@@ -41,6 +41,12 @@ const reviewedSourceIncrement = Object.freeze({
 // output pins are excluded: the existing all-four consumer verifies actual
 // producer outputs for the current candidate/run/attempt, rather than old pins.
 const reviewedInputsSha256 = 'ffcee458004b621e531917a23338bca978981406cb2087c22fd55bdd39b3a31a';
+// Projection of the same reviewed legacy closure: retain the entire graph
+// consumed by Android/iOS, not just a display version. Output bytes still bind
+// at their native consumer gates. This projection grants no D release authority.
+const reviewedMobileInputsSha256 = 'd5ecd0fd5c1131b5ecd1a2842fa8d3cf35b3a940aecdce03fdfa8ebabb3f77b7';
+const reviewedAppleSourceSha256 = '1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942';
+
 // Product policy of this closure: the Linux ownership chain is not built. The
 // generic validators accept an empty dependency graph; this requires it.
 export const OWNERSHIP_CHAIN_PATCHES = Object.freeze(['tun-owner-consumer.patch',
@@ -62,11 +68,40 @@ const readRepository = (relative) => readFileSync(join(root, relative));
 export function assertSourceFirstRelease(read = readRepository) {
   const manifest = JSON.parse(read('src-tauri/core-manifest.json'));
   for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
-  const spec = manifest.sourceBuild;
-  const sourcePath = 'scripts/libbox-patches/source-manifest.json';
+  const spec = validateSourcePins(manifest, 'linux', false);
+  const sourcePath = desktopSourceManifestPath(spec);
   // Named before the digests so a reintroduction is not reported as a hash drift.
   assertOwnershipChainAbsent(spec, JSON.parse(read(sourcePath)));
   const inputs = structuredClone(manifest);
+  if (hasDesktopSource(manifest)) {
+    // Structural admission is not release authority. Bind D bytes and retain
+    // the complete old mobile graph; the new reviewed closure needs real pins.
+    requireGraph(digest(read(sourcePath)) === spec.sourceManifestSha256,
+      'Reviewed desktop source SHA-256 differs');
+    requireGraph(digest(read('scripts/core-source-provision.py')) === spec.provisionerSha256,
+      'Reviewed desktop provisioner SHA-256 differs');
+    validateSourceManifest(JSON.parse(read(sourcePath)), spec);
+    const mobileInputs = { bundledCoreVersion: manifest.bundledCoreVersion, sourceBuild: structuredClone(manifest.sourceBuild) };
+    const mobileManifest = { ...mobileInputs };
+    for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(mobileManifest, key, false);
+    for (const platform of Object.values(mobileInputs.sourceBuild.platforms)) delete platform.binarySha256;
+    requireGraph(digest(canonical(mobileInputs)) === reviewedMobileInputsSha256,
+      'Mobile source inputs differ from the reviewed release policy');
+    const check = (path, sha) => {
+      const bytes = read(path);
+      requireGraph(digest(bytes) === sha, `Reviewed mobile source SHA-256 mismatch: ${path}`);
+      return bytes;
+    };
+    const mobileSpec = mobileManifest.sourceBuild;
+    const mobileSource = JSON.parse(check('scripts/libbox-patches/source-manifest.json', mobileSpec.sourceManifestSha256));
+    const mobileDependencies = validateSourceManifest(mobileSource, mobileSpec);
+    assertOwnershipChainAbsent(mobileSpec, mobileSource);
+    check('scripts/core-source-provision.py', mobileSpec.provisionerSha256);
+    for (const patch of mobileSource.patches) check(`scripts/libbox-patches/${patch.file}`, patch.sha256);
+    for (const dep of mobileDependencies) check(`scripts/libbox-patches/${dep.patchFile}`, dep.patchSha256);
+    check('scripts/libbox-ios-patches/source-manifest.json', reviewedAppleSourceSha256);
+    throw new Error('Desktop fork source review must be renewed: exact D release input closure not recorded');
+  }
   delete inputs.windowsBuild.binarySha256;
   for (const platform of Object.values(inputs.sourceBuild.platforms)) delete platform.binarySha256;
   requireGraph(digest(canonical(inputs)) === reviewedInputsSha256,

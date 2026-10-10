@@ -74,7 +74,7 @@ import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
 import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
-import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
+import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -971,45 +971,62 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   //
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
-  const version = String(manifest.bundledCoreVersion ?? '');
-  const sourceVersion = frozenSourceVersion(manifest);
-  if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
-      || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
-      || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
-    fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
-  }
-  if (manifest.windowsBuild) {
-    const build = manifest.windowsBuild;
-    if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
-        || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
-        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
-      fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
+  if (hasDesktopSource(manifest)) {
+    try {
+      const spec = validateSourcePins(manifest, 'linux', false);
+      const path = join(ROOT, desktopSourceManifestPath(spec));
+      verifyHash(path, spec.sourceManifestSha256);
+      const source = readJson(path);
+      const androidPath = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const applePath = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(androidPath, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateForkNotice(texts.NOTICE, manifest, source,
+        { android: identity(androidPath), apple: identity(applePath) });
+    } catch (error) { fail(error.message); }
+  } else {
+    const version = String(manifest.bundledCoreVersion ?? '');
+    const sourceVersion = frozenSourceVersion(manifest);
+    if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
+        || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
+        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
+      fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
     }
-  }
-  if (!/^\d[\w.\-+]*$/.test(version)) {
-    fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
-    return;
-  }
-  const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  if (proseVersions.length === 0) {
-    fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
-  }
-  if (tagVersions.length === 0) {
-    fail(
-      `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
-        `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
-    );
-  }
-  for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
-    for (const v of list) {
-      if (v !== version) {
-        fail(
-          `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
-            `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
-        );
+    if (manifest.windowsBuild) {
+      const build = manifest.windowsBuild;
+      if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
+          || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
+          || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
+        fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
       }
     }
+    if (!/^\d[\w.\-+]*$/.test(version)) {
+      fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
+      return;
+    }
+    const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    if (proseVersions.length === 0) {
+      fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
+    }
+    if (tagVersions.length === 0) {
+      fail(
+        `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
+          `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
+      );
+    }
+    for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
+      for (const v of list) {
+        if (v !== version) {
+          fail(
+            `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
+              `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
+          );
+        }
+      }
+    }
+
   }
 
   // ── ④ 版权行单一真值：NOTICE 的版权行必须与 LICENSE 里那行逐字一致（同 checkMacOpenGuide 的口径）。
@@ -2053,7 +2070,7 @@ function checkPayload(label, root) {
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
         const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
-        if (coreManifest && frozenSourceVersion(coreManifest)) {
+        if (coreManifest && (hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
           try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
           catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
         } else if (label === 'windows' && family.what === 'sing-box') {
@@ -3202,6 +3219,15 @@ try {
 }
 
 function runMode() {
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
+  if (hasDesktopSource(manifest)) {
+    try {
+      for (const key of Object.keys(CORE_TO_CONF)) validateSourcePins(manifest, key, false);
+    } catch (error) {
+      fail(`Desktop source admission failed: ${error.message}`);
+      return; // Never enter a legacy/bytes-only branch after invalid D admission.
+    }
+  }
 switch (mode) {
   case 'confs':
     checkConfs();

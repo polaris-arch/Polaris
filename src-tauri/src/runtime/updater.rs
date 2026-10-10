@@ -51,6 +51,9 @@ struct CoreManifest {
     windows_build: Option<WindowsBuild>,
     #[serde(rename = "sourceBuild")]
     source_build: Option<serde_json::Value>,
+    // Preserve presence, including null/arrays, without rejecting mobile parsing.
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,7 +76,8 @@ fn bundled_core_version() -> String {
     })
 }
 
-/// **桌面**补丁集标识：清单 `sourceBuild.patchedSourceTree`（打完桌面补丁队列后的源码树哈希）。
+/// **桌面**补丁集标识：显式 `desktopSourceBuild` 或旧 `sourceBuild` 的 `patchedSourceTree`。
+/// 显式桌面块无效时返回 `None`，不会借用旧移动端图的标识。
 ///
 /// 只在清单被认作冻结清单时给出（与 [`bundled_core_version_from_manifest`] 取 `sourceBuild.version`
 /// 用同一个判据 [`frozen_source_build_version`]）：清单不完整时版本回落到上游基线，那时再给一个
@@ -84,14 +88,31 @@ fn bundled_core_patch_set_from_manifest(raw: &str, mobile: bool) -> Option<Strin
         return None;
     }
     let manifest = serde_json::from_str::<CoreManifest>(raw).ok()?;
-    let source = manifest.source_build.as_ref()?;
-    frozen_source_build_version(source, &manifest.bundled_core_version)?;
+    let source = if let Some(source) = manifest.extra.get("desktopSourceBuild") {
+        frozen_desktop_source_version(
+            &manifest,
+            source,
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()?
+                .get("windowsBuild")
+                .is_some(),
+        )?;
+        source
+    } else {
+        let source = manifest.source_build.as_ref()?;
+        if source.get("sourceMode").is_some() {
+            return None;
+        }
+        frozen_source_build_version(source, &manifest.bundled_core_version)?;
+        source
+    };
     source["patchedSourceTree"].as_str().map(str::to_owned)
 }
 
 // Match the desktop JS inputs-only gate. Output hashes are first computed by
 // native producers, so they are not prerequisites for the compiled baseline.
-// Null/partial inputs keep the existing baseline; fetch still rejects them.
+// Legacy null/partial inputs keep the existing baseline; a present desktop
+// contract is selected separately and invalid inputs never fall back.
 fn frozen_source_build_version<'a>(
     source: &'a serde_json::Value,
     upstream: &str,
@@ -206,20 +227,83 @@ fn frozen_source_build_version<'a>(
     }
 }
 
+// Inputs-only desktop admission mirrors validateSourcePins in source-graph.mjs.
+// A malformed present block withholds both version and patch identity.
+fn frozen_desktop_source_version<'a>(
+    manifest: &CoreManifest,
+    source: &'a serde_json::Value,
+    windows_overlay_present: bool,
+) -> Option<&'a str> {
+    let upstream = source["upstreamVersion"].as_str()?;
+    if windows_overlay_present
+        || manifest.windows_build.is_some()
+        || source["sourceMode"].as_str()? != "fork-commit-v1"
+        || upstream.is_empty()
+        || !upstream.as_bytes()[0].is_ascii_digit()
+        || !upstream
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+        || source["graphScope"].as_str()? != "core-source-only"
+        || !source["dependencyModules"].as_array()?.is_empty()
+        || source["buildTree"] != source["patchedSourceTree"]
+    {
+        return None;
+    }
+    for field in ["mainGoModSha256", "mainGoSumSha256"] {
+        let value = source[field].as_str()?;
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+    }
+    for platform in source["platforms"].as_object()?.values() {
+        if platform["buildTree"] != source["buildTree"] {
+            return None;
+        }
+    }
+    frozen_source_build_version(source, upstream)
+}
+
 fn bundled_core_version_from_manifest(
     raw: &str,
     windows: bool,
     android: bool,
 ) -> Result<String, serde_json::Error> {
+    bundled_core_version_with_ios(raw, windows, android, cfg!(target_os = "ios"))
+}
+
+fn bundled_core_version_with_ios(
+    raw: &str,
+    windows: bool,
+    android: bool,
+    ios: bool,
+) -> Result<String, serde_json::Error> {
     let manifest = serde_json::from_str::<CoreManifest>(raw)?;
-    if !android {
-        if let Some(version) = manifest
-            .source_build
-            .as_ref()
-            .and_then(|source| frozen_source_build_version(source, &manifest.bundled_core_version))
-        {
-            return Ok(version.to_owned());
+    if android {
+        return Ok(manifest.bundled_core_version);
+    }
+    if !ios {
+        if let Some(source) = manifest.extra.get("desktopSourceBuild") {
+            return Ok(frozen_desktop_source_version(
+                &manifest,
+                source,
+                serde_json::from_str::<serde_json::Value>(raw)?
+                    .get("windowsBuild")
+                    .is_some(),
+            )
+            .map_or_else(String::new, str::to_owned));
         }
+    }
+    if let Some(version) = manifest.source_build.as_ref().and_then(|source| {
+        if source.get("sourceMode").is_some() {
+            return None;
+        }
+        frozen_source_build_version(source, &manifest.bundled_core_version)
+    }) {
+        return Ok(version.to_owned());
     }
     Ok(if windows {
         manifest

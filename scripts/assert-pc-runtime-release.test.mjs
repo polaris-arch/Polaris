@@ -321,3 +321,53 @@ test('both policy files select package impact and their tests are mandatory in N
   const required = nodeGate.split('required_tests=(')[1].split('\n)')[0];
   assert.ok(required.includes('scripts/assert-pc-runtime-release.test.mjs'));
 });
+
+
+function desktopPolicyFixture() {
+  const manifest = JSON.parse(inputs.get(manifestPath));
+  const desktop = structuredClone(manifest.sourceBuild);
+  desktop.sourceMode = 'fork-commit-v1'; desktop.upstreamVersion = '2.0.0-alpha.11'; desktop.version = '2.0.0-alpha.11.polaris.1';
+  desktop.mainGoModSha256 = 'a'.repeat(64); desktop.mainGoSumSha256 = 'b'.repeat(64);
+  desktop.buildTree = desktop.patchedSourceTree;
+  for (const platform of Object.values(desktop.platforms)) platform.buildTree = desktop.buildTree;
+  const source = { schema: 'polaris-desktop-fork-source-v1', role: 'desktop',
+    sourceURL: 'https://github.com/polaris-arch/polaris-box', sourceCommit: 'a'.repeat(40), sourceTree: desktop.buildTree,
+    sourceTag: 'polaris-v2.0.0-alpha.11-1', sourceTagObject: 'b'.repeat(40), upstreamTag: 'v2.0.0-alpha.11',
+    upstreamCommit: 'c'.repeat(40), goVersion: '1.25.5', patches: [], dependencyPatches: [] };
+  const bytes = JSON.stringify(source);
+  desktop.sourceManifestSha256 = createHash('sha256').update(bytes).digest('hex');
+  manifest.desktopSourceBuild = desktop; delete manifest.windowsBuild;
+  const changes = new Map([['scripts/desktop-core/source-manifest.json', bytes],
+    ['scripts/libbox-ios-patches/source-manifest.json', readFileSync(join(root, 'scripts/libbox-ios-patches/source-manifest.json'))],
+    [manifestPath, JSON.stringify(manifest)]]);
+  return { manifest, source, changes };
+}
+
+test('new D source closure selects D bytes and remains publication-blocked pending actual reviewed pins', () => {
+  const f = desktopPolicyFixture();
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /exact D release input closure not recorded/);
+  f.changes.set('scripts/desktop-core/source-manifest.json', JSON.stringify({ ...f.source, role: 'mobile' }));
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop source SHA-256/);
+  for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+    f.manifest.desktopSourceBuild = invalid;
+    f.changes.set(manifestPath, JSON.stringify(f.manifest));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktopSourceBuild|not frozen/);
+  }
+});
+
+test('D source admission retains the complete mobile graph, source and provider byte bindings', () => {
+  for (const field of ['bundledCoreVersion', 'sourceBuild']) {
+    const f = desktopPolicyFixture();
+    if (field === 'bundledCoreVersion') f.manifest.bundledCoreVersion = '9.9.9';
+    else f.manifest.sourceBuild.transportPins['example.invalid/unreviewed'] = 'v1.0.0';
+    f.changes.set(manifestPath, JSON.stringify(f.manifest));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /not frozen|Mobile source inputs/);
+  }
+  const patch = source.patches[0];
+  for (const path of [sourcePath, `scripts/libbox-patches/${patch.file}`, 'scripts/libbox-ios-patches/source-manifest.json']) {
+    const f = desktopPolicyFixture(); f.changes.set(path, Buffer.from('unreviewed changed bytes'));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Reviewed mobile source SHA-256/);
+  }
+  const f = desktopPolicyFixture(); f.changes.set('scripts/core-source-provision.py', Buffer.from('changed provider'));
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop provisioner SHA-256/);
+});

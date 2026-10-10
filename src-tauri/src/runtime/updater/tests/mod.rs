@@ -494,3 +494,136 @@ fn pending_portable_update_round_trips_through_the_state_file() {
         state.pending_portable_update
     );
 }
+
+fn desktop_source_fixture() -> serde_json::Value {
+    let mut fixture = source_baseline_fixture_with(&[]);
+    let mut desktop = fixture["sourceBuild"].clone();
+    desktop["sourceMode"] = serde_json::json!("fork-commit-v1");
+    desktop["upstreamVersion"] = serde_json::json!("2.0.0-alpha.11");
+    desktop["version"] = serde_json::json!("2.0.0-alpha.11.polaris.1");
+    desktop["graphScope"] = serde_json::json!("core-source-only");
+    desktop["mainGoModSha256"] = serde_json::json!("a".repeat(64));
+    desktop["mainGoSumSha256"] = serde_json::json!("b".repeat(64));
+    desktop["buildTree"] = desktop["patchedSourceTree"].clone();
+    for platform in desktop["platforms"].as_object_mut().unwrap().values_mut() {
+        platform["buildTree"] = serde_json::json!("e".repeat(40));
+    }
+    fixture["desktopSourceBuild"] = desktop;
+    fixture.as_object_mut().unwrap().remove("windowsBuild");
+    fixture
+}
+
+#[test]
+fn explicit_desktop_source_selects_d_and_preserves_mobile_baselines() {
+    let fixture = desktop_source_fixture();
+    for platform in ["linux", "win", "mac-x64", "mac-arm64"] {
+        assert_eq!(
+            bundled_core_version_with_ios(&fixture.to_string(), platform == "win", false, false)
+                .unwrap(),
+            "2.0.0-alpha.11.polaris.1",
+            "{platform}"
+        );
+    }
+    assert_eq!(
+        bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
+        Some("e".repeat(40))
+    );
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), false, true, false).unwrap(),
+        "1.0.0"
+    );
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
+        "1.0.0.polaris.2"
+    );
+    assert_eq!(
+        bundled_core_patch_set_from_manifest(&fixture.to_string(), true),
+        None
+    );
+}
+
+#[test]
+fn present_invalid_desktop_source_cannot_fall_back_to_legacy_graph() {
+    let mut cases = vec![
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!("bad"),
+        serde_json::json!({}),
+    ];
+    for field in [
+        "sourceMode",
+        "upstreamVersion",
+        "version",
+        "graphScope",
+        "mainGoModSha256",
+        "mainGoSumSha256",
+        "buildTree",
+        "patchedSourceTree",
+        "platforms",
+        "dependencyModules",
+        "transportPins",
+        "sourceManifestSha256",
+    ] {
+        let mut invalid = desktop_source_fixture()["desktopSourceBuild"].clone();
+        invalid[field] = serde_json::Value::Null;
+        cases.push(invalid);
+    }
+    let mut swapped = source_baseline_fixture()["sourceBuild"].clone();
+    swapped["sourceMode"] = serde_json::json!("fork-commit-v1");
+    swapped["upstreamVersion"] = serde_json::json!("1.0.0");
+    cases.push(swapped);
+    for invalid in cases {
+        let mut fixture = desktop_source_fixture();
+        fixture["desktopSourceBuild"] = invalid;
+        for windows in [false, true] {
+            assert_eq!(
+                bundled_core_version_with_ios(&fixture.to_string(), windows, false, false).unwrap(),
+                ""
+            );
+        }
+        assert_eq!(
+            bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
+            None
+        );
+        assert_eq!(
+            bundled_core_version_with_ios(&fixture.to_string(), false, true, false).unwrap(),
+            "1.0.0"
+        );
+        assert_eq!(
+            bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
+            "1.0.0.polaris.2"
+        );
+    }
+    let mut fixture = desktop_source_fixture();
+    fixture["windowsBuild"] = serde_json::json!({"version": "1.0.0.polaris.1"});
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
+        ""
+    );
+    fixture
+        .as_object_mut()
+        .unwrap()
+        .remove("desktopSourceBuild");
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
+        "1.0.0.polaris.2"
+    );
+}
+
+#[test]
+fn desktop_source_with_explicit_null_windows_overlay_is_invalid() {
+    let mut fixture = desktop_source_fixture();
+    fixture["windowsBuild"] = serde_json::Value::Null;
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), true, false, false).unwrap(),
+        ""
+    );
+    assert_eq!(
+        bundled_core_patch_set_from_manifest(&fixture.to_string(), false),
+        None
+    );
+    assert_eq!(
+        bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
+        "1.0.0.polaris.2"
+    );
+}
