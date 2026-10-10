@@ -454,7 +454,10 @@ fn proxy_signature(
                 }
             }
         },
-        _ => Fact::Known(false),
+        Platform::Win => Fact::Known(false),
+        Platform::Android => Fact::Known(false),
+        Platform::Ios => Fact::Known(false),
+        Platform::Other => Fact::Known(false),
     };
     or(address_hit, platform_hit)
 }

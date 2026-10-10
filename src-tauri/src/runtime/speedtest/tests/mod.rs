@@ -4827,7 +4827,7 @@ async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spaw
     let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
     let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
     std::fs::write(&raw, "Q6_SYNTHETIC_RAW_SECRET").unwrap();
-    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o0)).unwrap();
     std::fs::write(&kept, "Q6_SYNTHETIC_OLD_SECRET").unwrap();
     let out = TempCoreSession::run(
         &h.deps,

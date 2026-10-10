@@ -160,6 +160,12 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
     (
+        "crates/config-engine/src/builder/coexistence.rs",
+        "let entry = if input.platform == Platform::Linux && !input.criteria.tun_addresses.is_empty()",
+        1,
+        "只计算 Linux 策略规则/main 表导致的 TUN 入口不可保留；Mac/Win/Android/Ios/Other 在此为 false，由后续共存判据独立分类。未来平台不会借 Linux 机制，新增入口规则须单独审查。",
+    ),
+    (
         "crates/helper-client/src/manager.rs",
         "if self.platform == Platform::Win",
         1,

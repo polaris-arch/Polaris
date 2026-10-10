@@ -351,7 +351,7 @@ fn source_read_failure_cleans_both_files_without_raw_fallback() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     f.put(&json!({"password":"SECRET"}));
-    fs::set_permissions(f.raw(), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(f.raw(), fs::Permissions::from_mode(0o0)).unwrap();
     fs::write(f.kept(), "OLD_SECRET").unwrap();
     assert_eq!(
         retire(&f.raw(), true).unwrap_err().kind(),

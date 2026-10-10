@@ -473,5 +473,4 @@ fn retire_with_io(
 }
 
 #[cfg(test)]
-#[path = "tests/diagnostic.rs"]
 mod tests;
