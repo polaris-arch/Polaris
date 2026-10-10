@@ -59,6 +59,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+mod diagnostic;
+
 use polaris_config_engine::builder::endpoints::{
     build_masque_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
 };
@@ -2998,6 +3000,8 @@ impl TempCoreSession {
             }
         };
         if let Err(e) = std::fs::write(&config_path, bytes) {
+            // A failed write may have left a partial credential-bearing config.
+            retire_temp_config(&config_path, false);
             return BatchOutcome::Failed {
                 detail: format!("写测速临时核配置失败 {}: {e}", config_path.display()),
                 oversized: false,
@@ -3318,51 +3322,14 @@ impl TempCoreSession {
     }
 }
 
-/// 收尾处置临时配置。
-///
-/// - **常规档**：删掉，并顺手收掉上一次的留档。
-/// - **诊断档**（`debug` / `trace`）：改名成固定的 [`TEMP_CORE_LAST_CONFIG_NAME`] 留一份。
-///
-/// # 为什么诊断档要留、且留固定名
-///
-/// 排查临时核绕不开「这一轮到底给核喂了什么」——出站条数、有几条 `type:"naive"`、某个节点的形态。
-/// 而收尾是**无条件**删除，于是任何事后复盘都只能靠抢在删除前 `cp`（真机上抢不住）。用户已经把级别
-/// 拨到诊断档，就是在说「这次我要证据」，留一份配置正是最便宜的那份证据。
-///
-/// 固定名（覆盖式）而非带时间戳：理由同 [`TEMP_CORE_CONFIG_NAME`] —— 带时间戳会在 config 目录里越堆
-/// 越多，而排查只关心**最后一次**。改名而非复制：`rename` 是同目录内的元数据操作，不复制字节、不新增
-/// 失败面，且原路径当场消失（与「删掉」对下次运行的语义完全一致）。
+/// Q6: retain a sanitized diagnostic projection at the fixed last-config path.
+/// The raw runtime config is never renamed/copied into an archive. Retirement
+/// still occurs only at the existing lifecycle boundaries (including confirmed
+/// desktop close); this does not claim crash/startup cleanup or device acceptance.
 fn retire_temp_config(path: &std::path::Path, keep_for_diagnosis: bool) {
-    let kept = path.with_file_name(TEMP_CORE_LAST_CONFIG_NAME);
-    if keep_for_diagnosis {
-        match std::fs::rename(path, &kept) {
-            // 留档成功即收尾结束：原路径已经不在了，不需要再删一次。
-            Ok(()) => {
-                log::debug!("诊断档：测速临时核配置已留档 {}", kept.display());
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            // 改名失败（跨设备 / 权限 / 目标被占）→ 退回删除。留不下证据是可惜，留下一份**没被删掉的
-            // 活配置**才是真问题：这份文件里有全部被测节点的凭证（密码 / uuid / WG 私钥）。
-            Err(e) => log::warn!("留档测速临时核配置失败 {}: {e}（退回删除）", kept.display()),
-        }
-    } else {
-        // **非诊断档顺手收掉上一次的留档**（`NotFound` 即常态，忽略）。
-        //
-        // 留档里含**全部被测节点的凭证**（密码 / uuid / WG 私钥）。它与运行期配置的泄露等级相同，
-        // 但有一个决定性差别：`singbox-runtime.json` **有主**（核在跑就该在、停核换配置就被覆盖），
-        // 而这份**无主** —— 用户为排查把级别拨到 debug 跑一轮、随后拨回 info，这份带凭证的文件就
-        // 永远躺在 config 目录里，没有任何路径会再碰它。故把「回到非诊断档」当作它的回收点。
-        if let Err(e) = std::fs::remove_file(&kept) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("清理测速临时核留档失败 {}: {e}", kept.display());
-            }
-        }
-    }
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("删测速临时核配置失败 {}: {e}", path.display());
-        }
+    if let Err(error) = diagnostic::retire(path, keep_for_diagnosis) {
+        // Parser errors/custom values can contain credentials; log only the kind.
+        log::warn!("测速临时配置收尾/去凭据留档失败: {:?}", error.kind());
     }
 }
 

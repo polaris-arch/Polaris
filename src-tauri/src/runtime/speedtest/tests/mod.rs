@@ -2550,10 +2550,10 @@ async fn completed_round_carries_no_reason_field() {
     );
 }
 
-/// 🔴 **A6**：诊断档（`debug`/`trace`）收尾把配置**改名留档**，固定名、覆盖式。
+/// 🔴 **A6**：诊断档（`debug`/`trace`）收尾把配置去凭据留档，固定名、覆盖式。
 ///
 /// **牙**：① 退回无条件删除 → 留档断言转红（排查临时核绕不开「这一轮到底给核喂了什么」，而抢在
-/// 收尾前 `cp` 在真机上抢不住）；② 留档写成「复制」而不是「改名」→ 原文件仍在，第一条断言转红
+/// 收尾前 `cp` 在真机上抢不住）；② 留档保留原始运行配置 → 原文件仍在，第一条断言转红
 /// （留档是给人看的证据，不该同时还留着一份原名的活配置）。
 #[tokio::test]
 async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
@@ -2570,7 +2570,7 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
     assert!(
         !h.dir.join(TEMP_CORE_CONFIG_NAME).exists(),
-        "留档是**改名**：原路径必须消失，否则下次会话会把它当自己的配置覆盖，等于没留"
+        "去凭据留档：原路径必须消失，否则下次会话会把它当自己的配置覆盖，等于没留"
     );
     let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
     assert!(kept.exists(), "诊断档必须留下最后一份临时核配置");
@@ -2578,7 +2578,7 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
     assert_eq!(
         cfg["log"]["level"],
         json!("debug"),
-        "留下来的必须是**本轮真下发的那一份**"
+        "诊断投影必须保留本轮下发的日志级别"
     );
     cleanup(&h.dir);
 }
@@ -2912,13 +2912,9 @@ fn the_only_child_stream_drain_reads_bytes_not_lines() {
     );
 }
 
-/// 🔴 **回到非诊断档时，上一次的留档必须被收掉**（它含全部被测节点的凭证）。
+/// 回到非诊断档仍收掉上一份诊断投影，也兼容回收升级前的原始留档。
 ///
-/// 留档与 `singbox-runtime.json` 泄露等级相同，但那份**有主**（核在跑就该在、换配置即被覆盖），
-/// 这份**无主**：用户为排查把级别拨到 debug 跑一轮、随后拨回 info，这份带凭证的文件就永远躺在
-/// config 目录里，没有任何路径会再碰它。
-///
-/// **牙**：删掉非诊断路径里那句 `remove_file(TEMP_CORE_LAST_CONFIG_NAME)` ⇒ 转红。
+/// **牙**：删掉非诊断路径的旧留档回收 ⇒ 转红。
 #[tokio::test]
 async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover() {
     let mut h = harness(true, false, vec![20001, 20002, 20003]);
@@ -2946,7 +2942,7 @@ async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover()
     .await;
     assert!(
         !kept.exists(),
-        "回到非诊断档必须收掉上一次的留档 —— 那是一份无主的、含节点密码/uuid/WG 私钥的文件"
+        "回到非诊断档必须收掉上一份留档（含升级前可能带凭据的旧档）"
     );
     cleanup(&h.dir);
 }
@@ -4756,4 +4752,122 @@ async fn temp_core_results_carry_a_static_node_pin_binding() {
         }
         assert_eq!(bindings[&node.id], expected, "{}", node.id);
     }
+}
+
+/// Q6 integration: the actual planner/protocol serializers feed the same retire
+/// path as real sessions, but all core/checker/measurement dependencies are fake.
+#[tokio::test]
+async fn diagnostic_archive_scrubs_actual_planner_outputs() {
+    let secret = "Q6_SYNTHETIC_PLANNER_CREDENTIAL";
+    let mut raw_servers = Vec::new();
+    for protocol in ["vless", "vmess", "trojan", "naive", "ssh"] {
+        raw_servers.push(json!({"id":format!("node-{protocol}"),"name":"synthetic",
+            "protocol":protocol,"address":"vpn.invalid","port":443,
+            "uuid":secret,"password":secret,"username":secret,
+            "sshSettings":{"user":secret,"password":secret,"privateKey":secret,
+                "privateKeyPath":secret,"privateKeyPassphrase":secret},
+            "tlsSettings":{"serverName":"vpn.invalid"}}));
+    }
+    raw_servers.push(
+        json!({"id":"node-oc","name":"synthetic","protocol":"openconnect",
+        "openconnectSettings":{"server":"vpn.invalid:443","username":secret,"password":secret,
+            "token":{"mode":"totp","secret":secret},"mtu":1300}}),
+    );
+    raw_servers.push(
+        json!({"id":"node-ovpn","name":"synthetic","protocol":"openvpn-client",
+        "openvpnClientSettings":{"server":"vpn.invalid","server_port":1194,
+            "username":secret,"password":secret,"network":"udp","mtu":1400,
+            "tls":{"certificate":[secret],"key":[secret],"ca":[secret]}}}),
+    );
+    raw_servers.push(
+        json!({"id":"node-custom","name":"synthetic","protocol":"custom",
+        "customSettings":{"outbound":{"type":"http","server":"vpn.invalid","server_port":443,
+            "headers":{"Authorization":secret,"Cookie":secret},
+            "path":format!("/api?auth={secret}"),"unknown_credential":{"nested":secret}}}}),
+    );
+    let servers: Vec<ServerConfig> = raw_servers
+        .into_iter()
+        .map(|v| serde_json::from_value(v).unwrap())
+        .collect();
+    let plan = plan_temp_core(&servers, &env());
+    assert!(plan.unusable.is_empty(), "{:?}", plan.unusable);
+    assert_eq!(plan.testable.len(), 8);
+    let ports = (20100..20108).collect::<Vec<u16>>();
+    assert!(build_temp_core_config(&plan.testable, &ports, "debug")
+        .to_string()
+        .contains(secret));
+    let mut h = harness(true, false, ports);
+    h.deps.log_level = "debug".into();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &plan.testable,
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
+    let archived: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join(TEMP_CORE_LAST_CONFIG_NAME)).unwrap())
+            .unwrap();
+    assert!(!archived.to_string().contains(secret));
+    assert_eq!(archived["inbounds"].as_array().unwrap().len(), 8);
+    assert_eq!(archived["endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(archived["_diagnostic"]["sanitized"], true);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spawn() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
+    std::fs::write(&raw, "Q6_SYNTHETIC_RAW_SECRET").unwrap();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::write(&kept, "Q6_SYNTHETIC_OLD_SECRET").unwrap();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!raw.exists());
+    assert!(!kept.exists());
+    cleanup(&h.dir);
+}
+
+#[tokio::test]
+async fn checker_rejection_and_drop_keep_only_a_sanitized_diagnostic_projection() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    h.deps.checker = Arc::new(FakeChecker { ok: false });
+    let mut nodes = three_nodes();
+    for node in &mut nodes {
+        node.node = json!({"type":"trojan","tag":node.tag,"password":"Q6_SYNTHETIC_SECRET"});
+    }
+    let out = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_, _| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    let kept = std::fs::read_to_string(h.dir.join(TEMP_CORE_LAST_CONFIG_NAME)).unwrap();
+    assert!(!kept.contains("Q6_SYNTHETIC_SECRET"));
+    let cfg: Value = serde_json::from_str(&kept).unwrap();
+    assert_eq!(cfg["outbounds"][0]["type"], "trojan");
+    assert_eq!(cfg["_diagnostic"]["sanitized"], true);
+    cleanup(&h.dir);
 }
