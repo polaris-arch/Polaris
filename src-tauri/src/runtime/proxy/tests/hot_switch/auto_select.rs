@@ -2206,3 +2206,513 @@ fn refresh_fallback_after_current_deletion_keeps_same_tier_latency_and_tie_order
         "tie order remains configuration order"
     );
 }
+
+// S5 failure leg: the production coordinator is exercised with explicit probe batches.
+fn failover_fixture() -> (
+    Arc<ProxyRuntime>,
+    TestDir,
+    Value,
+    Vec<crate::runtime::auto_switch::RuntimeCandidate>,
+    BTreeSet<String>,
+) {
+    let (rt, dir, cfg, ledger) = refresh_fixture();
+    rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    let barred =
+        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
+    let snapshot = rt.switch_snapshot.read().unwrap().clone().unwrap();
+    let scope = BTreeSet::from(["node-b".to_string(), "node-c".to_string()]);
+    let mut plan = crate::runtime::auto_switch::plan_runtime_candidates(
+        &cfg,
+        Some("node-a"),
+        &snapshot.id_to_tag,
+        &snapshot.dirty_fingerprints,
+        &crate::commands::speedtest::current_server_fingerprints(&cfg),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        Some(&scope),
+    );
+    assert!(rt.retain_hot_switchable_candidates(rt.core_generation(), &cfg, &mut plan));
+    assert_eq!(plan.candidates.len(), 2);
+    (rt, dir, cfg, plan.candidates, barred)
+}
+
+fn failover_batch(
+    entries: &[(&str, crate::runtime::auto_switch::CandidateProbe)],
+) -> crate::commands::speedtest::RuntimeProbeBatch {
+    crate::commands::speedtest::RuntimeProbeBatch::Completed(
+        entries
+            .iter()
+            .map(|(id, outcome)| (id.to_string(), *outcome))
+            .collect(),
+    )
+}
+
+fn failover_ids(input: &[(String, String)]) -> Vec<String> {
+    input.iter().map(|(id, _)| id.clone()).collect()
+}
+
+fn failover_best(verdict: Option<crate::runtime::auto_switch::ProbeVerdict>) -> (String, u32) {
+    match verdict {
+        Some(crate::runtime::auto_switch::ProbeVerdict::Best(best)) => {
+            (best.id, best.latency_ms.unwrap())
+        }
+        other => panic!("expected a measured candidate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failover_fallback_prefers_unbarred_without_probing_the_faster_barred_node() {
+    use crate::runtime::auto_switch::CandidateProbe::Measured;
+    let (rt, _dir, cfg, candidates, barred) = failover_fixture();
+    let mut calls = Vec::new();
+    let result = rt
+        .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+            calls.push(failover_ids(&input));
+            // Even a foreign/late result for the other tier cannot participate in this tier's judge.
+            std::future::ready(failover_batch(&[
+                ("node-b", Measured(80)),
+                ("node-c", Measured(1)),
+            ]))
+        })
+        .await;
+    assert_eq!(failover_best(result), ("node-b".to_string(), 80));
+    assert_eq!(calls, [vec!["node-b"]]);
+    assert_eq!(rt.config.current().unwrap(), cfg);
+    let slot = rt.auto_select.lock().unwrap();
+    assert_eq!((slot.failover_switches, slot.select_switches), (1, 0));
+    assert!(slot.memory.is_barred("node-c", MONO));
+}
+
+#[tokio::test]
+async fn failover_fallback_rescues_only_after_an_explicit_all_failed_first_tier() {
+    use crate::runtime::auto_switch::CandidateProbe::{Failed, Measured};
+    let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+    let mut calls = Vec::new();
+    let result = rt
+        .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+            calls.push(failover_ids(&input));
+            let entries = if calls.len() == 1 {
+                vec![("node-b", Failed), ("node-c", Measured(1))]
+            } else {
+                vec![("node-c", Measured(20))]
+            };
+            std::future::ready(failover_batch(&entries))
+        })
+        .await;
+    assert_eq!(failover_best(result), ("node-c".to_string(), 20));
+    assert_eq!(calls, [vec!["node-b"], vec!["node-c"]]);
+}
+
+#[tokio::test]
+async fn failover_fallback_probes_barred_tier_directly_when_no_unbarred_candidate_is_eligible() {
+    use crate::runtime::auto_switch::CandidateProbe::Measured;
+    let (rt, _dir, _cfg, mut candidates, barred) = failover_fixture();
+    candidates.retain(|candidate| candidate.id == "node-c");
+    let mut calls = Vec::new();
+    let result = rt
+        .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+            calls.push(failover_ids(&input));
+            std::future::ready(failover_batch(&[("node-c", Measured(20))]))
+        })
+        .await;
+    assert_eq!(failover_best(result), ("node-c".to_string(), 20));
+    assert_eq!(calls, [vec!["node-c"]]);
+}
+
+#[tokio::test]
+async fn failover_fallback_does_not_rescue_after_mismatch_or_mix_tier_results() {
+    use crate::runtime::auto_switch::{
+        CandidateProbe::{Measured, MismatchSkipped},
+        ProbeVerdict,
+    };
+    let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+    let mut calls = Vec::new();
+    let result = rt
+        .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+            calls.push(failover_ids(&input));
+            std::future::ready(failover_batch(&[
+                ("node-b", MismatchSkipped),
+                ("node-c", Measured(1)),
+            ]))
+        })
+        .await;
+    assert_eq!(
+        result,
+        Some(ProbeVerdict::Inconclusive {
+            mismatch_skipped: 1
+        })
+    );
+    assert_eq!(calls, [vec!["node-b"]]);
+}
+
+#[tokio::test]
+async fn failover_fallback_busy_or_interrupted_in_either_tier_never_means_all_failed() {
+    use crate::commands::speedtest::RuntimeProbeBatch;
+    use crate::runtime::auto_switch::CandidateProbe::Failed;
+    for second_tier in [false, true] {
+        for interrupted in [false, true] {
+            let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+            let mut calls = Vec::new();
+            let result = rt
+                .probe_failover_candidates_from(
+                    rt.core_generation(),
+                    &candidates,
+                    &barred,
+                    |input| {
+                        calls.push(failover_ids(&input));
+                        std::future::ready(if second_tier && calls.len() == 1 {
+                            failover_batch(&[("node-b", Failed)])
+                        } else if interrupted {
+                            RuntimeProbeBatch::Interrupted
+                        } else {
+                            RuntimeProbeBatch::Busy
+                        })
+                    },
+                )
+                .await;
+            assert_eq!(result, None);
+            let expected = if second_tier {
+                vec![vec!["node-b"], vec!["node-c"]]
+            } else {
+                vec![vec!["node-b"]]
+            };
+            assert_eq!(calls, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failover_fallback_generation_change_or_stop_prevents_initial_or_rescue_probe() {
+    use crate::runtime::auto_switch::CandidateProbe::Failed;
+    for before_probe in [false, true] {
+        for stopped in [false, true] {
+            let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+            let generation = rt.core_generation();
+            let invalidate = || {
+                if stopped {
+                    rt.status.write().unwrap().running = false;
+                } else {
+                    rt.gate.bump_generation();
+                }
+            };
+            if before_probe {
+                invalidate();
+            }
+            let mut calls = Vec::new();
+            let result = rt
+                .probe_failover_candidates_from(generation, &candidates, &barred, |input| {
+                    calls.push(failover_ids(&input));
+                    invalidate();
+                    std::future::ready(failover_batch(&[("node-b", Failed)]))
+                })
+                .await;
+            assert_eq!(result, None);
+            let expected = if before_probe {
+                vec![]
+            } else {
+                vec![vec!["node-b"]]
+            };
+            assert_eq!(calls, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failover_fallback_discards_a_measured_rescue_when_its_generation_has_changed() {
+    use crate::runtime::auto_switch::CandidateProbe::{Failed, Measured};
+    let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+    let generation = rt.core_generation();
+    let mut calls = Vec::new();
+    let result = rt
+        .probe_failover_candidates_from(generation, &candidates, &barred, |input| {
+            calls.push(failover_ids(&input));
+            let batch = if calls.len() == 1 {
+                failover_batch(&[("node-b", Failed)])
+            } else {
+                rt.gate.bump_generation();
+                failover_batch(&[("node-c", Measured(20))])
+            };
+            std::future::ready(batch)
+        })
+        .await;
+    assert_eq!(result, None);
+    assert_eq!(calls, [vec!["node-b"], vec!["node-c"]]);
+}
+
+#[tokio::test]
+async fn failover_fallback_barred_tier_reports_its_own_all_failed_or_inconclusive_result() {
+    use crate::runtime::auto_switch::{
+        CandidateProbe::{Failed, MismatchSkipped},
+        ProbeVerdict,
+    };
+    for mismatch in [false, true] {
+        let (rt, _dir, _cfg, candidates, barred) = failover_fixture();
+        let mut calls = Vec::new();
+        let result = rt
+            .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+                calls.push(failover_ids(&input));
+                let entries = if calls.len() == 1 {
+                    vec![("node-b", Failed)]
+                } else {
+                    vec![("node-c", if mismatch { MismatchSkipped } else { Failed })]
+                };
+                std::future::ready(failover_batch(&entries))
+            })
+            .await;
+        let expected = if mismatch {
+            ProbeVerdict::Inconclusive {
+                mismatch_skipped: 1,
+            }
+        } else {
+            ProbeVerdict::AllFailed
+        };
+        assert_eq!(result, Some(expected));
+        assert_eq!(calls, [vec!["node-b"], vec!["node-c"]]);
+    }
+}
+
+#[tokio::test]
+async fn failover_fallback_preserves_same_tier_latency_and_configuration_tie_order() {
+    use crate::runtime::auto_switch::{CandidateProbe::Measured, RuntimeCandidate};
+    for all_barred in [false, true] {
+        let (rt, _dir, _cfg, mut candidates, _) = failover_fixture();
+        candidates.push(RuntimeCandidate {
+            id: "node-d".to_string(),
+            name: "Node D".to_string(),
+            tag: "Node D".to_string(),
+        });
+        let barred = if all_barred {
+            candidates.iter().map(|c| c.id.clone()).collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut calls = Vec::new();
+        let result = rt
+            .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+                calls.push(failover_ids(&input));
+                std::future::ready(failover_batch(&[
+                    ("node-b", Measured(80)),
+                    ("node-c", Measured(20)),
+                    ("node-d", Measured(20)),
+                ]))
+            })
+            .await;
+        assert_eq!(failover_best(result), ("node-c".to_string(), 20));
+        assert_eq!(calls, [vec!["node-b", "node-c", "node-d"]]);
+    }
+}
+
+#[test]
+fn failover_fallback_bar_projection_uses_existing_expiry_and_epoch_and_ignores_manual_intent() {
+    let (rt, _dir, cfg, ledger) = refresh_fixture();
+    rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
+    let period = 30 * MINUTE;
+    rt.auto_select_note_failover(Some(period), failover_record("node-c", "node-a"), MONO);
+    assert_eq!(
+        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger)),
+        BTreeSet::from(["node-c".to_string()])
+    );
+    let mut manual = cfg.clone();
+    manual.as_object_mut().unwrap().remove("selectionIntent");
+    assert!(rt
+        .auto_select_failover_barred_from(&manual, rt.core_generation(), &readings(&ledger))
+        .is_empty());
+    assert!(rt
+        .auto_select
+        .lock()
+        .unwrap()
+        .memory
+        .is_barred("node-c", MONO));
+    rt.gate.bump_generation();
+    assert_eq!(
+        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger)),
+        BTreeSet::from(["node-c".to_string()])
+    );
+    assert!(rt
+        .auto_select_failover_barred_from(
+            &cfg,
+            rt.core_generation(),
+            &readings_at(&ledger, MONO + 4 * period)
+        )
+        .is_empty());
+    let mut other = cfg.clone();
+    other["selectionIntent"] = polaris_store::selection_intent_auto("other");
+    other["servers"][1]["subscriptionId"] = serde_json::json!("other");
+    rt.auto_select_failover_barred_from(&other, rt.core_generation(), &readings(&ledger));
+    assert!(
+        rt.auto_select
+            .lock()
+            .unwrap()
+            .memory
+            .barred(MONO)
+            .is_empty(),
+        "epoch alignment intentionally mutates memory"
+    );
+}
+
+#[tokio::test]
+async fn failover_fallback_rescue_never_reintroduces_scoped_or_runtime_ineligible_nodes() {
+    use crate::runtime::auto_switch::{plan_runtime_candidates, CandidateProbe::Measured};
+    for invalid in [
+        "deleted",
+        "other-subscription",
+        "not-loaded",
+        "dirty",
+        "staged",
+        "not-ready",
+    ] {
+        let (rt, _dir, mut cfg, _candidates, barred) = failover_fixture();
+        let baseline = cfg.clone();
+        let mut snapshot = rt.switch_snapshot.read().unwrap().clone().unwrap();
+        let mut staged = BTreeSet::new();
+        let mut not_ready = BTreeSet::new();
+        match invalid {
+            "deleted" => cfg["servers"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|n| n["id"] != "node-b"),
+            "other-subscription" => {
+                cfg["servers"][1]["subscriptionId"] = serde_json::json!("other")
+            }
+            "not-loaded" => {
+                snapshot.id_to_tag.remove("node-b");
+            }
+            "dirty" => cfg["servers"][1]["port"] = serde_json::json!(19001),
+            "staged" => {
+                staged.insert("node-b".to_string());
+            }
+            "not-ready" => {
+                not_ready.insert("node-b".to_string());
+            }
+            _ => unreachable!(),
+        }
+        let scope = crate::runtime::auto_select::subscription_members(&cfg, "sub")
+            .into_iter()
+            .collect();
+        let mut plan = plan_runtime_candidates(
+            &cfg,
+            Some("node-a"),
+            &snapshot.id_to_tag,
+            &snapshot.dirty_fingerprints,
+            &crate::commands::speedtest::current_server_fingerprints(&cfg),
+            &staged,
+            &not_ready,
+            Some(&scope),
+        );
+        assert!(rt.retain_hot_switchable_candidates(rt.core_generation(), &baseline, &mut plan));
+        let mut calls = Vec::new();
+        let result = rt
+            .probe_failover_candidates_from(
+                rt.core_generation(),
+                &plan.candidates,
+                &barred,
+                |input| {
+                    calls.push(failover_ids(&input));
+                    std::future::ready(failover_batch(&[
+                        ("node-c", Measured(20)),
+                        ("node-b", Measured(1)),
+                        ("node-a", Measured(0)),
+                    ]))
+                },
+            )
+            .await;
+        assert_eq!(
+            failover_best(result),
+            ("node-c".to_string(), 20),
+            "{invalid}"
+        );
+        assert_eq!(calls, [vec!["node-c"]], "{invalid}");
+    }
+}
+
+#[tokio::test]
+async fn failover_fallback_a_late_batch_cannot_beat_a_new_generation_retry() {
+    use crate::runtime::auto_switch::CandidateProbe::Measured;
+    let (rt, _dir, cfg, candidates, barred) = failover_fixture();
+    let generation = rt.core_generation();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let old_rt = Arc::clone(&rt);
+    let old_candidates = candidates.clone();
+    let old_barred = barred.clone();
+    let old = tokio::spawn(async move {
+        let mut started = Some(started_tx);
+        let mut result = Some(result_rx);
+        old_rt
+            .probe_failover_candidates_from(generation, &old_candidates, &old_barred, |input| {
+                started.take().unwrap().send(failover_ids(&input)).unwrap();
+                let result = result.take().unwrap();
+                async move { result.await.unwrap() }
+            })
+            .await
+    });
+    let started = started_rx.await.unwrap();
+    rt.gate.bump_generation();
+    let new_result = rt
+        .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |_| {
+            std::future::ready(failover_batch(&[
+                ("node-b", Measured(80)),
+                ("node-c", Measured(1)),
+            ]))
+        })
+        .await;
+    result_tx
+        .send(failover_batch(&[
+            ("node-b", Measured(1)),
+            ("node-c", Measured(0)),
+        ]))
+        .unwrap();
+    assert_eq!(old.await.unwrap(), None);
+    assert_eq!(failover_best(new_result), ("node-b".to_string(), 80));
+    assert_eq!(started, ["node-b"]);
+    assert_eq!(rt.config.current().unwrap(), cfg);
+}
+
+#[test]
+fn failover_fallback_production_uses_layered_coordinator_after_candidate_qualification() {
+    let body = method_body(&module_code("runtime/proxy"),
+        "    async fn do_switch_io(self: &Arc<Self>, machine: &mut AutoSwitchMachine, reason: &str) -> bool {");
+    let qualify = body.find("self.retain_hot_switchable_candidates(").unwrap();
+    let bars = body.find("self.auto_select_failover_barred_from(").unwrap();
+    let layered = body.find(".probe_failover_candidates_from(").unwrap();
+    let probe = body.find("probe_runtime_candidates(").unwrap();
+    let commit = body.find(".auto_hot_switch_transaction(").unwrap();
+    assert!(qualify < bars && bars < layered && layered < probe && probe < commit);
+    assert!(body.contains("&candidate_plan.candidates,"));
+    assert!(body.contains("probe_runtime_candidates(self, targets, &probe_input, url)"));
+    assert!(
+        !body.contains("judge_probes("),
+        "the caller must not re-judge mixed tiers"
+    );
+}
+
+#[tokio::test]
+async fn failover_fallback_empty_candidates_or_missing_failure_receipts_do_not_prove_all_failed() {
+    use crate::runtime::auto_switch::CandidateProbe::Failed;
+    for invalid in ["empty", "missing-first", "missing-rescue"] {
+        let (rt, _dir, _cfg, mut candidates, barred) = failover_fixture();
+        if invalid == "empty" {
+            candidates.clear();
+        }
+        let mut calls = Vec::new();
+        let result = rt
+            .probe_failover_candidates_from(rt.core_generation(), &candidates, &barred, |input| {
+                calls.push(failover_ids(&input));
+                std::future::ready(if invalid == "missing-rescue" && calls.len() == 1 {
+                    failover_batch(&[("node-b", Failed)])
+                } else {
+                    failover_batch(&[])
+                })
+            })
+            .await;
+        assert_eq!(result, None, "{invalid}");
+        let expected = match invalid {
+            "empty" => vec![],
+            "missing-first" => vec![vec!["node-b"]],
+            "missing-rescue" => vec![vec!["node-b"], vec!["node-c"]],
+            _ => unreachable!(),
+        };
+        assert_eq!(calls, expected, "{invalid}");
+    }
+}

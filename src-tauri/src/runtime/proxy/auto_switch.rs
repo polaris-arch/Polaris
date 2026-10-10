@@ -6,6 +6,7 @@
 //! `spawn_crash_monitor` 原地重启同节点兜底，本腿只对「核活着但代理链不通」换节点。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -926,33 +927,25 @@ impl ProxyRuntime {
             candidate_plan.not_exit,
             candidate_plan.needs_restart
         );
-        let probe_input: Vec<(String, String)> = candidate_plan
-            .candidates
-            .iter()
-            .map(|candidate| (candidate.id.clone(), candidate.tag.clone()))
-            .collect();
+        let barred =
+            self.auto_select_failover_barred_from(&config, generation, &SelectReadings::live());
         let url = resolve_speed_test_url(&config);
-        let probes = match probe_runtime_candidates(self, &targets, &probe_input, &url).await {
-            RuntimeProbeBatch::Completed(probes) => probes,
-            RuntimeProbeBatch::Busy => {
-                log::info!("自动故障切换：用户测速正在占用 probe pool → 本轮让位");
-                return false;
-            }
-            RuntimeProbeBatch::Interrupted => {
-                log::info!("自动故障切换：候选探测期间内核世代变化 → 本轮作废");
-                return false;
-            }
-        };
-        if self.core_generation() != generation || !self.core_running() {
+        let Some(verdict) = self
+            .probe_failover_candidates_from(
+                generation,
+                &candidate_plan.candidates,
+                &barred,
+                |probe_input| {
+                    let targets = &targets;
+                    let url = &url;
+                    async move { probe_runtime_candidates(self, targets, &probe_input, url).await }
+                },
+            )
+            .await
+        else {
             return false;
-        }
-        let named: Vec<(String, String)> = candidate_plan
-            .candidates
-            .iter()
-            .map(|candidate| (candidate.id.clone(), candidate.name.clone()))
-            .collect();
-
-        let best = match judge_probes(&named, &probes) {
+        };
+        let best = match verdict {
             ProbeVerdict::Best(best) => best,
             // 有候选因读回不符被跳过（只在读回的「强制」档下出现）：量到的不是它，不能据此说它
             // 不可用，故不下「全部不可用」的结论，也不走那条结论的后续（重启受阻上报）。
@@ -1538,6 +1531,105 @@ impl ProxyRuntime {
             .find(|candidate| !slot.memory.is_barred(&candidate.node_id, readings.now))
             .or_else(|| ranked.first().copied())
             .cloned()
+    }
+
+    /// 故障腿只消费有效 Auto 订阅的既有屏蔽；手动故障切换不读写择优记忆。
+    pub(super) fn auto_select_failover_barred_from(
+        &self,
+        config: &Value,
+        generation: u64,
+        readings: &SelectReadings<'_>,
+    ) -> BTreeSet<String> {
+        let platform = self.helper.platform();
+        let Some(subscription) =
+            auto_select::effective_subscription(config, Switches::PRODUCTION, platform)
+        else {
+            return BTreeSet::new();
+        };
+        let network_epoch = self.network_epoch();
+        let mut slot = self.auto_select_slot();
+        slot.memory.observe_epoch(
+            &Epoch {
+                subscription: subscription.to_string(),
+                generation,
+                network_epoch,
+                foreground_epoch: measurement_scheduler::is_mobile(platform)
+                    .then(|| readings.ledger.foreground_epoch()),
+            },
+            readings.signals.round_serial,
+        );
+        slot.memory
+            .barred(readings.now)
+            .into_iter()
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    /// 合格候选按屏蔽分两层，逐层探测和裁决：未屏蔽层为空或明确全败才救援屏蔽层。
+    /// 无结论、抢占、停核与世代变化整轮作废；资格与最后提交仍由调用方裁定。
+    pub(super) async fn probe_failover_candidates_from<P, F>(
+        &self,
+        generation: u64,
+        candidates: &[RuntimeCandidate],
+        barred: &BTreeSet<String>,
+        mut probe: P,
+    ) -> Option<ProbeVerdict>
+    where
+        P: FnMut(Vec<(String, String)>) -> F,
+        F: Future<Output = RuntimeProbeBatch>,
+    {
+        if candidates.is_empty() {
+            return None;
+        }
+        let (unbarred, rescue): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .partition(|candidate| !barred.contains(&candidate.id));
+        for tier in [&unbarred, &rescue] {
+            if tier.is_empty() {
+                continue;
+            }
+            if self.core_generation() != generation || !self.core_running() {
+                return None;
+            }
+            let input = tier
+                .iter()
+                .map(|candidate| (candidate.id.clone(), candidate.tag.clone()))
+                .collect();
+            let probes = match probe(input).await {
+                RuntimeProbeBatch::Completed(probes) => probes,
+                RuntimeProbeBatch::Busy => {
+                    log::info!("自动故障切换：用户测速正在占用 probe pool → 本轮让位");
+                    return None;
+                }
+                RuntimeProbeBatch::Interrupted => {
+                    log::info!("自动故障切换：候选探测被抢占或内核世代变化 → 本轮作废");
+                    return None;
+                }
+            };
+            if self.core_generation() != generation || !self.core_running() {
+                return None;
+            }
+            let named = tier
+                .iter()
+                .map(|candidate| (candidate.id.clone(), candidate.name.clone()))
+                .collect::<Vec<_>>();
+            match judge_probes(&named, &probes) {
+                // Only an explicit failure for every eligible member proves this tier failed.
+                // The existing probe adapter supplies all members; do not turn a missing
+                // receipt into a rescue decision if that contract is ever violated.
+                ProbeVerdict::AllFailed
+                    if tier
+                        .iter()
+                        .any(|candidate| !probes.contains_key(&candidate.id)) =>
+                {
+                    log::info!("自动故障切换：候选探测回执不完整 → 本轮不下全败结论");
+                    return None;
+                }
+                ProbeVerdict::AllFailed => {}
+                verdict => return Some(verdict),
+            }
+        }
+        Some(ProbeVerdict::AllFailed)
     }
 
     /// 每个核世代开始时一行：意图、订阅、成员数与两个回退开关的取值。
