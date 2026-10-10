@@ -12,32 +12,37 @@ next to this file as LICENSE.
    **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - 桌面 sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
-        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+  - 桌面 sing-box v1.15.0-alpha.11 (GPLv3) — https://github.com/polaris-arch/polaris-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.11
         （代理内核，以独立 sidecar 子进程运行）
-        桌面源码修复构建：1.15.0-alpha.8.polaris.4（Linux、Windows、macOS x64 / arm64）
-        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
-        共同 source manifest SHA-256：d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec
-        共享补丁获取位置（动态 main；按共同 manifest 与补丁摘要核对）：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
-        已发布共享补丁基线（不含本轮 G1 增量）：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/libbox-patches
-        当前构建以随仓 manifest、8 个补丁摘要与实际 source/build tree 锁定，不含依赖补丁；最终固定提交由外部来源收据提供。
-        Windows 修复构建：1.15.0-alpha.8.polaris.4（共同修复加 DNS-only 变更缓存刷新）
-        Windows 附加补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
-        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/core-patches
+        桌面源码修复构建：1.15.0-alpha.11.polaris.1
+        固定源码：https://github.com/polaris-arch/polaris-box/tree/052297f735b80bdae5b2536ef2a07d04979a0511
+        固定消费标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-1
+        消费标签对象：343be85a5b4a56a3ed28e9549561a52c490635eb
+        共同 source manifest SHA-256：9a51f7d9ab2bd0741b9bce31d4743354d4425f17a22cf6bd48631c21a3d36a46
+        桌面修复已进入上述固定fork提交；App不重放补丁或Windows额外overlay。
+        对应源码资产：https://github.com/polaris-arch/polaris-box/releases/tag/polaris-v1.15.0-alpha.11-1
         构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
-        （以 libbox 形态载入应用进程，见下）
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
+  - Apple libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI，桌面专属）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
-桌面随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
-四平台共同修复版本及来源记录在同文件的 `sourceBuild`，Windows 附加输入记录在 `windowsBuild`。
-共享 `source-manifest.json` 固定 sing-box 的上游 commit、补丁顺序与摘要，不对依赖模块打补丁；
-Android libbox 也消费这些共同源码与补丁，构建说明见上述共享补丁目录。
-上面写死的桌面版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
-两边不一致即构建转红 —— 版本号写在这里是因为法律声明不该让读者去翻另一个文件。
+桌面随包 sing-box 的上游基线、修复版本与固定fork来源记录在
+`src-tauri/core-manifest.json` 的 `desktopSourceBuild`，对应源码记录在
+`scripts/desktop-core/source-manifest.json`；四平台共同消费该固定提交，不重放App补丁。
+Android/iOS继续消费旧 `bundledCoreVersion` / `sourceBuild` 和各自源码manifest，
+移动端对应源码及补丁获取位置为上述固定manifest与随仓补丁目录。
+上面写死的版本、来源及摘要由 `scripts/verify-packaging.mjs confs` 按各组件独立段核验。
 
 **链进产物的源码级依赖**（Tauri / React / 数百个 Rust crate 等）不属 mere aggregation，
 其许可与版权声明随二进制分发，逐包登记在 `THIRD-PARTY-LICENSES.md`

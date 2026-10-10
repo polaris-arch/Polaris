@@ -100,7 +100,9 @@ const inputPaths = [manifestPath, sourcePath, 'scripts/core-source-provision.py'
   ...source.patches.map((patch) => `scripts/libbox-patches/${patch.file}`),
   ...source.dependencyPatches.map((dep) => `scripts/libbox-patches/${dep.patchFile}`),
   'scripts/core-patches/windows-dns-refresh.patch'];
-const inputs = new Map(inputPaths.map((path) => [path, readFileSync(join(root, path))]));
+// Exact legacy manifest from accepted 36230f41, before D data activation.
+const legacyManifestBytes = readFileSync(join(root, 'scripts/desktop-core/fixtures/legacy-core-manifest.json'));
+const inputs = new Map(inputPaths.map((path) => [path, path === manifestPath ? legacyManifestBytes : readFileSync(join(root, path))]));
 function fixtureRead(changes = new Map()) {
   return (path) => {
     const bytes = changes.has(path) ? changes.get(path) : inputs.get(path);
@@ -124,9 +126,7 @@ function requireUnobserved(policy) {
 }
 
 test('only reviewed source inputs are eligible, without native or ownership clearance', () => {
-  const result = runPolicy();
-  assert.equal(result.status, 0, result.stderr);
-  const policy = JSON.parse(result.stdout);
+  const policy = assertSourceFirstRelease(fixtureRead());
   requireUnobserved(policy);
   assert.equal(policy.reviewedCandidate, '123259cb4ee0eef484368e34d8ea7211d39964b6');
   assert.deepEqual(assertSourceFirstRelease(fixtureRead()), policy);
@@ -242,7 +242,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
       'scripts/desktop-core/source-graph.mjs'];
     for (const path of fixturePaths) {
       mkdirSync(dirname(join(fixture, path)), { recursive: true });
-      writeFileSync(join(fixture, path), readFileSync(join(root, path)));
+      writeFileSync(join(fixture, path), inputs.get(path) ?? readFileSync(join(root, path)));
     }
     writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
     for (const env of [
@@ -251,9 +251,11 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
       { POLARIS_NO_KERNEL_RUN: '1', POLARIS_SKIP_QUALITY_GATES: '1' },
       { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' },
     ]) {
-      const good = runPolicy([], env);
+      writeFileSync(join(fixture, 'scripts/core-source-provision.py'), inputs.get('scripts/core-source-provision.py'));
+      const good = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
       assert.equal(good.status, 0, good.stderr);
       requireUnobserved(JSON.parse(good.stdout));
+      writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
       const bad = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
       assert.equal(bad.status, 1, JSON.stringify(env));
       assert.match(bad.stderr, /PC_RUNTIME_RELEASE_BLOCKED.*core-source-provision\.py/);
@@ -370,4 +372,21 @@ test('D source admission retains the complete mobile graph, source and provider 
   }
   const f = desktopPolicyFixture(); f.changes.set('scripts/core-source-provision.py', Buffer.from('changed provider'));
   assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop provisioner SHA-256/);
+});
+
+
+test('actual production D CLI remains blocked without its reviewed release closure under claimed clearance', () => {
+  const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
+  for (const env of [{}, { POLARIS_SKIP_PC_RUNTIME_RELEASE_GATE: '1' },
+    { POLARIS_ALLOW_PC_RUNTIME_RELEASE: '1', PC_RUNTIME_RELEASE_READY: 'true' },
+    { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' }]) {
+    const result = runPolicy([], env);
+    if (Object.hasOwn(manifest, 'desktopSourceBuild')) {
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: Desktop fork source review must be renewed: exact D release input closure not recorded/);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      requireUnobserved(JSON.parse(result.stdout));
+    }
+  }
 });

@@ -161,7 +161,8 @@ test('frozen production inputs still require exact pins; force and old outputs c
   try {
     for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
     const missingPin = structuredClone(manifest);
-    missingPin.sourceBuild.sourceReceiptFingerprint = null;
+    const selected = Object.hasOwn(missingPin, 'desktopSourceBuild') ? missingPin.desktopSourceBuild : missingPin.sourceBuild;
+    selected.sourceReceiptFingerprint = null;
     for (const key of Object.keys(DESKTOP_TARGETS)) {
       const dest = join(f.root, 'resources', key, coreFilename(key));
       write(dest, 'old cached core');

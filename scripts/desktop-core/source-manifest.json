@@ -1,0 +1,14 @@
+{
+  "schema": "polaris-desktop-fork-source-v1",
+  "role": "desktop",
+  "sourceURL": "https://github.com/polaris-arch/polaris-box",
+  "sourceCommit": "052297f735b80bdae5b2536ef2a07d04979a0511",
+  "sourceTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
+  "sourceTag": "polaris-v1.15.0-alpha.11-1",
+  "sourceTagObject": "343be85a5b4a56a3ed28e9549561a52c490635eb",
+  "upstreamTag": "v1.15.0-alpha.11",
+  "upstreamCommit": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+  "goVersion": "1.25.5",
+  "patches": [],
+  "dependencyPatches": []
+}

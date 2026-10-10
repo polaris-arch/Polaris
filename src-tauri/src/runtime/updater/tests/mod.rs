@@ -17,10 +17,18 @@ fn bundled_core_version_parses_from_embedded_manifest() {
     );
     // 上面两条分辨不出基线回落（回落值同样非空）。嵌入清单必须被认作冻结清单。
     let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let source = &manifest["sourceBuild"];
-    let expected = source["version"].as_str().expect("sourceBuild.version");
+    let parsed: CoreManifest = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
+    let source = manifest
+        .get("desktopSourceBuild")
+        .unwrap_or(&manifest["sourceBuild"]);
+    let expected = source["version"].as_str().expect("selected source version");
+    let admitted = if manifest.get("desktopSourceBuild").is_some() {
+        frozen_desktop_source_version(&parsed, source, manifest.get("windowsBuild").is_some())
+    } else {
+        frozen_source_build_version(source, manifest["bundledCoreVersion"].as_str().unwrap())
+    };
     assert_eq!(
-        frozen_source_build_version(source, manifest["bundledCoreVersion"].as_str().unwrap()),
+        admitted,
         Some(expected),
         "嵌入的 core-manifest 未被认作冻结清单，随包基线会回落"
     );
@@ -305,13 +313,16 @@ fn core_version_readers_are_asymmetric() {
     );
 }
 
-/// 嵌入清单的补丁集标识就是 `sourceBuild.patchedSourceTree`，且运行时访问器原样给出。
+/// 嵌入清单所选桌面源的 patchedSourceTree 由运行时访问器原样给出。
 #[test]
 fn bundled_patch_set_comes_from_the_embedded_manifest() {
     let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let expected = manifest["sourceBuild"]["patchedSourceTree"]
+    let source = manifest
+        .get("desktopSourceBuild")
+        .unwrap_or(&manifest["sourceBuild"]);
+    let expected = source["patchedSourceTree"]
         .as_str()
-        .expect("sourceBuild.patchedSourceTree");
+        .expect("selected patchedSourceTree");
     assert_eq!(expected.len(), 40);
     assert_eq!(
         bundled_core_patch_set_from_manifest(CORE_MANIFEST_JSON, false).as_deref(),

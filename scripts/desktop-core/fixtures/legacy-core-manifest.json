@@ -7,8 +7,16 @@
     "mac-arm64": "e3fb5d7e8586b92e3eab06fca80a09239ec0c9e7c8a04f6f16e483a034c78581"
   },
   "cronetLibrarySha256": {
-    "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
-    "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    "linux": "23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294",
+    "win": "3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928"
+  },
+  "windowsBuild": {
+    "version": "1.15.0-alpha.8.polaris.4",
+    "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
+    "sourceSha256": "77aabf518a4464832f6f4792196a8ab9aadadcc616dbbd82327137ce664a5862",
+    "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
+    "goVersion": "1.25.5",
+    "binarySha256": null
   },
   "sourceBuild": {
     "sourceManifestSha256": "d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec",
@@ -111,109 +119,5 @@
     "graphScope": "core-source-only",
     "mainGoModSha256": "44f8313894387dd4576ec8839ab2bb74307748e378d79863be778f05abdeaa5c",
     "mainGoSumSha256": "b0b62e1b51d268a1c569bf0ec39b72debb9683036d4913edfd8dee073db3a64f"
-  },
-  "desktopSourceBuild": {
-    "sourceManifestSha256": "9a51f7d9ab2bd0741b9bce31d4743354d4425f17a22cf6bd48631c21a3d36a46",
-    "provisionerSha256": "a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d",
-    "sourceReceiptFingerprint": "d0acf48015e649102636e038dcd3804aca3227639bb7998f858d231315f41558",
-    "moduleGraphSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    "patchedSourceTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-    "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-    "version": "1.15.0-alpha.11.polaris.1",
-    "dependencyModules": [],
-    "transportPins": {
-      "github.com/mdlayher/netlink": "v1.11.2",
-      "github.com/mdlayher/socket": "v0.6.0",
-      "github.com/sagernet/netlink": "v0.0.0-20260814022025-64455d367bbf",
-      "golang.org/x/sys": "v0.47.0",
-      "golang.org/x/net": "v0.57.0",
-      "golang.org/x/sync": "v0.22.0"
-    },
-    "platforms": {
-      "linux": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-        "patchedModules": {
-          "requiredLinked": [],
-          "allowedAbsent": []
-        },
-        "transportModules": {
-          "requiredLinked": [
-            "github.com/mdlayher/netlink",
-            "github.com/mdlayher/socket",
-            "github.com/sagernet/netlink",
-            "golang.org/x/sys",
-            "golang.org/x/net",
-            "golang.org/x/sync"
-          ],
-          "confirmedAbsent": []
-        },
-        "binarySha256": null
-      },
-      "win": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-        "patchedModules": {
-          "requiredLinked": [],
-          "allowedAbsent": []
-        },
-        "transportModules": {
-          "requiredLinked": [
-            "golang.org/x/sys",
-            "golang.org/x/net",
-            "golang.org/x/sync"
-          ],
-          "confirmedAbsent": [
-            "github.com/mdlayher/netlink",
-            "github.com/mdlayher/socket",
-            "github.com/sagernet/netlink"
-          ]
-        },
-        "binarySha256": null
-      },
-      "mac-x64": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-        "patchedModules": {
-          "requiredLinked": [],
-          "allowedAbsent": []
-        },
-        "transportModules": {
-          "requiredLinked": [
-            "golang.org/x/sys",
-            "golang.org/x/net",
-            "golang.org/x/sync"
-          ],
-          "confirmedAbsent": [
-            "github.com/mdlayher/netlink",
-            "github.com/mdlayher/socket",
-            "github.com/sagernet/netlink"
-          ]
-        },
-        "binarySha256": null
-      },
-      "mac-arm64": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-        "patchedModules": {
-          "requiredLinked": [],
-          "allowedAbsent": []
-        },
-        "transportModules": {
-          "requiredLinked": [
-            "golang.org/x/sys",
-            "golang.org/x/net",
-            "golang.org/x/sync"
-          ],
-          "confirmedAbsent": [
-            "github.com/mdlayher/netlink",
-            "github.com/mdlayher/socket",
-            "github.com/sagernet/netlink"
-          ]
-        },
-        "binarySha256": null
-      }
-    },
-    "graphScope": "core-source-only",
-    "mainGoModSha256": "a63e52e2d5a48befdaeee61a15a556404e5a82677bc412fe2ae181a5fd63f8c2",
-    "mainGoSumSha256": "3ff3e2f3b13951037b1d4109e7f32500943c232aa959bb96b7a757ffcd810cb8",
-    "sourceMode": "fork-commit-v1",
-    "upstreamVersion": "1.15.0-alpha.11"
   }
 }
