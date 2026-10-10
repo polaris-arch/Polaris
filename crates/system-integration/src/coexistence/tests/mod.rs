@@ -2,7 +2,7 @@
 use super::*;
 use crate::exec::CommandOutput;
 use polaris_config_engine::builder::coexistence::{
-    AddressFamily, PolicySelectorScope, RouteRole, Rule,
+    AddressFamily, PolicySelectorScope, RouteRole, RouteScope, Rule,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -701,7 +701,7 @@ fn numeric_route_competition_stays_unknown_after_type_parsing_succeeds() {
         .into_iter()
         .find(|r| r.interface == "vpn0")
         .unwrap();
-    assert_eq!(report.coverage.ipv4, Fact::Known(true));
+    assert!(matches!(report.coverage.ipv4, Fact::Unknown(_)));
     assert!(matches!(
         predicate(&report, Rule::OtherTunProxy),
         Fact::Unknown(_)
@@ -787,5 +787,129 @@ fn row_and_nested_address_limit_boundaries_are_inclusive() {
         let mut f = fixture(json!([]), json!([]), json!([]), json!([]));
         f.outputs[1] = Ok(json!([{"ifname":"vpn0","addr_info":(0..count).map(|_|json!({"family":"inet","local":"10.8.0.2","prefixlen":24})).collect::<Vec<_>>()}]).to_string());
         assert_eq!(matches!(object(&f).addresses, Fact::Known(_)), accepted);
+    }
+}
+fn main_split_competition(v6: bool, competing_table: u32) -> FixtureRunner {
+    let prefixes = if v6 {
+        ["::/1", "8000::/1"]
+    } else {
+        ["0.0.0.0/1", "128.0.0.0/1"]
+    };
+    let route_rows = json!([
+        {"type":"1","dst":prefixes[0],"dev":"eth0","table":competing_table.to_string(),"metric":10,"scope":"0","flags":[]},
+        {"type":"1","dst":prefixes[1],"dev":"eth0","table":competing_table.to_string(),"metric":10,"scope":"0","flags":[]},
+        {"type":"1","dst":prefixes[0],"dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]},
+        {"type":"1","dst":prefixes[1],"dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]}]);
+    let policy = json!([{"priority":32766,"src":"all","table":"254"}]);
+    let mut f = competition(32766);
+    f.outputs[2] = Ok(if v6 { json!([]) } else { route_rows.clone() }.to_string());
+    f.outputs[3] = Ok(if v6 { route_rows } else { json!([]) }.to_string());
+    f.outputs[4] = Ok(if v6 { json!([]) } else { policy.clone() }.to_string());
+    f.outputs[5] = Ok(if v6 { policy } else { json!([]) }.to_string());
+    f
+}
+fn assert_main_split_competition_unknown(v6: bool) {
+    let Fact::Known(objects) = collect_linux(&main_split_competition(v6, 254)).objects else {
+        panic!()
+    };
+    let vpn = objects.iter().find(|o| o.interface == "vpn0").unwrap();
+    let Fact::Known(routes) = &vpn.routes else {
+        panic!()
+    };
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().all(|r| r.table == Fact::Known(Some(254))
+        && r.scope == Fact::Known(RouteScope::Global)
+        && matches!(r.role, Fact::Unknown(_))));
+    let report = reports(&main_split_competition(v6, 254))
+        .into_iter()
+        .find(|r| r.interface == "vpn0")
+        .unwrap();
+    let coverage = if v6 {
+        &report.coverage.ipv6
+    } else {
+        &report.coverage.ipv4
+    };
+    println!(
+        "main split competition v6={v6}, coverage={coverage:?}, entry={:?}, decision={:?}",
+        predicate(&report, Rule::EntryCannotBePreserved),
+        report.decision
+    );
+    assert!(
+        matches!(coverage, Fact::Unknown(_)),
+        "per-interface coverage is not a selected-path witness"
+    );
+    assert!(matches!(
+        predicate(&report, Rule::EntryCannotBePreserved),
+        Fact::Unknown(_)
+    ));
+    assert!(matches!(report.decision, Fact::Unknown(_)));
+}
+#[test]
+fn main_split_competing_v4_coverage_does_not_establish_entry_loss() {
+    assert_main_split_competition_unknown(false);
+}
+#[test]
+fn main_split_competing_v6_coverage_does_not_establish_entry_loss() {
+    assert_main_split_competition_unknown(true);
+}
+
+#[test]
+fn main_split_coverage_does_not_borrow_other_table_competition() {
+    for v6 in [false, true] {
+        let report = reports(&main_split_competition(v6, 100))
+            .into_iter()
+            .find(|r| r.interface == "vpn0")
+            .unwrap();
+        let coverage = if v6 {
+            &report.coverage.ipv6
+        } else {
+            &report.coverage.ipv4
+        };
+        assert_eq!(coverage, &Fact::Known(true));
+        assert_eq!(
+            predicate(&report, Rule::EntryCannotBePreserved),
+            &Fact::Known(true)
+        );
+    }
+}
+#[test]
+fn main_split_coverage_does_not_borrow_other_family_competition() {
+    let mut f = main_split_competition(false, 254);
+    f.outputs[2] = Ok(json!([
+        {"type":"1","dst":"0.0.0.0/1","dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]},
+        {"type":"1","dst":"128.0.0.0/1","dev":"vpn0","table":"254","metric":100,"scope":"0","flags":[]}]).to_string());
+    f.outputs[3] = Ok(json!([
+        {"type":"1","dst":"::/1","dev":"eth0","table":"254","metric":10,"scope":"0","flags":[]},
+        {"type":"1","dst":"8000::/1","dev":"eth0","table":"254","metric":10,"scope":"0","flags":[]}]).to_string());
+    let report = reports(&f)
+        .into_iter()
+        .find(|r| r.interface == "vpn0")
+        .unwrap();
+    assert_eq!(report.coverage.ipv4, Fact::Known(true));
+    assert_eq!(
+        predicate(&report, Rule::EntryCannotBePreserved),
+        &Fact::Known(true)
+    );
+}
+#[test]
+fn same_table_terminal_path_or_unknown_table_path_leaves_coverage_unproved() {
+    for extra in [
+        json!({"type":"6","dst":"192.0.2.0/24","table":"254","metric":1,"flags":[]}),
+        json!({"type":"1","dst":"default","dev":"eth0","table":"unresolved-name","metric":1,"flags":[]}),
+    ] {
+        let mut f = main_split_competition(false, 100);
+        let mut rows: Value = serde_json::from_str(f.outputs[2].as_ref().unwrap()).unwrap();
+        rows.as_array_mut().unwrap().push(extra);
+        f.outputs[2] = Ok(rows.to_string());
+        let report = reports(&f)
+            .into_iter()
+            .find(|r| r.interface == "vpn0")
+            .unwrap();
+        assert!(matches!(report.coverage.ipv4, Fact::Unknown(_)));
+        assert!(matches!(
+            predicate(&report, Rule::EntryCannotBePreserved),
+            Fact::Unknown(_)
+        ));
+        assert!(matches!(report.decision, Fact::Unknown(_)));
     }
 }
