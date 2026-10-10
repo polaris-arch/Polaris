@@ -1,7 +1,8 @@
 //! COEX fact collection, separate from the legacy advisory route probe.
 //!
-//! This first slice supports Linux iproute2 JSON only. It does not schedule runtime
-//! reprobes, notify, persist repair history, or project exits. Collection is sequential
+//! The collector supports Linux iproute2 JSON; macOS has a pure route decoder only.
+//! These slices do not schedule runtime reprobes, notify, persist repair history,
+//! or project exits. Collection is sequential
 //! and read-only; callers must offload it when running in an async context. Enumeration
 //! is not atomic: no phase, own-interface attribution or stable identity is inferred.
 //! Geometric coverage candidates have Unknown roles: this slice supplies no RPDB/FIB
@@ -19,6 +20,9 @@ use polaris_helper_proto::Platform;
 use std::time::Duration;
 
 mod linux;
+
+/// Pure macOS route observations; no host queries or selected-egress claims.
+pub mod macos;
 
 /// Maximum UTF-8 JSON bytes accepted per completed command output (not a read cap).
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
