@@ -183,6 +183,10 @@ fn scope(flags: &str) -> Fact<RouteScope> {
         Fact::Unknown("unrecognized printed route flags".into())
     } else if flags.contains('I') {
         Fact::Known(RouteScope::InterfaceScoped)
+    } else if flags.len() >= 10 {
+        // p_flags(..., "%-10.10s ") clips late letters. Observed I is positive
+        // evidence above; absence at the print precision cannot prove Global.
+        Fact::Unknown("printed flags may truncate the interface-scope bit".into())
     } else {
         Fact::Known(RouteScope::Global)
     }

@@ -246,3 +246,41 @@ fn explicit_zero_row_table_is_known_empty_and_diagnostics_name_the_source() {
         assert!(reason.contains("denied"));
     }
 }
+
+#[test]
+fn printed_flag_width_cannot_prove_absence_of_late_interface_scope_bit() {
+    for family in [AddressFamily::V4, AddressFamily::V6] {
+        for (flags, expected) in [
+            ("UGHRDMmdC", Some(RouteScope::Global)), // 9: not clipped
+            ("UGHRDMmdCX", None),                    // 10: I may be beyond the print precision
+            ("UGHRDMmdCXL", None), // longer unsupported layout cannot prove absence
+            ("UGHRDMmdCI", Some(RouteScope::InterfaceScoped)), // observed I at width 10
+            ("UCSIg", Some(RouteScope::InterfaceScoped)),
+            ("UGci", Some(RouteScope::Global)), // i is not I
+        ] {
+            let rows = known(format!("{HEADER}default link#7 {flags} utun7\n"), family);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].flags, flags);
+            assert_eq!(rows[0].gateway, "link#7");
+            assert_eq!(rows[0].interface, "utun7");
+            assert_eq!(rows[0].family, family);
+            assert_eq!(
+                rows[0].prefix,
+                if family == AddressFamily::V4 {
+                    "0.0.0.0/0"
+                } else {
+                    "::/0"
+                }
+            );
+            if let Some(scope) = expected {
+                assert_eq!(rows[0].scope, Fact::Known(scope), "{family:?} {flags}");
+            } else {
+                assert!(
+                    matches!(rows[0].scope, Fact::Unknown(_)),
+                    "{family:?} {flags}: {:?}",
+                    rows[0].scope
+                );
+            }
+        }
+    }
+}
