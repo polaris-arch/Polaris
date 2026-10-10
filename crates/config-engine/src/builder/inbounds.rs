@@ -716,14 +716,15 @@ fn build_tun_inbound(
     // both family AutoRoute guards and SetDNS(family, nil, nil) else branches;
     // unmodified D052 + explicit hijack changes interface DNS. The dependency
     // fingerprint gate remains closed until that source closure is signed.
-    let dns_mode = if !auto_route
-        && matches!(
-            Platform::parse(&deps.platform),
-            Platform::Linux | Platform::Mac | Platform::Win
-        ) {
-        Some(TunDnsMode::Hijack)
-    } else {
-        None
+    let dns_mode = match Platform::parse(&deps.platform) {
+        Platform::Linux | Platform::Mac | Platform::Win => {
+            if auto_route {
+                None
+            } else {
+                Some(TunDnsMode::Hijack)
+            }
+        }
+        Platform::Android | Platform::Ios | Platform::Other => None,
     };
 
     // 🔴 `strict_route`：**Android 上一个键都不发**（其余平台逐字下发用户档位）。

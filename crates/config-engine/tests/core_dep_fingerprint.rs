@@ -209,11 +209,12 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
              ⚠ 只有这一格不符时，其余平台那几份仍是 pin 住的版本 —— 那更可能是\
              「升核只重拉了部分平台」，而不是上游换了依赖：先看 `node scripts/fetch-core.mjs`\
              是不是漏了 `--platform`（不传该 flag = 全平台）。\n\
-             本仓的 DNS 截获依赖 sing-tun 的 `DNSModeOrDefault()` 默认值为 `hijack`\
-             （tun inbound 刻意不下发 `dns_mode`）。默认值一变，生成的配置一字节不动、\
-             `sing-box check` 照样 rc=0，而用户侧表现是「能上网但分流失效」。\n\
-             ⇒ 先读新版 `tun.go` 的 `DNSModeOrDefault()` 确认默认仍是 `DNSModeHijack`，\
-             再更新 core_dep_fingerprint.rs 的 SING_TUN_PINNED。取源码路径见该常量的文档注释。\n",
+             桌面 TUN auto_route=false 显式下发 typed dns_mode:hijack；true/缺省保持 true 且省略该键，\
+             仍依赖精确审计的默认值。mobile alpha.8、未知平台和非 TUN 不发新键。\n\
+             ⇒ 按平台/AutoRoute 复核新版 DNSModeOrDefault() 与调用副作用；Windows 必须先签收\
+             IPv4/IPv6 AutoRoute guards、else SetDNS(family,nil,nil) 及实际调用 mock 矩阵，\
+             保留 external bypass/family/error/Start 边界。源码/tagObject/replacement/hash/receipt\
+             未定不得猜填，不能只更新 SING_TUN_PINNED 放行；实际门仍保持严格四核版本检查。\n",
             core.key, core.rel
         );
     }
