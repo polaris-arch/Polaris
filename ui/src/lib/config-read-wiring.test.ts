@@ -288,7 +288,13 @@ const SITES: readonly Site[] = [
     file: 'components/screens/nodes/NodesScreen.tsx',
     shape: 'useAppStore((s)=>s.config)',
     route: 'disk',
-    why: '对账类：仅以已保存配置变化刷新运行期组网报告；节点列表仍用 useEffectiveServers 展示暂存编辑',
+    why: '对账类：以已保存配置刷新运行期组网报告及自动选择状态；实际出口与意图订阅名称也与该磁盘快照对账，节点列表仍用 useEffectiveServers 展示暂存编辑',
+  },
+  {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    shape: 'useAppStore((s)=>s.config)',
+    route: 'disk',
+    why: '对账类：自动选择状态来自后端保存的选择意图；刷新身份、实际出口与意图订阅名称必须取同一磁盘快照，不能由暂存意图或节点改名冒充运行事实',
   },
   {
     file: 'components/screens/rules/RulesScreen.tsx',

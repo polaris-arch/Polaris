@@ -421,6 +421,8 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
         />
       </div>
 
+      {props.autoSelectStatus}
+
       {/* ── ③ 订阅摘要 ────────────────────────────────────────────────────── */}
       {props.sub !== undefined && (
         <div className="mn-sub" role="group" aria-label={props.sub.name}>
