@@ -225,6 +225,18 @@ const SITES: readonly Site[] = [
 
   // ── 与后端对账 / 重放基准 ──
   {
+    file: 'mobile/home/MobileHomeScreen.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk',
+    why: '入参类：点击节点或sentinel出口时，只有磁盘已处于同一手动选择才可跳过switch/readback；暂存selectionIntent不能证明后端已离开Auto',
+  },
+  {
+    file: 'mobile/nodes/MobileNodesScreen.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk',
+    why: '入参类：节点使用按钮点击时按磁盘selectionIntent与selectedServerId判断手动同出口no-op；暂存编辑不能替代后端切换及权威读回',
+  },
+  {
     file: 'components/layout/PendingChangesBar.tsx',
     shape: 'useAppStore((s)=>s.config)',
     route: 'disk',
