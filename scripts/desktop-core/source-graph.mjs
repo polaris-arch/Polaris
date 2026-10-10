@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 
 export const DESKTOP_TARGETS = Object.freeze({
   linux: { goos: 'linux', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
-  win: { goos: 'windows', goarch: 'amd64', cgo: '0', extras: ['with_purego'] },
+  win: { goos: 'windows', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
   'mac-x64': { goos: 'darwin', goarch: 'amd64', cgo: '1', extras: ['with_gvisor'] },
   'mac-arm64': { goos: 'darwin', goarch: 'arm64', cgo: '1', extras: ['with_gvisor'] },
 });

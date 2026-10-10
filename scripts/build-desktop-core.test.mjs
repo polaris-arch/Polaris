@@ -270,16 +270,19 @@ test('alpha.11 platform additions retain gvisor without accepting unrelated pres
   try {
     for (const key of Object.keys(DESKTOP_TARGETS)) {
       const dest = join(f.root, key, 'alpha11-core');
-      const change = { preset: preset.join(',') };
+      const change = { preset: preset.join(','), windowsPreset: expectedTags('win').filter((tag) => tag !== 'with_gvisor').join(',') };
       const s = stub(f, key, change);
       const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, s.run);
       const build = s.calls.find(({ args }) => args[0] === 'build');
       assert.deepEqual(build.args[build.args.indexOf('-tags') + 1].split(','), expectedTags(key));
       assert.deepEqual(receipt.tags, expectedTags(key));
-      assert.equal(receipt.tags.includes('with_gvisor'), key !== 'win');
-      const selectedPreset = key === 'win' ? expectedTags('win') : preset;
-      for (const bad of [selectedPreset.filter((tag) => tag !== 'with_quic'), [...selectedPreset, 'with_unreviewed'],
-        ...(key === 'win' ? [[...selectedPreset, 'with_gvisor']] : [])]) {
+      assert.equal(receipt.tags.includes('with_gvisor'), true, `${key}: explicit gvisor capability retained`);
+      if (key === 'win') {
+        assert.equal(receipt.cgo, '0');
+        assert.equal(receipt.tags.includes('with_purego'), true, 'purego and gvisor are independent capabilities');
+      }
+      const selectedPreset = key === 'win' ? change.windowsPreset.split(',') : preset;
+      for (const bad of [selectedPreset.filter((tag) => tag !== 'with_quic'), [...selectedPreset, 'with_unreviewed']]) {
         const r = stub(f, key, { ...change, [key === 'win' ? 'windowsPreset' : 'preset']: bad.join(',') });
         assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate, r.run), /feature tag preset differs/);
         assert.equal(r.calls.some(({ args }) => args[0] === 'build'), false);
@@ -289,10 +292,10 @@ test('alpha.11 platform additions retain gvisor without accepting unrelated pres
   } finally { f.dispose(); }
 });
 
-test('missing embedded gvisor rejects Linux and both Mac producer and consumer faces', () => {
+test('missing embedded gvisor rejects every desktop producer and consumer face', () => {
   const f = fixture();
   try {
-    for (const key of ['linux', 'mac-x64', 'mac-arm64']) {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
       const tags = expectedTags(key);
       assert.ok(tags.includes('with_gvisor'));
       const raw = metadata(key).replace(`-tags=${tags.join(',')}`, `-tags=${tags.filter((tag) => tag !== 'with_gvisor').join(',')}`);
