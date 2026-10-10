@@ -1,6 +1,7 @@
 //! COEX fact collection, separate from the legacy advisory route probe.
 //!
-//! The collector supports Linux iproute2 JSON; macOS has a pure route decoder only.
+//! Linux has an iproute2 collector; macOS has a pure route decoder and Windows
+//! has pure injected-input validation. Neither decoder/validator reads the host.
 //! These slices do not schedule runtime reprobes, notify, persist repair history,
 //! or project exits. Collection is sequential
 //! and read-only; callers must offload it when running in an async context. Enumeration
@@ -23,6 +24,9 @@ mod linux;
 
 /// Pure macOS route observations; no host queries or selected-egress claims.
 pub mod macos;
+
+/// Pure injected Windows observations; no production source or selected-egress claims.
+pub mod windows;
 
 /// Maximum UTF-8 JSON bytes accepted per completed command output (not a read cap).
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
