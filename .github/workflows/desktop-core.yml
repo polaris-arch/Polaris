@@ -1,13 +1,18 @@
 name: Desktop Core Sources
 
-# One four-native-producer bundle per caller run. Receipts remain transport
-# evidence; the unchanged consumer verifies all four actual binaries before use.
+# Ordinary callers build four native cores. Explicit technical validation builds
+# Windows and retrieves three reviewed origins without rewriting their receipts.
+# Every consumer still verifies all four actual binaries before use.
 on:
   workflow_call:
     inputs:
       candidate:
         type: string
         required: true
+      native_validation:
+        type: boolean
+        required: false
+        default: false
     outputs:
       candidate:
         value: ${{ inputs.candidate }}
@@ -25,6 +30,7 @@ env:
   CORE_CANDIDATE: ${{ inputs.candidate }}
   CORE_RUN_ID: ${{ github.run_id }}
   CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
+  POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
 
 jobs:
   produce:
@@ -34,11 +40,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {"platform":"linux","os":"ubuntu-22.04","host":"linux","arch":"x64"}
-          - {"platform":"win","os":"windows-2022","host":"win32","arch":"x64"}
-          - {"platform":"mac-x64","os":"macos-15-intel","host":"darwin","arch":"x64"}
-          - {"platform":"mac-arm64","os":"macos-15","host":"darwin","arch":"arm64"}
+        # Ordinary runs retain four producers. The reviewed validation mode
+        # rebuilds Windows only; the assembler fetches three exact fixed origins.
+        include: ${{ fromJSON(inputs.native_validation && '[{"platform":"win","os":"windows-2022","host":"win32","arch":"x64"}]' || '[{"platform":"linux","os":"ubuntu-22.04","host":"linux","arch":"x64"},{"platform":"win","os":"windows-2022","host":"win32","arch":"x64"},{"platform":"mac-x64","os":"macos-15-intel","host":"darwin","arch":"x64"},{"platform":"mac-arm64","os":"macos-15","host":"darwin","arch":"arm64"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,6 +66,9 @@ jobs:
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
           [ -z "$(git status --porcelain --untracked-files=no)" ]
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node --input-type=module -e 'import {validationContext} from "./scripts/desktop-core/validation-origin.mjs"; validationContext(process.env.CORE_CANDIDATE)'
+          fi
           node -e 'if (process.platform !== process.env.CORE_HOST || process.arch !== process.env.CORE_ARCH) throw Error("native producer host differs")'
 
       - name: Read pinned source Go version
@@ -132,8 +139,10 @@ jobs:
           cache: false
 
       # Default download scope is this workflow run, including reusable jobs.
-      # No token/run-id override may turn this into a previous-run fallback.
+      # Ordinary downloads have no previous-run fallback. The separate validation
+      # downloader below accepts only committed exact origin IDs/ZIP/receipt pins.
       - name: Download Linux source artifact from this attempt
+        if: inputs.native_validation != true
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-linux
@@ -146,16 +155,29 @@ jobs:
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download Intel macOS source artifact from this attempt
+        if: inputs.native_validation != true
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-x64
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download arm64 macOS source artifact from this attempt
+        if: inputs.native_validation != true
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-arm64
           path: ${{ runner.temp }}/desktop-core-bundle
+
+      - uses: actions/setup-python@v6
+        if: inputs.native_validation == true
+        with:
+          python-version: '3.12'
+
+      - name: Retrieve reviewed unchanged native origins
+        if: inputs.native_validation == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/desktop-core/validation-download.py --bundle-dir="$RUNNER_TEMP/desktop-core-bundle"
 
       - name: Assemble and verify exact candidate bundle
         id: bundle
@@ -163,7 +185,11 @@ jobs:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: |
           set -euo pipefail
-          node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node scripts/fetch-core.mjs --assemble --validation-origin --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          else
+            node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          fi
           node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
           echo "artifact_name=desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 

@@ -1,5 +1,6 @@
 // Transport receipts are checked for consistency, not cryptographic provenance.
-// CI must retrieve all four producer artifacts from the exact candidate run.
+// Ordinary CI retrieves four exact-candidate native artifacts; only the reviewed
+// validation-v2 envelope may preserve three explicitly pinned original origins.
 import { execFileSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync,
   writeFileSync } from 'node:fs';
@@ -7,7 +8,10 @@ import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
   desktopSourceManifestPath, desktopOverlays, validateMacCodeSignature, verifyMacCodeSignatureReceipt, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
+import { VALIDATION_SCHEMA, validateBundleOrigin } from './validation-origin.mjs';
+
 export const coreFilename = (key) => key === 'win' ? 'sing-box.exe' : 'sing-box';
+
 const receiptPath = (directory, key) => join(directory, key, `${coreFilename(key)}.source-receipt.json`);
 const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
 
@@ -45,7 +49,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
   const source = readJson(sourceManifest);
   validateSourceManifest(source, spec);
   const inventory = readJson(join(directory, 'bundle.json'));
-  requireGraph(inventory.schema === 'polaris-desktop-bundle-v1' && inventory.candidate === candidate
+  requireGraph(['polaris-desktop-bundle-v1', VALIDATION_SCHEMA].includes(inventory.schema) && inventory.candidate === candidate
     && canonical(Object.keys(inventory.platforms ?? {}).sort()) === canonical(Object.keys(DESKTOP_TARGETS).sort()),
   'Candidate bundle is missing an exact platform inventory');
   // Every selected subset still validates all four. No missing-platform skip.
@@ -57,10 +61,11 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
     verifyHash(receiptFile, item.receiptSha256);
     const receipt = readJson(receiptFile);
     const { fingerprint, ...facts } = receipt;
+    validateBundleOrigin(root, inventory, candidate, key, receipt);
     const target = DESKTOP_TARGETS[key];
     const overlays = desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256);
     if (overlays.length) verifyHash(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlays[0].sha256);
-    requireGraph(receipt.schema === 'polaris-desktop-core-v1' && receipt.candidate === candidate
+    requireGraph(receipt.schema === 'polaris-desktop-core-v1'
       && receipt.platform === key && receipt.version === spec.version && receipt.binarySha256 === item.binarySha256
       && receipt.buildTree === spec.platforms[key].buildTree && fingerprint === digest(canonical(facts))
       && receipt.goos === target.goos && receipt.goarch === target.goarch && receipt.cgo === target.cgo
@@ -114,10 +119,12 @@ export function verifyPackagedSource(root, manifest, key, binary, run, host = pr
   const receipt = readJson(join(root, 'resources/.source-receipts', `${key}.json`));
   const inventory = readJson(join(root, 'resources/.source-receipts/bundle.json'));
   const { fingerprint, ...facts } = receipt;
-  requireGraph(inventory.schema === 'polaris-desktop-bundle-v1'
+  requireGraph(['polaris-desktop-bundle-v1', VALIDATION_SCHEMA].includes(inventory.schema)
     && canonical(Object.keys(inventory.platforms ?? {}).sort()) === canonical(Object.keys(DESKTOP_TARGETS).sort())
-    && /^[a-f0-9]{40}$/.test(inventory.candidate ?? '') && receipt.candidate === inventory.candidate,
+    && /^[a-f0-9]{40}$/.test(inventory.candidate ?? ''),
   'Packaging source bundle candidate/inventory differs');
+  validateBundleOrigin(root, inventory, inventory.candidate, key, receipt);
+  if (inventory.schema === VALIDATION_SCHEMA) requireGraph(String((run ?? execFileSync)('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })).trim() === inventory.candidate, 'Packaging validation checkout differs');
   verifyHash(join(root, 'resources/.source-receipts', `${key}.json`), inventory.platforms[key].receiptSha256);
   const sourceManifest = join(root, desktopSourceManifestPath(spec));
   verifyHash(sourceManifest, spec.sourceManifestSha256);

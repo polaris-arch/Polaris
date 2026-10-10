@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { produceDesktopCore } from './desktop-core/build-core.mjs';
 import { consumeDesktopBundle, coreFilename, writeBundleInventory } from './desktop-core/bundle.mjs';
+import { writeValidationBundle } from './desktop-core/validation-origin.mjs';
 import { validateSourcePins } from './desktop-core/source-graph.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -58,7 +59,8 @@ try {
     console.log(JSON.stringify({ candidate, platform: key, binarySha256: receipt.binarySha256, fingerprint: receipt.fingerprint }));
   } else if (process.argv.includes('--assemble')) {
     if (!bundle || ONLY) throw new Error('Assembly requires --bundle-dir and all four producer outputs');
-    writeBundleInventory(bundle, candidate);
+    if (process.argv.includes('--validation-origin')) writeValidationBundle(ROOT, bundle, candidate);
+    else writeBundleInventory(bundle, candidate);
   } else {
     if (!bundle) throw new Error('Consumption requires --bundle-dir containing all four candidate producer outputs');
     consumeDesktopBundle(ROOT, manifest, bundle, candidate, PICKED.map((target) => target.key));

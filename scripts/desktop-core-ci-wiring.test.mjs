@@ -124,8 +124,12 @@ test('four source producers use exact native hosts, source Go pin and real Darwi
   const workflow = files['desktop-core'];
   kernelCoverage(workflow);
   assert.throws(() => kernelCoverage(workflow.replace('env:\n', "env:\n  POLARIS_NO_KERNEL_RUN: '1'\n")));
-  const rows = job(workflow, 'produce').split('\n').filter((line) => /^\s+- \{"platform"/.test(line))
-    .map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+  const matrix = /include: \$\{\{ fromJSON\(inputs\.native_validation && '([^']+)' \|\| '([^']+)'\) \}\}/.exec(workflow);
+  assert.ok(matrix, 'explicit validation and ordinary producer matrices required');
+  const fresh = JSON.parse(matrix[1]), rows = JSON.parse(matrix[2]);
+  assert.deepEqual(fresh, [{ platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' }],
+    'validation must rebuild Windows only on its real native host');
+  assert.match(workflow, /native_validation:[\s\S]*?default: false/);
   assert.deepEqual(rows, [
     { platform: 'linux', os: 'ubuntu-22.04', host: 'linux', arch: 'x64' },
     { platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' },

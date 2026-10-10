@@ -11,6 +11,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [ordinary, native-payload]
+        default: ordinary
+        required: true
 
 permissions:
   contents: read
@@ -64,6 +70,7 @@ jobs:
       android: ${{ steps.impact.outputs.android }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
+      native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -97,8 +104,22 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
+          POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.mode == 'native-payload' && '1' || '0' }}
         run: |
           set -euo pipefail
+          # Technical payload mode is explicit, branch-only and never publishing.
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node --input-type=module -e 'import {validationContext} from "./scripts/desktop-core/validation-origin.mjs"; validationContext(process.env.DISPATCH_SHA)'
+            {
+              echo 'kernel=false'
+              echo 'platforms=[]'
+              echo 'preflight=false'
+              echo 'has_package=false'
+              echo 'android=false'
+              echo 'unregistered='
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           base=''
           head=''
           case "$EVENT_NAME" in
@@ -143,10 +164,29 @@ jobs:
   desktop_core:
     name: four native source producers
     needs: classify
-    if: needs.classify.outputs.preflight == 'true'
+    if: needs.classify.outputs.preflight == 'true' || needs.classify.outputs.native_validation == 'true'
     uses: ./.github/workflows/desktop-core.yml
     with:
       candidate: ${{ needs.classify.outputs.candidate }}
+      native_validation: ${{ needs.classify.outputs.native_validation == 'true' }}
+
+  native_payload:
+    name: reviewed Linux Windows native final payload
+    needs: [classify, desktop_core]
+    if: needs.classify.outputs.native_validation == 'true'
+    permissions:
+      contents: write # reusable publishing DAG declaration; branch guard keeps it unreachable
+    uses: ./.github/workflows/package.yml
+    with:
+      platforms: '["linux","windows"]'
+      skip_quality_gates: true
+      run_kernel_gates: true
+      upload_artifacts: true
+      light_build: false
+      native_validation: true
+      core_candidate: ${{ needs.classify.outputs.candidate }}
+      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
+    secrets: inherit
 
   preflight:
     name: static packaging + bundled core gate
@@ -296,11 +336,13 @@ jobs:
 
   gate:
     name: release risk gate
-    needs: [classify, desktop_core, preflight, package, android, pc_runtime_release_policy]
+    needs: [classify, desktop_core, preflight, package, android, native_payload, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
+      NATIVE_VALIDATION_REQUIRED: ${{ needs.classify.outputs.native_validation }}
+      NATIVE_VALIDATION_RESULT: ${{ needs.native_payload.result }}
       PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
       DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}
       DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}
@@ -320,6 +362,10 @@ jobs:
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
           [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
             echo "::error::PC runtime 发布阻断策略未通过：$PC_RUNTIME_POLICY_RESULT"; exit 1; }
+          if [ "$NATIVE_VALIDATION_REQUIRED" = true ]; then
+            [ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ] || {
+              echo '::error::native source/actual final payload proof did not pass'; exit 1; }
+          fi
           # 未登记的影响面（落在 crates/ 或 src-tauri/ 内、两张登记表都查不到的 scope）当场红并点名。
           # 为什么这条门开在这里，而不是只靠 ui.yml 的 vitest 完备性门：
           #   1) 独立性 —— ui.yml 挂了、被 skip、或 required check 集合被改，那条门就没牙；

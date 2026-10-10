@@ -80,6 +80,10 @@ on:
         type: boolean
         required: false
         default: true
+      native_validation:
+        type: boolean
+        required: false
+        default: false
       core_candidate:
         type: string
         required: false
@@ -185,8 +189,23 @@ jobs:
           CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact }}
           CORE_RUN_ID: ${{ github.run_id }}
           CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
+          VALIDATION_KERNEL: ${{ inputs.run_kernel_gates }}
+          VALIDATION_UPLOAD: ${{ inputs.upload_artifacts }}
+          VALIDATION_LIGHT: ${{ inputs.light_build }}
+          VALIDATION_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
         run: |
           set -euo pipefail
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            [ "$GITHUB_ACTIONS" = true ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+            [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ]
+            [ "$GITHUB_REF" = refs/heads/collab/fk02-native-payload-validation-20261010 ]
+            [ "$GITHUB_WORKFLOW_REF" = "polaris-arch/Polaris/.github/workflows/release-risk.yml@$GITHUB_REF" ]
+            [ "$PLATFORMS_JSON" = '["linux","windows"]' ]
+            [ -n "$CORE_BUNDLE_ARTIFACT" ]
+            [ "$VALIDATION_KERNEL" = true ] && [ "$VALIDATION_UPLOAD" = true ]
+            [ "$VALIDATION_LIGHT" = false ] && [ "$VALIDATION_SKIP_QUALITY" = true ]
+          fi
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$CORE_CANDIDATE" = "$EXPECTED_CANDIDATE" ]
           if [ -n "$CORE_BUNDLE_ARTIFACT" ]; then
@@ -333,6 +352,7 @@ jobs:
     env:
       POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
+      POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
@@ -782,6 +802,22 @@ jobs:
           cargo test -p polaris-net-stack --lib singbox_import::tests::local_import_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
+
+      - uses: actions/setup-python@v6
+        if: inputs.native_validation == true
+        with:
+          python-version: '3.12'
+
+      - name: Observe canonical native Cronet and actual core mapping
+        if: inputs.native_validation == true && (runner.os == 'Linux' || runner.os == 'Windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            python3 scripts/native-payload-proof.py --platform linux --core "$PWD/resources/linux/sing-box" --library "$PWD/resources/linux/libcronet.so" --output native-payload-evidence/source-linux.json
+          else
+            python scripts/native-payload-proof.py --platform win --core "$PWD/resources/win/sing-box.exe" --library "$PWD/resources/win/libcronet.dll" --output native-payload-evidence/source-win.json
+          fi
 
       # 网络场景起核门：真 `run`（只监听 127.0.0.1，不建 TUN）验证环境条件规则的 Start 期引用——
       # `check` 拦不住引用不存在/类型不支持的 DNS server。dhcp 用例只在 Linux 且证明发不出包时跑，其余平台跳过。
@@ -1397,6 +1433,40 @@ jobs:
         shell: bash
         run: node scripts/verify-packaging.mjs assets --label windows --dir dist-win
 
+      - name: Verify actual final Linux package payloads
+        if: inputs.native_validation == true && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(target/release/bundle/deb/*.deb)
+          images=(target/release/bundle/appimage/*.AppImage)
+          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
+          python3 scripts/final-package-receipt.py --platform linux --kind deb --artifact "${debs[0]}" --output native-payload-evidence/final-deb.json
+          python3 scripts/final-package-receipt.py --platform linux --kind AppImage --artifact "${images[0]}" --output native-payload-evidence/final-AppImage.json
+
+      - name: Verify actual installed NSIS and final portable payloads
+        if: inputs.native_validation == true && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem dist-win/*-setup.exe)
+          $zips = @(Get-ChildItem dist-win/*-Portable.zip)
+          if ($installers.Count -ne 1 -or $zips.Count -ne 1) { throw 'expected exact final NSIS and ZIP' }
+          python scripts/final-package-receipt.py --platform win --kind nsis --artifact $installers[0].FullName --output native-payload-evidence/final-nsis.json
+          if ($LASTEXITCODE -ne 0) { throw 'actual NSIS proof failed' }
+          python scripts/final-package-receipt.py --platform win --kind zip --artifact $zips[0].FullName --output native-payload-evidence/final-zip.json
+          if ($LASTEXITCODE -ne 0) { throw 'actual ZIP proof failed' }
+
+      - name: Upload native payload evidence
+        if: inputs.native_validation == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-payload-proof-${{ env.CORE_CANDIDATE }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
+          path: native-payload-evidence/*.json
+          if-no-files-found: error
+          retention-days: 7
+
       # ── 上传产物 ── 每平台一个 artifact；mac 分架构后 label 为 macos-arm64 / macos-x64，故不撞名。
       # 路径以**仓库根 target/** 为准（cargo workspace 根在仓库根，见 Build installers 注释）。
       # 传了 --target 的 mac job 多一层 triple 目录，故 dmg 用 `target/*/release/...` 覆盖。
@@ -1459,6 +1529,7 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
+      POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
     steps:
       - uses: actions/checkout@v7
