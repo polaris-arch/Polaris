@@ -45,10 +45,22 @@ fn coverage(prefixes: &[&str]) -> Vec<RouteFact> {
         .collect()
 }
 
+fn table_coverage(prefixes: &[&str], table: u32) -> Vec<RouteFact> {
+    coverage(prefixes)
+        .into_iter()
+        .map(|mut route| {
+            route.table = known(Some(table));
+            route
+        })
+        .collect()
+}
+
 fn policy(priority: u32, table: Option<u32>) -> PolicyRuleFact {
     PolicyRuleFact {
         priority,
         lookup_table: known(table),
+        address_family: known(AddressFamily::V4),
+        selector_scope: known(PolicySelectorScope::Global),
         applies_to_object: known(true),
     }
 }
@@ -764,6 +776,201 @@ fn linux_entry_failure_uses_main_split_or_applicable_early_policy_with_full_cove
         ObjectShape::Global,
         Rule::GlobalCoverage,
     );
+}
+
+#[test]
+fn early_policy_cannot_borrow_full_coverage_from_another_table() {
+    // P1 receipt: the lookup path is truly linked to foreign0, but only covers 10/8.
+    let mut obj = object();
+    let mut routes = table_coverage(&["0.0.0.0/0"], 100);
+    let mut partial = route("10.0.0.0/8", RouteRole::ResourceClaim);
+    partial.table = known(Some(200));
+    routes.push(partial);
+    obj.routes = known(routes);
+    obj.policy_rules = known(vec![policy(8999, Some(200))]);
+    let report = run(&obj, Platform::Linux);
+    expect(&report, ObjectShape::Global, Rule::GlobalCoverage);
+    assert_eq!(
+        predicate(&report, Rule::EntryCannotBePreserved),
+        &known(false)
+    );
+
+    // Nor may half of a cover in each table be joined into this lookup path.
+    let mut routes = table_coverage(&["0.0.0.0/1"], 100);
+    routes.extend(table_coverage(&["128.0.0.0/1"], 200));
+    obj.routes = known(routes);
+    expect(
+        &run(&obj, Platform::Linux),
+        ObjectShape::Global,
+        Rule::GlobalCoverage,
+    );
+    obj.routes = known(table_coverage(&["0.0.0.0/0"], 200));
+    expect(
+        &run(&obj, Platform::Linux),
+        ObjectShape::Exclusive,
+        Rule::EntryCannotBePreserved,
+    );
+}
+
+#[test]
+fn early_policy_cannot_borrow_full_coverage_from_another_family() {
+    let mut obj = object();
+    let mut routes = table_coverage(&["0.0.0.0/0"], 100);
+    routes.extend(table_coverage(&["::/0"], 200));
+    obj.routes = known(routes);
+    for (table, family, hit) in [
+        (200, AddressFamily::V4, false),
+        (100, AddressFamily::V6, false),
+        (100, AddressFamily::V4, true),
+        (200, AddressFamily::V6, true),
+    ] {
+        let mut rule = policy(8999, Some(table));
+        rule.address_family = known(family);
+        obj.policy_rules = known(vec![rule]);
+        let report = run(&obj, Platform::Linux);
+        assert_eq!(
+            predicate(&report, Rule::EntryCannotBePreserved),
+            &known(hit)
+        );
+        expect(
+            &report,
+            if hit {
+                ObjectShape::Exclusive
+            } else {
+                ObjectShape::Global
+            },
+            if hit {
+                Rule::EntryCannotBePreserved
+            } else {
+                Rule::GlobalCoverage
+            },
+        );
+    }
+}
+
+#[test]
+fn early_policy_known_limited_selectors_do_not_mean_global_entry_loss() {
+    let mut obj = object();
+    obj.routes = known(table_coverage(&["0.0.0.0/0"], 100));
+    for restriction in ["from 10.0.0.0/8", "to 10.0.0.0/8", "fwmark 0x80000/0x80000"] {
+        let mut rule = policy(8999, Some(100));
+        rule.selector_scope = known(PolicySelectorScope::Limited(restriction.into()));
+        // Association is true in all three cases; finite scope is a different fact.
+        obj.policy_rules = known(vec![rule]);
+        let report = run(&obj, Platform::Linux);
+        expect(&report, ObjectShape::Global, Rule::GlobalCoverage);
+        assert_eq!(
+            predicate(&report, Rule::EntryCannotBePreserved),
+            &known(false)
+        );
+    }
+}
+
+#[test]
+fn early_policy_unknown_selector_or_lookup_path_is_not_guessed() {
+    let mut obj = object();
+    obj.routes = known(table_coverage(&["0.0.0.0/0"], 100));
+    for rule in [
+        PolicyRuleFact {
+            selector_scope: missing("from/to/fwmark selectors not parsed"),
+            ..policy(8999, Some(100))
+        },
+        PolicyRuleFact {
+            address_family: missing("rule family omitted"),
+            ..policy(8999, Some(100))
+        },
+        policy(8999, None),
+        PolicyRuleFact {
+            lookup_table: missing("lookup action not parsed"),
+            ..policy(8999, Some(100))
+        },
+    ] {
+        obj.policy_rules = known(vec![rule]);
+        let report = run(&obj, Platform::Linux);
+        expect_unknown(&report);
+        assert!(matches!(
+            predicate(&report, Rule::EntryCannotBePreserved),
+            Fact::Unknown(_)
+        ));
+    }
+    let mut routes = table_coverage(&["0.0.0.0/0"], 100);
+    let mut unlocated = route("0.0.0.0/0", RouteRole::CoverageDeclaration);
+    unlocated.table = missing("route table omitted");
+    routes.push(unlocated);
+    obj.routes = known(routes);
+    obj.policy_rules = known(vec![policy(8999, Some(200))]);
+    let report = run(&obj, Platform::Linux);
+    expect_unknown(&report);
+    assert_eq!(report.coverage.ipv4, known(true));
+    assert!(matches!(
+        predicate(&report, Rule::EntryCannotBePreserved),
+        Fact::Unknown(_)
+    ));
+}
+
+#[test]
+fn early_policy_object_association_and_global_scope_are_independent() {
+    let mut obj = object();
+    obj.routes = known(table_coverage(&["0.0.0.0/0"], 100));
+    for (association, scope, expected) in [
+        (known(false), missing("selectors absent"), known(false)),
+        (
+            missing("unattributed rule"),
+            known(PolicySelectorScope::Limited("to 10/8".into())),
+            known(false),
+        ),
+        (
+            missing("unattributed rule"),
+            known(PolicySelectorScope::Global),
+            missing("unattributed rule"),
+        ),
+        (
+            known(true),
+            missing("selectors absent"),
+            missing("policy selector scope: selectors absent"),
+        ),
+    ] {
+        let mut rule = policy(8999, Some(100));
+        rule.applies_to_object = association;
+        rule.selector_scope = scope;
+        obj.policy_rules = known(vec![rule]);
+        let report = run(&obj, Platform::Linux);
+        assert_eq!(predicate(&report, Rule::EntryCannotBePreserved), &expected);
+        if expected == known(false) {
+            expect(&report, ObjectShape::Global, Rule::GlobalCoverage);
+        } else {
+            expect_unknown(&report);
+        }
+    }
+}
+
+#[test]
+fn early_policy_matching_table_family_and_priority_boundaries() {
+    let mut obj = object();
+    for (prefix, family) in [
+        ("0.0.0.0/0", AddressFamily::V4),
+        ("::/0", AddressFamily::V6),
+    ] {
+        obj.routes = known(table_coverage(&[prefix], 100));
+        for priority in [0, 8998, 8999, 9000, 9010, 9011] {
+            let mut rule = policy(priority, Some(100));
+            rule.address_family = known(family);
+            obj.policy_rules = known(vec![rule]);
+            let report = run(&obj, Platform::Linux);
+            assert_eq!(
+                predicate(&report, Rule::EntryCannotBePreserved),
+                &known(priority < 9000)
+            );
+            let (shape, rule) = if priority < 9000 {
+                (ObjectShape::Exclusive, Rule::EntryCannotBePreserved)
+            } else if priority <= 9010 {
+                (ObjectShape::Exclusive, Rule::OtherTunProxy)
+            } else {
+                (ObjectShape::Global, Rule::GlobalCoverage)
+            };
+            expect(&report, shape, rule);
+        }
+    }
 }
 
 #[test]

@@ -57,10 +57,29 @@ pub struct RouteFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySelectorScope {
+    /// Verified whole-family applicability of from/to/fwmark AND every other rule filter,
+    /// including lookup suppressions. A bare `from all` alone is not this witness.
+    Global,
+    /// A proved restriction; partial applicability does not establish global entry loss.
+    Limited(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    V4,
+    V6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRuleFact {
     pub priority: u32,
     pub lookup_table: Fact<Option<u32>>,
+    pub address_family: Fact<AddressFamily>,
+    /// Independent of object association. Unknown selectors must never default to Global.
+    pub selector_scope: Fact<PolicySelectorScope>,
     /// Includes selector applicability AND the rule -> table -> this object's interface link.
+    /// It proves applicability to some traffic, NOT whole-family selector coverage.
     /// A collector unable to prove either must supply `Unknown`, not guess by priority/name.
     pub applies_to_object: Fact<bool>,
 }
@@ -156,14 +175,8 @@ pub struct ClassificationReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
-    V4,
-    V6,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Network {
-    family: Family,
+    family: AddressFamily,
     start: u128,
     end: u128,
     bits: u8,
@@ -171,8 +184,8 @@ struct Network {
 
 fn network(address: IpAddr, bits: u8) -> Result<Network, String> {
     let (family, width, value) = match address {
-        IpAddr::V4(ip) => (Family::V4, 32, u128::from(u32::from(ip))),
-        IpAddr::V6(ip) => (Family::V6, 128, u128::from(ip)),
+        IpAddr::V4(ip) => (AddressFamily::V4, 32, u128::from(u32::from(ip))),
+        IpAddr::V6(ip) => (AddressFamily::V6, 128, u128::from(ip)),
     };
     if bits > width {
         return Err(format!("invalid address prefix: {address}/{bits}"));
@@ -241,11 +254,11 @@ fn overlaps(a: Network, b: Network) -> bool {
     a.family == b.family && a.start <= b.end && b.start <= a.end
 }
 
-fn complete(mut intervals: Vec<Network>, family: Family) -> bool {
+fn complete(mut intervals: Vec<Network>, family: AddressFamily) -> bool {
     intervals.sort_by_key(|n| (n.start, n.end));
     let max = match family {
-        Family::V4 => u128::from(u32::MAX),
-        Family::V6 => u128::MAX,
+        AddressFamily::V4 => u128::from(u32::MAX),
+        AddressFamily::V6 => u128::MAX,
     };
     let mut next = 0;
     for n in intervals {
@@ -260,13 +273,14 @@ fn complete(mut intervals: Vec<Network>, family: Family) -> bool {
     false
 }
 
-/// Optional main-table/split filtering is used only by the documented Linux entry rule.
+/// Table and split filters keep Linux entry witnesses within the relevant lookup path.
 fn cover(
     object: &ObjectFacts,
     parsed: &[Result<Network, String>],
-    family: Family,
+    family: AddressFamily,
     scope: RouteScope,
-    main_split: bool,
+    required_table: Option<u32>,
+    split_only: bool,
 ) -> Fact<bool> {
     let routes = match &object.routes {
         Fact::Unknown(reason) => return Fact::Unknown(format!("routes: {reason}")),
@@ -282,7 +296,7 @@ fn cover(
                 continue;
             }
         };
-        if n.family != family || (main_split && n.bits == 0) {
+        if n.family != family || (split_only && n.bits == 0) {
             continue;
         }
         let role = match &route.role {
@@ -293,10 +307,10 @@ fn cover(
             Fact::Known(value) => Fact::Known(*value == scope),
             Fact::Unknown(reason) => Fact::Unknown(format!("route scope: {reason}")),
         };
-        let table = if main_split {
+        let table = if let Some(required) = required_table {
             match &route.table {
-                Fact::Known(Some(value)) => Fact::Known(*value == 254),
-                Fact::Known(None) => Fact::Unknown("Linux main table not established".into()),
+                Fact::Known(Some(value)) => Fact::Known(*value == required),
+                Fact::Known(None) => Fact::Unknown("Linux route table not established".into()),
                 Fact::Unknown(reason) => Fact::Unknown(format!("route table: {reason}")),
             }
         } else {
@@ -327,6 +341,32 @@ fn policy_any(
             .iter()
             .map(|rule| and(rule.applies_to_object.clone(), predicate(rule)))),
     }
+}
+
+fn early_policy_coverage(
+    object: &ObjectFacts,
+    parsed: &[Result<Network, String>],
+    rule: &PolicyRuleFact,
+) -> Fact<bool> {
+    let selectors = match &rule.selector_scope {
+        Fact::Known(PolicySelectorScope::Global) => Fact::Known(true),
+        Fact::Known(PolicySelectorScope::Limited(_)) => Fact::Known(false),
+        Fact::Unknown(reason) => Fact::Unknown(format!("policy selector scope: {reason}")),
+    };
+    let path = match (&rule.lookup_table, &rule.address_family) {
+        (Fact::Known(Some(table)), Fact::Known(family)) => cover(
+            object,
+            parsed,
+            *family,
+            RouteScope::Global,
+            Some(*table),
+            false,
+        ),
+        (Fact::Unknown(reason), _) => Fact::Unknown(format!("lookup table: {reason}")),
+        (_, Fact::Unknown(reason)) => Fact::Unknown(format!("policy address family: {reason}")),
+        (Fact::Known(None), _) => Fact::Unknown("Linux lookup table not established".into()),
+    };
+    and(Fact::Known(rule.priority < 9000), and(selectors, path))
 }
 
 fn proxy_signature(
@@ -389,15 +429,15 @@ fn proxy_signature(
                         Err(reason) => bad.push(reason.clone()),
                         Ok(n) => {
                             let width = match n.family {
-                                Family::V4 => 32,
-                                Family::V6 => 128,
+                                AddressFamily::V4 => 32,
+                                AddressFamily::V6 => 128,
                             };
                             if (1..=8).contains(&n.bits) && n.start == 1u128 << (width - n.bits) {
                                 match n.family {
-                                    Family::V4 => {
+                                    AddressFamily::V4 => {
                                         v4.insert(n.bits);
                                     }
-                                    Family::V6 => {
+                                    AddressFamily::V6 => {
                                         v6.insert(n.bits);
                                     }
                                 }
@@ -458,7 +498,7 @@ fn collision(
                 Fact::Unknown(reason) => Fact::Unknown(format!("resource/coverage role: {reason}")),
                 Fact::Known(RouteRole::CoverageDeclaration) => {
                     let witness = match &route.scope {
-                        Fact::Known(scope) => cover(object, parsed, n.family, *scope, false),
+                        Fact::Known(scope) => cover(object, parsed, n.family, *scope, None, false),
                         Fact::Unknown(reason) => Fact::Unknown(format!("coverage scope: {reason}")),
                     };
                     match witness {
@@ -528,17 +568,17 @@ pub fn classify(input: &ClassificationInput<'_>) -> Vec<ClassificationReport> {
             Fact::Unknown(_) => Vec::new(),
         };
         let coverage = Coverage {
-            ipv4: cover(object, &parsed, Family::V4, RouteScope::Global, false),
-            ipv6: cover(object, &parsed, Family::V6, RouteScope::Global, false),
+            ipv4: cover(object, &parsed, AddressFamily::V4, RouteScope::Global, None, false),
+            ipv6: cover(object, &parsed, AddressFamily::V6, RouteScope::Global, None, false),
         };
         let global = or(coverage.ipv4.clone(), coverage.ipv6.clone());
         let (history, history_match) = history(input, object);
         let entry = if input.platform == Platform::Linux && !input.criteria.tun_addresses.is_empty() {
             let main_split = or(
-                cover(object, &parsed, Family::V4, RouteScope::Global, true),
-                cover(object, &parsed, Family::V6, RouteScope::Global, true),
+                cover(object, &parsed, AddressFamily::V4, RouteScope::Global, Some(254), true),
+                cover(object, &parsed, AddressFamily::V6, RouteScope::Global, Some(254), true),
             );
-            let early = policy_any(object, |rule| Fact::Known(rule.priority < 9000));
+            let early = policy_any(object, |rule| early_policy_coverage(object, &parsed, rule));
             and(global.clone(), or(main_split, early))
         } else { Fact::Known(false) };
         let foreign = match input.own_interfaces {
