@@ -4,7 +4,12 @@ use super::*;
 #[test]
 fn healthy_listener_echo_and_worker_receipts_are_observable() {
     let listener = Listener::tcp_on(false);
-    tcp_probe(listener.port).unwrap();
+    tcp_probe(listener.port).unwrap_or_else(|error| {
+        panic!(
+            "healthy TCP probe failed: {error}; {}",
+            listener.diagnostic()
+        )
+    });
     assert!(eventually(|| listener
         .diagnostics
         .replies
@@ -13,6 +18,53 @@ fn healthy_listener_echo_and_worker_receipts_are_observable() {
     assert_eq!(listener.count(), 1);
     assert!(listener.diagnostics.last_error.lock().unwrap().is_none());
     assert!(listener.diagnostic().contains("worker_finished=false"));
+}
+
+#[test]
+fn accepted_connection_waits_for_payload_sent_after_accept_receipt() {
+    let listener = Listener::tcp_on(false);
+    let mut stream = TcpStream::connect(local(listener.port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(600)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(600)))
+        .unwrap();
+    // No payload until the worker has accepted this connection: no sleep or probe retry.
+    assert!(
+        eventually(|| listener.count() == 1),
+        "accept receipt missing: {}",
+        listener.diagnostic()
+    );
+    let before_send = listener.diagnostics.last_error.lock().unwrap().clone();
+    assert!(
+        before_send.is_none(),
+        "accepted connection failed before payload: {}",
+        listener.diagnostic()
+    );
+    assert_eq!(listener.diagnostics.replies.load(Ordering::Relaxed), 0);
+    stream.write_all(&[0x59]).unwrap_or_else(|error| {
+        panic!(
+            "delayed payload write failed: {error}; {}",
+            listener.diagnostic()
+        )
+    });
+    let mut echoed = [0];
+    stream.read_exact(&mut echoed).unwrap_or_else(|error| {
+        panic!(
+            "delayed payload read failed: {error}; {}",
+            listener.diagnostic()
+        )
+    });
+    assert_eq!(echoed, [0x59]);
+    assert!(
+        eventually(|| listener.diagnostics.replies.load(Ordering::Relaxed) == 1),
+        "echo receipt missing: {}",
+        listener.diagnostic()
+    );
+    assert_eq!(listener.count(), 1);
+    let after_echo = listener.diagnostics.last_error.lock().unwrap().clone();
+    assert!(after_echo.is_none(), "{}", listener.diagnostic());
 }
 
 fn response_fixture(response: Option<u8>) -> (u16, Arc<AtomicBool>, JoinHandle<()>) {

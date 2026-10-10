@@ -89,10 +89,23 @@ impl Listener {
                 match socket.accept() {
                     Ok((mut stream, _)) => {
                         hits_clone.fetch_add(1, Ordering::Relaxed);
+                        // BSD/Winsock may inherit nonblocking mode from the listener.
+                        // Only accept polls; every accepted connection uses bounded blocking I/O.
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            worker_diagnostics.record("tcp set_nonblocking(false)", error);
+                            continue;
+                        }
                         if let Err(error) =
                             stream.set_read_timeout(Some(Duration::from_millis(500)))
                         {
                             worker_diagnostics.record("tcp set_read_timeout", error);
+                            continue;
+                        }
+                        if let Err(error) =
+                            stream.set_write_timeout(Some(Duration::from_millis(500)))
+                        {
+                            worker_diagnostics.record("tcp set_write_timeout", error);
+                            continue;
                         }
                         let mut byte = [0u8; 1];
                         match stream.read_exact(&mut byte) {
