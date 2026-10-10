@@ -1,17 +1,19 @@
 // Four desktop consumers of the shared provisioner. No target kernel is run.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync,
   rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  desktopSourceManifestPath, desktopOverlays, isForkSource, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  desktopSourceManifestPath, desktopOverlays, isForkSource, observeMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
 const PROVISIONER = 'scripts/core-source-provision.py';
 const sourceText = (value) => String(value).trim();
+const nativeRun = (command, args, options = {}) => command === 'codesign'
+  ? spawnSync(command, args, options) : execFileSync(command, args, { stdio: 'inherit', ...options });
 
 export function buildDesktopCore(root, manifest, key, dest, _force = false,
-  run = (command, args, options = {}) => execFileSync(command, args, { stdio: 'inherit', ...options }),
+  run = nativeRun,
   production = {}) {
   // Incomplete pins fail before mkdir, network, cache inspection or execution.
   const spec = validateSourcePins(manifest, key, !production.producer);
@@ -149,6 +151,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     const linked = validateBuildInfo(buildInfo, source, key, spec);
     requireGraph(capture(go, ['tool', 'buildid', binary], { cwd: checkout }) === identity.buildID,
       'Actual binary source buildID differs');
+    const macCodeSignature = observeMacCodeSignature(binary, key, run);
     const binarySha256 = digest(readFileSync(binary));
     if (!production.producer) verifyHash(binary, spec.platforms[key].binarySha256);
     stageCompilerInputs();
@@ -160,6 +163,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       mainGoModSha256: receipt.mainGoModSha256,
       mainGoSumSha256: receipt.mainGoSumSha256,
       version: spec.version, binarySha256,
+      ...(macCodeSignature ? { macCodeSignature } : {}),
       buildInfoSha256: buildInfoFingerprint(buildInfo), goos: target.goos, goarch: target.goarch,
       cgo: target.cgo, tags };
     platformReceipt.fingerprint = digest(canonical(platformReceipt));
@@ -168,6 +172,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     const stagedBinary = join(staging, 'binary');
     const stagedReceipt = join(staging, 'receipt.json');
     copyFileSync(binary, stagedBinary);
+    verifyHash(stagedBinary, binarySha256);
     if (key !== 'win') chmodSync(stagedBinary, 0o755);
     writeFileSync(stagedReceipt, `${JSON.stringify(platformReceipt, null, 2)}\n`);
     renameSync(stagedReceipt, `${dest}.source-receipt.json`);

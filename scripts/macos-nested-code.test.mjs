@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { canonical, digest } from './desktop-core/source-graph.mjs';
 
 // `macos-nested-code.sh` 只在 macOS 打包腿上真跑（那里才有 codesign）。这里测的是它的**控制流**：
 // 谁只被校验、谁可以被补签、什么时候必须失败。`file` 与 `codesign` 换成同名桩放在 PATH 最前：
@@ -48,6 +49,7 @@ case " $* " in
     if grep -q SIGNED "$last"; then exit 0; fi
     if grep -q BROKEN "$last"; then echo "$last: invalid signature (code or signature have been modified)" >&2; exit 1; fi
     echo "$last: code object is not signed at all" >&2; exit 1 ;;
+  *" --display "*) echo "CDHash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >&2 ;;
   *" --sign "*) [ "\${STUB_SIGN_NOOP:-0}" = 1 ] || printf SIGNED >> "$last" ;;
   *) exit 64 ;;
 esac
@@ -77,11 +79,20 @@ function fixture(files, { ref } = {}) {
   const core = join(app, 'Contents', 'Resources', '_up_', 'resources', 'mac-arm64');
   mkdirSync(core, { recursive: true });
   for (const [name, body] of Object.entries(files)) writeFileSync(join(core, name), body);
-  const refPath = join(root, 'source-core');
-  writeFileSync(refPath, ref ?? files['sing-box'] ?? ARM_SIGNED);
+  const refBytes = ref ?? files['sing-box'] ?? ARM_SIGNED;
+  const key = refBytes.startsWith('MACHO-x86_64') ? 'mac-x64' : 'mac-arm64';
+  const refPath = join(root, 'resources', key, 'sing-box');
+  mkdirSync(dirname(refPath), { recursive: true });
+  writeFileSync(refPath, refBytes);
+  const metadata = join(root, 'resources/.source-receipts');
+  mkdirSync(metadata);
+  const facts = { schema: 'polaris-desktop-core-v1', platform: key, binarySha256: digest(refBytes),
+    macCodeSignature: refBytes.includes('SIGNED') ? { state: 'signed', cdHash: 'a'.repeat(40) } : { state: 'unsigned', cdHash: null } };
+  const receiptPath = join(metadata, `${key}.json`);
+  writeFileSync(receiptPath, JSON.stringify({ ...facts, fingerprint: digest(canonical(facts)) }));
   const log = join(root, 'codesign.log');
   writeFileSync(log, '');
-  return { root, app, core, bin, ref: refPath, log, files };
+  return { root, app, core, bin, ref: refPath, receiptPath, log, files };
 }
 
 const snapshot = (dir) => Object.fromEntries(readdirSync(dir).sort().map((name) => [name, readFileSync(join(dir, name), 'utf8')]));
@@ -474,4 +485,27 @@ test('源码面：find 不跟随链接、清单按 NUL 读、路径变量逐条�
   assert.deepEqual(unquoted, [], '路径变量未加引号');
   // 反向对照：判据对一条漏引号的写法确实命中。
   assert.ok(/(^|[\s=(])\$(f|app|res|core_ref|list)\b/.test('  codesign --verify --strict $f'));
+});
+
+test('包内实际state/CDHash必须与源receipt相符；缺receipt及签后改字节拒绝且不补签', behaviour, () => {
+  for (const mutation of ['state', 'cdHash', 'fingerprint', 'hash', 'missing', 'platform']) {
+    withFixture({ 'sing-box': X64_SIGNED, 'polaris-helper': X64_SIGNED }, {}, (fx) => {
+      const receipt = JSON.parse(readFileSync(fx.receiptPath));
+      if (mutation === 'missing') rmSync(fx.receiptPath);
+      else {
+        if (mutation === 'state') receipt.macCodeSignature = { state: 'unsigned', cdHash: null };
+        if (mutation === 'cdHash') receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        if (mutation === 'hash') receipt.binarySha256 = digest('changed signed bytes');
+        if (mutation === 'platform') receipt.platform = 'mac-arm64';
+        if (mutation !== 'fingerprint') {
+          const { fingerprint: _old, ...facts } = receipt;
+          receipt.fingerprint = digest(canonical(facts));
+        } else receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        writeFileSync(fx.receiptPath, JSON.stringify(receipt));
+      }
+      const result = run(fx, 'verify');
+      assert.notEqual(result.status, 0, mutation);
+      assert.deepEqual(signCalls(fx), []);
+    });
+  }
 });

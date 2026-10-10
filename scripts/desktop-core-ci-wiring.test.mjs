@@ -138,7 +138,16 @@ test('four source producers use exact native hosts, source Go pin and real Darwi
   assert.match(workflow, /xcrun --sdk macosx --find clang\+\+/);
   assert.match(workflow, /echo "SDKROOT=\$sdk"/);
   assert.match(workflow, /echo "CC=\$cc"/);
-  assert.match(workflow, /require\("\.\/scripts\/libbox-patches\/source-manifest.json"\).goVersion/);
+  const requireGoSelection = (text) => {
+    const pins = text.split('\n').filter((line) => line.includes('run: node') && line.includes('version='));
+    assert.equal(pins.length, 2);
+    for (const pin of pins) {
+      assert.match(pin, /desktopSourceGoVersion\(process.cwd\(\), JSON.parse\(readFileSync\("src-tauri\/core-manifest.json"/);
+      assert.doesNotMatch(pin, /libbox-patches|ios|gomobile/);
+    }
+  };
+  requireGoSelection(workflow);
+  assert.throws(() => requireGoSelection(workflow.replaceAll('desktopSourceGoVersion(process.cwd(),', 'mobileGoVersion(process.cwd(),')));
   assert.match(job(workflow, 'produce'), /--producer --platform="\$CORE_PLATFORM"/);
   assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
 });

@@ -70,7 +70,7 @@ fi
 if [ -z "$core_ref" ] || [ ! -f "$core_ref" ] || [ -L "$core_ref" ]; then
   fail "第三个参数必须是源内核文件（普通文件，非链接）：'${core_ref}'" 2
 fi
-for tool in find file codesign cmp mktemp; do
+for tool in find file codesign cmp mktemp node; do
   command -v "$tool" >/dev/null 2>&1 || fail "找不到命令 ${tool}（本脚本只在带 Xcode 命令行工具的 macOS 上有意义）" 2
 done
 
@@ -92,6 +92,8 @@ sig_state() {
     esac
   fi
 }
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 BUILD_SIDE="应在内核构建产物那一步签名，而不是在打包时补（见 scripts/core-patches/README.md「macOS code signature of the bundled core」）"
 
@@ -119,6 +121,18 @@ check_core() {
       fail "内核带有无效签名：${rel}。${BUILD_SIDE}"
       ;;
   esac
+  # The adjacent source receipt binds the observed state/CDHash and final bytes.
+  # Its upstream/source pins are checked by the existing packaging consumer.
+  node --input-type=module - "$core_ref" "$f" "$script_dir" <<'NODE'
+import { readFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [reference, binary, scripts] = process.argv.slice(2);
+const key = basename(dirname(reference));
+const receipt = JSON.parse(readFileSync(join(dirname(dirname(reference)), '.source-receipts', `${key}.json`), 'utf8'));
+const { verifyMacCodeSignatureReceipt } = await import(pathToFileURL(join(scripts, 'desktop-core/source-graph.mjs')));
+verifyMacCodeSignatureReceipt(binary, receipt, key);
+NODE
 }
 
 # helper：seal 模式下允许 ad-hoc 补签（本仓产物）。

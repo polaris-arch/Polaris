@@ -85,6 +85,13 @@ function stub(f, key, change = {}) {
   const fetched = new Map();
   const run = (command, args, options) => {
     calls.push({ command, args, options });
+    if (command === 'codesign') {
+      const state = change.signature ?? 'signed';
+      return { status: state === 'signed' ? 0 : 1, stdout: '', stderr: state === 'signed'
+        ? (args[0] === '--display' ? `CDHash=${change.cdHash ?? 'a'.repeat(40)}\n` : '')
+        : state === 'unsigned' ? 'core: code object is not signed at all' : 'core: invalid signature' };
+    }
+    if (command === 'file') return `Mach-O 64-bit executable ${key === 'mac-x64' ? 'x86_64' : 'arm64'}`;
     if (command === 'git') {
       if (args[0] === 'rev-parse') return change.rootHead ?? candidate;
       if (args[0] === 'status') return change.status ?? '';
@@ -141,7 +148,8 @@ function produceAll(f) {
   writeBundleInventory(directory, candidate);
   return directory;
 }
-const inspector = (patched) => (command, args) => command === 'git'
+const inspector = (patched) => (command, args) => command === 'codesign'
+  ? { status: 0, stdout: '', stderr: args[0] === '--display' ? `CDHash=${'a'.repeat(40)}\n` : '' } : command === 'git'
   ? (args[0] === 'rev-parse' ? candidate : '') : args[0] === 'tool'
     ? JSON.parse(readFileSync(`${args[2]}.source-receipt.json`)).buildID
     : metadata(args[2].split(/[/\\]/).at(-2), args[2], { patched });
@@ -501,6 +509,9 @@ test('bundle byte mismatch and unknown receipt fail closed', () => {
     const receiptFile = join(directory, 'linux/sing-box.source-receipt.json');
     const receipt = JSON.parse(readFileSync(receiptFile));
     write(receiptFile, JSON.stringify({ ...receipt, schema: 'Unknown' }));
+    assert.throws(() => writeBundleInventory(directory, candidate), /fingerprint/);
+    const { fingerprint: _old, ...facts } = receipt;
+    write(receiptFile, JSON.stringify(signed({ ...facts, schema: 'Unknown' })));
     writeBundleInventory(directory, candidate);
     assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'], inspectStub), /receipt binding/);
     assert.equal(existsSync(join(f.root, 'resources')), false);
@@ -753,4 +764,104 @@ test('real tiny local Go cross-platform replacements enter every target BuildInf
       assert.equal(digest(readFileSync(join(work, 'go.mod'))), goModSha256);
     }
   } finally { rmSync(work, { recursive: true, force: true }); }
+});
+
+test('Mac producer observes final signature bytes before hashing, and rejects missing/bad signatures', () => {
+  const f = fixture();
+  try {
+    for (const key of ['mac-x64', 'mac-arm64']) {
+      const s = stub(f, key);
+      const run = (command, args, options) => {
+        // Synthetic signing-byte boundary only, not a real codesign verdict.
+        if (command === 'codesign' && args[0] === '--verify') write(args.at(-1), `final signed bytes ${key}`);
+        return s.run(command, args, options);
+      };
+      const dest = join(f.root, 'observed', key, 'sing-box');
+      const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, run);
+      assert.equal(receipt.binarySha256, digest(`final signed bytes ${key}`));
+      assert.deepEqual(receipt.macCodeSignature, { state: 'signed', cdHash: 'a'.repeat(40) });
+      assert.equal(digest(readFileSync(dest)), receipt.binarySha256);
+      for (const state of ['invalid', ...(key === 'mac-arm64' ? ['unsigned'] : [])]) {
+        const blocked = join(f.root, 'blocked', key, state);
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, blocked, candidate,
+          stub(f, key, { signature: state }).run), /signature invalid or missing/);
+        assert.equal(existsSync(blocked), false);
+      }
+      for (const cdHash of ['', 'not-a-cdhash', 'a'.repeat(64)]) {
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate,
+          stub(f, key, { cdHash }).run), /unique actual CDHash/);
+      }
+    }
+    const unsigned = produceDesktopCore(f.root, f.manifest, 'mac-x64', join(f.root, 'intel/core'), candidate,
+      stub(f, 'mac-x64', { signature: 'unsigned' }).run);
+    assert.deepEqual(unsigned.macCodeSignature, { state: 'unsigned', cdHash: null });
+  } finally { f.dispose(); }
+});
+
+test('Mac signature state/CDHash must match actual consumer observations and immutable transport bytes', () => {
+  for (const mutation of ['state', 'cdHash', 'fingerprint', 'bytes']) {
+    const f = fixture();
+    try {
+      const directory = produceAll(f);
+      // Explicit mock host exercises the actual Mac consumer branch on Linux.
+      consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['mac-arm64'], inspectStub, 'darwin');
+      const packaged = join(f.root, 'resources/mac-arm64/sing-box');
+      verifyPackagedSource(f.root, f.manifest, 'mac-arm64', packaged, inspectStub, 'darwin');
+      const wrongActualSignature = (command, args) => command === 'codesign' && args[0] === '--display'
+        ? { status: 0, stderr: `CDHash=${'b'.repeat(40)}\n` } : inspectStub(command, args);
+      assert.throws(() => verifyPackagedSource(f.root, f.manifest, 'mac-arm64', packaged,
+        wrongActualSignature, 'darwin'), /Actual Mac signature/);
+      const file = join(directory, 'mac-x64', 'sing-box.source-receipt.json');
+      const receipt = JSON.parse(readFileSync(file));
+      if (mutation === 'bytes') write(join(directory, 'mac-x64', 'sing-box'), 'modified after signature');
+      else {
+        if (mutation === 'state') receipt.macCodeSignature = { state: 'unsigned', cdHash: null };
+        if (mutation === 'cdHash') receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        if (mutation !== 'fingerprint') {
+          const { fingerprint: _old, ...facts } = receipt;
+          receipt.fingerprint = digest(canonical(facts));
+        } else receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        write(file, JSON.stringify(receipt));
+      }
+      if (mutation === 'fingerprint' || mutation === 'bytes') assert.throws(() => writeBundleInventory(directory, candidate), /fingerprint|SHA-256/);
+      else {
+        writeBundleInventory(directory, candidate);
+        assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'], inspectStub, 'darwin'), /Actual Mac signature/);
+      }
+    } finally { f.dispose(); }
+  }
+});
+
+test('producer refuses a byte change after receipt hash and before publishing staged output', () => {
+  const f = fixture();
+  try {
+    const s = stub(f, 'mac-arm64');
+    const run = (command, args, options) => {
+      if (command === 'git' && args[0] === 'add') {
+        const build = s.calls.find((x) => x.args[0] === 'build');
+        if (build) write(build.args[build.args.indexOf('-o') + 1], 'modified after final digest');
+      }
+      return s.run(command, args, options);
+    };
+    const dest = join(f.root, 'must-not-publish/core');
+    assert.throws(() => produceDesktopCore(f.root, f.manifest, 'mac-arm64', dest, candidate, run), /SHA-256/);
+    assert.equal(existsSync(dest), false);
+  } finally { f.dispose(); }
+});
+
+test('consumer rejects a selected artifact changed after all inspections but before staging', () => {
+  const f = fixture();
+  try {
+    const directory = produceAll(f);
+    const run = (command, args) => {
+      const answer = inspectStub(command, args);
+      if (args[0] === 'tool' && args[1] === 'buildid' && args[2].split(/[/\\]/).at(-2) === 'mac-arm64') {
+        write(join(directory, 'mac-x64/sing-box'), 'changed after inspection');
+      }
+      return answer;
+    };
+    assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate,
+      ['mac-x64'], run, 'darwin'), /SHA-256/);
+    assert.equal(existsSync(join(f.root, 'resources/mac-x64/sing-box')), false);
+  } finally { f.dispose(); }
 });

@@ -5,7 +5,7 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSy
   writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  desktopSourceManifestPath, desktopOverlays, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  desktopSourceManifestPath, desktopOverlays, validateMacCodeSignature, verifyMacCodeSignatureReceipt, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
 export const coreFilename = (key) => key === 'win' ? 'sing-box.exe' : 'sing-box';
 const receiptPath = (directory, key) => join(directory, key, `${coreFilename(key)}.source-receipt.json`);
@@ -17,6 +17,9 @@ export function writeBundleInventory(directory, candidate) {
   for (const key of Object.keys(DESKTOP_TARGETS)) {
     const receipt = readJson(receiptPath(directory, key));
     requireGraph(receipt.candidate === candidate && receipt.platform === key, 'Producer candidate/platform differs');
+    validateMacCodeSignature(receipt.macCodeSignature, key);
+    const { fingerprint, ...facts } = receipt;
+    requireGraph(fingerprint === digest(canonical(facts)), 'Producer receipt fingerprint differs');
     verifyHash(join(directory, key, coreFilename(key)), receipt.binarySha256);
     platforms[key] = { binarySha256: receipt.binarySha256, receiptSha256: digest(readFileSync(receiptPath(directory, key))) };
   }
@@ -26,7 +29,7 @@ export function writeBundleInventory(directory, candidate) {
 }
 
 export function consumeDesktopBundle(root, manifest, directory, candidate, keys = Object.keys(DESKTOP_TARGETS),
-  run = execFileSync) {
+  run = execFileSync, host = process.platform) {
   const spec = validateSourcePins(manifest, 'linux', false);
   requireGraph(/^[a-f0-9]{40}$/.test(candidate ?? ''), 'Explicit candidate source SHA required');
   const gitOptions = { cwd: root, encoding: 'utf8', stdio: 'pipe', env: { ...process.env } };
@@ -65,6 +68,10 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
       && receipt.mainGoSumSha256 === receipt.sourceReceipt?.mainGoSumSha256
       && canonical(receipt.tags) === canonical(expectedTags(key))
       && canonical(receipt.overlays) === canonical(overlays), 'Platform receipt binding differs');
+    validateMacCodeSignature(receipt.macCodeSignature, key);
+    if (host === 'darwin' && key.startsWith('mac-')) {
+      verifyMacCodeSignatureReceipt(binary, receipt, key, run === execFileSync ? undefined : run);
+    }
     validateSourceReceipt(receipt.sourceReceipt, source, spec);
     const identity = platformSourceIdentity(receipt.sourceReceipt, source, spec, key, manifest.windowsBuild?.patchSha256);
     requireGraph(receipt.sourceFingerprint === identity.sourceFingerprint
@@ -88,6 +95,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
     try {
       const staged = join(staging, 'binary');
       copyFileSync(join(directory, key, coreFilename(key)), staged);
+      verifyHash(staged, inventory.platforms[key].binarySha256);
       if (key !== 'win') chmodSync(staged, 0o755);
       renameSync(staged, dest);
     } finally { rmSync(staging, { recursive: true, force: true }); }
@@ -101,7 +109,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
   return inventory;
 }
 
-export function verifyPackagedSource(root, manifest, key, binary) {
+export function verifyPackagedSource(root, manifest, key, binary, run, host = process.platform) {
   const spec = validateSourcePins(manifest, key, false);
   const receipt = readJson(join(root, 'resources/.source-receipts', `${key}.json`));
   const inventory = readJson(join(root, 'resources/.source-receipts/bundle.json'));
@@ -127,5 +135,7 @@ export function verifyPackagedSource(root, manifest, key, binary) {
     && receipt.mainGoModSha256 === receipt.sourceReceipt?.mainGoModSha256
     && receipt.mainGoSumSha256 === receipt.sourceReceipt?.mainGoSumSha256
     && fingerprint === digest(canonical(facts)), 'Packaged source receipt binding differs');
+  validateMacCodeSignature(receipt.macCodeSignature, key);
   verifyHash(binary, receipt.binarySha256);
+  if (host === 'darwin' && key.startsWith('mac-')) verifyMacCodeSignatureReceipt(binary, receipt, key, run);
 }

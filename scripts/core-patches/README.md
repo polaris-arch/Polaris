@@ -216,41 +216,33 @@ bundle, before the bundle seal and again in the final dmg:
 A core that fails these checks fails packaging. The fix belongs to the step
 that produces the core, not to packaging.
 
-Current state, with what each statement rests on:
+The native producer reads `go version -m` and checks the BuildID first,
+then observes the actual macOS code signature before computing `binarySha256`.
+It runs `codesign --verify --strict`; arm64 requires success. Thin Intel output
+may remain explicitly unsigned, but an invalid signature is rejected on both
+architectures. A signed core must yield exactly one actual `CDHash` from
+`codesign --display --verbose=4`. The producer does not sign or rewrite the core;
+it validates the Apple linker's output and fails if it does not meet this policy.
 
-- Both macOS cores are built natively with CGO (`macos-15` for arm64,
-  `macos-15-intel` for x64, `.github/workflows/desktop-core.yml`), so the final
-  link is done by the Apple linker. `scripts/desktop-core/build-core.mjs` runs
-  no `strip`, `lipo` or `codesign` after `go build`; artifact transport is
-  checked by hash, so the packaged bytes are the linker's output.
-- The Apple linker ad-hoc signs arm64 output by default. This is toolchain
-  behavior, not something this repository asserts at build time. Indirect
-  evidence: the kernel gates in `package.yml` execute
-  `resources/mac-arm64/sing-box` directly on an arm64 runner, which an
-  unsigned arm64 binary cannot do.
-- Whether the x64 core carries a signature has not been observed. The same
-  linker does not sign x86_64 output by default, so it is expected to be
-  unsigned; that is the case the exception above covers.
+The platform output receipt binds `macCodeSignature = {state, cdHash}` in its
+fingerprint: `signed` carries a lower-case 40-hex CDHash, while the thin Intel
+`unsigned` exception carries `null`. These output facts do not enter the
+pre-link platform BuildID, avoiding a CDHash/BuildID cycle. Non-Mac receipts
+cannot carry this field. Assembly validates the state/platform policy,
+fingerprint and actual bytes; native Mac consumption re-observes the signature
+and compares it to the receipt. Staged copies must still match the final hash.
 
-Prerequisite for the core supply task (not implemented here):
+Before bundle sealing and again in the final dmg, the read-only core check
+retains byte-for-byte `cmp` and strict signature validation, and also compares
+the actual state/CDHash and byte hash with the adjacent same-source receipt in
+`resources/.source-receipts`. Only the helper may be re-signed by packaging.
+Native Go pins select the desktop manifest through the App's source mode;
+an active desktop fork cannot accidentally select the separate mobile manifest.
 
-- Where: the macOS producers in `buildDesktopCore`
-  (`scripts/desktop-core/build-core.mjs`), after `go build` and the buildID
-  check, before `binarySha256` is computed. Signing changes the file, so it
-  has to happen before the hash that every later step compares against.
-- On what: the `sing-box` output for `mac-arm64` and `mac-x64`.
-- What: on arm64, run `codesign --verify --strict` and fail the producer when
-  it does not pass. On x64, either keep the binary unsigned (the exception
-  stays) or ad-hoc sign it with `codesign --sign - --timestamp=none` so both
-  architectures meet one rule and the exception can be removed.
-- Verifiable output: a field in the platform receipt recording the signature
-  state the producer observed (for example signed or unsigned, and the
-  `CDHash` printed by `codesign -dvvv`), covered by the receipt fingerprint.
-  Packaging can then compare the bundled core's `CDHash` with the receipt
-  instead of relying on the architecture exception.
-
-Signing at that step changes the binary hash, so the pinned output hashes and
-the receipts of both macOS platforms change with it.
+These code/fixture checks do not activate a production fork manifest or certify
+native output bytes. That requires real annotated consumption/upstream tags,
+frozen input pins, four native producers, and final post-signature output hashes.
+No guessed tag objects or empty output pins stand in for that acceptance.
 
 Any future pin must follow the combined L/N/R/I/C source freeze and native
 four-platform builds. Do not reuse an old output hash or remove the Windows

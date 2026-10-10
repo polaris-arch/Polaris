@@ -1,5 +1,7 @@
 // Source receipts bind reviewed inputs; they are not platform cleanup evidence.
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
 
 export const DESKTOP_TARGETS = Object.freeze({
@@ -58,6 +60,71 @@ export function isForkSource(spec) {
 }
 export const desktopSourceManifestPath = (spec) => isForkSource(spec)
   ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
+export function desktopSourceGoVersion(root, manifest) {
+  const spec = manifest.sourceBuild;
+  const path = join(root, desktopSourceManifestPath(spec));
+  verifyHash(path, spec.sourceManifestSha256);
+  const source = JSON.parse(readFileSync(path, 'utf8'));
+  validateSourceManifest(source, spec);
+  return source.goVersion;
+}
+
+// Output facts deliberately do not enter the pre-link BuildID: a CDHash
+// contains the signed bytes, including that BuildID, and would form a cycle.
+export function validateMacCodeSignature(signature, key) {
+  requireGraph(Object.hasOwn(DESKTOP_TARGETS, key), 'Unknown signature platform');
+  if (!key.startsWith('mac-')) {
+    requireGraph(signature === undefined, 'Non-Mac receipt carries a Mac signature');
+    return;
+  }
+  requireGraph(signature && same(Object.keys(signature).sort(), ['cdHash', 'state'])
+    && (signature.state === 'signed' && typeof signature.cdHash === 'string'
+      && /^[a-f0-9]{40}$/.test(signature.cdHash)
+      || key === 'mac-x64' && signature.state === 'unsigned' && signature.cdHash === null),
+  'Mac signature state/CDHash differs from platform policy');
+}
+
+export function observeMacCodeSignature(binary, key, run = spawnSync) {
+  if (!key.startsWith('mac-')) return undefined;
+  const inspect = (command, args) => {
+    let result;
+    try { result = run(command, args, { encoding: 'utf8', stdio: 'pipe' }); }
+    catch (error) { result = { status: error.status, stdout: error.stdout, stderr: error.stderr, error }; }
+    if (typeof result === 'string' || Buffer.isBuffer(result)) return { status: 0, stdout: String(result), stderr: '' };
+    requireGraph(result && Number.isInteger(result.status), `Cannot inspect Mac signature: ${command}`);
+    return { status: result.status, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') };
+  };
+  const verified = inspect('codesign', ['--verify', '--strict', binary]);
+  let signature;
+  if (verified.status === 0) {
+    const display = inspect('codesign', ['--display', '--verbose=4', binary]);
+    const matches = [...(display.stdout + '\n' + display.stderr).matchAll(/^CDHash=([a-fA-F0-9]{40})\r?$/gm)];
+    requireGraph(display.status === 0 && matches.length === 1, 'Signed Mac core has no unique actual CDHash');
+    signature = { state: 'signed', cdHash: matches[0][1].toLowerCase() };
+  } else {
+    requireGraph(key === 'mac-x64' && verified.status === 1
+      && verified.stderr.includes('code object is not signed at all'), 'Mac core signature invalid or missing');
+    const kind = inspect('file', ['-b', binary]);
+    requireGraph(kind.status === 0 && /^Mach-O\b.*\bx86_64\b/.test(kind.stdout.trim())
+      && !/arm64|universal|fat/i.test(kind.stdout), 'Unsigned exception requires a thin Intel Mach-O');
+    signature = { state: 'unsigned', cdHash: null };
+  }
+  validateMacCodeSignature(signature, key);
+  return signature;
+}
+
+export function verifyMacCodeSignatureReceipt(binary, receipt, key, run) {
+  requireGraph(key === 'mac-x64' || key === 'mac-arm64', 'Mac signature receipt requires a Mac target');
+  validateMacCodeSignature(receipt.macCodeSignature, key);
+  const { fingerprint, ...facts } = receipt;
+  requireGraph(receipt.schema === 'polaris-desktop-core-v1' && receipt.platform === key
+    && fingerprint === digest(canonical(facts)), 'Mac signature receipt fingerprint/platform differs');
+  verifyHash(binary, receipt.binarySha256);
+  requireGraph(same(observeMacCodeSignature(binary, key, run), receipt.macCodeSignature),
+    'Actual Mac signature state/CDHash differs from receipt');
+  verifyHash(binary, receipt.binarySha256);
+}
+
 export const desktopOverlays = (spec, key, overlaySha256) => isForkSource(spec) || key !== 'win'
   ? [] : [{ file: 'windows-dns-refresh.patch', sha256: overlaySha256 }];
 

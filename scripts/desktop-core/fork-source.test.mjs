@@ -9,7 +9,7 @@ import test from 'node:test';
 import { produceDesktopCore } from './build-core.mjs';
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, desktopSourceManifestPath, digest, expectedTags,
-  platformSourceIdentity, validateSourceManifest, validateSourcePins, validateSourceReceipt } from './source-graph.mjs';
+  platformSourceIdentity, desktopSourceGoVersion, observeMacCodeSignature, validateMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt } from './source-graph.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const candidate = 'c'.repeat(40);
@@ -66,6 +66,7 @@ function runner(f, key, mutate = {}) {
   const calls = [];
   const run = (command, args, options = {}) => {
     calls.push({ command, args });
+    if (command === 'codesign') return { status: 0, stdout: '', stderr: args[0] === '--display' ? `CDHash=${'a'.repeat(40)}\n` : '' };
     if (command === 'git') {
       if (options.cwd === f.root) return args[0] === 'rev-parse' ? candidate : '';
       const query = args[0] === '-C' && args[2] === 'rev-parse' ? args[3] : undefined;
@@ -191,4 +192,40 @@ test('all four fork producers, bundle consumer and packaging use the same pinned
     assert.throws(() => validateSourceReceipt(bad, f.source, { ...f.manifest.sourceBuild, sourceReceiptFingerprint: bad.fingerprint }), /commit tree/);
     assert.equal(buildInfoFingerprint(metadata('linux', 'a')), buildInfoFingerprint(metadata('linux', 'b')));
   } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop Go pin reads the selected desktop manifest, rejects mobile role and missing byte pin', () => {
+  const f = fixture();
+  try {
+    write(join(f.root, 'scripts/libbox-patches/source-manifest.json'), JSON.stringify({ goVersion: '1.26.0', role: 'mobile' }));
+    assert.equal(desktopSourceGoVersion(f.root, f.manifest), '1.25.5');
+    const selected = join(f.root, 'scripts/desktop-core/source-manifest.json');
+    write(selected, JSON.stringify({ ...f.source, goVersion: '1.26.0' }));
+    assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /SHA-256/);
+    f.source.role = 'mobile'; refresh(f);
+    assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /role/);
+    f.source.role = 'desktop'; refresh(f);
+    delete f.manifest.sourceBuild.sourceManifestSha256;
+    assert.throws(() => desktopSourceGoVersion(f.root, f.manifest), /SHA-256/);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('Mac observation requires strict success/unique CDHash or the precise thin Intel unsigned exception', () => {
+  const signedRun = (_command, args) => ({ status: 0, stdout: '', stderr: args[0] === '--display' ? `CDHash=${'A'.repeat(40)}\n` : '' });
+  assert.deepEqual(observeMacCodeSignature('/synthetic', 'mac-arm64', signedRun), { state: 'signed', cdHash: 'a'.repeat(40) });
+  for (const key of ['mac-x64', 'mac-arm64']) {
+    for (const signature of [undefined, {}, { state: 'invalid', cdHash: null }, { state: 'signed', cdHash: null },
+      { state: 'signed', cdHash: 'a'.repeat(40), extra: true }]) assert.throws(() => validateMacCodeSignature(signature, key));
+  }
+  assert.throws(() => validateMacCodeSignature({ state: 'unsigned', cdHash: null }, 'mac-arm64'));
+  assert.throws(() => validateMacCodeSignature({ state: 'signed', cdHash: 'a'.repeat(40) }, 'linux'));
+  for (const kind of ['Mach-O universal x86_64 arm64', 'Mach-O fat x86_64', 'ASCII text', 'Mach-O arm64']) {
+    const unsignedRun = (command) => command === 'file' ? { status: 0, stdout: kind, stderr: '' }
+      : { status: 1, stdout: '', stderr: 'core: code object is not signed at all' };
+    assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-x64', unsignedRun), /thin Intel/);
+  }
+  assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-x64', () => ({ status: 1, stderr: 'invalid signature' })), /invalid or missing/);
+  assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-x64', () => ({ status: null, error: Error('missing tool') })), /Cannot inspect/);
+  assert.throws(() => observeMacCodeSignature('/synthetic', 'mac-arm64', (_command, args) => ({ status: 0, stderr:
+    args[0] === '--display' ? `CDHash=${'a'.repeat(40)}\nCDHash=${'b'.repeat(40)}\n` : '' })), /unique actual/);
 });
