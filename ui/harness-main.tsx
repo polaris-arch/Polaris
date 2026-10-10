@@ -33,8 +33,8 @@ function coexFixture(): CoexSnapshot {
     objects: known([{
       interface: 'fixture-tun0', tunnel: known(true), virtualization: unknown('fixture link kind unavailable'),
       stableIdentity: known(null), addresses: known([{ address: '10.77.2.9', prefixLen: 24 }]),
-      routes: known([{ prefix: '0.0.0.0/1', table: known('100'), scope: known('global'), role: unknown('fixture role unverified') }]),
-      policyRules: known([{ priority: 120, lookupTable: known('100'), addressFamily: known('ipv4'),
+      routes: known([{ prefix: '0.0.0.0/1', table: known(100), scope: known('global'), role: unknown('fixture role unverified') }]),
+      policyRules: known([{ priority: 120, lookupTable: known(100), addressFamily: known('ipv4'),
         selectorScope: known({ kind: 'limited', selector: 'from 10.77.2.0/24' }), appliesToObject: unknown('fixture association unverified') }]),
     }]),
   };

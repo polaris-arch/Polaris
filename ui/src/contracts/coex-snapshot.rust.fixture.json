@@ -1,0 +1,448 @@
+{
+  "producer": {
+    "backendSourceSha256": "68559f976d48511e8d4339e4d45552822b94cbfe6d9ce62af1f1774c5084f1c3",
+    "collectorSourceSha256": "334c54d0d1e138f214fe6d41599bb95df38fb7cd553ce9be4e9c03d1043b7b07",
+    "copiedFunctions": [
+      "fact_wire",
+      "unknown_wire",
+      "object_wire",
+      "platform_tag",
+      "snapshot_wire"
+    ],
+    "copiedFunctionsSha256": "5d3e017142577970ca238c001dc66cd9a06b37713f27d0abf1163eb7cd87bf53",
+    "frozenBackendHead": "73551cc34519110113967d4d6619b424d0688ada",
+    "kind": "Rust-generated fixture; no host or native IPC sampling",
+    "method": "Production collect_linux with injected fixture runner; exact production fact_wire/object_wire/snapshot_wire functions compiled unchanged against actual crate types. Option-shapes case explicitly supplies typed synthetic table values to the same serializer.",
+    "typesSourceSha256": "e84a24f5f66a77cdf4082346a70cf7fc810d66af3f94f6460da2007cf2bda2c2"
+  },
+  "snapshots": {
+    "linuxCollector": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "status": "known",
+        "value": "noRetainedSnapshotCommand"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "status": "known",
+        "value": [
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "10.77.2.9",
+                  "prefixLen": 24
+                }
+              ]
+            },
+            "interface": "wire-fixture0",
+            "policyRules": {
+              "status": "known",
+              "value": [
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "route table membership does not prove selected object path",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 100
+                  },
+                  "priority": 1000,
+                  "selectorScope": {
+                    "status": "known",
+                    "value": {
+                      "kind": "global"
+                    }
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "route table membership does not prove selected object path",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 254
+                  },
+                  "priority": 1001,
+                  "selectorScope": {
+                    "status": "known",
+                    "value": {
+                      "kind": "global"
+                    }
+                  }
+                }
+              ]
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "0.0.0.0/1",
+                  "role": {
+                    "reason": "split coverage lacks same-table/family candidate",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 254
+                  }
+                },
+                {
+                  "prefix": "128.0.0.0/1",
+                  "role": {
+                    "reason": "split coverage lacks same-table/family candidate",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "status": "known",
+                    "value": "global"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 100
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "status": "known",
+              "value": null
+            },
+            "tunnel": {
+              "status": "known",
+              "value": true
+            },
+            "virtualization": {
+              "status": "known",
+              "value": false
+            }
+          }
+        ]
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "linux",
+      "schemaVersion": 1
+    },
+    "optionShapes": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "status": "known",
+        "value": "noRetainedSnapshotCommand"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "status": "known",
+        "value": [
+          {
+            "addresses": {
+              "status": "known",
+              "value": [
+                {
+                  "address": "10.77.2.9",
+                  "prefixLen": 24
+                }
+              ]
+            },
+            "interface": "wire-fixture0",
+            "policyRules": {
+              "status": "known",
+              "value": [
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 254
+                  },
+                  "priority": 0,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 100
+                  },
+                  "priority": 1,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": null
+                  },
+                  "priority": 2,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "reason": "table source unreadable",
+                    "status": "unknown"
+                  },
+                  "priority": 3,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 0
+                  },
+                  "priority": 4,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "addressFamily": {
+                    "status": "known",
+                    "value": "ipv4"
+                  },
+                  "appliesToObject": {
+                    "reason": "association fixture",
+                    "status": "unknown"
+                  },
+                  "lookupTable": {
+                    "status": "known",
+                    "value": 4294967295
+                  },
+                  "priority": 5,
+                  "selectorScope": {
+                    "reason": "selector fixture",
+                    "status": "unknown"
+                  }
+                }
+              ]
+            },
+            "routes": {
+              "status": "known",
+              "value": [
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 254
+                  }
+                },
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 100
+                  }
+                },
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": null
+                  }
+                },
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "reason": "table source unreadable",
+                    "status": "unknown"
+                  }
+                },
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 0
+                  }
+                },
+                {
+                  "prefix": "10.77.0.0/16",
+                  "role": {
+                    "reason": "role fixture",
+                    "status": "unknown"
+                  },
+                  "scope": {
+                    "reason": "scope fixture",
+                    "status": "unknown"
+                  },
+                  "table": {
+                    "status": "known",
+                    "value": 4294967295
+                  }
+                }
+              ]
+            },
+            "stableIdentity": {
+              "status": "known",
+              "value": null
+            },
+            "tunnel": {
+              "status": "known",
+              "value": true
+            },
+            "virtualization": {
+              "status": "known",
+              "value": false
+            }
+          }
+        ]
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "linux",
+      "schemaVersion": 1
+    }
+  }
+}

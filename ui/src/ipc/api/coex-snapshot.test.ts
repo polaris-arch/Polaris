@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { CoexSnapshotDecodeError } from '@/contracts/coex-snapshot';
+import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
 const transport = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: transport }));
 const { systemApi } = await import('./system');
@@ -17,6 +18,11 @@ describe('actual system wrapper through IPC envelope decoder', () => {
     transport.mockResolvedValue({ success: true, data: snapshot });
     expect(await systemApi.coexReadonlySnapshot()).toEqual(snapshot);
     expect(transport).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
+  });
+  it.each(Object.entries(rustFixture.snapshots))('decodes the Rust-generated %s through the real wrapper and envelope', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(wire);
     expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
   });
   it('propagates denied-window envelope and permits a later explicit retry', async () => {

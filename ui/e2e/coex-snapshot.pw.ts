@@ -7,6 +7,7 @@ import zhCN from '../src/i18n/locales/zh-CN.json' with { type: 'json' };
 import zhTW from '../src/i18n/locales/zh-TW.json' with { type: 'json' };
 import ru from '../src/i18n/locales/ru.json' with { type: 'json' };
 import fa from '../src/i18n/locales/fa.json' with { type: 'json' };
+import rustFixture from '../src/contracts/coex-snapshot.rust.fixture.json' with { type: 'json' };
 
 const card = (page: Page) => page.locator('[data-coex-snapshot]');
 const calls = (page: Page) => page.evaluate(() => window.__coexHarness!.calls.filter((call) => call.command === 'coex_readonly_snapshot'));
@@ -172,3 +173,22 @@ test('all five loaded locales display the mounted card and Unknown without trans
   }
   expect(await calls(page)).toHaveLength(1);
 });
+
+
+for (const [name, wire] of Object.entries(rustFixture.snapshots)) {
+  test(`actual Rust serializer ${name} crosses mounted wrapper and renders numeric/null table facts`, async ({ page }) => {
+    await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click();
+    await page.evaluate((data) => window.__coexHarness!.reply({ success: true, data }), wire);
+    await card(page).locator('summary').filter({ hasText: 'wire-fixture0' }).click();
+    await expect(card(page).getByRole('alert')).toHaveCount(0);
+    await expect(card(page)).toContainText(`${en.settings.coex.table}: 254`);
+    await expect(card(page)).toContainText(`${en.settings.coex.lookupTable}: 100`);
+    if (name === 'optionShapes') {
+      await expect(card(page).getByText(en.settings.coex.noTableNumber, { exact: false })).toHaveCount(2);
+      await expect(card(page)).toContainText(`${en.settings.coex.table}: 4294967295`);
+      await expect(card(page)).toContainText(`${en.settings.coex.lookupTable}: 0`);
+      await expect(card(page)).toContainText('table source unreadable');
+    }
+    expect(await calls(page)).toHaveLength(1);
+  });
+}

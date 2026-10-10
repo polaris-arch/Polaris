@@ -28,6 +28,7 @@ export function renderCoexFacts(
       </>}
     </div>
   );
+  const table = (value: number | null) => value === null ? t('settings.coex.noTableNumber') : <span className="mono">{value}</span>;
   const boolean = (value: boolean) => value ? t('settings.coex.true') : t('settings.coex.false');
   const rows = <T,>(field: keyof Pages, label: string, value: Fact<T[]>, show: (row: T) => ReactNode) =>
     fact(label, value, (known) => {
@@ -72,13 +73,13 @@ export function renderCoexFacts(
           {rows('addresses', t('settings.coex.addresses'), object.addresses, (row) => <span className="mono">{row.address}/{row.prefixLen}</span>)}
           {rows('routes', t('settings.coex.routes'), object.routes, (row) => <>
             <span className="mono">{row.prefix}</span>
-            {fact(t('settings.coex.table'), row.table, (v) => <span className="mono">{v}</span>)}
+            {fact(t('settings.coex.table'), row.table, table)}
             {fact(t('settings.coex.scope'), row.scope, (v) => v === 'global' ? t('settings.coex.global') : t('settings.coex.interfaceScoped'))}
             {fact(t('settings.coex.role'), row.role, (v) => v === 'coverageDeclaration' ? t('settings.coex.coverageDeclaration') : t('settings.coex.resourceClaim'))}
           </>)}
           {rows('policyRules', t('settings.coex.rules'), object.policyRules, (row) => <>
             <div>{t('settings.coex.priority')}: {row.priority}</div>
-            {fact(t('settings.coex.lookupTable'), row.lookupTable, (v) => <span className="mono">{v}</span>)}
+            {fact(t('settings.coex.lookupTable'), row.lookupTable, table)}
             {fact(t('settings.coex.family'), row.addressFamily, (v) => <span className="mono">{v}</span>)}
             {fact(t('settings.coex.selector'), row.selectorScope, (v) => v.kind === 'global' ? t('settings.coex.global') : <>{t('settings.coex.limited')}: <span className="mono">{v.selector}</span></>)}
             {fact(t('settings.coex.association'), row.appliesToObject, boolean)}

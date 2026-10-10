@@ -471,6 +471,7 @@
   },
   "settings": {
     "coex": {
+      "noTableNumber": "No table-number concept on this platform",
       "title": "Network facts · read only",
       "hint": "Collects reported network facts on request. A snapshot does not establish VPN coverage, current egress, connectivity or coexistence safety.",
       "collect": "Collect snapshot",

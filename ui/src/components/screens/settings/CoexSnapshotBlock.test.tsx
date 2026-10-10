@@ -49,11 +49,19 @@ describe('COEX fact projection on the actual settings surface', () => {
     const html = render(v); expect(html).toContain('1–20 / 41'); expect(html).toContain('host-19'); expect(html).not.toContain('host-20');
     const collapsed = render(v, null); expect(collapsed).not.toContain('host-0'); expect(collapsed).toContain('&lt;fixture&gt;');
   });
+  it('renders known-null route and lookup tables explicitly, separately from Unknown', () => {
+    const v = fixture(); if (v.objects.status !== 'known') throw Error('fixture');
+    v.objects.value[0].routes = known([{ prefix: '10.77.0.0/16', table: known(null), scope: known('global'), role: unknown('role unresolved') }]);
+    v.objects.value[0].policyRules = known([{ priority: 10, lookupTable: known(null), addressFamily: known('ipv4'), selectorScope: unknown('selector unresolved'), appliesToObject: unknown('association unresolved') }]);
+    const html = render(v);
+    expect(html.split(en.settings.coex.noTableNumber)).toHaveLength(3);
+    expect(html).toContain('selector unresolved');
+  });
   it('displays raw table/family/selector and independent association without joining them', () => {
     const v = fixture(); if (v.objects.status !== 'known') throw Error('fixture');
-    v.objects.value[0].routes = known([{ prefix: '0.0.0.0/1', table: known('table-A'), scope: known('interfaceScoped'), role: unknown('role unresolved') }]);
-    v.objects.value[0].policyRules = known([{ priority: 10, lookupTable: known('table-B'), addressFamily: known('ipv6'), selectorScope: known({ kind: 'limited', selector: 'fwmark 0x8' }), appliesToObject: unknown('association unresolved') }]);
-    const html = render(v); for (const raw of ['table-A', 'table-B', 'ipv6', 'fwmark 0x8', 'role unresolved', 'association unresolved']) expect(html).toContain(raw);
+    v.objects.value[0].routes = known([{ prefix: '0.0.0.0/1', table: known(254), scope: known('interfaceScoped'), role: unknown('role unresolved') }]);
+    v.objects.value[0].policyRules = known([{ priority: 10, lookupTable: known(100), addressFamily: known('ipv6'), selectorScope: known({ kind: 'limited', selector: 'fwmark 0x8' }), appliesToObject: unknown('association unresolved') }]);
+    const html = render(v); for (const raw of ['254', '100', 'ipv6', 'fwmark 0x8', 'role unresolved', 'association unresolved']) expect(html).toContain(raw);
     expect(html).toContain(en.settings.coex.classification);
   });
 });
