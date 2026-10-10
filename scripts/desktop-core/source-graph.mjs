@@ -391,4 +391,15 @@ export function validateForkNotice(notice, manifest, source, mobile) {
       `固定源码：https://github.com/SagerNet/sing-box/tree/${identity.sourceCommit}`,
       `source manifest SHA-256：${identity.manifestSha256}`]) exact(lines, line);
   }
+  const heading = '════ 对应源码 / Corresponding Source ════';
+  requireGraph(notice.split(heading).length === 2, 'NOTICE: unique corresponding-source guidance required');
+  const guidance = notice.split(heading)[1];
+  requireGraph(!/Windows\s*另加|固定\s*Windows\s*附加补丁目录|Windows\s+additionally\s+uses|fixed\s+Windows\s+overlay\s+directory/i.test(guidance),
+    'NOTICE: retired Windows overlay claim conflicts with fixed fork source');
+  const patchBase = 'https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts';
+  const lines = guidance.split(/\r?\n/).map((line) => line.trim());
+  for (const line of [`桌面 D 完整对应源码：${source.sourceURL}/tree/${source.sourceCommit}`,
+    `桌面 D 源码资产：${source.sourceURL}/releases/tag/${source.sourceTag}`,
+    `Android 旧补丁目录：${patchBase}/libbox-patches`,
+    `Apple 旧补丁目录：${patchBase}/libbox-ios-patches`]) exact(lines, line);
 }

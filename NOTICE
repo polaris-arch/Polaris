@@ -105,25 +105,36 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-sing-box 的上游基线在上述 tag / 固定 commit 链接处获取；修复构建的完整对应源码还包括
-上述固定共享补丁目录中的 source-manifest.json、各依赖的固定上游源码及补丁，Windows 另加
-固定 Windows 附加补丁目录中的补丁。按 manifest 中的 SHA-256 核对输入，并按随附构建说明重放。
-GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，本段即该指引。Polaris **不自建上游归档
-或镜像**；上游源码在其各自仓库，Polaris 补丁与构建脚本在本项目仓库。若链接失效，请在本项目 issue 中提出。
+桌面 D 完整对应源码：https://github.com/polaris-arch/polaris-box/tree/052297f735b80bdae5b2536ef2a07d04979a0511
+桌面 D 源码资产：https://github.com/polaris-arch/polaris-box/releases/tag/polaris-v1.15.0-alpha.11-1
+桌面修复已包含在固定 fork 源码中；App 不重放共享补丁，也不另加 Windows overlay。
+桌面构建输入以 scripts/desktop-core/source-manifest.json 固定；外部依赖按该源码的
+go.mod / go.sum 获取，并核对 manifest 中的 SHA-256 和随附构建说明。
+
+Android 旧补丁目录：https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts/libbox-patches
+Android 继续使用旧上游基线与该目录的 source-manifest.json、固定补丁及构建说明。
+Apple 旧补丁目录：https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts/libbox-ios-patches
+Apple 继续使用独立旧源码 manifest、固定补丁及 Apple 构建说明。
+移动端各自的固定 source commit 与 manifest 摘要见上方对应组件段落。
+
+GPLv3 §6 的对应源码指引按上述组件分别给出。桌面 fork 的完整源码及源码归档已在
+上述固定 commit 和 Release 发布；移动端旧补丁与构建脚本在本项目的固定目录。
+若链接失效，请在本项目 issue 中提出。
 
 **对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
 https://github.com/polaris-arch/Polaris
 
-The upstream baseline is available at the tag and fixed commit linked above.
-The complete Corresponding Source for the patched build also includes the
-source-manifest.json and the patches it lists in the fixed shared patch
-directory (no dependency module is patched); Windows additionally uses the fixed Windows overlay directory.
-Verify the inputs against the manifest's SHA-256 values and follow the included
-build instructions. GPLv3 §6 requires clear directions next to the object code,
-and this paragraph provides those directions. Polaris keeps no upstream archive
-or mirror; upstream sources remain in their respective repositories, and Polaris
-patches and build scripts are in this project's repository. If a link stops
-working, please open an issue on this project.
+The complete desktop D source is the fixed fork commit linked above, and its
+source archives are available at the fixed desktop Release. Desktop fixes are
+already included in that source; the App replays no shared patches or additional
+Windows overlay. Use scripts/desktop-core/source-manifest.json and the fork's
+fixed go.mod / go.sum to obtain and verify the build inputs.
+Android keeps its old baseline and the source-manifest.json, patches and build
+instructions in the fixed Android patch directory. Apple keeps its independent
+old manifest, patches and build instructions in the fixed Apple patch directory.
+The component sections above identify each mobile source commit and manifest
+hash. These component-specific locations provide the Corresponding Source
+instructions under GPLv3 §6. If a link stops working, please open a project issue.
 
 For the Android artifact, the Corresponding Source under GPLv3 §6 also
 includes Polaris's own complete source, published at the repository above.

@@ -365,7 +365,13 @@ test('fork NOTICE binds desktop, Android and Apple corresponding sources inside 
         `source manifest SHA-256：${identity.manifestSha256}`].map((line) => `    ${line}\n`).join('');
     const android = section('Android libbox 基线', mobile.android);
     const apple = section('Apple libbox 基线', mobile.apple);
-    const notice = desktop + android + apple;
+    const patchBase = 'https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts';
+    const guidance = `════ 对应源码 / Corresponding Source ════\n`
+      + `桌面 D 完整对应源码：${f.source.sourceURL}/tree/${f.source.sourceCommit}\n`
+      + `桌面 D 源码资产：${f.source.sourceURL}/releases/tag/${f.source.sourceTag}\n`
+      + `Android 旧补丁目录：${patchBase}/libbox-patches\n`
+      + `Apple 旧补丁目录：${patchBase}/libbox-ios-patches\n`;
+    const notice = desktop + android + apple + guidance;
     validateForkNotice(notice, f.manifest, f.source, mobile);
     const fixed = `    固定源码：${f.source.sourceURL}/tree/${f.source.sourceCommit}\n`;
     const invalid = [desktop.replace(fixed, '') + android + fixed + apple,
@@ -375,5 +381,13 @@ test('fork NOTICE binds desktop, Android and Apple corresponding sources inside 
       notice.replace(spec.sourceManifestSha256, mobile.android.manifestSha256),
       desktop + `    固定源码：https://github.com/SagerNet/sing-box/tree/${mobile.android.sourceCommit}\n` + android + apple];
     for (const text of invalid) assert.throws(() => validateForkNotice(text, f.manifest, f.source, mobile), /NOTICE/);
+    for (const oldClaim of ['Windows 另加固定 Windows 附加补丁目录中的补丁。',
+      'Windows additionally uses the fixed Windows overlay directory.',
+      'Verify patches in the fixed Windows overlay directory.']) {
+      assert.throws(() => validateForkNotice(notice + oldClaim, f.manifest, f.source, mobile), /retired Windows overlay/);
+    }
+    for (const bad of [notice.replace(`${patchBase}/libbox-ios-patches`, `${patchBase}/libbox-patches`),
+      notice.replace(`桌面 D 完整对应源码：${f.source.sourceURL}/tree/${f.source.sourceCommit}`, `桌面 D 完整对应源码：${patchBase}/libbox-patches`),
+      desktop + android + apple]) assert.throws(() => validateForkNotice(bad, f.manifest, f.source, mobile), /NOTICE/);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
