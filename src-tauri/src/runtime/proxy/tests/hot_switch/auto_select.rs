@@ -2832,3 +2832,104 @@ async fn s5_epoch_each_runtime_consumer_uses_confirmed_desktop_network_change() 
         assert!(!runtime_barred(&rt, "node-c"), "entry={entry}");
     }
 }
+
+fn s5_native_runtime_reading(
+    query: u64,
+    source: &str,
+    seq: u64,
+    known: bool,
+) -> crate::runtime::auto_select::NativeNetworkObservation {
+    crate::runtime::auto_select::NativeNetworkObservation {
+        query,
+        source: source.to_owned(),
+        seq,
+        current_known: known,
+        coverage_gap: !known,
+    }
+}
+
+#[tokio::test]
+async fn s5_android_all_three_runtime_consumers_consume_unknown_growth_once_and_accept_legal_new_source(
+) {
+    for entry in 0..3 {
+        let (rt, _dir) = test_runtime_on(Platform::Android);
+        let cfg = running(&rt, &auto_config("node-a", Some("sub")));
+        let ledger = MeasurementLedger::new();
+        refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+        let network_before = rt.network_epoch();
+        let mut reads = readings(&ledger);
+        reads.signals.native_network = Some(s5_native_runtime_reading(1, "z-source", 10, true));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        reads.signals.native_network = None;
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(runtime_barred(&rt, "node-c"));
+        reads.signals.native_network = Some(s5_native_runtime_reading(2, "z-source", 10, false));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(runtime_barred(&rt, "node-c"), "gap alone entry {entry}");
+        reads.signals.native_network = Some(s5_native_runtime_reading(3, "z-source", 12, false));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(
+            !runtime_barred(&rt, "node-c"),
+            "ABA history while Unknown entry {entry}"
+        );
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        for next in [
+            s5_native_runtime_reading(3, "z-source", 12, false),
+            s5_native_runtime_reading(2, "foreign", 999, true),
+            s5_native_runtime_reading(4, "z-source", 11, true),
+            s5_native_runtime_reading(5, "a-source", 0, true),
+            s5_native_runtime_reading(6, "z-source", 999, true),
+        ] {
+            reads.signals.native_network = Some(next);
+            consume_bar_context(&rt, &cfg, &reads, entry).await;
+            assert!(
+                runtime_barred(&rt, "node-c"),
+                "duplicate/old/source-baseline/retired entry {entry}"
+            );
+        }
+        reads.signals.native_network = Some(s5_native_runtime_reading(7, "a-source", 1, true));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(
+            !runtime_barred(&rt, "node-c"),
+            "new source growth entry {entry}"
+        );
+        assert_eq!(ledger.foreground_epoch(), 0);
+        assert_eq!(rt.network_epoch(), network_before);
+    }
+}
+
+#[tokio::test]
+async fn s5_android_runtime_native_growth_does_not_relax_foreground_receipt_freshness() {
+    let (rt, _dir) = test_runtime_on(Platform::Android);
+    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
+    let ledger = MeasurementLedger::new();
+    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+    let mut reads = readings(&ledger);
+    reads.signals.native_network = Some(s5_native_runtime_reading(1, "source", 0, true));
+    assert!(assess(&rt, &reads, None).await.is_some());
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    ledger.set_foreground_epoch(1);
+    reads.signals.native_network = Some(s5_native_runtime_reading(2, "source", 1, true));
+    assert!(assess(&rt, &reads, None).await.is_none());
+    assert_eq!(
+        last_decision(&rt),
+        Decision::NotEvaluated(Gate::WaitingFirstRound)
+    );
+    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
+    assert!(!runtime_barred(&rt, "node-c"));
+}
+
+#[tokio::test]
+async fn s5_android_runtime_other_platforms_ignore_native_network_bar_signals() {
+    for entry in 0..3 {
+        let (rt, _dir, cfg, ledger) = refresh_fixture();
+        let mut reads = readings(&ledger);
+        reads.signals.native_network = Some(s5_native_runtime_reading(1, "source", 0, true));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+        reads.signals.native_network = Some(s5_native_runtime_reading(2, "source", 1, true));
+        consume_bar_context(&rt, &cfg, &reads, entry).await;
+        assert!(runtime_barred(&rt, "node-c"));
+    }
+}

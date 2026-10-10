@@ -2293,3 +2293,80 @@ fn s5_epoch_resume_and_freeze_preserve_cost_sequence_and_existing_foreground_fre
         }
     }
 }
+
+fn s5_native_scheduler_reading(query: u64, source: &str, seq: u64, known: bool) -> DeviceReadings {
+    DeviceReadings {
+        conditions: DeviceConditions {
+            metered: Metered::No,
+            power_save: false,
+        },
+        native_network: Some(auto_select::NativeNetworkObservation {
+            query,
+            source: source.to_owned(),
+            seq,
+            current_known: known,
+            coverage_gap: !known,
+        }),
+    }
+}
+
+#[test]
+fn s5_android_scheduler_native_publication_retains_watermark_and_retires_sources_without_s1_changes(
+) {
+    let mut planner = Planner::new(Platform::Android, at(0));
+    planner.platform_enabled = true;
+    let plan = plan(&[("s1", 30, &["a"])]);
+    let ledger = MeasurementLedger::new();
+    for (query, source, seq, known, expected_source, expected_seq) in [
+        (1, "z-source", 10, true, "z-source", 10),
+        (2, "z-source", 12, false, "z-source", 12),
+        (3, "z-source", 11, true, "z-source", 12),
+        (2, "new-too-old", 100, true, "z-source", 12),
+        (4, "a-source", 0, true, "a-source", 0),
+        (5, "z-source", 999, true, "a-source", 0),
+        (6, "a-source", 1, true, "a-source", 1),
+    ] {
+        let readings = s5_native_scheduler_reading(query, source, seq, known);
+        consume_device_readings(&mut planner, &readings);
+        planner.tick_and_sync_ledger(&TickInput {
+            ledger: &ledger,
+            conditions: Some(readings.conditions),
+            ..input(at(query * 100), Some(query), &plan)
+        });
+        let published = planner.signals().native_network.unwrap();
+        assert_eq!(
+            (published.source.as_str(), published.seq),
+            (expected_source, expected_seq)
+        );
+        assert_eq!(planner.foreground_epoch(), 0);
+        assert_eq!(ledger.foreground_epoch(), 0);
+        assert_eq!(planner.signals().metered_change_epoch, 0);
+        assert_eq!(planner.network_epoch, None);
+    }
+    let retained = planner.signals().native_network;
+    consume_device_readings(&mut planner, &DeviceConditions::UNAVAILABLE.into());
+    planner.tick(&input(at(700), None, &plan));
+    assert_eq!(
+        planner.signals().native_network,
+        retained,
+        "Unknown/core stop cannot discard confirmed growth or rebaseline"
+    );
+}
+
+#[test]
+fn s5_android_scheduler_native_readings_are_bar_only_and_other_platforms_ignore_them() {
+    for platform in [
+        Platform::Linux,
+        Platform::Win,
+        Platform::Mac,
+        Platform::Ios,
+        Platform::Other,
+    ] {
+        let mut planner = Planner::new(platform, at(0));
+        consume_device_readings(
+            &mut planner,
+            &s5_native_scheduler_reading(1, "source", 9, true),
+        );
+        assert!(planner.signals().native_network.is_none(), "{platform:?}");
+    }
+}

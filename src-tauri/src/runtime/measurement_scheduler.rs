@@ -546,6 +546,7 @@ pub(crate) struct Planner {
     last_known_metered: Option<bool>,
     /// 已观测的已知计费翻转序号：只供故障排除消费，不改变择优有效范围。
     metered_change_epoch: u64,
+    native_network: auto_select::NativeNetworkHistory,
     round: Option<ActiveRound>,
     /// 上一轮被时间预算截断时没测到的节点：下一轮排在最前。
     carry_over: Vec<String>,
@@ -574,6 +575,8 @@ pub(crate) struct Signals {
     pub(crate) round_serial: u64,
     /// 进程内单调的已知计费翻转序号，不随核世代或前台变化清零。
     pub(crate) metered_change_epoch: u64,
+    /// Last admitted history, retained while querying is unavailable; flags describe that snapshot, not live connectivity.
+    pub(crate) native_network: Option<auto_select::NativeNetworkObservation>,
     /// 逐订阅：最近一次收尾的一轮的序号，与最近一次到期未执行的原因。
     pub(crate) subscriptions: BTreeMap<String, (Option<u64>, Option<&'static str>)>,
 }
@@ -585,6 +588,7 @@ impl Signals {
             verdict: Verdict::Idle(Idle::CoreNotRunning),
             round_serial: 0,
             metered_change_epoch: 0,
+            native_network: None,
             subscriptions: BTreeMap::new(),
         }
     }
@@ -647,6 +651,7 @@ impl Planner {
             conditions_at: None,
             last_known_metered: None,
             metered_change_epoch: 0,
+            native_network: auto_select::NativeNetworkHistory::default(),
             round: None,
             carry_over: Vec::new(),
             backoff_skips: BTreeMap::new(),
@@ -655,6 +660,12 @@ impl Planner {
             policy: MeteredPolicy::parse(None),
             last_width: None,
             round_serial: 0,
+        }
+    }
+
+    fn observe_native_network(&mut self, observation: &auto_select::NativeNetworkObservation) {
+        if self.platform == Platform::Android {
+            self.native_network.observe(observation);
         }
     }
 
@@ -677,6 +688,7 @@ impl Planner {
             verdict: self.verdict,
             round_serial: self.round_serial,
             metered_change_epoch: self.metered_change_epoch,
+            native_network: self.native_network.current(),
             subscriptions: self
                 .subs
                 .iter()
@@ -1422,44 +1434,72 @@ async fn native_metered() -> Metered {
     }
 }
 
+struct DeviceReadings {
+    conditions: DeviceConditions,
+    native_network: Option<auto_select::NativeNetworkObservation>,
+}
+
+impl From<DeviceConditions> for DeviceReadings {
+    fn from(conditions: DeviceConditions) -> Self {
+        Self {
+            conditions,
+            native_network: None,
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
-async fn android_conditions() -> DeviceConditions {
+async fn android_conditions() -> DeviceReadings {
     match crate::runtime::proxy::android_bridge::device_conditions().await {
-        Ok(conditions) => DeviceConditions {
-            metered: if conditions.metered {
-                Metered::Yes
-            } else {
-                Metered::No
+        Ok(conditions) => DeviceReadings {
+            conditions: DeviceConditions {
+                metered: if conditions.metered {
+                    Metered::Yes
+                } else {
+                    Metered::No
+                },
+                power_save: conditions.power_save,
             },
-            power_save: conditions.power_save,
+            native_network: conditions.network,
         },
         Err(error) => {
             log::debug!("周期测速：设备状况不可得：{error}");
-            DeviceConditions::UNAVAILABLE
+            DeviceConditions::UNAVAILABLE.into()
         }
     }
 }
 
 #[cfg(not(target_os = "android"))]
-async fn android_conditions() -> DeviceConditions {
-    DeviceConditions::UNAVAILABLE
+async fn android_conditions() -> DeviceReadings {
+    DeviceConditions::UNAVAILABLE.into()
 }
 
 /// 拉一次设备状况。拿不到的平台如实报「不可得」，不当作非计费。
-async fn device_conditions(platform: Platform) -> DeviceConditions {
+async fn device_conditions(platform: Platform) -> DeviceReadings {
     match platform {
         Platform::Android => android_conditions().await,
         Platform::Linux => DeviceConditions {
             metered: linux_metered().await,
             power_save: false,
-        },
+        }
+        .into(),
         Platform::Win | Platform::Mac => DeviceConditions {
             metered: native_metered().await,
             power_save: false,
-        },
-        // 原生侧的查询尚未就位（本平台的计划也还没有启用）。
-        Platform::Ios => DeviceConditions::UNAVAILABLE,
-        Platform::Other => DeviceConditions::UNAVAILABLE,
+        }
+        .into(),
+        Platform::Ios | Platform::Other => DeviceConditions::UNAVAILABLE.into(),
+    }
+}
+
+fn consume_device_readings(planner: &mut Planner, readings: &DeviceReadings) {
+    if let Some(network) = readings.native_network.as_ref() {
+        #[cfg(target_os = "android")]
+        crate::runtime::proxy::android_bridge::publish_device_network(network, |network| {
+            planner.observe_native_network(network)
+        });
+        #[cfg(not(target_os = "android"))]
+        planner.observe_native_network(network);
     }
 }
 
@@ -1611,13 +1651,16 @@ impl MeasurementScheduler {
             let (output, targets) = {
                 let mut shared = self.lock();
                 let Shared { planner, plan, .. } = &mut *shared;
+                if let Some(readings) = conditions.as_ref() {
+                    consume_device_readings(planner, readings);
+                }
                 let output = planner.tick_and_sync_ledger(&TickInput {
                     now: self.now(),
                     user_enabled: user_enabled(&config),
                     generation,
                     plan,
                     network_epoch,
-                    conditions,
+                    conditions: conditions.as_ref().map(|readings| readings.conditions),
                     policy: MeteredPolicy::parse(
                         config.get("speedTestMeteredPolicy").and_then(Value::as_str),
                     ),

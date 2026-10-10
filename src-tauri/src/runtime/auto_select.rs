@@ -32,7 +32,7 @@
 //! 本模块不做 I/O：时刻、账本读数与运行态全部由调用方注入；[`decide`] 的全部跨次状态在
 //! [`Memory`] 里。两条腿共用一个冷却时刻与一个在飞标志（都在故障腿的决策机上），不会同时换点。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use polaris_helper_proto::Platform;
 use serde::Serialize;
@@ -512,11 +512,59 @@ pub(crate) struct Epoch {
     pub(crate) foreground_epoch: Option<u64>,
 }
 
+/// A query-confirmed native history pair; never part of S1's selection/freshness epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeNetworkObservation {
+    pub(crate) query: u64,
+    pub(crate) source: String,
+    pub(crate) seq: u64,
+    pub(crate) current_known: bool,
+    pub(crate) coverage_gap: bool,
+}
+
+/// Source changes need newer admitted queries, never UUID ordering. Retired sources cannot return.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NativeNetworkHistory {
+    current: Option<NativeNetworkObservation>,
+    query: u64,
+    retired: BTreeSet<String>,
+}
+
+impl NativeNetworkHistory {
+    /// Return whether this confirms growth within the same source. A new source only establishes a baseline.
+    pub(crate) fn observe(&mut self, next: &NativeNetworkObservation) -> bool {
+        if next.query <= self.query || self.retired.contains(&next.source) {
+            return false;
+        }
+        self.query = next.query;
+        let changed = if let Some(previous) = self.current.as_ref() {
+            if previous.source != next.source {
+                self.retired.insert(previous.source.clone());
+                false
+            } else if next.seq < previous.seq {
+                return false;
+            } else {
+                next.seq > previous.seq
+            }
+        } else {
+            false
+        };
+        // Even an Unknown current network may carry already confirmed, unconsumed history.
+        self.current = Some(next.clone());
+        changed
+    }
+
+    pub(crate) fn current(&self) -> Option<NativeNetworkObservation> {
+        self.current.clone()
+    }
+}
+
 /// 故障排除的观测锚点，与择优的四字段有效范围分开。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BarContext {
     known_network_epoch: Option<u64>,
     metered_change_epoch: Option<u64>,
+    native_network: NativeNetworkHistory,
 }
 
 /// [`decide`] 的跨次状态。
@@ -592,6 +640,20 @@ impl Memory {
             }
             None => self.bar_context.metered_change_epoch = Some(metered_change_epoch),
             Some(_) => {}
+        }
+    }
+
+    /// All three runtime consumers align native history after the unchanged S1/desktop/cost scope.
+    pub(crate) fn observe_native_context(
+        &mut self,
+        epoch: &Epoch,
+        round_serial: u64,
+        metered_change_epoch: u64,
+        observation: Option<&NativeNetworkObservation>,
+    ) {
+        self.observe_context(epoch, round_serial, metered_change_epoch);
+        if observation.is_some_and(|next| self.bar_context.native_network.observe(next)) {
+            self.barred.clear();
         }
     }
 

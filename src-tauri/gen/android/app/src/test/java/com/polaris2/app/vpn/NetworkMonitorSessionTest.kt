@@ -193,6 +193,52 @@ class NetworkMonitorSessionTest {
         assertEquals(0, b.snapshot().delivering)
     }
 
+    @Test fun s5ObservationCountsBeforeBusyJniAndFencesLateCapabilitiesAcrossStopStart() {
+        val h = Harness(); val a = h.session()
+        h.events[0].available("a"); h.events[0].capabilitiesChanged("a", true)
+        val source = h.owner.networkObservation().sourceEpoch
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        h.delivery = { _, update -> if (update.name == "b") { entered.countDown(); await(release) } }
+        val worker = thread { h.events[0].available("b") }; await(entered)
+        try {
+            h.events[0].capabilitiesChanged("b", true)
+            h.events[0].available("a"); h.events[0].capabilitiesChanged("a", true)
+            assertEquals("2", h.owner.networkObservation().seq)
+            a.beginClose(); a.stop()
+            assertFalse(h.owner.networkObservation().currentKnown)
+            h.delivery = { _, _ -> } // Only the captured old JNI call waits on this latch.
+            val b = h.session("2")
+            h.events[1].available("b"); h.events[1].capabilitiesChanged("b", true)
+            h.events[0].available("old"); h.events[0].capabilitiesChanged("old", true)
+            a.stop()
+            assertEquals("b", b.defaultNetwork)
+            assertEquals("3", h.owner.networkObservation().seq)
+            assertEquals(source, h.owner.networkObservation().sourceEpoch)
+        } finally { release.countDown(); finish(worker) }
+    }
+
+    @Test fun s5UnfilteredBootstrapAndFailedRegistrationNeverSupplyKnownNetworkProof() {
+        val h = Harness(); h.initial = { "unfiltered-vpn" }; val a = h.session()
+        h.events[0].capabilitiesChanged("unfiltered-vpn", true)
+        assertFalse(h.owner.networkObservation().currentKnown)
+        a.stop()
+        h.registration = {
+            h.events.last().available("a"); h.events.last().capabilitiesChanged("a", true)
+            throw IllegalStateException("partial register")
+        }
+        try { h.owner.createSession().start(); fail("registration should fail") } catch (_: IllegalStateException) {}
+        assertFalse(h.owner.networkObservation().currentKnown)
+        val source = h.owner.networkObservation().sourceEpoch
+        h.registration = {}; val next = h.session("2")
+        h.events.last().available("a"); h.events.last().capabilitiesChanged("a", true)
+        h.events[1].available("late"); h.events[1].capabilitiesChanged("late", true)
+        next.start() // duplicate registration does not reset producer
+        assertEquals("0", h.owner.networkObservation().seq)
+        assertEquals(source, h.owner.networkObservation().sourceEpoch)
+        assertTrue(h.owner.networkObservation().currentKnown)
+        assertEquals(3, h.registered)
+    }
+
     @Test fun actualAttemptRevocationFencesMonitorWhileOperationLockAndJniAreBusy() {
         val entered = CountDownLatch(1); val release = CountDownLatch(1)
         val coordinator = NetworkMonitorCoordinator<android.net.Network, io.nekohasekai.libbox.InterfaceUpdateListener>(

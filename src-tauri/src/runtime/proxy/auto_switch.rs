@@ -1381,7 +1381,7 @@ impl ProxyRuntime {
         let signals = &readings.signals;
         let first_round_done = {
             let mut slot = self.auto_select_slot();
-            slot.memory.observe_context(
+            slot.memory.observe_native_context(
                 &Epoch {
                     subscription: auto.subscription.clone(),
                     generation,
@@ -1391,6 +1391,10 @@ impl ProxyRuntime {
                 },
                 signals.round_serial,
                 signals.metered_change_epoch,
+                signals
+                    .native_network
+                    .as_ref()
+                    .filter(|_| platform == Platform::Android),
             );
             slot.memory.latch_first_round(
                 read.covers_all_testable(),
@@ -1516,7 +1520,7 @@ impl ProxyRuntime {
         let read = auto.read(&auto.members, readings);
         let ranked = auto_select::rank(&read.selectable);
         let mut slot = self.auto_select_slot();
-        slot.memory.observe_context(
+        slot.memory.observe_native_context(
             &Epoch {
                 subscription: auto.subscription.clone(),
                 generation,
@@ -1526,6 +1530,11 @@ impl ProxyRuntime {
             },
             readings.signals.round_serial,
             readings.signals.metered_change_epoch,
+            readings
+                .signals
+                .native_network
+                .as_ref()
+                .filter(|_| platform == Platform::Android),
         );
         ranked
             .iter()
@@ -1550,7 +1559,7 @@ impl ProxyRuntime {
         };
         let network_epoch = self.network_epoch();
         let mut slot = self.auto_select_slot();
-        slot.memory.observe_context(
+        slot.memory.observe_native_context(
             &Epoch {
                 subscription: subscription.to_string(),
                 generation,
@@ -1560,6 +1569,11 @@ impl ProxyRuntime {
             },
             readings.signals.round_serial,
             readings.signals.metered_change_epoch,
+            readings
+                .signals
+                .native_network
+                .as_ref()
+                .filter(|_| platform == Platform::Android),
         );
         slot.memory
             .barred(readings.now)

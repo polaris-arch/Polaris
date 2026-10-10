@@ -46,7 +46,9 @@ object DefaultNetworkMonitor {
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) = events.available(network)
                 override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
-                    events.capabilitiesChanged(network)
+                    events.capabilitiesChanged(network,
+                        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                            !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
                 override fun onLost(network: Network) = events.lost(network)
             }
             object : NetworkMonitorRegistration {
@@ -66,6 +68,7 @@ object DefaultNetworkMonitor {
     )
 
     val defaultNetwork: Network? get() = coordinator.defaultNetwork
+    internal fun networkObservation() = coordinator.networkObservation()
     internal fun createSession(): NetworkMonitorSession<Network, InterfaceUpdateListener> = coordinator.createSession()
 
     private fun lookup(network: Network): NetworkMonitorUpdate? {
@@ -96,6 +99,7 @@ object DefaultNetworkMonitor {
     @SuppressLint("MissingPermission") // CHANGE_NETWORK_STATE 已在 Manifest 声明，lint 认不出跨方法的分支
     private fun register(callback: ConnectivityManager.NetworkCallback) {
         val request = NetworkRequest.Builder().apply {
+            addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
         }.build()

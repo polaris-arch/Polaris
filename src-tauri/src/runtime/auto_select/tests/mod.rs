@@ -2366,3 +2366,96 @@ fn s5_epoch_subscription_leave_and_rearm_reset_bar_observation_baselines() {
         "first consumption is not a historical change"
     );
 }
+
+fn s5_native_reading(query: u64, source: &str, seq: u64) -> NativeNetworkObservation {
+    NativeNetworkObservation {
+        query,
+        source: source.to_owned(),
+        seq,
+        current_known: true,
+        coverage_gap: false,
+    }
+}
+
+#[test]
+fn s5_android_memory_source_swap_gap_growth_and_duplicates_preserve_original_s1_scope() {
+    let epoch = bar_epoch(None, Some(1));
+    let intent = auto();
+    let mut memory = Memory::default();
+    let baseline = s5_native_reading(1, "z-source", 9);
+    memory.observe_native_context(&epoch, 0, 0, Some(&baseline));
+    round(
+        &intent,
+        &mut memory,
+        &[candidate("ch", 100, 1, T0 - 5 * MINUTE)],
+        T0 - 5 * MINUTE,
+    );
+    let streak = memory.streak().cloned();
+    assert!(memory.latch_first_round(true, None));
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_native_context(&epoch, 1, 0, None);
+    let mut gap = s5_native_reading(2, "z-source", 9);
+    gap.current_known = false;
+    gap.coverage_gap = true;
+    memory.observe_native_context(&epoch, 1, 0, Some(&gap));
+    assert!(memory.is_barred("flaky", T0));
+    gap.query = 3;
+    gap.seq = 11; // Confirmed ABA history remains consumable even currently Unknown.
+    memory.observe_native_context(&epoch, 1, 0, Some(&gap));
+    assert!(!memory.is_barred("flaky", T0));
+    assert_eq!(memory.streak().cloned(), streak);
+    assert!(memory.latch_first_round(false, None));
+    memory.bar("new", T0, 30 * MINUTE);
+    for next in [
+        gap.clone(),
+        s5_native_reading(2, "z-source", 100),
+        s5_native_reading(4, "z-source", 10),
+    ] {
+        memory.observe_native_context(&epoch, 1, 0, Some(&next));
+        assert!(memory.is_barred("new", T0));
+    }
+    memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(5, "a-source", 0)));
+    assert!(
+        memory.is_barred("new", T0),
+        "legal new source preserves bar and establishes baseline"
+    );
+    memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(6, "z-source", 999)));
+    assert!(memory.is_barred("new", T0), "retired source cannot return");
+    memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(7, "a-source", 1)));
+    assert!(!memory.is_barred("new", T0));
+    assert_eq!(memory.streak().cloned(), streak);
+    assert!(memory.latch_first_round(false, None));
+}
+
+#[test]
+fn s5_android_memory_scope_reset_only_rebaselines_bar_history() {
+    for leave in [false, true] {
+        let mut memory = Memory::default();
+        let mut epoch = bar_epoch(None, Some(1));
+        memory.observe_native_context(&epoch, 0, 0, Some(&s5_native_reading(1, "source", 20)));
+        memory.bar("old", T0, 30 * MINUTE);
+        if leave {
+            memory.leave();
+        } else {
+            epoch.subscription = "other".to_owned();
+        }
+        memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(2, "source", 21)));
+        memory.bar("new", T0, 30 * MINUTE);
+        memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(2, "source", 21)));
+        assert!(memory.is_barred("new", T0));
+        memory.observe_native_context(&epoch, 1, 0, Some(&s5_native_reading(3, "source", 22)));
+        assert!(!memory.is_barred("new", T0));
+    }
+    let mut memory = Memory::default();
+    memory.bar("existing", T0, 30 * MINUTE);
+    memory.observe_native_context(
+        &bar_epoch(None, None),
+        0,
+        0,
+        Some(&s5_native_reading(1, "source", 100)),
+    );
+    assert!(
+        memory.is_barred("existing", T0),
+        "first historical seq is baseline only"
+    );
+}

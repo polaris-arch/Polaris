@@ -160,6 +160,24 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
     (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "if self.platform == Platform::Android",
+        1,
+        "Android S5 的原生 source/seq 历史只在 Android Planner 准入。其他平台不取得 Java network 观测；不改变 S1/计费/前台条件。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/auto_switch.rs",
+        ", readings.signals.round_serial, readings.signals.metered_change_epoch, readings .signals .native_network .as_ref() .filter(|_| platform == Platform::Android), )",
+        2,
+        "刷新回退与故障腿 bar 投影两入口只在 Android 消费已准入的原生历史；其他平台保持既有网络/计费合同。非零新 seq 清一次，Unknown/gap/旧请求/新 source 基线不能借此改 S1 有效范围。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/auto_switch.rs",
+        ", signals.round_serial, signals.metered_change_epoch, signals .native_network .as_ref() .filter(|_| platform == Platform::Android), )",
+        1,
+        "择优 facts 的同一 Memory 对齐仅在 Android 读原生 source/seq 历史。其他平台不清除 Android bar，原四字段 epoch 与测量新鲜度门保持；真实三入口 host 注入回归不等于原生设备验证。",
+    ),
+    (
         "crates/config-engine/src/builder/coexistence.rs",
         "let entry = if input.platform == Platform::Linux && !input.criteria.tun_addresses.is_empty()",
         1,
@@ -2863,9 +2881,37 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "target_os = \"android\"",
         2,
         IosSide::DiffersRight,
-        "周期测速的设备状况查询（应答结构 + `deviceConditions` 命令腿）：活动网络是否计费、是否省电，\
+        "周期测速的设备状况查询（请求结构 + `deviceConditions` 命令腿）：活动网络是否计费、是否省电，\
          走 Android 的 `ConnectivityManager` / `PowerManager`。iOS 不编译它是对的：对应物是 App 侧\
          插件里的路径属性与低电量模式查询，要的是另一条桥，而且 iOS 的周期计划在那条桥就位前整体关闭。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        2,
+        IosSide::DiffersRight,
+        "Android S5 原生网络历史的全局查询序号门与原子发布入口：只在真实 Android JNI 查询完成后准入，iOS 不查询 Java 插件。仅 bar 历史，不迁移 S1/计费策略或声称 iOS 支持完成。",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "any(target_os = \"android\", test)",
+        7,
+        IosSide::DiffersRight,
+        "S5 可选 wire/归一读数、精确整数与 source decoder、查询门表示/实现和实际查询编排七处供 Android 生产与 host fake-native 负例共用。test=false iOS 不编译这些 Java 桥合同；host 验证不签 Gradle/AAR、实际 JNI 或设备。原两处纯 Android 应答/命令登记改对应请求/命令，总数不变。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "S5 原生网络历史只经 Android 最新查询门发布到保留的 source/seq 水位。iOS 没有 Android 读数，不经过此 JNI 准入分支；原前台/计费和 S1 新鲜度保持。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "not(target_os = \"android\")",
+        1,
+        IosSide::DiffersRight,
+        "非 Android 的可选原生读数消费只供 host 注入测试；生产查询总不给该字段，Planner 又仅接受 Platform::Android。iOS 保持自己的原 Unavailable 腿，不以 host pure negatives 签移动观测能力。",
     ),
     (
         "src-tauri/src/runtime/measurement_scheduler.rs",
@@ -3701,9 +3747,13 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 目录腿与 `lib.rs` 的播种 / 调度器装配共 6 处 WrongToday 随被守代码一起消失（债不是被改判，
 /// 是对象没了）；`lib.rs` 新增 2 处 `desktop`、`updater.rs` 新增 1 处「Android 或 iOS」（均 WithAndroid）。
 /// 债的具名清单随之 36 行 / 174 处 → 32 行 / 168 处。
+/// 2026-10-10（Android S5 network history）：实际新增 11 个正确分派点：bridge
+/// android +2 / any(android,test) +7，scheduler android +1 / not(android) +1。
+/// DiffersRight 265→276；只新增 Android 专属查询/精确 decoder 与 host 注入分支，
+/// 既有 iOS 债条目/判决、floor 与求值器均保留，未取得 iOS/native Gradle/设备证明。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
-    ("DiffersRight", 265),
+    ("DiffersRight", 276),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 142),
     ("WithAndroid", 89),

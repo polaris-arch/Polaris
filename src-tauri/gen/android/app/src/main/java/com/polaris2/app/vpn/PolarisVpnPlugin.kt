@@ -44,6 +44,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 @InvokeArg
+class DeviceConditionsArgs {
+    var queryId: String? = null
+}
+
+@InvokeArg
 class TailscaleStoreArgs {
     lateinit var operation: String
     var binding: String? = null
@@ -271,18 +276,29 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      */
     @Command
     fun deviceConditions(invoke: Invoke) {
+        val queryId = invoke.parseArgs(DeviceConditionsArgs::class.java).queryId
         Thread {
             runCatching {
                 val connectivity = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                 val power = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val observation = DefaultNetworkMonitor.networkObservation()
                 JSObject()
                     .put("metered", connectivity.isActiveNetworkMetered)
                     .put("powerSave", power.isPowerSaveMode)
+                    .put("queryId", queryId)
+                    .put("networkObservation", networkObservation(observation))
             }
                 .onSuccess { invoke.resolve(it) }
                 .onFailure { invoke.reject("Android device conditions query failed", "DEVICE_CONDITIONS_FAILED") }
         }.start()
     }
+
+    private fun networkObservation(observation: DefaultNetworkObservationSnapshot): JSObject = JSObject()
+        .put("version", 1)
+        .put("sourceEpoch", observation.sourceEpoch)
+        .put("seq", observation.seq)
+        .put("currentKnown", observation.currentKnown)
+        .put("coverageGap", observation.coverageGap)
 
     private fun bindableInterface(row: BindableInterface): JSObject = JSObject()
         .put("name", row.name)
