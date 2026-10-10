@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod bypass;
+pub mod coexistence;
 pub mod dns;
 pub mod dns_flush;
 pub mod dns_ops;
