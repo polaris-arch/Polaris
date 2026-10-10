@@ -287,6 +287,8 @@ async fn original_hook_ready_drives_worker_event_and_state() {
         states.insert("staleBusy".into(), o.get());
         o.terminal(3, true);
         states.insert("crashed".into(), o.get());
+        o.claim(4, false);
+        states.insert("stopped".into(), o.get());
         for partial in [true, false] {
             let (windows, _, _) = fixture();
             let mut windows = Arc::try_unwrap(windows).ok().unwrap();
@@ -512,4 +514,251 @@ fn stale_manual_revision_schedules_nothing_and_no_session_never_acquires() {
     assert_eq!(state["reason"]["value"]["code"], "noActiveSession");
     assert!(o.lock().pending.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn synchronous_refresh_without_tokio_context_runs_and_releases_driver() {
+    use crate::runtime::{
+        config::ConfigManager,
+        helper::HelperRuntime,
+        mesh::MeshRuntime,
+        proxy::{NoNetworkDoh, ProxyRuntime},
+    };
+    use polaris_core_supervisor::LifecycleKind;
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let dir = std::env::temp_dir().join(format!("polaris-coex-sync-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (o, _, calls) = fixture();
+    let mut rt = ProxyRuntime::new(
+        Arc::new(ConfigManager::new(dir.clone())),
+        Arc::new(HelperRuntime::never_installed_for_tests(dir.clone())),
+        Arc::new(MeshRuntime::new(dir.clone())),
+        Box::new(NoSystemProxy),
+        Arc::new(NoNetworkDoh),
+    );
+    rt.coex = o.clone();
+    let gen = rt.claim_generation(None, LifecycleKind::Start).unwrap();
+    rt.commit_coex_current_config(json!({"synchronousFixture":true}));
+    let token = o.begin_watcher(gen).unwrap();
+    o.watcher(gen, token, true);
+    // The synchronous Tauri command delegates directly to this actual facade method.
+    // Set only the injected fixture phase so no automatic request precedes refresh.
+    o.lock().binding.phase = "ready";
+    for expected_calls in [1, 2] {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let revision = rt.coex_state()["reportRevision"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        rt.coex_refresh(revision);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while o.lock().driver && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!o.lock().driver, "synchronous refresh left driver latched");
+        assert!(o.lock().pending.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(rt.coex_state()["freshness"], "latest");
+    }
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn report_projection_and_outer_revision_are_one_read_transaction() {
+    let (o, _, _) = fixture();
+    let mut o = Arc::try_unwrap(o).ok().unwrap();
+    let collector = o.collector.clone();
+    let (captured_tx, captured_rx) = mpsc::channel();
+    let latch = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiting = latch.clone();
+    o.collector = Arc::new(move |a| {
+        let wire = collector(a);
+        captured_tx.send(()).unwrap();
+        let mut released = waiting.0.lock().unwrap();
+        while !*released {
+            released = waiting.1.wait(released).unwrap();
+        }
+        wire
+    });
+    let o = Arc::new(o);
+    bind(&o, 1);
+    o.lock().running = true;
+    let worker = o.clone();
+    let task = std::thread::spawn(move || worker.run());
+    captured_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let service = o.service.clone();
+    let holder = std::thread::spawn(move || service.hold_slot_for_tests(held_tx, release_rx));
+    held_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    release(&latch);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !o.service.finish_waiting_for_tests() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let finish_waiting = o.service.finish_waiting_for_tests();
+    let (read_tx, read_rx) = mpsc::channel();
+    let reader = o.clone();
+    let read = std::thread::spawn(move || {
+        read_tx.send(reader.get()).unwrap();
+    });
+    let early = read_rx.recv_timeout(Duration::from_millis(50)).ok();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    task.join().unwrap();
+    read.join().unwrap();
+    let state = early
+        .clone()
+        .unwrap_or_else(|| read_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+    assert!(finish_waiting);
+    assert!(
+        early.is_none(),
+        "get-state observed an uncommitted report before physical finish"
+    );
+    let report_revision: u64 = state["report"]["value"]["reportRevision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let outer_revision: u64 = state["reportRevision"].as_str().unwrap().parse().unwrap();
+    assert!(report_revision <= outer_revision);
+    assert_eq!(state, o.get());
+}
+#[test]
+fn unchanged_config_is_rebound_to_a_new_session_with_new_revision() {
+    let (o, _, _) = fixture();
+    let value = json!({"unchangedAppliedConfig":true});
+    let mut current = Some(value.clone());
+    o.claim(1, true);
+    o.commit_config(&mut current, value.clone());
+    let first = o.get();
+    o.claim(2, true);
+    o.commit_config(&mut current, value.clone());
+    let second = o.get();
+    assert_eq!(current, Some(value));
+    assert_ne!(
+        first["binding"]["configGeneration"],
+        second["binding"]["configGeneration"]
+    );
+    assert_ne!(first["reportRevision"], second["reportRevision"]);
+}
+
+#[tokio::test]
+async fn actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_old_worker() {
+    use crate::runtime::{
+        config::ConfigManager,
+        helper::HelperRuntime,
+        mesh::MeshRuntime,
+        proxy::{NoNetworkDoh, ProxyRuntime},
+    };
+    use polaris_core_supervisor::LifecycleKind;
+    let dir = std::env::temp_dir().join(format!("polaris-coex-restart-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (o, _, _) = fixture();
+    let mut o = Arc::try_unwrap(o).ok().unwrap();
+    let collector = o.collector.clone();
+    let block = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let should_block = block.clone();
+    let latch = Arc::new((Mutex::new(false), Condvar::new()));
+    let wait = latch.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    o.collector = Arc::new(move |a| {
+        let wire = collector(a);
+        if should_block.load(Ordering::SeqCst) {
+            entered_tx.send(()).unwrap();
+            let mut released = wait.0.lock().unwrap();
+            while !*released {
+                released = wait.1.wait(released).unwrap();
+            }
+        }
+        wire
+    });
+    let o = Arc::new(o);
+    let mut rt = ProxyRuntime::new(
+        Arc::new(ConfigManager::new(dir.clone())),
+        Arc::new(HelperRuntime::never_installed_for_tests(dir.clone())),
+        Arc::new(MeshRuntime::new(dir.clone())),
+        Box::new(NoSystemProxy),
+        Arc::new(NoNetworkDoh),
+    );
+    rt.coex = o.clone();
+    let rt = Arc::new(rt);
+    let generation = rt.claim_generation(None, LifecycleKind::Start).unwrap();
+    rt.commit_coex_current_config(json!({"actualRestartFixture":true}));
+    let token = o.begin_watcher(generation).unwrap();
+    o.watcher(generation, token, true);
+    o.lock().binding.phase = "ready";
+    run(&o);
+    assert_eq!(rt.coex_state()["freshness"], "latest");
+    block.store(true, Ordering::SeqCst);
+    {
+        let mut state = o.lock();
+        state.running = true;
+        state.driver = true;
+    }
+    let worker = o.clone();
+    let old = std::thread::spawn(move || worker.run());
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+        .await
+        .unwrap();
+    rt.coex_refresh(
+        rt.coex_state()["reportRevision"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(rt.coex_state()["pending"]["status"], "known");
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rt.debounced
+        .schedule_with_ticket(true, move |outcome, ticket| {
+            tx.send((outcome, ticket)).unwrap();
+        });
+    let (outcome, ticket) = rx.await.unwrap();
+    assert!(matches!(
+        outcome,
+        polaris_switch_engine::DebouncedOutcome::Proceed(None)
+    ));
+    let (_, claimed, _lease) = rt
+        .claim_debounced_restart(None, generation, ticket)
+        .unwrap();
+    let claim_state = rt.coex_state();
+    let stopping = rt.clone();
+    let cleanup = tokio::spawn(async move {
+        stopping
+            .stop_inner(super::super::lifecycle::StopClaim::AlreadyClaimed(claimed))
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while rt.gate.depth() < 2 && Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    let cleanup_entered = rt.gate.depth() >= 2;
+    release(&latch);
+    old.join().unwrap();
+    let while_blocked = rt.coex_state();
+    // Poison empty Child custody to force an actual cleanup error before any native StopIo,
+    // route/DNS teardown or physical core operation can run after the held gate is released.
+    let poisoned = rt.clone();
+    assert!(std::thread::spawn(move || {
+        let _slot = poisoned.child.lock().unwrap();
+        panic!("fixture custody poison before native StopIo");
+    })
+    .join()
+    .is_err());
+    drop(gate);
+    let result = cleanup.await.unwrap();
+    rt.finish_lifecycle(LifecycleKind::Restart);
+    assert!(cleanup_entered);
+    assert!(result.unwrap_err().contains("custody poisoned before Stop"));
+    for state in [claim_state, while_blocked, rt.coex_state()] {
+        assert_eq!(state["freshness"], "unavailable");
+        assert_eq!(state["report"]["status"], "unknown");
+        assert_eq!(state["pending"]["status"], "unknown");
+        assert_eq!(state["binding"]["sessionId"]["status"], "unknown");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

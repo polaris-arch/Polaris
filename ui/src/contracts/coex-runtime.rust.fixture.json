@@ -96,7 +96,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791661652544",
+            "endedAtUnixMillis": "1791663320120",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -117,7 +117,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791661652544"
+            "startedAtUnixMillis": "1791663320120"
           },
           "reportRevision": "7",
           "snapshot": {
@@ -229,7 +229,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791661652544",
+            "endedAtUnixMillis": "1791663320120",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -250,7 +250,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791661652544"
+            "startedAtUnixMillis": "1791663320120"
           },
           "reportRevision": "7",
           "snapshot": {
@@ -297,6 +297,46 @@
         }
       },
       "reportRevision": "8",
+      "schemaVersion": 1
+    },
+    "stopped": {
+      "activity": "idle",
+      "binding": {
+        "configGeneration": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        },
+        "lifecycleGeneration": {
+          "status": "known",
+          "value": "4"
+        },
+        "lifecyclePhase": "stopped",
+        "networkEpoch": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        },
+        "sessionId": {
+          "reason": "binding unavailable",
+          "status": "unknown"
+        }
+      },
+      "freshness": "unavailable",
+      "pending": {
+        "reason": "no pending request",
+        "status": "unknown"
+      },
+      "reason": {
+        "status": "known",
+        "value": {
+          "code": "lifecycleChanged",
+          "detail": "lifecycleChanged"
+        }
+      },
+      "report": {
+        "reason": "no current session report",
+        "status": "unknown"
+      },
+      "reportRevision": "10",
       "schemaVersion": 1
     },
     "windowsPartial": {
@@ -354,7 +394,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791661652547",
+            "endedAtUnixMillis": "1791663320123",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -375,7 +415,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791661652547"
+            "startedAtUnixMillis": "1791663320122"
           },
           "reportRevision": "5",
           "snapshot": {
@@ -574,7 +614,7 @@
               }
             },
             "endedAtMonotonicMillis": "0",
-            "endedAtUnixMillis": "1791661652548",
+            "endedAtUnixMillis": "1791663320123",
             "startBinding": {
               "configGeneration": {
                 "status": "known",
@@ -595,7 +635,7 @@
               }
             },
             "startedAtMonotonicMillis": "0",
-            "startedAtUnixMillis": "1791661652548"
+            "startedAtUnixMillis": "1791663320123"
           },
           "reportRevision": "5",
           "snapshot": {
@@ -741,15 +781,15 @@
     "method": "Original Observer hooks and SnapshotService/collect_admitted/serializer executed in unit tests with fixed source injection. Export path explicitly supplied. No host/native API/core/IPC device.",
     "base": "9e3e4a92b484c2c7ae7baeee35791160fccb816e",
     "sourceSha256": {
-      "src-tauri/src/runtime/proxy/coex_observer.rs": "2e7d13332470b2962aaa1ab6801ae47d0ceeef13d8414f8bd6c8d227ad85a2cf",
-      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "b4b20aa588e139e878e7f8c7731f1a11e1d7c765a974c42cfb97723e27bd0ef1",
+      "src-tauri/src/runtime/proxy/coex_observer.rs": "fcb6b5da4966184b0f5f9b5065f1d09a453446f95a77b9c50bfb329965b05ca1",
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "14872b380301b68f76d94cca8f26a5eb56baafaa67811c6f0012ecfc2a876693",
       "src-tauri/src/runtime/proxy.rs": "a5ef608728b2c6bdf6831f4f5b8672d49a8ddf84ce69e731d54e2f602064ef1c",
-      "src-tauri/src/runtime/proxy/lifecycle.rs": "4e166dbe3407884818480b9eb541c4f969e2f5d009b80501a36dada48593ce5c",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "c7f2777ac3713c4bcb3cb8aa20b373f3af547709ae063d0bc57a57b2f8fe75d5",
       "src-tauri/src/runtime/proxy/startup.rs": "02986ed718dc197f55bc31888ef5a56173dc280dfb2ecfe4efe34509ef523139",
       "src-tauri/src/runtime/proxy/hot_switch.rs": "e880675ecb78a330b2c8d66e7807a13de8abcf808b40e02fdadb4ce1145c2cd5",
       "src-tauri/src/runtime/proxy/recovery.rs": "114bfa398e3c2bbf93b46c6b352ce6f63c424dfa1720b685b66b7190626e028d",
       "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",
-      "src-tauri/src/commands/coexistence_snapshot.rs": "0afbb08b347b06cff33a6099f678263ccc8fc646ffb73a86f7a6a5f67b6cf4b0"
+      "src-tauri/src/commands/coexistence_snapshot.rs": "8415766265c51972da7aac5cc38fd17811703c64dd2fe9f8e439955752455a4b"
     }
   }
 }

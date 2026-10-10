@@ -96,36 +96,58 @@ export function renderCoexFacts(
 export function CoexSnapshotBlock() {
   const { t } = useTranslation();
   const [state, setState] = useState<CoexRuntimeState | null>(null);
-  const [error, setError] = useState<{ malformed: boolean; detail: string } | null>(null);
+  const [error, setError] = useState<{ malformed: boolean; detail: string; subscription: boolean } | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [pages, setPages] = useState(FIRST_PAGES);
   const revision = useRef<bigint>(BigInt(-1));
   const alive = useRef(false);
   const inFlight = useRef(false);
   const epoch = useRef(0);
+  const listener = useRef<{ mount: number; off: () => void } | null>(null);
+  const registering = useRef<{ mount: number; promise: Promise<boolean> } | null>(null);
   const accept = (next: CoexRuntimeState) => {
-    if (!alive.current || BigInt(next.reportRevision) < revision.current) return;
+    if (!alive.current || BigInt(next.reportRevision) <= revision.current) return;
     revision.current = BigInt(next.reportRevision);
     setState(next); setError(null);
   };
-  const fail = (failure: unknown) => { if (alive.current) setError({ malformed: failure instanceof CoexRuntimeDecodeError || failure instanceof CoexSnapshotDecodeError, detail: failure instanceof Error ? failure.message : String(failure) }); };
+  const fail = (failure: unknown, subscription = false) => {
+    if (alive.current) setError({ malformed: failure instanceof CoexRuntimeDecodeError || failure instanceof CoexSnapshotDecodeError, detail: failure instanceof Error ? failure.message : String(failure), subscription });
+  };
+  const ensureSubscribed = async (mount: number): Promise<boolean> => {
+    if (listener.current?.mount === mount) return false;
+    if (registering.current?.mount === mount) return registering.current.promise;
+    const promise = (async () => {
+      const off = await api.system.onCoexRuntimeState(
+        next => { if (epoch.current === mount) accept(next); },
+        failure => { if (epoch.current === mount) fail(failure); },
+      );
+      if (!alive.current || epoch.current !== mount) { off(); return false; }
+      listener.current = { mount, off };
+      setError(previous => previous?.subscription ? null : previous);
+      return true;
+    })();
+    registering.current = { mount, promise };
+    try { return await promise; }
+    finally { if (registering.current?.promise === promise) registering.current = null; }
+  };
   useEffect(() => {
     alive.current = true;
     const mount = ++epoch.current;
-    let off: (() => void) | null = null;
     void (async () => {
+      try { await ensureSubscribed(mount); }
+      catch (failure) { if (epoch.current === mount) fail(failure, true); return; }
+      if (!alive.current || epoch.current !== mount) return;
+      const beforeGet = revision.current;
       try {
-        const registered = await api.system.onCoexRuntimeState(accept, fail);
-        if (!alive.current || epoch.current !== mount) { registered(); return; }
-        off = registered;
-        const beforeGet = revision.current;
-        try {
-          const initial = await api.system.coexRuntimeGetState();
-          if (epoch.current === mount) accept(initial);
-        } catch (failure) { if (epoch.current === mount && revision.current === beforeGet) fail(failure); }
-      } catch (failure) { if (epoch.current === mount) fail(failure); }
+        const initial = await api.system.coexRuntimeGetState();
+        if (epoch.current === mount) accept(initial);
+      }
+      catch (failure) { if (epoch.current === mount && revision.current === beforeGet) fail(failure); }
     })();
-    return () => { alive.current = false; epoch.current++; off?.(); };
+    return () => {
+      alive.current = false; epoch.current++;
+      if (listener.current?.mount === mount) { listener.current.off(); listener.current = null; }
+    };
   }, []);
   const collect = async () => {
     if (inFlight.current) return;
@@ -133,12 +155,17 @@ export function CoexSnapshotBlock() {
     const mount = epoch.current;
     const beforeRequest = revision.current;
     setExpanded(null); setPages(FIRST_PAGES);
+    let subscribed = false;
     try {
-      // A failed initial state is retried without manufacturing a revision or starting capture on mount.
-      const current = state ?? await api.system.coexRuntimeGetState();
+      // Retry restores the listener first, then reads state before scheduling refresh.
+      const restored = await ensureSubscribed(mount);
+      subscribed = true;
+      if (!alive.current || epoch.current !== mount) return;
+      const current = restored || !state ? await api.system.coexRuntimeGetState() : state;
+      if (!alive.current || epoch.current !== mount) return;
       const next = await api.system.coexRuntimeRefresh(current.reportRevision);
       if (epoch.current === mount) accept(next);
-    } catch (failure) { if (epoch.current === mount && revision.current === beforeRequest) fail(failure); }
+    } catch (failure) { if (epoch.current === mount && revision.current === beforeRequest) fail(failure, !subscribed); }
     finally { inFlight.current = false; }
   };
   const snapshot = state?.report.status === 'known' ? state.report.value.snapshot : null;

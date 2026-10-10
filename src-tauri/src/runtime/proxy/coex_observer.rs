@@ -85,6 +85,16 @@ impl Default for State {
     }
 }
 impl State {
+    fn advance_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("COEX revision overflow");
+    }
+    fn commit(&mut self) -> Value {
+        self.advance_revision();
+        self.wire()
+    }
     fn invalidate(&mut self, reason: &'static str) {
         self.invalid = self
             .invalid
@@ -149,6 +159,7 @@ impl Observer {
                 s.binding.network = None;
                 s.pending = None;
                 s.invalidate("bindingUnavailable");
+                s.advance_revision();
                 s
             }
         }
@@ -158,22 +169,26 @@ impl Observer {
             *s = Some(sink);
         }
     }
-    fn publish(&self) {
-        let wire = {
-            let mut s = self.lock();
-            s.revision = s.revision.checked_add(1).expect("COEX revision overflow");
-            s.wire()
-        };
+    fn emit(&self, wire: Value) {
         let sink = self.sink.lock().ok().and_then(|s| s.clone());
         if let Some(sink) = sink {
             sink(wire);
+        }
+    }
+    fn dispatch(self: &Arc<Self>, wire: Value, spawn: bool) {
+        self.emit(wire);
+        if spawn {
+            let this = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                this.drive().await;
+            });
         }
     }
     pub(crate) fn get(&self) -> Value {
         self.lock().wire()
     }
     pub(crate) fn claim(self: &Arc<Self>, generation: u64, start: bool) {
-        {
+        let wire = {
             let mut s = self.lock();
             s.invalidate("lifecycleChanged");
             s.report = None;
@@ -187,11 +202,12 @@ impl Observer {
                 phase: if start { "starting" } else { "stopped" },
             };
             s.network = 0;
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
     pub(crate) fn invalidate_generation(&self, generation: u64) {
-        {
+        let wire = {
             let mut s = self.lock();
             s.invalidate("lifecycleChanged");
             s.report = None;
@@ -202,22 +218,25 @@ impl Observer {
             s.binding.config = None;
             s.binding.network = None;
             s.binding.phase = "stopped";
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
     pub(crate) fn ready(self: &Arc<Self>, generation: u64) {
-        {
+        let (wire, spawn) = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) {
                 return;
             }
             s.invalidate("lifecycleChanged");
             s.binding.phase = "ready";
-        }
-        self.request("startup", false, None);
+            let spawn = self.queue(&mut s, "startup", false);
+            (s.commit(), spawn)
+        };
+        self.dispatch(wire, spawn);
     }
     pub(crate) fn fail_start(&self, generation: u64) {
-        {
+        let wire = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) || s.binding.phase != "starting" {
                 return;
@@ -230,11 +249,12 @@ impl Observer {
             s.binding.config = None;
             s.binding.network = None;
             s.binding.phase = "stopped";
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
     pub(crate) fn terminal(&self, generation: u64, crashed: bool) {
-        {
+        let wire = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) {
                 return;
@@ -247,40 +267,40 @@ impl Observer {
             s.binding.config = None;
             s.binding.network = None;
             s.binding.phase = if crashed { "crashed" } else { "stopped" };
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
-    /// Caller holds current_config.write; actual value and generation change under this same lock.
+    /// Caller holds current_config.write; actual value and binding commit under the same lock.
+    /// An unchanged value still receives a new stamp when rebinding a new session's Unknown config.
     pub(crate) fn commit_config(self: &Arc<Self>, current: &mut Option<Value>, value: Value) {
-        let changed = {
+        let (wire, spawn) = {
             let mut s = self.lock();
             let changed = current.as_ref() != Some(&value);
             *current = Some(value);
-            if changed || s.binding.config.is_none() {
-                s.config = s.config.checked_add(1).expect("COEX config overflow");
-                s.binding.config = Some(s.config);
-                s.invalidate("configChanged");
-                true
-            } else {
-                false
+            if !changed && s.binding.config.is_some() {
+                return;
             }
+            s.config = s.config.checked_add(1).expect("COEX config overflow");
+            s.binding.config = Some(s.config);
+            s.invalidate("configChanged");
+            let spawn = self.queue(&mut s, "config", false);
+            (s.commit(), spawn)
         };
-        if changed {
-            self.request("config", false, None);
-        }
+        self.dispatch(wire, spawn);
     }
     pub(crate) fn config_unavailable(&self) {
-        {
+        let wire = {
             let mut s = self.lock();
             s.binding.config = None;
             s.invalidate("bindingUnavailable");
             s.pending = None;
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
-    /// The original watcher owns its captured generation. Unknown -> Unknown also invalidates.
     pub(crate) fn begin_watcher(&self, generation: u64) -> Option<u64> {
-        let token = {
+        let (wire, token) = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) {
                 return None;
@@ -288,37 +308,37 @@ impl Observer {
             s.watcher = s.watcher.checked_add(1).expect("COEX watcher overflow");
             s.binding.network = None;
             s.invalidate("watcherUnavailable");
-            s.watcher
+            (s.commit(), s.watcher)
         };
-        self.publish();
+        self.emit(wire);
         Some(token)
     }
     pub(crate) fn watcher_unavailable(&self) {
-        {
+        let wire = {
             let mut s = self.lock();
             s.watcher = s.watcher.checked_add(1).expect("COEX watcher overflow");
             s.binding.network = None;
             s.invalidate("watcherUnavailable");
-        }
-        self.publish();
+            s.commit()
+        };
+        self.emit(wire);
     }
+    /// Unknown -> Unknown invalidates too; only this original watcher token can recover.
     pub(crate) fn watcher(self: &Arc<Self>, generation: u64, token: u64, available: bool) {
-        {
+        let (wire, spawn) = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) || s.watcher != token || token == 0 {
                 return;
             }
             s.invalidate("watcherUnavailable");
             s.binding.network = available.then_some(s.network);
-        }
-        if available {
-            self.request("network", false, None);
-        } else {
-            self.publish();
-        }
+            let spawn = available && self.queue(&mut s, "network", false);
+            (s.commit(), spawn)
+        };
+        self.dispatch(wire, spawn);
     }
     pub(crate) fn receipt(self: &Arc<Self>, generation: u64, token: u64) {
-        let coalesced = {
+        let committed = {
             let mut s = self.lock();
             if s.binding.session != Some(generation) || s.watcher != token || token == 0 {
                 return;
@@ -328,67 +348,67 @@ impl Observer {
             s.binding.network = Some(s.network);
             s.invalidate("networkChanged");
             if coalesced {
-                s.revision = s.revision.checked_add(1).expect("COEX revision overflow");
                 if let Some(pending) = s.pending.as_mut() {
                     pending.trigger = "network";
                 }
+                // No event is published for a coalesced receipt; state and its new revision
+                // still commit together, so any get-state sees a consistent snapshot.
+                s.advance_revision();
+                None
+            } else {
+                let spawn = self.queue(&mut s, "network", false);
+                Some((s.commit(), spawn))
             }
-            coalesced
         };
-        // First invalidation is synchronous. Later raw receipts update get-state and the
-        // pending intent without pushing the same potentially large stale report per event.
-        if !coalesced {
-            self.request("network", false, None);
+        if let Some((wire, spawn)) = committed {
+            self.dispatch(wire, spawn);
         }
     }
     pub(crate) fn manual(self: &Arc<Self>, expected: u64) -> Value {
-        self.request("manual", true, Some(expected));
-        self.get()
-    }
-    fn request(self: &Arc<Self>, trigger: &'static str, manual: bool, expected: Option<u64>) {
-        let spawn = {
+        let (wire, spawn) = {
             let mut s = self.lock();
-            if expected.is_some_and(|r| r != s.revision) {
-                return;
+            if expected != s.revision {
+                return s.wire();
             }
-            if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
-                s.reason = "unsupportedPlatform";
-                false
-            } else if manual && s.binding.session.is_none() {
-                s.reason = "noActiveSession";
-                false
-            } else if !manual && s.binding.phase != "ready" {
-                false
-            } else {
-                if let Some(p) = s.pending.as_mut() {
-                    p.manual |= manual;
-                    p.trigger = trigger;
-                } else {
-                    s.pending = Some(Pending {
-                        first: (self.clock)(),
-                        trigger,
-                        manual,
-                    });
-                }
-                if s.driver {
-                    false
-                } else {
-                    s.driver = true;
-                    true
-                }
-            }
+            let spawn = self.queue(&mut s, "manual", true);
+            (s.commit(), spawn)
         };
-        self.publish();
-        if spawn {
-            let this = Arc::clone(self);
-            tokio::spawn(async move {
-                this.drive().await;
+        self.dispatch(wire.clone(), spawn);
+        wire
+    }
+    /// Queue mutation is part of the caller's state/revision transaction.
+    fn queue(&self, s: &mut State, trigger: &'static str, manual: bool) -> bool {
+        if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            s.reason = "unsupportedPlatform";
+            return false;
+        }
+        if manual && s.binding.session.is_none() {
+            s.reason = "noActiveSession";
+            return false;
+        }
+        if !manual && s.binding.phase != "ready" {
+            return false;
+        }
+        if let Some(p) = s.pending.as_mut() {
+            p.manual |= manual;
+            p.trigger = trigger;
+        } else {
+            s.pending = Some(Pending {
+                first: (self.clock)(),
+                trigger,
+                manual,
             });
+        }
+        if s.driver {
+            false
+        } else {
+            s.driver = true;
+            true
         }
     }
     async fn drive(self: Arc<Self>) {
         loop {
-            let delay = {
+            let (delay, expired_wire) = {
                 let mut s = self.lock();
                 let now = (self.clock)();
                 let Some(p) = s.pending.as_ref() else {
@@ -402,41 +422,53 @@ impl Observer {
                     } else {
                         "pendingExpired"
                     };
-                    None
+                    (None, Some(s.commit()))
                 } else {
                     let next = s.last_started.map_or(now, |last| last + self.interval);
-                    Some(
-                        next.saturating_sub(now)
-                            .min((p.first + MAX_PENDING).saturating_sub(now)),
+                    (
+                        Some(
+                            next.saturating_sub(now)
+                                .min((p.first + MAX_PENDING).saturating_sub(now)),
+                        ),
+                        None,
                     )
                 }
             };
+            if let Some(wire) = expired_wire {
+                self.emit(wire);
+            }
             let Some(delay) = delay else {
-                self.publish();
                 continue;
             };
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            {
+            let wire = {
                 let mut s = self.lock();
                 if s.pending.is_none() {
                     continue;
                 }
                 s.pending = None;
                 s.running = true;
-            }
-            self.publish();
+                s.commit()
+            };
+            self.emit(wire);
             let this = Arc::clone(&self);
             let mut worker = tokio::task::spawn_blocking(move || this.run());
-            // Observe pending age during a stuck worker without cancelling/replacing its physical owner.
+            // A pending deadline never cancels or replaces the physical worker owner.
             loop {
                 tokio::select! {
-                    result=&mut worker=>{if result.is_err(){let mut s=self.lock();s.running=false;s.reason="serviceQuarantined";s.freshness="unavailable";drop(s);self.publish();}break;},
-                    ()=tokio::time::sleep(Duration::from_millis(100))=>{
-                        let expired={let mut s=self.lock();if s.pending.as_ref().is_some_and(|p|(self.clock)()>=p.first+MAX_PENDING){s.pending=None;s.reason="workerStillRunning";true}else{false}};
-                        if expired{self.publish();}
+                    result = &mut worker => {
+                        if result.is_err() {
+                            let wire = { let mut s=self.lock(); s.running=false; s.reason="serviceQuarantined"; s.freshness="unavailable"; s.commit() };
+                            self.emit(wire);
+                        }
+                        break;
+                    },
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let wire = { let mut s=self.lock(); if s.pending.as_ref().is_some_and(|p|(self.clock)()>=p.first+MAX_PENDING) { s.pending=None; s.reason="workerStillRunning"; Some(s.commit()) } else { None } };
+                        if let Some(wire)=wire { self.emit(wire); }
                     }
                 }
             }
@@ -446,7 +478,7 @@ impl Observer {
         let admission = match self.service.admit() {
             Ok(a) => a,
             Err(reason) => {
-                {
+                let wire = {
                     let mut s = self.lock();
                     s.running = false;
                     s.reason = if reason.contains("busy") {
@@ -459,8 +491,9 @@ impl Observer {
                     } else {
                         "unavailable"
                     };
-                }
-                self.publish();
+                    s.commit()
+                };
+                self.emit(wire);
                 return;
             }
         };
@@ -474,7 +507,7 @@ impl Observer {
         let snapshot = (self.collector)(&admission);
         let end = (self.clock)();
         let unix_end = unix_millis();
-        {
+        let wire = {
             let mut s = self.lock();
             let end_binding = s.binding.clone();
             // Unknown is never an equality wildcard; independent invalidation catches availability ABA.
@@ -511,12 +544,13 @@ impl Observer {
                     json!({"reportRevision":(s.revision+1).to_string(),"acquisition":{"startedAtUnixMillis":unix_start.to_string(),"endedAtUnixMillis":unix_end.to_string(),"startedAtMonotonicMillis":start.as_millis().to_string(),"endedAtMonotonicMillis":end.as_millis().to_string(),"startBinding":binding.wire(),"endBinding":end_binding.wire(),"atomic":false},"snapshot":snapshot}),
                 );
             }
-        }
-        admission.finish(); // END binding and projection completed before the original admission is released.
-        {
-            self.lock().running = false;
-        }
-        self.publish();
+            // Projection, outer revision and activity are one observable transaction.
+            // END projection still precedes release of the original physical admission.
+            admission.finish();
+            s.running = false;
+            s.commit()
+        };
+        self.emit(wire);
     }
 }
 fn unix_millis() -> u128 {

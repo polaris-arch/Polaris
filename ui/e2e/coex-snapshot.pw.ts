@@ -9,8 +9,8 @@ import ru from '../src/i18n/locales/ru.json' with { type: 'json' };
 import fa from '../src/i18n/locales/fa.json' with { type: 'json' };
 const card = (page: Page) => page.locator('[data-coex-snapshot]');
 const commands = (page: Page) => page.evaluate(() => window.__coexHarness!.calls.filter(c => c.command.startsWith('coex_')));
-async function reply(page: Page, name: 'latest' | 'staleBusy' | 'crashed' | 'windowsPartial' | 'windowsUnavailable') { await page.evaluate(name => window.__coexHarness!.reply({ success: true, data: window.__coexHarness!.runtimeState(name) }), name); }
-async function emit(page: Page, name: 'latest' | 'staleBusy' | 'crashed' | 'windowsPartial' | 'windowsUnavailable') { await page.evaluate(name => window.__coexHarness!.emitRuntimeState(window.__coexHarness!.runtimeState(name)), name); }
+async function reply(page: Page, name: 'latest' | 'staleBusy' | 'crashed' | 'stopped' | 'windowsPartial' | 'windowsUnavailable') { await page.evaluate(name => window.__coexHarness!.reply({ success: true, data: window.__coexHarness!.runtimeState(name) }), name); }
+async function emit(page: Page, name: 'latest' | 'staleBusy' | 'crashed' | 'stopped' | 'windowsPartial' | 'windowsUnavailable') { await page.evaluate(name => window.__coexHarness!.emitRuntimeState(window.__coexHarness!.runtimeState(name)), name); }
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(({ key }) => localStorage.setItem(key, 'en-US'), { key: LANGUAGE_STORAGE_KEY });
   await page.goto('/harness.html?coex-snapshot-fixture=1');
@@ -87,4 +87,38 @@ test('listenReady late acknowledgement after unmount is actually unsubscribed', 
 });
 test('newer event survives late initial get-state transport failure', async ({ page }) => {
   await emit(page, 'latest'); await page.evaluate(() => window.__coexHarness!.reject('older initial failure')); await expect(card(page)).toContainText(en.settings.coex.latest); await expect(card(page)).not.toContainText('older initial failure');
+});
+
+test('first listener rejection retries subscription and receives subsequent Stop', async ({ page }) => {
+  await reply(page, 'latest');
+  await page.getByRole('button', { name: en.settings.nav.back, exact: true }).click();
+  await page.evaluate(() => { window.__coexHarness!.rejectRegistration = true; });
+  await page.getByRole('button', { name: en.sidebar.settings, exact: true }).click();
+  await page.getByRole('button', { name: 'TUN', exact: true }).click();
+  await expect(card(page)).toContainText('fixture COEX listener registration rejected');
+  const before = (await commands(page)).filter(c => c.command === 'coex_runtime_get_state').length;
+  await page.evaluate(() => { window.__coexHarness!.rejectRegistration = false; });
+  await card(page).getByRole('button', { name: en.settings.coex.retry, exact: true }).click();
+  await expect.poll(async () => (await commands(page)).filter(c => c.command === 'coex_runtime_get_state').length).toBe(before + 1);
+  await reply(page, 'latest');
+  await expect.poll(async () => (await commands(page)).filter(c => c.command === 'coex_runtime_refresh').length).toBe(1);
+  await reply(page, 'latest');
+  await expect(card(page)).toContainText(en.settings.coex.latest);
+  await emit(page, 'stopped');
+  await expect(card(page)).toContainText(en.settings.coex.unavailable);
+  await expect(card(page)).not.toContainText('fixture COEX listener registration rejected');
+});
+test('equal-revision late get response cannot overwrite a committed terminal event', async ({ page }) => {
+  await emit(page, 'crashed');
+  await expect(card(page)).toContainText(en.settings.coex.unavailable);
+  await page.evaluate(() => {
+    const control = window.__coexHarness!;
+    const old = control.runtimeState('latest');
+    old.reportRevision = control.runtimeState('crashed').reportRevision;
+    control.reply({ success: true, data: old });
+  });
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(card(page)).toContainText(en.settings.coex.unavailable);
+  await expect(card(page)).not.toContainText(en.settings.coex.latest);
+  await expect(card(page).getByRole('alert')).toHaveCount(0);
 });

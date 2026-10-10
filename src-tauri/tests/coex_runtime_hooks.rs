@@ -48,6 +48,13 @@ fn successful_claims_ready_failure_and_crash_hooks_remain_reachable() {
     assert!(claim.contains(
         "ifletSome(generation)=generation{self.coex.claim(generation,kind==LifecycleKind::Start)"
     ));
+    let debounced = body(&lifecycle, "fn claim_debounced_restart(");
+    assert!(
+        debounced
+            .find("try_begin_restart(scheduled_generation,force_id)?")
+            .unwrap()
+            < debounced.find("self.coex.claim(generation,false)").unwrap()
+    );
     let start = body(&lifecycle, "async fn start_guarded_with_completion(");
     assert!(start.contains("publish_committed_ready_main(my_gen,||{"));
     assert!(start.contains("self.coex_committed_ready(my_gen)"));

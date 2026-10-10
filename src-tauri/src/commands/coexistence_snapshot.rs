@@ -97,9 +97,26 @@ struct SnapshotSlot {
 #[derive(Default)]
 pub(crate) struct SnapshotService {
     slot: Mutex<SnapshotSlot>,
+    #[cfg(test)]
+    finish_waiting: std::sync::atomic::AtomicBool,
 }
 
 impl SnapshotService {
+    #[cfg(test)]
+    pub(crate) fn hold_slot_for_tests(
+        &self,
+        held: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        let _slot = self.slot.lock().unwrap();
+        held.send(()).unwrap();
+        release.recv().unwrap();
+    }
+    #[cfg(test)]
+    pub(crate) fn finish_waiting_for_tests(&self) -> bool {
+        self.finish_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
     fn lock_worker(&self) -> MutexGuard<'_, SnapshotSlot> {
         match self.slot.lock() {
             Ok(slot) => slot,
@@ -217,8 +234,16 @@ impl Admission {
     }
 
     pub(crate) fn finish(mut self) {
+        #[cfg(test)]
+        self.service
+            .finish_waiting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.service.lock_worker().busy = false;
         self.recorded = true;
+        #[cfg(test)]
+        self.service
+            .finish_waiting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

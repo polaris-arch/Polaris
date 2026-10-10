@@ -1684,6 +1684,8 @@ impl ProxyRuntime {
             let generation = self
                 .gate
                 .try_begin_restart(scheduled_generation, force_id)?;
+            // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
+            self.coex.claim(generation, false);
             starts.book_restart(
                 Arc::clone(&self.stop_domain),
                 scheduled_generation,

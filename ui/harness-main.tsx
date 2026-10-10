@@ -47,6 +47,7 @@ const coexPending: Array<{ resolve: (value: unknown) => void; reject: (reason: E
 const coexControl = {
   calls: [] as Array<{ command: string; payload: unknown }>,
   holdRegistration: false,
+  rejectRegistration: false,
   registrationReleases: [] as Array<() => void>,
   unregisterCount: 0,
   releaseRegistration: () => { coexControl.holdRegistration = false; for (const release of coexControl.registrationReleases.splice(0)) release(); },
@@ -189,6 +190,7 @@ if (coexFixtureEnabled) {
   const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
   const original = internals.invoke;
   internals.invoke = async (cmd, args) => {
+    if (cmd === 'plugin:event|listen' && args?.event === 'event:coexRuntimeState' && coexControl.rejectRegistration) throw new Error('fixture COEX listener registration rejected');
     const value = await original(cmd, args);
     if (args?.event === 'event:coexRuntimeState') {
       if (cmd === 'plugin:event|listen' && coexControl.holdRegistration) await new Promise<void>(resolve => coexControl.registrationReleases.push(resolve));
