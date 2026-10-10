@@ -18,7 +18,7 @@ plist = "1"
 # 既有依赖用于network_cost；Windows UI/LibraryLoader另供会话查询与原生DNS缓存。
 # 均已在依赖图中，Cargo.lock不新增包。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Networking_Connectivity", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+windows = { version = "0.61", features = ["Networking_Connectivity", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_Rras", "Win32_Networking_WinSock"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

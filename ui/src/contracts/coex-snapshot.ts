@@ -1,3 +1,4 @@
+import { decodeCoexWindows, type CoexWindowsSnapshot } from './coex-windows';
 /** Frozen COEX snapshot v1. Facts are observations, never a safety verdict. */
 export type UnknownFact = { status: 'unknown'; reason: string };
 export type Fact<T> = { status: 'known'; value: T } | UnknownFact;
@@ -25,7 +26,7 @@ export interface CoexObject {
   policyRules: Fact<CoexPolicyRule[]>;
   stableIdentity: Fact<string | null>;
 }
-export interface CoexSnapshot {
+export interface CoexSnapshotV1 {
   schemaVersion: 1;
   platform: CoexPlatform;
   objects: Fact<CoexObject[]>;
@@ -40,8 +41,10 @@ export interface CoexSnapshot {
   classification: UnknownFact;
 }
 
+export type CoexSnapshot = CoexSnapshotV1 | CoexWindowsSnapshot;
+
 export class CoexSnapshotDecodeError extends Error {
-  constructor() { super('Invalid COEX snapshot v1'); this.name = 'CoexSnapshotDecodeError'; }
+  constructor() { super('Invalid COEX snapshot'); this.name = 'CoexSnapshotDecodeError'; }
 }
 const invalid = (): never => { throw new CoexSnapshotDecodeError(); };
 type Decode<T> = (input: unknown) => T;
@@ -113,6 +116,7 @@ const object: Decode<CoexObject> = (input) => {
 
 /** No transport fallback, default empty list, context synthesis or classification. */
 export function decodeCoexSnapshot(input: unknown): CoexSnapshot {
+  if (input !== null && typeof input === 'object' && (input as Record<string, unknown>).schemaVersion === 2) return decodeCoexWindows(input, invalid);
   const v = fields(input, ['schemaVersion', 'platform', 'objects', 'observation', 'commandCleanup', 'context', 'classification']);
   const context = fields(v.context, ['observationPhase', 'ownInterfaces', 'criteria', 'repairHistory']);
   return {

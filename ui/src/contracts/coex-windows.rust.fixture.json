@@ -1,0 +1,2180 @@
+{
+  "producer": {
+    "base": "22cc90f93a50c0e27f26487f9f5e1395d698ce3f",
+    "copiedFunctions": [
+      "fact_wire",
+      "unknown_wire",
+      "object_wire",
+      "platform_tag",
+      "snapshot_wire",
+      "windows_unavailable",
+      "windows_ref_wire",
+      "windows_source_wire",
+      "windows_snapshot_wire"
+    ],
+    "copiedFunctionsSha256": "6000423a5212d89064c5a0cd117ff5ae8fb5fdf64870b499aef5b87e180a0151",
+    "kind": "Compiled actual Rust wire functions and actual collect_windows with injected fixed source results; no host/native IPC/device sampling",
+    "sourceSha256": {
+      "crates/system-integration/src/coexistence/windows.rs": "d0b56f3887a013683359c19d174a530782a32b188c4975db57fec41248aa7a90",
+      "crates/system-integration/src/windows_coex.rs": "298e57dbc1eb4509ee2d3ab7834fce47754741150a7d990923032ad30de4e19e",
+      "crates/system-integration/src/windows_coex/native.rs": "deb8f42df1d93e9c7e31ee966495e68c6f172b28678b3e1bc915a7bce88f1c5b",
+      "src-tauri/src/commands/coexistence_snapshot.rs": "05d971221ca67095e2467e9b6e1eee4cfdea99da7f3f0a0b57ec22194e319c85"
+    }
+  },
+  "snapshots": {
+    "busy": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "reason": "native API queries provide no process-custody cleanup receipt",
+        "status": "unknown"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "reason": "Windows sources do not establish joined ObjectFacts",
+        "status": "unknown"
+      },
+      "observation": {
+        "reason": "no new collection performed",
+        "status": "unknown"
+      },
+      "platform": "win32",
+      "schemaVersion": 2,
+      "sources": {
+        "adapters": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "snapshot worker busy"
+          },
+          "rows": {
+            "reason": "snapshot worker busy",
+            "status": "unknown"
+          }
+        },
+        "addresses": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "snapshot worker busy"
+          },
+          "rows": {
+            "reason": "snapshot worker busy",
+            "status": "unknown"
+          }
+        },
+        "ras": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "snapshot worker busy"
+          },
+          "rows": {
+            "reason": "snapshot worker busy",
+            "status": "unknown"
+          }
+        },
+        "routes4": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "snapshot worker busy"
+          },
+          "rows": {
+            "reason": "snapshot worker busy",
+            "status": "unknown"
+          }
+        },
+        "routes6": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "snapshot worker busy"
+          },
+          "rows": {
+            "reason": "snapshot worker busy",
+            "status": "unknown"
+          }
+        }
+      }
+    },
+    "empty": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "reason": "native API queries provide no process-custody cleanup receipt",
+        "status": "unknown"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "reason": "Windows sources do not establish joined ObjectFacts",
+        "status": "unknown"
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "win32",
+      "schemaVersion": 2,
+      "sources": {
+        "adapters": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": []
+          }
+        },
+        "addresses": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": []
+          }
+        },
+        "ras": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": []
+          }
+        },
+        "routes4": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": []
+          }
+        },
+        "routes6": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": []
+          }
+        }
+      }
+    },
+    "full": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "reason": "native API queries provide no process-custody cleanup receipt",
+        "status": "unknown"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "reason": "Windows sources do not establish joined ObjectFacts",
+        "status": "unknown"
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "win32",
+      "schemaVersion": 2,
+      "sources": {
+        "adapters": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "description": {
+                  "status": "known",
+                  "value": "Synthetic fixture adapter"
+                },
+                "ifType": {
+                  "status": "known",
+                  "value": 53
+                },
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "reason": "adapter index has no single family",
+                    "status": "unknown"
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "addresses": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "fe80::1234",
+                "family": "ipv6",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 42
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 64
+                },
+                "scopeId": {
+                  "status": "known",
+                  "value": 42
+                }
+              }
+            ]
+          }
+        },
+        "ras": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "allUsers": true,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "reason": "RAS entry name withheld for privacy",
+                  "status": "unknown"
+                }
+              },
+              {
+                "allUsers": false,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "status": "known",
+                  "value": "Fixture RAS"
+                }
+              }
+            ]
+          }
+        },
+        "routes4": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "interfaceMetric": {
+                  "reason": "interface metric not observed",
+                  "status": "unknown"
+                },
+                "nextHop": {
+                  "status": "known",
+                  "value": "10.77.2.1"
+                },
+                "nextHopScopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                },
+                "prefix": "0.0.0.0/1",
+                "routeMetric": {
+                  "status": "known",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        },
+        "routes6": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "family": "ipv6",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 42
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "interfaceMetric": {
+                  "reason": "interface metric not observed",
+                  "status": "unknown"
+                },
+                "nextHop": {
+                  "status": "known",
+                  "value": "fe80::1"
+                },
+                "nextHopScopeId": {
+                  "status": "known",
+                  "value": 42
+                },
+                "prefix": "::/1",
+                "routeMetric": {
+                  "status": "known",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "paged": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "reason": "native API queries provide no process-custody cleanup receipt",
+        "status": "unknown"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "reason": "Windows sources do not establish joined ObjectFacts",
+        "status": "unknown"
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "win32",
+      "schemaVersion": 2,
+      "sources": {
+        "adapters": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "description": {
+                  "status": "known",
+                  "value": "Synthetic fixture adapter"
+                },
+                "ifType": {
+                  "status": "known",
+                  "value": 53
+                },
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "reason": "adapter index has no single family",
+                    "status": "unknown"
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "addresses": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              }
+            ]
+          }
+        },
+        "ras": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "allUsers": true,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "reason": "RAS entry name withheld for privacy",
+                  "status": "unknown"
+                }
+              },
+              {
+                "allUsers": false,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "status": "known",
+                  "value": "Fixture RAS"
+                }
+              }
+            ]
+          }
+        },
+        "routes4": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "interfaceMetric": {
+                  "reason": "interface metric not observed",
+                  "status": "unknown"
+                },
+                "nextHop": {
+                  "status": "known",
+                  "value": "10.77.2.1"
+                },
+                "nextHopScopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                },
+                "prefix": "0.0.0.0/1",
+                "routeMetric": {
+                  "status": "known",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        },
+        "routes6": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "family": "ipv6",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 42
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "interfaceMetric": {
+                  "reason": "interface metric not observed",
+                  "status": "unknown"
+                },
+                "nextHop": {
+                  "status": "known",
+                  "value": "fe80::1"
+                },
+                "nextHopScopeId": {
+                  "status": "known",
+                  "value": 42
+                },
+                "prefix": "::/1",
+                "routeMetric": {
+                  "status": "known",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "partial": {
+      "classification": {
+        "reason": "session provenance not supplied; classification not performed",
+        "status": "unknown"
+      },
+      "commandCleanup": {
+        "reason": "native API queries provide no process-custody cleanup receipt",
+        "status": "unknown"
+      },
+      "context": {
+        "criteria": {
+          "reason": "immutable emitted conflict criteria not supplied",
+          "status": "unknown"
+        },
+        "observationPhase": {
+          "reason": "immutable observation phase not supplied",
+          "status": "unknown"
+        },
+        "ownInterfaces": {
+          "reason": "complete session TUN and own mesh attribution not supplied",
+          "status": "unknown"
+        },
+        "repairHistory": {
+          "reason": "verified repair history not supplied",
+          "status": "unknown"
+        }
+      },
+      "objects": {
+        "reason": "Windows sources do not establish joined ObjectFacts",
+        "status": "unknown"
+      },
+      "observation": {
+        "status": "known",
+        "value": {
+          "atomic": false,
+          "elapsedMillis": 0
+        }
+      },
+      "platform": "win32",
+      "schemaVersion": 2,
+      "sources": {
+        "adapters": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "description": {
+                  "status": "known",
+                  "value": "Synthetic fixture adapter"
+                },
+                "ifType": {
+                  "status": "known",
+                  "value": 53
+                },
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "reason": "adapter index has no single family",
+                    "status": "unknown"
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "addresses": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "address": "10.77.2.9",
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 24
+                },
+                "scopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                }
+              },
+              {
+                "address": "fe80::1234",
+                "family": "ipv6",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 42
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "prefixLen": {
+                  "status": "known",
+                  "value": 64
+                },
+                "scopeId": {
+                  "status": "known",
+                  "value": 42
+                }
+              }
+            ]
+          }
+        },
+        "ras": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "allUsers": true,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "reason": "RAS entry name withheld for privacy",
+                  "status": "unknown"
+                }
+              },
+              {
+                "allUsers": false,
+                "interface": {
+                  "reason": "RAS interface association not established",
+                  "status": "unknown"
+                },
+                "name": {
+                  "status": "known",
+                  "value": "Fixture RAS"
+                }
+              }
+            ]
+          }
+        },
+        "routes4": {
+          "compartment": {
+            "reason": "fixture query compartment not established",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "fixture native scope not established",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": null
+          },
+          "rows": {
+            "status": "known",
+            "value": [
+              {
+                "family": "ipv4",
+                "interface": {
+                  "alias": {
+                    "status": "known",
+                    "value": "Fixture interface"
+                  },
+                  "ifIndex": {
+                    "status": "known",
+                    "value": 17
+                  },
+                  "luid": {
+                    "status": "known",
+                    "value": "18446744073709551615"
+                  }
+                },
+                "interfaceMetric": {
+                  "reason": "interface metric not observed",
+                  "status": "unknown"
+                },
+                "nextHop": {
+                  "status": "known",
+                  "value": "10.77.2.1"
+                },
+                "nextHopScopeId": {
+                  "reason": "IPv4 has no IPv6 scope id",
+                  "status": "unknown"
+                },
+                "prefix": "0.0.0.0/1",
+                "routeMetric": {
+                  "status": "known",
+                  "value": 0
+                }
+              }
+            ]
+          }
+        },
+        "routes6": {
+          "compartment": {
+            "reason": "source compartment unavailable",
+            "status": "unknown"
+          },
+          "complete": {
+            "reason": "source completeness unavailable",
+            "status": "unknown"
+          },
+          "error": {
+            "status": "known",
+            "value": "Windows GetIpForwardTable2 failed (code 5)"
+          },
+          "rows": {
+            "reason": "Windows GetIpForwardTable2 failed (code 5)",
+            "status": "unknown"
+          }
+        }
+      }
+    }
+  }
+}

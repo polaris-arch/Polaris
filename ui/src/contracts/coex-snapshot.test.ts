@@ -183,7 +183,7 @@ describe('COEX v1 strict observation boundary', () => {
     }
     const platforms = [...body('platform_tag').matchAll(/Platform::\w+ => "([^"]+)"/g)].map((m) => m[1]);
     expect(platforms.sort()).toEqual(['linux', 'darwin', 'win32', 'android', 'ios', 'other'].sort());
-    expect(body('collect_request')).toContain('if !matches!(platform, Platform::Linux | Platform::Mac) {');
+    expect(body('collect_request')).toContain('if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {');
     expect(body('collect_request')).toContain('production COEX snapshot collector unavailable on this platform');
   });
 });

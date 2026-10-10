@@ -53,6 +53,7 @@ pub mod route_ops;
 pub mod route_probe;
 #[cfg(test)]
 mod test_support;
+pub mod windows_coex;
 #[cfg(any(windows, test))]
 pub mod windows_dns;
 #[cfg(windows)]

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import { CoexSnapshotDecodeError, type CoexSnapshot, type Fact } from '@/contracts/coex-snapshot';
 import { SetBlock } from './Primitives';
+import { CoexWindowsSources } from './CoexWindowsSources';
 
 type Text = (key: string) => string;
 type Pages = { addresses: number; routes: number; policyRules: number };
@@ -19,6 +20,7 @@ export function renderCoexFacts(
   select: (index: number | null) => void = () => {},
   paginate: (field: keyof Pages, page: number) => void = () => {},
 ): ReactNode {
+  if (snapshot.schemaVersion === 2) return <CoexWindowsSources snapshot={snapshot} t={t} />;
   const fact = <T,>(label: string, value: Fact<T>, show: (known: T) => ReactNode) => (
     <div className="card-sub">
       <b>{label}: </b>
@@ -133,7 +135,7 @@ export function CoexSnapshotBlock() {
     <SetBlock header={t('settings.coex.title')}>
       <div className="card-sub">{t('settings.coex.hint')}</div>
       <button type="button" className="btn ghost sm" onClick={() => { void collect(); }} disabled={loading}>
-        {loading ? t('settings.coex.loading') : error ? t('settings.coex.retry') : t('settings.coex.collect')}
+        {loading ? t('settings.coex.loading') : error || snapshot?.schemaVersion === 2 ? t('settings.coex.retry') : t('settings.coex.collect')}
       </button>
       <div className="card-sub" role="status" aria-live="polite">
         {loading ? t('settings.coex.pending') : !snapshot && !error ? t('settings.coex.notCollected') : null}

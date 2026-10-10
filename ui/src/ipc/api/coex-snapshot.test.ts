@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { CoexSnapshotDecodeError } from '@/contracts/coex-snapshot';
 import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
+import windowsFixture from '@/contracts/coex-windows.rust.fixture.json';
 const transport = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: transport }));
 const { systemApi } = await import('./system');
@@ -14,6 +15,12 @@ const snapshot = {
 describe('actual system wrapper through IPC envelope decoder', () => {
   beforeEach(() => { transport.mockReset(); vi.stubGlobal('window', { __TAURI_INTERNALS__: {} }); });
   afterEach(() => vi.unstubAllGlobals());
+  it.each(Object.entries(windowsFixture.snapshots))('roundtrips actual Windows %s on the same manual IPC command', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(wire);
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
+  });
   it('invokes the registered no-argument command once and unwraps once', async () => {
     transport.mockResolvedValue({ success: true, data: snapshot });
     expect(await systemApi.coexReadonlySnapshot()).toEqual(snapshot);

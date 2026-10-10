@@ -19,6 +19,7 @@ fn source<T>(rows: Vec<T>) -> Fact<ReadRows<T>> {
         rows,
         complete: Fact::Known(true),
         compartment: Fact::Known(1),
+        error: Fact::Known(None),
     })
 }
 fn empty() -> WindowsFactInput {
@@ -43,6 +44,7 @@ fn address(family: AddressFamily, ip: &str, prefix: u8) -> WindowsAddressObserva
         family,
         address: ip.parse().unwrap(),
         prefix_len: Fact::Known(prefix),
+        scope_id: unknown(),
     }
 }
 fn route(family: AddressFamily, prefix: &str) -> WindowsRouteObservation {
@@ -51,6 +53,7 @@ fn route(family: AddressFamily, prefix: &str) -> WindowsRouteObservation {
         family,
         prefix: prefix.into(),
         next_hop: unknown(),
+        next_hop_scope_id: unknown(),
         route_metric: unknown(),
         interface_metric: unknown(),
     }
@@ -171,7 +174,7 @@ fn iftype_names_and_ras_do_not_become_identity_or_tunnel_facts() {
         adapter("vEthernet (Default Switch)", 3, 6),
     ]);
     input.ras = source(vec![WindowsRasObservation {
-        name: "PolarisProbeL2TP".into(),
+        name: Fact::Known("PolarisProbeL2TP".into()),
         all_users: true,
         interface: unknown(),
     }]);
@@ -180,13 +183,13 @@ fn iftype_names_and_ras_do_not_become_identity_or_tunnel_facts() {
     assert_eq!(a.len(), 3);
     assert_eq!(a[2].if_type, Fact::Known(6));
     let r = rows(&result.ras);
-    assert_eq!(r.rows[0].name, "PolarisProbeL2TP");
+    assert_eq!(r.rows[0].name, Fact::Known("PolarisProbeL2TP".into()));
     assert!(r.rows[0].all_users);
     assert!(matches!(r.rows[0].interface, Fact::Unknown(_)));
     assert!(matches!(r.complete, Fact::Unknown(_)));
     let mut input = empty();
     input.ras = source(vec![WindowsRasObservation {
-        name: "RAS-only".into(),
+        name: Fact::Known("RAS-only".into()),
         all_users: false,
         interface: Fact::Known(reference("RAS-only", 9, 35)),
     }]);
@@ -199,7 +202,7 @@ fn name_only_ras_reference_is_unknown_not_an_alias_join() {
     let mut input = empty();
     input.adapters = source(vec![adapter("VPN", 1, 131)]);
     input.ras = source(vec![WindowsRasObservation {
-        name: "VPN".into(),
+        name: Fact::Known("VPN".into()),
         all_users: false,
         interface: Fact::Known(WindowsInterfaceRef {
             alias: Fact::Known("VPN".into()),
@@ -209,7 +212,7 @@ fn name_only_ras_reference_is_unknown_not_an_alias_join() {
     }]);
     let result = validate_windows_input(input);
     let s = rows(&result.ras);
-    assert_eq!(s.rows[0].name, "VPN");
+    assert_eq!(s.rows[0].name, Fact::Known("VPN".into()));
     assert!(matches!(s.rows[0].interface, Fact::Unknown(_)));
     assert!(matches!(s.complete, Fact::Unknown(_)));
 }
@@ -337,7 +340,7 @@ fn interface_and_ras_row_limits_are_inclusive_then_fail_whole_source() {
         input.ras = source(
             (0..count)
                 .map(|i| WindowsRasObservation {
-                    name: format!("RAS{i}"),
+                    name: Fact::Known(format!("RAS{i}")),
                     all_users: false,
                     interface: unknown(),
                 })
@@ -450,7 +453,7 @@ fn byte_cap_counts_utf8_unknown_diagnostics_and_all_five_sources() {
     r.interface.alias = Fact::Known(big.clone());
     input.routes6 = source(vec![r]);
     input.ras = source(vec![WindowsRasObservation {
-        name: big,
+        name: Fact::Known(big),
         all_users: false,
         interface: unknown(),
     }]);
@@ -556,12 +559,14 @@ fn seven_existing_captures_inject_only_legacy_observations_never_complete_new_fa
                         family,
                         prefix: r.prefix,
                         next_hop: unknown(),
+                        next_hop_scope_id: unknown(),
                         route_metric: unknown(),
                         interface_metric: unknown(),
                     })
                     .collect(),
                 complete: unknown(),
                 compartment: unknown(),
+                error: Fact::Known(None),
             });
             if family == AddressFamily::V4 {
                 input.routes4 = source;
@@ -584,5 +589,20 @@ fn seven_existing_captures_inject_only_legacy_observations_never_complete_new_fa
         }
         assert!(matches!(result.addresses, Fact::Unknown(_)));
         assert!(matches!(result.ras, Fact::Unknown(_)));
+    }
+}
+
+#[test]
+fn source_error_never_proves_complete_or_authoritative_empty() {
+    for error in [Fact::Known(Some("permission denied".into())), unknown()] {
+        let mut input = empty();
+        let Fact::Known(ref mut source) = input.routes4 else {
+            panic!()
+        };
+        source.error = error;
+        let result = validate_windows_input(input);
+        let source = rows(&result.routes4);
+        assert!(matches!(source.complete, Fact::Unknown(_)));
+        assert!(matches!(source.proven_empty(), Fact::Unknown(_)));
     }
 }

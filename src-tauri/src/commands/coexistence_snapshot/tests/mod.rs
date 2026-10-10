@@ -207,13 +207,8 @@ async fn unknown_route_source_keeps_independent_address_evidence() {
 }
 
 #[tokio::test]
-async fn unsupported_platforms_and_denied_windows_have_zero_source_calls() {
-    for platform in [
-        Platform::Win,
-        Platform::Other,
-        Platform::Android,
-        Platform::Ios,
-    ] {
+async fn unsupported_platforms_and_denied_window_labels_have_zero_source_calls() {
+    for platform in [Platform::Other, Platform::Android, Platform::Ios] {
         let source = FixtureSource::empty();
         let calls = Arc::clone(&source.calls);
         let response = request_for_window(Arc::default(), platform, source, "main").await;
@@ -679,4 +674,198 @@ async fn macos_route_failures_keep_actual_addresses_unknown_roster_never_becomes
             .success
     );
     assert!(calls.lock().unwrap().is_empty());
+}
+
+// Native-source fixture seam: no host API, child process or device acceptance.
+struct WindowsFixtureSource {
+    entered: Option<std::sync::mpsc::SyncSender<()>>,
+    release: Option<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    panic_query: bool,
+}
+impl ObservationSource for WindowsFixtureSource {
+    fn start(&self, _: &Command, _: Duration) -> StartedCommand {
+        panic!("Windows must not spawn a child")
+    }
+    fn windows_facts(&self) -> WindowsFactInput {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = &self.entered {
+            entered.send(()).unwrap();
+        }
+        if self.panic_query {
+            panic!("injected native-query panic");
+        }
+        if let Some(release) = &self.release {
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }
+        let mut input = windows_unavailable("injected source unavailable");
+        input.ras = Fact::Known(ReadRows {
+            rows: vec![WindowsRasObservation {
+                name: Fact::Known(".12025550123".into()),
+                all_users: true,
+                interface: Fact::Unknown("unassociated".into()),
+            }],
+            complete: Fact::Known(true),
+            compartment: Fact::Unknown("not established".into()),
+            error: Fact::Known(None),
+        });
+        input
+    }
+}
+fn windows_fixture(calls: Arc<std::sync::atomic::AtomicUsize>) -> WindowsFixtureSource {
+    WindowsFixtureSource {
+        entered: None,
+        release: None,
+        calls,
+        panic_query: false,
+    }
+}
+#[tokio::test]
+async fn windows_main_entry_preserves_five_sources_masks_ras_and_never_claims_process_cleanup() {
+    let calls = Arc::default();
+    let value = request_for_window(
+        Arc::default(),
+        Platform::Win,
+        windows_fixture(calls),
+        "main",
+    )
+    .await
+    .data
+    .unwrap();
+    assert_eq!(value["schemaVersion"], 2);
+    assert_eq!(value["platform"], "win32");
+    assert_eq!(value["sources"].as_object().unwrap().len(), 5);
+    assert_eq!(
+        value["sources"]["ras"]["rows"]["value"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        value["sources"]["ras"]["rows"]["value"][0]["name"]["status"],
+        "unknown"
+    );
+    assert_eq!(value["sources"]["ras"]["complete"]["status"], "unknown");
+    assert_eq!(value["commandCleanup"]["status"], "unknown");
+    assert_eq!(value["objects"]["status"], "unknown");
+    assert!(!value.to_string().contains("12025550123"));
+    assert_context_unknown(&value);
+}
+#[tokio::test]
+async fn windows_tray_denied_before_any_native_query() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let result = request_for_window(
+        Arc::default(),
+        Platform::Win,
+        windows_fixture(calls.clone()),
+        "tray",
+    )
+    .await;
+    assert!(!result.success);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn windows_cancelled_waiter_retains_single_flight_until_original_native_worker_returns() {
+    let service = Arc::new(SnapshotService::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (entered, observed) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let source = WindowsFixtureSource {
+        entered: Some(entered),
+        release: Some(std::sync::Mutex::new(wait)),
+        calls: calls.clone(),
+        panic_query: false,
+    };
+    let task = tokio::spawn(collect_request(service.clone(), Platform::Win, source));
+    tokio::task::spawn_blocking(move || observed.recv_timeout(Duration::from_secs(2)).unwrap())
+        .await
+        .unwrap();
+    task.abort();
+    let blocked = collect_request(
+        service.clone(),
+        Platform::Win,
+        windows_fixture(calls.clone()),
+    )
+    .await
+    .data
+    .unwrap();
+    assert!(blocked["sources"]["adapters"]["error"]["value"]
+        .as_str()
+        .unwrap()
+        .contains("busy"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    release.send(()).unwrap();
+    for _ in 0..100 {
+        if !service.lock_worker().busy {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(!service.lock_worker().busy);
+    let next = collect_request(service, Platform::Win, windows_fixture(calls.clone()))
+        .await
+        .data
+        .unwrap();
+    assert_eq!(next["schemaVersion"], 2);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+#[tokio::test]
+async fn windows_native_panic_quarantines_admission_instead_of_releasing_unknown_work() {
+    let service = Arc::new(SnapshotService::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut source = windows_fixture(calls.clone());
+    source.panic_query = true;
+    let first = collect_request(service.clone(), Platform::Win, source)
+        .await
+        .data
+        .unwrap();
+    assert_eq!(first["objects"]["status"], "unknown");
+    assert!(service.lock_worker().quarantine.is_some());
+    let next = collect_request(service, Platform::Win, windows_fixture(calls.clone()))
+        .await
+        .data
+        .unwrap();
+    assert_eq!(next["sources"]["ras"]["rows"]["status"], "unknown");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retained_process_owner_blocks_windows_native_queries_until_observed_closed() {
+    let service = Arc::new(SnapshotService::default());
+    let retained = RetainedSource::new();
+    let closed = Arc::clone(&retained.closed);
+    let drops = Arc::clone(&retained.drops);
+    let _ = collect_request(service.clone(), Platform::Linux, retained).await;
+    let native_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let blocked = collect_request(
+        service.clone(),
+        Platform::Win,
+        windows_fixture(native_calls.clone()),
+    )
+    .await
+    .data
+    .unwrap();
+    assert_eq!(blocked["sources"]["adapters"]["rows"]["status"], "unknown");
+    assert_eq!(blocked["commandCleanup"]["status"], "unknown");
+    assert_eq!(native_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    closed.store(true, Ordering::SeqCst);
+    let completed = collect_request(
+        service,
+        Platform::Win,
+        windows_fixture(native_calls.clone()),
+    )
+    .await
+    .data
+    .unwrap();
+    assert_eq!(completed["sources"]["ras"]["rows"]["status"], "known");
+    assert_eq!(completed["commandCleanup"]["status"], "unknown");
+    assert_eq!(native_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }

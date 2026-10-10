@@ -231,3 +231,102 @@ for (const name of ['macosCollector', 'macosPartialSources', 'macosUnknownScope'
     await page.screenshot({ path: testInfo.outputPath(`coex-${name}.png`) });
   });
 }
+
+const windowsReply = (page: Page, name: 'full' | 'partial' | 'empty' | 'paged' | 'busy') => page.evaluate((name) => {
+  const c = window.__coexHarness!; c.reply({ success: true, data: c.serializedWindowsFixture(name) });
+}, name);
+const source = (page: Page, id: string) => card(page).locator(`[data-coex-source="${id}"]`);
+const expandSource = async (page: Page, id: string) => { await source(page, id).locator(':scope > summary').click(); };
+test('Windows actual Rust wire: five sources, lossless LUID, dual family indices, scope and masked unassociated RAS', async ({ page }, testInfo) => {
+  const button = card(page).getByRole('button', { name: en.settings.coex.collect, exact: true });
+  await button.evaluate((element: HTMLButtonElement) => { element.click(); element.click(); element.click(); });
+  await expect.poll(() => calls(page)).toHaveLength(1);
+  await windowsReply(page, 'full');
+  await expect(card(page).locator('[data-coex-windows]')).toBeVisible();
+  await expect(card(page).locator('[data-coex-source]')).toHaveCount(5);
+  for (const id of ['adapters', 'addresses', 'routes4', 'routes6', 'ras']) await expandSource(page, id);
+  await expect(source(page, 'adapters')).toContainText('18446744073709551615');
+  await expect(source(page, 'addresses')).toContainText('fe80::1234');
+  await expect(source(page, 'addresses')).toContainText(`${en.settings.coex.index}: 17`);
+  await expect(source(page, 'addresses')).toContainText(`${en.settings.coex.index}: 42`);
+  await expect(source(page, 'addresses')).toContainText(`${en.settings.coex.scopeId}: 42`);
+  await expect(source(page, 'routes6')).toContainText(`${en.settings.coex.nextHopScopeId}: 42`);
+  await expect(source(page, 'ras').locator('li')).toHaveCount(2);
+  await expect(source(page, 'ras')).toContainText('Fixture RAS');
+  await expect(source(page, 'ras')).toContainText(en.settings.coex.unknown);
+  await expect(card(page)).not.toContainText('12025550123');
+  await expect(card(page)).not.toContainText(en.settings.coex.sourceUnavailable);
+  await expect(card(page).locator('.good, .safe, .success')).toHaveCount(0);
+  await card(page).screenshot({ path: testInfo.outputPath('windows-five-sources.png') });
+  await card(page).getByRole('button', { name: en.settings.coex.retry, exact: true }).click();
+  await expect(card(page).locator('[data-coex-windows]')).toHaveCount(0);
+  await windowsReply(page, 'full'); expect(await calls(page)).toHaveLength(2);
+});
+test('Windows IPv6 permission failure keeps independent sources and allows manual retry', async ({ page }) => {
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click(); await windowsReply(page, 'partial');
+  await expandSource(page, 'addresses'); await expandSource(page, 'routes6');
+  await expect(source(page, 'addresses')).toContainText('10.77.2.9');
+  await expect(source(page, 'routes6')).toContainText('Windows GetIpForwardTable2 failed (code 5)');
+  await expect(source(page, 'routes6')).toContainText(en.settings.coex.unknown);
+  await expect(source(page, 'routes6')).not.toContainText(en.settings.coex.observedEmpty);
+  await card(page).getByRole('button', { name: en.settings.coex.retry, exact: true }).click(); await windowsReply(page, 'full');
+  await expect(card(page)).not.toContainText('failed (code 5)');
+});
+test('Windows known empty and busy are separate source facts', async ({ page }) => {
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click(); await windowsReply(page, 'empty');
+  await expandSource(page, 'adapters');
+  await expect(source(page, 'adapters')).toContainText(en.settings.coex.observedEmpty);
+  await expect(source(page, 'adapters')).toContainText(en.settings.coex.unknown);
+  await card(page).getByRole('button', { name: en.settings.coex.retry, exact: true }).click(); await windowsReply(page, 'busy');
+  await expandSource(page, 'adapters'); await expect(source(page, 'adapters')).toContainText('snapshot worker busy');
+  await expect(source(page, 'adapters')).not.toContainText(en.settings.coex.observedEmpty);
+});
+test('Windows source row pagination retains all 41 rows with explicit pages', async ({ page }) => {
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click(); await windowsReply(page, 'paged');
+  await expandSource(page, 'addresses'); const panel = source(page, 'addresses');
+  await expect(panel.locator('li')).toHaveCount(20); await expect(panel).toContainText('1–20 / 41');
+  await panel.getByRole('button', { name: en.settings.coex.next, exact: true }).click();
+  await expect(panel).toContainText('21–40 / 41'); await expect(panel.locator('li')).toHaveCount(20);
+  await panel.getByRole('button', { name: en.settings.coex.next, exact: true }).click();
+  await expect(panel).toContainText('41–41 / 41'); await expect(panel.locator('li')).toHaveCount(1);
+  await expect(panel.getByRole('button', { name: en.settings.coex.next, exact: true })).toBeDisabled();
+  await panel.getByRole('button', { name: en.settings.coex.previous, exact: true }).click(); await expect(panel).toContainText('21–40 / 41');
+});
+test('Windows unsafe wire rejection is private and retryable on the actual wrapper', async ({ page }) => {
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click();
+  await page.evaluate(() => {
+    const c = window.__coexHarness!; const wire = c.serializedWindowsFixture('full') as typeof import('../src/contracts/coex-windows.rust.fixture.json').snapshots.full;
+    Object.assign(wire.sources.ras.rows.value[0].name, { status: 'known', value: '.12025550123' });
+    delete (wire.sources.ras.rows.value[0].name as {reason?: string}).reason;
+    c.reply({ success: true, data: wire });
+  });
+  await expect(card(page).getByRole('alert')).toContainText(en.settings.coex.malformed);
+  await expect(card(page)).not.toContainText('12025550123'); await expect(card(page).locator('[data-coex-windows]')).toHaveCount(0);
+  await card(page).getByRole('button', { name: en.settings.coex.retry, exact: true }).click(); await windowsReply(page, 'full');
+  await expect(card(page).locator('[data-coex-windows]')).toBeVisible();
+});
+test('Windows delayed reply after leaving does not replace a new manual report', async ({ page }) => {
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click();
+  await page.getByRole('button', { name: en.settings.nav.general, exact: true }).click(); await openTun(page);
+  await windowsReply(page, 'full'); await expect(card(page).locator('[data-coex-windows]')).toHaveCount(0);
+  await card(page).getByRole('button', { name: en.settings.coex.collect, exact: true }).click(); await windowsReply(page, 'partial');
+  await expandSource(page, 'routes6'); await expect(source(page, 'routes6')).toContainText('failed (code 5)');
+  expect(await calls(page)).toHaveLength(2);
+});
+
+for (const [language, locale] of Object.entries({ 'en-US': en, 'zh-CN': zhCN, 'zh-TW': zhTW, ru, fa })) {
+  test(`Windows five-source labels and retry remain usable in ${language}`, async ({ page }) => {
+    if (language === 'fa') await page.setViewportSize({ width: 390, height: 844 });
+    await page.evaluate((language) => window.__coexHarness!.setLanguage(language), language);
+    await card(page).getByRole('button', { name: locale.settings.coex.collect, exact: true }).click(); await windowsReply(page, 'full');
+    for (const id of ['adapters', 'addresses', 'routes4', 'routes6', 'ras']) await expandSource(page, id);
+    await expect(source(page, 'ras')).toContainText(locale.settings.coex.rasName);
+    await expect(source(page, 'ras')).toContainText(locale.settings.coex.association);
+    await expect(source(page, 'addresses')).toContainText(locale.settings.coex.scopeId);
+    await expect(source(page, 'adapters')).toContainText('18446744073709551615');
+    await expect(card(page)).not.toContainText('12025550123');
+    const retry = card(page).getByRole('button', { name: locale.settings.coex.retry, exact: true });
+    await expect(retry).toBeEnabled(); await retry.click(); await windowsReply(page, 'empty');
+    await expect(card(page).locator('[data-coex-source]')).toHaveCount(5);
+  });
+}

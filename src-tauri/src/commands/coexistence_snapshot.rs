@@ -18,6 +18,7 @@ use polaris_system_integration::exec::{
 use serde_json::{json, Value};
 
 use crate::response::ApiResponse;
+use polaris_system_integration::coexistence::windows::*;
 
 // This is a cleanup observation allowance, not a snapshot deadline.
 const CLEANUP_OBSERVATION: Duration = Duration::from_millis(25);
@@ -46,11 +47,17 @@ enum StartedCommand {
 
 trait ObservationSource: Send + 'static {
     fn start(&self, command: &Command, timeout: Duration) -> StartedCommand;
+    fn windows_facts(&self) -> WindowsFactInput {
+        windows_unavailable("Windows source not supplied")
+    }
 }
 
 struct NativeSource;
 
 impl ObservationSource for NativeSource {
+    fn windows_facts(&self) -> WindowsFactInput {
+        collect_windows(&polaris_system_integration::windows_coex::NativeWindowsSource)
+    }
     fn start(&self, command: &Command, timeout: Duration) -> StartedCommand {
         let observed = StdCommandRunner.run_observed(command, timeout);
         // An original PendingCommand is transferred intact, not reconstructed from
@@ -309,7 +316,85 @@ fn snapshot_wire(
     })
 }
 
+fn windows_unavailable(reason: &str) -> WindowsFactInput {
+    WindowsFactInput {
+        adapters: Fact::Unknown(reason.into()),
+        addresses: Fact::Unknown(reason.into()),
+        routes4: Fact::Unknown(reason.into()),
+        routes6: Fact::Unknown(reason.into()),
+        ras: Fact::Unknown(reason.into()),
+    }
+}
+
+fn windows_ref_wire(reference: &WindowsInterfaceRef) -> Value {
+    json!({
+        "alias": fact_wire(&reference.alias, |v| json!(v)),
+        "luid": fact_wire(&reference.luid, |v| json!(v.to_string())),
+        "ifIndex": fact_wire(&reference.if_index, |v| json!(v)),
+    })
+}
+
+fn windows_source_wire<T>(source: &Fact<ReadRows<T>>, row: impl Fn(&T) -> Value) -> Value {
+    match source {
+        Fact::Known(source) => json!({
+            "rows": {"status":"known", "value":source.rows.iter().map(row).collect::<Vec<_>>()},
+            "complete": fact_wire(&source.complete, |v| json!(v)),
+            "compartment": fact_wire(&source.compartment, |v| json!(v)),
+            "error": fact_wire(&source.error, |v| json!(v)),
+        }),
+        Fact::Unknown(reason) => json!({
+            "rows":unknown_wire(reason),"complete":unknown_wire("source completeness unavailable"),
+            "compartment":unknown_wire("source compartment unavailable"),
+            "error":{"status":"known","value":reason},
+        }),
+    }
+}
+
+fn windows_snapshot_wire(input: &WindowsFactInput, observation: Value) -> Value {
+    let route = |row: &WindowsRouteObservation| {
+        json!({
+            "interface":windows_ref_wire(&row.interface),
+            "family":if row.family == AddressFamily::V4 {"ipv4"} else {"ipv6"},
+            "prefix":row.prefix,"nextHop":fact_wire(&row.next_hop, |v| json!(v.to_string())),
+            "nextHopScopeId":fact_wire(&row.next_hop_scope_id, |v|json!(v)),
+        "routeMetric":fact_wire(&row.route_metric, |v|json!(v)),
+            "interfaceMetric":fact_wire(&row.interface_metric, |v|json!(v)),
+        })
+    };
+    let mut value = snapshot_wire(
+        Platform::Win,
+        Fact::Unknown("Windows sources do not establish joined ObjectFacts".into()),
+        observation,
+        Fact::Unknown("native API queries provide no process-custody cleanup receipt".into()),
+    );
+    value["schemaVersion"] = json!(2);
+    value["sources"] = json!({
+        "adapters":windows_source_wire(&input.adapters, |row|json!({
+            "interface":windows_ref_wire(&row.interface),"ifType":fact_wire(&row.if_type, |v|json!(v)),
+            "description":fact_wire(&row.description, |v|json!(v)),
+        })),
+        "addresses":windows_source_wire(&input.addresses, |row|json!({
+            "interface":windows_ref_wire(&row.interface),"family":if row.family == AddressFamily::V4 {"ipv4"} else {"ipv6"},
+            "address":row.address.to_string(),"prefixLen":fact_wire(&row.prefix_len, |v|json!(v)),
+            "scopeId":fact_wire(&row.scope_id, |v|json!(v)),
+        })),
+        "routes4":windows_source_wire(&input.routes4, route),
+        "routes6":windows_source_wire(&input.routes6, route),
+        "ras":windows_source_wire(&input.ras, |row|json!({
+            "name":fact_wire(&row.name, |v|json!(v)),"allUsers":row.all_users,
+            "interface":fact_wire(&row.interface, windows_ref_wire),
+        })),
+    });
+    value
+}
+
 fn unavailable_wire(platform: Platform, reason: String) -> Value {
+    if platform == Platform::Win {
+        return windows_snapshot_wire(
+            &windows_unavailable(&reason),
+            unknown_wire("no new collection performed"),
+        );
+    }
     snapshot_wire(
         platform,
         Fact::Unknown(reason.clone()),
@@ -324,6 +409,20 @@ fn collect_blocking<S: ObservationSource>(
     source: S,
 ) -> Value {
     let started = Instant::now();
+    if platform == Platform::Win {
+        let input = match admission.service.observe_retained() {
+            Ok(()) => validate_windows_input(source.windows_facts()),
+            Err(reason) => windows_unavailable(&reason),
+        };
+        // Every native query AND the projection retain the original admission.
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let result = windows_snapshot_wire(
+            &input,
+            json!({"status":"known","value":{"elapsedMillis":elapsed,"atomic":false}}),
+        );
+        admission.finish();
+        return result;
+    }
     let objects = match admission.service.observe_retained() {
         Ok(()) => {
             let runner = SnapshotRunner {
@@ -357,7 +456,7 @@ async fn collect_request<S: ObservationSource>(
     platform: Platform,
     source: S,
 ) -> ApiResponse<Value> {
-    if !matches!(platform, Platform::Linux | Platform::Mac) {
+    if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {
         return ApiResponse::ok(unavailable_wire(
             platform,
             "production COEX snapshot collector unavailable on this platform".into(),

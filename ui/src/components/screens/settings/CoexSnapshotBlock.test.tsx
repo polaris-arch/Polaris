@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import en from '@/i18n/locales/en-US.json';
 import { decodeCoexSnapshot, type CoexSnapshot } from '@/contracts/coex-snapshot';
 import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
+import windowsFixture from '@/contracts/coex-windows.rust.fixture.json';
 const t = (key: string) => {
   let value: unknown = en;
   for (const part of key.split('.')) value = (value as Record<string, unknown>)[part];
@@ -25,6 +26,11 @@ const fixture = (): CoexSnapshot => ({
 });
 const render = (snapshot: CoexSnapshot, expanded: number | null = 0) => renderToStaticMarkup(<>{renderCoexFacts(snapshot, t, expanded)}</>);
 describe('COEX fact projection on the actual settings surface', () => {
+  it('dispatches actual v2 Windows sources through the existing card projection', () => {
+    const html = render(decodeCoexSnapshot(windowsFixture.snapshots.full));
+    expect(html).toContain('data-coex-windows'); expect(html).toContain('data-coex-source="ras"');
+    expect(html).not.toContain(en.settings.coex.sourceUnavailable);
+  });
   it('does not invoke on initial render and starts explicitly uncollected', () => {
     expect(renderToStaticMarkup(<CoexSnapshotBlock />)).toContain(en.settings.coex.notCollected);
     expect(collect).not.toHaveBeenCalled();

@@ -1,6 +1,7 @@
 //! Pure validation of injected Windows observations, separate from legacy netinfo.
 //!
-//! No helper/provider/OS calls, ObjectFacts assembly, classifier, joins or selected
+//! A safe provider seam supplies independent reads; no ObjectFacts assembly,
+//! classifier, joins or selected
 //! egress are supplied. Metadata references are not proof of association or persistent
 //! identity. Completeness and compartment are explicit per source; legacy Ok(Vec)
 //! results with skipped rows cannot become complete snapshots here. Consumers must
@@ -20,6 +21,8 @@ pub struct ReadRows<T> {
     pub complete: Fact<bool>,
     /// Read namespace, never defaulted to the current or default compartment.
     pub compartment: Fact<u32>,
+    /// Source-local read error; no credentials or raw RAS entry names.
+    pub error: Fact<Option<String>>,
 }
 impl<T> ReadRows<T> {
     /// Authoritative emptiness of THIS source in its scope, not absence of VPNs or
@@ -28,8 +31,10 @@ impl<T> ReadRows<T> {
         if !self.rows.is_empty() {
             return Fact::Known(false);
         }
-        match (&self.complete, &self.compartment) {
-            (Fact::Known(true), Fact::Known(id)) if *id != 0 => Fact::Known(true),
+        match (&self.complete, &self.compartment, &self.error) {
+            (Fact::Known(true), Fact::Known(id), Fact::Known(None)) if *id != 0 => {
+                Fact::Known(true)
+            }
             _ => Fact::Unknown("source emptiness lacks complete scoped evidence".into()),
         }
     }
@@ -57,6 +62,8 @@ pub struct WindowsAddressObservation {
     /// Actual host address is not normalized to its network prefix.
     pub address: IpAddr,
     pub prefix_len: Fact<u8>,
+    /// IPv6 zone/scope id, separate from the 128 address bits.
+    pub scope_id: Fact<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsRouteObservation {
@@ -64,12 +71,14 @@ pub struct WindowsRouteObservation {
     pub family: AddressFamily,
     pub prefix: String,
     pub next_hop: Fact<IpAddr>,
+    /// Scope of the next-hop address, never a route/compartment scope proof.
+    pub next_hop_scope_id: Fact<u32>,
     pub route_metric: Fact<u32>,
     pub interface_metric: Fact<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsRasObservation {
-    pub name: String,
+    pub name: Fact<String>,
     pub all_users: bool,
     /// A reported association needs a snapshot key; name equality is not evidence.
     pub interface: Fact<WindowsInterfaceRef>,
@@ -81,6 +90,43 @@ pub struct WindowsFactInput {
     pub routes4: Fact<ReadRows<WindowsRouteObservation>>,
     pub routes6: Fact<ReadRows<WindowsRouteObservation>>,
     pub ras: Fact<ReadRows<WindowsRasObservation>>,
+}
+
+/// Fixed source seam; OS reads belong to a blocking worker, never the IPC waiter.
+pub trait WindowsFactSource: Send + Sync {
+    fn adapters_and_addresses(
+        &self,
+    ) -> (
+        Fact<ReadRows<WindowsAdapterObservation>>,
+        Fact<ReadRows<WindowsAddressObservation>>,
+    );
+    fn routes(&self, family: AddressFamily) -> Fact<ReadRows<WindowsRouteObservation>>;
+    fn ras(&self) -> Fact<ReadRows<WindowsRasObservation>>;
+}
+
+/// Four sequential reads, five independent sources. No joins or classification.
+pub fn collect_windows(source: &impl WindowsFactSource) -> WindowsFactInput {
+    let (adapters, addresses) = source.adapters_and_addresses();
+    let routes4 = source.routes(AddressFamily::V4);
+    let routes6 = source.routes(AddressFamily::V6);
+    let ras = source.ras();
+    validate_windows_input(WindowsFactInput {
+        adapters,
+        addresses,
+        routes4,
+        routes6,
+        ras,
+    })
+}
+
+/// RAS may report a dot followed by a telephone number. Retain the row but
+/// discard that string before it can enter a DTO, debug output or error message.
+pub fn private_ras_name(raw: &str) -> Fact<String> {
+    if raw.trim_start().starts_with('.') {
+        Fact::Unknown("RAS entry name withheld for privacy".into())
+    } else {
+        Fact::Known(raw.to_string())
+    }
 }
 
 /// Validate each source independently. Limits apply AFTER provider allocation and
@@ -236,10 +282,15 @@ impl Observation for WindowsAddressObservation {
         Some(self.family)
     }
     fn bytes(&self) -> usize {
-        ref_bytes(&self.interface).saturating_add(fact_bytes(&self.prefix_len, |_| 0))
+        ref_bytes(&self.interface)
+            .saturating_add(fact_bytes(&self.prefix_len, |_| 0))
+            .saturating_add(fact_bytes(&self.scope_id, |_| 0))
     }
     fn normalize(&mut self) -> Result<(), String> {
         clean_ref(&mut self.interface);
+        if self.family == AddressFamily::V4 {
+            self.scope_id = Fact::Unknown("IPv4 has no IPv6 scope id".into());
+        }
         if !valid_family(self.family, self.address) {
             return Err("address family mismatch".into());
         }
@@ -266,6 +317,7 @@ impl Observation for WindowsRouteObservation {
         ref_bytes(&self.interface)
             .saturating_add(self.prefix.len())
             .saturating_add(fact_bytes(&self.next_hop, |_| 0))
+            .saturating_add(fact_bytes(&self.next_hop_scope_id, |_| 0))
             .saturating_add(fact_bytes(&self.route_metric, |_| 0))
             .saturating_add(fact_bytes(&self.interface_metric, |_| 0))
     }
@@ -292,6 +344,9 @@ impl Observation for WindowsRouteObservation {
         if matches!(self.next_hop, Fact::Known(address) if !valid_family(self.family,address)) {
             self.next_hop = Fact::Unknown("next hop family differs from source".into());
         }
+        if self.family == AddressFamily::V4 {
+            self.next_hop_scope_id = Fact::Unknown("IPv4 has no IPv6 scope id".into());
+        }
         for metric in [&mut self.route_metric, &mut self.interface_metric] {
             if *metric == Fact::Known(u32::MAX) {
                 *metric = Fact::Unknown("unused metric sentinel".into());
@@ -310,13 +365,17 @@ impl Observation for WindowsRasObservation {
         }
     }
     fn bytes(&self) -> usize {
-        self.name
-            .len()
-            .saturating_add(fact_bytes(&self.interface, ref_bytes))
+        fact_bytes(&self.name, String::len).saturating_add(fact_bytes(&self.interface, ref_bytes))
     }
     fn normalize(&mut self) -> Result<(), String> {
-        if self.name.trim().is_empty() || self.name.chars().any(char::is_control) {
-            return Err("invalid RAS name".into());
+        self.name = match &self.name {
+            Fact::Known(name) => private_ras_name(name),
+            Fact::Unknown(_) => Fact::Unknown("RAS entry name not established".into()),
+        };
+        if let Fact::Known(name) = &self.name {
+            if name.trim().is_empty() || name.chars().any(char::is_control) {
+                return Err("invalid RAS name".into());
+            }
         }
         if let Fact::Known(r) = &mut self.interface {
             clean_ref(r);
@@ -331,7 +390,11 @@ impl Observation for WindowsRasObservation {
 }
 fn string_budget<T: Observation>(source: &ReadRows<T>) -> usize {
     source.rows.iter().fold(
-        fact_bytes(&source.complete, |_| 0).saturating_add(fact_bytes(&source.compartment, |_| 0)),
+        fact_bytes(&source.complete, |_| 0)
+            .saturating_add(fact_bytes(&source.compartment, |_| 0))
+            .saturating_add(fact_bytes(&source.error, |v| {
+                v.as_ref().map_or(0, String::len)
+            })),
         |sum, row| sum.saturating_add(row.bytes()),
     )
 }
@@ -360,6 +423,9 @@ fn validate_source<T: Observation>(
         if source.compartment == Fact::Known(0) {
             source.compartment =
                 Fact::Unknown("zero compartment is not a verified read scope".into());
+        }
+        if source.error != Fact::Known(None) {
+            unprove(&mut source.complete, "source error not established absent");
         }
         if matches!(source.compartment, Fact::Unknown(_)) {
             unprove(&mut source.complete, "unknown read compartment");
