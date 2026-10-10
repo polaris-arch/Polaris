@@ -27,6 +27,9 @@ pub struct Inbound {
     pub mtu: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_route: Option<bool>,
+    /// Output-only DNS mode; mobile and automatic routing keep the audited core default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_mode: Option<TunDnsMode>,
     /// auto_redirect（1.10+）：Linux nftables 改善 TUN 路由/性能。P6 LAN 网关按 MAC 过滤时必发。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_redirect: Option<bool>,
@@ -94,6 +97,15 @@ pub struct Inbound {
     /// 桌面与 iOS 恒 `None` —— 缺席即内核不做认证，与改动前逐字节相同。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<InboundUser>>,
+}
+
+/// sing-box TUN DNS modes (option/tun.go); absence uses the core default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunDnsMode {
+    Disabled,
+    Native,
+    Hijack,
 }
 
 /// sing-box 入站认证表的一项（`auth.User{Username, Password}`，http 走 Basic proxy auth，

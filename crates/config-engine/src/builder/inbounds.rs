@@ -14,6 +14,7 @@ use crate::builder::helpers::{
     host_to_exclude_cidr, is_ipv4_host, is_ipv6_host, probe_pool_inbound_tag,
 };
 use crate::builder::tun_route_exclude::{compute_user_tun_exclude, UserTunExcludeInput};
+use crate::singbox::inbound::TunDnsMode;
 use crate::singbox::{HttpProxyPlatform, Inbound, InboundPlatform, InboundUser, UdpNatBehavior};
 use crate::user_config::cidr::cidr_overlaps_any;
 use crate::user_config::collections::dedupe;
@@ -176,6 +177,7 @@ pub fn build_inbounds(
             address: None,
             mtu: None,
             auto_route: None,
+            dns_mode: None,
             auto_redirect: None,
             strict_route: None,
             udp_mapping: None,
@@ -277,6 +279,7 @@ fn http_loopback(tag: &str, port: u16, users: Option<Vec<InboundUser>>) -> Inbou
         address: None,
         mtu: None,
         auto_route: None,
+        dns_mode: None,
         auto_redirect: None,
         strict_route: None,
         udp_mapping: None,
@@ -313,6 +316,7 @@ fn socks_loopback(tag: &str, port: u16, users: Option<Vec<InboundUser>>) -> Inbo
         address: None,
         mtu: None,
         auto_route: None,
+        dns_mode: None,
         auto_redirect: None,
         strict_route: None,
         udp_mapping: None,
@@ -705,6 +709,22 @@ fn build_tun_inbound(
     let user_mtu = tun_cfg.and_then(|t| t.mtu);
 
     let auto_route = tun_cfg.map(|t| t.auto_route).unwrap_or(true);
+    // Audited sing-tun 5c2edb183cc9: unset + auto_route=true is hijack,
+    // unset + false is disabled. Preserve the user's flag and compensate only
+    // known desktop manual-routing TUNs. Mobile stays on its alpha.8 contract.
+    // Windows delivery additionally requires the source-owner fix restoring
+    // both family AutoRoute guards and SetDNS(family, nil, nil) else branches;
+    // unmodified D052 + explicit hijack changes interface DNS. The dependency
+    // fingerprint gate remains closed until that source closure is signed.
+    let dns_mode = if !auto_route
+        && matches!(
+            Platform::parse(&deps.platform),
+            Platform::Linux | Platform::Mac | Platform::Win
+        ) {
+        Some(TunDnsMode::Hijack)
+    } else {
+        None
+    };
 
     // 🔴 `strict_route`：**Android 上一个键都不发**（其余平台逐字下发用户档位）。
     //
@@ -790,6 +810,7 @@ fn build_tun_inbound(
         address: Some(tun_address),
         mtu: user_mtu,
         auto_route: Some(auto_route),
+        dns_mode,
         auto_redirect: None,
         strict_route,
         udp_mapping,

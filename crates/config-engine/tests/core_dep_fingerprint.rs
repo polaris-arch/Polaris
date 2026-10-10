@@ -2,32 +2,20 @@
 //!
 //! # 为什么需要这一道（本门的第一个也是唯一的现存消费点：`sing-tun` 的 DNS 模式默认值）
 //!
-//! 本仓的 DNS 截获**完全建立在一个上游默认值上**，而那个默认值我们从不写进配置：
-//!
-//! - `route.rules` 里一条 `port:[53] + action:"hijack-dns"`（`builder/route.rs`），
-//!   配一个哨兵 IP `CONTROLLED_TUN_DNS_IP = 8.8.8.8`（`user_config/dns_constants.rs`，
-//!   **故意排除出 `BOOTSTRAP_DIRECT_DNS_IPS`**，否则被直连放行就逃逸了劫持）。
-//! - tun inbound 里**不发** `dns_mode` ⇒ 用的是 sing-tun 的默认值。
-//!   定版源码（`sing-tun@v0.9.0-beta.4` `tun.go:127-132`）：
-//!   `func (o *Options) DNSModeOrDefault() string { if o.DNSMode == "" { return DNSModeHijack } … }`
-//!
-//! 即：**默认是 `hijack`，我们整套 DNS 分流就靠它**。上游哪天把默认改成 `native`，
-//! 生成的配置一个字节都不变、`sing-box check` 照样 rc=0、全仓单测照样全绿，而用户侧的表现是
-//! **能上网但分流失效**（DNS 不再进规则引擎 ⇒ FakeIP / 国内外分流 / dns-race 全部旁路）。
-//! 这正是本仓反复吃亏的那类「看起来正常」的失败。
-//!
-//! # 为什么是「钉依赖版本」而不是「把 `dns_mode: hijack` 写进配置」
-//!
-//! 写进配置看着更直接，但代价在金样：`fixtures/config-snapshot.json` 是 **上游 4.2.6 冻结的
-//! parity 基线**（`golden_config_snapshot.rs` 开头明文「只重生、不手改」），而 上游侧不发这个键。
-//! 加一个 Polaris-only 的键 ⇒ 每个 TUN 场景当场 delta，且**永远无法靠重生对齐**（重生一次回来一次）。
-//! 为一个假想风险换掉一道真门的可信度，不划算。
-//!
-//! 于是判据挪到**依赖指纹**上：核一 bump，`sing-tun` 版本串必变 ⇒ 本门红 ⇒ 人被迫回去看一眼
-//! `DNSModeOrDefault` 的默认值还是不是 `hijack`，确认后才更新下面的常量。
-//! **判据独立于被检查的那个值** —— 这是 `28f5d46` 修 cronet go.mod 对拍时立下的同一条：
-//! 同一类坏味道曾出现在 Cronet：把待发现的依赖版本再写进 manifest 当新鲜度判据。现在 Cronet 版本
-//! 只从随包 sing-box tag 的 `go.mod` 解析，manifest 只保留库本体 SHA-256 pin。
+//! 当前契约（2026-10-10，候选适配；发布门仍关闭）：
+//! - route 的 port53/hijack-dns、哨兵与 bootstrap 直连顺序不变。
+//! - 已知 desktop TUN auto_route=false 显式发 typed hijack；true/缺席仍 true 且省略 dns_mode。
+//! - mobile alpha.8、未知平台和非 TUN 不发新键；原 37 金样不改。
+//! - 精确审计候选为 D052297f735b80bdae5b2536ef2a07d04979a0511 的
+//!   sing-tun v0.9.7-0.20261009022811-5c2edb183cc9，模块 ZIP
+//!   h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=；tun.go 的空模式
+//!   只在 AutoRoute=true 返回 hijack，false 返回 disabled。后面的旧版审计是历史记录。
+//! - 新版 Windows configure 去掉两处 AutoRoute guard；直接显式 hijack 会把旧 false
+//!   的 SetDNS(family,nil,nil) 改为派生 server，故必须由 source owner 恢复 IPv4/IPv6 guard
+//!   和 else nil，保留外部配置 bypass、family/error/Start 边界，并交真实调用代码的 mock 矩阵。
+//!   EMPTY mode 也必须覆盖 true→derived / false→nil；mock 和 check 都不是设备验收。
+//! - 本文件保留旧严格版本 pin。新 source/tagObject/replacement/receipt 未签收，不猜填、不放行。
+//!   仅候选生成测试绿不能发布；最终版本、替换模块及 hash 从新真实 receipt 取，再重新审默认。
 //!
 //! # 射程（自曝，别把绿读大）
 //!
@@ -58,7 +46,8 @@ const GATE_NAME: &str = "依赖指纹门未完整执行";
 /// 随包核当前使用的 `sing-tun` 版本。
 ///
 /// 🔴 **改这个常量之前，先做这件事**：去读该版本 `tun.go` 的 `DNSModeOrDefault()`，
-/// 确认 `o.DNSMode == ""` 时返回的仍是 `DNSModeHijack`。取源码的路径（符号表被剥时仍可用）：
+/// 按平台和 AutoRoute 审计空模式默认及 OS 副作用；true 默认必须仍为 hijack，
+/// false 必须由显式模式与已签源码保持旧契约。取源码的路径（符号表被剥时仍可用）：
 ///
 /// ```text
 /// go version -m <随包核>                     # 读出 sing-tun 的确切版本（伪版本带 commit）
@@ -266,4 +255,22 @@ fn ci_step_still_wired() {
         "package.yml 里找不到 `--test core_dep_fingerprint` —— 打包腿没在跑依赖指纹门，\
          缺核时它会静静跳过而没人知道"
     );
+}
+
+/// Pending-source release lock, not a claim about OS behavior. Remove/update only
+/// together with independently signed corrected source/dependency receipt/tests.
+#[test]
+fn candidate_d_dns_dependency_has_not_been_release_authorized() {
+    let candidate = b"dep\tgithub.com/sagernet/sing-tun\tv0.9.7-0.20261009022811-5c2edb183cc9\th1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=\n";
+    let version = extract_dep_version(candidate, SING_TUN_MODULE).unwrap();
+    assert_ne!(
+        version, SING_TUN_PINNED,
+        "unmodified D must remain blocked pending Windows source fix"
+    );
+    let source: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/desktop-core/source-manifest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source["sourceCommit"], "052297f735b80bdae5b2536ef2a07d04979a0511", "source changed: re-audit exact dependency/default/Windows contract before changing this lock");
 }
