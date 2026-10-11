@@ -226,9 +226,29 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
 }
 
 // Redirects are permitted only for immutable asset bytes, whose expected hash is already pinned.
+const PRIMARY_QUOTA_WAIT_MS = 10 * 60 * 1000;
+// One evidenced primary-quota recovery across the entire consumption, including
+// both public snapshots. Asset denials and unknown API denials stay fail-closed.
+export function releasePublicReader(options = {}) {
+  const quotaBudget = { available: true };
+  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget });
+}
+function primaryQuotaDelay(response, endpoint, asset, now) {
+  const reset = response.headers.get('x-ratelimit-reset'), retry = response.headers.get('retry-after');
+  if (asset || ![403, 429].includes(response.status) || endpoint.protocol !== 'https:'
+    || endpoint.hostname !== 'api.github.com' || endpoint.port || endpoint.username || endpoint.password
+    || endpoint.search || !(endpoint.pathname === `/repos/${REPO}` || endpoint.pathname.startsWith(`/repos/${REPO}/`))
+    || response.headers.get('x-ratelimit-limit') !== '60' || response.headers.get('x-ratelimit-remaining') !== '0'
+    || response.headers.get('x-ratelimit-resource') !== 'core' || !/^[0-9]+$/.test(reset ?? '')
+    || (retry !== null && !/^[0-9]+$/.test(retry))) return null;
+  const resetMs = Number(reset) * 1000;
+  if (!Number.isSafeInteger(resetMs) || resetMs <= now) return null;
+  const delay = Math.max(resetMs - now + 1000, retry === null ? 0 : Number(retry) * 1000);
+  return Number.isSafeInteger(delay) && delay > 0 && delay <= PRIMARY_QUOTA_WAIT_MS ? delay : null;
+}
 export async function publicBytes(url, limit, asset = false, options = {}) {
   const request = options.fetch ?? fetch;
-  for (let redirects = 0; redirects <= 3; redirects++) {
+  for (let redirects = 0; redirects <= 3;) {
     const endpoint = new URL(url);
     const headers = { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' };
     // Keep public reads anonymous. Neither credentials nor a signed query are
@@ -246,13 +266,21 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
       await response.body?.cancel(); const next = new URL(response.headers.get('location') ?? '', url);
       demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
         && ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname), 'Unapproved release redirect');
-      url = next.href; continue;
+      url = next.href; redirects++; continue;
     }
     if (!response.ok) {
       await response.body?.cancel();
       const quota = ['x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
         'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after']
         .map((name) => `${name}=${response.headers.get(name) ?? 'unknown'}`).join(', ');
+      const delay = options.quotaBudget?.available
+        ? primaryQuotaDelay(response, endpoint, asset, (options.now ?? Date.now)()) : null;
+      if (delay !== null) {
+        options.quotaBudget.available = false;
+        (options.report ?? console.error)(`Release primary quota wait ${delay}ms (${location}; ${quota})`);
+        await (options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
+        continue;
+      }
       throw new Error(`Release HTTP ${response.status} (${location}; ${quota})`);
     }
     const parts = []; let size = 0;
@@ -488,7 +516,7 @@ function replaceDirectories(resources, work, keys, rename) {
 
 export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_TARGETS), options = {}) {
   demand(keys.length && new Set(keys).size === keys.length && keys.every((k) => Object.hasOwn(RELEASE_TARGETS, k)), 'Unknown/duplicate App architecture selection');
-  const contract = loadReleaseContract(root, manifest), run = options.run ?? execFileSync, read = options.read ?? publicBytes;
+  const contract = loadReleaseContract(root, manifest), run = options.run ?? execFileSync, read = options.read ?? releasePublicReader();
   const adapter = adapterIdentity(root, run);
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
   const lock = join(resources, '.release-consumer.lock');

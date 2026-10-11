@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
-  RELEASE_TARGETS, publicBytes, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
+  RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
   verifyReleaseProvenance } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
@@ -703,4 +703,79 @@ test('repository public identity remains mandatory without relying on authentica
   f.transport.set(f.base, encode({ id: 1407705262, full_name: f.contract.repository, private: true }));
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], f), /Repository identity differs/);
   assert.deepEqual(resources(f), before);
+}));
+
+const quotaNow = 1791755097242;
+const observedQuotaHeaders = { 'x-github-request-id': 'E3C0:358CB1:1F5A584:2541386:6ACC0359',
+  'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1791755597',
+  'x-ratelimit-resource': 'core' };
+test('observed primary quota waits beyond reset once and retries the identical anonymous request', async () => {
+  const calls = [], waits = [], reports = [];
+  const read = releasePublicReader({ now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
+    fetch: async (url, options) => { calls.push({ url, options });
+      return calls.length === 2 ? new Response('ok') : new Response('denied', { status: 403, headers: observedQuotaHeaders }); } });
+  const url = 'https://api.github.com/repos/polaris-arch/polaris-box';
+  assert.equal((await read(url, 2)).toString(), 'ok');
+  assert.deepEqual(waits, [500758]); assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((c) => c.url), [url, url]);
+  assert(calls.every((c) => c.options.headers.Authorization === undefined && c.options.redirect === 'manual'));
+  assert.equal(reports.length, 1); assert(reports[0].includes('Release primary quota wait 500758ms'));
+  // Both snapshots and subsequent endpoints share the exhausted one-retry budget.
+  await assert.rejects(read(url + '/releases/17', 10), /Release HTTP 403/);
+  assert.equal(calls.length, 3); assert.equal(waits.length, 1);
+});
+test('a second quota denial is terminal without another wait or request', async () => {
+  let calls = 0; const waits = [];
+  const read = releasePublicReader({ now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: () => {},
+    fetch: async () => { calls++; return new Response('denied', { status: 429, headers: observedQuotaHeaders }); } });
+  await assert.rejects(read('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 429/);
+  assert.equal(calls, 2); assert.deepEqual(waits, [500758]);
+});
+test('unknown, expired, excessive, asset and noncanonical denials never consume a retry', async () => {
+  const base = 'https://api.github.com/repos/polaris-arch/polaris-box';
+  const cases = [
+    { status: 401 }, { status: 404 }, { status: 500 }, { asset: true },
+    { url: 'https://github.com/repos/polaris-arch/polaris-box' },
+    { url: 'http://api.github.com/repos/polaris-arch/polaris-box' },
+    { url: base + '?signature=never-log-query' }, { url: base.replace('https://', 'https://fixture-user@') },
+    { url: 'https://api.github.com/repos/other/repository' },
+    { headers: { 'x-ratelimit-limit': '5000' } }, { headers: { 'x-ratelimit-remaining': '1' } },
+    { headers: { 'x-ratelimit-resource': 'search' } }, { headers: { 'x-ratelimit-reset': '' } },
+    { headers: { 'x-ratelimit-reset': 'NaN' } }, { headers: { 'x-ratelimit-reset': '1791755097' } },
+    { headers: { 'x-ratelimit-reset': '1791755700' } }, { headers: { 'x-ratelimit-reset': '99999999999999999999' } },
+    { headers: { 'retry-after': '601' } }, { headers: { 'retry-after': 'bad' } },
+  ];
+  for (const c of cases) {
+    let calls = 0, waits = 0;
+    const read = releasePublicReader({ now: () => quotaNow, sleep: async () => { waits++; }, report: () => {},
+      fetch: async () => { calls++; return new Response('denied', { status: c.status ?? 403,
+        headers: { ...observedQuotaHeaders, ...c.headers } }); } });
+    await assert.rejects(read(c.url ?? base, 10, c.asset ?? false), /Release HTTP/);
+    assert.equal(calls, 1, JSON.stringify(c)); assert.equal(waits, 0, JSON.stringify(c));
+  }
+});
+test('quota recovery still enforces pinned response size and public identity without replacing resources', async () => withFixture(async (f) => {
+  let calls = 0;
+  const read = releasePublicReader({ now: () => quotaNow, sleep: async () => {}, report: () => {},
+    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
+      : new Response('larger than the pin') });
+  await assert.rejects(read(f.base, 2), /exceeds pinned size/); assert.equal(calls, 2);
+  write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
+  const changed = releasePublicReader({ now: () => quotaNow, sleep: async () => {}, report: () => {},
+    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
+      : new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })) });
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
+  assert.equal(calls, 2); assert.deepEqual(resources(f), before);
+}));
+test('default consumption uses the anonymous reader and preserves strict original producer receipt', async () => withFixture(async (f) => {
+  const previous = globalThis.fetch, calls = [];
+  globalThis.fetch = async (url, options) => { calls.push({ url, options });
+    assert(f.transport.has(url), 'Unexpected public endpoint'); return new Response(f.transport.get(url)); };
+  try {
+    const { read, ...options } = f;
+    const receipts = await consumeRelease(f.root, f.manifest, ['linux'], options);
+    assert.equal(receipts.linux.producer.sourceCommit, f.contract.sourceCommit);
+    assert.deepEqual(receipts.linux.producer, f.contract.platforms.linux);
+    assert(calls.length > 10); assert(calls.every((c) => c.options.headers.Authorization === undefined));
+  } finally { globalThis.fetch = previous; }
 }));
