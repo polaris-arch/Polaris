@@ -78,7 +78,7 @@ import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
-import { hasDesktopRelease, loadReleaseContract, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
+import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -2868,9 +2868,10 @@ function expectedSrsCount() {
  *
  * `min`/`max` 是**份数**约束，只在 artifact/staging 清点里生效（`--static` 时源是工作树，
  * helper 由 CI 现编现铺、内核 gitignore 不入库，份数在那儿不可判定 ⇒ 显式跳过并标注，见 [`checkInventory`]）。
+ * 发布合同的 core-release 成员是已下载的精确输入，--static 同样逐项要求一份。
  * 它挡的是白名单门的经典假绿：**空目录也满足「没有多余文件」**。
  */
-function payloadAllowRules(label, coreDir, srsCount) {
+function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
   const core = reQuote(coreDir);
   const rules = [
     {
@@ -2985,6 +2986,13 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: 'Naive/H3 出站的 Cronet 动态库，核在 initialize 阶段就要它、且必须与核同目录；缺了那两类节点直接起不来。',
     });
   }
+  // Legal/source/provenance bytes are transported from the reviewed platform archive.
+  // Exact paths and one copy each: no directory-wide exemption for arbitrary files.
+  if (releaseContract) for (const member of releasePayloadMembers(releaseContract, coreDir)) rules.push({
+    id: `release-member:${member}`, re: new RegExp(`^${reQuote(`_up_/resources/${coreDir}/${member}`)}$`),
+    min: 1, max: 1, releaseMember: true,
+    why: '已验发布合同本平台 archive.members 中的许可、对应源码索引或原出处；必须按原路径随核分发。',
+  });
   return rules;
 }
 
@@ -3036,7 +3044,9 @@ function checkInventory(label, { root, isStatic }) {
     return;
   }
   const srs = expectedSrsCount(); // 读不出来会抛 InputError → 顶层转成一条可读的违反，不静默
-  const rules = payloadAllowRules(label, coreDir, srs.count);
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'), '包内容清单缺少内核 manifest');
+  const releaseContract = hasDesktopRelease(manifest) ? loadReleaseContract(ROOT, manifest) : undefined;
+  const rules = payloadAllowRules(label, coreDir, srs.count, releaseContract);
 
   /** @type {{rel:string, abs:string, from?:string}[]} */
   let items = [];
@@ -3162,7 +3172,7 @@ function checkInventory(label, { root, isStatic }) {
   // 🔴 份数按**每棵资源树各自**算，不是全局汇总（同 payload 模式「每个 bundle target 各自命中」）：
   // linux 一次出 deb + appimage 两棵树，汇总口径下「deb 里 2 份内核 + appimage 里 0 份」= 2 份，
   // 与「各 1 份」在数上无法区分 —— 那正是「计数不等于位置」的原型。
-  const resTrees = [...new Set(items.map((it) => it.tree))].sort();
+  const resTrees = [...new Set([...(isStatic && releaseContract ? [`conf:${confName}`] : []), ...items.map((it) => it.tree)])].sort();
   // 两段拼 key 用 U+001F（单元分隔符）而不是裸 NUL：源码里出现裸 NUL 字节会让 grep / ripgrep
   // 把整个文件判成 binary 而「找不到也不报错」地跳过——
   // 任何以 grep 为基础的仓库级审计会静默漏掉本文件（打包判据的单点）。
@@ -3191,9 +3201,10 @@ function checkInventory(label, { root, isStatic }) {
     );
   }
 
-  if (enforceCounts) {
+  if (enforceCounts || releaseContract) {
     for (const t of resTrees) {
       for (const r of rules) {
+        if (!enforceCounts && !r.releaseMember) continue;
         const got = hitsOf.get(keyOf(t, r.id));
         if (got.length >= r.min && got.length <= r.max) continue;
         const want = r.min === r.max ? `恰 ${r.min}` : `${r.min}~${r.max === Infinity ? '不限' : r.max}`;
@@ -3220,7 +3231,7 @@ function checkInventory(label, { root, isStatic }) {
       (enforceCounts
         ? `，且份数在登记区间内（.srs 份数真值 ${srs.count} 取自 ${srs.where}：\`${srs.slice}\`）`
         : `。⚠️ 本模式**只判「多余」方向**：源是工作树，helper 由 CI 现编现铺、内核 gitignore 不入库，` +
-          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖`) +
+          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖；发布合同成员仍逐项要求恰1份`) +
       (isStatic ? '' : `；射程外（bundler/cargo 自己铺的、不由 bundle.resources 决定）${outOfScope} 个文件未清点`)
   );
 }

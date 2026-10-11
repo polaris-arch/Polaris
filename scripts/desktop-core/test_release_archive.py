@@ -100,6 +100,24 @@ class ArchiveBoundary(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'archive bytes differ'):
                     module.extract(str(archive), str(Path(directory) / 'out'), record, ROOT)
 
+    def test_raw_zip_nul_name_cannot_be_truncated_to_a_reviewed_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / 'native.zip'
+            name = ROOT + '/sing-boxXYZ'
+            with zipfile.ZipFile(archive, 'w') as output:
+                info = zipfile.ZipInfo(name)
+                info.external_attr = 0o100755 << 16
+                output.writestr(info, b'inert')
+            original = name.encode()
+            raw = archive.read_bytes().replace(original, (ROOT + '/sing-box\x00YZ').encode())
+            archive.write_bytes(raw)
+            record = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest(),
+                      'members': {ROOT + '/sing-box': hashlib.sha256(b'inert').hexdigest()}}
+            destination = Path(directory) / 'unpacked'
+            with self.assertRaisesRegex(ValueError, 'raw NUL ZIP member name'):
+                module.extract(str(archive), str(destination), record, ROOT)
+            self.assertFalse(destination.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

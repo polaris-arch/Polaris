@@ -39,7 +39,7 @@ function metadata(row) {
     + [...g.normalModules, ...g.prebuiltAcquisitionModules].map((d) => `\tdep\t${d.module}\t${d.version}\t${d.h1}\n`).join('')
     + Object.entries(g.settings).map(([k, v]) => `\tbuild\t${k}=${v}\n`).join('');
 }
-function fixture() {
+function fixture(options = {}) {
   const root = mkdtempSync(join(tmpdir(), 'polaris-release-fixture-'));
   const transport = new Map(), calls = [];
   const contract = { schema: 'polaris-box-release-consumer-contract-v1', providerContract: 'polaris-box-release-v1',
@@ -67,7 +67,10 @@ function fixture() {
       platformInputFingerprint: platform.fingerprint, buildID: platform.buildID,
       providerContract: contract.providerContract, providerFingerprint: provider.fingerprint, providerIdentity: provider,
       signaturePolicy: 'preserve measured original bytes; ad-hoc/not-signed observations do not assert trust',
-      signatureObservation: { core: { synthetic: true }, cronet: {}, trustValidated: false }, tags, ldflags: flags,
+      signatureObservation: { core: t.os === 'darwin' ? { format: 'Mach-O', signatureTrustValidated: false,
+        codeSignatureInspection: options.unsignedIntel && key === 'mac-x64' ? 'sing-box: code object is not signed at all\n'
+          : `Executable=/synthetic/sing-box\nSignature=adhoc\nCDHash=${'4'.repeat(40)}\n` }
+        : { synthetic: true }, cronet: {}, trustValidated: false }, tags, ldflags: flags,
       buildCommand: ['go', 'build', '-buildvcs=true', '-mod=readonly', '-p', '1', '-trimpath', '-tags', tags,
         '-ldflags', flags, '-o', `/synthetic/${rootName}/${t.core}`, './cmd/sing-box'],
       buildGraph: { settings: { GOOS: t.os, GOARCH: t.arch, CGO_ENABLED: t.cgo, 'vcs.revision': commit,
@@ -123,6 +126,7 @@ else:
   transport.set(base + '/git/tags/' + tagObject, encode({ sha: tagObject, tag, object: { type: 'commit', sha: commit } }));
   transport.set(base + '/git/commits/' + commit, encode({ sha: commit, tree: { sha: tree } }));
   const read = async (url) => { calls.push(url); assert(transport.has(url), `Unexpected HTTP: ${url}`); return transport.get(url); };
+  const inspections = [];
   const run = (command, args, options) => {
     if (command === 'git') return args[0] === 'rev-parse' ? candidate : '';
     if (command === 'go') {
@@ -130,11 +134,22 @@ else:
       const row = Object.values(contract.platforms).find((r) => r.core.sha256 === hash);
       assert(row, 'Unknown inert binary'); return args[0] === 'version' ? metadata(row) : row.buildID;
     }
+    if (command === 'codesign' || command === 'file') {
+      inspections.push([command, ...args]);
+      const hash = digest(readFileSync(args.at(-1))), row = Object.values(contract.platforms).find((r) => r.core.sha256 === hash);
+      assert(row && row.target.startsWith('darwin/'), 'Unknown inert Mac binary');
+      const display = row.signatureObservation.core.codeSignatureInspection;
+      if (command === 'file') return 'Mach-O 64-bit executable x86_64';
+      if (args[0] === '--display') return display;
+      assert.deepEqual(args.slice(0, -1), ['--verify', '--strict']);
+      if (display.includes('code object is not signed at all')) return { status: 1, stderr: display };
+      return '';
+    }
     assert(['python3', 'python'].includes(command), 'Target execution prohibited'); return execFileSync(command, args, options);
   };
-  return { root, contract, manifest, transport, calls, read, run, base, publicRelease };
+  return { root, contract, manifest, transport, calls, read, run, base, publicRelease, inspections };
 }
-async function withFixture(fn) { const f = fixture(); try { await fn(f); } finally { rmSync(f.root, { recursive: true, force: true }); } }
+async function withFixture(fn, options) { const f = fixture(options); try { await fn(f); } finally { rmSync(f.root, { recursive: true, force: true }); } }
 function resources(f) {
   const dir = join(f.root, 'resources'), result = {};
   function walk(p, relative = '') { if (!existsSync(p)) return; for (const n of readdirSync(p, { withFileTypes: true })) {
@@ -278,6 +293,93 @@ test('final carrier retains original notice/source bytes as well as exact core a
   writeFileSync(join(carrier, 'core-release/LICENSE'), 'wrong license');
   assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /notice\/source\/provenance/);
 }));
+
+test('actual inventory CLI admits precisely the release members and rejects missing/extra files in static and carrier trees', async () => withFixture(async (f) => {
+  cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
+  copyFileSync(join(repo, 'src-tauri/build.rs'), join(f.root, 'src-tauri/build.rs'));
+  const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8').match(/^const EXPECTED_SRS_COUNT: usize = (\d+);$/m)[1]);
+  for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']) write(join(f.root, name), 'inert');
+  for (let i = 0; i < count; i++) write(join(f.root, `resources/data/inert-${i}.srs`), 'inert');
+  for (const name of ['index.html', 'assets/inert.js', 'licenses/inert.txt', 'favicon.ico', 'favicon.svg', 'apple-touch-icon-180x180.png'])
+    write(join(f.root, 'resources/dashboard', name), 'inert');
+  await consumeRelease(f.root, f.manifest, undefined, f);
+  for (const [key, label] of [['linux', 'linux'], ['win', 'windows'], ['mac-arm64', 'macos-arm64'], ['mac-x64', 'macos-x64']]) {
+    const conf = `tauri.${key === 'linux' ? 'linux' : key === 'win' ? 'windows' : key === 'mac-arm64' ? 'macos-arm64' : 'macos-x64'}.conf.json`;
+    copyFileSync(join(repo, 'src-tauri', conf), join(f.root, 'src-tauri', conf));
+    write(join(f.root, 'resources', key, key === 'win' ? 'polaris-helper.exe' : 'polaris-helper'), 'inert');
+    if (key === 'win') write(join(f.root, 'resources/win/polaris-cleaner.exe'), 'inert');
+    const carrier = join(f.root, 'inventory-carrier', key);
+    const scopes = key === 'linux' ? [join(carrier, 'deb/usr/lib/Polaris'), join(carrier, 'appimage/Polaris.AppDir/usr/lib/Polaris')]
+      : key === 'win' ? [carrier] : [join(carrier, 'macos/Polaris.app/Contents/Resources')];
+    for (const scope of scopes) {
+      cpSync(join(f.root, 'src-tauri/core-manifest.json'), join(scope, 'core-manifest.json'), { recursive: true });
+      for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md', `resources/${key}`, 'resources/data', 'resources/dashboard']) {
+        mkdirSync(dirname(join(scope, '_up_', name)), { recursive: true });
+        cpSync(join(f.root, name), join(scope, '_up_', name), { recursive: true });
+      }
+    }
+    for (const [flags, directory] of [[['--static'], join(f.root, 'resources', key)],
+      [['--root', carrier], join(scopes[0], '_up_/resources', key)]]) {
+      const run = () => spawnSync(process.execPath, [join(f.root, 'scripts/verify-packaging.mjs'), 'inventory', '--label', label, ...flags], { encoding: 'utf8' });
+      let result = run(); assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, /release-member:core-release\/source\/SOURCE-INDEX.json=1/);
+      const missing = join(directory, 'core-release/source/SOURCE-INDEX.json'), original = readFileSync(missing); rmSync(missing);
+      result = run(); assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stderr, /release-member:core-release\/source\/SOURCE-INDEX.json.*实为 0 份/);
+      write(missing, original);
+      const extra = join(directory, 'core-release/source/unreviewed.json'); write(extra, 'unreviewed');
+      result = run(); assert.equal(result.status, 1, result.stdout + result.stderr); assert.match(result.stderr, /未登记/); rmSync(extra);
+      result = run(); assert.equal(result.status, 0, result.stdout + result.stderr);
+    }
+  }
+}));
+
+test('producer Mac display must yield a unique state/CDHash with no unsigned arm64 exception', () => withFixture(async (f) => {
+  for (const display of [undefined, '', 'CDHash=invalid\n', 'sing-box: code object is not signed at all\n',
+    `CDHash=${'4'.repeat(40)}\nCDHash=invalid\n`,
+    `CDHash=${'4'.repeat(40)}\nCDHash=${'5'.repeat(40)}\n`]) {
+    const contract = structuredClone(f.contract); contract.platforms['mac-arm64'].signatureObservation.core.codeSignatureInspection = display;
+    assert.throws(() => validateReleaseContract(contract), /signature|Mac/);
+  }
+}));
+
+test('Mac consumption and final bundle entry enforce strict native verification and bound CDHash without signing', async () => withFixture(async (f) => {
+  const key = 'mac-arm64';
+  const badRuns = [(command, args, options) => command === 'codesign' && args[0] === '--verify'
+    ? { status: 1, stderr: 'code object is not signed at all' } : f.run(command, args, options),
+  (command, args, options) => command === 'codesign' && args[0] === '--verify'
+    ? { status: 1, stderr: 'invalid signature' } : f.run(command, args, options),
+  (command, args, options) => command === 'codesign' && args[0] === '--display'
+    ? `CDHash=${'5'.repeat(40)}\n` : f.run(command, args, options)];
+  for (const run of badRuns) {
+    await assert.rejects(consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin', run }), /signature|CDHash/);
+    assert.deepEqual(resources(f), {});
+  }
+  const receipts = await consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin' });
+  assert.deepEqual(receipts[key].macCodeSignature, { state: 'signed', cdHash: '4'.repeat(40) });
+  const carrier = join(f.root, 'signature-carrier'); cpSync(join(f.root, 'resources', key), carrier, { recursive: true });
+  const core = join(carrier, 'sing-box'), before = digest(readFileSync(core));
+  assert.equal(verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  for (const run of badRuns) assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, run, 'darwin'), /signature|CDHash/);
+  const file = join(f.root, 'resources/.release-receipts', `${key}.json`), original = readFileSync(file);
+  for (const signature of [undefined, { state: 'invalid', cdHash: '4'.repeat(40) }, { state: 'signed', cdHash: '5'.repeat(40) }, { state: 'unsigned', cdHash: null }]) {
+    const value = JSON.parse(original); if (signature === undefined) delete value.macCodeSignature; else value.macCodeSignature = signature;
+    const { schema, fingerprint, ...facts } = value; value.fingerprint = digest(portableCanonical(facts)); write(file, encode(value));
+    assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin'), /signature|CDHash/);
+  }
+  write(file, original); assert.equal(digest(readFileSync(core)), before);
+  assert(f.inspections.some(([command, flag, strict]) => command === 'codesign' && flag === '--verify' && strict === '--strict'));
+  assert(f.inspections.every(([, ...args]) => !args.includes('--sign')));
+}));
+
+test('unsigned Intel release retains only the existing thin-x86_64 native exception', async () => withFixture(async (f) => {
+  const key = 'mac-x64', receipts = await consumeRelease(f.root, f.manifest, [key], { ...f, host: 'darwin' });
+  assert.deepEqual(receipts[key].macCodeSignature, { state: 'unsigned', cdHash: null });
+  const core = join(f.root, 'resources', key, 'sing-box');
+  assert.equal(verifyPackagedSource(f.root, f.manifest, key, core, f.run, 'darwin').platform, key);
+  const run = (command, args, options) => command === 'file' ? 'Mach-O universal x86_64 arm64' : f.run(command, args, options);
+  assert.throws(() => verifyPackagedSource(f.root, f.manifest, key, core, run, 'darwin'), /thin Intel/);
+}, { unsignedIntel: true }));
 test('actual fetch CLIs reject malformed release mode and check-only Cronet has no module proxy access', async () => withFixture(async (f) => {
   cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
   let result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-cronet.mjs'), '--check-only'], { encoding: 'utf8' });

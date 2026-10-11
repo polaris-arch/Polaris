@@ -4,7 +4,7 @@ import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lsta
   openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonical, digest, requireGraph as demand } from './source-graph.mjs';
+import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, requireGraph as demand } from './source-graph.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 
 const REPO = 'polaris-arch/polaris-box';
@@ -74,6 +74,7 @@ function validateRow(contract, key, row) {
     && row.sourceTree === contract.sourceTree && row.providerContract === 'polaris-box-release-v1'
     && row.signaturePolicy === POLICY && row.signatureObservation?.trustValidated === false,
   'Producer row/source/signature policy differs');
+  releaseMacCodeSignature(row, key);
   demand(row.sourceFingerprint?.schema === 'fork-source-fingerprint-v1', 'Original source collector missing');
   const facts = Object.fromEntries(['sourceCommit', 'sourceTree', 'sourceOverlay', 'goVersion',
     'goModSha256', 'goSumSha256', 'replacement'].map((k) => [k, row.sourceFingerprint[k]]));
@@ -104,6 +105,9 @@ function validateRow(contract, key, row) {
     { name: row.releaseAsset.name, bytes: row.releaseAsset.bytes, sha256: row.releaseAsset.sha256 }, 'Archive pin differs');
   const members = row.archive.members;
   demand(members && Object.keys(members).length <= 1024 && Object.values(members).every((v) => hex(v, 64)), 'Archive inventory invalid');
+  demand(Object.keys(members).every((name) => name.startsWith(`${root}/`) && name.slice(root.length + 1).split('/').every((part) =>
+    /^[A-Za-z0-9_+.-]+$/.test(part) && !['.', '..'].includes(part) && !part.endsWith('.')
+    && !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(part.split('.')[0]))), 'Archive member path invalid');
   for (const name of [target.core, 'LICENSE', 'NOTICE', 'licenses/NOTICE', 'provenance.json', 'source/SOURCE-INDEX.json', 'SHA256SUMS'])
     demand(hex(members[`${root}/${name}`], 64), `Required release member absent: ${name}`);
   function payload(p, name) {
@@ -151,6 +155,31 @@ export function loadReleaseContract(root, manifest) {
   same(selection.librarySha256, { linux: contract.platforms.linux.sidecar.sha256,
     win: contract.platforms.win.sidecar.sha256 }, 'Compiled same-package library pins differ');
   return contract;
+}
+
+// The producer preserves codesign display stderr; it does not supply App signature state.
+// Derive a bound state/CDHash, then use the existing strict native observer on Mac.
+function releaseMacCodeSignature(row, key) {
+  if (!key.startsWith('mac-')) return null;
+  const original = row.signatureObservation?.core;
+  demand(original?.format === 'Mach-O' && original.signatureTrustValidated === false
+    && typeof original.codeSignatureInspection === 'string', 'Original Mac signature observation missing');
+  const display = original.codeSignatureInspection;
+  const hashes = [...display.matchAll(/^CDHash=([a-fA-F0-9]{40})\r?$/gm)];
+  const unsigned = display.includes('code object is not signed at all');
+  demand(display.split(/\r?\n/).filter((line) => line.startsWith('CDHash=')).length === hashes.length
+    && (unsigned ? hashes.length === 0 : hashes.length === 1), 'Original Mac signature state/CDHash invalid');
+  const signature = unsigned ? { state: 'unsigned', cdHash: null }
+    : { state: 'signed', cdHash: hashes[0][1].toLowerCase() };
+  validateMacCodeSignature(signature, key);
+  return signature;
+}
+
+export function releasePayloadMembers(contract, key) {
+  const row = contract.platforms[key], prefix = validateRow(contract, key, row) + '/';
+  return Object.keys(row.archive.members).sort().map((name) => name.slice(prefix.length))
+    .filter((name) => name !== row.core.member && name !== row.sidecar?.member)
+    .map((name) => `core-release/${name}`);
 }
 
 export function validateReleaseNotice(notice, manifest, contract, mobile) {
@@ -270,7 +299,7 @@ function actualBuildInfo(raw) {
   const acquisition = deps.filter((d) => d.module.startsWith('github.com/sagernet/cronet-go/lib/'));
   return { settings, normalModules: deps.filter((d) => !acquisition.includes(d)), prebuiltAcquisitionModules: acquisition, localReplacement: replacements[0] };
 }
-export function verifyReleaseCore(path, row, key, run = execFileSync) {
+export function verifyReleaseCore(path, row, key, run = execFileSync, host = process.platform) {
   const bytes = checkedBytes(path, row.core); const target = RELEASE_TARGETS[key]; coreHeader(bytes, target);
   const options = { encoding: 'utf8', env: { ...process.env, GOTOOLCHAIN: 'local', GOWORK: 'off' }, maxBuffer: 8 * 1024 * 1024 };
   const graph = actualBuildInfo(String(run('go', ['version', '-m', path], options)).trimEnd() + '\n');
@@ -281,16 +310,21 @@ export function verifyReleaseCore(path, row, key, run = execFileSync) {
     && settings['-trimpath'] === 'true' && !Object.hasOwn(settings, '-ldflags'), 'Actual release build settings differ');
   same(settings['-tags']?.replaceAll('"', '').split(',').sort(), row.tags.split(',').sort(), 'Actual release feature tags differ');
   demand(String(run('go', ['tool', 'buildid', path], options)).trim() === row.buildID, 'Actual release BuildID differs');
+  const signature = releaseMacCodeSignature(row, key);
+  if (host === 'darwin' && signature) {
+    same(observeMacCodeSignature(path, key, run === execFileSync ? undefined : run), signature, 'Actual release Mac signature state/CDHash differs');
+    checkedBytes(path, row.core); // Inspection must preserve the original downloaded bytes.
+  }
   return graph;
 }
-function verifyExtracted(directory, rootName, row, key, run) {
+function verifyExtracted(directory, rootName, row, key, run, host) {
   const root = join(directory, rootName);
   const { archive, core, sidecar, releaseAsset, ...producer } = row;
   same(json(join(root, 'provenance.json')), producer, 'Inner release provenance differs');
   const sums = Object.keys(archive.members).filter((n) => n !== `${rootName}/SHA256SUMS`).sort()
     .map((n) => `${archive.members[n]}  ${n.slice(rootName.length + 1)}\n`).join('');
   demand(readFileSync(join(root, 'SHA256SUMS'), 'utf8') === sums, 'Inner checksum inventory differs');
-  verifyReleaseCore(join(root, core.member), row, key, run);
+  verifyReleaseCore(join(root, core.member), row, key, run, host);
   if (sidecar) inspectCronetBytes(checkedBytes(join(root, sidecar.member), sidecar), key);
   return root;
 }
@@ -416,7 +450,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       const extracted = join(work, `unpacked-${key}`), rootName = validateRow(contract, key, row);
       run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
         { input: JSON.stringify({ archive: row.archive, root: rootName }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
-      const source = verifyExtracted(extracted, rootName, row, key, run);
+      const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform);
       const dest = join(stage, key); mkdirSync(dest);
       const existing = join(resources, key);
       if (existsSync(existing)) { directoryTree(existing); cpSync(existing, dest, { recursive: true }); }
@@ -427,7 +461,8 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       const facts = { platform: key, contractSha256: manifest.desktopRelease.contractSha256,
         assetIndexSha256: contract.assetIndex.sha256, releaseAsset: row.releaseAsset, adapter, producer: row,
         publicReadback: before,
-        signaturePolicy: POLICY, actualAppAcceptance: 'pending native load, gvisor/mixed, feature and final carrier gates' };
+        signaturePolicy: POLICY, macCodeSignature: releaseMacCodeSignature(row, key),
+        actualAppAcceptance: 'pending native load, gvisor/mixed, feature and final carrier gates' };
       const receipt = { schema: 'polaris-app-release-consumption-v1', ...facts, fingerprint: digest(portableCanonical(facts)) };
       writeFileSync(join(metadata, `${key}.json`), JSON.stringify(receipt, null, 2) + '\n'); receipts[key] = receipt;
     }
@@ -450,7 +485,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
   }
 }
 
-export function verifyPackagedRelease(root, manifest, key, core, run = execFileSync) {
+export function verifyPackagedRelease(root, manifest, key, core, run = execFileSync, host = process.platform) {
   demand(Object.hasOwn(RELEASE_TARGETS, key), 'Unknown App target');
   demand(!existsSync(join(root, 'resources/.release-consumer.lock')), 'Release acquisition/recovery still pending');
   const contract = loadReleaseContract(root, manifest), row = contract.platforms[key];
@@ -460,6 +495,7 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     && receipt.platform === key && receipt.contractSha256 === manifest.desktopRelease.contractSha256
     && receipt.assetIndexSha256 === contract.assetIndex.sha256 && receipt.signaturePolicy === POLICY, 'Release consumption receipt differs');
   same(receipt.producer, row, 'Saved original producer differs'); same(receipt.releaseAsset, row.releaseAsset, 'Saved asset identity differs');
+  same(receipt.macCodeSignature, releaseMacCodeSignature(row, key), 'Saved Mac signature state/CDHash differs');
   same(receipt.adapter, adapterIdentity(root, run), 'App adapter identity differs');
   indexRows(checkedBytes(join(metadata, 'polaris-box-assets.json'), contract.assetIndex), contract);
   regularPath(join(metadata, 'public-readback.json'));
@@ -475,7 +511,7 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     [contract.assetIndex, ...Object.values(contract.platforms).map((r) => r.releaseAsset)]
       .map((p) => ({ name: p.name, id: p.assetId, bytes: p.bytes, url: p.url })), 'Saved public assets differ');
   // Both source and final carrier must retain the producer's bytes and permissions.
-  const source = join(root, 'resources', key, row.core.member); checkedBytes(source, row.core); verifyReleaseCore(core, row, key, run);
+  const source = join(root, 'resources', key, row.core.member); checkedBytes(source, row.core); verifyReleaseCore(core, row, key, run, host);
   demand((lstatSync(core).mode & 0o777) === (lstatSync(source).mode & 0o777), 'Final release core permissions differ');
   if (row.sidecar) {
     const lib = join(dirname(core), row.sidecar.member), original = join(root, 'resources', key, row.sidecar.member);

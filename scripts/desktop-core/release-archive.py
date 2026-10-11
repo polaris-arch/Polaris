@@ -53,6 +53,7 @@ def extract(path, destination, record, root):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             require(len(archive.infolist()) <= 2048, 'entry limit')
             for info in archive.infolist():
+                require('\x00' not in info.orig_filename, 'raw NUL ZIP member name')
                 mode = info.external_attr >> 16
                 directory = info.is_dir()
                 kind = stat.S_IFMT(mode)

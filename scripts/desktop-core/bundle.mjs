@@ -116,7 +116,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
 }
 
 export function verifyPackagedSource(root, manifest, key, binary, run, host = process.platform) {
-  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run);
+  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run, host);
   const spec = validateSourcePins(manifest, key, false);
   const receipt = readJson(join(root, 'resources/.source-receipts', `${key}.json`));
   const inventory = readJson(join(root, 'resources/.source-receipts/bundle.json'));
