@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
-  RELEASE_TARGETS, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease } from './release-consumer.mjs';
+  RELEASE_TARGETS, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
+  verifyReleaseProvenance } from './release-consumer.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
 import { validationContext } from './validation-origin.mjs';
@@ -81,10 +82,17 @@ function fixture(options = {}) {
       prebuiltAcquisitionModules: t.sidecar ? [{ module: `github.com/sagernet/cronet-go/lib/${t.os}_amd64`, version: 'v1.0.0', h1: 'h1:BB=' }] : [],
       localReplacement: { module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '' } },
       consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\n`, fixtureOnly: true };
-    const files = { [t.core]: coreFixture(key), LICENSE: Buffer.from('synthetic license'), NOTICE: Buffer.from('synthetic notice'),
-      'licenses/NOTICE': Buffer.from('synthetic notice'), 'provenance.json': encode(provenance), 'source/SOURCE-INDEX.json': encode({ fixtureOnly: true }) };
+    const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
+    const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
+      [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
+    const finalPackageCronetSmoke = { os: t.os, arch: t.arch, go: raw.goVersion, gvisorCompiled: true,
+      linkage: t.sidecar ? 'shared-purego' : 'static-cgo', version: '154.0.8037.49',
+      ...(t.sidecar ? { library: `/synthetic/${rootName}/${t.sidecar}`, sha256: digest(sidecarBytes) } : {}) };
+    const files = { [t.core]: coreBytes, LICENSE: Buffer.from('synthetic license'), NOTICE: Buffer.from('synthetic notice'),
+      'licenses/NOTICE': Buffer.from('synthetic notice'), 'provenance.json': encode({ ...provenance, archive: originalArchive }),
+      'source/SOURCE-INDEX.json': encode({ fixtureOnly: true }) };
     files.SHA256SUMS = Buffer.from(Object.keys(files).sort().map((n) => `${digest(files[n])}  ${n}\n`).join(''));
-    if (t.sidecar) { files[t.sidecar] = cronetFixture(key); files.SHA256SUMS = Buffer.from(Object.keys(files).filter((n) => n !== 'SHA256SUMS').sort().map((n) => `${digest(files[n])}  ${n}\n`).join('')); }
+    if (t.sidecar) { files[t.sidecar] = sidecarBytes; files.SHA256SUMS = Buffer.from(Object.keys(files).filter((n) => n !== 'SHA256SUMS').sort().map((n) => `${digest(files[n])}  ${n}\n`).join('')); }
     const archiveFile = join(root, 'inputs', rootName + t.suffix);
     write(join(root, 'members.json'), encode(Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, b.toString('base64')]))));
     mkdirSync(dirname(archiveFile), { recursive: true });
@@ -100,7 +108,7 @@ else:
    b=base64.b64decode(value);info=tarfile.TarInfo(name);info.size=len(b);info.mode=0o755 if name.endswith('/sing-box') else 0o644;z.addfile(info,io.BytesIO(b))
 `, join(root, 'members.json'), archiveFile]);
     const bytes = readFileSync(archiveFile), releaseAsset = asset(rootName + t.suffix, bytes, 20 + Object.keys(contract.platforms).length);
-    contract.platforms[key] = { ...provenance, releaseAsset, archive: { name: releaseAsset.name, bytes: bytes.length, sha256: digest(bytes),
+    contract.platforms[key] = { ...provenance, finalPackageCronetSmoke, releaseAsset, archive: { name: releaseAsset.name, bytes: bytes.length, sha256: digest(bytes),
       members: Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, digest(b)])) },
     core: { member: t.core, bytes: files[t.core].length, sha256: digest(files[t.core]) },
     sidecar: t.sidecar ? { member: t.sidecar, bytes: files[t.sidecar].length, sha256: digest(files[t.sidecar]) } : null };
@@ -479,4 +487,39 @@ test('cumulative strict Risk accepts only the verified published selection and e
   const sourceOnly = structuredClone(f.manifest); delete sourceOnly.desktopRelease;
   write(manifestPath, encode(sourceOnly));
   assert.throws(() => validationContext(candidate, env, f.root));
+}));
+
+
+test('original native receipt and final assembly remain separately bound, with no provenance projection bypass', async () => withFixture(async (f) => {
+  await consumeRelease(f.root, f.manifest, Object.keys(RELEASE_TARGETS), f);
+  for (const key of Object.keys(RELEASE_TARGETS)) {
+    const row = f.contract.platforms[key], target = RELEASE_TARGETS[key];
+    const rootName = `polaris-box-${row.version}-${target.os}-${target.arch}`;
+    const bytes = readFileSync(join(f.root, 'resources', key, 'core-release/provenance.json'));
+    verifyReleaseProvenance(bytes, row, key);
+    assert.throws(() => verifyReleaseProvenance(Buffer.concat([bytes, Buffer.from(' ')]), row, key), /provenance bytes/);
+    const original = JSON.parse(bytes);
+    for (const mutate of [
+      (p) => { delete p.archive; }, (p) => { p.sourceCommit = '0'.repeat(40); },
+      (p) => { p.unreviewed = true; }, (p) => { p.finalPackageCronetSmoke = row.finalPackageCronetSmoke; },
+      (p) => { p.archive.name = 'other.tar.gz'; },
+      (p) => { p.archive.members[`${rootName}/${target.core}`] = '0'.repeat(64); },
+      (p) => { p.archive.members['../escape'] = '0'.repeat(64); },
+      (p) => { p.archive.unreviewed = true; },
+    ]) {
+      const changed = structuredClone(original); mutate(changed);
+      const raw = encode(changed), pin = structuredClone(row);
+      // Rebind only this synthetic member to exercise semantics beyond the byte hash.
+      pin.archive.members[`${rootName}/provenance.json`] = digest(raw);
+      assert.throws(() => verifyReleaseProvenance(raw, pin, key), /lineage|provenance differs/);
+    }
+    for (const mutate of [(r) => { delete r.finalPackageCronetSmoke; },
+      (r) => { r.finalPackageCronetSmoke.gvisorCompiled = false; },
+      (r) => { r.finalPackageCronetSmoke.os = 'other'; },
+      (r) => { r.finalPackageCronetSmoke.go = 'go1.27.1'; },
+      (r) => { r.finalPackageCronetSmoke.linkage = 'unknown'; }]) {
+      const changed = structuredClone(row); mutate(changed);
+      assert.throws(() => verifyReleaseProvenance(bytes, changed, key), /smoke binding/);
+    }
+  }
 }));

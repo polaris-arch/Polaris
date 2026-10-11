@@ -318,10 +318,39 @@ export function verifyReleaseCore(path, row, key, run = execFileSync, host = pro
   }
   return graph;
 }
+export function verifyReleaseProvenance(bytes, row, key) {
+  const target = RELEASE_TARGETS[key], rootName = `polaris-box-${row.version}-${target.os}-${target.arch}`;
+  demand(digest(bytes) === row.archive.members[`${rootName}/provenance.json`], 'Inner provenance bytes differ');
+  const { archive: nativeArchive, ...nativeProducer } = JSON.parse(bytes);
+  const { archive, core, sidecar, releaseAsset, finalPackageCronetSmoke, ...producer } = row;
+  // The producer's original receipt contains its first archive inventory. The
+  // final assembly adds legal/source inputs and a final-package smoke record.
+  // Both records retain their original identities; the pinned member hash above
+  // binds the complete original receipt, including its earlier archive facts.
+  same(nativeProducer, producer, 'Inner release provenance differs');
+  demand(nativeArchive && equalKeys(nativeArchive, ['name', 'bytes', 'sha256', 'members'])
+    && nativeArchive.name === archive.name && positive(nativeArchive.bytes)
+    && nativeArchive.bytes <= archive.bytes && hex(nativeArchive.sha256, 64)
+    && nativeArchive.members && Object.keys(nativeArchive.members).length > 0
+    && Object.entries(nativeArchive.members).every(([name, hash]) => Object.hasOwn(archive.members, name) && hex(hash, 64))
+    && nativeArchive.members[`${rootName}/${core.member}`] === core.sha256
+    && (!sidecar || nativeArchive.members[`${rootName}/${sidecar.member}`] === sidecar.sha256),
+  'Original native archive lineage differs');
+  const smoke = finalPackageCronetSmoke;
+  demand(smoke && smoke.os === target.os && smoke.arch === target.arch
+    && smoke.go === row.sourceFingerprint.goVersion && smoke.gvisorCompiled === true
+    && smoke.linkage === (sidecar ? 'shared-purego' : 'static-cgo')
+    && /^\d+\.\d+\.\d+\.\d+$/.test(smoke.version ?? '')
+    && (sidecar ? smoke.sha256 === sidecar.sha256
+      && typeof smoke.library === 'string' && smoke.library.replaceAll('\\', '/').endsWith(`/${rootName}/${sidecar.member}`)
+      : smoke.library === undefined && smoke.sha256 === undefined), 'Final package Cronet smoke binding differs');
+  return nativeProducer;
+}
+function equalKeys(value, keys) { return canonical(Object.keys(value).sort()) === canonical([...keys].sort()); }
 function verifyExtracted(directory, rootName, row, key, run, host) {
   const root = join(directory, rootName);
-  const { archive, core, sidecar, releaseAsset, ...producer } = row;
-  same(json(join(root, 'provenance.json')), producer, 'Inner release provenance differs');
+  const { archive, core, sidecar } = row;
+  verifyReleaseProvenance(readFileSync(join(root, 'provenance.json')), row, key);
   const sums = Object.keys(archive.members).filter((n) => n !== `${rootName}/SHA256SUMS`).sort()
     .map((n) => `${archive.members[n]}  ${n.slice(rootName.length + 1)}\n`).join('');
   demand(readFileSync(join(root, 'SHA256SUMS'), 'utf8') === sums, 'Inner checksum inventory differs');
