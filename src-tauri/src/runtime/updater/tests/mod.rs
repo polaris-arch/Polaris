@@ -313,16 +313,22 @@ fn core_version_readers_are_asymmetric() {
     );
 }
 
-/// 嵌入清单所选桌面源的 patchedSourceTree 由运行时访问器原样给出。
+/// 嵌入清单所选桌面发布的 sourceTree 或旧源码的 patchedSourceTree 由运行时访问器原样给出。
 #[test]
 fn bundled_patch_set_comes_from_the_embedded_manifest() {
     let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let source = manifest
-        .get("desktopSourceBuild")
-        .unwrap_or(&manifest["sourceBuild"]);
-    let expected = source["patchedSourceTree"]
-        .as_str()
-        .expect("selected patchedSourceTree");
+    let expected = if let Some(release) = manifest.get("desktopRelease") {
+        release["sourceTree"]
+            .as_str()
+            .expect("selected release sourceTree")
+    } else {
+        let source = manifest
+            .get("desktopSourceBuild")
+            .unwrap_or(&manifest["sourceBuild"]);
+        source["patchedSourceTree"]
+            .as_str()
+            .expect("selected patchedSourceTree")
+    };
     assert_eq!(expected.len(), 40);
     assert_eq!(
         bundled_core_patch_set_from_manifest(CORE_MANIFEST_JSON, false).as_deref(),

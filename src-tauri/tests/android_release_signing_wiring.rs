@@ -1414,8 +1414,28 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     ),
     (
         "          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \\",
+        2,
+        "release_check 和 S5 单测各自由 Gradle 显式开启 unsigned，并只跳过已完成的 Rust task；两次调用都必须保留真实退出码。",
+    ),
+    (
+        "            :app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest \\",
         1,
-        "release_check 随后由 Gradle 本次命令行显式开启 unsigned，并只跳过已完成的 Rust task。",
+        "S5 单测清理旧 XML 并执行当前 release variant，不复用历史报告。",
+    ),
+    (
+        "            --tests com.polaris2.app.vpn.DefaultNetworkObservationTest \\",
+        1,
+        "实际执行完整默认网络观察测试类。",
+    ),
+    (
+        "            --tests com.polaris2.app.vpn.NetworkMonitorSessionTest \\",
+        1,
+        "实际执行完整监视器会话测试类。",
+    ),
+    (
+        "            -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon",
+        1,
+        "JUnit 仅跳过本 job 已完成的 Rust build，不跳过编译、测试或签名策略。",
     ),
 ];
 
@@ -1430,6 +1450,9 @@ const LOAD_BEARING_INVOCATIONS: &[&str] = &[
     "sh scripts/",
     "./gradlew",
     "src-tauri/gen/android/gradlew",
+    ":app:cleanTestArm64ReleaseUnitTest",
+    "--tests com.polaris2.app.vpn.",
+    "-PpolarisAllowUnsigned=true -x",
 ];
 
 /// 把一条命令的退出码中和掉的写法。命中任一即红。

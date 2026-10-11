@@ -473,7 +473,11 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
   const contract = loadReleaseContract(root, manifest), run = options.run ?? execFileSync, read = options.read ?? publicBytes;
   const adapter = adapterIdentity(root, run);
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
-  const lock = join(resources, '.release-consumer.lock'); const fd = openSync(lock, 'wx');
+  const lock = join(resources, '.release-consumer.lock');
+  // Exclusivity is the continuously present wx-created path, not an open
+  // descriptor: journal replacement changes its inode already. Windows refuses
+  // replacing an open destination, so release this handle without unlinking.
+  closeSync(openSync(lock, 'wx'));
   let work, preserve = false, replaced = false;
   try {
     work = mkdtempSync(join(resources, '.release-consumer-'));
@@ -524,7 +528,6 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     } catch (e) { if (replaced || e.message.startsWith('Release rollback failed;')) preserve = true; throw e; }
     return receipts;
   } finally {
-    closeSync(fd);
     if (!preserve) rmSync(lock);
     if (work && !preserve) rmSync(work, { recursive: true, force: true });
   }

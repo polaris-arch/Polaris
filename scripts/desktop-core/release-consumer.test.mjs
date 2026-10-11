@@ -1,6 +1,8 @@
 // Synthetic bytes and mocked public HTTP/Go metadata. No Git init, HTTP, core or C API execution.
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
   rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -256,6 +258,35 @@ test('exclusive lock and linked resource path fail without following a link or o
   symlinkSync(outside, join(f.root, 'resources/linux'), process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], f), /Non-regular/);
   assert.equal(readFileSync(join(outside, 'original'), 'utf8'), 'protected');
+}));
+test('Windows held-destination fixture preserves a continuous exclusive path while atomically replacing journals', async () => withFixture(async (f) => {
+  const original = { openSync: fs.openSync, closeSync: fs.closeSync, renameSync: fs.renameSync };
+  const held = new Map(); let journalReplacements = 0, checkedOwner = false;
+  const lock = join(f.root, 'resources/.release-consumer.lock');
+  fs.openSync = (...args) => { const fd = original.openSync(...args); held.set(fd, String(args[0])); return fd; };
+  fs.closeSync = (fd) => { original.closeSync(fd); held.delete(fd); };
+  fs.renameSync = (from, to) => {
+    if ([...held.values()].includes(String(to))) throw Object.assign(Error('Windows fixture: open destination'), { code: 'EPERM' });
+    if (String(to) === lock) { assert(existsSync(lock), 'journal replacement must not unlink the exclusive path'); journalReplacements++; }
+    return original.renameSync(from, to);
+  };
+  syncBuiltinESMExports();
+  try {
+    mkdirSync(join(f.root, 'resources'), { recursive: true });
+    // First show that this OS-semantics fixture rejects the real held-file case.
+    const fd = fs.openSync(lock, 'wx'); const next = join(f.root, 'held-next'); write(next, 'inert');
+    assert.throws(() => fs.renameSync(next, lock), { code: 'EPERM' }); fs.closeSync(fd); rmSync(lock); rmSync(next);
+    const read = async (...args) => {
+      if (!checkedOwner) {
+        checkedOwner = true; assert(existsSync(lock));
+        assert.throws(() => recoverRelease(f.root), /still active/);
+        await assert.rejects(consumeRelease(f.root, f.manifest, ['win'], f), /EEXIST/);
+      }
+      return f.read(...args);
+    };
+    await consumeRelease(f.root, f.manifest, ['win'], { ...f, read });
+    assert(checkedOwner); assert.equal(journalReplacements, 3); assert.equal(held.size, 0); assert(!existsSync(lock));
+  } finally { Object.assign(fs, original); syncBuiltinESMExports(); }
 }));
 test('portable canonical fingerprints retain Python ASCII encoding including Unicode and non-BMP text', () => {
   const value = { z: '界😀\u007f', a: ['é', 0] };

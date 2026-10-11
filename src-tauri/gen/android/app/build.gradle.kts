@@ -277,6 +277,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    // Shared JVM test sources call Tauri Android's public ObjectMapper API.
+    // Tauri keeps Jackson as implementation, so expose its same pinned version
+    // to test compilation only; release APK dependency scopes stay unchanged.
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.15.3")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
