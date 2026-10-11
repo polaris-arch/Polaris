@@ -92,6 +92,10 @@ on:
         type: string
         required: false
         default: ''
+      core_wire_input_artifact:
+        type: string
+        required: false
+        default: ''
       # 风险门专用的轻量构建开关（2026-10-07）。true ⇒ 打包腿不做 fat LTO、并行 codegen，
       # 产物**不是可分发物**（不上传、不进 release）。只有 release-risk.yml 传 true；
       # tag push 与本 workflow 的手动 dispatch 都没有这个输入 ⇒ 恒为 false ⇒ 发行构型一字不动。
@@ -377,6 +381,7 @@ jobs:
       # 它与上面两个开关的组合由 `Select installer build weight` 步 fail-closed 校验。
       POLARIS_LIGHT_BUILD: ${{ inputs.light_build && '1' || '0' }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       # fail-fast: false 保留（2026-07-31 复核，判据同 ci.yml 那条，别单独优化掉一个）：
       # fail-fast: true 只在「**快**腿先挂、慢腿还在途」时才省得下额度——它取消的是在途 job。
@@ -395,6 +400,10 @@ jobs:
         include: ${{ fromJSON(needs.setup.outputs.include) }}
 
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 179 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.candidate }}
@@ -1554,11 +1563,17 @@ jobs:
       && (needs.desktop_core.result == 'success'
         || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     env:
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
       POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
+      CORE_WIRE_INPUT_ARTIFACT: ${{ inputs.core_wire_input_artifact }}
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.candidate }}
@@ -1610,6 +1625,7 @@ jobs:
           cache: false
 
       - name: Download exact candidate core bundle
+        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.CORE_BUNDLE_ARTIFACT }}
@@ -1617,10 +1633,32 @@ jobs:
 
       # 不传 --platform = 四平台全量消费并逐份校验，与打包腿同一条命令。
       - name: Consume sing-box core bundle
+        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
         shell: bash
         env:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+
+      - name: Require current-attempt wire artifact identity
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs check --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
+
+      - name: Download current-attempt preflight wire inputs
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.CORE_WIRE_INPUT_ARTIFACT }}
+          path: ${{ runner.temp }}/core-wire-inputs
+
+      - name: Verify and import current-attempt preflight wire inputs
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs import --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
 
       # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
       # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。

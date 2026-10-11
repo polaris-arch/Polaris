@@ -18,6 +18,7 @@ import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
 import { validationContext } from './validation-origin.mjs';
 import { verifyPackagedSource } from './bundle.mjs';
+import { coreWireHandoffName, createCoreWireHandoff, importCoreWireHandoff, packCoreWireHandoff, unpackCoreWireHandoff } from './wire-input-handoff.mjs';
 import { assertSourceFirstRelease } from '../assert-pc-runtime-release.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
 
@@ -711,7 +712,7 @@ const observedQuotaHeaders = { 'x-github-request-id': 'E3C0:358CB1:1F5A584:25413
   'x-ratelimit-resource': 'core' };
 test('observed primary quota waits beyond reset once and retries the identical anonymous request', async () => {
   const calls = [], waits = [], reports = [];
-  const read = releasePublicReader({ now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
+  const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
     fetch: async (url, options) => { calls.push({ url, options });
       return calls.length === 2 ? new Response('ok') : new Response('denied', { status: 403, headers: observedQuotaHeaders }); } });
   const url = 'https://api.github.com/repos/polaris-arch/polaris-box';
@@ -726,7 +727,7 @@ test('observed primary quota waits beyond reset once and retries the identical a
 });
 test('a second quota denial is terminal without another wait or request', async () => {
   let calls = 0; const waits = [];
-  const read = releasePublicReader({ now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: () => {},
+  const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: () => {},
     fetch: async () => { calls++; return new Response('denied', { status: 429, headers: observedQuotaHeaders }); } });
   await assert.rejects(read('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 429/);
   assert.equal(calls, 2); assert.deepEqual(waits, [500758]);
@@ -742,12 +743,13 @@ test('unknown, expired, excessive, asset and noncanonical denials never consume 
     { headers: { 'x-ratelimit-limit': '5000' } }, { headers: { 'x-ratelimit-remaining': '1' } },
     { headers: { 'x-ratelimit-resource': 'search' } }, { headers: { 'x-ratelimit-reset': '' } },
     { headers: { 'x-ratelimit-reset': 'NaN' } }, { headers: { 'x-ratelimit-reset': '1791755097' } },
-    { headers: { 'x-ratelimit-reset': '1791755700' } }, { headers: { 'x-ratelimit-reset': '99999999999999999999' } },
-    { headers: { 'retry-after': '601' } }, { headers: { 'retry-after': 'bad' } },
+    { headers: { 'x-ratelimit-reset': String(Math.floor(quotaNow / 1000) + 3661) } },
+    { headers: { 'x-ratelimit-reset': '99999999999999999999' } },
+    { headers: { 'retry-after': '3661' } }, { headers: { 'retry-after': 'bad' } },
   ];
   for (const c of cases) {
     let calls = 0, waits = 0;
-    const read = releasePublicReader({ now: () => quotaNow, sleep: async () => { waits++; }, report: () => {},
+    const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => { waits++; }, report: () => {},
       fetch: async () => { calls++; return new Response('denied', { status: c.status ?? 403,
         headers: { ...observedQuotaHeaders, ...c.headers } }); } });
     await assert.rejects(read(c.url ?? base, 10, c.asset ?? false), /Release HTTP/);
@@ -756,12 +758,12 @@ test('unknown, expired, excessive, asset and noncanonical denials never consume 
 });
 test('quota recovery still enforces pinned response size and public identity without replacing resources', async () => withFixture(async (f) => {
   let calls = 0;
-  const read = releasePublicReader({ now: () => quotaNow, sleep: async () => {}, report: () => {},
+  const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => {}, report: () => {},
     fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
       : new Response('larger than the pin') });
   await assert.rejects(read(f.base, 2), /exceeds pinned size/); assert.equal(calls, 2);
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
-  const changed = releasePublicReader({ now: () => quotaNow, sleep: async () => {}, report: () => {},
+  const changed = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => {}, report: () => {},
     fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
       : new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })) });
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
@@ -778,4 +780,104 @@ test('default consumption uses the anonymous reader and preserves strict origina
     assert.deepEqual(receipts.linux.producer, f.contract.platforms.linux);
     assert(calls.length > 10); assert(calls.every((c) => c.options.headers.Authorization === undefined));
   } finally { globalThis.fetch = previous; }
+}));
+
+test('actual next-run reset beyond ten minutes is covered within one primary-window budget', async () => {
+  let requests = 0; const waits = [];
+  const read = releasePublicReader({ deadlineMs: 1791756567959 + 120 * 60000, now: () => 1791756567959, sleep: async (ms) => waits.push(ms), report: () => {},
+    fetch: async () => ++requests === 1 ? new Response('denied', { status: 403,
+      headers: { ...observedQuotaHeaders, 'x-ratelimit-reset': '1791757286',
+        'x-github-request-id': '9371:10BA2F:27BEFC0:2DB19BB:6ACC0918' } }) : new Response('ok') });
+  assert.equal((await read('https://api.github.com/repos/polaris-arch/polaris-box', 2)).toString(), 'ok');
+  assert.deepEqual(waits, [719041]); assert.equal(requests, 2);
+});
+test('absolute job deadline forbids an overrun, expired requests and a retry after time advances past cutoff', async () => {
+  let requests = 0, waits = 0;
+  const fetch = async () => { requests++; return new Response('denied', { status: 403, headers: observedQuotaHeaders }); };
+  const short = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 500000, fetch,
+    sleep: async () => { waits++; }, report: () => {} });
+  await assert.rejects(short('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 403/);
+  assert.equal(requests, 1); assert.equal(waits, 0);
+  const expired = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow - 1, fetch });
+  await assert.rejects(expired('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
+  assert.equal(requests, 1);
+  let clock = quotaNow; requests = 0;
+  const cutoff = quotaNow + 501000;
+  const late = releasePublicReader({ now: () => clock, deadlineMs: cutoff, fetch, report: () => {},
+    sleep: async () => { waits++; clock = cutoff + 1; } });
+  await assert.rejects(late('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
+  assert.equal(requests, 1); assert.equal(waits, 1);
+  for (const deadlineMs of ['bad', NaN, Infinity, quotaNow + 181 * 60000]) {
+    assert.throws(() => releasePublicReader({ now: () => quotaNow, deadlineMs, fetch }), /absolute release-consumer deadline/);
+  }
+});
+
+const handoffEnv = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_RUN_ID: '123',
+  GITHUB_RUN_ATTEMPT: '1', GITHUB_REF: 'refs/heads/inert', POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' };
+async function handoffFixture(f) {
+  await consumeRelease(f.root, f.manifest, undefined, f);
+  const before = resources(f), bundle = join(f.root, 'core-wire-inputs');
+  const options = { env: handoffEnv, run: f.run, host: 'linux' };
+  const name = createCoreWireHandoff(f.root, f.manifest, bundle, candidate, options);
+  for (const n of ['.release-receipts', ...Object.keys(RELEASE_TARGETS)]) rmSync(join(f.root, 'resources', n), { recursive: true });
+  return { before, bundle, options, name };
+}
+test('same-attempt wire handoff runs complete resource verification without repeating public consumption', async () => withFixture(async (f) => {
+  const h = await handoffFixture(f), calls = f.calls.length;
+  assert.equal(h.name, coreWireHandoffName(candidate, { runId: '123', attempt: '1' }));
+  const observation = importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options);
+  assert.equal(observation.candidate, candidate); assert.equal(observation.context.attempt, '1');
+  assert.deepEqual(resources(f), h.before); assert.equal(f.calls.length, calls);
+  for (const [key, target] of Object.entries(RELEASE_TARGETS)) {
+    verifyPackagedRelease(f.root, f.manifest, key, join(f.root, 'resources', key, target.core), f.run, 'linux');
+  }
+}));
+test('handoff rejects old attempts, source, artifact aliases, native mode and tags before resource writes', async () => withFixture(async (f) => {
+  const h = await handoffFixture(f);
+  const cases = [
+    { options: { ...h.options, env: { ...handoffEnv, GITHUB_RUN_ATTEMPT: '2' } } },
+    { options: { ...h.options, env: { ...handoffEnv, GITHUB_RUN_ID: '124' } } },
+    { options: { ...h.options, env: { ...handoffEnv, POLARIS_NATIVE_PAYLOAD_VALIDATION: '1' } } },
+    { options: { ...h.options, env: { ...handoffEnv, GITHUB_REF: 'refs/tags/inert' } } },
+    { candidate: 'd'.repeat(40) }, { name: h.name + '-alias' },
+  ];
+  for (const c of cases) {
+    assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, c.candidate ?? candidate,
+      c.name ?? h.name, c.options ?? h.options)); assert.deepEqual(resources(f), {});
+  }
+}));
+test('actual tar transport preserves executable modes despite artifact outer-file mode reset', async () => withFixture(async (f) => {
+  const h = await handoffFixture(f), packed = join(f.root, 'wire-archive');
+  const pin = packCoreWireHandoff(h.bundle, packed); assert(pin.archive.bytes > 0);
+  for (const n of readdirSync(packed)) fs.chmodSync(join(packed, n), 0o644);
+  const payload = unpackCoreWireHandoff(packed, join(f.root, 'wire-extracted'));
+  assert.equal(fs.statSync(join(payload, 'resources/linux/sing-box')).mode & 0o777, 0o755);
+  importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
+  assert.deepEqual(resources(f), h.before);
+  const tar = join(packed, pin.archive.name), original = readFileSync(tar);
+  const changed = Buffer.from(original); changed[Math.floor(changed.length / 2)] ^= 1; write(tar, changed);
+  const rejected = join(f.root, 'wire-corrupt-extracted');
+  assert.throws(() => unpackCoreWireHandoff(packed, rejected)); assert.equal(existsSync(rejected), false);
+}));
+test('handoff closes changed bytes, unsafe modes, links, extra members and changed manifest without writes', async () => withFixture(async (f) => {
+  const h = await handoffFixture(f), core = join(h.bundle, 'resources/linux/sing-box'), original = readFileSync(core);
+  const failed = () => { assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options)); assert.deepEqual(resources(f), {}); };
+  write(core, Buffer.alloc(original.length, 0)); failed(); write(core, original); fs.chmodSync(core, 0o755);
+  fs.chmodSync(core, 0o777); failed(); fs.chmodSync(core, 0o755);
+  const extra = join(h.bundle, 'resources/linux/extra'); write(extra, 'extra'); failed(); rmSync(extra);
+  symlinkSync(core, extra); failed(); rmSync(extra);
+  const manifest = join(f.root, 'src-tauri/core-manifest.json'), raw = readFileSync(manifest);
+  write(manifest, Buffer.concat([raw, Buffer.from(' ')])); failed(); write(manifest, raw);
+}));
+test('handoff does not overwrite existing resources and invalid receipts roll back its own fresh copies', async () => withFixture(async (f) => {
+  const h = await handoffFixture(f); write(join(f.root, 'resources/linux/sing-box'), 'existing'); const before = resources(f);
+  assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options), /fresh resource destinations/);
+  assert.deepEqual(resources(f), before); rmSync(join(f.root, 'resources/linux'), { recursive: true });
+  const proofPath = join(h.bundle, 'handoff.json'), proof = JSON.parse(readFileSync(proofPath));
+  const receipt = join(h.bundle, 'resources/.release-receipts/linux.json'), raw = readFileSync(receipt);
+  const changed = Buffer.from(raw); changed[changed.indexOf(Buffer.from('polaris-app-release-consumption-v1'))] = 'x'.charCodeAt(0); write(receipt, changed);
+  const file = proof.files.find((r) => r.name === '.release-receipts/linux.json'); file.sha256 = digest(changed);
+  const { fingerprint, ...facts } = proof; write(proofPath, encode({ ...facts, fingerprint: digest(portableCanonical(facts)) }));
+  assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options), /consumption receipt differs/);
+  assert.deepEqual(resources(f), {});
 }));

@@ -127,3 +127,41 @@ test('Release Risk checks all fetched cores only on kernel-impact changes', () =
   assert.match(protoc.body, /^        run: node scripts\/fetch-protoc\.mjs$/m);
   assert.ok(fetch.start < rust.start && rust.start < protoc.start && protoc.start < wire.start);
 });
+
+test('ordinary preflight passes fresh same-attempt bytes while Package keeps its full wire job and independent default', () => {
+  const risk = readFileSync(join(root, '.github/workflows/release-risk.yml'), 'utf8');
+  const pkg = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
+  const preflight = job(risk, 'preflight'), packageCaller = executable(job(risk, 'package'));
+  const nativeCaller = executable(job(risk, 'native_payload')), wire = job(pkg, 'core_wire');
+  const prepare = step(preflight, 'Prepare current-attempt wire inputs');
+  const runtime = step(preflight, 'Run mandatory bundled-core gates');
+  assert.ok(runtime.start < prepare.start, 'handoff must follow complete original preflight checks');
+  assert.match(prepare.body, /wire-input-handoff\.mjs create --bundle-dir="\$WIRE_INPUTS" --candidate="\$CORE_CANDIDATE"/);
+  assert.match(preflight, /core_wire_input_artifact: \$\{\{ steps\.wire-inputs\.outputs\.artifact_name \}\}/);
+  assert.match(packageCaller, /core_wire_input_artifact: \$\{\{ needs\.preflight\.outputs\.core_wire_input_artifact \}\}/);
+  assert.doesNotMatch(nativeCaller, /core_wire_input_artifact/);
+  const fetch = step(wire, 'Consume sing-box core bundle'), imported = step(wire, 'Verify and import current-attempt preflight wire inputs');
+  const checked = step(wire, 'Require current-attempt wire artifact identity'), downloaded = step(wire, 'Download current-attempt preflight wire inputs');
+  assert.ok(checked.start < downloaded.start && downloaded.start < imported.start);
+  assert.match(checked.body, /wire-input-handoff\.mjs check .*--candidate="\$CORE_CANDIDATE" --artifact-name="\$CORE_WIRE_INPUT_ARTIFACT"/);
+  assert.match(fetch.body, /if: env\.CORE_WIRE_INPUT_ARTIFACT == ''/);
+  assert.match(imported.body, /if: env\.CORE_WIRE_INPUT_ARTIFACT != ''/);
+  assert.match(imported.body, /wire-input-handoff\.mjs import .*--candidate="\$CORE_CANDIDATE" --artifact-name="\$CORE_WIRE_INPUT_ARTIFACT"/);
+  assert.ok(imported.start < step(wire, wireStep).start); assertWireStep(wire, { kernelOnly: false });
+  assert.equal(jobIf(executable(wire)), jobIf(executable(job(pkg, 'package'))));
+  assert.match(pkg, /core_wire_input_artifact:\n        type: string\n        required: false\n        default: ''/);
+  assert.doesNotMatch(executable(wire), /continue-on-error|\|\| true/);
+});
+
+test('every production consumption job seeds an absolute deadline before tools and has a finite outer timeout', () => {
+  for (const [file, name, timeout] of [['desktop-core.yml', 'produce', 90], ['release-risk.yml', 'preflight', 120],
+    ['package.yml', 'core_wire', 120], ['package.yml', 'package', 180], ['ci.yml', 'test', 120]]) {
+    const block = job(readFileSync(join(root, '.github/workflows', file), 'utf8'), name);
+    assert.match(block, new RegExp(`^    timeout-minutes: ${timeout}$`, 'm'));
+    const setter = step(block, 'Set absolute release-consumer job deadline');
+    assert.ok(setter.start < block.split('\n').findIndex((line) => /uses: actions\/checkout@/.test(line)));
+    assert.ok(setter.body.includes(`Date.now() + ${timeout - 1} * 60000`));
+    assert.match(setter.body, /POLARIS_RELEASE_JOB_DEADLINE_MS=/);
+    assert(timeout > 61 && timeout <= 180, 'bounded primary wait must fit within a finite job limit');
+  }
+});

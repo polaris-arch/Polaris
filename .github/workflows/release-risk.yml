@@ -197,7 +197,14 @@ jobs:
     needs: [classify, desktop_core]
     if: needs.classify.outputs.preflight == 'true'
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      core_wire_input_artifact: ${{ steps.wire-inputs.outputs.artifact_name }}
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.classify.outputs.candidate }}
@@ -290,6 +297,28 @@ jobs:
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
 
+      # Carry checked resources within this exact candidate/run/attempt. The
+      # downstream core_wire job still runs its full wire check, without a
+      # second HTTP consumption. Other Package entry points remain independent.
+      - name: Prepare current-attempt wire inputs
+        id: wire-inputs
+        if: needs.classify.outputs.has_package == 'true'
+        shell: bash
+        env:
+          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
+          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs create --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE"
+
+      - name: Upload current-attempt wire inputs
+        if: steps.wire-inputs.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.wire-inputs.outputs.artifact_name }}
+          path: ${{ runner.temp }}/core-wire-inputs
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   package:
     name: package selected platforms
     needs: [classify, preflight, desktop_core]
@@ -313,6 +342,7 @@ jobs:
       light_build: true
       core_candidate: ${{ needs.classify.outputs.candidate }}
       core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
+      core_wire_input_artifact: ${{ needs.preflight.outputs.core_wire_input_artifact }}
     secrets: inherit
 
   # ══ Android release-profile 产物腿 ══

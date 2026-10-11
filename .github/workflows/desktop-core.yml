@@ -61,13 +61,17 @@ jobs:
     needs: plan
     name: native core input (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         # Frozen DNS inputs use four fresh native producers in this attempt.
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 89 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate }}

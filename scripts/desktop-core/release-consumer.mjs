@@ -21,6 +21,7 @@ export const RELEASE_TARGETS = Object.freeze({
   'mac-arm64': { os: 'darwin', arch: 'arm64', core: 'sing-box', sidecar: null, suffix: '.tar.gz', cgo: '1' },
 });
 export const ADAPTER_FILES = ['scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/release-archive.py',
+  'scripts/desktop-core/wire-input-handoff.mjs',
   'scripts/desktop-core/release-native-gates.mjs',
   'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/desktop-core/bundle.mjs',
   'scripts/lib/cronet-payload.mjs', 'scripts/native-payload-input.mjs', 'scripts/verify-packaging.mjs',
@@ -226,14 +227,22 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
 }
 
 // Redirects are permitted only for immutable asset bytes, whose expected hash is already pinned.
-const PRIMARY_QUOTA_WAIT_MS = 10 * 60 * 1000;
+// An anonymous primary quota window is one hour. Bound recovery to one window
+// plus a minute of clock/reset margin, shared by the whole consumption.
+const PRIMARY_QUOTA_WAIT_MS = 61 * 60 * 1000;
 // One evidenced primary-quota recovery across the entire consumption, including
 // both public snapshots. Asset denials and unknown API denials stay fail-closed.
 export function releasePublicReader(options = {}) {
   const quotaBudget = { available: true };
-  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget });
+  const now = options.now ?? Date.now;
+  const supplied = options.deadlineMs ?? process.env.POLARIS_RELEASE_JOB_DEADLINE_MS;
+  const deadlineMs = supplied === undefined ? now() + 120 * 60 * 1000 : Number(supplied);
+  demand((supplied === undefined || /^[0-9]+$/.test(String(supplied)))
+    && Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= now() + 180 * 60 * 1000,
+  'Invalid absolute release-consumer deadline');
+  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget, deadlineMs });
 }
-function primaryQuotaDelay(response, endpoint, asset, now) {
+function primaryQuotaDelay(response, endpoint, asset, now, deadline) {
   const reset = response.headers.get('x-ratelimit-reset'), retry = response.headers.get('retry-after');
   if (asset || ![403, 429].includes(response.status) || endpoint.protocol !== 'https:'
     || endpoint.hostname !== 'api.github.com' || endpoint.port || endpoint.username || endpoint.password
@@ -244,7 +253,8 @@ function primaryQuotaDelay(response, endpoint, asset, now) {
   const resetMs = Number(reset) * 1000;
   if (!Number.isSafeInteger(resetMs) || resetMs <= now) return null;
   const delay = Math.max(resetMs - now + 1000, retry === null ? 0 : Number(retry) * 1000);
-  return Number.isSafeInteger(delay) && delay > 0 && delay <= PRIMARY_QUOTA_WAIT_MS ? delay : null;
+  return Number.isSafeInteger(delay) && delay > 0 && delay <= PRIMARY_QUOTA_WAIT_MS
+    && now + delay < deadline ? delay : null;
 }
 export async function publicBytes(url, limit, asset = false, options = {}) {
   const request = options.fetch ?? fetch;
@@ -255,9 +265,12 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     // included in failure diagnostics. Preserve denial until its cause is known.
     const stage = asset ? (redirects ? 'asset-redirect' : 'asset') : 'public-api';
     const location = `stage=${stage} host=${endpoint.hostname} path=${endpoint.pathname}`;
+    const now = (options.now ?? Date.now)();
+    const remaining = options.deadlineMs === undefined ? 60000 : options.deadlineMs - now;
+    demand(remaining > 0, `Release consumer job deadline exceeded (${location})`);
     let response;
     try {
-      response = await request(url, { redirect: 'manual', signal: AbortSignal.timeout(60000), headers });
+      response = await request(url, { redirect: 'manual', signal: AbortSignal.timeout(Math.min(60000, remaining)), headers });
     } catch (error) {
       const kind = ['AbortError', 'TimeoutError', 'TypeError', 'Error'].includes(error?.name) ? error.name : 'Error';
       throw new Error(`Release request failed (${location}; ${kind})`);
@@ -274,7 +287,7 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
         'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after']
         .map((name) => `${name}=${response.headers.get(name) ?? 'unknown'}`).join(', ');
       const delay = options.quotaBudget?.available
-        ? primaryQuotaDelay(response, endpoint, asset, (options.now ?? Date.now)()) : null;
+        ? primaryQuotaDelay(response, endpoint, asset, (options.now ?? Date.now)(), options.deadlineMs) : null;
       if (delay !== null) {
         options.quotaBudget.available = false;
         (options.report ?? console.error)(`Release primary quota wait ${delay}ms (${location}; ${quota})`);
@@ -559,11 +572,11 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
         signaturePolicy: POLICY, macCodeSignature: releaseMacCodeSignature(row, key),
         actualAppAcceptance: 'pending native load, gvisor/mixed, feature and final carrier gates' };
       const receipt = { schema: 'polaris-app-release-consumption-v1', ...facts, fingerprint: digest(portableCanonical(facts)) };
-      writeFileSync(join(metadata, `${key}.json`), JSON.stringify(receipt, null, 2) + '\n'); receipts[key] = receipt;
+      writeFileSync(join(metadata, `${key}.json`), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 }); receipts[key] = receipt;
     }
     const after = await publicSnapshot(contract, read); same(after, before, 'Release identity changed during acquisition');
-    writeFileSync(join(metadata, 'public-readback.json'), JSON.stringify({ schema: 'polaris-app-release-readback-v1', contractSha256: manifest.desktopRelease.contractSha256, before, after }, null, 2) + '\n');
-    writeFileSync(join(metadata, 'polaris-box-assets.json'), index);
+    writeFileSync(join(metadata, 'public-readback.json'), JSON.stringify({ schema: 'polaris-app-release-readback-v1', contractSha256: manifest.desktopRelease.contractSha256, before, after }, null, 2) + '\n', { mode: 0o600 });
+    writeFileSync(join(metadata, 'polaris-box-assets.json'), index, { mode: 0o600 });
     journal.phase = 'replacing'; journal.directories = [...keys, '.release-receipts'].map((key) => ({ key,
       original: existsSync(join(resources, key)) ? directoryFingerprint(join(resources, key)) : null,
       staged: directoryFingerprint(join(stage, key)) }));

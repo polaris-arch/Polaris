@@ -633,6 +633,7 @@ jobs:
   test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       # 维持 false 的理由见 lint job 的同名字段（那段别优化掉；两个矩阵 job 取同一判据）。
       fail-fast: false
@@ -650,6 +651,10 @@ jobs:
                   || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
 
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
 
       # 与 lint job 同口径钉 Node 26（测试会读仓库脚本；不借 runner 镜像的浮动预装版本）。
