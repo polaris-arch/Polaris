@@ -88,6 +88,10 @@ fn bundled_core_patch_set_from_manifest(raw: &str, mobile: bool) -> Option<Strin
         return None;
     }
     let manifest = serde_json::from_str::<CoreManifest>(raw).ok()?;
+    if let Some(selection) = manifest.extra.get("desktopRelease") {
+        return polaris_updater::core_release::desktop_release_identity(selection)
+            .map(|(_, tree)| tree.to_owned());
+    }
     let source = if let Some(source) = manifest.extra.get("desktopSourceBuild") {
         frozen_desktop_source_version(
             &manifest,
@@ -286,6 +290,12 @@ fn bundled_core_version_with_ios(
         return Ok(manifest.bundled_core_version);
     }
     if !ios {
+        if let Some(selection) = manifest.extra.get("desktopRelease") {
+            return Ok(
+                polaris_updater::core_release::desktop_release_identity(selection)
+                    .map_or_else(String::new, |(version, _)| version.to_owned()),
+            );
+        }
         if let Some(source) = manifest.extra.get("desktopSourceBuild") {
             return Ok(frozen_desktop_source_version(
                 &manifest,

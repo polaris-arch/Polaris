@@ -71,6 +71,7 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { hasDesktopSource, desktopSourceBaseline, validateSourcePins, desktopSourceManifestPath, validateSourceManifest, verifyHash, digest, requireGraph } from './desktop-core/source-graph.mjs';
+import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -79,6 +80,19 @@ const CORE_VERSION = coreManifest.bundledCoreVersion;
 let CRONET_SHA;
 const MODULE_PROXY = 'https://proxy.golang.org';
 const MODULE_BASE = 'github.com/sagernet/cronet-go/lib';
+
+if (hasDesktopRelease(coreManifest)) {
+  try {
+    const request = resolveCronetRequest(process.argv.slice(2));
+    loadReleaseContract(ROOT, coreManifest);
+    if (!request.checkOnly) for (const target of request.targets) {
+      verifyPackagedRelease(ROOT, coreManifest, target.key,
+        join(ROOT, 'resources', target.key, target.key === 'win' ? 'sing-box.exe' : 'sing-box'));
+    }
+    console.log('Release Cronet contract checked; libraries come exclusively from the core archive');
+    process.exit(0);
+  } catch (error) { console.error(`FAILED release Cronet: ${error.message}`); process.exit(1); }
+}
 
 let request;
 try {

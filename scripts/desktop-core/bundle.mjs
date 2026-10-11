@@ -2,6 +2,7 @@
 // Ordinary CI retrieves four exact-candidate native artifacts; only the reviewed
 // validation-v2 envelope may preserve three explicitly pinned original origins.
 import { execFileSync } from 'node:child_process';
+import { hasDesktopRelease, verifyPackagedRelease } from './release-consumer.mjs';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync,
   writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -115,6 +116,7 @@ export function consumeDesktopBundle(root, manifest, directory, candidate, keys 
 }
 
 export function verifyPackagedSource(root, manifest, key, binary, run, host = process.platform) {
+  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run);
   const spec = validateSourcePins(manifest, key, false);
   const receipt = readJson(join(root, 'resources/.source-receipts', `${key}.json`));
   const inventory = readJson(join(root, 'resources/.source-receipts/bundle.json'));

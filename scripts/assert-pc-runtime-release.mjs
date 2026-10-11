@@ -67,6 +67,8 @@ const readRepository = (relative) => readFileSync(join(root, relative));
 
 export function assertSourceFirstRelease(read = readRepository) {
   const manifest = JSON.parse(read('src-tauri/core-manifest.json'));
+  requireGraph(!Object.hasOwn(manifest, 'desktopRelease'),
+    'Published release consumption does not inherit source-first formal App release approval');
   for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
   const spec = validateSourcePins(manifest, 'linux', false);
   const sourcePath = desktopSourceManifestPath(spec);

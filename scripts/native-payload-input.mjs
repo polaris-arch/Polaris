@@ -8,6 +8,7 @@ import { validationContext, VALIDATION_SCHEMA } from './desktop-core/validation-
 import { buildInfoFingerprint, canonical, desktopSourceManifestPath, digest, requireGraph,
   sourceOwnedReplacements, validateBuildInfo, validateSourcePins, verifyHash } from './desktop-core/source-graph.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
+import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 
 function regular(path) {
   let cursor = resolve(path);
@@ -25,6 +26,23 @@ export function inspectNativePayload(root, key, core, library, run = execFileSyn
     && basename(library) === (key === 'win' ? 'libcronet.dll' : 'libcronet.so')
     && dirname(core) === dirname(library), 'Canonical colocated payload required');
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
+  if (hasDesktopRelease(manifest)) {
+    const contract = loadReleaseContract(root, manifest);
+    const receipt = verifyPackagedRelease(root, manifest, key, core, run);
+    const row = contract.platforms[key];
+    const cronet = verifyCronetPayload(join(root, 'resources', key, basename(library)), library, key, manifest);
+    const module = `github.com/sagernet/cronet-go/lib/${key === 'win' ? 'windows' : 'linux'}_amd64`;
+    const acquisition = row.buildGraph.prebuiltAcquisitionModules.filter((d) => d.module === module);
+    requireGraph(acquisition.length === 1, 'Release core lacks exact platform Cronet acquisition module');
+    return { schema: 'polaris-native-release-payload-input-v1', candidate: receipt.adapter.facts.candidate, platform: key,
+      core: { path: core, sha256: row.core.sha256, mode: lstatSync(core).mode & 0o7777,
+        buildID: row.buildID, goVersion: row.sourceFingerprint.goVersion },
+      library: { path: library, ...cronet, module, moduleIdentity: acquisition[0] },
+      producer: row, consumerReceiptFingerprint: receipt.fingerprint, adapter: receipt.adapter,
+      origin: { kind: 'published-fork-release', contractSha256: receipt.contractSha256,
+        releaseId: contract.releaseId, tagObject: contract.tagObject, assetIndex: contract.assetIndex, releaseAsset: row.releaseAsset },
+      actualAppAcceptance: receipt.actualAppAcceptance };
+  }
   const spec = validateSourcePins(manifest, key, false);
   const receipt = JSON.parse(readFileSync(join(root, `resources/.source-receipts/${key}.json`)));
   const inventory = JSON.parse(readFileSync(join(root, 'resources/.source-receipts/bundle.json')));

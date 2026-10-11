@@ -78,6 +78,7 @@ import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
+import { hasDesktopRelease, loadReleaseContract, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -973,7 +974,17 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   //
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
-  if (hasDesktopSource(manifest)) {
+  if (hasDesktopRelease(manifest)) {
+    try {
+      const contract = loadReleaseContract(ROOT, manifest);
+      const android = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const apple = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(android, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateReleaseNotice(texts.NOTICE, manifest, contract, { android: identity(android), apple: identity(apple) });
+    } catch (error) { fail(error.message); }
+  } else if (hasDesktopSource(manifest)) {
     try {
       const spec = validateSourcePins(manifest, 'linux', false);
       const path = join(ROOT, desktopSourceManifestPath(spec));
@@ -2072,7 +2083,7 @@ function checkPayload(label, root) {
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
         const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
-        if (coreManifest && (hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
+        if (coreManifest && (Object.hasOwn(coreManifest, 'desktopRelease') || hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
           try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
           catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
         } else if (label === 'windows' && family.what === 'sing-box') {
@@ -3232,7 +3243,10 @@ try {
 
 function runMode() {
   const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
-  if (hasDesktopSource(manifest)) {
+  if (hasDesktopRelease(manifest)) {
+    try { loadReleaseContract(ROOT, manifest); }
+    catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
+  } else if (hasDesktopSource(manifest)) {
     try {
       for (const key of Object.keys(CORE_TO_CONF)) validateSourcePins(manifest, key, false);
     } catch (error) {

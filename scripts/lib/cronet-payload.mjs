@@ -189,7 +189,12 @@ function regularBytes(path) {
 // Both input and final payload bind to the manifest's source-library digest.
 // Same size, GNU Build ID and an already-processed AppDir are never authority.
 export function verifyCronetPayload(source, payload, platform, manifest) {
-  const pin = validateCronetLibraryPins(manifest.cronetLibrarySha256)[platform];
+  // Release verification is performed by verifyPackagedRelease before this static
+  // same-package check; an explicit block never borrows the legacy library pins.
+  const pin = Object.hasOwn(manifest, 'desktopRelease')
+    ? manifest.desktopRelease.librarySha256?.[platform]
+    : validateCronetLibraryPins(manifest.cronetLibrarySha256)[platform];
+  demand(typeof pin === 'string' && /^[a-f0-9]{64}$/.test(pin), 'release library pin missing');
   const sourceBytes = regularBytes(source), payloadBytes = regularBytes(payload);
   demand(sha256(sourceBytes) === pin, 'source SHA-256 differs from manifest pin');
   demand(sha256(payloadBytes) === pin, 'final SHA-256 differs from manifest pin');

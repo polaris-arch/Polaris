@@ -12,6 +12,7 @@ import { produceDesktopCore } from './desktop-core/build-core.mjs';
 import { consumeDesktopBundle, coreFilename, writeBundleInventory } from './desktop-core/bundle.mjs';
 import { writeValidationBundle } from './desktop-core/validation-origin.mjs';
 import { validateSourcePins } from './desktop-core/source-graph.mjs';
+import { consumeRelease, hasDesktopRelease, recoverRelease, releasePlatforms } from './desktop-core/release-consumer.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
@@ -47,23 +48,32 @@ function valueOf(name) {
   return args[0]?.slice(name.length + 3);
 }
 try {
-  validateSourcePins(manifest, PICKED[0].key, false);
-  const candidate = valueOf('candidate');
-  const bundle = valueOf('bundle-dir');
-  if (process.argv.includes('--producer')) {
-    if (!ONLY || ONLY.length !== 1 || !bundle || process.argv.includes('--assemble')) {
-      throw new Error('Producer requires exactly one explicit --platform and --bundle-dir; do not fake cross-platform native builds');
+  if (hasDesktopRelease(manifest)) {
+    if (process.argv.slice(2).length === 1 && process.argv[2] === '--recover-release') {
+      console.log(JSON.stringify(recoverRelease(ROOT)));
+    } else {
+      await consumeRelease(ROOT, manifest, releasePlatforms(process.argv.slice(2)));
+      console.log('Pinned release resources ready; native App acceptance remains pending');
     }
-    const key = ONLY[0];
-    const receipt = produceDesktopCore(ROOT, manifest, key, join(bundle, key, coreFilename(key)), candidate);
-    console.log(JSON.stringify({ candidate, platform: key, binarySha256: receipt.binarySha256, fingerprint: receipt.fingerprint }));
-  } else if (process.argv.includes('--assemble')) {
-    if (!bundle || ONLY) throw new Error('Assembly requires --bundle-dir and all four producer outputs');
-    if (process.argv.includes('--validation-origin')) writeValidationBundle(ROOT, bundle, candidate);
-    else writeBundleInventory(bundle, candidate);
   } else {
-    if (!bundle) throw new Error('Consumption requires --bundle-dir containing all four candidate producer outputs');
-    consumeDesktopBundle(ROOT, manifest, bundle, candidate, PICKED.map((target) => target.key));
+    validateSourcePins(manifest, PICKED[0].key, false);
+    const candidate = valueOf('candidate');
+    const bundle = valueOf('bundle-dir');
+    if (process.argv.includes('--producer')) {
+      if (!ONLY || ONLY.length !== 1 || !bundle || process.argv.includes('--assemble')) {
+        throw new Error('Producer requires exactly one explicit --platform and --bundle-dir; do not fake cross-platform native builds');
+      }
+      const key = ONLY[0];
+      const receipt = produceDesktopCore(ROOT, manifest, key, join(bundle, key, coreFilename(key)), candidate);
+      console.log(JSON.stringify({ candidate, platform: key, binarySha256: receipt.binarySha256, fingerprint: receipt.fingerprint }));
+    } else if (process.argv.includes('--assemble')) {
+      if (!bundle || ONLY) throw new Error('Assembly requires --bundle-dir and all four producer outputs');
+      if (process.argv.includes('--validation-origin')) writeValidationBundle(ROOT, bundle, candidate);
+      else writeBundleInventory(bundle, candidate);
+    } else {
+      if (!bundle) throw new Error('Consumption requires --bundle-dir containing all four candidate producer outputs');
+      consumeDesktopBundle(ROOT, manifest, bundle, candidate, PICKED.map((target) => target.key));
+    }
   }
 } catch (error) {
   console.error(`FAILED desktop source graph: ${error.message}`);
