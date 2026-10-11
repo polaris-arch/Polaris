@@ -1462,11 +1462,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'actual ZIP proof failed' }
 
       - name: Upload native payload evidence
-        if: inputs.native_validation == true
+        if: ${{ !cancelled() && inputs.native_validation == true }}
         uses: actions/upload-artifact@v7
         with:
           name: native-payload-proof-${{ env.CORE_CANDIDATE }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
           path: native-payload-evidence/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Preserve Windows App stage bytes and failure evidence
+        if: ${{ !cancelled() && inputs.native_validation == true && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-app-bytes-${{ env.CORE_CANDIDATE }}-${{ github.run_id }}-${{ github.run_attempt }}-windows
+          path: |
+            native-payload-evidence/app-bytes/**
+            target/release/polaris.exe
+            target/release/nsis/x64/installer.nsi
+            dist-win/*.exe
+            dist-win/*-Portable.zip
           if-no-files-found: error
           retention-days: 7
 

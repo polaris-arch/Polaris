@@ -30,6 +30,166 @@ ENV = {'POLARIS_NATIVE_PAYLOAD_VALIDATION': '1', 'GITHUB_ACTIONS': 'true', 'GITH
 
 
 class NativeContract(unittest.TestCase):
+    @staticmethod
+    def inert_app(token=final.BUNDLE_UNK):
+        data = bytearray(1024); data[:2] = b'MZ'; struct.pack_into('<I', data, 0x3c, 0x80)
+        data[0x80:0x84] = b'PE\0\0'
+        struct.pack_into('<HHIIIHH', data, 0x84, 0x8664, 1, 0, 0, 0, 240, 0x22)
+        struct.pack_into('<H', data, 0x98, 0x20b); struct.pack_into('<I', data, 0x98 + 108, 16)
+        data[512:512+len(token)] = token
+        return bytes(data)
+
+    def test_exact_nsis_bundle_transform_and_zip_identity(self):
+        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.1')
+        self.assertEqual(len(source), len(expected))
+        self.assertEqual(expected, source[:512] + final.BUNDLE_NSS + source[512+len(final.BUNDLE_UNK):])
+        self.assertEqual(final.expected_windows_app(source, 'zip', '2.12.1'), source)
+        self.assertEqual(final.byte_differences(source, expected), [{'offset': 536, 'endExclusive': 539, 'beforeHex': '554e4b', 'afterHex': '4e5353'}])
+        for data in [self.inert_app(b''), self.inert_app(final.BUNDLE_NSS), self.inert_app(final.BUNDLE_PREFIX+b'MSI'),
+                     source+final.BUNDLE_UNK]:
+            with self.subTest(source=data[-25:]), self.assertRaisesRegex(ValueError, 'unique unpatched'):
+                final.expected_windows_app(data, 'nsis', '2.12.1')
+        for kind in ['nsis','zip']:
+            with self.assertRaisesRegex(ValueError, 'unreviewed Tauri CLI'):
+                final.expected_windows_app(source, kind, '2.11.4')
+
+    def test_existing_other_bundle_tokens_survive_and_each_byte_change_is_rejected(self):
+        # Runtime comparison strings are not additional patch targets. Include
+        # NSS/MSI and opaque same-prefix bytes before and after the unique UNK.
+        source=bytearray(self.inert_app())
+        other=[(400,final.BUNDLE_NSS),(600,final.BUNDLE_PREFIX+b'MSI'),(700,final.BUNDLE_PREFIX+b'BAD')]
+        for offset,token in other: source[offset:offset+len(token)]=token
+        source=bytes(source)
+        nsis=source[:512]+b'__TAURI_BUNDLE_TYPE_VAR_NSS'+source[539:]
+        self.assertEqual(final.expected_windows_app(source,'nsis','2.12.1'),nsis)
+        self.assertEqual(final.expected_windows_app(source,'zip','2.12.1'),source)
+        signature={'status':'NotSigned','signerThumbprint':None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(final,'windows_signature',return_value=signature):
+            root=Path(tmp);app=root/'polaris.exe'
+            for kind,expected in [('nsis',nsis),('zip',source)]:
+                app.write_bytes(expected)
+                final.verify_windows_app(app,source,expected,root/kind,{'kind':kind,'source':{'Authenticode':signature}})
+                for offset,token in other:
+                    # Mutate every byte in each other constant, including its
+                    # shared prefix. None of these offsets is exempted.
+                    for position in range(offset,offset+len(token)):
+                        changed=bytearray(expected);changed[position]^=1;app.write_bytes(changed)
+                        evidence={'kind':kind,'source':{'Authenticode':signature}}
+                        with self.subTest(kind=kind,position=position), self.assertRaisesRegex(ValueError,'exact carrier-stage'):
+                            final.verify_windows_app(app,source,expected,root/kind,evidence)
+                        self.assertEqual((root/kind/'actual.exe').read_bytes(),bytes(changed))
+
+    def test_app_byte_gate_rejects_other_mutations_and_retains_complete_failure_bytes(self):
+        source = self.inert_app(); expected = final.expected_windows_app(source, 'nsis', '2.12.1')
+        signature = {'status':'NotSigned','signerThumbprint':None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(final, 'windows_signature', return_value=signature):
+            root=Path(tmp); app=root/'polaris.exe'
+            for kind, wanted, actual in [
+                ('nsis',expected,expected), ('zip',source,source),
+                ('nsis',expected,source), ('nsis',expected,self.inert_app(final.BUNDLE_PREFIX+b'MSI')),
+                ('nsis',expected,expected[:20]+b'X'+expected[21:]),
+                ('nsis',expected,expected+b'x'), ('nsis',expected,expected[:-1]),
+                ('zip',source,expected),
+            ]:
+                with self.subTest(kind=kind, actualSHA=final.hashlib.sha256(actual).hexdigest()):
+                    directory=root/('case'+str(len(list(root.iterdir())))); directory.mkdir(); app.write_bytes(actual)
+                    evidence={'kind':kind,'source':{'Authenticode':signature}}
+                    if actual==wanted:
+                        result=final.verify_windows_app(app,source,wanted,directory,evidence)
+                        self.assertEqual(result['expectedSha256'],result['sha256'])
+                    else:
+                        with self.assertRaisesRegex(ValueError,'exact carrier-stage'):
+                            final.verify_windows_app(app,source,wanted,directory,evidence)
+                    self.assertEqual((directory/'actual.exe').read_bytes(),actual)
+                    saved=json.loads((directory/'app-byte-evidence.json').read_text(encoding='utf-8'))
+                    self.assertEqual(saved['completeFileBytesEqualExpected'],actual==wanted)
+                    self.assertEqual(saved['actual']['bytes'],len(actual))
+                    self.assertEqual(saved['sourceToActualDifferences'],final.byte_differences(source,actual))
+            app.write_bytes(expected)
+            with patch.object(final,'windows_signature',return_value={'status':'Valid','signerThumbprint':'bad'}):
+                with self.assertRaisesRegex(ValueError,'unsigned/no-certificate'):
+                    final.verify_windows_app(app,source,expected,root/'signed',{'kind':'nsis','source':{'Authenticode':signature}})
+            # Even a NotSigned observation cannot excuse a PE certificate table.
+            certificate=bytearray(source); struct.pack_into('<II',certificate,0x98+144,512,8)
+            certificate=bytes(certificate); app.write_bytes(certificate)
+            with self.assertRaisesRegex(ValueError,'unsigned/no-certificate'):
+                final.verify_windows_app(app,certificate,certificate,root/'certificate',{'kind':'zip','source':{'Authenticode':signature}})
+
+    def test_app_baseline_binds_runtime_version_generated_nsis_input_and_portable_member(self):
+        source=self.inert_app()+final.BUNDLE_NSS+final.BUNDLE_PREFIX+b'MSI'; signature={'status':'NotSigned','signerThumbprint':None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(final,'windows_signature',return_value=signature), \
+                patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.1\n') as cli:
+            root=Path(tmp); (root/'target/release/nsis/x64').mkdir(parents=True)
+            (root/'scripts').mkdir(); (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            app=root/'target/release/polaris.exe'; app.write_bytes(source)
+            script=root/'target/release/nsis/x64/installer.nsi'
+            script.write_text(f'!define MAINBINARYSRCPATH "{app}"\n  File "${{MAINBINARYSRCPATH}}"\n',encoding='utf-8-sig')
+            (root/'dist-win').mkdir(); archive=root/'dist-win/Polaris-test-Portable.zip'
+            with zipfile.ZipFile(archive,'w') as z: z.writestr('polaris.exe',source)
+            evidence={}; directory=root/'evidence'
+            observed, expected=final.windows_app_baseline(root,'nsis',directory,evidence)
+            self.assertEqual(observed,source); self.assertEqual(expected,final.expected_windows_app(source,'nsis','2.12.1'))
+            self.assertEqual((directory/'source.exe').read_bytes(),source)
+            self.assertEqual((directory/'portable.exe').read_bytes(),source)
+            self.assertEqual((directory/'installer.nsi').read_bytes(),script.read_bytes())
+            self.assertEqual(evidence['generatedNSISMainFileInput']['inputPath'],str(app))
+            for runtime in [b'tauri-cli 2.11.4\n',b'tauri-cli 2.12.1\nextra']:
+                cli.return_value=runtime
+                with self.assertRaisesRegex(ValueError,'actual Tauri CLI'):
+                    final.windows_app_baseline(root,'nsis',directory,{})
+            cli.return_value=b'tauri-cli 2.12.1\n'
+            (root/'scripts/tauri-cli.version').write_text('2.11.4\n')
+            with self.assertRaisesRegex(ValueError,'unreviewed Tauri CLI'):
+                final.windows_app_baseline(root,'nsis',directory,{})
+            (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            script.write_text('!define MAINBINARYSRCPATH "different.exe"\n  File "${MAINBINARYSRCPATH}"\n')
+            with self.assertRaises(ValueError): final.windows_app_baseline(root,'nsis',directory,{})
+
+    def test_final_nsis_actual_failure_retains_bytes_before_temporary_cleanup_and_blocks_native(self):
+        source=self.inert_app(); expected=final.expected_windows_app(source,'nsis','2.12.1')
+        signature={'status':'NotSigned','signerThumbprint':None}
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'target/release/nsis/x64').mkdir(parents=True); (root/'scripts').mkdir()
+            (root/'scripts/tauri-cli.version').write_text('2.12.1\n')
+            app=root/'target/release/polaris.exe'; app.write_bytes(source)
+            (root/'target/release/nsis/x64/installer.nsi').write_text(
+                f'!define MAINBINARYSRCPATH "{app}"\n  File "${{MAINBINARYSRCPATH}}"\n',encoding='utf-8-sig')
+            (root/'dist-win').mkdir()
+            with zipfile.ZipFile(root/'dist-win/Polaris-test-Portable.zip','w') as z: z.writestr('polaris.exe',source)
+            artifact=root/'dist-win/inert-setup.exe'; artifact.write_bytes(b'not executed')
+            output=root/'native-payload-evidence/final-nsis.json'; destinations=[]
+            def install_fixture(artifact,destination,root):
+                destinations.append(destination); destination.mkdir()
+                (destination/'polaris.exe').write_bytes(expected+b'unrelated mutation')
+                (destination/'sing-box.exe').write_bytes(b'not executed')
+                (destination/'libcronet.dll').write_bytes(b'not loaded')
+            with patch.object(final,'ci_context',return_value={'candidate':'c'*40,'runId':'900','attempt':'1'}), \
+                    patch.object(final,'windows_signature',return_value=signature), \
+                    patch.object(final,'pwsh',return_value=b'tauri-cli 2.12.1\n'), \
+                    patch.object(final,'nsis_install',side_effect=install_fixture) as installer, \
+                    patch.object(final,'prove',side_effect=AssertionError('native proof must not run')) as native_proof:
+                with self.assertRaisesRegex(ValueError,'exact carrier-stage'):
+                    final.final_proof(root,'win',artifact,'nsis',output)
+                installer.assert_called_once(); native_proof.assert_not_called()
+            self.assertFalse(destinations[0].exists()); self.assertFalse(output.exists())
+            directory=output.parent/'app-bytes/nsis'
+            self.assertEqual((directory/'actual.exe').read_bytes(),expected+b'unrelated mutation')
+            self.assertEqual((directory/'source.exe').read_bytes(),source)
+            self.assertEqual((directory/'expected.exe').read_bytes(),expected)
+            self.assertEqual((directory/'portable.exe').read_bytes(),source)
+            evidence=json.loads((directory/'app-byte-evidence.json').read_text(encoding='utf-8'))
+            self.assertFalse(evidence['completeFileBytesEqualExpected'])
+            self.assertIn('exact carrier-stage',evidence['failure']['message'])
+
+    def test_windows_failure_upload_keeps_exact_evidence_without_new_installation(self):
+        workflow=(ROOT/'.github/workflows/package.yml').read_text(encoding='utf-8')
+        block=workflow.split('- name: Preserve Windows App stage bytes and failure evidence')[1].split('# ── 上传产物')[0]
+        self.assertIn("!cancelled() && inputs.native_validation == true && runner.os == 'Windows'",block)
+        for path in ['native-payload-evidence/app-bytes/**','target/release/polaris.exe',
+                     'target/release/nsis/x64/installer.nsi','dist-win/*.exe','dist-win/*-Portable.zip']:
+            self.assertIn(path,block)
+        self.assertNotIn('run:',block)
+
     def test_nsis_policy_reads_utf8_with_windows_legacy_default_before_native_actions(self):
         raw = (ROOT / 'src-tauri/tauri.conf.json').read_bytes()
         # The actual repository config contains Chinese text that CP1252 rejects.
