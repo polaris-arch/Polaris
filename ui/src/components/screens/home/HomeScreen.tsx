@@ -702,6 +702,7 @@ export function HomeScreen() {
     if (!diskConfig) return;
     try {
       const receipt = await switchServer(DIRECT_SERVER_ID);
+      if (!receipt) return;
       const feedback = switchReceiptFeedback(receipt, t('home.directConnection'), t);
       if (feedback?.tone === 'success') toast.success(feedback.text);
       else if (feedback?.tone === 'warning') toast.warning(feedback.text);
@@ -721,6 +722,7 @@ export function HomeScreen() {
     if (!diskConfig || blockDisabledReason) return;
     try {
       const receipt = await switchServer(BLOCK_SERVER_ID);
+      if (!receipt) return;
       const feedback = switchReceiptFeedback(receipt, t('home.routingBlock'), t);
       if (feedback?.tone === 'success') toast.success(feedback.text);
       else if (feedback?.tone === 'warning') toast.warning(feedback.text);

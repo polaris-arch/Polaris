@@ -1089,7 +1089,7 @@ fn ambiguous_tag_and_unmanaged_scoped_override_block_emission() {
 }
 
 #[test]
-fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
+fn selected_core_accepts_managed_dns_and_route_shape() {
     let repo_core =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/linux/sing-box");
     let core = std::env::var_os("POLARIS_TEST_CORE")
@@ -1100,15 +1100,40 @@ fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
             std::env::var("POLARIS_REQUIRE_KERNEL_GATE").as_deref(),
             Ok("1")
         );
-        eprintln!("fixed b609 core absent; set POLARIS_TEST_CORE or fetch package core");
+        eprintln!("selected core absent; set POLARIS_TEST_CORE or fetch package core");
         return;
     }
-    let version = std::process::Command::new(&core)
-        .arg("version")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&version.stdout)
-        .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.join("src-tauri/core-manifest.json")).unwrap())
+            .unwrap();
+    if let Some(selection) = manifest.get("desktopRelease") {
+        // Validate exact selected bytes/receipt/provider/BuildID before execution;
+        // the same gate then checks successful version and full Version/Revision.
+        let identity = std::process::Command::new("node")
+            .arg("scripts/desktop-core/managed-mesh-core.mjs")
+            .arg(&core)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            identity.status.success(),
+            "selected managed core identity failed: {}",
+            String::from_utf8_lossy(&identity.stderr)
+        );
+        let verified: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
+        assert_eq!(verified["sourceCommit"], selection["sourceCommit"]);
+        assert_eq!(verified["sourceTree"], selection["sourceTree"]);
+    } else {
+        // Preserve the separately selected legacy b609 fixture contract.
+        let version = std::process::Command::new(&core)
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert!(String::from_utf8_lossy(&version.stdout)
+            .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    }
     let mut input = input();
     input.policy.overrides.push(MeshOverride {
         rule_id: "corp-only".into(),

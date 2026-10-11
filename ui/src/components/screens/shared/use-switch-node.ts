@@ -25,6 +25,7 @@ export function useSwitchNode(): (id: string) => Promise<void> {
       const nodeName = servers.find((s) => s.id === id)?.name ?? '';
       try {
         const receipt = await switchServer(id);
+        if (!receipt) return;
         const feedback = switchReceiptFeedback(receipt, nodeName, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);

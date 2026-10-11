@@ -749,7 +749,7 @@ async fn changed_binary_or_payload_after_check_cannot_publish_manifest() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn fixed_b609_core_check_accepts_only_the_staged_config_bytes() {
+async fn selected_core_check_accepts_only_the_staged_config_bytes() {
     let bundled =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources/linux/sing-box");
     let binary = std::env::var_os("POLARIS_TEST_CORE")
@@ -759,17 +759,42 @@ async fn fixed_b609_core_check_accepts_only_the_staged_config_bytes() {
         assert_ne!(
             std::env::var("POLARIS_REQUIRE_KERNEL_GATE").as_deref(),
             Ok("1"),
-            "fixed b609 core is required for this gate"
+            "selected core is required for this gate"
         );
-        eprintln!("fixed b609 core absent; set POLARIS_TEST_CORE or fetch package core");
+        eprintln!("selected core absent; set POLARIS_TEST_CORE or fetch package core");
         return;
     }
-    let version = std::process::Command::new(&binary)
-        .arg("version")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&version.stdout)
-        .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.join("src-tauri/core-manifest.json")).unwrap())
+            .unwrap();
+    if let Some(selection) = manifest.get("desktopRelease") {
+        // Validate exact selected bytes/receipt/provider/BuildID before execution;
+        // the same gate then checks successful version and full Version/Revision.
+        let identity = std::process::Command::new("node")
+            .arg("scripts/desktop-core/managed-mesh-core.mjs")
+            .arg(&binary)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            identity.status.success(),
+            "selected managed core identity failed: {}",
+            String::from_utf8_lossy(&identity.stderr)
+        );
+        let verified: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
+        assert_eq!(verified["sourceCommit"], selection["sourceCommit"]);
+        assert_eq!(verified["sourceTree"], selection["sourceTree"]);
+    } else {
+        // Preserve the separately selected legacy b609 fixture contract.
+        let version = std::process::Command::new(&binary)
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert!(String::from_utf8_lossy(&version.stdout)
+            .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    }
     let (dir, input, plan, legacy, config, rules) = fixture();
     let expected = receipt(&input, &plan, &config, &rules);
     let closure = validate_closure(

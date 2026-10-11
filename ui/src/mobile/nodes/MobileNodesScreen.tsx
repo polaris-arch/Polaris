@@ -272,6 +272,7 @@ export function MobileNodesScreen(): ReactElement {
       void runWrite(
         async () => {
           const receipt = await switchServer(row.server.id);
+          if (!receipt) return;
           const feedback = mobileSwitchReceiptFeedback(receipt, row.server.name, t);
           if (feedback?.tone === 'success') {
             setNotice(undefined);

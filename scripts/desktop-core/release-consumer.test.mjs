@@ -13,6 +13,7 @@ import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
   verifyReleaseProvenance } from './release-consumer.mjs';
+import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
 import { validationContext } from './validation-origin.mjs';
@@ -83,7 +84,7 @@ function fixture(options = {}) {
       normalModules: [{ module: 'example.com/inert', version: 'v1.0.0', h1: 'h1:AA=' }],
       prebuiltAcquisitionModules: t.sidecar ? [{ module: `github.com/sagernet/cronet-go/lib/${t.os}_amd64`, version: 'v1.0.0', h1: 'h1:BB=' }] : [],
       localReplacement: { module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '' } },
-      consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\n`, fixtureOnly: true };
+      consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\nRevision: ${commit}\n`, fixtureOnly: true };
     const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
     const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
       [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
@@ -602,3 +603,28 @@ test('original native receipt and final assembly remain separately bound, with n
     }
   }
 }));
+
+test('selected managed mesh identity binds original release bytes, receipt and full version observation', async () => withFixture(async f => {
+  await consumeRelease(f.root,f.manifest,['linux'],f);
+  const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux; let versions=0;
+  const run=(command,args,options)=>{if(command===core){assert.deepEqual(args,['version']);versions++;return row.actualVersionOutput;}return f.run(command,args,options);};
+  const id=verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'});
+  assert.equal(id.sourceCommit,commit);assert.equal(id.sourceTree,tree);assert.equal(id.coreSha256,row.core.sha256);
+  assert.equal(id.providerFingerprint,row.providerFingerprint);assert.equal(id.buildID,row.buildID);assert.equal(versions,1);
+}));
+test('selected managed mesh wrong core bytes fail before executing version', async () => withFixture(async f => {
+  await consumeRelease(f.root,f.manifest,['linux'],f);
+  const core=join(f.root,'resources/linux/sing-box'), bytes=readFileSync(core);bytes[220]^=1;writeFileSync(core,bytes);let versions=0;
+  const run=(command,args,options)=>{if(command===core){versions++;return f.contract.platforms.linux.actualVersionOutput;}return f.run(command,args,options);};
+  assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),/bytes differ/);assert.equal(versions,0);
+}));
+test('selected managed mesh wrong Revision and nonzero version both fail after strict metadata verification', async () => withFixture(async f => {
+  await consumeRelease(f.root,f.manifest,['linux'],f);const core=join(f.root,'resources/linux/sing-box'), row=f.contract.platforms.linux;
+  for(const fail of ['revision','status']){let versions=0;
+   const run=(command,args,options)=>{if(command===core){versions++;if(fail==='status')throw Object.assign(Error('version status 7'),{status:7});return row.actualVersionOutput.replace(`Revision: ${commit}`,`Revision: ${'9'.repeat(40)}`);}return f.run(command,args,options);};
+   assert.throws(()=>verifyManagedMeshCore(f.root,f.manifest,core,run,{os:'linux',arch:'x64'}),fail==='status'?/version status 7/:/version output differs/);assert.equal(versions,1);
+  }
+}));
+test('selected managed mesh refuses foreign hosts before inspecting or executing a core', () => {
+  for(const host of [{os:'win32',arch:'x64'},{os:'linux',arch:'arm64'}])assert.throws(()=>verifyManagedMeshCore('/absent',{},'/absent',()=>assert.fail('foreign execution'),host),/native Linux amd64/);
+});

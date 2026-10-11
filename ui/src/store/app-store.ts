@@ -185,7 +185,7 @@ export interface AppState {
   updateProxyMode: (mode: ProxyMode) => Promise<void>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
-  switchServer: (serverId: string) => Promise<ServerSwitchReceipt>;
+  switchServer: (serverId: string) => Promise<ServerSwitchReceipt | null>;
   setProxyStatus: (status: ProxyStatus | null) => void;
   refreshProxyStatus: () => Promise<void>;
   setTrafficStats: (stats: TrafficStats | null) => void;
@@ -399,12 +399,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   switchServer: async (serverId) => {
     // 与暂存保存/配置补丁共用同一条 webview 内写队列：快速连点必须按调用顺序落盘，
     // 否则较慢的旧 IPC 可能最后回包，把最后一次点击覆盖回旧节点。
-    const { receipt, config, readGeneration } = await withConfigWriteLock(async () => {
+    const readback = await withConfigWriteLock(async () => {
       const receipt = await api.server.switch(serverId);
       const readGeneration = configReadGeneration.beginRead();
-      return { receipt, config: await api.config.get(), readGeneration };
+      try {
+        return { receipt, config: await api.config.get(), readGeneration };
+      } catch (error) {
+        if (!configReadGeneration.isCurrent(readGeneration)) return null;
+        throw error;
+      }
     });
-    if (!configReadGeneration.isCurrent(readGeneration)) return receipt;
+    if (!readback || !configReadGeneration.isCurrent(readback.readGeneration)) return null;
+    const { receipt, config } = readback;
     invalidateLoadConfig();
     set({
       config,
@@ -413,9 +419,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
       dnsRules: config.dnsRules ?? [],
     });
-    const hydration = hydrateStagedConfig(config);
+    const publicationGeneration = configReadGeneration.current();
+    const hydration = hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publicationGeneration));
     if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') await hydration;
-    return receipt;
+    // A newer publication/read also owns feedback during asynchronous iOS hydration.
+    return configReadGeneration.isCurrent(publicationGeneration) ? receipt : null;
   },
 
   setProxyStatus: (status) => set({ proxyStatus: status }),

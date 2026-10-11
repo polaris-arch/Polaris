@@ -574,6 +574,7 @@ export function MobileHomeScreen(): ReactElement {
       }
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(server.id);
+        if (!receipt) return;
         const feedback = mobileSwitchReceiptFeedback(receipt, server.name, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
@@ -599,6 +600,7 @@ export function MobileHomeScreen(): ReactElement {
       }
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(id);
+        if (!receipt) return;
         const label = t(kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock');
         const feedback = mobileSwitchReceiptFeedback(receipt, label, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);

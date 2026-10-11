@@ -276,4 +276,27 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
    }finally{await page.close();}
   });
  }
+ for (const [surface,choice] of [['mobile-nodes','node-a'],['mobile-home','node-a'],['mobile-home','__direct__'],['mobile-home','__block__']] as const) {
+  it(`${surface}: stale applied manual ${choice} readback preserves window B without A success feedback`, async () => {
+   const page=await open(surface,true);try {
+    await page.evaluate(()=> {const f=(window as any).__actions;f.hold=true;f.delayNextRead=true;});
+    if(surface==='mobile-nodes')await page.locator('[data-exit-write="node-use"]').filter({hasText:'Fixture a'}).click();
+    else if(choice==='node-a'){
+     if(await page.locator('[data-picker-node="node-a"]').count()===0)await page.locator('[data-group-id="sub-a"]').click();
+     await page.locator('[data-picker-node="node-a"] [data-exit-write="home-node-pick"]').click();
+    }else await page.locator(`[data-exit-write="home-sentinel-${choice==='__direct__'?'direct':'block'}"]`).click();
+    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
+    expect((await state(page)).calls[0]).toEqual({cmd:'server_switch',args:{serverId:choice}});
+    await page.evaluate(()=> (window as any).__actions.finish());
+    await expect.poll(()=>page.evaluate(()=> (window as any).__actions.readJobs.length)).toBe(1);
+    await page.evaluate(()=> (window as any).__actions.manual());
+    await expect.poll(async()=> (await state(page)).config.selectedServerId).toBe('node-b');
+    await page.evaluate(async()=> {const f=(window as any).__actions;f.readJobs[0].release();await new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));});
+    expect((await state(page)).config.selectedServerId).toBe('node-b');
+    expect((await state(page)).saved.selectedServerId).toBe('node-b');
+    expect((await state(page)).messages).toEqual([]);
+   }finally{await page.close();}
+  });
+ }
+
 });
