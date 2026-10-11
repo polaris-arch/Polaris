@@ -17,7 +17,7 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def extract(path, destination, record, root):
+def extract(path, destination, record, root, target=None):
     require(0 < record['bytes'] <= 512 * 1024 * 1024 and Path(path).stat().st_size == record['bytes'],
             'archive bytes differ')
     data = Path(path).read_bytes()
@@ -59,6 +59,16 @@ def extract(path, destination, record, root):
                 kind = stat.S_IFMT(mode)
                 require(not info.flag_bits & 1 and kind in [0, stat.S_IFDIR if directory else stat.S_IFREG],
                         'encrypted/link/special ZIP member')
+                # The frozen Windows publisher stamps regular files 0100666
+                # and its sing-box.exe 0100777. Only this explicit target and
+                # these exact regular-file modes create safe private copies;
+                # all archive/member hashes, link/special/path/collision guards
+                # remain in force. Never restore group/other write bits.
+                if target == 'windows/amd64':
+                    if mode == (stat.S_IFREG | 0o666):
+                        mode = stat.S_IFREG | 0o644
+                    elif info.filename == root + '/sing-box.exe' and mode == (stat.S_IFREG | 0o777):
+                        mode = stat.S_IFREG | 0o755
                 with archive.open(info) as stream:
                     member(info.filename, directory, mode or (0o755 if directory else 0o644),
                            info.file_size, stream.read)
@@ -102,4 +112,4 @@ def extract(path, destination, record, root):
 
 if __name__ == '__main__':
     request = json.load(sys.stdin)
-    extract(sys.argv[1], sys.argv[2], request['archive'], request['root'])
+    extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], request.get('target'))

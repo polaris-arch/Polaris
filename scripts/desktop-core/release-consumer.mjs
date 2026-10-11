@@ -226,17 +226,35 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
 }
 
 // Redirects are permitted only for immutable asset bytes, whose expected hash is already pinned.
-export async function publicBytes(url, limit, asset = false) {
+export async function publicBytes(url, limit, asset = false, options = {}) {
+  const request = options.fetch ?? fetch;
   for (let redirects = 0; redirects <= 3; redirects++) {
-    const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(60000),
-      headers: { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' } });
+    const endpoint = new URL(url);
+    const headers = { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' };
+    // Keep public reads anonymous. Neither credentials nor a signed query are
+    // included in failure diagnostics. Preserve denial until its cause is known.
+    const stage = asset ? (redirects ? 'asset-redirect' : 'asset') : 'public-api';
+    const location = `stage=${stage} host=${endpoint.hostname} path=${endpoint.pathname}`;
+    let response;
+    try {
+      response = await request(url, { redirect: 'manual', signal: AbortSignal.timeout(60000), headers });
+    } catch (error) {
+      const kind = ['AbortError', 'TimeoutError', 'TypeError', 'Error'].includes(error?.name) ? error.name : 'Error';
+      throw new Error(`Release request failed (${location}; ${kind})`);
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       await response.body?.cancel(); const next = new URL(response.headers.get('location') ?? '', url);
       demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
         && ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname), 'Unapproved release redirect');
       url = next.href; continue;
     }
-    demand(response.ok, `Release HTTP ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel();
+      const quota = ['x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
+        'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after']
+        .map((name) => `${name}=${response.headers.get(name) ?? 'unknown'}`).join(', ');
+      throw new Error(`Release HTTP ${response.status} (${location}; ${quota})`);
+    }
     const parts = []; let size = 0;
     for await (const part of response.body) {
       size += part.length;
@@ -249,7 +267,7 @@ export async function publicBytes(url, limit, asset = false) {
 }
 async function publicSnapshot(contract, read) {
   const request = async (path) => JSON.parse(await read(`${API}${path}`, 8 * 1024 * 1024, false));
-  const repo = await request(''); demand(repo.id === 1407705262 && repo.full_name === REPO, 'Repository identity differs');
+  const repo = await request(''); demand(repo.id === 1407705262 && repo.full_name === REPO && repo.private === false, 'Repository identity differs');
   const release = await request(`/releases/${contract.releaseId}`);
   demand(release.id === contract.releaseId && release.tag_name === contract.tag && release.draft === false
     && release.html_url === `https://github.com/${REPO}/releases/tag/${contract.tag}`, 'Published release identity differs');
@@ -498,7 +516,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       writeFileSync(archive, bytes, { flag: 'wx' });
       const extracted = join(work, `unpacked-${key}`), rootName = validateRow(contract, key, row);
       run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
-        { input: JSON.stringify({ archive: row.archive, root: rootName }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
+        { input: JSON.stringify({ archive: row.archive, root: rootName, target: row.target }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
       const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform);
       const dest = join(stage, key); mkdirSync(dest);
       const existing = join(resources, key);

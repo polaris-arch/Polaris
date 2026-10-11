@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
-  RELEASE_TARGETS, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
+  RELEASE_TARGETS, publicBytes, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
   verifyReleaseProvenance } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
@@ -100,16 +100,16 @@ function fixture(options = {}) {
     write(join(root, 'members.json'), encode(Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, b.toString('base64')]))));
     mkdirSync(dirname(archiveFile), { recursive: true });
     execFileSync(PYTHON, ['-B', '-c', `import base64,io,json,sys,tarfile,zipfile
-members=json.load(open(sys.argv[1])); path=sys.argv[2]
+members=json.load(open(sys.argv[1])); path=sys.argv[2]; zip_mode=int(sys.argv[3]); core_mode=int(sys.argv[4])
 if path.endswith('.zip'):
  with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as z:
   for name,value in members.items():
-   info=zipfile.ZipInfo(name);info.external_attr=(0o100755 if name.endswith('sing-box.exe') else 0o100644)<<16;z.writestr(info,base64.b64decode(value))
+   info=zipfile.ZipInfo(name);info.external_attr=((core_mode if name.endswith('/sing-box.exe') else 0) or zip_mode or (0o100755 if name.endswith('sing-box.exe') else 0o100644))<<16;z.writestr(info,base64.b64decode(value))
 else:
  with tarfile.open(path,'w:gz') as z:
   for name,value in members.items():
    b=base64.b64decode(value);info=tarfile.TarInfo(name);info.size=len(b);info.mode=0o755 if name.endswith('/sing-box') else 0o644;z.addfile(info,io.BytesIO(b))
-`, join(root, 'members.json'), archiveFile]);
+`, join(root, 'members.json'), archiveFile, String(options.windowsZipMode ?? 0), String(options.windowsCoreMode ?? 0)]);
     const bytes = readFileSync(archiveFile), releaseAsset = asset(rootName + t.suffix, bytes, 20 + Object.keys(contract.platforms).length);
     contract.platforms[key] = { ...provenance, finalPackageCronetSmoke, releaseAsset, archive: { name: releaseAsset.name, bytes: bytes.length, sha256: digest(bytes),
       members: Object.fromEntries(Object.entries(files).map(([n, b]) => [rootName + '/' + n, digest(b)])) },
@@ -130,7 +130,7 @@ else:
   write(join(root, 'src-tauri/core-manifest.json'), encode(manifest));
   for (const name of ADAPTER_FILES) { mkdirSync(dirname(join(root, name)), { recursive: true }); copyFileSync(join(repo, name), join(root, name)); }
   const base = `https://api.github.com/repos/${contract.repository}`;
-  transport.set(base, encode({ id: 1407705262, full_name: contract.repository }));
+  transport.set(base, encode({ id: 1407705262, full_name: contract.repository, private: false }));
   const publicRelease = { id: 17, tag_name: tag, draft: false, html_url: `https://github.com/${contract.repository}/releases/tag/${tag}`,
     assets: [contract.assetIndex, ...Object.values(contract.platforms).map((r) => r.releaseAsset)].map((a) => ({ id: a.assetId, name: a.name,
       size: a.bytes, state: 'uploaded', browser_download_url: a.url, digest: `sha256:${a.sha256}` })) };
@@ -628,3 +628,79 @@ test('selected managed mesh wrong Revision and nonzero version both fail after s
 test('selected managed mesh refuses foreign hosts before inspecting or executing a core', () => {
   for(const host of [{os:'win32',arch:'x64'},{os:'linux',arch:'arm64'}])assert.throws(()=>verifyManagedMeshCore('/absent',{},'/absent',()=>assert.fail('foreign execution'),host),/native Linux amd64/);
 });
+
+
+test('explicit Windows target sanitizes only frozen regular0666 and exact sing-box.exe0777 into safe private copies', async () => withFixture(async (f) => {
+  const row = f.contract.platforms.win, core = join(f.root, 'resources/win/sing-box.exe');
+  const wrongTarget = join(f.root, 'wrong-target-unpacked');
+  const rejected = spawnSync(PYTHON, ['-B', join(repo, 'scripts/desktop-core/release-archive.py'),
+    join(f.root, 'inputs', row.archive.name), wrongTarget], { encoding: 'utf8',
+    input: JSON.stringify({ archive: row.archive, root: row.archive.name.slice(0, -4), target: 'linux/amd64' }) });
+  assert.notEqual(rejected.status, 0); assert(!existsSync(wrongTarget));
+  await consumeRelease(f.root, f.manifest, ['win'], f);
+  assert.equal(digest(readFileSync(core)), row.core.sha256);
+  assert.equal(digest(readFileSync(join(f.root, 'resources/win/libcronet.dll'))), row.sidecar.sha256);
+  // Windows chmod exposes only the read-only flag; POSIX can observe all bits.
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(core).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(join(f.root, 'resources/win/libcronet.dll')).mode & 0o777, 0o644);
+  }
+  assert.equal(verifyPackagedRelease(f.root, f.manifest, 'win', core, f.run).platform, 'win');
+}, { windowsZipMode: 0o100666, windowsCoreMode: 0o100777 }));
+test('Windows permission adaptation still rejects symlinks, setuid and non-core0777 modes before writes', async () => {
+  for (const mode of [0o120666, 0o104666, 0o100777]) await withFixture(async (f) => {
+    await assert.rejects(consumeRelease(f.root, f.manifest, ['win'], f));
+    assert.deepEqual(resources(f), {});
+  }, { windowsZipMode: mode });
+});
+test('public API and asset redirects stay anonymous even when credential variables exist', async () => {
+  const calls = [], env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token', GH_TOKEN: 'inert-gh-token' };
+  const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+  const fetch = async (url, options) => { calls.push({ url, ...options }); return new Response('ok'); };
+  await publicBytes('https://api.github.com/repos/polaris-arch/polaris-box/releases/17', 2, false, { fetch, env });
+  assert.equal(calls.pop().headers.Authorization, undefined);
+  const assetFetch = async (url, options) => { calls.push({ url, ...options });
+    return url.includes('github.com/') ? new Response(null, { status: 302,
+      headers: { Location: 'https://release-assets.githubusercontent.com/inert?signature=fixture' } }) : new Response('ok'); };
+  await publicBytes('https://github.com/polaris-arch/polaris-box/releases/download/inert/core.zip', 2, true, { fetch: assetFetch, env });
+  assert.equal(calls.length, 2); assert(calls.every((call) => call.headers.Authorization === undefined));
+  assert(calls.every((call) => call.redirect === 'manual'));
+  } finally { for (const [key, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } }
+});
+test('HTTP denial records phase, host, request-id and quota but neither credentials nor query and never blindly retries', async () => {
+  const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'never-log-fixture-secret' }; let requests = 0;
+  const fetch = async () => { requests++; return new Response('failure', { status: 403,
+    headers: { 'x-github-request-id': 'ABCD:1234', 'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0',
+      'x-ratelimit-reset': '123', 'x-ratelimit-resource': 'core', 'retry-after': '7' } }); };
+  await assert.rejects(publicBytes('https://api.github.com/repos/polaris-arch/polaris-box?secret=fixture-query', 10, false, { fetch, env }),
+    (error) => /Release HTTP 403/.test(error.message) && error.message.includes('stage=public-api host=api.github.com')
+      && error.message.includes('x-github-request-id=ABCD:1234') && error.message.includes('x-ratelimit-limit=60')
+      && error.message.includes('x-ratelimit-remaining=0') && error.message.includes('x-ratelimit-reset=123')
+      && error.message.includes('x-ratelimit-resource=core') && error.message.includes('retry-after=7')
+      && !error.message.includes(env.POLARIS_RELEASE_API_TOKEN) && !error.message.includes('fixture-query'));
+  assert.equal(requests, 1);
+});
+test('transport errors and signed asset denials expose only safe phase-host diagnostics', async () => {
+  await assert.rejects(publicBytes('https://github.com/inert?token=never-log-query', 10, true,
+    { fetch: async () => { throw new TypeError('credentials=never-log-error'); } }),
+    (error) => error.message.includes('stage=asset host=github.com')
+      && !error.message.includes('never-log-query') && !error.message.includes('never-log-error'));
+  let requests = 0;
+  const fetch = async () => ++requests === 1 ? new Response(null, { status: 302,
+    headers: { Location: 'https://release-assets.githubusercontent.com/inert?token=never-log-signed-query' } })
+    : new Response('denied', { status: 403, headers: { 'x-github-request-id': 'EF01:5678' } });
+  await assert.rejects(publicBytes('https://github.com/inert', 10, true, { fetch }),
+    (error) => error.message.includes('stage=asset-redirect host=release-assets.githubusercontent.com')
+      && error.message.includes('x-github-request-id=EF01:5678') && !error.message.includes('never-log-signed-query'));
+  assert.equal(requests, 2);
+});
+test('repository public identity remains mandatory without relying on authenticated visibility', async () => withFixture(async (f) => {
+  write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f);
+  f.transport.set(f.base, encode({ id: 1407705262, full_name: f.contract.repository, private: true }));
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], f), /Repository identity differs/);
+  assert.deepEqual(resources(f), before);
+}));
