@@ -12,7 +12,7 @@ import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
-  verifyReleaseProvenance } from './release-consumer.mjs';
+  verifyReleaseProvenance, verifyMacPackagedCore } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
@@ -880,4 +880,45 @@ test('handoff does not overwrite existing resources and invalid receipts roll ba
   const { fingerprint, ...facts } = proof; write(proofPath, encode({ ...facts, fingerprint: digest(portableCanonical(facts)) }));
   assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options), /consumption receipt differs/);
   assert.deepEqual(resources(f), {});
+}));
+
+test('final Mac core uses its complete explicit release receipt for both targets without legacy metadata or signing', async () => withFixture(async (f) => {
+  await consumeRelease(f.root, f.manifest, ['mac-x64', 'mac-arm64'], { ...f, host: 'darwin' });
+  assert.equal(existsSync(join(f.root, 'resources/.source-receipts')), false);
+  for (const key of ['mac-x64', 'mac-arm64']) {
+    const stage = join(f.root, 'final-carrier', key); cpSync(join(f.root, 'resources', key), stage, { recursive: true });
+    const binary = join(stage, 'sing-box'), before = readFileSync(binary);
+    const receipt = verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run);
+    assert.equal(receipt.schema, 'polaris-app-release-consumption-v1');
+    assert.deepEqual(receipt.producer, f.contract.platforms[key]); assert.deepEqual(readFileSync(binary), before);
+    assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
+  }
+}));
+test('Mac release selection rejects invalid or missing release receipts without using present legacy receipts', async () => withFixture(async (f) => {
+  await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
+  const core = join(f.root, 'resources/mac-arm64/sing-box');
+  write(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'legacy must not be read');
+  for (const desktopRelease of [null, {}, { ...f.manifest.desktopRelease, contractSha256: '0'.repeat(64) }]) {
+    assert.throws(() => verifyMacPackagedCore(f.root, { ...f.manifest, desktopRelease }, 'mac-arm64', core, f.run));
+  }
+  const receipt = join(f.root, 'resources/.release-receipts/mac-arm64.json'); rmSync(receipt);
+  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', core, f.run));
+  assert.equal(readFileSync(join(f.root, 'resources/.source-receipts/mac-arm64.json'), 'utf8'), 'legacy must not be read');
+}));
+test('final Mac release verification closes changed CDHash, bytes, missing notice and added sidecar', async () => withFixture(async (f) => {
+  await consumeRelease(f.root, f.manifest, ['mac-arm64'], { ...f, host: 'darwin' });
+  const stage = join(f.root, 'final-carrier/mac-arm64'); cpSync(join(f.root, 'resources/mac-arm64'), stage, { recursive: true });
+  const binary = join(stage, 'sing-box'), raw = readFileSync(binary);
+  write(binary, Buffer.alloc(raw.length)); assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run)); write(binary, raw);
+  const wrong = (cmd, args, opts) => {
+    const output = f.run(cmd, args, opts);
+    return cmd === 'codesign' && args[0] === '--display'
+      ? output.replace(/CDHash=([a-f0-9]{40})/, (_match, hash) => `CDHash=${hash[0] === '0' ? '1' : '0'}${hash.slice(1)}`) : output;
+  };
+  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, wrong), /signature/);
+  const notice = join(stage, 'core-release/NOTICE'); const content = readFileSync(notice); rmSync(notice);
+  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run)); write(notice, content);
+  write(join(stage, 'libcronet.dylib'), 'extra');
+  assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run), /Static carrier contains Cronet sidecar/);
+  assert.deepEqual(readFileSync(binary), raw);
 }));

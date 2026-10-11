@@ -69,6 +69,8 @@ const FAT_BARE = 'MACHO-fat bare';
  */
 function fixture(files, { ref } = {}) {
   const root = mkdtempSync(join(tmpdir(), "polaris nested 'code' $x 核-"));
+  mkdirSync(join(root, 'src-tauri'));
+  writeFileSync(join(root, 'src-tauri/core-manifest.json'), '{}');
   const bin = join(root, 'bin');
   mkdirSync(bin);
   for (const [name, body] of [['file', STUB_FILE], ['codesign', STUB_CODESIGN]]) {
@@ -139,6 +141,20 @@ test('seal：内核只校验，验不过的 helper 才被补签，签名命令�
     assert.ok(signs[0].endsWith('/polaris-helper'), signs[0]);
     assert.match(result.stdout, /::warning::.*polaris-helper 没有有效签名/);
     assert.match(result.stdout, /内核 1 份与源内核逐字节相同.*本次补签 1 份/);
+  });
+});
+
+test('actual nested-code entry rejects malformed explicit release selection instead of reading valid legacy receipt', behaviour, () => {
+  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {
+    // The old unconditional source path would succeed with this valid receipt.
+    writeFileSync(join(fx.root, 'src-tauri/core-manifest.json'), JSON.stringify({ desktopRelease: null }));
+    const rejected = run(fx, 'verify');
+    assert.notEqual(rejected.status, 0); assert.match(rejected.stderr, /[Ee]xplicit|selection|contract/);
+    assert.deepEqual(signCalls(fx), []);
+    rmSync(join(fx.root, 'src-tauri/core-manifest.json'));
+    const missing = run(fx, 'verify');
+    assert.notEqual(missing.status, 0); assert.match(missing.stderr, /core-manifest\.json/);
+    assert.deepEqual(signCalls(fx), []);
   });
 });
 

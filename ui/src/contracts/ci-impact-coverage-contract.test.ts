@@ -339,6 +339,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'scripts/build-libbox.sh',
       'scripts/classify-ci-impact.mjs',
       'scripts/desktop-core/validation-origin.mjs',
+      'scripts/desktop-core/wire-input-handoff.mjs',
       'scripts/fetch-core.mjs',
       'scripts/fetch-cronet.mjs',
       'scripts/fetch-dashboard.mjs',

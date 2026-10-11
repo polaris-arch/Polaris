@@ -121,17 +121,18 @@ check_core() {
       fail "内核带有无效签名：${rel}。${BUILD_SIDE}"
       ;;
   esac
-  # The adjacent source receipt binds the observed state/CDHash and final bytes.
-  # Its upstream/source pins are checked by the existing packaging consumer.
+  # Explicit release mode checks the complete original release contract and
+  # carrier bytes. The legacy source lane retains its source signature receipt.
   node --input-type=module - "$core_ref" "$f" "$script_dir" <<'NODE'
 import { readFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const [reference, binary, scripts] = process.argv.slice(2);
 const key = basename(dirname(reference));
-const receipt = JSON.parse(readFileSync(join(dirname(dirname(reference)), '.source-receipts', `${key}.json`), 'utf8'));
-const { verifyMacCodeSignatureReceipt } = await import(pathToFileURL(join(scripts, 'desktop-core/source-graph.mjs')));
-verifyMacCodeSignatureReceipt(binary, receipt, key);
+const root = resolve(dirname(dirname(reference)), '..');
+const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json'), 'utf8'));
+const { verifyMacPackagedCore } = await import(pathToFileURL(join(scripts, 'desktop-core/release-consumer.mjs')));
+verifyMacPackagedCore(root, manifest, key, binary);
 NODE
 }
 

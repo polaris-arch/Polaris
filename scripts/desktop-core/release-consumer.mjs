@@ -4,7 +4,8 @@ import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lsta
   openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, requireGraph as demand } from './source-graph.mjs';
+import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, verifyMacCodeSignatureReceipt,
+  requireGraph as demand } from './source-graph.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 
 const REPO = 'polaris-arch/polaris-box';
@@ -22,6 +23,7 @@ export const RELEASE_TARGETS = Object.freeze({
 });
 export const ADAPTER_FILES = ['scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/release-archive.py',
   'scripts/desktop-core/wire-input-handoff.mjs',
+  'scripts/macos-nested-code.sh',
   'scripts/desktop-core/release-native-gates.mjs',
   'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/desktop-core/bundle.mjs',
   'scripts/lib/cronet-payload.mjs', 'scripts/native-payload-input.mjs', 'scripts/verify-packaging.mjs',
@@ -635,5 +637,15 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
       'Release notice/source/provenance bytes differ in final carrier');
     demand((lstatSync(original).mode & 0o777) === (lstatSync(final).mode & 0o777), 'Final release notice permissions differ');
   }
+  return receipt;
+}
+
+// Final Mac bundle validation selects the explicit release contract before any
+// legacy source receipt. It never aliases/relabels the two receipt schemas.
+export function verifyMacPackagedCore(root, manifest, key, binary, run = execFileSync) {
+  demand(key === 'mac-x64' || key === 'mac-arm64', 'Mac packaged core requires a Mac target');
+  if (hasDesktopRelease(manifest)) return verifyPackagedRelease(root, manifest, key, binary, run, 'darwin');
+  const path = join(root, 'resources/.source-receipts', `${key}.json`); regularPath(path);
+  const receipt = json(path); verifyMacCodeSignatureReceipt(binary, receipt, key, run === execFileSync ? undefined : run);
   return receipt;
 }
