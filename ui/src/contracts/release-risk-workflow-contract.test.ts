@@ -1,5 +1,6 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,10 +46,12 @@ const classifyScript = (risk: string) => {
 
 function hasStrictResultGate(body: string, variable: string): boolean {
   const result = `"\\$${variable}"`;
-  const fail = '(?:echo "[^"\\n]*";?\\s*)?exit 1;?\\s*';
+  const fail = '(?:echo (?:"[^"\\n]*"|\'[^\'\\n]*\');?\\s*)?exit 1;?\\s*';
   const negative = new RegExp(`^\\s*if (?:\\[ "\\$[A-Z_]+" = true \\] && )?\\[ ${result} != success \\];?\\s*then\\s*${fail}fi(?:\\s*$)`, 'm');
-  const positive = new RegExp(`^\\s*\\[ ${result} = success \\] \\|\\| \\{\\s*${fail}\\}(?:\\s*$)`, 'm');
-  return negative.test(body) || positive.test(body);
+  const atom = '\\[ "\\$[A-Z_]+" = success \\]';
+  const positive = new RegExp(`^\\s*(${atom}(?: && ${atom})*) \\|\\| \\{\\s*${fail}\\}(?:\\s*$)`, 'gm');
+  return negative.test(body) || [...body.matchAll(positive)].some((match) =>
+    new RegExp(`\\[ ${result} = success \\]`).test(match[1]));
 }
 
 describe('合入前发布风险门', () => {
@@ -116,6 +119,7 @@ esac
             FAIL_FETCH: failFetch ? '1' : '0',
             RUNNER_TEMP: temp,
             GITHUB_OUTPUT: output,
+            POLARIS_NATIVE_PAYLOAD_VALIDATION: '0',
           },
           encoding: 'utf8',
         });
@@ -154,6 +158,45 @@ esac
     expect(risk).toContain('node scripts/classify-ci-impact.mjs');
     expect(risk).toContain('name: release risk gate');
     expect(risk).toMatch(/\n  gate:[\s\S]*?\n    if: always\(\)/);
+  });
+
+  it('native 分类仅接受明确的同候选 Risk 上下文，不借用 ordinary preflight 或 Android 结论', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'polaris-native-risk-contract-'));
+    try {
+      const output = join(temp, 'output');
+      const candidate = 'a'.repeat(40);
+      const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
+      const base = {
+        POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', POLARIS_NO_KERNEL_RUN: '0', DISPATCH_SHA: candidate,
+        GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
+        GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '12', GITHUB_RUN_ATTEMPT: '3',
+        GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}`,
+        RUNNER_TEMP: temp, GITHUB_OUTPUT: output,
+      };
+      const run = (changed: Record<string, string>) => {
+        writeFileSync(output, '');
+        const result = spawnSync('bash', ['-c', classifyScript(risk)], {
+          cwd: REPO_ROOT, env: { ...process.env, ...base, ...changed }, encoding: 'utf8',
+        });
+        return { result, output: readFileSync(output, 'utf8') };
+      };
+      const good = run({});
+      expect(good.result.status, good.result.stderr).toBe(0);
+      expect(good.output).toBe('kernel=false\nplatforms=[]\npreflight=false\nhas_package=false\nandroid=false\nunregistered=\n');
+      const invalidContexts: Record<string, string>[] = [
+        { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REF: 'refs/tags/v1.0.0' },
+        { GITHUB_SHA: 'b'.repeat(40) }, { GITHUB_REPOSITORY: 'other/repo' },
+        { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/package.yml@${ref}` },
+        { GITHUB_RUN_ID: '0' }, { GITHUB_RUN_ATTEMPT: '0' }, { POLARIS_NO_KERNEL_RUN: '1' },
+      ];
+      for (const changed of invalidContexts) {
+        const bad = run(changed);
+        expect(bad.result.status, bad.result.stderr).not.toBe(0);
+        expect(bad.output).toBe('');
+      }
+    } finally {
+      rmSync(temp, { recursive: true, force: true });
+    }
   });
 
   it('gate 对「未登记影响面」有牙：分类器自曝的 scope 必须当场红并点名', () => {
@@ -273,7 +316,11 @@ esac
 
   it('preflight 用钉扎 protoc 对拍四平台 wire，D1 CONNECT 仍在 REQUIRE 强制腿', () => {
     const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    expect(manifest.windowsBuild.sourceCommit).toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
+    expect(manifest.desktopSourceBuild.sourceMode).toBe('fork-commit-v1');
+    const sourceBytes = readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'));
+    expect(manifest.desktopSourceBuild.sourceManifestSha256).toBe(createHash('sha256').update(sourceBytes).digest('hex'));
+    expect(JSON.parse(sourceBytes.toString()).sourceCommit).toBe('aafc521b745e0d1a8f50a6a3f41169433f1c2194');
+    expect(manifest.windowsBuild).toBeUndefined();
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const fetchCore = preflight.indexOf('      - name: Fetch sing-box core');
     const fetchProtoc = preflight.indexOf('      - name: Fetch pinned protoc for gRPC wire check');
@@ -311,9 +358,18 @@ esac
     expect(risk).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
   });
 
-  it('手动分支分类命中内核时，仍保持 b609 随包核和现有 REQUIRE 硬化', () => {
+  it('手动分支内核门保持桌面 fork 角色来源、旧 mobile alpha8 与 REQUIRE 硬化', () => {
     const manifest = JSON.parse(readFileSync(join(REPO_ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
-    expect(manifest.windowsBuild.sourceCommit).toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
+    const source = JSON.parse(readFileSync(join(REPO_ROOT, 'scripts/desktop-core/source-manifest.json'), 'utf8'));
+    expect(source.sourceCommit).toBe('aafc521b745e0d1a8f50a6a3f41169433f1c2194');
+    expect(source.sourceTagObject).toBe('71876e8b33d3061bd9abba9618aa3e8c3e22db4e');
+    expect(manifest.desktopSourceBuild.patchedSourceTree).toBe(source.sourceTree);
+    expect(manifest.desktopSourceBuild.version).toBe('1.15.0-alpha.11.polaris.2');
+    expect(manifest.sourceBuild.version).toBe('1.15.0-alpha.8.polaris.4');
+    for (const path of ['libbox-patches', 'libbox-ios-patches']) {
+      expect(JSON.parse(readFileSync(join(REPO_ROOT, 'scripts', path, 'source-manifest.json'), 'utf8')).sourceCommit)
+        .toBe('b609f959f57ce34416c51c7b87ce4a76f2e1df56');
+    }
     const preflight = jobSection(risk, 'preflight', 'release-risk.yml');
     const mandatory = preflight.slice(preflight.indexOf('      - name: Run mandatory bundled-core gates'));
     expect(preflight).toContain('run: node scripts/fetch-core.mjs');
@@ -381,6 +437,17 @@ esac
         expect(classify).toContain('candidate: ${{ github.event.pull_request.head.sha || github.sha }}');
         continue;
       }
+      if (selector === 'native_validation') {
+        expect(classify).toContain("native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}");
+        const enabled = (event: string, mode: string) => runInNewContext(
+          "github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false'",
+          { github: { event_name: event }, inputs: { mode } },
+        );
+        expect(enabled('workflow_dispatch', 'native-payload')).toBe('true');
+        expect(enabled('workflow_dispatch', 'ordinary')).toBe('false');
+        expect(enabled('push', 'native-payload')).toBe('false');
+        continue;
+      }
       expect(
         classify,
         `classify job 没有声明 output \`${selector}\` —— 引用它的地方恒为空串`,
@@ -406,6 +473,7 @@ esac
       PREFLIGHT_REQUIRED: 'true', PREFLIGHT_RESULT: 'success',
       PACKAGE_REQUIRED: 'true', PACKAGE_RESULT: 'success',
       ANDROID_REQUIRED: 'true', ANDROID_RESULT: 'success',
+      NATIVE_VALIDATION_REQUIRED: 'false', NATIVE_VALIDATION_RESULT: 'skipped',
     };
     const run = (body: string, required: string, result: string) => spawnSync('bash', ['-c', body], {
       env: { ...process.env, ...base, DESKTOP_CORE_REQUIRED: required, DESKTOP_CORE_RESULT: result },
@@ -438,6 +506,14 @@ esac
     const negative = 'if [ "$PC_RUNTIME_POLICY_RESULT" != success ]; then\n  echo "failure"\n  exit 1\nfi';
     expect(hasStrictResultGate(positive, variable)).toBe(true);
     expect(hasStrictResultGate(negative, variable)).toBe(true);
+    const combined = '[ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ] || {\n  echo \'failure\'; exit 1; }';
+    expect(hasStrictResultGate(combined, 'DESKTOP_CORE_RESULT')).toBe(true);
+    expect(hasStrictResultGate(combined, 'NATIVE_VALIDATION_RESULT')).toBe(true);
+    expect(hasStrictResultGate(combined, 'OTHER_RESULT')).toBe(false);
+    for (const changed of [combined.replace(' && ', ' || '), combined.replace('exit 1', 'exit 0'),
+      combined.replace('= success', '!= success'), `${combined} || true`]) {
+      expect(hasStrictResultGate(changed, 'DESKTOP_CORE_RESULT'), changed).toBe(false);
+    }
     for (const body of [positive.replace('exit 1;', ''), positive.replace(variable, 'OTHER_RESULT'),
       positive.replace('exit 1', 'exit 0'), positive.replace('= success', '!= success'),
       positive.replace('exit 1', 'true'), positive.replace('exit 1;', 'exit 1 || true;'),
@@ -446,6 +522,46 @@ esac
       positive.split('\n').map((line) => `# ${line}`).join('\n'),
       negative.split('\n').map((line) => `# ${line}`).join('\n')]) {
       expect(hasStrictResultGate(body, variable), body).toBe(false);
+    }
+  });
+
+  it('真实 native 汇总同时要求四核与 final payload success，错误状态及实际门突变均拒绝', () => {
+    const gate = risk.slice(risk.indexOf('\n  gate:\n'));
+    expect(gate).toContain('NATIVE_VALIDATION_REQUIRED: ${{ needs.classify.outputs.native_validation }}');
+    expect(gate).toContain('NATIVE_VALIDATION_RESULT: ${{ needs.native_payload.result }}');
+    const runAt = gate.indexOf('        run: |\n');
+    expect(runAt).toBeGreaterThan(0);
+    const script = gate.slice(runAt + '        run: |\n'.length).split('\n').map((line) => line.slice(10)).join('\n');
+    const base = {
+      CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
+      NATIVE_VALIDATION_REQUIRED: 'true', DESKTOP_CORE_RESULT: 'success', NATIVE_VALIDATION_RESULT: 'success',
+      DESKTOP_CORE_REQUIRED: 'false', PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped',
+      PACKAGE_REQUIRED: 'false', PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped',
+    };
+    const run = (body: string, changed: Record<string, string>) => spawnSync('bash', ['-c', body], {
+      env: { ...process.env, ...base, ...changed }, encoding: 'utf8',
+    });
+    const check = (body: string) => {
+      expect(run(body, {}).status).toBe(0);
+      expect(run(body, { NATIVE_VALIDATION_REQUIRED: 'false', DESKTOP_CORE_RESULT: 'skipped', NATIVE_VALIDATION_RESULT: 'skipped' }).status).toBe(0);
+      for (const field of ['DESKTOP_CORE_RESULT', 'NATIVE_VALIDATION_RESULT']) {
+        for (const result of ['failure', 'cancelled', 'skipped', '', 'unknown']) {
+          const actual = run(body, { [field]: result });
+          expect(actual.status, `${field}=${result}: ${actual.stdout + actual.stderr}`).toBe(1);
+          expect(actual.stdout).toContain('native source/actual final payload proof did not pass');
+        }
+      }
+    };
+    check(script);
+    for (const changed of [
+      script.replace('[ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ]',
+        '[ "$DESKTOP_CORE_RESULT" = success ] || [ "$NATIVE_VALIDATION_RESULT" = success ]'),
+      script.replace("echo '::error::native source/actual final payload proof did not pass'; exit 1;",
+        "echo '::error::native source/actual final payload proof did not pass'; exit 0;"),
+      script.replace('[ "$NATIVE_VALIDATION_REQUIRED" = true ]', '[ "$NATIVE_VALIDATION_REQUIRED" = false ]'),
+    ]) {
+      expect(changed).not.toBe(script);
+      expect(() => check(changed)).toThrow();
     }
   });
 

@@ -22,7 +22,8 @@
  *     构建后：`--root` 收 **bundle 根**（`target/release/bundle`，传了 --target 时
  *     `target/<triple>/release/bundle`），对该 label 的**每个 bundle target 各自**断言
  *     「恰含本平台那一份内核、且字节大小与源 `resources/<平台>/` 一致」。
- *     Linux 原核额外要求 SHA/权限完全一致；AppImage 实际成员的同一契约由 postprocess 重封后校验。
+ *     Linux 原核与两动态 Cronet 库要求完整 SHA/权限一致；Cronet 还须匹配 manifest pin及静态 ABI。
+ *     AppImage 实际成员的同一契约由 postprocess 重封后校验。
  *     ⚠️ 不可指向 `target/release`：那里的 `_up_/resources/` 是 **cargo build script 的 staging copy**，
  *        与 bundler 有没有把内核铺进包无关，打在它上面等于没有门（详见 BUNDLE_TREES 注释）。
  *     ⚠️ windows 腿是**例外**：NSIS 把资源从源路径直接编进 .exe，bundle 侧无副本可扫，
@@ -71,11 +72,13 @@ import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
+import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
 import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
-import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
+import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
+import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -971,45 +974,72 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   //
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
-  const version = String(manifest.bundledCoreVersion ?? '');
-  const sourceVersion = frozenSourceVersion(manifest);
-  if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
-      || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
-      || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
-    fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
-  }
-  if (manifest.windowsBuild) {
-    const build = manifest.windowsBuild;
-    if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
-        || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
-        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
-      fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
+  if (hasDesktopRelease(manifest)) {
+    try {
+      const contract = loadReleaseContract(ROOT, manifest);
+      const android = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const apple = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(android, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateReleaseNotice(texts.NOTICE, manifest, contract, { android: identity(android), apple: identity(apple) });
+    } catch (error) { fail(error.message); }
+  } else if (hasDesktopSource(manifest)) {
+    try {
+      const spec = validateSourcePins(manifest, 'linux', false);
+      const path = join(ROOT, desktopSourceManifestPath(spec));
+      verifyHash(path, spec.sourceManifestSha256);
+      const source = readJson(path);
+      const androidPath = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const applePath = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(androidPath, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateForkNotice(texts.NOTICE, manifest, source,
+        { android: identity(androidPath), apple: identity(applePath) });
+    } catch (error) { fail(error.message); }
+  } else {
+    const version = String(manifest.bundledCoreVersion ?? '');
+    const sourceVersion = frozenSourceVersion(manifest);
+    if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
+        || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
+        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
+      fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
     }
-  }
-  if (!/^\d[\w.\-+]*$/.test(version)) {
-    fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
-    return;
-  }
-  const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  if (proseVersions.length === 0) {
-    fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
-  }
-  if (tagVersions.length === 0) {
-    fail(
-      `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
-        `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
-    );
-  }
-  for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
-    for (const v of list) {
-      if (v !== version) {
-        fail(
-          `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
-            `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
-        );
+    if (manifest.windowsBuild) {
+      const build = manifest.windowsBuild;
+      if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
+          || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
+          || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
+        fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
       }
     }
+    if (!/^\d[\w.\-+]*$/.test(version)) {
+      fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
+      return;
+    }
+    const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    if (proseVersions.length === 0) {
+      fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
+    }
+    if (tagVersions.length === 0) {
+      fail(
+        `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
+          `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
+      );
+    }
+    for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
+      for (const v of list) {
+        if (v !== version) {
+          fail(
+            `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
+              `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
+          );
+        }
+      }
+    }
+
   }
 
   // ── ④ 版权行单一真值：NOTICE 的版权行必须与 LICENSE 里那行逐字一致（同 checkMacOpenGuide 的口径）。
@@ -2048,12 +2078,12 @@ function checkPayload(label, root) {
       // linuxdeploy 合法改写 rpath（本机 1-alpha-20251107-1 实测：helper 1222440B → 1230912B，
       // sha 变，**GNU Build ID 前后同值**）。故体积失配时，appimage 侧用 Build ID 作「合法改写」
       // 的豁免证据（同 ⇒ 绿）；任一侧读不出 Build ID 或不同 ⇒ 红。**不把 Build ID 当普适判据**：
-      // Linux sing-box 是随包原字节种子（postprocess 恢复 linuxdeploy 加工前的源），
+      // Linux sing-box 与 Cronet 是随包原字节种子（postprocess 恢复已核源），
       // 必须独立比 SHA/权限，不能用相同体积或 Build ID 豁免替代内容身份。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
         const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
-        if (coreManifest && frozenSourceVersion(coreManifest)) {
+        if (coreManifest && (Object.hasOwn(coreManifest, 'desktopRelease') || hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
           try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
           catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
         } else if (label === 'windows' && family.what === 'sing-box') {
@@ -2066,6 +2096,16 @@ function checkPayload(label, root) {
         if (!existsSync(src)) {
           fail(`${scope.name}: 产物里有 ${p}，但源 ${src} 不存在 —— 完整性无从比对（前置缺失判红，不跳过）`);
           continue;
+        }
+        if (family.what === 'Cronet sidecar') {
+          try {
+            const name = expected === 'linux' ? 'libcronet.so' : 'libcronet.dll';
+            if (basename(p) !== name) throw new Error(`wrong Cronet filename for ${expected}: ${basename(p)}`);
+            verifyCronetPayload(src, p, expected, readJson(join(SRC_TAURI, 'core-manifest.json')));
+          } catch (error) {
+            fail(`${scope.name}: Cronet source/final content or static ABI mismatch: ${error.message}`);
+          }
+          continue; // no size / GNU Build ID exemption for Cronet
         }
         if (label === 'linux' && family.what === 'sing-box') {
           if (!lstatSync(p).isFile() || !lstatSync(src).isFile()
@@ -2103,14 +2143,14 @@ function checkPayload(label, root) {
   if (trees.length > 0) {
     note(
       `payload：${label} → 产物验证，${scopes.map((s) => s.name).join(' + ')} 各自命中 ${expected} 的 ` +
-        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核 SHA/权限一致；其余体积一致或 appimage ELF Build ID 豁免' : '体积与源一致'}）`
+        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核及 Cronet 固定 SHA/权限、Cronet 静态 ABI 一致；其余体积一致或 appimage ELF Build ID 豁免' : label === 'windows' ? 'Cronet 固定 SHA/权限及静态 ABI 一致；其余体积一致' : '体积与源一致'}）`
     );
   } else {
     // 如实标注，不冒充产物验证：NSIS 把资源从**源路径**直接编进 .exe，bundle 侧没有可扫的副本，
     // 故这条腿只能证明「cargo 侧 staging 恰好只有本平台那几份且体积对」，证明不了安装器内容。
     note(
       `payload：${label} → **staging 检查**（不是产物验证）：扫的是 cargo build 铺的 ${root}/_up_/resources/，` +
-        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且体积与源一致。` +
+        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且 Cronet 固定 SHA/权限及静态 ABI 一致、其余体积与源一致。` +
         `NSIS 从源路径直接编译资源进 .exe，bundle 侧无副本可扫 ⇒ ` +
         `「安装器内容是否含这些二进制」在本仓无自动门，由 Windows 真机安装验证覆盖。`
     );
@@ -2828,9 +2868,10 @@ function expectedSrsCount() {
  *
  * `min`/`max` 是**份数**约束，只在 artifact/staging 清点里生效（`--static` 时源是工作树，
  * helper 由 CI 现编现铺、内核 gitignore 不入库，份数在那儿不可判定 ⇒ 显式跳过并标注，见 [`checkInventory`]）。
+ * 发布合同的 core-release 成员是已下载的精确输入，--static 同样逐项要求一份。
  * 它挡的是白名单门的经典假绿：**空目录也满足「没有多余文件」**。
  */
-function payloadAllowRules(label, coreDir, srsCount) {
+function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
   const core = reQuote(coreDir);
   const rules = [
     {
@@ -2945,6 +2986,13 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: 'Naive/H3 出站的 Cronet 动态库，核在 initialize 阶段就要它、且必须与核同目录；缺了那两类节点直接起不来。',
     });
   }
+  // Legal/source/provenance bytes are transported from the reviewed platform archive.
+  // Exact paths and one copy each: no directory-wide exemption for arbitrary files.
+  if (releaseContract) for (const member of releasePayloadMembers(releaseContract, coreDir)) rules.push({
+    id: `release-member:${member}`, re: new RegExp(`^${reQuote(`_up_/resources/${coreDir}/${member}`)}$`),
+    min: 1, max: 1, releaseMember: true,
+    why: '已验发布合同本平台 archive.members 中的许可、对应源码索引或原出处；必须按原路径随核分发。',
+  });
   return rules;
 }
 
@@ -2996,7 +3044,9 @@ function checkInventory(label, { root, isStatic }) {
     return;
   }
   const srs = expectedSrsCount(); // 读不出来会抛 InputError → 顶层转成一条可读的违反，不静默
-  const rules = payloadAllowRules(label, coreDir, srs.count);
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'), '包内容清单缺少内核 manifest');
+  const releaseContract = hasDesktopRelease(manifest) ? loadReleaseContract(ROOT, manifest) : undefined;
+  const rules = payloadAllowRules(label, coreDir, srs.count, releaseContract);
 
   /** @type {{rel:string, abs:string, from?:string}[]} */
   let items = [];
@@ -3122,7 +3172,7 @@ function checkInventory(label, { root, isStatic }) {
   // 🔴 份数按**每棵资源树各自**算，不是全局汇总（同 payload 模式「每个 bundle target 各自命中」）：
   // linux 一次出 deb + appimage 两棵树，汇总口径下「deb 里 2 份内核 + appimage 里 0 份」= 2 份，
   // 与「各 1 份」在数上无法区分 —— 那正是「计数不等于位置」的原型。
-  const resTrees = [...new Set(items.map((it) => it.tree))].sort();
+  const resTrees = [...new Set([...(isStatic && releaseContract ? [`conf:${confName}`] : []), ...items.map((it) => it.tree)])].sort();
   // 两段拼 key 用 U+001F（单元分隔符）而不是裸 NUL：源码里出现裸 NUL 字节会让 grep / ripgrep
   // 把整个文件判成 binary 而「找不到也不报错」地跳过——
   // 任何以 grep 为基础的仓库级审计会静默漏掉本文件（打包判据的单点）。
@@ -3151,9 +3201,10 @@ function checkInventory(label, { root, isStatic }) {
     );
   }
 
-  if (enforceCounts) {
+  if (enforceCounts || releaseContract) {
     for (const t of resTrees) {
       for (const r of rules) {
+        if (!enforceCounts && !r.releaseMember) continue;
         const got = hitsOf.get(keyOf(t, r.id));
         if (got.length >= r.min && got.length <= r.max) continue;
         const want = r.min === r.max ? `恰 ${r.min}` : `${r.min}~${r.max === Infinity ? '不限' : r.max}`;
@@ -3180,7 +3231,7 @@ function checkInventory(label, { root, isStatic }) {
       (enforceCounts
         ? `，且份数在登记区间内（.srs 份数真值 ${srs.count} 取自 ${srs.where}：\`${srs.slice}\`）`
         : `。⚠️ 本模式**只判「多余」方向**：源是工作树，helper 由 CI 现编现铺、内核 gitignore 不入库，` +
-          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖`) +
+          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖；发布合同成员仍逐项要求恰1份`) +
       (isStatic ? '' : `；射程外（bundler/cargo 自己铺的、不由 bundle.resources 决定）${outOfScope} 个文件未清点`)
   );
 }
@@ -3202,6 +3253,18 @@ try {
 }
 
 function runMode() {
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
+  if (hasDesktopRelease(manifest)) {
+    try { loadReleaseContract(ROOT, manifest); }
+    catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
+  } else if (hasDesktopSource(manifest)) {
+    try {
+      for (const key of Object.keys(CORE_TO_CONF)) validateSourcePins(manifest, key, false);
+    } catch (error) {
+      fail(`Desktop source admission failed: ${error.message}`);
+      return; // Never enter a legacy/bytes-only branch after invalid D admission.
+    }
+  }
 switch (mode) {
   case 'confs':
     checkConfs();

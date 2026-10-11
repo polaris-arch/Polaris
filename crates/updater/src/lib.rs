@@ -19,6 +19,7 @@
 // pedantic/nursery，避免与同级 crate 的 lint 严格度漂移）。
 
 pub mod core_build;
+pub mod core_release;
 pub mod github;
 pub mod manifest;
 pub mod popup;

@@ -13,6 +13,7 @@ import { buildDesktopCore, produceDesktopCore } from './desktop-core/build-core.
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './desktop-core/bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, frozenSourceVersion, platformSourceIdentity,
   validateBuildInfo, validateSourcePins, validateSourceReceipt } from './desktop-core/source-graph.mjs';
+import { writeValidationBundle, validateBundleOrigin, validationContext } from './desktop-core/validation-origin.mjs';
 import { classifyImpact, androidRegistrationOf } from './classify-ci-impact.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -68,6 +69,7 @@ function fixture(patched = PATCHED) {
   for (const dep of source.dependencyPatches) write(join(root, 'scripts/libbox-patches', dep.patchFile), depPatch);
   write(join(root, 'scripts/core-source-provision.py'), provider);
   write(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlay);
+  write(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
   return { root, manifest, source, receipt, patched, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
 const patchedRow = (name, module) => `\tdep\t${module}\tv1.0.0\t\n\t=>\t./polaris-dependencies/${name}\t(devel)\t\n\t\n`;
@@ -123,8 +125,8 @@ function stub(f, key, change = {}) {
     if (args[0]?.endsWith('core-source-provision.py')) {
       const checkout = args[args.indexOf('--checkout') + 1];
       write(join(checkout, '.polaris-source-receipt.json'), JSON.stringify(change.receipt ?? f.receipt));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), expectedTags('mac-arm64').join(','));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), expectedTags('win').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), change.preset ?? expectedTags('mac-arm64').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), change.windowsPreset ?? expectedTags('win').join(','));
       write(join(checkout, 'release/LDFLAGS'), '-checklinkname=0');
       write(join(checkout, 'go.mod'), 'synthetic full main go.mod');
       write(join(checkout, 'go.sum'), 'synthetic full main go.sum');
@@ -161,7 +163,8 @@ test('frozen production inputs still require exact pins; force and old outputs c
   try {
     for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
     const missingPin = structuredClone(manifest);
-    missingPin.sourceBuild.sourceReceiptFingerprint = null;
+    const selected = Object.hasOwn(missingPin, 'desktopSourceBuild') ? missingPin.desktopSourceBuild : missingPin.sourceBuild;
+    selected.sourceReceiptFingerprint = null;
     for (const key of Object.keys(DESKTOP_TARGETS)) {
       const dest = join(f.root, 'resources', key, coreFilename(key));
       write(dest, 'old cached core');
@@ -176,7 +179,8 @@ test('frozen production inputs still require exact pins; force and old outputs c
     // product checkout: --force must reject before any source/tool execution.
     write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(missingPin));
     for (const path of ['scripts/fetch-core.mjs', 'scripts/desktop-core/build-core.mjs',
-      'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs']) {
+      'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/validation-origin.mjs',
+      'scripts/desktop-core/release-consumer.mjs', 'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs']) {
       write(join(f.root, path), readFileSync(join(repo, path)));
     }
     const cli = spawnSync(process.execPath, ['scripts/fetch-core.mjs', '--force', '--platform=linux'],
@@ -259,6 +263,46 @@ test('all four targets retain the existing platform feature and CGO faces', () =
           && query[1] === args[1] && query[2] === 'rev-parse').map(({ args: query }) => query[3]),
         [`${commit}^{commit}`, 'refs/heads/polaris-source']);
       }
+    }
+  } finally { f.dispose(); }
+});
+
+test('alpha.11 platform additions retain gvisor without accepting unrelated preset drift', () => {
+  const f = fixture();
+  const preset = expectedTags('mac-arm64').filter((tag) => tag !== 'with_gvisor');
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const dest = join(f.root, key, 'alpha11-core');
+      const change = { preset: preset.join(','), windowsPreset: expectedTags('win').filter((tag) => tag !== 'with_gvisor').join(',') };
+      const s = stub(f, key, change);
+      const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, s.run);
+      const build = s.calls.find(({ args }) => args[0] === 'build');
+      assert.deepEqual(build.args[build.args.indexOf('-tags') + 1].split(','), expectedTags(key));
+      assert.deepEqual(receipt.tags, expectedTags(key));
+      assert.equal(receipt.tags.includes('with_gvisor'), true, `${key}: explicit gvisor capability retained`);
+      if (key === 'win') {
+        assert.equal(receipt.cgo, '0');
+        assert.equal(receipt.tags.includes('with_purego'), true, 'purego and gvisor are independent capabilities');
+      }
+      const selectedPreset = key === 'win' ? change.windowsPreset.split(',') : preset;
+      for (const bad of [selectedPreset.filter((tag) => tag !== 'with_quic'), [...selectedPreset, 'with_unreviewed']]) {
+        const r = stub(f, key, { ...change, [key === 'win' ? 'windowsPreset' : 'preset']: bad.join(',') });
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate, r.run), /feature tag preset differs/);
+        assert.equal(r.calls.some(({ args }) => args[0] === 'build'), false);
+        assert.equal(readFileSync(dest, 'utf8'), `synthetic binary ${key}`, 'rejection preserves the prior output');
+      }
+    }
+  } finally { f.dispose(); }
+});
+
+test('missing embedded gvisor rejects every desktop producer and consumer face', () => {
+  const f = fixture();
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const tags = expectedTags(key);
+      assert.ok(tags.includes('with_gvisor'));
+      const raw = metadata(key).replace(`-tags=${tags.join(',')}`, `-tags=${tags.filter((tag) => tag !== 'with_gvisor').join(',')}`);
+      rejectProducerAndConsumerMetadata(f, key, raw, /Embedded feature tags differ/);
     }
   } finally { f.dispose(); }
 });
@@ -863,5 +907,129 @@ test('consumer rejects a selected artifact changed after all inspections but bef
     assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate,
       ['mac-x64'], run, 'darwin'), /SHA-256/);
     assert.equal(existsSync(join(f.root, 'resources/mac-x64/sing-box')), false);
+  } finally { f.dispose(); }
+});
+
+
+test('legacy source remains selected only when desktopSourceBuild is absent', () => {
+  const f = fixture([]);
+  try {
+    assert.equal(validateSourcePins(f.manifest, 'linux', false), f.manifest.sourceBuild);
+    const baseline = frozenSourceVersion(f.manifest);
+    assert.ok(baseline);
+    for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+      const manifest = { ...f.manifest, desktopSourceBuild: invalid };
+      assert.equal(frozenSourceVersion(manifest), undefined);
+      for (const key of Object.keys(DESKTOP_TARGETS)) assert.throws(() => validateSourcePins(manifest, key, false));
+    }
+    assert.equal(frozenSourceVersion(f.manifest), baseline);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+// Synthetic bridge cases run no kernel, loader, producer API or installer.
+const validationEnv = {
+  POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'workflow_dispatch',
+  GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
+  GITHUB_REF: 'refs/heads/collab/fk02-native-payload-validation-20261010',
+  GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/collab/fk02-native-payload-validation-20261010',
+};
+function withValidationEnv(callback) {
+  const names = [...Object.keys(validationEnv), 'POLARIS_NO_KERNEL_RUN'];
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, validationEnv); delete process.env.POLARIS_NO_KERNEL_RUN;
+  try { return callback(); } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+}
+function bridgeFixture() {
+  const f = fixture(), directory = produceAll(f), old = 'b'.repeat(40);
+  const policy = { schema: 'polaris-desktop-validation-origin-v1', repository: 'polaris-arch/Polaris', repositoryId: 1347028220,
+    runId: 800, attempt: 1, workflowHead: 'a'.repeat(40), candidate: old, platforms: {} };
+  const transport = { repository: policy.repository, run: { id: 800, run_attempt: 1, head_sha: policy.workflowHead,
+    status: 'completed', conclusion: 'success', event: 'workflow_dispatch', repository: { id: policy.repositoryId },
+    head_repository: { id: policy.repositoryId } }, artifacts: {} };
+  for (const [index, key] of ['linux', 'mac-x64', 'mac-arm64'].entries()) {
+    const receiptFile = join(directory, key, `${coreFilename(key)}.source-receipt.json`);
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(receiptFile));
+    const receipt = signed({ ...facts, candidate: old });
+    write(receiptFile, JSON.stringify(receipt));
+    const pin = policy.platforms[key] = { artifactId: 100 + index,
+      artifactName: `desktop-core-producer-${old}-800-1-${key}`, archiveSha256: 'e'.repeat(64),
+      binarySha256: receipt.binarySha256, receiptSha256: digest(readFileSync(receiptFile)),
+      platformInputFingerprint: receipt.platformInputFingerprint, sourceFingerprint: receipt.sourceFingerprint,
+      buildID: receipt.buildID, buildInfoSha256: receipt.buildInfoSha256, macCodeSignature: receipt.macCodeSignature ?? null };
+    transport.artifacts[key] = { archiveSha256: pin.archiveSha256, api: { id: pin.artifactId, name: pin.artifactName,
+      expired: false, digest: `sha256:${pin.archiveSha256}`, workflow_run: { id: 800, head_sha: policy.workflowHead,
+        repository_id: policy.repositoryId, head_repository_id: policy.repositoryId } } };
+  }
+  write(join(f.root, 'scripts/desktop-core/validation-origin.json'), JSON.stringify(policy));
+  write(join(directory, 'origin-transport.json'), JSON.stringify(transport));
+  return { ...f, directory, policy, transport };
+}
+test('validation bridge preserves original receipts and still verifies four actual inputs before a subset', () => {
+  const f = bridgeFixture();
+  try {
+    withValidationEnv(() => {
+      const before = Object.fromEntries(Object.keys(DESKTOP_TARGETS).map((key) => [key,
+        readFileSync(join(f.directory, key, `${coreFilename(key)}.source-receipt.json`))]));
+      const inventory = writeValidationBundle(f.root, f.directory, candidate);
+      consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub);
+      assert.equal(inventory.candidate, candidate);
+      assert.equal(inventory.origins.linux.candidate, f.policy.candidate);
+      assert.equal(inventory.origins.win.candidate, candidate);
+      for (const key of Object.keys(DESKTOP_TARGETS)) {
+        assert.deepEqual(readFileSync(join(f.root, `resources/.source-receipts/${key}.json`)), before[key]);
+      }
+      verifyPackagedSource(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), inspectStub);
+    });
+  } finally { f.dispose(); }
+});
+for (const [name, change] of [
+  ['local host', { GITHUB_ACTIONS: 'false' }], ['tag', { GITHUB_REF: 'refs/tags/v1' }],
+  ['PR event', { GITHUB_EVENT_NAME: 'pull_request' }], ['other candidate', { GITHUB_SHA: 'a'.repeat(40) }],
+  ['ordinary mode', { POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }], ['local no-kernel override', { POLARIS_NO_KERNEL_RUN: '1' }],
+  ['other workflow', { GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/package.yml@refs/heads/x' }],
+  ['missing run', { GITHUB_RUN_ID: '' }], ['bad attempt', { GITHUB_RUN_ATTEMPT: '0' }],
+]) test(`validation context refuses ${name}`, () => {
+  assert.throws(() => validationContext(candidate, { ...validationEnv, ...change }), /exact non-tag/);
+});
+for (const [name, mutate] of [
+  ['failed origin run', (f) => { f.transport.run.conclusion = 'failure'; }],
+  ['origin rerun', (f) => { f.transport.run.run_attempt = 2; }],
+  ['wrong workflow head', (f) => { f.transport.run.head_sha = 'f'.repeat(40); }],
+  ['foreign repository', (f) => { f.transport.run.head_repository.id = 123; }],
+  ['expired artifact', (f) => { f.transport.artifacts.linux.api.expired = true; }],
+  ['archive tamper', (f) => { f.transport.artifacts.linux.archiveSha256 = 'f'.repeat(64); }],
+  ['wrong artifact id', (f) => { f.transport.artifacts.linux.api.id = 999; }],
+  ['source input drift', (f) => { f.manifest.sourceBuild.transportPins['example.com/transport'] = 'v9.0.0'; }],
+  ['new current relabel of old receipt', (f) => {
+    const path = join(f.directory, 'linux/sing-box.source-receipt.json');
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(path)); write(path, JSON.stringify(signed({ ...facts, candidate })));
+  }],
+  ['old Windows candidate', (f) => {
+    const path = join(f.directory, 'win/sing-box.exe.source-receipt.json');
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(path)); write(path, JSON.stringify(signed({ ...facts, candidate: f.policy.candidate })));
+  }],
+  ['unselected Mac bytes corrupt', (f) => { write(join(f.directory, 'mac-x64/sing-box'), 'tamper'); }],
+]) test(`validation bridge refuses ${name} before publishing resources`, () => {
+  const f = bridgeFixture();
+  try {
+    mutate(f); write(join(f.directory, 'origin-transport.json'), JSON.stringify(f.transport));
+    withValidationEnv(() => assert.throws(() => {
+      writeValidationBundle(f.root, f.directory, candidate);
+      consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub);
+    }));
+    assert.equal(existsSync(join(f.root, 'resources/linux/sing-box')), false);
+  } finally { f.dispose(); }
+});
+test('validation bundle cannot be relabeled into strict production v1', () => {
+  const f = bridgeFixture();
+  try {
+    const inventory = writeValidationBundle(f.root, f.directory, candidate, validationEnv);
+    inventory.schema = 'polaris-desktop-bundle-v1'; write(join(f.directory, 'bundle.json'), JSON.stringify(inventory));
+    assert.throws(() => consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub), /candidate differs/);
   } finally { f.dispose(); }
 });

@@ -543,8 +543,12 @@ DialerOptions.udp_fragment
 DomainResolver.client_subnet
 DomainResolver.disable_cache
 DomainResolver.disable_optimistic_cache
+DomainResolver.mode
+DomainResolver.mode = [""]
+DomainResolver.mode = ["rules"]
 DomainResolver.rewrite_ttl
 DomainResolver.server
+DomainResolver.server = [""]
 DomainResolver.strategy
 DomainResolver.timeout
 Endpoint[masque-client].advertise_routes

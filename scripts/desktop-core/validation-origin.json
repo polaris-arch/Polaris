@@ -1,0 +1,53 @@
+{
+  "schema": "polaris-desktop-validation-origin-v1",
+  "repository": "polaris-arch/Polaris",
+  "repositoryId": 1347028220,
+  "runId": 38063297520,
+  "attempt": 1,
+  "workflowHead": "0ec8809d1efa93ec77a5c96dc65b69981f4ec543",
+  "candidate": "9dda5ba21a4cdacba8cb3a41366226a33609c0e9",
+  "platforms": {
+    "linux": {
+      "artifactId": 11673813856,
+      "artifactName": "desktop-core-producer-9dda5ba21a4cdacba8cb3a41366226a33609c0e9-38063297520-1-linux",
+      "binarySha256": "536fa086a19b0fc60c0ee34ea4030c0335a74c3da0bdeeef0c67ddc70db96a2e",
+      "receiptSha256": "85f51f7b15a8799da6ed722ac6b449f6ecbc95c60092b53c2725c5191c817ddd",
+      "archiveSha256": "9b79bb3aa7d693df319b8f21fc06a79f1380635ea9c2839fe1893d35039173e6",
+      "platformInputFingerprint": "712d96ba6dca88aeae749dcb5957b359f90ca91f22e3173c6c7c75b0a84395f2",
+      "sourceFingerprint": "d0acf48015e649102636e038dcd3804aca3227639bb7998f858d231315f41558",
+      "buildID": "polaris-desktop-source-v1-712d96ba6dca88aeae749dcb5957b359f90ca91f22e3173c6c7c75b0a84395f2",
+      "buildInfoSha256": "0c5c3af424964f2a344fc83da3424842f95bea20a8788b3c3e696edf8e309b2f",
+      "macCodeSignature": null
+    },
+    "mac-x64": {
+      "artifactId": 11674405226,
+      "artifactName": "desktop-core-producer-9dda5ba21a4cdacba8cb3a41366226a33609c0e9-38063297520-1-mac-x64",
+      "binarySha256": "c7d42fa5ac50c96dc289fed5f128f8863d336f03edd62457dc797c2a9198a051",
+      "receiptSha256": "8cd279398ec22c9028516ef185ccc01c4c2e18c8de77ed412a19a5d03a1f1882",
+      "archiveSha256": "90adefd16d00c722d96b3bbc8166d39e32e95856c0d519e1ea25d8a51f5540b1",
+      "platformInputFingerprint": "7ffbb5ca6a6cb266d88138223dcedf3a49c285ff9738628fe37ed5c6d90e252e",
+      "sourceFingerprint": "d0acf48015e649102636e038dcd3804aca3227639bb7998f858d231315f41558",
+      "buildID": "polaris-desktop-source-v1-7ffbb5ca6a6cb266d88138223dcedf3a49c285ff9738628fe37ed5c6d90e252e",
+      "buildInfoSha256": "f390a16016e0ded090a691f068d2c3bf4065b24721a03bc0ae2d34e818aff4aa",
+      "macCodeSignature": {
+        "state": "unsigned",
+        "cdHash": null
+      }
+    },
+    "mac-arm64": {
+      "artifactId": 11673519162,
+      "artifactName": "desktop-core-producer-9dda5ba21a4cdacba8cb3a41366226a33609c0e9-38063297520-1-mac-arm64",
+      "binarySha256": "6657d4bfe301a725d6cc4c36956e49faf8cfc0bbc959d1e6e7aee47910d9973f",
+      "receiptSha256": "3ae39ec52bd5aaa2bf8d65e3710025cc97f9699c197f8ec57ec2049a248de9b5",
+      "archiveSha256": "181c0b97b87ec3d251821e7942b455abda28a1518449c2e08685b20d9f57f12c",
+      "platformInputFingerprint": "a1f381e14c11b4677bef6cd7c8f81a24ee73209c31659f847435e126071b5e97",
+      "sourceFingerprint": "d0acf48015e649102636e038dcd3804aca3227639bb7998f858d231315f41558",
+      "buildID": "polaris-desktop-source-v1-a1f381e14c11b4677bef6cd7c8f81a24ee73209c31659f847435e126071b5e97",
+      "buildInfoSha256": "1399ba3e0d093d3c3db49b5046639ac4ae59435d49bfb1259f025e578b1abc84",
+      "macCodeSignature": {
+        "state": "signed",
+        "cdHash": "81bfdc1b5bf05d1eb783df77880c6f322bee433b"
+      }
+    }
+  }
+}

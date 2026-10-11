@@ -41,6 +41,7 @@ import type { TunnelConflictReport } from '@/contracts/tunnel-conflict-report';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { TunnelConflictBlock } from './TunnelConflictBlock';
 import { MeshRouteEvidenceBlock } from './MeshRouteEvidenceBlock';
+import { CoexSnapshotBlock } from './CoexSnapshotBlock';
 import { createLatestReportLoader, type ReportLoadState } from './latest-report-loader';
 import { ListEditor } from './ListEditor';
 import { bypassLanState, shellPlatformFromDataOs } from './settings-logic';
@@ -521,6 +522,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
           unknown，不能从前端配置推断实际承载。旧 endpoint 报告仅保留兼容 API。
           ⚠️ force-route 规则并不只在 TUN 模式发射（route.rules 对任何入站都生效），它落在本页
           是因为形态与「生效排除面」同源（后端跑真判据读回来），不是因为它属于 TUN。 */}
+      <CoexSnapshotBlock />
       <TunnelConflictBlock report={tunnelConflicts} />
       <MeshRouteEvidenceBlock
         report={meshRouteState.report}

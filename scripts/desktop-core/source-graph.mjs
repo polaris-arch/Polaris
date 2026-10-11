@@ -1,12 +1,12 @@
 // Source receipts bind reviewed inputs; they are not platform cleanup evidence.
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { lstatSync, readFileSync } from 'node:fs';
 
 export const DESKTOP_TARGETS = Object.freeze({
   linux: { goos: 'linux', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
-  win: { goos: 'windows', goarch: 'amd64', cgo: '0', extras: ['with_purego'] },
+  win: { goos: 'windows', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
   'mac-x64': { goos: 'darwin', goarch: 'amd64', cgo: '1', extras: ['with_gvisor'] },
   'mac-arm64': { goos: 'darwin', goarch: 'arm64', cgo: '1', extras: ['with_gvisor'] },
 });
@@ -35,6 +35,114 @@ const isSha = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(valu
 const isTree = (value) => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const isModule = (value) => typeof value === 'string' && /^[a-zA-Z0-9._/-]+$/.test(value);
 
+// Absence alone selects historical identity; []/null never activates a new mode.
+export function sourceOwnedReplacements(spec) {
+  if (!Object.hasOwn(spec ?? {}, 'sourceOwnedReplacements')) return undefined;
+  const list = spec.sourceOwnedReplacements;
+  requireGraph(isForkSource(spec) && Array.isArray(list) && list.length === 1,
+    'Explicit desktop source-owned replacement required');
+  const dep = list[0];
+  const fields = ['schemaVersion', 'module', 'version', 'replacementPath', 'replacementTree',
+    'replacementFileCount', 'baselineOriginCommit', 'baselineZipSha256', 'baselineModuleSum',
+    'baselineFiles', 'changedBaselineFiles', 'addedFiles', 'other252BaselineFilesByteExact',
+    'windowsAfterDNSSuffixUnchanged', 'patchSha256', 'fingerprintSchema', 'fourKernelPolicy',
+    'bindingSha256', 'bindingPath', 'patchPath'];
+  requireGraph(dep && same(Object.keys(dep).sort(), fields.sort()) && dep.schemaVersion === 1
+    && dep.module === 'github.com/sagernet/sing-tun' && /^v[0-9A-Za-z.+-]+$/.test(dep.version ?? '')
+    && dep.replacementPath === './third_party/sing-tun' && isTree(dep.replacementTree)
+    && dep.replacementFileCount === 256 && dep.baselineFiles === 253
+    && isTree(dep.baselineOriginCommit) && isSha(dep.baselineZipSha256)
+    && /^h1:[A-Za-z0-9+/]{43}=$/.test(dep.baselineModuleSum ?? '')
+    && same(dep.changedBaselineFiles, ['tun_windows.go'])
+    && same(dep.addedFiles, ['windows_dns_configuration.go', 'windows_dns_configuration_test.go',
+      'windows_lifecycle_guard_windows_test.go'])
+    && dep.other252BaselineFilesByteExact === true && dep.windowsAfterDNSSuffixUnchanged === true
+    && isSha(dep.patchSha256) && isSha(dep.bindingSha256)
+    && dep.bindingPath === 'release/dependency-sources/sing-tun-replacement.json'
+    && dep.patchPath === 'release/dependency-sources/sing-tun-windows-auto-route.patch'
+    && dep.fingerprintSchema === 'fork-source-fingerprint-v1'
+    && typeof dep.fourKernelPolicy === 'string' && dep.fourKernelPolicy.length > 0,
+  'Unfrozen source-owned replacement declaration');
+  return list;
+}
+
+// Actual producer context is fingerprinted before artifact upload, never added by
+// an assembler. These transport bindings are consistency evidence, not signatures.
+export function producerContext(candidate, env = process.env) {
+  const repository = 'polaris-arch/Polaris';
+  const ref = env.GITHUB_REF, event = env.GITHUB_EVENT_NAME;
+  const branch = typeof ref === 'string' && /^refs\/heads\/.+$/.test(ref);
+  const pull = typeof ref === 'string' && /^refs\/pull\/[1-9][0-9]*\/merge$/.test(ref);
+  const queue = typeof ref === 'string' && /^refs\/heads\/gh-readonly-queue\/main\/.+$/.test(ref);
+  const releaseTag = typeof ref === 'string' && /^refs\/tags\/v[^\s/]*$/.test(ref);
+  // Reusable workflows inherit the outer caller. desktop-core has only
+  // workflow_call: its own name cannot authorize a direct event.
+  const callerAllowed = env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/release-risk.yml@${ref}`
+    ? event === 'workflow_dispatch' && branch || event === 'push' && ref === 'refs/heads/main'
+      || event === 'pull_request' && pull || event === 'merge_group' && queue
+    : env.GITHUB_WORKFLOW_REF === `${repository}/.github/workflows/package.yml@${ref}`
+      && (event === 'push' && releaseTag || event === 'workflow_dispatch' && (branch || releaseTag));
+  requireGraph(env.GITHUB_ACTIONS === 'true' && env.GITHUB_REPOSITORY === repository
+    && env.GITHUB_REPOSITORY_ID === '1347028220' && isTree(candidate)
+    && isTree(env.GITHUB_SHA) && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ID ?? '')
+    && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ATTEMPT ?? '')
+    && callerAllowed,
+  'Exact source-owned producer workflow context required');
+  return { repository, repositoryId: env.GITHUB_REPOSITORY_ID, candidate,
+    runId: env.GITHUB_RUN_ID, runAttempt: env.GITHUB_RUN_ATTEMPT,
+    workflowRef: env.GITHUB_WORKFLOW_REF, workflowHead: env.GITHUB_SHA,
+    ref: env.GITHUB_REF, event: env.GITHUB_EVENT_NAME };
+}
+
+export function verifySourceOwnedCheckout(checkout, source, spec, capture) {
+  const list = sourceOwnedReplacements(spec);
+  if (!list) return;
+  validateSourceManifest(source, spec);
+  const dep = list[0], path = dep.replacementPath.slice(2);
+  const git = (args) => capture('git', args, { cwd: checkout });
+  requireGraph(git(['rev-parse', 'HEAD']) === source.sourceCommit
+    && git(['rev-parse', `HEAD:${path}`]) === dep.replacementTree,
+  'Source-owned checkout commit/subtree differs');
+  const entries = git(['ls-tree', '-rz', `HEAD:${path}`]).split('\0').filter(Boolean);
+  requireGraph(entries.length === dep.replacementFileCount, 'Source-owned tracked file count differs');
+  const index = new Map(git(['ls-files', '--stage', '-z', '--', path]).split('\0').filter(Boolean).map((row) => {
+    const split = row.indexOf('\t'); return [row.slice(split + 1), row.slice(0, split)];
+  }));
+  requireGraph(index.size === entries.length, 'Source-owned index inventory differs');
+  const seen = new Set();
+  for (const row of entries) {
+    const match = /^(100644|100755) blob ([a-f0-9]{40})\t(.+)$/.exec(row);
+    requireGraph(match, 'Source-owned non-regular Git entry');
+    const [, mode, blob, relative] = match;
+    requireGraph(!relative.split('/').some((part) => !part || part === '.' || part === '..')
+      && !relative.includes('\\') && !seen.has(relative), 'Source-owned path escape/duplicate');
+    seen.add(relative);
+    const file = join(checkout, path, relative);
+    let cursor = resolve(file);
+    while (cursor !== resolve(checkout)) {
+      const st = lstatSync(cursor);
+      requireGraph(cursor === resolve(file) ? st.isFile() : st.isDirectory(), 'Source-owned link/non-regular ancestor');
+      cursor = dirname(cursor);
+    }
+    const bytes = readFileSync(file);
+    requireGraph(createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex') === blob,
+      'Source-owned tracked bytes differ');
+    // Windows has no POSIX executable-bit equivalent; verify its exact index
+    // mode as well. Unix additionally observes the actual executable permission.
+    if (process.platform !== 'win32') requireGraph(Boolean(lstatSync(file).mode & 0o111) === (mode === '100755'),
+      'Source-owned actual executable mode differs');
+    requireGraph(index.get(`${path}/${relative}`) === `${mode} ${blob} 0`,
+      'Source-owned index mode/blob differs');
+  }
+  for (const name of [dep.bindingPath, dep.patchPath, 'go.mod', 'go.sum']) {
+    requireGraph(lstatSync(join(checkout, name)).isFile(), 'Source-owned binding/manifest is not regular');
+  }
+  verifyHash(join(checkout, dep.bindingPath), dep.bindingSha256);
+  verifyHash(join(checkout, dep.patchPath), dep.patchSha256);
+  verifyHash(join(checkout, 'go.mod'), spec.mainGoModSha256);
+  verifyHash(join(checkout, 'go.sum'), spec.mainGoSumSha256);
+}
+
 function isModulePartition(policy, inventory, absentField) {
   if (!policy || !same(Object.keys(policy).sort(), ['requiredLinked', absentField].sort())) return false;
   const required = policy.requiredLinked;
@@ -53,6 +161,24 @@ function hasPlatformModulePolicy(spec, key) {
     && isModulePartition(platform.transportModules, Object.keys(spec.transportPins ?? {}), 'confirmedAbsent');
 }
 
+// A present desktop block is an explicit contract, including null. Only an
+// absent key selects the historical graph, which mobile still owns unchanged.
+export const hasDesktopSource = (manifest) => Object.hasOwn(manifest, 'desktopSourceBuild');
+export function desktopSourceSpec(manifest) {
+  if (!hasDesktopSource(manifest)) {
+    requireGraph(manifest.sourceBuild?.sourceMode === undefined, 'Legacy sourceBuild cannot activate a desktop fork');
+    return manifest.sourceBuild;
+  }
+  const spec = manifest.desktopSourceBuild;
+  requireGraph(spec && typeof spec === 'object' && !Array.isArray(spec)
+    && spec.sourceMode === 'fork-commit-v1'
+    && typeof spec.upstreamVersion === 'string' && /^[0-9][0-9A-Za-z.+-]*$/.test(spec.upstreamVersion),
+  'Explicit desktopSourceBuild object/fork mode/upstreamVersion required');
+  return spec;
+}
+export const desktopSourceBaseline = (manifest) => hasDesktopSource(manifest)
+  ? desktopSourceSpec(manifest).upstreamVersion : manifest.bundledCoreVersion;
+
 // Activation belongs to the reviewed App manifest. No branch-head/default-URL fallback.
 export function isForkSource(spec) {
   requireGraph(spec?.sourceMode === undefined || spec.sourceMode === 'fork-commit-v1', 'Unsupported desktop source mode');
@@ -61,7 +187,7 @@ export function isForkSource(spec) {
 export const desktopSourceManifestPath = (spec) => isForkSource(spec)
   ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
 export function desktopSourceGoVersion(root, manifest) {
-  const spec = manifest.sourceBuild;
+  const spec = validateSourcePins(manifest, 'linux', false);
   const path = join(root, desktopSourceManifestPath(spec));
   verifyHash(path, spec.sourceManifestSha256);
   const source = JSON.parse(readFileSync(path, 'utf8'));
@@ -130,7 +256,9 @@ export const desktopOverlays = (spec, key, overlaySha256) => isForkSource(spec) 
 
 export function validateSourcePins(manifest, key, outputsRequired = true) {
   requireGraph(Object.hasOwn(DESKTOP_TARGETS, key), `Unknown desktop core target: ${key}`);
-  const spec = manifest.sourceBuild;
+  const spec = desktopSourceSpec(manifest);
+  const baseline = desktopSourceBaseline(manifest);
+  sourceOwnedReplacements(spec);
   requireGraph(!isForkSource(spec) || manifest.windowsBuild === undefined, 'Fork source cannot retain an App Windows overlay contract');
   const frozen = spec && ['sourceManifestSha256', 'provisionerSha256', 'sourceReceiptFingerprint',
     'moduleGraphSha256'].every((field) => isSha(spec[field]))
@@ -141,12 +269,16 @@ export function validateSourcePins(manifest, key, outputsRequired = true) {
     && spec.transportPins && typeof spec.transportPins === 'object' && !Array.isArray(spec.transportPins)
     && Object.keys(spec.transportPins).length > 0 && Object.entries(spec.transportPins).every(([module, version]) =>
       isModule(module) && typeof version === 'string' && /^v[0-9A-Za-z.+-]+$/.test(version))
-    && typeof spec.version === 'string' && spec.version.startsWith(`${manifest.bundledCoreVersion}.polaris.`)
-    && /^[1-9][0-9]*$/.test(spec.version.slice(`${manifest.bundledCoreVersion}.polaris.`.length))
+    && typeof spec.version === 'string' && spec.version.startsWith(`${baseline}.polaris.`)
+    && /^[1-9][0-9]*$/.test(spec.version.slice(`${baseline}.polaris.`.length))
     && same(Object.keys(spec.platforms ?? {}).sort(), Object.keys(DESKTOP_TARGETS).sort())
     && Object.entries(spec.platforms).every(([platformKey, platform]) => isTree(platform?.buildTree)
       && hasPlatformModulePolicy(spec, platformKey)
-      && (!outputsRequired || isSha(platform.binarySha256)));
+      && (!outputsRequired || isSha(platform.binarySha256)))
+    && (!hasDesktopSource(manifest) || isSha(spec.mainGoModSha256) && isSha(spec.mainGoSumSha256)
+      && spec.graphScope === 'core-source-only' && spec.dependencyModules.length === 0
+      && spec.buildTree === spec.patchedSourceTree
+      && Object.values(spec.platforms).every((platform) => platform.buildTree === spec.buildTree));
   requireGraph(frozen, `Desktop source graph is not frozen: combined source/dependency/receipt${outputsRequired ? ' and four output' : ' input'} pins are required; official assets and old cached cores cannot substitute`);
   return spec;
 }
@@ -163,18 +295,23 @@ export function platformSourceIdentity(receipt, source, spec, key, overlaySha256
     version: spec.version, goVersion: source.goVersion, platform: key, transportPins: spec.transportPins,
     patchedModules: spec.platforms[key].patchedModules, transportModules: spec.platforms[key].transportModules,
     goos: target.goos, goarch: target.goarch, cgo: target.cgo, tags: expectedTags(key) };
+  const owned = sourceOwnedReplacements(spec);
+  if (owned) facts.sourceOwnedReplacements = owned;
   const platformInputFingerprint = digest(canonical(facts));
   return { sourceFingerprint: receipt.fingerprint, platformInputFingerprint,
     buildID: `polaris-desktop-source-v1-${platformInputFingerprint}` };
 }
 
 export function validateSourceManifest(source, spec) {
+  const owned = sourceOwnedReplacements(spec);
+  requireGraph(owned ? same(source.sourceOwnedReplacements, owned)
+    : !Object.hasOwn(source, 'sourceOwnedReplacements'), 'Source-owned manifest/spec differs');
   requireGraph(isTree(source.sourceCommit) && /^\d+\.\d+\.\d+$/.test(source.goVersion ?? ''), 'Invalid source/toolchain pin');
   if (isForkSource(spec)) {
     requireGraph(source.schema === 'polaris-desktop-fork-source-v1' && source.role === 'desktop'
-      && source.sourceURL === 'https://github.com/polaris-arch/sing-box', 'Desktop fork repository/schema/role differs');
+      && source.sourceURL === 'https://github.com/polaris-arch/polaris-box', 'Desktop fork repository/schema/role differs');
     const version = /^(.*)\.polaris\.[1-9][0-9]*$/.exec(spec.version ?? '')?.[1];
-    requireGraph(version && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
+    requireGraph(version && version === spec.upstreamVersion && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
       && typeof source.sourceTag === 'string' && source.sourceTag.startsWith(`polaris-${source.upstreamTag}-`)
       && /^[1-9][0-9]*$/.test(source.sourceTag.slice(`polaris-${source.upstreamTag}-`.length))
       && isTree(source.sourceTagObject), 'Immutable fork tag/upstream pins missing or inconsistent');
@@ -212,7 +349,9 @@ export function validateSourceManifest(source, spec) {
 export function validateSourceReceipt(receipt, source, spec) {
   validateSourceManifest(source, spec);
   requireGraph(receipt?.schema === 'polaris-core-source-v1', 'Unsupported source receipt schema');
-  if (isForkSource(spec)) requireGraph(receipt.upstreamTree === source.sourceTree, 'Fork receipt commit tree differs');
+  if (isForkSource(spec)) requireGraph(receipt.upstreamTree === source.sourceTree
+    && receipt.mainGoModSha256 === spec.mainGoModSha256 && receipt.mainGoSumSha256 === spec.mainGoSumSha256,
+  'Fork receipt commit tree/full main manifests differ');
   const [graphScope, sourceGraphState] = source.dependencyPatches.length > 0
     ? ['declared-patched-modules', 'dependencies-patched'] : ['core-source-only', 'source-only'];
   requireGraph(receipt.graphScope === graphScope && receipt.sourceGraphState === sourceGraphState,
@@ -293,8 +432,20 @@ export function validateBuildInfo(raw, source, key, spec) {
   requireGraph(same(source.dependencyPatches.map((dep) => dep.module).sort(), [...spec.dependencyModules].sort()),
     'Patched module inventory differs');
   const facts = parseBuildInfo(raw);
+  const owned = sourceOwnedReplacements(spec);
   const target = DESKTOP_TARGETS[key];
   const platform = spec.platforms[key];
+  if (owned) {
+    validateSourceManifest(source, spec);
+    const roots = [...facts.modules.entries()].filter(([, value]) => value.kind === 'mod');
+    requireGraph(roots.length === 1 && roots[0][0] === 'github.com/sagernet/sing-box'
+      && !roots[0][1].replacement && facts.settings.get('vcs.revision') === source.sourceCommit
+      && facts.settings.get('vcs.modified') === 'false', 'Embedded root module/VCS differs');
+    const dep = owned[0], actual = facts.modules.get(dep.module);
+    requireGraph(actual?.kind === 'dep' && actual.version === dep.version
+      && actual.replacement === dep.replacementPath && actual.replacementVersion === '(devel)'
+      && !actual.replacementSum, 'Embedded source-owned replacement differs');
+  }
   requireGraph(facts.goVersion === source.goVersion, 'Embedded Go toolchain differs');
   for (const [field, expected] of [['GOOS', target.goos], ['GOARCH', target.goarch], ['CGO_ENABLED', target.cgo]]) {
     requireGraph(facts.settings.get(field) === expected, `Embedded ${field} differs`);
@@ -319,7 +470,8 @@ export function validateBuildInfo(raw, source, key, spec) {
   }
   // Any linked module carrying a replacement row must be a declared dependency.
   for (const [module, actual] of facts.modules) {
-    requireGraph(!actual.replacement || spec.dependencyModules.includes(module), `Undeclared embedded module replacement: ${module}`);
+    requireGraph(!actual.replacement || spec.dependencyModules.includes(module)
+      || owned?.some((dep) => dep.module === module), `Undeclared embedded module replacement: ${module}`);
   }
   return facts;
 }
@@ -331,4 +483,61 @@ export function buildInfoFingerprint(raw) {
   return digest(canonical({ goVersion: facts.goVersion,
     modules: [...facts.modules.entries()].sort(([a], [b]) => a.localeCompare(b)),
     settings: [...facts.settings.entries()].sort(([a], [b]) => a.localeCompare(b)) }));
+}
+
+// Section-local corresponding-source guidance cannot be supplied by another
+// platform's text. Legacy NOTICE retains its existing policy in the CLI.
+export function validateForkNotice(notice, manifest, source, mobile) {
+  const spec = validateSourcePins(manifest, 'linux', false);
+  validateSourceManifest(source, spec);
+  const block = (label) => {
+    const lines = notice.split(/\r?\n/);
+    const starts = lines.flatMap((line, index) => line.startsWith(`  - ${label} `) ? [index] : []);
+    requireGraph(starts.length === 1, `NOTICE: unique ${label} section required`);
+    const end = lines.findIndex((line, index) => index > starts[0] && line.startsWith('  - '));
+    return lines.slice(starts[0], end < 0 ? lines.length : end).map((line) => line.trim());
+  };
+  const exact = (lines, expected) => {
+    const label = expected.slice(0, expected.indexOf('：') + 1);
+    requireGraph(lines.filter((line) => line.startsWith(label)).length === 1 && lines.includes(expected),
+      `NOTICE: section-local identity missing/duplicated: ${expected}`);
+  };
+  const desktop = block('桌面 sing-box');
+  requireGraph(desktop[0] === `- 桌面 sing-box v${spec.upstreamVersion} (GPLv3) — ${source.sourceURL}`,
+    'NOTICE: desktop baseline/repository differs');
+  for (const line of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/${source.upstreamTag}`,
+    `桌面源码修复构建：${spec.version}`, `固定源码：${source.sourceURL}/tree/${source.sourceCommit}`,
+    `固定消费标签：${source.sourceURL}/tree/${source.sourceTag}`, `消费标签对象：${source.sourceTagObject}`,
+    `共同 source manifest SHA-256：${spec.sourceManifestSha256}`]) exact(desktop, line);
+  for (const [label, identity] of [['Android libbox 基线', mobile.android], ['Apple libbox 基线', mobile.apple]]) {
+    requireGraph(isTree(identity?.sourceCommit) && isSha(identity.manifestSha256), 'NOTICE: mobile source identity missing');
+    const lines = block(label);
+    requireGraph(lines[0] === `- ${label} v${manifest.bundledCoreVersion} (GPLv3) — https://github.com/SagerNet/sing-box`,
+      `NOTICE: ${label} baseline differs`);
+    for (const line of [`上游基线源码：https://github.com/SagerNet/sing-box/tree/v${manifest.bundledCoreVersion}`,
+      `固定源码：https://github.com/SagerNet/sing-box/tree/${identity.sourceCommit}`,
+      `source manifest SHA-256：${identity.manifestSha256}`]) exact(lines, line);
+  }
+  const heading = '════ 对应源码 / Corresponding Source ════';
+  requireGraph(notice.split(heading).length === 2, 'NOTICE: unique corresponding-source guidance required');
+  const guidance = notice.split(heading)[1];
+  requireGraph(!/Windows\s*另加|固定\s*Windows\s*附加补丁目录|Windows\s+additionally\s+uses|fixed\s+Windows\s+overlay\s+directory/i.test(guidance),
+    'NOTICE: retired Windows overlay claim conflicts with fixed fork source');
+  const patchBase = 'https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts';
+  const lines = guidance.split(/\r?\n/).map((line) => line.trim());
+  const owned = sourceOwnedReplacements(spec);
+  const desktopGuidance = owned
+    ? [`桌面 DNS 固定源码：${source.sourceURL}/tree/${source.sourceCommit}`,
+      `桌面 DNS 来源标签：${source.sourceURL}/tree/${source.sourceTag}`]
+    : [`桌面 D 完整对应源码：${source.sourceURL}/tree/${source.sourceCommit}`,
+      `桌面 D 源码资产：${source.sourceURL}/releases/tag/${source.sourceTag}`];
+  for (const line of [...desktopGuidance, `Android 旧补丁目录：${patchBase}/libbox-patches`,
+    `Apple 旧补丁目录：${patchBase}/libbox-ios-patches`]) exact(lines, line);
+  if (owned) {
+    for (const line of [`内置 sing-tun 替换：${owned[0].replacementPath}，tree ${owned[0].replacementTree}`,
+      `原始 sing-tun 来源：${owned[0].baselineOriginCommit}`,
+      `Windows DNS patch SHA-256：${owned[0].patchSha256}`]) exact(desktop, line);
+    requireGraph(notice.includes('最终源码归档与分发闭包尚待签收。')
+      && guidance.includes('当前不能作为生产分发闭包'), 'NOTICE: DNS publication closure must remain pending');
+  }
 }

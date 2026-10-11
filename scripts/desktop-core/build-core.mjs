@@ -5,12 +5,20 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSy
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  desktopSourceManifestPath, desktopOverlays, isForkSource, observeMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  sourceOwnedReplacements, producerContext, verifySourceOwnedCheckout, desktopSourceManifestPath, desktopOverlays, isForkSource, observeMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
 const PROVISIONER = 'scripts/core-source-provision.py';
 const sourceText = (value) => String(value).trim();
 const nativeRun = (command, args, options = {}) => command === 'codesign'
   ? spawnSync(command, args, options) : execFileSync(command, args, { stdio: 'inherit', ...options });
+
+export function withProviderMetadataOutside(checkout, work, operation) {
+  const metadata = join(checkout, '.polaris-source-receipt.json');
+  const savedMetadata = join(work, 'source-receipt.staging.json');
+  renameSync(metadata, savedMetadata);
+  try { return operation(); }
+  finally { renameSync(savedMetadata, metadata); }
+}
 
 export function buildDesktopCore(root, manifest, key, dest, _force = false,
   run = nativeRun,
@@ -27,6 +35,8 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
   for (const patch of source.patches) verifyHash(join(dirname(sourceManifest), patch.file), patch.sha256);
   for (const dep of dependencies) verifyHash(join(dirname(sourceManifest), dep.patchFile), dep.patchSha256);
   const fork = isForkSource(spec);
+  const owned = sourceOwnedReplacements(spec);
+  const context = owned ? producerContext(production.candidate) : undefined;
   const overlay = !fork && key === 'win' ? join(root, 'scripts/core-patches/windows-dns-refresh.patch') : undefined;
   if (overlay) {
     requireGraph(manifest.windowsBuild?.sourceCommit === source.sourceCommit
@@ -41,6 +51,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     // Always replay fresh sources. Darwin CGO requires a real SDK/compiler.
     const environment = { ...process.env, GOWORK: 'off', GOFLAGS: '', GOEXPERIMENT: '',
       GOOS: target.goos, GOARCH: target.goarch, CGO_ENABLED: target.cgo };
+    if (owned) environment.GOENV = 'off';
     for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GOAMD64', 'GOARM', 'GOARM64']) delete environment[name];
     if (target.goarch === 'amd64') environment.GOAMD64 = 'v1';
     const options = { env: { ...environment, GOTOOLCHAIN: `go${source.goVersion}` } };
@@ -66,9 +77,12 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     };
     const repository = fetch(fork ? source.sourceURL + '.git' : 'https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
     if (fork) {
-      // Resolve both named tags from the declared fork, not the checkout or a moving branch.
-      for (const tag of [source.sourceTag, source.upstreamTag]) {
-        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', source.sourceURL + '.git',
+      // Resolve the consumption tag from the fork and the baseline tag from its
+      // upstream. The fork need not mirror upstream tags; both identities are
+      // still checked against the frozen manifest below, never a moving branch.
+      for (const [tag, url] of [[source.sourceTag, source.sourceURL + '.git'],
+        [source.upstreamTag, 'https://github.com/SagerNet/sing-box.git']]) {
+        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', url,
           `refs/tags/${tag}:refs/tags/${tag}`], options);
       }
       requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}`]) === source.sourceTagObject
@@ -103,14 +117,9 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       // Git 2.53 rejects an excluded path when upstream also ignores it. Move
       // only receipt metadata outside the checkout during staging, regardless
       // of ignore policy, and restore its original bytes even when add fails.
-      const metadata = join(checkout, '.polaris-source-receipt.json');
-      const savedMetadata = join(work, 'source-receipt.staging.json');
-      renameSync(metadata, savedMetadata);
-      try {
+      withProviderMetadataOutside(checkout, work, () => {
         run('git', ['add', '-A', '--', '.', ':(exclude).polaris-source-receipt.json'], { ...options, cwd: checkout });
-      } finally {
-        renameSync(savedMetadata, metadata);
-      }
+      });
     };
     const buildOptions = { ...options, cwd: checkout };
     if (overlay) {
@@ -132,8 +141,11 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       'Untracked compiler input differs from reviewed source tree');
     };
     verifyCompilerInputs();
+    verifySourceOwnedCheckout(checkout, source, spec, capture);
     const preset = readFileSync(join(checkout, 'release', key === 'win' ? 'DEFAULT_BUILD_TAGS_WINDOWS' : 'DEFAULT_BUILD_TAGS'), 'utf8').trim();
-    const tags = [...new Set([...preset.split(','), ...(target.cgo === '0' ? ['with_purego'] : [])])].sort();
+    // alpha.11 moved gvisor out of the default preset. Keep the explicit
+    // Linux/Mac capability and CGO-free additions, then reject any other drift.
+    const tags = [...new Set([...preset.split(','), ...target.extras])].sort();
     requireGraph(canonical(tags) === canonical(expectedTags(key)), 'Upstream feature tag preset differs; review required, do not drop features');
     const flags = readFileSync(join(checkout, 'release/LDFLAGS'), 'utf8').trim();
     if (key === 'win') {
@@ -143,9 +155,20 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     }
     const binary = join(work, key === 'win' ? 'sing-box.exe' : 'sing-box');
     const identity = platformSourceIdentity(receipt, source, spec, key, manifest.windowsBuild?.patchSha256);
-    run(go, ['build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-tags', tags.join(','), '-ldflags',
-      `${flags} -X github.com/sagernet/sing-box/constant.Version=${spec.version} -s -w -buildid=${identity.buildID}`,
-      '-o', binary, './cmd/sing-box'], buildOptions);
+    const compile = () => {
+      if (owned) requireGraph(capture('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: checkout }) === '',
+        'Source-owned VCS must be clean during build');
+      run(go, ['build', '-mod=readonly', '-trimpath', owned ? '-buildvcs=true' : '-buildvcs=false', '-tags', tags.join(','), '-ldflags',
+        `${flags} -X github.com/sagernet/sing-box/constant.Version=${spec.version} -s -w -buildid=${identity.buildID}`,
+        '-o', binary, './cmd/sing-box'], buildOptions);
+      if (owned) {
+        verifySourceOwnedCheckout(checkout, source, spec, capture);
+        requireGraph(capture('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: checkout }) === '',
+          'Source-owned build changed clean VCS');
+      }
+    };
+    if (owned) withProviderMetadataOutside(checkout, work, compile);
+    else compile();
     // Read actual embedded metadata without executing the target binary.
     const buildInfo = capture(go, ['version', '-m', binary], { cwd: checkout });
     const linked = validateBuildInfo(buildInfo, source, key, spec);
@@ -157,8 +180,9 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     stageCompilerInputs();
     requireGraph(capture('git', ['write-tree'], { cwd: checkout }) === buildTree, 'Build changed reviewed source graph');
     verifyCompilerInputs();
+    verifySourceOwnedCheckout(checkout, source, spec, capture);
     const platformReceipt = { schema: 'polaris-desktop-core-v1', candidate: production.candidate, platform: key,
-      ...identity, linkedModules: Object.fromEntries(linked.modules),
+      ...identity, ...(owned ? { sourceOwnedReplacements: owned, producerContext: context } : {}), linkedModules: Object.fromEntries(linked.modules),
       sourceReceipt: receipt, buildTree, overlays: desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256),
       mainGoModSha256: receipt.mainGoModSha256,
       mainGoSumSha256: receipt.mainGoSumSha256,

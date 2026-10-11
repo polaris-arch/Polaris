@@ -408,6 +408,7 @@ impl ProxyRuntime {
         // A later Start may replace current_config before a deduplicated crash
         // is replayed; reading it then would turn B's exit into C's request.
         let config = self.current_config.read().ok().and_then(|g| g.clone());
+        self.coex.terminal(my_gen, true);
         self.mesh.exit_route_reset_state().await;
         self.stop_network_watcher();
         self.disarm_network_canary();

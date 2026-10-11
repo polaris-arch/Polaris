@@ -53,10 +53,9 @@ pub struct CoreBuild {
     /// 逐平台额外的 build tag。今天有两条：
     /// - `with_purego` 只出现在 linux / windows，mac 两份没有（mac 走 `CGO_ENABLED=1`，
     ///   用不着 purego 那套无 cgo 兜底）；
-    /// - `with_gvisor` 自 1.15.0-alpha.7 起 windows 那份不再带（上游 `release/DEFAULT_BUILD_TAGS_WINDOWS`
-    ///   去掉了它）。alpha.7 的 sing-box 模块内该 tag **零消费点**（WireGuard 用户态栈改走 sing-tun
-    ///   自研栈、tailscale 改由 `with_tailscale` 门控），只剩 sing-tun 里已弃用的 `gvisor` / `mixed`
-    ///   TUN 栈受它门控；本仓不下发 `stack`（`singbox/inbound.rs`），故对本仓无消费面。
+    /// - `with_gvisor` 四桌面显式保留 sing-tun 的 gvisor/mixed 能力；alpha.11 上游默认
+    ///   preset 移除该项后，由桌面 source graph 明确补入。Windows 与 purego 独立，仍 CGO=0。
+    ///   本仓不下发 `stack`；编入能力不代表实际启用或设备验收。
     pub extra_tags: &'static [&'static str],
 }
 
@@ -87,7 +86,7 @@ pub const CORE_MATRIX: &[CoreBuild] = &[
         goos: "windows",
         goarch: "amd64",
         cgo: "0",
-        extra_tags: &["with_purego"],
+        extra_tags: &["with_gvisor", "with_purego"],
     },
     CoreBuild {
         key: "mac-arm64",

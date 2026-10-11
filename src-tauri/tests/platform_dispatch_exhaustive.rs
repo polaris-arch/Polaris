@@ -159,6 +159,15 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("src-tauri/src/commands/coexistence_snapshot.rs",
+     "if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)", 1,
+     "COEX source admission supports only current desktop collectors; Android/iOS/Other explicitly unavailable, never empty/safe."),
+    ("src-tauri/src/commands/coexistence_snapshot.rs", "if platform == Platform::Win", 2,
+     "Windows wire and native DTO branch are separate from Unix process receipts. Android/iOS/Other never receive Windows scope/completeness or custody proof."),
+    ("src-tauri/src/commands/coexistence_snapshot.rs",
+     "let mut value = snapshot_wire( Platform::Win, Fact::Unknown( .into()), observation, Fact::Unknown( .into()), )", 1,
+     "Windows diagnostic wire explicitly preserves unknown objects/classification/command cleanup. Other platforms cannot borrow these Windows observations."),
+
     (
         "src-tauri/src/runtime/measurement_scheduler.rs",
         "if self.platform == Platform::Android",
@@ -3035,6 +3044,13 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/updater.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "既有 bundled_core_version_from_manifest 的 cfg!(ios) 只传递版本身份分派：iOS 为 true，跳过 desktopSourceBuild 并保留原 legacy/mobile 解析；Android 为 false，但在 android 早退先返回原 bundled 版本，桌面才可进入 desktopSourceBuild。只登记此既有资源身份隔离，不新增 iOS 更新/核功能，不代表 iOS 编译或设备验收。",
+    ),
+    (
+        "src-tauri/src/runtime/updater.rs",
         "any(target_os = \"android\", target_os = \"ios\")",
         1,
         IosSide::WithAndroid,
@@ -3749,11 +3765,13 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 债的具名清单随之 36 行 / 174 处 → 32 行 / 168 处。
 /// 2026-10-10（Android S5 network history）：实际新增 11 个正确分派点：bridge
 /// android +2 / any(android,test) +7，scheduler android +1 / not(android) +1。
-/// DiffersRight 265→276；只新增 Android 专属查询/精确 decoder 与 host 注入分支，
-/// 既有 iOS 债条目/判决、floor 与求值器均保留，未取得 iOS/native Gradle/设备证明。
+/// 原基线 DiffersRight 265→276；仅新增 Android 查询/decoder 与 host 注入分支。
+/// 2026-10-11 main 另补登记 updater.rs 既有 cfg!(ios) 一处资源版本身份隔离，265→266。
+/// 两条已审输入合并为 266+11=277；历史债条目/判决、floor 与求值器保持原样，
+/// 不以登记或 host 回归签收 iOS/native Gradle/设备能力。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
-    ("DiffersRight", 276),
+    ("DiffersRight", 277),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 142),
     ("WithAndroid", 89),

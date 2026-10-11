@@ -70,6 +70,9 @@ import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
+import { hasDesktopSource, desktopSourceBaseline, validateSourcePins, desktopSourceManifestPath, validateSourceManifest, verifyHash, digest, requireGraph } from './desktop-core/source-graph.mjs';
+import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const coreManifest = JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json'), 'utf-8'));
@@ -77,6 +80,19 @@ const CORE_VERSION = coreManifest.bundledCoreVersion;
 let CRONET_SHA;
 const MODULE_PROXY = 'https://proxy.golang.org';
 const MODULE_BASE = 'github.com/sagernet/cronet-go/lib';
+
+if (hasDesktopRelease(coreManifest)) {
+  try {
+    const request = resolveCronetRequest(process.argv.slice(2));
+    loadReleaseContract(ROOT, coreManifest);
+    if (!request.checkOnly) for (const target of request.targets) {
+      verifyPackagedRelease(ROOT, coreManifest, target.key,
+        join(ROOT, 'resources', target.key, target.key === 'win' ? 'sing-box.exe' : 'sing-box'));
+    }
+    console.log('Release Cronet contract checked; libraries come exclusively from the core archive');
+    process.exit(0);
+  } catch (error) { console.error(`FAILED release Cronet: ${error.message}`); process.exit(1); }
+}
 
 let request;
 try {
@@ -106,13 +122,27 @@ const sha256 = (file) => createHash('sha256').update(readFileSync(file)).digest(
  * 不能缓存或跳过这一步：它既是下载版本的唯一来源，也是防止 core manifest 与实际构建依赖分离的边界。
  */
 function resolveCronetVersionsFromGoMod() {
-  const url = `https://raw.githubusercontent.com/SagerNet/sing-box/v${CORE_VERSION}/go.mod`;
-  const text = execFileSync('curl', ['-fsSL', '--retry', '3', url], { encoding: 'utf-8' });
+  let text;
+  if (hasDesktopSource(coreManifest)) {
+    const spec = validateSourcePins(coreManifest, 'linux', false);
+    const path = join(ROOT, desktopSourceManifestPath(spec));
+    verifyHash(path, spec.sourceManifestSha256);
+    const source = JSON.parse(readFileSync(path, 'utf8'));
+    validateSourceManifest(source, spec);
+    // Preserve raw bytes. UTF-8/newline normalization must not change the hash.
+    const url = `https://raw.githubusercontent.com/polaris-arch/polaris-box/${source.sourceCommit}/go.mod`;
+    const bytes = execFileSync('curl', ['-fsSL', '--retry', '3', url]);
+    requireGraph(digest(bytes) === spec.mainGoModSha256, 'Fork Cronet go.mod SHA-256 differs');
+    text = bytes.toString('utf8');
+  } else {
+    const url = `https://raw.githubusercontent.com/SagerNet/sing-box/v${CORE_VERSION}/go.mod`;
+    text = execFileSync('curl', ['-fsSL', '--retry', '3', url], { encoding: 'utf-8' });
+  }
   const versions = parseCronetGoModRequires(text);
   const platformVersions = `${MODULE_BASE}/linux_amd64=${versions.linux}；` +
     `${MODULE_BASE}/windows_amd64=${versions.win}`;
   console.log(
-    `go.mod 已解析 Cronet 版本：sing-box v${CORE_VERSION} (${platformVersions})`
+    `go.mod 已解析 Cronet 版本：sing-box v${desktopSourceBaseline(coreManifest)} (${platformVersions})`
   );
   return versions;
 }
@@ -146,7 +176,8 @@ const stamps = readStamps(ROOT);
 const versionFor = (t) => MODULE_VERSIONS[t.key];
 const fingerprintOf = (t) => `${versionFor(t)}|${CRONET_SHA[t.key]}`;
 const isCurrent = (t) =>
-  isFresh(stamps, `cronet:${t.key}`, fingerprintOf(t), existsSync(join(ROOT, t.dir, t.out)));
+  isFresh(stamps, `cronet:${t.key}`, fingerprintOf(t), existsSync(join(ROOT, t.dir, t.out)))
+    && sha256(join(ROOT, t.dir, t.out)) === CRONET_SHA[t.key];
 
 let ok = 0;
 let failed = 0;

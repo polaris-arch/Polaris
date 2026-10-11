@@ -12,32 +12,40 @@ next to this file as LICENSE.
    **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - 桌面 sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
-        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+  - 桌面 sing-box v1.15.0-alpha.11 (GPLv3) — https://github.com/polaris-arch/polaris-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.11
         （代理内核，以独立 sidecar 子进程运行）
-        桌面源码修复构建：1.15.0-alpha.8.polaris.4（Linux、Windows、macOS x64 / arm64）
-        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
-        共同 source manifest SHA-256：d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec
-        共享补丁获取位置（动态 main；按共同 manifest 与补丁摘要核对）：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
-        已发布共享补丁基线（不含本轮 G1 增量）：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/libbox-patches
-        当前构建以随仓 manifest、8 个补丁摘要与实际 source/build tree 锁定，不含依赖补丁；最终固定提交由外部来源收据提供。
-        Windows 修复构建：1.15.0-alpha.8.polaris.4（共同修复加 DNS-only 变更缓存刷新）
-        Windows 附加补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
-        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/26bf0d71b85aa9a6b4a95685bed83579c52ebd37/scripts/core-patches
+        桌面源码修复构建：1.15.0-alpha.11.polaris.2
+        固定源码：https://github.com/polaris-arch/polaris-box/tree/aafc521b745e0d1a8f50a6a3f41169433f1c2194
+        固定消费标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-2
+        消费标签对象：71876e8b33d3061bd9abba9618aa3e8c3e22db4e
+        共同 source manifest SHA-256：3f633d5927bb5bfe7c0751678c44357bac97f5183fbc13a394c8e5568267886a
+        桌面修复已进入上述固定fork提交；App不重放补丁或Windows额外overlay。
+        对应源码：上述固定标签及提交；最终源码归档与分发闭包尚待签收。
+        内置 sing-tun 替换：./third_party/sing-tun，tree 18492017863a3bf41df92fe528c2bbe38fe97ab2
+        原始 sing-tun 来源：5c2edb183cc92eb190d41c04dedfa5519ca3e78c
+        Windows DNS patch SHA-256：812956b42cfbb5d302343998b898b9c6489a93f633b1f446c367c5c24681ecd1
         构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
-        （以 libbox 形态载入应用进程，见下）
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
+  - Apple libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI，桌面专属）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
-桌面随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
-四平台共同修复版本及来源记录在同文件的 `sourceBuild`，Windows 附加输入记录在 `windowsBuild`。
-共享 `source-manifest.json` 固定 sing-box 的上游 commit、补丁顺序与摘要，不对依赖模块打补丁；
-Android libbox 也消费这些共同源码与补丁，构建说明见上述共享补丁目录。
-上面写死的桌面版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
-两边不一致即构建转红 —— 版本号写在这里是因为法律声明不该让读者去翻另一个文件。
+桌面随包 sing-box 的上游基线、修复版本与固定fork来源记录在
+`src-tauri/core-manifest.json` 的 `desktopSourceBuild`，对应源码记录在
+`scripts/desktop-core/source-manifest.json`；四平台共同消费该固定提交，不重放App补丁。
+Android/iOS继续消费旧 `bundledCoreVersion` / `sourceBuild` 和各自源码manifest，
+移动端对应源码及补丁获取位置为上述固定manifest与随仓补丁目录。
+上面写死的版本、来源及摘要由 `scripts/verify-packaging.mjs confs` 按各组件独立段核验。
 
 **链进产物的源码级依赖**（Tauri / React / 数百个 Rust crate 等）不属 mere aggregation，
 其许可与版权声明随二进制分发，逐包登记在 `THIRD-PARTY-LICENSES.md`
@@ -100,25 +108,38 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-sing-box 的上游基线在上述 tag / 固定 commit 链接处获取；修复构建的完整对应源码还包括
-上述固定共享补丁目录中的 source-manifest.json、各依赖的固定上游源码及补丁，Windows 另加
-固定 Windows 附加补丁目录中的补丁。按 manifest 中的 SHA-256 核对输入，并按随附构建说明重放。
-GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，本段即该指引。Polaris **不自建上游归档
-或镜像**；上游源码在其各自仓库，Polaris 补丁与构建脚本在本项目仓库。若链接失效，请在本项目 issue 中提出。
+桌面 DNS 固定源码：https://github.com/polaris-arch/polaris-box/tree/aafc521b745e0d1a8f50a6a3f41169433f1c2194
+桌面 DNS 来源标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-2
+桌面修复已包含在固定 fork 源码中；App 不重放共享补丁，也不另加 Windows overlay。
+桌面构建输入以 scripts/desktop-core/source-manifest.json 固定；外部依赖按该源码的
+go.mod / go.sum 获取，并核对 manifest 中的 SHA-256 和随附构建说明。
+
+Android 旧补丁目录：https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts/libbox-patches
+Android 继续使用旧上游基线与该目录的 source-manifest.json、固定补丁及构建说明。
+Apple 旧补丁目录：https://github.com/polaris-arch/Polaris/tree/4563b1fc1ecb23cb7f1141a37a2cab144891ecd6/scripts/libbox-ios-patches
+Apple 继续使用独立旧源码 manifest、固定补丁及 Apple 构建说明。
+移动端各自的固定 source commit 与 manifest 摘要见上方对应组件段落。
+
+GPLv3 §6 的对应源码指引按上述组件分别给出。桌面 fork 的源码以
+上述固定 commit 和标签核对；新四核、签名、最终源码归档及 Cronet 逐库许可/对应源码
+清单尚待签收，当前不能作为生产分发闭包。移动端旧补丁与构建脚本在本项目的固定目录。
+若链接失效，请在本项目 issue 中提出。
 
 **对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
 https://github.com/polaris-arch/Polaris
 
-The upstream baseline is available at the tag and fixed commit linked above.
-The complete Corresponding Source for the patched build also includes the
-source-manifest.json and the patches it lists in the fixed shared patch
-directory (no dependency module is patched); Windows additionally uses the fixed Windows overlay directory.
-Verify the inputs against the manifest's SHA-256 values and follow the included
-build instructions. GPLv3 §6 requires clear directions next to the object code,
-and this paragraph provides those directions. Polaris keeps no upstream archive
-or mirror; upstream sources remain in their respective repositories, and Polaris
-patches and build scripts are in this project's repository. If a link stops
-working, please open an issue on this project.
+The desktop DNS source is the fixed fork commit and role tag linked above.
+Final native kernels, signatures, source archives and per-library Cronet notices
+and corresponding-source inventory remain pending; production admission stays closed. Desktop fixes are
+already included in that source; the App replays no shared patches or additional
+Windows overlay. Use scripts/desktop-core/source-manifest.json and the fork's
+fixed go.mod / go.sum to obtain and verify the build inputs.
+Android keeps its old baseline and the source-manifest.json, patches and build
+instructions in the fixed Android patch directory. Apple keeps its independent
+old manifest, patches and build instructions in the fixed Apple patch directory.
+The component sections above identify each mobile source commit and manifest
+hash. These component-specific locations provide the Corresponding Source
+instructions under GPLv3 §6. If a link stops working, please open a project issue.
 
 For the Android artifact, the Corresponding Source under GPLv3 §6 also
 includes Polaris's own complete source, published at the repository above.

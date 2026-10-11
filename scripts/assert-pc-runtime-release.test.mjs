@@ -100,7 +100,9 @@ const inputPaths = [manifestPath, sourcePath, 'scripts/core-source-provision.py'
   ...source.patches.map((patch) => `scripts/libbox-patches/${patch.file}`),
   ...source.dependencyPatches.map((dep) => `scripts/libbox-patches/${dep.patchFile}`),
   'scripts/core-patches/windows-dns-refresh.patch'];
-const inputs = new Map(inputPaths.map((path) => [path, readFileSync(join(root, path))]));
+// Exact legacy manifest from accepted 36230f41, before D data activation.
+const legacyManifestBytes = readFileSync(join(root, 'scripts/desktop-core/fixtures/legacy-core-manifest.json'));
+const inputs = new Map(inputPaths.map((path) => [path, path === manifestPath ? legacyManifestBytes : readFileSync(join(root, path))]));
 function fixtureRead(changes = new Map()) {
   return (path) => {
     const bytes = changes.has(path) ? changes.get(path) : inputs.get(path);
@@ -124,9 +126,7 @@ function requireUnobserved(policy) {
 }
 
 test('only reviewed source inputs are eligible, without native or ownership clearance', () => {
-  const result = runPolicy();
-  assert.equal(result.status, 0, result.stderr);
-  const policy = JSON.parse(result.stdout);
+  const policy = assertSourceFirstRelease(fixtureRead());
   requireUnobserved(policy);
   assert.equal(policy.reviewedCandidate, '123259cb4ee0eef484368e34d8ea7211d39964b6');
   assert.deepEqual(assertSourceFirstRelease(fixtureRead()), policy);
@@ -242,7 +242,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
       'scripts/desktop-core/source-graph.mjs'];
     for (const path of fixturePaths) {
       mkdirSync(dirname(join(fixture, path)), { recursive: true });
-      writeFileSync(join(fixture, path), readFileSync(join(root, path)));
+      writeFileSync(join(fixture, path), inputs.get(path) ?? readFileSync(join(root, path)));
     }
     writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
     for (const env of [
@@ -251,9 +251,11 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
       { POLARIS_NO_KERNEL_RUN: '1', POLARIS_SKIP_QUALITY_GATES: '1' },
       { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' },
     ]) {
-      const good = runPolicy([], env);
+      writeFileSync(join(fixture, 'scripts/core-source-provision.py'), inputs.get('scripts/core-source-provision.py'));
+      const good = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
       assert.equal(good.status, 0, good.stderr);
       requireUnobserved(JSON.parse(good.stdout));
+      writeFileSync(join(fixture, 'scripts/core-source-provision.py'), 'changed-source');
       const bad = runPolicy([], env, join(fixture, 'scripts/assert-pc-runtime-release.mjs'));
       assert.equal(bad.status, 1, JSON.stringify(env));
       assert.match(bad.stderr, /PC_RUNTIME_RELEASE_BLOCKED.*core-source-provision\.py/);
@@ -320,4 +322,81 @@ test('both policy files select package impact and their tests are mandatory in N
   const nodeGate = readFileSync(join(root, 'scripts/gate-node-test.sh'), 'utf8');
   const required = nodeGate.split('required_tests=(')[1].split('\n)')[0];
   assert.ok(required.includes('scripts/assert-pc-runtime-release.test.mjs'));
+});
+
+
+function desktopPolicyFixture() {
+  const manifest = JSON.parse(inputs.get(manifestPath));
+  const desktop = structuredClone(manifest.sourceBuild);
+  desktop.sourceMode = 'fork-commit-v1'; desktop.upstreamVersion = '2.0.0-alpha.11'; desktop.version = '2.0.0-alpha.11.polaris.1';
+  desktop.mainGoModSha256 = 'a'.repeat(64); desktop.mainGoSumSha256 = 'b'.repeat(64);
+  desktop.buildTree = desktop.patchedSourceTree;
+  for (const platform of Object.values(desktop.platforms)) platform.buildTree = desktop.buildTree;
+  const source = { schema: 'polaris-desktop-fork-source-v1', role: 'desktop',
+    sourceURL: 'https://github.com/polaris-arch/polaris-box', sourceCommit: 'a'.repeat(40), sourceTree: desktop.buildTree,
+    sourceTag: 'polaris-v2.0.0-alpha.11-1', sourceTagObject: 'b'.repeat(40), upstreamTag: 'v2.0.0-alpha.11',
+    upstreamCommit: 'c'.repeat(40), goVersion: '1.25.5', patches: [], dependencyPatches: [] };
+  const bytes = JSON.stringify(source);
+  desktop.sourceManifestSha256 = createHash('sha256').update(bytes).digest('hex');
+  manifest.desktopSourceBuild = desktop; delete manifest.windowsBuild;
+  const changes = new Map([['scripts/desktop-core/source-manifest.json', bytes],
+    ['scripts/libbox-ios-patches/source-manifest.json', readFileSync(join(root, 'scripts/libbox-ios-patches/source-manifest.json'))],
+    [manifestPath, JSON.stringify(manifest)]]);
+  return { manifest, source, changes };
+}
+
+test('new D source closure selects D bytes and remains publication-blocked pending actual reviewed pins', () => {
+  const f = desktopPolicyFixture();
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /exact D release input closure not recorded/);
+  f.changes.set('scripts/desktop-core/source-manifest.json', JSON.stringify({ ...f.source, role: 'mobile' }));
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop source SHA-256/);
+  for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+    f.manifest.desktopSourceBuild = invalid;
+    f.changes.set(manifestPath, JSON.stringify(f.manifest));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktopSourceBuild|not frozen/);
+  }
+});
+
+test('D source admission retains the complete mobile graph, source and provider byte bindings', () => {
+  for (const field of ['bundledCoreVersion', 'sourceBuild']) {
+    const f = desktopPolicyFixture();
+    if (field === 'bundledCoreVersion') f.manifest.bundledCoreVersion = '9.9.9';
+    else f.manifest.sourceBuild.transportPins['example.invalid/unreviewed'] = 'v1.0.0';
+    f.changes.set(manifestPath, JSON.stringify(f.manifest));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /not frozen|Mobile source inputs/);
+  }
+  const patch = source.patches[0];
+  for (const path of [sourcePath, `scripts/libbox-patches/${patch.file}`, 'scripts/libbox-ios-patches/source-manifest.json']) {
+    const f = desktopPolicyFixture(); f.changes.set(path, Buffer.from('unreviewed changed bytes'));
+    assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /Reviewed mobile source SHA-256/);
+  }
+  const f = desktopPolicyFixture(); f.changes.set('scripts/core-source-provision.py', Buffer.from('changed provider'));
+  assert.throws(() => assertSourceFirstRelease(fixtureRead(f.changes)), /desktop provisioner SHA-256/);
+});
+
+
+test('actual production D CLI remains blocked without its reviewed release closure under claimed clearance', () => {
+  const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
+  for (const env of [{}, { POLARIS_SKIP_PC_RUNTIME_RELEASE_GATE: '1' },
+    { POLARIS_ALLOW_PC_RUNTIME_RELEASE: '1', PC_RUNTIME_RELEASE_READY: 'true' },
+    { HELPER_STOP_ACK: 'stopped', PC_OWNER_STATE: 'NoOwner', GITHUB_REF_NAME: 'v999.999.999' }]) {
+    const result = runPolicy([], env);
+    if (Object.hasOwn(manifest, 'desktopSourceBuild')) {
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Desktop fork source review must be renewed: exact D release input closure not recorded|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      requireUnobserved(JSON.parse(result.stdout));
+    }
+  }
+});
+
+test('source-owned schema readiness cannot authorize source-first DNS publication', () => {
+  const source = readFileSync(join(root, 'scripts/assert-pc-runtime-release.mjs'), 'utf8');
+  assert.match(source, /requireGraph\(!sourceOwnedReplacements\(spec\),\s*'DNS source-owned release input closure\/signatures\/output pins not recorded'\)/);
+  const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
+  assert.equal(Object.hasOwn(manifest.desktopSourceBuild, 'sourceOwnedReplacements'), true);
+  assert.equal(JSON.parse(readFileSync(join(root, 'scripts/desktop-core/source-manifest.json'))).sourceCommit,
+    'aafc521b745e0d1a8f50a6a3f41169433f1c2194');
+  assert.throws(() => assertSourceFirstRelease(), /DNS source-owned release input closure\/signatures\/output pins not recorded/);
 });

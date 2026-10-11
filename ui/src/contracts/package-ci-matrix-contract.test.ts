@@ -376,6 +376,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(resolve).toContain('CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}');
     expect(resolve).toContain('CORE_RUN_ID: ${{ github.run_id }}');
     expect(resolve).toContain('CORE_RUN_ATTEMPT: ${{ github.run_attempt }}');
+    expect(resolve).toContain("POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}");
     const runAt = resolve.indexOf('\n        run: |\n');
     const matrixAt = resolve.indexOf('\n          all=', runAt);
     expect(runAt).toBeGreaterThan(0);
@@ -388,6 +389,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate,
       CORE_RUN_ID: '12', CORE_RUN_ATTEMPT: '3',
       CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-3`,
+      POLARIS_NATIVE_PAYLOAD_VALIDATION: '0',
     };
     const cases: [string, Record<string, string>, number][] = [
       ['exact reuse', {}, 0], ['standalone producer', { CORE_BUNDLE_ARTIFACT: '' }, 0],
@@ -398,6 +400,32 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     ];
     for (const [name, changed, status] of cases) {
       const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...base, ...changed }, encoding: 'utf8' });
+      expect(result.status, `${name}: ${result.stderr}`).toBe(status);
+    }
+    const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
+    const native = {
+      ...base, POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
+      GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REF: ref,
+      GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}`,
+      PLATFORMS_JSON: '["linux","windows"]', VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true',
+      VALIDATION_LIGHT: 'false', VALIDATION_SKIP_QUALITY: 'true',
+    };
+    const nativeCases: [string, Record<string, string>, number][] = [
+      ['native exact reuse', {}, 0], ['native wrong event', { GITHUB_EVENT_NAME: 'push' }, 1],
+      ['native outside Actions', { GITHUB_ACTIONS: 'false' }, 1],
+      ['native wrong repository', { GITHUB_REPOSITORY: 'other/repo' }, 1],
+      ['native tag', { GITHUB_REF: 'refs/tags/v1.0.0' }, 1],
+      ['native wrong caller', { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/package.yml@${ref}` }, 1],
+      ['native extra platform', { PLATFORMS_JSON: '["linux","windows","macos-x64"]' }, 1],
+      ['native no kernel gate', { VALIDATION_KERNEL: 'false' }, 1],
+      ['native no original artifacts', { VALIDATION_UPLOAD: 'false' }, 1],
+      ['native light build', { VALIDATION_LIGHT: 'true' }, 1],
+      ['native duplicate quality gates', { VALIDATION_SKIP_QUALITY: 'false' }, 1],
+      ['native no bundle', { CORE_BUNDLE_ARTIFACT: '' }, 1],
+      ['native previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
+    ];
+    for (const [name, changed, status] of nativeCases) {
+      const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...native, ...changed }, encoding: 'utf8' });
       expect(result.status, `${name}: ${result.stderr}`).toBe(status);
     }
   });
