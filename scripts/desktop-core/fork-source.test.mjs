@@ -21,6 +21,8 @@ const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8',
 function fixture(owned = false) {
   const root = mkdtempSync(join(tmpdir(), 'polaris-fork-contract-'));
   try {
+    // Legacy source-mode fixture includes current module dependencies but no release selection.
+    cpSync(join(repo, 'scripts'), join(root, 'scripts'), { recursive: true });
     const upstreamRepository = join(root, 'upstream-objects');
     mkdirSync(upstreamRepository);
     git(upstreamRepository, 'init', '--quiet');
@@ -79,6 +81,7 @@ function fixture(owned = false) {
     if (owned) spec.sourceOwnedReplacements = structuredClone(source.sourceOwnedReplacements);
     const manifest = { ...json(join(repo, 'src-tauri/core-manifest.json')), desktopSourceBuild: spec };
     delete manifest.windowsBuild;
+    delete manifest.desktopRelease;
     write(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
     return { root, repository, upstreamRepository, source, receipt, manifest };
   } catch (error) { rmSync(root, { recursive: true, force: true }); throw error; }

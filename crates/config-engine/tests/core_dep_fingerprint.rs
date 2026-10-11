@@ -418,6 +418,29 @@ fn verify_desktop_embedded_identity(
     Ok(())
 }
 
+fn verify_release_dependency(
+    bytes: &[u8],
+    declared: &serde_json::Value,
+) -> Result<(), &'static str> {
+    let identity = embedded_identity(bytes)?;
+    let actual = identity
+        .modules
+        .get(SING_TUN_MODULE)
+        .ok_or("missing published sing-tun")?;
+    if declared["module"] != SING_TUN_MODULE
+        || declared["version"].as_str() != Some(actual.version.as_str())
+        || actual.kind != "dep"
+        || actual
+            .replacement
+            .as_ref()
+            .map(|(path, version)| (path.as_str(), version.as_str()))
+            != Some(("./third_party/sing-tun", "(devel)"))
+    {
+        return Err("published sing-tun dependency/replacement differs");
+    }
+    Ok(())
+}
+
 fn hex_pin(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -451,6 +474,29 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
         let bytes =
             std::fs::read(path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
 
+        if manifest.get("desktopRelease").is_some() {
+            // The existing release verifier checks the exact public contract, App
+            // adapter/receipt, original bytes, full module graph and actual BuildID.
+            // It observes native Mac signatures on Mac; no foreign core is run.
+            let inspected = std::process::Command::new("node")
+                .args(["--input-type=module", "-e", "import fs from 'node:fs'; import {loadReleaseContract,verifyPackagedRelease} from './scripts/desktop-core/release-consumer.mjs'; const root=process.cwd(), m=JSON.parse(fs.readFileSync('src-tauri/core-manifest.json')), key=process.argv[1], core=process.argv[2], c=loadReleaseContract(root,m); verifyPackagedRelease(root,m,key,core); console.log(JSON.stringify(c.platforms[key].buildGraph.localReplacement));"])
+                .arg(core.key)
+                .arg(path)
+                .current_dir(repo_root())
+                .output()
+                .expect("Node release dependency verifier required");
+            assert!(
+                inspected.status.success(),
+                "{}: published dependency verification failed: {}",
+                core.key,
+                String::from_utf8_lossy(&inspected.stderr)
+            );
+            let declared: serde_json::Value = serde_json::from_slice(&inspected.stdout)
+                .expect("Release dependency row must be JSON");
+            verify_release_dependency(&bytes, &declared)
+                .unwrap_or_else(|error| panic!("{}: {error}", core.key));
+            continue;
+        }
         if owned_mode {
             let source: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(
@@ -754,4 +800,23 @@ fn source_owned_embedded_identity_requires_exact_root_replacement_vcs_and_build_
         &actual_build_id
     )
     .is_err());
+}
+
+#[test]
+fn published_dependency_still_rejects_wrong_version_path_and_missing_modinfo() {
+    let declared = serde_json::json!({"module": SING_TUN_MODULE, "version": "v0.9.7-fixture"});
+    let info = "path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\tgithub.com/sagernet/sing-tun\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.modified=false\n";
+    assert!(verify_release_dependency(&framed_identity_fixture(info), &declared).is_ok());
+    for bad in [
+        info.replace("v0.9.7-fixture", "v0.9.8-fixture"),
+        info.replace("./third_party/sing-tun", "./other"),
+        info.replace("(devel)", "v1.0.0"),
+        info.replace(
+            "github.com/sagernet/sing-tun",
+            "github.com/sagernet/sing-tun-extra",
+        ),
+    ] {
+        assert!(verify_release_dependency(&framed_identity_fixture(&bad), &declared).is_err());
+    }
+    assert!(verify_release_dependency(info.as_bytes(), &declared).is_err());
 }

@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
 /**
  * 首页视图模型 —— **呈现层与接线层之间的唯一契约**。
@@ -191,6 +192,7 @@ export interface HomeScreenViewProps {
   readonly pickerQuery: string;
   readonly onPickerQuery: (q: string) => void;
   readonly pickRows: readonly NodePickRow[];
+  readonly autoSelectControls?: ReactNode;
   readonly pickerSubscriptions?: readonly SubscriptionConfig[];
   readonly onUseAsExit: (server: ServerConfig) => void;
   /**

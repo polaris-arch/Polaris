@@ -1655,7 +1655,7 @@ fn the_status_payload_has_every_field_and_is_blank_under_a_manual_intent() {
     );
     assert_eq!(
         auto_status["barred"],
-        json!([{ "serverId": "flaky", "remainingMs": 120 * MINUTE }])
+        json!([{ "serverId": "flaky", "remainingMs": 120 * MINUTE, "failures": 1 }])
     );
     assert_eq!(
         auto_status["commit"],
@@ -2458,4 +2458,128 @@ fn s5_android_memory_scope_reset_only_rebaselines_bar_history() {
         memory.is_barred("existing", T0),
         "first historical seq is baseline only"
     );
+}
+
+// Repeated confirmed failover policy: test expiry re-entry, real context witnesses,
+// existing S1 gates, and bounded arithmetic instead of deriving UI timers.
+#[test]
+fn s5_repeated_failover_escalates_after_expiry_and_caps_without_overflow() {
+    let mut memory = Memory::default();
+    let mut now = T0;
+    for (failure, expected) in [(1, 120), (2, 240), (3, 480), (4, 960), (5, 1440), (6, 1440)] {
+        memory.bar("flaky", now, 30 * MINUTE);
+        assert_eq!(memory.bar_failures("flaky"), failure);
+        assert_eq!(memory.barred(now), [("flaky", expected * MINUTE)]);
+        now += expected * MINUTE;
+        assert!(!memory.is_barred("flaky", now));
+        assert!(memory.barred(now).is_empty());
+    }
+    memory.bar("overflow", u64::MAX - 10, u64::MAX);
+    assert_eq!(memory.barred(u64::MAX - 10), [("overflow", 10)]);
+    assert!(!memory.is_barred("overflow", u64::MAX));
+    memory.barred.get_mut("overflow").unwrap().failures = u32::MAX;
+    memory.bar("overflow", T0, u64::MAX);
+    assert_eq!(memory.bar_failures("overflow"), u32::MAX);
+    assert_eq!(memory.barred.get("overflow").unwrap().until, u64::MAX);
+}
+
+#[test]
+fn s5_repeated_failover_history_is_per_node_and_short_period_cannot_shorten_active_bar() {
+    let mut memory = Memory::default();
+    memory.bar("flaky", T0, 360 * MINUTE);
+    memory.bar("flaky", T0 + MINUTE, 5 * MINUTE);
+    assert_eq!(
+        memory.barred(T0 + MINUTE),
+        [("flaky", FAILOVER_BAR_MAX_MS - MINUTE)]
+    );
+    memory.bar("other", T0, 5 * MINUTE);
+    assert_eq!(memory.bar_failures("other"), 1);
+    assert_eq!(memory.bar_failures("flaky"), 2);
+    assert!(memory.is_barred("other", T0 + FAILOVER_BAR_MIN_MS - 1));
+    assert!(!memory.is_barred("other", T0 + FAILOVER_BAR_MIN_MS));
+}
+
+#[test]
+fn s5_core_foreground_good_latency_and_commit_failures_do_not_reset_failure_history() {
+    let epoch = |generation, foreground| Epoch {
+        subscription: "sub".into(),
+        generation,
+        network_epoch: Some(1),
+        foreground_epoch: Some(foreground),
+    };
+    let mut memory = Memory::default();
+    memory.observe_context(&epoch(1, 1), 0, 1);
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_context(&epoch(2, 2), 1, 1);
+    memory.record_switch(Cause::Better, T0 + 120 * MINUTE);
+    for failure in [
+        CommitFailure::Failed,
+        CommitFailure::NotEligible,
+        CommitFailure::Reconciling,
+        CommitFailure::Yielded,
+    ] {
+        memory.record_commit_failure(failure);
+    }
+    assert_eq!(memory.bar_failures("flaky"), 1);
+    memory.bar("flaky", T0 + 120 * MINUTE, 30 * MINUTE);
+    assert_eq!(memory.barred(T0 + 120 * MINUTE), [("flaky", 240 * MINUTE)]);
+}
+
+#[test]
+fn s5_only_proven_context_changes_or_leaving_auto_reset_escalation() {
+    let epoch = |subscription: &str, network| Epoch {
+        subscription: subscription.into(),
+        generation: 1,
+        network_epoch: network,
+        foreground_epoch: Some(1),
+    };
+    for reset in 0..4 {
+        let mut memory = Memory::default();
+        memory.observe_context(&epoch("sub", Some(1)), 0, 1);
+        memory.bar("flaky", T0, 30 * MINUTE);
+        memory.bar("flaky", T0, 30 * MINUTE);
+        match reset {
+            0 => memory.observe_context(&epoch("other", Some(1)), 0, 1),
+            1 => memory.observe_context(&epoch("sub", Some(2)), 0, 1),
+            2 => memory.observe_context(&epoch("sub", Some(1)), 0, 2),
+            _ => memory.leave(),
+        }
+        assert_eq!(memory.bar_failures("flaky"), 0);
+        memory.bar("flaky", T0, 30 * MINUTE);
+        assert_eq!(memory.barred(T0), [("flaky", 120 * MINUTE)]);
+    }
+    let mut memory = Memory::default();
+    memory.observe_context(&epoch("sub", Some(1)), 0, 2);
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_context(&epoch("sub", None), 0, 1); // unknown network and stale cost
+    memory.bar("flaky", T0, 30 * MINUTE);
+    assert_eq!(memory.bar_failures("flaky"), 2);
+}
+
+#[test]
+fn s5_native_history_growth_resets_strikes_but_baselines_and_retired_returns_do_not() {
+    let epoch = Epoch {
+        subscription: "sub".into(),
+        generation: 1,
+        network_epoch: None,
+        foreground_epoch: Some(1),
+    };
+    let observation = |query, source: &str, seq, known| NativeNetworkObservation {
+        query,
+        source: source.into(),
+        seq,
+        current_known: known,
+        coverage_gap: !known,
+    };
+    let mut memory = Memory::default();
+    memory.observe_native_context(&epoch, 0, 1, Some(&observation(1, "first", 0, true)));
+    memory.bar("flaky", T0, 30 * MINUTE);
+    memory.observe_native_context(&epoch, 0, 1, Some(&observation(2, "second", 0, true)));
+    memory.observe_native_context(&epoch, 0, 1, Some(&observation(3, "first", 100, true)));
+    memory.observe_native_context(&epoch, 0, 1, Some(&observation(2, "second", 10, true)));
+    assert_eq!(memory.bar_failures("flaky"), 1);
+    memory.observe_native_context(&epoch, 0, 1, Some(&observation(4, "second", 1, true)));
+    assert_eq!(memory.bar_failures("flaky"), 0);
+    memory.bar("flaky", T0, 30 * MINUTE);
+    assert_eq!(memory.barred(T0), [("flaky", 120 * MINUTE)]);
 }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { lstatSync, readFileSync } from 'node:fs';
+import { loadReleaseContract } from './release-consumer.mjs';
 
 export const DESKTOP_TARGETS = Object.freeze({
   linux: { goos: 'linux', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
@@ -187,6 +188,13 @@ export function isForkSource(spec) {
 export const desktopSourceManifestPath = (spec) => isForkSource(spec)
   ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
 export function desktopSourceGoVersion(root, manifest) {
+  if (Object.hasOwn(manifest, 'desktopRelease')) {
+    const contract = loadReleaseContract(root, manifest);
+    // Go version is a producer field; all four admitted rows must agree.
+    const goVersions = new Set(Object.values(contract.platforms).map((row) => row.portablePlatformIdentity.facts.goVersion));
+    requireGraph(goVersions.size === 1 && goVersions.has('go1.25.5'), 'Release inspection Go pin differs');
+    return [...goVersions][0].slice(2);
+  }
   const spec = validateSourcePins(manifest, 'linux', false);
   const path = join(root, desktopSourceManifestPath(spec));
   verifyHash(path, spec.sourceManifestSha256);

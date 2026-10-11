@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const verifier = join(repo, 'scripts/verify-packaging.mjs');
@@ -19,6 +20,9 @@ function fixture(t, label, extra = []) {
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const core = label === 'windows' ? 'win' : 'linux';
   const suffix = label === 'windows' ? '.exe' : '';
+  const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
+  const legalMembers = hasDesktopRelease(manifest)
+    ? releasePayloadMembers(loadReleaseContract(repo, manifest), core) : [];
   const members = [
     'core-manifest.json', '_up_/LICENSE', '_up_/NOTICE', '_up_/THIRD-PARTY-LICENSES.md',
     ...Array.from({ length: count }, (_, i) => `_up_/resources/data/fixture-${i}.srs`),
@@ -26,7 +30,8 @@ function fixture(t, label, extra = []) {
     '_up_/resources/dashboard/licenses/fixture.txt', '_up_/resources/dashboard/favicon.ico',
     '_up_/resources/dashboard/favicon.svg', '_up_/resources/dashboard/apple-touch-icon-180x180.png',
     `_up_/resources/${core}/sing-box${suffix}`, `_up_/resources/${core}/polaris-helper${suffix}`,
-    `_up_/resources/${core}/libcronet.${label === 'windows' ? 'dll' : 'so'}`, ...extra,
+    `_up_/resources/${core}/libcronet.${label === 'windows' ? 'dll' : 'so'}`,
+    ...legalMembers.map((member) => `_up_/resources/${core}/${member}`), ...extra,
   ];
   const scopes = label === 'windows' ? [root] : [join(root, 'deb/usr/lib/Polaris'), join(root, 'appimage/Polaris.AppDir/usr/lib/Polaris')];
   for (const scope of scopes) for (const member of members) {

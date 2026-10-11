@@ -304,7 +304,6 @@
   "home": {
     "addServer": "添加服务器",
     "addSubscription": "添加订阅",
-    "autoSwitched": "已自动切换到 {{name}}（{{latency}}ms）",
     "cancelStarting": "启动中 · 点击取消",
     "clear": "清空",
     "connectErrorClickToRetry": "连接失败 · 点击重试",
@@ -3158,6 +3157,102 @@
       "dwell": "距上次换点的驻留时间还不够",
       "rateLimit": "须等待换点限频窗口释放",
       "cooldown": "须等待换点冷却结束"
+    },
+    "choose": "自动选择订阅",
+    "choice": "自动 · {{subscription}}",
+    "choiceHelp": "自动意图与实际出口分开显示；点击任一节点会回到手动选择。",
+    "switchNow": "立即评估切换",
+    "keepManual": "保留当前出口，改为手动",
+    "intentSaved": "自动选择意图已保存；实际出口等待后端评估。",
+    "manualSaved": "手动选择已保存。",
+    "placementFailed": "自动意图已保存，但运行侧换点未完成，请检查实际出口与状态。",
+    "selectionChanged": "选择已更新，请以当前实际出口与意图为准。",
+    "actionFailed": "选择操作失败，请检查当前状态后重试。",
+    "details": "本次运行的评估详情",
+    "basis": "当前出口依据：{{state}} · {{latency}} · {{binding}} · {{at}}",
+    "lastSwitch": "最近换点：{{from}} → {{to}} · {{reason}} · {{at}}",
+    "lastEvaluation": "最近评估：{{at}} · {{reason}}",
+    "counts": "可选 {{selectable}} · 失败 {{failed}} · 过期 {{stale}} · 未测 {{unmeasured}} · 跳过 {{skipped}} · 未证实 {{unverified}} · 需重启 {{needsRestart}}",
+    "challenger": "候选 {{name}} · 连续胜出 {{wins}} / {{required}} 轮",
+    "commit": "连续提交失败 {{count}} 次 · 重试间隔 {{seconds}} 秒（最近状态）",
+    "lastFailure": "最近未完成：{{name}} · {{reason}} · {{at}}",
+    "noDataAge": "没有选点数据已持续 {{seconds}} 秒（最近状态）",
+    "outside": "实际出口不在自动订阅内。",
+    "outsideOverdue": "实际出口长时间未落入自动订阅，请检查候选与测速。",
+    "unverified": "此依据未通过运行态读回证实。",
+    "allUnverified": "全部可选候选都未被运行态读回证实。",
+    "switchCounts": "本次运行以来：故障换点 {{failover}} 次 · 自动选点 {{select}} 次",
+    "dataSource": "周期测速暂停原因：{{blocked}} · 最近跳过原因：{{skip}}",
+    "none": "无",
+    "barStrikes": "同一有效环境内，已因故障换走 {{count}} 次；重复故障会延长排除。",
+    "error": {
+      "AUTO_SELECT_SWITCHED_OFF": "自动选择功能未开放。",
+      "AUTO_SELECT_PLATFORM_NOT_OPEN": "本平台暂未开放自动选择。",
+      "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND": "订阅已不存在，请刷新节点。",
+      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "订阅内没有节点。",
+      "AUTO_SELECT_NOT_AUTO": "当前不是自动选择，请先选择自动订阅。",
+      "AUTO_SELECT_NO_TARGET": "此刻没有满足切换条件的候选，保留实际出口。",
+      "AUTO_SELECT_SWITCH_FAILED": "切换未完成，请检查实际出口与选择状态。",
+      "AUTO_SELECT_READBACK_FAILED": "操作后无法同步已保存配置，尚不能确认结果；请刷新检查。"
+    },
+    "receipt": {
+      "applied": "已切换到 {{name}}",
+      "pending": "已保存 {{name}}，等待运行侧确认。",
+      "restarting": "已保存 {{name}}，代理正在重启。",
+      "notRunning": "已保存 {{name}}，下次连接时使用。",
+      "deferred": "已保存 {{name}}，需要应用配置后生效。"
+    },
+    "basisState": {
+      "fresh": "新鲜",
+      "failed": "失败",
+      "expired": "过期",
+      "unmeasured": "未测",
+      "skipped": "跳过",
+      "mismatch": "身份不符"
+    },
+    "binding": {
+      "confirmed": "已证实",
+      "unverified": "未证实"
+    },
+    "event": {
+      "firstPlacement": "{{name}} · 已完成订阅内首次落点",
+      "better": "{{name}} · 已切换到持续更优的候选",
+      "currentFailed": "{{name}} · 当前出口连续测速失败后已换点",
+      "failover": "{{name}} · 已因连通性故障切换出口",
+      "winnerRemoved": "{{name}} · 原出口已从订阅删除，已在同订阅内改选",
+      "requested": "{{name}} · 已按用户请求完成换点",
+      "unknown": "实际出口已变为 {{name}}"
+    },
+    "dataReason": {
+      "switchedOff": "周期测速功能未开放",
+      "userDisabled": "全局周期测速已关闭",
+      "platformNotEnabled": "本平台暂未启用周期测速",
+      "coreNotRunning": "代理未运行",
+      "noSubscription": "没有订阅启用周期测速",
+      "background": "应用不在前台",
+      "metered": "计费网络策略暂停测速",
+      "powerSave": "省电策略暂停测速",
+      "gateBusy": "测速通道正在被占用",
+      "preempted": "本轮已让位给其他测速",
+      "budget": "本轮超出时间预算",
+      "frozen": "配置事务暂时冻结测速",
+      "poolUnavailable": "候选测量池不可用",
+      "nothingTestable": "本轮没有可测节点",
+      "noTargets": "本轮没有待测目标",
+      "crashed": "本轮异常结束，没有回执"
+    },
+    "cause": {
+      "firstPlacement": "订阅内首次落点",
+      "better": "持续更优的候选",
+      "currentFailed": "当前出口连续测速失败",
+      "failover": "连通性故障",
+      "winnerRemoved": "原出口从订阅删除",
+      "requested": "用户请求评估切换"
+    },
+    "outcome": {
+      "held": "本次评估未换点",
+      "switch": "本次评估决定换点，运行结果以实际出口为准",
+      "notEvaluated": "本次未评估"
     }
   }
 }

@@ -1156,17 +1156,37 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    // 验证腿的产物不离开 runner：唯一的 artifact 是 R8 的四份文本，没有 APK / SO，也不碰 release。
+    // 验证腿不上传 APK / SO：唯一的 artifact 只留 R8 四份文本与 S5 原 XML/收据，不碰 release。
     const releaseCheck = jobBlock(android, 'release_check');
     expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(1);
     const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
       .split('\n')
       .filter((line) => line.startsWith(' '.repeat(12)))
       .map((line) => line.trim());
-    expect(uploaded).toEqual(['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
-      (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
-    ));
+    expect(uploaded).toEqual([
+      ...['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
+        (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
+      ),
+      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest'].map(
+        (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
+      ),
+      '${{ runner.temp }}/s5-android-unit-results.json',
+    ]);
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
+    // 新证据白名单仍是文本；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
+    const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation unit tests'));
+    expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
+    expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
+    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest']) {
+      expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
+    }
+    expect(s5Units).toContain('python3 -I -');
+    expect(s5Units).toContain("for k in ('failures', 'errors', 'skipped')");
+    expect(s5Units).toContain('len(cases) == len(methods)');
+    expect(s5Units).toContain("sourceSha256");
+    expect(s5Units).toContain("reportSha256");
+    expect(s5Units).not.toMatch(/continue-on-error|kotlinc|\|\| true/);
+
 
     // 传 true 的调用点全仓恰两处，都在 release-risk：打包腿（与「不上传」成对）与 Android 腿（不传发布）。
     // 旧判据是「全仓恰一处」；现在按文件、按 job 各自点名，别的 workflow（含 tag 发布所在的 package.yml）为零。

@@ -36,6 +36,13 @@ function asStrValues(name: string): string[] {
 }
 
 describe('自动选择合同与后端一致', () => {
+  it('barred failure count is additive and supplied by the actual Memory projection', () => {
+    const schema = RUST.slice(RUST.indexOf('pub(crate) struct BarredView {'), RUST.indexOf('/// 提交的状况。', RUST.indexOf('pub(crate) struct BarredView {')));
+    expect(schema).toContain('pub(crate) failures: u32');
+    expect(RUST).toContain('failures: slot.memory.bar_failures(server_id)');
+    const contract = readFileSync(fileURLToPath(new URL('./auto-select.ts', import.meta.url)), 'utf8');
+    expect(contract).toContain('failures?: number');
+  });
   it('未评估的原因 = 闸门的全部取值，去掉两个不以原因出现的', () => {
     // `manual` 是模式，不是原因；`waitingFirstRound` 单独成一个模式。`notYetEvaluated` 由状态
     // 投影给出（意图刚写入、还没有评估过），不是闸门。
@@ -147,8 +154,8 @@ describe('界面写出口与意图的位置逐处登记', () => {
       '暂存区删掉了当前出口节点：随保存一起提交的兜底出口。用户删的是节点，不是在选出口',
     ],
     'store/app-store.ts': [
-      6,
-      'store 内存态的初值、重置归零及四处配置投影；全部登记，不以右值读取同名字段为由豁免写入',
+      7,
+      'store 内存态的初值、重置归零及五处配置投影；全部登记，不以右值读取同名字段为由豁免写入',
     ],
   };
 

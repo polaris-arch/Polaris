@@ -11,6 +11,8 @@ import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease } from './release-consumer.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
+import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
+import { validationContext } from './validation-origin.mjs';
 import { verifyPackagedSource } from './bundle.mjs';
 import { assertSourceFirstRelease } from '../assert-pc-runtime-release.mjs';
 import { cronetFixture } from '../lib/cronet-payload.test.mjs';
@@ -296,6 +298,8 @@ test('final carrier retains original notice/source bytes as well as exact core a
 
 test('actual inventory CLI admits precisely the release members and rejects missing/extra files in static and carrier trees', async () => withFixture(async (f) => {
   cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
+  // Production now has a bound contract; this private fixture retains its own exact bytes.
+  write(join(f.root, f.manifest.desktopRelease.contractPath), encode(f.contract));
   copyFileSync(join(repo, 'src-tauri/build.rs'), join(f.root, 'src-tauri/build.rs'));
   const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8').match(/^const EXPECTED_SRS_COUNT: usize = (\d+);$/m)[1]);
   for (const name of ['LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md']) write(join(f.root, name), 'inert');
@@ -382,12 +386,16 @@ test('unsigned Intel release retains only the existing thin-x86_64 native except
 }, { unsignedIntel: true }));
 test('actual fetch CLIs reject malformed release mode and check-only Cronet has no module proxy access', async () => withFixture(async (f) => {
   cpSync(join(repo, 'scripts'), join(f.root, 'scripts'), { recursive: true });
+  // Production now has a bound contract; this private fixture retains its own exact bytes.
+  write(join(f.root, f.manifest.desktopRelease.contractPath), encode(f.contract));
   let result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-cronet.mjs'), '--check-only'], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr); assert.match(result.stdout, /exclusively from the core archive/);
-  for (const args of [['--bundle-dir=old', '--candidate=' + candidate], ['--producer'], ['--platform=linux,,win']]) {
+  for (const args of [['--producer'], ['--platform=linux,,win']]) {
     result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-core.mjs'), ...args], { encoding: 'utf8' });
     assert.equal(result.status, 1); assert.match(result.stderr, /Release mode|architecture selection/);
   }
+  result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-core.mjs'), '--bundle-dir=old', '--candidate=' + candidate], { encoding: 'utf8' });
+  assert.equal(result.status, 1); assert.match(result.stderr, /ENOENT|Non-regular/);
   write(join(f.root, 'src-tauri/core-manifest.json'), encode({ ...f.manifest, desktopRelease: null }));
   result = spawnSync(process.execPath, [join(f.root, 'scripts/fetch-cronet.mjs'), '--check-only'], { encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stderr, /Explicit release selection incomplete/);
@@ -413,4 +421,62 @@ test('release notice identities are section-local and independent from mobile; o
   assert.throws(() => validateReleaseNotice(notice.replace('v1.15.0-alpha.8', 'v1.15.0-alpha.12'), f.manifest, f.contract, mobile));
   assert.throws(() => validateReleaseNotice(notice.replace(desktop[1], desktop[1] + '\n' + desktop[1]), f.manifest, f.contract, mobile));
   assert.throws(() => assertSourceFirstRelease((path) => { assert.equal(path, 'src-tauri/core-manifest.json'); return encode(f.manifest); }), /does not inherit/);
+}));
+
+// Inert fixture acquisition checks the native-attempt receipt transport only.
+// It does not claim a real native download, signature or final carrier gate.
+test('published native gate rejects wrong attempt, host, source, adapter and asset snapshots', () => withFixture(async (f) => {
+  const context = releaseGateContext({ GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
+    GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' });
+  assert.throws(() => releaseGateContext({}), /Actions/);
+  const receipts = await consumeRelease(f.root, f.manifest, ['linux'], f);
+  const receipt = receipts.linux;
+  const facts = { schema: 'polaris-app-native-release-gate-v1', candidate: receipt.adapter.facts.candidate,
+    context, contractSha256: f.manifest.desktopRelease.contractSha256, platform: 'linux', host: 'linux', arch: 'x64',
+    receipt, readback: JSON.parse(readFileSync(join(f.root, 'resources/.release-receipts/public-readback.json'), 'utf8')),
+    indexSha256: f.contract.assetIndex.sha256,
+    inspection: 'download-extract-buildinfo-buildid-cronet-native-signature',
+    actualAppAcceptance: 'pending load, gvisor/mixed, feature and final carrier' };
+  const freeze = (value) => { const { fingerprint, ...rest } = value; return { ...rest, fingerprint: digest(portableCanonical(rest)) }; };
+  const gate = freeze(facts);
+  const verify = (value) => verifyNativeReleaseGate(value, f.contract, f.manifest.desktopRelease, receipt.adapter, context, 'linux');
+  verify(gate);
+  for (const mutate of [
+    (g) => { g.context.attempt = '2'; }, (g) => { g.context.runId = '456'; },
+    (g) => { g.host = 'win32'; }, (g) => { g.arch = 'arm64'; },
+    (g) => { g.contractSha256 = '0'.repeat(64); }, (g) => { g.indexSha256 = '0'.repeat(64); },
+    (g) => { g.candidate = '0'.repeat(40); }, (g) => { g.actualAppAcceptance = 'passed'; },
+    (g) => { g.readback.after.sourceCommit = '0'.repeat(40); },
+    (g) => { g.receipt.producer.sourceCommit = '0'.repeat(40); },
+    (g) => { g.receipt.adapter.facts.fileSha256['scripts/fetch-core.mjs'] = '0'.repeat(64); },
+    (g) => { g.receipt.publicReadback.assets.pop(); },
+  ]) {
+    const changed = structuredClone(gate); mutate(changed); assert.throws(() => verify(freeze(changed)));
+  }
+}));
+
+
+test('cumulative strict Risk accepts only the verified published selection and exact manual run', async () => withFixture(async (f) => {
+  const ref = 'refs/heads/collab/s5-android-signal-20261010';
+  const env = { POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
+    GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
+    GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
+    GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}` };
+  assert.deepEqual(validationContext(candidate, env, f.root), { runId: '900', attempt: '1' });
+  for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
+    { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' },
+    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_SHA: '0'.repeat(40) },
+    { GITHUB_RUN_ATTEMPT: '0' }, { GITHUB_RUN_ID: '0' },
+    { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}` },
+    { POLARIS_NO_KERNEL_RUN: '1' }]) {
+    assert.throws(() => validationContext(candidate, { ...env, ...change }, f.root), /exact non-tag/);
+  }
+  const path = join(f.root, f.manifest.desktopRelease.contractPath), original = readFileSync(path);
+  write(path, Buffer.concat([original, Buffer.from(' ')]));
+  assert.throws(() => validationContext(candidate, env, f.root), /SHA|hash|differs/i);
+  write(path, original);
+  const manifestPath = join(f.root, 'src-tauri/core-manifest.json');
+  const sourceOnly = structuredClone(f.manifest); delete sourceOnly.desktopRelease;
+  write(manifestPath, encode(sourceOnly));
+  assert.throws(() => validationContext(candidate, env, f.root));
 }));

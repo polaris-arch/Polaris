@@ -822,7 +822,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                   </button>
                 </li>
               </ul>
-              <HomeNodePickerList rows={props.pickRows} subscriptions={props.pickerSubscriptions}
+              <HomeNodePickerList autoSelectControls={props.autoSelectControls} rows={props.pickRows} subscriptions={props.pickerSubscriptions}
                 query={props.pickerQuery} sortByLatency={sortByLatency} t={t} onUseAsExit={props.onUseAsExit} />
               </div>
             </HomePickerSheet>

@@ -1,3 +1,4 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * 移动端「首页」的**接线层**：读 store、订阅事件流、发 IPC，把结果整形成 `view-model.ts` 的 props。
  * 呈现层（`HomeScreenView`）不认识 store，也不认识 `api` —— 这条分界是门能真渲染本屏的前提。
@@ -761,6 +762,7 @@ export function MobileHomeScreen(): ReactElement {
       onClosePicker={() => setPickerOpen(false)}
       pickerQuery={pickerQuery}
       onPickerQuery={setPickerQuery}
+      autoSelectControls={<SavedAutoSelectControls showStatus t={t} query={pickerQuery} />}
       pickRows={pickRows}
       pickerSubscriptions={config?.subscriptions ?? []}
       onUseAsExit={onUseAsExit}

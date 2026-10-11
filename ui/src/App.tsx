@@ -1,3 +1,4 @@
+import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 /**
  * Polaris App 根组件。
  *
@@ -648,16 +649,12 @@ export default function App() {
     };
   }, []);
 
-  // 自动换节点（C3）：节点故障自动切换成功后后端 emit `event:autoNodeSwitched`（payload 含 newServerName/latency）。
-  // **emit 发射点由并行 proxy 批接线**（events.rs 已定义常量，发射随该批落地）——故此订阅非死通道，与 A3/A4 同型
-  // （契约先行、后端随批合璧，wave gate 验前后端合璧）。后端在本事件之前先发通用 configChanged
-  // signal，选中节点由上面的统一配置订阅重拉；这里仅①刷连接态 ②toast 告知已切到哪个节点，避免
-  // 同一事务连续发两次强制 config.get。Polaris toast 为单串（无 description）→ 只用
-  // home.autoSwitched（含 name/latency），舍 上游的补充 autoSwitchedDesc。
+  // Both confirmed failover and automatic selection use this event. ConfigChanged loads the
+  // saved exit separately; this listener refreshes connection state and reports the actual cause.
   useEffect(() => {
     const off = api.proxy.onAutoNodeSwitched((data) => {
       void refreshProxyStatus();
-      toast.success(t('home.autoSwitched', { name: data.newServerName, latency: data.latency }));
+      toast.success(autoNodeSwitchFeedback(data, t));
     });
     return off;
   }, [t, refreshProxyStatus]);

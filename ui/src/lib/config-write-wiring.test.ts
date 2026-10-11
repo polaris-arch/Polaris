@@ -100,7 +100,7 @@ const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   // W-d：专用 IPC 写腿 —— 前端发的是「加一个节点」而不是「写 servers 键」，但落盘的是同一份 config。
   [
     'W-d',
-    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel)\s*\(/g,
+    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel|autoSelectEnable|autoSelectSwitchNow)\s*\(/g,
   ],
 ];
 
@@ -325,6 +325,12 @@ interface Site {
 }
 
 const SITES: readonly Site[] = [
+  ...(['switch', 'autoSelectEnable', 'autoSelectSwitchNow'] as const).map(method => ({
+    file: 'lib/auto-select-actions.ts',
+    callee: `api.server.${method}(`,
+    route: 'direct' as const,
+    why: 'W-1 saved selection intent/actual exit transaction: dedicated backend command in existing webview write queue, authoritative readback before feedback; no config patch or staged selection intent.',
+  })),
   // ── W-a：设置子页与 DNS 资源工作区共用 `useConfig().update` 漏斗 ──
   // 漏斗按键判是硬要求而非风格：`SettingsNetwork` 的 `update({ [key]: next })` 一个调用点跨
   // `mixedPort`(Class B) / `controlPort`(Class A) 两个 class，静态判必错一半。

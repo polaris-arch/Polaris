@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState, type ReactElement } from 'react';
+import { Fragment, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
@@ -7,8 +7,9 @@ import { sortServersByLatency } from '@/domain/server-latency-sort';
 import type { NodePickRow, HomeScreenViewProps } from './view-model';
 
 /** Same provenance/order/defaults as PC NodeMenu. Search never mutates the manual collapse set. */
-export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLatency, t, onUseAsExit }: {
+export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLatency, t, onUseAsExit, autoSelectControls }: {
   rows: readonly NodePickRow[];
+  autoSelectControls?: ReactNode;
   subscriptions?: readonly SubscriptionConfig[];
   query: string;
   sortByLatency: boolean;
@@ -32,8 +33,8 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
     }) : filtered };
   }).filter(group => group.servers.length > 0);
   const scheduleReveal = useRevealAfterCommit();
-  if (shown.length === 0) return <p className="h-empty">{t('mobileHome.noMatchingNode')}</p>;
-  return <ul className="h-picklist">
+  if (shown.length === 0) return <>{autoSelectControls}<p className="h-empty">{t('mobileHome.noMatchingNode')}</p></>;
+  return <>{autoSelectControls}<ul className="h-picklist">
     {shown.map(group => {
       const open = !!needle || openGroups.has(group.id);
       const label = group.isManual ? t('nodes.tab.manual') : group.isMesh ? t('nodes.tab.mesh') : group.name;
@@ -63,5 +64,5 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
         })}
       </Fragment>;
     })}
-  </ul>;
+  </ul></>;
 }

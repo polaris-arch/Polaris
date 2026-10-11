@@ -239,7 +239,10 @@ export interface AutoSelectStatus {
     lacking: AutoSelectLacking | null;
   } | null;
   /** 因近期被故障切换换走而暂时不作为挑战者的节点。 */
-  barred: { serverId: string; remainingMs: number }[];
+  barred: { serverId: string; remainingMs: number;
+    /** Confirmed failover departures in this context. Optional for older additive status producers. */
+    failures?: number;
+  }[];
   /** 提交的状况：连续没有换成的次数、下一次重试前的间隔、最近一次没换成的记录。 */
   commit: {
     consecutiveFailures: number;

@@ -209,6 +209,18 @@ interface Site {
 }
 
 const SITES: readonly Site[] = [
+  {
+    file: 'mobile/SavedAutoSelectControls.tsx',
+    shape: 'useAppStore(state=>state.config)',
+    route: 'disk',
+    why: '落盘入参 / 后端对账：Auto 命令只针对已保存订阅与实际出口，不使用 staged-only 节点或草稿意图。',
+  },
+  {
+    file: 'mobile/SavedAutoSelectControls.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk',
+    why: '落盘入参 / 后端对账：执行队列与迟到回包同步读取已保存选择，不依赖 React 重渲后才更新的快照。',
+  },
   // ── 派生层自身 ──
   {
     file: 'store/app-store.ts',

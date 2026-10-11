@@ -1,3 +1,4 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * Home 屏（提取自原型 polaris-prototype.html L1633-1711）。
  *
@@ -1134,6 +1135,7 @@ export function HomeScreen() {
                     </svg>
                   </button>
                   <NodeMenu
+                    autoSelectControls={<SavedAutoSelectControls showStatus t={t} />}
                     open={nodeMenuOpen}
                     servers={servers}
                     subscriptions={config?.subscriptions ?? []}

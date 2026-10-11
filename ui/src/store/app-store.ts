@@ -175,6 +175,8 @@ export interface AppState {
 
   // ── 动作 ──
   loadConfig: (force?: boolean) => Promise<void>;
+  /** Publish only a complete authoritative selection readback. No writes or optimistic intent. */
+  acceptSelectionConfig: (config: UserConfig) => Promise<void>;
   /** 原子更新本次明确变动的顶层字段；未列出的字段保留后端锁内最新值。 */
   saveConfig: (patch: Partial<UserConfig>) => Promise<void>;
   /** 在后端锁内最新集合上按实体主键提交；多条 mutation 同盘提交，避免数组快照覆盖与半成功。 */
@@ -303,6 +305,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     })();
 
     return loadConfigInflight;
+  },
+
+  acceptSelectionConfig: async (config) => {
+    invalidateLoadConfig();
+    set({ config, configLoading: false, servers: config.servers ?? [], selectedServerId: config.selectedServerId,
+      rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [], dnsRules: config.dnsRules ?? [] });
+    await hydrateStagedConfig(config);
   },
 
   // 即时编辑只传本次明确变动的顶层字段。后端在单一配置写锁内把 patch 合到最新磁盘值上，故订阅刷新、

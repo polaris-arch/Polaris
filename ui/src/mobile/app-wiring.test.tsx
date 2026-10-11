@@ -1,3 +1,4 @@
+import { AUTO_SELECT_CAUSES } from '@/contracts/auto-select';
 /**
  * 移动端**全局接线层**的门 —— 射程 = 「后端把事实推过来之后，界面读的那些 store 会不会动」。
  *
@@ -735,6 +736,20 @@ describe('⑥.2 登录期出口让位 / 自动换节点：后端改了出口，�
     off();
   });
 
+  for (const cause of AUTO_SELECT_CAUSES) {
+    it(`confirmed ${cause} event preserves its cause on the mobile app subscription`, async () => {
+      const off = startMobileAppWiring(t);
+      await settle(); toasts = [];
+      const before = getStatusMock.mock.calls.length;
+      emit('autoSwitch', { cause, leg: cause === 'failover' ? 'failover' : 'select', reason: cause === 'failover' ? 'connectivity' : cause, oldServerName: 'previous', newServerName: 'actual', latency: 88 });
+      await settle();
+      expect(getStatusMock.mock.calls.length).toBeGreaterThan(before);
+      expect(toasts).toEqual([{ channel: 'success', msg: `autoSelect.event.${cause}` }]);
+      expect(notifyDesktopMock).not.toHaveBeenCalled();
+      off();
+    });
+  }
+
   it('自动换节点 → 重拉连接态 + 一条 toast（不然首页节点名会静默变成另一个）', async () => {
     const off = startMobileAppWiring(t);
     await settle();
@@ -745,7 +760,7 @@ describe('⑥.2 登录期出口让位 / 自动换节点：后端改了出口，�
     expect(getStatusMock.mock.calls.length, '没重拉连接态 ⇒ 出口名/国旗要等 30s 兜底才收敛').toBeGreaterThan(
       before,
     );
-    expect(toasts).toEqual([{ channel: 'success', msg: 'home.autoSwitched' }]);
+    expect(toasts).toEqual([{ channel: 'success', msg: 'autoSelect.event.unknown' }]);
     // 刻意不发系统通知（同 `onAutoUpdate` 的口径：结果本身是常驻呈现，通知留给「不看就错过」的那类）。
     expect(notifyDesktopMock).not.toHaveBeenCalled();
     off();

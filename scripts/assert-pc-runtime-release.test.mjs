@@ -239,7 +239,8 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     // Exercise the actual CLI with a changed source input under every claimed
     // clearance. Only copies in this private fixture are modified.
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
-      'scripts/desktop-core/source-graph.mjs'];
+      'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
+      'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs'];
     for (const path of fixturePaths) {
       mkdirSync(dirname(join(fixture, path)), { recursive: true });
       writeFileSync(join(fixture, path), inputs.get(path) ?? readFileSync(join(root, path)));
@@ -383,7 +384,7 @@ test('actual production D CLI remains blocked without its reviewed release closu
     const result = runPolicy([], env);
     if (Object.hasOwn(manifest, 'desktopSourceBuild')) {
       assert.equal(result.status, 1, result.stderr);
-      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Desktop fork source review must be renewed: exact D release input closure not recorded|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
+      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Published release consumption does not inherit source-first formal App release approval|Desktop fork source review must be renewed: exact D release input closure not recorded|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
     } else {
       assert.equal(result.status, 0, result.stderr);
       requireUnobserved(JSON.parse(result.stdout));
@@ -398,5 +399,5 @@ test('source-owned schema readiness cannot authorize source-first DNS publicatio
   assert.equal(Object.hasOwn(manifest.desktopSourceBuild, 'sourceOwnedReplacements'), true);
   assert.equal(JSON.parse(readFileSync(join(root, 'scripts/desktop-core/source-manifest.json'))).sourceCommit,
     'aafc521b745e0d1a8f50a6a3f41169433f1c2194');
-  assert.throws(() => assertSourceFirstRelease(), /DNS source-owned release input closure\/signatures\/output pins not recorded/);
+  assert.throws(() => assertSourceFirstRelease(), /Published release consumption does not inherit source-first formal App release approval/);
 });

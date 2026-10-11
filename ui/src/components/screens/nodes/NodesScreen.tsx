@@ -1,3 +1,4 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * NodesScreen —— 节点屏（1:1 提取自原型 polaris-prototype.html L1737-1868 #s-nodes
  * + renderMesh/meshItem L4816-4842/4806-4815 组网入口 + syncNodeToolbar L4482-4485 工具栏行为）。
@@ -556,6 +557,8 @@ export function NodesScreen() {
         openDialog={openDialog}
         subscriptionActions={subscriptionActions}
       />
+
+      <SavedAutoSelectControls t={t} />
 
       <AutoSelectStatusPanel {...autoSelectStatus} t={t}
         servers={diskServers} subscriptions={savedConfig?.subscriptions ?? []} />

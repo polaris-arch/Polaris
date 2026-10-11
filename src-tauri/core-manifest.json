@@ -245,5 +245,20 @@
         "patchPath": "release/dependency-sources/sing-tun-windows-auto-route.patch"
       }
     ]
+  },
+  "desktopRelease": {
+    "schema": "polaris-app-release-selection-v1",
+    "contractPath": "scripts/desktop-core/release-contract.json",
+    "contractSha256": "e5306f2e1ff32f9895cc245c6a71115bcb40e176088a268519e0e891bb8bb08f",
+    "version": "1.15.0-alpha.12.polaris.1",
+    "tag": "v1.15.0-alpha.12.polaris.1",
+    "tagObject": "ad6a8a7b80127c4e3d7a925841d18b8934fe694e",
+    "sourceCommit": "05221db98e08562b5c1a21bc242d245b144ac2d2",
+    "sourceTree": "2cbd81d5ec2372e3a427d39e820c0828efa27dbe",
+    "releaseId": 409794447,
+    "librarySha256": {
+      "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+      "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    }
   }
 }

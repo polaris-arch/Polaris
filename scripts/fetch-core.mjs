@@ -13,6 +13,7 @@ import { consumeDesktopBundle, coreFilename, writeBundleInventory } from './desk
 import { writeValidationBundle } from './desktop-core/validation-origin.mjs';
 import { validateSourcePins } from './desktop-core/source-graph.mjs';
 import { consumeRelease, hasDesktopRelease, recoverRelease, releasePlatforms } from './desktop-core/release-consumer.mjs';
+import { verifyNativeReleaseBundle } from './desktop-core/release-native-gates.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json'), 'utf8'));
@@ -52,7 +53,13 @@ try {
     if (process.argv.slice(2).length === 1 && process.argv[2] === '--recover-release') {
       console.log(JSON.stringify(recoverRelease(ROOT)));
     } else {
-      await consumeRelease(ROOT, manifest, releasePlatforms(process.argv.slice(2)));
+      const argv = process.argv.slice(2), bundle = valueOf('bundle-dir'), candidate = valueOf('candidate');
+      if (bundle || candidate) {
+        if (!bundle || !candidate) throw Error('Release native bundle and candidate must be supplied together');
+        verifyNativeReleaseBundle(ROOT, manifest, bundle, candidate);
+      }
+      const selection = argv.filter((arg) => !arg.startsWith('--bundle-dir=') && !arg.startsWith('--candidate='));
+      await consumeRelease(ROOT, manifest, releasePlatforms(selection));
       console.log('Pinned release resources ready; native App acceptance remains pending');
     }
   } else {

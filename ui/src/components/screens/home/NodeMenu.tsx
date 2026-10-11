@@ -26,7 +26,7 @@
  * 识别不到 → 不画（不回退地球：原型的 globe 兜底会让「没识别出来」看起来像「在某个未知国家」）。
  */
 
-import { Fragment, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import { Fragment, useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { groupServersBySubscription, defaultOpenGroupIds } from '@/domain/server-grouping';
@@ -53,6 +53,7 @@ const MiCheck = () => (
 
 export interface NodeMenuProps {
   open: boolean;
+  autoSelectControls?: ReactNode;
   servers: ServerConfig[];
   subscriptions: SubscriptionConfig[];
   selectedServerId: string | null;
@@ -69,6 +70,7 @@ export interface NodeMenuProps {
 
 export function NodeMenu({
   open,
+  autoSelectControls,
   servers,
   subscriptions,
   selectedServerId,
@@ -175,6 +177,7 @@ export function NodeMenu({
 
   return (
     <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')}>
+      {autoSelectControls}
       <div className="nm-search" hidden={totalCount < 8}>
         <input
           className="input"

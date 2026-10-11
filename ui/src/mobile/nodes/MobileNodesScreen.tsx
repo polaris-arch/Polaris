@@ -1,3 +1,4 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 import { AutoSelectStatusPanel } from '../AutoSelectStatusPanel';
 import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { runMobileSpeedTest, useMobileSpeedTestStore, mobileSpeedTestBusy } from '../use-mobile-speed-test';
@@ -743,8 +744,8 @@ export function MobileNodesScreen(): ReactElement {
   return (
     <NodesScreenView
       t={t}
-      autoSelectStatus={<AutoSelectStatusPanel {...autoSelectStatus} t={t}
-        servers={savedConfig?.servers ?? []} subscriptions={savedConfig?.subscriptions ?? []} />}
+      autoSelectStatus={<><SavedAutoSelectControls t={t} /><AutoSelectStatusPanel {...autoSelectStatus} t={t}
+        servers={savedConfig?.servers ?? []} subscriptions={savedConfig?.subscriptions ?? []} /></>}
       groups={groupTabs}
       activeTab={activeTab}
       onSelectTab={(id) => {

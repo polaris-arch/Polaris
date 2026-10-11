@@ -187,6 +187,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.updateProxyMode', role: 'action', disposition: act(STORE_APP), note: '改分流模式（首页模式芯片与规则屏「切回智能」共用这一条）。' },
   { id: 'useAppStore.startProxy', role: 'action', disposition: act(STORE_APP), note: '起核。它**故意不写** `proxyStatus` —— 托盘等别的入口也能启停，只有走事件才让多处收敛。' },
   { id: 'useAppStore.stopProxy', role: 'action', disposition: act(STORE_APP), note: '停核。同起核：不写连接态，等 `onStopped` 事件把真值推回来。' },
+  { id: 'useAppStore.acceptSelectionConfig', role: 'action', disposition: act({ file: 'ui/src/store/app-store.ts', mustContain: 'acceptSelectionConfig: async (config)' }), note: 'Auto 写事务读回后发布后端落盘配置与派生镜像；既不乐观改意图，也不另发配置写。' },
   { id: 'useAppStore.switchServer', role: 'action', disposition: act(STORE_APP), note: '换出口节点（首页选择面与节点屏整行主动作共用这一条）。' },
   { id: 'useAppStore.setUnlock', role: 'action', disposition: act(STORE_APP), note: '检测成功或失败后结束进行态。' },
   { id: 'useAppStore.setUnlockProgress', role: 'action', disposition: act(STORE_APP), note: '应用级 progress 事件逐个更新服务徽章。' },

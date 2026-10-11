@@ -201,6 +201,7 @@ function cronetCliFixture() {
   const goMod = `module example.invalid/fixture\n\ngo 1.25.5\n${block()}`;
   write('fixture.go.mod', goMod);
   const manifest = JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json')));
+  delete manifest.desktopRelease; // Explicit source-mode CLI fixture, including all original D checks.
   manifest.desktopSourceBuild = { sourceMode: 'fork-commit-v1', upstreamVersion: '2.0.0-alpha.11',
     version: '2.0.0-alpha.11.polaris.1', graphScope: 'core-source-only',
     sourceManifestSha256: digest(JSON.stringify(source)), provisionerSha256: digest(readFileSync(join(root, 'scripts/core-source-provision.py'))),

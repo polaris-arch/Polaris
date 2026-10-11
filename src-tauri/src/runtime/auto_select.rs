@@ -79,6 +79,10 @@ pub(crate) const FAILOVER_BAR_PERIODS: u64 = 4;
 /// 上一项的下限：一个限频窗口。窗口内它回不来，「测速好、连通性差」的节点至多每个窗口被换回
 /// 一次，远低于限频上限。
 pub(crate) const FAILOVER_BAR_MIN_MS: u64 = BETTER_RATE_WINDOW_MS;
+/// 同一有效环境内再次因故障换走时排除翻倍，最长一天。首次仍为四周期 / 一小时下限；
+/// 最大合法订阅周期六小时的首次排除已经一天，后续不再延长。仅运行内记忆，不持久化。
+/// 到期、测出好延迟、核重启与前后台变化不证明连通性恢复，不能洗掉故障次数。
+pub(crate) const FAILOVER_BAR_MAX_MS: u64 = 24 * 60 * 60_000;
 /// 读状态时：距最近一次评估超过这么久即判评估停滞（3 个心跳拍）。经验取值。
 pub(crate) const STALL_AFTER_MS: u64 = 3 * HEARTBEAT_INTERVAL_MS;
 /// 读状态时：没有数据持续超过订阅周期的这么多倍即判长期无数据。经验取值。
@@ -567,6 +571,13 @@ struct BarContext {
     native_network: NativeNetworkHistory,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FailureBar {
+    until: u64,
+    /// 已确认成功换走的次数；仅有效环境变化 / 离开自动清除。
+    failures: u32,
+}
+
 /// [`decide`] 的跨次状态。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Memory {
@@ -582,7 +593,7 @@ pub(crate) struct Memory {
     /// 提交连续失败的次数（成功即归零）。
     commit_failures: u32,
     /// 被故障腿换走的节点 → 排除到何时（单调毫秒）。
-    barred: BTreeMap<String, u64>,
+    barred: BTreeMap<String, FailureBar>,
     bar_context: BarContext,
 }
 
@@ -710,24 +721,38 @@ impl Memory {
 
     /// 故障腿把出口从 `node_id` 换走了：这个节点在一段时间内不作为「更优」的挑战者。
     pub(crate) fn bar(&mut self, node_id: &str, now: u64, period_ms: u64) {
-        let length = period_ms
+        let previous = self.barred.get(node_id).copied().unwrap_or_default();
+        let failures = previous.failures.saturating_add(1);
+        let base = period_ms
             .saturating_mul(FAILOVER_BAR_PERIODS)
             .max(FAILOVER_BAR_MIN_MS);
-        self.barred
-            .insert(node_id.to_string(), now.saturating_add(length));
+        let multiplier = 1u64 << failures.saturating_sub(1).min(63);
+        let length = base.saturating_mul(multiplier).min(FAILOVER_BAR_MAX_MS);
+        // Changing the subscription's period cannot shorten an already active exclusion.
+        self.barred.insert(
+            node_id.to_string(),
+            FailureBar {
+                until: previous.until.max(now.saturating_add(length)),
+                failures,
+            },
+        );
     }
 
     pub(crate) fn is_barred(&self, node_id: &str, now: u64) -> bool {
-        self.barred.get(node_id).is_some_and(|until| now < *until)
+        self.barred.get(node_id).is_some_and(|bar| now < bar.until)
     }
 
     /// 此刻仍被排除的节点与各自剩余的毫秒数。
     pub(crate) fn barred(&self, now: u64) -> Vec<(&str, u64)> {
         self.barred
             .iter()
-            .filter(|(_, until)| now < **until)
-            .map(|(id, until)| (id.as_str(), *until - now))
+            .filter(|(_, bar)| now < bar.until)
+            .map(|(id, bar)| (id.as_str(), bar.until - now))
             .collect()
+    }
+
+    fn bar_failures(&self, node_id: &str) -> u32 {
+        self.barred.get(node_id).map_or(0, |bar| bar.failures)
     }
 
     /// 窗口内因「更优」换点的次数。
@@ -1315,6 +1340,8 @@ pub(crate) struct ChallengerView {
 pub(crate) struct BarredView {
     pub(crate) server_id: String,
     pub(crate) remaining_ms: u64,
+    /// 同一有效环境内已确认因故障换走的次数；到期不会归零。
+    pub(crate) failures: u32,
 }
 
 /// 提交的状况。
@@ -1570,6 +1597,7 @@ pub(crate) fn project_status(inputs: &StatusInputs<'_>, slot: &Slot) -> Status {
             .map(|(server_id, remaining_ms)| BarredView {
                 server_id: server_id.to_string(),
                 remaining_ms,
+                failures: slot.memory.bar_failures(server_id),
             })
             .collect(),
         commit: CommitView {

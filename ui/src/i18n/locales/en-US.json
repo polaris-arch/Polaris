@@ -304,7 +304,6 @@
   "home": {
     "addServer": "Add Server",
     "addSubscription": "Add Subscription",
-    "autoSwitched": "Auto-switched to {{name}} ({{latency}}ms)",
     "cancelStarting": "Starting — click to cancel",
     "clear": "Clear",
     "connectErrorClickToRetry": "Connection failed — click to retry",
@@ -3158,6 +3157,102 @@
       "dwell": "The minimum dwell time since the last switch has not elapsed",
       "rateLimit": "Waiting for the switch rate window to free up",
       "cooldown": "Waiting for the switch cooldown to end"
+    },
+    "choose": "Automatically select within a subscription",
+    "choice": "Auto · {{subscription}}",
+    "choiceHelp": "The automatic intent and actual exit are shown separately. Picking any node returns to manual selection.",
+    "switchNow": "Evaluate switching now",
+    "keepManual": "Keep current exit in manual mode",
+    "intentSaved": "Automatic intent saved; the actual exit awaits backend evaluation.",
+    "manualSaved": "Manual selection saved.",
+    "placementFailed": "Automatic intent saved, but the runtime switch did not complete. Check the actual exit and status.",
+    "selectionChanged": "The selection changed. Use the current actual exit and intent.",
+    "actionFailed": "Selection failed. Check the current status and retry.",
+    "details": "Evaluation details for this run",
+    "basis": "Current exit basis: {{state}} · {{latency}} · {{binding}} · {{at}}",
+    "lastSwitch": "Last switch: {{from}} → {{to}} · {{reason}} · {{at}}",
+    "lastEvaluation": "Last evaluation: {{at}} · {{reason}}",
+    "counts": "Selectable {{selectable}} · Failed {{failed}} · Stale {{stale}} · Untested {{unmeasured}} · Skipped {{skipped}} · Unverified {{unverified}} · Restart required {{needsRestart}}",
+    "challenger": "Candidate {{name}} · Consecutive wins {{wins}} / {{required}} rounds",
+    "commit": "Consecutive commit failures {{count}} · Retry interval {{seconds}} seconds (last status)",
+    "lastFailure": "Last incomplete switch: {{name}} · {{reason}} · {{at}}",
+    "noDataAge": "No selection data for {{seconds}} seconds (last status)",
+    "outside": "The actual exit is outside the automatic subscription.",
+    "outsideOverdue": "The actual exit has remained outside the subscription for a while. Check candidates and tests.",
+    "unverified": "This evidence is not confirmed by runtime readback.",
+    "allUnverified": "No selectable candidate is confirmed by runtime readback.",
+    "switchCounts": "Since this run started: failover switches {{failover}} · automatic selections {{select}}",
+    "dataSource": "Periodic test pause: {{blocked}} · Last skip: {{skip}}",
+    "none": "None",
+    "barStrikes": "Switched away after failures {{count}} times in this context; repeated failures extend exclusion.",
+    "error": {
+      "AUTO_SELECT_SWITCHED_OFF": "Automatic selection is disabled.",
+      "AUTO_SELECT_PLATFORM_NOT_OPEN": "Automatic selection is unavailable on this platform.",
+      "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND": "The subscription no longer exists. Refresh nodes.",
+      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "The subscription has no nodes.",
+      "AUTO_SELECT_NOT_AUTO": "Selection is manual. Choose an automatic subscription first.",
+      "AUTO_SELECT_NO_TARGET": "No candidate currently meets the switch conditions; keeping the actual exit.",
+      "AUTO_SELECT_SWITCH_FAILED": "Switching did not complete. Check the actual exit and selection status.",
+      "AUTO_SELECT_READBACK_FAILED": "Could not synchronize saved configuration after the operation; its result is unconfirmed. Refresh to check."
+    },
+    "receipt": {
+      "applied": "Switched to {{name}}",
+      "pending": "{{name}} saved; awaiting runtime confirmation.",
+      "restarting": "{{name}} saved; the proxy is restarting.",
+      "notRunning": "{{name}} saved for the next connection.",
+      "deferred": "{{name}} saved; apply the configuration to activate it."
+    },
+    "basisState": {
+      "fresh": "Fresh",
+      "failed": "Failed",
+      "expired": "Expired",
+      "unmeasured": "Untested",
+      "skipped": "Skipped",
+      "mismatch": "Identity mismatch"
+    },
+    "binding": {
+      "confirmed": "Confirmed",
+      "unverified": "Unverified"
+    },
+    "event": {
+      "firstPlacement": "{{name}} · Initial placement in the subscription completed",
+      "better": "{{name}} · Switched to a consistently better candidate",
+      "currentFailed": "{{name}} · Switched after repeated test failures on the current exit",
+      "failover": "{{name}} · Switched after a connectivity failure",
+      "winnerRemoved": "{{name}} · The previous exit was removed; another node in the same subscription was selected",
+      "requested": "{{name}} · Switched at the user’s request",
+      "unknown": "Actual exit changed to {{name}}"
+    },
+    "dataReason": {
+      "switchedOff": "Periodic testing is disabled in this build",
+      "userDisabled": "Periodic testing is disabled globally",
+      "platformNotEnabled": "Periodic testing is unavailable on this platform",
+      "coreNotRunning": "The proxy is stopped",
+      "noSubscription": "No subscription has periodic testing enabled",
+      "background": "The app is in the background",
+      "metered": "Metered-network policy paused testing",
+      "powerSave": "Power-saving policy paused testing",
+      "gateBusy": "The test channel is busy",
+      "preempted": "This round yielded to another test",
+      "budget": "This round exceeded its time budget",
+      "frozen": "A configuration transaction temporarily froze testing",
+      "poolUnavailable": "The candidate measurement pool is unavailable",
+      "nothingTestable": "No node was testable in this round",
+      "noTargets": "There are no targets to test in this round",
+      "crashed": "This round ended unexpectedly without a receipt"
+    },
+    "cause": {
+      "firstPlacement": "Initial placement in the subscription",
+      "better": "A consistently better candidate",
+      "currentFailed": "Repeated test failure on the current exit",
+      "failover": "Connectivity failure",
+      "winnerRemoved": "Previous exit removed from the subscription",
+      "requested": "User-requested switch evaluation"
+    },
+    "outcome": {
+      "held": "This evaluation held the exit",
+      "switch": "This evaluation chose to switch; use the actual exit for the runtime result",
+      "notEvaluated": "Not evaluated this time"
     }
   }
 }

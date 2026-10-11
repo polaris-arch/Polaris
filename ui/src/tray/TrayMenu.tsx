@@ -1,3 +1,5 @@
+import { autoSelectT } from './auto-select-labels';
+import { AutoSelectControls } from '@/mobile/AutoSelectControls';
 /**
  * 托盘自绘浮层 UI（原型 `.tray-menu` L2905-2963 移植）——**真实接线，无假 UI**。
  *
@@ -135,7 +137,12 @@ function applyNativeTrayHover(clientX: number, clientY: number): void {
 }
 
 export default function TrayMenu() {
-  const [config, setConfig] = useState<UserConfig | null>(null);
+  const [config, setConfigState] = useState<UserConfig | null>(null);
+  const configRef = useRef<UserConfig | null>(null);
+  const setConfig = useCallback((saved: UserConfig | null) => {
+    configRef.current = saved;
+    setConfigState(saved);
+  }, []);
   const [servers, setServers] = useState<ServerConfig[]>([]);
   const [subscriptions, setSubscriptions] = useState<SubscriptionConfig[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1119,6 +1126,9 @@ export default function TrayMenu() {
             <div className="tray-sep" />
 
             {/* W15：零节点时的空态——不给「菜单塌成一条」的错觉，保住与主视图同量级的高度 */}
+            <AutoSelectControls showStatus config={config} t={autoSelectT} getCurrentConfig={() => configRef.current} accept={async saved => {
+              setConfig(saved); setServers(saved.servers ?? []); setSubscriptions(saved.subscriptions ?? []); setSelectedId(saved.selectedServerId);
+            }} />
             {groups.length === 0 && <div className="tray-nodes-empty">{t('tray.noNode')}</div>}
 
             {/* 按分组列出（自建/组网/各订阅），组内可选按延迟排序（use-node-sort-store 持久偏好，

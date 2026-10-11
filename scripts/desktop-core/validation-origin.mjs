@@ -2,6 +2,7 @@
 // Hashes bind reviewed bytes; API transport records are not signed provenance.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hasDesktopRelease, loadReleaseContract } from './release-consumer.mjs';
 import { canonical, digest, requireGraph, DESKTOP_TARGETS, verifyHash, validateSourcePins, validateSourceManifest, desktopSourceManifestPath, sourceOwnedReplacements, producerContext } from './source-graph.mjs';
 
 export const VALIDATION_SCHEMA = 'polaris-desktop-validation-bundle-v2';
@@ -12,11 +13,16 @@ const sha = (s) => /^[a-f0-9]{64}$/.test(s ?? '');
 const commit = (s) => /^[a-f0-9]{40}$/.test(s ?? '');
 const positive = (s) => /^[1-9][0-9]*$/.test(String(s ?? ''));
 
-export function validationContext(candidate, env = process.env) {
+export function validationContext(candidate, env = process.env, root = process.cwd()) {
+  const historicalRef = env.GITHUB_REF === 'refs/heads/collab/fk02-native-payload-validation-20261010';
+  // The cumulative S5 candidate consumes the strict published contract. It does
+  // not inherit the historical source/origin exemption on another branch.
+  const publishedRef = env.GITHUB_REF === 'refs/heads/collab/s5-android-signal-20261010'
+    && validationSourceMode(root) === 'published-release-v1';
   requireGraph(env.POLARIS_NATIVE_PAYLOAD_VALIDATION === '1' && env.GITHUB_ACTIONS === 'true'
     && env.POLARIS_NO_KERNEL_RUN !== '1' && env.GITHUB_EVENT_NAME === 'workflow_dispatch'
     && env.GITHUB_REPOSITORY === 'polaris-arch/Polaris'
-    && env.GITHUB_REF === 'refs/heads/collab/fk02-native-payload-validation-20261010'
+    && (historicalRef || publishedRef)
     && env.GITHUB_SHA === candidate && commit(candidate)
     && env.GITHUB_WORKFLOW_REF === `${env.GITHUB_REPOSITORY}/.github/workflows/release-risk.yml@${env.GITHUB_REF}`
     && positive(env.GITHUB_RUN_ID) && positive(env.GITHUB_RUN_ATTEMPT),
@@ -26,6 +32,7 @@ export function validationContext(candidate, env = process.env) {
 
 export function validationSourceMode(root) {
   const manifest = read(join(root, 'src-tauri/core-manifest.json'));
+  if (hasDesktopRelease(manifest)) { loadReleaseContract(root, manifest); return 'published-release-v1'; }
   const spec = validateSourcePins(manifest, 'linux', false);
   const sourcePath = join(root, desktopSourceManifestPath(spec));
   verifyHash(sourcePath, spec.sourceManifestSha256);
@@ -43,7 +50,7 @@ export function desktopProducerPlan(root, nativeValidation) {
     { platform: 'mac-x64', os: 'macos-15-intel', host: 'darwin', arch: 'x64' },
     { platform: 'mac-arm64', os: 'macos-15', host: 'darwin', arch: 'arm64' },
   ];
-  return { mode, legacyOrigins, matrix: legacyOrigins ? matrix.filter((row) => row.platform === 'win') : matrix };
+  return { mode, release: mode === 'published-release-v1', legacyOrigins, matrix: legacyOrigins ? matrix.filter((row) => row.platform === 'win') : matrix };
 }
 
 export function validateCurrentProducer(receipt, candidate, env = process.env) {

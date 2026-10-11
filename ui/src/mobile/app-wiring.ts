@@ -71,6 +71,7 @@ import { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
+import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 import type { UserConfig } from '@/contracts/types';
 import type { VpnStatusSnapshot } from '@/contracts/vpn-status';
 import { shouldArmIdleLock } from '@/domain/privacy';
@@ -458,7 +459,7 @@ export function startMobileAppWiring(t: WiringT): () => void {
   offs.push(
     api.proxy.onAutoNodeSwitched((data) => {
       void store().refreshProxyStatus();
-      toast.success(t('home.autoSwitched', { name: data.newServerName, latency: data.latency }));
+      toast.success(autoNodeSwitchFeedback(data, t));
     }),
   );
 

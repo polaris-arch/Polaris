@@ -1,6 +1,7 @@
 name: Desktop Core Sources
 
-# Ordinary callers build four native cores. Explicit technical validation builds
+# Published selection verifies four immutable inputs on their real native hosts.
+# Source-mode callers build four native cores. Explicit technical validation builds
 # Windows and retrieves three reviewed D origins, or four fresh cores for an
 # explicitly frozen source-owned replacement. Receipts are never relabeled.
 # Every consumer still verifies all four actual binaries before use.
@@ -39,6 +40,7 @@ jobs:
     outputs:
       matrix: ${{ steps.source-plan.outputs.matrix }}
       legacy_origins: ${{ steps.source-plan.outputs.legacy_origins }}
+      release: ${{ steps.source-plan.outputs.release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,11 +55,11 @@ jobs:
           set -euo pipefail
           [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
           [ -z "$(git status --porcelain --untracked-files=no)" ]
-          node --input-type=module -e 'import {desktopProducerPlan} from "./scripts/desktop-core/validation-origin.mjs"; const p=desktopProducerPlan(process.cwd(),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"); console.log("matrix="+JSON.stringify(p.matrix)); console.log("legacy_origins="+p.legacyOrigins)' >> "$GITHUB_OUTPUT"
+          node --input-type=module -e 'import {desktopProducerPlan} from "./scripts/desktop-core/validation-origin.mjs"; const p=desktopProducerPlan(process.cwd(),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"); console.log("matrix="+JSON.stringify(p.matrix)); console.log("legacy_origins="+p.legacyOrigins); console.log("release="+p.release)' >> "$GITHUB_OUTPUT"
 
   produce:
     needs: plan
-    name: native core (${{ matrix.platform }})
+    name: native core input (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -103,7 +105,7 @@ jobs:
           cache: false
 
       - name: Verify native macOS SDK and compiler
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.plan.outputs.release != 'true'
         run: |
           set -euo pipefail
           sdk="$(xcrun --sdk macosx --show-sdk-path)"
@@ -121,11 +123,17 @@ jobs:
 
       # On Windows the unchanged producer performs native systemconfig Go unit
       # tests. Darwin CGO uses the actual SDK above; no cross-host substitute.
-      - name: Produce exact platform source artifact
+      - name: Acquire exact platform core input
         env:
           CORE_PLATFORM: ${{ matrix.platform }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
-        run: node scripts/fetch-core.mjs --producer --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.plan.outputs.release }}" = true ]; then
+            node scripts/desktop-core/release-native-gates.mjs acquire --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          else
+            node scripts/fetch-core.mjs --producer --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -136,7 +144,7 @@ jobs:
           retention-days: 7
 
   assemble:
-    name: verify four source artifacts
+    name: verify four native core inputs
     needs: [plan, produce]
     permissions:
       contents: read
@@ -210,7 +218,9 @@ jobs:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: |
           set -euo pipefail
-          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+          if [ "${{ needs.plan.outputs.release }}" = true ]; then
+            node scripts/desktop-core/release-native-gates.mjs assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          elif [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
             node scripts/fetch-core.mjs --assemble --validation-origin --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
           else
             node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
