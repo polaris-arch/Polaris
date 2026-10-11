@@ -1,3 +1,5 @@
+import { AutoSelectStatusPanel } from '../AutoSelectStatusPanel';
+import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { runMobileSpeedTest, useMobileSpeedTestStore, mobileSpeedTestBusy } from '../use-mobile-speed-test';
 /**
  * 移动端「节点」屏的**接线层**：读 store、发 IPC、把结果整形成 `view-model.ts` 的 props。
@@ -134,6 +136,8 @@ import type {
 export function MobileNodesScreen(): ReactElement {
   const { t } = useTranslation();
   const config = useEffectiveConfig();
+  const savedConfig = useAppStore((s) => s.config);
+  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
@@ -739,6 +743,8 @@ export function MobileNodesScreen(): ReactElement {
   return (
     <NodesScreenView
       t={t}
+      autoSelectStatus={<AutoSelectStatusPanel {...autoSelectStatus} t={t}
+        servers={savedConfig?.servers ?? []} subscriptions={savedConfig?.subscriptions ?? []} />}
       groups={groupTabs}
       activeTab={activeTab}
       onSelectTab={(id) => {

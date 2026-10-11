@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 /**
  * 节点屏视图模型 —— **呈现层与接线层之间的唯一契约**。
  *
@@ -179,6 +180,7 @@ export function buildNodeMoreItems(args: {
 }
 
 export interface NodesScreenViewProps {
+  readonly autoSelectStatus?: ReactNode;
   readonly t: (key: string, vars?: Record<string, unknown>) => string;
 
   // ── block 1：分组段 ───────────────────────────────────────────────────────

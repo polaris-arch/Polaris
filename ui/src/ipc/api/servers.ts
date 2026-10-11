@@ -1,4 +1,4 @@
-import { invoke, listen } from '../ipc-client';
+import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { ServerConfig } from '../../contracts/types';
 import type { WarpWireGuardDraft } from '../../domain/warp';
@@ -230,6 +230,11 @@ export const serverApi = {
   /** 选择状态（只读）：意图、实际出口、模式与原因、上次换点、最近一次评估、自曝标记。 */
   async autoSelectStatus(): Promise<AutoSelectStatus> {
     return invoke(IPC_CHANNELS.AUTO_SELECT_STATUS);
+  },
+
+  /** 等待监听登记完成；登记失败由调用方展示并重试。 */
+  onAutoSelectStatusReady(listener: (data: AutoSelectStatus) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_AUTO_SELECT_STATUS, listener);
   },
 
   /** 选择状态变化。 */

@@ -19,6 +19,8 @@
  * **本屏不再自订 onSpeedTestProgress**，也不再画屏内进度行——见 `use-node-speed-test.ts` 的 `runSpeedTest` 判据。
  */
 
+import { AutoSelectStatusPanel } from '@/mobile/AutoSelectStatusPanel';
+import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
@@ -366,6 +368,7 @@ export function NodesScreen() {
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
   const savedConfig = useAppStore((s) => s.config);
+  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const [meshRouteState, setMeshRouteState] = useState<ReportLoadState<MeshRouteReport>>({
     report: null, loading: true, error: false,
   });
@@ -553,6 +556,9 @@ export function NodesScreen() {
         openDialog={openDialog}
         subscriptionActions={subscriptionActions}
       />
+
+      <AutoSelectStatusPanel {...autoSelectStatus} t={t}
+        servers={diskServers} subscriptions={savedConfig?.subscriptions ?? []} />
 
       <NodesToolbar
         t={t}
