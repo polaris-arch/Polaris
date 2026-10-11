@@ -79,3 +79,24 @@ test('every nested Package edge preserves the assembler Actions read ceiling', (
     }
   }
 });
+
+import { validateCurrentProducer } from './desktop-core/validation-origin.mjs';
+import { canonical, digest, producerContext } from './desktop-core/source-graph.mjs';
+test('native origin proof compares fingerprinted producer context, including same-candidate old attempts', () => {
+  const candidate = 'c'.repeat(40), ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
+  const env = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REPOSITORY_ID: '1347028220',
+    GITHUB_SHA: candidate, GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '2', GITHUB_REF: ref,
+    GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}` };
+  const sign = (facts) => ({ ...facts, fingerprint: digest(canonical(facts)) });
+  const facts = { schema: 'polaris-desktop-core-v1', candidate, producerContext: producerContext(candidate, env) };
+  validateCurrentProducer(sign(facts), candidate, env);
+  for (const field of ['runId', 'runAttempt', 'repository', 'repositoryId', 'workflowRef', 'workflowHead', 'ref', 'event', 'candidate']) {
+    const stale = sign({ ...facts, producerContext: { ...facts.producerContext, [field]: 'wrong' } });
+    assert.throws(() => validateCurrentProducer(stale, candidate, env), /producer context/, field);
+  }
+  assert.throws(() => validateCurrentProducer(sign({ ...facts, schema: 'polaris-dns-technical-native-v1' }), candidate, env));
+  assert.throws(() => validateCurrentProducer(sign({ schema: 'polaris-desktop-core-v1', candidate }), candidate, env));
+  const input = readFileSync(join(root, 'scripts/native-payload-input.mjs'), 'utf8');
+  assert.match(input, /sourceOwnedReplacements: receipt.sourceOwnedReplacements/);
+  assert.match(input, /producerContext: receipt.producerContext/);
+});

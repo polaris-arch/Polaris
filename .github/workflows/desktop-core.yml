@@ -1,7 +1,8 @@
 name: Desktop Core Sources
 
 # Ordinary callers build four native cores. Explicit technical validation builds
-# Windows and retrieves three reviewed origins without rewriting their receipts.
+# Windows and retrieves three reviewed D origins, or four fresh cores for an
+# explicitly frozen source-owned replacement. Receipts are never relabeled.
 # Every consumer still verifies all four actual binaries before use.
 on:
   workflow_call:
@@ -33,16 +34,37 @@ env:
   POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.source-plan.outputs.matrix }}
+      legacy_origins: ${{ steps.source-plan.outputs.legacy_origins }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Select producers from verified frozen manifest
+        id: source-plan
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
+          [ -z "$(git status --porcelain --untracked-files=no)" ]
+          node --input-type=module -e 'import {desktopProducerPlan} from "./scripts/desktop-core/validation-origin.mjs"; const p=desktopProducerPlan(process.cwd(),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"); console.log("matrix="+JSON.stringify(p.matrix)); console.log("legacy_origins="+p.legacyOrigins)' >> "$GITHUB_OUTPUT"
+
   produce:
+    needs: plan
     name: native core (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        # Ordinary runs retain four producers. The reviewed validation mode
-        # rebuilds Windows only; the assembler fetches three exact fixed origins.
-        include: ${{ fromJSON(inputs.native_validation && '[{"platform":"win","os":"windows-2022","host":"win32","arch":"x64"}]' || '[{"platform":"linux","os":"ubuntu-22.04","host":"linux","arch":"x64"},{"platform":"win","os":"windows-2022","host":"win32","arch":"x64"},{"platform":"mac-x64","os":"macos-15-intel","host":"darwin","arch":"x64"},{"platform":"mac-arm64","os":"macos-15","host":"darwin","arch":"arm64"}]') }}
+        # Frozen DNS inputs use four fresh native producers in this attempt.
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -115,7 +137,7 @@ jobs:
 
   assemble:
     name: verify four source artifacts
-    needs: produce
+    needs: [plan, produce]
     permissions:
       contents: read
       actions: read
@@ -145,7 +167,7 @@ jobs:
       # Ordinary downloads have no previous-run fallback. The separate validation
       # downloader below accepts only committed exact origin IDs/ZIP/receipt pins.
       - name: Download Linux source artifact from this attempt
-        if: inputs.native_validation != true
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-linux
@@ -158,26 +180,26 @@ jobs:
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download Intel macOS source artifact from this attempt
-        if: inputs.native_validation != true
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-x64
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download arm64 macOS source artifact from this attempt
-        if: inputs.native_validation != true
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-arm64
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - uses: actions/setup-python@v6
-        if: inputs.native_validation == true
+        if: needs.plan.outputs.legacy_origins == 'true'
         with:
           python-version: '3.12'
 
       - name: Retrieve reviewed unchanged native origins
-        if: inputs.native_validation == true
+        if: needs.plan.outputs.legacy_origins == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/desktop-core/validation-download.py --bundle-dir="$RUNNER_TEMP/desktop-core-bundle"

@@ -30,7 +30,7 @@ function candidates(source) {
   const producer = source['desktop-core'];
   const risk = source['release-risk'];
   const pkg = source.package;
-  assert.equal((producer.match(/ref: \$\{\{ inputs.candidate \}\}/g) ?? []).length, 2, 'both producer and assembly checkout candidate');
+  assert.equal((producer.match(/ref: \$\{\{ inputs.candidate \}\}/g) ?? []).length, 3, 'plan, producer and assembly checkout candidate');
   assert.match(producer, /CORE_CANDIDATE: \$\{\{ inputs.candidate \}\}/);
   assert.match(producer, /git rev-parse HEAD\)" = "\$CORE_CANDIDATE"/);
   assert.match(producer, /git status --porcelain --untracked-files=no/);
@@ -53,7 +53,7 @@ function bundles(source) {
   const wireJob = job(source.package, 'core_wire');
   assert.match(producer, /name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.platform \}\}/);
   assert.match(producer, /path: \$\{\{ runner.temp \}\}\/desktop-core-bundle\n/, 'upload bundle root retains platform directories');
-  assert.match(assemble, /needs: produce/);
+  assert.match(assemble, /needs: \[plan, produce\]/);
   const names = [...assemble.matchAll(/name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-([^\n]+)/g)].map((match) => match[1]);
   assert.deepEqual(names, ['linux', 'win', 'mac-x64', 'mac-arm64'], 'exact four downloads from the current candidate/run/attempt');
   assert.equal((assemble.match(/actions\/download-artifact@v8/g) ?? []).length, 4);
@@ -124,18 +124,16 @@ test('four source producers use exact native hosts, source Go pin and real Darwi
   const workflow = files['desktop-core'];
   kernelCoverage(workflow);
   assert.throws(() => kernelCoverage(workflow.replace('env:\n', "env:\n  POLARIS_NO_KERNEL_RUN: '1'\n")));
-  const matrix = /include: \$\{\{ fromJSON\(inputs\.native_validation && '([^']+)' \|\| '([^']+)'\) \}\}/.exec(workflow);
-  assert.ok(matrix, 'explicit validation and ordinary producer matrices required');
-  const fresh = JSON.parse(matrix[1]), rows = JSON.parse(matrix[2]);
-  assert.deepEqual(fresh, [{ platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' }],
-    'validation must rebuild Windows only on its real native host');
+  assert.match(workflow, /include: \$\{\{ fromJSON\(needs.plan.outputs.matrix\) \}\}/);
+  assert.match(job(workflow, 'produce'), /needs: plan/);
+  const planning = job(workflow, 'plan');
+  assert.match(planning, /git rev-parse HEAD/);
+  assert.match(planning, /git status --porcelain --untracked-files=no/);
+  assert.match(planning, /desktopProducerPlan\(process.cwd\(\),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"\)/);
+  assert.match(planning, /legacy_origins="\+p.legacyOrigins/);
+  assert.match(job(workflow, 'assemble'), /Retrieve reviewed unchanged native origins\n        if: needs.plan.outputs.legacy_origins == 'true'/);
+  assert.equal((job(workflow, 'assemble').match(/if: needs.plan.outputs.legacy_origins != 'true'/g) ?? []).length, 3);
   assert.match(workflow, /native_validation:[\s\S]*?default: false/);
-  assert.deepEqual(rows, [
-    { platform: 'linux', os: 'ubuntu-22.04', host: 'linux', arch: 'x64' },
-    { platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' },
-    { platform: 'mac-x64', os: 'macos-15-intel', host: 'darwin', arch: 'x64' },
-    { platform: 'mac-arm64', os: 'macos-15', host: 'darwin', arch: 'arm64' },
-  ]);
   assert.match(workflow, /process.platform !== process.env.CORE_HOST \|\| process.arch !== process.env.CORE_ARCH/);
   assert.match(workflow, /xcrun --sdk macosx --show-sdk-path/);
   assert.match(workflow, /\[ -d "\$sdk" \]/);

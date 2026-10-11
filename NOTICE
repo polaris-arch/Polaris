@@ -15,13 +15,16 @@ next to this file as LICENSE.
   - 桌面 sing-box v1.15.0-alpha.11 (GPLv3) — https://github.com/polaris-arch/polaris-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.11
         （代理内核，以独立 sidecar 子进程运行）
-        桌面源码修复构建：1.15.0-alpha.11.polaris.1
-        固定源码：https://github.com/polaris-arch/polaris-box/tree/052297f735b80bdae5b2536ef2a07d04979a0511
-        固定消费标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-1
-        消费标签对象：343be85a5b4a56a3ed28e9549561a52c490635eb
-        共同 source manifest SHA-256：9a51f7d9ab2bd0741b9bce31d4743354d4425f17a22cf6bd48631c21a3d36a46
+        桌面源码修复构建：1.15.0-alpha.11.polaris.2
+        固定源码：https://github.com/polaris-arch/polaris-box/tree/aafc521b745e0d1a8f50a6a3f41169433f1c2194
+        固定消费标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-2
+        消费标签对象：71876e8b33d3061bd9abba9618aa3e8c3e22db4e
+        共同 source manifest SHA-256：3f633d5927bb5bfe7c0751678c44357bac97f5183fbc13a394c8e5568267886a
         桌面修复已进入上述固定fork提交；App不重放补丁或Windows额外overlay。
-        对应源码资产：https://github.com/polaris-arch/polaris-box/releases/tag/polaris-v1.15.0-alpha.11-1
+        对应源码：上述固定标签及提交；最终源码归档与分发闭包尚待签收。
+        内置 sing-tun 替换：./third_party/sing-tun，tree 18492017863a3bf41df92fe528c2bbe38fe97ab2
+        原始 sing-tun 来源：5c2edb183cc92eb190d41c04dedfa5519ca3e78c
+        Windows DNS patch SHA-256：812956b42cfbb5d302343998b898b9c6489a93f633b1f446c367c5c24681ecd1
         构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
@@ -105,8 +108,8 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-桌面 D 完整对应源码：https://github.com/polaris-arch/polaris-box/tree/052297f735b80bdae5b2536ef2a07d04979a0511
-桌面 D 源码资产：https://github.com/polaris-arch/polaris-box/releases/tag/polaris-v1.15.0-alpha.11-1
+桌面 DNS 固定源码：https://github.com/polaris-arch/polaris-box/tree/aafc521b745e0d1a8f50a6a3f41169433f1c2194
+桌面 DNS 来源标签：https://github.com/polaris-arch/polaris-box/tree/polaris-v1.15.0-alpha.11-2
 桌面修复已包含在固定 fork 源码中；App 不重放共享补丁，也不另加 Windows overlay。
 桌面构建输入以 scripts/desktop-core/source-manifest.json 固定；外部依赖按该源码的
 go.mod / go.sum 获取，并核对 manifest 中的 SHA-256 和随附构建说明。
@@ -117,15 +120,17 @@ Apple 旧补丁目录：https://github.com/polaris-arch/Polaris/tree/4563b1fc1ec
 Apple 继续使用独立旧源码 manifest、固定补丁及 Apple 构建说明。
 移动端各自的固定 source commit 与 manifest 摘要见上方对应组件段落。
 
-GPLv3 §6 的对应源码指引按上述组件分别给出。桌面 fork 的完整源码及源码归档已在
-上述固定 commit 和 Release 发布；移动端旧补丁与构建脚本在本项目的固定目录。
+GPLv3 §6 的对应源码指引按上述组件分别给出。桌面 fork 的源码以
+上述固定 commit 和标签核对；新四核、签名、最终源码归档及 Cronet 逐库许可/对应源码
+清单尚待签收，当前不能作为生产分发闭包。移动端旧补丁与构建脚本在本项目的固定目录。
 若链接失效，请在本项目 issue 中提出。
 
 **对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
 https://github.com/polaris-arch/Polaris
 
-The complete desktop D source is the fixed fork commit linked above, and its
-source archives are available at the fixed desktop Release. Desktop fixes are
+The desktop DNS source is the fixed fork commit and role tag linked above.
+Final native kernels, signatures, source archives and per-library Cronet notices
+and corresponding-source inventory remain pending; production admission stays closed. Desktop fixes are
 already included in that source; the App replays no shared patches or additional
 Windows overlay. Use scripts/desktop-core/source-manifest.json and the fork's
 fixed go.mod / go.sum to obtain and verify the build inputs.

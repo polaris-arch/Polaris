@@ -113,13 +113,13 @@
     "mainGoSumSha256": "b0b62e1b51d268a1c569bf0ec39b72debb9683036d4913edfd8dee073db3a64f"
   },
   "desktopSourceBuild": {
-    "sourceManifestSha256": "9a51f7d9ab2bd0741b9bce31d4743354d4425f17a22cf6bd48631c21a3d36a46",
+    "sourceManifestSha256": "3f633d5927bb5bfe7c0751678c44357bac97f5183fbc13a394c8e5568267886a",
     "provisionerSha256": "a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d",
-    "sourceReceiptFingerprint": "d0acf48015e649102636e038dcd3804aca3227639bb7998f858d231315f41558",
+    "sourceReceiptFingerprint": "4449e20bba538b404559a5b901f73e0a67df3efc7594deddd3eab51e89996c59",
     "moduleGraphSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    "patchedSourceTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-    "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
-    "version": "1.15.0-alpha.11.polaris.1",
+    "patchedSourceTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+    "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+    "version": "1.15.0-alpha.11.polaris.2",
     "dependencyModules": [],
     "transportPins": {
       "github.com/mdlayher/netlink": "v1.11.2",
@@ -131,7 +131,7 @@
     },
     "platforms": {
       "linux": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
         "patchedModules": {
           "requiredLinked": [],
           "allowedAbsent": []
@@ -150,7 +150,7 @@
         "binarySha256": null
       },
       "win": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
         "patchedModules": {
           "requiredLinked": [],
           "allowedAbsent": []
@@ -170,7 +170,7 @@
         "binarySha256": null
       },
       "mac-x64": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
         "patchedModules": {
           "requiredLinked": [],
           "allowedAbsent": []
@@ -190,7 +190,7 @@
         "binarySha256": null
       },
       "mac-arm64": {
-        "buildTree": "9fb6d2f99b996d770ac128cd4ef0cb5255e53398",
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
         "patchedModules": {
           "requiredLinked": [],
           "allowedAbsent": []
@@ -211,9 +211,39 @@
       }
     },
     "graphScope": "core-source-only",
-    "mainGoModSha256": "a63e52e2d5a48befdaeee61a15a556404e5a82677bc412fe2ae181a5fd63f8c2",
-    "mainGoSumSha256": "3ff3e2f3b13951037b1d4109e7f32500943c232aa959bb96b7a757ffcd810cb8",
+    "mainGoModSha256": "a2d3d373d50a5d1d8a98fac6c3a0393885eeabc8404dfd3435eab41d6426324b",
+    "mainGoSumSha256": "6904f2adc151e575c3751e7bc0734ac40f3ac039b2640b6ceff4293825f68edb",
     "sourceMode": "fork-commit-v1",
-    "upstreamVersion": "1.15.0-alpha.11"
+    "upstreamVersion": "1.15.0-alpha.11",
+    "sourceOwnedReplacements": [
+      {
+        "schemaVersion": 1,
+        "module": "github.com/sagernet/sing-tun",
+        "version": "v0.9.7-0.20261009022811-5c2edb183cc9",
+        "replacementPath": "./third_party/sing-tun",
+        "replacementTree": "18492017863a3bf41df92fe528c2bbe38fe97ab2",
+        "replacementFileCount": 256,
+        "baselineOriginCommit": "5c2edb183cc92eb190d41c04dedfa5519ca3e78c",
+        "baselineZipSha256": "d30c485149d53a88d3d31dd2312b5e4ca97649169ac4d0ed81a918fa80c9bcaf",
+        "baselineModuleSum": "h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=",
+        "baselineFiles": 253,
+        "changedBaselineFiles": [
+          "tun_windows.go"
+        ],
+        "addedFiles": [
+          "windows_dns_configuration.go",
+          "windows_dns_configuration_test.go",
+          "windows_lifecycle_guard_windows_test.go"
+        ],
+        "other252BaselineFilesByteExact": true,
+        "windowsAfterDNSSuffixUnchanged": true,
+        "patchSha256": "812956b42cfbb5d302343998b898b9c6489a93f633b1f446c367c5c24681ecd1",
+        "fingerprintSchema": "fork-source-fingerprint-v1",
+        "fourKernelPolicy": "Collect same schema from each actual new kernel source/build input; existing a01 and mobilealpha8 fingerprints remain historical and unchanged.",
+        "bindingSha256": "fff7ce2035d71e37fc02d06ef22f1e643c147f6adfbde34f69b69d6d9351773b",
+        "bindingPath": "release/dependency-sources/sing-tun-replacement.json",
+        "patchPath": "release/dependency-sources/sing-tun-windows-auto-route.patch"
+      }
+    ]
   }
 }

@@ -383,10 +383,20 @@ test('actual production D CLI remains blocked without its reviewed release closu
     const result = runPolicy([], env);
     if (Object.hasOwn(manifest, 'desktopSourceBuild')) {
       assert.equal(result.status, 1, result.stderr);
-      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: Desktop fork source review must be renewed: exact D release input closure not recorded/);
+      assert.match(result.stderr, /PC_RUNTIME_RELEASE_BLOCKED: (?:Desktop fork source review must be renewed: exact D release input closure not recorded|DNS source-owned release input closure\/signatures\/output pins not recorded)/);
     } else {
       assert.equal(result.status, 0, result.stderr);
       requireUnobserved(JSON.parse(result.stdout));
     }
   }
+});
+
+test('source-owned schema readiness cannot authorize source-first DNS publication', () => {
+  const source = readFileSync(join(root, 'scripts/assert-pc-runtime-release.mjs'), 'utf8');
+  assert.match(source, /requireGraph\(!sourceOwnedReplacements\(spec\),\s*'DNS source-owned release input closure\/signatures\/output pins not recorded'\)/);
+  const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
+  assert.equal(Object.hasOwn(manifest.desktopSourceBuild, 'sourceOwnedReplacements'), true);
+  assert.equal(JSON.parse(readFileSync(join(root, 'scripts/desktop-core/source-manifest.json'))).sourceCommit,
+    'aafc521b745e0d1a8f50a6a3f41169433f1c2194');
+  assert.throws(() => assertSourceFirstRelease(), /DNS source-owned release input closure\/signatures\/output pins not recorded/);
 });

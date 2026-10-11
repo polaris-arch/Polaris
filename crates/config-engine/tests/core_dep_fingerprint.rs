@@ -173,6 +173,258 @@ fn extract_dep_version(bin: &[u8], module: &str) -> Option<String> {
     std::str::from_utf8(&rest[..end]).ok().map(str::to_owned)
 }
 
+// Decode only Go 1.18+ inline BuildInfo, not arbitrary plaintext in the binary.
+// Format/framing comes from installed Go debug/buildinfo and cmd/go/modload.
+#[derive(Debug)]
+struct EmbeddedModule {
+    kind: String,
+    version: String,
+    replacement: Option<(String, String)>,
+}
+
+#[derive(Debug)]
+struct EmbeddedIdentity {
+    go_version: String,
+    modules: std::collections::BTreeMap<String, EmbeddedModule>,
+    settings: std::collections::BTreeMap<String, String>,
+}
+
+fn inline_string<'a>(bin: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], &'static str> {
+    let mut len = 0u64;
+    let mut terminated = false;
+    for shift in (0..70).step_by(7) {
+        let byte = *bin.get(*cursor).ok_or("truncated inline string length")?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return Err("overflow inline string length");
+        }
+        len |= u64::from(byte & 127) << shift;
+        if byte < 128 {
+            terminated = true;
+            break;
+        }
+    }
+    if !terminated || len > 1024 * 1024 {
+        return Err("invalid inline string length");
+    }
+    let end = cursor
+        .checked_add(len as usize)
+        .ok_or("inline string overflow")?;
+    let data = bin.get(*cursor..end).ok_or("truncated inline string")?;
+    *cursor = end;
+    Ok(data)
+}
+
+fn embedded_identity(bin: &[u8]) -> Result<EmbeddedIdentity, &'static str> {
+    const MAGIC: &[u8] = b"\xff Go buildinf:";
+    const START: &[u8] = &[
+        0x30, 0x77, 0xaf, 0x0c, 0x92, 0x74, 0x08, 0x02, 0x41, 0xe1, 0xc1, 0x07, 0xe6, 0xd6, 0x18,
+        0xe6,
+    ];
+    const END: &[u8] = &[
+        0xf9, 0x32, 0x43, 0x31, 0x86, 0x18, 0x20, 0x72, 0x00, 0x82, 0x42, 0x10, 0x41, 0x16, 0xd8,
+        0xf2,
+    ];
+    let headers: Vec<_> = bin
+        .windows(MAGIC.len())
+        .enumerate()
+        .filter_map(|(at, value)| {
+            let header = bin.get(at..at + 32)?;
+            (value == MAGIC
+                && at.is_multiple_of(16)
+                && header[14] == 8
+                && header[15] & 2 == 2
+                && header[15] <= 3
+                && header[16..].iter().all(|byte| *byte == 0))
+            .then_some(at)
+        })
+        .collect();
+    if headers.len() != 1 {
+        return Err("missing/duplicate inline Go BuildInfo");
+    }
+    let mut cursor = headers[0] + 32;
+    let go_version = std::str::from_utf8(inline_string(bin, &mut cursor)?)
+        .map_err(|_| "invalid Go version")?
+        .to_owned();
+    let framed = inline_string(bin, &mut cursor)?;
+    if framed.len() < 33
+        || !framed.starts_with(START)
+        || !framed.ends_with(END)
+        || framed[framed.len() - 17] != b'\n'
+    {
+        return Err("invalid module framing");
+    }
+    let info =
+        std::str::from_utf8(&framed[16..framed.len() - 16]).map_err(|_| "invalid module text")?;
+    let mut result = EmbeddedIdentity {
+        go_version,
+        modules: Default::default(),
+        settings: Default::default(),
+    };
+    let mut previous: Option<String> = None;
+    for line in info.split_terminator('\n') {
+        let parts: Vec<_> = line.split('\t').collect();
+        match parts[0] {
+            "mod" | "dep" => {
+                if !(3..=4).contains(&parts.len())
+                    || parts[1].is_empty()
+                    || parts[2].is_empty()
+                    || result.modules.contains_key(parts[1])
+                {
+                    return Err("duplicate/malformed module");
+                }
+                result.modules.insert(
+                    parts[1].to_owned(),
+                    EmbeddedModule {
+                        kind: parts[0].to_owned(),
+                        version: parts[2].to_owned(),
+                        replacement: None,
+                    },
+                );
+                previous = Some(parts[1].to_owned());
+            }
+            "=>" => {
+                let key = previous.take().ok_or("unbound replacement")?;
+                if !(3..=4).contains(&parts.len())
+                    || parts[1].is_empty()
+                    || parts.get(3).is_some_and(|sum| !sum.is_empty())
+                {
+                    return Err("malformed local replacement");
+                }
+                let module = result
+                    .modules
+                    .get_mut(&key)
+                    .ok_or("missing replacement module")?;
+                if module.replacement.is_some() {
+                    return Err("duplicate replacement");
+                }
+                module.replacement = Some((parts[1].to_owned(), parts[2].to_owned()));
+            }
+            "build" => {
+                if parts.len() != 2 {
+                    return Err("malformed build setting");
+                }
+                let (key, value) = parts[1].split_once('=').ok_or("invalid build setting")?;
+                if key.is_empty() || result.settings.contains_key(key) {
+                    return Err("duplicate build setting");
+                }
+                let value = if value.starts_with('"') {
+                    serde_json::from_str::<String>(value)
+                        .map_err(|_| "invalid quoted build setting")?
+                } else {
+                    value.to_owned()
+                };
+                result.settings.insert(key.to_owned(), value);
+                previous = None;
+            }
+            "path" if parts.len() == 2 && !parts[1].is_empty() => {
+                previous = None;
+            }
+            "" if line.is_empty() => {
+                previous = None;
+            }
+            _ => return Err("unsupported BuildInfo row"),
+        }
+    }
+    Ok(result)
+}
+
+fn verify_desktop_embedded_identity(
+    bytes: &[u8],
+    source: &serde_json::Value,
+    spec: &serde_json::Value,
+    receipt: &serde_json::Value,
+    observed_build_id: &str,
+) -> Result<(), &'static str> {
+    let declared = spec["sourceOwnedReplacements"]
+        .as_array()
+        .ok_or("missing source-owned declaration")?;
+    if declared.len() != 1
+        || source["sourceOwnedReplacements"] != spec["sourceOwnedReplacements"]
+        || receipt["sourceOwnedReplacements"] != spec["sourceOwnedReplacements"]
+        || source["schema"] != "polaris-desktop-fork-source-v1"
+        || source["role"] != "desktop"
+        || source["sourceURL"] != "https://github.com/polaris-arch/polaris-box"
+        || source["sourceTagObject"]
+            .as_str()
+            .is_none_or(|value| !hex_pin(value, 40))
+        || source["sourceCommit"]
+            .as_str()
+            .is_none_or(|value| !hex_pin(value, 40))
+        || source["sourceTree"] != spec["buildTree"]
+        || spec["sourceMode"] != "fork-commit-v1"
+        || receipt["schema"] != "polaris-desktop-core-v1"
+        || receipt["version"] != spec["version"]
+        || receipt["sourceFingerprint"] != spec["sourceReceiptFingerprint"]
+        || receipt["sourceReceipt"]["sourceCommit"] != source["sourceCommit"]
+    {
+        return Err("source-owned receipt/source identity differs");
+    }
+    let identity = embedded_identity(bytes)?;
+    if identity.go_version
+        != format!(
+            "go{}",
+            source["goVersion"].as_str().ok_or("missing toolchain")?
+        )
+    {
+        return Err("embedded toolchain differs");
+    }
+    let roots: Vec<_> = identity
+        .modules
+        .iter()
+        .filter(|(_, value)| value.kind == "mod")
+        .collect();
+    if roots.len() != 1
+        || roots[0].0 != "github.com/sagernet/sing-box"
+        || roots[0].1.replacement.is_some()
+        || identity.settings.get("vcs.revision").map(String::as_str)
+            != source["sourceCommit"].as_str()
+        || identity.settings.get("vcs.modified").map(String::as_str) != Some("false")
+    {
+        return Err("embedded unique root/clean VCS differs");
+    }
+    let dep = &declared[0];
+    if dep["module"] != SING_TUN_MODULE || dep["replacementPath"] != "./third_party/sing-tun" {
+        return Err("source-owned module/path differs");
+    }
+    let actual = identity
+        .modules
+        .get(SING_TUN_MODULE)
+        .ok_or("missing linked sing-tun")?;
+    if actual.kind != "dep"
+        || Some(actual.version.as_str()) != dep["version"].as_str()
+        || actual
+            .replacement
+            .as_ref()
+            .map(|(path, version)| (path.as_str(), version.as_str()))
+            != Some(("./third_party/sing-tun", "(devel)"))
+        || identity
+            .modules
+            .iter()
+            .any(|(module, value)| value.replacement.is_some() && module != SING_TUN_MODULE)
+    {
+        return Err("embedded unique source-owned replacement differs");
+    }
+    let fingerprint = receipt["platformInputFingerprint"]
+        .as_str()
+        .ok_or("missing platform input")?;
+    let build_id = format!("polaris-desktop-source-v1-{fingerprint}");
+    // Go omits -ldflags from BuildInfo with -trimpath. Reuse the existing
+    // consumer's static Go buildid reader; never execute the target kernel.
+    if !hex_pin(fingerprint, 64) || receipt["buildID"] != build_id || observed_build_id != build_id
+    {
+        return Err("actual production BuildID differs");
+    }
+    Ok(())
+}
+
+fn hex_pin(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[test]
 fn bundled_core_still_uses_the_pinned_sing_tun() {
     let present = present_cores();
@@ -189,10 +441,100 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
         eprintln!("⚠ 依赖指纹门只看到部分平台，未覆盖的平台本轮没有被检查。");
     }
 
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("src-tauri/core-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let desktop = &manifest["desktopSourceBuild"];
+    let owned_mode = desktop.get("sourceOwnedReplacements").is_some();
     for (core, path) in &present {
         let bytes =
             std::fs::read(path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
 
+        if owned_mode {
+            let source: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    repo_root().join("scripts/desktop-core/source-manifest.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let metadata = repo_root().join("resources/.source-receipts");
+            let receipt: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata.join(format!("{}.json", core.key))).unwrap(),
+            )
+            .unwrap();
+            let bundle: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata.join("bundle.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                bundle["platforms"]
+                    .as_object()
+                    .is_some_and(|platforms| platforms.len() == 4),
+                "strict four-core receipt inventory required"
+            );
+            assert_eq!(receipt["platform"], core.key);
+            assert_eq!(receipt["candidate"], bundle["candidate"]);
+            let context = &receipt["producerContext"];
+            assert_eq!(context["repository"], "polaris-arch/Polaris");
+            assert_eq!(context["repositoryId"], "1347028220");
+            assert_eq!(context["candidate"], bundle["candidate"]);
+            for field in ["runId", "runAttempt"] {
+                assert!(
+                    context[field]
+                        .as_str()
+                        .is_some_and(|v| v.parse::<u64>().is_ok_and(|n| n > 0)),
+                    "producer context missing: {field}"
+                );
+            }
+            if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                for (field, env) in [
+                    ("runId", "GITHUB_RUN_ID"),
+                    ("runAttempt", "GITHUB_RUN_ATTEMPT"),
+                    ("workflowRef", "GITHUB_WORKFLOW_REF"),
+                    ("workflowHead", "GITHUB_SHA"),
+                    ("ref", "GITHUB_REF"),
+                    ("event", "GITHUB_EVENT_NAME"),
+                ] {
+                    assert_eq!(
+                        context[field].as_str(),
+                        std::env::var(env).ok().as_deref(),
+                        "current producer context differs: {field}"
+                    );
+                }
+            }
+            if bundle["schema"] == "polaris-desktop-validation-bundle-v2" {
+                assert_eq!(bundle["mode"], "source-owned-all-current-v1");
+                let mut origin = context.clone();
+                origin["kind"] = "current-native".into();
+                assert_eq!(
+                    bundle["origins"][core.key], origin,
+                    "old native attempt cannot be relabeled"
+                );
+            } else {
+                assert_eq!(bundle["schema"], "polaris-desktop-bundle-v1");
+            }
+            let buildid = std::process::Command::new("go")
+                .args(["tool", "buildid"])
+                .arg(path)
+                .env("GOTOOLCHAIN", "local")
+                .env("GOWORK", "off")
+                .env("GOENV", "off")
+                .output()
+                .expect("static Go buildid reader required; target core is not executed");
+            assert!(
+                buildid.status.success(),
+                "{}: static BuildID read failed",
+                core.key
+            );
+            let actual_build_id = std::str::from_utf8(&buildid.stdout)
+                .expect("Go BuildID must be UTF-8")
+                .trim();
+            verify_desktop_embedded_identity(&bytes, &source, desktop, &receipt, actual_build_id)
+                .unwrap_or_else(|error| panic!("{}: {error}", core.key));
+            continue;
+        }
         // 提不出来 = 本门失效（Go 换了 modinfo 编码 / 核被 strip 得更狠 / 拿到的不是 Go 二进制）。
         // 这种情况必须**红**而不是跳过 —— 否则本门会从「守着依赖」静静退化成「永远绿」。
         let actual = extract_dep_version(&bytes, SING_TUN_MODULE).unwrap_or_else(|| {
@@ -273,5 +615,143 @@ fn candidate_d_dns_dependency_has_not_been_release_authorized() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(source["sourceCommit"], "052297f735b80bdae5b2536ef2a07d04979a0511", "source changed: re-audit exact dependency/default/Windows contract before changing this lock");
+    if source.get("sourceOwnedReplacements").is_none() {
+        assert_eq!(source["sourceCommit"], "052297f735b80bdae5b2536ef2a07d04979a0511", "source changed: re-audit exact dependency/default/Windows contract before changing this lock");
+    }
+}
+
+fn framed_identity_fixture(info: &str) -> Vec<u8> {
+    fn append(bytes: &mut Vec<u8>, data: &[u8]) {
+        let mut size = data.len();
+        while size >= 128 {
+            bytes.push((size as u8 & 127) | 128);
+            size >>= 7;
+        }
+        bytes.push(size as u8);
+        bytes.extend_from_slice(data);
+    }
+    let mut bytes = vec![0u8; 32];
+    bytes[..14].copy_from_slice(b"\xff Go buildinf:");
+    bytes[14] = 8;
+    bytes[15] = 2;
+    append(&mut bytes, b"go1.25.5");
+    let mut framed = vec![
+        0x30, 0x77, 0xaf, 0x0c, 0x92, 0x74, 0x08, 0x02, 0x41, 0xe1, 0xc1, 0x07, 0xe6, 0xd6, 0x18,
+        0xe6,
+    ];
+    framed.extend_from_slice(info.as_bytes());
+    framed.extend_from_slice(&[
+        0xf9, 0x32, 0x43, 0x31, 0x86, 0x18, 0x20, 0x72, 0x00, 0x82, 0x42, 0x10, 0x41, 0x16, 0xd8,
+        0xf2,
+    ]);
+    append(&mut bytes, &framed);
+    bytes
+}
+
+#[test]
+fn source_owned_embedded_identity_rejects_plaintext_and_broken_framing() {
+    let info = "path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\tgithub.com/sagernet/sing-tun\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.modified=false\n";
+    let bytes = framed_identity_fixture(info);
+    assert_eq!(
+        embedded_identity(&bytes).unwrap().modules[SING_TUN_MODULE]
+            .replacement
+            .as_ref()
+            .unwrap()
+            .0,
+        "./third_party/sing-tun"
+    );
+    assert!(embedded_identity(info.as_bytes()).is_err());
+    assert!(embedded_identity(&bytes[..bytes.len() - 1]).is_err());
+    let mut bad = bytes.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(embedded_identity(&bad).is_err());
+    let mut duplicate = bytes.clone();
+    while !duplicate.len().is_multiple_of(16) {
+        duplicate.push(0);
+    }
+    duplicate.extend_from_slice(&bytes);
+    assert!(embedded_identity(&duplicate).is_err());
+    for extra in [
+        "dep\tgithub.com/sagernet/sing-tun\tv9\n",
+        "build\tvcs.modified=true\n",
+        "=>\t./arbitrary\t(devel)\n",
+    ] {
+        assert!(embedded_identity(&framed_identity_fixture(&format!("{info}{extra}"))).is_err());
+    }
+}
+
+#[test]
+fn source_owned_embedded_identity_requires_exact_root_replacement_vcs_and_build_identity() {
+    let commit = "c".repeat(40);
+    let fp = "f".repeat(64);
+    let source_fp = "a".repeat(64);
+    let declaration = serde_json::json!([{ "module": SING_TUN_MODULE, "version": "v0.9.7-fixture", "replacementPath": "./third_party/sing-tun" }]);
+    let source = serde_json::json!({ "schema": "polaris-desktop-fork-source-v1", "role": "desktop", "sourceURL": "https://github.com/polaris-arch/polaris-box",
+      "sourceTagObject": "b".repeat(40), "sourceCommit": commit, "sourceTree": "d".repeat(40), "goVersion": "1.25.5", "sourceOwnedReplacements": declaration });
+    let spec = serde_json::json!({ "sourceMode": "fork-commit-v1", "sourceOwnedReplacements": declaration, "buildTree": "d".repeat(40), "version": "1.0.0.polaris.1", "sourceReceiptFingerprint": source_fp });
+    let receipt = serde_json::json!({ "schema": "polaris-desktop-core-v1", "version": "1.0.0.polaris.1", "sourceOwnedReplacements": declaration, "sourceFingerprint": source_fp,
+      "sourceReceipt": {"sourceCommit": commit}, "platformInputFingerprint": fp, "buildID": format!("polaris-desktop-source-v1-{fp}") });
+    let info = format!("path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\t{SING_TUN_MODULE}\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.revision={commit}\nbuild\tvcs.modified=false\nbuild\t-trimpath=true\n");
+    let actual_build_id = format!("polaris-desktop-source-v1-{fp}");
+    verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &receipt,
+        &actual_build_id,
+    )
+    .unwrap();
+    for changed in [
+        info.replace("sing-box\tv0", "sing-box-extra\tv0"),
+        info.replace("(devel)", "v1"),
+        info.replace("./third_party/sing-tun", "/absolute/sing-tun"),
+        info.replace("vcs.modified=false", "vcs.modified=true"),
+        info.replace(&commit, &"e".repeat(40)),
+        info.replace("v0.9.7-fixture", "v0.9.8-fixture"),
+        format!("{info}mod\texample.com/workspace\tv0.0.0\n"),
+        format!("{info}dep\texample.com/extra\tv1\n=>\t./extra\t(devel)\n"),
+    ] {
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&changed),
+            &source,
+            &spec,
+            &receipt,
+            &actual_build_id
+        )
+        .is_err());
+    }
+    for id in [
+        format!("polaris-dns-technical-v1-{fp}"),
+        String::new(),
+        format!("polaris-desktop-source-v1-{}", "e".repeat(64)),
+    ] {
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&info),
+            &source,
+            &spec,
+            &receipt,
+            &id
+        )
+        .is_err());
+    }
+    let mut wrong_version = receipt.clone();
+    wrong_version["version"] = "candidate".into();
+    assert!(verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &wrong_version,
+        &actual_build_id
+    )
+    .is_err());
+    let mut technical = receipt.clone();
+    technical["schema"] = "polaris-dns-technical-native-v1".into();
+    assert!(verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &technical,
+        &actual_build_id
+    )
+    .is_err());
 }

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 import { validationContext, VALIDATION_SCHEMA } from './desktop-core/validation-origin.mjs';
 import { buildInfoFingerprint, canonical, desktopSourceManifestPath, digest, requireGraph,
-  validateBuildInfo, validateSourcePins, verifyHash } from './desktop-core/source-graph.mjs';
+  sourceOwnedReplacements, validateBuildInfo, validateSourcePins, verifyHash } from './desktop-core/source-graph.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 
 function regular(path) {
@@ -56,6 +56,8 @@ export function inspectNativePayload(root, key, core, library, run = execFileSyn
       tree: spec.buildTree, manifestSha256: spec.sourceManifestSha256,
       mainGoModSha256: receipt.mainGoModSha256, mainGoSumSha256: receipt.mainGoSumSha256,
       sourceFingerprint: receipt.sourceFingerprint, platformInputFingerprint: receipt.platformInputFingerprint,
+      ...(sourceOwnedReplacements(spec) ? { sourceOwnedReplacements: receipt.sourceOwnedReplacements,
+        producerContext: receipt.producerContext } : {}),
       version: receipt.version, goos: receipt.goos, goarch: receipt.goarch, cgo: receipt.cgo, tags: receipt.tags },
     receiptSha256: inventory.platforms[key].receiptSha256, origin: inventory.origins[key] };
 }

@@ -2,7 +2,7 @@
 // Hashes bind reviewed bytes; API transport records are not signed provenance.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { canonical, digest, requireGraph, DESKTOP_TARGETS, verifyHash } from './source-graph.mjs';
+import { canonical, digest, requireGraph, DESKTOP_TARGETS, verifyHash, validateSourcePins, validateSourceManifest, desktopSourceManifestPath, sourceOwnedReplacements, producerContext } from './source-graph.mjs';
 
 export const VALIDATION_SCHEMA = 'polaris-desktop-validation-bundle-v2';
 export const ORIGIN_POLICY = 'scripts/desktop-core/validation-origin.json';
@@ -22,6 +22,37 @@ export function validationContext(candidate, env = process.env) {
     && positive(env.GITHUB_RUN_ID) && positive(env.GITHUB_RUN_ATTEMPT),
   'Validation origin requires exact non-tag manual Risk candidate/run context');
   return { runId: String(env.GITHUB_RUN_ID), attempt: String(env.GITHUB_RUN_ATTEMPT) };
+}
+
+export function validationSourceMode(root) {
+  const manifest = read(join(root, 'src-tauri/core-manifest.json'));
+  const spec = validateSourcePins(manifest, 'linux', false);
+  const sourcePath = join(root, desktopSourceManifestPath(spec));
+  verifyHash(sourcePath, spec.sourceManifestSha256);
+  validateSourceManifest(read(sourcePath), spec);
+  return sourceOwnedReplacements(spec) ? 'source-owned-all-current-v1' : 'historical-d-origin-v1';
+}
+
+export function desktopProducerPlan(root, nativeValidation) {
+  requireGraph(typeof nativeValidation === 'boolean', 'Explicit native validation selection required');
+  const mode = validationSourceMode(root);
+  const legacyOrigins = nativeValidation && mode === 'historical-d-origin-v1';
+  const matrix = [
+    { platform: 'linux', os: 'ubuntu-22.04', host: 'linux', arch: 'x64' },
+    { platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' },
+    { platform: 'mac-x64', os: 'macos-15-intel', host: 'darwin', arch: 'x64' },
+    { platform: 'mac-arm64', os: 'macos-15', host: 'darwin', arch: 'arm64' },
+  ];
+  return { mode, legacyOrigins, matrix: legacyOrigins ? matrix.filter((row) => row.platform === 'win') : matrix };
+}
+
+export function validateCurrentProducer(receipt, candidate, env = process.env) {
+  const context = producerContext(candidate, env);
+  const { fingerprint, ...facts } = receipt;
+  requireGraph(receipt.schema === 'polaris-desktop-core-v1' && receipt.candidate === candidate
+    && fingerprint === digest(canonical(facts)) && equal(receipt.producerContext, context),
+  'Current native producer context/fingerprint differs');
+  return context;
 }
 
 export function loadOriginPolicy(root) {
@@ -61,11 +92,35 @@ export function verifyOriginTransport(root, transport) {
 
 export function validateBundleOrigin(root, inventory, candidate, key, receipt, env = process.env) {
   if (inventory.schema !== VALIDATION_SCHEMA) {
+    requireGraph(inventory.mode === undefined, 'Unsupported bundle mode');
+    if (validationSourceMode(root) === 'source-owned-all-current-v1') validateCurrentProducer(receipt, candidate, env);
     requireGraph(inventory.schema === 'polaris-desktop-bundle-v1' && receipt.candidate === candidate,
       'Producer candidate differs');
     return;
   }
-  const context = validationContext(candidate, env), { policy, policySha256 } = loadOriginPolicy(root);
+  const context = validationContext(candidate, env);
+  if (inventory.mode === 'source-owned-all-current-v1') {
+    requireGraph(validationSourceMode(root) === inventory.mode && inventory.validationOnly === true
+      && inventory.candidate === candidate && equal(inventory.transport, context)
+      && equal(Object.keys(inventory.origins ?? {}).sort(), Object.keys(DESKTOP_TARGETS).sort())
+      && inventory.policySha256 === undefined && inventory.originTransport === undefined,
+    'All-current validation envelope differs');
+    const manifest = read(join(root, 'src-tauri/core-manifest.json'));
+    const spec = validateSourcePins(manifest, key, false);
+    const owned = sourceOwnedReplacements(spec);
+    requireGraph(inventory.sourceManifestSha256 === spec.sourceManifestSha256
+      && inventory.sourceOwnedReplacementsSha256 === digest(canonical(owned))
+      && equal(receipt.sourceOwnedReplacements, owned) && receipt.platform === key,
+    'All-current source-owned identity differs');
+    const producer = validateCurrentProducer(receipt, candidate, env);
+    requireGraph(equal(inventory.origins[key], { kind: 'current-native', ...producer }),
+      'All-current origin differs from actual producer context');
+    return;
+  }
+  requireGraph(validationSourceMode(root) === 'historical-d-origin-v1'
+    && inventory.mode === undefined && !Object.hasOwn(receipt, 'producerContext')
+    && !Object.hasOwn(receipt, 'sourceOwnedReplacements'), 'New source cannot reuse historical origins');
+  const { policy, policySha256 } = loadOriginPolicy(root);
   requireGraph(inventory.validationOnly === true && inventory.candidate === candidate
     && inventory.policySha256 === policySha256 && equal(inventory.transport, context)
     && equal(Object.keys(inventory.origins ?? {}).sort(), Object.keys(DESKTOP_TARGETS).sort()), 'Validation consumer envelope differs');
@@ -88,7 +143,29 @@ export function validateBundleOrigin(root, inventory, candidate, key, receipt, e
 }
 
 export function writeValidationBundle(root, directory, candidate, env = process.env) {
-  const context = validationContext(candidate, env), { policy, policySha256 } = loadOriginPolicy(root);
+  const context = validationContext(candidate, env);
+  if (validationSourceMode(root) === 'source-owned-all-current-v1') {
+    const manifest = read(join(root, 'src-tauri/core-manifest.json'));
+    const spec = validateSourcePins(manifest, 'linux', false), owned = sourceOwnedReplacements(spec);
+    const platforms = {}, origins = {};
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const file = join(directory, key, key === 'win' ? 'sing-box.exe' : 'sing-box');
+      const receiptFile = `${file}.source-receipt.json`, receipt = read(receiptFile);
+      verifyHash(file, receipt.binarySha256);
+      platforms[key] = { binarySha256: receipt.binarySha256, receiptSha256: digest(readFileSync(receiptFile)) };
+      origins[key] = { kind: 'current-native', ...validateCurrentProducer(receipt, candidate, env) };
+    }
+    const inventory = { schema: VALIDATION_SCHEMA, mode: 'source-owned-all-current-v1',
+      validationOnly: true, candidate, transport: context, sourceManifestSha256: spec.sourceManifestSha256,
+      sourceOwnedReplacementsSha256: digest(canonical(owned)), platforms, origins };
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const file = join(directory, key, key === 'win' ? 'sing-box.exe' : 'sing-box');
+      validateBundleOrigin(root, inventory, candidate, key, read(`${file}.source-receipt.json`), env);
+    }
+    writeFileSync(join(directory, 'bundle.json'), `${JSON.stringify(inventory, null, 2)}\n`);
+    return inventory;
+  }
+  const { policy, policySha256 } = loadOriginPolicy(root);
   const originTransport = read(join(directory, 'origin-transport.json'));
   verifyOriginTransport(root, originTransport);
   const platforms = {}, origins = {};

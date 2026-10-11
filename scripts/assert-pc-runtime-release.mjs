@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, DESKTOP_TARGETS, digest, requireGraph, validateSourceManifest,
-  validateSourcePins, hasDesktopSource, desktopSourceManifestPath } from './desktop-core/source-graph.mjs';
+  sourceOwnedReplacements, validateSourcePins, hasDesktopSource, desktopSourceManifestPath } from './desktop-core/source-graph.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Historical reviewed backend anchor, not a commit claiming the later Go inputs.
@@ -100,6 +100,8 @@ export function assertSourceFirstRelease(read = readRepository) {
     for (const patch of mobileSource.patches) check(`scripts/libbox-patches/${patch.file}`, patch.sha256);
     for (const dep of mobileDependencies) check(`scripts/libbox-patches/${dep.patchFile}`, dep.patchSha256);
     check('scripts/libbox-ios-patches/source-manifest.json', reviewedAppleSourceSha256);
+    requireGraph(!sourceOwnedReplacements(spec),
+      'DNS source-owned release input closure/signatures/output pins not recorded');
     throw new Error('Desktop fork source review must be renewed: exact D release input closure not recorded');
   }
   delete inputs.windowsBuild.binarySha256;

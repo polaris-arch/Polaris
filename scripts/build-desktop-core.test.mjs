@@ -69,6 +69,7 @@ function fixture(patched = PATCHED) {
   for (const dep of source.dependencyPatches) write(join(root, 'scripts/libbox-patches', dep.patchFile), depPatch);
   write(join(root, 'scripts/core-source-provision.py'), provider);
   write(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlay);
+  write(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
   return { root, manifest, source, receipt, patched, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
 const patchedRow = (name, module) => `\tdep\t${module}\tv1.0.0\t\n\t=>\t./polaris-dependencies/${name}\t(devel)\t\n\t\n`;
