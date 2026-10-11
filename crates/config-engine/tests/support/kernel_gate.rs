@@ -63,14 +63,67 @@ pub fn load_cases() -> Vec<SnapshotCase> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/config-snapshot.json");
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("fixtures/config-snapshot.json 读不到: {e}"));
-    let fixture: SnapshotFixture =
+    let mut fixture: SnapshotFixture =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixture 解析失败: {e}"));
     assert_eq!(
         fixture.cases.len(),
         37,
         "完整 fixture 数量漂移：本真核门要求恰好 37 个生成配置"
     );
+    // The frozen golden snapshot carries base64("privkey") / base64("pubkey").
+    // alpha11 validates the peer's 32-byte key during initialize. Only these
+    // live-kernel inputs use the existing mesh runtime test keys; the golden
+    // file, generated shape, four credential artifacts and 33-success ratchet
+    // remain unchanged. Both outbound and full-config gates share this loader.
+    let mut replaced = 0;
+    for case in &mut fixture.cases {
+        if case.name != "WireGuard endpoint（mesh）" {
+            continue;
+        }
+        assert_eq!(
+            case.input.servers.len(),
+            1,
+            "WireGuard fixture shape drifted"
+        );
+        let settings = case.input.servers[0]
+            .wireguard_settings
+            .as_deref_mut()
+            .expect("WireGuard fixture lost settings");
+        assert_eq!(settings.private_key.as_deref(), Some("cHJpdmtleQ=="));
+        assert_eq!(settings.peer_public_key.as_deref(), Some("cHVia2V5"));
+        settings.private_key = Some(LIVE_FIXTURE_WG_PRIVATE.to_owned());
+        settings.peer_public_key = Some(LIVE_FIXTURE_WG_PEER_PUBLIC.to_owned());
+        replaced += 1;
+    }
+    assert_eq!(replaced, 1, "WireGuard fixture must occur exactly once");
     fixture.cases
+}
+
+// Public test-only values also used by mesh_inbound_runtime; never real secrets.
+const LIVE_FIXTURE_WG_PRIVATE: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+const LIVE_FIXTURE_WG_PEER_PUBLIC: &str = "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns=";
+
+#[test]
+fn live_kernel_fixture_changes_only_two_wireguard_placeholder_credentials() {
+    let raw = include_str!("../../fixtures/config-snapshot.json");
+    let original: SnapshotFixture = serde_json::from_str(raw).expect("frozen snapshot parses");
+    let live = load_cases();
+    assert_eq!(original.cases.len(), live.len());
+    let mut changed = 0;
+    for (before, after) in original.cases.into_iter().zip(live) {
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.platform, after.platform);
+        let mut expected = serde_json::to_value(before.input).expect("snapshot serializes");
+        if before.name == "WireGuard endpoint（mesh）" {
+            expected["servers"][0]["wireguardSettings"]["privateKey"] =
+                LIVE_FIXTURE_WG_PRIVATE.into();
+            expected["servers"][0]["wireguardSettings"]["peerPublicKey"] =
+                LIVE_FIXTURE_WG_PEER_PUBLIC.into();
+            changed += 1;
+        }
+        assert_eq!(serde_json::to_value(after.input).unwrap(), expected);
+    }
+    assert_eq!(changed, 1);
 }
 
 fn scenario_deps(name: &str) -> (Option<u16>, Option<u16>, Option<u16>, Option<String>) {
