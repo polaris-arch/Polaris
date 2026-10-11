@@ -22,6 +22,7 @@ import type { TailscaleStatusEvent } from '../contracts/tailscale-status';
 import type { ServerSwitchReceipt } from '../contracts/server-switch';
 import { api } from '../ipc';
 import { withConfigWriteLock } from '../lib/config-write-lock';
+import { configReadGeneration } from '../lib/config-read-generation';
 import { replay, type StagedEntry } from '../lib/staged-config';
 import {
   flushStagedPendingSync,
@@ -263,25 +264,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     const myGeneration = ++loadConfigGeneration;
+    const readGeneration = configReadGeneration.beginRead();
     set({ configLoading: true });
 
     loadConfigInflight = (async () => {
       try {
         const config = await api.config.get();
         // 代际比对：mutation 成功后自增代际，在飞的旧 load（拿的是 mutation 前旧快照）回填被丢弃
-        if (myGeneration !== loadConfigGeneration) {
+        if (myGeneration !== loadConfigGeneration || !configReadGeneration.isCurrent(readGeneration)) {
           // 被 force 刷新取代时，不能让调用者把「旧 fetch 已结束」错当成「最新 config 已发布」。
           // 新一代若已存在就等它；若被 mutation 作废，mutation 已同步发布自己的最新快照。
-          await loadConfigInflight;
+          if (myGeneration !== loadConfigGeneration) await loadConfigInflight;
           return;
         }
 
         // 首次暂存恢复要先消费 clean-exit 标记。等它完成才发布 config：否则编辑入口会在
         // baseline 仍为 null 时可达，随后 hydrate 的恢复快照会覆盖刚刚写入的 staged 条目。
-        await hydrateStagedConfig(config);
+        await hydrateStagedConfig(config, () => configReadGeneration.isCurrent(readGeneration));
         // 水合 await 期间可能收到更新的 configChanged；旧代际绝不能在较新快照之后发布。
-        if (myGeneration !== loadConfigGeneration) {
-          await loadConfigInflight;
+        if (myGeneration !== loadConfigGeneration || !configReadGeneration.isCurrent(readGeneration)) {
+          if (myGeneration !== loadConfigGeneration) await loadConfigInflight;
           return;
         }
 
@@ -300,6 +302,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       } finally {
         if (myGeneration === loadConfigGeneration) {
           loadConfigInflight = null;
+          set({ configLoading: false });
         }
       }
     })();
@@ -308,10 +311,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   acceptSelectionConfig: async (config) => {
-    invalidateLoadConfig();
     set({ config, configLoading: false, servers: config.servers ?? [], selectedServerId: config.selectedServerId,
       rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [], dnsRules: config.dnsRules ?? [] });
-    await hydrateStagedConfig(config);
+    const publication = configReadGeneration.current();
+    await hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publication));
   },
 
   // 即时编辑只传本次明确变动的顶层字段。后端在单一配置写锁内把 patch 合到最新磁盘值上，故订阅刷新、
@@ -396,10 +399,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   switchServer: async (serverId) => {
     // 与暂存保存/配置补丁共用同一条 webview 内写队列：快速连点必须按调用顺序落盘，
     // 否则较慢的旧 IPC 可能最后回包，把最后一次点击覆盖回旧节点。
-    const { receipt, config } = await withConfigWriteLock(async () => {
+    const { receipt, config, readGeneration } = await withConfigWriteLock(async () => {
       const receipt = await api.server.switch(serverId);
-      return { receipt, config: await api.config.get() };
+      const readGeneration = configReadGeneration.beginRead();
+      return { receipt, config: await api.config.get(), readGeneration };
     });
+    if (!configReadGeneration.isCurrent(readGeneration)) return receipt;
     invalidateLoadConfig();
     set({
       config,
@@ -686,6 +691,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       tailscaleLoginInitiated: {},
     }),
 }));
+
+// Includes mutation results, staged-store publications and external setState
+// callers. Whole-config freshness cannot be inferred from selection context.
+useAppStore.subscribe((state, previous) => {
+  if (state.config !== previous.config) configReadGeneration.published();
+});
 
 // ─────────────────────────── effectiveConfig（暂存回显的唯一读点）───────────────────────────
 

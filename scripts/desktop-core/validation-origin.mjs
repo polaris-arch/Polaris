@@ -1,7 +1,8 @@
 // Narrow technical-validation bridge. Original receipts are never rewritten.
 // Hashes bind reviewed bytes; API transport records are not signed provenance.
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { hasDesktopRelease, loadReleaseContract } from './release-consumer.mjs';
 import { canonical, digest, requireGraph, DESKTOP_TARGETS, verifyHash, validateSourcePins, validateSourceManifest, desktopSourceManifestPath, sourceOwnedReplacements, producerContext } from './source-graph.mjs';
 
@@ -28,6 +29,13 @@ export function validationContext(candidate, env = process.env, root = process.c
     && positive(env.GITHUB_RUN_ID) && positive(env.GITHUB_RUN_ATTEMPT),
   'Validation origin requires exact non-tag manual Risk candidate/run context');
   return { runId: String(env.GITHUB_RUN_ID), attempt: String(env.GITHUB_RUN_ATTEMPT) };
+}
+
+// Package's Bash setup and the Python native/final proof use the same admission
+// function as the Node assembler. The contract is read from actual source bytes.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  requireGraph(process.argv.length === 3, 'Validation context requires exactly one candidate');
+  console.log(JSON.stringify(validationContext(process.argv[2])));
 }
 
 export function validationSourceMode(root) {

@@ -27,21 +27,24 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def ci_context(key, env=None, system=None, machine=None):
+def ci_context(key, env=None, system=None, machine=None, root=None):
     env = os.environ if env is None else env
     system = platform.system() if system is None else system
     machine = platform.machine() if machine is None else machine
-    branch = 'refs/heads/collab/fk02-native-payload-validation-20261010'
-    require(env.get('POLARIS_NO_KERNEL_RUN') != '1' and env.get('POLARIS_NATIVE_PAYLOAD_VALIDATION') == '1'
-            and env.get('GITHUB_ACTIONS') == 'true' and env.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
-            and env.get('GITHUB_REPOSITORY') == 'polaris-arch/Polaris' and env.get('GITHUB_REF') == branch
-            and env.get('GITHUB_WORKFLOW_REF') == 'polaris-arch/Polaris/.github/workflows/release-risk.yml@' + branch
-            and re.fullmatch('[a-f0-9]{40}', env.get('GITHUB_SHA', ''))
-            and re.fullmatch('[1-9][0-9]*', env.get('GITHUB_RUN_ID', ''))
-            and re.fullmatch('[1-9][0-9]*', env.get('GITHUB_RUN_ATTEMPT', '')),
+    # Reject the local no-execution override before even starting the validator.
+    require(env.get('POLARIS_NO_KERNEL_RUN') != '1',
             'native payload requires exact non-tag manual CI validation context')
     require(key in ['linux', 'win'] and system == {'linux': 'Linux', 'win': 'Windows'}[key]
             and machine.lower() in ['x86_64', 'amd64'], 'native amd64 host/platform differs')
+    source_root = Path(__file__).resolve().parent.parent
+    execution_env = {key: os.environ[key] for key in ['PATH', 'SystemRoot', 'TEMP', 'TMP'] if key in os.environ}
+    execution_env.update(env)
+    result = subprocess.run(['node', str(source_root / 'scripts/desktop-core/validation-origin.mjs'),
+                             env.get('GITHUB_SHA', '')], cwd=source_root if root is None else root,
+                            env=execution_env,
+                            capture_output=True, text=True, timeout=30)
+    require(result.returncode == 0, 'native payload requires exact non-tag manual CI validation context: '
+            + result.stderr.strip())
     return {'candidate': env['GITHUB_SHA'], 'runId': env['GITHUB_RUN_ID'], 'attempt': env['GITHUB_RUN_ATTEMPT']}
 
 

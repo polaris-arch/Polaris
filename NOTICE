@@ -40,8 +40,9 @@ next to this file as LICENSE.
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
 桌面随包 sing-box 的上游基线、修复版本与固定fork来源记录在
-`src-tauri/core-manifest.json` 的 `desktopSourceBuild`，对应源码记录在
-`scripts/desktop-core/source-manifest.json`；四平台共同消费该固定提交，不重放App补丁。
+`src-tauri/core-manifest.json` 的 `desktopRelease`，消费合同固定在
+`scripts/desktop-core/release-contract.json`；对应源码由公开资产 index 的
+`sourceDelivery` 指向固定公开来源。四平台共同消费已发布原包，不重放App补丁。
 Android/iOS继续消费旧 `bundledCoreVersion` / `sourceBuild` 和各自源码manifest，
 移动端对应源码及补丁获取位置为上述固定manifest与随仓补丁目录。
 上面写死的版本、来源及摘要由 `scripts/verify-packaging.mjs confs` 按各组件独立段核验。
@@ -128,12 +129,19 @@ App 原生加载、功能与最终 carrier 验收另行记录，不由源码指�
 **对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
 https://github.com/polaris-arch/Polaris
 
-The desktop DNS source is the fixed fork commit and role tag linked above.
-Final native kernels, signatures, source archives and per-library Cronet notices
-and corresponding-source inventory remain pending; production admission stays closed. Desktop fixes are
-already included in that source; the App replays no shared patches or additional
-Windows overlay. Use scripts/desktop-core/source-manifest.json and the fork's
-fixed go.mod / go.sum to obtain and verify the build inputs.
+Desktop release: 1.15.0-alpha.12.polaris.1 — https://github.com/polaris-arch/polaris-box/releases/tag/v1.15.0-alpha.12.polaris.1
+Desktop source: https://github.com/polaris-arch/polaris-box/tree/05221db98e08562b5c1a21bc242d245b144ac2d2
+Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 e5306f2e1ff32f9895cc245c6a71115bcb40e176088a268519e0e891bb8bb08f)
+Published asset index SHA-256: eeafe44a18bf97fc7764ccaab84ec15c4d59a1d1ef737c4819398f42781da683
+Desktop selection uses src-tauri/core-manifest.json desktopRelease. The public
+asset index sourceDelivery identifies the automatic product source archive,
+fixed Go module ZIP URLs/versions/h1/hashes, Cronet driver and exact Naive
+submodule, Go distribution source and recovery instructions. It replaces the
+extra source.tar.gz asset and supersedes the old source-asset pointers retained
+in original package receipts. The App preserves the published native bytes and
+per-library notices, and replays no shared patches or Windows overlay.
+Original signature observations do not establish signature trust. Actual App
+loading, functionality and final carrier acceptance remain separate gates.
 Android keeps its old baseline and the source-manifest.json, patches and build
 instructions in the fixed Android patch directory. Apple keeps its independent
 old manifest, patches and build instructions in the fixed Apple patch directory.

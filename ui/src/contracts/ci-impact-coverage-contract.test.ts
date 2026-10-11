@@ -324,7 +324,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
         ).toBe(false);
       }
       for (const match of source.matchAll(
-        /(?:^|[\s;&|(`])(?:node|sh|bash)\s+(?:--test\s+)?(scripts\/[A-Za-z0-9._-]+)/g,
+        /(?:^|[\s;&|(`])(?:node|sh|bash)\s+(?:--test\s+)?(scripts\/[A-Za-z0-9._/-]+)/g,
       )) {
         invoked.push([match[1], workflow]);
       }
@@ -338,6 +338,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'scripts/build-android-apk.sh',
       'scripts/build-libbox.sh',
       'scripts/classify-ci-impact.mjs',
+      'scripts/desktop-core/validation-origin.mjs',
       'scripts/fetch-core.mjs',
       'scripts/fetch-cronet.mjs',
       'scripts/fetch-dashboard.mjs',

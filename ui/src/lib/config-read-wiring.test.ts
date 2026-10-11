@@ -210,6 +210,12 @@ interface Site {
 
 const SITES: readonly Site[] = [
   {
+    file: 'store/app-store.ts',
+    shape: 'useAppStore.subscribe((state,previous)=>{if(state.config!==p…',
+    route: 'disk',
+    why: '对账类：所有完整磁盘配置发布使较早读取代次失效；引用比较只驱动排序，不显示或修改暂存配置',
+  },
+  {
     file: 'mobile/SavedAutoSelectControls.tsx',
     shape: 'useAppStore(state=>state.config)',
     route: 'disk',

@@ -405,6 +405,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
     const native = {
       ...base, POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
+      POLARIS_NO_KERNEL_RUN: '0', GITHUB_SHA: candidate, GITHUB_RUN_ID: '12', GITHUB_RUN_ATTEMPT: '3',
       GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REF: ref,
       GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}`,
       PLATFORMS_JSON: '["linux","windows"]', VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true',
@@ -425,7 +426,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       ['native previous attempt', { CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-2` }, 1],
     ];
     for (const [name, changed, status] of nativeCases) {
-      const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...native, ...changed }, encoding: 'utf8' });
+      const result = spawnSync('bash', ['-c', script], { cwd: REPO_ROOT, env: { ...process.env, ...native, ...changed }, encoding: 'utf8' });
       expect(result.status, `${name}: ${result.stderr}`).toBe(status);
     }
   });

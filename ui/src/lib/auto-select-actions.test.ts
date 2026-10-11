@@ -4,6 +4,7 @@ import type { AutoSelectReceipt } from '@/contracts/auto-select';
 import { statusFixture } from '@/contracts/auto-select-status.test-support';
 import { autoSelectActionFeedback, autoSelectContext, autoSelectErrorFeedback, runAutoSelectAction } from './auto-select-actions';
 import { withConfigWriteLock } from './config-write-lock';
+import { configReadGeneration } from './config-read-generation';
 const native = vi.hoisted(() => ({ server: { autoSelectEnable: vi.fn(), autoSelectSwitchNow: vi.fn(), switch: vi.fn() }, config: { get: vi.fn() } }));
 vi.mock('@/ipc', () => ({ api: native }));
 const t = (key: string, vars?: Readonly<Record<string, string | number>>) => key + (vars ? JSON.stringify(vars) : '');
@@ -48,10 +49,21 @@ describe('authoritative Auto selection actions', () => {
   });
   it('a late readback cannot overwrite a newer saved selection', async () => {
     const accept = vi.fn();
-    const result = await runAutoSelectAction({ kind: 'enable', subscriptionId: 'sub-a' }, accept, () => true, () => false);
+    native.config.get.mockImplementation(async () => { configReadGeneration.published(); return config(); });
+    const result = await runAutoSelectAction({ kind: 'enable', subscriptionId: 'sub-a' }, accept);
     expect(result).toBeNull();
     expect(native.server.autoSelectEnable).toHaveBeenCalledTimes(1);
     expect(native.config.get).toHaveBeenCalledTimes(1);
+    expect(accept).not.toHaveBeenCalled();
+  });
+  for (const fails of [false, true]) it(`a newer whole-config read supersedes a late ${fails ? 'failed' : 'successful'} action read`, async () => {
+    const accept = vi.fn();
+    native.config.get.mockImplementation(async () => {
+      configReadGeneration.beginRead();
+      if (fails) throw Error('old read failed');
+      return config();
+    });
+    expect(await runAutoSelectAction({ kind: 'switchNow' }, accept)).toBeNull();
     expect(accept).not.toHaveBeenCalled();
   });
   it('queued work cancels synchronously after a preceding selection change', async () => {

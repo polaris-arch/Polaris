@@ -139,6 +139,17 @@ jobs:
       full: ${{ steps.resolve.outputs.full }}
       candidate: ${{ steps.resolve.outputs.candidate }}
     steps:
+      - uses: actions/checkout@v7
+        if: inputs.native_validation
+        with:
+          ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: inputs.native_validation
+        with:
+          node-version: '26'
+
       # ══════════════════════════════════════════════════════════════════════════════
       # ↓↓↓ 以下整段原在 jobs.package.strategy.matrix.include 上方，随**数据本体**原样搬来。
       #     它记的是矩阵每个字段为什么长这样，跟着数据走才不会被下一个人重新踩。
@@ -197,11 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
-            [ "$GITHUB_ACTIONS" = true ]
-            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
-            [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ]
-            [ "$GITHUB_REF" = refs/heads/collab/fk02-native-payload-validation-20261010 ]
-            [ "$GITHUB_WORKFLOW_REF" = "polaris-arch/Polaris/.github/workflows/release-risk.yml@$GITHUB_REF" ]
+            node scripts/desktop-core/validation-origin.mjs "$CORE_CANDIDATE"
             [ "$PLATFORMS_JSON" = '["linux","windows"]' ]
             [ -n "$CORE_BUNDLE_ARTIFACT" ]
             [ "$VALIDATION_KERNEL" = true ]

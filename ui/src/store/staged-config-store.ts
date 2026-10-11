@@ -511,7 +511,7 @@ function consumeCleanExitFlag(): Promise<void> {
  * 放在这里而不是让 app-store 直接 `getState().hydrate(...)`：调用点只该知道「有份新 config 到了」，
  * 不该知道暂存层的开关与恢复语义（现在还多了一条「恢复前要先问后端上次怎么退的」）。
  */
-export function hydrateStagedConfig(config: UserConfig): Promise<void> {
+export function hydrateStagedConfig(config: UserConfig, isCurrent: () => boolean = () => true): Promise<void> {
   // 判据取 **store 的 `enabled`** 而非编译期常量：`stage`/`revert`/`reset`/`editRoute` 判的都是前者，
   // 两处不同源会造出一个「半开」态 —— 谁在运行期把 `enabled` 置 true（文档明说该字段就是为了让单测
   // 两侧都跑到），hydrate 却因常量为 false 永不执行 ⇒ `baseVersion` 恒 null ⇒ `persist()` 走
@@ -522,9 +522,11 @@ export function hydrateStagedConfig(config: UserConfig): Promise<void> {
   // 已 hydrate 过 ⇒ 同步快路径。这条腿只跟盘刷 `baseVersion`/`baseline`，**不读存储**，
   // 与「上次怎么退的」无关；配置变更事件走的全是这条，不该为它多绕一个微任务。
   if (store.hydrated) {
-    store.hydrate(config);
+    if (isCurrent()) store.hydrate(config);
     return Promise.resolve();
   }
   // 首次恢复**必须**排在标记消费之后：反过来的话条目已经进内存，事后再清存储也追不回来。
-  return consumeCleanExitFlag().then(() => useStagedConfigStore.getState().hydrate(config));
+  return consumeCleanExitFlag().then(() => {
+    if (isCurrent()) useStagedConfigStore.getState().hydrate(config);
+  });
 }

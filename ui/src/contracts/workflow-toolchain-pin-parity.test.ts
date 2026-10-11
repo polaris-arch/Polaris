@@ -45,8 +45,10 @@ const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as
  *   · ci.yml 1 → 3：串行单 job 拆成 lint / cross / test 三个并行 job；
  *   · package.yml 3 → 4：新增 core_wire job（wire 契约从每条打包腿各跑一次收成只跑一次）。
  */
+// Strict native Package setup also checks out the exact candidate and uses Node 26
+// to validate its published contract before admitting the matrix.
 const NODE_JOBS = [
-  ['ci.yml', 3], ['ui.yml', 1], ['package.yml', 4], ['release-risk.yml', 3],
+  ['ci.yml', 3], ['ui.yml', 1], ['package.yml', 5], ['release-risk.yml', 3],
 ] as const;
 const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
 

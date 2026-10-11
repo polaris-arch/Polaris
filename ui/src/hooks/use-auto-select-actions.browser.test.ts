@@ -31,9 +31,15 @@ let disk={selectedServerId:'node-a',proxyMode:'smart',proxyModeType:'manual',ser
 if(params.get('auto')==='1')disk.selectionIntent={mode:'auto',scope:'subscription',subscriptionId:'sub-a'};
 let status={...initial,intent:disk.selectionIntent?initial.intent:{mode:'manual',scope:null,subscriptionId:null}};
 let id=0;const handlers=new Map(),listeners=[];
-const jobs=[];let app;
-const f=window.__actions={calls:[],reads:0,jobs,messages:[],readFail:false,hold:false,
+const jobs=[],readJobs=[];let app;
+const f=window.__actions={calls:[],reads:0,jobs,readJobs,messages:[],readFail:false,hold:false,
  state:()=>structuredClone(useAppStore.getState().config),saved:()=>structuredClone(disk),
+ // Observe the full config prop of each production control, including Tray's
+ // private state. Only native IPC is replaced; components/stores remain real.
+ displayed(){const el=document.querySelector('[data-auto-select-controls]');let fiber=el?.[Object.keys(el).find(k=>k.startsWith('__reactFiber$'))];while(fiber){if(fiber.memoizedProps?.config)return structuredClone(fiber.memoizedProps.config);fiber=fiber.return;}return null;},
+ changeDisk(patch){disk={...disk,...patch};},
+ refresh(){if(surface==='tray'){for(const l of listeners)if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:undefined});}else f.refreshPending=useAppStore.getState().loadConfig(true);},
+ loading:()=>useAppStore.getState().configLoading,
  event(patch){status={...status,...patch};for(const l of listeners)if(l.event===C.EVENT_AUTO_SELECT_STATUS)handlers.get(l.handler)?.({payload:structuredClone(status)});},
  publish(patch){disk={...disk,...patch};useAppStore.setState({config:structuredClone(disk),servers:disk.servers,selectedServerId:disk.selectedServerId});for(const l of listeners)if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:undefined});},
  manual(){delete disk.selectionIntent;f.publish({selectedServerId:'node-b'});},
@@ -55,7 +61,7 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
   if(cmd==='plugin:event|listen'){const key=++id;listeners.push({id:key,event:args.event,handler:args.handler});return Promise.resolve(key);}
   if(cmd==='plugin:event|unlisten')return Promise.resolve();
   if([C.AUTO_SELECT_ENABLE,C.AUTO_SELECT_SWITCH_NOW,C.SERVER_SWITCH].includes(cmd)){f.calls.push({cmd,args});return new Promise(resolve=>{jobs.push({cmd,args,resolve});if(!f.hold)f.finish(jobs.length-1);});}
-  if(cmd===C.CONFIG_GET){f.reads++;if(f.delayNextRead){f.delayNextRead=false;const captured=structuredClone(disk);return new Promise(resolve=>{f.releaseRead=()=>resolve({success:true,data:captured});});}return f.readFail?Promise.reject(Error('saved readback failed')):Promise.resolve({success:true,data:structuredClone(disk)});}
+  if(cmd===C.CONFIG_GET){f.reads++;if(f.delayNextRead){f.delayNextRead=false;const captured=structuredClone(disk);return new Promise(resolve=>{const release=()=>resolve({success:true,data:captured});f.releaseRead=release;readJobs.push({captured,release});});}return f.readFail?Promise.reject(Error('saved readback failed')):Promise.resolve({success:true,data:structuredClone(disk)});}
   if(cmd===C.AUTO_SELECT_STATUS)return Promise.resolve({success:true,data:structuredClone(status)});
   if(cmd===C.PROXY_GET_STATUS)return Promise.resolve({success:true,data:{running:false,starting:false}});
   if(cmd===C.PROXY_GET_PENDING_CHANGES)return Promise.resolve({success:true,data:{needsRestart:false,fields:[],scopes:[]}});
@@ -194,6 +200,31 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
     expect((await state(page)).config.selectionIntent).toBeUndefined();
     expect((await state(page)).config.selectedServerId).toBe('node-b');
     expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
+   }finally{await page.close();}
+  });
+  for(const refreshPending of [false,true])it(`${surface}: same-selection newer ${refreshPending?'in-flight refresh':'published whole config'} survives old CONFIG_GET`,async()=>{
+   const page=await open(surface,true);try{
+    await page.evaluate(()=>{const f=(window as any).__actions;f.hold=true;f.delayNextRead=true;});
+    await controls(page).locator('[data-exit-write="auto-select-now"]').click();
+    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
+    await page.evaluate(()=> (window as any).__actions.finish());
+    await expect.poll(()=>page.evaluate(()=> (window as any).__actions.readJobs.length)).toBe(1);
+    const patch={servers:[{id:'node-a',name:'New Server C2',protocol:'socks',address:'new.invalid',port:2,subscriptionId:'sub-a'}],subscriptions:[{id:'sub-a',name:'New Subscription C2',url:'https://new.invalid'}],trafficRules:[{id:'rule-c2',name:'New Rule C2',action:'direct'}]};
+    await page.evaluate(({patch,refreshPending})=>{const f=(window as any).__actions;if(refreshPending){f.changeDisk(patch);f.delayNextRead=true;f.refresh();}else f.publish(patch);},{patch,refreshPending});
+    if(refreshPending)await expect.poll(()=>page.evaluate(()=> (window as any).__actions.readJobs.length)).toBe(2);
+    else await expect.poll(()=>page.evaluate(()=> (window as any).__actions.displayed()?.servers[0]?.name)).toBe('New Server C2');
+    await page.evaluate(()=> (window as any).__actions.readJobs[0].release());
+    await expect.poll(()=>controls(page).getAttribute('aria-busy')).toBe('false');
+    expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
+    if(refreshPending){
+     if(surface!=='tray')expect(await page.evaluate(()=> (window as any).__actions.loading())).toBe(true);
+     await page.evaluate(()=> (window as any).__actions.readJobs[1].release());
+    }
+    await expect.poll(()=>page.evaluate(()=> (window as any).__actions.displayed()?.servers[0]?.name)).toBe('New Server C2');
+    const shown=await page.evaluate(()=> (window as any).__actions.displayed());
+    expect(shown.subscriptions).toEqual(patch.subscriptions);expect(shown.trafficRules).toEqual(patch.trafficRules);
+    expect(shown.selectedServerId).toBe('node-a');expect(shown.selectionIntent.subscriptionId).toBe('sub-a');
+    if(surface!=='tray')await expect.poll(()=>page.evaluate(()=> (window as any).__actions.loading())).toBe(false);
    }finally{await page.close();}
   });
   it(`${surface}: an unmounted action reads authoritative truth without emitting stale feedback`,async()=>{

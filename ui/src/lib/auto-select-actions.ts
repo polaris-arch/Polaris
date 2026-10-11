@@ -3,6 +3,7 @@ import type { ServerSwitchReceipt } from '@/contracts/server-switch';
 import type { UserConfig } from '@/contracts/types';
 import { api } from '@/ipc';
 import { withConfigWriteLock } from './config-write-lock';
+import { configReadGeneration } from './config-read-generation';
 
 export type AutoSelectT = (key: string, vars?: Readonly<Record<string, string | number>>) => string;
 export type AutoSelectAction = { kind: 'enable'; subscriptionId: string } | { kind: 'switchNow' } | { kind: 'manual'; serverId: string };
@@ -18,7 +19,7 @@ export function autoSelectContext(config: UserConfig | null): string {
  * The existing webview queue also orders these operations against explicit manual choices.
  * beforeStart cancels queued work after navigation or a newer selection; it cannot cancel native IPC.
  */
-export function runAutoSelectAction(action: AutoSelectAction, accept: (config: UserConfig) => void | Promise<void>, beforeStart: () => boolean = () => true, mayAccept: (config: UserConfig) => boolean = () => true): Promise<AutoSelectActionResult | null> {
+export function runAutoSelectAction(action: AutoSelectAction, accept: (config: UserConfig) => void | Promise<void>, beforeStart: () => boolean = () => true): Promise<AutoSelectActionResult | null> {
   return withConfigWriteLock(async () => {
     if (!beforeStart()) return null;
     let receipt: AutoSelectReceipt | ServerSwitchReceipt | undefined;
@@ -28,11 +29,15 @@ export function runAutoSelectAction(action: AutoSelectAction, accept: (config: U
         : action.kind === 'switchNow' ? await api.server.autoSelectSwitchNow()
         : await api.server.switch(action.serverId);
     } catch (error) { failure = error; }
+    const readGeneration = configReadGeneration.beginRead();
     let config: UserConfig;
     try { config = await api.config.get(); }
-    catch (error) { throw Object.assign(new Error('AUTO_SELECT_READBACK_FAILED'), { code: 'AUTO_SELECT_READBACK_FAILED', cause: error, commandFailure: failure }); }
-    // A snapshot captured before a newer selection must not overwrite that selection.
-    if (!mayAccept(config)) return null;
+    catch (error) {
+      if (!configReadGeneration.isCurrent(readGeneration)) return null;
+      throw Object.assign(new Error('AUTO_SELECT_READBACK_FAILED'), { code: 'AUTO_SELECT_READBACK_FAILED', cause: error, commandFailure: failure });
+    }
+    // A newer whole-config publication or read supersedes this snapshot.
+    if (!configReadGeneration.isCurrent(readGeneration)) return null;
     try { await accept(config); }
     catch (error) { throw Object.assign(new Error('AUTO_SELECT_ADOPTION_FAILED'), { code: 'AUTO_SELECT_READBACK_FAILED', cause: error, commandFailure: failure, savedContext: autoSelectContext(config) }); }
     if (failure !== undefined) {

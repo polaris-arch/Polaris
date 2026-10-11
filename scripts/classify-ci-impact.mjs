@@ -279,6 +279,11 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     why: '同上（mac 两条腿成对验证）。',
   },
   // ── resources/：随包资源载荷树（2026-08-30 纳入登记根）──
+  'resources/.release-receipts/': {
+    kernel: true,
+    platforms: ALL,
+    why: '公开 release 消费的构建期原包、合同与 readback 收据；虽不直接入包，随核核验读取其绑定，变化必须触发四桌面打包门。',
+  },
   'resources/data/': {
     kernel: true,
     platforms: ALL,

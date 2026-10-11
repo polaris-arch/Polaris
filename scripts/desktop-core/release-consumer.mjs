@@ -201,6 +201,21 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
     `源码 tree：${contract.sourceTree}`, `固定消费标签：https://github.com/${REPO}/tree/${contract.tag}`,
     `消费标签对象：${contract.tagObject}`, `消费合同 SHA-256：${manifest.desktopRelease.contractSha256}`,
     `公开资产 index SHA-256：${contract.assetIndex.sha256}`, `桌面发布：https://github.com/${REPO}/releases/tag/${contract.tag}`]) exact(desktop, text);
+  // Source guidance is bilingual. Reject contradictory legacy desktop guidance
+  // anywhere in NOTICE, while preserving the independent mobile manifests.
+  for (const text of [`Desktop release: ${contract.version} — https://github.com/${REPO}/releases/tag/${contract.tag}`,
+    `Desktop source: https://github.com/${REPO}/tree/${contract.sourceCommit}`,
+    `Desktop release contract: ${CONTRACT_PATH} (SHA-256 ${manifest.desktopRelease.contractSha256})`,
+    `Published asset index SHA-256: ${contract.assetIndex.sha256}`]) {
+    const label = text.slice(0, text.indexOf(':') + 1), lines = notice.split(/\r?\n/);
+    demand(lines.filter((line) => line.startsWith(label)).length === 1 && lines.includes(text), 'NOTICE: English release identity differs');
+  }
+  demand(notice.includes('`src-tauri/core-manifest.json` 的 `desktopRelease`')
+    && notice.includes('`sourceDelivery` 指向固定公开来源。')
+    && notice.includes('Desktop selection uses src-tauri/core-manifest.json desktopRelease.')
+    && notice.includes('asset index sourceDelivery identifies the automatic product source archive,'), 'NOTICE: bilingual release source guidance missing');
+  demand(!/desktopSourceBuild|scripts\/desktop-core\/source-manifest\.json|desktop[^\n]*alpha\.11|Final native kernels, signatures, source archives/i.test(notice),
+    'NOTICE: obsolete desktop source guidance');
   for (const [label, source] of [['Android libbox 基线', mobile.android], ['Apple libbox 基线', mobile.apple]]) {
     demand(hex(source?.sourceCommit, 40) && hex(source?.manifestSha256, 64), 'NOTICE: mobile source identity missing');
     const lines = section(label);

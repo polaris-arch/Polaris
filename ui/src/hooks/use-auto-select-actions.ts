@@ -1,6 +1,7 @@
 import type { AutoSelectT } from '@/lib/auto-select-actions';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { UserConfig } from '@/contracts/types';
+import { configReadGeneration } from '@/lib/config-read-generation';
 import { autoSelectActionFeedback, autoSelectContext, autoSelectErrorFeedback, runAutoSelectAction, type AutoSelectAction, type AutoSelectActionFeedback } from '@/lib/auto-select-actions';
 
 export function useAutoSelectActions(config: UserConfig | null, accept: (config: UserConfig) => void | Promise<void>, t: AutoSelectT, getCurrentConfig?: () => UserConfig | null) {
@@ -18,7 +19,8 @@ export function useAutoSelectActions(config: UserConfig | null, accept: (config:
     const generation = lifetime.current.generation;
     const alive = () => lifetime.current.alive && lifetime.current.generation === generation;
     const origin = context;
-    void runAutoSelectAction(action, accept, () => alive() && currentContext() === origin, saved => currentContext() === origin || currentContext() === autoSelectContext(saved)).then(result => {
+    const queuedGeneration = configReadGeneration.current();
+    void runAutoSelectAction(action, accept, () => alive() && configReadGeneration.isCurrent(queuedGeneration)).then(result => {
       if (!result || !alive()) return;
       const saved = autoSelectContext(result.config);
       if (currentContext() !== origin && currentContext() !== saved) return;

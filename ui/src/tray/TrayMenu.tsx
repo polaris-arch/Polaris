@@ -1,5 +1,6 @@
 import { autoSelectT } from './auto-select-labels';
 import { AutoSelectControls } from '@/mobile/AutoSelectControls';
+import { configReadGeneration } from '@/lib/config-read-generation';
 /**
  * 托盘自绘浮层 UI（原型 `.tray-menu` L2905-2963 移植）——**真实接线，无假 UI**。
  *
@@ -140,6 +141,7 @@ export default function TrayMenu() {
   const [config, setConfigState] = useState<UserConfig | null>(null);
   const configRef = useRef<UserConfig | null>(null);
   const setConfig = useCallback((saved: UserConfig | null) => {
+    configReadGeneration.published();
     configRef.current = saved;
     setConfigState(saved);
   }, []);
@@ -260,6 +262,7 @@ export default function TrayMenu() {
   }, []);
 
   const hydrate = useCallback(async () => {
+    const readGeneration = configReadGeneration.beginRead();
     // 出口 IP 那腿要按连接态分叉取值（见下），而 status 的作用域收在上面那个 try 里 ⇒ 提一个本地变量。
     // 读取失败时保持 false（= 未连接），与该 catch 的「保持空态」一致，绝不乐观假定已连接。
     let connected = false;
@@ -268,6 +271,7 @@ export default function TrayMenu() {
         api.config.get(),
         api.proxy.getStatus(),
       ]);
+      if (!configReadGeneration.isCurrent(readGeneration)) return;
       connected = status.running;
       setConfig(cfg);
       setServers(cfg.servers ?? []);
@@ -559,10 +563,12 @@ export default function TrayMenu() {
 
   const switchExit = async (id: string, node: string) => {
     try {
-      const { receipt, saved } = await withConfigWriteLock(async () => {
+      const { receipt, saved, readGeneration } = await withConfigWriteLock(async () => {
         const receipt = await api.server.switch(id);
-        return { receipt, saved: await api.config.get() };
+        const readGeneration = configReadGeneration.beginRead();
+        return { receipt, saved: await api.config.get(), readGeneration };
       });
+      if (!configReadGeneration.isCurrent(readGeneration)) return;
       setConfig(saved);
       setSelectedId(saved.selectedServerId);
       const feedback = traySwitchFeedback(receipt, node, t);

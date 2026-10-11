@@ -424,7 +424,20 @@ test('release notice identities are section-local and independent from mobile; o
       '上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8',
       `固定源码：https://github.com/SagerNet/sing-box/tree/${row.sourceCommit}`, `source manifest SHA-256：${row.manifestSha256}`];
   });
-  const notice = [...desktop, ...blocks].join('\n'); validateReleaseNotice(notice, f.manifest, f.contract, mobile);
+  const guidance = ['`src-tauri/core-manifest.json` 的 `desktopRelease`', '`sourceDelivery` 指向固定公开来源。',
+    `Desktop release: ${version} — https://github.com/polaris-arch/polaris-box/releases/tag/${tag}`,
+    `Desktop source: https://github.com/polaris-arch/polaris-box/tree/${commit}`,
+    `Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 ${f.manifest.desktopRelease.contractSha256})`,
+    `Published asset index SHA-256: ${f.contract.assetIndex.sha256}`,
+    'Desktop selection uses src-tauri/core-manifest.json desktopRelease.',
+    'asset index sourceDelivery identifies the automatic product source archive,'];
+  const notice = [...desktop, ...blocks, ...guidance].join('\n'); validateReleaseNotice(notice, f.manifest, f.contract, mobile);
+  for (const line of guidance) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
+  for (const stale of ['desktopSourceBuild', 'scripts/desktop-core/source-manifest.json', 'Desktop v1.15.0-alpha.11',
+    'Final native kernels, signatures, source archives remain pending']) {
+    assert.throws(() => validateReleaseNotice(notice + '\n' + stale, f.manifest, f.contract, mobile), /obsolete desktop/);
+  }
+  assert.throws(() => validateReleaseNotice(notice.replace(guidance[2], guidance[2] + '\n' + guidance[2]), f.manifest, f.contract, mobile));
   for (const line of desktop.slice(1)) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
   assert.throws(() => validateReleaseNotice(notice.replace('v1.15.0-alpha.8', 'v1.15.0-alpha.12'), f.manifest, f.contract, mobile));
   assert.throws(() => validateReleaseNotice(notice.replace(desktop[1], desktop[1] + '\n' + desktop[1]), f.manifest, f.contract, mobile));
@@ -471,6 +484,39 @@ test('cumulative strict Risk accepts only the verified published selection and e
     GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
     GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/release-risk.yml@${ref}` };
   assert.deepEqual(validationContext(candidate, env, f.root), { runId: '900', attempt: '1' });
+  // Execute the actual Package Bash prefix and actual Python admission. These
+  // fixtures never run a kernel, loader, installer or network request.
+  copyFileSync(join(repo, 'scripts/desktop-core/validation-origin.mjs'), join(f.root, 'scripts/desktop-core/validation-origin.mjs'));
+  const workflow = readFileSync(join(repo, '.github/workflows/package.yml'), 'utf8');
+  const body = workflow.match(/      - name: Resolve platform matrix[\s\S]*?        run: \|\n([\s\S]*?)          # 全量矩阵/)[1];
+  const bash = body.split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n');
+  const setupEnv = { ...process.env, ...env, POLARIS_NO_KERNEL_RUN: '0', CORE_CANDIDATE: candidate,
+    EXPECTED_CANDIDATE: candidate, PLATFORMS_JSON: '["linux","windows"]',
+    CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-900-1`, CORE_RUN_ID: '900', CORE_RUN_ATTEMPT: '1',
+    VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true', VALIDATION_LIGHT: 'false', VALIDATION_SKIP_QUALITY: 'true' };
+  const runBash = (changes = {}) => spawnSync('bash', ['-c', bash], { cwd: f.root, env: { ...setupEnv, ...changes }, encoding: 'utf8' });
+  const python = `import importlib.util,json,sys
+spec=importlib.util.spec_from_file_location('native',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+print(json.dumps(m.ci_context('linux',json.loads(sys.argv[2]),'Linux','amd64',root=sys.argv[3])))`;
+  const runPython = (changes = {}) => spawnSync(PYTHON, ['-B', '-c', python,
+    join(repo, 'scripts/native-payload-proof.py'), JSON.stringify({ ...env, ...changes }), f.root], { encoding: 'utf8' });
+  for (const run of [runBash, runPython]) {
+    let result = run(); assert.equal(result.status, 0, result.stdout + result.stderr);
+    for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
+      { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' }, { GITHUB_REF: 'refs/heads/main' },
+      { GITHUB_REF: 'refs/tags/v1' }, { GITHUB_SHA: 'invalid' }, { GITHUB_RUN_ID: '0' }, { GITHUB_RUN_ATTEMPT: '0' },
+      { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}` }, { POLARIS_NO_KERNEL_RUN: '1' }]) {
+      // Native-validation=false is ordinary Package setup, so admission is not
+      // invoked there; Python must still reject it.
+      if (run === runBash && change.POLARIS_NATIVE_PAYLOAD_VALIDATION === '0') continue;
+      assert.notEqual(run(change).status, 0, JSON.stringify(change));
+    }
+  }
+  for (const change of [{ CORE_CANDIDATE: '0'.repeat(40) }, { EXPECTED_CANDIDATE: '0'.repeat(40) },
+    { CORE_BUNDLE_ARTIFACT: 'desktop-core-bundle-wrong' }, { CORE_RUN_ID: '901' }, { CORE_RUN_ATTEMPT: '2' },
+    { PLATFORMS_JSON: '["linux"]' }, { VALIDATION_KERNEL: 'false' }, { VALIDATION_UPLOAD: 'false' },
+    { VALIDATION_LIGHT: 'true' }, { VALIDATION_SKIP_QUALITY: 'false' }]) assert.notEqual(runBash(change).status, 0, JSON.stringify(change));
+
   for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
     { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' },
     { GITHUB_REF: 'refs/heads/main' }, { GITHUB_SHA: '0'.repeat(40) },
@@ -482,11 +528,13 @@ test('cumulative strict Risk accepts only the verified published selection and e
   const path = join(f.root, f.manifest.desktopRelease.contractPath), original = readFileSync(path);
   write(path, Buffer.concat([original, Buffer.from(' ')]));
   assert.throws(() => validationContext(candidate, env, f.root), /SHA|hash|differs/i);
+  assert.notEqual(runBash().status, 0); assert.notEqual(runPython().status, 0);
   write(path, original);
   const manifestPath = join(f.root, 'src-tauri/core-manifest.json');
   const sourceOnly = structuredClone(f.manifest); delete sourceOnly.desktopRelease;
   write(manifestPath, encode(sourceOnly));
   assert.throws(() => validationContext(candidate, env, f.root));
+  assert.notEqual(runBash().status, 0); assert.notEqual(runPython().status, 0);
 }));
 
 
