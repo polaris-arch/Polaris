@@ -98,7 +98,7 @@ def windows_signature(path):
 def nsis_install(artifact, destination, root):
     ci_context('win')
     require(not destination.exists() and destination.parent.is_dir(), 'NSIS requires new isolated prefix')
-    conf = json.loads((root / 'src-tauri/tauri.conf.json').read_text())
+    conf = json.loads((root / 'src-tauri/tauri.conf.json').read_text(encoding='utf-8'))
     require(conf['bundle']['windows']['nsis']['installMode'] == 'currentUser'
             and conf['bundle']['windows']['certificateThumbprint'] is None, 'reviewed NSIS install/signature policy differs')
     # Disposable runner preconditions prevent an old installation/update/uninstall path.
@@ -147,7 +147,7 @@ def final_proof(root, key, artifact, kind, output):
                   'relativeCore': str(core.relative_to(destination)), 'relativeLibrary': str(library.relative_to(destination)),
                   'native': native_proof, 'macFinalSignatureAcceptance': 'not observed by Linux/Windows batch',
                   'deviceAcceptance': 'not observed'}
-        output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(result, indent=2) + '\n')
+        output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
     # Temporary files removed directly. The uninstaller is never executed.
     return result
 

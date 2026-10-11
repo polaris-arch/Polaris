@@ -30,6 +30,48 @@ ENV = {'POLARIS_NATIVE_PAYLOAD_VALIDATION': '1', 'GITHUB_ACTIONS': 'true', 'GITH
 
 
 class NativeContract(unittest.TestCase):
+    def test_nsis_policy_reads_utf8_with_windows_legacy_default_before_native_actions(self):
+        raw = (ROOT / 'src-tauri/tauri.conf.json').read_bytes()
+        # The actual repository config contains Chinese text that CP1252 rejects.
+        with self.assertRaises(UnicodeDecodeError): raw.decode('cp1252')
+        original_read_text = Path.read_text
+
+        def windows_default_read_text(path, encoding=None, errors=None, **kwargs):
+            # Simulate the Windows default at the public text-read boundary.
+            # Path.read_text may resolve None before calling Path.open.
+            effective = 'cp1252' if encoding is None else encoding
+            return original_read_text(path, encoding=effective, errors=errors, **kwargs)
+
+        class GuardReached(Exception): pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'src-tauri').mkdir()
+            config = root / 'src-tauri/tauri.conf.json'
+            config.write_bytes(raw)
+            with patch.object(Path, 'read_text', windows_default_read_text), \
+                    patch.object(final, 'ci_context', return_value={}), \
+                    patch.object(final, 'pwsh', side_effect=GuardReached) as guard, \
+                    patch.object(final.subprocess, 'run', side_effect=AssertionError('installer must not run')) as installer:
+                with self.assertRaises(GuardReached):
+                    final.nsis_install(root / 'inert.exe', root / 'payload', root)
+                guard.assert_called_once(); installer.assert_not_called()
+                # Explicit UTF-8 must retain both reviewed install/signature policy checks.
+                for field, value in [('installMode', 'perMachine'), ('certificateThumbprint', 'unreviewed')]:
+                    bad = json.loads(raw.decode('utf-8'))
+                    if field == 'installMode': bad['bundle']['windows']['nsis'][field] = value
+                    else: bad['bundle']['windows'][field] = value
+                    config.write_bytes(json.dumps(bad, ensure_ascii=False).encode('utf-8'))
+                    guard.reset_mock()
+                    with self.assertRaisesRegex(ValueError, 'install/signature policy differs'):
+                        final.nsis_install(root / 'inert.exe', root / 'payload', root)
+                    guard.assert_not_called(); installer.assert_not_called()
+                # UTF-8 remains strict: invalid input must stop before any native action.
+                config.write_bytes(raw + b'\xff')
+                guard.reset_mock()
+                with self.assertRaises(UnicodeDecodeError):
+                    final.nsis_install(root / 'inert.exe', root / 'payload', root)
+                guard.assert_not_called(); installer.assert_not_called()
+
     def test_signature_uses_fixed_file_and_literal_path_argv(self):
         path = r'C:\inert payload with spaces\unsigned payload.exe'
         with patch.object(native.subprocess, 'check_output', return_value=b'{"status":"NotSigned","signerThumbprint":null}') as call:
