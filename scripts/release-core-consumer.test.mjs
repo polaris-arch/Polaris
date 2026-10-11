@@ -6,5 +6,5 @@ import test from 'node:test';
 
 test('native ZIP/tar safety boundary rejects private adversarial archive fixtures', () => {
   execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B',
-    fileURLToPath(new URL('./desktop-core/test_release_archive.py', import.meta.url))], { stdio: 'pipe' });
+    fileURLToPath(new URL('./desktop-core/test-release-archive.py', import.meta.url))], { stdio: 'pipe' });
 });
