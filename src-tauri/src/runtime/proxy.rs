@@ -48,6 +48,7 @@ mod login_fallback;
 mod management_api;
 // S4 journal, artifact, and guarded CAS contract. The managed coordinator is
 // deliberately not wired until core ownership and platform receipts exist.
+pub(crate) mod coex_observer;
 #[allow(dead_code)]
 pub(crate) mod mesh_apply;
 mod mesh_route_report;
@@ -792,6 +793,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法无需动 lib.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
 
+    fn emit_coex_state(&self, _state: serde_json::Value) {}
+
     /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
     ///
     /// canary 探针结果变化（起核 / 停核 / 网络变化 / 周期探测翻转）时发；渲染端收到即重拉
@@ -1021,6 +1024,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             &self.app,
             crate::events::channel::EVENT_PROXY_PENDING_CHANGES,
             summary,
+        );
+    }
+
+    fn emit_coex_state(&self, state: serde_json::Value) {
+        crate::events::emit_to_main(
+            &self.app,
+            crate::events::channel::EVENT_COEX_RUNTIME_STATE,
+            state,
         );
     }
 
@@ -1595,6 +1606,7 @@ pub struct ProxyRuntime {
     /// 网络代次：每处置一次去抖后的网络变化自增一次（见 `network_monitor`）。
     /// 只读面是 [`Self::network_epoch`]。
     network_epoch: AtomicU64,
+    coex: Arc<coex_observer::Observer>,
     /// 系统代理 controller + marker 生命周期 + residual 会话门闩的唯一 owner。
     /// 同步 OS 操作的 blocking 隔离与幂等门控全部收敛在 `proxy/system_takeover.rs`。
     system_proxy: SystemProxyTakeover,
@@ -1619,7 +1631,7 @@ pub struct ProxyRuntime {
     /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`lib.rs` setup 内
     /// [`set_error_emitter`](Self::set_error_emitter)）。未接线（单测 / setup 前的极早期失败）→
     /// `set_error` 只记日志 + 落状态码，不 panic：**发不出事件绝不能反过来打断错误处理本身**。
-    error_emitter: std::sync::OnceLock<Box<dyn ProxyErrorEmitter>>,
+    error_emitter: std::sync::OnceLock<Arc<dyn ProxyErrorEmitter>>,
     /// A4 登录期出口让位内存态（上游 `bootstrapFallbackEngaged` + `bootstrapFallbackServerId`）。
     ///
     /// engaged=当前 proxy-selector 是否被临时热切到 direct；server_id=让位所服务的选中出口 id（用户中途
@@ -1844,6 +1856,7 @@ impl ProxyRuntime {
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),
             network_epoch: AtomicU64::new(0),
+            coex: Arc::default(),
             tailnet_file_write_lock: Mutex::new(()),
             system_proxy: SystemProxyTakeover::new(proxy_clearer),
             tunnel_conflicts: RwLock::new(tunnel_conflict::TunnelConflictSnapshot::NotProbed),
@@ -1897,8 +1910,34 @@ impl ProxyRuntime {
     /// 幂等：已接线则忽略重复接线（`OnceLock::set` 的 Err 腿）——重复接线是编程错误而非运行期状况，
     /// 记 warn 让它可见，但不 panic（不为一个诊断通道搭上 App 启动）。
     pub fn set_error_emitter(&self, emitter: Box<dyn ProxyErrorEmitter>) {
+        let emitter: Arc<dyn ProxyErrorEmitter> = Arc::from(emitter);
+        let coex_emitter = Arc::clone(&emitter);
         if self.error_emitter.set(emitter).is_err() {
             log::warn!("proxy error emitter 重复接线 → 忽略（保留首次）");
+        } else {
+            self.coex
+                .set_sink(Arc::new(move |state| coex_emitter.emit_coex_state(state)));
+        }
+    }
+
+    fn coex_committed_ready(&self, generation: u64) {
+        if self.gate.generation() == generation {
+            self.coex.ready(generation);
+        }
+    }
+    fn coex_network_receipt(&self, generation: u64, token: u64) {
+        self.coex.receipt(generation, token);
+    }
+    pub(crate) fn coex_state(&self) -> Value {
+        self.coex.get()
+    }
+    pub(crate) fn coex_refresh(&self, revision: u64) -> Value {
+        self.coex.manual(revision)
+    }
+    fn commit_coex_current_config(&self, value: Value) {
+        match self.current_config.write() {
+            Ok(mut current) => self.coex.commit_config(&mut current, value),
+            Err(_) => self.coex.config_unavailable(),
         }
     }
 

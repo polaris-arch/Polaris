@@ -35,6 +35,7 @@
 #![deny(unsafe_code)]
 
 pub mod bypass;
+pub mod coexistence;
 pub mod dns;
 pub mod dns_flush;
 pub mod dns_ops;
@@ -52,6 +53,7 @@ pub mod route_ops;
 pub mod route_probe;
 #[cfg(test)]
 mod test_support;
+pub mod windows_coex;
 #[cfg(any(windows, test))]
 pub mod windows_dns;
 #[cfg(windows)]

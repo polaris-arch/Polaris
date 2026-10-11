@@ -157,6 +157,10 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     { file: 'ui/src/mobile/settings/MobileSettings.test.tsx', mustContain: '⑩ 写失败必须可见' },
   ],
   actions: [
+    { id: 'CoexWindowsSources.tsx|k:settings.coex.displayed+settings.coex.next+settings.coex.observedEmpty+settings.coex.previous+settings.coex.rows+settings.coex.total', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 来源行与分页总览；当前移动端 provider 返回 unavailable/Unknown，未挂载桌面来源 UI，不是永久 OS 能力结论。' },
+    { id: 'CoexWindowsSources.tsx|k:settings.coex.previous', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
+    { id: 'CoexWindowsSources.tsx|k:settings.coex.next', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
+
     /* ══════════════ `controls` 面：桌面这一屏的每一个动作元素 ══════════════
      * 🔴 上一版这一屏**只有** `config-fields` 一个面，理由写的是「整个目录里字面意义的 `<button`
      * 只有 12 颗，全是脚手架」——那是提取器的性质，不是这一屏的事实：真正的动作全走同目录
@@ -312,6 +316,42 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '⚠️ 检查那条腿的重试仍是同一颗检查按钮再点一次（`k:settings.about.checkUpdate#3`，失败态不禁用）。',
     },
 
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.previous',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
+      },
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.next',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
+      },
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|f:preventDefault',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
+      },
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
+    {
+      id: 'CoexSnapshotBlock.tsx|k:settings.coex.collect+settings.coex.loading+settings.coex.retry',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
+      },
+      note: '只读运行期事实卡的手动刷新、折叠或显示分页动作。当前移动端原事件源与采集源未接入，不挂卡、不调用桌面命令；' +
+        '保持 unsupported/Unknown，不伪装空表或安全，不表示移动 OS 永久不能采集。',
+    },
     /* ── TUN 组网网段报告：手动刷新与加载反馈 ─────────────────────────────── */
     {
       id: 'MeshRouteEvidenceBlock.tsx|k:common.refresh',
@@ -965,6 +1005,51 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     },
     /* ── 桌面「多 VPN 兼容」批（2026-09-12 合入 main）新加的两块只读报告 ───────────── */
     {
+      id: 'CoexWindowsSources',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 五来源只读报告壳；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
+      id: 'Field',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 来源局部事实/Unknown 原因行；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
+      id: 'Source',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: 'Windows 单来源展开与分页块；当前移动端 provider 未接入，返回 unavailable/Unknown，不挂桌面采集 UI。源接入或组件复用时须重审，不判为无冲突或永久平台缺失。',
+    },
+    {
+      id: 'CoexSnapshotBlock',
+      disposition: {
+        kind: 'platform-absent',
+        evidence: {
+          file: 'src-tauri/src/commands/coexistence_snapshot.rs',
+          mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {',
+        },
+      },
+      note: '当前 COEX 原 watcher 和采集源未接入移动端，返回 unavailable/Unknown；本片不挂桌面 get-state/事件/刷新命令。' +
+        '这是当前 provider 状态，不是永久 OS 能力结论；不伪装空表或安全，源接入时须重审此登记。',
+    },
+    {
       id: 'TunnelConflictBlock',
       disposition: {
         kind: 'platform-absent',
@@ -1024,10 +1109,12 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   ],
 
   /**
-   * 桌面设置屏的具名数据槽基线（69 个）。**变更探测器，不是对差面**。
+   * 桌面设置屏的具名数据槽基线（74 个）。**变更探测器，不是对差面**。
    * 桌面加一行带 id 的设置槽 ⇒ 这条不等 ⇒ 红 ⇒ 逼一次「移动端要不要有」的显式决定。
    */
   slotBaseline: [
+    // Windows 五来源槽与上面 Source/Field 的当前 provider 缺席登记同属一批。
+    'adapters', 'addresses', 'ras', 'routes4', 'routes6',
     'app-update-card', 'auto-dl-swt', 'backup-block', 'backup-master',
     'browser-doh-list', 'browser-doh-swt', 'bypass-lan-swt', 'cidr-bypass-off-note', 'cidr-list',
     'control-port-input', 'core-info-card', 'disable-log-file-swt', 'dns-bootstrap-row',
