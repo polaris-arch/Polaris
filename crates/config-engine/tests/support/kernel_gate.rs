@@ -105,8 +105,8 @@ const LIVE_FIXTURE_WG_PEER_PUBLIC: &str = "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp
 
 #[test]
 fn live_kernel_fixture_changes_only_two_wireguard_placeholder_credentials() {
-    let raw = include_str!("../../fixtures/config-snapshot.json");
-    let original: SnapshotFixture = serde_json::from_str(raw).expect("frozen snapshot parses");
+    let raw = polaris_source_probe::crate_file!("fixtures/config-snapshot.json");
+    let original: SnapshotFixture = serde_json::from_str(&raw).expect("frozen snapshot parses");
     let live = load_cases();
     assert_eq!(original.cases.len(), live.len());
     let mut changed = 0;

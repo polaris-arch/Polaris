@@ -197,14 +197,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
-            [ "$GITHUB_ACTIONS" = true ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+            [ "$GITHUB_ACTIONS" = true ]
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
             [ "$GITHUB_REPOSITORY" = polaris-arch/Polaris ]
             [ "$GITHUB_REF" = refs/heads/collab/fk02-native-payload-validation-20261010 ]
             [ "$GITHUB_WORKFLOW_REF" = "polaris-arch/Polaris/.github/workflows/release-risk.yml@$GITHUB_REF" ]
             [ "$PLATFORMS_JSON" = '["linux","windows"]' ]
             [ -n "$CORE_BUNDLE_ARTIFACT" ]
-            [ "$VALIDATION_KERNEL" = true ] && [ "$VALIDATION_UPLOAD" = true ]
-            [ "$VALIDATION_LIGHT" = false ] && [ "$VALIDATION_SKIP_QUALITY" = true ]
+            [ "$VALIDATION_KERNEL" = true ]
+            [ "$VALIDATION_UPLOAD" = true ]
+            [ "$VALIDATION_LIGHT" = false ]
+            [ "$VALIDATION_SKIP_QUALITY" = true ]
           fi
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$CORE_CANDIDATE" = "$EXPECTED_CANDIDATE" ]
