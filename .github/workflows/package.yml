@@ -1168,12 +1168,16 @@ jobs:
             # 可写中间件放**临时目录**，不放 bundle_dir：放在里面的话，一次中途失败留下的
             # 残件会被下一次重跑的 `*.dmg` 通配捞进去，跟着打上架构标记发给用户
             # （self-hosted / 重跑的脏工作区是真实场景，本文件别处已为此踩过一次）。
-            rw="$(mktemp -d)/rw.dmg"
+            # Physical paths only for freshly-created trusted temporary roots; payload links stay rejected.
+            rw_dir=$(mktemp -d)
+            rw_dir=$(cd "$rw_dir" && pwd -P)
+            rw="$rw_dir/rw.dmg"
             hdiutil convert "$dmg" -format UDRW -o "$rw" -ov -quiet
             # 现有大小 + 20MB 余量：引导只有几 KB，余量是给 HFS+ 元数据的。
             need=$(( $(du -m "$rw" | cut -f1) + 20 ))
             hdiutil resize -size "${need}m" "$rw" >/dev/null
             mnt=$(mktemp -d)
+            mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$rw" -mountpoint "$mnt" -nobrowse -noverify -quiet
             cp "$guide" "$mnt/$guide_name"
             # Tauri 先生成 Finder 的 .DS_Store，本步骤随后才把指南复制进去；只 cp 会让文件没有
@@ -1248,6 +1252,7 @@ jobs:
           checked=0
           for dmg in "$bundle_dir"/*.dmg; do
             mnt=$(mktemp -d)
+            mnt=$(cd "$mnt" && pwd -P)
             hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -readonly -quiet
             apps=("$mnt"/*.app)
             if [ "${#apps[@]}" -ne 1 ] || ! codesign --verify --deep --strict --verbose=2 "${apps[0]}"; then

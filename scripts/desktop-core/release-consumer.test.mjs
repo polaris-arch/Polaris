@@ -922,3 +922,42 @@ test('final Mac release verification closes changed CDHash, bytes, missing notic
   assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, 'mac-arm64', binary, f.run), /Static carrier contains Cronet sidecar/);
   assert.deepEqual(readFileSync(binary), raw);
 }));
+
+test('DMG trusted temporary roots use physical paths while final Mac payload links still fail closed',
+  { skip: process.platform === 'win32' ? 'POSIX shell path fixture; actual macOS packaging remains required' : false },
+  async () => withFixture(async (f) => {
+    await consumeRelease(f.root, f.manifest, ['mac-x64', 'mac-arm64'], { ...f, host: 'darwin' });
+    const workflow = readFileSync(join(repo, '.github/workflows/package.yml'), 'utf8');
+    const physical = join(f.root, 'physical-temp'), alias = join(f.root, 'temp-alias');
+    mkdirSync(physical); symlinkSync(physical, alias, 'dir');
+    const env = { ...process.env, TMPDIR: alias };
+    const mountSteps = [...workflow.matchAll(/            mnt=\$\(mktemp -d\)\n(?:            mnt=[^\n]+\n)?            hdiutil attach[^\n]+/g)];
+    assert.equal(mountSteps.length, 2, 'Both writable and final read-only DMG mount steps must be exercised');
+    for (const step of mountSteps) {
+      const commands = step[0].slice(0, step[0].indexOf('            hdiutil'));
+      const mount = execFileSync('/bin/bash', ['-e', '-u', '-o', 'pipefail', '-c', commands + '\nprintf "%s" "$mnt"'], { env, encoding: 'utf8' });
+      assert.equal(mount, fs.realpathSync(mount), 'A freshly-created mount root still crosses the TMPDIR alias');
+      for (const key of ['mac-x64', 'mac-arm64']) {
+        const payload = join(mount, `${key}.app/Contents/Resources`, key);
+        cpSync(join(f.root, 'resources', key), payload, { recursive: true });
+        const binary = join(payload, 'sing-box'), original = readFileSync(binary);
+        assert.equal(verifyMacPackagedCore(f.root, f.manifest, key, binary, f.run).platform, key);
+        // Canonicalizing only the new temporary root does not admit a linked
+        // payload directory, linked core, or the original alias spelling.
+        const linkedDirectory = join(mount, `${key}-linked-payload`);
+        symlinkSync(payload, linkedDirectory, 'dir');
+        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run), /Linked release ancestor/);
+        const linkedCore = join(mount, `${key}-linked-core`, 'sing-box');
+        mkdirSync(dirname(linkedCore)); symlinkSync(binary, linkedCore);
+        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, f.run), /Non-regular release path/);
+        const aliasBinary = join(alias, mount.slice(physical.length + 1), `${key}.app/Contents/Resources`, key, 'sing-box');
+        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, aliasBinary, f.run), /Linked release ancestor/);
+        assert.deepEqual(readFileSync(binary), original);
+      }
+    }
+    const writable = workflow.match(/            rw_dir=\$\(mktemp -d\)\n            rw_dir=[^\n]+\n            rw="\$rw_dir\/rw\.dmg"/);
+    assert(writable, 'The writable DMG staging root must be exercised');
+    const rw = execFileSync('/bin/bash', ['-e', '-u', '-o', 'pipefail', '-c', writable[0] + '\nprintf "%s" "$rw"'], { env, encoding: 'utf8' });
+    assert.equal(dirname(rw), fs.realpathSync(dirname(rw)));
+    assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
+  }));
