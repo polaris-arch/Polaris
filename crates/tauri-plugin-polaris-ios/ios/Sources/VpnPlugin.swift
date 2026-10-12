@@ -46,6 +46,7 @@ private final class VpnOperation {
 }
 
 final class VpnPlugin: Plugin {
+    private let measurementDevice = MeasurementDeviceObserver()
     private let viewportObservers = NSMapTable<WKWebView, ViewportObserver>(keyOptions: .weakMemory, valueOptions: .strongMemory)
 
     override func load(webview: WKWebView) {
@@ -82,6 +83,12 @@ final class VpnPlugin: Plugin {
     }
     @objc func sharedDirectory(_ invoke: Invoke) {
         do { invoke.resolve(["path": try directory().path]) } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    /// Read-only conditions for the App scheduler, independent of NE lifecycle
+    /// and its start/stop mutation queue. Unknown path cost stays JSON null.
+    @objc func deviceConditions(_ invoke: Invoke) {
+        invoke.resolve(measurementDevice.snapshot())
     }
 
     /// Read-only status must not manufacture a manager or save preferences.

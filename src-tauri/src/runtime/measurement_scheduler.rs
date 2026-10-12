@@ -267,9 +267,8 @@ pub(crate) const fn decide_tick(facts: &TickFacts) -> Verdict {
     Verdict::Start
 }
 
-/// 本平台是否启用周期计划。iOS 的原生侧（屏幕状态接线与设备状况查询）尚未就位：设备第一次
-/// 休眠后内核会一直停在设备暂停态，经 WireGuard 类节点的探测会挂到超时并被记成失败。在那之前
-/// iOS 不建计划。
+/// 本平台是否启用周期计划。iOS 的屏幕状态/WakeNow/设备状况源已接线，但尚未取得
+/// 原约定 Mac Apple 探针的实际编译/最终链接与唤醒证据；此前 iOS 不建周期计划。
 pub(crate) const fn platform_enabled(platform: Platform) -> bool {
     match platform {
         Platform::Mac | Platform::Win | Platform::Linux | Platform::Android => true,
@@ -1476,9 +1475,31 @@ async fn android_conditions() -> DeviceReadings {
 }
 
 /// 拉一次设备状况。拿不到的平台如实报「不可得」，不当作非计费。
+#[cfg(target_os = "ios")]
+async fn ios_conditions() -> DeviceReadings {
+    match tauri_plugin_polaris_ios::device_conditions().await {
+        Ok(conditions) => DeviceConditions {
+            metered: metered_of(conditions.metered),
+            power_save: conditions.power_save,
+        }
+        .into(),
+        Err(error) => {
+            log::debug!("周期测速：iOS 设备状况不可得：{error}");
+            DeviceConditions::UNAVAILABLE.into()
+        }
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn ios_conditions() -> DeviceReadings {
+    DeviceConditions::UNAVAILABLE.into()
+}
+
+/// Native cost is a read-only observation, not evidence of core/NE ownership.
 async fn device_conditions(platform: Platform) -> DeviceReadings {
     match platform {
         Platform::Android => android_conditions().await,
+        Platform::Ios => ios_conditions().await,
         Platform::Linux => DeviceConditions {
             metered: linux_metered().await,
             power_save: false,
@@ -1489,7 +1510,7 @@ async fn device_conditions(platform: Platform) -> DeviceReadings {
             power_save: false,
         }
         .into(),
-        Platform::Ios | Platform::Other => DeviceConditions::UNAVAILABLE.into(),
+        Platform::Other => DeviceConditions::UNAVAILABLE.into(),
     }
 }
 

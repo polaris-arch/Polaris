@@ -502,6 +502,20 @@ async fn call<T: DeserializeOwned + Send + 'static>(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceConditions {
+    pub metered: Option<bool>,
+    pub power_save: bool,
+}
+
+/// Read only App conditions; does not observe or mutate the NE custody cache.
+pub async fn device_conditions() -> Result<DeviceConditions, String> {
+    call("deviceConditions", serde_json::json!({}), 3, None, None)
+        .await
+        .map_err(NativeCallFailure::message)
+}
+
 pub async fn status() -> Result<TunnelStatus, String> {
     let generation = state()
         .lock()

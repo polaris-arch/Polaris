@@ -2940,7 +2940,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         1,
         IosSide::DiffersRight,
         "`android_conditions` 的真实腿：经 Android 桥拉设备状况。只在 `Platform::Android` 臂被调用；\
-         iOS 走自己的臂（今天如实返回「不可得」），不经过这个函数。",
+         iOS 走自己的 Swift 只读查询臂，查询失败如实不可得，不经过 Android/JNI。",
     ),
     (
         "src-tauri/src/runtime/measurement_scheduler.rs",
@@ -2949,6 +2949,20 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "`android_conditions` 的非 Android 桩，返回「不可得」。它只为让 `Platform::Android` 臂在别的\
          目标上编得过，运行期不可达；iOS 落这一侧不改变行为（iOS 臂本来就不调它）。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "ME03 iOS原生只读计费/省电查询经自己的Tauri Swift插件；Android不引用Apple依赖。它不写NE状态/custody，周期开放仍等原Mac探针真实门。此条登记新增源分派，不重标旧iOS欠账为已验。",
+    ),
+    (
+        "src-tauri/src/runtime/measurement_scheduler.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "iOS查询的非iOS桩只为统一编译面，返回Unavailable；Android仍走自己的原生查询。未来平台不能借Apple计费/power观测，真实iOS查询失败也保持未知。",
     ),
     (
         "src-tauri/src/runtime/measurement_scheduler.rs",
@@ -3783,7 +3797,8 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 不以登记或 host 回归签收 iOS/native Gradle/设备能力。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
-    ("DiffersRight", 277),
+    // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
+    ("DiffersRight", 279),
     ("DiffersUndecided", 25),
     ("DiffersWrongToday", 142),
     ("WithAndroid", 89),

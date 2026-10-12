@@ -260,7 +260,7 @@ fn the_scheduler_switch_gates_every_round() {
     const { assert!(SCHEDULER_ENABLED, "出包取值") };
 }
 
-/// iOS 的原生侧未就位：不建计划，状态如实报「本平台未启用」。其余平台启用。
+/// iOS 原生源已接线、Mac探针尚未验：此前不建周期计划，如实报未启用。
 #[test]
 fn ios_builds_no_schedule_and_says_so() {
     for platform in Platform::ALL {

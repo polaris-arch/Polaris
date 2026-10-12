@@ -202,9 +202,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func sleep(completionHandler: @escaping () -> Void) {
         let completion = TunnelCompletion<Void> { _ in completionHandler() }
         deadlines.asyncAfter(deadline: .now() + 2) { completion.finish(()) }
-        worker.async { self.commandServer?.pause(); completion.finish(()) }
+        worker.async {
+            self.commandServer?.recordScreenState(false)
+            self.commandServer?.pause()
+            completion.finish(())
+        }
     }
-    override func wake() { worker.async { self.commandServer?.wake() } }
+    override func wake() {
+        worker.async {
+            self.commandServer?.recordScreenState(true)
+            // Go Wake() only clears the pause on Android. iOS needs WakeNow().
+            self.commandServer?.wakeNow()
+        }
+    }
 
     private func sharedDirectory() throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "PolarisAppGroup") as? String,
