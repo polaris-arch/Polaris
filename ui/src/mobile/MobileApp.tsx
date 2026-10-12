@@ -1,3 +1,4 @@
+import { MeasurementStartNotice } from './MeasurementStartNotice';
 /**
  * 移动端根组件：路由（五个目的地之间切换）+ 外壳装配 + 系统返回键接线。
  *
@@ -247,6 +248,7 @@ export function MobileApp(): ReactElement {
       {/* 锁屏遮罩：外壳的**兄弟**（fixed 层压不过它自己所在的层叠上下文，故不能塞进外壳里）。
           锁定态由这里喂进去而不是它自己读 store，理由见 `MobileLockOverlay.tsx` 头注那条 🔴。 */}
       <MobileLockOverlay locked={locked} />
+      <MeasurementStartNotice disabled={locked} />
     </>
   );
 }

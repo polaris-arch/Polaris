@@ -1,7 +1,8 @@
+import { requestIOSMeasurementConsent, requiresMeasurementConsent } from './MeasurementStartNotice';
 import { create } from 'zustand';
 import { api } from '@/ipc';
 import { isSpeedTestCountProgress, type SpeedTestDonePayload, type SpeedTestInvokeResult, type SpeedTestMeasurementContext, type SpeedTestProgressPayload, type SpeedTestResultPayload } from '@/contracts/speed-test';
-import { useLatencyStore } from '@/store/use-latency-store';
+import { useLatencyStore, subscribeLatencyEvents } from '@/store/use-latency-store';
 import { getEffectiveConfig, useAppStore } from '@/store/app-store';
 
 export type MobileSpeedTestPhase = 'preparingConnection' | 'waitingForReady' | 'running' | 'waiting' | 'completed' | 'interrupted' | 'failed';
@@ -200,6 +201,7 @@ export function subscribeMobileSpeedTestProgress(): () => void {
     timer = setTimeout(() => useMobileSpeedTestStore.getState().waiting(task.runId), 20_000);
   };
   const offs = [
+    subscribeLatencyEvents(),
     api.server.onSpeedTestProgress(event => {
       const before = useMobileSpeedTestStore.getState().task;
       useMobileSpeedTestStore.getState().progress(event);
@@ -234,7 +236,11 @@ export function subscribeMobileSpeedTestProgress(): () => void {
 }
 
 /** One local request lock across screens; a late invocation cannot replace an observed newer run. */
-export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRequest['kind'], acceptLatency?: LatencyGuard): Promise<SpeedTestInvokeResult | null> {
+export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRequest['kind'], acceptLatency?: LatencyGuard, consentGranted = false): Promise<SpeedTestInvokeResult | null> {
+  const requestedConfig = JSON.stringify(getEffectiveConfig());
+  const requestedSelection = useAppStore.getState().selectedServerId;
+  if (!consentGranted && requiresMeasurementConsent() && !await requestIOSMeasurementConsent()) return null;
+  if (JSON.stringify(getEffectiveConfig()) !== requestedConfig || useAppStore.getState().selectedServerId !== requestedSelection) return null;
   const token = useMobileSpeedTestStore.getState().begin(ids, kind, latencyGuard(ids, kind, acceptLatency));
   if (token === null) return null;
   try {

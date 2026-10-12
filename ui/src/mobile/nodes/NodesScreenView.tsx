@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '../MeasurementLabel';
 import { MobileSpeedTestProgress } from '../MobileSpeedTestProgress';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
@@ -306,7 +307,8 @@ function NodeRow({
           {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
           {row.invalidReason !== undefined && <span className="mn-note">{row.invalidReason}</span>}
         </span>
-        {lat.text !== '' && <span className={`mn-lat ${lat.level}`} data-numeric={numericLatency ? '' : undefined}>{lat.text}</span>}
+        <span className={`mn-lat ${lat.level}`} data-numeric={numericLatency ? '' : undefined}>{row.speedTestable ? <MeasurementLabel serverId={row.server.id} displayedServer={row.server} /> : lat.text}</span>
+        {row.sourceLabel && <span data-node-source="">{row.sourceLabel}</span>
       </button>
       {/* Both secondary controls are outside the exit-selection button. Opening help never selects a node. */}
       {(explanations.length > 0 || hasMeshRoute || !batchMode) && <span className="mn-row-actions">

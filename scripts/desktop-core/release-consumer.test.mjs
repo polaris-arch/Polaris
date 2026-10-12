@@ -510,8 +510,8 @@ test('published native gate rejects wrong attempt, host, source, adapter and ass
 }));
 
 
-test('cumulative strict Risk accepts only the verified published selection and exact manual run', async () => withFixture(async (f) => {
-  const ref = 'refs/heads/collab/s5-android-signal-20261010';
+for (const ref of ['refs/heads/collab/s5-android-signal-20261010', 'refs/heads/collab/ui01-status-20261010'])
+  test(`cumulative strict Risk ${ref} accepts only published selection and exact manual run`, async () => withFixture(async (f) => {
   const env = { POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true',
     GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
     GITHUB_REF: ref, GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
@@ -552,7 +552,7 @@ print(json.dumps(m.ci_context('linux',json.loads(sys.argv[2]),'Linux','amd64',ro
 
   for (const change of [{ POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }, { GITHUB_ACTIONS: 'false' },
     { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REPOSITORY: 'other/Polaris' },
-    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_SHA: '0'.repeat(40) },
+    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_REF: 'refs/heads/collab/ui01-unapproved' }, { GITHUB_SHA: '0'.repeat(40) },
     { GITHUB_RUN_ATTEMPT: '0' }, { GITHUB_RUN_ID: '0' },
     { GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}` },
     { POLARIS_NO_KERNEL_RUN: '1' }]) {

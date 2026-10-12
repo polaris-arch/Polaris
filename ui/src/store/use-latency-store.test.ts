@@ -13,46 +13,26 @@
  *     「组件卸载」不参与其中，故跨屏切换不丢。
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 
-// 事件流 mock：捕获注册的 listener，供测试手动投递（等价后端 emit）。
-const listeners: Array<(d: { serverId: string; latency: number }) => void> = [];
-const offSpy = vi.fn();
-vi.mock('@/ipc', () => ({
-  api: {
-    server: {
-      onSpeedTestResult: (l: (d: { serverId: string; latency: number }) => void) => {
-        listeners.push(l);
-        return offSpy;
-      },
-    },
-  },
-}));
+import { seedMeasurementFixture } from './measurement-fixture.test-support';
 
 import {
   useLatencyStore,
-  subscribeLatencyEvents,
   isLatencyStale,
   LATENCY_STALE_MS,
   normalizeLatencyResult,
 } from './use-latency-store';
 
-/** 投递一条后端 `event:speedTestResult`（打给所有在册监听器）。 */
-function emitResult(serverId: string, latency: number): void {
-  for (const l of listeners) l({ serverId, latency });
-}
-
 beforeEach(() => {
-  listeners.length = 0;
-  offSpy.mockClear();
   // 直接经 zustand 的 setState 复位：清空只有测试夹具需要，生产零调用点 —— 为它在 store 上导出一个
   // 公开 API 等于给四个屏幕 import 的 store 挂一条死 API（复审 #9），故不留 `resetLatencies`。
-  useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
+  useLatencyStore.setState({ latencyMap: {}, testedAt: {}, snapshot: null, projections: {}, currentProjections: {}, readError: false });
 });
 
 describe('use-latency-store：单一真值', () => {
   it('逐节点回填**合并**而非替换（一轮全量测速后每个节点都留有值）', () => {
-    const { applyLatencyResult } = useLatencyStore.getState();
+    const applyLatencyResult = (id: string, latency: number) => seedMeasurementFixture({ [id]: latency });
     applyLatencyResult('a', 120);
     applyLatencyResult('b', 240);
     applyLatencyResult('c', -1); // 后端判定的真实不可测
@@ -61,15 +41,15 @@ describe('use-latency-store：单一真值', () => {
   });
 
   it('批量合并保留未在本批的历史值（invoke 返回值兜底同步不得抹掉旧结果）', () => {
-    useLatencyStore.getState().applyLatencyResult('old', 50);
-    useLatencyStore.getState().applyLatencyResults({ a: 120, b: 240 });
+    seedMeasurementFixture({ 'old': 50 });
+    seedMeasurementFixture({ a: 120, b: 240 });
 
     expect(useLatencyStore.getState().latencyMap).toEqual({ old: 50, a: 120, b: 240 });
   });
 
   it('后写覆盖同一节点的先前值（重测即刷新）', () => {
-    useLatencyStore.getState().applyLatencyResult('a', 120);
-    useLatencyStore.getState().applyLatencyResult('a', 88);
+    seedMeasurementFixture({ 'a': 120 });
+    seedMeasurementFixture({ 'a': 88 });
 
     expect(useLatencyStore.getState().latencyMap.a).toBe(88);
   });
@@ -79,12 +59,12 @@ describe('use-latency-store：单一真值', () => {
     expect(normalizeLatencyResult(Number.NaN)).toBeNull();
     expect(normalizeLatencyResult(0)).toBe(0);
 
-    useLatencyStore.getState().applyLatencyResults({ failed: -1, ok: 86 });
+    seedMeasurementFixture({ failed: -1, ok: 86 });
     expect(useLatencyStore.getState().latencyMap).toEqual({ failed: null, ok: 86 });
   });
 
   it('节点删除后同时裁剪延迟与时间戳，保留节点的结果不动', () => {
-    useLatencyStore.getState().applyLatencyResults({ keep: 42, removed: 88 });
+    seedMeasurementFixture({ keep: 42, removed: 88 });
     const keepStamp = useLatencyStore.getState().testedAt.keep;
 
     useLatencyStore.getState().retainServerIds(['keep']);
@@ -94,7 +74,7 @@ describe('use-latency-store：单一真值', () => {
   });
 
   it('节点集没有删除项时保持 state 引用，避免 configChanged 触发无效通知', () => {
-    useLatencyStore.getState().applyLatencyResult('keep', 42);
+    seedMeasurementFixture({ 'keep': 42 });
     const before = useLatencyStore.getState();
     useLatencyStore.getState().retainServerIds(['keep', 'new-without-result']);
     expect(useLatencyStore.getState()).toBe(before);
@@ -102,10 +82,10 @@ describe('use-latency-store：单一真值', () => {
 });
 
 describe('use-latency-store：陈旧判定的数据基础（契约「陈旧 >30min 半透明」）', () => {
-  it('两个写入口**都**打时间戳（漏一个就有一路延迟永远不显陈旧）', () => {
+  it('账本投影保留生产时刻，无身份入口不制造接收戳', () => {
     const before = Date.now();
-    useLatencyStore.getState().applyLatencyResult('a', 120);
-    useLatencyStore.getState().applyLatencyResults({ b: 240, c: -1 });
+    seedMeasurementFixture({ 'a': 120 });
+    seedMeasurementFixture({ b: 240, c: -1 });
     const { testedAt } = useLatencyStore.getState();
 
     for (const id of ['a', 'b', 'c']) {
@@ -114,14 +94,14 @@ describe('use-latency-store：陈旧判定的数据基础（契约「陈旧 >30m
   });
 
   it('批量结果同批同戳（同一次 speedTest 不该产生毫秒级抖动）', () => {
-    useLatencyStore.getState().applyLatencyResults({ a: 1, b: 2, c: 3 });
+    seedMeasurementFixture({ a: 1, b: 2, c: 3 });
     const { testedAt } = useLatencyStore.getState();
     expect(new Set([testedAt.a, testedAt.b, testedAt.c]).size).toBe(1);
   });
 
   it('重测刷新时间戳（陈旧态必须能被一次重测清掉）', () => {
     useLatencyStore.setState({ latencyMap: { a: 120 }, testedAt: { a: 1 } });
-    useLatencyStore.getState().applyLatencyResult('a', 88);
+    seedMeasurementFixture({ 'a': 88 });
     expect(useLatencyStore.getState().testedAt.a).toBeGreaterThan(1);
   });
 
@@ -134,45 +114,11 @@ describe('use-latency-store：陈旧判定的数据基础（契约「陈旧 >30m
   });
 });
 
-describe('use-latency-store：订阅脱离组件生命周期（跨屏不丢）', () => {
-  it('事件经 subscribeLatencyEvents 落 store', () => {
-    subscribeLatencyEvents();
-    emitResult('a', 120);
-
-    expect(useLatencyStore.getState().latencyMap.a).toBe(120);
-  });
-
-  it('**跨屏不丢**：订阅建立后，任意多次「组件卸载/重挂」都不影响已积累的结果', () => {
-    subscribeLatencyEvents(); // 建在 App.tsx 顶层，全窗口生命周期只此一次
-    emitResult('a', 120);
-    emitResult('b', 240);
-
-    // 模拟用户切屏：业务屏卸载再挂载（组件不再持有任何测速状态，故这里没有任何清理动作可做）——
-    // 若哪天有人把状态搬回组件私有 useState，这一条会立刻失败：那时值随卸载消失。
-    const afterUnmount = useLatencyStore.getState().latencyMap;
-    const afterRemount = useLatencyStore.getState().latencyMap;
-
-    expect(afterUnmount).toEqual({ a: 120, b: 240 });
-    expect(afterRemount).toEqual({ a: 120, b: 240 });
-
-    // 切回来之后**继续**收流式结果（订阅还活着，没被卸载带走）。
-    emitResult('c', 60);
-    expect(useLatencyStore.getState().latencyMap).toEqual({ a: 120, b: 240, c: 60 });
-  });
-
-  it('测速进行中切屏：在飞的流式结果照样落库（原实现在这里丢结果）', () => {
-    subscribeLatencyEvents();
-    emitResult('a', 120); // 第 1 波
-    // …用户此刻切到别的屏（组件卸载）。后端继续推第 2 波：
-    emitResult('b', 240);
-    emitResult('c', 300);
-
-    expect(useLatencyStore.getState().latencyMap).toEqual({ a: 120, b: 240, c: 300 });
-  });
-
-  it('返回可退订句柄（窗口销毁时收口，不泄漏监听器）', () => {
-    const off = subscribeLatencyEvents();
-    off();
-    expect(offSpy).toHaveBeenCalledTimes(1);
+describe('unqualified event/return values', () => {
+  it('bare numeric writers cannot label unknown identity as success or failure', () => {
+    useLatencyStore.getState().applyLatencyResult('a', 1);
+    useLatencyStore.getState().applyLatencyResults({ b: -1 });
+    expect(useLatencyStore.getState().latencyMap).toEqual({});
+    expect(useLatencyStore.getState().testedAt).toEqual({});
   });
 });

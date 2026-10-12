@@ -290,7 +290,7 @@ impl MeasureFailure {
         Self { phase, kind }
     }
 
-    fn to_json(self) -> Value {
+    pub(crate) fn to_json(self) -> Value {
         let mut failure = json!({ "phase": self.phase.as_str(), "kind": self.kind.as_str() });
         if let FailKind::HttpStatus(code) = self.kind {
             failure["httpStatus"] = json!(code);
@@ -402,7 +402,7 @@ pub(crate) enum MeasurePath {
 }
 
 impl MeasurePath {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Candidate => "candidate",
             Self::System => "system",
@@ -870,7 +870,7 @@ pub(crate) struct ResultIdentity {
 }
 
 impl ResultIdentity {
-    fn to_json(&self) -> Value {
+    pub(crate) fn to_json(&self) -> Value {
         let (context, instance) = match self.instance {
             CoreInstance::Main {
                 generation,
@@ -3436,6 +3436,12 @@ pub(crate) async fn run_scheduled_round(
 #[tauri::command]
 pub fn speed_test_schedule_status(app: AppHandle) -> ApiResponse<Value> {
     ApiResponse::ok(crate::runtime::measurement_scheduler::status(&app))
+}
+
+/// Read the existing ledger; no measurement, selection or proxy start is performed.
+#[tauri::command]
+pub fn speed_test_result_snapshot(app: AppHandle) -> ApiResponse<Value> {
+    crate::runtime::measurement_ledger::display::snapshot(&app)
 }
 
 /// **§15.11 让位判据**（纯逻辑，对齐 上游 `SpeedTestService.ts:706` 的 `superseded()`）。

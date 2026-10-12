@@ -15,6 +15,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Notify;
 
+pub(crate) mod display;
+
 use crate::commands::speedtest::{
     is_selectable, result_key, stale_reason, supersedes_stored, BindingVerdict, CoreInstance,
     CurrentState, MeasureFailure, MeasurePath, Measured, ResultIdentity, ResultKey,

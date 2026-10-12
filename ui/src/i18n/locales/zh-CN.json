@@ -2193,6 +2193,7 @@
     "subUpdatingHint": "正在更新本订阅（手动刷新与后台自动刷新共用同一进度）",
     "subUpdatingProviders": "拉取子订阅 {{done}}/{{total}}",
     "tab": {
+      "all": "全部",
       "manual": "自建节点",
       "mesh": "组网"
     },
@@ -3254,5 +3255,21 @@
       "switch": "本次评估决定换点，运行结果以实际出口为准",
       "notEvaluated": "本次未评估"
     }
+  },
+  "measurement": {
+    "unavailable": "结果暂不可读",
+    "success": "成功",
+    "failed": "失败",
+    "unmeasured": "未测",
+    "expired": "过期",
+    "paused": "暂停",
+    "notIncluded": "未纳入",
+    "disconnected": "未连接测量",
+    "systemPath": "系统路径",
+    "selectedPath": "当前出口",
+    "nodePath": "节点测量",
+    "bindingMismatch": "实际承载与请求节点不同",
+    "iosTitle": "通过VPN测量",
+    "iosWillStart": "此测量使用正常VPN连接。如果尚未连接，将开启VPN并保持连接。"
   }
 }

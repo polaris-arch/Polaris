@@ -1,3 +1,5 @@
+import { MeasurementLabel } from '@/mobile/MeasurementLabel';
+import { useAppStore } from '@/store/app-store';
 import { autoSelectT } from './auto-select-labels';
 import { AutoSelectControls } from '@/mobile/AutoSelectControls';
 import { configReadGeneration } from '@/lib/config-read-generation';
@@ -144,6 +146,8 @@ export default function TrayMenu() {
     configReadGeneration.published();
     configRef.current = saved;
     setConfigState(saved);
+    // This standalone window hydrates its own JS store from the same authoritative readback.
+    useAppStore.setState({ config: saved });
   }, []);
   const [servers, setServers] = useState<ServerConfig[]>([]);
   const [subscriptions, setSubscriptions] = useState<SubscriptionConfig[]>([]);
@@ -278,6 +282,7 @@ export default function TrayMenu() {
       setSubscriptions(cfg.subscriptions ?? []);
       setSelectedId(cfg.selectedServerId);
       setRunning(status.running);
+      useAppStore.setState({ proxyStatus: status });
       setStarting(status.starting ?? false);
       setErrorCode(status.errorCode);
       // 活态取一发 —— 只在**适用范围内**（核稳定运行 + 非 starting + systemProxy）才查，闸门与主窗共用同一个谓词
@@ -419,7 +424,7 @@ export default function TrayMenu() {
   // 同一件事的两个名字（同宽回落、只改基线时可能量不出尺寸变化），而它的成本只是一个 promise 回调。
   useEffect(() => armFontsReadyRemeasure(document, requestRemeasure), [requestRemeasure]);
 
-  useEffect(() => subscribeLatencyEvents(), []);
+  useEffect(() => subscribeLatencyEvents({ poll: false }), []);
 
   // 每次重排都重新收敛：主视图的每一次测量都写进锁，节点视图再长也只在卡片内部滚动，全部折叠也
   // 不会把整个自绘菜单缩成一截（那段时间回报的是最近一次主视图的值）。
@@ -807,11 +812,7 @@ export default function TrayMenu() {
       .filter((s): s is ServerConfig => !!s);
   }, [config?.recentServerIds, directSelected, blockSelected, selectedId, servers]);
 
-  const latText = (v: number | null | undefined): string => {
-    if (v === null) return t('tray.timeout');
-    if (v === undefined) return '';
-    return `${v} ms`;
-  };
+
 
   return (
     <>
@@ -896,7 +897,7 @@ export default function TrayMenu() {
                       <path d="M5 12l5 5 9-11" />
                     </svg>
                   ) : (
-                    <span className={`tray-lat ${latLevel(lat)}`}>{latText(lat)}</span>
+                    <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} /></span>
                   )}
                 </button>
               );
@@ -1190,7 +1191,7 @@ export default function TrayMenu() {
                               <path d="M5 12l5 5 9-11" />
                             </svg>
                           ) : (
-                            <span className={`tray-lat ${latLevel(lat)}`}>{latText(lat)}</span>
+                            <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} /></span>
                           )}
                         </button>
                       );

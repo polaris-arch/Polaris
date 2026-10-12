@@ -35,6 +35,7 @@ export type { TsExitWarning, MeshTunnelHealth, NodesListSortKey };
 /** 一行节点。字段全部由接线层按桌面同一套判据算好——呈现层不得自己再判一遍。 */
 export interface NodeRowVM {
   readonly server: ServerConfig;
+  readonly sourceLabel?: string;
   /** 当前出口。 */
   readonly isCurrent: boolean;
   /** 组网/端点协议节点（桌面 `.nd-cap exit` 那颗角标的判据）。 */

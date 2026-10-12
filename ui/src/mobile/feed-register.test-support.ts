@@ -210,10 +210,16 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.retainServerIds', role: 'action', disposition: act(STORE_APP), note: '配置对账时驱逐已删节点的派生缓存（长会话里这些表只增不减就是泄漏）。' },
 
   /* ── 延迟 ───────────────────────────────────────────────────────────── */
-  { id: 'useLatencyStore.latencyMap', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: 'applyLatencyResult(event.serverId, event.latency)' }), note: '窗口 coordinator 接主动带 runId 结果与 passive RTT；旧轮次不写延迟，invoke 仅补遗漏，切页仍继续。' },
-  { id: 'useLatencyStore.testedAt', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: 'applyLatencyResult(event.serverId, event.latency)' }), note: '测速时刻（陈旧判定靠它，陈旧要画成「陈旧」而不是一个数）。' },
-  { id: 'useLatencyStore.applyLatencyResult', role: 'action', disposition: act(STORE_LATENCY), note: '已接受主动 RESULT 或无 ID passive RTT 的单项延迟写入口。' },
-  { id: 'useLatencyStore.applyLatencyResults', role: 'action', disposition: act(STORE_LATENCY), note: '延迟落库腿（一次测速的结果整批写进去）。' },
+  { id: 'useLatencyStore.latencyMap', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, current.config.servers)' }), note: '事件与invoke仅触发共享账本读回；同配置/生命周期资格的快照才写入数字。' },
+  { id: 'useLatencyStore.testedAt', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, current.config.servers)' }), note: '测速时刻（陈旧判定靠它，陈旧要画成「陈旧」而不是一个数）。' },
+  { id: 'useLatencyStore.applyLatencyResult', role: 'action', disposition: act(STORE_LATENCY), note: '旧单项回包只请求账本刷新，不采信无身份数字。' },
+  { id: 'useLatencyStore.applyLatencyResults', role: 'action', disposition: act(STORE_LATENCY), note: '旧批量回执只请求账本刷新，不采信裸数值。' },
+  { id: 'useLatencyStore.projections', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, current.config.servers)' }), note: '同版账本的候选五态及测量标注。' },
+  { id: 'useLatencyStore.currentProjections', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, current.config.servers)' }), note: '当前出口保留实际测量目的，不覆盖候选路径。' },
+  { id: 'useLatencyStore.readError', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'invalidate(true)' }), note: '权威读回失败如实显示结果不可读，不冒未测或成功。' },
+  { id: 'useLatencyStore.snapshot', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, current.config.servers)' }), note: '进程/版本/资格绑定的只读账本快照，不持久化。' },
+  { id: 'useLatencyStore.applySnapshot', role: 'action', disposition: act(STORE_LATENCY), note: '已验证读回唯一数字写入口。' },
+  { id: 'useLatencyStore.invalidate', role: 'action', disposition: act(STORE_LATENCY), note: '配置或生命周期变化立刻撤回当前数值。' },
   { id: 'useLatencyStore.retainServerIds', role: 'action', disposition: act(STORE_LATENCY), note: '延迟表的对账驱逐（节点删了它的延迟也要跟着走）。' },
 
   /* ── 暂存（待应用条）─────────────────────────────────────────────────── */

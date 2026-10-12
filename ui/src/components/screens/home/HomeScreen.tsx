@@ -1,3 +1,4 @@
+import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * Home 屏（提取自原型 polaris-prototype.html L1633-1711）。
@@ -62,7 +63,7 @@ import {
 import { resolveExitNodeFlagCode } from '@/domain/exit-flag';
 import { FlagImg } from '@/components/FlagImg';
 import { speedTestableIds } from '@/domain/endpoint-routes';
-import { useLatencyStore, latencyMapWhen } from '@/store/use-latency-store';
+import { useLatencyStore } from '@/store/use-latency-store';
 import { useSystemProxyLive } from '@/store/use-system-proxy-live';
 import { isReverseRegionRouting } from '@/domain/region-routing';
 import {
@@ -283,7 +284,7 @@ export function HomeScreen() {
    *    返回值的 `applyLatencyResults` 兜底，两条都与本组件订不订阅无关 ⇒ 结果完整落库，
    *    只是本组件不为它重渲；下次打开选单即刻显示全部结果。不丢数据、不推迟、不显示陈旧值。
    */
-  const latencies = useLatencyStore(latencyMapWhen(nodeMenuOpen));
+  const latencies = useQualifiedLatencies(servers, nodeMenuOpen);
   /** 本次解锁快照是否由用户点「网络检测」触发（喂 onUpdated 里的完成 toast，见 onUnlockRefresh）。 */
   const unlockUserRequested = useRef(false);
   /** 当前出口显示名。走 ref 而非直接读闭包：解锁事件订阅 effect 不该因换节点重挂（重挂会丢事件），

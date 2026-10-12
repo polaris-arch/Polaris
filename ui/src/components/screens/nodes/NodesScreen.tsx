@@ -31,7 +31,7 @@ import { toast } from '@/lib/error-handler';
 import { api } from '@/ipc';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
-import { groupServersBySubscription } from '@/domain/server-grouping';
+import { nodeViewGroups } from '@/domain/server-grouping';
 import { initialNodesTab } from './initial-tab';
 import { isMeshNode, type SpeedTestCaps } from '@/domain/endpoint-routes';
 import { meshNodeRouteBadge, reportForDisplayedMeshNode } from '@/domain/mesh-route-badges';
@@ -192,8 +192,8 @@ export function NodesScreen() {
 
   // 分组（单一真值：自建 → 组网 → 各订阅）
   const groups = useMemo(
-    () => groupServersBySubscription(servers, subscriptions, true),
-    [servers, subscriptions],
+    () => nodeViewGroups(servers, subscriptions, { manual: t('nodes.tab.manual'), mesh: t('nodes.tab.mesh') }),
+    [servers, subscriptions, t],
   );
 
   const manualCount = groups.find((g) => g.isManual)?.servers.length ?? 0;

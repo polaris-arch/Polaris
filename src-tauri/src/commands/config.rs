@@ -79,7 +79,7 @@ pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
 ///
 /// **新增注入一律加进 `ensure_effective_config`，不要在这里再并列一行** —— 那份表
 /// （`INJECTED_FIELD_PATHS`）同时是前端 SoT 守卫的取材面，绕过它注入的字段守卫管不到。
-fn apply_frontend_view(cfg: &mut Value) {
+pub(crate) fn apply_frontend_view(cfg: &mut Value) {
     // F29：绝不下发隐私密码（历史残留明文 `privacyPassword` + salted hash `privacyPasswordHash`）。
     strip_privacy_secrets(cfg);
     // 本机 mesh 账本是后端权威状态；排除于前端快照和 configVersion。

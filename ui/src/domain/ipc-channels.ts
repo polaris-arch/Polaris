@@ -68,6 +68,7 @@ export const IPC_CHANNELS = {
   SERVER_DELETE_BATCH: 'server_delete_batch',
   SERVER_SPEED_TEST: 'server_speed_test',
   SPEED_TEST_SCHEDULE_STATUS: 'speed_test_schedule_status', // 周期测速的计划状态（只读）
+  SPEED_TEST_RESULT_SNAPSHOT: 'speed_test_result_snapshot', // Existing ledger, read-only UI projection.
   AUTO_SELECT_ENABLE: 'auto_select_enable', // 把选择意图置为「自动选择（该订阅）」；清掉只需点任一节点
   AUTO_SELECT_SWITCH_NOW: 'auto_select_switch_now', // 自动意图下按共享裁决请求换点（允许重启内核）
   AUTO_SELECT_STATUS: 'auto_select_status', // 选择状态（只读）

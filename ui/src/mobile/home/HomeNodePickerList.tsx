@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '../MeasurementLabel';
 import { Fragment, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
@@ -56,7 +57,7 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
               <span className="h-pickmeta"><span className="h-pill">{row.protocolLabel}</span>
                 {row.stagedOnly && <span className="h-pill warn">{t('home.stagedOnlyBadge')}</span>}
                 <span className={`h-lat ${row.latencyStale ? 'none' : latLevel(row.latencyMs)}`}>
-                  {row.latencyMs === undefined ? t('home.unlockStatus.idle') : row.latencyMs === null ? t('nodes.timeout') : row.latencyStale ? t('nodes.mobileLatencyStale') : `${row.latencyMs} ms`}
+                  <MeasurementLabel serverId={server.id} displayedServer={server} />
                 </span>
               </span>
             </button>

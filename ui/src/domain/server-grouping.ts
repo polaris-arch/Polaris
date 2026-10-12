@@ -13,6 +13,9 @@ export interface ServerGroup {
   isManual: boolean;
   /** 组网组（WireGuard/WARP/Tailscale 等 endpoint 协议）：调用方本地化为「组网」。 */
   isMesh?: boolean;
+  /** Nodes-page view only. Existing selectors never receive a duplicated all group. */
+  isAll?: boolean;
+  sources?: Record<string, { id: string; kind: 'manual' | 'mesh' | 'subscription'; name: string }>;
   servers: ServerConfig[];
 }
 
@@ -64,6 +67,18 @@ export function groupServersBySubscription(
   }
 
   return groups;
+}
+
+/** Append an all-nodes view without changing existing first-open/default group behavior. */
+export function nodeViewGroups(servers: ServerConfig[], subscriptions: SubscriptionConfig[] = [], sourceNames = { manual: 'manual', mesh: 'mesh' }): ServerGroup[] {
+  const groups = groupServersBySubscription(servers, subscriptions, true);
+  let id = '__all_nodes__';
+  while (groups.some(group => group.id === id)) id += '_';
+  const sources = Object.fromEntries(groups.flatMap(group => group.servers.map(server => [server.id, {
+    id: group.id, kind: group.isManual ? 'manual' as const : group.isMesh ? 'mesh' as const : 'subscription' as const,
+    name: group.isManual ? sourceNames.manual : group.isMesh ? sourceNames.mesh : group.name,
+  }])));
+  return [...groups, { id, name: 'all', isManual: false, isAll: true, servers, sources }];
 }
 
 /**

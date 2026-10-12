@@ -1,3 +1,4 @@
+import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
 /**
  * `useNodesRenderWindow` —— 节点屏的**渲染窗口**：可见集投影（`visibleServers`）+ 渲染尾分批
  * （`renderedServers` / `gridRef` / 三个采样器）。整块逐字外提自 `NodesScreen.tsx`，行为不变。
@@ -10,9 +11,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import type { ServerGroup } from '@/domain/server-grouping';
-import { useLatencyStore } from '@/store/use-latency-store';
 import { useScrollBatch } from '@/lib/use-scroll-batch';
-import { latencySortSelector } from './nodes-logic';
 import { projectVisibleServers, type NodesListSortKey } from './nodes-list-projection';
 
 /**
@@ -179,7 +178,7 @@ export function useNodesRenderWindow(params: {
    * 需要「此刻最新的整张表」的是三条**动作腿**（删/批删/注销 WARP 的兜底出口），它们在点击当刻
    * 用 `useLatencyStore.getState()` 现取，既拿到最新快照，又不制造一条订阅。
    */
-  const latencies = useLatencyStore(latencySortSelector(sortKey === 'lat'));
+  const latencies = useQualifiedLatencies(activeGroup?.servers ?? [], sortKey === 'lat');
   const visibleServers = useMemo(
     () => projectVisibleServers(activeGroup, search, protoFilter, sortKey, latencies),
     [activeGroup, search, protoFilter, sortKey, latencies],

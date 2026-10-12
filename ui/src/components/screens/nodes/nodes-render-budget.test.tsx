@@ -1,3 +1,4 @@
+import { seedMeasurementFixture } from '@/store/measurement-fixture.test-support';
 /**
  * 节点屏渲染预算门 —— 守住「测速逐节点回包时，只有回包的那一张卡重渲」以及「分批只切渲染尾」。
  *
@@ -187,15 +188,15 @@ describe('自曝 · 扫描面还在', () => {
 });
 
 /* ════════════════════════════════════════════════════════════════════════════
- * 不变量① 及时性 —— 回包必须立刻到达那张卡，且不许靠 timer / 节流 / 合批把它推迟
+ * 不变量① 及时性 —— 已验证账本投影必须同步到达那张卡，且不许靠 timer / 节流 / 合批把它推迟
  * ════════════════════════════════════════════════════════════════════════════ */
 
 describe('不变量① · 延迟回包的及时性', () => {
-  it('store 提交是**同步**通知的：回包写入即可读，中间没有异步跳板', () => {
+  it('store 提交是**同步**通知的：同版账本投影提交即可读，中间没有异步跳板', () => {
     useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
     const seen: (number | null | undefined)[] = [];
     const unsub = useLatencyStore.subscribe((s) => seen.push(s.latencyMap['n1']));
-    useLatencyStore.getState().applyLatencyResult('n1', 42);
+    seedMeasurementFixture({ 'n1': 42 });
     // 同一个 tick 里就已经通知过了 —— 若有人在写入路径上加 setTimeout/节流/合批，这里恒为空。
     expect(seen).toEqual([42]);
     expect(useLatencyStore.getState().latencyMap.n1).toBe(42);
@@ -206,9 +207,9 @@ describe('不变量① · 延迟回包的及时性', () => {
     useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
     // 这两条正是 `NodeCard` 里 `(s) => s.latencyMap[server.id]` 的取值语义。
     const readOf = (id: string) => useLatencyStore.getState().latencyMap[id];
-    useLatencyStore.getState().applyLatencyResult('n1', 100);
+    seedMeasurementFixture({ 'n1': 100 });
     const otherBefore = readOf('n2');
-    useLatencyStore.getState().applyLatencyResult('n1', 55);
+    seedMeasurementFixture({ 'n1': 55 });
     expect(readOf('n1')).toBe(55); // 本卡：值变了 ⇒ 该卡重渲
     expect(readOf('n2')).toBe(otherBefore); // 邻卡：判等 ⇒ 不重渲
     expect(Object.is(readOf('n2'), otherBefore)).toBe(true);
@@ -225,10 +226,10 @@ describe('不变量① · 延迟回包的及时性', () => {
       sortServersByLatency(list, (id) => useLatencyStore.getState().latencyMap[id], 'asc').map(
         (s) => s.id
       );
-    useLatencyStore.getState().applyLatencyResults({ a: 300, b: 200, c: 100 });
+    seedMeasurementFixture({ a: 300, b: 200, c: 100 });
     expect(order()).toEqual(['c', 'b', 'a']);
     // 单个节点回包 → 下一次求值立刻反映新顺序，不等任何计时器。
-    useLatencyStore.getState().applyLatencyResult('a', 10);
+    seedMeasurementFixture({ 'a': 10 });
     expect(order()).toEqual(['a', 'c', 'b']);
   });
 
@@ -321,7 +322,7 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
   });
 
   it('选择器**每次渲染都会被重建**，跨实例也必须返回同一引用', () => {
-    // 调用点写的是 `useLatencyStore(latencySortSelector(sortKey === 'lat'))` —— 每渲染一次就是一个
+    // 调用点写的是 `useQualifiedLatencies(activeGroup?.servers ?? [], sortKey === 'lat')` —— 每渲染一次就是一个
     // 新的选择器函数。稳定性只能来自模块级常量，不能来自 useMemo/闭包缓存。
     const a = latencySortSelector(false);
     const b = latencySortSelector(false);
@@ -340,7 +341,7 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
   });
 
   it('父层确实按 sortKey 条件订阅，且不得退回无条件订整表', () => {
-    expect(WINDOW).toContain("useLatencyStore(latencySortSelector(sortKey === 'lat'))");
+    expect(WINDOW).toContain("useQualifiedLatencies(activeGroup?.servers ?? [], sortKey === 'lat')");
     // 原状形态：`const latencies = useLatencyStore((s) => s.latencyMap);`
     expect(SPLIT_ALL + WINDOW, '父层又无条件订整张延迟表了').not.toMatch(
       /useLatencyStore\(\s*\(s\)\s*=>\s*s\.latencyMap\s*\)/

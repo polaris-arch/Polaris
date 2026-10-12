@@ -2193,6 +2193,7 @@
     "subUpdatingHint": "Updating this subscription (manual refresh and background auto-update share the same progress)",
     "subUpdatingProviders": "Fetching providers {{done}}/{{total}}",
     "tab": {
+      "all": "All",
       "manual": "Manual Nodes",
       "mesh": "Mesh"
     },
@@ -3254,5 +3255,21 @@
       "switch": "This evaluation chose to switch; use the actual exit for the runtime result",
       "notEvaluated": "Not evaluated this time"
     }
+  },
+  "measurement": {
+    "unavailable": "Results temporarily unavailable",
+    "success": "Success",
+    "failed": "Failed",
+    "unmeasured": "Unmeasured",
+    "expired": "Expired",
+    "paused": "Paused",
+    "notIncluded": "Not included",
+    "disconnected": "Measured while disconnected",
+    "systemPath": "System path",
+    "selectedPath": "Selected exit",
+    "nodePath": "Node measurement",
+    "bindingMismatch": "Carrier differs from requested node",
+    "iosTitle": "Measure using VPN",
+    "iosWillStart": "This measurement uses the normal VPN connection. If disconnected, it will start the VPN and keep it connected."
   }
 }

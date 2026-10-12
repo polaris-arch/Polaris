@@ -2193,6 +2193,7 @@
     "subUpdatingHint": "正在更新此訂閱（手動重新整理與背景自動更新共用同一進度）",
     "subUpdatingProviders": "擷取子訂閱 {{done}}/{{total}}",
     "tab": {
+      "all": "全部",
       "manual": "自建節點",
       "mesh": "組網"
     },
@@ -3254,5 +3255,21 @@
       "switch": "本次評估決定換點，執行結果以實際出口為準",
       "notEvaluated": "本次未評估"
     }
+  },
+  "measurement": {
+    "unavailable": "結果暫不可讀",
+    "success": "成功",
+    "failed": "失敗",
+    "unmeasured": "未測",
+    "expired": "過期",
+    "paused": "暫停",
+    "notIncluded": "未納入",
+    "disconnected": "未連線測量",
+    "systemPath": "系統路徑",
+    "selectedPath": "目前出口",
+    "nodePath": "節點測量",
+    "bindingMismatch": "實際承載與請求節點不同",
+    "iosTitle": "透過VPN測量",
+    "iosWillStart": "此測量使用正常VPN連線。如果尚未連線，將開啟VPN並保持連線。"
   }
 }

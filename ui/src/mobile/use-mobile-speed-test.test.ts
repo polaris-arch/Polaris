@@ -84,7 +84,7 @@ describe('mobile measured latency task identity', () => {
     expect(store.getState().task).toMatchObject({runId:'7',phase:'waiting',tested:1,total:3});
     dispose();expect(off).toHaveBeenCalledTimes(3);
   });
-  it('only accepted active RESULT writes latency; old results cannot overwrite a newer run and passive RTT still works', () => {
+  it('accepted task results keep run identity while passive/bare numbers cannot bypass ledger qualification', () => {
     let result!: Parameters<typeof api.server.onSpeedTestResult>[0];
     vi.spyOn(api.server,'onSpeedTestProgress').mockReturnValue(() => {});
     vi.spyOn(api.server,'onSpeedTestResult').mockImplementation(handler => { result=handler;return () => {}; });
@@ -93,9 +93,9 @@ describe('mobile measured latency task identity', () => {
     result({runId:'9',serverId:'a',latency:10});
     result({runId:'10',serverId:'a',latency:20});
     result({runId:'9',serverId:'a',latency:99});
-    expect(useLatencyStore.getState().latencyMap.a).toBe(20);
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined(); // Only a qualified ledger snapshot may publish numeric data.
     result({serverId:'warm',latency:30});
-    expect(useLatencyStore.getState().latencyMap.warm).toBe(30);
+    expect(useLatencyStore.getState().latencyMap.warm).toBeUndefined();
     expect(store.getState().task?.runId).toBe('10');
     expect(store.getState().task?.results).toEqual({a:20});
     dispose();
@@ -121,7 +121,7 @@ describe('mobile measured latency task identity', () => {
     const second=runMobileSpeedTest(['a'],'all');
     result({runId:'12',serverId:'a',latency:40});
     finish(receipt('12',{results:{a:40}}));await second;
-    expect(useLatencyStore.getState().latencyMap.a).toBe(40);
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined(); // Receipt is a refresh signal, not an identity proof.
     expect(apply).toHaveBeenCalledOnce(); // event and receipt together write the value once
     dispose();
   });
@@ -162,7 +162,7 @@ describe('mobile measured latency task identity', () => {
     expect(store.getState().task?.appliedResults).toEqual({});
     finish(receipt('21', { results: { a: 42 }, measurementContext: context }));
     await pending;
-    expect(useLatencyStore.getState().latencyMap.a).toBe(42);
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined(); // Qualified snapshot feed is tested separately.
     expect(write).toHaveBeenCalledOnce();
     expect(useAppStore.getState().proxyStatus).toMatchObject({ running: true, mainGeneration: 2 });
     dispose();

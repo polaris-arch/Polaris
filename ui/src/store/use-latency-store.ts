@@ -29,6 +29,12 @@
  */
 import { create } from 'zustand';
 import { api } from '@/ipc';
+import { useAppStore } from './app-store';
+import { configBaseVersion, configContentDigest } from '@/lib/staged-config';
+import type { ServerConfig } from '@/contracts/types';
+import type { MeasurementProjection, MeasurementSnapshot } from '@/contracts/measurement-display';
+import { projectMeasurement } from '@/domain/measurement-display';
+import { validMeasurementSnapshot } from '@/domain/measurement-snapshot';
 
 /**
  * 「延迟已陈旧」阈值（契约「状态栏」：`当前节点延迟(陈旧>30min 半透明)`）。
@@ -49,20 +55,19 @@ export function isLatencyStale(testedAt: number | undefined, now: number = Date.
 }
 
 interface LatencyState {
-  /** `serverId → 延迟 ms`。`null`=后端真实探测失败/超时；键缺席=本会话未测过（UI 显「—」）。 */
+  /** Compatibility numeric view: only current candidate-path ledger values. */
   latencyMap: Record<string, number | null>;
-  /**
-   * `serverId → 该延迟的落库时刻（epoch ms）`。与 `latencyMap` **同写同键**：两个写入口
-   * （`applyLatencyResult` / `applyLatencyResults`）就是全部写入点，故只要打戳收口在本 store 内，
-   * 就不存在「某条写入路径忘了打戳」的漏面——组件侧无法绕过它直接改 map。
-   */
   testedAt: Record<string, number>;
-  /** 单节点结果落库（`onSpeedTestResult` 流式回填的唯一写入口）。 */
+  projections: Record<string, MeasurementProjection>;
+  currentProjections: Record<string, MeasurementProjection>;
+  snapshot: MeasurementSnapshot | null;
+  readError: boolean;
+  /** Old callers only request authoritative refresh; their bare numbers never enter the store. */
   applyLatencyResult: (serverId: string, latency: number | null) => void;
-  /** 批量合并（invoke 返回值兜底同步：事件丢失时补齐）。**合并不替换** —— 未在本批的节点保留历史值。 */
   applyLatencyResults: (results: Record<string, number | null>) => void;
-  /** 配置节点集变化后驱逐已删除节点；两个 map 同键裁剪，避免长会话反复订阅/删除后只增不减。 */
   retainServerIds: (serverIds: readonly string[]) => void;
+  applySnapshot: (snapshot: MeasurementSnapshot, servers: readonly ServerConfig[], now?: number) => void;
+  invalidate: (readFailed?: boolean) => void;
 }
 
 /**
@@ -75,44 +80,55 @@ export function normalizeLatencyResult(latency: number | null): number | null {
   return latency === null || !Number.isFinite(latency) || latency < 0 ? null : latency;
 }
 
+let requestLedgerRefresh: (() => void) | undefined;
+
+function stableMap<T>(previous: Record<string, T>, next: Record<string, T>): Record<string, T> {
+  const keys = Object.keys(next);
+  return keys.length === Object.keys(previous).length && keys.every(key => Object.is(previous[key], next[key])) ? previous : next;
+}
+
 export const useLatencyStore = create<LatencyState>((set) => ({
-  latencyMap: {},
-  testedAt: {},
-  applyLatencyResult: (serverId, latency) =>
-    set((s) => ({
-      latencyMap: { ...s.latencyMap, [serverId]: normalizeLatencyResult(latency) },
-      testedAt: { ...s.testedAt, [serverId]: Date.now() },
-    })),
-  applyLatencyResults: (results) =>
-    set((s) => {
-      // 一批同一时刻：批量结果来自同一次 speedTest 的 invoke 返回值，逐键取 Date.now() 只会引入
-      // 无意义的毫秒级抖动。
-      const now = Date.now();
-      const stamps: Record<string, number> = { ...s.testedAt };
-      const normalized: Record<string, number | null> = {};
-      for (const [id, latency] of Object.entries(results)) {
-        stamps[id] = now;
-        normalized[id] = normalizeLatencyResult(latency);
-      }
-      return { latencyMap: { ...s.latencyMap, ...normalized }, testedAt: stamps };
-    }),
-  retainServerIds: (serverIds) =>
-    set((s) => {
-      const keep = new Set(serverIds);
-      const latencyMap: Record<string, number | null> = {};
-      const testedAt: Record<string, number> = {};
-      let removed = false;
-      for (const [id, latency] of Object.entries(s.latencyMap)) {
-        if (keep.has(id)) latencyMap[id] = latency;
-        else removed = true;
-      }
-      for (const [id, at] of Object.entries(s.testedAt)) {
-        if (keep.has(id)) testedAt[id] = at;
-        else removed = true;
-      }
-      // 返回原 state 保持引用稳定：节点集未删项是常态，不为一次 configChanged 制造全树通知。
-      return removed ? { latencyMap, testedAt } : s;
-    }),
+  latencyMap: {}, testedAt: {}, projections: {}, currentProjections: {}, snapshot: null, readError: false,
+  applyLatencyResult: () => requestLedgerRefresh?.(),
+  applyLatencyResults: () => requestLedgerRefresh?.(),
+  applySnapshot: (snapshot, servers, now = snapshot.now) => set(previous => {
+    if (!validMeasurementSnapshot(snapshot) || !snapshot.consistent) return previous;
+    if (previous.snapshot?.process === snapshot.process && BigInt(previous.snapshot.revision) > BigInt(snapshot.revision)) return previous;
+    const candidate: Array<[string, MeasurementProjection]> = [];
+    const current: Array<[string, MeasurementProjection]> = [];
+    const values: Array<[string, number | null]> = [];
+    const stamps: Array<[string, number]> = [];
+    for (const server of servers) {
+      if (!Object.hasOwn(snapshot.rows, server.id)) continue;
+      const project = (purpose: 'candidate' | 'current', old: Record<string, MeasurementProjection>) => {
+        const value = projectMeasurement(snapshot, server, now, purpose);
+        return JSON.stringify(old[server.id]) === JSON.stringify(value) ? old[server.id] : value;
+      };
+      const value = project('candidate', previous.projections);
+      candidate.push([server.id, value]); current.push([server.id, project('current', previous.currentProjections)]);
+      if (value.state === 'success' && value.latency !== undefined && !value.bindingMismatch) values.push([server.id, value.latency]);
+      else if (value.state === 'failed') values.push([server.id, null]);
+      if (value.measuredAt !== undefined) stamps.push([server.id, value.measuredAt]);
+    }
+    return { snapshot, readError: false, projections: stableMap(previous.projections, Object.fromEntries(candidate)),
+      currentProjections: stableMap(previous.currentProjections, Object.fromEntries(current)),
+      latencyMap: stableMap(previous.latencyMap, Object.fromEntries(values)), testedAt: stableMap(previous.testedAt, Object.fromEntries(stamps)) };
+  }),
+  invalidate: (readFailed = false) => set(previous => {
+    const expire = (values: Record<string, MeasurementProjection>) => Object.fromEntries(Object.entries(values)
+      .map(([id, value]) => [id, value.state === 'success' || value.state === 'failed'
+        ? { ...value, state: 'expired' as const, latency: undefined } : value]));
+    return { snapshot: null, readError: readFailed, latencyMap: {}, projections: expire(previous.projections), currentProjections: expire(previous.currentProjections) };
+  }),
+  retainServerIds: ids => set(previous => {
+    const keep = new Set(ids);
+    const retain = <T,>(values: Record<string, T>): Record<string, T> =>
+      stableMap(values, Object.fromEntries(Object.entries(values).filter(([id]) => keep.has(id))));
+    const next = { latencyMap: retain(previous.latencyMap), testedAt: retain(previous.testedAt),
+      projections: retain(previous.projections), currentProjections: retain(previous.currentProjections) };
+    return next.latencyMap === previous.latencyMap && next.testedAt === previous.testedAt
+      && next.projections === previous.projections && next.currentProjections === previous.currentProjections ? previous : next;
+  }),
 }));
 
 /**
@@ -152,8 +168,121 @@ export function latencyMapWhen(
  * 调用点必须是该窗口生命周期内**只挂载一次**的根（主窗 `App.tsx` / 托盘窗 `TrayMenu`）。
  * 挂到业务组件里即退回「切屏即丢」（见本文件顶部）。
  */
-export function subscribeLatencyEvents(): () => void {
-  return api.server.onSpeedTestResult((r) => {
-    useLatencyStore.getState().applyLatencyResult(r.serverId, r.latency);
-  });
+/** One shared, reference-counted feed per JS window. Events are invalidation signals;
+ * only a same-context readback may publish numeric data. No persistent results or probes. */
+export function subscribeLatencyEvents(options: { poll?: boolean } = {}): () => void {
+  return acquireMeasurementFeed(options.poll !== false);
+}
+
+let feedUsers = 0;
+let stopFeed: (() => void) | undefined;
+function acquireMeasurementFeed(poll: boolean): () => void {
+  if (feedUsers++ === 0) stopFeed = startMeasurementFeed(poll);
+  let stopped = false;
+  return () => { if (!stopped) { stopped = true; if (--feedUsers === 0) { stopFeed?.(); stopFeed = undefined; } } };
+}
+
+function startMeasurementFeed(pollEnabled: boolean): () => void {
+  useLatencyStore.getState().invalidate();
+  let alive = true, inFlight = false, pending = false, epoch = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let snapshotMono = 0;
+  let snapshotWall = 0;
+  let hashInput: unknown;
+  let hashPromise: Promise<string> | undefined;
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  const offs: Array<() => void> = [];
+  const refresh = async () => {
+    if (!alive) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (inFlight) { pending = true; return; }
+    const state = useAppStore.getState();
+    if (!state.config) return;
+    inFlight = true;
+    const ticket = epoch;
+    const version = configBaseVersion(state.config);
+    const context = connectionKey(state.proxyStatus);
+    try {
+      if (hashInput !== state.config || !hashPromise) {
+        hashInput = state.config; hashPromise = configContentDigest(state.config);
+      }
+      const digest = await hashPromise;
+      if (!alive || ticket !== epoch) return;
+      const result = await api.server.speedTestResultSnapshot();
+      const current = useAppStore.getState();
+      if (!alive || ticket !== epoch || !current.config || configBaseVersion(current.config) !== version
+        || connectionKey(current.proxyStatus) !== context) return;
+      if (!validMeasurementSnapshot(result)
+        || result.configVersion !== version || result.frontendConfigDigest !== digest || !result.consistent
+        || current.proxyStatus?.running === true && (result.generation !== current.proxyStatus.mainGeneration
+          || result.startTime !== (current.proxyStatus.startTime ?? null))
+        || current.proxyStatus?.running === false && result.generation !== null) {
+        useLatencyStore.getState().invalidate(true); return;
+      }
+      const prior = useLatencyStore.getState().snapshot;
+      if (prior?.process === result.process && BigInt(prior.revision) > BigInt(result.revision)) return;
+      useLatencyStore.getState().applySnapshot(result, current.config.servers);
+      snapshotMono = performance.now(); snapshotWall = Date.now();
+      nextExpiry = earliestExpiry(result, result.now);
+    } catch {
+      hashPromise = undefined;
+      if (alive && ticket === epoch) useLatencyStore.getState().invalidate(true);
+    } finally {
+      inFlight = false;
+      if (alive && pending) { pending = false; schedule(); }
+    }
+  };
+  const schedule = () => {
+    if (!alive || timer !== undefined) return;
+    timer = setTimeout(() => { timer = undefined; void refresh(); }, 200);
+  };
+  requestLedgerRefresh = schedule;
+  const register = (listen: () => () => void) => {
+    try { offs.push(listen()); } catch { useLatencyStore.getState().invalidate(); }
+  };
+  register(() => api.server.onSpeedTestResult(schedule));
+  register(() => api.server.onSpeedTestSchedule(schedule));
+  const invalidate = () => { epoch += 1; useLatencyStore.getState().invalidate(); schedule(); };
+  register(() => api.proxy.onLifecycle(invalidate));
+  offs.push(useAppStore.subscribe((next, previous) => {
+    if (next.config !== previous.config || connectionKey(next.proxyStatus) !== connectionKey(previous.proxyStatus)) invalidate();
+  }));
+  // Bounded read-only refresh covers backend network/foreground changes even without a
+  // result event. Stable projections preserve per-node references between unchanged reads.
+  const poll = pollEnabled ? setInterval(schedule, 5000) : undefined;
+  const clock = setInterval(() => {
+    const result = useLatencyStore.getState().snapshot;
+    const config = useAppStore.getState().config;
+    if (!alive || !result || !config) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    const elapsed = performance.now() - snapshotMono;
+    if (Date.now() < snapshotWall || Math.abs(Date.now() - snapshotWall - elapsed) > 5000) {
+      invalidate(); return;
+    }
+    const now = result.now + elapsed;
+    if (now > nextExpiry) {
+      useLatencyStore.getState().applySnapshot(result, config.servers, now);
+      nextExpiry = earliestExpiry(result, now);
+    }
+  }, 1000);
+  const onVisible = () => { if (document.visibilityState === 'visible') invalidate(); };
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', onVisible);
+    offs.push(() => document.removeEventListener('visibilitychange', onVisible));
+  }
+  void refresh();
+  return () => { alive = false; epoch += 1; clearTimeout(timer); clearInterval(poll); clearInterval(clock); requestLedgerRefresh = undefined; offs.forEach(off => off()); };
+}
+
+function earliestExpiry(snapshot: MeasurementSnapshot, now: number): number {
+  let next = Number.POSITIVE_INFINITY;
+  for (const row of Object.values(snapshot.rows)) for (const purpose of ['candidate','system','selected'] as const) {
+    const record = row[purpose];
+    if (record && record.state !== 'expired' && record.expiresAt > now) next = Math.min(next, record.expiresAt);
+  }
+  return next;
+}
+
+function connectionKey(status: ReturnType<typeof useAppStore.getState>['proxyStatus']): string {
+  return `${status?.running === true}|${status?.mainGeneration ?? ''}|${status?.startTime ?? ''}`;
 }

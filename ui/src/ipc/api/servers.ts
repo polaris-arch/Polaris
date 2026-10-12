@@ -7,6 +7,7 @@ import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTas
 import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload, SpeedTestScheduleStatus } from '../../contracts/speed-test';
 import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 import type { AutoSelectReceipt, AutoSelectStatus } from '../../contracts/auto-select';
+import type { MeasurementSnapshot } from '../../contracts/measurement-display';
 
 // ============================================================================
 // serverApi
@@ -203,6 +204,11 @@ export const serverApi = {
   /** 周期测速的计划状态（只读）：四态与原因、逐订阅的上次完整轮次、设置项的取值范围。 */
   async speedTestScheduleStatus(): Promise<SpeedTestScheduleStatus> {
     return invoke(IPC_CHANNELS.SPEED_TEST_SCHEDULE_STATUS);
+  },
+
+  /** Hydrate the existing ledger after a window restart, or a result/lifecycle change. */
+  async speedTestResultSnapshot(): Promise<MeasurementSnapshot> {
+    return invoke(IPC_CHANNELS.SPEED_TEST_RESULT_SNAPSHOT);
   },
 
   /** 计划状态变化（状态或其原因变了、一轮刚收尾）。 */

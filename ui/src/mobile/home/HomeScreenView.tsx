@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '../MeasurementLabel';
 import { MobileSpeedTestProgress } from '../MobileSpeedTestProgress';
 import { HomeNodePickerList } from './HomeNodePickerList';
 import { RuleHitButton } from './RuleHitButton';
@@ -671,6 +672,8 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                     ? t('mobileHome.latencyChecking')
                     : props.node.kind !== 'node'
                       ? props.latencyCheck.blockedStatus
+                      : props.node.serverId
+                        ? <MeasurementLabel serverId={props.node.serverId} purpose="current" />
                       : props.node.latencyMs === undefined
                         ? props.latencyCheck.blocked ? props.latencyCheck.blockedStatus : t('home.unlockStatus.idle')
                         : props.node.latencyMs === null

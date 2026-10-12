@@ -979,6 +979,16 @@ export function configBaseVersion(config: unknown): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
+/** Content binding for read-only measurement snapshots; the FNV edit version alone
+ * is not a collision-resistant identity. Uses the existing config serialization. */
+export async function configContentDigest(config: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(stableStringify(config)));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** Exact content comparison for displayed versus saved node objects, without a short hash. */
+export function configCanonicalText(config: unknown): string { return stableStringify(config); }
+
 /** 键序稳定的 JSON 序列化（数组保序 —— 数组顺序在 config 里是语义的一部分）。 */
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;

@@ -1,3 +1,5 @@
+import { useQualifiedLatencies } from '../use-qualified-latencies';
+import { requestIOSMeasurementConsent } from '../MeasurementStartNotice';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * 移动端「首页」的**接线层**：读 store、订阅事件流、发 IPC，把结果整形成 `view-model.ts` 的 props。
@@ -159,7 +161,7 @@ export function MobileHomeScreen(): ReactElement {
   /** 连接/断开在飞（后端只投影 `starting`，「停止中」没有对应字段，由这里补）。 */
   const [connectBusy, setConnectBusy] = useState<'starting' | 'stopping' | null>(null);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
-  const checkRun = useRef({ generation: 0, busy: false, alive: true, requestId: null as string | null });
+  const checkRun = useRef({ generation: 0, busy: false, alive: true, backendRequested: false, requestId: null as string | null });
   const normalMainRequired = manualSpeedTestCaps(false).normalMainRequired === true;
   const runWrite = useMemo(() => createRunWrite(setWriteErrors, t), [t]);
 
@@ -178,7 +180,7 @@ export function MobileHomeScreen(): ReactElement {
   const beginUnlockCheck = useAppStore((s) => s.beginUnlockCheck);
   const applyUnlockSnapshot = useAppStore((s) => s.applyUnlockSnapshot);
   const setIpInfo = useAppStore((s) => s.setIpInfo);
-  const latencyMap = useLatencyStore((s) => s.latencyMap);
+  const latencyMap = useQualifiedLatencies(servers);
   const testedAt = useLatencyStore((s) => s.testedAt);
   const config = useEffectiveConfig();
   const { update } = useConfig();
@@ -207,7 +209,7 @@ export function MobileHomeScreen(): ReactElement {
       checkRun.current.generation += 1;
       checkRun.current.alive = false;
       const requestId = checkRun.current.requestId;
-      if (requestId) void runWrite('network-check', async () => {
+      if (requestId && checkRun.current.backendRequested) void runWrite('network-check', async () => {
         try {
           await unlockApi.cancelManualCheck(requestId);
         } catch {
@@ -311,6 +313,7 @@ export function MobileHomeScreen(): ReactElement {
     const code = resolveExitNodeFlagCode(proxyRunning, ipInfo?.proxy?.countryCode);
     return {
       kind: 'node',
+      serverId: currentServer.id,
       name: currentServer.name,
       protocolLabel: protocolLabelOf(currentServer.protocol),
       flagSrc: code === null ? null : (countryCodeToFlagAsset(code)?.src ?? null),
@@ -517,9 +520,14 @@ export function MobileHomeScreen(): ReactElement {
     const startedConfig = JSON.stringify(getEffectiveConfig());
     const requestId = normalMainRequired ? crypto.randomUUID() : null;
     checkRun.current.requestId = requestId;
+    checkRun.current.backendRequested = false;
     setManualCheckBusy(true);
     void runWrite('network-check', async () => {
       if (requestId) {
+        if (!await requestIOSMeasurementConsent()) return;
+        if (!checkRun.current.alive || checkRun.current.generation !== generation
+          || JSON.stringify(getEffectiveConfig()) !== startedConfig || useAppStore.getState().selectedServerId !== startedServerId) return;
+        checkRun.current.backendRequested = true;
         const result = await unlockApi.manualCheck(requestId, true);
         const previous = useAppStore.getState().proxyStatus;
         const current = await api.proxy.getStatus();
@@ -534,7 +542,7 @@ export function MobileHomeScreen(): ReactElement {
         if (result.unlock.data) applyUnlockSnapshot(result.unlock.data);
         state.setUnlock({ running: false });
         // The same explicit network action also refreshes the current RTT, after ready.
-        await latencyCheck.runCurrent();
+        await latencyCheck.runCurrent(true);
         const failures = [result.ipInfo.error && t('prerequisite.ipInfoFailed'),
           result.unlock.error && t('prerequisite.unlockFailed')].filter(Boolean);
         if (failures.length) throw new Error(failures.join(' '));
@@ -557,9 +565,11 @@ export function MobileHomeScreen(): ReactElement {
       if (ip.status === 'rejected') throw ip.reason;
       if (services.status === 'rejected') throw services.reason;
     }).finally(() => {
+      const requested = checkRun.current.backendRequested;
       checkRun.current.busy = false;
       checkRun.current.requestId = null;
-      if (requestId && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
+      checkRun.current.backendRequested = false;
+      if (requestId && requested && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
       if (checkRun.current.alive) setManualCheckBusy(false);
     });
   }, [runWrite, beginUnlockCheck, applyUnlockSnapshot, setIpInfo, normalMainRequired, latencyCheck, t]);

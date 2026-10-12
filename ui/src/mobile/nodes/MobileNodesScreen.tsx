@@ -1,3 +1,5 @@
+import { cancelMeasurementConsent } from '../MeasurementStartNotice';
+import { useQualifiedLatencies } from '../use-qualified-latencies';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 import { AutoSelectStatusPanel } from '../AutoSelectStatusPanel';
 import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
@@ -70,7 +72,7 @@ import { useSubscriptionProgressStore } from '@/store/use-subscription-progress-
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
-import { groupServersBySubscription } from '@/domain/server-grouping';
+import { nodeViewGroups } from '@/domain/server-grouping';
 import {
   speedTestableIds,
   manualSpeedTestCaps,
@@ -135,6 +137,7 @@ import type {
    `protocol-label-parity.test.ts`。 */
 
 export function MobileNodesScreen(): ReactElement {
+  useEffect(() => () => cancelMeasurementConsent(), []);
   const { t } = useTranslation();
   const config = useEffectiveConfig();
   const savedConfig = useAppStore((s) => s.config);
@@ -145,14 +148,14 @@ export function MobileNodesScreen(): ReactElement {
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const startProxy = useAppStore((s) => s.startProxy);
   const invalidNodes = useAppStore((s) => s.invalidNodes);
-  const latencyMap = useLatencyStore((s) => s.latencyMap);
+  const latencyMap = useQualifiedLatencies(servers);
   const testedAt = useLatencyStore((s) => s.testedAt);
   const subscriptionProgress = useSubscriptionProgressStore((s) => s.progress);
 
   const subscriptions = useMemo(() => config?.subscriptions ?? [], [config?.subscriptions]);
   const groups = useMemo(
-    () => groupServersBySubscription(servers, subscriptions, true),
-    [servers, subscriptions],
+    () => nodeViewGroups(servers, subscriptions, { manual: t('nodes.tab.manual'), mesh: t('nodes.tab.mesh') }),
+    [servers, subscriptions, t],
   );
 
   const [tab, setTab] = useState<string | null>(null);
@@ -531,7 +534,7 @@ export function MobileNodesScreen(): ReactElement {
         const progress = subscriptionProgress[g.id];
         return {
           id: g.id,
-          label: g.isManual ? t('nodes.tab.manual') : g.isMesh === true ? t('nodes.tab.mesh') : g.name,
+          label: g.isAll ? t('nodes.tab.all') : g.isManual ? t('nodes.tab.manual') : g.isMesh === true ? t('nodes.tab.mesh') : g.name,
           count: g.servers.length,
           failureDetail:
             progress?.phase === 'failed' ? subscriptionErrorDetail(progress, t) : undefined,
@@ -543,12 +546,14 @@ export function MobileNodesScreen(): ReactElement {
   const rows = useMemo<NodeRowVM[]>(
     () =>
       visibleServers.map((server) => {
-        const mesh = activeGroup?.isMesh === true || isMeshNode(server);
+        const source = activeGroup?.sources?.[server.id];
+        const mesh = activeGroup?.isMesh === true || source?.kind === 'mesh' || isMeshNode(server);
         const meshRouteContextMismatch = mesh && meshRoute.report?.snapshot.configSource === 'running' &&
           (!meshReportMatchesScreen || stagedOnly.has(server.id));
         const reason = speedTestBlockReason(server, speedTestCaps, stagedOnly.has(server.id));
         return {
           server,
+          sourceLabel: source ? source.kind === 'subscription' ? source.name : t(`nodes.tab.${source.kind}`) : undefined,
           isCurrent: server.id === selectedServerId,
           isExit: mesh,
           lanOnly: mesh && !meshAllowsInternet(server),

@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 /**
  * NodeMenu —— 首页出口节点内联选单（1:1 提取自原型 polaris-prototype.html #node-menu，
  * renderNodeMenu/toggleNodeMenu/pickNode/pickDirectExit/toggleNmGroup，L3457-3521）。
@@ -165,11 +166,7 @@ export function NodeMenu({
     }
   };
 
-  const latText = (v: number | null | undefined): string => {
-    if (v === null) return t('home.timeoutShort');
-    if (v === undefined) return '';
-    return `${v} ms`;
-  };
+
 
   if (!open) {
     return <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')} hidden />;
@@ -290,7 +287,7 @@ export function NodeMenu({
                   <span className="nm-badge">
                     {s.protocol === 'masque-client' ? 'MASQUE' : s.protocol.toUpperCase()}
                   </span>
-                  <span className={cn('nm-lat', latLevel(lat))}>{latText(lat)}</span>
+                  <span className={cn('nm-lat', latLevel(lat))}>{<MeasurementLabel serverId={s.id} displayedServer={s} />}</span>
                   {on && <NmCheck />}
                 </button>
               );

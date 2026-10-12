@@ -16,9 +16,9 @@ const positive = (s) => /^[1-9][0-9]*$/.test(String(s ?? ''));
 
 export function validationContext(candidate, env = process.env, root = process.cwd()) {
   const historicalRef = env.GITHUB_REF === 'refs/heads/collab/fk02-native-payload-validation-20261010';
-  // The cumulative S5 candidate consumes the strict published contract. It does
+  // The cumulative S5/UI candidates consume the strict published contract. They do
   // not inherit the historical source/origin exemption on another branch.
-  const publishedRef = env.GITHUB_REF === 'refs/heads/collab/s5-android-signal-20261010'
+  const publishedRef = ['refs/heads/collab/s5-android-signal-20261010', 'refs/heads/collab/ui01-status-20261010'].includes(env.GITHUB_REF)
     && validationSourceMode(root) === 'published-release-v1';
   requireGraph(env.POLARIS_NATIVE_PAYLOAD_VALIDATION === '1' && env.GITHUB_ACTIONS === 'true'
     && env.POLARIS_NO_KERNEL_RUN !== '1' && env.GITHUB_EVENT_NAME === 'workflow_dispatch'
