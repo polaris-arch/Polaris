@@ -81,6 +81,8 @@ export function normalizeLatencyResult(latency: number | null): number | null {
 }
 
 let requestLedgerRefresh: (() => void) | undefined;
+/** Actual invoke failures may have published qualified omissions without a result event. */
+export function refreshMeasurementLedger(): void { requestLedgerRefresh?.(); }
 
 function stableMap<T>(previous: Record<string, T>, next: Record<string, T>): Record<string, T> {
   const keys = Object.keys(next);

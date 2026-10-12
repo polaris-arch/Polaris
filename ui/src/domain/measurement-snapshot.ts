@@ -36,10 +36,12 @@ export function validMeasurementSnapshot(value: unknown): value is MeasurementSn
       && (record.state === 'expired' || identity.instance.kind !== 'main' || identity.configDigest === value.emissionDigest && value.emissionDigest !== null)
       && (identity.instance.kind === 'temp') === record.disconnected
       && nullableNumber(identity.networkEpoch)
-      && (identity.nodeFingerprint === null || typeof identity.nodeFingerprint === 'string')
+      && !Object.hasOwn(identity, 'nodeFingerprint')
+      && (identity.nodeFingerprintDigest === null || typeof identity.nodeFingerprintDigest === 'string' && /^[a-f0-9]{64}$/.test(identity.nodeFingerprintDigest))
+      && (identity.connectionDigest === null || typeof identity.connectionDigest === 'string' && /^[a-f0-9]{64}$/.test(identity.connectionDigest))
       && (identity.configDigest === null || typeof identity.configDigest === 'string')
       && (record.state !== 'success' || integer(record.latency))
-      && (record.state === 'expired' || typeof identity.nodeFingerprint === 'string' && /^[a-f0-9]{64}$/.test(identity.nodeFingerprint))
+      && (record.state === 'expired' || typeof identity.nodeFingerprintDigest === 'string' && typeof identity.connectionDigest === 'string')
       && (record.state !== 'failed' || record.latency === null);
   }));
 }

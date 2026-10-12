@@ -7,8 +7,9 @@ import type { ServerConfig } from '@/contracts/types';
 import type { MeasurementProjection } from '@/contracts/measurement-display';
 
 /** Shared desktop/mobile presentation. The store owns qualification and purpose. */
-export function MeasurementLabel({ serverId, purpose = 'candidate', displayedServer }: { serverId: string; purpose?: 'candidate' | 'current'; displayedServer?: ServerConfig }) {
-  const { t } = useTranslation();
+export function MeasurementLabel({ serverId, purpose = 'candidate', displayedServer, translate }: { serverId: string; purpose?: 'candidate' | 'current'; displayedServer?: ServerConfig; translate?: (key: string, vars?: Record<string, unknown>) => string }) {
+  const { t: sharedT } = useTranslation();
+  const t = translate ?? sharedT;
   const result = useLatencyStore(state => {
     const values = purpose === 'candidate' ? state.projections : state.currentProjections;
     return Object.hasOwn(values, serverId) ? values[serverId] : UNMEASURED_PROJECTION;

@@ -314,6 +314,7 @@ export function MobileHomeScreen(): ReactElement {
     return {
       kind: 'node',
       serverId: currentServer.id,
+      displayedServer: currentServer,
       name: currentServer.name,
       protocolLabel: protocolLabelOf(currentServer.protocol),
       flagSrc: code === null ? null : (countryCodeToFlagAsset(code)?.src ?? null),

@@ -1,3 +1,15 @@
+import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
+import { useLatencyStore } from '@/store/use-latency-store';
+import { useAppStore } from '@/store/app-store';
+import type { UserConfig } from '@/contracts/types';
+vi.mock('@/store/use-latency-store', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/use-latency-store')>();
+  return { ...actual, useLatencyStore: Object.assign((select: (state: ReturnType<typeof actual.useLatencyStore.getState>) => unknown) => select(actual.useLatencyStore.getState()), actual.useLatencyStore) };
+});
+vi.mock('@/store/app-store', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/app-store')>();
+  return { ...actual, useAppStore: Object.assign((select: (state: ReturnType<typeof actual.useAppStore.getState>) => unknown) => select(actual.useAppStore.getState()), actual.useAppStore) };
+});
 /**
  * 移动端「节点」屏的门。射程 = 本屏的**屏级契约**，与相邻两道门不重叠：
  * `../mobile-entry.test.ts` 守入口链路（CSS 契约 A1 / 五个目的地 / 导航与路由同源），
@@ -18,7 +30,7 @@
  * 纯否定式判据（「不许出现 X」）会被「什么都没发生」骗过：扫描器塌了、正则敲错一个字母、
  * 渲染抛异常被吞，都会让它们一路绿灯。故每组先断言取材面非空、量级合理，再断言正面等式。
  */
-import { beforeAll, describe, it, expect } from 'vitest';
+import { beforeAll, describe, it, expect, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -246,8 +258,18 @@ const baseProps = (over: Partial<NodesScreenViewProps> = {}): NodesScreenViewPro
   ...over,
 });
 
-const render = (over: Partial<NodesScreenViewProps> = {}): string =>
-  renderToStaticMarkup(<NodesScreenView {...baseProps(over)} />);
+let renderRevision = 0;
+const render = (over: Partial<NodesScreenViewProps> = {}): string => {
+  const props = baseProps(over);
+  const config = { servers: props.rows.map(row => row.server), subscriptions: [] } as unknown as UserConfig;
+  const values = Object.fromEntries(props.rows.filter(row => row.latencyMs !== undefined).map(row => [row.server.id,row.latencyMs!]));
+  const snapshot = measurementFixture(config,values,String(++renderRevision),Date.now());
+  for (const row of props.rows) if (row.latencyStale && snapshot.rows[row.server.id]?.candidate) snapshot.rows[row.server.id].candidate!.state='expired';
+  useAppStore.setState({config,servers:config.servers});
+  useLatencyStore.setState({snapshot:null,readError:false,latencyMap:{},testedAt:{},projections:{},currentProjections:{}});
+  useLatencyStore.getState().applySnapshot(snapshot,config.servers);
+  return renderToStaticMarkup(<NodesScreenView {...props} />);
+};
 
 // Cold PostCSS compilation and Chromium launch are fixture setup, not a width assertion.
 // The oracle's own file-level hook drains and closes the shared browser after all groups.
@@ -1791,7 +1813,7 @@ describe('⑨ 空态四档齐（IA §2.1 States 前四行）', () => {
 
   it('延迟陈旧渲染成「陈旧」而不是一个数（IA §2.1：never as a number）', () => {
     const html = render({ rows: [row('s', { latencyMs: 42, latencyStale: true })] });
-    expect(html).toContain('nodes.mobileLatencyStale');
+    expect(html).toContain('measurement.expired');
     expect(html).not.toContain('42 ms');
   });
 });
@@ -2181,17 +2203,20 @@ describe('⑫ 行内颜色角色：延迟分档色 + 角标族', () => {
   it('`none` 三档：没测过 / 陈旧 / 结构上不可测都不许染语义色（那是替用户断言一件不知道的事）', () => {
     expect(latClassOf({ latencyMs: 42, latencyStale: true })).toBe('none');
     expect(latClassOf({ speedTestable: false, speedTestBlockedHint: 'why' })).toBe('none');
-    // 没测过（`undefined`）连文案都没有 ⇒ 整个位不渲染，这也是「不画一个数」的一种。
-    expect(latClassOf({ latencyMs: undefined })).toBeNull();
+    // Unmeasured now stays mounted as an explicit qualified state, without a numeric value.
+    expect(latClassOf({ latencyMs: undefined })).toBe('none');
+    const unmeasured = render({rows:[row('x',{latencyMs:undefined})]});
+    expect(unmeasured).toContain('data-measurement-state="unmeasured"');
+    expect(unmeasured).not.toContain('42 ms');
   });
 
   it('文案与档位色同源：写着「超时」的那一格必须是 dead，不是中性色', () => {
     const html = render({ rows: [row('x', { latencyMs: null })] });
-    expect(html).toContain('nodes.timeout');
+    expect(html).toContain('measurement.failed');
     expect(html).toContain('class="mn-lat dead"');
     // 反向对照：陈旧那一格写的是「陈旧」且色退回 none —— 两句话不许互相拆台。
     const stale = render({ rows: [row('x', { latencyMs: 42, latencyStale: true })] });
-    expect(stale).toContain('nodes.mobileLatencyStale');
+    expect(stale).toContain('measurement.expired');
     expect(stale).toContain('class="mn-lat none"');
   });
 
@@ -3237,7 +3262,7 @@ describe('mobile consequence badges with the real two-action row width', () => {
     it(`${viewport.width}px: short non-numeric status uses its own line without overflow`, async () => {
       const translated = translatedFor('zh-CN');
       const html = render({ t: translated, rows: [row('short-status', { latencyMs: null })] });
-      expect(html).toContain(translated('nodes.timeout'));
+      expect(html).toContain(translated('measurement.failed'));
       const m = await measure({ ctx: 'mobile', html: inMobileShell(html, 'nodes'), viewport }, [
         { select: '.mn-row-copy', props: ['width'] },
         { select: '.mn-lat.dead', props: ['text-align'] },

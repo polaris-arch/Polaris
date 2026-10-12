@@ -15,7 +15,7 @@ export function measurementFixture(config: UserConfig, values: Record<string, nu
       failure: latency === null || latency < 0 ? { phase: 'measure', kind: 'timeout' } : null,
       identity: { run: revision, seq: 1, origin: 'manual', scope: null, path: 'candidate', metric: 'warm_ttfb_v1',
         urlDigest: 'a'.repeat(64), instance: { kind: 'main', generation: 7, startTime: 10 }, configDigest: 'b'.repeat(64),
-        nodeFingerprint: 'c'.repeat(64), networkEpoch: 3, measuredAt: now, context: 'connected' },
+        nodeFingerprintDigest: 'c'.repeat(64), connectionDigest: 'e'.repeat(64), networkEpoch: 3, measuredAt: now, context: 'connected' },
       disconnected: false, bindingMismatch: false, expiresAt: now + 1000,
     } satisfies MeasurementRecord }])) };
 }

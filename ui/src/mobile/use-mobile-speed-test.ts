@@ -2,7 +2,7 @@ import { requestIOSMeasurementConsent, requiresMeasurementConsent } from './Meas
 import { create } from 'zustand';
 import { api } from '@/ipc';
 import { isSpeedTestCountProgress, type SpeedTestDonePayload, type SpeedTestInvokeResult, type SpeedTestMeasurementContext, type SpeedTestProgressPayload, type SpeedTestResultPayload } from '@/contracts/speed-test';
-import { useLatencyStore, subscribeLatencyEvents } from '@/store/use-latency-store';
+import { useLatencyStore, subscribeLatencyEvents, refreshMeasurementLedger } from '@/store/use-latency-store';
 import { getEffectiveConfig, useAppStore } from '@/store/app-store';
 
 export type MobileSpeedTestPhase = 'preparingConnection' | 'waitingForReady' | 'running' | 'waiting' | 'completed' | 'interrupted' | 'failed';
@@ -254,6 +254,8 @@ export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRe
   } catch (cause) {
     useMobileSpeedTestStore.getState().settle(token);
     throw cause;
+  } finally {
+    refreshMeasurementLedger();
   }
 }
 

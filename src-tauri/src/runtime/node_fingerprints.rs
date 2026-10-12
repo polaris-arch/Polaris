@@ -116,5 +116,93 @@ pub fn modified_table_json(config: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Measurement-only full connection identity. Never used for subscription IDs or
+/// the legacy five-field dirty formula. Presentation/ownership fields cannot
+/// change a connection; every remaining serialized parameter (TLS, SNI, WS,
+/// detour, protocol settings, credentials) participates in the SHA-256.
+pub(crate) fn measurement_digest(canonical_server: &str) -> Option<String> {
+    let mut server: Value = serde_json::from_str(canonical_server).ok()?;
+    let object = server.as_object_mut()?;
+    for key in [
+        "id",
+        "name",
+        "subscriptionId",
+        "providerName",
+        "createdAt",
+        "updatedAt",
+    ] {
+        object.remove(key);
+    }
+    Some(polaris_updater::sha256_hex(
+        polaris_config_engine::builder::orchestration::stable_stringify(&server).as_bytes(),
+    ))
+}
+
+pub(crate) fn measurement_table_json(config: &Value) -> BTreeMap<String, String> {
+    measurement_table(&modified_table_json(config))
+}
+
+/// Consumes the actual running snapshot's full server projection, never saved D.
+pub(crate) fn measurement_table(full: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    // Parse/hash each node once and memoize the chain suffix. Long shared detour
+    // chains remain linear in node count; malformed/missing/cyclic inputs fail closed.
+    let nodes: BTreeMap<String, (String, Option<String>)> = full
+        .iter()
+        .filter_map(|(id, value)| {
+            let parsed: Value = serde_json::from_str(value).ok()?;
+            Some((
+                id.clone(),
+                (
+                    measurement_digest(value)?,
+                    parsed["detour"].as_str().map(str::to_owned),
+                ),
+            ))
+        })
+        .collect();
+    let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for root in nodes.keys() {
+        if resolved.contains_key(root) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = root.clone();
+        let mut tail = loop {
+            if let Some(value) = resolved.get(&current) {
+                break value.clone();
+            }
+            if !seen.insert(current.clone()) {
+                break None;
+            }
+            let Some((own, detour)) = nodes.get(&current) else {
+                break None;
+            };
+            path.push(current.clone());
+            if let Some(next) = detour {
+                current = next.clone();
+            } else {
+                resolved.insert(current, Some(own.clone()));
+                path.pop();
+                break Some(own.clone());
+            }
+        };
+        for id in path.into_iter().rev() {
+            tail = tail.map(|next| {
+                polaris_updater::sha256_hex(
+                    polaris_config_engine::builder::orchestration::stable_stringify(
+                        &serde_json::json!([nodes[&id].0, next]),
+                    )
+                    .as_bytes(),
+                )
+            });
+            resolved.insert(id, tail.clone());
+        }
+    }
+    resolved
+        .into_iter()
+        .filter_map(|(id, value)| Some((id, value?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

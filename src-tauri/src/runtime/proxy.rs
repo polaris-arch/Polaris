@@ -1946,6 +1946,18 @@ impl ProxyRuntime {
     /// 返回 `Some` ⟺ 核运行且起核时成功注入了探测池（`probe_pool_ports` 非空）；否则 `None`（测速回退活跃出口）。
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
+    pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|snapshot| {
+                    crate::runtime::node_fingerprints::measurement_table(&snapshot.fingerprints)
+                })
+            })
+            .unwrap_or_default()
+    }
+
     pub fn speed_probe_targets(&self) -> Option<SpeedProbeTargets> {
         if !self.status().running {
             return None;

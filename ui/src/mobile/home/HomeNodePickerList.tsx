@@ -57,7 +57,7 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
               <span className="h-pickmeta"><span className="h-pill">{row.protocolLabel}</span>
                 {row.stagedOnly && <span className="h-pill warn">{t('home.stagedOnlyBadge')}</span>}
                 <span className={`h-lat ${row.latencyStale ? 'none' : latLevel(row.latencyMs)}`}>
-                  <MeasurementLabel serverId={server.id} displayedServer={server} />
+                  <MeasurementLabel serverId={server.id} displayedServer={server} translate={t} />
                 </span>
               </span>
             </button>

@@ -154,7 +154,7 @@ useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',sw
 }});
 createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);
 `;
-const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { MobileToaster } from '/src/mobile/MobileToaster';").replace(
+const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { MobileToaster } from '/src/mobile/MobileToaster';\nimport { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';").replace(
   "createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);",
   `
 document.documentElement.dataset.mobileOs = new URLSearchParams(location.search).get('os') || 'ios';
@@ -177,7 +177,7 @@ unlockApi.manualCheck=(requestId,force)=>new Promise(resolve=>{
 });
 api.server.speedTest=async ids=>{net.speeds.push(ids);return {runId:'1',results:{'node-a':24},outcome:'completed',notInPool:[],tsNotReady:[],
  measurementContext:{runId:'1',requestId:'speed-1',mainGeneration:7,startTime:123}};};
-function Host(){const [home,setHome]=React.useState(true);net.leave=()=>setHome(false);return <>{home?<MobileHomeScreen/>:<p>Other screen</p>}<MobileToaster/></>;}
+function Host(){const [home,setHome]=React.useState(true);net.leave=()=>setHome(false);return <>{home?<MobileHomeScreen/>:<p>Other screen</p>}<MobileToaster/><MeasurementStartNotice/></>;}
 createRoot(document.getElementById('root')).render(<Host/>);
 `,
 );
@@ -420,6 +420,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       const button=page.locator('[data-write-control="network-check"]');await button.waitFor();
       expect(await page.evaluate(()=>(window as any).__networkTest.manual)).toEqual([]);
       await button.click();
+      await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
       await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
       expect(await button.isDisabled()).toBe(true);
       expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.raw,n.speeds,n.mainStarts,n.mainStops];})).toEqual([[],[],0,0]);
@@ -436,6 +437,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
       try {
         await page.goto(origin+'/__network');
         const button=page.locator('[data-write-control="network-check"]');await button.click();
+        await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
         await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
         await page.evaluate(kind=>{const n=(window as any).__networkTest;
           n.setStatus({running:kind!=='stop',mainGeneration:kind==='generation'?8:7,startTime:123});
@@ -462,6 +464,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     try {
       await page.goto(origin+'/__network');
       await page.locator('[data-write-control="network-check"]').click();
+      await page.getByRole('dialog').getByRole('button',{name:'确认',exact:true}).click();
       await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
       await page.evaluate(()=>(window as any).__networkTest.leave());
       await page.getByText('Other screen',{exact:true}).waitFor();

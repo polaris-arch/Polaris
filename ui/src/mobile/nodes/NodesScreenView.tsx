@@ -1,3 +1,4 @@
+import { selectedDeletableIds } from '@/components/screens/nodes/nodes-logic';
 import { MeasurementLabel } from '../MeasurementLabel';
 import { MobileSpeedTestProgress } from '../MobileSpeedTestProgress';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
@@ -307,8 +308,8 @@ function NodeRow({
           {/* Invalid configuration remains directly visible and actionable, rather than hidden in help. */}
           {row.invalidReason !== undefined && <span className="mn-note">{row.invalidReason}</span>}
         </span>
-        <span className={`mn-lat ${lat.level}`} data-numeric={numericLatency ? '' : undefined}>{row.speedTestable ? <MeasurementLabel serverId={row.server.id} displayedServer={row.server} /> : lat.text}</span>
-        {row.sourceLabel && <span data-node-source="">{row.sourceLabel}</span>
+        <span className={`mn-lat ${lat.level}`} data-numeric={numericLatency ? '' : undefined}>{row.speedTestable ? <MeasurementLabel serverId={row.server.id} displayedServer={row.server} translate={t} /> : lat.text}</span>
+        {row.sourceLabel && <span data-node-source="">{row.sourceLabel}</span>}
       </button>
       {/* Both secondary controls are outside the exit-selection button. Opening help never selects a node. */}
       {(explanations.length > 0 || hasMeshRoute || !batchMode) && <span className="mn-row-actions">
@@ -391,6 +392,7 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
     (props.rows.some((r) => r.speedTestable) ? undefined : t('nodes.noTestableNodes'));
 
   const selectedCount = props.selectedIds.size;
+  const deletableCount = selectedDeletableIds(props.rows.filter(row=>row.deletable).map(row=>row.server),props.selectedIds).length;
 
   return (
     <section className="mn" aria-label={t('mobileNav.nodes')} data-exit-scope="mobile-nodes">
@@ -649,7 +651,7 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
           <button
             type="button"
             className="mn-act danger"
-            disabled={selectedCount === 0}
+            disabled={deletableCount === 0}
             onClick={props.onBatchDelete}
           >
             {t('common.delete')}

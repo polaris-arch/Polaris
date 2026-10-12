@@ -5,12 +5,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const entry = `
-import React from 'react';
+import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import NodesScreen from '/src/components/screens/nodes/NodesScreen';
 import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
 import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
 import { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';
+import { MeasurementLabel } from '/src/mobile/MeasurementLabel';
+import { measurementT, refreshTrayLang } from '/src/tray/labels';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { useLatencyStore, subscribeLatencyEvents } from '/src/store/use-latency-store';
@@ -21,6 +23,7 @@ import i18n, { i18nReady } from '/src/i18n';
 import zhCN from '/src/i18n/locales/zh-CN.json';
 await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); await i18n.changeLanguage('zh-CN');
 const mode=new URLSearchParams(location.search).get('mode')||'desktop';
+localStorage.setItem('polaris.language','zh-CN');refreshTrayLang();
 document.documentElement.dataset.mobileOs=mode==='ios'?'ios':'android';
 if(mode==='desktop')await import('/src/styles/index.css');
 else {await import('/src/styles/tokens.resolved.css');await import('/src/mobile/mobile.css');await import('/src/mobile/redesign.css');}
@@ -35,6 +38,8 @@ const f=window.__measurement={calls:0,networkCalls:0, reads:0, kind:'success',
   if(kind==='notIncluded')snap.rows.a.notIncluded='notInPool';
   if(kind==='disconnected'){snap.rows.a.candidate.disconnected=true;snap.rows.a.candidate.identity.instance={kind:'temp'};snap.rows.a.candidate.identity.context='disconnected';}
   useLatencyStore.getState().applySnapshot(snap,config.servers);},
+ editSelected(){useStagedConfigStore.setState({entries:[{id:'server:a',kind:'server',label:'edit',entityPath:['servers','a'],nextValue:{...servers[0],address:'new.invalid'}}]});},
+ language:null,
  unmount(){app.unmount();dispose();},
 };
 let id=0;window.__TAURI_INTERNALS__={transformCallback(){return ++id;},invoke(cmd){
@@ -57,8 +62,9 @@ unlockApi.manualCheck=async()=>{f.networkCalls++;throw Error('fixture stops afte
 useStagedConfigStore.setState({enabled:false,hydrated:true,entries:[]});
 useAppStore.setState({config,servers,selectedServerId:'a',proxyStatus:status,invalidNodes:[]});
 const dispose=subscribeLatencyEvents();
+function TrayLanguageFixture(){const [lang,setLang]=useState('zh-CN');f.language=()=>{localStorage.setItem('polaris.language','en-US');setLang(refreshTrayLang());};return <div data-tray-language={lang}><MeasurementLabel serverId="a" displayedServer={servers[0]} translate={measurementT}/></div>;}
 let app=createRoot(document.getElementById('root'));
-app.render(mode==='ios'?<><MobileHomeScreen/><MeasurementStartNotice/></>:mode==='mobile'?<MobileNodesScreen/>:<div className="main-scroll"><NodesScreen/></div>);
+app.render(mode==='tray-language'?<TrayLanguageFixture/>:mode==='home'?<MobileHomeScreen/>:mode==='ios'?<><MobileHomeScreen/><MeasurementStartNotice/></>:mode==='mobile'?<MobileNodesScreen/>:<div className="main-scroll"><NodesScreen/></div>);
 `;
 
 let server: ViteDevServer;
@@ -91,7 +97,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
         await page.goto(origin+'/__measurement?mode='+mode);
         await page.getByRole('button', { name: /^全部\s*3$/ }).click();
         await expect.poll(() => page.locator('[data-node-source]').count()).toBe(3);
-        expect(await page.locator('[data-node-source]').allTextContents()).toEqual(expect.arrayContaining(['Alpha','Beta','自建']));
+        expect(await page.locator('[data-node-source]').allTextContents()).toEqual(expect.arrayContaining([expect.stringContaining('Alpha'),expect.stringContaining('Beta'),expect.stringContaining('自建节点')]));
         expect(await page.evaluate(() => (window as any).__measurement.state().selected)).toBe('a');
         await page.locator('input[placeholder]').first().fill('Beta');
         await expect.poll(() => page.locator('[data-node-source]').count()).toBe(1);
@@ -117,6 +123,30 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     });
   }
 
+
+  it('Home rejects the previous result when the displayed effective node has a same-ID address edit',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__measurement?mode=home');
+      await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="success"]').count()).toBe(1);
+      await page.evaluate(()=>(window as any).__measurement.editSelected());
+      await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="unmeasured"]').count()).toBe(1);
+      expect(await page.locator('.h-latency-value').innerText()).toContain('未纳入');
+      expect(await page.locator('.h-latency-value').innerText()).not.toContain('40 ms');
+    } finally {await page.close();}
+  });
+  it('a warm tray measurement label uses the same hot-refreshed language as its auxiliary labels',async()=>{
+    const page=await browser.newPage({viewport:{width:420,height:500}});
+    try {
+      await page.goto(origin+'/__measurement?mode=tray-language');
+      await page.evaluate(()=>(window as any).__measurement.publish('notIncluded'));
+      await expect.poll(()=>page.locator('[data-measurement-state]').innerText()).toContain('未纳入');
+      await page.evaluate(()=>(window as any).__measurement.language());
+      await expect.poll(()=>page.locator('[data-tray-language]').getAttribute('data-tray-language')).toBe('en-US');
+      const text=await page.locator('[data-measurement-state]').innerText();
+      expect(text).not.toContain('未纳入');expect(text).toContain('Not included');
+    } finally {await page.close();}
+  });
   it('iOS: cancelling the actual current-measurement prompt issues no server request; confirmation issues one', async () => {
     const page = await browser.newPage({ viewport:{width:390,height:844} });
     try {

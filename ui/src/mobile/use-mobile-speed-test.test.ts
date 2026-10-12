@@ -82,7 +82,7 @@ describe('mobile measured latency task identity', () => {
     progress({runId:'6',tested:1,ok:1,total:2});
     vi.advanceTimersByTime(1_000);
     expect(store.getState().task).toMatchObject({runId:'7',phase:'waiting',tested:1,total:3});
-    dispose();expect(off).toHaveBeenCalledTimes(3);
+    dispose();expect(off).toHaveBeenCalledTimes(4);
   });
   it('accepted task results keep run identity while passive/bare numbers cannot bypass ledger qualification', () => {
     let result!: Parameters<typeof api.server.onSpeedTestResult>[0];

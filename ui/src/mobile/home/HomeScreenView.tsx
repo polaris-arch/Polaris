@@ -673,7 +673,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                     : props.node.kind !== 'node'
                       ? props.latencyCheck.blockedStatus
                       : props.node.serverId
-                        ? <MeasurementLabel serverId={props.node.serverId} purpose="current" />
+                        ? <MeasurementLabel serverId={props.node.serverId} displayedServer={props.node.displayedServer} purpose="current" translate={t} />
                       : props.node.latencyMs === undefined
                         ? props.latencyCheck.blocked ? props.latencyCheck.blockedStatus : t('home.unlockStatus.idle')
                         : props.node.latencyMs === null

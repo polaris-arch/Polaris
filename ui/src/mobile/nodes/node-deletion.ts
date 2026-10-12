@@ -35,9 +35,9 @@ import {
   fallbackExitAfterDelete,
   partitionNodeDeleteRoutes,
 } from '@/components/screens/nodes/node-delete-fallback';
-import { selectedVisibleIds, subDeleteNodeCount } from '@/components/screens/nodes/nodes-logic';
+import { selectedDeletableIds, subDeleteNodeCount } from '@/components/screens/nodes/nodes-logic';
 import { editRoute, splitStagedOnly } from '@/lib/staged-config';
-import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
+import { useAppStore, getEffectiveConfig, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
@@ -252,15 +252,18 @@ export function useMobileNodeDeletion(deps: MobileDeletionDeps): MobileDeletion 
     (selectedIds: ReadonlySet<string>, visibleServers: readonly ServerConfig[]): void => {
       /* 射程上界与桌面同一条：勾选集**先与可见集求交** —— 勾选集不随 tab 切换 / 筛选收窄而收缩，
          直接消费它会删掉用户此刻看不见的节点。求交后为空 ⇒ 连确认都不该弹。 */
-      const ids = new Set(selectedVisibleIds(visibleServers, selectedIds));
-      if (ids.size === 0) return;
+      const requested = new Set(selectedDeletableIds(visibleServers, selectedIds, diskServers));
+      if (requested.size === 0) return;
       const confirmId = confirm({
         title: t('common.delete'),
-        message: t('nodes.batchDeleteConfirmMobile', { count: ids.size }),
+        message: t('nodes.batchDeleteConfirmMobile', { count: requested.size }),
         confirmLabel: t('common.delete'),
         danger: true,
         onConfirm: () => {
           dismiss(confirmId);
+          const latest = useAppStore.getState().servers;
+          const ids = new Set(selectedDeletableIds(getEffectiveConfig()?.servers ?? latest, requested, latest));
+          if (ids.size === 0) return;
           const split = splitStagedOnly(
             'server.deleteBatch',
             [...ids],

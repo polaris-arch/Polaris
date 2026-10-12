@@ -37,13 +37,97 @@ fn stale_code(reason: LedgerStale) -> &'static str {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct Skipped {
+    pub(super) reason: &'static str,
+    pub(super) identity: crate::commands::speedtest::ResultIdentity,
+    connection_digest: String,
+    foreground_epoch: u64,
+}
+
+/// Display IPC has its own digest-only identity. Existing event and subscription
+/// identity contracts remain unchanged; their credential-bearing legacy string
+/// is never forwarded by this read command.
+fn display_identity(entry: &LedgerEntry) -> Value {
+    let mut identity = entry.identity.to_json();
+    identity
+        .as_object_mut()
+        .expect("identity object")
+        .remove("nodeFingerprint");
+    identity["nodeFingerprintDigest"] = json!(entry
+        .identity
+        .node_fingerprint
+        .as_ref()
+        .map(|value| polaris_updater::sha256_hex(value.as_bytes())));
+    identity["connectionDigest"] = json!(entry.connection_digest);
+    identity
+}
+
 impl MeasurementLedger {
+    pub(crate) fn set_display_skipped(
+        &self,
+        members: &[String],
+        skipped: &[(String, &'static str)],
+        identity: crate::commands::speedtest::ResultIdentity,
+        connections: &BTreeMap<String, String>,
+    ) {
+        let mut inner = self.lock();
+        for id in members {
+            if inner
+                .display_skipped
+                .get(id)
+                .is_some_and(|old| old.identity.run <= identity.run)
+            {
+                inner.display_skipped.remove(id);
+            }
+        }
+        for (id, reason) in skipped.iter().take(super::HARD_CAP) {
+            let Some(digest) = connections.get(id) else {
+                continue;
+            };
+            if inner
+                .display_skipped
+                .get(id)
+                .is_some_and(|old| old.identity.run > identity.run)
+                || inner
+                    .entries
+                    .iter()
+                    .any(|(key, entry)| key.node_id == *id && entry.identity.run > identity.run)
+            {
+                continue;
+            }
+            inner.display_skipped.insert(
+                id.clone(),
+                Skipped {
+                    reason,
+                    identity: identity.clone(),
+                    connection_digest: digest.clone(),
+                    foreground_epoch: self.foreground_epoch(),
+                },
+            );
+        }
+        while inner.display_skipped.len() > super::HARD_CAP {
+            let Some(id) = inner
+                .display_skipped
+                .iter()
+                .min_by_key(|(_, value)| value.identity.run)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            inner.display_skipped.remove(&id);
+        }
+        drop(inner);
+        self.bump();
+    }
+
     /// At most the ledger's existing hard bound plus bounded skip markers. Missing
     /// nodes are unmeasured in the UI, not failed. All record reads hold one lock.
     pub(crate) fn display_rows(
         &self,
         context: &ReadContext<'_>,
         emission_digest: Option<&str>,
+        connections: &BTreeMap<String, String>,
     ) -> Value {
         let inner = self.lock();
         let mut latest: BTreeMap<(&str, MeasurePath), &LedgerEntry> = BTreeMap::new();
@@ -69,13 +153,20 @@ impl MeasurementLedger {
         let mut rows = serde_json::Map::new();
         for ((id, purpose), entry) in latest {
             let wrong_url = entry.identity.url_digest != context.url_digest;
-            let incomplete = entry.identity.node_fingerprint.is_none()
+            let incomplete = entry.connection_digest.is_none()
+                || entry.identity.node_fingerprint.is_none()
                 || matches!(entry.identity.instance, CoreInstance::Main { .. })
                     && emission_digest.is_none();
+            let changed_connection = entry.connection_digest.as_ref() != connections.get(id);
             let changed_config = matches!(entry.identity.instance, CoreInstance::Main { .. })
                 && entry.identity.config_digest.as_deref() != emission_digest;
             let stale = ledger_stale(entry, id, context);
-            let state = if wrong_url || incomplete || changed_config || stale.is_some() {
+            let state = if wrong_url
+                || incomplete
+                || changed_config
+                || changed_connection
+                || stale.is_some()
+            {
                 "expired"
             } else if entry.measured.is_ok() {
                 "success"
@@ -88,23 +179,45 @@ impl MeasurementLedger {
                 Some("identityUnknown")
             } else if changed_config {
                 Some("configurationChanged")
-            } else {
+            } else if stale.is_some() {
                 stale.map(stale_code)
+            } else if changed_connection {
+                Some("connectionChanged")
+            } else {
+                None
             };
             let cap = (context.freshness_cap_ms)(id, entry);
             let value = json!({
                 "state": state, "reason": reason,
                 "latency": entry.measured.ok(), "failure": entry.measured.err().map(|e|e.to_json()),
-                "identity": entry.identity.to_json(),
+                "identity": display_identity(entry),
                 "disconnected": entry.identity.instance == CoreInstance::Temp,
                 "bindingMismatch": entry.identity.binding == Some(crate::commands::speedtest::BindingVerdict::Mismatch),
                 "expiresAt": entry.identity.measured_at.saturating_add(cap),
             });
             rows.entry(id.to_owned()).or_insert_with(|| json!({}))[purpose.as_str()] = value;
         }
-        for (id, reason) in inner.skipped.iter().take(super::HARD_CAP) {
-            if context.fingerprints.contains_key(id) {
-                rows.entry(id.clone()).or_insert_with(|| json!({}))["notIncluded"] = json!(reason);
+        for (id, skip) in &inner.display_skipped {
+            let valid_instance = match skip.identity.instance {
+                CoreInstance::Temp => context.main_generation.is_none(),
+                CoreInstance::Main { generation, .. } => {
+                    context.main_generation == Some(generation)
+                        && skip.identity.config_digest.as_deref() == emission_digest
+                        && emission_digest.is_some()
+                }
+            };
+            if connections.get(id) == Some(&skip.connection_digest)
+                && valid_instance
+                && skip.identity.url_digest == context.url_digest
+                && skip.identity.network_epoch == context.network_epoch
+                && context
+                    .foreground_epoch
+                    .is_none_or(|epoch| epoch == skip.foreground_epoch)
+                && context.now_ms >= skip.identity.measured_at
+                && context.now_ms.saturating_sub(skip.identity.measured_at) <= 30 * 60 * 1000
+            {
+                rows.entry(id.clone()).or_insert_with(|| json!({}))["notIncluded"] =
+                    json!(skip.reason);
             }
         }
         Value::Object(rows)
@@ -140,7 +253,12 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let now = crate::runtime::subscription_scheduler::now_ms();
     let emission_digest =
         generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
-    let rows = ledger.display_rows(&view.read(&cap, ledger, now), emission_digest.as_deref());
+    let connections = crate::runtime::node_fingerprints::measurement_table_json(&config);
+    let rows = ledger.display_rows(
+        &view.read(&cap, ledger, now),
+        emission_digest.as_deref(),
+        &connections,
+    );
     let mut frontend = config.clone();
     crate::commands::config::apply_frontend_view(&mut frontend);
     let frontend_config_digest = polaris_updater::sha256_hex(

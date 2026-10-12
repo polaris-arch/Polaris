@@ -38,6 +38,7 @@ const SOFT_CAP_PER_NODE: usize = 4;
 pub(crate) struct LedgerEntry {
     pub(crate) measured: Measured,
     pub(crate) identity: ResultIdentity,
+    pub(crate) connection_digest: Option<String>,
     /// 入账那一刻的前台代次。
     pub(crate) foreground_epoch: u64,
     /// 到这一条为止的连续失败次数（成功即归零；手动测过即从头数；换核世代或切网时清零）。
@@ -152,6 +153,7 @@ struct Inner {
     entries: BTreeMap<ResultKey, LedgerEntry>,
     /// 最近一轮起测前被预筛跳过的节点及原因；节点一旦有新结果入账即移除。
     skipped: BTreeMap<String, &'static str>,
+    display_skipped: BTreeMap<String, display::Skipped>,
     /// 因运行号或序号不比已有记录新而被拒的入账次数。
     rejected_not_newer: u64,
 }
@@ -177,6 +179,7 @@ impl MeasurementLedger {
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
                 skipped: BTreeMap::new(),
+                display_skipped: BTreeMap::new(),
                 rejected_not_newer: 0,
             }),
             version: AtomicU64::new(0),
@@ -230,6 +233,7 @@ impl MeasurementLedger {
     }
 
     /// 入账一条盖过章的逐节点结果。返回是否取代了已有记录。
+    #[cfg(test)]
     pub(crate) fn record(
         &self,
         node_id: &str,
@@ -240,11 +244,23 @@ impl MeasurementLedger {
     }
 
     /// [`record`](Self::record) 的本体，入账的单调时刻由调用方给（单测注入时钟）。
+    #[cfg(test)]
     pub(crate) fn record_at(
         &self,
         node_id: &str,
         measured: Measured,
         identity: ResultIdentity,
+        recorded_mono: u64,
+    ) -> bool {
+        self.record_connection_at(node_id, measured, identity, None, recorded_mono)
+    }
+
+    pub(crate) fn record_connection_at(
+        &self,
+        node_id: &str,
+        measured: Measured,
+        identity: ResultIdentity,
+        connection_digest: Option<String>,
         recorded_mono: u64,
     ) -> bool {
         let key = result_key(node_id, &identity);
@@ -273,8 +289,17 @@ impl MeasurementLedger {
             recorded_mono,
             period_factor: self.period_factor.load(Ordering::Acquire),
             measured,
+            connection_digest,
             identity,
         };
+        if entry.identity.path == crate::commands::speedtest::MeasurePath::Candidate
+            && inner
+                .display_skipped
+                .get(node_id)
+                .is_some_and(|skip| skip.identity.run <= entry.identity.run)
+        {
+            inner.display_skipped.remove(node_id);
+        }
         inner.entries.insert(key, entry);
         inner.skipped.remove(node_id);
         if inner.entries.len() > HARD_CAP {

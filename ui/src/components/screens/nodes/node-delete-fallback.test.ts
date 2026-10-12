@@ -1,3 +1,4 @@
+import { selectedDeletableIds } from './nodes-logic';
 /**
  * 删除节点兜底出口单测（vitest，node 环境）。
  *
@@ -180,5 +181,30 @@ describe('fallbackExitAfterDelete', () => {
     const list = [srv('a'), wgFull];
     expect(isViableFallbackExit(wgFull)).toBe(true);
     expect(fallbackExitAfterDelete(list, 'a', new Set(['a']), { wgf: 30 })).toBe('wgf');
+  });
+});
+
+describe('All view source protection before direct/staged deletion', () => {
+  const managed = srv('sub-node', { subscriptionId: 'sub' });
+  const manual = srv('manual');
+  for (const [mode, policy] of [['direct', DIRECT_POLICY], ['staged', STAGED_POLICY]] as const) {
+    it(`${mode}: managed-only selection produces no delete route`, () => {
+      const ids = selectedDeletableIds([managed, manual], new Set([managed.id]), [managed, manual]);
+      const routes = partitionNodeDeleteRoutes([managed, manual], ids, policy);
+      expect(routes).toEqual({directIds:[],staged:[]});
+    });
+    it(`${mode}: mixed selection only deletes manual rows, preserving the managed selected exit`, () => {
+      const ids = selectedDeletableIds([managed,manual], new Set([managed.id,manual.id]), [managed,manual]);
+      expect(ids).toEqual([manual.id]);
+      const routes = partitionNodeDeleteRoutes([managed,manual], ids, policy);
+      expect([...routes.directIds,...routes.staged.map(server=>server.id)]).toEqual([manual.id]);
+      expect(fallbackExitAfterDelete([managed,manual], managed.id, new Set(ids), {})).toBeUndefined();
+    });
+  }
+  it('an effective edit cannot remove ownership protection from the saved counterpart', () => {
+    expect(selectedDeletableIds([{...managed,subscriptionId:undefined}],new Set([managed.id]),[managed])).toEqual([]);
+  });
+  it('staged-only subscription rows remain protected, even without a saved counterpart', () => {
+    expect(selectedDeletableIds([managed,manual],new Set([managed.id,manual.id]),[])).toEqual([manual.id]);
   });
 });

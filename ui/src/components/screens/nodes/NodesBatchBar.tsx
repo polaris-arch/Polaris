@@ -1,7 +1,8 @@
 import type { TFunction } from 'i18next';
 import type { ServerConfig } from '@/contracts/types';
+import { useAppStore } from '@/store/app-store';
 import { cn } from '@/lib/utils';
-import { canMoveToGroup } from './nodes-logic';
+import { canMoveToGroup, selectedDeletableIds } from './nodes-logic';
 import { BATCH_DEL_KEY, type useNodeDeletion } from './use-node-deletion';
 
 interface Props {
@@ -32,6 +33,8 @@ export function NodesBatchBar({
   nodeDeletion,
   exitBatch,
 }: Props) {
+  const saved = useAppStore(state => state.servers);
+  const deletable = selectedDeletableIds(visibleServers, selectedIds, saved).length;
   return (
     <div className="batch-bar" id="nodes-batch">
       <button
@@ -102,7 +105,7 @@ export function NodesBatchBar({
           className={cn('btn ghost sm', confirmArmed === BATCH_DEL_KEY && 'confirming')}
           style={{ color: 'hsl(var(--err))' }}
           onClick={nodeDeletion.deleteBatch}
-          disabled={selectedIds.size === 0}
+          disabled={deletable === 0}
         >
           {confirmArmed === BATCH_DEL_KEY
             ? t('nodes.batchDeleteConfirmAgain')

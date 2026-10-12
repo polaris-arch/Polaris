@@ -346,6 +346,28 @@ pub fn server_delete(
     }
 }
 
+/// Individual-node batch actions never remove subscription-managed rows. Source
+/// ownership is rechecked inside the config transaction, including stale UI calls.
+fn remove_batch_manual_nodes(
+    cfg: &mut Value,
+    requested: &std::collections::HashSet<&str>,
+) -> Vec<Value> {
+    match cfg.get_mut("servers").and_then(Value::as_array_mut) {
+        Some(arr) => {
+            let (keep, removed) = arr.drain(..).partition(|server| {
+                server
+                    .get("subscriptionId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())
+                    || !requested.contains(server.get("id").and_then(Value::as_str).unwrap_or(""))
+            });
+            *arr = keep;
+            removed
+        }
+        None => Vec::new(),
+    }
+}
+
 /// 上游 `SERVER_DELETE_BATCH`：批量删除（返回实际删除数）。
 ///
 /// `fallback_selected_id`：选中节点落在删除集内时的兜底出口（渲染端按「剩余节点里最快」算，见 `pickFallbackExit`）。
@@ -367,22 +389,15 @@ pub fn server_delete_batch(
             .get("selectedServerId")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let removed: Vec<Value> = match cfg.get_mut("servers").and_then(Value::as_array_mut) {
-            Some(arr) => {
-                let (keep, drop) = arr.drain(..).partition(|s| {
-                    !id_set.contains(s.get("id").and_then(Value::as_str).unwrap_or(""))
-                });
-                *arr = keep;
-                drop
-            }
-            None => Vec::new(),
-        };
+        let removed = remove_batch_manual_nodes(cfg, &id_set);
         if removed.is_empty() {
             return ConfigDecision::Skip((old_selected, 0u32));
         }
-        let selected_in_set = old_selected
-            .as_deref()
-            .is_some_and(|sid| id_set.contains(sid));
+        let selected_in_set = old_selected.as_deref().is_some_and(|sid| {
+            removed
+                .iter()
+                .any(|server| server["id"].as_str() == Some(sid))
+        });
         apply_selection_fallback(cfg, selected_in_set, fallback_selected_id.as_deref());
         prune_recent_server_ids_to_existing(cfg);
         ConfigDecision::Write((old_selected, u32::try_from(removed.len()).unwrap_or(0)))
@@ -1767,3 +1782,30 @@ fn new_uuid() -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod batch_source_protection_tests {
+    use super::*;
+    #[test]
+    fn subscription_only_batch_cannot_remove_rows_or_selected_exit() {
+        let mut config = serde_json::json!({"selectedServerId":"s", "servers":[{"id":"s","subscriptionId":"sub"}]});
+        let before = config.clone();
+        assert!(
+            remove_batch_manual_nodes(&mut config, &std::collections::HashSet::from(["s"]))
+                .is_empty()
+        );
+        assert_eq!(config, before);
+    }
+    #[test]
+    fn mixed_batch_only_removes_manual_nodes() {
+        let mut config = serde_json::json!({"selectedServerId":"s", "servers":[{"id":"s","subscriptionId":"sub"},{"id":"m"}]});
+        let removed =
+            remove_batch_manual_nodes(&mut config, &std::collections::HashSet::from(["s", "m"]));
+        assert_eq!(removed, vec![serde_json::json!({"id":"m"})]);
+        assert_eq!(
+            config["servers"],
+            serde_json::json!([{"id":"s","subscriptionId":"sub"}])
+        );
+        assert_eq!(config["selectedServerId"], "s");
+    }
+}

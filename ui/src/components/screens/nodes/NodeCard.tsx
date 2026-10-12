@@ -243,7 +243,7 @@ function NodeCardView({
         </div>
         {/* 不可测时把原因也挂在延迟位上（而非只挂在按钮上）：延迟位不是 `disabled`，鼠标与键盘
             都碰得到，是这条解释最可靠的落点。按钮那处见下方注释。 */}
-        {latText && (
+        {(testable || latText) && (
           <span className={cn('nd-lat', level)} data-tip={latencyTip}>
             {testable ? <MeasurementLabel serverId={server.id} displayedServer={server} /> : latText}
           </span>

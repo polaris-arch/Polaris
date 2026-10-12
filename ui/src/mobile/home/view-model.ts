@@ -95,6 +95,7 @@ export type NodeIdentity =
   | {
       readonly kind: 'node';
       readonly serverId?: string;
+      readonly displayedServer?: ServerConfig;
       readonly name: string;
       readonly protocolLabel: string;
       /** 有验证过的国家码才有旗；**绝不合成一个回退国家**。 */

@@ -1,0 +1,65 @@
+{
+  "server": {
+    "id": "interop",
+    "name": "Fixture",
+    "protocol": "trojan",
+    "address": "example.test",
+    "port": 443,
+    "password": "fixture-secret",
+    "network": "tcp"
+  },
+  "url": "https://example.test/measure",
+  "legacyFingerprint": "trojan|example.test|443|fixture-secret|tcp",
+  "snapshot": {
+    "schema": "polaris-measurement-display-v1",
+    "process": "producer-interop-fixture",
+    "revision": "1",
+    "configVersion": "00000000",
+    "frontendConfigDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "emissionDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "consistent": true,
+    "generation": 7,
+    "startTime": 10,
+    "networkEpoch": 3,
+    "foregroundEpoch": 0,
+    "now": 1001,
+    "schedule": {
+      "state": "waiting",
+      "reason": null,
+      "stalled": false
+    },
+    "rows": {
+      "interop": {
+        "candidate": {
+          "state": "success",
+          "reason": null,
+          "latency": 40,
+          "failure": null,
+          "identity": {
+            "run": "10",
+            "seq": 1,
+            "origin": "manual",
+            "scope": null,
+            "path": "candidate",
+            "metric": "warm_ttfb_v1",
+            "urlDigest": "ca2cffbc53b3c1f60040022bec607ae67393babcac0c03ed53fb6c41ede37abc",
+            "context": "connected",
+            "instance": {
+              "kind": "main",
+              "generation": 7,
+              "startTime": 10
+            },
+            "configDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "nodeFingerprintDigest": "83c8618a2ca1d99aaa3d21496a85062d6783e3cf52f46f257438bee59deddc37",
+            "connectionDigest": "0f0ad378b5df3e74fa45837c55d8fe9ec0e3981cecf71deec5079640329641d0",
+            "networkEpoch": 3,
+            "measuredAt": 1000
+          },
+          "disconnected": false,
+          "bindingMismatch": false,
+          "expiresAt": 2000
+        }
+      }
+    }
+  }
+}

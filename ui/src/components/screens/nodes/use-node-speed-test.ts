@@ -10,7 +10,7 @@ import {
   speedTestBlockedMessage,
 } from '../shared/speedtest-feedback';
 import { speedTestableIds, type SpeedTestCaps } from '@/domain/endpoint-routes';
-import { useLatencyStore } from '@/store/use-latency-store';
+import { useLatencyStore, refreshMeasurementLedger } from '@/store/use-latency-store';
 import {
   speedTestIdsForSelection,
   type SpeedTestBlockReason,
@@ -65,6 +65,7 @@ export function useNodeSpeedTest({
       } catch (err) {
         speedTestError(err, context);
       } finally {
+        refreshMeasurementLedger();
         setTesting(false);
       }
     },
@@ -93,6 +94,8 @@ export function useNodeSpeedTest({
         absorbRunResult(await api.server.speedTest([server.id]));
       } catch (err) {
         speedTestError(err, 'speedTest one');
+      } finally {
+        refreshMeasurementLedger();
       }
     },
     [absorbRunResult, speedTestError],

@@ -3958,6 +3958,8 @@ impl ScheduleBench {
                 instance: main_instance(),
                 config_digest: None,
                 fingerprints: BTreeMap::new(),
+                connection_fingerprints: BTreeMap::new(),
+                skipped_fingerprints: BTreeMap::new(),
             },
             &ScheduledRoundDeps {
                 gate: self.gate,
@@ -4163,6 +4165,8 @@ async fn a_gap_between_results_over_the_threshold_discards_the_rest_as_frozen() 
                 instance: main_instance(),
                 config_digest: None,
                 fingerprints: BTreeMap::new(),
+                connection_fingerprints: BTreeMap::new(),
+                skipped_fingerprints: BTreeMap::new(),
             },
             &ScheduledRoundDeps {
                 gate: bench.gate,

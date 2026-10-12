@@ -6,7 +6,7 @@ export interface MeasurementRecord {
   reason: string | null;
   latency: number | null;
   failure: SpeedTestFailure | null;
-  identity: SpeedTestResultIdentity;
+  identity: Omit<SpeedTestResultIdentity, 'nodeFingerprint'> & { nodeFingerprintDigest: string | null; connectionDigest: string | null };
   disconnected: boolean;
   bindingMismatch: boolean;
   expiresAt: number;

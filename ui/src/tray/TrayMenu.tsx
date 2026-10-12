@@ -88,7 +88,7 @@ import {
   resolveTrayExitIp,
 } from './tray-node-select';
 import { applyTrayTheme } from './tray-theme';
-import { t, trayLang, refreshTrayLang, type TrayKey } from './labels';
+import { t, trayLang, refreshTrayLang, measurementT, type TrayKey } from './labels';
 import { trayStatusTone, TRAY_TONE_DOT_CLASS } from './tray-status-tone';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
 
@@ -897,7 +897,7 @@ export default function TrayMenu() {
                       <path d="M5 12l5 5 9-11" />
                     </svg>
                   ) : (
-                    <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} /></span>
+                    <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} translate={measurementT} /></span>
                   )}
                 </button>
               );
@@ -1191,7 +1191,7 @@ export default function TrayMenu() {
                               <path d="M5 12l5 5 9-11" />
                             </svg>
                           ) : (
-                            <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} /></span>
+                            <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} translate={measurementT} /></span>
                           )}
                         </button>
                       );

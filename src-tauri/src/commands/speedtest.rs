@@ -918,6 +918,7 @@ pub(crate) struct RunEvents {
     /// 运行级身份；逐节点的三个字段在盖章时填。
     identity: ResultIdentity,
     fingerprints: BTreeMap<String, String>,
+    connection_fingerprints: BTreeMap<String, String>,
     requested: usize,
     skipped: Vec<(&'static str, usize)>,
     /// 本轮的汇总行。终态到达时生成并写进日志；有值即「已收尾」，此后的事件一律丢弃。
@@ -965,6 +966,7 @@ impl RunEvents {
                 binding: None,
             },
             fingerprints,
+            connection_fingerprints: BTreeMap::new(),
             requested: request.targets.len(),
             skipped: Vec::new(),
             summary: None,
@@ -977,6 +979,29 @@ impl RunEvents {
             static_bound: 0,
             system_path: 0,
         }
+    }
+
+    pub(crate) fn with_connection_fingerprints(
+        mut self,
+        fingerprints: BTreeMap<String, String>,
+    ) -> Self {
+        self.connection_fingerprints = fingerprints;
+        self
+    }
+
+    pub(crate) fn with_display_skipped(
+        self,
+        members: &[String],
+        skipped: &[(String, &'static str)],
+        fingerprints: &BTreeMap<String, String>,
+        network_epoch: Option<u64>,
+    ) -> Self {
+        let mut identity = self.identity.clone();
+        identity.network_epoch = network_epoch;
+        identity.measured_at = crate::runtime::subscription_scheduler::now_ms();
+        self.ledger
+            .set_display_skipped(members, skipped, identity, fingerprints);
+        self
     }
 
     /// 接上本轮的读回上下文。
@@ -1054,7 +1079,13 @@ impl RunEvents {
                     }
                     _ => Err(MeasureFailure::from_json(&payload["failure"])),
                 };
-                self.ledger.record(node_id, measured, identity.clone());
+                self.ledger.record_connection_at(
+                    node_id,
+                    measured,
+                    identity.clone(),
+                    self.connection_fingerprints.get(node_id).cloned(),
+                    measurement_ledger::mono_now_ms(),
+                );
             }
             payload["identity"] = identity.to_json();
             // 归属「系统路径」的结果到此为止：已入账，不向外发（见 [`SYSTEM_PATH_ID`]）。
@@ -1528,6 +1559,7 @@ struct PoolPrefilter<'a> {
     /// 每个不就绪 TS 节点的**具体成因**（键集 == `ts_pending`）。只喂零可测信封的文案，
     /// 不参与分区判定 —— 分区只问「就不就绪」，文案才需要问「为什么」。
     ts_reasons: &'a BTreeMap<String, TsNotReady>,
+    connection_fingerprints: &'a BTreeMap<String, String>,
 }
 
 /// 请求集波前预筛分区（纯逻辑，对齐 上游 `SpeedTestService.ts:674-700` 的 `poolTestable` 循环）。
@@ -2035,6 +2067,41 @@ async fn run_temp_core_speed_test(
         })
         .collect();
     let plan = plan_temp_core_with_bindings(&servers, &proxy.core_build_env(), &bind_interfaces);
+    let skip_request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: requested.clone(),
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: url.clone(),
+    };
+    let _skip_events = RunEvents::new(
+        run_id,
+        &skip_request,
+        CoreInstance::Temp,
+        None,
+        current_server_fingerprints(config),
+        None,
+    )
+    .with_display_skipped(
+        &requested,
+        &[
+            (
+                &plan
+                    .unusable
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>(),
+                "notInPool",
+            ),
+            (&plan.tailscale, "tsNotReady"),
+            (&plan.system_interface_blocked, "notInPool"),
+        ]
+        .into_iter()
+        .flat_map(|(ids, reason)| ids.iter().map(move |id| (id.clone(), reason)))
+        .collect::<Vec<_>>(),
+        &crate::runtime::node_fingerprints::measurement_table_json(config),
+        None,
+    );
     if plan.testable.is_empty() {
         if !plan.system_interface_blocked.is_empty() {
             #[cfg(target_os = "android")]
@@ -2127,6 +2194,9 @@ async fn run_temp_core_speed_test(
         current_server_fingerprints(config),
         None,
     )
+    .with_connection_fingerprints(crate::runtime::node_fingerprints::measurement_table_json(
+        config,
+    ))
     .with_skipped(vec![
         (
             "tempCoreUnsupported",
@@ -2395,10 +2465,13 @@ pub async fn server_speed_test(
                     .map(|r| (id.clone(), r))
             })
             .collect();
+        let connection_fingerprints =
+            crate::runtime::node_fingerprints::measurement_table_json(&config);
         let prefilter = PoolPrefilter {
             dirty: &dirty_pending,
             ts_pending: &ts_pending,
             ts_reasons: &ts_reasons,
+            connection_fingerprints: &connection_fingerprints,
         };
         let open_readback = || {
             Readback::open(
@@ -2427,6 +2500,46 @@ pub async fn server_speed_test(
         release_then_emit(guard, done, emit_done);
         return Ok(response);
     }
+
+    let fallback_requested = server_ids.clone().unwrap_or_else(|| all.clone());
+    let fallback_skip_request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: fallback_requested.clone(),
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: url.clone(),
+    };
+    let fallback_omissions = fallback_requested
+        .iter()
+        .filter_map(|id| {
+            if *id != active {
+                Some((id.clone(), "notInPool"))
+            } else if tailscale_ids.contains(id)
+                && !ts_node_ready(state.mesh().ts_status_event(id).as_ref())
+            {
+                Some((id.clone(), "tsNotReady"))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let _skip_events = RunEvents::new(
+        &run_id,
+        &fallback_skip_request,
+        CoreInstance::Main {
+            generation: proxy.core_generation(),
+            start_time: status.start_time,
+        },
+        proxy.ready_main_emission_digest(proxy.core_generation()),
+        BTreeMap::new(),
+        context.clone(),
+    )
+    .with_display_skipped(
+        &fallback_requested,
+        &fallback_omissions,
+        &crate::runtime::node_fingerprints::measurement_table_json(&config),
+        proxy.network_epoch(),
+    );
 
     // ── 回退：探测池未注入（端口分配失败/回滚）→ 仅当前活跃出口经 mixed 口可测 ──
     // 零可测的两条腿一律走**失败信封**（非 ok(empty)）：前端据此 throw → catch 复位 testing，
@@ -2508,6 +2621,16 @@ pub async fn server_speed_test(
         proxy.ready_main_emission_digest(gen0),
         BTreeMap::new(),
         context.clone(),
+    )
+    .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
+    .with_display_skipped(
+        &request.targets,
+        &skipped
+            .iter()
+            .map(|id| (id.clone(), "notInPool"))
+            .collect::<Vec<_>>(),
+        &crate::runtime::node_fingerprints::measurement_table_json(&config),
+        proxy.network_epoch(),
     )
     .with_skipped(vec![("notInPool", skipped.len())])
     .with_readback(&readback);
@@ -2769,6 +2892,38 @@ async fn run_pool_speed_test(
         prefilter.ts_pending,
     );
 
+    let skip_request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: requested.to_vec(),
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: url.to_owned(),
+    };
+    let _skip_events = RunEvents::new(
+        run_id,
+        &skip_request,
+        CoreInstance::Main {
+            generation: proxy.core_generation(),
+            start_time: proxy.status().start_time,
+        },
+        proxy.ready_main_emission_digest(proxy.core_generation()),
+        targets.fingerprints.clone(),
+        context.cloned(),
+    )
+    .with_display_skipped(
+        requested,
+        &[
+            (&not_in_pool, "notInPool"),
+            (&dirty, "dirty"),
+            (&ts_not_ready, "tsNotReady"),
+        ]
+        .into_iter()
+        .flat_map(|(ids, reason)| ids.iter().map(move |id| (id.clone(), reason)))
+        .collect::<Vec<_>>(),
+        prefilter.connection_fingerprints,
+        proxy.network_epoch(),
+    );
+
     // 波前预筛后零可测（全未入池 / 全已编辑未生效 / 全 TS 未就绪 / 混合）→ 失败信封防前端卡死 +
     // 缺席原因如实分流。
     if pool_testable.is_empty() {
@@ -2817,6 +2972,7 @@ async fn run_pool_speed_test(
         targets.fingerprints.clone(),
         context.cloned(),
     )
+    .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_skipped(vec![
         ("notInPool", not_in_pool.len()),
         ("dirty", dirty.len()),
@@ -2966,6 +3122,7 @@ pub(crate) async fn probe_runtime_candidates(
         targets.fingerprints.clone(),
         None,
     )
+    .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_readback(&readback);
     let mut sink = events.sink(|_, _| {});
     drive_runtime_probe(
@@ -3165,6 +3322,8 @@ pub(crate) struct ScheduledRoundInput<'a> {
     pub(crate) instance: CoreInstance,
     pub(crate) config_digest: Option<String>,
     pub(crate) fingerprints: BTreeMap<String, String>,
+    pub(crate) connection_fingerprints: BTreeMap<String, String>,
+    pub(crate) skipped_fingerprints: BTreeMap<String, String>,
 }
 
 /// 周期一轮的注入面：闸、运行号序列、账本、取消槽、墙钟与冻结阈值。
@@ -3237,15 +3396,9 @@ where
         ..RoundReport::default()
     };
     let waves = plan_waves(&partition.testable, width);
-    // 本轮零可测：不领运行号，没有任何节点被测。
-    if waves.is_empty() {
-        return ScheduledRound::Ran(report);
-    }
     let Some(run_id) = next_speed_test_run_id(deps.sequence) else {
         return ScheduledRound::Ran(report);
     };
-    // 有可测目标、领到了运行号，才建读回流。
-    let readback = (deps.open_readback)();
 
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Schedule,
@@ -3268,7 +3421,19 @@ where
         ("tsNotReady", partition.ts_not_ready.len()),
     ])
     .with_ledger(deps.ledger)
-    .with_readback(&readback);
+    .with_connection_fingerprints(input.connection_fingerprints)
+    .with_display_skipped(
+        input.targets,
+        &report.skipped,
+        &input.skipped_fingerprints,
+        network_epoch(),
+    );
+    // A valid admitted zero-testable round records omissions, never opens readback.
+    if waves.is_empty() {
+        return ScheduledRound::Ran(report);
+    }
+    let readback = (deps.open_readback)();
+    events = events.with_readback(&readback);
 
     let mut trace = WaveTrace::default();
     let mut admitted: BTreeMap<String, bool> = BTreeMap::new();
@@ -3391,6 +3556,8 @@ pub(crate) async fn run_scheduled_round(
         },
         config_digest: proxy.ready_main_emission_digest(gen0),
         fingerprints: probe.fingerprints.clone(),
+        connection_fingerprints: proxy.speed_measurement_fingerprints(),
+        skipped_fingerprints: crate::runtime::node_fingerprints::measurement_table_json(&config),
     };
     let deps = ScheduledRoundDeps {
         gate: &SPEED_TEST_GATE,

@@ -1,5 +1,6 @@
+import producerFixture from '@/contracts/measurement-producer.fixture.json';
 import { describe, expect, it } from 'vitest';
-import type { UserConfig } from '@/contracts/types';
+import type { UserConfig, ServerConfig } from '@/contracts/types';
 import { projectMeasurement, measurementText } from './measurement-display';
 import { validMeasurementSnapshot } from './measurement-snapshot';
 import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
@@ -45,5 +46,23 @@ describe('five-state, purpose-aware measurement projection', () => {
     snapshot.rows.a.candidate!.identity.path = 'system'; expect(validMeasurementSnapshot(snapshot)).toBe(false);
     const malformed = measurementFixture(config, { a: 1 }); malformed.rows.a.candidate!.latency = Number.NaN;
     expect(validMeasurementSnapshot(malformed)).toBe(false);
+  });
+});
+
+describe('Rust producer display IPC interoperability', () => {
+  it('accepts the actual stamped/readback golden and rejects the raw legacy event shape', () => {
+    const snapshot = structuredClone(producerFixture.snapshot) as import('@/contracts/measurement-display').MeasurementSnapshot;
+    expect(validMeasurementSnapshot(snapshot)).toBe(true);
+    expect(projectMeasurement(snapshot as import('@/contracts/measurement-display').MeasurementSnapshot,
+      producerFixture.server as ServerConfig, 1001)).toMatchObject({state:'success',latency:40});
+    const raw = structuredClone(snapshot) as any;
+    raw.rows.interop.candidate.identity.nodeFingerprint = producerFixture.legacyFingerprint;
+    delete raw.rows.interop.candidate.identity.nodeFingerprintDigest;
+    expect(validMeasurementSnapshot(raw)).toBe(false);
+    const changed = structuredClone(snapshot); changed.rows.interop.candidate.state = 'expired';
+    changed.rows.interop.candidate.reason = 'connectionChanged';
+    expect(validMeasurementSnapshot(changed)).toBe(true);
+    expect(projectMeasurement(changed as import('@/contracts/measurement-display').MeasurementSnapshot,
+      producerFixture.server as ServerConfig,1001)).toMatchObject({state:'expired',latency:undefined});
   });
 });
