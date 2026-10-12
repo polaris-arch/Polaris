@@ -59,6 +59,19 @@ pub(super) struct Context<'a> {
     pub b: &'a Value,
 }
 
+fn source_core_identity_from_repo(repo: &Path, core: &Path) -> Option<Value> {
+    let source_proof = repo.join("native-payload-evidence").join(if cfg!(windows) {
+        "source-win.json"
+    } else {
+        "source-linux.json"
+    });
+    std::fs::read(source_proof)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|proof| proof.pointer("/input/core").cloned())
+        .filter(|identity| identity["path"].as_str() == core.to_str())
+}
+
 pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut Running) {
     let Context {
         phase,
@@ -69,16 +82,7 @@ pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut R
         a,
         b,
     } = context;
-    let source_proof = Path::new("native-payload-evidence").join(if cfg!(windows) {
-        "source-win.json"
-    } else {
-        "source-linux.json"
-    });
-    let identity = std::fs::read(&source_proof)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|proof| proof.pointer("/input/core").cloned())
-        .filter(|identity| identity["path"].as_str() == core.to_str());
+    let identity = source_core_identity_from_repo(&support::core_locator::repo_root(), core);
     // Request both owned stacks before waiting: the first peer's exit must not consume
     // a full wait window before the other peer receives its diagnostic signal.
     let a_request = request_owned_stack(a_core);
@@ -97,10 +101,11 @@ pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut R
     eprintln!("WG_FAILURE_DIAGNOSTICS={snapshot}");
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn owned_sigquit_capture_keeps_original_and_signal_response() {
         let temp = tempfile::tempdir().unwrap();
@@ -125,6 +130,7 @@ mod tests {
             .contains("owned-stack-response"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn already_reaped_child_never_receives_a_stack_signal() {
         let temp = tempfile::tempdir().unwrap();
@@ -144,5 +150,60 @@ mod tests {
             .unwrap()
             .contains("original-failure"));
         assert_eq!(receipt["beforeStackRequest"], receipt["afterStackRequest"]);
+    }
+
+    fn fixture_proof(repo: &Path, core: &Path) -> Value {
+        let folder = repo.join("native-payload-evidence");
+        std::fs::create_dir_all(&folder).unwrap();
+        let identity = json!({"path":core,"sha256":"test-fixture-only-not-a-production-pin"});
+        let path = folder.join(if cfg!(windows) {
+            "source-win.json"
+        } else {
+            "source-linux.json"
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({"input":{"core":identity}})).unwrap(),
+        )
+        .unwrap();
+        identity
+    }
+
+    #[test]
+    fn crate_cwd_reads_proof_from_the_explicit_repo_root() {
+        // Cargo starts integration tests at the crate, while the workflow writes at repo root.
+        assert_eq!(
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .canonicalize()
+                .unwrap()
+        );
+        let repo = tempfile::tempdir().unwrap();
+        let core = repo.path().join("resources/linux/sing-box");
+        let identity = fixture_proof(repo.path(), &core);
+        assert_eq!(
+            source_core_identity_from_repo(repo.path(), &core),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn wrong_core_path_never_supplies_an_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let core = repo.path().join("resources/linux/sing-box");
+        fixture_proof(repo.path(), &core);
+        assert_eq!(
+            source_core_identity_from_repo(repo.path(), &repo.path().join("other-core")),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_repo_root_proof_stays_unbound() {
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(
+            source_core_identity_from_repo(repo.path(), &repo.path().join("core")),
+            None
+        );
     }
 }
