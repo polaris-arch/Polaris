@@ -33,6 +33,9 @@
 //! 这正是 §K7.1「组合面无门」的形态。故 [`HttpRuntime::new`] 无条件先装 provider，
 //! 并由 `http_runtime_builds_a_real_client_without_panicking` 钉死（该测试若删掉 provider 安装即 panic 转红）。
 
+#[cfg(debug_assertions)]
+pub(crate) mod local_acceptance;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;

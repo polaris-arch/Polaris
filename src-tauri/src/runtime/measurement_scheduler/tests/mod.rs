@@ -990,6 +990,7 @@ fn the_metered_policy_pauses_reduces_or_ignores() {
     assert_eq!(status["metered"], "metered");
 
     let (first, at_one_period, status) = run(Metered::Yes, MeteredPolicy::Reduced);
+    assert_eq!(status["periodFactor"], METERED_REDUCED_FACTOR);
     assert!(first, "降频：首轮照发");
     assert!(!at_one_period, "降频：一个周期后还不到期");
     assert_eq!(

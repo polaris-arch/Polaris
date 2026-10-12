@@ -1469,7 +1469,21 @@ pub async fn update_download(
     // 中间帧的发事件入口在下载 task 线程上，接不到上面那个借栈的 `emit` ⇒ 清单按值克隆一份
     // （一次下载克隆一次，不是一帧一次）。带的仍是**同一个** `update_info`。
     let on_progress = download_progress_emitter(&app, update_info.clone());
+    #[cfg(debug_assertions)]
+    let local_handle = tokio::runtime::Handle::current();
+    #[cfg(debug_assertions)]
+    let local_max_bytes = app_update_size_limit(declared_size);
     let streamed = match tokio::task::spawn_blocking(move || {
+        #[cfg(debug_assertions)]
+        if let Some(result) = crate::runtime::http::local_acceptance::download(
+            &url_for_task,
+            local_max_bytes,
+            new_sink.clone(),
+            on_progress.clone(),
+            &local_handle,
+        ) {
+            return result;
+        }
         dl.download_to_sink_with_progress(&url_for_task, new_sink, on_progress)
     })
     .await

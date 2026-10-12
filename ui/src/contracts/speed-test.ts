@@ -287,6 +287,8 @@ export interface SpeedTestScheduleStatus {
   metered?: 'metered' | 'unmetered' | 'unavailable';
   /** 生效的计费网络策略。`metered` 为 `metered` 且本项为 `reduced` 即正在降频（周期乘 4）。 */
   meteredPolicy?: 'reduced' | 'pause' | 'normal';
+  /** Actual multiplier from the scheduler; never inferred from elapsed wall time. */
+  periodFactor?: number;
   lastTickAt?: number;
   /** 读时投影：代理在运行、应用在前台，而调度器很久没有走过一拍。 */
   stalled: boolean;

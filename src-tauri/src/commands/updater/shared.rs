@@ -61,6 +61,14 @@ pub(crate) async fn fetch_releases_json(
     owner: &str,
     repo: &str,
 ) -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    if (owner, repo) == polaris_updater::github::APP_UPDATE_REPO {
+        if let Some(result) =
+            crate::runtime::http::local_acceptance::releases(MAX_GITHUB_JSON_BYTES).await
+        {
+            return result;
+        }
+    }
     let http = state.http().clone();
     let url = github_releases_api_url(owner, repo);
     let resp = safe_redirect_fetch(SafeRedirectFetchOptions {

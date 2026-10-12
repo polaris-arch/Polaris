@@ -1275,6 +1275,7 @@ impl Planner {
             // 当前网络的计费状态与生效的策略：两者合起来才说得清是「降频」「暂停」还是「照常」。
             "metered": self.conditions.metered.as_str(),
             "meteredPolicy": self.policy.as_str(),
+            "periodFactor": self.period_factor(),
             "lastTickAt": last_tick,
             "stalled": core_running
                 && self.foreground
