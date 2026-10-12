@@ -56,6 +56,8 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("crates/helper/src/pinned_core/tests/mod.rs", Kind::ExecBit, 1,
+        "Private root/source directories for inert content status fixtures"),
     ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,
         "PayloadDir owner/permission rejection fixture; directory traversal only"),
     ("crates/helper/src/platform/windows/helper/tests/mod.rs", Kind::ExecBit, 1,

@@ -1106,19 +1106,7 @@ impl HelperRuntime {
             .map_err(|error| format!("helper pinned 起核通信失败：{error}"))?;
         let resp = match received {
             Response::Ok(ResponseKind::PinnedStart { id: actual, start }) if actual == id => {
-                match start {
-                    polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start)
-                        if self.platform == Platform::Linux =>
-                    {
-                        Response::Ok(ResponseKind::LinuxBirthStart(start))
-                    }
-                    polaris_helper_proto::core_protocol::PinnedBirthStart::Native(start)
-                        if matches!(self.platform, Platform::Mac | Platform::Win) =>
-                    {
-                        Response::Ok(ResponseKind::NativeBirthStart(start))
-                    }
-                    _ => return Err("HELPER_CORE_MISMATCH: wrong receipt platform".into()),
-                }
+                pinned_receipt_response(self.platform, start)?
             }
             Response::Ok(ResponseKind::PinnedStart { start, .. }) => {
                 return match start {
@@ -1774,6 +1762,30 @@ fn is_helper_slot_occupied(error: &polaris_helper_proto::Error) -> bool {
             | "slot-owned-or-core-occupied"
             | "core-occupied"
     )
+}
+
+fn pinned_receipt_response(
+    platform: Platform,
+    start: polaris_helper_proto::core_protocol::PinnedBirthStart,
+) -> Result<Response, String> {
+    use polaris_helper_proto::core_protocol::PinnedBirthStart;
+    match (platform, start) {
+        (Platform::Linux, PinnedBirthStart::Linux(start)) => {
+            Ok(Response::Ok(ResponseKind::LinuxBirthStart(start)))
+        }
+        (Platform::Mac | Platform::Win, PinnedBirthStart::Native(start)) => {
+            Ok(Response::Ok(ResponseKind::NativeBirthStart(start)))
+        }
+        (
+            Platform::Linux
+            | Platform::Mac
+            | Platform::Win
+            | Platform::Android
+            | Platform::Ios
+            | Platform::Other,
+            _,
+        ) => Err("HELPER_CORE_MISMATCH: wrong receipt platform".into()),
+    }
 }
 
 fn format_helper_mutation_error(

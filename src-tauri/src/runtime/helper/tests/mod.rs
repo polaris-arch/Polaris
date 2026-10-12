@@ -66,6 +66,28 @@ fn birth_target(pid: u32, wire: &str) -> HelperBirthTarget {
 }
 
 #[test]
+fn pinned_receipt_family_is_explicit_for_every_platform() {
+    use polaris_helper_proto::core_protocol::PinnedBirthStart;
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    let linux = LinuxBirthStart::Already { target };
+    let native = NativeBirthStart::Already { target };
+    for &platform in Platform::ALL {
+        let linux_result = pinned_receipt_response(platform, PinnedBirthStart::Linux(linux));
+        let native_result = pinned_receipt_response(platform, PinnedBirthStart::Native(native));
+        assert_eq!(linux_result.is_ok(), platform == Platform::Linux);
+        assert_eq!(
+            native_result.is_ok(),
+            matches!(platform, Platform::Mac | Platform::Win)
+        );
+        for result in [linux_result, native_result] {
+            if let Err(error) = result {
+                assert!(error.starts_with("HELPER_CORE_MISMATCH:"));
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_start_accepts_only_birth_receipts_and_never_promotes_already() {
     let target = birth_target(4242, "00112233445566778899aabbccddeeff");
     assert_eq!(

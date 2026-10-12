@@ -84,7 +84,7 @@ const COMPARISON_FLOOR: usize = 20;
 /// `Self::` 已归一成 `Platform::`），故 `parse` 那条里 `"darwin" | "macos"` 只剩一个裸 `|`，
 /// `"linux"` 之类只剩空白 —— 那不是笔误，而是这一面上它本来的样子。
 ///
-/// # 唯一一条放行（2026-09-06）
+/// # 精确片段放行（2026-09-06；2026-10-12 增加 fail-closed 复合判据）
 ///
 /// K10 把当时仅有的四处裸通配全部展开成了具名臂（`helper-client/src/manager.rs` 的
 /// `is_installed` / `install_script_name` / `uninstall_script_name`，与
@@ -95,7 +95,12 @@ const COMPARISON_FLOOR: usize = 20;
 /// 放行它不放松任何强制力：新增平台**变体**时该红的是别处（穷举 `match` 编译不过、
 /// `platform_variants_stay_in_sync_with_all` 与 [`variant_names_cover_every_variant`] 变红）；
 /// 新增平台**名字面量**时该红的是 `STRING_DISPATCH_REGISTRY` 里 `parse` 那条（语句原文变了）。
-const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
+///
+/// B2b/B3 增加清单字符串解析、native identity/platform 与 response/platform 元组。
+/// 它们的 wildcard 拒绝未知输入或保留 Unknown，不能为新平台授予操作能力；
+/// 下表逐块绑定准确源码与理由，不按文件放行，不降低扫描范围或正面下限。
+const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
+(
     "crates/helper-proto/src/lib.rs",
     "{ | => Platform::Mac, | => Platform::Win, => Platform::Linux, => Platform::Android, \
      => Platform::Ios, _ => Platform::Other, }",
@@ -103,7 +108,23 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
      `Platform`：字符串上没有穷举可言，`_` 是唯一写法。它的兜底值 `Platform::Other` 就是\
      「本仓没为这个平台答过题」的显式落点，正是本门头注里 `Other` 该有的语义。\
      2026-09-06 因扫描器补上 `Self::` 归一化而首次进入取材面 —— 判据没变，看得见的东西变多了。",
-)];
+),
+(
+    "crates/helper-proto/src/core_manifest.rs",
+    "{ => Platform::Linux, => Platform::Win, | => Platform::Mac, _ => return Err( ), }",
+    "Manifest parses a source-contract string, not a Platform value. Only four desktop rows are accepted; Android/iOS/unknown strings fail closed. The string registry below binds the exact accepted names.",
+),
+(
+    "crates/helper-client/src/manager.rs",
+    "{ (CallerIdentity::Unix(uid), Platform::Linux | Platform::Mac) if *uid == params.uid => {} (CallerIdentity::Windows(sid), Platform::Win) if CallerIdentity::windows(sid).is_some() => { } _ => { return Err(ManagerError::InvalidInstallation( , )) } }",
+    "The tuple also validates native identity kind and UID/SID. All mismatches, Android/iOS/Other and future platforms are rejected before privileged script creation; the wildcard does not grant installation on a new platform.",
+),
+(
+    "crates/helper/src/admin_probe.rs",
+    "{ ( Platform::Linux, Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Empty)), ) | ( Platform::Mac | Platform::Win, Response::Ok(ResponseKind::NativeBirthStatus(NativeBirthStatus::Empty)), ) => Slot::Empty, ( Platform::Linux, Response::Ok(ResponseKind::LinuxBirthStatus( LinuxBirthStatus::Running { .. } | LinuxBirthStatus::Stopping { .. }, )), ) | ( Platform::Mac | Platform::Win, Response::Ok(ResponseKind::NativeBirthStatus( NativeBirthStatus::Running { .. } | NativeBirthStatus::Stopping { .. }, )), ) => Slot::Occupied, _ => Slot::Unknown, }",
+    "This tuple classifies an authenticated response as well as its platform. Wrong response families, errors and every unsupported platform stay Unknown, which cannot admit service replacement. Empty requires the matching Linux/native receipt.",
+),
+];
 
 /// 比较型（非 `match`）`Platform` 分派点登记表。
 ///
@@ -159,6 +180,16 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[(
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("crates/helper-client/src/manager.rs",
+     "!raw.contains([ , , ]) && (path.is_absolute() || platform == Platform::Win && raw.as_bytes().get(1) == Some(&b ) && matches!(raw.as_bytes().get(2), Some(b | b )))", 1,
+     "Only Windows accepts a drive-qualified staged path when the authoring host uses Unix path syntax. Android/iOS/Other cannot borrow that path rule or pass native caller admission."),
+    ("crates/helper-proto/src/core_manifest.rs", "if platform != Platform::Win", 1,
+     "A cleaner hash is legal only for a Windows manifest. Mobile/unknown rows were already rejected by the preceding exact desktop source-contract parser."),
+    ("crates/helper/src/admin_probe.rs",
+     "if !matches!(ping, Ok(Response::Ok(ResponseKind::Pong(_)))) && matches!(platform, Platform::Mac | Platform::Win)", 1,
+     "Legacy token retry belongs only to Mac/Windows authenticated endpoints. Mobile/Other cannot acquire install-time upgrade admission from a failed handshake."),
+    ("src-tauri/src/runtime/helper.rs", "let helper_name = if self.platform == Platform::Win", 1,
+     "Selects the Windows staged helper basename. Android/iOS/Other have no supported desktop installation path; they cannot inherit Windows or Unix helper installation."),
     ("src-tauri/src/commands/coexistence_snapshot.rs",
      "if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)", 1,
      "COEX source admission supports only current desktop collectors; Android/iOS/Other explicitly unavailable, never empty/safe."),
@@ -1451,6 +1482,9 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("crates/helper-proto/src/core_manifest.rs",
+     "\"linux\" => Platform::Linux, \"win\" => Platform::Win, \"mac-x64\" | \"mac-arm64\" => Platform::Mac, _ => return Err(\"core-platform-invalid\"),", 1,
+     "The core manifest source-contract axis accepts exactly the four desktop App rows. Android/iOS and unknown strings return an error; the cleaner and complete payload checks then use the resolved desktop platform."),
     (
         "src-tauri/src/runtime/uninstall.rs",
         "if self.os != \"windows\" && !self.helper.installed()",
