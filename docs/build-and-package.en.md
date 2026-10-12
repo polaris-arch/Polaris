@@ -247,3 +247,11 @@ The user then extracts everything in the archive into the program folder, choosi
 ⚠️ A portable run that is handed the installer (or an installed run that is handed the portable archive) is treated as a form mismatch: nothing is installed, the file is handed to the system and the update card reports an error, so a second copy is never installed behind the user's back.
 
 ⚠️ If a user deletes `portable.marker`, the app goes back to treating itself as an installed build and starts offering the installer instead. **No automated mechanism can guard against this**, so the file itself states that it must not be deleted.
+
+## Bundled core and privileged helper
+
+Desktop production packages use the selected polaris-box core for this app version. Linux and Windows include Cronet beside the core; macOS uses static inputs. Packaging freezes the actual helper bytes (and Windows cleaner), generates `core-manifest.json` as an App compile input, and verifies the final payload against it. Production builds accept neither uploaded cores nor environment overrides for the core path.
+
+A change to the selected content identity requires an administrator installation transaction before TUN startup. The helper stores immutable versions by CoreID; runtime requests send the ID without uploading files. A newer compatible helper may be retained. Adding another core version does not stop another user's active core. If an old helper retains custody or an empty slot cannot be established, replacement is deferred.
+
+Retention keeps the three most recently used content identities and every version with a live native lease. Flat cores and old user caches are retired only after complete idle observation; unknown use preserves them. Public release asset cleanup follows verified App consumption and migration of active references.

@@ -2,7 +2,7 @@
   "schema": "polaris-app-pending-release-v1",
   "selection": {
     "schema": "polaris-app-release-selection-v1",
-    "contractPath": "scripts/desktop-core/pending-release-contract.json",
+    "contractPath": "scripts/desktop-core/release-contract.json",
     "contractSha256": "0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d",
     "version": "1.15.0-alpha.12",
     "tag": "v1.15.0-alpha.12",
@@ -29,7 +29,8 @@
       "unauthenticatedReadback": true,
       "url": "https://github.com/polaris-arch/polaris-box/releases/download/v1.15.0-alpha.12/polaris-box-assets.json"
     },
-    "parentAnonymousReadbackConfirmed": true
+    "parentAnonymousReadbackConfirmed": true,
+    "candidateSourceSelectionWritten": true
   },
   "migrationRequirement": "whole task-table source completion, concentrated independent review and corresponding complete App download/unpack/load/carrier validation"
 }

@@ -53,6 +53,8 @@ const GIO_DIR_PREFIX = 'export GIO_MODULE_DIR=';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const APPIMAGE_CORE_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/sing-box';
 const CRONET_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/libcronet.so';
+export const APPIMAGE_HELPER_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/polaris-helper';
+const INSTALL_MANIFEST_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/core-manifest.json';
 
 function regularMember(root, member) {
   let path = resolve(root);
@@ -82,9 +84,13 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
   const target = regularMember(appDir, APPIMAGE_CORE_MEMBER);
   const cronetSource = regularMember(sourceRoot, 'resources/linux/libcronet.so');
   const cronetTarget = regularMember(appDir, CRONET_MEMBER);
+  const helperSource = regularMember(sourceRoot, 'resources/linux/polaris-helper');
+  const helperTarget = regularMember(appDir, APPIMAGE_HELPER_MEMBER);
+  const installationSource = regularMember(sourceRoot, 'resources/linux/core-manifest.json');
+  const installationTarget = regularMember(appDir, INSTALL_MANIFEST_MEMBER);
   const manifest = JSON.parse(readFileSync(regularMember(sourceRoot, 'src-tauri/core-manifest.json'), 'utf8'));
   const verifiedCronet = verifyCronetPayload(cronetSource, cronetSource, 'linux', manifest);
-  const matches = new Map([['sing-box', []], ['libcronet.so', []]]);
+  const matches = new Map([['sing-box', []], ['libcronet.so', []], ['polaris-helper', []]]);
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
@@ -93,14 +99,19 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
     }
   };
   visit(appDir);
-  for (const [name, wanted] of [['sing-box', target], ['libcronet.so', cronetTarget]]) {
+  for (const [name, wanted] of [['sing-box', target], ['libcronet.so', cronetTarget], ['polaris-helper', helperTarget]]) {
     const found = matches.get(name);
     if (found.length !== 1 || found[0] !== wanted) throw new Error(`AppDir ${name} 成员必须唯一且位于 ${wanted}`);
   }
   const expected = identity(source);
   if ((expected.mode & 0o111) === 0) throw new Error('源内核不可执行');
   const cronetIdentity = { sha256: verifiedCronet.sha256, mode: verifiedCronet.mode };
-  const seeds = [[source, target, expected], [cronetSource, cronetTarget, cronetIdentity]];
+  const helperIdentity = identity(helperSource), installationIdentity = identity(installationSource);
+  const installation = JSON.parse(readFileSync(installationSource));
+  if (installation.core?.helperSha256 !== helperIdentity.sha256) throw new Error('source helper differs from compiled installation pin');
+  if (!readFileSync(installationSource).equals(readFileSync(installationTarget))) throw new Error('AppDir installation manifest differs from compiled input');
+  const seeds = [[source, target, expected], [cronetSource, cronetTarget, cronetIdentity],
+    [helperSource, helperTarget, helperIdentity]];
   const staging = mkdtempSync(join(dirname(target), '.core-seed-'));
   try {
     for (const [input, output, wanted] of seeds) {
@@ -116,7 +127,8 @@ export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
     rmSync(staging, { recursive: true, force: true });
   }
   verifyCronetPayload(cronetSource, cronetTarget, 'linux', manifest);
-  return { [APPIMAGE_CORE_MEMBER]: expected, [CRONET_MEMBER]: cronetIdentity };
+  return { [APPIMAGE_CORE_MEMBER]: expected, [CRONET_MEMBER]: cronetIdentity,
+    [APPIMAGE_HELPER_MEMBER]: helperIdentity, [INSTALL_MANIFEST_MEMBER]: installationIdentity };
 }
 
 // Read SquashFS with a host tool, never execute the AppImage runtime. A magic

@@ -55,10 +55,8 @@ pub const PRIVILEGED_SIDS: [&str; 2] = [SID_LOCAL_SYSTEM, SID_ADMINISTRATORS];
 
 /// 配套 DLL 名（与核同目录，兜底白名单的第二个文件）。
 ///
-/// **真值住在 [`crate::core_install`]，本处只是转发**：`platform::windows` 的 cfg 谓词里那个
-/// `test` 只在 polaris-helper 自己的 test 编译期成立，src-tauri 的跨 crate 等值门够不着这里。
-/// 理由全文见 [`crate::core_install::CRONET_DLL_NAME_WIN`]。
-pub use crate::core_install::CRONET_DLL_NAME_WIN;
+/// Filename authority is shared with the content manifest whitelist.
+pub use polaris_helper_proto::core_payload::WIN_SIDECAR_FILENAME as CRONET_DLL_NAME_WIN;
 
 /// 「写类权」位掩码。任一位命中即视为可改该对象。
 ///
@@ -568,3 +566,28 @@ pub fn locked_down_fixture() -> ObjectSecurity {
 
 #[cfg(test)]
 mod tests;
+
+/// Config directories are private to their native SID; SYSTEM/admin remain
+/// trusted. An unreadable/conditional ACE never proves caller isolation.
+pub fn is_private_user_config(sec: &ObjectSecurity, sid: &str) -> bool {
+    if sec.owner_sid.as_deref() != Some(sid)
+        || polaris_helper_proto::core_protocol::CallerIdentity::windows(sid).is_none()
+    {
+        return false;
+    }
+    let Some(aces) = &sec.dacl else {
+        return false;
+    };
+    aces.iter().all(|ace| {
+        !ace.is_effective_on_object()
+            || match ace.kind {
+                AceKind::Unparsed(_) => false,
+                AceKind::Deny => true,
+                AceKind::Allow => {
+                    ace.sid == sid
+                        || is_privileged_sid(&ace.sid)
+                        || ace.mask & (WRITE_ACCESS_MASK | READ_EXECUTE_ACCESS_MASK) == 0
+                }
+            }
+    })
+}

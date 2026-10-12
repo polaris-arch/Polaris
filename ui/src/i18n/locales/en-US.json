@@ -47,6 +47,16 @@
       "missingAsset": "The helper files bundled with this app are unavailable",
       "notReady": "The helper was installed but is not ready yet",
       "failed": "The helper action could not be completed"
+    },
+    "selectedCoreVersion": "Selected core version",
+    "selectedCoreId": "Selected content ID",
+    "selectedCoreProvider": "Source identity",
+    "selectedCoreState": "Installed content",
+    "coreState": {
+      "present": "Verified",
+      "absent": "Not installed",
+      "invalid": "Verification failed",
+      "unavailable": "Unavailable"
     }
   },
   "proxy": {
@@ -243,8 +253,20 @@
       "body": "The core file inside the installed package is not executable, so the connection was not established. Please reinstall the app."
     },
     "helperCoreMismatch": {
-      "title": "Polaris could not start TUN mode",
-      "body": "Polaris could not confirm that the core inside the privileged helper matches this app, so TUN mode was not started. Open the app and go to Settings › Helper to reinstall or upgrade the helper, then try again"
+      "title": "Polaris could not start",
+      "body": "Polaris could not verify the selected core receipt. Go to Settings › Helper to repair or upgrade the helper."
+    },
+    "coreBundleMismatch": {
+      "title": "Polaris could not start",
+      "body": "The bundled core does not match this app’s content identity. Reinstall Polaris."
+    },
+    "helperCoreAbsent": {
+      "title": "Polaris could not start",
+      "body": "This app’s selected core is not installed. Go to Settings › Helper to install it."
+    },
+    "helperCoreInvalid": {
+      "title": "Polaris could not start",
+      "body": "The installed core failed verification. Go to Settings › Helper to repair it."
     }
   },
   "connections": {
@@ -1668,13 +1690,16 @@
     "rootOrphanBlocked": "A leftover core process is holding the cache file, so startup was blocked",
     "coreBinaryMismatch": "The running core does not match the version bundled with this app. Reinstall Helper, then check Logs for details.",
     "coreNotExecutable": "The core file inside the installed package is not executable, so it cannot start. Please reinstall the app.",
-    "helperCoreMismatch": "Polaris could not confirm that the core inside the privileged helper matches this app, so it refused to start in TUN mode. Go to Settings › Helper to reinstall or upgrade the helper, then try again.",
+    "helperCoreMismatch": "Polaris could not verify the selected core receipt. Go to Settings › Helper to repair or upgrade the helper.",
     "tunAdapterMissing": "The TUN adapter could not be created. Check whether security software is blocking the wintun driver, then restart and try again.",
     "autoSwitchNeedsRestart": "Automatic node switching was triggered, but nothing was switched this time: some candidate nodes need the core restarted before they can take over. Pick another node manually.",
     "tunAddressUnavailable": "The TUN adapter address could not be assigned — it may be held by a leftover adapter or another VPN. Disconnect other VPNs, or restart and try again.",
     "androidNativeCapacityClosed": "This session has reached its lifecycle record limit. Fully close and restart the app, then try again.",
     "vpnPermissionDenied": "VPN permission is still needed. Complete or dismiss any open permission dialog, then tap Connect again and allow the system VPN connection request.",
-    "systemInterfaceUnsupported": "This node requests a system interface, which Android VPN mode does not support. Turn off the system interface option in the node editor; for custom nodes, set system to false in the JSON."
+    "systemInterfaceUnsupported": "This node requests a system interface, which Android VPN mode does not support. Turn off the system interface option in the node editor; for custom nodes, set system to false in the JSON.",
+    "coreBundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris.",
+    "helperCoreAbsent": "This app’s selected core is not installed. Go to Settings › Helper to install it.",
+    "helperCoreInvalid": "The installed core failed verification. Go to Settings › Helper to repair it."
   },
   "privacy": {
     "wrongPassword": "Incorrect unlock password",

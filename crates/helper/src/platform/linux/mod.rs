@@ -7,8 +7,7 @@
 //!
 //! ## 共用层（不在本模块 —— 见 crate 顶层）
 //!
-//! - install-core 核心：[`crate::core_install`]（与 mac 逐字同）。本模块 [`core_installer`] 只留
-//!   linux 专属的清理（受管目录里凡不是本次装入的常规文件都删，按目录 fd、不跟随链接）。
+//! - 管理员内容安装：[`crate::core_cli`] + [`crate::core_store`]；运行时只接受选定 CoreID。
 //! - 行协议读写：[`crate::line_io`]（与 mac 共用）。
 //! - token：linux **不用** —— 鉴权走 SO_PEERCRED（内核背书，不可伪造），是比 token 行更强的边界，
 //!   真平台差异。
@@ -18,7 +17,6 @@
 //! - [`auth`]：SO_PEERCRED 凭据取 + 授权 uid 列表 + config 属主校验（移植自 `helper.go:77-133`）。
 //! - [`state`]：Handler 进程状态（child/childDone）+ CoreSpawner trait（对应 Go 全局 `child` + `c.Start()`）。
 //! - [`ops`]：系统操作 trait 抽象（systemd / TUN / route，§D 特权矩阵可测试边界）。
-//! - [`core_installer`]：install-core 的 linux 清理 hook（核心走公共层）。
 //! - [`freeport`]：按端口找 LISTEN 持有者 + 跨用户防误杀（linux 机制：`ss` 正则 + `/proc` +
 //!   `kill(2)` —— 与 mac 的 `lsof`+`ps` 是真差异）。
 //! - [`handler`]：命令分发器（移植自 `helper.go:333-482` 的 `handle(conn)`，所有命令逐分支对照）。
@@ -56,7 +54,6 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
-pub mod core_installer;
 pub mod daemon;
 pub mod freeport;
 pub mod handler;
@@ -74,7 +71,6 @@ pub use auth::{
     is_authorized, owned_by, supplementary_groups, AuthError, CapturedPeerCred, PeerCred,
     PeerCredProvider,
 };
-pub use core_installer::install_core;
 pub use freeport::{free_port, parse_ss_pids, FreePortDeps};
 pub use handler::{handle, Conn, HandlerDeps, LineConn, READ_TIMEOUT_SECS};
 // DNS flush 不在 Linux helper 职责内（无上游 Go 命令 / app 进程非提权侧已有单一真值

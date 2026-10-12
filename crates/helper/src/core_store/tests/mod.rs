@@ -14,7 +14,7 @@ fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
         CoreFile {
             name: name.into(),
             bytes: raw.len() as u64,
-            sha256: crate::core_install::sha256_hex(&raw),
+            sha256: crate::core_hash::sha256_hex(&raw),
         }
     })
     .collect();
@@ -27,7 +27,7 @@ fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
         cleaner_sha256: None,
     };
     let id = core
-        .id(crate::core_install::sha256_hex)
+        .id(crate::core_hash::sha256_hex)
         .unwrap()
         .as_str()
         .to_owned();
@@ -160,4 +160,34 @@ fn linked_payload_and_weakened_store_permissions_are_rejected() {
         .is_err());
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
     assert!(CoreStore::open(root.path(), OwnerPolicy { uid: Some(uid) }).is_err());
+}
+
+#[test]
+fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() {
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("1.0.0");
+    store
+        .install(&manifest, source.path(), Some(uid), None)
+        .unwrap();
+    for name in ["sing-box", "libcronet.so"] {
+        fs::write(root.path().join(name), b"old-flat").unwrap();
+    }
+    for state in [
+        crate::legacy_use::LegacyUse::Unknown,
+        crate::legacy_use::LegacyUse::InUse,
+    ] {
+        assert!(store.retire_flat_layout_with(|_| state).unwrap().is_empty());
+        for name in ["sing-box", "libcronet.so"] {
+            assert_eq!(fs::read(root.path().join(name)).unwrap(), b"old-flat");
+        }
+    }
+    assert_eq!(
+        store
+            .retire_flat_layout_with(|_| crate::legacy_use::LegacyUse::Idle)
+            .unwrap()
+            .len(),
+        2
+    );
+    let id = CoreId::parse(&manifest.id).unwrap();
+    assert!(store.verify_for_start(&id).is_ok());
 }

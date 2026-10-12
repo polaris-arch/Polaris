@@ -8,14 +8,18 @@ fn start(
     h: &WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps>,
     forwarding: bool,
 ) -> HelperBirthTarget {
-    let reply = h.handle(
+    let reply = handle_selected(
+        &h,
         "real-token",
-        Request::NativeStartBirth(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".into(),
-            log: String::new(),
-            fwd: forwarding,
-            parent_pid: None,
-        }),
+        pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: forwarding,
+                parent_pid: None,
+            },
+        ),
     );
     let HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
         NativeBirthStart::Started { target, .. },
@@ -30,7 +34,7 @@ fn stop(
     h: &WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps>,
     target: HelperBirthTarget,
 ) -> NativeBirthStop {
-    let reply = h.handle("real-token", Request::NativeStopBirth { target });
+    let reply = handle_selected(&h, "real-token", Request::NativeStopBirth { target });
     let HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(stop))) = reply else {
         panic!("{reply:?}");
     };
@@ -61,7 +65,7 @@ fn poisoned_dns_admission_does_not_skip_or_fake_native_drain() {
     assert!(h.child_mu.lock().unwrap().native.is_none());
     assert!(ops.native_custody_empty());
     assert!(matches!(
-        h.handle("real-token", Request::FlushDns),
+        handle_selected(&h, "real-token", Request::FlushDns),
         HandleOutcome::Respond(Response::Err(_))
     ));
     assert_eq!(ops.flush_dns_calls(), 0);
@@ -75,7 +79,7 @@ fn system_uninstall_defers_to_uac_without_detaching_or_draining_live_custody() {
     for poll in [NativeChildPoll::Running, NativeChildPoll::Exited] {
         ops.set_native_stop(poll);
         assert!(matches!(
-            h.handle("real-token", Request::Uninstall),
+            handle_selected(&h, "real-token", Request::Uninstall),
             HandleOutcome::Respond(Response::Err(_))
         ));
         assert_eq!(
@@ -92,7 +96,8 @@ fn system_uninstall_defers_to_uac_without_detaching_or_draining_live_custody() {
 fn legacy_start_is_rejected_before_forwarding_or_process_creation() {
     let ops = MockProcOps::new();
     let h = make_helper(ops.clone(), MockNetTableOps::new());
-    let reply = h.handle(
+    let reply = handle_selected(
+        &h,
         "real-token",
         Request::Start(StartParams {
             cfg: r"C:\Users\polaris\config\c.json".into(),
@@ -102,7 +107,7 @@ fn legacy_start_is_rejected_before_forwarding_or_process_creation() {
         }),
     );
     assert!(
-        matches!(reply, HandleOutcome::Respond(Response::Err(error)) if error.detail.contains("client-upgrade-required"))
+        matches!(reply, HandleOutcome::Respond(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Unknown)
     );
     assert_eq!(ops.snapshot().start_calls, 0);
     assert_eq!(ops.snapshot().ip_forward_calls, 0);
@@ -110,13 +115,17 @@ fn legacy_start_is_rejected_before_forwarding_or_process_creation() {
 
 #[test]
 fn native_start_frame_round_trips_optional_parent_and_rejects_incomplete_or_extra_args() {
+    let h = make_helper_defaults();
     for parent_pid in [None, Some(4242)] {
-        let request = Request::NativeStartBirth(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".into(),
-            log: String::new(),
-            fwd: true,
-            parent_pid,
-        });
+        let request = pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid,
+            },
+        );
         let wire = String::from_utf8(polaris_helper_proto::codec::encode(
             polaris_helper_proto::Platform::Win,
             "real-token",
@@ -136,10 +145,11 @@ fn native_start_frame_round_trips_optional_parent_and_rejects_incomplete_or_extr
         vec!["cfg", "log", "0", "bad"],
         vec!["cfg", "log", "0", "1", "2"],
     ] {
-        assert!(
-            crate::platform::windows::logic::parse_request("start-native-birth-safe", &args)
-                .is_none()
-        );
+        assert!(crate::platform::windows::logic::parse_request(
+            "start-native-pinned-birth-safe",
+            &args
+        )
+        .is_none());
     }
 }
 
@@ -162,14 +172,18 @@ fn pending_and_wait_error_keep_exact_native_custody_and_block_replacement_side_e
             h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
             target
         );
-        let reply = h.handle(
+        let reply = handle_selected(
+            &h,
             "real-token",
-            Request::NativeStartBirth(StartParams {
-                cfg: r"C:\Users\polaris\config\other.json".into(),
-                log: String::new(),
-                fwd: true,
-                parent_pid: None,
-            }),
+            pinned_start(
+                &h,
+                StartParams {
+                    cfg: r"C:\Users\polaris\config\other.json".into(),
+                    log: String::new(),
+                    fwd: true,
+                    parent_pid: None,
+                },
+            ),
         );
         assert!(
             matches!(reply, HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedPending { target: observed } | NativeBirthStart::NotAdmittedUnknown { target: Some(observed) }))) if observed == target)
@@ -228,14 +242,18 @@ fn native_exit_with_unconfirmed_tail_keeps_birth_and_refuses_new_forwarding_or_s
         h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
         target
     );
-    let reply = h.handle(
+    let reply = handle_selected(
+        &h,
         "real-token",
-        Request::NativeStartBirth(StartParams {
-            cfg: r"C:\Users\polaris\config\next.json".into(),
-            log: String::new(),
-            fwd: true,
-            parent_pid: None,
-        }),
+        pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\next.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid: None,
+            },
+        ),
     );
     assert!(
         matches!(reply, HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedUnknown { target: Some(observed) }))) if observed == target)
@@ -269,19 +287,23 @@ fn native_status_is_read_only_capability_and_never_mints_a_birth_for_legacy_stat
     let h = make_helper_defaults();
     h.child_mu.lock().unwrap().pid = Some(42);
     assert_eq!(
-        h.handle("real-token", Request::NativeStatusBirth),
+        handle_selected(&h, "real-token", Request::NativeStatusBirth),
         HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
             NativeBirthStatus::Unknown { target: None }
         )))
     );
-    let bad = h.handle(
+    let bad = handle_selected(
+        &h,
         "real-token",
-        Request::NativeStartBirth(StartParams {
-            cfg: r"C:\Users\polaris\config\c.json".into(),
-            log: String::new(),
-            fwd: true,
-            parent_pid: None,
-        }),
+        pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid: None,
+            },
+        ),
     );
     assert!(matches!(
         bad,
@@ -305,7 +327,7 @@ fn legacy_stop_cleanup_and_service_shutdown_cannot_detach_a_pending_native_objec
         Request::Uninstall,
     ] {
         assert!(matches!(
-            h.handle("real-token", request),
+            handle_selected(&h, "real-token", request),
             HandleOutcome::Respond(Response::Err(_))
         ));
         assert_eq!(
@@ -397,7 +419,7 @@ fn shutdown_pending_wait_error_and_logger_tail_failure_cannot_confirm_exit() {
         assert!(h.child_mu.lock().unwrap().closing);
         assert!(!ops.native_custody_empty());
         assert!(matches!(
-            h.handle("real-token", Request::NativeStartBirth(StartParams {
+            handle_selected(&h, "real-token", pinned_start(&h, StartParams {
                 cfg: r"C:\Users\polaris\config\next.json".into(),
                 log: String::new(), fwd: true, parent_pid: None,
             })),
@@ -458,20 +480,24 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
         poison_child_state(&h);
         assert_eq!(stop(&h, target), NativeBirthStop::Unknown { target });
         assert_eq!(
-            h.handle("real-token", Request::NativeStatusBirth),
+            handle_selected(&h, "real-token", Request::NativeStatusBirth),
             HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
                 NativeBirthStatus::Unknown { target: None }
             )))
         );
         assert!(matches!(
-            h.handle(
+            handle_selected(
+                &h,
                 "real-token",
-                Request::NativeStartBirth(StartParams {
-                    cfg: r"C:\Users\polaris\config\next.json".into(),
-                    log: String::new(),
-                    fwd: true,
-                    parent_pid: None,
-                })
+                pinned_start(
+                    &h,
+                    StartParams {
+                        cfg: r"C:\Users\polaris\config\next.json".into(),
+                        log: String::new(),
+                        fwd: true,
+                        parent_pid: None,
+                    }
+                )
             ),
             HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
                 NativeBirthStart::NotAdmittedUnknown { target: None }
@@ -489,7 +515,7 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
             }),
         ] {
             assert!(matches!(
-                h.handle("real-token", request),
+                handle_selected(&h, "real-token", request),
                 HandleOutcome::Respond(Response::Err(_))
             ));
         }
@@ -508,7 +534,7 @@ fn poisoned_live_slot_retains_exact_birth_and_cannot_retire_after_native_exit() 
     ops.set_native_poll(NativeChildPoll::Exited);
     poison_child_state(&h);
     assert_eq!(
-        h.handle("real-token", Request::NativeStatusBirth),
+        handle_selected(&h, "real-token", Request::NativeStatusBirth),
         HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
             NativeBirthStatus::Unknown {
                 target: Some(target)
@@ -541,7 +567,7 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
         .unwrap();
     assert!(h.reap_child_on_exit().is_err());
     assert_eq!(
-        h.handle("real-token", Request::NativeStatusBirth),
+        handle_selected(&h, "real-token", Request::NativeStatusBirth),
         HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
             NativeBirthStatus::Unknown { target: None }
         )))
@@ -598,4 +624,46 @@ fn shutdown_waits_for_start_publication_and_then_fences_replacement() {
     assert!(ops.native_custody_empty());
     assert!(h.child_mu.lock().unwrap().closing);
     assert_eq!(ops.snapshot().start_calls, 1);
+}
+
+#[test]
+fn other_native_user_cannot_start_stop_or_observe_an_owned_slot() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let target = start(&h, false);
+    let other = crate::user_control::NativePeer {
+        identity: polaris_helper_proto::core_protocol::CallerIdentity::windows(
+            "S-1-5-21-1-2-3-1001",
+        )
+        .unwrap(),
+        administrator: false,
+    };
+    let before = ops.snapshot();
+    for request in [
+        Request::NativeStatusBirth,
+        Request::NativeStopBirth { target },
+        pinned_start(
+            &h,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: true,
+                parent_pid: None,
+            },
+        ),
+    ] {
+        let result = h.dispatch(request, Some(&other));
+        assert!(matches!(
+            result,
+            HandleOutcome::AuthFailed | HandleOutcome::Respond(Response::Err(_))
+        ));
+    }
+    assert_eq!(ops.snapshot().start_calls, before.start_calls);
+    assert_eq!(ops.native_stop_calls(), 0);
+    assert_eq!(ops.snapshot().ip_forward_calls, before.ip_forward_calls);
+    assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
+    assert!(matches!(
+        h.dispatch(Request::NativeStopBirth { target }, Some(&other)),
+        HandleOutcome::AuthFailed
+    ));
 }

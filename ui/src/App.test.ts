@@ -315,6 +315,18 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
     ]);
   });
 
+  it.each([
+    ['CORE_BUNDLE_MISMATCH', 'coreBundleMismatch'],
+    ['HELPER_CORE_ABSENT', 'helperCoreAbsent'],
+    ['HELPER_CORE_INVALID', 'helperCoreInvalid'],
+  ])('%s reports a localized content error without native diagnostics', (errorCode, key) => {
+    handleProxyErrorEvent({ errorCode, message: '/private/native/path diagnostic' }, { t, refreshProxyStatus });
+    expect(isProxyErrorCode(errorCode)).toBe(true);
+    expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock.mock.calls).toEqual([[`errors.${key}`]]);
+    expect(notifyDesktopMock.mock.calls).toEqual([[`notify.${key}.title`, `notify.${key}.body`]]);
+  });
+
   it("isProxyErrorCode('HELPER_CORE_MISMATCH') === true", () => {
     expect(isProxyErrorCode('HELPER_CORE_MISMATCH')).toBe(true);
   });
@@ -354,6 +366,7 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       'HELPER_NOT_INSTALLED',
       'ROOT_ORPHAN_BLOCKED',
       'CORE_NOT_EXECUTABLE',
+      'CORE_BUNDLE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID',
       'HELPER_CORE_MISMATCH',
     ])(
       '%s：认领期内仍必须刷连接态（await 腿并不刷，漏刷则 UI 停在假「已连接」）',

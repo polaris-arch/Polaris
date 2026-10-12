@@ -84,6 +84,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_NetworkManagement_IpHelper",
@@ -97,7 +98,7 @@ windows-sys = { version = "0.61", features = [
 polaris-system-integration = { path = "../system-integration" }
 
 [dev-dependencies]
-# tempfile = core_install / token / launchd / core_installer 单测的临时目录。
+# tempfile = content store / token / launchd inert fixture directories.
 tempfile = "3"
 # 源码级门的取材锚点（`polaris_source_probe::crate_source!` 等宏）。dev-only：
 # 不进 lib 依赖图，不进包。零第三方依赖（只用 std）⇒ Cargo.lock 与 THIRD-PARTY 均无新增。

@@ -46,7 +46,7 @@ pub const SERVICE_LABEL: &str = "com.polaris.helper";
 ///
 /// ⚠️ 这是**最容易被漏掉的连带**：只把常量从 9/5/1 改成 1、却留着 `>= 4`，会让每一台机器的 helper
 /// 都判为 `ready=false / needs_repair=true` —— TUN 直接不可用。`min_usable_not_above_current` 锁死。
-pub const MIN_USABLE_PROTO: u32 = 1;
+pub const MIN_USABLE_PROTO: u32 = 2;
 
 /// 三平台安装路径集合（移植自 Polaris 路径常量）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +180,7 @@ pub struct HelperStatus {
     pub version: Option<u32>,
     /// helper 自报构建身份；旧 helper 的 pong 不带该字段。
     pub build_id: Option<String>,
-    /// 是否可升级（ready ∧（proto 落后，或同 proto 的构建身份与随包 helper 不一致））。
+    /// 是否可升级（ready 且协议落后）；构建身份不用于覆盖较新 helper。
     pub upgradeable: bool,
     /// 是否需修复（installed 但 !ready，如 token 丢失 / proto 过旧）。
     pub needs_repair: bool,
@@ -513,7 +513,7 @@ pub const WIN_CORE_DIR_NAME: &str = "core";
 pub const HELPER_TOKEN_FILENAME: &str = "helper.token";
 /// win 受保护核目录里的核文件名。
 ///
-/// 与 helper 侧的 `polaris_helper::core_install::SINGBOX_BIN_NAME_WIN` 和 app 侧的
+/// 与 helper 侧的 `polaris_helper_proto::core_payload::WIN_CORE_FILENAME` 和 app 侧的
 /// `core_paths::core_filename_for("windows")` 是三份同值字面量 —— 本 crate 既看不见 helper
 /// 也看不见 app，故不在 crate 间新开真值源，改由 `src-tauri` 的等值门把三者钉在一起
 /// （`runtime/proxy/platform_contracts` 的 `win_core_binary_names_agree_across_crates`）。
@@ -682,7 +682,7 @@ impl HelperManager {
     ///
     /// 每轮 [`compute_status_with_client`](Self::compute_status_with_client)（内含 ping）。`client` 须用
     /// 生产 [`Connector`](crate::client::Connector)（每 ping 重连）。同 proto 的旧 helper 也会 `ready=true`，
-    /// 但仍 `upgradeable=true`；安装/升级腿若在这里提前停，会把旧进程尚未退出/新服务未接管误报成功。
+    /// 但仍 `upgradeable=true`；兼容协议与 App 内容身份分别由 manager 和 App 验证。
     /// 因此仅 `ready && !upgradeable` 收口；返回最终状态（当前构建或轮询耗尽）。
     #[must_use]
     pub fn wait_until_ready(

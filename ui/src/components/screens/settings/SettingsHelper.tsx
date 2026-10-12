@@ -218,6 +218,14 @@ export default function SettingsHelper() {
         </div>
 
         <div className="hc-body">
+          {status?.selectedCore && (
+            <dl className="card-sub" data-testid="helper-selected-core" style={{ overflowWrap: 'anywhere' }}>
+              <dt>{t('helper.selectedCoreVersion')}</dt><dd>{status.selectedCore.version}</dd>
+              <dt>{t('helper.selectedCoreId')}</dt><dd title={status.selectedCore.id}>{status.selectedCore.id.slice(0, 16)}</dd>
+              <dt>{t('helper.selectedCoreProvider')}</dt><dd title={status.selectedCore.providerFingerprint}>{status.selectedCore.providerFingerprint.slice(0, 16)}</dd>
+              <dt>{t('helper.selectedCoreState')}</dt><dd>{t(`helper.coreState.${status.selectedCore.state}`)}</dd>
+            </dl>
+          )}
           {state === 'checking' && (
             <div className="helper-state" data-s="checking">
               <div className="hc-status">
@@ -256,7 +264,7 @@ export default function SettingsHelper() {
                 <b>{t(state === 'cleanup-pending' ? 'helper.uninstallFail' : 'helper.statusInstalled')}</b>
                 {state === 'installed' && (
                   <Pill variant="ok" style={{ marginLeft: 'auto' }}>
-                    {t('helper.protocolVersion', { version: status?.version ?? 3 })}
+                    {t('helper.protocolVersion', { version: status?.version ?? status?.expectedProtocolVersion ?? '—' })}
                   </Pill>
                 )}
               </div>

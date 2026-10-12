@@ -17,9 +17,10 @@ pub(crate) fn selected_manifest(platform: &str) -> Result<CoreManifest, String> 
             polaris_updater::sha256_hex,
         )
         .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid compiled installation identity")?;
-        if selected.core.platform == platform {
-            return Ok(selected.core);
+        if selected.core.platform != platform {
+            return Err("CORE_BUNDLE_MISMATCH: compiled platform differs".into());
         }
+        return Ok(selected.core);
     }
     let contract: serde_json::Value = serde_json::from_str(RELEASE_CONTRACT)
         .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid compiled identity")?;
@@ -200,7 +201,7 @@ pub(crate) fn stage_installation(
         .chain(std::iter::once((helper_name, None, expected_helper)))
         .chain(cleaner)
     {
-        let (mut input, bytes) = objects
+        let (input, bytes) = objects
             .open_regular(name)
             .map_err(|error| error.to_string())?;
         if bytes == 0
@@ -286,8 +287,11 @@ pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<()
         if bytes != expected.bytes {
             return Err("CORE_BUNDLE_MISMATCH: payload size differs".into());
         }
-        let digest = polaris_updater::verify::sha256_reader_hex(file)
-            .map_err(|_| "CORE_BUNDLE_MISMATCH: payload read failed")?;
+        let digest = polaris_updater::verify::sha256_reader_hex(std::io::Read::take(
+            file,
+            expected.bytes + 1,
+        ))
+        .map_err(|_| "CORE_BUNDLE_MISMATCH: payload read failed")?;
         if digest != expected.sha256 {
             return Err("CORE_BUNDLE_MISMATCH: payload bytes differ".into());
         }

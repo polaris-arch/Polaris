@@ -30,6 +30,17 @@ macro_rules! request_samples {
 }
 
 request_samples! {
+    PrepareHelperUpgrade => Request::PrepareHelperUpgrade,
+    CancelHelperUpgrade => Request::CancelHelperUpgrade,
+    CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
+    LinuxStartPinned => Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams { cfg: "/home/u/config.json".into(), log: String::new(), fwd: false, parent_pid: None },
+    }),
+    NativeStartPinned => Request::NativeStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams { cfg: r"C:\Users\polaris\config\config.json".into(), log: String::new(), fwd: false, parent_pid: None },
+    }),
     Ping => Request::Ping,
     Version => Request::Version,
     Status => Request::Status,
@@ -84,7 +95,7 @@ request_samples! {
     }),
     // src 指向不存在的目录：分派会在读 sing-box.exe 那步失败，一个字节都不写（且 support 是 tempdir）。
     InstallCore => Request::InstallCore(InstallCoreParams {
-        src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\core_promote".to_owned(),
+        src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\retired-upload".to_owned(),
         want_hash: "ab".repeat(32),
     }),
     LinuxDnsSet => Request::LinuxDnsSet(polaris_helper_proto::LinuxDnsSetParams {
@@ -115,9 +126,9 @@ request_samples! {
 
 /// 每次调用一个全新 helper：start 会记账 pid，留着会让后面的 install-core 回 busy。
 fn fresh_helper(
-    support: &std::path::Path,
+    _support: &std::path::Path,
 ) -> WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps> {
-    make_helper_with_support(MockProcOps::new(), &support.to_string_lossy())
+    make_helper_defaults()
 }
 
 fn is_unknown(out: &HandleOutcome) -> bool {

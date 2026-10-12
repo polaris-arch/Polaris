@@ -130,13 +130,12 @@ use selector_reconcile::SelectorReconcileOwner;
 use selector_reconcile::SelectorReconcileOutcome;
 // B9：`startup` 域搬出后 façade 侧仍在消费的六项——`HelperGateDecision` 是
 // `ProxyErrorEmitter::prompt_helper_gate` 的返回类型（trait 定义按 §C 例外② 钉死在 façade），
-// 按 §A.3 由 façade `pub use` 再导出；`KernelGateCacheRecord` / `ProtectedCoreCacheRecord` 是
+// 按 §A.3 由 façade `pub use` 再导出；`KernelGateCacheRecord` 是
 // `ProxyRuntime` 的字段类型、`load_kernel_gate_cache` / `KERNEL_GATE_CACHE_FILE` / `cronet_available`
 // 供仍留在 façade 的 `new` / `core_build_env` 使用（结构体与这 6 个方法按 §A.5 钉死在 façade）。
 pub use startup::HelperGateDecision;
 use startup::{
-    cronet_available, load_kernel_gate_cache, KernelGateCacheRecord, ProtectedCoreCacheRecord,
-    KERNEL_GATE_CACHE_FILE,
+    cronet_available, load_kernel_gate_cache, KernelGateCacheRecord, KERNEL_GATE_CACHE_FILE,
 };
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -421,20 +420,15 @@ pub mod code {
     ///
     /// 非终态（核确在跑，只是版本不对），同走 `set_nonfatal_error`。
     pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
-    /// **提权助手里的内核与本应用不配套，或确认不了配套**：TUN 模式由提权助手以 root / SYSTEM 执行
-    /// 它受保护目录里的内核，那份内核必须就是本应用随包的那一份。两处判定落本码：
-    ///
-    /// - 起核前（`startup::protected_core_verdict`）：受保护核对账没有得到「逐字节一致」的结论
-    ///   —— 助手不接受装核命令，或对账这一次失败。**确认不了即拒绝**，不带着一份来历不明的内核起核。
-    /// - 起核后（内核自证）：助手实际执行的文件自报的版本与随包内核不同 ⇒ 停核。
-    ///
-    /// 终态（核没起，或已被停掉）。用户的下一步是到「设置 › Helper」重装或升级提权助手；非 TUN
-    /// 模式不经提权助手，不受影响。单列一个码而不落进 [`STARTUP_FAILED`]：后者引导用户去查服务器
-    /// 配置，指错了方向。
-    ///
-    /// 与 [`CORE_BINARY_MISMATCH`] 的分工：那一条是核仍在运行时的告警（版本读不出，或对账的是
-    /// 应用直起的核）；本码是拒绝运行。
+    /// The pinned Start/status receipt differs from the selected immutable CoreID.
+    /// Runtime version strings are diagnostic and never establish this verdict.
     pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
+    /// The package payload does not match its compiled content identity.
+    pub const CORE_BUNDLE_MISMATCH: &str = "CORE_BUNDLE_MISMATCH";
+    /// The selected content id has not been installed by an administrator.
+    pub const HELPER_CORE_ABSENT: &str = "HELPER_CORE_ABSENT";
+    /// Installed content failed the protected store's file verification.
+    pub const HELPER_CORE_INVALID: &str = "HELPER_CORE_INVALID";
     /// **随包内核不可执行**：安装包里的内核文件没有可执行权限，应用直起内核前即拒绝。
     ///
     /// 终态（核没起）。单列一个码而不落进 [`STARTUP_FAILED`]：成因是安装包损坏或被改过权限，
@@ -1542,7 +1536,6 @@ pub struct ProxyRuntime {
     /// readiness / FATAL / 出口自证不依赖此字段。
     kernel_gate_cache: Mutex<Option<KernelGateCacheRecord>>,
     /// 受保护核完整 hash 对账的进程内热缓存。任何 payload 元数据变化即 miss；app 重启后首次连接必重验。
-    protected_core_cache: Arc<Mutex<Option<ProtectedCoreCacheRecord>>>,
     /// 单测同步屏障：记录就绪探测已经真实失败并进入 `on_retry` 的次数。
     ///
     /// 不能用固定 sleep 代替：Windows hosted runner 上 PowerShell 占位核启动/任务调度可能超过监听延时，
@@ -1699,7 +1692,7 @@ pub struct ProxyRuntime {
     /// 受保护核对账结论的桩（**仅单测置位**；生产没有这个字段）。经替身 helper 起核的用例没有
     /// 受保护核目录可对账，由测试工厂置成「已确认」；验配套闸本身的用例把它清掉走真对账。
     #[cfg(test)]
-    protected_core_verdict_fixture: Mutex<Option<startup::ProtectedCoreVerdict>>,
+    selected_core_ready_fixture: Mutex<Option<Result<(), String>>>,
     /// 管理 API PUT 的落点桩（**仅单测置位**，同 `core_binary_override` 的先例；生产恒 `None`）。
     ///
     /// 生产的 PUT 出口是 [`ProxyRuntime::management_api`] → 真 gRPC；单测里核不起、`clash_api_port` 为 0
@@ -1845,7 +1838,6 @@ impl ProxyRuntime {
             crash_recovery: Mutex::new(recovery::CrashRecoveryState::default()),
             diagnostics: Mutex::new(DiagnosticCounters::new()),
             kernel_gate_cache: Mutex::new(kernel_gate_cache),
-            protected_core_cache: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             ready_retry_count: Arc::new(AtomicU32::new(0)),
             stale_sweep_disabled: AtomicBool::new(false),
@@ -1878,7 +1870,7 @@ impl ProxyRuntime {
             #[cfg(test)]
             metadata_validation_admission: Mutex::new(None),
             #[cfg(test)]
-            protected_core_verdict_fixture: Mutex::new(None),
+            selected_core_ready_fixture: Mutex::new(None),
             #[cfg(test)]
             management_api_stub: Mutex::new(None),
         }

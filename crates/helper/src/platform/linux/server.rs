@@ -1242,6 +1242,8 @@ impl ConnServer {
             let ss: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &ss_fn;
             let fwd: &(dyn Fn(bool) + Send + Sync) = &fwd_fn;
             let deps = HandlerDeps {
+                #[cfg(test)]
+                test_core: None,
                 core_dir: this.core_dir.as_deref(),
                 auth_file: &this.auth_file,
                 peer_cred: &peer,

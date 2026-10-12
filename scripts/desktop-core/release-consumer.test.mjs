@@ -33,8 +33,8 @@ const providerNames = ['scripts/polaris_production_release.py', 'scripts/polaris
   'scripts/polaris_source_fingerprint.py', 'scripts/polaris_dns_identity.py', 'scripts/polaris_go_environment.py',
   'scripts/polaris_native_distribution.py', 'release/polaris-production-release.json', 'release/polaris-candidate-inputs.json'];
 
-test('actual 577d public contract is pending input with exact four App identities', () => {
-  const bytes = readFileSync(join(repo, 'scripts/desktop-core/pending-release-contract.json'));
+test('actual 577d candidate source uses exact four App identities without acceptance claims', () => {
+  const bytes = readFileSync(join(repo, 'scripts/desktop-core/release-contract.json'));
   assert.equal(bytes.length, 439026);
   assert.equal(digest(bytes), '0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d');
   const actual = validateReleaseContract(JSON.parse(bytes));
@@ -46,8 +46,8 @@ test('actual 577d public contract is pending input with exact four App identitie
   assert.equal(pending.active, false); assert.equal(pending.AppAccepted, false);
   assert.deepEqual(loadReleaseContract(repo, { desktopRelease: pending.selection }), actual);
   const active = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json'))).desktopRelease;
-  assert.equal(active.sourceCommit, '05221db98e08562b5c1a21bc242d245b144ac2d2');
-  const changed = structuredClone(pending.selection); changed.contractSha256 = active.contractSha256;
+  assert.equal(active.sourceCommit, actual.sourceCommit);
+  const changed = structuredClone(pending.selection); changed.contractSha256 = 'a'.repeat(64);
   assert.throws(() => loadReleaseContract(repo, { desktopRelease: changed }), /SHA differs/);
   const changedVersion = structuredClone(actual); changedVersion.version = '1.15.0-alpha.12.polaris.1';
   assert.throws(() => validateReleaseContract(changedVersion));

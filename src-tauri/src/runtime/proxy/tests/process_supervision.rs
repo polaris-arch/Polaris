@@ -1211,7 +1211,7 @@ fn windows_stale_core_io_ends_the_scanned_process_and_liveness_follows() {
 /// 版本字符串不符、版本不可读均是非终态诊断，不得升级为停核判据。
 #[test]
 fn version_attestation_remains_a_nonfatal_runtime_diagnostic() {
-    use crate::runtime::core_promote::CoreBinaryAttestation as Attestation;
+    use crate::runtime::core_attest::CoreBinaryAttestation as Attestation;
     let running = PathBuf::from("/var/lib/polaris/core/sing-box");
     let mismatch = Attestation::VersionMismatch {
         running: running.clone(),

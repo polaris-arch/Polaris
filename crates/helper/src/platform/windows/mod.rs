@@ -21,28 +21,7 @@
 //!   [`crate::token::is_authed_constant_time`]）。
 //! - **不用** [`crate::line_io`]：win 走裸 Win32 `HANDLE` 的**整帧读**（命名管道，一次 `ReadFile` 取整个
 //!   请求帧再切行），不经 `std::io::BufRead` —— 是**真平台差异**，不强行归一。
-//! - **install-core 核心**：[`crate::core_install`]（与 mac/linux 同一份）。Windows 侧的差异只有两处
-//!   —— 主二进制名是 `sing-box.exe`（[`crate::core_install::SINGBOX_BIN_NAME_WIN`]），以及受管核在跑时
-//!   回 `ERR busy`（Windows rename 不动运行中的 exe / 已加载的 DLL）。coreDir 由 `--support` 派生，
-//!   不从命令行取；见 [`helper::WinHelper::handle`] 的 install-core 分支。
-//!
-//! ## 移植纪律
-//!
-//! 1. **Go 源仅 oracle**：逐行对照，Rust 重写（语义对齐，不照搬语法）。
-//! 2. **复用 helper-proto**：[`polaris_helper_proto`] 的 Request/Response/codec 单一真值，本模块不重复定义 wire 形态。
-//! 3. **Windows API**：用 `windows-sys` crate（非手写 syscall），全部 `#[cfg(windows)]` gate —— 该依赖在
-//!    `Cargo.toml` 里是 `[target.'cfg(windows)'.dependencies]`，编非 Windows target 时**不参与解析**。
-//! 4. **`#![deny(unsafe_code)]`**：本模块 deny（非 forbid —— forbid 无法被子模块 allow 覆盖）。
-//!    Windows FFI 的 unsafe 集中在 [`winproc`] / [`service`] 模块，用模块级 `#![allow(unsafe_code)]` 局部放开
-//!    + 文档化每处 unsafe 的理由；FFI 之外全部 safe（跨平台核心逻辑 + 测试 mock 无 unsafe）。
-//! 5. **本机 Linux 可编译/可测**：Windows 特定代码 cfg skip；跨平台逻辑（固定卸载接线、iface 白名单判定、
-//!    token 鉴权、协议分派、wintun 轮询骨架、winproc 逻辑经 trait mock）在 Linux 上有单元测试。
-//!    故本模块声明处的 cfg 谓词带 `test`（见 [`crate::platform`] 门控矩阵）。
-//! 6. **不触碰宿主**：系统操作（进程枚举/kill、TCP 表、IP 转发注册表、SCM 服务、命名管道）经 trait 抽象
-//!    （[`ops`]）+ 生产实现（[`winproc`]），测试用 mock 实现。
-//!
-//! ## 本模块布局（真 win 差异）
-//!
+//! - **管理员内容安装**：[`crate::core_cli`] 与 [`crate::core_store`]；运行时只验选定 CoreID。
 //! - `polaris-windows-cleaner`：固定用途原生卸载，独立 worker，拒绝任意命令/路径。
 //! - [`logic`]：协议层纯逻辑（iface/cfg/port 白名单、filepath basename、TCP 端口字节序解析、sing-box 镜像匹配）。
 //! - [`coreacl`]：受保护核目录的 owner/DACL **判据**（纯逻辑，Linux 单测；搬运腿在 [`winproc`]）。
@@ -65,9 +44,9 @@
 pub mod coreacl;
 pub mod daemon;
 pub mod helper;
+pub mod logic;
 #[cfg(windows)]
 pub mod native_caller;
-pub mod logic;
 /// 本机网络接口只读枚举（**免提权**，app 进程直调；住在本 crate 纯为复用已有的 `windows-sys` FFI —— 理由见模块文档）。
 pub mod netinfo;
 pub mod ops;

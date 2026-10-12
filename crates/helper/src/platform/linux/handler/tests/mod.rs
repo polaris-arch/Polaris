@@ -77,6 +77,15 @@ impl MockSpawner {
 }
 
 impl CoreSpawner for MockSpawner {
+    fn spawn_pinned(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        let mut spawned = self.spawn(req)?;
+        spawned.handle = spawned.handle.with_core(core, req.uid);
+        Ok(spawned)
+    }
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.start_admission.lock().unwrap().unwrap_or_else(|| {
             current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {
@@ -263,6 +272,7 @@ fn make_deps_with_resolved<'a, PE: PeerCredProvider>(
     resolved_dns: &'a dyn ResolvedDnsOps,
 ) -> HandlerDeps<'a, PE, MockSpawner, MockFreePort, MockSystemd> {
     HandlerDeps {
+        test_core: core_dir.map(native_fixture),
         core_dir,
         auth_file,
         peer_cred: peer,
@@ -289,7 +299,65 @@ fn setup_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let core_dir = dir.path().join("core");
     std::fs::create_dir_all(&core_dir).unwrap();
     std::fs::write(core_dir.join("sing-box"), b"#!bin\nfake sing-box").unwrap();
+    std::fs::write(core_dir.join("libcronet.so"), b"inert-sidecar").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&core_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     (dir, auth, core_dir)
+}
+
+fn native_fixture(directory: &Path) -> Arc<crate::core_store::VerifiedCore> {
+    use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest, InstalledCoreManifest};
+    let files = ["sing-box", "libcronet.so"]
+        .into_iter()
+        .map(|name| {
+            let raw = std::fs::read(directory.join(name)).unwrap();
+            CoreFile {
+                name: name.into(),
+                bytes: raw.len() as u64,
+                sha256: crate::core_hash::sha256_hex(&raw),
+            }
+        })
+        .collect();
+    let core = CoreManifest {
+        platform: "linux".into(),
+        version: "1.15.0-alpha.12".into(),
+        provider_fingerprint: "a".repeat(64),
+        files,
+        helper_sha256: None,
+        cleaner_sha256: None,
+    };
+    let manifest = InstalledCoreManifest {
+        schema: "polaris-core-manifest-v1".into(),
+        id: core
+            .id(crate::core_hash::sha256_hex)
+            .unwrap()
+            .as_str()
+            .into(),
+        app_version: "1.0.0".into(),
+        core,
+    };
+    Arc::new(
+        crate::core_store::VerifiedCore::fixture(
+            directory,
+            &directory.join("fixture.lease"),
+            manifest,
+        )
+        .unwrap(),
+    )
+}
+fn selected_start(response: &str, expected: &str) -> LinuxBirthStart {
+    let Response::Ok(ResponseKind::PinnedStart {
+        id,
+        start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start),
+    }) = Response::parse(response)
+    else {
+        panic!("missing selected core receipt: {response}")
+    };
+    assert_eq!(id.as_str(), expected);
+    start
 }
 
 fn no_op_fwd() -> impl Fn(bool) {
@@ -335,13 +403,17 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
         &fwd,
     );
     let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
+    let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg = cfg.to_string_lossy().into_owned();
     let mut start = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
-    let Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, .. })) =
-        Response::parse(&start.writes()[0])
-    else {
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
+    let LinuxBirthStart::Started { target, .. } = selected_start(&start.writes()[0], &sb) else {
         panic!("exact start did not return target")
     };
     assert_eq!(target.pid.get(), 7777);
@@ -359,14 +431,12 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
         &mut state,
         &deps,
         &cred,
-        lcmd::START_BIRTH_SAFE,
+        lcmd::START_PINNED_BIRTH,
         &mut already,
     );
     assert_eq!(
-        Response::parse(&already.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
-            target
-        }))
+        selected_start(&already.writes()[0], &sb),
+        LinuxBirthStart::Already { target }
     );
     assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
 
@@ -541,7 +611,7 @@ fn reaped_exact_birth_ack_survives_a_legacy_successor() {
 
 #[test]
 fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
-    let (_dir, auth, _core_dir) = setup_env();
+    let (_dir, auth, core_dir) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let cred = PeerCred { uid: 0, gid: 0 };
     let spawner = MockSpawner::succeeding(100);
@@ -550,20 +620,35 @@ fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
     let ss = no_op_ss();
     let forwards = StdMutex::new(Vec::new());
     let fwd = |value| forwards.lock().unwrap().push(value);
-    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
-    let old = exact_handle(42, BIRTH_ONE);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let old =
+        exact_handle(42, BIRTH_ONE).with_core(Arc::clone(deps.test_core.as_ref().unwrap()), 0);
     let target = old.target().unwrap();
     let mut state = HandlerState {
         child: Some(ManagedChild::Stopping(old)),
         ..HandlerState::new()
     };
-    let mut conn = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut conn);
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
     assert_eq!(
-        Response::parse(&conn.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(
-            LinuxBirthStart::NotAdmittedPending { target }
-        ))
+        selected_start(&conn.writes()[0], &id),
+        LinuxBirthStart::NotAdmittedPending { target }
     );
     assert!(matches!(state.child, Some(ManagedChild::Stopping(_))));
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
@@ -597,13 +682,18 @@ fn hidden_legacy_custody_never_reports_exact_empty_or_spawns() {
     );
     // 带尾文，与「不认识这条命令」的裸 `ERR unknown` 区分开（客户端据裸形判 helper 过旧）。
     assert_eq!(status.writes(), ["ERR unknown birth-custody-unidentified"]);
-    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    let id = "a".repeat(64);
+    let mut start = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
     assert_eq!(
-        Response::parse(&start.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(
-            LinuxBirthStart::NotAdmittedUnknown { target: None }
-        ))
+        selected_start(&start.writes()[0], &id),
+        LinuxBirthStart::NotAdmittedUnknown { target: None }
     );
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
     assert!(forwards.lock().unwrap().is_empty());
@@ -631,8 +721,21 @@ fn exact_commands_reject_extra_lines_before_custody_changes() {
         &mut status,
     );
     assert_eq!(status.writes(), ["ERR bad-args"]);
-    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", "", "extra"]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    let mut start = MockConn::new(vec![
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "/cfg.json",
+        "",
+        "0",
+        "",
+        "extra",
+    ]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
     assert_eq!(start.writes(), ["ERR bad-args"]);
     assert!(state.child.is_none());
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
@@ -1148,28 +1251,9 @@ fn freeport_kills_own_singbox() {
     assert_eq!(*fp.killed.lock().unwrap(), vec![1234]);
 }
 
-// ===== install-core =====
-
 #[test]
-fn install_core_coredir_unset() {
-    let (_dir, auth, _core) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
-    let state = Mutex::new(HandlerState::new());
-    let hash = "a".repeat(64);
-    let mut conn = MockConn::new(vec!["install-core", "/tmp/src", &hash]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR coredir-unset"]);
-}
-
-#[test]
-fn install_core_bad_args_for_short_hash() {
-    let (_dir, auth, core_dir) = setup_env();
+fn retired_start_and_upload_frames_never_read_sources_or_change_custody() {
+    let (_dir, auth, core) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let spawner = MockSpawner::succeeding(100);
     let fp = MockFreePort::empty();
@@ -1177,7 +1261,7 @@ fn install_core_bad_args_for_short_hash() {
     let ss = no_op_ss();
     let fwd = no_op_fwd();
     let deps = make_deps(
-        Some(&core_dir),
+        Some(&core),
         &auth,
         &peer,
         &spawner,
@@ -1186,418 +1270,24 @@ fn install_core_bad_args_for_short_hash() {
         &ss,
         &fwd,
     );
-    let state = Mutex::new(HandlerState::new());
-    let mut conn = MockConn::new(vec!["install-core", "/tmp/src", "abc"]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR bad-args"]);
-}
-
-/// install-core 用的是**这条连接上已鉴权的对端 uid**：源目录属谁，谁才装得进去。
-///
-/// 三个对端各发同一帧：文件属主本人 → 装入；另一个 uid → 拒；root → 也拒（root 对端在鉴权门上
-/// 恒放行，但这里比的是「源文件是不是对端自己的」，不因为对端是 root 就替它读别人的目录）。
-#[test]
-fn install_core_requires_the_sources_to_belong_to_the_authenticated_peer() {
-    use std::os::unix::fs::PermissionsExt;
-    let (dir, auth, core_dir) = setup_env();
-    let self_uid = nix::unistd::getuid().as_raw();
-    let src = dir.path().join("src");
-    std::fs::create_dir(&src).unwrap();
-    std::fs::write(src.join("sing-box"), b"new core").unwrap();
-    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(src.join("sing-box"), std::fs::Permissions::from_mode(0o644)).unwrap();
-    let hash = crate::core_install::sha256_hex(b"new core");
-    let src_s = src.to_string_lossy().into_owned();
-
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    // 直调 `dispatch_locked`：非 root 对端过不了本文件造的 authfile（理由见 `setup_env`）。
-    let run = |uid: u32| {
-        let mut state = HandlerState::new();
-        let mut conn = MockConn::new(vec![&src_s, &hash]);
-        let cred = PeerCred { uid, gid: uid };
-        dispatch_locked(&mut state, &deps, &cred, lcmd::INSTALL_CORE, &mut conn);
-        conn.writes()
-    };
-
-    for other in [self_uid + 1, 0] {
-        if other == self_uid {
-            continue; // 以 root 跑测试时 0 就是自己。
-        }
+    for command in [
+        cmd::START,
+        lcmd::START_REAP_SAFE,
+        lcmd::START_BIRTH_SAFE,
+        lcmd::INSTALL_CORE,
+    ] {
+        let state = Mutex::new(HandlerState::new());
+        let mut conn = MockConn::new(vec![command, "/tmp/untrusted", "not-a-hash"]);
+        handle(&state, &deps, &mut conn);
+        assert_eq!(conn.writes(), ["ERR unknown"]);
+        assert!(state.lock().unwrap().child.is_none());
         assert_eq!(
-            run(other),
-            vec!["ERR readdir not owned by the caller"],
-            "对端 uid={other}"
-        );
-        assert_eq!(
-            std::fs::read(core_dir.join("sing-box")).unwrap(),
-            b"#!bin\nfake sing-box",
-            "被拒的请求动了受管核"
+            std::fs::read(core.join("sing-box")).unwrap(),
+            b"#!bin\nfake sing-box"
         );
     }
-
-    assert_eq!(run(self_uid), vec!["OK installed"]);
-    assert_eq!(
-        std::fs::read(core_dir.join("sing-box")).unwrap(),
-        b"new core"
-    );
-}
-
-// ===== start =====
-
-#[test]
-fn start_bad_args_when_cfg_empty() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    // singbox / cfg="" / log / fwd / ppid
-    let mut conn = MockConn::new(vec!["start", &sb, "", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR bad-args"]);
-}
-
-#[test]
-fn start_core_path_denied_when_singbox_mismatch() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    // singbox 传一个错误路径（!= coreDir/sing-box）。
-    let mut conn = MockConn::new(vec![
-        "start",
-        "/tmp/evil/sing-box",
-        "/tmp/cfg.json",
-        "",
-        "0",
-        "",
-    ]);
-    handle(&state, &deps, &mut conn);
-    let w = &conn.writes()[0];
-    assert!(w.starts_with("ERR core-path-denied"), "got {w}");
-}
-
-#[test]
-fn start_core_missing_when_binary_absent() {
-    // coreDir 存在但 sing-box 不存在 → core-missing。
-    let dir = tempdir().unwrap();
-    let auth = dir.path().join("auth");
-    std::fs::write(&auth, "1000\n").unwrap();
-    let core_dir = dir.path().join("core");
-    std::fs::create_dir_all(&core_dir).unwrap();
-    // 不建 sing-box 二进制。
-
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR core-missing"]);
-}
-
-#[test]
-fn start_config_not_owned_rejected() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    // cfg 路径不存在 → owned_by 返回 err → config-not-owned。
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/nonexistent/cfg.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    let w = &conn.writes()[0];
-    assert!(w.starts_with("ERR config-not-owned"), "got {w}");
-}
-
-#[test]
-fn start_spawns_and_reports_pid() {
-    let (dir, auth, core_dir) = setup_env();
-    // 造一个属主 = 本进程 uid 的 cfg。
-    let cfg = dir.path().join("cfg.json");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    let writes = conn.writes();
-    assert_eq!(writes.len(), 1);
-    assert!(matches!(
-        Response::parse(&writes[0]),
-        Response::Ok(ResponseKind::Start(Start::StartedTimed { pid: 7777, .. }))
-    ));
-    let calls = spawner.spawn_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].binary, core_dir.join("sing-box"));
-}
-
-/// log 必须与 cfg 同父目录 —— 不校验就是「root 在任意位置建文件、再 fchown 给调用者」。
-#[test]
-fn start_log_path_denied_when_outside_cfg_dir() {
-    let (dir, auth, core_dir) = setup_env();
-    let cfg = dir.path().join("cfg.json");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    // cfg 合法（属主对、目录对），只有 log 越界。
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, "/etc/cron.d/pwn", "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR log-path-denied"]);
-    // 越界就不该 spawn —— 只看错误行不够，恒拒的实现也会让上一条通过。
-    assert!(
-        spawner.spawn_calls.lock().unwrap().is_empty(),
-        "被拒了却仍然起了核"
-    );
-}
-
-/// 生产形态（log 与 cfg 同目录）必须放行，且 log 被原样下发给 spawner。
-#[test]
-fn start_ok_when_log_beside_cfg() {
-    let (dir, auth, core_dir) = setup_env();
-    let cfg = dir.path().join("singbox-runtime.json");
-    let log = dir.path().join("singbox-startup.log");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let log_s = log.to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, &log_s, "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    let writes = conn.writes();
-    assert_eq!(writes.len(), 1);
-    assert!(
-        matches!(
-            Response::parse(&writes[0]),
-            Response::Ok(ResponseKind::Start(Start::StartedTimed { pid: 7777, .. }))
-        ),
-        "生产形态被误拒: {writes:?}"
-    );
-    let calls = spawner.spawn_calls.lock().unwrap();
-    assert_eq!(calls[0].log.as_deref(), Some(log.as_path()));
-}
-
-#[test]
-fn start_already_when_child_present() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    state.child = Some(ManagedChild::Running(CoreHandle::new(8888)));
-    let state = Mutex::new(state);
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["OK already 8888"]);
-    // 已有 child → 不再 spawn。
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    *spawner.start_admission.lock().unwrap() = Some(StartAdmission::Blocked {
-        pid: 7007,
-        state: ReapBlockerState::Unknown,
-    });
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
-    let fwd = {
-        let calls = Arc::clone(&fwd_called);
-        move |on| calls.lock().unwrap().push(on)
-    };
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState {
-        child: Some(ManagedChild::Running(CoreHandle::new(8888))),
-        ..HandlerState::new()
-    });
-    // Deliberately invalid arguments: admission must run before validation too.
-    let mut conn = MockConn::new(vec![lcmd::START_REAP_SAFE, "/wrong", "", "", "1", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), ["OK start-not-admitted unknown 7007"]);
-    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-    assert!(fwd_called.lock().unwrap().is_empty());
-    assert_eq!(
-        state
-            .lock()
-            .unwrap()
-            .child
-            .as_ref()
-            .map(|child| child.handle().pid),
-        Some(8888)
-    );
+    assert!(spawner.kill_calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1677,7 +1367,7 @@ fn start_failure_reports_err_start_and_resets_forward() {
     let cfg = dir.path().join("cfg.json");
     std::fs::write(&cfg, b"{}").unwrap();
     let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
+    let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg_s = cfg.to_string_lossy().into_owned();
     let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
     // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
@@ -1687,7 +1377,13 @@ fn start_failure_reports_err_start_and_resets_forward() {
         uid: self_uid,
         gid: self_uid,
     };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
     let w = &conn.writes()[0];
     assert!(w.starts_with("ERR start"), "got {w}");
     // fwd=1 先设，spawn 失败后复位为 false。
@@ -1818,4 +1514,79 @@ fn wire_forms_match_go_source() {
     assert_eq!("ERR config-not-owned", "ERR config-not-owned");
     assert_eq!("ERR coredir-unset", "ERR coredir-unset");
     assert_eq!("ERR start boom", "ERR start boom");
+}
+
+#[test]
+fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
+    let (dir, auth, core_dir) = setup_env();
+    let cfg = dir.path().join("cfg.json");
+    std::fs::write(&cfg, b"{}").unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let cred = PeerCred { uid, gid: uid };
+    let peer = StaticPeerCred::new(uid, uid);
+    let spawner = MockSpawner::succeeding(7777);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let cfg = cfg.to_string_lossy().into_owned();
+    let mut state = HandlerState::new();
+    let other_id = "b".repeat(64);
+    let mut bad = MockConn::new(vec![&other_id, &cfg, "", "1"]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_PINNED_BIRTH, &mut bad);
+    assert_eq!(bad.writes(), ["ERR core-invalid"]);
+    std::fs::write(core_dir.join("libcronet.so"), b"changed-sidecar").unwrap();
+    let mut corrupt = MockConn::new(vec![&id, &cfg, "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut corrupt,
+    );
+    assert_eq!(corrupt.writes(), ["ERR core-invalid"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+    std::fs::write(core_dir.join("libcronet.so"), b"inert-sidecar").unwrap();
+    let mut good = MockConn::new(vec![&id, &cfg, "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut good,
+    );
+    assert!(matches!(
+        selected_start(&good.writes()[0], &id),
+        LinuxBirthStart::Started { .. }
+    ));
+    assert_eq!(state.child.as_ref().unwrap().handle().owner_uid, Some(uid));
+    let other_uid = if uid == 1001 { 1002 } else { 1001 };
+    let other = PeerCred {
+        uid: other_uid,
+        gid: other_uid,
+    };
+    for command in [lcmd::START_PINNED_BIRTH, lcmd::STATUS_BIRTH_SAFE] {
+        let mut denied = MockConn::new(if command == lcmd::START_PINNED_BIRTH {
+            vec![&id, &cfg, "", "1"]
+        } else {
+            vec![]
+        });
+        dispatch_locked(&mut state, &deps, &other, command, &mut denied);
+        assert_eq!(denied.writes(), ["ERR slot-owned-by-other-user"]);
+    }
+    assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
+    assert_eq!(*forwards.lock().unwrap(), [true]);
 }

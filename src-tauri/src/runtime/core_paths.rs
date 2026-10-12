@@ -71,11 +71,7 @@ pub fn core_sidecar_path_for(core: &Path, os: &str) -> Option<PathBuf> {
 /// - `core-staged/`：旧的内核自动更新暂存与解压工作目录。
 /// - `core-promote/`：向提权助手递送内核时的暂存目录；每次递送后即清，这里收的是递送中途进程
 ///   被杀留下的那一份。
-pub const LEGACY_CORE_STATE_NAMES: [&str; 3] = [
-    "core_update",
-    "core-staged",
-    crate::runtime::core_promote::CORE_PROMOTE_DIR_NAME,
-];
+pub const LEGACY_CORE_STATE_NAMES: [&str; 3] = ["core_update", "core-staged", "core-promote"];
 
 /// 清理 [`LEGACY_CORE_STATE_NAMES`]，返回实际删掉的路径。
 ///
@@ -86,6 +82,13 @@ pub const LEGACY_CORE_STATE_NAMES: [&str; 3] = [
 ///
 /// 失败只记日志：残留目录已经不被任何代码读取，删不掉不影响起核，下次启动再试。
 pub fn remove_legacy_core_state(config_root: &Path) -> Vec<PathBuf> {
+    remove_legacy_core_state_with(config_root, polaris_helper::legacy_use::directory_use)
+}
+
+fn remove_legacy_core_state_with(
+    config_root: &Path,
+    observe: impl Fn(&Path) -> polaris_helper::legacy_use::LegacyUse,
+) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     for name in LEGACY_CORE_STATE_NAMES {
         let Some(path) = direct_child(config_root, name) else {
@@ -101,6 +104,10 @@ pub fn remove_legacy_core_state(config_root: &Path) -> Vec<PathBuf> {
             }
         };
         let file_type = metadata.file_type();
+        if observe(&path) != polaris_helper::legacy_use::LegacyUse::Idle {
+            log::info!("旧内核残留仍在使用或无法完整观察，保留 {}", path.display());
+            continue;
+        }
         let result = if file_type.is_dir() && !file_type.is_symlink() {
             std::fs::remove_dir_all(&path)
         } else {

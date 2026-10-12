@@ -1587,39 +1587,6 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     assert!(rt.child.lock().unwrap().has_helper_start());
 }
 
-/// 对账结果 → 配套结论：只有拿到内容哈希证据的三种结果算确认，其余一律确认不了。
-///
-/// **变异探针**：把 `InstallCoreUnsupported` 归进确认 ⇒ 第四、五条转红；把 `Err` 归进确认 ⇒
-/// 末条转红。
-#[test]
-fn protected_core_is_confirmed_only_by_a_content_hash_result() {
-    use ProtectedCoreReconcileOutcome as Outcome;
-    for confirmed in [
-        Outcome::Verified,
-        Outcome::Cached,
-        Outcome::Promoted("ab".repeat(32)),
-    ] {
-        assert_eq!(
-            protected_core_verdict(Ok(&confirmed)),
-            ProtectedCoreVerdict::Confirmed,
-            "{confirmed:?}"
-        );
-    }
-    for from_cache in [false, true] {
-        assert!(
-            matches!(
-                protected_core_verdict(Ok(&Outcome::InstallCoreUnsupported { from_cache })),
-                ProtectedCoreVerdict::Unconfirmed(_)
-            ),
-            "助手不认装核命令 ⇒ 它手里的内核换不成随包的（from_cache={from_cache}）"
-        );
-    }
-    assert_eq!(
-        protected_core_verdict(Err("helper 装核失败：ERR hash-mismatch")),
-        ProtectedCoreVerdict::Unconfirmed("helper 装核失败：ERR hash-mismatch".to_owned())
-    );
-}
-
 /// 🔴 **配套闸**：确认不了提权助手将要执行的是随包内核 ⇒ 拒绝起核，落专用码，**一帧起核请求
 /// 都不发**。
 ///
@@ -1634,7 +1601,7 @@ fn protected_core_is_confirmed_only_by_a_content_hash_result() {
 #[tokio::test]
 async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
     let (rt, dir) = test_runtime_on(Platform::Linux);
-    *rt.protected_core_verdict_fixture.lock().unwrap() = None;
+    *rt.selected_core_ready_fixture.lock().unwrap() = None;
     let cfg_path = dir.join("singbox-runtime.json");
     std::fs::write(&cfg_path, "{}").unwrap();
     let binary = dir.join("bundle-that-is-not-there").join("sing-box");
@@ -1667,7 +1634,7 @@ async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
 
     // 正面对照：同一条腿、同一个替身，结论换成「已确认」⇒ 走到起核通信（替身恒失败）。
     // 没有这一半，上面的红绿可能只是因为这条腿本来就走不通。
-    *rt.protected_core_verdict_fixture.lock().unwrap() = Some(ProtectedCoreVerdict::Confirmed);
+    *rt.selected_core_ready_fixture.lock().unwrap() = Some(Ok(()));
     let error = rt
         .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await
@@ -3355,107 +3322,6 @@ fn background_attestation_only_commits_to_the_same_running_generation_and_pid() 
 
     let stopped = ProxyStatus::default();
     assert!(!attestation_commit_allowed(7, 7, &stopped, 4245));
-}
-
-/// **P4 能力缓存**：「这个 helper 不支持 install-core」的记号必须能失效，且「探不到」不算命中。
-///
-/// 它治的是纯性能坑（旧 Windows helper 回 `ERR unknown` 那条腿此前一个缓存都不记，于是每次起核
-/// 都白跑两个 80MB 的 sha256 + 一次暂存）。但缓存**只要永不失效就变成缺陷**：helper 升级后能力
-/// 会变，而缓存还在替旧 helper 回答。失效键取 helper 自报的 `build_identity` —— 它与
-/// `HelperManager` 判 `upgradeable` 用的是同一个字段，「helper 换了一版而 build_id 没变」与
-/// 「app 判不出可升级」是同一个前提，不会只坏一边。
-#[test]
-fn install_core_capability_cache_keys_on_helper_build_and_never_hits_on_a_failed_probe() {
-    use crate::runtime::helper::{HelperBuildProbe, InstallCoreUnsupportedRecord};
-
-    let recorded = InstallCoreUnsupportedRecord {
-        helper_build_id: Some("build-A".to_owned()),
-    };
-
-    // 同一个 helper 构建 → 命中（这是它存在的理由：省掉重复的 80MB 空转）。
-    assert!(install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-    // helper 升级（build_id 必变）→ 失效，重新真试一次 install-core。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Reported(Some("build-B".to_owned()))
-    ));
-    // 探不到 ≠ 还是那个 helper：宁可白跑一轮完整对账，也不能让缓存永不失效。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Unreachable
-    ));
-    // 没记过就不许命中（否则首次起核直接跳过对账 = 加固整条不生效）。
-    assert!(!install_core_unsupported_cache_hit(
-        None,
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-
-    // 旧 helper 如实不带 build_identity：`Reported(None)` 本身是个稳定身份，可命中；
-    // 但它与 `Unreachable` 必须分得开 —— 折在一起就等于「探测失败也算命中」。
-    let legacy = InstallCoreUnsupportedRecord {
-        helper_build_id: None,
-    };
-    assert!(install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Reported(None)
-    ));
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Unreachable
-    ));
-    // 旧 helper（无 build_id）升级成本批的新 helper（必带 build_id）→ None ⇒ Some 也要失效。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-}
-
-#[test]
-fn protected_core_cache_requires_both_unchanged_payloads() {
-    let dir = fresh_test_dir();
-    let active_dir = dir.join("active");
-    let protected_dir = dir.join("protected");
-    std::fs::create_dir_all(&active_dir).unwrap();
-    std::fs::create_dir_all(&protected_dir).unwrap();
-    std::fs::write(active_dir.join("sing-box"), b"CORE").unwrap();
-    std::fs::write(protected_dir.join("sing-box"), b"CORE").unwrap();
-
-    let active = crate::runtime::core_promote::payload_stamp(
-        &active_dir,
-        polaris_helper_proto::Platform::Linux,
-    )
-    .unwrap();
-    let protected = crate::runtime::core_promote::payload_stamp(
-        &protected_dir,
-        polaris_helper_proto::Platform::Linux,
-    )
-    .unwrap();
-    let cached = ProtectedCoreCacheRecord {
-        active: active.clone(),
-        protected: protected.clone(),
-    };
-    assert!(protected_core_cache_hit(
-        Some(&cached),
-        &active,
-        Some(&protected)
-    ));
-    assert!(!protected_core_cache_hit(Some(&cached), &active, None));
-
-    std::fs::write(active_dir.join("libcronet.so"), b"CRONET").unwrap();
-    let changed_active = crate::runtime::core_promote::payload_stamp(
-        &active_dir,
-        polaris_helper_proto::Platform::Linux,
-    )
-    .unwrap();
-    assert!(!protected_core_cache_hit(
-        Some(&cached),
-        &changed_active,
-        Some(&protected)
-    ));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(unix)]

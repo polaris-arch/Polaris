@@ -30,14 +30,13 @@ use polaris_helper_client::PipeConnector;
 use polaris_helper_client::UnixConnector;
 use polaris_helper_client::{
     read_token, EscalationOutcome, HelperClient, HelperManager, HelperStatus, InstallParams,
-    InstallPaths, StdExecutor, StdSysOps, SysOps, INSTALL_CORE_TIMEOUT_MS, READY_POLL_ATTEMPTS,
-    READY_POLL_DELAY,
+    InstallPaths, StdExecutor, StdSysOps, SysOps, READY_POLL_ATTEMPTS, READY_POLL_DELAY,
 };
 use polaris_helper_proto::{
-    FlushDns, HelperBirthTarget, InstallCoreParams, LinuxBirthStart, LinuxBirthStatus,
-    LinuxBirthStop, LinuxDns, LinuxDnsSetParams, LinuxStartParams, NativeBirthStart,
-    NativeBirthStatus, NativeBirthStop, Platform, Request, Response, ResponseKind, RouteParams,
-    Start, StartNotAdmitted, StartParams, Status as CoreStatus, Stop,
+    FlushDns, HelperBirthTarget, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
+    LinuxDnsSetParams, LinuxStartParams, NativeBirthStart, NativeBirthStatus, NativeBirthStop,
+    Platform, Request, Response, ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams,
+    Status as CoreStatus, Stop,
 };
 use polaris_system_integration::dns_flush::HelperFlushResult;
 use polaris_system_integration::linux_resolved::LinuxResolvedOps;
@@ -114,20 +113,22 @@ const HELPER_LINUX_RESOLVED_TIMEOUT: Duration = Duration::from_secs(45);
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelperStatusSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_core: Option<SelectedCoreSnapshot>,
     /// 当前平台是否支持提权 helper（mac/win/linux 三平台均有实现）。
     pub supported: bool,
     /// helper 二进制 + 描述符（plist/unit/SCM）是否在位。
     pub installed: bool,
     /// socket ping 成功且 proto ≥ 最低可用（可零提权驱动 TUN）。
     pub ready: bool,
-    /// 可用但不是当前随包构建（proto 偏旧，或同 proto 的 build identity 不同/缺失）→ 温和提示可升级。
+    /// 协议需升级，或当前选定 CoreID 尚未安装。构建身份差异只供诊断。
     pub upgradeable: bool,
     /// 协议版本（ping/version 返回），未就绪为缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
     /// 当前 app 期望的 shared protocol 版本；前端不得再硬编码版本数字。
     pub expected_protocol_version: u32,
-    /// 已安装 helper 自报的构建身份；旧 helper 缺省（这本身就是可升级证据）。
+    /// 已安装 helper 自报的构建身份；缺省或差异只供诊断。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub helper_build_id: Option<String>,
     /// 当前 app 随包 helper 的期望构建身份，供诊断与 app/helper 同包对账。
@@ -146,60 +147,13 @@ pub struct HelperStatusSnapshot {
     pub installed_singbox_path: Option<String>,
 }
 
-/// [`HelperRuntime::install_core`] 的失败分类。
-///
-/// 两态必须分开：`Unsupported` 是**能力缺失**（这个 helper 构建就没有 install-core 这条命令，
-/// 升级前重试多少次都一样），`Failed` 是**这一次**没成（IPC 挂、hash 不符、磁盘满，下次可能就好）。
-/// 折成一个 `String` 的后果是调用方只能靠 `contains("unknown")` 猜——那是按文案分流，helper 换
-/// 一句措辞就静默失效。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstallCoreError {
-    /// helper 回不带尾文的 `ERR unknown`：不认识 install-core（旧 Windows helper 的常态，见 spec
-    /// §3.5 兼容矩阵）。判据见 [`is_unknown_command_reply`]。
-    Unsupported,
-    /// 其它失败，串是给日志看的诊断。
-    Failed(String),
-}
-
-impl std::fmt::Display for InstallCoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported => f.write_str("helper 不支持 install-core（ERR unknown）"),
-            Self::Failed(e) => f.write_str(e),
-        }
-    }
-}
-
-/// 一次 helper 构建身份探测的结果（[`HelperRuntime::helper_build_probe`]）。
-///
-/// `Reported(None)` 与 `Unreachable` **必须分开**：前者是旧 helper 如实不带 `build_identity`
-/// 字段——那本身是个稳定身份，可以当缓存键；后者是「这次没问到」，把它当身份会让缓存在 helper
-/// 换代之后继续命中（= 缓存永不失效）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HelperBuildProbe {
-    /// helper 应答了握手；`None` = 该构建不带 `build_identity`（旧 helper）。
-    Reported(Option<String>),
-    /// 没问到（未装 / 管道不通 / 超时）。**不是**一个身份。
-    Unreachable,
-}
-
-/// 「**这个** helper 构建不支持 `install-core`」的进程内记号（仅本 app 会话，不落盘）。
-///
-/// 治的是纯性能坑：旧 Windows helper 对 `install-core` 回 `ERR unknown`，而受保护核对账的缓存
-/// 只在 `UpToDate` 分支写 ⇒ 那条腿一个缓存都不记，于是**每次起核**都完整跑两个 80MB 的 sha256 +
-/// 复制一次暂存目录，最后换回同一句 warn。
-///
-/// **只是性能，不改安全语义**：命中时的行为与跑完一整轮失败完全一致——warn 一句、继续起核
-/// （spec §3.5 兼容矩阵：加固未生效时降级回本批前的现状，不 brick、不误报）。
-///
-/// 记号住在 [`HelperRuntime`] 而不是 `ProxyRuntime`：它描述的是 **helper 的能力**，而让它失效的
-/// 最精确事件（app 自己刚重装/升级了 helper）也发生在这里 —— 放在 proxy 侧就得为「装完通知一声」
-/// 另拉一条跨对象回调，而 `install()` 有三个调用点（命令层 + proxy 的两条就地授权腿），
-/// 逐点接线必然漏。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallCoreUnsupportedRecord {
-    /// 回 `ERR unknown` 的那个 helper 自报的构建身份（`None` = 该构建不带该字段）。
-    pub helper_build_id: Option<String>,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectedCoreSnapshot {
+    pub id: String,
+    pub version: String,
+    pub provider_fingerprint: String,
+    pub state: String,
 }
 
 /// Helper 动作的稳定失败码。前端按码本地化，`diagnostic` 不得直接展示。
@@ -259,10 +213,8 @@ impl HelperActionResult {
     }
 }
 
-/// 安装/升级成功不只意味着协议可用，还必须是当前随包 helper build。
-///
-/// 同 proto 的旧 helper 有意保持 `ready=true`（避免升级提示把可用助手误报损坏），因此安装动作若只看
-/// ready，会在 UAC 脚本未执行或旧服务仍占管道时谎报成功。动作完成态必须额外要求不再 upgradeable。
+/// Completion requires a compatible helper and a verified selected CoreID.
+/// A newer compatible helper may be retained; BuildID is diagnostic only.
 fn helper_install_reached_expected_build(status: &HelperStatusSnapshot) -> bool {
     status.ready && !status.upgradeable
 }
@@ -270,6 +222,7 @@ fn helper_install_reached_expected_build(status: &HelperStatusSnapshot) -> bool 
 /// 从 client 侧 [`HelperStatus`] 投影到前端快照（补 supported + macOS 真机门惰值）。
 fn snapshot_from(status: &HelperStatus, supported: bool) -> HelperStatusSnapshot {
     HelperStatusSnapshot {
+        selected_core: None,
         supported,
         installed: status.installed,
         ready: status.ready,
@@ -552,9 +505,6 @@ pub struct HelperRuntime {
     /// **D2/D3(4) 的「start 拿初值」**：最近一次 `start` 响应回传的受管核身份 `(pid, created)`。
     /// 旧 helper / 非 Windows 不回传 ⇒ `None`。读写见 [`Self::managed_start_identity`]。
     start_identity: Mutex<Option<(u32, u64)>>,
-    /// 「这个 helper 构建不支持 install-core」的进程内记号，见 [`InstallCoreUnsupportedRecord`]。
-    /// 失效键 = helper 自报的 `build_identity`；另由 [`Self::install`] 的成功分支主动清除。
-    install_core_unsupported: Mutex<Option<InstallCoreUnsupportedRecord>>,
     /// All runtimes sharing this helper retain their own direct Child fence.
     core_mutation_fences: Mutex<CoreMutationFences>,
     /// 与 `sys_ops` 同一隔离边界：测试 fixture 不仅要把“已安装”探测钉成 false，直接调用
@@ -577,7 +527,6 @@ impl HelperRuntime {
             platform,
             sys_ops: Arc::new(|| Box::new(StdSysOps)),
             start_identity: Mutex::new(None),
-            install_core_unsupported: Mutex::new(None),
             core_mutation_fences: Mutex::new(CoreMutationFences::default()),
             #[cfg(test)]
             never_connect: false,
@@ -677,7 +626,6 @@ impl HelperRuntime {
             platform: Platform::current(),
             sys_ops: Arc::new(|| Box::new(NeverInstalled)),
             start_identity: Mutex::new(None),
-            install_core_unsupported: Mutex::new(None),
             core_mutation_fences: Mutex::new(CoreMutationFences::default()),
             never_connect: true,
             status_override: None,
@@ -834,27 +782,60 @@ impl HelperRuntime {
         match self.build_client() {
             Ok(client) => {
                 let mut status = snapshot_from(&manager.status_with_recovery(&client), supported);
-                if status.ready && !status.upgradeable {
-                    match self.core_status() {
-                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => {}
-                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Absent { .. }) => {
-                            status.ready = false;
-                            status.upgradeable = true;
-                        }
-                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. })
-                        | Err(_) => {
-                            status.ready = false;
-                            status.needs_repair = true;
-                        }
-                    }
-                }
+                self.apply_selected_core_status(&mut status);
                 status
             }
             Err(e) => {
                 log::debug!("helper status：建 client 失败（{e}）→ 视作未就绪");
-                snapshot_from(&HelperStatus::default(), supported)
+                let mut status = snapshot_from(&HelperStatus::default(), supported);
+                self.apply_selected_core_status(&mut status);
+                status
             }
         }
+    }
+
+    fn apply_selected_core_status(&self, status: &mut HelperStatusSnapshot) {
+        let Ok(platform) = crate::runtime::core_identity::current_platform() else {
+            return;
+        };
+        let Ok(manifest) = crate::runtime::core_identity::selected_manifest(platform) else {
+            status.ready = false;
+            status.needs_repair = true;
+            return;
+        };
+        let Ok(id) = manifest.id(polaris_updater::sha256_hex) else {
+            status.ready = false;
+            status.needs_repair = true;
+            return;
+        };
+        let state = if !status.ready {
+            "unavailable"
+        } else {
+            match self.core_status() {
+                Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => "present",
+                Ok(polaris_helper_proto::core_protocol::CoreStatus::Absent { .. }) => {
+                    status.ready = false;
+                    status.upgradeable = true;
+                    "absent"
+                }
+                Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. }) => {
+                    status.ready = false;
+                    status.needs_repair = true;
+                    "invalid"
+                }
+                Err(_) => {
+                    status.ready = false;
+                    status.needs_repair = true;
+                    "unavailable"
+                }
+            }
+        };
+        status.selected_core = Some(SelectedCoreSnapshot {
+            id: id.as_str().into(),
+            version: manifest.version,
+            provider_fingerprint: manifest.provider_fingerprint,
+            state: state.into(),
+        });
     }
 
     /// 组装失败结果（失败态复用一次真状态探测）。原始错误只进日志，回包只留稳定码和泛化诊断。
@@ -896,20 +877,16 @@ impl HelperRuntime {
         let manager = self.manager();
         match manager.install(&params, &StdExecutor) {
             Ok(EscalationOutcome::Success) => {
-                // 提权脚本跑完 = 磁盘上那个 helper.exe/二进制**已经换了一份**，它的能力集因此作废。
-                // 清在这里而不是等就绪轮询判定之后：失效事件是「二进制被替换」，不是「新 helper 就绪」
-                // ——回退粒度要等于故障粒度。清早了最多白跑一轮完整对账（纯性能），清晚了/不清则
-                // 「源码构建 build_identity 不变」那条链上记号永不失效（见
-                // [`Self::clear_install_core_unsupported`]）。
-                self.clear_install_core_unsupported();
-                // 装完轮询就绪（daemon 注册后绑 socket 需时间）。
-                let status = match self.build_client() {
+                // Service readiness and this App's installed content id are
+                // separate receipts, including when a newer helper is retained.
+                let mut status = match self.build_client() {
                     Ok(client) => snapshot_from(
                         &manager.wait_until_ready(&client, READY_POLL_ATTEMPTS, READY_POLL_DELAY),
                         true,
                     ),
                     Err(_) => self.status(),
                 };
+                self.apply_selected_core_status(&mut status);
                 if helper_install_reached_expected_build(&status) {
                     HelperActionResult {
                         success: true,
@@ -922,7 +899,8 @@ impl HelperRuntime {
                         success: false,
                         error_code: Some(HelperActionErrorCode::NotReady),
                         diagnostic: Some(
-                            "helper did not reach the expected build after installation".to_owned(),
+                            "helper protocol or selected core is not ready after installation"
+                                .to_owned(),
                         ),
                         status,
                     }
@@ -1051,30 +1029,10 @@ impl HelperRuntime {
     pub(crate) fn core_status(
         &self,
     ) -> Result<polaris_helper_proto::core_protocol::CoreStatus, String> {
-        use polaris_helper_proto::core_protocol::CoreStatus;
         let id = crate::runtime::core_identity::selected_id(
             crate::runtime::core_identity::current_platform()?,
         )?;
-        let client = self.build_client()?;
-        match client.send_with_timeout(
-            &Request::CoreStatus { id: id.clone() },
-            Duration::from_secs(5),
-        ) {
-            Ok(Response::Ok(ResponseKind::CoreStatus(status))) => {
-                let reported = match &status {
-                    CoreStatus::Present { id, .. }
-                    | CoreStatus::Absent { id }
-                    | CoreStatus::Invalid { id, .. } => id,
-                };
-                if reported != &id {
-                    return Err("HELPER_CORE_MISMATCH: status content id differs".into());
-                }
-                Ok(status)
-            }
-            _ => {
-                Err("HELPER_CORE_MISMATCH: pinned content status unavailable; update helper".into())
-            }
-        }
+        query_core_status(&self.build_client()?, &id)
     }
 
     pub(crate) fn require_selected_core(&self) -> Result<(), String> {
@@ -1310,46 +1268,6 @@ impl HelperRuntime {
         self.start_identity.lock().ok().and_then(|slot| *slot)
     }
 
-    /// 当前的「不支持 install-core」记号（无记号 / 锁中毒 ⇒ `None` ⇒ 调用方照常真试一次）。
-    pub(crate) fn install_core_unsupported_note(&self) -> Option<InstallCoreUnsupportedRecord> {
-        self.install_core_unsupported
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-    }
-
-    /// 记下「这个 helper 构建不支持 install-core」。
-    ///
-    /// `probe` 必须是**发 `install-core` 之前**探到的那次身份，不能事后再探：UAC 重装是秒级操作，
-    /// 「回 `ERR unknown`」与「事后再探」之间 helper 完全可能已被换成新版 ⇒ 记号写成
-    /// 「**新** helper 不支持」⇒ 本会话内永久跳过对账，而新 helper 其实是支持的。
-    ///
-    /// [`HelperBuildProbe::Unreachable`] **不记**：没有失效键的记号 = 永不失效的缓存。
-    pub(crate) fn note_install_core_unsupported(&self, probe: &HelperBuildProbe) {
-        if let Ok(mut slot) = self.install_core_unsupported.lock() {
-            *slot = match probe {
-                HelperBuildProbe::Reported(id) => Some(InstallCoreUnsupportedRecord {
-                    helper_build_id: id.clone(),
-                }),
-                HelperBuildProbe::Unreachable => None,
-            };
-        }
-    }
-
-    /// 清掉记号。**唯一调用点是 [`Self::install`] 的成功分支**。
-    ///
-    /// 为什么非要这一下：记号的失效键是 helper 自报的 `build_identity`，而
-    /// `polaris_helper_proto::build_identity::current()` 在 `POLARIS_BUILD_ID` 未注入时落
-    /// `CARGO_PKG_VERSION` —— **开源项目的源码构建、CI 的非发布产物都不注入**。于是
-    /// 「拉新源码重编 helper → 设置页点升级/修复 → 新 helper 仍自报 `0.x.y`」这条链上失效键根本
-    /// 不变，缓存命中，本会话内 install-core 永不再试，受保护目录停在旧核，现场只有一句 warn。
-    /// app 自己刚把 helper 重装了一遍，这是能拿到的**最精确**的失效事件。
-    fn clear_install_core_unsupported(&self) {
-        if let Ok(mut slot) = self.install_core_unsupported.lock() {
-            *slot = None;
-        }
-    }
-
     /// 查询 helper 自己受管的核状态。
     ///
     /// app 进程对 root/SYSTEM child 的本地进程查询可能只能得到“未知”；helper 与 child 位于同一权限
@@ -1405,50 +1323,6 @@ impl HelperRuntime {
     #[must_use]
     pub fn protected_core_dir_path(&self) -> PathBuf {
         InstallPaths::for_platform(self.platform).core_dir
-    }
-
-    /// 经 helper 把暂存目录里的核 root 写入受保护核目录（`install-core`）。
-    ///
-    /// **这是让提权助手拿到本应用配套内核的通道**：mac/win 的 `start` 不带核路径、linux 的会被
-    /// 强制校验成锁定路径，故应用升级后的新内核只能靠本命令**换掉那个锁定路径的内容**（路径不变 ⇒ helper 无需重启）。
-    /// 移植自 上游 `HelperManager.installCore`（`HelperManager.ts:421-430`）——helper 侧
-    /// （[`polaris_helper::core_install::install_core_files`]）在 Polaris 移植时就已完整落地，
-    /// 缺的一直是本方法这条 app 侧调用边。
-    ///
-    /// `src_dir` 必须是**只含该进受保护目录的文件**的干净目录：helper 会把其中每个非目录文件都搬进去，
-    /// 并把不在其中的旧文件 prune 掉（`core_install::prune_extra_files`）。备好它用
-    /// [`core_promote::stage_promote_dir`](crate::runtime::core_promote::stage_promote_dir)。
-    ///
-    /// `want_hash` = `src_dir/sing-box` 的 sha256 hex（helper 读全字节复算比对，堵 TOCTOU）。
-    ///
-    /// **真机门**：真写 root 目录需 mac/win 真机 + 已就绪 helper。
-    ///
-    /// # Errors
-    ///
-    /// 建客户端失败 / IPC 失败 / helper 返回 `ERR *`（`hash-mismatch` / `coredir-unset` / 写盘失败等）。
-    /// `ERR unknown` 单列为 [`InstallCoreError::Unsupported`]，理由见该变体文档。
-    pub fn install_core(&self, src_dir: &Path, want_hash: &str) -> Result<(), InstallCoreError> {
-        self.register_core_mutation()
-            .map_err(InstallCoreError::Failed)?;
-        let client = self.build_client().map_err(InstallCoreError::Failed)?;
-        install_core_with_client(&client, src_dir, want_hash)
-    }
-
-    /// 探一次已装 helper 自报的**构建身份**（一次 `Ping`，无副作用）。
-    ///
-    /// 只服务 [`install-core 能力缓存`](crate::runtime::proxy) 的失效键：一次 ping 是微秒级管道
-    /// 往返，而它挡掉的是两次 80MB sha256 + 一次暂存目录复制。不复用
-    /// [`Self::status`]——那条会走 `status_with_recovery`（探不到就去拉服务），对每次起核都跑的
-    /// 热路径太重，且会把「探测」变成「有副作用的动作」。
-    pub(crate) fn helper_build_probe(&self) -> HelperBuildProbe {
-        let Ok(client) = self.build_client() else {
-            return HelperBuildProbe::Unreachable;
-        };
-        // 超时取与 helper-client 握手腿同一量级（1.5s）：探不到就当探不到，不拖起核。
-        match client.send_with_timeout(&Request::Ping, Duration::from_millis(1500)) {
-            Ok(Response::Ok(ResponseKind::Pong(p))) => HelperBuildProbe::Reported(p.build_identity),
-            _ => HelperBuildProbe::Unreachable,
-        }
     }
 
     /// 经 helper 停核（对称：经 helper 起的核经 helper stop）。daemon `stop` 摘其受管 child → 终止 →
@@ -1707,87 +1581,6 @@ fn classify_mac_proxy_client_error(
         ClientError::Timeout | ClientError::Io(_) | ClientError::EmptyResponse => {
             MacProxyWriterError::Failed(error.to_string())
         }
-    }
-}
-
-/// install-core 的可测试通信核（[`HelperRuntime::install_core`] 的全部判据）。
-///
-/// # Windows 上「写出了、对端 0 字节就断开」的归类
-///
-/// 批三之前的 Windows helper 不认识 install-core，批三到本批之间的 helper 分派认识、线协议解码器
-/// 不认识 —— 两者都在**验 token 之前** NoWait 回 `ERR unknown` 并 `DisconnectNamedPipe`，这行
-/// 几乎总被丢掉，app 读到 0 字节（真机：`ERROR_PIPE_NOT_CONNECTED`(233)，客户端读腿已把它归为
-/// EOF ⇒ [`ClientError::EmptyResponse`]）。不归类的话 `Unsupported` 分支在 Windows 上永远不触发，
-/// 能力缓存形同虚设，每次起核白 stage 约 80MB。
-///
-/// 三种失败要分开（`helper-client` 已按类型分开，见 `windows_pipe::is_peer_gone`）：
-/// - 连不上（[`ClientError::Connect`]）：helper 没在听 ⇒ `Failed`；
-/// - 请求没写出（[`ClientError::Io`]，写腿）⇒ `Failed`；
-/// - 写出了、对端一个字节没回就断开（[`ClientError::EmptyResponse`]）⇒ **复核**后才可能 `Unsupported`。
-///
-/// 只对 Windows 的 install-core 做这件事：`ping`/`start` 收到 0 字节是真故障；mac/linux 的旧
-/// helper 会如实回 `ERR unknown` 文本，不需要猜。
-///
-/// # 为什么要复核一帧，而不是直接归 `Unsupported`
-///
-/// 记号的失效键是 helper 自报的构建身份，而它只在 helper 换代或 `install()` 成功时才变。
-/// **新** helper（认识 install-core）若在装核途中偶发断开（进程崩溃、被 SCM 重启），直接记号就会把
-/// 「这一次失败」钉成「整个会话不再尝试」，受保护目录停在旧核。故再发一帧**无副作用**的
-/// install-core（空 src / 空 hash）：认识它的 helper 会在落盘之前回一行文本（`ERR busy` /
-/// `ERR bad-args` / `ERR coredir-acl-weakened`，核心 `install_core_files` 对空 src 首先回
-/// `BadArgs`），不认识的旧 helper 仍是 0 字节或 `ERR unknown`。只有复核也是这两种之一才归
-/// `Unsupported`；复核拿到任何其它应答、或连不上，都按这一次的偶发失败处理（`Failed`，不记号）。
-fn install_core_with_client(
-    client: &HelperClient,
-    src_dir: &Path,
-    want_hash: &str,
-) -> Result<(), InstallCoreError> {
-    let req = Request::InstallCore(InstallCoreParams {
-        src_dir: src_dir.to_string_lossy().into_owned(),
-        want_hash: want_hash.to_owned(),
-    });
-    // install-core 走长超时（sha256 + 80MB 量级复制），沿用 client 侧既有常量，不另开一个。
-    match client.send_with_timeout(&req, Duration::from_millis(INSTALL_CORE_TIMEOUT_MS)) {
-        Ok(resp) => install_core_response(resp),
-        Err(ClientError::EmptyResponse) if client.platform() == Platform::Win => {
-            confirm_install_core_unsupported(client)
-        }
-        Err(e) => Err(InstallCoreError::Failed(format!(
-            "helper 装核通信失败：{e}"
-        ))),
-    }
-}
-
-/// install-core 应答 → 结果分类。
-fn install_core_response(resp: Response) -> Result<(), InstallCoreError> {
-    match resp {
-        Response::Ok(ResponseKind::Installed) => Ok(()),
-        Response::Ok(other) => Err(InstallCoreError::Failed(format!(
-            "helper 装核返回非预期响应：{other:?}"
-        ))),
-        // 裸 `ERR unknown` = 这个 helper 压根不认识 install-core（旧 Windows helper 的常态）。
-        // 与「这次装核失败了」分开：前者重试一万次也是同一个结果，后者可能下次就好了。
-        Response::Err(e) if is_unknown_command_reply(&e) => Err(InstallCoreError::Unsupported),
-        Response::Err(e) => Err(InstallCoreError::Failed(format!("helper 装核失败：{e}"))),
-    }
-}
-
-/// Windows 上 install-core 0 字节之后的复核帧（理由见 [`install_core_with_client`]）。
-fn confirm_install_core_unsupported(client: &HelperClient) -> Result<(), InstallCoreError> {
-    let probe = Request::InstallCore(InstallCoreParams {
-        src_dir: String::new(),
-        want_hash: String::new(),
-    });
-    match client.send(&probe) {
-        Err(ClientError::EmptyResponse) => Err(InstallCoreError::Unsupported),
-        Ok(Response::Err(e)) if is_unknown_command_reply(&e) => Err(InstallCoreError::Unsupported),
-        Ok(resp) => Err(InstallCoreError::Failed(format!(
-            "helper 装核连接写出后 0 字节即断开；复核帧得到应答 {resp:?} ⇒ helper 认识 \
-             install-core，按本次偶发故障处理"
-        ))),
-        Err(e) => Err(InstallCoreError::Failed(format!(
-            "helper 装核连接写出后 0 字节即断开；复核帧也失败（{e}）⇒ 无法判定能力，按本次失败处理"
-        ))),
     }
 }
 
@@ -2341,3 +2134,27 @@ fn resolve_helper_binary() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests;
+
+fn query_core_status(
+    client: &HelperClient,
+    id: &polaris_helper_proto::core_manifest::CoreId,
+) -> Result<polaris_helper_proto::core_protocol::CoreStatus, String> {
+    use polaris_helper_proto::core_protocol::CoreStatus;
+    match client.send_with_timeout(
+        &Request::CoreStatus { id: id.clone() },
+        Duration::from_secs(5),
+    ) {
+        Ok(Response::Ok(ResponseKind::CoreStatus(status))) => {
+            let reported = match &status {
+                CoreStatus::Present { id, .. }
+                | CoreStatus::Absent { id }
+                | CoreStatus::Invalid { id, .. } => id,
+            };
+            if reported != id {
+                return Err("HELPER_CORE_MISMATCH: status content id differs".into());
+            }
+            Ok(status)
+        }
+        _ => Err("HELPER_CORE_MISMATCH: pinned content status unavailable; update helper".into()),
+    }
+}

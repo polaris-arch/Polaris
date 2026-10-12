@@ -11,7 +11,7 @@ dist/
 dist-package/
 *.tsbuildinfo
 
-# 下载的内核 / 资源二进制（由 scripts/ 拉取，不入库）
+# 固定发布消费的内核与 helper/cleaner/安装身份资源（由 scripts/ 物化，不入库）
 /resources/*
 !/resources/.gitkeep
 # geo 规则集随包入库（对齐 上游 resources/data/）：28 个 .srs ≈ 472K（= builtin_geo_rulesets()

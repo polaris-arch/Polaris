@@ -318,8 +318,7 @@ fn test_runtime_in_on(dir: PathBuf, helper: HelperRuntime) -> Arc<ProxyRuntime> 
     *rt.metadata_validation_admission.lock().unwrap() = Some(Ok(()));
     // 本工厂也没有受保护核目录可对账：经替身 helper 起核的用例关心的是 custody 与协议，
     // 配套闸另有专门的用例（它们把这个桩清掉，走真对账）。
-    *rt.protected_core_verdict_fixture.lock().unwrap() =
-        Some(super::startup::ProtectedCoreVerdict::Confirmed);
+    *rt.selected_core_ready_fixture.lock().unwrap() = Some(Ok(()));
     rt
 }
 

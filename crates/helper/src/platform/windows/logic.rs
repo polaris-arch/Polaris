@@ -5,7 +5,7 @@
 //! - iface / cidr / sha256 白名单 → 复用 `helper-proto`（不重复定义，消灭 drift）。
 //! - winproc 特有的端口解析、镜像匹配、basename、路径归一化 → 本模块（Go `winproc.go` 对应）。
 
-use polaris_helper_proto::{Request, codec, command};
+use polaris_helper_proto::{codec, command, Request};
 
 /// Windows 接口白名单（移植自 `helper.go:50-60` 的 `ifaceAllowed`）。
 ///
@@ -302,7 +302,7 @@ pub fn split_frame(raw: &str) -> Option<Frame<'_>> {
 /// 解析 command + arg lines 为 Request（对应 Go handle() 各 case 的 readLine 序列）。
 ///
 /// 缺行一律按 Go `readLine` 的 EOF 语义取 `""`；参数值是否合法由各分派腿自己判（例如
-/// install-core 的空 src / 非 64 hex hash 由 [`crate::core_install::install_core_files`] 回
+/// Retired content-upload and unpinned Start commands never decode.
 /// `ERR bad-args`），解码层不重复造判据。返回 `None` = 不认识的命令（或参数连类型都解不出）。
 #[must_use]
 pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {

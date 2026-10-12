@@ -69,18 +69,6 @@ const REGISTERED: [(&str, Kind, usize, &str); 26] = [
         "sleeping_probe_script 只产出脚本正文，落盘仍经共用办法",
     ),
     (
-        "crates/helper/src/core_install/tests/mod.rs",
-        Kind::ExecBit,
-        1,
-        "假核是安装器的输入字节，只被复制与校验哈希，从不执行",
-    ),
-    (
-        "crates/helper/src/platform/linux/core_installer/tests/mod.rs",
-        Kind::ExecBit,
-        2,
-        "源目录权限与安装器输入字节，从不执行",
-    ),
-    (
         "crates/helper-client/src/manager/tests/mod.rs",
         Kind::Shebang,
         2,
@@ -109,18 +97,6 @@ const REGISTERED: [(&str, Kind, usize, &str); 26] = [
         Kind::ExecBit,
         1,
         "源目录权限与假核输入字节，xattr/codesign 经桩执行，从不起核",
-    ),
-    (
-        "crates/helper/src/platform/windows/helper/tests/mod.rs",
-        Kind::ExecBit,
-        1,
-        "unix 宿主上设置源目录与安装器输入字节权限，从不执行",
-    ),
-    (
-        "src-tauri/src/runtime/core_promote/tests/mod.rs",
-        Kind::ExecBit,
-        1,
-        "构造组可写的安装输入验证暂存权限收紧，从不执行",
     ),
     (
         "crates/core-supervisor/src/config_gate/check_custody/tests/mod.rs",

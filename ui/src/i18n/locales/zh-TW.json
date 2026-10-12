@@ -47,6 +47,16 @@
       "missingAsset": "應用程式內建的 helper 檔案無法使用",
       "notReady": "helper 已安裝，但暫未就緒",
       "failed": "helper 操作未能完成"
+    },
+    "selectedCoreVersion": "選定核心版本",
+    "selectedCoreId": "選定內容識別",
+    "selectedCoreProvider": "原始碼身分",
+    "selectedCoreState": "安裝狀態",
+    "coreState": {
+      "present": "已驗證",
+      "absent": "未安裝",
+      "invalid": "驗證失敗",
+      "unavailable": "無法使用"
     }
   },
   "proxy": {
@@ -243,8 +253,20 @@
       "body": "安裝套件內的核心檔案沒有可執行權限，本次連線未建立。請重新安裝應用程式"
     },
     "helperCoreMismatch": {
-      "title": "Polaris 未能啟動 TUN 模式",
-      "body": "無法確認提權助手內的核心與本應用程式相符，本次未以 TUN 模式連線。請開啟應用到「設定 › Helper」重新安裝或升級提權助手後重試"
+      "title": "Polaris 無法啟動",
+      "body": "無法驗證選定核心的回執，請前往「設定 › Helper」修復或升級助手。"
+    },
+    "coreBundleMismatch": {
+      "title": "Polaris 無法啟動",
+      "body": "隨附核心與本應用程式的內容身分不符，請重新安裝 Polaris。"
+    },
+    "helperCoreAbsent": {
+      "title": "Polaris 無法啟動",
+      "body": "本應用程式選定的核心尚未安裝，請前往「設定 › Helper」安裝。"
+    },
+    "helperCoreInvalid": {
+      "title": "Polaris 無法啟動",
+      "body": "已安裝核心未通過內容驗證，請前往「設定 › Helper」修復。"
     }
   },
   "connections": {
@@ -1668,13 +1690,16 @@
     "rootOrphanBlocked": "偵測到殘留的核心行程佔用快取檔案，啟動核心已被阻斷",
     "coreBinaryMismatch": "目前執行中的核心與本應用程式配套的版本不一致。請重新安裝 Helper，並在日誌中查看詳情",
     "coreNotExecutable": "安裝套件內的核心檔案沒有可執行權限，無法啟動。請重新安裝應用程式。",
-    "helperCoreMismatch": "無法確認提權助手內的核心與本應用程式相符，已拒絕以 TUN 模式啟動。請到「設定 › Helper」重新安裝或升級提權助手後重試。",
+    "helperCoreMismatch": "無法驗證選定核心的回執，請前往「設定 › Helper」修復或升級助手。",
     "tunAdapterMissing": "TUN 虛擬網卡未能建立，請檢查 wintun 驅動是否被安全軟體攔截，或重新啟動後重試",
     "autoSwitchNeedsRestart": "已嘗試自動換節點，但本次未能換成：有候選節點需要重新啟動核心才能切換過去。請手動選擇其他節點。",
     "tunAddressUnavailable": "TUN 虛擬網卡位址無法配置，可能被殘留網卡或其他 VPN 佔用。請中斷其他 VPN，或重新啟動系統後再試",
     "androidNativeCapacityClosed": "本次執行的生命週期記錄已滿，請完全關閉並重新啟動應用程式後重試。",
     "vpnPermissionDenied": "VPN 授權尚未完成。請完成或關閉目前的授權視窗，再點擊連線，並在系統 VPN 連線要求中選擇允許。",
-    "systemInterfaceUnsupported": "此節點要求系統網卡，Android VPN 模式不支援。請在節點編輯中關閉系統網卡選項；自訂節點請將 JSON 中的 system 設為 false。"
+    "systemInterfaceUnsupported": "此節點要求系統網卡，Android VPN 模式不支援。請在節點編輯中關閉系統網卡選項；自訂節點請將 JSON 中的 system 設為 false。",
+    "coreBundleMismatch": "隨附核心與本應用程式的內容身分不符，請重新安裝 Polaris。",
+    "helperCoreAbsent": "本應用程式選定的核心尚未安裝，請前往「設定 › Helper」安裝。",
+    "helperCoreInvalid": "已安裝核心未通過內容驗證，請前往「設定 › Helper」修復。"
   },
   "privacy": {
     "wrongPassword": "解鎖密碼錯誤",

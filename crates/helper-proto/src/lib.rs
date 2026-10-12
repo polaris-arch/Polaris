@@ -172,8 +172,9 @@ pub mod proto_version {
     /// 当前 wire 协议版本，mac/win/linux 共用。
     ///
     /// 唯一定义点：helper 侧的 `ping`/`version` 响应与 client 侧的握手期望都读它 → 结构上不可能分叉。
-    /// Linux resolved 命令在首次正式发布前加入，仍属于 v1；只有已发布 wire 出现不兼容变化时才递增。
-    pub const CURRENT: u32 = 1;
+    /// v2 uses immutable content ids and rejects all runtime installation and
+    /// executable-path/legacy birth Start frames before dispatch.
+    pub const CURRENT: u32 = 2;
 }
 
 /// 当前安装包内 app/helper 的共同构建身份。

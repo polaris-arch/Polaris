@@ -306,16 +306,6 @@ impl WinProcOps {
                 "previous managed HANDLE custody still retained",
             ));
         }
-        // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
-        let total_started = Instant::now();
-        let forwarding_started = Instant::now();
-        if fwd {
-            self.enable_ip_forwarding();
-        }
-        let forwarding_ms = crate::elapsed_ms(forwarding_started);
-        // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
-        // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
-        let mut cmd = std::process::Command::new(singbox_bin);
         // SCM inherits machine-owned environment. Pass only the system roots
         // and trusted executable directories; never inherit DLL/path overrides.
         let system_root = std::env::var_os("SystemRoot")
@@ -330,6 +320,16 @@ impl WinProcOps {
         let path =
             std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")])
                 .map_err(std::io::Error::other)?;
+        // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
+        let total_started = Instant::now();
+        let forwarding_started = Instant::now();
+        if fwd {
+            self.enable_ip_forwarding();
+        }
+        let forwarding_ms = crate::elapsed_ms(forwarding_started);
+        // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
+        // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
+        let mut cmd = std::process::Command::new(singbox_bin);
         cmd.env_clear()
             .env("SystemRoot", &system_root)
             .env("PATH", path);
@@ -1587,18 +1587,19 @@ fn sid_to_string(psid: PSID) -> Option<String> {
     unsafe_code,
     reason = "read-only security descriptor of one held file object"
 )]
-pub fn file_owner(file: &File) -> std::io::Result<String> {
+pub fn file_security(file: &File) -> std::io::Result<ObjectSecurity> {
     let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    // SAFETY: the File retains its handle throughout the synchronous query; outputs are live.
+    // SAFETY: File owns the queried HANDLE; output pointers live until LocalFree.
     let result = unsafe {
         GetSecurityInfo(
             file.as_raw_handle().cast(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut dacl,
             std::ptr::null_mut(),
             &mut descriptor,
         )
@@ -1606,16 +1607,19 @@ pub fn file_owner(file: &File) -> std::io::Result<String> {
     if result != 0 {
         return Err(std::io::Error::from_raw_os_error(result as i32));
     }
-    let value = if owner.is_null() {
-        None
-    } else {
-        sid_to_string(owner)
-    };
-    // SAFETY: successful GetSecurityInfo allocates the descriptor with LocalAlloc.
-    if !descriptor.is_null() {
-        unsafe { LocalFree(descriptor) };
+    if descriptor.is_null() {
+        return Err(std::io::Error::other("held object security unavailable"));
     }
-    value.ok_or_else(|| std::io::Error::other("source file owner unavailable"))
+    let value = parse_object_security("held-object", owner, dacl);
+    // SAFETY: successful GetSecurityInfo returned one LocalAlloc allocation.
+    unsafe { LocalFree(descriptor) };
+    Ok(value)
+}
+
+pub fn file_owner(file: &File) -> std::io::Result<String> {
+    file_security(file)?
+        .owner_sid
+        .ok_or_else(|| std::io::Error::other("source file owner unavailable"))
 }
 
 /// 宽字符串辅助：OsStr → null 终止 UTF-16（供 windows-sys API）。

@@ -20,7 +20,7 @@
 //!
 //! ## 重连 / 超时
 //!
-//! - **超时**：单请求超时由调用方传入（默认 [`DEFAULT_REQUEST_TIMEOUT_MS`]，install-core 用 [`INSTALL_CORE_TIMEOUT_MS`](crate::transport::INSTALL_CORE_TIMEOUT_MS)）。
+//! - **超时**：单请求超时由调用方传入（默认 [`DEFAULT_REQUEST_TIMEOUT_MS`]；较长只读操作由调用方显式给定预算）。
 //!   超时返回 [`ClientError::Timeout`]（对齐 上游 `helper socket 超时`，HelperManager.ts:441）。
 //! - **重连**：[`HelperClient::send_with_retry`] 在连接失败 / 超时时按策略重试（默认 0 次 —— Polaris sendCommand
 //!   不重试，调用方决定。重试用于「刚 install 完等 daemon 起来」场景，对齐 Polaris install 后轮询就绪
@@ -32,8 +32,6 @@
 //! 2. socket/pipe 经 trait 抽象，测试 mock（不碰宿主）。
 //! 3. `forbid(unsafe_code)`。
 
-#[cfg(test)]
-use crate::transport::INSTALL_CORE_TIMEOUT_MS;
 use crate::transport::{ConnectionStream, DEFAULT_REQUEST_TIMEOUT_MS};
 use polaris_helper_proto::codec;
 use polaris_helper_proto::{Platform, Request, Response};
@@ -117,7 +115,7 @@ impl HelperClient {
 
     /// 发送一个请求，自定义超时。
     ///
-    /// install-core 用 [`INSTALL_CORE_TIMEOUT_MS`](crate::transport::INSTALL_CORE_TIMEOUT_MS)（sha256 + 大文件复制耗时长，HelperManager.ts:421）。
+    /// Runtime content queries are read-only; installation uses the administrator CLI transaction.
     pub fn send_with_timeout(
         &self,
         req: &Request,

@@ -122,10 +122,18 @@ pub fn run_console(cfg: ServiceConfig) -> std::io::Result<()> {
 
 /// 构造生产 WinHelper（FileTokenStore + WinProcOps）。
 fn build_helper(cfg: &ServiceConfig) -> ProductionHelper {
+    let root = std::path::Path::new(&cfg.support_dir).join("core");
+    if let Ok(store) =
+        crate::core_store::CoreStore::open(&root, crate::core_store::OwnerPolicy::privileged())
+    {
+        if let Err(error) = store.retire_flat_layout() {
+            log::warn!("legacy flat retirement retained: {error}");
+        }
+    }
     let token = FileTokenStore::new(&cfg.support_dir);
     let proc = WinProcOps::new();
     let net = WinProcOps::new();
-    WinHelper::new(token, proc, net, "", "", SERVICE_NAME, &cfg.support_dir)
+    WinHelper::new(token, proc, net, &cfg.support_dir)
 }
 
 /// HANDLE（`*mut c_void`）的 Send 包装，用于把管道句柄移入 spawned 线程。

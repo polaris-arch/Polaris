@@ -1396,13 +1396,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// **legacy** salted SHA-256：`sha256(salt || password)` → hex。复用 `polaris_helper::core_install::sha256_hex`。
+/// **legacy** salted SHA-256：`sha256(salt || password)` → hex。复用 `polaris_helper::core_hash::sha256_hex`。
 /// 新密码已改用 scrypt 独立文件（见 `store::privacy_lock`）；本函数仅供**存量 SHA-256 用户的解锁校验**
 /// （经 [`verify_password`] → [`unlock_core`] legacy 分支）复算比对，production 不再用它**创建**新哈希。
 fn hash_password(salt: &[u8], password: &str) -> String {
     let mut data = salt.to_vec();
     data.extend_from_slice(password.as_bytes());
-    polaris_helper::core_install::sha256_hex(&data)
+    polaris_helper::core_hash::sha256_hex(&data)
 }
 
 /// 常量时间比较（等长逐字节 XOR 累加，无早退时序泄漏）。长度不等直接 false（hash 恒等长，不泄信息）。

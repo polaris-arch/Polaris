@@ -30,9 +30,6 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 单次请求默认超时（毫秒）—— 移植自 `HelperManager.ts:443` 的 `setTimeout(..., timeoutMs)`，ping 默认 1500ms。
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1500;
 
-/// install-core 的长超时（毫秒）—— 移植自 `HelperManager.ts:421` 的 `sendCommand([...], 30_000)`（sha256 + 大文件复制）。
-pub const INSTALL_CORE_TIMEOUT_MS: u64 = 30_000;
-
 /// 抽象的「连接字节流」—— helper socket / pipe 的统一读写边界。
 ///
 /// 实现者负责：

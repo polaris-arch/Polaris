@@ -89,8 +89,7 @@ use serde_json::Value;
 
 use crate::logging::SING_BOX_TARGET;
 use crate::runtime::helper::{
-    HelperBuildProbe, HelperStartResult, HelperStatusSnapshot, HelperStopOps, HelperStopTarget,
-    InstallCoreError, InstallCoreUnsupportedRecord,
+    HelperStartResult, HelperStatusSnapshot, HelperStopOps, HelperStopTarget,
 };
 use crate::runtime::route_binding::plan_runtime_bindings;
 
@@ -511,97 +510,6 @@ pub(super) struct KernelGateCacheRecord {
     pub(super) binary_len: u64,
     pub(super) binary_modified_ns: u64,
     pub(super) config_sha256: String,
-}
-
-/// 一次完整 SHA256 对账通过后记住的两侧 payload 身份（仅进程内）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProtectedCoreCacheRecord {
-    pub(super) active: crate::runtime::core_promote::PayloadStamp,
-    pub(super) protected: crate::runtime::core_promote::PayloadStamp,
-}
-
-pub(super) fn protected_core_cache_hit(
-    cached: Option<&ProtectedCoreCacheRecord>,
-    active: &crate::runtime::core_promote::PayloadStamp,
-    protected: Option<&crate::runtime::core_promote::PayloadStamp>,
-) -> bool {
-    protected.is_some_and(|protected| {
-        cached.is_some_and(|cached| cached.active == *active && cached.protected == *protected)
-    })
-}
-
-/// 能力缓存是否命中（**纯函数**）。
-///
-/// 失效键 = helper 自报的 `build_identity`。它在**发布构建**上必变：`build_identity::current()`
-/// 取 `POLARIS_BUILD_ID`（发布流水线注入的 `github.sha`），每次发版都不同 ——`HelperManager` 正是
-/// 拿同一个比较判 `upgradeable`（`manager.rs` 的 `same_proto_build_mismatch`）。
-///
-/// **源码构建下它不变**（如实登记，别当它是万能键）：`POLARIS_BUILD_ID` 未注入时
-/// `build_identity::current()` 回落 `CARGO_PKG_VERSION` —— 开源项目的本地构建、CI 的非发布产物
-/// 都走这条。于是「重编 helper → 点升级/修复 → 新 helper 仍自报同一个 `0.x.y`」这条链上，
-/// 光靠本键失效不了。那一格由 [`crate::runtime::helper::HelperRuntime::install`] 的成功分支主动清记号补上
-/// （`runtime/helper.rs` 的 `clear_install_core_unsupported`）：二进制换了就作废，与它自报什么无关。
-///
-/// [`HelperBuildProbe::Unreachable`] 恒判不命中：探不到 ≠ 还是那个 helper。宁可白跑一轮完整对账，
-/// 也不能把「没问到」当成身份不变——那会让缓存永不失效。
-pub(super) fn install_core_unsupported_cache_hit(
-    cached: Option<&InstallCoreUnsupportedRecord>,
-    probe: &HelperBuildProbe,
-) -> bool {
-    match (cached, probe) {
-        (Some(cached), HelperBuildProbe::Reported(now)) => &cached.helper_build_id == now,
-        _ => false,
-    }
-}
-
-#[derive(Debug)]
-pub(super) enum ProtectedCoreReconcileOutcome {
-    Cached,
-    Verified,
-    Promoted(String),
-    /// 这个 helper 不支持 install-core：本轮跳过（能力缓存命中）或刚刚记下（首次撞上）。
-    /// `bool` = 是否由缓存命中提前退出（命中与首次撞上的日志必须可分辨，否则「能力探测没跑」
-    /// 与「跑了且命中」在现场长得一样）。
-    InstallCoreUnsupported {
-        from_cache: bool,
-    },
-}
-
-/// 受保护核对账之后，能不能确认「提权助手将要执行的内核就是本应用随包的那一份」。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ProtectedCoreVerdict {
-    /// 逐字节一致。
-    Confirmed,
-    /// 确认不了；串是给日志与诊断看的原因。
-    Unconfirmed(String),
-}
-
-/// 对账结果 → 配套结论（纯函数）。
-///
-/// 判据是对账本身拿到的证据，都是内容哈希，不是版本串：
-/// - `Verified`：应用自己读两侧文件，内核的 sha256 相等、同目录的附属库逐个相等；
-/// - `Cached`：本会话已得到过上一条，且此后两侧文件的元数据都没变；
-/// - `Promoted`：助手刚把随包内核装进受保护目录，装入前它自己复算过 sha256。
-///
-/// 其余一律确认不了：助手不认识装核命令（它手里那份内核换不成随包的）、对账这一次失败
-/// （通信、读文件、哈希不符、磁盘）、对账任务没跑完。**确认不了即拒绝** —— 不再是「告警后照常
-/// 起核、让 root / SYSTEM 执行一份来历不明的内核」。
-pub(super) fn protected_core_verdict(
-    outcome: Result<&ProtectedCoreReconcileOutcome, &str>,
-) -> ProtectedCoreVerdict {
-    match outcome {
-        Ok(
-            ProtectedCoreReconcileOutcome::Cached
-            | ProtectedCoreReconcileOutcome::Verified
-            | ProtectedCoreReconcileOutcome::Promoted(_),
-        ) => ProtectedCoreVerdict::Confirmed,
-        Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { .. }) => {
-            ProtectedCoreVerdict::Unconfirmed(
-                "已安装的提权助手不接受本应用的配套内核（不支持装核命令）".to_owned(),
-            )
-        }
-        Err(error) => ProtectedCoreVerdict::Unconfirmed((*error).to_owned()),
-    }
 }
 
 /// [`code::HELPER_CORE_MISMATCH`] 的诊断文案（zh）；渲染端按稳定码取 i18n 键
@@ -1733,7 +1641,15 @@ impl ProxyRuntime {
             let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let binary = {
-                let binary = binary_res?;
+                let binary = binary_res.map_err(|error| {
+                    let error_code = if error.starts_with("CORE_BUNDLE_MISMATCH:") {
+                        code::CORE_BUNDLE_MISMATCH
+                    } else {
+                        code::STARTUP_FAILED
+                    };
+                    self.set_error(&error, error_code);
+                    StartError::coded(error, error_code)
+                })?;
                 // 应用直起时执行的就是安装包里的这个文件，没有任何一步会再给它补可执行位。
                 // 经提权助手起核时执行的是助手目录里的副本，这个文件的权限位不决定成败，故不拦。
                 if !via_helper {
@@ -2696,20 +2612,38 @@ impl ProxyRuntime {
                 return Ok(None);
             }
         }
-        // **受保护核对账**：helper 只会 exec 它安装期锁定的那个路径，故必须先把现役核（随包核）的
-        // **内容**推进去 —— 应用升级后受保护目录里还是上一版的内核。幂等——hash 相同即零动作、零 IPC。
-        // 放在置 `core_via_helper` 标记与 IPC 之前：此刻还没有受管核，失败也不产生孤儿。
-        //
-        // **配套闸**：对账给不出「逐字节一致」就到此为止，不发起核请求。
+        // Content is installed only by the administrator transaction. Runtime
+        // status must attest the compiled id before any pinned birth request.
         let helper = Arc::clone(&self.helper);
-        if let Err(why) = tokio::task::spawn_blocking(move || helper.require_selected_core())
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Err(StartError::coded(
-                helper_core_mismatch_message(&why),
-                code::HELPER_CORE_MISMATCH,
-            ));
+        #[cfg(test)]
+        let fixture = self
+            .selected_core_ready_fixture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(not(test))]
+        let fixture: Option<Result<(), String>> = None;
+        let selected_ready = match fixture {
+            Some(result) => result,
+            None => tokio::task::spawn_blocking(move || helper.require_selected_core())
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        if let Err(why) = selected_ready {
+            // Prefixes are emitted by our selected-id status adapter, never by
+            // parsing a core's version output or arbitrary native diagnostics.
+            let error_code = if why.starts_with("HELPER_CORE_ABSENT:") {
+                code::HELPER_CORE_ABSENT
+            } else if why.starts_with("HELPER_CORE_INVALID:") {
+                code::HELPER_CORE_INVALID
+            } else if why.starts_with("CORE_BUNDLE_MISMATCH:") {
+                code::CORE_BUNDLE_MISMATCH
+            } else {
+                code::HELPER_CORE_MISMATCH
+            };
+            let message = helper_core_mismatch_message(&why);
+            self.set_error(&message, error_code);
+            return Err(StartError::coded(message, error_code));
         }
         // The lease can reject before any helper operation is queued.
         let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
@@ -2822,213 +2756,6 @@ impl ProxyRuntime {
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
         Ok(Some(pid))
-    }
-
-    /// **受保护核对账**：把现役核推进 helper 锁定的受保护核目录（幂等；内容相同则零动作）。
-    ///
-    /// # 为什么在**每次**经 helper 起核前做
-    ///
-    /// 受保护核与现役核（随包核）有三条独立的漂移路径：
-    ///  1. **应用升级**：安装包带来新内核，受保护目录里还是上一版；
-    ///  2. helper 装得比核晚（安装脚本的播种被 `if [ ! -x "$COREDIR/sing-box" ]` 守着，**已存在就不覆盖**，
-    ///     故重装 helper 也修不好已漂移的受保护核）；
-    ///  3. 用户换机器/迁移配置目录。
-    ///
-    /// 起核前对账把这三条一次性收口，且天然覆盖「helper 早就在跑」这个常态（不需要重启 helper：
-    /// 路径不变、内容变新，helper 每次 `start` 现 spawn）。
-    ///
-    /// # 失败处置：确认不了配套即拒绝起核
-    ///
-    /// 提权助手以 root / SYSTEM 执行受保护目录里的那份内核，而那份内核必须就是本应用随包的
-    /// 一份。本方法是唯一能在**起核之前**回答这个问题的地方：它手里有两侧文件的内容哈希
-    /// （[`protected_core_verdict`] 列了哪些结果算确认）。给不出「逐字节一致」时返回
-    /// [`ProtectedCoreVerdict::Unconfirmed`]，调用方据此落 [`code::HELPER_CORE_MISMATCH`]、不发
-    /// 起核请求。此前这里只告警、照常起核，于是受保护目录里留着旧版本推入的内核时，对账失败或
-    /// 助手不认装核命令都会让它被原样执行。
-    ///
-    /// 起核后的 [`attest_running_core_binary`](Self::attest_running_core_binary) 是第二道：它问的
-    /// 是另一件事（助手**实际**执行的是哪个文件、那个文件自报什么版本），本方法通过不代表它不必
-    /// 跑 —— 助手真正锁定的路径与应用以为的那个对不上时，只有它看得见。
-    ///
-    /// # Errors
-    ///
-    /// 对账尚未开始就被 Child custody 拒绝：与内核配不配套无关，按普通启动失败上报。
-    async fn reconcile_protected_core(
-        &self,
-        active_core: &Path,
-    ) -> Result<ProtectedCoreVerdict, String> {
-        use crate::runtime::core_promote as promote;
-
-        #[cfg(test)]
-        if let Some(verdict) = self
-            .protected_core_verdict_fixture
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            return Ok(verdict);
-        }
-        if !promote::platform_has_protected_core(self.helper.platform()) {
-            // 当前三平台恒假不成立；留着是给「新增平台没有受保护目录」一条早退：那里没有第二份
-            // 内核，也就没有配不配套的问题。
-            return Ok(ProtectedCoreVerdict::Confirmed);
-        }
-        let Some(src_dir) = active_core.parent().map(Path::to_path_buf) else {
-            return Ok(ProtectedCoreVerdict::Unconfirmed(format!(
-                "现役核路径无父目录，无法对账：{}",
-                active_core.display()
-            )));
-        };
-        let core_dir = self.helper.protected_core_dir_path();
-        let dest = promote::protected_core_path_in(&core_dir, std::env::consts::OS);
-        let protected_payload_dir = core_dir.clone();
-        let staged_dir = self.config.join(promote::CORE_PROMOTE_DIR_NAME);
-        let helper = Arc::clone(&self.helper);
-        let active_core = active_core.to_path_buf();
-        // 与上面的 `dest` 同口径：文件名按**宿主** OS 取。
-        let platform = polaris_helper_proto::Platform::current();
-        let cache = Arc::clone(&self.protected_core_cache);
-        let started = std::time::Instant::now();
-
-        // install_core can replace the executable selected by a later helper
-        // start. Register before queuing the blocking task, including a task
-        // whose async caller is cancelled before the IPC returns.
-        if let Err(error) = self.register_helper_backend() {
-            return Err(format!("受保护核对账被 Child custody 拒绝：{error}"));
-        }
-
-        // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
-        let blocking_lease = self.config.retain_active_legacy_start_lease();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let _blocking_lease = blocking_lease;
-            // 能力缓存：这个 helper 构建已经回过 `ERR unknown` 就不必再走整条重路。放在**最前**
-            // ——放在 stage 之后等于白省，两个 80MB 的 sha256 才是这条腿的主要开销。
-            // 探测本身是一次微秒级 ping；探不到（Unreachable）判不命中，宁可白跑一轮。
-            let cached_unsupported = helper.install_core_unsupported_note();
-            // `&&` 的短路是**有意的**：没记过「不支持」时这一路必然不命中，为它去 ping 等于给
-            // mac/linux 的稳态热路径平白加一次 IPC（那两个平台永远不会走到记号那一步）。
-            if cached_unsupported.is_some()
-                && install_core_unsupported_cache_hit(
-                    cached_unsupported.as_ref(),
-                    &helper.helper_build_probe(),
-                )
-            {
-                return Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported {
-                    from_cache: true,
-                });
-            }
-            // 首次完整对账通过后，同一会话内只做廉价 metadata 对账。两侧必须同时可观测且与缓存
-            // 完全一致才命中；任一读取失败/变化都清缓存并回到 SHA256，不把“观测不到”当“没变化”。
-            let active_before = promote::payload_stamp(&src_dir, platform)?;
-            let protected_before = promote::payload_stamp(&protected_payload_dir, platform).ok();
-            let cache_hit = cache.lock().ok().is_some_and(|cached| {
-                protected_core_cache_hit(cached.as_ref(), &active_before, protected_before.as_ref())
-            });
-            if cache_hit {
-                return Ok(ProtectedCoreReconcileOutcome::Cached);
-            }
-            if let Ok(mut cached) = cache.lock() {
-                *cached = None;
-            }
-
-            let src_hash = promote::sha256_file(&active_core)?;
-            // 受保护核读不到（不存在 / 无权限）→ None ⇒ 判「要推」。**不吞成"已最新"**。
-            let dest_hash = promote::sha256_file(&dest).ok();
-            // 核同版但 Cronet 缺失/漂移也必须推：Linux helper 真正执行的是 root 受保护目录，
-            // 只比 sing-box hash 会让旧安装永久缺 libcronet.so，Naive/H3 继续报依赖缺失。
-            let sidecars_match =
-                promote::sidecar_payload_matches(&src_dir, &protected_payload_dir, platform);
-            if promote::decide_promote(&src_hash, dest_hash.as_deref(), sidecars_match)
-                == promote::PromoteDecision::UpToDate
-            {
-                // 只在完整 hash 前后两侧身份均稳定时记缓存。若校验过程中刚好发生换核，当前轮仍沿用
-                // 既有 hash 结论，但下一次连接必须重验，绝不能把竞态后的 metadata 误记成已验证。
-                let active_after = promote::payload_stamp(&src_dir, platform)?;
-                let protected_after = promote::payload_stamp(&protected_payload_dir, platform)?;
-                if active_before == active_after
-                    && protected_before.as_ref() == Some(&protected_after)
-                {
-                    if let Ok(mut cached) = cache.lock() {
-                        *cached = Some(ProtectedCoreCacheRecord {
-                            active: active_after,
-                            protected: protected_after,
-                        });
-                    }
-                }
-                return Ok(ProtectedCoreReconcileOutcome::Verified);
-            }
-            let names = promote::promote_names(&promote::list_file_names(&src_dir), platform);
-            if names.is_empty() {
-                return Err(format!("现役核目录没有可提升的文件：{}", src_dir.display()));
-            }
-            let install_src = promote::stage_promote_dir(&src_dir, &staged_dir, &names)?;
-            // 🔴 身份必须在**发 install-core 之前**探。事后再探会把「回 ERR unknown 的那个
-            // helper」与「此刻在管道那头的 helper」混为一谈：UAC 重装是秒级操作，两者之间完全
-            // 可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒ 本会话内永久跳过对账，而新
-            // helper 其实支持。反过来（探完才换代）只会让记号挂在旧身份上 ⇒ 下次探到新身份即
-            // 失效、重试 —— 方向是安全的。成本与 install-core 本身同量级下可忽略（一次 ping）。
-            let build_before = helper.helper_build_probe();
-            let r = helper.install_core(&install_src, &src_hash);
-            // 暂存目录用完即清（它是现役核的一份完整副本：留着白占 80MB，
-            // 且用户目录里躺一个影子核容易被误读为"又一份核"）。
-            let _ = std::fs::remove_dir_all(&staged_dir);
-            // 提升成功也不立即把 metadata 当作“完整对账通过”：helper 对核心做了 hash 校验，但 sidecar
-            // 复制没有独立摘要。下一次连接完整验一次后再进入热路径，避免扩大信任假设。
-            match r {
-                Ok(()) => Ok(ProtectedCoreReconcileOutcome::Promoted(src_hash)),
-                // 能力缺失才记号；`Failed` 一律不记——那可能是磁盘满/瞬态 IPC，下次就好了，
-                // 记下来会把一次偶发失败变成整个会话都不再尝试。
-                // 用的是 `build_before`（发 install-core **之前**探到的身份），理由见那行注释；
-                // 「探不到就不记」由 `note_install_core_unsupported` 统一持有。
-                Err(InstallCoreError::Unsupported) => {
-                    helper.note_install_core_unsupported(&build_before);
-                    Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache: false })
-                }
-                Err(e) => Err(e.to_string()),
-            }
-        })
-        .await;
-
-        let elapsed_ms = started.elapsed().as_millis();
-        let join_error = outcome.as_ref().err().map(ToString::to_string);
-        let verdict = protected_core_verdict(match &outcome {
-            Ok(Ok(reconciled)) => Ok(reconciled),
-            Ok(Err(error)) => Err(error.as_str()),
-            Err(_) => Err(join_error.as_deref().unwrap_or_default()),
-        });
-        match outcome {
-            Ok(Ok(ProtectedCoreReconcileOutcome::Cached)) => {
-                log::info!("受保护核元数据缓存命中 → 跳过重复 SHA256（{elapsed_ms}ms）")
-            }
-            Ok(Ok(ProtectedCoreReconcileOutcome::Verified)) => {
-                log::info!("受保护核已与现役核一致（完整校验，{elapsed_ms}ms）→ 跳过提升")
-            }
-            Ok(Ok(ProtectedCoreReconcileOutcome::Promoted(h))) => log::info!(
-                "受保护核已提升到现役核（sha256={}…，{elapsed_ms}ms）：{}",
-                &h[..h.len().min(12)],
-                core_dir.display()
-            ),
-            // 「没执行」必须自曝：命中与首次撞上分两句，否则「能力探测根本没跑」与「跑了且命中」
-            // 在日志里长得一样。
-            Ok(Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache })) => {
-                if from_cache {
-                    log::warn!(
-                        "已装 helper 不支持 install-core（能力缓存命中，{elapsed_ms}ms）→ 跳过受保护核对账；\
-                         它手里的内核换不成本应用配套的，拒绝经它起核；helper 升级后自动重试"
-                    );
-                } else {
-                    log::warn!(
-                        "已装 helper 不支持 install-core（ERR unknown，{elapsed_ms}ms）→ 记下能力缺失，\
-                         本会话内不再重复推送；它手里的内核换不成本应用配套的，拒绝经它起核"
-                    );
-                }
-            }
-            Ok(Err(e)) => log::warn!("受保护核对账失败（{elapsed_ms}ms），拒绝经 helper 起核：{e}"),
-            Err(e) => {
-                log::warn!("受保护核对账任务 join 失败（{elapsed_ms}ms），拒绝经 helper 起核：{e}")
-            }
-        }
-        Ok(verdict)
     }
 
     /// **规则资源缺失** → 用户可见信号（`RULE_RESOURCES_MISSING`）。

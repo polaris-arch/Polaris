@@ -967,12 +967,12 @@ impl ProxyRuntime {
     /// 路径相同 ⇒ 同一文件，直接通过，**零 spawn**（app 直起腿的稳态走这里）。
     /// 路径不同才各跑一次 `version`（TUN 提权腿的稳态：实跑受保护核副本，版本应相同）。
     /// 「读不出版本」判**告警**而非通过 —— 见 [`CoreBinaryAttestation::VersionUnreadable`]。
-    /// 「读不到实跑 exe」判 [`Unobservable`](crate::runtime::core_promote::CoreBinaryAttestation::Unobservable)：只落 warn，
+    /// 「读不到实跑 exe」判 [`Unobservable`](crate::runtime::core_attest::CoreBinaryAttestation::Unobservable)：只落 warn，
     /// **绝不写成「自证通过」**（没观测到 ≠ 观测到没问题）。
     ///
     /// 版本首行只作运行期诊断，经助手起核也不因版本字符串停核；清单身份与内容校验另守起核准入。
     ///
-    /// [`CoreBinaryAttestation::VersionUnreadable`]: crate::runtime::core_promote::CoreBinaryAttestation::VersionUnreadable
+    /// [`CoreBinaryAttestation::VersionUnreadable`]: crate::runtime::core_attest::CoreBinaryAttestation::VersionUnreadable
     pub(super) fn spawn_running_core_binary_attestation(
         self: &Arc<Self>,
         pid: u32,
@@ -992,7 +992,7 @@ impl ProxyRuntime {
     }
 
     async fn attest_running_core_binary(self: &Arc<Self>, pid: u32, expected: &Path, my_gen: u64) {
-        use crate::runtime::core_promote::attest_core_binary;
+        use crate::runtime::core_attest::attest_core_binary;
 
         let expected = expected.to_path_buf();
         let via_helper = self.core_via_helper.load(Ordering::SeqCst);
@@ -1000,6 +1000,12 @@ impl ProxyRuntime {
         // 恒判「未能进行」。helper 在权限边界另一侧、且持着受管核的句柄，它 status 回传的 `image=`
         // 就是同一个事实。只在**经 helper 起核**时取这条腿：直起腿本地就读得到，不必多一次 IPC。
         let helper = via_helper.then(|| Arc::clone(&self.helper));
+        let selected_version = via_helper.then(|| {
+            crate::runtime::core_identity::current_platform()
+                .and_then(crate::runtime::core_identity::selected_manifest)
+                .map(|manifest| format!("sing-box version {}", manifest.version))
+                .unwrap_or_default()
+        });
         // 观测腿全是阻塞 syscall / 子进程 / 同步 IPC → spawn_blocking。
         let attestation = tokio::task::spawn_blocking(move || {
             let running = running_exe_path(pid)
@@ -1007,7 +1013,9 @@ impl ProxyRuntime {
             // 路径相同就不必花两次 spawn 去问版本（同一文件，版本必同）。
             let (ev, rv) = match running.as_deref() {
                 Some(r) if r != expected.as_path() => (
-                    core_version_first_line(&expected),
+                    selected_version
+                        .clone()
+                        .unwrap_or_else(|| core_version_first_line(&expected)),
                     core_version_first_line(r),
                 ),
                 _ => (String::new(), String::new()),
@@ -1610,9 +1618,9 @@ pub(super) enum AttestationDisposition {
 /// 安装设计稿末尾裁定第 6 条：版本首行与清单的一致性由发布门保证，运行期只作诊断。
 /// 它不能替代受保护内容校验或清单身份比对，也不能单凭字符串差异中止正在运行的代理。
 pub(super) fn attestation_disposition(
-    attestation: &crate::runtime::core_promote::CoreBinaryAttestation,
+    attestation: &crate::runtime::core_attest::CoreBinaryAttestation,
 ) -> AttestationDisposition {
-    use crate::runtime::core_promote::CoreBinaryAttestation as Attestation;
+    use crate::runtime::core_attest::CoreBinaryAttestation as Attestation;
     match attestation {
         _ if attestation.is_alarm() => AttestationDisposition::Alarm,
         Attestation::Unobservable => AttestationDisposition::Unobserved,
@@ -1782,7 +1790,7 @@ fn running_exe_path_impl(_pid: u32) -> Option<PathBuf> {
 ///
 /// 与 `UpdaterRuntime::read_core_version_line` 同一纪律：**探测失败绝不回落随包基线** ——
 /// 那会把「读不到」伪装成「就是基线」，正是自证最不能犯的错。此处更严：空串在
-/// [`attest_core_binary`](crate::runtime::core_promote::attest_core_binary) 里被判**告警**而非通过。
+/// [`attest_core_binary`](crate::runtime::core_attest::attest_core_binary) 里被判**告警**而非通过。
 fn core_version_first_line(bin: &Path) -> String {
     match no_console_window(std::process::Command::new(bin).arg("version")).output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)

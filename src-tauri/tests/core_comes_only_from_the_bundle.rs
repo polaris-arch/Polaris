@@ -561,22 +561,10 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("logging.rs", "\"sing-box\"", 2, "日志来源名，不是路径"),
     (
-        "runtime/core_promote.rs",
-        "core_filename_for(",
-        1,
-        "受保护目录里的核文件名（递送目标）",
-    ),
-    (
         "runtime/proxy/process_supervision.rs",
         "core_filename(",
         1,
         "孤儿核清扫按文件名认进程",
-    ),
-    (
-        "runtime/core_promote.rs",
-        "core_filename(",
-        2,
-        "随包解析所得目录的 payload 身份及 sidecar 比对排除主核，不新增路径来源",
     ),
 ];
 

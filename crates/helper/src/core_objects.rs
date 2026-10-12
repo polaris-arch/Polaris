@@ -205,6 +205,9 @@ pub struct PayloadDir(File);
 
 #[cfg(windows)]
 impl PayloadDir {
+    pub(crate) fn security(&self) -> io::Result<crate::platform::windows::coreacl::ObjectSecurity> {
+        crate::platform::windows::winproc::file_security(&self.0)
+    }
     /// Windows 这条腿不判属主（见模块文档），`_owner_uid` 不用。
     pub fn open(path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;

@@ -3,15 +3,14 @@
 //! ## 职责（system-design §D.3 mac 行）
 //!
 //! root LaunchDaemon（plist + `launchctl bootstrap`）+ 0666 unix socket + **token 行协议**
-//! （token 即全部边界，`helper.go:87-90` 威胁模型）+ `route -ifscope` 白名单接口面 + DNS flush
-//! （dscacheutil+killall）+ install-core（mac 专属内核持久化）+ BTM 三级探测（13/14/15 分叉）。
+//! （token 绑定原生 UID 注册；受管 Child 另校验 owner/admin）+ `route -ifscope` 白名单接口面 + DNS flush
+//! （dscacheutil+killall）+ 管理员内容安装+ BTM 三级探测（13/14/15 分叉）。
 //!
 //! ## 共用层（不在本模块 —— 见 crate 顶层）
 //!
 //! - token 行鉴权：[`crate::token`]（与 win 逐字同 → 单一真值。原 `helper-mac/src/token.rs` 是
 //!   thin re-export 壳，单 crate 后转发无意义，已删；调用点直接用 [`crate::token::check_token`]）。
-//! - install-core 核心：[`crate::core_install`]（与 linux 逐字同）。本模块只留 [`install_core::to_response`]
-//!   （wire 适配）+ handler 里的 xattr/codesign hook（真 mac 差异）。
+//! - 管理员内容安装：[`crate::core_cli`] + [`crate::core_store`]，按内容身份保留版本与租约。
 //! - 行协议读写：[`crate::line_io`]（与 linux 共用；win 是裸 HANDLE 整帧读，真差异）。
 //!
 //! ## 本模块布局（真 mac 差异）
@@ -21,8 +20,7 @@
 //! - [`exec`]：[`exec::CommandRunner`] trait + 生产 [`exec::SystemRunner`]（带超时）。
 //! - [`route`]：route-add/del/default-restore argv 构造。
 //! - [`flush_dns`]：DNS 刷新两步逻辑。
-//! - [`install_core`]：公共核心的 mac wire 适配。
-//! - [`freeport`]：端口 LISTEN 持有者定位（mac 机制：`lsof` + `ps` + kill 子进程 —— 真差异）。
+//! - [`freeport`]：端口 LISTEN 持有者定位（mac 机制：`lsof` + `ps` 只读观察 —— 真差异）。
 //! - [`btm`]：BTM 三级探测评估（13/14/15）。
 //! - [`proc_start`]：进程启动时间格式化 + 存活分类（sysctl 部分见下方 mac-gated）。
 //! - [`handler`]：[`handler::dispatch`] 协议分派（核心）。
@@ -53,7 +51,6 @@ pub mod exec;
 pub mod flush_dns;
 pub mod freeport;
 pub mod handler;
-pub mod install_core;
 mod native_birth;
 pub mod proc_start;
 pub mod route;

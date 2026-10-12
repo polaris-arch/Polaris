@@ -1,3 +1,4 @@
+import { proxyErrorText } from '@/domain/proxy-error-text';
 import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
@@ -609,6 +610,12 @@ export function HomeScreen() {
       }
       // 确认不了提权助手里的内核与本应用配套 → 拒绝以 TUN 起核。下一步是重装或升级助手，
       // 同样与服务器配置无关。
+      if (code === ProxyErrorCode.CORE_BUNDLE_MISMATCH ||
+          code === ProxyErrorCode.HELPER_CORE_ABSENT ||
+          code === ProxyErrorCode.HELPER_CORE_INVALID) {
+        toast.error(proxyErrorText({ errorCode: code }, t));
+        return;
+      }
       if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
         toast.error(t('errors.helperCoreMismatch'));
         return;

@@ -368,7 +368,7 @@ fn status_ready_when_proto_above_min_usable() {
 }
 
 #[test]
-fn status_same_proto_without_build_identity_is_ready_but_upgradeable() {
+fn same_protocol_without_build_identity_does_not_force_a_helper_replacement() {
     // .207 现场旧 helper：protocol v1 与随包 helper 相同，但 pong 没 build 字段。它仍可用，
     // 不能误报 needsRepair；同时必须进入既有五语种升级流，否则部署漂移会永久滞留。
     let paths = InstallPaths::mac();
@@ -393,13 +393,16 @@ fn status_same_proto_without_build_identity_is_ready_but_upgradeable() {
         "TOK",
     ));
     assert!(status.ready, "同 proto 旧 helper 仍可用");
-    assert!(status.upgradeable, "缺 build identity 必须识别为旧 helper");
+    assert!(
+        !status.upgradeable,
+        "build identity is diagnostic, not a version criterion"
+    );
     assert!(!status.needs_repair, "升级态不是损坏态");
     assert_eq!(status.build_id, None);
 }
 
 #[test]
-fn status_same_proto_with_different_build_identity_is_upgradeable() {
+fn same_protocol_with_different_build_identity_does_not_force_a_helper_replacement() {
     let paths = InstallPaths::mac();
     let mut sysops = MockSysOps::default();
     sysops.exists_paths.insert(paths.binary.clone());
@@ -422,7 +425,7 @@ fn status_same_proto_with_different_build_identity_is_upgradeable() {
         "TOK",
     ));
     assert!(status.ready);
-    assert!(status.upgradeable);
+    assert!(!status.upgradeable);
     assert_eq!(status.build_id.as_deref(), Some("older-package"));
     assert!(!status.needs_repair);
 }

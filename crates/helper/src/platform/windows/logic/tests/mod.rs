@@ -530,19 +530,35 @@ fn parse_request_freeport_bad_port_returns_none() {
 
 #[test]
 fn parse_request_start_full() {
-    let r = parse_request("start", &["/c/cfg.json", "/l/log.txt", "1", "4242"]).unwrap();
-    let Request::Start(p) = r else { panic!() };
-    assert_eq!(p.cfg, "/c/cfg.json");
-    assert_eq!(p.log, "/l/log.txt");
-    assert!(p.fwd);
-    assert_eq!(p.parent_pid, Some(4242));
+    let id = "a".repeat(64);
+    let r = parse_request(
+        "start-native-pinned-birth-safe",
+        &[&id, "/c/cfg.json", "/l/log.txt", "1", "4242"],
+    )
+    .unwrap();
+    let Request::NativeStartPinned(p) = r else {
+        panic!()
+    };
+    assert_eq!(p.id.as_str(), id);
+    assert_eq!(p.common.cfg, "/c/cfg.json");
+    assert_eq!(p.common.log, "/l/log.txt");
+    assert!(p.common.fwd);
+    assert_eq!(p.common.parent_pid, Some(4242));
 }
 
 #[test]
 fn parse_request_start_without_ppid() {
-    let r = parse_request("start", &["/c/cfg.json", "", "0"]).unwrap();
-    let Request::Start(p) = r else { panic!() };
-    assert_eq!(p.parent_pid, None);
+    let id = "a".repeat(64);
+    let r = parse_request(
+        "start-native-pinned-birth-safe",
+        &[&id, "/c/cfg.json", "", "0"],
+    )
+    .unwrap();
+    let Request::NativeStartPinned(p) = r else {
+        panic!()
+    };
+    assert_eq!(p.id.as_str(), id);
+    assert_eq!(p.common.parent_pid, None);
 }
 
 #[test]
@@ -588,31 +604,16 @@ fn parse_request_flush_dns() {
 ///
 /// 变异：删掉 `INSTALL_CORE` 那一格 → 本条转红（= 批三真机缺陷的形态：分派有、解码无 ⇒ 0 字节 / 233）。
 #[test]
-fn parse_request_install_core() {
-    let hash = "ab".repeat(32);
-    assert_eq!(
-        parse_request(
-            "install-core",
-            &[r"C:\Users\bob\stage core", &format!(" {hash} ")]
-        ),
-        Some(Request::InstallCore(
-            polaris_helper_proto::InstallCoreParams {
-                src_dir: r"C:\Users\bob\stage core".to_owned(),
-                want_hash: hash,
-            }
-        )),
-        "src 原样（路径可含空格）、hash trim（与 mac decode_request 同形）"
-    );
-    // 缺行不在解码层拒：解成空串，交给 install_core_files 的 BadArgs 判（不在两处各造一份判据）。
-    assert_eq!(
-        parse_request("install-core", &[][..]),
-        Some(Request::InstallCore(
-            polaris_helper_proto::InstallCoreParams {
-                src_dir: String::new(),
-                want_hash: String::new(),
-            }
-        ))
-    );
+fn parse_request_retired_mutators_are_unknown() {
+    for (command, args) in [
+        ("install-core", vec!["/retired/source", "not-a-pin"]),
+        ("start", vec!["cfg", "", "0"]),
+        ("start-native-birth-safe", vec!["cfg", "", "0"]),
+        ("start-reap-safe", vec!["binary", "cfg", "", "0"]),
+        ("install-core", Vec::new()),
+    ] {
+        assert_eq!(parse_request(command, &args), None);
+    }
 }
 
 /// 切行：行1 token、行2 命令、其余参数；`\r\n` 与 `\n` 同剥；凑不齐两行 ⇒ None。

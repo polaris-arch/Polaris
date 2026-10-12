@@ -33,12 +33,12 @@ fn core_filename_is_platform_specific() {
 #[test]
 fn win_core_binary_names_agree_across_crates() {
     assert_eq!(
-        polaris_helper::core_install::SINGBOX_BIN_NAME_WIN,
+        polaris_helper_proto::core_payload::WIN_CORE_FILENAME,
         core_filename_for("windows"),
         "helper 侧 Windows 核名与 app 侧真值源分叉"
     );
     assert_eq!(
-        polaris_helper::core_install::SINGBOX_BIN_NAME,
+        polaris_helper_proto::core_payload::UNIX_CORE_FILENAME,
         core_filename_for("linux"),
         "helper 侧 unix 核名与 app 侧真值源分叉"
     );
@@ -62,7 +62,7 @@ fn win_core_binary_names_agree_across_crates() {
     // helper 自检这份不会 ⇒ 它去问一个不存在的路径 ⇒ 落 `unreadable` ⇒ 只 warn、起核照常 ⇒
     // 真正躺在 exec 目录里的那个 DLL（spec §2.4：exe 目录是 DLL 搜索第 7 位，先于 CWD）从此无人检查。
     assert_eq!(
-        polaris_helper::core_install::CRONET_DLL_NAME_WIN,
+        polaris_helper_proto::core_payload::WIN_SIDECAR_FILENAME,
         core_sidecar_filename_for("windows").expect("windows 必有 cronet sidecar"),
         "helper ACL 自检取材面的 cronet 名与 app 侧真值源分叉"
     );
@@ -149,7 +149,7 @@ fn legacy_cleanup_removes_exactly_the_legacy_entries() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("sing-box"), b"not ours").unwrap();
 
-    let mut removed = remove_legacy_core_state(&root);
+    let mut removed = idle_legacy_cleanup(&root);
     removed.sort();
     assert_eq!(
         removed,
@@ -174,7 +174,7 @@ fn legacy_cleanup_removes_exactly_the_legacy_entries() {
     );
 
     // 幂等：第二次什么都不删，也不报错。
-    assert!(remove_legacy_core_state(&root).is_empty());
+    assert!(idle_legacy_cleanup(&root).is_empty());
 }
 
 /// 反向对照：没有任何残留的配置根，清理必须零动作（否则上一条的「删掉三项」可能只是
@@ -189,7 +189,7 @@ fn legacy_cleanup_is_a_noop_on_a_clean_root() {
     std::fs::create_dir_all(root.join("core_update.keep")).unwrap();
     std::fs::write(root.join("core-staged.txt"), b"x").unwrap();
 
-    assert!(remove_legacy_core_state(&root).is_empty());
+    assert!(idle_legacy_cleanup(&root).is_empty());
     assert_eq!(
         names_in(&root),
         [
@@ -200,7 +200,7 @@ fn legacy_cleanup_is_a_noop_on_a_clean_root() {
         ]
     );
     // 配置根本身不存在同样是零动作。
-    assert!(remove_legacy_core_state(&tmp.path().join("missing")).is_empty());
+    assert!(idle_legacy_cleanup(&tmp.path().join("missing")).is_empty());
 }
 
 #[cfg(unix)]
@@ -229,7 +229,7 @@ fn legacy_cleanup_unlinks_symlinks_without_touching_their_targets() {
     symlink(&victim_file, staged.join("link-to-file")).unwrap();
     symlink(tmp.path().join("nowhere"), staged.join("dangling")).unwrap();
 
-    let removed = remove_legacy_core_state(&root);
+    let removed = idle_legacy_cleanup(&root);
     assert_eq!(removed.len(), 3, "三个顶层条目都应被删掉：{removed:?}");
     assert!(names_in(&root).is_empty());
 
@@ -255,7 +255,7 @@ fn legacy_cleanup_through_a_symlinked_root_stays_inside_it() {
     let link = tmp.path().join("polaris");
     symlink(&real, &link).unwrap();
 
-    let removed = remove_legacy_core_state(&link);
+    let removed = idle_legacy_cleanup(&link);
     assert_eq!(removed.len(), 2);
     assert_eq!(
         names_in(&real),
@@ -300,4 +300,24 @@ fn legacy_cleanup_list_is_pinned() {
         LEGACY_CORE_STATE_NAMES,
         ["core_update", "core-staged", "core-promote"]
     );
+}
+
+fn idle_legacy_cleanup(path: &Path) -> Vec<PathBuf> {
+    remove_legacy_core_state_with(path, |_| polaris_helper::legacy_use::LegacyUse::Idle)
+}
+#[test]
+fn busy_or_unobservable_legacy_payloads_are_kept_for_lazy_readers() {
+    for state in [
+        polaris_helper::legacy_use::LegacyUse::InUse,
+        polaris_helper::legacy_use::LegacyUse::Unknown,
+    ] {
+        let tmp = tmpdir();
+        let root = tmp.path().join("polaris");
+        std::fs::create_dir_all(&root).unwrap();
+        seed_legacy_layout(&root);
+        let before = names_in(&root);
+        assert!(remove_legacy_core_state_with(&root, |_| state).is_empty());
+        assert_eq!(names_in(&root), before);
+        assert!(root.join("core_update/sing-box").exists());
+    }
 }

@@ -80,6 +80,14 @@ pub fn policy(binary: &Path, metadata: &Path) -> io::Result<&'static str> {
     if record.sha256 != actual {
         return Err(io::Error::other("installed helper receipt differs"));
     }
+    if record.version == env!("CARGO_PKG_VERSION")
+        && record.protocol == polaris_helper_proto::proto_version::CURRENT
+        && actual == hash(&std::env::current_exe()?)? {
+        // Adding another immutable core does not require replacing identical
+        // helper bytes or interrupting its active owner. Build identity is not
+        // a version/upgrade criterion.
+        return Ok("retain");
+    }
     if may_replace(
         &record.version,
         record.protocol,

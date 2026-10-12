@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, openSync, closeSync, readSync, fstatSync, constants, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import { lstatSync, openSync, closeSync, readSync, readFileSync, fstatSync, constants, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -7,6 +7,28 @@ const hex = (value) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)
 function demand(value, reason) { if (!value) throw new Error(`Core identity: ${reason}`); }
 function u64(value) { demand(Number.isSafeInteger(value) && value >= 0, 'invalid integer'); const bytes = Buffer.alloc(8); bytes.writeBigUInt64BE(BigInt(value)); return bytes; }
 function field(value) { const bytes = Buffer.from(value, 'utf8'); return Buffer.concat([u64(bytes.length), bytes]); }
+
+/** Read-only final packaging check; the source manifest is the compiled input. */
+export function verifySelectedCoreManifest(directory, sourceDirectory, platform) {
+  const finalPath = join(directory, 'core-manifest.json'), sourcePath = join(sourceDirectory, 'core-manifest.json');
+  for (const path of [finalPath, sourcePath]) {
+    const stat = lstatSync(path); demand(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 64 * 1024, 'invalid installation manifest object');
+  }
+  const source = readFileSync(sourcePath), final = readFileSync(finalPath);
+  demand(source.equals(final), 'final manifest differs from compiled installation input');
+  const value = JSON.parse(source);
+  demand(value?.schema === 'polaris-core-manifest-v1' && value.core?.platform === platform
+    && hex(value.id) && value.id === hash(canonicalCoreIdentity(value.core)), 'installation identity differs');
+  const helper = platform === 'win' ? 'polaris-helper.exe' : 'polaris-helper';
+  demand(hex(value.core.helperSha256), 'actual helper pin required');
+  demand(actualCoreFile(join(directory, helper)).sha256 === value.core.helperSha256, 'final helper bytes differ from compiled pin');
+  for (const file of value.core.files) actualCoreFile(join(directory, file.name), file);
+  if (platform === 'win') {
+    demand(hex(value.core.cleanerSha256), 'actual cleaner pin required');
+    demand(actualCoreFile(join(directory, 'polaris-cleaner.exe')).sha256 === value.core.cleanerSha256, 'final cleaner bytes differ from compiled pin');
+  } else demand(value.core.cleanerSha256 === null || value.core.cleanerSha256 === undefined, 'unexpected cleaner');
+  return value;
+}
 
 export function canonicalCoreIdentity(core) {
   const names = { linux: ['sing-box', 'libcronet.so'], win: ['sing-box.exe', 'libcronet.dll'],

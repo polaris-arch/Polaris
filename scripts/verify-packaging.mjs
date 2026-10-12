@@ -78,6 +78,7 @@ import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
 import { assetMatches, assetNames } from './release-assets.mjs';
 import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
+import { verifySelectedCoreManifest } from './lib/core-identity.mjs';
 import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -2092,6 +2093,10 @@ function checkPayload(label, root) {
             fail(`${scope.name}: Windows 修复核 SHA-256 与 manifest 不符：${p}`);
           }
         }
+        if (family.what === 'polaris-helper') {
+          try { verifySelectedCoreManifest(dirname(p), srcDir, expected); }
+          catch (error) { fail(`${scope.name}: compiled installation payload differs: ${error.message}`); }
+        }
         const src = join(srcDir, basename(p));
         if (!existsSync(src)) {
           fail(`${scope.name}: 产物里有 ${p}，但源 ${src} 不存在 —— 完整性无从比对（前置缺失判红，不跳过）`);
@@ -2107,7 +2112,7 @@ function checkPayload(label, root) {
           }
           continue; // no size / GNU Build ID exemption for Cronet
         }
-        if (label === 'linux' && family.what === 'sing-box') {
+        if (label === 'linux' && ['sing-box', 'polaris-helper'].includes(family.what)) {
           if (!lstatSync(p).isFile() || !lstatSync(src).isFile()
               || createHash('sha256').update(readFileSync(p)).digest('hex') !== createHash('sha256').update(readFileSync(src)).digest('hex')
               || (lstatSync(p).mode & 0o7777) !== (lstatSync(src).mode & 0o7777)) {

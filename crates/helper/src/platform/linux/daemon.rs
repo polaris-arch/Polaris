@@ -94,6 +94,15 @@ pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> ExitCode {
 
 /// async 主体（socket serve + 信号收割器 + 退出兜底）。
 async fn async_main(cfg: ServerConfig) -> ExitCode {
+    if let Some(root) = &cfg.core_dir {
+        if let Ok(store) =
+            crate::core_store::CoreStore::open(root, crate::core_store::OwnerPolicy::privileged())
+        {
+            if let Err(error) = store.retire_flat_layout() {
+                log::warn!("legacy flat retirement retained: {error}");
+            }
+        }
+    }
     // main.go: MkdirAll 0755 + 删旧 socket + Listen(unix) + Chmod 0666（std 同步 bind）。
     let std_listener = match prepare_socket(&cfg) {
         Ok(l) => l,

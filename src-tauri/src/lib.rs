@@ -776,7 +776,7 @@ pub fn run() {
             // ── 配置根目录注入（供无 AppHandle 的自由函数取用）──
             runtime::core_paths::init_base_dir(config_dir.clone());
             // 旧版本曾把内核放在配置根下的可写目录里（在线更新 / 手动上传 / 回滚备份）。应用现在
-            // 只从安装包解析内核，那些目录不再被读取；启动即清，免得来源不明的内核继续躺在用户盘上。
+            // 只从安装包解析内核；原生观察确认旧目录闲置才清，活跃/不可观察时保留供后续重试。
             #[cfg(desktop)]
             runtime::core_paths::remove_legacy_core_state(&config_dir);
 

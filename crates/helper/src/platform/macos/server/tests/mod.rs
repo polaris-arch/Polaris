@@ -165,38 +165,53 @@ fn decode_freeport() {
 }
 
 #[test]
-fn decode_start_full() {
-    let mut lines = vec![
-        "/tmp/c.json".to_owned(),
-        "/tmp/l.log".to_owned(),
-        "1".to_owned(),
-        "1234".to_owned(),
-    ]
-    .into_iter();
-    let r = decode_request("start", &mut lines).unwrap();
-    match r {
-        Request::Start(p) => {
-            assert_eq!(p.cfg, "/tmp/c.json");
-            assert_eq!(p.log, "/tmp/l.log");
-            assert!(p.fwd);
-            assert_eq!(p.parent_pid, Some(1234));
-        }
-        other => panic!("{other:?}"),
+fn decoder_rejects_retired_start_and_content_frames() {
+    for command in [
+        "start",
+        "start-native-birth-safe",
+        "install-core",
+        "start-reap-safe",
+        "start-birth-safe",
+    ] {
+        let mut frame = vec!["/caller/input".to_owned(), "a".repeat(64)].into_iter();
+        assert!(matches!(
+            decode_request(command, &mut frame),
+            Err(DecodeError::UnknownCommand(_))
+        ));
     }
 }
-
 #[test]
-fn decode_start_without_ppid() {
-    // helper.go:513: ppid 可选（EOF → 0 → None）
-    let mut lines = vec!["/tmp/c.json".to_owned(), "".to_owned(), "0".to_owned()].into_iter();
-    let r = decode_request("start", &mut lines).unwrap();
-    match r {
-        Request::Start(p) => {
-            assert_eq!(p.parent_pid, None);
-            assert!(!p.fwd);
-        }
-        other => panic!("{other:?}"),
-    }
+fn decoder_admits_only_pinned_native_start_shape() {
+    let id = "a".repeat(64);
+    let mut frame = vec![
+        id.clone(),
+        "/caller/cfg".into(),
+        "/caller/log".into(),
+        "1".into(),
+        "42".into(),
+    ]
+    .into_iter();
+    assert!(matches!(
+        decode_request(
+            polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH,
+            &mut frame
+        ),
+        Ok(Request::NativeStartPinned(_))
+    ));
+    let mut extra = vec![
+        id,
+        "/caller/cfg".into(),
+        "".into(),
+        "0".into(),
+        "42".into(),
+        "extra".into(),
+    ]
+    .into_iter();
+    assert!(decode_request(
+        polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH,
+        &mut extra
+    )
+    .is_err());
 }
 
 #[test]
@@ -221,19 +236,6 @@ fn decode_route_del() {
     let mut lines = vec!["utun3".to_owned(), "::/0".to_owned()].into_iter();
     let r = decode_request("route-del", &mut lines).unwrap();
     assert!(matches!(r, Request::RouteDel(_)));
-}
-
-#[test]
-fn decode_install_core() {
-    let mut lines = vec!["/tmp/staging".to_owned(), "abcd".repeat(16)].into_iter();
-    let r = decode_request("install-core", &mut lines).unwrap();
-    match r {
-        Request::InstallCore(p) => {
-            assert_eq!(p.src_dir, "/tmp/staging");
-            assert_eq!(p.want_hash.len(), 64);
-        }
-        other => panic!("{other:?}"),
-    }
 }
 
 #[test]

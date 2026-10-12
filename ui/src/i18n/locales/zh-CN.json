@@ -47,6 +47,16 @@
       "missingAsset": "应用内置的 helper 文件不可用",
       "notReady": "helper 已安装，但暂未就绪",
       "failed": "helper 操作未能完成"
+    },
+    "selectedCoreVersion": "选定内核版本",
+    "selectedCoreId": "选定内容标识",
+    "selectedCoreProvider": "源码身份",
+    "selectedCoreState": "安装状态",
+    "coreState": {
+      "present": "已核验",
+      "absent": "未安装",
+      "invalid": "核验失败",
+      "unavailable": "不可用"
     }
   },
   "proxy": {
@@ -243,8 +253,20 @@
       "body": "安装包内的内核文件没有可执行权限，本次连接未建立。请重新安装应用"
     },
     "helperCoreMismatch": {
-      "title": "Polaris 未能启动 TUN 模式",
-      "body": "无法确认提权助手里的内核与本应用配套，本次未以 TUN 模式连接。请打开应用到「设置 › Helper」重新安装或升级提权助手后重试"
+      "title": "Polaris 无法启动",
+      "body": "无法核验选定内核的回执，请前往「设置 › Helper」修复或升级助手。"
+    },
+    "coreBundleMismatch": {
+      "title": "Polaris 无法启动",
+      "body": "随包内核与本应用的内容身份不符，请重新安装 Polaris。"
+    },
+    "helperCoreAbsent": {
+      "title": "Polaris 无法启动",
+      "body": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。"
+    },
+    "helperCoreInvalid": {
+      "title": "Polaris 无法启动",
+      "body": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。"
     }
   },
   "connections": {
@@ -1668,13 +1690,16 @@
     "rootOrphanBlocked": "检测到残留的核心进程占用缓存文件，起核已被阻断",
     "coreBinaryMismatch": "当前运行的内核与本应用配套的版本不一致。请重新安装 Helper，并在日志中查看详情",
     "coreNotExecutable": "安装包内的内核文件没有可执行权限，无法启动。请重新安装应用。",
-    "helperCoreMismatch": "无法确认提权助手里的内核与本应用配套，已拒绝以 TUN 模式启动。请到「设置 › Helper」重新安装或升级提权助手后重试。",
+    "helperCoreMismatch": "无法核验选定内核的回执，请前往「设置 › Helper」修复或升级助手。",
     "tunAdapterMissing": "TUN 虚拟网卡未能创建，请检查 wintun 驱动是否被安全软件拦截，或重启后重试",
     "autoSwitchNeedsRestart": "已尝试自动换节点，但本次未能换成：有候选节点需要重启内核才能切换过去。请手动选择其他节点。",
     "tunAddressUnavailable": "TUN 虚拟网卡地址无法分配，可能被残留网卡或其他 VPN 占用。请断开其他 VPN，或重启系统后重试",
     "androidNativeCapacityClosed": "本次运行的生命周期记录已满，请完全关闭并重新启动应用后重试。",
     "vpnPermissionDenied": "VPN 授权尚未完成。请完成或关闭当前授权窗口，再点击连接，并在系统 VPN 连接请求中选择允许。",
-    "systemInterfaceUnsupported": "此节点请求系统网卡，Android VPN 模式不支持。请在节点编辑中关闭系统网卡选项；自定义节点请将 JSON 中的 system 设为 false。"
+    "systemInterfaceUnsupported": "此节点请求系统网卡，Android VPN 模式不支持。请在节点编辑中关闭系统网卡选项；自定义节点请将 JSON 中的 system 设为 false。",
+    "coreBundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。",
+    "helperCoreAbsent": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。",
+    "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。"
   },
   "privacy": {
     "wrongPassword": "解锁密码错误",

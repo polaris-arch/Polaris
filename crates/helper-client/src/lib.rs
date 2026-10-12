@@ -58,7 +58,7 @@ pub use privilege::{
     uac_escalation, Escalation, EscalationOutcome, Executor, PrivilegeMethod, StdExecutor,
 };
 pub use token::{read_token, remove_token, write_token, write_token_content};
-pub use transport::{ConnectionStream, IoAdapter, INSTALL_CORE_TIMEOUT_MS, READ_TIMEOUT};
+pub use transport::{ConnectionStream, IoAdapter, READ_TIMEOUT};
 // MockStream 是测试替身：只在 test / test-utils 下导出，不进生产 API 面。
 #[cfg(any(test, feature = "test-utils"))]
 pub use transport::MockStream;

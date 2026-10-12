@@ -115,7 +115,7 @@ fn install(args: &InstallArgs) -> io::Result<String> {
     let mut raw = Vec::new();
     file.take(64 * 1024 + 1).read_to_end(&mut raw)?;
     let manifest =
-        InstalledCoreManifest::parse(&raw, crate::core_install::sha256_hex).map_err(invalid)?;
+        InstalledCoreManifest::parse(&raw, crate::core_hash::sha256_hex).map_err(invalid)?;
     if manifest.core.platform != current_platform()? {
         return Err(invalid("core platform differs from installer"));
     }

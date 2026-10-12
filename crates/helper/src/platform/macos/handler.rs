@@ -266,6 +266,11 @@ pub fn dispatch_from_peer(
     if peer_uid != Some(0) && !matches!(check_token(token, &stored), TokenCheck::Authed) {
         return Response::Err(ProtoError::new(ErrorCode::Auth));
     }
+    if services.native_custody_active()
+        && matches!(req, Request::RouteAdd(_) | Request::RouteDel(_) | Request::DefaultRestore { .. } | Request::FlushDns | Request::MacProxyTransaction { .. } | Request::MacProxyCompareTransaction { .. } | Request::Cleanup)
+        && !services.native_caller_allowed(peer_uid, None) {
+        return Response::Err(ProtoError::with_detail(ErrorCode::Auth, "slot-owned-by-other-user"));
+    }
 
     // Freeport can signal PID owners, so native custody fences it before any runner call.
     if let Request::FreePort { port } = req {

@@ -36,12 +36,12 @@ pub fn register(
         CallerIdentity::Windows(sid) => {
             #[cfg(windows)]
             {
-                use crate::platform::windows::{ops::ProcOps, winproc::WinProcOps};
-                let sec = WinProcOps::default()
-                    .read_object_security(text)
-                    .map_err(|_| io::Error::other("config owner unavailable"))?;
-                if sec.owner_sid.as_deref() != Some(sid.as_str()) {
-                    return Err(io::Error::other("config owner differs"));
+                let directory = PayloadDir::open(config, None)?;
+                if !crate::platform::windows::coreacl::is_private_user_config(
+                    &directory.security()?,
+                    sid,
+                ) {
+                    return Err(io::Error::other("config owner or isolation differs"));
                 }
             }
             #[cfg(not(windows))]
@@ -162,6 +162,18 @@ fn read_record(
     }
     let objects = PayloadDir::open(&directory, policy.uid)?;
     let (file, bytes) = objects.open_regular(name)?;
+    #[cfg(windows)]
+    for sec in [
+        objects.security()?,
+        crate::platform::windows::winproc::file_security(&file)?,
+    ] {
+        if crate::platform::windows::coreacl::grants_non_privileged_read_execute(&sec) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "user registration is not private",
+            ));
+        }
+    }
     if bytes > maximum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -175,6 +187,10 @@ fn read_record(
 
 fn registration(support: &Path, caller: &CallerIdentity) -> io::Result<(PathBuf, String)> {
     let raw = read_record(support, caller, "registration", 34 * 1024)?;
+    parse_registration(&raw, caller)
+}
+
+fn parse_registration(raw: &str, caller: &CallerIdentity) -> io::Result<(PathBuf, String)> {
     let lines: Vec<_> = raw.split_terminator('\n').collect();
     if !raw.ends_with('\n')
         || lines.len() != 3
@@ -203,8 +219,6 @@ pub fn token(support: &Path, caller: &CallerIdentity) -> io::Result<String> {
 
 pub fn conf_dir(support: &Path, caller: &CallerIdentity) -> io::Result<PathBuf> {
     let (path, _) = registration(support, caller)?;
-    #[cfg(windows)]
-    let raw = path.to_string_lossy();
     match caller {
         CallerIdentity::Unix(uid) => {
             let _ = PayloadDir::open(&path, Some(*uid))?;
@@ -212,19 +226,14 @@ pub fn conf_dir(support: &Path, caller: &CallerIdentity) -> io::Result<PathBuf> 
         CallerIdentity::Windows(sid) => {
             #[cfg(windows)]
             {
-                use crate::platform::windows::{ops::ProcOps, winproc::WinProcOps};
-                let sec = WinProcOps::default()
-                    .read_object_security(&raw)
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "user config owner unavailable",
-                        )
-                    })?;
-                if sec.owner_sid.as_deref() != Some(sid.as_str()) {
+                let directory = PayloadDir::open(&path, None)?;
+                if !crate::platform::windows::coreacl::is_private_user_config(
+                    &directory.security()?,
+                    sid,
+                ) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "user config owner differs",
+                        "user config owner or isolation differs",
                     ));
                 }
             }
@@ -240,3 +249,7 @@ pub fn conf_dir(support: &Path, caller: &CallerIdentity) -> io::Result<PathBuf> 
     }
     Ok(path)
 }
+
+#[cfg(test)]
+#[path = "user_control/tests/mod.rs"]
+mod tests;

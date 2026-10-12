@@ -52,6 +52,8 @@ pub const READ_TIMEOUT_SECS: u64 = polaris_helper_proto::codec::READ_TIMEOUT_SEC
 pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps, SD: SystemdOps> {
     /// 锁定的 root-owned 受管核目录（start 只跑 coreDir/sing-box）。
     pub core_dir: Option<&'a Path>,
+    #[cfg(test)]
+    pub(crate) test_core: Option<Arc<crate::core_store::VerifiedCore>>,
     /// 授权 uid 列表文件。
     pub auth_file: &'a Path,
     /// SO_PEERCRED 凭据提供者。
@@ -676,6 +678,30 @@ fn handle_freeport<P, S, D, SD>(
     let _ = conn.write_line(&resp.to_wire_line());
 }
 
+fn verified_selected<P, S, D, SD>(
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    root: &Path,
+    id: &polaris_helper_proto::core_manifest::CoreId,
+) -> std::io::Result<Arc<crate::core_store::VerifiedCore>>
+where
+    P: PeerCredProvider,
+    S: CoreSpawner,
+    D: FreePortDeps,
+    SD: SystemdOps,
+{
+    #[cfg(test)]
+    if let Some(core) = &deps.test_core {
+        if core.manifest.id != id.as_str() {
+            return Err(std::io::Error::other("fixture selected id differs"));
+        }
+        core.recheck_fixture()?;
+        return Ok(Arc::clone(core));
+    }
+    #[cfg(not(test))]
+    let _ = deps;
+    crate::pinned_core::verify(root, id).map(Arc::new)
+}
+
 /// start（:400-478）：核路径锁 + config 属主校验 + AmbientCaps 拉核。
 #[allow(clippy::too_many_lines)]
 fn handle_start<P, S, D, SD>(
@@ -849,8 +875,8 @@ fn handle_start<P, S, D, SD>(
         return;
     };
     let verified = if let Some(id) = &id {
-        match crate::pinned_core::verify(core_dir, id) {
-            Ok(core) => Some(Arc::new(core)),
+        match verified_selected(deps, core_dir, id) {
+            Ok(core) => Some(core),
             Err(_) => {
                 let _ = conn.write_line("ERR core-invalid");
                 return;

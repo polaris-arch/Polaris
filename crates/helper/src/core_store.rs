@@ -72,6 +72,76 @@ impl std::fmt::Debug for VerifiedCore {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+impl VerifiedCore {
+    pub(crate) fn recheck_fixture(&self) -> io::Result<()> {
+        use std::io::Seek;
+        let mut sidecars = self.sidecars.iter();
+        for expected in &self.manifest.core.files {
+            let file = if expected.name.starts_with("sing-box") {
+                &self.binary
+            } else {
+                sidecars
+                    .next()
+                    .ok_or_else(|| invalid("fixture sidecar absent"))?
+            };
+            let mut file = file.try_clone()?;
+            file.rewind()?;
+            if file.metadata()?.len() != expected.bytes
+                || hash_reader(&mut file, expected.bytes)? != expected.sha256
+            {
+                return Err(invalid("fixture contents changed"));
+            }
+        }
+        Ok(())
+    }
+    /// Virtual native-ops tests still bind their exact bytes/id and retain real
+    /// file objects. This does not install a root store or attest a device.
+    pub(crate) fn fixture(
+        directory: &Path,
+        lease_path: &Path,
+        manifest: InstalledCoreManifest,
+    ) -> io::Result<Self> {
+        manifest
+            .validate(crate::core_hash::sha256_hex)
+            .map_err(invalid)?;
+        #[cfg(unix)]
+        let uid = Some(nix::unistd::Uid::current().as_raw());
+        #[cfg(not(unix))]
+        let uid = None;
+        let objects = PayloadDir::open(directory, uid)?;
+        let mut binary = None;
+        let mut sidecars = Vec::new();
+        for expected in &manifest.core.files {
+            let (mut file, bytes) = objects.open_regular(&expected.name)?;
+            if bytes != expected.bytes || hash_reader(&mut file, bytes)? != expected.sha256 {
+                return Err(invalid("fixture bytes differ"));
+            }
+            if expected.name.starts_with("sing-box") {
+                binary = Some(file);
+            } else {
+                sidecars.push(file);
+            }
+        }
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(lease_path)?;
+        lease
+            .try_lock_shared()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(Self {
+            manifest,
+            binary: binary.ok_or_else(|| invalid("fixture core absent"))?,
+            sidecars,
+            directory: directory.into(),
+            _directory_object: objects,
+            _lease: lease,
+        })
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
     Installed,
@@ -112,6 +182,47 @@ fn seal_dir(path: &Path) -> io::Result<()> {
 }
 
 impl CoreStore {
+    /// Daemon startup only, before accepting any pinned or retired IPC. Preserve
+    /// the entire flat cohort while any native mapping/reader is observed or
+    /// cannot be ruled out. This never reclaims immutable version directories.
+    pub fn retire_flat_layout(&self) -> io::Result<Vec<PathBuf>> {
+        self.retire_flat_layout_with(crate::legacy_use::directory_use)
+    }
+    fn retire_flat_layout_with(
+        &self,
+        observe: impl FnOnce(&Path) -> crate::legacy_use::LegacyUse,
+    ) -> io::Result<Vec<PathBuf>> {
+        let _lock = self.mutation_lock()?;
+        let names = ["sing-box", "sing-box.exe", "libcronet.so", "libcronet.dll"];
+        let mut flat = Vec::new();
+        for name in names {
+            let path = self.root.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                    self.owner.check(&path)?;
+                    let _ = self._root_object.open_regular(name)?;
+                    flat.push(path);
+                }
+                Ok(_) => return Err(invalid("unexpected legacy flat object")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if flat.is_empty() {
+            return Ok(flat);
+        }
+        if observe(&self.root) != crate::legacy_use::LegacyUse::Idle {
+            log::info!("legacy flat core retirement deferred: native use active or unknown");
+            return Ok(Vec::new());
+        }
+        for path in &flat {
+            self.owner.check(path)?;
+            fs::remove_file(path)?;
+        }
+        #[cfg(unix)]
+        File::open(&self.root)?.sync_all()?;
+        Ok(flat)
+    }
     fn lease_file(&self, id: &CoreId) -> io::Result<File> {
         let dir = self.root.join("leases");
         self.owner.check(&dir)?;
@@ -200,7 +311,7 @@ impl CoreStore {
         let mut raw = Vec::new();
         file.take(64 * 1024 + 1).read_to_end(&mut raw)?;
         let manifest =
-            InstalledCoreManifest::parse(&raw, crate::core_install::sha256_hex).map_err(invalid)?;
+            InstalledCoreManifest::parse(&raw, crate::core_hash::sha256_hex).map_err(invalid)?;
         if manifest.id != id.as_str() {
             return Err(invalid("core id mismatch"));
         }
@@ -267,7 +378,7 @@ impl CoreStore {
         let _ = source_sid;
         let _lock = self.mutation_lock()?;
         manifest
-            .validate(crate::core_install::sha256_hex)
+            .validate(crate::core_hash::sha256_hex)
             .map_err(invalid)?;
         let id = CoreId::parse(&manifest.id).map_err(invalid)?;
         let destination = self.root.join("versions").join(id.as_str());

@@ -46,9 +46,8 @@ fn read_timeout_constant_matches_helper_proto() {
 
 #[test]
 fn default_timeouts_match_polaris() {
-    // HelperManager.ts:443 ping 1500ms；:421 install-core 30000ms
+    // Default socket request budget; installation is administrative CLI, not RPC.
     assert_eq!(DEFAULT_REQUEST_TIMEOUT_MS, 1500);
-    assert_eq!(INSTALL_CORE_TIMEOUT_MS, 30_000);
 }
 
 #[test]

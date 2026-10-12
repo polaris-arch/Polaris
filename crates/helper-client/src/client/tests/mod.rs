@@ -306,19 +306,17 @@ fn retry_exhausted_returns_last_error() {
 }
 
 #[test]
-fn install_core_uses_long_timeout() {
-    // install-core 默认超时 30s（HelperManager.ts:421）
-    let mock = MockStream::with_response(b"OK installed\n".to_vec());
-    let (client, _) = client_with(vec![mock]);
-    use polaris_helper_proto::InstallCoreParams;
-    let req = Request::InstallCore(InstallCoreParams {
-        src_dir: "/tmp/staging".into(),
-        want_hash: "a".repeat(64),
-    });
-    let resp = client
-        .send_with_timeout(&req, Duration::from_millis(INSTALL_CORE_TIMEOUT_MS))
+fn read_only_selected_status_supports_an_explicit_caller_budget() {
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    let reply = format!("OK core-present {} 1.15.0-alpha.12\n", id.as_str());
+    let (client, _) = client_with(vec![MockStream::with_response(reply.into_bytes())]);
+    let response = client
+        .send_with_timeout(&Request::CoreStatus { id }, Duration::from_secs(10))
         .unwrap();
-    assert!(matches!(resp, Response::Ok(ResponseKind::Installed)));
+    assert!(matches!(
+        response,
+        Response::Ok(ResponseKind::CoreStatus(_))
+    ));
 }
 
 #[test]
@@ -431,10 +429,7 @@ fn caller_timeout_is_pushed_down_to_the_stream() {
         "TOK",
     );
     let resp = client
-        .send_with_timeout(
-            &Request::Ping,
-            Duration::from_millis(INSTALL_CORE_TIMEOUT_MS),
-        )
+        .send_with_timeout(&Request::Ping, Duration::from_secs(10))
         .unwrap();
     assert!(matches!(resp, Response::Ok(ResponseKind::Pong(_))));
     let got = budgets.lock().unwrap().clone();
@@ -444,7 +439,7 @@ fn caller_timeout_is_pushed_down_to_the_stream() {
         "首次下发 {:?} 未超过 5s 默认读超时 ⇒ 预算被硬顶",
         got[0]
     );
-    assert!(got[0] <= Duration::from_millis(INSTALL_CORE_TIMEOUT_MS));
+    assert!(got[0] <= Duration::from_secs(10));
     // 下发的是**剩余**预算：随读进度单调不增。
     assert!(
         got.windows(2).all(|w| w[0] >= w[1]),

@@ -84,6 +84,9 @@ export enum ProxyErrorCode {
   OUTBOUND_INTERFACE_UNAVAILABLE = 'OUTBOUND_INTERFACE_UNAVAILABLE', // 配置绑定的物理出口不存在或 down：起核 fail-closed；热切换保留旧运行配置并进入待应用态，绝不静默回落到系统默认出口
   BINARY_NOT_EXECUTABLE = 'BINARY_NOT_EXECUTABLE', // 退出码 126
   CORE_NOT_EXECUTABLE = 'CORE_NOT_EXECUTABLE', // 随包内核文件缺少可执行权限：起核前即拒绝（终态，核没有起来）→ 引导重新安装应用
+  CORE_BUNDLE_MISMATCH = 'CORE_BUNDLE_MISMATCH',
+  HELPER_CORE_ABSENT = 'HELPER_CORE_ABSENT',
+  HELPER_CORE_INVALID = 'HELPER_CORE_INVALID',
   HELPER_CORE_MISMATCH = 'HELPER_CORE_MISMATCH', // 确认不了提权助手里的内核就是本应用配套的那一份（起核前对账不通过），或起核后自证发现助手实跑的版本不同而停核（终态）→ 引导到「设置 › Helper」重装或升级助手
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127
   CRONET_LIB_MISSING = 'CRONET_LIB_MISSING', // 'cronet: library not found' / dlopen 失败（naive 出站缺/坏 libcronet → 整核 FATAL，自愈冷路径触发）
@@ -258,6 +261,8 @@ export interface ConnectionsAggregate {
 // ============================================================================
 
 export interface HelperStatus {
+  /** Compiled content identity and the helper's observed provisioning state. */
+  selectedCore?: { id: string; version: string; providerFingerprint: string; state: 'present' | 'absent' | 'invalid' | 'unavailable' };
   /** 当前平台是否支持提权 helper（Polaris 统一 helper：mac/win/linux 三平台均支持，未知平台为 false） */
   supported: boolean;
   /** helper 二进制 + LaunchDaemon plist 是否在位 */

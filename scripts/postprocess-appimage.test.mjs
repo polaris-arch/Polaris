@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 
+import { createHash } from 'node:crypto';
 import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
 
 import { APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
@@ -255,6 +256,12 @@ function seedCoreFixture(root, appDir) {
   const cronet = cronetFixture('linux');
   writeFileSync(join(dirname(source), 'libcronet.so'), cronet, { mode: 0o755 });
   writeFileSync(join(dirname(target), 'libcronet.so'), cronet, { mode: 0o755 });
+  const helper = Buffer.from('verified-helper-seed');
+  writeFileSync(join(dirname(source), 'polaris-helper'), helper, { mode: 0o755 });
+  writeFileSync(join(dirname(target), 'polaris-helper'), 'linuxdeploy-changed-helper', { mode: 0o700 });
+  const installation = JSON.stringify({ core: { helperSha256: createHash('sha256').update(helper).digest('hex') } });
+  writeFileSync(join(dirname(source), 'core-manifest.json'), installation);
+  writeFileSync(join(dirname(target), 'core-manifest.json'), installation);
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
   writeFileSync(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(fixtureManifest(cronet)));
   return { source, target };
@@ -379,6 +386,12 @@ function linuxPayloadFixture(t) {
   const packedDir = join(bundle, 'appimage/Polaris.AppDir');
   renameSync(appDir, packedDir);
   mkdirSync(join(root, 'scripts'));
+  const helper = Buffer.from('verified-helper-seed');
+  writeFileSync(join(dirname(source), 'polaris-helper'), helper, { mode: 0o755 });
+  writeFileSync(join(dirname(target), 'polaris-helper'), 'linuxdeploy-changed-helper', { mode: 0o700 });
+  const installation = JSON.stringify({ core: { helperSha256: createHash('sha256').update(helper).digest('hex') } });
+  writeFileSync(join(dirname(source), 'core-manifest.json'), installation);
+  writeFileSync(join(dirname(target), 'core-manifest.json'), installation);
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
   for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));

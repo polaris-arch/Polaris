@@ -76,6 +76,14 @@ pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCod
 #[cfg(target_os = "macos")]
 fn run(cfg: &MacConfig) -> std::process::ExitCode {
     use crate::platform::macos::server::{serve, DaemonServices};
+    if let Ok(store) = crate::core_store::CoreStore::open(
+        std::path::Path::new(&cfg.core_dir),
+        crate::core_store::OwnerPolicy::privileged(),
+    ) {
+        if let Err(error) = store.retire_flat_layout() {
+            log::warn!("legacy flat retirement retained: {error}");
+        }
+    }
 
     // 生产服务 bundle（token/runner/config + child 记账 + command_mu）—— accept 循环与信号收割器共享
     // 同一 child 状态（`Arc`），使收割器能在退出前对 child sing-box 走精确 terminateChild 分支。

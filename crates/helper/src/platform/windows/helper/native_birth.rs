@@ -85,8 +85,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
         let Some(peer) = peer else {
             return HandleOutcome::AuthFailed;
         };
-        let conf = match crate::user_control::conf_dir(Path::new(&self.support_dir), &peer.identity)
-        {
+        let conf = match self.registered_config(peer) {
             Ok(conf) => conf,
             Err(_) => {
                 return start_error(std::io::Error::other("registered user config unavailable"));
@@ -95,8 +94,8 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
         let Some(conf) = conf.to_str() else {
             return start_error(std::io::Error::other("invalid registered config"));
         };
-        let core = match crate::pinned_core::verify(&self.derived_core_dir(), &params.id) {
-            Ok(core) => Arc::new(core),
+        let core = match self.verified_core(&params.id) {
+            Ok(core) => core,
             Err(_) => return start_error(std::io::Error::other("core-invalid")),
         };
         let outcome = self.handle_native_start(&params.common, core, peer, conf);

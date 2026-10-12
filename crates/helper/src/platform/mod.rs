@@ -1,4 +1,4 @@
-//! 平台差异隔离层 —— **只放真差异**，共用逻辑在 crate 顶层（[`crate::core_install`] /
+//! 平台差异隔离层 —— **只放真差异**，共用逻辑在 crate 顶层（[`crate::core_store`] /
 //! [`crate::line_io`] / [`crate::token`]）。
 //!
 //! ## 已确认的真平台差异（本层存在的全部理由）
