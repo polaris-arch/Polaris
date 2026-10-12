@@ -130,7 +130,9 @@ impl HelperStartCompletion {
         }
         let known = match result {
             Ok(HelperStartResult::Started(pid)) => Some(*pid),
-            Ok(HelperStartResult::BirthStarted(target)) => Some(target.pid.get()),
+            Ok(
+                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
+            ) => Some(target.pid.get()),
             Ok(
                 HelperStartResult::NotAdmitted(_)
                 | HelperStartResult::BirthAlready(_)
@@ -157,9 +159,9 @@ impl HelperStartCompletion {
             Ok(HelperStartResult::BirthAlready(target)) => {
                 child.finish_helper_birth_not_admitted(&self.token, Some(*target))
             }
-            Ok(HelperStartResult::BirthStarted(target)) => {
-                child.finish_helper_birth_start(&self.token, *target)
-            }
+            Ok(
+                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
+            ) => child.finish_helper_birth_start(&self.token, *target),
             Ok(HelperStartResult::Started(_)) => child.finish_helper_start(&self.token, known),
             Err(_) => child.finish_helper_start(&self.token, None),
         };
@@ -2699,8 +2701,10 @@ impl ProxyRuntime {
         // 放在置 `core_via_helper` 标记与 IPC 之前：此刻还没有受管核，失败也不产生孤儿。
         //
         // **配套闸**：对账给不出「逐字节一致」就到此为止，不发起核请求。
-        if let ProtectedCoreVerdict::Unconfirmed(why) =
-            self.reconcile_protected_core(binary).await?
+        let helper = Arc::clone(&self.helper);
+        if let Err(why) = tokio::task::spawn_blocking(move || helper.require_selected_core())
+            .await
+            .map_err(|error| error.to_string())?
         {
             return Err(StartError::coded(
                 helper_core_mismatch_message(&why),
@@ -2759,6 +2763,20 @@ impl ProxyRuntime {
         let target = match started {
             Ok(HelperStartResult::Started(pid)) => HelperStopTarget::Legacy(pid),
             Ok(HelperStartResult::BirthStarted(target)) => HelperStopTarget::Birth(target),
+            Ok(HelperStartResult::BirthRejected(target)) => {
+                let (diagnostic, _) = self
+                    .reject_helper_start_with_result(
+                        Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
+                        &attempt,
+                        HelperStopTarget::Birth(target),
+                        Some(main_reservation),
+                    )
+                    .await;
+                return Err(StartError::coded(
+                    format!("helper content identity mismatch; {diagnostic}"),
+                    code::HELPER_CORE_MISMATCH,
+                ));
+            }
             Ok(HelperStartResult::BirthAlready(target)) => {
                 return Err(format!(
                     "helper exact birth 已有受管核 {target:?}；本次配置未获启动证明，保留既有 custody"

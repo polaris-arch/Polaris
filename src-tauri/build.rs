@@ -17,6 +17,7 @@ fn main() {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-z,common-page-size=16384");
     }
     export_product_name();
+    embed_selected_core_identity();
     assert_bundled_geo_data();
     assert_bundled_dashboard();
     embed_windows_manifest_for_msvc();
@@ -32,6 +33,47 @@ fn main() {
     } else {
         tauri_build::build();
     }
+}
+
+fn embed_selected_core_identity() {
+    println!("cargo:rerun-if-env-changed=POLARIS_CORE_IDENTITY_FILE");
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
+        .join("selected-core-manifest.json");
+    let raw = match std::env::var_os("POLARIS_CORE_IDENTITY_FILE") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+            let raw = std::fs::read(&path).expect("selected installation manifest is readable");
+            let manifest =
+                polaris_helper_proto::core_manifest::InstalledCoreManifest::parse(&raw, |bytes| {
+                    use sha2::Digest;
+                    format!("{:x}", sha2::Sha256::digest(bytes))
+                })
+                .expect("selected installation manifest has an exact content identity");
+            let os = std::env::var("CARGO_CFG_TARGET_OS").expect("target OS");
+            let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("target architecture");
+            let platform = match (os.as_str(), arch.as_str()) {
+                ("linux", "x86_64") => "linux",
+                ("windows", "x86_64") => "win",
+                ("macos", "x86_64") => "mac-x64",
+                ("macos", "aarch64") => "mac-arm64",
+                _ => panic!("selected desktop identity on unsupported target"),
+            };
+            assert_eq!(
+                manifest.core.platform, platform,
+                "selected core target differs"
+            );
+            assert!(
+                manifest.core.helper_sha256.is_some(),
+                "actual helper hash required"
+            );
+            raw
+        }
+        // Library tests/mobile/debug source compilation do not create a desktop
+        // installer. Actual installers always supply this frozen input in package.yml.
+        None => b"null".to_vec(),
+    };
+    std::fs::write(output, raw).expect("write compiled selected core identity");
 }
 
 fn is_windows_msvc() -> bool {

@@ -15,14 +15,14 @@
 //! Terminal receipts are cached per birth. Legacy Start is rejected before any
 //! forwarding/spawn; legacy Stop cannot detach native custody.
 
-use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME_WIN};
+use crate::core_install::{InstallResult, SINGBOX_BIN_NAME_WIN, install_core_files};
 use crate::platform::windows::coreacl;
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
 use polaris_helper_proto::Platform;
 mod native_birth;
-use crate::token::{is_authed_constant_time, TokenStore};
-use native_birth::{stop_locked, NativeCustody};
+use crate::token::{TokenStore, is_authed_constant_time};
+use native_birth::{NativeCustody, stop_locked};
 use polaris_helper_proto::{Request, Response, ResponseKind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -224,7 +224,7 @@ where
         if !self.is_authed(client_token) {
             return HandleOutcome::AuthFailed;
         }
-        self.dispatch(req)
+        self.dispatch(req, None)
     }
 
     /// 处理命名管道读回的**一整帧**（切行 → 验 token → 解码 → 分派），产出要写回的那一行。
@@ -241,10 +241,24 @@ where
     /// 4. 分派。
     #[must_use]
     pub fn handle_frame(&self, raw: &str) -> FrameReply {
+        self.handle_frame_from_peer(raw, None)
+    }
+
+    pub fn handle_frame_from_peer(
+        &self,
+        raw: &str,
+        peer: Option<&crate::user_control::NativePeer>,
+    ) -> FrameReply {
         let Some(frame) = logic::split_frame(raw) else {
             return FrameReply::no_wait(bad_frame_line());
         };
-        if !self.is_authed(frame.token) {
+        let authed = match peer {
+            Some(peer) if peer.administrator => true,
+            Some(peer) => crate::user_control::token(Path::new(&self.support_dir), &peer.identity)
+                .is_ok_and(|token| is_authed_constant_time(frame.token, &token)),
+            None => self.is_authed(frame.token),
+        };
+        if !authed {
             return FrameReply::from_outcome(HandleOutcome::AuthFailed);
         }
         let Some(req) = logic::parse_request(frame.command, &frame.args) else {
@@ -254,7 +268,7 @@ where
                 exit_after: false,
             };
         };
-        FrameReply::from_outcome(self.dispatch(req))
+        FrameReply::from_outcome(self.dispatch(req, peer))
     }
 
     /// token 常量时间比对（Go helper.go:169）。[`Self::handle`] 与 [`Self::handle_frame`] 共用。
@@ -263,8 +277,44 @@ where
     }
 
     /// 鉴权已过之后的 switch 分派（Go `handle()` 的 switch 主体）。
-    fn dispatch(&self, req: Request) -> HandleOutcome {
+    fn dispatch(
+        &self,
+        req: Request,
+        peer: Option<&crate::user_control::NativePeer>,
+    ) -> HandleOutcome {
+        if let Some(peer) = peer {
+            let allowed = self.child_mu.lock().is_ok_and(|mut state| {
+                if let Some(target) = state.native.as_ref().map(|native| native.target) {
+                    if self.proc.poll_native_child(target) == crate::platform::windows::ops::NativeChildPoll::Exited {
+                        let _ = native_birth::cache_exit(&mut state, self.proc.as_ref(), target);
+                    }
+                }
+                peer.administrator
+                    || state.native.as_ref().map_or(state.pid.is_none(), |native| {
+                        native.owner.as_ref() == Some(&peer.identity)
+                    })
+            });
+            if !allowed
+                && !matches!(
+                    req,
+                    Request::Ping | Request::Version | Request::CoreStatus { .. }
+                )
+            {
+                return HandleOutcome::Respond(Response::Err(
+                    polaris_helper_proto::Error::with_detail(
+                        polaris_helper_proto::ErrorCode::Auth,
+                        "slot-owned-by-other-user",
+                    ),
+                ));
+            }
+        }
         match req {
+            Request::CoreStatus { id } => {
+                HandleOutcome::Respond(Response::Ok(ResponseKind::CoreStatus(
+                    crate::pinned_core::status(Some(&self.derived_core_dir()), &id),
+                )))
+            }
+            Request::NativeStartPinned(params) => self.handle_native_pinned(&params, peer),
             Request::Ping => HandleOutcome::Respond(Response::Ok(ResponseKind::Pong(
                 // Go helper.go:179: Windows Getuid()=-1 破坏正则，固定发 0。
                 polaris_helper_proto::Pong::current(0),
@@ -358,9 +408,16 @@ where
                     "client-upgrade-required: use native birth safe Start",
                 )))
             }
-            Request::NativeStartBirth(params) => self.handle_native_start(&params),
-            Request::NativeStatusBirth => self.handle_native_status(),
-            Request::NativeStopBirth { target } => self.handle_native_stop(target),
+            Request::NativeStartBirth(_) => HandleOutcome::Respond(Response::Err(
+                polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
+            )),
+            Request::NativeStatusBirth if peer.is_some() => self.handle_native_status(peer.expect("peer guarded")),
+            Request::NativeStopBirth { target } if peer.is_some() => {
+                self.handle_native_stop(target, peer.expect("peer guarded"))
+            }
+            Request::NativeStatusBirth | Request::NativeStopBirth { .. } => {
+                HandleOutcome::AuthFailed
+            }
             Request::FreePort { port } => self.handle_freeport(port),
             // W9 修：route-add / route-del 须区分 add/delete（此前合并丢了 op 区分）。
             Request::RouteAdd(rp) => self.handle_route(&rp.iface, &rp.cidrs, false),
@@ -371,9 +428,12 @@ where
             Request::FlushDns | Request::WindowsFlushDnsNative => self.handle_flush_dns(),
             // P4：Windows 也落受保护内核目录（此前只有 mac/linux 有这个 chokepoint，win 落 ERR unknown，
             // helper 以 LocalSystem 直接 exec 用户可写路径下的 sing-box.exe）。
-            Request::InstallCore(p) => self.handle_install_core(&p),
+            Request::InstallCore(_) => HandleOutcome::Respond(Response::Err(
+                polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
+            )),
             // 以下命令 Windows helper 不支持（mac/linux 专属）—— Go default 分支回 ERR unknown。
             Request::LinuxStart(_)
+            | Request::LinuxStartPinned(_)
             | Request::LinuxStop { .. }
             | Request::LinuxStartBirth(_)
             | Request::LinuxStatusBirth

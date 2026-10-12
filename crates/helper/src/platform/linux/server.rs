@@ -47,7 +47,7 @@ use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
+use crate::platform::accept_retry::{ACCEPT_LOG_INTERVAL, LogThrottle};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
 use crate::platform::linux::ops::set_forward_prod;
 use crate::platform::linux::state::{
@@ -757,6 +757,32 @@ impl CoreSpawner for AmbientCapsSpawner {
     }
 
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
+        self.spawn_verified(req, None)
+    }
+
+    fn spawn_pinned(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        self.spawn_verified(req, Some(core))
+    }
+
+    fn terminate(&self, h: &CoreHandle) -> StopReap {
+        self.terminate_owned(h)
+    }
+
+    fn kill(&self, h: &CoreHandle) {
+        self.kill_owned(h)
+    }
+}
+
+impl AmbientCapsSpawner {
+    fn spawn_verified(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Option<Arc<crate::core_store::VerifiedCore>>,
+    ) -> Result<SpawnedCore, SpawnError> {
         let pinned_log = req
             .log
             .as_deref()
@@ -766,7 +792,19 @@ impl CoreSpawner for AmbientCapsSpawner {
                 detail: format!("secure log path: {error}"),
             })?;
         // Go: exec.Command(coreBin(), "run", "-c", cfg)（:431）。
-        let mut cmd = std::process::Command::new(&req.binary);
+        // /proc/self/fd is resolved by exec while the verified original fd is
+        // still open. It is never a second open of a user-supplied executable.
+        use std::os::fd::AsRawFd;
+        let executable = core.as_ref().map_or_else(
+            || req.binary.clone(),
+            |core| PathBuf::from(format!("/proc/self/fd/{}", core.binary.as_raw_fd())),
+        );
+        let mut cmd = std::process::Command::new(executable);
+        if let Some(core) = &core {
+            cmd.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LD_LIBRARY_PATH", &core.directory);
+        }
         cmd.arg("run").arg("-c").arg(&req.config);
 
         // CWD = 配置文件所在目录（= 用户可写 config 目录）：helper daemon（systemd）CWD=`/`，spawn 的核继承 `/`
@@ -841,6 +879,10 @@ impl CoreSpawner for AmbientCapsSpawner {
             ),
             None => CoreHandle::new(pid),
         };
+        let handle = match core {
+            Some(core) => handle.with_core(core, req.uid),
+            None => handle,
+        };
         let slot = ChildSlot::from_child(child, handle.clone());
         self.slots
             .lock()
@@ -874,7 +916,7 @@ impl CoreSpawner for AmbientCapsSpawner {
         })
     }
 
-    fn terminate(&self, h: &CoreHandle) -> StopReap {
+    fn terminate_owned(&self, h: &CoreHandle) -> StopReap {
         // The wire request never waits through the five-second escalation. One
         // exact-birth worker owns it; later Stop requests only poll native reap.
         let Some(slot) = self.find_slot(h) else {
@@ -892,7 +934,7 @@ impl CoreSpawner for AmbientCapsSpawner {
         outcome
     }
 
-    fn kill(&self, h: &CoreHandle) {
+    fn kill_owned(&self, h: &CoreHandle) {
         // Go cleanup：child.Process.Kill()（SIGKILL 即时；收割线程随后收尸，:383）。
         // 身份判据与 terminate 同源（slot 在册 + 尚未被收割）：cleanup 拿到的 `h.pid` 来自 state.child，
         // 而收割线程清 state.child 那一步会被「全程持 state 锁」的 handler 挡住 ⇒ 这里完全可能拿到一个
@@ -944,7 +986,7 @@ fn apply_privilege_drop(
     groups: &[nix::unistd::Gid],
     caps: &[caps::Capability],
 ) -> std::io::Result<()> {
-    use nix::unistd::{setgid, setgroups, setuid, Gid, Uid};
+    use nix::unistd::{Gid, Uid, setgid, setgroups, setuid};
     caps::securebits::set_keepcaps(true).map_err(std::io::Error::other)?;
     setgroups(groups).map_err(std::io::Error::other)?;
     setgid(Gid::from_raw(gid)).map_err(std::io::Error::other)?;
@@ -1124,7 +1166,7 @@ impl ConnServer {
     /// `spawn_blocking` 池（合法请求排队等不到，比 EMFILE 更早发作），再攥满 fd 走到 EMFILE。
     pub fn dispatch(self: &Arc<Self>, stream: tokio::net::UnixStream) {
         use crate::platform::linux::auth::{CapturedPeerCred, PeerCredProvider, TokioPeerCred};
-        use crate::platform::linux::handler::{handle, HandlerDeps, LineConn, READ_TIMEOUT_SECS};
+        use crate::platform::linux::handler::{HandlerDeps, LineConn, READ_TIMEOUT_SECS, handle};
 
         // 0. 闸在**起阻塞任务之前**（也在鉴权之前）。超限即快速失败：`stream` 在此 drop = 立即关连接，
         //    不排队（排队只是把耗尽从池搬到队列，攻击面不变）、不阻塞 accept 循环。

@@ -180,6 +180,7 @@ fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
         filename,
     );
     if let Some(core) = first_existing_bundle_candidate(&candidates) {
+        crate::runtime::core_identity::verify_bundled(&core)?;
         return Ok(core);
     }
     Err(format!(

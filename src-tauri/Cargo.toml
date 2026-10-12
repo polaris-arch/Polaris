@@ -25,6 +25,11 @@ tauri-build = { version = "2", features = [] }
 # 不手写 JSON 取值：那等于把刚删掉的「正则抓源码」换个方向再来一遍。
 serde_json = { workspace = true }
 
+# Host-side validation uses the same framed identity as app/helper; both packages
+# already exist in the lock. No second parser or hash contract in build.rs.
+polaris-helper-proto = { path = "../crates/helper-proto" }
+sha2 = "0.11"
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 serde = { workspace = true }

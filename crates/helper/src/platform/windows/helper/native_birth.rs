@@ -11,6 +11,8 @@ pub(super) struct NativeCustody {
     pub(super) target: HelperBirthTarget,
     stopping: bool,
     unknown: bool,
+    pub(super) owner: Option<polaris_helper_proto::core_protocol::CallerIdentity>,
+    core: Option<Arc<crate::core_store::VerifiedCore>>,
 }
 
 pub(super) fn cache_exit<P: ProcOps>(
@@ -67,12 +69,46 @@ pub(super) fn stop_locked<P: ProcOps>(
 }
 
 impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
-    pub(super) fn handle_native_stop(&self, target: HelperBirthTarget) -> HandleOutcome {
+    pub(super) fn handle_native_pinned(
+        &self,
+        params: &polaris_helper_proto::core_protocol::PinnedStartParams,
+        peer: Option<&crate::user_control::NativePeer>,
+    ) -> HandleOutcome {
+        let Some(peer) = peer else {
+            return HandleOutcome::AuthFailed;
+        };
+        let conf = match crate::user_control::conf_dir(Path::new(&self.support_dir), &peer.identity)
+        {
+            Ok(conf) => conf,
+            Err(_) => {
+                return start_error(std::io::Error::other("registered user config unavailable"));
+            }
+        };
+        let Some(conf) = conf.to_str() else {
+            return start_error(std::io::Error::other("invalid registered config"));
+        };
+        let core = match crate::pinned_core::verify(&self.derived_core_dir(), &params.id) {
+            Ok(core) => Arc::new(core),
+            Err(_) => return start_error(std::io::Error::other("core-invalid")),
+        };
+        let outcome = self.handle_native_start(&params.common, core, peer, conf);
+        match outcome {
+            HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(start))) => {
+                HandleOutcome::Respond(Response::Ok(ResponseKind::PinnedStart {
+                    id: params.id.clone(),
+                    start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(start),
+                }))
+            }
+            other => other,
+        }
+    }
+    pub(super) fn handle_native_stop(&self, target: HelperBirthTarget, peer: &crate::user_control::NativePeer) -> HandleOutcome {
         let Ok(mut state) = self.child_mu.lock() else {
             return HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(
                 NativeBirthStop::Unknown { target },
             )));
         };
+        if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
         HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(stop_locked(
             &mut state,
             self.proc.as_ref(),
@@ -80,7 +116,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
         ))))
     }
 
-    pub(super) fn handle_native_status(&self) -> HandleOutcome {
+    pub(super) fn handle_native_status(&self, peer: &crate::user_control::NativePeer) -> HandleOutcome {
         let mut state = match self.child_mu.lock() {
             Ok(state) => state,
             Err(poison) => {
@@ -91,6 +127,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 )));
             }
         };
+        if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
         let status = if let Some(native) = &state.native {
             let target = native.target;
             match self.proc.poll_native_child(target) {
@@ -134,6 +171,9 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
     pub(super) fn handle_native_start(
         &self,
         p: &polaris_helper_proto::StartParams,
+        core: Arc<crate::core_store::VerifiedCore>,
+        peer: &crate::user_control::NativePeer,
+        conf_dir: &str,
     ) -> HandleOutcome {
         let started = {
             let mut state = match self.child_mu.lock() {
@@ -149,7 +189,15 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     target: state.native.as_ref().map(|c| c.target),
                 });
             }
+            if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
             if let Some(native) = &state.native {
+                if native
+                    .core
+                    .as_ref()
+                    .is_none_or(|old| old.manifest.id != core.manifest.id)
+                {
+                    return start_error(std::io::Error::other("core-occupied"));
+                }
                 let target = native.target;
                 match self.proc.poll_native_child(target) {
                     NativeChildPoll::Exited
@@ -157,7 +205,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     NativeChildPoll::Exited | NativeChildPoll::Unknown => {
                         return start_response(NativeBirthStart::NotAdmittedUnknown {
                             target: Some(target),
-                        })
+                        });
                     }
                     NativeChildPoll::Running => {
                         let current = state.native.as_ref().unwrap();
@@ -181,9 +229,9 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
             }
             let invalid = if p.cfg.is_empty() {
                 Some(polaris_helper_proto::ErrorCode::NoConfig)
-            } else if !logic::cfg_allowed(&p.cfg, &self.conf_dir) {
+            } else if !logic::cfg_allowed(&p.cfg, conf_dir) {
                 Some(polaris_helper_proto::ErrorCode::ConfigPathDenied)
-            } else if !p.log.is_empty() && !logic::cfg_allowed(&p.log, &self.conf_dir) {
+            } else if !p.log.is_empty() && !logic::cfg_allowed(&p.log, conf_dir) {
                 Some(polaris_helper_proto::ErrorCode::LogPathDenied)
             } else {
                 None
@@ -193,15 +241,12 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     code,
                 )));
             }
-            if let Some(error) = self.core_acl_gate() {
-                return HandleOutcome::Respond(Response::Err(error));
-            }
             let birth = match self.proc.mint_native_birth() {
                 Ok(birth) => birth,
                 Err(error) => return start_error(error),
             };
             let started = match self.proc.start_native_singbox(
-                &self.singbox_bin,
+                core.directory.join("sing-box.exe").to_str().unwrap_or(""),
                 &p.cfg,
                 &p.log,
                 p.fwd,
@@ -219,6 +264,8 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 target,
                 stopping: false,
                 unknown: false,
+                owner: Some(peer.identity.clone()),
+                core: Some(core),
             });
             (target, started)
         };

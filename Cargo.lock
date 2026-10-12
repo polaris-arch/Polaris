@@ -3194,6 +3194,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -3285,6 +3286,10 @@ dependencies = [
 [[package]]
 name = "polaris-helper-proto"
 version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "polaris-log-budget"

@@ -28,22 +28,19 @@
 //! freeport 与 native Start 共用 server 命令锁，避免空槽检查后新核启动再遭 PID 清理。
 //! 本 dispatch 是无状态的（状态在 [`MacServices`] 内），不模拟 Go 的 mu —— 并发控制由 server 层负责。
 
-use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME};
-use crate::platform::macos::exec::{CommandRunner, CODESIGN_TIMEOUT, EXEC_TIMEOUT};
+use crate::platform::macos::exec::{CommandRunner, EXEC_TIMEOUT};
 use crate::platform::macos::flush_dns;
 use crate::platform::macos::freeport;
-use crate::platform::macos::install_core::to_response;
 use crate::platform::macos::route::{self, RouteOp};
 use crate::platform::macos::whitelist;
-use crate::token::{check_token, TokenCheck, TokenStore};
-use polaris_helper_proto::request::{InstallCoreParams, RouteParams, StartParams};
+use crate::token::{TokenCheck, TokenStore, check_token};
+use polaris_helper_proto::request::{RouteParams, StartParams};
 use polaris_helper_proto::response::{
-    NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, Start as StartResp,
-    StartTiming, Status, Stop,
+    NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, StartTiming, Status, Stop,
 };
 use polaris_helper_proto::{
-    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request,
-    Response,
+    Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request, Response,
+    stop_pid_matches,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -111,6 +108,23 @@ pub struct SpawnedCore {
 /// macOS helper 的服务 bundle —— 把所有外部依赖（token 存储、命令执行、child 状态）打包成一个 trait，
 /// 便于测试注入 mock、生产注入真实实现。
 pub trait MacServices: Send + Sync {
+    fn token_for_peer(&self, _uid: Option<u32>) -> String {
+        self.token_store().token_value()
+    }
+    fn native_start_pinned(
+        &self,
+        _params: &polaris_helper_proto::core_protocol::PinnedStartParams,
+        _uid: u32,
+    ) -> Result<NativeBirthStart, SpawnError> {
+        Err(SpawnError::NotImplemented)
+    }
+    fn native_caller_allowed(
+        &self,
+        uid: Option<u32>,
+        _id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        uid == Some(0)
+    }
     /// Unsupported services cannot attest native custody by calling the legacy void stop.
     fn native_start(&self, _params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
         Err(SpawnError::NotImplemented)
@@ -258,8 +272,8 @@ pub fn dispatch_from_peer(
     peer_uid: Option<u32>,
 ) -> Response {
     // helper.go:405-408: token 鉴权（首道边界）
-    let stored = services.token_store().token_value();
-    if !matches!(check_token(token, &stored), TokenCheck::Authed) {
+    let stored = services.token_for_peer(peer_uid);
+    if peer_uid != Some(0) && !matches!(check_token(token, &stored), TokenCheck::Authed) {
         return Response::Err(ProtoError::new(ErrorCode::Auth));
     }
 
@@ -275,27 +289,46 @@ pub fn dispatch_from_peer(
     // 其余命令在「临界区」内处理 —— 这里用 child() mutex 体现互斥语义
     // （实际生产由 server 层在调 dispatch 前后包 mu；本函数内部对 child 状态的访问仍走 mutex）
     match req {
-        Request::NativeStatusBirth => {
-            Response::Ok(ResponseKind::NativeBirthStatus(services.native_status()))
-        }
-        Request::NativeStopBirth { target } => {
-            Response::Ok(ResponseKind::NativeBirthStop(services.native_stop(*target)))
-        }
-        Request::NativeStartBirth(params) => {
-            if let Err(error) = validate_start_paths(config, &params.cfg, &params.log) {
-                return Response::Err(error);
+        Request::CoreStatus { id } => Response::Ok(ResponseKind::CoreStatus(
+            crate::pinned_core::status(Some(Path::new(&config.core_dir)), id),
+        )),
+        Request::NativeStartPinned(params) => {
+            let Some(uid) = peer_uid else {
+                return Response::Err(ProtoError::new(ErrorCode::Auth));
+            };
+            if !services.native_caller_allowed(Some(uid), Some(&params.id)) {
+                return Response::Err(ProtoError::with_detail(
+                    ErrorCode::Start,
+                    "slot-owned-or-core-occupied",
+                ));
             }
-            match services.native_start(params) {
-                Ok(started) => Response::Ok(ResponseKind::NativeBirthStart(started)),
+            match services.native_start_pinned(params, uid) {
+                Ok(start) => Response::Ok(ResponseKind::PinnedStart {
+                    id: params.id.clone(),
+                    start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(start),
+                }),
                 Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
                     ErrorCode::Start,
-                    "native birth custody unsupported",
+                    "pinned spawn unavailable",
                 )),
                 Err(SpawnError::Failed(error)) => {
                     Response::Err(ProtoError::with_detail(ErrorCode::Start, error))
                 }
             }
         }
+        Request::NativeStatusBirth => {
+            if !services.native_caller_allowed(peer_uid, None) {
+                return Response::Err(ProtoError::new(ErrorCode::Auth));
+            }
+            Response::Ok(ResponseKind::NativeBirthStatus(services.native_status()))
+        }
+        Request::NativeStopBirth { target } => {
+            if !services.native_caller_allowed(peer_uid, None) {
+                return Response::Err(ProtoError::new(ErrorCode::Auth));
+            }
+            Response::Ok(ResponseKind::NativeBirthStop(services.native_stop(*target)))
+        }
+        Request::NativeStartBirth(_) => Response::Err(ProtoError::new(ErrorCode::Unknown)),
         Request::Ping => {
             // helper.go:422-423: OK pong uid=<n> v<ver>
             Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(
@@ -407,23 +440,12 @@ pub fn dispatch_from_peer(
         // 纯 capability probe：只有新 helper 识别该 command 就返成功，绝不解码 payload、
         // 不打开 SCPreferences，因此 controller 可在任何系统写之前安全探测。
         Request::MacProxyCompareCapability => Response::Ok(ResponseKind::MacProxyTransaction),
-        Request::Start(params) => {
-            // helper.go:507-579
-            handle_start(
-                services,
-                config,
-                params.cfg.as_str(),
-                params.log.as_str(),
-                params.fwd,
-                params.parent_pid,
-            )
-        }
-        Request::InstallCore(params) => {
-            // helper.go:580-585
-            handle_install_core(services.runner(), config, params, peer_uid)
+        Request::Start(_) | Request::InstallCore(_) => {
+            Response::Err(ProtoError::new(ErrorCode::Unknown))
         }
         // 以下命令不属于 mac helper 谱系（LinuxStart/IfaceMetric/Uninstall）
         Request::LinuxStart(_)
+        | Request::LinuxStartPinned(_)
         | Request::LinuxStop { .. }
         | Request::LinuxStartBirth(_)
         | Request::LinuxStatusBirth
@@ -478,139 +500,11 @@ fn handle_default_restore(runner: &dyn CommandRunner, gateway_ipv4: &str) -> Res
     }
 }
 
-/// start 处理（移植自 `helper.go:507-579`）。
-fn handle_start(
-    services: &dyn MacServices,
-    config: &MacConfig,
-    cfg: &str,
-    log: &str,
-    fwd: bool,
-    parent_pid: Option<u32>,
-) -> Response {
-    if !services.legacy_start_supported() || services.native_custody_active() {
-        return legacy_native_required();
-    }
-    // helper.go:521-524: 已有 child → OK already <pid>
-    {
-        let guard = services
-            .child()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(child) = &*guard {
-            return Response::Ok(ResponseKind::Start(StartResp::Already { pid: child.pid }));
-        }
-    }
-    if let Err(error) = validate_start_paths(config, cfg, log) {
-        return Response::Err(error);
-    }
-    // 从已通过参数/路径校验后开始计时：拒绝腿不伪装成“起核耗时”。
-    let total_started = Instant::now();
-    let forwarding_started = Instant::now();
-    if fwd {
-        let _ = services.runner().run(
-            EXEC_TIMEOUT,
-            "/usr/sbin/sysctl",
-            &["-w", "net.inet.ip.forwarding=1"],
-        );
-        let _ = services.runner().run(
-            EXEC_TIMEOUT,
-            "/usr/sbin/sysctl",
-            &["-w", "net.inet6.ip6.forwarding=1"],
-        );
-    }
-    let forwarding_ms = crate::elapsed_ms(forwarding_started);
-    match services.spawn_child(cfg, log, fwd, parent_pid) {
-        Ok(started) => Response::Ok(ResponseKind::Start(StartResp::StartedTimed {
-            pid: started.pid,
-            timing: StartTiming {
-                forwarding_ms,
-                process_ms: started.process_ms,
-                job_ms: 0,
-                log_handoff_ms: started.log_handoff_ms,
-                total_ms: crate::elapsed_ms(total_started),
-            },
-            created: None,
-        })),
-        Err(SpawnError::NotImplemented) => Response::Err(ProtoError::with_detail(
-            ErrorCode::Start,
-            "spawn not implemented on this platform",
-        )),
-        Err(SpawnError::Failed(msg)) => {
-            Response::Err(ProtoError::with_detail(ErrorCode::Start, msg))
-        }
-    }
-}
-
 fn legacy_native_required() -> Response {
     Response::Err(ProtoError::with_detail(
         ErrorCode::Start,
         "native birth protocol required; upgrade the client",
     ))
-}
-
-fn validate_start_paths(config: &MacConfig, cfg: &str, log: &str) -> Result<(), ProtoError> {
-    // helper.go:525-527: cfg 空 → ERR no-config
-    if cfg.is_empty() {
-        return Err(ProtoError::new(ErrorCode::NoConfig));
-    }
-    // helper.go:528-531: cfg 不在白名单 → ERR config-path-denied
-    if !whitelist::cfg_allowed(cfg, &config.conf_dir) {
-        return Err(ProtoError::new(ErrorCode::ConfigPathDenied));
-    }
-    // **Polaris 新增（上游无）**：log 走与 cfg 同一条 lexical 白名单；`server::do_spawn`
-    // 再从 `/` 逐级 openat(O_NOFOLLOW) 固定 current/.1，二者缺一不可。否则 root helper 既能
-    // 越界创建文件，也会在用户可写父目录的 rename/symlink 竞态中写错对象。生产下发的 log
-    // 与 cfg 同在 conf_dir，收紧无行为变化；空串 = 不重定向，放行。
-    //
-    // 这里不把 cfg 内容伪装成 helper 的可信输入：同一登录账户可读 token 且可写 conf_dir，
-    // 因此当前承诺不抵抗同账户恶意进程。扩大承诺需要签名 app identity + 完整资源闭包封存，
-    // 只 staging 主 JSON 或 canonicalize 路径不成立。协议契约见 StartParams 文档。
-    if !log.is_empty() && !whitelist::cfg_allowed(log, &config.conf_dir) {
-        return Err(ProtoError::new(ErrorCode::LogPathDenied));
-    }
-    Ok(())
-}
-
-/// install-core 处理（移植自 `helper.go:580-585,127-198`）。
-///
-/// 文件操作（校验+原子写入+清理）走 [`install_core_files`](crate::core_install::install_core_files)，
-/// mac 专属的 xattr/codesign 在文件就位后执行（`helper.go:195-196`）。
-fn handle_install_core(
-    runner: &dyn CommandRunner,
-    config: &MacConfig,
-    params: &InstallCoreParams,
-    peer_uid: Option<u32>,
-) -> Response {
-    let core_dir = Path::new(&config.core_dir);
-    let src_dir = Path::new(&params.src_dir);
-    // helper.go:133-198: 文件操作
-    let installed = install_core_files(
-        core_dir,
-        src_dir,
-        &params.want_hash,
-        Platform::Mac,
-        peer_uid,
-    );
-    match installed {
-        Ok(_) => {
-            // helper.go:194-196: mac 专属 —— 清 quarantine + adhoc 签名 sing-box
-            let core_dir_str = config.core_dir.as_str();
-            let (xattr_prog, xattr_args) =
-                crate::platform::macos::btm::clear_quarantine_cmd(core_dir_str);
-            let xattr_refs: Vec<&str> = xattr_args.iter().map(String::as_str).collect();
-            let _ = runner.run(EXEC_TIMEOUT, xattr_prog, &xattr_refs);
-
-            let sb_path = std::path::PathBuf::from(core_dir).join(SINGBOX_BIN_NAME);
-            let sb_str = sb_path.to_string_lossy();
-            let (cs_prog, cs_args) = crate::platform::macos::btm::adhoc_sign_cmd(&sb_str);
-            let cs_refs: Vec<&str> = cs_args.iter().map(String::as_str).collect();
-            let _ = runner.run(CODESIGN_TIMEOUT, cs_prog, &cs_refs);
-
-            Response::Ok(ResponseKind::Installed)
-        }
-        Err(InstallResult::Installed) => Response::Ok(ResponseKind::Installed),
-        Err(e) => to_response(e),
-    }
 }
 
 // wire 写方向已上提 helper-proto：见 [`polaris_helper_proto::Response::to_wire_line`]

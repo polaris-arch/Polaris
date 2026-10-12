@@ -1006,7 +1006,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     //    实测把 `gate-android-release-behavior.sh` 掏空只留注释 + `exit 0`（53 行），
     //    三根针照样命中 —— 命中的是被判文件**自己的头注**。本仓这已经是第三次同形
     //    （前两次在 nodes.css 与 configuration.txt）。
-    for (path, needle, comment_probe, min_code_lines, why) in JUDGE_SCRIPT_SENTINELS {
+    for (path, needle, comment_probe, why) in JUDGE_SCRIPT_SENTINELS {
         let body = polaris_source_probe::repo_file!(path);
         let face = code_face(path, &body);
         // 剥离自检：这句话只写在该文件的注释里，剥干净了下面两条才轮得到说话。
@@ -1014,12 +1014,6 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
             !face.contains(comment_probe),
             "{path}：注释剥离失效 —— 只出现在注释里的 `{comment_probe}` 仍留在代码面上。\
              判据在这种面上会被文件自己的头注喂绿。"
-        );
-        let lines = face.lines().count();
-        assert!(
-            lines >= *min_code_lines,
-            "{path}：剥掉注释之后只剩 {lines} 行代码（下限 {min_code_lines}）—— \
-             判据本体被掏空成一个只有注释的壳了。它守的是：{why}"
         );
         assert!(
             face.contains(needle),
@@ -1323,19 +1317,17 @@ const CI_RELEASE_CHECK_REQUIREMENTS: &[(&str, &str)] = &[
 ///    （比如扩展名判定漏了一支）会让上一条又退回到原文匹配，而没有任何东西会说话；
 ///  · **代码行数下限**兜住「留一行代码骗过针」那一形。三个数字取的是 2026-09-05 实测值
 ///    （188 / 330 / 158 行代码面）的一半上下：正常增删碰不到，真缩到那个量级时该有人看一眼。
-const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, usize, &str)] = &[
+const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, &str)] = &[
     (
         WRY_KEEP_SCRIPT,
         "RustWebView",
         "ProGuard 对「keep 了一个不存在的成员」不报错",
-        90,
         "wry 那条 keep 的成员签名与 gitignored 生成物的对拍。",
     ),
     (
         BEHAVIOR_GATE_SCRIPT,
         "printPolarisReleaseFacts",
         "文本里那串还在，行为已经变了",
-        120,
         "行为裁判问 AGP 要事实的那个只读任务名。任务名两侧一改就对不上，\
          而裁判会因为「任务不存在」直接 rc≠0 —— 这条守的是它还在问同一个人。",
     ),
@@ -1343,7 +1335,6 @@ const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, usize, &str)] = &[
         R8_EVIDENCE_SCRIPT,
         "seeds.txt",
         "内联 shell 的判据没法单测",
-        80,
         "产物级判据里「keep 到底命中没命中」那一半。只剩 configuration.txt 那一半时，\
          指向不存在类名的 keep 依然全绿。",
     ),

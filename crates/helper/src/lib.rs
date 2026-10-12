@@ -70,6 +70,11 @@ pub mod cli;
 
 // ===== 共用层：三平台共享的普通模块（无 cfg，无抽象层）=====
 pub mod core_install;
+pub mod core_objects;
+pub mod core_store;
+pub mod core_cli;
+pub mod pinned_core;
+pub mod user_control;
 pub mod exact_start;
 pub mod line_io;
 pub mod token;

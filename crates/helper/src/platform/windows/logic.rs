@@ -5,7 +5,7 @@
 //! - iface / cidr / sha256 白名单 → 复用 `helper-proto`（不重复定义，消灭 drift）。
 //! - winproc 特有的端口解析、镜像匹配、basename、路径归一化 → 本模块（Go `winproc.go` 对应）。
 
-use polaris_helper_proto::{codec, command, Request};
+use polaris_helper_proto::{Request, codec, command};
 
 /// Windows 接口白名单（移植自 `helper.go:50-60` 的 `ifaceAllowed`）。
 ///
@@ -309,6 +309,17 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
     let mut iter = args.iter();
     let mut next_line = || iter.next().copied().unwrap_or("");
     Some(match cmd {
+        command::common::CORE_STATUS if args.len() == 1 => Request::CoreStatus {
+            id: polaris_helper_proto::core_manifest::CoreId::parse(args[0]).ok()?,
+        },
+        command::common::NATIVE_START_PINNED_BIRTH => Request::NativeStartPinned(
+            polaris_helper_proto::core_protocol::PinnedStartParams::parse(
+                &args
+                    .iter()
+                    .map(|line| (*line).to_owned())
+                    .collect::<Vec<_>>(),
+            )?,
+        ),
         command::common::PING => Request::Ping,
         command::common::VERSION => Request::Version,
         command::common::STATUS => Request::Status,
@@ -316,22 +327,10 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
         command::common::NATIVE_STOP_BIRTH => Request::NativeStopBirth {
             target: polaris_helper_proto::parse_native_birth_stop_args(args)?,
         },
-        command::common::NATIVE_START_BIRTH if (3..=4).contains(&args.len()) => {
-            if !matches!(args[2], "0" | "1") {
-                return None;
-            }
-            let parent_pid = if args.len() == 4 {
-                Some(args[3].parse::<u32>().ok().filter(|pid| *pid > 0)?)
-            } else {
-                None
-            };
-            Request::NativeStartBirth(polaris_helper_proto::StartParams {
-                cfg: next_line().to_owned(),
-                log: next_line().to_owned(),
-                fwd: next_line() == "1",
-                parent_pid,
-            })
+        command::common::NATIVE_START_BIRTH => {
+            return None;
         }
+
         // stop 的受管 pid 身份行可选：旧客户端不发 → next_line() 返 "" → None（旧语义）。
         command::common::STOP => Request::Stop {
             pid: polaris_helper_proto::parse_stop_pid(next_line()),
@@ -341,12 +340,9 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
             let port = parse_port(next_line())?;
             Request::FreePort { port }
         }
-        command::common::START => Request::Start(polaris_helper_proto::StartParams {
-            cfg: next_line().to_owned(),
-            log: next_line().to_owned(),
-            fwd: next_line() == "1",
-            parent_pid: next_line().parse::<u32>().ok(),
-        }),
+        command::common::START => {
+            return None;
+        }
         command::common::ROUTE_ADD => Request::RouteAdd(parse_route_params(&mut next_line)),
         command::common::ROUTE_DEL => Request::RouteDel(parse_route_params(&mut next_line)),
         command::win::UNINSTALL => Request::Uninstall,
@@ -357,10 +353,7 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
         // P4：src 行 + wantHash 行（与编码侧 `Request::write_args` 同序；与 mac `decode_request`
         // 同形：src 原样、hash trim）。批三只加了分派没加这一格 ⇒ 真机 0 字节 / 233。
         command::mac::INSTALL_CORE => {
-            Request::InstallCore(polaris_helper_proto::InstallCoreParams {
-                src_dir: next_line().to_owned(),
-                want_hash: next_line().trim().to_owned(),
-            })
+            return None;
         }
         command::win::IFACE_METRIC => {
             let iface = next_line().to_owned();

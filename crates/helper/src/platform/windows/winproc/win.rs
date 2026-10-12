@@ -316,6 +316,14 @@ impl WinProcOps {
         // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
         // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
         let mut cmd = std::process::Command::new(singbox_bin);
+        // SCM inherits machine-owned environment. Pass only the system roots
+        // and trusted executable directories; never inherit DLL/path overrides.
+        let system_root = std::env::var_os("SystemRoot").ok_or_else(|| std::io::Error::other("native SystemRoot unavailable"))?;
+        let system_root = std::path::PathBuf::from(system_root);
+        if !system_root.is_absolute() { return Err(std::io::Error::other("invalid native SystemRoot")); }
+        let core_directory = std::path::Path::new(singbox_bin).parent().ok_or_else(|| std::io::Error::other("missing core directory"))?;
+        let path = std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")]).map_err(std::io::Error::other)?;
+        cmd.env_clear().env("SystemRoot", &system_root).env("PATH", path);
         cmd.args(["run", "-c", cfg])
             .stdin(std::process::Stdio::null());
         if !log_path.is_empty() {

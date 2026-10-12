@@ -19,6 +19,8 @@ pub mod common {
     pub const PING: &str = "ping";
     /// `OK <ver>`（mac/win/linux，纯协议版本查询）。
     pub const VERSION: &str = "version";
+    pub const CORE_STATUS: &str = "core-status";
+    pub const NATIVE_START_PINNED_BIRTH: &str = "start-native-pinned-birth-safe";
     /// `OK started <pid>` / `OK already <pid>` / `ERR ...`（启核，参数最多）。
     pub const START: &str = "start";
     /// `OK stopped <pid>` / `OK notrunning`（停核，TERM→等→KILL 后台收割）。
@@ -82,6 +84,7 @@ pub mod win {
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。
 pub mod linux {
+    pub const START_PINNED_BIRTH: &str = "start-pinned-birth-safe";
     /// Exact helper-owned birth admission. Old helpers reject before spawning.
     pub const START_BIRTH_SAFE: &str = "start-birth-safe";
     /// Read the exact helper-owned birth, including its opaque birth token.

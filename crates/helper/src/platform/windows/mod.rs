@@ -65,6 +65,8 @@
 pub mod coreacl;
 pub mod daemon;
 pub mod helper;
+#[cfg(windows)]
+pub mod native_caller;
 pub mod logic;
 /// 本机网络接口只读枚举（**免提权**，app 进程直调；住在本 crate 纯为复用已有的 `windows-sys` FFI —— 理由见模块文档）。
 pub mod netinfo;

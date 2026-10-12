@@ -2952,6 +2952,13 @@ function payloadAllowRules(label, coreDir, srsCount, releaseContract) {
       why: '特权 helper：缺了 resolve_helper_binary → Err ⇒ TUN / 路由 / DNS 接管整条不可用，而 app 照常启动（2026-08-10 出过三平台静默缺 helper 的货）。',
     },
     {
+      id: 'installed-core-manifest',
+      re: new RegExp(`^_up_/resources/${core}/core-manifest\\.json$`),
+      min: 1,
+      max: 1,
+      why: 'B2b/B3 本平台安装输入：严格内容 id、完整 core/sidecar 字节和实际 helper 哈希；helper 构建/签名后、App 编译前冻结。',
+    },
+    {
       id: 'main-binary',
       re: /^(polaris|Polaris)(\.exe)?$/,
       min: 0,

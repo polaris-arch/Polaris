@@ -31,6 +31,8 @@ pub struct CoreHandle {
     pub pid: u32,
     birth: Arc<()>,
     mode: BirthMode,
+    pub(crate) owner_uid: Option<u32>,
+    pub(crate) core: Option<Arc<crate::core_store::VerifiedCore>>,
 }
 
 impl CoreHandle {
@@ -42,6 +44,8 @@ impl CoreHandle {
             pid,
             birth: Arc::new(()),
             mode: BirthMode::Legacy,
+            owner_uid: None,
+            core: None,
         }
     }
 
@@ -51,7 +55,23 @@ impl CoreHandle {
             pid: pid.get(),
             birth: Arc::new(()),
             mode: BirthMode::Exact(token),
+            owner_uid: None,
+            core: None,
         }
+    }
+
+    pub(crate) fn with_core(
+        mut self,
+        core: Arc<crate::core_store::VerifiedCore>,
+        owner_uid: u32,
+    ) -> Self {
+        self.core = Some(core);
+        self.owner_uid = Some(owner_uid);
+        self
+    }
+
+    pub(crate) fn caller_allowed(&self, uid: u32) -> bool {
+        uid == 0 || self.owner_uid == Some(uid)
     }
 
     #[must_use]
@@ -159,6 +179,15 @@ pub enum StopReap {
 ///
 /// 对照 Go 源 start 分支的 `c.Start()`（:452）+ stop 的 `terminateChild`（:246-256）+ cleanup 的 `Kill`（:383）。
 pub trait CoreSpawner: Send + Sync {
+    fn spawn_pinned(
+        &self,
+        _req: &SpawnCoreRequest,
+        _core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        Err(SpawnError::Spawn {
+            detail: "pinned spawn unavailable".into(),
+        })
+    }
     /// Inspect every physical birth before a Start can reuse or spawn.
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         current_running.map_or(StartAdmission::Admitted, |handle| StartAdmission::Already {

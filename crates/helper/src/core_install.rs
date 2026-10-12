@@ -37,11 +37,10 @@
 //! - [`prune_extra_files`]：清受保护目录多余旧残留（通用版，keep_names 外全删，best-effort）。
 //! - [`install_core_files`]：完整流程编排（参数校验 + 上三步），平台 hook 留各 helper crate。
 
-mod src_dir;
 
 use polaris_helper_proto::{core_payload, Platform};
 use sha2::{Digest, Sha256};
-use src_dir::SrcDir;
+use crate::core_objects::PayloadDir as SrcDir;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};

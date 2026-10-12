@@ -136,28 +136,16 @@ verifyMacPackagedCore(root, manifest, key, binary);
 NODE
 }
 
-# helper：seal 模式下允许 ad-hoc 补签（本仓产物）。
+# helper bytes were signed and frozen before compiling the App's installation identity.
 check_helper() {
-  local f="$1" kind="$2" rel="$3" level="warning"
+  local f="$1" kind="$2" rel="$3" reference
+  reference="$(dirname "$core_ref")/polaris-helper"
+  cmp -s "$f" "$reference" || fail "包内 helper 与 App 编译前冻结的 helper 不同：${rel}"
   sig_state "$f"
-  [ "$state" = "signed" ] && return 0
-  if [ "$mode" = "verify" ]; then
+  if [ "$state" != signed ]; then
     echo "$detail" >&2
-    fail "最终产物里的 polaris-helper 没有有效签名：${rel}"
+    fail "helper 的签名必须在 App 编译前完成：${rel}"
   fi
-  # 分支顺序与 check_core 相同：universal 的 `file` 输出里同时有 x86_64 与 arm64，必须先被前一支接住。
-  case "${state}:${kind}" in
-    unsigned:*arm64* | unsigned:*universal*) ;;
-    unsigned:*x86_64*) level="notice" ;;
-  esac
-  echo "::${level}::macos-nested-code: ${rel} 没有有效签名（${state}），ad-hoc 补签"
-  codesign --force --sign - --timestamp=none "$f"
-  sig_state "$f"
-  if [ "$state" != "signed" ]; then
-    echo "$detail" >&2
-    fail "补签后仍验不过：${rel}"
-  fi
-  resigned=$((resigned + 1))
 }
 
 count=0
@@ -204,5 +192,11 @@ fi
 if [ "$helper_seen" -lt 1 ]; then
   fail "Contents/Resources 下没有扫到 Mach-O「polaris-helper」（共扫到 ${count} 个 Mach-O）—— 逐个验没有验到它"
 fi
+
+# Verify the exact pre-compilation installation metadata and helper/core bytes.
+core_key="$(basename "$(dirname "$core_ref")")"
+identity_mode=verify
+node "$script_dir/prepare-core-identity.mjs" --platform="$core_key" \
+  --directory="$res/_up_/resources/$core_key" --mode="$identity_mode"
 
 echo "macos-nested-code(${mode}): Contents/Resources 下 ${count} 个 Mach-O 已逐个判定；内核 ${core_seen} 份与源内核逐字节相同（其中未签名的 x86_64 ${core_unsigned} 份，其余签名有效），polaris-helper ${helper_seen} 份签名有效（本次补签 ${resigned} 份）"

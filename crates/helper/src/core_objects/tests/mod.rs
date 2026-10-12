@@ -80,7 +80,7 @@ mod unix {
         )
     }
 
-    /// 没有 `openat2` 的内核上，`SrcDir::open` 走回退路径。那条路的既定行为是：只守最后一级
+    /// 没有 `openat2` 的内核上，`PayloadDir::open` 走回退路径。那条路的既定行为是：只守最后一级
     /// 不跟随，路径中间的链接走得过去，但属主判据照过。`via_link` 是一条中间经过链接、指向
     /// 一个属本进程的 0755 目录的路径。
     #[cfg(target_os = "linux")]
@@ -89,10 +89,10 @@ mod unix {
         let holder = tempfile::tempdir().unwrap();
         symlink(via_link, holder.path().join("final-link")).unwrap();
         assert!(
-            SrcDir::open(&holder.path().join("final-link"), Some(me())).is_err(),
+            PayloadDir::open(&holder.path().join("final-link"), Some(me())).is_err(),
             "回退路径：最后一级是链接仍须拒"
         );
-        let wrong_owner = SrcDir::open(via_link, Some(me() + 1))
+        let wrong_owner = PayloadDir::open(via_link, Some(me() + 1))
             .err()
             .map(|e| e.to_string());
         assert_eq!(
@@ -100,7 +100,7 @@ mod unix {
             Some("not owned by the caller"),
             "回退路径：属主判据仍须生效"
         );
-        SrcDir::open(via_link, Some(me())).expect("回退路径：中间的链接走得过去");
+        PayloadDir::open(via_link, Some(me())).expect("回退路径：中间的链接走得过去");
     }
 
     /// 路径中间某一级是符号链接：`openat2` 那条路整条路径都不穿越。
@@ -111,13 +111,13 @@ mod unix {
         mkdir(&holder.path().join("real/src"));
         symlink(holder.path().join("real"), holder.path().join("link")).unwrap();
         // 正面对照：真实路径打得开。
-        SrcDir::open(&holder.path().join("real/src"), Some(me())).unwrap();
+        PayloadDir::open(&holder.path().join("real/src"), Some(me())).unwrap();
 
         if !openat2_available() {
             assert_fallback_contract(&holder.path().join("link/src"));
             return;
         }
-        assert!(SrcDir::open(&holder.path().join("link/src"), Some(me())).is_err());
+        assert!(PayloadDir::open(&holder.path().join("link/src"), Some(me())).is_err());
     }
 
     /// `/proc/<pid>/root` 这类魔法链接：经它能走进别的挂载命名空间。
@@ -129,13 +129,13 @@ mod unix {
         let via_proc = format!("/proc/self/root{}", src.path().display());
         // 前置条件：这条路径本身是通的（普通的打开走得过去）。
         assert!(std::fs::read_dir(&via_proc).is_ok());
-        SrcDir::open(src.path(), Some(me())).unwrap();
+        PayloadDir::open(src.path(), Some(me())).unwrap();
 
         if !openat2_available() {
             assert_fallback_contract(Path::new(&via_proc));
             return;
         }
-        assert!(SrcDir::open(Path::new(&via_proc), Some(me())).is_err());
+        assert!(PayloadDir::open(Path::new(&via_proc), Some(me())).is_err());
     }
 
     /// 内核没有 `openat2` 时的回退：只守最后一级不跟随，但属主判据照过 —— 回退不放宽它。
@@ -156,10 +156,12 @@ mod unix {
         // 中间一级是链接：回退路径打得开（这是它比 `openat2` 弱的地方）……
         let fd = open_dir_last_component_nofollow(&holder.path().join("link/src")).unwrap();
         // ……但属主不符照样拒。
-        let wrong_owner = SrcDir::from_fd(fd, me() + 1).err().map(|e| e.to_string());
+        let wrong_owner = PayloadDir::from_fd(fd, me() + 1)
+            .err()
+            .map(|e| e.to_string());
         assert_eq!(wrong_owner.as_deref(), Some("not owned by the caller"));
 
         let fd = open_dir_last_component_nofollow(&holder.path().join("link/src")).unwrap();
-        SrcDir::from_fd(fd, me()).unwrap();
+        PayloadDir::from_fd(fd, me()).unwrap();
     }
 }

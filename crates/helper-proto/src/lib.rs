@@ -45,6 +45,8 @@
 
 pub mod codec;
 pub mod command;
+pub mod core_manifest;
+pub mod core_protocol;
 pub mod error;
 pub mod exact_start;
 pub mod request;

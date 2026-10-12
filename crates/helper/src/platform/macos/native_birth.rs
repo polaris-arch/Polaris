@@ -3,8 +3,8 @@
 //! The old PID snapshot/reaper cannot represent failed native waits or an unfinished chown.
 //! Keep one original Child here; workers borrow it, and only wait + the entire tail retire it.
 
-use polaris_helper_proto::response::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};
 use polaris_helper_proto::HelperBirthTarget;
+use polaris_helper_proto::response::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +32,7 @@ enum Phase {
 struct OwnedChild {
     child: Box<dyn NativeChild>,
     log_custody: Option<polaris_log_budget::PipeLogCustody>,
+    core: Option<(Arc<crate::core_store::VerifiedCore>, u32)>,
     phase: Phase,
     native_exited: bool,
     wait_identity_lost: bool,
@@ -46,6 +47,12 @@ pub(super) struct NativeBirth {
 }
 
 impl NativeBirth {
+    pub(super) fn attach_core(&self, core: Arc<crate::core_store::VerifiedCore>, uid: u32) {
+        self.owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .core = Some((core, uid));
+    }
     /// Attach before starting the worker. Registry custody retains the writer capability if
     /// that worker disappears; Poison is retained and can never become a stopped receipt.
     pub(super) fn attach_log_custody(&self, log_custody: polaris_log_budget::PipeLogCustody) {
@@ -70,6 +77,33 @@ pub(super) struct NativeCustody {
 }
 
 impl NativeCustody {
+    pub(super) fn caller_allowed(
+        &self,
+        uid: Option<u32>,
+        id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        let Some(uid) = uid else {
+            return false;
+        };
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        if slot.starting || slot.closing {
+            return false;
+        }
+        let Some(current) = &slot.current else {
+            return true;
+        };
+        let Ok(owned) = current.owned.lock() else {
+            return false;
+        };
+        match &owned.core {
+            Some((core, owner)) => {
+                (uid == 0 || uid == *owner) && id.is_none_or(|id| core.manifest.id == id.as_str())
+            }
+            None => uid == 0 && id.is_none(),
+        }
+    }
     fn slot(&self) -> MutexGuard<'_, Slot> {
         self.slot
             .lock()
@@ -145,6 +179,7 @@ impl NativeCustody {
             owned: Mutex::new(OwnedChild {
                 child,
                 log_custody: None,
+                core: None,
                 phase: if unknown {
                     Phase::Unknown
                 } else {
@@ -169,7 +204,7 @@ impl NativeCustody {
                 Err(poison) => {
                     return NativeBirthStatus::Unknown {
                         target: poison.get_ref().current.as_ref().map(|birth| birth.target),
-                    }
+                    };
                 }
             };
             (slot.current.clone(), slot.starting)

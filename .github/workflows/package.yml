@@ -975,11 +975,19 @@ jobs:
           [ -f "$src" ] || { echo "::error::helper 构建产物不存在：$src"; exit 1; }
           mkdir -p "resources/$res_dir"
           cp "$src" "resources/$res_dir/$bin"
+          if [ "${{ runner.os }}" = macOS ]; then
+            if ! codesign --verify --strict "resources/$res_dir/$bin"; then
+              codesign --force --sign - --timestamp=none "resources/$res_dir/$bin"
+            fi
+            codesign --verify --strict "resources/$res_dir/$bin"
+          fi
           ls -l "resources/$res_dir/$bin"
           if [ "${{ matrix.label }}" = windows ]; then
             cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner --target "${{ matrix.rust_target }}"
             cp "target/${{ matrix.rust_target }}/release/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
           fi
+          node scripts/prepare-core-identity.mjs --platform="$res_dir"
+          printf 'POLARIS_CORE_IDENTITY_FILE=%s/resources/%s/core-manifest.json\n' "$GITHUB_WORKSPACE" "$res_dir" >> "$GITHUB_ENV"
 
       # ── 构建 ──
       # tauri build 自动跑 beforeBuildCommand（pnpm --dir ../ui build）→ 编 Rust → 产安装包。
@@ -1220,8 +1228,7 @@ jobs:
             # 不由下面那次 bundle 封印作证（Resources 下的文件按资源封哈希），故先逐个判定：
             #   · 内核只校验、绝不改写 —— 必须与本次取用的源内核逐字节相同，且签名有效（没有签名的
             #     纯 x86_64 内核放行并留 notice）；验不过即失败，不在打包时补签；
-            #   · polaris-helper 是本仓产物，验不过的在这里 ad-hoc 补签并点名。
-            # 必须排在 bundle 封印**之前**：helper 补签改了文件字节，封印要封的是改后的哈希。
+            #   · helper 在 App 编译前签名并冻结哈希；包内必须与这一份原字节相同。
             bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"
             codesign --force --deep --sign - --timestamp=none "${apps[0]}"
             codesign --verify --deep --strict --verbose=2 "${apps[0]}"

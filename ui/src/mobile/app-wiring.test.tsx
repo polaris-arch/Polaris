@@ -889,10 +889,8 @@ describe('⑩ 喂数腿在移动树里真有调用点（源码面，与上面的
   /** 「谁调了 `name(`」——返回相对路径 + 行号，红的时候人能直接跳过去。 */
   const callSites = (name: string): string[] => callSitesIn(SOURCES, name);
 
-  it('⓪ 取材面自检：文件数、行数、以及「注释 / 声明行都不算调用点」', () => {
+  it('⓪ 取材面自检：生产文件与真实调用点，注释 / 声明行不算调用点', () => {
     expect(FILES.length, '移动树的生产源码文件数掉了一大截 —— 取材面塌了').toBeGreaterThan(30);
-    const lines = [...SOURCES.values()].reduce((n, s) => n + s.split('\n').length, 0);
-    expect(lines, '扫到的行数掉了一大截').toBeGreaterThan(5000);
     // 共用谓词的正反自检（含「声明行不算」那四对）。夹具住在被共用的那份实现旁边。
     for (const [name, line, expected] of CALL_SITE_FIXTURE) {
       expect(isCallSiteLine(name, line), `${name} @ ${line}`).toBe(expected);

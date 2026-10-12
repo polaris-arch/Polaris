@@ -2,7 +2,7 @@
 //!
 //! 源目录由低权限客户端指定、内容由它摆放，本进程以高权限读。这里保证两件事：
 //!
-//! 1. [`SrcDir::open_regular`] 交回的句柄**就是**持有的那个目录里那个名字本身 —— 不是它指向的
+//! 1. [`PayloadDir::open_regular`] 交回的句柄**就是**持有的那个目录里那个名字本身 —— 不是它指向的
 //!    别处，不是打开之后被换掉的另一个目录里的同名文件，也不是一个会把读线程卡住的对象。
 //!    调用方此后只从这个句柄读，不再按路径回头打开。
 //! 2. （unix）目录与文件都**属调用者所有、且组与其他人不可写**：能把内容摆进来的只有调用者
@@ -35,7 +35,7 @@ fn rejected(reason: &'static str) -> io::Error {
 
 /// 已打开的源目录。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) struct SrcDir {
+pub struct PayloadDir {
     dir: nix::dir::Dir,
     owner_uid: u32,
 }
@@ -88,9 +88,9 @@ fn open_dir(path: &Path) -> io::Result<std::os::fd::OwnedFd> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-impl SrcDir {
+impl PayloadDir {
     /// `owner_uid` 是已鉴权的调用者 uid；拿不到（`None`）就不收。
-    pub(super) fn open(path: &Path, owner_uid: Option<u32>) -> io::Result<Self> {
+    pub fn open(path: &Path, owner_uid: Option<u32>) -> io::Result<Self> {
         let owner_uid = owner_uid.ok_or_else(|| rejected("caller identity unavailable"))?;
         Self::from_fd(open_dir(path)?, owner_uid)
     }
@@ -105,12 +105,12 @@ impl SrcDir {
 
     /// 单测：打开目录之后把记下的调用者换掉，单独走到「文件属主不符」那条分支。
     #[cfg(test)]
-    pub(super) fn set_owner_uid_for_test(&mut self, owner_uid: u32) {
+    pub fn set_owner_uid_for_test(&mut self, owner_uid: u32) {
         self.owner_uid = owner_uid;
     }
 
     /// 全部条目名（不含 `.` / `..`，任何类型都列出）；超过 `max` 个即失败。
-    pub(super) fn entry_names(&mut self, max: usize) -> io::Result<Vec<OsString>> {
+    pub fn entry_names(&mut self, max: usize) -> io::Result<Vec<OsString>> {
         use std::os::unix::ffi::OsStrExt;
         let mut names = Vec::new();
         for entry in self.dir.iter() {
@@ -128,7 +128,14 @@ impl SrcDir {
     }
 
     /// 打开源目录里名为 `name` 的**属调用者所有的单链接常规文件**，返回句柄与打开时的大小。
-    pub(super) fn open_regular(&self, name: &str) -> io::Result<(File, u64)> {
+    pub fn open_regular(&self, name: &str) -> io::Result<(File, u64)> {
+        if !matches!(
+            std::path::Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || std::path::Path::new(name).components().count() != 1
+        {
+            return Err(rejected("single payload name required"));
+        }
         use nix::fcntl::{openat, OFlag};
         use nix::sys::stat::{fstat, Mode, SFlag};
         let flags = OFlag::O_RDONLY
@@ -194,12 +201,12 @@ fn parse_dir_entry_names(
 
 /// 已打开的源目录（句柄一直持有，子项相对它打开）。
 #[cfg(windows)]
-pub(super) struct SrcDir(File);
+pub struct PayloadDir(File);
 
 #[cfg(windows)]
-impl SrcDir {
+impl PayloadDir {
     /// Windows 这条腿不判属主（见模块文档），`_owner_uid` 不用。
-    pub(super) fn open(path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {
+    pub fn open(path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -257,7 +264,7 @@ impl SrcDir {
     /// 全部条目名（不含 `.` / `..`，任何类型都列出）；超过 `max` 个即失败。
     ///
     /// 经**持有的句柄**枚举，不按路径重开目录：否则列出来的与随后打开的可以是两个目录。
-    pub(super) fn entry_names(&mut self, max: usize) -> io::Result<Vec<OsString>> {
+    pub fn entry_names(&mut self, max: usize) -> io::Result<Vec<OsString>> {
         use std::mem::offset_of;
         use std::os::windows::ffi::OsStringExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_FULL_DIR_INFO;
@@ -349,7 +356,16 @@ impl SrcDir {
     }
 
     /// 打开源目录里名为 `name` 的**常规文件**，返回句柄与打开时的大小。
-    pub(super) fn open_regular(&self, name: &str) -> io::Result<(File, u64)> {
+    pub fn open_regular(&self, name: &str) -> io::Result<(File, u64)> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.ends_with('.')
+            || name.ends_with(' ')
+            || name.bytes().any(|b| b"/\\:\0\r\n".contains(&b))
+        {
+            return Err(rejected("single payload name required"));
+        }
         let file = self.open_relative(name)?;
         let metadata = file.metadata()?;
         let file_type = metadata.file_type();
@@ -365,19 +381,19 @@ impl SrcDir {
 
 /// 没有 helper 的 target：构造不出来，故下面两个方法不可达。
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(super) struct SrcDir(std::convert::Infallible);
+pub struct PayloadDir(std::convert::Infallible);
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-impl SrcDir {
-    pub(super) fn open(_path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {
+impl PayloadDir {
+    pub fn open(_path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
-    pub(super) fn entry_names(&mut self, _max: usize) -> io::Result<Vec<OsString>> {
+    pub fn entry_names(&mut self, _max: usize) -> io::Result<Vec<OsString>> {
         match self.0 {}
     }
 
-    pub(super) fn open_regular(&self, _name: &str) -> io::Result<(File, u64)> {
+    pub fn open_regular(&self, _name: &str) -> io::Result<(File, u64)> {
         match self.0 {}
     }
 }

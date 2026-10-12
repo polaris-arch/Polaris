@@ -19,23 +19,22 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::line_io;
 use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
-    parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode,
-    HelperBirthToken, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns, Response,
-    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
+    Error as ProtoError, ErrorCode, HelperBirthToken, LinuxBirthStart, LinuxBirthStatus,
+    LinuxBirthStop, LinuxDns, Response, ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
+    parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches,
 };
 
-use crate::core_install::InstallResult;
 use crate::platform::linux::auth::{
-    is_authorized, owned_by, supplementary_groups, AuthError, PeerCred, PeerCredProvider,
+    AuthError, PeerCred, PeerCredProvider, is_authorized, owned_by, supplementary_groups,
 };
-use crate::platform::linux::core_installer::install_core;
-use crate::platform::linux::freeport::{free_port, parse_ss_pids, FreePortDeps};
+use crate::platform::linux::freeport::{FreePortDeps, free_port, parse_ss_pids};
 use crate::platform::linux::ops::SystemdOps;
 use crate::platform::linux::resolved_dns::ResolvedDnsOps;
 use crate::platform::linux::state::{
@@ -214,9 +213,38 @@ fn dispatch_locked<P, S, D, SD>(
     SD: SystemdOps,
 {
     match command {
-        lcmd::STATUS_BIRTH_SAFE => handle_birth_status(state, deps, conn),
-        lcmd::STOP_BIRTH_SAFE => handle_birth_stop(state, deps, conn),
-        lcmd::START_BIRTH_SAFE => handle_start(state, deps, cred, conn, true),
+        cmd::CORE_STATUS => {
+            let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict())
+            else {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            };
+            let Ok(id) = polaris_helper_proto::core_manifest::CoreId::parse(&id) else {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            };
+            let response = Response::Ok(ResponseKind::CoreStatus(crate::pinned_core::status(
+                deps.core_dir,
+                &id,
+            )));
+            let _ = conn.write_line(&response.to_wire_line());
+        }
+        lcmd::STATUS_BIRTH_SAFE => {
+            if caller_owns_slot(state, cred, conn) {
+                handle_birth_status(state, deps, conn);
+            }
+        }
+        lcmd::STOP_BIRTH_SAFE => {
+            if caller_owns_slot(state, cred, conn) {
+                handle_birth_stop(state, deps, conn);
+            }
+        }
+        lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn, true, true),
+        // Retired executable-path/content-write commands never dispatch, even
+        // when no child is running. Only administrative CLI installs bytes.
+        cmd::START | lcmd::START_REAP_SAFE | lcmd::START_BIRTH_SAFE | lcmd::INSTALL_CORE => {
+            let _ = conn.write_line("ERR unknown");
+        }
         _ if legacy_command_rejected(command, state, deps.spawner) => {
             let _ = conn.write_line("ERR unknown");
         }
@@ -224,13 +252,37 @@ fn dispatch_locked<P, S, D, SD>(
         cmd::STOP | lcmd::STOP_REAP_SAFE => handle_stop(state, deps, conn),
         cmd::CLEANUP => handle_cleanup(state, deps, cred, conn),
         cmd::FREEPORT => handle_freeport(deps, cred, conn),
-        // install-core 是 linux 专属命令名（lcmd::INSTALL_CORE == "install-core"）。
-        lcmd::INSTALL_CORE => handle_install_core(deps, cred, conn),
-        cmd::START | lcmd::START_REAP_SAFE => handle_start(state, deps, cred, conn, false),
         _ => {
             let _ = conn.write_line("ERR unknown");
         }
     }
+}
+
+fn caller_owns_slot(state: &HandlerState, cred: &PeerCred, conn: &mut impl Conn) -> bool {
+    if state
+        .child
+        .as_ref()
+        .is_some_and(|child| !child.handle().caller_allowed(cred.uid))
+    {
+        let _ = conn.write_line("ERR slot-owned-by-other-user");
+        false
+    } else {
+        true
+    }
+}
+
+fn birth_start_line(
+    id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    start: LinuxBirthStart,
+) -> String {
+    let kind = match id {
+        Some(id) => ResponseKind::PinnedStart {
+            id: id.clone(),
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start),
+        },
+        None => ResponseKind::LinuxBirthStart(start),
+    };
+    Response::Ok(kind).to_wire_line()
 }
 
 fn legacy_command_rejected(
@@ -549,26 +601,6 @@ fn handle_freeport<P, S, D, SD>(
     let _ = conn.write_line(&resp.to_wire_line());
 }
 
-/// install-core（:396-399）：校验 sha256 + 原子写入 coreDir。
-fn handle_install_core<P, S, D, SD>(
-    deps: &HandlerDeps<'_, P, S, D, SD>,
-    cred: &PeerCred,
-    conn: &mut impl Conn,
-) where
-    P: PeerCredProvider,
-    S: CoreSpawner,
-    D: FreePortDeps,
-    SD: SystemdOps,
-{
-    // :397-398: 读 srcDir 行 + wantHash 行。
-    let src = conn.read_line();
-    let want_hash = conn.read_line();
-    // 源目录与其中文件必须属已鉴权的对端所有：高权限进程只替调用者读它自己的东西。
-    let outcome: InstallResult =
-        install_core(deps.core_dir, src.trim(), want_hash.trim(), cred.uid);
-    let _ = conn.write_line(&outcome.to_wire_line());
-}
-
 /// start（:400-478）：核路径锁 + config 属主校验 + AmbientCaps 拉核。
 #[allow(clippy::too_many_lines)]
 fn handle_start<P, S, D, SD>(
@@ -577,6 +609,7 @@ fn handle_start<P, S, D, SD>(
     cred: &PeerCred,
     conn: &mut impl Conn,
     exact: bool,
+    pinned: bool,
 ) where
     P: PeerCredProvider,
     S: CoreSpawner,
@@ -617,6 +650,38 @@ fn handle_start<P, S, D, SD>(
         )
     };
     let ppid: u32 = ppid_str.trim().parse().unwrap_or(0);
+    let id = if pinned {
+        let lines = vec![
+            singbox.clone(),
+            cfg.clone(),
+            log_path.clone(),
+            fwd.clone(),
+            ppid_str.clone(),
+        ];
+        let Some(params) = polaris_helper_proto::core_protocol::PinnedStartParams::parse(&lines)
+        else {
+            let _ = conn.write_line("ERR bad-args");
+            return;
+        };
+        Some(params.id)
+    } else {
+        None
+    };
+    if !caller_owns_slot(state, cred, conn) {
+        return;
+    }
+    if let Some(id) = &id {
+        if state.child.as_ref().is_some_and(|child| {
+            child
+                .handle()
+                .core
+                .as_ref()
+                .is_none_or(|core| core.manifest.id != id.as_str())
+        }) {
+            let _ = conn.write_line("ERR core-occupied");
+            return;
+        }
+    }
 
     // Admission precedes `already`, validation, forwarding, and spawn. The
     // production spawner inspects every retained native slot, including births
@@ -635,14 +700,14 @@ fn handle_start<P, S, D, SD>(
             {
                 let response = LinuxBirthStart::NotAdmittedPending { target };
                 let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                    &birth_start_line(id.as_ref(), response),
                 );
                 return;
             }
             BirthAdmission::Already(target) => {
                 let response = LinuxBirthStart::Already { target };
                 let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                    &birth_start_line(id.as_ref(), response),
                 );
                 return;
             }
@@ -657,7 +722,7 @@ fn handle_start<P, S, D, SD>(
                     (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
                 };
                 let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
+                    &birth_start_line(id.as_ref(), response),
                 );
                 return;
             }
@@ -696,8 +761,22 @@ fn handle_start<P, S, D, SD>(
         let _ = conn.write_line("ERR coredir-unset");
         return;
     };
-    let core_bin: PathBuf = core_dir.join("sing-box");
-    if Path::new(singbox.trim()) != core_bin.as_path() {
+    let verified = if let Some(id) = &id {
+        match crate::pinned_core::verify(core_dir, id) {
+            Ok(core) => Some(Arc::new(core)),
+            Err(_) => {
+                let _ = conn.write_line("ERR core-invalid");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let core_bin: PathBuf = verified.as_ref().map_or_else(
+        || core_dir.join("sing-box"),
+        |core| core.directory.join("sing-box"),
+    );
+    if !pinned && Path::new(singbox.trim()) != core_bin.as_path() {
         let _ = conn.write_line(&format!(
             "ERR core-path-denied (want {})",
             core_bin.display()
@@ -781,7 +860,11 @@ fn handle_start<P, S, D, SD>(
         groups: supplementary_groups(cred.uid),
     };
     let process_prepare_ms = crate::elapsed_ms(process_prepare_started);
-    match deps.spawner.spawn(&req) {
+    let spawned = match verified {
+        Some(core) => deps.spawner.spawn_pinned(&req, core),
+        None => deps.spawner.spawn(&req),
+    };
+    match spawned {
         Ok(started) => {
             let pid = started.handle.pid;
             let target = started.handle.target();
@@ -797,10 +880,12 @@ fn handle_start<P, S, D, SD>(
             let response = if exact {
                 match target {
                     Some(target) => {
-                        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+                        let start = LinuxBirthStart::Started {
                             target,
                             timing: Some(timing),
-                        }))
+                        };
+                        let _ = conn.write_line(&birth_start_line(id.as_ref(), start));
+                        return;
                     }
                     None => {
                         // A broken spawner cannot publish a successful exact birth.

@@ -22,10 +22,10 @@
 //! socket 权限 0666（任何本地进程可连）—— **token 行是唯一安全边界**（见 [`crate::token`]）。
 //! 0666 是为让普通用户 app 能连；远程不可达（unix socket 仅本机）。
 
-use crate::line_io::{read_line_trimmed_bounded, write_line, BoundedLineError};
-use crate::platform::macos::handler::{dispatch_from_peer, MacConfig, MacServices};
-use polaris_helper_proto::request::{InstallCoreParams, RouteParams, StartParams};
-use polaris_helper_proto::{parse_stop_pid, Request};
+use crate::line_io::{BoundedLineError, read_line_trimmed_bounded, write_line};
+use crate::platform::macos::handler::{MacConfig, MacServices, dispatch_from_peer};
+use polaris_helper_proto::request::RouteParams;
+use polaris_helper_proto::{Request, parse_stop_pid};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -107,6 +107,30 @@ pub fn decode_request<I: Iterator<Item = String>>(
         return Err(DecodeError::LineTooLong);
     }
     match command {
+        polaris_helper_proto::command::common::CORE_STATUS => {
+            let raw = required_line(lines, "core id")?;
+            if checked_line(lines, None)?.is_some() {
+                return Err(DecodeError::MissingArg("exact core status frame"));
+            }
+            let id = polaris_helper_proto::core_manifest::CoreId::parse(&raw)
+                .map_err(|_| DecodeError::MissingArg("core id"))?;
+            Ok(Request::CoreStatus { id })
+        }
+        polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH => {
+            let mut args = Vec::new();
+            for field in ["id", "cfg", "log", "fwd"] {
+                args.push(required_line(lines, field)?);
+            }
+            if let Some(parent) = checked_line(lines, None)? {
+                args.push(parent);
+            }
+            if checked_line(lines, None)?.is_some() {
+                return Err(DecodeError::MissingArg("exact pinned start frame"));
+            }
+            let params = polaris_helper_proto::core_protocol::PinnedStartParams::parse(&args)
+                .ok_or(DecodeError::MissingArg("pinned start"))?;
+            Ok(Request::NativeStartPinned(params))
+        }
         "ping" => Ok(Request::Ping),
         "version" => Ok(Request::Version),
         "status" => Ok(Request::Status),
@@ -154,26 +178,9 @@ pub fn decode_request<I: Iterator<Item = String>>(
             Ok(Request::FreePort { port })
         }
         "start" | polaris_helper_proto::command::common::NATIVE_START_BIRTH => {
-            // helper.go:508-513: cfg/log/fwd/ppid
-            let cfg = required_line(lines, "cfg")?;
-            let log = optional_line(lines)?;
-            let fwd_str = optional_line(lines)?;
-            let fwd = fwd_str.trim() == "1";
-            // helper.go:513: ppid 可选（EOF → "" → 0 → None）
-            let ppid_str = optional_line(lines)?;
-            let parent_pid = ppid_str.trim().parse::<u32>().ok().filter(|&p| p > 0);
-            let params = StartParams {
-                cfg,
-                log,
-                fwd,
-                parent_pid,
-            };
-            Ok(if command == "start" {
-                Request::Start(params)
-            } else {
-                Request::NativeStartBirth(params)
-            })
+            return Err(DecodeError::UnknownCommand(command.into()));
         }
+
         "route-add" | "route-del" => {
             // helper.go:455-456: iface/cidrs
             let iface = required_line(lines, "iface")?;
@@ -192,15 +199,7 @@ pub fn decode_request<I: Iterator<Item = String>>(
             }
             Ok(req)
         }
-        "install-core" => {
-            // helper.go:583-584: src/wantHash
-            let src_dir = required_line(lines, "src_dir")?;
-            let want_hash = required_line(lines, "want_hash")?.trim().to_owned();
-            Ok(Request::InstallCore(InstallCoreParams {
-                src_dir,
-                want_hash,
-            }))
-        }
+        "install-core" => Err(DecodeError::UnknownCommand(command.into())),
         "default-restore" => {
             // helper.go:485: gateway
             let gateway_ipv4 = required_line(lines, "gateway_ipv4")?.trim().to_owned();
@@ -315,10 +314,12 @@ pub fn process_connection_from_peer<R: Read, W: Write>(
     //
     // linux 腿与 Go 源都是**先鉴权后取锁**（`linux/handler.rs` 的步骤 4→5、Go `helper.go` 的
     // `tok != tokenValue() → ERR auth; return` 在 `mu.Lock()` 之前），本处属移植时的次序回退。
-    if !matches!(
-        crate::token::check_token(&token, &services.token_store().token_value()),
-        crate::token::TokenCheck::Authed
-    ) {
+    if peer_uid != Some(0)
+        && !matches!(
+            crate::token::check_token(&token, &services.token_for_peer(peer_uid)),
+            crate::token::TokenCheck::Authed
+        )
+    {
         let resp = polaris_helper_proto::Response::Err(polaris_helper_proto::Error::new(
             polaris_helper_proto::ErrorCode::Auth,
         ));
@@ -405,17 +406,18 @@ fn write_response<W: Write>(writer: &mut W, resp: &polaris_helper_proto::Respons
 mod sys {
     use super::*;
     use crate::platform::accept_retry::{
-        classify_accept_error, AcceptAction, LogThrottle, ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL,
+        ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL, AcceptAction, LogThrottle, classify_accept_error,
     };
     use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
-    use crate::platform::macos::exec::{CommandRunner, SystemRunner, EXEC_TIMEOUT};
+    use crate::platform::macos::exec::{CommandRunner, EXEC_TIMEOUT, SystemRunner};
     use crate::platform::macos::handler::{ChildHandle, SpawnError, TerminateOutcome};
     use crate::platform::macos::native_birth::{NativeBirth, NativeChild, NativeCustody};
     use crate::platform::macos::proc_start::{
-        classify_alive, kill_zero_exists, proc_start_time, AliveProbe, WATCH_TICK_INTERVAL,
+        AliveProbe, WATCH_TICK_INTERVAL, classify_alive, kill_zero_exists, proc_start_time,
     };
     use crate::token::{FileTokenStore, TokenStore};
     use nix::sys::signal::Signal;
+    use polaris_helper_proto::StartParams;
     use polaris_helper_proto::response::{
         NativeBirthStart, NativeBirthStatus, NativeBirthStop, StartTiming,
     };
@@ -485,7 +487,13 @@ mod sys {
             &self.command_mu
         }
 
-        fn do_native_spawn(&self, params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
+        fn do_native_spawn(
+            &self,
+            params: &StartParams,
+            core: Arc<crate::core_store::VerifiedCore>,
+            conf_dir: &str,
+            uid: u32,
+        ) -> Result<NativeBirthStart, SpawnError> {
             if let Err(not_admitted) = self.native.admit() {
                 return Ok(not_admitted);
             }
@@ -514,11 +522,14 @@ mod sys {
             }
             let forwarding_ms = crate::elapsed_ms(forwarding_started);
             let process_started = Instant::now();
-            prepare_cache_for_user(&self.config.conf_dir).map_err(SpawnError::Failed)?;
-            let mut command = std::process::Command::new(&self.config.singbox_bin);
+            prepare_cache_for_user(conf_dir).map_err(SpawnError::Failed)?;
+            let mut command = std::process::Command::new(core.directory.join("sing-box"));
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
             command.arg("run").arg("-c").arg(&params.cfg);
-            if !self.config.conf_dir.is_empty() {
-                command.current_dir(&self.config.conf_dir);
+            if !conf_dir.is_empty() {
+                command.current_dir(conf_dir);
             }
             if !params.log.is_empty() {
                 command.stdout(std::process::Stdio::piped());
@@ -527,10 +538,7 @@ mod sys {
             let log_files = if params.log.is_empty() {
                 None
             } else {
-                match crate::platform::unix_log::preopen_log_files(
-                    &self.config.conf_dir,
-                    &params.log,
-                ) {
+                match crate::platform::unix_log::preopen_log_files(conf_dir, &params.log) {
                     Ok(files) => Some(files),
                     Err(error) => {
                         log::warn!(
@@ -553,6 +561,7 @@ mod sys {
             let birth = self
                 .native
                 .publish(target, Box::new(OwnedNativeChild(child)));
+            birth.attach_core(core, uid);
             admission.1 = true;
             let process_ms = crate::elapsed_ms(process_started);
             let log_handoff_started = Instant::now();
@@ -573,7 +582,7 @@ mod sys {
             spawn_native_worker(
                 Arc::clone(&self.native),
                 Arc::clone(&birth),
-                self.config.conf_dir.clone(),
+                conf_dir.to_owned(),
             );
             if let Some(parent_pid) = params.parent_pid {
                 spawn_native_parent_watch(
@@ -617,6 +626,16 @@ mod sys {
     }
 
     impl MacServices for DaemonServices {
+        fn token_for_peer(&self, uid: Option<u32>) -> String {
+            uid.and_then(|uid| {
+                crate::user_control::token(
+                    Path::new(&self.config.support_dir),
+                    &polaris_helper_proto::core_protocol::CallerIdentity::Unix(uid),
+                )
+                .ok()
+            })
+            .unwrap_or_default()
+        }
         fn token_store(&self) -> &dyn TokenStore {
             &self.token
         }
@@ -626,8 +645,34 @@ mod sys {
         fn child(&self) -> &Mutex<Option<ChildHandle>> {
             &self.child
         }
-        fn native_start(&self, params: &StartParams) -> Result<NativeBirthStart, SpawnError> {
-            self.do_native_spawn(params)
+        fn native_start_pinned(
+            &self,
+            params: &polaris_helper_proto::core_protocol::PinnedStartParams,
+            uid: u32,
+        ) -> Result<NativeBirthStart, SpawnError> {
+            let owner = polaris_helper_proto::core_protocol::CallerIdentity::Unix(uid);
+            let conf =
+                crate::user_control::conf_dir(Path::new(&self.config.support_dir), &owner)
+                    .map_err(|_| SpawnError::Failed("registered user config unavailable".into()))?;
+            let conf = conf
+                .to_str()
+                .ok_or_else(|| SpawnError::Failed("invalid registered config path".into()))?;
+            if !crate::platform::macos::whitelist::cfg_allowed(&params.common.cfg, conf)
+                || (!params.common.log.is_empty()
+                    && !crate::platform::macos::whitelist::cfg_allowed(&params.common.log, conf))
+            {
+                return Err(SpawnError::Failed("config-or-log-path-denied".into()));
+            }
+            let core = crate::pinned_core::verify(Path::new(&self.config.core_dir), &params.id)
+                .map_err(|_| SpawnError::Failed("core-invalid".into()))?;
+            self.do_native_spawn(&params.common, Arc::new(core), conf, uid)
+        }
+        fn native_caller_allowed(
+            &self,
+            uid: Option<u32>,
+            id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+        ) -> bool {
+            self.native.caller_allowed(uid, id)
         }
         fn native_status(&self) -> NativeBirthStatus {
             self.native.status()
@@ -668,24 +713,26 @@ mod sys {
         parent_pid: u32,
         parent_start: Option<String>,
     ) {
-        std::thread::spawn(move || loop {
-            std::thread::sleep(WATCH_TICK_INTERVAL);
-            if !custody.is_current(&birth) {
-                return;
-            }
-            let exists = kill_zero_exists(parent_pid);
-            let current = if exists && parent_start.is_some() {
-                proc_start_time(parent_pid)
-            } else {
-                None
-            };
-            if matches!(
-                classify_alive(exists, parent_start.as_deref(), current.as_deref()),
-                AliveProbe::Dead | AliveProbe::PidReused
-            ) {
-                // Captured birth, never a naked child PID. Old callbacks cannot affect a successor.
-                custody.stop(birth.target);
-                return;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(WATCH_TICK_INTERVAL);
+                if !custody.is_current(&birth) {
+                    return;
+                }
+                let exists = kill_zero_exists(parent_pid);
+                let current = if exists && parent_start.is_some() {
+                    proc_start_time(parent_pid)
+                } else {
+                    None
+                };
+                if matches!(
+                    classify_alive(exists, parent_start.as_deref(), current.as_deref()),
+                    AliveProbe::Dead | AliveProbe::PidReused
+                ) {
+                    // Captured birth, never a naked child PID. Old callbacks cannot affect a successor.
+                    custody.stop(birth.target);
+                    return;
+                }
             }
         });
     }
@@ -852,7 +899,7 @@ mod sys {
 }
 
 #[cfg(target_os = "macos")]
-pub use sys::{serve, DaemonServices};
+pub use sys::{DaemonServices, serve};
 
 #[cfg(test)]
 mod tests;

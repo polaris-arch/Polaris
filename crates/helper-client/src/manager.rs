@@ -395,10 +395,9 @@ impl HelperManager {
         let proto_version = handshake.proto_version;
         let ready = proto_version >= MIN_USABLE_PROTO;
         let expected_proto = expected_proto();
-        let expected_build_id = polaris_helper_proto::build_identity::current();
-        let same_proto_build_mismatch = proto_version == expected_proto
-            && handshake.build_identity.as_deref() != Some(expected_build_id);
-        let upgradeable = ready && (proto_version < expected_proto || same_proto_build_mismatch);
+        // B3: a newer compatible helper serves multiple App/core versions.
+        // Build id remains diagnostic; App overlays its own core-status id proof.
+        let upgradeable = ready && proto_version < expected_proto;
         HelperStatus {
             installed: true,
             ready,

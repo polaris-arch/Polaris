@@ -250,6 +250,11 @@ pub enum LinuxDns {
 /// [`ResponseKind::OkRaw`]（保留原文）——保证解析永不丢消息，便于协议演进期的诊断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseKind {
+    CoreStatus(crate::core_protocol::CoreStatus),
+    PinnedStart {
+        id: crate::core_manifest::CoreId,
+        start: crate::core_protocol::PinnedBirthStart,
+    },
     /// `OK pong uid=<n> v<ver> [build=<id>]`（ping）。
     Pong(Pong),
     /// `OK <ver>`（version）。
@@ -319,6 +324,32 @@ impl Response {
     /// - 其它 → [`Response::Ok`](ResponseKind::OkRaw)，token 为原文（永不丢消息，便于诊断畸形/未来协议响应）。
     #[must_use]
     pub fn parse(line: &str) -> Self {
+        if let Some((birth_line, id)) = line.rsplit_once(" core=") {
+            if let Ok(id) = crate::core_manifest::CoreId::parse(id) {
+                if birth_line.contains(" core=") {
+                    return Self::Ok(ResponseKind::OkRaw {
+                        token: "malformed-pinned-start".into(),
+                        rest: line.into(),
+                    });
+                }
+                let start = match Self::parse(birth_line) {
+                    Self::Ok(ResponseKind::LinuxBirthStart(start)) => {
+                        Some(crate::core_protocol::PinnedBirthStart::Linux(start))
+                    }
+                    Self::Ok(ResponseKind::NativeBirthStart(start)) => {
+                        Some(crate::core_protocol::PinnedBirthStart::Native(start))
+                    }
+                    _ => None,
+                };
+                if let Some(start) = start {
+                    return Self::Ok(ResponseKind::PinnedStart { id, start });
+                }
+            }
+            return Self::Ok(ResponseKind::OkRaw {
+                token: "malformed-pinned-start".into(),
+                rest: line.into(),
+            });
+        }
         if let Some(err) = Error::parse(line) {
             return Self::Err(err);
         }
@@ -338,7 +369,8 @@ impl Response {
         let kind = parse_ok(rest);
         if matches!(
             kind,
-            ResponseKind::LinuxBirthStart(_)
+            ResponseKind::CoreStatus(_)
+                | ResponseKind::LinuxBirthStart(_)
                 | ResponseKind::LinuxBirthStatus(_)
                 | ResponseKind::LinuxBirthStop(_)
                 | ResponseKind::NativeBirthStart(_)
@@ -380,6 +412,18 @@ impl Response {
 /// 把 [`ResponseKind`] 序列化为 `OK ...` wire 行（[`parse_ok`] 的反方向）。
 fn ok_kind_to_wire(kind: &ResponseKind) -> String {
     match kind {
+        ResponseKind::CoreStatus(status) => status.to_wire(),
+        ResponseKind::PinnedStart { id, start } => {
+            let birth = match start {
+                crate::core_protocol::PinnedBirthStart::Linux(start) => {
+                    ResponseKind::LinuxBirthStart(*start)
+                }
+                crate::core_protocol::PinnedBirthStart::Native(start) => {
+                    ResponseKind::NativeBirthStart(*start)
+                }
+            };
+            format!("{} core={}", ok_kind_to_wire(&birth), id.as_str())
+        }
         ResponseKind::Pong(p) => {
             let base = format!("OK pong uid={} v{}", p.uid, p.proto_version);
             p.build_identity
@@ -566,6 +610,9 @@ fn flush_dns_to_wire(f: &FlushDns) -> String {
 /// 分派 `OK <rest>` 的载荷（rest 已剥 "OK " 前缀，可能为空）。
 fn parse_ok(rest: &str) -> ResponseKind {
     let (token, tail) = parse_first_token(rest);
+    if let Some(status) = crate::core_protocol::CoreStatus::parse(token, tail) {
+        return ResponseKind::CoreStatus(status);
+    }
     match token {
         "" => ResponseKind::OkRaw {
             token: String::new(),

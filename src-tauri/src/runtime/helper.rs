@@ -69,6 +69,8 @@ pub(crate) enum HelperStartResult {
     NotAdmitted(StartNotAdmitted),
     BirthStarted(HelperBirthTarget),
     BirthAlready(HelperBirthTarget),
+    /// Keep exact custody so startup can stop a new birth with the wrong/missing content receipt.
+    BirthRejected(HelperBirthTarget),
     BirthNotAdmitted {
         target: Option<HelperBirthTarget>,
         pending: bool,
@@ -830,7 +832,24 @@ impl HelperRuntime {
         }
         let manager = self.manager();
         match self.build_client() {
-            Ok(client) => snapshot_from(&manager.status_with_recovery(&client), supported),
+            Ok(client) => {
+                let mut status = snapshot_from(&manager.status_with_recovery(&client), supported);
+                if status.ready && !status.upgradeable {
+                    match self.core_status() {
+                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => {}
+                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Absent { .. }) => {
+                            status.ready = false;
+                            status.upgradeable = true;
+                        }
+                        Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. })
+                        | Err(_) => {
+                            status.ready = false;
+                            status.needs_repair = true;
+                        }
+                    }
+                }
+                status
+            }
             Err(e) => {
                 log::debug!("helper status：建 client 失败（{e}）→ 视作未就绪");
                 snapshot_from(&HelperStatus::default(), supported)
@@ -990,6 +1009,47 @@ impl HelperRuntime {
         })
     }
 
+    pub(crate) fn core_status(
+        &self,
+    ) -> Result<polaris_helper_proto::core_protocol::CoreStatus, String> {
+        use polaris_helper_proto::core_protocol::CoreStatus;
+        let id = crate::runtime::core_identity::selected_id(
+            crate::runtime::core_identity::current_platform()?,
+        )?;
+        let client = self.build_client()?;
+        match client.send_with_timeout(
+            &Request::CoreStatus { id: id.clone() },
+            Duration::from_secs(5),
+        ) {
+            Ok(Response::Ok(ResponseKind::CoreStatus(status))) => {
+                let reported = match &status {
+                    CoreStatus::Present { id, .. }
+                    | CoreStatus::Absent { id }
+                    | CoreStatus::Invalid { id, .. } => id,
+                };
+                if reported != &id {
+                    return Err("HELPER_CORE_MISMATCH: status content id differs".into());
+                }
+                Ok(status)
+            }
+            _ => {
+                Err("HELPER_CORE_MISMATCH: pinned content status unavailable; update helper".into())
+            }
+        }
+    }
+
+    pub(crate) fn require_selected_core(&self) -> Result<(), String> {
+        match self.core_status()? {
+            polaris_helper_proto::core_protocol::CoreStatus::Present { .. } => Ok(()),
+            polaris_helper_proto::core_protocol::CoreStatus::Absent { .. } => {
+                Err("HELPER_CORE_ABSENT: 提权助手尚未安装本版本配套内核，请更新提权助手".into())
+            }
+            polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. } => {
+                Err("HELPER_CORE_INVALID: 配套内核校验失败，请重新安装提权助手".into())
+            }
+        }
+    }
+
     /// 经就绪 helper 提权起核（TUN 模式，proxy.rs 决策路由后调）。返回 root/SYSTEM 受管核 pid。
     ///
     /// - linux：`Request::LinuxStartBirth`（多带核路径行，helper 校验 == 锁定 coreBin + setuid 回登录用户 +
@@ -1027,35 +1087,67 @@ impl HelperRuntime {
             fwd,
             parent_pid: ppid,
         };
+        let id = crate::runtime::core_identity::selected_id(
+            crate::runtime::core_identity::current_platform()?,
+        )?;
+        let params = polaris_helper_proto::core_protocol::PinnedStartParams {
+            id: id.clone(),
+            common,
+        };
         let req = match self.platform {
-            Platform::Mac | Platform::Win => Request::NativeStartBirth(common),
-            // linux/未知谱系：带核路径行，且**只能**是 helper 锁定的 coreBin（它会逐字比对）。
-            // Android 同臂但不可达：`should_start_via_helper` 对它恒 false（`platform_supported`
-            // 同源），Android 起核走的是进程内 libbox（`android_bridge`），根本不建 helper client。
-            // iOS 同 Android/Other 落 `LinuxStart` 臂，且同样**不可达**：`should_start_via_helper`
-            // 与 `platform_supported` 同源，对 iOS 恒 false ⇒ 根本走不到 `build_client()`。
-            // 本处特有的那半句：iOS 起核连「起一个核进程」这件事都不存在 —— 核是 NE 扩展进程
-            // 自己 `startTunnel` 时在进程内拉起的 libbox，没有可传路径的 exec 面。
-            Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
-                let params = LinuxStartParams {
-                    singbox_path: crate::runtime::core_promote::protected_core_path_in(
-                        &self.protected_core_dir_path(),
-                        std::env::consts::OS,
-                    )
-                    .to_string_lossy()
-                    .into_owned(),
-                    common,
-                };
-                if self.platform == Platform::Linux {
-                    Request::LinuxStartBirth(params)
-                } else {
-                    Request::LinuxStart(params)
-                }
+            Platform::Linux => Request::LinuxStartPinned(params),
+            Platform::Mac | Platform::Win => Request::NativeStartPinned(params),
+            Platform::Other | Platform::Android | Platform::Ios => {
+                return Err("pinned desktop helper unavailable on this platform".into())
             }
         };
-        let resp = client
+        let received = client
             .send_with_timeout(&req, HELPER_START_TIMEOUT)
-            .map_err(|e| format!("helper 起核通信失败：{e}"))?;
+            .map_err(|error| format!("helper pinned 起核通信失败：{error}"))?;
+        let resp = match received {
+            Response::Ok(ResponseKind::PinnedStart { id: actual, start }) if actual == id => {
+                match start {
+                    polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start)
+                        if self.platform == Platform::Linux =>
+                    {
+                        Response::Ok(ResponseKind::LinuxBirthStart(start))
+                    }
+                    polaris_helper_proto::core_protocol::PinnedBirthStart::Native(start)
+                        if matches!(self.platform, Platform::Mac | Platform::Win) =>
+                    {
+                        Response::Ok(ResponseKind::NativeBirthStart(start))
+                    }
+                    _ => return Err("HELPER_CORE_MISMATCH: wrong receipt platform".into()),
+                }
+            }
+            Response::Ok(ResponseKind::PinnedStart { start, .. }) => {
+                return match start {
+                    polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(
+                        LinuxBirthStart::Started { target, .. },
+                    )
+                    | polaris_helper_proto::core_protocol::PinnedBirthStart::Native(
+                        NativeBirthStart::Started { target, .. },
+                    ) => Ok(HelperStartResult::BirthRejected(target)),
+                    _ => Err("HELPER_CORE_MISMATCH: helper content id differs".into()),
+                };
+            }
+            Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+                target,
+                ..
+            }))
+            | Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::Started {
+                target,
+                ..
+            })) => return Ok(HelperStartResult::BirthRejected(target)),
+            Response::Err(error) => {
+                return Err(format_helper_mutation_error(
+                    self.platform,
+                    "pinned 起核",
+                    &error,
+                ))
+            }
+            _ => return Err("HELPER_CORE_MISMATCH: helper omitted pinned receipt".into()),
+        };
         if self.platform == Platform::Linux {
             return classify_linux_birth_start_response(resp);
         }
