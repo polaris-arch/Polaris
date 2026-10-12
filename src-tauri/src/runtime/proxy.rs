@@ -423,6 +423,8 @@ pub mod code {
     /// The pinned Start/status receipt differs from the selected immutable CoreID.
     /// Runtime version strings are diagnostic and never establish this verdict.
     pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
+    /// Another content id/user or pending native custody occupies the helper.
+    pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
     /// The package payload does not match its compiled content identity.
     pub const CORE_BUNDLE_MISMATCH: &str = "CORE_BUNDLE_MISMATCH";
     /// The selected content id has not been installed by an administrator.

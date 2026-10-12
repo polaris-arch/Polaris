@@ -4339,3 +4339,12 @@ fn the_management_secret_has_a_single_reader() {
         vec!["runtime/proxy/management_api.rs".to_string()]
     );
 }
+
+#[test]
+fn occupied_helper_capability_has_a_dedicated_content_resource_error() {
+    let error = crate::runtime::helper::BirthCapabilityError::SlotOccupied("occupied".into());
+    assert_eq!(
+        birth_capability_error_code(&error),
+        code::HELPER_CORE_OCCUPIED
+    );
+}

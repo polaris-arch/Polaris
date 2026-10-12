@@ -562,91 +562,45 @@ fn windows_setup_script_passes_update_flag() {
 }
 
 #[test]
-fn mac_script_must_clear_quarantine_and_resign_adhoc() {
-    // **变异验证（用户点名）**：删掉 quarantine 清除步骤 → 本测试必须转红。
-    // ad-hoc 签名下不清 quarantine = 用户点了更新、装完打不开（最差体验）。
-    let spec = script_of(&plan_of(InstallPlatform::Macos));
-    let s = String::from_utf8(spec.bytes).unwrap();
-    assert!(
-        s.contains("xattr -dr com.apple.quarantine \"$DEST\""),
-        "ad-hoc 签名下必须清 quarantine，否则 Gatekeeper 拦「身份不明的开发者」"
-    );
-    assert!(
-        s.contains("codesign --force --deep --sign - \"$DEST\""),
-        "签名校验不过时必须 ad-hoc 重签（`-s -` 无需任何证书）"
-    );
-    // 清 quarantine 必须在 `open` **之前**（顺序颠倒 = 先被拦一次）。
-    let q = s.find("xattr -dr com.apple.quarantine").unwrap();
-    let o = s.find("open \"$DEST\"").unwrap();
-    assert!(q < o, "清 quarantine 必须早于启动新版");
-    // 兜底指引：若仍起不来，把 .app 亮给用户（可右键→打开放行）。
-    assert!(
-        s.contains("open -R \"$DEST\""),
-        "启动失败须给出用户可执行的下一步"
-    );
-    // 原子性：mv-swap，绝不先 rm 目标。
-    assert!(
-        !s.contains("rm -rf \"$DEST\""),
-        "绝不先毁目标再建（brick 风险）"
-    );
-    assert!(s.contains("hdiutil attach"), "须挂载 DMG");
-    assert!(s.contains("hdiutil detach"), "须卸载 DMG（否则残留挂载点）");
+fn mac_script_checks_adhoc_signature_without_rewriting_frozen_payloads() {
+    let s = String::from_utf8(script_of(&plan_of(InstallPlatform::Macos)).bytes).unwrap();
+    assert!(s.contains("xattr -dr com.apple.quarantine \"$STAGE\""));
+    assert!(s.contains("codesign --verify --deep --strict \"$STAGE\""));
+    assert!(s.contains("codesign --verify --deep --strict \"$DEST\""));
+    assert!(!s.contains("codesign --force"));
+    assert!(!s.contains("--sign -"));
+    assert!(!s.contains("rm -rf \"$DEST\""));
+    let verify = s
+        .find("codesign --verify --deep --strict \"$STAGE\"")
+        .unwrap();
+    let replace = s.find("mv \"$DEST\" \"$BAK\"").unwrap();
+    assert!(verify < replace);
+    assert!(s.contains("hdiutil detach"));
+    assert!(s.contains("open -R \"$BAK\""));
 }
 
-/// 成功判据必须落在 `$STAGE`（被移走 = 真替换过），不得落在 `$BAK` 不在场上。
-///
-/// `[ ! -d "$BAK" ]` 是**三种状态共有**的：真成功、第二步 mv 失败后已回滚、第一步 mv 就失败
-/// （含提权密码框被取消，$BAK 从未产生）。后两种落进成功分支 = 删掉新版与 DMG、把旧版拉起来，
-/// 而调用方已经向前端回了 success。
 #[test]
-fn mac_script_success_branch_keys_on_stage_not_bak() {
-    let spec = script_of(&plan_of(InstallPlatform::Macos));
-    let s = String::from_utf8(spec.bytes).unwrap();
-
-    assert!(
-        s.contains(r#"if [ -d "$DEST" ] && [ ! -d "$STAGE" ]; then"#),
-        "成功判据没落在 $STAGE 上：\n{s}"
-    );
-    assert!(
-        !s.contains(r#"[ ! -d "$BAK" ]"#),
-        "还在用 $BAK 不在场当成功判据 —— 失败已回滚与提权被取消都满足它"
-    );
-
-    // 破坏性收尾必须落在**成功分支体内**。
-    // 不做全局位置比较：脚本更早还有一条合法的早退腿（找不到 `.app` 时 `rm -f "$DMG"; exit 0`），
-    // 全局 `find` 会撞上它 —— 实测本门第一版就是这么误红的。
-    let cond = s.find(r#"[ ! -d "$STAGE" ]"#).expect("上一条已断言存在");
-    let branch_end = s[cond..].find("\nelse\n").map_or(s.len(), |i| cond + i);
-    let branch = &s[cond..branch_end];
-    for destructive in [r#"rm -f "$DMG""#, r#"open "$DEST""#, r#"rm -rf "$STAGE""#] {
-        assert!(
-            branch.contains(destructive),
-            "`{destructive}` 不在成功分支体内（跑到判据之外 = 失败时也会执行）：\n{branch}"
-        );
-    }
-
-    // 失败侧的退路必须还在：重新打开 DMG 让用户手动拖拽。
-    // **判据必须落在 else 分支体内**：脚本更早还有两处 `open "$DMG"`（挂载失败早退、
-    // 定位不到 bundle 的回退），裸 `contains` 会被它们喂饱 —— 实测本门第一版就是这样，
-    // 把 else 里那行删掉照样绿。
-    let else_at = s[cond..]
-        .find("\nelse\n")
-        .map(|i| cond + i)
-        .expect("成功分支没有 else —— 失败时无退路");
-    let else_end = s[else_at..].find("\nfi").map_or(s.len(), |i| else_at + i);
-    let else_body = &s[else_at..else_end];
-    assert!(
-        else_body.contains(r#"open "$DMG""#),
-        "else 分支的手动拖拽退路没了 —— 失败时用户无路可走：\n{else_body}"
-    );
-
-    // 自检：$STAGE 确实是被 mv 走的那个（否则上面的判据在语义上不成立）。
-    assert!(
-        s.contains(r#"mv "$STAGE" "$DEST""#),
-        "$STAGE 不再是被移走的对象，本门的整个前提失效"
-    );
+fn mac_script_success_requires_explicit_candidate_commit_after_verification() {
+    let s = String::from_utf8(script_of(&plan_of(InstallPlatform::Macos)).bytes).unwrap();
+    assert!(s.contains(
+        "if [ -f \"$WORK/committed\" ] && [ -d \"$DEST\" ] && [ ! -d \"$STAGE\" ]; then"
+    ));
+    let verify = s
+        .find("codesign --verify --deep --strict \"$DEST\"")
+        .unwrap();
+    let commit = s.find("touch \"$WORK/committed\"").unwrap();
+    let retire = s.find("rm -rf \"$BAK\"").unwrap();
+    assert!(verify < commit && commit < retire);
+    assert!(s.contains("mv \"$BAK\" \"$DEST\""));
+    assert!(s.contains("recovery-required"));
+    assert!(s.contains("mkdir -m 0700 \"$LOCK\""));
+    assert!(!s.contains(".polaris-update-*.app"));
+    let success = s.rfind("if [ -f \"$WORK/committed\"").unwrap();
+    let tail = &s[success..];
+    let failure = tail.find("\nelse\n").unwrap();
+    assert!(tail[..failure].contains("rm -f \"$DMG\""));
+    assert!(tail[failure..].contains("open \"$DMG\""));
 }
-
 #[test]
 fn mac_script_falls_back_to_open_dmg_without_bundle() {
     let plan = InstallPlan {
@@ -1145,4 +1099,18 @@ fn a_portable_install_never_hands_an_installer_to_the_system() {
     ] {
         assert!(handed.hands_to_system(), "{handed:?}");
     }
+}
+
+#[test]
+fn appimage_update_stages_exact_bytes_before_mutating_the_existing_image() {
+    let s = String::from_utf8(script_of(&plan_of(InstallPlatform::LinuxAppImage)).bytes).unwrap();
+    assert!(!s.contains("cp -f \"$NEW\" \"$DEST\""));
+    let copy = s.find("cp \"$NEW\" \"$STAGE\"").unwrap();
+    let verify = s.find("cmp -s \"$NEW\" \"$STAGE\"").unwrap();
+    let original = s.find("mv \"$DEST\" \"$BAK\"").unwrap();
+    assert!(copy < verify && verify < original);
+    assert!(s.contains("mv \"$BAK\" \"$DEST\""));
+    assert!(s.contains("recovery-required"));
+    assert!(s.contains("mkdir -m 0700 \"$LOCK\""));
+    assert!(!s.contains("nohup \"$NEW\""));
 }

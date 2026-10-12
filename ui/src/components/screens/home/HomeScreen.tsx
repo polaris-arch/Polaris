@@ -611,6 +611,7 @@ export function HomeScreen() {
       // 确认不了提权助手里的内核与本应用配套 → 拒绝以 TUN 起核。下一步是重装或升级助手，
       // 同样与服务器配置无关。
       if (code === ProxyErrorCode.CORE_BUNDLE_MISMATCH ||
+          code === ProxyErrorCode.HELPER_CORE_OCCUPIED ||
           code === ProxyErrorCode.HELPER_CORE_ABSENT ||
           code === ProxyErrorCode.HELPER_CORE_INVALID) {
         toast.error(proxyErrorText({ errorCode: code }, t));

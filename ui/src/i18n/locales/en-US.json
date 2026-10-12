@@ -269,6 +269,10 @@
     "helperCoreInvalid": {
       "title": "Polaris could not start",
       "body": "The installed core failed verification. Go to Settings › Helper to repair it."
+    },
+    "helperCoreOccupied": {
+      "title": "Polaris could not start",
+      "body": "The helper is occupied or still finishing its previous core. Disconnect that core in its owning app, then retry. If ownership cannot be confirmed, arrange administrator maintenance."
     }
   },
   "connections": {
@@ -1701,7 +1705,8 @@
     "systemInterfaceUnsupported": "This node requests a system interface, which Android VPN mode does not support. Turn off the system interface option in the node editor; for custom nodes, set system to false in the JSON.",
     "coreBundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris.",
     "helperCoreAbsent": "This app’s selected core is not installed. Go to Settings › Helper to install it.",
-    "helperCoreInvalid": "The installed core failed verification. Go to Settings › Helper to repair it."
+    "helperCoreInvalid": "The installed core failed verification. Go to Settings › Helper to repair it.",
+    "helperCoreOccupied": "The helper is occupied or still finishing its previous core. Disconnect that core in its owning app, then retry. If ownership cannot be confirmed, arrange administrator maintenance."
   },
   "privacy": {
     "wrongPassword": "Incorrect unlock password",

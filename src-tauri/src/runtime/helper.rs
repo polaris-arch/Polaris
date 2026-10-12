@@ -1762,11 +1762,28 @@ fn stop_birth_with_client_budget(
     }
 }
 
+fn is_helper_slot_occupied(error: &polaris_helper_proto::Error) -> bool {
+    use polaris_helper_proto::ErrorCode;
+    matches!(
+        error.code,
+        ErrorCode::Auth | ErrorCode::Start | ErrorCode::Other
+    ) && matches!(
+        error.detail.as_str(),
+        "slot-owned-by-other-user"
+            | "slot-owned-or-control-busy"
+            | "slot-owned-or-core-occupied"
+            | "core-occupied"
+    )
+}
+
 fn format_helper_mutation_error(
     platform: Platform,
     operation: &str,
     error: &polaris_helper_proto::Error,
 ) -> String {
+    if is_helper_slot_occupied(error) {
+        return "HELPER_CORE_OCCUPIED: helper resource is occupied by an existing core".into();
+    }
     if matches!(platform, Platform::Linux | Platform::Mac | Platform::Win)
         && is_unknown_command_reply(error)
     {
@@ -1820,12 +1837,15 @@ pub(crate) enum BirthCapabilityError {
     HelperOutdated(String),
     /// 其余：通信失败、既有 custody 未清、非预期应答、带尾文的 `ERR unknown`。
     Unavailable(String),
+    SlotOccupied(String),
 }
 
 impl BirthCapabilityError {
     pub(crate) fn into_message(self) -> String {
         match self {
-            Self::HelperOutdated(message) | Self::Unavailable(message) => message,
+            Self::HelperOutdated(message)
+            | Self::Unavailable(message)
+            | Self::SlotOccupied(message) => message,
         }
     }
 }
@@ -1841,6 +1861,11 @@ fn require_linux_birth_capability_with_client(
     }
     match client.send_with_timeout(&Request::LinuxStatusBirth, Duration::from_millis(1500)) {
         Ok(Response::Ok(ResponseKind::LinuxBirthStatus(_))) => Ok(()),
+        Ok(Response::Err(error)) if is_helper_slot_occupied(&error) => {
+            Err(BirthCapabilityError::SlotOccupied(
+                "HELPER_CORE_OCCUPIED: helper resource is occupied by an existing core".into(),
+            ))
+        }
         Ok(Response::Err(error)) if is_unknown_command_reply(&error) => Err(HelperOutdated(
             "已安装的 Linux helper 不支持 exact birth 安全协议；请升级或修复 helper 后重试"
                 .to_owned(),
@@ -1874,6 +1899,11 @@ fn require_native_birth_capability_with_client(
         Ok(Response::Ok(ResponseKind::NativeBirthStatus(status))) => Err(Unavailable(format!(
             "helper native birth 起核未获准：既有 custody={status:?}，等待同birth native Stop后重试"
         ))),
+        Ok(Response::Err(error)) if is_helper_slot_occupied(&error) => {
+            Err(BirthCapabilityError::SlotOccupied(
+                "HELPER_CORE_OCCUPIED: helper resource is occupied by an existing core".into(),
+            ))
+        }
         Ok(Response::Err(error)) if is_unknown_command_reply(&error) => {
             Err(HelperOutdated(unsupported(&error)))
         }

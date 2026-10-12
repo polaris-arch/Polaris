@@ -316,6 +316,7 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
   });
 
   it.each([
+    ['HELPER_CORE_OCCUPIED', 'helperCoreOccupied'],
     ['CORE_BUNDLE_MISMATCH', 'coreBundleMismatch'],
     ['HELPER_CORE_ABSENT', 'helperCoreAbsent'],
     ['HELPER_CORE_INVALID', 'helperCoreInvalid'],
@@ -366,7 +367,7 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
       'HELPER_NOT_INSTALLED',
       'ROOT_ORPHAN_BLOCKED',
       'CORE_NOT_EXECUTABLE',
-      'CORE_BUNDLE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID',
+      'HELPER_CORE_OCCUPIED', 'CORE_BUNDLE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID',
       'HELPER_CORE_MISMATCH',
     ])(
       '%s：认领期内仍必须刷连接态（await 腿并不刷，漏刷则 UI 停在假「已连接」）',

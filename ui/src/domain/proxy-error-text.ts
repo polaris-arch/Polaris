@@ -34,6 +34,7 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   CORE_BINARY_MISMATCH: 'errors.coreBinaryMismatch',
   CORE_NOT_EXECUTABLE: 'errors.coreNotExecutable',
   CORE_BUNDLE_MISMATCH: 'errors.coreBundleMismatch',
+  HELPER_CORE_OCCUPIED: 'errors.helperCoreOccupied',
   HELPER_CORE_ABSENT: 'errors.helperCoreAbsent',
   HELPER_CORE_INVALID: 'errors.helperCoreInvalid',
   HELPER_CORE_MISMATCH: 'errors.helperCoreMismatch',

@@ -269,6 +269,10 @@
     "helperCoreInvalid": {
       "title": "Polaris 无法启动",
       "body": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。"
+    },
+    "helperCoreOccupied": {
+      "title": "Polaris 无法启动",
+      "body": "助手资源已被占用，或上一内核尚未收口。请先在属主应用中正常断开，再重试；归属无法确认时，请安排管理员维护。"
     }
   },
   "connections": {
@@ -1701,7 +1705,8 @@
     "systemInterfaceUnsupported": "此节点请求系统网卡，Android VPN 模式不支持。请在节点编辑中关闭系统网卡选项；自定义节点请将 JSON 中的 system 设为 false。",
     "coreBundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。",
     "helperCoreAbsent": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。",
-    "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。"
+    "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。",
+    "helperCoreOccupied": "助手资源已被占用，或上一内核尚未收口。请先在属主应用中正常断开，再重试；归属无法确认时，请安排管理员维护。"
   },
   "privacy": {
     "wrongPassword": "解锁密码错误",

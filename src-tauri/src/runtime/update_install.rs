@@ -18,7 +18,7 @@
 //!
 //! | 平台 | 症状 | 应用内能否消除 | 本模块的处置 |
 //! |---|---|---|---|
-//! | macOS | 下载件带 `com.apple.quarantine` → Gatekeeper「来自身份不明的开发者」，**装完打不开** | ✅ **能** | 安装脚本在替换成功后**必跑** `xattr -dr com.apple.quarantine`（对齐 上游 `update-install-script.ts:259`）+ ad-hoc 重签兜底；失败分支给出「右键→打开」指引 |
+//! | macOS | 下载件带 `com.apple.quarantine` → Gatekeeper「来自身份不明的开发者」，**装完打不开** | ✅ **能** | 安装脚本在替换成功后**必跑** `xattr -dr com.apple.quarantine`（对齐 上游 `update-install-script.ts:259`）+ 验证随包签名且保留冻结字节；失败保留安装件并恢复原文件 |
 //! | Windows | SmartScreen「未知发布者」 | ❌ **不能**（唯一解是买证书 / 攒信誉） | 安装**前**经 [`install_advisory`] 返 [`InstallAdvisory::WindowsSmartScreen`]，UI 弹说明框告知「更多信息 → 仍要运行」的具体点法 |
 //!
 //! **诚实原则**：无法在应用内消除拦截的平台，**必须**在安装前把用户可执行的下一步说清楚
@@ -30,8 +30,8 @@
 //! |---|---|---|
 //! | Windows NSIS | `buildWindowsUpdateVbs`（UTF-16LE+BOM 的 `.vbs`，`wscript` 无窗口跑） | [`build_install_script`] → [`ScriptSpec`] |
 //! | Windows 便携 | 上游便携版是单个自解压 exe，脚本把新 exe 拷进原目录 | **本仓便携版是 zip**（`Polaris_<version>_x64-win-Portable.zip`），没有脚本腿：[`InstallPlatform::WindowsPortable`] 由 command 层停核 → 打开压缩包与程序目录 → 退出，用户在应用退出后覆盖解压 |
-//! | macOS | `buildMacUpdateScript`（`hdiutil attach` → `ditto` 暂存 → mv-swap 原子替换 → `xattr -dr`） | 同上 |
-//! | Linux AppImage | `buildLinuxAppImageScript`（覆盖 `$APPIMAGE` + chmod +x） | 同上 |
+//! | macOS | `buildMacUpdateScript`（`hdiutil attach` → `ditto` 私有暂存 → 签名核验 → 原子替换/本次失败恢复） | 同上 |
+//! | Linux AppImage | `buildLinuxAppImageScript`（同目录暂存核验 + rename 替换/失败恢复） | 同上 |
 //! | Linux deb | `buildLinuxDebScript`（`pkexec apt-get install`） | 同上 |
 //! | Android | **上游没有这一腿**（ 上游 是桌面 Electron 应用） | [`InstallPlatform::Android`]：不生成脚本，经 FileProvider 交系统安装器（`android_bridge::hand_apk_to_system_installer`） |
 //! | 形态错配 | 不强制 root，回退 `shell.openPath` 交系统（`UpdateService.ts:427-436`） | [`InstallReject::FormMismatch`]，command 层回退 `shell.open` |
@@ -605,80 +605,95 @@ const UNIX_EXIT_WAIT: &str =
 ///
 /// 替换成功后**必跑** `xattr -dr com.apple.quarantine "$DEST"`：ad-hoc 签名的 `.app` 一旦带
 /// quarantine 属性，Gatekeeper 直接拒绝启动（「来自身份不明的开发者」）——**用户点了更新、装完打不开**，
-/// 比不做更新还糟。再加一道 `codesign` 校验 + ad-hoc 重签兜底；两步都失败才落到「右键→打开」指引。
+/// 比不做更新还糟。验证发行时已有的签名；失败保留候选并恢复本次操作前的原文件，不重签冻结的 helper/core。
 fn build_mac_script(plan: &InstallPlan) -> String {
     let dmg = sh_quote(&plan.installer_path.to_string_lossy());
     let Some(bundle) = plan.app_bundle_path.as_ref() else {
-        // 定位不到 `.app` → 回退手动拖拽（**不猜路径**）。
         return format!("#!/bin/bash\n{UNIX_EXIT_WAIT}\nopen {dmg}\n");
     };
     let dest = sh_quote(&bundle.to_string_lossy());
-    [
-        "#!/bin/bash",
-        UNIX_EXIT_WAIT,
-        &format!("DMG={dmg}"),
-        &format!("DEST={dest}"),
-        "BAK=\"$DEST.bak-$$\"",
-        "STAGE=\"$(dirname \"$DEST\")/.polaris-update-$$.app\"",
-        // 清历史中断遗留的暂存（防 /Applications 下垃圾堆积）。
-        "rm -rf \"$(dirname \"$DEST\")\"/.polaris-update-*.app 2>/dev/null",
-        "MNT=$(hdiutil attach \"$DMG\" -nobrowse -noautoopen -mountrandom /tmp 2>/dev/null | grep -o \"/tmp/[^[:space:]]*\" | tail -1)",
-        "[ -z \"$MNT\" ] && { open \"$DMG\"; exit 0; }",
-        "SRC=$(/usr/bin/find \"$MNT\" -maxdepth 1 -name \"*.app\" | head -1)",
-        "[ -z \"$SRC\" ] && { hdiutil detach \"$MNT\" >/dev/null 2>&1; rm -f \"$DMG\"; exit 0; }",
-        "rm -rf \"$STAGE\"",
-        "if ! ditto \"$SRC\" \"$STAGE\"; then hdiutil detach \"$MNT\" >/dev/null 2>&1; rm -rf \"$STAGE\"; rm -f \"$DMG\"; exit 0; fi",
-        "hdiutil detach \"$MNT\" >/dev/null 2>&1",
-        // mv-swap 原子替换（**绝不先毁后建**）；失败回滚旧版并保留 $BAK 可人工恢复。
-        "replace() {",
-        "  mv \"$DEST\" \"$BAK\" 2>/dev/null || return 1",
-        "  if mv \"$STAGE\" \"$DEST\" 2>/dev/null; then rm -rf \"$BAK\"; return 0; fi",
-        "  mv \"$BAK\" \"$DEST\" 2>/dev/null; return 1",
-        "}",
-        "if ! replace; then",
-        // 无提权失败 → 同一 mv-swap 落盘成脚本，osascript 一次性 root 跑（系统原生密码框，不依赖常驻 helper）。
-        "  ELEV=\"$(dirname \"$DEST\")/.polaris-elev-$$.sh\"",
-        "  cat > \"$ELEV\" <<EOF",
-        "#!/bin/bash",
-        "mv $(printf %q \"$DEST\") $(printf %q \"$BAK\") || exit 1",
-        "mv $(printf %q \"$STAGE\") $(printf %q \"$DEST\") || { mv $(printf %q \"$BAK\") $(printf %q \"$DEST\"); exit 1; }",
-        "rm -rf $(printf %q \"$BAK\")",
-        "EOF",
-        "  osascript -e \"do shell script \\\"/bin/bash '$ELEV'\\\" with administrator privileges\" 2>/dev/null",
-        "  rm -f \"$ELEV\"",
-        "fi",
-        // 成功判据取 **$STAGE 是否已被移走**，不取 `[ ! -d "$BAK" ]`。
-        //
-        // `$BAK` 不在场是**三种状态共有**的，其中两种是失败：
-        //   ① 真成功（`mv "$STAGE" "$DEST"` 后 `rm -rf "$BAK"`）
-        //   ② 第二步 mv 失败 → 脚本自己回滚（`mv "$BAK" "$DEST"`）⇒ $BAK 也不在，而 $DEST 是**旧版**
-        //   ③ 第一步 mv 就失败（非管理员账户 / .app 在只读位置）或提权密码框被取消 ⇒ $BAK 从未产生
-        // ②③ 落进成功分支的后果是：删掉已解压好的新版与刚下载的 DMG、把**旧版**重新拉起来，
-        // 而调用方在 spawn 后立即 `app.exit(0)` 并向前端回 success ⇒ 用户看到「更新完成、应用重启」，
-        // 版本号却没变，且手动拖拽的退路（else 分支的 `open "$DMG"`）被绕过、安装包已被删。
-        //
-        // `$STAGE` 没有这个歧义：成功时它被 `mv` 移走，**任何**失败腿上它都还在
-        //（第一步失败没动过它；第二步失败后回滚也没动过它；提权腿的 mv 失败同理）。
-        "if [ -d \"$DEST\" ] && [ ! -d \"$STAGE\" ]; then",
-        // ── ad-hoc 签名必需的两步（顺序不可换）──
-        // ① 清 quarantine：不清则 Gatekeeper 拦「身份不明的开发者」→ 装完打不开。
-        "  xattr -dr com.apple.quarantine \"$DEST\" 2>/dev/null",
-        // ② 校验签名；ad-hoc 签名在替换过程中可能被破坏 → 就地重签（`-s -` = ad-hoc，无需任何证书）。
-        "  if ! codesign --verify --deep --strict \"$DEST\" >/dev/null 2>&1; then",
-        "    codesign --force --deep --sign - \"$DEST\" >/dev/null 2>&1",
-        "  fi",
-        "  rm -rf \"$STAGE\" 2>/dev/null",
-        "  rm -f \"$DMG\"",
-        "  open \"$DEST\"",
-        // ③ 兜底：`open` 若仍被 Gatekeeper 拦，把 .app 所在目录亮出来，用户可「右键 → 打开」放行。
-        "  sleep 3",
-        "  pgrep -f \"$DEST\" >/dev/null 2>&1 || open -R \"$DEST\"",
-        "else",
-        "  open \"$DMG\"",
-        "fi",
-        "",
-    ]
-    .join("\n")
+    ["#!/bin/bash", UNIX_EXIT_WAIT, &format!("DMG={dmg}"), &format!("DEST={dest}"), r#"
+set -u
+PARENT=$(dirname "$DEST")
+WORK=$(mktemp -d "$PARENT/.polaris-update.XXXXXX") || { open "$DMG"; open "$DEST"; exit 1; }
+chmod 0700 "$WORK"
+LOCK="$PARENT/.polaris-update.lock"
+if ! mkdir -m 0700 "$LOCK"; then rm -rf "$WORK"; open "$DMG"; exit 1; fi
+STAGE="$WORK/candidate.app"
+BAK="$WORK/original.app"
+MNT=''
+MOUNTED=0
+cleanup() {
+  if [ "$MOUNTED" -eq 1 ]; then hdiutil detach "$MNT" >/dev/null 2>&1 || return; fi
+  if [ -n "$MNT" ]; then rmdir "$MNT" 2>/dev/null || true; fi
+  if [ -e "$BAK" ] || [ -e "$WORK/recovery-required" ]; then
+    echo "Polaris update recovery retained: $WORK" >&2
+    return
+  fi
+  rm -rf "$WORK" && rmdir "$LOCK"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+MNT=$(mktemp -d /tmp/polaris-update-mount.XXXXXX) || { open "$DMG"; exit 1; }
+if ! hdiutil attach "$DMG" -readonly -nobrowse -noautoopen -mountpoint "$MNT" >/dev/null 2>&1; then
+  open "$DMG"; open "$DEST"; exit 1
+fi
+MOUNTED=1
+APPS=("$MNT"/*.app)
+if [ "${#APPS[@]}" -ne 1 ] || [ ! -d "${APPS[0]}" ] || [ -L "${APPS[0]}" ]; then
+  open "$DMG"; open "$DEST"; exit 1
+fi
+if ! ditto "${APPS[0]}" "$STAGE"; then open "$DMG"; open "$DEST"; exit 1; fi
+# Preserve every compiled helper/core byte. Quarantine removal changes xattrs;
+# signature verification never repairs or rewrites a nested executable.
+xattr -dr com.apple.quarantine "$STAGE" 2>/dev/null || true
+if ! codesign --verify --deep --strict "$STAGE" >/dev/null 2>&1; then
+  echo 'Polaris candidate signature invalid; frozen payload was not resigned' >&2
+  open "$DMG"; open "$DEST"; exit 1
+fi
+if ! hdiutil detach "$MNT" >/dev/null 2>&1; then open "$DMG"; exit 1; fi
+MOUNTED=0
+replace() {
+  [ ! -e "$BAK" ] || return 2
+  mv "$DEST" "$BAK" 2>/dev/null || return 1
+  if mv "$STAGE" "$DEST" 2>/dev/null && codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 && touch "$WORK/committed"; then
+    rm -rf "$BAK"
+    return 0
+  fi
+  if [ -e "$DEST" ] && ! mv "$DEST" "$WORK/rejected.app"; then
+    touch "$WORK/recovery-required"; return 2
+  fi
+  if ! mv "$BAK" "$DEST"; then touch "$WORK/recovery-required"; return 2; fi
+  return 1
+}
+if ! replace; then
+  # Elevation retries only this intact candidate after a permission failure.
+  # A failed rollback retains its original bytes and is never retried blindly.
+  if [ -d "$STAGE" ] && [ ! -e "$BAK" ] && [ ! -e "$WORK/recovery-required" ]; then
+    ELEV="$WORK/replace.sh"
+    {
+      printf '%s\n' '#!/bin/bash' 'set -u'
+      printf 'DEST=%q\nSTAGE=%q\nBAK=%q\nWORK=%q\n' "$DEST" "$STAGE" "$BAK" "$WORK"
+      declare -f replace
+      printf '%s\n' 'replace'
+    } > "$ELEV"
+    chmod 0700 "$ELEV"
+    osascript - "$ELEV" <<'POLARIS_ELEVATE'
+on run argv
+  do shell script "/bin/bash " & quoted form of (item 1 of argv) with administrator privileges
+end run
+POLARIS_ELEVATE
+  fi
+fi
+if [ -f "$WORK/committed" ] && [ -d "$DEST" ] && [ ! -d "$STAGE" ]; then
+  rm -f "$DMG"
+  open "$DEST" || open -R "$DEST"
+else
+  open "$DMG"
+  if [ -d "$DEST" ]; then open "$DEST"; fi
+  if [ -e "$BAK" ]; then open -R "$BAK"; fi
+fi
+"#].join("\n")
 }
 
 /// Linux AppImage 原位覆盖脚本（移植 `buildLinuxAppImageScript`）。
@@ -696,17 +711,46 @@ fn build_linux_appimage_script(plan: &InstallPlan) -> String {
         UNIX_EXIT_WAIT,
         &format!("NEW={src}"),
         &format!("DEST={dst}"),
-        // 只覆盖 AppImage 这一个文件；`~/.config/polaris` 不动 → 配置 + 已更新内核零丢失。
-        "if cp -f \"$NEW\" \"$DEST\" 2>/dev/null; then",
-        "  chmod +x \"$DEST\" 2>/dev/null",
-        "  rm -f \"$NEW\" 2>/dev/null",
-        "  nohup \"$DEST\" >/dev/null 2>&1 &",
-        "else",
-        // 覆盖失败（原 AppImage 只读/无权限）→ 跑临时新版，至少本次拿到新版（不删临时件）。
-        "  chmod +x \"$NEW\" 2>/dev/null",
-        "  nohup \"$NEW\" >/dev/null 2>&1 &",
-        "fi",
-        "",
+        r#"
+set -u
+WORK=$(mktemp -d "$(dirname "$DEST")/.polaris-update.XXXXXX") || {
+  nohup "$DEST" >/dev/null 2>&1 &
+  xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
+  exit 1
+}
+chmod 0700 "$WORK"
+LOCK="$(dirname "$DEST")/.polaris-update.lock"
+if ! mkdir -m 0700 "$LOCK"; then rm -rf "$WORK"; exit 1; fi
+STAGE="$WORK/candidate.AppImage"
+BAK="$WORK/original.AppImage"
+cleanup() {
+  if [ -e "$BAK" ] || [ -e "$WORK/recovery-required" ]; then
+    echo "Polaris update recovery retained: $WORK" >&2
+  else rm -rf "$WORK" && rmdir "$LOCK"; fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if ! cp "$NEW" "$STAGE" || ! cmp -s "$NEW" "$STAGE" || ! chmod 0755 "$STAGE"; then
+  nohup "$DEST" >/dev/null 2>&1 &
+  xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
+  exit 1
+fi
+if ! mv "$DEST" "$BAK"; then nohup "$DEST" >/dev/null 2>&1 & exit 1; fi
+if mv "$STAGE" "$DEST"; then
+  rm -f "$BAK"
+  rm -f "$NEW"
+  nohup "$DEST" >/dev/null 2>&1 &
+else
+  if ! mv "$BAK" "$DEST"; then
+    touch "$WORK/recovery-required"
+    xdg-open "$WORK" >/dev/null 2>&1 &
+    exit 1
+  fi
+  nohup "$DEST" >/dev/null 2>&1 &
+  xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
+  exit 1
+fi
+"#,
     ]
     .join("\n")
 }

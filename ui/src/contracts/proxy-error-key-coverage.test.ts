@@ -259,7 +259,7 @@ describe('G2 映射表指向的键在五份 locale 里都有真译文', () => {
  * 用户端一个字都看不到 —— 这一侧此前没有任何门。
  */
 const MUST_BE_ROUTED = [
-  'CORE_BUNDLE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID', 'HELPER_CORE_MISMATCH',
+  'HELPER_CORE_OCCUPIED', 'CORE_BUNDLE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID', 'HELPER_CORE_MISMATCH',
   // 自动换节点落空（可用节点都要整核重启才能切过去）：整件事全程在后台发生、用户完全无感。
   // 不上屏 = 用户只知道「网怎么突然不通了」，不知道自己其实可以手动换个节点或重启代理。
   'AUTO_SWITCH_NEEDS_RESTART',

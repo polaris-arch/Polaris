@@ -269,6 +269,10 @@
     "helperCoreInvalid": {
       "title": "Polaris 無法啟動",
       "body": "已安裝核心未通過內容驗證，請前往「設定 › Helper」修復。"
+    },
+    "helperCoreOccupied": {
+      "title": "Polaris 無法啟動",
+      "body": "助手資源已被占用，或上一個核心尚未完成收尾。請先在擁有者的應用程式中正常中斷連線，再重試；無法確認歸屬時，請安排管理員維護。"
     }
   },
   "connections": {
@@ -1701,7 +1705,8 @@
     "systemInterfaceUnsupported": "此節點要求系統網卡，Android VPN 模式不支援。請在節點編輯中關閉系統網卡選項；自訂節點請將 JSON 中的 system 設為 false。",
     "coreBundleMismatch": "隨附核心與本應用程式的內容身分不符，請重新安裝 Polaris。",
     "helperCoreAbsent": "本應用程式選定的核心尚未安裝，請前往「設定 › Helper」安裝。",
-    "helperCoreInvalid": "已安裝核心未通過內容驗證，請前往「設定 › Helper」修復。"
+    "helperCoreInvalid": "已安裝核心未通過內容驗證，請前往「設定 › Helper」修復。",
+    "helperCoreOccupied": "助手資源已被占用，或上一個核心尚未完成收尾。請先在擁有者的應用程式中正常中斷連線，再重試；無法確認歸屬時，請安排管理員維護。"
   },
   "privacy": {
     "wrongPassword": "解鎖密碼錯誤",

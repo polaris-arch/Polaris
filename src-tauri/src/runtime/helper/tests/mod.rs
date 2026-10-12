@@ -1221,3 +1221,32 @@ fn selected_core_status_projection_keeps_identity_and_native_state_read_only() {
     assert_eq!(wire["selectedCore"]["state"], "absent");
     assert!(!helper_install_reached_expected_build(&status));
 }
+
+#[test]
+fn native_slot_denial_is_not_an_authentication_or_node_configuration_hint() {
+    use polaris_helper_proto::{Error, ErrorCode};
+    for error in [
+        Error::with_detail(ErrorCode::Auth, "slot-owned-by-other-user"),
+        Error::with_detail(ErrorCode::Auth, "slot-owned-or-core-occupied"),
+        Error::with_detail(ErrorCode::Start, "core-occupied"),
+        Error::parse("ERR slot-owned-by-other-user").unwrap(),
+    ] {
+        assert!(is_helper_slot_occupied(&error));
+        assert!(format_helper_mutation_error(Platform::Win, "start", &error)
+            .starts_with("HELPER_CORE_OCCUPIED:"));
+    }
+    for error in [
+        Error::new(ErrorCode::Auth),
+        Error::with_detail(ErrorCode::Other, "arbitrary native error"),
+        Error::new(ErrorCode::Unknown),
+    ] {
+        assert!(!is_helper_slot_occupied(&error));
+    }
+    let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
+        b"ERR auth slot-owned-by-other-user\n".to_vec(),
+    )]);
+    assert!(matches!(
+        require_native_birth_capability_with_client(&client),
+        Err(BirthCapabilityError::SlotOccupied(_))
+    ));
+}

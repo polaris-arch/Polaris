@@ -709,6 +709,7 @@ pub(super) fn birth_capability_error_code(
             code::HELPER_NOT_INSTALLED
         }
         crate::runtime::helper::BirthCapabilityError::Unavailable(_) => code::STARTUP_FAILED,
+        crate::runtime::helper::BirthCapabilityError::SlotOccupied(_) => code::HELPER_CORE_OCCUPIED,
     }
 }
 
@@ -2607,7 +2608,10 @@ impl ProxyRuntime {
             tokio::task::spawn_blocking(move || helper.require_native_birth_capability())
                 .await
                 .map_err(|error| format!("helper native birth capability task failed: {error}"))?
-                .map_err(crate::runtime::helper::BirthCapabilityError::into_message)?;
+                .map_err(|error| {
+                    let code = birth_capability_error_code(&error);
+                    StartError::coded(error.into_message(), code)
+                })?;
             if self.gate.generation() != my_gen {
                 return Ok(None);
             }
@@ -2712,23 +2716,27 @@ impl ProxyRuntime {
                 ));
             }
             Ok(HelperStartResult::BirthAlready(target)) => {
-                return Err(format!(
-                    "helper exact birth 已有受管核 {target:?}；本次配置未获启动证明，保留既有 custody"
-                )
-                .into());
+                return Err(StartError::coded(
+                    format!(
+                        "existing helper birth {target:?}; this configuration was not admitted"
+                    ),
+                    code::HELPER_CORE_OCCUPIED,
+                ));
             }
             Ok(HelperStartResult::NotAdmitted(blocker)) => {
-                return Err(format!(
-                    "helper 起核未获准：此前受管核 pid={} 仍处于 {blocker:?} custody",
-                    blocker.pid()
-                )
-                .into());
+                return Err(StartError::coded(
+                    format!("helper custody still retained: {blocker:?}"),
+                    code::HELPER_CORE_OCCUPIED,
+                ));
             }
             Ok(HelperStartResult::BirthNotAdmitted { target, pending }) => {
-                return Err(format!(
-                    "helper exact birth 起核未获准：既有 custody={target:?} pending={pending}"
-                )
-                .into());
+                return Err(StartError::coded(
+                    format!("helper custody still retained: {target:?}, pending={pending}"),
+                    code::HELPER_CORE_OCCUPIED,
+                ));
+            }
+            Err(error) if error.starts_with("HELPER_CORE_OCCUPIED:") => {
+                return Err(StartError::coded(error, code::HELPER_CORE_OCCUPIED));
             }
             Err(e) => return Err(e.into()),
         };

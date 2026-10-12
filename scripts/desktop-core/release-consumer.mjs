@@ -47,6 +47,7 @@ export const ADAPTER_FILES = ['scripts/desktop-core/release-consumer.mjs', 'scri
   '.github/workflows/package.yml',
   'crates/helper-proto/src/lib.rs', 'crates/helper-proto/src/codec.rs', 'crates/helper-proto/src/error.rs',
   'crates/helper-client/src/client.rs', 'crates/helper-client/src/transport.rs',
+  'src-tauri/src/runtime/update_install.rs',
   'src-tauri/src/runtime/core_paths.rs', 'src-tauri/src/runtime/proxy/core_binary.rs',
   'src-tauri/src/runtime/proxy/startup.rs', 'src-tauri/src/runtime/proxy/process_supervision.rs',
   'crates/helper-proto/src/core_manifest.rs', 'crates/helper-proto/src/core_protocol.rs',

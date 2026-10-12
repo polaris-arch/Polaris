@@ -236,12 +236,14 @@ export function handleProxyErrorEvent(
   // 相同（认领期内让位给发起方的 await 腿）；起核后停核那一种发生在后台，没有人 await，只有这里报。
   const contentErrorNotification: Readonly<Record<string, string>> = {
     CORE_BUNDLE_MISMATCH: 'coreBundleMismatch',
+    HELPER_CORE_OCCUPIED: 'helperCoreOccupied',
     HELPER_CORE_ABSENT: 'helperCoreAbsent',
     HELPER_CORE_INVALID: 'helperCoreInvalid',
     HELPER_CORE_MISMATCH: 'helperCoreMismatch',
   };
   const contentErrorKey = data.errorCode && contentErrorNotification[data.errorCode];
   if (data.errorCode === 'CORE_BUNDLE_MISMATCH' ||
+      data.errorCode === 'HELPER_CORE_OCCUPIED' ||
       data.errorCode === 'HELPER_CORE_ABSENT' ||
       data.errorCode === 'HELPER_CORE_INVALID' ||
       data.errorCode === 'HELPER_CORE_MISMATCH') {
