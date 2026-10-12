@@ -7,6 +7,9 @@ mod support;
 #[path = "mesh_inbound_runtime/diagnostics.rs"]
 mod diagnostics;
 
+#[path = "mesh_inbound_runtime/failure.rs"]
+mod failure;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -627,6 +630,21 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         let mut a_core = run(core, &a_path, &a_temp);
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
         let forward_tcp = eventually_tcp(a_out_tcp);
+        if let Err(error) = &forward_tcp {
+            failure::capture(
+                failure::Context {
+                    phase: "forward-before-ingress",
+                    family,
+                    policy: label,
+                    error,
+                    core,
+                    a: &a,
+                    b: &b,
+                },
+                &mut a_core,
+                &mut b_core,
+            );
+        }
         assert!(
             forward_tcp.is_ok(),
             "{family}/{label}: A→B TCP unavailable: A={} / B={}; probe={forward_tcp:?}; listener={}",
@@ -734,6 +752,21 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         let before_forward_tcp = b_tcp.count();
         let before_forward_udp = b_udp.count();
         let forward_tcp = eventually_tcp(a_out_tcp);
+        if let Err(error) = &forward_tcp {
+            failure::capture(
+                failure::Context {
+                    phase: "forward-after-ingress",
+                    family,
+                    policy: label,
+                    error,
+                    core,
+                    a: &a,
+                    b: &b,
+                },
+                &mut a_core,
+                &mut b_core,
+            );
+        }
         assert!(
             forward_tcp.is_ok(),
             "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}; probe={forward_tcp:?}; listener={}",
