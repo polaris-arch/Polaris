@@ -153,7 +153,16 @@ pub struct SelectedCoreSnapshot {
     pub id: String,
     pub version: String,
     pub provider_fingerprint: String,
-    pub state: String,
+    pub state: SelectedCoreState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectedCoreState {
+    Present,
+    Absent,
+    Invalid,
+    Unavailable,
 }
 
 /// Helper 动作的稳定失败码。前端按码本地化，`diagnostic` 不得直接展示。
@@ -166,6 +175,7 @@ pub enum HelperActionErrorCode {
     ProxyRunning,
     Unsupported,
     MissingAsset,
+    BundleMismatch,
     NotReady,
     Failed,
 }
@@ -216,7 +226,12 @@ impl HelperActionResult {
 /// Completion requires a compatible helper and a verified selected CoreID.
 /// A newer compatible helper may be retained; BuildID is diagnostic only.
 fn helper_install_reached_expected_build(status: &HelperStatusSnapshot) -> bool {
-    status.ready && !status.upgradeable
+    status.ready
+        && !status.upgradeable
+        && status
+            .selected_core
+            .as_ref()
+            .is_some_and(|core| core.state == SelectedCoreState::Present)
 }
 
 /// 从 client 侧 [`HelperStatus`] 投影到前端快照（补 supported + macOS 真机门惰值）。
@@ -809,24 +824,26 @@ impl HelperRuntime {
             return;
         };
         let state = if !status.ready {
-            "unavailable"
+            SelectedCoreState::Unavailable
         } else {
             match self.core_status() {
-                Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => "present",
+                Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. }) => {
+                    SelectedCoreState::Present
+                }
                 Ok(polaris_helper_proto::core_protocol::CoreStatus::Absent { .. }) => {
                     status.ready = false;
                     status.upgradeable = true;
-                    "absent"
+                    SelectedCoreState::Absent
                 }
                 Ok(polaris_helper_proto::core_protocol::CoreStatus::Invalid { .. }) => {
                     status.ready = false;
                     status.needs_repair = true;
-                    "invalid"
+                    SelectedCoreState::Invalid
                 }
                 Err(_) => {
                     status.ready = false;
                     status.needs_repair = true;
-                    "unavailable"
+                    SelectedCoreState::Unavailable
                 }
             }
         };
@@ -834,7 +851,7 @@ impl HelperRuntime {
             id: id.as_str().into(),
             version: manifest.version,
             provider_fingerprint: manifest.provider_fingerprint,
-            state: state.into(),
+            state,
         });
     }
 
@@ -866,8 +883,12 @@ impl HelperRuntime {
             Err(e) => {
                 log::warn!("helper install assets unavailable: {e}");
                 return self.action_failed(
-                    HelperActionErrorCode::MissingAsset,
-                    "helper assets unavailable",
+                    if e.starts_with("CORE_BUNDLE_MISMATCH:") {
+                        HelperActionErrorCode::BundleMismatch
+                    } else {
+                        HelperActionErrorCode::MissingAsset
+                    },
+                    "helper installation inputs unavailable or invalid",
                 );
             }
         };
@@ -1047,28 +1068,10 @@ impl HelperRuntime {
         }
     }
 
-    /// 经就绪 helper 提权起核（TUN 模式，proxy.rs 决策路由后调）。返回 root/SYSTEM 受管核 pid。
-    ///
-    /// - linux：`Request::LinuxStartBirth`（多带核路径行，helper 校验 == 锁定 coreBin + setuid 回登录用户 +
-    ///   AmbientCaps 拉核）。
-    /// - mac/win：`Request::Start`（helper 用锁定的 `--singbox` 核）。
-    ///
-    /// # 为什么**不收**「要跑哪个核」这个参数（根因）
-    ///
-    /// 本方法起的核，其二进制**由 helper 单方面决定**：mac/win 的 `start` 协议压根没有核路径字段
-    /// （`request.rs:35-45`），helper 恒 exec 安装期 `--singbox` 锁定的那一个；linux 虽有该字段，
-    /// 但 helper 会强制它 == 锁定的 `coredir/sing-box`，否则 `ERR core-path-denied`
-    /// （`platform/linux/handler.rs:350`）。这是**安全边界**（杜绝「持 token 让 root 跑任意二进制」）。
-    ///
-    /// 早先本方法收一个 `singbox: &Path`，调用方老老实实传了 app 解析出的现役核，而 mac 分支
-    /// **把它整个丢掉** —— 于是「app 请求的 bin」与「helper 实际跑的 bin」可以长期分叉且零告警
-    /// （p101 实测：请求 `core_update/sing-box`(1.14.0-beta.3)，实跑受保护核 1.14.0-alpha.45，持续一天多）。
-    /// 参数留着就是在邀请下一个调用方再次误以为「我传什么它就跑什么」，故**删掉**：
-    /// 想让 helper 跑新核只有一条路 —— [`install_core`](Self::install_core) 换掉锁定路径的**内容**。
-    /// linux 分支据此改传[受保护核路径](Self::protected_core_dir_path)（即 helper 真会跑的那个），
-    /// 而非 app 侧解析出的随包核路径 —— 后者必被 helper 判 `core-path-denied`。
-    ///
-    /// **真机门**：真起 root 受管核 + 建 TUN。`fwd` = allowLan（开 IP 转发），`ppid` = app pid（父死看护）。
+    /// Start only the compiled selected CoreID after the administrator has
+    /// installed its immutable objects. Runtime IPC never chooses executable
+    /// paths or uploads bytes. The native receipt must echo this same id.
+    /// Actual spawn/TUN and administrator installation remain native validation gates.
     pub fn start_core(
         &self,
         cfg: &Path,
@@ -1302,24 +1305,9 @@ impl HelperRuntime {
         require_native_birth_capability_with_client(&client)
     }
 
-    /// **受保护核目录**（三平台的 root/SYSTEM 锁定核目录）。
-    ///
-    /// 与 helper 安装期烧进描述符的路径同源（[`InstallPaths::for_platform`]）：mac/linux 是
-    /// plist/unit 的 `--coredir`，win（P4 起）是服务 ImagePath 里 `--singbox` 的父目录
-    /// （`<core_dir>\sing-box.exe`，由安装脚本从**同一个** `core_dir` 派生）。故它就是 helper
-    /// `--singbox` 所指那个文件的父目录 —— 「app 认为 helper 会跑哪个文件」与「helper 实际跑
-    /// 哪个文件」由这一个真值保证同步。
-    ///
-    /// **存量未迁移的例外**：升级到 P4 helper 之前装好的服务，其 SCM ImagePath 仍指着旧的
-    /// app 侧路径（`<配置根>\core_update\sing-box.exe`）。那种机器上本方法返回的目录是「将来会
-    /// 生效」的那个，不是此刻 helper 实际 exec 的那个；helper 侧的 ACL 自检因此刻意按
-    /// `singbox_bin` 的父目录取材（见 `coreacl`）。
-    ///
-    /// 那个旧路径如今已不存在：配置根下的 `core_update/` 在应用启动时被清掉
-    /// （`core_paths::remove_legacy_core_state`）。这不会变成一次指不出原因的起核失败 ——
-    /// 那一代 helper 早于 native birth 协议，起核前的只读能力探测
-    /// （`require_native_birth_capability`）先得到 `ERR unknown`，按
-    /// `BirthCapabilityError::HelperOutdated` 引导用户去升级 / 重装助手，根本走不到 exec。
+    /// Root/SYSTEM content-store root, shared with administrator installation.
+    /// Executables live below immutable versions/<CoreID>; old flat objects are
+    /// preserved while native use is active or unknown.
     #[must_use]
     pub fn protected_core_dir_path(&self) -> PathBuf {
         InstallPaths::for_platform(self.platform).core_dir

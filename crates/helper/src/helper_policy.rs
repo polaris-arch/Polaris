@@ -82,7 +82,8 @@ pub fn policy(binary: &Path, metadata: &Path) -> io::Result<&'static str> {
     }
     if record.version == env!("CARGO_PKG_VERSION")
         && record.protocol == polaris_helper_proto::proto_version::CURRENT
-        && actual == hash(&std::env::current_exe()?)? {
+        && actual == hash(&std::env::current_exe()?)?
+    {
         // Adding another immutable core does not require replacing identical
         // helper bytes or interrupting its active owner. Build identity is not
         // a version/upgrade criterion.
@@ -95,8 +96,12 @@ pub fn policy(binary: &Path, metadata: &Path) -> io::Result<&'static str> {
         polaris_helper_proto::proto_version::CURRENT,
     )? {
         Ok("replace")
-    } else {
+    } else if record.protocol >= polaris_helper_proto::proto_version::CURRENT {
         Ok("retain")
+    } else {
+        Err(io::Error::other(
+            "newer helper is incompatible; downgrade refused",
+        ))
     }
 }
 pub fn record(binary: &Path, metadata: &Path) -> io::Result<()> {

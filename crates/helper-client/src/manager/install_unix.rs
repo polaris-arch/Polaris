@@ -44,6 +44,7 @@ MUTATED=0
 HAD_HELPER=0
 HAD_DESCRIPTOR=0
 HAD_RECORD=0
+KEEP_HELPER=0
 WAS_ACTIVE=0
 WAS_ENABLED=0
 RECORD="$SUPPORT/helper-installed.json"
@@ -72,7 +73,7 @@ chmod 0600 "$TXDIR/user-token"
 "$TXDIR/helper" register-user --support "$SUPPORT" --identity {identity} --confdir {config} --token-file "$TXDIR/user-token"
 POLICY=$("$TXDIR/helper" helper-policy --binary "$DEST" --metadata "$RECORD")
 case "$POLICY" in
-  'helper-policy retain') echo polaris-helper-core-only-ok; exit 0;;
+  'helper-policy retain') KEEP_HELPER=1;;
   'helper-policy replace'|'helper-policy replace-legacy') ;;
   *) echo HELPER_INSTALLED_RECEIPT_INVALID >&2; exit 1;;
 esac
@@ -88,15 +89,19 @@ rollback() {{
   OK=1
   if [ "$MUTATED" -eq 1 ]; then
     stop_service || OK=0
+    if [ "$KEEP_HELPER" -eq 0 ]; then
     if [ "$HAD_HELPER" -eq 1 ]; then
       install -o root -g "$GROUP" -m 0755 "$TXDIR/helper.rollback" "$DEST.new.$$" && mv -f "$DEST.new.$$" "$DEST" || OK=0
     else rm -f "$DEST" || OK=0; fi
+    fi
     if [ "$HAD_DESCRIPTOR" -eq 1 ]; then
       install -o root -g "$GROUP" -m 0644 "$TXDIR/descriptor.rollback" "$DESCRIPTOR.new.$$" && mv -f "$DESCRIPTOR.new.$$" "$DESCRIPTOR" || OK=0
     else rm -f "$DESCRIPTOR" || OK=0; fi
+    if [ "$KEEP_HELPER" -eq 0 ]; then
     if [ "$HAD_RECORD" -eq 1 ]; then
       install -o root -g "$GROUP" -m 0644 "$TXDIR/record.rollback" "$RECORD.new.$$" && mv -f "$RECORD.new.$$" "$RECORD" || OK=0
     else rm -f "$RECORD" || OK=0; fi
+    fi
     restore_service || OK=0
   elif [ "$ADMITTED" -eq 1 ]; then
     "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || OK=0
@@ -144,16 +149,50 @@ rollback() {{
     } else {
         format!(
             r#"AUTHFILE={authfile}
-if [ -L "$AUTHFILE" ] || {{ [ -e "$AUTHFILE" ] && [ ! -f "$AUTHFILE" ]; }}; then echo invalid-authfile >&2; exit 1; fi
-if [ ! -e "$AUTHFILE" ]; then (umask 077; touch "$AUTHFILE"); fi
-chown -h root:root "$AUTHFILE"; chmod 0600 "$AUTHFILE"
-grep -qxF {uid} "$AUTHFILE" || printf '%s\n' {uid} >> "$AUTHFILE"
+HAD_AUTH=0
+AUTH_SNAPSHOTTED=0
+AUTH_MODE=0600
+snapshot_authorization() {{
+  if [ "$AUTH_SNAPSHOTTED" -eq 1 ]; then return; fi
+  if [ -L "$AUTHFILE" ] || {{ [ -e "$AUTHFILE" ] && [ ! -f "$AUTHFILE" ]; }}; then echo invalid-authfile >&2; exit 1; fi
+  if [ -f "$AUTHFILE" ]; then
+    [ "$(stat -c %u "$AUTHFILE")" = 0 ] || {{ echo invalid-authfile-owner >&2; exit 1; }}
+    AUTH_MODE=$(stat -c %a "$AUTHFILE")
+    case "$AUTH_MODE" in ''|*[!0-7]*) echo invalid-authfile-mode >&2; exit 1;; esac
+    cp "$AUTHFILE" "$TXDIR/auth.rollback"
+    chmod 0600 "$TXDIR/auth.rollback"
+    HAD_AUTH=1
+  fi
+  AUTH_SNAPSHOTTED=1
+}}
+merge_authorization() {{
+  snapshot_authorization
+  AUTHNEW="$TXDIR/auth.next"
+  if [ "$HAD_AUTH" -eq 1 ]; then cp "$TXDIR/auth.rollback" "$AUTHNEW"; else (umask 077; touch "$AUTHNEW"); fi
+  grep -qxF {uid} "$AUTHNEW" || printf '%s\n' {uid} >> "$AUTHNEW"
+  chown root:root "$AUTHNEW"; chmod 0600 "$AUTHNEW"
+  mv -f "$AUTHNEW" "$AUTHFILE"
+}}
+restore_authorization() {{
+  if [ "$AUTH_SNAPSHOTTED" -eq 0 ]; then return; fi
+  if [ "$HAD_AUTH" -eq 1 ]; then
+    install -o root -g root -m "$AUTH_MODE" "$TXDIR/auth.rollback" "$AUTHFILE.new.$$" && mv -f "$AUTHFILE.new.$$" "$AUTHFILE" || return 1
+  else rm -f "$AUTHFILE" || return 1; fi
+}}
 "#,
             authfile = shell_quote(LINUX_AUTH_FILE),
             uid = shell_quote(&params.uid.to_string())
         )
     };
-    let header = header.replace("POLICY=$(", &format!("{authorization}POLICY=$("));
+    // Merely preparing a new CoreID/registration must not extend authorization
+    // on an old daemon which can still accept retired content RPCs.
+    let mut header = header.replace("POLICY=$(", &format!("{authorization}POLICY=$("));
+    if !mac {
+        header = header.replace(
+            "    restore_service || OK=0",
+            "    restore_authorization || OK=0\n    restore_service || OK=0",
+        );
+    }
     let platform = if mac {
         let plist = render_mac_plist(&program, &core, support);
         format!(
@@ -203,11 +242,13 @@ if [ "$WAS_ACTIVE" -eq 1 ]; then
 fi
 MUTATED=1
 if [ "$WAS_ACTIVE" -eq 1 ]; then stop_service; fi
-install -o root -g "$GROUP" -m 0755 "$TXDIR/helper" "$DEST.new.$$"
-mv -f "$DEST.new.$$" "$DEST"
+if [ "$KEEP_HELPER" -eq 0 ]; then
+  install -o root -g "$GROUP" -m 0755 "$TXDIR/helper" "$DEST.new.$$"
+  mv -f "$DEST.new.$$" "$DEST"
+fi
 install -o root -g "$GROUP" -m 0644 "$TXDIR/descriptor" "$DESCRIPTOR.new.$$"
 mv -f "$DESCRIPTOR.new.$$" "$DESCRIPTOR"
-"$TXDIR/helper" helper-record --binary "$DEST" --metadata "$RECORD"
+if [ "$KEEP_HELPER" -eq 0 ]; then "$TXDIR/helper" helper-record --binary "$DEST" --metadata "$RECORD"; fi
 "#;
     let takeover = if mac {
         r#"launchctl enable "system/$SERVICE"
@@ -230,7 +271,16 @@ done
 [ "$TAKEOVER_OK" -eq 1 ] || { echo HELPER_TAKEOVER_TIMEOUT >&2; exit 1; }
 "#
     };
-    format!("{header}{platform}{admission}{takeover}ADMITTED=0\ntrap cleanup EXIT\necho polaris-helper-install-ok\n")
+    let grant = if mac { "" } else { "merge_authorization\n" };
+    let retain = format!(
+        r#"if [ "$KEEP_HELPER" -eq 1 ] && [ "$WAS_ACTIVE" -eq 1 ] && "$TXDIR/helper" retain-probe --support "$SUPPORT" --id {id}; then
+{grant}echo polaris-helper-core-only-ok
+exit 0
+fi
+"#,
+        id = shell_quote(params.core_id.as_str())
+    );
+    format!("{header}{platform}{retain}{admission}{grant}{takeover}ADMITTED=0\ntrap cleanup EXIT\necho polaris-helper-install-ok\n")
 }
 
 pub(super) fn build_mac_install_script(

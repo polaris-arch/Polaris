@@ -109,6 +109,7 @@ $tx = $null
 $utility = $null
 $admitted = $false
 $mutated = $false
+$keepHelper = $false
 $keepRecovery = $false
 try {{
   $tx = Join-Path $support ('helper-upgrade.' + [Guid]::NewGuid().ToString('N'))
@@ -137,12 +138,17 @@ try {{
   Invoke-Utility @('core-install', '--root', $coreDir, '--source', '{payload}', '--manifest', $manifest, '--source-owner', $identity) | Out-Null
   Invoke-Utility @('register-user', '--support', $support, '--identity', $identity, '--confdir', '{config}', '--token-file', $tokenFile) | Out-Null
   $policy = Invoke-Utility @('helper-policy', '--binary', $helperDst, '--metadata', $record)
-  if ($policy -ceq 'helper-policy retain') {{ Write-Output 'polaris-helper-core-only-ok'; return }}
-  if ($policy -cne 'helper-policy replace' -and $policy -cne 'helper-policy replace-legacy') {{ throw 'invalid installed helper policy' }}
+  if ($policy -ceq 'helper-policy retain') {{ $keepHelper = $true }}
+  if (-not $keepHelper -and $policy -cne 'helper-policy replace' -and $policy -cne 'helper-policy replace-legacy') {{ throw 'invalid installed helper policy' }}
   $old = Get-CimInstance -ClassName Win32_Service -Filter "Name='$service'" -ErrorAction Stop
   $wasRunning = $null -ne $old -and $old.State -ne 'Stopped'
+  if ($keepHelper -and $wasRunning) {{
+    & $utility 'retain-probe' '--support' $support '--id' '{core_id}' | Out-Null
+    if ($LASTEXITCODE -eq 0) {{ Write-Output 'polaris-helper-core-only-ok'; return }}
+  }}
   $snapshots = @()
-  foreach ($path in @($helperDst, $cleanerDst, $record)) {{
+  $replaceObjects = if ($keepHelper) {{ @() }} else {{ @($helperDst, $cleanerDst, $record) }}
+  foreach ($path in $replaceObjects) {{
     $backup = Join-Path $tx ((Split-Path -Leaf $path) + '.rollback')
     $present = Test-Path -LiteralPath $path
     if ($present) {{ Assert-Regular $path; Copy-Item -LiteralPath $path -Destination $backup; Seal-File $backup }}
@@ -155,6 +161,7 @@ try {{
   $mutated = $true
   Stop-ServiceChecked
   Delete-ServiceChecked
+  if (-not $keepHelper) {{
   $copied = $false
   for ($i = 0; $i -lt 10 -and -not $copied; $i++) {{
     try {{ Copy-Item -LiteralPath $utility -Destination $helperDst -Force; Copy-Item -LiteralPath $cleaner -Destination $cleanerDst -Force; $copied = $true }}
@@ -165,6 +172,7 @@ try {{
   Check-Hash $helperDst '{helper_hash}'
   Check-Hash $cleanerDst $selection.core.cleanerSha256
   Invoke-Utility @('helper-record', '--binary', $helperDst, '--metadata', $record) | Out-Null
+  }}
   New-Service -Name $service -BinaryPathName $binPath -StartupType Automatic | Out-Null
   Configure-Service
   & $sc start $service | Out-Null

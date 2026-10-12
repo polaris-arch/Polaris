@@ -728,6 +728,24 @@ impl CoreSpawner for AmbientCapsSpawner {
             matches!(slot.reap_fact(), LocalReapFact::Reaped(_)) || slot.handle.caller_allowed(uid)
         })
     }
+    fn birth_core_matches(
+        &self,
+        target: &polaris_helper_proto::HelperBirthTarget,
+        _current: Option<&CoreHandle>,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> bool {
+        self.slots.lock().is_ok_and(|slots| {
+            slots.iter().any(|slot| {
+                slot.handle.target().as_ref() == Some(target)
+                    && slot
+                        .handle
+                        .core
+                        .as_ref()
+                        .is_some_and(|core| core.manifest.id == id.as_str())
+                    && !matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+            })
+        })
+    }
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.scan_start_admission(current_running)
     }

@@ -263,7 +263,11 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
     if args.first().is_some_and(|name| {
         matches!(
             name.as_str(),
-            "helper-policy" | "helper-record" | "prepare-upgrade" | "cancel-upgrade"
+            "helper-policy"
+                | "helper-record"
+                | "prepare-upgrade"
+                | "cancel-upgrade"
+                | "retain-probe"
         )
     }) {
         let result = (|| {
@@ -274,6 +278,19 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
                 ));
             }
             match args[0].as_str() {
+                "retain-probe" => {
+                    if args.len() != 5
+                        || args[1] != "--support"
+                        || args[3] != "--id"
+                        || !Path::new(&args[2]).is_absolute()
+                    {
+                        return Err(invalid("invalid retained helper arguments"));
+                    }
+                    let id = polaris_helper_proto::core_manifest::CoreId::parse(&args[4])
+                        .map_err(invalid)?;
+                    crate::admin_probe::retained_ready(Path::new(&args[2]), &id)?;
+                    Ok("helper-retain-ready".to_owned())
+                }
                 "prepare-upgrade" | "cancel-upgrade" => {
                     if args.len() != 3
                         || args[1] != "--support"

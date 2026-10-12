@@ -13,6 +13,7 @@ export function helperActionErrorText(
     case 'partialCleanup': return t('helper.actionError.partialCleanup');
     case 'proxyRunning': return t('helper.actionError.proxyRunning');
     case 'unsupported': return t('helper.actionError.unsupported');
+    case 'bundleMismatch': return t('helper.actionError.bundleMismatch');
     case 'missingAsset': return t('helper.actionError.missingAsset');
     case 'notReady': return t('helper.actionError.notReady');
     default: return t('helper.actionError.failed');

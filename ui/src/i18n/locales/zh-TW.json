@@ -29,7 +29,7 @@
     "installAction": "安裝提權助手（需授權）",
     "installing": "安裝中…",
     "installingDesc": "等待一次性系統管理員授權…",
-    "upgradeDescCard": "已安裝的 helper 版本與目前應用程式不一致，需一次系統管理員授權完成同步升級",
+    "upgradeDescCard": "安裝本版本配套核心需要管理員授權，可保留較新的相容助手。使用中的核心繼續執行；替換受到占用時，請在擁有者正常中斷連線後重試。",
     "upgradeHelperAction": "升級提權助手（需授權）",
     "upgradeToastAction": "去升級",
     "btmTitle": "背景執行被停用 (BTM)",
@@ -46,7 +46,8 @@
       "unsupported": "此平台不支援提權 helper",
       "missingAsset": "應用程式內建的 helper 檔案無法使用",
       "notReady": "helper 已安裝，但暫未就緒",
-      "failed": "helper 操作未能完成"
+      "failed": "helper 操作未能完成",
+      "bundleMismatch": "隨附核心與本應用程式的內容身分不符，請重新安裝 Polaris。"
     },
     "selectedCoreVersion": "選定核心版本",
     "selectedCoreId": "選定內容識別",
@@ -57,7 +58,8 @@
       "absent": "未安裝",
       "invalid": "驗證失敗",
       "unavailable": "無法使用"
-    }
+    },
+    "installSelectedCoreAction": "安裝本版本配套核心"
   },
   "proxy": {
     "systemProxyResidualDesc": "TUN 模式下偵測到系統代理仍開啟（{{proxy}}），它不是 Polaris 設定的，可能導致連線異常。如非必要建議關閉。",

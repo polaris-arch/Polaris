@@ -363,3 +363,64 @@ fn slot_poison_during_tail_keeps_reaped_birth_without_stopped_cache() {
     });
     assert_eq!(probe.waits.load(Ordering::SeqCst), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn pinned_admission_binds_owner_and_content_under_the_same_slot_lock() {
+    use polaris_helper_proto::core_manifest::{
+        CoreFile, CoreId, CoreManifest, InstalledCoreManifest,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let raw = b"inert-mac-core";
+    std::fs::write(directory.path().join("sing-box"), raw).unwrap();
+    let core = CoreManifest {
+        platform: "mac-x64".into(),
+        version: "1.15.0-alpha.12".into(),
+        provider_fingerprint: "a".repeat(64),
+        helper_sha256: None,
+        cleaner_sha256: None,
+        files: vec![CoreFile {
+            name: "sing-box".into(),
+            bytes: raw.len() as u64,
+            sha256: crate::core_hash::sha256_hex(raw),
+        }],
+    };
+    let id = core.id(crate::core_hash::sha256_hex).unwrap();
+    let manifest = InstalledCoreManifest {
+        schema: "polaris-core-manifest-v1".into(),
+        id: id.as_str().into(),
+        app_version: "1.0.0".into(),
+        core,
+    };
+    let verified = Arc::new(
+        crate::core_store::VerifiedCore::fixture(
+            directory.path(),
+            &directory.path().join("lease"),
+            manifest,
+        )
+        .unwrap(),
+    );
+    let custody = NativeCustody::default();
+    let (birth, probe) = install(&custody, target(42, 1));
+    birth.attach_core(verified, 1000);
+    for (uid, requested) in [
+        (1001, id.clone()),
+        (1000, CoreId::parse(&"b".repeat(64)).unwrap()),
+    ] {
+        assert_eq!(
+            custody.admit_pinned(uid, &requested),
+            Err(NativeBirthStart::NotAdmittedUnknown { target: None })
+        );
+    }
+    assert_eq!(
+        custody.admit_pinned(1000, &id),
+        Err(NativeBirthStart::Already {
+            target: birth.target
+        })
+    );
+    assert_eq!(probe.terms.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.kills.load(Ordering::SeqCst), 0);
+    assert!(custody.is_current(&birth));
+}

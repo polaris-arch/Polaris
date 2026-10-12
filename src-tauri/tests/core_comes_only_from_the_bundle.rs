@@ -511,12 +511,30 @@ fn release_core_resolution_has_exactly_one_leg() {
 ///
 /// 两类标识：
 /// - `resolve_core_binary`：内核路径的唯一解析函数。起核、起核前 `check`、测速临时核、Tailscale
-///   登录核、向提权助手递送，全部经它拿路径；
+///   登录核、管理员安装暂存，全部经它拿路径；
 /// - 内核文件名：`core_filename()` / `core_filename_for()` 的调用，以及字面量 `"sing-box"` /
 ///   `"sing-box.exe"`。不经解析函数而自己定位一个内核文件，绕不开文件名。
 ///
 /// 定义处（`runtime/proxy/core_binary.rs`、`runtime/core_paths.rs`）整文件不计。
 const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
+    (
+        "runtime/helper.rs",
+        "core_filename(",
+        1,
+        "Selected manifest whitelist names staged installer bytes resolved from the bundle",
+    ),
+    (
+        "runtime/core_identity.rs",
+        "\"sing-box\"",
+        2,
+        "Compiled selection whitelist and private installation stage retirement",
+    ),
+    (
+        "runtime/core_identity.rs",
+        "\"sing-box.exe\"",
+        1,
+        "Compiled Windows core member is resolved only within the bundle payload",
+    ),
     (
         "commands/proxy.rs",
         "resolve_core_binary",
@@ -533,7 +551,7 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime/helper.rs",
         "resolve_core_binary",
         1,
-        "安装提权助手时播种的内核来源",
+        "管理员内容安装的随包来源",
     ),
     (
         "runtime/proxy.rs",

@@ -55,7 +55,13 @@ enum Kind {
 }
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
-const REGISTERED: [(&str, Kind, usize, &str); 26] = [
+const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,
+        "PayloadDir owner/permission rejection fixture; directory traversal only"),
+    ("crates/helper/src/platform/windows/helper/tests/mod.rs", Kind::ExecBit, 1,
+        "Private directory for held inert core/sidecar objects; no execution"),
+    ("crates/helper/src/platform/macos/native_birth/tests/mod.rs", Kind::ExecBit, 1,
+        "Private directory for a hashed inert content-id lease fixture"),
     (
         HELPER_FILE,
         Kind::ExecBit,
@@ -75,28 +81,10 @@ const REGISTERED: [(&str, Kind, usize, &str); 26] = [
         "断言生成的安装脚本首行，不落盘执行",
     ),
     (
-        "crates/helper/src/core_install/src_dir/tests/mod.rs",
-        Kind::ExecBit,
-        1,
-        "仅设置源目录的遍历权限",
-    ),
-    (
-        "crates/helper/src/core_install/tests/unix_src.rs",
-        Kind::ExecBit,
-        3,
-        "权限拒绝用例经变量设置目录与输入文件模式，从不执行",
-    ),
-    (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",
         Kind::ExecBit,
         1,
         "仅设置源目录的遍历权限",
-    ),
-    (
-        "crates/helper/src/platform/macos/handler/tests/mod.rs",
-        Kind::ExecBit,
-        1,
-        "源目录权限与假核输入字节，xattr/codesign 经桩执行，从不起核",
     ),
     (
         "crates/core-supervisor/src/config_gate/check_custody/tests/mod.rs",
@@ -320,7 +308,7 @@ fn violations(files: &[(String, String)], registered: &[(&str, Kind, usize, &str
 #[test]
 fn test_code_drops_executables_only_through_the_shared_helper() {
     let files = scan_surface();
-    let problems = violations(&files, &REGISTERED);
+    let problems = violations(&files, REGISTERED);
     assert!(
         problems.is_empty(),
         "测试代码里出现了绕过 `{HELPER}` 的可执行文件落盘写法。写出文件、加执行位、随即执行，\

@@ -29,7 +29,7 @@
     "installAction": "Install the helper (authorization required)",
     "installing": "Installing…",
     "installingDesc": "Waiting for the one-time admin authorization…",
-    "upgradeDescCard": "The installed helper does not match this app; one admin authorization synchronizes and upgrades it",
+    "upgradeDescCard": "Administrator approval is required to install this app’s selected core. A newer compatible helper can be retained. Active cores stay running; if replacement is busy, retry after the owner disconnects.",
     "upgradeHelperAction": "Upgrade the helper (authorization required)",
     "upgradeToastAction": "Upgrade",
     "btmTitle": "Background execution blocked (BTM)",
@@ -46,7 +46,8 @@
       "unsupported": "This platform does not support the privileged helper",
       "missingAsset": "The helper files bundled with this app are unavailable",
       "notReady": "The helper was installed but is not ready yet",
-      "failed": "The helper action could not be completed"
+      "failed": "The helper action could not be completed",
+      "bundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris."
     },
     "selectedCoreVersion": "Selected core version",
     "selectedCoreId": "Selected content ID",
@@ -57,7 +58,8 @@
       "absent": "Not installed",
       "invalid": "Verification failed",
       "unavailable": "Unavailable"
-    }
+    },
+    "installSelectedCoreAction": "Install selected core"
   },
   "proxy": {
     "systemProxyResidualDesc": "A system proxy is still enabled ({{proxy}}) in TUN mode. It wasn't set by Polaris and may cause connection issues. Consider disabling it unless you need it.",

@@ -9,7 +9,8 @@ import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
 import type { CoreVersionInfo } from '@/contracts/types/update';
 import { GH_PROXY_PRESETS } from '@/domain/gh-proxy';
-import { coreApi } from '@/ipc/api-client';
+import type { HelperStatus } from '@/contracts/types/runtime';
+import { coreApi, helperApi } from '@/ipc/api-client';
 import {
   Card,
   Phead,
@@ -43,6 +44,7 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
   const { t } = useTranslation();
   const [ghCustomMode, setGhCustomMode] = useState(false);
   const [coreInfo, setCoreInfo] = useState<CoreVersionInfo | null>(null);
+  const [selectedCore, setSelectedCore] = useState<HelperStatus['selectedCore']>();
   useEffect(() => {
     let cancelled = false;
     void coreApi
@@ -53,8 +55,19 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
       .catch((error: unknown) => {
         console.error('[SettingsUpdate] core version info unavailable:', error);
       });
+    const readInstalledCore = () => {
+      void helperApi.getStatus().then((status) => {
+        if (!cancelled) setSelectedCore(status.selectedCore);
+      }).catch((error: unknown) => {
+        if (!cancelled) setSelectedCore((previous) => previous ? { ...previous, state: 'unavailable' } : undefined);
+        console.error('[SettingsUpdate] selected core status unavailable:', error);
+      });
+    };
+    readInstalledCore();
+    const off = helperApi.onUpgradeable(readInstalledCore);
     return () => {
       cancelled = true;
+      off();
     };
   }, []);
   const interval = backgroundIntervalSelectValue(config);
@@ -142,7 +155,7 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
       </SetBlock>
 
       <AppUpdateCard config={config} update={update} />
-      <CoreInfoCard info={coreInfo} />
+      <CoreInfoCard info={coreInfo} selectedCore={selectedCore} />
 
       <Card pad style={{ marginBottom: 16 }}>
         <SetRow

@@ -64,6 +64,18 @@ describe('内核只读信息卡', () => {
     expect(cell(pending, 'patch-set')).toBeNull();
   });
 
+  it.each([
+    ['present', '已核验'], ['absent', '未安装'], ['invalid', '核验失败'], ['unavailable', '不可用'],
+  ] as const)('selected content %s remains a read-only native observation', (state, label) => {
+    const selectedCore = { id: 'a'.repeat(64), version: '1.15.0-alpha.12', providerFingerprint: 'b'.repeat(64), state };
+    const markup = renderToStaticMarkup(<CoreInfoCard info={FULL} selectedCore={selectedCore} />);
+    expect(cell(markup, 'selected-id')).toBe('a'.repeat(16));
+    expect(cell(markup, 'provider')).toBe('b'.repeat(16));
+    expect(cell(markup, 'installed-state')).toBe(label);
+    const withoutTip = markup.replace(/<span class="info-i"[\s\S]*?<\/span>/g, '');
+    expect(INTERACTIVE.test(withoutTip)).toBe(false);
+  });
+
   it('卡片里没有任何可操作控件', () => {
     // 谓词自检：它认得出按钮、开关与下拉（否则下面的否定断言没有信息量）。
     expect(INTERACTIVE.test('<button type="button">x</button>')).toBe(true);
@@ -81,7 +93,7 @@ describe('内核只读信息卡', () => {
   });
 
   it('更新页挂的是这张卡，数据来自 core_get_version_info 那一条只读命令', () => {
-    expect(pageSource).toContain('<CoreInfoCard info={coreInfo} />');
+    expect(pageSource).toContain('<CoreInfoCard info={coreInfo} selectedCore={selectedCore} />');
     expect(pageSource).toContain('coreApi\n      .getVersionInfo()');
     expect(pageSource).toContain("console.error('[SettingsUpdate] core version info unavailable:', error)");
   });

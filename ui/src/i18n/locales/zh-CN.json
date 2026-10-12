@@ -29,7 +29,7 @@
     "installAction": "安装提权助手（需授权）",
     "installing": "安装中…",
     "installingDesc": "等待一次性管理员授权…",
-    "upgradeDescCard": "已安装的 helper 版本与当前应用不一致，需一次管理员授权完成同步升级",
+    "upgradeDescCard": "安装本版本配套内核需要管理员授权，可保留较新的兼容助手。活跃内核继续运行；替换被占用时，请在属主正常断开后重试。",
     "upgradeHelperAction": "升级提权助手（需授权）",
     "upgradeToastAction": "去升级",
     "btmTitle": "后台运行被禁用 (BTM)",
@@ -46,7 +46,8 @@
       "unsupported": "此平台不支持提权 helper",
       "missingAsset": "应用内置的 helper 文件不可用",
       "notReady": "helper 已安装，但暂未就绪",
-      "failed": "helper 操作未能完成"
+      "failed": "helper 操作未能完成",
+      "bundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。"
     },
     "selectedCoreVersion": "选定内核版本",
     "selectedCoreId": "选定内容标识",
@@ -57,7 +58,8 @@
       "absent": "未安装",
       "invalid": "核验失败",
       "unavailable": "不可用"
-    }
+    },
+    "installSelectedCoreAction": "安装本版本配套内核"
   },
   "proxy": {
     "systemProxyResidualDesc": "TUN 模式下检测到系统代理仍开启（{{proxy}}），它不是 Polaris 设置的，可能导致连接异常。如非必要建议关闭。",

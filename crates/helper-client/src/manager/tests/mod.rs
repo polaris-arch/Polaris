@@ -854,7 +854,7 @@ fn unix_upgrade_admission_precedes_every_service_replacement() {
         assert!(arm < admit && admit < mutate && mutate < stop && stop < replace);
         assert!(script[admit..mutate].contains("exit 75"));
         assert!(script.contains("cancel-upgrade --support"));
-        assert!(script.contains("'helper-policy retain') echo polaris-helper-core-only-ok; exit 0"));
+        assert!(script.contains("echo polaris-helper-core-only-ok\nexit 0"));
     }
 }
 
@@ -906,20 +906,28 @@ fn machine_service_never_contains_an_app_profile_or_a_flat_core() {
 fn linux_auth_merge_retains_other_users_and_matches_private_reader_contract() {
     let script = unix_scripts().into_iter().nth(1).unwrap();
     assert!(
-        script.contains("grep -qxF '1000' \"$AUTHFILE\" || printf '%s\\n' '1000' >> \"$AUTHFILE\"")
+        script.contains("grep -qxF '1000' \"$AUTHNEW\" || printf '%s\\n' '1000' >> \"$AUTHNEW\"")
     );
-    assert!(script.contains("(umask 077; touch \"$AUTHFILE\")"));
-    assert!(script.contains("chown -h root:root \"$AUTHFILE\"; chmod 0600 \"$AUTHFILE\""));
-    let auth = script.find("AUTHFILE=").unwrap();
-    let retain = script.find("'helper-policy retain')").unwrap();
+    assert!(script.contains("chmod 0600 \"$AUTHNEW\""));
+    assert!(script.contains("invalid-authfile-owner"));
+    assert!(script.contains("'helper-policy retain') KEEP_HELPER=1"));
+    assert!(script.contains("retain-probe --support \"$SUPPORT\" --id"));
+    let stopped = script
+        .find("if [ \"$WAS_ACTIVE\" -eq 1 ]; then stop_service; fi")
+        .unwrap();
+    let grant = script.rfind("\nmerge_authorization\n").unwrap();
+    let start = script.rfind("systemctl restart \"$SERVICE\"").unwrap();
     assert!(
-        auth < retain,
-        "a retained helper still needs this user's authorization"
+        stopped < grant && grant < start,
+        "new authorization cannot reach a running legacy daemon"
     );
-    assert!(script.contains("cmp -s \"/proc/$PID/exe\" \"$DEST\""));
-    assert!(script.contains("HELPER_TAKEOVER_TIMEOUT"));
-    assert!(script.contains("RuntimeDirectoryMode=0755"));
-    assert!(script.contains("Restart=on-failure"));
+    let restore_auth = script.find("restore_authorization || OK=0").unwrap();
+    let restore_old = script.find("restore_service || OK=0").unwrap();
+    assert!(
+        restore_auth < restore_old,
+        "rollback restores authorization before restarting the old service"
+    );
+    assert!(script.contains("auth.rollback"));
 }
 
 fn windows_script() -> String {
@@ -1439,4 +1447,23 @@ fn windows_payload_directory_is_absolute_even_when_rendered_on_unix() {
     assert!(script.contains("Check-Hash $cleaner $selection.core.cleanerSha256"));
     assert!(script.contains("foreach ($path in @($helperDst, $cleanerDst, $record))"));
     assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
+}
+
+#[test]
+fn retained_binary_requires_live_content_receipt_or_repair_without_downgrade() {
+    for script in unix_scripts() {
+        let policy = script
+            .find("'helper-policy retain') KEEP_HELPER=1")
+            .unwrap();
+        let probe = script.find("retain-probe --support").unwrap();
+        let admit = script.find("trap rollback EXIT").unwrap();
+        assert!(policy < probe && probe < admit);
+        assert!(script.contains("if [ \"$KEEP_HELPER\" -eq 0 ]; then"));
+    }
+    let script = windows_script();
+    assert!(script.contains("$keepHelper = $true"));
+    assert!(script.contains("'retain-probe' '--support' $support '--id'"));
+    assert!(script.contains("$replaceObjects = if ($keepHelper) { @() }"));
+    assert!(script.contains("if (-not $keepHelper) {"));
+    assert!(script.contains("New-Service -Name $service"));
 }

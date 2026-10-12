@@ -16,6 +16,7 @@ export type HelperActionErrorCode =
   | 'partialCleanup'
   | 'proxyRunning'
   | 'unsupported'
+  | 'bundleMismatch'
   | 'missingAsset'
   | 'notReady'
   | 'failed';

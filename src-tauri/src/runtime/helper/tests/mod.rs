@@ -656,13 +656,31 @@ fn protected_core_platforms_are_a_subset_of_helper_platforms() {
 }
 
 #[test]
-fn helper_install_success_requires_the_expected_build() {
+fn helper_install_success_requires_compatible_protocol_and_selected_content() {
     let current = HelperStatusSnapshot {
+        selected_core: Some(SelectedCoreSnapshot {
+            id: "a".repeat(64),
+            version: "1.15.0-alpha.12".into(),
+            provider_fingerprint: "b".repeat(64),
+            state: SelectedCoreState::Present,
+        }),
         ready: true,
         upgradeable: false,
         ..Default::default()
     };
     assert!(helper_install_reached_expected_build(&current));
+    let mut unknown = current.clone();
+    unknown.selected_core = None;
+    assert!(!helper_install_reached_expected_build(&unknown));
+    for state in [
+        SelectedCoreState::Absent,
+        SelectedCoreState::Invalid,
+        SelectedCoreState::Unavailable,
+    ] {
+        let mut bad = current.clone();
+        bad.selected_core.as_mut().unwrap().state = state;
+        assert!(!helper_install_reached_expected_build(&bad));
+    }
 
     let old_same_proto = HelperStatusSnapshot {
         ready: true,
@@ -840,6 +858,7 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::ProxyRunning, "proxyRunning"),
         (HelperActionErrorCode::Unsupported, "unsupported"),
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
+        (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
         (HelperActionErrorCode::NotReady, "notReady"),
         (HelperActionErrorCode::Failed, "failed"),
     ];
@@ -1189,7 +1208,7 @@ fn selected_core_status_projection_keeps_identity_and_native_state_read_only() {
             id: "a".repeat(64),
             version: "1.15.0-alpha.12".into(),
             provider_fingerprint: "b".repeat(64),
-            state: "absent".into(),
+            state: SelectedCoreState::Absent,
         }),
         supported: true,
         installed: true,

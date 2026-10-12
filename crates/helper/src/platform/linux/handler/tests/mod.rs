@@ -1481,7 +1481,7 @@ fn resolved_dns_failure_keeps_structured_error_detail() {
 #[test]
 fn wire_forms_match_go_source() {
     // v1 是 wire 断代真值；build 字段是尾部向后兼容扩展（旧 app 忽略）。
-    assert_eq!(PROTO_VERSION, 1);
+    assert_eq!(PROTO_VERSION, 2);
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
@@ -1489,7 +1489,7 @@ fn wire_forms_match_go_source() {
             polaris_helper_proto::build_identity::current()
         )
     );
-    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 1");
+    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 2");
     assert_eq!("OK stopped", "OK stopped");
     assert_eq!("OK running 12345", "OK running 12345");
     assert_eq!("OK notrunning", "OK notrunning");
@@ -1589,4 +1589,42 @@ fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
     }
     assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
     assert_eq!(*forwards.lock().unwrap(), [true]);
+}
+
+#[test]
+fn hidden_already_birth_cannot_be_relabeled_with_a_requested_core_id() {
+    let (_dir, auth, core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let target = exact_handle(42, BIRTH_ONE).target().unwrap();
+    *spawner.birth_admission.lock().unwrap() = Some(BirthAdmission::Already(target));
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let mut state = HandlerState::new();
+    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
+    assert_eq!(conn.writes(), ["ERR core-occupied"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
 }

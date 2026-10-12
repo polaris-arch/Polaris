@@ -156,7 +156,23 @@ impl NativeCustody {
     }
 
     /// Reserve before forwarding/cache/spawn. Failure does not authorize any write.
+    #[cfg(test)]
     pub(super) fn admit(&self) -> Result<(), NativeBirthStart> {
+        self.admit_for(None)
+    }
+
+    pub(super) fn admit_pinned(
+        &self,
+        uid: u32,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> Result<(), NativeBirthStart> {
+        self.admit_for(Some((uid, id)))
+    }
+
+    fn admit_for(
+        &self,
+        selected: Option<(u32, &polaris_helper_proto::core_manifest::CoreId)>,
+    ) -> Result<(), NativeBirthStart> {
         let current = {
             let mut slot =
                 self.slot
@@ -170,7 +186,19 @@ impl NativeCustody {
                 });
             }
             match slot.current.clone() {
-                Some(current) => current,
+                Some(current) => {
+                    if let Some((uid, id)) = selected {
+                        let Ok(owned) = current.owned.lock() else {
+                            return Err(NativeBirthStart::NotAdmittedUnknown { target: None });
+                        };
+                        if !owned.core.as_ref().is_some_and(|(core, owner)| {
+                            (uid == 0 || uid == *owner) && core.manifest.id == id.as_str()
+                        }) {
+                            return Err(NativeBirthStart::NotAdmittedUnknown { target: None });
+                        }
+                    }
+                    current
+                }
                 None => {
                     slot.starting = true;
                     return Ok(());

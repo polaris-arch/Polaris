@@ -132,6 +132,40 @@ pub fn upgrade_admission(support: &Path, close: bool) -> io::Result<()> {
     }
 }
 
+/// A compatible retained service must actually attest the new selected id;
+/// disk metadata alone cannot establish which daemon owns the live endpoint.
+pub fn retained_ready(
+    support: &Path,
+    id: &polaris_helper_proto::core_manifest::CoreId,
+) -> io::Result<()> {
+    let (client, pong) = authenticated(support)?;
+    retained_ready_with_client(&client, pong.proto_version, id)
+}
+
+fn retained_ready_with_client(
+    client: &HelperClient,
+    protocol: u32,
+    id: &polaris_helper_proto::core_manifest::CoreId,
+) -> io::Result<()> {
+    if protocol < polaris_helper_proto::proto_version::CURRENT {
+        return Err(io::Error::other("retained helper protocol incompatible"));
+    }
+    let response = client
+        .send_with_timeout(
+            &Request::CoreStatus { id: id.clone() },
+            Duration::from_secs(5),
+        )
+        .map_err(|_| io::Error::other("retained helper content status unavailable"))?;
+    if matches!(response, Response::Ok(ResponseKind::CoreStatus(polaris_helper_proto::core_protocol::CoreStatus::Present { id: actual, .. })) if actual == *id)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "retained helper did not attest selected content",
+        ))
+    }
+}
+
 pub fn probe(support: &Path) -> io::Result<String> {
     let platform = Platform::current();
     let (client, pong) = authenticated(support)?;

@@ -197,6 +197,22 @@ pub trait CoreSpawner: Send + Sync {
                 (None, Some(_)) => false,
             }
     }
+    /// A retained physical birth must attest its own installed content id.
+    /// Matching ownership or PID alone cannot bind a new Start receipt.
+    fn birth_core_matches(
+        &self,
+        target: &HelperBirthTarget,
+        current: Option<&CoreHandle>,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> bool {
+        current.is_some_and(|handle| {
+            handle.target().as_ref() == Some(target)
+                && handle
+                    .core
+                    .as_ref()
+                    .is_some_and(|core| core.manifest.id == id.as_str())
+        })
+    }
     fn spawn_pinned(
         &self,
         _req: &SpawnCoreRequest,

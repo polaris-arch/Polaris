@@ -98,6 +98,7 @@ windows-sys = { version = "0.61", features = [
 polaris-system-integration = { path = "../system-integration" }
 
 [dev-dependencies]
+polaris-helper-client = { path = "../helper-client", features = ["test-utils"] }
 # tempfile = content store / token / launchd inert fixture directories.
 tempfile = "3"
 # 源码级门的取材锚点（`polaris_source_probe::crate_source!` 等宏）。dev-only：

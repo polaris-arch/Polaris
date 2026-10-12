@@ -464,7 +464,9 @@ fn poison_child_state(h: &WinHelper<StaticTokenStore, MockProcOps, MockNetTableO
 fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
     for with_cache in [false, true] {
         let ops = MockProcOps::new();
-        let h = make_helper(ops.clone(), MockNetTableOps::new());
+        let mut h = make_helper(ops.clone(), MockNetTableOps::new());
+        // Administrator recovery remains observable when owner custody is poisoned.
+        h.test_context.as_mut().unwrap().peer.administrator = true;
         let target = if with_cache {
             let target = start(&h, false);
             assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });

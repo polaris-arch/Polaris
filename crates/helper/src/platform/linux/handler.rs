@@ -28,7 +28,7 @@ use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
     parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode,
     HelperBirthToken, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns, Response,
-    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
+    ResponseKind, StartTiming, Stop,
 };
 
 use crate::platform::linux::auth::{
@@ -298,7 +298,7 @@ fn dispatch_locked<P, S, D, SD>(
         lcmd::STOP_BIRTH_SAFE => {
             handle_birth_stop(state, deps, cred, conn);
         }
-        lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn, true, true),
+        lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn),
         // Retired executable-path/content-write commands never dispatch, even
         // when no child is running. Only administrative CLI installs bytes.
         cmd::START | lcmd::START_REAP_SAFE | lcmd::START_BIRTH_SAFE | lcmd::INSTALL_CORE => {
@@ -702,15 +702,13 @@ where
     crate::pinned_core::verify(root, id).map(Arc::new)
 }
 
-/// start（:400-478）：核路径锁 + config 属主校验 + AmbientCaps 拉核。
-#[allow(clippy::too_many_lines)]
+/// The only executable admission route: a strict selected-id frame and a
+/// verified immutable object, followed by native custody and caller checks.
 fn handle_start<P, S, D, SD>(
     state: &mut HandlerState,
     deps: &HandlerDeps<'_, P, S, D, SD>,
     cred: &PeerCred,
     conn: &mut impl Conn,
-    exact: bool,
-    pinned: bool,
 ) where
     P: PeerCredProvider,
     S: CoreSpawner,
@@ -729,294 +727,153 @@ fn handle_start<P, S, D, SD>(
         let _ = conn.write_line("ERR slot-owned-or-control-busy");
         return;
     }
-    // :401-405: 读 singbox / cfg / log / fwd / ppid 行。
-    let (singbox, cfg, log_path, fwd, ppid_str) = if exact {
-        let (Ok(Some(singbox)), Ok(Some(cfg)), Ok(Some(log)), Ok(Some(fwd))) = (
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-        ) else {
-            let _ = conn.write_line("ERR bad-args");
-            return;
-        };
-        let ppid = match conn.read_line_strict() {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(_) => {
+    let mut lines = Vec::new();
+    for _ in 0..4 {
+        match conn.read_line_strict() {
+            Ok(Some(line)) => lines.push(line),
+            _ => {
                 let _ = conn.write_line("ERR bad-args");
                 return;
             }
-        };
-        if !matches!(conn.read_line_strict(), Ok(None)) {
+        }
+    }
+    match conn.read_line_strict() {
+        Ok(Some(line)) => lines.push(line),
+        Ok(None) => {}
+        Err(_) => {
             let _ = conn.write_line("ERR bad-args");
             return;
         }
-        (singbox, cfg, log, fwd, ppid)
-    } else {
-        (
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-        )
-    };
-    let ppid: u32 = ppid_str.trim().parse().unwrap_or(0);
-    let id = if pinned {
-        let lines = vec![
-            singbox.clone(),
-            cfg.clone(),
-            log_path.clone(),
-            fwd.clone(),
-            ppid_str.clone(),
-        ];
-        let Some(params) = polaris_helper_proto::core_protocol::PinnedStartParams::parse(&lines)
-        else {
-            let _ = conn.write_line("ERR bad-args");
-            return;
-        };
-        Some(params.id)
-    } else {
-        None
+    }
+    if !matches!(conn.read_line_strict(), Ok(None)) {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    }
+    let Some(params) = polaris_helper_proto::core_protocol::PinnedStartParams::parse(&lines) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
     };
     if !caller_owns_slot(state, deps.spawner, cred, conn) {
         return;
     }
-    if let Some(id) = &id {
-        if state.child.as_ref().is_some_and(|child| {
-            child
-                .handle()
-                .core
-                .as_ref()
-                .is_none_or(|core| core.manifest.id != id.as_str())
-        }) {
-            let _ = conn.write_line("ERR core-occupied");
-            return;
-        }
-    }
-
-    // Admission precedes `already`, validation, forwarding, and spawn. The
-    // production spawner inspects every retained native slot, including births
-    // no longer represented by this handler state.
-    let current_running = state.child.as_ref().and_then(ManagedChild::running);
-    if exact {
-        // Include Stopping in the custody scan. A state-held birth whose
-        // registry slot vanished without native proof must block admission.
-        let current = state.child.as_ref().map(ManagedChild::handle);
-        match deps.spawner.birth_admission(current) {
-            BirthAdmission::Admitted => state.child = None,
-            BirthAdmission::Already(target)
-                if state.child.as_ref().is_some_and(|child| {
-                    matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))
-                }) =>
-            {
-                let response = LinuxBirthStart::NotAdmittedPending { target };
-                let _ = conn.write_line(
-                    &birth_start_line(id.as_ref(), response),
-                );
+    let id = &params.id;
+    let current = state.child.as_ref().map(ManagedChild::handle);
+    match deps.spawner.birth_admission(current) {
+        BirthAdmission::Admitted => state.child = None,
+        BirthAdmission::Already(target) => {
+            // This proof comes from the retained native registry, including
+            // hidden slots. Never relabel a different core as this request's id.
+            if !deps.spawner.birth_core_matches(&target, current, id) {
+                let _ = conn.write_line("ERR core-occupied");
                 return;
             }
-            BirthAdmission::Already(target) => {
-                let response = LinuxBirthStart::Already { target };
-                let _ = conn.write_line(
-                    &birth_start_line(id.as_ref(), response),
-                );
+            let Some(root) = deps.core_dir else {
+                let _ = conn.write_line("ERR coredir-unset");
                 return;
-            }
-            BirthAdmission::Blocked {
-                target,
-                state: blocker,
-            } => {
-                let response = match (target, blocker) {
-                    (Some(target), ReapBlockerState::Pending) => {
-                        LinuxBirthStart::NotAdmittedPending { target }
-                    }
-                    (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
-                };
-                let _ = conn.write_line(
-                    &birth_start_line(id.as_ref(), response),
-                );
-                return;
-            }
-        }
-    } else {
-        match deps.spawner.start_admission(current_running) {
-            StartAdmission::Admitted => {
-                // A stale Running/Stopping state can be cleared only because the
-                // admission scan observed its exact slot as Reaped.
-                state.child = None;
-            }
-            StartAdmission::Already { pid } => {
-                let response = Response::Ok(ResponseKind::Start(Start::Already { pid }));
-                let _ = conn.write_line(&response.to_wire_line());
-                return;
-            }
-            StartAdmission::Blocked { pid, state } => {
-                let blocked = match state {
-                    ReapBlockerState::Pending => StartNotAdmitted::Pending { pid },
-                    ReapBlockerState::Unknown => StartNotAdmitted::Unknown { pid },
-                };
-                let response = Response::Ok(ResponseKind::Start(Start::NotAdmitted(blocked)));
-                let _ = conn.write_line(&response.to_wire_line());
-                return;
-            }
-        }
-    }
-    // :411-413: cfg 空 → bad-args。
-    let cfg = cfg.trim();
-    if cfg.is_empty() {
-        let _ = conn.write_line("ERR bad-args");
-        return;
-    }
-    // :417-420: 核路径锁 —— singbox 必须 == coreDir/sing-box。
-    let Some(core_dir) = deps.core_dir else {
-        let _ = conn.write_line("ERR coredir-unset");
-        return;
-    };
-    let verified = if let Some(id) = &id {
-        match verified_selected(deps, core_dir, id) {
-            Ok(core) => Some(core),
-            Err(_) => {
+            };
+            if verified_selected(deps, root, id).is_err() {
                 let _ = conn.write_line("ERR core-invalid");
                 return;
             }
-        }
-    } else {
-        None
-    };
-    let core_bin: PathBuf = verified.as_ref().map_or_else(
-        || core_dir.join("sing-box"),
-        |core| core.directory.join("sing-box"),
-    );
-    if !pinned && Path::new(singbox.trim()) != core_bin.as_path() {
-        let _ = conn.write_line(&format!(
-            "ERR core-path-denied (want {})",
-            core_bin.display()
-        ));
-        return;
-    }
-    // :421-424: 锁定核二进制必须存在。
-    if !core_bin.exists() {
-        let _ = conn.write_line("ERR core-missing");
-        return;
-    }
-    // :425-428: config 必须属于对端 uid（防读别人配置）。
-    match owned_by(Path::new(cfg), cred.uid) {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = conn.write_line("ERR config-not-owned");
+            let result = if state.child.as_ref().is_some_and(|child|
+                matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))) {
+                LinuxBirthStart::NotAdmittedPending { target }
+            } else { LinuxBirthStart::Already { target } };
+            let _ = conn.write_line(&birth_start_line(Some(id), result));
             return;
         }
-        Err(e) => {
-            let _ = conn.write_line(&format!("ERR config-not-owned {e}"));
+        BirthAdmission::Blocked {
+            target,
+            state: blocker,
+        } => {
+            let result = match (target, blocker) {
+                (Some(target), ReapBlockerState::Pending) => {
+                    LinuxBirthStart::NotAdmittedPending { target }
+                }
+                (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
+            };
+            let _ = conn.write_line(&birth_start_line(Some(id), result));
             return;
         }
     }
-    // **Polaris 新增（上游无）**：log 必须与 cfg **同一父目录**。
-    //
-    // 上游只校验 cfg 的属主，而 `spawn` 会以 **root** 身份 `O_CREATE|O_APPEND|0644` 打开这个 log
-    // 路径、**并 `fchown` 给对端 uid**（`linux/server.rs`）⇒ 不校验就是「root 在任意位置建文件、
-    // 再把属主给调用者」——比单纯的任意追加写更强，`/etc/cron.d/` 之类落一个文件即完全提权。
-    //
-    // 判据取「同父目录」而非 conf_dir 白名单：linux 腿没有 `--confdir`（它用属主校验代替），
-    // 而生产下发的 cfg 与 log 恒是同目录的 `singbox-runtime.json` / `singbox-startup.log`
-    //（`runtime/proxy.rs`）⇒ 这条收紧**零行为变更**。含 `..` 的路径会让父目录字面不等，自然被拒。
-    //
-    // 🔴 **未覆盖：符号链接**。判据是纯路径比较，若攻击者在该目录里放一个指向 `/etc/...` 的符号
-    // 链接，root 打开时仍会跟随。要堵死得上 `O_NOFOLLOW`（只管最后一段）或 openat2 RESOLVE_BENEATH；
-    // 更彻底的修法是**根本不接受客户端下发 log 路径**（helper 自己按 conf_dir 拼）。均已登记，见
-    // `~/docs/polaris/design/polaris-platform-code-sweep-2026-08-09.md`。
-    let log_trimmed = log_path.trim();
-    if !log_trimmed.is_empty() && Path::new(log_trimmed).parent() != Path::new(cfg).parent() {
-        let _ = conn.write_line("ERR log-path-denied");
+    let Some(root) = deps.core_dir else {
+        let _ = conn.write_line("ERR coredir-unset");
+        return;
+    };
+    let core = match verified_selected(deps, root, id) {
+        Ok(core) => core,
+        Err(_) => {
+            let _ = conn.write_line("ERR core-invalid");
+            return;
+        }
+    };
+    let cfg = Path::new(&params.common.cfg);
+    if !matches!(owned_by(cfg, cred.uid), Ok(true)) {
+        let _ = conn.write_line("ERR config-not-owned");
         return;
     }
-    let birth = if exact {
-        match mint_birth_token() {
-            Ok(token) => Some(token),
-            Err(error) => {
-                log::error!("Linux helper could not mint birth token: {error}");
-                let _ = conn.write_line("ERR start birth-entropy");
-                return;
-            }
-        }
-    } else {
+    let log = if params.common.log.is_empty() {
         None
+    } else {
+        let log = Path::new(&params.common.log);
+        if log.parent() != cfg.parent() {
+            let _ = conn.write_line("ERR log-path-denied");
+            return;
+        }
+        Some(log.to_path_buf())
     };
-    // 从已通过参数/路径/属主校验后开始计时：拒绝腿不伪装成“起核耗时”。
+    let birth = match mint_birth_token() {
+        Ok(birth) => birth,
+        Err(error) => {
+            log::error!("Linux helper birth entropy unavailable: {error}");
+            let _ = conn.write_line("ERR start birth-entropy");
+            return;
+        }
+    };
     let total_started = Instant::now();
-    // :429: 显式跟随本次会话的转发态。
     let forwarding_started = Instant::now();
-    (deps.set_forward)(fwd.trim() == "1");
+    (deps.set_forward)(params.common.fwd);
     let forwarding_ms = crate::elapsed_ms(forwarding_started);
-
-    // :431-478: AmbientCaps 拉核（setuid 回对端登录用户 + CAP_NET_ADMIN/RAW/BIND_SERVICE）。
-    // 经 CoreSpawner trait 抽象：生产实现做 fork+setuid+AmbientCaps+execve（§helper-rust-evaluation B3 真机项）；
-    // 测试 mock 返回固定 pid。
     let process_prepare_started = Instant::now();
     let req = SpawnCoreRequest {
-        birth,
-        binary: core_bin.clone(),
-        config: PathBuf::from(cfg),
-        log: if log_path.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(log_path.trim()))
-        },
-        fwd: fwd.trim() == "1",
-        parent_pid: if ppid > 0 { Some(ppid) } else { None },
+        birth: Some(birth),
+        binary: core.directory.join("sing-box"),
+        config: cfg.to_path_buf(),
+        log,
+        fwd: params.common.fwd,
+        parent_pid: params.common.parent_pid,
         uid: cred.uid,
         gid: cred.gid,
-        // 补充组在 fork 前于父进程解析（Go SysProcAttr.Credential.Groups），随 request 下发给 pre_exec 的
-        // setgroups（拉核子进程不碰 NSS）。对照 Go start 分支 `Groups: supplementaryGroups(cred.Uid)`，:439。
         groups: supplementary_groups(cred.uid),
     };
     let process_prepare_ms = crate::elapsed_ms(process_prepare_started);
-    let spawned = match verified {
-        Some(core) => deps.spawner.spawn_pinned(&req, core),
-        None => deps.spawner.spawn(&req),
-    };
-    match spawned {
+    match deps.spawner.spawn_pinned(&req, core) {
         Ok(started) => {
-            let pid = started.handle.pid;
             let target = started.handle.target();
             state.child = Some(ManagedChild::Running(started.handle));
-            let process_ms = started.process_ms.saturating_add(process_prepare_ms);
-            let timing = StartTiming {
-                forwarding_ms,
-                process_ms,
-                job_ms: 0,
-                log_handoff_ms: started.log_handoff_ms,
-                total_ms: crate::elapsed_ms(total_started),
-            };
-            let response = if exact {
-                match target {
-                    Some(target) => {
-                        let start = LinuxBirthStart::Started {
+            match target {
+                Some(target) => {
+                    let timing = StartTiming {
+                        forwarding_ms,
+                        process_ms: started.process_ms.saturating_add(process_prepare_ms),
+                        job_ms: 0,
+                        log_handoff_ms: started.log_handoff_ms,
+                        total_ms: crate::elapsed_ms(total_started),
+                    };
+                    let _ = conn.write_line(&birth_start_line(
+                        Some(id),
+                        LinuxBirthStart::Started {
                             target,
                             timing: Some(timing),
-                        };
-                        let _ = conn.write_line(&birth_start_line(id.as_ref(), start));
-                        return;
-                    }
-                    None => {
-                        // A broken spawner cannot publish a successful exact birth.
-                        let _ = conn.write_line("ERR start missing-birth");
-                        return;
-                    }
+                        },
+                    ));
                 }
-            } else {
-                Response::Ok(ResponseKind::Start(Start::StartedTimed {
-                    pid,
-                    timing,
-                    created: None,
-                }))
-            };
-            let _ = conn.write_line(&response.to_wire_line());
+                None => {
+                    let _ = conn.write_line("ERR start missing-birth");
+                }
+            }
         }
         Err(SpawnError::Spawn { detail }) => {
-            // :456: 复位转发态（拉核失败不留全局转发）。
             (deps.set_forward)(false);
             let _ = conn.write_line(&format!("ERR start {detail}"));
         }

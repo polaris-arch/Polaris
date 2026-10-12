@@ -326,7 +326,7 @@ export default function SettingsHelper() {
                         version: status.version,
                         required: status.expectedProtocolVersion,
                       })
-                    : t('helper.buildVersionMismatch')}
+                    : t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent' : 'helper.statusUpgradeable')}
                 </Pill>
               </div>
               <div className="card-sub">{t('helper.upgradeDescCard')}</div>
@@ -335,7 +335,7 @@ export default function SettingsHelper() {
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                     <path d="M12 3v11M8 10l4 4 4-4" />
                   </svg>
-                  <span>{t('helper.upgradeHelperAction')}</span>
+                  <span>{t(status?.selectedCore?.state === 'absent' ? 'helper.installSelectedCoreAction' : 'helper.upgradeHelperAction')}</span>
                 </Button>
               </div>
             </div>

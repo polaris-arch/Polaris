@@ -507,7 +507,9 @@ mod sys {
             conf_dir: &str,
             uid: u32,
         ) -> Result<NativeBirthStart, SpawnError> {
-            if let Err(not_admitted) = self.native.admit() {
+            let id = polaris_helper_proto::core_manifest::CoreId::parse(&core.manifest.id)
+                .map_err(|_| SpawnError::Failed("core-invalid".into()))?;
+            if let Err(not_admitted) = self.native.admit_pinned(uid, &id) {
                 return Ok(not_admitted);
             }
             let mut admission = StartAdmission(&self.native, false);

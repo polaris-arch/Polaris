@@ -87,7 +87,7 @@ export enum ProxyErrorCode {
   CORE_BUNDLE_MISMATCH = 'CORE_BUNDLE_MISMATCH',
   HELPER_CORE_ABSENT = 'HELPER_CORE_ABSENT',
   HELPER_CORE_INVALID = 'HELPER_CORE_INVALID',
-  HELPER_CORE_MISMATCH = 'HELPER_CORE_MISMATCH', // 确认不了提权助手里的内核就是本应用配套的那一份（起核前对账不通过），或起核后自证发现助手实跑的版本不同而停核（终态）→ 引导到「设置 › Helper」重装或升级助手
+  HELPER_CORE_MISMATCH = 'HELPER_CORE_MISMATCH', // 选定 CoreID 与助手内容或起核回执不符；版本首行仅作诊断
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127
   CRONET_LIB_MISSING = 'CRONET_LIB_MISSING', // 'cronet: library not found' / dlopen 失败（naive 出站缺/坏 libcronet → 整核 FATAL，自愈冷路径触发）
   HELPER_NOT_INSTALLED = 'HELPER_NOT_INSTALLED', // TUN 需提权 helper 但未安装、且引导门内也没能装上 → 渲染端引导去「设置 › Helper」，不抛裸 socket ENOENT

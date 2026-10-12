@@ -9,6 +9,7 @@ const t = (key: string) => `translated:${key}`;
 
 describe('structured action error text', () => {
   it('stable helper code wins over any diagnostic', () => {
+    expect(helperActionErrorText('bundleMismatch', t)).toBe('translated:helper.actionError.bundleMismatch');
     expect(helperActionErrorText('missingAsset', t)).toBe('translated:helper.actionError.missingAsset');
     expect(helperActionErrorText('authorizationUnavailable', t)).toBe(
       'translated:helper.actionError.authorizationUnavailable'
