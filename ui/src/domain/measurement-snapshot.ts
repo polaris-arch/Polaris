@@ -36,7 +36,7 @@ export function validMeasurementSnapshot(value: unknown): value is MeasurementSn
       && (record.state === 'expired' || identity.instance.kind !== 'main' || identity.configDigest === value.emissionDigest && value.emissionDigest !== null)
       && (identity.instance.kind === 'temp') === record.disconnected
       && nullableNumber(identity.networkEpoch)
-      && !Object.hasOwn(identity, 'nodeFingerprint')
+      && !Object.prototype.hasOwnProperty.call(identity, 'nodeFingerprint')
       && (identity.nodeFingerprintDigest === null || typeof identity.nodeFingerprintDigest === 'string' && /^[a-f0-9]{64}$/.test(identity.nodeFingerprintDigest))
       && (identity.connectionDigest === null || typeof identity.connectionDigest === 'string' && /^[a-f0-9]{64}$/.test(identity.connectionDigest))
       && (identity.configDigest === null || typeof identity.configDigest === 'string')

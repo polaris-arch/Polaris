@@ -12,11 +12,11 @@ export function MeasurementLabel({ serverId, purpose = 'candidate', displayedSer
   const t = translate ?? sharedT;
   const result = useLatencyStore(state => {
     const values = purpose === 'candidate' ? state.projections : state.currentProjections;
-    return Object.hasOwn(values, serverId) ? values[serverId] : UNMEASURED_PROJECTION;
+    return Object.prototype.hasOwnProperty.call(values, serverId) ? values[serverId] : UNMEASURED_PROJECTION;
   });
   const saved = useAppStore(state => state.config?.servers.find(server => server.id === serverId));
   const paused = useLatencyStore(state => state.snapshot?.schedule.state === 'paused'
-    && !!saved?.subscriptionId && Object.hasOwn(state.snapshot.schedule.subscriptions ?? {}, saved.subscriptionId));
+    && !!saved?.subscriptionId && Object.prototype.hasOwnProperty.call(state.snapshot.schedule.subscriptions ?? {}, saved.subscriptionId));
   const pauseReason = useLatencyStore(state => state.snapshot?.schedule.reason);
   const readError = useLatencyStore(state => state.readError);
   const projected: MeasurementProjection = result === UNMEASURED_PROJECTION && paused ? { state: 'paused', reason: pauseReason } : result;

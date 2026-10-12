@@ -12,6 +12,6 @@ export function useQualifiedLatencies(displayed: readonly ServerConfig[], needed
     if (!needed || !saved) return EMPTY_LATENCY_MAP;
     const versions = new Map(saved.map(server => [server.id, configCanonicalText(server)]));
     return Object.fromEntries(displayed.filter(server => versions.get(server.id) === configCanonicalText(server)
-      && Object.hasOwn(raw, server.id)).map(server => [server.id, raw[server.id]]));
+      && Object.prototype.hasOwnProperty.call(raw, server.id)).map(server => [server.id, raw[server.id]]));
   }, [raw, saved, displayed, needed]);
 }

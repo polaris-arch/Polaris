@@ -9,7 +9,7 @@ export function projectMeasurement(
   snapshot: MeasurementSnapshot, server: ServerConfig, now: number,
   purpose: 'candidate' | 'current' = 'candidate',
 ): MeasurementProjection {
-  const rows: MeasurementRows | undefined = Object.hasOwn(snapshot.rows, server.id) ? snapshot.rows[server.id] : undefined;
+  const rows: MeasurementRows | undefined = Object.prototype.hasOwnProperty.call(snapshot.rows, server.id) ? snapshot.rows[server.id] : undefined;
   const record: MeasurementRecord | undefined = purpose === 'candidate' ? rows?.candidate
     : [rows?.candidate, rows?.system, rows?.selected].filter((value): value is MeasurementRecord => value !== undefined)
       .sort((a, b) => BigInt(a.identity.run) < BigInt(b.identity.run) ? 1 : BigInt(a.identity.run) > BigInt(b.identity.run) ? -1 : b.identity.seq - a.identity.seq)[0];
@@ -17,7 +17,7 @@ export function projectMeasurement(
   if (purpose === 'candidate' && rows?.notIncluded) return { state: 'unmeasured', notIncluded: rows.notIncluded };
   const paused = purpose === 'candidate' && !!server.subscriptionId
     && snapshot.schedule.state === 'paused'
-    && Object.hasOwn(snapshot.schedule.subscriptions ?? {}, server.subscriptionId);
+    && Object.prototype.hasOwnProperty.call(snapshot.schedule.subscriptions ?? {}, server.subscriptionId);
   if (paused) return { state: 'paused', reason: snapshot.schedule.reason, measuredAt: record?.identity.measuredAt };
   if (!record) return UNMEASURED;
   const expired = record.state === 'expired' || !Number.isFinite(now)

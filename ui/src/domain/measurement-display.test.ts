@@ -59,8 +59,11 @@ describe('Rust producer display IPC interoperability', () => {
     raw.rows.interop.candidate.identity.nodeFingerprint = producerFixture.legacyFingerprint;
     delete raw.rows.interop.candidate.identity.nodeFingerprintDigest;
     expect(validMeasurementSnapshot(raw)).toBe(false);
-    const changed = structuredClone(snapshot); changed.rows.interop.candidate.state = 'expired';
-    changed.rows.interop.candidate.reason = 'connectionChanged';
+    const changed = structuredClone(snapshot);
+    const candidate = changed.rows.interop.candidate;
+    if (!candidate) throw new Error('Shared producer fixture is missing its candidate record');
+    candidate.state = 'expired';
+    candidate.reason = 'connectionChanged';
     expect(validMeasurementSnapshot(changed)).toBe(true);
     expect(projectMeasurement(changed as import('@/contracts/measurement-display').MeasurementSnapshot,
       producerFixture.server as ServerConfig,1001)).toMatchObject({state:'expired',latency:undefined});

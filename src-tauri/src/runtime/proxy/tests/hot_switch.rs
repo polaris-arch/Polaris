@@ -2121,6 +2121,7 @@ fn mark_running_with_snapshot(rt: &ProxyRuntime, cfg: &Value) {
         static_detours: BTreeMap::new(),
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
+        measurement_fingerprints: node_fingerprints::measurement_table_config(&uc),
         probe_pool_ports: vec![],
         probe_proxy_port: None,
         loopback_auth: None,

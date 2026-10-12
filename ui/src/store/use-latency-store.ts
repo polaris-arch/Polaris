@@ -101,7 +101,7 @@ export const useLatencyStore = create<LatencyState>((set) => ({
     const values: Array<[string, number | null]> = [];
     const stamps: Array<[string, number]> = [];
     for (const server of servers) {
-      if (!Object.hasOwn(snapshot.rows, server.id)) continue;
+      if (!Object.prototype.hasOwnProperty.call(snapshot.rows, server.id)) continue;
       const project = (purpose: 'candidate' | 'current', old: Record<string, MeasurementProjection>) => {
         const value = projectMeasurement(snapshot, server, now, purpose);
         return JSON.stringify(old[server.id]) === JSON.stringify(value) ? old[server.id] : value;
