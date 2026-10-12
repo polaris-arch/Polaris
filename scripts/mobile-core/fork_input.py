@@ -31,14 +31,14 @@ def canonical(value):
                       allow_nan=False).encode()
 
 
-def decode(raw):
+def decode(raw, maximum=65536):
     def pairs(rows):
         value = {}
         for key, item in rows:
             require(key not in value, 'duplicate mobile contract key')
             value[key] = item
         return value
-    require(len(raw) <= 65536, 'mobile input contract is too large')
+    require(len(raw) <= maximum, 'mobile input contract is too large')
     return json.loads(raw, object_pairs_hook=pairs,
                       parse_constant=lambda _: (_ for _ in ()).throw(RuntimeError('nonfinite input')))
 
@@ -150,7 +150,7 @@ def bind_command(platform, value, gomobile, output, input_fingerprint, bootclass
     require(platform in ('android', 'apple'), 'unknown formal mobile platform')
     profile = value[platform]
     args = [str(gomobile), 'bind', '-o', str(output), '-target', ','.join(profile['targets']),
-            '-libname=' + profile['libname'], '-trimpath', '-buildvcs=false',
+            '-libname=' + profile['libname'], '-trimpath', '-buildvcs=false', '-work', '-x',
             '-ldflags', linker_flags(value, input_fingerprint), '-tags', ','.join(profile['tags'])]
     if platform == 'android':
         require(bootclasspath is not None, 'explicit Android bootclasspath required')
@@ -168,7 +168,7 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
     import os
     env = dict(os.environ)
     for key in ['GOWORK', 'GOFLAGS', 'GOTOOLCHAIN', 'GOROOT', 'GOOS', 'GOARCH', 'GOARM', 'GOARM64',
-                'GOBIN', 'CGO_CFLAGS', 'CGO_CPPFLAGS', 'CGO_LDFLAGS', 'CC', 'CXX',
+                'GOBIN', 'GOPATH', 'CGO_CFLAGS', 'CGO_CPPFLAGS', 'CGO_LDFLAGS', 'CC', 'CXX',
                 'ANDROID_HOME', 'ANDROID_SDK_ROOT', 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT',
                 'DEVELOPER_DIR', 'SDKROOT', 'MACOSX_DEPLOYMENT_TARGET', 'IPHONEOS_DEPLOYMENT_TARGET']:
         env.pop(key, None)
@@ -176,6 +176,7 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
     env.update(PATH=os.pathsep.join(paths + [env.get('PATH', '')]), GOWORK='off',
                GOFLAGS='-mod=readonly', GOTOOLCHAIN='local', CGO_ENABLED='1',
                GOCACHE=str(Path(cache) / 'go-build'), GOMODCACHE=str(Path(cache) / 'go-mod'),
+               GOPATH=str(Path(cache) / 'go-path'),
                TMPDIR=str(scratch))
     if sdk is not None:
         require(ndk is not None and jdk is not None and developer is None, 'explicit Android tools required')

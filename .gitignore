@@ -82,3 +82,5 @@ src-tauri/gen/schemas/
 /scripts/debug-pc-echo-driver-*/
 /scripts/ios-simulator-acceptance/
 /scripts/acc01-local-acceptance-*/
+/scripts/mobile-core/android-consumption.json
+/scripts/mobile-core/android-consumption.json.tmp

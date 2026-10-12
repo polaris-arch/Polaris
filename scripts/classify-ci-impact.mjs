@@ -617,6 +617,15 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
       'libbox.aar 的唯一来源。它的坑② 明写「不能靠摘掉 with_naive_outbound 绕过 NDK 报错」—— '
       + '摘了之后 aar/APK/CI 全绿，只有真机上 naive/H3 静默连不上，唯一能抓到的就是本腿的 so 指纹判据。',
   },
+  'scripts/mobile-source-unit.test.mjs': {
+    why: 'Formal mobile input/output/cache and transaction counterexamples protect the Android producer and Apple link source boundary.',
+  },
+  'scripts/mobile-core/': {
+    why: 'Formal zero-overlay mobile source, SDK producer, native-input/cache and final-carrier predicates feed the actual Android APK leg; host source tests also cover Apple binding/link controls.',
+  },
+  'scripts/build-mobile-core.sh': {
+    why: 'The explicit formal component entry uses fixed source/tools/reservation slots and must reach the Android packaging/source checks.',
+  },
   'scripts/libbox-patches/': {
     why: 'libbox 固定来源、工具链、补丁、构建与收据核验同属 AAR 来源；任何改动都须重跑 Android APK 腿。',
   },

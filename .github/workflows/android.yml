@@ -189,7 +189,7 @@ jobs:
   #     输入是 Java/Kotlin 字节码与 keep 规则，Rust 构型不在其输入里，成立；
   #   · `release 构建行为裁判` —— gradle 配置期事实（`--dry-run` 任务图与 `printPolarisReleaseFacts`），
   #     不调 cargo，成立；
-  #   · libbox 收据（`verify-receipt.py --apk`）—— 判 libbox 来源与随包一致性，成立；
+  #   · libbox 收据（`mobile-core/ci_android.py verify --apk`）—— 判 libbox 来源与随包一致性，成立；
   #   · 体积 —— Android 侧**没有体积上限门**（`verify-apk.mjs` 刻意按节区与死字节比值判，理由在其
   #     判据 ⑥ 的注释）。末步打印的 APK 字节数在轻量构型下**偏大，不是发行体积**，该步已标注构型。
   # 风险门从此**不验**的一件事：Android target 上 fat LTO 链接本身能否成功、以及 fat LTO 产物的
@@ -314,8 +314,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/libbox-patches/android-source.py admit
-          version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
+          python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
+          version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
@@ -369,7 +369,7 @@ jobs:
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 source-manifest.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
@@ -399,103 +399,31 @@ jobs:
       # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
       # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
       # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
-      - name: Prepare libbox tools and source cache identity
+      - name: Prepare formal mobile source and isolated tools
         id: libbox_input
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/libbox-patches/android-source.py admit
-          libbox_go="$(command -v go)"
-          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
-          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
-          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
-          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
-          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
-          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
-          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
-          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+        run: python3 scripts/mobile-core/ci_android.py prepare
 
-      - name: Cache libbox.aar
+      - name: Restore formal component and fixed Go cache
         id: libbox
         uses: actions/cache/restore@v6
         with:
           path: |
-            src-tauri/gen/android/app/libs/libbox.aar
-            scripts/libbox-patches/build-receipt.json
-          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
+            ${{ steps.libbox_input.outputs.work }}
+            ${{ steps.libbox_input.outputs.cache }}
+          key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
-      - name: Build libbox.aar (缓存未命中)
-        if: steps.libbox.outputs.cache-hit != 'true'
+      - name: Build or revalidate formal four-ABI component and App input
         shell: bash
-        run: |
-          set -euo pipefail
-          app_status="$(git status --porcelain --untracked-files=normal)"
-          if [ -n "$app_status" ]; then
-            echo "::error::App source candidate must be clean before libbox build"
-            git status --porcelain --untracked-files=all
-            exit 1
-          fi
-          src="$RUNNER_TEMP/sing-box"
-          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
-          # A named ref keeps the pinned core reachable in the provider's shared clone.
-          python3 - "$RUNNER_TEMP" <<'PYDEPS'
-          import json, pathlib, subprocess, sys
-          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
-          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
-          directory = pathlib.Path(sys.argv[1])
-          def revision(repository, ref):
-              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
-          def fetch(url, commit, name):
-              repository = directory / name
-              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
-              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
-              ref = 'refs/heads/polaris-source'
-              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
-              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
-                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
-              return repository
-          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
-          repository = fetch(url, source['sourceCommit'], 'sing-box')
-          tag = 'refs/tags/v' + core['bundledCoreVersion']
-          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
-          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
-              raise RuntimeError('Upstream version tag differs from source-manifest commit')
-          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
-          values = []
-          for dependency in source['dependencyPatches']:
-              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
-              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
-          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
-          PYDEPS
-          (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
-          mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
-          df -h / | tail -1
-          mapfile -t module_sources < <(python3 -c 'import json,os; [print(value) for value in json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))]')
-          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
+        run: python3 scripts/mobile-core/ci_android.py build
 
-          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
-          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
-          # APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
-          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
-          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
-          go clean -cache -modcache || true
-          rm -rf "$src" /var/tmp/gomobile-tmp
-          df -h / | tail -1
-
-      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
-      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
       - name: libbox.aar 必须在位
         id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
-          aar=src-tauri/gen/android/app/libs/libbox.aar
-          [ -s "$aar" ] || {
-            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
-            exit 1; }
-          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
-          python3 scripts/libbox-patches/verify-receipt.py
+          test -s src-tauri/gen/android/app/libs/libbox.aar
+          python3 scripts/mobile-core/ci_android.py verify
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
@@ -503,8 +431,8 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
-            src-tauri/gen/android/app/libs/libbox.aar
-            scripts/libbox-patches/build-receipt.json
+            ${{ steps.libbox_input.outputs.work }}
+            ${{ steps.libbox_input.outputs.cache }}
           key: ${{ steps.libbox.outputs.cache-primary-key }}
 
 
@@ -649,7 +577,23 @@ jobs:
       - name: R8 吃进了什么 / 保住了什么（产物级证据）
         run: |
           node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
-          python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+          python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
+
+      - name: Retain actual formal mobile component and original receipts
+        if: always() && steps.libbox_input.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-mobile-input-${{ github.job }}
+          path: |
+            ${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar
+            ${{ steps.libbox_input.outputs.work }}/*receipt.json
+            ${{ steps.libbox_input.outputs.work }}/*bind.log
+            ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            scripts/mobile-core/android-consumption.json
+            src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
+            ${{ runner.temp }}/*.source-consumption.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: 记录未分发 APK 体积
         shell: bash
@@ -859,8 +803,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/libbox-patches/android-source.py admit
-          version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").goVersion')"
+          python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
+          version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
@@ -914,7 +858,7 @@ jobs:
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 source-manifest.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
@@ -944,103 +888,31 @@ jobs:
       # 缓存身份由完整共同 pins、四 ABI policy、实际工具/SDK 与 producer code 形成。
       # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
       # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
-      - name: Prepare libbox tools and source cache identity
+      - name: Prepare formal mobile source and isolated tools
         id: libbox_input
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/libbox-patches/android-source.py admit
-          libbox_go="$(command -v go)"
-          libbox_ndk="$(python3 scripts/libbox-patches/prepare-ndk-linux.py "$RUNNER_TEMP")"
-          export LIBBOX_GO="$libbox_go" LIBBOX_NDK_HOME="$libbox_ndk"
-          mobile_version="$(node -p 'require("./scripts/libbox-patches/source-manifest.json").gomobileVersion')"
-          GOBIN="$HOME/go/bin" GOTOOLCHAIN=local GOWORK=off go install "github.com/sagernet/gomobile/cmd/gomobile@$mobile_version" "github.com/sagernet/gomobile/cmd/gobind@$mobile_version"
-          echo "LIBBOX_GO=$libbox_go" >> "$GITHUB_ENV"
-          echo "LIBBOX_NDK_HOME=$libbox_ndk" >> "$GITHUB_ENV"
-          fingerprint="$(python3 scripts/libbox-patches/android-source.py identity)"
-          [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]]
-          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+        run: python3 scripts/mobile-core/ci_android.py prepare
 
-      - name: Cache libbox.aar
+      - name: Restore formal component and fixed Go cache
         id: libbox
         uses: actions/cache/restore@v6
         with:
           path: |
-            src-tauri/gen/android/app/libs/libbox.aar
-            scripts/libbox-patches/build-receipt.json
-          key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
+            ${{ steps.libbox_input.outputs.work }}
+            ${{ steps.libbox_input.outputs.cache }}
+          key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
-      - name: Build libbox.aar (缓存未命中)
-        if: steps.libbox.outputs.cache-hit != 'true'
+      - name: Build or revalidate formal four-ABI component and App input
         shell: bash
-        run: |
-          set -euo pipefail
-          app_status="$(git status --porcelain --untracked-files=normal)"
-          if [ -n "$app_status" ]; then
-            echo "::error::App source candidate must be clean before libbox build"
-            git status --porcelain --untracked-files=all
-            exit 1
-          fi
-          src="$RUNNER_TEMP/sing-box"
-          # Fetch exact upstream objects, not patched candidateCommit or only the default branch.
-          # A named ref keeps the pinned core reachable in the provider's shared clone.
-          python3 - "$RUNNER_TEMP" <<'PYDEPS'
-          import json, pathlib, subprocess, sys
-          source = json.loads(pathlib.Path('scripts/libbox-patches/source-manifest.json').read_text())
-          core = json.loads(pathlib.Path('src-tauri/core-manifest.json').read_text())
-          directory = pathlib.Path(sys.argv[1])
-          def revision(repository, ref):
-              return subprocess.check_output(['git', '-C', str(repository), 'rev-parse', ref], text=True).strip()
-          def fetch(url, commit, name):
-              repository = directory / name
-              repository.mkdir()  # Refuse stale runner checkouts; every input is fetched fresh.
-              subprocess.run(['git', 'init', '--quiet', str(repository)], check=True)
-              ref = 'refs/heads/polaris-source'
-              subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, commit + ':' + ref], check=True)
-              if revision(repository, commit + '^{commit}') != commit or revision(repository, ref) != commit:
-                  raise RuntimeError('Fetched upstream object/ref differs from manifest pin: ' + name)
-              return repository
-          url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
-          repository = fetch(url, source['sourceCommit'], 'sing-box')
-          tag = 'refs/tags/v' + core['bundledCoreVersion']
-          subprocess.run(['git', '-C', str(repository), 'fetch', '--no-tags', '--depth=1', url, tag + ':' + tag], check=True)
-          if revision(repository, tag + '^{commit}') != source['sourceCommit']:
-              raise RuntimeError('Upstream version tag differs from source-manifest commit')
-          subprocess.run(['git', '-C', str(repository), 'checkout', '--detach', source['sourceCommit']], check=True)
-          values = []
-          for dependency in source['dependencyPatches']:
-              repository = fetch(dependency['sourceURL'], dependency['upstreamCommit'], 'polaris-upstream-' + dependency['name'])
-              values.append('--module-source=' + dependency['module'] + '=' + str(repository))
-          (directory / 'polaris-module-sources.json').write_text(json.dumps(values))
-          PYDEPS
-          (cd "$src" && GOTOOLCHAIN=local GOWORK=off go mod download all)
-          mkdir -p "$HOME/Code"  # build.py clones the pinned source into a fresh checkout here.
-          df -h / | tail -1
-          mapfile -t module_sources < <(python3 -c 'import json,os; [print(value) for value in json.load(open(os.environ["RUNNER_TEMP"] + "/polaris-module-sources.json"))]')
-          bash scripts/build-libbox.sh "$src" "${module_sources[@]}"
+        run: python3 scripts/mobile-core/ci_android.py build
 
-          # 🔴 腾磁盘再交给 Rust 那一步。本机实测这次构建产生 **7.4 GB** Go 构建缓存
-          # （加 module cache 更多），而同一个 job 后面还要放 Rust 的 android target 目录与 release
-          # APK。GitHub runner 的系统盘余量有限，且爆盘的报错形态（链接器
-          # 中途 ENOSPC）离真因很远。这里的缓存对本 job 之后的步骤零价值 —— 要的是那个 aar，
-          # 它已经落在 app/libs/ 下并会被 actions/cache 保存。
-          go clean -cache -modcache || true
-          rm -rf "$src" /var/tmp/gomobile-tmp
-          df -h / | tail -1
-
-      # 命中与否都断言，且是**正面**断言：这条腿拿不到 aar 时必须在这里响亮地红，
-      # 而不是一路走到 gradle 说「找不到 libs/libbox.aar」，更不是静默出一个没有内核的包。
       - name: libbox.aar 必须在位
         id: libbox_verified
         shell: bash
         run: |
           set -euo pipefail
-          aar=src-tauri/gen/android/app/libs/libbox.aar
-          [ -s "$aar" ] || {
-            echo "::error::$aar 缺失或为 0 字节 —— 这条腿的内核来源没拿到（缓存命中=${{ steps.libbox.outputs.cache-hit }}）"
-            exit 1; }
-          echo "libbox.aar $(stat -c%s "$aar") 字节  sha256=$(sha256sum "$aar" | cut -d' ' -f1)"
-          python3 scripts/libbox-patches/verify-receipt.py
+          test -s src-tauri/gen/android/app/libs/libbox.aar
+          python3 scripts/mobile-core/ci_android.py verify
 
       # Save only the validated AAR/receipt pair before an unrelated APK failure can discard it.
       - name: Save verified libbox.aar
@@ -1048,8 +920,8 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
-            src-tauri/gen/android/app/libs/libbox.aar
-            scripts/libbox-patches/build-receipt.json
+            ${{ steps.libbox_input.outputs.work }}
+            ${{ steps.libbox_input.outputs.cache }}
           key: ${{ steps.libbox.outputs.cache-primary-key }}
 
       # ── 签名凭据：从 secret 落到 runner 的临时路径，用后即删 ──
@@ -1266,10 +1138,26 @@ jobs:
           for pair in arm64:arm64-v8a arm:armeabi-v7a universal:universal; do
             flavor="${pair%%:*}"
             abi="${pair#*:}"
-            python3 scripts/libbox-patches/verify-receipt.py \
+            python3 scripts/mobile-core/ci_android.py verify \
               --apk "$RUNNER_TEMP/Polaris_${version}_${abi}-android.apk" --abi "$abi" \
               --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
           done
+
+      - name: Retain actual formal mobile component and original receipts
+        if: always() && steps.libbox_input.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-mobile-input-${{ github.job }}
+          path: |
+            ${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar
+            ${{ steps.libbox_input.outputs.work }}/*receipt.json
+            ${{ steps.libbox_input.outputs.work }}/*bind.log
+            ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            scripts/mobile-core/android-consumption.json
+            src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
+            ${{ runner.temp }}/*.source-consumption.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: 上传成 release 资产
         shell: bash

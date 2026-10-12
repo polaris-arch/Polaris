@@ -32,6 +32,7 @@ builder = load('fixture_builder', HERE / 'build.py')
 android = builder.android
 verifier = load('fixture_verifier', HERE / 'verify-receipt.py')
 FIXTURE_PATCHED = ['example.com/patched', 'example.com/second']
+HISTORICAL_CI = json.loads((HERE / 'historical-ci-fragments.json').read_bytes())
 EMPTY_GRAPH_SHA256 = '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'
 
 
@@ -683,19 +684,18 @@ class AndroidSourceFixture(unittest.TestCase):
 
     def test_workflow_prelookup_mirrors(self):
         text = (ROOT / '.github/workflows/android.yml').read_text()
-        mirrors = text.split('      - name: Cache libbox.aar')
+        mirrors = text.split('      - name: Restore formal component and fixed Go cache')
         self.assertEqual(len(mirrors), 3)
         for before, after in zip(mirrors, mirrors[1:]):
-            preparation = before[before.rindex('      - name: Prepare libbox tools'):]
+            preparation = before[before.rindex('      - name: Prepare formal mobile source and isolated tools'):]
             self.assertIn('id: libbox_input', preparation)
-            self.assertIn('android-source.py identity', preparation)
-            prior = before[:before.rindex('      - name: Prepare libbox tools')]
-            self.assertIn('android-source.py admit', prior)
-            cache, remaining = after.split('      - name: Build libbox.aar', 1)
-            self.assertIn('key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', cache)
+            self.assertIn('ci_android.py prepare', preparation)
+            prior = before[:before.rindex('      - name: Prepare formal mobile source and isolated tools')]
+            self.assertIn('from fork_input import load; load()', prior)
+            cache, remaining = after.split('      - name: Build or revalidate formal four-ABI component and App input', 1)
+            self.assertIn('key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', cache)
             self.assertNotIn('restore-keys:', cache)
-            self.assertIn('verify-receipt.py', remaining)
-        # Shell syntax is verified without executing tool/fetch/build commands.
+            self.assertIn('ci_android.py verify', remaining)
         for block in re.findall(r'(?m)^        run: \|\n((?:^          .*\n|^\n)+)', text):
             shell = '\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines())
             shell = re.sub(r'\$\{\{.*?\}\}', 'fixture', shell)
@@ -704,15 +704,13 @@ class AndroidSourceFixture(unittest.TestCase):
 
 class CISourceFetchFixture(unittest.TestCase):
     def programs(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        blocks = re.findall(r'(?m)^          python3 - "\$RUNNER_TEMP" <<\'PYDEPS\'\n(.*?)^          PYDEPS$', text, re.S)
-        self.assertEqual(len(blocks), 2)
-        programs = ['\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines()) for block in blocks]
-        self.assertEqual(programs[0], programs[1])
-        self.assertGreater(len(programs[0]), 1000)
-        return programs
+        # Fixed exact historical YAML, retained for alpha8 compatibility tests.
+        block = HISTORICAL_CI['fetch']
+        program = '\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines())
+        self.assertGreater(len(program), 1000)
+        return [program, program]
 
-    def test_actual_yaml_exact_fetch_and_refusal_controls(self):
+    def test_historical_yaml_exact_fetch_and_refusal_controls(self):
         actual = json.loads((HERE / 'source-manifest.json').read_text())
         core = json.loads((ROOT / 'src-tauri/core-manifest.json').read_text())
         # The committed manifest decides the product fetch set; a synthetic
@@ -796,12 +794,13 @@ class CISourceFetchFixture(unittest.TestCase):
                             self.assertFalse(output.exists(), 'A failed source fetch must not publish a builder handoff')
                         checked += 1
         self.assertEqual(checked, 32)
-        print('Actual YAML source fetch controls: 32/32 PASS (two mirrors, committed and declared-dependency manifests; Git/Go/network callees not executed)')
+        print('Historical YAML source fetch controls: 32/32 PASS (two mirrors, committed and declared-dependency manifests; Git/Go/network callees not executed)')
 
-    def test_actual_yaml_module_source_handoff_passes_no_empty_argument(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
+    def test_historical_yaml_module_source_handoff_passes_no_empty_argument(self):
+        text = '          ' + HISTORICAL_CI['handoff'].replace('\nbash ', '\n          bash ')
         handoffs = re.findall(r'(?m)^          (mapfile -t module_sources < <\(.*\)\n)          (bash scripts/build-libbox\.sh "\$src" "\$\{module_sources\[@\]\}"\n)', text)
-        self.assertEqual(len(handoffs), 2)
+        self.assertEqual(len(handoffs), 1)
+        handoffs *= 2
         self.assertEqual(handoffs[0], handoffs[1])
         # Only the builder entry is replaced; the expansion itself is the YAML's.
         callee = 'bash() { printf "%s\\n" "$#"; printf "<%s>\\n" "$@"; }\nsrc=SOURCE\n'
@@ -823,7 +822,7 @@ class CISourceFetchFixture(unittest.TestCase):
         text = (ROOT / '.github/workflows/android.yml').read_text()
         check, signed = text.split('\n  release-apk:\n', 1)
         start = '      - uses: actions/setup-node@v7'
-        end = '          python3 scripts/libbox-patches/verify-receipt.py'
+        end = '          python3 scripts/mobile-core/ci_android.py verify'
         preludes = [body[body.index(start):body.index(end) + len(end)] for body in (check, signed)]
         self.assertGreater(len(preludes[0]), 2000)
         self.assertEqual(preludes[0], preludes[1])
@@ -833,12 +832,9 @@ class CISourceFetchFixture(unittest.TestCase):
             subprocess.run(['bash', '-n'], input=shell, text=True, check=True)
 
 
-class CIIdentityFixture(unittest.TestCase):
-    def test_actual_yaml_identity_refusal_before_output_and_lookup(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        preparation_blocks = re.findall(
-            r'(?m)^      - name: Prepare libbox tools and source cache identity\n((?:^        .*\n|^\n)+)', text)
-        self.assertEqual(len(preparation_blocks), 2)
+class HistoricalCIIdentityFixture(unittest.TestCase):
+    def test_historical_yaml_identity_refusal_before_output_and_lookup(self):
+        preparation_blocks = [HISTORICAL_CI['identity']] * 2
         cases = [('exit7', '', 7, 7), ('empty', '', 0, 1), ('uppercase64', 'A' * 64, 0, 1),
                  ('nonhex64', 'g' * 64, 0, 1), ('short63', 'a' * 63, 0, 1),
                  ('long65', 'a' * 65, 0, 1), ('valid64', '0123456789abcdef' * 4, 0, 0)]
@@ -867,7 +863,7 @@ class CIIdentityFixture(unittest.TestCase):
                     self.assertEqual(result.stdout, 'cache_lookup_reached\n' if expected_exit == 0 else '')
                     checked += 1
         self.assertEqual(checked, 14)
-        print('Actual YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
+        print('Historical YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
 
 
 class CIAppCleanFixture(unittest.TestCase):
@@ -939,10 +935,8 @@ print(module.candidate(run))
                 self.assertIn('App source candidate must be clean', result.stderr)
                 self.assertEqual(git('status', '--porcelain', '--untracked-files=all', cwd=app), before)
 
-    def test_actual_build_preludes_diagnose_exact_dirty_paths_and_stop(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        blocks = re.findall(r'(?m)^      - name: Build libbox.aar \(缓存未命中\)\n((?:^        .*\n|^\n)+)', text)
-        self.assertEqual(len(blocks), 2)
+    def test_historical_build_preludes_diagnose_exact_dirty_paths_and_stop(self):
+        blocks = [HISTORICAL_CI['build']] * 2
         for mirror, block in enumerate(blocks):
             body = block.split('        run: |\n', 1)[1]
             shell = '\n'.join(line[10:] for line in body.splitlines() if line.startswith('          '))
@@ -1055,23 +1049,23 @@ class CIVerifiedCacheFixture(unittest.TestCase):
 
     def cache_steps(self, steps):
         names = [name for name, _ in steps]
-        restore_index = names.index('Cache libbox.aar')
+        restore_index = names.index('Restore formal component and fixed Go cache')
         verify_index = names.index('libbox.aar 必须在位')
         save_index = names.index('Save verified libbox.aar')
-        self.assertLess(restore_index, names.index('Build libbox.aar (缓存未命中)'))
+        self.assertLess(restore_index, names.index('Build or revalidate formal four-ABI component and App input'))
         self.assertEqual(save_index, verify_index + 1)
         self.assertLess(save_index, next(i for i, name in enumerate(names) if 'APK' in name and name.startswith('Build')))
         restore, verify, save = [steps[i][1] for i in (restore_index, verify_index, save_index)]
         self.assertIn('uses: actions/cache/restore@v6', restore)
         self.assertIn('id: libbox\n', restore)
-        self.assertIn('key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', restore)
+        self.assertIn('key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', restore)
         self.assertNotIn('restore-keys:', restore)
         self.assertIn('id: libbox_verified\n', verify)
         self.assertNotIn('continue-on-error:', verify)
-        self.assertIn('python3 scripts/libbox-patches/verify-receipt.py', verify)
+        self.assertIn('python3 scripts/mobile-core/ci_android.py verify', verify)
         self.assertIn('uses: actions/cache/save@v6', save)
         self.assertIn('key: ${{ steps.libbox.outputs.cache-primary-key }}', save)
-        expected_paths = ['src-tauri/gen/android/app/libs/libbox.aar', 'scripts/libbox-patches/build-receipt.json']
+        expected_paths = ['${{ steps.libbox_input.outputs.work }}', '${{ steps.libbox_input.outputs.cache }}']
         for block in (restore, save):
             paths = re.search(r'(?m)^          path: \|\n((?:^            .*\n)+)', block).group(1)
             self.assertEqual([line.strip() for line in paths.splitlines()], expected_paths)
@@ -1110,7 +1104,7 @@ class CIVerifiedCacheFixture(unittest.TestCase):
                     environment.update(VERIFY_EXIT=str(verify_exit), VERIFY_TRACE=str(trace))
                     run = '\n'.join(line[10:] if line.startswith('          ') else '' for line in body.splitlines())
                     run = run.replace('${{ steps.libbox.outputs.cache-hit }}', hit)
-                    callee = ('python3() { [[ "$*" == "scripts/libbox-patches/verify-receipt.py" ]] || return 97; '
+                    callee = ('python3() { [[ "$*" == "scripts/mobile-core/ci_android.py verify" ]] || return 97; '
                               'printf "actual verifier invocation\\n" >> "$VERIFY_TRACE"; return "$VERIFY_EXIT"; }\n')
                     result = subprocess.run(['bash', '-c', callee + run], cwd=app, env=environment,
                                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

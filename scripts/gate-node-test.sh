@@ -46,6 +46,7 @@ required_tests=(
   # 卸载钩子里唯一提权执行的那一段：脚本随命令行进入提权进程、删除前逐项校验、退出码被消费。
   scripts/nsis-helper-cleanup.test.mjs
   scripts/release-assets.test.mjs
+  scripts/mobile-source-unit.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {

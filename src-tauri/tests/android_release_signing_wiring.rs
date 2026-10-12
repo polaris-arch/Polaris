@@ -1255,7 +1255,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
 /// 只会逼后人把判据改宽 = 门被磨钝。
 // release-apk 在 checkout 与 setup-node 之间多一道 tag/SHA/draft 身份门；公共工具链从 setup-node 起。
 const PRELUDE_START: &str = "      - uses: actions/setup-node@v7";
-const PRELUDE_END: &str = "sha256=$(sha256sum";
+const PRELUDE_END: &str = "python3 scripts/mobile-core/ci_android.py verify";
 
 /// release-profile 验证腿必须持有的判据：`(在 workflow 里要找到的串, 它守什么)`。
 ///

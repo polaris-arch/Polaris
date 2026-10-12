@@ -49,11 +49,78 @@ The explicit planning entry is `bash scripts/plan-mobile-core.sh android` or
 paths. Planning does not resolve or download an SDK. Existing legacy build entry
 bytes are kept intact so old frozen receipt/script identities remain resolvable.
 
-The formal producer runner/actual output verifier/cache consumer wiring still
-has to consume this input. Required actual results are four-ABI ELF/API/JNI and
-module/BuildID checks, three static Apple architecture slices and generated API,
-and final APK/R8/alignment/App+PacketTunnel static-link provenance. Old
-`scripts/libbox-patches` and Apple six-patch inputs remain historical inputs;
-their receipts cannot be relabeled. The input has no artifact pins, producer
-receipt, App/device acceptance or publication eligibility. A plan, CLI output
-or diagnostic selfcheck cannot fill those fields.
+The formal producer entry is now `bash scripts/build-mobile-core.sh android`
+or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
+and `--cache`. Android also requires `--sdk --ndk --jdk`; Apple requires
+`--developer`. It reads the supplied exact source without another fork clone,
+uses scoped Go/module/GOPATH caches, and directly binds one fixed stage. The
+pinned generator's marker directory is created inside that GOPATH: `gomobile
+init` is never invoked because v0.1.13 would install gobind@latest.
+
+`artifacts.py` is the shared fresh/cache predicate: four exact Android ABIs,
+API24 ident notes, 16KiB PT_LOAD, actual dynamic runtime/JNI exports, generated
+Java API, original Go BuildInfo/module/replacement/BuildID; Apple has exactly
+three static architecture slices, bounded ar/Mach-O parsing, safe framework
+internal links, generated Objective-C API and real deployment/platform facts.
+`-x -work` preserves actual compiler objects and logs. `native_inputs.py` records
+those byte identities plus original external static archives, and maps every
+non-Go Apple archive member to actual compiler/runtime origins with multiplicity.
+Cache hits reread original native inputs, original log and the complete output.
+A changed producer commit can reuse identical producer code/tools while keeping
+the original component receipt's candidate and BuildID unchanged.
+
+`transaction.py` stages output/receipt/log together and journals exact fixed
+paths and byte/tree pins. Failure or interrupted commit restores the original
+pair and keeps rejected bytes and the original journal in bounded recovery
+slots. Identical Android input materialization is a verified cache hit. Occupied
+prior/rejected slots block replacement pending owner/reference review; nothing
+recursively deletes an unknown or unique input to make a build proceed.
+
+All local entries use `budget.py`'s atomic same-filesystem admission ledger and
+child-inherited flock reservation, plus fixed work/cache locks. The common
+ledger defaults to `~/.cache/polaris-build-budget`; an external volume needs one
+explicit `POLARIS_BUILD_BUDGET_ROOT` shared by its concurrent callers. Each
+mobile build reserves 16GiB of additional peak growth plus 1GiB system margin;
+this conservative ledger subtracts all live reservations, including child-held
+reservations after parent loss. Hosted jobs have private filesystems. One cache
+slot per platform has a 20GiB limit. Success/failure/cancellation all record
+actual inode-deduplicated slot bytes and filesystem free bytes. Original
+component/native-input/log/recovery evidence remains retained for the first
+unified review; cleanup is not asserted by a successful build. Existing unrelated
+build allocators must join the same physical-filesystem reservation protocol
+before concurrent local heavy validation; this entry cannot account for an
+unregistered external builder.
+
+Android's existing workflow uses `ci_android.py` to prepare pinned tools/source,
+restore exact work/cache keys, unconditionally build or revalidate, and
+materialize the verified input. Both unsigned and signed APK legs verify final
+APK ABI/runtime bytes, R8 evidence and the same original AAR/receipt; signed
+publication still goes through existing certificate/tag/draft gates. The formal
+SDK has four ABIs; published App scope remains the existing two ARM ABIs. SDK,
+original receipts/logs and final source-consumption receipts are retained as
+Actions evidence, not new public SDK publication.
+
+Apple's explicit uniform Mac entry is `python3 -B
+scripts/mobile-core/build_apple_app.py` with the same source/tool/slot arguments.
+It builds/revalidates the static SDK, freezes an App-specific link context, runs
+the pure measurement-state Swift controls, and compiles/archives App and
+PacketTunnel. `--simulator` selects a simulator link probe (`--simulator-arch`
+arm64 or amd64); omit it for the unsigned device compile/link probe, or supply an
+explicit `--signing-team` for that team's signing observation. Xcode's extension
+pre-link hook verifies the exact link-context SHA and original static input.
+`carriers.py` checks final Go carrier/module/BuildID, the actual original or
+byte-equal DerivedData static archive and generated headers, linker-map member
+origins, bundle/App Group/device-family/platform/minimum-OS facts, and absence of
+installed static SDK payloads. It does not assert signing permission/trust,
+installation, device lifecycle or App acceptance. No Apple CI is dispatched by
+these source entries.
+
+`scripts/libbox-patches` and the old Apple six-patch entry remain historical
+alpha8 compatibility inputs. Their raw receipts are not relabeled; the small
+`historical-ci-fragments.json` pins only retired caller fragments for existing
+negative tests. New formal source controls live in `test_inputs.py` and
+`test_outputs.py` and enter the existing host Node gate through
+`mobile-source-unit.test.mjs`. This source batch has not executed those tests,
+compiled native output, dispatched CI, signed/installed Apps or published mobile
+assets. Contract artifact pins/producer receipt remain null, and
+AppAccepted/devicePassed/publicationEligible remain false until actual results.

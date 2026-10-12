@@ -112,13 +112,12 @@ def component_source_wiring(project, declaration):
     script = re.search(r'^        script: \|\n(.*?)(?=^        \S|\Z)', target[1], re.M | re.S)
     builder.require(script is not None and hook == ''.join(line[10:] + '\n' for line in script[1].splitlines()),
                     'component source wiring hooks differ')
-    builder.require('scripts/ios-libbox.py" verify --component-for-link' in hook
+    builder.require('scripts/mobile-core/consume.py" verify-link' in hook
                     and all(token not in hook for token in ('--historical', '.libbox-current', 'Frameworks/Libbox')),
                     'component source wiring verifier scope')
-    for flag, setting in [('generation-root', 'GENERATION_ROOT'), ('output-fingerprint', 'OUTPUT_FINGERPRINT'),
-                          ('receipt-sha256', 'RECEIPT_SHA256'), ('build-policy', 'BUILD_POLICY'),
-                          ('build-policy-sha256', 'BUILD_POLICY_SHA256'), ('tools', 'TOOLS'), ('tools-sha256', 'TOOLS_SHA256')]:
-        builder.require('--' + flag + ' "${POLARIS_LIBBOX_' + setting + ':?' in hook,
+    for flag, setting in [('link-input', 'LINK_INPUT'), ('link-input-sha256', 'LINK_INPUT_SHA256'),
+                          ('scratch', 'SCRATCH')]:
+        builder.require('--' + flag + ' "${POLARIS_MOBILE_' + setting + ':?' in hook,
                         'component source wiring approved argument: ' + flag)
     configs = objects[field(targets[0], 'buildConfigurationList')]
     configurations = members(configs, 'buildConfigurations')
@@ -410,7 +409,7 @@ def preflight_tests():
     # unqualified final artifact gate remains closed and is tested above.
     for file in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
         hook = (builder.ROOT / file).read_text()
-        assert 'scripts/ios-libbox.py' in hook and ' verify' in hook and '--historical' not in hook
+        assert 'scripts/mobile-core/consume.py' in hook and ' verify-link' in hook and '--historical' not in hook
         count += 1
 
     project = (builder.ROOT / 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj').read_text()
@@ -421,7 +420,7 @@ def preflight_tests():
     count += 1
     for old, new in [('path = "$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"', 'path = Frameworks/Libbox.xcframework'),
                      ('sourceTree = "<absolute>"', 'sourceTree = "<group>"'),
-                     ('--component-for-link', ''), ('--receipt-sha256', '--ignored-receipt'),
+                     ('verify-link', 'verify-android'), ('--link-input-sha256', '--ignored-receipt'),
                      ('"$(POLARIS_LIBBOX_GENERATION_ROOT)"', '"\\\"Frameworks\\\""')]:
         rejected(lambda: component_source_wiring(project.replace(old, new), declaration), 'component source wiring')
         count += 1

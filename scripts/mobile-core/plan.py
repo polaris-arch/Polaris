@@ -8,6 +8,9 @@ import argparse
 import json
 from pathlib import Path
 
+import sys
+sys.dont_write_bytecode = True
+
 from fork_input import bind_command, canonical, load, sha, verify_source
 
 
