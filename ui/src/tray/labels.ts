@@ -69,4 +69,6 @@ const measurementI18n = createAuxI18n<MeasurementKey>('measurement', {
   'zh-CN': measurementZhCN, 'zh-TW': measurementZhTW, 'en-US': measurementEnUS, ru: measurementRu, fa: measurementFa,
 });
 /** Same refreshed language as the rest of the warm tray, even in an isolated JS window. */
-export const measurementT = (key: string, vars?: Record<string, unknown>): string => measurementI18n.t(key as MeasurementKey, vars);
+const isMeasurementKey = (key: string): key is MeasurementKey => key.startsWith('measurement.')
+  && Object.hasOwn(measurementEnUS, key.slice('measurement.'.length));
+export const measurementT = (key: string): string => isMeasurementKey(key) ? measurementI18n.t(key) : key;

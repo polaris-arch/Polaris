@@ -2099,8 +2099,8 @@ async fn run_temp_core_speed_test(
         .into_iter()
         .flat_map(|(ids, reason)| ids.iter().map(move |id| (id.clone(), reason)))
         .collect::<Vec<_>>(),
-        &crate::runtime::node_fingerprints::measurement_table_json(config),
-        None,
+        &crate::runtime::node_fingerprints::measurement_temp_table(&servers, &user_config),
+        proxy.network_epoch(),
     );
     if plan.testable.is_empty() {
         if !plan.system_interface_blocked.is_empty() {
@@ -2194,8 +2194,9 @@ async fn run_temp_core_speed_test(
         current_server_fingerprints(config),
         None,
     )
-    .with_connection_fingerprints(crate::runtime::node_fingerprints::measurement_table_json(
-        config,
+    .with_connection_fingerprints(crate::runtime::node_fingerprints::measurement_temp_table(
+        &servers,
+        &user_config,
     ))
     .with_skipped(vec![
         (

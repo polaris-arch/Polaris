@@ -127,7 +127,7 @@ impl MeasurementLedger {
         &self,
         context: &ReadContext<'_>,
         emission_digest: Option<&str>,
-        connections: &BTreeMap<String, String>,
+        connections: &crate::runtime::node_fingerprints::MeasurementConnections,
     ) -> Value {
         let inner = self.lock();
         let mut latest: BTreeMap<(&str, MeasurePath), &LedgerEntry> = BTreeMap::new();
@@ -157,7 +157,10 @@ impl MeasurementLedger {
                 || entry.identity.node_fingerprint.is_none()
                 || matches!(entry.identity.instance, CoreInstance::Main { .. })
                     && emission_digest.is_none();
-            let changed_connection = entry.connection_digest.as_ref() != connections.get(id);
+            let changed_connection = entry.connection_digest.as_ref()
+                != connections
+                    .for_temp(entry.identity.instance == CoreInstance::Temp)
+                    .get(id);
             let changed_config = matches!(entry.identity.instance, CoreInstance::Main { .. })
                 && entry.identity.config_digest.as_deref() != emission_digest;
             let stale = ledger_stale(entry, id, context);
@@ -206,7 +209,10 @@ impl MeasurementLedger {
                         && emission_digest.is_some()
                 }
             };
-            if connections.get(id) == Some(&skip.connection_digest)
+            if connections
+                .for_temp(skip.identity.instance == CoreInstance::Temp)
+                .get(id)
+                == Some(&skip.connection_digest)
                 && valid_instance
                 && skip.identity.url_digest == context.url_digest
                 && skip.identity.network_epoch == context.network_epoch
@@ -253,7 +259,7 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
     let now = crate::runtime::subscription_scheduler::now_ms();
     let emission_digest =
         generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
-    let connections = crate::runtime::node_fingerprints::measurement_table_json(&config);
+    let connections = crate::runtime::node_fingerprints::measurement_connections_json(&config);
     let rows = ledger.display_rows(
         &view.read(&cap, ledger, now),
         emission_digest.as_deref(),

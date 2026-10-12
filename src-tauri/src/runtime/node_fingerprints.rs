@@ -116,10 +116,24 @@ pub fn modified_table_json(config: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Measurement-only full connection identity. Never used for subscription IDs or
-/// the legacy five-field dirty formula. Presentation/ownership fields cannot
-/// change a connection; every remaining serialized parameter (TLS, SNI, WS,
-/// detour, protocol settings, credentials) participates in the SHA-256.
+/// Full measurement input identity is separate from subscription IDs and dirty
+/// fingerprints. Bind declarations are replaced by the production-resolved
+/// interface; detoured main children inherit the final physical root's policy.
+#[derive(Clone, Default)]
+pub(crate) struct MeasurementConnections {
+    pub(crate) main: BTreeMap<String, String>,
+    pub(crate) temp: BTreeMap<String, String>,
+}
+impl MeasurementConnections {
+    pub(crate) fn for_temp(&self, temp: bool) -> &BTreeMap<String, String> {
+        if temp {
+            &self.temp
+        } else {
+            &self.main
+        }
+    }
+}
+
 pub(crate) fn measurement_digest(canonical_server: &str) -> Option<String> {
     let mut server: Value = serde_json::from_str(canonical_server).ok()?;
     let object = server.as_object_mut()?;
@@ -130,6 +144,7 @@ pub(crate) fn measurement_digest(canonical_server: &str) -> Option<String> {
         "providerName",
         "createdAt",
         "updatedAt",
+        "bindInterface",
     ] {
         object.remove(key);
     }
@@ -138,27 +153,82 @@ pub(crate) fn measurement_digest(canonical_server: &str) -> Option<String> {
     ))
 }
 
-pub(crate) fn measurement_table_json(config: &Value) -> BTreeMap<String, String> {
-    measurement_table(&modified_table_json(config))
+fn measurement_seed(
+    server: &ServerConfig,
+    interface: Option<String>,
+    temp: bool,
+) -> Option<String> {
+    let mut value = serde_json::to_value(server).ok()?;
+    // The actual temp builder strips detour and installs only the requested node.
+    if temp {
+        value.as_object_mut()?.remove("detour");
+    }
+    let own = measurement_digest(
+        &polaris_config_engine::builder::orchestration::stable_stringify(&value),
+    )?;
+    Some(interface.map_or_else(
+        || own.clone(),
+        |interface| {
+            polaris_updater::sha256_hex(
+                polaris_config_engine::builder::orchestration::stable_stringify(
+                    &serde_json::json!([own, interface]),
+                )
+                .as_bytes(),
+            )
+        },
+    ))
 }
 
-/// Consumes the actual running snapshot's full server projection, never saved D.
-pub(crate) fn measurement_table(full: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    // Parse/hash each node once and memoize the chain suffix. Long shared detour
-    // chains remain linear in node count; malformed/missing/cyclic inputs fail closed.
-    let nodes: BTreeMap<String, (String, Option<String>)> = full
+/// Uses exactly the same server + UserConfig policy and resolver as the actual
+/// temp plan's bind_interfaces map, including its partial-config fallback.
+pub(crate) fn measurement_temp_table(
+    servers: &[ServerConfig],
+    config: &polaris_config_engine::user_config::UserConfig,
+) -> BTreeMap<String, String> {
+    servers
         .iter()
-        .filter_map(|(id, value)| {
-            let parsed: Value = serde_json::from_str(value).ok()?;
+        .filter_map(|server| {
             Some((
-                id.clone(),
+                server.id.clone(),
+                measurement_seed(
+                    server,
+                    polaris_config_engine::builder::outbounds::effective_proxy_bind_interface(
+                        server, config,
+                    ),
+                    true,
+                )?,
+            ))
+        })
+        .collect()
+}
+
+/// Called when the actual main switch snapshot is built, with its running input.
+pub(crate) fn measurement_table_config(
+    config: &polaris_config_engine::user_config::UserConfig,
+) -> BTreeMap<String, String> {
+    let nodes: BTreeMap<String, (String, Option<String>)> = config
+        .servers
+        .iter()
+        .filter_map(|server| {
+            // build_outbounds does not open a socket for a detoured child.
+            let interface = if server.detour.is_none() {
+                polaris_config_engine::builder::outbounds::effective_proxy_bind_interface(
+                    server, config,
+                )
+            } else {
+                None
+            };
+            Some((
+                server.id.clone(),
                 (
-                    measurement_digest(value)?,
-                    parsed["detour"].as_str().map(str::to_owned),
+                    measurement_seed(server, interface, false)?,
+                    server.detour.clone(),
                 ),
             ))
         })
         .collect();
+    // Memoize suffixes: long shared detour chains do not repeatedly parse/hash
+    // nodes. Missing/cyclic main chains are unavailable, never fresh.
     let mut resolved: BTreeMap<String, Option<String>> = BTreeMap::new();
     for root in nodes.keys() {
         if resolved.contains_key(root) {
@@ -202,6 +272,41 @@ pub(crate) fn measurement_table(full: &BTreeMap<String, String>) -> BTreeMap<Str
         .into_iter()
         .filter_map(|(id, value)| Some((id, value?)))
         .collect()
+}
+
+pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnections {
+    // Only the fields consulted by effective_proxy_bind_interface are parsed;
+    // unrelated malformed settings cannot discard a preserved interface policy.
+    let servers: Vec<ServerConfig> = config["servers"]
+        .as_array()
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|server| serde_json::from_value(server.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let policy = polaris_config_engine::user_config::UserConfig {
+        servers,
+        subscriptions: config
+            .get("subscriptions")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        network_interfaces: config
+            .get("networkInterfaces")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        ..Default::default()
+    };
+    MeasurementConnections {
+        main: measurement_table_config(&policy),
+        temp: measurement_temp_table(&policy.servers, &policy),
+    }
+}
+
+pub(crate) fn measurement_table_json(config: &Value) -> BTreeMap<String, String> {
+    measurement_connections_json(config).main
 }
 
 #[cfg(test)]

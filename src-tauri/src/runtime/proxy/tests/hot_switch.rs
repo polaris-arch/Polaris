@@ -1818,6 +1818,7 @@ fn install_startup_snapshot(rt: &ProxyRuntime, cfg: &Value) {
         dashboard_mode_selector: false,
         fingerprints: node_fingerprints::modified_table(&uc.servers),
         dirty_fingerprints: node_fingerprints::dirty_table(&uc.servers),
+        measurement_fingerprints: node_fingerprints::measurement_table_config(&uc),
         ..Default::default()
     });
 }
@@ -5520,4 +5521,25 @@ async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retr
         "same production journal retry deletes state once no writer remains"
     );
     assert!(dir.exists());
+}
+
+#[test]
+fn measurement_getter_uses_the_running_snapshot_interface_identity() {
+    use polaris_config_engine::user_config::app_config::NetworkInterfaceDefaults;
+    let (rt, _dir) = test_runtime();
+    let running=UserConfig {servers:serde_json::from_value(serde_json::json!([{"id":"a","name":"A","protocol":"socks","address":"a.test","port":1080}])).unwrap(),
+        network_interfaces:Some(NetworkInterfaceDefaults{direct:None,proxy:Some("R-A".to_owned())}),..Default::default()};
+    mark_running_with_snapshot(&rt, &serde_json::to_value(&running).unwrap());
+    let frozen = node_fingerprints::measurement_table_config(&running);
+    assert_eq!(rt.speed_measurement_fingerprints(), frozen);
+    let mut saved = running.clone();
+    saved.network_interfaces.as_mut().unwrap().proxy = Some("D-B".to_owned());
+    let newer =
+        node_fingerprints::measurement_connections_json(&serde_json::to_value(&saved).unwrap());
+    assert_ne!(frozen["a"], newer.main["a"]);
+    assert_eq!(
+        rt.speed_measurement_fingerprints(),
+        frozen,
+        "reading D must never restamp the actual running core"
+    );
 }

@@ -1951,9 +1951,9 @@ impl ProxyRuntime {
             .read()
             .ok()
             .and_then(|guard| {
-                guard.as_ref().map(|snapshot| {
-                    crate::runtime::node_fingerprints::measurement_table(&snapshot.fingerprints)
-                })
+                guard
+                    .as_ref()
+                    .map(|snapshot| snapshot.measurement_fingerprints.clone())
             })
             .unwrap_or_default()
     }

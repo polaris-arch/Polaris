@@ -1,4 +1,4 @@
-import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
+import { measurementFixture } from '@/store/measurement-fixture.test-support';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useAppStore } from '@/store/app-store';
 import type { UserConfig } from '@/contracts/types';

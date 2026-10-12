@@ -157,6 +157,8 @@ pub(super) struct SwitchSnapshot {
     ///
     /// [`dirty_fingerprint`]: crate::runtime::node_fingerprints::dirty_fingerprint
     pub(super) dirty_fingerprints: BTreeMap<String, String>,
+    /// Full measurement identity resolved from the actual running input, including interface policy.
+    pub(super) measurement_fingerprints: BTreeMap<String, String>,
     /// **§15**：运行核的测速探测池端口（`probe-in-k`，起核分配）。空 = 池未注入（分配失败/回滚）。
     /// 与 `running` 同生共死（起核就绪时随本快照置、停核清）→「有池端口 ⟺ 运行核有池」；`server_speed_test`
     /// 据此裁定走「主核 K 槽分波测速」还是回退「仅活跃出口」。`poolPorts[k] ↔ probe-selector-k`（1:1 槽绑定）。
@@ -1010,6 +1012,7 @@ impl ProxyRuntime {
                 .collect(),
             fingerprints,
             dirty_fingerprints,
+            measurement_fingerprints: node_fingerprints::measurement_table_config(user_config),
             // §15：与运行核 config 同源（deps.probe_pool_ports 正是本次 generate 注入的池端口）→ 快照即池真值。
             probe_pool_ports: deps.probe_pool_ports.clone(),
             // 同源同刻：本次 generate 实际注入的探针端口与凭据（凭据是否被发射由生成侧按平台决定，
