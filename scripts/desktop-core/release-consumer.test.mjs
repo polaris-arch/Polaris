@@ -32,6 +32,26 @@ const identity = (schema, facts) => ({ schema, facts, fingerprint: digest(portab
 const providerNames = ['scripts/polaris_production_release.py', 'scripts/polaris_native_candidate.py',
   'scripts/polaris_source_fingerprint.py', 'scripts/polaris_dns_identity.py', 'scripts/polaris_go_environment.py',
   'scripts/polaris_native_distribution.py', 'release/polaris-production-release.json', 'release/polaris-candidate-inputs.json'];
+
+test('actual 577d public contract is pending input with exact four App identities', () => {
+  const bytes = readFileSync(join(repo, 'scripts/desktop-core/pending-release-contract.json'));
+  assert.equal(bytes.length, 439026);
+  assert.equal(digest(bytes), '0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d');
+  const actual = validateReleaseContract(JSON.parse(bytes));
+  assert.equal(actual.sourceCommit, '577d4b9a089b71d2f0a4ca334b87264b55c10478');
+  assert.equal(actual.tagObject, '5cedbe7a54594756da544af90ebfd1f403f2e091');
+  assert.equal(actual.assetIndex.sha256, 'af5cb4704e1c4c216928d78d84af3c29322c7c1359a42eea9902c4a0823927d2');
+  assert.deepEqual(Object.keys(actual.platforms).sort(), ['linux', 'mac-arm64', 'mac-x64', 'win']);
+  const pending = JSON.parse(readFileSync(join(repo, 'scripts/desktop-core/pending-release-selection.json')));
+  assert.equal(pending.active, false); assert.equal(pending.AppAccepted, false);
+  assert.deepEqual(loadReleaseContract(repo, { desktopRelease: pending.selection }), actual);
+  const active = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json'))).desktopRelease;
+  assert.equal(active.sourceCommit, '05221db98e08562b5c1a21bc242d245b144ac2d2');
+  const changed = structuredClone(pending.selection); changed.contractSha256 = active.contractSha256;
+  assert.throws(() => loadReleaseContract(repo, { desktopRelease: changed }), /SHA differs/);
+  const changedVersion = structuredClone(actual); changedVersion.version = '1.15.0-alpha.12.polaris.1';
+  assert.throws(() => validateReleaseContract(changedVersion));
+});
 function coreFixture(key) {
   const t = RELEASE_TARGETS[key], b = Buffer.alloc(256);
   if (t.os === 'linux') { b.set([127, 69, 76, 70, 2, 1]); b.writeUInt16LE(62, 18); }

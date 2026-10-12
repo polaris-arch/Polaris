@@ -88,6 +88,8 @@ fn private_dir(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    crate::platform::windows::winproc::seal_store_object(path, false)?;
     Ok(())
 }
 fn seal_dir(path: &Path) -> io::Result<()> {
@@ -96,6 +98,8 @@ fn seal_dir(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
+    #[cfg(windows)]
+    crate::platform::windows::winproc::seal_store_object(path, true)?;
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()
@@ -139,6 +143,8 @@ impl CoreStore {
         if !file.metadata()?.is_file() {
             return Err(invalid("invalid store lock"));
         }
+        #[cfg(windows)]
+        crate::platform::windows::winproc::seal_store_object(&path, false)?;
         self.owner.check(&path)?;
         file.try_lock()
             .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
@@ -255,7 +261,10 @@ impl CoreStore {
         manifest: &InstalledCoreManifest,
         source: &Path,
         source_uid: Option<u32>,
+        source_sid: Option<&str>,
     ) -> io::Result<InstallOutcome> {
+        #[cfg(not(windows))]
+        let _ = source_sid;
         let _lock = self.mutation_lock()?;
         manifest
             .validate(crate::core_install::sha256_hex)
@@ -269,13 +278,56 @@ impl CoreStore {
                 .join(format!("{}.json", id.as_str()))
                 .exists()
             {
-                self.verify_for_start(&id)?;
-                return Ok(InstallOutcome::AlreadyPresent);
+                if let Ok(_verified) = self.verify_for_start(&id) {
+                    // Reinstallation refreshes retention recency without changing
+                    // the immutable manifest bytes or an already running core.
+                    let receipt = self
+                        .root
+                        .join("manifests")
+                        .join(format!("{}.json", id.as_str()));
+                    let mut options = OpenOptions::new();
+                    options.write(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.custom_flags(nix::libc::O_NOFOLLOW);
+                    }
+                    let file = options.open(&receipt)?;
+                    self.owner.check(&receipt)?;
+                    file.set_modified(std::time::SystemTime::now())?;
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                // Corrupt versions can be repaired only after excluding every
+                // verifier, running Child and lazy sidecar reader by native lease.
+                let lease = self.lease_file(&id)?;
+                lease
+                    .try_lock()
+                    .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+                let receipt = self
+                    .root
+                    .join("manifests")
+                    .join(format!("{}.json", id.as_str()));
+                self.owner.check(&receipt)?;
+                fs::remove_file(receipt)?;
+                self.owner.check(&destination)?;
+                self.trash_version(&id, &destination)?;
             }
-            // No manifest means this directory was never eligible to start. An interrupted
-            // installer may remove only this unreferenced orphan while holding the store lock.
-            self.owner.check(&destination)?;
-            fs::remove_dir_all(&destination)?;
+            if destination.exists() {
+                // An orphan with a lease can still be held after external damage;
+                // missing metadata must never override a busy native lease.
+                let lease = match self.lease_file(&id) {
+                    Ok(file) => Some(file),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(lease) = &lease {
+                    lease
+                        .try_lock()
+                        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+                }
+                self.owner.check(&destination)?;
+                self.trash_version(&id, &destination)?;
+            }
         }
         let sources = PayloadDir::open(source, source_uid)?;
         let mut stage = None;
@@ -298,6 +350,12 @@ impl CoreStore {
         let result = (|| {
             for expected in &manifest.core.files {
                 let (mut input, length) = sources.open_regular(&expected.name)?;
+                #[cfg(windows)]
+                if let Some(expected_sid) = source_sid {
+                    if crate::platform::windows::winproc::file_owner(&input)? != expected_sid {
+                        return Err(invalid("source file owner differs"));
+                    }
+                }
                 if length != expected.bytes {
                     return Err(invalid("source size differs"));
                 }
@@ -332,6 +390,8 @@ impl CoreStore {
                     return Err(invalid("source hash differs"));
                 }
                 output.sync_all()?;
+                #[cfg(windows)]
+                crate::platform::windows::winproc::seal_store_object(&path, true)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -364,6 +424,7 @@ impl CoreStore {
                     options.mode(0o600);
                 }
                 options.open(&lease_path)?.sync_all()?;
+                private_mode(&lease_path, 0o600)?;
             }
             let target = self
                 .root
@@ -374,6 +435,12 @@ impl CoreStore {
                 .join("manifests")
                 .join(format!("{}.new", id.as_str()));
             let raw = manifest.to_json().map_err(invalid)?;
+            if temporary.try_exists()? {
+                self.owner.check(&temporary)?;
+                let objects = PayloadDir::open(&self.root.join("manifests"), self.owner.uid)?;
+                let _ = objects.open_regular(&format!("{}.new", id.as_str()))?;
+                fs::remove_file(&temporary)?;
+            }
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -384,6 +451,7 @@ impl CoreStore {
             let mut file = options.open(&temporary)?;
             file.write_all(&raw)?;
             file.sync_all()?;
+            private_mode(&temporary, 0o644)?;
             fs::rename(&temporary, &target)?;
             self.verify_for_start(&id)?;
             Ok(InstallOutcome::Installed)
@@ -502,8 +570,15 @@ fn private_mode(path: &Path, mode: u32) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, mode);
-        Ok(())
+        #[cfg(windows)]
+        {
+            crate::platform::windows::winproc::seal_store_object(path, mode & 0o044 != 0)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, mode);
+            Err(invalid("unsupported store platform"))
+        }
     }
 }
 

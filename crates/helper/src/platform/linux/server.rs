@@ -47,7 +47,7 @@ use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::platform::accept_retry::{ACCEPT_LOG_INTERVAL, LogThrottle};
+use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
 use crate::platform::linux::ops::set_forward_prod;
 use crate::platform::linux::state::{
@@ -303,6 +303,12 @@ struct ChildSlot {
     cv: Condvar,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReapedOwner {
+    target: HelperBirthTarget,
+    uid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildWaitOutcome {
     Reaped,
@@ -502,7 +508,7 @@ pub struct AmbientCapsSpawner {
     /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
     /// Published under the slots lock, so removal and proof are atomic to readers.
-    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: Arc<Mutex<VecDeque<ReapedOwner>>>,
     /// 在途后台 terminate 计数（SIGTERM 退出前 waitReaps 等它归零）。
     reaps: Arc<ReapGroup>,
 }
@@ -693,6 +699,35 @@ impl AmbientCapsSpawner {
 }
 
 impl CoreSpawner for AmbientCapsSpawner {
+    fn caller_allowed(
+        &self,
+        uid: u32,
+        _current: Option<&CoreHandle>,
+        target: Option<&HelperBirthTarget>,
+    ) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        let Ok(slots) = self.slots.lock() else {
+            return false;
+        };
+        if let Some(target) = target {
+            if let Some(slot) = slots
+                .iter()
+                .find(|slot| slot.handle.target().as_ref() == Some(target))
+            {
+                return slot.handle.caller_allowed(uid);
+            }
+            return self.tombstones.lock().is_ok_and(|proofs| {
+                proofs
+                    .iter()
+                    .any(|proof| proof.target == *target && proof.uid == Some(uid))
+            });
+        }
+        slots.iter().all(|slot| {
+            matches!(slot.reap_fact(), LocalReapFact::Reaped(_)) || slot.handle.caller_allowed(uid)
+        })
+    }
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.scan_start_admission(current_running)
     }
@@ -720,7 +755,7 @@ impl CoreSpawner for AmbientCapsSpawner {
             .cloned();
         if slot.is_none() {
             return self.tombstones.lock().map_or(StopReap::Unknown, |proofs| {
-                if proofs.contains(target) {
+                if proofs.iter().any(|proof| proof.target == *target) {
                     StopReap::Reaped
                 } else {
                     StopReap::Unknown
@@ -753,7 +788,7 @@ impl CoreSpawner for AmbientCapsSpawner {
         }
         self.tombstones
             .lock()
-            .is_ok_and(|proofs| proofs.contains(target))
+            .is_ok_and(|proofs| proofs.iter().any(|proof| proof.target == *target))
     }
 
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
@@ -986,7 +1021,7 @@ fn apply_privilege_drop(
     groups: &[nix::unistd::Gid],
     caps: &[caps::Capability],
 ) -> std::io::Result<()> {
-    use nix::unistd::{Gid, Uid, setgid, setgroups, setuid};
+    use nix::unistd::{setgid, setgroups, setuid, Gid, Uid};
     caps::securebits::set_keepcaps(true).map_err(std::io::Error::other)?;
     setgroups(groups).map_err(std::io::Error::other)?;
     setgid(Gid::from_raw(gid)).map_err(std::io::Error::other)?;
@@ -1004,7 +1039,7 @@ fn clear_reaped_birth(
     proof: &HelperBirthReaped,
     state: &Arc<Mutex<HandlerState>>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
     {
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1024,7 +1059,10 @@ fn clear_reaped_birth(
             if tombstones.len() == REAP_TOMBSTONES {
                 tombstones.pop_front();
             }
-            tombstones.push_back(target);
+            tombstones.push_back(ReapedOwner {
+                target,
+                uid: proof.birth.owner_uid,
+            });
         }
     }
 }
@@ -1035,7 +1073,7 @@ fn spawn_reaper(
     state: Arc<Mutex<HandlerState>>,
     slot: Arc<ChildSlot>,
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
     std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots, &tombstones));
 }
@@ -1045,7 +1083,7 @@ fn run_reaper(
     state: &Arc<Mutex<HandlerState>>,
     slot: &Arc<ChildSlot>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
     let proof = loop {
         match slot.reap_fact() {
@@ -1166,7 +1204,7 @@ impl ConnServer {
     /// `spawn_blocking` 池（合法请求排队等不到，比 EMFILE 更早发作），再攥满 fd 走到 EMFILE。
     pub fn dispatch(self: &Arc<Self>, stream: tokio::net::UnixStream) {
         use crate::platform::linux::auth::{CapturedPeerCred, PeerCredProvider, TokioPeerCred};
-        use crate::platform::linux::handler::{HandlerDeps, LineConn, READ_TIMEOUT_SECS, handle};
+        use crate::platform::linux::handler::{handle, HandlerDeps, LineConn, READ_TIMEOUT_SECS};
 
         // 0. 闸在**起阻塞任务之前**（也在鉴权之前）。超限即快速失败：`stream` 在此 drop = 立即关连接，
         //    不排队（排队只是把耗尽从池搬到队列，攻击面不变）、不阻塞 accept 循环。

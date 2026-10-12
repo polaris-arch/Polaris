@@ -179,6 +179,24 @@ pub enum StopReap {
 ///
 /// 对照 Go 源 start 分支的 `c.Start()`（:452）+ stop 的 `terminateChild`（:246-256）+ cleanup 的 `Kill`（:383）。
 pub trait CoreSpawner: Send + Sync {
+    /// Ownership comes from retained physical births and reap receipts. A hidden
+    /// registry slot must not disappear from authorization when HandlerState clears.
+    fn caller_allowed(
+        &self,
+        uid: u32,
+        current: Option<&CoreHandle>,
+        target: Option<&HelperBirthTarget>,
+    ) -> bool {
+        uid == 0
+            || match (current, target) {
+                (Some(current), Some(target)) => {
+                    current.target().as_ref() == Some(target) && current.caller_allowed(uid)
+                }
+                (Some(current), None) => current.caller_allowed(uid),
+                (None, None) => true,
+                (None, Some(_)) => false,
+            }
+    }
     fn spawn_pinned(
         &self,
         _req: &SpawnCoreRequest,
@@ -257,6 +275,9 @@ impl ManagedChild {
 /// Handler 进程状态（对应 Go 全局 `child`/`childDone`，实例化可测）。
 #[derive(Debug)]
 pub struct HandlerState {
+    pub upgrade_closed: bool,
+    pub dns_owner: Option<u32>,
+    pub dns_busy: bool,
     /// Exact current birth. `Stopping` remains present through Pending/Unknown.
     pub child: Option<ManagedChild>,
 }
@@ -265,7 +286,12 @@ impl HandlerState {
     /// 构造空状态（无 child）。
     #[must_use]
     pub fn new() -> Self {
-        Self { child: None }
+        Self {
+            child: None,
+            upgrade_closed: false,
+            dns_owner: None,
+            dns_busy: false,
+        }
     }
 }
 

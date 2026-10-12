@@ -448,6 +448,7 @@ fn exact_stop_rejects_mismatch_and_bad_frames_without_mutation() {
     let current = exact_handle(42, BIRTH_ONE);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(current.clone())),
+        ..HandlerState::new()
     };
     for args in [
         vec!["0", BIRTH_ONE],
@@ -499,6 +500,7 @@ fn reaped_exact_birth_ack_survives_a_legacy_successor() {
     let legacy = CoreHandle::new(42);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(legacy.clone())),
+        ..HandlerState::new()
     };
     let old = exact_handle(42, BIRTH_ONE).target().unwrap();
     spawner.reaped_births.lock().unwrap().push(old);
@@ -553,6 +555,7 @@ fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
     let target = old.target().unwrap();
     let mut state = HandlerState {
         child: Some(ManagedChild::Stopping(old)),
+        ..HandlerState::new()
     };
     let mut conn = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
     dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut conn);
@@ -655,6 +658,7 @@ fn legacy_mutating_commands_cannot_touch_exact_birth() {
     let current = exact_handle(42, BIRTH_ONE);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(current.clone())),
+        ..HandlerState::new()
     };
     for command in [
         cmd::START,
@@ -878,6 +882,7 @@ fn reap_safe_stop_retains_stopping_birth_until_exact_reap() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(555))),
+        ..HandlerState::new()
     });
 
     let mut pending = MockConn::new(vec![lcmd::STOP_REAP_SAFE, "555"]);
@@ -917,6 +922,7 @@ fn stop_unknown_retains_custody_and_never_claims_success() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(556))),
+        ..HandlerState::new()
     });
     let mut conn = MockConn::new(vec!["stop", "556"]);
     handle(&state, &deps, &mut conn);
@@ -1575,6 +1581,7 @@ fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
     );
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(8888))),
+        ..HandlerState::new()
     });
     // Deliberately invalid arguments: admission must run before validation too.
     let mut conn = MockConn::new(vec![lcmd::START_REAP_SAFE, "/wrong", "", "", "1", ""]);
@@ -1609,6 +1616,7 @@ fn unknown_command_is_rejected_before_arguments_or_child_mutation() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(9001))),
+        ..HandlerState::new()
     });
     let mut conn = MockConn::new(vec!["future-mutating-command", "9001"]);
 

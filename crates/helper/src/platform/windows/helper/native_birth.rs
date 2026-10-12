@@ -24,7 +24,11 @@ pub(super) fn cache_exit<P: ProcOps>(
     {
         return false;
     }
-    state.terminal.push_back(target);
+    let owner = state
+        .native
+        .as_ref()
+        .and_then(|native| native.owner.clone());
+    state.terminal.push_back((target, owner));
     if state.terminal.len() > 16 {
         state.terminal.pop_front();
     }
@@ -39,7 +43,11 @@ pub(super) fn stop_locked<P: ProcOps>(
     requested: HelperBirthTarget,
 ) -> NativeBirthStop {
     // A cached old receipt must never signal or clear a replacement birth.
-    if state.terminal.contains(&requested) {
+    if state
+        .terminal
+        .iter()
+        .any(|(target, _)| *target == requested)
+    {
         return NativeBirthStop::Stopped { target: requested };
     }
     let Some(current) = &mut state.native else {
@@ -102,13 +110,25 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
             other => other,
         }
     }
-    pub(super) fn handle_native_stop(&self, target: HelperBirthTarget, peer: &crate::user_control::NativePeer) -> HandleOutcome {
+    pub(super) fn handle_native_stop(
+        &self,
+        target: HelperBirthTarget,
+        peer: &crate::user_control::NativePeer,
+    ) -> HandleOutcome {
         let Ok(mut state) = self.child_mu.lock() else {
             return HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(
                 NativeBirthStop::Unknown { target },
             )));
         };
-        if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
+        let owner = state
+            .terminal
+            .iter()
+            .find(|(birth, _)| *birth == target)
+            .map(|(_, owner)| owner.as_ref())
+            .or_else(|| state.native.as_ref().map(|native| native.owner.as_ref()));
+        if !peer.administrator && owner != Some(Some(&peer.identity)) {
+            return HandleOutcome::AuthFailed;
+        }
         HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(stop_locked(
             &mut state,
             self.proc.as_ref(),
@@ -116,7 +136,10 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
         ))))
     }
 
-    pub(super) fn handle_native_status(&self, peer: &crate::user_control::NativePeer) -> HandleOutcome {
+    pub(super) fn handle_native_status(
+        &self,
+        peer: &crate::user_control::NativePeer,
+    ) -> HandleOutcome {
         let mut state = match self.child_mu.lock() {
             Ok(state) => state,
             Err(poison) => {
@@ -127,7 +150,14 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 )));
             }
         };
-        if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
+        if !peer.administrator
+            && state
+                .native
+                .as_ref()
+                .is_some_and(|native| native.owner.as_ref() != Some(&peer.identity))
+        {
+            return HandleOutcome::AuthFailed;
+        }
         let status = if let Some(native) = &state.native {
             let target = native.target;
             match self.proc.poll_native_child(target) {
@@ -189,7 +219,14 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     target: state.native.as_ref().map(|c| c.target),
                 });
             }
-            if !peer.administrator && state.native.as_ref().is_some_and(|native| native.owner.as_ref() != Some(&peer.identity)) { return HandleOutcome::AuthFailed; }
+            if !peer.administrator
+                && state
+                    .native
+                    .as_ref()
+                    .is_some_and(|native| native.owner.as_ref() != Some(&peer.identity))
+            {
+                return HandleOutcome::AuthFailed;
+            }
             if let Some(native) = &state.native {
                 if native
                     .core

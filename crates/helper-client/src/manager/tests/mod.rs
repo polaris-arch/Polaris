@@ -771,9 +771,29 @@ fn capturing(result: (String, i32)) -> (CapturingExecutor, CapturedCalls, Captur
 }
 
 fn install_params(script_dir: PathBuf, src: PathBuf) -> InstallParams {
+    let raw = src.to_string_lossy();
+    let (parent, name) = raw.rsplit_once(['/', '\\']).expect("source parent");
+    let windows = name.ends_with(".exe");
+    let separator = if windows { "\\" } else { "/" };
+    let manifest_path = PathBuf::from(format!("{parent}{separator}core-manifest.json"));
+    let bundled_core = PathBuf::from(format!(
+        "{parent}{separator}{}",
+        if windows { "sing-box.exe" } else { "sing-box" }
+    ));
     InstallParams {
+        manifest_path,
+        manifest_sha256: "b".repeat(64),
+        core_id: polaris_helper_proto::core_manifest::CoreId::parse(&"c".repeat(64)).unwrap(),
+        helper_sha256: "a".repeat(64),
+        helper_version: "1.0.0".into(),
+        user_identity: if windows {
+            polaris_helper_proto::core_protocol::CallerIdentity::windows("S-1-5-21-1-2-3-1000")
+                .unwrap()
+        } else {
+            polaris_helper_proto::core_protocol::CallerIdentity::Unix(1000)
+        },
         src_binary: src,
-        bundled_core: PathBuf::from("/app/resources/sing-box"),
+        bundled_core,
         conf_dir: PathBuf::from("/home/user/.config/polaris"),
         uid: 1000,
         script_dir,
@@ -790,363 +810,217 @@ fn install_manager(platform: Platform, src: &Path) -> (HelperManager, tempfile::
     (m, dir)
 }
 
-// ── 脚本内容（移植保真度 —— mutation 相关：删任一关键步骤即挂）──
-#[test]
-fn mac_install_script_has_all_steps() {
-    let paths = InstallPaths::mac();
+// ── Immutable installation and machine-service transaction contracts ──
+fn unix_scripts() -> [String; 2] {
     let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let s = build_mac_install_script(&paths, &p, "TOKEN123");
-    // 同目录暂存，旧 job 完全退出后才原子替换。
-    assert!(
-        s.contains("cp \"$SRC\" \"$NEW_HELPER\"") && s.contains("mv -f \"$NEW_HELPER\" \"$DEST\""),
-        "缺 helper 暂存/原子替换"
-    );
-    assert!(
-        s.contains("DEST='/Library/PrivilegedHelperTools/com.polaris.helper'"),
-        "DEST 路径错"
-    );
-    // 写 root 侧 token（600）
-    assert!(
-        s.contains("printf '%s' 'TOKEN123' > \"$SUPPORT/helper.token\""),
-        "缺写 token"
-    );
-    assert!(
-        s.contains("chmod 600 \"$SUPPORT/helper.token\""),
-        "token 权限须 600"
-    );
-    // 播种核（守卫 + codesign）
-    assert!(
-        s.contains("if [ ! -x \"$COREDIR/sing-box\" ]; then"),
-        "缺核播种守卫"
-    );
-    assert!(s.contains("codesign --force --sign -"), "缺 codesign");
-    // 写 plist（含 daemon flag）
-    assert!(
-        s.contains("<key>Label</key><string>com.polaris.helper</string>"),
-        "plist Label 错"
-    );
-    assert!(
-        s.contains("<string>--singbox</string>"),
-        "plist 缺 --singbox flag"
-    );
-    assert!(
-        s.contains("<string>--coredir</string>"),
-        "plist 缺 --coredir flag"
-    );
-    // bootstrap
-    assert!(
-        s.contains("launchctl bootstrap system \"$PLIST\""),
-        "缺 launchctl bootstrap"
-    );
-    assert!(s.contains("echo installed-ok"));
+    [
+        build_mac_install_script(&InstallPaths::mac(), &p, &"a".repeat(64)),
+        build_linux_install_script(&InstallPaths::linux(), &p, &"a".repeat(64)),
+    ]
 }
 
 #[test]
-fn mac_helper_upgrade_stops_before_replace_and_rolls_back_on_failure() {
-    let paths = InstallPaths::mac();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_mac_install_script(&paths, &p, "TOKEN123");
-
-    let armed = script
-        .find("trap rollback_install EXIT")
-        .expect("缺破坏性阶段回滚闸");
-    let stop = script[armed..]
-        .find("launchctl bootout \"system/$LABEL\"")
-        .map(|at| at + armed)
-        .expect("缺硬 bootout");
-    let wait = script[stop..]
-        .find("while launchctl print \"system/$LABEL\"")
-        .map(|at| at + stop)
-        .expect("缺旧 job 退出确认");
-    let replace = script[wait..]
-        .find("mv -f \"$NEW_HELPER\" \"$DEST\"")
-        .map(|at| at + wait)
-        .expect("缺 helper 原子替换");
-    let bootstrap = script[replace..]
-        .find("launchctl bootstrap system \"$PLIST\"")
-        .map(|at| at + replace)
-        .expect("缺新 job bootstrap");
-    let verify = script[bootstrap..]
-        .find("launchctl print \"system/$LABEL\" >/dev/null")
-        .map(|at| at + bootstrap)
-        .expect("缺新 job 注册态确认");
-
-    assert!(
-        armed < stop && stop < wait && wait < replace && replace < bootstrap && bootstrap < verify,
-        "mac 升级必须按 回滚武装→停旧→确认退出→原子替换→启动→确认 的顺序执行"
-    );
-    assert!(
-        !script[armed..replace]
-            .contains("launchctl bootout \"system/$LABEL\" >/dev/null 2>&1 || true"),
-        "破坏性阶段不得吞掉 bootout 失败"
-    );
-    for needle in [
-        "cp \"$DEST\" \"$TXDIR/helper.rollback\"",
-        "cp \"$PLIST\" \"$TXDIR/plist.rollback\"",
-        "cp \"$TXDIR/helper.rollback\" \"$NEW_HELPER\"",
-        "cp \"$TXDIR/plist.rollback\" \"$NEW_PLIST\"",
-        "rollback incomplete; recovery files kept at $TXDIR",
-    ] {
-        assert!(script.contains(needle), "mac 回滚腿缺：{needle}");
+fn installation_seals_bytes_before_executing_the_administrator_utility() {
+    for script in unix_scripts() {
+        let helper_hash = script.find("[ \"$(hash_file \"$TXDIR/helper\")\"").unwrap();
+        let manifest_hash = script
+            .find("[ \"$(hash_file \"$TXDIR/core-manifest.json\")\"")
+            .unwrap();
+        let install = script.find("\"$TXDIR/helper\" core-install").unwrap();
+        assert!(helper_hash < install && manifest_hash < install);
+        assert!(script.contains("--source-owner 'u1000'"));
+        assert!(script.contains("chmod 0700 \"$TXDIR\""));
+        assert!(script.contains("--manifest \"$TXDIR/core-manifest.json\""));
+        assert!(!script.contains(".seed.new"));
+        assert!(!script.contains("codesign --force"));
+        assert!(!script.contains("find "));
     }
 }
 
 #[test]
-fn mac_plist_flags_match_daemon_parse_args() {
-    // daemon macos/daemon.rs:parse_args 认 --singbox/--confdir/--support/--coredir；plist argv 须逐一对上。
-    let plist = render_mac_plist(
-        "/Library/PrivilegedHelperTools/com.polaris.helper",
-        "/Library/Application Support/Polaris/core",
-        "/home/u/conf",
-        "/Library/Application Support/Polaris",
-    );
-    assert!(plist.contains("<string>--singbox</string><string>/Library/Application Support/Polaris/core/sing-box</string>"));
-    assert!(plist.contains("<string>--confdir</string><string>/home/u/conf</string>"));
-    assert!(plist.contains(
-        "<string>--support</string><string>/Library/Application Support/Polaris</string>"
-    ));
-    assert!(plist.contains(
-        "<string>--coredir</string><string>/Library/Application Support/Polaris/core</string>"
-    ));
-    assert!(plist.contains("<key>RunAtLoad</key><true/>"));
-    assert!(plist.contains("<key>KeepAlive</key><true/>"));
+fn unix_upgrade_admission_precedes_every_service_replacement() {
+    for script in unix_scripts() {
+        let arm = script.find("trap rollback EXIT").unwrap();
+        let admit = script[arm..].find("prepare-upgrade --support").unwrap() + arm;
+        let mutate = script[admit..].find("MUTATED=1").unwrap() + admit;
+        let stop = script[mutate..].find("then stop_service; fi").unwrap() + mutate;
+        let replace = script[stop..]
+            .find("mv -f \"$DEST.new.$$\" \"$DEST\"")
+            .unwrap()
+            + stop;
+        assert!(arm < admit && admit < mutate && mutate < stop && stop < replace);
+        assert!(script[admit..mutate].contains("exit 75"));
+        assert!(script.contains("cancel-upgrade --support"));
+        assert!(script.contains("'helper-policy retain') echo polaris-helper-core-only-ok; exit 0"));
+    }
 }
 
 #[test]
-fn linux_install_script_has_all_steps() {
-    let paths = InstallPaths::linux();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let s = build_linux_install_script(&paths, &p);
-    // 同目录暂存后原子替换二进制
-    assert!(
-        s.contains("DEST='/usr/local/lib/polaris/helper'")
-            && s.contains("NEW_HELPER=\"$DEST.new.$$\"")
-            && s.contains("install -D -o root -g root -m 0755 '/app/helper' \"$NEW_HELPER\"")
-            && s.contains("mv -f \"$NEW_HELPER\" \"$DEST\""),
-        "缺 helper 同目录暂存/原子替换"
-    );
-    // 播种核守卫
-    assert!(
-        s.contains("if [ ! -x '/usr/local/lib/polaris/core/sing-box' ]; then"),
-        "缺核播种守卫"
-    );
-    // 授权 uid 合并追加（不覆写）
-    assert!(
-        s.contains("grep -qxF '1000' '/var/lib/polaris/authorized-uids'"),
-        "缺 uid 授权"
-    );
-    // 装 unit（含 daemon flag）
-    assert!(s.contains("ExecStart=/usr/local/lib/polaris/helper --socket=/run/polaris/helper.sock --authfile=/var/lib/polaris/authorized-uids --coredir=/usr/local/lib/polaris/core"), "ExecStart flag 须对齐 daemon parse_args");
-    assert!(s.contains("RuntimeDirectory=polaris"));
-    // reload + enable + restart：restart 在首装 inactive 时会启动，在升级 active 时必换进程。
-    assert!(s.contains("systemctl daemon-reload"), "缺 daemon-reload");
-    assert!(
-        s.contains("systemctl enable \"$SERVICE\"") && s.contains("systemctl restart \"$SERVICE\""),
-        "缺 enable + restart"
-    );
-    assert!(
-        !s.contains("enable --now"),
-        "enable --now 不会替换已 active 的旧进程"
-    );
-    assert!(
-        !s.contains("try-restart"),
-        "try-restart 在首装 inactive 时不会启动服务"
-    );
-    assert!(s.contains("echo polaris-helper-install-ok"));
+fn unix_rollback_restores_helper_descriptor_receipt_and_keeps_failed_recovery() {
+    for script in unix_scripts() {
+        for object in ["helper.rollback", "descriptor.rollback", "record.rollback"] {
+            assert!(
+                script.matches(object).count() >= 2,
+                "missing snapshot/restore for {object}"
+            );
+        }
+        assert!(script.contains("restore_service || OK=0"));
+        assert!(script.contains("if [ \"$OK\" -eq 1 ]"));
+        assert!(script.contains("recovery transaction retained: $TXDIR"));
+        assert!(script.contains("mkdir -m 0700 \"$LOCK\""));
+        assert!(script.contains("HELPER_INSTALL_TRANSACTION_BUSY"));
+    }
 }
 
-/// Linux 安装脚本由 root 新建或接管的目录：创建模式不随调用方 umask；每个目录**先验是不是
-/// 真目录、再定属主与权限**（`chown`/`chmod` 会跟随最后一级的符号链接，而 `/usr/local/lib` 在
-/// Debian 系对 staff 组可写）；对已存在的目录同样处置。
-///
-/// 判据从脚本自身取材：全脚本只许有一条 `mkdir -p`，且它在 `secure_dir` 里 —— 新增一个绕开
-/// `secure_dir` 的 `mkdir -p`，这里就红。
 #[test]
-fn linux_install_script_fixes_umask_and_directory_ownership() {
-    let paths = InstallPaths::linux();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_linux_install_script(&paths, &p);
-    let lines: Vec<&str> = script.lines().map(str::trim).collect();
-    let at = |needle: &str| lines.iter().position(|l| *l == needle);
-
-    // umask 是第一条有副作用的语句（只排在 shebang 与 `set -eu` 之后）。
-    assert_eq!(&lines[..3], ["#!/bin/sh", "set -eu", "umask 022"]);
-    // 脚本级 umask 恰这一条；另一处只在圈住 touch 的子壳里。
-    assert_eq!(
-        lines.iter().filter(|l| l.starts_with("umask ")).count(),
-        1,
-        "脚本级 umask 被改写过"
-    );
-
-    // `secure_dir`：建 → 验（链接或非目录即退出）→ chown -h → chmod，顺序与内容逐行钉死。
-    let body = at("secure_dir() {").expect("缺 secure_dir");
-    assert_eq!(
-        &lines[body..body + 6],
-        [
-            "secure_dir() {",
-            "mkdir -p \"$1\"",
-            "if [ -L \"$1\" ] || [ ! -d \"$1\" ]; then echo \"polaris-helper: refusing $1: not a real directory\" >&2; exit 1; fi",
-            "chown -h root:root \"$1\"",
-            "chmod 0755 \"$1\"",
-            "}",
-        ]
-    );
-    // 所有目录都走它：全脚本只有函数里那一条 mkdir，也没有别的对目录的 chown / chmod 0755。
-    assert_eq!(
-        lines.iter().filter(|l| l.starts_with("mkdir ")).count(),
-        1,
-        "有绕开 secure_dir 的 mkdir"
-    );
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.starts_with("chmod 0755 "))
-            .count(),
-        1,
-        "有绕开 secure_dir 的 chmod 0755"
-    );
-    assert!(
-        !lines.iter().any(|l| l.starts_with("chown root:root '")),
-        "有不带 -h、直接对固定路径的 chown"
-    );
-    assert!(
-        !lines
-            .iter()
-            .any(|l| l.starts_with("chmod ") && (l.contains(" 0775 ") || l.contains(" 0777 "))),
-        "脚本里出现了组可写/人人可写的 chmod"
-    );
-
-    // 三个目录各一次，绝对值写死；安装目录先于它下面的受管核目录；都在动任何别的东西之前。
-    let install_dir = at("secure_dir '/usr/local/lib/polaris'").expect("缺安装目录");
-    let core_dir = at("secure_dir '/usr/local/lib/polaris/core'").expect("缺受管核目录");
-    let state_dir = at("secure_dir '/var/lib/polaris'").expect("缺状态目录");
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|l| l.starts_with("secure_dir '"))
-            .count(),
-        3
-    );
-    assert!(body < install_dir && install_dir < core_dir, "父目录须先验");
-    let seed_guard = at("if [ ! -x '/usr/local/lib/polaris/core/sing-box' ]; then").unwrap();
-    let authfile = at("(umask 077; touch '/var/lib/polaris/authorized-uids')").unwrap();
-    assert!(core_dir < seed_guard, "受管核目录须在播种之前处置");
-    assert!(state_dir < authfile, "状态目录须在建 authfile 之前处置");
-}
-
-/// 受管核目录里既有的内容：不属 root、或组与其他人可写、或不是常规文件的直接子项，在播种之前
-/// 一律删掉 —— 目录权限曾经过宽时被换进去的东西不会因为「核已存在」而一直留着。
-#[test]
-fn linux_install_script_purges_untrusted_entries_from_the_core_dir_before_seeding() {
-    let paths = InstallPaths::linux();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_linux_install_script(&paths, &p);
-    let lines: Vec<&str> = script.lines().map(str::trim).collect();
-    let at = |needle: &str| lines.iter().position(|l| *l == needle);
-
-    // 逐字钉死：只看直接子项（-mindepth 1 -maxdepth 1）、三个条件是「或」、find 不带 -L。
-    let purge = at(
-        "find '/usr/local/lib/polaris/core' -mindepth 1 -maxdepth 1 \\( ! -type f -o ! -user root -o -perm /022 \\) -exec rm -rf -- {} +",
-    )
-    .expect("缺受管核目录的清理");
-    let core_dir = at("secure_dir '/usr/local/lib/polaris/core'").unwrap();
-    let seed_guard = at("if [ ! -x '/usr/local/lib/polaris/core/sing-box' ]; then").unwrap();
-    assert!(
-        core_dir < purge && purge < seed_guard,
-        "清理须在确认目录是真目录之后、播种判断之前"
-    );
-    // 清理对象只有受管核目录这一处。
-    assert_eq!(lines.iter().filter(|l| l.starts_with("find ")).count(), 1);
-}
-
-/// macOS 安装脚本：支持目录先确认是真目录，再定权限与属主（`chown -h`），都发生在写 token 之前。
-#[test]
-fn mac_install_script_takes_ownership_of_the_support_dir() {
+fn machine_service_never_contains_an_app_profile_or_a_flat_core() {
     let paths = InstallPaths::mac();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_mac_install_script(&paths, &p, "TOKEN123");
-    let lines: Vec<&str> = script.lines().map(str::trim).collect();
-    assert_eq!(&lines[..3], ["#!/bin/bash", "set -e", "umask 077"]);
-    let at = |needle: &str| lines.iter().position(|l| *l == needle);
-    let mkdir = at("mkdir -p /Library/PrivilegedHelperTools \"$SUPPORT\"").expect("缺 mkdir");
-    let check = at(
-        "if [ -L \"$SUPPORT\" ] || [ ! -d \"$SUPPORT\" ]; then echo \"polaris-helper: refusing $SUPPORT: not a real directory\" >&2; exit 1; fi",
-    )
-    .expect("缺支持目录的真目录检查");
-    let chmod = at("chmod 755 /Library/PrivilegedHelperTools \"$SUPPORT\"").expect("缺 chmod");
-    let chown = at("chown -h root:wheel \"$SUPPORT\"").expect("缺支持目录的 chown -h");
-    let token = at("printf '%s' 'TOKEN123' > \"$SUPPORT/helper.token\"").expect("缺写 token");
-    assert!(
-        mkdir < check && check < chmod && chmod < chown && chown < token,
-        "顺序须为：建 → 验 → chmod → chown → 写 token"
+    let plist = render_mac_plist(
+        &paths.binary.to_string_lossy(),
+        &paths.core_dir.to_string_lossy(),
+        MAC_SUPPORT_DIR,
     );
-    assert!(
-        !lines.contains(&"chown root:wheel \"$SUPPORT\""),
-        "支持目录的 chown 不带 -h"
+    assert!(plist.contains("<key>KeepAlive</key><true/>"));
+    assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+    assert!(plist.contains("<string>--support</string>"));
+    assert!(plist.contains("<string>--coredir</string>"));
+    assert!(!plist.contains("--confdir"));
+    assert!(!plist.contains("--singbox"));
+    let win = build_win_install_script(
+        &InstallPaths::win(),
+        &install_params(
+            PathBuf::from("/x"),
+            PathBuf::from(r"C:\App\polaris-helper.exe"),
+        ),
+        &"a".repeat(64),
     );
-    // 受管核目录原有的那条仍在。
-    assert!(lines.contains(&"chown root:wheel \"$COREDIR\"; chmod 755 \"$COREDIR\""));
+    assert!(!win.contains("--confdir "));
+    assert!(!win.contains("--singbox"));
+    assert!(win.contains(r#"$binPath = '"C:\ProgramData\Polaris\polaris-helper.exe" --support "C:\ProgramData\Polaris"'"#));
 }
 
 #[test]
-fn linux_helper_upgrade_is_transactional_and_verifies_the_running_inode() {
-    let paths = InstallPaths::linux();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_linux_install_script(&paths, &p);
-
-    let snapshot_state = script
-        .find("systemctl is-active --quiet \"$SERVICE\"")
-        .expect("缺旧服务运行态快照");
-    let live_binary_backup = script
-        .find("cp \"/proc/$OLD_PID/exe\" \"$TXDIR/helper.rollback\"")
-        .expect("active 服务必须从 /proc/MainPID/exe 备份最后已知可用进程");
-    let stage_helper = script
-        .find("install -D -o root -g root -m 0755 '/app/helper' \"$NEW_HELPER\"")
-        .expect("缺新 helper 暂存");
-    let stop = script[snapshot_state..]
-        .find("systemctl stop \"$SERVICE\"; fi")
-        .map(|at| at + snapshot_state)
-        .expect("缺破坏性写入前停旧服务");
-    let replace = script[stop..]
-        .find("mv -f \"$NEW_HELPER\" \"$DEST\"")
-        .map(|at| at + stop)
-        .expect("缺原子替换");
-    let restart = script[replace..]
-        .find("systemctl restart \"$SERVICE\"")
-        .map(|at| at + replace)
-        .expect("缺新服务启动");
-    let verify = script
-        .find("while [ \"$TAKEOVER_ATTEMPTS\" -gt 0 ]; do")
-        .expect("缺有界接管等待");
-    let commit = script
-        .find("trap - EXIT HUP INT TERM\nrm -rf \"$TXDIR\"\necho polaris-helper-install-ok")
-        .expect("缺验证后的事务提交");
-
+fn linux_auth_merge_retains_other_users_and_matches_private_reader_contract() {
+    let script = unix_scripts().into_iter().nth(1).unwrap();
     assert!(
-        snapshot_state < live_binary_backup
-            && live_binary_backup < stage_helper
-            && stage_helper < stop
-            && stop < replace
-            && replace < restart
-            && restart < verify
-            && verify < commit,
-        "快照/暂存/停服/替换/启动/验证/提交顺序错误"
+        script.contains("grep -qxF '1000' \"$AUTHFILE\" || printf '%s\\n' '1000' >> \"$AUTHFILE\"")
     );
-    for needle in [
-        "rollback_install() {",
-        "install -o root -g root -m 0755 \"$TXDIR/helper.rollback\" \"$NEW_HELPER\"",
-        "install -o root -g root -m 0644 \"$TXDIR/unit.rollback\" \"$NEW_UNIT\"",
-        "if [ \"$WAS_ACTIVE\" -eq 1 ] && ! systemctl restart \"$SERVICE\"",
-        "rollback incomplete; recovery files kept at $TXDIR",
-        "TAKEOVER_ATTEMPTS=50",
-        "systemctl is-active --quiet \"$SERVICE\" 2>/dev/null",
-        "NEW_PID=$(systemctl show -p MainPID --value \"$SERVICE\")",
-        "cmp -s \"/proc/$NEW_PID/exe\" \"$DEST\"",
-        "TAKEOVER_ATTEMPTS=$((TAKEOVER_ATTEMPTS - 1))",
-        "sleep 0.1",
-        "HELPER_TAKEOVER_TIMEOUT",
+    assert!(script.contains("(umask 077; touch \"$AUTHFILE\")"));
+    assert!(script.contains("chown -h root:root \"$AUTHFILE\"; chmod 0600 \"$AUTHFILE\""));
+    let auth = script.find("AUTHFILE=").unwrap();
+    let retain = script.find("'helper-policy retain')").unwrap();
+    assert!(
+        auth < retain,
+        "a retained helper still needs this user's authorization"
+    );
+    assert!(script.contains("cmp -s \"/proc/$PID/exe\" \"$DEST\""));
+    assert!(script.contains("HELPER_TAKEOVER_TIMEOUT"));
+    assert!(script.contains("RuntimeDirectoryMode=0755"));
+    assert!(script.contains("Restart=on-failure"));
+}
+
+fn windows_script() -> String {
+    build_win_install_script(
+        &InstallPaths::win(),
+        &install_params(
+            PathBuf::from("/x"),
+            PathBuf::from(r"C:\App\polaris-helper.exe"),
+        ),
+        &"a".repeat(64),
+    )
+}
+
+#[test]
+fn windows_seals_helper_manifest_and_cleaner_before_any_service_mutation() {
+    let script = windows_script();
+    let helper = script.find("Check-Hash $utility '").unwrap();
+    let manifest = script.find("Check-Hash $manifest '").unwrap();
+    let cleaner = script
+        .find("Check-Hash $cleaner $selection.core.cleanerSha256")
+        .unwrap();
+    let execute = script.find("Invoke-Utility @('core-install'").unwrap();
+    let admit = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
+    let mutate = script.find("$mutated = $true").unwrap();
+    assert!(helper < execute && manifest < execute && cleaner < execute);
+    assert!(execute < admit && admit < mutate);
+    assert!(script.contains("$selection.id -cne '"));
+    assert!(script.contains("--source-owner', $identity"));
+    assert!(!script.contains(".seed.new"));
+    assert!(!script.contains("$support\\helper.token"));
+    assert!(script.contains("Secure-Directory (Join-Path $users $identity) $false"));
+    assert!(script.contains("[IO.FileShare]::None"));
+}
+
+#[test]
+fn windows_replaces_the_entire_dacl_with_numeric_privileged_owners() {
+    let script = windows_script();
+    assert!(script.contains("/setowner '*S-1-5-32-544'"));
+    assert!(script.contains("Security.AccessControl.DirectorySecurity"));
+    assert!(script.contains("Security.AccessControl.FileSecurity"));
+    assert_eq!(
+        script
+            .matches("$acl.SetAccessRuleProtection($true, $false)")
+            .count(),
+        2
+    );
+    assert_eq!(
+        script
+            .matches("Set-Acl -LiteralPath $path -AclObject $acl")
+            .count(),
+        2
+    );
+    assert!(script.contains("@('S-1-5-18', 'S-1-5-32-544')"));
+    assert!(script.contains("SecurityIdentifier]::new('S-1-5-32-545'), [Security.AccessControl.FileSystemRights]::ReadAndExecute"));
+    assert!(!script.contains("Administrators:"));
+    assert!(!script.contains("Users:(F)"));
+    assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
+}
+
+#[test]
+fn windows_checks_native_exits_and_rolls_back_exact_old_service_command() {
+    let script = windows_script();
+    for guard in [
+        "SCM stop",
+        "SCM delete",
+        "SCM start permission",
+        "SCM recovery",
+        "SCM start",
+        "SCM rollback start",
     ] {
-        assert!(script.contains(needle), "回滚腿缺：{needle}");
+        assert!(script.contains(&format!("Assert-NativeExit '{guard}'")));
+    }
+    assert!(script.contains("actions= restart/5000/restart/5000/restart/5000"));
+    assert!(script.contains("(A;;RP;;;IU)"));
+    assert!(script.contains("$old.PathName -StartupType $startType"));
+    assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
+    assert!(script.contains("$keepRecovery = $true"));
+    assert!(script.contains("finally { $lock.Dispose() }"));
+    assert!(script.contains("WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running"));
+}
+
+#[test]
+fn invalid_installation_identity_is_rejected_before_escalation() {
+    let src = PathBuf::from("/app/helper");
+    let (manager, _token_dir) = install_manager(Platform::Linux, &src);
+    let stage = tempfile::tempdir().unwrap();
+    let original = install_params(stage.path().into(), src);
+    let mut candidates = Vec::new();
+    let mut missing_hash = original.clone();
+    missing_hash.helper_sha256.clear();
+    candidates.push(missing_hash);
+    let mut wrong_uid = original.clone();
+    wrong_uid.uid += 1;
+    candidates.push(wrong_uid);
+    let mut injection = original.clone();
+    injection.conf_dir = PathBuf::from("/tmp/profile\n--bad");
+    candidates.push(injection);
+    for params in candidates {
+        let (executor, calls, _) = capturing((String::new(), 0));
+        assert!(matches!(
+            manager.install(&params, &executor),
+            Err(ManagerError::InvalidInstallation(_))
+        ));
+        assert!(calls.lock().unwrap().is_empty());
     }
 }
 
@@ -1179,731 +1053,9 @@ fn assert_shell_syntax(shell: &str, script: &str) {
 #[cfg(unix)]
 #[test]
 fn generated_unix_install_scripts_are_valid_shell() {
-    let params = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let linux = build_linux_install_script(&InstallPaths::linux(), &params);
-    assert_shell_syntax("/bin/sh", &linux);
-
-    let mac = build_mac_install_script(&InstallPaths::mac(), &params, "TOKEN");
-    assert_shell_syntax("/bin/bash", &mac);
-}
-
-/// **跨侧契约门**：linux 安装脚本给 authfile 的权限，必须落在**读侧 helper 的 accept 面**内。
-///
-/// 对端判据锚点 —— `crates/helper/src/platform/linux/auth.rs`：
-/// `const GROUP_OTHER_BITS: u32 = 0o077;`（:164）+ `authorize_uid()` 里
-/// `if mode & GROUP_OTHER_BITS != 0 { return Err(GroupOrOtherAccessible) }`（:188）。
-/// 叠加同函数的 `owner_uid != 0` 分支 ⇒ **accept 面 = root 属主 且 0600 或更严**。
-///
-/// 本脚本的历史值 `root:root 0644` 恰好落在**拒绝**分支上：装完 helper 对 authfile 里
-/// 任何非 root uid 恒判 unauthorized，Linux SO_PEERCRED 授权腿整条不可用；且 repair 复用
-/// 同一份安装脚本 ⇒ 人工 `chmod 0600` 修好的文件会被下一次修复重新改坏。两侧各自有测试
-/// 且都绿（读侧钉判据、写侧钉「装了哪些步骤」），**唯独没人比过两侧指的是不是同一个面**。
-///
-/// 断言取「**恰一处** + 值恰为 0600」而非 `contains("chmod 0600")`：后者在脚本尾部再补一条
-/// `chmod 0644 authfile` 的情况下**照样绿**（最后一条才是生效值），门等于没有。
-#[test]
-fn linux_install_script_chmods_authfile_0600_matching_helper_auth_contract() {
-    let paths = InstallPaths::linux();
-    let p = install_params(PathBuf::from("/x"), PathBuf::from("/app/helper"));
-    let script = build_linux_install_script(&paths, &p);
-
-    // 判据独立于生产常量：这里写死字面路径，不引 LINUX_AUTH_FILE
-    //（引常量的话，常量一改判据跟着漂，门就跟着被判对象走了）。
-    let authfile = "/var/lib/polaris/authorized-uids";
-
-    // 取材面自检：脚本里必须真提到 authfile，否则下面「恰一条」的计数是空集恒过。
-    // 期望至少 3 行：创建 / chmod / uid 合并追加（systemd unit 的 --authfile= 还有一行）。
-    let mentions: Vec<&str> = script.lines().filter(|l| l.contains(authfile)).collect();
-    assert!(
-        mentions.len() >= 3,
-        "取材面塌：脚本里提到 authfile 的行只剩 {} 条，期望 ≥3（创建/chmod/uid 追加）。实际：{mentions:#?}",
-        mentions.len()
-    );
-
-    // 所有给 authfile 设权限的行（chmod 或 install -m）——必须恰一条，且恰为 0600。
-    let mode_lines: Vec<&str> = mentions
-        .iter()
-        .copied()
-        .filter(|l| l.contains("chmod") || l.contains("install "))
-        .collect();
-    assert_eq!(
-        mode_lines.len(),
-        1,
-        "给 authfile 设权限的行必须恰一条（第二条会覆盖第一条，把 0600 改回宽权限也无人拦）。实际：{mode_lines:#?}"
-    );
-    assert_eq!(
-        mode_lines[0].trim(),
-        format!("chmod 0600 '{authfile}'"),
-        "authfile 权限须恰为 0600 —— 读侧 auth.rs GROUP_OTHER_BITS=0o077，mode & 0o077 != 0 一律拒绝"
-    );
-
-    // 创建瞬窗：裸 `touch` 的创建模式是 0666 & ~umask，pkexec 常见 umask 022 ⇒ 先落地 0644
-    // 再被 chmod 收紧，中间存在其他用户可读的瞬窗。故创建圈进 umask 077 子壳（不依赖继承 umask）。
-    assert!(
-        script.contains(&format!("(umask 077; touch '{authfile}')")),
-        "authfile 创建须在 umask 077 子壳内，消除 chmod 0600 生效前的宽权限瞬窗"
-    );
-}
-
-/// **接线门**：状态探测读的路径 / 服务名，必须与安装脚本真正写的逐字一致。
-///
-/// 这条测试的全部价值在于把两条曾经分叉的真相源钉在一起。此前两侧**各自都有测试且都绿**——
-/// `win_install_script_has_all_steps` 钉脚本落点、`is_installed_*` 用 mock 自填路径钉判定
-/// （判据与被判对象同源，是恒真的同义反复）——**唯独没人比过它们指不指同一个东西**。
-/// 于是 Windows 上 `is_installed` 恒 false。典型的「测方法体不测接线」。
-///
-/// 顺带钉死「落点不再随源文件名漂移」：这里故意传一个**改过名**的 src_binary。
-#[test]
-fn win_install_script_targets_the_same_paths_status_probes() {
-    let paths = InstallPaths::win();
-    // 故意用与目标不同的源文件名：落点应恒为 WIN_HELPER_EXE，不随 src 漂移。
-    let p = install_params(
-        PathBuf::from("/x"),
-        PathBuf::from(r"C:\app\renamed-helper.exe"),
-    );
-    let script = build_win_install_script(&paths, &p, "WTOKEN");
-
-    let binary = paths.binary.to_string_lossy();
-    assert!(
-        script.contains(&format!("$helperDst = '{binary}'")),
-        "状态探测查 {binary}，安装脚本却装到别处——两条真相源又分叉了"
-    );
-    // 源文件名出现在 `$helperSrc` 是对的（那是拷贝来源）；要钉的是**目标**不随它漂移。
-    assert!(
-        !script.contains(&format!(r"{WIN_SUPPORT_DIR}\renamed-helper.exe")),
-        "落点不得随源文件名漂移"
-    );
-    assert!(
-        script.contains(&format!("New-Service -Name {}", paths.service_label)),
-        "安装脚本注册的服务名与状态探测用的不一致"
-    );
-}
-
-#[test]
-fn win_install_script_has_all_steps() {
-    let p = install_params(
-        PathBuf::from("/x"),
-        PathBuf::from(r"C:\app\polaris-helper.exe"),
-    );
-    let s = build_win_install_script(&InstallPaths::win(), &p, "WTOKEN");
-    // 外置副本到 ProgramData
-    assert!(
-        s.contains(r"$helperDst = 'C:\ProgramData\Polaris\polaris-helper.exe'"),
-        "helperDst 须外置到 ProgramData"
-    );
-    // 锁 ACL
-    assert!(
-        s.contains(r#"/grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)""#),
-        "缺目录 ACL 锁（主体须为数值 SID，英文组名在非英文 Windows 上解析不到）"
-    );
-    // 写 token
-    assert!(
-        s.contains("Set-Content -Path $tokenFile -Value 'WTOKEN' -NoNewline -Encoding ascii"),
-        "缺写 token"
-    );
-    // binPath 含 daemon flag（真双引号）。P4：`--singbox` 由受保护核目录派生，**不再**是
-    // `params` 里那个 app 侧用户可写核（原断言是 `C:\app\sing-box.exe`）。
-    assert!(
-        s.contains(r#"--singbox "C:\ProgramData\Polaris\core\sing-box.exe" --confdir"#),
-        "binPath 的 --singbox 必须指受保护核目录"
-    );
-    assert!(
-        s.contains(r#"--support "C:\ProgramData\Polaris""#),
-        "binPath 缺 --support"
-    );
-    // New-Service + start
-    assert!(
-        s.contains("New-Service -Name PolarisHelper -BinaryPathName $bp -StartupType Automatic"),
-        "缺 New-Service"
-    );
-    assert!(s.contains("& $sc start PolarisHelper"), "缺 sc start");
-    assert!(
-        s.contains("& $icacls $support /inheritance:r"),
-        "缺 icacls inheritance:r"
-    );
-    assert!(
-        s.contains("$ErrorActionPreference = 'Stop'"),
-        "缺 fail-loud"
-    );
-    // 🔴 病根牙（2026-08-19 提权重放首曝）：`& '$env:...'` / `& '$sc'` 这类**单引号包任何
-    // $ 引用**都是字面量不展开 → CommandNotFound + EAP=Stop → 脚本必死。本脚本所有 `& `
-    // 调用位都应是裸变量/裸路径，出现 `& '$` 即病（评审实证：分句带冒号的禁令是永真死针，
-    // `& '$sc'` 穿透）。
-    assert!(
-        !s.contains("& '$"),
-        "win 安装脚本出现单引号包 $ 引用的调用——CommandNotFound 必死形态"
-    );
-    assert!(
-        s.contains(r#"$icacls = "$env:SystemRoot\System32\icacls.exe""#),
-        "缺 $env: 双引号变量赋值（icacls）"
-    );
-    assert!(
-        s.contains(r#"$sc = "$env:SystemRoot\System32\sc.exe""#),
-        "缺 $env: 双引号变量赋值（sc）"
-    );
-}
-
-/// W20：安装脚本必须配好两层自愈——① `sdset` 授 IU `SERVICE_START`（默认服务 DACL 只给交互
-/// 用户查询权，.207 实测无 RP；不补授则未提权 app 永远拉不起停着的服务）；② `sc failure`
-/// 失败恢复（任务管理器手杀/崩溃 → SCM 5s 自动重启，对齐 mac KeepAlive / linux Restart）。
-/// 两者都必须在首次 `sc start` 之前，且各带 `$LASTEXITCODE` 守卫——PS 5.1 的 EAP=Stop 拦不住
-/// 外部程序非零退出（评审 F3），静默失败会让安装「看着成功」而自愈全没配上。
-/// 变异锁：删任一行 / 删守卫 / 挪到 start 之后 → 转红。
-///
-/// 第 ⑤ 段把「哪些外部命令必须带守卫」从**手写清单**改成**扫描派生**（S-3）：新增一条
-/// `& $icacls …` / `& $sc …` 自动进覆盖面，不改这里一个字。
-/// 变异锁：加一条无守卫的假腿 → 计数与逐条定位双红；把守卫写到别处凑数 → 计数红。
-#[test]
-fn win_install_script_self_heals_and_grants_iu_start_before_first_start() {
-    let script = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\app\polaris-helper.exe"),
-        ),
-        "WTOKEN",
-    );
-    // ① IU 启动权：逐字钉死 sdset 行——IU 的第二段 ACE 恰好只有 RP（只授 start，不授
-    // stop/改配置）；改任何一段（尤其给 IU 加权）都该过 review 而不是悄悄过。
-    assert!(
-        script.contains(
-            "& $sc sdset PolarisHelper \"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RP;;;IU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)\""
-        ),
-        "缺 sdset 授 IU SERVICE_START（W20 恢复腿的硬前提）"
-    );
-    // ② 失败恢复 + ③ 三道退出码守卫（sdset/failure/start）+ ④ 次序：配置先于首启。
-    let sdset_at = script.find("sdset PolarisHelper").expect("缺 sdset");
-    let failure_line = "& $sc failure PolarisHelper reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null";
-    let failure_at = script.find(failure_line).expect("缺 sc failure 自愈配置");
-    let start_at = script
-        .find("& $sc start PolarisHelper")
-        .expect("缺 sc start");
-    assert!(
-        sdset_at < failure_at && failure_at < start_at,
-        "自愈配置必须在首次 start 之前（首启即被覆盖）"
-    );
-    // ⑤ **覆盖轴从脚本自身派生，不写手工清单**。
-    //
-    // 上一版这里是一张写死的 10 条 icacls 腿 + 精确计数 13。那张清单的绕过面是现成的：新增
-    // 第 11 条 `& $icacls …` 且不带守卫，只要把计数改一下、再在任意一条非 icacls 行后面多写
-    // 一个 `if ($LASTEXITCODE -ne 0)`（写进注释里都行——`matches()` 不剥注释），门就全绿。
-    // 即「覆盖面由夹具定」而不是「由判据定」。改成扫描派生后，新增腿**自动进取材面**。
-    let face = script_code_face(&script);
-    let head = guarded_region(&face);
-    let calls = derived_guarded_calls(head);
-
-    // 取材面自检①：派生集合非空。空集会让下面的逐条断言与计数一起变成恒真。
-    assert!(
-        !calls.is_empty(),
-        "取材面自检失败：一条待守卫的外部命令都没派生出来（变量名改了？）—— \
-         空集上的逐条断言与计数断言都恒真"
-    );
-    // 取材面自检②：两族都在。只剩一族（例如 `$icacls` 改了变量名）时集合仍非空，
-    // 但那一族的全部腿会**静默**退出覆盖面。
-    assert!(
-        calls.iter().any(|l| l.starts_with("& $icacls ")),
-        "取材面自检失败：派生集合里没有 icacls 腿"
-    );
-    assert!(
-        calls.iter().any(|l| l.starts_with("& $sc ")),
-        "取材面自检失败：派生集合里没有 sc 腿"
-    );
-    // 取材面自检③：不许有重复行 —— 逐条定位用 `find()` 取首次出现，重复行会让第二次
-    // 迭代重复验证第一处，那条真腿无人检查。
-    let mut seen = HashSet::new();
-    for call in &calls {
-        assert!(
-            seen.insert(*call),
-            "派生集合里有重复行（逐条定位会重复查到第一处）：{call}"
-        );
+    for script in unix_scripts() {
+        assert_shell_syntax("/bin/sh", &script);
     }
-    // 正面断言（防缩水）：当前脚本的待守卫外部命令是 7 条 icacls + 3 条 sc。派生集合会随脚本
-    // 一起缩小，故单靠「派生数 == 守卫数」拦不住「把整段 ACL 加固删了」——那一刀下去两边同时
-    // 归零仍然相等。这条地板不是门本身，是门的下限。
-    assert!(
-        calls.len() >= 10,
-        "待守卫的外部命令只剩 {} 条（应 ≥10）：ACL 加固或自愈配置被整段删了？",
-        calls.len()
-    );
-
-    // 计数：**恰好**等于派生集合大小。多一个 = 有人在非受守行后面凑了个守卫；少一个 = 有腿
-    // 没守。`} catch {` 之后不计——回滚段是 EAP=SilentlyContinue 的 best-effort，刻意不守。
-    assert_eq!(
-        head.matches("if ($LASTEXITCODE -ne 0)").count(),
-        calls.len(),
-        "退出码守卫数与待守卫的外部命令数不等（EAP=Stop 拦不住外部程序非零退出）"
-    );
-    // 计数只保证「有 N 处」，不保证它们长在哪儿——N 条全挂在 sdset 后面也是 N。
-    // 故逐条钉「这条命令之后、下一条 `& $` 调用之前就是它的守卫」。
-    for call in &calls {
-        let at = head
-            .find(call)
-            .unwrap_or_else(|| panic!("派生腿在净化面里找不回来：{call}"));
-        let rest = &head[at + call.len()..];
-        let guard_at = rest
-            .find("if ($LASTEXITCODE -ne 0)")
-            .unwrap_or_else(|| panic!("外部命令没有退出码守卫：{call}"));
-        // 下一条外部命令调用（`& $`）必须在守卫之后 —— 否则守卫查的是别人的退出码。
-        let next_call = rest.find("\n& $").unwrap_or(rest.len());
-        assert!(
-            guard_at < next_call,
-            "退出码守卫被下一条外部命令抢在前面（查的不是它自己的退出码）：{call}"
-        );
-    }
-}
-
-/// PowerShell 脚本的**净化取材面**：`#` 整行注释整行抹空（保留行数与行序，`find()` 的顺序
-/// 语义不变）。
-///
-/// 非剥不可：本文件的判据全是 `contains` / `find` / `matches().count()` 型，而注释里随手写一句
-/// `if ($LASTEXITCODE -ne 0)` 就能替一条真腿作证 —— 判据被自己的取材面污染。
-/// 偏移在净化面里自洽，故**下游一律拿净化面自己去 find**，绝不把它的偏移套回原串。
-fn script_code_face(script: &str) -> String {
-    script
-        .lines()
-        .map(|l| {
-            if l.trim_start().starts_with('#') {
-                ""
-            } else {
-                l
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 净化面里「必须守退出码」的区域：升级事务的 `} catch {` **之前**。
-///
-/// 回滚段刻意是 best-effort（`$ErrorActionPreference = 'SilentlyContinue'`，失败也要把能恢复的
-/// 恢复完），它里面的 `& $sc …` 不该被要求带守卫。锚点取不到即 panic：门失去射程必须当场红。
-fn guarded_region(face: &str) -> &str {
-    let at = face
-        .find("} catch {")
-        .expect("找不到 `} catch {` —— 事务边界没了，守卫门的射程无从谈起");
-    &face[..at]
-}
-
-/// 从安装脚本**派生**「必须带退出码守卫的外部命令」集合（S-3：覆盖轴由判据定，不由夹具定）。
-///
-/// 取材规则逐条：
-/// 1. 入参必须是 [`guarded_region`] 切出来的**净化面**（注释已抹空、catch 段已切掉）；
-/// 2. 行首（`trim_start` 后）是 `& $icacls ` 或 `& $sc ` 的行 —— 即脚本里全部外部程序调用；
-/// 3. **排除**以 `2>$null | Out-Null` 结尾的行：`sc stop` / `sc delete` 在幂等重装时本就期望
-///    非零退出（服务不存在是常态），给它们加守卫等于把每次「首次安装」判成失败。
-///    这一条是**有意不守**的唯一形态，写成后缀判据而不是列服务名，新增同形腿自动豁免。
-fn derived_guarded_calls(head: &str) -> Vec<&str> {
-    head.lines()
-        .map(str::trim_end)
-        .filter(|l| {
-            let t = l.trim_start();
-            (t.starts_with("& $icacls ") || t.starts_with("& $sc "))
-                && !t.ends_with("2>$null | Out-Null")
-        })
-        .collect()
-}
-
-/// **本地化门**：icacls 的主体一律用数值 SID，不许出现英文组名。
-///
-/// BUILTIN / NT AUTHORITY 的账户名**是本地化的**（德语 `Benutzer`、法语 `Utilisateurs`…）。英文名
-/// 在非英文 Windows 上解析不到 → icacls 报「No mapping between account names and security IDs was
-/// done」并非零退出。本批给每条 icacls 都补了退出码守卫，若还留着英文名，原先的**静默弱 ACL**就会
-/// 变成**装不上**；换 well-known SID 后这条故障路径整条消失，守卫也就不会误伤正常机器。
-///
-/// 判据钉 **SID 串本身**而不是「包含 Users」：后者改回英文名 `Users:` 照样绿，门等于没有。
-#[test]
-fn win_install_script_uses_numeric_sids_so_localized_windows_resolves_them() {
-    let script = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\app\polaris-helper.exe"),
-        ),
-        "WTOKEN",
-    );
-
-    // 取材面自检：先证明「所有 icacls 行」这个集合非空且完整，否则下面的全称否定是空集恒过。
-    let icacls_lines: Vec<&str> = script
-        .lines()
-        .filter(|l| l.trim_start().starts_with("& $icacls "))
-        .collect();
-    // 7 = 4 条 `/setowner` + 3 条 `/inheritance:r /grant:r`（N-1a 把后两类合并成一条命令之后
-    // 从 10 条降到 7 条；这是**地板**，防的是取材面缩水后全称否定变成空集恒过）。
-    assert!(
-        icacls_lines.len() >= 7,
-        "取材面自检失败：只取到 {} 条 icacls 行（应 ≥7），全称否定会变成空集恒过",
-        icacls_lines.len()
-    );
-
-    // 全称否定：一条 icacls 行都不许出现英文主体名。
-    for line in &icacls_lines {
-        for english in ["SYSTEM:", "Administrators:", "Users:"] {
-            assert!(
-                !line.contains(english),
-                "icacls 用了本地化敏感的英文组名 `{english}`（非英文 Windows 上解析失败 → \
-                 非零退出 → 守卫 throw → 装不上）：{line}"
-            );
-        }
-        // 正面断言：每条带主体的腿都得真的出现 `*S-`。`/inheritance:r` 不带主体，豁免。
-        assert!(
-            line.contains("/inheritance:r") || line.contains("*S-"),
-            "icacls 腿既没有主体 SID 也不是 /inheritance:r：{line}"
-        );
-    }
-
-    // 逐字钉三个 well-known SID（跨语言恒等，与 helper 侧 `coreacl` 的白名单同源）。
-    assert!(
-        script.contains(
-            r#"& $icacls $coreDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(RX)""#
-        ),
-        "受保护核目录的 grant 必须是 SYSTEM/Administrators/Users 三个数值 SID"
-    );
-    assert!(
-        script.contains(
-            r#"& $icacls $support /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)""#
-        ),
-        "support 目录的 grant 必须换成数值 SID（这条腿此前是英文名且无守卫）"
-    );
-    assert!(
-        script.contains(
-            r#"& $icacls $helperDst /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)""#
-        ),
-        "helper.exe 的 grant 必须换成数值 SID（这条腿此前是英文名且无守卫）"
-    );
-}
-
-/// 🔴 **N-1a + N-1b：DACL 一次写入 + owner 归 Administrators。**
-///
-/// # N-1a：`/inheritance:r` 与 `/grant:r` 必须在**同一条** icacls 命令里
-///
-/// 拆成两条时，`/setowner` 已先把属主交出去，而**新建目录上的 ACE 全是继承来的**，
-/// `/inheritance:r` 把它们一次删光 ⇒ 中间存在一个「调用者既非 owner、又没有任何 ACE」的
-/// 空 DACL 瞬间。此时紧随的 `/grant:r` 写不写得进去，取决于 icacls 会不会自行启用
-/// `SeRestorePrivilege` —— 无一手来源。任一依赖不成立 ⇒ 守卫 throw ⇒ **全新安装装不上**
-/// （不是本地化机器才炸，是全量）。合成一条 = 一次 `SetNamedSecurityInfo`，中间态不存在。
-///
-/// # N-1b：`/setowner` 的目标是 `*S-1-5-32-544` 而不是 `*S-1-5-18`
-///
-/// 设一个**不在调用者 token 里**的 SID 当 owner（SYSTEM 对提权管理员正是如此）需要
-/// `SeRestorePrivilege` 已启用；`BUILTIN\Administrators` 在提权 token 里且带 `SE_GROUP_OWNER`，
-/// 设它当 owner 零特权。安全上无差：Administrators 本就持 `(F)`，owner 隐含的 `WRITE_DAC`
-/// 不增加任何能力，而「预创建者以 CREATOR OWNER 留在 owner 位」照样被替掉。544 在 helper 侧
-/// `coreacl::PRIVILEGED_SIDS`（owner 白名单）内 ⇒ 起核前自检照常放行。
-///
-/// 变异锁：把任一条合并调用拆回两条 → N-1a 段红；把任一 `/setowner` 改回 `*S-1-5-18` → N-1b 段红。
-#[test]
-fn win_install_script_writes_each_dacl_in_one_call_and_owns_by_administrators() {
-    let script = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\app\polaris-helper.exe"),
-        ),
-        "WTOKEN",
-    );
-    let face = script_code_face(&script);
-    let icacls: Vec<&str> = face
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| l.trim_start().starts_with("& $icacls "))
-        .collect();
-    // 取材面自检：集合非空且覆盖全部四个受保护对象，否则下面按子集分组的断言会变成空集恒过。
-    assert!(
-        icacls.len() >= 7,
-        "取材面自检失败：只取到 {} 条 icacls 行（应 ≥7）",
-        icacls.len()
-    );
-    for obj in [
-        "$support",
-        "$coreDir",
-        "$tokenFile",
-        "$helperDst",
-        "$cleanerDst",
-    ] {
-        assert!(
-            icacls.iter().any(|l| l.contains(obj)),
-            "取材面自检失败：没有一条 icacls 打在 {obj} 上"
-        );
-    }
-
-    // ── N-1a：去继承与授权同命令 ──────────────────────────────────────────────
-    let inherit: Vec<&str> = icacls
-        .iter()
-        .copied()
-        .filter(|l| l.contains("/inheritance:r"))
-        .collect();
-    let grant: Vec<&str> = icacls
-        .iter()
-        .copied()
-        .filter(|l| l.contains("/grant:r"))
-        .collect();
-    assert_eq!(
-        inherit.len(),
-        4,
-        "去继承的对象应恰好是 $support / $coreDir / $helperDst / $cleanerDst 四个，实得 {inherit:?}"
-    );
-    assert_eq!(
-        inherit, grant,
-        "`/inheritance:r` 与 `/grant:r` 必须逐条同命令：拆开会在两条命令之间留出空 DACL \
-         中间态（调用者既非 owner 又无 ACE），第二条能否写入取决于 icacls 是否自行启用 \
-         SeRestorePrivilege —— 不成立则全新安装装不上"
-    );
-    for line in &inherit {
-        let inherit_at = line.find("/inheritance:r").expect("上面刚筛过");
-        let grant_at = line.find("/grant:r").expect("上面刚筛过");
-        assert!(
-            inherit_at < grant_at,
-            "同一条命令里 `/inheritance:r` 必须在 `/grant:r` 之前（顺序即语义）：{line}"
-        );
-    }
-
-    // ── N-1b：owner 归 Administrators ─────────────────────────────────────────
-    let setowner: Vec<&str> = icacls
-        .iter()
-        .copied()
-        .filter(|l| l.contains("/setowner"))
-        .collect();
-    assert_eq!(
-        setowner.len(),
-        5,
-        "五个受保护对象（$support/$coreDir/$tokenFile/$helperDst/$cleanerDst）都要显式 /setowner，实得 {setowner:?}"
-    );
-    for line in &setowner {
-        assert!(
-            line.contains(r#"/setowner "*S-1-5-32-544""#),
-            "/setowner 的主体必须是 BUILTIN\\Administrators（*S-1-5-32-544）：{line}"
-        );
-        assert!(
-            !line.contains("*S-1-5-18"),
-            "owner 设成不在提权 token 里的 SID（SYSTEM）需要 SeRestorePrivilege 已启用，\
-             无一手来源保证 icacls 会自行启用它：{line}"
-        );
-    }
-    // 正面对照：544 当 owner 不等于「放弃 SYSTEM 的权」—— 三条 grant 里 SYSTEM 的 (F) 必须还在，
-    // 否则「owner 换人」就悄悄变成了「服务身份失去完全控制」。
-    for line in &grant {
-        assert!(
-            line.contains("*S-1-5-18:("),
-            "grant 里丢了 SYSTEM 的完全控制（服务本体就是以 SYSTEM 跑的）：{line}"
-        );
-    }
-}
-
-/// W24：覆盖升级不是“删旧 → 祈祷新服务能起”。旧 helper/token/SCM 快照必须先于第一处
-/// 破坏性写入；只有新服务首启成功才删备份；catch 必须恢复两份文件和原服务运行态。
-#[test]
-fn win_helper_upgrade_is_transactional_and_keeps_recovery_copies_on_failure() {
-    let script = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\app\polaris-helper.exe"),
-        ),
-        "WTOKEN",
-    );
-    let snapshot = script
-        .find("$oldService = Get-CimInstance")
-        .expect("缺旧 SCM 快照");
-    let backup_helper = script
-        .find("Copy-Item -LiteralPath $helperDst -Destination $helperBackup")
-        .expect("缺旧 helper 备份");
-    let backup_token = script
-        .find("Copy-Item -LiteralPath $tokenFile -Destination $tokenBackup")
-        .expect("缺旧 token 备份");
-    let transaction = script.find("try {\n").expect("缺升级事务边界");
-    let destructive = script
-        .find("Remove-Item -Force -Path $tokenFile")
-        .expect("缺 token 替换腿");
-    let first_start = script
-        .find("& $sc start PolarisHelper")
-        .expect("缺新服务首启");
-    let commit = first_start
-        + script[first_start..]
-            .find("Remove-Item -Force -Path $helperBackup,$tokenBackup")
-            .expect("缺成功 commit 清备份");
-    let rollback = script.find("} catch {\n").expect("缺失败回滚腿");
-
-    assert!(
-        snapshot < backup_helper
-            && backup_helper < backup_token
-            && backup_token < transaction
-            && transaction < destructive,
-        "SCM/helper/token 快照必须完整发生在首个破坏性写入之前"
-    );
-    assert!(
-        first_start < commit && commit < rollback,
-        "首启成功后才能 commit"
-    );
-    for needle in [
-        "Copy-Item -LiteralPath $helperBackup -Destination $helperDst -Force",
-        "Copy-Item -LiteralPath $tokenBackup -Destination $tokenFile -Force",
-        "New-Service -Name PolarisHelper -BinaryPathName $oldBinPath",
-        "if ($oldWasRunning) { & $sc start PolarisHelper",
-        "失败时保留 .rollback",
-    ] {
-        assert!(script[rollback..].contains(needle), "回滚腿缺：{needle}");
-    }
-}
-
-/// **P4 · S 受保护内核目录的写侧门**：ImagePath 指受保护路径 + 播种 + `/setowner` 先行 + `Users:(RX)`。
-///
-/// 这一条是让整批「有牙」的那一条：helper 侧的 chokepoint（install-core 分派 + ACL 自检）在前两片
-/// 就建好了，但只要安装脚本还把 `--singbox` 烧成 app 侧用户可写路径，装完之后起核跑的仍是老路径
-/// 那一份 —— chokepoint 没人用。
-///
-/// 每条断言对应一个**静默**失效形态（都不编译错、真机才炸）：
-/// - `--singbox` 退回 `params.singbox_path` ⇒ 受保护目录白建，helper exec 用户可写核；
-/// - 播种挪到 `New-Service` 之后 ⇒ 服务先起、ImagePath 指空目录 ⇒ TUN 整条不可用（spec §4.4 首行风险）；
-/// - `/setowner` 挪到 `/grant:r` 之后 ⇒ 预创建者的 owner 隐含 WRITE_DAC 没被中和，DACL 设了也能改回去；
-/// - 漏 `Users:(OI)(CI)(RX)` ⇒ app 侧 `sha256_file(dest)` 读不到、自证无执行权 ⇒ 每次起核白推 80MB；
-/// - 路径用 `/` 分隔（`PathBuf::join` 在 Linux 上的形态）⇒ 真机 ImagePath 指向不存在的路径。
-#[test]
-fn win_install_script_seeds_and_locks_the_protected_core_dir() {
-    let paths = InstallPaths::win();
-    let p = install_params(
-        PathBuf::from("/x"),
-        PathBuf::from(r"C:\app\polaris-helper.exe"),
-    );
-    let script = build_win_install_script(&paths, &p, "WTOKEN");
-
-    // ── ① 受保护路径从 `InstallPaths::win().core_dir` 派生，且是纯反斜杠形态 ───────────────
-    let core_dir = paths.core_dir.to_string_lossy().into_owned();
-    let core_bin = format!(r"{core_dir}\{WIN_CORE_BIN_NAME}");
-    let core_sidecar = format!(r"{core_dir}\{WIN_CORE_SIDECAR_NAME}");
-    assert_eq!(
-        core_bin, r"C:\ProgramData\Polaris\core\sing-box.exe",
-        "受保护核路径的形态改了必须过 review（app 侧 reconcile 与 helper 侧自检都锚在它上）"
-    );
-    assert!(
-        script.contains(&format!("$coreBin = '{core_bin}'")),
-        "脚本里的 $coreBin 必须由 InstallPaths::win().core_dir 派生"
-    );
-    assert!(
-        script.contains(&format!(r#"--singbox "{core_bin}" --confdir"#)),
-        "服务 ImagePath 的 --singbox 必须指受保护核，而不是 app 侧用户可写核"
-    );
-    // 取材面自检 + 反向对照：脚本里凡提到受保护核目录的行，一条都不许出现正斜杠。
-    // （`PathBuf::join` 在 Linux 上拼 `/`，这种错不编译错、只让真机 ImagePath 指向不存在的路径。）
-    let core_lines: Vec<&str> = script
-        .lines()
-        .filter(|l| l.contains(r"ProgramData\Polaris\core") || l.contains("ProgramData/Polaris"))
-        .collect();
-    assert!(
-        core_lines.len() >= 4,
-        "取材面自检失败：提到受保护核目录的行只有 {} 条，下面的全称否定会变成空集恒过",
-        core_lines.len()
-    );
-    for line in &core_lines {
-        assert!(
-            !line.contains(r"Polaris/"),
-            "受保护核路径出现正斜杠（PathBuf::join 的宿主分隔符漏了出来）：{line}"
-        );
-    }
-
-    // ── ② 播种：条件播、先 .seed.new 再 Move，且**整段在 New-Service 之前** ─────────────────
-    // `-PathType Leaf` 是判据的一部分，不是装饰：裸 `Test-Path` 对**目录**也返 True，同账户用户
-    // 抢先建一个名叫 sing-box.exe 的目录就能让播种被跳过（ACL 三步照样全过、安装「成功」），
-    // 而 helper 之后 CreateProcess 一个目录必败、install-core 的 rename 覆盖目录也必败。
-    let seed_guard = script
-        .find("if (-not (Test-Path -LiteralPath $coreBin -PathType Leaf))")
-        .expect("缺条件播种，或漏了 -PathType Leaf（预建同名目录即可跳过播种）");
-    let seed_copy = script
-        .find(r#"Copy-Item -LiteralPath $bundledCore -Destination "$coreBin.seed.new" -Force"#)
-        .expect("缺核播种");
-    let seed_move = script
-        .find(r#"Move-Item -LiteralPath "$coreBin.seed.new" -Destination $coreBin -Force"#)
-        .expect("缺核播种的原子落位（先 .seed.new 再 Move，杜绝 exec 到写了一半的 exe）");
-    let sidecar_guard = script
-        .find("if (Test-Path -LiteralPath $bundledSidecar)")
-        .expect("缺 cronet 的条件播种（不随包时必须跳过，对齐 linux 的 `[ -f ] &&`）");
-    let new_service = script
-        .find("New-Service -Name PolarisHelper -BinaryPathName $bp")
-        .expect("缺 New-Service");
-    assert!(
-        seed_guard < seed_copy && seed_copy < seed_move,
-        "播种次序错：必须先判缺失、再落 .seed.new、最后 Move 就位"
-    );
-    assert!(
-        seed_move < new_service && sidecar_guard < new_service,
-        "播种必须早于 New-Service —— 否则服务起来时 ImagePath 指向空目录，TUN 整条不可用"
-    );
-    assert!(
-        script.contains(&format!("$coreSidecar = '{core_sidecar}'")),
-        "cronet 播种目标必须与核同目录"
-    );
-
-    // ── ③ ACL 三步的**顺序**：/setowner → /inheritance:r → /grant:r（面 I / 必改2）──────────
-    // 只钉「都包含」会被「顺序反了」骗过：/setowner 在 /grant:r 之后跑，等于先设 DACL 再换 owner，
-    // 中间那一刻预创建者的 WRITE_DAC 仍在，门就是摆设。
-    let core_setowner = script
-        .find(r#"& $icacls $coreDir /setowner "*S-1-5-32-544" /T"#)
-        .expect("缺受保护核目录 /setowner（/T 连播下的文件一起收）");
-    // `/inheritance:r` 与 `/grant:r` 已合成一条命令（N-1a：拆开会留空 DACL 中间态），
-    // 故这里只剩两步顺序：先 setowner，再一次性重建 DACL。
-    let core_dacl = script
-        .find("& $icacls $coreDir /inheritance:r /grant:r")
-        .expect("缺受保护核目录的 /inheritance:r + /grant:r（必须同一条命令）");
-    let core_grant = core_dacl;
-    assert!(
-        core_setowner < core_dacl,
-        "受保护核目录的 ACL 顺序必须是 /setowner → （/inheritance:r + /grant:r 同命令）"
-    );
-    assert!(
-        seed_move < core_setowner,
-        "/setowner /T 必须在播种之后 —— 提权 PowerShell 新建文件的默认属主是创建者账户，\
-         不在自检白名单里，先设后播等于把 owner 判定留在放宽态"
-    );
-    // $support / $tokenFile / $helperDst 三处也必须 setowner 先行（面 I 同理）。
-    for (obj, inherit) in [
-        (
-            r#"& $icacls $support /setowner "*S-1-5-32-544""#,
-            "& $icacls $support /inheritance:r /grant:r",
-        ),
-        (
-            r#"& $icacls $helperDst /setowner "*S-1-5-32-544""#,
-            "& $icacls $helperDst /inheritance:r /grant:r",
-        ),
-    ] {
-        let a = script.find(obj).unwrap_or_else(|| panic!("缺 {obj}"));
-        let b = script
-            .find(inherit)
-            .unwrap_or_else(|| panic!("缺 {inherit}"));
-        assert!(a < b, "/setowner 必须先于 /inheritance:r：{obj}");
-    }
-    let token_write = script
-        .find("Set-Content -Path $tokenFile")
-        .expect("缺写 token");
-    let token_setowner = script
-        .find(r#"& $icacls $tokenFile /setowner "*S-1-5-32-544""#)
-        .expect("缺 token /setowner");
-    assert!(
-        token_write < token_setowner,
-        "token 得先写出来才谈得上改属主"
-    );
-
-    // ── ④ Users:(RX) 一格都不许少（必改7）──────────────────────────────────────────────
-    // 主体钉 `*S-1-5-32-545`（BUILTIN\Users 的 well-known SID）而不是英文名 `Users:` ——
-    // 英文名在本地化 Windows 上解析不到，见 `win_install_script_uses_numeric_sids_...`。
-    assert!(
-        script.contains(
-            r#"& $icacls $coreDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(RX)""#
-        ),
-        "受保护核目录必须显式授 *S-1-5-32-545:(OI)(CI)(RX)：继承父目录只有 SYSTEM/Admin(F)，\
-         Users 一条 ACE 都没有 ⇒ app 侧 sha256_file(受保护核) 读不到、内核自证无执行权"
-    );
-    // 反向：不得给 Users 授写类权（helper 侧 coreacl 判「放宽」→ 拒起核）。
-    assert!(
-        !script.contains("\"*S-1-5-32-545:(OI)(CI)(F)\"")
-            && !script.contains("\"*S-1-5-32-545:(OI)(CI)(M)\""),
-        "给 Users 授写类权会被 helper 的 ACL 自检判放宽并拒起核"
-    );
-
-    // ── ⑤ 事务边界：受保护核这一段刻意在 try 之外（失败时既有安装完整无损）───────────────
-    let transaction = script.find("try {\n").expect("缺升级事务边界");
-    assert!(
-        core_grant < transaction,
-        "建目录/播种/锁 ACL 应落在 try 之外：那几步对既有安装幂等且非破坏，\
-         失败时在动旧 token/helper/服务之前就非零退出，比进 try 后靠 catch 收拾更可回退"
-    );
 }
 
 #[test]
@@ -1939,7 +1091,7 @@ fn install_linux_end_to_end_wires_pkexec_and_writes_script() {
     let written = content.lock().unwrap().clone().expect("脚本应已落盘");
     assert!(written.contains("systemctl enable \"$SERVICE\""));
     assert!(written.contains("systemctl restart \"$SERVICE\""));
-    assert!(written.contains("cmp -s \"/proc/$NEW_PID/exe\" \"$DEST\""));
+    assert!(written.contains("cmp -s \"/proc/$PID/exe\" \"$DEST\""));
     // 清理：脚本文件已删（finally unlink）。
     assert!(!Path::new(&calls[0][2]).exists(), "脚本执行后须清理");
 }
@@ -2269,66 +1421,19 @@ fn join_literal(src: &str) -> Option<&str> {
         .and_then(|r| r.split('"').next())
 }
 
-/// cronet 的播种源必须是**随包核同目录**下的绝对路径。
-///
-/// 回归来由（2026-09-24 207 真机）：原实现用 `Path::parent()` 取目录，而单测跑在 Linux 上，
-/// `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")` ⇒ 渲染成裸名 `libcronet.dll`。
-/// 生产（Windows）不受影响，但此前没有断言看这个值 —— 测试看到的是错值却照样绿，
-/// 将来真改坏了也照不出来。本条让 Linux 上渲染出的就是生产真值。
+/// The immutable utility receives the exact stage directory containing both files.
 #[test]
-fn win_install_script_seeds_cronet_from_the_bundled_core_directory() {
-    let p = InstallParams {
-        src_binary: PathBuf::from(
-            r"C:\Users\u\AppData\Local\Polaris\_up_\resources\win\polaris-helper.exe",
-        ),
-        bundled_core: PathBuf::from(
-            r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\sing-box.exe",
-        ),
-        conf_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
-        uid: 0,
-        script_dir: PathBuf::from(r"C:\Users\u\AppData\Roaming\com.polaris.app\polaris"),
-    };
-    let script =
-        build_win_install_script(&InstallPaths::win(), &p, "0123456789abcdef0123456789abcdef");
-    let want = r"$bundledSidecar = 'C:\Users\u\AppData\Roaming\com.polaris.app\polaris\core_update\libcronet.dll'";
+fn windows_payload_directory_is_absolute_even_when_rendered_on_unix() {
+    let p = install_params(
+        PathBuf::from("/x"),
+        PathBuf::from(r"C:\Users\u\Polaris\stage\polaris-helper.exe"),
+    );
+    let script = build_win_install_script(&InstallPaths::win(), &p, &"a".repeat(64));
+    assert!(script.contains(r"--source', 'C:\Users\u\Polaris\stage'"));
     assert!(
-        script.contains(want),
-        "cronet 播种源不是随包核同目录下的绝对路径：\n{}",
-        script
-            .lines()
-            .find(|l| l.starts_with("$bundledSidecar"))
-            .unwrap_or("<缺这一行>")
+        script.contains(r"Copy-Item -LiteralPath 'C:\Users\u\Polaris\stage\polaris-cleaner.exe'")
     );
-    // 反向：绝不能退化成相对路径的裸名（`Test-Path` 相对当前目录 ⇒ 静默不播种）。
-    assert!(!script.contains("$bundledSidecar = 'libcronet.dll'"));
-}
-
-#[test]
-fn windows_cleaner_install_is_fixed_protected_and_transactional() {
-    let script = build_win_install_script(
-        &InstallPaths::win(),
-        &install_params(
-            PathBuf::from("/x"),
-            PathBuf::from(r"C:\app\polaris-helper.exe"),
-        ),
-        "TOKEN",
-    );
-    for needle in [
-        r"$cleanerSrc = 'C:\app\polaris-cleaner.exe'",
-        r"$cleanerDst = 'C:\ProgramData\Polaris\polaris-cleaner.exe'",
-        "$hadCleaner = Test-Path -LiteralPath $cleanerDst",
-        "Copy-Item -LiteralPath $cleanerDst -Destination $cleanerBackup -Force",
-        "Copy-Item -LiteralPath $cleanerBackup -Destination $cleanerDst -Force",
-        "Remove-Item -Force -Path $cleanerDst -ErrorAction SilentlyContinue",
-    ] {
-        assert!(script.contains(needle), "{needle}");
-    }
-    assert!(
-        script.find("bundled native cleaner missing").unwrap() < script.find("& $sc stop").unwrap()
-    );
-    assert!(script.find("$hadCleaner").unwrap() < script.find("try {").unwrap());
-    assert!(
-        script.find("& $icacls $cleanerDst /setowner").unwrap()
-            < script.find("New-Service -Name").unwrap()
-    );
+    assert!(script.contains("Check-Hash $cleaner $selection.core.cleanerSha256"));
+    assert!(script.contains("foreach ($path in @($helperDst, $cleanerDst, $record))"));
+    assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
 }

@@ -20,6 +20,8 @@ pub mod common {
     /// `OK <ver>`（mac/win/linux，纯协议版本查询）。
     pub const VERSION: &str = "version";
     pub const CORE_STATUS: &str = "core-status";
+    pub const PREPARE_HELPER_UPGRADE: &str = "prepare-helper-upgrade";
+    pub const CANCEL_HELPER_UPGRADE: &str = "cancel-helper-upgrade";
     pub const NATIVE_START_PINNED_BIRTH: &str = "start-native-pinned-birth-safe";
     /// `OK started <pid>` / `OK already <pid>` / `ERR ...`（启核，参数最多）。
     pub const START: &str = "start";

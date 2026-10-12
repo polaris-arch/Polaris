@@ -910,6 +910,7 @@ fn production_stop_poll_is_pending_until_native_reaper_clears_birth() {
     let slot = ChildSlot::from_child(child, handle.clone());
     let state = Arc::new(Mutex::new(HandlerState {
         child: Some(ManagedChild::Stopping(handle.clone())),
+        ..HandlerState::new()
     }));
     let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
     spawner.slots.lock().unwrap().push(Arc::clone(&slot));

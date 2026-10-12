@@ -195,6 +195,8 @@ pub enum Request {
     Ping,
     /// `version`（无参数行）。
     Version,
+    PrepareHelperUpgrade,
+    CancelHelperUpgrade,
     /// Read-only verification of one installed content identity.
     CoreStatus {
         id: crate::core_manifest::CoreId,
@@ -289,6 +291,8 @@ impl Request {
         match self {
             Self::Ping => command::common::PING,
             Self::Version => command::common::VERSION,
+            Self::PrepareHelperUpgrade => command::common::PREPARE_HELPER_UPGRADE,
+            Self::CancelHelperUpgrade => command::common::CANCEL_HELPER_UPGRADE,
             Self::CoreStatus { .. } => command::common::CORE_STATUS,
             Self::LinuxStartPinned(_) => command::linux::START_PINNED_BIRTH,
             Self::NativeStartPinned(_) => command::common::NATIVE_START_PINNED_BIRTH,
@@ -335,6 +339,8 @@ impl Request {
                 push_start_args(&params.common, out);
             }
             Self::Ping
+            | Self::PrepareHelperUpgrade
+            | Self::CancelHelperUpgrade
             | Self::Version
             | Self::Status
             | Self::LinuxStatusBirth

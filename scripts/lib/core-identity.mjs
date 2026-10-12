@@ -24,12 +24,13 @@ export function canonicalCoreIdentity(core) {
 
 export function coreIdentityId(core) { return hash(canonicalCoreIdentity(core)); }
 
-export function selectedCoreManifest(contract, platform, appVersion, helperSha256 = null) {
+export function selectedCoreManifest(contract, platform, appVersion, helperSha256 = null, cleanerSha256 = null) {
   const row = contract.platforms[platform]; demand(row, 'missing selected platform');
   const entry = (file) => ({ name: file.member, bytes: file.bytes, sha256: file.sha256 });
   const core = { platform, version: contract.version, providerFingerprint: row.providerFingerprint,
-    files: [entry(row.core), ...(row.sidecar ? [entry(row.sidecar)] : [])], helperSha256 };
+    files: [entry(row.core), ...(row.sidecar ? [entry(row.sidecar)] : [])], helperSha256, cleanerSha256 };
   demand(helperSha256 === null || hex(helperSha256), 'invalid helper hash');
+  demand(cleanerSha256 === null || platform === 'win' && hex(cleanerSha256), 'invalid cleaner hash');
   demand(typeof appVersion === 'string' && /^[A-Za-z0-9.+-]{1,128}$/.test(appVersion), 'invalid App version');
   return { schema: 'polaris-core-manifest-v1', id: coreIdentityId(core), appVersion, core };
 }
@@ -55,7 +56,8 @@ export function writeSelectedCoreManifest(directory, contract, platform, appVers
   const dir = lstatSync(directory); demand(dir.isDirectory() && !dir.isSymbolicLink(), 'payload directory required');
   const helper = platform === 'win' ? 'polaris-helper.exe' : 'polaris-helper';
   const helperSha256 = actualCoreFile(join(directory, helper)).sha256;
-  const manifest = selectedCoreManifest(contract, platform, appVersion, helperSha256);
+  const cleanerSha256 = platform === 'win' ? actualCoreFile(join(directory, 'polaris-cleaner.exe')).sha256 : null;
+  const manifest = selectedCoreManifest(contract, platform, appVersion, helperSha256, cleanerSha256);
   for (const expected of manifest.core.files) actualCoreFile(join(directory, expected.name), expected);
   writeManifest(directory, manifest);
   return manifest;

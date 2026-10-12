@@ -12,6 +12,7 @@ const REPO = 'polaris-arch/polaris-box';
 const API = `https://api.github.com/repos/${REPO}`;
 const POLICY = 'preserve measured original bytes; ad-hoc/not-signed observations do not assert trust';
 const CONTRACT_PATH = 'scripts/desktop-core/release-contract.json';
+const PENDING_CONTRACT_PATH = 'scripts/desktop-core/pending-release-contract.json';
 const PROVIDER_FILES = ['scripts/polaris_production_release.py', 'scripts/polaris_native_candidate.py',
   'scripts/polaris_source_fingerprint.py', 'scripts/polaris_dns_identity.py', 'scripts/polaris_go_environment.py',
   'scripts/polaris_native_distribution.py', 'release/polaris-production-release.json', 'release/polaris-candidate-inputs.json'];
@@ -23,6 +24,7 @@ export const RELEASE_TARGETS = Object.freeze({
 });
 export const ADAPTER_FILES = ['scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/release-archive.py',
   'scripts/desktop-core/wire-input-handoff.mjs',
+  'scripts/prepare-core-identity.mjs', 'scripts/lib/core-identity.mjs',
   'scripts/macos-nested-code.sh',
   'scripts/desktop-core/release-native-gates.mjs',
   'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/desktop-core/bundle.mjs',
@@ -135,7 +137,7 @@ export function validateReleaseContract(contract) {
   demand(contract?.schema === 'polaris-box-release-consumer-contract-v1'
     && contract.providerContract === 'polaris-box-release-v1' && contract.repository === REPO
     && positive(contract.releaseId) && hex(contract.sourceCommit, 40) && hex(contract.sourceTree, 40)
-    && hex(contract.tagObject, 40) && /^1\.15\.0-alpha\.12\.polaris\.[1-9][0-9]*$/.test(contract.version)
+    && hex(contract.tagObject, 40) && /^1\.15\.0-alpha\.12(?:\.polaris\.[1-9][0-9]*)?$/.test(contract.version)
     && contract.tag === `v${contract.version}`, 'Unbound or unsupported desktop release contract');
   same(Object.keys(contract.platforms ?? {}).sort(), Object.keys(RELEASE_TARGETS).sort(), 'Exactly four App targets required');
   pin(contract.assetIndex, 'polaris-box-assets.json', contract, 8 * 1024 * 1024);
@@ -149,9 +151,9 @@ export function validateReleaseContract(contract) {
 
 export function loadReleaseContract(root, manifest) {
   const selection = manifest.desktopRelease;
-  demand(selection?.schema === 'polaris-app-release-selection-v1' && selection.contractPath === CONTRACT_PATH
+  demand(selection?.schema === 'polaris-app-release-selection-v1' && [CONTRACT_PATH, PENDING_CONTRACT_PATH].includes(selection.contractPath)
     && hex(selection.contractSha256, 64), 'Explicit release selection incomplete');
-  const file = join(root, CONTRACT_PATH); regularPath(file);
+  const file = join(root, selection.contractPath); regularPath(file);
   const bytes = readFileSync(file); demand(bytes.length <= 8 * 1024 * 1024 && digest(bytes) === selection.contractSha256, 'Reviewed consumer contract SHA differs');
   const contract = validateReleaseContract(JSON.parse(bytes));
   for (const key of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree', 'releaseId'])

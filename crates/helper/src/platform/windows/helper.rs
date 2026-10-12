@@ -15,14 +15,14 @@
 //! Terminal receipts are cached per birth. Legacy Start is rejected before any
 //! forwarding/spawn; legacy Stop cannot detach native custody.
 
-use crate::core_install::{InstallResult, SINGBOX_BIN_NAME_WIN, install_core_files};
+use crate::core_install::{install_core_files, InstallResult, SINGBOX_BIN_NAME_WIN};
 use crate::platform::windows::coreacl;
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
 use polaris_helper_proto::Platform;
 mod native_birth;
-use crate::token::{TokenStore, is_authed_constant_time};
-use native_birth::{NativeCustody, stop_locked};
+use crate::token::{is_authed_constant_time, TokenStore};
+use native_birth::{stop_locked, NativeCustody};
 use polaris_helper_proto::{Request, Response, ResponseKind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,7 +45,10 @@ struct ChildState {
     pid: Option<u32>,
     closing: bool,
     native: Option<NativeCustody>,
-    terminal: std::collections::VecDeque<polaris_helper_proto::HelperBirthTarget>,
+    terminal: std::collections::VecDeque<(
+        polaris_helper_proto::HelperBirthTarget,
+        Option<polaris_helper_proto::core_protocol::CallerIdentity>,
+    )>,
 }
 
 /// Windows helper 核心分派器（移植自 `helper.go` 的 `handle()` + 模块级 `mu/child/childDone`）。
@@ -285,7 +288,9 @@ where
         if let Some(peer) = peer {
             let allowed = self.child_mu.lock().is_ok_and(|mut state| {
                 if let Some(target) = state.native.as_ref().map(|native| native.target) {
-                    if self.proc.poll_native_child(target) == crate::platform::windows::ops::NativeChildPoll::Exited {
+                    if self.proc.poll_native_child(target)
+                        == crate::platform::windows::ops::NativeChildPoll::Exited
+                    {
                         let _ = native_birth::cache_exit(&mut state, self.proc.as_ref(), target);
                     }
                 }
@@ -297,7 +302,10 @@ where
             if !allowed
                 && !matches!(
                     req,
-                    Request::Ping | Request::Version | Request::CoreStatus { .. }
+                    Request::Ping
+                        | Request::Version
+                        | Request::CoreStatus { .. }
+                        | Request::NativeStopBirth { .. }
                 )
             {
                 return HandleOutcome::Respond(Response::Err(
@@ -309,6 +317,26 @@ where
             }
         }
         match req {
+            Request::PrepareHelperUpgrade | Request::CancelHelperUpgrade => {
+                if !peer.is_some_and(|peer| peer.administrator) {
+                    return HandleOutcome::AuthFailed;
+                }
+                let Ok(mut state) = self.child_mu.lock() else {
+                    return native_busy();
+                };
+                if state.pid.is_some()
+                    || state.native.is_some()
+                    || !self.proc.native_custody_empty()
+                {
+                    return native_busy();
+                }
+                state.closing = matches!(req, Request::PrepareHelperUpgrade);
+                HandleOutcome::Respond(Response::Ok(if state.closing {
+                    ResponseKind::HelperUpgradeAdmitted
+                } else {
+                    ResponseKind::HelperUpgradeCancelled
+                }))
+            }
             Request::CoreStatus { id } => {
                 HandleOutcome::Respond(Response::Ok(ResponseKind::CoreStatus(
                     crate::pinned_core::status(Some(&self.derived_core_dir()), &id),
@@ -411,7 +439,9 @@ where
             Request::NativeStartBirth(_) => HandleOutcome::Respond(Response::Err(
                 polaris_helper_proto::Error::new(polaris_helper_proto::ErrorCode::Unknown),
             )),
-            Request::NativeStatusBirth if peer.is_some() => self.handle_native_status(peer.expect("peer guarded")),
+            Request::NativeStatusBirth if peer.is_some() => {
+                self.handle_native_status(peer.expect("peer guarded"))
+            }
             Request::NativeStopBirth { target } if peer.is_some() => {
                 self.handle_native_stop(target, peer.expect("peer guarded"))
             }

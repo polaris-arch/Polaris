@@ -26,15 +26,15 @@ use std::time::Instant;
 use crate::line_io;
 use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
-    Error as ProtoError, ErrorCode, HelperBirthToken, LinuxBirthStart, LinuxBirthStatus,
-    LinuxBirthStop, LinuxDns, Response, ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
-    parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches,
+    parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode,
+    HelperBirthToken, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns, Response,
+    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
 };
 
 use crate::platform::linux::auth::{
-    AuthError, PeerCred, PeerCredProvider, is_authorized, owned_by, supplementary_groups,
+    is_authorized, owned_by, supplementary_groups, AuthError, PeerCred, PeerCredProvider,
 };
-use crate::platform::linux::freeport::{FreePortDeps, free_port, parse_ss_pids};
+use crate::platform::linux::freeport::{free_port, parse_ss_pids, FreePortDeps};
 use crate::platform::linux::ops::SystemdOps;
 use crate::platform::linux::resolved_dns::ResolvedDnsOps;
 use crate::platform::linux::state::{
@@ -174,17 +174,48 @@ pub fn handle<P, S, D, SD>(
         return;
     }
 
-    // resolved 操作不依赖受管核状态，且可能等待多个有界子进程；不能持有全局 child 锁阻塞 stop/status。
-    match command.as_str() {
-        lcmd::RESOLVED_DNS_SET => {
-            handle_resolved_dns_set(deps.resolved_dns, conn);
+    // Reserve native ownership before a slow DNS operation, then release the
+    // child mutex so the owner can still stop/status its retained birth.
+    if matches!(
+        command.as_str(),
+        lcmd::RESOLVED_DNS_SET | lcmd::RESOLVED_DNS_REVERT
+    ) {
+        let Ok(mut guard) = state.lock() else {
+            let _ = conn.write_line("ERR unknown");
+            return;
+        };
+        if guard.upgrade_closed
+            || guard.dns_busy
+            || guard
+                .dns_owner
+                .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+            || !deps.spawner.caller_allowed(
+                cred.uid,
+                guard.child.as_ref().map(ManagedChild::handle),
+                None,
+            )
+        {
+            let _ = conn.write_line("ERR slot-owned-or-control-busy");
             return;
         }
-        lcmd::RESOLVED_DNS_REVERT => {
-            handle_resolved_dns_revert(deps.resolved_dns, conn);
-            return;
+        guard.dns_busy = true;
+        if guard.dns_owner.is_none() {
+            guard.dns_owner = Some(cred.uid);
         }
-        _ => {}
+        drop(guard);
+        let reverting = command == lcmd::RESOLVED_DNS_REVERT;
+        let success = if reverting {
+            handle_resolved_dns_revert(deps.resolved_dns, conn)
+        } else {
+            handle_resolved_dns_set(deps.resolved_dns, conn)
+        };
+        if let Ok(mut guard) = state.lock() {
+            guard.dns_busy = false;
+            if reverting && success && guard.child.is_none() {
+                guard.dns_owner = None;
+            }
+        }
+        return;
     }
 
     // 5. 持锁按 command 分发（Go: mu.Lock(); defer mu.Unlock()）。
@@ -213,6 +244,34 @@ fn dispatch_locked<P, S, D, SD>(
     SD: SystemdOps,
 {
     match command {
+        cmd::PREPARE_HELPER_UPGRADE | cmd::CANCEL_HELPER_UPGRADE => {
+            if cred.uid != 0 {
+                let _ = conn.write_line("ERR unauthorized");
+                return;
+            }
+            if !matches!(conn.read_line_strict(), Ok(None)) {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            }
+            if state.dns_busy
+                || state.dns_owner.is_some()
+                || !matches!(
+                    deps.spawner
+                        .birth_admission(state.child.as_ref().map(ManagedChild::handle)),
+                    BirthAdmission::Admitted
+                )
+            {
+                let _ = conn.write_line("ERR helper-upgrade-busy");
+                return;
+            }
+            state.child = None;
+            state.upgrade_closed = command == cmd::PREPARE_HELPER_UPGRADE;
+            let _ = conn.write_line(if state.upgrade_closed {
+                "OK helper-upgrade-admitted"
+            } else {
+                "OK helper-upgrade-cancelled"
+            });
+        }
         cmd::CORE_STATUS => {
             let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict())
             else {
@@ -230,14 +289,12 @@ fn dispatch_locked<P, S, D, SD>(
             let _ = conn.write_line(&response.to_wire_line());
         }
         lcmd::STATUS_BIRTH_SAFE => {
-            if caller_owns_slot(state, cred, conn) {
+            if caller_owns_slot(state, deps.spawner, cred, conn) {
                 handle_birth_status(state, deps, conn);
             }
         }
         lcmd::STOP_BIRTH_SAFE => {
-            if caller_owns_slot(state, cred, conn) {
-                handle_birth_stop(state, deps, conn);
-            }
+            handle_birth_stop(state, deps, cred, conn);
         }
         lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn, true, true),
         // Retired executable-path/content-write commands never dispatch, even
@@ -258,12 +315,17 @@ fn dispatch_locked<P, S, D, SD>(
     }
 }
 
-fn caller_owns_slot(state: &HandlerState, cred: &PeerCred, conn: &mut impl Conn) -> bool {
-    if state
-        .child
-        .as_ref()
-        .is_some_and(|child| !child.handle().caller_allowed(cred.uid))
-    {
+fn caller_owns_slot(
+    state: &HandlerState,
+    spawner: &impl CoreSpawner,
+    cred: &PeerCred,
+    conn: &mut impl Conn,
+) -> bool {
+    if !spawner.caller_allowed(
+        cred.uid,
+        state.child.as_ref().map(ManagedChild::handle),
+        None,
+    ) {
         let _ = conn.write_line("ERR slot-owned-by-other-user");
         false
     } else {
@@ -309,7 +371,7 @@ fn legacy_command_rejected(
 
 // ===== 各命令处理（逐分支对照 Go 源）=====
 
-fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
+fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> bool {
     let interface_name = conn.read_line();
     let server_ip = conn.read_line();
     let response = match ops.takeover(&interface_name, &server_ip) {
@@ -319,10 +381,12 @@ fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
             single_line_wire_detail(&error),
         )),
     };
+    let success = matches!(response, Response::Ok(_));
     let _ = conn.write_line(&response.to_wire_line());
+    success
 }
 
-fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
+fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> bool {
     let interface_name = conn.read_line();
     let response = match ops.revert(&interface_name) {
         Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Reverted)),
@@ -331,7 +395,9 @@ fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
             single_line_wire_detail(&error),
         )),
     };
+    let success = matches!(response, Response::Ok(_));
     let _ = conn.write_line(&response.to_wire_line());
+    success
 }
 
 /// helper wire 一次响应只能占一行；resolvectl stderr 可能含换行，必须先压平，避免截断诊断或注入伪帧。
@@ -392,6 +458,7 @@ fn handle_birth_status<P, S, D, SD>(
 fn handle_birth_stop<P, S, D, SD>(
     state: &mut HandlerState,
     deps: &HandlerDeps<'_, P, S, D, SD>,
+    cred: &PeerCred,
     conn: &mut impl Conn,
 ) where
     P: PeerCredProvider,
@@ -411,6 +478,14 @@ fn handle_birth_stop<P, S, D, SD>(
         let _ = conn.write_line("ERR bad-args");
         return;
     };
+    if !deps.spawner.caller_allowed(
+        cred.uid,
+        state.child.as_ref().map(ManagedChild::handle),
+        Some(&target),
+    ) {
+        let _ = conn.write_line("ERR slot-owned-by-other-user");
+        return;
+    }
     if let Some(current) = state.child.as_ref().map(ManagedChild::handle) {
         match current.target() {
             Some(current) if current != target => {
@@ -616,6 +691,18 @@ fn handle_start<P, S, D, SD>(
     D: FreePortDeps,
     SD: SystemdOps,
 {
+    if state.upgrade_closed {
+        let _ = conn.write_line("ERR helper-upgrade-admission-closed");
+        return;
+    }
+    if state.dns_busy
+        || state
+            .dns_owner
+            .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+    {
+        let _ = conn.write_line("ERR slot-owned-or-control-busy");
+        return;
+    }
     // :401-405: 读 singbox / cfg / log / fwd / ppid 行。
     let (singbox, cfg, log_path, fwd, ppid_str) = if exact {
         let (Ok(Some(singbox)), Ok(Some(cfg)), Ok(Some(log)), Ok(Some(fwd))) = (
@@ -667,7 +754,7 @@ fn handle_start<P, S, D, SD>(
     } else {
         None
     };
-    if !caller_owns_slot(state, cred, conn) {
+    if !caller_owns_slot(state, deps.spawner, cred, conn) {
         return;
     }
     if let Some(id) = &id {

@@ -13,7 +13,13 @@ pub fn desktop_release_identity(selection: &Value) -> Option<(&str, &str)> {
         })
     }
     if selection["schema"] != "polaris-app-release-selection-v1"
-        || selection["contractPath"] != "scripts/desktop-core/release-contract.json"
+        || !matches!(
+            selection["contractPath"].as_str(),
+            Some(
+                "scripts/desktop-core/release-contract.json"
+                    | "scripts/desktop-core/pending-release-contract.json"
+            )
+        )
         || !hex(&selection["contractSha256"], 64)
         || !hex(&selection["sourceCommit"], 40)
         || !hex(&selection["sourceTree"], 40)
@@ -28,14 +34,17 @@ pub fn desktop_release_identity(selection: &Value) -> Option<(&str, &str)> {
         return None;
     }
     let version = selection["version"].as_str()?;
-    let suffix = version.strip_prefix("1.15.0-alpha.12.polaris.")?;
-    if !suffix
-        .bytes()
-        .next()
-        .is_some_and(|b| (b'1'..=b'9').contains(&b))
-        || !suffix.bytes().all(|b| b.is_ascii_digit())
-        || selection["tag"].as_str()? != format!("v{version}")
-    {
+    let valid_version = version == "1.15.0-alpha.12"
+        || version
+            .strip_prefix("1.15.0-alpha.12.polaris.")
+            .is_some_and(|suffix| {
+                suffix
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| (b'1'..=b'9').contains(&b))
+                    && suffix.bytes().all(|b| b.is_ascii_digit())
+            });
+    if !valid_version || selection["tag"].as_str()? != format!("v{version}") {
         return None;
     }
     Some((version, selection["sourceTree"].as_str()?))

@@ -5,6 +5,7 @@ fn linux() -> CoreManifest {
         version: "1.15.0-alpha.12.polaris.1".into(),
         provider_fingerprint: "a".repeat(64),
         helper_sha256: None,
+        cleaner_sha256: None,
         files: vec![
             CoreFile {
                 name: "sing-box".into(),

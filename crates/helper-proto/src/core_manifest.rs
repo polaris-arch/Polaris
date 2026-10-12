@@ -38,6 +38,7 @@ pub struct CoreManifest {
     pub provider_fingerprint: String,
     pub files: Vec<CoreFile>,
     pub helper_sha256: Option<String>,
+    pub cleaner_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +48,37 @@ pub struct InstalledCoreManifest {
     pub id: String,
     pub app_version: String,
     pub core: CoreManifest,
+}
+
+/// Administrative helper receipt, independent of each immutable kernel id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstalledHelperRecord {
+    pub schema: String,
+    pub version: String,
+    pub protocol: u32,
+    pub build_identity: String,
+    pub sha256: String,
+}
+impl InstalledHelperRecord {
+    pub fn parse(raw: &[u8]) -> Result<Self, &'static str> {
+        if raw.len() > 4096 {
+            return Err("helper-record-too-large");
+        }
+        let record: Self = serde_json::from_slice(raw).map_err(|_| "helper-record-invalid")?;
+        if record.schema != "polaris-helper-installed-v1"
+            || record.protocol == 0
+            || record.version.len() > 128
+            || !crate::build_identity::is_wire_safe(&record.build_identity)
+        {
+            return Err("helper-record-invalid");
+        }
+        CoreId::parse(&record.sha256)?;
+        Ok(record)
+    }
+    pub fn to_json(&self) -> Result<Vec<u8>, &'static str> {
+        serde_json::to_vec(self).map_err(|_| "helper-record-invalid")
+    }
 }
 
 impl InstalledCoreManifest {
@@ -99,6 +131,12 @@ impl CoreManifest {
         }
         CoreId::parse(&self.provider_fingerprint)?;
         if let Some(hash) = &self.helper_sha256 {
+            CoreId::parse(hash)?;
+        }
+        if let Some(hash) = &self.cleaner_sha256 {
+            if platform != Platform::Win {
+                return Err("cleaner-platform-invalid");
+            }
             CoreId::parse(hash)?;
         }
         let mut names = std::collections::BTreeSet::new();

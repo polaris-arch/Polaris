@@ -309,6 +309,8 @@ pub fn parse_request(cmd: &str, args: &[&str]) -> Option<Request> {
     let mut iter = args.iter();
     let mut next_line = || iter.next().copied().unwrap_or("");
     Some(match cmd {
+        command::common::PREPARE_HELPER_UPGRADE if args.is_empty() => Request::PrepareHelperUpgrade,
+        command::common::CANCEL_HELPER_UPGRADE if args.is_empty() => Request::CancelHelperUpgrade,
         command::common::CORE_STATUS if args.len() == 1 => Request::CoreStatus {
             id: polaris_helper_proto::core_manifest::CoreId::parse(args[0]).ok()?,
         },

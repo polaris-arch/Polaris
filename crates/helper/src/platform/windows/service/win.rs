@@ -14,32 +14,32 @@
 use crate::platform::windows::helper::{FlushMode, WinHelper};
 use crate::platform::windows::logic;
 use crate::platform::windows::winproc::WinProcOps;
-use crate::platform::windows::{DEFAULT_SUPPORT_DIR, PIPE_NAME, PIPE_SDDL, SERVICE_NAME};
+use crate::platform::windows::{PIPE_NAME, PIPE_SDDL, SERVICE_NAME};
 use crate::token::FileTokenStore;
 use polaris_helper_proto::codec::MAX_FRAME_BYTES;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use std::sync::Arc;
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, FALSE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-use windows_sys::Win32::System::IO::CancelIoEx;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-    SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW,
-    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
+    RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
+use windows_sys::Win32::System::IO::CancelIoEx;
 
 /// 命名管道实例数（accept 循环预创建的并行实例）。镜像 go-winio 默认行为。
 const PIPE_INSTANCES: u32 = 4;
@@ -80,8 +80,6 @@ static SERVICE_HELPER: std::sync::OnceLock<Arc<ProductionHelper>> = std::sync::O
 
 /// 服务运行配置（main 解析 flags 后构造）。
 pub struct ServiceConfig {
-    pub singbox_bin: String,
-    pub conf_dir: String,
     /// support 目录；受保护内核目录是它下面的 `core\`（install-core 分支自行派生，不单列字段 ——
     /// 多一个可注入的核路径入口正是 P4 要收掉的东西）。
     pub support_dir: String,
@@ -89,11 +87,9 @@ pub struct ServiceConfig {
 
 impl ServiceConfig {
     #[must_use]
-    pub fn default_with(singbox_bin: impl Into<String>, conf_dir: impl Into<String>) -> Self {
+    pub fn default_with_support(support_dir: impl Into<String>) -> Self {
         Self {
-            singbox_bin: singbox_bin.into(),
-            conf_dir: conf_dir.into(),
-            support_dir: DEFAULT_SUPPORT_DIR.to_owned(),
+            support_dir: support_dir.into(),
         }
     }
 }
@@ -129,15 +125,7 @@ fn build_helper(cfg: &ServiceConfig) -> ProductionHelper {
     let token = FileTokenStore::new(&cfg.support_dir);
     let proc = WinProcOps::new();
     let net = WinProcOps::new();
-    WinHelper::new(
-        token,
-        proc,
-        net,
-        &cfg.singbox_bin,
-        &cfg.conf_dir,
-        SERVICE_NAME,
-        &cfg.support_dir,
-    )
+    WinHelper::new(token, proc, net, "", "", SERVICE_NAME, &cfg.support_dir)
 }
 
 /// HANDLE（`*mut c_void`）的 Send 包装，用于把管道句柄移入 spawned 线程。
@@ -701,7 +689,7 @@ fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32, accepts: u32) -> std::i
             .saturating_add(1);
     }
     status.dwWaitHint = 30000; // 30s
-    // SAFETY: SetServiceStatus 报状态。
+                               // SAFETY: SetServiceStatus 报状态。
     let ok = unsafe { SetServiceStatus(handle, &status) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error());

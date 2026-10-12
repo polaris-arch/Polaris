@@ -55,6 +55,7 @@ pub(crate) fn selected_manifest(platform: &str) -> Result<CoreManifest, String> 
             .to_string(),
         files,
         helper_sha256: None,
+        cleaner_sha256: None,
     };
     manifest
         .validate()
@@ -180,11 +181,24 @@ pub(crate) fn stage_installation(
         directory,
         manifest,
     };
+    let cleaner = if platform == "win" {
+        Some((
+            "polaris-cleaner.exe",
+            None,
+            selected
+                .cleaner_sha256
+                .as_deref()
+                .ok_or("CORE_BUNDLE_MISMATCH: compiled cleaner hash unavailable")?,
+        ))
+    } else {
+        None
+    };
     for (name, expected_bytes, expected_hash) in selected
         .files
         .iter()
         .map(|file| (file.name.as_str(), Some(file.bytes), file.sha256.as_str()))
         .chain(std::iter::once((helper_name, None, expected_helper)))
+        .chain(cleaner)
     {
         let (mut input, bytes) = objects
             .open_regular(name)
@@ -220,7 +234,10 @@ pub(crate) fn stage_installation(
             fs::set_permissions(
                 &path,
                 fs::Permissions::from_mode(
-                    if name == helper_name || name.starts_with("sing-box") {
+                    if name == helper_name
+                        || name == "polaris-cleaner.exe"
+                        || name.starts_with("sing-box")
+                    {
                         0o700
                     } else {
                         0o600

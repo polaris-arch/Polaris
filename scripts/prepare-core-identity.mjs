@@ -52,6 +52,7 @@ if (mode !== 'prepare') {
     for (const expected of [row.core, ...(row.sidecar ? [row.sidecar] : [])]) actualCoreFile(join(directory, expected.member), expected);
     const helper = platform === 'win' ? 'polaris-helper.exe' : 'polaris-helper';
     if (actualCoreFile(join(directory, helper)).sha256 !== old.core.helperSha256) throw Error('Final helper bytes differ from manifest');
+    if (platform === 'win' && actualCoreFile(join(directory, 'polaris-cleaner.exe')).sha256 !== old.core.cleanerSha256) throw Error('Final cleaner bytes differ from manifest');
     if (old.core.version !== contract.version || old.core.providerFingerprint !== row.providerFingerprint) throw Error('Final selected identity differs');
     console.log(`verified-core-id ${old.id}`);
     process.exit(0);

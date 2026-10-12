@@ -67,6 +67,12 @@ fn embed_selected_core_identity() {
                 manifest.core.helper_sha256.is_some(),
                 "actual helper hash required"
             );
+            if platform == "win" {
+                assert!(
+                    manifest.core.cleaner_sha256.is_some(),
+                    "actual cleaner hash required"
+                );
+            }
             raw
         }
         // Library tests/mobile/debug source compilation do not create a desktop

@@ -22,10 +22,10 @@
 //! socket 权限 0666（任何本地进程可连）—— **token 行是唯一安全边界**（见 [`crate::token`]）。
 //! 0666 是为让普通用户 app 能连；远程不可达（unix socket 仅本机）。
 
-use crate::line_io::{BoundedLineError, read_line_trimmed_bounded, write_line};
-use crate::platform::macos::handler::{MacConfig, MacServices, dispatch_from_peer};
+use crate::line_io::{read_line_trimmed_bounded, write_line, BoundedLineError};
+use crate::platform::macos::handler::{dispatch_from_peer, MacConfig, MacServices};
 use polaris_helper_proto::request::RouteParams;
-use polaris_helper_proto::{Request, parse_stop_pid};
+use polaris_helper_proto::{parse_stop_pid, Request};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -107,6 +107,19 @@ pub fn decode_request<I: Iterator<Item = String>>(
         return Err(DecodeError::LineTooLong);
     }
     match command {
+        polaris_helper_proto::command::common::PREPARE_HELPER_UPGRADE
+        | polaris_helper_proto::command::common::CANCEL_HELPER_UPGRADE => {
+            if checked_line(lines, None)?.is_some() {
+                return Err(DecodeError::MissingArg("exact upgrade frame"));
+            }
+            Ok(
+                if command == polaris_helper_proto::command::common::PREPARE_HELPER_UPGRADE {
+                    Request::PrepareHelperUpgrade
+                } else {
+                    Request::CancelHelperUpgrade
+                },
+            )
+        }
         polaris_helper_proto::command::common::CORE_STATUS => {
             let raw = required_line(lines, "core id")?;
             if checked_line(lines, None)?.is_some() {
@@ -406,21 +419,21 @@ fn write_response<W: Write>(writer: &mut W, resp: &polaris_helper_proto::Respons
 mod sys {
     use super::*;
     use crate::platform::accept_retry::{
-        ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL, AcceptAction, LogThrottle, classify_accept_error,
+        classify_accept_error, AcceptAction, LogThrottle, ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL,
     };
     use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
-    use crate::platform::macos::exec::{CommandRunner, EXEC_TIMEOUT, SystemRunner};
+    use crate::platform::macos::exec::{CommandRunner, SystemRunner, EXEC_TIMEOUT};
     use crate::platform::macos::handler::{ChildHandle, SpawnError, TerminateOutcome};
     use crate::platform::macos::native_birth::{NativeBirth, NativeChild, NativeCustody};
     use crate::platform::macos::proc_start::{
-        AliveProbe, WATCH_TICK_INTERVAL, classify_alive, kill_zero_exists, proc_start_time,
+        classify_alive, kill_zero_exists, proc_start_time, AliveProbe, WATCH_TICK_INTERVAL,
     };
     use crate::token::{FileTokenStore, TokenStore};
     use nix::sys::signal::Signal;
-    use polaris_helper_proto::StartParams;
     use polaris_helper_proto::response::{
         NativeBirthStart, NativeBirthStatus, NativeBirthStop, StartTiming,
     };
+    use polaris_helper_proto::StartParams;
     use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
@@ -626,6 +639,9 @@ mod sys {
     }
 
     impl MacServices for DaemonServices {
+        fn upgrade_admission(&self, close: bool) -> bool {
+            self.native.upgrade_admission(close)
+        }
         fn token_for_peer(&self, uid: Option<u32>) -> String {
             uid.and_then(|uid| {
                 crate::user_control::token(
@@ -679,6 +695,9 @@ mod sys {
         }
         fn native_stop(&self, target: HelperBirthTarget) -> NativeBirthStop {
             self.native.stop(target)
+        }
+        fn native_stop_allowed(&self, uid: Option<u32>, target: HelperBirthTarget) -> bool {
+            self.native.caller_may_stop(uid, target)
         }
         fn native_custody_active(&self) -> bool {
             self.native.active()
@@ -899,7 +918,7 @@ mod sys {
 }
 
 #[cfg(target_os = "macos")]
-pub use sys::{DaemonServices, serve};
+pub use sys::{serve, DaemonServices};
 
 #[cfg(test)]
 mod tests;

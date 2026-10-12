@@ -1,5 +1,23 @@
 use super::*;
 #[test]
+fn native_sid_has_one_canonical_namespace_key() {
+    let sid = CallerIdentity::windows("S-1-5-21-1-2-3-1000").unwrap();
+    assert_eq!(sid.key(), "sS-1-5-21-1-2-3-1000");
+    for invalid in [
+        "S-1-05-21-1",
+        "S-1-5-21-01",
+        "S-2-5-21-1",
+        "S-1-5-4294967296",
+        "S-1-281474976710656-1",
+        "S-1-5-21\n--root",
+    ] {
+        assert!(
+            CallerIdentity::windows(invalid).is_none(),
+            "accepted {invalid}"
+        );
+    }
+}
+#[test]
 fn pinned_start_admits_only_exact_frames() {
     let valid = vec![
         "a".repeat(64),

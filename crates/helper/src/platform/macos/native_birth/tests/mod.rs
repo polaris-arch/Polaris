@@ -1,4 +1,15 @@
 use super::*;
+#[test]
+fn cached_stop_receipt_keeps_the_original_user_owner() {
+    let custody = NativeCustody::default();
+    let old = target(42, 1);
+    custody.slot().stopped.push_back((old, Some(1000)));
+    assert!(custody.caller_may_stop(Some(1000), old));
+    assert!(custody.caller_may_stop(Some(0), old));
+    assert!(!custody.caller_may_stop(Some(1001), old));
+    assert!(!custody.caller_may_stop(None, old));
+    assert_eq!(custody.stop(old), NativeBirthStop::Stopped { target: old });
+}
 use polaris_helper_proto::HelperBirthToken;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;

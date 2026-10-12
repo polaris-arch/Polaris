@@ -22,11 +22,13 @@ repository.workspace = true
 
 [dependencies]
 polaris-helper-proto = { path = "../helper-proto" }
+polaris-helper-client = { path = "../helper-client" }
 polaris-log-budget = { path = "../log-budget" }
 # 以下四个是**跨平台**依赖（纯 Rust，无 OS 绑定），三平台编译单元都可能用到，故不 target-gate：
 # sha2/hex = core_install 的内核 sha256 校验 + hex 编码（共用层，mac/linux 都走）。
 sha2 = "0.11"
 hex = "0.4"
+semver = "1"
 # thiserror = win 的 HelperError/HandlerError + linux 的 ServerError/SpawnError 枚举 derive。
 thiserror = "2"
 # log = win SCM 服务日志 + winproc 旁路 stderr 的 facade（生产侧由 host 接管）。

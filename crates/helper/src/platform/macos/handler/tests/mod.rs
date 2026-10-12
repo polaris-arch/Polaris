@@ -210,8 +210,6 @@ fn legacy_requests_cannot_bypass_native_custody_or_apply_forwarding() {
 
 fn test_config() -> MacConfig {
     MacConfig::new(
-        "/usr/local/lib/polaris/sing-box",
-        "/Users/test/Polaris",
         "/Library/Application Support/Polaris",
         "/Library/Application Support/Polaris/core",
     )

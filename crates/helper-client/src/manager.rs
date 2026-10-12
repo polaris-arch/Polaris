@@ -539,6 +539,8 @@ const RECOVERY_POLL_DELAY: Duration = Duration::from_millis(500);
 /// escalation 本身的三态（成功/取消/失败）由 [`EscalationOutcome`] 表达（非 `Err`）—— 用户取消是正常流程，不是错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
+    #[error("安装身份参数无效: {0}")]
+    InvalidInstallation(&'static str),
     /// helper 源二进制缺失（构建未包含），对齐 上游 `!fs.existsSync(srcBinary)`。
     #[error("helper 二进制缺失: {0}")]
     HelperBinaryMissing(PathBuf),
@@ -561,71 +563,19 @@ pub enum ManagerError {
 /// 各平台按需取用，无关字段忽略（移植锚点见各字段）。
 #[derive(Debug, Clone)]
 pub struct InstallParams {
-    /// 源 helper 二进制（app 资源内 `polaris-helper`，脚本拷到特权路径）。
-    /// 上游: `resourceManager.getMacHelperPath()` / `getLinuxHelperPath()` / `getWinHelperPath()`。
-    ///
-    /// # 🔴 这个字段的**所在目录是否对普通用户可写，决定了一条提权链通不通**
-    ///
-    /// 各平台的安装脚本都以提权身份把它拷到特权落点再注册成 root/SYSTEM 服务，**拷贝前不做任何
-    /// 签名 / hash 校验**（Windows 见本模块的 `build_win_install_script`，mac/linux 同形）。于是「谁能写这个
-    /// 路径」就等于「谁能决定那个 root 服务跑什么代码」——受信提权动作读的是一个不受信的源。
-    ///
-    /// 路径由调用方解析（app 侧 `runtime/helper.rs::resolve_helper_binary`，取随包资源目录），所以
-    /// 这件事**由装机形态决定**，不由本 crate 保证：
-    ///
-    /// - macOS：`/Applications/Polaris.app`；Linux：`/usr/lib/Polaris`（deb）—— 均 root-owned，链断开。
-    /// - **Windows：当前形态 `installMode: currentUser` ⇒ app 与随包 `polaris-helper.exe` 落
-    ///   `%LOCALAPPDATA%\Polaris`，同账户 Medium IL 进程可写 ⇒ 这条链当前是通的**：攻击者可在那一次
-    ///   UAC 提权发生**之前**替换它，受信安装随后把他的 exe 装成 LocalSystem 服务。
-    ///   这是**已知残留、如实登记**，不是「已经修好了」。
-    ///
-    /// 为什么不靠改 `installMode` 修：`perMachine` 会把 app 落到 `%PROGRAMFILES%\Polaris`（Users 只读，
-    /// 链断开），但 Tauri NSIS 模板给 per-machine 的落点只有 `$PROGRAMFILES64` / `$PROGRAMFILES`，
-    /// 且必发 `RequestExecutionLevel admin` ⇒ 与「标准用户也能自己装」**结构性互斥**。产品决策选了后者
-    /// （2026-09-16），所以这条链得换别的堵法（签名 / 安装前校验 / 把源换到不可写目录），
-    /// 不是换一个 conf 取值。`scripts/verify-packaging.mjs` 的 `checkWindowsInstallMode` 钉的是
-    /// 「这个取值必须被显式写下来」，不是钉某一个值。
-    ///
-    /// 其它残留（同样诚实登记）：无代码签名 ⇒ 不防「安装包 / 更新包在分发链路被篡改」；
-    /// 本地管理员本就在威胁模型之外。
+    /// Complete private stage, frozen by the App before administrator approval.
+    pub manifest_path: PathBuf,
+    pub manifest_sha256: String,
+    pub core_id: polaris_helper_proto::core_manifest::CoreId,
+    pub helper_sha256: String,
+    pub helper_version: String,
+    pub user_identity: polaris_helper_proto::core_protocol::CallerIdentity,
+    /// Private stage helper. Administrator scripts copy and hash it before execution.
+    /// Same-account replacement of the whole App remains outside this byte receipt.
     pub src_binary: PathBuf,
-    /// 安装脚本用来**播种**受保护核目录的源文件（三平台同构；P4 起含 win）。
-    ///
-    /// 唯一的生产装配点（`src-tauri/src/runtime/helper.rs::install_params`）传的是
-    /// `crate::runtime::proxy::resolve_core_binary()`：发行构型下它只解析打进安装包的资源目录，
-    /// 即随包核；用户配置目录、`PATH`、配置字段都不参与。debug / test 构型在它之前多一级开发态
-    /// 环境变量超驰（release 不编译）。
-    ///
-    /// 这个源文件在安全上**不构成信任锚点**：安装包本体若落在用户可写位置（Windows 的
-    /// `installMode: currentUser`、AppImage、便携版），随包核同样可被同账户进程改写。真要的是
-    /// 内容鉴权，不是换一个 seed 源。播种只在目标不存在时发生，随后的内容对账由起核前的
-    /// `reconcile_protected_core` → `install-core`（带 sha256 校验）负责，对账给不出一致结论时
-    /// 应用拒绝经提权助手起核。
-    ///
-    /// 上游: `resourceManager.getBundledSingBoxPath()`。
+    /// Staged core and sidecar, consumed against a root-sealed manifest via held FDs.
     pub bundled_core: PathBuf,
-    /// 用户 config/data 目录（`--confdir`；**linux 忽略**——核以登录用户跑，config 属主天然对）。
-    /// 上游: `getUserDataPath()`。
-    ///
-    /// # ⚠️ 多用户机器的已知限制（如实登记，本批不修）
-    ///
-    /// 这是**装 helper 的那个用户**的目录，会被烤进 Windows 服务的 `BinaryPathName`，而服务本身是
-    /// **机器级**的。helper 起核前用它做白名单前缀比对
-    /// （`crates/helper/src/platform/windows/logic.rs::cfg_allowed`，不符回 `ERR config-path-denied`，
-    /// `platform/windows/helper.rs:281`）。于是同一台机器上的第二个用户：
-    ///
-    /// - 看得到服务、`is_installed` 为真、buildId 相同 ⇒ **不会**被引导去修复/重装（`upgradeable`
-    ///   只看 proto 与 buildId）；
-    /// - 起 TUN 时 cfg 在自己的 profile 下 ⇒ 前缀失配 ⇒ `config-path-denied`；
-    /// - 他若手动重装 helper（一次 UAC），`--confdir` 被改烤成他的目录 ⇒ **换成第一个用户失效**。
-    ///
-    /// 这条限制来自「helper 是机器级服务、`--confdir` 却是安装它那个用户的目录」这一对错配，
-    /// 与装机形态无关。当前形态 `installMode: currentUser` 下它的**可达性较低**：app 是 per-user
-    /// 安装，同机第二个用户通常压根没装 Polaris，撞上需要两个用户各自装过。
-    /// 🔮 若将来改 `perMachine`，app 对全机可见（快捷方式在 All Users 开始菜单）⇒ 这条路径变得**常见**，
-    /// 届时它会从「登记的限制」升级成「必须先修的前置」。
-    /// **彻底修需要 helper 支持多 confdir / 按调用方会话解析**，超出本批（面 K）射程，
-    /// 故按字面登记而不是假装不存在。
+    /// Per-native-user config registration; never embedded in a machine service command.
     pub conf_dir: PathBuf,
     /// 授权 uid（linux 写 `authorized-uids`；**mac/win 忽略**）。上游(linux): `process.getuid()`。
     pub uid: u32,
@@ -648,6 +598,7 @@ impl HelperManager {
         params: &InstallParams,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
+        validate_install_params(self.platform, params)?;
         // ① 源二进制存在（Polaris: !fs.existsSync(srcBinary) → 缺失）。
         if !self.sysops.exists(&params.src_binary) {
             return Err(ManagerError::HelperBinaryMissing(params.src_binary.clone()));
@@ -657,7 +608,12 @@ impl HelperManager {
         // ③ 生成 root 安装脚本。
         let script = self.build_install_script(params, &token)?;
         // ④⑤ 落盘 + 提权 + 清理。
-        self.run_privileged_script(params, self.install_script_name(), &script, executor)
+        self.run_privileged_script(
+            &params.script_dir,
+            self.install_script_name(),
+            &script,
+            executor,
+        )
     }
 
     /// 卸载 helper（全流程，移植自三平台 `uninstall()` 的提权路径）。
@@ -696,16 +652,12 @@ impl HelperManager {
             return Err(ManagerError::UnsupportedPlatform(Platform::Win));
         }
         let script = self.build_uninstall_script();
-        // uninstall 脚本不依赖 InstallParams 的其它字段，仅需 script_dir 落盘。
-        let params = InstallParams {
-            src_binary: PathBuf::new(),
-            bundled_core: PathBuf::new(),
-            conf_dir: PathBuf::new(),
-            uid: 0,
-            script_dir: script_dir.to_path_buf(),
-        };
-        let outcome =
-            self.run_privileged_script(&params, self.uninstall_script_name(), &script, executor)?;
+        let outcome = self.run_privileged_script(
+            script_dir,
+            self.uninstall_script_name(),
+            &script,
+            executor,
+        )?;
         // 只有完整成功清 app 侧 token，取消/partial 保留以支持重试。
         if matches!(outcome, EscalationOutcome::Success) {
             self.clear_token();
@@ -757,13 +709,14 @@ impl HelperManager {
         params: &InstallParams,
         token: &str,
     ) -> Result<String, ManagerError> {
+        validate_install_params(self.platform, params)?;
         match self.platform {
             Platform::Mac => Ok(build_mac_install_script(&self.paths, params, token)),
             // Android/iOS 同 Other：无 helper 可装，本臂不可达（理由见 `InstallPaths::for_platform`）。
             // iOS 本处特有的那半句：脚本这个概念本身在 iOS 上没有承载物 —— 应用沙箱里没有可执行
             // 的 shell，写出来的 .sh 没有任何东西能跑它。
             Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
-                Ok(build_linux_install_script(&self.paths, params))
+                Ok(build_linux_install_script(&self.paths, params, token))
             }
             Platform::Win => Ok(build_win_install_script(&self.paths, params, token)),
         }
@@ -815,14 +768,14 @@ impl HelperManager {
     /// 脚本安全落盘（随机名 + 0700 + O_EXCL）→ 构造提权 [`Escalation`] → [`run_escalation`] → 清理脚本。
     fn run_privileged_script(
         &self,
-        params: &InstallParams,
+        script_dir: &Path,
         name: &str,
         script: &str,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
         // TOCTOU 加固（移植 HelperManager.ts:872-882）：私有 0700 目录 + 随机名 + O_EXCL 独占创建。
-        let script_path = write_secure_script(&params.script_dir, name, script)
-            .map_err(ManagerError::ScriptWrite)?;
+        let script_path =
+            write_secure_script(script_dir, name, script).map_err(ManagerError::ScriptWrite)?;
         let script_path_str = script_path.to_string_lossy().into_owned();
         let escalation = self.build_escalation(&script_path_str)?;
         let outcome = run_escalation(&escalation, executor);
@@ -846,6 +799,73 @@ impl HelperManager {
             Platform::Win => uac_escalation(script_path)?,
         })
     }
+}
+
+fn validate_install_params(platform: Platform, params: &InstallParams) -> Result<(), ManagerError> {
+    use polaris_helper_proto::{core_manifest::CoreId, core_protocol::CallerIdentity};
+    if CoreId::parse(&params.helper_sha256).is_err()
+        || CoreId::parse(&params.manifest_sha256).is_err()
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "missing actual byte hashes",
+        ));
+    }
+    let absolute = |path: &Path| {
+        let raw = path.to_string_lossy();
+        !raw.contains(['\0', '\n', '\r'])
+            && (path.is_absolute()
+                || platform == Platform::Win
+                    && raw.as_bytes().get(1) == Some(&b':')
+                    && matches!(raw.as_bytes().get(2), Some(b'\\' | b'/')))
+    };
+    if [
+        &params.src_binary,
+        &params.bundled_core,
+        &params.manifest_path,
+        &params.conf_dir,
+        &params.script_dir,
+    ]
+    .into_iter()
+    .any(|path| !absolute(path))
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "absolute single-line paths required",
+        ));
+    }
+    let split = |path: &Path| {
+        let raw = path.to_string_lossy();
+        raw.rsplit_once(['/', '\\'])
+            .map(|(parent, name)| (parent.to_owned(), name.to_owned()))
+    };
+    let manifest = split(&params.manifest_path);
+    let helper = split(&params.src_binary);
+    let core = split(&params.bundled_core);
+    if manifest
+        .as_ref()
+        .is_none_or(|(_, name)| name != "core-manifest.json")
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "invalid manifest basename",
+        ));
+    }
+    if helper.as_ref().map(|(parent, _)| parent) != manifest.as_ref().map(|(parent, _)| parent)
+        || core.as_ref().map(|(parent, _)| parent) != manifest.as_ref().map(|(parent, _)| parent)
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "installation files must share one private stage",
+        ));
+    }
+    match (&params.user_identity, platform) {
+        (CallerIdentity::Unix(uid), Platform::Linux | Platform::Mac) if *uid == params.uid => {}
+        (CallerIdentity::Windows(sid), Platform::Win) if CallerIdentity::windows(sid).is_some() => {
+        }
+        _ => {
+            return Err(ManagerError::InvalidInstallation(
+                "native source owner differs",
+            ))
+        }
+    }
+    Ok(())
 }
 
 // ===== 脚本安全落盘（TOCTOU 加固）=====
@@ -1000,7 +1020,7 @@ fn ps_quote(s: &str) -> String {
 ///
 /// `program` = HELPER_DEST（daemon 二进制特权路径）；argv = `--singbox <core/sing-box> --confdir <conf>
 /// --support <support> --coredir <core>`（对齐 daemon `macos/daemon.rs:parse_args` flag 名）。
-fn render_mac_plist(program: &str, core_dir: &str, conf_dir: &str, support_dir: &str) -> String {
+fn render_mac_plist(program: &str, core_dir: &str, support_dir: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -1010,8 +1030,6 @@ fn render_mac_plist(program: &str, core_dir: &str, conf_dir: &str, support_dir: 
   <key>ProgramArguments</key>\n\
   <array>\n\
     <string>{program}</string>\n\
-    <string>--singbox</string><string>{singbox}</string>\n\
-    <string>--confdir</string><string>{confdir}</string>\n\
     <string>--support</string><string>{support}</string>\n\
     <string>--coredir</string><string>{coredir}</string>\n\
   </array>\n\
@@ -1021,139 +1039,13 @@ fn render_mac_plist(program: &str, core_dir: &str, conf_dir: &str, support_dir: 
 </plist>",
         label = xml_escape(SERVICE_LABEL),
         program = xml_escape(program),
-        singbox = xml_escape(&format!("{core_dir}/sing-box")),
-        confdir = xml_escape(conf_dir),
         support = xml_escape(support_dir),
         coredir = xml_escape(core_dir),
     )
 }
 
-/// mac 安装脚本（bash，root 侧经 osascript 提权跑）。忠实迁自 HelperManager.ts:798-841。
-fn build_mac_install_script(paths: &InstallPaths, params: &InstallParams, token: &str) -> String {
-    let helper_dest = paths.binary.to_string_lossy();
-    // mac 恒有 plist（`InstallPaths::mac()` 建的），只有 Windows 是 None。
-    let plist_path = paths
-        .descriptor
-        .as_ref()
-        .expect("mac 必有 plist 描述符")
-        .to_string_lossy();
-    let core_dir = paths.core_dir.to_string_lossy();
-    let support = MAC_SUPPORT_DIR;
-    let conf_dir = params.conf_dir.to_string_lossy();
-    let src = params.src_binary.to_string_lossy();
-    let bundled_sb = params.bundled_core.to_string_lossy();
-
-    let plist = render_mac_plist(&helper_dest, &core_dir, &conf_dir, support);
-
-    format!(
-        "#!/bin/bash\n\
-set -e\n\
-umask 077\n\
-	SRC={src}\n\
-	DEST={dest}\n\
-	SUPPORT={support}\n\
-	PLIST={plist_path}\n\
-	LABEL={label_q}\n\
-	mkdir -p /Library/PrivilegedHelperTools \"$SUPPORT\"\n\
-# umask 077 会把新建目录设成 700 → 普通用户 app 无法穿越连 socket(EACCES)。目录须 755 可穿越\n\
-# （socket 内部仍靠 token 鉴权 + token 文件 600 保护）。\n\
-# chmod / chown 对最后一级会跟随符号链接，而父目录对 admin 组可写：先确认它是个真目录再动。\n\
-if [ -L \"$SUPPORT\" ] || [ ! -d \"$SUPPORT\" ]; then echo \"polaris-helper: refusing $SUPPORT: not a real directory\" >&2; exit 1; fi\n\
-chmod 755 /Library/PrivilegedHelperTools \"$SUPPORT\"\n\
-# 支持目录的属主显式归 root：它的父目录 /Library/Application Support 对 admin 组可写，\n\
-# 目录可能早就被别人建好了 —— 属主不是 root 的话，里面的 token、socket、受管核目录的名字都能被换掉。\n\
-chown -h root:wheel \"$SUPPORT\"\n\
-	printf '%s' {token} > \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
-chown root:wheel \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"; chmod 600 \"$SUPPORT/{HELPER_TOKEN_FILENAME}\"\n\
-COREDIR={core_dir}\n\
-BUNDLED_SB={bundled_sb}\n\
-mkdir -p \"$COREDIR\"\n\
-chown root:wheel \"$COREDIR\"; chmod 755 \"$COREDIR\"\n\
-if [ ! -x \"$COREDIR/sing-box\" ]; then\n\
-  cp \"$BUNDLED_SB\" \"$COREDIR/sing-box.seed.new\"\n\
-  mv -f \"$COREDIR/sing-box.seed.new\" \"$COREDIR/sing-box\"\n\
-  chown root:wheel \"$COREDIR/sing-box\"; chmod 755 \"$COREDIR/sing-box\"\n\
-  xattr -cr \"$COREDIR\" 2>/dev/null || true\n\
-  codesign --force --sign - \"$COREDIR/sing-box\" 2>/dev/null || true\n\
-fi\n\
-	TXDIR=$(mktemp -d \"$SUPPORT/helper-upgrade.XXXXXX\")\n\
-	NEW_HELPER=\"$DEST.new.$$\"\n\
-	NEW_PLIST=\"$PLIST.new.$$\"\n\
-	HAD_HELPER=0\n\
-	HAD_PLIST=0\n\
-	WAS_LOADED=0\n\
-	ROLLBACK_OK=1\n\
-	cleanup_staging() {{\n\
-	  rc=$?\n\
-	  trap - EXIT HUP INT TERM\n\
-	  rm -f \"$NEW_HELPER\" \"$NEW_PLIST\"\n\
-	  rm -rf \"$TXDIR\"\n\
-	  exit \"$rc\"\n\
-	}}\n\
-	rollback_install() {{\n\
-	  rc=$?\n\
-	  trap - EXIT HUP INT TERM\n\
-	  launchctl bootout \"system/$LABEL\" >/dev/null 2>&1 || true\n\
-	  if [ \"$HAD_HELPER\" -eq 1 ]; then\n\
-	    if cp \"$TXDIR/helper.rollback\" \"$NEW_HELPER\" && chown root:wheel \"$NEW_HELPER\" && chmod 755 \"$NEW_HELPER\" && mv -f \"$NEW_HELPER\" \"$DEST\"; then :; else ROLLBACK_OK=0; fi\n\
-	  elif ! rm -f \"$DEST\"; then ROLLBACK_OK=0; fi\n\
-	  if [ \"$HAD_PLIST\" -eq 1 ]; then\n\
-	    if cp \"$TXDIR/plist.rollback\" \"$NEW_PLIST\" && chown root:wheel \"$NEW_PLIST\" && chmod 644 \"$NEW_PLIST\" && mv -f \"$NEW_PLIST\" \"$PLIST\"; then :; else ROLLBACK_OK=0; fi\n\
-	  elif ! rm -f \"$PLIST\"; then ROLLBACK_OK=0; fi\n\
-	  if [ \"$WAS_LOADED\" -eq 1 ]; then\n\
-	    launchctl enable \"system/$LABEL\" >/dev/null 2>&1 || true\n\
-	    if ! launchctl bootstrap system \"$PLIST\"; then ROLLBACK_OK=0; fi\n\
-	  fi\n\
-	  rm -f \"$NEW_HELPER\" \"$NEW_PLIST\"\n\
-	  if [ \"$ROLLBACK_OK\" -eq 1 ]; then\n\
-	    rm -rf \"$TXDIR\"\n\
-	  else\n\
-	    echo \"polaris-helper rollback incomplete; recovery files kept at $TXDIR\" >&2\n\
-	  fi\n\
-	  exit \"$rc\"\n\
-	}}\n\
-	trap cleanup_staging EXIT\n\
-	trap 'exit 1' HUP INT TERM\n\
-	if [ -f \"$DEST\" ]; then cp \"$DEST\" \"$TXDIR/helper.rollback\"; HAD_HELPER=1; fi\n\
-	if [ -f \"$PLIST\" ]; then cp \"$PLIST\" \"$TXDIR/plist.rollback\"; HAD_PLIST=1; fi\n\
-	if launchctl print \"system/$LABEL\" >/dev/null 2>&1; then WAS_LOADED=1; fi\n\
-	cp \"$SRC\" \"$NEW_HELPER\"\n\
-	chown root:wheel \"$NEW_HELPER\"; chmod 755 \"$NEW_HELPER\"\n\
-	cat > \"$NEW_PLIST\" <<'POLARIS_PLIST_EOF'\n\
-	{plist}\n\
-	POLARIS_PLIST_EOF\n\
-	chown root:wheel \"$NEW_PLIST\"; chmod 644 \"$NEW_PLIST\"\n\
-	trap - EXIT HUP INT TERM\n\
-	trap rollback_install EXIT\n\
-	trap 'exit 1' HUP INT TERM\n\
-	if [ \"$WAS_LOADED\" -eq 1 ]; then\n\
-	  launchctl bootout \"system/$LABEL\"\n\
-	  WAIT=0\n\
-	  while launchctl print \"system/$LABEL\" >/dev/null 2>&1; do\n\
-	    WAIT=$((WAIT + 1))\n\
-	    if [ \"$WAIT\" -ge 50 ]; then echo \"old helper service did not stop\" >&2; exit 1; fi\n\
-	    sleep 0.1\n\
-	  done\n\
-	fi\n\
-	mv -f \"$NEW_HELPER\" \"$DEST\"\n\
-	mv -f \"$NEW_PLIST\" \"$PLIST\"\n\
-	launchctl enable \"system/$LABEL\" 2>/dev/null || true\n\
-	launchctl bootstrap system \"$PLIST\"\n\
-	launchctl print \"system/$LABEL\" >/dev/null\n\
-	trap - EXIT HUP INT TERM\n\
-	rm -rf \"$TXDIR\"\n\
-	echo installed-ok\n",
-        src = shell_quote(&src),
-        dest = shell_quote(&helper_dest),
-        support = shell_quote(support),
-        plist_path = shell_quote(&plist_path),
-        token = shell_quote(token),
-        core_dir = shell_quote(&core_dir),
-        bundled_sb = shell_quote(&bundled_sb),
-        plist = plist,
-        label_q = shell_quote(SERVICE_LABEL),
-    )
-}
+mod install_unix;
+use install_unix::{build_linux_install_script, build_mac_install_script};
 
 /// mac 卸载脚本（bash）。忠实迁自 HelperManager.ts:844-852。
 fn build_mac_uninstall_script(paths: &InstallPaths) -> String {
@@ -1220,187 +1112,6 @@ WantedBy=multi-user.target\n",
     )
 }
 
-/// linux 安装脚本（sh/bash，经 pkexec 提权跑）。忠实迁自 LinuxServiceHelper.ts:330-357。
-///
-/// 🔴 **authfile 权限是跨侧契约，不是本地口味**：读侧 `helper` 的
-/// `crates/helper/src/platform/linux/auth.rs`（`GROUP_OTHER_BITS = 0o077`，
-/// `authorize_uid` 见 `mode & 0o077 != 0` 即返回 `GroupOrOtherAccessible` 拒绝）——
-/// **accept 面 = root 属主 且 0600 或更严**。此处曾建成 `root:root 0644`，
-/// 落在读侧的拒绝分支上：装完 helper 对文件里**任何非 root uid 恒判 unauthorized**，
-/// Linux 的 SO_PEERCRED 授权腿整条不可用；且 repair 复用本脚本 ⇒ 人工修好的 0600 会被改回去。
-/// 由 `linux_install_script_chmods_authfile_0600_matching_helper_auth_contract` 钉死。
-///
-/// 无宽权限瞬窗：`touch` 的创建模式是 `0666 & ~umask`，pkexec 常见 umask 022 ⇒ 裸 `touch`
-/// 会先落地成 0644 再被 chmod 收紧（存在可读瞬窗）。故创建走 `(umask 077; touch …)` 子壳
-/// ——**不依赖**继承来的 umask，新建即 0600；随后的 `chmod 0600` 负责把既存的宽权限文件
-/// （老版本装出来的 0644）收紧，两者缺一不可。子壳只圈 touch，不影响脚本其余步骤的 umask。
-///
-/// 🔴 **脚本开头 `umask 022`，且三个目录的属主与权限显式定**：`mkdir -p` 的创建模式是
-/// `0777 & ~umask`，脚本经 pkexec 跑、umask 继承自调用环境 —— 宽松的 umask 会把
-/// `/usr/local/lib/polaris` 建成组可写乃至人人可写，而 helper 二进制与受管核目录都在它下面
-/// （对目录有写权就能把里面的名字换掉，不需要对文件本身有写权）。`chown`/`chmod` 不放在
-/// 「新建时」的分支里：老版本装出来的、已经是宽权限的目录也要在这里纠正。
-///
-/// 三个目录都经 `secure_dir` 一个一个处置，**先验后改**：`chown`/`chmod` 对路径最后一级会跟随
-/// 符号链接，而 Debian 系的 `/usr/local/lib` 对 `staff` 组可写 —— 那里的人可以抢先把我们的目录名
-/// 做成一个指向别处的链接，让 root 去改别处的属主与权限。故建完先看它是不是一个真目录，
-/// 不是就退出、什么都不改；`chown` 另带 `-h`。安装目录验过之后才去建它下面的受管核目录。
-///
-/// 受管核目录里**既有的内容**也要过一遍：目录权限曾经过宽的话，里面的核或配套库可能早被换过，
-/// 而播种只在核缺失时发生，换过的东西会一直留着。凡不是 root 所有、或组与其他人可写、或不是
-/// 常规文件的直接子项一律删掉（`find` 不跟随链接，`rm` 删的是链接本身），再按原逻辑播种。
-/// 不改成每次无条件重播：留下来的只可能是 root 所有、别人写不动的常规文件，其内容是否就是
-/// 现役核由起核前的 sha256 对账负责；无条件重播则会在随包核读不到时把整个安装打断。
-fn build_linux_install_script(paths: &InstallPaths, params: &InstallParams) -> String {
-    let helper_dest = paths.binary.to_string_lossy();
-    let core_dir = paths.core_dir.to_string_lossy();
-    let core_bin = format!("{core_dir}/sing-box");
-    let unit_path = paths
-        .descriptor
-        .as_ref()
-        .expect("linux 必有 systemd unit 描述符")
-        .to_string_lossy();
-    let src = params.src_binary.to_string_lossy();
-    let bundled_core = params.bundled_core.to_string_lossy();
-    // libcronet.so 若随包（naive 出站需）随核一并播种。
-    let bundled_cronet = params.bundled_core.parent().map_or_else(
-        || "libcronet.so".to_owned(),
-        |d| d.join("libcronet.so").to_string_lossy().into_owned(),
-    );
-    let unit = build_linux_unit(paths);
-    // INSTALL_DIR = helper 二进制父目录（/usr/local/lib/polaris），受管核目录也在它下面。
-    let install_dir = paths
-        .binary
-        .parent()
-        .map_or_else(|| paths.binary.clone(), Path::to_path_buf);
-
-    format!(
-        "#!/bin/sh\n\
-	set -eu\n\
-	umask 022\n\
-	DEST={dest}\n\
-	UNIT={unit_path}\n\
-	SERVICE={service}\n\
-	secure_dir() {{\n\
-	  mkdir -p \"$1\"\n\
-	  if [ -L \"$1\" ] || [ ! -d \"$1\" ]; then echo \"polaris-helper: refusing $1: not a real directory\" >&2; exit 1; fi\n\
-	  chown -h root:root \"$1\"\n\
-	  chmod 0755 \"$1\"\n\
-	}}\n\
-	secure_dir {install_dir}\n\
-	secure_dir {core_dir}\n\
-	find {core_dir} -mindepth 1 -maxdepth 1 \\( ! -type f -o ! -user root -o -perm /022 \\) -exec rm -rf -- {{}} +\n\
-if [ ! -x {core_bin} ]; then\n\
-  install -o root -g root -m 0755 {bundled_core} {core_bin}\n\
-  [ -f {bundled_cronet} ] && install -o root -g root -m 0755 {bundled_cronet} {core_dir_cronet} || true\n\
-fi\n\
-	secure_dir {state_dir}\n\
-	(umask 077; touch {authfile})\n\
-	chmod 0600 {authfile}\n\
-	grep -qxF '{uid}' {authfile} || printf '%s\\n' '{uid}' >> {authfile}\n\
-	TXDIR=$(mktemp -d {state_dir}/helper-upgrade.XXXXXX)\n\
-	NEW_HELPER=\"$DEST.new.$$\"\n\
-	NEW_UNIT=\"$UNIT.new.$$\"\n\
-	HAD_HELPER=0\n\
-	HAD_UNIT=0\n\
-	WAS_ACTIVE=0\n\
-	WAS_ENABLED=0\n\
-	ROLLBACK_OK=1\n\
-	cleanup_staging() {{\n\
-	  rc=$?\n\
-	  trap - EXIT HUP INT TERM\n\
-	  rm -f \"$NEW_HELPER\" \"$NEW_UNIT\"\n\
-	  rm -rf \"$TXDIR\"\n\
-	  exit \"$rc\"\n\
-	}}\n\
-	rollback_install() {{\n\
-	  rc=$?\n\
-	  trap - EXIT HUP INT TERM\n\
-	  systemctl stop \"$SERVICE\" >/dev/null 2>&1 || true\n\
-	  if [ \"$HAD_HELPER\" -eq 1 ]; then\n\
-	    if install -o root -g root -m 0755 \"$TXDIR/helper.rollback\" \"$NEW_HELPER\" && mv -f \"$NEW_HELPER\" \"$DEST\"; then :; else ROLLBACK_OK=0; fi\n\
-	  elif ! rm -f \"$DEST\"; then ROLLBACK_OK=0; fi\n\
-	  if [ \"$HAD_UNIT\" -eq 1 ]; then\n\
-	    if install -o root -g root -m 0644 \"$TXDIR/unit.rollback\" \"$NEW_UNIT\" && mv -f \"$NEW_UNIT\" \"$UNIT\"; then :; else ROLLBACK_OK=0; fi\n\
-	  elif ! rm -f \"$UNIT\"; then ROLLBACK_OK=0; fi\n\
-	  if ! systemctl daemon-reload; then ROLLBACK_OK=0; fi\n\
-	  if [ \"$WAS_ENABLED\" -eq 1 ]; then\n\
-	    if ! systemctl enable \"$SERVICE\"; then ROLLBACK_OK=0; fi\n\
-	  elif [ \"$HAD_UNIT\" -eq 1 ] && ! systemctl disable \"$SERVICE\"; then ROLLBACK_OK=0; fi\n\
-	  if [ \"$WAS_ACTIVE\" -eq 1 ] && ! systemctl restart \"$SERVICE\"; then ROLLBACK_OK=0; fi\n\
-	  rm -f \"$NEW_HELPER\" \"$NEW_UNIT\"\n\
-	  if [ \"$ROLLBACK_OK\" -eq 1 ]; then\n\
-	    rm -rf \"$TXDIR\"\n\
-	  else\n\
-	    echo \"polaris-helper rollback incomplete; recovery files kept at $TXDIR\" >&2\n\
-	  fi\n\
-	  exit \"$rc\"\n\
-	}}\n\
-	trap cleanup_staging EXIT\n\
-	trap 'exit 1' HUP INT TERM\n\
-	if systemctl is-enabled --quiet \"$SERVICE\" 2>/dev/null; then WAS_ENABLED=1; fi\n\
-	if systemctl is-active --quiet \"$SERVICE\" 2>/dev/null; then\n\
-	  WAS_ACTIVE=1\n\
-	  OLD_PID=$(systemctl show -p MainPID --value \"$SERVICE\")\n\
-	  case \"$OLD_PID\" in ''|0|*[!0-9]*) echo \"active helper has no valid MainPID\" >&2; exit 1;; esac\n\
-	  cp \"/proc/$OLD_PID/exe\" \"$TXDIR/helper.rollback\"\n\
-	  HAD_HELPER=1\n\
-	elif [ -f \"$DEST\" ]; then\n\
-	  cp \"$DEST\" \"$TXDIR/helper.rollback\"\n\
-	  HAD_HELPER=1\n\
-	fi\n\
-	if [ -f \"$UNIT\" ]; then cp \"$UNIT\" \"$TXDIR/unit.rollback\"; HAD_UNIT=1; fi\n\
-	install -D -o root -g root -m 0755 {src} \"$NEW_HELPER\"\n\
-	cat > \"$NEW_UNIT\" <<'POLARIS_UNIT_EOF'\n\
-	{unit}POLARIS_UNIT_EOF\n\
-	chown root:root \"$NEW_UNIT\"\n\
-	chmod 0644 \"$NEW_UNIT\"\n\
-	trap - EXIT HUP INT TERM\n\
-	trap rollback_install EXIT\n\
-	trap 'exit 1' HUP INT TERM\n\
-	if [ \"$WAS_ACTIVE\" -eq 1 ]; then systemctl stop \"$SERVICE\"; fi\n\
-	if systemctl is-active --quiet \"$SERVICE\" 2>/dev/null; then echo \"old helper service did not stop\" >&2; exit 1; fi\n\
-	mv -f \"$NEW_HELPER\" \"$DEST\"\n\
-	mv -f \"$NEW_UNIT\" \"$UNIT\"\n\
-	systemctl daemon-reload\n\
-	systemctl enable \"$SERVICE\"\n\
-	systemctl restart \"$SERVICE\"\n\
-	TAKEOVER_OK=0\n\
-	TAKEOVER_ATTEMPTS=50\n\
-	while [ \"$TAKEOVER_ATTEMPTS\" -gt 0 ]; do\n\
-	  if systemctl is-active --quiet \"$SERVICE\" 2>/dev/null; then\n\
-	    NEW_PID=$(systemctl show -p MainPID --value \"$SERVICE\")\n\
-	    case \"$NEW_PID\" in\n\
-	      ''|0|*[!0-9]*) ;;\n\
-	      *)\n\
-	        if cmp -s \"/proc/$NEW_PID/exe\" \"$DEST\"; then TAKEOVER_OK=1; break; fi\n\
-	        ;;\n\
-	    esac\n\
-	  fi\n\
-	  TAKEOVER_ATTEMPTS=$((TAKEOVER_ATTEMPTS - 1))\n\
-	  sleep 0.1\n\
-	done\n\
-	if [ \"$TAKEOVER_OK\" -ne 1 ]; then echo HELPER_TAKEOVER_TIMEOUT >&2; exit 1; fi\n\
-	trap - EXIT HUP INT TERM\n\
-	rm -rf \"$TXDIR\"\n\
-	echo polaris-helper-install-ok\n",
-        src = shell_quote(&src),
-        dest = shell_quote(&helper_dest),
-        install_dir = shell_quote(&install_dir.to_string_lossy()),
-        core_dir = shell_quote(&core_dir),
-        core_bin = shell_quote(&core_bin),
-        bundled_core = shell_quote(&bundled_core),
-        bundled_cronet = shell_quote(&bundled_cronet),
-        core_dir_cronet = shell_quote(&format!("{core_dir}/libcronet.so")),
-        state_dir = shell_quote(LINUX_STATE_DIR),
-        authfile = shell_quote(LINUX_AUTH_FILE),
-        uid = params.uid,
-        unit_path = shell_quote(&unit_path),
-        unit = unit,
-        service = shell_quote(LINUX_SERVICE_NAME),
-    )
-}
-
 /// linux 卸载脚本（sh）。忠实迁自 LinuxServiceHelper.ts:360-370。
 fn build_linux_uninstall_script(paths: &InstallPaths) -> String {
     let unit_path = paths
@@ -1441,283 +1152,8 @@ echo polaris-helper-uninstall-ok\n",
 /// 旧文件、旧 binPath/start mode 与原运行态，避免覆盖升级把可用 helper 留成半安装态。
 /// `$ErrorActionPreference = Stop` 让失败以非零退出透出（提权 executor 归类 Failed；privilege.rs 的
 /// uac_escalation 无 上游的 flag-file 错误回写协议 —— 见报告 DESIGN-REVIEW）。
-fn build_win_install_script(paths: &InstallPaths, params: &InstallParams, token: &str) -> String {
-    let support = WIN_SUPPORT_DIR;
-    let exe = params.src_binary.to_string_lossy();
-    let cleaner_src = params
-        .src_binary
-        .to_string_lossy()
-        .rsplit_once(['\\', '/'])
-        .map_or_else(
-            || "polaris-cleaner.exe".to_owned(),
-            |(dir, _)| format!(r"{dir}\polaris-cleaner.exe"),
-        );
-    let cleaner_dst = format!(r"{support}\polaris-cleaner.exe");
-    // helperDst = SUPPORT\WIN_HELPER_EXE —— **不从 src_binary 现算 basename**：落点必须与
-    // `InstallPaths::win().binary` 同源，否则状态探测查一个地方、脚本装到另一个地方（这正是
-    // Windows 上 `is_installed` 曾恒 false 的成因）。接线由
-    // `win_install_script_targets_the_same_paths_status_probes` 钉死。
-    // 单一真相源：与 `InstallPaths::win().binary` 同取 WIN_HELPER_EXE（此前这里用
-    // `win_basename(src_binary)` 现算，与状态探测那侧的写死路径分叉 → Windows 恒判未安装）。
-    let helper_dst = format!(r"{support}\{WIN_HELPER_EXE}");
-    let token_file = format!(r"{support}\{HELPER_TOKEN_FILENAME}");
-    let helper_backup = format!(r"{support}\{WIN_HELPER_EXE}.rollback");
-    let token_backup = format!(r"{support}\{HELPER_TOKEN_FILENAME}.rollback");
-    let cleaner_backup = format!(r"{support}\polaris-cleaner.exe.rollback");
-    // ★S（P4）：`--singbox` 由 `paths.core_dir` 派生的**受保护**路径，不再取 `params` 里那个
-    // app 侧用户可写核 —— 安装脚本与 app 侧 `protected_core_dir_path()` 的唯一来源是
-    // `InstallPaths::win().core_dir`；helper 自检（`coreacl`）查的目录由它自己从 `--support`
-    // 独立派生（`derived_core_dir()` = `<support>\core`），两侧靠 [`WIN_CORE_DIR_NAME`] 的等值门收敛。
-    //
-    // 🔴 **字面量拼接，不用 `PathBuf::join`**：`core_dir` 是硬编码的 Windows 路径字符串，而
-    // `join` 用**宿主**分隔符 —— 在本机（Linux）生成脚本时会拼出
-    // `C:\ProgramData\Polaris\core/sing-box.exe`。这种错不编译错、本机测试也照样绿，只会让
-    // 真机的 ImagePath 指向一个不存在的路径（服务起不来 = TUN 整条不可用）。同 `binary`
-    // 那条的理由，由 `win_install_script_seeds_and_locks_the_protected_core_dir` 钉死。
-    let core_dir = paths.core_dir.to_string_lossy();
-    let core_bin = format!(r"{core_dir}\{WIN_CORE_BIN_NAME}");
-    let core_sidecar = format!(r"{core_dir}\{WIN_CORE_SIDECAR_NAME}");
-    // 播种源：`bundled_core` 与同目录的 cronet（与 linux 腿同构，`[ -f ] &&` 形态 → 条件播种）。
-    //
-    // 🔴 **按 Windows 字符串切父目录，不用 `Path::parent`**：本函数只产出 Windows 脚本，而单测跑在
-    // Linux 上 —— 那里 `Path::new(r"C:\…\sing-box.exe").parent()` 返回 `Some("")`，拼出来的是
-    // **裸名** `libcronet.dll`（相对 PowerShell 当前目录，`Test-Path` 恒假 ⇒ 静默不播种 cronet）。
-    // 生产在 Windows 上 `parent()` 正常，所以这个错只在测试里出现、且此前没有任何断言看这个值：
-    // 测试看到的是错值却照样绿。改成字符串切分后，Linux 测试渲染出的就是生产真值，
-    // 由 `win_install_script_seeds_cronet_from_the_bundled_core_directory` 钉住。
-    let bundled_core = params.bundled_core.to_string_lossy().into_owned();
-    let bundled_sidecar = bundled_core.rsplit_once(['\\', '/']).map_or_else(
-        || WIN_CORE_SIDECAR_NAME.to_owned(),
-        |(dir, _)| format!(r"{dir}\{WIN_CORE_SIDECAR_NAME}"),
-    );
-    let conf_dir = params.conf_dir.to_string_lossy();
-    // BinaryPathName：各含空格路径用真双引号包裹，经 New-Service 单一字符串直达 CreateService。
-    let bin_path = format!(
-        "\"{helper_dst}\" --singbox \"{core_bin}\" --confdir \"{conf_dir}\" --support \"{support}\""
-    );
-    // 🔴 $env: 引用必须走「双引号变量赋值 + 裸变量调用」：PowerShell 单引号是字面量，
-    // `& '$env:SystemRoot\icacls.exe'` 不展开 → CommandNotFound + EAP=Stop → 脚本死在
-    // New-Item 之后第一条 icacls（目录建了、之后全没做）。2026-08-19 .207 提权重放首曝，
-    // 该病自 TS 移植起就存在、从未在任何 Windows 机器上成功执行过（E0 的深层前提）。
-    let sc = r#"$sc = "$env:SystemRoot\System32\sc.exe""#;
-    let icacls = r#"$icacls = "$env:SystemRoot\System32\icacls.exe""#;
-    // 🔴 **所有 icacls 主体一律用数值 SID（`*` 前缀），不用英文组名**。
-    //
-    // 根因：BUILTIN / NT AUTHORITY 的账户名**是本地化的**（德语 `Benutzer`、法语 `Utilisateurs`…），
-    // 英文名在非英文 Windows 上解析不到，icacls 报「No mapping between account names and security
-    // IDs was done」并非零退出。此前四条腿（`$support`/`$helperDst` 的 `/inheritance:r` + `/grant:r`）
-    // 一直写英文名**且没有退出码守卫** ⇒ 在那些机器上安全加固**从来没生效过，而且完全静默**。
-    // 本批给每条 icacls 都补了守卫，若还留着英文名，静默弱 ACL 就会变成「装不上」——换 SID 才是治本：
-    // well-known SID 跨语言恒等，守卫因此不会误伤正常机器。
-    // MS 官方口径（icacls 文档 Remarks）：「SIDs may be in either numerical or friendly name form.
-    // If you use a numerical form, affix the wildcard character * to the beginning of the SID.」
-    const SID_SYSTEM: &str = "*S-1-5-18"; // NT AUTHORITY\SYSTEM（服务本体的运行身份）
-    const SID_ADMINS: &str = "*S-1-5-32-544"; // BUILTIN\Administrators
-    const SID_USERS: &str = "*S-1-5-32-545"; // BUILTIN\Users（只读执行，app 侧对账腿要用）
-                                             // 🔴 **`/setowner` 的目标是 Administrators（544），不是 SYSTEM（S-1-5-18）**。
-                                             //
-                                             // 把 owner 设成**不在调用者 token 里**的 SID 需要 `SeRestorePrivilege` 处于**已启用**态；
-                                             // 提权 PowerShell 的 token 里 SYSTEM 并不在列，那条路要靠 icacls 自己去 enable 特权，
-                                             // 无一手来源可依。而 `BUILTIN\Administrators` **在提权 token 里且带 `SE_GROUP_OWNER`**，
-                                             // 设它当 owner 是 `SetNamedSecurityInfo` 的零特权路径 —— 装不上的风险整条消失。
-                                             //
-                                             // 安全上无差：Administrators 本就持 `(F)`，owner 隐含的 `WRITE_DAC` 不给它任何新能力；
-                                             // 要中和的「预创建者以 CREATOR OWNER 身份留在 owner 位上」照样被替掉。
-                                             // helper 侧 `coreacl` 的 owner 白名单是 `{S-1-5-18, S-1-5-32-544}`
-                                             // （`platform/windows/coreacl.rs` 的 `PRIVILEGED_SIDS` / `is_privileged_sid`），544 在内，
-                                             // 故自检照常放行，helper 侧无需任何改动。
-    const SID_OWNER: &str = SID_ADMINS;
-    format!(
-        "$ErrorActionPreference = 'Stop'\n\
-{sc}\n\
-{icacls}\n\
-$support = '{support_q}'\n\
-$tokenFile = '{token_file_q}'\n\
-$helperSrc = '{exe_q}'\n\
-$cleanerSrc = '{cleaner_src_q}'\n\
-$cleanerDst = '{cleaner_dst_q}'\n\
-$cleanerBackup = '{cleaner_backup_q}'\n\
-$helperDst = '{helper_dst_q}'\n\
-$helperBackup = '{helper_backup_q}'\n\
-$tokenBackup = '{token_backup_q}'\n\
-$bp = '{bin_path_q}'\n\
-$coreDir = '{core_dir_q}'\n\
-$coreBin = '{core_bin_q}'\n\
-$coreSidecar = '{core_sidecar_q}'\n\
-$bundledCore = '{bundled_core_q}'\n\
-$bundledSidecar = '{bundled_sidecar_q}'\n\
-if (-not (Test-Path -LiteralPath $cleanerSrc -PathType Leaf)) {{ throw \"bundled native cleaner missing\" }}\n\
-New-Item -ItemType Directory -Force -Path $support | Out-Null\n\
-# ★面 I（必改2）：先取所有权再改 DACL。普通用户可在 C:\\ProgramData 下直建子目录并成\n\
-# CREATOR OWNER 拿完全控制——owner 隐含 WRITE_DAC，不中和的话下面 /inheritance:r + /grant:r\n\
-# 设得再严，预创建者都能把自己加回去。/setowner 必须在 /inheritance:r 与 /grant:r 之前。\n\
-& $icacls $support /setowner \"{sid_owner}\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 助手支持目录失败（退出码 $LASTEXITCODE）\" }}\n\
-# 锁目录 ACL：去继承、仅 SYSTEM/Administrators 完全控制并 (OI)(CI) 下传 → token/exe 出生即 SYSTEM/Admin 私有。\n\
-# 🔴 `/inheritance:r` 与 `/grant:r` **必须同一条命令**（一次 SetNamedSecurityInfo 写入）。\n\
-# 拆成两条会在中间留出一个**空 DACL**的瞬间：`/setowner` 已把属主交给 Administrators，\n\
-# 新建目录的 ACE 全是继承来的、被 `:r` 一次删光 ⇒ 此刻调用者既非 owner 又无任何 ACE，\n\
-# 下一条 `/grant:r` 能不能写回去只能指望 icacls 自行启用 SeRestorePrivilege（无一手来源）。\n\
-# 任一前提不成立 ⇒ 守卫 throw ⇒ 全新安装必然装不上。合成一条则空 DACL 中间态根本不存在。\n\
-& $icacls $support /inheritance:r /grant:r \"{sid_system}:(OI)(CI)(F)\" \"{sid_admins}:(OI)(CI)(F)\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r 助手支持目录失败（退出码 $LASTEXITCODE）\" }}\n\
-# ★S 受保护内核目录（spec §3.1 安装期流）。刻意放在升级事务（try）**之外**：\n\
-# 建目录 + 条件播种对既有安装是幂等且非破坏的，失败时 EAP=Stop 让脚本在动旧 token/helper/服务\n\
-# 之前就非零退出 —— 既有安装完整无损，比「进 try 后靠 catch 收拾」更可回退。反之若失败发生在\n\
-# try 内，catch 恢复的是旧 binPath（仍指旧路径），残留的 core 目录反而成了没人引用的孤儿。\n\
-New-Item -ItemType Directory -Force -Path $coreDir | Out-Null\n\
-# 播种必须早于 New-Service：ImagePath 已改指 $coreBin，服务先起来会 exec 一个空目录 ⇒ TUN 不可用。\n\
-# 只在缺失时播（与 mac `if [ ! -x ]` / linux `if [ ! -x ]` 同构）：已有内容归起核前的\n\
-# reconcile → install-core 按 sha256 对账，安装脚本不做内容判断。\n\
-# 先落 .seed.new 再 Move-Item：杜绝服务恰好在此刻启动时 exec 到一个写了一半的 exe。\n\
-# `-PathType Leaf` 不是装饰：裸 Test-Path 对**目录**也返 True。同账户用户可抢先在受保护核目录\n\
-# 下建一个名叫 sing-box.exe 的**目录** ⇒ 播种被跳过 ⇒ ACL 三步照样全过（装得「成功」）⇒\n\
-# helper CreateProcess 一个目录必败、install-core 的 rename 覆盖目录也必败 ⇒ 要管理员手清。\n\
-if (-not (Test-Path -LiteralPath $coreBin -PathType Leaf)) {{\n\
-  Copy-Item -LiteralPath $bundledCore -Destination \"$coreBin.seed.new\" -Force\n\
-  Move-Item -LiteralPath \"$coreBin.seed.new\" -Destination $coreBin -Force\n\
-  if (Test-Path -LiteralPath $bundledSidecar) {{\n\
-    Copy-Item -LiteralPath $bundledSidecar -Destination \"$coreSidecar.seed.new\" -Force\n\
-    Move-Item -LiteralPath \"$coreSidecar.seed.new\" -Destination $coreSidecar -Force\n\
-  }}\n\
-}}\n\
-# ★S+面 I：/setowner 先行（同上），/T 连同刚播下的文件一起收 —— 提权 PowerShell 新建的文件\n\
-# 默认属主是**创建者账户**而非 SYSTEM/Administrators，不 /T 的话 helper 起核前自检读到的\n\
-# owner 就落在白名单外 ⇒ ERR coredir-acl-weakened ⇒ 装完直接起不了核。\n\
-# 刻意**不带 `/C`**：那个开关让 icacls 跳过出错项继续跑，退出码不再如实反映失败 ⇒ 下面那条守卫失去牙。\n\
-& $icacls $coreDir /setowner \"{sid_owner}\" /T | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 受保护内核目录失败（退出码 $LASTEXITCODE）\" }}\n\
-# Users:(OI)(CI)(RX) 不能漏（必改7）：父目录只有 SYSTEM/Admin(F)，光继承会让 Users 一条 ACE 都没有\n\
-# ⇒ app 侧 reconcile 的 sha256_file(受保护核) 读不到、内核自证跑 `sing-box version` 无执行权\n\
-# ⇒ 每次起核白推 80MB 且自证恒告警。(RX) 只读执行不属写类权，helper 自检放行。\n\
-# `/inheritance:r` 与 `/grant:r` 合一的理由同 $support（空 DACL 中间态）。\n\
-& $icacls $coreDir /inheritance:r /grant:r \"{sid_system}:(OI)(CI)(F)\" \"{sid_admins}:(OI)(CI)(F)\" \"{sid_users}:(OI)(CI)(RX)\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r 受保护内核目录失败（退出码 $LASTEXITCODE）\" }}\n\
-# 升级事务快照：属性来自 Win32_Service，不解析受系统显示语言影响的 sc qc 文本。\n\
-$oldService = Get-CimInstance -ClassName Win32_Service -Filter \"Name='{service}'\" -ErrorAction SilentlyContinue\n\
-$serviceExisted = $null -ne $oldService\n\
-$oldBinPath = if ($serviceExisted) {{ $oldService.PathName }} else {{ $null }}\n\
-$oldStartMode = if ($serviceExisted) {{ $oldService.StartMode }} else {{ $null }}\n\
-$oldWasRunning = $serviceExisted -and $oldService.State -eq 'Running'\n\
-$hadHelper = Test-Path -LiteralPath $helperDst\n\
-$hadToken = Test-Path -LiteralPath $tokenFile\n\
-$hadCleaner = Test-Path -LiteralPath $cleanerDst\n\
-Remove-Item -Force -Path $helperBackup,$tokenBackup,$cleanerBackup -ErrorAction SilentlyContinue\n\
-if ($hadHelper) {{ Copy-Item -LiteralPath $helperDst -Destination $helperBackup -Force }}\n\
-if ($hadToken) {{ Copy-Item -LiteralPath $tokenFile -Destination $tokenBackup -Force }}\n\
-if ($hadCleaner) {{ Copy-Item -LiteralPath $cleanerDst -Destination $cleanerBackup -Force }}\n\
-try {{\n\
-# 先删残留旧 token 再写（旧 Admin 只读会拒 Set-Content 覆盖；经目录 FILE_DELETE_CHILD 删旧不受其自身 DACL 阻挡）。\n\
-Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue\n\
-Set-Content -Path $tokenFile -Value '{token_q}' -NoNewline -Encoding ascii\n\
-# ★面 I：token 文件属主归 Administrators（新建文件的默认属主是创建者账户，owner 隐含 WRITE_DAC）。\n\
-& $icacls $tokenFile /setowner \"{sid_owner}\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner 助手 token 失败（退出码 $LASTEXITCODE）\" }}\n\
-& $sc stop {service} 2>$null | Out-Null\n\
-& $sc delete {service} 2>$null | Out-Null\n\
-# sc delete 异步标记删除 → 轮询等服务真消失，否则 New-Service 撞 1072。\n\
-$deadline = (Get-Date).AddSeconds(15)\n\
-while ((Get-Service -Name {service} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {{ Start-Sleep -Milliseconds 300 }}\n\
-# 外置复制（退避重试兜解锁窗口竞态）。\n\
-$copied = $false\n\
-for ($i = 0; $i -lt 10 -and -not $copied; $i++) {{\n\
-  try {{ Copy-Item -LiteralPath $helperSrc -Destination $helperDst -Force\n\
-Copy-Item -LiteralPath $cleanerSrc -Destination $cleanerDst -Force; $copied = $true }}\n\
-  catch {{ Start-Sleep -Milliseconds 300 }}\n\
-}}\n\
-if (-not $copied) {{ throw \"复制 helper.exe 到 ProgramData 失败（旧服务二进制可能仍被占用，请稍后重试或重启后再装）\" }}\n\
-# ★面 I：同理，helper.exe 副本的属主也归 Administrators（顺序仍是 setowner → inheritance:r + grant:r）。\n\
-& $icacls $helperDst /setowner \"{sid_owner}\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /setowner helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
-& $icacls $helperDst /inheritance:r /grant:r \"{sid_system}:(F)\" \"{sid_admins}:(F)\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"icacls /inheritance:r + /grant:r helper.exe 失败（退出码 $LASTEXITCODE）\" }}\n\
-& $icacls $cleanerDst /setowner \"{sid_owner}\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"native cleaner owner failed\" }}\n\
-& $icacls $cleanerDst /inheritance:r /grant:r \"{sid_system}:(F)\" \"{sid_admins}:(F)\" | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"native cleaner DACL failed\" }}\n\
-# New-Service 退避重试（1072 窗口）：BinaryPathName 单一字符串直达 CreateService；默认 LocalSystem；Automatic 开机自启。\n\
-$created = $false\n\
-$lastErr = $null\n\
-for ($i = 0; $i -lt 10 -and -not $created; $i++) {{\n\
-  try {{ New-Service -Name {service} -BinaryPathName $bp -StartupType Automatic | Out-Null; $created = $true }}\n\
-  catch {{ $lastErr = $_; Start-Sleep -Milliseconds 500 }}\n\
-}}\n\
-if (-not $created) {{ throw \"New-Service 失败（重试 10 次；多为 sc delete 标记删除态 1072 竞态，若持续请重启）：$($lastErr.Exception.Message)\" }}\n\
-# W20 自愈（对齐 mac plist KeepAlive=true / linux unit Restart=on-failure——Windows 此前是唯一没配自愈的平台）：\n\
-# ① IU 启动权：默认服务 DACL 只给交互用户查询权（.207 实测 CCLCSWLOCRRC，无 RP=SERVICE_START），\n\
-#    未提权 app 拉不起停着的服务（app 侧恢复腿的硬前提）→ 显式补授 RP（仅 start，不授 stop/改配置；\n\
-#    其余 ACE 与默认逐字一致，SACL 保留）。与管道 SDDL 授 IU 读写同一威胁模型：多给的只是「让默认\n\
-#    本就开机自启的服务提前起来」，无任何新能力。\n\
-& $sc sdset {service} \"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RP;;;IU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)\" | Out-Null\n\
-# 🔴 EAP=Stop 拦不住外部程序非零退出（PS 5.1 无 PSNativeCommandUseErrorActionPreference），\n\
-# 这两步是 W20 双层自愈的硬前提，静默失败 = 装完看着成功、自愈却全没配上 → 必须显式查退出码。\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"sc sdset 授 IU 启动权失败（退出码 $LASTEXITCODE）\" }}\n\
-# ② SCM 失败恢复：进程被任务管理器结束/异常退出 → SCM 5s 后自动重启；reset= 86400=失败计数 24h\n\
-#    归零，三段 restart 覆盖连续误杀。sc 语法注意：等号后必须带一个空格。\n\
-& $sc failure {service} reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"sc failure 自愈配置失败（退出码 $LASTEXITCODE）\" }}\n\
-& $sc start {service} | Out-Null\n\
-if ($LASTEXITCODE -ne 0) {{ throw \"sc start helper service failed\" }}\n\
-# commit：新服务已成功首启，旧文件才失去回滚价值。\n\
-Remove-Item -Force -Path $helperBackup,$tokenBackup,$cleanerBackup -ErrorAction SilentlyContinue\n\
-}} catch {{\n\
-  $installError = $_\n\
-  $ErrorActionPreference = 'SilentlyContinue'\n\
-  & $sc stop {service} 2>$null | Out-Null\n\
-  & $sc delete {service} 2>$null | Out-Null\n\
-  $rollbackDeadline = (Get-Date).AddSeconds(15)\n\
-  while ((Get-Service -Name {service} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $rollbackDeadline) {{ Start-Sleep -Milliseconds 300 }}\n\
-  if ($hadHelper -and (Test-Path -LiteralPath $helperBackup)) {{\n\
-    Copy-Item -LiteralPath $helperBackup -Destination $helperDst -Force\n\
-  }} elseif (-not $hadHelper) {{\n\
-    Remove-Item -Force -Path $helperDst -ErrorAction SilentlyContinue\n\
-  }}\n\
-  if ($hadToken -and (Test-Path -LiteralPath $tokenBackup)) {{\n\
-    Copy-Item -LiteralPath $tokenBackup -Destination $tokenFile -Force\n\
-  }} elseif (-not $hadToken) {{\n\
-    Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue\n\
-  }}\n\
-  if ($hadCleaner -and (Test-Path -LiteralPath $cleanerBackup)) {{\n\
-    Copy-Item -LiteralPath $cleanerBackup -Destination $cleanerDst -Force\n\
-  }} elseif (-not $hadCleaner) {{\n\
-    Remove-Item -Force -Path $cleanerDst -ErrorAction SilentlyContinue\n\
-  }}\n\
-  if ($serviceExisted) {{\n\
-    $oldStartType = switch ($oldStartMode) {{ 'Disabled' {{ 'Disabled' }} 'Manual' {{ 'Manual' }} default {{ 'Automatic' }} }}\n\
-    New-Service -Name {service} -BinaryPathName $oldBinPath -StartupType $oldStartType | Out-Null\n\
-    & $sc sdset {service} \"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RP;;;IU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)\" | Out-Null\n\
-    & $sc failure {service} reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null\n\
-    if ($oldWasRunning) {{ & $sc start {service} | Out-Null }}\n\
-  }}\n\
-  # 失败时保留 .rollback：自动恢复若被外部文件锁阻断，管理员仍有可恢复副本。\n\
-  $ErrorActionPreference = 'Stop'\n\
-  throw $installError\n\
-}}\n",
-        support_q = ps_quote(support),
-        token_file_q = ps_quote(&token_file),
-        exe_q = ps_quote(&exe),
-        cleaner_src_q = ps_quote(&cleaner_src),
-        cleaner_dst_q = ps_quote(&cleaner_dst),
-        cleaner_backup_q = ps_quote(&cleaner_backup),
-        helper_dst_q = ps_quote(&helper_dst),
-        helper_backup_q = ps_quote(&helper_backup),
-        token_backup_q = ps_quote(&token_backup),
-        bin_path_q = ps_quote(&bin_path),
-        core_dir_q = ps_quote(&core_dir),
-        core_bin_q = ps_quote(&core_bin),
-        core_sidecar_q = ps_quote(&core_sidecar),
-        bundled_core_q = ps_quote(&bundled_core),
-        bundled_sidecar_q = ps_quote(&bundled_sidecar),
-        sid_system = SID_SYSTEM,
-        sid_admins = SID_ADMINS,
-        sid_users = SID_USERS,
-        sid_owner = SID_OWNER,
-        token_q = ps_quote(token),
-        icacls = icacls,
-        sc = sc,
-        service = WIN_SERVICE_NAME,
-    )
-}
+mod install_windows;
+use install_windows::build_win_install_script;
 
 // ===== 默认 SysOps（生产实现，跨平台可编译）=====
 

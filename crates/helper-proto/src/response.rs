@@ -250,6 +250,8 @@ pub enum LinuxDns {
 /// [`ResponseKind::OkRaw`]（保留原文）——保证解析永不丢消息，便于协议演进期的诊断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseKind {
+    HelperUpgradeAdmitted,
+    HelperUpgradeCancelled,
     CoreStatus(crate::core_protocol::CoreStatus),
     PinnedStart {
         id: crate::core_manifest::CoreId,
@@ -369,7 +371,9 @@ impl Response {
         let kind = parse_ok(rest);
         if matches!(
             kind,
-            ResponseKind::CoreStatus(_)
+            ResponseKind::HelperUpgradeAdmitted
+                | ResponseKind::HelperUpgradeCancelled
+                | ResponseKind::CoreStatus(_)
                 | ResponseKind::LinuxBirthStart(_)
                 | ResponseKind::LinuxBirthStatus(_)
                 | ResponseKind::LinuxBirthStop(_)
@@ -412,6 +416,8 @@ impl Response {
 /// 把 [`ResponseKind`] 序列化为 `OK ...` wire 行（[`parse_ok`] 的反方向）。
 fn ok_kind_to_wire(kind: &ResponseKind) -> String {
     match kind {
+        ResponseKind::HelperUpgradeAdmitted => "OK helper-upgrade-admitted".into(),
+        ResponseKind::HelperUpgradeCancelled => "OK helper-upgrade-cancelled".into(),
         ResponseKind::CoreStatus(status) => status.to_wire(),
         ResponseKind::PinnedStart { id, start } => {
             let birth = match start {
@@ -610,6 +616,14 @@ fn flush_dns_to_wire(f: &FlushDns) -> String {
 /// 分派 `OK <rest>` 的载荷（rest 已剥 "OK " 前缀，可能为空）。
 fn parse_ok(rest: &str) -> ResponseKind {
     let (token, tail) = parse_first_token(rest);
+    if tail.is_empty() {
+        if token == "helper-upgrade-admitted" {
+            return ResponseKind::HelperUpgradeAdmitted;
+        }
+        if token == "helper-upgrade-cancelled" {
+            return ResponseKind::HelperUpgradeCancelled;
+        }
+    }
     if let Some(status) = crate::core_protocol::CoreStatus::parse(token, tail) {
         return ResponseKind::CoreStatus(status);
     }

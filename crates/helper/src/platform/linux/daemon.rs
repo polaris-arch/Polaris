@@ -71,7 +71,14 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> ServerConfig {
 /// 本函数建多线程 runtime 并 `block_on` `async_main`（对齐 Go 的 goroutine 并发模型）。
 #[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> ExitCode {
-    let cfg = parse_args(argv);
+    let argv: Vec<_> = argv.collect();
+    if let Err(error) =
+        crate::cli::validate_flags(&argv, &["socket", "authfile", "coredir"], &["console"])
+    {
+        eprintln!("polaris-helper: {error}");
+        return ExitCode::FAILURE;
+    }
+    let cfg = parse_args(argv.into_iter());
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

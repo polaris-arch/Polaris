@@ -73,6 +73,8 @@ pub mod core_install;
 pub mod core_objects;
 pub mod core_store;
 pub mod core_cli;
+pub mod admin_probe;
+pub mod helper_policy;
 pub mod pinned_core;
 pub mod user_control;
 pub mod exact_start;

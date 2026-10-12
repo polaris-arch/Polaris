@@ -1,4 +1,28 @@
 use super::*;
+#[test]
+fn service_argv_rejects_retired_duplicate_and_incomplete_flags() {
+    let args = |tail: &[&str]| {
+        std::iter::once("helper".to_owned())
+            .chain(tail.iter().map(|s| (*s).into()))
+            .collect::<Vec<String>>()
+    };
+    assert!(validate_flags(
+        &args(&["--support=/root/store", "--console"]),
+        &["support"],
+        &["console"]
+    )
+    .is_ok());
+    for tail in [
+        vec!["--singbox", "/user/core"],
+        vec!["--support", "/a", "--support=/b"],
+        vec!["--support"],
+        vec!["--console=true"],
+        vec!["loose"],
+        vec!["--support", "--console"],
+    ] {
+        assert!(validate_flags(&args(&tail), &["support"], &["console"]).is_err());
+    }
+}
 
 fn argv(args: &[&str]) -> std::vec::IntoIter<String> {
     // 模拟真实 argv：首元素为程序名（被跳过）。

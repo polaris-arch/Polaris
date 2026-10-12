@@ -23,6 +23,29 @@ fn complete_release_identity_is_distinct_from_source_identity() {
 }
 
 #[test]
+fn plain_alpha12_is_admitted_only_with_the_complete_exact_release_binding() {
+    let pending: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/desktop-core/pending-release-selection.json"
+    )))
+    .unwrap();
+    let value = &pending["selection"];
+    assert_eq!(
+        desktop_release_identity(value),
+        Some((
+            "1.15.0-alpha.12",
+            "072dacb999c07c7948816f10efaaaf371da45eb9"
+        ))
+    );
+    let mut invalid = value.clone();
+    invalid["tag"] = json!("v1.15.0-alpha.12.polaris.1");
+    assert!(desktop_release_identity(&invalid).is_none());
+    let mut invalid = value.clone();
+    invalid["contractPath"] = json!("scripts/desktop-core/arbitrary.json");
+    assert!(desktop_release_identity(&invalid).is_none());
+}
+
+#[test]
 fn every_public_binding_is_required_and_invalid_values_withhold_identity() {
     let value = selection();
     for key in value.as_object().unwrap().keys() {

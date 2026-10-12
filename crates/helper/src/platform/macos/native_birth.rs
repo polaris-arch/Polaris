@@ -3,8 +3,8 @@
 //! The old PID snapshot/reaper cannot represent failed native waits or an unfinished chown.
 //! Keep one original Child here; workers borrow it, and only wait + the entire tail retire it.
 
-use polaris_helper_proto::HelperBirthTarget;
 use polaris_helper_proto::response::{NativeBirthStart, NativeBirthStatus, NativeBirthStop};
+use polaris_helper_proto::HelperBirthTarget;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,7 +66,7 @@ impl NativeBirth {
 #[derive(Default)]
 struct Slot {
     current: Option<Arc<NativeBirth>>,
-    stopped: VecDeque<HelperBirthTarget>,
+    stopped: VecDeque<(HelperBirthTarget, Option<u32>)>,
     starting: bool,
     closing: bool,
 }
@@ -77,6 +77,34 @@ pub(super) struct NativeCustody {
 }
 
 impl NativeCustody {
+    pub(super) fn caller_may_stop(&self, uid: Option<u32>, target: HelperBirthTarget) -> bool {
+        let Some(uid) = uid else {
+            return false;
+        };
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        if let Some((_, owner)) = slot.stopped.iter().find(|(birth, _)| *birth == target) {
+            return uid == 0 || *owner == Some(uid);
+        }
+        let Some(birth) = &slot.current else {
+            return uid == 0;
+        };
+        let Ok(owned) = birth.owned.lock() else {
+            return false;
+        };
+        uid == 0 || owned.core.as_ref().is_some_and(|(_, owner)| *owner == uid)
+    }
+    pub(super) fn upgrade_admission(&self, close: bool) -> bool {
+        let Ok(mut slot) = self.slot.lock() else {
+            return false;
+        };
+        if slot.current.is_some() || slot.starting {
+            return false;
+        }
+        slot.closing = close;
+        true
+    }
     pub(super) fn caller_allowed(
         &self,
         uid: Option<u32>,
@@ -259,7 +287,7 @@ impl NativeCustody {
                     return NativeBirthStop::Unknown { target };
                 }
             };
-            if slot.stopped.contains(&target) {
+            if slot.stopped.iter().any(|(birth, _)| *birth == target) {
                 return NativeBirthStop::Stopped { target };
             }
             slot.current.clone()
@@ -390,7 +418,8 @@ impl NativeCustody {
             }
         };
         if slot.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, birth)) {
-            slot.stopped.push_back(birth.target);
+            slot.stopped
+                .push_back((birth.target, owned.core.as_ref().map(|(_, owner)| *owner)));
             if slot.stopped.len() > STOP_CACHE_LIMIT {
                 slot.stopped.pop_front();
             }

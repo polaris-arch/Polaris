@@ -125,7 +125,7 @@ impl MacServices for TestServices {
 }
 
 fn test_config() -> MacConfig {
-    MacConfig::new("/sb", "/Users/test/Polaris", "/tmp/support", "/tmp/core")
+    MacConfig::new("/tmp/support", "/tmp/core")
 }
 
 // ===== decode_request（对照 Go handle() readLine 序列）=====

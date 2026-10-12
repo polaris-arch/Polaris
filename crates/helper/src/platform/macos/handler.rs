@@ -33,32 +33,23 @@ use crate::platform::macos::flush_dns;
 use crate::platform::macos::freeport;
 use crate::platform::macos::route::{self, RouteOp};
 use crate::platform::macos::whitelist;
-use crate::token::{TokenCheck, TokenStore, check_token};
+use crate::token::{check_token, TokenCheck, TokenStore};
 use polaris_helper_proto::request::{RouteParams, StartParams};
 use polaris_helper_proto::response::{
     NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, StartTiming, Status, Stop,
 };
 use polaris_helper_proto::{
-    Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request, Response,
-    stop_pid_matches,
+    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request,
+    Response,
 };
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// macOS helper 配置（对应 Go 的 `--singbox`/`--confdir`/`--support`/`--coredir` flag）。
-///
-/// 这些值在安装期锁定（改需 root），是安全边界的一部分：
-/// - `singbox_bin`：sing-box 二进制路径锁定（杜绝「持 token 跑任意二进制」，`helper.go:6`）。
-/// - `conf_dir`：允许的配置文件目录（`cfgAllowed` 白名单，`helper.go:245-252`）。
-/// - `support_dir`：socket + token 所在目录。
-/// - `core_dir`：install-core 只写此目录（防写任意路径，`helper.go:128`）。
+/// Machine support/store roots. Core id and config registration are resolved
+/// from the authenticated native caller, never from service argv.
 #[derive(Debug, Clone)]
 pub struct MacConfig {
-    /// 锁定的 sing-box 二进制路径（`helper.go:592` flag `--singbox`）。
-    pub singbox_bin: String,
-    /// 允许的配置文件目录（`helper.go:593` flag `--confdir`）。
-    pub conf_dir: String,
     /// socket + token 所在目录（`helper.go:594` flag `--support`，默认 `/Library/Application Support/Polaris`）。
     pub support_dir: String,
     /// install-core 的受保护内核目录（`helper.go:595` flag `--coredir`）。
@@ -68,15 +59,8 @@ pub struct MacConfig {
 impl MacConfig {
     /// 构造默认配置（对应 Go main 的 flag 默认值）。
     #[must_use]
-    pub fn new(
-        singbox_bin: impl Into<String>,
-        conf_dir: impl Into<String>,
-        support_dir: impl Into<String>,
-        core_dir: impl Into<String>,
-    ) -> Self {
+    pub fn new(support_dir: impl Into<String>, core_dir: impl Into<String>) -> Self {
         Self {
-            singbox_bin: singbox_bin.into(),
-            conf_dir: conf_dir.into(),
             support_dir: support_dir.into(),
             core_dir: core_dir.into(),
         }
@@ -108,6 +92,9 @@ pub struct SpawnedCore {
 /// macOS helper 的服务 bundle —— 把所有外部依赖（token 存储、命令执行、child 状态）打包成一个 trait，
 /// 便于测试注入 mock、生产注入真实实现。
 pub trait MacServices: Send + Sync {
+    fn upgrade_admission(&self, _close: bool) -> bool {
+        false
+    }
     fn token_for_peer(&self, _uid: Option<u32>) -> String {
         self.token_store().token_value()
     }
@@ -134,6 +121,9 @@ pub trait MacServices: Send + Sync {
     }
     fn native_stop(&self, target: HelperBirthTarget) -> NativeBirthStop {
         NativeBirthStop::Unknown { target }
+    }
+    fn native_stop_allowed(&self, uid: Option<u32>, _target: HelperBirthTarget) -> bool {
+        uid == Some(0)
     }
     fn native_custody_active(&self) -> bool {
         false
@@ -289,6 +279,23 @@ pub fn dispatch_from_peer(
     // 其余命令在「临界区」内处理 —— 这里用 child() mutex 体现互斥语义
     // （实际生产由 server 层在调 dispatch 前后包 mu；本函数内部对 child 状态的访问仍走 mutex）
     match req {
+        Request::PrepareHelperUpgrade | Request::CancelHelperUpgrade => {
+            if peer_uid != Some(0) {
+                return Response::Err(ProtoError::new(ErrorCode::Auth));
+            }
+            let close = matches!(req, Request::PrepareHelperUpgrade);
+            if !services.upgrade_admission(close) {
+                return Response::Err(ProtoError::with_detail(
+                    ErrorCode::Other,
+                    "helper-upgrade-busy",
+                ));
+            }
+            Response::Ok(if close {
+                ResponseKind::HelperUpgradeAdmitted
+            } else {
+                ResponseKind::HelperUpgradeCancelled
+            })
+        }
         Request::CoreStatus { id } => Response::Ok(ResponseKind::CoreStatus(
             crate::pinned_core::status(Some(Path::new(&config.core_dir)), id),
         )),
@@ -323,7 +330,7 @@ pub fn dispatch_from_peer(
             Response::Ok(ResponseKind::NativeBirthStatus(services.native_status()))
         }
         Request::NativeStopBirth { target } => {
-            if !services.native_caller_allowed(peer_uid, None) {
+            if !services.native_stop_allowed(peer_uid, *target) {
                 return Response::Err(ProtoError::new(ErrorCode::Auth));
             }
             Response::Ok(ResponseKind::NativeBirthStop(services.native_stop(*target)))
@@ -380,13 +387,14 @@ pub fn dispatch_from_peer(
             if services.native_custody_active() {
                 return legacy_native_required();
             }
-            // helper.go:444-449: pkill -9 -f "<singboxBin> run" + 摘 child
-            let pattern = format!("{} run", config.singbox_bin);
-            let _ = services
-                .runner()
-                .run(EXEC_TIMEOUT, "/usr/bin/pkill", &["-9", "-f", &pattern]);
-            // helper.go:448: child, childDone = nil, nil（生产实现同步清 done/generation）
-            services.clear_child();
+            if services
+                .child()
+                .lock()
+                .ok()
+                .is_none_or(|child| child.is_some())
+            {
+                return legacy_native_required();
+            }
             Response::Ok(ResponseKind::Cleaned)
         }
         Request::RouteAdd(rp) | Request::RouteDel(rp) => {

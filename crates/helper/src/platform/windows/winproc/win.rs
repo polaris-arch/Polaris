@@ -30,7 +30,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -318,12 +318,21 @@ impl WinProcOps {
         let mut cmd = std::process::Command::new(singbox_bin);
         // SCM inherits machine-owned environment. Pass only the system roots
         // and trusted executable directories; never inherit DLL/path overrides.
-        let system_root = std::env::var_os("SystemRoot").ok_or_else(|| std::io::Error::other("native SystemRoot unavailable"))?;
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| std::io::Error::other("native SystemRoot unavailable"))?;
         let system_root = std::path::PathBuf::from(system_root);
-        if !system_root.is_absolute() { return Err(std::io::Error::other("invalid native SystemRoot")); }
-        let core_directory = std::path::Path::new(singbox_bin).parent().ok_or_else(|| std::io::Error::other("missing core directory"))?;
-        let path = std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")]).map_err(std::io::Error::other)?;
-        cmd.env_clear().env("SystemRoot", &system_root).env("PATH", path);
+        if !system_root.is_absolute() {
+            return Err(std::io::Error::other("invalid native SystemRoot"));
+        }
+        let core_directory = std::path::Path::new(singbox_bin)
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing core directory"))?;
+        let path =
+            std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")])
+                .map_err(std::io::Error::other)?;
+        cmd.env_clear()
+            .env("SystemRoot", &system_root)
+            .env("PATH", path);
         cmd.args(["run", "-c", cfg])
             .stdin(std::process::Stdio::null());
         if !log_path.is_empty() {
@@ -1573,7 +1582,127 @@ fn sid_to_string(psid: PSID) -> Option<String> {
     Some(s)
 }
 
+/// Source ownership is read from the exact held file HANDLE, not a second path lookup.
+#[allow(
+    unsafe_code,
+    reason = "read-only security descriptor of one held file object"
+)]
+pub fn file_owner(file: &File) -> std::io::Result<String> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the File retains its handle throughout the synchronous query; outputs are live.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+    let value = if owner.is_null() {
+        None
+    } else {
+        sid_to_string(owner)
+    };
+    // SAFETY: successful GetSecurityInfo allocates the descriptor with LocalAlloc.
+    if !descriptor.is_null() {
+        unsafe { LocalFree(descriptor) };
+    }
+    value.ok_or_else(|| std::io::Error::other("source file owner unavailable"))
+}
+
 /// 宽字符串辅助：OsStr → null 终止 UTF-16（供 windows-sys API）。
+/// Seal an administrator-created object before it enters the store namespace.
+/// Parent must already be protected; never use this to repair arbitrary user paths.
+#[allow(
+    unsafe_code,
+    reason = "native ACL for new administrator-owned store objects"
+)]
+pub fn seal_store_object(path: &Path, readable: bool) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("cannot seal reparse object"));
+    }
+    let inheritance = if meta.is_dir() { "OICI" } else { "" };
+    let users = if readable {
+        format!("(A;{inheritance};FRFX;;;BU)")
+    } else {
+        String::new()
+    };
+    let sddl = wide_null(format!(
+        "O:BAD:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA){users}"
+    ));
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: terminated SDDL and a live descriptor output; revision 1.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        // SAFETY: the successful conversion owns this descriptor until LocalFree;
+        // all output pointers refer to native-size live variables.
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+            || owner.is_null()
+            || dacl.is_null()
+            || present == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let name = wide_null(path);
+        // SAFETY: protected parent prevents unprivileged name replacement. Owner
+        // and DACL borrow the still-live converted descriptor; no SACL is changed.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(code as i32))
+        }
+    })();
+    // SAFETY: descriptor was allocated by successful conversion, released once.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
 fn wide_null(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }

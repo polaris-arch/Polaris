@@ -40,12 +40,12 @@ const DEFAULT_SUPPORT_DIR: &str = "/Library/Application Support/Polaris";
 pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
     let m = crate::cli::parse_flags(argv, &[]);
     MacConfig::new(
-        m.get("singbox").cloned().unwrap_or_default(),
-        m.get("confdir").cloned().unwrap_or_default(),
         m.get("support")
             .cloned()
             .unwrap_or_else(|| DEFAULT_SUPPORT_DIR.to_owned()),
-        m.get("coredir").cloned().unwrap_or_default(),
+        m.get("coredir")
+            .cloned()
+            .unwrap_or_else(|| format!("{DEFAULT_SUPPORT_DIR}/core")),
     )
 }
 
@@ -55,7 +55,12 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
 /// 生产 mac 二进制走 [`run`]。
 #[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCode {
-    let cfg = parse_args(argv);
+    let argv: Vec<_> = argv.collect();
+    if let Err(error) = crate::cli::validate_flags(&argv, &["support", "coredir"], &[]) {
+        eprintln!("polaris-helper: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let cfg = parse_args(argv.into_iter());
     #[cfg(target_os = "macos")]
     {
         run(&cfg)

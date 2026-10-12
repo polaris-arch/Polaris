@@ -880,7 +880,7 @@ impl HelperRuntime {
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
-        let params = match self.install_params() {
+        let (params, _stage) = match self.install_params() {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("helper install assets unavailable: {e}");
@@ -993,20 +993,59 @@ impl HelperRuntime {
     }
 
     /// 组装 [`InstallParams`]（解析 bundled 资源 + 当前 uid）。
-    fn install_params(&self) -> Result<InstallParams, String> {
+    fn install_params(
+        &self,
+    ) -> Result<(InstallParams, crate::runtime::core_identity::InstallStage), String> {
         let src_binary = resolve_helper_binary()?;
         // 三平台同构：安装脚本用它**播种**受保护核目录（仅在目标缺失时）。名叫 bundled 实为
         // `resolve_core_binary()` = **现役核**（即随包核；debug / test 构型可被开发态超驰替换），如实登记在
         // `InstallParams::bundled_core` 的字段文档里。
         // win 的 `--singbox` 不再从这里取：P4 起由 `InstallPaths::win().core_dir` 派生受保护路径。
         let bundled_core = crate::runtime::proxy::resolve_core_binary()?;
-        Ok(InstallParams {
-            src_binary,
-            bundled_core,
+        let stage = crate::runtime::core_identity::stage_installation(
+            &bundled_core,
+            &src_binary,
+            &self.dir,
+        )?;
+        #[cfg(windows)]
+        let user_identity = polaris_helper::platform::windows::native_caller::current_user()
+            .map_err(|error| error.to_string())?;
+        #[cfg(not(windows))]
+        let user_identity =
+            polaris_helper_proto::core_protocol::CallerIdentity::Unix(current_uid());
+        let core_name = polaris_helper_proto::core_payload::core_filename(self.platform);
+        let helper_name = if self.platform == Platform::Win {
+            "polaris-helper.exe"
+        } else {
+            "polaris-helper"
+        };
+        let manifest_path = stage.directory.join("core-manifest.json");
+        let manifest_sha256 = polaris_updater::sha256_hex(
+            &stage
+                .manifest
+                .to_json()
+                .map_err(|error| error.to_string())?,
+        );
+        let params = InstallParams {
+            manifest_path,
+            manifest_sha256,
+            core_id: polaris_helper_proto::core_manifest::CoreId::parse(&stage.manifest.id)
+                .map_err(|error| error.to_string())?,
+            helper_sha256: stage
+                .manifest
+                .core
+                .helper_sha256
+                .clone()
+                .ok_or("actual installer hash unavailable")?,
+            helper_version: env!("CARGO_PKG_VERSION").into(),
+            user_identity,
+            src_binary: stage.directory.join(helper_name),
+            bundled_core: stage.directory.join(core_name),
             conf_dir: self.dir.clone(),
             uid: current_uid(),
             script_dir: self.dir.clone(),
-        })
+        };
+        Ok((params, stage))
     }
 
     pub(crate) fn core_status(

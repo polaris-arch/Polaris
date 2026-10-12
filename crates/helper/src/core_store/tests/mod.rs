@@ -24,6 +24,7 @@ fn fixture(version: &str) -> (tempfile::TempDir, InstalledCoreManifest) {
         provider_fingerprint: "a".repeat(64),
         files,
         helper_sha256: Some("b".repeat(64)),
+        cleaner_sha256: None,
     };
     let id = core
         .id(crate::core_install::sha256_hex)
@@ -62,7 +63,9 @@ fn mismatched_source_never_becomes_an_eligible_version() {
     let (root, store, uid) = store();
     let (source, manifest) = fixture("1.0.0");
     fs::write(source.path().join("libcronet.so"), b"changed").unwrap();
-    assert!(store.install(&manifest, source.path(), Some(uid)).is_err());
+    assert!(store
+        .install(&manifest, source.path(), Some(uid), None)
+        .is_err());
     assert!(!root
         .path()
         .join("manifests")
@@ -76,17 +79,20 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
     let (root, store, uid) = store();
     let (source, manifest) = fixture("1.0.0");
     assert_eq!(
-        store.install(&manifest, source.path(), Some(uid)).unwrap(),
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
         InstallOutcome::Installed
     );
     assert_eq!(
-        store.install(&manifest, source.path(), Some(uid)).unwrap(),
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
         InstallOutcome::AlreadyPresent
     );
     let id = CoreId::parse(&manifest.id).unwrap();
     let verified = store.verify_for_start(&id).unwrap();
     assert_eq!(verified.manifest.id, manifest.id);
-    drop(verified);
     fs::write(
         root.path()
             .join("versions")
@@ -96,8 +102,18 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
     )
     .unwrap();
     assert!(store.verify_for_start(&id).is_err());
-    // Reinstall must not replace a manifest-backed id to hide a damaged payload.
-    assert!(store.install(&manifest, source.path(), Some(uid)).is_err());
+    // A damaged active version cannot be replaced beneath a held lazy-sidecar lease.
+    assert!(store
+        .install(&manifest, source.path(), Some(uid), None)
+        .is_err());
+    drop(verified);
+    assert_eq!(
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    assert!(store.verify_for_start(&id).is_ok());
 }
 
 #[test]
@@ -106,7 +122,9 @@ fn busy_leases_allow_new_install_but_prevent_retirement() {
     let mut leases = Vec::new();
     for version in ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4"] {
         let (source, manifest) = fixture(version);
-        store.install(&manifest, source.path(), Some(uid)).unwrap();
+        store
+            .install(&manifest, source.path(), Some(uid), None)
+            .unwrap();
         leases.push(
             store
                 .verify_for_start(&CoreId::parse(&manifest.id).unwrap())
@@ -137,7 +155,9 @@ fn linked_payload_and_weakened_store_permissions_are_rejected() {
         source.path().join("sing-box"),
     )
     .unwrap();
-    assert!(store.install(&manifest, source.path(), Some(uid)).is_err());
+    assert!(store
+        .install(&manifest, source.path(), Some(uid), None)
+        .is_err());
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
     assert!(CoreStore::open(root.path(), OwnerPolicy { uid: Some(uid) }).is_err());
 }

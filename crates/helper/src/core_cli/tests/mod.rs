@@ -1,6 +1,6 @@
 use super::*;
 #[test]
-fn administrative_arguments_are_exact_and_manifest_is_part_of_stage() {
+fn administrative_arguments_are_exact_and_allow_a_root_sealed_manifest() {
     let args = |values: &[&str]| {
         values
             .iter()
@@ -28,6 +28,16 @@ fn administrative_arguments_are_exact_and_manifest_is_part_of_stage() {
         r"C:\stage\core-manifest.json",
     ]);
     assert!(InstallArgs::parse(&valid).is_ok());
+    let mut sealed = valid.clone();
+    #[cfg(unix)]
+    {
+        sealed[6] = "/root/transaction/core-manifest.json".into();
+    }
+    #[cfg(windows)]
+    {
+        sealed[6] = r"C:\root-transaction\core-manifest.json".into();
+    }
+    assert!(InstallArgs::parse(&sealed).is_ok());
     let mut duplicate = valid.clone();
     duplicate[3] = "--root".into();
     assert!(InstallArgs::parse(&duplicate).is_err());

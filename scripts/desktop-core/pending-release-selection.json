@@ -1,0 +1,35 @@
+{
+  "schema": "polaris-app-pending-release-v1",
+  "selection": {
+    "schema": "polaris-app-release-selection-v1",
+    "contractPath": "scripts/desktop-core/pending-release-contract.json",
+    "contractSha256": "0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d",
+    "version": "1.15.0-alpha.12",
+    "tag": "v1.15.0-alpha.12",
+    "tagObject": "5cedbe7a54594756da544af90ebfd1f403f2e091",
+    "sourceCommit": "577d4b9a089b71d2f0a4ca334b87264b55c10478",
+    "sourceTree": "072dacb999c07c7948816f10efaaaf371da45eb9",
+    "releaseId": 410852499,
+    "librarySha256": {
+      "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+      "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    }
+  },
+  "active": false,
+  "AppAccepted": false,
+  "sourceEvidence": {
+    "owner": "task12",
+    "delivery": "PUBLICATION-FINAL-DELIVERY.json",
+    "publicIndex": {
+      "assetId": 634479056,
+      "bytes": 973091,
+      "name": "polaris-box-assets.json",
+      "releaseId": 410852499,
+      "sha256": "af5cb4704e1c4c216928d78d84af3c29322c7c1359a42eea9902c4a0823927d2",
+      "unauthenticatedReadback": true,
+      "url": "https://github.com/polaris-arch/polaris-box/releases/download/v1.15.0-alpha.12/polaris-box-assets.json"
+    },
+    "parentAnonymousReadbackConfirmed": true
+  },
+  "migrationRequirement": "whole task-table source completion, concentrated independent review and corresponding complete App download/unpack/load/carrier validation"
+}

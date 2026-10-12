@@ -15,14 +15,21 @@ impl CallerIdentity {
     pub fn windows(sid: &str) -> Option<Self> {
         let fields: Vec<_> = sid.split('-').collect();
         if sid.len() > 184
-            || fields.len() < 4
+            || !(4..=18).contains(&fields.len())
             || fields[0] != "S"
             || fields[1] != "1"
             || fields[2..].iter().any(|part| {
                 part.is_empty()
                     || !part.bytes().all(|byte| byte.is_ascii_digit())
                     || part.parse::<u64>().is_err()
+                    || part
+                        .parse::<u64>()
+                        .is_ok_and(|value| value.to_string() != *part)
             })
+            || fields[2]
+                .parse::<u64>()
+                .is_ok_and(|value| value > 0x0000_ffff_ffff_ffff)
+            || fields[3..].iter().any(|part| part.parse::<u32>().is_err())
         {
             return None;
         }
