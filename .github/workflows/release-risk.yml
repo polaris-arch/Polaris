@@ -68,6 +68,7 @@ jobs:
       preflight: ${{ steps.impact.outputs.preflight }}
       has_package: ${{ steps.impact.outputs.has_package }}
       android: ${{ steps.impact.outputs.android }}
+      apple: ${{ steps.impact.outputs.apple }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
       native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
@@ -116,6 +117,7 @@ jobs:
               echo 'preflight=false'
               echo 'has_package=false'
               echo 'android=false'
+              echo 'apple=false'
               echo 'unregistered='
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -142,13 +144,16 @@ jobs:
           esac
 
           result="$RUNNER_TEMP/release-impact.json"
+          apple_result="$RUNNER_TEMP/apple-impact.txt"
           if [ -n "$base" ] && [ -n "$head" ] \
             && git cat-file -e "${base}^{commit}" 2>/dev/null \
             && git cat-file -e "${head}^{commit}" 2>/dev/null; then
             git diff --name-only -z "$base" "$head" | node scripts/classify-ci-impact.mjs > "$result"
+            git diff --name-only -z "$base" "$head" | node scripts/apple-ci-impact.mjs > "$apple_result"
           else
             echo "无法取得可靠 diff，故障关闭为内核门 + 四平台。"
             node scripts/classify-ci-impact.mjs --full > "$result"
+            node scripts/apple-ci-impact.mjs --full < /dev/null > "$apple_result"
           fi
 
           jq . "$result"
@@ -158,6 +163,7 @@ jobs:
             echo "preflight=$(jq -r '.preflight' "$result")"
             echo "has_package=$(jq -r '.hasPackage' "$result")"
             echo "android=$(jq -r '.android' "$result")"
+            echo "apple=$(cat "$apple_result")"
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
@@ -369,9 +375,19 @@ jobs:
       # android.yml（发行构型）上暴露。
       light_build: true
 
+  apple:
+    name: apple unsigned App and PacketTunnel gate
+    needs: classify
+    if: needs.classify.outputs.apple == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/apple.yml
+    with:
+      candidate: ${{ needs.classify.outputs.candidate }}
+
   gate:
     name: release risk gate
-    needs: [classify, desktop_core, preflight, package, android, native_payload, pc_runtime_release_policy]
+    needs: [classify, desktop_core, preflight, package, android, apple, native_payload, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
@@ -387,6 +403,8 @@ jobs:
       PACKAGE_RESULT: ${{ needs.package.result }}
       ANDROID_REQUIRED: ${{ needs.classify.outputs.android }}
       ANDROID_RESULT: ${{ needs.android.result }}
+      APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
+      APPLE_RESULT: ${{ needs.apple.result }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
@@ -428,4 +446,8 @@ jobs:
             echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
             exit 1
           fi
-          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"
+          if [ "$APPLE_REQUIRED" = true ] && [ "$APPLE_RESULT" != success ]; then
+            echo "::error::Apple App/PacketTunnel 腿未通过：$APPLE_RESULT"
+            exit 1
+          fi
+          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT apple=$APPLE_RESULT"

@@ -7,6 +7,7 @@
 
 include!("proto_wire_check.rs");
 include!("android_wire_check.rs");
+include!("apple_wire_check.rs");
 
 // 符号表与 vendored proto 原文均取自 `proto_wire_check`（此前 build.rs / tests 各存一份，
 // 两处注释都写着「一处漏加，另一处就白守」；运行期换核检查要用第三次，故下沉共用）。
@@ -21,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/started_service.proto");
     println!("cargo:rerun-if-changed=proto_wire_check.rs");
     println!("cargo:rerun-if-changed=android_wire_check.rs");
+    println!("cargo:rerun-if-changed=apple_wire_check.rs");
     Ok(())
 }
 
@@ -66,6 +68,19 @@ fn assert_proto_matches_bundled_core() {
     // AAR's JNI library. Its actual descriptor must satisfy the same wire table.
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        println!("cargo:rerun-if-env-changed=POLARIS_APPLE_WIRE_ARCHIVE");
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            let archive = std::path::PathBuf::from(
+                std::env::var_os("POLARIS_APPLE_WIRE_ARCHIVE")
+                    .expect("iOS Release wire guard requires the actual admitted static slice"),
+            );
+            println!("cargo:rerun-if-changed={}", archive.display());
+            apple_wire_check::check_apple_archive(&archive)
+                .unwrap_or_else(|report| panic!("iOS Release wire guard refused: {report}"));
+        }
+        return;
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         let aar = proto_wire_check::repo_root().join("src-tauri/gen/android/app/libs/libbox.aar");
         println!("cargo:rerun-if-changed={}", aar.display());

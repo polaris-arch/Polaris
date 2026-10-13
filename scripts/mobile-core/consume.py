@@ -51,7 +51,8 @@ def app_identity():
                  'scripts/mobile-core/native_inputs.py', 'src-tauri/gen/apple/project.yml',
                  'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
                  'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',
-                 'scripts/release-assets.mjs', 'scripts/mobile-core/build_apple_app.py']}}
+                 'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
+             'scripts/mobile-core/build_apple_app.py']}}
 
 
 def materialize_android(component, receipt_path, tools, work, cache):
@@ -141,6 +142,9 @@ def main():
     args = parser.parse_args()
     tools = {name: str(getattr(args, name)) for name in ('go', 'javap', 'readelf') if getattr(args, name) is not None}
     if args.action == 'verify-link':
+        # Xcode's build service does not transport compiler reservation fds.
+        # This CLI phase only reads frozen metadata; no compiler is launched.
+        os.environ.pop('POLARIS_BUILD_RESERVATION_FD', None)
         require(args.link_input is not None and args.link_input_sha256 is not None and args.scratch is not None,
                 'original fixed Apple link context and scratch required')
         result = verify_link(args.link_input, args.link_input_sha256, args.scratch)

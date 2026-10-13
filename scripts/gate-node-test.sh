@@ -47,6 +47,7 @@ required_tests=(
   scripts/nsis-helper-cleanup.test.mjs
   scripts/release-assets.test.mjs
   scripts/mobile-source-unit.test.mjs
+  scripts/apple-ci-impact.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -137,7 +138,8 @@ fi
 #   294 → 295（2026-10-08）卸载钩子提权清理 16 → 17 条：校验通过后某一级被换成联接点时删除中止、
 #           其后的项一项不删、退出码按「未通过校验」报告。
 #   295 → 303（main PKG-01 集成）保留 B2a 全部合同并加 8 条发布命名/ABI/摘要清单合同。
-if [ "$pass" -lt 303 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 303）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+# 303 → 307: finite Apple selection/runner/actual aggregate negative controls.
+if [ "$pass" -lt 307 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 307）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

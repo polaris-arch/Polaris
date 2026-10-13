@@ -473,6 +473,7 @@ esac
       PREFLIGHT_REQUIRED: 'true', PREFLIGHT_RESULT: 'success',
       PACKAGE_REQUIRED: 'true', PACKAGE_RESULT: 'success',
       ANDROID_REQUIRED: 'true', ANDROID_RESULT: 'success',
+      APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped',
       NATIVE_VALIDATION_REQUIRED: 'false', NATIVE_VALIDATION_RESULT: 'skipped',
     };
     const run = (body: string, required: string, result: string) => spawnSync('bash', ['-c', body], {
@@ -537,6 +538,7 @@ esac
       NATIVE_VALIDATION_REQUIRED: 'true', DESKTOP_CORE_RESULT: 'success', NATIVE_VALIDATION_RESULT: 'success',
       DESKTOP_CORE_REQUIRED: 'false', PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped',
       PACKAGE_REQUIRED: 'false', PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped',
+      APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped',
     };
     const run = (body: string, changed: Record<string, string>) => spawnSync('bash', ['-c', body], {
       env: { ...process.env, ...base, ...changed }, encoding: 'utf8',

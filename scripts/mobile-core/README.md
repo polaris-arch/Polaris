@@ -121,6 +121,33 @@ origins, bundle/App Group/device-family/platform/minimum-OS facts, and absence o
 installed static SDK payloads. It does not assert signing permission/trust,
 installation, device lifecycle or App acceptance. No Apple CI is dispatched by
 these source entries.
+The source-owned `.github/workflows/apple.yml` now calls `ci_apple.py`
+prepare/build/evidence from the existing Release Risk graph. Selection reads
+actual changed paths through `apple-ci-impact.mjs`; the aggregate refuses a
+selected failed/cancelled/skipped Apple leg. The hosted `xcode-27` runner must
+actually provide Xcode27.0 build27A266a and both SDK27.0; admission fails without
+fallback. Its one fixed `~/Code/polaris-mobile-apple-ci` root has one component
+slot, one cache (20GiB maximum including a shared Rust target), and the three
+finite device-arm64/sim-arm64/sim-amd64 App slots, built sequentially under the
+existing 16GiB peak/1GiB margin reservation and cache lease. No signing secrets,
+simulator boot, device deployment or mobile publication are part of that graph.
+The hosted preview advertises 14GiB storage; actual free space must still pass
+the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runner
+is an environment failure, never grounds to weaken the reservation or skip a
+selected leg. The eventual unified run must establish actual runner resources.
+
+The formal builder compiles through `apple_rust.py build` under its inherited
+reservation before Xcode starts; the Xcode Rust phase runs `apple_rust.py verify`
+with the admitted
+link context, explicit Cargo target, locked dependencies and iOS config. It
+checks the actual static archive/start_app and saves its byte/source/tool facts;
+it does not require a running Tauri CLI options server or regenerate tracked
+PBX/Cargo files. The original CLI development hook remains. The release wire
+check consumes the exact verified Apple static slice rather than a desktop
+binary. SDK origins, real Rust input, final carriers, link maps and original
+logs are retained in one indexed evidence ZIP; entire caches/checkout/target
+copies are excluded. Failed chains retain partial evidence without acceptance.
+
 
 `scripts/libbox-patches` and the old Apple six-patch entry remain historical
 alpha8 compatibility inputs. Their raw receipts are not relabeled; the small

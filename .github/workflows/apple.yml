@@ -1,0 +1,65 @@
+name: Apple unsigned App and PacketTunnel
+
+# Called once by the complete candidate Risk graph. No push trigger, release,
+# signing identity, simulator boot or device deployment.
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        type: string
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  POLARIS_APP_CANDIDATE: ${{ inputs.candidate || github.sha }}
+
+concurrency:
+  group: apple-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unsigned-chain:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          cache: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Exact Apple tool/source admission
+        run: python3 -B scripts/mobile-core/ci_apple.py prepare
+      - name: Pinned protobuf compiler
+        run: node scripts/fetch-protoc.mjs
+      - name: Scoped frontend tool and locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/polaris-pnpm" --no-audit --no-fund pnpm@11.24.0
+          export PATH="$RUNNER_TEMP/polaris-pnpm/node_modules/.bin:$PATH"
+          echo "$RUNNER_TEMP/polaris-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
+          pnpm --dir ui install --frozen-lockfile
+      - name: Three-slice SDK and three real unsigned App carriers
+        run: python3 -B scripts/mobile-core/ci_apple.py build
+      - name: Preserve original selected bytes on success or failure
+        if: always()
+        run: python3 -B scripts/mobile-core/ci_apple.py evidence
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-original-${{ inputs.candidate || github.sha }}
+          path: ~/Code/polaris-mobile-apple-ci/apple-original-evidence.zip
+          if-no-files-found: error
+          retention-days: 7

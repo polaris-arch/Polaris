@@ -180,6 +180,7 @@ def producer_code():
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
+             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
              'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json',
