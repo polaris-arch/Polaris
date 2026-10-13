@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { CoreVersionInfo } from '@/contracts/types/update';
+import type { HelperStatus } from '@/contracts/types/runtime';
 
 const locale = JSON.parse(readFileSync(fileURLToPath(new URL('../../../i18n/locales/zh-CN.json', import.meta.url)), 'utf8')) as Record<string, unknown>;
 function translate(key: string): string {
@@ -29,6 +30,31 @@ const cell = (markup: string, name: string): string | null =>
   new RegExp(`data-core-info="${name}"[^>]*>([^<]*)<`).exec(markup)?.[1] ?? null;
 /** 可操作控件：原生表单/按钮/链接元素，或带交互 role / tabindex 的任意元素。 */
 const INTERACTIVE = /<(?:button|input|select|textarea|a)\b|role="(?:button|switch|radio|radiogroup|combobox|listbox|checkbox|link|tab)"|tabindex=/i;
+
+/** Only two plain text spans bound to the supplied native identities may focus
+ * to expose their full explanatory tooltip. A marker alone grants no exception. */
+function verifiedIdentityNotes(markup: string, selectedCore: HelperStatus['selectedCore']) {
+  const found = new Set<string>();
+  if (!selectedCore) return { markup, found };
+  const identities: Record<string, string> = {
+    'selected-id': selectedCore.id,
+    provider: selectedCore.providerFingerprint,
+  };
+  const cleaned = markup.replace(/<span\b([^>]*)>([^<]*)<\/span>/g, (whole, rawAttributes: string, text: string) => {
+    const pairs = [...rawAttributes.matchAll(/([A-Za-z_:][\w:.-]*)="([^"]*)"/g)];
+    if (rawAttributes.replace(/([A-Za-z_:][\w:.-]*)="([^"]*)"/g, '').trim() !== '') return whole;
+    const attrs = Object.fromEntries(pairs.map(pair => [pair[1], pair[2]]));
+    if (Object.keys(attrs).length !== pairs.length || Object.keys(attrs).sort().join(',') !== 'aria-label,class,data-core-info,data-tip,tabindex') return whole;
+    const key = attrs['data-core-info'];
+    if (!Object.prototype.hasOwnProperty.call(identities, key) || found.has(key)) return whole;
+    const identity = identities[key];
+    if (!/^[a-f0-9]{64}$/.test(identity) || attrs.class !== 'mono' || attrs.tabindex !== '0'
+      || attrs['data-tip'] !== identity || attrs['aria-label'] !== identity || text !== identity.slice(0, 16)) return whole;
+    found.add(key);
+    return '';
+  });
+  return { markup: cleaned, found };
+}
 
 describe('内核只读信息卡', () => {
   it('三格都渲染，且各自给的是自己那一个字段', () => {
@@ -69,13 +95,37 @@ describe('内核只读信息卡', () => {
   ] as const)('selected content %s remains a read-only native observation', (state, label) => {
     const selectedCore = { id: 'a'.repeat(64), version: '1.15.0-alpha.12', providerFingerprint: 'b'.repeat(64), state };
     const markup = renderToStaticMarkup(<CoreInfoCard info={FULL} selectedCore={selectedCore} />);
-    expect(cell(markup, 'selected-id')).toBe(selectedCore.id);
-    expect(cell(markup, 'provider')).toBe(selectedCore.providerFingerprint);
+    expect(cell(markup, 'selected-id')).toBe(selectedCore.id.slice(0, 16));
+    expect(cell(markup, 'provider')).toBe(selectedCore.providerFingerprint.slice(0, 16));
     expect(cell(markup, 'installed-state')).toBe(label);
-    expect(markup).toContain('overflow-wrap:anywhere');
     const withoutTip = markup.replace(/<span class="info-i"[\s\S]*?<\/span>/g, '');
-    expect(withoutTip).not.toContain('data-tip=');
-    expect(INTERACTIVE.test(withoutTip)).toBe(false);
+    const notes = verifiedIdentityNotes(withoutTip, selectedCore);
+    expect([...notes.found].sort()).toEqual(['provider', 'selected-id']);
+    expect(INTERACTIVE.test(notes.markup)).toBe(false);
+  });
+
+  it('身份说明的窄豁免拒绝伪 marker、错 hash、额外属性、嵌套或真实动作', () => {
+    const selectedCore = { id: 'a'.repeat(64), version: 'fixture', providerFingerprint: 'b'.repeat(64), state: 'present' as const };
+    const note = `<span class="mono" data-core-info="selected-id" data-tip="${selectedCore.id}" tabindex="0" aria-label="${selectedCore.id}">${selectedCore.id.slice(0, 16)}</span>`;
+    expect(verifiedIdentityNotes(note, selectedCore).found.size).toBe(1);
+    expect(INTERACTIVE.test(verifiedIdentityNotes(note, selectedCore).markup)).toBe(false);
+    for (const untrusted of [
+      note.replace('data-core-info="selected-id"', 'data-core-info="fake-readonly"'),
+      note.replace(`data-tip="${selectedCore.id}"`, `data-tip="${'c'.repeat(64)}"`),
+      note.replace(`aria-label="${selectedCore.id}"`, `aria-label="${'c'.repeat(64)}"`),
+      note.replace(selectedCore.id.slice(0, 16) + '</span>', 'c'.repeat(16) + '</span>'),
+      note.replace(' tabindex=', ' role="button" tabindex='),
+      note.replace(' tabindex=', ' onclick="write()" tabindex='),
+      note.replace('tabindex="0"', 'tabindex="1"'),
+      note.replace(selectedCore.id.slice(0, 16) + '</span>', '<button>write</button></span>'),
+      note.replace('<span ', '<button ').replace('</span>', '</button>'),
+      note + note,
+      '<span tabindex="0">unbound note</span>',
+    ]) {
+      expect(INTERACTIVE.test(verifiedIdentityNotes(untrusted, selectedCore).markup), untrusted).toBe(true);
+    }
+    expect(INTERACTIVE.test(verifiedIdentityNotes(note, undefined).markup)).toBe(true);
+    expect(INTERACTIVE.test(verifiedIdentityNotes(note, { ...selectedCore, id: 'c'.repeat(64) }).markup)).toBe(true);
   });
 
   it('卡片里没有任何可操作控件', () => {

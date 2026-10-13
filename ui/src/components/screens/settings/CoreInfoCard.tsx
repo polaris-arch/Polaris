@@ -46,10 +46,10 @@ export default function CoreInfoCard({ info, selectedCore }: CoreInfoCardProps) 
       {selectedCore && (
         <>
           <SetRow label={t('helper.selectedCoreId')}>
-            <span className="mono" data-core-info="selected-id" style={{ overflowWrap: 'anywhere' }}>{selectedCore.id}</span>
+            <span className="mono" data-core-info="selected-id" data-tip={selectedCore.id} tabIndex={0} aria-label={selectedCore.id}>{selectedCore.id.slice(0, 16)}</span>
           </SetRow>
           <SetRow label={t('helper.selectedCoreProvider')}>
-            <span className="mono" data-core-info="provider" style={{ overflowWrap: 'anywhere' }}>{selectedCore.providerFingerprint}</span>
+            <span className="mono" data-core-info="provider" data-tip={selectedCore.providerFingerprint} tabIndex={0} aria-label={selectedCore.providerFingerprint}>{selectedCore.providerFingerprint.slice(0, 16)}</span>
           </SetRow>
           <SetRow label={t('helper.selectedCoreState')}>
             <span data-core-info="installed-state">{t(`helper.coreState.${selectedCore.state}`)}</span>
