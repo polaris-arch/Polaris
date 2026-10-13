@@ -61,6 +61,43 @@ class AppleEntryTests(unittest.TestCase):
         with mock.patch.dict(ci_apple.os.environ, {'GITHUB_ACTIONS': 'false'}), self.assertRaises(RuntimeError):
             ci_apple.location()
 
+    def test_hosted_selection_rejects_default_xcode_wrong_build_and_either_old_sdk_before_tool_install(self):
+        value = ci_apple.load()
+        apple = value['apple']
+        expected_xcode = 'Xcode ' + apple['xcodeVersion'] + '\nBuild version ' + apple['xcodeBuild']
+        developer = Path('/selected/Xcode_27.1_beta.app/Contents/Developer')
+        candidate = 'a' * 40
+        admitted = 'control: exact selected tools admitted'
+        cases = [
+            ('Xcode 27.0\nBuild version 27A266a', apple['iPhoneSDK'], apple['simulatorSDK'],
+             'runner does not provide the exact selected Xcode; no fallback/skip'),
+            ('Xcode ' + apple['xcodeVersion'] + '\nBuild version 27A266a', apple['iPhoneSDK'], apple['simulatorSDK'],
+             'runner does not provide the exact selected Xcode; no fallback/skip'),
+            (expected_xcode, '27.0', apple['simulatorSDK'], 'runner does not provide the exact selected SDK'),
+            (expected_xcode, apple['iPhoneSDK'], '27.0', 'runner does not provide the exact selected SDK'),
+            (expected_xcode, apple['iPhoneSDK'], apple['simulatorSDK'], admitted),
+        ]
+        for xcode, device_sdk, simulator_sdk, reason in cases:
+            with self.subTest(xcode=xcode, device_sdk=device_sdk, simulator_sdk=simulator_sdk):
+                answers = {('git', 'rev-parse', 'HEAD'): candidate, ('xcodebuild', '-version'): xcode,
+                    ('xcrun', '--sdk', 'iphoneos', '--show-sdk-version'): device_sdk,
+                    ('xcrun', '--sdk', 'iphonesimulator', '--show-sdk-version'): simulator_sdk}
+                selected_path = mock.Mock()
+                selected_path.resolve.return_value = developer
+                with mock.patch.object(ci_apple, 'producer_code', return_value={}), \
+                        mock.patch.object(ci_apple, 'location', return_value=Path('/isolated/entry')), \
+                        mock.patch.dict(ci_apple.os.environ, {'POLARIS_APP_CANDIDATE': candidate}), \
+                        mock.patch.object(ci_apple, 'Path', return_value=selected_path) as path, \
+                        mock.patch.object(ci_apple, 'run', side_effect=lambda args, **_: answers[tuple(args)]) as run, \
+                        mock.patch.object(ci_apple, 'private_dir', side_effect=RuntimeError(admitted)) as tools, \
+                        self.assertRaisesRegex(RuntimeError, '^' + reason + '$'):
+                    ci_apple.prepare()
+                path.assert_called_once_with('/Applications/Xcode_27.1_beta.app/Contents/Developer')
+                selected_path.resolve.assert_called_once_with(strict=True)
+                for call in run.call_args_list[1:]:
+                    self.assertEqual(call.kwargs['env']['DEVELOPER_DIR'], str(developer))
+                self.assertEqual(tools.call_count, int(reason == admitted))
+
     def test_actual_rust_link_verifier_refuses_changed_archive_and_drops_xcode_fd(self):
         from artifacts import file_pin
         from fork_input import canonical, sha

@@ -136,9 +136,12 @@ The source-owned `.github/workflows/apple.yml` now calls `ci_apple.py`
 prepare/build/evidence from the existing Release Risk graph. Selection reads
 actual changed paths through `apple-ci-impact.mjs`; the aggregate refuses a
 selected failed/cancelled/skipped Apple leg. The hosted `xcode-27` runner must
-actually provide Xcode27.0 build27A266a and both SDK27.0; admission fails without
-fallback. Its one fixed `~/Code/polaris-mobile-apple-ci` root has one component
-slot, one cache (20GiB maximum including a shared Rust target), and the three
+actually provide Xcode27.1 build27A9269 and both SDK27.1, explicitly selected via
+`/Applications/Xcode_27.1_beta.app`; admission fails without fallback. This SDK
+declares the viewport's iOS27.1 APIs; their runtime availability guards and the
+iOS17.0 App deployment target remain. Its one fixed `~/Code/polaris-mobile-apple-ci`
+root has one component slot, one cache (20GiB maximum including a shared Rust
+target), and the three
 finite device-arm64/sim-arm64/sim-amd64 App slots, built sequentially under the
 existing 16GiB peak/1GiB margin reservation and cache lease. No signing secrets,
 simulator boot, device deployment or mobile publication are part of that graph.
