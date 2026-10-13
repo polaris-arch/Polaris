@@ -252,6 +252,7 @@ class AppleEntryTests(unittest.TestCase):
             library.mkdir(parents=True)
             raw = single_fat_archive(object_archive(0x100000c, 0, 2))
             (library / 'Libbox').write_bytes(raw)
+            (root / 'cache').mkdir(mode=0o700)
             rust_archive = root / 'cache/rust-target/aarch64-apple-ios/release/libpolaris_lib.a'
             rust_archive.parent.mkdir(parents=True)
             rust_archive.write_bytes(b'!<arch>\nunaccepted archive fixture')
