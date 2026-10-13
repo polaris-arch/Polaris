@@ -360,3 +360,12 @@ test('fixed native cleaner requires Windows package validation without a real ke
   assert.equal(result.hasPackage, true);
   assert.deepEqual(result.unregisteredScopes, []);
 });
+
+// Frozen helper/cleaner metadata changes every desktop carrier, not Android.
+test('compiled core identity entry selects all four desktop packaging targets', () => {
+  const result = classifyImpact(['scripts/prepare-core-identity.mjs']);
+  assert.deepEqual(result.platforms, [...ALL_PACKAGE_PLATFORMS]);
+  assert.equal(result.hasPackage, true);
+  assert.equal(result.android, false);
+  assert.deepEqual(result.unregisteredScopes, []);
+});

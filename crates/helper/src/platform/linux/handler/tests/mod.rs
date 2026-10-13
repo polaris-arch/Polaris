@@ -212,6 +212,7 @@ static NOOP_RESOLVED_DNS: NoopResolvedDns = NoopResolvedDns;
 struct MockResolvedDns {
     calls: StdMutex<Vec<Vec<String>>>,
     error: Option<String>,
+    revert_error: Option<String>,
 }
 
 impl ResolvedDnsOps for MockResolvedDns {
@@ -229,7 +230,7 @@ impl ResolvedDnsOps for MockResolvedDns {
             .lock()
             .unwrap()
             .push(vec!["revert".into(), interface_name.into()]);
-        self.error.clone().map_or(Ok(()), Err)
+        self.revert_error.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -1485,7 +1486,7 @@ fn wire_forms_match_go_source() {
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
-            "OK pong uid=0 v1 build={}",
+            "OK pong uid=0 v2 build={}",
             polaris_helper_proto::build_identity::current()
         )
     );
@@ -1627,4 +1628,36 @@ fn hidden_already_birth_cannot_be_relabeled_with_a_requested_core_id() {
     assert_eq!(conn.writes(), ["ERR core-occupied"]);
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
     assert!(forwards.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failed_dns_set_releases_reservation_only_after_confirmed_rollback() {
+    for rollback_error in [None, Some("rollback failed".to_string())] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(1000, 1000);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let resolved = MockResolvedDns {
+            error: Some("set failed".into()),
+            revert_error: rollback_error.clone(),
+            ..Default::default()
+        };
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let state = Mutex::new(HandlerState::new());
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_owner, rollback_error.map(|_| 1000));
+        assert_eq!(resolved.calls.lock().unwrap().len(), 2);
+    }
 }

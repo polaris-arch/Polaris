@@ -17,7 +17,6 @@
 
 use crate::platform::windows::logic;
 use crate::platform::windows::ops::{NetTableOps, ProcOps};
-use polaris_helper_proto::Platform;
 mod native_birth;
 use crate::token::{is_authed_constant_time, TokenStore};
 use native_birth::{stop_locked, NativeCustody};
@@ -64,6 +63,8 @@ pub struct WinHelper<T, P, N> {
     /// `Arc<Mutex<..>>`：child 状态须在**父死看护后台线程**（W15）与管道命令线程间共享（Go 的
     /// 包级 `mu`/`child` 全局，goroutine 直接引用；Rust 用 Arc 共享所有权）。
     child_mu: Arc<Mutex<ChildState>>,
+    // Admission and caller-scoped network writes commit under one reservation.
+    control_mu: Mutex<()>,
     dns_admission: crate::platform::windows::ops::DnsFlushAdmission,
     token: T,
     /// `Arc<P>`：父死看护的 `on_parent_dead` 闭包（后台线程）须持 proc 收割 child，故需共享所有权。
@@ -194,6 +195,7 @@ where
     pub fn new(token: T, proc: P, net: N, support_dir: impl Into<String>) -> Self {
         Self {
             child_mu: Arc::new(Mutex::new(ChildState::default())),
+            control_mu: Mutex::new(()),
             dns_admission: crate::platform::windows::ops::DnsFlushAdmission::default(),
             token,
             proc: Arc::new(proc),
@@ -333,6 +335,25 @@ where
         req: Request,
         peer: Option<&crate::user_control::NativePeer>,
     ) -> HandleOutcome {
+        let _reservation = if matches!(
+            &req,
+            Request::NativeStartPinned(_)
+                | Request::PrepareHelperUpgrade
+                | Request::CancelHelperUpgrade
+                | Request::RouteAdd(_)
+                | Request::RouteDel(_)
+                | Request::IfaceMetric { .. }
+                | Request::FlushDns
+                | Request::WindowsFlushDnsNative
+                | Request::FreePort { .. }
+        ) {
+            match self.control_mu.lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => return native_busy(),
+            }
+        } else {
+            None
+        };
         if let Some(peer) = peer {
             let allowed = self.child_mu.lock().is_ok_and(|mut state| {
                 if let Some(target) = state.native.as_ref().map(|native| native.target) {

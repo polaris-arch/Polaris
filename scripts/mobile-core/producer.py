@@ -141,13 +141,19 @@ def tool_facts(args, value, env):
         jdk, ndk = Path(args.jdk).resolve(strict=True), Path(args.ndk).resolve(strict=True)
         java = run([jdk / 'bin/java', '--version'], env=env)
         require(re.search(r'^(?:openjdk|java) 17[. ]', java), 'formal JNI requires actual Java17')
+        javac = Path(run(['which', 'javac'], env=env).strip()).resolve(strict=True)
+        require(javac == (jdk / 'bin/javac').resolve(strict=True), 'actual javac resolution differs from pinned JDK')
+        javac_version = run([javac, '--version'], env=env).strip()
+        require(re.fullmatch(r'javac 17(?:[.][0-9]+)*(?:[-+].*)?', javac_version), 'actual javac must be Java17')
         paths['javap'] = str(jdk / 'bin/javap')
         host = 'linux-x86_64' if os.uname().sysname == 'Linux' else 'darwin-x86_64'
         paths['readelf'] = str((ndk / 'toolchains/llvm/prebuilt' / host / 'bin/llvm-readelf').resolve(strict=True))
         binaries = ndk / 'toolchains/llvm/prebuilt' / host / 'bin'
         compiler_paths = {name: str((binaries / name).resolve(strict=True)) for name in
                           ['clang', 'clang++', 'ld.lld', 'llvm-ar']}
-        result.update(java=java, ndkProperties=(ndk / 'source.properties').read_text(),
+        result.update(java={'path': str((jdk / 'bin/java').resolve(strict=True)),
+                            **file_pin((jdk / 'bin/java').resolve(strict=True)), 'version': java}, javac={'path': str(javac), **file_pin(javac), 'version': javac_version},
+                      ndkProperties=(ndk / 'source.properties').read_text(),
                       readelf=file_pin(paths['readelf']), javap=file_pin(paths['javap']),
                       compilers={name: {'path': path, **file_pin(path), 'version': run([path, '--version'], env=env)}
                                  for name, path in compiler_paths.items()})
@@ -225,11 +231,16 @@ def execute(args):
     initial_source = verify_source(args.source, value)
     with lease(args.work, args.cache, value) as (work, cache):
         scratch = private_dir(work / 'scratch')
-        # gomobile creates its binding main package in the owned TMPDIR. The
-        # supplied exact source is read-only, checked before and after bind;
-        # do not clone another full fork per App/producer invocation.
-        source = Path(args.source).resolve(strict=True)
-        source_observation = verify_source(source, value)
+        # The fixed generator writes source/build/<arch>, despite TMPDIR.
+        # One fixed shared-object view per work slot contains that mutation;
+        # distinct producers never share its generated directories.
+        require(work.is_relative_to(Path.home() / 'Code') or not work.is_relative_to(Path.home()),
+                'producer Git build view must be under Code or outside home')
+        source = work / 'build-view'
+        if not source.exists():
+            run(['git', 'clone', '--no-checkout', '--shared', Path(args.source).resolve(strict=True), source])
+            run(['git', 'checkout', '--detach', value['sourceCommit']], cwd=source)
+        source_observation = verify_source(source, value, generator_outputs=True)
         require(source_observation == initial_source, 'source changed during admission')
         if args.platform == 'android':
             sdk, jar = prepare_view(work, args.sdk, args.ndk, value['android'])
@@ -257,7 +268,9 @@ def execute(args):
         component = work / (value['android']['outputName'] if args.platform == 'android' else 'Libbox.xcframework')
         receipt_path = work / 'component-receipt.json'
         from transaction import recover
-        recover([(work / ('stage.aar' if args.platform == 'android' else 'stage.xcframework'), component),
+        stage_root = private_dir(work / 'staging')
+        stage_component = stage_root / ('stage.aar' if args.platform == 'android' else 'Libbox.xcframework')
+        recover([(stage_component, component),
                  (work / 'stage-component-receipt.json', receipt_path),
                  (work / 'stage-original-bind.log', work / 'original-bind.log')], work)
         run_tool = lambda command: run(command, cwd=source, env=env)
@@ -281,7 +294,9 @@ def execute(args):
                     require(tree_inventory(component) == receipt['output']['inventory'], 'retained old framework bytes differ')
                 rebuild = True
         if rebuild:
-            staged = work / ('stage.aar' if args.platform == 'android' else 'stage.xcframework')
+            require(not (source / 'build').exists(),
+                    'original generator outputs retained; explicit recovery required before rebinding')
+            staged = stage_component
             require(not staged.exists(), 'unaccepted prior stage retained; inspect before recovery')
             recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
             from fork_input import bind_command
@@ -293,13 +308,16 @@ def execute(args):
             # even if the Go compiler cache already contains the target.
             env['GODEBUG'] = 'gocacheverify=1'
             run(command, cwd=source, env=env, log=log)
-            require(verify_source(source, value) == source_observation, 'source changed during bind')
+            require(verify_source(source, value, generator_outputs=True) == source_observation, 'source changed during bind')
             require(tool_facts(args, value, env)[1] == identities and producer_code() == binding['producer'], 'producer/tool input changed')
             expected = 'polaris-mobile-' + fp
             output = (inspect_aar(staged, value, graph, tools, run_tool, scratch, expected) if args.platform == 'android'
                       else inspect_framework(staged, value, graph, expected))
             from native_inputs import collect, verify
             origins = collect(scratch, log, args.platform, output, cache)
+            if (source / 'build').exists():
+                origins['generatorOutputRoot'] = str(source / 'build')
+                origins['generatorOutputInventory'] = tree_inventory(source / 'build')
             verify(origins, scratch, log)
             receipt = {'schema': 'polaris-mobile-component-v1', 'platform': args.platform, 'input': binding,
                        'command': command, 'declaredPlan': recipe['facts'], 'sourceOverlay': 0, 'output': output,

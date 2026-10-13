@@ -104,6 +104,10 @@ export function scopeOf(rawPath) {
  * 用来把「整棵树四平台」收窄成单腿。
  */
 export const PACKAGE_IMPACT_SCOPES = Object.freeze({
+  'scripts/prepare-core-identity.mjs': {
+    kernel: false, platforms: ALL,
+    why: 'Pre-compilation helper/cleaner/core identity and final byte verification feed all four desktop carriers.',
+  },
   'scripts/release-assets.mjs': {
     kernel: false,
     platforms: ALL,

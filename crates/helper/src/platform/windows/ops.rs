@@ -272,6 +272,8 @@ struct MockProcOpsInner {
     native_retire_allowed: std::sync::atomic::AtomicBool,
     native_start_pause:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    route_pause:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     birth_count: std::sync::atomic::AtomicU32,
     /// `start_singbox` 累计调用次数。
     pub start_calls: std::sync::atomic::AtomicUsize,
@@ -380,6 +382,14 @@ impl MockProcOps {
         resume: std::sync::mpsc::Receiver<()>,
     ) {
         *self.inner.native_start_pause.lock().unwrap() = Some((entered, resume));
+    }
+
+    pub fn pause_route(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.route_pause.lock().unwrap() = Some((entered, resume));
     }
 
     /// 预设 pid → 映像路径（freeport 测试用）。
@@ -744,6 +754,10 @@ impl ProcOps for MockProcOps {
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {
+        if let Some((entered, resume)) = self.inner.route_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         self.inner
             .route_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

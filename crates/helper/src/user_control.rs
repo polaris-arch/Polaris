@@ -115,7 +115,7 @@ pub fn register(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let result = (|| {
+    let result: io::Result<()> = (|| {
         let mut file = options.open(&temporary)?;
         file.write_all(raw.as_bytes())?;
         file.sync_all()?;

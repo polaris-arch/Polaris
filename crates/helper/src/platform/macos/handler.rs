@@ -36,15 +36,13 @@ use crate::platform::macos::whitelist;
 use crate::token::{check_token, TokenCheck, TokenStore};
 use polaris_helper_proto::request::{RouteParams, StartParams};
 use polaris_helper_proto::response::{
-    NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, StartTiming, Status, Stop,
+    NativeBirthStart, NativeBirthStatus, NativeBirthStop, ResponseKind, Status, Stop,
 };
 use polaris_helper_proto::{
-    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Platform, Request,
-    Response,
+    stop_pid_matches, Error as ProtoError, ErrorCode, HelperBirthTarget, Request, Response,
 };
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Instant;
 
 /// Machine support/store roots. Core id and config registration are resolved
 /// from the authenticated native caller, never from service argv.
@@ -267,9 +265,22 @@ pub fn dispatch_from_peer(
         return Response::Err(ProtoError::new(ErrorCode::Auth));
     }
     if services.native_custody_active()
-        && matches!(req, Request::RouteAdd(_) | Request::RouteDel(_) | Request::DefaultRestore { .. } | Request::FlushDns | Request::MacProxyTransaction { .. } | Request::MacProxyCompareTransaction { .. } | Request::Cleanup)
-        && !services.native_caller_allowed(peer_uid, None) {
-        return Response::Err(ProtoError::with_detail(ErrorCode::Auth, "slot-owned-by-other-user"));
+        && matches!(
+            req,
+            Request::RouteAdd(_)
+                | Request::RouteDel(_)
+                | Request::DefaultRestore { .. }
+                | Request::FlushDns
+                | Request::MacProxyTransaction { .. }
+                | Request::MacProxyCompareTransaction { .. }
+                | Request::Cleanup
+        )
+        && !services.native_caller_allowed(peer_uid, None)
+    {
+        return Response::Err(ProtoError::with_detail(
+            ErrorCode::Auth,
+            "slot-owned-by-other-user",
+        ));
     }
 
     // Freeport can signal PID owners, so native custody fences it before any runner call.

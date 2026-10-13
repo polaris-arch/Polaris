@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest } from './desktop-core/source-graph.mjs';
+import { selectedCoreManifest } from './lib/core-identity.mjs';
 
 // `macos-nested-code.sh` 只在 macOS 打包腿上真跑（那里才有 codesign）。这里测的是它的**控制流**：
 // 谁只被校验、谁可以被补签、什么时候必须失败。`file` 与 `codesign` 换成同名桩放在 PATH 最前：
@@ -78,14 +79,21 @@ function fixture(files, { ref } = {}) {
     chmodSync(join(bin, name), 0o755);
   }
   const app = join(root, 'Polaris.app');
-  const core = join(app, 'Contents', 'Resources', '_up_', 'resources', 'mac-arm64');
-  mkdirSync(core, { recursive: true });
-  for (const [name, body] of Object.entries(files)) writeFileSync(join(core, name), body);
   const refBytes = ref ?? files['sing-box'] ?? ARM_SIGNED;
   const key = refBytes.startsWith('MACHO-x86_64') ? 'mac-x64' : 'mac-arm64';
+  const core = join(app, 'Contents', 'Resources', '_up_', 'resources', key);
+  mkdirSync(core, { recursive: true });
+  for (const [name, body] of Object.entries(files)) writeFileSync(join(core, name), body);
   const refPath = join(root, 'resources', key, 'sing-box');
   mkdirSync(dirname(refPath), { recursive: true });
   writeFileSync(refPath, refBytes);
+  const helper = files['polaris-helper'] ?? ARM_SIGNED;
+  writeFileSync(join(dirname(refPath), 'polaris-helper'), helper);
+  const contract = { version: '1.0.0-fixture', platforms: { [key]: {
+    providerFingerprint: 'a'.repeat(64), core: { member: 'sing-box', bytes: Buffer.byteLength(refBytes), sha256: digest(refBytes) }, sidecar: null,
+  } } };
+  const installation = JSON.stringify(selectedCoreManifest(contract, key, '1.0.0-fixture', digest(helper)));
+  for (const directory of [dirname(refPath), core]) writeFileSync(join(directory, 'core-manifest.json'), installation);
   const metadata = join(root, 'resources/.source-receipts');
   mkdirSync(metadata);
   const facts = { schema: 'polaris-desktop-core-v1', platform: key, binarySha256: digest(refBytes),
@@ -130,17 +138,19 @@ function withFixture(files, options, body) {
   }
 }
 
-test('seal：内核只校验，验不过的 helper 才被补签，签名命令的唯一对象是 helper', behaviour, () => {
-  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE, 'notes.txt': 'plain' }, {}, (fx) => {
-    const result = run(fx, 'seal');
+test('seal：冻结的 helper/core 只读验签，不发签名命令', behaviour, () => {
+  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
+    const before = snapshot(fx.core), result = run(fx, 'seal');
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(readFileSync(join(fx.core, 'polaris-helper'), 'utf8'), `${ARM_BARE}SIGNED`);
-    assert.equal(readFileSync(join(fx.core, 'notes.txt'), 'utf8'), 'plain');
-    const signs = signCalls(fx);
-    assert.equal(signs.length, 1, `签名类调用应恰好 1 次：${JSON.stringify(signs)}`);
-    assert.ok(signs[0].endsWith('/polaris-helper'), signs[0]);
-    assert.match(result.stdout, /::warning::.*polaris-helper 没有有效签名/);
-    assert.match(result.stdout, /内核 1 份与源内核逐字节相同.*本次补签 1 份/);
+    assert.deepEqual(snapshot(fx.core), before);
+    assert.deepEqual(signCalls(fx), []);
+    assert.match(result.stdout, /本次补签 0 份/);
+  });
+  withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, {}, (fx) => {
+    const before = snapshot(fx.core), result = run(fx, 'seal');
+    assert.equal(result.status, 1);
+    assert.deepEqual(snapshot(fx.core), before);
+    assert.deepEqual(signCalls(fx), []);
   });
 });
 
@@ -158,33 +168,16 @@ test('actual nested-code entry rejects malformed explicit release selection inst
   });
 });
 
-test('seal：helper 补签的点名级别 —— 纯 x86_64 没有签名是每次打包的预期形态（notice），其余是异常（warning）', behaviour, () => {
-  for (const [helper, core, level] of [
-    [X64_BARE, X64_SIGNED, 'notice'],
-    [ARM_BARE, ARM_SIGNED, 'warning'],
-    [FAT_BARE, ARM_SIGNED, 'warning'],
-    [X64_BROKEN, X64_SIGNED, 'warning'],
-    [ARM_BROKEN, ARM_SIGNED, 'warning'],
-  ]) {
-    withFixture({ 'sing-box': core, 'polaris-helper': helper }, {}, (fx) => {
-      const result = run(fx, 'seal');
-      assert.equal(result.status, 0, `${helper}: ${result.stderr}`);
-      const named = result.stdout.split('\n').filter((line) => /polaris-helper 没有有效签名/.test(line));
-      assert.equal(named.length, 1, `${helper}: 补签必须点名恰好一次：${result.stdout}`);
-      assert.ok(named[0].startsWith(`::${level}::macos-nested-code: `), `${helper}: 应为 ${level}，实为 ${named[0]}`);
-      // 级别只影响提示，不影响动作：照样补签、照样复验、照样计数。
-      assert.equal(signCalls(fx).length, 1);
-      assert.equal(readFileSync(join(fx.core, 'polaris-helper'), 'utf8'), `${helper}SIGNED`);
-      assert.match(result.stdout, /本次补签 1 份/);
+test('seal/verify：所有架构 helper 未签或损坏均拒绝且不补签', behaviour, () => {
+  for (const helper of [X64_BARE, ARM_BARE, FAT_BARE, X64_BROKEN, ARM_BROKEN]) {
+    for (const mode of ['seal', 'verify']) withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': helper }, {}, (fx) => {
+      const before = snapshot(fx.core), result = run(fx, mode);
+      assert.equal(result.status, 1, result.stdout);
+      assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
+      assert.deepEqual(snapshot(fx.core), before);
+      assert.deepEqual(signCalls(fx), []);
     });
   }
-  // verify 模式不因级别放宽而放行：没有签名的 x86_64 helper 在最终产物里仍是失败。
-  withFixture({ 'sing-box': X64_SIGNED, 'polaris-helper': X64_BARE }, {}, (fx) => {
-    const result = run(fx, 'verify');
-    assert.equal(result.status, 1, result.stdout);
-    assert.match(result.stderr, /最终产物里的 polaris-helper 没有有效签名/);
-    assert.deepEqual(signCalls(fx), []);
-  });
 });
 
 test('seal：arm64 内核没有签名或签名无效必须失败，且不补签（一次签名命令都不发）', behaviour, () => {
@@ -245,8 +238,8 @@ test('verify：全部有效时通过，不改任何字节，不发任何签名�
 test('verify：内核或 helper 验不过都必须失败，且只读（不补签、不改字节）', behaviour, () => {
   for (const [files, why] of [
     [{ 'sing-box': ARM_BARE, 'polaris-helper': ARM_SIGNED }, /内核没有签名/],
-    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, /最终产物里的 polaris-helper 没有有效签名/],
-    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BROKEN }, /最终产物里的 polaris-helper 没有有效签名/],
+    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, /helper.*签名必须在 App 编译前完成/],
+    [{ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BROKEN }, /helper.*签名必须在 App 编译前完成/],
   ]) {
     withFixture(files, {}, (fx) => {
       const before = snapshot(fx.core);
@@ -259,11 +252,11 @@ test('verify：内核或 helper 验不过都必须失败，且只读（不补签
   }
 });
 
-test('seal：helper 的签名命令 rc=0 但没签上，必须失败（不把「跑过签名」当成「签上了」）', behaviour, () => {
+test('seal：签名桩可返回0也不能使未签 helper 进入补签路径', behaviour, () => {
   withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE }, {}, (fx) => {
     const result = run(fx, 'seal', { STUB_SIGN_NOOP: '1' });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /补签后仍验不过/);
+    assert.match(result.stderr, /helper.*签名必须在 App 编译前完成/);
   });
 });
 
@@ -352,17 +345,16 @@ function functionBody(name) {
 }
 const codeLines = (lines) => lines.filter((line) => !/^\s*#/.test(line));
 
-test('源码面：会改写文件的命令只有 helper 那一处，内核路径上没有任何签名或改写命令', () => {
+test('源码面：helper/core 路径均无签名或载荷改写命令', () => {
   const MUTATING = /--sign\b|--force\b|--remove-signature|\bstrip\b|\blipo\b|install_name_tool|\bxattr\b|\bchmod\b|\bcp\b|\bmv\b|\btouch\b/;
   const all = codeLines(scriptText.split(/\r?\n/));
   // 取材面自检：剥注释不能把代码剥没。
   assert.ok(all.some((line) => line.includes('codesign --verify --strict')));
 
   const mutating = all.filter((line) => MUTATING.test(line)).map((line) => line.trim());
-  assert.deepEqual(mutating, ['codesign --force --sign - --timestamp=none "$f"']);
-  assert.ok(codeLines(functionBody('check_helper')).some((line) => line.trim() === mutating[0]), '补签不在 check_helper 里');
+  assert.deepEqual(mutating, [], '载荷路径禁止包后補签或改写');
 
-  for (const name of ['check_core', 'sig_state']) {
+  for (const name of ['check_core', 'check_helper', 'sig_state']) {
     const body = codeLines(functionBody(name));
     assert.ok(body.length > 2, `${name} 的本体取空了`);
     assert.deepEqual(body.filter((line) => MUTATING.test(line)), [], `${name} 里出现改写命令`);
@@ -397,10 +389,10 @@ test(
       : `本机没有 bash 3.2（bash 是 ${localBash ?? '缺失'}；/bin/bash 与 POLARIS_BASH32 都不是 3.2）—— 「3.2 可跑」在这里没有被执行过，真判断在 macOS 打包腿`,
   },
   () => {
-    withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_BARE, 'notes.txt': 'plain' }, {}, (fx) => {
+    withFixture({ 'sing-box': ARM_SIGNED, 'polaris-helper': ARM_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
       const sealed = run(fx, 'seal', {}, bash32);
       assert.equal(sealed.status, 0, sealed.stderr);
-      assert.match(sealed.stdout, /内核 1 份与源内核逐字节相同.*本次补签 1 份/);
+      assert.match(sealed.stdout, /内核 1 份与源内核逐字节相同.*本次补签 0 份/);
       const verified = run(fx, 'verify', {}, bash32);
       assert.equal(verified.status, 0, verified.stderr);
     });
@@ -480,7 +472,7 @@ test(
       withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_BARE, 'notes.txt': 'plain' }, {}, (fx) => {
         const sealed = run(fx, 'seal', env);
         assert.equal(sealed.status, 0, sealed.stderr);
-        assert.match(sealed.stdout, /未签名的 x86_64 1 份.*本次补签 1 份/);
+        assert.match(sealed.stdout, /未签名的 x86_64 1 份.*本次补签 0 份/);
         assert.equal(run(fx, 'verify', env).status, 0);
       });
       withFixture({ 'sing-box': ARM_BROKEN, 'polaris-helper': ARM_SIGNED }, {}, (fx) => {

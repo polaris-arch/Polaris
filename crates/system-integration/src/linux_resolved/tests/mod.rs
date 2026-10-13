@@ -176,3 +176,21 @@ fn checked_io_failure_is_not_the_legacy_missing_marker() {
         .contains("fixture denied"));
     assert!(controller.ops.calls.lock().unwrap().is_empty());
 }
+
+#[test]
+fn failed_takeover_and_failed_revert_preserve_recovery_marker() {
+    let mut controller = controller(MockOps {
+        takeover_error: Some("set partially failed".into()),
+        revert_error: Some("native revert failed".into()),
+        ..Default::default()
+    });
+    assert!(controller.takeover().is_err());
+    assert!(controller.has_marker());
+    assert_eq!(
+        *controller.ops.calls.lock().unwrap(),
+        ["takeover", "revert"]
+    );
+    controller.ops.revert_error = None;
+    controller.restore().unwrap();
+    assert!(!controller.has_marker());
+}

@@ -424,3 +424,37 @@ fn pinned_admission_binds_owner_and_content_under_the_same_slot_lock() {
     assert_eq!(probe.kills.load(Ordering::SeqCst), 0);
     assert!(custody.is_current(&birth));
 }
+
+#[test]
+fn authorization_does_not_wait_for_post_exit_tail_or_invert_its_locks() {
+    let custody = Arc::new(NativeCustody::default());
+    let (birth, probe) = install(&custody, target(510, 4));
+    let (answer, received) = mpsc::channel();
+    let barrier = std::sync::Barrier::new(2);
+    let timely = std::thread::scope(|scope| {
+        // Retain the exact native-child/tail critical section. Release it after
+        // the observation even for the old inversion, so this regression cannot
+        // deadlock its test process while reporting a failed deadline.
+        let owned = birth.owned.lock().unwrap();
+        let c = &custody;
+        let b = &birth;
+        let ready = &barrier;
+        scope.spawn(move || {
+            ready.wait();
+            answer
+                .send((
+                    c.caller_may_stop(Some(0), b.target),
+                    c.caller_allowed(Some(0), None),
+                ))
+                .unwrap();
+        });
+        barrier.wait();
+        let result = received.recv_timeout(Duration::from_secs(1));
+        drop(owned);
+        result
+    });
+    assert_eq!(timely.unwrap(), (true, true));
+    probe.exited.store(true, Ordering::SeqCst);
+    custody.drive(&birth, Instant::now(), &|| Ok(()));
+    assert!(!custody.active());
+}

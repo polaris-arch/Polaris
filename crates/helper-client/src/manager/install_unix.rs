@@ -36,8 +36,12 @@ secure_dir() {{
 secure_dir {parent}
 secure_dir "$SUPPORT"
 secure_dir "$COREDIR"
-LOCK="$SUPPORT/helper-install.lock"
-if ! mkdir -m 0700 "$LOCK"; then echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; fi
+[ ! -e "$SUPPORT/helper-install.lock" ] && [ ! -L "$SUPPORT/helper-install.lock" ] || {{ echo LEGACY_HELPER_INSTALL_RECOVERY_REQUIRED >&2; exit 75; }}
+LOCK="$SUPPORT/helper-install.lease"
+if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 75; fi
+[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || {{ echo HELPER_INSTALL_LOCK_INVALID >&2; exit 1; }}
+exec 9>>"$LOCK"
+LEASED=0
 TXDIR=''
 ADMITTED=0
 MUTATED=0
@@ -51,9 +55,9 @@ RECORD="$SUPPORT/helper-installed.json"
 cleanup() {{
   rc=$?
   trap - EXIT HUP INT TERM
-  if [ "$ADMITTED" -eq 1 ]; then "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || true; fi
-  if [ -n "$TXDIR" ]; then rm -rf "$TXDIR"; fi
-  rmdir "$LOCK"
+  if [ "$ADMITTED" -eq 1 ]; then "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || {{ touch "$TXDIR/recovery-required"; rc=1; }}; fi
+  if [ "$LEASED" -eq 1 ]; then "$TXDIR/helper" lease-release --lock "$LOCK" --fd 9 || {{ touch "$TXDIR/recovery-required"; rc=1; }}; fi
+  if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR"; fi
   exit "$rc"
 }}
 trap cleanup EXIT
@@ -67,6 +71,14 @@ chown root:"$GROUP" "$TXDIR/core-manifest.json"; chmod 0600 "$TXDIR/core-manifes
 hash_file() {{ {hash_command}; }}
 [ "$(hash_file "$TXDIR/helper")" = {helper_hash} ] || {{ echo HELPER_BUNDLE_MISMATCH >&2; exit 1; }}
 [ "$(hash_file "$TXDIR/core-manifest.json")" = {manifest_hash} ] || {{ echo CORE_BUNDLE_MISMATCH >&2; exit 1; }}
+"$TXDIR/helper" lease-acquire --lock "$LOCK" --fd 9 || {{ echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }}
+LEASED=1
+# An interrupted transaction is an independent recovery object, not a stale
+# directory lock. Preserve it and refuse replacement until exact recovery.
+for OLD in "$SUPPORT"/helper-upgrade.*; do
+  [ "$OLD" = "$TXDIR" ] || [ ! -d "$OLD" ] || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+done
+printf '%s\n' staging > "$TXDIR/transaction-phase"
 printf '%s' {token} > "$TXDIR/user-token"
 chmod 0600 "$TXDIR/user-token"
 "$TXDIR/helper" core-install --root "$COREDIR" --source {payload} --manifest "$TXDIR/core-manifest.json" --source-owner {identity}
@@ -107,7 +119,8 @@ rollback() {{
     "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || OK=0
   fi
   rm -f "$DEST.new.$$" "$DESCRIPTOR.new.$$" "$RECORD.new.$$"
-  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR"; rmdir "$LOCK"; else echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
+  if [ "$LEASED" -eq 1 ]; then "$TXDIR/helper" lease-release --lock "$LOCK" --fd 9 || OK=0; fi
+  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR"; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
   exit "$rc"
 }}
 "#,
@@ -240,6 +253,7 @@ if [ "$WAS_ACTIVE" -eq 1 ]; then
   fi
   ADMITTED=1
 fi
+printf '%s\n' service-mutation > "$TXDIR/transaction-phase"
 MUTATED=1
 if [ "$WAS_ACTIVE" -eq 1 ]; then stop_service; fi
 if [ "$KEEP_HELPER" -eq 0 ]; then

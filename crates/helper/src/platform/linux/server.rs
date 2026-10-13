@@ -1059,14 +1059,51 @@ fn clear_reaped_birth(
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
     tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
-    {
+    clear_reaped_birth_with_dns(
+        proof,
+        state,
+        slots,
+        tombstones,
+        &crate::platform::linux::resolved_dns::ResolvectlDnsOps::new(),
+    );
+}
+
+fn clear_reaped_birth_with_dns(
+    proof: &HelperBirthReaped,
+    state: &Arc<Mutex<HandlerState>>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
+    dns: &dyn crate::platform::linux::resolved_dns::ResolvedDnsOps,
+) {
+    let revert_dns = {
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
         if g.child
             .as_ref()
             .is_some_and(|child| child.handle().same_birth(&proof.birth))
         {
             g.child = None;
+            if g.dns_busy {
+                g.dns_cleanup_pending = true;
+                false
+            } else if g.dns_owner.is_some() {
+                g.dns_busy = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if revert_dns {
+        let cleared = dns
+            .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
+            .is_ok();
+        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if cleared {
+            g.dns_owner = None;
+        }
+        g.dns_busy = false;
     }
     let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
     let before = slots.len();

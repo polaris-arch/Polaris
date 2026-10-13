@@ -275,10 +275,17 @@ fn bounded_terminal_cache_eviction_and_helper_restart_are_unknown() {
         let target = start(&h, false);
         let _ = stop(&h, target);
     }
-    assert_eq!(stop(&h, old), NativeBirthStop::Unknown { target: old });
     assert_eq!(
-        stop(&make_helper_defaults(), old),
-        NativeBirthStop::Unknown { target: old }
+        handle_selected(&h, "real-token", Request::NativeStopBirth { target: old }),
+        HandleOutcome::AuthFailed
+    );
+    assert_eq!(
+        handle_selected(
+            &make_helper_defaults(),
+            "real-token",
+            Request::NativeStopBirth { target: old }
+        ),
+        HandleOutcome::AuthFailed
     );
 }
 
@@ -288,9 +295,7 @@ fn native_status_is_read_only_capability_and_never_mints_a_birth_for_legacy_stat
     h.child_mu.lock().unwrap().pid = Some(42);
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
-            NativeBirthStatus::Unknown { target: None }
-        )))
+        HandleOutcome::AuthFailed
     );
     let bad = handle_selected(
         &h,
@@ -483,9 +488,7 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
         assert_eq!(stop(&h, target), NativeBirthStop::Unknown { target });
         assert_eq!(
             handle_selected(&h, "real-token", Request::NativeStatusBirth),
-            HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
-                NativeBirthStatus::Unknown { target: None }
-            )))
+            HandleOutcome::AuthFailed
         );
         assert!(matches!(
             handle_selected(
@@ -501,9 +504,7 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
                     }
                 )
             ),
-            HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
-                NativeBirthStart::NotAdmittedUnknown { target: None }
-            )))
+            HandleOutcome::AuthFailed
         ));
         for request in [
             Request::Status,
@@ -518,7 +519,7 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
         ] {
             assert!(matches!(
                 handle_selected(&h, "real-token", request),
-                HandleOutcome::Respond(Response::Err(_))
+                HandleOutcome::AuthFailed | HandleOutcome::Respond(Response::Err(_))
             ));
         }
         assert!(h.reap_child_on_exit().is_err());
@@ -537,11 +538,7 @@ fn poisoned_live_slot_retains_exact_birth_and_cannot_retire_after_native_exit() 
     poison_child_state(&h);
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
-            NativeBirthStatus::Unknown {
-                target: Some(target)
-            }
-        )))
+        HandleOutcome::AuthFailed
     );
     assert_eq!(stop(&h, target), NativeBirthStop::Unknown { target });
     assert!(h.reap_child_on_exit().is_err());
@@ -570,9 +567,7 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     assert!(h.reap_child_on_exit().is_err());
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
-            NativeBirthStatus::Unknown { target: None }
-        )))
+        HandleOutcome::AuthFailed
     );
     assert_eq!(ops.native_stop_calls(), 0);
 
@@ -668,4 +663,45 @@ fn other_native_user_cannot_start_stop_or_observe_an_owned_slot() {
         h.dispatch(Request::NativeStopBirth { target }, Some(&other)),
         HandleOutcome::AuthFailed
     ));
+}
+
+#[test]
+fn other_user_route_and_start_share_the_complete_control_reservation() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let peer = crate::user_control::NativePeer {
+        identity: polaris_helper_proto::core_protocol::CallerIdentity::windows(
+            "S-1-5-21-1-2-3-1001",
+        )
+        .unwrap(),
+        administrator: false,
+    };
+    let route = Request::RouteAdd(polaris_helper_proto::RouteParams {
+        iface: "polaris-tun0".into(),
+        cidrs: vec!["10.0.0.0/8".into()],
+    });
+    let (entered, ready) = std::sync::mpsc::channel();
+    let (release, proceed) = std::sync::mpsc::channel();
+    let (completed, observed) = std::sync::mpsc::channel();
+    ops.pause_route(entered, proceed);
+    let premature = std::thread::scope(|scope| {
+        let h = &h;
+        let peer = &peer;
+        let route = route.clone();
+        scope.spawn(move || h.dispatch(route, Some(peer)));
+        ready.recv().unwrap(); // B has passed auth, but its mutation is unfinished.
+        scope.spawn(move || completed.send(start(h, false)).unwrap());
+        let early = observed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        release.send(()).unwrap();
+        early
+    });
+    assert!(
+        !premature,
+        "A cannot start before B's network operation finishes"
+    );
+    assert!(matches!(h.dispatch(route, Some(&peer)),
+        HandleOutcome::Respond(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Auth));
+    assert_eq!(ops.snapshot().route_calls, 1);
 }

@@ -1,4 +1,5 @@
 // Synthetic bytes and mocked public HTTP/Go metadata. No Git init, HTTP, core or C API execution.
+import { writeSelectedCoreManifest } from '../lib/core-identity.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -373,6 +374,7 @@ test('actual inventory CLI admits precisely the release members and rejects miss
     copyFileSync(join(repo, 'src-tauri', conf), join(f.root, 'src-tauri', conf));
     write(join(f.root, 'resources', key, key === 'win' ? 'polaris-helper.exe' : 'polaris-helper'), 'inert');
     if (key === 'win') write(join(f.root, 'resources/win/polaris-cleaner.exe'), 'inert');
+    writeSelectedCoreManifest(join(f.root, 'resources', key), f.contract, key, '1.0.0-fixture');
     const carrier = join(f.root, 'inventory-carrier', key);
     const scopes = key === 'linux' ? [join(carrier, 'deb/usr/lib/Polaris'), join(carrier, 'appimage/Polaris.AppDir/usr/lib/Polaris')]
       : key === 'win' ? [carrier] : [join(carrier, 'macos/Polaris.app/Contents/Resources')];

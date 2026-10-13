@@ -66,7 +66,8 @@ def prepare():
     require(producer_code() == producer_identity, 'App producer source changed during preparation')
     fingerprint = sha(canonical({'source': value, 'code': producer_identity['files'],
                 'tools': {name: file_pin(paths[name]) for name in ('go', 'gomobile', 'gobind')},
-                'java': run([jdk / 'bin/java', '--version']),
+                'java': {**file_pin((jdk / 'bin/java').resolve(strict=True)), 'version': run([jdk / 'bin/java', '--version'])},
+                'javac': {**file_pin((jdk / 'bin/javac').resolve(strict=True)), 'version': run([jdk / 'bin/javac', '--version'])},
                 'ndkProperties': (Path(ndk) / 'source.properties').read_text(),
                 'bootclasspath': file_pin(sdk / 'platforms/android-36/android.jar')}))
     (root / 'tools.json').write_text(json.dumps(paths, indent=2) + '\n')

@@ -615,10 +615,21 @@ fn build_mac_script(plan: &InstallPlan) -> String {
     ["#!/bin/bash", UNIX_EXIT_WAIT, &format!("DMG={dmg}"), &format!("DEST={dest}"), r#"
 set -u
 PARENT=$(dirname "$DEST")
+[ ! -e "$PARENT/.polaris-update.lock" ] && [ ! -L "$PARENT/.polaris-update.lock" ] || { echo "Legacy Polaris update recovery required" >&2; exit 1; }
+LOCK="$PARENT/.polaris-update.lease"
+[ ! -L "$LOCK" ] || exit 1
+if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 1; fi
+[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || exit 1
+exec 9>>"$LOCK"
 WORK=$(mktemp -d "$PARENT/.polaris-update.XXXXXX") || { open "$DMG"; open "$DEST"; exit 1; }
 chmod 0700 "$WORK"
-LOCK="$PARENT/.polaris-update.lock"
-if ! mkdir -m 0700 "$LOCK"; then rm -rf "$WORK"; open "$DMG"; exit 1; fi
+LOCK_HELPER="$WORK/lease-helper"
+cp "${POLARIS_LOCK_HELPER:?bundled lease helper required}" "$LOCK_HELPER" && cmp -s "$POLARIS_LOCK_HELPER" "$LOCK_HELPER" && chmod 0700 "$LOCK_HELPER" || { rm -rf "$WORK"; exit 1; }
+"$LOCK_HELPER" lease-acquire --lock "$LOCK" --fd 9 || { rm -rf "$WORK"; open "$DMG"; exit 1; }
+for OLD in "$PARENT"/.polaris-update.*; do
+  [ "$OLD" = "$WORK" ] || [ ! -d "$OLD" ] || { "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9; rm -rf "$WORK"; echo "Polaris update recovery required: $OLD" >&2; exit 1; }
+done
+printf '%s\n' staging > "$WORK/transaction-phase"
 STAGE="$WORK/candidate.app"
 BAK="$WORK/original.app"
 MNT=''
@@ -630,7 +641,8 @@ cleanup() {
     echo "Polaris update recovery retained: $WORK" >&2
     return
   fi
-  rm -rf "$WORK" && rmdir "$LOCK"
+  "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 || return
+  rm -rf "$WORK"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -655,6 +667,7 @@ if ! hdiutil detach "$MNT" >/dev/null 2>&1; then open "$DMG"; exit 1; fi
 MOUNTED=0
 replace() {
   [ ! -e "$BAK" ] || return 2
+  printf '%s\n' backup > "$WORK/transaction-phase"
   mv "$DEST" "$BAK" 2>/dev/null || return 1
   if mv "$STAGE" "$DEST" 2>/dev/null && codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 && touch "$WORK/committed"; then
     rm -rf "$BAK"
@@ -713,40 +726,52 @@ fn build_linux_appimage_script(plan: &InstallPlan) -> String {
         &format!("DEST={dst}"),
         r#"
 set -u
+[ ! -e "$(dirname "$DEST")/.polaris-update.lock" ] && [ ! -L "$(dirname "$DEST")/.polaris-update.lock" ] || { echo "Legacy Polaris update recovery required" >&2; exit 1; }
+LOCK="$(dirname "$DEST")/.polaris-update.lease"
+[ ! -L "$LOCK" ] || exit 1
+if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 1; fi
+[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || exit 1
+exec 9>>"$LOCK"
 WORK=$(mktemp -d "$(dirname "$DEST")/.polaris-update.XXXXXX") || {
-  nohup "$DEST" >/dev/null 2>&1 &
+  nohup "$DEST" 9>&- >/dev/null 2>&1 &
   xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
   exit 1
 }
 chmod 0700 "$WORK"
-LOCK="$(dirname "$DEST")/.polaris-update.lock"
-if ! mkdir -m 0700 "$LOCK"; then rm -rf "$WORK"; exit 1; fi
+LOCK_HELPER="$WORK/lease-helper"
+cp "${POLARIS_LOCK_HELPER:?bundled lease helper required}" "$LOCK_HELPER" && cmp -s "$POLARIS_LOCK_HELPER" "$LOCK_HELPER" && chmod 0700 "$LOCK_HELPER" || { rm -rf "$WORK"; exit 1; }
+"$LOCK_HELPER" lease-acquire --lock "$LOCK" --fd 9 || { rm -rf "$WORK"; exit 1; }
+for OLD in "$(dirname "$DEST")"/.polaris-update.*; do
+  [ "$OLD" = "$WORK" ] || [ ! -d "$OLD" ] || { "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9; rm -rf "$WORK"; echo "Polaris update recovery required: $OLD" >&2; exit 1; }
+done
+printf '%s\n' staging > "$WORK/transaction-phase"
 STAGE="$WORK/candidate.AppImage"
 BAK="$WORK/original.AppImage"
 cleanup() {
   if [ -e "$BAK" ] || [ -e "$WORK/recovery-required" ]; then
     echo "Polaris update recovery retained: $WORK" >&2
-  else rm -rf "$WORK" && rmdir "$LOCK"; fi
+  else "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 && rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 if ! cp "$NEW" "$STAGE" || ! cmp -s "$NEW" "$STAGE" || ! chmod 0755 "$STAGE"; then
-  nohup "$DEST" >/dev/null 2>&1 &
+  nohup "$DEST" 9>&- >/dev/null 2>&1 &
   xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
   exit 1
 fi
-if ! mv "$DEST" "$BAK"; then nohup "$DEST" >/dev/null 2>&1 & exit 1; fi
+printf '%s\n' backup > "$WORK/transaction-phase"
+if ! mv "$DEST" "$BAK"; then nohup "$DEST" 9>&- >/dev/null 2>&1 & exit 1; fi
 if mv "$STAGE" "$DEST"; then
   rm -f "$BAK"
   rm -f "$NEW"
-  nohup "$DEST" >/dev/null 2>&1 &
+  nohup "$DEST" 9>&- >/dev/null 2>&1 &
 else
   if ! mv "$BAK" "$DEST"; then
     touch "$WORK/recovery-required"
     xdg-open "$WORK" >/dev/null 2>&1 &
     exit 1
   fi
-  nohup "$DEST" >/dev/null 2>&1 &
+  nohup "$DEST" 9>&- >/dev/null 2>&1 &
   xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
   exit 1
 fi
@@ -800,6 +825,13 @@ pub fn spawn_detached_script(dir: &Path, spec: &ScriptSpec) -> Result<PathBuf, S
     }
     let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.leading_args).arg(&path);
+    #[cfg(unix)]
+    if std::str::from_utf8(&spec.bytes).is_ok_and(|text| text.contains("${POLARIS_LOCK_HELPER:?")) {
+        cmd.env(
+            "POLARIS_LOCK_HELPER",
+            crate::runtime::helper::resolve_helper_binary()?,
+        );
+    }
     // detached：父进程随即 exit(0)，脚本必须活下去。
     #[cfg(unix)]
     {

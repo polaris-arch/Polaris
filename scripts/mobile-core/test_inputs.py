@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import unittest
 
-from fork_input import CONTRACT, bind_command, tool_environment, validate
+from fork_input import CONTRACT, bind_command, tool_environment, validate, verify_source, sha
 
 
 class MobileInputs(unittest.TestCase):
@@ -49,6 +49,50 @@ class MobileInputs(unittest.TestCase):
         self.assertEqual(env['ANDROID_HOME'], '/private/sdk-view')
         self.assertEqual(env['ANDROID_NDK_HOME'], '/verified/ndk30')
         self.assertNotIn('GOBIN', env)
+
+    def test_pinned_javac_precedes_ambient_java21_path(self):
+        import os
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ['jdk17', 'jdk21']:
+                (root / name / 'bin').mkdir(parents=True)
+                (root / name / 'bin/javac').write_text('inert executable fixture')
+                (root / name / 'bin/javac').chmod(0o700)
+            with patch.dict(os.environ, {'PATH': str(root / 'jdk21/bin')}, clear=True):
+                env = tool_environment('/tools/go', '/tools/gomobile', '/tools/gobind', '/cache', '/scratch',
+                                       sdk='/sdk', ndk='/ndk', jdk=root / 'jdk17')
+            self.assertEqual(shutil.which('javac', path=env['PATH']), str(root / 'jdk17/bin/javac'))
+
+    def test_ignored_objective_c_and_embed_inputs_refuse_zero_overlay(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = deepcopy(self.value)
+            module = f"module {value['goModule']}\ngo {value['goVersion']}\nrequire github.com/sagernet/gomobile {value['gomobileVersion']}\n".encode()
+            (root / 'go.mod').write_bytes(module); value['goModSha256'] = sha(module)
+            (root / 'go.sum').write_bytes(b'fixture-sum'); value['goSumSha256'] = sha(b'fixture-sum')
+            declared = root / value['declaredTagsSource']['path']; declared.parent.mkdir(parents=True)
+            declared.write_bytes(b'fixture-tag-declaration'); value['declaredTagsSource']['sha256'] = sha(declared.read_bytes())
+            ignored = []
+            def git(_root, *args):
+                if args[0] == 'cat-file': return 'tag'
+                if args[0] == 'status': return ''
+                if args[0] == 'ls-files': return '\n'.join(ignored) if '--ignored' in args else ''
+                ref = args[1]
+                return value['sourceTagObject'] if ref.endswith('^{tag}') else value['sourceTree'] if ref.endswith('^{tree}') else value['sourceCommit']
+            with patch('fork_input.git', side_effect=git):
+                self.assertEqual(verify_source(root, value)['sourceOverlay'], 0)
+                for name in ['experimental/libbox/extra_darwin.m', 'experimental/libbox/extra.cxx', 'experimental/libbox/embedded.data']:
+                    ignored[:] = [name]
+                    with self.assertRaises(RuntimeError): verify_source(root, value)
+                    with self.assertRaises(RuntimeError): verify_source(root, value, generator_outputs=True)
+                ignored[:] = ['build/ios/Libbox.h']
+                with self.assertRaises(RuntimeError): verify_source(root, value)
+                self.assertEqual(verify_source(root, value, generator_outputs=True)['sourceOverlay'], 0)
 
 
 if __name__ == '__main__':

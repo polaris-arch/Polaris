@@ -1,6 +1,7 @@
 use super::*;
 use crate::platform::macos::exec::RunError;
 use crate::token::FileTokenStore;
+use polaris_helper_proto::StartResp;
 use std::sync::Mutex;
 
 // 测试用 services bundle：注入 FileTokenStore（tempfile）+ 记录型 runner + 可控 child。
@@ -763,4 +764,13 @@ fn dispatch_freeport_still_requires_auth() {
 #[test]
 fn file_token_store_trait_compat() {
     let _store = FileTokenStore::new("/tmp/nonexistent");
+}
+
+fn proto_start_params() -> polaris_helper_proto::StartParams {
+    polaris_helper_proto::StartParams {
+        cfg: "/tmp/Polaris/config.json".into(),
+        log: "/tmp/Polaris/log".into(),
+        fwd: true,
+        parent_pid: Some(3333),
+    }
 }

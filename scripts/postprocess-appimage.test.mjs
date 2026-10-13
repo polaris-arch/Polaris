@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 
 import { createHash } from 'node:crypto';
+import { selectedCoreManifest } from './lib/core-identity.mjs';
 import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
 
 import { APPIMAGE_CORE_MEMBER, APPIMAGE_HOST_WAYLAND_LIBS, appImageRuntimeViolations, patchGtkHook, restoreCoreSeed, verifyAppImageMembers } from './postprocess-appimage.mjs';
@@ -259,7 +260,10 @@ function seedCoreFixture(root, appDir) {
   const helper = Buffer.from('verified-helper-seed');
   writeFileSync(join(dirname(source), 'polaris-helper'), helper, { mode: 0o755 });
   writeFileSync(join(dirname(target), 'polaris-helper'), 'linuxdeploy-changed-helper', { mode: 0o700 });
-  const installation = JSON.stringify({ core: { helperSha256: createHash('sha256').update(helper).digest('hex') } });
+  const installation = JSON.stringify(selectedCoreManifest({ version: '1.0.0-fixture', platforms: { linux: {
+    providerFingerprint: 'a'.repeat(64), core: { member: 'sing-box', bytes: readFileSync(source).length, sha256: createHash('sha256').update(readFileSync(source)).digest('hex') },
+    sidecar: { member: 'libcronet.so', bytes: cronet.length, sha256: createHash('sha256').update(cronet).digest('hex') },
+  } } }, 'linux', '1.0.0-fixture', createHash('sha256').update(helper).digest('hex')));
   writeFileSync(join(dirname(source), 'core-manifest.json'), installation);
   writeFileSync(join(dirname(target), 'core-manifest.json'), installation);
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
@@ -366,7 +370,7 @@ for (const component of ['core', 'cronet']) test(`CLI refuses a repacker changin
 });
 
 function linuxPayloadFixture(t) {
-  const { root, appDir } = coreFixture(t);
+  const { root, appDir, source, target } = coreFixture(t);
   restoreCoreSeed(appDir, root);
   writeFileSync(join(root, 'resources/linux/polaris-helper'), 'helper');
   // The canonical structured Cronet seed and pin were installed by coreFixture.
@@ -386,12 +390,6 @@ function linuxPayloadFixture(t) {
   const packedDir = join(bundle, 'appimage/Polaris.AppDir');
   renameSync(appDir, packedDir);
   mkdirSync(join(root, 'scripts'));
-  const helper = Buffer.from('verified-helper-seed');
-  writeFileSync(join(dirname(source), 'polaris-helper'), helper, { mode: 0o755 });
-  writeFileSync(join(dirname(target), 'polaris-helper'), 'linuxdeploy-changed-helper', { mode: 0o700 });
-  const installation = JSON.stringify({ core: { helperSha256: createHash('sha256').update(helper).digest('hex') } });
-  writeFileSync(join(dirname(source), 'core-manifest.json'), installation);
-  writeFileSync(join(dirname(target), 'core-manifest.json'), installation);
   mkdirSync(join(root, 'src-tauri'), { recursive: true });
   for (const name of ['verify-packaging.mjs', 'postprocess-appimage.mjs', 'release-assets.mjs']) {
     copyFileSync(new URL(`./${name}`, import.meta.url), join(root, 'scripts', name));

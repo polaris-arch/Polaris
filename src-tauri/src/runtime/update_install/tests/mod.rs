@@ -593,7 +593,10 @@ fn mac_script_success_requires_explicit_candidate_commit_after_verification() {
     assert!(verify < commit && commit < retire);
     assert!(s.contains("mv \"$BAK\" \"$DEST\""));
     assert!(s.contains("recovery-required"));
-    assert!(s.contains("mkdir -m 0700 \"$LOCK\""));
+    assert!(s.contains("lease-acquire --lock \"$LOCK\" --fd 9"));
+    assert!(s.contains("lease-release --lock \"$LOCK\" --fd 9"));
+    assert!(s.contains("transaction-phase"));
+    assert!(!s.contains("rmdir \"$LOCK\""));
     assert!(!s.contains(".polaris-update-*.app"));
     let success = s.rfind("if [ -f \"$WORK/committed\"").unwrap();
     let tail = &s[success..];
@@ -1111,6 +1114,9 @@ fn appimage_update_stages_exact_bytes_before_mutating_the_existing_image() {
     assert!(copy < verify && verify < original);
     assert!(s.contains("mv \"$BAK\" \"$DEST\""));
     assert!(s.contains("recovery-required"));
-    assert!(s.contains("mkdir -m 0700 \"$LOCK\""));
+    assert!(s.contains("lease-acquire --lock \"$LOCK\" --fd 9"));
+    assert!(s.contains("lease-release --lock \"$LOCK\" --fd 9"));
+    assert!(s.contains("transaction-phase"));
+    assert!(!s.contains("rmdir \"$LOCK\""));
     assert!(!s.contains("nohup \"$NEW\""));
 }

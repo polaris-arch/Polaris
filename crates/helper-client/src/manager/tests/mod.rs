@@ -1445,7 +1445,7 @@ fn windows_payload_directory_is_absolute_even_when_rendered_on_unix() {
         script.contains(r"Copy-Item -LiteralPath 'C:\Users\u\Polaris\stage\polaris-cleaner.exe'")
     );
     assert!(script.contains("Check-Hash $cleaner $selection.core.cleanerSha256"));
-    assert!(script.contains("foreach ($path in @($helperDst, $cleanerDst, $record))"));
+    assert!(script.contains("foreach ($path in $replaceObjects)"));
     assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
 }
 
@@ -1466,4 +1466,18 @@ fn retained_binary_requires_live_content_receipt_or_repair_without_downgrade() {
     assert!(script.contains("$replaceObjects = if ($keepHelper) { @() }"));
     assert!(script.contains("if (-not $keepHelper) {"));
     assert!(script.contains("New-Service -Name $service"));
+}
+
+#[test]
+fn unix_install_retains_recovery_and_never_guesses_dead_directory_owner() {
+    for script in unix_scripts() {
+        let acquire = script.find("lease-acquire --lock").unwrap();
+        let install = script.find("core-install --root").unwrap();
+        assert!(acquire < install);
+        assert!(script.contains("transaction-phase"));
+        assert!(script.contains("HELPER_INSTALL_RECOVERY_REQUIRED"));
+        assert!(script.contains("LEGACY_HELPER_INSTALL_RECOVERY_REQUIRED"));
+        assert!(script.contains("exec 9>>"));
+        assert!(!script.contains("rmdir \"$LOCK\""));
+    }
 }

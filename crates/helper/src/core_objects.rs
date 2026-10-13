@@ -36,7 +36,7 @@ fn rejected(reason: &'static str) -> io::Error {
 /// 已打开的源目录。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct PayloadDir {
-    dir: nix::dir::Dir,
+    dir: std::sync::Mutex<nix::dir::Dir>,
     owner_uid: u32,
 }
 
@@ -98,7 +98,7 @@ impl PayloadDir {
     fn from_fd(fd: std::os::fd::OwnedFd, owner_uid: u32) -> io::Result<Self> {
         check_owner(&nix::sys::stat::fstat(&fd)?, owner_uid)?;
         Ok(Self {
-            dir: nix::dir::Dir::from_fd(fd)?,
+            dir: std::sync::Mutex::new(nix::dir::Dir::from_fd(fd)?),
             owner_uid,
         })
     }
@@ -113,7 +113,11 @@ impl PayloadDir {
     pub fn entry_names(&mut self, max: usize) -> io::Result<Vec<OsString>> {
         use std::os::unix::ffi::OsStrExt;
         let mut names = Vec::new();
-        for entry in self.dir.iter() {
+        let mut directory = self
+            .dir
+            .lock()
+            .map_err(|_| rejected("directory custody poisoned"))?;
+        for entry in directory.iter() {
             let entry = entry?;
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {
@@ -143,7 +147,11 @@ impl PayloadDir {
             | OFlag::O_NONBLOCK
             | OFlag::O_NOCTTY
             | OFlag::O_CLOEXEC;
-        let fd = openat(&self.dir, name, flags, Mode::empty())?;
+        let directory = self
+            .dir
+            .lock()
+            .map_err(|_| rejected("directory custody poisoned"))?;
+        let fd = openat(&*directory, name, flags, Mode::empty())?;
         let stat = fstat(&fd)?;
         if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
             return Err(rejected("not a regular file"));

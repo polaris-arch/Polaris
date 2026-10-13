@@ -2094,14 +2094,11 @@ impl LinuxResolvedOps for HelperLinuxResolvedOps {
     }
 }
 
-/// 当前登录用户 uid（linux install 写 `authorized-uids`；mac/win InstallParams 忽略）。
-///
-/// 经 `/proc/self` 属主读取（stdlib `MetadataExt::uid`，无新依赖、无 unsafe）——`/proc/self` 恒属真实
-/// 运行用户。非 Linux（无 `/proc`）→ 回退 0（该平台 InstallParams 忽略 uid，无害）。
+/// POSIX real UID for the App's staged payload and administrator CLI caller.
+/// getuid has no error sentinel; a missing Linux procfs never becomes root.
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
+    nix::unistd::getuid().as_raw()
 }
 
 #[cfg(not(unix))]
@@ -2121,7 +2118,7 @@ fn current_uid() -> u32 {
 /// 逃生门再指一次只会多一个入口、不多一分能力。
 /// 判据不过 ⇒ 记 `ENV_PATH_UNTRUSTED` 并回落兜底腿，**绝不静默**。
 /// 开发态（debug / test）逃生门仍是原样的第一优先级 —— helper 的本地迭代靠它装自编产物。
-fn resolve_helper_binary() -> Result<PathBuf, String> {
+pub(super) fn resolve_helper_binary() -> Result<PathBuf, String> {
     let filename = if cfg!(windows) {
         "polaris-helper.exe"
     } else {

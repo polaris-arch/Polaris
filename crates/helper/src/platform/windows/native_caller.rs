@@ -4,11 +4,11 @@ use crate::user_control::NativePeer;
 use polaris_helper_proto::core_protocol::CallerIdentity;
 use std::io;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, LocalFree},
+    Foundation::{CloseHandle, LocalFree, HANDLE},
     Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW},
     Security::{
-        CheckTokenMembership, GetTokenInformation, RevertToSelf, TOKEN_ELEVATION, TOKEN_QUERY,
-        TOKEN_USER, TokenElevation, TokenUser,
+        CheckTokenMembership, GetTokenInformation, RevertToSelf, TokenElevation, TokenUser,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
     },
     System::Pipes::ImpersonateNamedPipeClient,
     System::Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},

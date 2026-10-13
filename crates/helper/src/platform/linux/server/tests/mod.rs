@@ -1025,3 +1025,45 @@ async fn dispatch_permits_are_returned_when_the_connection_finishes() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[test]
+fn reaped_birth_keeps_dns_responsibility_until_native_revert_succeeds() {
+    struct Dns(bool);
+    impl crate::platform::linux::resolved_dns::ResolvedDnsOps for Dns {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn revert(&self, name: &str) -> Result<(), String> {
+            assert_eq!(name, polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME);
+            if self.0 {
+                Ok(())
+            } else {
+                Err("native revert failed".into())
+            }
+        }
+    }
+    for success in [false, true] {
+        let slot = ChildSlot::new(712);
+        let state = Arc::new(Mutex::new(HandlerState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.child = Some(ManagedChild::Running(slot.handle.clone()));
+            state.dns_owner = Some(1000);
+        }
+        slot.mark_exited();
+        let LocalReapFact::Reaped(proof) = slot.reap_fact() else {
+            panic!("expected native wait");
+        };
+        clear_reaped_birth_with_dns(
+            &proof,
+            &state,
+            &Arc::new(Mutex::new(vec![slot])),
+            &Arc::new(Mutex::new(VecDeque::new())),
+            &Dns(success),
+        );
+        let state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_owner, if success { None } else { Some(1000) });
+    }
+}

@@ -101,7 +101,7 @@ polaris-unlock-transport = { version = "1.0.0", path = "../crates/unlock-transpo
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [target."cfg(unix)".dependencies]
-nix = { version = "0.31.3", features = ["fs", "net", "process", "signal"] }
+nix = { version = "0.31.3", features = ["fs", "net", "process", "signal", "user"] }
 
 [target."cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))".dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

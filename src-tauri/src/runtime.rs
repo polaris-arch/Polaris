@@ -19,9 +19,9 @@
 pub(crate) mod auto_select;
 pub mod auto_switch;
 pub mod config;
-pub mod core_paths;
-pub(crate) mod core_identity;
 pub mod core_attest;
+pub(crate) mod core_identity;
+pub mod core_paths;
 /// 路径型环境逃生门的信任级判定单点（`POLARIS_HELPER_PATH`）。
 pub(crate) mod env_trust;
 pub mod geo_seed;

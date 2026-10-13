@@ -103,10 +103,15 @@ impl<Ops: LinuxResolvedOps, Fs: MarkerFs> LinuxResolvedController<Ops, Fs> {
         }
     }
 
-    /// 先写 intent，再请求 helper；helper 失败时已自行回滚，本层清除 intent 并向上返回可观测错误。
+    /// 先写 intent，再请求 helper；失败后明确恢复成功才清 intent，否则保留恢复责任。
     pub fn takeover(&mut self) -> Result<(), String> {
         self.marker.write()?;
         if let Err(error) = self.ops.takeover() {
+            // A failed helper call is not a rollback receipt. Keep intent while
+            // DNS responsibility is unresolved, so startup recovery can retry.
+            if let Err(revert_error) = self.ops.revert() {
+                return Err(format!("{error}; DNS rollback unconfirmed: {revert_error}"));
+            }
             let clear = self.marker.clear();
             return match clear {
                 Ok(()) => Err(error),

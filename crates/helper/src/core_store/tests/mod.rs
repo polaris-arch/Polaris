@@ -183,7 +183,16 @@ fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() 
     }
     assert_eq!(
         store
-            .retire_flat_layout_with(|_| crate::legacy_use::LegacyUse::Idle)
+            .retire_flat_layout_with(|paths| {
+                let mut observed = paths
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_str().unwrap())
+                    .collect::<Vec<_>>();
+                observed.sort_unstable();
+                assert_eq!(observed, ["libcronet.so", "sing-box"]);
+                assert!(paths.iter().all(|p| p.parent() == Some(root.path())));
+                crate::legacy_use::LegacyUse::Idle
+            })
             .unwrap()
             .len(),
         2

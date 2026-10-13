@@ -15,7 +15,12 @@
 
 fn main() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if let Some(exit) = polaris_helper::core_cli::run(&args) { return exit; }
+    if let Some(exit) = polaris_helper::process_lease::run(&args) {
+        return exit;
+    }
+    if let Some(exit) = polaris_helper::core_cli::run(&args) {
+        return exit;
+    }
     #[cfg(target_os = "macos")]
     {
         polaris_helper::platform::macos::daemon_main(std::env::args())

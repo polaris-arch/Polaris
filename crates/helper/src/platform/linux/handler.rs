@@ -200,21 +200,45 @@ pub fn handle<P, S, D, SD>(
             let _ = conn.write_line("ERR slot-owned-or-control-busy");
             return;
         }
-        guard.dns_busy = true;
-        if guard.dns_owner.is_none() {
-            guard.dns_owner = Some(cred.uid);
-        }
+        let previous_owner = guard.dns_owner;
+        guard.dns_busy = true; // reservation, not proof that DNS was modified
         drop(guard);
         let reverting = command == lcmd::RESOLVED_DNS_REVERT;
-        let success = if reverting {
-            handle_resolved_dns_revert(deps.resolved_dns, conn)
+        let (success, cleared) = if reverting {
+            let success = handle_resolved_dns_revert(deps.resolved_dns, conn);
+            (success, success)
         } else {
             handle_resolved_dns_set(deps.resolved_dns, conn)
         };
+        // Inspect the reaper's handoff while holding the final state lock.
+        // A birth exit cannot set pending between observation and completion.
         if let Ok(mut guard) = state.lock() {
-            guard.dns_busy = false;
-            if reverting && success && guard.child.is_none() {
-                guard.dns_owner = None;
+            if guard.dns_cleanup_pending {
+                drop(guard);
+                let cleanup_cleared = deps
+                    .resolved_dns
+                    .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
+                    .is_ok();
+                if let Ok(mut guard) = state.lock() {
+                    guard.dns_owner = if cleanup_cleared {
+                        None
+                    } else {
+                        previous_owner.or(Some(cred.uid))
+                    };
+                    guard.dns_cleanup_pending = false;
+                    guard.dns_busy = false;
+                }
+            } else {
+                guard.dns_owner = if reverting && success {
+                    None
+                } else if success {
+                    Some(cred.uid)
+                } else if cleared {
+                    previous_owner
+                } else {
+                    previous_owner.or(Some(cred.uid))
+                };
+                guard.dns_busy = false;
             }
         }
         return;
@@ -373,19 +397,28 @@ fn legacy_command_rejected(
 
 // ===== 各命令处理（逐分支对照 Go 源）=====
 
-fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> bool {
+fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> (bool, bool) {
     let interface_name = conn.read_line();
     let server_ip = conn.read_line();
+    let mut cleared = false;
     let response = match ops.takeover(&interface_name, &server_ip) {
         Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Set)),
-        Err(error) => Response::Err(ProtoError::with_detail(
-            ErrorCode::ResolvedDns,
-            single_line_wire_detail(&error),
-        )),
+        Err(error) => {
+            // Only the fixed admitted link can be reverted. Invalid requests
+            // are known not to have modified DNS; otherwise require real revert.
+            cleared = !polaris_helper_proto::linux_dns::takeover_request_allowed(
+                &interface_name,
+                &server_ip,
+            ) || ops.revert(&interface_name).is_ok();
+            Response::Err(ProtoError::with_detail(
+                ErrorCode::ResolvedDns,
+                single_line_wire_detail(&error),
+            ))
+        }
     };
     let success = matches!(response, Response::Ok(_));
     let _ = conn.write_line(&response.to_wire_line());
-    success
+    (success, cleared)
 }
 
 fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> bool {

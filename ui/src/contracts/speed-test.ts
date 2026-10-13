@@ -290,6 +290,10 @@ export interface SpeedTestScheduleStatus {
   /** Actual multiplier from the scheduler; never inferred from elapsed wall time. */
   periodFactor?: number;
   lastTickAt?: number;
+  /** 原调度器前台恢复及有界轮次记录，供静默窗口核对。 */
+  foregroundReturnAt?: number | null;
+  roundTraceSerial?: number;
+  roundStarts?: { serial: number; startedAt: number; endedAt: number }[];
   /** 读时投影：代理在运行、应用在前台，而调度器很久没有走过一拍。 */
   stalled: boolean;
   limits?: SpeedTestScheduleLimits;

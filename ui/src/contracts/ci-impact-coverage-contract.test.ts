@@ -131,6 +131,14 @@ function stripLineComments(source: string, kind: 'js' | 'yaml'): string {
 }
 
 describe('CI 影响分类器的完备性（fail-open 根治）', () => {
+  it('实际编译前安装身份入口和共享进程租约覆盖全部桌面载体', () => {
+    for (const path of ['scripts/prepare-core-identity.mjs', 'crates/helper/src/process_lease.rs']) {
+      const actual = classifyImpact([path]);
+      expect(actual.platforms).toEqual([...ALL_PACKAGE_PLATFORMS]);
+      expect(actual.hasPackage).toBe(true);
+      expect(actual.unregisteredScopes).toEqual([]);
+    }
+  });
   it('本地资源目录 symlink 按目录 scope 枚举，未知目录仍会触发登记门', () => {
     const root = mkdtempSync(join(tmpdir(), 'polaris-impact-scopes-'));
     try {

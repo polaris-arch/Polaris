@@ -532,6 +532,9 @@ pub(crate) struct Planner {
     foreground: bool,
     /// 离开前台的墙钟时刻。
     left_at: Option<u64>,
+    foreground_return_at: Option<u64>,
+    round_trace_serial: u64,
+    round_starts: std::collections::VecDeque<(u64, u64, u64)>,
     quiet_until: u64,
     foreground_epoch: u64,
     /// 最近一拍的墙钟时刻，与那一拍计划睡多久。
@@ -640,6 +643,9 @@ impl Planner {
             subs: BTreeMap::new(),
             foreground: true,
             left_at: None,
+            foreground_return_at: None,
+            round_trace_serial: 0,
+            round_starts: std::collections::VecDeque::new(),
             quiet_until: 0,
             foreground_epoch: 0,
             last_tick: (now.wall, TICK_IDLE_MS),
@@ -761,6 +767,7 @@ impl Planner {
     pub(crate) fn on_resumed(&mut self, now: Now) {
         self.foreground = true;
         if let Some(left_at) = self.left_at.take() {
+            self.foreground_return_at = Some(now.wall);
             self.returned(now, now.wall.saturating_sub(left_at));
         }
     }
@@ -1071,6 +1078,17 @@ impl Planner {
                 }
             }
             ScheduledRound::Ran(report) => {
+                // Original start/completion times, including failed/interrupted
+                // rounds, make absence windows auditable without last-only loss.
+                self.round_trace_serial += 1;
+                self.round_starts.push_back((
+                    self.round_trace_serial,
+                    report.started_at,
+                    report.ended_at,
+                ));
+                if self.round_starts.len() > 32 {
+                    self.round_starts.pop_front();
+                }
                 self.last_width = Some((report.width, report.halved));
                 let frozen = report.frozen || round.abort_cause == Some(AbortCause::Frozen);
                 let skip = if frozen {
@@ -1270,6 +1288,11 @@ impl Planner {
             "state": state,
             "reason": reason,
             "subscriptions": subscriptions,
+            "foregroundReturnAt": self.foreground_return_at,
+            "roundTraceSerial": self.round_trace_serial,
+            "roundStarts": self.round_starts.iter().map(|(serial, started, ended)| json!({
+                "serial": serial, "startedAt": started, "endedAt": ended
+            })).collect::<Vec<_>>(),
             "concurrency": self.last_width.map(|(width, halved)| json!({ "width": width, "halved": halved })),
             // 当前网络的计费状态与生效的策略：两者合起来才说得清是「降频」「暂停」还是「照常」。
             "metered": self.conditions.metered.as_str(),

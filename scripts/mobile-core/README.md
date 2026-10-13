@@ -52,8 +52,15 @@ bytes are kept intact so old frozen receipt/script identities remain resolvable.
 The formal producer entry is now `bash scripts/build-mobile-core.sh android`
 or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
 and `--cache`. Android also requires `--sdk --ndk --jdk`; Apple requires
-`--developer`. It reads the supplied exact source without another fork clone,
-uses scoped Go/module/GOPATH caches, and directly binds one fixed stage. The
+`--developer`. It verifies the supplied exact source and uses one fixed `work/build-view`
+shared-object Git clone at that exact commit. The generator writes/deletes its
+own `source/build/<arch>` paths there; the supplied checkout stays untouched.
+This build view shares the work/cache filesystem budget and inherited lease,
+so separate producers cannot mutate one another's generator paths. It uses
+scoped Go/module/GOPATH caches and directly binds `staging/Libbox.xcframework`
+on Apple, preserving the generator's actual `Libbox` framework/module name.
+Android selects the verified Java17 `java` and `javac` paths and records both
+binary hashes/versions, regardless of an ambient Java21 PATH. The
 pinned generator's marker directory is created inside that GOPATH: `gomobile
 init` is never invoked because v0.1.13 would install gobind@latest.
 

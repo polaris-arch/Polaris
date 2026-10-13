@@ -102,7 +102,7 @@ def git(source, *args):
     return subprocess.check_output(['git', '-C', str(source), *args], text=True).strip()
 
 
-def verify_source(source, value):
+def verify_source(source, value, *, generator_outputs=False):
     value = validate(value)
     source = Path(source).resolve(strict=True)
     require(git(source, 'cat-file', '-t', value['sourceTagObject']) == 'tag', 'annotated source tag required')
@@ -111,7 +111,7 @@ def verify_source(source, value):
             git(source, 'rev-parse', value['sourceCommit'] + '^{tree}') == value['sourceTree'],
             'mobile source tag/object/commit/tree differs')
     require(git(source, 'rev-parse', 'HEAD') == value['sourceCommit'] and
-            not git(source, 'status', '--porcelain=v1', '--untracked-files=all'),
+            not git(source, 'status', '--porcelain=v1', '--untracked-files=no'),
             'source checkout must be exact and clean before mobile bind')
     for name, key in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(sha((source / name).read_bytes()) == value[key], 'source module bytes differ')
@@ -123,12 +123,16 @@ def verify_source(source, value):
     declared = value['declaredTagsSource']
     require(declared['path'] == 'cmd/internal/build_libbox/main.go' and
             sha((source / declared['path']).read_bytes()) == declared['sha256'], 'source-owned tags declaration differs')
-    # Ignore only non-compiler evidence/output objects. A dirty ignored compiler
-    # input could bypass the tracked tree check and must not enter a producer.
+    # Only the fixed producer view may contain its generator-owned build outputs.
+    # The supplied source has no such exemption. Tracked changes always refuse.
     ignored = git(source, 'ls-files', '--others', '--ignored', '--exclude-standard').splitlines()
-    require(not any(Path(path).suffix in {'.go', '.c', '.cc', '.cpp', '.h', '.s', '.S', '.syso'} or
-                    Path(path).name in {'go.mod', 'go.sum', 'go.work', 'go.work.sum'} for path in ignored),
-            'untracked ignored compiler input is not a zero-overlay source')
+    # Go accepts Objective-C, C++, assembler, SWIG and Fortran as cgo inputs;
+    # go:embed can consume arbitrary data extensions. No ignored file is an
+    # admissible zero-overlay input in the isolated producer view.
+    untracked = git(source, 'ls-files', '--others', '--exclude-standard').splitlines()
+    unexpected = [name for name in ignored + untracked
+                  if not (generator_outputs and name.startswith('build/'))]
+    require(not unexpected, 'untracked ignored compiler/embed input is not a zero-overlay source')
     return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,
@@ -184,6 +188,7 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
         # SDK/ndk over ANDROID_NDK_HOME cannot fall back to an installed NDK28.
         env.update(ANDROID_HOME=str(sdk), ANDROID_SDK_ROOT=str(sdk),
                    ANDROID_NDK_HOME=str(ndk), ANDROID_NDK_ROOT=str(ndk), JAVA_HOME=str(jdk))
+        env['PATH'] = str(Path(jdk) / 'bin') + os.pathsep + env['PATH']
     else:
         require(developer is not None and ndk is None and jdk is None, 'explicit Apple developer directory required')
         env['DEVELOPER_DIR'] = str(developer)

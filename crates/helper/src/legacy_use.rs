@@ -14,6 +14,93 @@ pub enum LegacyUse {
 }
 const OUTPUT_LIMIT: u64 = 512 * 1024;
 
+/// Observe precisely the payload cohort. Directory handles, store locks and
+/// metadata held by the manager are not evidence that a payload is in use.
+pub fn payload_use(paths: &[std::path::PathBuf]) -> LegacyUse {
+    if paths.is_empty()
+        || paths.len() > 4
+        || paths.iter().any(|path| {
+            !path.is_absolute()
+                || path.to_string_lossy().contains(['\n', '\r', '\0'])
+                || std::fs::symlink_metadata(path).is_err()
+                || std::fs::symlink_metadata(path)
+                    .is_ok_and(|m| !m.is_file() || m.file_type().is_symlink())
+        })
+    {
+        return LegacyUse::Unknown;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut command = Command::new(if cfg!(target_os = "macos") {
+            "/usr/sbin/lsof"
+        } else {
+            "/usr/bin/lsof"
+        });
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .args(["-nP", "-Fpn", "--"])
+            .args(paths);
+        return match observe_command(&mut command) {
+            Ok((code, out, err)) => classify_unix(code, &out, &err),
+            Err(_) => LegacyUse::Unknown,
+        };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::process::CommandExt;
+        let mut held = Vec::new();
+        for path in paths {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+            {
+                Ok(file) => held.push(file),
+                Err(error) if error.raw_os_error() == Some(32) => return LegacyUse::InUse,
+                Err(_) => return LegacyUse::Unknown,
+            }
+        }
+        let Ok(root) = native_windows_root() else {
+            return LegacyUse::Unknown;
+        };
+        let literals = paths
+            .iter()
+            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            r#"$ErrorActionPreference='Stop'; $files=@({literals}); $unknown=$false; $busy=$false; foreach($p in Get-Process) {{ try {{ foreach($m in $p.Modules) {{ foreach($file in $files) {{ if([String]::Equals($m.FileName,$file,[StringComparison]::OrdinalIgnoreCase)) {{$busy=$true}} }} }} }} catch {{$unknown=$true}} }}; if($busy){{'in-use'}} elseif($unknown){{'unknown'}} else {{'idle'}}"#
+        );
+        let mut command = Command::new(root.join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+        command
+            .env_clear()
+            .env("SystemRoot", &root)
+            .env("PATH", root.join("System32"))
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .creation_flags(0x0800_0000);
+        return match observe_command(&mut command) {
+            Ok((0, out, err)) if err.is_empty() => {
+                match std::str::from_utf8(&out).ok().map(str::trim) {
+                    Some("idle") => LegacyUse::Idle,
+                    Some("in-use") => LegacyUse::InUse,
+                    _ => LegacyUse::Unknown,
+                }
+            }
+            _ => LegacyUse::Unknown,
+        };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    LegacyUse::Unknown
+}
+
 fn capture(mut input: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     input

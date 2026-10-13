@@ -1272,3 +1272,29 @@ fn native_slot_denial_is_not_an_authentication_or_node_configuration_hint() {
         Err(BirthCapabilityError::SlotOccupied(_))
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn installer_uid_matches_the_native_nonroot_app_user() {
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let observed: u32 = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(current_uid(), observed);
+    let identity = polaris_helper_proto::core_protocol::CallerIdentity::Unix(current_uid());
+    assert_eq!(
+        identity,
+        polaris_helper_proto::core_protocol::CallerIdentity::Unix(observed)
+    );
+    #[cfg(target_os = "macos")]
+    assert_ne!(
+        observed, 0,
+        "Mac App/admin-CLI regression must run as the actual nonroot runner"
+    );
+}

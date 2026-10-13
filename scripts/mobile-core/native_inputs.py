@@ -5,7 +5,7 @@ import re
 import shlex
 
 from fork_input import require
-from artifacts import file_pin, module
+from artifacts import file_pin, module, tree_inventory
 
 
 def collect(scratch, log, platform, output, cache):
@@ -71,6 +71,12 @@ def collect(scratch, log, platform, output, cache):
 
 def verify(facts, scratch=None, log=None):
     require(facts.get('schema') == 'polaris-mobile-native-inputs-v1', 'actual native input receipt required')
+    if 'generatorOutputRoot' in facts:
+        generated = Path(facts['generatorOutputRoot']).resolve(strict=True)
+        require(generated.name == 'build' and generated.parent.name == 'build-view',
+                'generator output escaped the fixed build view')
+        require(tree_inventory(generated) == facts['generatorOutputInventory'],
+                'original generator output bytes differ')
     original_scratch, cache = Path(facts['scratch']).resolve(strict=True), Path(facts['cache']).resolve(strict=True)
     if scratch is not None:
         require(original_scratch == Path(scratch).resolve(strict=True), 'native scratch input changed')

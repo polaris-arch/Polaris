@@ -186,11 +186,11 @@ impl CoreStore {
     /// the entire flat cohort while any native mapping/reader is observed or
     /// cannot be ruled out. This never reclaims immutable version directories.
     pub fn retire_flat_layout(&self) -> io::Result<Vec<PathBuf>> {
-        self.retire_flat_layout_with(crate::legacy_use::directory_use)
+        self.retire_flat_layout_with(crate::legacy_use::payload_use)
     }
     fn retire_flat_layout_with(
         &self,
-        observe: impl FnOnce(&Path) -> crate::legacy_use::LegacyUse,
+        observe: impl FnOnce(&[PathBuf]) -> crate::legacy_use::LegacyUse,
     ) -> io::Result<Vec<PathBuf>> {
         let _lock = self.mutation_lock()?;
         let names = ["sing-box", "sing-box.exe", "libcronet.so", "libcronet.dll"];
@@ -211,7 +211,7 @@ impl CoreStore {
         if flat.is_empty() {
             return Ok(flat);
         }
-        if observe(&self.root) != crate::legacy_use::LegacyUse::Idle {
+        if observe(&flat) != crate::legacy_use::LegacyUse::Idle {
             log::info!("legacy flat core retirement deferred: native use active or unknown");
             return Ok(Vec::new());
         }

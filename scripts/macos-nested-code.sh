@@ -27,13 +27,8 @@
 #      内核验不过 ⇒ 打包失败，不在这里修：签名属于内核构建产物那一步（前置说明见
 #      `scripts/core-patches/README.md` 的「macOS code signature of the bundled core」一节）。
 #
-#   2. `polaris-helper` —— 本仓 Rust 产物，不在「不得改写」之内。
-#      seal 模式：验不过就 ad-hoc 补签并点名，补签后再验一次；verify 模式：只验，验不过即失败。
-#      所以最终产物里 helper 的签名由「seal 补签 + verify 复验」这一对保证。
-#      点名的级别：纯 x86_64 且「根本没有签名」打 notice，其余（arm64 / universal 没有签名、任何架构上
-#      签名无效）打 warning。前者是每次打包都会出现的预期形态 —— 链接器只给 arm64 产物自动加 ad-hoc
-#      签名，x86_64 产物出链接器时就是没有签名的（内核那一侧的同一事实见上面 1b）；每次都响的 warning
-#      只会让真正异常的那一次没人看。后者说明构建链上有东西不对，照旧打 warning。
+#   2. `polaris-helper` —— 编译 App 之前已签并冻结。两种模式仅校验源/载体
+#      字节与签名；验不过即拒绝，不在包后补签，也不改写安装身份。
 #
 #   3. 其它 Mach-O（包内容白名单目前不允许出现）—— 只校验，验不过即失败，不替来历不明的文件签名。
 #
@@ -180,7 +175,7 @@ while IFS= read -r -d '' f; do
       sig_state "$f"
       if [ "$state" != "signed" ]; then
         echo "$detail" >&2
-        fail "未登记的 Mach-O 没有有效签名：${rel} —— 本脚本只替 polaris-helper 补签"
+        fail "未登记的 Mach-O 没有有效签名：${rel} —— 本脚本不补签任何 Mach-O"
       fi
       ;;
   esac
@@ -195,8 +190,12 @@ fi
 
 # Verify the exact pre-compilation installation metadata and helper/core bytes.
 core_key="$(basename "$(dirname "$core_ref")")"
-identity_mode=verify
-node "$script_dir/prepare-core-identity.mjs" --platform="$core_key" \
-  --directory="$res/_up_/resources/$core_key" --mode="$identity_mode"
+node --input-type=module - "$res/_up_/resources/$core_key" "$(dirname "$core_ref")" "$core_key" "$script_dir" <<'NODE'
+import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
+const [directory, source, platform, scripts] = process.argv.slice(2);
+const { verifySelectedCoreManifest } = await import(pathToFileURL(join(scripts, 'lib/core-identity.mjs')));
+verifySelectedCoreManifest(directory, source, platform);
+NODE
 
 echo "macos-nested-code(${mode}): Contents/Resources 下 ${count} 个 Mach-O 已逐个判定；内核 ${core_seen} 份与源内核逐字节相同（其中未签名的 x86_64 ${core_unsigned} 份，其余签名有效），polaris-helper ${helper_seen} 份签名有效（本次补签 ${resigned} 份）"

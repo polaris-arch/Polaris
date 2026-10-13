@@ -47,7 +47,12 @@ fn embed_selected_core_identity() {
             let manifest =
                 polaris_helper_proto::core_manifest::InstalledCoreManifest::parse(&raw, |bytes| {
                     use sha2::Digest;
-                    format!("{:x}", sha2::Sha256::digest(bytes))
+                    use std::fmt::Write;
+                    let mut hex = String::with_capacity(64);
+                    for byte in sha2::Sha256::digest(bytes) {
+                        write!(&mut hex, "{byte:02x}").expect("write digest to String");
+                    }
+                    hex
                 })
                 .expect("selected installation manifest has an exact content identity");
             let os = std::env::var("CARGO_CFG_TARGET_OS").expect("target OS");

@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+import { selectedCoreManifest } from './lib/core-identity.mjs';
+import { createHash } from 'node:crypto';
 import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -29,6 +31,7 @@ function fixture(t, label, extra = []) {
     '_up_/resources/dashboard/index.html', '_up_/resources/dashboard/assets/fixture.js',
     '_up_/resources/dashboard/licenses/fixture.txt', '_up_/resources/dashboard/favicon.ico',
     '_up_/resources/dashboard/favicon.svg', '_up_/resources/dashboard/apple-touch-icon-180x180.png',
+    `_up_/resources/${core}/core-manifest.json`,
     `_up_/resources/${core}/sing-box${suffix}`, `_up_/resources/${core}/polaris-helper${suffix}`,
     `_up_/resources/${core}/libcronet.${label === 'windows' ? 'dll' : 'so'}`,
     ...legalMembers.map((member) => `_up_/resources/${core}/${member}`), ...extra,
@@ -92,6 +95,11 @@ function windowsPayloadFixture(t, options = {}) {
     const content = name === 'libcronet.dll' ? bytes : Buffer.from(name);
     writeFileSync(join(source, name), content); writeFileSync(join(staging, name), content);
   }
+  const pin = name => { const value = readFileSync(join(source, name)); return { member: name, bytes: value.length, sha256: createHash('sha256').update(value).digest('hex') }; };
+  const installation = JSON.stringify(selectedCoreManifest({ version: '1.0.0-fixture', platforms: { win: {
+    providerFingerprint: 'a'.repeat(64), core: pin('sing-box.exe'), sidecar: pin('libcronet.dll'),
+  } } }, 'win', '1.0.0-fixture', pin('polaris-helper.exe').sha256, pin('polaris-cleaner.exe').sha256));
+  for (const directory of [source, staging]) writeFileSync(join(directory, 'core-manifest.json'), installation);
   const run = () => { const result = spawnSync(process.execPath, [join(root, 'scripts/verify-packaging.mjs'), 'payload', '--label', 'windows', '--root', join(root, 'staging')], { encoding: 'utf8' }); return { code: result.status, output: result.stdout + result.stderr }; };
   return { root, source: join(source, 'libcronet.dll'), payload: join(staging, 'libcronet.dll'), bytes, run };
 }

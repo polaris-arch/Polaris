@@ -72,13 +72,14 @@ pub mod cli;
 pub mod admin_probe;
 pub mod core_cli;
 pub mod core_hash;
-pub mod legacy_use;
 pub mod core_objects;
 pub mod core_store;
 pub mod exact_start;
 pub mod helper_policy;
+pub mod legacy_use;
 pub mod line_io;
 pub mod pinned_core;
+pub mod process_lease;
 pub mod token;
 pub mod user_control;
 

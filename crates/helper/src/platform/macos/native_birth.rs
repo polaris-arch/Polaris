@@ -8,7 +8,7 @@ use polaris_helper_proto::HelperBirthTarget;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 const STOP_CACHE_LIMIT: usize = 16;
@@ -32,7 +32,6 @@ enum Phase {
 struct OwnedChild {
     child: Box<dyn NativeChild>,
     log_custody: Option<polaris_log_budget::PipeLogCustody>,
-    core: Option<(Arc<crate::core_store::VerifiedCore>, u32)>,
     phase: Phase,
     native_exited: bool,
     wait_identity_lost: bool,
@@ -43,15 +42,18 @@ struct OwnedChild {
 pub(super) struct NativeBirth {
     pub(super) target: HelperBirthTarget,
     owned: Mutex<OwnedChild>,
+    // Installed once before the worker starts. Authorization under slot never
+    // borrows the child/tail mutex, so exit cannot form slot/owned ABBA.
+    core: OnceLock<(Arc<crate::core_store::VerifiedCore>, u32)>,
     stop_requested: AtomicBool,
 }
 
 impl NativeBirth {
     pub(super) fn attach_core(&self, core: Arc<crate::core_store::VerifiedCore>, uid: u32) {
-        self.owned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .core = Some((core, uid));
+        assert!(
+            self.core.set((core, uid)).is_ok(),
+            "native core identity already attached"
+        );
     }
     /// Attach before starting the worker. Registry custody retains the writer capability if
     /// that worker disappears; Poison is retained and can never become a stopped receipt.
@@ -90,10 +92,7 @@ impl NativeCustody {
         let Some(birth) = &slot.current else {
             return uid == 0;
         };
-        let Ok(owned) = birth.owned.lock() else {
-            return false;
-        };
-        uid == 0 || owned.core.as_ref().is_some_and(|(_, owner)| *owner == uid)
+        uid == 0 || birth.core.get().is_some_and(|(_, owner)| *owner == uid)
     }
     pub(super) fn upgrade_admission(&self, close: bool) -> bool {
         let Ok(mut slot) = self.slot.lock() else {
@@ -122,10 +121,7 @@ impl NativeCustody {
         let Some(current) = &slot.current else {
             return true;
         };
-        let Ok(owned) = current.owned.lock() else {
-            return false;
-        };
-        match &owned.core {
+        match current.core.get() {
             Some((core, owner)) => {
                 (uid == 0 || uid == *owner) && id.is_none_or(|id| core.manifest.id == id.as_str())
             }
@@ -188,10 +184,7 @@ impl NativeCustody {
             match slot.current.clone() {
                 Some(current) => {
                     if let Some((uid, id)) = selected {
-                        let Ok(owned) = current.owned.lock() else {
-                            return Err(NativeBirthStart::NotAdmittedUnknown { target: None });
-                        };
-                        if !owned.core.as_ref().is_some_and(|(core, owner)| {
+                        if !current.core.get().is_some_and(|(core, owner)| {
                             (uid == 0 || uid == *owner) && core.manifest.id == id.as_str()
                         }) {
                             return Err(NativeBirthStart::NotAdmittedUnknown { target: None });
@@ -235,7 +228,6 @@ impl NativeCustody {
             owned: Mutex::new(OwnedChild {
                 child,
                 log_custody: None,
-                core: None,
                 phase: if unknown {
                     Phase::Unknown
                 } else {
@@ -247,6 +239,7 @@ impl NativeCustody {
                 kill_sent: false,
             }),
             stop_requested: AtomicBool::new(slot.closing),
+            core: OnceLock::new(),
         });
         slot.current = Some(Arc::clone(&birth));
         slot.starting = false;
@@ -447,7 +440,7 @@ impl NativeCustody {
         };
         if slot.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, birth)) {
             slot.stopped
-                .push_back((birth.target, owned.core.as_ref().map(|(_, owner)| *owner)));
+                .push_back((birth.target, birth.core.get().map(|(_, owner)| *owner)));
             if slot.stopped.len() > STOP_CACHE_LIMIT {
                 slot.stopped.pop_front();
             }

@@ -24,6 +24,11 @@ def load(name, filename):
 collector = load('c2_pure_collector', 'apple-source-inputs.py')
 builder = load('c2_pure_builder', 'ios-libbox.py')
 helper = builder.source_helpers()
+# The old C2 producer's frozen CONSUMERS policy is retained. Pure source/tool
+# controls use an explicit fixture projection of this candidate's App bytes;
+# this cannot approve an alpha8 framework for the new formal App entry.
+collector.CONSUMERS = {name: helper.file_hash(collector.ROOT / 'src-tauri/gen/apple/PacketTunnel' / name)
+                      for name in collector.CONSUMERS}
 COUNT = 0
 
 

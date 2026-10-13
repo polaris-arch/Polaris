@@ -294,6 +294,7 @@ pub struct HandlerState {
     pub upgrade_closed: bool,
     pub dns_owner: Option<u32>,
     pub dns_busy: bool,
+    pub dns_cleanup_pending: bool,
     /// Exact current birth. `Stopping` remains present through Pending/Unknown.
     pub child: Option<ManagedChild>,
 }
@@ -307,6 +308,7 @@ impl HandlerState {
             upgrade_closed: false,
             dns_owner: None,
             dns_busy: false,
+            dns_cleanup_pending: false,
         }
     }
 }
