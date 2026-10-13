@@ -38,6 +38,8 @@ class FormalOutputs(unittest.TestCase):
         facts = objc_validation_getter_contract(header)
         self.assertEqual(facts['receiver'], 'LibboxConfigValidationResult')
         self.assertEqual(len(facts['getters']), 9)
+        self.assertEqual(objc_validation_getter_contract(header.replace('\n', ' ')), facts,
+                         'valid declaration formatting cannot depend on newlines')
         getter = '- (NSString* _Nonnull)getTailscaleStoreRetirement;'
         membership = '- (NSString* _Nonnull)getTailscaleStoreMembership;'
         for wrong in [
@@ -49,6 +51,8 @@ class FormalOutputs(unittest.TestCase):
             header.replace(getter, getter.replace(';', ': (NSString*)argument;')),
             header.replace(getter, getter.replace('- ', '+ ')),
             header.replace(getter, getter + '\n' + getter),
+            header.replace(getter, getter + ' ' + getter),
+            header.replace(getter, getter + ' - (void)setTailscaleStoreRetirement:(NSString*)value;'),
             header.replace('LibboxConfigValidationResult', 'LibboxOtherReceiver'),
             header.replace('goSeqRefInterface', 'OtherProtocol'), header + header,
             header.replace('@end', '- (void)setTailscaleStoreRetirement:(NSString*)value;\n@end'),

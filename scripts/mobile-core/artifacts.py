@@ -343,15 +343,32 @@ def objc_validation_getter_contract(header):
                            r'<\s*goSeqRefInterface\s*>\s*\{\s*\}(.*?)@end\b', code, re.S)
     require(len(receivers) == 1, 'generated Objective-C validation result receiver differs')
     receiver, declarations = receivers[0], {}
+    # Method declarations end at semicolons, not newlines. In particular a
+    # same-line duplicate getter or setter must enter the same method table.
+    statements = receiver.split(';')
+    require(not statements[-1].strip(), 'unterminated Objective-C result declaration')
+    methods, properties = {}, []
+    for statement in statements[:-1]:
+        statement = statement.strip()
+        if not statement:
+            continue
+        if statement.startswith('@property'):
+            properties.append(statement)
+            continue
+        method = re.fullmatch(r'([-+])\s*\(([^()]*)\)\s*([A-Za-z_]\w*)\s*(.*)', statement, re.S)
+        require(method is not None, 'unexpected Objective-C result declaration')
+        sign, return_type, name, arguments = method.groups()
+        methods.setdefault(name, []).append((sign, return_type.strip(), arguments.strip()))
     for selector in ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
                      'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError']:
-        named = re.findall(r'(?m)^\s*[-+]\s*\([^;{}\n]+\)\s*' + selector + r'\s*(?=[:;])', receiver)
-        exact = re.findall(r'(?m)^\s*-\s*\(\s*NSString\s*\*\s*_Nonnull\s*\)\s*' + selector + r'\s*;', receiver)
-        require(len(named) == len(exact) == 1, 'generated Objective-C immutable getter differs: ' + selector)
-        require(not re.search(r'(?m)^\s*[-+]\s*\([^;{}\n]+\)\s*set' + selector[3:] + r'\s*(?=[:;])', receiver),
+        named = methods.get(selector, [])
+        require(len(named) == 1 and named[0][0] == '-' and not named[0][2] and
+                re.fullmatch(r'NSString\s*\*\s*_Nonnull', named[0][1]) is not None,
+                'generated Objective-C immutable getter differs: ' + selector)
+        require('set' + selector[3:] not in methods,
                 'generated Objective-C validation result setter: ' + selector)
         field = selector[3:4].lower() + selector[4:]
-        require(not re.search(r'@property\b[^;]*\b' + field + r'\b', receiver),
+        require(not any(re.search(r'\b' + field + r'\b', item) for item in properties),
                 'generated Objective-C validation result property alias: ' + field)
         declarations[selector] = '- (NSString* _Nonnull)' + selector + ';'
     return {'receiver': 'LibboxConfigValidationResult', 'getters': declarations}
