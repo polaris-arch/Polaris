@@ -347,7 +347,10 @@ async fn facade_claim_commit_receipt_worker_and_get_state_are_same_production_pa
     use polaris_core_supervisor::LifecycleKind;
     let dir = std::env::temp_dir().join(format!("polaris-coex-runtime-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (o, _, calls) = fixture();
+    let (mut o, clock, calls) = fixture();
+    // The worker runs on Tauri's global executor, independently of this test.
+    // Hold the next sample behind the injected clock until stale is observed.
+    Arc::get_mut(&mut o).unwrap().interval = Duration::from_millis(1);
     let mut rt = ProxyRuntime::new(
         Arc::new(ConfigManager::new(dir.clone())),
         Arc::new(HelperRuntime::never_installed_for_tests(dir.clone())),
@@ -367,7 +370,10 @@ async fn facade_claim_commit_receipt_worker_and_get_state_are_same_production_pa
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     rt.coex_network_receipt(gen, 1);
     assert_eq!(rt.coex_state()["freshness"], "stale");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    clock.store(1, Ordering::SeqCst);
     settled(&o).await;
+    assert_eq!(rt.coex_state()["freshness"], "latest");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     rt.claim_generation(Some(gen), LifecycleKind::Stop).unwrap();
     assert_eq!(rt.coex_state()["report"]["status"], "unknown");

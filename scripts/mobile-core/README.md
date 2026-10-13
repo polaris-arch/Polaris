@@ -177,6 +177,24 @@ success plus a defined `_start_app` text symbol, and retains its full output.
 Rust's compiler-builtins IR is left to the unchanged final Xcode link; this
 check does not claim IR compatibility or final carrier acceptance. Original
 archives are retained even when no accepted Rust receipt has been written.
+The plugin stages its unchanged `Package.swift`/`Sources` and source-owned
+`Package.resolved` into the
+Cargo-owned `OUT_DIR/polaris-ios-package/ios` (256 entries/4MiB input cap).
+Tauri's existing builder receives that absolute path; its local `.tauri` bridge
+and SwiftPM's `Package.resolved` are generated in the same build slot. Source
+changes invalidate Cargo through the original manifest/lock/source paths.
+Restaging removes stale owned Swift sources and restores the frozen resolver
+lock; after the original builder returns, its actual complete resolver pin must
+match that lock. Known SwiftPM v1/v2/v3 envelopes are checked explicitly,
+including v3 origin-hash shape; unknown schemas, extra fields/pins and changed
+repository/revision/version are rejected (formatting changes are allowed).
+This isolates generated files without ignoring them in the checkout or changing
+SwiftPM's upstream Tauri dependency range. `Cargo.lock` does not freeze that
+Swift dependency resolution. The new lock pins the verified public SwiftRs
+1.0.7 tag commit, matching the Rust bridge's existing version; it is a new
+source input, not a reconstruction of the old 323-byte observed lock, whose
+dependency pins were not retained. Missing, malformed or changed resolver pins
+fail the build without exporting their body.
 After formal environment/slot admission, the Rust entry observes source status
 before link verification and after archive copying. Earlier admission failures
 need not have an observation. Capturing status is capped at 16KiB stdout, 1KiB
