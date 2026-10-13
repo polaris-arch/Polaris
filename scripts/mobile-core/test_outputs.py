@@ -12,7 +12,7 @@ from unittest.mock import patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, tree_inventory, zip_entries
+from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import reservation
 from ci_android import emit_outputs, prepare_source, prepare
@@ -23,6 +23,42 @@ from transaction import install, recover
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
         self.value = load()
+
+    def validation_result_objc_header(self):
+        # Declaration spelling/receiver/return type from the preserved original
+        # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.
+        selectors = ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
+                     'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError']
+        return ('@interface LibboxConfigValidationResult : NSObject <goSeqRefInterface> {\n}\n'
+                '@property(strong, readonly) _Nonnull id _ref;\n' +
+                '\n'.join('- (NSString* _Nonnull)' + name + ';' for name in selectors) + '\n@end\n')
+
+    def test_objc_validation_getters_require_exact_result_receiver_types_and_readonly_selectors(self):
+        header = self.validation_result_objc_header()
+        facts = objc_validation_getter_contract(header)
+        self.assertEqual(facts['receiver'], 'LibboxConfigValidationResult')
+        self.assertEqual(len(facts['getters']), 9)
+        getter = '- (NSString* _Nonnull)getTailscaleStoreRetirement;'
+        membership = '- (NSString* _Nonnull)getTailscaleStoreMembership;'
+        for wrong in [
+            header.replace(getter, ''), header.replace(membership, ''),
+            header.replace(getter, '// ' + getter), header.replace(getter, '/* ' + getter + ' */'),
+            header.replace(getter, getter.replace('getTailscaleStoreRetirement', 'tailscaleStoreRetirement')),
+            header.replace(getter, getter.replace('NSString* _Nonnull', 'int64_t')),
+            header.replace(getter, getter.replace('_Nonnull', '_Nullable')),
+            header.replace(getter, getter.replace(';', ': (NSString*)argument;')),
+            header.replace(getter, getter.replace('- ', '+ ')),
+            header.replace(getter, getter + '\n' + getter),
+            header.replace('LibboxConfigValidationResult', 'LibboxOtherReceiver'),
+            header.replace('goSeqRefInterface', 'OtherProtocol'), header + header,
+            header.replace('@end', '- (void)setTailscaleStoreRetirement:(NSString*)value;\n@end'),
+            header.replace('@end', '@property(strong) NSString* tailscaleStoreMembership;\n@end'),
+        ]:
+            with self.subTest(header=wrong[:150]), self.assertRaises(RuntimeError):
+                objc_validation_getter_contract(wrong)
+        wrong_receiver = header.replace(getter, '') + ('@interface LibboxOtherReceiver : NSObject\n' + getter + '\n@end\n')
+        with self.assertRaises(RuntimeError):
+            objc_validation_getter_contract(wrong_receiver)
 
     def facts(self, apple=False, simulator=False):
         tags = self.value['apple' if apple else 'android']['tags'][:]
@@ -385,13 +421,22 @@ class FormalOutputs(unittest.TestCase):
                 (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
                 symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                     'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
-                    'tailscaleStoreRetirement', 'tailscaleStoreMembership', 'wakeNow', 'recordScreenState']
-                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols))
+                    'wakeNow', 'recordScreenState']
+                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header())
             info = framework / 'Info.plist'; info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
             with patch('artifacts.check_buildinfo') as buildinfo:
                 output = inspect_framework(framework, self.value, [], expected_id)
                 self.assertEqual(set(output['slices']), set(self.value['apple']['slices']))
                 self.assertEqual(buildinfo.call_count, 3)
+                for row in output['slices'].values():
+                    self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
+                original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
+                text = original_header.read_text()
+                original_header.write_text(text.replace('- (NSString* _Nonnull)getTailscaleStoreRetirement;',
+                                                       '// - (NSString* _Nonnull)getTailscaleStoreRetirement;'))
+                with self.assertRaisesRegex(RuntimeError, 'immutable getter'):
+                    inspect_framework(framework, self.value, [], expected_id)
+                original_header.write_text(text)
                 entries[1]['SupportedArchitectures'] = ['arm64']
                 info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
                 with self.assertRaisesRegex(RuntimeError, 'declared architecture inventory'):

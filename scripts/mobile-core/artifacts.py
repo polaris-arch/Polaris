@@ -331,6 +331,32 @@ def framework_entry_targets(entry):
     return ({'ios-arm64-simulator', 'ios-x86_64-simulator'} if len(expected) == 2 else {'ios-arm64'})
 
 
+def objc_validation_getter_contract(header):
+    # Actual pinned gobind headers use getTailscaleStore* selectors on this
+    # result receiver, not lowercase tailscaleStore* aliases. Comments or
+    # selectors on another class cannot supply the immutable result contract.
+    code = re.sub(r'/\*.*?\*/', '', header, flags=re.S)
+    code = re.sub(r'//[^\n]*', '', code)
+    require(len(re.findall(r'@interface\s+LibboxConfigValidationResult\b', code)) == 1,
+            'one generated Objective-C validation result receiver required')
+    receivers = re.findall(r'@interface\s+LibboxConfigValidationResult\s*:\s*NSObject\s*'
+                           r'<\s*goSeqRefInterface\s*>\s*\{\s*\}(.*?)@end\b', code, re.S)
+    require(len(receivers) == 1, 'generated Objective-C validation result receiver differs')
+    receiver, declarations = receivers[0], {}
+    for selector in ['getCleanup', 'getCleanupError', 'getConfigDigest', 'getContractVersion', 'getRequestID',
+                     'getTailscaleStoreMembership', 'getTailscaleStoreRetirement', 'getValidation', 'getValidationError']:
+        named = re.findall(r'(?m)^\s*[-+]\s*\([^;{}\n]+\)\s*' + selector + r'\s*(?=[:;])', receiver)
+        exact = re.findall(r'(?m)^\s*-\s*\(\s*NSString\s*\*\s*_Nonnull\s*\)\s*' + selector + r'\s*;', receiver)
+        require(len(named) == len(exact) == 1, 'generated Objective-C immutable getter differs: ' + selector)
+        require(not re.search(r'(?m)^\s*[-+]\s*\([^;{}\n]+\)\s*set' + selector[3:] + r'\s*(?=[:;])', receiver),
+                'generated Objective-C validation result setter: ' + selector)
+        field = selector[3:4].lower() + selector[4:]
+        require(not re.search(r'@property\b[^;]*\b' + field + r'\b', receiver),
+                'generated Objective-C validation result property alias: ' + field)
+        declarations[selector] = '- (NSString* _Nonnull)' + selector + ';'
+    return {'receiver': 'LibboxConfigValidationResult', 'getters': declarations}
+
+
 def inspect_framework(framework, value, graph, expected_id):
     validate(value)
     framework = Path(framework)
@@ -375,8 +401,9 @@ def inspect_framework(framework, value, graph, expected_id):
         header = '\n'.join(headers.values())
         for symbol in ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                        'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
-                       'tailscaleStoreRetirement', 'tailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
+                       'getTailscaleStoreRetirement', 'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
             require(symbol in header, 'generated Objective-C API missing: ' + symbol)
+        validation_getters = objc_validation_getter_contract(header)
         for slice_row in slices:
             members = [m for m in slice_row['archive']['members'] if m['classification'] == 'code']
             require(members, 'static archive has no code')
@@ -404,6 +431,7 @@ def inspect_framework(framework, value, graph, expected_id):
                             expected_id=expected_id, actual_id=ids[0], simulator=spec[3] == 'simulator')
             observed[target] = {'libraryIdentifier': identifier, 'binary': file_pin(binary),
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
+                'validationResultGetterContract': validation_getters,
                 'goBuildInfo': infos[0], 'buildID': ids[0],
                 'linkerOptions': [{'memberOrdinal': m['ordinal'], 'memberName': m['name'],
                                   'memberSha256': m['sha256'], 'command': command}
