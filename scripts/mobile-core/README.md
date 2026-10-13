@@ -168,7 +168,10 @@ The formal builder compiles through `apple_rust.py build` under its inherited
 reservation before Xcode starts; the Xcode Rust phase runs `apple_rust.py verify`
 with the admitted
 link context, explicit Cargo target, locked dependencies and iOS config. It
-checks the actual static archive/start_app and saves its byte/source/tool facts;
+uses `cargo rustc --lib --crate-type staticlib` only for this iOS archive stage;
+the shared Cargo manifest retains Android's cdylib and the other library types.
+Swift bridge symbols must resolve in the subsequent full Xcode App link.
+It checks the actual static archive/start_app and saves its byte/source/tool facts;
 it does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected

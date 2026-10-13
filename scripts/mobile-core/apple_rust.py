@@ -118,8 +118,9 @@ def build_reserved():
                   for name in ('cargo', 'rustc')}
     tool_pins = {name: {'path': str(path), **file_pin(path)} for name, path in tool_paths.items()}
     env['RUSTC'] = str(tool_paths['rustc'])
-    command = [str(tool_paths['cargo']), 'build', '--locked', '--release', '--lib', '--package', 'polaris',
-               '--target', triple, '--features', 'tauri/custom-protocol']
+    # Swift bridge symbols resolve in the final Xcode App link, after this archive.
+    command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
+               '--target', triple, '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib']
     run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'))
     archive = target / triple / 'release/libpolaris_lib.a'
     require(not archive.is_symlink() and archive.read_bytes().startswith(b'!<arch>\n'), 'actual Rust static archive required')
