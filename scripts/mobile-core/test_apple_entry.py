@@ -251,6 +251,73 @@ class AppleEntryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unsupported code member format'):
                 parser.archive(fixtures.archive([(table_name + ' UNKNOWN', table), ('actual-code.o', code)]), helper)
 
+    def test_actual_literal_and_tlv_section_kinds_keep_width_and_zero_fill_bounds(self):
+        fixtures = module('formal_section_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_section_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_section_info', 'scripts/libbox-patches/android-source.py')
+        # All seven kinds occur in the exact ac6 three-slice SDK inventory.
+        layouts = [(3, '__TEXT', '__literal4', 4), (4, '__TEXT', '__literal8', 8),
+                   (5, '__DATA', '__objc_selrefs', 8), (14, '__TEXT', '__literal16', 16),
+                   (17, '__DATA', '__thread_data', 9), (18, '__DATA', '__thread_bss', 8),
+                   (19, '__DATA', '__thread_vars', 24)]
+        section_header = 32 + 72 + 80  # second section in the anonymous MH_OBJECT segment
+        for target in ('ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'):
+            for kind, segment, section, length in layouts:
+                raw = bytearray(fixtures.mach_object(target, extra=[(segment, section, bytes(length))]))
+                struct.pack_into('<I', raw, section_header + 64, kind)
+                if kind == 18:
+                    struct.pack_into('<I', raw, section_header + 48, 0)
+                observed = parser.macho(bytes(raw), helper)['sections'][1]
+                self.assertEqual(observed['flags'] & 255, kind)
+                self.assertEqual(observed['zeroFill'], kind == 18)
+                self.assertEqual('sha256' in observed, kind != 18)
+                bad = bytearray(raw); struct.pack_into('<I', bad, section_header + 68, 1)
+                with self.subTest(target=target, kind=kind, bad='reserved'), self.assertRaises(RuntimeError):
+                    parser.macho(bytes(bad), helper)
+                bad = bytearray(raw); struct.pack_into('<I', bad, section_header + 64, 0x7f)
+                with self.assertRaisesRegex(RuntimeError, 'unsupported section type'):
+                    parser.macho(bytes(bad), helper)
+                if kind in (3, 4, 5, 14, 19):
+                    bad = bytearray(raw); struct.pack_into('<Q', bad, section_header + 40, length - 1)
+                    with self.assertRaisesRegex(RuntimeError, 'element width'):
+                        parser.macho(bytes(bad), helper)
+                if kind == 18:
+                    bad = bytearray(raw); struct.pack_into('<I', bad, section_header + 48, 1)
+                    with self.assertRaisesRegex(RuntimeError, 'zero-fill file offset'):
+                        parser.macho(bytes(bad), helper)
+                    bad = bytearray(raw); struct.pack_into('<I', bad, section_header + 60, 1)
+                    with self.assertRaisesRegex(RuntimeError, 'TLV zero-fill relocation'):
+                        parser.macho(bytes(bad), helper)
+
+    def test_observed_optimization_hint_is_object_only_bounded_disjoint_and_recorded(self):
+        fixtures = module('formal_optimization_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_optimization_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_optimization_info', 'scripts/libbox-patches/android-source.py')
+        payload = bytes(8)  # structural fixture, not a compiler/linker run
+        for target in ('ios-arm64', 'ios-arm64-simulator'):
+            raw = bytearray(fixtures.mach_object(target, load_commands=[struct.pack('<4I', 0x2e, 16, 0, len(payload))]))
+            command = 32 + 152 + 24  # one-section segment and LC_BUILD_VERSION
+            struct.pack_into('<I', raw, command + 8, len(raw))
+            raw += payload
+            observed = [r for r in parser.macho(bytes(raw), helper)['loadCommands'] if r['command'] == 0x2e][0]
+            self.assertEqual(observed['dataBytes'], len(payload))
+            self.assertEqual(observed['payloadSha256'], helper.digest(payload))
+            for field, value in [(4, 24), (8, 1), (8, len(raw) + 1), (12, len(raw)), (0, 0x8000002e)]:
+                bad = bytearray(raw); struct.pack_into('<I', bad, command + field, value)
+                with self.subTest(field=field, value=value), self.assertRaises(RuntimeError):
+                    parser.macho(bytes(bad), helper)
+            bad = bytearray(raw); struct.pack_into('<I', bad, 12, 2)
+            with self.assertRaisesRegex(RuntimeError, 'optimization hint object'):
+                parser.macho(bytes(bad), helper)
+            bad = bytearray(raw)
+            text_offset = struct.unpack_from('<I', bad, 32 + 72 + 48)[0]
+            struct.pack_into('<I', bad, command + 8, text_offset)
+            with self.assertRaisesRegex(RuntimeError, 'overlap'):
+                parser.macho(bytes(bad), helper)
+        duplicate = struct.pack('<4I', 0x2e, 16, 0, 0)
+        with self.assertRaisesRegex(RuntimeError, 'duplicate'):
+            parser.macho(fixtures.mach_object('ios-arm64', load_commands=[duplicate, duplicate]), helper)
+
     def test_observed_linker_option_command_bytes_are_parsed_and_recorded_for_object_only(self):
         fixtures = module('formal_linker_option_fixtures', 'scripts/apple-carrier.test.py')
         parser = module('formal_linker_option_parser', 'scripts/apple-carrier.py')

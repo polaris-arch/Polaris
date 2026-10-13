@@ -12,7 +12,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import file_pin, inspect_aar, inspect_framework, read_receipt
+from artifacts import component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
 from producer import lease, run, write_json
 
 
@@ -38,7 +38,18 @@ def verify_original(component, receipt_path, platform, tools, scratch):
         observed = inspect_aar(component, value, binding['moduleGraph'], tools, run, scratch, expected_id)
     else:
         observed = inspect_framework(component, value, binding['moduleGraph'], expected_id)
-    require(observed == receipt['output'], 'actual component bytes/API/native identity differ')
+    current_identity, producer_identity = component_output_identity(observed), component_output_identity(receipt['output'])
+    missing = object()
+    changed = sorted(key for key in set(current_identity) | set(producer_identity)
+                     if current_identity.get(key, missing) != producer_identity.get(key, missing))
+    headers = {}
+    if platform == 'android':
+        for name, row in observed['nativeLibraries'].items():
+            if 'goBuildInfo' in row:
+                headers[name] = {'observed': row['goBuildInfo'].split('\n', 1)[0],
+                                 'producer': receipt['output'].get('nativeLibraries', {}).get(name, {}).get('goBuildInfo', '').split('\n', 1)[0]}
+    require(current_identity == producer_identity, 'actual component bytes/API/native identity differ; fields=' + repr(changed) +
+            '; originalRawHeaders=' + repr(headers))
     return receipt
 
 

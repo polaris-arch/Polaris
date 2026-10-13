@@ -226,7 +226,9 @@ def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch)
         observed = inspect_aar(component, value, binding['moduleGraph'], tools, run_tool, scratch, expected)
     else:
         observed = inspect_framework(component, value, binding['moduleGraph'], expected)
-    require(observed == receipt['output'], 'cached component native/content predicate differs')
+    from artifacts import component_output_identity
+    require(component_output_identity(observed) == component_output_identity(receipt['output']),
+            'cached component native/content predicate differs')
     return receipt
 
 

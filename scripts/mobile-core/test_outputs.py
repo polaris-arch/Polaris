@@ -12,7 +12,7 @@ from unittest.mock import patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import check_buildinfo, framework_entry_targets, inspect_framework, module, module_stream, tree_inventory, zip_entries
+from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import reservation
 from ci_android import emit_outputs, prepare_source, prepare
@@ -462,6 +462,75 @@ class FormalOutputs(unittest.TestCase):
             driver.unlink(); driver.symlink_to('missing-lld')
             with self.assertRaises(OSError):
                 executable_driver_identity(driver)
+
+    def relocated_android_observations(self):
+        name = 'jni/arm64-v8a/libbox.so'
+        body = '\tpath\tgobind\n\tdep\texample.org/module\tv1.2.3\th1:fixed\n'
+        original = {'format': 'AAR', 'artifact': {'bytes': 123, 'sha256': 'a' * 64},
+                    'nativeLibraries': {name: {'bytes': 42, 'sha256': 'b' * 64,
+                        'goBuildInfo': '/producer/scratch/jni_arm64-v8a_libbox.so: go1.25.5\n' + body,
+                        'parsedBuildInfo': self.facts(), 'buildID': 'original-build-id',
+                        'jniExports': ['JNI_OnLoad'], 'needed': ['libc.so']}},
+                    'javaInterfaces': {'Libbox': 'original API'}}
+        observed = deepcopy(original)
+        observed['nativeLibraries'][name]['goBuildInfo'] = '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.5\n' + body
+        return name, original, observed
+
+    def test_component_identity_ignores_only_the_exact_go_invocation_filename_and_preserves_raw(self):
+        name, original, observed = self.relocated_android_observations()
+        frozen = deepcopy(original), deepcopy(observed)
+        self.assertNotEqual(original, observed)
+        self.assertEqual(component_output_identity(original), component_output_identity(observed))
+        self.assertEqual((original, observed), frozen, 'original stdout and receipt observations must stay intact')
+        for mutate in [
+            lambda v: v['artifact'].update(sha256='c' * 64),
+            lambda v: v['nativeLibraries'][name].update(bytes=43),
+            lambda v: v['nativeLibraries'][name].update(buildID='other-build-id'),
+            lambda v: v['nativeLibraries'][name].update(jniExports=[]),
+            lambda v: v['nativeLibraries'][name].update(needed=['libother.so']),
+            lambda v: v['nativeLibraries'][name]['parsedBuildInfo']['settings'].update(GOARCH='amd64'),
+            lambda v: v['nativeLibraries'][name]['parsedBuildInfo']['modules']['example.org/module'].update(sum='h1:other'),
+            lambda v: v['nativeLibraries'][name].update(goBuildInfo=v['nativeLibraries'][name]['goBuildInfo'].replace('h1:fixed', 'h1:other')),
+            lambda v: v['javaInterfaces'].update(Libbox='changed API'),
+            lambda v: v.update(unboundNull=None),
+        ]:
+            wrong = deepcopy(observed); mutate(wrong)
+            self.assertNotEqual(component_output_identity(original), component_output_identity(wrong))
+        for header in ['relative/jni_arm64-v8a_libbox.so: go1.25.5',
+                       '/consumer/work/other.so: go1.25.5',
+                       '/consumer/work/jni_arm64-v8a_libbox.so: go1.25.6']:
+            wrong = deepcopy(observed)
+            wrong['nativeLibraries'][name]['goBuildInfo'] = header + '\n\tpath\tgobind\n'
+            with self.subTest(header=header), self.assertRaises(RuntimeError):
+                component_output_identity(wrong)
+        bad = deepcopy(observed); bad['nativeLibraries'][name]['goBuildInfo'] += '\t=>\t./other-source\t(devel)\n'
+        self.assertNotEqual(component_output_identity(original), component_output_identity(bad))
+        framework = {'format': 'static-XCFramework', 'goBuildInfo': {'moduleRaw': 'raw original'}}
+        self.assertEqual(component_output_identity(framework), framework)
+
+    def test_consumer_and_producer_reinspection_keep_the_original_receipt_identity(self):
+        from consume import verify_original
+        from producer import verify_receipt
+        name, original, observed = self.relocated_android_observations()
+        binding = {'platform': 'android', 'sourceContract': self.value, 'sourceOverlay': 0,
+                   'sourceObservation': {'commit': self.value['sourceCommit'], 'tree': self.value['sourceTree']},
+                   'moduleGraph': []}
+        receipt = {'schema': 'polaris-mobile-component-v1', 'platform': 'android', 'input': binding,
+                   'output': original, 'nativeInputs': {}, 'sourceOverlay': 0, 'AppAccepted': False, 'devicePassed': False}
+        receipt['fingerprint'] = sha(canonical(receipt))
+        frozen = deepcopy(receipt)
+        tools = {'go': 'actual-go', 'javap': 'actual-javap', 'readelf': 'actual-readelf'}
+        with patch('consume.load', return_value=self.value), patch('consume.read_receipt', return_value=receipt), \
+                patch('consume.inspect_aar', return_value=observed), patch('native_inputs.verify'), \
+                patch('producer.inspect_aar', return_value=observed):
+            self.assertIs(verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work')), receipt)
+            self.assertIs(verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work')), receipt)
+            self.assertEqual(receipt, frozen)
+            observed['nativeLibraries'][name]['buildID'] = 'changed-native-id'
+            with self.assertRaisesRegex(RuntimeError, 'native identity differ; fields=.*nativeLibraries.*originalRawHeaders='):
+                verify_original('/component.aar', '/receipt.json', 'android', tools, Path('/consumer/work'))
+            with self.assertRaisesRegex(RuntimeError, 'cached component native/content'):
+                verify_receipt('/component.aar', receipt, self.value, binding, tools, None, Path('/consumer/work'))
 
     def test_source_owned_local_replacement_accepts_only_coherent_declared_literal_or_directory(self):
         with tempfile.TemporaryDirectory() as temporary:

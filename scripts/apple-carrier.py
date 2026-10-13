@@ -99,7 +99,7 @@ def macho(data, helper):
     require(0 < count <= command_bytes // 8, 'load-command count')
     limit, position = 32 + command_bytes, 32
     sections, segments, vm_segments, platforms, commands, auxiliary = [], [], [], [], [], []
-    symbols, dynamic = None, None
+    symbols, dynamic, optimization_hint = None, None, None
     for ordinal in range(count):
         bounds(position, 8, limit, 'load-command header')
         command, size = struct.unpack_from('<II', data, position)
@@ -125,8 +125,19 @@ def macho(data, helper):
                 require(not segment_name or segment_name == segment, 'section segment differs')
                 require(addr >= address and length_s <= address + vm_size - addr
                         and align <= 31 and addr % (1 << align) == 0, 'section address/alignment')
-                zero = sflags & 255 == 1
-                require(sflags & 255 in (0, 1, 2, 6, 8, 9, 11, 22), 'unsupported section type')
+                section_type = sflags & 255
+                # The real three-slice SDK also contains literal pools,
+                # Objective-C literal pointers and the three TLV section kinds.
+                # Only these defined encodings extend the original inventory.
+                require(section_type in (0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 14, 17, 18, 19, 22),
+                        'unsupported section type')
+                if section_type in (3, 4, 5, 14, 17, 18, 19):
+                    require(r1 == r2 == r3 == 0, 'literal/TLV reserved fields')
+                    width = {3: 4, 4: 8, 5: 8, 14: 16, 19: 24}.get(section_type)
+                    require(width is None or length_s % width == 0, 'literal/TLV element width')
+                    if section_type == 18:
+                        require(nreloc == 0, 'TLV zero-fill relocation')
+                zero = section_type in (1, 18)
                 row = {'segment': segment, 'section': section, 'address': addr, 'offset': off,
                        'bytes': length_s, 'flags': sflags, 'zeroFill': zero,
                        'relocationOffset': reloc, 'relocationCount': nreloc}
@@ -192,6 +203,19 @@ def macho(data, helper):
                 if entries:
                     require(off >= limit, 'dynamic symbol table in headers')
                     auxiliary.append((off, off + entries * width))
+        elif command == 0x2e:
+            # LC_LINKER_OPTIMIZATION_HINT: one MH_OBJECT linkedit_data_command,
+            # bounded outside headers and disjoint from sections/other tables.
+            require(kind == 1 and size == 16 and optimization_hint is None,
+                    'optimization hint object/size/duplicate')
+            off, length = struct.unpack_from('<2I', data, position + 8)
+            bounds(off, length, len(data), 'optimization hint data')
+            require(not length or off >= limit, 'optimization hint in headers')
+            optimization_hint = (off, length)
+            if length:
+                auxiliary.append((off, off + length))
+            commands[-1].update(dataOffset=off, dataBytes=length,
+                                payloadSha256=helper.digest(data[off:off + length]))
         elif command in (0x80000033, 0x80000034, 0x26, 0x29):
             require(size == 16, 'linkedit command size')
             off, length = struct.unpack_from('<2I', data, position + 8)

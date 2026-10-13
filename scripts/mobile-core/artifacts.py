@@ -65,6 +65,39 @@ def module_stream(raw):
     return rows
 
 
+def component_output_identity(output):
+    """Compare content while retaining the original verifier stdout observation.
+
+    Go1.25.5 version.scanFile prints its invocation filename in the first
+    line. A consumer uses its own scratch directory for the same pinned ELF.
+    Only that absolute filename is observational; the version, entire module
+    body, parsed facts, native bytes, BuildID, JNI/API and all other output
+    fields still participate in equality. Neither original output is mutated.
+    """
+    result = json.loads(json.dumps(output))
+    if result.get('format') != 'AAR':
+        return result
+    require(isinstance(result.get('nativeLibraries'), dict), 'AAR native observation inventory missing')
+    for name, row in result['nativeLibraries'].items():
+        require(isinstance(row, dict), 'AAR native observation row differs')
+        if 'goBuildInfo' not in row:
+            continue
+        require(name.endswith('/libbox.so') and isinstance(row['goBuildInfo'], str),
+                'raw Go observation must describe the bound libbox member')
+        version = row.get('parsedBuildInfo', {}).get('goVersion')
+        require(isinstance(version, str) and re.fullmatch(r'\d+\.\d+\.\d+', version),
+                'raw Go observation version missing')
+        header, separator, body = row['goBuildInfo'].partition('\n')
+        suffix = ': go' + version
+        require(separator and body.startswith('\t') and header.endswith(suffix),
+                'raw Go observation header/body differs')
+        filename = header[:-len(suffix)]
+        require('\0' not in filename and Path(filename).is_absolute() and
+                Path(filename).name == name.replace('/', '_'), 'raw Go observation filename differs')
+        row['goBuildInfo'] = 'go' + version + '\n' + body
+    return result
+
+
 def local_replacement_aliases(replacement, source_dir, observed, name):
     literal, directory = replacement.get('Path'), replacement.get('Dir')
     diagnostic = ('native replacement differs: ' + name + '; observed=' + repr(observed) +

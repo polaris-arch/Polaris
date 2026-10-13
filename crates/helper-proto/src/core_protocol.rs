@@ -50,7 +50,7 @@ pub struct PinnedStartParams {
 }
 
 impl PinnedStartParams {
-    /// id/cfg/log/fwd/[parentPid], with no aliases, duplicate or trailing lines.
+    /// `id/cfg/log/fwd/[parentPid]`, with no aliases, duplicate or trailing lines.
     pub fn parse(lines: &[String]) -> Option<Self> {
         if !(4..=5).contains(&lines.len()) {
             return None;
