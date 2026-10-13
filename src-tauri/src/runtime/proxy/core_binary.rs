@@ -33,6 +33,10 @@ pub(super) const LINUX_BUNDLE_PRODUCT_DIR: &str = env!("POLARIS_PRODUCT_NAME");
 /// **之后**：安装升级不会删除旧版遗留目录，反过来会让新 app 静默首选旧 core/helper
 /// （2026-08-23 `.207` 真机实证）。⑥ `CARGO_MANIFEST_DIR/../resources/`（开发态）。
 ///
+/// iOS 的 `exe_dir` 本身是 `Polaris.app`，权威资源优先位于
+/// `exe/assets/_up_/resources/`（formal Xcode 复制的实际 assets 文件夹）；
+/// macOS 的 `exe_dir` 是 `Contents/MacOS`，仍走既有 `../Resources` 布局。
+///
 /// `exe_dir` = `current_exe().parent()`（None=取不到）；`manifest_dir` = `CARGO_MANIFEST_DIR`。
 pub(crate) fn bundle_resource_candidates(
     exe_dir: Option<&std::path::Path>,
@@ -58,6 +62,12 @@ fn bundle_resource_roots(
 ) -> Vec<PathBuf> {
     let mut prefixes: Vec<PathBuf> = Vec::new();
     if let Some(dir) = exe_dir {
+        // iOS has no Contents/MacOS level: current_exe is directly inside
+        // Polaris.app. The checked Xcode folder resource is assets/_up_;
+        // use that shipped input before any legacy/development candidates.
+        if dir.extension() == Some(std::ffi::OsStr::new("app")) {
+            prefixes.push(dir.join("assets").join("_up_").join("resources"));
+        }
         // Windows NSIS 装机布局（W10 根因，2026-08-19 真机 toast 首曝）：tauri-utils 的
         // `resource_relpath` 把 `../` 段改名 `_up_`（与 bundler 无关，NSIS 同样生效），装机后资源
         // 在 `<exe目录>\_up_\resources\`——此前候选表只有 mac 的一种 `_up_` 形态（`../Resources/

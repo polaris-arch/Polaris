@@ -109,3 +109,93 @@ fn build_rs_expected_count_matches_builtin_table() {
              改真值表必须同步改那个常量，否则打包期断言会按旧数量放行（少的那几个 .srs 照样出包）"
     );
 }
+
+/// Exercise the exact shipped iOS layout through the production resolver and
+/// seeder, not a repo fallback or a bare resources directory beside the App.
+#[test]
+#[cfg(not(target_os = "android"))]
+fn ios_app_assets_resolve_and_seed_all_28_without_history_or_development_tree() {
+    let root = super::tmp_root("ios-app-assets");
+    let app = root.join("Containers/Bundle/Application/fixture/Polaris.app");
+    let shipped = app.join("assets/_up_/resources/data");
+    std::fs::create_dir_all(&shipped).expect("create real iOS assets layout");
+    std::fs::write(app.join("polaris"), b"inert executable location").expect("create App location");
+    let files = super::all_builtin_files();
+    assert_eq!(
+        files.len(),
+        28,
+        "formal iOS carrier binds all 28 bundled geo files"
+    );
+    for (ordinal, name) in files.iter().enumerate() {
+        let mut bytes = b"SRS\x01ios-shipped-geo-".to_vec();
+        bytes.extend_from_slice(&(ordinal as u32).to_le_bytes());
+        std::fs::write(shipped.join(name), bytes).expect("write actual App resource");
+    }
+    assert!(!app.join("_up_/resources/data").exists());
+    assert!(!app.join("resources/data").exists());
+    let candidates = super::super::bundled_data_candidates_for(Some(&app), None, true);
+    assert_eq!(candidates.first(), Some(&shipped));
+    let resolved =
+        super::super::resolve_data_candidates(candidates).expect("shipped iOS directory resolves");
+    assert_eq!(resolved, shipped);
+    let runtime = root.join("Containers/Data/Application/fixture/config/rules");
+    let report = super::super::seed_builtin_rule_sets(&resolved, &runtime, &SeedOptions::default());
+    assert_eq!(report.seeded.len(), 28);
+    assert!(report.still_missing.is_empty());
+    for name in &files {
+        assert!(super::super::is_valid_srs_file(&runtime.join(name)));
+        assert_eq!(
+            std::fs::read(runtime.join(name)).unwrap(),
+            std::fs::read(shipped.join(name)).unwrap()
+        );
+    }
+    let again = super::super::seed_builtin_rule_sets(&resolved, &runtime, &SeedOptions::default());
+    assert!(again.seeded.is_empty());
+    assert!(again.still_missing.is_empty());
+    std::fs::remove_dir_all(root).expect("remove owned fixture only");
+}
+
+#[test]
+#[cfg(not(target_os = "android"))]
+fn ios_shipped_assets_precede_legacy_and_release_never_uses_development_geo() {
+    let root = super::tmp_root("ios-assets-order");
+    let app = root.join("Polaris.app");
+    let shipped = app.join("assets/_up_/resources/data");
+    let legacy = app.join("_up_/resources/data");
+    let manifest = root.join("development/src-tauri");
+    let development = manifest.join("../resources/data");
+    for dir in [&shipped, &legacy, &manifest, &development] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for name in super::all_builtin_files() {
+        std::fs::write(shipped.join(&name), b"SRS\x01new App").unwrap();
+        std::fs::write(legacy.join(&name), b"SRS\x01old legacy").unwrap();
+        std::fs::write(development.join(name), b"SRS\x01developer tree").unwrap();
+    }
+    let candidates = super::super::bundled_data_candidates_for(Some(&app), Some(&manifest), true);
+    assert!(!candidates.contains(&development));
+    let resolved = super::super::resolve_data_candidates(candidates).unwrap();
+    assert_eq!(resolved, shipped);
+    let runtime = root.join("runtime/rules");
+    let report = super::super::seed_builtin_rule_sets(&resolved, &runtime, &SeedOptions::default());
+    assert_eq!(report.seeded.len(), 28);
+    assert!(report.still_missing.is_empty());
+    for name in super::all_builtin_files() {
+        assert_eq!(
+            std::fs::read(runtime.join(name)).unwrap(),
+            b"SRS\x01new App"
+        );
+    }
+    std::fs::remove_dir_all(&shipped).unwrap();
+    std::fs::remove_dir_all(&legacy).unwrap();
+    assert!(
+        super::super::resolve_data_candidates(super::super::bundled_data_candidates_for(
+            Some(&app),
+            Some(&manifest),
+            true
+        ))
+        .is_none(),
+        "release cannot manufacture a shipped resource hit from the development tree"
+    );
+    std::fs::remove_dir_all(root).expect("remove owned fixture only");
+}

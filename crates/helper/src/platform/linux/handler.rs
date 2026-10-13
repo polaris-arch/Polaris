@@ -229,7 +229,15 @@ pub fn handle<P, S, D, SD>(
                     guard.dns_owner = previous_owner.or(Some(cred.uid));
                 }
             }
-            if guard.dns_cleanup_pending && guard.dns_owner.is_some() {
+            // The same flag also retains an unconfirmed live-birth SET.
+            // Only a retired/replaced birth hands DNS restoration to this
+            // completion; a successful retry on the retained birth keeps DNS.
+            let dns_birth_current = guard
+                .dns_birth
+                .as_ref()
+                .zip(guard.child.as_ref())
+                .is_some_and(|(birth, child)| birth.same_birth(child.handle()));
+            if guard.dns_cleanup_pending && !dns_birth_current && guard.dns_owner.is_some() {
                 drop(guard);
                 let cleanup_cleared = deps
                     .resolved_dns
@@ -246,7 +254,11 @@ pub fn handle<P, S, D, SD>(
             } else {
                 // A failed rollback/revert leaves retained DNS responsibility;
                 // another Start cannot reuse the slot until a real restore.
-                guard.dns_cleanup_pending = matches!(outcome, DnsChange::Unconfirmed);
+                guard.dns_cleanup_pending = match outcome {
+                    DnsChange::Applied | DnsChange::Restored => false,
+                    DnsChange::Unmodified => guard.dns_cleanup_pending,
+                    DnsChange::Unconfirmed => true,
+                };
                 guard.dns_busy = false;
             }
         }

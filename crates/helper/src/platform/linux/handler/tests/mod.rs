@@ -1819,3 +1819,120 @@ fn reap_during_dns_set_hands_restoration_back_to_the_reserved_operation() {
         assert_eq!(*resolved.calls.lock().unwrap(), 1);
     }
 }
+
+#[test]
+fn successful_dns_retry_keeps_live_birth_takeover_but_reaped_retry_is_restored() {
+    struct RetryDns<'a> {
+        state: &'a Mutex<HandlerState>,
+        retire_during_retry: bool,
+        takeover_calls: StdMutex<usize>,
+        revert_calls: StdMutex<usize>,
+        applied: StdMutex<bool>,
+    }
+    impl ResolvedDnsOps for RetryDns<'_> {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            let mut calls = self.takeover_calls.lock().unwrap();
+            *calls += 1;
+            *self.applied.lock().unwrap() = true;
+            if *calls == 1 {
+                Err("initial SET readback failed".into())
+            } else {
+                if self.retire_during_retry {
+                    let mut state = self.state.lock().unwrap();
+                    assert!(state.dns_busy);
+                    let birth = state.child.as_ref().unwrap().handle().clone();
+                    state.retire_birth(&birth);
+                }
+                Ok(())
+            }
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            let mut calls = self.revert_calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Err("initial rollback failed".into())
+            } else {
+                *self.applied.lock().unwrap() = false;
+                Ok(())
+            }
+        }
+    }
+    for (retire_during_retry, refused_retry) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        let state = Mutex::new(initial);
+        let resolved = RetryDns {
+            state: &state,
+            retire_during_retry,
+            takeover_calls: StdMutex::new(0),
+            revert_calls: StdMutex::new(0),
+            applied: StdMutex::new(false),
+        };
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let request = || {
+            MockConn::new(vec![
+                lcmd::RESOLVED_DNS_SET,
+                polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+                polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+            ])
+        };
+        let mut first = request();
+        handle(&state, &deps, &mut first);
+        assert_eq!(
+            first.writes(),
+            ["ERR resolved-dns initial SET readback failed"]
+        );
+        {
+            let mut state = state.lock().unwrap();
+            assert!(state.dns_cleanup_pending);
+            assert_eq!(state.dns_owner, Some(0));
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+            assert!(!state.dns_busy);
+            let mut next = MockConn::new(vec![]);
+            handle_start(&mut state, &deps, &PeerCred { uid: 0, gid: 0 }, &mut next);
+            assert_eq!(next.writes(), ["ERR slot-owned-or-control-busy"]);
+        }
+        if refused_retry {
+            // A rejected retry is unmodified: it must retain responsibility and
+            // may not turn the live birth's unknown DNS into exit cleanup.
+            let mut denied =
+                MockConn::new(vec![lcmd::RESOLVED_DNS_SET, "other-interface", "8.8.8.8"]);
+            handle(&state, &deps, &mut denied);
+            assert!(denied.writes()[0].starts_with("ERR resolved-dns "));
+            assert!(state.lock().unwrap().dns_cleanup_pending);
+            assert_eq!(*resolved.takeover_calls.lock().unwrap(), 1);
+            assert_eq!(*resolved.revert_calls.lock().unwrap(), 1);
+        }
+        let mut second = request();
+        handle(&state, &deps, &mut second);
+        assert_eq!(second.writes(), ["OK resolved-dns-set"]);
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        assert!(!state.dns_cleanup_pending);
+        assert_eq!(state.child.is_none(), retire_during_retry);
+        assert_eq!(state.dns_owner, (!retire_during_retry).then_some(0));
+        assert_eq!(state.dns_birth.is_some(), !retire_during_retry);
+        assert_eq!(*resolved.applied.lock().unwrap(), !retire_during_retry);
+        assert_eq!(*resolved.takeover_calls.lock().unwrap(), 2);
+        assert_eq!(
+            *resolved.revert_calls.lock().unwrap(),
+            if retire_during_retry { 2 } else { 1 }
+        );
+        if !retire_during_retry {
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        }
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    }
+}

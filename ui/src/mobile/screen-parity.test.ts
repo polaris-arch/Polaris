@@ -1040,6 +1040,14 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
         `${register.screen}：${file} 不在这一屏的 desktopDirs 里 —— 那不是「本屏的原语库」`,
       ).toBe(true);
     }
+    // Sharing the measurement implementation across desktop/mobile does not make
+    // its owned status/path copy a common-only primitive.
+    expect(screenKeysOf('ui/src/mobile/MeasurementLabel.tsx')).toEqual([
+      'measurement.nodePath', 'measurement.unavailable',
+    ]);
+    expect(HOME_PARITY.extraBlockSources).toContain('ui/src/mobile/MeasurementLabel.tsx');
+    expect(HOME_PARITY.sharedPrimitives).not.toContain('ui/src/mobile/MeasurementLabel.tsx');
+    expect(HOME_PARITY.blocks.find(entry => entry.id === 'MeasurementLabel')?.disposition.kind).toBe('ported');
     // 反向对照：一份**真的是内容**的文件必须被这条判据判成不合格（证明它不是恒真）。
     expect(
       screenKeysOf('ui/src/components/hover-cards/RuleHoverCard.tsx').length,
