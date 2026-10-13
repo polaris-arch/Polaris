@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import file_pin, module, zip_entries, check_buildinfo, read_receipt
+from artifacts import receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt
 from producer import lease, run, write_json
 from consume import app_identity, apple_resources, verify_original
 
@@ -28,7 +28,7 @@ def android(apk, abi, r8, component, receipt_path, tools, scratch):
             material['componentReceiptSha256'] == file_pin(receipt_path)['sha256'] and
             material['output'] == receipt['output'] and material.get('sourceOverlay') == 0 and
             material.get('AppAccepted') is False and material.get('devicePassed') is False and
-            material['fingerprint'] == sha(canonical({k: v for k, v in material.items() if k != 'fingerprint'})),
+            material['fingerprint'] == receipt_digest({k: v for k, v in material.items() if k != 'fingerprint'}),
             'actual materialized App input changed')
     current = app_identity()
     require(current == material['App'], 'App candidate changed after SDK materialization')
@@ -118,7 +118,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     require(file_pin(link_path)['sha256'] == link_sha, 'fixed Apple link input bytes differ')
     link = read_receipt(Path(link_path))
     require(link['schema'] == 'polaris-mobile-apple-link-input-v1' and link['staticOnly'] is True and
-            link['fingerprint'] == sha(canonical({k: v for k, v in link.items() if k != 'fingerprint'})), 'Apple link input differs')
+            link['fingerprint'] == receipt_digest({k: v for k, v in link.items() if k != 'fingerprint'}), 'Apple link input differs')
     require(file_pin(receipt_path)['sha256'] == link['componentReceiptSha256'], 'original Apple component receipt changed')
     receipt = verify_original(link['framework'], receipt_path, 'apple', {}, scratch)
     require(receipt['fingerprint'] == link['componentFingerprint'] and receipt['output'] == link['componentOutput'],
@@ -161,7 +161,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
                 require(len(infos) == len(ids) == 1, 'final extension must retain original Go source carrier')
                 check_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
                                 os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive', simulator=bool(simulator_arch),
-                                expected_id='polaris-mobile-' + sha(canonical(receipt['input'])), actual_id=ids[0])
+                                expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
                 rows[name].update(goBuildInfo=infos[0], buildID=ids[0])
         require(not any(n.startswith(app_root) and (n.endswith('.a') or 'Libbox.framework/' in n) for n in archive.namelist()),
                 'build-only static SDK must not be copied into the installed App')
@@ -203,7 +203,7 @@ def main():
             require(all([args.link_input, args.link_input_sha256, args.linkmap, args.derived_data]), 'Apple original link context required')
             result = apple(args.artifact, args.link_input, args.link_input_sha256, args.linkmap, args.receipt, args.scratch,
                            args.derived_data, args.simulator_arch)
-    result['fingerprint'] = sha(canonical(result))
+    result['fingerprint'] = receipt_digest(result)
     require(not args.output.exists(), 'final carrier receipt already frozen')
     write_json(args.output, result)
     print(json.dumps({'fingerprint': result['fingerprint'], 'devicePassed': False, 'signatureTrustValidated': False}))

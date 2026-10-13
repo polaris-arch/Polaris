@@ -33,7 +33,7 @@ class FormalOutputs(unittest.TestCase):
             path = Path(temporary) / 'receipt.json'
             for schema in ('polaris-mobile-component-v1', 'polaris-mobile-apple-link-input-v1'):
                 value = {'schema': schema, 'platform': 'apple',
-                         'originalInventoryObservation': 'x' * (16 * 1024 ** 2),
+                         'originalInventoryObservation': ['x' * 800 for _ in range(22000)],
                          'AppAccepted': False, 'devicePassed': False}
                 value['fingerprint'] = sha(canonical(value))
                 write_json(path, value)
@@ -80,8 +80,9 @@ class FormalOutputs(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'before installation'):
                 write_json(path, {'schema': 'polaris-mobile-component-v1', 'platform': 'apple', 'raw': 'x' * 129})
             write = json.loads(log.getvalue().splitlines()[0])
-            self.assertGreater(write['bytes'], write['maximumBytes'])
-            self.assertEqual(write['phase'], 'serialize-before-install')
+            self.assertEqual(write['maximumBytes'], 128)
+            self.assertEqual(write['phase'], 'bounded-serialization-rejected')
+            self.assertNotIn('bytes', write, 'rejected bounded stream must not invent a complete size')
             self.assertEqual(path.read_bytes(), b'x' * 129)
 
     def test_component_capacity_does_not_expand_link_android_or_control_receipt_budgets(self):
@@ -107,6 +108,29 @@ class FormalOutputs(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     artifacts.read_receipt(path)
                 path.write_bytes(original)
+
+    def test_streaming_fingerprint_and_pretty_bytes_keep_canonical_contract(self):
+        value = {'schema': 'small-control', 'utf8': '中文', 'number': 1.25, 'nested': [None, True, {'b': 2, 'a': 1}]}
+        self.assertEqual(artifacts.receipt_digest(value), sha(canonical(value)))
+        self.assertEqual(b''.join(artifacts.receipt_chunks(value, pretty=True)),
+                         (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n').encode())
+        self.assertEqual(artifacts.receipt_field_bytes(value), {key: len(canonical(child)) for key, child in value.items()})
+        for value in [{'raw': 'x' * (artifacts.MAX_JSON_STRING + 1)}, {'raw': float('inf')}, {'raw': 1 << 257}]:
+            with self.assertRaises(RuntimeError): artifacts.receipt_digest(value)
+        cycle = {}; cycle['self'] = cycle
+        with self.assertRaisesRegex(RuntimeError, 'cyclic'): artifacts.receipt_digest(cycle)
+        value = {}; node = value
+        for _ in range(66): node['child'] = {}; node = node['child']
+        with self.assertRaisesRegex(RuntimeError, 'depth'): artifacts.receipt_digest(value)
+        with patch.object(artifacts, 'MAX_JSON_NODES', 4), self.assertRaisesRegex(RuntimeError, 'node'):
+            artifacts.receipt_digest({'many': [1, 2, 3]})
+
+    def test_reader_checks_lexical_depth_before_building_a_dom(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'receipt.json'; path.write_bytes(b'[' * 65 + b'0' + b']' * 65)
+            with patch('artifacts.decode') as decode, self.assertRaisesRegex(RuntimeError, 'depth'):
+                artifacts.read_receipt(path)
+            decode.assert_not_called()
 
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original

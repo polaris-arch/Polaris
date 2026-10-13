@@ -6,6 +6,8 @@ import plistlib
 import re
 import struct
 import sys
+import hashlib
+import math
 import zipfile
 
 from fork_input import ROOT, canonical, decode, require, sha, validate
@@ -17,11 +19,93 @@ APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
          'ios-x86_64-simulator': (0x1000007, 7, 'amd64', 'simulator')}
 MAX_ARTIFACT = 1024 ** 3
 MAX_RECEIPT = 16 * 1024 ** 2
-# 57b3 actual three-slice component serialized 152757078 bytes before
-# installation (artifact 11816058619 original-component-runner.log).
-# Retain its complete origin inventory within a finite component envelope.
-MAX_APPLE_RECEIPT = 256 * 1024 ** 2
+# Normalized origins remove the measured member x candidate expansion;
+# preserve a finite envelope, not the rejected 256MiB capacity workaround.
+MAX_APPLE_RECEIPT = 64 * 1024 ** 2
 MAX_APPLE_LINK_RECEIPT = 64 * 1024 ** 2
+MAX_JSON_NODES = 500000
+MAX_JSON_DEPTH = 64
+MAX_JSON_STRING = 1024 ** 2
+
+
+def receipt_shape(value, maximum):
+    """Bound the object and individual encoder tokens before serializing."""
+    nodes, characters, active = 0, 0, set()
+    def walk(item, depth):
+        nonlocal nodes, characters
+        nodes += 1
+        require(nodes <= MAX_JSON_NODES and depth <= MAX_JSON_DEPTH, 'receipt JSON node/depth budget')
+        if isinstance(item, str):
+            characters += len(item)
+            require(len(item) <= MAX_JSON_STRING and characters <= maximum, 'receipt JSON string budget')
+        elif isinstance(item, (dict, list, tuple)):
+            require(id(item) not in active, 'cyclic receipt JSON')
+            active.add(id(item))
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    require(isinstance(key, str) and len(key) <= 4096, 'receipt JSON key budget')
+                    walk(key, depth + 1); walk(child, depth + 1)
+            else:
+                for child in item: walk(child, depth + 1)
+            active.remove(id(item))
+        else:
+            require(item is None or isinstance(item, (bool, int, float)), 'unsupported receipt JSON value')
+            require(not isinstance(item, int) or item.bit_length() <= 256, 'receipt JSON integer budget')
+            require(not isinstance(item, float) or math.isfinite(item), 'nonfinite receipt JSON')
+    walk(value, 0)
+
+
+def _receipt_chunks(value, maximum, pretty=False):
+    receipt_shape(value, maximum)
+    encoder = json.JSONEncoder(sort_keys=True, ensure_ascii=pretty, allow_nan=False,
+                               indent=2 if pretty else None, separators=None if pretty else (',', ':'))
+    total = 0
+    for text in encoder.iterencode(value):
+        raw = text.encode()
+        total += len(raw)
+        require(total <= maximum, 'receipt JSON byte budget')
+        yield raw
+    if pretty:
+        require(total + 1 <= maximum, 'receipt JSON byte budget')
+        yield b'\n'
+
+
+def receipt_chunks(value, *, pretty=False):
+    yield from _receipt_chunks(value, receipt_limit(value), pretty)
+
+
+def receipt_field_bytes(value):
+    maximum = receipt_limit(value)
+    return {key: sum(len(raw) for raw in _receipt_chunks(child, maximum)) for key, child in value.items()}
+
+
+def receipt_digest(value):
+    digest = hashlib.sha256()
+    for raw in receipt_chunks(value): digest.update(raw)
+    return digest.hexdigest()
+
+
+def receipt_lexical_budget(raw):
+    # Scan bytes without creating decoded strings/containers. Bound potential
+    # DOM allocation before json.loads; decode still validates actual syntax,
+    # duplicate keys and nonfinite values, then the object receives shape checks.
+    quoted = escaped = False
+    depth = tokens = string_bytes = 0
+    for byte in raw:
+        if quoted:
+            string_bytes += 1
+            require(string_bytes <= 6 * MAX_JSON_STRING + 2, 'receipt JSON encoded string budget')
+            if escaped: escaped = False
+            elif byte == 92: escaped = True
+            elif byte == 34: quoted = False
+        elif byte == 34:
+            quoted = True; string_bytes = 0; tokens += 1
+        elif byte in (123, 91):
+            depth += 1; tokens += 1
+            require(depth <= MAX_JSON_DEPTH, 'receipt JSON depth budget')
+        elif byte in (125, 93): depth -= 1
+        elif byte in (44, 58): tokens += 1
+        require(tokens <= 3 * MAX_JSON_NODES, 'receipt JSON lexical node budget')
 
 
 def receipt_limit(value):
@@ -48,8 +132,10 @@ def read_receipt(path):
     with path.open('rb') as stream:
         raw = stream.read(MAX_APPLE_RECEIPT + 1)
     require(len(raw) == size, 'receipt size changed during read')
+    receipt_lexical_budget(raw)
     value = decode(raw, maximum=MAX_APPLE_RECEIPT)
     require(len(raw) <= receipt_limit(value), 'original receipt exceeds its schema budget')
+    receipt_shape(value, receipt_limit(value))
     return value
 
 

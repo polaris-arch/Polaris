@@ -12,7 +12,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
+from artifacts import receipt_digest, component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
 from producer import lease, run, write_json
 
 
@@ -22,16 +22,16 @@ def verify_original(component, receipt_path, platform, tools, scratch):
     require(receipt.get('schema') == 'polaris-mobile-component-v1' and receipt.get('platform') == platform and
             type(receipt.get('sourceOverlay')) is int and receipt.get('sourceOverlay') == 0 and receipt.get('AppAccepted') is False and receipt.get('devicePassed') is False,
             'old/CLI/diagnostic mobile component receipt rejected')
-    require(receipt['fingerprint'] == sha(canonical({k: v for k, v in receipt.items() if k != 'fingerprint'})), 'component receipt changed')
+    require(receipt['fingerprint'] == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}), 'component receipt changed')
     from native_inputs import verify
-    verify(receipt['nativeInputs'], log=Path(component).parent / 'original-bind.log')
+    verify(receipt['nativeInputs'], log=Path(component).parent / 'original-bind.log', output=receipt['output'])
     binding = receipt['input']
     require(binding['sourceContract'] == value and binding['sourceObservation']['sourceCommit'] == value['sourceCommit'] and
             binding['sourceObservation']['sourceTree'] == value['sourceTree'] and binding['sourceOverlay'] == 0,
             'formal component source input differs')
     # Preserve producer candidate, original graph paths and actual BuildID.
     # The consuming App gets its own identity; it does not relabel the producer.
-    expected_id = 'polaris-mobile-' + sha(canonical(binding))
+    expected_id = 'polaris-mobile-' + receipt_digest(binding)
     if platform == 'android':
         for name in ('go', 'javap', 'readelf'):
             require(name in tools, 'actual verifier tool missing: ' + name)
@@ -87,7 +87,7 @@ def materialize_android(component, receipt_path, tools, work, cache):
         if dest.exists() and target_receipt.exists():
             existing = read_receipt(target_receipt)
             if (existing.get('componentFingerprint') == receipt['fingerprint'] and existing.get('App') == identity and
-                    existing.get('fingerprint') == sha(canonical({k: v for k, v in existing.items() if k != 'fingerprint'})) and
+                    existing.get('fingerprint') == receipt_digest({k: v for k, v in existing.items() if k != 'fingerprint'}) and
                     existing.get('output') == receipt['output'] and existing.get('AppAccepted') is False and
                     existing.get('devicePassed') is False and existing.get('sourceOverlay') == 0 and
                     file_pin(dest) == receipt['output']['artifact']):
@@ -100,7 +100,7 @@ def materialize_android(component, receipt_path, tools, work, cache):
                  'componentReceiptSha256': file_pin(receipt_path)['sha256'],
                  'componentFingerprint': receipt['fingerprint'], 'output': receipt['output'],
                  'AppAccepted': False, 'devicePassed': False, 'sourceOverlay': 0}
-        facts['fingerprint'] = sha(canonical(facts))
+        facts['fingerprint'] = receipt_digest(facts)
         from transaction import install
         staged_receipt = work / 'stage-app-consumption.json'
         write_json(staged_receipt, facts)
@@ -197,7 +197,7 @@ def apple_link(component, receipt_path, output, work, cache):
                  'componentFingerprint': receipt['fingerprint'], 'producerInput': receipt['input'],
                  'componentOutput': receipt['output'], 'resources': apple_resources(), 'staticOnly': True,
                  'AppAccepted': False, 'devicePassed': False}
-        facts['fingerprint'] = sha(canonical(facts))
+        facts['fingerprint'] = receipt_digest(facts)
         require(not Path(output).exists(), 'fixed link input already exists; do not overwrite a frozen context')
         write_json(output, facts)
         return facts
@@ -207,7 +207,7 @@ def verify_link(path, expected_sha, scratch):
     require(file_pin(path)['sha256'] == expected_sha, 'fixed Apple link input changed')
     link = read_receipt(Path(path))
     require(link.get('schema') == 'polaris-mobile-apple-link-input-v1' and link.get('staticOnly') is True and
-            link.get('fingerprint') == sha(canonical({k: v for k, v in link.items() if k != 'fingerprint'})), 'Apple link context differs')
+            link.get('fingerprint') == receipt_digest({k: v for k, v in link.items() if k != 'fingerprint'}), 'Apple link context differs')
     require(file_pin(link['componentReceipt'])['sha256'] == link['componentReceiptSha256'], 'original component receipt changed')
     receipt = verify_original(link['framework'], link['componentReceipt'], 'apple', {}, scratch)
     require(receipt['fingerprint'] == link['componentFingerprint'] and receipt['output'] == link['componentOutput'] and

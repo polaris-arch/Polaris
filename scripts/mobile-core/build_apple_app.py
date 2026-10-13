@@ -11,7 +11,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, load, require
 from producer import lease, private_dir, run
-from artifacts import file_pin
+from artifacts import receipt_digest, file_pin
 
 
 def main():
@@ -106,16 +106,16 @@ def main():
         final_receipt = apple(ipa, link, file_pin(link)['sha256'], maps[0],
                               component_work / 'component-receipt.json', private_dir(root / 'final-check'),
                               derived, args.simulator_arch if args.simulator else None)
-        final_receipt['fingerprint'] = sha(canonical(final_receipt))
+        final_receipt['fingerprint'] = receipt_digest(final_receipt)
         rust_receipts = list(root.glob('rust-*.json'))
         require(len(rust_receipts) == 1, 'one actual Rust target receipt required')
         from artifacts import read_receipt
         rust = read_receipt(rust_receipts[0])
         require(rust['App'] == final_receipt['App'] and rust['devicePassed'] is False and
-                rust['fingerprint'] == sha(canonical({k: v for k, v in rust.items() if k != 'fingerprint'})),
+                rust['fingerprint'] == receipt_digest({k: v for k, v in rust.items() if k != 'fingerprint'}),
                 'actual Rust/App source receipt differs')
         final_receipt['rustInput'] = {'receipt': str(rust_receipts[0]), **file_pin(rust_receipts[0])}
-        final_receipt['fingerprint'] = sha(canonical({k: v for k, v in final_receipt.items() if k != 'fingerprint'}))
+        final_receipt['fingerprint'] = receipt_digest({k: v for k, v in final_receipt.items() if k != 'fingerprint'})
         require(not (root / 'app-carrier.json').exists(), 'final carrier receipt already frozen')
         write_json(root / 'app-carrier.json', final_receipt)
         # Neither ad-hoc nor a selected Team here means device/entitlement trust passed.

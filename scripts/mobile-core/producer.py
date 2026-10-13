@@ -23,7 +23,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from fork_input import ROOT, canonical, load, require, sha, verify_source, tool_environment
 from android_sdk import prepare_view
 from plan import plan
-from artifacts import file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt
+from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt
 from budget import group_alive, register_group, reservation
 
 ACTIVE_FDS = []
@@ -217,11 +217,11 @@ def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch)
             receipt.get('input') == binding and type(receipt.get('sourceOverlay')) is int and receipt.get('sourceOverlay') == 0 and
             receipt.get('devicePassed') is False and receipt.get('AppAccepted') is False,
             'old/CLI/diagnostic component receipt rejected')
-    fp = sha(canonical({k: v for k, v in receipt.items() if k != 'fingerprint'}))
+    fp = receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'})
     require(fp == receipt.get('fingerprint'), 'component receipt fingerprint differs')
     from native_inputs import verify
-    verify(receipt['nativeInputs'], log=Path(component).parent / 'original-bind.log')
-    expected = 'polaris-mobile-' + sha(canonical(binding))
+    verify(receipt['nativeInputs'], log=Path(component).parent / 'original-bind.log', output=receipt['output'])
+    expected = 'polaris-mobile-' + receipt_digest(binding)
     if binding['platform'] == 'android':
         observed = inspect_aar(component, value, binding['moduleGraph'], tools, run_tool, scratch, expected)
     else:
@@ -241,21 +241,36 @@ def equivalent_binding(original, current):
 
 
 def write_json(path, value):
-    from artifacts import receipt_limit
-    raw = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n').encode()
+    from artifacts import receipt_limit, receipt_chunks, receipt_field_bytes
+    # First measure a bounded stream, then write the same stream. Never hold
+    # a full canonical string plus a full pretty string/bytes beside the DOM.
+    try:
+        size = sum(len(raw) for raw in receipt_chunks(value, pretty=True))
+    except (RuntimeError, ValueError) as error:
+        print(json.dumps({'schema': 'polaris-receipt-size-observation-v1', 'phase': 'bounded-serialization-rejected',
+                          'path': str(path), 'maximumBytes': receipt_limit(value), 'error': str(error),
+                          'scope': 'no full serialized bytes produced or installed'}), file=sys.stderr, flush=True)
+        raise RuntimeError('receipt rejected before installation: ' + str(error)) from error
     print(json.dumps({'schema': 'polaris-receipt-size-observation-v1', 'phase': 'serialize-before-install',
-                      'path': str(path), 'bytes': len(raw), 'maximumBytes': receipt_limit(value),
+                      'path': str(path), 'bytes': size, 'maximumBytes': receipt_limit(value),
                       'receiptSchema': value.get('schema'),
+                      'canonicalValueBytesByTopLevelField': receipt_field_bytes(value),
                       'scope': 'actual serialized size; not installation or carrier acceptance'}), file=sys.stderr, flush=True)
-    require(len(raw) <= receipt_limit(value),
-            'receipt exceeds schema budget before installation: path=' + str(path) +
-            '; bytes=' + str(len(raw)) + '; maximum=' + str(receipt_limit(value)))
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
-    with temporary.open('xb') as stream:
-        stream.write(raw)
-        stream.flush(); os.fsync(stream.fileno())
-    temporary.replace(path)
+    created = False
+    try:
+        with temporary.open('xb') as stream:
+            created = True
+            written = 0
+            for raw in receipt_chunks(value, pretty=True):
+                stream.write(raw); written += len(raw)
+            require(written == size, 'receipt changed during serialization')
+            stream.flush(); os.fsync(stream.fileno())
+        temporary.replace(path)
+    except BaseException:
+        if created: temporary.unlink(missing_ok=True)
+        raise
 
 
 def execute(args):
@@ -297,7 +312,7 @@ def execute(args):
                    'sourceObservation': source_observation, 'sourceContract': value, 'moduleGraph': graph,
                    'tools': identities, 'producer': producer_identity, 'sourceOverlay': 0}
         require(producer_code() == producer_identity, 'producer source changed during tool admission')
-        fp = sha(canonical(binding))
+        fp = receipt_digest(binding)
         component = work / (value['android']['outputName'] if args.platform == 'android' else 'Libbox.xcframework')
         receipt_path = work / 'component-receipt.json'
         from transaction import recover
@@ -319,7 +334,7 @@ def execute(args):
                 # An occupied prior slot requires explicit ownership/recovery,
                 # not a recursive delete of potentially unique evidence.
                 require(not previous.exists(), 'prior component recovery slot is occupied')
-                require(receipt.get('fingerprint') == sha(canonical({k: v for k, v in receipt.items() if k != 'fingerprint'})),
+                require(receipt.get('fingerprint') == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}),
                         'retained old receipt is corrupt; preserve without replacement')
                 if args.platform == 'android':
                     require(file_pin(component) == receipt['output']['artifact'], 'retained old component bytes differ')
@@ -351,13 +366,13 @@ def execute(args):
             if (source / 'build').exists():
                 origins['generatorOutputRoot'] = str(source / 'build')
                 origins['generatorOutputInventory'] = tree_inventory(source / 'build')
-            verify(origins, scratch, log)
+            verify(origins, scratch, log, output=output)
             receipt = {'schema': 'polaris-mobile-component-v1', 'platform': args.platform, 'input': binding,
                        'command': command, 'declaredPlan': recipe['facts'], 'sourceOverlay': 0, 'output': output,
                        'nativeInputs': origins,
                        'AppAccepted': False, 'devicePassed': False, 'publicationEligible': False,
                        'scope': 'actual component bytes/API/source/tool identity only; final App/carrier/device pending'}
-            receipt['fingerprint'] = sha(canonical(receipt))
+            receipt['fingerprint'] = receipt_digest(receipt)
             # Both receipt and log are staged before any accepted bytes move.
             from transaction import install
             staged_receipt = work / 'stage-component-receipt.json'

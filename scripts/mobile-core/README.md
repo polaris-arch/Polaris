@@ -189,6 +189,20 @@ path, first header bytes, fat count and declared architectures; those observatio
 are distinct from inferred container properties based on bind commands.
 
 
+Apple native-input schema v2 stores each complete source-candidate list once
+in `originsByDigest`; each static member keeps its ordinal and digest reference.
+Equal bytes from distinct source paths/archives/ordinals remain distinct rows.
+Producer and consumer reconstruct the table from original pinned files and
+check exact references and per-target multiplicities. Legacy inline v1 inputs
+are verified without rewriting their original receipt. The observed 57b3
+152757078-byte envelope was dominated by repeated origin lists; it is not a
+required capacity. Component/link envelopes return to 64MiB, controls/Android
+remain 16MiB. Fingerprints and pretty serialization stream bounded tokens;
+shape/lexical checks cap depth at 64, nodes at 500000 and strings at 1MiB.
+The producer logs exact new serialized bytes and canonical value bytes per
+top-level field. These are metadata bounds, not a claimed measured process RSS
+or native/carrier acceptance; native archive parsing remains separate.
+
 `scripts/libbox-patches` and the old Apple six-patch entry remain historical
 alpha8 compatibility inputs. Their raw receipts are not relabeled; the small
 `historical-ci-fragments.json` pins only retired caller fragments for existing
