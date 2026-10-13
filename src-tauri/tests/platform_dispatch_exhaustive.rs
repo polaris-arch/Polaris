@@ -3795,11 +3795,16 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// 2026-10-11 main 另补登记 updater.rs 既有 cfg!(ios) 一处资源版本身份隔离，265→266。
 /// 两条已审输入合并为 266+11=277；历史债条目/判决、floor 与求值器保持原样，
 /// 不以登记或 host 回归签收 iOS/native Gradle/设备能力。
+/// 2026-10-13 总账对齐：上一批 geo_seed 的 not(android) 精确登记 2→3，
+/// 但漏同步本独立总账与 IOS_DEBT_SITES；新增一处是既有候选纯函数，
+/// Undecided 25→26、具名 geo 债 2→3。没有新增运行能力或将 iOS 资源布局债改判。
+/// helper core_store receipt 的 Linux/Mac O_NOFOLLOW 属性是两移动端同不编译，
+/// 且 PayloadDir 的移动构造仍 Unsupported；它不产生本移动分叉轴上的新债。
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
     ("DiffersRight", 279),
-    ("DiffersUndecided", 25),
+    ("DiffersUndecided", 26),
     ("DiffersWrongToday", 142),
     ("WithAndroid", 89),
 ];
@@ -3843,7 +3848,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/geo_seed.rs",
         "not(target_os = \"android\")",
-        2,
+        3,
     ),
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
@@ -4104,4 +4109,57 @@ fn has_bare_word(hay: &str, word: &str) -> bool {
         i = at + 1;
     }
     false
+}
+
+fn is_desktop_store_no_follow_profile(predicate: &str) -> bool {
+    for (os, want) in [
+        ("linux", true),
+        ("macos", true),
+        ("ios", false),
+        ("android", false),
+    ] {
+        let env = CfgEnv {
+            target_os: os,
+            mobile: matches!(os, "ios" | "android"),
+            desktop: matches!(os, "linux" | "macos"),
+            ..IOS_ENV
+        };
+        if eval_cfg(predicate, env) != Some(want) {
+            return false;
+        }
+    }
+    !mentions_mobile_axis(predicate)
+}
+
+#[test]
+fn native_store_receipt_no_follow_is_desktop_only_and_mobile_constructor_stays_unsupported() {
+    let store = polaris_source_probe::repo_file!("crates/helper/src/core_store.rs");
+    let code = mask_comments(&store);
+    let call = code
+        .find("options.custom_flags(nix::libc::O_NOFOLLOW);")
+        .expect("receipt no-follow call");
+    let attribute = code[..call]
+        .rfind("#[cfg(")
+        .expect("receipt target attribute");
+    let predicates = cfg_predicates(&code[attribute..call]);
+    assert_eq!(predicates.len(), 1);
+    assert!(is_desktop_store_no_follow_profile(&predicates[0]));
+    // Mobile widening and unknown Unix atoms cannot masquerade as this scope.
+    for broken in [
+        "unix",
+        "not(target_os = \"android\")",
+        "any(target_os = \"linux\", target_os = \"macos\", target_os = \"ios\")",
+        "target_os = \"android\"",
+    ] {
+        assert!(!is_desktop_store_no_follow_profile(broken));
+    }
+    let objects = mask_comments(&polaris_source_probe::repo_file!(
+        "crates/helper/src/core_objects.rs"
+    ));
+    let compact = fold(&objects);
+    assert!(compact.contains(&fold("#[cfg(not(any(target_os = \"linux\", target_os = \"macos\", windows)))] pub struct PayloadDir(std::convert::Infallible);")));
+    let unsupported = objects
+        .find("impl PayloadDir {\n    pub fn open(_path: &Path, _owner_uid: Option<u32>)")
+        .expect("mobile/unhandled constructor");
+    assert!(objects[unsupported..].starts_with("impl PayloadDir {\n    pub fn open(_path: &Path, _owner_uid: Option<u32>) -> io::Result<Self> {\n        Err(io::Error::from(io::ErrorKind::Unsupported))\n    }"));
 }

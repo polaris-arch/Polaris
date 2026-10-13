@@ -599,6 +599,7 @@ jobs:
           name: formal-mobile-input-${{ github.job }}
           path: |
             ${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar
+            ${{ steps.libbox_input.outputs.work }}/staging/stage.aar
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
@@ -1176,6 +1177,7 @@ jobs:
           name: formal-mobile-input-${{ github.job }}
           path: |
             ${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar
+            ${{ steps.libbox_input.outputs.work }}/staging/stage.aar
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json

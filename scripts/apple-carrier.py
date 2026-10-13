@@ -149,6 +149,30 @@ def macho(data, helper):
             platform, minimum, sdk, ntools = struct.unpack_from('<4I', data, position + 8)
             require(size == 24 + ntools * 8 and platform in (2, 7), 'platform command layout')
             platforms.append({'platform': platform, 'minOSRaw': minimum, 'sdkRaw': sdk})
+        elif command == 0x2d:
+            # LC_LINKER_OPTION is an MH_OBJECT command with count NUL-terminated
+            # UTF-8 strings and zero alignment padding. Admit the observed
+            # framework pairs, never path flags or arbitrary linker arguments.
+            require(kind == 1 and size in (32, 40), 'linker option object/size')
+            option_count = struct.unpack_from('<I', data, position + 8)[0]
+            require(option_count == 2, 'linker option count')
+            cursor, options = position + 12, []
+            for _ in range(option_count):
+                stop = data.find(b'\0', cursor, position + size)
+                require(stop > cursor, 'linker option string termination')
+                try:
+                    option = data[cursor:stop].decode('utf-8', errors='strict')
+                except UnicodeDecodeError as error:
+                    raise RuntimeError('Apple carrier: linker option UTF-8') from error
+                options.append(option)
+                cursor = stop + 1
+            require(options[0] == '-framework' and options[1] in
+                    ('Foundation', 'CFNetwork', 'Security', 'CoreFoundation'), 'unsupported linker option pair')
+            require(0 <= position + size - cursor < 8 and not data[cursor:position + size].strip(b'\0'),
+                    'linker option padding')
+            commands[-1].update(count=option_count, options=options,
+                                paddingBytes=position + size - cursor,
+                                payloadHex=data[position:position + size].hex())
         elif command == 2:
             require(size == 24 and symbols is None, 'symbol command size/duplicate')
             symoff, nsyms, stroff, strsize = struct.unpack_from('<4I', data, position + 8)

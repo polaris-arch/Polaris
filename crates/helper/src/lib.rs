@@ -7,16 +7,20 @@
 //!
 //! ## 组织原则（本 crate 的宪法）
 //!
-//! 1. **默认共用**：逻辑写在 crate 顶层普通模块（[`core_install`] / [`line_io`] / [`token`]），三平台
-//!    直接 `crate::xxx` 调用。同 crate 内共享**不需要任何抽象层** —— 就是普通 `pub fn`。
+//! 1. **默认共用**：逻辑写在 crate 顶层普通模块（[`core_store`] / [`core_objects`] / [`line_io`] /
+//!    [`token`]），三平台直接 `crate::xxx` 调用。同 crate 内共享**不需要任何抽象层** —— 就是普通 `pub fn`。
 //! 2. **只有真平台差异才隔离**：进 [`platform`] 的 `macos` / `windows` / `linux` 子模块。
 //! 3. **判据**：「OS 语义不同」= 真差异（服务管理 launchd/SCM/systemd、freeport 持有者定位机制、
 //!    win 裸 HANDLE 整帧读）；「只是当初拆在不同 crate 里」= **假差异**，必须共用。
 //!
 //! ## 共用层（顶层模块，无 cfg）
 //!
-//! - [`core_install`]：内核 sha256 校验 + 逐文件原子安装 + 清残留。mac/linux 核心流程逐字同，
-//!   平台差异（mac xattr/codesign、linux 按目录 fd 的清理）由各平台模块在调用前后加 hook。
+//! - [`core_store`]：管理员安装不可变内容对象，按 manifest 校验文件大小与 sha256，并保留目录与租约。
+//!   [`pinned_core`] 将运行期选择限制为已安装的内容 id；IPC 不接收源字节或可执行路径安装请求。
+//! - [`core_objects`]：持有目录对象，以该目录为基准枚举、打开常规文件，拒绝链接或重解析路径替换；
+//!   调用方从已验证句柄读取，三平台的底层文件语义在此隔离。
+//! - [`legacy_use`]：仅观察旧 flat 布局的准确 payload 集合；[`core_store`] 只在完整闲置观察后退休它们，
+//!   在用、未知或不完整观察保留原文件，不以目录句柄或管理锁冒充 payload 使用状态。
 //! - [`line_io`]：行协议读写原语（trim `\r\n` / 写行 + flush），泛型于 `std::io::{BufRead, Write}`。
 //!   mac/linux 共用；**win 走裸 Win32 `HANDLE` 整帧读，是真差异**，不用本模块。
 //! - [`token`]：socket 鉴权 token 读写 + **常量时间比对**。mac/win 逐字同 → 单一真值。

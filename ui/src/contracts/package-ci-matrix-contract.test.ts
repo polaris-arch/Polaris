@@ -1182,6 +1182,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     ]);
     const formalEvidence = [
       '${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar',
+      '${{ steps.libbox_input.outputs.work }}/staging/stage.aar',
       '${{ steps.libbox_input.outputs.work }}/*receipt.json',
       '${{ steps.libbox_input.outputs.work }}/*bind.log',
       '${{ steps.libbox_input.outputs.work }}/budget-observation.json',
@@ -1189,6 +1190,12 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
       '${{ runner.temp }}/*.source-consumption.json',
     ];
+    // A bind/inspect rejection leaves the real producer staging component in place.
+    // Bind this whitelist to its source-owned path, rather than guessing the final name.
+    const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
+    expect(producer).toContain("stage_root = private_dir(work / 'staging')");
+    expect(producer).toContain("stage_component = stage_root / ('stage.aar' if args.platform == 'android' else 'Libbox.xcframework')");
+    expect(formalEvidence).toHaveLength(8);
     const ndkObservations = [
       '~/Code/polaris-mobile-ci/ndk-source.properties',
       '~/Code/polaris-mobile-ci/sdk-input-observation.json',
@@ -1218,10 +1225,10 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       expect(observations).toContain('name: formal-mobile-ndk-input-${{ github.job }}');
       expect(observations).toContain('if-no-files-found: error');
       expect(observedPaths.filter(isApkOrSoPayload), `${job}: no APK/SO in failed prepare evidence`).toEqual([]);
-      expect([...paths, ...observedPaths], `${job}: exact combined nine formal evidence paths`).toEqual([...formalEvidence, ...ndkObservations]);
+      expect([...paths, ...observedPaths], `${job}: exact combined ten formal evidence paths`).toEqual([...formalEvidence, ...ndkObservations]);
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
-    // 新证据白名单仍是文本；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
+    // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
     const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation unit tests'));
     expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');

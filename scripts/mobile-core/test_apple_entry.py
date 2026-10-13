@@ -251,6 +251,50 @@ class AppleEntryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unsupported code member format'):
                 parser.archive(fixtures.archive([(table_name + ' UNKNOWN', table), ('actual-code.o', code)]), helper)
 
+    def test_observed_linker_option_command_bytes_are_parsed_and_recorded_for_object_only(self):
+        fixtures = module('formal_linker_option_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_linker_option_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_linker_option_info', 'scripts/libbox-patches/android-source.py')
+        # Exact command bytes observed in the original three slices (efe artifact).
+        commands = {
+            'Foundation': '2d00000028000000020000002d6672616d65776f726b00466f756e646174696f6e00000000000000',
+            'CFNetwork': '2d00000028000000020000002d6672616d65776f726b0043464e6574776f726b0000000000000000',
+            'Security': '2d00000020000000020000002d6672616d65776f726b00536563757269747900',
+            'CoreFoundation': '2d00000028000000020000002d6672616d65776f726b00436f7265466f756e646174696f6e000000',
+        }
+        for target in ('ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'):
+            raw = fixtures.mach_object(target, load_commands=[bytes.fromhex(value) for value in commands.values()])
+            observed = parser.macho(raw, helper)
+            actual = [row for row in observed['loadCommands'] if row['command'] == 0x2d]
+            self.assertEqual(len(actual), 4)
+            for row, (framework, payload) in zip(actual, commands.items()):
+                self.assertEqual(row['count'], 2)
+                self.assertEqual(row['options'], ['-framework', framework])
+                self.assertEqual(row['payloadHex'], payload)
+                self.assertLess(row['paddingBytes'], 8)
+        foundation = bytes.fromhex(commands['Foundation'])
+        controls = []
+        for count in (0, 1, 3, 0xffffffff):
+            bad = bytearray(foundation); struct.pack_into('<I', bad, 8, count); controls.append(bytes(bad))
+        bad = bytearray(foundation); bad[-1] = 1; controls.append(bytes(bad))
+        bad = bytearray(foundation); bad[12] = 0xff; controls.append(bytes(bad))
+        controls.append(struct.pack('<3I', 0x2d, 40, 2) + b'x' * 28)  # no NUL
+        for option in [b'-L\0Foundation\0', b'-framework\0/private/Foundation\0', b'-framework\0Unknown\0',
+                       b'-framework\0../Foundation\0', b'-framework\0\0']:
+            size = (12 + len(option) + 7) // 8 * 8
+            controls.append(struct.pack('<3I', 0x2d, size, 2) + option + bytes(size - 12 - len(option)))
+        controls.append(foundation + bytes(8))
+        enlarged = bytearray(foundation + bytes(8)); struct.pack_into('<I', enlarged, 4, 48)
+        controls.append(bytes(enlarged))
+        for command in controls:
+            with self.subTest(command=command.hex()), self.assertRaises(RuntimeError):
+                parser.macho(fixtures.mach_object('ios-arm64', load_commands=[command]), helper)
+        with self.assertRaisesRegex(RuntimeError, 'object/size'):
+            parser.macho(fixtures.mach_object('ios-arm64', kind=2, load_commands=[foundation]), helper)
+        unknown = bytearray(foundation); struct.pack_into('<I', unknown, 0, 0x7ffffffe)
+        with self.assertRaisesRegex(RuntimeError, 'unsupported load command'):
+            parser.macho(fixtures.mach_object('ios-arm64', load_commands=[bytes(unknown)]), helper)
+
 
 if __name__ == '__main__':
     unittest.main()

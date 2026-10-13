@@ -1,9 +1,12 @@
 //! Bounded, read-only observations for retiring exact legacy directories.
 //! An unavailable or partial scan keeps files. This is not a machine-wide
 //! no-owner receipt and never signals a process or executes a candidate binary.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::io::{self, Read};
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::process::{Command, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +15,7 @@ pub enum LegacyUse {
     InUse,
     Unknown,
 }
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const OUTPUT_LIMIT: u64 = 512 * 1024;
 
 /// Observe precisely the payload cohort. Directory handles, store locks and
@@ -101,6 +105,7 @@ pub fn payload_use(paths: &[std::path::PathBuf]) -> LegacyUse {
     LegacyUse::Unknown
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn capture(mut input: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     input
@@ -113,6 +118,7 @@ fn capture(mut input: impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn observe_command(command: &mut Command) -> io::Result<(i32, Vec<u8>, Vec<u8>)> {
     let mut child = command
         .stdin(Stdio::null())

@@ -65,6 +65,30 @@ def module_stream(raw):
     return rows
 
 
+def local_replacement_aliases(replacement, source_dir, observed, name):
+    literal, directory = replacement.get('Path'), replacement.get('Dir')
+    diagnostic = ('native replacement differs: ' + name + '; observed=' + repr(observed) +
+                  '; declaredPath=' + repr(literal) + '; declaredDir=' + repr(directory))
+    require(isinstance(literal, str) and isinstance(directory, str) and
+            isinstance(source_dir, str) and literal.startswith('./') and '\\' not in literal and '\0' not in literal,
+            diagnostic + '; exact source-owned relative replacement required')
+    components = literal[2:].split('/')
+    require(components and all(part not in ('', '.', '..') for part in components),
+            diagnostic + '; relative replacement escapes or is not canonical')
+    root, declared_dir = Path(source_dir), Path(directory)
+    require(root.is_absolute() and declared_dir.is_absolute() and '..' not in root.parts and '..' not in declared_dir.parts,
+            diagnostic + '; absolute source graph roots required')
+    expected = root.joinpath(*components)
+    require(declared_dir == expected, diagnostic + '; source graph Path/Dir disagree')
+    try:
+        physical_root, physical_dir = root.resolve(strict=True), declared_dir.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(diagnostic + '; declared source directory unavailable') from error
+    require(physical_dir.is_dir() and physical_dir.is_relative_to(physical_root),
+            diagnostic + '; replacement escaped verified source root')
+    return {literal, directory}, diagnostic
+
+
 def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, actual_id, simulator=False):
     require(facts['goVersion'] == value['goVersion'], 'native Go version differs')
     settings = facts['settings']
@@ -102,11 +126,21 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
             require(observed['version'] == expected.get('Version'), 'native module version differs: ' + name)
         replacement = expected.get('Replace')
         if replacement:
-            expected_path = replacement.get('Dir', replacement['Path']) if not replacement.get('Version') else replacement['Path']
-            require(observed.get('replacement') == expected_path, 'native replacement differs: ' + name)
-            require(observed.get('replacementVersion', '') == replacement.get('Version', ''), 'replacement version differs')
-            if replacement.get('Sum'):
-                require(observed.get('replacementSum') == replacement['Sum'], 'replacement h1 differs')
+            diagnostic = ('native replacement differs: ' + name + '; observed=' + repr(observed) +
+                          '; declaredPath=' + repr(replacement.get('Path')) + '; declaredDir=' + repr(replacement.get('Dir')))
+            if replacement.get('Version'):
+                require(observed.get('replacement') == replacement['Path'], diagnostic)
+            else:
+                aliases, _ = local_replacement_aliases(replacement, declared[value['goModule']].get('Dir'),
+                                                    observed.get('replacement'), name)
+                require(observed.get('replacement') in aliases, diagnostic)
+            # Go1.25.5 debugModFromModinfo represents a versionless local
+            # replacement as (devel), while go list leaves Version absent.
+            # Keep that native encoding intact; versioned remote replacements
+            # still require their exact source graph version and h1.
+            expected_versions = {replacement['Version']} if replacement.get('Version') else {'', '(devel)'}
+            require(observed.get('replacementVersion', '') in expected_versions, 'replacement version differs; ' + diagnostic)
+            require(observed.get('replacementSum', '') == replacement.get('Sum', ''), 'replacement h1 differs; ' + diagnostic)
         else:
             require('replacement' not in observed, 'undeclared native module replacement')
             if expected.get('Sum'):
@@ -338,6 +372,10 @@ def inspect_framework(framework, value, graph, expected_id):
             observed[target] = {'libraryIdentifier': identifier, 'binary': file_pin(binary),
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
                 'goBuildInfo': infos[0], 'buildID': ids[0],
+                'linkerOptions': [{'memberOrdinal': m['ordinal'], 'memberName': m['name'],
+                                  'memberSha256': m['sha256'], 'command': command}
+                                 for m in members for command in m['machO']['loadCommands']
+                                 if command['command'] == 0x2d],
                 'members': [{**{k: v for k, v in m.items() if k != 'machO'},
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
         require(entry_targets == expected_targets, 'actual framework target inventory differs')

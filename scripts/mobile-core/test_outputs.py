@@ -463,6 +463,69 @@ class FormalOutputs(unittest.TestCase):
             with self.assertRaises(OSError):
                 executable_driver_identity(driver)
 
+    def test_source_owned_local_replacement_accepts_only_coherent_declared_literal_or_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / 'fork'; directory = source / 'third_party/sing-tun'; directory.mkdir(parents=True)
+            name = 'github.com/sagernet/sing-tun'
+            version = 'v0.9.7-0.20261009022811-5c2edb183cc9'
+            graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
+                     {'Path': self.value['goModule'], 'Main': True, 'Dir': str(source)},
+                     {'Path': name, 'Version': version, 'Replace': {'Path': './third_party/sing-tun', 'Dir': str(directory)}}]
+            facts = self.facts(); facts['modules'][self.value['goModule']]['replacement'] = str(source)
+            def check(observed, declared=graph):
+                check_buildinfo(observed, self.value, declared, os_name='android', arch='arm64', mode='c-shared',
+                                expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+            for alias in ('./third_party/sing-tun', str(directory)):
+                for replacement_version in ('', '(devel)'):
+                    facts['modules'][name] = {'kind': 'dep', 'version': version, 'replacement': alias,
+                                             'replacementVersion': replacement_version}
+                    frozen = deepcopy(facts)
+                    check(facts)
+                    self.assertEqual(facts, frozen, 'native BuildInfo must remain its original observed values')
+            for wrong in ('third_party/sing-tun', '../third_party/sing-tun', './third_party/sing-tun/',
+                          './third_party/../third_party/sing-tun', str(root / 'elsewhere/sing-tun')):
+                facts['modules'][name]['replacement'] = wrong
+                with self.subTest(path=wrong), self.assertRaisesRegex(RuntimeError, 'observed=.*declaredPath=.*declaredDir='):
+                    check(facts)
+            facts['modules'][name]['replacement'] = './third_party/sing-tun'
+            for change in [('version', 'v9.0.0'), ('replacementVersion', 'v0.1.0'),
+                           ('replacementVersion', 'devel'), ('replacementSum', 'h1:undeclared')]:
+                wrong = deepcopy(facts); wrong['modules'][name][change[0]] = change[1]
+                with self.subTest(change=change), self.assertRaises(RuntimeError):
+                    check(wrong)
+            wrong = deepcopy(graph); wrong[-1]['Replace']['Dir'] = str(root / 'outside')
+            with self.assertRaisesRegex(RuntimeError, 'Path/Dir disagree'):
+                check(facts, wrong)
+            for path in ('./../outside', './third_party/../sing-tun', '/absolute', './third_party//sing-tun'):
+                wrong = deepcopy(graph); wrong[-1]['Replace']['Path'] = path
+                with self.subTest(declared=path), self.assertRaises(RuntimeError):
+                    check(facts, wrong)
+            with self.assertRaisesRegex(RuntimeError, 'native module not in actual source graph'):
+                check(facts, graph[:-1])
+            outside = root / 'outside'; outside.mkdir()
+            directory.rmdir(); directory.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'escaped verified source root'):
+                check(facts)
+
+    def test_remote_versioned_replacement_retains_exact_path_version_and_h1(self):
+        facts = self.facts()
+        name = 'example.org/module'
+        graph = [{'Path': name, 'Version': 'v1.2.3',
+                  'Replace': {'Path': 'example.org/replaced', 'Version': 'v1.4.5', 'Sum': 'h1:replaced'}},
+                 {'Path': self.value['goModule'], 'Main': True, 'Dir': '/verified/fork'}]
+        facts['modules'][name].update(replacement='example.org/replaced', replacementVersion='v1.4.5',
+                                      replacementSum='h1:replaced')
+        def check(observed):
+            check_buildinfo(observed, self.value, graph, os_name='android', arch='arm64', mode='c-shared',
+                            expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+        check(facts)
+        for key, bad in [('replacement', './example.org/replaced'), ('replacementVersion', 'v9.0.0'),
+                         ('replacementSum', 'h1:other'), ('replacementVersion', '(devel)'), ('version', 'v9.0.0')]:
+            wrong = deepcopy(facts); wrong['modules'][name][key] = bad
+            with self.subTest(field=key), self.assertRaises(RuntimeError):
+                check(wrong)
+
 
 if __name__ == '__main__':
     unittest.main()

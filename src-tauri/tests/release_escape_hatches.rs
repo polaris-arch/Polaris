@@ -223,18 +223,8 @@ const TEXT_ONLY: &[Entry] = &[
                  决定，后者的值由用户机的进程环境决定。改成后者即转红。",
     },
     Entry {
-        name: "POLARIS_UNIT_EOF",
-        reason: "`crates/helper-client/src/manager.rs` 里 systemd unit 安装脚本的 shell heredoc \
-                 定界符（`cat > … <<'POLARIS_UNIT_EOF'`）。是被生成的 shell 脚本的语法成分，\
-                 与进程环境无关。",
-    },
-    Entry {
-        name: "POLARIS_PLIST_EOF",
-        reason: "同上，launchd plist 安装脚本的 heredoc 定界符。",
-    },
-    Entry {
         name: "POLARIS_DESCRIPTOR_EOF",
-        reason: "helper-client install_unix 的 quoted descriptor heredoc 定界符，不读取进程环境。",
+        reason: "helper-client install_unix 的 Linux unit / Mac plist 共用 quoted descriptor heredoc 定界符；旧 UNIT_EOF / PLIST_EOF 随原生成器移除，不读取进程环境。",
     },
     Entry {
         name: "POLARIS_ELEVATE",
@@ -2209,5 +2199,50 @@ fn frozen_lease_inputs_are_explicit_child_environment() {
         format!("spawn_with_lifetime_pipe(&mut cmd);{body}"),
     ] {
         assert!(!frozen_lease_input_binding_is_complete(&broken));
+    }
+}
+
+fn unix_descriptor_delimiters_are_complete(source: &str) -> bool {
+    source
+        .matches("cat > \"$TXDIR/descriptor\" <<'POLARIS_DESCRIPTOR_EOF'")
+        .count()
+        == 2
+        && source.matches("{plist}\nPOLARIS_DESCRIPTOR_EOF").count() == 1
+        && source.matches("{unit}POLARIS_DESCRIPTOR_EOF").count() == 1
+        && !source.contains("POLARIS_UNIT_EOF")
+        && !source.contains("POLARIS_PLIST_EOF")
+}
+
+#[test]
+fn current_unix_descriptor_delimiter_is_live_in_both_branches_and_retired_names_are_absent() {
+    let source =
+        polaris_source_probe::repo_file!("crates/helper-client/src/manager/install_unix.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    assert!(unix_descriptor_delimiters_are_complete(&source));
+    for broken in [
+        source.replacen("<<'POLARIS_DESCRIPTOR_EOF'", "<<'OTHER_EOF'", 1),
+        source.replace("{plist}\nPOLARIS_DESCRIPTOR_EOF", "{plist}\nOTHER_EOF"),
+        source.replace("{unit}POLARIS_DESCRIPTOR_EOF", "{unit}OTHER_EOF"),
+        source.replace("POLARIS_DESCRIPTOR_EOF", "POLARIS_UNIT_EOF"),
+    ] {
+        assert!(!unix_descriptor_delimiters_are_complete(&broken));
+    }
+    let surface = scan_surface();
+    let owner = surface
+        .iter()
+        .find(|file| file.rel == "crates/helper-client/src/manager/install_unix.rs")
+        .unwrap();
+    assert!(
+        !owner.in_tests_dir && !owner.release_off_file,
+        "live production generator cannot be swallowed by parent cfg"
+    );
+    let observed = scan();
+    assert!(observed.names.contains_key("POLARIS_DESCRIPTOR_EOF"));
+    assert!(!observed
+        .release_reads()
+        .contains_key("POLARIS_DESCRIPTOR_EOF"));
+    for old in ["POLARIS_UNIT_EOF", "POLARIS_PLIST_EOF"] {
+        assert!(!observed.names.contains_key(old));
+        assert!(!TEXT_ONLY.iter().any(|entry| entry.name == old));
     }
 }
