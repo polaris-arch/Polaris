@@ -53,8 +53,31 @@ def verify_original(component, receipt_path, platform, tools, scratch):
     return receipt
 
 
-def app_identity():
-    require(not run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], cwd=ROOT), 'App consumer source is not frozen')
+def app_identity(*, status_log=None):
+    if status_log is not None:
+        status_log = Path(status_log)
+        require(not status_log.exists() and not status_log.is_symlink(), 'source status observation already frozen')
+    status = run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], cwd=ROOT, log=status_log)
+    if status and status_log is not None:
+        # Retain the actual tracked delta and this known SwiftPM input as evidence.
+        # Neither a generated file nor a recorded diff grants source acceptance.
+        diff_log = status_log.with_suffix('.diff.log')
+        require(not diff_log.exists() and not diff_log.is_symlink(), 'source diff observation already frozen')
+        run(['git', 'diff', '--binary', 'HEAD'], cwd=ROOT, log=diff_log)
+        resolved = ROOT / 'crates/tauri-plugin-polaris-ios/ios/Package.resolved'
+        if (resolved.is_file() and not resolved.is_symlink() and
+                resolved.resolve(strict=True).is_relative_to(ROOT.resolve(strict=True)) and
+                resolved.stat().st_size <= 1024 ** 2):
+            snapshot = status_log.with_suffix('.swift-package-resolved.log')
+            require(not snapshot.exists() and not snapshot.is_symlink(), 'Swift input observation already frozen')
+            with resolved.open('rb') as stream:
+                raw = stream.read(1024 ** 2 + 1)
+            if len(raw) <= 1024 ** 2:
+                with snapshot.open('xb') as stream:
+                    stream.write(raw)
+    rows = status.splitlines()
+    require(not status, 'App consumer source is not frozen; actual status rows=' + repr(rows[:32]) +
+            '; totalRows=' + str(len(rows)) + '; originalStatusLog=' + str(status_log))
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
             'consumerCode': {name: file_pin(ROOT / name) for name in
                 ['scripts/mobile-core/consume.py', 'scripts/mobile-core/artifacts.py',

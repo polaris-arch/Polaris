@@ -86,7 +86,7 @@ def build_reserved():
     scratch = private_dir(root / 'rust-link-check')
     link = verify_link(Path(os.environ['POLARIS_MOBILE_LINK_INPUT']),
                        os.environ['POLARIS_MOBILE_LINK_INPUT_SHA256'], scratch)
-    identity = app_identity()
+    identity = app_identity(status_log=root / 'original-source-status-before-rust.log')
     require(link['App'] == identity, 'formal Rust source differs from frozen App input')
     sdk = Path(run(['xcrun', '--sdk', os.environ['PLATFORM_NAME'], '--show-sdk-path']).strip()).resolve(strict=True)
     require(Path(os.environ['SDKROOT']).resolve(strict=True) == sdk, 'Xcode SDKROOT differs from selected SDK')
@@ -145,7 +145,9 @@ def build_reserved():
     shutil.copyfile(archive, stage)
     require(file_pin(stage) == pin, 'Rust static archive copy differs')
     os.replace(stage, dest)
-    require(file_pin(dest) == pin and app_identity() == identity, 'Rust link bytes/source changed')
+    require(file_pin(dest) == pin and
+            app_identity(status_log=root / 'original-source-status-after-rust.log') == identity,
+            'Rust link bytes/source changed')
     receipt = {'schema': 'polaris-formal-apple-rust-v1', 'App': identity, 'target': triple,
                'sdk': str(sdk), 'sdkVersion': sdk_version, 'command': command,
                'rustc': run([tool_paths['rustc'], '-vV']), 'tools': tool_pins,

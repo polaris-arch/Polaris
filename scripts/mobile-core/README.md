@@ -177,6 +177,9 @@ success plus a defined `_start_app` text symbol, and retains its full output.
 Rust's compiler-builtins IR is left to the unchanged final Xcode link; this
 check does not claim IR compatibility or final carrier acceptance. Original
 archives are retained even when no accepted Rust receipt has been written.
+The Rust entry preserves original Git status before and after compilation. A dirty
+checkout still rejects; its tracked diff and bounded SwiftPM resolution bytes are
+retained only as failed-source observations, without suppressing generated paths.
 It does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected

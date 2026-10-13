@@ -39,6 +39,53 @@ def fat_archive(arm_platform=7, intel_platform=7):
 
 
 class AppleEntryTests(unittest.TestCase):
+    def test_clean_source_status_is_retained_without_changing_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / 'original-source-status-before-rust.log'
+
+            def observed(command, *, cwd=None, log=None):
+                raw = 'a' * 40 + '\n' if command[1] == 'rev-parse' else ''
+                if log is not None:
+                    Path(log).write_text(raw)
+                return raw
+
+            with mock.patch.object(consume, 'run', side_effect=observed), \
+                    mock.patch.object(consume, 'file_pin', return_value={'bytes': 1, 'sha256': 'b' * 64}):
+                identity = consume.app_identity(status_log=log)
+            self.assertEqual(identity['candidate'], 'a' * 40)
+            self.assertEqual(log.read_bytes(), b'')
+            self.assertFalse(log.with_suffix('.diff.log').exists())
+
+    def test_actual_generated_or_tracked_dirty_source_still_rejects_and_retains_originals(self):
+        untracked = '?? crates/tauri-plugin-polaris-ios/ios/Package.resolved\n'
+        tracked = ' M src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj\n'
+        for status in (untracked, tracked, untracked + tracked):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                log = root / 'original-source-status-after-rust.log'
+                original = b'{"pins": [], "version": 3}\n'
+                resolution = root / 'crates/tauri-plugin-polaris-ios/ios/Package.resolved'
+                resolution.parent.mkdir(parents=True)
+                resolution.write_bytes(original)
+                delta = 'diff --git a/controlled b/controlled\n-controlled before\n+controlled after\n'
+
+                def observed(command, *, cwd=None, log=None):
+                    raw = status if command[1] == 'status' else delta
+                    if log is not None:
+                        Path(log).write_text(raw)
+                    return raw
+
+                with mock.patch.object(consume, 'ROOT', root), \
+                        mock.patch.object(consume, 'run', side_effect=observed), \
+                        self.assertRaisesRegex(RuntimeError, 'App consumer source is not frozen') as failure:
+                    consume.app_identity(status_log=log)
+                self.assertIn('totalRows=' + str(len(status.splitlines())), str(failure.exception))
+                self.assertEqual(log.read_text(), status)
+                self.assertEqual(log.with_suffix('.diff.log').read_text(), delta)
+                self.assertEqual(log.with_suffix('.swift-package-resolved.log').read_bytes(), original)
+                self.assertEqual(resolution.read_bytes(), original)
+
     def test_exact_three_actual_target_mappings(self):
         self.assertEqual(apple_rust.target_for('iphoneos', 'arm64', 'release'), 'aarch64-apple-ios')
         self.assertEqual(apple_rust.target_for('iphonesimulator', 'arm64', 'release'), 'aarch64-apple-ios-sim')
