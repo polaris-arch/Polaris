@@ -12,6 +12,7 @@ import apple_rust
 import ci_apple
 import consume
 from carriers import verify_apple_resources
+from artifacts import module
 
 
 def object_archive(cpu, subtype, platform):
@@ -211,6 +212,44 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertFalse(index['stagedComponentIsAccepted'])
                 self.assertFalse(index['completeUnsignedChain'])
                 self.assertEqual(index['files'][member]['sha256'], __import__('hashlib').sha256(raw).hexdigest())
+
+    def test_actual_bsd_unsorted_and_sorted_symbol_tables_bind_real_code_offsets(self):
+        fixtures = module('formal_bsd_symbol_table_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_bsd_symbol_table_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_bsd_symbol_table_info', 'scripts/libbox-patches/android-source.py')
+        for table_name in ('__.SYMDEF', '__.SYMDEF SORTED'):
+            # For the unsorted table intentionally preserve zeta before alpha.
+            # These are structural fixtures, not executed native/SDK proof.
+            strings = b'zeta\0alpha\0'
+            offsets = (0, 5) if table_name == '__.SYMDEF' else (5, 0)
+            table = struct.pack('<6I', 16, offsets[0], 0, offsets[1], 0, len(strings)) + strings
+            first = fixtures.archive([(table_name, table)])
+            code_offset = len(first)
+            table = struct.pack('<6I', 16, offsets[0], code_offset, offsets[1], code_offset, len(strings)) + strings
+            code = fixtures.mach_object('ios-arm64')
+            raw = fixtures.archive([(table_name, table), ('actual-code.o', code)])
+            observed = parser.archive(raw, helper)
+            self.assertEqual(observed['members'][0]['name'], table_name)
+            self.assertEqual(observed['members'][0]['classification'], 'symbol-table')
+            self.assertEqual(observed['members'][1]['headerOffset'], code_offset)
+            wrapped = single_fat_archive(raw)
+            thin, selected = apple_rust.selected_wire_bytes(wrapped, 'aarch64-apple-ios')
+            self.assertEqual(thin, raw)
+            self.assertEqual(selected['bytes'], len(raw))
+            for bad_table in [table[:-1],
+                    struct.pack('<I', 15) + table[4:],
+                    table[:4] + struct.pack('<I', len(strings)) + table[8:],
+                    table[:8] + struct.pack('<I', code_offset + 1) + table[12:],
+                    table[:8] + struct.pack('<I', 8) + table[12:],
+                    table[:-1] + b'x', table + bytes(8), table + b'bad']:
+                with self.subTest(name=table_name, table=bad_table[:24]), self.assertRaises(RuntimeError):
+                    parser.archive(fixtures.archive([(table_name, bad_table), ('actual-code.o', code)]), helper)
+            with self.assertRaisesRegex(RuntimeError, 'position/payload'):
+                parser.archive(fixtures.archive([('actual-code.o', code), (table_name, table)]), helper)
+            with self.assertRaisesRegex(RuntimeError, 'position/payload'):
+                parser.archive(fixtures.archive([(table_name, table), (table_name, table), ('actual-code.o', code)]), helper)
+            with self.assertRaisesRegex(RuntimeError, 'unsupported code member format'):
+                parser.archive(fixtures.archive([(table_name + ' UNKNOWN', table), ('actual-code.o', code)]), helper)
 
 
 if __name__ == '__main__':

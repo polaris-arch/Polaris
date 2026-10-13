@@ -257,7 +257,9 @@ def archive(data, helper):
         row = {'ordinal': len(members), 'headerOffset': position, 'rawName': raw_name,
                'name': name, 'nameBytes': name_length, 'payloadOffset': payload_start,
                'bytes': len(payload), 'sha256': helper.digest(payload)}
-        if name == '__.SYMDEF SORTED':
+        if name in ('__.SYMDEF', '__.SYMDEF SORTED'):
+            # The observed Apple BSD tables differ only in declared sorting.
+            # Both take the same bounded table/string/member-offset predicate.
             require(not members and not payload.startswith(MACHO), 'ar symbol table position/payload')
             row['classification'] = 'symbol-table'
             symbol_payload = payload

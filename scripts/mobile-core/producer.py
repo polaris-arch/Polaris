@@ -126,6 +126,26 @@ def lease(work, cache, value):
                 require(report['cacheBytes'] <= value['budget']['cacheMaxBytes'], 'fixed mobile cache budget exceeded')
 
 
+def executable_driver_identity(path):
+    """Bind physical bytes while retaining the name used by LLVM's argv[0] dispatch."""
+    driver = Path(path).absolute()
+    info = driver.lstat()
+    require(stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode), 'compiler driver must be a file or explicit symlink')
+    physical = driver.resolve(strict=True)
+    return {'path': str(physical), **file_pin(physical),
+            'driverPath': str(driver), 'driverMode': stat.S_IMODE(info.st_mode),
+            'driverLinkTarget': os.readlink(driver) if stat.S_ISLNK(info.st_mode) else None}
+
+
+def compiler_fact(path, env):
+    identity = executable_driver_identity(path)
+    # Resolving ld.lld to lld (or clang++ to clang) changes the actual driver.
+    # Call the original bound name, then verify both link and physical input.
+    version = run([identity['driverPath'], '--version'], env=env)
+    require(executable_driver_identity(path) == identity, 'compiler driver/physical bytes changed during observation')
+    return {**identity, 'version': version}
+
+
 def tool_facts(args, value, env):
     paths = {name: str(Path(getattr(args, name)).resolve(strict=True)) for name in ('go', 'gomobile', 'gobind')}
     require(run([paths['go'], 'version'], env=env).strip().startswith('go version go' + value['goVersion'] + ' '),
@@ -147,16 +167,18 @@ def tool_facts(args, value, env):
         require(re.fullmatch(r'javac 17(?:[.][0-9]+)*(?:[-+].*)?', javac_version), 'actual javac must be Java17')
         paths['javap'] = str(jdk / 'bin/javap')
         host = 'linux-x86_64' if os.uname().sysname == 'Linux' else 'darwin-x86_64'
-        paths['readelf'] = str((ndk / 'toolchains/llvm/prebuilt' / host / 'bin/llvm-readelf').resolve(strict=True))
         binaries = ndk / 'toolchains/llvm/prebuilt' / host / 'bin'
-        compiler_paths = {name: str((binaries / name).resolve(strict=True)) for name in
+        readelf = executable_driver_identity(binaries / 'llvm-readelf')
+        paths['readelf'] = readelf['driverPath']
+        compiler_paths = {name: binaries / name for name in
                           ['clang', 'clang++', 'ld.lld', 'llvm-ar']}
         result.update(java={'path': str((jdk / 'bin/java').resolve(strict=True)),
                             **file_pin((jdk / 'bin/java').resolve(strict=True)), 'version': java}, javac={'path': str(javac), **file_pin(javac), 'version': javac_version},
                       ndkProperties=(ndk / 'source.properties').read_text(),
-                      readelf=file_pin(paths['readelf']), javap=file_pin(paths['javap']),
-                      compilers={name: {'path': path, **file_pin(path), 'version': run([path, '--version'], env=env)}
-                                 for name, path in compiler_paths.items()})
+                      readelf={key: readelf[key] for key in ('bytes', 'sha256')}, readelfDriver=readelf, javap=file_pin(paths['javap']),
+                      compilers={name: compiler_fact(path, env) for name, path in compiler_paths.items()})
+        require(executable_driver_identity(binaries / 'llvm-readelf') == readelf,
+                'readelf driver/physical bytes changed during observation')
     else:
         xcode = run(['xcodebuild', '-version'], env=env)
         require('Xcode ' + value['apple']['xcodeVersion'] in xcode and

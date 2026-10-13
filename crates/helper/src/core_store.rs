@@ -398,7 +398,10 @@ impl CoreStore {
                         .join(format!("{}.json", id.as_str()));
                     let mut options = OpenOptions::new();
                     options.write(true);
-                    #[cfg(unix)]
+                    // PayloadDir is supported only on the desktop targets;
+                    // its Android/iOS constructor already returns Unsupported.
+                    // Keep no-follow on every supported Unix store target.
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         use std::os::unix::fs::OpenOptionsExt;
                         options.custom_flags(nix::libc::O_NOFOLLOW);

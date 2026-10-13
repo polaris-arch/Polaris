@@ -108,6 +108,67 @@ fn a_whole_fat_container_cannot_supply_the_first_architectures_descriptor() {
     );
 }
 
+fn symbol_member(name: &str, object_header_offset: u32) -> Vec<u8> {
+    let strings = b"_fixture\0";
+    let mut payload = Vec::new();
+    for word in [8_u32, 0, object_header_offset, strings.len() as u32] {
+        payload.extend_from_slice(&word.to_le_bytes());
+    }
+    payload.extend_from_slice(strings);
+    let size = name.len() + payload.len();
+    let mut member = format!(
+        "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        format!("#1/{}", name.len()),
+        0,
+        0,
+        0,
+        "644",
+        size
+    )
+    .into_bytes();
+    member.extend_from_slice(name.as_bytes());
+    member.extend_from_slice(&payload);
+    if !size.is_multiple_of(2) {
+        member.push(b'\n');
+    }
+    member
+}
+
+#[test]
+fn exact_bsd_symbol_names_do_not_hide_wrong_objects_or_replace_wire_proof() {
+    for (target, cpu, subtype, platform) in [
+        ("aarch64-apple-ios", 0x0100_000c, 0, 2),
+        ("aarch64-apple-ios-sim", 0x0100_000c, 0, 7),
+        ("x86_64-apple-ios", 0x0100_0007, 3, 7),
+    ] {
+        for name in ["__.SYMDEF", "__.SYMDEF SORTED"] {
+            let object = object_archive(cpu, subtype, platform);
+            let offset = (8 + symbol_member(name, 0).len()) as u32;
+            let mut archive = b"!<arch>\n".to_vec();
+            archive.extend(symbol_member(name, offset));
+            archive.extend_from_slice(&object[8..]);
+            assert!(apple_wire_check::check_bytes_for_target(&archive, target)
+                .unwrap_err()
+                .contains("descriptor unavailable"));
+            let mut misplaced = object.clone();
+            misplaced.extend(symbol_member(name, 8));
+            assert!(apple_wire_check::check_bytes_for_target(&misplaced, target)
+                .unwrap_err()
+                .contains("symbol table position"));
+            let mut wrong = archive;
+            wrong[offset as usize + 60 + 4 + 4..offset as usize + 60 + 4 + 8]
+                .copy_from_slice(&0_u32.to_le_bytes());
+            assert!(apple_wire_check::check_bytes_for_target(&wrong, target)
+                .unwrap_err()
+                .contains("CPU/subtype/type"));
+        }
+    }
+    let mut unknown = b"!<arch>\n".to_vec();
+    unknown.extend(symbol_member("__.UNRECOGNIZED", 0));
+    unknown.extend_from_slice(&object_archive(0x0100_000c, 0, 2)[8..]);
+    assert!(apple_wire_check::check_bytes_for_target(&unknown, "aarch64-apple-ios").is_err());
+}
+
 #[test]
 fn truncated_or_unsupported_target_cannot_pass_selected_slice_guard() {
     let mut archive = object_archive(0x0100_000c, 0, 2);

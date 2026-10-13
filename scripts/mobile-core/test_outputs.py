@@ -16,7 +16,7 @@ from artifacts import check_buildinfo, framework_entry_targets, inspect_framewor
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import reservation
 from ci_android import emit_outputs, prepare_source, prepare
-from producer import equivalent_binding
+from producer import compiler_fact, equivalent_binding, executable_driver_identity
 from transaction import install, recover
 
 
@@ -416,6 +416,52 @@ class FormalOutputs(unittest.TestCase):
                 self.assertIn('path=' + str(device_path), message)
                 self.assertIn('header=' + bytes(bad_count[:16]).hex(), message)
                 self.assertIn("declaredArchitectures=['arm64']", message)
+
+    def test_llvm_symlink_drivers_keep_invocation_name_and_bind_actual_physical_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            drivers = {'ld.lld': 'lld', 'clang++': 'clang', 'llvm-ar': 'llvm-ar-physical',
+                       'llvm-readelf': 'llvm-readobj'}
+            for name, physical_name in drivers.items():
+                physical = root / physical_name
+                physical.write_bytes(('inert physical ' + physical_name).encode())
+                driver = root / name; driver.symlink_to(physical_name)
+                calls = []
+                def observe(command, *, env):
+                    calls.append(command)
+                    self.assertEqual(command, [str(driver), '--version'])
+                    self.assertEqual(env, {'controlled': 'input'})
+                    return name + ' controlled version'
+                with patch('producer.run', side_effect=observe):
+                    fact = compiler_fact(driver, {'controlled': 'input'})
+                self.assertEqual(calls, [[str(driver), '--version']])
+                self.assertEqual(fact['path'], str(physical))
+                self.assertEqual(fact['driverPath'], str(driver))
+                self.assertEqual(fact['driverLinkTarget'], physical_name)
+                self.assertEqual(fact['sha256'], sha(physical.read_bytes()))
+                self.assertEqual(fact['bytes'], physical.stat().st_size)
+                self.assertEqual(fact['version'], name + ' controlled version')
+
+    def test_compiler_observation_refuses_retargeted_alias_or_changed_physical_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            physical, replacement, driver = root / 'lld', root / 'other-lld', root / 'ld.lld'
+            physical.write_bytes(b'inert same physical'); replacement.write_bytes(physical.read_bytes())
+            driver.symlink_to('lld')
+            def retarget(*args, **kwargs):
+                driver.unlink(); driver.symlink_to('other-lld')
+                return 'controlled version'
+            with patch('producer.run', side_effect=retarget), self.assertRaisesRegex(RuntimeError, 'changed during observation'):
+                compiler_fact(driver, {})
+            driver.unlink(); driver.symlink_to('lld')
+            def change(*args, **kwargs):
+                physical.write_bytes(b'changed actual physical')
+                return 'controlled version'
+            with patch('producer.run', side_effect=change), self.assertRaisesRegex(RuntimeError, 'changed during observation'):
+                compiler_fact(driver, {})
+            driver.unlink(); driver.symlink_to('missing-lld')
+            with self.assertRaises(OSError):
+                executable_driver_identity(driver)
 
 
 if __name__ == '__main__':

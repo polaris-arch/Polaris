@@ -2126,23 +2126,27 @@ fn external_module_cfg_survives_item_visibility_without_borrowing_neighbor_cfg()
 
 #[test]
 fn release_off_child_file_excludes_both_reads_and_names_but_live_file_does_not() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("child.rs");
-    std::fs::write(
-        &path,
-        r#"fn read() { let _ = std::env::var("POLARIS_FIXTURE_CHILD"); }"#,
-    )
-    .unwrap();
+    // Reuse the actual two-read debug child as the controlled source input.
+    // Toggling only its inherited release gate tests both classifications
+    // without creating a temporary file or adding a dev dependency.
+    let rel = "src-tauri/src/runtime/http/local_acceptance.rs";
+    let path = workspace_root().join(rel);
+    let expected = ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"];
     for off in [false, true] {
         let result = scan_files(vec![SourceFile {
-            rel: "src/child.rs".to_owned(),
+            rel: rel.to_owned(),
             path: path.clone(),
             in_tests_dir: false,
             release_off_file: off,
         }]);
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].release, !off);
-        assert_eq!(result.names.contains_key("POLARIS_FIXTURE_CHILD"), !off);
+        assert_eq!(result.hits.len(), expected.len());
+        for name in expected {
+            assert!(result
+                .hits
+                .iter()
+                .any(|hit| hit.name == name && hit.release != off));
+            assert_eq!(result.names.contains_key(name), !off);
+        }
     }
     let surface = scan_surface();
     let child = surface

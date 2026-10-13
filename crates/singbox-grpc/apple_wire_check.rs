@@ -80,7 +80,10 @@ mod apple_wire_check {
                 .next()
                 .ok_or("ar name missing")?;
             let object = body.get(name_length..).ok_or("ar payload bounds")?;
-            if name != b"__.SYMDEF SORTED" {
+            // Xcode's actual thin archives use the unsorted BSD spelling too.
+            // The App builder already validates the receipt-bound table; only
+            // these two exact metadata names bypass the Mach-O object check.
+            if name != b"__.SYMDEF SORTED" && name != b"__.SYMDEF" {
                 if object.get(..4) != Some(b"\xcf\xfa\xed\xfe")
                     || u32_at(object, 4)? != cpu
                     || u32_at(object, 8)? != subtype
