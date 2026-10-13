@@ -177,9 +177,17 @@ success plus a defined `_start_app` text symbol, and retains its full output.
 Rust's compiler-builtins IR is left to the unchanged final Xcode link; this
 check does not claim IR compatibility or final carrier acceptance. Original
 archives are retained even when no accepted Rust receipt has been written.
-The Rust entry preserves original Git status before and after compilation. A dirty
-checkout still rejects; its tracked diff and bounded SwiftPM resolution bytes are
-retained only as failed-source observations, without suppressing generated paths.
+After formal environment/slot admission, the Rust entry observes source status
+before link verification and after archive copying. Earlier admission failures
+need not have an observation. Capturing status is capped at 16KiB stdout, 1KiB
+stderr, 64 paths of at most 512 bytes, 1MiB total file hashing and 10 seconds.
+One sentinel byte beyond each pipe/hash cap detects overflow; capture buffers and
+metadata cardinality are bounded, while whole-process RSS remains unmeasured.
+The derived JSON is capped at 64KiB; unknown paths have opaque hashes, and only
+reviewed exact names are displayed. No stdout/stderr, diff or file bodies are
+exported. Overflow or collection failure records incomplete observation and
+rejects; every dirty checkout still rejects. These are metadata observations,
+not original source snapshots, root-cause confirmation or App acceptance.
 It does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected

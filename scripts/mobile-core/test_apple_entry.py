@@ -39,52 +39,143 @@ def fat_archive(arm_platform=7, intel_platform=7):
 
 
 class AppleEntryTests(unittest.TestCase):
-    def test_clean_source_status_is_retained_without_changing_identity(self):
+    def controlled_status(self, root, raw):
+        facts = {'statusComplete': True, 'reason': None, 'observedStdoutBytes': len(raw),
+                 'observedStderrBytes': 0, 'observedStatusPrefixSha256': consume.sha(raw)}
+        with mock.patch.object(consume, 'ROOT', root), \
+                mock.patch.object(consume, 'bounded_source_status', return_value=(raw, facts)):
+            return consume.source_status_observation()
+
+    def test_clean_derived_status_preserves_identity_without_original_export(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            log = root / 'original-source-status-before-rust.log'
-
-            def observed(command, *, cwd=None, log=None):
-                raw = 'a' * 40 + '\n' if command[1] == 'rev-parse' else ''
-                if log is not None:
-                    Path(log).write_text(raw)
-                return raw
-
-            with mock.patch.object(consume, 'run', side_effect=observed), \
+            log = root / 'source-status-before-rust.json'
+            observed = self.controlled_status(root, b'')
+            with mock.patch.object(consume, 'source_status_observation', return_value=observed), \
+                    mock.patch.object(consume, 'run', return_value='a' * 40 + '\n'), \
                     mock.patch.object(consume, 'file_pin', return_value={'bytes': 1, 'sha256': 'b' * 64}):
                 identity = consume.app_identity(status_log=log)
             self.assertEqual(identity['candidate'], 'a' * 40)
-            self.assertEqual(log.read_bytes(), b'')
-            self.assertFalse(log.with_suffix('.diff.log').exists())
+            saved = json.loads(log.read_bytes())
+            self.assertTrue(saved['complete'] and saved['clean'])
+            self.assertFalse(saved['rawStatusRetained'] or saved['fileContentsExported'])
+            self.assertEqual(list(root.glob('*.log')), [])
 
-    def test_actual_generated_or_tracked_dirty_source_still_rejects_and_retains_originals(self):
-        untracked = '?? crates/tauri-plugin-polaris-ios/ios/Package.resolved\n'
-        tracked = ' M src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj\n'
-        for status in (untracked, tracked, untracked + tracked):
-            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                log = root / 'original-source-status-after-rust.log'
-                original = b'{"pins": [], "version": 3}\n'
-                resolution = root / 'crates/tauri-plugin-polaris-ios/ios/Package.resolved'
-                resolution.parent.mkdir(parents=True)
-                resolution.write_bytes(original)
-                delta = 'diff --git a/controlled b/controlled\n-controlled before\n+controlled after\n'
+    def test_dirty_generated_or_tracked_metadata_rejects_without_credentials_or_bodies(self):
+        generated = 'crates/tauri-plugin-polaris-ios/ios/Package.resolved'
+        tracked = 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'
+        secret = 'DO_NOT_EXPORT_CREDENTIAL_OR_SOURCE_BODY'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in (generated, tracked):
+                path = root / name; path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('https://user:' + secret + '@example.invalid/private\n')
+            raw = b'?? ' + generated.encode() + b'\0 M ' + tracked.encode() + b'\0'
+            saved = self.controlled_status(root, raw)
+            self.assertTrue(saved['complete']); self.assertFalse(saved['clean'])
+            self.assertEqual([row['path'] for row in saved['paths']], [generated, tracked])
+            self.assertTrue(all(row['sha256'] for row in saved['paths']))
+            self.assertNotIn(secret, json.dumps(saved))
+            self.assertNotIn('https://', json.dumps(saved))
+            log = root / 'source-status-after-rust.json'
+            with mock.patch.object(consume, 'source_status_observation', return_value=saved), \
+                    self.assertRaisesRegex(RuntimeError, 'App consumer source is not frozen'):
+                consume.app_identity(status_log=log)
+            self.assertNotIn(secret, log.read_text())
+            self.assertEqual(list(root.glob('*.log')), [])
+            unknown = root / ('private-' + secret); unknown.write_bytes(b'inert')
+            redacted = self.controlled_status(root, b'?? ' + unknown.name.encode() + b'\0')
+            self.assertIsNone(redacted['paths'][0]['path'])
+            self.assertNotIn(secret, json.dumps(redacted))
 
-                def observed(command, *, cwd=None, log=None):
-                    raw = status if command[1] == 'status' else delta
-                    if log is not None:
-                        Path(log).write_text(raw)
-                    return raw
+    def test_path_count_length_and_total_hash_budgets_are_incomplete_not_clean(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for i in range(consume.STATUS_PATHS + 1): (root / ('entry-' + str(i))).write_bytes(b'')
+            many = b''.join(b'?? entry-' + str(i).encode() + b'\0' for i in range(consume.STATUS_PATHS + 1))
+            for raw in (many, b'?? ' + b'x' * (consume.STATUS_PATH_BYTES + 1) + b'\0', b'?? partial'):
+                observed = self.controlled_status(root, raw)
+                self.assertFalse(observed['complete'] or observed['clean'])
+                self.assertLessEqual(len(observed['paths']), consume.STATUS_PATHS)
+            large = root / 'Cargo.lock'; large.write_bytes(b'x' * (consume.STATUS_HASH_BYTES + 1))
+            observed = self.controlled_status(root, b' M Cargo.lock\0')
+            self.assertFalse(observed['complete'])
+            self.assertEqual(observed['hashBytesRead'], 0)
+            self.assertIsNone(observed['paths'][0]['sha256'])
 
-                with mock.patch.object(consume, 'ROOT', root), \
-                        mock.patch.object(consume, 'run', side_effect=observed), \
-                        self.assertRaisesRegex(RuntimeError, 'App consumer source is not frozen') as failure:
-                    consume.app_identity(status_log=log)
-                self.assertIn('totalRows=' + str(len(status.splitlines())), str(failure.exception))
-                self.assertEqual(log.read_text(), status)
-                self.assertEqual(log.with_suffix('.diff.log').read_text(), delta)
-                self.assertEqual(log.with_suffix('.swift-package-resolved.log').read_bytes(), original)
-                self.assertEqual(resolution.read_bytes(), original)
+    def test_pipe_stdout_stderr_and_deadline_are_capped_during_collection(self):
+        import sys
+        import time
+        cases = [
+            ('import os; os.write(1, b"x" * 65536)', 'stdout-budget', consume.STATUS_BYTES + 1),
+            ('import os; os.write(2, b"DO_NOT_EXPORT_SECRET" * 2048)', 'stderr-budget', consume.STATUS_STDERR_BYTES + 1),
+            ('import time; time.sleep(2)', 'deadline', None),
+        ]
+        for code, reason, expected in cases:
+            with self.subTest(reason=reason):
+                raw, observed = consume.bounded_source_status(
+                    [sys.executable, '-c', code], time.monotonic() + (0.1 if reason == 'deadline' else 5))
+                self.assertFalse(observed['statusComplete'])
+                self.assertEqual(observed['reason'], reason)
+                self.assertLessEqual(len(raw), consume.STATUS_BYTES + 1)
+                self.assertNotIn('DO_NOT_EXPORT_SECRET', json.dumps(observed))
+                if expected is not None:
+                    self.assertEqual(observed['observedStdoutBytes' if reason == 'stdout-budget' else 'observedStderrBytes'], expected)
+
+    def test_collection_error_writes_incomplete_safe_metadata_and_rejects(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / 'source-status-before-rust.json'
+            with mock.patch.object(consume, 'source_status_observation', side_effect=OSError('DO_NOT_EXPORT_SECRET')), \
+                    self.assertRaisesRegex(RuntimeError, 'App consumer source is not frozen'):
+                consume.app_identity(status_log=log)
+            observed = json.loads(log.read_bytes())
+            self.assertFalse(observed['complete'] or observed['clean'])
+            self.assertEqual(observed['reason'], 'collector-error')
+            self.assertNotIn('DO_NOT_EXPORT_SECRET', log.read_text())
+            with mock.patch.object(consume.subprocess, 'Popen', side_effect=OSError('DO_NOT_EXPORT_SECRET')):
+                raw, observed = consume.bounded_source_status(['git'], float('inf'))
+            self.assertEqual(raw, b'')
+            self.assertFalse(observed['statusComplete'])
+            self.assertNotIn('DO_NOT_EXPORT_SECRET', json.dumps(observed))
+
+    def test_report_budget_and_write_failure_cannot_accept_or_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            observed = self.controlled_status(root, b'')
+            observed['paths'] = [{'pathSha256': 'a' * 64}] * 64
+            observed.update(clean=False, complete=False, reason='controlled-dirty')
+            log = root / 'source-status-after-rust.json'
+            with mock.patch.object(consume, 'source_status_observation', return_value=observed), \
+                    mock.patch.object(consume, 'STATUS_REPORT_BYTES', 1024), \
+                    self.assertRaisesRegex(RuntimeError, 'App consumer source is not frozen'):
+                consume.app_identity(status_log=log)
+            self.assertEqual(json.loads(log.read_bytes())['reason'], 'report-budget')
+            self.assertLessEqual(log.stat().st_size, 1024)
+            original = log.read_bytes()
+            with mock.patch.object(consume, 'source_status_observation', return_value=self.controlled_status(root, b'')), \
+                    self.assertRaisesRegex(RuntimeError, 'already frozen'):
+                consume.app_identity(status_log=log)
+            self.assertEqual(log.read_bytes(), original)
+            with mock.patch.object(consume, 'source_status_observation', return_value=self.controlled_status(root, b'')), \
+                    self.assertRaisesRegex(RuntimeError, 'incomplete source status observation could not be written'):
+                consume.app_identity(status_log=root / 'absent/observation.json')
+
+    def test_preexisting_dirty_rejects_before_link_verification_after_slot_admission(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); target = root / 'target'; target.mkdir()
+            env = {'POLARIS_FORMAL_APP_BUILD': '1', 'PLATFORM_NAME': 'iphoneos', 'ARCHS': 'arm64',
+                   'CONFIGURATION': 'release', 'POLARIS_APP_WORK': str(root), 'POLARIS_APP_RUST_TARGET': str(target)}
+            with mock.patch.dict(apple_rust.os.environ, env), \
+                    mock.patch.object(apple_rust.os, 'uname', return_value=SimpleNamespace(sysname='Darwin')), \
+                    mock.patch.object(apple_rust, 'load', return_value={}), \
+                    mock.patch.object(apple_rust, 'private_dir', side_effect=lambda value: Path(value)), \
+                    mock.patch.object(apple_rust, 'app_identity', side_effect=RuntimeError('controlled dirty')) as identity, \
+                    mock.patch.object(apple_rust, 'verify_link') as link, \
+                    self.assertRaisesRegex(RuntimeError, 'controlled dirty'):
+                apple_rust.build_reserved()
+            identity.assert_called_once_with(status_log=root / 'source-status-before-rust.json')
+            link.assert_not_called()
 
     def test_exact_three_actual_target_mappings(self):
         self.assertEqual(apple_rust.target_for('iphoneos', 'arm64', 'release'), 'aarch64-apple-ios')

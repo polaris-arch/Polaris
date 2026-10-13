@@ -6,6 +6,11 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import hashlib
+import selectors
+import signal
+import subprocess
+import time
 
 import sys
 sys.dont_write_bytecode = True
@@ -13,7 +18,8 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
 from artifacts import receipt_digest, component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
-from producer import lease, run, write_json
+from producer import ACTIVE_FDS, lease, run, write_json
+from budget import group_alive, register_group
 
 
 def verify_original(component, receipt_path, platform, tools, scratch):
@@ -53,31 +59,172 @@ def verify_original(component, receipt_path, platform, tools, scratch):
     return receipt
 
 
+STATUS_BYTES, STATUS_STDERR_BYTES, STATUS_PATHS, STATUS_PATH_BYTES = 16384, 1024, 64, 512
+STATUS_HASH_BYTES, STATUS_REPORT_BYTES, STATUS_SECONDS = 1024 ** 2, 65536, 10
+# Only these reviewed names may be displayed. Unknown names have opaque hashes.
+STATUS_DISPLAY_PATHS = frozenset({
+    'Cargo.toml', 'Cargo.lock', '.gitignore', 'src-tauri/tauri.ios.conf.json',
+    'src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
+    'crates/tauri-plugin-polaris-ios/ios/Package.swift',
+    'crates/tauri-plugin-polaris-ios/ios/Package.resolved',
+})
+
+
+def bounded_source_status(command, deadline):
+    """Drain capped pipes while the child runs; never communicate/full-buffer it."""
+    raw, stderr_bytes, process, reason = bytearray(), 0, None, None
+    try:
+        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, pass_fds=tuple(ACTIVE_FDS))
+        register_group(process.pid)
+        with selectors.DefaultSelector() as selected:
+            for stream, label in [(process.stdout, 'stdout'), (process.stderr, 'stderr')]:
+                os.set_blocking(stream.fileno(), False)
+                selected.register(stream, selectors.EVENT_READ, label)
+            while selected.get_map() and reason is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    reason = 'deadline'; break
+                for key, _ in selected.select(min(0.2, remaining)):
+                    used, maximum = (len(raw), STATUS_BYTES) if key.data == 'stdout' else (stderr_bytes, STATUS_STDERR_BYTES)
+                    chunk = os.read(key.fd, min(1024, maximum - used + 1))
+                    if not chunk:
+                        selected.unregister(key.fileobj); continue
+                    if key.data == 'stdout': raw.extend(chunk)
+                    else: stderr_bytes += len(chunk)  # Content is never exported.
+                    if used + len(chunk) > maximum:
+                        reason = key.data + '-budget'; break
+        if reason is None:
+            try: process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired: reason = 'deadline'
+        if reason is None and (process.returncode != 0 or group_alive(process.pid)):
+            reason = 'git-exit-or-live-group'
+    except (OSError, RuntimeError):
+        reason = 'collector-error'  # Never copy arbitrary exception/stderr text.
+    finally:
+        if process is not None:
+            try:
+                if process.poll() is None or group_alive(process.pid):
+                    try: os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError: pass
+                    try: process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                        process.wait(timeout=1)
+                    if group_alive(process.pid):
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                register_group(process.pid, finished=True)
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                reason = reason or 'cleanup-error'
+            finally:
+                for stream in (process.stdout, process.stderr): stream.close()
+    return bytes(raw), {'statusComplete': reason is None, 'reason': reason,
+                        'observedStdoutBytes': len(raw), 'observedStderrBytes': stderr_bytes,
+                        'observedStatusPrefixSha256': sha(raw)}
+
+
+def source_status_observation():
+    deadline = time.monotonic() + STATUS_SECONDS
+    raw, observation = bounded_source_status(
+        ['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'], deadline)
+    rows, hash_bytes, reason = [], 0, observation['reason']
+    cursor = 0
+    while cursor < len(raw) and len(rows) < STATUS_PATHS:
+        end = raw.find(b'\0', cursor)
+        if end < 0: reason = reason or 'partial-status'; break
+        entry = raw[cursor:end]; cursor = end + 1
+        if len(entry) < 4 or entry[2:3] != b' ' or any(v not in b' MADRCU?!T' for v in entry[:2]):
+            reason = reason or 'invalid-status'; break
+        paths = [('current', entry[3:])]
+        if b'R' in entry[:2] or b'C' in entry[:2]:
+            end = raw.find(b'\0', cursor)
+            if end < 0: reason = reason or 'missing-rename-origin'; break
+            paths.append(('rename-origin', raw[cursor:end])); cursor = end + 1
+        for role, encoded in paths:
+            if len(rows) >= STATUS_PATHS or len(encoded) > STATUS_PATH_BYTES:
+                reason = reason or 'path-budget'; break
+            row = {'status': entry[:2].decode('ascii'), 'role': role, 'pathBytes': len(encoded),
+                   'pathSha256': sha(encoded), 'path': None, 'type': None, 'sha256': None}
+            rows.append(row)
+            try:
+                name = encoded.decode('utf-8')
+                rel = Path(name)
+                if not name or rel.is_absolute() or '..' in rel.parts:
+                    reason = reason or 'invalid-path'; continue
+                row['path'] = name if name in STATUS_DISPLAY_PATHS else None
+                path = ROOT / rel
+                info = path.lstat()
+                row.update(bytes=info.st_size, mode=stat.S_IMODE(info.st_mode))
+                row['type'] = ('symlink' if stat.S_ISLNK(info.st_mode) else 'file' if stat.S_ISREG(info.st_mode)
+                               else 'directory' if stat.S_ISDIR(info.st_mode) else 'other')
+                if row['type'] != 'file': continue
+                if time.monotonic() >= deadline or info.st_size > STATUS_HASH_BYTES - hash_bytes:
+                    reason = reason or 'hash-budget-or-deadline'; continue
+                if not path.resolve(strict=True).is_relative_to(ROOT.resolve(strict=True)):
+                    reason = reason or 'redirected-path'; continue
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(fd, 'rb') as stream:
+                    actual = os.fstat(stream.fileno())
+                    if (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino):
+                        reason = reason or 'changed-file'; continue
+                    digest, count = hashlib.sha256(), 0
+                    while True:
+                        if time.monotonic() >= deadline:
+                            reason = reason or 'deadline'; break
+                        chunk = stream.read(min(8192, STATUS_HASH_BYTES - hash_bytes + 1))
+                        if not chunk: break
+                        count += len(chunk); hash_bytes += len(chunk)
+                        if hash_bytes > STATUS_HASH_BYTES:
+                            reason = reason or 'hash-budget'; break
+                        digest.update(chunk)
+                    after = os.fstat(stream.fileno())
+                    if count == info.st_size and (after.st_size, after.st_mtime_ns) == (info.st_size, info.st_mtime_ns):
+                        row['sha256'] = digest.hexdigest()
+                    else: reason = reason or 'incomplete-or-changed-file'
+            except FileNotFoundError:
+                row['type'] = 'absent'
+                if b'D' not in entry[:2]: reason = reason or 'metadata-missing'
+            except (OSError, UnicodeError, ValueError):
+                reason = reason or 'metadata-error'
+    if cursor < len(raw): reason = reason or 'path-budget'
+    observation.update(schema='polaris-app-source-status-observation-v1', complete=reason is None,
+                       reason=reason, clean=not raw and observation['statusComplete'], paths=rows,
+                       hashBytesRead=hash_bytes, rawStatusRetained=False, fileContentsExported=False,
+                       processRSS=None,
+                       scope='derived bounded metadata; exact reviewed names only; no raw stdout/stderr/diff/file bodies',
+                       limits={'stdoutBytes': STATUS_BYTES, 'stderrBytes': STATUS_STDERR_BYTES,
+                               'paths': STATUS_PATHS, 'pathBytes': STATUS_PATH_BYTES,
+                               'hashBytes': STATUS_HASH_BYTES, 'reportBytes': STATUS_REPORT_BYTES,
+                               'seconds': STATUS_SECONDS, 'pipeOverflowSentinelBytes': 1,
+                               'hashOverflowSentinelBytes': 1})
+    return observation
+
+
 def app_identity(*, status_log=None):
+    try:
+        observation = source_status_observation()
+    except (OSError, RuntimeError, ValueError):
+        observation = {'schema': 'polaris-app-source-status-observation-v1', 'complete': False,
+                       'clean': False, 'statusComplete': False, 'paths': [], 'reason': 'collector-error',
+                       'rawStatusRetained': False, 'fileContentsExported': False, 'processRSS': None,
+                       'scope': 'incomplete derived metadata; no raw error text or original source export'}
     if status_log is not None:
         status_log = Path(status_log)
         require(not status_log.exists() and not status_log.is_symlink(), 'source status observation already frozen')
-    status = run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], cwd=ROOT, log=status_log)
-    if status and status_log is not None:
-        # Retain the actual tracked delta and this known SwiftPM input as evidence.
-        # Neither a generated file nor a recorded diff grants source acceptance.
-        diff_log = status_log.with_suffix('.diff.log')
-        require(not diff_log.exists() and not diff_log.is_symlink(), 'source diff observation already frozen')
-        run(['git', 'diff', '--binary', 'HEAD'], cwd=ROOT, log=diff_log)
-        resolved = ROOT / 'crates/tauri-plugin-polaris-ios/ios/Package.resolved'
-        if (resolved.is_file() and not resolved.is_symlink() and
-                resolved.resolve(strict=True).is_relative_to(ROOT.resolve(strict=True)) and
-                resolved.stat().st_size <= 1024 ** 2):
-            snapshot = status_log.with_suffix('.swift-package-resolved.log')
-            require(not snapshot.exists() and not snapshot.is_symlink(), 'Swift input observation already frozen')
-            with resolved.open('rb') as stream:
-                raw = stream.read(1024 ** 2 + 1)
-            if len(raw) <= 1024 ** 2:
-                with snapshot.open('xb') as stream:
-                    stream.write(raw)
-    rows = status.splitlines()
-    require(not status, 'App consumer source is not frozen; actual status rows=' + repr(rows[:32]) +
-            '; totalRows=' + str(len(rows)) + '; originalStatusLog=' + str(status_log))
+        raw = json.dumps(observation, ensure_ascii=True, sort_keys=True).encode()
+        if len(raw) > STATUS_REPORT_BYTES:
+            observation.update(complete=False, reason='report-budget', paths=[], omittedPathCount=len(observation['paths']))
+            raw = json.dumps(observation, ensure_ascii=True, sort_keys=True).encode()
+        require(len(raw) <= STATUS_REPORT_BYTES, 'source status observation exceeds fixed report budget')
+        try:
+            with status_log.open('xb') as stream: stream.write(raw)
+        except OSError:
+            raise RuntimeError('incomplete source status observation could not be written') from None
+    require(observation['complete'] and observation['clean'],
+            'App consumer source is not frozen; observationComplete=' + str(observation['complete']) +
+            '; observedPaths=' + str(len(observation['paths'])) + '; reason=' + str(observation['reason']))
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
             'consumerCode': {name: file_pin(ROOT / name) for name in
                 ['scripts/mobile-core/consume.py', 'scripts/mobile-core/artifacts.py',
