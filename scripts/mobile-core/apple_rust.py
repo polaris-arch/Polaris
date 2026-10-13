@@ -59,6 +59,14 @@ def selected_wire_bytes(raw, triple):
                   'offset': selected['offset'], 'bytes': selected['bytes'], 'container': observed['kind']}
 
 
+def verify_start_app(archive, log):
+    # This predicate needs a defined native text symbol, not Rust's LLVM IR.
+    # The final Xcode link still validates the complete unchanged archive.
+    symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', archive], log=log)
+    require(re.search(r'\b[Tt]\s+_start_app\s*$', symbols, re.MULTILINE),
+            'actual Rust start_app definition missing')
+
+
 def build():
     root = private_dir(Path(os.environ['POLARIS_APP_WORK']))
     require(os.environ.get('POLARIS_BUILD_RESERVATION_FD') is not None,
@@ -124,8 +132,7 @@ def build_reserved():
     run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'))
     archive = target / triple / 'release/libpolaris_lib.a'
     require(not archive.is_symlink() and archive.read_bytes().startswith(b'!<arch>\n'), 'actual Rust static archive required')
-    symbols = run(['xcrun', 'nm', '-gU', archive])
-    require(re.search(r'\b[Tt]\s+_start_app\s*$', symbols, re.MULTILINE), 'actual Rust start_app definition missing')
+    verify_start_app(archive, root / ('original-rust-symbols-' + triple + '.log'))
     pin = file_pin(archive)
     dest = ROOT / 'src-tauri/gen/apple/Externals' / os.environ['ARCHS'] / 'release/libapp.a'
     for parent in [dest, *dest.parents]:

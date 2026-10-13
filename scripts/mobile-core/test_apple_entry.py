@@ -61,6 +61,20 @@ class AppleEntryTests(unittest.TestCase):
         with mock.patch.dict(ci_apple.os.environ, {'GITHUB_ACTIONS': 'false'}), self.assertRaises(RuntimeError):
             ci_apple.location()
 
+    def test_native_start_app_definition_is_required_and_tool_errors_propagate(self):
+        archive, log = Path('/inert/libpolaris_lib.a'), Path('/inert/symbols.log')
+        with mock.patch.object(apple_rust, 'run', return_value='00000000 T _start_app\n') as tool:
+            apple_rust.verify_start_app(archive, log)
+        tool.assert_called_once_with(['xcrun', 'nm', '--no-llvm-bc', '-gU', archive], log=log)
+        for symbols in ['', '                 U _start_app\n', '00000000 T _start_app_extra\n']:
+            with self.subTest(symbols=symbols), \
+                    mock.patch.object(apple_rust, 'run', return_value=symbols), \
+                    self.assertRaisesRegex(RuntimeError, '^actual Rust start_app definition missing$'):
+                apple_rust.verify_start_app(archive, log)
+        with mock.patch.object(apple_rust, 'run', side_effect=RuntimeError('invalid native object')), \
+                self.assertRaisesRegex(RuntimeError, '^invalid native object$'):
+            apple_rust.verify_start_app(archive, log)
+
     def test_hosted_selection_rejects_default_xcode_wrong_build_and_either_old_sdk_before_tool_install(self):
         value = ci_apple.load()
         apple = value['apple']
@@ -238,12 +252,16 @@ class AppleEntryTests(unittest.TestCase):
             library.mkdir(parents=True)
             raw = single_fat_archive(object_archive(0x100000c, 0, 2))
             (library / 'Libbox').write_bytes(raw)
+            rust_archive = root / 'cache/rust-target/aarch64-apple-ios/release/libpolaris_lib.a'
+            rust_archive.parent.mkdir(parents=True)
+            rust_archive.write_bytes(b'!<arch>\nunaccepted archive fixture')
             with mock.patch.object(ci_apple, 'location', return_value=root), \
                     mock.patch.object(ci_apple, 'lease', held), mock.patch('builtins.print'):
                 ci_apple.evidence()
             with zipfile.ZipFile(root / 'apple-original-evidence.zip') as archive:
                 member = 'component/staging/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox'
                 self.assertEqual(archive.read(member), raw)
+                self.assertEqual(archive.read(rust_archive.relative_to(root).as_posix()), rust_archive.read_bytes())
                 index = json.loads(archive.read('EVIDENCE-INDEX.json'))
                 self.assertFalse(index['componentAccepted'])
                 self.assertFalse(index['stagedComponentIsAccepted'])

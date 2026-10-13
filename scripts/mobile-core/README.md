@@ -172,7 +172,12 @@ uses `cargo rustc --lib --crate-type staticlib` only for this iOS archive stage;
 the shared Cargo manifest retains Android's cdylib and the other library types.
 Swift bridge symbols must resolve in the subsequent full Xcode App link.
 It checks the actual static archive/start_app and saves its byte/source/tool facts;
-it does not require a running Tauri CLI options server or regenerate tracked
+the native symbol check uses the existing `nm --no-llvm-bc -gU` mode, requires
+success plus a defined `_start_app` text symbol, and retains its full output.
+Rust's compiler-builtins IR is left to the unchanged final Xcode link; this
+check does not claim IR compatibility or final carrier acceptance. Original
+archives are retained even when no accepted Rust receipt has been written.
+It does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected
 original container by the actual Cargo CPU and iOS/device or simulator platform.

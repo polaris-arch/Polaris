@@ -130,6 +130,14 @@ def evidence():
             paths.update(work.glob('*.ipa'))
             paths.update(work.glob('wire-*.a'))
             paths.update((work / 'derived-data').rglob('*LinkMap*.txt'))
+            # A failed symbol check has no accepted Rust receipt yet. Preserve
+            # its actual archive as unaccepted evidence under the same budget.
+            from apple_rust import target_for
+            target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
+                                'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+            archive = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
+            if archive.is_file():
+                paths.add(archive)
             for receipt in work.glob('rust-*.json'):
                 try:
                     target = read_receipt(receipt)['target']
