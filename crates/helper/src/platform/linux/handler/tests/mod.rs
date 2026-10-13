@@ -1936,3 +1936,114 @@ fn successful_dns_retry_keeps_live_birth_takeover_but_reaped_retry_is_restored()
         assert!(spawner.spawn_calls.lock().unwrap().is_empty());
     }
 }
+
+#[test]
+fn refused_dns_frame_retiring_only_a_reservation_does_not_block_the_next_start() {
+    struct RetireWhileReading<'a> {
+        state: &'a Mutex<HandlerState>,
+        inner: MockConn,
+        reads: usize,
+        retire_at: usize,
+    }
+    impl Conn for RetireWhileReading<'_> {
+        fn read_line(&mut self) -> String {
+            if self.reads == self.retire_at {
+                let mut state = self.state.lock().unwrap();
+                assert!(state.dns_busy);
+                assert_eq!(state.dns_owner, None);
+                let birth = state.child.as_ref().unwrap().handle().clone();
+                assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+                state.retire_birth(&birth);
+                assert!(state.child.is_none());
+                assert!(state.dns_cleanup_pending);
+            }
+            self.reads += 1;
+            self.inner.read_line()
+        }
+        fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
+            self.inner.read_line_strict()
+        }
+        fn write_line(&mut self, line: &str) -> bool {
+            self.inner.write_line(line)
+        }
+    }
+    // Retire before either parameter read, including the missing IP read.
+    for (truncated, retire_at) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+        let (dir, auth, core_dir) = setup_env();
+        let cfg = dir.path().join("cfg.json");
+        std::fs::write(&cfg, b"{}").unwrap();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let forwards = StdMutex::new(Vec::new());
+        let fwd = |value| forwards.lock().unwrap().push(value);
+        let resolved = MockResolvedDns::default();
+        let deps = make_deps_with_resolved(
+            Some(&core_dir),
+            &auth,
+            &peer,
+            &spawner,
+            &fp,
+            &systemd,
+            &ss,
+            &fwd,
+            &resolved,
+        );
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(exact_handle(77, BIRTH_ONE)));
+        assert!(initial.dns_owner.is_none() && initial.dns_birth.is_none());
+        let state = Mutex::new(initial);
+        let mut denied = RetireWhileReading {
+            state: &state,
+            inner: MockConn::new(if truncated {
+                vec![
+                    lcmd::RESOLVED_DNS_SET,
+                    polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+                ]
+            } else {
+                vec![lcmd::RESOLVED_DNS_SET, "other-interface", "8.8.8.8"]
+            }),
+            reads: 0,
+            retire_at,
+        };
+        handle(&state, &deps, &mut denied);
+        assert_eq!(
+            denied.inner.writes(),
+            ["ERR resolved-dns request denied by Polaris resolved whitelist"]
+        );
+        assert!(resolved.calls.lock().unwrap().is_empty());
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+        assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+        assert!(spawner.kill_calls.lock().unwrap().is_empty());
+        assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+        assert!(fp.killed.lock().unwrap().is_empty());
+        assert!(systemd.calls.lock().unwrap().is_empty());
+        assert!(forwards.lock().unwrap().is_empty());
+        let mut state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(state.dns_owner.is_none() && state.dns_birth.is_none());
+        assert!(!state.dns_busy && !state.dns_cleanup_pending);
+
+        // Use the existing selected-core admission fixture and actual dispatch
+        // with the config's owner, rather than only checking the pending bit.
+        let uid = nix::unistd::getuid().as_raw();
+        let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+        let cfg = cfg.to_string_lossy().into_owned();
+        let mut next = MockConn::new(vec![&id, &cfg, "", "1", ""]);
+        dispatch_locked(
+            &mut state,
+            &deps,
+            &PeerCred { uid, gid: uid },
+            lcmd::START_PINNED_BIRTH,
+            &mut next,
+        );
+        assert!(matches!(
+            selected_start(&next.writes()[0], &id),
+            LinuxBirthStart::Started { .. }
+        ));
+        assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
+        assert!(resolved.calls.lock().unwrap().is_empty());
+    }
+}

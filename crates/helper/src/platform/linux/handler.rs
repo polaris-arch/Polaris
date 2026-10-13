@@ -256,7 +256,14 @@ pub fn handle<P, S, D, SD>(
                 // another Start cannot reuse the slot until a real restore.
                 guard.dns_cleanup_pending = match outcome {
                     DnsChange::Applied | DnsChange::Restored => false,
-                    DnsChange::Unmodified => guard.dns_cleanup_pending,
+                    // A reaper can mark the temporary reservation pending
+                    // while an invalid/truncated frame is being read. After
+                    // restoring the previous custody, keep pending only when
+                    // there is actual DNS responsibility left to discharge.
+                    DnsChange::Unmodified => {
+                        guard.dns_cleanup_pending
+                            && (guard.dns_owner.is_some() || guard.dns_birth.is_some())
+                    }
                     DnsChange::Unconfirmed => true,
                 };
                 guard.dns_busy = false;
