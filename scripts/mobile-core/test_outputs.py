@@ -15,7 +15,7 @@ from fork_input import ROOT, canonical, load, sha
 from artifacts import check_buildinfo, framework_entry_targets, inspect_framework, module, module_stream, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import reservation
-from ci_android import emit_outputs, prepare_source
+from ci_android import emit_outputs, prepare_source, prepare
 from producer import equivalent_binding
 from transaction import install, recover
 
@@ -291,6 +291,60 @@ class FormalOutputs(unittest.TestCase):
             jar.write_bytes(b'wrong bootclasspath')
             with self.assertRaisesRegex(RuntimeError, 'bootclasspath differs'):
                 prepare_view(work, sdk, ndk, profile)
+
+    def test_prepare_refusal_retains_ndk_inputs_without_success_outputs(self):
+        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\nPkg.BaseRevision = 30.0.16138531\nPkg.ReleaseName = r30-beta3\n'
+        # Execute the real prepare/observe path, with all external tool operations
+        # controlled. Both admission refusal and a later source refusal happen
+        # before emit_outputs, so the work output cannot be the evidence root.
+        for admission_refuses in [True, False]:
+            with self.subTest(admission_refuses=admission_refuses), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                ndk = root / 'ndk'; ndk.mkdir()
+                raw = properties.replace(b'-beta3', b'-beta2') if admission_refuses else properties
+                (ndk / 'source.properties').write_bytes(raw)
+                jdk = root / 'jdk'; jdk.mkdir()
+                sdk = root / 'sdk'; sdk.mkdir()
+                output, environment = root / 'github-output', root / 'github-env'
+
+                def controlled_run(args, **kwargs):
+                    command = [str(arg) for arg in args]
+                    if command == ['which', 'go']:
+                        return '/controlled/go'
+                    if command == ['/controlled/go', 'version']:
+                        return 'go version go' + self.value['goVersion'] + ' linux/amd64'
+                    if command == ['/controlled/go', 'install',
+                            'github.com/sagernet/gomobile/cmd/gomobile@' + self.value['gomobileVersion'],
+                            'github.com/sagernet/gomobile/cmd/gobind@' + self.value['gobindVersion']]:
+                        return ''
+                    if len(command) == 3 and command[1:] == [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), str(root)]:
+                        return str(ndk)
+                    self.fail('unexpected external operation: ' + repr(command))
+
+                reason = 'revision/base/release differs' if admission_refuses else 'controlled source refusal'
+                with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'JAVA_HOME_17_X64': str(jdk),
+                        'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
+                        patch('ci_android.location', return_value=root), \
+                        patch('ci_android.producer_code', return_value={'files': []}), \
+                        patch('ci_android.run', side_effect=controlled_run), \
+                        patch('ci_android.prepare_source', side_effect=RuntimeError('controlled source refusal')) as source, \
+                        patch('ci_android.emit_outputs') as emit, self.assertRaisesRegex(RuntimeError, reason):
+                    prepare()
+                emit.assert_not_called()
+                if admission_refuses:
+                    source.assert_not_called()
+                else:
+                    source.assert_called_once()
+                self.assertFalse(output.exists())
+                self.assertFalse(environment.exists())
+                self.assertFalse((root / 'tools.json').exists())
+                self.assertEqual((root / 'ndk-source.properties').read_bytes(), raw)
+                observation = json.loads((root / 'sdk-input-observation.json').read_bytes())
+                self.assertEqual(observation['sourceProperties']['sha256'], sha(raw))
+                self.assertEqual(observation['revision'], revision_from_properties(raw.decode()))
+                self.assertEqual(observation['requiredRevision'], self.value['android']['ndkSourceRevision'])
+                self.assertFalse(observation['devicePassed'])
+                self.assertFalse(observation['publicationEligible'])
 
     def test_framework_declares_exact_device_and_simulator_architectures(self):
         device = {'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}

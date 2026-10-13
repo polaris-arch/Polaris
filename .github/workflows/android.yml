@@ -579,6 +579,19 @@ jobs:
           node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
           python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
 
+      # prepare can reject after observation but before it emits work/cache outputs.
+      # Keep these two fixed-root inputs independently of successful SDK admission.
+      - name: Retain actual NDK input observations even on prepare failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-mobile-ndk-input-${{ github.job }}
+          path: |
+            ~/Code/polaris-mobile-ci/ndk-source.properties
+            ~/Code/polaris-mobile-ci/sdk-input-observation.json
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Retain actual formal mobile component and original receipts
         if: always() && steps.libbox_input.outcome == 'success'
         uses: actions/upload-artifact@v7
@@ -589,8 +602,6 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
-            ~/Code/polaris-mobile-ci/ndk-source.properties
-            ~/Code/polaris-mobile-ci/sdk-input-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json
@@ -1145,6 +1156,19 @@ jobs:
               --r8 "src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release"
           done
 
+      # prepare can reject after observation but before it emits work/cache outputs.
+      # Keep these two fixed-root inputs independently of successful SDK admission.
+      - name: Retain actual NDK input observations even on prepare failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-mobile-ndk-input-${{ github.job }}
+          path: |
+            ~/Code/polaris-mobile-ci/ndk-source.properties
+            ~/Code/polaris-mobile-ci/sdk-input-observation.json
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Retain actual formal mobile component and original receipts
         if: always() && steps.libbox_input.outcome == 'success'
         uses: actions/upload-artifact@v7
@@ -1155,8 +1179,6 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
-            ~/Code/polaris-mobile-ci/ndk-source.properties
-            ~/Code/polaris-mobile-ci/sdk-input-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json

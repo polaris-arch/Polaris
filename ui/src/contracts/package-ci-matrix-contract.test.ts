@@ -1164,9 +1164,9 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    // Two distinct evidence allowlists: R8/S5 text and actual formal SDK/receipts. No APK or release write.
+    // Three distinct evidence allowlists: R8/S5, fixed-root NDK observations, and formal SDK/receipts.
     const releaseCheck = jobBlock(android, 'release_check');
-    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(2);
+    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(3);
     const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
       .split('\n')
       .filter((line) => line.startsWith(' '.repeat(12)))
@@ -1189,6 +1189,10 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
       '${{ runner.temp }}/*.source-consumption.json',
     ];
+    const ndkObservations = [
+      '~/Code/polaris-mobile-ci/ndk-source.properties',
+      '~/Code/polaris-mobile-ci/sdk-input-observation.json',
+    ];
     // Match actual payload filename extensions, not the '.so' prefix of
     // '*.source-consumption.json'. Exact evidence inventories remain required.
     const isApkOrSoPayload = (path: string) => /(?:^|\/)[^/]*\.(?:apk|so)$/i.test(path.trim());
@@ -1204,6 +1208,17 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       expect(evidence).toContain('if-no-files-found: error');
       expect(evidence).not.toMatch(/\bgh\s+release\b/);
       expect(paths.filter(isApkOrSoPayload), `${job}: no APK/SO payload in evidence upload`).toEqual([]);
+      const block = jobBlock(android, job);
+      expect(executable(block).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: three evidence artifacts`).toHaveLength(3);
+      const observations = executable(stepBlock(block, 'Retain actual NDK input observations even on prepare failure'));
+      const observedPaths = observations.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
+      expect(observedPaths, `${job}: exact failure-reachable NDK evidence whitelist`).toEqual(ndkObservations);
+      expect(observations).toMatch(/^ {8}if: always\(\)$/m);
+      expect(observations).not.toMatch(/libbox_input|outputs\.|\bgh\s+release\b/);
+      expect(observations).toContain('name: formal-mobile-ndk-input-${{ github.job }}');
+      expect(observations).toContain('if-no-files-found: error');
+      expect(observedPaths.filter(isApkOrSoPayload), `${job}: no APK/SO in failed prepare evidence`).toEqual([]);
+      expect([...paths, ...observedPaths], `${job}: exact combined nine formal evidence paths`).toEqual([...formalEvidence, ...ndkObservations]);
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 新证据白名单仍是文本；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。

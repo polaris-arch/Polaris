@@ -64,7 +64,7 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
         "Private directory for held inert core/sidecar objects; no execution"),
     ("crates/helper/src/platform/macos/native_birth/tests/mod.rs", Kind::ExecBit, 1,
         "Private directory for a hashed inert content-id lease fixture"),
-    ("src-tauri/src/runtime/core_store/tests/mod.rs", Kind::ExecBit, 1,
+    ("crates/helper/src/core_store/tests/mod.rs", Kind::ExecBit, 1,
         "Temp root directory mode 0777 rejects unsafe custody; no executable file"),
     ("src-tauri/src/runtime/update_install/tests/lease_recovery.rs", Kind::ExecBit, 2,
         "Fixture root and old journal directory modes 0700; executable helper uses shared writer"),
