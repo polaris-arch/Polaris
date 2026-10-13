@@ -615,6 +615,7 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/test_apple_entry.py",
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",
+    "scripts/mobile-core/test_native_inputs.py",
     "scripts/mobile-core/ci_apple.py",
     "scripts/mobile-core/native_inputs.py",
     "scripts/mobile-core/build_apple_app.py",
@@ -629,6 +630,9 @@ fn registered_python_module(rel: &str) -> bool {
 
 #[test]
 fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
+    assert!(registered_python_module(
+        "scripts/mobile-core/test_native_inputs.py"
+    ));
     for path in PYTHON_MODULE_FILES {
         assert!(registered_python_module(path));
         let stem = Path::new(path).file_stem().unwrap().to_str().unwrap();
@@ -636,6 +640,9 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     }
     for path in [
         "scripts/mobile-core/unknown_module.py",
+        "scripts/mobile-core/test_native_inputs_extra.py",
+        "scripts/other/test_native_inputs.py",
+        "scripts/mobile-core/nested/test_native_inputs.py",
         "scripts/other/ci_apple.py",
         "scripts/mobile-core/nested/ci_apple.py",
         "ui/src/ci_apple.py",

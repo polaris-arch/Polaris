@@ -99,19 +99,21 @@ class OriginReferences(unittest.TestCase):
             facts, output, _, digest = self.fixture(Path(temporary).resolve())
             self.legacy(facts, digest)
             mutations = [
-                lambda v: v['staticMemberOrigins'].update(extra=[]),
-                lambda v: v['staticMemberOrigins']['controlled'].pop(),
-                lambda v: v['staticMemberOrigins']['controlled'][1].update(memberOrdinal=1),
-                lambda v: v['staticMemberOrigins']['controlled'][0].update(memberOrdinal=True),
-                lambda v: v['staticMemberOrigins']['controlled'][0].update(sha256='0' * 64),
-                lambda v: v['staticMemberOrigins']['controlled'][0].update(extra='unbound'),
-                lambda v: v['staticMemberOrigins']['controlled'][0].pop('origins'),
-                lambda v: v['staticMemberOrigins']['controlled'][0].update(origins=None),
+                (lambda v: v['staticMemberOrigins'].update(extra=[]), 'static source table/member targets required'),
+                (lambda v: v['staticMemberOrigins']['controlled'].pop(), 'static source table/member counts differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][1].update(memberOrdinal=1), 'static source table/member references differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][0].update(memberOrdinal=True), 'static source table/member references differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][0].update(sha256='0' * 64), 'static source table/member references differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][0].update(extra='unbound'), 'static source table/member references differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][0].pop('origins'), 'static source table/member references differ'),
+                (lambda v: v['staticMemberOrigins']['controlled'][0].update(origins=None), 'legacy actual source/member origins required'),
             ]
-            for mutate in mutations:
+            for mutate, reason in mutations:
                 changed = deepcopy(facts); mutate(changed)
-                with patch('native_inputs.source_table', side_effect=AssertionError('must reject before source inspection')):
-                    with self.assertRaisesRegex(RuntimeError, 'table/member'): verify(changed, output=output)
+                with self.subTest(reason=reason), patch('native_inputs.source_table', side_effect=AssertionError('must reject before source inspection')):
+                    # Each mutation must hit its specific structural/type guard,
+                    # not merely raise some downstream source-reading error.
+                    with self.assertRaisesRegex(RuntimeError, '^' + reason + '$'): verify(changed, output=output)
 
     def test_many_equal_digest_legacy_origins_normalize_actual_candidates_once_and_scan_inline_lists_once(self):
         class OnePassOrigins(list):
