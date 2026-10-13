@@ -51,6 +51,9 @@ import type { SubscriptionUpdateProgress } from '@/contracts/subscription-progre
 import type { SubscriptionCreateSnapshot } from '@/contracts/subscription-create-operation';
 import type { TaildropTaskSnapshot } from '@/contracts/taildrop';
 import * as ts from '@/test/ts-compiler';
+import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
+import { configContentDigest } from '@/lib/staged-config';
+import type { MeasurementSnapshot } from '@/contracts/measurement-display';
 import {
   CALL_SITE_FIXTURE,
   callSitesIn,
@@ -82,6 +85,8 @@ function emit<T>(name: string, payload: T): void {
 }
 
 let proxyStatus: ProxyStatus | null = null;
+let measurementSnapshot: MeasurementSnapshot | null = null;
+const measurementSnapshotMock = vi.fn(async () => measurementSnapshot);
 let pendingRaw: unknown = { added: [], modified: [], removed: [], restartDeferred: false };
 let vpnSnapshot: VpnStatusSnapshot = { connected: false, openConnect: [], openVpn: [] };
 
@@ -150,6 +155,8 @@ vi.mock('@/ipc', () => ({
     server: {
       tailscaleStateExists: (ids: string[]) => tailscaleStateExistsMock(ids),
       tailscaleLoginCancel: (serverId: string, attemptId: string) => cancelLoginMock(serverId, attemptId),
+      speedTestResultSnapshot: () => measurementSnapshotMock(),
+      onSpeedTestSchedule: channel('speedTestSchedule'),
       onSpeedTestResult: channel<{ runId?: string; serverId: string; latency: number }>('speedTestResult'),
       onSpeedTestProgress: channel('speedTestProgress'),
       onSpeedTestDone: channel('speedTestDone'),
@@ -251,6 +258,8 @@ beforeEach(() => {
   bus.clear();
   toasts = [];
   proxyStatus = null;
+  measurementSnapshot = null;
+  measurementSnapshotMock.mockClear();
   pendingRaw = { added: [], modified: [], removed: [], restartDeferred: false };
   vpnSnapshot = { connected: false, openConnect: [], openVpn: [] };
   offSpy.mockClear();
@@ -269,7 +278,7 @@ beforeEach(() => {
   useAppStore.setState({ ipInfoRevision: -1 });
   useVpnStatusStore.getState().replace(false, [], []);
   useSubscriptionProgressStore.setState({ progress: {} });
-  useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
+  useLatencyStore.setState({ latencyMap: {}, testedAt: {}, snapshot: null, projections: {}, currentProjections: {}, readError: false });
   useTailscaleLoginCacheStore.setState({ cache: {} });
   useTailscaleLoginProgressStore.setState({ attempts: {} });
   createListSeed = [];
@@ -1354,7 +1363,6 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
    * 不许写「本批不做」——那是排期，不是判定。
    */
   const NOT_PORTED: ReadonlyArray<readonly [string, string]> = [
-    ['subscribeLatencyEvents', '移动端由 subscribeMobileSpeedTestProgress 同时接主动轮次与被动 warm RTT：旧 runId 不落延迟；原桌面无轮次门订阅不重复挂。应用级实际 RTT/退订行为见本文件末尾'],
     ['onOpenConnectStatus', 'OpenConnect 增量在移动端零消费者：节点屏的 `deriveMeshTunnelHealth` 只读 `openVpn`，首帧快照那一跳已经把 `openConnect` 落进 store 了'],
     ['onSystemProxyResidual', '移动端接管方式恒为 TUN，系统代理这个对象在 Android 上不存在'],
     ['subscribeSpeedTestProgressToast', '移动端通过runId会话store与行内进度消费同样事件；不重复显示桌面的sticky toast'],
@@ -1579,17 +1587,41 @@ describe('⑬ 订阅创建恢复面 + Taildrop 发件进度：应用级订阅真
 });
 
 describe('连接后检测由 Rust 排程，应用级事件跨页接收', () => {
-  it('后台 warm RTT 在切屏后仍落全局 store，应用卸载后监听器确实退订', () => {
+  it('后台 warm RTT 在切屏后由同身份账本落全局 store，卸载后确实退订', async () => {
+    vi.useFakeTimers();
+    const config = { servers: ['n-hk', 'n-jp', 'n-sg'].map(measurementServer), subscriptions: [] } as unknown as UserConfig;
+    useAppStore.setState({ config, proxyStatus: { running: true, mainGeneration: 7, startTime: 10 } });
+    const digest = await configContentDigest(config);
+    const ledger = (values: Record<string, number>, revision: string) => ({
+      ...measurementFixture(config, values, revision), frontendConfigDigest: digest,
+    });
+    measurementSnapshot = ledger({ 'n-hk': 38 }, '1');
     const off = subscribeMobileSpeedTestProgress();
-    emit('speedTestResult', { serverId: 'n-hk', latency: 38 });
-    expect(useLatencyStore.getState().latencyMap['n-hk']).toBe(38);
-    // Switching from Home to Nodes does not unmount the app-level subscription.
-    emit('speedTestResult', { serverId: 'n-jp', latency: 73 });
-    expect(useLatencyStore.getState().latencyMap).toMatchObject({ 'n-hk': 38, 'n-jp': 73 });
-    off();
-    emit('speedTestResult', { serverId: 'n-sg', latency: 91 });
-    expect(useLatencyStore.getState().latencyMap['n-sg']).toBeUndefined();
-    expect(offSpy).toHaveBeenCalledWith('speedTestResult');
+    try {
+      // Initial and result-event reads have the same 200ms debounce; event numbers
+      // themselves are never measurement evidence.
+      emit('speedTestResult', { serverId: 'n-hk', latency: 999 });
+      expect(useLatencyStore.getState().latencyMap['n-hk']).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() => expect(useLatencyStore.getState().latencyMap['n-hk']).toBe(38));
+      // Switching Home → Nodes leaves the app-level feed mounted.
+      measurementSnapshot = ledger({ 'n-hk': 38, 'n-jp': 73 }, '2');
+      emit('speedTestResult', { serverId: 'n-jp', latency: 999 });
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() => expect(useLatencyStore.getState().latencyMap).toMatchObject({ 'n-hk': 38, 'n-jp': 73 }));
+      off();
+      const reads = measurementSnapshotMock.mock.calls.length;
+      measurementSnapshot = ledger({ 'n-sg': 91 }, '3');
+      emit('speedTestResult', { serverId: 'n-sg', latency: 91 });
+      await vi.advanceTimersByTimeAsync(5200);
+      expect(measurementSnapshotMock.mock.calls.length).toBe(reads);
+      expect(useLatencyStore.getState().latencyMap['n-sg']).toBeUndefined();
+      expect(offSpy).toHaveBeenCalledWith('speedTestResult');
+      expect(offSpy).toHaveBeenCalledWith('speedTestSchedule');
+    } finally {
+      off();
+      vi.useRealTimers();
+    }
   });
 
   it('失效后显示检测中，progress 与终态落库；连接变化不额外 force', async () => {

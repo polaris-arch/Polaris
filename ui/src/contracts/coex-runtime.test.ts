@@ -5,8 +5,15 @@ import fixture from './coex-runtime.rust.fixture.json';
 import { decodeCoexRuntimeState } from './coex-runtime';
 const latest = () => structuredClone(fixture.states.latest);
 describe('actual runtime Rust serializer boundary', () => {
-  it('pins the actual producer sources', () => {
-    for (const [path, sha] of Object.entries(fixture.producer.sourceSha256)) expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
+  it('pins original serializer sources and the current graph without relabeling actual exported states', () => {
+    expect(fixture.sourceCompatibility.newSerializerExecution).toBe(false);
+    for (const path of fixture.sourceCompatibility.unchangedOriginalSources) {
+      expect(fixture.sourceCompatibility.sourceSha256[path as keyof typeof fixture.sourceCompatibility.sourceSha256])
+        .toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
+    }
+    for (const [path, sha] of Object.entries(fixture.sourceCompatibility.sourceSha256)) {
+      expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
+    }
   });
   it.each(Object.entries(fixture.states))('decodes actual %s state without changing inner trust', (_name, state) => {
     const decoded = decodeCoexRuntimeState(state); expect(decoded).toEqual(state);

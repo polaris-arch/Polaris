@@ -488,7 +488,10 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
         assert_eq!(stop(&h, target), NativeBirthStop::Unknown { target });
         assert_eq!(
             handle_selected(&h, "real-token", Request::NativeStatusBirth),
-            HandleOutcome::AuthFailed
+            HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+                polaris_helper_proto::ErrorCode::Auth,
+                "slot-owned-by-other-user",
+            )))
         );
         assert!(matches!(
             handle_selected(
@@ -504,7 +507,7 @@ fn poisoned_empty_or_cached_slot_never_attests_empty_stopped_or_admission() {
                     }
                 )
             ),
-            HandleOutcome::AuthFailed
+            HandleOutcome::Respond(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Auth
         ));
         for request in [
             Request::Status,
@@ -538,7 +541,10 @@ fn poisoned_live_slot_retains_exact_birth_and_cannot_retire_after_native_exit() 
     poison_child_state(&h);
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::AuthFailed
+        HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+            polaris_helper_proto::ErrorCode::Auth,
+            "slot-owned-by-other-user",
+        )))
     );
     assert_eq!(stop(&h, target), NativeBirthStop::Unknown { target });
     assert!(h.reap_child_on_exit().is_err());
@@ -567,7 +573,9 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     assert!(h.reap_child_on_exit().is_err());
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::AuthFailed
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Unknown { target: None },
+        )))
     );
     assert_eq!(ops.native_stop_calls(), 0);
 
@@ -704,4 +712,67 @@ fn other_user_route_and_start_share_the_complete_control_reservation() {
     assert!(matches!(h.dispatch(route, Some(&peer)),
         HandleOutcome::Respond(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Auth));
     assert_eq!(ops.snapshot().route_calls, 1);
+}
+
+#[test]
+fn cleanup_rechecks_the_actual_owner_after_empty_slot_admission() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let other = crate::user_control::NativePeer {
+        identity: polaris_helper_proto::core_protocol::CallerIdentity::windows(
+            "S-1-5-21-1-2-3-1001",
+        )
+        .unwrap(),
+        administrator: false,
+    };
+    // B was admitted against an empty slot. A takes ownership before the
+    // cleanup body sees it; admission alone must never authorize stopping A.
+    assert!(h.child_mu.lock().unwrap().native.is_none());
+    let target = start(&h, false);
+    assert!(matches!(h.handle_cleanup(Some(&other)),
+        HandleOutcome::Respond(Response::Err(error))
+            if error.code == polaris_helper_proto::ErrorCode::Auth));
+    assert_eq!(ops.native_stop_calls(), 0);
+    assert_eq!(
+        h.child_mu.lock().unwrap().native.as_ref().unwrap().target,
+        target
+    );
+    assert_eq!(
+        h.handle_cleanup(Some(&h.test_context.as_ref().unwrap().peer)),
+        HandleOutcome::Respond(Response::Ok(ResponseKind::Cleaned))
+    );
+    assert_eq!(ops.native_stop_calls(), 1);
+}
+
+#[test]
+fn cleanup_cannot_cross_an_in_progress_control_reservation() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let target = start(&h, false);
+    let reservation = h.control_mu.lock().unwrap();
+    let (entered, ready) = std::sync::mpsc::channel();
+    let (finished, observed) = std::sync::mpsc::channel();
+    let premature = std::thread::scope(|scope| {
+        let h = &h;
+        scope.spawn(move || {
+            entered.send(()).unwrap();
+            finished
+                .send(handle_selected(h, "real-token", Request::Cleanup))
+                .unwrap();
+        });
+        ready.recv().unwrap();
+        let premature = observed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let stops = ops.native_stop_calls();
+        drop(reservation); // Always release even if the old implementation bypasses it.
+        assert_eq!(stops, 0);
+        premature
+    });
+    assert!(
+        !premature,
+        "cleanup bypassed Start/network control reservation"
+    );
+    assert_eq!(ops.native_stop_calls(), 1);
+    assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
 }

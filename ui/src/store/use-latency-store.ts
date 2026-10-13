@@ -198,32 +198,34 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
     if (!alive) return;
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     if (inFlight) { pending = true; return; }
-    const state = useAppStore.getState();
-    if (!state.config) return;
+    const config = useAppStore.getState().config;
+    const proxyStatus = useAppStore.getState().proxyStatus;
+    if (!config) return;
     inFlight = true;
     const ticket = epoch;
-    const version = configBaseVersion(state.config);
-    const context = connectionKey(state.proxyStatus);
+    const version = configBaseVersion(config);
+    const context = connectionKey(proxyStatus);
     try {
-      if (hashInput !== state.config || !hashPromise) {
-        hashInput = state.config; hashPromise = configContentDigest(state.config);
+      if (hashInput !== config || !hashPromise) {
+        hashInput = config; hashPromise = configContentDigest(config);
       }
       const digest = await hashPromise;
       if (!alive || ticket !== epoch) return;
       const result = await api.server.speedTestResultSnapshot();
-      const current = useAppStore.getState();
-      if (!alive || ticket !== epoch || !current.config || configBaseVersion(current.config) !== version
-        || connectionKey(current.proxyStatus) !== context) return;
+      const currentConfig = useAppStore.getState().config;
+      const currentProxyStatus = useAppStore.getState().proxyStatus;
+      if (!alive || ticket !== epoch || !currentConfig || configBaseVersion(currentConfig) !== version
+        || connectionKey(currentProxyStatus) !== context) return;
       if (!validMeasurementSnapshot(result)
         || result.configVersion !== version || result.frontendConfigDigest !== digest || !result.consistent
-        || current.proxyStatus?.running === true && (result.generation !== current.proxyStatus.mainGeneration
-          || result.startTime !== (current.proxyStatus.startTime ?? null))
-        || current.proxyStatus?.running === false && result.generation !== null) {
+        || currentProxyStatus?.running === true && (result.generation !== currentProxyStatus.mainGeneration
+          || result.startTime !== (currentProxyStatus.startTime ?? null))
+        || currentProxyStatus?.running === false && result.generation !== null) {
         useLatencyStore.getState().invalidate(true); return;
       }
       const prior = useLatencyStore.getState().snapshot;
       if (prior?.process === result.process && BigInt(prior.revision) > BigInt(result.revision)) return;
-      useLatencyStore.getState().applySnapshot(result, current.config.servers);
+      useLatencyStore.getState().applySnapshot(result, currentConfig.servers);
       snapshotMono = performance.now(); snapshotWall = Date.now();
       nextExpiry = earliestExpiry(result, result.now);
     } catch {

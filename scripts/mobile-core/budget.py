@@ -76,6 +76,8 @@ def inherited(fd, work, value, root):
         info, actual = os.fstat(fd), path.lstat()
         require(stat.S_ISREG(actual.st_mode) and (info.st_dev, info.st_ino) == (actual.st_dev, actual.st_ino) and
                 info.st_dev == work.stat().st_dev and info.st_uid == os.getuid() and info.st_nlink == 1 and
+                stat.S_IMODE(info.st_mode) == 0o600 and not path.is_symlink() and
+                row['filesystem'] == info.st_dev and Path(row['work']).stat().st_dev == info.st_dev and
                 row['schema'] == 'polaris-mobile-filesystem-reservation-v1' and
                 row['reserveBytes'] >= value['budget']['buildPeakReserveBytes'], 'inherited reservation identity differs')
         # On an inherited open-file description this retains the existing lock;
@@ -88,11 +90,8 @@ def inherited(fd, work, value, root):
 @contextlib.contextmanager
 def reservation(work, value, active_fds):
     work = directory(work)
-    if os.environ.get('GITHUB_ACTIONS') == 'true':
-        require(os.statvfs(work).f_bavail * os.statvfs(work).f_frsize >= value['budget']['buildPeakReserveBytes'],
-                'hosted build peak reserve unavailable')
-        yield
-        return
+    # Hosted and local builders use the same child-held ledger descriptor.
+    # A free-space observation alone cannot admit/transport a reservation.
     # All local formal mobile entries share one ledger on this filesystem.
     # An explicit root supports an external build volume; all concurrent callers
     # on that volume must use the same root.

@@ -1405,6 +1405,24 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
 });
 
 describe('⑤ 喂数腿：移动端读的每一格 store 状态都有写入方（W-23 / W-24 住在这一面上）', () => {
+  it('共享测量 feed 是数字写入与撤回的真实调用方，不把共享内部 action 伪登记为移动直接读点', () => {
+    const source = strip(readFileSync(join(REPO, 'ui/src/store/use-latency-store.ts'), 'utf8'));
+    expect(source).toContain('applySnapshot(result, currentConfig.servers)');
+    expect(source).toContain('useLatencyStore.getState().invalidate(true)');
+    expect(source).toContain('const ticket = epoch;');
+    expect(source).toContain('ticket !== epoch');
+    expect(source).toContain('api.server.speedTestResultSnapshot()');
+    expect(source).toContain('api.server.onSpeedTestResult(schedule)');
+    expect(source).toContain('api.server.onSpeedTestSchedule(schedule)');
+    for (const id of ['useLatencyStore.applySnapshot', 'useLatencyStore.invalidate']) {
+      expect(FEED_FACE.has(id)).toBe(false);
+      expect(MOBILE_FEEDS.some(row => row.id === id)).toBe(false);
+    }
+    for (const id of ['useLatencyStore.projections', 'useLatencyStore.currentProjections', 'useLatencyStore.snapshot', 'useLatencyStore.readError']) {
+      expect(FEED_FACE.has(id)).toBe(true);
+      expect(MOBILE_FEEDS.some(row => row.id === id && row.role === 'state')).toBe(true);
+    }
+  });
   const registered = MOBILE_FEEDS.map((e) => e.id);
 
   it('移动端读点面 ≡ 喂数腿登记表', () => {

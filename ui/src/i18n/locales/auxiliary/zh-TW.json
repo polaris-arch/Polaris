@@ -21,7 +21,6 @@
     "noEffectInDirect": "直連模式下無效",
     "groupManual": "自建節點",
     "groupMesh": "組網",
-    "timeout": "逾時",
     "cancelStartup": "取消啟動",
     "disconnect": "斷開代理",
     "connect": "連接代理",

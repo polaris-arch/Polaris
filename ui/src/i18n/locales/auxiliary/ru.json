@@ -21,7 +21,6 @@
     "noEffectInDirect": "Не работает в «Напрямую»",
     "groupManual": "Свои узлы",
     "groupMesh": "Mesh-сеть",
-    "timeout": "тайм-аут",
     "cancelStartup": "Отменить запуск",
     "disconnect": "Отключить",
     "connect": "Подключить",

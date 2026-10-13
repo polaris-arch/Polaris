@@ -870,7 +870,10 @@ fn unix_rollback_restores_helper_descriptor_receipt_and_keeps_failed_recovery() 
         assert!(script.contains("restore_service || OK=0"));
         assert!(script.contains("if [ \"$OK\" -eq 1 ]"));
         assert!(script.contains("recovery transaction retained: $TXDIR"));
-        assert!(script.contains("mkdir -m 0700 \"$LOCK\""));
+        assert!(script.contains("exec 9>>\"$LOCK\""));
+        assert!(script.contains("lease-acquire --lock \"$LOCK\" --fd 9"));
+        assert!(script.contains("helper-admission.XXXXXX"));
+        assert!(script.contains("helper-upgrade.${TXDIR##*.}"));
         assert!(script.contains("HELPER_INSTALL_TRANSACTION_BUSY"));
     }
 }
@@ -1479,5 +1482,132 @@ fn unix_install_retains_recovery_and_never_guesses_dead_directory_owner() {
         assert!(script.contains("LEGACY_HELPER_INSTALL_RECOVERY_REQUIRED"));
         assert!(script.contains("exec 9>>"));
         assert!(!script.contains("rmdir \"$LOCK\""));
+    }
+}
+
+#[test]
+fn unix_install_publishes_initialized_journal_only_after_admission_and_cleans_before_unlock() {
+    for script in unix_scripts() {
+        let stage = script.find("helper-admission.XXXXXX").unwrap();
+        let acquire = script.find("lease-acquire --lock").unwrap();
+        let kind = script.find("polaris-helper-upgrade-v1 >").unwrap();
+        let publish = script.find("mv \"$TXDIR\" \"$PUBLISHED\"").unwrap();
+        assert!(stage < acquire && acquire < kind && kind < publish);
+        assert!(!script.contains("mktemp -d \"$SUPPORT/helper-upgrade."));
+        let cleanup = script
+            .split("cleanup() {\n")
+            .nth(1)
+            .unwrap()
+            .split("\n}\ntrap cleanup")
+            .next()
+            .unwrap();
+        assert!(cleanup.find("rm -rf \"$TXDIR\"").unwrap() < cleanup.find("exec 9>&-").unwrap());
+        let rollback = script
+            .split("rollback() {\n")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(rollback.find("rm -rf \"$TXDIR\"").unwrap() < rollback.find("exec 9>&-").unwrap());
+        assert!(!rollback.contains("lease-release"));
+        assert!(script.contains("case \"$(cat \"$OLD/transaction-phase\")\" in"));
+        assert!(script.contains("staging) rm -rf \"$OLD\";;"));
+        assert!(script.contains("admission)"));
+        assert!(script.contains("completed) rm -rf \"$OLD\";;"));
+        assert!(script.contains("*) echo \"HELPER_INSTALL_RECOVERY_REQUIRED $OLD\""));
+        assert!(script.contains("set_phase service-mutation"));
+        assert!(script.contains("set_phase completed"));
+    }
+}
+
+#[cfg(unix)]
+mod unix_journal_recovery {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    fn recover(
+        phase: &str,
+        cancel_succeeds: bool,
+        unknown: bool,
+    ) -> (tempfile::TempDir, PathBuf, bool) {
+        let fixture = tempfile::tempdir().unwrap();
+        let support = fixture.path();
+        let old = support.join("helper-upgrade.previous");
+        let admission = support.join("helper-admission.current");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&admission).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).unwrap();
+        let dest = support.join("installed-helper");
+        fs::write(old.join("transaction-kind"), "polaris-helper-upgrade-v1\n").unwrap();
+        fs::write(old.join("transaction-destination"), dest.to_str().unwrap()).unwrap();
+        fs::write(old.join("transaction-phase"), format!("{phase}\n")).unwrap();
+        fs::write(old.join("helper"), b"previous bundled helper bytes").unwrap();
+        if unknown {
+            fs::remove_file(old.join("transaction-kind")).unwrap();
+        }
+        let helper = format!("#!/bin/sh\n[ \"$1\" = cancel-upgrade ] || exit 1\nprintf cancelled > \"$3/cancelled\"\nexit {}\n", if cancel_succeeds { 0 } else { 1 });
+        fs::write(admission.join("helper"), helper).unwrap();
+        fs::set_permissions(admission.join("helper"), fs::Permissions::from_mode(0o700)).unwrap();
+        let script = unix_scripts().into_iter().nth(1).unwrap();
+        let begin = script
+            .find("for OLD in \"$SUPPORT\"/helper-upgrade.*; do")
+            .unwrap();
+        let end = begin + script[begin..].find("\nPUBLISHED=").unwrap();
+        // Root ownership is a simulated identity in this unprivileged fixture;
+        // actual mode/link/marker/phase/destination operations are unchanged.
+        let owner = if cfg!(target_os = "macos") {
+            "stat -f '%Lp' \"$1\""
+        } else {
+            "stat -c '%a' \"$1\""
+        };
+        let prefix = format!(
+            "set -eu\nSUPPORT={}\nDEST={}\nTXDIR={}\nowner_mode() {{ printf '0:'; {owner}; }}\n",
+            shell_quote(support.to_str().unwrap()),
+            shell_quote(dest.to_str().unwrap()),
+            shell_quote(admission.to_str().unwrap())
+        );
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{prefix}{}", &script[begin..end]))
+            .output()
+            .unwrap();
+        (fixture, old, output.status.success())
+    }
+
+    #[test]
+    fn known_pre_mutation_or_completed_journal_retires_but_partial_service_mutation_does_not() {
+        for phase in ["staging", "completed"] {
+            let (_fixture, old, success) = recover(phase, false, false);
+            assert!(success, "{phase}");
+            assert!(!old.exists());
+        }
+        for phase in ["service-mutation", "unknown"] {
+            let (_fixture, old, success) = recover(phase, true, false);
+            assert!(!success, "{phase}");
+            assert!(old.exists());
+        }
+        let (_fixture, old, success) = recover("staging", true, true);
+        assert!(!success);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn possibly_accepted_upgrade_reservation_is_cancelled_before_retirement_and_failed_cancel_is_retained(
+    ) {
+        for accepted in [true, false] {
+            let (fixture, old, success) = recover("admission", accepted, false);
+            assert_eq!(success, accepted);
+            assert_eq!(old.exists(), !accepted);
+            assert!(fixture.path().join("cancelled").exists());
+        }
+        let (fixture, _old, success) = recover("staging", false, false);
+        assert!(success);
+        assert!(
+            !fixture.path().join("cancelled").exists(),
+            "no daemon exists yet in staging"
+        );
     }
 }

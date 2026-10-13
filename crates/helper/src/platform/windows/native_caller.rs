@@ -149,7 +149,10 @@ fn administrator(token: &Token, caller: &CallerIdentity) -> io::Result<bool> {
     unsafe_code,
     reason = "capture authenticated named-pipe token before privileged dispatch"
 )]
-pub fn from_pipe(pipe: HANDLE) -> io::Result<NativePeer> {
+/// # Safety
+/// `pipe` must be a live connected pipe HANDLE retained by this worker for the
+/// entire capture. It must not be concurrently closed or replaced.
+pub unsafe fn from_pipe(pipe: HANDLE) -> io::Result<NativePeer> {
     // SAFETY: caller retains the connected pipe handle throughout this synchronous capture.
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         return Err(io::Error::last_os_error());

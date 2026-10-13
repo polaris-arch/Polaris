@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::runtime::proxy::DirectCoreSlot;
 
+#[cfg(any(test, target_os = "macos"))]
 use polaris_helper_client::ClientError;
 #[cfg(test)]
 use polaris_helper_client::ConnectionStream;
@@ -34,8 +35,8 @@ use polaris_helper_client::{
 };
 use polaris_helper_proto::{
     FlushDns, HelperBirthTarget, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
-    LinuxDnsSetParams, LinuxStartParams, NativeBirthStart, NativeBirthStatus, NativeBirthStop,
-    Platform, Request, Response, ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams,
+    LinuxDnsSetParams, NativeBirthStart, NativeBirthStatus, NativeBirthStop, Platform, Request,
+    Response, ResponseKind, RouteParams, Start, StartNotAdmitted, StartParams,
     Status as CoreStatus, Stop,
 };
 use polaris_system_integration::dns_flush::HelperFlushResult;
@@ -1291,14 +1292,6 @@ impl HelperRuntime {
             .build_client()
             .map_err(BirthCapabilityError::Unavailable)?;
         require_native_birth_capability_with_client(&client)
-    }
-
-    /// Root/SYSTEM content-store root, shared with administrator installation.
-    /// Executables live below immutable versions/<CoreID>; old flat objects are
-    /// preserved while native use is active or unknown.
-    #[must_use]
-    pub fn protected_core_dir_path(&self) -> PathBuf {
-        InstallPaths::for_platform(self.platform).core_dir
     }
 
     /// 经 helper 停核（对称：经 helper 起的核经 helper stop）。daemon `stop` 摘其受管 child → 终止 →

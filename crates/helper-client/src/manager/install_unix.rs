@@ -56,29 +56,55 @@ cleanup() {{
   rc=$?
   trap - EXIT HUP INT TERM
   if [ "$ADMITTED" -eq 1 ]; then "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || {{ touch "$TXDIR/recovery-required"; rc=1; }}; fi
-  if [ "$LEASED" -eq 1 ]; then "$TXDIR/helper" lease-release --lock "$LOCK" --fd 9 || {{ touch "$TXDIR/recovery-required"; rc=1; }}; fi
+  # Cleanup is part of the lease transaction. Closing fd 9 releases the kernel
+  # lease only after the journal has disappeared; the helper lives in TXDIR.
   if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR"; fi
+  exec 9>&-
   exit "$rc"
 }}
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-TXDIR=$(mktemp -d "$SUPPORT/helper-upgrade.XXXXXX")
+TXDIR=$(mktemp -d "$SUPPORT/helper-admission.XXXXXX")
 chmod 0700 "$TXDIR"
 cp {source} "$TXDIR/helper"
 chown root:"$GROUP" "$TXDIR/helper"; chmod 0755 "$TXDIR/helper"
 cp {manifest} "$TXDIR/core-manifest.json"
 chown root:"$GROUP" "$TXDIR/core-manifest.json"; chmod 0600 "$TXDIR/core-manifest.json"
 hash_file() {{ {hash_command}; }}
+owner_mode() {{ {owner_mode}; }}
 [ "$(hash_file "$TXDIR/helper")" = {helper_hash} ] || {{ echo HELPER_BUNDLE_MISMATCH >&2; exit 1; }}
 [ "$(hash_file "$TXDIR/core-manifest.json")" = {manifest_hash} ] || {{ echo CORE_BUNDLE_MISMATCH >&2; exit 1; }}
 "$TXDIR/helper" lease-acquire --lock "$LOCK" --fd 9 || {{ echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }}
 LEASED=1
-# An interrupted transaction is an independent recovery object, not a stale
-# directory lock. Preserve it and refuse replacement until exact recovery.
-for OLD in "$SUPPORT"/helper-upgrade.*; do
-  [ "$OLD" = "$TXDIR" ] || [ ! -d "$OLD" ] || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
-done
+# Admission bytes live outside the recovery namespace until the lease is held.
+# Publish the initialized journal by same-directory rename, never mkdir there.
+printf '%s\n' polaris-helper-upgrade-v1 > "$TXDIR/transaction-kind"
+printf '%s' "$DEST" > "$TXDIR/transaction-destination"
 printf '%s\n' staging > "$TXDIR/transaction-phase"
+for OLD in "$SUPPORT"/helper-upgrade.*; do
+  [ -e "$OLD" ] || [ -L "$OLD" ] || continue
+  [ -d "$OLD" ] && [ ! -L "$OLD" ] && [ "$(owner_mode "$OLD")" = '0:700' ] || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+  for OBJECT in "$OLD/transaction-kind" "$OLD/transaction-destination" "$OLD/transaction-phase" "$OLD/helper"; do
+    [ -f "$OBJECT" ] && [ ! -L "$OBJECT" ] || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+  done
+  [ "$(cat "$OLD/transaction-kind")" = polaris-helper-upgrade-v1 ] && printf '%s' "$DEST" | cmp -s - "$OLD/transaction-destination" || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+  [ ! -e "$OLD/recovery-required" ] && [ ! -L "$OLD/recovery-required" ] || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+  case "$(cat "$OLD/transaction-phase")" in
+    staging) rm -rf "$OLD";;
+    admission)
+      # These phases precede any service mutation. Cancel a possibly accepted
+      # upgrade reservation with the current sealed utility before retirement.
+      "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || {{ echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75; }}
+      rm -rf "$OLD";;
+    completed) rm -rf "$OLD";;
+    *) echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2; exit 75;;
+  esac
+done
+PUBLISHED="$SUPPORT/helper-upgrade.${{TXDIR##*.}}"
+[ ! -e "$PUBLISHED" ] && [ ! -L "$PUBLISHED" ] || exit 75
+mv "$TXDIR" "$PUBLISHED"
+TXDIR="$PUBLISHED"
+set_phase() {{ printf '%s\n' "$1" > "$TXDIR/transaction-phase.next" && mv -f "$TXDIR/transaction-phase.next" "$TXDIR/transaction-phase"; }}
 printf '%s' {token} > "$TXDIR/user-token"
 chmod 0600 "$TXDIR/user-token"
 "$TXDIR/helper" core-install --root "$COREDIR" --source {payload} --manifest "$TXDIR/core-manifest.json" --source-owner {identity}
@@ -119,8 +145,8 @@ rollback() {{
     "$TXDIR/helper" cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || OK=0
   fi
   rm -f "$DEST.new.$$" "$DESCRIPTOR.new.$$" "$RECORD.new.$$"
-  if [ "$LEASED" -eq 1 ]; then "$TXDIR/helper" lease-release --lock "$LOCK" --fd 9 || OK=0; fi
   if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR"; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
+  exec 9>&-
   exit "$rc"
 }}
 "#,
@@ -145,6 +171,11 @@ rollback() {{
             "shasum -a 256 \"$1\" | awk '{print $1}'"
         } else {
             "sha256sum \"$1\" | awk '{print $1}'"
+        },
+        owner_mode = if mac {
+            "stat -f '%u:%Lp' \"$1\""
+        } else {
+            "stat -c '%u:%a' \"$1\""
         },
         token = shell_quote(token),
         payload = shell_quote(
@@ -247,13 +278,14 @@ cat > "$TXDIR/descriptor" <<'POLARIS_DESCRIPTOR_EOF'
     };
     let admission = r#"trap rollback EXIT
 if [ "$WAS_ACTIVE" -eq 1 ]; then
+  set_phase admission
   if ! "$TXDIR/helper" prepare-upgrade --support "$SUPPORT"; then
     echo HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY >&2
     exit 75
   fi
   ADMITTED=1
 fi
-printf '%s\n' service-mutation > "$TXDIR/transaction-phase"
+set_phase service-mutation
 MUTATED=1
 if [ "$WAS_ACTIVE" -eq 1 ]; then stop_service; fi
 if [ "$KEEP_HELPER" -eq 0 ]; then
@@ -294,7 +326,7 @@ fi
 "#,
         id = shell_quote(params.core_id.as_str())
     );
-    format!("{header}{platform}{retain}{admission}{grant}{takeover}ADMITTED=0\ntrap cleanup EXIT\necho polaris-helper-install-ok\n")
+    format!("{header}{platform}{retain}{admission}{grant}{takeover}ADMITTED=0\nset_phase completed\ntrap cleanup EXIT\necho polaris-helper-install-ok\n")
 }
 
 pub(super) fn build_mac_install_script(

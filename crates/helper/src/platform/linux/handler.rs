@@ -18,7 +18,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -201,43 +201,52 @@ pub fn handle<P, S, D, SD>(
             return;
         }
         let previous_owner = guard.dns_owner;
+        let previous_birth = guard.dns_birth.clone();
+        let reservation_birth = guard.child.as_ref().map(|child| child.handle().clone());
+        guard.dns_birth = reservation_birth.clone().or(previous_birth.clone());
         guard.dns_busy = true; // reservation, not proof that DNS was modified
         drop(guard);
-        let reverting = command == lcmd::RESOLVED_DNS_REVERT;
-        let (success, cleared) = if reverting {
-            let success = handle_resolved_dns_revert(deps.resolved_dns, conn);
-            (success, success)
+        let outcome = if command == lcmd::RESOLVED_DNS_REVERT {
+            handle_resolved_dns_revert(deps.resolved_dns, conn)
         } else {
             handle_resolved_dns_set(deps.resolved_dns, conn)
         };
-        // Inspect the reaper's handoff while holding the final state lock.
-        // A birth exit cannot set pending between observation and completion.
         if let Ok(mut guard) = state.lock() {
-            if guard.dns_cleanup_pending {
+            match outcome {
+                DnsChange::Applied => {
+                    guard.dns_owner = Some(cred.uid);
+                    guard.dns_birth = reservation_birth;
+                }
+                DnsChange::Restored => {
+                    guard.dns_owner = None;
+                    guard.dns_birth = None;
+                }
+                DnsChange::Unmodified => {
+                    guard.dns_owner = previous_owner;
+                    guard.dns_birth = previous_birth;
+                }
+                DnsChange::Unconfirmed => {
+                    guard.dns_owner = previous_owner.or(Some(cred.uid));
+                }
+            }
+            if guard.dns_cleanup_pending && guard.dns_owner.is_some() {
                 drop(guard);
                 let cleanup_cleared = deps
                     .resolved_dns
                     .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
                     .is_ok();
                 if let Ok(mut guard) = state.lock() {
-                    guard.dns_owner = if cleanup_cleared {
-                        None
-                    } else {
-                        previous_owner.or(Some(cred.uid))
-                    };
-                    guard.dns_cleanup_pending = false;
+                    if cleanup_cleared {
+                        guard.dns_owner = None;
+                        guard.dns_birth = None;
+                    }
+                    guard.dns_cleanup_pending = !cleanup_cleared;
                     guard.dns_busy = false;
                 }
             } else {
-                guard.dns_owner = if reverting && success {
-                    None
-                } else if success {
-                    Some(cred.uid)
-                } else if cleared {
-                    previous_owner
-                } else {
-                    previous_owner.or(Some(cred.uid))
-                };
+                // A failed rollback/revert leaves retained DNS responsibility;
+                // another Start cannot reuse the slot until a real restore.
+                guard.dns_cleanup_pending = matches!(outcome, DnsChange::Unconfirmed);
                 guard.dns_busy = false;
             }
         }
@@ -280,6 +289,7 @@ fn dispatch_locked<P, S, D, SD>(
                 return;
             }
             if state.dns_busy
+                || state.dns_cleanup_pending
                 || state.dns_owner.is_some()
                 || !matches!(
                     deps.spawner
@@ -397,42 +407,67 @@ fn legacy_command_rejected(
 
 // ===== 各命令处理（逐分支对照 Go 源）=====
 
-fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> (bool, bool) {
+/// A refused request is distinct from a confirmed rollback of existing DNS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsChange {
+    Applied,
+    Unmodified,
+    Restored,
+    Unconfirmed,
+}
+
+fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> DnsChange {
     let interface_name = conn.read_line();
     let server_ip = conn.read_line();
-    let mut cleared = false;
-    let response = match ops.takeover(&interface_name, &server_ip) {
-        Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Set)),
+    if !polaris_helper_proto::linux_dns::takeover_request_allowed(&interface_name, &server_ip) {
+        let _ = conn.write_line("ERR resolved-dns request denied by Polaris resolved whitelist");
+        return DnsChange::Unmodified;
+    }
+    let (response, outcome) = match ops.takeover(&interface_name, &server_ip) {
+        Ok(()) => (
+            Response::Ok(ResponseKind::LinuxDns(LinuxDns::Set)),
+            DnsChange::Applied,
+        ),
         Err(error) => {
-            // Only the fixed admitted link can be reverted. Invalid requests
-            // are known not to have modified DNS; otherwise require real revert.
-            cleared = !polaris_helper_proto::linux_dns::takeover_request_allowed(
-                &interface_name,
-                &server_ip,
-            ) || ops.revert(&interface_name).is_ok();
+            let outcome = if ops.revert(&interface_name).is_ok() {
+                DnsChange::Restored
+            } else {
+                DnsChange::Unconfirmed
+            };
+            (
+                Response::Err(ProtoError::with_detail(
+                    ErrorCode::ResolvedDns,
+                    single_line_wire_detail(&error),
+                )),
+                outcome,
+            )
+        }
+    };
+    let _ = conn.write_line(&response.to_wire_line());
+    outcome
+}
+
+fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> DnsChange {
+    let interface_name = conn.read_line();
+    if interface_name != polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME {
+        let _ = conn.write_line("ERR resolved-dns request denied by Polaris resolved whitelist");
+        return DnsChange::Unmodified;
+    }
+    let (response, outcome) = match ops.revert(&interface_name) {
+        Ok(()) => (
+            Response::Ok(ResponseKind::LinuxDns(LinuxDns::Reverted)),
+            DnsChange::Restored,
+        ),
+        Err(error) => (
             Response::Err(ProtoError::with_detail(
                 ErrorCode::ResolvedDns,
                 single_line_wire_detail(&error),
-            ))
-        }
+            )),
+            DnsChange::Unconfirmed,
+        ),
     };
-    let success = matches!(response, Response::Ok(_));
     let _ = conn.write_line(&response.to_wire_line());
-    (success, cleared)
-}
-
-fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> bool {
-    let interface_name = conn.read_line();
-    let response = match ops.revert(&interface_name) {
-        Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Reverted)),
-        Err(error) => Response::Err(ProtoError::with_detail(
-            ErrorCode::ResolvedDns,
-            single_line_wire_detail(&error),
-        )),
-    };
-    let success = matches!(response, Response::Ok(_));
-    let _ = conn.write_line(&response.to_wire_line());
-    success
+    outcome
 }
 
 /// helper wire 一次响应只能占一行；resolvectl stderr 可能含换行，必须先压平，避免截断诊断或注入伪帧。
@@ -565,7 +600,8 @@ fn handle_birth_stop<P, S, D, SD>(
     let outcome = match deps.spawner.stop_birth(&target) {
         StopReap::Reaped => {
             if same_current {
-                state.child = None;
+                let handle = state.child.as_ref().unwrap().handle().clone();
+                state.retire_birth(&handle);
                 (deps.set_forward)(false);
             }
             LinuxBirthStop::Stopped { target }
@@ -635,7 +671,7 @@ fn handle_stop<P, S, D, SD>(
                 .as_ref()
                 .is_some_and(|child| child.handle().same_birth(&handle))
             {
-                state.child = None;
+                state.retire_birth(&handle);
             }
             (deps.set_forward)(false);
             let response = Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }));
@@ -753,6 +789,7 @@ fn handle_start<P, S, D, SD>(
         return;
     }
     if state.dns_busy
+        || state.dns_cleanup_pending
         || state
             .dns_owner
             .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)

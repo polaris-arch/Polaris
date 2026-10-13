@@ -42,6 +42,7 @@ class ProducerCalls(unittest.TestCase):
                     return '{"Path":"github.com/sagernet/sing-box","Main":true}'
                 return ''
             with ExitStack() as stack:
+                stack.enter_context(patch.object(producer.os, 'uname', return_value=SimpleNamespace(sysname='Darwin')))
                 for name, replacement in {
                     'lease': lease, 'producer_code': lambda: {'candidate': 'a'*40, 'files': {}},
                     'verify_source': lambda *a, **k: {'sourceOverlay': 0}, 'run': run,

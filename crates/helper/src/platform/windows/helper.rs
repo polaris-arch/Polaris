@@ -338,6 +338,7 @@ where
         let _reservation = if matches!(
             &req,
             Request::NativeStartPinned(_)
+                | Request::Cleanup
                 | Request::PrepareHelperUpgrade
                 | Request::CancelHelperUpgrade
                 | Request::RouteAdd(_)
@@ -492,7 +493,7 @@ where
                     ))),
                 }
             }
-            Request::Cleanup => self.handle_cleanup(),
+            Request::Cleanup => self.handle_cleanup(peer),
             Request::Uninstall => {
                 HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
                     polaris_helper_proto::ErrorCode::Other,
@@ -572,10 +573,26 @@ where
         Path::new(&self.support_dir).join("core")
     }
 
-    fn handle_cleanup(&self) -> HandleOutcome {
+    fn handle_cleanup(&self, peer: Option<&crate::user_control::NativePeer>) -> HandleOutcome {
         let Ok(mut state) = self.child_mu.lock() else {
             return native_busy();
         };
+        // Recheck the owner in the exact stop critical section as well as
+        // reserving control across dispatch admission and cleanup.
+        if let Some(peer) = peer {
+            if !peer.administrator
+                && state.native.as_ref().map_or(state.pid.is_some(), |native| {
+                    native.owner.as_ref() != Some(&peer.identity)
+                })
+            {
+                return HandleOutcome::Respond(Response::Err(
+                    polaris_helper_proto::Error::with_detail(
+                        polaris_helper_proto::ErrorCode::Auth,
+                        "slot-owned-by-other-user",
+                    ),
+                ));
+            }
+        }
         if let Some(native) = &state.native {
             let target = native.target;
             if !matches!(

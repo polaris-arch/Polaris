@@ -210,6 +210,31 @@ interface Site {
 
 const SITES: readonly Site[] = [
   {
+    file: "mobile/MeasurementLabel.tsx",
+    shape: "useAppStore(state=>state.config?.servers.find(server=>server…",
+    route: 'disk',
+    why: "对账类：显示实体仍读 effective；磁盘节点仅用于与测量身份对账，暂存编辑不得获得旧数值，订阅暂停只认已保存订阅。",
+  },
+  {
+    file: "mobile/use-qualified-latencies.ts",
+    shape: "useAppStore(state=>state.config?.servers)",
+    route: 'disk',
+    why: "对账类：排序资格与已保存节点逐字节对账，暂存同 id 修改不能继承历史 RTT；展示集合由 effective 入参提供。",
+  },
+  {
+    file: "store/use-latency-store.ts",
+    shape: "useAppStore.getState().config",
+    route: 'disk',
+    why: "对账类：权威测量快照必须绑定保存配置版本/摘要；读前与异步回包后复核同一 epoch，不改变 effective 编辑展示。",
+  },
+  {
+    file: "store/use-latency-store.ts",
+    shape: "useAppStore.subscribe((next,previous)=>{if(next.config!==pre…",
+    route: 'disk',
+    why: "对账类：保存配置或运行上下文变更撤回旧测量资格，触发权威读回；暂存变化不冒充保存事件。",
+  },
+
+  {
     file: 'store/app-store.ts',
     shape: 'useAppStore.subscribe((state,previous)=>{if(state.config!==p…',
     route: 'disk',
@@ -398,6 +423,42 @@ interface MirrorSite {
 }
 
 const MIRROR_SITES: readonly MirrorSite[] = [
+  {
+    file: "mobile/MeasurementLabel.tsx",
+    shape: "useAppStore(state=>state.config?.servers.find(server=>server…",
+    count: 1,
+    surface: 'operation',
+    why: "对账类：显示实体仍读 effective；磁盘节点仅用于与测量身份对账，暂存编辑不得获得旧数值，订阅暂停只认已保存订阅。",
+  },
+  {
+    file: "mobile/use-qualified-latencies.ts",
+    shape: "useAppStore(state=>state.config?.servers)",
+    count: 1,
+    surface: 'operation',
+    why: "对账类：排序资格与已保存节点逐字节对账，暂存同 id 修改不能继承历史 RTT；展示集合由 effective 入参提供。",
+  },
+  {
+    file: "components/screens/nodes/NodesBatchBar.tsx",
+    shape: "useAppStore(state=>state.servers)",
+    count: 1,
+    surface: 'operation',
+    why: "按 id 删除对账：批量删除只允许后端保存节点，保护订阅节点，不能把暂存集合当可删除事实。",
+  },
+  {
+    file: "components/screens/nodes/use-node-deletion.ts",
+    shape: "useAppStore.getState().servers",
+    count: 1,
+    surface: 'operation',
+    why: "按 id 删除对账：提交前核已保存节点所有权，订阅节点不可由暂存编辑绕过保护。",
+  },
+  {
+    file: "mobile/nodes/node-deletion.ts",
+    shape: "useAppStore.getState().servers",
+    count: 1,
+    surface: 'operation',
+    why: "按 id 删除对账：移动删除同样以磁盘订阅所有权作准入，不依据 effective 暂存变化。",
+  },
+
   {
     file: 'mobile/use-mobile-speed-test.ts',
     shape: 'useAppStore.getState().servers.some',

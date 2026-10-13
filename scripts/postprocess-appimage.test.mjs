@@ -372,7 +372,8 @@ for (const component of ['core', 'cronet']) test(`CLI refuses a repacker changin
 function linuxPayloadFixture(t) {
   const { root, appDir, source, target } = coreFixture(t);
   restoreCoreSeed(appDir, root);
-  writeFileSync(join(root, 'resources/linux/polaris-helper'), 'helper');
+  // Keep the canonical helper seed and its exact installed manifest identity.
+  // A positive payload fixture must not fail before the intended core/Cronet mutation.
   // The canonical structured Cronet seed and pin were installed by coreFixture.
   copyFileSync(join(root, 'resources/linux/polaris-helper'), join(dirname(join(appDir, APPIMAGE_CORE_MEMBER)), 'polaris-helper'));
   const graphical = makeAppDir({ waylandLibs: [], gioExtra: [], gioModuleDir: [BUNDLED_GIO] });

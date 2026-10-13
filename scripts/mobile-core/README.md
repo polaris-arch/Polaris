@@ -136,6 +136,20 @@ the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runne
 is an environment failure, never grounds to weaken the reservation or skip a
 selected leg. The eventual unified run must establish actual runner resources.
 
+Hosted and local entries now share the same protected reservation ledger and
+inheritable descriptor; hosted admission never substitutes a space-only yield.
+The child's reservation identity includes the actual inode, filesystem, owner,
+private mode and held flock. Compiler children receive that descriptor before
+any Cargo invocation; the Xcode metadata-only verifier does not reuse it.
+
+Both the direct builder and hosted entry materialize the actual iOS config's
+28 `.srs` files and three license/notice texts into the generated
+`gen/apple/assets/_up_` tree before the App link context is frozen. Unknown
+stages or differing retained bytes are preserved and refused. The context binds
+source bytes/modes; the final IPA predicate requires the same complete resource
+inventory, bytes and modes in the real App bundle, alongside App/PacketTunnel
+static-link/source checks. An empty assets folder cannot satisfy the predicate.
+
 The formal builder compiles through `apple_rust.py build` under its inherited
 reservation before Xcode starts; the Xcode Rust phase runs `apple_rust.py verify`
 with the admitted
@@ -143,8 +157,13 @@ link context, explicit Cargo target, locked dependencies and iOS config. It
 checks the actual static archive/start_app and saves its byte/source/tool facts;
 it does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
-check consumes the exact verified Apple static slice rather than a desktop
-binary. SDK origins, real Rust input, final carriers, link maps and original
+check consumes a receipt-bound thin archive selected from the fully inspected
+original container by the actual Cargo CPU and iOS/device or simulator platform.
+For the fat simulator SDK it independently selects arm64 or x86_64, retains the
+original archive pin plus exact offset/length and thin bytes, and rechecks them
+before Xcode link. The Rust release guard validates every code member's Cargo
+CPU/subtype and platform before scanning that selected archive's descriptor;
+a whole fat input is rejected. Original component/producer bytes are unchanged. SDK origins, real Rust input, final carriers, link maps and original
 logs are retained in one indexed evidence ZIP; entire caches/checkout/target
 copies are excluded. Failed chains retain partial evidence without acceptance.
 

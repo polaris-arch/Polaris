@@ -191,7 +191,7 @@ pub fn decode_request<I: Iterator<Item = String>>(
             Ok(Request::FreePort { port })
         }
         "start" | polaris_helper_proto::command::common::NATIVE_START_BIRTH => {
-            return Err(DecodeError::UnknownCommand(command.into()));
+            Err(DecodeError::UnknownCommand(command.into()))
         }
 
         "route-add" | "route-del" => {

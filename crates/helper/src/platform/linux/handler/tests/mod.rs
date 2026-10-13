@@ -7,6 +7,7 @@ use crate::platform::linux::state::{
     BirthAdmission, CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore,
     StartAdmission, StopReap,
 };
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 
@@ -1634,7 +1635,7 @@ fn hidden_already_birth_cannot_be_relabeled_with_a_requested_core_id() {
 fn failed_dns_set_releases_reservation_only_after_confirmed_rollback() {
     for rollback_error in [None, Some("rollback failed".to_string())] {
         let (_dir, auth, _core) = setup_env();
-        let peer = StaticPeerCred::new(1000, 1000);
+        let peer = StaticPeerCred::new(0, 0);
         let spawner = MockSpawner::succeeding(100);
         let fp = MockFreePort::empty();
         let systemd = MockSystemd::default();
@@ -1657,7 +1658,164 @@ fn failed_dns_set_releases_reservation_only_after_confirmed_rollback() {
         handle(&state, &deps, &mut conn);
         let state = state.lock().unwrap();
         assert!(!state.dns_busy);
-        assert_eq!(state.dns_owner, rollback_error.map(|_| 1000));
+        assert_eq!(state.dns_cleanup_pending, rollback_error.is_some());
+        assert_eq!(state.dns_owner, rollback_error.map(|_| 0));
         assert_eq!(resolved.calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn refused_dns_request_preserves_previous_state_but_real_rollback_clears_it() {
+    for invalid in [true, false] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let resolved = MockResolvedDns {
+            error: Some("set failed".into()),
+            ..Default::default()
+        };
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        initial.dns_owner = Some(1000);
+        initial.dns_birth = Some(birth.clone());
+        let state = Mutex::new(initial);
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            if invalid {
+                "other-interface"
+            } else {
+                polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME
+            },
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        assert!(conn.writes()[0].starts_with("ERR resolved-dns "));
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        if invalid {
+            assert_eq!(state.dns_owner, Some(1000));
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+            assert!(resolved.calls.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(state.dns_owner, None);
+            assert!(state.dns_birth.is_none());
+            assert_eq!(resolved.calls.lock().unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn synchronous_stop_ack_hands_dns_custody_to_the_same_birth_reaper() {
+    for exact in [false, true] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        spawner
+            .birth_stop_results
+            .lock()
+            .unwrap()
+            .push_back(StopReap::Reaped);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+        let birth = if exact {
+            exact_handle(77, BIRTH_ONE)
+        } else {
+            CoreHandle::new(77)
+        };
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        initial.dns_owner = Some(0);
+        initial.dns_birth = Some(birth.clone());
+        let state = Mutex::new(initial);
+        let mut conn = MockConn::new(if exact {
+            vec![lcmd::STOP_BIRTH_SAFE, "77", BIRTH_ONE]
+        } else {
+            vec!["stop"]
+        });
+        handle(&state, &deps, &mut conn);
+        assert!(conn.writes()[0].starts_with("OK "));
+        let mut state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(state.dns_cleanup_pending);
+        assert_eq!(state.dns_owner, Some(0));
+        assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        let mut next = MockConn::new(vec![]);
+        handle_start(&mut state, &deps, &PeerCred { uid: 0, gid: 0 }, &mut next);
+        assert_eq!(next.writes(), ["ERR slot-owned-or-control-busy"]);
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn reap_during_dns_set_hands_restoration_back_to_the_reserved_operation() {
+    struct ReapDuringSet<'a> {
+        state: &'a Mutex<HandlerState>,
+        fail_revert: bool,
+        calls: StdMutex<usize>,
+    }
+    impl ResolvedDnsOps for ReapDuringSet<'_> {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            assert!(state.dns_busy);
+            let birth = state.child.as_ref().unwrap().handle().clone();
+            state.retire_birth(&birth);
+            Ok(())
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            if self.fail_revert {
+                Err("restore unknown".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for fail_revert in [false, true] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        let state = Mutex::new(initial);
+        let resolved = ReapDuringSet {
+            state: &state,
+            fail_revert,
+            calls: StdMutex::new(0),
+        };
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        let state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_cleanup_pending, fail_revert);
+        assert_eq!(state.dns_owner, fail_revert.then_some(0));
+        assert_eq!(state.dns_birth.is_some(), fail_revert);
+        if fail_revert {
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        }
+        assert_eq!(*resolved.calls.lock().unwrap(), 1);
     }
 }

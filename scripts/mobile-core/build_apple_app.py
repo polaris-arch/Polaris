@@ -31,6 +31,9 @@ def main():
     rust_target = private_dir(args.rust_target or root / 'rust-target')
     require(root.stat().st_dev == component_work.stat().st_dev == rust_target.stat().st_dev == cache.stat().st_dev,
             'App/component/Rust/cache slots must share the reserved filesystem')
+    from consume import materialize_apple_resources
+    with lease(root, cache, value):
+        materialize_apple_resources()
     # The component producer owns its own reservation. Do not sell a second
     # nested peak while waiting for it; the App lease below covers real linking.
     producer_args = [sys_python(), ROOT / 'scripts/mobile-core/producer.py', 'apple']

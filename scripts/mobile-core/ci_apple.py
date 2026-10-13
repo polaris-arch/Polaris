@@ -13,6 +13,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from artifacts import file_pin, read_receipt
 from ci_android import prepare_source
+from consume import materialize_apple_resources
 from fork_input import ROOT, canonical, load, require, sha
 from producer import lease, private_dir, producer_code, run, write_json
 
@@ -73,6 +74,7 @@ def build():
     with lease(private_dir(root / 'frontend-work'), Path(paths['cache']), load()):
         run(['node', ROOT / 'scripts/fetch-dashboard.mjs'], cwd=ROOT, log=root / 'original-dashboard.log')
         run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log')
+        materialize_apple_resources()
     for slot, simulator in CARRIERS:
         command = [sys.executable, ROOT / 'scripts/mobile-core/build_apple_app.py']
         for name, path in paths.items():
@@ -114,6 +116,7 @@ def evidence():
             paths.update(work.glob('*.json'))
             paths.update(work.glob('*.log'))
             paths.update(work.glob('*.ipa'))
+            paths.update(work.glob('wire-*.a'))
             paths.update((work / 'derived-data').rglob('*LinkMap*.txt'))
             for receipt in work.glob('rust-*.json'):
                 target = read_receipt(receipt)['target']

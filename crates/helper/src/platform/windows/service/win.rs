@@ -289,6 +289,10 @@ fn connect_pipe(h: HANDLE) -> bool {
 }
 
 /// 处理一个已连接的管道实例（对应 Go `handle(conn)` 的 IO 部分）。
+#[allow(
+    unsafe_code,
+    reason = "capture peer while this worker retains its connected pipe"
+)]
 fn handle_connection<T, P, N>(h: HANDLE, helper: &WinHelper<T, P, N>)
 where
     T: crate::token::TokenStore,
@@ -315,7 +319,9 @@ where
     // 切行 → 验 token → 解码 → 分派 全在 `handle_frame`（跨平台、Linux 有门）；这里只管 IO。
     // 顺序与各腿的 flush 档位见该方法文档：token 不对时不看命令（已知/未知不可区分），
     // 已鉴权而命令未知的 `ERR unknown` 走 WaitPeer 可靠送达。
-    let peer = match crate::platform::windows::native_caller::from_pipe(h) {
+    // SAFETY: this worker owns the connected pipe until cleanup below; timeout
+    // cancellation has ended and no other worker closes or replaces this handle.
+    let peer = match unsafe { crate::platform::windows::native_caller::from_pipe(h) } {
         Ok(peer) => peer,
         Err(_) => {
             cleanup_pipe(h);

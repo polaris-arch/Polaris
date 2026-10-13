@@ -293,6 +293,8 @@ impl ManagedChild {
 pub struct HandlerState {
     pub upgrade_closed: bool,
     pub dns_owner: Option<u32>,
+    /// Physical birth responsible for the DNS reservation or retained state.
+    pub dns_birth: Option<CoreHandle>,
     pub dns_busy: bool,
     pub dns_cleanup_pending: bool,
     /// Exact current birth. `Stopping` remains present through Pending/Unknown.
@@ -300,6 +302,25 @@ pub struct HandlerState {
 }
 
 impl HandlerState {
+    /// Retire upper custody without discarding the DNS responsibility that the
+    /// native reaper must discharge, including a synchronous Stop acknowledgement.
+    pub(crate) fn retire_birth(&mut self, birth: &CoreHandle) {
+        if self
+            .child
+            .as_ref()
+            .is_some_and(|child| child.handle().same_birth(birth))
+        {
+            self.child = None;
+        }
+        if self
+            .dns_birth
+            .as_ref()
+            .is_some_and(|dns| dns.same_birth(birth))
+        {
+            self.dns_cleanup_pending = true;
+        }
+    }
+
     /// 构造空状态（无 child）。
     #[must_use]
     pub fn new() -> Self {
@@ -307,6 +328,7 @@ impl HandlerState {
             child: None,
             upgrade_closed: false,
             dns_owner: None,
+            dns_birth: None,
             dns_busy: false,
             dns_cleanup_pending: false,
         }

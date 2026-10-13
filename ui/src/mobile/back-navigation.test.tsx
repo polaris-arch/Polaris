@@ -406,6 +406,7 @@ const REGISTRATION_SITES = [
  * 加一处登记要在这里补一行，那正是「新弹层落地」该有的动静。
  */
 const REGISTERED = [
+  'MeasurementStartNotice.tsx::MeasurementStartNotice',
   'MobileInfo.tsx::MobileInfoPanel',
   'MobileSelect.tsx::MobileSelect',
   'connections/ConnectionsView.tsx::ActionSheet',

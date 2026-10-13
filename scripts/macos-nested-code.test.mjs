@@ -469,7 +469,7 @@ test(
     // 反向对照：不设该变量时 compat32 是关的，上面的探测不是恒真。
     assert.notEqual(spawnSync('bash', ['-c', 'shopt -q compat32'], { env: { ...process.env, BASH_COMPAT: '' } }).status, 0);
     for (const env of [{}, { BASH_COMPAT: '3.2' }]) {
-      withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_BARE, 'notes.txt': 'plain' }, {}, (fx) => {
+      withFixture({ 'sing-box': X64_BARE, 'polaris-helper': X64_SIGNED, 'notes.txt': 'plain' }, {}, (fx) => {
         const sealed = run(fx, 'seal', env);
         assert.equal(sealed.status, 0, sealed.stderr);
         assert.match(sealed.stdout, /未签名的 x86_64 1 份.*本次补签 0 份/);

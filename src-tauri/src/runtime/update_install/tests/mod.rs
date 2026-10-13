@@ -619,7 +619,10 @@ fn mac_script_falls_back_to_open_dmg_without_bundle() {
 #[test]
 fn linux_scripts_match_form() {
     let s = String::from_utf8(script_of(&plan_of(InstallPlatform::LinuxAppImage)).bytes).unwrap();
-    assert!(s.contains("chmod +x \"$DEST\""), "覆盖后必须补执行位");
+    assert!(
+        s.contains("chmod 0755 \"$STAGE\""),
+        "候选必须核字节并补执行位后才能替换"
+    );
     assert!(!s.contains("pkexec"), "AppImage 路径绝不提权");
 
     let s = String::from_utf8(script_of(&plan_of(InstallPlatform::LinuxDeb)).bytes).unwrap();
@@ -1120,3 +1123,6 @@ fn appimage_update_stages_exact_bytes_before_mutating_the_existing_image() {
     assert!(!s.contains("rmdir \"$LOCK\""));
     assert!(!s.contains("nohup \"$NEW\""));
 }
+
+#[cfg(unix)]
+mod lease_recovery;

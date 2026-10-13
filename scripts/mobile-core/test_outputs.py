@@ -211,6 +211,37 @@ class FormalOutputs(unittest.TestCase):
                     self.fail('no peak/system margin')
             self.assertEqual(active, [])
 
+    def test_hosted_admission_has_real_descriptor_and_nested_child_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            value = deepcopy(self.value); value['budget']['buildPeakReserveBytes'] = 1024
+            active, nested = [], []
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true',
+                    'POLARIS_BUILD_BUDGET_ROOT': str(root / 'budget')}, clear=True), \
+                    patch('budget.os.statvfs', return_value=type('Space', (), {'f_bavail': 10**12, 'f_frsize': 1})()):
+                with reservation(root / 'work', value, active):
+                    fd = int(os.environ['POLARIS_BUILD_RESERVATION_FD'])
+                    self.assertEqual(active, [fd])
+                    self.assertTrue(os.get_inheritable(fd))
+                    row = json.loads(os.pread(fd, 8192, 0))
+                    self.assertEqual(row['reserveBytes'], 1024)
+                    self.assertEqual(row['filesystem'], (root / 'work').stat().st_dev)
+                    with reservation(root / 'child-work', value, nested):
+                        self.assertEqual(nested, [fd])
+                        self.assertEqual(int(os.environ['POLARIS_BUILD_RESERVATION_FD']), fd)
+                    self.assertEqual(nested, [])
+                    lock = root / 'budget' / row['slot']; lock.chmod(0o644)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, 'identity differs'):
+                            with reservation(root / 'child-work', value, nested):
+                                self.fail('unprotected inherited descriptor admitted')
+                    finally:
+                        lock.chmod(0o600)
+                self.assertEqual(active, [])
+                self.assertNotIn('POLARIS_BUILD_RESERVATION_FD', os.environ)
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
 
 if __name__ == '__main__':
     unittest.main()

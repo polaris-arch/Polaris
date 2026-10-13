@@ -550,26 +550,33 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       'run: bash scripts/gate-android-release-behavior.sh',
     );
     expect(releaseCheck).toContain(
-      'python3 scripts/libbox-patches/verify-receipt.py --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
+      'python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
     );
     expect(releaseCheck).toContain(
       'node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release',
     );
-    // R8 入口随 source-consumption 收敛到 verifier；守住实际委托、必填证据和失败传播。
-    const verifier = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/verify-receipt.py'), 'utf8');
-    const consumption = verifier.slice(verifier.indexOf('def consumption('), verifier.indexOf('\ndef main('));
-    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/assert-r8-evidence.mjs'), str(r8)], cwd=ROOT)");
-    expect(consumption).toContain("builder.run(['node', str(ROOT / 'scripts/verify-apk.mjs'), str(apk), '--abi', item], cwd=ROOT)");
-    const beforePackage = consumption.slice(0, consumption.indexOf('    with zipfile.ZipFile('));
-    expect(beforePackage).not.toMatch(/^\s*try:/m);
-    expect(consumption).not.toMatch(/^\s*except\b/m);
-    expect(verifier).toContain("builder.require(args.r8 is not None, 'APK source consumption requires actual R8 evidence')");
-    expect(verifier).toContain('consumption(args.apk.resolve(), args.abi, args.r8.resolve(), receipt, receipt_path)');
-    expect(verifier).toMatch(/except \([^\n]*subprocess\.CalledProcessError\) as error:\n\s*print\([^\n]*\n\s*sys\.exit\(1\)/);
-    const builder = readFileSync(join(REPO_ROOT, 'scripts/libbox-patches/build.py'), 'utf8');
-    const run = builder.slice(builder.indexOf('def run('), builder.indexOf('\ndef require('));
-    expect(run).toContain('return subprocess.run(args, cwd=cwd, env=env, check=True, text=True,');
-    expect(run).not.toMatch(/^\s*(?:try:|except\b)/m);
+    // Real workflow → formal input wrapper → final carrier → R8/APK checks.
+    const verifier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/ci_android.py'), 'utf8');
+    const verify = verifier.slice(verifier.indexOf('def verify('), verifier.indexOf('\ndef main('));
+    expect(verify).toContain("require(r8 is not None, 'actual APK R8 output required')");
+    expect(verify).toContain("ROOT / 'scripts/mobile-core/carriers.py', 'android'");
+    expect(verify).toContain("'--artifact', apk, '--abi', abi, '--r8', r8");
+    expect(verify).toContain("'--component', Path(paths['work']) / value['android']['outputName']");
+    expect(verify).toContain("'--receipt', Path(paths['work']) / 'component-receipt.json'");
+    expect(verify).toContain('subprocess.run([str(arg) for arg in args], check=True)');
+    expect(verify).not.toMatch(/^\s*(?:try:|except\b)/m);
+    const carrier = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/carriers.py'), 'utf8');
+    const consumption = carrier.slice(carrier.indexOf('def android('), carrier.indexOf('\ndef apple('));
+    expect(consumption).toContain("verify_original(component, receipt_path, 'android', tools, scratch)");
+    expect(consumption).toContain("run(['node', ROOT / 'scripts/assert-r8-evidence.mjs', r8], cwd=ROOT)");
+    expect(consumption).toContain("run(['node', ROOT / 'scripts/verify-apk.mjs', apk, '--abi', target], cwd=ROOT)");
+    expect(consumption).toContain("require(current == material['App'], 'App candidate changed after SDK materialization')");
+    expect(consumption).not.toMatch(/^\s*(?:try:|except\b)/m);
+    const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
+    const run = producer.slice(producer.indexOf('def run('), producer.indexOf('\ndef ', producer.indexOf('def run(') + 1));
+    expect(run).toContain('require(process.returncode == 0,');
+    expect(run).toMatch(/except BaseException:[\s\S]*?\n        raise\n/);
+    expect(run).toContain('register_group(process.pid, finished=True)');
     expect(releaseCheck).toContain(
       'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
     );
@@ -1157,9 +1164,9 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    // 验证腿不上传 APK / SO：唯一的 artifact 只留 R8 四份文本与 S5 原 XML/收据，不碰 release。
+    // Two distinct evidence allowlists: R8/S5 text and actual formal SDK/receipts. No APK or release write.
     const releaseCheck = jobBlock(android, 'release_check');
-    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(1);
+    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(2);
     const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
       .split('\n')
       .filter((line) => line.startsWith(' '.repeat(12)))
@@ -1173,6 +1180,23 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       ),
       '${{ runner.temp }}/s5-android-unit-results.json',
     ]);
+    const formalEvidence = [
+      '${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar',
+      '${{ steps.libbox_input.outputs.work }}/*receipt.json',
+      '${{ steps.libbox_input.outputs.work }}/*bind.log',
+      '${{ steps.libbox_input.outputs.work }}/budget-observation.json',
+      'scripts/mobile-core/android-consumption.json',
+      'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
+      '${{ runner.temp }}/*.source-consumption.json',
+    ];
+    for (const job of ['release_check', 'release-apk']) {
+      const evidence = executable(stepBlock(jobBlock(android, job), 'Retain actual formal mobile component and original receipts'));
+      const paths = evidence.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
+      expect(paths, `${job}: exact formal evidence whitelist`).toEqual(formalEvidence);
+      expect(evidence).toContain("if: always() && steps.libbox_input.outcome == 'success'");
+      expect(evidence).toContain('if-no-files-found: error');
+      expect(evidence).not.toMatch(/(?:gh release|\*\.apk|\*\.so)/);
+    }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 新证据白名单仍是文本；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
     const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation unit tests'));

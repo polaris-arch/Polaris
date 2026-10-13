@@ -2591,7 +2591,7 @@ impl ProxyRuntime {
     /// **残余微竞态**（stop 的 Stop 与本 Start 在 daemon 单 mu 上的到达序）= 真机门（与 上游 同形）。
     pub(super) async fn spawn_core_via_helper(
         self: &Arc<Self>,
-        binary: &Path,
+        _binary: &Path,
         config_path: &Path,
         user_config: &UserConfig,
         my_gen: u64,

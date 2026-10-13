@@ -1,7 +1,7 @@
 use super::*;
 use crate::platform::macos::exec::RunError;
 use crate::token::FileTokenStore;
-use polaris_helper_proto::StartResp;
+use polaris_helper_proto::response::Start as StartResp;
 use std::sync::Mutex;
 
 // 测试用 services bundle：注入 FileTokenStore（tempfile）+ 记录型 runner + 可控 child。

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 
 import sys
 sys.dont_write_bytecode = True
@@ -100,6 +101,78 @@ def materialize_android(component, receipt_path, tools, work, cache):
         return facts
 
 
+def apple_resource_inputs():
+    """The actual iOS bundle config is the resource inventory, not a placeholder."""
+    config = json.loads((ROOT / 'src-tauri/tauri.ios.conf.json').read_bytes())
+    require(config['bundle']['resources'] == ['../resources/data/', '../THIRD-PARTY-LICENSES.md',
+                                             '../NOTICE', '../LICENSE'], 'iOS resource contract changed')
+    data = ROOT / 'resources/data'
+    require(not data.is_symlink() and data.is_dir(), 'real geo resource directory required')
+    geo = sorted(data.iterdir())
+    require(len(geo) == 28 and all(p.suffix == '.srs' for p in geo), 'complete 28 geo resource inventory required')
+    sources = geo + [ROOT / name for name in ('THIRD-PARTY-LICENSES.md', 'NOTICE', 'LICENSE')]
+    rows = {}
+    for source in sources:
+        for parent in (source, *source.parents):
+            require(not parent.is_symlink(), 'resource source redirected')
+            if parent == ROOT:
+                break
+        require(source.is_file(), 'resource source must be regular')
+        pin = file_pin(source)
+        if source.suffix == '.srs':
+            require(source.read_bytes().startswith(b'SRS'), 'resource geo bytes lack SRS magic')
+        mode = stat.S_IMODE(source.stat().st_mode)
+        require(mode == 0o644, 'resource source mode differs')
+        name = '_up_/' + source.relative_to(ROOT).as_posix()
+        rows[name] = {'source': source.relative_to(ROOT).as_posix(), **pin, 'mode': mode}
+    return rows
+
+
+def apple_resources():
+    rows = apple_resource_inputs()
+    assets = ROOT / 'src-tauri/gen/apple/assets'
+    require(not assets.is_symlink() and assets.is_dir(), 'materialized Apple resources required before input freeze')
+    actual = set()
+    for path in assets.rglob('*'):
+        require(not path.is_symlink(), 'Apple resource output redirected')
+        if path.is_file():
+            name = path.relative_to(assets).as_posix()
+            require(name in rows and file_pin(path) == {k: rows[name][k] for k in ('bytes', 'sha256')} and
+                    stat.S_IMODE(path.stat().st_mode) == rows[name]['mode'], 'materialized Apple resource differs')
+            actual.add(name)
+        else:
+            require(path.is_dir() and any(name.startswith(path.relative_to(assets).as_posix() + '/') for name in rows),
+                    'unbound Apple resource directory')
+    require(actual == set(rows), 'materialized Apple resource inventory differs')
+    return rows
+
+
+def materialize_apple_resources():
+    rows = apple_resource_inputs()
+    assets = ROOT / 'src-tauri/gen/apple/assets'
+    for parent in (assets, *assets.parents):
+        require(not parent.is_symlink(), 'Apple resource destination redirected')
+        if parent == ROOT:
+            break
+    if assets.exists():
+        require(apple_resources() == rows, 'retained Apple resource output differs')
+        return rows
+    stage = assets.with_name('assets.formal-stage')
+    require(not stage.exists(), 'unaccepted Apple resource stage retained')
+    stage.mkdir(mode=0o700)
+    for name, row in rows.items():
+        dest = stage / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / row['source'], dest)
+        dest.chmod(row['mode'])
+        require(file_pin(dest) == {k: row[k] for k in ('bytes', 'sha256')}, 'resource copy differs')
+    require(apple_resource_inputs() == rows, 'resource source changed during materialization')
+    stage.chmod(0o755)
+    os.rename(stage, assets)
+    require(apple_resources() == rows, 'installed Apple resource output differs')
+    return rows
+
+
 def apple_link(component, receipt_path, output, work, cache):
     value = load()
     with lease(work, cache, value) as (work, cache):
@@ -111,7 +184,7 @@ def apple_link(component, receipt_path, output, work, cache):
                  'componentReceipt': str(Path(receipt_path).resolve(strict=True)),
                  'componentReceiptSha256': file_pin(receipt_path)['sha256'],
                  'componentFingerprint': receipt['fingerprint'], 'producerInput': receipt['input'],
-                 'componentOutput': receipt['output'], 'staticOnly': True,
+                 'componentOutput': receipt['output'], 'resources': apple_resources(), 'staticOnly': True,
                  'AppAccepted': False, 'devicePassed': False}
         facts['fingerprint'] = sha(canonical(facts))
         require(not Path(output).exists(), 'fixed link input already exists; do not overwrite a frozen context')
@@ -127,7 +200,8 @@ def verify_link(path, expected_sha, scratch):
     require(file_pin(link['componentReceipt'])['sha256'] == link['componentReceiptSha256'], 'original component receipt changed')
     receipt = verify_original(link['framework'], link['componentReceipt'], 'apple', {}, scratch)
     require(receipt['fingerprint'] == link['componentFingerprint'] and receipt['output'] == link['componentOutput'] and
-            app_identity() == link['App'], 'actual component/App link context changed')
+            app_identity() == link['App'] and apple_resources() == link['resources'],
+            'actual component/App/resource link context changed')
     return link
 
 

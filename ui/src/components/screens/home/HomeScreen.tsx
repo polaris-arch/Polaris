@@ -614,8 +614,7 @@ export function HomeScreen() {
           code === ProxyErrorCode.HELPER_CORE_OCCUPIED ||
           code === ProxyErrorCode.HELPER_CORE_ABSENT ||
           code === ProxyErrorCode.HELPER_CORE_INVALID) {
-        toast.error(proxyErrorText({ errorCode: code }, (key, fallback) =>
-          t(key, { defaultValue: fallback ?? key })));
+        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
         return;
       }
       if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {

@@ -1077,11 +1077,13 @@ fn clear_reaped_birth_with_dns(
 ) {
     let revert_dns = {
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-        if g.child
+        g.retire_birth(&proof.birth);
+        // Synchronous Stop may already have cleared the upper child slot.
+        // DNS custody remains attached to its physical birth until restored.
+        if g.dns_birth
             .as_ref()
-            .is_some_and(|child| child.handle().same_birth(&proof.birth))
+            .is_some_and(|birth| birth.same_birth(&proof.birth))
         {
-            g.child = None;
             if g.dns_busy {
                 g.dns_cleanup_pending = true;
                 false
@@ -1089,6 +1091,8 @@ fn clear_reaped_birth_with_dns(
                 g.dns_busy = true;
                 true
             } else {
+                g.dns_birth = None;
+                g.dns_cleanup_pending = false;
                 false
             }
         } else {
@@ -1102,7 +1106,9 @@ fn clear_reaped_birth_with_dns(
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
         if cleared {
             g.dns_owner = None;
+            g.dns_birth = None;
         }
+        g.dns_cleanup_pending = !cleared;
         g.dns_busy = false;
     }
     let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);

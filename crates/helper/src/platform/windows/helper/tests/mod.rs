@@ -3,7 +3,7 @@
 use super::*;
 use crate::platform::windows::ops::{MockNetTableOps, MockProcOps};
 use crate::token::StaticTokenStore;
-use polaris_helper_proto::StartParams;
+use polaris_helper_proto::{Platform, StartParams};
 
 mod native_birth;
 mod wire_gate;

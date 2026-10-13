@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import plistlib
 import re
+import stat
 import zipfile
 
 import os
@@ -15,7 +16,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from fork_input import ROOT, canonical, load, require, sha
 from artifacts import file_pin, module, zip_entries, check_buildinfo, read_receipt
 from producer import lease, run, write_json
-from consume import app_identity, verify_original
+from consume import app_identity, apple_resources, verify_original
 
 
 def android(apk, abi, r8, component, receipt_path, tools, scratch):
@@ -99,6 +100,20 @@ def static_linkmap(text, framework, selected, derived):
     return consumed
 
 
+def verify_apple_resources(archive, app_root, expected):
+    prefix = app_root + 'assets/'
+    actual = {name.removeprefix(prefix): name for name in archive.namelist()
+              if name.startswith(prefix) and not name.endswith('/')}
+    require(set(actual) == set(expected), 'final App resource inventory differs')
+    observed = {}
+    for name, row in expected.items():
+        raw, info = archive.read(actual[name]), archive.getinfo(actual[name])
+        pin = {'bytes': len(raw), 'sha256': sha(raw), 'mode': stat.S_IMODE(info.external_attr >> 16)}
+        require(pin == {key: row[key] for key in ('bytes', 'sha256', 'mode')}, 'final App resource bytes/mode differ')
+        observed[name] = pin
+    return observed
+
+
 def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, simulator_arch=None):
     require(file_pin(link_path)['sha256'] == link_sha, 'fixed Apple link input bytes differ')
     link = read_receipt(Path(link_path))
@@ -109,7 +124,8 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     require(receipt['fingerprint'] == link['componentFingerprint'] and receipt['output'] == link['componentOutput'],
             'actual link component differs')
     current = app_identity()
-    require(current == link['App'], 'App source changed after link context was frozen')
+    require(current == link['App'] and apple_resources() == link['resources'],
+            'App source/resources changed after link context was frozen')
     value = load()
     helper = module('final_mobile_info', 'scripts/libbox-patches/android-source.py')
     parser = module('final_mobile_carrier', 'scripts/apple-carrier.py')
@@ -119,6 +135,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
         require(len(apps) == 1, 'one actual host App required')
         app_root = apps[0].removesuffix('Info.plist')
         app = plistlib.loads(archive.read(apps[0]))
+        resources = verify_apple_resources(archive, app_root, link['resources'])
         extensions = [n for n in archive.namelist() if n.startswith(app_root + 'PlugIns/') and n.endswith('.appex/Info.plist')]
         require(len(extensions) == 1, 'one actual PacketTunnel required')
         extension_root = extensions[0].removesuffix('Info.plist')
@@ -158,7 +175,7 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     return {'schema': 'polaris-mobile-apple-carrier-v1', 'App': current, 'ipa': file_pin(ipa), 'binaries': rows,
             'producerCandidate': receipt['input']['producer']['candidate'],
             'componentFingerprint': receipt['fingerprint'], 'linkInputSha256': link_sha,
-            'selectedTarget': target, 'linkedOriginalStaticMembers': consumed,
+            'selectedTarget': target, 'resources': resources, 'linkedOriginalStaticMembers': consumed,
             'linkmap': file_pin(linkmap), 'AppCarrierValidated': True,
             'AppAccepted': False, 'devicePassed': False, 'signatureTrustValidated': False,
             'scope': 'App/PacketTunnel compile/static source and original bytes; signing permissions/device lifecycle are separate'}

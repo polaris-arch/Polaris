@@ -221,8 +221,8 @@ export default function SettingsHelper() {
           {status?.selectedCore && (
             <dl className="card-sub" data-testid="helper-selected-core" style={{ overflowWrap: 'anywhere' }}>
               <dt>{t('helper.selectedCoreVersion')}</dt><dd>{status.selectedCore.version}</dd>
-              <dt>{t('helper.selectedCoreId')}</dt><dd title={status.selectedCore.id}>{status.selectedCore.id.slice(0, 16)}</dd>
-              <dt>{t('helper.selectedCoreProvider')}</dt><dd title={status.selectedCore.providerFingerprint}>{status.selectedCore.providerFingerprint.slice(0, 16)}</dd>
+              <dt>{t('helper.selectedCoreId')}</dt><dd data-tip={status.selectedCore.id} tabIndex={0}>{status.selectedCore.id.slice(0, 16)}</dd>
+              <dt>{t('helper.selectedCoreProvider')}</dt><dd data-tip={status.selectedCore.providerFingerprint} tabIndex={0}>{status.selectedCore.providerFingerprint.slice(0, 16)}</dd>
               <dt>{t('helper.selectedCoreState')}</dt><dd>{t(`helper.coreState.${status.selectedCore.state}`)}</dd>
             </dl>
           )}
@@ -326,7 +326,9 @@ export default function SettingsHelper() {
                         version: status.version,
                         required: status.expectedProtocolVersion,
                       })
-                    : t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent' : 'helper.statusUpgradeable')}
+                    : status?.helperBuildId != null && status.helperBuildId !== status.expectedBuildId
+                      ? t('helper.buildVersionMismatch')
+                      : t(status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent' : 'helper.statusUpgradeable')}
                 </Pill>
               </div>
               <div className="card-sub">{t('helper.upgradeDescCard')}</div>

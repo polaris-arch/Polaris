@@ -41,10 +41,10 @@ pub fn payload_use(paths: &[std::path::PathBuf]) -> LegacyUse {
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .args(["-nP", "-Fpn", "--"])
             .args(paths);
-        return match observe_command(&mut command) {
+        match observe_command(&mut command) {
             Ok((code, out, err)) => classify_unix(code, &out, &err),
             Err(_) => LegacyUse::Unknown,
-        };
+        }
     }
     #[cfg(windows)]
     {
@@ -86,7 +86,7 @@ pub fn payload_use(paths: &[std::path::PathBuf]) -> LegacyUse {
                 &script,
             ])
             .creation_flags(0x0800_0000);
-        return match observe_command(&mut command) {
+        match observe_command(&mut command) {
             Ok((0, out, err)) if err.is_empty() => {
                 match std::str::from_utf8(&out).ok().map(str::trim) {
                     Some("idle") => LegacyUse::Idle,
@@ -95,7 +95,7 @@ pub fn payload_use(paths: &[std::path::PathBuf]) -> LegacyUse {
                 }
             }
             _ => LegacyUse::Unknown,
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     LegacyUse::Unknown

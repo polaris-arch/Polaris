@@ -72,7 +72,7 @@ class MobileInputs(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = deepcopy(self.value)
-            module = f"module {value['goModule']}\ngo {value['goVersion']}\nrequire github.com/sagernet/gomobile {value['gomobileVersion']}\n".encode()
+            module = f"module {value['goModule']}\ngo {value['goVersion']}\nrequire (\n\tgithub.com/sagernet/gomobile {value['gomobileVersion']}\n)\n".encode()
             (root / 'go.mod').write_bytes(module); value['goModSha256'] = sha(module)
             (root / 'go.sum').write_bytes(b'fixture-sum'); value['goSumSha256'] = sha(b'fixture-sum')
             declared = root / value['declaredTagsSource']['path']; declared.parent.mkdir(parents=True)

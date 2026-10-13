@@ -36,7 +36,8 @@ export const HOME_PARITY: ScreenParityRegister = {
   // 「给这个主机加一条规则」的菜单项片段（拓扑图右键面板的内容）住在 `components/` 下，
   // 但它渲染的是 `rules.*` 屏级文案 —— 按 ⓪ 组那条判据它是**内容**，不是通用原语。
   extraBlockSources: ['ui/src/components/RuleSubjectMenuItems.tsx'],
-  sharedPrimitives: ['ui/src/components/FlagImg.tsx', 'ui/src/mobile/SavedAutoSelectControls.tsx'],
+  // MeasurementLabel is shared desktop/mobile ledger presentation; saved/effective qualification is covered by measurement tests.
+  sharedPrimitives: ['ui/src/components/FlagImg.tsx', 'ui/src/mobile/SavedAutoSelectControls.tsx', 'ui/src/mobile/MeasurementLabel.tsx'],
   slotHandoffGates: [
     { file: 'ui/src/mobile/mobile-chrome.test.tsx', mustContain: '③ 反向分流指示器（真机 2026-07-20 §1.4 的移植）' },
     { file: 'ui/src/mobile/home/home-screen.test.tsx', mustContain: '① DOM 序 = 重要性序，不许被断点重排' },

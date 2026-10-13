@@ -182,7 +182,7 @@ esac
       };
       const good = run({});
       expect(good.result.status, good.result.stderr).toBe(0);
-      expect(good.output).toBe('kernel=false\nplatforms=[]\npreflight=false\nhas_package=false\nandroid=false\nunregistered=\n');
+      expect(good.output).toBe('kernel=false\nplatforms=[]\npreflight=false\nhas_package=false\nandroid=false\napple=false\nunregistered=\n');
       const invalidContexts: Record<string, string>[] = [
         { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REF: 'refs/tags/v1.0.0' },
         { GITHUB_SHA: 'b'.repeat(40) }, { GITHUB_REPOSITORY: 'other/repo' },

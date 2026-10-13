@@ -8,10 +8,15 @@ test('real Apple and shared producer/application edits select the final App leg'
   for (const path of ['src-tauri/gen/apple/project.yml', 'src-tauri/src/lib.rs',
     'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/apple_rust.py',
+    'src-tauri/capabilities/default.json', 'src-tauri/capabilities/tray.json',
+    'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs',
     'ui/src/App.tsx', 'Cargo.lock', 'src-tauri/tauri.ios.conf.json', '.github/workflows/apple.yml']) {
     assert.equal(appleRequired([path]), true, path);
   }
-  assert.equal(appleRequired(['docs/notes.md']), false);
+  for (const path of ['docs/notes.md', 'src-tauri/gen/android/app/build.gradle.kts',
+    'src-tauri/capabilities-not-real/control.json', 'scripts/lib/unrelated.mjs', 'scripts/fetch-protoc-not-real.mjs']) {
+    assert.equal(appleRequired([path]), false, path);
+  }
   assert.equal(appleRequired([], true), true);
   assert.throws(() => appleRequired(['../caller-input']), /normalized/);
 });

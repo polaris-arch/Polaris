@@ -23,7 +23,7 @@ impl InstallArgs {
         let mut root = None;
         let mut source = None;
         let mut manifest = None;
-        for pair in args[1..7].chunks_exact(2) {
+        for pair in args[1..7].as_chunks::<2>().0 {
             let value = PathBuf::from(&pair[1]);
             if !value.is_absolute() || pair[1].contains(['\n', '\r', '\0']) {
                 return Err("absolute path required");

@@ -11,7 +11,7 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from artifacts import file_pin, read_receipt
+from artifacts import file_pin, module, read_receipt
 from consume import app_identity, verify_link
 from fork_input import ROOT, canonical, load, require, sha
 from producer import ACTIVE_FDS, private_dir, run, write_json
@@ -26,6 +26,37 @@ def target_for(platform, arches, configuration):
                ('iphonesimulator', 'x86_64'): 'x86_64-apple-ios'}
     require((platform, arches) in targets, 'unsupported actual App platform/architecture')
     return targets[(platform, arches)]
+
+
+def selected_wire_bytes(raw, triple):
+    """Inspect every fat entry, then select the actual Cargo architecture/platform."""
+    specs = {'aarch64-apple-ios': (0x100000c, 2),
+             'aarch64-apple-ios-sim': (0x100000c, 7), 'x86_64-apple-ios': (0x1000007, 7)}
+    require(triple in specs and len(raw) <= 1024 ** 3, 'bounded selected wire target required')
+    parser = module('apple_selected_wire_carrier', 'scripts/apple-carrier.py')
+    helper = module('apple_selected_wire_info', 'scripts/libbox-patches/android-source.py')
+    observed = parser.container(raw, helper)
+    require(observed['kind'] in ('bsd-ar', 'fat-ar'), 'actual static wire input required')
+    slices = observed['slices'] if observed['kind'] == 'fat-ar' else [
+        {'offset': 0, 'bytes': len(raw), 'archive': observed}]
+    cpu, platform = specs[triple]
+    matching = []
+    for row in slices:
+        code = [member['machO'] for member in row['archive']['members'] if member['classification'] == 'code']
+        require(code and len({obj['cpu'] for obj in code}) == 1, 'mixed or missing wire architecture')
+        require('cpu' not in row or (row['cpu'], row['subCPU']) == (code[0]['cpu'], code[0]['subCPU']),
+                'fat header/payload architecture differs')
+        require(len({(obj['cpu'], obj['subCPU']) for obj in code}) == 1, 'mixed wire CPU/subtype')
+        platforms = [p['platform'] for obj in code for p in obj['platformCommands']]
+        require(platforms and len(set(platforms)) == 1, 'mixed or missing wire platform')
+        if code[0]['cpu'] == cpu and platforms[0] == platform:
+            matching.append(row)
+    require(len(matching) == 1, 'exact Cargo architecture/platform wire slice required')
+    selected = matching[0]
+    thin = raw[selected['offset']:selected['offset'] + selected['bytes']]
+    require(thin.startswith(b'!<arch>\n'), 'selected wire slice is not a static archive')
+    return thin, {'target': triple, 'cpu': cpu, 'platform': platform,
+                  'offset': selected['offset'], 'bytes': selected['bytes'], 'container': observed['kind']}
 
 
 def build():
@@ -71,7 +102,13 @@ def build_reserved():
     library = Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox'
     library = library.resolve(strict=True)
     require(file_pin(library) == selected['binary'], 'actual selected wire archive differs')
-    env['POLARIS_APPLE_WIRE_ARCHIVE'] = str(library)
+    thin, selection = selected_wire_bytes(library.read_bytes(), triple)
+    wire = root / ('wire-' + triple + '.a')
+    require(not wire.exists() and not wire.is_symlink(), 'actual selected wire output already retained')
+    with wire.open('xb') as stream:
+        stream.write(thin)
+    require(file_pin(library) == selected['binary'], 'original wire archive changed during selection')
+    env['POLARIS_APPLE_WIRE_ARCHIVE'] = str(wire)
     for kind in ('CFLAGS', 'CXXFLAGS'):
         env[kind + '_' + suffix] = '-isysroot ' + str(sdk)
         for host in ('aarch64_apple_darwin', 'x86_64_apple_darwin'):
@@ -107,9 +144,12 @@ def build_reserved():
                'cargoLock': file_pin(ROOT / 'Cargo.lock'),
                'iosConfig': file_pin(ROOT / 'src-tauri/tauri.ios.conf.json'),
                'linkInputSha256': os.environ['POLARIS_MOBILE_LINK_INPUT_SHA256'],
-               'wireArchive': {'path': str(library), **file_pin(library)},
+               'originalWireArchive': {'path': str(library), **file_pin(library)},
+               'wireSelection': selection, 'wireArchive': {'path': str(wire), **file_pin(wire)},
                'archive': pin, 'linkedArchive': str(dest), 'devicePassed': False}
     receipt['fingerprint'] = sha(canonical(receipt))
+    require(file_pin(wire) == {'bytes': len(thin), 'sha256': sha(thin)} and
+            file_pin(library) == selected['binary'], 'wire input changed during Rust compile')
     require(all(file_pin(pin['path']) == {key: pin[key] for key in ('bytes', 'sha256')}
                 for pin in tool_pins.values()), 'actual Cargo/Rust compiler changed during build')
     output = root / ('rust-' + triple + '.json')
@@ -137,6 +177,16 @@ def verify():
             receipt['iosConfig'] == file_pin(ROOT / 'src-tauri/tauri.ios.conf.json') and
             Path(os.environ['SDKROOT']).resolve(strict=True) == Path(receipt['sdk']) and
             receipt['devicePassed'] is False, 'actual compiled Rust/Xcode input differs')
+    slice_name = ('ios-arm64' if os.environ['PLATFORM_NAME'] == 'iphoneos' else
+                  'ios-arm64-simulator' if os.environ['ARCHS'] == 'arm64' else 'ios-x86_64-simulator')
+    selected = link['componentOutput']['slices'][slice_name]
+    original = (Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox').resolve(strict=True)
+    thin, selection = selected_wire_bytes(original.read_bytes(), triple)
+    wire = root / ('wire-' + triple + '.a')
+    require(receipt['originalWireArchive'] == {'path': str(original), **selected['binary']} and
+            file_pin(original) == selected['binary'] and receipt['wireSelection'] == selection and
+            receipt['wireArchive'] == {'path': str(wire), 'bytes': len(thin), 'sha256': sha(thin)} and
+            file_pin(wire) == {'bytes': len(thin), 'sha256': sha(thin)}, 'actual selected Rust wire input differs')
     require(all(file_pin(pin['path']) == {key: pin[key] for key in ('bytes', 'sha256')}
                 for pin in receipt['tools'].values()), 'actual Cargo/Rust input changed before link')
 

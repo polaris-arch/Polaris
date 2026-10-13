@@ -456,7 +456,6 @@
     "takeoverMethod": "Takeover",
     "takeoverSystemProxy": "System",
     "takeoverTun": "TUN",
-    "timeoutShort": "timeout",
     "topoColDevice": "Device",
     "topoColActiveTarget": "Active targets",
     "topoColOutbound": "Outbound",

@@ -21,7 +21,6 @@
     "noEffectInDirect": "No effect in Direct",
     "groupManual": "Manual Nodes",
     "groupMesh": "Mesh",
-    "timeout": "timeout",
     "cancelStartup": "Cancel startup",
     "disconnect": "Disconnect",
     "connect": "Connect",

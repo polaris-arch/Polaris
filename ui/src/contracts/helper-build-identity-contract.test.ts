@@ -92,6 +92,8 @@ describe('W24：app/helper 共享出包构建身份', () => {
     const screen = read('ui/src/components/screens/settings/SettingsHelper.tsx');
     expect(screen.includes('status.version < status.expectedProtocolVersion')).toBe(true);
     expect(screen.includes("t('helper.buildVersionMismatch')")).toBe(true);
+    expect(screen).toContain('status?.helperBuildId != null && status.helperBuildId !== status.expectedBuildId');
+    expect(screen).toContain("status?.selectedCore?.state === 'absent' ? 'helper.coreState.absent'");
     expect(screen.includes('required: status.expectedProtocolVersion')).toBe(true);
     expect(screen.includes('required: 3'), 'shared protocol 已是 v1，UI 不得残留 v3 硬编码').toBe(false);
   });

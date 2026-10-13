@@ -577,9 +577,9 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '安装提权助手。移动端的隧道来自 `VpnService`、权限来自系统授权弹窗，没有可安装的助手进程。',
     },
     {
-      id: 'SettingsHelper.tsx|k:helper.upgradeHelperAction',
+      id: 'SettingsHelper.tsx|f:install',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '升级助手到与应用匹配的版本。同上，没有被升级的那个对象。',
+      note: '同一 install handler 按实际 selectedCore.state 显示安装缺失核或升级助手动作；移动端没有可安装的提权助手进程，VpnService 另有真实权限入口。',
     },
     {
       id: 'SettingsHelper.tsx|k:helper.repairAction',

@@ -1042,13 +1042,17 @@ fn reaped_birth_keeps_dns_responsibility_until_native_revert_succeeds() {
             }
         }
     }
-    for success in [false, true] {
+    for (success, upper_retired) in [(false, false), (true, false), (false, true), (true, true)] {
         let slot = ChildSlot::new(712);
         let state = Arc::new(Mutex::new(HandlerState::new()));
         {
             let mut state = state.lock().unwrap();
             state.child = Some(ManagedChild::Running(slot.handle.clone()));
             state.dns_owner = Some(1000);
+            state.dns_birth = Some(slot.handle.clone());
+            if upper_retired {
+                state.retire_birth(&slot.handle);
+            }
         }
         slot.mark_exited();
         let LocalReapFact::Reaped(proof) = slot.reap_fact() else {
@@ -1065,5 +1069,59 @@ fn reaped_birth_keeps_dns_responsibility_until_native_revert_succeeds() {
         assert!(state.child.is_none());
         assert!(!state.dns_busy);
         assert_eq!(state.dns_owner, if success { None } else { Some(1000) });
+        assert_eq!(state.dns_birth.is_some(), !success);
+        assert_eq!(state.dns_cleanup_pending, !success);
+    }
+}
+
+#[test]
+fn reaper_hands_busy_dns_to_completion_and_never_reverts_another_birth() {
+    struct Dns(std::sync::atomic::AtomicUsize);
+    impl crate::platform::linux::resolved_dns::ResolvedDnsOps for Dns {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for same_birth in [true, false] {
+        let old = ChildSlot::new(712);
+        let next = ChildSlot::new(712); // numeric PID reuse is not physical identity
+        let state = Arc::new(Mutex::new(HandlerState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.child = Some(ManagedChild::Running(next.handle.clone()));
+            state.dns_owner = Some(1000);
+            state.dns_birth = Some(if same_birth {
+                old.handle.clone()
+            } else {
+                next.handle.clone()
+            });
+            state.dns_busy = same_birth;
+        }
+        old.mark_exited();
+        let LocalReapFact::Reaped(proof) = old.reap_fact() else {
+            panic!("missing native proof")
+        };
+        let dns = Dns(std::sync::atomic::AtomicUsize::new(0));
+        clear_reaped_birth_with_dns(
+            &proof,
+            &state,
+            &Arc::new(Mutex::new(vec![old, Arc::clone(&next)])),
+            &Arc::new(Mutex::new(VecDeque::new())),
+            &dns,
+        );
+        let state = state.lock().unwrap();
+        assert!(state
+            .child
+            .as_ref()
+            .unwrap()
+            .handle()
+            .same_birth(&next.handle));
+        assert_eq!(state.dns_owner, Some(1000));
+        assert_eq!(state.dns_cleanup_pending, same_birth);
+        assert_eq!(dns.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

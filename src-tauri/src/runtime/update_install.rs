@@ -599,6 +599,105 @@ fn windows_exit_wait(pid: u32) -> String {
 const UNIX_EXIT_WAIT: &str =
     "[ -p /dev/fd/0 ] || exit 1\n/bin/dd bs=4096 of=/dev/null 2>/dev/null || exit 1";
 
+// The executable is frozen by the living App into /tmp, not resolved after EOF
+// from an AppImage mount or from an installed (possibly older) system service.
+// Admission directories are distinct from the lease-protected recovery journals.
+fn unix_update_admission(mac: bool) -> String {
+    let owner_mode = if mac {
+        "stat -f '%u:%Lp' \"$1\""
+    } else {
+        "stat -c '%u:%a' \"$1\""
+    };
+    let hash = if mac {
+        "shasum -a 256 \"$1\" | awk '{print $1}'"
+    } else {
+        "sha256sum \"$1\" | awk '{print $1}'"
+    };
+    let original = if mac {
+        "original.app"
+    } else {
+        "original.AppImage"
+    };
+    let original_kind = if mac { "-d" } else { "-f" };
+    let candidate = if mac {
+        "candidate.app"
+    } else {
+        "candidate.AppImage"
+    };
+    format!(
+        r#"
+set -u
+PARENT=$(dirname "$DEST")
+owner_mode() {{ {owner_mode}; }}
+hash_file() {{ {hash}; }}
+LOCK_HELPER="${{POLARIS_LOCK_HELPER:?frozen bundled lease helper required}}"
+FROZEN_DIR=$(dirname "$LOCK_HELPER")
+[ ! -L "$FROZEN_DIR" ] && [ -d "$FROZEN_DIR" ] && [ "$(owner_mode "$FROZEN_DIR")" = "$(id -u):700" ] || exit 1
+[ -f "$LOCK_HELPER" ] && [ ! -L "$LOCK_HELPER" ] && [ "$(hash_file "$LOCK_HELPER")" = "${{POLARIS_LOCK_HELPER_SHA256:?}}" ] || exit 1
+[ ! -e "$PARENT/.polaris-update.lock" ] && [ ! -L "$PARENT/.polaris-update.lock" ] || {{ echo "Legacy Polaris update recovery required" >&2; exit 1; }}
+LOCK="$PARENT/.polaris-update.lease"
+[ ! -L "$LOCK" ] || exit 1
+if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 1; fi
+[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || exit 1
+exec 9>>"$LOCK"
+WORK=''
+ADMISSION=''
+LEASED=0
+initial_cleanup() {{
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$ADMISSION" ]; then rm -rf "$ADMISSION"; fi
+  if [ "$LEASED" -eq 1 ]; then "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 || rc=1; fi
+  exec 9>&-
+  rm -f "$LOCK_HELPER"; rmdir "$FROZEN_DIR" 2>/dev/null || true
+  exit "$rc"
+}}
+trap initial_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+ADMISSION=$(mktemp -d "$PARENT/.polaris-admission.XXXXXX") || exit 1
+chmod 0700 "$ADMISSION" || exit 1
+printf '%s\n' polaris-update-v1 > "$ADMISSION/transaction-kind" || exit 1
+printf '%s' "$DEST" > "$ADMISSION/transaction-destination" || exit 1
+printf '%s\n' staging > "$ADMISSION/transaction-phase" || exit 1
+"$LOCK_HELPER" lease-acquire --lock "$LOCK" --fd 9 || exit 1
+LEASED=1
+for OLD in "$PARENT"/.polaris-update.*; do
+  [ "$OLD" = "$LOCK" ] && continue
+  [ -e "$OLD" ] || [ -L "$OLD" ] || continue
+  [ -d "$OLD" ] && [ ! -L "$OLD" ] && [ "$(owner_mode "$OLD")" = "$(id -u):700" ] || {{ echo "Polaris update recovery required: $OLD" >&2; exit 1; }}
+  for OBJECT in "$OLD/transaction-kind" "$OLD/transaction-destination" "$OLD/transaction-phase"; do
+    [ -f "$OBJECT" ] && [ ! -L "$OBJECT" ] || {{ echo "Polaris update recovery required: $OLD" >&2; exit 1; }}
+  done
+  [ "$(cat "$OLD/transaction-kind")" = polaris-update-v1 ] && printf '%s' "$DEST" | cmp -s - "$OLD/transaction-destination" || {{ echo "Polaris update recovery required: $OLD" >&2; exit 1; }}
+  [ ! -e "$OLD/recovery-required" ] && [ ! -L "$OLD/recovery-required" ] || {{ echo "Polaris update recovery required: $OLD" >&2; exit 1; }}
+  case "$(cat "$OLD/transaction-phase")" in
+    staging)
+      [ ! -e "$OLD/{original}" ] && [ ! -L "$OLD/{original}" ] && [ ! -e "$OLD/committed" ] && [ ! -L "$OLD/committed" ] || exit 1;;
+    backup)
+      # A missing destination plus the protected original is an unambiguous
+      # interrupted first rename. Never overwrite an existing destination.
+      if [ ! -e "$DEST" ] && [ ! -L "$DEST" ] && [ {original_kind} "$OLD/{original}" ] && [ ! -L "$OLD/{original}" ]; then
+        mv "$OLD/{original}" "$DEST" || exit 1
+      elif [ ! -e "$OLD/{original}" ] && [ ! -L "$OLD/{original}" ] && candidate_matches "$DEST" "$OLD/original-identity"; then
+        : # The first rename did not happen, or exact rollback already finished.
+      else echo "Polaris update recovery ambiguous: $OLD" >&2; exit 1; fi;;
+    committed)
+      candidate_matches "$DEST" "$OLD/candidate-identity" || exit 1;;
+    *) echo "Polaris update recovery required: $OLD" >&2; exit 1;;
+  esac
+  rm -rf "$OLD" || exit 1
+done
+WORK="$PARENT/.polaris-update.${{ADMISSION##*.}}"
+[ ! -e "$WORK" ] && [ ! -L "$WORK" ] || exit 1
+mv "$ADMISSION" "$WORK" || exit 1
+ADMISSION=''
+STAGE="$WORK/{candidate}"
+BAK="$WORK/{original}"
+set_phase() {{ printf '%s\n' "$1" > "$WORK/transaction-phase.next" && mv -f "$WORK/transaction-phase.next" "$WORK/transaction-phase"; }}
+"#
+    )
+}
+
 /// macOS 更新脚本（移植 `buildMacUpdateScript`）。
 ///
 /// # ad-hoc 签名的关键一步
@@ -613,25 +712,13 @@ fn build_mac_script(plan: &InstallPlan) -> String {
     };
     let dest = sh_quote(&bundle.to_string_lossy());
     ["#!/bin/bash", UNIX_EXIT_WAIT, &format!("DMG={dmg}"), &format!("DEST={dest}"), r#"
-set -u
-PARENT=$(dirname "$DEST")
-[ ! -e "$PARENT/.polaris-update.lock" ] && [ ! -L "$PARENT/.polaris-update.lock" ] || { echo "Legacy Polaris update recovery required" >&2; exit 1; }
-LOCK="$PARENT/.polaris-update.lease"
-[ ! -L "$LOCK" ] || exit 1
-if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 1; fi
-[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || exit 1
-exec 9>>"$LOCK"
-WORK=$(mktemp -d "$PARENT/.polaris-update.XXXXXX") || { open "$DMG"; open "$DEST"; exit 1; }
-chmod 0700 "$WORK"
-LOCK_HELPER="$WORK/lease-helper"
-cp "${POLARIS_LOCK_HELPER:?bundled lease helper required}" "$LOCK_HELPER" && cmp -s "$POLARIS_LOCK_HELPER" "$LOCK_HELPER" && chmod 0700 "$LOCK_HELPER" || { rm -rf "$WORK"; exit 1; }
-"$LOCK_HELPER" lease-acquire --lock "$LOCK" --fd 9 || { rm -rf "$WORK"; open "$DMG"; exit 1; }
-for OLD in "$PARENT"/.polaris-update.*; do
-  [ "$OLD" = "$WORK" ] || [ ! -d "$OLD" ] || { "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9; rm -rf "$WORK"; echo "Polaris update recovery required: $OLD" >&2; exit 1; }
-done
-printf '%s\n' staging > "$WORK/transaction-phase"
-STAGE="$WORK/candidate.app"
-BAK="$WORK/original.app"
+candidate_identity() {
+  codesign -dv --verbose=4 "$1" 2>&1 | awk -F= '/^CDHash=/ {print $2}'
+}
+candidate_matches() {
+  [ -f "$2" ] && [ ! -L "$2" ] && [ -d "$1" ] && [ ! -L "$1" ] && codesign --verify --deep --strict "$1" >/dev/null 2>&1 && [ -s "$2" ] && candidate_identity "$1" | cmp -s - "$2"
+}
+"#, &unix_update_admission(true), r#"
 MNT=''
 MOUNTED=0
 cleanup() {
@@ -641,8 +728,10 @@ cleanup() {
     echo "Polaris update recovery retained: $WORK" >&2
     return
   fi
+  rm -rf "$WORK" || return
   "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 || return
-  rm -rf "$WORK"
+  exec 9>&-
+  rm -f "$LOCK_HELPER"; rmdir "$FROZEN_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -665,11 +754,15 @@ if ! codesign --verify --deep --strict "$STAGE" >/dev/null 2>&1; then
 fi
 if ! hdiutil detach "$MNT" >/dev/null 2>&1; then open "$DMG"; exit 1; fi
 MOUNTED=0
+candidate_identity "$DEST" > "$WORK/original-identity"
+candidate_identity "$STAGE" > "$WORK/candidate-identity"
+[ -s "$WORK/candidate-identity" ] || exit 1
 replace() {
   [ ! -e "$BAK" ] || return 2
-  printf '%s\n' backup > "$WORK/transaction-phase"
+  set_phase backup || return 2
+  # Durable backup phase precedes the first destination mutation.
   mv "$DEST" "$BAK" 2>/dev/null || return 1
-  if mv "$STAGE" "$DEST" 2>/dev/null && codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 && touch "$WORK/committed"; then
+  if mv "$STAGE" "$DEST" 2>/dev/null && codesign --verify --deep --strict "$DEST" >/dev/null 2>&1 && touch "$WORK/committed" && set_phase committed; then
     rm -rf "$BAK"
     return 0
   fi
@@ -687,7 +780,7 @@ if ! replace; then
     {
       printf '%s\n' '#!/bin/bash' 'set -u'
       printf 'DEST=%q\nSTAGE=%q\nBAK=%q\nWORK=%q\n' "$DEST" "$STAGE" "$BAK" "$WORK"
-      declare -f replace
+      declare -f set_phase replace
       printf '%s\n' 'replace'
     } > "$ELEV"
     chmod 0700 "$ELEV"
@@ -725,32 +818,21 @@ fn build_linux_appimage_script(plan: &InstallPlan) -> String {
         &format!("NEW={src}"),
         &format!("DEST={dst}"),
         r#"
-set -u
-[ ! -e "$(dirname "$DEST")/.polaris-update.lock" ] && [ ! -L "$(dirname "$DEST")/.polaris-update.lock" ] || { echo "Legacy Polaris update recovery required" >&2; exit 1; }
-LOCK="$(dirname "$DEST")/.polaris-update.lease"
-[ ! -L "$LOCK" ] || exit 1
-if [ ! -e "$LOCK" ]; then (umask 077; set -C; : > "$LOCK") || [ -f "$LOCK" ] || exit 1; fi
-[ -f "$LOCK" ] && [ ! -L "$LOCK" ] || exit 1
-exec 9>>"$LOCK"
-WORK=$(mktemp -d "$(dirname "$DEST")/.polaris-update.XXXXXX") || {
-  nohup "$DEST" 9>&- >/dev/null 2>&1 &
-  xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
-  exit 1
+candidate_matches() {
+  [ -f "$2" ] && [ ! -L "$2" ] && [ -f "$1" ] && [ ! -L "$1" ] && [ "$(hash_file "$1")" = "$(cat "$2")" ]
 }
-chmod 0700 "$WORK"
-LOCK_HELPER="$WORK/lease-helper"
-cp "${POLARIS_LOCK_HELPER:?bundled lease helper required}" "$LOCK_HELPER" && cmp -s "$POLARIS_LOCK_HELPER" "$LOCK_HELPER" && chmod 0700 "$LOCK_HELPER" || { rm -rf "$WORK"; exit 1; }
-"$LOCK_HELPER" lease-acquire --lock "$LOCK" --fd 9 || { rm -rf "$WORK"; exit 1; }
-for OLD in "$(dirname "$DEST")"/.polaris-update.*; do
-  [ "$OLD" = "$WORK" ] || [ ! -d "$OLD" ] || { "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9; rm -rf "$WORK"; echo "Polaris update recovery required: $OLD" >&2; exit 1; }
-done
-printf '%s\n' staging > "$WORK/transaction-phase"
-STAGE="$WORK/candidate.AppImage"
-BAK="$WORK/original.AppImage"
+"#,
+        &unix_update_admission(false),
+        r#"
 cleanup() {
   if [ -e "$BAK" ] || [ -e "$WORK/recovery-required" ]; then
     echo "Polaris update recovery retained: $WORK" >&2
-  else "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 && rm -rf "$WORK"; fi
+  else
+    rm -rf "$WORK" || return
+    "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 || return
+    exec 9>&-
+    rm -f "$LOCK_HELPER"; rmdir "$FROZEN_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -759,13 +841,18 @@ if ! cp "$NEW" "$STAGE" || ! cmp -s "$NEW" "$STAGE" || ! chmod 0755 "$STAGE"; th
   xdg-open "$(dirname "$NEW")" >/dev/null 2>&1 &
   exit 1
 fi
-printf '%s\n' backup > "$WORK/transaction-phase"
+hash_file "$DEST" > "$WORK/original-identity" || exit 1
+hash_file "$STAGE" > "$WORK/candidate-identity" || exit 1
+set_phase backup || exit 1
 if ! mv "$DEST" "$BAK"; then nohup "$DEST" 9>&- >/dev/null 2>&1 & exit 1; fi
-if mv "$STAGE" "$DEST"; then
+if mv "$STAGE" "$DEST" && candidate_matches "$DEST" "$WORK/candidate-identity" && set_phase committed; then
   rm -f "$BAK"
   rm -f "$NEW"
   nohup "$DEST" 9>&- >/dev/null 2>&1 &
 else
+  if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+    mv "$DEST" "$WORK/rejected.AppImage" || { touch "$WORK/recovery-required"; exit 1; }
+  fi
   if ! mv "$BAK" "$DEST"; then
     touch "$WORK/recovery-required"
     xdg-open "$WORK" >/dev/null 2>&1 &
@@ -826,12 +913,22 @@ pub fn spawn_detached_script(dir: &Path, spec: &ScriptSpec) -> Result<PathBuf, S
     let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.leading_args).arg(&path);
     #[cfg(unix)]
-    if std::str::from_utf8(&spec.bytes).is_ok_and(|text| text.contains("${POLARIS_LOCK_HELPER:?")) {
-        cmd.env(
-            "POLARIS_LOCK_HELPER",
-            crate::runtime::helper::resolve_helper_binary()?,
-        );
-    }
+    let mut frozen_helper = if std::str::from_utf8(&spec.bytes)
+        .is_ok_and(|text| text.contains("${POLARIS_LOCK_HELPER:?"))
+    {
+        let expected = crate::runtime::core_identity::selected_manifest(
+            crate::runtime::core_identity::current_platform()?,
+        )?
+        .helper_sha256
+        .ok_or("CORE_BUNDLE_MISMATCH: compiled lease helper hash unavailable")?;
+        let frozen =
+            freeze_lease_helper(&crate::runtime::helper::resolve_helper_binary()?, &expected)?;
+        cmd.env("POLARIS_LOCK_HELPER", frozen.path())
+            .env("POLARIS_LOCK_HELPER_SHA256", expected);
+        Some(frozen)
+    } else {
+        None
+    };
     // detached：父进程随即 exit(0)，脚本必须活下去。
     #[cfg(unix)]
     {
@@ -854,12 +951,108 @@ pub fn spawn_detached_script(dir: &Path, spec: &ScriptSpec) -> Result<PathBuf, S
         // No await or fallible publication after spawn: only OS process exit closes this fd.
         // CLOEXEC prevents subsequent child processes from extending this lifetime.
         let _process_lifetime_fd = lifetime_writer.into_raw_fd();
+        if let Some(frozen) = frozen_helper.as_mut() {
+            // The script now owns removal; this has no fallible publication.
+            frozen.directory = None;
+        }
         drop(child);
     }
     #[cfg(not(unix))]
     cmd.spawn()
         .map_err(|e| format!("启动安装脚本失败 {}: {e}", spec.program))?;
     Ok(path)
+}
+
+#[cfg(unix)]
+struct FrozenLeaseHelper {
+    directory: Option<PathBuf>,
+    executable: PathBuf,
+}
+#[cfg(unix)]
+impl FrozenLeaseHelper {
+    fn path(&self) -> &Path {
+        &self.executable
+    }
+}
+#[cfg(unix)]
+impl Drop for FrozenLeaseHelper {
+    fn drop(&mut self) {
+        if let Some(directory) = &self.directory {
+            let _ = std::fs::remove_file(&self.executable);
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn freeze_lease_helper(source: &Path, expected: &str) -> Result<FrozenLeaseHelper, String> {
+    use std::os::unix::fs::MetadataExt;
+    // Fixed, root-owned sticky temporary root. TMPDIR can point into AppImage's
+    // short-lived mount, so it is deliberately not a staging authority here.
+    let parent = Path::new("/tmp")
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(&parent).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o1000 == 0 {
+        return Err("invalid independent update staging root".into());
+    }
+    freeze_lease_helper_in(&parent, source, expected)
+}
+
+#[cfg(unix)]
+fn freeze_lease_helper_in(
+    parent: &Path,
+    source: &Path,
+    expected: &str,
+) -> Result<FrozenLeaseHelper, String> {
+    use std::fs::{DirBuilder, OpenOptions};
+    use std::io::Read;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let input = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| error.to_string())?;
+    let source_metadata = input.metadata().map_err(|error| error.to_string())?;
+    // Match the existing immutable installation-file budget, without holding
+    // a second helper binary in memory. No candidate is executed before sealing.
+    if !source_metadata.is_file()
+        || source_metadata.len() == 0
+        || source_metadata.len() > 512 * 1024 * 1024
+    {
+        return Err("lease helper is not a bounded regular bundled file".into());
+    }
+    let directory = parent.join(format!("polaris-update-helper.{}", uuid::Uuid::new_v4()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|error| error.to_string())?;
+    let frozen = FrozenLeaseHelper {
+        executable: directory.join("lease-helper"),
+        directory: Some(directory.clone()),
+    };
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
+    if metadata.uid() != nix::unistd::getuid().as_raw() || metadata.mode() & 0o777 != 0o700 {
+        return Err("invalid independent lease helper stage".into());
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(frozen.path())
+        .map_err(|error| error.to_string())?;
+    let copied = std::io::copy(&mut input.take(source_metadata.len() + 1), &mut output)
+        .map_err(|error| error.to_string())?;
+    output.sync_all().map_err(|error| error.to_string())?;
+    let actual = polaris_updater::verify::sha256_reader_hex(
+        std::fs::File::open(frozen.path()).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if copied != source_metadata.len() || actual != expected {
+        return Err("CORE_BUNDLE_MISMATCH: independent lease helper copy differs".into());
+    }
+    Ok(frozen)
 }
 
 #[cfg(unix)]
