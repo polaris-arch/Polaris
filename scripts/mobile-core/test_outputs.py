@@ -84,6 +84,30 @@ class FormalOutputs(unittest.TestCase):
             self.assertEqual(write['phase'], 'serialize-before-install')
             self.assertEqual(path.read_bytes(), b'x' * 129)
 
+    def test_component_capacity_does_not_expand_link_android_or_control_receipt_budgets(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(artifacts, 'MAX_RECEIPT', 256), \
+                patch.object(artifacts, 'MAX_APPLE_LINK_RECEIPT', 512), \
+                patch.object(artifacts, 'MAX_APPLE_RECEIPT', 1024):
+            path = Path(temporary) / 'receipt.json'
+            component = {'schema': 'polaris-mobile-component-v1', 'platform': 'apple',
+                         'originalNativeInventory': 'x' * 600}
+            component['fingerprint'] = sha(canonical(component))
+            write_json(path, component)
+            self.assertEqual(artifacts.read_receipt(path), component)
+            original = path.read_bytes()
+            for changed in [dict(component, platform='android'),
+                            dict(component, schema='polaris-mobile-apple-link-input-v1'),
+                            dict(component, schema='unknown-control'),
+                            dict(component, originalNativeInventory='x' * 1024)]:
+                with self.assertRaisesRegex(RuntimeError, 'before installation'):
+                    write_json(path, changed)
+                self.assertEqual(path.read_bytes(), original)
+                path.write_text(json.dumps(changed))
+                with self.assertRaises(RuntimeError):
+                    artifacts.read_receipt(path)
+                path.write_bytes(original)
+
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original
         # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.

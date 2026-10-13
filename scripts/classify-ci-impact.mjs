@@ -1076,6 +1076,9 @@ export function androidRegistrationOf(rawPath) {
 }
 
 const CORE_PATHS = new Set(['scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/build-desktop-core.test.mjs', 'scripts/core-source-provision.py',
+  // Direct release-risk runtime input inspection binds the actual core before
+  // its traffic gate. Changes must retain kernel + desktop packaging signals.
+  'scripts/native-payload-input.mjs',
   '.github/workflows/desktop-core.yml', 'scripts/desktop-core-ci-wiring.test.mjs']);
 
 /**

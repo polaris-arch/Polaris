@@ -17,16 +17,22 @@ APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
          'ios-x86_64-simulator': (0x1000007, 7, 'amd64', 'simulator')}
 MAX_ARTIFACT = 1024 ** 3
 MAX_RECEIPT = 16 * 1024 ** 2
-MAX_APPLE_RECEIPT = 64 * 1024 ** 2
+# 57b3 actual three-slice component serialized 152757078 bytes before
+# installation (artifact 11816058619 original-component-runner.log).
+# Retain its complete origin inventory within a finite component envelope.
+MAX_APPLE_RECEIPT = 256 * 1024 ** 2
+MAX_APPLE_LINK_RECEIPT = 64 * 1024 ** 2
 
 
 def receipt_limit(value):
     # Full three-slice member/origin inventories exceed the small-control
     # envelope. Keep those original fields, with a separate finite budget.
     require(isinstance(value, dict), 'receipt must be an object')
-    large = (value.get('schema') == 'polaris-mobile-component-v1' and value.get('platform') == 'apple' or
-             value.get('schema') == 'polaris-mobile-apple-link-input-v1')
-    return MAX_APPLE_RECEIPT if large else MAX_RECEIPT
+    if value.get('schema') == 'polaris-mobile-component-v1' and value.get('platform') == 'apple':
+        return MAX_APPLE_RECEIPT
+    if value.get('schema') == 'polaris-mobile-apple-link-input-v1':
+        return MAX_APPLE_LINK_RECEIPT
+    return MAX_RECEIPT
 
 
 def read_receipt(path):

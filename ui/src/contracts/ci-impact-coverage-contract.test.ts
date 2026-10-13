@@ -133,6 +133,14 @@ function stripLineComments(source: string, kind: 'js' | 'yaml'): string {
 }
 
 describe('CI 影响分类器的完备性（fail-open 根治）', () => {
+  it('实际核身份采集入口的变更同时点亮真核门与桌面包装，不能只登记包装腿', () => {
+    expect(compact(['scripts/native-payload-input.mjs'])).toEqual({
+      kernel: true,
+      platforms: [...ALL_PACKAGE_PLATFORMS],
+      preflight: true,
+      hasPackage: true,
+    });
+  });
   it('实际编译前安装身份入口和共享进程租约覆盖全部桌面载体', () => {
     for (const path of ['scripts/prepare-core-identity.mjs', 'crates/helper/src/process_lease.rs']) {
       const actual = classifyImpact([path]);
@@ -358,6 +366,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'scripts/gate-android-release-behavior.sh',
       'scripts/gate-node-test.sh',
       'scripts/macos-nested-code.sh',
+      'scripts/native-payload-input.mjs',
       'scripts/postprocess-appimage.mjs',
       'scripts/prepare-core-identity.mjs',
       'scripts/release-assets.mjs',
