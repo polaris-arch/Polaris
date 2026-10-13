@@ -354,9 +354,32 @@ fn production_handle_connection_goes_through_handle_frame() {
     assert!(body.contains("cleanup_pipe(h)"), "窗口没盖住断开");
 
     assert_eq!(
-        body.matches("helper.handle_frame(&raw)").count(),
+        body.matches("helper.handle_frame_from_peer(&raw, Some(&peer))")
+            .count(),
         1,
-        "handle_connection 不再经 handle_frame 处理整帧"
+        "handle_connection must dispatch the entire frame with its captured native peer"
+    );
+    let peer_capture = body
+        .find("native_caller::from_pipe(h)")
+        .expect("connected pipe peer must be captured before dispatch");
+    let dispatch = body
+        .find("helper.handle_frame_from_peer(&raw, Some(&peer))")
+        .unwrap();
+    let auth_window = &body[peer_capture..dispatch];
+    assert!(auth_window.contains("Err(_) =>"));
+    assert!(auth_window.contains("cleanup_pipe(h)"));
+    assert!(
+        auth_window.contains("return;"),
+        "failed native peer capture cannot reach dispatch"
+    );
+    assert!(body.find("read_frame(h, &mut buf)").unwrap() < peer_capture);
+    assert!(
+        !body.contains("NativePeer {"),
+        "service cannot manufacture a caller identity"
+    );
+    assert!(
+        !body.contains("handle_frame(&raw)"),
+        "missing-peer dispatch bypass is forbidden"
     );
     assert!(
         body.contains("write_response(h, reply.line.as_bytes(), reply.flush)"),
@@ -379,4 +402,48 @@ fn production_handle_connection_goes_through_handle_frame() {
         !code.contains("fn parse_request"),
         "service/win.rs 又长出了自己的 parse_request"
     );
+}
+
+#[test]
+fn captured_native_peer_and_registered_token_are_both_required_for_pinned_start_frame() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let request = pinned_start(
+        &h,
+        StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    );
+    let peer = &h.test_context.as_ref().unwrap().peer;
+    let raw = String::from_utf8(codec::encode(Platform::Win, TOKEN, &request)).unwrap();
+    let bad_token =
+        String::from_utf8(codec::encode(Platform::Win, "wrong-token", &request)).unwrap();
+    assert_eq!(
+        h.handle_frame_from_peer(&bad_token, Some(peer)).line,
+        "ERR auth\n"
+    );
+    assert_eq!(ops.snapshot().start_calls, 0);
+    let mut missing_peer = make_helper(ops.clone(), MockNetTableOps::new());
+    // Disable the test-only peer fallback to exercise production's absent-peer
+    // path; native admission must refuse even with the correct token.
+    missing_peer.test_context = None;
+    assert_eq!(
+        missing_peer.handle_frame_from_peer(&raw, None).line,
+        "ERR auth\n"
+    );
+    assert_eq!(ops.snapshot().start_calls, 0);
+    let reply = h.handle_frame_from_peer(&raw, Some(peer));
+    assert!(matches!(
+        Response::parse(reply.line.trim_end()),
+        Response::Ok(ResponseKind::PinnedStart {
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(
+                polaris_helper_proto::NativeBirthStart::Started { .. }
+            ),
+            ..
+        })
+    ));
+    assert_eq!(ops.snapshot().start_calls, 1);
 }

@@ -40,6 +40,7 @@
     "minimumLoadAlignment": 16384,
     "javaMajor": 17,
     "ndkRevision": "30.0.16138531",
+    "ndkSourceRevision": "30.0.16138531-beta3",
     "ndkPackage": "android-ndk-r30-beta3",
     "ndkArchivePath": "scripts/libbox-patches/ndk-linux-archive.json",
     "bootclasspath": {

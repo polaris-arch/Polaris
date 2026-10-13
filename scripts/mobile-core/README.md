@@ -36,6 +36,17 @@ Formal binding plans are explicit:
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
 
+The NDK input distinguishes the unchanged numeric SDK-view directory
+`ndkRevision=30.0.16138531` from the archive's exact
+`ndkSourceRevision=30.0.16138531-beta3`. Admission checks the complete
+`Pkg.Revision`, `Pkg.BaseRevision` and `Pkg.ReleaseName`; it strips property key
+spacing and rejects duplicate keys, never drops the preview suffix. The new
+required source-contract field enters the existing source/tool fingerprints and
+cache key; older receipts/cache entries cannot be relabeled. The hosted entry
+retains the original small properties bytes and their pinned observation even
+if a later producer step fails. Historical manifests/archive pins are unchanged.
+
+
 `plan.py` verifies the input and prints a bind plan. It never executes a build,
 copies an SDK into an App, installs tools, creates a tag or publishes assets.
 Plan fingerprints bind source and target declarations; actual tool identities
@@ -159,13 +170,23 @@ it does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected
 original container by the actual Cargo CPU and iOS/device or simulator platform.
+The original bind log records a single-input device `lipo -create` and a
+two-input simulator merge; the failed run retained no staging binary, so its
+actual fat count remains unobserved. The parser admits the format's one-entry
+wrapper only under the exact device inventory, and validates each header against
+every code member, while the formal consumer requires the exact Info.plist
+device arm64 and simulator arm64+x86_64 inventories and all three final targets.
 For the fat simulator SDK it independently selects arm64 or x86_64, retains the
 original archive pin plus exact offset/length and thin bytes, and rechecks them
 before Xcode link. The Rust release guard validates every code member's Cargo
 CPU/subtype and platform before scanning that selected archive's descriptor;
 a whole fat input is rejected. Original component/producer bytes are unchanged. SDK origins, real Rust input, final carriers, link maps and original
 logs are retained in one indexed evidence ZIP; entire caches/checkout/target
-copies are excluded. Failed chains retain partial evidence without acceptance.
+copies are excluded. Failed chains retain partial evidence without acceptance,
+including actual unaccepted staging frameworks when inspection failed before
+a final component/receipt was installed. Parser failures log the actual binary
+path, first header bytes, fat count and declared architectures; those observations
+are distinct from inferred container properties based on bind commands.
 
 
 `scripts/libbox-patches` and the old Apple six-patch entry remain historical

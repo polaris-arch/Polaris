@@ -67,7 +67,7 @@ fn attest_unobservable_is_neither_pass_nor_alarm() {
 
 #[test]
 fn helper_start_requires_installed_id_before_ipc_and_has_no_content_write_rpc() {
-    let helper = polaris_source_probe::crate_source!("src/runtime/helper.rs");
+    let helper = crate::test_support::crate_source("runtime/helper.rs");
     let proxy = crate::test_support::module_code("runtime/proxy");
     let body =
         crate::test_support::method_body(&proxy, "    pub(super) async fn spawn_core_via_helper(");

@@ -797,7 +797,7 @@ fn install_params(script_dir: PathBuf, src: PathBuf) -> InstallParams {
         },
         src_binary: src,
         bundled_core,
-        conf_dir: PathBuf::from("/home/user/.config/polaris"),
+        conf_dir: script_dir.join("user-config"),
         uid: 1000,
         script_dir,
     }
@@ -1014,10 +1014,11 @@ fn windows_checks_native_exits_and_rolls_back_exact_old_service_command() {
 
 #[test]
 fn invalid_installation_identity_is_rejected_before_escalation() {
-    let src = PathBuf::from("/app/helper");
-    let (manager, _token_dir) = install_manager(Platform::Linux, &src);
     let stage = tempfile::tempdir().unwrap();
+    let src = stage.path().join("helper");
+    let (manager, _token_dir) = install_manager(Platform::Linux, &src);
     let original = install_params(stage.path().into(), src);
+    validate_install_params(Platform::Linux, &original).unwrap();
     let mut candidates = Vec::new();
     let mut missing_hash = original.clone();
     missing_hash.helper_sha256.clear();
@@ -1035,6 +1036,32 @@ fn invalid_installation_identity_is_rejected_before_escalation() {
             Err(ManagerError::InvalidInstallation(_))
         ));
         assert!(calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn injected_installation_platforms_use_valid_host_absolute_fixtures_and_reject_relative_inputs() {
+    for platform in [Platform::Linux, Platform::Mac, Platform::Win] {
+        let stage = tempfile::tempdir().unwrap();
+        let name = if platform == Platform::Win {
+            "helper.exe"
+        } else {
+            "helper"
+        };
+        let original = install_params(stage.path().into(), stage.path().join(name));
+        validate_install_params(platform, &original).unwrap();
+        let mut relative = original.clone();
+        relative.conf_dir = PathBuf::from("relative-profile");
+        assert!(matches!(
+            validate_install_params(platform, &relative),
+            Err(ManagerError::InvalidInstallation(_))
+        ));
+        let mut injected = original;
+        injected.script_dir = stage.path().join("profile\n--bad");
+        assert!(matches!(
+            validate_install_params(platform, &injected),
+            Err(ManagerError::InvalidInstallation(_))
+        ));
     }
 }
 
@@ -1085,7 +1112,8 @@ fn uninstall_scripts_remove_service_and_files() {
 // ── install()/uninstall() 端到端（提权接线 + 落盘 + 清理）──
 #[test]
 fn install_linux_end_to_end_wires_pkexec_and_writes_script() {
-    let src = PathBuf::from("/app/polaris-helper");
+    let source_stage = tempfile::tempdir().unwrap();
+    let src = source_stage.path().join("polaris-helper");
     let (m, _tok_dir) = install_manager(Platform::Linux, &src);
     let script_dir = tempfile::tempdir().unwrap();
     let params = install_params(script_dir.path().to_path_buf(), src);
@@ -1120,10 +1148,7 @@ fn install_missing_binary_errors() {
         Box::new(MockSysOps::default()),
     );
     let script_dir = tempfile::tempdir().unwrap();
-    let params = install_params(
-        script_dir.path().to_path_buf(),
-        PathBuf::from("/app/absent"),
-    );
+    let params = install_params(script_dir.path().to_path_buf(), dir.path().join("absent"));
     let (exec, calls, _) = capturing((String::new(), 0));
     let err = m.install(&params, &exec).unwrap_err();
     assert!(matches!(err, ManagerError::HelperBinaryMissing(_)));
@@ -1132,7 +1157,8 @@ fn install_missing_binary_errors() {
 
 #[test]
 fn install_mac_selects_osascript() {
-    let src = PathBuf::from("/app/helper");
+    let source_stage = tempfile::tempdir().unwrap();
+    let src = source_stage.path().join("helper");
     let (m, _d) = install_manager(Platform::Mac, &src);
     let script_dir = tempfile::tempdir().unwrap();
     let params = install_params(script_dir.path().to_path_buf(), src);
@@ -1163,7 +1189,8 @@ fn install_win_selects_uac() {
 #[test]
 fn install_user_cancel_maps_to_cancelled() {
     // pkexec 126 = 取消 → Cancelled（非 Err，取消是正常流程）。
-    let src = PathBuf::from("/app/helper");
+    let source_stage = tempfile::tempdir().unwrap();
+    let src = source_stage.path().join("helper");
     let (m, _d) = install_manager(Platform::Linux, &src);
     let script_dir = tempfile::tempdir().unwrap();
     let params = install_params(script_dir.path().to_path_buf(), src);
@@ -1528,6 +1555,25 @@ mod unix_journal_recovery {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
+    // Same closure discipline as the App's shared executable fixture writer:
+    // this test process never holds a write fd on the directly executed file.
+    // A single cp child opens/closes it before any cancellation CLI invocation.
+    fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>) {
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(".staged");
+        let staged = PathBuf::from(staged);
+        fs::write(&staged, contents).unwrap();
+        let status = Command::new("cp")
+            .arg(&staged)
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test executable writer failed: {status}");
+        fs::remove_file(staged).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn recover(
         phase: &str,
         cancel_succeeds: bool,
@@ -1548,9 +1594,10 @@ mod unix_journal_recovery {
         if unknown {
             fs::remove_file(old.join("transaction-kind")).unwrap();
         }
-        let helper = format!("#!/bin/sh\n[ \"$1\" = cancel-upgrade ] || exit 1\nprintf cancelled > \"$3/cancelled\"\nexit {}\n", if cancel_succeeds { 0 } else { 1 });
-        fs::write(admission.join("helper"), helper).unwrap();
-        fs::set_permissions(admission.join("helper"), fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable_stand_in(
+            &admission.join("helper"),
+            format!("#!/bin/sh\n[ \"$1\" = cancel-upgrade ] || exit 1\nprintf cancelled > \"$3/cancelled\"\nexit {}\n", if cancel_succeeds { 0 } else { 1 }),
+        );
         let script = unix_scripts().into_iter().nth(1).unwrap();
         let begin = script
             .find("for OLD in \"$SUPPORT\"/helper-upgrade.*; do")

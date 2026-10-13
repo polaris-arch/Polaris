@@ -589,6 +589,8 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            ~/Code/polaris-mobile-ci/ndk-source.properties
+            ~/Code/polaris-mobile-ci/sdk-input-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json
@@ -1153,6 +1155,8 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            ~/Code/polaris-mobile-ci/ndk-source.properties
+            ~/Code/polaris-mobile-ci/sdk-input-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json

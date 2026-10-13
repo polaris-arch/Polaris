@@ -64,6 +64,10 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
         "Private directory for held inert core/sidecar objects; no execution"),
     ("crates/helper/src/platform/macos/native_birth/tests/mod.rs", Kind::ExecBit, 1,
         "Private directory for a hashed inert content-id lease fixture"),
+    ("src-tauri/src/runtime/core_store/tests/mod.rs", Kind::ExecBit, 1,
+        "Temp root directory mode 0777 rejects unsafe custody; no executable file"),
+    ("src-tauri/src/runtime/update_install/tests/lease_recovery.rs", Kind::ExecBit, 2,
+        "Fixture root and old journal directory modes 0700; executable helper uses shared writer"),
     (
         HELPER_FILE,
         Kind::ExecBit,
@@ -78,9 +82,9 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     ),
     (
         "crates/helper-client/src/manager/tests/mod.rs",
-        Kind::Shebang,
+        Kind::ExecBit,
         2,
-        "断言生成的安装脚本首行，不落盘执行",
+        "One private journal directory; one same-crate shared writer chmod after cp child closes target fd",
     ),
     (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",
@@ -367,48 +371,68 @@ fn the_scan_surface_and_the_helper_are_what_the_gate_assumes() {
          要么共用办法改了名而本门的针没跟着改"
     );
 
-    let helper_source = &files
-        .iter()
-        .find(|(rel, _)| rel == HELPER_FILE)
-        .expect("共用办法所在文件")
-        .1;
-    let syntax = polaris_source_probe::mask_comments_and_strings(helper_source);
+    let helper_files = [HELPER_FILE, "crates/helper-client/src/manager/tests/mod.rs"];
     let definition = format!("fn {HELPER}(");
-    let starts: Vec<_> = syntax.match_indices(&definition).collect();
-    assert_eq!(starts.len(), 1, "共用办法的定义必须唯一");
-    let start = starts[0].0;
-    let open = start + syntax[start..].find('{').expect("共用办法没有函数体");
-    let mut depth = 0usize;
-    let mut end = open;
-    for (offset, byte) in syntax.as_bytes()[open..].iter().enumerate() {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = open + offset;
-                    break;
+    let definitions: Vec<_> = files
+        .iter()
+        .filter_map(|(rel, source)| {
+            let count = polaris_source_probe::mask_comments_and_strings(source)
+                .matches(&definition)
+                .count();
+            (count > 0).then_some((rel.as_str(), count))
+        })
+        .collect();
+    let expected: Vec<_> = helper_files.iter().map(|path| (*path, 1)).collect();
+    let actual: std::collections::BTreeMap<_, _> = definitions.into_iter().collect();
+    let expected: std::collections::BTreeMap<_, _> = expected.into_iter().collect();
+    assert_eq!(
+        actual, expected,
+        "Only the two exact shared-writer definitions are supported"
+    );
+    for helper_file in helper_files {
+        let helper_source = &files
+            .iter()
+            .find(|(rel, _)| rel == helper_file)
+            .expect("共用办法所在文件")
+            .1;
+        let syntax = polaris_source_probe::mask_comments_and_strings(helper_source);
+        let definition = format!("fn {HELPER}(");
+        let starts: Vec<_> = syntax.match_indices(&definition).collect();
+        assert_eq!(starts.len(), 1, "共用办法的定义必须唯一");
+        let start = starts[0].0;
+        let open = start + syntax[start..].find('{').expect("共用办法没有函数体");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (offset, byte) in syntax.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset;
+                        break;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    let body_syntax = &syntax[open..=end];
-    let body = &helper_source[open..=end];
-    assert!(
-        body.contains("Command::new(\"cp\")") && body_syntax.contains(".status()"),
-        "切片自检：共用办法的函数体里应有写入子进程及对它的等待"
-    );
-    assert!(
-        body_syntax.matches("fs::write(").count() == 1 && body.contains("fs::write(&staged,"),
-        "共用办法在本进程里只许写暂存文件"
-    );
-    for forbidden in ["File::create", "OpenOptions", "fs::copy(", "File::options"] {
+        let body_syntax = &syntax[open..=end];
+        let body = &helper_source[open..=end];
         assert!(
-            !body_syntax.contains(forbidden),
-            "共用办法自己在本进程里开了目标文件（`{forbidden}`）—— 写句柄一旦存在于测试进程，\
-             别的线程 fork 时就能继承它，整套办法失效"
+            body.contains("Command::new(\"cp\")") && body_syntax.contains(".status()"),
+            "切片自检：共用办法的函数体里应有写入子进程及对它的等待"
         );
+        assert!(
+            body_syntax.matches("fs::write(").count() == 1 && body.contains("fs::write(&staged,"),
+            "共用办法在本进程里只许写暂存文件"
+        );
+        for forbidden in ["File::create", "OpenOptions", "fs::copy(", "File::options"] {
+            assert!(
+                !body_syntax.contains(forbidden),
+                "共用办法自己在本进程里开了目标文件（`{forbidden}`）—— 写句柄一旦存在于测试进程，\
+                 别的线程 fork 时就能继承它，整套办法失效"
+            );
+        }
     }
 }
 

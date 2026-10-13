@@ -74,6 +74,28 @@ fn birth_daemon_runtime(
     (test_runtime_in_on(dir.clone(), helper), dir, frames)
 }
 
+#[cfg(target_os = "linux")]
+fn pinned_birth_started_reply(pid: u32, birth: &str) -> String {
+    let id = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    let target = exact_helper_target(pid, birth);
+    format!(
+        "{}\n",
+        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::PinnedStart {
+            id,
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(
+                polaris_helper_proto::LinuxBirthStart::Started {
+                    target,
+                    timing: None
+                },
+            ),
+        },)
+        .to_wire_line()
+    )
+}
+
 fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
     super::super::android_bridge::AndroidExactTarget {
         run_id: run_id.to_owned(),
@@ -2102,13 +2124,13 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
     let a_hex = "00112233445566778899aabbccddeeff";
     let b_hex = "11112222333344445555666677778888";
     let (rt, dir, frames) = birth_daemon_runtime([
-        format!("OK birth-started {a_pid} {a_hex}\n"),
+        pinned_birth_started_reply(a_pid, a_hex),
         format!("OK birth-stopped {a_pid} {a_hex}\n"),
-        format!("OK birth-started {b_pid} {b_hex}\n"),
+        pinned_birth_started_reply(b_pid, b_hex),
     ]);
     let gate = rt.mesh.tailscale_state_gate().await;
     let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
-    let binary = dir.join("missing-test-core"); // Reconcile is best effort; no host helper.
+    let binary = dir.join("missing-test-core"); // Selected readiness is an isolated fixture; no host helper.
     let config_path = dir.join("test-core.json");
     let mut a_reservation = rt
         .mesh
@@ -2181,9 +2203,13 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
             3,
             "only Start A, Stop A, Start B may reach the daemon"
         );
-        assert!(sent[0].starts_with("start-birth-safe\n"));
+        let id = crate::runtime::core_identity::selected_id(
+            crate::runtime::core_identity::current_platform().unwrap(),
+        )
+        .unwrap();
+        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
         assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
-        assert!(sent[2].starts_with("start-birth-safe\n"));
+        assert!(sent[2].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
     }
     b_process.start_kill().unwrap();
     b_process.wait().await.unwrap();
@@ -2195,7 +2221,7 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     let pid = u32::MAX; // checked_pid rejects it without probing any host process.
     let hex = "00112233445566778899aabbccddeeff";
     let (rt, dir, frames) = birth_daemon_runtime([
-        format!("OK birth-started {pid} {hex}\n"),
+        pinned_birth_started_reply(pid, hex),
         format!("OK birth-stopped {pid} {hex}\n"),
     ]);
     let gate = rt.mesh.tailscale_state_gate().await;
@@ -2230,8 +2256,69 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     let sent = frames.lock().unwrap();
     assert_eq!(sent.len(), 2);
-    assert!(sent[0].starts_with("start-birth-safe\n"));
+    let id = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
     assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
+}
+
+/// A legacy birth receipt or a different CoreID may identify a process to stop,
+/// but cannot attest a selected Start. Keep the production rejection/cleanup leg
+/// as the negative control for the pinned positive transport fixtures above.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unpinned_and_wrong_id_birth_receipts_are_rejected_and_exact_stopped() {
+    let pid = u32::MAX; // checked_pid refuses this value without a host process probe.
+    let birth = "00112233445566778899aabbccddeeff";
+    let selected = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    let wrong = if selected.as_str() == "b".repeat(64) {
+        "a".repeat(64)
+    } else {
+        "b".repeat(64)
+    };
+    for reply in [
+        format!("OK birth-started {pid} {birth}\n"),
+        format!("OK birth-started {pid} {birth} core={wrong}\n"),
+    ] {
+        let (rt, dir, frames) =
+            birth_daemon_runtime([reply, format!("OK birth-stopped {pid} {birth}\n")]);
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints": []}),
+                &gate,
+                rt.mesh.mint_tailscale_main_birth(),
+            )
+            .await
+            .unwrap();
+        let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+        let error = rt
+            .spawn_core_via_helper(
+                &dir.join("not-executed-core"),
+                &dir.join("config.json"),
+                &user_config,
+                rt.gate.generation(),
+                &mut reservation,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Some(code::HELPER_CORE_MISMATCH));
+        assert!(error
+            .message
+            .starts_with("helper content identity mismatch;"));
+        assert!(!rt.child.lock().unwrap().has_helper_start());
+        assert!(rt.pid.lock().unwrap().is_none());
+        let sent = frames.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", selected.as_str())));
+        assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{birth}\n"));
+    }
 }
 
 #[tokio::test]

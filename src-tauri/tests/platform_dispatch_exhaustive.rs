@@ -2695,9 +2695,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/geo_seed.rs",
         "not(target_os = \"android\")",
-        2,
+        3,
         IosSide::DiffersUndecided,
-        "非 Android 候选从 exe 目录找随包 resources/data 并在 release 剔除源码仓；\
+        "非 Android 包含候选纯函数、current_exe 入口及别名三处；从 exe 目录找随包 resources/data 并在 release 剔除源码仓；\
          iOS app bundle 的真实资源布局尚无构建产物验证，当前沿用此路径待核。",
     ),
     (

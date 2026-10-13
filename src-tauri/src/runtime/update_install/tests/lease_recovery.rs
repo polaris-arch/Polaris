@@ -54,10 +54,14 @@ impl Fixture {
         let source = self.0.join(format!("source-{}", uuid::Uuid::new_v4()));
         // flock on the inherited open description persists in Bash after this
         // short-lived fixture exits, as in the actual process_lease utility.
-        let helper = b"#!/usr/bin/env python3\nimport sys,fcntl\nfd=int(sys.argv[-1])\nfcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB if sys.argv[1]=='lease-acquire' else fcntl.LOCK_UN)\n";
-        fs::write(&source, helper).unwrap();
+        crate::test_support::write_executable_stand_in(
+            &source,
+            b"#!/usr/bin/env python3\nimport sys,fcntl\nfd=int(sys.argv[-1])\nfcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB if sys.argv[1]=='lease-acquire' else fcntl.LOCK_UN)\n",
+        );
+        let helper = fs::read(&source).unwrap();
         let frozen =
-            freeze_lease_helper_in(&self.0, &source, &polaris_updater::sha256_hex(helper)).unwrap();
+            freeze_lease_helper_in(&self.0, &source, &polaris_updater::sha256_hex(&helper))
+                .unwrap();
         let object = if cfg!(target_os = "macos") {
             "[ -d \"$1\" ] && [ \"$(hash_file \"$1/content\")\" = \"$(cat \"$2\")\" ]"
         } else {
@@ -73,7 +77,7 @@ impl Fixture {
             .env("POLARIS_LOCK_HELPER", frozen.path())
             .env(
                 "POLARIS_LOCK_HELPER_SHA256",
-                polaris_updater::sha256_hex(helper),
+                polaris_updater::sha256_hex(&helper),
             );
         // Only this isolated fixture transfers removal to the production shell.
         let mut frozen = frozen;

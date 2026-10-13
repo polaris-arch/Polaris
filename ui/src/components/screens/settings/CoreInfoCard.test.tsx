@@ -69,10 +69,12 @@ describe('内核只读信息卡', () => {
   ] as const)('selected content %s remains a read-only native observation', (state, label) => {
     const selectedCore = { id: 'a'.repeat(64), version: '1.15.0-alpha.12', providerFingerprint: 'b'.repeat(64), state };
     const markup = renderToStaticMarkup(<CoreInfoCard info={FULL} selectedCore={selectedCore} />);
-    expect(cell(markup, 'selected-id')).toBe('a'.repeat(16));
-    expect(cell(markup, 'provider')).toBe('b'.repeat(16));
+    expect(cell(markup, 'selected-id')).toBe(selectedCore.id);
+    expect(cell(markup, 'provider')).toBe(selectedCore.providerFingerprint);
     expect(cell(markup, 'installed-state')).toBe(label);
+    expect(markup).toContain('overflow-wrap:anywhere');
     const withoutTip = markup.replace(/<span class="info-i"[\s\S]*?<\/span>/g, '');
+    expect(withoutTip).not.toContain('data-tip=');
     expect(INTERACTIVE.test(withoutTip)).toBe(false);
   });
 

@@ -777,7 +777,7 @@ fn start_req_with_ppid(
     ppid: Option<u32>,
 ) -> Request {
     pinned_start(
-        &h,
+        h,
         StartParams {
             cfg: r"C:\Users\polaris\config\c.json".to_owned(),
             log: String::new(),

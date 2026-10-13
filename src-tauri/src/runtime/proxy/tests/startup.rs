@@ -1576,7 +1576,7 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
         .expect_err("无 helper daemon → 起核必失败（不静默直起）")
         .message;
     assert!(
-        error.starts_with("helper 起核通信失败："),
+        error.starts_with("helper pinned 起核通信失败："),
         "必须抵达所测的起核通信失败分支：{error}"
     );
     assert!(
@@ -1587,17 +1587,12 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     assert!(rt.child.lock().unwrap().has_helper_start());
 }
 
-/// 🔴 **配套闸**：确认不了提权助手将要执行的是随包内核 ⇒ 拒绝起核，落专用码，**一帧起核请求
-/// 都不发**。
-///
-/// 走真对账（把测试工厂置的桩清掉）：随包核路径不存在 ⇒ 对账第一步就读不到现役核 ⇒ 确认不了。
-/// 此前这条腿只告警，随后照常向助手发起核请求，由 root / SYSTEM 执行受保护目录里现有的那份。
-///
-/// 替身 helper 的通信恒失败；本条断言的是**根本没走到通信**（没有 helper route、没有 Start
-/// custody），所以红绿与通信替身无关。
-///
-/// **变异探针**：把 `spawn_core_via_helper` 里的配套闸删掉（忽略对账结论）⇒ 走到起核通信 ⇒
-/// 错误码不再是 `HELPER_CORE_MISMATCH`、且留下了 helper route ⇒ 转红。
+/// The current daemon must attest the compiled selected CoreID before Start
+/// custody is reserved. Clear the isolated readiness fixture to exercise the
+/// real CoreStatus preflight: NeverConnect cannot confirm that installed ID.
+/// No binary path, runtime install-core fallback, privileged IPC, or native core
+/// is admitted by this fixture. Its positive control restores readiness only.
+/// Removing this preflight would reach Start communication and retain custody.
 #[tokio::test]
 async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
     let (rt, dir) = test_runtime_on(Platform::Linux);
@@ -1641,7 +1636,7 @@ async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
         .expect_err("替身 helper 不可连接");
     assert_eq!(error.code, None, "{error}");
     assert!(
-        error.message.starts_with("helper 起核通信失败："),
+        error.message.starts_with("helper pinned 起核通信失败："),
         "{error}"
     );
     assert!(rt.child.lock().unwrap().has_helper_start());
@@ -3914,50 +3909,41 @@ fn start_inner_feeds_wait_ready_the_scale_derived_budget() {
     );
 }
 
-/// 🔴 **S-6：能力记号的身份必须在**发 `install-core` 之前**探到。**
-///
-/// 事后再探会把「回 `ERR unknown` 的那个 helper」与「此刻在管道那头的 helper」混为一谈：
-/// UAC 重装是秒级操作，两者之间完全可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒
-/// 失效键立刻就是最新值 ⇒ 本会话内永久跳过受保护核对账，而新 helper 其实是支持的。
-/// 反过来（探完才换代）只会让记号挂在旧身份上，下次探到新身份即失效、重试 —— 方向安全。
-///
-/// 源码级的理由：这一格要一个「回 `ERR unknown` 且在两次调用之间被换掉」的真 helper，本机造不出。
-///
-/// 变异锁：把 `helper_build_probe()` 挪到 `install_core(` 之后 → 第二/第三条转红；
-/// 在 `install_core` 之后再探一次（哪怕前面那次留着）→ 第三条转红。
+/// Runtime never uploads an executable or caches an obsolete install-core
+/// capability. Each Start reads the current daemon's selected CoreID status
+/// before reserving Start custody or sending its pinned mutation.
 #[test]
-fn install_core_capability_note_uses_the_identity_probed_before_the_call() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
-        "    async fn reconcile_protected_core(",
-    );
-    // 切点自检：切出来的确实是那个方法（含它的两个锚点），否则下面全是空断言。
-    let install_at = body
-        .find("helper.install_core(")
-        .expect("切点自检失败：方法体里没有 install_core 调用");
-    let probe_at = body
-        .find("let build_before = helper.helper_build_probe();")
-        .expect("能力记号的身份没有单独探一次并存下来（事后再探 = 记号可能挂到新 helper 身上）");
-    assert!(
-        probe_at < install_at,
-        "身份必须在发 install-core **之前**探：两者之间 helper 可能已被重装换代"
-    );
-    // `install_core` 之后不许再出现探测调用 —— 留一条事后腿等于把上面那条顺序断言架空。
-    let after = &body[install_at..];
-    assert!(
-        !after.contains("helper_build_probe()"),
-        "install-core 之后还在探身份：那次探到的可能是刚换上的新 helper"
-    );
-    // 正面断言：记下去的就是 `build_before` 那一份（只钉顺序会被「探了但没用」骗过）。
-    assert!(
-        after.contains("note_install_core_unsupported(&build_before)"),
-        "Unsupported 臂没有拿 `build_before` 去记号"
-    );
-    // 命中判定那一路的探测（缓存命中检查）是另一回事，必须仍在 —— 它探的就是「此刻的 helper」。
-    assert!(
-        body[..install_at].contains("&helper.helper_build_probe()"),
-        "缓存命中判定的即时探测被一起删了：那一路要的恰恰是「此刻在管道那头的是谁」"
-    );
+fn selected_content_preflight_rechecks_current_daemon_before_start_custody() {
+    let proxy = module_code("runtime/proxy");
+    let body = method_body(&proxy, "    pub(super) async fn spawn_core_via_helper(");
+    let status = body.find("helper.require_selected_core()").unwrap();
+    for mutation in [
+        "self.lease_legacy_start()",
+        "self.register_helper_start_backend_with_main(",
+        "helper.start_core(",
+    ] {
+        assert!(
+            status < body.find(mutation).unwrap(),
+            "selected content preflight must precede {mutation}"
+        );
+    }
+    assert!(body.contains("if let Err(why) = selected_ready"));
+    assert!(body.contains("return Err(StartError::coded(message, error_code))"));
+    for retired in [
+        "reconcile_protected_core",
+        "note_install_core_unsupported",
+        "helper.install_core(",
+    ] {
+        assert!(
+            !proxy.contains(retired),
+            "retired runtime content mutation/cache: {retired}"
+        );
+    }
+    let helper = crate::test_support::crate_code("runtime/helper.rs");
+    let status_body = method_body(&helper, "    pub(crate) fn core_status(");
+    assert!(status_body.contains("crate::runtime::core_identity::selected_id("));
+    assert!(status_body.contains("query_core_status(&self.build_client()?, &id)"));
+    assert!(!helper.contains("Request::InstallCore"));
 }
 
 /// 取值函数单测不能覆盖历史漏接；从真实 controller marker 穿过生产 generate_deps。

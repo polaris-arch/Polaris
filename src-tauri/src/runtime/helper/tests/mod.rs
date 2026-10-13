@@ -1093,7 +1093,7 @@ fn start_core_records_the_identity_baseline_on_both_response_legs() {
 }
 
 #[test]
-fn production_start_selects_exact_linux_and_native_desktop_birth_wire() {
+fn production_start_selects_compiled_id_on_linux_and_native_desktop_birth_wire() {
     let body = impl_method_body(
         &crate_code("runtime/helper.rs"),
         concat!(
@@ -1106,9 +1106,14 @@ fn production_start_selects_exact_linux_and_native_desktop_birth_wire() {
             "    ) -> Result<HelperStartResult, String> {"
         ),
     );
-    assert!(body.contains("Platform::Mac | Platform::Win => Request::NativeStartBirth(common)"));
+    assert!(body.contains("Platform::Mac | Platform::Win => Request::NativeStartPinned(params)"));
+    assert!(body.contains("Platform::Linux => Request::LinuxStartPinned(params)"));
+    assert!(body.contains("crate::runtime::core_identity::selected_id("));
+    assert!(body.contains("id: id.clone()"));
+    assert!(body.contains("if actual == id"));
+    assert!(!body.contains("Request::LinuxStartBirth("));
+    assert!(!body.contains("Request::NativeStartBirth("));
     assert!(body.contains("if self.platform == Platform::Linux"));
-    assert!(body.contains("Request::LinuxStartBirth(params)"));
     assert!(body.contains("return classify_linux_birth_start_response(resp)"));
 }
 

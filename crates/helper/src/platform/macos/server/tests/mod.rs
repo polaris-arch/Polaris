@@ -41,6 +41,8 @@ struct TestServices {
     child: Mutex<Option<ChildHandle>>,
     uid: i64,
     runner_calls: AtomicUsize,
+    pinned_calls: Mutex<Vec<(polaris_helper_proto::core_protocol::PinnedStartParams, u32)>>,
+    native_pinned_fixture: bool,
 }
 
 impl TestServices {
@@ -50,7 +52,15 @@ impl TestServices {
             child: Mutex::new(None),
             uid: 0,
             runner_calls: AtomicUsize::new(0),
+            pinned_calls: Mutex::new(Vec::new()),
+            native_pinned_fixture: false,
         }
+    }
+
+    fn pinned_fixture(token: &str) -> Self {
+        let mut services = Self::new(token);
+        services.native_pinned_fixture = true;
+        services
     }
 
     fn runner_calls(&self) -> usize {
@@ -95,6 +105,39 @@ impl crate::platform::macos::exec::CommandRunner for TestServices {
 }
 
 impl MacServices for TestServices {
+    fn native_caller_allowed(
+        &self,
+        uid: Option<u32>,
+        id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        if self.native_pinned_fixture {
+            uid == Some(1000) && id.is_some_and(|id| id.as_str() == "a".repeat(64))
+        } else {
+            uid == Some(0)
+        }
+    }
+    fn native_start_pinned(
+        &self,
+        params: &polaris_helper_proto::core_protocol::PinnedStartParams,
+        uid: u32,
+    ) -> Result<polaris_helper_proto::NativeBirthStart, SpawnError> {
+        if !self.native_pinned_fixture {
+            return Err(SpawnError::NotImplemented);
+        }
+        self.pinned_calls
+            .lock()
+            .unwrap()
+            .push((params.clone(), uid));
+        Ok(polaris_helper_proto::NativeBirthStart::Started {
+            target: polaris_helper_proto::HelperBirthTarget::parse_wire(
+                "4242",
+                "01010101010101010101010101010101",
+            )
+            .unwrap(),
+            timing: None,
+            created: None,
+        })
+    }
     fn token_store(&self) -> &dyn TokenStore {
         self
     }
@@ -476,7 +519,7 @@ fn oversized_token_command_and_ordinary_argument_all_fail_before_dispatch() {
     frames.push([b"T\n".to_vec(), oversized.clone(), b"\n".to_vec()].concat());
     frames.push(
         [
-            b"T\nstart\n".to_vec(),
+            b"T\nroute-add\n".to_vec(),
             oversized,
             b"\n/tmp/log\n0\n".to_vec(),
         ]
@@ -497,21 +540,133 @@ fn oversized_token_command_and_ordinary_argument_all_fail_before_dispatch() {
 }
 
 #[test]
-fn process_conn_start_full_flow() {
-    let svc = TestServices::new("T");
-    let cfg = test_config();
-    let input = Cursor::new(b"T\nstart\n/Users/test/Polaris/c.json\n\n0\n".to_vec());
+fn process_conn_pinned_start_full_flow_with_native_peer() {
+    use polaris_helper_proto::{
+        codec,
+        core_manifest::CoreId,
+        core_protocol::{PinnedBirthStart, PinnedStartParams},
+        NativeBirthStart, Platform, Response, ResponseKind, StartParams,
+    };
+    let params = PinnedStartParams {
+        id: CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams {
+            cfg: "/Users/test/Polaris/c.json".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    };
+    let svc = TestServices::pinned_fixture("T");
+    let bytes = codec::encode(
+        Platform::Mac,
+        "T",
+        &Request::NativeStartPinned(params.clone()),
+    );
     let mut output = Vec::new();
-    let outcome = process_connection(input, &mut output, &svc, &cfg, None);
+    let outcome = process_connection_from_peer(
+        Cursor::new(bytes),
+        &mut output,
+        &svc,
+        &test_config(),
+        None,
+        Some(1000),
+    );
     assert!(matches!(outcome, ConnOutcome::Done));
-    // spawn_child mock 返回 4242；新版三平台 helper 追加可选分段计时。
-    let line = String::from_utf8(output).unwrap();
-    assert!(matches!(
-        polaris_helper_proto::Response::parse(line.trim_end()),
-        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::Start(
-            polaris_helper_proto::Start::StartedTimed { pid: 4242, .. }
-        ))
-    ));
+    // The real frame decoder and peer admission reach only the injected native
+    // pinned service. No executable or native process is run by this fixture.
+    let target = polaris_helper_proto::HelperBirthTarget::parse_wire(
+        "4242",
+        "01010101010101010101010101010101",
+    )
+    .unwrap();
+    assert_eq!(
+        Response::parse(String::from_utf8(output).unwrap().trim_end()),
+        Response::Ok(ResponseKind::PinnedStart {
+            id: params.id.clone(),
+            start: PinnedBirthStart::Native(NativeBirthStart::Started {
+                target,
+                timing: None,
+                created: None,
+            }),
+        })
+    );
+    assert_eq!(*svc.pinned_calls.lock().unwrap(), [(params.clone(), 1000)]);
+    assert_eq!(svc.runner_calls(), 0);
+    assert!(svc.child.lock().unwrap().is_none());
+    for (token, uid, id, expected_code) in [
+        (
+            "wrong-token",
+            Some(1000),
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Auth,
+        ),
+        (
+            "T",
+            None,
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Auth,
+        ),
+        (
+            "T",
+            Some(1001),
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Start,
+        ),
+        (
+            "T",
+            Some(1000),
+            CoreId::parse(&"b".repeat(64)).unwrap(),
+            polaris_helper_proto::ErrorCode::Start,
+        ),
+    ] {
+        let svc = TestServices::pinned_fixture("T");
+        let mut rejected = params.clone();
+        rejected.id = id;
+        let bytes = codec::encode(Platform::Mac, token, &Request::NativeStartPinned(rejected));
+        let mut output = Vec::new();
+        process_connection_from_peer(
+            Cursor::new(bytes),
+            &mut output,
+            &svc,
+            &test_config(),
+            None,
+            uid,
+        );
+        assert!(
+            matches!(Response::parse(String::from_utf8(output).unwrap().trim_end()),
+            Response::Err(error) if error.code == expected_code)
+        );
+        assert!(svc.pinned_calls.lock().unwrap().is_empty());
+        assert_eq!(svc.runner_calls(), 0);
+        assert!(svc.child.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn retired_start_frames_are_refused_without_consuming_parameters_or_spawning() {
+    for command in [
+        "start",
+        polaris_helper_proto::command::common::NATIVE_START_BIRTH,
+    ] {
+        let svc = TestServices::new("T");
+        let frame = format!(
+            "T\n{command}\n{}\n\n0\n",
+            "x".repeat(MAX_WIRE_LINE_BYTES + 1)
+        );
+        let mut output = Vec::new();
+        process_connection_from_peer(
+            Cursor::new(frame),
+            &mut output,
+            &svc,
+            &test_config(),
+            None,
+            Some(1000),
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), "ERR unknown\n");
+        assert!(svc.pinned_calls.lock().unwrap().is_empty());
+        assert_eq!(svc.runner_calls(), 0);
+        assert!(svc.child.lock().unwrap().is_none());
+    }
 }
 
 #[test]

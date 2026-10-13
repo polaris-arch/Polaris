@@ -220,10 +220,9 @@ fn real_failure_skip_disconnected_and_missing_identity_remain_distinct() {
 
 #[test]
 fn config_content_digest_matches_the_renderer_shared_golden_bytes() {
-    let fixtures: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../ui/src/contracts/measurement-config-digest.fixture.json"
-    )))
+    let fixtures: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/measurement-config-digest.fixture.json",
+    ))
     .expect("measurement config fixtures");
     for fixture in fixtures.as_array().expect("fixtures are an array") {
         let canonical =
@@ -243,10 +242,9 @@ fn config_content_digest_matches_the_renderer_shared_golden_bytes() {
 fn actual_producer_identity_round_trips_to_the_renderer_golden_without_raw_credentials() {
     use crate::commands::speedtest::{RunEvents, SpeedTestRequest};
     use crate::runtime::node_fingerprints;
-    let fixture: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../ui/src/contracts/measurement-producer.fixture.json"
-    )))
+    let fixture: Value = serde_json::from_str(&crate::test_support::repo_file(
+        "ui/src/contracts/measurement-producer.fixture.json",
+    ))
     .unwrap();
     let config = json!({"servers": [fixture["server"].clone()]});
     let server = serde_json::from_value(fixture["server"].clone()).unwrap();

@@ -158,6 +158,9 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     // StdCommandRunner 的两条流各交给一个 CommandReader，起线程跑原来那个读到 EOF 的 `drain`。
     // 精确接线与真实读体由 std_command_runner_starts_both_eof_readers_before_it_waits 钉住。
     "CommandReader::start(",
+    // Legacy observer: two independent bounded EOF readers before polling.
+    // Real input reader and both thread handoffs are separately pinned below.
+    "capture(",
 ];
 
 /// 「带着两条未排空管道的 child」这件事在**类型**上的全部落点。
@@ -256,6 +259,12 @@ const PIPED_SITES: &[PipedSite] = &[
         kind: SiteKind::Producer,
         drain_forms: &[],
     },
+    PipedSite {
+        file: "crates/helper/src/legacy_use.rs",
+        anchor: "fn observe_command(",
+        kind: SiteKind::Sink,
+        drain_forms: &["capture("],
+    },
     // ── crates/helper（特权守护进程 / 服务；卡死后果比 app 侧重）──
     PipedSite {
         file: "crates/helper/src/platform/linux/resolved_dns.rs",
@@ -266,7 +275,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/linux/server.rs",
-        anchor: "impl CoreSpawner for AmbientCapsSpawner {",
+        anchor: "fn spawn_verified(",
         kind: SiteKind::Sink,
         drain_forms: &["spawn_pipe_loggers_with_file"],
     },
@@ -2063,4 +2072,54 @@ fn the_order_leg_is_red_on_the_historical_resolvectl_defect() {
         err.contains("晚于等待"),
         "红的不是次序腿，而是别的东西（{err}）—— 那这次回放仍然没有证明次序判据对真缺陷敏感"
     );
+}
+
+fn legacy_capture_wiring_is_complete(owner: &str, reader: &str) -> bool {
+    let compact: String = owner.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(wait) = first_of(&compact, WAIT_FORMS) else {
+        return false;
+    };
+    for stream in ["out", "err"] {
+        let handoff = format!("let{stream}=std::thread::spawn(move||capture({stream}));");
+        if compact.matches(&handoff).count() != 1
+            || compact.find(&handoff).is_none_or(|at| at >= wait)
+            || !compact.contains(&format!(
+                "let{stream}=child.{}.take()",
+                if stream == "out" { "stdout" } else { "stderr" }
+            ))
+            || !compact.contains(&format!("{stream}.join()"))
+        {
+            return false;
+        }
+    }
+    let reader: String = reader.chars().filter(|c| !c.is_whitespace()).collect();
+    reader.contains("input.by_ref().take(OUTPUT_LIMIT+1).read_to_end(&mutbytes)?")
+        && reader.contains("ifbytes.len()asu64>OUTPUT_LIMIT")
+        && reader.contains("returnErr(")
+}
+
+#[test]
+fn legacy_observer_starts_both_bounded_readers_before_waiting_and_joins_them() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, "crates/helper/src/legacy_use.rs");
+    let run = block_of(owner, "fn observe_command(");
+    let reader = block_of(owner, "fn capture(");
+    assert!(legacy_capture_wiring_is_complete(run, reader));
+    for broken in [
+        run.replace("capture(out)", "ignore(out)"),
+        run.replace("capture(err)", "ignore(err)"),
+        run.replace(".join()", ".discard()"),
+        format!("child.try_wait();{run}"),
+    ] {
+        assert!(!legacy_capture_wiring_is_complete(&broken, reader));
+    }
+    assert!(!legacy_capture_wiring_is_complete(
+        run,
+        &reader.replace(".take(OUTPUT_LIMIT + 1)", "")
+    ));
+    assert!(!legacy_capture_wiring_is_complete(
+        run,
+        &reader.replace(".read_to_end(", ".ignore(")
+    ));
 }

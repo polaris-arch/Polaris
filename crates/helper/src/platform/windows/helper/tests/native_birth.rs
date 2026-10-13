@@ -9,10 +9,10 @@ fn start(
     forwarding: bool,
 ) -> HelperBirthTarget {
     let reply = handle_selected(
-        &h,
+        h,
         "real-token",
         pinned_start(
-            &h,
+            h,
             StartParams {
                 cfg: r"C:\Users\polaris\config\c.json".into(),
                 log: String::new(),
@@ -34,7 +34,7 @@ fn stop(
     h: &WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps>,
     target: HelperBirthTarget,
 ) -> NativeBirthStop {
-    let reply = handle_selected(&h, "real-token", Request::NativeStopBirth { target });
+    let reply = handle_selected(h, "real-token", Request::NativeStopBirth { target });
     let HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStop(stop))) = reply else {
         panic!("{reply:?}");
     };
@@ -295,7 +295,10 @@ fn native_status_is_read_only_capability_and_never_mints_a_birth_for_legacy_stat
     h.child_mu.lock().unwrap().pid = Some(42);
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
-        HandleOutcome::AuthFailed
+        HandleOutcome::Respond(Response::Err(polaris_helper_proto::Error::with_detail(
+            polaris_helper_proto::ErrorCode::Auth,
+            "slot-owned-by-other-user",
+        )))
     );
     let bad = handle_selected(
         &h,
@@ -312,10 +315,24 @@ fn native_status_is_read_only_capability_and_never_mints_a_birth_for_legacy_stat
     );
     assert!(matches!(
         bad,
-        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
-            NativeBirthStart::NotAdmittedUnknown { target: None }
-        )))
+        HandleOutcome::Respond(Response::Err(error))
+            if error.code == polaris_helper_proto::ErrorCode::Auth
     ));
+    assert_eq!(h.child_mu.lock().unwrap().pid, Some(42));
+    assert!(h.child_mu.lock().unwrap().native.is_none());
+    // Native administrator status is observable as Unknown, never a minted
+    // birth; the ordinary user cannot bypass the retained legacy slot.
+    let admin = crate::user_control::NativePeer {
+        identity: h.test_context.as_ref().unwrap().peer.identity.clone(),
+        administrator: true,
+    };
+    assert_eq!(
+        h.dispatch(Request::NativeStatusBirth, Some(&admin)),
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStatus(
+            NativeBirthStatus::Unknown { target: None },
+        )))
+    );
+    assert_eq!(h.proc.snapshot().start_calls, 0);
 }
 
 #[test]

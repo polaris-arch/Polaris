@@ -56,6 +56,8 @@ def prepare():
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env)
     ndk = run([sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py', root]).strip()
     require(Path(ndk).is_dir(), 'actual NDK preparation failed')
+    from android_sdk import observe_ndk_input
+    observe_ndk_input(root, ndk, value['android'])
     jdk = Path(os.environ['JAVA_HOME_17_X64']).resolve(strict=True)
     sdk = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', ''))).resolve(strict=True)
     paths = {'go': go, 'gomobile': str(tools / 'gomobile'), 'gobind': str(tools / 'gobind'),

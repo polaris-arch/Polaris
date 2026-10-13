@@ -364,15 +364,18 @@ fn slot_poison_during_tail_keeps_reaped_birth_without_stopped_cache() {
     assert_eq!(probe.waits.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(unix)]
 #[test]
 fn pinned_admission_binds_owner_and_content_under_the_same_slot_lock() {
     use polaris_helper_proto::core_manifest::{
         CoreFile, CoreId, CoreManifest, InstalledCoreManifest,
     };
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // Immutable inert bytes are read and hashed on every host, never executed.
     let raw = b"inert-mac-core";
     std::fs::write(directory.path().join("sing-box"), raw).unwrap();
     let core = CoreManifest {
@@ -457,4 +460,33 @@ fn authorization_does_not_wait_for_post_exit_tail_or_invert_its_locks() {
     probe.exited.store(true, Ordering::SeqCst);
     custody.drive(&birth, Instant::now(), &|| Ok(()));
     assert!(!custody.active());
+}
+
+#[test]
+fn upgrade_admission_closes_only_empty_custody_and_can_be_cancelled() {
+    let custody = NativeCustody::default();
+    assert!(custody.upgrade_admission(true));
+    assert_eq!(
+        custody.admit(),
+        Err(NativeBirthStart::NotAdmittedUnknown { target: None })
+    );
+    assert!(custody.upgrade_admission(false));
+    custody.admit().unwrap();
+    assert!(
+        !custody.upgrade_admission(true),
+        "in-flight spawn owns the reservation"
+    );
+    custody.abort_start();
+    let (birth, probe) = install(&custody, target(42, 1));
+    assert!(
+        !custody.upgrade_admission(true),
+        "retained native child blocks upgrade"
+    );
+    assert!(custody.is_current(&birth));
+    assert_eq!(probe.terms.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.kills.load(Ordering::SeqCst), 0);
+    probe.exited.store(true, Ordering::SeqCst);
+    custody.drive(&birth, Instant::now(), &|| Ok(()));
+    assert!(!custody.is_current(&birth));
+    assert!(custody.upgrade_admission(true));
 }

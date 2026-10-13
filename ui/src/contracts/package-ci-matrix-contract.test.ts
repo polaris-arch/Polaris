@@ -1189,13 +1189,21 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
       '${{ runner.temp }}/*.source-consumption.json',
     ];
+    // Match actual payload filename extensions, not the '.so' prefix of
+    // '*.source-consumption.json'. Exact evidence inventories remain required.
+    const isApkOrSoPayload = (path: string) => /(?:^|\/)[^/]*\.(?:apk|so)$/i.test(path.trim());
+    for (const path of ['app-arm64-release.apk', '/work/**/*.apk', '/work/libbox.so', '/work/**/*.so']) {
+      expect(isApkOrSoPayload(path), `actual payload must be refused: ${path}`).toBe(true);
+    }
+    expect(isApkOrSoPayload('${{ runner.temp }}/*.source-consumption.json')).toBe(false);
     for (const job of ['release_check', 'release-apk']) {
       const evidence = executable(stepBlock(jobBlock(android, job), 'Retain actual formal mobile component and original receipts'));
       const paths = evidence.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
       expect(paths, `${job}: exact formal evidence whitelist`).toEqual(formalEvidence);
       expect(evidence).toContain("if: always() && steps.libbox_input.outcome == 'success'");
       expect(evidence).toContain('if-no-files-found: error');
-      expect(evidence).not.toMatch(/(?:gh release|\*\.apk|\*\.so)/);
+      expect(evidence).not.toMatch(/\bgh\s+release\b/);
+      expect(paths.filter(isApkOrSoPayload), `${job}: no APK/SO payload in evidence upload`).toEqual([]);
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 新证据白名单仍是文本；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。

@@ -294,7 +294,10 @@ def container(data, helper):
     if data.startswith(FAT):
         bounds(0, 8, len(data), 'fat header')
         count = struct.unpack_from('>I', data, 4)[0]
-        require(count == 2, 'unsupported fat slice count')
+        # A valid single-target fat wrapper has one entry; the formal
+        # simulator wrapper requires two. Consumers still require their exact
+        # declared target inventory, never merely an arbitrary bounded count.
+        require(count in (1, 2), 'unsupported fat slice count')
         header_end = 8 + count * 20
         bounds(8, count * 20, len(data), 'fat table')
         slices, ranges = [], []
@@ -315,6 +318,9 @@ def container(data, helper):
         require(cursor == len(data), 'fat trailing bytes')
         for row in slices:
             row['archive'] = archive(data[row['offset']:row['offset'] + row['bytes']], helper)
+            code = [member['machO'] for member in row['archive']['members'] if member['classification'] == 'code']
+            require(code and all((obj['cpu'], obj['subCPU']) == (row['cpu'], row['subCPU']) for obj in code),
+                    'fat header/payload CPU differs')
         return {'kind': 'fat-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'slices': slices}
     if data.startswith(AR):
         return archive(data, helper)

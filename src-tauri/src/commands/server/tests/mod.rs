@@ -887,3 +887,5 @@ fn switch_now_moves_the_exit_only_to_the_decided_target_and_keeps_the_intent() {
     assert_eq!(error.code(), code::OUTBOUND_INTERFACE_UNAVAILABLE);
     assert_eq!(mgr.load_full().unwrap()["selectedServerId"], "n-b");
 }
+
+mod batch_source_protection;

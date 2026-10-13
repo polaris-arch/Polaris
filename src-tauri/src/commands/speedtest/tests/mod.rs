@@ -3809,20 +3809,47 @@ fn production_entries_wire_origin_instance_cancel_and_terminal() {
     let manual = compact_production_fn("pub async fn server_speed_test(");
     let failover = compact_production_fn("pub(crate) async fn probe_runtime_candidates(");
 
-    // 切点自检：每个切片恰含一处运行身份构造，且带着只属于该函数的锚点（切歪了会多出或缺失）。
-    for (name, body, own) in [
-        ("临时核腿", &temp, "TempCoreSession::run("),
-        ("池路径", &pool, "zero_testable_envelope("),
-        ("命令入口", &manual, "plan_speed_test("),
-        ("后台探测", &failover, "RuntimeProbeBatch::Busy;"),
+    // The manual paths freeze display-only omissions before constructing the
+    // executing run. Check both identities separately below; failover has no
+    // display snapshot. Exact counts still catch a misplaced/extra constructor.
+    for (name, body, own, constructors) in [
+        ("临时核腿", &temp, "TempCoreSession::run(", 2),
+        ("池路径", &pool, "zero_testable_envelope(", 2),
+        ("命令入口", &manual, "plan_speed_test(", 2),
+        ("后台探测", &failover, "RuntimeProbeBatch::Busy;", 1),
     ] {
-        assert_eq!(occurrences(body, "RunEvents::new("), 1, "{name}：切片不对");
+        assert_eq!(
+            occurrences(body, "RunEvents::new("),
+            constructors,
+            "{name}：切片不对"
+        );
         assert_eq!(
             occurrences(body, own),
             1,
             "{name}：切片不含自己的锚点 {own}"
         );
     }
+
+    // Omission snapshots retain the same origin/instance and configuration
+    // provenance as their path; a display snapshot must not mint another run.
+    for (body, displays) in [(&temp, 1), (&pool, 1), (&manual, 2)] {
+        assert_eq!(occurrences(body, "let_skip_events=RunEvents::new("), 1);
+        assert_eq!(occurrences(body, ".with_display_skipped("), displays);
+    }
+    assert!(temp.contains(
+        "RunEvents::new(run_id,&skip_request,CoreInstance::Temp,None,\
+         current_server_fingerprints(config),None,)"
+    ));
+    assert!(pool.contains(
+        "RunEvents::new(run_id,&skip_request,CoreInstance::Main{\
+         generation:proxy.core_generation(),start_time:proxy.status().start_time,},\
+         proxy.ready_main_emission_digest(proxy.core_generation()),targets.fingerprints.clone(),"
+    ));
+    assert!(manual.contains(
+        "RunEvents::new(&run_id,&fallback_skip_request,CoreInstance::Main{\
+         generation:proxy.core_generation(),start_time:status.start_time,},\
+         proxy.ready_main_emission_digest(proxy.core_generation()),BTreeMap::new(),"
+    ));
 
     // 临时核腿：手动来源、临时核实例（不带世代与配置摘要）、取消句柄进依赖、终态扣发。
     assert!(temp.contains("origin:SpeedTestOrigin::Manual,"));

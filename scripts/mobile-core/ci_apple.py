@@ -102,9 +102,12 @@ def evidence():
         component = root / 'component'
         paths.update(component.glob('*.json'))
         paths.update(component.glob('*.log'))
-        framework = component / 'Libbox.xcframework'
-        if framework.exists():
-            paths.update(path for path in framework.rglob('*') if path.is_file() or path.is_symlink())
+        frameworks = [component / 'Libbox.xcframework', component / 'staging/Libbox.xcframework']
+        for framework in frameworks:
+            if framework.exists():
+                # Failed inspection leaves the real generator output in staging.
+                # Preserve those bytes as unaccepted evidence, never a final receipt.
+                paths.update(path for path in framework.rglob('*') if path.is_file() or path.is_symlink())
         receipt = component / 'component-receipt.json'
         if receipt.exists():
             origins = read_receipt(receipt)['nativeInputs']
@@ -130,7 +133,8 @@ def evidence():
                         'original Apple evidence escaped its fixed slots')
                 name = path.relative_to(root).as_posix()
                 if path.is_symlink():
-                    require(path.is_relative_to(framework), 'only verified framework links may be retained')
+                    require(any(path.is_relative_to(framework) for framework in frameworks),
+                            'only actual component/staged framework links may be retained')
                     import stat
                     info = zipfile.ZipInfo(name)
                     info.create_system = 3
@@ -145,6 +149,8 @@ def evidence():
                 rows[name] = {'originalPath': str(path), **pin}
             index = {'schema': 'polaris-apple-original-evidence-v1', 'files': rows,
                      'completeUnsignedChain': (root / 'apple-chain.json').exists(),
+                     'componentAccepted': (component / 'component-receipt.json').exists(),
+                     'stagedComponentIsAccepted': False,
                      'devicePassed': False, 'publicationEligible': False}
             package.writestr('EVIDENCE-INDEX.json', json.dumps(index, indent=2) + '\n')
         print('Original selected bytes/paths preserved; unsigned chain is not device or signing acceptance')

@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 
 use polaris_helper_proto::core_manifest::{CoreFile, CoreId, CoreManifest};
 
-const RELEASE_CONTRACT: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../scripts/desktop-core/release-contract.json"
-));
+const RELEASE_CONTRACT: &str = include_str!("../../../scripts/desktop-core/release-contract.json");
 const COMPILED_INSTALLATION: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/selected-core-manifest.json"));
 

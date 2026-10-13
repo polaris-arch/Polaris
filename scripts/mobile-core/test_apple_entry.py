@@ -22,6 +22,12 @@ def object_archive(cpu, subtype, platform):
     return b'!<arch>\n' + header + body
 
 
+def single_fat_archive(raw, cpu=0x100000c, subtype=0):
+    header = b'\xca\xfe\xba\xbe' + struct.pack('>I', 1)
+    header += struct.pack('>5I', cpu, subtype, 32, len(raw), 4)
+    return header + bytes(32 - len(header)) + raw
+
+
 def fat_archive(arm_platform=7, intel_platform=7):
     arm = object_archive(0x100000c, 0, arm_platform)
     intel = object_archive(0x1000007, 3, intel_platform)
@@ -165,6 +171,46 @@ class AppleEntryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'stage retained'):
                     consume.materialize_apple_resources()
             self.assertEqual(retained.read_bytes(), b'retained')
+
+    def test_single_fat_device_wrapper_selects_the_same_actual_target_bytes(self):
+        device = object_archive(0x100000c, 0, 2)
+        raw = single_fat_archive(device)
+        thin, selection = apple_rust.selected_wire_bytes(raw, 'aarch64-apple-ios')
+        self.assertEqual(thin, device)
+        self.assertEqual(selection, {'target': 'aarch64-apple-ios', 'cpu': 0x100000c, 'platform': 2,
+            'offset': 32, 'bytes': len(device), 'container': 'fat-ar'})
+        with self.assertRaisesRegex(RuntimeError, 'exact Cargo'):
+            apple_rust.selected_wire_bytes(raw, 'aarch64-apple-ios-sim')
+        invalid_counts = []
+        for count in (0, 3):
+            changed = bytearray(raw); struct.pack_into('>I', changed, 4, count); invalid_counts.append(bytes(changed))
+        for invalid in [raw[:-1], raw + b'\0', single_fat_archive(device, cpu=0x1000007, subtype=3), *invalid_counts]:
+            with self.subTest(raw=invalid[:32]), self.assertRaises(RuntimeError):
+                apple_rust.selected_wire_bytes(invalid, 'aarch64-apple-ios')
+
+    def test_failed_staging_sdk_original_bytes_are_retained_without_acceptance(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def held(*args):
+            yield
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            framework = root / 'component/staging/Libbox.xcframework'
+            library = framework / 'ios-arm64/Libbox.framework'
+            library.mkdir(parents=True)
+            raw = single_fat_archive(object_archive(0x100000c, 0, 2))
+            (library / 'Libbox').write_bytes(raw)
+            with mock.patch.object(ci_apple, 'location', return_value=root), \
+                    mock.patch.object(ci_apple, 'lease', held), mock.patch('builtins.print'):
+                ci_apple.evidence()
+            with zipfile.ZipFile(root / 'apple-original-evidence.zip') as archive:
+                member = 'component/staging/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox'
+                self.assertEqual(archive.read(member), raw)
+                index = json.loads(archive.read('EVIDENCE-INDEX.json'))
+                self.assertFalse(index['componentAccepted'])
+                self.assertFalse(index['stagedComponentIsAccepted'])
+                self.assertFalse(index['completeUnsignedChain'])
+                self.assertEqual(index['files'][member]['sha256'], __import__('hashlib').sha256(raw).hexdigest())
 
 
 if __name__ == '__main__':

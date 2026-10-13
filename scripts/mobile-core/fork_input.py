@@ -69,7 +69,8 @@ def validate(value):
             android['minimumAPI'] == 24 and android['minimumLoadAlignment'] == 16384 and
             android['javaMajor'] == 17 and android['legacyAPI21Enabled'] is False,
             'formal Android requires one API24/four-ABI AAR and no legacy variant')
-    require(android['ndkRevision'] == '30.0.16138531' and android['ndkPackage'] == 'android-ndk-r30-beta3',
+    require(android['ndkRevision'] == '30.0.16138531' and
+            android.get('ndkSourceRevision') == '30.0.16138531-beta3' and android['ndkPackage'] == 'android-ndk-r30-beta3',
             'formal Android NDK differs')
     require(apple['targets'] == APPLE_TARGETS and
             apple['slices'] == ['ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'] and

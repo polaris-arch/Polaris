@@ -5,13 +5,15 @@ import json
 import os
 from pathlib import Path
 import struct
+import plistlib
 import tempfile
 import unittest
 from unittest.mock import patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
-from artifacts import check_buildinfo, module_stream, tree_inventory, zip_entries
+from artifacts import check_buildinfo, framework_entry_targets, inspect_framework, module, module_stream, tree_inventory, zip_entries
+from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import reservation
 from ci_android import emit_outputs, prepare_source
 from producer import equivalent_binding
@@ -241,6 +243,125 @@ class FormalOutputs(unittest.TestCase):
                 self.assertNotIn('POLARIS_BUILD_RESERVATION_FD', os.environ)
                 with self.assertRaises(OSError):
                     os.fstat(fd)
+
+    def test_actual_ndk_properties_spacing_keeps_exact_pin_and_rejects_duplicate_or_other_revision(self):
+        # Matches the observed fixed archive's full revision and distinct base revision.
+        self.assertEqual(revision_from_properties('Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\n'),
+                         self.value['android']['ndkSourceRevision'])
+        self.assertEqual(revision_from_properties('Pkg.Revision=30.0.16138531\n'), '30.0.16138531')
+        for bad in ['Pkg.Revision = 30.0.16138531\nPkg.Revision=30.0.16138531',
+                    'Pkg.Revision=30.0.16138531\n Pkg.Revision = 27.3.13750724',
+                    'Pkg.Revision = 30.0.16138531 trailing', 'Pkg.Desc = Android NDK']:
+            with self.subTest(properties=bad), self.assertRaises(RuntimeError):
+                revision_from_properties(bad)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            work = root / 'work'; work.mkdir(mode=0o700)
+            sdk, ndk = root / 'sdk', root / 'ndk'; ndk.mkdir()
+            profile = deepcopy(self.value['android'])
+            for name in ['platforms/' + profile['bootclasspath']['platform'], 'build-tools', 'platform-tools']:
+                (sdk / name).mkdir(parents=True)
+            jar = sdk / 'platforms' / profile['bootclasspath']['platform'] / 'android.jar'
+            jar.write_bytes(b'actual controlled bootclasspath')
+            profile['bootclasspath']['sha256'] = sha(jar.read_bytes())
+            properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\nPkg.BaseRevision = 30.0.16138531\nPkg.ReleaseName = r30-beta3\n'
+            (ndk / 'source.properties').write_bytes(properties)
+            observation = observe_ndk_input(root, ndk, profile)
+            self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
+            self.assertEqual(observation['revision'], profile['ndkSourceRevision'])
+            self.assertEqual(observation['baseRevision'], profile['ndkRevision'])
+            self.assertFalse(observation['publicationEligible'])
+            view, actual_jar = prepare_view(work, sdk, ndk, profile)
+            self.assertEqual(actual_jar, jar)
+            self.assertEqual((view / 'ndk' / profile['ndkRevision']).resolve(), ndk)
+            (ndk / 'source.properties').write_text('Pkg.Revision = 27.3.13750724\n')
+            with self.assertRaisesRegex(RuntimeError, 'revision/base/release differs'):
+                prepare_view(work, sdk, ndk, profile)
+            with self.assertRaisesRegex(RuntimeError, 'observation differs'):
+                observe_ndk_input(root, ndk, profile)
+            self.assertEqual((root / 'ndk-source.properties').read_bytes(), properties)
+            for bad in [properties.replace(b'-beta3', b'-beta2'),
+                        properties.replace(b'Pkg.BaseRevision = 30.0.16138531', b'Pkg.BaseRevision = 30.0.0'),
+                        properties.replace(b'r30-beta3', b'r30-rc1'),
+                        properties.replace(b'Pkg.Revision = 30.0.16138531-beta3', b'Pkg.Revision = 30.0.16138531')]:
+                (ndk / 'source.properties').write_bytes(bad)
+                with self.assertRaisesRegex(RuntimeError, 'revision/base/release differs'):
+                    prepare_view(work, sdk, ndk, profile)
+            (ndk / 'source.properties').write_bytes(properties)
+            jar.write_bytes(b'wrong bootclasspath')
+            with self.assertRaisesRegex(RuntimeError, 'bootclasspath differs'):
+                prepare_view(work, sdk, ndk, profile)
+
+    def test_framework_declares_exact_device_and_simulator_architectures(self):
+        device = {'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}
+        simulator = {**device, 'SupportedPlatformVariant': 'simulator', 'SupportedArchitectures': ['x86_64', 'arm64']}
+        self.assertEqual(framework_entry_targets(device), {'ios-arm64'})
+        self.assertEqual(framework_entry_targets(simulator), {'ios-arm64-simulator', 'ios-x86_64-simulator'})
+        for bad in [{**device, 'SupportedArchitectures': []}, {**device, 'SupportedArchitectures': ['arm64', 'x86_64']},
+                    {**simulator, 'SupportedArchitectures': ['arm64']},
+                    {**simulator, 'SupportedArchitectures': ['arm64', 'arm64']},
+                    {**simulator, 'SupportedArchitectures': ['arm64', 'x86_64', 'armv7']},
+                    {**device, 'SupportedPlatform': 'macos'}]:
+            with self.subTest(entry=bad), self.assertRaises(RuntimeError):
+                framework_entry_targets(bad)
+
+    def test_framework_content_predicate_accepts_single_device_fat_and_exact_two_simulator_targets(self):
+        fixtures = module('formal_mobile_framework_fixtures', 'scripts/apple-carrier.test.py')
+        from test_apple_entry import single_fat_archive
+        raw_info = 'path\tsynthetic/main\nmod\tgithub.com/sagernet/sing-box\t(devel)\t\n'
+        expected_id = 'polaris-mobile-' + 'a' * 64
+        def archive(target):
+            return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info), expected_id)),
+                                     ('native.o', fixtures.mach_object(target))])
+        device = single_fat_archive(archive('ios-arm64'))
+        simulator = fixtures.fat(archive('ios-x86_64-simulator'), archive('ios-arm64-simulator'))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            framework = root / 'Libbox.xcframework'; framework.mkdir()
+            entries = []
+            for identifier, variant, arches, raw in [('ios-arm64', None, ['arm64'], device),
+                    ('ios-arm64_x86_64-simulator', 'simulator', ['arm64', 'x86_64'], simulator)]:
+                entry = {'LibraryIdentifier': identifier, 'LibraryPath': 'Libbox.framework',
+                         'SupportedPlatform': 'ios', 'SupportedArchitectures': arches}
+                if variant: entry['SupportedPlatformVariant'] = variant
+                entries.append(entry)
+                lib = framework / identifier / 'Libbox.framework'; (lib / 'Resources').mkdir(parents=True)
+                (lib / 'Headers').mkdir()
+                (lib / 'Libbox').write_bytes(raw)
+                (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
+                symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+                    'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
+                    'tailscaleStoreRetirement', 'tailscaleStoreMembership', 'wakeNow', 'recordScreenState']
+                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols))
+            info = framework / 'Info.plist'; info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
+            with patch('artifacts.check_buildinfo') as buildinfo:
+                output = inspect_framework(framework, self.value, [], expected_id)
+                self.assertEqual(set(output['slices']), set(self.value['apple']['slices']))
+                self.assertEqual(buildinfo.call_count, 3)
+                entries[1]['SupportedArchitectures'] = ['arm64']
+                info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
+                with self.assertRaisesRegex(RuntimeError, 'declared architecture inventory'):
+                    inspect_framework(framework, self.value, [], expected_id)
+                entries[1]['SupportedArchitectures'] = ['arm64', 'x86_64']
+                info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
+                sim = framework / entries[1]['LibraryIdentifier'] / 'Libbox.framework/Libbox'
+                sim.write_bytes(single_fat_archive(archive('ios-arm64-simulator')))
+                with self.assertRaisesRegex(RuntimeError, 'static slice inventory'):
+                    inspect_framework(framework, self.value, [], expected_id)
+                sim.write_bytes(simulator)
+                bad = bytearray(device); struct.pack_into('>I', bad, 8, 0x1000007)
+                (framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Libbox').write_bytes(bad)
+                with self.assertRaisesRegex(RuntimeError, 'header/payload CPU'):
+                    inspect_framework(framework, self.value, [], expected_id)
+                bad_count = bytearray(device); struct.pack_into('>I', bad_count, 4, 3)
+                device_path = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Libbox'
+                device_path.write_bytes(bad_count)
+                with self.assertRaisesRegex(RuntimeError, 'fatCount=3') as rejected:
+                    inspect_framework(framework, self.value, [], expected_id)
+                message = str(rejected.exception)
+                self.assertIn('path=' + str(device_path), message)
+                self.assertIn('header=' + bytes(bad_count[:16]).hex(), message)
+                self.assertIn("declaredArchitectures=['arm64']", message)
 
 
 if __name__ == '__main__':

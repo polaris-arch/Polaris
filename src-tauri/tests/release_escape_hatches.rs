@@ -232,6 +232,22 @@ const TEXT_ONLY: &[Entry] = &[
         name: "POLARIS_PLIST_EOF",
         reason: "同上，launchd plist 安装脚本的 heredoc 定界符。",
     },
+    Entry {
+        name: "POLARIS_DESCRIPTOR_EOF",
+        reason: "helper-client install_unix 的 quoted descriptor heredoc 定界符，不读取进程环境。",
+    },
+    Entry {
+        name: "POLARIS_ELEVATE",
+        reason: "update_install 的 quoted installer heredoc 定界符，不读取进程环境。",
+    },
+    Entry {
+        name: "POLARIS_LOCK_HELPER",
+        reason: "生成的 Unix shell 读子进程参数；spawn_detached_script 用已冻结的随包 helper 路径覆盖该环境键，非 ambient Rust env::var 入口。接线另由 frozen_lease_inputs_are_explicit_child_environment 守住。",
+    },
+    Entry {
+        name: "POLARIS_LOCK_HELPER_SHA256",
+        reason: "生成的 Unix shell 验子进程 helper 摘要；spawn_detached_script 用 compiled selected_manifest.helper_sha256 覆盖该键，非 ambient Rust env::var 入口。",
+    },
 ];
 
 // ============================================================================
@@ -417,7 +433,44 @@ fn mark_release_off_files(root: &Path, files: &mut [SourceFile]) {
 /// 属性内层文本取**原文**：`feature = "test-utils"` 的判据在字符串字面量里，取净化面会读成空。
 fn preceding_cfg_is_release_off(masked: &str, raw: &str, at: usize) -> bool {
     let bytes = masked.as_bytes();
+    // Visibility belongs to the same item. Stop before its `pub` token so an
+    // adjacent cfg on `pub(crate) mod child;` is not lost at the closing `)`.
     let mut i = at;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b')' {
+        let end = i;
+        let mut depth = 1usize;
+        i -= 1;
+        while i > 0 && depth > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i >= 3
+            && &masked[i - 3..i] == "pub"
+            && (i == 3 || !(bytes[i - 4].is_ascii_alphanumeric() || bytes[i - 4] == b'_'))
+        {
+            i -= 3;
+        } else {
+            i = end;
+        }
+    } else if i >= 3
+        && &masked[i - 3..i] == "pub"
+        && (i == 3 || !(bytes[i - 4].is_ascii_alphanumeric() || bytes[i - 4] == b'_'))
+    {
+        i -= 3;
+    }
     loop {
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
             i -= 1;
@@ -953,11 +1006,15 @@ struct Scan {
 }
 
 fn scan() -> Scan {
+    scan_files(scan_surface())
+}
+
+fn scan_files(files: Vec<SourceFile>) -> Scan {
     let mut hits = Vec::new();
     let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut off_regions = 0usize;
 
-    for file in scan_surface() {
+    for file in files {
         let raw = std::fs::read_to_string(&file.path)
             .unwrap_or_else(|err| panic!("读不到 `{}`（{err}）", file.path.display()));
         let masked = polaris_source_probe::mask_comments_and_strings(&raw);
@@ -975,11 +1032,8 @@ fn scan() -> Scan {
                 if !name.starts_with(PREFIX) {
                     continue;
                 }
-                let (why, release) = if file.in_tests_dir {
-                    (
-                        "文件在 `tests/` 目录下（本仓约定：`<dir>/tests/` 恒为测试）",
-                        false,
-                    )
+                let (why, release) = if file.in_tests_dir || file.release_off_file {
+                    ("文件属于测试目录或 release 恒假的父模块子树", false)
                 } else if regions.iter().any(|(a, b)| *a <= at && at <= *b) {
                     (
                         "位于「任何 release 构型下都不编译」的 `#[cfg(..)]` 块内",
@@ -1005,7 +1059,7 @@ fn scan() -> Scan {
         }
 
         // ── 探测器 ②：生产文本里的 `POLARIS_*` 名字（与调用形态无关）──
-        if !file.in_tests_dir {
+        if !file.in_tests_dir && !file.release_off_file {
             off_regions += regions.len();
             let production = blank_regions(&raw, &regions);
             for (at, name) in polaris_names_in(&production) {
@@ -2029,4 +2083,127 @@ fn release_profile_must_enable_lto_without_panic_abort() {
          `commands/subscription/create.rs:86` 两处生产 catch_unwind 会被静默废掉，一 panic 直接崩 App。\
          当前段内容：\n{release_body}"
     );
+}
+
+#[test]
+fn external_module_cfg_survives_item_visibility_without_borrowing_neighbor_cfg() {
+    for visibility in [
+        "",
+        "pub ",
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(in crate::runtime) ",
+    ] {
+        for (cfg, want) in [
+            ("debug_assertions", true),
+            ("test", true),
+            ("unix", false),
+            ("not(test)", false),
+        ] {
+            let raw = format!("#[cfg({cfg})]\n{visibility}mod child;");
+            let masked = polaris_source_probe::mask_comments_and_strings(&raw);
+            let declarations = mod_declarations(&masked);
+            assert_eq!(declarations.len(), 1);
+            assert_eq!(
+                preceding_cfg_is_release_off(&masked, &raw, declarations[0].0),
+                want,
+                "{raw}"
+            );
+        }
+    }
+    for raw in [
+        "#[cfg(test)] fn prior() {} pub(crate) mod child;",
+        "pub(crate) mod child;",
+    ] {
+        let masked = polaris_source_probe::mask_comments_and_strings(raw);
+        assert!(!preceding_cfg_is_release_off(
+            &masked,
+            raw,
+            mod_declarations(&masked)[0].0
+        ));
+    }
+}
+
+#[test]
+fn release_off_child_file_excludes_both_reads_and_names_but_live_file_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("child.rs");
+    std::fs::write(
+        &path,
+        r#"fn read() { let _ = std::env::var("POLARIS_FIXTURE_CHILD"); }"#,
+    )
+    .unwrap();
+    for off in [false, true] {
+        let result = scan_files(vec![SourceFile {
+            rel: "src/child.rs".to_owned(),
+            path: path.clone(),
+            in_tests_dir: false,
+            release_off_file: off,
+        }]);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].release, !off);
+        assert_eq!(result.names.contains_key("POLARIS_FIXTURE_CHILD"), !off);
+    }
+    let surface = scan_surface();
+    let child = surface
+        .iter()
+        .find(|f| f.rel == "src-tauri/src/runtime/http/local_acceptance.rs")
+        .unwrap();
+    assert!(
+        child.release_off_file,
+        "actual debug-only module declaration must propagate"
+    );
+    let result = scan();
+    for name in ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"] {
+        assert!(!result.names.contains_key(name));
+        assert!(result.hits.iter().any(|h| h.name == name && !h.release));
+    }
+}
+
+fn frozen_lease_input_binding_is_complete(body: &str) -> bool {
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let binding = "cmd.env(\"POLARIS_LOCK_HELPER\",frozen.path()).env(\"POLARIS_LOCK_HELPER_SHA256\",expected);";
+    if compact.matches(binding).count() != 1 {
+        return false;
+    }
+    let Some(freeze) = compact
+        .find("freeze_lease_helper(&crate::runtime::helper::resolve_helper_binary()?,&expected)?")
+    else {
+        return false;
+    };
+    let Some(selected) = compact.find("crate::runtime::core_identity::selected_manifest(") else {
+        return false;
+    };
+    let Some(spawn) = compact.find("spawn_with_lifetime_pipe(&mutcmd)") else {
+        return false;
+    };
+    let bind = compact.find(binding).unwrap();
+    selected < freeze
+        && freeze < bind
+        && bind < spawn
+        && compact[selected..freeze].contains(".helper_sha256")
+}
+
+#[test]
+fn frozen_lease_inputs_are_explicit_child_environment() {
+    let raw = polaris_source_probe::repo_file!("src-tauri/src/runtime/update_install.rs");
+    let literals = polaris_source_probe::mask_comments(&raw);
+    let masked = polaris_source_probe::mask_comments_and_strings(&raw);
+    let at = masked
+        .find("cmd.env(")
+        .expect("explicit lease input binding");
+    let body = enclosing_fn_body(&masked, at).expect("binding belongs to spawn_detached_script");
+    let start = body.as_ptr() as usize - masked.as_ptr() as usize;
+    let body = &literals[start..start + body.len()];
+    assert!(frozen_lease_input_binding_is_complete(body));
+    for broken in [
+        body.replace("frozen.path()", "ambient.path()"),
+        body.replace(".helper_sha256", ".untrusted_hash"),
+        body.replace("POLARIS_LOCK_HELPER_SHA256", "IGNORED_CHILD_KEY"),
+        body.replace("freeze_lease_helper(", "skip_freeze("),
+        body.replace("selected_manifest(", "ambient_manifest("),
+        format!("spawn_with_lifetime_pipe(&mut cmd);{body}"),
+    ] {
+        assert!(!frozen_lease_input_binding_is_complete(&broken));
+    }
 }

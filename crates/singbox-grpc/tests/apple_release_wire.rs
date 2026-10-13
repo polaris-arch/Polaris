@@ -59,7 +59,7 @@ fn object_archive(cpu: u32, subtype: u32, platform: u32) -> Vec<u8> {
     );
     archive.extend_from_slice(name);
     archive.extend_from_slice(&object);
-    if size % 2 != 0 {
+    if !size.is_multiple_of(2) {
         archive.push(b'\n');
     }
     archive

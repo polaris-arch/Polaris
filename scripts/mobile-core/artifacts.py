@@ -253,6 +253,17 @@ def tree_inventory(root):
     return sorted(rows, key=lambda row: row['path'])
 
 
+def framework_entry_targets(entry):
+    require(entry.get('SupportedPlatform') == 'ios' and
+            entry.get('SupportedPlatformVariant') in (None, 'simulator'), 'framework must contain only device/simulator iOS')
+    architectures = entry.get('SupportedArchitectures')
+    expected = ['arm64', 'x86_64'] if entry.get('SupportedPlatformVariant') == 'simulator' else ['arm64']
+    require(isinstance(architectures, list) and all(isinstance(arch, str) for arch in architectures) and
+            len(architectures) == len(expected) and set(architectures) == set(expected),
+            'framework declared architecture inventory differs')
+    return ({'ios-arm64-simulator', 'ios-x86_64-simulator'} if len(expected) == 2 else {'ios-arm64'})
+
+
 def inspect_framework(framework, value, graph, expected_id):
     validate(value)
     framework = Path(framework)
@@ -261,8 +272,13 @@ def inspect_framework(framework, value, graph, expected_id):
     inventory = tree_inventory(framework)
     info = plistlib.loads((framework / 'Info.plist').read_bytes())
     libraries, observed = info['AvailableLibraries'], {}
-    require(len({r['LibraryIdentifier'] for r in libraries}) == len(libraries), 'duplicate framework identifiers')
+    require(isinstance(libraries, list) and len(libraries) == 2 and
+            len({r['LibraryIdentifier'] for r in libraries}) == len(libraries), 'framework device/simulator library inventory differs')
+    require({r.get('SupportedPlatformVariant') for r in libraries} == {None, 'simulator'},
+            'framework must contain one device and one simulator library')
     for entry in libraries:
+        expected_targets = framework_entry_targets(entry)
+        entry_targets = set()
         identifier, path = entry['LibraryIdentifier'], entry['LibraryPath']
         require(PurePosixPath(identifier).name == identifier and PurePosixPath(path).name == path and
                 entry['SupportedPlatform'] == 'ios' and entry.get('SupportedPlatformVariant') in (None, 'simulator'),
@@ -274,9 +290,20 @@ def inspect_framework(framework, value, graph, expected_id):
         plistlib.loads((lib / 'Resources/Info.plist').read_bytes())
         binary = (lib / 'Libbox').resolve(strict=True)
         require(binary.is_relative_to(framework.resolve(strict=True)), 'static binary escaped framework')
-        parsed = carrier.container(binary.read_bytes(), helper)
+        raw = binary.read_bytes()
+        require(len(raw) <= MAX_ARTIFACT, 'bounded actual framework binary required')
+        try:
+            parsed = carrier.container(raw, helper)
+        except RuntimeError as error:
+            # Retain the actual failing header/declared input in the original
+            # log; a lipo command alone does not prove the emitted fat count.
+            count = struct.unpack_from('>I', raw, 4)[0] if len(raw) >= 8 and raw.startswith(carrier.FAT) else None
+            raise RuntimeError('actual framework input refused: path=' + str(binary) +
+                '; header=' + raw[:16].hex() + '; fatCount=' + str(count) +
+                '; declaredArchitectures=' + repr(entry['SupportedArchitectures']) + '; ' + str(error)) from error
         slices = parsed['slices'] if parsed['kind'] == 'fat-ar' else [{'ordinal': 0, 'archive': parsed}]
-        require(all(s['archive']['kind'] == 'bsd-ar' for s in slices), 'Libbox must be static, never dynamic Mach-O')
+        require(len(slices) == len(expected_targets) and all(s['archive']['kind'] == 'bsd-ar' for s in slices),
+                'Libbox static slice inventory differs from framework declaration')
         headers = {p.name: p.read_text() for p in (lib / 'Headers').glob('*.h')}
         header = '\n'.join(headers.values())
         for symbol in ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
@@ -288,7 +315,9 @@ def inspect_framework(framework, value, graph, expected_id):
             require(members, 'static archive has no code')
             cpu = members[0]['machO']['cpu']
             target = next((key for key, spec in APPLE.items() if spec[0] == cpu and spec[3] == entry.get('SupportedPlatformVariant')), None)
-            require(target is not None and target not in observed, 'unknown/duplicate Apple architecture slice')
+            require(target in expected_targets and target not in entry_targets and target not in observed,
+                    'unknown/duplicate Apple architecture slice')
+            entry_targets.add(target)
             spec = APPLE[target]
             require(all(m['machO']['cpu'] == cpu for m in members), 'mixed archive CPU')
             infos, ids = [], []
@@ -311,6 +340,7 @@ def inspect_framework(framework, value, graph, expected_id):
                 'goBuildInfo': infos[0], 'buildID': ids[0],
                 'members': [{**{k: v for k, v in m.items() if k != 'machO'},
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
+        require(entry_targets == expected_targets, 'actual framework target inventory differs')
     require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly three architecture slices')
     return {'format': 'static-XCFramework', 'inventory': inventory,
             'inventorySha256': sha(canonical(inventory)), 'slices': observed}

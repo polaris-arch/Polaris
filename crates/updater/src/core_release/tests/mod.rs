@@ -24,10 +24,9 @@ fn complete_release_identity_is_distinct_from_source_identity() {
 
 #[test]
 fn plain_alpha12_is_admitted_only_with_the_complete_exact_release_binding() {
-    let pending: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/desktop-core/pending-release-selection.json"
-    )))
+    let pending: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "scripts/desktop-core/pending-release-selection.json"
+    ))
     .unwrap();
     let value = &pending["selection"];
     assert_eq!(

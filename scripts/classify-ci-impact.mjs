@@ -810,6 +810,12 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/geo_seed/tests/resolve_tests.rs':
+    '测试源码：唯一 target_os 条件把真实 iOS 资产布局/28 文件播种回归限定在非 Android 宿主；'
+    + 'ci.yml 的宿主 cargo test --workspace 实际执行这些资源解析与播种用例。Android bundled-geo'
+    + '路径和 Kotlin 提取常量另有同文件宿主静态对账；APK 构建不运行这些测试。'
+    + '生产 Android 条件代码仍由 aarch64-linux-android 交叉 check 覆盖，Kotlin BundledRules 与'
+    + ' verify-apk 核实际随包资产；设备播种验收未由本登记代签。',
   'src-tauri/src/runtime/tailscale_login_core/tests/attempt_lifecycle.rs':
     '原 cfg(test) 登录动作回归，只由 ci.yml 的 host cargo test --workspace 执行纯 Attempt/CAS 与源码绑定负门，测试代码不进入 APK。'
     + 'Android cargo check -p polaris 不带 --all-targets，APK 构建也不构建 test target，因此其中 Android test cfg 编译/运行没有被 APK 腿保证；'

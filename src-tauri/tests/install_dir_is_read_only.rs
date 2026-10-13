@@ -70,7 +70,7 @@ const WRITE_FORMS: [&str; 14] = [
 ///
 /// 每条都必须命中至少一个探针；命中 0 次 ⇒ 它守的东西已经没了，条目本身会变成将来某个真违规的
 /// 免死金牌，故当场红。
-const REGISTRY: [(&str, &str, &str); 12] = [
+const REGISTRY: [(&str, &str, &str); 13] = [
     (
         "test_support.rs",
         "ran_in_isolated_worker",
@@ -94,6 +94,11 @@ const REGISTRY: [(&str, &str, &str); 12] = [
         "app_uninstall_all",
         "exe 路径进 `SystemUninstallOps.exe`，供 `plan_app_removal` 定位应用本体；Windows 腿只**拉起**\
          `uninstall.exe`（运行中的 exe 删不掉自己），本函数自己不删不写。",
+    ),
+    (
+        "runtime/geo_seed.rs",
+        "bundled_data_candidates_for",
+        "纯候选函数：只读取传入 exe 的 bundle_resource_candidates 并过滤源码仓路径；播种仍由 seed_one 写用户目录。",
     ),
     (
         "runtime/geo_seed.rs",
