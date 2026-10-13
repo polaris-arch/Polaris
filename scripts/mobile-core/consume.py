@@ -132,6 +132,7 @@ def source_status_observation():
     rows, hash_bytes, reason = [], 0, observation['reason']
     cursor = 0
     while cursor < len(raw) and len(rows) < STATUS_PATHS:
+        if time.monotonic() >= deadline: reason = reason or 'deadline'; break
         end = raw.find(b'\0', cursor)
         if end < 0: reason = reason or 'partial-status'; break
         entry = raw[cursor:end]; cursor = end + 1
@@ -198,7 +199,7 @@ def source_status_observation():
                                'paths': STATUS_PATHS, 'pathBytes': STATUS_PATH_BYTES,
                                'hashBytes': STATUS_HASH_BYTES, 'reportBytes': STATUS_REPORT_BYTES,
                                'seconds': STATUS_SECONDS, 'pipeOverflowSentinelBytes': 1,
-                               'hashOverflowSentinelBytes': 1})
+                               'hashOverflowSentinelBytes': 1, 'terminationGraceSeconds': 2})
     return observation
 
 

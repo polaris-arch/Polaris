@@ -180,7 +180,8 @@ archives are retained even when no accepted Rust receipt has been written.
 After formal environment/slot admission, the Rust entry observes source status
 before link verification and after archive copying. Earlier admission failures
 need not have an observation. Capturing status is capped at 16KiB stdout, 1KiB
-stderr, 64 paths of at most 512 bytes, 1MiB total file hashing and 10 seconds.
+stderr, 64 paths of at most 512 bytes, 1MiB total file hashing and a 10-second
+collection deadline, with up to two seconds to terminate the owned child.
 One sentinel byte beyond each pipe/hash cap detects overflow; capture buffers and
 metadata cardinality are bounded, while whole-process RSS remains unmeasured.
 The derived JSON is capped at 64KiB; unknown paths have opaque hashes, and only
