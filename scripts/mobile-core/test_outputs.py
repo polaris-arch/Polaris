@@ -513,7 +513,7 @@ class FormalOutputs(unittest.TestCase):
         from producer import verify_receipt
         name, original, observed = self.relocated_android_observations()
         binding = {'platform': 'android', 'sourceContract': self.value, 'sourceOverlay': 0,
-                   'sourceObservation': {'commit': self.value['sourceCommit'], 'tree': self.value['sourceTree']},
+                   'sourceObservation': {'sourceCommit': self.value['sourceCommit'], 'sourceTree': self.value['sourceTree']},
                    'moduleGraph': []}
         receipt = {'schema': 'polaris-mobile-component-v1', 'platform': 'android', 'input': binding,
                    'output': original, 'nativeInputs': {}, 'sourceOverlay': 0, 'AppAccepted': False, 'devicePassed': False}
