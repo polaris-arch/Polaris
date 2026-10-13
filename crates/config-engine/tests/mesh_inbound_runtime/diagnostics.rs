@@ -1,6 +1,102 @@
 //! Pure loopback diagnostics fixtures: no sing-box, TUN or host settings.
 use super::*;
 
+pub(super) fn listener_snapshots(listeners: &[(&str, &Listener)]) -> Value {
+    Value::Object(
+        listeners
+            .iter()
+            .map(|(name, listener)| ((*name).into(), listener.snapshot()))
+            .collect(),
+    )
+}
+
+fn deltas(before: &Value, after: &Value) -> Value {
+    Value::Object(
+        after
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, row)| {
+                let mut counters = serde_json::Map::new();
+                for key in ["accepted", "replies", "errorSequence"] {
+                    let delta = row[key]
+                        .as_u64()
+                        .zip(before[name][key].as_u64())
+                        .and_then(|(a, b)| a.checked_sub(b));
+                    counters.insert(key.into(), json!(delta));
+                }
+                (name.clone(), Value::Object(counters))
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn observe_forward_tcp(
+    port: u16,
+    listeners: &[(&str, &Listener)],
+    policy_baseline: &Value,
+) -> (Result<(), String>, Value) {
+    let mut attempts = Vec::new();
+    let mut count = 0usize;
+    let mut last_error = "no probe attempt completed".to_string();
+    let passed = eventually(|| {
+        count += 1;
+        let before = listener_snapshots(listeners);
+        let result = tcp_probe(port); // Same original 600ms probe and 10s retry window.
+        let after = listener_snapshots(listeners);
+        let record = json!({"attempt":count,"before":before,"after":after,
+            "delta":deltas(&before,&after),"probeResult":result.as_ref().err()});
+        // Bound observation storage, never the actual probe/retry count.
+        if attempts.len() < 100 {
+            attempts.push(record);
+        } else {
+            *attempts.last_mut().unwrap() = record;
+        }
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                last_error = error;
+                false
+            }
+        }
+    });
+    let pre_signal = listener_snapshots(listeners);
+    let observation = json!({"policyBaseline":policy_baseline,"preSIGQUIT":pre_signal,
+        "policyDelta":deltas(policy_baseline,&pre_signal),"attemptCount":count,
+        "omittedAttempts":count.saturating_sub(attempts.len()),"attempts":attempts,
+        "scope":"policy and probe attempt observation windows frozen before SIGQUIT; EOF may follow client timeout and is not attributed as original root cause"});
+    (if passed { Ok(()) } else { Err(last_error) }, observation)
+}
+
+#[test]
+fn policy_and_attempt_receipts_do_not_attribute_old_or_later_errors_to_current_probe() {
+    let listener = Listener::tcp_on(false);
+    listener
+        .diagnostics
+        .record("prior policy", std::io::Error::other("old error"));
+    let listeners = [("b_tcp", &listener)];
+    let baseline = listener_snapshots(&listeners);
+    let (result, frozen) = observe_forward_tcp(listener.port, &listeners, &baseline);
+    assert!(result.is_ok());
+    assert_eq!(frozen["attemptCount"], 1);
+    assert_eq!(frozen["policyDelta"]["b_tcp"]["accepted"], 1);
+    assert_eq!(frozen["policyDelta"]["b_tcp"]["errorSequence"], 0);
+    assert!(frozen["preSIGQUIT"]["b_tcp"]["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("old error"));
+    let original = frozen.clone();
+    listener
+        .diagnostics
+        .record("after signal", std::io::Error::other("later EOF"));
+    assert_eq!(frozen, original);
+    assert!(!frozen.to_string().contains("later EOF"));
+    assert_eq!(
+        deltas(&baseline, &listener_snapshots(&listeners))["b_tcp"]["errorSequence"],
+        1
+    );
+}
+
 #[test]
 fn healthy_listener_echo_and_worker_receipts_are_observable() {
     let listener = Listener::tcp_on(false);

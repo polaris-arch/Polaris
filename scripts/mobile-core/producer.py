@@ -243,6 +243,10 @@ def equivalent_binding(original, current):
 def write_json(path, value):
     from artifacts import receipt_limit
     raw = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n').encode()
+    print(json.dumps({'schema': 'polaris-receipt-size-observation-v1', 'phase': 'serialize-before-install',
+                      'path': str(path), 'bytes': len(raw), 'maximumBytes': receipt_limit(value),
+                      'receiptSchema': value.get('schema'),
+                      'scope': 'actual serialized size; not installation or carrier acceptance'}), file=sys.stderr, flush=True)
     require(len(raw) <= receipt_limit(value),
             'receipt exceeds schema budget before installation: path=' + str(path) +
             '; bytes=' + str(len(raw)) + '; maximum=' + str(receipt_limit(value)))

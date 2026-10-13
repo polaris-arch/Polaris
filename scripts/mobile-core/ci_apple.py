@@ -167,6 +167,8 @@ def evidence():
                      'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
                      'componentAccepted': origins is not None,
                      'receiptReadErrors': receipt_errors,
+                     'receiptBytes': {name: row['bytes'] for name, row in rows.items()
+                                      if name.endswith('.json') and 'bytes' in row},
                      'stagedComponentIsAccepted': False,
                      'devicePassed': False, 'publicationEligible': False}
             package.writestr('EVIDENCE-INDEX.json', json.dumps(index, indent=2) + '\n')

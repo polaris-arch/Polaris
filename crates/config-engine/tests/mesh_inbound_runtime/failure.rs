@@ -1,5 +1,7 @@
 //! Failed WG forward probes keep their original error and collect owned-child evidence.
 use super::*;
+#[path = "bounded_inspector.rs"]
+mod bounded_inspector;
 
 fn request_owned_stack(running: &mut Running) -> Value {
     let started = Instant::now();
@@ -57,6 +59,7 @@ pub(super) struct Context<'a> {
     pub core: &'a Path,
     pub a: &'a Value,
     pub b: &'a Value,
+    pub listener_observations: &'a Value,
 }
 
 fn source_core_identity_from_repo(repo: &Path, core: &Path) -> Option<Value> {
@@ -106,15 +109,24 @@ fn actual_core_input(repo: &Path, core: &Path) -> Value {
     } else {
         "libcronet.so"
     });
-    let output = std::process::Command::new("node")
+    let mut command = std::process::Command::new("node");
+    command
         .arg(repo.join("scripts/native-payload-input.mjs"))
         .arg(key)
         .arg(core)
         .arg(library)
-        .current_dir(repo)
-        .output();
+        .current_dir(repo);
+    let output =
+        bounded_inspector::capture(&mut command, Duration::from_secs(20), 8 * 1024 * 1024, 8192);
     match output {
-        Ok(output) if output.status.success() && output.stdout.len() <= 8 * 1024 * 1024 => {
+        Ok(output)
+            if output.failure.is_none()
+                && output.cleanup_complete
+                && output
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.success()) =>
+        {
             match serde_json::from_slice::<Value>(&output.stdout) {
                 Ok(input)
                     if matches!(
@@ -125,13 +137,21 @@ fn actual_core_input(repo: &Path, core: &Path) -> Value {
                         )
                     ) =>
                 {
-                    json!({"verified":true,"input":input})
+                    json!({"verified":true,"input":input,
+                        "stdoutBytes":output.stdout_observed,"stderrBytes":output.stderr_observed,
+                        "deadlineSeconds":20,"stdoutMaximumBytes":8*1024*1024,"stderrMaximumBytes":8192})
                 }
                 _ => json!({"verified":false,"error":"actual metadata inspector response differs"}),
             }
         }
-        Ok(output) => json!({"verified":false,"status":output.status.code(),
-            "stderr":String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(8192)])}),
+        Ok(output) => {
+            json!({"verified":false,"status":output.status.as_ref().and_then(|s|s.code()),
+            "error":output.failure,"cleanupComplete":output.cleanup_complete,
+            "stdoutBytesObservedAtLeast":output.stdout_observed,"stderrBytesObservedAtLeast":output.stderr_observed,
+            "deadlineSeconds":20,"stdoutMaximumBytes":8*1024*1024,"stderrMaximumBytes":8192,
+            "stdoutPrefix":String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(8192)]),
+            "stderr":String::from_utf8_lossy(&output.stderr)})
+        }
         Err(error) => json!({"verified":false,"error":error.to_string()}),
     }
 }
@@ -153,6 +173,7 @@ pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut R
         core,
         a,
         b,
+        listener_observations,
     } = context;
     let repo = support::core_locator::repo_root();
     let recorded = source_core_identity_from_repo(&repo, core);
@@ -162,21 +183,30 @@ pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut R
     let b_request = request_owned_stack(b_core);
     let a_snapshot = finish_owned_snapshot(a_core, a_request);
     let b_snapshot = finish_owned_snapshot(b_core, b_request);
-    // Preserve the original immediate stack requests. Metadata inspection
-    // rereads the same file afterwards and must not delay either peer's dump.
-    let actual = actual_core_input(&repo, core);
-    let identity = matched_core_identity(recorded.clone(), &actual, core);
     let snapshot = json!({
         "schema":"polaris-wg-failed-probe-diagnostics-v1",
         "phase":phase,"family":family,"policy":policy,"originalProbeError":error,
-        "corePath":core,"matchingNativeSourceCoreIdentity":identity,
-        "recordedCoreInputIdentity":recorded,"actualCoreInputObservation":actual,
+        "corePath":core,"matchingNativeSourceCoreIdentity":null,
+        "recordedCoreInputIdentity":recorded,"listenerObservationsBeforeSIGQUIT":listener_observations,
         "aConfig":a,"bConfig":b,
         "aChild":a_snapshot,"bChild":b_snapshot,
-        "scope":"after failed original probe; immediate owned SIGQUIT then actual metadata reinspection; no timeout/routing/skip changes; unmatched identity is null"
+        "scope":"original failed probe and pre-SIGQUIT listener observations; immediate owned dual stack requests; no timeout/routing/skip changes"
     });
     // Full run logs already preserve stderr in CI. No extra files or inferred success pins.
     eprintln!("WG_FAILURE_DIAGNOSTICS={snapshot}");
+    // Freeze the original error, configuration, listener windows and both
+    // stacks before the independently bounded metadata collector can fail.
+    let actual = actual_core_input(&repo, core);
+    let identity = matched_core_identity(recorded, &actual, core);
+    eprintln!(
+        "WG_CORE_IDENTITY_DIAGNOSTICS={}",
+        json!({
+            "phase":phase,"family":family,"policy":policy,"corePath":core,
+            "aPID":a_core.child.id(),"bPID":b_core.child.id(),
+            "matchingNativeSourceCoreIdentity":identity,"actualCoreInputObservation":actual,
+            "scope":"metadata reinspection after frozen original failure; unmatched/timeout/overflow remains unverified"
+        })
+    );
 }
 
 #[cfg(test)]

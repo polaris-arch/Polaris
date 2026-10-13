@@ -232,6 +232,7 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertEqual(archive.read('component/original-bind.log'), b'original tool output')
                 index = json.loads(archive.read('EVIDENCE-INDEX.json'))
                 self.assertIn('component/component-receipt.json', index['receiptReadErrors'])
+                self.assertEqual(index['receiptBytes']['component/component-receipt.json'], len(raw))
                 self.assertFalse(index['componentAccepted'])
                 self.assertFalse(index['completeUnsignedChain'])
                 self.assertFalse(index['publicationEligible'])

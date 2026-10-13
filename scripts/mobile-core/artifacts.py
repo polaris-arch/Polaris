@@ -5,6 +5,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import struct
+import sys
 import zipfile
 
 from fork_input import ROOT, canonical, decode, require, sha, validate
@@ -31,6 +32,10 @@ def receipt_limit(value):
 def read_receipt(path):
     path = Path(path)
     size = path.lstat().st_size if path.exists() or path.is_symlink() else 0
+    print(json.dumps({'schema': 'polaris-receipt-size-observation-v1', 'phase': 'read',
+                      'path': str(path), 'bytes': size, 'symlink': path.is_symlink(),
+                      'maximumReadBytes': MAX_APPLE_RECEIPT,
+                      'scope': 'actual lstat size; not receipt or carrier acceptance'}), file=sys.stderr, flush=True)
     require(path.is_file() and not path.is_symlink() and 0 < size <= MAX_APPLE_RECEIPT,
             'bounded regular original receipt required: path=' + str(path) + '; bytes=' + str(size) +
             '; maximum=' + str(MAX_APPLE_RECEIPT))

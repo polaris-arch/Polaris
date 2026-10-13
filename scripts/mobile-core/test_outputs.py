@@ -66,6 +66,24 @@ class FormalOutputs(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'bounded regular'):
                 artifacts.read_receipt(link)
 
+    def test_receipt_size_observation_precedes_rejection_and_preserves_actual_lstat_size(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(artifacts, 'MAX_APPLE_RECEIPT', 128), patch('sys.stderr', new_callable=io.StringIO) as log:
+            path = Path(temporary) / 'component-receipt.json'; path.write_bytes(b'x' * 129)
+            with self.assertRaisesRegex(RuntimeError, 'bounded regular'):
+                artifacts.read_receipt(path)
+            read = json.loads(log.getvalue().splitlines()[0])
+            self.assertEqual(read['bytes'], path.stat().st_size)
+            self.assertEqual(read['maximumReadBytes'], 128)
+            self.assertEqual(read['phase'], 'read')
+            log.seek(0); log.truncate()
+            with self.assertRaisesRegex(RuntimeError, 'before installation'):
+                write_json(path, {'schema': 'polaris-mobile-component-v1', 'platform': 'apple', 'raw': 'x' * 129})
+            write = json.loads(log.getvalue().splitlines()[0])
+            self.assertGreater(write['bytes'], write['maximumBytes'])
+            self.assertEqual(write['phase'], 'serialize-before-install')
+            self.assertEqual(path.read_bytes(), b'x' * 129)
+
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original
         # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.

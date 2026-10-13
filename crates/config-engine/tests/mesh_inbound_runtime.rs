@@ -59,12 +59,15 @@ fn local(port: u16) -> SocketAddr {
 #[derive(Default)]
 struct ListenerDiagnostics {
     replies: AtomicUsize,
+    errors: AtomicUsize,
     // Keep one error, not an unbounded event log across policy cases.
     last_error: Mutex<Option<String>>,
 }
 impl ListenerDiagnostics {
     fn record(&self, stage: &str, error: std::io::Error) {
-        *self.last_error.lock().unwrap() = Some(format!("{stage}: {error}"));
+        let mut last = self.last_error.lock().unwrap();
+        *last = Some(format!("{stage}: {error}"));
+        self.errors.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -206,6 +209,14 @@ impl Listener {
             self.worker.as_ref().is_none_or(JoinHandle::is_finished),
             self.diagnostics.last_error.lock().unwrap()
         )
+    }
+    fn snapshot(&self) -> Value {
+        let last = self.diagnostics.last_error.lock().unwrap();
+        json!({"address":self.address,"accepted":self.count(),
+            "replies":self.diagnostics.replies.load(Ordering::Relaxed),
+            "errorSequence":self.diagnostics.errors.load(Ordering::Acquire),
+            "last_error":last.clone(),"worker_finished":self.worker.as_ref().is_none_or(JoinHandle::is_finished),
+            "scope":"concurrent counters observed at this point; last_error is not a causal verdict"})
     }
 }
 impl Drop for Listener {
@@ -603,9 +614,18 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             udp: true,
         },
     ];
+    let listeners = [
+        ("a_tcp", &a_tcp),
+        ("a_denied_tcp", &a_denied_tcp),
+        ("a_udp", &a_udp),
+        ("b_tcp", &b_tcp),
+        ("b_udp", &b_udp),
+        ("dns_upstream", &upstream),
+    ];
     for (label, policy, should_allow) in
         policy_cases(peer_cidr, wrong_source, wide_target, a_tcp.port, a_udp.port)
     {
+        let policy_baseline = diagnostics::listener_snapshots(&listeners);
         let has_policy = policy.is_some();
         // 每轮独立路径与双核，避免旧 UDP flow、peer 状态和磁盘 DNS cache 跨策略轮次复用。
         let a_temp = tempfile::tempdir().unwrap();
@@ -629,7 +649,8 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         let a_path = write_config(&a_temp, &a);
         let mut a_core = run(core, &a_path, &a_temp);
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
-        let forward_tcp = eventually_tcp(a_out_tcp);
+        let (forward_tcp, listener_observations) =
+            diagnostics::observe_forward_tcp(a_out_tcp, &listeners, &policy_baseline);
         if let Err(error) = &forward_tcp {
             failure::capture(
                 failure::Context {
@@ -640,6 +661,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
                     core,
                     a: &a,
                     b: &b,
+                    listener_observations: &listener_observations,
                 },
                 &mut a_core,
                 &mut b_core,
@@ -650,7 +672,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             "{family}/{label}: A→B TCP unavailable: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
             b_core.log(),
-            b_tcp.diagnostic()
+            listener_observations
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
@@ -751,7 +773,8 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         }
         let before_forward_tcp = b_tcp.count();
         let before_forward_udp = b_udp.count();
-        let forward_tcp = eventually_tcp(a_out_tcp);
+        let (forward_tcp, listener_observations) =
+            diagnostics::observe_forward_tcp(a_out_tcp, &listeners, &policy_baseline);
         if let Err(error) = &forward_tcp {
             failure::capture(
                 failure::Context {
@@ -762,6 +785,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
                     core,
                     a: &a,
                     b: &b,
+                    listener_observations: &listener_observations,
                 },
                 &mut a_core,
                 &mut b_core,
@@ -772,7 +796,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
             b_core.log(),
-            b_tcp.diagnostic()
+            listener_observations
         );
         assert!(
             eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
