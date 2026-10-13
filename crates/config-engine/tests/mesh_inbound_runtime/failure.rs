@@ -60,6 +60,27 @@ pub(super) struct Context<'a> {
 }
 
 fn source_core_identity_from_repo(repo: &Path, core: &Path) -> Option<Value> {
+    let runtime_input = repo.join("native-payload-evidence").join(if cfg!(windows) {
+        "runtime-input-win.json"
+    } else {
+        "runtime-input-linux.json"
+    });
+    if runtime_input.exists() {
+        return std::fs::read(runtime_input)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(|input| {
+                matches!(
+                    input["schema"].as_str(),
+                    Some(
+                        "polaris-native-release-payload-input-v1"
+                            | "polaris-native-payload-input-v1"
+                    )
+                )
+            })
+            .and_then(|input| input.get("core").cloned())
+            .filter(|identity| identity["path"].as_str() == core.to_str());
+    }
     let source_proof = repo.join("native-payload-evidence").join(if cfg!(windows) {
         "source-win.json"
     } else {
@@ -72,6 +93,57 @@ fn source_core_identity_from_repo(repo: &Path, core: &Path) -> Option<Value> {
         .filter(|identity| identity["path"].as_str() == core.to_str())
 }
 
+fn actual_core_input(repo: &Path, core: &Path) -> Value {
+    // Reinspect the precise path used by this failed probe. The existing
+    // inspector checks actual SHA/BuildID against the frozen consumption
+    // receipt and source contract; it does not run a TUN or traffic probe.
+    if !cfg!(any(target_os = "linux", windows)) {
+        return json!({"verified":false,"error":"dynamic metadata inspector is Linux/Windows only"});
+    }
+    let key = if cfg!(windows) { "win" } else { "linux" };
+    let library = core.with_file_name(if cfg!(windows) {
+        "libcronet.dll"
+    } else {
+        "libcronet.so"
+    });
+    let output = std::process::Command::new("node")
+        .arg(repo.join("scripts/native-payload-input.mjs"))
+        .arg(key)
+        .arg(core)
+        .arg(library)
+        .current_dir(repo)
+        .output();
+    match output {
+        Ok(output) if output.status.success() && output.stdout.len() <= 8 * 1024 * 1024 => {
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(input)
+                    if matches!(
+                        input["schema"].as_str(),
+                        Some(
+                            "polaris-native-release-payload-input-v1"
+                                | "polaris-native-payload-input-v1"
+                        )
+                    ) =>
+                {
+                    json!({"verified":true,"input":input})
+                }
+                _ => json!({"verified":false,"error":"actual metadata inspector response differs"}),
+            }
+        }
+        Ok(output) => json!({"verified":false,"status":output.status.code(),
+            "stderr":String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(8192)])}),
+        Err(error) => json!({"verified":false,"error":error.to_string()}),
+    }
+}
+
+fn matched_core_identity(recorded: Option<Value>, actual: &Value, core: &Path) -> Option<Value> {
+    recorded.filter(|identity| {
+        actual["verified"] == true
+            && actual.pointer("/input/core") == Some(identity)
+            && identity["path"].as_str() == core.to_str()
+    })
+}
+
 pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut Running) {
     let Context {
         phase,
@@ -82,20 +154,26 @@ pub(super) fn capture(context: Context<'_>, a_core: &mut Running, b_core: &mut R
         a,
         b,
     } = context;
-    let identity = source_core_identity_from_repo(&support::core_locator::repo_root(), core);
+    let repo = support::core_locator::repo_root();
+    let recorded = source_core_identity_from_repo(&repo, core);
     // Request both owned stacks before waiting: the first peer's exit must not consume
     // a full wait window before the other peer receives its diagnostic signal.
     let a_request = request_owned_stack(a_core);
     let b_request = request_owned_stack(b_core);
     let a_snapshot = finish_owned_snapshot(a_core, a_request);
     let b_snapshot = finish_owned_snapshot(b_core, b_request);
+    // Preserve the original immediate stack requests. Metadata inspection
+    // rereads the same file afterwards and must not delay either peer's dump.
+    let actual = actual_core_input(&repo, core);
+    let identity = matched_core_identity(recorded.clone(), &actual, core);
     let snapshot = json!({
         "schema":"polaris-wg-failed-probe-diagnostics-v1",
         "phase":phase,"family":family,"policy":policy,"originalProbeError":error,
         "corePath":core,"matchingNativeSourceCoreIdentity":identity,
+        "recordedCoreInputIdentity":recorded,"actualCoreInputObservation":actual,
         "aConfig":a,"bConfig":b,
         "aChild":a_snapshot,"bChild":b_snapshot,
-        "scope":"after failed original probe; no timeout/routing/skip changes; missing identity is null"
+        "scope":"after failed original probe; immediate owned SIGQUIT then actual metadata reinspection; no timeout/routing/skip changes; unmatched identity is null"
     });
     // Full run logs already preserve stderr in CI. No extra files or inferred success pins.
     eprintln!("WG_FAILURE_DIAGNOSTICS={snapshot}");
@@ -205,5 +283,56 @@ mod tests {
             source_core_identity_from_repo(repo.path(), &repo.path().join("core")),
             None
         );
+    }
+
+    #[test]
+    fn changed_bytes_buildid_or_path_and_failed_inspector_never_bind_the_failed_probe() {
+        let core = Path::new("/controlled/resources/linux/sing-box");
+        let recorded = json!({"path":core,"sha256":"a".repeat(64),"buildID":"controlled-id"});
+        let actual = json!({"verified":true,"input":{"core":recorded}});
+        assert_eq!(
+            matched_core_identity(Some(recorded.clone()), &actual, core),
+            Some(recorded.clone())
+        );
+        for field in ["sha256", "buildID", "path"] {
+            let mut changed = actual.clone();
+            changed["input"]["core"][field] = json!("changed");
+            assert!(matched_core_identity(Some(recorded.clone()), &changed, core).is_none());
+        }
+        let mut failed = actual.clone();
+        failed["verified"] = json!(false);
+        assert!(matched_core_identity(Some(recorded.clone()), &failed, core).is_none());
+        assert!(matched_core_identity(None, &actual, core).is_none());
+    }
+
+    #[test]
+    fn runtime_input_is_used_without_relabelling_it_as_a_native_capi_proof() {
+        let repo = tempfile::tempdir().unwrap();
+        let core = repo.path().join("resources/linux/sing-box");
+        fixture_proof(repo.path(), &core);
+        let identity =
+            json!({"path":core,"sha256":"a".repeat(64),"buildID":"actual-metadata-control"});
+        let path = repo
+            .path()
+            .join("native-payload-evidence")
+            .join(if cfg!(windows) {
+                "runtime-input-win.json"
+            } else {
+                "runtime-input-linux.json"
+            });
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema":"polaris-native-release-payload-input-v1","core":identity
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            source_core_identity_from_repo(repo.path(), &core),
+            Some(identity)
+        );
+        std::fs::write(&path, b"not JSON").unwrap();
+        assert!(source_core_identity_from_repo(repo.path(), &core).is_none());
     }
 }

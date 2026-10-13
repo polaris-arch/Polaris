@@ -109,8 +109,17 @@ def evidence():
                 # Preserve those bytes as unaccepted evidence, never a final receipt.
                 paths.update(path for path in framework.rglob('*') if path.is_file() or path.is_symlink())
         receipt = component / 'component-receipt.json'
+        receipt_errors = {}
+        origins = None
         if receipt.exists():
-            origins = read_receipt(receipt)['nativeInputs']
+            try:
+                origins = read_receipt(receipt)['nativeInputs']
+                require(isinstance(origins, dict) and isinstance(origins.get('files'), dict),
+                        'original native input inventory differs')
+            except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
+                receipt_errors[receipt.relative_to(root).as_posix()] = str(error)
+                origins = None
+        if origins is not None:
             paths.update(Path(path) for path in origins['files'])
             if 'generatorOutputRoot' in origins:
                 paths.update(path for path in Path(origins['generatorOutputRoot']).rglob('*') if path.is_file())
@@ -122,7 +131,14 @@ def evidence():
             paths.update(work.glob('wire-*.a'))
             paths.update((work / 'derived-data').rglob('*LinkMap*.txt'))
             for receipt in work.glob('rust-*.json'):
-                target = read_receipt(receipt)['target']
+                try:
+                    target = read_receipt(receipt)['target']
+                    require(isinstance(target, str) and target in
+                            ('aarch64-apple-ios', 'aarch64-apple-ios-sim', 'x86_64-apple-ios'),
+                            'original Rust target differs')
+                except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
+                    receipt_errors[receipt.relative_to(root).as_posix()] = str(error)
+                    continue
                 paths.add(root / 'cache/rust-target' / target / 'release/libpolaris_lib.a')
         output = root / 'apple-original-evidence.zip'
         require(not output.exists(), 'previous original evidence must not be overwritten')
@@ -148,8 +164,9 @@ def evidence():
                 package.write(path, name)
                 rows[name] = {'originalPath': str(path), **pin}
             index = {'schema': 'polaris-apple-original-evidence-v1', 'files': rows,
-                     'completeUnsignedChain': (root / 'apple-chain.json').exists(),
-                     'componentAccepted': (component / 'component-receipt.json').exists(),
+                     'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
+                     'componentAccepted': origins is not None,
+                     'receiptReadErrors': receipt_errors,
                      'stagedComponentIsAccepted': False,
                      'devicePassed': False, 'publicationEligible': False}
             package.writestr('EVIDENCE-INDEX.json', json.dumps(index, indent=2) + '\n')

@@ -15,13 +15,31 @@ APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
          'ios-arm64-simulator': (0x100000c, 7, 'arm64', 'simulator'),
          'ios-x86_64-simulator': (0x1000007, 7, 'amd64', 'simulator')}
 MAX_ARTIFACT = 1024 ** 3
+MAX_RECEIPT = 16 * 1024 ** 2
+MAX_APPLE_RECEIPT = 64 * 1024 ** 2
+
+
+def receipt_limit(value):
+    # Full three-slice member/origin inventories exceed the small-control
+    # envelope. Keep those original fields, with a separate finite budget.
+    require(isinstance(value, dict), 'receipt must be an object')
+    large = (value.get('schema') == 'polaris-mobile-component-v1' and value.get('platform') == 'apple' or
+             value.get('schema') == 'polaris-mobile-apple-link-input-v1')
+    return MAX_APPLE_RECEIPT if large else MAX_RECEIPT
 
 
 def read_receipt(path):
     path = Path(path)
-    require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 16 * 1024 ** 2,
-            'bounded regular original receipt required')
-    return decode(path.read_bytes(), maximum=16 * 1024 ** 2)
+    size = path.lstat().st_size if path.exists() or path.is_symlink() else 0
+    require(path.is_file() and not path.is_symlink() and 0 < size <= MAX_APPLE_RECEIPT,
+            'bounded regular original receipt required: path=' + str(path) + '; bytes=' + str(size) +
+            '; maximum=' + str(MAX_APPLE_RECEIPT))
+    with path.open('rb') as stream:
+        raw = stream.read(MAX_APPLE_RECEIPT + 1)
+    require(len(raw) == size, 'receipt size changed during read')
+    value = decode(raw, maximum=MAX_APPLE_RECEIPT)
+    require(len(raw) <= receipt_limit(value), 'original receipt exceeds its schema budget')
+    return value
 
 
 def module(name, relative):

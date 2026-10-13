@@ -213,6 +213,29 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertFalse(index['completeUnsignedChain'])
                 self.assertEqual(index['files'][member]['sha256'], __import__('hashlib').sha256(raw).hexdigest())
 
+    def test_unreadable_component_receipt_does_not_block_original_evidence_packaging(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def held(*args):
+            yield
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            component = root / 'component'; component.mkdir()
+            raw = b'{"schema":"polaris-mobile-component-v1","nativeInputs":'
+            (component / 'component-receipt.json').write_bytes(raw)
+            (component / 'original-bind.log').write_bytes(b'original tool output')
+            with mock.patch.object(ci_apple, 'location', return_value=root), \
+                    mock.patch.object(ci_apple, 'lease', held), mock.patch('builtins.print'):
+                ci_apple.evidence()
+            with zipfile.ZipFile(root / 'apple-original-evidence.zip') as archive:
+                self.assertEqual(archive.read('component/component-receipt.json'), raw)
+                self.assertEqual(archive.read('component/original-bind.log'), b'original tool output')
+                index = json.loads(archive.read('EVIDENCE-INDEX.json'))
+                self.assertIn('component/component-receipt.json', index['receiptReadErrors'])
+                self.assertFalse(index['componentAccepted'])
+                self.assertFalse(index['completeUnsignedChain'])
+                self.assertFalse(index['publicationEligible'])
+
     def test_actual_bsd_unsorted_and_sorted_symbol_tables_bind_real_code_offsets(self):
         fixtures = module('formal_bsd_symbol_table_fixtures', 'scripts/apple-carrier.test.py')
         parser = module('formal_bsd_symbol_table_parser', 'scripts/apple-carrier.py')

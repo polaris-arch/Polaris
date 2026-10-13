@@ -18,11 +18,53 @@ from budget import reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import compiler_fact, equivalent_binding, executable_driver_identity
 from transaction import install, recover
+import artifacts
+from producer import write_json
 
 
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
         self.value = load()
+
+    def test_large_apple_receipts_round_trip_original_inventory_and_fingerprint(self):
+        # Model the real producer/consumer boundary, not native acceptance.
+        # The full JSON is larger than the former 16MiB reader envelope.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'receipt.json'
+            for schema in ('polaris-mobile-component-v1', 'polaris-mobile-apple-link-input-v1'):
+                value = {'schema': schema, 'platform': 'apple',
+                         'originalInventoryObservation': 'x' * (16 * 1024 ** 2),
+                         'AppAccepted': False, 'devicePassed': False}
+                value['fingerprint'] = sha(canonical(value))
+                write_json(path, value)
+                self.assertGreater(path.stat().st_size, artifacts.MAX_RECEIPT)
+                self.assertEqual(artifacts.read_receipt(path), value)
+                self.assertEqual(value['fingerprint'], sha(canonical({k: v for k, v in value.items() if k != 'fingerprint'})))
+
+    def test_receipt_budgets_refuse_unknown_android_oversize_and_preserve_prior_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(artifacts, 'MAX_RECEIPT', 256), patch.object(artifacts, 'MAX_APPLE_RECEIPT', 1024):
+            path = Path(temporary) / 'receipt.json'
+            original = b'{"schema":"small-original"}\n'; path.write_bytes(original)
+            for value in [{'schema': 'unknown'}, {'schema': 'polaris-mobile-component-v1', 'platform': 'android'},
+                          {'schema': 'polaris-mobile-component-v1', 'platform': 'apple', 'payload': 'x' * 1024}]:
+                value.setdefault('payload', 'x' * 256)
+                with self.assertRaisesRegex(RuntimeError, 'before installation'):
+                    write_json(path, value)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertFalse(path.with_name('receipt.json.tmp').exists())
+                path.write_text(json.dumps(value))
+                with self.assertRaises(RuntimeError):
+                    artifacts.read_receipt(path)
+                path.write_bytes(original)
+            for invalid in [b'[]', b'{"a":1,"a":2}', b'{"a":NaN}', b'']:
+                path.write_bytes(invalid)
+                with self.assertRaises(RuntimeError):
+                    artifacts.read_receipt(path)
+            path.write_bytes(original)
+            link = path.with_name('link.json'); link.symlink_to(path.name)
+            with self.assertRaisesRegex(RuntimeError, 'bounded regular'):
+                artifacts.read_receipt(link)
 
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original

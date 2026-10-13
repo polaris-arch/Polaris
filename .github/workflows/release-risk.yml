@@ -289,6 +289,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Metadata inspection only, distinct from the native C API/final-payload proof.
+          # Retain the actual consumed core binding before the first runtime probe.
+          mkdir -p native-payload-evidence
+          node scripts/native-payload-input.mjs linux "$PWD/resources/linux/sing-box" "$PWD/resources/linux/libcronet.so" > native-payload-evidence/runtime-input-linux.json
+          node -e 'const i=JSON.parse(require("node:fs").readFileSync("native-payload-evidence/runtime-input-linux.json")); console.log("WG_RUNTIME_CORE_INPUT="+JSON.stringify({core:i.core,sourceCommit:i.producer?.sourceCommit,sourceTree:i.producer?.sourceTree,scope:"actual metadata binding; no runtime/device acceptance"}))'
           cargo test -p polaris-config-engine --test core_dep_fingerprint
           cargo test -p polaris-config-engine --test core_schema_surface
           cargo test -p polaris-config-engine --test core_build_matrix

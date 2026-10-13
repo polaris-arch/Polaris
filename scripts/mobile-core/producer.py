@@ -241,11 +241,15 @@ def equivalent_binding(original, current):
 
 
 def write_json(path, value):
+    from artifacts import receipt_limit
+    raw = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n').encode()
+    require(len(raw) <= receipt_limit(value),
+            'receipt exceeds schema budget before installation: path=' + str(path) +
+            '; bytes=' + str(len(raw)) + '; maximum=' + str(receipt_limit(value)))
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
-    with temporary.open('x') as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write('\n')
+    with temporary.open('xb') as stream:
+        stream.write(raw)
         stream.flush(); os.fsync(stream.fileno())
     temporary.replace(path)
 
