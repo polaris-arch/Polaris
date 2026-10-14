@@ -120,15 +120,21 @@ fn same_id_is_immutable_and_every_start_rechecks_contents() {
 fn busy_leases_allow_new_install_but_prevent_retirement() {
     let (root, store, uid) = store();
     let mut leases = Vec::new();
-    for version in ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4"] {
+    let started = std::time::Instant::now();
+    for (iteration, version) in ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4"]
+        .into_iter()
+        .enumerate()
+    {
         let (source, manifest) = fixture(version);
         store
             .install(&manifest, source.path(), Some(uid), None)
-            .unwrap();
+            .unwrap_or_else(|error| panic!("busy-lease stage=install iteration={iteration} version={version} held_leases={} elapsed_ns={} error={error:?}",
+                leases.len(), started.elapsed().as_nanos()));
         leases.push(
             store
                 .verify_for_start(&CoreId::parse(&manifest.id).unwrap())
-                .unwrap(),
+                .unwrap_or_else(|error| panic!("busy-lease stage=outer-start-verify iteration={iteration} version={version} held_leases={} elapsed_ns={} error={error:?}",
+                    leases.len(), started.elapsed().as_nanos())),
         );
     }
     assert!(store.retain_latest_three(&[]).unwrap().is_empty());
@@ -142,6 +148,129 @@ fn busy_leases_allow_new_install_but_prevent_retirement() {
         fs::read_dir(root.path().join("versions")).unwrap().count(),
         3
     );
+}
+
+#[test]
+fn lock_failures_keep_closed_roles_and_native_error_classification_without_paths() {
+    for role in [
+        LockRole::StoreMutationExclusive,
+        LockRole::RepairExclusive,
+        LockRole::OrphanExclusive,
+        LockRole::StartShared,
+    ] {
+        let error = lock_error(
+            role,
+            LockObservation {
+                fd: Some(41),
+                dev: Some(7),
+                inode: Some(11),
+                cloexec: Some(true),
+            },
+            TryLockError::WouldBlock,
+        );
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let text = format!("{error:?}");
+        assert!(text.contains(&format!("role={}", role.name())));
+        for fact in [
+            "class=would-block",
+            "fd=Some(41)",
+            "dev=Some(7)",
+            "inode=Some(11)",
+            "cloexec=Some(true)",
+        ] {
+            assert!(text.contains(fact), "missing closed observation: {fact}");
+        }
+    }
+    let error = lock_error(
+        LockRole::StoreMutationExclusive,
+        LockObservation::default(),
+        TryLockError::Error(io::Error::from_raw_os_error(nix::libc::EACCES)),
+    );
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("class=io-error"));
+    let failure = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<LockFailure>()
+        .unwrap();
+    let source = std::error::Error::source(failure)
+        .unwrap()
+        .downcast_ref::<io::Error>()
+        .unwrap();
+    assert_eq!(source.raw_os_error(), Some(nix::libc::EACCES));
+    // Display and Debug stay safe even when an injected original OS error has
+    // a path/message. The original cause remains available through source().
+    let secret = "/private/fixture/source payload=never-export";
+    let error = lock_error(
+        LockRole::StartShared,
+        LockObservation::default(),
+        TryLockError::Error(io::Error::other(secret)),
+    );
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(!error.to_string().contains(secret));
+    assert!(!format!("{error:?}").contains(secret));
+    assert!(error.to_string().contains("fd=None"));
+}
+
+#[test]
+fn role_diagnostics_preserve_shared_and_exclusive_modes_and_descriptor_flags() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("controlled-lease");
+    let owner = File::create_new(&path).unwrap();
+    let peer_shared = File::open(&path).unwrap();
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    acquire_lock(&owner, LockRole::StartShared).unwrap();
+    acquire_lock(&peer_shared, LockRole::StartShared).unwrap();
+    let flags = nix::fcntl::fcntl(&contender, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+    for role in [
+        LockRole::StoreMutationExclusive,
+        LockRole::RepairExclusive,
+        LockRole::OrphanExclusive,
+    ] {
+        let error = acquire_lock(&contender, role).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let failure = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<LockFailure>()
+            .unwrap();
+        assert_eq!(failure.observation.fd, Some(contender.as_raw_fd()));
+        assert_eq!(
+            failure.observation.dev,
+            Some(contender.metadata().unwrap().dev())
+        );
+        assert_eq!(
+            failure.observation.inode,
+            Some(contender.metadata().unwrap().ino())
+        );
+        assert_eq!(
+            failure.observation.cloexec,
+            Some(flags & nix::libc::FD_CLOEXEC != 0)
+        );
+        assert_eq!(
+            nix::fcntl::fcntl(&contender, nix::fcntl::FcntlArg::F_GETFD).unwrap(),
+            flags
+        );
+    }
+    // The contender is a separately opened, initially unlocked description;
+    // never attempt unspecified shared-to-exclusive conversion on a holder.
+    let exclusive_path = root.path().join("exclusive-lease");
+    let exclusive = File::create_new(&exclusive_path).unwrap();
+    let shared_contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&exclusive_path)
+        .unwrap();
+    acquire_lock(&exclusive, LockRole::StoreMutationExclusive).unwrap();
+    let error = acquire_lock(&shared_contender, LockRole::StartShared).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error.to_string().contains("role=start-shared"));
 }
 
 #[test]

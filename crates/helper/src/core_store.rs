@@ -1,5 +1,5 @@
 //! B3 immutable content store. Runtime callers select an installed id, never source bytes.
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,107 @@ use crate::core_objects::PayloadDir;
 use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum LockRole {
+    StoreMutationExclusive,
+    RepairExclusive,
+    OrphanExclusive,
+    StartShared,
+}
+impl LockRole {
+    fn name(self) -> &'static str {
+        match self {
+            Self::StoreMutationExclusive => "store-mutation-exclusive",
+            Self::RepairExclusive => "repair-exclusive",
+            Self::OrphanExclusive => "orphan-exclusive",
+            Self::StartShared => "start-shared",
+        }
+    }
+}
+
+#[derive(Default)]
+struct LockObservation {
+    fd: Option<i32>,
+    dev: Option<u64>,
+    inode: Option<u64>,
+    cloexec: Option<bool>,
+}
+impl LockObservation {
+    fn from_file(file: &File) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata().ok();
+            let flags = nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_GETFD).ok();
+            Self {
+                fd: Some(file.as_raw_fd()),
+                dev: metadata.as_ref().map(MetadataExt::dev),
+                inode: metadata.as_ref().map(MetadataExt::ino),
+                cloexec: flags.map(|value| value & nix::libc::FD_CLOEXEC != 0),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = file;
+            Self::default()
+        }
+    }
+}
+
+// Failure-only observations borrow the original descriptor. They neither open
+// another lease nor change its lock, ownership, lifetime or inheritance flags.
+struct LockFailure {
+    role: LockRole,
+    observation: LockObservation,
+    cause: TryLockError,
+}
+impl std::fmt::Display for LockFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (class, kind, os_code) = match &self.cause {
+            TryLockError::WouldBlock => ("would-block", io::ErrorKind::WouldBlock, None),
+            TryLockError::Error(error) => ("io-error", error.kind(), error.raw_os_error()),
+        };
+        write!(f, "core-store-lock role={} class={} kind={kind:?} os_code={os_code:?} fd={:?} dev={:?} inode={:?} cloexec={:?}",
+            self.role.name(), class, self.observation.fd, self.observation.dev,
+            self.observation.inode, self.observation.cloexec)
+    }
+}
+impl std::fmt::Debug for LockFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for LockFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            TryLockError::WouldBlock => None,
+            TryLockError::Error(error) => Some(error),
+        }
+    }
+}
+fn lock_error(role: LockRole, observation: LockObservation, cause: TryLockError) -> io::Error {
+    let kind = match &cause {
+        TryLockError::WouldBlock => io::ErrorKind::WouldBlock,
+        TryLockError::Error(error) => error.kind(),
+    };
+    io::Error::new(
+        kind,
+        LockFailure {
+            role,
+            observation,
+            cause,
+        },
+    )
+}
+fn acquire_lock(file: &File, role: LockRole) -> io::Result<()> {
+    let result = match role {
+        LockRole::StartShared => file.try_lock_shared(),
+        _ => file.try_lock(),
+    };
+    result.map_err(|cause| lock_error(role, LockObservation::from_file(file), cause))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerPolicy {
@@ -257,8 +358,7 @@ impl CoreStore {
         #[cfg(windows)]
         crate::platform::windows::winproc::seal_store_object(&path, false)?;
         self.owner.check(&path)?;
-        file.try_lock()
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+        acquire_lock(&file, LockRole::StoreMutationExclusive)?;
         Ok(file)
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
@@ -296,9 +396,7 @@ impl CoreStore {
 
     pub fn verify_for_start(&self, id: &CoreId) -> io::Result<VerifiedCore> {
         let lease = self.lease_file(id)?;
-        lease
-            .try_lock_shared()
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+        acquire_lock(&lease, LockRole::StartShared)?;
         let manifests = self.root.join("manifests");
         self.owner.check(&manifests)?;
         let manifest_objects = PayloadDir::open(&manifests, self.owner.uid)?;
@@ -414,9 +512,7 @@ impl CoreStore {
                 // Corrupt versions can be repaired only after excluding every
                 // verifier, running Child and lazy sidecar reader by native lease.
                 let lease = self.lease_file(&id)?;
-                lease
-                    .try_lock()
-                    .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+                acquire_lock(&lease, LockRole::RepairExclusive)?;
                 let receipt = self
                     .root
                     .join("manifests")
@@ -435,9 +531,7 @@ impl CoreStore {
                     Err(error) => return Err(error),
                 };
                 if let Some(lease) = &lease {
-                    lease
-                        .try_lock()
-                        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+                    acquire_lock(lease, LockRole::OrphanExclusive)?;
                 }
                 self.owner.check(&destination)?;
                 self.trash_version(&id, &destination)?;
