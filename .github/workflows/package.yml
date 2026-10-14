@@ -371,6 +371,11 @@ jobs:
       CORE_CANDIDATE: ${{ needs.setup.outputs.candidate }}
       POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
+      # Ordinary Risk already acquired/read back these exact four inputs in
+      # this run/attempt. POSIX installers can import the same checked bytes.
+      # Windows retains its original acquisition until file-mode transport is
+      # explicitly supported; standalone Package/tag have no handoff input.
+      CORE_WIRE_INPUT_ARTIFACT: ${{ matrix.label != 'windows' && inputs.core_wire_input_artifact || '' }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
       # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
@@ -703,16 +708,39 @@ jobs:
           cache: false
 
       - name: Download exact candidate core bundle
+        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.CORE_BUNDLE_ARTIFACT }}
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Consume sing-box core bundle
+        if: env.CORE_WIRE_INPUT_ARTIFACT == ''
         shell: bash
         env:
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+
+      - name: Require current-attempt installer input identity
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs check --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
+
+      - name: Download current-attempt preflight installer inputs
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.CORE_WIRE_INPUT_ARTIFACT }}
+          path: ${{ runner.temp }}/installer-core-inputs
+
+      - name: Verify and import current-attempt preflight installer inputs
+        if: env.CORE_WIRE_INPUT_ARTIFACT != ''
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs import --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
 
       # 四平台 wire descriptor 对拍（`Bundled core gRPC wire contract`）不在本腿：它与宿主平台无关，
       # 2026-10-07 起由下面的 `core_wire` job 全 workflow 只跑一次（依据见该 job 头注）。

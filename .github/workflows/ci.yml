@@ -63,6 +63,10 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      preserve_run:
+        description: '保留固定源码审计运行；不被后续普通手动运行取消'
+        type: boolean
+        default: false
       os:
         # 单平台确认专用（2026-08-05）：要回答的是「**这一个**平台还能不能编/跑」时，另外两条腿
         # 不增加目标平台的信息且延长反馈。缺省仍是 `all`，不改任何既有语义。
@@ -86,8 +90,10 @@ on:
 # 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
 # tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  # Fixed audit dispatches have a unique group; a later ordinary dispatch cannot
+  # cancel them. Reusable publishing callers and tag refs retain their groups.
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.preserve_run && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name != 'workflow_dispatch') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && inputs.preserve_run != true) }}
 
 jobs:
   # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══

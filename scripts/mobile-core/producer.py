@@ -26,7 +26,7 @@ from fork_input import ROOT, canonical, load, require, sha, verify_source, tool_
 from android_sdk import prepare_view
 from plan import plan
 from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt
-from budget import group_alive, register_group, reservation
+from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
 ACTIVE_FDS = []
 
@@ -198,8 +198,7 @@ def tool_facts(args, value, env):
     return paths, result
 
 
-def producer_code():
-    files = ['scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py',
+PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py',
              'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
@@ -208,10 +207,34 @@ def producer_code():
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
              'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json',
-             'scripts/libbox-patches/android-source.py', 'scripts/apple-carrier.py']
+             'scripts/libbox-patches/android-source.py', 'scripts/apple-carrier.py')
+ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v1'
+ANDROID_UNRELATED_CODE = frozenset({
+    'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py',
+    'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
+})
+
+
+def producer_code():
     require(not run(['git', 'status', '--porcelain=v1', '--untracked-files=all'], cwd=ROOT), 'App author source must be frozen')
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
-            'files': {name: file_pin(ROOT / name) for name in files}}
+            'files': {name: file_pin(ROOT / name) for name in PRODUCER_FILES}}
+
+
+def android_build_code(identity, policy=ANDROID_BUILD_CODE_POLICY):
+    """One reviewed projection for cache lookup and reuse, never provenance."""
+    require(policy == ANDROID_BUILD_CODE_POLICY, 'unknown Android build code policy')
+    files = identity.get('files') if isinstance(identity, dict) else None
+    require(isinstance(files, dict) and set(PRODUCER_FILES) <= set(files),
+            'complete original producer code inventory required')
+    for name, pin in files.items():
+        require(isinstance(name, str) and isinstance(pin, dict) and set(pin) == {'bytes', 'sha256'} and
+                type(pin['bytes']) is int and pin['bytes'] > 0 and isinstance(pin['sha256'], str) and
+                re.fullmatch('[0-9a-f]{64}', pin['sha256']), 'producer code file pin differs')
+    # Unknown extra files stay relevant; only these four Apple-only entries are
+    # omitted. The original nineteen-file identity is not edited or replaced.
+    return {'policy': policy, 'files': {name: pin for name, pin in files.items()
+                                      if name not in ANDROID_UNRELATED_CODE}}
 
 
 def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch):
@@ -244,6 +267,26 @@ def comparison_binding(value):
             'component input/producer structure differs')
     result = dict(value)
     result['producer'] = {key: item for key, item in value.get('producer', {}).items() if key != 'candidate'}
+    if value.get('platform') == 'android':
+        projected = android_build_code(value['producer'])
+        result['producer'] = {**result['producer'], 'files': projected['files'],
+                              'comparisonPolicy': projected['policy']}
+    return result
+
+
+def component_revalidation_observation(receipt, binding, receipt_pin, reused):
+    """Current verifier identity alongside immutable original producer facts."""
+    policy = (ANDROID_BUILD_CODE_POLICY if binding['platform'] == 'android'
+              else 'polaris-full-producer-code-v1')
+    result = {'schema': 'polaris-mobile-component-revalidation-v1', 'derivedObservation': True,
+              'comparisonPolicy': policy, 'reused': reused,
+              'currentVerifier': binding['producer'],
+              'originalProducerCandidate': receipt['input']['producer']['candidate'],
+              'originalReceipt': receipt_pin, 'originalComponentFingerprint': receipt['fingerprint'],
+              'originalBuildID': 'polaris-mobile-' + receipt_digest(receipt['input']),
+              'currentBuildInputFingerprint': receipt_digest(comparison_binding(binding)),
+              'scope': 'current byte/origin revalidation; original receipt/BuildID remain unchanged; no App/device acceptance'}
+    result['fingerprint'] = receipt_digest(result)
     return result
 
 
@@ -526,6 +569,13 @@ def execute(args):
             jar = None
             env = tool_environment(args.go, args.gomobile, args.gobind, cache, scratch,
                                    developer=Path(args.developer).resolve(strict=True))
+        # Observe the runner without requiring a compiler's memory budget.
+        # A cache hit still runs the complete byte/native/origin predicate under
+        # its existing filesystem reservation and bounded metadata collectors.
+        print(json.dumps({'phase': 'component-validation-resources', 'platform': args.platform,
+                          'capacity': native_capacity(), 'compilerAdmissionRequired': False,
+                          'budget': {'filesystemPeakReserveBytes': value['budget']['buildPeakReserveBytes'],
+                                     'cacheMaxBytes': value['budget']['cacheMaxBytes']}}))
         tools, identities = tool_facts(args, value, env)
         # init installs gobind@latest. The pinned generator only requires this
         # private GOPATH marker directory; create it without invoking init.
@@ -580,6 +630,11 @@ def execute(args):
                     'original generator outputs retained; explicit recovery required before rebinding')
             staged = stage_component
             require(not staged.exists(), 'unaccepted prior stage retained; inspect before recovery')
+            # Only an actual new bind requires native compilation admission.
+            # Dynamic caps remain outside the immutable binding/BuildID input.
+            env, capacity = native_environment(env)
+            print(json.dumps({'phase': 'component-native-capacity', 'platform': args.platform,
+                              'capacity': capacity, 'compilerAdmissionRequired': True}))
             recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
             from fork_input import bind_command
             command = bind_command(args.platform, value, tools['gomobile'], staged, fp, jar)
@@ -615,8 +670,11 @@ def execute(args):
                      (log, work / 'original-bind.log')], work,
                     lambda: verify_receipt(component, receipt, value, binding, tools, run_tool, scratch))
         require(os.statvfs(work).f_bavail * os.statvfs(work).f_frsize >= 1024 ** 3, 'post-build filesystem reserve exhausted')
+        require(producer_code() == producer_identity, 'verifier source changed during component validation')
         print(json.dumps({'component': str(component), 'receipt': str(receipt_path),
-                          'fingerprint': receipt['fingerprint'], 'AppAccepted': False, 'devicePassed': False}))
+                          'fingerprint': receipt['fingerprint'], 'AppAccepted': False, 'devicePassed': False,
+                          'revalidation': component_revalidation_observation(
+                              receipt, binding, file_pin(receipt_path), not rebuild)}))
 
 
 def main():

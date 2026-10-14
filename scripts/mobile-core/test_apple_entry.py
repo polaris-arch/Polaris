@@ -603,6 +603,84 @@ class AppleEntryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'duplicate'):
             parser.macho(fixtures.mach_object('ios-arm64', load_commands=[duplicate, duplicate]), helper)
 
+    @staticmethod
+    def code_signature_fixture(fixtures, target, *, kind=2, duplicate=False, overlap=False,
+                               duplicate_linkedit=False):
+        # Structural metadata only: the blob is opaque and is not a valid
+        # authenticated signature or a compiler-generated CodeDirectory.
+        payload = struct.pack('>7I', 0xfade0cc0, 28, 1, 0, 20, 0xfade0c02, 8)
+        text = b'fixture!'
+        cpu, subcpu, platform, _, _, _ = fixtures.carrier.TARGETS[target]
+        data_commands = 1 + int(duplicate) + int(overlap)
+        commands_bytes = 152 + 72 + int(duplicate_linkedit) * 72 + 24 + data_commands * 16
+        text_offset = 32 + commands_bytes
+        signature_offset = text_offset + len(text)
+        section = struct.pack('<16s16sQQ8I', b'__text', b'__TEXT', text_offset,
+                              len(text), text_offset, 0, 0, 0, 0, 0, 0, 0)
+        text_segment = struct.pack('<II16s4Q4I', 0x19, 152, b'__TEXT', 0,
+                                   signature_offset, 0, signature_offset, 5, 5, 1, 0) + section
+        linkedit = struct.pack('<II16s4Q4I', 0x19, 72, b'__LINKEDIT', 0x1000,
+                               len(payload), signature_offset, len(payload), 1, 1, 0, 0)
+        build_version = struct.pack('<6I', 0x32, 24, platform, 17 << 16, (27 << 16) | (1 << 8), 0)
+        signature = struct.pack('<4I', 0x1d, 16, signature_offset, len(payload))
+        commands = text_segment + linkedit
+        if duplicate_linkedit:
+            commands += struct.pack('<II16s4Q4I', 0x19, 72, b'__LINKEDIT', 0x2000,
+                                    0, signature_offset, 0, 1, 1, 0, 0)
+        commands += build_version + signature
+        if duplicate:
+            commands += signature
+        if overlap:
+            commands += struct.pack('<4I', 0x26, 16, signature_offset, len(payload))
+        header = struct.pack('<8I', 0xfeedfacf, cpu, subcpu, kind,
+                             3 + data_commands + int(duplicate_linkedit), commands_bytes, 0, 0)
+        return (header + commands + text + payload,
+                32 + 152 + 72 + int(duplicate_linkedit) * 72 + 24, signature_offset, payload)
+
+    def test_linked_code_signature_records_opaque_bytes_without_trust(self):
+        fixtures = module('formal_signature_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_signature_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_signature_info', 'scripts/libbox-patches/android-source.py')
+        # The command was observed in the actual8795 sim-arm64 App and
+        # PacketTunnel; other targets here are structural controls, not builds.
+        for target in ('ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'):
+            raw, _, offset, payload = self.code_signature_fixture(fixtures, target)
+            parsed = parser.macho(raw, helper)
+            row = next(row for row in parsed['loadCommands'] if row['command'] == 0x1d)
+            self.assertEqual((row['dataOffset'], row['dataBytes']), (offset, len(payload)))
+            self.assertEqual(row['payloadSha256'], helper.digest(payload))
+            self.assertEqual(row['payloadKind'], 'opaque-code-signature')
+            self.assertIs(row['trustValidated'], False)
+            changed = raw[:-1] + bytes([raw[-1] ^ 1])
+            observed = next(row for row in parser.macho(changed, helper)['loadCommands'] if row['command'] == 0x1d)
+            self.assertNotEqual(observed['payloadSha256'], row['payloadSha256'])
+            self.assertIs(observed['trustValidated'], False)
+
+    def test_code_signature_refuses_invalid_locus_duplicate_size_and_overlap(self):
+        fixtures = module('formal_signature_negative_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_signature_negative_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_signature_negative_info', 'scripts/libbox-patches/android-source.py')
+        raw, command, offset, payload = self.code_signature_fixture(fixtures, 'ios-arm64-simulator')
+        bads = []
+        for field, value in [(command + 4, 8), (command + 8, 0),
+                             (command + 8, len(raw) + 1), (command + 12, 0),
+                             (command + 12, len(payload) + 1)]:
+            bad = bytearray(raw); struct.pack_into('<I', bad, field, value); bads.append(bytes(bad))
+        missing = bytearray(raw); missing[32 + 152 + 8:32 + 152 + 24] = b'__MISSING'.ljust(16, b'\0'); bads.append(bytes(missing))
+        short = bytearray(raw); struct.pack_into('<Q', short, 32 + 152 + 48, len(payload) - 1); bads.append(bytes(short))
+        outside = bytearray(raw); struct.pack_into('<2I', outside, command + 8, offset - 8, 8); bads.append(bytes(outside))
+        for bad in bads:
+            with self.subTest(control=bad[command:command + 16].hex()), self.assertRaises(RuntimeError):
+                parser.macho(bad, helper)
+        for flags, reason in [({'kind': 1}, 'executable'), ({'duplicate': True}, 'duplicate'),
+                              ({'overlap': True}, 'overlap'), ({'duplicate_linkedit': True}, 'unique')]:
+            bad, _, _, _ = self.code_signature_fixture(fixtures, 'ios-arm64-simulator', **flags)
+            with self.assertRaisesRegex(RuntimeError, reason):
+                parser.macho(bad, helper)
+        unknown = bytearray(raw); struct.pack_into('<I', unknown, command, 0x1e)
+        with self.assertRaisesRegex(RuntimeError, 'unsupported load command'):
+            parser.macho(bytes(unknown), helper)
+
     def test_actual_linked_weak_swift_libraries_and_rpaths_are_structurally_recorded(self):
         fixtures = module('formal_dyld_fixtures', 'scripts/apple-carrier.test.py')
         parser = module('formal_dyld_parser', 'scripts/apple-carrier.py')

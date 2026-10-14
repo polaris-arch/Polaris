@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 import zipfile
 
 import sys
@@ -14,6 +15,20 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from fork_input import ROOT, load, require
 from producer import lease, private_dir, run
 from artifacts import receipt_digest, file_pin
+
+
+def timed_phase(name, operation, *args, **kwargs):
+    started = time.monotonic()
+    completed = False
+    try:
+        result = operation(*args, **kwargs)
+        completed = True
+        return result
+    finally:
+        print('APPLE_PHASE_TIMING=' + json.dumps({'phase': name,
+              'elapsedSeconds': round(time.monotonic() - started, 3),
+              'completed': completed, 'scope': 'elapsed observation only'},
+              sort_keys=True), flush=True)
 
 
 def host_swift_controls(root, app_env):
@@ -63,11 +78,12 @@ def main():
     for name in ('source', 'go', 'gomobile', 'gobind', 'developer'):
         producer_args += ['--' + name, getattr(args, name)]
     producer_args += ['--work', component_work, '--cache', cache]
-    run(producer_args, log=root / 'original-component-runner.log')
+    timed_phase('component-build-or-revalidate', run, producer_args,
+                log=root / 'original-component-runner.log')
     link = root / 'apple-link-input.json'
     # A retained link context cannot be overwritten as a new App identity.
     if not link.exists():
-        run([sys_python(), ROOT / 'scripts/mobile-core/consume.py', 'apple-link',
+        timed_phase('component-link-input', run, [sys_python(), ROOT / 'scripts/mobile-core/consume.py', 'apple-link',
             '--component', component_work / 'Libbox.xcframework', '--receipt', component_work / 'component-receipt.json',
             '--work', private_dir(root / 'link-work'), '--cache', cache, '--output', link],
             log=root / 'original-link-input.log')
@@ -83,19 +99,23 @@ def main():
         env.update(PLATFORM_NAME=platform, CONFIGURATION='release',
                    ARCHS='x86_64' if args.simulator and args.simulator_arch == 'amd64' else 'arm64')
         env['SDKROOT'] = run(['xcrun', '--sdk', platform, '--show-sdk-path'], env=env).strip()
+        from budget import native_environment
+        env, capacity = native_environment(env)
+        print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
         # Compile before Xcode starts its build service so the reservation fd,
         # registered compiler group and child lifetime remain observable.
-        run([sys_python(), ROOT / 'scripts/mobile-core/apple_rust.py', 'build'], env=env,
+        timed_phase('rust-target-build', run, [sys_python(), ROOT / 'scripts/mobile-core/apple_rust.py', 'build'], env=env,
             log=root / 'original-rust-entry.log')
         # Authored pure Swift controls compile on the same real toolchain as the App.
         # This entry runs only in the eventual single uniform Mac validation phase.
         if not args.simulator:
-            host_swift_controls(root, env)
+            timed_phase('host-swift-controls', host_swift_controls, root, env)
         derived = private_dir(root / 'derived-data')
         archive = root / 'Polaris.xcarchive'
         require(not archive.exists(), 'existing actual archive must not be overwritten')
         command = ['xcodebuild', '-project', ROOT / 'src-tauri/gen/apple/polaris.xcodeproj',
                    '-scheme', 'polaris_iOS', '-configuration', 'release', '-derivedDataPath', derived,
+                   '-jobs', str(capacity['appliedEnvironment']['CARGO_BUILD_JOBS']),
                    '-destination', 'generic/platform=iOS Simulator' if args.simulator else 'generic/platform=iOS',
                    '-archivePath', archive, 'archive', 'LD_GENERATE_MAP_FILE=YES']
         if args.simulator:
@@ -105,7 +125,8 @@ def main():
             command += ['DEVELOPMENT_TEAM=' + args.signing_team]
         else:
             command += ['CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO']
-        run(command, env=env, log=root / 'original-app-extension-link.log')
+        timed_phase('app-extension-archive', run, command, env=env,
+                    log=root / 'original-app-extension-link.log')
         apps = list((archive / 'Products/Applications').glob('*.app'))
         require(len(apps) == 1 and not apps[0].is_symlink(), 'actual archived host App required')
         ipa = root / ('polaris-box-' + value['version'] + '-app-link-probe.ipa')
@@ -122,7 +143,7 @@ def main():
         from carriers import apple
         from fork_input import canonical, sha
         from producer import write_json
-        final_receipt = apple(ipa, link, file_pin(link)['sha256'], maps[0],
+        final_receipt = timed_phase('final-carrier-inspection', apple, ipa, link, file_pin(link)['sha256'], maps[0],
                               component_work / 'component-receipt.json', private_dir(root / 'final-check'),
                               derived, args.simulator_arch if args.simulator else None)
         final_receipt['fingerprint'] = receipt_digest(final_receipt)

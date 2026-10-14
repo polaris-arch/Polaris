@@ -12,7 +12,8 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha, verify_source
-from producer import run, private_dir, producer_code
+from producer import run, private_dir, producer_code, android_build_code
+from budget import native_environment
 
 
 def prepare_source(source, value):
@@ -52,6 +53,8 @@ def prepare():
     env = dict(os.environ, GOBIN=str(tools), GOTOOLCHAIN='local', GOWORK='off', GOFLAGS='-mod=readonly',
                GOPATH=str(tool_cache / 'go-path'), GOCACHE=str(tool_cache / 'go-build'),
                GOMODCACHE=str(tool_cache / 'go-mod'))
+    env, capacity = native_environment(env)
+    print(json.dumps({'phase': 'android-tool-prepare-capacity', 'capacity': capacity}))
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env)
     ndk = run([sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py', root]).strip()
@@ -66,7 +69,7 @@ def prepare():
     prepare_source(paths['source'], value)
     from artifacts import file_pin
     require(producer_code() == producer_identity, 'App producer source changed during preparation')
-    fingerprint = sha(canonical({'source': value, 'code': producer_identity['files'],
+    fingerprint = sha(canonical({'source': value, 'code': android_build_code(producer_identity),
                 'tools': {name: file_pin(paths[name]) for name in ('go', 'gomobile', 'gobind')},
                 'java': {**file_pin((jdk / 'bin/java').resolve(strict=True)), 'version': run([jdk / 'bin/java', '--version'])},
                 'javac': {**file_pin((jdk / 'bin/javac').resolve(strict=True)), 'version': run([jdk / 'bin/javac', '--version'])},

@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const command = 'cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact';
@@ -151,6 +152,36 @@ test('ordinary preflight passes fresh same-attempt bytes while Package keeps its
   assert.equal(jobIf(executable(wire)), jobIf(executable(job(pkg, 'package'))));
   assert.match(pkg, /core_wire_input_artifact:\n        type: string\n        required: false\n        default: ''/);
   assert.doesNotMatch(executable(wire), /continue-on-error|\|\| true/);
+});
+
+test('ordinary POSIX installers reuse checked same-attempt bytes, with independent default and Windows acquisition', () => {
+  const pkg = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
+  const installer = executable(job(pkg, 'package'));
+  const selection = installer.match(/^      CORE_WIRE_INPUT_ARTIFACT: \$\{\{ (.+) \}\}$/m);
+  assert.ok(selection);
+  const selected = (label, artifact) => runInNewContext(selection[1], {
+    matrix: { label }, inputs: { core_wire_input_artifact: artifact },
+  });
+  for (const label of ['linux', 'macos-arm64', 'macos-x64']) {
+    assert.equal(selected(label, 'current-attempt-artifact'), 'current-attempt-artifact');
+    assert.equal(selected(label, ''), '');
+  }
+  assert.equal(selected('windows', 'current-attempt-artifact'), '');
+  const checked = step(installer, 'Require current-attempt installer input identity');
+  const downloaded = step(installer, 'Download current-attempt preflight installer inputs');
+  const imported = step(installer, 'Verify and import current-attempt preflight installer inputs');
+  assert.ok(checked.start < downloaded.start && downloaded.start < imported.start);
+  assert.match(checked.body, /wire-input-handoff\.mjs check .*--candidate="\$CORE_CANDIDATE" --artifact-name="\$CORE_WIRE_INPUT_ARTIFACT"/);
+  assert.match(imported.body, /wire-input-handoff\.mjs import .*--candidate="\$CORE_CANDIDATE" --artifact-name="\$CORE_WIRE_INPUT_ARTIFACT"/);
+  assert.match(step(installer, 'Download exact candidate core bundle').body, /if: env\.CORE_WIRE_INPUT_ARTIFACT == ''/);
+  assert.match(step(installer, 'Consume sing-box core bundle').body, /if: env\.CORE_WIRE_INPUT_ARTIFACT == ''/);
+  for (const value of [checked, downloaded, imported]) {
+    assert.match(value.body, /if: env\.CORE_WIRE_INPUT_ARTIFACT != ''/);
+    assert.doesNotMatch(value.body, /run-id:|repository:|github-token:|continue-on-error|\|\| true/);
+  }
+  // Reuse replaces acquisition only. The separate wire contract and all later
+  // installer/final-payload gates continue to run on the imported actual bytes.
+  assertWireStep(job(pkg, 'core_wire'), { kernelOnly: false });
 });
 
 test('every production consumption job seeds an absolute deadline before tools and has a finite outer timeout', () => {

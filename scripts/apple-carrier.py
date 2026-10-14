@@ -101,6 +101,7 @@ def macho(data, helper):
     sections, segments, vm_segments, platforms, commands, auxiliary = [], [], [], [], [], []
     symbols, dynamic, optimization_hint = None, None, None
     rpaths = set()
+    linkedit_segments, code_signature = [], None
     for ordinal in range(count):
         bounds(position, 8, limit, 'load-command header')
         command, size = struct.unpack_from('<II', data, position)
@@ -119,6 +120,8 @@ def macho(data, helper):
             require(address + vm_size <= 1 << 64, 'segment address overflow')
             segments.append((offset, offset + length))
             vm_segments.append((address, address + vm_size))
+            if segment_name == '__LINKEDIT':
+                linkedit_segments.append((offset, offset + length))
             for index in range(nsections):
                 start = position + 72 + index * 80
                 section_raw, segment_raw, addr, length_s, off, align, reloc, nreloc, sflags, r1, r2, r3 = struct.unpack_from('<16s16sQQ8I', data, start)
@@ -217,6 +220,20 @@ def macho(data, helper):
                 auxiliary.append((off, off + length))
             commands[-1].update(dataOffset=off, dataBytes=length,
                                 payloadSha256=helper.digest(data[off:off + length]))
+        elif command == 0x1d:
+            # Simulator MH_EXECUTE images carry the linker's code-signature
+            # blob. Preserve its bounded opaque bytes; this is not a codesign
+            # inspection, CodeDirectory/CDHash calculation or trust decision.
+            require(kind == 2 and size == 16 and code_signature is None,
+                    'code signature executable/size/duplicate')
+            off, length = struct.unpack_from('<2I', data, position + 8)
+            bounds(off, length, len(data), 'code signature data')
+            require(length > 0 and off >= limit, 'code signature empty/in headers')
+            code_signature = (off, off + length)
+            auxiliary.append(code_signature)
+            commands[-1].update(dataOffset=off, dataBytes=length,
+                                payloadSha256=helper.digest(data[off:off + length]),
+                                payloadKind='opaque-code-signature', trustValidated=False)
         elif command in (0x80000033, 0x80000034, 0x26, 0x29):
             require(size == 16, 'linkedit command size')
             off, length = struct.unpack_from('<2I', data, position + 8)
@@ -282,6 +299,10 @@ def macho(data, helper):
         for index in (0, 2, 4):
             bounds(dynamic[index], dynamic[index + 1], symbols, 'dynamic symbol index')
     require(len(platforms) <= 1, 'duplicate platform command')
+    if code_signature is not None:
+        require(len(linkedit_segments) == 1 and
+                linkedit_segments[0][0] <= code_signature[0] < code_signature[1] <= linkedit_segments[0][1],
+                'code signature outside unique __LINKEDIT segment')
     require(len({(s['segment'], s['section']) for s in sections}) == len(sections), 'duplicate section')
     disjoint(segments, 'segment file')
     disjoint(vm_segments, 'segment address')

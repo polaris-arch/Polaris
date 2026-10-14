@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """One hosted unsigned Apple SDK/App/PacketTunnel chain; no publish/device action."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import time
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -18,6 +20,21 @@ from fork_input import ROOT, canonical, load, require, sha
 from producer import lease, private_dir, producer_code, run, write_json
 
 CARRIERS = [('device-arm64', None), ('sim-arm64', 'arm64'), ('sim-amd64', 'amd64')]
+
+
+@contextlib.contextmanager
+def phase_timing(name):
+    """Original elapsed observation only; never a carrier acceptance receipt."""
+    started = time.monotonic()
+    completed = False
+    try:
+        yield
+        completed = True
+    finally:
+        print('APPLE_PHASE_TIMING=' + json.dumps({'phase': name,
+              'elapsedSeconds': round(time.monotonic() - started, 3),
+              'completed': completed, 'scope': 'elapsed observation only'},
+              sort_keys=True), flush=True)
 
 
 def location():
@@ -47,6 +64,9 @@ def prepare():
     env.update(GOBIN=str(tools), GOTOOLCHAIN='local', GOWORK='off', GOFLAGS='-mod=readonly',
                GOPATH=str(tool_cache / 'go-path'), GOCACHE=str(tool_cache / 'go-build'),
                GOMODCACHE=str(tool_cache / 'go-mod'))
+    from budget import native_environment
+    env, capacity = native_environment(env)
+    print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env,
         log=root / 'original-generator-prepare.log')
@@ -71,10 +91,11 @@ def build():
     paths = read_receipt(root / 'tools.json')['paths']
     # The existing Tauri beforeBuild commands belong before source/link freeze.
     # Their outputs are ignored generated UI/resources, not mutations of PBX/Cargo.
-    with lease(private_dir(root / 'frontend-work'), Path(paths['cache']), load()):
-        run(['node', ROOT / 'scripts/fetch-dashboard.mjs'], cwd=ROOT, log=root / 'original-dashboard.log')
-        run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log')
-        materialize_apple_resources()
+    with phase_timing('frontend-resources'):
+        with lease(private_dir(root / 'frontend-work'), Path(paths['cache']), load()):
+            run(['node', ROOT / 'scripts/fetch-dashboard.mjs'], cwd=ROOT, log=root / 'original-dashboard.log')
+            run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log')
+            materialize_apple_resources()
     for slot, simulator in CARRIERS:
         command = [sys.executable, ROOT / 'scripts/mobile-core/build_apple_app.py']
         for name, path in paths.items():
@@ -82,7 +103,8 @@ def build():
         command += ['--work', private_dir(root / slot)]
         if simulator:
             command += ['--simulator', '--simulator-arch', simulator]
-        run(command, cwd=ROOT, log=root / ('original-' + slot + '.log'))
+        with phase_timing(slot):
+            run(command, cwd=ROOT, log=root / ('original-' + slot + '.log'))
     receipts = {slot: read_receipt(root / slot / 'app-carrier.json') for slot, _ in CARRIERS}
     require(all(row.get('devicePassed') is False for row in receipts.values()), 'unsigned CI cannot accept a device')
     result = {'schema': 'polaris-apple-unsigned-chain-v1', 'App': producer_code(),

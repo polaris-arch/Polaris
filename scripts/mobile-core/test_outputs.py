@@ -14,7 +14,7 @@ import zipfile
 from fork_input import ROOT, canonical, load, sha
 from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
-from budget import reservation
+from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
 from producer import compiler_fact, equivalent_binding, executable_driver_identity
 from transaction import install, recover
@@ -25,6 +25,95 @@ from producer import write_json
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
         self.value = load()
+
+    def test_native_capacity_caps_current_runner_by_load_affinity_quota_and_memory(self):
+        facts = {'logicalCPUs': 16, 'affinityCPUs': 8, 'quotaCPUs': 4.5, 'load1': 1.1,
+                 'availableMemoryBytes': 9 * 1024 ** 3,
+                 'memoryHeadroomBytes': 1024 ** 3, 'memoryPerJobBytes': 2 * 1024 ** 3}
+        observed = capacity_limit(facts)
+        self.assertEqual(observed['effectiveCPUs'], 4)
+        self.assertEqual(observed['loadJobCap'], 2)
+        self.assertEqual(observed['memoryJobCap'], 4)
+        self.assertEqual(observed['jobCap'], 2)
+        original = {'CARGO_BUILD_JOBS': '1', 'UNCHANGED': 'fixture'}
+        child, applied = native_environment(original, observed)
+        self.assertEqual(child, dict(original, GOMAXPROCS='2'))
+        self.assertEqual(original, {'CARGO_BUILD_JOBS': '1', 'UNCHANGED': 'fixture'})
+        self.assertEqual(applied['appliedEnvironment'], {'CARGO_BUILD_JOBS': 1, 'GOMAXPROCS': 2})
+        self.assertNotIn('appliedEnvironment', observed)
+
+    def test_native_capacity_unknowns_are_serial_and_low_memory_refuses_admission(self):
+        facts = {'logicalCPUs': None, 'affinityCPUs': None, 'quotaCPUs': None, 'load1': None,
+                 'availableMemoryBytes': None, 'memoryHeadroomBytes': 1024 ** 3,
+                 'memoryPerJobBytes': 2 * 1024 ** 3}
+        observed = capacity_limit(facts)
+        self.assertEqual(observed['jobCap'], 1)
+        self.assertEqual(observed['unknown'], ['cpu', 'load', 'memory'])
+        facts.update(logicalCPUs=8, load1=0, availableMemoryBytes=3 * 1024 ** 3 - 1)
+        with self.assertRaisesRegex(RuntimeError, 'memory headroom'):
+            native_environment({}, capacity_limit(facts))
+        for value in ('0', '-1', 'auto', '١', ''):
+            with self.assertRaisesRegex(RuntimeError, 'positive integer'):
+                native_environment({'GOMAXPROCS': value}, observed)
+
+    def test_native_capacity_reads_parent_cgroup_limits_without_exporting_environment(self):
+        text = {'/proc/self/cgroup': '0::/runner/job\n',
+                '/proc/meminfo': 'MemAvailable: 16777216 kB\n',
+                '/sys/fs/cgroup/runner/job/cpu.max': 'max 100000\n',
+                '/sys/fs/cgroup/runner/cpu.max': '200000 100000\n',
+                '/sys/fs/cgroup/cpu.max': 'max 100000\n',
+                '/sys/fs/cgroup/runner/memory.max': str(7 * 1024 ** 3),
+                '/sys/fs/cgroup/runner/memory.current': str(2 * 1024 ** 3)}
+        with patch('budget.sys.platform', 'linux'), patch('budget.os.cpu_count', return_value=16), \
+                patch('budget.os.sched_getaffinity', return_value=set(range(8)), create=True), \
+                patch('budget.os.getloadavg', return_value=(0, 0, 0)), \
+                patch('budget._capacity_text', side_effect=lambda path: text.get(str(path))), \
+                patch.dict(os.environ, {'DO_NOT_EXPORT_SECRET': 'fixture'}):
+            observed = native_capacity()
+        self.assertEqual(observed['jobCap'], 2)
+        self.assertEqual(observed['quotaCPUs'], 2)
+        self.assertEqual(observed['availableMemoryBytes'], 5 * 1024 ** 3)
+        self.assertEqual(observed['memorySource'], 'cgroup-v2-headroom')
+        self.assertNotIn('DO_NOT_EXPORT_SECRET', json.dumps(observed))
+
+    def test_native_capacity_darwin_uses_actual_vm_pages_and_bounded_command(self):
+        result = type('Result', (), {'stdout': b'Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+                    b'Pages free: 300000.\nPages inactive: 600000.\nPages speculative: 0.\n'})()
+        with patch('budget.sys.platform', 'darwin'), patch('budget.os.cpu_count', return_value=8), \
+                patch('budget.os.sched_getaffinity', side_effect=AttributeError, create=True), \
+                patch('budget.os.getloadavg', return_value=(1, 0, 0)), \
+                patch('budget.subprocess.run', return_value=result) as command:
+            observed = native_capacity()
+        self.assertEqual(observed['availableMemoryBytes'], 900000 * 16384)
+        self.assertEqual(observed['jobCap'], 6)
+        self.assertTrue(observed['quotaObserved'])
+        self.assertIsNone(observed['quotaCPUs'])
+        self.assertEqual(observed['unknown'], [])
+        self.assertEqual(command.call_args.args[0], ['/usr/bin/vm_stat'])
+        self.assertEqual(command.call_args.kwargs['timeout'], 2)
+        self.assertEqual(command.call_args.kwargs['env'], {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+
+    def test_native_capacity_legacy_cgroup_limits_and_missing_quota_are_conservative(self):
+        text = {'/proc/self/cgroup': '2:cpu,cpuacct:/job\n3:memory:/job\n',
+                '/proc/meminfo': 'MemAvailable: 16777216 kB\n',
+                '/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_quota_us': '350000',
+                '/sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_period_us': '100000',
+                '/sys/fs/cgroup/memory/job/memory.limit_in_bytes': str(6 * 1024 ** 3),
+                '/sys/fs/cgroup/memory/job/memory.usage_in_bytes': str(1024 ** 3)}
+        with patch('budget.sys.platform', 'linux'), patch('budget.os.cpu_count', return_value=16), \
+                patch('budget.os.sched_getaffinity', return_value=set(range(8)), create=True), \
+                patch('budget.os.getloadavg', return_value=(0, 0, 0)), \
+                patch('budget._capacity_text', side_effect=lambda path: text.get(str(path))):
+            observed = native_capacity()
+            self.assertEqual(observed['jobCap'], 2)
+            self.assertEqual(observed['cgroupVersion'], 1)
+            self.assertEqual(observed['quotaCPUs'], 3.5)
+            self.assertEqual(observed['memorySource'], 'cgroup-v1-headroom')
+            text.clear()
+            unknown = native_capacity()
+        self.assertEqual(unknown['jobCap'], 1)
+        self.assertIn('cpu-quota', unknown['unknown'])
+        self.assertIn('memory', unknown['unknown'])
 
     def test_large_apple_receipts_round_trip_original_inventory_and_fingerprint(self):
         # Model the real producer/consumer boundary, not native acceptance.
@@ -474,6 +563,8 @@ class FormalOutputs(unittest.TestCase):
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
+                        patch('ci_android.native_environment', side_effect=lambda env: (dict(env),
+                              {'jobCap': 1, 'scope': 'inert prepare test; not runner observation'})), \
                         patch('ci_android.run', side_effect=controlled_run), \
                         patch('ci_android.prepare_source', side_effect=RuntimeError('controlled source refusal')) as source, \
                         patch('ci_android.emit_outputs') as emit, self.assertRaisesRegex(RuntimeError, reason):

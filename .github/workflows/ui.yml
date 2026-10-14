@@ -32,6 +32,11 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      preserve_run:
+        description: '保留固定源码审计运行；不被后续普通手动运行取消'
+        type: boolean
+        default: false
   # 供 package.yml 复用作发布前置门：CI 绿但前端红也不许**发布**。
   # （2026-09-04 起本门与打包腿并行；判据挂在 package.yml 的 release job 上，不在 package job 上。）
   workflow_call:
@@ -39,8 +44,10 @@ on:
 # 判据与 ci.yml 一致：调用方名称进入并发组，独立 UI 与 Package 内复用门互不取消；
 # 同一调用方/ref 的旧 main/PR 跑仍由新跑顶掉。
 concurrency:
-  group: ui-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  # An audit uses its own run group, so ordinary branch dispatches can replace
+  # obsolete runs without interrupting fixed audit or tag publishing callers.
+  group: ui-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.preserve_run && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name != 'workflow_dispatch') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && inputs.preserve_run != true) }}
 
 jobs:
   test:

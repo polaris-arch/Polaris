@@ -299,6 +299,13 @@ The producer logs exact new serialized bytes and canonical value bytes per
 top-level field. These are metadata bounds, not a claimed measured process RSS
 or native/carrier acceptance; native archive parsing remains separate.
 
+The actual8795 ARM64 simulator App/PacketTunnel adds `LC_CODE_SIGNATURE`.
+The carrier parser bounds its single nonempty MH_EXECUTE payload inside one
+`__LINKEDIT` segment and disjoint from sections/other tables, retaining an
+opaque payload SHA256 and `trustValidated=false`. It does not interpret the
+CodeDirectory, calculate CDHash, validate a signer or assert signature trust.
+The new structural controls are not actual device/x64-simulator carrier builds.
+
 `scripts/libbox-patches` and the old Apple six-patch entry remain historical
 alpha8 compatibility inputs. Their raw receipts are not relabeled; the small
 `historical-ci-fragments.json` pins only retired caller fragments for existing

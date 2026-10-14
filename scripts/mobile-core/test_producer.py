@@ -156,14 +156,93 @@ class ProducerCalls(unittest.TestCase):
             self.assertFalse(producer.equivalent_binding(original, altered))
         self.assertEqual(original['producer']['candidate'], 'a'*40)
 
-    def test_actual_apple_bind_preserves_module_basename_and_isolates_source_mutation(self):
+    @staticmethod
+    def android_projection_binding():
+        return {'schema': 'polaris-mobile-producer-input-v1', 'platform': 'android',
+                'producer': {'candidate': 'a'*40, 'files': {
+                    name: {'bytes': index + 1, 'sha256': producer.sha(name.encode())}
+                    for index, name in enumerate(producer.PRODUCER_FILES)}},
+                'sourceContract': {'sourceCommit': 'f'*40, 'android': {'minSDK': 24}},
+                'sourceObservation': {'sourceTree': 'e'*40},
+                'moduleGraph': [{'Path': 'example.invalid/core', 'Version': 'v1', 'Sum': 'h1:fixed',
+                                 'Dir': '/original/native/module'}],
+                'tools': {'compiler': {'sha256': 'd'*64}}, 'sourceOverlay': 0}
+
+    def test_android_projection_reuses_only_four_apple_only_changes(self):
+        original = self.android_projection_binding()
+        frozen = json.dumps(original, sort_keys=True)
+        current = json.loads(frozen); current['producer']['candidate'] = 'b'*40
+        for name in producer.ANDROID_UNRELATED_CODE:
+            current['producer']['files'][name] = {'bytes': 99, 'sha256': 'c'*64}
+        self.assertEqual(producer.android_build_code(original['producer']),
+                         producer.android_build_code(current['producer']))
+        self.assertTrue(producer.equivalent_binding(original, current))
+        self.assertEqual(json.dumps(original, sort_keys=True), frozen)
+        apple_original = {**original, 'platform': 'apple'}
+        apple_current = {**current, 'platform': 'apple'}
+        self.assertFalse(producer.equivalent_binding(apple_original, apple_current))
+        for name in set(producer.PRODUCER_FILES) - producer.ANDROID_UNRELATED_CODE:
+            altered = json.loads(frozen)
+            altered['producer']['files'][name]['sha256'] = 'c'*64
+            with self.subTest(relevant=name):
+                self.assertNotEqual(producer.android_build_code(original['producer']),
+                                    producer.android_build_code(altered['producer']))
+                self.assertFalse(producer.equivalent_binding(original, altered))
+        for field in ['sourceContract', 'sourceObservation', 'moduleGraph', 'tools', 'sourceOverlay']:
+            altered = json.loads(frozen); altered[field] = 'changed'
+            with self.subTest(input=field):
+                self.assertFalse(producer.equivalent_binding(original, altered))
+        extra = json.loads(frozen)
+        extra['producer']['files']['scripts/new-component-input.py'] = {'bytes': 1, 'sha256': 'c'*64}
+        self.assertFalse(producer.equivalent_binding(original, extra))
+
+    def test_android_projection_requires_complete_pins_and_known_policy(self):
+        binding = self.android_projection_binding()
+        with self.assertRaisesRegex(RuntimeError, 'unknown Android build code policy'):
+            producer.android_build_code(binding['producer'], 'unreviewed-policy')
+        incomplete = json.loads(json.dumps(binding['producer']))
+        del incomplete['files']['scripts/apple-carrier.py']
+        with self.assertRaisesRegex(RuntimeError, 'complete original producer code inventory'):
+            producer.android_build_code(incomplete)
+        for pin in [{'bytes': True, 'sha256': 'a'*64}, {'bytes': 1, 'sha256': 'not-a-hash'},
+                    {'bytes': 1, 'sha256': 'a'*64, 'unbound': True}]:
+            broken = json.loads(json.dumps(binding['producer']))
+            broken['files']['scripts/apple-carrier.py'] = pin
+            with self.assertRaisesRegex(RuntimeError, 'producer code file pin differs'):
+                producer.android_build_code(broken)
+
+    def test_revalidation_observes_current_verifier_without_relabeling_original(self):
+        original = self.android_projection_binding()
+        receipt = {'input': original, 'fingerprint': 'c'*64}
+        frozen = json.dumps(receipt, sort_keys=True)
+        current = json.loads(json.dumps(original)); current['producer']['candidate'] = 'b'*40
+        current['producer']['files']['scripts/apple-carrier.py'] = {'bytes': 99, 'sha256': 'd'*64}
+        pin = {'bytes': len(frozen), 'sha256': producer.sha(frozen.encode())}
+        observed = producer.component_revalidation_observation(receipt, current, pin, True)
+        self.assertEqual(observed['comparisonPolicy'], producer.ANDROID_BUILD_CODE_POLICY)
+        self.assertEqual(observed['currentVerifier'], current['producer'])
+        self.assertEqual(len(observed['currentVerifier']['files']), 19)
+        self.assertEqual(observed['originalProducerCandidate'], 'a'*40)
+        self.assertEqual(observed['originalReceipt'], pin)
+        self.assertEqual(observed['originalComponentFingerprint'], 'c'*64)
+        self.assertEqual(observed['originalBuildID'], 'polaris-mobile-' + producer.receipt_digest(original))
+        self.assertEqual(observed['fingerprint'], producer.receipt_digest({
+            key: value for key, value in observed.items() if key != 'fingerprint'}))
+        self.assertEqual(json.dumps(receipt, sort_keys=True), frozen)
+
+    def test_actual_apple_bind_and_low_memory_cache_keep_original_module_and_source(self):
         value = load()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             supplied = root / 'source'; supplied.mkdir()
             developer = root / 'developer'; developer.mkdir()
             tool = root / 'inert-tool'; tool.write_bytes(b'not executed')
-            bindings = []
+            bindings, capacities, bind_caps = [], [], []
+            def native_environment(env):
+                cap = 1 + len(capacities) % 2
+                capacities.append(cap)
+                return (dict(env, GOMAXPROCS=str(cap), CARGO_BUILD_JOBS=str(cap)),
+                        {'jobCap': cap, 'fixture': True})
             @contextmanager
             def lease(work, cache, _value):
                 work.mkdir(mode=0o700, exist_ok=True); cache.mkdir(mode=0o700, exist_ok=True)
@@ -181,6 +260,7 @@ class ProducerCalls(unittest.TestCase):
                     generated = Path(cwd) / 'build/ios'; generated.mkdir(parents=True)
                     (generated / 'generated.m').write_bytes(b'inert generated Objective-C')
                     bindings.append((Path(cwd), out))
+                    bind_caps.append((env['GOMAXPROCS'], env['CARGO_BUILD_JOBS']))
                     Path(log).write_text('inert original bind log')
                 elif command[1:4] == ['list', '-m', '-json']:
                     return '{"Path":"github.com/sagernet/sing-box","Main":true}'
@@ -190,6 +270,9 @@ class ProducerCalls(unittest.TestCase):
                 for name, replacement in {
                     'lease': lease, 'producer_code': lambda: {'candidate': 'a'*40, 'files': {}},
                     'verify_source': lambda *a, **k: {'sourceOverlay': 0}, 'run': run,
+                    'native_capacity': lambda: {'jobCap': 0, 'availableMemoryBytes': 1024**3,
+                                                'scope': 'controlled low-memory observation'},
+                    'native_environment': native_environment,
                     'tool_facts': lambda *a: ({'go': str(tool), 'gomobile': str(tool), 'gobind': str(tool)}, {}),
                     'inspect_framework': lambda path, *a: {'inventory': tree_inventory(path), 'slices': {}},
                     'verify_receipt': lambda *a: None,
@@ -212,10 +295,14 @@ class ProducerCalls(unittest.TestCase):
                     count = len(bindings)
                     # A matching cache keeps its original receipt and generated
                     # inputs; it does not rebind, relabel or delete them.
-                    producer.execute(args)
+                    with patch.object(producer, 'native_environment', side_effect=RuntimeError(
+                            'current runner memory headroom cannot admit one native compiler')) as admission:
+                        producer.execute(args)
+                        admission.assert_not_called()
                     self.assertEqual(len(bindings), count)
                     self.assertEqual((args.work/'component-receipt.json').read_bytes(), saved)
                     self.assertEqual(generated.read_bytes(), original_generated)
+                    self.assertNotIn('capacity', receipt['input'])
                     with patch.object(producer, 'tool_facts', return_value=(
                             {'go':str(tool),'gomobile':str(tool),'gobind':str(tool)}, {'compiler':'changed'})), \
                             self.assertRaisesRegex(RuntimeError, 'original generator outputs retained'):
@@ -225,9 +312,25 @@ class ProducerCalls(unittest.TestCase):
                     self.assertEqual(generated.read_bytes(), original_generated)
                     delta = producer.read_receipt(args.work/'cache-binding-observation.json')
                     self.assertEqual(delta['changedFields'], ['tools'])
+                # The same low-memory runner must refuse a genuine fresh bind,
+                # before any compiler output/receipt is emitted or old bytes change.
+                count = len(bindings)
+                args = SimpleNamespace(platform='apple', source=supplied, developer=developer,
+                    go=tool, gomobile=tool, gobind=tool, work=root/'low-memory', cache=root/'low-cache')
+                with patch.object(producer, 'native_environment', side_effect=RuntimeError(
+                        'current runner memory headroom cannot admit one native compiler')) as admission, \
+                        self.assertRaisesRegex(RuntimeError, 'memory headroom cannot admit'):
+                    producer.execute(args)
+                self.assertEqual(admission.call_count, 1)
+                self.assertEqual(len(bindings), count)
+                self.assertFalse((args.work/'component-receipt.json').exists())
+                self.assertFalse((args.work/'stage-component-receipt.json').exists())
+                self.assertFalse((args.work/'stage-original-bind.log').exists())
             self.assertEqual(list(supplied.iterdir()), [])
             self.assertNotEqual(bindings[0][0], bindings[1][0])
             self.assertTrue(all(cwd.name == 'build-view' for cwd, _ in bindings))
+            self.assertGreater(len(set(capacities)), 1)
+            self.assertTrue(all(go == cargo and go in ('1', '2') for go, cargo in bind_caps))
 
     def test_tool_receipt_binds_actual_javac_resolution_version_and_binary(self):
         value = load()
