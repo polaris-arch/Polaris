@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import apple_rust
+import build_apple_app
 import ci_apple
 import consume
 from carriers import verify_apple_resources
@@ -39,6 +40,44 @@ def fat_archive(arm_platform=7, intel_platform=7):
 
 
 class AppleEntryTests(unittest.TestCase):
+    def test_host_swift_controls_select_mac_sdk_target_without_changing_app_environment(self):
+        from types import SimpleNamespace
+        for host in ('arm64', 'x86_64'):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); sdk = root / 'MacOSX.sdk'; sdk.mkdir()
+                config = root / 'src-tauri/tauri.conf.json'; config.parent.mkdir()
+                config.write_text(json.dumps({'bundle': {'macOS': {'minimumSystemVersion': '13.0'}}}))
+                env = {'SDKROOT': '/selected/iPhoneOS.sdk', 'PLATFORM_NAME': 'iphoneos',
+                       'ARCHS': 'arm64', 'IPHONEOS_DEPLOYMENT_TARGET': '17.0',
+                       'DEVELOPER_DIR': '/selected/Xcode/Contents/Developer'}
+                original = dict(env); calls = []
+                def run(command, **kwargs):
+                    calls.append(([str(x) for x in command], kwargs))
+                    return str(sdk) if '--show-sdk-path' in command else ''
+                with mock.patch.object(build_apple_app, 'ROOT', root), \
+                        mock.patch.object(build_apple_app.os, 'uname', return_value=SimpleNamespace(machine=host)), \
+                        mock.patch.object(build_apple_app, 'run', side_effect=run):
+                    build_apple_app.host_swift_controls(root, env)
+                command, options = calls[1]
+                self.assertEqual(command[:4], ['xcrun', '--sdk', 'macosx', 'swiftc'])
+                self.assertEqual(command[command.index('-sdk') + 1], str(sdk))
+                self.assertEqual(command[command.index('-target') + 1], host + '-apple-macosx13.0')
+                self.assertIn('-parse-as-library', command)
+                self.assertEqual(options['env']['SDKROOT'], str(sdk))
+                self.assertEqual(options['env']['ARCHS'], host)
+                self.assertNotIn('IPHONEOS_DEPLOYMENT_TARGET', options['env'])
+                self.assertEqual(calls[2][0], [str(root / 'measurement-conditions-test')])
+                self.assertEqual(env, original)
+                self.assertEqual(options['env']['DEVELOPER_DIR'], env['DEVELOPER_DIR'])
+
+    def test_host_swift_control_rejects_unknown_host_before_compilation(self):
+        from types import SimpleNamespace
+        with mock.patch.object(build_apple_app.os, 'uname', return_value=SimpleNamespace(machine='unknown')), \
+                mock.patch.object(build_apple_app, 'run') as run, \
+                self.assertRaisesRegex(RuntimeError, 'unsupported actual Mac'):
+            build_apple_app.host_swift_controls(Path('/not-used'), {})
+        run.assert_not_called()
+
     def controlled_status(self, root, raw):
         facts = {'statusComplete': True, 'reason': None, 'observedStdoutBytes': len(raw),
                  'observedStderrBytes': 0, 'observedStatusPrefixSha256': consume.sha(raw)}

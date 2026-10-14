@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Explicit PRB00/VAL01 producer and App+PacketTunnel link entry; no publish/device action."""
 import argparse
+import json
 import os
 from pathlib import Path
+import re
 import zipfile
 
 import sys
@@ -12,6 +14,27 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from fork_input import ROOT, load, require
 from producer import lease, private_dir, run
 from artifacts import receipt_digest, file_pin
+
+
+def host_swift_controls(root, app_env):
+    """The pure Foundation executable runs on the host, not an iOS slice."""
+    host = os.uname().machine
+    require(host in ('arm64', 'x86_64'), 'unsupported actual Mac control architecture')
+    minimum = json.loads((ROOT / 'src-tauri/tauri.conf.json').read_bytes())['bundle']['macOS']['minimumSystemVersion']
+    require(isinstance(minimum, str) and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?', minimum),
+            'explicit Mac control deployment target required')
+    env = dict(app_env)
+    env.pop('IPHONEOS_DEPLOYMENT_TARGET', None)
+    sdk = run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], env=env).strip()
+    require(Path(sdk).is_absolute() and Path(sdk).is_dir(), 'actual host Mac SDK required')
+    env.update(SDKROOT=sdk, PLATFORM_NAME='macosx', ARCHS=host, MACOSX_DEPLOYMENT_TARGET=minimum)
+    unit = root / 'measurement-conditions-test'
+    run(['xcrun', '--sdk', 'macosx', 'swiftc', '-sdk', sdk,
+         '-target', host + '-apple-macosx' + minimum, '-parse-as-library',
+         ROOT / 'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
+         ROOT / 'crates/tauri-plugin-polaris-ios/ios/Tests/DeviceConditionsTests.swift', '-o', unit], env=env,
+        log=root / 'original-swift-control-build.log')
+    run([unit], env=env, log=root / 'original-swift-control-run.log')
 
 
 def main():
@@ -66,12 +89,8 @@ def main():
             log=root / 'original-rust-entry.log')
         # Authored pure Swift controls compile on the same real toolchain as the App.
         # This entry runs only in the eventual single uniform Mac validation phase.
-        unit = root / 'measurement-conditions-test'
         if not args.simulator:
-            run(['xcrun', 'swiftc', ROOT / 'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
-                 ROOT / 'crates/tauri-plugin-polaris-ios/ios/Tests/DeviceConditionsTests.swift', '-o', unit], env=env,
-                log=root / 'original-swift-control-build.log')
-            run([unit], env=env, log=root / 'original-swift-control-run.log')
+            host_swift_controls(root, env)
         derived = private_dir(root / 'derived-data')
         archive = root / 'Polaris.xcarchive'
         require(not archive.exists(), 'existing actual archive must not be overwritten')

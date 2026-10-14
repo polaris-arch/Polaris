@@ -793,10 +793,10 @@
     }
   },
   "sourceCompatibility": {
-    "method": "Source-only current graph observation. Original actual serializer/export states and producer provenance retained; serializer/test/command sources are byte-exact. Three changed lifecycle-control callers do not regenerate serializer states. No new export run claimed.",
+    "method": "Source-only current graph observation. Original actual serializer/export states and producer provenance retained; serializer/command sources remain byte-exact. Three changed lifecycle-control callers and the controlled-clock facade test do not regenerate the original exported states. No new export run claimed.",
     "sourceSha256": {
       "src-tauri/src/runtime/proxy/coex_observer.rs": "fcb6b5da4966184b0f5f9b5065f1d09a453446f95a77b9c50bfb329965b05ca1",
-      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "2d7b11267c033301be5b11c53f2a684e70dc7e2a544c01130b09d5a03b4b112e",
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "ac87a23f5ca82b17322c7ac22dd4014be2906d743fa1d3b9e8e8ec48ae70eb45",
       "src-tauri/src/runtime/proxy.rs": "162c9ca316c926467bd61a4abe7568b22306de2c039884ad3d3db7258aea3f7f",
       "src-tauri/src/runtime/proxy/lifecycle.rs": "c7f2777ac3713c4bcb3cb8aa20b373f3af547709ae063d0bc57a57b2f8fe75d5",
       "src-tauri/src/runtime/proxy/startup.rs": "7652243e0a6291388f386951e7f16875890a967f6f6ac08aeb15e4d9549cbe54",
@@ -807,7 +807,6 @@
     },
     "unchangedOriginalSources": [
       "src-tauri/src/runtime/proxy/coex_observer.rs",
-      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs",
       "src-tauri/src/runtime/proxy/lifecycle.rs",
       "src-tauri/src/runtime/proxy/recovery.rs",
       "src-tauri/src/runtime/proxy/network_monitor.rs",
@@ -817,6 +816,9 @@
       "src-tauri/src/runtime/proxy.rs",
       "src-tauri/src/runtime/proxy/startup.rs",
       "src-tauri/src/runtime/proxy/hot_switch.rs"
+    ],
+    "changedTestSources": [
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs"
     ],
     "originalStatesCanonicalSha256": "285de8e6e9ff31d6a499e4e606f36661d8bda0a2b0866c3c13c06e52cf63d874",
     "newSerializerExecution": false

@@ -86,6 +86,24 @@ non-Go Apple archive member to actual compiler/runtime origins with multiplicity
 Cache hits reread original native inputs, original log and the complete output.
 A changed producer commit can reuse identical producer code/tools while keeping
 the original component receipt's candidate and BuildID unchanged.
+Before that input is frozen, exact remote module versions already covered by
+the source `go.sum` are admitted into the same module cache if their directories
+are missing. Go1.25.5's `go list -m -json` reports those directories according to
+cache availability; a cold graph must not be frozen and then change merely
+because the original bind populated the cache. Download admission uses one
+fixed `module-cache-admission/admission.mod` plus `.sum` copy (each at most 1MiB,
+at most 1024 exact arguments), never the frozen checkout's module files.
+Returned module/version/h1 inventories and unchanged source bytes are checked,
+then the full graph and `go mod verify` are read again. No graph identity or
+location is discarded. This uses the existing lease, 20GiB cache and reserve;
+retained admission inputs refuse instead of being overwritten or deleted.
+An actual unequal cached binding still refuses original generator output reuse.
+Its derived `cache-binding-observation.json` records only fixed changed-field
+labels, row/directory/sum counts and already validated fingerprints, never input
+values or module URLs; the hosted failure evidence retains it. The old failed
+attempt did not record its current binding, so its exact differing fields remain
+unknown. Cache admission addresses the confirmed availability-dependent graph
+mechanism; the next exact-SHA run must establish the actual reuse outcome.
 
 `transaction.py` stages output/receipt/log together and journals exact fixed
 paths and byte/tree pins. Failure or interrupted commit restores the original
@@ -171,6 +189,11 @@ link context, explicit Cargo target, locked dependencies and iOS config. It
 uses `cargo rustc --lib --crate-type staticlib` only for this iOS archive stage;
 the shared Cargo manifest retains Android's cdylib and the other library types.
 Swift bridge symbols must resolve in the subsequent full Xcode App link.
+The pure Foundation control executable uses the selected Xcode's explicit Mac
+SDK and the actual host architecture with the existing Mac deployment target.
+Its environment is a separate copy; the iOS SDK/target used by the subsequent
+full App/PacketTunnel link is unchanged. The control is compiled and run, never
+skipped to make a selected Apple gate green.
 It checks the actual static archive/start_app and saves its byte/source/tool facts;
 the native symbol check uses the existing `nm --no-llvm-bc -gU` mode, requires
 success plus a defined `_start_app` text symbol, and retains its full output.

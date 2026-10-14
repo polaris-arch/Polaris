@@ -603,6 +603,7 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            ${{ steps.libbox_input.outputs.work }}/cache-binding-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json
@@ -1181,6 +1182,7 @@ jobs:
             ${{ steps.libbox_input.outputs.work }}/*receipt.json
             ${{ steps.libbox_input.outputs.work }}/*bind.log
             ${{ steps.libbox_input.outputs.work }}/budget-observation.json
+            ${{ steps.libbox_input.outputs.work }}/cache-binding-observation.json
             scripts/mobile-core/android-consumption.json
             src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json
             ${{ runner.temp }}/*.source-consumption.json

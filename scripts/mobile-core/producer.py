@@ -234,10 +234,93 @@ def verify_receipt(component, receipt, value, binding, tools, run_tool, scratch)
 
 def equivalent_binding(original, current):
     # Reusing unchanged SDK producer bytes does not relabel its original commit.
-    left, right = json.loads(json.dumps(original)), json.loads(json.dumps(current))
-    left.get('producer', {}).pop('candidate', None)
-    right.get('producer', {}).pop('candidate', None)
-    return left == right
+    return comparison_binding(original) == comparison_binding(current)
+
+
+def comparison_binding(value):
+    require(isinstance(value, dict) and isinstance(value.get('producer', {}), dict),
+            'component input/producer structure differs')
+    result = dict(value)
+    result['producer'] = {key: item for key, item in value.get('producer', {}).items() if key != 'candidate'}
+    return result
+
+
+def cache_binding_observation(receipt, binding, fingerprint):
+    """Fixed field labels/counts only; never export input values or module URLs."""
+    left, right = comparison_binding(receipt['input']), comparison_binding(binding)
+    known = ('schema', 'platform', 'sourceObservation', 'sourceContract', 'moduleGraph', 'tools', 'producer', 'sourceOverlay')
+    def graph(value):
+        rows = value.get('moduleGraph')
+        if not isinstance(rows, list): return {'rows': None, 'directories': None, 'sums': None}
+        return {'rows': len(rows), 'directories': sum(isinstance(row, dict) and bool(row.get('Dir')) for row in rows),
+                'sums': sum(isinstance(row, dict) and bool(row.get('Sum')) for row in rows)}
+    require(re.fullmatch('[0-9a-f]{64}', fingerprint) and
+            re.fullmatch('[0-9a-f]{64}', receipt['fingerprint']), 'actual binding/receipt fingerprint required')
+    return {'schema': 'polaris-mobile-cache-binding-observation-v1', 'derivedObservation': True,
+            'changedFields': [name for name in known if left.get(name) != right.get(name)],
+            'unknownFieldCount': len((set(left) | set(right)) - set(known)),
+            'retainedReceiptFingerprint': receipt['fingerprint'], 'currentInputFingerprint': fingerprint,
+            'originalModuleGraph': graph(left), 'currentModuleGraph': graph(right),
+            'inputValuesExported': False, 'fileContentsExported': False,
+            'scope': 'actual comparison before refusal; not component, recovery or App acceptance'}
+
+
+def admit_module_cache(source, graph, go, env, work):
+    """Make already source-summed module directories observable before freezing.
+
+    go list's remote Dir fields depend on DownloadDir availability. Download only
+    exact versions already covered by the source go.sum, with an alternate mod
+    file in one fixed scratch slot. Never edit the frozen source's mod/sum files.
+    """
+    source = Path(source)
+    candidates = []
+    for row in graph:
+        node = row.get('Replace', row)
+        require(isinstance(node, dict), 'module replacement structure differs')
+        if not node.get('Main') and not node.get('Dir') and node.get('Version'): candidates.append(node)
+    if not candidates: return
+    def source_bytes(name):
+        path = source / name
+        require(path.stat().st_size <= 1024 ** 2, 'bounded source module input required')
+        with path.open('rb') as stream: raw = stream.read(1024 ** 2 + 1)
+        require(len(raw) <= 1024 ** 2, 'source module input grew beyond budget')
+        return raw
+    originals = {name: source_bytes(name) for name in ('go.mod', 'go.sum')}
+    sums = {}
+    for line in originals['go.sum'].decode().splitlines():
+        fields = line.split()
+        require(len(fields) == 3, 'source sum record differs')
+        path, version, checksum = fields
+        if not version.endswith('/go.mod'):
+            require((path, version) not in sums or sums[(path, version)] == checksum,
+                    'conflicting source module checksum')
+            sums[(path, version)] = checksum
+    pending = {}
+    for node in candidates:
+        key = (node.get('Path'), node['Version'])
+        if key in sums: pending[key] = sums[key]
+    if not pending: return
+    require(len(pending) <= 1024 and all(isinstance(path, str) and isinstance(version, str) and
+            len(path.encode()) <= 512 and len(version.encode()) <= 128 and
+            not any(c.isspace() or c == '@' for c in path + version) for path, version in pending),
+            'bounded exact source-summed module arguments required')
+    require(sum(len((path + '@' + version).encode()) + 1 for path, version in pending) <= 128 * 1024,
+            'module download argument byte budget exceeded')
+    view = private_dir(Path(work) / 'module-cache-admission')
+    modfile, sumfile = view / 'admission.mod', view / 'admission.sum'
+    require(not modfile.exists() and not modfile.is_symlink() and not sumfile.exists() and not sumfile.is_symlink(),
+            'prior module admission inputs retained; explicit recovery required')
+    for path, raw in [(modfile, originals['go.mod']), (sumfile, originals['go.sum'])]:
+        with path.open('xb') as stream: stream.write(raw)
+    downloaded = module_stream(run([go, '-modfile=' + str(modfile), 'mod', 'download', '-json',
+                                   *[path + '@' + version for path, version in sorted(pending)]],
+                                  cwd=source, env=env, log=Path(work) / 'original-module-cache-admission.log'))
+    require(len(downloaded) == len(pending) and
+            {(row['Path'], row.get('Version')) for row in downloaded} == set(pending) and
+            all(row.get('Sum') == pending[(row['Path'], row.get('Version'))] and row.get('Dir') and not row.get('Error')
+                for row in downloaded), 'actual downloaded module identity differs from frozen source sum')
+    require(all(source_bytes(name) == raw for name, raw in originals.items()),
+            'source module bytes changed during cache admission')
 
 
 def write_json(path, value):
@@ -306,6 +389,10 @@ def execute(args):
         private_dir(Path(env['GOPATH']) / 'pkg/gomobile')
         run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log')
         graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
+        admit_module_cache(source, graph, tools['go'], env, work)
+        require(verify_source(source, value, generator_outputs=True) == source_observation,
+                'source changed during module cache admission')
+        graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
         run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log')
         # Keep exact paths for native BuildInfo; portable source facts stay separate.
         binding = {'schema': 'polaris-mobile-producer-input-v1', 'platform': args.platform,
@@ -340,6 +427,10 @@ def execute(args):
                     require(file_pin(component) == receipt['output']['artifact'], 'retained old component bytes differ')
                 else:
                     require(tree_inventory(component) == receipt['output']['inventory'], 'retained old framework bytes differ')
+                observation = work / 'cache-binding-observation.json'
+                require(not observation.exists() and not observation.is_symlink(),
+                        'prior cache binding observation retained; explicit recovery required')
+                write_json(observation, cache_binding_observation(receipt, binding, fp))
                 rebuild = True
         if rebuild:
             require(not (source / 'build').exists(),

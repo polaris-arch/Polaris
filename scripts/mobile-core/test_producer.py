@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
+import json
 
 import producer
 from artifacts import tree_inventory
@@ -12,6 +13,70 @@ from fork_input import load
 
 
 class ProducerCalls(unittest.TestCase):
+    def test_module_admission_uses_only_source_sums_and_alternate_files_then_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / 'source'; source.mkdir(); work = root / 'work'; work.mkdir()
+            originals = {'go.mod': b'module example.invalid/main\ngo 1.25.5\n',
+                         'go.sum': b'example.invalid/known v1.0.0 h1:fixed\nexample.invalid/known v1.0.0/go.mod h1:mod\n'}
+            for name, raw in originals.items(): (source / name).write_bytes(raw)
+            graph = [{'Path': 'example.invalid/main', 'Main': True, 'Dir': str(source)},
+                     {'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed'},
+                     {'Path': 'example.invalid/unknown', 'Version': 'v2.0.0'},
+                     {'Path': 'example.invalid/local', 'Version': 'v1.0.0', 'Replace': {'Path': './local', 'Dir': str(source/'local')}}]
+            calls = []
+            def run(command, **kwargs):
+                calls.append((command, kwargs))
+                alternate = Path(command[1].removeprefix('-modfile='))
+                self.assertEqual(alternate.read_bytes(), originals['go.mod'])
+                self.assertEqual(alternate.with_suffix('.sum').read_bytes(), originals['go.sum'])
+                alternate.with_suffix('.sum').write_bytes(b'owned download sum update')
+                return json.dumps({'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed',
+                                   'Dir': str(root/'cache/go-mod/known')})
+            with patch.object(producer, 'run', side_effect=run):
+                producer.admit_module_cache(source, graph, 'inert-go', {}, work)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0][-4:], ['mod', 'download', '-json', 'example.invalid/known@v1.0.0'])
+            self.assertEqual(calls[0][1]['cwd'], source)
+            self.assertEqual({name:(source/name).read_bytes() for name in originals}, originals)
+            graph[1]['Dir'] = '/actual/warm/cache/known'
+            with patch.object(producer, 'run') as run:
+                producer.admit_module_cache(source, graph, 'inert-go', {}, work)
+            run.assert_not_called()
+
+    def test_changed_download_checksum_or_retained_admission_view_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / 'source'; source.mkdir(); work = root / 'work'; work.mkdir()
+            (source/'go.mod').write_bytes(b'module example.invalid/main\n')
+            (source/'go.sum').write_bytes(b'example.invalid/known v1.0.0 h1:fixed\n')
+            graph = [{'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed'}]
+            changed = {'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:changed', 'Dir': '/fake/cache'}
+            with patch.object(producer, 'run', return_value=json.dumps(changed)), \
+                    self.assertRaisesRegex(RuntimeError, 'downloaded module identity differs'):
+                producer.admit_module_cache(source, graph, 'inert-go', {}, work)
+            with patch.object(producer, 'run') as run, self.assertRaisesRegex(RuntimeError, 'prior module admission inputs retained'):
+                producer.admit_module_cache(source, graph, 'inert-go', {}, work)
+            run.assert_not_called()
+            self.assertEqual((source/'go.sum').read_bytes(), b'example.invalid/known v1.0.0 h1:fixed\n')
+
+    def test_cache_delta_is_safe_metadata_and_never_relaxes_actual_input_identity(self):
+        original = {'schema': 'input', 'producer': {'candidate': 'a'*40, 'files': {'source.py': 'fixed'}},
+                    'moduleGraph': [{'Path': 'example.invalid/known', 'Version': 'v1', 'Sum': 'h1:fixed'}],
+                    'tools': {'private': 'DO_NOT_EXPORT'}, 'sourceOverlay': 0}
+        current = json.loads(json.dumps(original)); current['producer']['candidate'] = 'b'*40
+        self.assertTrue(producer.equivalent_binding(original, current))
+        current['moduleGraph'][0]['Dir'] = '/private/DO_NOT_EXPORT'
+        self.assertFalse(producer.equivalent_binding(original, current))
+        observation = producer.cache_binding_observation({'input':original,'fingerprint':'c'*64}, current, 'd'*64)
+        self.assertEqual(observation['changedFields'], ['moduleGraph'])
+        self.assertEqual(observation['originalModuleGraph']['directories'], 0)
+        self.assertEqual(observation['currentModuleGraph']['directories'], 1)
+        self.assertNotIn('DO_NOT_EXPORT', json.dumps(observation))
+        self.assertFalse(observation['inputValuesExported'] or observation['fileContentsExported'])
+        for field in ['tools', 'sourceOverlay']:
+            altered = json.loads(json.dumps(original)); altered[field] = 'different'
+            self.assertFalse(producer.equivalent_binding(original, altered))
+        self.assertEqual(original['producer']['candidate'], 'a'*40)
+
     def test_actual_apple_bind_preserves_module_basename_and_isolates_source_mutation(self):
         value = load()
         with tempfile.TemporaryDirectory() as temporary:
@@ -22,7 +87,7 @@ class ProducerCalls(unittest.TestCase):
             bindings = []
             @contextmanager
             def lease(work, cache, _value):
-                work.mkdir(mode=0o700); cache.mkdir(mode=0o700)
+                work.mkdir(mode=0o700, exist_ok=True); cache.mkdir(mode=0o700, exist_ok=True)
                 yield work, cache
             def run(command, *, cwd=None, env=None, log=None):
                 command = [str(item) for item in command]
@@ -62,6 +127,25 @@ class ProducerCalls(unittest.TestCase):
                     self.assertFalse(receipt['AppAccepted'])
                     self.assertEqual(receipt['command'][receipt['command'].index('-o')+1], str(bindings[-1][1]))
                     self.assertEqual(receipt['nativeInputs']['generatorOutputRoot'], str(args.work/'build-view/build'))
+                    saved = (args.work/'component-receipt.json').read_bytes()
+                    generated = args.work/'build-view/build/ios/generated.m'
+                    original_generated = generated.read_bytes()
+                    count = len(bindings)
+                    # A matching cache keeps its original receipt and generated
+                    # inputs; it does not rebind, relabel or delete them.
+                    producer.execute(args)
+                    self.assertEqual(len(bindings), count)
+                    self.assertEqual((args.work/'component-receipt.json').read_bytes(), saved)
+                    self.assertEqual(generated.read_bytes(), original_generated)
+                    with patch.object(producer, 'tool_facts', return_value=(
+                            {'go':str(tool),'gomobile':str(tool),'gobind':str(tool)}, {'compiler':'changed'})), \
+                            self.assertRaisesRegex(RuntimeError, 'original generator outputs retained'):
+                        producer.execute(args)
+                    self.assertEqual(len(bindings), count)
+                    self.assertEqual((args.work/'component-receipt.json').read_bytes(), saved)
+                    self.assertEqual(generated.read_bytes(), original_generated)
+                    delta = producer.read_receipt(args.work/'cache-binding-observation.json')
+                    self.assertEqual(delta['changedFields'], ['tools'])
             self.assertEqual(list(supplied.iterdir()), [])
             self.assertNotEqual(bindings[0][0], bindings[1][0])
             self.assertTrue(all(cwd.name == 'build-view' for cwd, _ in bindings))

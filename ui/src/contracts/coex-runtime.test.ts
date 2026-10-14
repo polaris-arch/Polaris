@@ -7,6 +7,11 @@ const latest = () => structuredClone(fixture.states.latest);
 describe('actual runtime Rust serializer boundary', () => {
   it('pins original serializer sources and the current graph without relabeling actual exported states', () => {
     expect(fixture.sourceCompatibility.newSerializerExecution).toBe(false);
+    for (const path of fixture.sourceCompatibility.changedTestSources) {
+      expect(fixture.sourceCompatibility.unchangedOriginalSources).not.toContain(path);
+      expect(fixture.sourceCompatibility.sourceSha256[path as keyof typeof fixture.sourceCompatibility.sourceSha256])
+        .not.toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
+    }
     for (const path of fixture.sourceCompatibility.unchangedOriginalSources) {
       expect(fixture.sourceCompatibility.sourceSha256[path as keyof typeof fixture.sourceCompatibility.sourceSha256])
         .toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
