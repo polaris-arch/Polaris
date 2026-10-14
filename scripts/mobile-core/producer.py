@@ -575,7 +575,7 @@ def execute(args):
         print(json.dumps({'phase': 'component-validation-resources', 'platform': args.platform,
                           'capacity': native_capacity(), 'compilerAdmissionRequired': False,
                           'budget': {'filesystemPeakReserveBytes': value['budget']['buildPeakReserveBytes'],
-                                     'cacheMaxBytes': value['budget']['cacheMaxBytes']}}))
+                                     'cacheMaxBytes': value['budget']['cacheMaxBytes']}}), flush=True)
         tools, identities = tool_facts(args, value, env)
         # init installs gobind@latest. The pinned generator only requires this
         # private GOPATH marker directory; create it without invoking init.
@@ -630,11 +630,14 @@ def execute(args):
                     'original generator outputs retained; explicit recovery required before rebinding')
             staged = stage_component
             require(not staged.exists(), 'unaccepted prior stage retained; inspect before recovery')
-            # Only an actual new bind requires native compilation admission.
-            # Dynamic caps remain outside the immutable binding/BuildID input.
-            env, capacity = native_environment(env)
+            # Sample and flush before validating explicit child concurrency.
+            # Dynamic caps guide compilation, outside immutable binding/BuildID.
+            observation = native_capacity()
+            print(json.dumps({'phase': 'component-native-capacity-sample', 'platform': args.platform,
+                              'capacity': observation}), flush=True)
+            env, capacity = native_environment(env, observation)
             print(json.dumps({'phase': 'component-native-capacity', 'platform': args.platform,
-                              'capacity': capacity, 'compilerAdmissionRequired': True}))
+                              'capacity': capacity, 'compilerCapacityApplied': True}), flush=True)
             recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
             from fork_input import bind_command
             command = bind_command(args.platform, value, tools['gomobile'], staged, fp, jar)

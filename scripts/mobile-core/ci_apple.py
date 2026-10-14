@@ -64,8 +64,10 @@ def prepare():
     env.update(GOBIN=str(tools), GOTOOLCHAIN='local', GOWORK='off', GOFLAGS='-mod=readonly',
                GOPATH=str(tool_cache / 'go-path'), GOCACHE=str(tool_cache / 'go-build'),
                GOMODCACHE=str(tool_cache / 'go-mod'))
-    from budget import native_environment
-    env, capacity = native_environment(env)
+    from budget import native_capacity, native_environment
+    observation = native_capacity()
+    print(json.dumps({'phase': 'apple-tool-prepare-capacity-sample', 'capacity': observation}, sort_keys=True), flush=True)
+    env, capacity = native_environment(env, observation)
     print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env,

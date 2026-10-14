@@ -40,9 +40,10 @@ def _cgroup_v2_directories():
 def native_capacity():
     """Observe this runner once, without changing locks, tools or global env.
 
-    Two GiB per concurrent compiler and one GiB headroom are conservative
-    admission estimates, not measured peak RSS. Unknown CPU/load/memory reduces
-    concurrency to one; known insufficient memory refuses a new native build.
+    Two GiB per concurrent compiler and one GiB headroom only guide concurrency;
+    they are unmeasured estimates, never a condition for refusing compilation.
+    Low or unknown memory reduces concurrency to one. Darwin's selected vm_stat
+    pages are a reclaimable subset, not a complete available-memory measurement.
     Other processes may change after sampling, so this is a cap, not a promise.
     """
     facts = {'schema': 'polaris-native-runner-capacity-v1',
@@ -51,7 +52,8 @@ def native_capacity():
              'logicalCPUs': os.cpu_count(), 'affinityCPUs': None,
              'quotaCPUs': None, 'load1': None, 'availableMemoryBytes': None,
              'memorySource': None, 'cgroupVersion': None, 'quotaObserved': False,
-             'cgroupMemoryObserved': False}
+             'cgroupMemoryObserved': False, 'osMemoryObservationBytes': None,
+             'osMemoryObservationKind': None, 'cgroupMemoryConstraints': []}
     try:
         facts['affinityCPUs'] = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -67,7 +69,10 @@ def native_capacity():
         for row in text.splitlines():
             words = row.split()
             if len(words) == 3 and words[0] == 'MemAvailable:' and words[1].isdigit() and words[2] == 'kB':
-                facts.update(availableMemoryBytes=int(words[1]) * 1024, memorySource='proc-meminfo-MemAvailable')
+                facts.update(availableMemoryBytes=int(words[1]) * 1024,
+                             osMemoryObservationBytes=int(words[1]) * 1024,
+                             osMemoryObservationKind='kernel-MemAvailable-estimate',
+                             memorySource='proc-meminfo-MemAvailable')
                 break
         for path in _cgroup_v2_directories():
             cpu = (_capacity_text(path / 'cpu.max') or '').split()
@@ -83,6 +88,8 @@ def native_capacity():
                 facts['cgroupMemoryObserved'] = True
             if limit.isdigit() and current.isdigit():
                 available = max(0, int(limit) - int(current))
+                facts['cgroupMemoryConstraints'].append({'version': 2, 'path': str(path),
+                    'limitBytes': int(limit), 'usageBytes': int(current), 'headroomBytes': available})
                 if facts['availableMemoryBytes'] is None or available < facts['availableMemoryBytes']:
                     facts.update(availableMemoryBytes=available, memorySource='cgroup-v2-headroom')
                 facts['cgroupVersion'] = 2
@@ -113,12 +120,11 @@ def native_capacity():
                 if limit.isdigit() and current.isdigit():
                     facts['cgroupMemoryObserved'] = True
                     available = max(0, int(limit) - int(current))
+                    facts['cgroupMemoryConstraints'].append({'version': 1, 'path': str(path),
+                        'limitBytes': int(limit), 'usageBytes': int(current), 'headroomBytes': available})
                     if facts['availableMemoryBytes'] is None or available < facts['availableMemoryBytes']:
                         facts.update(availableMemoryBytes=available, memorySource='cgroup-v1-headroom')
                     facts['cgroupVersion'] = 1
-        if not facts['quotaObserved']:
-            # Affinity alone cannot rule out a hidden container CPU quota.
-            facts['quotaCPUs'] = 1
     elif sys.platform == 'darwin':
         facts['quotaObserved'] = True  # No Linux cgroup controller on this host.
         try:
@@ -135,11 +141,15 @@ def native_capacity():
             names = ('Pages free', 'Pages inactive', 'Pages speculative')
             if size > 0 and all(name in pages for name in names):
                 facts.update(availableMemoryBytes=sum(pages[name] for name in names) * size,
+                             osMemoryObservationBytes=sum(pages[name] for name in names) * size,
+                             osMemoryObservationKind='reclaimable-page-subset-not-complete-available-memory',
                              memorySource='vm-stat-free-inactive-speculative')
         except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, IndexError):
             pass
     result = capacity_limit(facts)
     if sys.platform.startswith('linux') and not facts['quotaObserved']:
+        # Keep the real quota unknown; serialize without inventing a quota.
+        result['jobCap'] = min(result['jobCap'], 1)
         result['unknown'].append('cpu-quota')
     if sys.platform.startswith('linux') and not facts['cgroupMemoryObserved']:
         # Host MemAvailable does not rule out an unreadable container limit.
@@ -157,8 +167,15 @@ def capacity_limit(facts):
     load = facts['load1']
     load_cap = max(1, cpu - math.ceil(load)) if load is not None else 1
     memory = facts['availableMemoryBytes']
-    memory_cap = max(0, (memory - facts['memoryHeadroomBytes']) // facts['memoryPerJobBytes']) if memory is not None else 1
+    estimate = max(0, (memory - facts['memoryHeadroomBytes']) // facts['memoryPerJobBytes']) if memory is not None else None
+    memory_cap = max(1, estimate) if estimate is not None else 1
     facts.update(effectiveCPUs=cpu, loadJobCap=load_cap, memoryJobCap=memory_cap,
+                 estimatedMemoryJobCap=estimate,
+                 memoryEstimateRisk=('unknown-memory' if estimate is None else
+                                     'below-unmeasured-single-job-estimate' if estimate == 0 else
+                                     'within-unmeasured-concurrency-estimate'),
+                 memoryPolicy='concurrency-guidance-only; no memory admission or reservation',
+                 peakRSSBytes=None,
                  jobCap=min(cpu, load_cap, memory_cap),
                  unknown=[name for name, value in [('cpu', bool(cpus)), ('load', load is not None),
                                                     ('memory', memory is not None)] if not value])
@@ -170,7 +187,7 @@ def native_environment(env, observation=None):
     observation = native_capacity() if observation is None else observation
     cap = observation['jobCap']
     require(isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1,
-            'current runner memory headroom cannot admit one native compiler')
+            'native compiler concurrency observation must be a positive integer')
     result, applied = dict(env), dict(observation)
     limits = {}
     for key in ('CARGO_BUILD_JOBS', 'GOMAXPROCS'):

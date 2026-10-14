@@ -181,6 +181,16 @@ the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runne
 is an environment failure, never grounds to weaken the reservation or skip a
 selected leg. The eventual unified run must establish actual runner resources.
 
+CPU/affinity/quota, load and memory observations guide child Go/Rust/Xcode
+concurrency. The 2GiB/compiler plus 1GiB headroom is an unmeasured estimate,
+not a memory reservation or compilation admission condition. Low or unknown
+memory uses one task; Darwin free/inactive/speculative pages are a reclaimable
+subset, not the complete OS available memory. The real OS observation and
+cgroup limit/usage/headroom remain separate. Samples are flushed before
+explicit child limits are validated, so invalid limits retain the observation.
+An actual compiler/OOM failure remains a failure; this policy does not predict
+peak RSS or relax the independent filesystem reservation.
+
 Hosted and local entries now share the same protected reservation ledger and
 inheritable descriptor; hosted admission never substitutes a space-only yield.
 The child's reservation identity includes the actual inode, filesystem, owner,

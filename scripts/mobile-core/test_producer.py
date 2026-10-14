@@ -10,6 +10,7 @@ import sys
 
 import producer
 from artifacts import tree_inventory
+from budget import native_environment as apply_native_environment
 from fork_input import load
 
 
@@ -238,7 +239,7 @@ class ProducerCalls(unittest.TestCase):
             developer = root / 'developer'; developer.mkdir()
             tool = root / 'inert-tool'; tool.write_bytes(b'not executed')
             bindings, capacities, bind_caps = [], [], []
-            def native_environment(env):
+            def native_environment(env, observation=None):
                 cap = 1 + len(capacities) % 2
                 capacities.append(cap)
                 return (dict(env, GOMAXPROCS=str(cap), CARGO_BUILD_JOBS=str(cap)),
@@ -270,7 +271,9 @@ class ProducerCalls(unittest.TestCase):
                 for name, replacement in {
                     'lease': lease, 'producer_code': lambda: {'candidate': 'a'*40, 'files': {}},
                     'verify_source': lambda *a, **k: {'sourceOverlay': 0}, 'run': run,
-                    'native_capacity': lambda: {'jobCap': 0, 'availableMemoryBytes': 1024**3,
+                    'native_capacity': lambda: {'jobCap': 1, 'estimatedMemoryJobCap': 0,
+                                                'memoryEstimateRisk': 'below-unmeasured-single-job-estimate',
+                                                'availableMemoryBytes': 1024**3,
                                                 'scope': 'controlled low-memory observation'},
                     'native_environment': native_environment,
                     'tool_facts': lambda *a: ({'go': str(tool), 'gomobile': str(tool), 'gobind': str(tool)}, {}),
@@ -279,7 +282,7 @@ class ProducerCalls(unittest.TestCase):
                 }.items(): stack.enter_context(patch.object(producer, name, replacement))
                 stack.enter_context(patch('native_inputs.collect', return_value={'files': {}}))
                 stack.enter_context(patch('native_inputs.verify'))
-                stack.enter_context(patch('builtins.print'))
+                printed = stack.enter_context(patch('builtins.print'))
                 stack.enter_context(patch.object(producer.os, 'statvfs', return_value=SimpleNamespace(f_bavail=10**12, f_frsize=1)))
                 for slot in ['one', 'two']:
                     args = SimpleNamespace(platform='apple', source=supplied, developer=developer,
@@ -296,7 +299,7 @@ class ProducerCalls(unittest.TestCase):
                     # A matching cache keeps its original receipt and generated
                     # inputs; it does not rebind, relabel or delete them.
                     with patch.object(producer, 'native_environment', side_effect=RuntimeError(
-                            'current runner memory headroom cannot admit one native compiler')) as admission:
+                            'controlled compiler-only path must not run on a matching cache')) as admission:
                         producer.execute(args)
                         admission.assert_not_called()
                     self.assertEqual(len(bindings), count)
@@ -312,20 +315,46 @@ class ProducerCalls(unittest.TestCase):
                     self.assertEqual(generated.read_bytes(), original_generated)
                     delta = producer.read_receipt(args.work/'cache-binding-observation.json')
                     self.assertEqual(delta['changedFields'], ['tools'])
-                # The same low-memory runner must refuse a genuine fresh bind,
-                # before any compiler output/receipt is emitted or old bytes change.
+                # A fresh bind uses one child task despite the unmeasured
+                # estimate of zero. Native outputs here are entirely inert.
                 count = len(bindings)
                 args = SimpleNamespace(platform='apple', source=supplied, developer=developer,
                     go=tool, gomobile=tool, gobind=tool, work=root/'low-memory', cache=root/'low-cache')
-                with patch.object(producer, 'native_environment', side_effect=RuntimeError(
-                        'current runner memory headroom cannot admit one native compiler')) as admission, \
-                        self.assertRaisesRegex(RuntimeError, 'memory headroom cannot admit'):
+                with patch.object(producer, 'native_environment', side_effect=apply_native_environment) as applied:
                     producer.execute(args)
-                self.assertEqual(admission.call_count, 1)
-                self.assertEqual(len(bindings), count)
-                self.assertFalse((args.work/'component-receipt.json').exists())
-                self.assertFalse((args.work/'stage-component-receipt.json').exists())
-                self.assertFalse((args.work/'stage-original-bind.log').exists())
+                self.assertEqual(applied.call_count, 1)
+                self.assertEqual(len(bindings), count + 1)
+                self.assertEqual(bind_caps[-1], ('1', '1'))
+                self.assertTrue((args.work/'component-receipt.json').is_file())
+                self.assertNotIn('capacity', producer.read_receipt(args.work/'component-receipt.json')['input'])
+                # Invalid explicit limits still fail before compilation. The
+                # flushed sample survives without exporting the child env.
+                original_receipts = {(root/slot/'component-receipt.json'):
+                    (root/slot/'component-receipt.json').read_bytes() for slot in ('one', 'two', 'low-memory')}
+                for key in ('GOMAXPROCS', 'CARGO_BUILD_JOBS'):
+                    for bad in ('0', '-1', 'auto', ''):
+                        slot = 'invalid-' + key + '-' + str(len(list(root.iterdir())))
+                        invalid = SimpleNamespace(platform='apple', source=supplied, developer=developer,
+                            go=tool, gomobile=tool, gobind=tool, work=root/slot, cache=root/(slot+'-cache'))
+                        def invalid_environment(env, observation=None):
+                            return apply_native_environment(dict(env, **{key: bad}), observation)
+                        printed.reset_mock(); count = len(bindings)
+                        with patch.object(producer, 'native_environment', side_effect=invalid_environment), \
+                                self.assertRaisesRegex(RuntimeError, 'explicit native compiler concurrency must be a positive integer'):
+                            producer.execute(invalid)
+                        samples = [call for call in printed.call_args_list if call.args and
+                            'component-native-capacity-sample' in str(call.args[0])]
+                        self.assertEqual(len(samples), 1)
+                        self.assertTrue(samples[0].kwargs['flush'])
+                        sample = json.loads(samples[0].args[0])['capacity']
+                        self.assertEqual(sample['jobCap'], 1)
+                        self.assertEqual(sample['estimatedMemoryJobCap'], 0)
+                        self.assertNotIn(key, sample)
+                        self.assertEqual(len(bindings), count)
+                        for name in ('component-receipt.json', 'stage-component-receipt.json', 'stage-original-bind.log'):
+                            self.assertFalse((invalid.work/name).exists())
+                        for path, saved in original_receipts.items():
+                            self.assertEqual(path.read_bytes(), saved)
             self.assertEqual(list(supplied.iterdir()), [])
             self.assertNotEqual(bindings[0][0], bindings[1][0])
             self.assertTrue(all(cwd.name == 'build-view' for cwd, _ in bindings))

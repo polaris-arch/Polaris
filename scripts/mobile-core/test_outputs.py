@@ -1,5 +1,6 @@
 """Pure format, provenance, cache and rollback controls; no compiler/device runs."""
 from copy import deepcopy
+import ast
 import io
 import json
 import os
@@ -8,7 +9,7 @@ import struct
 import plistlib
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha
@@ -42,19 +43,47 @@ class FormalOutputs(unittest.TestCase):
         self.assertEqual(applied['appliedEnvironment'], {'CARGO_BUILD_JOBS': 1, 'GOMAXPROCS': 2})
         self.assertNotIn('appliedEnvironment', observed)
 
-    def test_native_capacity_unknowns_are_serial_and_low_memory_refuses_admission(self):
+    def test_native_capacity_unknowns_and_low_memory_guide_concurrency_without_refusing_builds(self):
         facts = {'logicalCPUs': None, 'affinityCPUs': None, 'quotaCPUs': None, 'load1': None,
                  'availableMemoryBytes': None, 'memoryHeadroomBytes': 1024 ** 3,
                  'memoryPerJobBytes': 2 * 1024 ** 3}
         observed = capacity_limit(facts)
         self.assertEqual(observed['jobCap'], 1)
         self.assertEqual(observed['unknown'], ['cpu', 'load', 'memory'])
-        facts.update(logicalCPUs=8, load1=0, availableMemoryBytes=3 * 1024 ** 3 - 1)
-        with self.assertRaisesRegex(RuntimeError, 'memory headroom'):
-            native_environment({}, capacity_limit(facts))
-        for value in ('0', '-1', 'auto', '١', ''):
-            with self.assertRaisesRegex(RuntimeError, 'positive integer'):
-                native_environment({'GOMAXPROCS': value}, observed)
+        self.assertIsNone(observed['estimatedMemoryJobCap'])
+        self.assertEqual(observed['memoryEstimateRisk'], 'unknown-memory')
+        # The same sampled limits apply before either a fresh build or a cache
+        # lookup. Neither path may be denied by an unmeasured per-job estimate.
+        for phase in ('fresh', 'cache-hit'):
+            for memory in (0, 1024 ** 3, 3 * 1024 ** 3 - 1):
+                with self.subTest(phase=phase, memory=memory):
+                    facts.update(logicalCPUs=8, load1=0, availableMemoryBytes=memory)
+                    limited = capacity_limit(facts)
+                    self.assertEqual(limited['estimatedMemoryJobCap'], 0)
+                    self.assertEqual(limited['memoryJobCap'], 1)
+                    self.assertEqual(limited['memoryEstimateRisk'], 'below-unmeasured-single-job-estimate')
+                    child, applied = native_environment({}, limited)
+                    self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
+                    self.assertIsNone(applied['peakRSSBytes'])
+        child, applied = native_environment({}, observed)
+        self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
+        self.assertEqual(applied['unknown'], ['cpu', 'load', 'memory'])
+
+    def test_native_capacity_retains_strict_explicit_caps_and_refuses_only_invalid_limits(self):
+        facts = {'logicalCPUs': 8, 'affinityCPUs': None, 'quotaCPUs': None, 'load1': 0,
+                 'availableMemoryBytes': 17 * 1024 ** 3, 'memoryHeadroomBytes': 1024 ** 3,
+                 'memoryPerJobBytes': 2 * 1024 ** 3}
+        observed = capacity_limit(facts)
+        original = {'CARGO_BUILD_JOBS': '2', 'GOMAXPROCS': '1'}
+        child, _ = native_environment(original, observed)
+        self.assertEqual(child, original)
+        for key in ('CARGO_BUILD_JOBS', 'GOMAXPROCS'):
+            for value in ('0', '-1', 'auto', '١', '', True, 2):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(RuntimeError, 'positive integer'):
+                    native_environment({key: value}, observed)
+        for cap in (0, -1, True, '1'):
+            with self.subTest(cap=cap), self.assertRaisesRegex(RuntimeError, 'observation must be'):
+                native_environment({}, dict(observed, jobCap=cap))
 
     def test_native_capacity_reads_parent_cgroup_limits_without_exporting_environment(self):
         text = {'/proc/self/cgroup': '0::/runner/job\n',
@@ -74,6 +103,9 @@ class FormalOutputs(unittest.TestCase):
         self.assertEqual(observed['quotaCPUs'], 2)
         self.assertEqual(observed['availableMemoryBytes'], 5 * 1024 ** 3)
         self.assertEqual(observed['memorySource'], 'cgroup-v2-headroom')
+        self.assertEqual(observed['osMemoryObservationBytes'], 16 * 1024 ** 3)
+        self.assertEqual(observed['cgroupMemoryConstraints'][0]['limitBytes'], 7 * 1024 ** 3)
+        self.assertEqual(observed['cgroupMemoryConstraints'][0]['usageBytes'], 2 * 1024 ** 3)
         self.assertNotIn('DO_NOT_EXPORT_SECRET', json.dumps(observed))
 
     def test_native_capacity_darwin_uses_actual_vm_pages_and_bounded_command(self):
@@ -85,6 +117,8 @@ class FormalOutputs(unittest.TestCase):
                 patch('budget.subprocess.run', return_value=result) as command:
             observed = native_capacity()
         self.assertEqual(observed['availableMemoryBytes'], 900000 * 16384)
+        self.assertEqual(observed['osMemoryObservationKind'],
+                         'reclaimable-page-subset-not-complete-available-memory')
         self.assertEqual(observed['jobCap'], 6)
         self.assertTrue(observed['quotaObserved'])
         self.assertIsNone(observed['quotaCPUs'])
@@ -114,6 +148,84 @@ class FormalOutputs(unittest.TestCase):
         self.assertEqual(unknown['jobCap'], 1)
         self.assertIn('cpu-quota', unknown['unknown'])
         self.assertIn('memory', unknown['unknown'])
+        self.assertIsNone(unknown['quotaCPUs'])
+
+    def test_native_capacity_low_darwin_subset_and_unavailable_sampling_remain_serial(self):
+        result = type('Result', (), {'stdout': b'Mach Virtual Memory Statistics: (page size of 16384 bytes)\n'
+                    b'Pages free: 1000.\nPages inactive: 2000.\nPages speculative: 0.\n'})()
+        with patch('budget.sys.platform', 'darwin'), patch('budget.os.cpu_count', return_value=8), \
+                patch('budget.os.sched_getaffinity', side_effect=AttributeError, create=True), \
+                patch('budget.os.getloadavg', return_value=(0, 0, 0)), \
+                patch('budget.subprocess.run', return_value=result) as command:
+            sample = native_capacity()
+            self.assertEqual(sample['osMemoryObservationBytes'], 3000 * 16384)
+            self.assertEqual(sample['estimatedMemoryJobCap'], 0)
+            self.assertEqual(sample['jobCap'], 1)
+            child, applied = native_environment({}, sample)
+            self.assertEqual(child, {'CARGO_BUILD_JOBS': '1', 'GOMAXPROCS': '1'})
+            self.assertEqual(applied['memorySource'], 'vm-stat-free-inactive-speculative')
+            command.side_effect = OSError('controlled unavailable sampler')
+            missing = native_capacity()
+        self.assertIsNone(missing['availableMemoryBytes'])
+        self.assertIsNone(missing['osMemoryObservationBytes'])
+        self.assertEqual(missing['memoryEstimateRisk'], 'unknown-memory')
+        self.assertEqual(missing['jobCap'], 1)
+        self.assertNotIn('cpu-quota', missing['unknown'])
+
+    def test_native_prepare_and_app_calls_flush_samples_before_invalid_env_without_compiler_calls(self):
+        # Execute only the actual capacity call-site statements extracted from
+        # these callers. All runner sampling/output/compiler hooks are controlled;
+        # this is an error-state control, not a native or full prepare execution.
+        class FlushedOutput(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+                super().flush()
+
+        cases = [('ci_android.py', 'prepare', 'android-tool-prepare-capacity-sample'),
+                 ('ci_apple.py', 'prepare', 'apple-tool-prepare-capacity-sample'),
+                 ('build_apple_app.py', 'main', 'apple-app-build-capacity-sample')]
+        for filename, function_name, phase in cases:
+            with self.subTest(caller=filename):
+                path = ROOT / 'scripts/mobile-core' / filename
+                tree = ast.parse(path.read_text(), filename=str(path))
+                function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == function_name)
+                blocks = [node.body for node in ast.walk(function) if hasattr(node, 'body') and isinstance(node.body, list)]
+                selected = []
+                for statements in blocks:
+                    for position, node in enumerate(statements):
+                        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                                and isinstance(node.value.func, ast.Name) and node.value.func.id == 'native_capacity'):
+                            selected.append(statements[position:position + 5])
+                self.assertEqual(len(selected), 1)
+                statements = selected[0]
+                self.assertEqual(len(statements), 5)
+                self.assertIsInstance(statements[-1], ast.Expr)
+                self.assertIn(statements[-1].value.func.id, ('run', 'timed_phase'))
+                stream = FlushedOutput()
+                sample = {'jobCap': 1, 'availableMemoryBytes': 0,
+                          'scope': 'controlled original sample; not runner observation'}
+                sampler, compiler, phase_runner = Mock(return_value=sample), Mock(), Mock()
+
+                def apply(env, observation):
+                    self.assertIs(observation, sample)
+                    self.assertEqual(stream.flush_count, 1)
+                    self.assertEqual(json.loads(stream.getvalue()), {'phase': phase, 'capacity': sample})
+                    return native_environment(env, observation)
+
+                namespace = {'json': json, 'env': {'GOMAXPROCS': 'auto'},
+                             'native_capacity': sampler, 'native_environment': apply,
+                             'run': compiler, 'timed_phase': phase_runner}
+                code = compile(ast.Module(body=statements, type_ignores=[]), str(path), 'exec')
+                with patch('sys.stdout', stream), self.assertRaisesRegex(RuntimeError, 'positive integer'):
+                    exec(code, namespace)
+                sampler.assert_called_once_with()
+                compiler.assert_not_called()
+                phase_runner.assert_not_called()
+                self.assertEqual(stream.flush_count, 1)
 
     def test_large_apple_receipts_round_trip_original_inventory_and_fingerprint(self):
         # Model the real producer/consumer boundary, not native acceptance.
@@ -563,7 +675,9 @@ class FormalOutputs(unittest.TestCase):
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
-                        patch('ci_android.native_environment', side_effect=lambda env: (dict(env),
+                        patch('ci_android.native_capacity', return_value=
+                              {'jobCap': 1, 'scope': 'inert prepare test; not runner observation'}), \
+                        patch('ci_android.native_environment', side_effect=lambda env, observation: (dict(env),
                               {'jobCap': 1, 'scope': 'inert prepare test; not runner observation'})), \
                         patch('ci_android.run', side_effect=controlled_run), \
                         patch('ci_android.prepare_source', side_effect=RuntimeError('controlled source refusal')) as source, \

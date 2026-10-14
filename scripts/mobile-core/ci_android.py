@@ -13,7 +13,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha, verify_source
 from producer import run, private_dir, producer_code, android_build_code
-from budget import native_environment
+from budget import native_capacity, native_environment
 
 
 def prepare_source(source, value):
@@ -53,8 +53,10 @@ def prepare():
     env = dict(os.environ, GOBIN=str(tools), GOTOOLCHAIN='local', GOWORK='off', GOFLAGS='-mod=readonly',
                GOPATH=str(tool_cache / 'go-path'), GOCACHE=str(tool_cache / 'go-build'),
                GOMODCACHE=str(tool_cache / 'go-mod'))
-    env, capacity = native_environment(env)
-    print(json.dumps({'phase': 'android-tool-prepare-capacity', 'capacity': capacity}))
+    observation = native_capacity()
+    print(json.dumps({'phase': 'android-tool-prepare-capacity-sample', 'capacity': observation}, sort_keys=True), flush=True)
+    env, capacity = native_environment(env, observation)
+    print(json.dumps({'phase': 'android-tool-prepare-capacity', 'capacity': capacity}), flush=True)
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env)
     ndk = run([sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py', root]).strip()

@@ -729,6 +729,116 @@ test('repository public identity remains mandatory without relying on authentica
 }));
 
 const quotaNow = 1791755097242;
+const transportURL = 'https://api.github.com/repos/polaris-arch/polaris-box';
+const codedTransportError = (code) => new TypeError('never-log-outer-secret', {
+  cause: Object.assign(new Error('never-log-cause-address-or-query'), { code }) });
+test('recognized transient API transport gets one same-URL anonymous retry shared across all reads', async () => {
+  const calls = [], waits = [], reports = [];
+  const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000,
+    sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
+    fetch: async (url, options) => { calls.push({ url, options });
+      if (calls.length !== 2) throw codedTransportError('ECONNRESET'); return new Response('ok'); } });
+  assert.equal((await read(transportURL, 2)).toString(), 'ok');
+  assert.deepEqual(waits, [1000]); assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.url), [transportURL, transportURL]);
+  assert(calls.every((call) => call.options.redirect === 'manual' && call.options.headers.Authorization === undefined));
+  assert.equal(reports.length, 1); assert(reports[0].includes('codes=ECONNRESET; causeComplete=true'));
+  assert(!reports[0].includes('never-log'));
+  await assert.rejects(read(transportURL + '/releases/17', 2), /codes=ECONNRESET/);
+  assert.equal(calls.length, 3); assert.equal(waits.length, 1);
+});
+test('unknown, terminal, mixed, cyclic, clipped and cancelled transport errors fail without retry or raw causes', async () => {
+  const cycle = codedTransportError('ECONNRESET'); cycle.cause.cause = cycle;
+  let deep = codedTransportError('ECONNRESET'); for (let i = 0; i < 6; i++) deep = new Error('never-log-depth', { cause: deep });
+  const errors = [new TypeError('never-log-unknown'), codedTransportError('never-log-unknown-code'),
+    ...['ENOTFOUND', 'ECONNREFUSED', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED', 'EPERM'].map(codedTransportError),
+    new AggregateError([Object.assign(Error('never-log-a'), { code: 'ECONNRESET' }), Error('never-log-b')]),
+    new AggregateError([Object.assign(Error('never-log-a'), { code: 'ECONNRESET' }),
+      Object.assign(Error('never-log-b'), { code: 'ENOTFOUND' })]), cycle, deep,
+    new AggregateError(Array.from({ length: 17 }, () => codedTransportError('ECONNRESET'))),
+    new Error('never-log-wrapper', { cause: Object.assign(Error('never-log-abort'), { name: 'AbortError', code: 'ECONNRESET' }) }),
+    Object.assign(Error('never-log-timeout'), { name: 'TimeoutError', code: 'ETIMEDOUT' })];
+  errors.push(Object.defineProperty(Error('never-log-getter'), 'code', { get() { throw Error('never-log-property'); } }));
+  for (const error of errors) {
+    let calls = 0, waits = 0;
+    const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000,
+      fetch: async () => { calls++; throw error; }, sleep: async () => { waits++; }, report: () => assert.fail('unexpected recovery') });
+    await assert.rejects(read(transportURL + '?secret=never-log-query', 2),
+      (failure) => failure.message.includes('Release request failed') && !failure.message.includes('never-log'));
+    assert.equal(calls, 1); assert.equal(waits, 0);
+    // The error itself must refuse recovery even on a canonical endpoint.
+    await assert.rejects(read(transportURL, 2), (failure) => !failure.message.includes('never-log'));
+    assert.equal(calls, 2); assert.equal(waits, 0);
+  }
+});
+test('transport diagnostic reads each code and root name once, keeping its closed vocabulary', async () => {
+  let codeReads = 0, nameReads = 0;
+  const error = Object.defineProperties(new Error('never-log-message'), {
+    name: { get: () => ++nameReads === 1 ? 'TypeError' : 'never-log-name' },
+    code: { get: () => ++codeReads === 1 ? 'ECONNRESET' : 'never-log-code' } });
+  await assert.rejects(publicBytes(transportURL, 2, false, { fetch: async () => { throw error; } }),
+    (failure) => failure.message.includes('codes=ECONNRESET') && !failure.message.includes('never-log'));
+  assert.equal(codeReads, 1);
+  assert.equal(nameReads, 1);
+});
+test('transient transport does not retry assets, queries, credentials, fragments or another repository', async () => {
+  for (const [url, asset] of [[transportURL, true], [transportURL + '?signature=never-log-query', false],
+    [transportURL + '#fragment', false], [transportURL.replace('https://', 'https://fixture-user@'), false],
+    ['https://api.github.com/repos/other/repository', false], [transportURL.replace('https:', 'http:'), false]]) {
+    let calls = 0;
+    const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000,
+      fetch: async () => { calls++; throw codedTransportError('EAI_AGAIN'); }, sleep: async () => assert.fail('unexpected wait') });
+    await assert.rejects(read(url, 2, asset), /codes=EAI_AGAIN/); assert.equal(calls, 1);
+  }
+});
+test('transport retry stops at second error and cannot exceed original absolute deadline', async () => {
+  let calls = 0, waits = 0;
+  const fetch = async () => { calls++; throw codedTransportError('UND_ERR_CONNECT_TIMEOUT'); };
+  const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000, fetch,
+    sleep: async () => { waits++; }, report: () => {} });
+  await assert.rejects(read(transportURL, 2), /codes=UND_ERR_CONNECT_TIMEOUT/);
+  assert.equal(calls, 2); assert.equal(waits, 1);
+  calls = 0; waits = 0;
+  const short = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 1000, fetch,
+    sleep: async () => { waits++; }, report: () => {} });
+  await assert.rejects(short(transportURL, 2), /Release request failed/); assert.equal(calls, 1); assert.equal(waits, 0);
+  let clock = quotaNow;
+  const late = releasePublicReader({ now: () => clock, deadlineMs: quotaNow + 2000, fetch,
+    sleep: async () => { clock += 2001; }, report: () => {} });
+  await assert.rejects(late(transportURL, 2), /job deadline exceeded/); assert.equal(calls, 2);
+});
+test('transport recovery still rejects size and changed public identity without replacing resources', async () => withFixture(async (f) => {
+  let calls = 0;
+  const fetch = async () => { if (++calls === 1) throw codedTransportError('ECONNRESET'); return new Response('exceeds pin'); };
+  const options = { now: () => quotaNow, deadlineMs: quotaNow + 60000, sleep: async () => {}, report: () => {} };
+  await assert.rejects(releasePublicReader({ ...options, fetch })(transportURL, 2), /exceeds pinned size/); assert.equal(calls, 2);
+  write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
+  const changed = releasePublicReader({ ...options, fetch: async () => {
+    if (++calls === 1) throw codedTransportError('ECONNRESET');
+    return new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })); } });
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
+  assert.equal(calls, 2); assert.deepEqual(resources(f), before);
+}));
+test('body-stream errors never retry or write partial bytes and sanitize the cause', async () => withFixture(async (f) => {
+  write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); let calls = 0;
+  const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000,
+    sleep: async () => assert.fail('body must not retry'), fetch: async () => { calls++;
+      return { ok: true, status: 200, headers: new Headers(), body: (async function* () {
+        yield Buffer.from('partial'); throw codedTransportError('ECONNRESET'); })() }; } });
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read }),
+    (error) => /Release body read failed/.test(error.message) && error.message.includes('codes=ECONNRESET') && !error.message.includes('never-log'));
+  assert.equal(calls, 1); assert.deepEqual(resources(f), before);
+}));
+test('response cancellation failures are bounded diagnostics without recovery', async () => {
+  let calls = 0;
+  const read = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 60000,
+    fetch: async () => { calls++; return { ok: false, status: 403, headers: new Headers(),
+      body: { cancel: async () => { throw codedTransportError('UND_ERR_SOCKET'); } } }; },
+    sleep: async () => assert.fail('cancel must not retry') });
+  await assert.rejects(read(transportURL, 2),
+    (error) => /Release body cancellation failed/.test(error.message) && !error.message.includes('never-log'));
+  assert.equal(calls, 1);
+});
 const observedQuotaHeaders = { 'x-github-request-id': 'E3C0:358CB1:1F5A584:2541386:6ACC0359',
   'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1791755597',
   'x-ratelimit-resource': 'core' };

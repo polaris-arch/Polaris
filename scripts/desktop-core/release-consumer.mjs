@@ -261,23 +261,70 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
 // An anonymous primary quota window is one hour. Bound recovery to one window
 // plus a minute of clock/reset margin, shared by the whole consumption.
 const PRIMARY_QUOTA_WAIT_MS = 61 * 60 * 1000;
+const TRANSPORT_WAIT_MS = 1000;
+const TRANSPORT_CODES = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND',
+  'EACCES', 'EPERM', 'ABORT_ERR', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET', 'UND_ERR_ABORTED', 'UND_ERR_DESTROYED']);
+const TRANSIENT_TRANSPORT_CODES = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET']);
+function canonicalPublicAPI(endpoint, asset) {
+  return !asset && endpoint.protocol === 'https:' && endpoint.hostname === 'api.github.com'
+    && !endpoint.port && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
+    && (endpoint.pathname === `/repos/${REPO}` || endpoint.pathname.startsWith(`/repos/${REPO}/`));
+}
+// Keep only a closed code vocabulary. Never copy error messages, addresses,
+// URLs, signed queries or a raw cause into the public diagnostic. Mixed,
+// unknown, cyclic or clipped cause graphs cannot authorize recovery.
+function transportObservation(error) {
+  const codes = new Set(), seen = new Set(); let complete = true, cancelled = false, kind = 'Error';
+  const visit = (item, depth) => {
+    if (!item || typeof item !== 'object' || depth > 4 || seen.size >= 16 || seen.has(item)) {
+      complete = false; return;
+    }
+    seen.add(item);
+    try {
+      const name = item.name;
+      if (depth === 0 && ['AbortError', 'TimeoutError', 'TypeError', 'Error', 'AggregateError'].includes(name)) kind = name;
+      if (['AbortError', 'TimeoutError'].includes(name)) cancelled = true;
+      const code = item.code, cause = item.cause, errors = item.errors;
+      if (code !== undefined) {
+        if (TRANSPORT_CODES.has(code)) codes.add(code);
+        else complete = false;
+      }
+      const children = cause === undefined ? [] : [cause];
+      if (errors !== undefined) {
+        if (!Array.isArray(errors) || errors.length > 16) complete = false;
+        else children.push(...errors);
+      }
+      if (!children.length && code === undefined) complete = false;
+      for (const child of children) visit(child, depth + 1);
+    } catch { complete = false; }
+  };
+  visit(error, 0);
+  const sorted = [...codes].sort();
+  return { kind, codes: sorted, complete,
+    retryable: complete && !cancelled
+      && sorted.length > 0 && sorted.every((code) => TRANSIENT_TRANSPORT_CODES.has(code)) };
+}
+const transportDetail = (observation) => `${observation.kind}; codes=${observation.codes.join(',') || 'unknown'}; causeComplete=${observation.complete}`;
 // One evidenced primary-quota recovery across the entire consumption, including
 // both public snapshots. Asset denials and unknown API denials stay fail-closed.
 export function releasePublicReader(options = {}) {
   const quotaBudget = { available: true };
+  const transportBudget = { available: true };
   const now = options.now ?? Date.now;
   const supplied = options.deadlineMs ?? process.env.POLARIS_RELEASE_JOB_DEADLINE_MS;
   const deadlineMs = supplied === undefined ? now() + 120 * 60 * 1000 : Number(supplied);
   demand((supplied === undefined || /^[0-9]+$/.test(String(supplied)))
     && Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= now() + 180 * 60 * 1000,
   'Invalid absolute release-consumer deadline');
-  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget, deadlineMs });
+  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget, transportBudget, deadlineMs });
 }
 function primaryQuotaDelay(response, endpoint, asset, now, deadline) {
   const reset = response.headers.get('x-ratelimit-reset'), retry = response.headers.get('retry-after');
-  if (asset || ![403, 429].includes(response.status) || endpoint.protocol !== 'https:'
-    || endpoint.hostname !== 'api.github.com' || endpoint.port || endpoint.username || endpoint.password
-    || endpoint.search || !(endpoint.pathname === `/repos/${REPO}` || endpoint.pathname.startsWith(`/repos/${REPO}/`))
+  if (!canonicalPublicAPI(endpoint, asset) || ![403, 429].includes(response.status)
     || response.headers.get('x-ratelimit-limit') !== '60' || response.headers.get('x-ratelimit-remaining') !== '0'
     || response.headers.get('x-ratelimit-resource') !== 'core' || !/^[0-9]+$/.test(reset ?? '')
     || (retry !== null && !/^[0-9]+$/.test(retry))) return null;
@@ -303,17 +350,28 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     try {
       response = await request(url, { redirect: 'manual', signal: AbortSignal.timeout(Math.min(60000, remaining)), headers });
     } catch (error) {
-      const kind = ['AbortError', 'TimeoutError', 'TypeError', 'Error'].includes(error?.name) ? error.name : 'Error';
-      throw new Error(`Release request failed (${location}; ${kind})`);
+      const observation = transportObservation(error);
+      if (options.transportBudget?.available && observation.retryable && canonicalPublicAPI(endpoint, asset)
+        && (options.now ?? Date.now)() + TRANSPORT_WAIT_MS < options.deadlineMs) {
+        options.transportBudget.available = false;
+        (options.report ?? console.error)(`Release transport retry ${TRANSPORT_WAIT_MS}ms (${location}; ${transportDetail(observation)})`);
+        await (options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(TRANSPORT_WAIT_MS);
+        continue;
+      }
+      throw new Error(`Release request failed (${location}; ${transportDetail(observation)})`);
     }
+    const cancelBody = async () => {
+      try { await response.body?.cancel(); }
+      catch (error) { throw new Error(`Release body cancellation failed (${location}; ${transportDetail(transportObservation(error))})`); }
+    };
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      await response.body?.cancel(); const next = new URL(response.headers.get('location') ?? '', url);
+      await cancelBody(); const next = new URL(response.headers.get('location') ?? '', url);
       demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
         && ['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(next.hostname), 'Unapproved release redirect');
       url = next.href; redirects++; continue;
     }
     if (!response.ok) {
-      await response.body?.cancel();
+      await cancelBody();
       const quota = ['x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
         'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after']
         .map((name) => `${name}=${response.headers.get(name) ?? 'unknown'}`).join(', ');
@@ -328,11 +386,17 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
       throw new Error(`Release HTTP ${response.status} (${location}; ${quota})`);
     }
     const parts = []; let size = 0;
-    for await (const part of response.body) {
-      size += part.length;
-      if (size > limit) throw new Error('Release response exceeds pinned size');
-      parts.push(part);
+    let oversized = false;
+    try {
+      for await (const part of response.body) {
+        size += part.length;
+        if (size > limit) { oversized = true; break; }
+        parts.push(part);
+      }
+    } catch (error) {
+      throw new Error(`Release body read failed (${location}; ${transportDetail(transportObservation(error))})`);
     }
+    demand(!oversized, 'Release response exceeds pinned size');
     return Buffer.concat(parts);
   }
   throw new Error('Release redirect limit');

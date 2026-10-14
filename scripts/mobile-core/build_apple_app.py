@@ -99,8 +99,10 @@ def main():
         env.update(PLATFORM_NAME=platform, CONFIGURATION='release',
                    ARCHS='x86_64' if args.simulator and args.simulator_arch == 'amd64' else 'arm64')
         env['SDKROOT'] = run(['xcrun', '--sdk', platform, '--show-sdk-path'], env=env).strip()
-        from budget import native_environment
-        env, capacity = native_environment(env)
+        from budget import native_capacity, native_environment
+        observation = native_capacity()
+        print(json.dumps({'phase': 'apple-app-build-capacity-sample', 'capacity': observation}, sort_keys=True), flush=True)
+        env, capacity = native_environment(env, observation)
         print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
         # Compile before Xcode starts its build service so the reservation fd,
         # registered compiler group and child lifetime remain observable.
