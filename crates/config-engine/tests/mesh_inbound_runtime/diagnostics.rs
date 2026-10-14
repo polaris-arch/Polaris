@@ -1,6 +1,94 @@
 //! Pure loopback diagnostics fixtures: no sing-box, TUN or host settings.
 use super::*;
 
+fn stage(
+    name: &str,
+    origin: Instant,
+    started: Instant,
+    error: Option<std::io::ErrorKind>,
+) -> Value {
+    json!({"stage":name,"startedMicros":started.duration_since(origin).as_micros(),
+        "completedMicros":origin.elapsed().as_micros(),
+        "errorKind":error.map(|kind|format!("{kind:?}"))})
+}
+
+pub(super) fn probe_stages(port: u16, origin: Instant) -> (Result<(), String>, Value) {
+    let started = Instant::now();
+    let mut stages = Vec::with_capacity(4);
+    let mut socket = None;
+    let mut timeout_error = None;
+    let result = (|| {
+        let connected = TcpStream::connect_timeout(&local(port), Duration::from_millis(600));
+        stages.push(stage(
+            "connect",
+            origin,
+            started,
+            connected.as_ref().err().map(|e| e.kind()),
+        ));
+        let mut stream = connected.map_err(|error| format!("connect: {error}"))?;
+        socket = Some(json!({"local":stream.local_addr().ok(),"peer":stream.peer_addr().ok()}));
+        timeout_error = stream
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .err();
+        let write_started = Instant::now();
+        let written = stream.write_all(&[0x59]);
+        stages.push(stage(
+            "write",
+            origin,
+            write_started,
+            written.as_ref().err().map(|e| e.kind()),
+        ));
+        written.map_err(|error| format!("write: {error}"))?;
+        let read_started = Instant::now();
+        let mut echoed = [0u8; 1];
+        let read = stream.read_exact(&mut echoed);
+        stages.push(stage(
+            "read",
+            origin,
+            read_started,
+            read.as_ref().err().map(|e| e.kind()),
+        ));
+        read.map_err(|error| format!("read: {error}; set_read_timeout_error={timeout_error:?}"))?;
+        let validation_started = Instant::now();
+        let matches = echoed == [0x59];
+        stages.push(json!({"stage":"echo-check", "startedMicros":validation_started.duration_since(origin).as_micros(),
+            "completedMicros":origin.elapsed().as_micros(),"matches":matches}));
+        if matches {
+            Ok(())
+        } else {
+            Err("echo mismatch: response did not match".to_owned())
+        }
+    })();
+    let result = result.map_err(|error| {
+        format!(
+            "relay={} elapsed={:?} {error}",
+            local(port),
+            started.elapsed()
+        )
+    });
+    let observed = json!({"startedMicros":started.duration_since(origin).as_micros(),
+        "completedMicros":origin.elapsed().as_micros(),"socket":socket,"stages":stages,
+        "readTimeoutSetupErrorKind":timeout_error.map(|e|format!("{:?}",e.kind())),
+        "scope":"monotonic fixture socket stages only; no payload/key bytes or causal verdict"});
+    (result, observed)
+}
+
+fn log_windows(logs: &[(&str, &Path)], origin: Instant) -> Value {
+    Value::Object(
+        logs.iter()
+            .map(|(role, path)| {
+                let observed = std::fs::metadata(path);
+                (
+                    (*role).to_owned(),
+                    json!({"observedMicros":origin.elapsed().as_micros(),
+            "fileBytes":observed.as_ref().ok().map(std::fs::Metadata::len),
+            "errorKind":observed.err().map(|e|format!("{:?}",e.kind()))}),
+                )
+            })
+            .collect(),
+    )
+}
+
 pub(super) fn listener_snapshots(listeners: &[(&str, &Listener)]) -> Value {
     Value::Object(
         listeners
@@ -36,16 +124,29 @@ pub(super) fn observe_forward_tcp(
     listeners: &[(&str, &Listener)],
     policy_baseline: &Value,
 ) -> (Result<(), String>, Value) {
+    observe_forward_tcp_with_logs(port, listeners, policy_baseline, &[])
+}
+
+pub(super) fn observe_forward_tcp_with_logs(
+    port: u16,
+    listeners: &[(&str, &Listener)],
+    policy_baseline: &Value,
+    logs: &[(&str, &Path)],
+) -> (Result<(), String>, Value) {
+    let origin = Instant::now();
     let mut attempts = Vec::new();
     let mut count = 0usize;
     let mut last_error = "no probe attempt completed".to_string();
     let passed = eventually(|| {
         count += 1;
         let before = listener_snapshots(listeners);
-        let result = tcp_probe(port); // Same original 600ms probe and 10s retry window.
+        let logs_before = log_windows(logs, origin);
+        let (result, probe_window) = probe_stages(port, origin); // Original 600ms probe /10s window.
         let after = listener_snapshots(listeners);
+        let logs_after = log_windows(logs, origin);
         let record = json!({"attempt":count,"before":before,"after":after,
-            "delta":deltas(&before,&after),"probeResult":result.as_ref().err()});
+            "delta":deltas(&before,&after),"probeResult":result.as_ref().err(),
+            "probeStages":probe_window,"coreLogBefore":logs_before,"coreLogAfter":logs_after});
         // Bound observation storage, never the actual probe/retry count.
         if attempts.len() < 100 {
             attempts.push(record);
@@ -64,8 +165,56 @@ pub(super) fn observe_forward_tcp(
     let observation = json!({"policyBaseline":policy_baseline,"preSIGQUIT":pre_signal,
         "policyDelta":deltas(policy_baseline,&pre_signal),"attemptCount":count,
         "omittedAttempts":count.saturating_sub(attempts.len()),"attempts":attempts,
-        "scope":"policy and probe attempt observation windows frozen before SIGQUIT; EOF may follow client timeout and is not attributed as original root cause"});
+        "scope":"policy/probe monotonic sampling windows and core log byte offsets before SIGQUIT, not exact engine event times; no payload/key capture; EOF may follow client timeout and is not attributed as original root cause"});
     (if passed { Ok(()) } else { Err(last_error) }, observation)
+}
+
+#[test]
+fn probe_stages_and_log_offsets_keep_metadata_without_content() {
+    let listener = Listener::tcp_on(false);
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("owned.stderr");
+    let private_content = b"controlled-log-content-not-for-export";
+    std::fs::write(&log, private_content).unwrap();
+    let listeners = [("b_tcp", &listener)];
+    let baseline = listener_snapshots(&listeners);
+    let (result, observation) =
+        observe_forward_tcp_with_logs(listener.port, &listeners, &baseline, &[("a", &log)]);
+    assert!(result.is_ok());
+    let attempt = &observation["attempts"][0];
+    let probe = &attempt["probeStages"];
+    let stages = probe["stages"].as_array().unwrap();
+    assert_eq!(
+        stages
+            .iter()
+            .map(|row| row["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["connect", "write", "read", "echo-check"]
+    );
+    let mut previous = probe["startedMicros"].as_u64().unwrap();
+    for row in stages {
+        let start = row["startedMicros"].as_u64().unwrap();
+        let end = row["completedMicros"].as_u64().unwrap();
+        assert!(previous <= start && start <= end);
+        previous = end;
+    }
+    assert!(previous <= probe["completedMicros"].as_u64().unwrap());
+    assert_eq!(
+        attempt["coreLogBefore"]["a"]["fileBytes"],
+        private_content.len()
+    );
+    assert_eq!(
+        attempt["coreLogAfter"]["a"]["fileBytes"],
+        private_content.len()
+    );
+    assert!(!observation
+        .to_string()
+        .contains(std::str::from_utf8(private_content).unwrap()));
+    assert!(
+        log_windows(&[("missing", &temp.path().join("missing"))], Instant::now())["missing"]
+            ["fileBytes"]
+            .is_null()
+    );
 }
 
 #[test]
@@ -211,7 +360,7 @@ fn idle_response_fixture_can_be_cancelled_without_a_connection() {
 fn early_eof_and_wrong_echo_keep_the_probe_failure_stage() {
     for response in [None, Some(0x58)] {
         let (port, stop, worker) = response_fixture(response);
-        let result = tcp_probe(port);
+        let (result, observation) = probe_stages(port, Instant::now());
         // Even a connect failure or unexpected success must release the idle worker.
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
@@ -222,6 +371,15 @@ fn early_eof_and_wrong_echo_keep_the_probe_failure_stage() {
         } else {
             "echo mismatch:"
         }));
+        let stages = observation["stages"].as_array().unwrap();
+        if response.is_none() {
+            assert_eq!(stages.last().unwrap()["stage"], "read");
+            assert!(!stages.last().unwrap()["errorKind"].is_null());
+        } else {
+            assert_eq!(stages.last().unwrap()["stage"], "echo-check");
+            assert_eq!(stages.last().unwrap()["matches"], false);
+            assert!(!failure.contains("0x58") && !failure.contains("[88]"));
+        }
     }
 }
 

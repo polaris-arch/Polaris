@@ -26,6 +26,14 @@ function packageFetchStep(source) {
   assert.ok(body.includes(marker), 'Package requires its exact source consumption step');
   return body.split(marker)[1].split('\n      - ')[0];
 }
+function replacePackageFetchShell(source, replacement) {
+  const body = job(source, 'package'), before = packageFetchStep(source);
+  assert.match(before, /^        shell: bash$/m, 'mutation requires the actual consumption shell');
+  const after = before.replace(/^        shell: bash\n/m, replacement);
+  assert.notEqual(after, before, 'shell negative control must alter the selected step');
+  assert.equal(body.split(before).length, 2, 'selected consumption step must be unique in Package');
+  return source.replace(body, body.replace(before, after));
+}
 function candidates(source) {
   const producer = source['desktop-core'];
   const risk = source['release-risk'];
@@ -191,9 +199,12 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
     { ...files, 'release-risk': files['release-risk'].replace(' --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"', '') },
     { ...files, package: files.package.replace('name: ${{ env.CORE_BUNDLE_ARTIFACT }}', 'name: old-source-artifact') },
     { ...files, package: files.package.replace('desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]', 'desktop-core-bundle-$CORE_CANDIDATE" ]') },
-    { ...files, package: files.package.replace('      - name: Consume sing-box core bundle\n        shell: bash\n', '      - name: Consume sing-box core bundle\n') },
-    { ...files, package: files.package.replace('      - name: Consume sing-box core bundle\n        shell: bash\n', '      - name: Consume sing-box core bundle\n        shell: pwsh\n') },
-  ]) assert.throws(() => bundles(changed));
+    { ...files, package: replacePackageFetchShell(files.package, '') },
+    { ...files, package: replacePackageFetchShell(files.package, '        shell: pwsh\n') },
+  ]) {
+    assert.notEqual(JSON.stringify(changed), JSON.stringify(files), 'negative control must actually mutate source');
+    assert.throws(() => bundles(changed));
+  }
   // Exercise the unchanged run line's quoting with actual Bash and a Node argv
   // reporter. This invokes neither the consumer nor any Go/core command.
   const invocation = /^        run: (.+)$/m.exec(packageFetchStep(files.package))[1];

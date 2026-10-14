@@ -421,7 +421,9 @@ fn runtime_config(
         assert_eq!(value["dns"]["rules"][0]["action"], "reject");
     }
     // 失败时完整打印双核 stderr，保留入站选择与路由路径证据；成功时日志留在临时目录。
-    value["log"] = json!({"level":"debug", "timestamp":false});
+    // Fixture-only trace exposes existing stack send/resend error messages.
+    // Probe observations below add monotonic windows without packet/key dumps.
+    value["log"] = json!({"level":"trace", "timestamp":false});
     value["inbounds"] = Value::Array(
         probes
             .iter()
@@ -506,33 +508,7 @@ fn run(core: &Path, config: &Path, temp: &TempDir) -> Running {
     Running { child, log }
 }
 fn tcp_probe(port: u16) -> Result<(), String> {
-    let started = Instant::now();
-    let result = (|| {
-        let mut stream = TcpStream::connect_timeout(&local(port), Duration::from_millis(600))
-            .map_err(|error| format!("connect: {error}"))?;
-        let timeout_error = stream
-            .set_read_timeout(Some(Duration::from_millis(600)))
-            .err();
-        stream
-            .write_all(&[0x59])
-            .map_err(|error| format!("write: {error}"))?;
-        let mut echoed = [0u8; 1];
-        stream
-            .read_exact(&mut echoed)
-            .map_err(|error| format!("read: {error}; set_read_timeout_error={timeout_error:?}"))?;
-        if echoed == [0x59] {
-            Ok(())
-        } else {
-            Err(format!("echo mismatch: {echoed:?}"))
-        }
-    })();
-    result.map_err(|error| {
-        format!(
-            "relay={} elapsed={:?} {error}",
-            local(port),
-            started.elapsed()
-        )
-    })
+    diagnostics::probe_stages(port, Instant::now()).0
 }
 fn tcp(port: u16) -> bool {
     tcp_probe(port).is_ok()
@@ -711,8 +687,18 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         drop(a_lease);
         let mut a_core = run(core, &a_path, &a_temp);
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
-        let (forward_tcp, listener_observations) =
-            diagnostics::observe_forward_tcp(a_out_tcp, &listeners, &policy_baseline);
+        let (forward_tcp, listener_observations) = diagnostics::observe_forward_tcp_with_logs(
+            a_out_tcp,
+            &listeners,
+            &policy_baseline,
+            &[("a", &a_core.log), ("b", &b_core.log)],
+        );
+        // Retain the same bounded metadata for successful cases, so a later
+        // failure can be compared with actual observations, not regenerated data.
+        eprintln!(
+            "WG_FORWARD_OBSERVATION={}",
+            json!({"family":family,"policy":label,"observation":listener_observations})
+        );
         if let Err(error) = &forward_tcp {
             failure::capture(
                 failure::Context {
