@@ -275,6 +275,64 @@ class AppleHandoffControls(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'source bytes/modes changed'):
                 handoff.verify_replacements(snapshots, receipt, component)
 
+    def test_versioned_framework_links_restore_after_dependencies_with_original_bytes_and_modes(self):
+        import os
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); root = base / 'owned'; checkout = base / 'checkout'
+            root.mkdir(mode=0o700); checkout.mkdir()
+            framework = root / 'Libbox.framework'
+            version = framework / 'Versions/A'
+            (version / 'Headers').mkdir(parents=True)
+            (version / 'Resources/empty').mkdir(parents=True)
+            (version / 'Modules').mkdir()
+            (version / 'Libbox').write_bytes(b'original structural archive bytes')
+            (version / 'Headers/Libbox.h').write_bytes(b'original header bytes')
+            (version / 'Resources/Info.plist').write_bytes(b'original resources bytes')
+            (version / 'Modules/module.modulemap').write_bytes(b'original module bytes')
+            (framework / 'Versions/Current').symlink_to('A')
+            for name in ('Headers', 'Libbox', 'Modules', 'Resources'):
+                (framework / name).symlink_to('Versions/Current/' + name)
+            if hasattr(os, 'lchmod'):
+                os.lchmod(framework / 'Versions/Current', 0o701)
+            (root / 'alias').symlink_to('Libbox.framework/Libbox')
+            rows = {'root': handoff.selected_inventory(set(root.rglob('*')), root), 'checkout': {}}
+            names = list(rows['root'])
+            self.assertLess(names.index('Libbox.framework/Headers'), names.index('Libbox.framework/Versions/Current'))
+            payload = base / 'versioned.zip'
+            with zipfile.ZipFile(payload, 'w') as package:
+                handoff.write_payload(package, rows, root, checkout)
+            root.rename(base / 'original'); root.mkdir(mode=0o700)
+            with zipfile.ZipFile(payload) as package:
+                handoff.restore_payload(package, rows, root, checkout)
+            self.assertEqual(handoff.selected_inventory(set(root.rglob('*')), root), rows['root'])
+            self.assertEqual((framework / 'Libbox').read_bytes(), b'original structural archive bytes')
+            self.assertEqual((framework / 'Headers/Libbox.h').read_bytes(), b'original header bytes')
+            self.assertEqual(os.readlink(framework / 'Versions/Current'), 'A')
+            self.assertEqual(os.readlink(framework / 'Headers'), 'Versions/Current/Headers')
+            self.assertEqual((root / 'alias').read_bytes(), b'original structural archive bytes')
+
+    def test_link_dependency_missing_cycle_and_escape_fail_without_installing_invalid_links(self):
+        import stat
+        import zipfile
+        for links, reason in (({'first': 'second', 'second': 'first'}, 'dependency'),
+                ({'first': 'missing'}, 'dependency'), ({'first': '../outside'}, 'escaped'),
+                ({'first': 'second', 'second': '../outside'}, 'escaped')):
+            with self.subTest(links=links), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); root = base / 'owned'; checkout = base / 'checkout'
+                root.mkdir(mode=0o700); checkout.mkdir(); (base / 'outside').write_bytes(b'outside')
+                rows = {'root': {name: {'link': target, 'mode': 0o777} for name, target in links.items()},
+                        'checkout': {}}
+                payload = base / 'invalid.zip'
+                with zipfile.ZipFile(payload, 'w') as package:
+                    for name, target in links.items():
+                        info = zipfile.ZipInfo('root/' + name); info.create_system = 3
+                        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                        package.writestr(info, target.encode())
+                with zipfile.ZipFile(payload) as package, self.assertRaisesRegex(RuntimeError, reason):
+                    handoff.restore_payload(package, rows, root, checkout)
+                self.assertFalse(any((root / name).is_symlink() for name in links))
+
     def test_exact_three_slot_aggregate_rejects_missing_wrong_target_and_other_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp); (folder / 'component').mkdir()

@@ -9,6 +9,13 @@ use polaris_helper_proto::core_manifest::{CoreId, InstalledCoreManifest};
 
 static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod lock_diagnostics;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+type MutationLock = lock_diagnostics::MutationLock;
+#[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
+type MutationLock = File;
+
 #[derive(Clone, Copy)]
 enum LockRole {
     StoreMutationExclusive,
@@ -67,6 +74,8 @@ struct LockFailure {
     role: LockRole,
     observation: LockObservation,
     cause: TryLockError,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    holder_snapshot: Option<lock_diagnostics::Snapshot>,
 }
 impl std::fmt::Display for LockFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,9 +83,21 @@ impl std::fmt::Display for LockFailure {
             TryLockError::WouldBlock => ("would-block", io::ErrorKind::WouldBlock, None),
             TryLockError::Error(error) => ("io-error", error.kind(), error.raw_os_error()),
         };
-        write!(f, "core-store-lock role={} class={} kind={kind:?} os_code={os_code:?} fd={:?} dev={:?} inode={:?} cloexec={:?}",
-            self.role.name(), class, self.observation.fd, self.observation.dev,
-            self.observation.inode, self.observation.cloexec)
+        write!(
+            f,
+            "core-store-lock role={} class={} kind={kind:?} os_code={os_code:?} fd={:?} dev={:?} inode={:?} cloexec={:?}",
+            self.role.name(),
+            class,
+            self.observation.fd,
+            self.observation.dev,
+            self.observation.inode,
+            self.observation.cloexec
+        )?;
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        if let Some(snapshot) = &self.holder_snapshot {
+            write!(f, " holder-snapshot={snapshot}")?;
+        }
+        Ok(())
     }
 }
 impl std::fmt::Debug for LockFailure {
@@ -97,12 +118,22 @@ fn lock_error(role: LockRole, observation: LockObservation, cause: TryLockError)
         TryLockError::WouldBlock => io::ErrorKind::WouldBlock,
         TryLockError::Error(error) => error.kind(),
     };
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    let holder_snapshot = if matches!(role, LockRole::StoreMutationExclusive)
+        && matches!(&cause, TryLockError::WouldBlock)
+    {
+        Some(lock_diagnostics::snapshot(&observation))
+    } else {
+        None
+    };
     io::Error::new(
         kind,
         LockFailure {
             role,
             observation,
             cause,
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            holder_snapshot,
         },
     )
 }
@@ -363,7 +394,7 @@ impl CoreStore {
         let (file, _) = objects.open_regular(&format!("{}.lock", id.as_str()))?;
         Ok(file)
     }
-    fn mutation_lock(&self) -> io::Result<File> {
+    fn mutation_lock(&self) -> io::Result<MutationLock> {
         let path = self.root.join(".core-store.lock");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -389,6 +420,8 @@ impl CoreStore {
         crate::platform::windows::winproc::seal_store_object(&path, false)?;
         self.owner.check(&path)?;
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let file = lock_diagnostics::MutationLock::new(file);
         Ok(file)
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {

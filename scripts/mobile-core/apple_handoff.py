@@ -197,6 +197,7 @@ def restore_payload(archive, inventories, root, checkout):
                 dest.mkdir(mode=0o700)
                 dest.chmod(0o700)  # Explicitly defeat any caller umask.
                 directories.append((dest, row['mode']))
+    pending_links = []
     for links in (False, True):
         for namespace, rows in inventories.items():
             base = root if namespace == 'root' else checkout
@@ -216,15 +217,34 @@ def restore_payload(archive, inventories, root, checkout):
                 if links:
                     require(info.file_size <= 4096, 'handoff symlink target budget')
                     target = archive.read(info).decode()
-                    require(target == row['link'] and not Path(target).is_absolute() and
-                            (dest.parent / target).resolve(strict=True).is_relative_to(base.resolve()),
+                    require(target == row['link'] and not Path(target).is_absolute(),
                             'handoff symlink escaped bound root')
-                    dest.symlink_to(target)
+                    pending_links.append((dest, target, base, row['mode']))
                 else:
                     require(info.file_size == row['bytes'], 'handoff member length differs')
                     with archive.open(info) as source, dest.open('xb') as output:
                         shutil.copyfileobj(source, output, 1024 ** 2)
                     dest.chmod(row['mode'])
+    # Versioned frameworks contain Headers -> Versions/Current/Headers before
+    # Versions/Current -> A in the sorted inventory. Restore only links whose
+    # targets already exist; each pass must remove at least one dependency.
+    # No link is installed before strict containment succeeds. Missing targets
+    # and dependency cycles fail closed rather than becoming dangling links.
+    while pending_links:
+        unresolved = []
+        for dest, target, base, mode in pending_links:
+            try:
+                resolved = (dest.parent / target).resolve(strict=True)
+            except FileNotFoundError:
+                unresolved.append((dest, target, base, mode))
+                continue
+            require(resolved.is_relative_to(base.resolve(strict=True)),
+                    'handoff symlink escaped bound root')
+            dest.symlink_to(target)
+            if stat.S_IMODE(dest.lstat().st_mode) != mode:
+                dest.lchmod(mode)  # The link itself, never its framework target.
+        require(len(unresolved) < len(pending_links), 'handoff symlink dependency missing or cyclic')
+        pending_links = unresolved
     for path, mode in reversed(directories):
         path.chmod(mode)
     for namespace, rows in inventories.items():
