@@ -48,6 +48,9 @@ name: Android
 on:
   workflow_call:
     inputs:
+      preserve_run:
+        type: boolean
+        default: false
       # 风险门专用的轻量构建开关（2026-10-08）。true ⇒ 验证腿的 Rust 侧不做 fat LTO、并行 codegen，
       # 产物**不是可分发物**（APK 本来就不上传，也不进 release）。只有 release-risk.yml 传 true；
       # package.yml 的 tag 发布段只传 publish_release，手动 dispatch 没有任何输入 ⇒ 恒为 false。
@@ -92,6 +95,10 @@ on:
   # 手动入口只跑非发布 release-profile 验证。发布参数只声明在 workflow_call，故只有 Package DAG
   # 能传 publish_release=true；避免直接 Android dispatch 与 Package 对同一 tag 草稿并发 --clobber。
   workflow_dispatch:
+    inputs:
+      preserve_run:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -107,9 +114,11 @@ env:
   POLARIS_PUBLISH_RELEASE: ${{ inputs.publish_release && '1' || '0' }}
 
 # 判据与 ci.yml / ui.yml 一致：调用方名称进并发组，Android 与 Release Risk 内的复用互不取消。
+# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: android-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  group: android-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
 
@@ -228,8 +237,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
+          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies
@@ -733,8 +742,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
+          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
 
       # tauri 的 `beforeBuildCommand` 是 `pnpm --dir ../ui build`，依赖必须先就位。
       - name: Install UI dependencies

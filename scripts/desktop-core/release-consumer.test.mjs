@@ -981,11 +981,19 @@ test('handoff rejects old attempts, source, artifact aliases, native mode and ta
 test('actual tar transport preserves executable modes despite artifact outer-file mode reset', async () => withFixture(async (f) => {
   const h = await handoffFixture(f), packed = join(f.root, 'wire-archive');
   const pin = packCoreWireHandoff(h.bundle, packed); assert(pin.archive.bytes > 0);
+  assert.equal(pin.archive.memberModes['core-wire-inputs/resources/linux/sing-box'], 0o755);
+  assert.equal(pin.archive.memberModes['core-wire-inputs/handoff.json'], 0o600);
   for (const n of readdirSync(packed)) fs.chmodSync(join(packed, n), 0o644);
   const payload = unpackCoreWireHandoff(packed, join(f.root, 'wire-extracted'));
   assert.equal(fs.statSync(join(payload, 'resources/linux/sing-box')).mode & 0o777, 0o755);
   importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
   assert.deepEqual(resources(f), h.before);
+  const metadata = join(packed, 'archive.json'), frozenMetadata = readFileSync(metadata);
+  const changedMode = structuredClone(pin); changedMode.archive.memberModes['core-wire-inputs/resources/linux/sing-box'] = 0o644;
+  write(metadata, encode(changedMode));
+  const badMode = join(f.root, 'wire-mode-extracted');
+  assert.throws(() => unpackCoreWireHandoff(packed, badMode)); assert.equal(existsSync(badMode), false);
+  write(metadata, frozenMetadata);
   const tar = join(packed, pin.archive.name), original = readFileSync(tar);
   const changed = Buffer.from(original); changed[Math.floor(changed.length / 2)] ^= 1; write(tar, changed);
   const rejected = join(f.root, 'wire-corrupt-extracted');

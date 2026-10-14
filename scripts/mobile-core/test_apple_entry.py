@@ -295,6 +295,7 @@ class AppleEntryTests(unittest.TestCase):
                         mock.patch.dict(ci_apple.os.environ, {'POLARIS_APP_CANDIDATE': candidate}), \
                         mock.patch.object(ci_apple, 'Path', return_value=selected_path) as path, \
                         mock.patch.object(ci_apple, 'run', side_effect=lambda args, **_: answers[tuple(args)]) as run, \
+                        mock.patch('apple_admission.preflight', return_value={}) as admission, \
                         mock.patch.object(ci_apple, 'private_dir', side_effect=RuntimeError(admitted)) as tools, \
                         self.assertRaisesRegex(RuntimeError, '^' + reason + '$'):
                     ci_apple.prepare()
@@ -303,6 +304,7 @@ class AppleEntryTests(unittest.TestCase):
                 for call in run.call_args_list[1:]:
                     self.assertEqual(call.kwargs['env']['DEVELOPER_DIR'], str(developer))
                 self.assertEqual(tools.call_count, int(reason == admitted))
+                self.assertEqual(admission.call_count, int(reason == admitted))
 
     def test_actual_rust_link_verifier_refuses_changed_archive_and_drops_xcode_fd(self):
         from artifacts import file_pin

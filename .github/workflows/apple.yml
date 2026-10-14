@@ -1,14 +1,21 @@
 name: Apple unsigned App and PacketTunnel
 
-# Called once by the complete candidate Risk graph. No push trigger, release,
-# signing identity, simulator boot or device deployment.
+# One component producer, then independent physical carrier trees. This is the
+# complete candidate graph; no signing, simulator boot or device deployment.
 on:
   workflow_call:
     inputs:
       candidate:
         type: string
         required: true
+      preserve_run:
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      preserve_run:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,11 +25,11 @@ env:
   POLARIS_APP_CANDIDATE: ${{ inputs.candidate || github.sha }}
 
 concurrency:
-  group: apple-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: apple-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && github.run_id || 'tip' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && github.event_name != 'merge_group' && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
-  unsigned-chain:
+  component:
     runs-on: xcode-27
     timeout-minutes: 180
     steps:
@@ -39,27 +46,141 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-      - name: Exact Apple tool/source admission
+      - name: Exact tool/source and three-slot resolved configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
-      - name: Pinned protobuf compiler
-        run: node scripts/fetch-protoc.mjs
-      - name: Scoped frontend tool and locked dependencies
+      - name: Scoped frontend tool
         shell: bash
         run: |
           set -euo pipefail
           npm install --prefix "$RUNNER_TEMP/polaris-pnpm" --no-audit --no-fund pnpm@11.24.0
           export PATH="$RUNNER_TEMP/polaris-pnpm/node_modules/.bin:$PATH"
           echo "$RUNNER_TEMP/polaris-pnpm/node_modules/.bin" >> "$GITHUB_PATH"
-          pnpm --dir ui install --frozen-lockfile
-      - name: Three-slice SDK and three real unsigned App carriers
+          echo "PNPM_STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v5
+        with:
+          path: ${{ env.PNPM_STORE_PATH }}
+          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
+      - name: Locked frontend dependencies
+        run: pnpm --dir ui install --frozen-lockfile
+      - name: Frontend resources and three-slice component produced once
         run: python3 -B scripts/mobile-core/ci_apple.py build
-      - name: Preserve original selected bytes on success or failure
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apple-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-handoff.zip
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-transport.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apple-component-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-handoff.json
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/component-transport.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve producer originals on success or failure
         if: always()
         run: python3 -B scripts/mobile-core/ci_apple.py evidence
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: apple-original-${{ inputs.candidate || github.sha }}
-          path: ~/Code/polaris-mobile-apple-ci/apple-original-evidence.zip
+          name: apple-component-original-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-original-evidence.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  carrier:
+    needs: component
+    runs-on: xcode-27
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [device-arm64, sim-arm64, sim-amd64]
+    env:
+      POLARIS_APPLE_CARRIER_SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.5'
+          cache: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: actions/download-artifact@v8
+        with:
+          name: apple-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-component-input
+      - name: Import exact original bytes under the identical canonical host layout
+        run: python3 -B scripts/mobile-core/ci_apple.py import --handoff "$RUNNER_TEMP/apple-component-input"
+      - name: Pinned protobuf compiler
+        run: node scripts/fetch-protoc.mjs
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apple-${{ matrix.slot }}-xcode27.1
+          workspaces: . -> ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/cache/rust-target
+      - name: Real target Rust and unsigned App plus PacketTunnel carrier
+        run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "${{ matrix.slot }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apple-carrier-summary-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/carrier-${{ matrix.slot }}.json
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/summary-app-carrier.json
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/summary-rust-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve slot originals on success or failure
+        if: always()
+        run: python3 -B scripts/mobile-core/ci_apple.py evidence
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-carrier-original-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-original-evidence.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  unsigned-chain:
+    needs: [component, carrier]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: apple-component-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-chain/component
+      - uses: actions/download-artifact@v8
+        with:
+          name: apple-carrier-summary-device-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-chain/device-arm64
+      - uses: actions/download-artifact@v8
+        with:
+          name: apple-carrier-summary-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-chain/sim-arm64
+      - uses: actions/download-artifact@v8
+        with:
+          name: apple-carrier-summary-sim-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-chain/sim-amd64
+      - name: Strict complete-slot same-run candidate/source/component aggregate
+        run: python3 -B scripts/mobile-core/ci_apple.py aggregate --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-chain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/apple-chain.json
           if-no-files-found: error
           retention-days: 7

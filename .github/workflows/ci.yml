@@ -83,17 +83,21 @@ on:
           - macos-14
   # 供 package.yml 复用作发布前置门（与打包并行跑，门不绿则 release job 不起），零重复定义。
   workflow_call:
+    inputs:
+      preserve_run:
+        type: boolean
+        default: false
 
 # 同一 ref 上新跑取消在途旧跑。
 # 2026-07-31 把 main push 也纳入取消：连着推几笔时，被顶掉的旧 tip 没有消费者，照跑只会计费。
 # `workflow_call` 里的 `github.workflow` 取**调用方**名称（GitHub 官方语义），故把它纳入组：
 # 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
 # tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
+# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  # Fixed audit dispatches have a unique group; a later ordinary dispatch cannot
-  # cancel them. Reusable publishing callers and tag refs retain their groups.
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.preserve_run && format('-fixed-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name != 'workflow_dispatch') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && inputs.preserve_run != true) }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══

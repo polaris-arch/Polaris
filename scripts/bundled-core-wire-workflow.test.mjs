@@ -41,10 +41,14 @@ function step(yaml, name) {
 function assertWireStep(yaml, { kernelOnly }) {
   const { body } = step(yaml, wireStep);
   assert.match(body, /^        env:\n          POLARIS_REQUIRE_KERNEL_GATE: '1'$/m);
-  assert.ok(body.includes(`        run: ${command}\n`), 'must run only the exact descriptor test');
+  if (kernelOnly) {
+    assert.match(body, /run: node scripts\/desktop-core\/wire-input-handoff\.mjs wire --bundle-dir=.* --candidate=/);
+    const source = readFileSync(join(root, 'scripts/desktop-core/wire-input-handoff.mjs'), 'utf8');
+    assert.match(source, /const WIRE_ARGS = \['test', '-p', 'polaris-singbox-grpc', '--test', 'bundled_core_wire',\n  'vendored_proto_matches_every_bundled_core', '--', '--exact'\]/);
+  } else assert.ok(body.includes(`        run: ${command}\n`), 'standalone must run only the exact descriptor test');
   assert.equal(body.includes('POLARIS_NO_KERNEL_RUN'), false, 'the static wire gate does not inherit the local no-kernel-run mode');
   if (kernelOnly) assert.match(body, /^        if: needs\.classify\.outputs\.kernel == 'true'$/m);
-  else assert.doesNotMatch(body, /^        if:/m, 'direct Package dispatch must not skip the wire gate');
+  else assert.match(body, /^        if: steps\.wire-import\.outputs\.wire_verified != 'true'$/m, 'only strict input/result import may reuse the check');
 }
 
 function assertAllFourSourceConsumption(fetch) {
@@ -154,7 +158,7 @@ test('ordinary preflight passes fresh same-attempt bytes while Package keeps its
   assert.doesNotMatch(executable(wire), /continue-on-error|\|\| true/);
 });
 
-test('ordinary POSIX installers reuse checked same-attempt bytes, with independent default and Windows acquisition', () => {
+test('all ordinary installers reuse checked current-attempt transport IDs and bytes, with independent default', () => {
   const pkg = readFileSync(join(root, '.github/workflows/package.yml'), 'utf8');
   const installer = executable(job(pkg, 'package'));
   const selection = installer.match(/^      CORE_WIRE_INPUT_ARTIFACT: \$\{\{ (.+) \}\}$/m);
@@ -162,11 +166,13 @@ test('ordinary POSIX installers reuse checked same-attempt bytes, with independe
   const selected = (label, artifact) => runInNewContext(selection[1], {
     matrix: { label }, inputs: { core_wire_input_artifact: artifact },
   });
-  for (const label of ['linux', 'macos-arm64', 'macos-x64']) {
+  for (const label of ['linux', 'windows', 'macos-arm64', 'macos-x64']) {
     assert.equal(selected(label, 'current-attempt-artifact'), 'current-attempt-artifact');
     assert.equal(selected(label, ''), '');
   }
-  assert.equal(selected('windows', 'current-attempt-artifact'), '');
+  assert.equal(selected('windows', 'current-attempt-artifact'), 'current-attempt-artifact');
+  assert.match(step(installer, 'Download current-attempt preflight installer inputs').body, /wire-input-handoff\.mjs download/);
+  assert.match(installer, /CORE_WIRE_INPUT_ARTIFACT_DIGEST: \$\{\{ inputs\.core_wire_input_artifact_digest \}\}/);
   const checked = step(installer, 'Require current-attempt installer input identity');
   const downloaded = step(installer, 'Download current-attempt preflight installer inputs');
   const imported = step(installer, 'Verify and import current-attempt preflight installer inputs');
@@ -179,8 +185,8 @@ test('ordinary POSIX installers reuse checked same-attempt bytes, with independe
     assert.match(value.body, /if: env\.CORE_WIRE_INPUT_ARTIFACT != ''/);
     assert.doesNotMatch(value.body, /run-id:|repository:|github-token:|continue-on-error|\|\| true/);
   }
-  // Reuse replaces acquisition only. The separate wire contract and all later
-  // installer/final-payload gates continue to run on the imported actual bytes.
+  // Installer-specific/final checks remain; the host-independent wire result
+  // is only reused after full current-attempt source/tool/input verification.
   assertWireStep(job(pkg, 'core_wire'), { kernelOnly: false });
 });
 

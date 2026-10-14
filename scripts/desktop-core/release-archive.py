@@ -47,6 +47,10 @@ def extract(path, destination, record, root, target=None):
         content = read(size + 1)
         require(len(content) == size and hashlib.sha256(content).hexdigest() == expected[name],
                 'member bytes differ')
+        if 'memberModes' in record:
+            require(set(record['memberModes']) == set(expected)
+                    and record['memberModes'][name] == mode & 0o777,
+                    'member permissions differ')
         members[name] = (content, mode & 0o777)
 
     if path.endswith('.zip'):
@@ -110,6 +114,39 @@ def extract(path, destination, record, root, target=None):
         target.chmod(mode)
 
 
+def extract_wire_transport(path, destination, record):
+    """Current-run Actions outer ZIP: pin whole bytes, then two flat members."""
+    source, destination = Path(path), Path(destination)
+    require(0 < record['bytes'] <= 512 * 1024 * 1024
+            and source.stat().st_size == record['bytes'], 'wire ZIP bytes differ')
+    data = source.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == record['sha256'], 'wire ZIP SHA differs')
+    names = {'archive.json', 'core-wire-inputs.tar.gz'}
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        infos = archive.infolist()
+        require(len(infos) == 2 and {i.filename for i in infos} == names, 'wire ZIP inventory differs')
+        contents = {}
+        for info in infos:
+            mode = info.external_attr >> 16
+            require(info.orig_filename == info.filename and not info.flag_bits & 1
+                    and stat.S_IFMT(mode) in [0, stat.S_IFREG]
+                    and 0 < info.file_size <= 512 * 1024 * 1024, 'unsafe wire ZIP member')
+            contents[info.filename] = archive.read(info)  # full CRC before any write
+        require(sum(map(len, contents.values())) <= 512 * 1024 * 1024, 'wire ZIP expanded limit')
+    require(not destination.exists(), 'wire ZIP destination already exists')
+    for parent in destination.absolute().parents:
+        require(parent.is_dir() and not parent.is_symlink()
+                and not getattr(parent, 'is_junction', lambda: False)(), 'linked wire ZIP ancestor')
+    destination.mkdir(mode=0o700)
+    for name, content in contents.items():
+        with (destination / name).open('xb') as stream:
+            stream.write(content)
+        (destination / name).chmod(0o600)
+
+
 if __name__ == '__main__':
     request = json.load(sys.stdin)
-    extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], request.get('target'))
+    if 'wireTransport' in request:
+        extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])
+    else:
+        extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], request.get('target'))

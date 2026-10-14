@@ -48,6 +48,7 @@ required_tests=(
   scripts/release-assets.test.mjs
   scripts/mobile-source-unit.test.mjs
   scripts/apple-ci-impact.test.mjs
+  scripts/ci-workflow-efficiency.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -139,7 +140,9 @@ fi
 #           其后的项一项不删、退出码按「未通过校验」报告。
 #   295 → 303（main PKG-01 集成）保留 B2a 全部合同并加 8 条发布命名/ABI/摘要清单合同。
 # 303 → 307: finite Apple selection/runner/actual aggregate negative controls.
-if [ "$pass" -lt 307 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 307）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+# 307 → 489: retained actual 77b Linux classification 480 passes plus nine
+# mandatory workflow-efficiency controls; authored controls are not yet run.
+if [ "$pass" -lt 489 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 489）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

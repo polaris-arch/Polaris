@@ -8,6 +8,9 @@ name: Desktop Core Sources
 on:
   workflow_call:
     inputs:
+      preserve_run:
+        type: boolean
+        default: false
       candidate:
         type: string
         required: true

@@ -2,7 +2,7 @@ name: Package
 
 # B10 发布工程：三平台打包流水线（出安装包）。职责 = 「能否产出可分发的安装包」。
 # 与 ci.yml（fmt+clippy+build+test 快速门禁）分工：本 workflow 跑完整 fetch + tauri build + 产物上传，
-# 只在发布/手动时触发（tag / release / dispatch），产物体积大故不进常规 push/PR 门禁。
+# 只在发布/手动时触发（tag / dispatch / workflow_call），产物体积大故不进常规 push/PR 门禁。
 #
 # 设计文档：
 #   - §H B10：NSIS + mac DMG（无发行身份签名）+ deb/AppImage + portable + README/LICENSE/NOTICE 谱系
@@ -41,6 +41,10 @@ on:
   # 单平台用于定位平台故障，发布仍必须 all。
   workflow_dispatch:
     inputs:
+      preserve_run:
+        description: 固定源码审计不被后续 tip 取消
+        type: boolean
+        default: false
       platform:
         description: '打包平台（单平台用于迭代验证；只有 all 才会发 release）'
         type: choice
@@ -56,6 +60,9 @@ on:
   # 2026-10-07 起自动门另传 `light_build: true`：打包腿用轻量构型（见下方该输入的注释）。
   workflow_call:
     inputs:
+      preserve_run:
+        type: boolean
+        default: false
       platform:
         type: string
         required: false
@@ -96,6 +103,14 @@ on:
         type: string
         required: false
         default: ''
+      core_wire_input_artifact_id:
+        type: string
+        required: false
+        default: ''
+      core_wire_input_artifact_digest:
+        type: string
+        required: false
+        default: ''
       # 风险门专用的轻量构建开关（2026-10-07）。true ⇒ 打包腿不做 fat LTO、并行 codegen，
       # 产物**不是可分发物**（不上传、不进 release）。只有 release-risk.yml 传 true；
       # tag push 与本 workflow 的手动 dispatch 都没有这个输入 ⇒ 恒为 false ⇒ 发行构型一字不动。
@@ -109,6 +124,7 @@ on:
 # release 写权限只发给发布 DAG 的三个写入 job（job 级 permissions 覆盖本块）。
 permissions:
   contents: read
+  actions: read # current-run handoff API metadata, never artifact mutation
 
 # 打包耗时且产物大：tag/release 不取消在途（保 release 产物完整性）；
 # workflow_dispatch / workflow_call 落在非 tag ref 上，同平台重复触发取消旧跑（减少等待与重复下载）。
@@ -118,9 +134,11 @@ permissions:
 #   「同 ref、不同平台」变成两件**不同**的事：先跑 macos-arm64，再跑 macos-x64 时不能互相取消。
 #   拆进 group 后两者各占一组；同平台的新提交仍取消旧跑，避免旧 tip 占住 runner。
 # `inputs.platform` 同时覆盖 workflow_dispatch 与 workflow_call；tag push 没有输入时兜到 all。
+# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: package-${{ github.ref }}-${{ inputs.platforms || inputs.platform || github.event.inputs.platform || 'all' }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: package-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ inputs.platforms || inputs.platform || 'all' }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
   # ══ 矩阵解析：把 workflow_dispatch 的 platform 输入翻成 package job 的 include ══
@@ -305,6 +323,8 @@ jobs:
       needs.setup.outputs.full == 'true'
       && inputs.skip_quality_gates != true
     uses: ./.github/workflows/ci.yml
+    with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
     secrets: inherit
 
   # 前端门同样是发布前置：打包腿只跑 `tauri build`（= tsc + vite build），**不跑 vitest**，
@@ -316,6 +336,8 @@ jobs:
       needs.setup.outputs.full == 'true'
       && inputs.skip_quality_gates != true
     uses: ./.github/workflows/ui.yml
+    with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
     secrets: inherit
 
   # Risk supplies the verified same-run bundle; standalone Package produces it
@@ -329,6 +351,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/desktop-core.yml
     with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.setup.outputs.candidate }}
 
   package:
@@ -372,10 +395,13 @@ jobs:
       POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
       # Ordinary Risk already acquired/read back these exact four inputs in
-      # this run/attempt. POSIX installers can import the same checked bytes.
-      # Windows retains its original acquisition until file-mode transport is
-      # explicitly supported; standalone Package/tag have no handoff input.
-      CORE_WIRE_INPUT_ARTIFACT: ${{ matrix.label != 'windows' && inputs.core_wire_input_artifact || '' }}
+      # this run/attempt. All installers import pinned tar members; Windows
+      # keeps declared POSIX modes in the transport proof and validates native
+      # filesystem projection separately. Standalone Package/tag acquire afresh.
+      CORE_WIRE_INPUT_ARTIFACT: ${{ inputs.core_wire_input_artifact }}
+      CORE_WIRE_INPUT_ARTIFACT_ID: ${{ inputs.core_wire_input_artifact_id }}
+      CORE_WIRE_INPUT_ARTIFACT_DIGEST: ${{ inputs.core_wire_input_artifact_digest }}
+      GH_TOKEN: ${{ github.token }}
       # macos-arm64 与 macos-x64 同跑在 arm64 runner；真核门据此选择目标核并为 x64 经 Rosetta 执行。
       POLARIS_KERNEL_GATE_TARGET: ${{ matrix.label }}
       # 直接 tag / Package dispatch 保持原行为；release-risk 手动 dispatch 复用本 workflow 时
@@ -442,6 +468,7 @@ jobs:
       #
       # 与 ui.yml 及 ui/package.json 精确同版；Node 已先落位，满足 pnpm 11 的运行时基线。
       - name: Setup pnpm (pinned)
+        id: pnpm
         shell: bash
         env:
           PNPM_VERSION: '11.24.0'
@@ -451,6 +478,18 @@ jobs:
           got="$(pnpm --version)"
           [ "$got" = "$PNPM_VERSION" ] || {
             echo "::error::pnpm is '$got', expected '$PNPM_VERSION'"; exit 1; }
+
+      - name: Resolve pnpm store
+        shell: bash
+        run: echo "store_path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+        id: pnpm-store
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm-store.outputs.store_path }}
+          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
 
       - name: Install UI dependencies
         run: pnpm --dir ui install --frozen-lockfile
@@ -730,10 +769,10 @@ jobs:
 
       - name: Download current-attempt preflight installer inputs
         if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.CORE_WIRE_INPUT_ARTIFACT }}
-          path: ${{ runner.temp }}/installer-core-inputs
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/installer-core-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs download --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
 
       - name: Verify and import current-attempt preflight installer inputs
         if: env.CORE_WIRE_INPUT_ARTIFACT != ''
@@ -1609,6 +1648,9 @@ jobs:
       POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
       CORE_BUNDLE_ARTIFACT: ${{ inputs.core_bundle_artifact || needs.desktop_core.outputs.artifact_name }}
       CORE_WIRE_INPUT_ARTIFACT: ${{ inputs.core_wire_input_artifact }}
+      CORE_WIRE_INPUT_ARTIFACT_ID: ${{ inputs.core_wire_input_artifact_id }}
+      CORE_WIRE_INPUT_ARTIFACT_DIGEST: ${{ inputs.core_wire_input_artifact_digest }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Set absolute release-consumer job deadline
         shell: bash
@@ -1688,12 +1730,13 @@ jobs:
 
       - name: Download current-attempt preflight wire inputs
         if: env.CORE_WIRE_INPUT_ARTIFACT != ''
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.CORE_WIRE_INPUT_ARTIFACT }}
-          path: ${{ runner.temp }}/core-wire-inputs
+        shell: bash
+        env:
+          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
+        run: node scripts/desktop-core/wire-input-handoff.mjs download --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --artifact-name="$CORE_WIRE_INPUT_ARTIFACT"
 
       - name: Verify and import current-attempt preflight wire inputs
+        id: wire-import
         if: env.CORE_WIRE_INPUT_ARTIFACT != ''
         shell: bash
         env:
@@ -1703,6 +1746,7 @@ jobs:
       # 四平台 wire descriptor 只读对拍；不启动 sing-box，也不受可选真核运行门控制。
       # REQUIRE 仅限本步，缺任一 manifest 平台时不能以本机允许的 skip 冒充验证通过。
       - name: Bundled core gRPC wire contract (all platforms)
+        if: steps.wire-import.outputs.wire_verified != 'true'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
         run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
@@ -2101,6 +2145,7 @@ jobs:
       contents: write
     uses: ./.github/workflows/android.yml
     with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       publish_release: true
       release_tag: ${{ needs.release_desktop.outputs.release_tag }}
     secrets: inherit

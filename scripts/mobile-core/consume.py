@@ -235,7 +235,8 @@ def app_identity(*, status_log=None):
                  'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
                  'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',
                  'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
-             'scripts/mobile-core/build_apple_app.py']}}
+             'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/apple_handoff.py',
+                 'scripts/mobile-core/apple_admission.py']}}
 
 
 def materialize_android(component, receipt_path, tools, work, cache):

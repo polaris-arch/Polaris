@@ -31,10 +31,16 @@ test('selected Apple failure/skip is consumed by the existing aggregate gate', (
   assert.match(risk, /node scripts\/apple-ci-impact\.mjs --full/);
 });
 
-test('Apple workflow uses one exact source three-carrier build and preserves failed evidence', () => {
+test('Apple workflow hands one component to three isolated carriers and preserves failed evidence', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
   assert.match(workflow, /runs-on: xcode-27/);
-  for (const action of ['prepare', 'build', 'evidence']) assert.match(workflow, new RegExp(`ci_apple.py ${action}`));
+  for (const action of ['prepare', 'build', 'import', 'carrier', 'aggregate', 'evidence']) {
+    assert.match(workflow, new RegExp(`ci_apple.py ${action}`));
+  }
+  assert.match(workflow, /carrier:\n\s+needs: component/);
+  assert.match(workflow, /fail-fast: false/);
+  assert.match(workflow, /slot: \[device-arm64, sim-arm64, sim-amd64\]/);
+  assert.match(workflow, /unsigned-chain:\n\s+needs: \[component, carrier\]\n\s+if: always\(\)/);
   assert.match(workflow, /if: always\(\)/);
   assert.match(workflow, /contents: read/);
   assert.doesNotMatch(workflow, /contents: write|secrets:|publish_release|codesign --sign/);

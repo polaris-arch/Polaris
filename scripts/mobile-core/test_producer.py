@@ -169,7 +169,7 @@ class ProducerCalls(unittest.TestCase):
                                  'Dir': '/original/native/module'}],
                 'tools': {'compiler': {'sha256': 'd'*64}}, 'sourceOverlay': 0}
 
-    def test_android_projection_reuses_only_four_apple_only_changes(self):
+    def test_android_projection_reuses_only_declared_apple_only_changes(self):
         original = self.android_projection_binding()
         frozen = json.dumps(original, sort_keys=True)
         current = json.loads(frozen); current['producer']['candidate'] = 'b'*40

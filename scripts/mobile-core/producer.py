@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -29,39 +30,223 @@ from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, 
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
 ACTIVE_FDS = []
+BORROWED_PROGRESS_FD = None
+BORROWED_PROGRESS_PHASE = None
 
 
-def run(args, *, cwd=None, env=None, log=None):
-    process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               start_new_session=True, pass_fds=tuple(ACTIVE_FDS))
+RUN_SECONDS = 3600
+RUN_TERM_SECONDS = 10
+RUN_HEARTBEAT_SECONDS = 30
+OBSERVATION_PHASES = frozenset((
+    'component-build-or-revalidate', 'component-import-verification', 'component-link-input',
+    'rust-target-build', 'host-swift-controls', 'app-extension-archive',
+    'final-carrier-inspection', 'carrier-command', 'build-settings-admission',
+    'tool-prepare', 'frontend-dashboard', 'frontend-build'))
+OBSERVATION_SLOTS = frozenset(('device-arm64', 'sim-arm64', 'sim-amd64'))
+
+
+def progress_write(fd, prefix, row):
+    """One fixed-schema small event. Callers never pass native text or env."""
+    raw = (prefix + json.dumps(row, sort_keys=True) + '\n').encode('ascii')
+    require(len(raw) <= 4096, 'progress event exceeds fixed bound')
+    view = memoryview(raw)
+    while view:
+        written = os.write(fd, view)
+        require(written > 0, 'incomplete tool progress output')
+        view = view[written:]
+
+
+
+def inspection_progress(stage, elapsed_seconds, file_reads, read_bytes):
+    require(stage in ('verify-original', 'ipa-parse', 'static-linkmap', 'framework-inspection'), 'unknown inspection progress stage')
+    require(isinstance(elapsed_seconds, (int, float)) and 0 <= elapsed_seconds < 86400 and
+            all(value is None or (type(value) is int and value >= 0) for value in (file_reads, read_bytes)),
+            'invalid inspection progress measurement')
+    row = {'schema': 'polaris-apple-inspection-observation-v1', 'stage': stage,
+           'elapsedSeconds': round(elapsed_seconds, 3), 'fileReads': file_reads,
+           'readBytes': read_bytes, 'scope': 'local reads and elapsed only; no acceptance'}
+    if BORROWED_PROGRESS_FD is None:
+        print('APPLE_INSPECTION_PROGRESS=' + json.dumps(row, sort_keys=True), file=sys.stderr, flush=True)
+    else:
+        progress_write(BORROWED_PROGRESS_FD, 'APPLE_INSPECTION_PROGRESS=', row)
+
+
+@contextlib.contextmanager
+def _run_log(log):
+    if log is None:
+        yield None
+        return
+    resource = Path(log).open('ab')
+    sink = resource.__enter__()
     try:
-        register_group(process.pid)
-        stdout, stderr = process.communicate(timeout=3600)
-    except BaseException:
-        # Only this newly created compiler/tool session is stopped. Keep the
-        # producer reservation until its original direct child has been waited.
+        yield sink
+    finally:
+        original = sys.exc_info()
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+            resource.__exit__(*original)
+        except BaseException:
+            if original[0] is None:
+                raise
+
+def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
+        observation_fd=None, observation_phase=None, observation_slot=None):
+    if observation_phase is None and BORROWED_PROGRESS_FD is not None:
+        observation_phase = BORROWED_PROGRESS_PHASE
+    # Only the explicit carrier receives the borrowed progress descriptor.
+    # Native grandchildren inherit reservation descriptors, never progress_fd.
+    require(observation_phase is None or observation_phase in OBSERVATION_PHASES,
+            'unknown tool observation phase')
+    require(observation_slot is None or observation_slot in OBSERVATION_SLOTS,
+            'unknown tool observation slot')
+    extra_fds = () if progress_fd is None else (progress_fd,)
+    event_fd = (observation_fd if observation_fd is not None else
+                progress_fd if progress_fd is not None else BORROWED_PROGRESS_FD)
+    require(BORROWED_PROGRESS_FD not in ACTIVE_FDS, 'progress descriptor cannot own a native lease')
+    # Preserve each original stream separately while it is still growing.
+    # The consumer projection remains complete stdout followed by stderr;
+    # arbitrary pipe scheduling must never splice UTF-8/WORK/merge lines.
+    stdout_log = None if log is None else str(log) + '.stdout.raw'
+    stderr_log = None if log is None else str(log) + '.stderr.raw'
+    with _run_log(log) as sink, _run_log(stdout_log) as out_sink, _run_log(stderr_log) as err_sink:
+        raw_sinks = {'stdout': out_sink, 'stderr': err_sink}
+        selected = selectors.DefaultSelector()
         try:
-            stdout, stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-        if log is not None:
-            with Path(log).open('a') as stream:
-                stream.write(stdout + stderr)
-        register_group(process.pid, finished=True)
-        raise
-    register_group(process.pid, finished=True)
-    require(not group_alive(process.pid), 'native session still owns descendants; original reservation retained')
-    if log is not None:
-        with Path(log).open('a') as stream:
-            stream.write(stdout + stderr)
-    require(process.returncode == 0, 'actual tool failed (' + str(args[0]) + '): ' + stderr[-8192:])
-    return stdout
+            process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       start_new_session=True, pass_fds=tuple(ACTIVE_FDS) + extra_fds)
+        except BaseException:
+            selected.close()
+            raise
+        encoding, errors = process.stdout.encoding, process.stdout.errors
+        buffers = {'stdout': [], 'stderr': []}
+        counts = {'stdout': 0, 'stderr': 0}
+        started, next_observation = time.monotonic(), 0
+
+        def observe(event):
+            if event_fd is None:
+                return
+            try:
+                load1 = os.getloadavg()[0]
+                if not math.isfinite(load1) or load1 < 0:
+                    load1 = None
+            except (OSError, AttributeError):
+                load1 = None
+            progress_write(event_fd, 'APPLE_TOOL_PROGRESS=', {
+                'event': event, 'phase': observation_phase, 'slot': observation_slot,
+                'pid': process.pid, 'elapsedSeconds': round(time.monotonic() - started, 3),
+                'stdoutBytes': counts['stdout'], 'stderrBytes': counts['stderr'],
+                'processRunning': process.poll() is None, 'load1': load1, 'peakRSSBytes': None,
+                'scope': 'direct process/pipe bytes only; no descendant liveness or acceptance'})
+
+        def drain(deadline, *, cleanup=False):
+            nonlocal next_observation
+            while selected.get_map() or process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise subprocess.TimeoutExpired(str(args[0]), RUN_SECONDS)
+                if not cleanup and now >= next_observation:
+                    observe('waiting')
+                    next_observation = now + RUN_HEARTBEAT_SECONDS
+                for key, _ in selected.select(min(1, max(0, deadline - now))):
+                    raw = os.read(key.fileobj.fileno(), 65536)
+                    if not raw:
+                        selected.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    buffers[key.data].append(raw)
+                    counts[key.data] += len(raw)
+                    stream_sink = raw_sinks[key.data]
+                    if stream_sink is not None:
+                        if cleanup:
+                            # A secondary log failure must not interrupt pipe
+                            # draining or replace the triggering exception.
+                            try:
+                                stream_sink.write(raw)
+                                stream_sink.flush()
+                            except OSError:
+                                pass
+                        else:
+                            stream_sink.write(raw)
+                            stream_sink.flush()
+            process.wait()
+
+        try:
+            selected.register(process.stdout, selectors.EVENT_READ, 'stdout')
+            selected.register(process.stderr, selectors.EVENT_READ, 'stderr')
+            register_group(process.pid)
+            observe('start')
+            drain(started + RUN_SECONDS)
+            require(not group_alive(process.pid),
+                    'native session still owns descendants; original reservation retained')
+            register_group(process.pid, finished=True)
+            observe('end')
+        except BaseException as original:
+            # All failures, including output/observer and cancellation errors,
+            # retain the original exception while stopping this session only.
+            # No completed ledger entry is written while descendants survive.
+            cleanup_failed = False
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    drain(time.monotonic() + RUN_TERM_SECONDS, cleanup=True)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    drain(time.monotonic() + RUN_TERM_SECONDS, cleanup=True)
+            except BaseException:
+                cleanup_failed = True
+                # A secondary I/O/selector failure still cannot leave the
+                # direct child alive or prevent a bounded wait after KILL.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=RUN_TERM_SECONDS)
+                except BaseException:
+                    pass
+            try:
+                if not group_alive(process.pid):
+                    register_group(process.pid, finished=True)
+                else:
+                    cleanup_failed = True
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
+                original.add_note('native cleanup incomplete; original reservation/group retained')
+            raise
+        finally:
+            failing = sys.exc_info()[0] is not None
+            try:
+                if sink is not None:
+                    for stream in ('stdout', 'stderr'):
+                        for raw in buffers[stream]:
+                            sink.write(raw)
+                    sink.flush()
+            except BaseException:
+                if not failing:
+                    raise
+            finally:
+                closing_with_failure = failing or sys.exc_info()[0] is not None
+                for resource in (selected, process.stdout, process.stderr):
+                    try:
+                        resource.close()
+                    except BaseException:
+                        if not closing_with_failure:
+                            raise
+        # Decode only after EOF, so split multibyte sequences remain complete.
+
+        # Preserve the original text=True universal-newline stdout contract.
+        def text_output(stream):
+            return b''.join(buffers[stream]).decode(encoding, errors).replace('\r\n', '\n').replace('\r', '\n')
+        stdout, stderr = text_output('stdout'), text_output('stderr')
+        require(process.returncode == 0, 'actual tool failed (' + str(args[0]) + '): ' + stderr[-8192:])
+        return stdout
 
 
 def private_dir(path):
@@ -204,14 +389,16 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
              'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
+             'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
              'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json',
              'scripts/libbox-patches/android-source.py', 'scripts/apple-carrier.py')
-ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v1'
+ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({
     'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
+    'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
 })
 
 
@@ -681,13 +868,24 @@ def execute(args):
 
 
 def main():
+    global BORROWED_PROGRESS_FD, BORROWED_PROGRESS_PHASE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('platform', choices=['android', 'apple'])
     for name in ('source', 'go', 'gomobile', 'gobind', 'work', 'cache'):
         parser.add_argument('--' + name, required=True, type=Path)
     for name in ('sdk', 'ndk', 'jdk', 'developer'):
         parser.add_argument('--' + name, type=Path)
+    parser.add_argument('--progress-fd', type=int, help='Explicit parent descriptor for fixed Apple native observations')
     args = parser.parse_args()
+    if args.progress_fd is not None:
+        require(args.platform == 'apple' and args.progress_fd > 2, 'dedicated Apple progress descriptor required')
+        require(str(args.progress_fd) != os.environ.get('POLARIS_BUILD_RESERVATION_FD'),
+                'progress descriptor cannot own a native reservation')
+        os.fstat(args.progress_fd)
+        flags = fcntl.fcntl(args.progress_fd, fcntl.F_GETFD)
+        fcntl.fcntl(args.progress_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        BORROWED_PROGRESS_FD = args.progress_fd
+        BORROWED_PROGRESS_PHASE = 'component-build-or-revalidate'
     require((args.sdk is not None and args.ndk is not None and args.jdk is not None and args.developer is None)
             if args.platform == 'android' else
             (args.developer is not None and args.sdk is None and args.ndk is None and args.jdk is None), 'platform tools differ')

@@ -5,7 +5,7 @@ import re
 import shlex
 
 from fork_input import require
-from artifacts import file_pin, module, tree_inventory
+from artifacts import file_pin, module, tree_inventory, read_pinned
 
 
 def source_table(files):
@@ -25,9 +25,9 @@ def source_table(files):
             append(pin['sha256'], {'kind': pin['kind'], 'path': path, 'sha256': pin['sha256']})
         else:
             require(pin['kind'] == 'external-static-archive', 'unknown native origin kind')
-            raw = Path(path).read_bytes()
-            from fork_input import sha
-            require(len(raw) == pin['bytes'] and sha(raw) == pin['sha256'], 'static origin changed during inspection')
+            raw, actual_pin = read_pinned(path)
+            require(actual_pin == {key: pin[key] for key in ('bytes', 'sha256')},
+                    'static origin changed during inspection')
             parsed = carrier.container(raw, helper)
             slices = parsed['slices'] if parsed['kind'] == 'fat-ar' else [{'ordinal': 0, 'archive': parsed}]
             for row in slices:
@@ -182,7 +182,10 @@ def verify(facts, scratch=None, log=None, output=None):
         p = Path(path)
         require(not p.is_symlink() and p.resolve(strict=True).is_relative_to(
                 original_scratch if pin['kind'] == 'compiler-object' else cache), 'native input escaped owned roots')
-        require(file_pin(p) == {key: pin[key] for key in ('bytes', 'sha256')}, 'actual native input bytes changed')
+        # The external archive's same bounded read below verifies its pin and
+        # parses members; avoid a second full read at this single boundary.
+        if not (static and pin['kind'] == 'external-static-archive'):
+            require(file_pin(p) == {key: pin[key] for key in ('bytes', 'sha256')}, 'actual native input bytes changed')
     if static:
         actual = bind_origins(refs, source_table(facts['files']))
         if facts['schema'] == 'polaris-mobile-native-inputs-v2':

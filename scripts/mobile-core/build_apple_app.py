@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Explicit PRB00/VAL01 producer and App+PacketTunnel link entry; no publish/device action."""
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import time
+import threading
 import zipfile
 
 import sys
@@ -13,22 +15,72 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, load, require
-from producer import lease, private_dir, run
+import producer
+from producer import lease, private_dir, run as native_run, progress_write
 from artifacts import receipt_digest, file_pin
+
+APPLE_PHASES = frozenset(('component-build-or-revalidate', 'component-import-verification', 'component-link-input',
+                         'rust-target-build', 'host-swift-controls',
+                         'app-extension-archive', 'final-carrier-inspection'))
+PROGRESS_FD = None
+CURRENT_PHASE = None
+CURRENT_SLOT = None
+
+
+def run(*args, **kwargs):
+    # Observation is never inherited as a descriptor by native grandchildren.
+    kwargs.setdefault('observation_fd', PROGRESS_FD)
+    kwargs.setdefault('observation_phase', CURRENT_PHASE)
+    kwargs.setdefault('observation_slot', CURRENT_SLOT)
+    return native_run(*args, **kwargs)
+
+
+def phase_progress(name, event, elapsed, completed=None):
+    require(name in APPLE_PHASES and event in ('start', 'waiting', 'end'), 'unknown Apple progress phase')
+    row = {'phase': name, 'slot': CURRENT_SLOT, 'event': event, 'pid': os.getpid(),
+           'elapsedSeconds': round(elapsed, 3), 'completed': completed,
+           'scope': 'phase wait observation only; not compiler liveness or carrier acceptance'}
+    if PROGRESS_FD is None:
+        print('APPLE_PHASE_PROGRESS=' + json.dumps(row, sort_keys=True), flush=True)
+    else:
+        progress_write(PROGRESS_FD, 'APPLE_PHASE_PROGRESS=', row)
 
 
 def timed_phase(name, operation, *args, **kwargs):
-    started = time.monotonic()
-    completed = False
+    global CURRENT_PHASE
+    previous, CURRENT_PHASE = CURRENT_PHASE, name
+    started, completed = time.monotonic(), False
+    stopped, observer_errors = threading.Event(), []
+
+    def heartbeat():
+        while not stopped.wait(30):
+            try:
+                phase_progress(name, 'waiting', time.monotonic() - started)
+            except BaseException as error:
+                observer_errors.append(error)
+                return
+
+    monitor = threading.Thread(target=heartbeat, daemon=True)
     try:
+        phase_progress(name, 'start', 0)
+        monitor.start()
         result = operation(*args, **kwargs)
+        if observer_errors:
+            raise RuntimeError('Apple phase observation failed') from observer_errors[0]
         completed = True
         return result
     finally:
-        print('APPLE_PHASE_TIMING=' + json.dumps({'phase': name,
-              'elapsedSeconds': round(time.monotonic() - started, 3),
-              'completed': completed, 'scope': 'elapsed observation only'},
-              sort_keys=True), flush=True)
+        stopped.set()
+        if monitor.ident is not None:
+            monitor.join(timeout=1)
+        CURRENT_PHASE = previous
+        # Keep an operation failure primary if its output channel also broke.
+        failing = sys.exc_info()[0] is not None
+        try:
+            phase_progress(name, 'end', time.monotonic() - started, completed)
+        except BaseException:
+            if not failing:
+                raise
 
 
 def host_swift_controls(root, app_env):
@@ -53,6 +105,7 @@ def host_swift_controls(root, app_env):
 
 
 def main():
+    global PROGRESS_FD, CURRENT_SLOT
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('source', 'go', 'gomobile', 'gobind', 'developer', 'work', 'cache'):
         parser.add_argument('--' + name, required=True, type=Path)
@@ -61,10 +114,26 @@ def main():
     parser.add_argument('--signing-team', help='Explicit device signing identity; omit for unsigned compile/link probe')
     parser.add_argument('--component-work', type=Path, help='One fixed shared three-slice component slot')
     parser.add_argument('--rust-target', type=Path, help='One fixed Rust target shared under the actual cache lease')
+    parser.add_argument('--imported-component', action='store_true', help='Verify same-run frozen component handoff; never reproduce it')
+    parser.add_argument('--slot', choices=['device-arm64', 'sim-arm64', 'sim-amd64'])
+    parser.add_argument('--progress-fd', type=int, help='Explicit parent stdout descriptor for fixed phase events')
     args = parser.parse_args()
     value = load()
+    CURRENT_SLOT = 'sim-' + args.simulator_arch if args.simulator else 'device-arm64'
+    require(args.slot is None or args.slot == CURRENT_SLOT, 'selected carrier slot differs')
     require(os.uname().sysname == 'Darwin', 'Apple App producer requires the selected Mac host')
     root, cache = private_dir(args.work), private_dir(args.cache)
+    if args.progress_fd is not None:
+        require(args.progress_fd > 2, 'dedicated Apple progress descriptor required')
+        require(str(args.progress_fd) != os.environ.get('POLARIS_BUILD_RESERVATION_FD'),
+                'progress descriptor cannot own a native reservation')
+        os.fstat(args.progress_fd)
+        # This borrowed stdout copy belongs only to this carrier process.
+        # It must not reach compiler/native grandchildren or lease state.
+        flags = fcntl.fcntl(args.progress_fd, fcntl.F_GETFD)
+        fcntl.fcntl(args.progress_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+        PROGRESS_FD = args.progress_fd
+        producer.BORROWED_PROGRESS_FD = PROGRESS_FD
     component_work = private_dir(args.component_work or root / 'component')
     rust_target = private_dir(args.rust_target or root / 'rust-target')
     require(root.stat().st_dev == component_work.stat().st_dev == rust_target.stat().st_dev == cache.stat().st_dev,
@@ -74,12 +143,19 @@ def main():
         materialize_apple_resources()
     # The component producer owns its own reservation. Do not sell a second
     # nested peak while waiting for it; the App lease below covers real linking.
-    producer_args = [sys_python(), ROOT / 'scripts/mobile-core/producer.py', 'apple']
-    for name in ('source', 'go', 'gomobile', 'gobind', 'developer'):
-        producer_args += ['--' + name, getattr(args, name)]
-    producer_args += ['--work', component_work, '--cache', cache]
-    timed_phase('component-build-or-revalidate', run, producer_args,
-                log=root / 'original-component-runner.log')
+    if args.imported_component:
+        from apple_handoff import verify_import
+        with lease(root, cache, value):
+            timed_phase('component-import-verification', verify_import,
+                        component_work, cache, args.source, args.go, args.gomobile,
+                        args.gobind, args.developer)
+    else:
+        producer_args = [sys_python(), ROOT / 'scripts/mobile-core/producer.py', 'apple']
+        for name in ('source', 'go', 'gomobile', 'gobind', 'developer'):
+            producer_args += ['--' + name, getattr(args, name)]
+        producer_args += ['--work', component_work, '--cache', cache]
+        timed_phase('component-build-or-revalidate', run, producer_args,
+                    log=root / 'original-component-runner.log')
     link = root / 'apple-link-input.json'
     # A retained link context cannot be overwritten as a new App identity.
     if not link.exists():

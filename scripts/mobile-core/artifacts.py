@@ -9,6 +9,8 @@ import sys
 import hashlib
 import math
 import zipfile
+import time
+from contextlib import contextmanager
 
 from fork_input import ROOT, canonical, decode, require, sha, validate
 
@@ -146,12 +148,50 @@ def module(name, relative):
     return value
 
 
-def file_pin(path, *, allow_empty=False):
+@contextmanager
+def inspection_stage(stage, reads=None):
+    """Ephemeral timing/read observations; never receipt or cache identity."""
+    started, primary = time.monotonic(), None
+    try:
+        yield
+    except BaseException as error:
+        # Only a failure raised by this operation is primary. An already
+        # handled exception in the caller must not suppress observer failure.
+        primary = error
+        raise
+    finally:
+        try:
+            # Lazy import avoids artifacts/producer's existing import cycle.
+            # The explicit borrowed descriptor crosses the outer capture layer;
+            # no native tool text or path is forwarded by this observation.
+            from producer import inspection_progress
+            inspection_progress(stage, time.monotonic() - started,
+                                reads.get('fileReads', 0) if reads is not None else None,
+                                reads.get('readBytes', 0) if reads is not None else None)
+        except BaseException:
+            if primary is None:
+                # Keep the existing observer-only failure policy.
+                raise
+            BaseException.add_note(primary, 'Apple inspection observation failed; original failure preserved')
+
+
+def read_pinned(path, *, allow_empty=False, observations=None):
+    """Read bounded original bytes once for both content parsing and pinning."""
     path = Path(path)
-    require(path.is_file() and not path.is_symlink() and (allow_empty or path.stat().st_size > 0) and path.stat().st_size <= MAX_ARTIFACT,
-            'bounded regular artifact required')
-    raw = path.read_bytes()
-    return {'bytes': len(raw), 'sha256': sha(raw)}
+    require(path.is_file() and not path.is_symlink(), 'bounded regular artifact required')
+    size = path.stat().st_size
+    require((allow_empty or size > 0) and size <= MAX_ARTIFACT, 'bounded regular artifact required')
+    with path.open('rb') as stream:
+        raw = stream.read(size + 1)
+    require(len(raw) == size and len(raw) <= MAX_ARTIFACT, 'artifact size changed during bounded read')
+    if observations is not None:
+        observations['fileReads'] = observations.get('fileReads', 0) + 1
+        observations['readBytes'] = observations.get('readBytes', 0) + len(raw)
+    return raw, {'bytes': len(raw), 'sha256': sha(raw)}
+
+
+def file_pin(path, *, allow_empty=False, observations=None):
+    return read_pinned(path, allow_empty=allow_empty, observations=observations)[1]
 
 
 def zip_entries(archive):
@@ -410,7 +450,7 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
                 'manifestSha256': sha(archive.read('AndroidManifest.xml')), 'minimumAPI': 24}
 
 
-def tree_inventory(root):
+def tree_inventory(root, *, pinned=None, observations=None, metadata_only=False):
     import os
     root = Path(root)
     require(not root.is_symlink() and root.is_dir(), 'component root redirected/missing')
@@ -426,7 +466,12 @@ def tree_inventory(root):
                         'framework link must remain inside the same component')
                 row.update(type='symlink', target=target)
             elif path.is_file():
-                row.update(type='file', **file_pin(path, allow_empty=True))
+                row['type'] = 'file'
+                if not metadata_only:
+                    key = path.resolve(strict=True)
+                    pin = pinned.get(key) if pinned is not None else None
+                    row.update(pin if pin is not None else
+                               file_pin(path, allow_empty=True, observations=observations))
             else:
                 require(path.is_dir(), 'unsupported component object')
                 row['type'] = 'directory'
@@ -490,12 +535,24 @@ def objc_validation_getter_contract(header):
 
 
 def inspect_framework(framework, value, graph, expected_id):
+    reads = {}
+    with inspection_stage('framework-inspection', reads):
+        return _inspect_framework(framework, value, graph, expected_id, reads)
+
+
+def _inspect_framework(framework, value, graph, expected_id, reads):
     validate(value)
     framework = Path(framework)
     helper = module('formal_apple_buildinfo', 'scripts/libbox-patches/android-source.py')
     carrier = module('formal_apple_container', 'scripts/apple-carrier.py')
-    inventory = tree_inventory(framework)
-    info = plistlib.loads((framework / 'Info.plist').read_bytes())
+    # Pins used by parsing are reused only within this invocation. A complete
+    # fresh inventory at the final boundary detects changes to bytes/modes,
+    # links and the file set without retaining multiple large binary buffers.
+    layout = tree_inventory(framework, metadata_only=True)
+    pinned = {}
+    raw_info, info_pin = read_pinned(framework / 'Info.plist', observations=reads)
+    pinned[(framework / 'Info.plist').resolve(strict=True)] = info_pin
+    info = plistlib.loads(raw_info)
     libraries, observed = info['AvailableLibraries'], {}
     require(isinstance(libraries, list) and len(libraries) == 2 and
             len({r['LibraryIdentifier'] for r in libraries}) == len(libraries), 'framework device/simulator library inventory differs')
@@ -512,11 +569,14 @@ def inspect_framework(framework, value, graph, expected_id):
         require(lib.is_dir() and lib.suffix == '.framework', 'expected a framework component')
         # The pinned generator writes an empty Resources/Info.plist and a
         # versioned static Libbox binary; it has no CFBundleExecutable field.
-        plistlib.loads((lib / 'Resources/Info.plist').read_bytes())
+        resource_info = lib / 'Resources/Info.plist'
+        resource_raw, resource_pin = read_pinned(resource_info, observations=reads)
+        pinned[resource_info.resolve(strict=True)] = resource_pin
+        plistlib.loads(resource_raw)
         binary = (lib / 'Libbox').resolve(strict=True)
         require(binary.is_relative_to(framework.resolve(strict=True)), 'static binary escaped framework')
-        raw = binary.read_bytes()
-        require(len(raw) <= MAX_ARTIFACT, 'bounded actual framework binary required')
+        raw, binary_pin = read_pinned(binary, observations=reads)
+        pinned[binary] = binary_pin
         try:
             parsed = carrier.container(raw, helper)
         except RuntimeError as error:
@@ -529,7 +589,14 @@ def inspect_framework(framework, value, graph, expected_id):
         slices = parsed['slices'] if parsed['kind'] == 'fat-ar' else [{'ordinal': 0, 'archive': parsed}]
         require(len(slices) == len(expected_targets) and all(s['archive']['kind'] == 'bsd-ar' for s in slices),
                 'Libbox static slice inventory differs from framework declaration')
-        headers = {p.name: p.read_text() for p in (lib / 'Headers').glob('*.h')}
+        headers = {}
+        for header_path in (lib / 'Headers').glob('*.h'):
+            resolved = header_path.resolve(strict=True)
+            require(resolved.is_relative_to(framework.resolve(strict=True)), 'header escaped framework')
+            header_raw, header_pin = read_pinned(resolved, observations=reads)
+            pinned[resolved] = header_pin
+            # Match read_text's universal newline behavior in the stable output.
+            headers[header_path.name] = header_raw.decode().replace('\r\n', '\n').replace('\r', '\n')
         header = '\n'.join(headers.values())
         for symbol in ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                        'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
@@ -561,7 +628,7 @@ def inspect_framework(framework, value, graph, expected_id):
             require(len(infos) == len(ids) == 1, 'one original Go carrier per Apple slice required')
             check_buildinfo(infos[0]['parsedBuildInfo'], value, graph, os_name='ios', arch=spec[2], mode='c-archive',
                             expected_id=expected_id, actual_id=ids[0], simulator=spec[3] == 'simulator')
-            observed[target] = {'libraryIdentifier': identifier, 'binary': file_pin(binary),
+            observed[target] = {'libraryIdentifier': identifier, 'binary': binary_pin,
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
                 'validationResultGetterContract': validation_getters,
                 'goBuildInfo': infos[0], 'buildID': ids[0],
@@ -573,5 +640,10 @@ def inspect_framework(framework, value, graph, expected_id):
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
         require(entry_targets == expected_targets, 'actual framework target inventory differs')
     require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly three architecture slices')
+    inventory = tree_inventory(framework, pinned=pinned, observations=reads)
+    require([{k: v for k, v in row.items() if k not in ('bytes', 'sha256')} for row in inventory] == layout,
+            'framework layout changed during original-byte inspection')
+    require(tree_inventory(framework, observations=reads) == inventory,
+            'framework changed during original-byte inspection')
     return {'format': 'static-XCFramework', 'inventory': inventory,
             'inventorySha256': sha(canonical(inventory)), 'slices': observed}

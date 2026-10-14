@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt
+from artifacts import receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt, inspection_stage
 from producer import lease, run, write_json
 from consume import app_identity, apple_resources, verify_original
 
@@ -65,16 +65,29 @@ def android(apk, abi, r8, component, receipt_path, tools, scratch):
 
 
 def static_linkmap(text, framework, selected, derived):
+    reads = {}
+    with inspection_stage('static-linkmap', reads):
+        return _static_linkmap(text, framework, selected, derived, reads)
+
+
+def _static_linkmap(text, framework, selected, derived, reads):
     require('# Object files:' in text and '# Sections:' in text and '# Symbols:' in text,
             'actual extension linker map required')
-    binary = (Path(framework) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox').resolve(strict=True)
+    original_binary = Path(framework) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox'
+    binary = original_binary.resolve(strict=True)
     derived = Path(derived).resolve(strict=True)
     require(derived.is_dir(), 'actual fixed derived-data directory required')
     members = {}
     for member in selected['members']:
         members.setdefault(member['name'], []).append(member)
     body = text.split('# Object files:', 1)[1].split('# Sections:', 1)[0]
-    consumed = []
+    consumed, pinned, resolutions = [], {}, {}
+    def original_pin(path):
+        resolved = path.resolve(strict=True)
+        resolutions[path] = resolved
+        if resolved not in pinned:
+            pinned[resolved] = file_pin(resolved, observations=reads)
+        return pinned[resolved]
     for line in body.splitlines():
         match = re.fullmatch(r'\[\s*(\d+)\]\s+(.+)\(([^()]+)\)', line.strip())
         if match is None:
@@ -82,21 +95,34 @@ def static_linkmap(text, framework, selected, derived):
         archive, name = match[2], match[3]
         if 'Libbox.framework' not in archive:
             continue
-        linked = Path(archive).resolve(strict=True)
-        require((linked == binary or linked.is_relative_to(derived)) and name in members and
-                file_pin(linked) == selected['binary'],
+        archive_path = Path(archive)
+        linked = archive_path.resolve(strict=True)
+        # Check ownership and membership for every line, before any reuse.
+        require((linked == binary or linked.is_relative_to(derived)) and name in members,
                 'extension link map used a different/unbound static SDK input')
-        headers = Path(archive).parent / 'Headers'
+        pin = original_pin(archive_path)
+        require(pin == selected['binary'], 'extension link map used a different/unbound static SDK input')
+        headers = archive_path.parent / 'Headers'
         for header, digest in selected['headerSha256'].items():
-            require(file_pin((headers / header).resolve(strict=True))['sha256'] == digest,
-                    'actual selected framework headers changed')
-        consumed.append({'linkOrdinal': int(match[1]), 'archive': str(linked), 'archivePin': file_pin(linked),
+            header_path = headers / header
+            require(header_path.resolve(strict=True).is_relative_to(linked.parent),
+                    'actual selected framework header escaped')
+            require(original_pin(header_path)['sha256'] == digest, 'actual selected framework headers changed')
+        consumed.append({'linkOrdinal': int(match[1]), 'archive': str(linked), 'archivePin': pin,
                          'memberName': name, 'originalMembers': members[name]})
     require(consumed and any(m['goCarrier'] for row in consumed for m in row['originalMembers']),
             'link map lacks original Go carrier member')
     require(any(not m['goCarrier'] for row in consumed for m in row['originalMembers']),
             'link map lacks original generated/native members')
     require(len({r['linkOrdinal'] for r in consumed}) == len(consumed), 'link map object ordinals duplicate')
+    require(original_binary.resolve(strict=True) == binary, 'selected framework resolution changed')
+    for original, resolved in resolutions.items():
+        require(original.resolve(strict=True) == resolved, 'linked framework resolution changed')
+    # Re-read each canonical file once at the final boundary. Same basenames in
+    # different derived-data frameworks never share pins, and changed bytes fail.
+    for resolved, pin in pinned.items():
+        require(file_pin(resolved, observations=reads) == pin,
+                'linked framework bytes changed during member inspection')
     return consumed
 
 
@@ -120,7 +146,8 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     require(link['schema'] == 'polaris-mobile-apple-link-input-v1' and link['staticOnly'] is True and
             link['fingerprint'] == receipt_digest({k: v for k, v in link.items() if k != 'fingerprint'}), 'Apple link input differs')
     require(file_pin(receipt_path)['sha256'] == link['componentReceiptSha256'], 'original Apple component receipt changed')
-    receipt = verify_original(link['framework'], receipt_path, 'apple', {}, scratch)
+    with inspection_stage('verify-original'):
+        receipt = verify_original(link['framework'], receipt_path, 'apple', {}, scratch)
     require(receipt['fingerprint'] == link['componentFingerprint'] and receipt['output'] == link['componentOutput'],
             'actual link component differs')
     current = app_identity()
@@ -129,42 +156,43 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     value = load()
     helper = module('final_mobile_info', 'scripts/libbox-patches/android-source.py')
     parser = module('final_mobile_carrier', 'scripts/apple-carrier.py')
-    with zipfile.ZipFile(ipa) as archive:
-        zip_entries(archive)
-        apps = [n for n in archive.namelist() if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)]
-        require(len(apps) == 1, 'one actual host App required')
-        app_root = apps[0].removesuffix('Info.plist')
-        app = plistlib.loads(archive.read(apps[0]))
-        resources = verify_apple_resources(archive, app_root, link['resources'])
-        extensions = [n for n in archive.namelist() if n.startswith(app_root + 'PlugIns/') and n.endswith('.appex/Info.plist')]
-        require(len(extensions) == 1, 'one actual PacketTunnel required')
-        extension_root = extensions[0].removesuffix('Info.plist')
-        extension = plistlib.loads(archive.read(extensions[0]))
-        require(extension['CFBundleIdentifier'] == app['CFBundleIdentifier'] + '.PacketTunnel' and
-                extension['NSExtension']['NSExtensionPointIdentifier'] == 'com.apple.networkextension.packet-tunnel' and
-                app['PolarisAppGroup'] == extension['PolarisAppGroup'] and app['PolarisAppGroup'].startswith('group.') and
-                '$(' not in app['PolarisAppGroup'], 'actual App/extension identities/group differ')
-        rows = {}
-        for name, root, info in [('app', app_root, app), ('extension', extension_root, extension)]:
-            require(info['UIDeviceFamily'] == [1, 2] and info['CFBundleSupportedPlatforms'] ==
-                    (['iPhoneSimulator'] if simulator_arch else ['iPhoneOS']) and
-                    tuple(map(int, info['MinimumOSVersion'].split('.'))) >= (17, 0), 'actual device carrier scope differs')
-            raw = archive.read(root + info['CFBundleExecutable'])
-            parsed = parser.container(raw, helper)
-            cpu = 0x1000007 if simulator_arch == 'amd64' else 0x100000c
-            require(parsed['kind'] == 'Mach-O64' and parsed['cpu'] == cpu and parsed['filetype'] == 2,
-                    'actual App binary target must be the selected thin MH_EXECUTE')
-            rows[name] = {'bytes': len(raw), 'sha256': sha(raw), 'bundleIdentifier': info['CFBundleIdentifier']}
-            if name == 'extension':
-                infos = [s['buildInfo'] for s in parsed['sections'] if 'buildInfo' in s]
-                ids = [n['value'] for s in parsed['sections'] for n in s.get('buildIDs', [])]
-                require(len(infos) == len(ids) == 1, 'final extension must retain original Go source carrier')
-                check_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
-                                os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive', simulator=bool(simulator_arch),
-                                expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
-                rows[name].update(goBuildInfo=infos[0], buildID=ids[0])
-        require(not any(n.startswith(app_root) and (n.endswith('.a') or 'Libbox.framework/' in n) for n in archive.namelist()),
-                'build-only static SDK must not be copied into the installed App')
+    with inspection_stage('ipa-parse'):
+        with zipfile.ZipFile(ipa) as archive:
+            zip_entries(archive)
+            apps = [n for n in archive.namelist() if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)]
+            require(len(apps) == 1, 'one actual host App required')
+            app_root = apps[0].removesuffix('Info.plist')
+            app = plistlib.loads(archive.read(apps[0]))
+            resources = verify_apple_resources(archive, app_root, link['resources'])
+            extensions = [n for n in archive.namelist() if n.startswith(app_root + 'PlugIns/') and n.endswith('.appex/Info.plist')]
+            require(len(extensions) == 1, 'one actual PacketTunnel required')
+            extension_root = extensions[0].removesuffix('Info.plist')
+            extension = plistlib.loads(archive.read(extensions[0]))
+            require(extension['CFBundleIdentifier'] == app['CFBundleIdentifier'] + '.PacketTunnel' and
+                    extension['NSExtension']['NSExtensionPointIdentifier'] == 'com.apple.networkextension.packet-tunnel' and
+                    app['PolarisAppGroup'] == extension['PolarisAppGroup'] and app['PolarisAppGroup'].startswith('group.') and
+                    '$(' not in app['PolarisAppGroup'], 'actual App/extension identities/group differ')
+            rows = {}
+            for name, root, info in [('app', app_root, app), ('extension', extension_root, extension)]:
+                require(info['UIDeviceFamily'] == [1, 2] and info['CFBundleSupportedPlatforms'] ==
+                        (['iPhoneSimulator'] if simulator_arch else ['iPhoneOS']) and
+                        tuple(map(int, info['MinimumOSVersion'].split('.'))) >= (17, 0), 'actual device carrier scope differs')
+                raw = archive.read(root + info['CFBundleExecutable'])
+                parsed = parser.container(raw, helper)
+                cpu = 0x1000007 if simulator_arch == 'amd64' else 0x100000c
+                require(parsed['kind'] == 'Mach-O64' and parsed['cpu'] == cpu and parsed['filetype'] == 2,
+                        'actual App binary target must be the selected thin MH_EXECUTE')
+                rows[name] = {'bytes': len(raw), 'sha256': sha(raw), 'bundleIdentifier': info['CFBundleIdentifier']}
+                if name == 'extension':
+                    infos = [s['buildInfo'] for s in parsed['sections'] if 'buildInfo' in s]
+                    ids = [n['value'] for s in parsed['sections'] for n in s.get('buildIDs', [])]
+                    require(len(infos) == len(ids) == 1, 'final extension must retain original Go source carrier')
+                    check_buildinfo(infos[0]['parsedBuildInfo'], value, receipt['input']['moduleGraph'],
+                                    os_name='ios', arch=simulator_arch or 'arm64', mode='c-archive', simulator=bool(simulator_arch),
+                                    expected_id='polaris-mobile-' + receipt_digest(receipt['input']), actual_id=ids[0])
+                    rows[name].update(goBuildInfo=infos[0], buildID=ids[0])
+            require(not any(n.startswith(app_root) and (n.endswith('.a') or 'Libbox.framework/' in n) for n in archive.namelist()),
+                    'build-only static SDK must not be copied into the installed App')
     original_map = Path(linkmap).read_bytes()
     text = original_map.decode('utf-8')
     target = ('ios-x86_64-simulator' if simulator_arch == 'amd64' else 'ios-arm64-simulator') if simulator_arch else 'ios-arm64'
