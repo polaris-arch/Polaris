@@ -97,6 +97,19 @@ Returned module/version/h1 inventories and unchanged source bytes are checked,
 then the full graph and `go mod verify` are read again. No graph identity or
 location is discarded. This uses the existing lease, 20GiB cache and reserve;
 retained admission inputs refuse instead of being overwritten or deleted.
+Only the added download invocation uses a separate bounded collector: 1MiB
+stdout, 4KiB discarded stderr (one overflow sentinel each), 8KiB lines,
+32768 lines, 4KiB JSON strings, depth8/65536 structural tokens and at most the
+requested 1024 objects. Duplicate keys, nonfinite constants, Error objects,
+unknown fields or wrong record types refuse with fixed safe reasons. Collection
+keeps the original 3600-second limit plus at most two seconds of owned-group
+cleanup; a remaining group retains ledger ownership and rejects. No
+`original-module-cache-admission.log` is created. The failure/success artifact
+gets only `module-cache-admission-observation.json` counters/limits/reason and
+cleanup status, never original JSON, stderr, URLs or error bodies. Its `complete`
+means pipe/JSON collection only; full checksum/input predicates still follow.
+Whole-process RSS is unmeasured. Other established producer/tool calls retain
+their original behavior and evidence scope.
 An actual unequal cached binding still refuses original generator output reuse.
 Its derived `cache-binding-observation.json` records only fixed changed-field
 labels, row/directory/sum counts and already validated fingerprints, never input

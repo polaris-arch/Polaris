@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import json
+import sys
 
 import producer
 from artifacts import tree_inventory
@@ -13,6 +14,75 @@ from fork_input import load
 
 
 class ProducerCalls(unittest.TestCase):
+    def test_bounded_download_pipe_and_structure_failures_never_export_raw_errors(self):
+        secret = 'DO_NOT_EXPORT_MODULE_CREDENTIAL'
+        good = {'Path':'example.invalid/pkg','Version':'v1.0.0','Sum':'h1:fixed','Dir':'/fixed/cache'}
+        cases = [
+            ('import os; os.write(1, (b"x"*4000+b"\\n")*1024)', 'stdout-budget'),
+            ('import os; os.write(2, b"' + secret + '"*1024)', 'stderr-budget'),
+            ('import os; os.write(1, b"x"*20000)', 'line-budget'),
+            ('import os; os.write(1, b"\\n"*40000)', 'line-budget'),
+            ('import json; print(json.dumps({"Path":"x"*5000}))', 'string-budget'),
+            ('print(\'{"Origin":\'+"["*10)', 'structure-or-item-budget'),
+            ('import os; os.write(1,b\'{"Origin":[\'+b"0,0,0,\\n"*25000+b"0]}\")', 'structure-budget'),
+            ('print(' + repr(json.dumps(good) + '\n' + json.dumps(good)) + ')', 'structure-or-item-budget'),
+            ('print(\'{"Path":"one","Path":"two"}\')', 'download-collection-or-json-error'),
+            ('print(\'{"Path":NaN}\')', 'download-collection-or-json-error'),
+            ('print(' + repr(json.dumps({'Error':'https://user:' + secret + '@example.invalid/private'})) + ')', 'download-json-error'),
+            ('print(\'{"unknown":"value"}\')', 'download-json-structure'),
+            ('import sys; sys.stderr.write("' + secret + '"); sys.exit(1)', 'download-exit-or-live-group'),
+            ('import time; time.sleep(5)', 'deadline'),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (code, reason) in enumerate(cases):
+                observation = root / (str(index) + '.json')
+                with self.subTest(reason=reason, index=index), \
+                        patch.object(producer, 'DOWNLOAD_SECONDS', 0.1 if reason == 'deadline' else 5), \
+                        patch('builtins.print'), self.assertRaisesRegex(RuntimeError, 'module download rejected: ' + reason):
+                    producer.bounded_module_download([sys.executable,'-c',code], cwd=root, env=None,
+                                                    expected_count=1, observation=observation)
+                observed = json.loads(observation.read_bytes())
+                self.assertFalse(observed['complete'] or observed['rawOutputRetained'] or observed['inputValuesExported'])
+                self.assertTrue(observed['cleanupComplete'])
+                self.assertEqual(observed['reason'], reason)
+                self.assertLessEqual(observed['stdoutBytesObserved'], producer.DOWNLOAD_STDOUT_BYTES + 1)
+                self.assertLessEqual(observed['stderrBytesObserved'], producer.DOWNLOAD_STDERR_BYTES + 1)
+                self.assertNotIn(secret, observation.read_text())
+                self.assertNotIn('https://', observation.read_text())
+            self.assertEqual(list(root.glob('*.log')), [])
+
+    def test_bounded_download_valid_records_and_spawn_failure_are_safe(self):
+        row = {'Path':'example.invalid/pkg','Version':'v1.0.0','Sum':'h1:fixed','Dir':'/fixed/cache'}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); observation = root / 'valid.json'
+            with patch('builtins.print'):
+                rows = producer.bounded_module_download([sys.executable,'-c','print(' + repr(json.dumps(row)) + ')'],
+                    cwd=root, env=None, expected_count=1, observation=observation)
+            self.assertEqual(rows, [row])
+            value = json.loads(observation.read_bytes()); self.assertTrue(value['complete'] and value['cleanupComplete'])
+            self.assertEqual(value['itemsDecoded'], 1)
+            with patch.object(producer.subprocess, 'Popen', side_effect=OSError('DO_NOT_EXPORT')), \
+                    patch('builtins.print'), self.assertRaisesRegex(RuntimeError, 'download-collection-or-json-error'):
+                producer.bounded_module_download(['not-executed'], cwd=root, env=None, expected_count=1,
+                                                observation=root/'failed.json')
+            self.assertNotIn('DO_NOT_EXPORT', (root/'failed.json').read_text())
+
+    def test_bounded_download_unfinished_group_retains_ledger_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # The direct child exits. A simulated live descendant is never
+            # removed from the reservation merely because the parent returned.
+            with patch.object(producer, 'group_alive', return_value=True), \
+                    patch.object(producer.os, 'killpg'), patch.object(producer, 'DOWNLOAD_CLEANUP_SECONDS', 0.05), \
+                    patch.object(producer, 'register_group') as register, patch('builtins.print'), \
+                    self.assertRaisesRegex(RuntimeError, 'download-cleanup-incomplete'):
+                producer.bounded_module_download([sys.executable,'-c','pass'], cwd=root, env=None,
+                                                expected_count=1, observation=root/'group.json')
+            self.assertFalse(json.loads((root/'group.json').read_bytes())['cleanupComplete'])
+            self.assertTrue(register.called)
+            self.assertFalse(any(call.kwargs.get('finished') for call in register.call_args_list))
+
     def test_module_admission_uses_only_source_sums_and_alternate_files_then_preserves_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); source = root / 'source'; source.mkdir(); work = root / 'work'; work.mkdir()
@@ -30,16 +100,17 @@ class ProducerCalls(unittest.TestCase):
                 self.assertEqual(alternate.read_bytes(), originals['go.mod'])
                 self.assertEqual(alternate.with_suffix('.sum').read_bytes(), originals['go.sum'])
                 alternate.with_suffix('.sum').write_bytes(b'owned download sum update')
-                return json.dumps({'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed',
-                                   'Dir': str(root/'cache/go-mod/known')})
-            with patch.object(producer, 'run', side_effect=run):
+                self.assertEqual(kwargs['expected_count'], 1)
+                return [{'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed',
+                         'Dir': str(root/'cache/go-mod/known')}]
+            with patch.object(producer, 'bounded_module_download', side_effect=run):
                 producer.admit_module_cache(source, graph, 'inert-go', {}, work)
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][0][-4:], ['mod', 'download', '-json', 'example.invalid/known@v1.0.0'])
             self.assertEqual(calls[0][1]['cwd'], source)
             self.assertEqual({name:(source/name).read_bytes() for name in originals}, originals)
             graph[1]['Dir'] = '/actual/warm/cache/known'
-            with patch.object(producer, 'run') as run:
+            with patch.object(producer, 'bounded_module_download') as run:
                 producer.admit_module_cache(source, graph, 'inert-go', {}, work)
             run.assert_not_called()
 
@@ -50,10 +121,10 @@ class ProducerCalls(unittest.TestCase):
             (source/'go.sum').write_bytes(b'example.invalid/known v1.0.0 h1:fixed\n')
             graph = [{'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:fixed'}]
             changed = {'Path': 'example.invalid/known', 'Version': 'v1.0.0', 'Sum': 'h1:changed', 'Dir': '/fake/cache'}
-            with patch.object(producer, 'run', return_value=json.dumps(changed)), \
+            with patch.object(producer, 'bounded_module_download', return_value=[changed]), \
                     self.assertRaisesRegex(RuntimeError, 'downloaded module identity differs'):
                 producer.admit_module_cache(source, graph, 'inert-go', {}, work)
-            with patch.object(producer, 'run') as run, self.assertRaisesRegex(RuntimeError, 'prior module admission inputs retained'):
+            with patch.object(producer, 'bounded_module_download') as run, self.assertRaisesRegex(RuntimeError, 'prior module admission inputs retained'):
                 producer.admit_module_cache(source, graph, 'inert-go', {}, work)
             run.assert_not_called()
             self.assertEqual((source/'go.sum').read_bytes(), b'example.invalid/known v1.0.0 h1:fixed\n')

@@ -12,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import subprocess
+import time
 
 import sys
 sys.dont_write_bytecode = True
@@ -265,6 +267,144 @@ def cache_binding_observation(receipt, binding, fingerprint):
             'scope': 'actual comparison before refusal; not component, recovery or App acceptance'}
 
 
+DOWNLOAD_STDOUT_BYTES, DOWNLOAD_STDERR_BYTES = 1024 ** 2, 4096
+DOWNLOAD_LINE_BYTES, DOWNLOAD_LINES, DOWNLOAD_ITEMS = 8192, 32768, 1024
+DOWNLOAD_STRING_BYTES, DOWNLOAD_DEPTH, DOWNLOAD_TOKENS = 4096, 8, 65536
+DOWNLOAD_SECONDS, DOWNLOAD_CLEANUP_SECONDS = 3600, 2
+
+
+def bounded_module_download(command, *, cwd, env, expected_count, observation):
+    """Only this admission call: capped pipes/JSON, safe failure, no raw log."""
+    require(type(expected_count) is int and 0 < expected_count <= DOWNLOAD_ITEMS,
+            'bounded module download item count required')
+    observation = Path(observation)
+    require(not observation.exists() and not observation.is_symlink(), 'retained module download observation')
+    deadline = time.monotonic() + DOWNLOAD_SECONDS
+    raw, stderr_bytes, process, reason, rows = bytearray(), 0, None, None, []
+    lines, line_bytes, string_bytes, depth, tokens, items = 0, 0, 0, 0, 0, 0
+    quoted = escaped = False
+    cleanup_complete = True
+    try:
+        process = subprocess.Popen([str(arg) for arg in command], cwd=cwd, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True, pass_fds=tuple(ACTIVE_FDS))
+        register_group(process.pid)
+        with selectors.DefaultSelector() as selected:
+            for stream, label in [(process.stdout, 'stdout'), (process.stderr, 'stderr')]:
+                os.set_blocking(stream.fileno(), False)
+                selected.register(stream, selectors.EVENT_READ, label)
+            while selected.get_map() and reason is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: reason = 'deadline'; break
+                for key, _ in selected.select(min(0.2, remaining)):
+                    used, maximum = (len(raw), DOWNLOAD_STDOUT_BYTES) if key.data == 'stdout' else (stderr_bytes, DOWNLOAD_STDERR_BYTES)
+                    chunk = os.read(key.fd, min(4096, maximum - used + 1))
+                    if not chunk: selected.unregister(key.fileobj); continue
+                    if key.data == 'stderr': stderr_bytes += len(chunk)
+                    else: raw.extend(chunk)
+                    if used + len(chunk) > maximum: reason = key.data + '-budget'; break
+                    if key.data == 'stderr': continue  # Discard contents immediately.
+                    for byte in chunk:
+                        line_bytes += 1
+                        if byte == 10: lines += 1; line_bytes = 0
+                        if lines > DOWNLOAD_LINES or line_bytes > DOWNLOAD_LINE_BYTES:
+                            reason = 'line-budget'; break
+                        if quoted:
+                            string_bytes += 1
+                            if string_bytes > DOWNLOAD_STRING_BYTES: reason = 'string-budget'; break
+                            if escaped: escaped = False
+                            elif byte == 92: escaped = True
+                            elif byte == 34: quoted = False
+                        elif byte == 34: quoted = True; string_bytes = 0
+                        elif byte in (123, 91):
+                            depth += 1; tokens += 1
+                            if depth == 1:
+                                items += 1
+                                if byte != 123: reason = 'download-json-structure'; break
+                            if depth > DOWNLOAD_DEPTH or items > expected_count:
+                                reason = 'structure-or-item-budget'; break
+                        elif byte in (125, 93): depth -= 1
+                        elif byte in (44, 58): tokens += 1
+                        if tokens > DOWNLOAD_TOKENS or depth < 0: reason = 'structure-budget'; break
+                    if reason is not None: break
+        if reason is None:
+            try: process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired: reason = 'deadline'
+        if reason is None and (process.returncode != 0 or group_alive(process.pid)):
+            reason = 'download-exit-or-live-group'
+        if reason is None:
+            def pairs(entries):
+                value = {}
+                for key, item in entries:
+                    if key in value: raise ValueError()
+                    value[key] = item
+                return value
+            def invalid_constant(_value): raise ValueError()
+            decoder = json.JSONDecoder(object_pairs_hook=pairs, parse_constant=invalid_constant)
+            text, cursor = raw.decode('utf-8'), 0
+            allowed = {'Path', 'Version', 'Info', 'GoMod', 'Zip', 'Dir', 'Sum', 'GoModSum', 'Origin', 'Reuse'}
+            while cursor < len(text):
+                if time.monotonic() >= deadline: reason = 'deadline'; break
+                while cursor < len(text) and text[cursor].isspace(): cursor += 1
+                if cursor == len(text): break
+                if len(rows) >= expected_count: reason = 'item-budget'; break
+                row, cursor = decoder.raw_decode(text, cursor)
+                if not isinstance(row, dict) or 'Error' in row: reason = 'download-json-error'; break
+                if not set(row) <= allowed or not all(isinstance(row.get(k), str) for k in ('Path', 'Version', 'Sum', 'Dir')):
+                    reason = 'download-json-structure'; break
+                if any(not isinstance(value, str) for key, value in row.items() if key not in ('Origin', 'Reuse')):
+                    reason = 'download-json-structure'; break
+                if 'Reuse' in row and type(row['Reuse']) is not bool:
+                    reason = 'download-json-structure'; break
+                if 'Origin' in row and (not isinstance(row['Origin'], dict) or
+                        not set(row['Origin']) <= {'VCS', 'URL', 'Subdir', 'Hash', 'TagSum', 'Ref', 'RepoSum'} or
+                        not all(isinstance(value, str) for value in row['Origin'].values())):
+                    reason = 'download-json-structure'; break
+                rows.append(row)
+            if reason is None and len(rows) != expected_count: reason = 'download-item-count'
+    except (OSError, RuntimeError, ValueError, RecursionError):
+        reason = reason or 'download-collection-or-json-error'
+    except BaseException:
+        reason = 'download-interrupted'
+    finally:
+        if process is not None:
+            end = time.monotonic() + DOWNLOAD_CLEANUP_SECONDS
+            try:
+                if process.poll() is None or group_alive(process.pid):
+                    try: os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError: pass
+                    try: process.wait(timeout=min(1, max(0.001, end - time.monotonic())))
+                    except subprocess.TimeoutExpired: pass
+                    if process.poll() is None or group_alive(process.pid):
+                        try: os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    if process.poll() is None:
+                        process.wait(timeout=max(0.001, end - time.monotonic()))
+                    while group_alive(process.pid) and time.monotonic() < end:
+                        time.sleep(min(0.02, max(0, end - time.monotonic())))
+                cleanup_complete = process.poll() is not None and not group_alive(process.pid)
+                if cleanup_complete: register_group(process.pid, finished=True)
+                else: reason = 'download-cleanup-incomplete'  # Keep ledger ownership.
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+                cleanup_complete = False; reason = 'download-cleanup-incomplete'
+            finally:
+                for stream in (process.stdout, process.stderr): stream.close()
+    report = {'schema': 'polaris-module-download-observation-v1', 'derivedObservation': True,
+              'complete': reason is None, 'reason': reason, 'cleanupComplete': cleanup_complete,
+              'stdoutBytesObserved': len(raw), 'stderrBytesObserved': stderr_bytes,
+              'linesObserved': lines, 'itemsObserved': items, 'itemsDecoded': len(rows),
+              'limits': {'stdoutBytes': DOWNLOAD_STDOUT_BYTES, 'stderrBytes': DOWNLOAD_STDERR_BYTES,
+                         'lineBytes': DOWNLOAD_LINE_BYTES, 'lines': DOWNLOAD_LINES, 'items': expected_count,
+                         'stringBytes': DOWNLOAD_STRING_BYTES, 'depth': DOWNLOAD_DEPTH, 'tokens': DOWNLOAD_TOKENS,
+                         'seconds': DOWNLOAD_SECONDS, 'cleanupSeconds': DOWNLOAD_CLEANUP_SECONDS},
+              'rawOutputRetained': False, 'inputValuesExported': False, 'processRSS': None,
+              'scope': 'bounded pipe/JSON collection only; module checksum/cache admission separately required'}
+    try: write_json(observation, report)
+    except (OSError, RuntimeError, ValueError): raise RuntimeError('module download observation could not be saved') from None
+    if reason is not None: raise RuntimeError('module download rejected: ' + reason) from None
+    return rows
+
+
 def admit_module_cache(source, graph, go, env, work):
     """Make already source-summed module directories observable before freezing.
 
@@ -312,9 +452,10 @@ def admit_module_cache(source, graph, go, env, work):
             'prior module admission inputs retained; explicit recovery required')
     for path, raw in [(modfile, originals['go.mod']), (sumfile, originals['go.sum'])]:
         with path.open('xb') as stream: stream.write(raw)
-    downloaded = module_stream(run([go, '-modfile=' + str(modfile), 'mod', 'download', '-json',
-                                   *[path + '@' + version for path, version in sorted(pending)]],
-                                  cwd=source, env=env, log=Path(work) / 'original-module-cache-admission.log'))
+    downloaded = bounded_module_download([go, '-modfile=' + str(modfile), 'mod', 'download', '-json',
+                                         *[path + '@' + version for path, version in sorted(pending)]],
+                                        cwd=source, env=env, expected_count=len(pending),
+                                        observation=Path(work) / 'module-cache-admission-observation.json')
     require(len(downloaded) == len(pending) and
             {(row['Path'], row.get('Version')) for row in downloaded} == set(pending) and
             all(row.get('Sum') == pending[(row['Path'], row.get('Version'))] and row.get('Dir') and not row.get('Error')
