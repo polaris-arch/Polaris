@@ -201,7 +201,18 @@ with the admitted
 link context, explicit Cargo target, locked dependencies and iOS config. It
 uses `cargo rustc --lib --crate-type staticlib` only for this iOS archive stage;
 the shared Cargo manifest retains Android's cdylib and the other library types.
-Swift bridge symbols must resolve in the subsequent full Xcode App link.
+Swift bridge symbols must be native global definitions in this archive before
+it is staged, then resolve in the subsequent full Xcode App link. The locked
+Tauri 2.11.5 and dialog/notification/shell 2.7.2/2.3.3/2.3.5 Swift packages declare
+their C entries with internal access. Their iOS inputs are staged under the
+existing Cargo `OUT_DIR/polaris-c-exports` slot (256 entries/4MiB combined cap),
+including the plugins' relative `.tauri/tauri-api` dependency. Only the seven
+known `@_cdecl` declarations receive `public`; versions, unique declarations,
+ordinary paths and byte budgets are checked, while implementations and package
+manifests/locks are preserved. Registry sources are untouched, and macOS keeps
+its original build path. The source-owned Polaris entry is explicitly public.
+The Rust receipt binds all eight observed global definitions and the three
+export-policy source hashes; Xcode's verification phase checks that binding.
 The pure Foundation control executable uses the selected Xcode's explicit Mac
 SDK and the actual host architecture with the existing Mac deployment target.
 Its environment is a separate copy; the iOS SDK/target used by the subsequent
@@ -209,7 +220,8 @@ full App/PacketTunnel link is unchanged. The control is compiled and run, never
 skipped to make a selected Apple gate green.
 It checks the actual static archive/start_app and saves its byte/source/tool facts;
 the native symbol check uses the existing `nm --no-llvm-bc -gU` mode, requires
-success plus a defined `_start_app` text symbol, and retains its full output.
+success plus a defined `_start_app` and all eight global Swift bridge text
+symbols, and retains its full output. Local/private names cannot satisfy it.
 Rust's compiler-builtins IR is left to the unchanged final Xcode link; this
 check does not claim IR compatibility or final carrier acceptance. Original
 archives are retained even when no accepted Rust receipt has been written.

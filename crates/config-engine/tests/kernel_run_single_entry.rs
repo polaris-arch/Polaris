@@ -134,7 +134,8 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             5,
             5,
         ),
-        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 3, 2),
+        // The socket lease control does not start a core; both runtime gates remain.
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 4, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             2,

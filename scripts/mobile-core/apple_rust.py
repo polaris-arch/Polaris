@@ -17,6 +17,12 @@ from fork_input import ROOT, canonical, load, require, sha
 from producer import ACTIVE_FDS, private_dir, run, write_json
 from budget import reservation
 
+SWIFT_BRIDGES = ('_init_plugin_dialog', '_init_plugin_notification', '_init_plugin_polaris_ios',
+                 '_init_plugin_shell', '_log_stdout', '_on_webview_created',
+                 '_register_plugin', '_run_plugin_command')
+SWIFT_EXPORT_POLICY = ('vendor/swift-rs/src-rs/build.rs', 'vendor/swift-rs/src-rs/ios_exports.rs',
+                       'crates/tauri-plugin-polaris-ios/ios/Sources/VpnPlugin.swift')
+
 
 def target_for(platform, arches, configuration):
     require(configuration == 'release', 'formal App hook requires release configuration')
@@ -65,6 +71,17 @@ def verify_start_app(archive, log):
     symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', archive], log=log)
     require(re.search(r'\b[Tt]\s+_start_app\s*$', symbols, re.MULTILINE),
             'actual Rust start_app definition missing')
+    return symbols
+
+
+def verify_swift_bridges(symbols):
+    # nm -gU is the actual native global-definition table, not a source marker
+    # or a local/private @_cdecl name. The original failed archive has all
+    # eight names only as local/private Mach-O nlist entries (n_type 0x1e).
+    for name in SWIFT_BRIDGES:
+        require(re.search(r'\bT\s+' + re.escape(name) + r'\s*$', symbols, re.MULTILINE),
+                'actual global Swift bridge definition missing: ' + name)
+    return list(SWIFT_BRIDGES)
 
 
 def build():
@@ -126,13 +143,15 @@ def build_reserved():
                   for name in ('cargo', 'rustc')}
     tool_pins = {name: {'path': str(path), **file_pin(path)} for name, path in tool_paths.items()}
     env['RUSTC'] = str(tool_paths['rustc'])
-    # Swift bridge symbols resolve in the final Xcode App link, after this archive.
+    # The final Xcode link needs global native Swift bridge definitions in this
+    # archive. Source declarations or local/private names cannot satisfy it.
     command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
                '--target', triple, '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib']
     run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'))
     archive = target / triple / 'release/libpolaris_lib.a'
     require(not archive.is_symlink() and archive.read_bytes().startswith(b'!<arch>\n'), 'actual Rust static archive required')
-    verify_start_app(archive, root / ('original-rust-symbols-' + triple + '.log'))
+    bridges = verify_swift_bridges(verify_start_app(
+        archive, root / ('original-rust-symbols-' + triple + '.log')))
     pin = file_pin(archive)
     dest = ROOT / 'src-tauri/gen/apple/Externals' / os.environ['ARCHS'] / 'release/libapp.a'
     for parent in [dest, *dest.parents]:
@@ -153,6 +172,8 @@ def build_reserved():
                'rustc': run([tool_paths['rustc'], '-vV']), 'tools': tool_pins,
                'cargoLock': file_pin(ROOT / 'Cargo.lock'),
                'iosConfig': file_pin(ROOT / 'src-tauri/tauri.ios.conf.json'),
+               'swiftBridgeDefinitions': bridges,
+               'swiftExportPolicy': {name: file_pin(ROOT / name) for name in SWIFT_EXPORT_POLICY},
                'linkInputSha256': os.environ['POLARIS_MOBILE_LINK_INPUT_SHA256'],
                'originalWireArchive': {'path': str(library), **file_pin(library)},
                'wireSelection': selection, 'wireArchive': {'path': str(wire), **file_pin(wire)},
@@ -185,6 +206,8 @@ def verify():
             Path(receipt['linkedArchive']) == expected and file_pin(expected) == receipt['archive'] and
             receipt['cargoLock'] == file_pin(ROOT / 'Cargo.lock') and
             receipt['iosConfig'] == file_pin(ROOT / 'src-tauri/tauri.ios.conf.json') and
+            receipt.get('swiftBridgeDefinitions') == list(SWIFT_BRIDGES) and
+            receipt.get('swiftExportPolicy') == {name: file_pin(ROOT / name) for name in SWIFT_EXPORT_POLICY} and
             Path(os.environ['SDKROOT']).resolve(strict=True) == Path(receipt['sdk']) and
             receipt['devicePassed'] is False, 'actual compiled Rust/Xcode input differs')
     slice_name = ('ios-arm64' if os.environ['PLATFORM_NAME'] == 'iphoneos' else

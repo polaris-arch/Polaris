@@ -83,8 +83,20 @@ fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() 
     let b_port = b.local_addr().unwrap().port();
     assert!(!excluded.contains(&a_port) && !excluded.contains(&b_port));
     assert_ne!(a_port, b_port);
-    assert!(UdpSocket::bind(("::1", a_port)).is_err());
-    assert!(UdpSocket::bind(("::1", b_port)).is_err());
+    // Match WireGuard's wildcard bind. Windows permits a same-user specific
+    // loopback bind while a default wildcard socket is held; this is not an
+    // SO_EXCLUSIVEADDRUSE lease over every address.
+    #[cfg(windows)]
+    {
+        let a_loopback = UdpSocket::bind(("::1", a_port)).unwrap();
+        let b_loopback = UdpSocket::bind(("::1", b_port)).unwrap();
+        assert_eq!(a_loopback.local_addr().unwrap().port(), a_port);
+        assert_eq!(b_loopback.local_addr().unwrap().port(), b_port);
+    }
+    for port in [a_port, b_port] {
+        let error = UdpSocket::bind(("::", port)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
 }
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))

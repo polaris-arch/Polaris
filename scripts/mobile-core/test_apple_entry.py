@@ -252,6 +252,21 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, '^invalid native object$'):
             apple_rust.verify_start_app(archive, log)
 
+    def test_all_eight_native_global_swift_entries_are_required_before_staging_app_archive(self):
+        entries = apple_rust.SWIFT_BRIDGES
+        complete = ''.join('00000000 T ' + name + '\n' for name in entries)
+        self.assertEqual(apple_rust.verify_swift_bridges(complete), list(entries))
+        # Each missing, undefined or local/private entry is a real link gap.
+        for name in entries:
+            for replacement in ('', '                 U ' + name + '\n',
+                                '00000000 t ' + name + '\n', '00000000 T ' + name + '_extra\n'):
+                with self.subTest(name=name, replacement=replacement), \
+                        self.assertRaisesRegex(RuntimeError, 'actual global Swift bridge definition missing'):
+                    apple_rust.verify_swift_bridges(complete.replace('00000000 T ' + name + '\n', replacement))
+        original_partial_log = '00000000 T _start_app\n'
+        with self.assertRaisesRegex(RuntimeError, 'actual global Swift bridge definition missing'):
+            apple_rust.verify_swift_bridges(original_partial_log)
+
     def test_hosted_selection_rejects_default_xcode_wrong_build_and_either_old_sdk_before_tool_install(self):
         value = ci_apple.load()
         apple = value['apple']
@@ -299,7 +314,7 @@ class AppleEntryTests(unittest.TestCase):
             work = root / 'work'; work.mkdir(mode=0o700)
             archive = root / 'src-tauri/gen/apple/Externals/arm64/release/libapp.a'
             archive.parent.mkdir(parents=True); archive.write_bytes(b'!<arch>\ninert control')
-            for name in ['Cargo.lock', 'src-tauri/tauri.ios.conf.json']:
+            for name in ['Cargo.lock', 'src-tauri/tauri.ios.conf.json', *apple_rust.SWIFT_EXPORT_POLICY]:
                 path = root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b'inert source')
             tool = root / 'tool'; tool.write_bytes(b'inert tool')
             framework = root / 'Libbox.xcframework'
@@ -315,6 +330,8 @@ class AppleEntryTests(unittest.TestCase):
                        'linkedArchive': str(archive), 'archive': file_pin(archive),
                        'cargoLock': file_pin(root / 'Cargo.lock'),
                        'iosConfig': file_pin(root / 'src-tauri/tauri.ios.conf.json'),
+                       'swiftBridgeDefinitions': list(apple_rust.SWIFT_BRIDGES),
+                       'swiftExportPolicy': {name: file_pin(root / name) for name in apple_rust.SWIFT_EXPORT_POLICY},
                        'tools': {'cargo': {'path': str(tool), **file_pin(tool)}}, 'devicePassed': False,
                        'originalWireArchive': {'path': str(original), **file_pin(original)},
                        'wireArchive': {'path': str(wire), **file_pin(wire)}, 'wireSelection': selection}
@@ -328,6 +345,17 @@ class AppleEntryTests(unittest.TestCase):
                     mock.patch.object(apple_rust, 'verify_link', return_value=link):
                 apple_rust.verify()
                 self.assertNotIn('POLARIS_BUILD_RESERVATION_FD', apple_rust.os.environ)
+                for field in ('swiftBridgeDefinitions', 'swiftExportPolicy'):
+                    changed = {key: val for key, val in receipt.items() if key not in (field, 'fingerprint')}
+                    changed['fingerprint'] = sha(canonical(changed))
+                    with mock.patch.object(apple_rust, 'read_receipt', return_value=changed), \
+                            self.assertRaisesRegex(RuntimeError, 'input differs'):
+                        apple_rust.verify()
+                policy = root / apple_rust.SWIFT_EXPORT_POLICY[0]
+                policy.write_bytes(b'changed export policy')
+                with self.assertRaisesRegex(RuntimeError, 'input differs'):
+                    apple_rust.verify()
+                policy.write_bytes(b'inert source')
                 archive.write_bytes(b'!<arch>\nchanged')
                 with self.assertRaisesRegex(RuntimeError, 'input differs'):
                     apple_rust.verify()

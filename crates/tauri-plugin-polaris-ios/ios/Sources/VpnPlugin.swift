@@ -666,4 +666,4 @@ private func vpnError(_ message: String) -> NSError {
     NSError(domain: "PolarisVPN", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
 }
 @_cdecl("init_plugin_polaris_ios")
-func initPlugin() -> Plugin { VpnPlugin() }
+public func initPlugin() -> Plugin { VpnPlugin() }
