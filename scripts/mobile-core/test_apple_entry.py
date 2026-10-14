@@ -603,6 +603,64 @@ class AppleEntryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'duplicate'):
             parser.macho(fixtures.mach_object('ios-arm64', load_commands=[duplicate, duplicate]), helper)
 
+    def test_actual_linked_weak_swift_libraries_and_rpaths_are_structurally_recorded(self):
+        fixtures = module('formal_dyld_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_dyld_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_dyld_info', 'scripts/libbox-patches/android-source.py')
+        # Exact device-arm64 App/PacketTunnel command bytes from ab8cf's IPA.
+        weak = bytes.fromhex('18000080480000001800000002000000014d9209000001002f7573722f6c69622f73776966742f6c696273776966744156466f756e646174696f6e2e64796c696200000000000000')
+        rpaths = [bytes.fromhex(raw) for raw in (
+            '1c000080200000000c0000002f7573722f6c69622f7377696674000000000000',
+            '1c000080280000000c0000004065786563757461626c655f706174682f4672616d65776f726b7300',
+            '1c000080300000000c0000004065786563757461626c655f706174682f2e2e2f2e2e2f4672616d65776f726b73000000',
+        )]
+        for target in ('ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'):
+            observed = parser.macho(fixtures.mach_object(target, kind=2, load_commands=[weak, *rpaths]), helper)
+            rows = [r for r in observed['loadCommands'] if r['command'] in (0x80000018, 0x8000001c)]
+            self.assertEqual([r['payloadHex'] for r in rows], [c.hex() for c in [weak, *rpaths]])
+            self.assertEqual(rows[0]['name'], '/usr/lib/swift/libswiftAVFoundation.dylib')
+            self.assertTrue(rows[0]['weak'])
+            self.assertEqual((rows[0]['timestamp'], rows[0]['currentVersionRaw'], rows[0]['compatibilityVersionRaw']),
+                             struct.unpack_from('<3I', weak, 12))
+            self.assertEqual([r['name'] for r in rows[1:]],
+                             ['/usr/lib/swift', '@executable_path/Frameworks', '@executable_path/../../Frameworks'])
+
+    def test_weak_dylib_and_rpath_refuse_malformed_strings_versions_kind_and_unknown_commands(self):
+        fixtures = module('formal_dyld_negative_fixtures', 'scripts/apple-carrier.test.py')
+        parser = module('formal_dyld_negative_parser', 'scripts/apple-carrier.py')
+        helper = module('formal_dyld_negative_info', 'scripts/libbox-patches/android-source.py')
+        def command(kind, name, offset=None):
+            base = 24 if kind == 0x80000018 else 12
+            size = (base + len(name) + 1 + 7) // 8 * 8
+            head = struct.pack('<3I', kind, size, base if offset is None else offset)
+            if kind == 0x80000018:
+                head += struct.pack('<3I', 2, 0x10000, 0x10000)
+            return head + name + bytes(size - base - len(name))
+        for kind, valid in [(0x80000018, b'/usr/lib/swift/libswiftCoreFoundation.dylib'),
+                            (0x8000001c, b'@executable_path/Frameworks')]:
+            good = command(kind, valid)
+            bads = [command(kind, valid, 0), command(kind, valid, len(good)), command(kind, valid, 32),
+                    command(kind, valid + bytes(160)), command(kind, b''),
+                    command(kind, b'\xff'), command(kind, b'/private/evil.dylib'),
+                    command(kind, b'/usr/lib/swift/../evil.dylib'), command(kind, b'@rpath/evil.dylib')]
+            no_nul = bytearray(good); no_nul[24 if kind == 0x80000018 else 12:] = b'x' * (len(good) - (24 if kind == 0x80000018 else 12)); bads.append(bytes(no_nul))
+            padding = bytearray(good + bytes(8)); struct.pack_into('<I', padding, 4, len(padding)); bads.append(bytes(padding))
+            trailing = bytearray(command(kind, valid + b'\0x')); bads.append(bytes(trailing))
+            undersized = struct.pack('<4I', kind, 16, 12, 0); bads.append(undersized)
+            unknown = bytearray(good); struct.pack_into('<I', unknown, 0, 0x80000017); bads.append(bytes(unknown))
+            for bad in bads:
+                with self.subTest(kind=kind, bad=bad.hex()), self.assertRaises(RuntimeError):
+                    parser.macho(fixtures.mach_object('ios-arm64', kind=2, load_commands=[bad]), helper)
+            with self.assertRaisesRegex(RuntimeError, 'linked executable'):
+                parser.macho(fixtures.mach_object('ios-arm64', load_commands=[good]), helper)
+            if kind == 0x80000018:
+                wrong = bytearray(good); struct.pack_into('<I', wrong, 16, 0)
+                with self.assertRaisesRegex(RuntimeError, 'version relationship'):
+                    parser.macho(fixtures.mach_object('ios-arm64', kind=2, load_commands=[bytes(wrong)]), helper)
+            else:
+                with self.assertRaisesRegex(RuntimeError, 'duplicate executable rpath'):
+                    parser.macho(fixtures.mach_object('ios-arm64', kind=2, load_commands=[good, good]), helper)
+
     def test_observed_linker_option_command_bytes_are_parsed_and_recorded_for_object_only(self):
         fixtures = module('formal_linker_option_fixtures', 'scripts/apple-carrier.test.py')
         parser = module('formal_linker_option_parser', 'scripts/apple-carrier.py')

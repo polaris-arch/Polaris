@@ -213,6 +213,13 @@ manifests/locks are preserved. Registry sources are untouched, and macOS keeps
 its original build path. The source-owned Polaris entry is explicitly public.
 The Rust receipt binds all eight observed global definitions and the three
 export-policy source hashes; Xcode's verification phase checks that binding.
+The subsequent carrier predicate also parses the device outputs' weak system
+Swift dylib loads and three observed executable rpaths, retaining exact command
+payloads and version fields. These commands are limited to linked executables;
+string bounds/UTF-8/zero padding, system Swift paths, rpath inventory/duplicates
+and version relationships fail closed. Unknown commands still fail. Parsing a
+command does not accept a carrier, signing or device execution; the full
+App/extension/source/static-link predicates remain required.
 The pure Foundation control executable uses the selected Xcode's explicit Mac
 SDK and the actual host architecture with the existing Mac deployment target.
 Its environment is a separate copy; the iOS SDK/target used by the subsequent

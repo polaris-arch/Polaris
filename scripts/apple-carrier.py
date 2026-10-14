@@ -100,6 +100,7 @@ def macho(data, helper):
     limit, position = 32 + command_bytes, 32
     sections, segments, vm_segments, platforms, commands, auxiliary = [], [], [], [], [], []
     symbols, dynamic, optimization_hint = None, None, None
+    rpaths = set()
     for ordinal in range(count):
         bounds(position, 8, limit, 'load-command header')
         command, size = struct.unpack_from('<II', data, position)
@@ -223,6 +224,41 @@ def macho(data, helper):
             if length:
                 require(off >= limit, 'linkedit data in headers')
                 auxiliary.append((off, off + length))
+        elif command in (0x80000018, 0x8000001c):
+            # Real device App/PacketTunnel outputs use LC_LOAD_WEAK_DYLIB and
+            # LC_RPATH (Apple mach-o/loader.h). These are linked-image commands,
+            # not MH_OBJECT linker options; retain exact fields and payload.
+            require(kind == 2, 'weak dylib/rpath requires linked executable')
+            base = 24 if command == 0x80000018 else 12
+            require(base + 1 <= size <= 160, 'weak dylib/rpath command size')
+            off = struct.unpack_from('<I', data, position + 8)[0]
+            require(off == base and off < size,
+                    'weak dylib/rpath string offset/prefix')
+            stop = data.find(b'\0', position + off, position + size)
+            require(position + off < stop <= position + off + 128,
+                    'weak dylib/rpath string termination/length')
+            padding = position + size - stop - 1
+            require(padding < 8 and not data[stop + 1:position + size].strip(b'\0'),
+                    'weak dylib/rpath string padding')
+            try:
+                name = data[position + off:stop].decode('utf-8', errors='strict')
+            except UnicodeDecodeError as error:
+                raise RuntimeError('Apple carrier: weak dylib/rpath UTF-8') from error
+            row = {'name': name, 'nameOffset': off, 'paddingBytes': padding,
+                   'payloadHex': data[position:position + size].hex()}
+            if command == 0x80000018:
+                require(re.fullmatch(r'/usr/lib/swift/libswift[A-Za-z0-9_]{1,64}\.dylib', name),
+                        'weak dylib must be an observed system Swift library')
+                timestamp, current, compatibility = struct.unpack_from('<3I', data, position + 12)
+                require(current >= compatibility, 'weak dylib version relationship')
+                row.update(weak=True, timestamp=timestamp, currentVersionRaw=current,
+                           compatibilityVersionRaw=compatibility)
+            else:
+                require(name in ('/usr/lib/swift', '@executable_path/Frameworks',
+                                 '@executable_path/../../Frameworks') and name not in rpaths,
+                        'unobserved or duplicate executable rpath')
+                rpaths.add(name)
+            commands[-1].update(row)
         elif command in (12, 14):
             base = 24 if command == 12 else 12
             require(size >= base, 'dylib/dylinker command size')
