@@ -425,13 +425,22 @@ def carrier_summary(root, slot):
            'receipt': receipt, 'receiptPin': file_pin(receipt_path),
            'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False}
     row['fingerprint'] = receipt_digest(row)
-    write_json(root / ('carrier-' + slot + '.json'), row)
-    # Preserve actual pretty receipt bytes for aggregate SHA comparison.
-    shutil.copyfile(receipt_path, root / 'summary-app-carrier.json')
     rust_path = Path(receipt['rustInput']['receipt'])
     require(rust_path.is_relative_to(root / slot) and file_pin(rust_path) ==
             {k: receipt['rustInput'][k] for k in ('bytes', 'sha256')}, 'original Rust receipt changed')
-    shutil.copyfile(rust_path, root / 'summary-rust-receipt.json')
+    # One host executes several slots. Neither a later slot nor a repeated
+    # export may replace an earlier slot's accepted original bytes.
+    summary = root / 'summaries' / slot
+    private_dir(summary.parent)
+    summary.mkdir(mode=0o700)
+    write_json(summary / ('carrier-' + slot + '.json'), row)
+    for source, name in [(receipt_path, 'summary-app-carrier.json'),
+                         (rust_path, 'summary-rust-receipt.json')]:
+        expected = file_pin(source)
+        with source.open('rb') as original, (summary / name).open('xb') as output:
+            shutil.copyfileobj(original, output)
+        require(file_pin(source) == expected and file_pin(summary / name) == expected,
+                'original summary bytes changed during export')
 
 
 def aggregate(folder, output):

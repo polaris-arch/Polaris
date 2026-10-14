@@ -38,6 +38,11 @@ fn same_process_holder_and_parent_file_close_have_distinct_original_observations
         nix::fcntl::fcntl(owner.file.as_ref().unwrap(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
     let error = failure(&store);
     let snapshot = observed(&error);
+    writeln!(
+        io::stderr().lock(),
+        "LOCK_CONTROL_SAME_PROCESS phase=owner-held {error}"
+    )
+    .unwrap();
     assert!(snapshot
         .events
         .iter()
@@ -76,6 +81,23 @@ fn same_process_holder_and_parent_file_close_have_distinct_original_observations
 }
 
 struct ChildCleanup(Option<i32>);
+
+// Direct OS stderr is retained for successful controls too. libtest captures
+// eprintln! on success, which otherwise hides the PID needed to distinguish
+// this exact diagnostic subprocess from an unrelated production spawn.
+fn control_origin(phase: &str, child_pid: Option<u32>) {
+    let unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_nanos());
+    writeln!(
+        io::stderr().lock(),
+        "LOCK_CONTROL_ORIGIN origin=isolated-inherited-cloexec phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} scope=test-only-not-production",
+        std::process::id()
+    )
+    .unwrap();
+}
+
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
         // This guard owns the unreaped child. Even assertion failure releases
@@ -105,12 +127,29 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
         // The deliberate fork barrier must not inherit and prolong unrelated
         // parallel unit tests' descriptors. Exec the exact control first; its
         // later fork sees only this isolated fixture, not the full test cohort.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        control_origin("before-exact-exec", None);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "core_store::lock_diagnostics::tests::inherited_cloexec_description_remains_observable_after_parent_file_closes", "--nocapture"])
             .env(PROBE, "isolated-v1")
             .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap(); // output() concurrently drains both captured streams.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        control_origin("exact-exec-returned", Some(child_pid));
+        let output = child.wait_with_output().unwrap(); // Drains both streams concurrently.
+        control_origin("exact-child-reaped", Some(child_pid));
+        // Only this control's closed diagnostic records are forwarded, not
+        // arbitrary child arguments, environment, stdout or panic contents.
+        for line in String::from_utf8_lossy(&output.stderr).lines() {
+            if line.len() <= 64 * 1024
+                && (line.starts_with("LOCK_CONTROL_ORIGIN ")
+                    || line.starts_with("controlled-fork-only-child-pid="))
+            {
+                writeln!(io::stderr().lock(), "{line}").unwrap();
+            }
+        }
         eprintln!(
             "isolated-lock-control stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
@@ -170,7 +209,12 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
     drop(owner);
     let error = failure(&store);
     let snapshot = observed(&error);
-    eprintln!("controlled-fork-only-child-pid={pid} {error}");
+    control_origin("forced-fork-after-parent-file-drop", Some(pid as u32));
+    writeln!(
+        io::stderr().lock(),
+        "controlled-fork-only-child-pid={pid} {error}"
+    )
+    .unwrap();
     assert!(snapshot
         .events
         .iter()

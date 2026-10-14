@@ -31,22 +31,72 @@ test('selected Apple failure/skip is consumed by the existing aggregate gate', (
   assert.match(risk, /node scripts\/apple-ci-impact\.mjs --full/);
 });
 
-test('Apple workflow hands one component to three isolated carriers and preserves failed evidence', () => {
+test('Apple workflow keeps one admitted host and three complete isolated carrier outputs', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
   assert.match(workflow, /runs-on: xcode-27/);
-  for (const action of ['prepare', 'build', 'import', 'carrier', 'aggregate', 'evidence']) {
+  for (const action of ['prepare', 'build', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot']) {
     assert.match(workflow, new RegExp(`ci_apple.py ${action}`));
   }
-  assert.match(workflow, /carrier:\n\s+needs: component/);
-  assert.match(workflow, /fail-fast: false/);
-  assert.match(workflow, /slot: \[device-arm64, sim-arm64, sim-amd64\]/);
-  assert.match(workflow, /unsigned-chain:\n\s+needs: \[component, carrier\]\n\s+if: always\(\)/);
+  assert.doesNotMatch(workflow, /\n  carrier:\n/);
+  assert.equal((workflow.match(/ci_apple.py build/g) || []).length, 1);
+  assert.equal((workflow.match(/ci_apple.py carrier --slot/g) || []).length, 3);
+  assert.match(workflow, /unsigned-chain:\n\s+needs: component\n\s+if: always\(\)/);
+  for (const slot of ['device-arm64', 'sim-arm64', 'sim-amd64']) {
+    const id = slot.replaceAll('-', '_');
+    const start = workflow.indexOf('id: ' + id + '\n');
+    const original = workflow.indexOf('id: original_' + id + '\n', start);
+    const summary = workflow.indexOf('/summaries/' + slot + '/', original);
+    const retire = workflow.indexOf('retire-slot --slot "' + slot + '"', summary);
+    assert.ok(start >= 0 && original > start && summary > original && retire > summary);
+    assert.match(workflow.slice(start, original), /!cancelled\(\) && steps.shared_ready.conclusion == 'success'/);
+    assert.match(workflow.slice(summary, retire), new RegExp('steps.original_' + id + ".conclusion == 'success'"));
+  }
   assert.match(workflow, /if: always\(\)/);
   assert.match(workflow, /contents: read/);
   assert.doesNotMatch(workflow, /contents: write|secrets:|publish_release|codesign --sign/);
   const hook = readFileSync(new URL('../src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
   assert.match(hook, /POLARIS_FORMAL_APP_BUILD/);
   assert.match(hook, /mobile-core\/apple_rust\.py/);
+});
+
+test('shared prerequisite failure builds no carriers while first carrier failure leaves later slots selected', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
+  const shared = workflow.slice(workflow.indexOf('id: shared_ready'), workflow.indexOf('id: device_arm64'));
+  const condition = shared.match(/if: (.+)/)[1];
+  const prerequisites = [...condition.matchAll(/steps\.(\w+)\.conclusion == 'success'/g)].map(m => m[1]);
+  for (const required of ['shared_component', 'component_payload', 'component_manifest',
+    'component_original', 'local_component', 'protoc', 'rust_cache']) {
+    assert.ok(prerequisites.includes(required));
+  }
+  const nativeConditions = ['device_arm64', 'sim_arm64', 'sim_amd64'].map(id => {
+    const block = workflow.slice(workflow.indexOf('id: ' + id + '\n'));
+    return block.match(/if: (.+)/)[1];
+  });
+  for (const text of nativeConditions) {
+    assert.match(text, /!cancelled\(\) && steps.shared_ready.conclusion == 'success'/);
+    assert.doesNotMatch(text, /steps\.(device_arm64|sim_arm64|sim_amd64)\./);
+  }
+  const selectedCount = statuses => {
+    const ready = prerequisites.every(id => statuses[id] === 'success');
+    return nativeConditions.filter(text => ready && text.includes('steps.shared_ready')).length;
+  };
+  const success = Object.fromEntries(prerequisites.map(id => [id, 'success']));
+  assert.equal(selectedCount(success), 3);
+  for (const id of prerequisites) {
+    for (const state of ['failure', 'skipped', 'cancelled']) {
+      assert.equal(selectedCount({ ...success, [id]: state }), 0);
+    }
+  }
+  assert.equal(selectedCount({ ...success, device_arm64: 'failure' }), 3);
+});
+
+test('one native host rejects mismatched tools before setup without carrier transport', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
+  const component = workflow.slice(workflow.indexOf('\n  component:\n'), workflow.indexOf('\n  unsigned-chain:\n'));
+  const admission = component.indexOf('ci_apple.py admit');
+  assert.ok(admission > component.indexOf('actions/checkout@v7'));
+  assert.ok(admission < component.indexOf('actions/setup-go@v7'));
+  assert.doesNotMatch(component, /actions\/download-artifact|ci_apple.py import --handoff/);
 });
 
 test('actual aggregate shell refuses every selected non-success Apple status', () => {

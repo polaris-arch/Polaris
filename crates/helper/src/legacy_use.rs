@@ -120,11 +120,19 @@ fn capture(mut input: impl Read) -> io::Result<Vec<u8>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn observe_command(command: &mut Command) -> io::Result<(i32, Vec<u8>, Vec<u8>)> {
+    #[cfg(all(test, target_os = "macos"))]
+    crate::core_store::observe_test_spawn("legacy-use-observer", "before-spawn", None);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    #[cfg(all(test, target_os = "macos"))]
+    crate::core_store::observe_test_spawn(
+        "legacy-use-observer",
+        "spawn-returned",
+        Some(child.id()),
+    );
     let out = child
         .stdout
         .take()

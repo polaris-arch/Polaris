@@ -182,6 +182,34 @@ the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runne
 is an environment failure, never grounds to weaken the reservation or skip a
 selected leg. The eventual unified run must establish actual runner resources.
 
+The component and all three carriers now run in the same admitted hosted job.
+The official selected RC rollout must finish before dispatch; early admission
+does not pin a rolling hosted image. The local-import adapter reuses the frozen
+component and the existing complete original-source/compiler/SDK byte verifier,
+without extracting over files or manufacturing a new receipt. Each carrier has
+its own work/derived-data and target triple; execution is initially sequential
+because the checkout's arm64 Externals staging is shared. This reduces cross-host
+drift, not a claim of faster wall time.
+
+Each slot exports create-new summary files under summaries/<slot>. Its original
+linked Rust archive is copied and checked before another arm64 platform can
+replace staging; success and failure originals have distinct slot ZIP names.
+A failed slot does not suppress the remaining selected slots, and the final
+aggregate still requires all three exact same-run/source/component results.
+Shared component uploads, protobuf setup, cache setup and local verification
+must all succeed before any carrier is selected; a carrier failure does not
+change that shared readiness for later slots. Slot ZIPs retain the independent
+stdout/stderr raw streams even when the combined log is unfinished. Staging
+bytes that disagree with a Rust receipt are copied as explicitly unaccepted
+evidence with their actual hash. Unsafe or incomplete preservation blocks the
+next slot sharing that staging path, while different staging remains eligible.
+After an original ZIP uploads, retirement borrows the same work/cache locks,
+checks the retained archive's native bytes, then removes only that slot's
+rebuildable Rust target triple and derived-data. A surviving child-held lock or
+incomplete original preservation prevents retirement. Component inputs, shared
+host dependencies, receipts, logs, IPA and original ZIPs remain, with the fixed
+20GiB cache bound and existing build reservation unchanged.
+
 CPU/affinity/quota, load and memory observations guide child Go/Rust/Xcode
 concurrency. The 2GiB/compiler plus 1GiB headroom is an unmeasured estimate,
 not a memory reservation or compilation admission condition. Low or unknown

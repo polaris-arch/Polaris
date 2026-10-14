@@ -16,6 +16,15 @@ type MutationLock = lock_diagnostics::MutationLock;
 #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
 type MutationLock = File;
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn observe_test_spawn(
+    origin: &'static str,
+    phase: &'static str,
+    child_pid: Option<u32>,
+) {
+    lock_diagnostics::spawn_origin(origin, phase, child_pid);
+}
+
 #[derive(Clone, Copy)]
 enum LockRole {
     StoreMutationExclusive,

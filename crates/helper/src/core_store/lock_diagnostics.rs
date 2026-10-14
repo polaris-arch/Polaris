@@ -11,6 +11,24 @@ const MAX_EVENTS: usize = 512;
 const MAX_PROCESSES: usize = 64;
 const MAX_FDS: usize = 512;
 const MAX_PEERS: usize = 32;
+
+#[cfg(target_os = "macos")]
+pub(super) fn spawn_origin(origin: &'static str, phase: &'static str, child_pid: Option<u32>) {
+    use std::io::Write;
+    let unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_nanos());
+    // Source-owned category/PID/time only; never arguments, paths or env.
+    // This is observation in the unit-test process, not production logging,
+    // process authority or serialization of spawn and lock acquisition.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "TEST_SPAWN_ORIGIN origin={origin} phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} scope=test-process-only",
+        std::process::id()
+    );
+}
+
 #[derive(Default)]
 struct History {
     events: VecDeque<ScopeEvent>,
@@ -474,7 +492,7 @@ mod platform {
                 );
                 if n <= 0
                     || n as usize > size_of_val(&fds)
-                    || n as usize % size_of::<libc::proc_fdinfo>() != 0
+                    || !(n as usize).is_multiple_of(size_of::<libc::proc_fdinfo>())
                 {
                     result.unavailable += 1;
                     continue;

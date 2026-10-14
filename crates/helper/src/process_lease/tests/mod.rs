@@ -52,11 +52,23 @@ fn live_inherited_child_keeps_lease_after_controller_description_closes() {
         FcntlArg::F_SETFD(FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC),
     )
     .unwrap();
+    #[cfg(target_os = "macos")]
+    crate::core_store::observe_test_spawn(
+        "process-lease-inherited-child-control",
+        "before-spawn",
+        None,
+    );
     let mut child = std::process::Command::new("/bin/sh")
         .args(["-c", "read -r finish"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    #[cfg(target_os = "macos")]
+    crate::core_store::observe_test_spawn(
+        "process-lease-inherited-child-control",
+        "spawn-returned",
+        Some(child.id()),
+    );
     drop(owner);
     let contender = OpenOptions::new()
         .read(true)
@@ -66,6 +78,12 @@ fn live_inherited_child_keeps_lease_after_controller_description_closes() {
     let blocked = apply(&path, contender.as_raw_fd(), false).is_err();
     child.stdin.take().unwrap().write_all(b"finish\n").unwrap();
     assert!(child.wait().unwrap().success());
+    #[cfg(target_os = "macos")]
+    crate::core_store::observe_test_spawn(
+        "process-lease-inherited-child-control",
+        "wait-returned",
+        Some(child.id()),
+    );
     assert!(
         blocked,
         "inherited child still owns the original file description"

@@ -14,6 +14,64 @@ class AppleHandoffControls(unittest.TestCase):
     ctx = {'candidate': 'a' * 40, 'runId': '123', 'attempt': '1', 'repository': 'polaris-arch/Polaris'}
     app = {'candidate': 'a' * 40, 'files': {'synthetic.py': {'bytes': 1, 'sha256': 'b' * 64}}}
 
+    def test_three_same_host_exports_preserve_each_original_and_reject_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'component-transport.json').write_text(json.dumps({'original': 'same-run'}))
+            retained = {}
+            with mock.patch.object(handoff, 'context', return_value=self.ctx):
+                for slot in handoff.SLOTS:
+                    work = root / slot; work.mkdir(mode=0o700)
+                    rust = work / 'rust-original.json'; rust.write_text(json.dumps({'slot': slot}))
+                    receipt = {'App': self.app, 'devicePassed': False,
+                               'rustInput': {'receipt': str(rust), **file_pin(rust)}}
+                    original = work / 'app-carrier.json'
+                    original.write_text(json.dumps(receipt, indent=2) + '\n')
+                    handoff.carrier_summary(root, slot)
+                    export = root / 'summaries' / slot
+                    self.assertEqual((export / 'summary-app-carrier.json').read_bytes(), original.read_bytes())
+                    self.assertEqual((export / 'summary-rust-receipt.json').read_bytes(), rust.read_bytes())
+                    retained[slot] = {f.name: f.read_bytes() for f in export.iterdir()}
+                for slot in handoff.SLOTS:
+                    self.assertEqual({f.name: f.read_bytes() for f in (root / 'summaries' / slot).iterdir()},
+                                     retained[slot])
+                with self.assertRaises(FileExistsError):
+                    handoff.carrier_summary(root, 'device-arm64')
+            self.assertFalse((root / 'summary-app-carrier.json').exists())
+            self.assertFalse((root / 'summary-rust-receipt.json').exists())
+
+    def test_local_component_adapter_uses_full_original_verifier_without_restore_or_reproduce(self):
+        import ci_apple
+        from contextlib import nullcontext
+        root = Path('/same-host/fixed')
+        paths = {n: str(root / n) for n in ('component-work', 'cache', 'source', 'go', 'gomobile', 'gobind', 'developer')}
+        tools = {'paths': paths, 'rustc': 'exact-compiler-version'}
+        with mock.patch.object(ci_apple, 'location', return_value=root), \
+                mock.patch.object(ci_apple, 'selected_apple_tools'), \
+                mock.patch.object(ci_apple, 'read_receipt', side_effect=[tools, {'original': 'transport'}]), \
+                mock.patch.object(ci_apple, 'private_dir', side_effect=lambda p: p), \
+                mock.patch.object(ci_apple, 'lease', return_value=nullcontext()), \
+                mock.patch.object(ci_apple, 'phase_timing', return_value=nullcontext()), \
+                mock.patch.object(ci_apple, 'run', return_value=tools['rustc']) as run, \
+                mock.patch.object(ci_apple, 'write_json') as save, \
+                mock.patch.object(handoff, 'context', return_value=self.ctx), \
+                mock.patch.object(handoff, 'verify_import') as verify, \
+                mock.patch.object(handoff, 'import_bundle') as restore:
+            ci_apple.import_local()
+            verify.assert_called_once_with(Path(paths['component-work']), Path(paths['cache']),
+                                           *(paths[n] for n in ('source', 'go', 'gomobile', 'gobind', 'developer')))
+            restore.assert_not_called()
+            run.assert_called_once_with(['rustc', '-vV'])
+            self.assertTrue(save.call_args.args[1]['completed'])
+            self.assertEqual(save.call_args.args[1]['context'], self.ctx)
+            verify.side_effect = RuntimeError('actual compiler bytes differ')
+            save.reset_mock()
+            # Reset the original input reader for the second rejected call.
+            ci_apple.read_receipt.side_effect = [tools]
+            with self.assertRaisesRegex(RuntimeError, 'actual compiler bytes differ'):
+                ci_apple.import_local()
+            save.assert_not_called()
+
     def manifest(self, root, checkout):
         return self.signed({'schema': 'polaris-apple-component-handoff-v1', 'context': self.ctx,
             'producerJob': 'component', 'root': str(root), 'checkout': str(checkout),
@@ -102,13 +160,20 @@ class AppleHandoffControls(unittest.TestCase):
         import ci_apple
         from contextlib import nullcontext
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'component-handoff.json').write_text('{}')
-            paths = {name: str(root / name) for name in ('source', 'go', 'gomobile', 'gobind', 'developer',
-                                                        'component-work', 'cache', 'rust-target')}
-            (root / 'tools.json').write_text(json.dumps({'paths': paths}))
             for slot in handoff.SLOTS:
+                # This is an independent argument-dispatch control, not the
+                # full same-host build/evidence lifecycle. Isolate each scope
+                # rather than pretending its incomplete staging was preserved.
+                root = Path(tmp) / slot
+                root.mkdir(mode=0o700)
+                (root / 'component-handoff.json').write_text('{}')
+                paths = {name: str(root / name) for name in ('source', 'go', 'gomobile', 'gobind', 'developer',
+                                                            'component-work', 'cache', 'rust-target')}
+                (root / 'tools.json').write_text(json.dumps({'paths': paths}))
+                (root / 'import-observation.json').write_text(json.dumps({
+                    'completed': True, 'context': self.ctx}))
                 with mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(handoff, 'context', return_value=self.ctx), \
                         mock.patch.object(ci_apple, 'phase_timing', return_value=nullcontext()), \
                         mock.patch.object(ci_apple, 'private_dir', side_effect=lambda p: p), \
                         mock.patch.object(ci_apple, 'run') as dispatch, \

@@ -17,8 +17,8 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from artifacts import file_pin, read_receipt
 from ci_android import prepare_source
 from consume import materialize_apple_resources
-from fork_input import ROOT, canonical, load, require, sha
-from producer import lease, private_dir, producer_code, run, write_json
+from fork_input import ROOT, canonical, decode, load, require, sha
+from producer import lease, slot_locks, private_dir, producer_code, run, write_json
 
 CARRIERS = [('device-arm64', None), ('sim-arm64', 'arm64'), ('sim-amd64', 'amd64')]
 
@@ -65,12 +65,13 @@ def location():
     return private_dir(base / (run_id + '-' + attempt))
 
 
-def prepare():
-    value = load()
-    identity = producer_code()
-    root = location()
-    expected = os.environ['POLARIS_APP_CANDIDATE']
-    require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
+def selected_apple_tools(value):
+    """Exact source-owned selection, shared by producer and every carrier.
+
+    A rolling hosted label is not a tool identity. Reject an older image before
+    tool installation or component transport; never select another beta/RC.
+    The later import still compares actual compiler/SDK bytes to the producer.
+    """
     developer = Path('/Applications/Xcode_27.1.app/Contents/Developer').resolve(strict=True)
     env = dict(os.environ, DEVELOPER_DIR=str(developer))
     xcode = run(['xcodebuild', '-version'], env=env).strip()
@@ -79,6 +80,30 @@ def prepare():
     for sdk, key in [('iphoneos', 'iPhoneSDK'), ('iphonesimulator', 'simulatorSDK')]:
         require(run(['xcrun', '--sdk', sdk, '--show-sdk-version'], env=env).strip() == value['apple'][key],
                 'runner does not provide the exact selected SDK')
+    return developer, env, xcode
+
+
+def admit():
+    value = load()
+    expected = os.environ['POLARIS_APP_CANDIDATE']
+    require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
+    developer, _, xcode = selected_apple_tools(value)
+    facts = {'schema': 'polaris-apple-runner-tool-admission-v1',
+             'candidate': expected, 'xcode': xcode, 'developer': str(developer),
+             'iPhoneSDK': value['apple']['iPhoneSDK'], 'simulatorSDK': value['apple']['simulatorSDK'],
+             'compilerByteIdentityChecked': False, 'carrierAccepted': False, 'devicePassed': False,
+             'scope': 'exact version/build/SDK admission only; original compiler byte verification still mandatory'}
+    write_json(location() / 'runner-tool-admission.json', facts)
+    print('APPLE_RUNNER_TOOL_ADMISSION=' + json.dumps(facts, sort_keys=True), flush=True)
+
+
+def prepare():
+    value = load()
+    identity = producer_code()
+    root = location()
+    expected = os.environ['POLARIS_APP_CANDIDATE']
+    require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
+    developer, env, xcode = selected_apple_tools(value)
     from apple_admission import preflight
     preflight(root, env)
     tools = private_dir(root / 'tools')
@@ -144,6 +169,9 @@ def build():
 
 def import_carrier(folder):
     root = location()
+    # Also enforce selection for direct invocation. Import's original-byte
+    # comparison remains authoritative, rather than trusting this admission.
+    selected_apple_tools(load())
     from apple_handoff import import_bundle
     with phase_timing('component-handoff-import'):
         tools = import_bundle(folder, root)
@@ -157,16 +185,37 @@ def import_carrier(folder):
         stream.write('POLARIS_FORMAL_APPLE_ROOT=' + str(root) + '\nDEVELOPER_DIR=' + paths['developer'] + '\n')
 
 
+def import_local():
+    """Revalidate this job's frozen producer; never extract over its originals."""
+    from apple_handoff import verify_import, context
+    root = location()
+    selected_apple_tools(load())
+    tools = read_receipt(root / 'tools.json')
+    paths = tools['paths']
+    with phase_timing('component-local-verification'):
+        with lease(private_dir(root / 'import-work'), Path(paths['cache']), load()):
+            verify_import(Path(paths['component-work']), Path(paths['cache']),
+                          *(paths[n] for n in ('source', 'go', 'gomobile', 'gobind', 'developer')))
+    require(run(['rustc', '-vV']) == tools['rustc'], 'actual consumer Rust toolchain differs')
+    write_json(root / 'import-observation.json', {'schema': 'polaris-apple-import-observation-v1',
+               'context': context(), 'transport': read_receipt(root / 'component-transport.json'),
+               'completed': True, 'devicePassed': False})
+
+
 def carrier(slot):
-    from apple_handoff import carrier_summary
+    from apple_handoff import carrier_summary, context
     require(slot in dict(CARRIERS), 'exact carrier slot required')
     root = location()
-    # The import is a separate workflow step so the ordinary per-target Rust
-    # cache can restore before compilation, without replacing component files.
+    # Local verification precedes the common Rust cache restore. Every actual
+    # carrier also rechecks the original component bytes before compilation.
     require((root / 'component-handoff.json').is_file(), 'verified component import required')
+    imported = read_receipt(root / 'import-observation.json')
+    require(imported['completed'] is True and imported['context'] == context(),
+            'same-run complete component verification required')
+    ensure_previous_staging_preserved(root, slot)
     paths = read_receipt(root / 'tools.json')['paths']
-    # This job has its own checkout, Externals/target, cache, derived-data,
-    # reservation and process groups. No three jobs touch one physical tree.
+    # Work/derived-data/target triples are slot-specific. Checkout Externals
+    # staging is shared, so the hosted workflow executes these calls in order.
     command = [sys.executable, ROOT / 'scripts/mobile-core/build_apple_app.py']
     for name, path in paths.items():
         command += ['--' + name, path]
@@ -174,6 +223,9 @@ def carrier(slot):
     simulator = dict(CARRIERS)[slot]
     if simulator:
         command += ['--simulator', '--simulator-arch', simulator]
+    marker = root / ('staging-preservation-' + slot + '.json')
+    require(not marker.exists(), 'carrier staging scope already started')
+    write_json(marker, {'slot': slot, 'context': context(), 'complete': False})
     with phase_timing(slot):
         progress_fd = os.dup(sys.stdout.fileno())
         try:
@@ -185,8 +237,74 @@ def carrier(slot):
     carrier_summary(root, slot)
 
 
-def evidence(*, publish_env=False):
+def ensure_previous_staging_preserved(root, slot):
+    from apple_handoff import context, transport_pin
+    for previous, _ in CARRIERS:
+        if previous == slot:
+            break
+        # Only the two arm64 platforms share a writable staging filename.
+        if (previous == 'sim-amd64') != (slot == 'sim-amd64'):
+            continue
+        marker = root / ('staging-preservation-' + previous + '.json')
+        if marker.exists():
+            facts = read_receipt(marker)
+            require(facts['slot'] == previous and facts['context'] == context() and
+                    facts['complete'] is True and
+                    facts['archive'] == transport_pin(root / ('apple-original-' + previous + '-evidence.zip')),
+                    'previous shared staging not safely preserved; replacement blocked')
+
+
+def preserve_linked_archive(root, slot, receipt_path=None):
+    """Freeze writable Externals staging before another arm64 platform uses it."""
+    from apple_rust import target_for
+    target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
+                        'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+    original = ROOT / 'src-tauri/gen/apple/Externals' / (
+        'x86_64' if slot == 'sim-amd64' else 'arm64') / 'release/libapp.a'
+    require(original.resolve(strict=False) == original, 'linked archive path cannot be redirected')
+    work = private_dir(root / slot)
+    if not original.exists():
+        write_json(work / 'linked-rust-preservation.json', {
+            'slot': slot, 'originalPath': str(original), 'originalAbsent': True,
+            'preservationComplete': True, 'acceptedByReceipt': False,
+            'receiptClaimedArchive': receipt_path is not None,
+            'scope': 'fixed safe staging path absent; no accepted archive claimed'})
+        require(receipt_path is None, 'claimed original linked Rust archive missing')
+        return None
+    # Observe and freeze the actual fixed-path bytes first. A bad receipt must
+    # not cause these unaccepted bytes to disappear when the next slot runs.
+    actual = file_pin(original, allow_empty=True)
+    copy = work / 'original-linked-rust-archive.a'
+    with original.open('rb') as source, copy.open('xb') as output:
+        shutil.copyfileobj(source, output)
+    shutil.copystat(original, copy)
+    require(file_pin(original, allow_empty=True) == actual and file_pin(copy, allow_empty=True) == actual,
+            'linked Rust archive changed during preservation')
+    expected, accepted, reason = None, False, 'accepted Rust receipt unavailable'
+    if receipt_path is not None:
+        try:
+            receipt = read_receipt(receipt_path)
+            expected = receipt['archive']
+            accepted = receipt['target'] == target and receipt['linkedArchive'] == str(original) and expected == actual
+            reason = 'original linked Rust archive differs before preservation'
+        except (RuntimeError, ValueError, OSError, KeyError, TypeError):
+            reason = 'accepted Rust receipt unreadable'
+    write_json(work / 'linked-rust-preservation.json', {
+        'schema': 'polaris-apple-linked-rust-preservation-v1', 'slot': slot,
+        'originalPath': str(original), 'preservedPath': str(copy),
+        'originalPin': actual, 'preservedPin': file_pin(copy, allow_empty=True), 'expectedPin': expected,
+        'preservationComplete': True, 'acceptedByReceipt': accepted,
+        'scope': 'actual staging bytes retained, accepted or unaccepted; not a new producer receipt'})
+    require(accepted, reason)
+    return copy
+
+
+def evidence(*, publish_env=False, slot=None):
     root = location()
+    require(slot is None or slot in dict(CARRIERS), 'unknown Apple evidence slot')
+    scoped_slot = slot or os.environ.get('POLARIS_APPLE_CARRIER_SLOT')
+    require(scoped_slot is None or scoped_slot in dict(CARRIERS), 'unknown Apple evidence slot')
+    output = root / ('apple-original-' + slot + '-evidence.zip' if slot else 'apple-original-evidence.zip')
     # Even preparation/import failures may precede the normal GITHUB_ENV write.
     # Publish only the fixed owned evidence path for the following upload step.
     if publish_env:
@@ -196,15 +314,26 @@ def evidence(*, publish_env=False):
     # Both failed and successful builds retain original evidence. Package only
     # selected bytes, never an entire cache, repeated checkout or target tree.
     with lease(private_dir(root / 'evidence-work'), cache, load()):
+        require(not output.exists(), 'previous original evidence must not be overwritten')
+        if slot:
+            from apple_handoff import context
+            marker = root / ('staging-preservation-' + slot + '.json')
+            write_json(marker, {'slot': slot, 'context': context(), 'complete': False})
         imported = (read_receipt(root / 'import-observation.json').get('completed') is True
                     if (root / 'import-observation.json').is_file() else False)
-        paths = set(root.glob('*.json')) | set(root.glob('*.log')) | set(root.glob('*.raw'))
+        paths = (set(root.glob('*.json')) | set(root.glob('*.log')) | set(root.glob('*.raw'))
+                 if not scoped_slot else
+                 {root / name for name in ('tools.json', 'component-handoff.json',
+                  'component-transport.json', 'import-observation.json', 'runner-tool-admission.json',
+                  'original-' + scoped_slot + '.log',
+                  'original-' + scoped_slot + '.log.stdout.raw',
+                  'original-' + scoped_slot + '.log.stderr.raw') if (root / name).is_file()})
         component = root / 'component'
         paths.update(component.glob('*.json'))
         paths.update(component.glob('*.log'))
         paths.update(component.glob('*.raw'))
         frameworks = [component / 'Libbox.xcframework', component / 'staging/Libbox.xcframework']
-        for framework in (frameworks if not os.environ.get('POLARIS_APPLE_CARRIER_SLOT') else []):
+        for framework in (frameworks if not scoped_slot else []):
             if framework.exists():
                 # Failed inspection leaves the real generator output in staging.
                 # Preserve those bytes as unaccepted evidence, never a final receipt.
@@ -220,7 +349,7 @@ def evidence(*, publish_env=False):
             except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
                 receipt_errors[receipt.relative_to(root).as_posix()] = str(error)
                 origins = None
-        if origins is not None and not os.environ.get('POLARIS_APPLE_CARRIER_SLOT'):
+        if origins is not None and not scoped_slot:
             for path in origins['files']:
                 original = Path(path)
                 if original.exists():
@@ -229,8 +358,10 @@ def evidence(*, publish_env=False):
                     receipt_errors['native-input:' + str(len(receipt_errors))] = 'original input missing in failed partial work'
             if 'generatorOutputRoot' in origins:
                 paths.update(path for path in Path(origins['generatorOutputRoot']).rglob('*') if path.is_file())
-        for slot, _ in CARRIERS:
-            work = root / slot
+        for current_slot, _ in CARRIERS:
+            if scoped_slot and current_slot != scoped_slot:
+                continue
+            work = root / current_slot
             paths.update(work.glob('*.json'))
             paths.update(work.glob('*.log'))
             paths.update(work.glob('*.raw'))
@@ -240,8 +371,8 @@ def evidence(*, publish_env=False):
             # A failed symbol check has no accepted Rust receipt yet. Preserve
             # its actual archive as unaccepted evidence under the same budget.
             from apple_rust import target_for
-            target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
-                                'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+            target = target_for('iphoneos' if current_slot == 'device-arm64' else 'iphonesimulator',
+                                'x86_64' if current_slot == 'sim-amd64' else 'arm64', 'release')
             archive = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
             if archive.is_file():
                 paths.add(archive)
@@ -254,9 +385,31 @@ def evidence(*, publish_env=False):
                 except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
                     receipt_errors[receipt.relative_to(root).as_posix()] = str(error)
                     continue
-                paths.add(root / 'cache/rust-target' / target / 'release/libpolaris_lib.a')
-        output = root / 'apple-original-evidence.zip'
-        require(not output.exists(), 'previous original evidence must not be overwritten')
+                native = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
+                if native.is_file():
+                    paths.add(native)
+                else:
+                    receipt_errors[receipt.relative_to(root).as_posix() + ':archive'] = 'original Rust archive missing'
+        staging_safe = False
+        if slot:
+            work = root / slot
+            from apple_rust import target_for
+            target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
+                                'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+            accepted = work / ('rust-' + target + '.json')
+            try:
+                preserved = preserve_linked_archive(root, slot, accepted if accepted.is_file() else None)
+                if preserved is not None:
+                    paths.add(preserved)
+            except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
+                receipt_errors[slot + ':linked-preservation'] = str(error)
+            for name in ('original-linked-rust-archive.a', 'linked-rust-preservation.json'):
+                if (work / name).is_file():
+                    paths.add(work / name)
+            observation = work / 'linked-rust-preservation.json'
+            if observation.is_file():
+                observed = read_receipt(observation)
+                staging_safe = observed.get('preservationComplete') is True
         rows, total = {}, 0
         with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED) as package:
             for path in sorted(paths):
@@ -281,9 +434,10 @@ def evidence(*, publish_env=False):
             index = {'schema': 'polaris-apple-original-evidence-v1', 'files': rows,
                      'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
                      'componentAccepted': origins is not None and not receipt_errors and
-                                          (not os.environ.get('POLARIS_APPLE_CARRIER_SLOT') or imported),
-                     'componentOriginalsInThisArchive': not bool(os.environ.get('POLARIS_APPLE_CARRIER_SLOT')),
-                     'componentOriginalsReferencedByTransport': bool(os.environ.get('POLARIS_APPLE_CARRIER_SLOT')),
+                                          (not scoped_slot or imported),
+                     'componentOriginalsInThisArchive': not bool(scoped_slot),
+                     'componentOriginalsReferencedByTransport': bool(scoped_slot),
+                     'slot': scoped_slot,
                      'sameRunComponentArtifact': 'apple-component-original-' + os.environ.get('GITHUB_RUN_ID', '') +
                                                  '-' + os.environ.get('GITHUB_RUN_ATTEMPT', ''),
                      'receiptReadErrors': receipt_errors,
@@ -292,12 +446,77 @@ def evidence(*, publish_env=False):
                      'stagedComponentIsAccepted': False,
                      'devicePassed': False, 'publicationEligible': False}
             package.writestr('EVIDENCE-INDEX.json', json.dumps(index, indent=2) + '\n')
+        if slot:
+            from apple_handoff import context, transport_pin
+            write_json(root / ('evidence-' + slot + '-pin.json'), {
+                'slot': slot, 'context': context(), 'archive': transport_pin(output),
+                'receiptReadErrors': receipt_errors, 'devicePassed': False})
+            write_json(marker, {'slot': slot, 'context': context(), 'complete': staging_safe,
+                               'archive': transport_pin(output)})
         print('Original selected bytes/paths preserved; unsigned chain is not device or signing acceptance')
+
+
+def retire_slot(slot):
+    """Retire only rebuildable slot intermediates after exact archive retention.
+
+    The workflow invokes this only after upload succeeds. Borrow the same
+    cache/work locks, so surviving native descendants refuse deletion. This
+    operation allocates no native build and needs no second 16GiB reservation.
+    """
+    from apple_handoff import context, transport_pin
+    from apple_rust import target_for
+    require(slot in dict(CARRIERS), 'unknown Apple retirement slot')
+    root = location()
+    target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
+                        'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+    archive = root / ('apple-original-' + slot + '-evidence.zip')
+    with slot_locks(private_dir(root / ('retirement-' + slot)), private_dir(root / 'cache')):
+        pin = read_receipt(root / ('evidence-' + slot + '-pin.json'))
+        require(pin['slot'] == slot and pin['context'] == context() and
+                pin['archive'] == transport_pin(archive) and not pin['receiptReadErrors'],
+                'slot originals are incomplete or changed; intermediates retained')
+        target_dir = root / 'cache/rust-target' / target
+        native = target_dir / 'release/libpolaris_lib.a'
+        with zipfile.ZipFile(archive) as package:
+            require(package.getinfo('EVIDENCE-INDEX.json').file_size <= 16 * 1024 ** 2,
+                    'original evidence index exceeds bound')
+            index = decode(package.read('EVIDENCE-INDEX.json'), maximum=16 * 1024 ** 2)
+            require(index['slot'] == slot and not index['receiptReadErrors'], 'slot archive scope differs')
+            if native.is_file():
+                name = native.relative_to(root).as_posix()
+                expected = file_pin(native)
+                require({k: index['files'][name][k] for k in ('bytes', 'sha256')} == expected,
+                        'native archive missing from preserved originals')
+                import hashlib
+                digest, size = hashlib.sha256(), 0
+                with package.open(name) as original:
+                    for chunk in iter(lambda: original.read(1024 * 1024), b''):
+                        size += len(chunk)
+                        require(size <= expected['bytes'], 'preserved native archive exceeds expected bytes')
+                        digest.update(chunk)
+                require({'bytes': size, 'sha256': digest.hexdigest()} == expected,
+                        'preserved native archive bytes differ')
+        before_space = os.statvfs(root)
+        removed = []
+        for path in (target_dir, root / slot / 'derived-data'):
+            if path.exists() or path.is_symlink():
+                require(not path.is_symlink() and path.resolve(strict=True) == path and path.is_dir() and
+                        path.stat().st_uid == os.getuid(), 'retirement directory identity differs')
+                shutil.rmtree(path)  # No component, cache root, receipts, logs, IPA or original ZIP.
+                removed.append(str(path))
+        write_json(root / ('retirement-' + slot + '.json'), {
+            'slot': slot, 'context': context(), 'preservedArchive': pin['archive'],
+            'removedRebuildableDirectories': removed,
+            'filesystem': root.stat().st_dev,
+            'freeBytesBefore': before_space.f_bavail * before_space.f_frsize,
+            'freeBytesAfter': os.statvfs(root).f_bavail * before_space.f_frsize,
+            'freeSpaceDeltaIsNotExclusiveReleaseMeasurement': True,
+            'scope': 'uploaded and byte-verified originals retained; native descendants excluded by cache lock'})
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['prepare', 'build', 'import', 'carrier', 'aggregate', 'evidence'])
+    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot'])
     parser.add_argument('--handoff', type=Path)
     parser.add_argument('--slot', choices=[slot for slot, _ in CARRIERS])
     parser.add_argument('--summaries', type=Path)
@@ -313,5 +532,10 @@ if __name__ == '__main__':
         require(args.summaries is not None and args.output is not None, 'aggregate inputs/output required')
         from apple_handoff import aggregate
         aggregate(args.summaries, args.output)
+    elif args.action == 'evidence':
+        evidence(publish_env=True, slot=args.slot)
+    elif args.action == 'retire-slot':
+        require(args.slot is not None, 'exact slot required')
+        retire_slot(args.slot)
     else:
-        {'prepare': prepare, 'build': build, 'evidence': lambda: evidence(publish_env=True)}[args.action]()
+        {'admit': admit, 'prepare': prepare, 'build': build, 'import-local': import_local}[args.action]()

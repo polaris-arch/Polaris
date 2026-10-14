@@ -563,6 +563,8 @@ mod sys {
                     }
                 }
             };
+            #[cfg(all(test, target_os = "macos"))]
+            crate::core_store::observe_test_spawn("mac-native-core", "before-spawn", None);
             let mut child = command
                 .spawn()
                 .map_err(|error| SpawnError::Failed(error.to_string()))?;
@@ -578,6 +580,12 @@ mod sys {
                 .publish(target, Box::new(OwnedNativeChild(child)));
             birth.attach_core(core, uid);
             admission.1 = true;
+            #[cfg(all(test, target_os = "macos"))]
+            crate::core_store::observe_test_spawn(
+                "mac-native-core",
+                "custody-published",
+                Some(target.pid.get()),
+            );
             let process_ms = crate::elapsed_ms(process_started);
             let log_handoff_started = Instant::now();
             // Initialize Fresh/session synchronously while this admitted command still owns

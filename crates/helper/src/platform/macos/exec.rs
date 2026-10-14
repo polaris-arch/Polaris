@@ -111,13 +111,27 @@ impl SystemRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        #[cfg(all(test, target_os = "macos"))]
+        crate::core_store::observe_test_spawn("mac-system-runner", "before-spawn", None);
         let child = cmd.spawn().map_err(|e| RunError::Spawn(e.to_string()))?;
         let child_id = child.id();
+        #[cfg(all(test, target_os = "macos"))]
+        crate::core_store::observe_test_spawn(
+            "mac-system-runner",
+            "spawn-returned",
+            Some(child_id),
+        );
 
         // 子线程：阻塞 wait_with_output（回收子进程资源 + 捕获管道）
         let (tx, rx) = mpsc::channel::<Result<Output, String>>();
         let join = std::thread::spawn(move || {
             let result = child.wait_with_output().map_err(|e| e.to_string());
+            #[cfg(all(test, target_os = "macos"))]
+            crate::core_store::observe_test_spawn(
+                "mac-system-runner",
+                "wait-returned",
+                Some(child_id),
+            );
             let _ = tx.send(result);
         });
 
