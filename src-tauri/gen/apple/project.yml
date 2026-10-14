@@ -118,6 +118,8 @@ targets:
         excludes: [Info.plist, PacketTunnel.entitlements]
     settings:
       base:
+        VALID_ARCHS: arm64
+        VALID_ARCHS[sdk=iphonesimulator*]: arm64 x86_64
         LD_GENERATE_MAP_FILE: YES
         LD_MAP_FILE_PATH: $(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel

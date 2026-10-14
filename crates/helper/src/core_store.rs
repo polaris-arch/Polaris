@@ -15,6 +15,8 @@ enum LockRole {
     RepairExclusive,
     OrphanExclusive,
     StartShared,
+    RetainExclusive,
+    GcExclusive,
 }
 impl LockRole {
     fn name(self) -> &'static str {
@@ -23,6 +25,8 @@ impl LockRole {
             Self::RepairExclusive => "repair-exclusive",
             Self::OrphanExclusive => "orphan-exclusive",
             Self::StartShared => "start-shared",
+            Self::RetainExclusive => "retain-exclusive",
+            Self::GcExclusive => "gc-exclusive",
         }
     }
 }
@@ -108,6 +112,32 @@ fn acquire_lock(file: &File, role: LockRole) -> io::Result<()> {
         _ => file.try_lock(),
     };
     result.map_err(|cause| lock_error(role, LockObservation::from_file(file), cause))
+}
+
+fn optional_lock_result(
+    file: &File,
+    role: LockRole,
+    result: Result<(), TryLockError>,
+) -> io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => {
+            // Expected busy versions remain protected. Test-only observations
+            // expose the original descriptor/class without logging any paths
+            // or changing lock lifetime, flags or acquisition policy.
+            #[cfg(test)]
+            eprintln!(
+                "{}",
+                lock_error(
+                    role,
+                    LockObservation::from_file(file),
+                    TryLockError::WouldBlock
+                )
+            );
+            Ok(false)
+        }
+        Err(cause) => Err(lock_error(role, LockObservation::from_file(file), cause)),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -708,7 +738,7 @@ impl CoreStore {
             }
             self.owner.check(&entry.path())?;
             let lease = self.lease_file(&id)?;
-            if lease.try_lock().is_err() {
+            if !optional_lock_result(&lease, LockRole::GcExclusive, lease.try_lock())? {
                 continue;
             }
             self.trash_version(&id, &entry.path())?;
@@ -744,7 +774,7 @@ impl CoreStore {
                 continue;
             }
             let lease = self.lease_file(&id)?;
-            if lease.try_lock().is_err() {
+            if !optional_lock_result(&lease, LockRole::RetainExclusive, lease.try_lock())? {
                 continue;
             }
             // Removing the manifest first makes an interrupted cleanup ineligible

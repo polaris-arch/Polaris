@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 from artifacts import file_pin
-from fork_input import ROOT, require
+from fork_input import ROOT, require, sha
 from producer import run, write_json
 
 SLOTS = (('device-arm64', 'iphoneos', 'arm64'),
@@ -12,6 +12,49 @@ SLOTS = (('device-arm64', 'iphoneos', 'arm64'),
          ('sim-amd64', 'iphonesimulator', 'x86_64'))
 TARGETS = ('polaris_iOS', 'polaris_PacketTunnel')
 SETTINGS_BYTES = 2 * 1024 ** 2
+
+
+def architecture_value(value):
+    """Only bounded architecture identifiers; never unrelated settings/env."""
+    if not isinstance(value, str):
+        return {'type': type(value).__name__ if type(value) in (type(None), bool, int, float, list, dict) else 'other'}
+    raw = value.encode('utf-8', errors='surrogatepass')
+    result = {'type': 'str', 'encoding': 'utf8-surrogatepass', 'bytes': len(raw), 'sha256': sha(raw)}
+    if re.fullmatch(r'[A-Za-z0-9_$(){}.+\-\s]{0,256}', value, re.ASCII):
+        result['value'] = value
+    else:
+        result['valueWithheld'] = True
+    return result
+
+
+def architecture_rejection(target, key, value, reason):
+    detail = {'target': target if target in TARGETS else 'other', 'field': key,
+              'reason': reason, 'observed': architecture_value(value)}
+    return 'unresolved Apple architecture setting: ' + json.dumps(detail, sort_keys=True)
+
+
+def retain_architecture_rows(root, slot, query, rows, raw):
+    require(slot in {s for s, _, _ in SLOTS} and query in ('scheme', 'extension'),
+            'closed Apple settings observation required')
+    observed = []
+    for row in rows[:3] if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            observed.append({'rowShape': 'not-object'})
+            continue
+        settings = row.get('buildSettings')
+        record = {'target': row.get('target') if row.get('target') in TARGETS else 'other'}
+        if isinstance(settings, dict):
+            record['architectureSettings'] = {key: {'present': key in settings,
+                **architecture_value(settings.get(key))} for key in ('ARCHS', 'VALID_ARCHS', 'EXCLUDED_ARCHS')}
+        else:
+            record['settingsShape'] = 'not-object'
+        observed.append(record)
+    value = {'schema': 'polaris-apple-architecture-observation-v1', 'slot': slot, 'query': query,
+             'rows': observed, 'rowCount': len(rows) if isinstance(rows, list) else None,
+             'normalizedResponseText': {'bytes': len(raw.encode()), 'sha256': sha(raw.encode())},
+             'componentAccepted': False, 'devicePassed': False,
+             'scope': 'selected architecture fields before admission; full settings/environment not retained'}
+    write_json(Path(root) / ('build-settings-' + slot + '-' + query + '.json'), value)
 
 
 def checked_build_settings(rows, sdk, arch, minimum, *, expected_targets=TARGETS):
@@ -28,10 +71,13 @@ def checked_build_settings(rows, sdk, arch, minimum, *, expected_targets=TARGETS
         fields = {}
         for key in ('ARCHS', 'VALID_ARCHS', 'EXCLUDED_ARCHS'):
             value = settings.get(key, '' if key == 'EXCLUDED_ARCHS' else None)
-            require(isinstance(value, str), 'resolved Apple architecture settings required')
+            if not isinstance(value, str):
+                raise RuntimeError(architecture_rejection(row['target'], key, value, 'non-string'))
             fields[key] = value.split()
-            require(all(item in ('arm64', 'arm64e', 'armv7', 'armv7s', 'i386', 'x86_64') for item in fields[key]) and
-                    len(fields[key]) == len(set(fields[key])), 'unresolved Apple architecture setting')
+            if not all(item in ('arm64', 'arm64e', 'armv7', 'armv7s', 'i386', 'x86_64') for item in fields[key]):
+                raise RuntimeError(architecture_rejection(row['target'], key, value, 'unknown-token'))
+            if len(fields[key]) != len(set(fields[key])):
+                raise RuntimeError(architecture_rejection(row['target'], key, value, 'duplicate-token'))
         effective = (set(fields['ARCHS']) & set(fields['VALID_ARCHS'])) - set(fields['EXCLUDED_ARCHS'])
         require(fields['ARCHS'] == [arch] and effective == {arch},
                 'selected Apple architecture is excluded by actual build settings')
@@ -56,7 +102,7 @@ def checked_build_settings(rows, sdk, arch, minimum, *, expected_targets=TARGETS
     return selected
 
 
-def _read_rows(command, env, slot):
+def _read_rows(command, env, slot, root, query):
     raw = run(command, cwd=ROOT, env=env, observation_fd=1,
               observation_phase='build-settings-admission', observation_slot=slot)
     require(len(raw.encode()) <= SETTINGS_BYTES, 'Apple build-settings response exceeds observation bound')
@@ -64,6 +110,7 @@ def _read_rows(command, env, slot):
         rows = json.loads(raw)
     except (ValueError, UnicodeError):
         raise RuntimeError('invalid resolved Apple settings JSON') from None
+    retain_architecture_rows(root, slot, query, rows, raw)
     return rows
 
 
@@ -88,12 +135,12 @@ def preflight(root, env):
                   'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO']
         rows = _read_rows(['xcodebuild', '-scheme', 'polaris_iOS', '-destination',
             'generic/platform=iOS Simulator' if sdk == 'iphonesimulator' else 'generic/platform=iOS',
-            *common], env, slot)
+            *common], env, slot, root, 'scheme')
         require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows),
                 'actual Apple build-settings array required')
         targets = [row.get('target') for row in rows]
         if targets == ['polaris_iOS']:
-            extension = _read_rows(['xcodebuild', '-target', 'polaris_PacketTunnel', *common], env, slot)
+            extension = _read_rows(['xcodebuild', '-target', 'polaris_PacketTunnel', *common], env, slot, root, 'extension')
             checked_build_settings(extension, sdk, arch, minimum, expected_targets=('polaris_PacketTunnel',))
             rows += extension
         observations[slot] = checked_build_settings(rows, sdk, arch, minimum)

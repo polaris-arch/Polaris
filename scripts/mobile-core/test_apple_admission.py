@@ -1,6 +1,7 @@
 """Resolved Xcode JSON controls; never starts Xcode or compiles a carrier."""
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,53 @@ def rows(sdk='iphonesimulator', arch='x86_64'):
 
 
 class AppleAdmission(unittest.TestCase):
+    def test_extension_source_declares_same_three_slot_architecture_contract(self):
+        project = (admission.ROOT / 'src-tauri/gen/apple/project.yml').read_text()
+        target = project.split('  polaris_PacketTunnel:\n', 1)[1].split('    info:\n', 1)[0]
+        self.assertIn('\n        VALID_ARCHS: arm64\n', target)
+        self.assertIn('\n        VALID_ARCHS[sdk=iphonesimulator*]: arm64 x86_64\n', target)
+        native = (admission.ROOT / 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj').read_text()
+        configurations = [(name, block) for name, block in re.findall(
+            r'^\t\t[A-F0-9]{24} /\* (debug|release) \*/ = \{\n(.*?)^\t\t\};', native, re.M | re.S)
+            if 'PRODUCT_BUNDLE_IDENTIFIER = "$(POLARIS_BUNDLE_ID).PacketTunnel";' in block]
+        self.assertEqual(sorted(name for name, _ in configurations), ['debug', 'release'])
+        for _, block in configurations:
+            self.assertIn('\n\t\t\t\tVALID_ARCHS = arm64;\n', block)
+            self.assertIn('\n\t\t\t\t"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";\n', block)
+
+    def test_rejected_architecture_reports_closed_exact_field_without_other_settings(self):
+        for key in ('ARCHS', 'VALID_ARCHS', 'EXCLUDED_ARCHS'):
+            for value, reason in [('$(inherited)', 'unknown-token'), ('arm64 arm64', 'duplicate-token')]:
+                sample = rows(); sample[1]['buildSettings'][key] = value
+                with self.subTest(field=key, value=value), self.assertRaises(RuntimeError) as rejected:
+                    admission.checked_build_settings(sample, 'iphonesimulator', 'x86_64', '17.0')
+                detail = json.loads(str(rejected.exception).split(': ', 1)[1])
+                self.assertEqual(detail['target'], 'polaris_PacketTunnel')
+                self.assertEqual(detail['field'], key); self.assertEqual(detail['reason'], reason)
+                self.assertEqual(detail['observed']['value'], value)
+                self.assertNotIn('DO_NOT_EXPORT', str(rejected.exception))
+
+    def test_failure_observation_keeps_architecture_before_rejection_and_withholds_paths(self):
+        sample = rows('iphoneos', 'arm64')[1:]
+        sample[0]['buildSettings']['VALID_ARCHS'] = '$(inherited)'
+        saved = []
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(admission, 'run', return_value=json.dumps(sample)), \
+                patch.object(admission, 'write_json', side_effect=lambda path, value: saved.append((path, value))):
+            root = Path(temporary)
+            observed = admission._read_rows(['xcodebuild'], {}, 'device-arm64', root, 'extension')
+            with self.assertRaisesRegex(RuntimeError, 'unresolved Apple architecture setting'):
+                admission.checked_build_settings(observed, 'iphoneos', 'arm64', '17.0',
+                                                 expected_targets=('polaris_PacketTunnel',))
+        self.assertEqual(saved[0][0].name, 'build-settings-device-arm64-extension.json')
+        self.assertEqual(saved[0][1]['rows'][0]['architectureSettings']['VALID_ARCHS']['value'], '$(inherited)')
+        self.assertFalse(saved[0][1]['componentAccepted']); self.assertFalse(saved[0][1]['devicePassed'])
+        self.assertNotIn('DO_NOT_EXPORT', json.dumps([value for _, value in saved]))
+        for value in ['/private/settings/path', 'x'*257, 'bad\x00value', 'bad\ud800value']:
+            projection = admission.architecture_value(value)
+            self.assertNotIn('value', projection); self.assertTrue(projection['valueWithheld'])
+            self.assertEqual(projection['sha256'], admission.sha(value.encode('utf-8', errors='surrogatepass')))
+
     def test_original_intel_arm64_only_negative_and_single_target_selection(self):
         original = rows(); original[0]['buildSettings']['VALID_ARCHS'] = 'arm64'
         with self.assertRaisesRegex(RuntimeError, 'architecture is excluded'):
@@ -62,7 +110,10 @@ class AppleAdmission(unittest.TestCase):
                 observed = admission.preflight(root, {'DEVELOPER_DIR':'selected'})
             self.assertEqual(set(observed['slots']), {slot for slot,_,_ in admission.SLOTS})
             self.assertEqual(len(calls), 6)
-            self.assertEqual(len(saved), 1); self.assertNotIn('DO_NOT_EXPORT', json.dumps(observed))
+            self.assertEqual(len(saved), 7); self.assertNotIn('DO_NOT_EXPORT', json.dumps(observed))
+            self.assertEqual({path.name for path, _ in saved[:-1]},
+                             {'build-settings-' + slot + '-' + query + '.json'
+                              for slot, _, _ in admission.SLOTS for query in ('scheme', 'extension')})
             for command, kwargs in calls:
                 self.assertIn('-showBuildSettings', command); self.assertNotIn('archive', command)
                 self.assertEqual(command[command.index('-configuration')+1], 'release')
@@ -73,4 +124,5 @@ class AppleAdmission(unittest.TestCase):
                     patch.object(admission, 'file_pin', side_effect=[{'bytes':1}]*3+[{'bytes':2}]*3), \
                     patch.object(admission, 'write_json') as write, self.assertRaisesRegex(RuntimeError,'inputs changed'):
                 admission.preflight(root, {})
-            write.assert_not_called()
+            self.assertEqual(write.call_count, 6)
+            self.assertNotIn('build-settings-admission.json', [call.args[0].name for call in write.call_args_list])

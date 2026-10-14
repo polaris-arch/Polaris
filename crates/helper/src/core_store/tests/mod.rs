@@ -137,13 +137,26 @@ fn busy_leases_allow_new_install_but_prevent_retirement() {
                     leases.len(), started.elapsed().as_nanos())),
         );
     }
+    eprintln!("busy-lease stage=retire-held held_leases={}", leases.len());
     assert!(store.retain_latest_three(&[]).unwrap().is_empty());
     assert_eq!(
         fs::read_dir(root.path().join("manifests")).unwrap().count(),
         5
     );
     drop(leases);
-    assert_eq!(store.retain_latest_three(&[]).unwrap().len(), 2);
+    eprintln!("busy-lease stage=retire-after-drop held_leases=0");
+    let retired = store.retain_latest_three(&[]).unwrap_or_else(|error| {
+        panic!(
+            "busy-lease stage=retire-after-drop elapsed_ns={} error={error:?}",
+            started.elapsed().as_nanos()
+        )
+    });
+    assert_eq!(
+        retired.len(),
+        2,
+        "busy-lease stage=retire-after-drop elapsed_ns={}",
+        started.elapsed().as_nanos()
+    );
     assert_eq!(
         fs::read_dir(root.path().join("versions")).unwrap().count(),
         3
@@ -157,6 +170,8 @@ fn lock_failures_keep_closed_roles_and_native_error_classification_without_paths
         LockRole::RepairExclusive,
         LockRole::OrphanExclusive,
         LockRole::StartShared,
+        LockRole::RetainExclusive,
+        LockRole::GcExclusive,
     ] {
         let error = lock_error(
             role,
@@ -210,6 +225,31 @@ fn lock_failures_keep_closed_roles_and_native_error_classification_without_paths
     assert!(!error.to_string().contains(secret));
     assert!(!format!("{error:?}").contains(secret));
     assert!(error.to_string().contains("fd=None"));
+}
+
+#[test]
+fn optional_retirement_skips_only_native_contention_and_preserves_other_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let file = File::create_new(root.path().join("controlled-lease")).unwrap();
+    for role in [LockRole::RetainExclusive, LockRole::GcExclusive] {
+        assert!(optional_lock_result(&file, role, Ok(())).unwrap());
+        assert!(!optional_lock_result(&file, role, Err(TryLockError::WouldBlock)).unwrap());
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::WouldBlock] {
+            let error = optional_lock_result(
+                &file,
+                role,
+                Err(TryLockError::Error(io::Error::new(
+                    kind,
+                    "/private/controlled-error must-not-appear",
+                ))),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains("class=io-error"));
+            assert!(error.to_string().contains(role.name()));
+            assert!(!error.to_string().contains("/private/controlled-error"));
+        }
+    }
 }
 
 #[test]

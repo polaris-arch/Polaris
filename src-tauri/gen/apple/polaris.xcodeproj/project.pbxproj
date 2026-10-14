@@ -2180,6 +2180,8 @@
 		BE511D40453904F4CF76CE66 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				LD_GENERATE_MAP_FILE = YES;
 				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
@@ -2206,6 +2208,8 @@
 		DE54A0F0E14E3A71E2B7BBEA /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				LD_GENERATE_MAP_FILE = YES;
 				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
