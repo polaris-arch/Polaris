@@ -342,7 +342,8 @@ def bounded_module_download(command, *, cwd, env, expected_count, observation):
             def invalid_constant(_value): raise ValueError()
             decoder = json.JSONDecoder(object_pairs_hook=pairs, parse_constant=invalid_constant)
             text, cursor = raw.decode('utf-8'), 0
-            allowed = {'Path', 'Version', 'Info', 'GoMod', 'Zip', 'Dir', 'Sum', 'GoModSum', 'Origin', 'Reuse'}
+            # Go 1.25.5 ModuleJSON also reports the exact version Query.
+            allowed = {'Path', 'Version', 'Query', 'Info', 'GoMod', 'Zip', 'Dir', 'Sum', 'GoModSum', 'Origin', 'Reuse'}
             while cursor < len(text):
                 if time.monotonic() >= deadline: reason = 'deadline'; break
                 while cursor < len(text) and text[cursor].isspace(): cursor += 1
@@ -357,7 +358,7 @@ def bounded_module_download(command, *, cwd, env, expected_count, observation):
                 if 'Reuse' in row and type(row['Reuse']) is not bool:
                     reason = 'download-json-structure'; break
                 if 'Origin' in row and (not isinstance(row['Origin'], dict) or
-                        not set(row['Origin']) <= {'VCS', 'URL', 'Subdir', 'Hash', 'TagSum', 'Ref', 'RepoSum'} or
+                        not set(row['Origin']) <= {'VCS', 'URL', 'Subdir', 'Hash', 'TagPrefix', 'TagSum', 'Ref', 'RepoSum'} or
                         not all(isinstance(value, str) for value in row['Origin'].values())):
                     reason = 'download-json-structure'; break
                 rows.append(row)
@@ -452,7 +453,8 @@ def admit_module_cache(source, graph, go, env, work):
             'prior module admission inputs retained; explicit recovery required')
     for path, raw in [(modfile, originals['go.mod']), (sumfile, originals['go.sum'])]:
         with path.open('xb') as stream: stream.write(raw)
-    downloaded = bounded_module_download([go, '-modfile=' + str(modfile), 'mod', 'download', '-json',
+    # -modfile belongs to the download subcommand, not go's global flags.
+    downloaded = bounded_module_download([go, 'mod', 'download', '-modfile=' + str(modfile), '-json',
                                          *[path + '@' + version for path, version in sorted(pending)]],
                                         cwd=source, env=env, expected_count=len(pending),
                                         observation=Path(work) / 'module-cache-admission-observation.json')

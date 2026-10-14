@@ -1186,6 +1186,8 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       '${{ steps.libbox_input.outputs.work }}/*receipt.json',
       '${{ steps.libbox_input.outputs.work }}/*bind.log',
       '${{ steps.libbox_input.outputs.work }}/budget-observation.json',
+      '${{ steps.libbox_input.outputs.work }}/cache-binding-observation.json',
+      '${{ steps.libbox_input.outputs.work }}/module-cache-admission-observation.json',
       'scripts/mobile-core/android-consumption.json',
       'src-tauri/gen/android/app/build/outputs/apk/**/*.source-consumption.json',
       '${{ runner.temp }}/*.source-consumption.json',
@@ -1195,7 +1197,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
     expect(producer).toContain("stage_root = private_dir(work / 'staging')");
     expect(producer).toContain("stage_component = stage_root / ('stage.aar' if args.platform == 'android' else 'Libbox.xcframework')");
-    expect(formalEvidence).toHaveLength(8);
+    expect(formalEvidence).toHaveLength(10);
     const ndkObservations = [
       '~/Code/polaris-mobile-ci/ndk-source.properties',
       '~/Code/polaris-mobile-ci/sdk-input-observation.json',

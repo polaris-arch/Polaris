@@ -52,6 +52,40 @@ fn free_udp_port() -> u16 {
         .unwrap()
         .port()
 }
+
+fn reserve_wireguard_port(excluded: &[u16]) -> UdpSocket {
+    // WireGuard binds the IPv6 wildcard even when its peers dial IPv4 loopback.
+    // Keep the selected port bound until handoff, and exclude this fixture's
+    // IPv4 listeners too on hosts with IPv6-only sockets. Retain rejected
+    // reservations during selection so a port cannot be selected repeatedly.
+    let mut rejected = Vec::new();
+    for _ in 0..64 {
+        let socket = UdpSocket::bind("[::]:0").expect("reserve WireGuard wildcard port");
+        if !excluded.contains(&socket.local_addr().unwrap().port()) {
+            return socket;
+        }
+        rejected.push(socket);
+    }
+    panic!("no distinct WireGuard port within 64 reservations");
+}
+
+#[test]
+fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() {
+    let ipv6 = UdpSocket::bind("[::1]:0").unwrap();
+    let ipv4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let excluded = [
+        ipv6.local_addr().unwrap().port(),
+        ipv4.local_addr().unwrap().port(),
+    ];
+    let a = reserve_wireguard_port(&excluded);
+    let b = reserve_wireguard_port(&excluded);
+    let a_port = a.local_addr().unwrap().port();
+    let b_port = b.local_addr().unwrap().port();
+    assert!(!excluded.contains(&a_port) && !excluded.contains(&b_port));
+    assert_ne!(a_port, b_port);
+    assert!(UdpSocket::bind(("::1", a_port)).is_err());
+    assert!(UdpSocket::bind(("::1", b_port)).is_err());
+}
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -546,8 +580,6 @@ fn wireguard_family(core: &Path, ipv6: bool) {
         (A_IP, B_IP, "10.77.0.2/32", "10.77.0.99/32", "0.0.0.0/0")
     };
     let family = if ipv6 { "IPv6" } else { "IPv4" };
-    let a_wg = free_udp_port();
-    let b_wg = free_udp_port();
     let a_tcp = Listener::tcp_on(ipv6);
     let a_denied_tcp = Listener::tcp_on(ipv6);
     let a_udp = Listener::udp_on(false, ipv6);
@@ -625,6 +657,22 @@ fn wireguard_family(core: &Path, ipv6: bool) {
     for (label, policy, should_allow) in
         policy_cases(peer_cidr, wrong_source, wide_target, a_tcp.port, a_udp.port)
     {
+        // Allocate after all live echo/DNS listeners. Their IPv6 ports must not
+        // be reused by the wildcard WireGuard endpoints (original CI collision).
+        // Each policy gets fresh leases; kernel execution itself is never retried.
+        let excluded = [
+            a_udp.port,
+            b_udp.port,
+            upstream.port,
+            a_out_udp,
+            a_warm_dns,
+            b_in_udp,
+            b_in_dns,
+        ];
+        let a_lease = reserve_wireguard_port(&excluded);
+        let b_lease = reserve_wireguard_port(&excluded);
+        let a_wg = a_lease.local_addr().unwrap().port();
+        let b_wg = b_lease.local_addr().unwrap().port();
         let policy_baseline = diagnostics::listener_snapshots(&listeners);
         let has_policy = policy.is_some();
         // 每轮独立路径与双核，避免旧 UDP flow、peer 状态和磁盘 DNS cache 跨策略轮次复用。
@@ -638,6 +686,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             None,
         );
         let b_path = write_config(&b_temp, &b);
+        drop(b_lease);
         let mut b_core = run(core, &b_path, &b_temp);
         let a = runtime_config(
             wg_config(true, ipv6, b_wg, policy),
@@ -647,6 +696,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             Some(upstream.port),
         );
         let a_path = write_config(&a_temp, &a);
+        drop(a_lease);
         let mut a_core = run(core, &a_path, &a_temp);
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
         let (forward_tcp, listener_observations) =

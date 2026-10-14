@@ -30,6 +30,8 @@ class ProducerCalls(unittest.TestCase):
             ('print(\'{"Path":NaN}\')', 'download-collection-or-json-error'),
             ('print(' + repr(json.dumps({'Error':'https://user:' + secret + '@example.invalid/private'})) + ')', 'download-json-error'),
             ('print(\'{"unknown":"value"}\')', 'download-json-structure'),
+            ('print(' + repr(json.dumps(dict(good, Query=[]))) + ')', 'download-json-structure'),
+            ('print(' + repr(json.dumps(dict(good, Origin={'TagPrefix': 7}))) + ')', 'download-json-structure'),
             ('import sys; sys.stderr.write("' + secret + '"); sys.exit(1)', 'download-exit-or-live-group'),
             ('import time; time.sleep(5)', 'deadline'),
         ]
@@ -53,7 +55,9 @@ class ProducerCalls(unittest.TestCase):
             self.assertEqual(list(root.glob('*.log')), [])
 
     def test_bounded_download_valid_records_and_spawn_failure_are_safe(self):
-        row = {'Path':'example.invalid/pkg','Version':'v1.0.0','Sum':'h1:fixed','Dir':'/fixed/cache'}
+        row = {'Path':'example.invalid/pkg','Version':'v1.0.0','Query':'v1.0.0','Sum':'h1:fixed','Dir':'/fixed/cache',
+               'Origin': {'VCS':'git', 'URL':'https://example.invalid/pkg', 'Hash':'fixed',
+                          'TagPrefix':'sub/', 'TagSum':'fixed', 'Ref':'refs/tags/v1.0.0'}}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); observation = root / 'valid.json'
             with patch('builtins.print'):
@@ -96,7 +100,9 @@ class ProducerCalls(unittest.TestCase):
             calls = []
             def run(command, **kwargs):
                 calls.append((command, kwargs))
-                alternate = Path(command[1].removeprefix('-modfile='))
+                self.assertEqual(command[:3], ['inert-go', 'mod', 'download'])
+                self.assertTrue(command[3].startswith('-modfile='))
+                alternate = Path(command[3].removeprefix('-modfile='))
                 self.assertEqual(alternate.read_bytes(), originals['go.mod'])
                 self.assertEqual(alternate.with_suffix('.sum').read_bytes(), originals['go.sum'])
                 alternate.with_suffix('.sum').write_bytes(b'owned download sum update')
@@ -106,7 +112,9 @@ class ProducerCalls(unittest.TestCase):
             with patch.object(producer, 'bounded_module_download', side_effect=run):
                 producer.admit_module_cache(source, graph, 'inert-go', {}, work)
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][0][-4:], ['mod', 'download', '-json', 'example.invalid/known@v1.0.0'])
+            self.assertEqual(calls[0][0], ['inert-go', 'mod', 'download',
+                '-modfile=' + str(work/'module-cache-admission/admission.mod'), '-json',
+                'example.invalid/known@v1.0.0'])
             self.assertEqual(calls[0][1]['cwd'], source)
             self.assertEqual({name:(source/name).read_bytes() for name in originals}, originals)
             graph[1]['Dir'] = '/actual/warm/cache/known'
