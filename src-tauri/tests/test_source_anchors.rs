@@ -622,6 +622,12 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/fork_input.py",
     "scripts/mobile-core/android_sdk.py",
     "scripts/mobile-core/test_inputs.py",
+    "scripts/mobile-core/apple_admission.py",
+    "scripts/mobile-core/apple_handoff.py",
+    "scripts/mobile-core/test_apple_admission.py",
+    "scripts/mobile-core/test_apple_handoff.py",
+    "scripts/mobile-core/test_apple_progress.py",
+    "scripts/mobile-core/test_apple_read_reuse.py",
 ];
 
 fn registered_python_module(rel: &str) -> bool {
@@ -646,6 +652,10 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
         "scripts/other/ci_apple.py",
         "scripts/mobile-core/nested/ci_apple.py",
         "ui/src/ci_apple.py",
+        "scripts/mobile-core/apple_handoff_extra.py",
+        "scripts/mobile-core/apple_admission_extra.py",
+        "scripts/mobile-core/nested/apple_handoff.py",
+        "scripts/other/test_apple_progress.py",
     ] {
         assert!(!registered_python_module(path));
     }

@@ -74,7 +74,8 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
       expect(match).not.toBeNull();
       expect(source).toMatch(/preserve_run:\n\s+description: .+\n\s+type: boolean\n\s+default: false/);
       const context = (event: string, ref: string, preserve: boolean, runId: number) => ({
-        github: { event_name: event, ref, workflow: 'fixture-caller', run_id: runId },
+        github: { event_name: event, ref, workflow: 'fixture-caller', run_id: runId,
+          event: { inputs: { preserve_run: preserve ? 'true' : 'false' }, pull_request: {}, merge_group: {} } },
         inputs: { preserve_run: preserve },
         startsWith: (value: string, prefix: string) => value.startsWith(prefix),
         format: (value: string, argument: number) => value.replace('{0}', String(argument)),

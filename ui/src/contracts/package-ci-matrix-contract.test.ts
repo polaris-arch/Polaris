@@ -23,6 +23,25 @@ function workflow(name: string): string {
   return readFileSync(join(REPO_ROOT, '.github/workflows', name), 'utf8');
 }
 
+function workflowConcurrency(source: string, caller: string, eventName = 'workflow_dispatch',
+  ref = 'refs/heads/collab/contract', preserve = false, runId = 1,
+  selection: { platform?: string; platforms?: string; pullRequestNumber?: number;
+    mergeGroupHead?: string; eventPreserveRun?: boolean } = {}) {
+  const match = source.match(/^  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}$/m);
+  expect(match, 'workflow concurrency must be executable').not.toBeNull();
+  const context = {
+    github: { workflow: caller, event_name: eventName, ref, run_id: runId,
+      event: { inputs: { preserve_run: preserve || selection.eventPreserveRun ? 'true' : 'false' },
+        pull_request: { number: selection.pullRequestNumber }, merge_group: { head_sha: selection.mergeGroupHead } } },
+    inputs: { preserve_run: preserve, platform: selection.platform ?? '', platforms: selection.platforms ?? '' },
+    startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+    format: (value: string, argument: number) => value.replace('{0}', String(argument)),
+  };
+  return { group: match![1].replace(/\$\{\{ (.+?) \}\}/g,
+    (_text, expression: string) => String(runInNewContext(expression, context))),
+  cancels: runInNewContext(match![2], context) };
+}
+
 /**
  * 取出 `jobs:` 下某个 job 的整段文本（含其注释），从 `\n  <name>:\n` 到下一个同缩进 job 键为止。
  *
@@ -281,12 +300,19 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
   });
 
   it('独立门与 Package 复用门必须按调用方隔离并发组，不能互相取消制造假红', () => {
-    expect(workflow('ci.yml')).toContain(
-      'group: ci-${{ github.workflow }}-${{ github.ref }}',
-    );
-    expect(workflow('ui.yml')).toContain(
-      'group: ui-${{ github.workflow }}-${{ github.ref }}',
-    );
+    for (const name of ['ci.yml', 'ui.yml']) {
+      const source = workflow(name);
+      const direct = workflowConcurrency(source, name);
+      const called = workflowConcurrency(source, 'Package');
+      expect(direct.cancels).toBe(true);
+      expect(called.cancels).toBe(true);
+      expect(direct.group).not.toBe(called.group);
+      expect(called.group).toBe(workflowConcurrency(source, 'Package', undefined, undefined, false, 2).group);
+      const fixed = workflowConcurrency(source, 'Package', undefined, undefined, true, 1);
+      expect(fixed.cancels).toBe(false);
+      expect(fixed.group).not.toBe(called.group);
+      expect(fixed.group).not.toBe(workflowConcurrency(source, 'Package', undefined, undefined, true, 2).group);
+    }
   });
 
   it('切片器本身有效：两个 job 都切得出非平凡的块', () => {
@@ -531,12 +557,41 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
         .join('\n')
         .match(/publish_release:\s*true/g) ?? [],
     ).toHaveLength(1);
-    expect(androidWorkflow).toContain(
-      'group: android-${{ github.workflow }}-${{ github.ref }}',
-    );
-    expect(workflow('package.yml')).toContain(
-      "group: package-${{ github.ref }}-${{ inputs.platforms || inputs.platform || github.event.inputs.platform || 'all' }}",
-    );
+    const tagRun = workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v1.0.0');
+    expect(tagRun.cancels).toBe(false);
+    expect(tagRun.group).toBe(workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v1.0.0', false, 2).group);
+    expect(tagRun.group).not.toBe(workflowConcurrency(androidWorkflow, 'Package', 'push', 'refs/tags/v2.0.0').group);
+    expect(workflowConcurrency(androidWorkflow, 'Android').group).not.toBe(workflowConcurrency(androidWorkflow, 'Package').group);
+    const packageSource = workflow('package.yml');
+    const packageGroup = (selection: Parameters<typeof workflowConcurrency>[6] = {},
+      caller = 'Package', ref = 'refs/heads/collab/contract', preserve = false, runId = 1,
+      event = 'workflow_dispatch') => workflowConcurrency(packageSource, caller, event, ref, preserve, runId, selection);
+    const tip = packageGroup();
+    expect(tip.group).toBe('package-Package-refs/heads/collab/contract-all');
+    expect(tip.cancels).toBe(true);
+    expect(tip.group).toBe(packageGroup({}, 'Package', undefined, false, 2).group);
+    expect(tip.group).not.toBe(packageGroup({}, 'Release Risk').group);
+    expect(tip.group).not.toBe(packageGroup({}, 'Package', 'refs/heads/collab/other').group);
+    expect(packageGroup({ platform: 'linux' }).group).not.toBe(packageGroup({ platform: 'windows' }).group);
+    expect(packageGroup({ platforms: '["linux"]' }).group).not.toBe(packageGroup({ platforms: '["windows"]' }).group);
+    expect(packageGroup({ platforms: '["linux"]', platform: 'windows' }).group).toBe(
+      packageGroup({ platforms: '["linux"]' }).group);
+    expect(packageGroup({ pullRequestNumber: 7 }, 'Release Risk', 'refs/pull/7/merge', false, 1, 'pull_request').group)
+      .toBe('package-Release Risk-7-all');
+    const fixed = packageGroup({}, 'Package', undefined, true);
+    expect(fixed.cancels).toBe(false);
+    expect(fixed.group).not.toBe(tip.group);
+    expect(fixed.group).not.toBe(packageGroup({}, 'Package', undefined, true, 2).group);
+    const inherited = packageGroup({ eventPreserveRun: true }, 'Release Risk');
+    expect(inherited.cancels).toBe(false);
+    expect(inherited.group).not.toBe(packageGroup({ eventPreserveRun: true }, 'Release Risk', undefined, false, 2).group);
+    const packageTag = packageGroup({}, 'Package', 'refs/tags/v1.0.0', false, 1, 'push');
+    expect(packageTag.cancels).toBe(false);
+    expect(packageTag.group).toBe(packageGroup({}, 'Package', 'refs/tags/v1.0.0', false, 2, 'push').group);
+    expect(packageTag.group).not.toBe(packageGroup({}, 'Package', 'refs/tags/v2.0.0', false, 1, 'push').group);
+    const queue = packageGroup({ mergeGroupHead: 'queued-source' }, 'Package', 'refs/heads/queue', false, 1, 'merge_group');
+    expect(queue.cancels).toBe(false);
+    expect(queue.group).not.toBe(packageGroup({ mergeGroupHead: 'queued-source' }, 'Package', 'refs/heads/queue', false, 2, 'merge_group').group);
     expect(releaseCheck).toContain('if: inputs.publish_release != true');
     expect(androidWorkflow).not.toContain('\n  apk:\n');
     expect(allExecutable).not.toContain('--debug');
@@ -575,7 +630,44 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const producer = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/producer.py'), 'utf8');
     const run = producer.slice(producer.indexOf('def run('), producer.indexOf('\ndef ', producer.indexOf('def run(') + 1));
     expect(run).toContain('require(process.returncode == 0,');
-    expect(run).toMatch(/except BaseException:[\s\S]*?\n        raise\n/);
+    // Parse the actual handler and binding; aliases/indentation do not decide
+    // whether cleanup preserves and rethrows the primary exception.
+    const primaryPolicy = (mutation = '') => {
+      const result = spawnSync('python3', ['-c', `
+import ast,json,sys
+request=json.load(sys.stdin)
+tree=ast.parse(request['source'])
+function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run')
+handlers=[n for n in ast.walk(function) if isinstance(n,ast.ExceptHandler)
+          and isinstance(n.type,ast.Name) and n.type.id=='BaseException' and n.name]
+if len(handlers)!=1:
+ print(json.dumps({'valid':False}));sys.exit(0)
+handler=handlers[0]
+notes=[n for n in ast.walk(handler) if isinstance(n,ast.Call)
+       and isinstance(n.func,ast.Name) and n.func.id=='failure_note']
+if request['mutation']=='silence': handler.body[-1]=ast.Pass()
+if request['mutation']=='replace': handler.body[-1]=ast.Raise(exc=ast.Call(func=ast.Name(id='RuntimeError'),args=[],keywords=[]))
+if request['mutation']=='wrong-note' and notes: notes[0].args[0]=ast.Name(id='secondary')
+last=handler.body[-1]
+bare=isinstance(last,ast.Raise) and last.exc is None and last.cause is None
+replacement=any(isinstance(n,ast.Raise) and n.exc is not None for n in ast.walk(handler))
+bound=len(notes)==1 and isinstance(notes[0].args[0],ast.Name) and notes[0].args[0].id==handler.name
+print(json.dumps({'valid':bare and not replacement and bound,
+                 'bareReraise':bare,'replacementRaise':replacement,'noteBoundToPrimary':bound}))
+`], { input: JSON.stringify({ source: producer, mutation }), encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      return JSON.parse(result.stdout);
+    };
+    expect(primaryPolicy()).toEqual({ valid: true, bareReraise: true,
+      replacementRaise: false, noteBoundToPrimary: true });
+    for (const mutation of ['silence', 'replace', 'wrong-note']) {
+      expect(primaryPolicy(mutation).valid, mutation).toBe(false);
+    }
+    const cleanupControls = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/test_apple_progress.py'), 'utf8');
+    expect(cleanupControls).toContain('def test_cleanup_failures_do_not_replace_original_or_release_live_group(');
+    expect(cleanupControls).toContain("self.assertRaisesRegex(OSError, 'PRIMARY_LOG_FAILURE')");
+    expect(cleanupControls).toContain("self.assertFalse(any(call.kwargs.get('finished') for call in register.call_args_list))");
+    expect(cleanupControls).toContain("self.assertIn('cleanup incomplete', ' '.join(raised.exception.__notes__))");
     expect(run).toContain('register_group(process.pid, finished=True)');
     expect(releaseCheck).toContain(
       'run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a',
@@ -1143,7 +1235,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     };
     const light = androidEnv('POLARIS_LIGHT_BUILD');
     const publish = androidEnv('POLARIS_PUBLISH_RELEASE');
-    // 手动 dispatch（无任何输入）与 tag 发布调用（只传 publish_release / release_tag）都不是轻量。
+    // 手动 dispatch 不接收构型/发布输入；preserve_run 不改变轻量或签名模式。
     expect([light({}), publish({})]).toEqual(['0', '0']);
     expect([
       light({ publish_release: true, release_tag: 'v1.0.0' }),
@@ -1156,11 +1248,13 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       light({ light_build: true, publish_release: true }),
       publish({ light_build: true, publish_release: true }),
     ]).toEqual(['1', '1']);
-    // 输入只在 workflow_call 上声明、缺省 false；手动 dispatch 没有任何输入。
+    // 构型/发布输入只在 workflow_call 上声明、缺省 false；手动入口只允许保护审计运行。
     const androidDispatch = executable(
       android.slice(android.indexOf('\n  workflow_dispatch:'), android.indexOf('\npermissions:')),
     );
-    expect(androidDispatch.trim()).toBe('workflow_dispatch:');
+    expect(androidDispatch).toMatch(/\n {6}preserve_run:\n {8}type: boolean\n {8}default: false/);
+    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run']);
+    expect(androidDispatch).not.toMatch(/light_build:|publish_release:|release_tag:/);
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);

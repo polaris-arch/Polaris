@@ -26,7 +26,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 from fork_input import ROOT, canonical, load, require, sha, verify_source, tool_environment
 from android_sdk import prepare_view
 from plan import plan
-from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt
+from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
 from budget import group_alive, register_group, reservation, native_capacity, native_environment
 
 ACTIVE_FDS = []
@@ -218,7 +218,7 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
             except BaseException:
                 cleanup_failed = True
             if cleanup_failed:
-                original.add_note('native cleanup incomplete; original reservation/group retained')
+                failure_note(original, 'native cleanup incomplete; original reservation/group retained')
             raise
         finally:
             failing = sys.exc_info()[0] is not None

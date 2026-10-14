@@ -238,22 +238,40 @@ esac
   });
 
   it('并发组：同一 PR / 分支上新提交取消旧运行，merge queue 不取消，且被取消的腿里没有写 release 的任务', () => {
-    // 旧判据（隐含在 YAML 里，此前无门）：PR 与 main 取消在途。新判据是它的超集：除 merge queue
-    // 外一律取消（多出手动 dispatch）。逐事件求值，不是只看字面量在不在。
+    // 普通 tip 可替代；固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
     const match = risk.match(
       /^concurrency:\n  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}\n/m,
     );
     expect(match, 'release-risk.yml 缺顶层 concurrency 段').not.toBeNull();
-    expect(match![1]).toBe(
-      'release-risk-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}',
-    );
-    const cancels = (eventName: string, ref: string) =>
-      runInNewContext(match![2], { github: { event_name: eventName, ref } });
+    const context = (eventName: string, ref: string, preserve = false, runId = 1) => ({
+      github: { workflow: 'Release Risk', event_name: eventName, ref, run_id: runId,
+        event: { pull_request: { number: eventName === 'pull_request' ? 7 : undefined },
+          merge_group: { head_sha: eventName === 'merge_group' ? 'queued-head' : undefined },
+          inputs: { preserve_run: preserve ? 'true' : 'false' } } },
+      inputs: { preserve_run: preserve },
+      startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+      format: (value: string, argument: number) => value.replace('{0}', String(argument)),
+    });
+    const cancels = (eventName: string, ref: string, preserve = false) =>
+      runInNewContext(match![2], context(eventName, ref, preserve));
+    const group = (eventName: string, ref: string, preserve = false, runId = 1) =>
+      match![1].replace(/\$\{\{ (.+?) \}\}/g, (_text, expression: string) =>
+        String(runInNewContext(expression, context(eventName, ref, preserve, runId))));
     expect(cancels('pull_request', 'refs/pull/7/merge')).toBe(true);
     expect(cancels('push', 'refs/heads/main')).toBe(true);
     expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(true);
     // 队列里的每一组都必须跑完才能出结论。
     expect(cancels('merge_group', 'refs/heads/gh-readonly-queue/main/pr-7')).toBe(false);
+    expect(cancels('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(false);
+    expect(cancels('push', 'refs/tags/v1.0.0')).toBe(false);
+    expect(group('pull_request', 'refs/pull/7/merge')).toBe('release-risk-Release Risk-7');
+    expect(group('push', 'refs/heads/main')).toBe(group('push', 'refs/heads/main', false, 2));
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
+      group('workflow_dispatch', 'refs/heads/collab/audit', true, 2));
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
+      group('workflow_dispatch', 'refs/heads/collab/audit'));
+    expect(group('merge_group', 'refs/heads/queue')).not.toBe(group('merge_group', 'refs/heads/queue', false, 2));
+    expect(group('push', 'refs/tags/v1.0.0')).not.toBe(group('push', 'refs/tags/v2.0.0'));
 
     // 取消只有在被取消的 run 里没有副作用任务时才安全。三条各自成立才算数：
     // ① 本 workflow 没有 tag 触发；
@@ -281,7 +299,21 @@ esac
     expect(androidJob).toContain('uses: ./.github/workflows/android.yml');
     expect(androidJob).not.toContain('publish_release');
     // Android 腿同样是轻量构型（2026-10-08）：被调方对「轻量 + 发布」当场红，故这两条必须同时成立。
-    expect(androidJob).toMatch(/\n {4}with:\n {6}light_build: true\n/);
+    const withAt = androidJob.indexOf('\n    with:\n');
+    expect(withAt).toBeGreaterThan(0);
+    const androidInputs = androidJob.slice(withAt);
+    expect(androidInputs).toMatch(/^ {6}light_build: true$/m);
+    expect([...androidInputs.matchAll(/^ {6}([a-z_]+):/gm)].map((m) => m[1]).sort())
+      .toEqual(['light_build', 'preserve_run']);
+    const preserved = androidInputs.match(/^ {6}preserve_run: \$\{\{ (.+) \}\}$/m);
+    expect(preserved).not.toBeNull();
+    for (const inherited of [false, true]) {
+      for (const input of [false, true]) {
+        expect(runInNewContext(preserved![1], { inputs: { preserve_run: input },
+          github: { event: { inputs: { preserve_run: inherited ? 'true' : 'false' } } } }))
+          .toBe(input || inherited);
+      }
+    }
     // 安装包不上传、且是轻量构型（不是可分发物）。
     const pkgJob = executable(jobSection(risk, 'package', 'release-risk.yml'));
     expect(pkgJob).toContain('upload_artifacts: false');
@@ -331,7 +363,11 @@ esac
     expect(wire).toBeGreaterThan(fetchProtoc);
     expect(mandatory).toBeGreaterThan(wire);
     expect(preflight).toContain('node scripts/fetch-protoc.mjs');
-    expect(preflight).toContain('cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact');
+    expect(preflight).toContain('node scripts/desktop-core/wire-input-handoff.mjs wire');
+    const wireSource = readFileSync(join(REPO_ROOT, 'scripts/desktop-core/wire-input-handoff.mjs'), 'utf8');
+    expect(wireSource).toMatch(/const WIRE_ARGS = \['test', '-p', 'polaris-singbox-grpc', '--test', 'bundled_core_wire',\s*'vendored_proto_matches_every_bundled_core', '--', '--exact'\]/);
+    expect(wireSource).toContain("run('cargo', WIRE_ARGS,");
+    expect(wireSource).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
     const mandatoryStep = preflight.slice(mandatory);
     expect(mandatoryStep).toContain("POLARIS_REQUIRE_KERNEL_GATE: '1'");
     expect(mandatoryStep).toContain('cargo test -p polaris-config-engine --test managed_mesh_emission_runtime -- --nocapture');

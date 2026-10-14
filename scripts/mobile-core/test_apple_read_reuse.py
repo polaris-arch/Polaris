@@ -14,6 +14,23 @@ from artifacts import file_pin, module, read_pinned
 
 
 class AppleReadReuse(unittest.TestCase):
+    def test_fixed_failure_notes_do_not_require_a_newer_exception_api(self):
+        class LegacyFailure(RuntimeError):
+            def add_note(self, message):
+                raise AssertionError('newer exception API must not be required')
+        primary = LegacyFailure('original parse error')
+        primary.__notes__ = ['existing fixed observation']
+        notes = primary.__notes__
+        artifacts.failure_note(primary, 'fixed follow-up observation')
+        self.assertIs(primary.__notes__, notes)
+        self.assertEqual(notes, ['existing fixed observation', 'fixed follow-up observation'])
+        self.assertEqual(str(primary), 'original parse error')
+        # Even malformed pre-existing note metadata cannot mask the failure.
+        primary.__notes__ = 'opaque existing metadata'
+        artifacts.failure_note(primary, 'fixed follow-up observation')
+        self.assertEqual(primary.__notes__, 'opaque existing metadata')
+        self.assertEqual(str(primary), 'original parse error')
+
     def test_parse_failure_remains_primary_when_observation_channel_breaks(self):
         primary = RuntimeError('controlled parse failure')
         observer = BrokenPipeError('controlled observer failure')

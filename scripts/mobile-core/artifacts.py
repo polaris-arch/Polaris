@@ -172,7 +172,20 @@ def inspection_stage(stage, reads=None):
             if primary is None:
                 # Keep the existing observer-only failure policy.
                 raise
-            BaseException.add_note(primary, 'Apple inspection observation failed; original failure preserved')
+            failure_note(primary, 'Apple inspection observation failed; original failure preserved')
+
+
+def failure_note(error, message):
+    """Retain fixed exception metadata on Python 3.10 as well as newer hosts."""
+    try:
+        notes = error.__dict__.get('__notes__')
+        if notes is None:
+            error.__dict__['__notes__'] = [message]
+        elif isinstance(notes, list):
+            notes.append(message)
+    except BaseException:
+        # A diagnostic annotation must never replace the primary failure.
+        pass
 
 
 def read_pinned(path, *, allow_empty=False, observations=None):
