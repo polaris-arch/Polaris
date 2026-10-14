@@ -71,7 +71,7 @@ def prepare():
     root = location()
     expected = os.environ['POLARIS_APP_CANDIDATE']
     require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
-    developer = Path('/Applications/Xcode_27.1_beta.app/Contents/Developer').resolve(strict=True)
+    developer = Path('/Applications/Xcode_27.1.app/Contents/Developer').resolve(strict=True)
     env = dict(os.environ, DEVELOPER_DIR=str(developer))
     xcode = run(['xcodebuild', '-version'], env=env).strip()
     require(xcode == 'Xcode ' + value['apple']['xcodeVersion'] + '\nBuild version ' + value['apple']['xcodeBuild'],

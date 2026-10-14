@@ -167,8 +167,9 @@ The source-owned `.github/workflows/apple.yml` now calls `ci_apple.py`
 prepare/build/evidence from the existing Release Risk graph. Selection reads
 actual changed paths through `apple-ci-impact.mjs`; the aggregate refuses a
 selected failed/cancelled/skipped Apple leg. The hosted `xcode-27` runner must
-actually provide Xcode27.1 build27A9269 and both SDK27.1, explicitly selected via
-`/Applications/Xcode_27.1_beta.app`; admission fails without fallback. This SDK
+actually provide Xcode27.1 build27A9275 and both SDK27.1, explicitly selected via
+`/Applications/Xcode_27.1.app` (the installed 27.1 release candidate); admission
+fails without fallback on any other build or SDK. This SDK
 declares the viewport's iOS27.1 APIs; their runtime availability guards and the
 iOS17.0 App deployment target remain. Its one fixed `~/Code/polaris-mobile-apple-ci`
 root has one component slot, one cache (20GiB maximum including a shared Rust

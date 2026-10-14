@@ -91,7 +91,7 @@
     "minimumOS": "15.0",
     "appMinimumOS": "17.0",
     "xcodeVersion": "27.1",
-    "xcodeBuild": "27A9269",
+    "xcodeBuild": "27A9275",
     "iPhoneSDK": "27.1",
     "simulatorSDK": "27.1",
     "tags": [

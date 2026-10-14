@@ -38,35 +38,27 @@ fn same_process_holder_and_parent_file_close_have_distinct_original_observations
         nix::fcntl::fcntl(owner.file.as_ref().unwrap(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
     let error = failure(&store);
     let snapshot = observed(&error);
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|e| e.phase == "acquired" && e.fd == Some(fd))
-    );
-    assert!(
-        snapshot
-            .native
-            .peers
-            .iter()
-            .any(|p| p.identity.pid == std::process::id() && p.fd == fd)
-    );
-    assert!(
-        snapshot
-            .native
-            .peers
-            .iter()
-            .filter(|p| p.fd == fd)
-            .all(|p| p.identity.start[0] > 0)
-    );
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|e| e.phase == "acquired" && e.fd == Some(fd)));
+    assert!(snapshot
+        .native
+        .peers
+        .iter()
+        .any(|p| p.identity.pid == std::process::id() && p.fd == fd));
+    assert!(snapshot
+        .native
+        .peers
+        .iter()
+        .filter(|p| p.fd == fd)
+        .all(|p| p.identity.start[0] > 0));
     #[cfg(target_os = "linux")]
-    assert!(
-        snapshot
-            .native
-            .peers
-            .iter()
-            .any(|p| p.fd == fd && p.flock_write == Some(true))
-    );
+    assert!(snapshot
+        .native
+        .peers
+        .iter()
+        .any(|p| p.fd == fd && p.flock_write == Some(true)));
     assert_eq!(
         nix::fcntl::fcntl(owner.file.as_ref().unwrap(), nix::fcntl::FcntlArg::F_GETFD).unwrap(),
         flags
@@ -77,12 +69,10 @@ fn same_process_holder_and_parent_file_close_have_distinct_original_observations
     // a failed install or converting the holder's shared/exclusive mode.
     let next = store.mutation_lock().unwrap();
     let snapshot = super::snapshot(&next.observation);
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|e| e.phase == "parent-file-closed" && e.fd == Some(fd))
-    );
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|e| e.phase == "parent-file-closed" && e.fd == Some(fd)));
 }
 
 struct ChildCleanup(Option<i32>);
@@ -181,40 +171,32 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
     let error = failure(&store);
     let snapshot = observed(&error);
     eprintln!("controlled-fork-only-child-pid={pid} {error}");
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|e| e.phase == "parent-file-closed" && e.fd == Some(fd))
-    );
-    assert!(
-        snapshot
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|e| e.phase == "parent-file-closed" && e.fd == Some(fd)));
+    assert!(snapshot
+        .native
+        .peers
+        .iter()
+        .any(|p| p.identity.pid == pid as u32
+            && p.fd == fd
+            && p.cloexec == Some(true)
+            && p.same_executable == Some(true)));
+    #[cfg(target_os = "linux")]
+    {
+        assert!(snapshot
             .native
             .peers
             .iter()
-            .any(|p| p.identity.pid == pid as u32
-                && p.fd == fd
-                && p.cloexec == Some(true)
-                && p.same_executable == Some(true))
-    );
-    #[cfg(target_os = "linux")]
-    {
-        assert!(
-            snapshot
-                .native
-                .peers
-                .iter()
-                .any(|p| p.identity.pid == pid as u32 && p.flock_write == Some(true))
-        );
+            .any(|p| p.identity.pid == pid as u32 && p.flock_write == Some(true)));
         // The contender may reuse the closed parent's descriptor number. Its
         // open description must not be mislabelled as the original lock holder.
-        assert!(
-            !snapshot
-                .native
-                .peers
-                .iter()
-                .any(|p| p.identity.pid == std::process::id() && p.flock_write == Some(true))
-        );
+        assert!(!snapshot
+            .native
+            .peers
+            .iter()
+            .any(|p| p.identity.pid == std::process::id() && p.flock_write == Some(true)));
     }
     parent.write_all(&[1]).unwrap();
     // Wait/reap belongs to normal control cleanup, not an acquisition retry.

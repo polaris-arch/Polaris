@@ -271,13 +271,15 @@ class AppleEntryTests(unittest.TestCase):
         value = ci_apple.load()
         apple = value['apple']
         expected_xcode = 'Xcode ' + apple['xcodeVersion'] + '\nBuild version ' + apple['xcodeBuild']
-        developer = Path('/selected/Xcode_27.1_beta.app/Contents/Developer')
+        developer = Path('/selected/Xcode_27.1_Release_Candidate.app/Contents/Developer')
         candidate = 'a' * 40
         admitted = 'control: exact selected tools admitted'
         cases = [
             ('Xcode 27.0\nBuild version 27A266a', apple['iPhoneSDK'], apple['simulatorSDK'],
              'runner does not provide the exact selected Xcode; no fallback/skip'),
             ('Xcode ' + apple['xcodeVersion'] + '\nBuild version 27A266a', apple['iPhoneSDK'], apple['simulatorSDK'],
+             'runner does not provide the exact selected Xcode; no fallback/skip'),
+            ('Xcode ' + apple['xcodeVersion'] + '\nBuild version 27A9269', apple['iPhoneSDK'], apple['simulatorSDK'],
              'runner does not provide the exact selected Xcode; no fallback/skip'),
             (expected_xcode, '27.0', apple['simulatorSDK'], 'runner does not provide the exact selected SDK'),
             (expected_xcode, apple['iPhoneSDK'], '27.0', 'runner does not provide the exact selected SDK'),
@@ -299,7 +301,7 @@ class AppleEntryTests(unittest.TestCase):
                         mock.patch.object(ci_apple, 'private_dir', side_effect=RuntimeError(admitted)) as tools, \
                         self.assertRaisesRegex(RuntimeError, '^' + reason + '$'):
                     ci_apple.prepare()
-                path.assert_called_once_with('/Applications/Xcode_27.1_beta.app/Contents/Developer')
+                path.assert_called_once_with('/Applications/Xcode_27.1.app/Contents/Developer')
                 selected_path.resolve.assert_called_once_with(strict=True)
                 for call in run.call_args_list[1:]:
                     self.assertEqual(call.kwargs['env']['DEVELOPER_DIR'], str(developer))

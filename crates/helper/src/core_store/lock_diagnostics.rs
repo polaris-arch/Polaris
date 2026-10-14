@@ -33,11 +33,15 @@ struct ScopeEvent {
 }
 impl fmt::Debug for ScopeEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{{phase={},pid={},thread={:?},ns={},fd={:?},dev={:?},inode={:?}}",
-            self.phase, self.pid, self.thread, self.elapsed_ns, self.fd, self.dev, self.inode
-        )
+        f.debug_struct("ScopeEvent")
+            .field("phase", &self.phase)
+            .field("pid", &self.pid)
+            .field("thread", &self.thread)
+            .field("ns", &self.elapsed_ns)
+            .field("fd", &self.fd)
+            .field("dev", &self.dev)
+            .field("inode", &self.inode)
+            .finish()
     }
 }
 fn record(phase: &'static str, observation: &LockObservation) {
@@ -106,17 +110,15 @@ struct Peer {
 }
 impl fmt::Debug for Peer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{{identity={:?},fd={},cloexec={:?},same-executable={:?},shared-description={:?},flock-write={:?},flock-acquirer-pid={:?}}",
-            self.identity,
-            self.fd,
-            self.cloexec,
-            self.same_executable,
-            self.shared_description,
-            self.flock_write,
-            self.flock_acquirer_pid
-        )
+        f.debug_struct("Peer")
+            .field("identity", &self.identity)
+            .field("fd", &self.fd)
+            .field("cloexec", &self.cloexec)
+            .field("same-executable", &self.same_executable)
+            .field("shared-description", &self.shared_description)
+            .field("flock-write", &self.flock_write)
+            .field("flock-acquirer-pid", &self.flock_acquirer_pid)
+            .finish()
     }
 }
 #[derive(Default)]
