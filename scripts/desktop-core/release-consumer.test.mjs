@@ -1239,3 +1239,22 @@ test('all five fresh second-snapshot 304 checks preserve strict receipts without
   assert([...counts].filter(([url]) => url.startsWith('https://api.github.com/')).every(([, count]) => count === 2));
   assert.equal(counts.get(f.contract.assetIndex.url), 1); assert.equal(counts.get(f.contract.platforms.linux.releaseAsset.url), 1);
 }));
+
+
+test('dedicated opaque Bearer credentials accept standard punctuation without exposing their bytes', async () => {
+  for (const secret of ['inert_fixture_token', 'v1.fixture.payload.signature', 'fixture~token+part/other==']) {
+    const reports = []; let calls = 0;
+    const read = releasePublicReader({ env: { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: secret },
+      report: (text) => reports.push(text), fetch: async (url, options) => {
+        calls++; assert.equal(options.headers.Authorization, `Bearer ${secret}`);
+        return new Response('ok', { headers: { 'x-ratelimit-limit': '1000', 'x-ratelimit-remaining': '999' } });
+      } });
+    assert.equal((await read(transportURL, 2)).toString(), 'ok'); assert.equal(calls, 1);
+    assert(reports.every((text) => !text.includes(secret)));
+  }
+  for (const secret of ['fixture token', 'fixture\r\nX-Fixture: injected', 'fixture\tvalue', 'é', '=leading', 'mid=dle', 'x'.repeat(4097)]) {
+    assert.throws(() => releasePublicReader({ env: { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: secret },
+      fetch: async () => assert.fail('invalid credentials must not reach HTTP') }),
+    (error) => error.message === 'Invalid dedicated release API credential');
+  }
+});

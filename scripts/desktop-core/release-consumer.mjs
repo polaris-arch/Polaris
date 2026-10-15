@@ -279,10 +279,13 @@ function canonicalPublicAPI(endpoint, asset) {
     && !endpoint.port && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
     && (endpoint.pathname === `/repos/${REPO}` || endpoint.pathname.startsWith(`/repos/${REPO}/`));
 }
+// Installation credentials are opaque Bearer values, not a frozen GitHub token-prefix alphabet.
+// RFC 6750 b64token excludes whitespace/control bytes while permitting JWT dots and padding.
 function releaseAPIToken(env) {
   if (env.GITHUB_ACTIONS !== 'true' || !env.POLARIS_RELEASE_API_TOKEN) return null;
   demand(typeof env.POLARIS_RELEASE_API_TOKEN === 'string'
-    && /^[A-Za-z0-9_-]{1,4096}$/.test(env.POLARIS_RELEASE_API_TOKEN), 'Invalid dedicated release API credential');
+    && env.POLARIS_RELEASE_API_TOKEN.length <= 4096
+    && /^[A-Za-z0-9._~+/-]+=*$/.test(env.POLARIS_RELEASE_API_TOKEN), 'Invalid dedicated release API credential');
   return env.POLARIS_RELEASE_API_TOKEN;
 }
 function quotaDetail(response, token) {
