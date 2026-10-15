@@ -132,6 +132,7 @@ jobs:
       # tests. Darwin CGO uses the actual SDK above; no cross-host substitute.
       - name: Acquire exact platform core input
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_PLATFORM: ${{ matrix.platform }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: |
@@ -222,6 +223,7 @@ jobs:
       - name: Assemble and verify exact candidate bundle
         id: bundle
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: |
           set -euo pipefail

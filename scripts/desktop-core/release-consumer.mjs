@@ -10,6 +10,11 @@ import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 
 const REPO = 'polaris-arch/polaris-box';
 const API = `https://api.github.com/repos/${REPO}`;
+// Only consumer steps explicitly receive the built-in Actions token. Keep it
+// in this reader's closure, not in the environment inherited by native tools.
+const RELEASE_API_ENV = Object.freeze({ GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+  POLARIS_RELEASE_API_TOKEN: process.env.POLARIS_RELEASE_API_TOKEN });
+delete process.env.POLARIS_RELEASE_API_TOKEN;
 const POLICY = 'preserve measured original bytes; ad-hoc/not-signed observations do not assert trust';
 const CONTRACT_PATH = 'scripts/desktop-core/release-contract.json';
 const PENDING_CONTRACT_PATH = 'scripts/desktop-core/pending-release-contract.json';
@@ -258,9 +263,9 @@ export function validateReleaseNotice(notice, manifest, contract, mobile) {
 }
 
 // Redirects are permitted only for immutable asset bytes, whose expected hash is already pinned.
-// An anonymous primary quota window is one hour. Bound recovery to one window
-// plus a minute of clock/reset margin, shared by the whole consumption.
-const PRIMARY_QUOTA_WAIT_MS = 61 * 60 * 1000;
+// Do not spend a native runner waiting for a shared anonymous IP's hourly reset.
+// One short, evidenced recovery remains shared by the whole consumption.
+const PRIMARY_QUOTA_WAIT_MS = 2 * 60 * 1000;
 const TRANSPORT_WAIT_MS = 1000;
 const TRANSPORT_CODES = new Set(['EAI_AGAIN', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND',
   'EACCES', 'EPERM', 'ABORT_ERR', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED',
@@ -274,6 +279,23 @@ function canonicalPublicAPI(endpoint, asset) {
     && !endpoint.port && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
     && (endpoint.pathname === `/repos/${REPO}` || endpoint.pathname.startsWith(`/repos/${REPO}/`));
 }
+function releaseAPIToken(env) {
+  if (env.GITHUB_ACTIONS !== 'true' || !env.POLARIS_RELEASE_API_TOKEN) return null;
+  demand(typeof env.POLARIS_RELEASE_API_TOKEN === 'string'
+    && /^[A-Za-z0-9_-]{1,4096}$/.test(env.POLARIS_RELEASE_API_TOKEN), 'Invalid dedicated release API credential');
+  return env.POLARIS_RELEASE_API_TOKEN;
+}
+function quotaDetail(response, token) {
+  return ['x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
+    'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after'].map((name) => {
+    const value = response.headers.get(name);
+    const safe = value !== null && value !== token && (name === 'x-github-request-id'
+      ? /^[A-Fa-f0-9:.-]{1,128}$/.test(value) : name === 'x-ratelimit-resource'
+        ? ['core', 'search'].includes(value) : /^[0-9]{1,20}$/.test(value));
+    return `${name}=${safe ? value : 'unknown'}`;
+  }).join(', ');
+}
+const validETag = (value) => typeof value === 'string' && /^(?:W\/)?"[\x21\x23-\x7e]{1,256}"$/.test(value);
 // Keep only a closed code vocabulary. Never copy error messages, addresses,
 // URLs, signed queries or a raw cause into the public diagnostic. Mixed,
 // unknown, cyclic or clipped cause graphs cannot authorize recovery.
@@ -314,33 +336,41 @@ const transportDetail = (observation) => `${observation.kind}; codes=${observati
 export function releasePublicReader(options = {}) {
   const quotaBudget = { available: true };
   const transportBudget = { available: true };
+  const metadataCache = new Map(), observationBudget = { available: true };
+  const apiToken = releaseAPIToken(options.env ?? RELEASE_API_ENV);
   const now = options.now ?? Date.now;
   const supplied = options.deadlineMs ?? process.env.POLARIS_RELEASE_JOB_DEADLINE_MS;
   const deadlineMs = supplied === undefined ? now() + 120 * 60 * 1000 : Number(supplied);
   demand((supplied === undefined || /^[0-9]+$/.test(String(supplied)))
     && Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= now() + 180 * 60 * 1000,
   'Invalid absolute release-consumer deadline');
-  return (url, limit, asset = false) => publicBytes(url, limit, asset, { ...options, quotaBudget, transportBudget, deadlineMs });
+  return (url, limit, asset = false) => publicBytes(url, limit, asset,
+    { ...options, apiToken, quotaBudget, transportBudget, deadlineMs, metadataCache, observationBudget });
 }
-function primaryQuotaDelay(response, endpoint, asset, now, deadline) {
+function primaryQuotaDelay(response, endpoint, asset, now, authenticated) {
   const reset = response.headers.get('x-ratelimit-reset'), retry = response.headers.get('retry-after');
   if (!canonicalPublicAPI(endpoint, asset) || ![403, 429].includes(response.status)
-    || response.headers.get('x-ratelimit-limit') !== '60' || response.headers.get('x-ratelimit-remaining') !== '0'
+    || !(authenticated ? ['1000', '15000'] : ['60']).includes(response.headers.get('x-ratelimit-limit'))
+    || response.headers.get('x-ratelimit-remaining') !== '0'
     || response.headers.get('x-ratelimit-resource') !== 'core' || !/^[0-9]+$/.test(reset ?? '')
     || (retry !== null && !/^[0-9]+$/.test(retry))) return null;
   const resetMs = Number(reset) * 1000;
   if (!Number.isSafeInteger(resetMs) || resetMs <= now) return null;
   const delay = Math.max(resetMs - now + 1000, retry === null ? 0 : Number(retry) * 1000);
-  return Number.isSafeInteger(delay) && delay > 0 && delay <= PRIMARY_QUOTA_WAIT_MS
-    && now + delay < deadline ? delay : null;
+  return Number.isSafeInteger(delay) && delay > 0 ? delay : null;
 }
 export async function publicBytes(url, limit, asset = false, options = {}) {
   const request = options.fetch ?? fetch;
+  const token = options.apiToken ?? releaseAPIToken(options.env ?? RELEASE_API_ENV);
   for (let redirects = 0; redirects <= 3;) {
     const endpoint = new URL(url);
     const headers = { 'User-Agent': 'Polaris-release-consumer', Accept: 'application/vnd.github+json' };
-    // Keep public reads anonymous. Neither credentials nor a signed query are
-    // included in failure diagnostics. Preserve denial until its cause is known.
+    const metadata = canonicalPublicAPI(endpoint, asset), authenticated = metadata && token !== null;
+    if (authenticated) headers.Authorization = `Bearer ${token}`;
+    const cached = metadata ? options.metadataCache?.get(url) : null;
+    if (cached) headers['If-None-Match'] = cached.etag;
+    // Assets/CDN redirects remain anonymous; API redirects fail closed. Never
+    // put a credential, response body, signed query or raw error in diagnostics.
     const stage = asset ? (redirects ? 'asset-redirect' : 'asset') : 'public-api';
     const location = `stage=${stage} host=${endpoint.hostname} path=${endpoint.pathname}`;
     const now = (options.now ?? Date.now)();
@@ -364,6 +394,14 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
       try { await response.body?.cancel(); }
       catch (error) { throw new Error(`Release body cancellation failed (${location}; ${transportDetail(transportObservation(error))})`); }
     };
+    if (response.status === 304) {
+      await cancelBody();
+      const etag = response.headers.get('etag');
+      demand(metadata && cached && (etag === null || etag === cached.etag)
+        && cached.bytes.length === cached.size && cached.size <= limit && digest(cached.bytes) === cached.sha256,
+      'Release conditional response has no intact matching metadata');
+      return Buffer.from(cached.bytes);
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       await cancelBody(); const next = new URL(response.headers.get('location') ?? '', url);
       demand(asset && next.protocol === 'https:' && !next.username && !next.password && !next.port
@@ -372,18 +410,18 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     }
     if (!response.ok) {
       await cancelBody();
-      const quota = ['x-github-request-id', 'x-ratelimit-limit', 'x-ratelimit-remaining',
-        'x-ratelimit-reset', 'x-ratelimit-resource', 'retry-after']
-        .map((name) => `${name}=${response.headers.get(name) ?? 'unknown'}`).join(', ');
+      const quota = `apiAuth=${authenticated ? 'actions' : 'anonymous'}; ${quotaDetail(response, token)}`;
       const delay = options.quotaBudget?.available
-        ? primaryQuotaDelay(response, endpoint, asset, (options.now ?? Date.now)(), options.deadlineMs) : null;
-      if (delay !== null) {
+        ? primaryQuotaDelay(response, endpoint, asset, (options.now ?? Date.now)(), authenticated) : null;
+      if (delay !== null && delay <= PRIMARY_QUOTA_WAIT_MS
+        && (options.now ?? Date.now)() + delay < options.deadlineMs) {
         options.quotaBudget.available = false;
         (options.report ?? console.error)(`Release primary quota wait ${delay}ms (${location}; ${quota})`);
         await (options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
         continue;
       }
-      throw new Error(`Release HTTP ${response.status} (${location}; ${quota})`);
+      const budget = delay !== null && delay > PRIMARY_QUOTA_WAIT_MS ? '; primary-quota-wait-budget-exceeded' : '';
+      throw new Error(`Release HTTP ${response.status} (${location}; ${quota}${budget})`);
     }
     const parts = []; let size = 0;
     let oversized = false;
@@ -397,7 +435,20 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
       throw new Error(`Release body read failed (${location}; ${transportDetail(transportObservation(error))})`);
     }
     demand(!oversized, 'Release response exceeds pinned size');
-    return Buffer.concat(parts);
+    const bytes = Buffer.concat(parts);
+    // Five metadata endpoints, each at most the existing 8 MiB API limit. The
+    // second snapshot still performs fresh HTTP validation; no stale/disk cache.
+    const etag = response.headers.get('etag');
+    if (metadata && options.metadataCache) {
+      options.metadataCache.delete(url);
+      if (validETag(etag) && bytes.length <= 8 * 1024 * 1024 && options.metadataCache.size < 5)
+        options.metadataCache.set(url, { etag, bytes: Buffer.from(bytes), size: bytes.length, sha256: digest(bytes) });
+    }
+    if (metadata && options.observationBudget?.available) {
+      options.observationBudget.available = false;
+      (options.report ?? console.error)(`Release API observation (${location}; status=${response.status}; apiAuth=${authenticated ? 'actions' : 'anonymous'}; ${quotaDetail(response, token)})`);
+    }
+    return bytes;
   }
   throw new Error('Release redirect limit');
 }
@@ -624,7 +675,12 @@ function replaceDirectories(resources, work, keys, rename) {
 
 export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_TARGETS), options = {}) {
   demand(keys.length && new Set(keys).size === keys.length && keys.every((k) => Object.hasOwn(RELEASE_TARGETS, k)), 'Unknown/duplicate App architecture selection');
-  const contract = loadReleaseContract(root, manifest), run = options.run ?? execFileSync, read = options.read ?? releasePublicReader();
+  const contract = loadReleaseContract(root, manifest), invoke = options.run ?? execFileSync, read = options.read ?? releasePublicReader();
+  const run = (command, args, settings = {}) => {
+    const env = { ...(settings.env ?? process.env) };
+    delete env.POLARIS_RELEASE_API_TOKEN;
+    return invoke(command, args, { ...settings, env });
+  };
   const adapter = adapterIdentity(root, run);
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
   const lock = join(resources, '.release-consumer.lock');

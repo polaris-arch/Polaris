@@ -676,14 +676,27 @@ test('Windows permission adaptation still rejects symlinks, setuid and non-core0
     assert.deepEqual(resources(f), {});
   }, { windowsZipMode: mode });
 });
-test('public API and asset redirects stay anonymous even when credential variables exist', async () => {
+test('dedicated Actions token is API-only while ambient tokens, assets and redirects stay anonymous', async () => {
   const calls = [], env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token', GH_TOKEN: 'inert-gh-token' };
   const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
   const fetch = async (url, options) => { calls.push({ url, ...options }); return new Response('ok'); };
   await publicBytes('https://api.github.com/repos/polaris-arch/polaris-box/releases/17', 2, false, { fetch, env });
-  assert.equal(calls.pop().headers.Authorization, undefined);
+   assert.equal(calls.pop().headers.Authorization, 'Bearer inert-fixture-token');
+   for (const outside of [{ GITHUB_ACTIONS: 'false', POLARIS_RELEASE_API_TOKEN: 'inert-fixture-token' },
+     { GITHUB_ACTIONS: 'true', GH_TOKEN: 'ignored-fixture-token', GITHUB_TOKEN: 'ignored-fixture-token' }]) {
+     await publicBytes('https://api.github.com/repos/polaris-arch/polaris-box', 2, false, { fetch, env: outside });
+     assert.equal(calls.pop().headers.Authorization, undefined);
+   }
+   for (const url of ['https://api.github.com/repos/other/repo',
+     'https://api.github.com/repos/polaris-arch/polaris-box?secret=fixture',
+     'https://api.github.com/repos/polaris-arch/polaris-box#fragment',
+     'https://fixture-user@api.github.com/repos/polaris-arch/polaris-box',
+     'http://api.github.com/repos/polaris-arch/polaris-box']) {
+     await publicBytes(url, 2, false, { fetch, env });
+     assert.equal(calls.pop().headers.Authorization, undefined);
+   }
   const assetFetch = async (url, options) => { calls.push({ url, ...options });
     return url.includes('github.com/') ? new Response(null, { status: 302,
       headers: { Location: 'https://release-assets.githubusercontent.com/inert?signature=fixture' } }) : new Response('ok'); };
@@ -742,7 +755,8 @@ test('recognized transient API transport gets one same-URL anonymous retry share
   assert.deepEqual(waits, [1000]); assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((call) => call.url), [transportURL, transportURL]);
   assert(calls.every((call) => call.options.redirect === 'manual' && call.options.headers.Authorization === undefined));
-  assert.equal(reports.length, 1); assert(reports[0].includes('codes=ECONNRESET; causeComplete=true'));
+  assert.equal(reports.length, 2); assert(reports[0].includes('codes=ECONNRESET; causeComplete=true'));
+  assert(reports[1].includes('Release API observation') && reports[1].includes('apiAuth=anonymous'));
   assert(!reports[0].includes('never-log'));
   await assert.rejects(read(transportURL + '/releases/17', 2), /codes=ECONNRESET/);
   assert.equal(calls.length, 3); assert.equal(waits.length, 1);
@@ -842,17 +856,19 @@ test('response cancellation failures are bounded diagnostics without recovery', 
 const observedQuotaHeaders = { 'x-github-request-id': 'E3C0:358CB1:1F5A584:2541386:6ACC0359',
   'x-ratelimit-limit': '60', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1791755597',
   'x-ratelimit-resource': 'core' };
-test('observed primary quota waits beyond reset once and retries the identical anonymous request', async () => {
+const shortQuotaHeaders = { ...observedQuotaHeaders, 'x-ratelimit-reset': String(Math.floor(quotaNow / 1000) + 30) };
+test('short evidenced primary quota waits beyond reset once and retries the identical anonymous request', async () => {
   const calls = [], waits = [], reports = [];
   const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: (s) => reports.push(s),
     fetch: async (url, options) => { calls.push({ url, options });
-      return calls.length === 2 ? new Response('ok') : new Response('denied', { status: 403, headers: observedQuotaHeaders }); } });
+      return calls.length === 2 ? new Response('ok') : new Response('denied', { status: 403, headers: shortQuotaHeaders }); } });
   const url = 'https://api.github.com/repos/polaris-arch/polaris-box';
   assert.equal((await read(url, 2)).toString(), 'ok');
-  assert.deepEqual(waits, [500758]); assert.equal(calls.length, 2);
+  assert.deepEqual(waits, [30758]); assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((c) => c.url), [url, url]);
   assert(calls.every((c) => c.options.headers.Authorization === undefined && c.options.redirect === 'manual'));
-  assert.equal(reports.length, 1); assert(reports[0].includes('Release primary quota wait 500758ms'));
+  assert.equal(reports.length, 2); assert(reports[0].includes('Release primary quota wait 30758ms'));
+  assert(reports[1].includes('Release API observation'));
   // Both snapshots and subsequent endpoints share the exhausted one-retry budget.
   await assert.rejects(read(url + '/releases/17', 10), /Release HTTP 403/);
   assert.equal(calls.length, 3); assert.equal(waits.length, 1);
@@ -860,9 +876,9 @@ test('observed primary quota waits beyond reset once and retries the identical a
 test('a second quota denial is terminal without another wait or request', async () => {
   let calls = 0; const waits = [];
   const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async (ms) => waits.push(ms), report: () => {},
-    fetch: async () => { calls++; return new Response('denied', { status: 429, headers: observedQuotaHeaders }); } });
+    fetch: async () => { calls++; return new Response('denied', { status: 429, headers: shortQuotaHeaders }); } });
   await assert.rejects(read('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 429/);
-  assert.equal(calls, 2); assert.deepEqual(waits, [500758]);
+  assert.equal(calls, 2); assert.deepEqual(waits, [30758]);
 });
 test('unknown, expired, excessive, asset and noncanonical denials never consume a retry', async () => {
   const base = 'https://api.github.com/repos/polaris-arch/polaris-box';
@@ -883,7 +899,7 @@ test('unknown, expired, excessive, asset and noncanonical denials never consume 
     let calls = 0, waits = 0;
     const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => { waits++; }, report: () => {},
       fetch: async () => { calls++; return new Response('denied', { status: c.status ?? 403,
-        headers: { ...observedQuotaHeaders, ...c.headers } }); } });
+        headers: { ...shortQuotaHeaders, ...c.headers } }); } });
     await assert.rejects(read(c.url ?? base, 10, c.asset ?? false), /Release HTTP/);
     assert.equal(calls, 1, JSON.stringify(c)); assert.equal(waits, 0, JSON.stringify(c));
   }
@@ -891,12 +907,12 @@ test('unknown, expired, excessive, asset and noncanonical denials never consume 
 test('quota recovery still enforces pinned response size and public identity without replacing resources', async () => withFixture(async (f) => {
   let calls = 0;
   const read = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => {}, report: () => {},
-    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
+    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: shortQuotaHeaders })
       : new Response('larger than the pin') });
   await assert.rejects(read(f.base, 2), /exceeds pinned size/); assert.equal(calls, 2);
   write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f); calls = 0;
   const changed = releasePublicReader({ deadlineMs: quotaNow + 120 * 60000, now: () => quotaNow, sleep: async () => {}, report: () => {},
-    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: observedQuotaHeaders })
+    fetch: async () => ++calls === 1 ? new Response('denied', { status: 403, headers: shortQuotaHeaders })
       : new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true })) });
   await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read: changed }), /Repository identity differs/);
   assert.equal(calls, 2); assert.deepEqual(resources(f), before);
@@ -914,19 +930,22 @@ test('default consumption uses the anonymous reader and preserves strict origina
   } finally { globalThis.fetch = previous; }
 }));
 
-test('actual next-run reset beyond ten minutes is covered within one primary-window budget', async () => {
-  let requests = 0; const waits = [];
-  const read = releasePublicReader({ deadlineMs: 1791756567959 + 120 * 60000, now: () => 1791756567959, sleep: async (ms) => waits.push(ms), report: () => {},
-    fetch: async () => ++requests === 1 ? new Response('denied', { status: 403,
-      headers: { ...observedQuotaHeaders, 'x-ratelimit-reset': '1791757286',
-        'x-github-request-id': '9371:10BA2F:27BEFC0:2DB19BB:6ACC0918' } }) : new Response('ok') });
-  assert.equal((await read('https://api.github.com/repos/polaris-arch/polaris-box', 2)).toString(), 'ok');
-  assert.deepEqual(waits, [719041]); assert.equal(requests, 2);
+test('observed long resets, including the 27-minute Windows wait, fail before sleeping or retrying', async () => {
+  for (const [now, reset] of [[quotaNow, observedQuotaHeaders['x-ratelimit-reset']],
+    [1791756567959, '1791757286'], [1792030955775, '1792032577']]) {
+    let requests = 0;
+    const read = releasePublicReader({ env: {}, deadlineMs: now + 120 * 60000, now: () => now,
+      sleep: async () => assert.fail('long hourly quota must not occupy the runner'), report: () => {},
+      fetch: async () => { requests++; return new Response('denied', { status: 403,
+        headers: { ...observedQuotaHeaders, 'x-ratelimit-reset': reset } }); } });
+    await assert.rejects(read(transportURL, 2), /Release HTTP 403.*primary-quota-wait-budget-exceeded/);
+    assert.equal(requests, 1);
+  }
 });
 test('absolute job deadline forbids an overrun, expired requests and a retry after time advances past cutoff', async () => {
   let requests = 0, waits = 0;
-  const fetch = async () => { requests++; return new Response('denied', { status: 403, headers: observedQuotaHeaders }); };
-  const short = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 500000, fetch,
+  const fetch = async () => { requests++; return new Response('denied', { status: 403, headers: shortQuotaHeaders }); };
+  const short = releasePublicReader({ now: () => quotaNow, deadlineMs: quotaNow + 30000, fetch,
     sleep: async () => { waits++; }, report: () => {} });
   await assert.rejects(short('https://api.github.com/repos/polaris-arch/polaris-box', 10), /Release HTTP 403/);
   assert.equal(requests, 1); assert.equal(waits, 0);
@@ -934,7 +953,7 @@ test('absolute job deadline forbids an overrun, expired requests and a retry aft
   await assert.rejects(expired('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
   assert.equal(requests, 1);
   let clock = quotaNow; requests = 0;
-  const cutoff = quotaNow + 501000;
+  const cutoff = quotaNow + 31000;
   const late = releasePublicReader({ now: () => clock, deadlineMs: cutoff, fetch, report: () => {},
     sleep: async () => { waits++; clock = cutoff + 1; } });
   await assert.rejects(late('https://api.github.com/repos/polaris-arch/polaris-box', 10), /job deadline exceeded/);
@@ -1101,3 +1120,122 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
     assert.equal(dirname(rw), fs.realpathSync(dirname(rw)));
     assert(f.inspections.every((call) => !call.includes('--sign') && !call.includes('--force')));
   }));
+
+test('API redirects cannot forward the dedicated token and unknown authenticated denials never fall back', async () => {
+  const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert_fixture_token' };
+  for (const status of [302, 401, 403, 404]) {
+    let requests = 0;
+    const read = releasePublicReader({ env, now: () => quotaNow, deadlineMs: quotaNow + 60000,
+      sleep: async () => assert.fail('unknown denial must not wait'), fetch: async (url, options) => {
+        requests++; assert.equal(options.headers.Authorization, 'Bearer inert_fixture_token');
+        return new Response(null, { status, headers: { Location: 'https://release-assets.githubusercontent.com/inert' } }); } });
+    await assert.rejects(read(transportURL, 2), status === 302 ? /Unapproved release redirect/ : new RegExp(`Release HTTP ${status}`));
+    assert.equal(requests, 1);
+  }
+});
+test('authorized core quota may recover once using the same Actions credential', async () => {
+  const env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: 'inert_fixture_token' };
+  for (const limit of ['1000', '15000']) {
+    const calls = [], waits = [];
+    const read = releasePublicReader({ env, now: () => quotaNow, deadlineMs: quotaNow + 60000,
+      sleep: async (ms) => waits.push(ms), report: () => {}, fetch: async (url, options) => {
+        calls.push(options); return calls.length === 1 ? new Response('denied', { status: 403,
+          headers: { ...shortQuotaHeaders, 'x-ratelimit-limit': limit } }) : new Response('ok'); } });
+    assert.equal((await read(transportURL, 2)).toString(), 'ok'); assert.deepEqual(waits, [30758]);
+    assert(calls.every((options) => options.headers.Authorization === 'Bearer inert_fixture_token'));
+  }
+});
+test('conditional metadata performs fresh HTTP and returned Buffer mutation cannot corrupt cached bytes', async () => {
+  const calls = [], reports = [];
+  const read = releasePublicReader({ env: {}, report: (s) => reports.push(s), fetch: async (url, options) => {
+    calls.push({ url, options }); return calls.length === 1 ? new Response('abc', { headers: { etag: '"one"' } })
+      : new Response(null, { status: 304, headers: { etag: '"one"' } }); } });
+  const first = await read(transportURL, 3); first.fill(0);
+  assert.equal((await read(transportURL, 3)).toString(), 'abc'); assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.headers['If-None-Match'], undefined);
+  assert.equal(calls[1].options.headers['If-None-Match'], '"one"');
+  assert.equal(reports.length, 1); assert(!reports[0].includes('"one"'));
+});
+test('unsolicited, mismatched, smaller-limit and asset 304 responses never reuse metadata', async () => {
+  for (const change of ['unsolicited', 'etag', 'limit', 'asset']) {
+    let calls = 0;
+    const read = releasePublicReader({ env: {}, report: () => {}, fetch: async () => {
+      calls++; return calls === 1 && change !== 'unsolicited' ? new Response('abc', { headers: { etag: '"one"' } })
+        : new Response(null, { status: 304, headers: { etag: change === 'etag' ? '"other"' : '"one"' } }); } });
+    if (change !== 'unsolicited') await read(transportURL, 3);
+    await assert.rejects(read(transportURL, change === 'limit' ? 2 : 3, change === 'asset'), /no intact matching metadata/);
+  }
+});
+test('metadata cache is per-reader, bounded to five URLs, and never retains asset bytes', async () => {
+  const calls = [];
+  const fetch = async (url, options) => { calls.push({ url, options }); return new Response('ok', { headers: { etag: '"one"' } }); };
+  const read = releasePublicReader({ env: {}, fetch, report: () => {} });
+  for (let i = 0; i < 6; i++) await read(transportURL + `/releases/${i}`, 2);
+  await read(transportURL + '/releases/5', 2); assert.equal(calls.at(-1).options.headers['If-None-Match'], undefined);
+  await read(transportURL + '/releases/0', 2); assert.equal(calls.at(-1).options.headers['If-None-Match'], '"one"');
+  await releasePublicReader({ env: {}, fetch, report: () => {} })(transportURL + '/releases/0', 2);
+  assert.equal(calls.at(-1).options.headers['If-None-Match'], undefined);
+  const asset = 'https://github.com/polaris-arch/polaris-box/releases/download/inert/core.zip';
+  await read(asset, 2, true); await read(asset, 2, true);
+  assert(calls.slice(-2).every((c) => c.options.headers['If-None-Match'] === undefined && c.options.headers.Authorization === undefined));
+});
+test('a changed 200 replaces conditional metadata and loss of ETag removes that cache entry', async () => {
+  const calls = [];
+  const read = releasePublicReader({ env: {}, report: () => {}, fetch: async (url, options) => {
+    calls.push(options); return new Response(calls.length === 1 ? 'old' : 'new',
+      { headers: calls.length < 3 ? { etag: calls.length === 1 ? '"old"' : '"new"' } : {} }); } });
+  assert.equal((await read(transportURL, 3)).toString(), 'old');
+  assert.equal((await read(transportURL, 3)).toString(), 'new');
+  await read(transportURL, 3); await read(transportURL, 3);
+  assert.deepEqual(calls.map((c) => c.headers['If-None-Match']), [undefined, '"old"', '"new"', undefined]);
+});
+test('conditional second snapshot rejects changed public identity and leaves old resources intact', async () => withFixture(async (f) => {
+  write(join(f.root, 'resources/linux/sing-box'), 'previous'); const before = resources(f), counts = new Map();
+  const read = releasePublicReader({ env: {}, report: () => {}, fetch: async (url, options) => {
+    const count = (counts.get(url) ?? 0) + 1; counts.set(url, count); assert(f.transport.has(url));
+    if (url === f.base && count === 2) {
+      assert.equal(options.headers['If-None-Match'], '"one"');
+      return new Response(encode({ id: 1407705262, full_name: f.contract.repository, private: true }), { headers: { etag: '"changed"' } });
+    }
+    assert.equal(options.headers['If-None-Match'], undefined);
+    return new Response(f.transport.get(url), { headers: url.startsWith('https://api.github.com/') ? { etag: '"one"' } : {} });
+  } });
+  await assert.rejects(consumeRelease(f.root, f.manifest, ['linux'], { ...f, read }), /Repository identity differs/);
+  assert.equal(counts.get(f.base), 2); assert.deepEqual(resources(f), before);
+}));
+test('dedicated API token is removed from consumer native-tool environments and receipts', async () => withFixture(async (f) => {
+  const previous = process.env.POLARIS_RELEASE_API_TOKEN; process.env.POLARIS_RELEASE_API_TOKEN = 'never_log_fixture_secret';
+  let tools = 0;
+  try {
+    const run = (command, args, settings) => { tools++; assert.equal(settings.env.POLARIS_RELEASE_API_TOKEN, undefined);
+      return f.run(command, args, settings); };
+    const receipts = await consumeRelease(f.root, f.manifest, ['linux'], { ...f, run });
+    assert(tools > 0); assert(!JSON.stringify(receipts).includes('never_log_fixture_secret'));
+  } finally {
+    if (previous === undefined) delete process.env.POLARIS_RELEASE_API_TOKEN; else process.env.POLARIS_RELEASE_API_TOKEN = previous;
+  }
+}));
+test('untrusted quota header text cannot echo credentials or arbitrary response content into diagnostics', async () => {
+  const secret = 'never_log_fixture_secret', env = { GITHUB_ACTIONS: 'true', POLARIS_RELEASE_API_TOKEN: secret };
+  await assert.rejects(publicBytes(transportURL, 2, false, { env, fetch: async () => new Response('never_log_body', { status: 403,
+    headers: { 'x-github-request-id': secret, 'x-ratelimit-limit': 'never_log_header' } }) }),
+  (error) => !error.message.includes('never_log') && error.message.includes('x-github-request-id=unknown'));
+});
+test('all five fresh second-snapshot 304 checks preserve strict receipts without downloading assets twice', async () => withFixture(async (f) => {
+  const counts = new Map();
+  const read = releasePublicReader({ env: {}, report: () => {}, fetch: async (url, options) => {
+    assert(f.transport.has(url)); const count = (counts.get(url) ?? 0) + 1; counts.set(url, count);
+    if (url.startsWith('https://api.github.com/')) {
+      assert.equal(options.headers['If-None-Match'], count === 1 ? undefined : '"one"');
+      return count === 1 ? new Response(f.transport.get(url), { headers: { etag: '"one"' } })
+        : new Response(null, { status: 304, headers: { etag: '"one"' } });
+    }
+    assert.equal(options.headers.Authorization, undefined); assert.equal(options.headers['If-None-Match'], undefined);
+    return new Response(f.transport.get(url));
+  } });
+  const receipts = await consumeRelease(f.root, f.manifest, ['linux'], { ...f, read });
+  assert.deepEqual(receipts.linux.producer, f.contract.platforms.linux);
+  assert.equal([...counts].filter(([url]) => url.startsWith('https://api.github.com/')).length, 5);
+  assert([...counts].filter(([url]) => url.startsWith('https://api.github.com/')).every(([, count]) => count === 2));
+  assert.equal(counts.get(f.contract.assetIndex.url), 1); assert.equal(counts.get(f.contract.platforms.linux.releaseAsset.url), 1);
+}));

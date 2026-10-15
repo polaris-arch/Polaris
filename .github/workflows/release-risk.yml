@@ -252,6 +252,7 @@ jobs:
 
       - name: Fetch sing-box core
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
