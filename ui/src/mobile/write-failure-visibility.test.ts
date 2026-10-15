@@ -185,6 +185,8 @@ const READ_CALLS: readonly string[] = [
   // 回调里的 `loadConfig(true)`（一次读），失败落 console，没有可归因的控件。
   'api.config.onChanged',
   'api.proxy.onLifecycle',
+  // The readiness-aware form only registers the same read-only lifecycle subscription.
+  'api.proxy.onLifecycleReady',
   'api.proxy.getPendingChanges',
   'api.ipInfo.get',
   'api.ruleResources.list',

@@ -9,7 +9,6 @@ import {
   composeBarView,
   stagedPhaseOf,
   pendingPhaseOf,
-  type ApplyPhase,
   type ApplyStatus,
   type BarInput,
   type PendingPhase,

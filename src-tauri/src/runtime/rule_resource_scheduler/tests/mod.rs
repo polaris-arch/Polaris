@@ -590,28 +590,36 @@ fn catalog_cache_file_name_mirrors_rules_rs() {
     );
 }
 
-
 #[test]
 fn background_external_refresh_uses_the_same_guarded_core_as_manual_refresh() {
     let scheduler = crate::test_support::crate_code("runtime/rule_resource_scheduler.rs");
     assert!(scheduler.contains("rule_resources_redownload_silent("));
     let commands = crate::test_support::crate_code("commands/rules/resources.rs");
-    let silent = crate::commands::guard_scan::top_level_fn_body(&commands, "pub async fn rule_resources_redownload_silent(");
+    let silent = crate::commands::guard_scan::top_level_fn_body(
+        &commands,
+        "pub async fn rule_resources_redownload_silent(",
+    );
     assert!(silent.contains("redownload_with_mode("));
-    let shared = crate::commands::guard_scan::top_level_fn_body(&commands, "async fn redownload_with_mode(");
+    let shared =
+        crate::commands::guard_scan::top_level_fn_body(&commands, "async fn redownload_with_mode(");
     assert!(shared.contains("download_registered_resource("));
     assert!(shared.contains("persist_registered_resource("));
     assert!(!shared.contains("persist_resources("));
 }
-
 
 #[test]
 fn background_and_builtin_downloads_acquire_exclusive_staging_before_fetch() {
     use crate::commands::guard_scan::{impl_method_body, top_level_fn_body};
     let code = crate_code("commands/rules/resources.rs");
     for (signature, creation) in [
-        ("async fn download_registered_resource<H: HttpClient, L: DnsLookup>(", "ResourceStageDir::create(res_dir)"),
-        ("async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(", "ResourceStageDir::create(runtime_dir)"),
+        (
+            "async fn download_registered_resource<H: HttpClient, L: DnsLookup>(",
+            "ResourceStageDir::create(res_dir)",
+        ),
+        (
+            "async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(",
+            "ResourceStageDir::create(runtime_dir)",
+        ),
     ] {
         let body = top_level_fn_body(&code, signature);
         assert!(body.find(creation).unwrap() < body.find("download_with_progress(").unwrap());

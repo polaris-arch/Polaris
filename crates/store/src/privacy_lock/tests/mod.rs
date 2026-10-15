@@ -141,7 +141,9 @@ fn write_sets_0600_perms_on_unix() {
 
 #[test]
 fn hex_decode_rejects_unicode_and_non_hex_without_panicking() {
-    for bad in ["€x", "a€", "é", "🔒", "中a", "0", "abc", "zz", "+1", " 1", "1\n"] {
+    for bad in [
+        "€x", "a€", "é", "🔒", "中a", "0", "abc", "zz", "+1", " 1", "1\n",
+    ] {
         assert_eq!(hex_decode(bad), None, "malformed hex: {bad:?}");
     }
     assert_eq!(hex_decode("00aAfF"), Some(vec![0, 0xaa, 0xff]));

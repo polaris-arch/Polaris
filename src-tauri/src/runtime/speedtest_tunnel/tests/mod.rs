@@ -645,9 +645,11 @@ async fn interim_responses_preserve_final_status_and_warmup_body() {
             ],
         })
         .await;
-        assert!(measure_detailed(port, &http_target(), Duration::from_secs(5))
-            .await
-            .is_ok());
+        assert!(
+            measure_detailed(port, &http_target(), Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
         assert_eq!(observed.lock().unwrap().request_lines.len(), 3);
     }
 }
@@ -656,8 +658,14 @@ async fn interim_responses_preserve_final_status_and_warmup_body() {
 async fn interim_responses_do_not_hide_final_failures_or_upgrades() {
     use crate::commands::speedtest::{FailKind, FailPhase, MeasureFailure};
     for (final_reply, kind) in [
-        ("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 403 Forbidden\r\n\r\n", FailKind::HttpStatus(403)),
-        ("HTTP/1.1 101 Switching Protocols\r\n\r\n", FailKind::Transport),
+        (
+            "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 403 Forbidden\r\n\r\n",
+            FailKind::HttpStatus(403),
+        ),
+        (
+            "HTTP/1.1 101 Switching Protocols\r\n\r\n",
+            FailKind::Transport,
+        ),
     ] {
         for measured_leg in [false, true] {
             let mut gets = Vec::new();
@@ -675,8 +683,10 @@ async fn interim_responses_do_not_hide_final_failures_or_upgrades() {
             } else {
                 FailPhase::Warmup
             };
-            assert_eq!(measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
-                Err(MeasureFailure::new(phase, kind)));
+            assert_eq!(
+                measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
+                Err(MeasureFailure::new(phase, kind))
+            );
         }
     }
 }
@@ -700,8 +710,10 @@ async fn interim_only_eof_is_transport_failure_on_either_get() {
         } else {
             FailPhase::Warmup
         };
-        assert_eq!(measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
-            Err(MeasureFailure::new(phase, FailKind::Transport)));
+        assert_eq!(
+            measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
+            Err(MeasureFailure::new(phase, FailKind::Transport))
+        );
     }
 }
 
@@ -737,7 +749,10 @@ async fn interim_and_final_heads_share_a_hard_byte_limit() {
     let interim = b"HTTP/1.1 103 Early Hints\r\n\r\n";
     let mut bytes = interim.repeat(MAX_HEAD_BYTES / interim.len() + 1);
     bytes.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
-    assert_eq!(read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await, None);
+    assert_eq!(
+        read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await,
+        None
+    );
 
     // Final head exactly on the aggregate boundary is accepted; one byte over
     // the boundary is rejected even when the complete head is already buffered.
@@ -747,8 +762,14 @@ async fn interim_and_final_heads_share_a_hard_byte_limit() {
         bytes.resize(MAX_HEAD_BYTES - 4 + extra, b'x');
         bytes.extend_from_slice(b"\r\n\r\n");
         let expected = (extra == 0).then_some(200);
-        assert_eq!(read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await, expected);
-        assert_eq!(read_response_status(&mut &b""[..], &mut bytes).await, expected);
+        assert_eq!(
+            read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await,
+            expected
+        );
+        assert_eq!(
+            read_response_status(&mut &b""[..], &mut bytes).await,
+            expected
+        );
     }
 }
 
@@ -808,19 +829,25 @@ mod authenticated_tls {
     );
 
     fn der(hex: &str) -> Vec<u8> {
-        (0..hex.len()).step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     fn trusted_config() -> Arc<rustls::ClientConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(
-            [rustls::pki_types::CertificateDer::from(der(CA))], provider.clone(),
-        ).expect("offline fixture CA");
+            [rustls::pki_types::CertificateDer::from(der(CA))],
+            provider.clone(),
+        )
+        .expect("offline fixture CA");
         verified_tls_client_config(provider, verifier).expect("verified TLS configuration")
     }
 
-    async fn tls_origin(cert: &str) -> (
+    async fn tls_origin(
+        cert: &str,
+    ) -> (
         u16,
         Arc<std::sync::Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
@@ -828,10 +855,14 @@ mod authenticated_tls {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let server = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions().unwrap()
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(der(cert))],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(KEY)))).unwrap();
+            .with_single_cert(
+                vec![CertificateDer::from(der(cert))],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(KEY))),
+            )
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -863,7 +894,10 @@ mod authenticated_tls {
                     header.push(byte[0]);
                     assert!(header.len() <= MAX_HEAD_BYTES);
                 }
-                observed.lock().unwrap().push(String::from_utf8(header.clone()).unwrap());
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(header.clone()).unwrap());
                 if tls
                     .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
                     .await
@@ -877,7 +911,10 @@ mod authenticated_tls {
     }
 
     async fn finish(task: tokio::task::JoinHandle<()>) {
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -889,15 +926,22 @@ mod authenticated_tls {
         .unwrap();
         let config = trusted_config();
         let result = crate::commands::speedtest::measure_warm_ttfb(
-            Duration::from_secs(5), Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
-        ).await;
-        assert!(result.is_ok(), "trusted offline origin should complete both GETs");
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "trusted offline origin should complete both GETs"
+        );
         finish(task).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for request in requests.iter() {
-            assert!(request.starts_with("GET /private?signature=fixture-token%2Bvalue HTTP/1.1\r\n"));
+            assert!(
+                request.starts_with("GET /private?signature=fixture-token%2Bvalue HTTP/1.1\r\n")
+            );
             assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
         }
     }
@@ -914,12 +958,18 @@ mod authenticated_tls {
                 SpeedTestTarget::parse(&format!("https://{host}/private?signature=fixture-token"))
                     .unwrap();
             let config = trusted_config();
-            let result = tokio::time::timeout(Duration::from_secs(5),
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
                 open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             assert!(matches!(result, Err(TunnelError::Transport)));
             finish(task).await;
-            assert!(requests.lock().unwrap().is_empty(), "unauthenticated peer must receive no GET");
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "unauthenticated peer must receive no GET"
+            );
         }
     }
 

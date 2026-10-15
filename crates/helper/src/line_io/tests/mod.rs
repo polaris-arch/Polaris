@@ -76,7 +76,9 @@ fn write_line_propagates_io_error() {
 #[test]
 fn terminated_reader_distinguishes_eof_empty_and_truncated_lines() {
     let mut empty = Cursor::new(b"");
-    assert!(read_line_terminated_bounded(&mut empty, 8).unwrap().is_none());
+    assert!(read_line_terminated_bounded(&mut empty, 8)
+        .unwrap()
+        .is_none());
     let mut blank = Cursor::new(b"\n");
     assert_eq!(
         read_line_terminated_bounded(&mut blank, 8).unwrap(),
@@ -104,11 +106,15 @@ fn terminated_reader_enforces_wire_limit_and_preserves_next_line() {
     ] {
         let mut reader = BufReader::with_capacity(2, Cursor::new(input));
         assert_eq!(
-            read_line_terminated_bounded(&mut reader, limit).unwrap().as_deref(),
+            read_line_terminated_bounded(&mut reader, limit)
+                .unwrap()
+                .as_deref(),
             Some(expected)
         );
         assert_eq!(
-            read_line_terminated_bounded(&mut reader, 4).unwrap().as_deref(),
+            read_line_terminated_bounded(&mut reader, 4)
+                .unwrap()
+                .as_deref(),
             Some("next")
         );
     }

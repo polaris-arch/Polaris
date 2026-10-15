@@ -2105,8 +2105,9 @@ fn real_command_framing_preserves_ping_version_and_authorization() {
     use std::io::Cursor;
     for ending in ["\n", "\r\n"] {
         let ping = handle_unauthorized_wire(Cursor::new(format!("ping{ending}")));
-        assert!(String::from_utf8_lossy(&ping.inner.get_ref().output)
-            .starts_with("OK pong uid=9999 "));
+        assert!(
+            String::from_utf8_lossy(&ping.inner.get_ref().output).starts_with("OK pong uid=9999 ")
+        );
         let version = handle_unauthorized_wire(Cursor::new(format!("version{ending}")));
         assert_eq!(
             version.inner.get_ref().output,
@@ -2160,6 +2161,9 @@ fn continuous_unterminated_command_stops_after_limit_plus_one_bytes() {
         }
     }
     let conn = handle_unauthorized_wire(Continuous { supplied: 0 });
-    assert_eq!(conn.inner.get_ref().input.supplied, MAX_COMMAND_LINE_BYTES + 1);
+    assert_eq!(
+        conn.inner.get_ref().input.supplied,
+        MAX_COMMAND_LINE_BYTES + 1
+    );
     assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
 }

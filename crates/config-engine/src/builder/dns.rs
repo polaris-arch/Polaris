@@ -152,7 +152,13 @@ fn dns_rule_from_matcher(matcher: DnsEffectMatcher) -> DnsRule {
         return DnsRule {
             type_field: Some("logical".into()),
             mode: Some("and".into()),
-            rules: Some(matcher.all_of.into_iter().map(dns_rule_from_matcher).collect()),
+            rules: Some(
+                matcher
+                    .all_of
+                    .into_iter()
+                    .map(dns_rule_from_matcher)
+                    .collect(),
+            ),
             ..Default::default()
         };
     }
@@ -1522,7 +1528,11 @@ pub fn build_dns_config(
             if rule.combine_mode == Some(crate::user_config::rule::CombineMode::And) {
                 // Default DNS domain fields are OR in the core. Each user condition
                 // needs its own headless child to preserve AND (including repeated types).
-                match conditions.iter().map(matcher_for).collect::<Option<Vec<_>>>() {
+                match conditions
+                    .iter()
+                    .map(matcher_for)
+                    .collect::<Option<Vec<_>>>()
+                {
                     Some(mut children) if children.len() == 1 => vec![children.remove(0)],
                     Some(children) if !children.is_empty() => vec![DnsEffectMatcher {
                         all_of: children,

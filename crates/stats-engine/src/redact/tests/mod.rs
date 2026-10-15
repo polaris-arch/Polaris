@@ -927,7 +927,10 @@ fn unicode_around_ascii_identifiers_never_disables_redaction() {
         ("İ dial A.COM 中", "İ dial <domain-1> 中"),
         ("İİ a.com K", "İİ <domain-1> K"),
         ("K a.com İİ", "K <domain-1> İİ"),
-        ("🙂 a.com:443 / cdn.a.com / a.com.evil", "🙂 <domain-1>:443 / cdn.a.com / a.com.evil"),
+        (
+            "🙂 a.com:443 / cdn.a.com / a.com.evil",
+            "🙂 <domain-1>:443 / cdn.a.com / a.com.evil",
+        ),
     ] {
         assert_eq!(redact_identifiers(text, &ids), expected);
     }
@@ -946,14 +949,20 @@ fn unicode_identifiers_map_case_folded_offsets_to_whole_original_characters() {
         },
     ];
     assert_eq!(
-        redact_identifiers("İSTANBUL节点 / i\u{307}stanbul节点 / kelvin节点 / Kelvin节点", &ids),
+        redact_identifiers(
+            "İSTANBUL节点 / i\u{307}stanbul节点 / kelvin节点 / Kelvin节点",
+            &ids
+        ),
         "<node-1> / <node-1> / <node-2> / <node-2>"
     );
     let ascii = vec![NodeIdentifier {
         value: "k.com".into(),
         placeholder: "<domain-1>".into(),
     }];
-    assert_eq!(redact_identifiers("K.com / K.COM", &ascii), "<domain-1> / <domain-1>");
+    assert_eq!(
+        redact_identifiers("K.com / K.COM", &ascii),
+        "<domain-1> / <domain-1>"
+    );
     let partial = vec![NodeIdentifier {
         value: "i".into(),
         placeholder: "<node-3>".into(),
@@ -978,7 +987,10 @@ fn unicode_longest_match_and_host_boundaries_remain_intact() {
         },
     ];
     assert_eq!(
-        redact_identifiers("İİ [İSTANBUL 专线] / xİstanbul / İstanbul-x / İstanbul K", &ids),
+        redact_identifiers(
+            "İİ [İSTANBUL 专线] / xİstanbul / İstanbul-x / İstanbul K",
+            &ids
+        ),
         "İİ [<node-2>] / xİstanbul / İstanbul-x / <node-1> K"
     );
 }
@@ -1005,16 +1017,41 @@ fn native_vpn_secret_paths_keep_public_and_generic_keys() {
         "public_key": "PUBLIC_KEY", "client_key": null
     });
     let out = redact(&value);
-    assert_no_plaintext(&out, &["STATIC_SECRET", "CLIENT_SECRET", "WRAP_SECRET", "SESSION_COOKIE", "FORM_SECRET", "CLIENT_PASS", "MCA_SECRET", "MCA_PASS"]);
+    assert_no_plaintext(
+        &out,
+        &[
+            "STATIC_SECRET",
+            "CLIENT_SECRET",
+            "WRAP_SECRET",
+            "SESSION_COOKIE",
+            "FORM_SECRET",
+            "CLIENT_PASS",
+            "MCA_SECRET",
+            "MCA_PASS",
+        ],
+    );
     let text = out.to_string();
-    for public in ["PUBLIC_CA", "PUBLIC_CLIENT_CERT", "PUBLIC_DIAGNOSTIC_KEY", "PUBLIC_MCA_CERT", "ORDINARY_KEY", "UNRELATED_KEY", "OTHER_PROTOCOL_KEY", "PUBLIC_KEY", "anyconnect", "tls_auth"] {
-        assert!(text.contains(public), "diagnostic control disappeared: {public}");
+    for public in [
+        "PUBLIC_CA",
+        "PUBLIC_CLIENT_CERT",
+        "PUBLIC_DIAGNOSTIC_KEY",
+        "PUBLIC_MCA_CERT",
+        "ORDINARY_KEY",
+        "UNRELATED_KEY",
+        "OTHER_PROTOCOL_KEY",
+        "PUBLIC_KEY",
+        "anyconnect",
+        "tls_auth",
+    ] {
+        assert!(
+            text.contains(public),
+            "diagnostic control disappeared: {public}"
+        );
     }
     assert!(out["client_key"].is_null());
     assert_eq!(out["endpoints"][0]["tls"]["control_wrap"]["direction"], 1);
     assert_eq!(
-        value["endpoints"][0]["static_key"][0],
-        "STATIC_SECRET",
+        value["endpoints"][0]["static_key"][0], "STATIC_SECRET",
         "redaction is non-mutating"
     );
 }
@@ -1029,7 +1066,14 @@ fn unknown_pem_string_and_line_array_are_sanitized_but_certificates_survive() {
         "public_key": "-----BEGIN PUBLIC KEY-----\nPUBLIC_KEY_BODY\n-----END PUBLIC KEY-----"
     });
     let out = redact(&value);
-    assert_no_plaintext(&out, &["UNKNOWN_RSA_SECRET", "UNKNOWN_ARRAY_SECRET", "UNKNOWN_STATIC_SECRET"]);
+    assert_no_plaintext(
+        &out,
+        &[
+            "UNKNOWN_RSA_SECRET",
+            "UNKNOWN_ARRAY_SECRET",
+            "UNKNOWN_STATIC_SECRET",
+        ],
+    );
     assert_eq!(out["unexpected"], format!("before\n{REDACTED}\nafter"));
     assert_eq!(out["certificate"], value["certificate"]);
     assert_eq!(out["public_key"], value["public_key"]);

@@ -2,6 +2,7 @@ import { chromium, type Browser } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
+import type { ServerConfig } from '@/contracts/types';
 
 // The real UI consumers run against deferred, synthetic API receipts. No native mutation/network.
 const root = path.resolve(import.meta.dirname, '../../..');
@@ -15,6 +16,7 @@ import { useSubscriptionCreateOperationStore } from '/src/store/subscription-cre
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import PendingChangesBar from '/src/components/layout/PendingChangesBar';
+import { MobilePendingBar } from '/src/mobile/MobilePendingBar';
 import { useNodeActions } from '/src/components/screens/nodes/use-node-actions';
 import { NodesBatchBar } from '/src/components/screens/nodes/NodesBatchBar';
 import { RulesScreen } from '/src/components/screens/rules/RulesScreen';
@@ -55,8 +57,17 @@ api.networkProfile.resolvedSources = async () => [];
 api.rules.update = async () => { test.writes++; };
 api.vpn.submitOpenVpn = async () => new Promise(resolve => { test.release = resolve; });
 api.vpn.cancelOpenVpn = async () => {};
-api.proxy.onLifecycleReady = async (listener) => { test.events = listener; return () => { test.events = null; }; };
-api.proxy.applyPendingChanges = async () => new Promise(resolve => { test.receipt = resolve; });
+test.applyCalls = 0;
+api.proxy.onStarted = listener => { test.unownedStarted = listener; return () => { test.unownedStarted = null; }; };
+api.proxy.onError = listener => { test.unownedError = listener; return () => { test.unownedError = null; }; };
+api.proxy.onLifecycleReady = async listener => {
+  const registration = new URLSearchParams(location.search).get('listener');
+  if (registration === 'failed') throw new Error('Synthetic listener registration failure');
+  if (registration === 'deferred') await new Promise(resolve => { test.releaseListener = resolve; });
+  test.events = listener;
+  return () => { test.events = null; };
+};
+api.proxy.applyPendingChanges = async () => { test.applyCalls++; return new Promise(resolve => { test.receipt = resolve; }); };
 api.proxy.getStatus = async () => { test.statusReads = (test.statusReads ?? 0) + 1; return { running: true, mainGeneration: 99, ownedStopContext: { selectedServerId: useAppStore.getState().selectedServerId, selectionIntentGeneration: 0 } }; };
 test.stack = () => useDialogStore.getState().stack.map(({ instanceId, kind, serverId }) => ({ instanceId, kind, serverId }));
 test.openVpn = (serverId, challengeId = serverId + '-challenge') => {
@@ -74,7 +85,7 @@ if (mode === 'recovery') {
   useDialogStore.getState().open({ kind: 'sub-create-task', operationId: 'op' });
   test.fail = () => { recovery = { ...recovery, revision: 2, phase: 'failed', terminal: true }; useSubscriptionCreateOperationStore.getState().accept(recovery); };
 }
-if (mode === 'apply') {
+if (mode === 'apply' || mode === 'mobile-apply') {
   useAppStore.setState({ pendingChanges: { added: [], removed: [], modified: [], restartDeferred: true } });
   const schedule = window.setTimeout.bind(window);
   window.setTimeout = (callback, delay, ...args) => delay === 12000 ? (test.fallback = callback, 0) : schedule(callback, delay, ...args);
@@ -200,6 +211,7 @@ function Selection() {
 }
 createRoot(document.getElementById('root')).render(<><DialogHost />
   {mode === 'apply' && <PendingChangesBar />}
+  {mode === 'mobile-apply' && <main className="mobile-root"><MobilePendingBar /></main>}
   {mode === 'selection' && <Selection />}
   {mode === 'mobile-nodes' && <main className="mobile-root"><MobileNodesScreen /></main>}
   {mode === 'connections' && <main className="mobile-root"><MobileConnectionsScreen /></main>}
@@ -265,103 +277,139 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.evaluate('window.__transactions.stack().length')).toBe(0);
     await page.close();
   });
-  it.each(['ready', 'failed'])('binds an early intermediate restart and then owned %s', async (phase) => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate('window.__transactions.events({ phase: "stopped", kind: "restart", terminal: false, applyId: 7, mainGeneration: 11 }); window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });');
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === true');
-    await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 6, mainGeneration: 12 });`);
-    expect(await page.locator('.pending-bar .btn.flow').isDisabled()).toBe(true);
-    await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 12 });`);
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === false');
-    expect(await page.locator('.pending-bar').evaluate(el => el.classList.contains('err'))).toBe(phase === 'failed');
-    await page.close();
-  });
-  it.each([['ready', true], ['failed', true], ['ready', false], ['failed', false]] as const)('retains the early generation high-water mark after buffer overflow: %s/attributed=%s', async (phase, attributed) => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply&generation=100');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate(`
-      window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: ${attributed ? '8' : 'undefined'}, mainGeneration: 102 });
-      for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
-      window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
-      window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
-    `);
-    // The maximum observation was the evicted 33rd-oldest payload. Neither old terminal
-    // is current evidence, so the actual mounted bar must still wait with its timeout armed.
-    await page.waitForFunction('typeof window.__transactions.fallback === "function"');
-    expect(await page.locator('.pending-bar .btn.flow').isDisabled()).toBe(true);
-    expect(await page.locator('.pending-bar.err').count()).toBe(0);
-    await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 103 });`);
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === false');
-    expect(await page.locator('.pending-bar.err').count()).toBe(phase === 'failed' ? 1 : 0);
-    await page.close();
-  });
-  it('invalid early generations never raise the retained floor, including across overflow', async () => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply&generation=100');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate(`
-      for (const mainGeneration of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
-      for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
-      window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
-      window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
-    `);
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === false');
-    expect(await page.locator('.pending-bar.err').count()).toBe(0);
-    await page.close();
-  });
-  it('an observed newer explicit stop stays neutral after its early payload is evicted', async () => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply&generation=100');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate(`
-      window.__transactions.events({ phase: "stopped", kind: "stop", terminal: true, mainGeneration: 102 });
-      for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
-      window.__transactions.events({ phase: "failed", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
-      window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
-    `);
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === false');
-    expect(await page.locator('.pending-bar.err').count()).toBe(0);
-    await page.evaluate('window.__transactions.events({ phase: "failed", kind: "restart", terminal: true, applyId: 7, mainGeneration: 103 })');
-    expect(await page.locator('.pending-bar.err').count()).toBe(0);
-    await page.close();
-  });
-  it('a delayed lower-generation stop cannot cancel after a higher early observation', async () => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply&generation=100');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate(`
-      window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration: 103 });
-      window.__transactions.events({ phase: "stopped", kind: "stop", terminal: true, mainGeneration: 102 });
-      for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
-      window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
-      window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
-    `);
-    await page.waitForFunction('typeof window.__transactions.fallback === "function"');
-    expect(await page.locator('.pending-bar .btn.flow').isDisabled()).toBe(true);
-    await page.evaluate('window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 104 })');
-    await page.waitForFunction('document.querySelector(".pending-bar .btn.flow")?.disabled === false');
-    await page.close();
-  });
-  it('lost completion cannot succeed from an unrelated running core status', async () => {
-    const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=apply');
-    await page.locator('.pending-bar .btn.flow').click();
-    await page.waitForFunction('typeof window.__transactions.receipt === "function"');
-    await page.evaluate('window.__transactions.receipt({ok:true,status:"deferred",applyId:7})');
-    await page.waitForFunction('typeof window.__transactions.fallback === "function"');
-    await page.evaluate('window.__transactions.fallback()');
-    await page.locator('.pending-bar.err').waitFor();
-    expect(await page.evaluate('window.__transactions.statusReads')).toBe(1);
-    expect(await page.locator('.pending-bar .btn.flow').isDisabled()).toBe(false);
-    await page.close();
+  describe.each([
+    { mode: 'apply', button: '.pending-bar .btn.flow', errorBar: '.pending-bar.err' },
+    { mode: 'mobile-apply', button: '.m-pending .m-pending-primary', errorBar: '.m-pending.m-pending-err' },
+  ])('attributed Apply consumer: $mode', ({ mode, button, errorBar }) => {
+    it.each(['ready', 'failed'])('binds an early intermediate restart and then owned %s', async (phase) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.events({ phase: "stopped", kind: "restart", terminal: false, applyId: 7, mainGeneration: 11 }); window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });');
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === true, button);
+      await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 6, mainGeneration: 12 });`);
+      expect(await page.locator(button).isDisabled()).toBe(true);
+      await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 12 });`);
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+      expect(await page.locator(errorBar).count()).toBe(phase === 'failed' ? 1 : 0);
+      await page.close();
+    });
+    it.each([['ready', true], ['failed', true], ['ready', false], ['failed', false]] as const)('retains the early generation high-water mark after buffer overflow: %s/attributed=%s', async (phase, attributed) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&generation=100');
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(`
+        window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: ${attributed ? '8' : 'undefined'}, mainGeneration: 102 });
+        for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
+        window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
+        window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
+      `);
+      // The maximum observation was the evicted 33rd-oldest payload. Neither old terminal
+      // is current evidence, so the actual mounted bar must still wait with its timeout armed.
+      await page.waitForFunction('typeof window.__transactions.fallback === "function"');
+      expect(await page.locator(button).isDisabled()).toBe(true);
+      expect(await page.locator(errorBar).count()).toBe(0);
+      await page.evaluate(`window.__transactions.events({ phase: "${phase}", kind: "restart", terminal: true, applyId: 7, mainGeneration: 103 });`);
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+      expect(await page.locator(errorBar).count()).toBe(phase === 'failed' ? 1 : 0);
+      await page.close();
+    });
+    it('invalid early generations never raise the retained floor, including across overflow', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&generation=100');
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(`
+        for (const mainGeneration of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
+        for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
+        window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
+        window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
+      `);
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+      expect(await page.locator(errorBar).count()).toBe(0);
+      await page.close();
+    });
+    it('an observed newer explicit stop stays neutral after its early payload is evicted', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&generation=100');
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(`
+        window.__transactions.events({ phase: "stopped", kind: "stop", terminal: true, mainGeneration: 102 });
+        for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
+        window.__transactions.events({ phase: "failed", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
+        window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
+      `);
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+      expect(await page.locator(errorBar).count()).toBe(0);
+      await page.evaluate('window.__transactions.events({ phase: "failed", kind: "restart", terminal: true, applyId: 7, mainGeneration: 103 })');
+      expect(await page.locator(errorBar).count()).toBe(0);
+      await page.close();
+    });
+    it('a delayed lower-generation stop cannot cancel after a higher early observation', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&generation=100');
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(`
+        window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration: 103 });
+        window.__transactions.events({ phase: "stopped", kind: "stop", terminal: true, mainGeneration: 102 });
+        for (let mainGeneration = 1; mainGeneration <= 31; mainGeneration++) window.__transactions.events({ phase: "ready", kind: "start", terminal: true, mainGeneration });
+        window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 101 });
+        window.__transactions.receipt({ ok: true, status: "applied", applyId: 7 });
+      `);
+      await page.waitForFunction('typeof window.__transactions.fallback === "function"');
+      expect(await page.locator(button).isDisabled()).toBe(true);
+      await page.evaluate('window.__transactions.events({ phase: "ready", kind: "restart", terminal: true, applyId: 7, mainGeneration: 104 })');
+      await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+      await page.close();
+    });
+    it('lost completion cannot succeed from an unrelated running core status', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ok:true,status:"deferred",applyId:7})');
+      await page.waitForFunction('typeof window.__transactions.fallback === "function"');
+      await page.evaluate('window.__transactions.fallback()');
+      await page.locator(errorBar).waitFor();
+      expect(await page.evaluate('window.__transactions.statusReads')).toBe(1);
+      expect(await page.locator(button).isDisabled()).toBe(false);
+      await page.close();
+    });
+    it('awaits registration before Apply and ignores unowned broadcasts', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&listener=deferred');
+      await page.waitForFunction('typeof window.__transactions.releaseListener === "function"');
+      await page.locator(button).click();
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(0);
+      await page.evaluate('window.__transactions.releaseListener()');
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ok:true,status:"applied",applyId:7})');
+      await page.waitForFunction('typeof window.__transactions.fallback === "function"');
+      await page.evaluate(`
+        window.__transactions.unownedStarted?.();
+        window.__transactions.unownedError?.({errorCode:'STARTUP_FAILED',message:'private diagnostic'});
+      `);
+      expect(await page.locator(button).isDisabled()).toBe(true);
+      expect(await page.locator(errorBar).count()).toBe(0);
+      await page.evaluate('window.__transactions.events({phase:"failed",kind:"restart",terminal:true,applyId:7,mainGeneration:11,errorCode:"STARTUP_FAILED",message:"private diagnostic"})');
+      await page.locator(errorBar).waitFor();
+      expect(await page.locator(errorBar).textContent()).not.toContain('private diagnostic');
+      expect(await page.locator(button).isDisabled()).toBe(false);
+      await page.close();
+    });
+    it('registration failure blocks Apply and remains a visible retryable failure', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&listener=failed');
+      await page.locator(button).click();
+      await page.locator(errorBar).waitFor();
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(0);
+      expect(await page.locator(button).isDisabled()).toBe(false);
+      await page.close();
+    });
   });
   it.each([
     { selectedServerId: 'other-node', intent: 0, outcome: 'stopped' },
@@ -415,10 +463,10 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
       await toggle.click();
       await page.locator(mode === 'desktop-warp' ? '.dlg-foot .btn.flow' : '.m-form-foot .primary').last().click();
       await page.waitForFunction('!!window.__transactions.payload()');
-      const payload = await page.evaluate('window.__transactions.payload()');
+      const payload = await page.evaluate<ServerConfig>('window.__transactions.payload()');
       expect(payload.onDemand).toBe(enabled ? undefined : true);
-      if (mode === 'mobile-ts') expect(payload.tailscaleSettings.hostname).toBe('synthetic-ts');
-      else expect(payload.wireguardSettings.warpDevice.deviceId).toBe('synthetic-device');
+      if (mode === 'mobile-ts') expect(payload.tailscaleSettings?.hostname).toBe('synthetic-ts');
+      else expect(payload.wireguardSettings?.warpDevice?.deviceId).toBe('synthetic-device');
       await page.close();
     }
   });

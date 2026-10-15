@@ -201,10 +201,20 @@ test('Terminate 判据收紧前后的输入对差：新判据命中旧判据命�
   }
   assert.ok(TABLE.filter(([, before, after]) => !before && after).length >= 6, '对差表里没有体现收紧');
   assert.ok(TABLE.some(([, before]) => before), '对差表里没有旧判据命中的样例，「不比旧的弱」没有被检验');
-  // 真文件的代码面（含写出去的脚本）对新判据零命中；取材面自检：代码面里确实有那条结束动作。
+  // The raw regex also matches the exact owned-handle P/Invoke declaration.
+  // Invoke the production validator, whose exception is that one canonical
+  // generated declaration, rather than treating declarations as a second call.
   const code = real.split('\n').filter((line) => !/^\s*[;#]/.test(line));
   assert.ok(code.some((line) => line.includes('$$proc.Kill()')));
-  assert.deepEqual(code.filter((line) => NEW.test(line)), []);
+  const declarations = code.filter((line) => NEW.test(line));
+  assert.equal(declarations.length, 1);
+  assert.ok(declarations[0].includes('EntryPoint="TerminateProcess"'));
+  assert.ok(declarations[0].includes('StopOwned(SafeProcessHandle h, uint code)'));
+  assert.deepEqual(nsisCoreSweepViolations(real), []);
+  const alteredDeclaration = mutate(real, declarations[0], declarations[0].replace('SafeProcessHandle h', 'IntPtr h'));
+  assert.ok(nsisCoreSweepViolations(alteredDeclaration).some((line) => line.includes('代码面出现 Terminate / TerminateProcess')));
+  const directCall = mutate(real, '$$proc.Kill()', '[Native]::TerminateProcess($$proc.Handle, 1)');
+  assert.ok(nsisCoreSweepViolations(directCall).some((line) => line.includes('代码面出现 Terminate / TerminateProcess')));
 });
 
 test('宏体内的指令顺序：InitPluginsDir → FileOpen → FileWrite… → FileClose → nsExec，反了、缺了、重了都必须转红', () => {

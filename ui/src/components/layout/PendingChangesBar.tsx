@@ -45,6 +45,7 @@ import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import type { ProxyLifecycleEvent } from '@/contracts/types';
+import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
@@ -104,8 +105,11 @@ export default function PendingChangesBar() {
     earlyStopped: boolean;
   } | null>(null);
   const lifecycleReady = useRef<Promise<void> | null>(null);
-  const translateRef = useRef(t);
-  translateRef.current = t;
+  // Adapt the existing minimal translator contract without widening its optional argument.
+  const simpleT: ProxyErrorTranslate = (key, fallback) =>
+    fallback === undefined ? t(key) : t(key, fallback);
+  const translateRef = useRef(simpleT);
+  translateRef.current = simpleT;
   /** 明细 popover 开合（原型 `.pd-pop`）。 */
   const [detailOpen, setDetailOpen] = useState(false);
   /** staged 条目 id → 「保存后仍需应用」（FR-9）。当前 Apply 会重启核；缺 key = 尚未判出，不猜。 */
@@ -269,7 +273,7 @@ export default function PendingChangesBar() {
             // A retained old terminal cannot settle below a newer observation that overflow
             // evicted. Missing payload remains pending for a future owned event or timeout.
             next.mainGeneration = request.earlyGeneration;
-            for (const event of request.early) next = applyStateOnLifecycle(next, event, t) ?? next;
+            for (const event of request.early) next = applyStateOnLifecycle(next, event, translateRef.current) ?? next;
           }
         }
       }

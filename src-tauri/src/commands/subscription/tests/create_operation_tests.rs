@@ -297,26 +297,33 @@ fn classified_error_preserves_the_pipeline_operation_timeout_code() {
     assert_eq!(error["code"], "SUBSCRIPTION_OPERATION_TIMEOUT");
 }
 
-
 #[test]
 fn atomic_create_and_shared_reconcile_preserve_explicit_sentinels() {
     use super::super::reconcile_subscription_servers;
     for sentinel in ["__direct__", "__block__"] {
         let dir = TestDir::new("polaris-create-sentinel-");
         let manager = ConfigManager::new(dir.clone());
-        manager.update(|cfg| {
-            cfg["selectedServerId"] = json!(sentinel);
-            Decision::Write(())
-        }).unwrap();
-        manager.update(|cfg| {
-            append_subscription(cfg, json!({"id":"new-sub","name":"New","url":"https://example.com/sub"}));
-            let server = serde_json::from_value(json!({
-                "id":"new-node", "name":"Node", "protocol":"http",
-                "address":"example.com", "port":443, "subscriptionId":"new-sub"
-            })).unwrap();
-            reconcile_subscription_servers(cfg, "new-sub", vec![server], false, &[]);
-            Decision::Write(())
-        }).unwrap();
+        manager
+            .update(|cfg| {
+                cfg["selectedServerId"] = json!(sentinel);
+                Decision::Write(())
+            })
+            .unwrap();
+        manager
+            .update(|cfg| {
+                append_subscription(
+                    cfg,
+                    json!({"id":"new-sub","name":"New","url":"https://example.com/sub"}),
+                );
+                let server = serde_json::from_value(json!({
+                    "id":"new-node", "name":"Node", "protocol":"http",
+                    "address":"example.com", "port":443, "subscriptionId":"new-sub"
+                }))
+                .unwrap();
+                reconcile_subscription_servers(cfg, "new-sub", vec![server], false, &[]);
+                Decision::Write(())
+            })
+            .unwrap();
         let saved = manager.load_full().unwrap();
         assert_eq!(saved["selectedServerId"], sentinel);
         assert_eq!(saved["servers"][0]["id"], "new-node");

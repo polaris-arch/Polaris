@@ -303,6 +303,8 @@ fn diagnostic_races_keep_bounded_closed_context_and_total_count() {
     assert_eq!(native.raced, MAX_RACE_OBSERVATIONS + 3);
     assert_eq!(native.race_observations.len(), MAX_RACE_OBSERVATIONS);
     assert_eq!(native.race_observations_lost, 3);
-    assert!(native.race_observations.iter().all(|entry|
-        *entry == (RaceStage::ParentChanged, 42, Some(7))));
+    assert!(native
+        .race_observations
+        .iter()
+        .all(|entry| *entry == (RaceStage::ParentChanged, 42, Some(7))));
 }

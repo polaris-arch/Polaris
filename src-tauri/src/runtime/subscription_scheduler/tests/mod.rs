@@ -334,12 +334,14 @@ fn every_autoupdate_trigger_waits_for_proxy_network_settle_before_http() {
     );
 }
 
-
 #[test]
 fn ready_event_during_active_round_is_coalesced_and_drained_without_overlapping_runner() {
     let scheduler = SubscriptionScheduler::new();
     lock_inner(&scheduler.inner).is_running = true;
-    let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+    let mut guard = RunningGuard {
+        inner: Arc::clone(&scheduler.inner),
+        armed: true,
+    };
     {
         let mut inner = lock_inner(&scheduler.inner);
         // A ready event can precede selection setting pending_proxy_catchup.
@@ -348,8 +350,14 @@ fn ready_event_during_active_round_is_coalesced_and_drained_without_overlapping_
         inner.pending_proxy_catchup = true;
     }
     assert!(guard.finish_or_repeat());
-    assert!(lock_inner(&scheduler.inner).is_running, "catch-up retains the same gate");
-    assert!(!lock_inner(&scheduler.inner).proxy_ready_requested, "duplicate wakes coalesce");
+    assert!(
+        lock_inner(&scheduler.inner).is_running,
+        "catch-up retains the same gate"
+    );
+    assert!(
+        !lock_inner(&scheduler.inner).proxy_ready_requested,
+        "duplicate wakes coalesce"
+    );
     lock_inner(&scheduler.inner).pending_proxy_catchup = false;
     assert!(!guard.finish_or_repeat());
     assert!(!lock_inner(&scheduler.inner).is_running);
@@ -386,9 +394,14 @@ fn catchup_reselects_live_proxy_config_and_backoff_after_a_direct_round() {
     assert_eq!(catchup.due_ids, ["proxied"]);
     assert!(!catchup.pending_proxy_catchup);
     cfg["subscriptions"][1]["autoUpdate"] = json!(false);
-    assert!(select_due(&cfg, now + 1, &backoff, true, true).due_ids.is_empty());
+    assert!(select_due(&cfg, now + 1, &backoff, true, true)
+        .due_ids
+        .is_empty());
     cfg["autoUpdateSubscriptionOnStart"] = json!(false);
-    assert_eq!(select_due(&cfg, now + 1, &backoff, true, true), DueSelection::default());
+    assert_eq!(
+        select_due(&cfg, now + 1, &backoff, true, true),
+        DueSelection::default()
+    );
 }
 
 #[test]
@@ -405,7 +418,6 @@ fn production_round_drains_wakes_and_reloads_live_selection_under_one_gate() {
     assert!(body.contains("inner.record_selection(&sel, ignore_staleness)"));
     assert_eq!(body.matches("inner.is_running = true").count(), 1);
 }
-
 
 #[test]
 fn periodic_selection_cannot_erase_a_queued_catchup_including_manual_only_interval() {
@@ -436,17 +448,29 @@ fn periodic_selection_cannot_erase_a_queued_catchup_including_manual_only_interv
                 let periodic = select_due(&config, now, &inner.backoff, true, false);
                 assert_eq!(periodic, DueSelection::default());
                 inner.record_selection(&periodic, false);
-                assert!(inner.pending_proxy_catchup, "periodic selection erased startup intent");
+                assert!(
+                    inner.pending_proxy_catchup,
+                    "periodic selection erased startup intent"
+                );
                 if !ready_before_selection {
                     assert!(!inner.request_proxy_ready());
                 }
             }
-            let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+            let mut guard = RunningGuard {
+                inner: Arc::clone(&scheduler.inner),
+                armed: true,
+            };
             assert!(guard.finish_or_repeat());
             {
                 let mut inner = lock_inner(&scheduler.inner);
-                assert!(inner.is_running, "catch-up must retain the same runner gate");
-                assert!(!inner.proxy_ready_requested, "one pass consumes duplicate ready events");
+                assert!(
+                    inner.is_running,
+                    "catch-up must retain the same runner gate"
+                );
+                assert!(
+                    !inner.proxy_ready_requested,
+                    "one pass consumes duplicate ready events"
+                );
                 let catchup = select_due(&config, now, &inner.backoff, true, true);
                 assert_eq!(catchup.due_ids, ["proxied"]);
                 inner.record_selection(&catchup, true);
@@ -472,7 +496,10 @@ fn idle_ready_event_still_sees_pending_intent_after_an_empty_periodic_pass() {
     let periodic = select_due(&config, now, &inner.backoff, true, false);
     assert_eq!(periodic, DueSelection::default());
     inner.record_selection(&periodic, false);
-    assert!(inner.request_proxy_ready(), "idle ready must schedule the still-owed catch-up");
+    assert!(
+        inner.request_proxy_ready(),
+        "idle ready must schedule the still-owed catch-up"
+    );
 }
 
 #[test]
@@ -488,8 +515,14 @@ fn recorded_selection_cannot_consume_an_independent_ready_event() {
         inner.record_selection(&selection, true);
         assert!(!inner.pending_proxy_catchup);
     }
-    let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+    let mut guard = RunningGuard {
+        inner: Arc::clone(&scheduler.inner),
+        armed: true,
+    };
     assert!(guard.finish_or_repeat());
     assert!(lock_inner(&scheduler.inner).is_running);
-    assert!(!guard.finish_or_repeat(), "a consumed wake must not create an unbounded loop");
+    assert!(
+        !guard.finish_or_repeat(),
+        "a consumed wake must not create an unbounded loop"
+    );
 }

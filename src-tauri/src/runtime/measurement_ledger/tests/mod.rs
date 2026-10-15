@@ -661,16 +661,23 @@ fn saved_unapplied_connection_edits_exclude_main_receipts_in_the_same_generation
         let mut desired = base.clone();
         desired["servers"][0][key] = value;
         let current = current_server_fingerprints(&desired);
-        assert_eq!(current, legacy, "subscription dedup semantics stay unchanged");
+        assert_eq!(
+            current, legacy,
+            "subscription dedup semantics stay unchanged"
+        );
         let connections = measurement_table_json(&desired);
         let read = ReadContext {
             main_connections: &connections,
             ..context(&current, 101, None)
         };
-        assert_eq!(exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
-            Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint)));
-        assert!(ledger.current_results(&ids(&["a"]), &read).is_empty(),
-            "an old running receipt cannot satisfy desired-configuration coverage");
+        assert_eq!(
+            exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+            Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint))
+        );
+        assert!(
+            ledger.current_results(&ids(&["a"]), &read).is_empty(),
+            "an old running receipt cannot satisfy desired-configuration coverage"
+        );
     }
     for key in ["name", "providerName", "updatedAt", "subscriptionId"] {
         let mut desired = base.clone();
@@ -689,8 +696,10 @@ fn saved_unapplied_connection_edits_exclude_main_receipts_in_the_same_generation
         main_connections: &running,
         ..context(&legacy, 101, None)
     };
-    assert_eq!(exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
-        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance)));
+    assert_eq!(
+        exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+    );
 }
 
 #[test]
@@ -710,8 +719,10 @@ fn unknown_or_changed_connection_identity_is_not_a_current_candidate_or_failure(
                 };
                 let result = ledger.candidates(&ids(&["a"]), &read);
                 assert!(result.selectable.is_empty());
-                assert_eq!(exclusion_of(&result, "a"),
-                    Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint)));
+                assert_eq!(
+                    exclusion_of(&result, "a"),
+                    Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint))
+                );
                 assert!(ledger.current_results(&ids(&["a"]), &read).is_empty());
             }
         }
@@ -748,6 +759,11 @@ fn main_candidate_identity_includes_detour_connections_and_rejects_temp_scope() 
         main_connections: &running.temp,
         ..context(&legacy, 101, None)
     };
-    assert!(ledger.candidates(&ids(&["a"]), &wrong_scope).selectable.is_empty(),
-        "temp identities cannot validate main receipts");
+    assert!(
+        ledger
+            .candidates(&ids(&["a"]), &wrong_scope)
+            .selectable
+            .is_empty(),
+        "temp identities cannot validate main receipts"
+    );
 }

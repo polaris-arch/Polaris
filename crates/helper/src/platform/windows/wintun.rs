@@ -424,6 +424,9 @@ mod win_impl {
         String::from_utf16(slice).ok()
     }
 
+    // 抑制未用警告（c_void 在签名里出现但本模块未直接命名使用）。
+    const _: Option<*const c_void> = None;
+
     #[cfg(test)]
     mod enumeration_tests {
         use super::*;
@@ -468,8 +471,7 @@ mod win_impl {
 
         #[test]
         fn ffi_enumeration_errors_remain_errors_instead_of_absent() {
-            let error =
-                list_matching_adapters_with(|_, _, _| ERROR_ACCESS_DENIED).unwrap_err();
+            let error = list_matching_adapters_with(|_, _, _| ERROR_ACCESS_DENIED).unwrap_err();
             assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
             let error = list_matching_adapters_with(|_, addresses, size| {
                 if addresses.is_null() {
@@ -491,14 +493,13 @@ mod win_impl {
             assert!(adapter_name_is_probeable(&name));
             let adapters = WinAdapterProbe.list_matching_adapters().unwrap();
             assert!(
-                adapters.iter().any(|found| found.eq_ignore_ascii_case(&name)),
+                adapters
+                    .iter()
+                    .any(|found| found.eq_ignore_ascii_case(&name)),
                 "existing adapter {name} was not returned: {adapters:?}"
             );
         }
     }
-
-    // 抑制未用警告（c_void 在签名里出现但本模块未直接命名使用）。
-    const _: Option<*const c_void> = None;
 }
 
 #[cfg(windows)]

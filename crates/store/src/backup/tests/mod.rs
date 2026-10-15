@@ -500,13 +500,11 @@ fn merge_traffic_rules_preserves_shared_tables_when_dns_is_retained() {
     let out = merge_categories(&current, &backup, &[C::CustomRules]);
     assert_eq!(out.config["customRules"][0]["id"], json!("nr1"));
     assert_eq!(
-        out.config["customRuleSets"],
-        current["customRuleSets"],
+        out.config["customRuleSets"], current["customRuleSets"],
         "未选 DNS 平面的共享规则集必须保留"
     );
     assert_eq!(
-        out.config["ruleResources"],
-        current["ruleResources"],
+        out.config["ruleResources"], current["ruleResources"],
         "未选 DNS 平面的共享资源必须保留"
     );
     assert_eq!(out.config["policyRules"][0]["id"], json!("nr1"));
@@ -533,8 +531,14 @@ fn merge_v2_dns_rules_and_dns_resources_together() {
     assert_eq!(out.config["dnsRules"][0]["id"], json!("dns-only"));
     assert_eq!(out.config["dnsRuleOrder"], json!(["dns-only"]));
     assert_eq!(out.config["trafficRules"][0]["id"], json!("r1"));
-    assert_eq!(out.config["customRuleSets"], json!([{"id":"rs1"}, {"id":"dns-rs"}]));
-    assert_eq!(out.config["ruleResources"], json!([{"id":"res1"}, {"id":"dns-res"}]));
+    assert_eq!(
+        out.config["customRuleSets"],
+        json!([{"id":"rs1"}, {"id":"dns-rs"}])
+    );
+    assert_eq!(
+        out.config["ruleResources"],
+        json!([{"id":"res1"}, {"id":"dns-res"}])
+    );
     assert_eq!(out.config["dnsServers"][0]["id"], json!("dns-new"));
     assert_eq!(
         out.config["dnsDefaults"]["directServerId"],
@@ -573,7 +577,10 @@ fn merge_custom_rules_via_rule_sets_only() {
     let backup = json!({ "customRuleSets": [{ "id": "nrs1" }] });
     let out = merge_categories(&current, &backup, &[C::CustomRules]);
     assert_eq!(out.config["customRules"], json!([]));
-    assert_eq!(out.config["customRuleSets"], json!([{"id":"rs1"}, {"id":"nrs1"}]));
+    assert_eq!(
+        out.config["customRuleSets"],
+        json!([{"id":"rs1"}, {"id":"nrs1"}])
+    );
     assert!(out.skipped.is_empty());
 }
 
@@ -635,7 +642,10 @@ fn skipped_traffic_rules_still_import_explicit_dns_rule_dependencies() {
     assert_eq!(out.skipped, vec![C::CustomRules]);
     assert_eq!(out.config["trafficRules"], current["trafficRules"]);
     assert_eq!(out.config["dnsRules"][0]["id"], json!("dns-imported"));
-    assert_eq!(out.config["ruleResources"], json!([{"id":"res1"}, {"id":"dns-resource"}]));
+    assert_eq!(
+        out.config["ruleResources"],
+        json!([{"id":"res1"}, {"id":"dns-resource"}])
+    );
 }
 
 #[test]
@@ -1438,10 +1448,19 @@ fn partial_rule_restore_preserves_both_planes_shared_resource_dependencies() {
         assert_eq!(outcome.config[retained], current[retained]);
         assert_eq!(outcome.config[replaced], backup[replaced]);
         for key in ["ruleResources", "customRuleSets"] {
-            assert_eq!(outcome.config[key], json!([current[key][0], backup[key][0]]));
+            assert_eq!(
+                outcome.config[key],
+                json!([current[key][0], backup[key][0]])
+            );
         }
-        assert_eq!(outcome.config[retained][0]["conditions"][0]["values"][0], "res:local-resource");
-        assert_eq!(outcome.config[replaced][0]["conditions"][0]["values"][0], "res:incoming-resource");
+        assert_eq!(
+            outcome.config[retained][0]["conditions"][0]["values"][0],
+            "res:local-resource"
+        );
+        assert_eq!(
+            outcome.config[replaced][0]["conditions"][0]["values"][0],
+            "res:incoming-resource"
+        );
     }
 }
 
@@ -1456,7 +1475,10 @@ fn partial_restore_reuses_identical_shared_ids_without_duplicates() {
         assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
         assert_eq!(outcome.config["customRuleSets"], current["customRuleSets"]);
         let again = merge_categories(&outcome.config, &backup, &[selected]);
-        assert_eq!(again.config, outcome.config, "same backup remains idempotent");
+        assert_eq!(
+            again.config, outcome.config,
+            "same backup remains idempotent"
+        );
         assert!(again.conflicts.is_empty());
     }
 }
@@ -1472,10 +1494,23 @@ fn partial_restore_dependency_conflict_keeps_the_entire_transaction_unchanged() 
     backup["ruleResources"][0]["fileName"] = json!("different.srs");
     backup["customRuleSets"][0]["url"] = json!("https://different.example/set.srs");
     for selected in [C::DnsRules, C::CustomRules] {
-        let outcome = merge_categories(&current, &backup, &[selected, C::ManualNodes, C::GeneralSettings]);
-        assert_eq!(outcome.config, current, "no partial node, settings, or rule import on conflict");
-        assert!(outcome.skipped.is_empty(), "conflict is not an empty-category skip");
-        assert_eq!(outcome.conflicts, ["customRuleSets:shared-set", "ruleResources:shared-resource"]);
+        let outcome = merge_categories(
+            &current,
+            &backup,
+            &[selected, C::ManualNodes, C::GeneralSettings],
+        );
+        assert_eq!(
+            outcome.config, current,
+            "no partial node, settings, or rule import on conflict"
+        );
+        assert!(
+            outcome.skipped.is_empty(),
+            "conflict is not an empty-category skip"
+        );
+        assert_eq!(
+            outcome.conflicts,
+            ["customRuleSets:shared-set", "ruleResources:shared-resource"]
+        );
     }
 }
 
@@ -1490,7 +1525,12 @@ fn full_rule_restore_replaces_shared_tables_and_resolves_same_id_conflicts() {
     let outcome = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
     assert!(outcome.conflicts.is_empty());
     assert!(outcome.skipped.is_empty());
-    for key in ["trafficRules", "dnsRules", "customRuleSets", "ruleResources"] {
+    for key in [
+        "trafficRules",
+        "dnsRules",
+        "customRuleSets",
+        "ruleResources",
+    ] {
         assert_eq!(outcome.config[key], backup[key]);
     }
 }

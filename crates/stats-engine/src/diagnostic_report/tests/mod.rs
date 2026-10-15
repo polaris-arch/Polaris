@@ -613,7 +613,8 @@ fn assembly_redacts_native_vpn_credentials_from_typed_user_and_real_endpoint_bui
         .servers
         .iter()
         .map(|server| {
-            serde_json::to_value(build_vpn_client_endpoint(server, &server.id, None).unwrap()).unwrap()
+            serde_json::to_value(build_vpn_client_endpoint(server, &server.id, None).unwrap())
+                .unwrap()
         })
         .collect();
     let raw_user = serde_json::to_value(&user).unwrap();
@@ -621,7 +622,15 @@ fn assembly_redacts_native_vpn_credentials_from_typed_user_and_real_endpoint_bui
     // 确认夹具确实把原生材料带进两种配置；若生产 builder 停止下发，测试也不会假绿。
     for raw in [&raw_user, &raw_generated] {
         let text = raw.to_string();
-        for secret in ["OV_CLIENT_KEY_BODY", "OV_CONTROL_WRAP_BODY", "OV_STATIC_KEY_BODY", "OC_CLIENT_KEY_BODY", "OC_MCA_KEY", "OC_COOKIE", "OC_FORM_SECRET"] {
+        for secret in [
+            "OV_CLIENT_KEY_BODY",
+            "OV_CONTROL_WRAP_BODY",
+            "OV_STATIC_KEY_BODY",
+            "OC_CLIENT_KEY_BODY",
+            "OC_MCA_KEY",
+            "OC_COOKIE",
+            "OC_FORM_SECRET",
+        ] {
             assert!(text.contains(secret), "fixture missing {secret}");
         }
     }
@@ -630,14 +639,47 @@ fn assembly_redacts_native_vpn_credentials_from_typed_user_and_real_endpoint_bui
         singbox_config: raw_generated,
         ..Default::default()
     });
-    for secret in ["OV_CLIENT_KEY_BODY", "OV_CONTROL_WRAP_BODY", "OV_STATIC_KEY_BODY", "OC_PASSWORD", "OC_COOKIE", "OC_TOKEN", "OC_FORM_SECRET", "OC_CLIENT_KEY_BODY", "OC_CLIENT_PASSPHRASE", "OC_MCA_KEY", "OC_MCA_PASSPHRASE"] {
+    for secret in [
+        "OV_CLIENT_KEY_BODY",
+        "OV_CONTROL_WRAP_BODY",
+        "OV_STATIC_KEY_BODY",
+        "OC_PASSWORD",
+        "OC_COOKIE",
+        "OC_TOKEN",
+        "OC_FORM_SECRET",
+        "OC_CLIENT_KEY_BODY",
+        "OC_CLIENT_PASSPHRASE",
+        "OC_MCA_KEY",
+        "OC_MCA_PASSPHRASE",
+    ] {
         assert!(!report.contains(secret), "diagnostic leak: {secret}");
     }
-    for public in ["PUBLIC_OV_CA", "PUBLIC_OV_CLIENT", "PUBLIC_OC_CA", "PUBLIC_OC_CLIENT", "PUBLIC_OC_MCA", "PUBLIC_FINGERPRINT"] {
-        assert_eq!(report.matches(public).count(), 2, "public certificate must survive in both sections: {public}");
+    for public in [
+        "PUBLIC_OV_CA",
+        "PUBLIC_OV_CLIENT",
+        "PUBLIC_OC_CA",
+        "PUBLIC_OC_CLIENT",
+        "PUBLIC_OC_MCA",
+        "PUBLIC_FINGERPRINT",
+    ] {
+        assert_eq!(
+            report.matches(public).count(),
+            2,
+            "public certificate must survive in both sections: {public}"
+        );
     }
-    for useful in ["PUBLIC_KEY_CONTROL", "ORDINARY_KEY_CONTROL", "tls_crypt", "AES-128-CBC", "SHA256", "anyconnect"] {
-        assert!(report.contains(useful), "diagnostic signal disappeared: {useful}");
+    for useful in [
+        "PUBLIC_KEY_CONTROL",
+        "ORDINARY_KEY_CONTROL",
+        "tls_crypt",
+        "AES-128-CBC",
+        "SHA256",
+        "anyconnect",
+    ] {
+        assert!(
+            report.contains(useful),
+            "diagnostic signal disappeared: {useful}"
+        );
     }
 }
 
@@ -664,7 +706,8 @@ fn assembly_keeps_redacting_identity_when_unrelated_unicode_changes_folded_lengt
 
 #[test]
 fn assembly_redacts_greek_final_sigma_variants_in_both_directions() {
-    for (configured, logged) in [("ΚΟΣΜΟΣ", "κοσμος"), ("κοσμος", "ΚΟΣΜΟΣ")] {
+    for (configured, logged) in [("ΚΟΣΜΟΣ", "κοσμος"), ("κοσμος", "ΚΟΣΜΟΣ")]
+    {
         let report = assemble_diagnostic_report(&DiagnosticReportSource {
             app: AppSection {
                 os: "İ device K".into(),

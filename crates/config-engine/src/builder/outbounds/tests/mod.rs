@@ -1625,22 +1625,50 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
         let mut inner = ss_server("inner", "Inner");
         inner.bind_interface = Some("en7".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
-            password: "wrapper-password".into(), sni: "cover.example.com".into(),
-            fingerprint: None, port: Some(443),
+            password: "wrapper-password".into(),
+            sni: "cover.example.com".into(),
+            fingerprint: None,
+            port: Some(443),
         });
         let mut upstream = ss_server("upstream", "Upstream");
-        inner.detour = match case { "none" => None, "missing" => Some("absent".into()), _ => Some("upstream".into()) };
-        if case == "cycle" { upstream.detour = Some("inner".into()); }
+        inner.detour = match case {
+            "none" => None,
+            "missing" => Some("absent".into()),
+            _ => Some("upstream".into()),
+        };
+        if case == "cycle" {
+            upstream.detour = Some("inner".into());
+        }
         let config = UserConfig {
-            servers: vec![inner, upstream], selected_server_id: Some("inner".into()), ..Default::default()
+            servers: vec![inner, upstream],
+            selected_server_id: Some("inner".into()),
+            ..Default::default()
         };
         let result = build_outbounds(&config, &mut deps_default()).unwrap();
         let inner = result.outbounds.iter().find(|o| o.tag == "Inner").unwrap();
-        let wrapper = result.outbounds.iter().find(|o| o.tag == "stls-out-inner").unwrap();
+        let wrapper = result
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "stls-out-inner")
+            .unwrap();
         assert_eq!(inner.detour.as_deref(), Some("stls-out-inner"));
-        assert_eq!(wrapper.detour.as_deref(), if case == "chain" { Some("Upstream") } else { None }, "{case}");
+        assert_eq!(
+            wrapper.detour.as_deref(),
+            if case == "chain" {
+                Some("Upstream")
+            } else {
+                None
+            },
+            "{case}"
+        );
         assert!(inner.extra.get("bind_interface").is_none());
-        assert_eq!(wrapper.extra.get("bind_interface").and_then(serde_json::Value::as_str), Some("en7"));
+        assert_eq!(
+            wrapper
+                .extra
+                .get("bind_interface")
+                .and_then(serde_json::Value::as_str),
+            Some("en7")
+        );
     }
 }
 
@@ -1650,7 +1678,10 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
         let mut inner = ss_server("inner", "Inner");
         inner.detour = Some("upstream".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
-            password: "p".into(), sni: "cover.example".into(), fingerprint: None, port: None,
+            password: "p".into(),
+            sni: "cover.example".into(),
+            fingerprint: None,
+            port: None,
         });
         let config = UserConfig {
             servers: vec![inner, ss_server("upstream", "Upstream")],
@@ -1658,13 +1689,17 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
             ..Default::default()
         };
         let mut deps = deps_default();
-        deps.gate_invalid_nodes.insert("upstream".into(), INVALID_REASON_DETOUR_CASCADE);
+        deps.gate_invalid_nodes
+            .insert("upstream".into(), INVALID_REASON_DETOUR_CASCADE);
         let result = build_outbounds(&config, &mut deps);
         if selected {
             assert!(result.is_err());
         } else {
             let result = result.unwrap();
-            assert!(!result.outbounds.iter().any(|o| o.tag == "Inner" || o.tag == "stls-out-inner"));
+            assert!(!result
+                .outbounds
+                .iter()
+                .any(|o| o.tag == "Inner" || o.tag == "stls-out-inner"));
             assert!(deps.gate_invalid_nodes.contains_key("inner"));
         }
     }

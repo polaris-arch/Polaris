@@ -22,8 +22,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-    FALSE, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
+    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE,
+    INVALID_HANDLE_VALUE, NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};

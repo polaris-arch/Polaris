@@ -200,35 +200,74 @@ fn rr_walk_rejects_truncated_or_wrong_sized_answers_before_classifying_hit() {
     let valid = a_response(&query, &[[1, 1, 1, 1], [8, 8, 8, 8]]);
     for cut in 1..=4 {
         let malformed = &valid[..valid.len() - cut];
-        assert_eq!(classify_dns_response(malformed, TYPE_A), DnsResponseClass::Fail);
+        assert_eq!(
+            classify_dns_response(malformed, TYPE_A),
+            DnsResponseClass::Fail
+        );
         assert!(extract_answer_ip_bytes(malformed).is_empty());
     }
     for (rtype, size) in [(TYPE_A, 3), (TYPE_A, 5), (TYPE_AAAA, 15), (TYPE_AAAA, 17)] {
-        let response = build_answer_response(&query, &[AnswerRecord { rtype, rdata: vec![1; size] }]);
-        assert_eq!(classify_dns_response(&response, rtype), DnsResponseClass::Fail);
+        let response = build_answer_response(
+            &query,
+            &[AnswerRecord {
+                rtype,
+                rdata: vec![1; size],
+            }],
+        );
+        assert_eq!(
+            classify_dns_response(&response, rtype),
+            DnsResponseClass::Fail
+        );
         assert!(extract_answer_ip_bytes(&response).is_empty());
     }
     // Also validate the remainder after a good answer and after an NXDOMAIN header.
     let mut bad_additional = a_response(&query, &[[1, 1, 1, 1]]);
     put_u16(&mut bad_additional, 10, 1);
     bad_additional.push(0xc0); // Incomplete compressed NAME.
-    assert_eq!(classify_dns_response(&bad_additional, TYPE_A), DnsResponseClass::Fail);
+    assert_eq!(
+        classify_dns_response(&bad_additional, TYPE_A),
+        DnsResponseClass::Fail
+    );
     put_u16(&mut bad_additional, 2, 0x8183);
-    assert_eq!(classify_dns_response(&bad_additional, TYPE_A), DnsResponseClass::Fail);
+    assert_eq!(
+        classify_dns_response(&bad_additional, TYPE_A),
+        DnsResponseClass::Fail
+    );
 }
 
 #[test]
 fn rr_walk_keeps_complete_cname_and_multiple_addresses() {
     let query = encode_dns_query("safe.example", TYPE_A, 7);
-    let response = build_answer_response(&query, &[
-        AnswerRecord { rtype: 5, rdata: vec![0xc0, 0x0c] },
-        AnswerRecord { rtype: TYPE_A, rdata: vec![1, 1, 1, 1] },
-        AnswerRecord { rtype: TYPE_A, rdata: vec![8, 8, 8, 8] },
-    ]);
-    assert_eq!(classify_dns_response(&response, TYPE_A), DnsResponseClass::Hit);
-    assert_eq!(extract_answer_ip_bytes(&response), vec![vec![1, 1, 1, 1], vec![8, 8, 8, 8]]);
+    let response = build_answer_response(
+        &query,
+        &[
+            AnswerRecord {
+                rtype: 5,
+                rdata: vec![0xc0, 0x0c],
+            },
+            AnswerRecord {
+                rtype: TYPE_A,
+                rdata: vec![1, 1, 1, 1],
+            },
+            AnswerRecord {
+                rtype: TYPE_A,
+                rdata: vec![8, 8, 8, 8],
+            },
+        ],
+    );
+    assert_eq!(
+        classify_dns_response(&response, TYPE_A),
+        DnsResponseClass::Hit
+    );
+    assert_eq!(
+        extract_answer_ip_bytes(&response),
+        vec![vec![1, 1, 1, 1], vec![8, 8, 8, 8]]
+    );
     let mut missing_question = query;
     put_u16(&mut missing_question, 2, 0x8180);
     missing_question.pop();
-    assert_eq!(classify_dns_response(&missing_question, TYPE_A), DnsResponseClass::Fail);
+    assert_eq!(
+        classify_dns_response(&missing_question, TYPE_A),
+        DnsResponseClass::Fail
+    );
 }

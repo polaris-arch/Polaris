@@ -964,45 +964,80 @@ fn tun_dns_mode_is_typed_and_omission_roundtrips() {
 fn engaged_mesh_carves_tun_exclusion_once_and_keeps_platform_lan_guards() {
     use crate::user_config::server_config::{Protocol, ServerConfig, WireGuardSettings};
     let node = ServerConfig {
-        id: "wg".into(), name: "mesh".into(), protocol: Protocol::Wireguard,
-        address: "203.0.113.1".into(), port: 51820,
+        id: "wg".into(),
+        name: "mesh".into(),
+        protocol: Protocol::Wireguard,
+        address: "203.0.113.1".into(),
+        port: 51820,
         wireguard_settings: Some(Box::new(WireGuardSettings {
             allowed_ips: vec!["10.20.0.0/16".into()],
-            always_route_subnets: Some(false), ..Default::default()
-        })), ..Default::default()
+            always_route_subnets: Some(false),
+            ..Default::default()
+        })),
+        ..Default::default()
     };
     for platform in ["win32", "darwin", "linux"] {
         for engagement in ["selected", "targeted", "unused", "always"] {
             let mut config = UserConfig {
-                servers: vec![node.clone()], proxy_mode_type: ProxyModeType::Tun,
-                selected_server_id: Some(if engagement == "selected" { "wg" } else { "__direct__" }.into()),
+                servers: vec![node.clone()],
+                proxy_mode_type: ProxyModeType::Tun,
+                selected_server_id: Some(
+                    if engagement == "selected" {
+                        "wg"
+                    } else {
+                        "__direct__"
+                    }
+                    .into(),
+                ),
                 tun_config: Some(crate::user_config::tun_config::TunModeConfig {
-                    inbound_exclude_cidrs: Some(vec!["10.20.0.0/16".into()]), ..Default::default()
-                }), ..Default::default()
+                    inbound_exclude_cidrs: Some(vec!["10.20.0.0/16".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
             };
             if engagement == "always" {
-                config.servers[0].wireguard_settings.as_mut().unwrap().always_route_subnets = Some(true);
+                config.servers[0]
+                    .wireguard_settings
+                    .as_mut()
+                    .unwrap()
+                    .always_route_subnets = Some(true);
             }
             if engagement == "targeted" {
                 config.custom_rules = vec![serde_json::from_value(serde_json::json!({
                     "id":"target", "type":"domain", "values":["example.com"],
                     "action":"proxy", "targetServerId":"wg", "enabled":true
-                })).unwrap()];
+                }))
+                .unwrap()];
             }
             let mut deps = deps_linux();
             deps.platform = platform.into();
             let inbounds = build_inbounds(&config, None, &deps);
-            let exclude = inbounds.iter().find(|i| i.tag == "tun-in").unwrap()
-                .route_exclude_address.clone().unwrap_or_default();
-            assert_eq!(crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/16", &exclude),
-                platform != "linux" && engagement == "unused", "{platform}/{engagement}: {exclude:?}");
+            let exclude = inbounds
+                .iter()
+                .find(|i| i.tag == "tun-in")
+                .unwrap()
+                .route_exclude_address
+                .clone()
+                .unwrap_or_default();
+            assert_eq!(
+                crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/16", &exclude),
+                platform != "linux" && engagement == "unused",
+                "{platform}/{engagement}: {exclude:?}"
+            );
             if platform == "win32" && engagement != "unused" {
                 deps.own_lan_cidrs = vec!["10.20.0.0/24".into()];
                 let physical = build_inbounds(&config, None, &deps);
-                let exclude = physical.iter().find(|i| i.tag == "tun-in").unwrap()
-                    .route_exclude_address.clone().unwrap_or_default();
-                assert!(crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/24", &exclude),
-                    "real physical LAN must keep its existing bypass protection");
+                let exclude = physical
+                    .iter()
+                    .find(|i| i.tag == "tun-in")
+                    .unwrap()
+                    .route_exclude_address
+                    .clone()
+                    .unwrap_or_default();
+                assert!(
+                    crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/24", &exclude),
+                    "real physical LAN must keep its existing bypass protection"
+                );
             }
         }
     }

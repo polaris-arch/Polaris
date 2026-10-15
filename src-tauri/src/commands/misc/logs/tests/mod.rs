@@ -397,8 +397,19 @@ fn diagnostic_export_gateway_receives_redacted_vpn_config_and_unicode_identities
     let payload = finish_export(&gateway, Some(saf_file_path()), &markdown);
     assert_eq!(payload["success"], true);
     let exported = gateway.contents().expect("diagnostic bytes written");
-    for private in ["EXPORT_PRIVATE_BODY", "EXPORT_WRAP_BODY", "EXPORT_STATIC_BODY", "vpn.example", "VPN.EXAMPLE", "İstanbul VPN", "İSTANBUL VPN"] {
-        assert!(!exported.contains(private), "exported diagnostic leaks {private}");
+    for private in [
+        "EXPORT_PRIVATE_BODY",
+        "EXPORT_WRAP_BODY",
+        "EXPORT_STATIC_BODY",
+        "vpn.example",
+        "VPN.EXAMPLE",
+        "İstanbul VPN",
+        "İSTANBUL VPN",
+    ] {
+        assert!(
+            !exported.contains(private),
+            "exported diagnostic leaks {private}"
+        );
     }
     assert!(exported.contains("PUBLIC_EXPORT_CA"));
     assert!(exported.contains("<domain-1>"));

@@ -173,6 +173,22 @@ pub async fn proxy_stop(
             Err(error) => ApiResponse::err(error),
         });
     }
+    let response = proxy_stop_unconditional(app, state).await?;
+    Ok(ApiResponse {
+        success: response.success,
+        data: None,
+        error: response.error,
+        code: response.code,
+    })
+}
+
+/// Native menu Stop/cancel has no IPC Request and keeps the unit response shared
+/// with native Start. The ordinary IPC branch uses this same stop/event route.
+pub(crate) async fn proxy_stop_unconditional(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+) -> Result<ApiResponse<()>, ()> {
+    let proxy = state.proxy.clone();
     Ok(match proxy.stop().await {
         Ok(()) => {
             let _ = app.emit(EVENT_PROXY_STOPPED, json!({}));

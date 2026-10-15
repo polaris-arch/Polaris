@@ -258,7 +258,13 @@ impl MeasurementLedger {
         // Legacy unit fixtures use one synthetic token for both identities.
         // Production always supplies the actual connection digest explicitly.
         let connection_digest = identity.node_fingerprint.clone();
-        self.record_connection_at(node_id, measured, identity, connection_digest, recorded_mono)
+        self.record_connection_at(
+            node_id,
+            measured,
+            identity,
+            connection_digest,
+            recorded_mono,
+        )
     }
 
     pub(crate) fn record_connection_at(
@@ -506,9 +512,11 @@ fn classify(
     if let Some(stale) = ledger_stale(entry, node_id, context) {
         return Err(Exclusion::Stale(stale));
     }
-    if entry.connection_digest.as_ref().is_none_or(|measured| {
-        context.main_connections.get(node_id) != Some(measured)
-    }) {
+    if entry
+        .connection_digest
+        .as_ref()
+        .is_none_or(|measured| context.main_connections.get(node_id) != Some(measured))
+    {
         return Err(Exclusion::Stale(LedgerStale::Identity(
             StaleReason::NodeFingerprint,
         )));

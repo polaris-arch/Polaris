@@ -72,10 +72,7 @@ fn skip_name(buf: &[u8], offset: usize) -> Option<usize> {
 /// message before either caller can use an early answer; a good first RR cannot mask a
 /// truncated later answer/authority/additional record. Unknown types (including CNAME)
 /// retain their wire bytes and only require a complete RDATA span.
-fn visit_answer_records(
-    resp: &[u8],
-    mut visit: impl FnMut(u16, u16, &[u8]),
-) -> Option<()> {
+fn visit_answer_records(resp: &[u8], mut visit: impl FnMut(u16, u16, &[u8])) -> Option<()> {
     let qd = u16_at(resp, 4)?;
     let an = u16_at(resp, 6)?;
     let ns = u16_at(resp, 8)?;

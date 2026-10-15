@@ -577,10 +577,18 @@ fn missing_connection_identity_fails_closed_but_pool_membership_keeps_priority()
     let cur = fp_map(&[("a", "fp-a"), ("newbie", "fp-n")]);
     let dirty = partition_dirty(&ids(&["newbie"]), &snap, &cur);
     assert_eq!(dirty, id_set(&["newbie"]));
-    let partition = partition_pool(&ids(&["newbie"]), &BTreeMap::new(), &dirty, &BTreeSet::new());
+    let partition = partition_pool(
+        &ids(&["newbie"]),
+        &BTreeMap::new(),
+        &dirty,
+        &BTreeSet::new(),
+    );
     assert_eq!(partition.not_in_pool, ids(&["newbie"]));
     assert!(partition.dirty.is_empty());
-    assert_eq!(partition_dirty(&ids(&["a"]), &snap, &BTreeMap::new()), id_set(&["a"]));
+    assert_eq!(
+        partition_dirty(&ids(&["a"]), &snap, &BTreeMap::new()),
+        id_set(&["a"])
+    );
 }
 
 /// 只筛**请求集内**的节点：配置里别的节点脏了不影响本波。
@@ -6811,7 +6819,6 @@ async fn a_scheduled_round_with_nothing_testable_opens_no_readback() {
     assert_eq!(bench.readbacks_opened.load(Ordering::SeqCst), 0);
 }
 
-
 #[test]
 fn saved_unapplied_tls_sni_and_ws_changes_are_dirty_without_staged_drafts() {
     use crate::runtime::node_fingerprints::measurement_table_json;
@@ -6827,15 +6834,28 @@ fn saved_unapplied_tls_sni_and_ws_changes_are_dirty_without_staged_drafts() {
     ] {
         let mut desired = base.clone();
         desired["servers"][0][key] = value;
-        assert_eq!(current_server_fingerprints(&base), current_server_fingerprints(&desired));
+        assert_eq!(
+            current_server_fingerprints(&base),
+            current_server_fingerprints(&desired)
+        );
         let dirty = partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired));
         assert_eq!(dirty, id_set(&["a"]));
-        let partition = partition_pool(&ids(&["a"]), &fp_map(&[("a", "tag-a")]), &dirty, &BTreeSet::new());
-        assert!(partition.testable.is_empty(), "saved changes must not measure the old running exit");
+        let partition = partition_pool(
+            &ids(&["a"]),
+            &fp_map(&[("a", "tag-a")]),
+            &dirty,
+            &BTreeSet::new(),
+        );
+        assert!(
+            partition.testable.is_empty(),
+            "saved changes must not measure the old running exit"
+        );
     }
     for key in ["name", "providerName", "updatedAt", "subscriptionId"] {
         let mut desired = base.clone();
         desired["servers"][0][key] = json!("display-only");
-        assert!(partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired)).is_empty());
+        assert!(
+            partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired)).is_empty()
+        );
     }
 }

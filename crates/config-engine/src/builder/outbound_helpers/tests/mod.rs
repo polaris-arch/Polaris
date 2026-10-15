@@ -96,7 +96,10 @@ fn pruned_default() {
 fn ws_early_data_preserves_non_control_query_bytes() {
     let raw = "/socket?token=a%26b&ed=2048&token=%23&unicode=%E4%B8%AD&literal=中文&flag&empty=&x=1+2&eh=X%2DHeader";
     let result = parse_ws_early_data(raw);
-    assert_eq!(result.path, "/socket?token=a%26b&token=%23&unicode=%E4%B8%AD&literal=中文&flag&empty=&x=1+2");
+    assert_eq!(
+        result.path,
+        "/socket?token=a%26b&token=%23&unicode=%E4%B8%AD&literal=中文&flag&empty=&x=1+2"
+    );
     assert_eq!(result.max_early_data, Some(2048));
     assert_eq!(result.early_data_header_name.as_deref(), Some("X-Header"));
     for raw in ["/x?token=a%26b&flag", "/x?ed=no&token=%23", "/x?ed=0&ed=4"] {

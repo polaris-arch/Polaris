@@ -45,7 +45,7 @@ import {
 import { exitAddrText } from './exit-addr';
 import { notifyDesktop } from '@/lib/desktop-notify';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
-import { ProxyErrorCode, type UserConfig } from '@/contracts/types';
+import { ProxyErrorCode } from '@/contracts/types';
 import { ConnectionTopology } from './ConnectionTopology';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
 import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';

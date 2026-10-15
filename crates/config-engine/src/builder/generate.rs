@@ -838,9 +838,7 @@ fn retain_defined_dns_rule_sets(
         children.retain_mut(|child| retain_defined_dns_rule_sets(child, defined, pruned));
         // Same fail-closed policy as route logical pruning: an incomplete AND cannot
         // become a broader matcher; an empty OR cannot become unconditional.
-        if children.is_empty()
-            || (rule.mode.as_deref() == Some("and") && children.len() < before)
-        {
+        if children.is_empty() || (rule.mode.as_deref() == Some("and") && children.len() < before) {
             return false;
         }
     }

@@ -1466,14 +1466,26 @@ pub fn encode_share_url(c: &ServerConfig) -> Result<String, String> {
     if let Some(tls) = &c.tls_settings {
         // There is no supported URI grammar for the SPKI pin. Never silently remove a
         // security constraint, including on protocols whose URI cannot carry TLS pins.
-        if tls.certificate_public_key_sha256.as_ref().is_some_and(|pin| !pin.is_empty()) {
+        if tls
+            .certificate_public_key_sha256
+            .as_ref()
+            .is_some_and(|pin| !pin.is_empty())
+        {
             return Err("分享链接无法保留公钥证书固定，请使用配置导出".into());
         }
-        if let Some(pin) = tls.certificate_sha256.as_deref().filter(|pin| !pin.is_empty()) {
+        if let Some(pin) = tls
+            .certificate_sha256
+            .as_deref()
+            .filter(|pin| !pin.is_empty())
+        {
             let carries_pin = match c.protocol {
                 Protocol::Hysteria2 | Protocol::Tuic => true,
-                Protocol::Vless | Protocol::Vmess => c.security.as_ref().is_some_and(SecurityMode::is_tls),
-                Protocol::Trojan | Protocol::Anytls => c.security.as_ref().is_none_or(SecurityMode::is_tls),
+                Protocol::Vless | Protocol::Vmess => {
+                    c.security.as_ref().is_some_and(SecurityMode::is_tls)
+                }
+                Protocol::Trojan | Protocol::Anytls => {
+                    c.security.as_ref().is_none_or(SecurityMode::is_tls)
+                }
                 _ => false,
             };
             if !carries_pin {
@@ -1481,7 +1493,10 @@ pub fn encode_share_url(c: &ServerConfig) -> Result<String, String> {
             }
             // Import drops invalid entries. Refuse an export that would not round-trip
             // every pin, rather than emitting a link with a weakened constraint.
-            if pin.split(',').any(|item| keep_valid_cert_pins(item).is_none()) {
+            if pin
+                .split(',')
+                .any(|item| keep_valid_cert_pins(item).is_none())
+            {
                 return Err("证书固定格式无效，无法生成无损分享链接".into());
             }
         }

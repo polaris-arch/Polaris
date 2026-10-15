@@ -43,8 +43,10 @@ fn connected_test_pipe() -> (OwnedHandle, OwnedHandle) {
         )
     };
     assert_ne!(
-        raw_server, INVALID_HANDLE_VALUE,
-        "{}", std::io::Error::last_os_error()
+        raw_server,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
     );
     // SAFETY: successful API result transfers exactly one owned handle.
     let server = unsafe { OwnedHandle::from_raw_handle(raw_server) };
@@ -64,8 +66,10 @@ fn connected_test_pipe() -> (OwnedHandle, OwnedHandle) {
         )
     };
     assert_ne!(
-        raw_client, INVALID_HANDLE_VALUE,
-        "{}", std::io::Error::last_os_error()
+        raw_client,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
     );
     // SAFETY: successful API result transfers exactly one owned handle.
     let client = unsafe { OwnedHandle::from_raw_handle(raw_client) };

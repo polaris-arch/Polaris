@@ -1013,12 +1013,12 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                         i18n::key::TRAY_CONNECT,
                     ),
                     TrayProxyAction::Stop => (
-                        commands::proxy::proxy_stop(app.clone(), state).await,
+                        commands::proxy::proxy_stop_unconditional(app.clone(), state).await,
                         i18n::key::TRAY_DISCONNECT,
                     ),
                     // 起核期 `running=false`，仍必须走 stop；这是自绘托盘已经建立的取消契约。
                     TrayProxyAction::Cancel => (
-                        commands::proxy::proxy_stop(app.clone(), state).await,
+                        commands::proxy::proxy_stop_unconditional(app.clone(), state).await,
                         i18n::key::TRAY_CANCEL_STARTUP,
                     ),
                 };

@@ -372,9 +372,18 @@ async fn fast_truncated_answer_cannot_cancel_slow_complete_upstream() {
     let good = a_reply(&query, &[[93, 184, 216, 34]]);
     let mock = MockQuery::new(&[
         ("ali", Script::Reply(Duration::from_millis(1), truncated)),
-        ("dnspod", Script::Reply(Duration::from_millis(30), good.clone())),
+        (
+            "dnspod",
+            Script::Reply(Duration::from_millis(30), good.clone()),
+        ),
     ]);
-    let out = race_forward(&query, &ups(&["ali", "dnspod"]), &mock,
-        DEFAULT_RACE_BUDGET, &DecoySet::builtin()).await;
+    let out = race_forward(
+        &query,
+        &ups(&["ali", "dnspod"]),
+        &mock,
+        DEFAULT_RACE_BUDGET,
+        &DecoySet::builtin(),
+    )
+    .await;
     assert_eq!(out, set_dns_message_id(&good, 0x4242));
 }

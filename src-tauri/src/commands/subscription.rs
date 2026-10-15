@@ -919,8 +919,7 @@ impl SubscriptionFetchIdentity {
     }
 
     fn check_current(&self, cfg: &Value, id: &str) -> Result<(), String> {
-        let current =
-            find_subscription(cfg, id).ok_or_else(|| format!("订阅不存在: {id}"))?;
+        let current = find_subscription(cfg, id).ok_or_else(|| format!("订阅不存在: {id}"))?;
         if self != &Self::new(cfg, &current) {
             return Err("拉取期间订阅 URL 或生效 UA 已变化，旧响应未写入，请重试更新".to_owned());
         }

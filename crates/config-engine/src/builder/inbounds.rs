@@ -6,8 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::builder::endpoint_routes::{
-    collect_rule_targeted_server_ids, engaged_mesh_forced_route_cidrs,
-    ObservedTailnetAddresses,
+    collect_rule_targeted_server_ids, engaged_mesh_forced_route_cidrs, ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
     effective_app_rules, effective_custom_rules, get_custom_domestic_dns_endpoint,

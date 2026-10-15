@@ -758,7 +758,12 @@ pub async fn rule_resources_update_all(
             &res_dir,
             |resource, staged| {
                 persist_registered_resource(
-                    &app, &state, &existing, resource, staged, BroadcastMode::Deferred,
+                    &app,
+                    &state,
+                    &existing,
+                    resource,
+                    staged,
+                    BroadcastMode::Deferred,
                 )
             },
         )
@@ -1218,11 +1223,18 @@ async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
         Ok(stage) => stage,
         Err(error) => {
             let message = format!("创建资源暂存目录失败: {error}");
-            emit_resource_progress(sink, plan, json!({
-                "received": 0, "total": null, "percent": null, "status": "error",
-                "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
-            }));
-            return DownloadOutcome::Failed { message, code: ERR_RESOURCE_WRITE_FAILED };
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            return DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            };
         }
     };
     let outcome =
@@ -1233,18 +1245,32 @@ async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
     let existed_before = res_dir.join(&plan.file_name).is_file();
     match commit(&resource, &stage.0.join(&plan.file_name)) {
         Ok(()) => {
-            emit_resource_progress(sink, plan, json!({
-                "received": resource.size, "total": resource.size,
-                "percent": 100.0, "status": "done",
-            }));
-            DownloadOutcome::Stored { resource, existed_before }
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": resource.size, "total": resource.size,
+                    "percent": 100.0, "status": "done",
+                }),
+            );
+            DownloadOutcome::Stored {
+                resource,
+                existed_before,
+            }
         }
         Err(message) => {
-            emit_resource_progress(sink, plan, json!({
-                "received": 0, "total": null, "percent": null, "status": "error",
-                "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
-            }));
-            DownloadOutcome::Failed { message, code: ERR_RESOURCE_WRITE_FAILED }
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            }
         }
     }
 }
@@ -1267,7 +1293,11 @@ fn commit_registered_resource(
         .iter_mut()
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(expected.id.as_str()))
         .ok_or_else(|| "资源已删除，旧下载已丢弃".to_owned())?;
-    if serde_json::from_value::<RuleResource>(current.clone()).ok().as_ref() != Some(expected) {
+    if serde_json::from_value::<RuleResource>(current.clone())
+        .ok()
+        .as_ref()
+        != Some(expected)
+    {
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".to_owned());
     }
     let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
@@ -1375,11 +1405,18 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
         Ok(stage) => stage,
         Err(error) => {
             let message = format!("创建资源暂存目录失败: {error}");
-            emit_resource_progress(sink, plan, json!({
-                "received": 0, "total": null, "percent": null, "status": "error",
-                "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
-            }));
-            return DownloadOutcome::Failed { message, code: ERR_RESOURCE_WRITE_FAILED };
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            return DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            };
         }
     };
     let outcome =

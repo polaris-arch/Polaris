@@ -681,7 +681,10 @@ fn route_rule_bad_ref(servers: &[DnsServer], rule: &RouteRule) -> Option<EnvRefE
 fn dns_rule_bad_ref(servers: &[DnsServer], rule: &DnsRule) -> Option<EnvRefError> {
     first_bad_ref(
         servers,
-        env_tags(rule.dns_server_address.as_ref(), rule.dns_search_domain.as_ref()),
+        env_tags(
+            rule.dns_server_address.as_ref(),
+            rule.dns_search_domain.as_ref(),
+        ),
     )
     .or_else(|| {
         rule.rules
@@ -718,14 +721,12 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
             });
     }
     if let Some(rules) = cfg.dns.as_mut().and_then(|dns| dns.rules.as_mut()) {
-        rules.retain(|rule| {
-            match dns_rule_bad_ref(&servers, rule) {
-                Some(err) => {
-                    record(err);
-                    false
-                }
-                None => true,
+        rules.retain(|rule| match dns_rule_bad_ref(&servers, rule) {
+            Some(err) => {
+                record(err);
+                false
             }
+            None => true,
         });
     }
     pruned

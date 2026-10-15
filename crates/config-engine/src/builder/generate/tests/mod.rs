@@ -439,7 +439,10 @@ fn route_rule_set_count(config: &SingBoxConfig, tag: &str) -> usize {
 }
 
 fn dns_references_rule_set(config: &SingBoxConfig, tag: &str) -> bool {
-    config.dns.as_ref().is_some_and(|dns| dns_rule_set_references(dns).contains(tag))
+    config
+        .dns
+        .as_ref()
+        .is_some_and(|dns| dns_rule_set_references(dns).contains(tag))
 }
 
 /// DNS 规则与流量规则的作用域不同：前者在 smart/global/direct 都生效，后者只在 smart
@@ -466,13 +469,19 @@ fn dns_local_rule_set_definitions_follow_dns_across_modes_without_preloading_unu
                 // Actual JSON bytes cannot satisfy the SRS magic callback. This used to
                 // be hidden by an unconditional true stub for both resource formats.
                 let content: &[u8] = match format {
-                    RuleResourceFormat::Source => br#"{"version":3,"rules":[{"domain":["api.example.com"]}]}"#,
+                    RuleResourceFormat::Source => {
+                        br#"{"version":3,"rules":[{"domain":["api.example.com"]}]}"#
+                    }
                     RuleResourceFormat::Binary => b"SRS\x03",
                 };
                 std::fs::write(dir.path().join("dns-resource.srs"), content).unwrap();
                 let mut deps = deps_default();
                 deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
-                deps.is_valid_srs_fn = |path| crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path));
+                deps.is_valid_srs_fn = |path| {
+                    crate::user_config::builtin_geo_rulesets::is_valid_srs_file(
+                        std::path::Path::new(path),
+                    )
+                };
 
                 let outcome =
                     generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps)
@@ -2190,53 +2199,92 @@ fn inbound_exclude_warn_survives_full_assembly() {
 fn dns_and_source_rule_set_closes_graph_across_modes_and_missing_binary_fails_closed() {
     use crate::user_config::rule::{CombineMode, RuleCondition};
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("source.srs"), br#"{"version":3,"rules":[{"domain_suffix":["example.com"]}]}"#).unwrap();
+    std::fs::write(
+        dir.path().join("source.srs"),
+        br#"{"version":3,"rules":[{"domain_suffix":["example.com"]}]}"#,
+    )
+    .unwrap();
     std::fs::write(dir.path().join("broken.srs"), b"corrupt").unwrap();
     for mode in [ProxyMode::Smart, ProxyMode::Global, ProxyMode::Direct] {
         let mut config = base_config();
         config.proxy_mode = mode;
-        config.rule_resources = vec![rule_resource("source", RuleResourceFormat::Source), rule_resource("broken", RuleResourceFormat::Binary)];
+        config.rule_resources = vec![
+            rule_resource("source", RuleResourceFormat::Source),
+            rule_resource("broken", RuleResourceFormat::Binary),
+        ];
         let mut rule = dns_rule_set_rule("dns-and-source", "source");
         rule.combine_mode = Some(CombineMode::And);
         rule.conditions = Some(vec![
-            RuleCondition { type_field: RuleType::Domain, values: vec!["api.example.com".into()] },
-            RuleCondition { type_field: RuleType::RuleSet, values: vec!["res:source".into()] },
+            RuleCondition {
+                type_field: RuleType::Domain,
+                values: vec!["api.example.com".into()],
+            },
+            RuleCondition {
+                type_field: RuleType::RuleSet,
+                values: vec!["res:source".into()],
+            },
         ]);
         config.custom_rules = vec![rule.clone()];
         let mut deps = deps_default();
         deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
-        deps.is_valid_srs_fn = |path| crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path));
+        deps.is_valid_srs_fn = |path| {
+            crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path))
+        };
         let built = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
-        assert!(dns_references_rule_set(&built, "local-rs-source"), "{mode:?}");
+        assert!(
+            dns_references_rule_set(&built, "local-rs-source"),
+            "{mode:?}"
+        );
         assert_eq!(route_rule_set_count(&built, "local-rs-source"), 1);
         config.custom_rules[0].conditions.as_mut().unwrap()[1].values = vec!["res:broken".into()];
         let broken = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
         assert!(!dns_references_rule_set(&broken, "local-rs-broken"));
         assert_eq!(route_rule_set_count(&broken, "local-rs-broken"), 0);
-        assert!(!broken.dns.unwrap().rules.unwrap().iter().any(|rule| rule.type_field.as_deref() == Some("logical")),
-            "missing AND resource must remove the entire predicate, not broaden it");
+        assert!(
+            !broken
+                .dns
+                .unwrap()
+                .rules
+                .unwrap()
+                .iter()
+                .any(|rule| rule.type_field.as_deref() == Some("logical")),
+            "missing AND resource must remove the entire predicate, not broaden it"
+        );
     }
 }
 
 #[test]
 fn unresolved_nested_dns_rules_preserve_and_or_fail_closed_semantics() {
-    let child = |tag: &str| DnsRule { rule_set: Some(OneOrMany::One(tag.into())), ..Default::default() };
+    let child = |tag: &str| DnsRule {
+        rule_set: Some(OneOrMany::One(tag.into())),
+        ..Default::default()
+    };
     let logical = |mode: &str| DnsRule {
-        type_field: Some("logical".into()), mode: Some(mode.into()),
+        type_field: Some("logical".into()),
+        mode: Some(mode.into()),
         rules: Some(vec![child("present"), child("missing")]),
-        action: Some("reject".into()), ..Default::default()
+        action: Some("reject".into()),
+        ..Default::default()
     };
     let defined = BTreeSet::from(["present".to_string()]);
     let mut pruned = BTreeSet::new();
     let mut and = logical("and");
-    assert!(!retain_defined_dns_rule_sets(&mut and, &defined, &mut pruned));
+    assert!(!retain_defined_dns_rule_sets(
+        &mut and,
+        &defined,
+        &mut pruned
+    ));
     assert!(pruned.contains("missing"));
     let mut or = logical("or");
     assert!(retain_defined_dns_rule_sets(&mut or, &defined, &mut pruned));
     assert_eq!(or.rules.as_ref().unwrap().len(), 1);
     assert_eq!(or.action.as_deref(), Some("reject"));
     let mut empty = logical("or");
-    assert!(!retain_defined_dns_rule_sets(&mut empty, &BTreeSet::new(), &mut pruned));
+    assert!(!retain_defined_dns_rule_sets(
+        &mut empty,
+        &BTreeSet::new(),
+        &mut pruned
+    ));
 }
 
 #[test]
@@ -2245,7 +2293,8 @@ fn dns_geosite_source_fallback_keeps_its_declared_format_across_modes() {
     std::fs::write(
         dir.path().join("geosite-cn.srs"),
         br#"{"version":3,"rules":[{"domain_suffix":["example.cn"]}]}"#,
-    ).unwrap();
+    )
+    .unwrap();
     for mode in [ProxyMode::Smart, ProxyMode::Global, ProxyMode::Direct] {
         let mut config = base_config();
         config.proxy_mode = mode;
@@ -2256,11 +2305,21 @@ fn dns_geosite_source_fallback_keeps_its_declared_format_across_modes() {
         config.custom_rules = vec![rule];
         let mut deps = deps_default();
         deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
-        deps.is_valid_srs_fn = |path| crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path));
+        deps.is_valid_srs_fn = |path| {
+            crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path))
+        };
         let built = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
         assert!(dns_references_rule_set(&built, "geosite-cn"), "{mode:?}");
-        let definitions: Vec<_> = built.route.as_ref().unwrap().rule_set.as_ref().unwrap()
-            .iter().filter(|rule_set| rule_set.tag == "geosite-cn").collect();
+        let definitions: Vec<_> = built
+            .route
+            .as_ref()
+            .unwrap()
+            .rule_set
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|rule_set| rule_set.tag == "geosite-cn")
+            .collect();
         assert_eq!(definitions.len(), 1, "{mode:?}");
         assert_eq!(definitions[0].format, "source");
     }

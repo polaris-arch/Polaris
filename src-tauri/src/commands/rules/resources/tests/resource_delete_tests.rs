@@ -95,7 +95,6 @@ fn deferred_delete_never_unlinks_the_catalog_cache() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 fn resource_rule(id: &str, enabled: bool) -> Value {
     json!({"id":id, "type":"ruleSet", "values":["res:res_a"], "action":"proxy", "enabled":enabled})
 }
@@ -118,10 +117,16 @@ fn dns_only_and_both_sides_are_counted_using_the_same_delete_scan_even_if_file_i
     cfg["trafficRules"] = json!([resource_rule("traffic-1", true)]);
     let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
     assert_eq!(resource_refs(&uc, "res_a").len(), 2);
-    assert!(matches!(plan_resource_delete(&cfg, "res_a", true), ResourceDeletePlan::Proceed));
+    assert!(matches!(
+        plan_resource_delete(&cfg, "res_a", true),
+        ResourceDeletePlan::Proceed
+    ));
     cfg["trafficRules"] = json!([resource_rule("traffic-1", false)]);
     cfg["dnsRules"] = json!([resource_rule("dns-1", false)]);
-    assert!(matches!(plan_resource_delete(&cfg, "res_a", false), ResourceDeletePlan::Proceed));
+    assert!(matches!(
+        plan_resource_delete(&cfg, "res_a", false),
+        ResourceDeletePlan::Proceed
+    ));
 }
 
 #[test]
@@ -133,7 +138,11 @@ fn shared_legacy_rule_arrays_are_counted_once_and_explicit_empty_arrays_override
         assert_eq!(resource_refs(&uc, "res_a").len(), 1, "{legacy}");
         cfg["trafficRules"] = json!([]);
         let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
-        assert_eq!(resource_refs(&uc, "res_a").len(), 1, "DNS fallback: {legacy}");
+        assert_eq!(
+            resource_refs(&uc, "res_a").len(),
+            1,
+            "DNS fallback: {legacy}"
+        );
         cfg["dnsRules"] = json!([]);
         let uc: UserConfig = serde_json::from_value(cfg).unwrap();
         assert!(resource_refs(&uc, "res_a").is_empty());

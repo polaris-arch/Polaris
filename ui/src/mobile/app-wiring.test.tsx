@@ -1259,13 +1259,17 @@ function App() {
   });
 
   it.each([
-    ['onStarted', '「应用中…」在起核落地后收场'],
-    ['onError', '重启失败时把原因写进条上（而不是永久转圈）'],
-    ['onLifecycle', '「立即应用」走的是后端自驱去抖重启，那条路径 started/error 一个都不发'],
-    ['applyStateOnLifecycle', '收场判定复用桌面那份纯逻辑（含「failed 带原因 / stopped 不判失败」）'],
+    ['onLifecycleReady', '先完成监听注册再 Apply，终态带本次 applyId/generation'],
+    ['applyStateOnLifecycle', '复用桌面归属判定：匹配 ready/failed，中间 stopped 不收场'],
   ])('`MobilePendingBar` 的 effect 里真的订了 `%s`（%s）', (callee) => {
     expect(effectInstalls(parse('./MobilePendingBar.tsx'), 'MobilePendingBar', callee)).toBe(true);
   });
+
+  it.each(['onStarted', 'onError'])(
+    '`MobilePendingBar` 不用无归属 `%s` 广播决定本次 Apply 的结局', (callee) => {
+      expect(effectInstalls(parse('./MobilePendingBar.tsx'), 'MobilePendingBar', callee)).toBe(false);
+    },
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

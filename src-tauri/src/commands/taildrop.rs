@@ -807,7 +807,10 @@ async fn write_stream_to(
     use std::io::Write;
 
     let mut staged = TaildropStagedFile::create(dest)?;
-    let file = staged.file.as_mut().expect("unpublished stage owns its file");
+    let file = staged
+        .file
+        .as_mut()
+        .expect("unpublished stage owns its file");
     let mut written = 0u64;
     while let Some(chunk) = stream
         .message()

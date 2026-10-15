@@ -866,7 +866,6 @@ fn the_refresh_transaction_prefers_the_auto_candidate_after_reconciling() {
     );
 }
 
-
 #[test]
 fn both_sentinels_survive_delete_changed_unchanged_and_auto_reselection() {
     for sentinel in ["__direct__", "__block__"] {
@@ -878,13 +877,20 @@ fn both_sentinels_survive_delete_changed_unchanged_and_auto_reselection() {
         apply_subscription_delete(&mut deleted, "sub1").unwrap();
         assert_eq!(deleted["selectedServerId"], sentinel);
         assert!(deleted["servers"].as_array().unwrap().is_empty());
-        for incoming in [vec![srv("A", "a.com", 443)], vec![srv("B", "b.com", 443)], vec![]] {
+        for incoming in [
+            vec![srv("A", "a.com", 443)],
+            vec![srv("B", "b.com", 443)],
+            vec![],
+        ] {
             let mut refreshed = initial.clone();
             reconcile_subscription_servers(&mut refreshed, "sub1", incoming, false, &[]);
             assert_eq!(refreshed["selectedServerId"], sentinel);
-            assert_eq!(prefer_auto_exit_after_removal(&mut refreshed, Some(sentinel), |_| {
-                panic!("explicit sentinel must not consult automatic selection")
-            }), None);
+            assert_eq!(
+                prefer_auto_exit_after_removal(&mut refreshed, Some(sentinel), |_| {
+                    panic!("explicit sentinel must not consult automatic selection")
+                }),
+                None
+            );
             assert_eq!(refreshed["selectedServerId"], sentinel);
         }
     }

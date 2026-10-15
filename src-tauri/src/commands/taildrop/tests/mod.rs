@@ -241,7 +241,6 @@ fn the_uri_legs_are_wired_through_the_tested_functions() {
     );
 }
 
-
 #[test]
 fn concurrent_staging_owns_unique_files_and_never_touches_a_part_neighbor() {
     use super::TaildropStagedFile;
@@ -280,7 +279,10 @@ fn failed_rename_and_dropped_unfinished_transfer_clean_only_owned_staging() {
     let staged = TaildropStagedFile::create(&dir.path().join("unfinished")).unwrap();
     let path = staged.path.clone();
     // Dropping a transfer future drops the same owner, including read/write error paths.
-    let never_polled = async move { let _owned = staged; std::future::pending::<()>().await; };
+    let never_polled = async move {
+        let _owned = staged;
+        std::future::pending::<()>().await;
+    };
     drop(never_polled);
     assert!(!path.exists());
 }
