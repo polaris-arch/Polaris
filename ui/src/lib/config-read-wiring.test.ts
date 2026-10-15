@@ -210,6 +210,31 @@ interface Site {
 
 const SITES: readonly Site[] = [
   {
+    file: 'components/screens/settings/use-config.ts',
+    shape: 'useAppStore.subscribe((state)=>{constpublication=state.confi…',
+    route: 'disk',
+    why: '基准类：共享权威发布仅更新实例 raw baseline，未结算 direct 意图重放之后再经既有 effectiveConfigOf 投影暂存。',
+  },
+  {
+    file: 'tray/TrayMenu.tsx',
+    shape: 'useAppStore((state)=>state.config)',
+    route: 'disk',
+    why: '后端入参：独立托盘只显示已保存执行列表，主窗 staged-only 实体不能进入切节点/测速执行集合。',
+  },
+  {
+    file: 'tray/TrayMenu.tsx',
+    shape: 'useAppStore.getState().config',
+    route: 'disk',
+    why: '对账类：status/config 并行刷新后按本窗最新权威配置判断 system-proxy-live applicability。',
+  },
+  {
+    file: 'tray/TrayMenu.tsx',
+    shape: 'useAppStore.subscribe((state,previous)=>{if(state.config&&st…',
+    route: 'disk',
+    why: '对账类：共享磁盘发布驱动托盘语言、主题、通知开关与 ancillary 状态刷新，不恢复主窗暂存。',
+  },
+
+  {
     file: "mobile/MeasurementLabel.tsx",
     shape: "useAppStore(state=>state.config?.servers.find(server=>server…",
     route: 'disk',
@@ -236,7 +261,7 @@ const SITES: readonly Site[] = [
 
   {
     file: 'store/app-store.ts',
-    shape: 'useAppStore.subscribe((state,previous)=>{if(state.config!==p…',
+    shape: 'useAppStore.subscribe((state,previous)=>{if(state.config===p…',
     route: 'disk',
     why: '对账类：所有完整磁盘配置发布使较早读取代次失效；引用比较只驱动排序，不显示或修改暂存配置',
   },
@@ -423,6 +448,13 @@ interface MirrorSite {
 }
 
 const MIRROR_SITES: readonly MirrorSite[] = [
+  {
+    file: 'store/app-store.ts',
+    shape: 'useAppStore.setState({config,configPublication:{epoch,reason…',
+    count: 1,
+    surface: 'operation',
+    why: '镜像自身：唯一权威发布把同一 raw config 的 servers/rules 同步写入扁平镜像，绝不从 staged 投影发布。',
+  },
   {
     file: 'components/screens/rules/RulesScreen.tsx',
     shape: "useAppStore.setState((state)=>{constcurrent=plane==='dns'?st…",

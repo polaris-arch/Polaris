@@ -100,8 +100,8 @@ def host_swift_controls(root, app_env):
          '-target', host + '-apple-macosx' + minimum, '-parse-as-library',
          ROOT / 'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
          ROOT / 'crates/tauri-plugin-polaris-ios/ios/Tests/DeviceConditionsTests.swift', '-o', unit], env=env,
-        log=root / 'original-swift-control-build.log')
-    run([unit], env=env, log=root / 'original-swift-control-run.log')
+        log=root / 'original-swift-control-build.log', capture='none')
+    run([unit], env=env, log=root / 'original-swift-control-run.log', capture='none')
 
 
 def main():
@@ -155,14 +155,14 @@ def main():
             producer_args += ['--' + name, getattr(args, name)]
         producer_args += ['--work', component_work, '--cache', cache]
         timed_phase('component-build-or-revalidate', run, producer_args,
-                    log=root / 'original-component-runner.log')
+                    log=root / 'original-component-runner.log', capture='none')
     link = root / 'apple-link-input.json'
     # A retained link context cannot be overwritten as a new App identity.
     if not link.exists():
         timed_phase('component-link-input', run, [sys_python(), ROOT / 'scripts/mobile-core/consume.py', 'apple-link',
             '--component', component_work / 'Libbox.xcframework', '--receipt', component_work / 'component-receipt.json',
             '--work', private_dir(root / 'link-work'), '--cache', cache, '--output', link],
-            log=root / 'original-link-input.log')
+            log=root / 'original-link-input.log', capture='none')
     with lease(root, cache, value):
         env = dict(os.environ, DEVELOPER_DIR=str(args.developer.resolve(strict=True)),
                    POLARIS_LIBBOX_GENERATION_ROOT=str(component_work), POLARIS_MOBILE_LINK_INPUT=str(link),
@@ -183,7 +183,7 @@ def main():
         # Compile before Xcode starts its build service so the reservation fd,
         # registered compiler group and child lifetime remain observable.
         timed_phase('rust-target-build', run, [sys_python(), ROOT / 'scripts/mobile-core/apple_rust.py', 'build'], env=env,
-            log=root / 'original-rust-entry.log')
+            log=root / 'original-rust-entry.log', capture='none')
         # Authored pure Swift controls compile on the same real toolchain as the App.
         # This entry runs only in the eventual single uniform Mac validation phase.
         if not args.simulator:
@@ -204,7 +204,7 @@ def main():
         else:
             command += ['CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO']
         timed_phase('app-extension-archive', run, command, env=env,
-                    log=root / 'original-app-extension-link.log')
+                    log=root / 'original-app-extension-link.log', capture='none')
         apps = list((archive / 'Products/Applications').glob('*.app'))
         require(len(apps) == 1 and not apps[0].is_symlink(), 'actual archived host App required')
         ipa = root / ('polaris-box-' + value['version'] + '-app-link-probe.ipa')

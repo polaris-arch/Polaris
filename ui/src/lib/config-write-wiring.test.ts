@@ -464,7 +464,7 @@ const SITES: readonly Site[] = [
   },
   {
     file: 'tray/TrayMenu.tsx',
-    callee: 'api.config.patch(',
+    callee: 'saveConfig(',
     route: 'direct',
     why: 'W-1 模式/出口与 W-2 系统代理接管：只提交本动作字段；托盘虽是独立 webview，未提交字段仍由后端锁内保留',
   },

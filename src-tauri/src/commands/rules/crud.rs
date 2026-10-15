@@ -231,8 +231,15 @@ pub fn rules_update(
         else {
             return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
         };
-        if !expected_rule_matches(&rules[idx], expected_rule.as_ref(), require_expected.unwrap_or(false)) {
-            return Decision::Skip(Err(("Rule changed; reopen and retry".to_string(), Some(ERR_RULE_CONFLICT))));
+        if !expected_rule_matches(
+            &rules[idx],
+            expected_rule.as_ref(),
+            require_expected.unwrap_or(false),
+        ) {
+            return Decision::Skip(Err((
+                "Rule changed; reopen and retry".to_string(),
+                Some(ERR_RULE_CONFLICT),
+            )));
         }
         rules[idx] = rule;
         sync_plane_order(cfg, order_key, &rules);
@@ -276,7 +283,11 @@ pub fn rules_delete(
         else {
             return Decision::Skip(Err(format!("Rule not found: {rule_id}")));
         };
-        if !expected_rule_matches(&rules[idx], expected_rule.as_ref(), require_expected.unwrap_or(false)) {
+        if !expected_rule_matches(
+            &rules[idx],
+            expected_rule.as_ref(),
+            require_expected.unwrap_or(false),
+        ) {
             return Decision::Skip(Err("Rule changed; reopen and retry".to_string()));
         }
         rules.remove(idx);

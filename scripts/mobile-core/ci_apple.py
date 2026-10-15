@@ -173,7 +173,7 @@ def prepare():
     print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env,
-        log=root / 'original-generator-prepare.log', observation_fd=sys.stdout.fileno(),
+        log=root / 'original-generator-prepare.log', capture='none', observation_fd=sys.stdout.fileno(),
         observation_phase='tool-prepare')
     paths = {'go': str(go), 'gomobile': str(tools / 'gomobile'), 'gobind': str(tools / 'gobind'),
              'developer': str(developer), 'source': str(root / 'fork-source'),
@@ -198,9 +198,9 @@ def build():
     # Their outputs are ignored generated UI/resources, not mutations of PBX/Cargo.
     with phase_timing('frontend-resources'):
         with lease(private_dir(root / 'frontend-work'), Path(paths['cache']), load()):
-            run(['node', ROOT / 'scripts/fetch-dashboard.mjs'], cwd=ROOT, log=root / 'original-dashboard.log',
+            run(['node', ROOT / 'scripts/fetch-dashboard.mjs'], cwd=ROOT, log=root / 'original-dashboard.log', capture='none',
                 observation_fd=sys.stdout.fileno(), observation_phase='frontend-dashboard')
-            run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log',
+            run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log', capture='none',
                 observation_fd=sys.stdout.fileno(), observation_phase='frontend-build')
             materialize_apple_resources()
     command = [sys.executable, ROOT / 'scripts/mobile-core/producer.py', 'apple']
@@ -211,7 +211,7 @@ def build():
         progress_fd = os.dup(sys.stdout.fileno())
         try:
             command += ['--progress-fd', str(progress_fd)]
-            run(command, cwd=ROOT, log=root / 'original-component-producer.log',
+            run(command, cwd=ROOT, log=root / 'original-component-producer.log', capture='none',
                 progress_fd=progress_fd, observation_phase='component-build-or-revalidate')
         finally:
             os.close(progress_fd)
@@ -283,7 +283,7 @@ def carrier(slot):
         progress_fd = os.dup(sys.stdout.fileno())
         try:
             command += ['--progress-fd', str(progress_fd)]
-            run(command, cwd=ROOT, log=root / ('original-' + slot + '.log'),
+            run(command, cwd=ROOT, log=root / ('original-' + slot + '.log'), capture='none',
                 progress_fd=progress_fd, observation_phase='carrier-command', observation_slot=slot)
         finally:
             os.close(progress_fd)

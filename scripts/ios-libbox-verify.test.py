@@ -36,6 +36,21 @@ def rejected(action, expected):
         raise AssertionError(f'Counterexample was accepted: {expected}')
 
 
+def require_case_ids(case_ids, expected_ids, label):
+    observed = list(case_ids)
+    expected = list(expected_ids)
+    if len(observed) != len(set(observed)) or len(expected) != len(set(expected)):
+        raise AssertionError(f'{label}: duplicate case ID')
+    if set(observed) != set(expected):
+        raise AssertionError(f'{label}: missing={sorted(set(expected) - set(observed))}; '
+                             f'extra={sorted(set(observed) - set(expected))}')
+
+
+def require_count_delta(before, after, expected, label):
+    if after - before != expected:
+        raise AssertionError(f'{label}: executed {after - before} successful cases; expected {expected}')
+
+
 def monitor_source_wiring(project, declaration):
     """Resolve file -> build file -> target Sources, plus the generated folder source."""
     project = re.sub(r'/\*.*?\*/', '', project, flags=re.S)
@@ -186,51 +201,92 @@ def preflight_tests():
                 rejected(action, expected)
                 count += 1
 
-    actions = [lambda: builder.verify(missing, missing, native=None),
-               builder.inputs, lambda: archive_checker.verify_archive(missing),
-               lambda: builder.main(['verify', '--framework', str(missing), '--receipt', str(missing)]),
-               lambda: archive_checker.main([str(missing)])]
+    active_entries = [
+        ('verify-direct', lambda: builder.verify(missing, missing, native=None)),
+        ('inputs', builder.inputs),
+        ('archive-verify', lambda: archive_checker.verify_archive(missing)),
+        ('verify-cli', lambda: builder.main(['verify', '--framework', str(missing), '--receipt', str(missing)])),
+        ('archive-cli', lambda: archive_checker.main([str(missing)])),
+    ]
+    require_case_ids((name for name, _ in active_entries),
+                     ('verify-direct', 'inputs', 'archive-verify', 'verify-cli', 'archive-cli'),
+                     'active entrypoints')
+    actions = [action for _, action in active_entries]
     no_side_effects(actions, 'Apple final artifact evidence not implemented')
     # Every legacy production route refuses before any policy/source/tool read,
     # component import, or mutable output. Historical reads remain independent.
-    retired = [lambda: builder.build(None),
-               lambda: builder.build(missing, offline=True, historical=True),
-               lambda: builder.build_component(SimpleNamespace()),
-               lambda: builder.main(['build']),
-               lambda: builder.main(['build', str(missing), '--historical', '--offline']),
-               lambda: builder.main(['build', '--phase', 'publish']),
-               lambda: builder.main(['build', '--component']),
-               lambda: builder.main(['build', '--component', '--phase', 'assemble',
-                                      '--build-policy', str(missing), '--evidence-dir', str(missing)]),
-               lambda: builder.main(['build', '--component', '--phase', 'publish',
-                                      '--tools', str(missing), '--output-root', str(missing)]),
-               lambda: builder.main(['build', '--component', '--historical'])]
+    retired_entries = [
+        ('build-api', lambda: builder.build(None)),
+        ('build-api-historical-offline', lambda: builder.build(missing, offline=True, historical=True)),
+        ('build-component-api', lambda: builder.build_component(SimpleNamespace())),
+        ('build-cli', lambda: builder.main(['build'])),
+        ('build-cli-historical-offline', lambda: builder.main(['build', str(missing), '--historical', '--offline'])),
+        ('build-cli-publish', lambda: builder.main(['build', '--phase', 'publish'])),
+        ('build-component-cli', lambda: builder.main(['build', '--component'])),
+        ('build-component-cli-assemble', lambda: builder.main([
+            'build', '--component', '--phase', 'assemble',
+            '--build-policy', str(missing), '--evidence-dir', str(missing)])),
+        ('build-component-cli-publish', lambda: builder.main([
+            'build', '--component', '--phase', 'publish',
+            '--tools', str(missing), '--output-root', str(missing)])),
+        ('build-component-cli-historical', lambda: builder.main(['build', '--component', '--historical'])),
+    ]
+    require_case_ids((name for name, _ in retired_entries), (
+        'build-api', 'build-api-historical-offline', 'build-component-api', 'build-cli',
+        'build-cli-historical-offline', 'build-cli-publish', 'build-component-cli',
+        'build-component-cli-assemble', 'build-component-cli-publish', 'build-component-cli-historical',
+    ), 'retired entrypoints')
+    forbidden_hooks = [
+        ('builder.inputs', builder, 'inputs'),
+        ('builder.final_preflight', builder, 'final_preflight'),
+        ('builder.artifact_preflight', builder, 'artifact_preflight'),
+        ('builder.component_module', builder, 'component_module'),
+        ('builder.source_helpers', builder, 'source_helpers'),
+        ('builder.source_check', builder, 'source_check'),
+        ('builder.approved_component_inputs', builder, 'approved_component_inputs'),
+        ('builder.run', builder, 'run'),
+        ('subprocess.run', builder.subprocess, 'run'),
+        ('platform.system', builder.platform, 'system'),
+        ('platform.machine', builder.platform, 'machine'),
+        ('shutil.which', shutil, 'which'), ('shutil.copyfile', shutil, 'copyfile'),
+        ('tempfile.TemporaryDirectory', tempfile, 'TemporaryDirectory'),
+        ('Path.read_text', Path, 'read_text'), ('Path.read_bytes', Path, 'read_bytes'),
+        ('Path.open', Path, 'open'), ('Path.mkdir', Path, 'mkdir'),
+        ('Path.write_text', Path, 'write_text'), ('Path.write_bytes', Path, 'write_bytes'),
+    ]
+    require_case_ids((name for name, _, _ in forbidden_hooks), (
+        'builder.inputs', 'builder.final_preflight', 'builder.artifact_preflight',
+        'builder.component_module', 'builder.source_helpers', 'builder.source_check',
+        'builder.approved_component_inputs', 'builder.run', 'subprocess.run',
+        'platform.system', 'platform.machine', 'shutil.which', 'shutil.copyfile',
+        'tempfile.TemporaryDirectory', 'Path.read_text', 'Path.read_bytes', 'Path.open',
+        'Path.mkdir', 'Path.write_text', 'Path.write_bytes',
+    ), 'retired forbidden hooks')
     with ExitStack() as stack:
-        forbidden = []
-        for owner, name in [(builder, 'inputs'), (builder, 'final_preflight'),
-                            (builder, 'artifact_preflight'), (builder, 'component_module'),
-                            (builder, 'source_helpers'), (builder, 'source_check'),
-                            (builder, 'approved_component_inputs'), (builder, 'run'),
-                            (builder.subprocess, 'run'), (builder.platform, 'system'),
-                            (builder.platform, 'machine'), (shutil, 'which'), (shutil, 'copyfile'),
-                            (tempfile, 'TemporaryDirectory'), (Path, 'read_text'),
-                            (Path, 'read_bytes'), (Path, 'open'), (Path, 'mkdir'),
-                            (Path, 'write_text'), (Path, 'write_bytes')]:
-            forbidden.append(stack.enter_context(mock.patch.object(owner, name,
-                side_effect=AssertionError('Retired production reached ' + name))))
-        for action in retired:
+        forbidden = {case_id: stack.enter_context(mock.patch.object(owner, name,
+                     side_effect=AssertionError('Retired production reached ' + name)))
+                     for case_id, owner, name in forbidden_hooks}
+        retired_before = count
+        for _, action in retired_entries:
             rejected(action, builder.LEGACY_BUILD_RETIRED)
             count += 1
-        assert all(call.call_count == 0 for call in forbidden)
+        require_count_delta(retired_before, count, 10, 'retired entrypoints')
+        for case_id, observed in forbidden.items():
+            if observed.call_count != 0:
+                raise AssertionError(f'Retired production reached {case_id}: {observed.call_count}')
     manifest, version = builder.inputs(historical=True)
     historical_paths = [builder.MANIFEST, *[builder.PATCH_DIR / row['file'] for row in manifest['patches']]]
     historical_hashes = {path: builder.digest(path.read_bytes()) for path in historical_paths}
+    historical_inputs_before = count
     with mock.patch.object(builder, 'run', side_effect=AssertionError('Historical input check executed a tool')), \
             redirect_stdout(io.StringIO()) as output:
         builder.main(['check-inputs', '--historical'])
-    assert 'historical-only six-patch hashes and source manifest' in output.getvalue()
-    assert historical_hashes == {path: builder.digest(path.read_bytes()) for path in historical_paths}
+    builder.require('historical-only six-patch hashes and source manifest' in output.getvalue(),
+                    'historical check-inputs summary differs')
+    builder.require(historical_hashes == {path: builder.digest(path.read_bytes()) for path in historical_paths},
+                    'historical check-inputs changed source bytes')
     count += 1
+    require_count_delta(historical_inputs_before, count, 1, 'historical check-inputs')
     shared, core, policy = builder.final_preflight()
     assert len(shared['patches']) == 8 and shared['dependencyPatches'] == []
     assert core['sourceBuild']['dependencyModules'] == [] and policy['moduleInventory']['patched'] == []
@@ -250,48 +306,105 @@ def preflight_tests():
     with tempfile.TemporaryDirectory(prefix='polaris-ios-preflight-test-') as temp:
         root = Path(temp)
         declaration = root / 'apple-source-policy.json'
-        cases = []
+        policy_cases = []
         for field in builder.COMMON_FIELDS:
             bad = copy.deepcopy(policy)
             bad['commonSource'][field] = 'wrong'
-            cases.append((bad, 'Apple common source pins differ'))
+            policy_cases.append((f'commonSource.{field}', bad, 'Apple common source pins differ'))
         for field in policy['binding']:
             bad = copy.deepcopy(policy)
             bad['binding'][field] = 'wrong'
-            cases.append((bad, 'binding/tags/deployment'))
+            policy_cases.append((f'binding.{field}', bad, 'binding/tags/deployment'))
         for field, value in [('trimpath', 1), ('buildVCS', 0)]:
             bad = copy.deepcopy(policy)
             bad['binding'][field] = value
-            cases.append((bad, 'binding/tags/deployment'))
+            policy_cases.append((f'binding.{field}-wrong-type', bad, 'binding/tags/deployment'))
         for name, target in policy['targets'].items():
             for field in target:
                 bad = copy.deepcopy(policy)
                 bad['targets'][name][field] = 'wrong'
-                cases.append((bad, 'target policy'))
-        for field, value, expected in [('schema', 'unknown', 'policy scope'),
-                                       ('evidenceScope', 'final', 'policy scope'),
-                                       ('sourceHelperSha256', '0' * 64, 'helper hash'),
-                                       ('moduleInventory', {'patched': [], 'transport': []}, 'module inventory'),
-                                       ('moduleInventory', {**policy['moduleInventory'], 'patched': ['example.com/patched']}, 'module inventory'),
-                                       ('unresolvedArtifactEvidence', [], 'artifact evidence requirements')]:
+                policy_cases.append((f'target.{name}.{field}', bad, 'target policy'))
+        for case_id, field, value, expected in [
+                ('top.schema', 'schema', 'unknown', 'policy scope'),
+                ('top.evidenceScope', 'evidenceScope', 'final', 'policy scope'),
+                ('top.sourceHelperSha256', 'sourceHelperSha256', '0' * 64, 'helper hash'),
+                ('top.moduleInventory-empty', 'moduleInventory', {'patched': [], 'transport': []}, 'module inventory'),
+                ('top.moduleInventory-patched', 'moduleInventory',
+                 {**policy['moduleInventory'], 'patched': ['example.com/patched']}, 'module inventory'),
+                ('top.unresolvedArtifactEvidence', 'unresolvedArtifactEvidence', [], 'artifact evidence requirements')]:
             bad = copy.deepcopy(policy)
             bad[field] = value
-            cases.append((bad, expected))
+            policy_cases.append((case_id, bad, expected))
         for field in ('constructedBoxCleanup', 'exactCleanupEnabled', 'noOwnerCleanupEnabled'):
             bad = copy.deepcopy(policy)
             bad['validationCleanupContract'][field] = True
-            cases.append((bad, 'cleanup contract'))
+            policy_cases.append((f'cleanup.{field}-enabled', bad, 'cleanup contract'))
         for field in ('exactCleanupEnabled', 'noOwnerCleanupEnabled'):
             bad = copy.deepcopy(policy)
             bad['validationCleanupContract'][field] = 0
-            cases.append((bad, 'cleanup contract'))
+            policy_cases.append((f'cleanup.{field}-wrong-type', bad, 'cleanup contract'))
         bad = copy.deepcopy(policy)
         bad['carrierVerified'] = True
-        cases.append((bad, 'policy fields'))
+        policy_cases.append(('carrierVerified', bad, 'policy fields'))
+        # Frozen complete IDs, independent of the runtime loops and manifest key inventory.
+        require_case_ids((case_id for case_id, _, _ in policy_cases), (
+            'commonSource.sourceManifestSha256',
+            'commonSource.provisionerSha256',
+            'commonSource.sourceReceiptFingerprint',
+            'commonSource.moduleGraphSha256',
+            'commonSource.patchedSourceTree',
+            'commonSource.buildTree',
+            'commonSource.version',
+            'commonSource.dependencyModules',
+            'commonSource.transportPins',
+            'commonSource.graphScope',
+            'commonSource.mainGoModSha256',
+            'commonSource.mainGoSumSha256',
+            'binding.target',
+            'binding.libname',
+            'binding.trimpath',
+            'binding.buildVCS',
+            'binding.gomobileVersion',
+            'binding.iosMinimumVersion',
+            'binding.appMinimumVersion',
+            'binding.buildTags',
+            'binding.nonMacOSTags',
+            'binding.trimpath-wrong-type',
+            'binding.buildVCS-wrong-type',
+            'target.ios-arm64.goos',
+            'target.ios-arm64.goarch',
+            'target.ios-arm64.cgo',
+            'target.ios-arm64.sdk',
+            'target.ios-arm64.variant',
+            'target.ios-arm64-simulator.goos',
+            'target.ios-arm64-simulator.goarch',
+            'target.ios-arm64-simulator.cgo',
+            'target.ios-arm64-simulator.sdk',
+            'target.ios-arm64-simulator.variant',
+            'target.ios-x86_64-simulator.goos',
+            'target.ios-x86_64-simulator.goarch',
+            'target.ios-x86_64-simulator.cgo',
+            'target.ios-x86_64-simulator.sdk',
+            'target.ios-x86_64-simulator.variant',
+            'top.schema',
+            'top.evidenceScope',
+            'top.sourceHelperSha256',
+            'top.moduleInventory-empty',
+            'top.moduleInventory-patched',
+            'top.unresolvedArtifactEvidence',
+            'cleanup.constructedBoxCleanup-enabled',
+            'cleanup.exactCleanupEnabled-enabled',
+            'cleanup.noOwnerCleanupEnabled-enabled',
+            'cleanup.exactCleanupEnabled-wrong-type',
+            'cleanup.noOwnerCleanupEnabled-wrong-type',
+            'carrierVerified',
+        ), 'policy mutations')
         with mock.patch.object(builder, 'APPLE_POLICY', declaration):
-            for bad, expected in cases:
+            policy_before = count
+            for _, bad, expected in policy_cases:
                 declaration.write_text(json.dumps(bad))
                 no_side_effects([builder.final_preflight, *actions], expected)
+            require_count_delta(policy_before, count, 300, 'policy mutations across final_preflight and five active entries')
             declaration.write_text(json.dumps(policy))
             assert builder.final_preflight() == (shared, core, policy)
             no_side_effects(actions, 'Apple final artifact evidence not implemented')
@@ -299,20 +412,33 @@ def preflight_tests():
         common = root / 'common'
         shutil.copytree(builder.SHARED_MANIFEST.parent, common)
         shared_path = common / 'source-manifest.json'
+        shared_cases = [
+            ('patches-truncated', 'patches', shared['patches'][:-1]),
+            ('patches-reversed', 'patches', list(reversed(shared['patches']))),
+            ('dependency-patches-injected', 'dependencyPatches', [{'name': 'patched', 'module': 'example.com/patched'}]),
+            ('source-commit-zero', 'sourceCommit', '0' * 40),
+            ('monitor-patch-appended', None, None),
+        ]
+        require_case_ids((case_id for case_id, _, _ in shared_cases), (
+            'patches-truncated', 'patches-reversed', 'dependency-patches-injected',
+            'source-commit-zero', 'monitor-patch-appended',
+        ), 'shared corruptions')
         with mock.patch.object(builder, 'SHARED_MANIFEST', shared_path):
-            for field, value in [('patches', shared['patches'][:-1]),
-                                 ('patches', list(reversed(shared['patches']))),
-                                 ('dependencyPatches', [{'name': 'patched', 'module': 'example.com/patched'}]),
-                                 ('sourceCommit', '0' * 40)]:
-                assert value != shared[field]
-                changed = copy.deepcopy(shared)
-                changed[field] = value
-                shared_path.write_text(json.dumps(changed))
-                no_side_effects([builder.final_preflight, *actions], 'shared manifest/provider hash differs')
-            shared_path.write_bytes(builder.ROOT.joinpath('scripts/libbox-patches/source-manifest.json').read_bytes())
-            patch = common / 'default-monitor-isolation.patch'
-            patch.write_bytes(patch.read_bytes() + b'\n')
-            no_side_effects([builder.final_preflight, *actions], 'ordered common patch hash differs')
+            shared_before = count
+            for _, field, value in shared_cases:
+                if field is None:
+                    shared_path.write_bytes(builder.ROOT.joinpath('scripts/libbox-patches/source-manifest.json').read_bytes())
+                    patch = common / 'default-monitor-isolation.patch'
+                    patch.write_bytes(patch.read_bytes() + b'\n')
+                    expected = 'ordered common patch hash differs'
+                else:
+                    builder.require(value != shared[field], 'shared corruption must change the actual input')
+                    changed = copy.deepcopy(shared)
+                    changed[field] = value
+                    shared_path.write_text(json.dumps(changed))
+                    expected = 'shared manifest/provider hash differs'
+                no_side_effects([builder.final_preflight, *actions], expected)
+            require_count_delta(shared_before, count, 30, 'shared corruptions across final_preflight and five active entries')
         # The production preparation entry calls the real shared-provider API.
         # Stub execution proves dispatch/arguments and receipt checks, never real source replay.
         helper = builder.source_helpers()
@@ -416,48 +542,71 @@ def preflight_tests():
             receipt['toolchain'][name] = dict(version=manifest['gomobileVersion'], sha256='1' * 64,
                 buildInfo=f'github.com/sagernet/gomobile\t{manifest["gomobileVersion"]}\t')
         receipt_path = root / 'receipt.json'
+        historical_receipt_before = count
+        historical_receipt_ids = []
         with mock.patch.object(builder, 'framework_evidence', return_value={}):
             receipt_path.write_text(json.dumps(receipt))
             before = receipt_path.read_bytes()
-            assert builder.verify(missing, receipt_path, historical=True) == receipt
-            assert receipt_path.read_bytes() == before
+            builder.require(builder.verify(missing, receipt_path, historical=True) == receipt,
+                            'legacy historical receipt changed')
+            builder.require(receipt_path.read_bytes() == before, 'legacy historical receipt bytes changed')
             count += 1
-            for key in ('buildScriptSha256', 'buildEntrySha256'):
+            historical_receipt_ids.append('legacy-build-only')
+            legacy_hash_cases = [('legacy-script-zero', 'buildScriptSha256'),
+                                 ('legacy-entry-zero', 'buildEntrySha256')]
+            for case_id, key in legacy_hash_cases:
                 bad = copy.deepcopy(receipt)
                 bad[key] = '0' * 64
                 receipt_path.write_text(json.dumps(bad))
                 rejected(lambda: builder.verify(missing, receipt_path, historical=True), key)
                 count += 1
+                historical_receipt_ids.append(case_id)
             new = copy.deepcopy(receipt)
             new['evidenceScope'] = 'historical-only'
             new['buildScriptSha256'] = builder.HISTORICAL_ONLY_SCRIPT_SHA256
             new['buildEntrySha256'] = builder.HISTORICAL_ENTRY_SHA256
             receipt_path.write_text(json.dumps(new))
             original_historical = receipt_path.read_bytes()
-            assert builder.verify(missing, receipt_path, historical=True) == new
-            assert receipt_path.read_bytes() == original_historical
+            builder.require(builder.verify(missing, receipt_path, historical=True) == new,
+                            'historical-only receipt changed')
+            builder.require(receipt_path.read_bytes() == original_historical, 'historical-only receipt bytes changed')
             count += 1
+            historical_receipt_ids.append('historical-only')
             # Retirement cannot manufacture a historical producer identity.
-            for producer in (builder.digest(builder.SCRIPT.read_bytes()), '0' * 64,
-                             builder.HISTORICAL_SCRIPT_SHA256):
+            historical_producer_cases = [
+                ('historical-producer-current-script', builder.digest(builder.SCRIPT.read_bytes())),
+                ('historical-producer-zero', '0' * 64),
+                ('historical-producer-legacy', builder.HISTORICAL_SCRIPT_SHA256),
+            ]
+            for case_id, producer in historical_producer_cases:
                 bad = copy.deepcopy(new)
                 bad['buildScriptSha256'] = producer
                 receipt_path.write_text(json.dumps(bad))
                 rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildScriptSha256')
                 count += 1
+                historical_receipt_ids.append(case_id)
             bad = copy.deepcopy(new)
             bad['buildEntrySha256'] = '0' * 64
             receipt_path.write_text(json.dumps(bad))
             rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildEntrySha256')
             count += 1
+            historical_receipt_ids.append('historical-entry-zero')
             new['evidenceScope'] = 'build-only'
             receipt_path.write_text(json.dumps(new))
             rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildScriptSha256')
             count += 1
+            historical_receipt_ids.append('historical-build-only')
             new['evidenceScope'] = 'final'
             receipt_path.write_text(json.dumps(new))
             rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'evidence scope')
             count += 1
+            historical_receipt_ids.append('historical-final')
+        require_case_ids(historical_receipt_ids, (
+            'legacy-build-only', 'legacy-script-zero', 'legacy-entry-zero', 'historical-only',
+            'historical-producer-current-script', 'historical-producer-zero', 'historical-producer-legacy',
+            'historical-entry-zero', 'historical-build-only', 'historical-final',
+        ), 'historical receipt group')
+        require_count_delta(historical_receipt_before, count, 10, 'historical receipt group')
 
     # Both checked-in hooks explicitly verify the component prerequisite. The
     # unqualified final artifact gate remains closed and is tested above.

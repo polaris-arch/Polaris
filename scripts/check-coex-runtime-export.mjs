@@ -57,6 +57,79 @@ export function stateDifferences(expected, actual, path = '$') {
   }
   return [{ path, kind: 'changed', expected, actual }];
 }
+// This is a narrow eligibility policy for the controlled CI export, not a product
+// clock guarantee. The real decoder intentionally permits Unix display-clock rollback.
+export const TEMPORAL_POLICY_VERSION = 'coex-ci-acquisition-unix-v1';
+export const TEMPORAL_STATES = ['latest', 'staleBusy', 'windowsPartial', 'windowsUnavailable'];
+const UNIX_FIELDS = ['startedAtUnixMillis', 'endedAtUnixMillis'];
+export const TEMPORAL_PATHS = TEMPORAL_STATES.flatMap(state => UNIX_FIELDS.map(field =>
+  `$["${state}"]["report"]["value"]["acquisition"]["${field}"]`));
+export function compareExportStates(historical, current, execution) {
+  const differences = stateDifferences(historical, current);
+  const temporalPaths = new Set(TEMPORAL_PATHS);
+  const nonTemporalDifferences = differences.filter(diff => !temporalPaths.has(diff.path) || diff.kind !== 'changed');
+  const result = {
+    policyVersion: TEMPORAL_POLICY_VERSION,
+    scope: 'controlled CI export evidence only; no product clock monotonicity claim',
+    allowedPaths: [...TEMPORAL_PATHS], status: 'failed', stateDifferences: differences,
+    acceptedTemporalDiffs: [], rejectedDifferences: [], errors: [],
+  };
+  try {
+    validateStates(historical, 'historical states');
+    validateStates(current, 'current states');
+    requireThat(execution && Number.isSafeInteger(execution.startedAtMs) && execution.startedAtMs >= 0
+      && Number.isSafeInteger(execution.finishedAtMs) && execution.finishedAtMs >= execution.startedAtMs,
+    'temporal policy requires a safe, ordered execution window');
+    const low = BigInt(execution.startedAtMs); const high = BigInt(execution.finishedAtMs);
+    result.executionWindow = { startedAtMs: execution.startedAtMs, finishedAtMs: execution.finishedAtMs };
+    const uint64 = (value, label) => {
+      requireThat(typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value)
+        && BigInt(value) <= 18446744073709551615n, `${label}: noncanonical uint64 decimal string`);
+      return BigInt(value);
+    };
+    const inspect = (states, label, withinWindow) => {
+      const acquisitions = {};
+      for (const name of TEMPORAL_STATES) {
+        const report = states[name].report;
+        requireThat(record(report) && report.status === 'known' && record(report.value)
+          && record(report.value.acquisition), `${label}.${name}: missing known acquisition`);
+        const acquisition = report.value.acquisition;
+        const values = UNIX_FIELDS.map(field => {
+          const value = uint64(acquisition[field], `${label}.${name}.${field}`);
+          if (withinWindow) requireThat(value >= low && value <= high, `${name}.${field}: outside this execution window`);
+          return value;
+        });
+        requireThat(values[0] <= values[1], `${label}.${name}: acquisition start follows end`);
+        acquisitions[name] = { raw: acquisition, start: values[0], end: values[1] };
+      }
+      requireThat(canonical(acquisitions.latest.raw) === canonical(acquisitions.staleBusy.raw),
+        `${label}: latest/staleBusy must retain the same acquisition`);
+      // The unchanged export test finishes latest, then samples Windows partial,
+      // then Windows unavailable. Equal milliseconds are allowed, inverted order is not.
+      requireThat(acquisitions.latest.end <= acquisitions.windowsPartial.start
+        && acquisitions.windowsPartial.end <= acquisitions.windowsUnavailable.start,
+      `${label}: controlled acquisition sequence is reversed`);
+    };
+    inspect(historical, 'historical', false);
+    inspect(current, 'current', true);
+    result.acceptedTemporalDiffs = differences.filter(diff => temporalPaths.has(diff.path) && diff.kind === 'changed');
+    result.validatedConstraints = ['eight canonical uint64 strings', 'all eight in this execution window',
+      'each start <= end', 'latest/staleBusy identical acquisition', 'latest then Windows partial then Windows unavailable'];
+  } catch (error) { result.errors.push(String(error)); }
+  // Every raw row has one outcome. A failed shared temporal qualification rejects
+  // all otherwise-allowlisted rows, retaining its exact constraint failure reasons.
+  const accepted = new Set(result.acceptedTemporalDiffs);
+  result.rejectedDifferences = differences.filter(diff => !accepted.has(diff)).map(diff => ({
+    ...diff,
+    ...(!temporalPaths.has(diff.path) ? { reason: 'outside exact temporal allowlist' }
+      : diff.kind !== 'changed' ? { reason: 'structural change at temporal path' }
+        : { reason: 'shared temporal qualification failed', constraintErrors: [...result.errors] }),
+  }));
+  if (nonTemporalDifferences.length) result.errors.push('non-temporal or structural field differences remain');
+  if (!result.errors.length) result.status = 'passed';
+  return result;
+}
+
 function exactKeys(value, keys, label) {
   requireThat(record(value), `${label}: expected object`);
   requireThat(canonical(Object.keys(value).sort()) === canonical([...keys].sort()), `${label}: incomplete or extra keys`);
@@ -222,7 +295,7 @@ export async function capture(root, scriptPath, env) {
 export async function verify(root, env) {
   const directory = evidenceDirectory(env);
   const errors = [];
-  const result = { status: 'failed', newSerializerExecution: false, errors, stateDifferences: [] };
+  const result = { status: 'failed', newSerializerExecution: false, errors, stateDifferences: [], acceptedTemporalDiffs: [] };
   const attempt = operation => { try { return operation(); } catch (error) { errors.push(String(error)); return undefined; } };
   const before = attempt(() => jsonFile(join(directory, 'before.json')));
   const historical = attempt(() => jsonFile(join(directory, 'historical-fixture.json')));
@@ -256,13 +329,18 @@ export async function verify(root, env) {
     result.newSerializerExecution = true;
   });
   if (historical && exported) attempt(() => {
+    // Classify all raw rows before shape/provenance checks can reject this export.
+    const comparison = compareExportStates(historical.states, exported.states, execution);
+    const { stateDifferences: rawDifferences, acceptedTemporalDiffs, ...temporalPolicy } = comparison;
+    result.stateDifferences = rawDifferences;
+    result.acceptedTemporalDiffs = acceptedTemporalDiffs;
+    result.temporalPolicy = temporalPolicy;
     validateStates(exported.states, 'current states');
     validateStates(historical.states, 'historical states');
     requireThat(typeof exported.provenance === 'string' && exported.provenance.length > 0, 'missing native export provenance');
     result.originalStatesCanonicalSha256 = sha256(canonical(historical.states));
     result.currentStatesCanonicalSha256 = sha256(canonical(exported.states));
-    result.stateDifferences = stateDifferences(historical.states, exported.states);
-    requireThat(result.stateDifferences.length === 0, 'current serialized states differ from historical states; review the complete field diff');
+    requireThat(comparison.status === 'passed', `current serialized states violate ${TEMPORAL_POLICY_VERSION}: ${comparison.errors.join('; ')}`);
   });
   if (exported && before && after) {
     try {
@@ -276,6 +354,7 @@ export async function verify(root, env) {
   }
   if (!result.decoder && !errors.length) errors.push('decoder execution is required');
   writeJson(join(directory, 'state-diff.json'), result.stateDifferences);
+  writeJson(join(directory, 'accepted-temporal-diff.json'), result.acceptedTemporalDiffs);
   if (!errors.length && result.newSerializerExecution && result.decoder?.status === 'passed') result.status = 'passed';
   writeJson(join(directory, 'verification.json'), result);
   requireThat(result.status === 'passed', `Coex export verification failed: ${errors.join('; ')}`);

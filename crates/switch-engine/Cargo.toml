@@ -12,6 +12,8 @@ polaris-config-engine = { path = "../config-engine" }
 polaris-core-supervisor = { path = "../core-supervisor" }
 # trait 内 async fn（ManagementApi / ConnectionsFeed 的异步签名）。
 async-trait = { workspace = true }
+# 精准断连：复用 runtime 的有界、无 spawn future stream。
+futures = { workspace = true }
 # 异步运行时：DebouncedRestart 的 timer + spawn + mpsc。
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 # 错误类型。

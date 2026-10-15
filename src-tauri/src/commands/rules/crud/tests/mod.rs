@@ -227,7 +227,6 @@ fn rule_writes_check_network_profile_ref_inside_the_transaction() {
     }
 }
 
-
 #[test]
 fn guarded_rule_writes_compare_exact_entity_and_fail_closed_on_null() {
     let rule = rules(&["r"]).remove(0);
@@ -242,7 +241,11 @@ fn guarded_rule_writes_compare_exact_entity_and_fail_closed_on_null() {
         let mut cfg = json!({});
         write_plane_rules(&mut cfg, collection, vec![rule.clone()]);
         let before = plane_rules(&cfg, collection);
-        write_plane_rules(&mut cfg, collection, vec![changed.clone(), rules(&["new"]).remove(0)]);
+        write_plane_rules(
+            &mut cfg,
+            collection,
+            vec![changed.clone(), rules(&["new"]).remove(0)],
+        );
         let after = plane_rules(&cfg, collection);
         assert!(!expected_rule_matches(&after[0], Some(&before[0]), true));
         assert!(expected_rule_matches(&after[1], Some(&after[1]), true));
@@ -251,15 +254,110 @@ fn guarded_rule_writes_compare_exact_entity_and_fail_closed_on_null() {
     }
 }
 
+/// Parse only the bounded writer closure, on a surface with strings/comments
+/// masked before whitespace removal. Formatting cannot change this predicate.
+fn guarded_mutation_is_inside_writer(body: &str, mutation: &str) -> bool {
+    fn closing_brace(code: &str, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, byte) in code.as_bytes()[open..].iter().copied().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    let surface = polaris_source_probe::mask_comments_and_strings(body);
+    let compact: String = surface.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = compact.replace(",)", ")");
+    let writer = "state.config().update(|cfg|{";
+    if compact.matches(writer).count() != 1 {
+        return false;
+    }
+    let open = compact.find(writer).unwrap() + writer.len() - 1;
+    let Some(close) = closing_brace(&compact, open) else {
+        return false;
+    };
+    let closure = &compact[open + 1..close];
+    let guard = "if!expected_rule_matches(&rules[idx],expected_rule.as_ref(),require_expected.unwrap_or(false)){";
+    if compact.matches(guard).count() != 1 || closure.matches(guard).count() != 1 {
+        return false;
+    }
+    let guard_open = closure.find(guard).unwrap() + guard.len() - 1;
+    let Some(guard_close) = closing_brace(closure, guard_open) else {
+        return false;
+    };
+    let failure = &closure[guard_open + 1..guard_close];
+    let mutation: String = mutation.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.matches(mutation.as_str()).count() == 1
+        && closure.matches(mutation.as_str()).count() == 1
+        && guard_close < closure.find(mutation.as_str()).unwrap()
+        && failure.starts_with("returnDecision::Skip(Err(")
+        && failure.ends_with(';')
+        && failure.matches(';').count() == 1
+}
+
 #[test]
 fn guarded_comparison_is_inside_both_writer_transactions_before_mutation() {
-    let source = include_str!("../../crud.rs");
-    for (name, mutation) in [("rules_update", "rules[idx] = rule"), ("rules_delete", "rules.remove(idx)")] {
-        let body = top_level_fn_body(source, &format!("pub fn {name}("));
-        let writer = body.find("state.config().update(|cfg|").unwrap();
-        let compare = body.find("expected_rule_matches(&rules[idx]").unwrap();
-        let write = body.find(mutation).unwrap();
-        assert!(writer < compare && compare < write);
+    let source = crate_code("commands/rules/crud.rs");
+    for (name, mutation) in [
+        ("rules_update", "rules[idx] = rule"),
+        ("rules_delete", "rules.remove(idx)"),
+    ] {
+        let body = top_level_fn_body(&source, &format!("pub fn {name}("));
+        assert!(guarded_mutation_is_inside_writer(&body, mutation), "{name}");
+    }
+}
+
+#[test]
+fn guarded_writer_source_accepts_multiline_and_rejects_comparison_outside_or_after_mutation() {
+    let guard = r#"if !expected_rule_matches(
+            &rules[idx],
+            expected_rule.as_ref(),
+            require_expected.unwrap_or(false),
+        ) {
+            return Decision::Skip(Err("Rule changed; reopen and retry".to_string()));
+        }"#;
+    for (name, mutation) in [
+        ("rules_update", "rules[idx] = rule;"),
+        ("rules_delete", "rules.remove(idx);"),
+    ] {
+        let source = |outside: &str, inside: &str| {
+            format!(
+            "pub fn {name}() {{\n    {outside}\n    state.config().update(|cfg| {{\n        {inside}\n    }})\n}}\n"
+        )
+        };
+        let probe = |source: &str| {
+            let body = top_level_fn_body(source, &format!("pub fn {name}("));
+            guarded_mutation_is_inside_writer(&body, mutation.trim_end_matches(';'))
+        };
+        let valid = source("", &format!("{guard}\n{mutation}"));
+        assert!(probe(&valid), "multiline {name} positive control");
+        assert!(
+            !probe(&source(guard, mutation)),
+            "comparison moved outside writer"
+        );
+        assert!(
+            !probe(&source("", &format!("{mutation}\n{guard}"))),
+            "comparison moved after mutation"
+        );
+        for (old, replacement) in [
+            ("&rules[idx]", "&rules[0]"),
+            ("expected_rule.as_ref()", "None"),
+            ("require_expected.unwrap_or(false)", "true"),
+            ("return Decision::Skip(Err", "record(Err"),
+        ] {
+            assert!(
+                !probe(&valid.replace(old, replacement)),
+                "lost guard contract: {old}"
+            );
+        }
     }
 }
 
@@ -274,37 +372,79 @@ fn concurrent_guarded_edits_have_one_winner_under_the_real_config_writer_fence()
         let manager = Arc::new(ConfigManager::new(directory.clone()));
         manager.update(|cfg| {
             let rule = if collection == "dnsRules" {
-                json!({"id":"r","type":"domain","values":["a.example"],"enabled":true,
-                    "effects":{"dns":{"action":{"type":"fakeIp"}}}})
+                json!({"id":"r","type":"domain","values":["a.example"],"action":"proxy","enabled":true,
+                    "effects":{"dns":{"enabled":true,"resolver":"inherit","answerMode":"fakeIp",
+                        "action":{"type":"fakeIp"}}}})
             } else {
-                json!({"id":"r","type":"domain","values":["a.example"],"action":"proxy","enabled":true})
+                json!({"id":"r","type":"domain","values":["a.example"],"action":"proxy","enabled":true,
+                    "effects":{"route":{"enabled":true,"action":"proxy"}}})
             };
             write_plane_rules(cfg, collection, vec![rule]);
             Decision::Write(())
         }).unwrap();
-        let snapshot = plane_rules(&manager.load_full().unwrap(), collection)[0].clone();
+        let reloaded = manager.load_full().unwrap();
+        let canonical = plane_rules(&reloaded, collection);
+        assert_eq!(
+            canonical.len(),
+            1,
+            "{collection} must survive the real save/reload"
+        );
+        assert_eq!(canonical[0]["id"], "r");
+        assert_eq!(canonical[0]["action"], "proxy");
+        if collection == "dnsRules" {
+            assert_eq!(
+                canonical[0]["effects"]["dns"],
+                json!({
+                    "enabled": true, "resolver": "inherit", "answerMode": "fakeIp",
+                    "action": {"type": "fakeIp"}
+                })
+            );
+        } else {
+            assert_eq!(
+                canonical[0]["effects"]["route"],
+                json!({"enabled": true, "action": "proxy"})
+            );
+            assert!(canonical[0].pointer("/effects/dns").is_none());
+        }
+        let snapshot = canonical[0].clone();
         let barrier = Arc::new(Barrier::new(2));
-        let workers: Vec<_> = ["one", "two"].into_iter().map(|label| {
-            let manager = Arc::clone(&manager);
-            let barrier = Arc::clone(&barrier);
-            let expected = snapshot.clone();
-            std::thread::spawn(move || {
-                barrier.wait();
-                manager.update(|cfg| {
-                    let mut current = plane_rules(cfg, collection);
-                    if !expected_rule_matches(&current[0], Some(&expected), true) {
-                        return Decision::Skip(false);
-                    }
-                    current[0]["remarks"] = json!(label);
-                    write_plane_rules(cfg, collection, current);
-                    Decision::Write(true)
-                }).unwrap().0
+        let workers: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|label| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                let expected = snapshot.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager
+                        .update(|cfg| {
+                            let mut current = plane_rules(cfg, collection);
+                            if !expected_rule_matches(&current[0], Some(&expected), true) {
+                                return Decision::Skip(false);
+                            }
+                            current[0]["remarks"] = json!(label);
+                            write_plane_rules(cfg, collection, current);
+                            Decision::Write(true)
+                        })
+                        .unwrap()
+                        .0
+                })
             })
-        }).collect();
-        let wins = workers.into_iter().map(|worker| worker.join().unwrap()).filter(|won| *won).count();
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let wins = results.iter().filter(|won| **won).count();
         assert_eq!(wins, 1);
+        assert_eq!(results.iter().filter(|won| !**won).count(), 1);
         let saved = plane_rules(&manager.load_full().unwrap(), collection);
+        assert_eq!(saved.len(), 1);
         assert_ne!(saved[0], snapshot);
         assert_eq!(saved[0]["values"], snapshot["values"]);
+        assert!(matches!(saved[0]["remarks"].as_str(), Some("one" | "two")));
+        let mut expected = snapshot.clone();
+        expected["remarks"] = saved[0]["remarks"].clone();
+        assert_eq!(saved[0], expected, "the winning edit changes only remarks");
     }
 }

@@ -91,15 +91,18 @@ describe('接线：三件结构事实（源码断言 —— 证明的是接线�
     //（FR-1「零磁盘写」当场破）。故这条腿必须只写 `cfg` 本身。
     const load = SRC.slice(SRC.indexOf('const load = useCallback'), SRC.indexOf('const reload ='));
     expect(load.length).toBeGreaterThan(200); // 切片没切空（否则下面两条恒真）
-    expect(load).toMatch(/setConfig\(cfg\)/);
+    expect(load).toContain('refreshConfig(');
+    expect(SRC).toContain('acceptConfig(edits.current, state.config, publication.serial, publication.epoch)');
+    expect(SRC).not.toContain('configApi.get(');
     expect(load).not.toMatch(/effectiveConfigOf|\breplay\b/);
   });
 
   it('落盘只提交 `direct` 字段补丁，乐观副本与后端终态都不混入暂存键', () => {
-    expect(SRC).toMatch(/const persisted = \{ \.\.\.prev, \.\.\.direct \}/);
+    expect(SRC).toContain('beginDirect(edits.current, id, direct)');
     expect(SRC).toMatch(/configApi\.patch\(direct\)/);
-    expect(SRC).toMatch(/setConfig\(persisted\)/);
-    expect(SRC).toMatch(/setConfig\(saved\)/);
+    expect(SRC).toContain('displayConfig(state)');
+    expect(SRC).toContain('commitDirect(edits.current, id, saved, confirmation.barrier)');
+    expect(SRC).not.toMatch(/setConfig\(saved\)|setConfig\(prev\)/);
     expect(SRC).not.toMatch(/configApi\.save\(persisted\)/);
     // 旧写法 `const next = { ...prev, ...patch }` + `setConfig(next)`：把暂存键并进了磁盘副本，
     // 第二次改一个直落盘键时会把它们一起写盘。该变量已删，复活即红。

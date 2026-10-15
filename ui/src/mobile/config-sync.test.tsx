@@ -71,7 +71,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
-      onChanged: (cb: () => void) => onChangedMock(cb),
+      onChangedReady: async (cb: () => void) => onChangedMock(cb),
       setStagedPending: (pending: boolean) => setStagedPendingMock(pending),
     },
     window: { takeCleanExitFlag: () => takeCleanExitFlagMock() },
@@ -93,7 +93,7 @@ vi.mock('@/ipc', () => ({
 vi.mock('@/ipc/api-client', () => ({
   configApi: {
     get: () => getMock(),
-    onChanged: (cb: () => void) => onChangedMock(cb),
+    onChangedReady: async (cb: () => void) => onChangedMock(cb),
     patch: async (patch: Partial<UserConfig>) => ({ ...disk, ...patch }),
   },
   windowApi: { startupConfigFlags: () => startupConfigFlagsMock() },
@@ -202,11 +202,12 @@ describe('② 外部改动收敛：广播一到，store 追到盘上的新值', 
     off();
   });
 
-  it('订阅确实登记了一个**零形参**回调（无载荷信号，读它只会拿到 {}）', () => {
+  it('订阅确实登记了一个**零形参**回调（无载荷信号，读它只会拿到 {}）', async () => {
     const off = startConfigSync();
     expect(onChangedMock).toHaveBeenCalledTimes(1);
     expect(onChangedMock.mock.calls[0][0].length).toBe(0);
     off();
+    await vi.waitFor(() => expect(offSpy).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -316,7 +317,7 @@ describe('⑥ hook 把 startConfigSync 交给了 useEffect，且依赖为空', (
   const CODE = strip(SRC).replace(/\s+/g, '');
 
   it('⓪ 取材面自检：源码非空、剥离器认得注释里的假形态', () => {
-    expect(SRC.length).toBeGreaterThan(2000);
+    expect(SRC.length).toBeGreaterThan(200);
     expect(CODE).toContain('exportfunctionstartConfigSync');
     expect(CODE).toContain('exportfunctionuseMobileConfigSync');
     // 注释里的同款形态不得被算进取材面（否则删掉真代码也能靠头注喂饱本判据）。
@@ -329,14 +330,10 @@ describe('⑥ hook 把 startConfigSync 交给了 useEffect，且依赖为空', (
     expect(CODE).toContain('useEffect(startConfigSync,[])');
   });
 
-  it('首拉不带 force、广播重拉必须带 force（非 force 会被在飞的那次单飞合并）', () => {
-    expect(CODE).toContain('loadConfig()');
-    expect(CODE).toContain('loadConfig(true)');
-  });
-
-  it('`.onChanged(` 恰好一处，且实参是零形参箭头（本文件不在 Rust 侧那张消费方表内，自守）', () => {
-    const sites = [...CODE.matchAll(/\.onChanged\(/g)];
-    expect(sites.length).toBe(1);
-    expect(CODE.slice(sites[0].index)).toMatch(/^\.onChanged\(\(\)=>/);
+  it('mobile root acquires the same main-scope feed and returns its cleanup', () => {
+    expect(CODE).toContain("returnacquireConfigSync({scope:'main'});");
+    expect(CODE).not.toContain('.onChanged(');
+    expect(CODE).not.toContain('.onChangedReady(');
+    expect(CODE).not.toContain('config.get(');
   });
 });

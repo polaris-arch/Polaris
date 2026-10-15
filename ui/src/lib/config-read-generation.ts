@@ -4,6 +4,7 @@
 let generation = 0;
 export const configReadGeneration = {
   beginRead: () => ++generation,
+  invalidate: () => { generation++; },
   published: () => { generation++; },
   current: () => generation,
   isCurrent: (read: number) => read === generation,

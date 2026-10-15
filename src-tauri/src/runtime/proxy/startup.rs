@@ -63,9 +63,11 @@ use polaris_config_engine::builder::{
     build_id_to_tag_map, generate_sing_box_config_with_report_and_runtime_bindings,
     GenerateConfigDeps, GenerateOutcome, InvalidNode,
 };
-use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
+use polaris_config_engine::singbox::{InboundUser, RouteRule, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
-use polaris_config_engine::user_config::dns_constants::{is_direct_selection, is_sentinel_selection, BLOCK_TAG, DIRECT_TAG};
+use polaris_config_engine::user_config::dns_constants::{
+    is_block_selection, is_direct_selection, BLOCK_TAG, DIRECT_TAG, PROXY_SELECTOR_TAG,
+};
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_proxy_port};
 use polaris_config_engine::user_config::server_config::ServerConfig;
@@ -4354,6 +4356,313 @@ pub(super) fn region_reverse_rule_sets_intact(
         .all(|t| defined.contains(t.as_str()))
 }
 
+/// Block is a routing shape, not a legacy outbound tag. Keep every matcher in
+/// the Default comparison so new RouteRule fields cannot silently widen proof.
+fn block_route_shape_matches(singbox_config: &SingBoxConfig) -> bool {
+    fn references_selected_exit(rule: &RouteRule) -> bool {
+        rule.outbound.as_deref() == Some(PROXY_SELECTOR_TAG)
+            || rule
+                .rules
+                .as_ref()
+                .is_some_and(|children| children.iter().any(references_selected_exit))
+    }
+
+    enum ScopeProof {
+        Unconditional,
+        Scoped(BTreeSet<String>),
+        Unknown,
+    }
+
+    fn finite_strings(value: &Value) -> Option<Vec<String>> {
+        let mut values = match value {
+            Value::String(value) => vec![value.clone()],
+            Value::Array(values) => values
+                .iter()
+                .map(|value| value.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        if values.is_empty()
+            || values.len() > 1024
+            || values
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return None;
+        }
+        values.sort();
+        values.dedup();
+        Some(values)
+    }
+
+    // An upper bound on covered addresses, not a CIDR evaluator or expansion.
+    // IPv6 prefixes beyond /64 round upward by one unit, never to a false proof.
+    fn bounded_cidrs(values: &[String]) -> bool {
+        let mut covered = [0u128; 2];
+        for value in values {
+            let (address, prefix) = value
+                .split_once('/')
+                .map_or((value.as_str(), None), |(address, prefix)| {
+                    (address, Some(prefix))
+                });
+            let Ok(address) = address.parse::<std::net::IpAddr>() else {
+                return false;
+            };
+            let (family, bits, precision) = if address.is_ipv4() {
+                (0, 32u32, 32u32)
+            } else {
+                (1, 128u32, 64u32)
+            };
+            let prefix = match prefix {
+                Some(prefix) => match prefix.parse::<u32>() {
+                    Ok(prefix) => prefix,
+                    Err(_) => return false,
+                },
+                None => bits,
+            };
+            if prefix > bits {
+                return false;
+            }
+            covered[family] += 1u128 << precision.saturating_sub(prefix);
+            if covered[family] >= 1u128 << precision {
+                return false;
+            }
+        }
+        true
+    }
+
+    // This proves only supported positive shapes. Each atom is an entire leaf,
+    // not an assumed AND of its fields (domain/address fields may be grouped OR).
+    fn prove_scope(node: &Value, depth: usize, remaining: &mut usize) -> ScopeProof {
+        if depth > 8 || *remaining == 0 {
+            return ScopeProof::Unknown;
+        }
+        *remaining -= 1;
+        let Some(mut fields) = node.as_object().cloned() else {
+            return ScopeProof::Unknown;
+        };
+        let invert = fields
+            .remove("invert")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        // Mode alone can cover the whole active branch; it never proves scope.
+        fields.remove("clash_mode");
+        let kind = fields
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        if kind == "logical" {
+            let mode = fields
+                .remove("mode")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let children = fields.remove("rules");
+            let Some(children) = children.as_ref().and_then(Value::as_array) else {
+                return ScopeProof::Unknown;
+            };
+            if invert || !fields.is_empty() || children.is_empty() || children.len() > 64 {
+                return ScopeProof::Unknown;
+            }
+            match mode.as_deref() {
+                Some("and") => {
+                    let mut bounds = BTreeSet::new();
+                    let mut unknown = false;
+                    for child in children {
+                        match prove_scope(child, depth + 1, remaining) {
+                            ScopeProof::Scoped(atoms) => bounds.extend(atoms),
+                            ScopeProof::Unknown => unknown = true,
+                            ScopeProof::Unconditional => {}
+                        }
+                    }
+                    if !bounds.is_empty() {
+                        ScopeProof::Scoped(bounds)
+                    } else if unknown {
+                        ScopeProof::Unknown
+                    } else {
+                        ScopeProof::Unconditional
+                    }
+                }
+                Some("or") => {
+                    let mut common: Option<BTreeSet<String>> = None;
+                    for child in children {
+                        match prove_scope(child, depth + 1, remaining) {
+                            ScopeProof::Unconditional => return ScopeProof::Unconditional,
+                            ScopeProof::Unknown => return ScopeProof::Unknown,
+                            ScopeProof::Scoped(atoms) => {
+                                common = Some(match common {
+                                    Some(previous) => {
+                                        previous.intersection(&atoms).cloned().collect()
+                                    }
+                                    None => atoms,
+                                });
+                            }
+                        }
+                    }
+                    match common {
+                        Some(bounds) if !bounds.is_empty() => ScopeProof::Scoped(bounds),
+                        _ => ScopeProof::Unknown,
+                    }
+                }
+                _ => ScopeProof::Unknown,
+            }
+        } else {
+            if !kind.is_empty() && kind != "default" {
+                return ScopeProof::Unknown;
+            }
+            // Normalize every current empty collection/Listable or empty scalar
+            // matcher; an unknown future field is retained and fails closed.
+            fields.retain(|key, value| {
+                let known = matches!(
+                    key.as_str(),
+                    "protocol"
+                        | "network"
+                        | "rule_set"
+                        | "domain"
+                        | "domain_suffix"
+                        | "domain_keyword"
+                        | "domain_regex"
+                        | "geosite"
+                        | "ip_cidr"
+                        | "source_ip_cidr"
+                        | "port"
+                        | "port_range"
+                        | "source_port"
+                        | "source_port_range"
+                        | "source_mac_address"
+                        | "source_hostname"
+                        | "process_name"
+                        | "process_path"
+                        | "package_name"
+                        | "process_name_not"
+                        | "inbound"
+                        | "preferred_by"
+                        | "dns_server_address"
+                        | "dns_search_domain"
+                );
+                !known
+                    || !(value.is_null()
+                        || value.as_array().is_some_and(Vec::is_empty)
+                        || value.as_object().is_some_and(serde_json::Map::is_empty)
+                        || value.as_str() == Some(""))
+            });
+            // The pinned engine matches an empty leaf before applying invert.
+            if fields.is_empty() {
+                return ScopeProof::Unconditional;
+            }
+            if invert {
+                return ScopeProof::Unknown;
+            }
+            let mut positive = false;
+            let mut destination_family = None;
+            for (key, value) in &mut fields {
+                let family = match key.as_str() {
+                    "domain" | "domain_suffix" => Some("names"),
+                    "domain_keyword" => Some("keywords"),
+                    "ip_cidr" => Some("addresses"),
+                    "rule_set" => Some("builtin-set"),
+                    _ => None,
+                };
+                if let Some(family) = family {
+                    if destination_family.is_some_and(|previous| previous != family) {
+                        return ScopeProof::Unknown;
+                    }
+                    destination_family = Some(family);
+                }
+                if matches!(key.as_str(), "port" | "source_port") {
+                    let ports = value
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![value.clone()]);
+                    if ports.is_empty()
+                        || ports.len() > 1024
+                        || ports
+                            .iter()
+                            .any(|port| !port.as_u64().is_some_and(|port| port <= 65535))
+                    {
+                        return ScopeProof::Unknown;
+                    }
+                    positive = true;
+                    *value = Value::Array(ports);
+                    continue;
+                }
+                let Some(values) = finite_strings(value) else {
+                    return ScopeProof::Unknown;
+                };
+                let bounded = match key.as_str() {
+                    "domain" => values.iter().all(|value| !matches!(value.as_str(), "." | "*")),
+                    "domain_suffix" => values.iter().all(|value| value.trim_matches('.').contains('.') && !value.contains('*')),
+                    "domain_keyword" => values.iter().all(|value| value.chars().count() >= 2 && !value.contains('*')),
+                    "ip_cidr" | "source_ip_cidr" => bounded_cidrs(&values),
+                    "rule_set" => values.len() == 1 && (values[0] == polaris_config_engine::user_config::builtin_geo_rulesets::PRIVATE_DOMAIN_DIRECT_TAG || polaris_config_engine::user_config::builtin_geo_rulesets::is_bundled_geo_tag(&values[0])),
+                    "protocol" | "inbound" | "process_name" | "process_path" | "package_name" | "source_mac_address" | "source_hostname" => values.iter().all(|value| value != "*"),
+                    "network" => {
+                        if values.iter().any(|value| !matches!(value.as_str(), "tcp" | "udp" | "icmp")) { return ScopeProof::Unknown; }
+                        values.len() == 1
+                    }
+                    _ => return ScopeProof::Unknown,
+                };
+                if !bounded && key != "network" {
+                    return ScopeProof::Unknown;
+                }
+                positive |= bounded;
+                *value = Value::Array(values.into_iter().map(Value::String).collect());
+            }
+            if positive {
+                ScopeProof::Scoped(BTreeSet::from([Value::Object(fields).to_string()]))
+            } else {
+                ScopeProof::Unknown
+            }
+        }
+    }
+
+    fn terminates_before_block(rule: &RouteRule) -> bool {
+        let terminal_route = rule.action.as_deref() == Some("route")
+            || (rule.action.is_none() && rule.outbound.is_some());
+        if !terminal_route {
+            return false;
+        }
+        // Action options do not constrain matching. Keep all matcher fields,
+        // including future fields, for the explicit bounded proof above.
+        let matcher = RouteRule {
+            action: None,
+            outbound: None,
+            server: None,
+            no_drop: None,
+            sniffer: None,
+            rewrite_target: None,
+            timeout: None,
+            domain_resolver: None,
+            override_address: None,
+            tls_spoof: None,
+            tls_spoof_method: None,
+            ..rule.clone()
+        };
+        let Ok(node) = serde_json::to_value(matcher) else {
+            return true;
+        };
+        let mut remaining = 64;
+        !matches!(prove_scope(&node, 0, &mut remaining), ScopeProof::Scoped(_))
+    }
+
+    let Some(route) = singbox_config.route.as_ref() else {
+        return false;
+    };
+    if route.final_outbound.as_deref() != Some(DIRECT_TAG) {
+        return false;
+    }
+    let Some((last, preceding)) = route.rules.split_last() else {
+        return false;
+    };
+    let reject = RouteRule {
+        action: Some("reject".to_string()),
+        // no_drop changes the rejection method, not its matching scope.
+        no_drop: last.no_drop,
+        ..RouteRule::default()
+    };
+    last == &reject
+        && !route.rules.iter().any(references_selected_exit)
+        && !preceding.iter().any(terminates_before_block)
+}
+
 pub(super) fn attest_effective_exit(
     user_config: &UserConfig,
     singbox_config: &SingBoxConfig,
@@ -4362,6 +4671,32 @@ pub(super) fn attest_effective_exit(
     // 门①：用户显式选「全直连」模式 → `final=direct` 是设计语义，不是降级。
     if user_config.proxy_mode == ProxyMode::Direct {
         return ExitAttestation::Match;
+    }
+    // Block must precede reverse/mesh exemptions, and stale persisted selection
+    // must precede its success. Non-block and explicit direct-mode gates retain
+    // their existing order and meaning.
+    if is_block_selection(user_config.selected_server_id.as_deref()) {
+        let started_with = user_config.selected_server_id.as_deref();
+        if let Some(persisted) = persisted_selected_id {
+            if started_with != Some(persisted) {
+                return ExitAttestation::StaleSelection {
+                    persisted: persisted.to_string(),
+                    started_with: started_with.unwrap_or("<none>").to_string(),
+                };
+            }
+        }
+        if block_route_shape_matches(singbox_config) {
+            return ExitAttestation::Match;
+        }
+        return match effective_exit_tag(singbox_config) {
+            Some(actual) if actual != BLOCK_TAG => ExitAttestation::WrongExit {
+                expected_tag: BLOCK_TAG.to_string(),
+                actual_tag: actual,
+            },
+            _ => ExitAttestation::UnresolvedExit {
+                expected_tag: BLOCK_TAG.to_string(),
+            },
+        };
     }
     // 门②：smart + 地区反向（回国：本地走代理·海外直连）→ `final=direct` 同为设计语义。
     // 这两门不放行就会对**用户自己选的模式**天天误报，告警一旦有假就会被整体无视。
@@ -4422,17 +4757,6 @@ pub(super) fn attest_effective_exit(
     if is_direct_selection(started_with) {
         return ExitAttestation::Match;
     }
-    if is_sentinel_selection(started_with) {
-        let expected = BLOCK_TAG;
-        return match effective_exit_tag(singbox_config) {
-            Some(actual) if actual == expected => ExitAttestation::Match,
-            Some(actual) => ExitAttestation::WrongExit {
-                expected_tag: expected.to_string(),
-                actual_tag: actual,
-            },
-            None => ExitAttestation::UnresolvedExit { expected_tag: expected.to_string() },
-        };
-    }
     // 未选中任何节点 → 无可对账的意图（generate 侧另有校验）。
     let Some(selected_id) = started_with else {
         return ExitAttestation::Match;
@@ -4483,27 +4807,4 @@ pub(super) fn server_ids(config: &Value) -> std::collections::HashSet<String> {
         }
     }
     set
-}
-
-
-#[cfg(test)]
-mod block_sentinel_attestation_tests {
-    use super::*;
-
-    #[test]
-    fn intentional_block_is_not_an_unknown_node_but_wrong_and_stale_exits_still_fail() {
-        let cfg: UserConfig = serde_json::from_value(serde_json::json!({
-            "servers": [], "selectedServerId": "__block__", "proxyMode": "global"
-        })).unwrap();
-        let core = |tag: &str| -> SingBoxConfig {
-            serde_json::from_value(serde_json::json!({ "inbounds": [], "outbounds": [],
-                "route": { "rules": [], "final": tag } })).unwrap()
-        };
-        assert_eq!(attest_effective_exit(&cfg, &core(BLOCK_TAG), Some("__block__")), ExitAttestation::Match);
-        assert!(matches!(attest_effective_exit(&cfg, &core(DIRECT_TAG), Some("__block__")), ExitAttestation::WrongExit { .. }));
-        assert!(matches!(attest_effective_exit(&cfg, &core(BLOCK_TAG), Some("other")), ExitAttestation::StaleSelection { .. }));
-        let mut unknown = cfg;
-        unknown.selected_server_id = Some("missing".to_string());
-        assert!(matches!(attest_effective_exit(&unknown, &core(BLOCK_TAG), Some("missing")), ExitAttestation::UnknownSelection { .. }));
-    }
 }

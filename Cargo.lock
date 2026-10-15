@@ -3346,6 +3346,7 @@ dependencies = [
  "http",
  "hyper-util",
  "log",
+ "polaris-source-probe",
  "prost",
  "thiserror 2.0.20",
  "tokio",
@@ -3389,6 +3390,7 @@ name = "polaris-switch-engine"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "futures",
  "polaris-config-engine",
  "polaris-core-supervisor",
  "thiserror 2.0.20",

@@ -219,7 +219,7 @@ it('nodeViewGroups retains original all-node order, source attribution and colli
   const nodes = [server('b', { subscriptionId: '__all_nodes__' }), server('m'), server('e', { protocol: 'openconnect' })];
   const groups = nodeViewGroups(nodes, [sub('__all_nodes__', 'Subscription')], { manual: 'Local', mesh: 'Endpoints' });
   expect(groups.map(group => group.id)).toEqual(['manual', 'mesh', '__all_nodes__', '__all_nodes___']);
-  const all = groups.at(-1)!;
+  const all = groups[groups.length - 1]!;
   expect(all.servers).toBe(nodes);
   expect(all.sources).toEqual({
     b: { id: '__all_nodes__', kind: 'subscription', name: 'Subscription' },

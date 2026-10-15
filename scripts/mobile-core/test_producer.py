@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
+import ast
+import inspect
 import json
 import os
 import sys
@@ -16,6 +18,66 @@ from fork_input import load
 
 
 class ProducerCalls(unittest.TestCase):
+    def test_run_capture_default_and_invalid_modes_do_not_start_or_open_logs(self):
+        self.assertEqual(inspect.signature(producer.run).parameters['capture'].default, 'full')
+        for mode in ('tail', '', None, False, [], {}):
+            with self.subTest(mode=mode), patch.object(producer.subprocess, 'Popen') as spawn, \
+                    patch.object(Path, 'open') as opened, self.assertRaisesRegex(RuntimeError, 'unknown tool capture mode'):
+                producer.run(['never-executed'], log='never-opened', capture=mode)
+            spawn.assert_not_called(); opened.assert_not_called()
+        with patch.object(producer.subprocess, 'Popen') as spawn, patch.object(Path, 'open') as opened, \
+                self.assertRaisesRegex(RuntimeError, 'requires complete original logs'):
+            producer.run(['never-executed'], capture='none')
+        spawn.assert_not_called(); opened.assert_not_called()
+
+    def test_only_fifteen_logged_nonconsumers_disable_full_capture(self):
+        directory = Path(producer.__file__).parent
+        expected = {'producer.py': 3, 'ci_apple.py': 5, 'build_apple_app.py': 6, 'apple_rust.py': 1}
+        for filename, count in expected.items():
+            tree = ast.parse((directory / filename).read_text())
+            selected, symbols = [], []
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                direct = node.func.id == 'run'
+                indirect = (node.func.id == 'timed_phase' and len(node.args) > 1 and
+                            isinstance(node.args[1], ast.Name) and node.args[1].id == 'run')
+                if not (direct or indirect):
+                    continue
+                keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+                capture = keywords.get('capture')
+                if 'log' not in keywords:
+                    self.assertIsNone(capture, (filename, node.lineno))
+                    continue
+                if (filename == 'apple_rust.py' and direct and node.args and
+                        isinstance(node.args[0], ast.List) and any(
+                            isinstance(arg, ast.Constant) and arg.value == 'nm' for arg in node.args[0].elts)):
+                    self.assertIsNone(capture, 'nm must retain every symbol')
+                    symbols.append(node)
+                    continue
+                self.assertIsInstance(capture, ast.Constant, (filename, node.lineno))
+                self.assertEqual(capture.value, 'none', (filename, node.lineno))
+                selected.append(node)
+            self.assertEqual(len(selected), count, filename)
+            self.assertEqual(len(symbols), 1 if filename == 'apple_rust.py' else 0)
+        # These protocol parsers remain on the same full-return contract.
+        for filename in ('artifacts.py', 'apple_admission.py', 'ci_android.py', 'consume.py', 'carriers.py'):
+            tree = ast.parse((directory / filename).read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'run':
+                    self.assertFalse(any(keyword.arg == 'capture' for keyword in node.keywords),
+                                     (filename, node.lineno))
+
+    def test_apple_wrapper_forwards_capture_without_changing_full_results(self):
+        import build_apple_app
+        for kwargs, result in (({}, 'complete stdout'), ({'capture': 'full'}, 'complete stdout'),
+                               ({'capture': 'none', 'log': 'original.log'}, None)):
+            with self.subTest(kwargs=kwargs), patch.object(build_apple_app, 'native_run', return_value=result) as native:
+                self.assertEqual(build_apple_app.run(['inert'], **kwargs), result)
+            self.assertEqual(native.call_args.args, (['inert'],))
+            self.assertEqual({key: value for key, value in native.call_args.kwargs.items()
+                              if not key.startswith('observation_')}, kwargs)
+
     def test_bounded_download_pipe_and_structure_failures_never_export_raw_errors(self):
         secret = 'DO_NOT_EXPORT_MODULE_CREDENTIAL'
         good = {'Path':'example.invalid/pkg','Version':'v1.0.0','Sum':'h1:fixed','Dir':'/fixed/cache'}
@@ -270,8 +332,9 @@ class ProducerCalls(unittest.TestCase):
             def lease(work, cache, _value):
                 work.mkdir(mode=0o700, exist_ok=True); cache.mkdir(mode=0o700, exist_ok=True)
                 yield work, cache
-            def run(command, *, cwd=None, env=None, log=None):
+            def run(command, *, cwd=None, env=None, log=None, capture='full'):
                 command = [str(item) for item in command]
+                self.assertEqual(capture, 'none' if log is not None else 'full')
                 if command[:2] == ['git', 'clone']:
                     Path(command[-1]).mkdir()
                 elif len(command) > 1 and command[1] == 'bind':
@@ -288,7 +351,7 @@ class ProducerCalls(unittest.TestCase):
                     Path(log).write_text('inert original bind log')
                 elif command[1:4] == ['list', '-m', '-json']:
                     return '{"Path":"github.com/sagernet/sing-box","Main":true}'
-                return ''
+                return None if capture == 'none' else ''
             with ExitStack() as stack:
                 stack.enter_context(patch.object(producer.os, 'uname', return_value=SimpleNamespace(sysname='Darwin')))
                 for name, replacement in {

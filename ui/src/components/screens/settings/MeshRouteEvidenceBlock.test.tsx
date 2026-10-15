@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
-import type { ServerConfig } from '@/contracts/types';
+import type { ServerConfig, UserConfig } from '@/contracts/types';
+import { DEMO_CONFIG } from '../../../../harness-fixture';
 import { meshRouteEvidenceRows } from '@/domain/mesh-route-evidence';
 import { createLatestReportLoader, type ReportLoadState } from './latest-report-loader';
 
@@ -218,7 +219,10 @@ it('cross-platform mesh warnings are computed-visible without exposing Linux-onl
 
 it('TUN preview identity changes for mesh routes, real server input and observed generation only', async () => {
   const { tunPreviewIdentity } = await import('./SettingsTun');
-  const config = { servers: [{ id: 'mesh', name: 'Mesh', protocol: 'openvpn', meshRoutes: ['10.1.0.0/16'] }] } as import('@/contracts/types').UserConfig;
+  const config: UserConfig = {
+    ...DEMO_CONFIG,
+    servers: [{ id: 'mesh', name: 'Mesh', protocol: 'openvpn-client', address: 'mesh.fixture.invalid', port: 1194, meshRoutes: ['10.1.0.0/16'] }],
+  };
   const key = tunPreviewIdentity(config, '["100.64.0.1"]', 'running:1');
   expect(tunPreviewIdentity({ ...config, language: 'fa' }, '["100.64.0.1"]', 'running:1')).toBe(key);
   expect(tunPreviewIdentity({ ...config, servers: (config.servers ?? []).map(server => ({ ...server, meshRoutes: ['10.2.0.0/16'] })) }, '["100.64.0.1"]', 'running:1')).not.toBe(key);

@@ -1,4 +1,6 @@
 use super::*;
+use polaris_config_engine::singbox::RouteRule;
+use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, BLOCK_TAG};
 use polaris_core_supervisor::{PortAllocator, PortExclusions};
 use polaris_singbox_grpc::tonic;
 use tonic::codegen::{http, Body as HttpBody, BoxFuture, Service};
@@ -2482,6 +2484,312 @@ fn singbox_fixture(final_tag: &str, selector_default: Option<&str>) -> SingBoxCo
         "route": { "rules": [], "final": final_tag }
     }))
     .expect("fixture sing-box config 应可解析")
+}
+
+/// Positives come from the real production generator, including its log,
+/// selector membership, exemption rules and matcher-less reject representation.
+fn generated_block_exit(mode: &str, reverse: bool) -> (UserConfig, SingBoxConfig) {
+    let mut raw = polaris_store::store::default_config();
+    raw["selectedServerId"] = serde_json::json!(BLOCK_SERVER_ID);
+    raw["proxyMode"] = serde_json::json!(mode);
+    raw["proxyModeType"] = serde_json::json!("systemProxy");
+    raw["servers"] = serde_json::json!([{
+        "id": "fixture-node", "name": "fixture-node", "protocol": "socks",
+        "address": "192.0.2.1", "port": 1080
+    }]);
+    if reverse {
+        raw["regionRouting"] =
+            serde_json::json!({"enabled": true, "region": "cn", "reverse": true});
+    }
+    let user: UserConfig = serde_json::from_value(raw).expect("real default UserConfig");
+    let core = polaris_config_engine::builder::generate_sing_box_config(
+        &user,
+        &BTreeMap::new(),
+        &probe_pool_generate_deps(0),
+    )
+    .expect("production block configuration generates without starting a core");
+    (user, core)
+}
+
+#[test]
+fn intentional_block_is_not_an_unknown_node_but_wrong_and_stale_exits_still_fail() {
+    for mode in ["global", "smart"] {
+        let (user, core) = generated_block_exit(mode, false);
+        let route = core.route.as_ref().unwrap();
+        assert_eq!(route.final_outbound.as_deref(), Some(DIRECT_TAG));
+        let mut tail = serde_json::to_value(route.rules.last().unwrap()).unwrap();
+        tail.as_object_mut().unwrap().remove("no_drop");
+        assert_eq!(tail, serde_json::json!({"action": "reject"}));
+        assert!(core.outbounds.iter().all(|outbound| {
+            outbound.type_field != "block"
+                && outbound.tag != BLOCK_TAG
+                && outbound.default.as_deref() != Some(BLOCK_TAG)
+                && outbound
+                    .outbounds
+                    .as_ref()
+                    .is_none_or(|members| !members.iter().any(|tag| tag == BLOCK_TAG))
+        }));
+        assert_eq!(
+            attest_effective_exit(&user, &core, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+        for no_drop in [None, Some(false), Some(true)] {
+            let mut rejection_method = core.clone();
+            rejection_method
+                .route
+                .as_mut()
+                .unwrap()
+                .rules
+                .last_mut()
+                .unwrap()
+                .no_drop = no_drop;
+            assert_eq!(
+                attest_effective_exit(&user, &rejection_method, Some(BLOCK_SERVER_ID)),
+                ExitAttestation::Match
+            );
+        }
+        for tag in [DIRECT_TAG, "HK01"] {
+            assert!(matches!(
+                attest_effective_exit(&user, &singbox_fixture(tag, None), Some(BLOCK_SERVER_ID)),
+                ExitAttestation::WrongExit { .. }
+            ));
+        }
+        assert!(matches!(
+            attest_effective_exit(&user, &core, Some("other")),
+            ExitAttestation::StaleSelection { .. }
+        ));
+        let mut unknown = user.clone();
+        unknown.selected_server_id = Some("missing".to_string());
+        assert!(matches!(
+            attest_effective_exit(&unknown, &core, Some("missing")),
+            ExitAttestation::UnknownSelection { .. }
+        ));
+        let mut direct = user.clone();
+        direct.selected_server_id = Some(DIRECT_SERVER_ID.to_string());
+        assert_eq!(
+            attest_effective_exit(
+                &direct,
+                &singbox_fixture(DIRECT_TAG, None),
+                Some(DIRECT_SERVER_ID)
+            ),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_requires_the_unconditional_reject_and_rejects_legacy_final_tags() {
+    for mode in ["global", "smart"] {
+        let (user, core) = generated_block_exit(mode, false);
+        let mut missing_tail = core.clone();
+        missing_tail.route.as_mut().unwrap().rules.pop();
+        assert_ne!(
+            attest_effective_exit(&user, &missing_tail, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+        for (field, value) in [
+            ("domain", serde_json::json!(["example.invalid"])),
+            ("port", serde_json::json!(443)),
+            ("inbound", serde_json::json!("mixed-in")),
+            ("clash_mode", serde_json::json!("Global")),
+        ] {
+            let mut raw = serde_json::to_value(&core).unwrap();
+            raw["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap()[field] = value;
+            let conditional: SingBoxConfig = serde_json::from_value(raw).unwrap();
+            assert_ne!(
+                attest_effective_exit(&user, &conditional, Some(BLOCK_SERVER_ID)),
+                ExitAttestation::Match,
+                "conditional reject: {field}"
+            );
+        }
+        let mut absent_route = core.clone();
+        absent_route.route = None;
+        assert!(matches!(
+            attest_effective_exit(&user, &absent_route, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::UnresolvedExit { .. }
+        ));
+        let forged_legacy = singbox_fixture(BLOCK_TAG, None);
+        assert_ne!(
+            attest_effective_exit(&user, &forged_legacy, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_rejects_selector_leaks_and_earlier_unconditional_routes() {
+    let (user, core) = generated_block_exit("global", false);
+    for rule in [
+        RouteRule {
+            domain: Some(vec!["example.invalid".into()]),
+            action: Some("route".into()),
+            outbound: Some(PROXY_SELECTOR_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            type_field: Some("logical".into()),
+            mode: Some("or".into()),
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            rules: Some(vec![RouteRule {
+                domain: Some(vec!["example.invalid".into()]),
+                outbound: Some(PROXY_SELECTOR_TAG.into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        RouteRule {
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            action: Some("route".into()),
+            outbound: Some("fixture-node".into()),
+            override_address: Some("192.0.2.2".into()),
+            ..Default::default()
+        },
+        RouteRule {
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            clash_mode: Some("Global".into()),
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+    ] {
+        let mut leaking = core.clone();
+        let rules = &mut leaking.route.as_mut().unwrap().rules;
+        rules.insert(rules.len() - 1, rule);
+        assert_ne!(
+            attest_effective_exit(&user, &leaking, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+    // Explicitly matched direct/management/custom-node exemptions remain valid;
+    // block is the selected-exit policy, not a whole-device kill switch.
+    assert!(core
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == "fixture-node"));
+    for tag in [DIRECT_TAG, "fixture-node"] {
+        let mut exempted = core.clone();
+        let rules = &mut exempted.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            RouteRule {
+                domain: Some(vec!["explicit-exemption.invalid".into()]),
+                action: Some("route".into()),
+                outbound: Some(tag.into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            attest_effective_exit(&user, &exempted, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_rejects_semantically_unconditional_and_unproved_route_scopes() {
+    let (user, core) = generated_block_exit("global", false);
+    // These are real RouteRule values inserted into a generated block config,
+    // including the pinned engine's empty-before-invert and P-or-not-P cases.
+    for raw in [
+        serde_json::json!({"action":"route", "outbound":"direct", "invert":false}),
+        serde_json::json!({"action":"route", "outbound":"direct", "invert":true}),
+        serde_json::json!({"action":"route", "outbound":"direct", "domain":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "network":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "rule_set":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "port":[]}),
+        serde_json::json!({"type":"default", "action":"route", "outbound":"direct"}),
+        serde_json::json!({"type":"logical", "mode":"or", "action":"route", "outbound":"direct", "rules":[
+            {"protocol":"tcp"}, {"protocol":"tcp", "invert":true}
+        ]}),
+        serde_json::json!({"type":"logical", "mode":"or", "action":"route", "outbound":"direct", "rules":[
+            {"domain":["example.invalid"]}, {"domain":["other.invalid"]}
+        ]}),
+        serde_json::json!({"type":"logical", "mode":"and", "invert":true, "action":"route", "outbound":"direct", "rules":[
+            {"domain":["example.invalid"]}, {"port":443}
+        ]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "domain_regex":[".*"]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["0.0.0.0/0"]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["::/0"]}),
+    ] {
+        let mut bypass = core.clone();
+        let rules = &mut bypass.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            serde_json::from_value(raw.clone()).unwrap(),
+        );
+        assert_ne!(
+            attest_effective_exit(&user, &bypass, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match,
+            "unconditional or unproved preceding route: {raw}"
+        );
+    }
+}
+
+#[test]
+fn generated_block_preserves_positive_leaf_and_bounded_logical_exemptions() {
+    let (user, core) = generated_block_exit("global", false);
+    for raw in [
+        serde_json::json!({"action":"route", "outbound":"direct", "type":"default", "invert":false,
+            "domain":["example.invalid"], "network":[], "rule_set":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "inbound":"management-in"}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["192.168.0.0/16", "fc00::/7"]}),
+        serde_json::json!({"action":"route", "outbound":"fixture-node", "rule_set":"geosite-private"}),
+        serde_json::json!({"action":"route", "outbound":"direct", "type":"logical", "mode":"and", "rules":[
+            {"domain":["example.invalid"]}, {"protocol":"tcp", "invert":true}
+        ]}),
+        serde_json::json!({"action":"route", "outbound":"fixture-node", "type":"logical", "mode":"or", "rules":[
+            {"type":"logical", "mode":"and", "rules":[{"domain":["example.invalid"]}, {"port":443}]},
+            {"type":"logical", "mode":"and", "rules":[{"domain":["example.invalid"]}, {"port":8443}]}
+        ]}),
+    ] {
+        let mut exempted = core.clone();
+        let rules = &mut exempted.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            serde_json::from_value(raw.clone()).unwrap(),
+        );
+        assert_eq!(
+            attest_effective_exit(&user, &exempted, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match,
+            "proved positive preceding route: {raw}"
+        );
+    }
+}
+
+#[test]
+fn reverse_geo_exemption_cannot_hide_block_shape_or_stale_selection() {
+    let (user, core) = generated_block_exit("smart", true);
+    assert!(region_reverse_rule_sets_intact(&user, &core));
+    assert_eq!(
+        attest_effective_exit(&user, &core, Some(BLOCK_SERVER_ID)),
+        ExitAttestation::Match
+    );
+    assert!(matches!(
+        attest_effective_exit(&user, &core, Some("fixture-node")),
+        ExitAttestation::StaleSelection { .. }
+    ));
+    let mut unblocked = core.clone();
+    unblocked.route.as_mut().unwrap().rules.pop();
+    assert_ne!(
+        attest_effective_exit(&user, &unblocked, Some(BLOCK_SERVER_ID)),
+        ExitAttestation::Match
+    );
+    assert!(matches!(
+        attest_effective_exit(&user, &unblocked, Some("fixture-node")),
+        ExitAttestation::StaleSelection { .. }
+    ));
 }
 
 /// 造 UserConfig：两个节点（HK01/JP01），选中 `selected`。

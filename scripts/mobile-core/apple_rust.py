@@ -146,7 +146,7 @@ def build_reserved():
     # archive. Source declarations or local/private names cannot satisfy it.
     command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
                '--target', triple, '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib']
-    run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'))
+    run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'), capture='none')
     archive = target / triple / 'release/libpolaris_lib.a'
     require(not archive.is_symlink() and archive.read_bytes().startswith(b'!<arch>\n'), 'actual Rust static archive required')
     bridges = verify_swift_bridges(verify_start_app(

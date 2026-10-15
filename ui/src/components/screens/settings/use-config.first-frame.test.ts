@@ -157,17 +157,18 @@ describe('接线门：useConfig 首帧确实吃种子，SettingsPage 的回落�
     expect(HOOK, 'loading 初值写死 true = 首帧必转圈').not.toMatch(/useState\(true\)/);
   });
 
-  it('`latestConfig` 镜像同样取种子（否则首帧就动手改设置会被静默丢掉）', () => {
+  it('实例 baseline 同样取 raw 种子（否则首帧就动手改设置会被静默丢掉）', () => {
     // `update` 首行是 `if (!prev) return`：state 有种子而 ref 还停在 null 时，界面上的开关已经可点，
     // 按下去却什么都不发生 —— 比转圈更糟。
-    expect(HOOK).toContain('useRef<UserConfig | null>(seed.config)');
+    expect(HOOK).toContain('useRef(configEditState(seed.config))');
+    expect(HOOK).toContain('const prev = displayConfig(edits.current)');
   });
 
   it('挂载那次拉取在已种子化时降级为 silent 重拉（复用事件驱动那条腿，不新开一条）', () => {
     expect(HOOK).toContain('void load(seed.config !== null)');
     // `silent` 的语义就是「不动 loading/error」——那条腿的定义还在，不许被改掉。
     expect(HOOK).toContain('if (!silent) {');
-    expect(HOOK).toContain('if (!silent) setLoading(false);');
+    expect(HOOK).toMatch(/request === requestId\.current && !silent\) setLoading\(false\)/);
   });
 
   it('回落腿：SettingsPage 仍在 `loading` 时渲染 Spinner', () => {

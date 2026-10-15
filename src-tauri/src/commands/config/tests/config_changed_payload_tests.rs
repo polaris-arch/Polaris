@@ -52,16 +52,8 @@ fn renderer_sources() -> Vec<(String, String)> {
 /// 没有它，把 [`renderer_sources`] 改回三行清单不会有任何判据说话。
 const RENDERER_FILE_FLOOR: usize = 200;
 
-/// `.onChanged(` 消费方数的下限（**正面断言**）。
-///
-/// 2026-09-05 在本工作树实测 **3** 个：`ui/src/App.tsx`、`ui/src/tray/TrayMenu.tsx`、
-/// `ui/src/components/screens/settings/use-config.ts`（移动端那一份订阅尚未落到本树）。
-///
-/// 取 3 而不是更大：下限的职责是让「一个消费方都没扫到」自曝 —— 只写「不许违反形态」在扫到
-/// 0 个时是**免费的绿**。它**不**承担「消费方数目不许变」那件事：那正是上一版枚举表的做法，
-/// 而新增消费方本来就该被自动纳入判据、逐个断言形态，不该因为「数目变了」而红。
-/// 删到只剩 2 个仍会红，这是本条要拦的方向。
-const CONSUMER_FLOOR: usize = 3;
+/// Positive floor plus exact centralized owner below: deleting the feed cannot pass.
+const CONSUMER_FLOOR: usize = 1;
 
 /// 发射点：`app.emit(EVENT_CONFIG_CHANGED, …)` 的实参必须是空对象字面量 `json!({})`。
 ///
@@ -202,7 +194,9 @@ fn on_changed_param_lists(path: &str, src: &str) -> Vec<String> {
     const CALL: &str = ".onChanged(";
     // 先剥块注释（含 JSDoc）再剥整行注释：注释里出现调用形态（如 `use-config.ts` 头部 JSDoc
     // 提到的 `` `configApi.onChanged` ``）会喂饱/顶红判据（与 Rust 侧剥行注释同一理由）。
-    let src = strip_line_comments(&strip_block_comments(src));
+    // Both APIs are the same payload-free native signal. Normalize only the
+    // member spelling; callback syntax and every negative control stay strict.
+    let src = strip_line_comments(&strip_block_comments(src)).replace(".onChangedReady(", ".onChanged(");
     // **自曝**：`strip_block_comments` 找不到闭合就不清空、原样保留——那份「不作为」必须
     // 自己被看见，不能只在剩余文本恰好含 `.onChanged(` 时才被间接带出来（那是零信号的巧合绿）。
     // 扫一遍剥完的文本，任何一行 trim 后仍以 `/*`/`{/*` 开头，说明这正是一次未闭合起笔被原样吐回。
@@ -309,6 +303,19 @@ fn every_consumer_discards_the_payload() {
          或者扫描器坏掉了。实到清单：{roster:?}",
         roster.len()
     );
+
+    assert_eq!(roster.len(), 1, "one native config listener per WebView: {roster:?}");
+    assert_eq!(roster[0].0, "ui/src/store/app-store.ts");
+    let store = files.iter().find(|(path, _)| path == "ui/src/store/app-store.ts").unwrap();
+    let store_code = strip_line_comments(&strip_block_comments(&store.1));
+    assert!(store_code.contains("api.config.onChangedReady(() =>"));
+    // The four real entry types must consume the feed, not just define an unused helper.
+    for path in ["ui/src/App.tsx", "ui/src/mobile/config-sync.ts", "ui/src/components/screens/settings/use-config.ts", "ui/src/tray/TrayMenu.tsx"] {
+        let src = &files.iter().find(|(candidate, _)| candidate == path).unwrap().1;
+        let code = strip_line_comments(&strip_block_comments(src));
+        assert!(code.contains("acquireConfigSync({ scope:"), "{path} does not acquire the shared feed");
+        assert!(!code.contains(".onChanged(") && !code.contains(".onChangedReady("), "{path} duplicates the native signal");
+    }
 
     // 正面断言②：逐个断言形态。新增消费方自动进面，不需要有人回来改任何清单。
     for (path, params) in &roster {
@@ -421,4 +428,18 @@ fn block_comment_mentioning_on_changed_is_not_counted() {
         sites, 1,
         "块注释里的 `.onChanged(` 被计入了 —— TS 取材器漏剥块注释，注释能伪造一次订阅"
     );
+}
+
+
+#[test]
+fn ready_signal_scanner_retains_payload_negative_controls() {
+    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady(() => refresh());"), vec!["()"]);
+    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady((...args: unknown[]) => consume(args));"), vec!["(...args: unknown[])"]);
+    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady(async (payload: unknown) => consume(payload));"), vec!["(payload: unknown)"]);
+    for invalid in [
+        "api.config.onChangedReady(namedCallback);",
+        "api.config.onChangedReady(function () { consume(arguments[0]); });",
+    ] {
+        assert!(std::panic::catch_unwind(|| on_changed_param_lists("fixture.ts", invalid)).is_err());
+    }
 }

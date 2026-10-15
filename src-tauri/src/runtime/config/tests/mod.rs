@@ -3284,15 +3284,19 @@ fn credential_index_preserves_order_missing_ids_and_duplicate_rejection() {
     reconcile_tailscale_credentials(&duplicated, &mut unrelated, None).unwrap();
     for trusted in [None, Some("a")] {
         let mut matched = json!({"servers": [{"id":"a", "protocol":"vmess"}]});
-        let error = reconcile_tailscale_credentials(&duplicated, &mut matched, trusted)
-            .unwrap_err();
+        let error =
+            reconcile_tailscale_credentials(&duplicated, &mut matched, trusted).unwrap_err();
         assert!(error.to_string().contains("credentialRevisionChanged"));
     }
     // All non-string IDs shared the absent-ID lookup key, including JSON null.
     for old in [json!([{}, {"id": null}]), json!([{"id": 1}, {"id": false}])] {
         let mut missing = json!({"servers": [{"protocol":"vmess"}]});
-        assert!(reconcile_tailscale_credentials(&json!({"servers":old}), &mut missing, None)
-            .unwrap_err().to_string().contains("credentialRevisionChanged"));
+        assert!(
+            reconcile_tailscale_credentials(&json!({"servers":old}), &mut missing, None)
+                .unwrap_err()
+                .to_string()
+                .contains("credentialRevisionChanged")
+        );
     }
     let mut no_nodes = json!({});
     reconcile_tailscale_credentials(&duplicated, &mut no_nodes, None).unwrap();
@@ -3310,6 +3314,12 @@ fn credential_index_keeps_each_nodes_own_secret_when_reordered() {
         {"id":"a", "protocol":"tailscale", "tailscaleSettings":{}}
     ]});
     reconcile_tailscale_credentials(&previous, &mut incoming, None).unwrap();
-    assert_eq!(incoming["servers"][0]["tailscaleSettings"]["authKey"], "key-b");
-    assert_eq!(incoming["servers"][1]["tailscaleSettings"]["authKey"], "key-a");
+    assert_eq!(
+        incoming["servers"][0]["tailscaleSettings"]["authKey"],
+        "key-b"
+    );
+    assert_eq!(
+        incoming["servers"][1]["tailscaleSettings"]["authKey"],
+        "key-a"
+    );
 }

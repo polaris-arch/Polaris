@@ -3,6 +3,7 @@ import { useMobileSpeedTestStore as store, compareSpeedTestRunIds, validSpeedTes
 import { api } from '@/ipc';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { useAppStore } from '@/store/app-store';
+import { useStagedConfigStore } from '@/store/staged-config-store';
 import type { SpeedTestInvokeResult, SpeedTestMeasurementContext } from '@/contracts/speed-test';
 
 const applyResults = useLatencyStore.getState().applyLatencyResults;
@@ -201,4 +202,219 @@ describe('mobile measured latency task identity', () => {
     expect(useAppStore.getState().proxyStatus?.running).toBe(false);
   });
 
+});
+
+describe('mobile measurement in-flight reuse and final intent fences', () => {
+  const node = { id: 'a', name: 'a', protocol: 'vless', address: 'a.example', port: 443 } as const;
+  const second = { ...node, id: 'b', name: 'b' };
+  const context: SpeedTestMeasurementContext = { runId: '101', requestId: 'request-101', mainGeneration: 2, startTime: 123 };
+  const running = { running: true, mainGeneration: 2, startTime: 123 };
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    let reject!: (cause: unknown) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  };
+  function start(extra?: Parameters<typeof runMobileSpeedTest>[2]) {
+    const backend = deferred<SpeedTestInvokeResult>();
+    vi.spyOn(api.server, 'speedTest').mockReturnValue(backend.promise);
+    const pending = runMobileSpeedTest(['a', 'b'], 'nodes', extra, true);
+    const guard = store.getState().request!.acceptLatency!;
+    return { guard, pending, backend, finish: async () => {
+      backend.resolve(receipt('101', { results: {}, measurementContext: context }));
+      await pending;
+    } };
+  }
+  beforeEach(() => {
+    useStagedConfigStore.setState({ entries: [] });
+    useAppStore.setState({ servers: [node, second], selectedServerId: 'a',
+      config: { servers: [node, second], subscriptions: [], mixedPort: 7890 } as never, proxyStatus: { ...running } });
+  });
+  afterEach(() => { useStagedConfigStore.setState({ entries: [] }); });
+
+  it('shares only concurrent raw status reads; each waiter checks the extra guard and settled reads are not cached', async () => {
+    const read = deferred<typeof running>();
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValueOnce(read.promise).mockResolvedValue(running);
+    const extra = vi.fn().mockResolvedValue(true);
+    const request = start(extra);
+    const first = request.guard(context);
+    const concurrent = request.guard({ ...context });
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledOnce());
+    read.resolve(running);
+    expect(await Promise.all([first, concurrent])).toEqual([true, true]);
+    expect(extra).toHaveBeenCalledTimes(2);
+    expect(await request.guard(context)).toBe(true);
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    expect(extra).toHaveBeenCalledTimes(3);
+    await request.finish();
+  });
+
+  it.each(['runId', 'requestId', 'mainGeneration', 'startTime'] as const)('does not merge a different %s', async field => {
+    const reads = [deferred<typeof running>(), deferred<typeof running>()];
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValueOnce(reads[0].promise).mockReturnValueOnce(reads[1].promise);
+    const request = start();
+    const changed = { ...context, [field]: field === 'runId' ? '102' : field === 'requestId' ? 'request-102' : 999 };
+    const first = request.guard(context);
+    const other = request.guard(changed);
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledTimes(2));
+    reads.forEach(read => read.resolve(running));
+    await Promise.all([first, other]);
+    await request.finish();
+  });
+
+  it('settling an old identity does not clear a newer identity in flight', async () => {
+    const oldRead = deferred<typeof running>();
+    const newRead = deferred<typeof running>();
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(newRead.promise);
+    const request = start();
+    const newer = { ...context, runId: '102', requestId: 'request-102' };
+    const oldWaiter = request.guard(context);
+    const newWaiter = request.guard(newer);
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledTimes(2));
+    oldRead.resolve(running);
+    expect(await oldWaiter).toBe(true);
+    const anotherNewWaiter = request.guard(newer);
+    await Promise.resolve();
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    newRead.resolve(running);
+    expect(await Promise.all([newWaiter, anotherNewWaiter])).toEqual([true, true]);
+    await request.finish();
+  });
+
+  it('does not share the same producer identity across distinct captured request intents', async () => {
+    const oldRead = deferred<typeof running>();
+    const newRead = deferred<typeof running>();
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(newRead.promise);
+    const first = start();
+    const oldWaiter = first.guard(context);
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledOnce());
+    await first.finish();
+    const secondRequest = start();
+    const newWaiter = secondRequest.guard(context);
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledTimes(2));
+    oldRead.resolve(running); newRead.resolve(running);
+    await Promise.all([oldWaiter, newWaiter]);
+    await secondRequest.finish();
+  });
+
+  it.each(['rejected', 'stopped'] as const)('clears a %s flight so a later receipt can retry', async failure => {
+    const read = deferred<typeof running>();
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValueOnce(read.promise).mockResolvedValue(running);
+    const request = start();
+    const first = request.guard(context);
+    const secondWaiter = request.guard(context);
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledOnce());
+    if (failure === 'rejected') read.reject(new Error('status unavailable'));
+    else read.resolve({ ...running, running: false });
+    expect(await Promise.all([first, secondWaiter])).toEqual([false, false]);
+    expect(await request.guard(context)).toBe(true);
+    expect(getStatus).toHaveBeenCalledTimes(2);
+    await request.finish();
+  });
+
+  it('reuses complete serialization and membership, while equal new config objects retain equality semantics', async () => {
+    const config = useAppStore.getState().config!;
+    const servers = useAppStore.getState().servers;
+    const stringify = vi.spyOn(JSON, 'stringify');
+    const members = vi.spyOn(servers, 'map');
+    vi.spyOn(api.proxy, 'getStatus').mockResolvedValue(running);
+    const request = start();
+    expect(await request.guard(context)).toBe(true);
+    expect(await request.guard(context)).toBe(true);
+    expect(stringify.mock.calls.filter(([value]) => value === config)).toHaveLength(1);
+    expect(members).toHaveBeenCalledOnce();
+    const equalConfig = { ...config };
+    useAppStore.setState({ config: equalConfig });
+    expect(await request.guard(context)).toBe(true);
+    expect(stringify.mock.calls.filter(([value]) => value === equalConfig)).toHaveLength(1);
+    const freshServers = [...servers];
+    const freshMembers = vi.spyOn(freshServers, 'map');
+    useAppStore.setState({ servers: freshServers });
+    expect(await request.guard(context)).toBe(true);
+    expect(freshMembers).toHaveBeenCalledOnce();
+    await request.finish();
+  });
+
+  it.each(['non-node config', 'same-id node', 'staged entry', 'selection', 'membership'] as const)('rejects %s changes during the shared status wait', async change => {
+    const read = deferred<typeof running>();
+    vi.spyOn(api.proxy, 'getStatus').mockReturnValue(read.promise);
+    const request = start();
+    const guarded = request.guard(context);
+    await vi.waitFor(() => expect(api.proxy.getStatus).toHaveBeenCalledOnce());
+    if (change === 'non-node config') useAppStore.setState({ config: { ...useAppStore.getState().config!, mixedPort: 7891 } });
+    if (change === 'same-id node') useAppStore.setState({ config: { ...useAppStore.getState().config!, servers: [{ ...node, address: 'other.example' }, second] } as never });
+    if (change === 'staged entry') useStagedConfigStore.setState({ entries: [{ id: 'setting:mixedPort', kind: 'setting', label: 'port', entityPath: ['mixedPort'], nextValue: 7891 }] });
+    if (change === 'selection') useAppStore.setState({ selectedServerId: 'b' });
+    if (change === 'membership') useAppStore.setState({ servers: [node] });
+    read.resolve(running);
+    expect(await guarded).toBe(false);
+    await request.finish();
+  });
+
+  it.each(['stop', 'generation', 'start time', 'configuration', 'selection', 'membership', 'new task'] as const)('does not commit after %s changes while the extra guard awaits', async change => {
+    const route = deferred<boolean>();
+    const extra = vi.fn(() => route.promise);
+    vi.spyOn(api.proxy, 'getStatus').mockResolvedValue(running);
+    vi.spyOn(api.server, 'speedTest').mockResolvedValue(receipt('101', { results: { a: 42 }, measurementContext: context }));
+    const write = vi.spyOn(useLatencyStore.getState(), 'applyLatencyResults').mockImplementation(() => {});
+    const pending = runMobileSpeedTest(['a', 'b'], 'nodes', extra, true);
+    await vi.waitFor(() => expect(extra).toHaveBeenCalledOnce());
+    if (change === 'stop') useAppStore.setState({ proxyStatus: { ...running, running: false } });
+    if (change === 'generation') useAppStore.setState({ proxyStatus: { ...running, mainGeneration: 3 } });
+    if (change === 'start time') useAppStore.setState({ proxyStatus: { ...running, startTime: 456 } });
+    if (change === 'configuration') useAppStore.setState({ config: { ...useAppStore.getState().config!, mixedPort: 7891 } });
+    if (change === 'selection') useAppStore.setState({ selectedServerId: 'b' });
+    if (change === 'membership') useAppStore.setState({ servers: [node] });
+    if (change === 'new task') store.getState().progress({ runId: '102', tested: 1, total: 2, ok: 1, measurementContext: { ...context, runId: '102', requestId: 'request-102' } });
+    route.resolve(true);
+    await pending;
+    expect(write).not.toHaveBeenCalled();
+    expect(store.getState().task?.appliedResults).toEqual({});
+  });
+
+  it('keeps iOS no-context refusal and other-platform legacy fallback without a status read', async () => {
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockResolvedValue(running);
+    const extra = vi.fn().mockResolvedValue(true);
+    vi.stubGlobal('document', { documentElement: { dataset: { mobileOs: 'ios' } } });
+    try {
+      const ios = start(extra);
+      expect(await ios.guard()).toBe(false);
+      expect(extra).not.toHaveBeenCalled();
+      await ios.finish();
+      document.documentElement.dataset.mobileOs = 'android';
+      const legacy = start(extra);
+      expect(await legacy.guard()).toBe(true);
+      expect(extra).toHaveBeenCalledOnce();
+      expect(getStatus).not.toHaveBeenCalled();
+      await legacy.finish();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('one concurrent status read serves burst frames and receipt without duplicate commits', async () => {
+    let result!: Parameters<typeof api.server.onSpeedTestResult>[0];
+    let progress!: Parameters<typeof api.server.onSpeedTestProgress>[0];
+    vi.spyOn(api.server, 'onSpeedTestProgress').mockImplementation(handler => { progress = handler; return () => {}; });
+    vi.spyOn(api.server, 'onSpeedTestResult').mockImplementation(handler => { result = handler; return () => {}; });
+    vi.spyOn(api.server, 'onSpeedTestDone').mockReturnValue(() => {});
+    const read = deferred<typeof running>();
+    const getStatus = vi.spyOn(api.proxy, 'getStatus').mockReturnValue(read.promise);
+    const write = vi.spyOn(useLatencyStore.getState(), 'applyLatencyResults').mockImplementation(() => {});
+    const dispose = subscribeMobileSpeedTestProgress();
+    const request = start();
+    result({ runId: '101', serverId: 'a', latency: 12, measurementContext: context });
+    result({ runId: '101', serverId: 'b', latency: 24, measurementContext: context });
+    progress({ runId: '101', tested: 2, total: 2, ok: 2, measurementContext: context });
+    request.backend.resolve(receipt('101', { results: { a: 12, b: 24 }, measurementContext: context }));
+    await vi.waitFor(() => expect(getStatus).toHaveBeenCalledOnce());
+    read.resolve(running);
+    await request.pending;
+    expect(getStatus).toHaveBeenCalledOnce();
+    expect(store.getState().task?.appliedResults).toEqual({ a: 12, b: 24 });
+    const writes = write.mock.calls.flatMap(([values]) => Object.entries(values));
+    expect(writes.filter(([id]) => id === 'a')).toEqual([['a', 12]]);
+    expect(writes.filter(([id]) => id === 'b')).toEqual([['b', 24]]);
+    dispose();
+  });
 });

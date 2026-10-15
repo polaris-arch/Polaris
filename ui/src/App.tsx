@@ -1,3 +1,4 @@
+import { acquireConfigSync } from '@/store/app-store';
 import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 /**
  * Polaris App 根组件。
@@ -158,7 +159,7 @@ export function handleHelperUpgradeable(
 
 export default function App() {
   const { t, i18n } = useTranslation();
-  const loadConfig = useAppStore((s) => s.loadConfig);
+
   const refreshProxyStatus = useAppStore((s) => s.refreshProxyStatus);
   const servers = useAppStore((s) => s.servers);
   const config = useAppStore((s) => s.config);
@@ -257,11 +258,12 @@ export default function App() {
 
   // 首帧水合：config + 连接态各拉一次（事件只推增量，初值得自己取）。
   useEffect(() => {
-    void loadConfig();
+    const releaseConfig = acquireConfigSync({ scope: 'main' });
     void refreshProxyStatus();
     // R2 挂载首拉待应用差集（上游 4 触发点之「挂载」）：window 重建后 store 为空时水合操作条。
     pullPendingChanges();
-  }, [loadConfig, refreshProxyStatus]);
+    return releaseConfig;
+  }, [refreshProxyStatus]);
 
   // 隐私态首帧水合：`config_get_privacy_mode` 读的是 Rust 进程内 PRIVACY_MODE atomic（跨 renderer
   // reload 存活）。**必须自取初值**——若锁定期间 renderer 白屏 reload / 从托盘锁定后首次开主窗，
@@ -466,22 +468,6 @@ export default function App() {
     );
     return off;
   }, []);
-
-  // 配置变更：任何写盘路径（config_save / config_set_value，见 commands/config.rs 的
-  // broadcast_config_changed）都会广播 → 重拉 config。这是「写后端 → UI 刷新」的兜底总线：
-  // 弹窗提交后各自 loadConfig(true) 是快路径，此处保证漏掉的、以及别的窗口写的，也能收敛。
-  //
-  // **必须 force**：非 force 会被在飞的 loadConfig 单飞合并——写 1 的回声启动 get；写 2 在其在飞期间
-  // 落盘，其回声被合并进写 1 那次 get；若该 get 携带的是写 2 之前的快照，store 就停在旧值，而写 2 的
-  // 回声已被消费掉、不会再有刷新 → 与磁盘持久分叉（表现：开关点了弹回、拖拽回跳一拍）。
-  // force 自带代际失效（invalidateLoadConfig），旧在飞载的回填会被丢弃。代价只是每次广播一次 get。
-  // 回调必须零参（不得读 payload——事件已无载荷）：Rust 侧 `commands/config.rs` 的
-  // `config_changed_payload_tests` 把本文件 include_str! 进测试判据锁住这条形态，改成读参数的
-  // 形态会让 `cargo test -p polaris` 转红。
-  useEffect(() => {
-    const off = api.config.onChanged(() => void loadConfig(true));
-    return off;
-  }, [loadConfig]);
 
   // 代理错误：分腿的**全部判定**在 `domain/proxy-error-routing.ts`（2026-09-06 从本文件整段迁出，
   // 迁出理由与「Android 上哪几条不可达」见该文件头注）—— 移动入口 `mobile/app-wiring.ts` 读的是

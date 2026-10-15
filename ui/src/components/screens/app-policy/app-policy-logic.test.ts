@@ -102,7 +102,8 @@ it('disabled app hover cards do not advertise their saved direct/block policy as
   const { createElement } = await import('react');
   const { renderToStaticMarkup } = await import('react-dom/server');
   const { AppRuleHoverCardContent } = await import('@/components/hover-cards/AppRuleHoverCard');
-  const preset = { id: 'sample', labelKey: 'Sample', geositeTags: [], category: 'custom' } as import('@/domain/app-rules-preset').AppPreset;
+  const { customToPreset } = await import('@/domain/app-rules-preset');
+  const preset = customToPreset({ id: 'sample', name: 'Sample', emoji: '🧩', geositeTags: [], category: 'tools' });
   for (const action of ['direct', 'block'] as const) {
     const html = renderToStaticMarkup(createElement(AppRuleHoverCardContent, {
       preset, rule: { appId: 'sample', action, enabled: false }, isCustom: true,

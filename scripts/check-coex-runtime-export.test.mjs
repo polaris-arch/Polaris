@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   TEST_COMMAND, EXPORT_TEST, SOURCE_PATHS, DECODER_PATHS, STATE_KEYS, canonical, sha256, stateDifferences,
+  TEMPORAL_POLICY_VERSION, TEMPORAL_STATES, TEMPORAL_PATHS, compareExportStates,
   validateStates, validateSnapshot, validateExecution, workspaceInvocation, prepare, capture, verify,
 } from './check-coex-runtime-export.mjs';
 
@@ -57,6 +58,166 @@ test('zero/ignored/failed/duplicate export tests, nonzero cargo, failed capture 
   for (const time of [99, 201, NaN]) assert.throws(() => validateExecution(execution(), passedLine, 90, time));
 });
 
+function assertCompletePartition(result) {
+  const rejected = result.rejectedDifferences ?? result.temporalPolicy?.rejectedDifferences ?? [];
+  const accepted = result.acceptedTemporalDiffs;
+  const rawRejected = rejected.map(({ reason, constraintErrors, ...raw }) => {
+    assert.ok(typeof reason === 'string' && reason.length > 0);
+    if (reason === 'shared temporal qualification failed') {
+      assert.ok(Array.isArray(constraintErrors) && constraintErrors.length > 0);
+      assert.ok(constraintErrors.every(error => typeof error === 'string' && error.length > 0));
+    }
+    return raw;
+  });
+  const key = row => `${row.path}\0${row.kind}`;
+  const acceptedKeys = new Set(accepted.map(key));
+  assert.equal(acceptedKeys.size, accepted.length);
+  assert.equal(new Set(rawRejected.map(key)).size, rawRejected.length);
+  assert.ok(rawRejected.every(row => !acceptedKeys.has(key(row))), 'accepted/rejected must be disjoint');
+  assert.deepEqual([...accepted, ...rawRejected].map(canonical).sort(), result.stateDifferences.map(canonical).sort(),
+    'every original raw diff must occur exactly once, with its exact original expected/actual values');
+}
+
+// These times are controlled checker inputs, not replacement native export evidence.
+const controlledWindow = () => ({ ...execution(), startedAtMs: 90, finishedAtMs: 160 });
+function currentStates() {
+  const value = states();
+  for (const [name, start, end] of [['latest', '100', '110'], ['staleBusy', '100', '110'],
+    ['windowsPartial', '120', '130'], ['windowsUnavailable', '140', '150']]) {
+    Object.assign(value[name].report.value.acquisition, { startedAtUnixMillis: start, endedAtUnixMillis: end });
+  }
+  return value;
+}
+function temporalLocation(path) { return JSON.parse(`[${path.slice(1).replaceAll('][', ',').slice(1, -1)}]`); }
+function changePath(value, parts, replacement, remove = false) {
+  let parent = value;
+  for (const key of parts.slice(0, -1)) parent = parent[key];
+  if (remove) delete parent[parts.at(-1)]; else parent[parts.at(-1)] = replacement;
+}
+test('the explicit eight-path policy retains the full raw diff, original values and history identity', () => {
+  const original = states(); const current = currentStates();
+  const oldBytes = canonical(original); const newBytes = canonical(current);
+  const result = compareExportStates(original, current, controlledWindow());
+  assertCompletePartition(result);
+  assert.equal(TEMPORAL_PATHS.length, 8); assert.equal(new Set(TEMPORAL_PATHS).size, 8);
+  assert.equal(result.policyVersion, 'coex-ci-acquisition-unix-v1');
+  assert.equal(result.status, 'passed');
+  assert.deepEqual(result.stateDifferences, stateDifferences(original, current));
+  assert.equal(result.stateDifferences.length, 8);
+  assert.deepEqual(result.acceptedTemporalDiffs, result.stateDifferences);
+  assert.deepEqual(result.acceptedTemporalDiffs.map(row => row.path).sort(), [...TEMPORAL_PATHS].sort());
+  assert.deepEqual(result.rejectedDifferences, []);
+  assert.equal(canonical(original), oldBytes); assert.equal(canonical(current), newBytes);
+  assert.notEqual(oldBytes, newBytes);
+  // A repeated millisecond and a nonzero sampling duration are both legitimate;
+  // the gate preserves acquisition order, not the historical duration/equality accident.
+  const repeated = currentStates();
+  for (const name of TEMPORAL_STATES) Object.assign(repeated[name].report.value.acquisition,
+    { startedAtUnixMillis: '100', endedAtUnixMillis: '100' });
+  assert.equal(compareExportStates(original, repeated, controlledWindow()).status, 'passed');
+});
+for (const path of TEMPORAL_PATHS) {
+  const parts = temporalLocation(path);
+  test(`temporal field ${path} rejects wrong type, noncanonical decimal and uint64 overflow`, () => {
+    for (const value of [100, null, true, {}, [], '', '01', '-1', '+100', '1.0', '1e2', ' 100', '18446744073709551616']) {
+      const current = currentStates(); changePath(current, parts, value);
+      const result = compareExportStates(states(), current, controlledWindow());
+      assertCompletePartition(result);
+      assert.equal(result.status, 'failed', JSON.stringify(value));
+      assert.ok(result.errors.some(error => error.includes('noncanonical uint64')), JSON.stringify(value));
+      assert.deepEqual(result.acceptedTemporalDiffs, []);
+      assert.deepEqual(result.stateDifferences, stateDifferences(states(), current));
+    }
+  });
+  test(`temporal field ${path} rejects both sides of the actual execution window`, () => {
+    for (const value of ['89', '161', '18446744073709551615']) {
+      const current = currentStates(); changePath(current, parts, value);
+      const result = compareExportStates(states(), current, controlledWindow());
+      assertCompletePartition(result);
+      assert.equal(result.status, 'failed');
+      assert.ok(result.errors.some(error => error.includes('outside this execution window')));
+      assert.deepEqual(result.acceptedTemporalDiffs, []);
+    }
+  });
+  test(`temporal field ${path} cannot reverse its acquisition pair or disappear`, () => {
+    const current = currentStates();
+    const acquisition = current[parts[0]].report.value.acquisition;
+    const start = parts.at(-1) === 'startedAtUnixMillis';
+    changePath(current, parts, String(BigInt(acquisition[start ? 'endedAtUnixMillis' : 'startedAtUnixMillis']) + (start ? 1n : -1n)));
+    const reversed = compareExportStates(states(), current, controlledWindow());
+    assertCompletePartition(reversed);
+    assert.equal(reversed.status, 'failed');
+    assert.ok(reversed.errors.some(error => error.includes('start follows end')));
+    assert.deepEqual(reversed.acceptedTemporalDiffs, []);
+    const missing = currentStates(); changePath(missing, parts, undefined, true);
+    const removed = compareExportStates(states(), missing, controlledWindow());
+    assertCompletePartition(removed);
+    assert.equal(removed.status, 'failed');
+    assert.ok(removed.rejectedDifferences.some(diff => diff.path === path && diff.kind === 'missing'));
+    assert.deepEqual(removed.acceptedTemporalDiffs, []);
+  });
+}
+test('latest/stale acquisition identity and sequential Windows sampling remain required', () => {
+  for (const name of ['latest', 'staleBusy']) for (const field of ['startedAtUnixMillis', 'endedAtUnixMillis']) {
+    const current = currentStates(); current[name].report.value.acquisition[field] = field === 'startedAtUnixMillis' ? '101' : '111';
+    const result = compareExportStates(states(), current, controlledWindow());
+    assertCompletePartition(result);
+    assert.equal(result.status, 'failed');
+    assert.ok(result.errors.some(error => error.includes('same acquisition')));
+  }
+  for (const [name, field, value] of [['windowsPartial', 'startedAtUnixMillis', '109'],
+    ['windowsPartial', 'endedAtUnixMillis', '141'], ['windowsUnavailable', 'startedAtUnixMillis', '129']]) {
+    const current = currentStates(); current[name].report.value.acquisition[field] = value;
+    const result = compareExportStates(states(), current, controlledWindow());
+    assertCompletePartition(result);
+    assert.equal(result.status, 'failed');
+    assert.ok(result.errors.some(error => error.includes('sequence is reversed')));
+    assert.deepEqual(result.acceptedTemporalDiffs, []);
+  }
+});
+test('missing, unsafe or reversed execution windows cannot qualify temporal evidence', () => {
+  for (const value of [undefined, {}, { startedAtMs: '90', finishedAtMs: 160 }, { startedAtMs: 90.5, finishedAtMs: 160 },
+    { startedAtMs: -1, finishedAtMs: 160 }, { startedAtMs: 170, finishedAtMs: 160 },
+    { startedAtMs: 90, finishedAtMs: Number.MAX_SAFE_INTEGER + 1 }]) {
+    const result = compareExportStates(states(), currentStates(), value);
+    assertCompletePartition(result);
+    assert.equal(result.status, 'failed'); assert.deepEqual(result.acceptedTemporalDiffs, []);
+    assert.ok(result.errors.some(error => error.includes('execution window')));
+  }
+});
+function leaves(value, parts = []) {
+  if (value !== null && typeof value === 'object' && Object.keys(value).length) {
+    return Object.keys(value).flatMap(key => leaves(value[key], [...parts, Array.isArray(value) ? Number(key) : key]));
+  }
+  return [{ parts, value }];
+}
+const jsonPath = parts => '$' + parts.map(part => `[${JSON.stringify(part)}]`).join('');
+test('every non-allowlisted leaf stays canonical-strict, including monotonic clocks, bindings and Unknown reasons', () => {
+  const original = states(); const base = currentStates();
+  const candidates = leaves(base).filter(row => !TEMPORAL_PATHS.includes(jsonPath(row.parts)));
+  assert.ok(candidates.length > 100);
+  for (const { parts, value } of candidates) {
+    const changed = structuredClone(base);
+    const replacement = typeof value === 'string' ? `${value}:changed` : typeof value === 'number' ? value + 1
+      : typeof value === 'boolean' ? !value : Array.isArray(value) ? ['changed'] : 'changed';
+    changePath(changed, parts, replacement);
+    const result = compareExportStates(original, changed, controlledWindow());
+    assertCompletePartition(result);
+    assert.equal(result.status, 'failed', jsonPath(parts));
+    assert.ok(result.rejectedDifferences.length > 0, jsonPath(parts));
+    assert.deepEqual(result.stateDifferences, stateDifferences(original, changed));
+  }
+  for (const name of STATE_KEYS) {
+    const changed = currentStates(); changed[name].unreviewedField = 'new';
+    const result = compareExportStates(original, changed, controlledWindow());
+    assertCompletePartition(result);
+    assert.equal(result.status, 'failed');
+    assert.ok(result.rejectedDifferences.some(diff => diff.path === `$["${name}"]["unreviewedField"]`));
+  }
+  const changed = currentStates(); changed.latest.report.value.acquisition.anotherAtUnixMillis = '100';
+  assert.equal(compareExportStates(original, changed, controlledWindow()).status, 'failed');
+});
+
 // These are controlled checker fixtures, NOT native serializer evidence: a private temporary
 // Git repository and fake cargo exercise actual prepare/capture/verify I/O without compiling.
 function fixture(t, options = {}, originalStates = states()) {
@@ -76,7 +237,7 @@ function fixture(t, options = {}, originalStates = states()) {
   const bin = join(temporary, 'bin'); mkdirSync(bin);
   writeFileSync(join(bin, 'cargo'), `#!/usr/bin/env bash\nexec "${process.execPath}" "$FAKE_CARGO_SCRIPT" "$@"\n`, { mode: 0o700 });
   const fake = join(temporary, 'fake-cargo.mjs');
-  writeFileSync(fake, `import { appendFileSync, writeFileSync } from 'node:fs';\nappendFileSync(process.env.FAKE_INVOCATIONS, JSON.stringify({ args: process.argv.slice(2), exportPath: process.env.POLARIS_COEX_RUNTIME_FIXTURE ?? null }) + '\\n');\nif (!process.env.NO_EXPORT) writeFileSync(process.env.POLARIS_COEX_RUNTIME_FIXTURE, process.env.EXPORT_BYTES);\nif (!process.env.ZERO_TESTS) console.log(${JSON.stringify(passedLine.trim())});\nprocess.exitCode = Number(process.env.FAKE_EXIT || '0');\n`);
+  writeFileSync(fake, `import { appendFileSync, writeFileSync } from 'node:fs';\nappendFileSync(process.env.FAKE_INVOCATIONS, JSON.stringify({ args: process.argv.slice(2), exportPath: process.env.POLARIS_COEX_RUNTIME_FIXTURE ?? null }) + '\\n');\nif (!process.env.NO_EXPORT) { const payload = JSON.parse(process.env.EXPORT_BYTES); const now = String(Date.now()); for (const name of ${JSON.stringify(['latest','staleBusy','windowsPartial','windowsUnavailable'])}) { const a = payload.states[name].report.value.acquisition; a.startedAtUnixMillis = now; a.endedAtUnixMillis = now; } writeFileSync(process.env.POLARIS_COEX_RUNTIME_FIXTURE, JSON.stringify(payload)); }\nif (!process.env.ZERO_TESTS) console.log(${JSON.stringify(passedLine.trim())});\nprocess.exitCode = Number(process.env.FAKE_EXIT || '0');\n`);
   const env = { ...process.env, RUNNER_OS: 'Linux', RUNNER_TEMP: temporary, GITHUB_OUTPUT: output, GITHUB_SHA: git('rev-parse', 'HEAD'),
     GITHUB_RUN_ID: 'fixture-run', GITHUB_RUN_ATTEMPT: '1', GITHUB_JOB: 'fixture-job', GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'fixture/fixture',
     PATH: `${bin}:${process.env.PATH}`, FAKE_CARGO_SCRIPT: fake, FAKE_INVOCATIONS: join(temporary, 'invocations.jsonl'), EXPORT_BYTES: JSON.stringify({ provenance: 'controlled checker fixture only', states: states() }), ...options };
@@ -88,8 +249,14 @@ test('actual checker path retains evidence, passes controlled matching output, a
   const f = fixture(t);
   assert.equal(await capture(f.root, f.script, f.env), 0);
   const result = await verify(f.root, f.env);
+  assertCompletePartition(result);
   assert.equal(result.status, 'passed');
   assert.equal(result.newSerializerExecution, true);
+  assert.equal(result.temporalPolicy.policyVersion, TEMPORAL_POLICY_VERSION);
+  assert.equal(result.temporalPolicy.status, 'passed');
+  assert.equal(result.stateDifferences.length, 8);
+  assert.deepEqual(result.acceptedTemporalDiffs, result.stateDifferences);
+  assert.notEqual(result.originalStatesCanonicalSha256, result.currentStatesCanonicalSha256);
   assert.equal(result.decoder.entry, DECODER_PATHS[0]);
   assert.equal(result.decoder.exportName, 'decodeCoexRuntimeState');
   assert.equal(result.decoder.status, 'passed');
@@ -100,7 +267,7 @@ test('actual checker path retains evidence, passes controlled matching output, a
   assert.deepEqual(invocations, [{ args: ['test', '--workspace', '--no-fail-fast'], exportPath: join(f.directory, 'coex-runtime-current.json') }]);
   assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
   for (const path of ['before.json', 'after.json', 'cargo-test.log', 'cargo-test.stdout.log', 'cargo-test.stderr.log',
-    'cargo-test-execution.json', 'coex-runtime-current.json', 'state-diff.json', 'verification.json']) assert.ok(existsSync(join(f.directory, path)), path);
+    'cargo-test-execution.json', 'coex-runtime-current.json', 'state-diff.json', 'accepted-temporal-diff.json', 'verification.json']) assert.ok(existsSync(join(f.directory, path)), path);
 });
 for (const options of [{ NO_EXPORT: '1' }, { ZERO_TESTS: '1' }, { FAKE_EXIT: '7' }]) {
   test(`actual checker rejects ${JSON.stringify(options)} and preserves failure artifacts`, async t => {
@@ -111,6 +278,14 @@ for (const options of [{ NO_EXPORT: '1' }, { ZERO_TESTS: '1' }, { FAKE_EXIT: '7'
     const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
     assert.equal(result.status, 'failed');
     assert.ok(result.errors.length > 0);
+    if (options.FAKE_EXIT) {
+      assert.equal(result.execution.exitCode, 7);
+      assert.equal(result.newSerializerExecution, false);
+      assert.equal(result.temporalPolicy.status, 'passed');
+      assert.equal(result.decoder.status, 'passed');
+      assert.equal(result.acceptedTemporalDiffs.length, 8);
+      assert.ok(result.errors.some(error => error.includes('workspace test or evidence capture failed')));
+    }
     assert.ok(existsSync(join(f.directory, 'cargo-test-execution.json')));
     assert.ok(existsSync(join(f.directory, 'state-diff.json')));
   });
@@ -124,22 +299,54 @@ test('actual checker preserves full field mismatch, and rejects a changed source
   const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
   assert.equal(result.status, 'failed');
   assert.ok(result.errors.some(error => error.includes('checkout')));
-  assert.deepEqual(result.stateDifferences, [{ path: '$["latest"]["binding"]["sessionId"]["value"]', kind: 'changed', expected: '3', actual: '4' }]);
+  assert.equal(result.stateDifferences.length, 9);
+  assert.equal(result.acceptedTemporalDiffs.length, 8);
+  assert.deepEqual(result.temporalPolicy.rejectedDifferences, [{ path: '$["latest"]["binding"]["sessionId"]["value"]', kind: 'changed', expected: '3', actual: '4', reason: 'outside exact temporal allowlist' }]);
+  assertCompletePartition(result);
   assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
 });
-test('canonical equality alone cannot pass states rejected by the actual TypeScript consumer', async t => {
+test('allowed temporal differences cannot pass matching schema-invalid states through the real TypeScript consumer', async t => {
   const invalid = states(); invalid.latest.schemaVersion = 999;
   const f = fixture(t, { EXPORT_BYTES: JSON.stringify({ provenance: 'controlled fixture', states: invalid }) }, invalid);
   assert.equal(await capture(f.root, f.script, f.env), 0);
   await assert.rejects(verify(f.root, f.env), /actual decodeCoexRuntimeState rejected/);
   const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
-  assert.deepEqual(result.stateDifferences, []);
-  assert.equal(result.originalStatesCanonicalSha256, result.currentStatesCanonicalSha256);
+  assert.equal(result.stateDifferences.length, 8);
+  assert.deepEqual(result.acceptedTemporalDiffs, result.stateDifferences);
+  assert.equal(result.temporalPolicy.status, 'passed');
+  assert.deepEqual(result.temporalPolicy.rejectedDifferences, []);
   assert.equal(result.decoder.exportName, 'decodeCoexRuntimeState');
   assert.equal(result.decoder.status, 'failed');
   assert.equal(result.decoder.results.length, 6);
   assert.equal(result.decoder.results.find(row => row.name === 'latest').status, 'failed');
   assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
+});
+for (const shape of ['missing-crashed', 'null-crashed']) test(`malformed ${shape} retains a complete rejected classification`, async t => {
+  const current = states();
+  if (shape === 'missing-crashed') delete current.crashed; else current.crashed = null;
+  const f = fixture(t, { EXPORT_BYTES: JSON.stringify({ provenance: 'controlled fixture', states: current }) });
+  assert.equal(await capture(f.root, f.script, f.env), 0);
+  await assert.rejects(verify(f.root, f.env));
+  const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
+  assert.equal(result.status, 'failed');
+  assert.equal(result.temporalPolicy.status, 'failed');
+  assert.equal(result.stateDifferences.length, 9);
+  assert.deepEqual(result.acceptedTemporalDiffs, []);
+  assert.equal(result.temporalPolicy.rejectedDifferences.length, 9);
+  assertCompletePartition(result);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.directory, 'state-diff.json'))), result.stateDifferences);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.directory, 'accepted-temporal-diff.json'))), []);
+  assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
+});
+test('missing provenance still preserves the full temporal partition without making the export pass', async t => {
+  const f = fixture(t, { EXPORT_BYTES: JSON.stringify({ provenance: '', states: states() }) });
+  assert.equal(await capture(f.root, f.script, f.env), 0);
+  await assert.rejects(verify(f.root, f.env), /missing native export provenance/);
+  const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
+  assert.equal(result.status, 'failed');
+  assert.equal(result.temporalPolicy.status, 'passed');
+  assert.equal(result.stateDifferences.length, 8);
+  assertCompletePartition(result);
 });
 test('the static custom shell routes each platform to one original command and preserves PowerShell native exit', () => {
   for (const platform of ['Linux', 'macOS']) assert.deepEqual(workspaceInvocation(platform, '/tmp/command', `${TEST_COMMAND}\n`),

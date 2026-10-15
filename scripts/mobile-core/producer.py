@@ -6,8 +6,10 @@ or issues device acceptance. Cache hits use the same native/content predicate
 as fresh outputs. A verified component still needs final App carrier validation.
 """
 import argparse
+import codecs
 import contextlib
 import fcntl
+import io
 import json
 import math
 import os
@@ -37,6 +39,8 @@ BORROWED_PROGRESS_PHASE = None
 RUN_SECONDS = 3600
 RUN_TERM_SECONDS = 10
 RUN_HEARTBEAT_SECONDS = 30
+RUN_CHUNK_BYTES = 65536
+RUN_ERROR_CHARS = 8192
 OBSERVATION_PHASES = frozenset((
     'component-build-or-revalidate', 'component-import-verification', 'component-link-input',
     'rust-target-build', 'host-swift-controls', 'app-extension-archive',
@@ -72,11 +76,11 @@ def inspection_progress(stage, elapsed_seconds, file_reads, read_bytes):
 
 
 @contextlib.contextmanager
-def _run_log(log):
+def _run_log(log, *, read_back=False):
     if log is None:
         yield None
         return
-    resource = Path(log).open('ab')
+    resource = Path(log).open('a+b' if read_back else 'ab')
     sink = resource.__enter__()
     try:
         yield sink
@@ -84,12 +88,64 @@ def _run_log(log):
         original = sys.exc_info()
         try:
             resource.__exit__(*original)
-        except BaseException:
+        except BaseException as error:
             if original[0] is None:
+                failure_note(error, 'original tool log incomplete; close failed')
                 raise
+            failure_note(original[1], 'original tool log incomplete; secondary close failed')
 
-def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
+
+def _write_run_log(sink, raw):
+    try:
+        require(sink.write(raw) == len(raw), 'original tool log incomplete: short write')
+    except BaseException as error:
+        failure_note(error, 'original tool log incomplete; write failed')
+        raise
+
+
+def _project_run_logs(sink, raw_sinks, starts, counts, encoding, errors):
+    """Append this call's stdout then stderr with bounded decode/error state."""
+    tail, decode_error = '', None
+    for stream in ('stdout', 'stderr'):
+        source = raw_sinks[stream]
+        source.flush()
+        source.seek(starts[stream])
+        remaining = counts[stream]
+        decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder(encoding)(errors), True)
+        while remaining:
+            raw = source.read(min(RUN_CHUNK_BYTES, remaining))
+            require(raw, 'original tool log incomplete: raw range ended early')
+            remaining -= len(raw)
+            _write_run_log(sink, raw)
+            if decoder is not None:
+                try:
+                    text = decoder.decode(raw)
+                    if stream == 'stderr':
+                        tail = (tail + text)[-RUN_ERROR_CHARS:]
+                except UnicodeError as error:
+                    # Keep the complete original projection even when the
+                    # historical strict text contract will reject these bytes.
+                    if decode_error is None:
+                        decode_error = error
+                    decoder = None
+        if decoder is not None:
+            try:
+                text = decoder.decode(b'', final=True)
+                if stream == 'stderr':
+                    tail = (tail + text)[-RUN_ERROR_CHARS:]
+            except UnicodeError as error:
+                if decode_error is None:
+                    decode_error = error
+    sink.flush()
+    if decode_error is not None:
+        raise decode_error
+    return tail
+
+
+def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
         observation_fd=None, observation_phase=None, observation_slot=None):
+    require(capture in ('full', 'none'), 'unknown tool capture mode')
+    require(capture != 'none' or log is not None, 'capture none requires complete original logs')
     if observation_phase is None and BORROWED_PROGRESS_FD is not None:
         observation_phase = BORROWED_PROGRESS_PHASE
     # Only the explicit carrier receives the borrowed progress descriptor.
@@ -107,19 +163,26 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
     # arbitrary pipe scheduling must never splice UTF-8/WORK/merge lines.
     stdout_log = None if log is None else str(log) + '.stdout.raw'
     stderr_log = None if log is None else str(log) + '.stderr.raw'
-    with _run_log(log) as sink, _run_log(stdout_log) as out_sink, _run_log(stderr_log) as err_sink:
+    with _run_log(log) as sink, _run_log(stdout_log, read_back=capture == 'none') as out_sink, \
+            _run_log(stderr_log, read_back=capture == 'none') as err_sink:
         raw_sinks = {'stdout': out_sink, 'stderr': err_sink}
+        starts = ({stream: stream_sink.tell() for stream, stream_sink in raw_sinks.items()}
+                  if capture == 'none' else None)
         selected = selectors.DefaultSelector()
         try:
             process = subprocess.Popen([str(a) for a in args], cwd=cwd, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        start_new_session=True, pass_fds=tuple(ACTIVE_FDS) + extra_fds)
-        except BaseException:
-            selected.close()
+        except BaseException as original:
+            try:
+                selected.close()
+            except BaseException:
+                failure_note(original, 'secondary selector close failed after spawn failure')
             raise
         encoding, errors = process.stdout.encoding, process.stdout.errors
-        buffers = {'stdout': [], 'stderr': []}
+        buffers = {'stdout': [], 'stderr': []} if capture == 'full' else None
         counts = {'stdout': 0, 'stderr': 0}
+        cleanup_log_failed = False
         started, next_observation = time.monotonic(), 0
 
         def observe(event):
@@ -139,7 +202,7 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
                 'scope': 'direct process/pipe bytes only; no descendant liveness or acceptance'})
 
         def drain(deadline, *, cleanup=False):
-            nonlocal next_observation
+            nonlocal next_observation, cleanup_log_failed
             while selected.get_map() or process.poll() is None:
                 now = time.monotonic()
                 if now >= deadline:
@@ -148,12 +211,13 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
                     observe('waiting')
                     next_observation = now + RUN_HEARTBEAT_SECONDS
                 for key, _ in selected.select(min(1, max(0, deadline - now))):
-                    raw = os.read(key.fileobj.fileno(), 65536)
+                    raw = os.read(key.fileobj.fileno(), RUN_CHUNK_BYTES)
                     if not raw:
                         selected.unregister(key.fileobj)
                         key.fileobj.close()
                         continue
-                    buffers[key.data].append(raw)
+                    if buffers is not None:
+                        buffers[key.data].append(raw)
                     counts[key.data] += len(raw)
                     stream_sink = raw_sinks[key.data]
                     if stream_sink is not None:
@@ -161,13 +225,17 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
                             # A secondary log failure must not interrupt pipe
                             # draining or replace the triggering exception.
                             try:
-                                stream_sink.write(raw)
+                                _write_run_log(stream_sink, raw)
                                 stream_sink.flush()
-                            except OSError:
-                                pass
+                            except Exception:
+                                cleanup_log_failed = True
                         else:
-                            stream_sink.write(raw)
-                            stream_sink.flush()
+                            try:
+                                _write_run_log(stream_sink, raw)
+                                stream_sink.flush()
+                            except BaseException as error:
+                                failure_note(error, 'original tool log incomplete; raw storage failed')
+                                raise
             process.wait()
 
         try:
@@ -221,31 +289,46 @@ def run(args, *, cwd=None, env=None, log=None, progress_fd=None,
                 failure_note(original, 'native cleanup incomplete; original reservation/group retained')
             raise
         finally:
-            failing = sys.exc_info()[0] is not None
+            original = sys.exc_info()[1]
+            if cleanup_log_failed and original is not None:
+                failure_note(original, 'original tool log incomplete; secondary raw storage failed during cleanup')
             try:
-                if sink is not None:
+                if capture == 'none':
+                    stderr_tail = _project_run_logs(sink, raw_sinks, starts, counts, encoding, errors)
+                elif sink is not None:
                     for stream in ('stdout', 'stderr'):
                         for raw in buffers[stream]:
-                            sink.write(raw)
+                            _write_run_log(sink, raw)
                     sink.flush()
-            except BaseException:
-                if not failing:
+            except BaseException as error:
+                if not isinstance(error, UnicodeError):
+                    failure_note(error, 'original tool log incomplete; projection failed')
+                if original is None:
                     raise
+                failure_note(original, 'secondary original-log projection or decoding failed')
             finally:
-                closing_with_failure = failing or sys.exc_info()[0] is not None
+                closing_error = sys.exc_info()[1] or original
+                first_close_error = None
                 for resource in (selected, process.stdout, process.stderr):
                     try:
                         resource.close()
-                    except BaseException:
-                        if not closing_with_failure:
-                            raise
+                    except BaseException as error:
+                        if first_close_error is None:
+                            first_close_error = error
+                if first_close_error is not None:
+                    if closing_error is None:
+                        raise first_close_error
+                    failure_note(closing_error, 'secondary selector/pipe close failed')
+        if capture == 'none':
+            require(process.returncode == 0, 'actual tool failed (' + str(args[0]) + '): ' + stderr_tail)
+            return None
         # Decode only after EOF, so split multibyte sequences remain complete.
 
         # Preserve the original text=True universal-newline stdout contract.
         def text_output(stream):
             return b''.join(buffers[stream]).decode(encoding, errors).replace('\r\n', '\n').replace('\r', '\n')
         stdout, stderr = text_output('stdout'), text_output('stderr')
-        require(process.returncode == 0, 'actual tool failed (' + str(args[0]) + '): ' + stderr[-8192:])
+        require(process.returncode == 0, 'actual tool failed (' + str(args[0]) + '): ' + stderr[-RUN_ERROR_CHARS:])
         return stdout
 
 
@@ -770,13 +853,13 @@ def execute(args):
         # init installs gobind@latest. The pinned generator only requires this
         # private GOPATH marker directory; create it without invoking init.
         private_dir(Path(env['GOPATH']) / 'pkg/gomobile')
-        run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log')
+        run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log', capture='none')
         graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
         admit_module_cache(source, graph, tools['go'], env, work)
         require(verify_source(source, value, generator_outputs=True) == source_observation,
                 'source changed during module cache admission')
         graph = module_stream(run([tools['go'], 'list', '-m', '-json', 'all'], cwd=source, env=env))
-        run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log')
+        run([tools['go'], 'mod', 'verify'], cwd=source, env=env, log=work / 'original-module-verify.log', capture='none')
         # Keep exact paths for native BuildInfo; portable source facts stay separate.
         binding = {'schema': 'polaris-mobile-producer-input-v1', 'platform': args.platform,
                    'sourceObservation': source_observation, 'sourceContract': value, 'moduleGraph': graph,
@@ -837,7 +920,7 @@ def execute(args):
             # Actual compiler objects must remain observable on a fresh producer
             # even if the Go compiler cache already contains the target.
             env['GODEBUG'] = 'gocacheverify=1'
-            run(command, cwd=source, env=env, log=log)
+            run(command, cwd=source, env=env, log=log, capture='none')
             require(verify_source(source, value, generator_outputs=True) == source_observation, 'source changed during bind')
             require(tool_facts(args, value, env)[1] == identities and producer_code() == binding['producer'], 'producer/tool input changed')
             expected = 'polaris-mobile-' + fp

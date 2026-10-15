@@ -1,4 +1,4 @@
-import { invoke, invokeScalar, listen } from '../ipc-client';
+import { invoke, invokeScalar, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { UserConfig, StagedClassification, SaveOutcome } from '../../contracts/types';
 import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
@@ -126,6 +126,11 @@ export const configApi = {
    * `{ key?, oldValue?, newValue? }` 是照搬 Electron 侧的形状，而 `newValue` 经脱敏、
    * 也没走 `config_get` 那侧的 bypassLANList 补齐 —— 直接拿来用是错的（见 `use-config.ts`）。
    */
+  /** Resolve only after native registration; callers then take their initial snapshot. */
+  onChangedReady(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_CONFIG_CHANGED, listener);
+  },
+
   onChanged(listener: () => void): () => void {
     return listen(IPC_CHANNELS.EVENT_CONFIG_CHANGED, listener);
   },

@@ -235,7 +235,9 @@ fn norm_server_projection_preserves_id_order_filter_and_duplicate_order() {
     let selected = BTreeSet::from(["a".to_owned(), "z".to_owned()]);
     let empty = BTreeSet::new();
     for filter in [None, Some(&selected), Some(&empty)] {
-        let mut expected: Vec<_> = config.servers.iter()
+        let mut expected: Vec<_> = config
+            .servers
+            .iter()
             .filter(|server| filter.is_none_or(|ids| ids.contains(&server.id)))
             .collect();
         expected.sort_by(|left, right| left.id.cmp(&right.id));

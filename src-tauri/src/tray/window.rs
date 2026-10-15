@@ -343,8 +343,8 @@ pub(super) fn notify_screen_change_remeasure(app: &AppHandle) {
         return;
     };
     // 走腿 A 那条**既有** eval 桥（[`show_ready_overlay`] 里的同一个全局），不新开 IPC 通道、
-    // 不新增第二个全局：这仍是一次单向、无载荷的通知，通道的注册/契约/双侧维护成本全是净亏。
-    let _ = win.eval("window.__POLARIS_TRAY_REMEASURE__?.();");
+    // 不新增第二个全局：geometry 只重量，不表示窗口已展开或恢复交互。
+    let _ = win.eval("window.__POLARIS_TRAY_REMEASURE__?.('geometry');");
 }
 
 /// 把冷建排到托盘点击回调返回之后：W18 已证实 WebView 建/销不能跑在 OS 消息分发栈内；同一纪律
@@ -422,8 +422,8 @@ pub(super) fn show_ready_overlay(app: &AppHandle, win: &tauri::WebviewWindow) {
     // 「退出」要往下拉才看得见；中途改了分辨率或换屏则可能反过来高得超出屏幕，连滚都够不到。
     // 排在 `win.show()` **之后**：隐藏态 WebView 量到的仍是上一次展开的布局。
     // 走既有 eval 桥（同 `hide_overlay` 里的 `__POLARIS_NATIVE_HOVER__`）而不新开 IPC 通道 ——
-    // 这是一次单向、无载荷的通知，通道的注册/契约/双侧维护成本全是净亏。
-    let _ = win.eval("window.__POLARIS_TRAY_REMEASURE__?.();");
+    // show 原因只在成功展开后发送；non-activating 宿主不保证另发 focus。
+    let _ = win.eval("window.__POLARIS_TRAY_REMEASURE__?.('show');");
     focus_overlay(win);
     log_open_probe(app, "shown", true);
 }
