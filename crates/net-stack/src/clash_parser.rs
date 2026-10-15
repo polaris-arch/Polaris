@@ -693,8 +693,8 @@ fn resolve_merge_keys_limited(
                         }
                     }
                     Value::Sequence(seq) => {
-                        // 列表形式：逆序合并（靠前优先级高，与 js-yaml 一致）。
-                        for item in seq.into_iter().rev() {
+                        // First mapping wins; explicit keys already in m retain highest priority.
+                        for item in seq {
                             if let Value::Mapping(src) = item {
                                 for (k, v) in src {
                                     if !m.contains_key(&k) {
@@ -1731,7 +1731,7 @@ pub fn apply_provider_filters(
             }
             None => warn(format!(
                 "provider [{provider_name}] filter 非法或超长正则，已忽略该过滤: {}",
-                &filter[..filter.len().min(80)]
+                utf8_prefix(filter, 80)
             )),
         }
     }
@@ -1746,7 +1746,7 @@ pub fn apply_provider_filters(
             }
             None => warn(format!(
                 "provider [{provider_name}] exclude-filter 非法或超长正则，已忽略该过滤: {}",
-                &exclude_filter[..exclude_filter.len().min(80)]
+                utf8_prefix(exclude_filter, 80)
             )),
         }
     }
@@ -1756,11 +1756,16 @@ pub fn apply_provider_filters(
 
 /// 被匹配 name 截断到 MAX_FILTER_NAME_LEN（ReDoS 护栏：界定回溯输入规模）。
 fn safe_name(s: &str) -> String {
-    if s.len() > MAX_FILTER_NAME_LEN {
-        s[..MAX_FILTER_NAME_LEN].to_string()
-    } else {
-        s.to_string()
+    utf8_prefix(s, MAX_FILTER_NAME_LEN).to_string()
+}
+
+/// Retain the byte budget without ever slicing inside a UTF-8 character.
+fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
+    &s[..end]
 }
 
 /// override 白名单 3 键（浅合并到解析后的 ServerConfig）。上游 `applyOverride`：

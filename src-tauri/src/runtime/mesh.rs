@@ -1585,12 +1585,16 @@ fn is_utun_name(n: &str) -> bool {
 /// `ifconfig`（全量）输出 → 每张 utun 接口的 inet(v4) 地址表（保序）。上游 `probeMacosTailnetIface` 解析段。纯函数。
 fn parse_ifconfig_ifaces(stdout: &str) -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut active = None;
     for line in stdout.lines() {
-        if let Some(name) = utun_header_name(line) {
-            out.push((name, Vec::new()));
-        } else if let Some((_, ips)) = out.last_mut() {
+        if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            active = utun_header_name(line).map(|name| {
+                out.push((name, Vec::new()));
+                out.len() - 1
+            });
+        } else if let Some(index) = active {
             if let Some(ip) = inet_v4_addr(line) {
-                ips.push(ip);
+                out[index].1.push(ip);
             }
         }
     }

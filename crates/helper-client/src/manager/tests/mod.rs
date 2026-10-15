@@ -261,7 +261,7 @@ fn lifecycle_uses_platform_service_label() {
     for (platform, want) in [
         (Platform::Win, WIN_SERVICE_NAME),
         (Platform::Mac, SERVICE_LABEL),
-        (Platform::Linux, SERVICE_LABEL),
+        (Platform::Linux, LINUX_SERVICE_NAME),
     ] {
         let start_calls = Arc::new(Mutex::new(vec![]));
         let stop_calls = Arc::new(Mutex::new(vec![]));
@@ -1657,4 +1657,23 @@ mod unix_journal_recovery {
             "no daemon exists yet in staging"
         );
     }
+}
+
+#[test]
+fn linux_lifecycle_label_matches_installed_unit_and_uninstall_target() {
+    let paths = InstallPaths::linux();
+    let descriptor = paths.descriptor.as_ref().unwrap();
+    assert_eq!(descriptor.file_name().unwrap(), paths.service_label);
+    assert_eq!(paths.service_label, LINUX_SERVICE_NAME);
+    let params = install_params(
+        PathBuf::from("/inert"),
+        PathBuf::from("/inert/polaris-helper"),
+    );
+    let install = build_linux_install_script(&paths, &params, &"a".repeat(64));
+    assert!(install.contains(descriptor.to_str().unwrap()));
+    assert!(install.contains(&format!("SERVICE='{LINUX_SERVICE_NAME}'")));
+    assert!(install.contains("systemctl enable \"$SERVICE\""));
+    assert!(install.contains("systemctl restart \"$SERVICE\""));
+    let uninstall = build_linux_uninstall_script(&paths);
+    assert!(uninstall.contains(&format!("systemctl disable --now {LINUX_SERVICE_NAME}")));
 }

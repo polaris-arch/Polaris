@@ -360,3 +360,96 @@ fn updater_must_prepare_before_detached_spawn_with_no_running_shortcut() {
     assert!(!body.contains("proxy.status().running") && !body.contains("proxy.stop().await"));
     assert!(body[prepare..spawn].contains("return Ok(ApiResponse::err_with_code("));
 }
+
+/// Main drain is the real ProxyRuntime path; only the unrelated owners and OS
+/// DNS operations are fixtures. No application/service/device removal is used.
+struct DnsExitPorts {
+    proxy: Arc<crate::runtime::proxy::ProxyRuntime>,
+}
+#[async_trait]
+impl ExitPorts for DnsExitPorts {
+    fn identity(&self) -> RuntimeIdentity {
+        [Arc::as_ptr(&self.proxy) as usize, 0]
+    }
+    fn fence_main(&self) -> Result<(), String> {
+        self.proxy.begin_shutdown()
+    }
+    fn fence_login(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn fence_temp(&self) -> Result<(), String> {
+        Ok(())
+    }
+    fn fence_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn drain_main(&self) -> Result<(), String> {
+        self.proxy.shutdown_for_exit().await
+    }
+    async fn drain_login(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn drain_temp(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn drain_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dns_failure_denies_exit_ready_and_preserves_full_removal_material_until_retry() {
+    use crate::runtime::proxy::tests::{install_dns_recovery_fixture, test_runtime_recording};
+    use crate::runtime::uninstall::{self, StepOutcome, UninstallOps};
+    struct Removal {
+        config: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+    impl UninstallOps for Removal {
+        fn disable_autostart(&self) -> StepOutcome {
+            StepOutcome::done("fixture")
+        }
+        fn uninstall_helper(&self) -> StepOutcome {
+            StepOutcome::done("fixture")
+        }
+        fn remove_user_config(&self) -> StepOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::remove_dir_all(&self.config).unwrap();
+            StepOutcome::done("temporary fixture only")
+        }
+        fn remove_cache_dir(&self) -> StepOutcome {
+            StepOutcome::done("fixture")
+        }
+        fn remove_preferences(&self) -> StepOutcome {
+            StepOutcome::done("fixture")
+        }
+        fn remove_app(&self) -> StepOutcome {
+            StepOutcome::done("fixture")
+        }
+    }
+    let (proxy, dir, _) = test_runtime_recording();
+    let dns = install_dns_recovery_fixture(&proxy);
+    let removal = Removal {
+        config: dir.to_path_buf(),
+        calls: AtomicUsize::new(0),
+    };
+    let ports = DnsExitPorts { proxy };
+    let state = ExitCleanupState::default();
+    let prepare_and_remove = || async {
+        let ready = state.prepare(&ports, Duration::from_secs(5)).await?;
+        // Same authority boundary as app_uninstall_all: no deletion pipeline
+        // exists without Ready, and Ready remains held throughout the pipeline.
+        let report = uninstall::run_uninstall(&removal, StepOutcome::done("exit confirmed"));
+        drop(ready);
+        Ok::<_, String>(report)
+    };
+    assert!(prepare_and_remove().await.is_err());
+    assert_eq!(removal.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    assert!(matches!(*state.phase.lock().await, ExitPhase::Pending));
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    assert!(prepare_and_remove().await.is_ok());
+    assert_eq!(removal.calls.load(Ordering::SeqCst), 1);
+    assert!(!removal.config.exists());
+    assert!(!dns.marker.exists());
+}

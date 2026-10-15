@@ -78,3 +78,31 @@ describe('redactSensitive（日志脱敏）', () => {
     expect(redactSensitive('helper connected v3')).toBe('helper connected v3');
   });
 });
+
+
+describe('compressed IPv6 privacy tokens', () => {
+  it.each(['2001:db8::1234', '::ffff:192.0.2.1', 'fe80::abcd%en0', '::', '::1'])('redacts %s', (address) => {
+    expect(redactSensitive(`peer [${address}]:443`)).toBe('peer [•••]:443');
+    expect(redactSensitive(`peer ${address} up`)).toBe('peer ••• up');
+  });
+  it('keeps timestamps and invalid colon tokens while handling trailing punctuation', () => {
+    expect(redactSensitive('12:34:56 abc:def:123 2001:db8::5.')).toBe('12:34:56 abc:def:123 •••.');
+  });
+});
+
+
+describe('colon-delimited IPv6 log values', () => {
+  it.each([
+    ['peer:2001:db8::1234', 'peer:•••'],
+    ['key:::1', 'key:•••'],
+    ['key:::ffff:192.0.2.1', 'key:•••'],
+    ['peer:fe80::abcd%en0', 'peer:•••'],
+    ['peer:2001:db8:1:2:3:4:5:6.', 'peer:•••.'],
+  ])('redacts a valid value inside %s', (line, masked) => {
+    expect(redactSensitive(line)).toBe(masked);
+  });
+  it('keeps tagged timestamps, versions and incomplete colon groups', () => {
+    expect(redactSensitive('time:12:34:56 version:1.14.0-alpha.43 key:abc:def:123'))
+      .toBe('time:12:34:56 version:1.14.0-alpha.43 key:abc:def:123');
+  });
+});

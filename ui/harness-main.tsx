@@ -202,12 +202,14 @@ if (coexFixtureEnabled) {
 
 void i18nReady.then(async () => {
   if (meshIngressFixture) {
-    const [{ useAppStore }, { default: TsSettingsDialog }] = await Promise.all([
-      import('./src/store/app-store'), import('./src/components/dialogs/TsSettingsDialog'),
+    const [{ useAppStore }, { DialogHost }, { useDialogStore }] = await Promise.all([
+      import('./src/store/app-store'), import('./src/components/dialogs/DialogHost'),
+      import('./src/components/dialogs/dialog-store'),
     ]);
     await useAppStore.getState().loadConfig(true);
+    useDialogStore.getState().open({ kind: 'ts-settings', serverId: 'mesh-ingress-ts' });
     ReactDOM.createRoot(document.getElementById('root')!).render(
-      <TsSettingsDialog serverId="mesh-ingress-ts" />,
+      <DialogHost />,
     );
   } else {
     ReactDOM.createRoot(document.getElementById('root')!).render(

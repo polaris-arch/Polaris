@@ -95,6 +95,76 @@ struct LifecycleTests {
         let successfulStop = vpnSessionEvidence(profileIdentity: profile, report: report, stopRequestID: "new-stop")
         assert(vpnStopFailure(evidence: successfulStop, profileExists: true) == nil)
         assert(vpnIdleFailure(evidence: successfulStop, profileExists: true, active: false) == nil)
+        var disconnectedStop = successfulStop
+        disconnectedStop["active"] = false; disconnectedStop["running"] = false; disconnectedStop["status"] = 1
+        disconnectedStop["extensionGeneration"] = NSNumber(value: 8)
+        assert(vpnIdempotentStopIsConfirmed(evidence: disconnectedStop, expectedGeneration: 7))
+        assert(!vpnIdempotentStopIsConfirmed(evidence: disconnectedStop, expectedGeneration: 8))
+        assert(disconnectedStop["tailscaleStoreRetirement"] == nil)
+        var staleDisconnectedStop = disconnectedStop
+        staleDisconnectedStop["runtimeStopped"] = nil
+        assert(!vpnIdempotentStopIsConfirmed(evidence: staleDisconnectedStop, expectedGeneration: 7))
+        staleDisconnectedStop = disconnectedStop; staleDisconnectedStop["lastError"] = "unknown cleanup"
+        assert(!vpnIdempotentStopIsConfirmed(evidence: staleDisconnectedStop, expectedGeneration: 7))
+        // Actual recovery helper used by the disconnected no-op Stop branch.
+        // A host deadline/read failure must yield to a late clean native report.
+        var hostSession: String? = "session-a"
+        var hostReason: String? = "Host Stop deadline expired"
+        let oldOperation = report["operationRequestID"] as? String
+        assert(vpnRecoverRepeatedStop(evidence: disconnectedStop, expectedGeneration: 7,
+            uncertainSession: &hostSession, uncertainReason: &hostReason))
+        assert(hostSession == nil && hostReason == nil)
+        assert(vpnIdleFailure(evidence: disconnectedStop, profileExists: true, active: false) == nil)
+        assert(report["operationRequestID"] as? String == oldOperation)
+        assert(disconnectedStop["tailscaleStoreRetirement"] == nil)
+        for key in ["cleanupError", "lastError", "uncertainSettingsGeneration"] {
+            var bad = disconnectedStop
+            if key == "uncertainSettingsGeneration" { bad[key] = NSNumber(value: 9) }
+            else { bad[key] = "provider quarantine" }
+            hostSession = "session-a"; hostReason = "host observation unknown"
+            assert(!vpnRecoverRepeatedStop(evidence: bad, expectedGeneration: 7,
+                uncertainSession: &hostSession, uncertainReason: &hostReason))
+            assert(hostSession == "session-a" && hostReason == "host observation unknown")
+        }
+        hostSession = "different-session"; hostReason = "other owner still unknown"
+        assert(!vpnRecoverRepeatedStop(evidence: disconnectedStop, expectedGeneration: 7,
+            uncertainSession: &hostSession, uncertainReason: &hostReason))
+        assert(hostSession == "different-session" && hostReason == "other owner still unknown")
+        // Execute the failure transition used by VpnPlugin.stop's actual catch,
+        // then retry A. A rejected Stop must not rebind uncertainty B to A.
+        hostSession = "session-b"; hostReason = "late B callback remains unknown"
+        for _ in 0..<2 {
+            do {
+                guard vpnRecoverRepeatedStop(evidence: disconnectedStop, expectedGeneration: 7,
+                    uncertainSession: &hostSession, uncertainReason: &hostReason) else {
+                    throw NSError(domain: "PolarisVPN", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "CleanupUnknown: The disconnected session has no matching completed Stop"])
+                }
+                assertionFailure("A cannot clear B's host uncertainty")
+            } catch {
+                vpnRecordStopFailure(sessionID: "session-a", reason: error.localizedDescription,
+                    uncertainSession: &hostSession, uncertainReason: &hostReason)
+            }
+            assert(hostSession == "session-b" && hostReason == "late B callback remains unknown")
+        }
+        // A failure for its own scope can still be recorded and then recovered.
+        hostSession = nil; hostReason = nil
+        vpnRecordStopFailure(sessionID: "session-a", reason: "same-session host timeout",
+            uncertainSession: &hostSession, uncertainReason: &hostReason)
+        assert(vpnRecoverRepeatedStop(evidence: disconnectedStop, expectedGeneration: 7,
+            uncertainSession: &hostSession, uncertainReason: &hostReason))
+        assert(hostSession == nil && hostReason == nil)
+        hostSession = nil; hostReason = "unscoped host failure"
+        vpnRecordStopFailure(sessionID: "session-a", reason: "narrower failure",
+            uncertainSession: &hostSession, uncertainReason: &hostReason)
+        assert(hostSession == nil && hostReason == "unscoped host failure")
+        var wrongProfile: [String: Any] = ["status":1, "running":false, "active":false]
+        wrongProfile.merge(vpnSessionEvidence(profileIdentity: ["sessionID":"different", "requestID":"start-a", "configDigest":"digest-a"],
+            report: report, stopRequestID: oldOperation)) { _, live in live }
+        hostSession = "session-a"; hostReason = "host unknown"
+        assert(!vpnRecoverRepeatedStop(evidence: wrongProfile, expectedGeneration: 7,
+            uncertainSession: &hostSession, uncertainReason: &hostReason))
+        assert(hostReason == "host unknown")
         var incompleteStop = successfulStop
         incompleteStop["runtimeStopped"] = false
         assert(vpnStopFailure(evidence: incompleteStop, profileExists: true) != nil)

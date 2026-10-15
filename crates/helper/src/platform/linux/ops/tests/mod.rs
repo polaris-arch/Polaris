@@ -190,14 +190,58 @@ fn trim_lossy_empty_when_no_output() {
     assert_eq!(trim_lossy(&o), "");
 }
 
-// ===== set_forward_prod（best-effort，非 root 不 panic）=====
+// ===== forwarding writes: no test may invoke the real /proc writer =====
 
 #[test]
-fn set_forward_prod_does_not_panic_when_not_root() {
-    // 写 /proc/sys 需要 root；非 root 环境应静默忽略（best-effort，对齐 Go `_ =`）。
-    set_forward_prod(true);
-    set_forward_prod(false);
-    // 不 panic 即通过。
+fn forwarding_writes_both_families_with_injected_writer() {
+    let paths = [
+        "/proc/sys/net/ipv4/ip_forward",
+        "/proc/sys/net/ipv6/conf/all/forwarding",
+    ];
+    // Deliberately different initial values; no host configuration is involved.
+    let mut values = [b"0".to_vec(), b"1".to_vec()];
+    for on in [true, false] {
+        let mut calls = Vec::new();
+        set_forward_with(on, |path, value| {
+            let index = paths
+                .iter()
+                .position(|candidate| *candidate == path)
+                .unwrap();
+            values[index] = value.to_vec();
+            calls.push(path.to_owned());
+            Ok(())
+        });
+        assert_eq!(calls, paths);
+        let expected = if on { b"1" } else { b"0" };
+        assert!(values.iter().all(|value| value == expected));
+    }
+}
+
+#[test]
+fn forwarding_write_failure_is_best_effort_for_each_family() {
+    for on in [true, false] {
+        for failed_index in [0, 1] {
+            let mut values = [b"0".to_vec(), b"1".to_vec()];
+            let initial = values.clone();
+            let mut attempts = 0;
+            set_forward_with(on, |_path, value| {
+                let index = attempts;
+                attempts += 1;
+                if index == failed_index {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected",
+                    ));
+                }
+                values[index] = value.to_vec();
+                Ok(())
+            });
+            assert_eq!(attempts, 2, "a failed first write must not skip the second");
+            assert_eq!(values[failed_index], initial[failed_index]);
+            let expected = if on { b"1" } else { b"0" };
+            assert_eq!(values[1 - failed_index], expected);
+        }
+    }
 }
 
 // ===== SystemdResult helpers =====

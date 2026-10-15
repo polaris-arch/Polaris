@@ -1,3 +1,4 @@
+import { applyOnDemand } from '@/components/dialogs/on-demand-field';
 /**
  * 移动端 **Cloudflare WARP 接入表**（注册 / 编辑）—— 批 3，销掉 `register:mesh-join:warp`。
  *
@@ -296,6 +297,7 @@ export function WarpPanel({
           wireguardSettings: buildWarpSettings(editNode.wireguardSettings ?? {}, draft),
         };
         applyDetour(next, currentDetour);
+        applyOnDemand(next, draft.onDemand);
         if (bindInterface) next.bindInterface = bindInterface;
         else delete next.bindInterface;
         await api.server.update(next);

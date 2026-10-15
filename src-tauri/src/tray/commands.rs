@@ -78,8 +78,12 @@ pub async fn tray_renderer_ready(app: AppHandle, generation: u64) -> ApiResponse
 
 /// 收起浮层（连接/断开/切节点等动作后关闭菜单）。
 #[tauri::command]
-pub fn tray_hide(app: AppHandle) -> ApiResponse<()> {
-    hide_overlay(&app);
+pub fn tray_hide(app: AppHandle, reason: Option<String>) -> ApiResponse<()> {
+    if reason.as_deref() == Some("blur") {
+        super::window::hide_overlay_on_blur(&app);
+    } else {
+        hide_overlay(&app);
+    }
     ok_void()
 }
 

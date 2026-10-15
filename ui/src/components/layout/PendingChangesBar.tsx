@@ -24,13 +24,10 @@
  * `applied` 只意味着 `schedule_restart()` 已排程，**重启到底成没成走的是另一条通道**。故点完「立即应用」
  * 后条进 `applying`、不报成功。
  *
- * **收场的主腿是 `event:proxyLifecycle`**（后端在真状态跃迁点发，覆盖后端自驱的去抖重启）：
- * `ready` → 成功收场，`failed` → 落 `.err` 并显示后端给的原因，`stopped` → 回 idle（不判失败）。
- * 差集则由后端同刻推的空差集清掉，条自然隐藏。
- *
- * `event:proxyStarted` / `event:proxyError` 两条腿**保留**：它们覆盖命令层发起的启停（Home 连接钮 /
- * 托盘 / 自动连接），且与主腿写的是同一个转移、幂等。**刻意不靠它们做「立即应用」的收场** ——
- * 那条路径后端两个事件一个都不发，这正是「点了立即应用、核真重启了、条上仍是立即应用」的成因。
+ * **收场只接受 `event:proxyLifecycle` 的本次 applyId + 有效 generation**：
+ * restart 的中间 stopped 不收场；匹配的 terminal ready/failed 才决定结果。
+ * 较新的显式 stop 中性取消本次等待。无归属的 started/error 广播不能证明本次 Apply 完成。
+ * 监听先注册，早于命令回执到达的事件先有界缓存，再绑定回执里的 force_restart_seq。
  *
  * `.err` 态（原型 `:531`/`:534`，此前是**零使用点的死 CSS**）：toast 是 fire-and-forget（2.2s 自动消失），
  * 失败信息一闪即逝；条本身转红才是持续可见的那一份。重试 / 忽略即清红 —— 条只反映**最近一次**尝试的
@@ -47,18 +44,17 @@ import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
-import { proxyErrorReason } from '@/domain/proxy-error-text';
+import type { ProxyLifecycleEvent } from '@/contracts/types';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
   applyStateOnLifecycle,
   composeBarView,
   hasPendingWork,
-  isRestartFailureCode,
   pendingChangesCount,
   pendingPhaseOf,
   stagedPhaseOf,
-  type ApplyPhase,
+  type ApplyState,
   type BarActionId,
 } from './pending-bar-logic';
 
@@ -97,10 +93,19 @@ export default function PendingChangesBar() {
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
   const conflict = useStagedConfigStore((s) => s.conflict);
   /** B 维度里属于「这一次 apply」的那部分。`reason` 只在 `failed` 时有意义。 */
-  const [apply, setApply] = useState<{ phase: ApplyPhase; reason: string | null }>({
+  const [apply, setApply] = useState<ApplyState>({
     phase: 'idle',
     reason: null,
   });
+  const applyRequest = useRef<{
+    awaitingReply: boolean;
+    early: ProxyLifecycleEvent[];
+    earlyGeneration: number | undefined;
+    earlyStopped: boolean;
+  } | null>(null);
+  const lifecycleReady = useRef<Promise<void> | null>(null);
+  const translateRef = useRef(t);
+  translateRef.current = t;
   /** 明细 popover 开合（原型 `.pd-pop`）。 */
   const [detailOpen, setDetailOpen] = useState(false);
   /** staged 条目 id → 「保存后仍需应用」（FR-9）。当前 Apply 会重启核；缺 key = 尚未判出，不猜。 */
@@ -126,74 +131,58 @@ export default function PendingChangesBar() {
     };
   }, [detailOpen]);
 
-  /* 「应用中…」的收场（Q8）：只有后端真运行态能判，`applyPendingChanges` 的返回值判不了（C-8）。
-     两条腿都只在 `applying` 时改态 —— 别的时候来的起停/报错是别人的事（托盘启停、后台自愈），
-     不该把一条与本次 apply 无关的错误算成「应用失败」。 */
+  // Await actual listener registration before issuing Apply; plain start/error broadcasts have
+  // no action ownership and therefore must not decide this request's outcome.
   useEffect(() => {
-    // 收窄 i18next `TFunction` 的重载形（同 `App.tsx` 的 `simpleT`）：实际调用形只有 `t(key)`，
-    // 是 TFunction 支持的合法调用，此处仅收窄类型标注。
-    const simpleT = t as (key: string, fallback?: string) => string;
-    const offStarted = api.proxy.onStarted(() =>
-      setApply((a) => (a.phase === 'applying' ? { phase: 'idle', reason: null } : a))
-    );
-    // `reason` 只由稳定 `errorCode` 映射，**不直接用 `data.message`**：后者可携带
-    // 固定语言、路径、PID、命令或 stderr，仅属诊断载荷（详见 pending-bar-logic 该函数头注）。
-    const offError = api.proxy.onError((data) =>
-      setApply((a) =>
-        a.phase === 'applying' && isRestartFailureCode(data.errorCode)
-          ? { phase: 'failed', reason: proxyErrorReason(data, simpleT) }
-          : a
-      )
-    );
-    /* **本次 apply 的主收场腿**（`event:proxyLifecycle`）。上面两条只覆盖后端**命令层**发的起停
-       ——「立即应用」触发的是后端自驱的去抖重启，那条路径两条都不发，此前只能等 12s 兜底轮询。
-       判定全在纯函数 `applyStateOnLifecycle`（含「失败带原因 / stopped 不判失败」的因果）。 */
-    const offLifecycle = api.proxy.onLifecycle((data) =>
-      setApply((a) => applyStateOnLifecycle(a.phase, data, simpleT) ?? a)
-    );
+    let disposed = false;
+    let offLifecycle: (() => void) | undefined;
+    const ready = api.proxy.onLifecycleReady((data) => {
+      const request = applyRequest.current;
+      if (!request) return;
+      if (request.awaitingReply) {
+        // Payload retention is bounded, but generation knowledge must never be evicted.
+        // Observe explicit Stop against the floor at arrival, before raising it: replaying
+        // later from the maximum floor alone would hide an already-observed neutral cancel.
+        if (Number.isSafeInteger(data.mainGeneration) && data.mainGeneration > 0) {
+          const previous = request.earlyGeneration;
+          if (data.kind === 'stop' && data.terminal === true && data.phase === 'stopped'
+              && previous !== undefined && data.mainGeneration > previous) {
+            request.earlyStopped = true;
+          }
+          if (data.mainGeneration > (previous ?? 0)) request.earlyGeneration = data.mainGeneration;
+        }
+        request.early = [...request.early, data].slice(-32);
+        return;
+      }
+      setApply((state) => applyStateOnLifecycle(state, data, translateRef.current) ?? state);
+    }).then((off) => {
+      if (disposed) off();
+      else offLifecycle = off;
+    });
+    lifecycleReady.current = ready;
+    void ready.catch(() => undefined); // onApply reports the registration failure, no unhandled rejection.
     return () => {
-      offStarted();
-      offError();
-      offLifecycle();
+      disposed = true;
+      offLifecycle?.();
+      applyRequest.current = null;
+      lifecycleReady.current = null;
     };
-    // `t` 入依赖：切界面语言时 i18next 换掉它，重挂订阅让后续失败按新语种解文案。
-    // 三个 off 都是幂等注销，重挂的代价只是一次 listen/unlisten 往返。
-  }, [t]);
+  }, []);
 
-  /* 「应用中…」的**最后一道兜底** —— 事件腿是主路，这条只在事件压根没到时收场。
-   *
-   * 历史（陈先生 2026-07-29 真机）：TUN 模式下点「立即应用」→ 后端排程重启 → 重启撞上提权助手安装门、
-   * 用户取消 ⇒ 那次失败对渲染端**全静默**（`applyPendingChanges` 早已返回，而 proxyStarted/Error
-   * 在这条后端自驱路径上本就不发）⇒ 条永远停在「应用中…」，用户没有任何出口。
-   *
-   * **`event:proxyLifecycle` 已经把那一类收进来了**：起核失败统一在 `start` 包装的 Err 腿广播
-   * `phase:'failed'`（含「无可诚实断言分类」的那些），故上面那条订阅现在是该场景的**正路**。
-   *
-   * 保留本条的理由变了 —— 不再是「后端不发」，而是「**事件可能送不到**」：webview 在 apply 期间
-   * 自愈重载 / C16 轻量模式销毁重建 / 订阅还没挂上，这些都会让一帧事件落空，而落空的代价是条
-   * 永久转圈。到点**查一次真运行态**再判：跑起来了就当成功（事件丢了不代表重启没成），没跑起来
-   * 才落 `failed`。用实测状态而非盲目超时，避免把「重启慢」误报成失败。
-   *
-   * **两条腿不会打脸**：本 timer 只在 `phase==='applying'` 期间存在，事件腿一旦推离该态，
-   * 下面的 cleanup 立刻 `clearTimeout`；反之事件没来才由这里收场。两者问的是同一件事（核在不在跑）。 */
+  // A running core alone may be a successor or the old generation. A lost attributed event
+  // therefore ends as unconfirmed/failed, preserving the existing retry path without false success.
   useEffect(() => {
-    if (apply.phase !== 'applying') return;
+    if (apply.phase !== 'applying' || apply.applyId === undefined) return;
+    const request = applyRequest.current;
     const timer = setTimeout(() => {
-      void api.proxy
-        .getStatus()
-        .then((s) => {
-          setApply((a) => {
-            if (a.phase !== 'applying') return a;
-            if (s?.running) return { phase: 'idle', reason: null };
-            return { phase: 'failed', reason: null };
-          });
-        })
-        .catch(() => {
-          setApply((a) => (a.phase === 'applying' ? { phase: 'failed', reason: null } : a));
-        });
+      void api.proxy.getStatus().catch(() => null).then(() => {
+        if (applyRequest.current !== request) return;
+        setApply((state) => state.phase === 'applying' && state.applyId === apply.applyId
+          ? { phase: 'failed', reason: null } : state);
+      });
     }, APPLY_CONFIRM_TIMEOUT_MS);
     return () => clearTimeout(timer);
-  }, [apply.phase]);
+  }, [apply.phase, apply.applyId]);
 
   /* FR-9：逐条标注「仅需保存 / 保存后仍需应用」。**只在 popover 打开时问**——它是 N 次只读 IPC，
      挂在条目变化上会让每次表单提交都打一轮。 */
@@ -248,17 +237,52 @@ export default function PendingChangesBar() {
   };
 
   const onApply = async () => {
-    setApply({ phase: 'applying', reason: null });
-    const r = await useStagedConfigStore.getState().applyNow();
-    if (!r.saved) {
-      // 保存那一半就没过 ⇒ 核根本没碰。条已由 A 维度显示「保存失败：<原因>」，
-      // 这里再叠一个「应用失败」会让人以为炸了两回。
-      setApply({ phase: 'idle', reason: null });
-      return;
+    if (applyRequest.current?.awaitingReply || apply.phase === 'applying') return;
+    const generation = useAppStore.getState().proxyStatus?.mainGeneration;
+    const initial: ApplyState = { phase: 'applying', reason: null,
+      ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
+    const request = { awaitingReply: true, early: [] as ProxyLifecycleEvent[],
+      earlyGeneration: initial.mainGeneration, earlyStopped: false };
+    applyRequest.current = request;
+    setApply(initial);
+    try {
+      if (!lifecycleReady.current) throw new Error('Lifecycle listener unavailable');
+      await lifecycleReady.current;
+      if (applyRequest.current !== request) return;
+      const result = await useStagedConfigStore.getState().applyNow();
+      if (applyRequest.current !== request) return;
+      request.awaitingReply = false;
+      if (!result.saved) {
+        setApply({ phase: 'idle', reason: null });
+        return;
+      }
+      const outcome = applyOutcome(result.status);
+      let next: ApplyState = { ...initial, phase: outcome.phase };
+      if (outcome.phase === 'applying') {
+        if (!Number.isSafeInteger(result.applyId) || (result.applyId ?? 0) <= 0) {
+          next = { phase: 'failed', reason: null };
+        } else {
+          next.applyId = result.applyId;
+          if (request.earlyStopped) {
+            next = { phase: 'idle', reason: null };
+          } else {
+            // A retained old terminal cannot settle below a newer observation that overflow
+            // evicted. Missing payload remains pending for a future owned event or timeout.
+            next.mainGeneration = request.earlyGeneration;
+            for (const event of request.early) next = applyStateOnLifecycle(next, event, t) ?? next;
+          }
+        }
+      }
+      request.early = [];
+      setApply(next);
+      if (outcome.toast !== null) toast[outcome.toast.kind](t(outcome.toast.key));
+    } catch (error) {
+      if (applyRequest.current !== request) return;
+      request.awaitingReply = false;
+      request.early = [];
+      setApply({ phase: 'failed', reason: null });
+      console.error('[PendingChangesBar] Apply failed:', error);
     }
-    const outcome = applyOutcome(r.status);
-    setApply({ phase: outcome.phase, reason: null });
-    if (outcome.toast !== null) toast[outcome.toast.kind](t(outcome.toast.key));
   };
 
   const runAction = (id: BarActionId): void => {

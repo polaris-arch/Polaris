@@ -11,6 +11,8 @@ export interface ProxyStatus {
   running: boolean;
   /** Shared lifecycle generation from getStatus; used to reject results from a replaced main. */
   mainGeneration?: number;
+  /** Captured under backend D/selector-intent serialization; absent means unknown. */
+  ownedStopContext?: { selectedServerId: string | null; selectionIntentGeneration: number };
   pid?: number;
   /** 起核**就绪**时刻（epoch ms；未运行则缺省）。运行时长的唯一真值 —— 要让时长自己走字，
    *  用它在渲染端本地 tick，别依赖 `uptime`（理由见该字段）。 */

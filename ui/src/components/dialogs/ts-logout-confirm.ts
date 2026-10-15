@@ -36,7 +36,7 @@ export async function confirmStopThenTsLogout(
           selectedId: () => useAppStore.getState().selectedServerId,
           serverPresent: (id) => useAppStore.getState().servers.some((s) => s.id === id),
           status: () => api.proxy.getStatus(),
-          stop: () => useAppStore.getState().stopProxy(),
+          stopExpected: (expected) => api.proxy.stopExpected(expected),
           logout: async (id) => { await api.server.tailscaleLogout(id); },
         });
         if (result.kind === 'loggedOut') onLoggedOut();

@@ -104,10 +104,12 @@ impl InstallPaths {
     pub fn linux() -> Self {
         Self {
             binary: PathBuf::from("/usr/local/lib/polaris/helper"),
-            descriptor: Some(PathBuf::from("/etc/systemd/system/polaris-helper.service")),
+            descriptor: Some(PathBuf::from(format!(
+                "/etc/systemd/system/{LINUX_SERVICE_NAME}"
+            ))),
             socket: PathBuf::from("/run/polaris/helper.sock"),
             core_dir: PathBuf::from("/usr/local/lib/polaris/core"),
-            service_label: SERVICE_LABEL,
+            service_label: LINUX_SERVICE_NAME,
         }
     }
 

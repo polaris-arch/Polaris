@@ -435,7 +435,7 @@ mod sys {
     };
     use polaris_helper_proto::StartParams;
     use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -774,66 +774,17 @@ mod sys {
         if conf_dir.is_empty() {
             return Ok(());
         }
-        let dir_meta = std::fs::metadata(conf_dir)
-            .map_err(|e| format!("读取配置目录属主失败（{conf_dir}）：{e}"))?;
-        let uid = dir_meta.uid();
-        let gid = dir_meta.gid();
-        if should_skip_confdir_chown(uid) {
-            return Err(format!(
-                "配置目录异常归 root 所有，拒绝准备 cache.db：{conf_dir}"
-            ));
-        }
-        let cache = Path::new(conf_dir).join(CHOWN_FILES[0]);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&cache)
-            .map_err(|e| format!("安全打开 cache.db 失败（{}）：{e}", cache.display()))?;
-        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
-            .map_err(|e| format!("归还 cache.db 属主失败（{}）：{e}", cache.display()))
+        super::runtime_ownership::prepare_cache(Path::new(conf_dir))
+            .map_err(|error| format!("prepare pinned runtime cache: {error}"))
     }
 
-    /// A native receipt includes the complete ownership tail, not merely process exit.
+    /// A native stop receipt retains custody until this fd-bound tail succeeds.
     fn chown_runtime_dirs(conf_dir: &str) -> Result<(), String> {
         if conf_dir.is_empty() {
             return Ok(());
         }
-        let meta = std::fs::metadata(conf_dir)
-            .map_err(|error| format!("read runtime owner {conf_dir}: {error}"))?;
-        let (uid, gid) = (meta.uid(), meta.gid());
-        if should_skip_confdir_chown(uid) {
-            return Err(format!(
-                "runtime config directory unexpectedly belongs to root: {conf_dir}"
-            ));
-        }
-        for name in CHOWN_SUBDIRS.into_iter().chain(CHOWN_FILES) {
-            chown_tree(&Path::new(conf_dir).join(name), uid, gid)?;
-        }
-        Ok(())
-    }
-
-    fn chown_tree(root: &Path, uid: u32, gid: u32) -> Result<(), String> {
-        let meta = match std::fs::symlink_metadata(root) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("read runtime entry {}: {error}", root.display())),
-        };
-        if should_chown_entry(meta.uid()) {
-            std::os::unix::fs::lchown(root, Some(uid), Some(gid))
-                .map_err(|error| format!("chown runtime entry {}: {error}", root.display()))?;
-        }
-        if meta.is_dir() {
-            for entry in std::fs::read_dir(root)
-                .map_err(|error| format!("read runtime tree {}: {error}", root.display()))?
-            {
-                let entry = entry.map_err(|error| format!("read runtime tree entry: {error}"))?;
-                chown_tree(&entry.path(), uid, gid)?;
-            }
-        }
-        Ok(())
+        super::runtime_ownership::return_runtime_ownership(Path::new(conf_dir))
+            .map_err(|error| format!("return pinned runtime ownership: {error}"))
     }
 
     /// 建 socket（0666）+ accept 循环，每连接一线程 dispatch（`helper.go:598-642`）。
@@ -929,6 +880,231 @@ mod sys {
 
 #[cfg(target_os = "macos")]
 pub use sys::{serve, DaemonServices};
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+mod runtime_ownership {
+    //! Runtime ownership return uses pinned directory/file descriptors throughout.
+    //! User-writable ancestor renames never redirect a later enumeration or fchown.
+
+    use nix::fcntl::{open, openat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, FileStat, Mode, SFlag};
+    use std::fs::File;
+    use std::io;
+    use std::path::{Component, Path};
+
+    const DIRECTORY: OFlag = OFlag::O_RDONLY
+        .union(OFlag::O_DIRECTORY)
+        .union(OFlag::O_NOFOLLOW)
+        .union(OFlag::O_CLOEXEC);
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_DEPTH: usize = 64;
+
+    fn rejected(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    fn open_directory(path: &Path) -> io::Result<File> {
+        if !path.is_absolute() {
+            return Err(rejected("absolute runtime directory required"));
+        }
+        let mut directory = File::from(open(Path::new("/"), DIRECTORY, Mode::empty())?);
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => {
+                    directory = File::from(openat(&directory, name, DIRECTORY, Mode::empty())?);
+                }
+                _ => return Err(rejected("non-normal runtime directory component")),
+            }
+        }
+        Ok(directory)
+    }
+
+    fn walk_child(
+        parent: &File,
+        name: &std::ffi::OsStr,
+        depth: usize,
+        remaining: &mut usize,
+        visit: &mut impl FnMut(&File, &FileStat) -> io::Result<()>,
+    ) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        if depth > MAX_DEPTH || *remaining == 0 {
+            return Err(rejected("runtime tree exceeds ownership budget"));
+        }
+        *remaining -= 1;
+        let before = match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(nix::errno::Errno::ENOENT) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let kind = SFlag::from_bits_truncate(before.st_mode) & SFlag::S_IFMT;
+        if kind != SFlag::S_IFREG && kind != SFlag::S_IFDIR {
+            return Err(rejected(
+                "runtime ownership refuses links and special files",
+            ));
+        }
+        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let file = File::from(openat(parent, name, flags, Mode::empty())?);
+        let metadata = fstat(&file)?;
+        if before.st_dev != metadata.st_dev
+            || before.st_ino != metadata.st_ino
+            || (SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT) != kind
+            || (kind == SFlag::S_IFREG && metadata.st_nlink != 1)
+        {
+            return Err(rejected("runtime entry identity/type/link count changed"));
+        }
+        visit(&file, &metadata)?;
+        if kind == SFlag::S_IFDIR {
+            let mut directory =
+                nix::dir::Dir::from_fd(openat(&file, ".", DIRECTORY, Mode::empty())?)?;
+            let mut names = Vec::new();
+            for entry in directory.iter() {
+                let entry = entry?;
+                let bytes = entry.file_name().to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if names.len() == *remaining {
+                    return Err(rejected("runtime tree exceeds ownership budget"));
+                }
+                names.push(std::ffi::OsStr::from_bytes(bytes).to_owned());
+            }
+            for child in names {
+                walk_child(&file, &child, depth + 1, remaining, visit)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn runtime_owner(root: &File) -> io::Result<(u32, u32)> {
+        let metadata = fstat(root)?;
+        if super::should_skip_confdir_chown(metadata.st_uid) {
+            return Err(rejected("runtime directory unexpectedly belongs to root"));
+        }
+        Ok((metadata.st_uid, metadata.st_gid))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn return_runtime_ownership(path: &Path) -> io::Result<()> {
+        let root = open_directory(path)?;
+        let (uid, gid) = runtime_owner(&root)?;
+        let mut remaining = MAX_ENTRIES;
+        for name in super::CHOWN_SUBDIRS.into_iter().chain(super::CHOWN_FILES) {
+            walk_child(
+                &root,
+                name.as_ref(),
+                0,
+                &mut remaining,
+                &mut |file, metadata| {
+                    if super::should_chown_entry(metadata.st_uid) {
+                        std::os::unix::fs::fchown(file, Some(uid), Some(gid))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn prepare_cache(path: &Path) -> io::Result<()> {
+        let root = open_directory(path)?;
+        let (uid, gid) = runtime_owner(&root)?;
+        let flags = OFlag::O_RDWR
+            | OFlag::O_CREAT
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK;
+        let file = File::from(openat(
+            &root,
+            super::CHOWN_FILES[0],
+            flags,
+            Mode::from_bits_truncate(0o600),
+        )?);
+        let metadata = fstat(&file)?;
+        if (SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT) != SFlag::S_IFREG
+            || metadata.st_nlink != 1
+        {
+            return Err(rejected("cache must be an unlinked regular-file object"));
+        }
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        #[test]
+        fn ancestor_swap_after_open_cannot_redirect_descendants_or_chown() {
+            let temp = tempfile::tempdir().unwrap();
+            // macOS TMPDIR may have /var -> /private/var ancestors. Resolve
+            // the fixture base before testing the deliberate no-follow policy.
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("root");
+            let external = base.join("external");
+            std::fs::create_dir_all(root.join("logs")).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            std::fs::write(root.join("logs/owned"), "owned").unwrap();
+            std::fs::write(external.join("foreign"), "foreign").unwrap();
+            let owned = std::fs::metadata(root.join("logs/owned")).unwrap().ino();
+            let foreign = std::fs::metadata(external.join("foreign")).unwrap().ino();
+            let directory = open_directory(&root).unwrap();
+            let mut visited = Vec::new();
+            let mut swapped = false;
+            let mut remaining = MAX_ENTRIES;
+            walk_child(
+                &directory,
+                "logs".as_ref(),
+                0,
+                &mut remaining,
+                &mut |file, metadata| {
+                    assert_eq!(fstat(file)?.st_ino, metadata.st_ino);
+                    visited.push(metadata.st_ino);
+                    if !swapped {
+                        swapped = true;
+                        std::fs::rename(root.join("logs"), root.join("captured"))?;
+                        symlink(&external, root.join("logs"))?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(visited.contains(&owned));
+            assert!(!visited.contains(&foreign));
+            assert_eq!(
+                std::fs::read_to_string(external.join("foreign")).unwrap(),
+                "foreign"
+            );
+        }
+
+        #[test]
+        fn static_links_hardlinks_and_ancestor_links_are_rejected_before_visiting() {
+            let temp = tempfile::tempdir().unwrap();
+            // macOS TMPDIR may have /var -> /private/var ancestors. Resolve
+            // the fixture base before testing the deliberate no-follow policy.
+            let base = temp.path().canonicalize().unwrap();
+            let root = base.join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("original"), "original").unwrap();
+            std::fs::hard_link(root.join("original"), root.join("hard")).unwrap();
+            symlink(root.join("original"), root.join("sym")).unwrap();
+            let directory = open_directory(&root).unwrap();
+            for name in ["hard", "sym"] {
+                let mut remaining = MAX_ENTRIES;
+                assert!(
+                    walk_child(&directory, name.as_ref(), 0, &mut remaining, &mut |_, _| {
+                        panic!("unsafe object must not reach the ownership action");
+                    })
+                    .is_err()
+                );
+            }
+            symlink(&root, base.join("alias")).unwrap();
+            assert!(open_directory(&base.join("alias")).is_err());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

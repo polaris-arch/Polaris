@@ -1,3 +1,4 @@
+import { subscriptionExpiryDate } from '@/domain/subscription-expiry';
 /**
  * SubInfoBar —— 订阅信息栏（1:1 提取自原型 polaris-prototype.html L1762-1779 .sub-info.sub-info2）。
  *
@@ -190,9 +191,7 @@ export function SubInfoBar({
   // 阈值/百分比派生归 nodes-logic（契约数字须可单测；此前内联写 80，比契约的 85 早一档变红）。
   const { used: usedBytes, total: totalBytes, pct, warn: usageWarn } = subUsage(ui);
   const updatedText = relativeTimeTextIso(subscription.lastUpdated, t);
-  const expiryText = ui?.expire
-    ? new Date(ui.expire * 1000).toISOString().slice(0, 10)
-    : null;
+  const expiryText = subscriptionExpiryDate(ui?.expire);
 
   return (
     <div className="sub-info sub-info2">

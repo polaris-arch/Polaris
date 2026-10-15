@@ -363,3 +363,18 @@ async fn tier1_upstreams_run_concurrently_not_serially() {
     assert!(t0.elapsed() < Duration::from_millis(40), "串行就会 ≥40ms");
     assert_eq!(mock.concurrent_peak.load(Ordering::SeqCst), 2, "同层齐射");
 }
+
+#[tokio::test]
+async fn fast_truncated_answer_cannot_cancel_slow_complete_upstream() {
+    let query = q_wire();
+    let mut truncated = a_reply(&query, &[[1, 1, 1, 1], [31, 13, 95, 169]]);
+    truncated.pop(); // First RR is good; the later decoy RR is incomplete.
+    let good = a_reply(&query, &[[93, 184, 216, 34]]);
+    let mock = MockQuery::new(&[
+        ("ali", Script::Reply(Duration::from_millis(1), truncated)),
+        ("dnspod", Script::Reply(Duration::from_millis(30), good.clone())),
+    ]);
+    let out = race_forward(&query, &ups(&["ali", "dnspod"]), &mock,
+        DEFAULT_RACE_BUDGET, &DecoySet::builtin()).await;
+    assert_eq!(out, set_dns_message_id(&good, 0x4242));
+}

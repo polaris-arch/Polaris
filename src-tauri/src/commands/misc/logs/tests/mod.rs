@@ -373,3 +373,34 @@ fn archiving_the_legacy_log_refuses_a_content_uri_instead_of_pretending_to_be_ca
         PickedTarget::Uri(_)
     ));
 }
+
+#[test]
+fn diagnostic_export_gateway_receives_redacted_vpn_config_and_unicode_identities() {
+    let dir = TestDir::new("polaris-diagnostic-vpn-redaction");
+    let gateway = RecordingGateway::new(dir.path().join("diagnostic-doc"));
+    let source = polaris_stats_engine::DiagnosticReportSource {
+        user_config: json!({"servers": [{
+            "address": "vpn.example", "name": "İstanbul VPN",
+            "openvpnClientSettings": {"tls": {
+                "client_key": ["-----BEGIN PRIVATE KEY-----", "EXPORT_PRIVATE_BODY", "-----END PRIVATE KEY-----"],
+                "certificate": ["PUBLIC_EXPORT_CA"],
+                "control_wrap": {"type":"tls_auth", "key":["EXPORT_WRAP_BODY"]}
+            }}
+        }]}),
+        singbox_config: json!({"endpoints": [{
+            "type": "openvpn-client", "server": "vpn.example", "static_key": ["EXPORT_STATIC_BODY"]
+        }]}),
+        app_log_tail: "İİ dial VPN.EXAMPLE through İSTANBUL VPN K".into(),
+        ..Default::default()
+    };
+    let markdown = polaris_stats_engine::assemble_diagnostic_report(&source);
+    let payload = finish_export(&gateway, Some(saf_file_path()), &markdown);
+    assert_eq!(payload["success"], true);
+    let exported = gateway.contents().expect("diagnostic bytes written");
+    for private in ["EXPORT_PRIVATE_BODY", "EXPORT_WRAP_BODY", "EXPORT_STATIC_BODY", "vpn.example", "VPN.EXAMPLE", "İstanbul VPN", "İSTANBUL VPN"] {
+        assert!(!exported.contains(private), "exported diagnostic leaks {private}");
+    }
+    assert!(exported.contains("PUBLIC_EXPORT_CA"));
+    assert!(exported.contains("<domain-1>"));
+    assert!(exported.contains("<node-1>"));
+}

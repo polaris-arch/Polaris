@@ -4523,7 +4523,20 @@ fn points_to_us_unit() {
         ..Default::default()
     };
     assert!(points_to_us(Some(&st), "127.0.0.1:8080"));
-    assert!(points_to_us(Some(&st), "127.0.0.1:1080")); // host 匹配
+    assert!(!points_to_us(Some(&st), "127.0.0.1:1080"));
+    let replaced_web = SystemProxyStatus {
+        http_proxy: Some("127.0.0.1:7890".into()),
+        https_proxy: Some("127.0.0.1:8080".into()),
+        socks_proxy: Some("127.0.0.1:1080".into()),
+        ..st.clone()
+    };
+    assert!(!points_to_us(Some(&replaced_web), "127.0.0.1:8080"));
+    let socks_only = SystemProxyStatus {
+        enabled: true,
+        socks_proxy: Some("127.0.0.1:1080".into()),
+        ..Default::default()
+    };
+    assert!(points_to_us(Some(&socks_only), "127.0.0.1:8080"));
     assert!(!points_to_us(Some(&st), "10.0.0.1:8080"));
     assert!(!points_to_us(None, "127.0.0.1:8080"));
     // 关着的代理不算指向我们。

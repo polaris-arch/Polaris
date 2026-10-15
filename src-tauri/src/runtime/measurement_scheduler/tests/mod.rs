@@ -1674,7 +1674,10 @@ fn sample_between_rounds(
     let view = LedgerView::new(&Value::Null, Some(1), None, Platform::Linux);
     let ledger = MeasurementLedger::new();
     ledger.set_period_factor(period_factor);
-    let fingerprints = BTreeMap::new();
+    let fingerprints = BTreeMap::from([
+        ("good".to_string(), "good-connection".to_string()),
+        ("bad".to_string(), "bad-connection".to_string()),
+    ]);
     let interval = period_minutes * interval_factor * MINUTE;
     let mut skips = BTreeMap::new();
     let (mut reads, mut stale_reads) = (0, 0);
@@ -1709,7 +1712,7 @@ fn sample_between_rounds(
                         start_time: None,
                     },
                     config_digest: None,
-                    node_fingerprint: None,
+                    node_fingerprint: fingerprints.get(id).cloned(),
                     network_epoch: None,
                     measured_at: started,
                     binding: None,
@@ -1722,6 +1725,7 @@ fn sample_between_rounds(
                 &ReadContext {
                     main_generation: Some(1),
                     fingerprints: &fingerprints,
+                    main_connections: &fingerprints,
                     network_epoch: None,
                     url_digest: &view.url_digest,
                     now_ms: started + minute * MINUTE,
@@ -1940,7 +1944,7 @@ fn measured(run: u64, measured_at: u64) -> crate::commands::speedtest::ResultIde
             start_time: None,
         },
         config_digest: None,
-        node_fingerprint: None,
+        node_fingerprint: Some("a-connection".to_string()),
         network_epoch: None,
         measured_at,
         binding: None,
@@ -1955,13 +1959,14 @@ fn selectable_at(
     now_ms: u64,
 ) -> bool {
     let view = LedgerView::new(&Value::Null, Some(1), None, Platform::Linux);
-    let fingerprints = BTreeMap::new();
+    let fingerprints = BTreeMap::from([("a".to_string(), "a-connection".to_string())]);
     !ledger
         .candidates(
             &ids(&["a"]),
             &ReadContext {
                 main_generation: Some(1),
                 fingerprints: &fingerprints,
+                main_connections: &fingerprints,
                 network_epoch: None,
                 url_digest: &view.url_digest,
                 now_ms,

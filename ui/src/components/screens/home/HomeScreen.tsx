@@ -43,7 +43,6 @@ import {
   deriveTakeoverConnState,
 } from './connection-state';
 import { exitAddrText } from './exit-addr';
-import { applyFakeIpTunEntry } from './fakeip-tun-entry';
 import { notifyDesktop } from '@/lib/desktop-notify';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
 import { ProxyErrorCode, type UserConfig } from '@/contracts/types';
@@ -241,7 +240,6 @@ export function HomeScreen() {
   const setUnlock = useAppStore((s) => s.setUnlock);
   const beginUnlockCheck = useAppStore((s) => s.beginUnlockCheck);
   const applyUnlockSnapshot = useAppStore((s) => s.applyUnlockSnapshot);
-  const saveConfig = useAppStore((s) => s.saveConfig);
   const switchServer = useAppStore((s) => s.switchServer);
   const switchNode = useSwitchNode();
   const openDialog = useDialogStore((s) => s.open);
@@ -822,23 +820,12 @@ export function HomeScreen() {
     await Promise.allSettled([onSpeedTest(), onUnlockRefresh()]);
   }, [onSpeedTest, onUnlockRefresh]);
 
-  /* ── 接管方式落盘：写 config.proxyModeType（需重启核才生效，由 configChanged 触发）。
-   * 顺带消费「FakeIP-TUN 待纠正」快照：systemProxy 迁移冻结的 enableFakeIp:false 首次进 TUN 回 true。
-   * 必须在 saveConfig **之前**对目标模式求值（flag 只在目标为 tun 时才消费），故先合成 next 再存。 */
+  /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
   const applyIntercept = useCallback(
     async (v: InterceptKind) => {
       if (!diskConfig) return;
       try {
-        const { config: next, corrected } = applyFakeIpTunEntry({
-          ...diskConfig,
-          proxyModeType: v,
-        });
-        const patch: Partial<UserConfig> = {
-          proxyModeType: next.proxyModeType,
-          dnsConfig: next.dnsConfig,
-        };
-        if (next.dnsDefaults !== undefined) patch.dnsDefaults = next.dnsDefaults;
-        await saveConfig(patch);
+        const { corrected } = await api.config.setTakeover(v);
         // 仅在真把 false 改回 true 时提示（罕见且有实际副作用需告知）；纯消费 flag 不打扰用户。
         // toast 在主窗可见时够用，但接管方式亦可从**托盘浮层**（独立窗口，FX-tray 已加入口）切换 →
         // 主窗 toast 此时看不到，故并发一条系统通知兜底（对齐 上游 notify-user；正文不含节点身份）。
@@ -855,7 +842,7 @@ export function HomeScreen() {
         toast.error(t('settings.proxyMode.failUpdate'));
       }
     },
-    [diskConfig, saveConfig, t]
+    [diskConfig, t]
   );
 
   /* ── 接管方式切换入口：已连接时切换会重启核、瞬断当前连接 → 先弹确认；未连接直接落盘。 */

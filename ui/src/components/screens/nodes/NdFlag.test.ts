@@ -7,6 +7,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { flagCodeForName } from './NdFlag';
+import { readFileSync } from 'node:fs';
+import { getCountryCode } from '@/domain/flag-detect';
 
 describe('flagCodeForName', () => {
   it('带数字后缀的节点名正确命中（原 \\b 词边界在此漏报的回归用例）', () => {
@@ -33,4 +35,18 @@ describe('flagCodeForName', () => {
     expect(flagCodeForName('Russia-01')).toBe('ru');
     expect(flagCodeForName('Berlin-02')).toBe('de');
   });
+});
+
+
+it('keeps boundary matching compatible with the minimum WebKit (no lookbehind)', () => {
+  const source = readFileSync(new URL('../../../domain/flag-detect.ts', import.meta.url), 'utf8');
+  const manifest = readFileSync(new URL('../../../domain/flag-regions.json', import.meta.url), 'utf8');
+  expect(source + manifest).not.toMatch(/\(\?<([=!])/);
+  expect(getCountryCode('russia')).toBe('ru');
+  expect(getCountryCode('berlin')).toBe('de');
+  expect(getCountryCode('CN2')).toBeNull();
+  expect(getCountryCode('xcn us01')).toBe('us');
+  expect(getCountryCode('hong_kong-02')).toBe('hk');
+  expect(getCountryCode('印度尼西亚')).toBe('id');
+  expect(getCountryCode('CN 🇯🇵')).toBe('jp');
 });

@@ -50,9 +50,14 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  renameSync,
+  readdirSync,
+  lstatSync,
+  writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname, resolve } from 'path';
+import { pathToFileURL } from 'url';
 
 const PROTOC_VERSION = '35.1';
 
@@ -68,6 +73,58 @@ const ASSETS = {
   'darwin-x64': { asset: 'osx-x86_64', sha256: '537d73604a344ded6fc94e98e07e529d4fe3e4a0b09e59905353950fafc2a1f7' },
 };
 
+const CACHE_MARKER = '.polaris-complete.json';
+const REQUIRED_PROTOS = ['any', 'api', 'descriptor', 'duration', 'empty', 'field_mask',
+  'source_context', 'struct', 'timestamp', 'type', 'wrappers'];
+
+function cacheFiles(dir, prefix = '') {
+  const files = [];
+  for (const entry of readdirSync(join(dir, prefix), { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (rel === CACHE_MARKER) continue;
+    const st = lstatSync(join(dir, rel));
+    if (st.isDirectory()) files.push(...cacheFiles(dir, rel));
+    else if (st.isFile() && st.size > 0) files.push(rel);
+    else throw new Error(`invalid protoc cache member: ${rel}`);
+  }
+  return files.sort();
+}
+
+export function sealCache(dir, platform = process.platform) {
+  const files = cacheFiles(dir);
+  const required = [`bin/${platform === 'win32' ? 'protoc.exe' : 'protoc'}`,
+    ...REQUIRED_PROTOS.map((name) => `include/google/protobuf/${name}.proto`)];
+  for (const name of required) if (!files.includes(name)) throw new Error(`missing protoc member: ${name}`);
+  if (platform !== 'win32') chmodSync(join(dir, 'bin/protoc'), 0o755);
+  writeFileSync(join(dir, CACHE_MARKER), JSON.stringify(Object.fromEntries(files.map((name) =>
+    [name, createHash('sha256').update(readFileSync(join(dir, name))).digest('hex')]))));
+}
+
+export function completeCache(dir, platform = process.platform) {
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, CACHE_MARKER), 'utf8'));
+    const files = cacheFiles(dir);
+    const required = [`bin/${platform === 'win32' ? 'protoc.exe' : 'protoc'}`,
+      ...REQUIRED_PROTOS.map((name) => `include/google/protobuf/${name}.proto`)];
+    return required.every((name) => files.includes(name)) &&
+      JSON.stringify(Object.keys(manifest).sort()) === JSON.stringify(files) &&
+      files.every((name) => manifest[name] === createHash('sha256').update(readFileSync(join(dir, name))).digest('hex'));
+  } catch { return false; }
+}
+
+// Extraction and publication share the cache filesystem. Failed extraction never touches dest.
+export function installCache(zip, dest, extract = extractZip, platform = process.platform) {
+  mkdirSync(dirname(dest), { recursive: true });
+  const stage = mkdtempSync(join(dirname(dest), '.protoc-stage-'));
+  try {
+    extract(zip, stage);
+    sealCache(stage, platform);
+    rmSync(dest, { recursive: true, force: true });
+    renameSync(stage, dest);
+  } finally { rmSync(stage, { recursive: true, force: true }); }
+}
+
+function main() {
 const key = `${process.platform}-${process.arch}`;
 const pinned = ASSETS[key];
 if (!pinned) {
@@ -99,7 +156,7 @@ const sha256 = (file) => createHash('sha256').update(readFileSync(file)).digest(
 
 // 已装配且非 --force 则直接复用（幂等重跑；sha 表换版后 dest 路径天然不同）。
 const FORCE = process.argv.includes('--force');
-if (!FORCE && existsSync(join(dest, 'bin'))) {
+if (!FORCE && completeCache(dest)) {
   console.log(`skip (up to date): ${dest}`);
 } else {
   const work = mkdtempSync(join(tmpdir(), 'polaris-protoc-dl-'));
@@ -118,9 +175,7 @@ if (!FORCE && existsSync(join(dest, 'bin'))) {
       throw new Error(`sha256 不符：期望 ${pinned.sha256}，实得 ${got}（版本漂移 / 投毒 / 截断）`);
     }
     console.log(`sha256 ok (${got.slice(0, 12)}…)`);
-    rmSync(dest, { recursive: true, force: true });
-    mkdirSync(dest, { recursive: true });
-    extractZip(zip, dest);
+    installCache(zip, dest);
     console.log(`extracted → ${dest}`);
   } catch (e) {
     console.error(`FAILED: ${e.message}`);
@@ -157,3 +212,6 @@ if (process.env.GITHUB_ENV) {
   appendFileSync(process.env.GITHUB_ENV, `PROTOC_EXPECT=libprotoc ${PROTOC_VERSION}\n`);
   console.log(`PROTOC_EXPECT=libprotoc ${PROTOC_VERSION}`);
 }
+
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();

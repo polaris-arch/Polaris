@@ -1,3 +1,4 @@
+import { applyOnDemand, onDemandDraftValue } from '@/components/dialogs/on-demand-field';
 import { supportsTsAccountActions, tsAccountActionsUseNormalMain, tsLoginErrorReason } from '@/components/dialogs/ts-login-server';
 import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
 /**
@@ -118,6 +119,7 @@ export function TsSettingsPanel({
   const stateReadRevision = useRef(0);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
+    onDemand: onDemandDraftValue(node),
     bindInterface: node?.bindInterface ?? '',
   }));
   const [name, setName] = useState(node?.name ?? '');
@@ -275,6 +277,7 @@ export function TsSettingsPanel({
       if (bindInterface) next.bindInterface = bindInterface;
       else delete next.bindInterface;
       applyMeshInboundPolicy(next, policy);
+      applyOnDemand(next, draft.onDemand);
       // 暂存灰度的**唯一**闸门（与桌面同一个 `editRoute`）。
       if (editRoute('servers', stagingEnabled) === 'staged') {
         stage({
@@ -358,7 +361,7 @@ export function TsSettingsPanel({
                   selectedId: () => useAppStore.getState().selectedServerId,
                   serverPresent: (id) => useAppStore.getState().servers.some((s) => s.id === id),
                   status: () => api.proxy.getStatus(),
-                  stop: () => useAppStore.getState().stopProxy(),
+                  stopExpected: (expected) => api.proxy.stopExpected(expected),
                   logout: async (id) => { await api.server.tailscaleLogout(id); },
                 });
                 if (result.kind === 'loggedOut') await completeLogout(serverId);

@@ -104,6 +104,7 @@ import {
   fmtLogTs,
   matchConnRow,
   resetActiveFeed,
+  restoreFailedClosingRows,
   resetClosedFeed,
   sortConnRows,
   type ConnRowVM,
@@ -745,24 +746,17 @@ export function MobileConnectionsScreen(): ReactElement {
     (id: string) => {
       const feed = activeFeedRef.current;
       const snapshot = activeRows;
-      const at = snapshot.findIndex((r) => r.id === id);
+      const generation = feed.sync.generation;
       // 乐观移除 + 入抑制集：detail 流按 1s 合并，请求发出时可能已有一帧在途，
       // 那帧仍会更新这条连接 ⇒ 行「关掉又冒回来」。
       feed.closing.add(id);
       setActiveRows((prev) => prev.filter((r) => r.id !== id));
       void runWrite(`row:${id}`, closeFailKey, async () => {
-        const res = await api.connections.close(id);
+        const res = await api.connections.close(id).catch(() => null);
         if (res?.ok) return true;
-        // 失败必须显式放回**原来的位置**：暂停态没有后续帧，不放回那条连接就凭空消失了，
-        // 用户以为关成功了。追加到表尾同样不行 —— 那是「关不掉」+「还换了地方」两件事叠一起。
-        feed.closing.delete(id);
-        setActiveRows((prev) => {
-          if (prev.some((r) => r.id === id)) return prev;
-          const next = [...prev];
-          const row = snapshot[at];
-          if (row) next.splice(at < 0 ? next.length : Math.min(at, next.length), 0, row);
-          return next;
-        });
+        if (feed.sync.generation === generation) {
+          setActiveRows((rows) => restoreFailedClosingRows(feed, rows, snapshot, [id]));
+        }
         return false;
       });
     },
@@ -772,12 +766,16 @@ export function MobileConnectionsScreen(): ReactElement {
   const onCloseAll = useCallback(() => {
     const ids = activeRows.map((r) => r.id);
     const feed = activeFeedRef.current;
+    const snapshot = activeRows;
+    const generation = feed.sync.generation;
     // fan-out **之前**批量入抑制集：请求在飞期间就可能有增量帧回来。
     for (const id of ids) feed.closing.add(id);
     void runWrite('screen', closeFailKey, async () => {
-      const res = await api.connections.closeAll();
+      const res = await api.connections.closeAll().catch(() => null);
       if (res?.ok) return true;
-      for (const id of ids) feed.closing.delete(id);
+      if (feed.sync.generation === generation) {
+        setActiveRows((rows) => restoreFailedClosingRows(feed, rows, snapshot, ids));
+      }
       return false;
     });
   }, [activeRows, runWrite]);
@@ -786,17 +784,20 @@ export function MobileConnectionsScreen(): ReactElement {
     // 射程是**筛选命中的全部**，不是当前页：分页只改 DOM 行数，不得把动作偷偷降级。
     const ids = filteredRows.map((r) => r.id);
     const feed = activeFeedRef.current;
+    const snapshot = activeRows;
+    const generation = feed.sync.generation;
     for (const id of ids) feed.closing.add(id);
     void runWrite('screen', closeFailKey, async () => {
-      const results = await Promise.all(ids.map((id) => api.connections.close(id)));
+      const results = await Promise.all(ids.map((id) => api.connections.close(id).catch(() => null)));
       if (results.every((r) => r?.ok)) return true;
       // **只放回失败的那几条**，成功的继续被抑制到删除增量追上为止，否则整批一起闪回。
-      results.forEach((r, i) => {
-        if (!r?.ok) feed.closing.delete(ids[i]);
-      });
+      const failedIds = ids.filter((_, index) => !results[index]?.ok);
+      if (feed.sync.generation === generation) {
+        setActiveRows((rows) => restoreFailedClosingRows(feed, rows, snapshot, failedIds));
+      }
       return false;
     });
-  }, [filteredRows, runWrite]);
+  }, [filteredRows, activeRows, runWrite]);
 
   const onClearClosed = useCallback(() => {
     void runWrite('screen', 'connections.clearClosedFailed', async () => {

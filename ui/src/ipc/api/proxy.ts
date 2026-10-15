@@ -1,6 +1,6 @@
-import { invoke, listen } from '../ipc-client';
+import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent } from '../../contracts/types';
+import type { ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '../../contracts/types';
 import type { TailscaleStatusEvent } from '../../contracts/tailscale-status';
 import type { AutoNodeSwitchedPayload } from '../../contracts/auto-select';
 import type { TailscaleLoginProgress } from '../../domain/tailscale-login-progress';
@@ -24,6 +24,17 @@ export const proxyApi = {
 
   async stop(): Promise<void> {
     return invoke(IPC_CHANNELS.PROXY_STOP);
+  },
+
+  async stopExpected(expected: ExpectedMainCoreStop): Promise<ExpectedMainCoreStopResult> {
+    if (!Number.isSafeInteger(expected.expectedMainGeneration) || expected.expectedMainGeneration <= 0) {
+      throw new Error('Invalid expected main generation');
+    }
+    if (!Number.isSafeInteger(expected.expectedSelectionIntentGeneration) || expected.expectedSelectionIntentGeneration < 0
+      || !(expected.expectedSelectedServerId === null || (typeof expected.expectedSelectedServerId === 'string' && expected.expectedSelectedServerId.length > 0))) {
+      throw new Error('Invalid expected selection context');
+    }
+    return invoke(IPC_CHANNELS.PROXY_STOP, expected);
   },
 
   async getStatus(): Promise<ProxyStatus> {
@@ -78,6 +89,7 @@ export const proxyApi = {
   async applyPendingChanges(): Promise<{
     ok: boolean;
     status: 'applied' | 'deferred' | 'skipped';
+    applyId?: number | null;
   }> {
     return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES);
   },
@@ -137,6 +149,10 @@ export const proxyApi = {
    */
   onLifecycle(listener: (data: ProxyLifecycleEvent) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_PROXY_LIFECYCLE, listener);
+  },
+
+  async onLifecycleReady(listener: (data: ProxyLifecycleEvent) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_PROXY_LIFECYCLE, listener);
   },
 
   /** 监听启动前配置校验 gate 剔除的非法节点（空数组=本次启动无非法节点/清陈旧标灰）。 */

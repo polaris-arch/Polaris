@@ -214,8 +214,8 @@ mod win_impl {
         GetBestInterfaceEx,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_FRIENDLY_NAME,
-        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH};
     use windows_sys::Win32::Networking::WinSock::{
@@ -330,78 +330,77 @@ mod win_impl {
 
     impl AdapterProbe for WinAdapterProbe {
         fn list_matching_adapters(&self) -> std::io::Result<Vec<String>> {
-            // SAFETY: GetAdaptersAddresses 是线程安全的 Win32 API。我们传 SizePointer 控制缓冲区，
-            // 重试直到 ERROR_BUFFER_OVERFLOW 不再出现（标准两步法：先取大小，再取内容）。
-            // 缓冲区由我们拥有，释放由 Vec drop 处理。指针仅在本函数作用域内有效。
-            let flags: u32 = GAA_FLAG_SKIP_UNICAST
-                | GAA_FLAG_SKIP_ANYCAST
-                | GAA_FLAG_SKIP_MULTICAST
-                | GAA_FLAG_SKIP_DNS_SERVER
-                | GAA_FLAG_SKIP_FRIENDLY_NAME;
-            let mut size: u32 = 0;
-            let mut retries = 0u32;
-            loop {
-                // SAFETY: 第一次调用取所需大小（pAdapterAddresses=NULL），返回 ERROR_BUFFER_OVERFLOW。
-                // 详见上方 SAFETY 注释。
-                let rc = unsafe {
-                    GetAdaptersAddresses(
-                        0,
-                        flags,
-                        std::ptr::null(),
-                        std::ptr::null_mut(),
-                        &mut size,
-                    )
-                };
-                if rc == ERROR_BUFFER_OVERFLOW {
-                    break;
-                }
-                if rc == NO_ERROR && size == 0 {
-                    return Ok(Vec::new()); // 无适配器
-                }
-                if rc != NO_ERROR {
-                    return Err(std::io::Error::from_raw_os_error(rc as i32));
-                }
-                retries += 1;
-                if retries > 3 {
-                    return Err(std::io::Error::other("GetAdaptersAddresses size loop"));
-                }
+            list_matching_adapters_with(|flags, addresses, size| {
+                // SAFETY: the enumerator owns an aligned buffer of at least *size
+                // bytes (or a null sizing probe). The API retains no pointers.
+                unsafe { GetAdaptersAddresses(0, flags, std::ptr::null(), addresses, size) }
+            })
+        }
+    }
+
+    // A narrow FFI seam keeps sizing, requested fields and name filtering on the
+    // production path under test; mocks must populate the same aligned buffer.
+    fn list_matching_adapters_with(
+        mut enumerate: impl FnMut(u32, *mut IP_ADAPTER_ADDRESSES_LH, &mut u32) -> u32,
+    ) -> std::io::Result<Vec<String>> {
+        // SAFETY: GetAdaptersAddresses 是线程安全的 Win32 API。我们传 SizePointer 控制缓冲区，
+        // 重试直到 ERROR_BUFFER_OVERFLOW 不再出现（标准两步法：先取大小，再取内容）。
+        // 缓冲区由我们拥有，释放由 Vec drop 处理。指针仅在本函数作用域内有效。
+        let flags: u32 = GAA_FLAG_SKIP_UNICAST
+            | GAA_FLAG_SKIP_ANYCAST
+            | GAA_FLAG_SKIP_MULTICAST
+            | GAA_FLAG_SKIP_DNS_SERVER;
+        let mut size: u32 = 0;
+        let mut retries = 0u32;
+        loop {
+            // SAFETY: 第一次调用取所需大小（pAdapterAddresses=NULL），返回 ERROR_BUFFER_OVERFLOW。
+            // 详见上方 SAFETY 注释。
+            let rc = enumerate(flags, std::ptr::null_mut(), &mut size);
+            if rc == ERROR_BUFFER_OVERFLOW {
+                break;
             }
-            // 缓冲区按 u64 槽分配：结果要按 `&IP_ADAPTER_ADDRESSES_LH` 解引用，该结构体含指针/u64
-            // ⇒ align = 8，而 `Vec<u8>` 只保证 align 1，从未对齐地址造引用按语言规则即 UB
-            //（实践上 Windows 堆恰好 16 字节对齐所以不炸，但那是靠分配器实现细节而非语言保证）。
-            let mut buf: Vec<u64> = vec![0u64; u64_cells_for(size)];
-            // SAFETY: buf 容量 ≥ size 字节（u64_cells_for 向上取整）且对齐满足目标结构体（上方 const
-            // 断言编译期保证）。pAdapterAddresses 指向 buf 首字节。后续遍历以 SingleLinkedList 形式
-            //（Next 指针），仅读不写。
-            let rc = unsafe {
-                GetAdaptersAddresses(
-                    0,
-                    flags,
-                    std::ptr::null(),
-                    buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
-                    &mut size,
-                )
-            };
+            if rc == NO_ERROR && size == 0 {
+                return Ok(Vec::new()); // 无适配器
+            }
             if rc != NO_ERROR {
                 return Err(std::io::Error::from_raw_os_error(rc as i32));
             }
-            // 遍历链表，取 FriendlyName 匹配前缀。
-            let mut out = Vec::new();
-            let mut ptr = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-            // SAFETY: 链表节点由 GetAdaptersAddresses 填充，Next 为 NULL 终止。ptr 非空时解引用安全。
-            while !ptr.is_null() {
-                let entry: &IP_ADAPTER_ADDRESSES_LH = unsafe { &*ptr };
-                if let Some(name) = read_friendly_name(entry) {
-                    // 前缀判据经 `adapter_name_is_probeable` 收口 —— 存在性探测的调用方要用**同一个**
-                    // 谓词判「这个名字我方看不看得见」，两处各写一遍 `starts_with` 就是第二真值源。
-                    if adapter_name_is_probeable(&name) {
-                        out.push(name);
-                    }
-                }
-                ptr = entry.Next as *const IP_ADAPTER_ADDRESSES_LH;
+            retries += 1;
+            if retries > 3 {
+                return Err(std::io::Error::other("GetAdaptersAddresses size loop"));
             }
-            Ok(out)
         }
+        // 缓冲区按 u64 槽分配：结果要按 `&IP_ADAPTER_ADDRESSES_LH` 解引用，该结构体含指针/u64
+        // ⇒ align = 8，而 `Vec<u8>` 只保证 align 1，从未对齐地址造引用按语言规则即 UB
+        //（实践上 Windows 堆恰好 16 字节对齐所以不炸，但那是靠分配器实现细节而非语言保证）。
+        let mut buf: Vec<u64> = vec![0u64; u64_cells_for(size)];
+        // SAFETY: buf 容量 ≥ size 字节（u64_cells_for 向上取整）且对齐满足目标结构体（上方 const
+        // 断言编译期保证）。pAdapterAddresses 指向 buf 首字节。后续遍历以 SingleLinkedList 形式
+        //（Next 指针），仅读不写。
+        let rc = enumerate(
+            flags,
+            buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+            &mut size,
+        );
+        if rc != NO_ERROR {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        // 遍历链表，取 FriendlyName 匹配前缀。
+        let mut out = Vec::new();
+        let mut ptr = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        // SAFETY: 链表节点由 GetAdaptersAddresses 填充，Next 为 NULL 终止。ptr 非空时解引用安全。
+        while !ptr.is_null() {
+            let entry: &IP_ADAPTER_ADDRESSES_LH = unsafe { &*ptr };
+            if let Some(name) = read_friendly_name(entry) {
+                // 前缀判据经 `adapter_name_is_probeable` 收口 —— 存在性探测的调用方要用**同一个**
+                // 谓词判「这个名字我方看不看得见」，两处各写一遍 `starts_with` 就是第二真值源。
+                if adapter_name_is_probeable(&name) {
+                    out.push(name);
+                }
+            }
+            ptr = entry.Next as *const IP_ADAPTER_ADDRESSES_LH;
+        }
+        Ok(out)
     }
 
     /// 读 IP_ADAPTER_ADDRESSES_LH.FriendlyName（UTF-16 widestring → String）。
@@ -423,6 +422,79 @@ mod win_impl {
         // SAFETY: p 指向 len 个有效 u16（widestring），由 GetAdaptersAddresses 填充。
         let slice: &[u16] = unsafe { std::slice::from_raw_parts(p, len) };
         String::from_utf16(slice).ok()
+    }
+
+    #[cfg(test)]
+    mod enumeration_tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::NetworkManagement::IpHelper::GAA_FLAG_SKIP_FRIENDLY_NAME;
+
+        #[test]
+        fn ffi_flags_keep_friendly_names_and_real_filter_observes_them() {
+            for name in ["polaris-tun0", "Polaris-TUN1", "Ethernet"] {
+                let mut wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                let mut calls = 0;
+                let found = list_matching_adapters_with(|flags, addresses, size| {
+                    calls += 1;
+                    assert_eq!(
+                        flags & GAA_FLAG_SKIP_FRIENDLY_NAME,
+                        0,
+                        "both sizing and enumeration must request the field used for matching"
+                    );
+                    if addresses.is_null() {
+                        *size = std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>() as u32;
+                        return ERROR_BUFFER_OVERFLOW;
+                    }
+                    assert!(*size as usize >= std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>());
+                    // SAFETY: production allocated the requested aligned buffer.
+                    // The UTF-16 name remains alive through traversal; Next is null.
+                    unsafe {
+                        addresses.write(std::mem::zeroed());
+                        (*addresses).FriendlyName = wide.as_mut_ptr();
+                    }
+                    NO_ERROR
+                })
+                .unwrap();
+                assert_eq!(calls, 2);
+                let expected = if adapter_name_is_probeable(name) {
+                    vec![name.to_owned()]
+                } else {
+                    vec![]
+                };
+                assert_eq!(found, expected);
+            }
+        }
+
+        #[test]
+        fn ffi_enumeration_errors_remain_errors_instead_of_absent() {
+            let error =
+                list_matching_adapters_with(|_, _, _| ERROR_ACCESS_DENIED).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+            let error = list_matching_adapters_with(|_, addresses, size| {
+                if addresses.is_null() {
+                    *size = std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>() as u32;
+                    ERROR_BUFFER_OVERFLOW
+                } else {
+                    ERROR_ACCESS_DENIED
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        }
+
+        #[test]
+        #[ignore = "requires an existing adapter named by POLARIS_TEST_ADAPTER_NAME; read-only"]
+        fn live_existing_polaris_adapter_is_visible() {
+            let name = std::env::var("POLARIS_TEST_ADAPTER_NAME")
+                .expect("set the name of an already-existing polaris-* adapter");
+            assert!(adapter_name_is_probeable(&name));
+            let adapters = WinAdapterProbe.list_matching_adapters().unwrap();
+            assert!(
+                adapters.iter().any(|found| found.eq_ignore_ascii_case(&name)),
+                "existing adapter {name} was not returned: {adapters:?}"
+            );
+        }
     }
 
     // 抑制未用警告（c_void 在签名里出现但本模块未直接命名使用）。

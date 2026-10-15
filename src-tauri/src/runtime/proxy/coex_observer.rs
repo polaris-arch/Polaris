@@ -9,6 +9,13 @@ const MAX_PENDING: Duration = Duration::from_secs(10);
 type Sink = Arc<dyn Fn(Value) + Send + Sync>;
 type Collector = Arc<dyn Fn(&Admission) -> Value + Send + Sync>;
 
+/// Opaque memory commit; dispatch only after the caller releases its state locks.
+pub(crate) struct ClaimPublication {
+    generation: u64,
+    revision: u64,
+    wire: Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Binding {
     session: Option<u64>,
@@ -188,8 +195,21 @@ impl Observer {
         self.lock().wire()
     }
     pub(crate) fn claim(self: &Arc<Self>, generation: u64, start: bool) {
-        let wire = {
+        if let Some(publication) = self.prepare_claim(generation, start) {
+            self.publish_claim(publication);
+        }
+    }
+    /// Invalidation and binding commit only. No sink, driver or external callback.
+    pub(crate) fn prepare_claim(&self, generation: u64, start: bool) -> Option<ClaimPublication> {
+        let publication = {
             let mut s = self.lock();
+            // A prior gate claimant can arrive after a newer claimant's observer commit.
+            if s.binding
+                .lifecycle
+                .is_some_and(|current| current > generation)
+            {
+                return None;
+            }
             s.invalidate("lifecycleChanged");
             s.report = None;
             s.freshness = "unavailable";
@@ -202,13 +222,38 @@ impl Observer {
                 phase: if start { "starting" } else { "stopped" },
             };
             s.network = 0;
-            s.commit()
+            let wire = s.commit();
+            ClaimPublication {
+                generation,
+                revision: s.revision,
+                wire,
+            }
         };
-        self.emit(wire);
+        Some(publication)
+    }
+    /// Owned lifecycle callers hold generation publication, after releasing config,
+    /// selector and crash locks. A newer owner or invalidation must not be replayed over.
+    pub(crate) fn publish_claim(&self, publication: ClaimPublication) -> bool {
+        {
+            let s = self.lock();
+            if s.binding.lifecycle != Some(publication.generation)
+                || s.revision != publication.revision
+            {
+                return false;
+            }
+        }
+        self.emit(publication.wire);
+        true
     }
     pub(crate) fn invalidate_generation(&self, generation: u64) {
         let wire = {
             let mut s = self.lock();
+            if s.binding
+                .lifecycle
+                .is_some_and(|current| current > generation)
+            {
+                return;
+            }
             s.invalidate("lifecycleChanged");
             s.report = None;
             s.freshness = "unavailable";

@@ -105,7 +105,9 @@ pub use hot_switch::{StagedClassification, SwitchOutcome};
 // §C 例外② 钉死在 façade），按 §A.3 由 façade `pub use` 再导出。
 // B9：同批注释里的 `now_ms` / `sleep_unless_superseded_on` 随 `start_inner` / `wait_ready`
 // 进 `startup.rs`，façade 侧已如期下线。
-pub use lifecycle::ProxyLifecycleEvent;
+pub use lifecycle::{
+    ExpectedCoreStopRequest, ExpectedCoreStopResult, OwnedStopContext, ProxyLifecycleEvent,
+};
 use login_fallback::LoginFallbackState;
 use mesh_route_report::MeshRouteRunEvidence;
 use network_settle::NetworkSettleGate;
@@ -284,6 +286,8 @@ pub struct ProxyStatus {
     /// Read-time projection of the shared lifecycle generation for action attribution.
     #[serde(rename = "mainGeneration", default)]
     pub main_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_stop_context: Option<OwnedStopContext>,
     /// **是否有起核腿在飞**（`running:false` 期间也可能正在起核——重试预算内一轮可达数十秒）。
     ///
     /// **读时投影**（同 `uptime`）：存储态恒 `false`，真值是 [`ProxyRuntime::start_inflight`] 计数，
@@ -1671,6 +1675,10 @@ pub struct ProxyRuntime {
     /// **真机门**：真正的 mac `networksetup` 与 Linux helper→`resolvectl` 都触碰宿主 DNS，只能在明确
     /// 授权后真机验证；普通 gate 只跑 mock/只读检查。
     dns_controller: Mutex<polaris_system_integration::ProdDnsController>,
+    #[cfg(test)]
+    test_dns_restore: Mutex<Option<dns_takeover::TestDnsRestore>>,
+    #[cfg(test)]
+    test_restart_after_claim: Mutex<Option<lifecycle::TestRestartAfterClaim>>,
     /// Linux `systemd-resolved` per-link 生命周期；实际 root 写入全部经共享 helper，marker 独立于 macOS
     /// 物理网卡 DNS 快照，避免两种恢复语义互相污染。
     linux_resolved_controller: Mutex<
@@ -1865,6 +1873,10 @@ impl ProxyRuntime {
                 dns_marker_path,
             )),
             linux_resolved_controller: Mutex::new(linux_resolved_controller),
+            #[cfg(test)]
+            test_dns_restore: Mutex::new(None),
+            #[cfg(test)]
+            test_restart_after_claim: Mutex::new(None),
             network_watcher: Mutex::new(None),
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
             #[cfg(test)]
@@ -2079,4 +2091,4 @@ impl ProxyRuntime {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

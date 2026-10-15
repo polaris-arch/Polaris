@@ -223,12 +223,17 @@ impl ProxyRuntime {
     ///
     /// **边界**：上游的 `coreSwapInProgress` 轴（换核窗口 → deferred）在 Polaris 无对应 actor，
     /// 该轴不存在（非省略）。
+    #[cfg(test)]
     pub async fn apply_pending(self: &Arc<Self>) -> &'static str {
+        self.apply_pending_owned().await.0
+    }
+
+    pub async fn apply_pending_owned(self: &Arc<Self>) -> (&'static str, Option<u64>) {
         let new_config = match self.config.current() {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("applyPendingChanges 读配置失败: {e} → skipped");
-                return "skipped";
+                return ("skipped", None);
             }
         };
         let id = self.force_restart_seq.fetch_add(1, Ordering::SeqCst);
@@ -246,14 +251,14 @@ impl ProxyRuntime {
             }
             self.gate.set_restart_pending();
             log::info!("applyPendingChanges：lifecycle 在飞（depth>0）→ deferred（排入 drain）");
-            return "deferred";
+            return ("deferred", Some(id));
         }
         // 2. 真未运行 → 下次 start 从磁盘纳入新节点。
         if !self.core_running() {
             // 无活核可保护时，Apply 本身就是安全事务点；不必强迫用户再启动一次才能完成物理删除。
             self.process_deferred_config_deletions().await;
             log::info!("applyPendingChanges：核未运行 → skipped");
-            return "skipped";
+            return ("skipped", None);
         }
         // 3. depth=0 且运行中 → 去抖重启（drain 亦读专用字段，绕开潜在覆盖）。
         {
@@ -267,7 +272,7 @@ impl ProxyRuntime {
         }
         self.schedule_restart();
         log::info!("applyPendingChanges：运行中 + 非在飞 → applied（已排程去抖重启）");
-        "applied"
+        ("applied", Some(id))
     }
 
     /// 消费由暂存保存腿写下的不可逆删除意图。失败条目保留在 journal，下次 Apply/启动重试。

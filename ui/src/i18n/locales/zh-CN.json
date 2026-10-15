@@ -1821,6 +1821,7 @@
       "readFailed": "无法读取备份文件",
       "invalidFormat": "这不是有效的 Polaris 备份文件",
       "invalidArgs": "请至少选择一个要恢复的类别",
+      "sharedDependencyConflict": "所选类别与未选类别使用的共享资源冲突，未保存任何更改。请检查类别选择后重试。",
       "saveFailed": "无法保存恢复后的配置",
       "meshRoutingRequiresTrustedRestore": "组网路由策略恢复需要可信旧范围证明，当前已阻止写入。",
       "meshRoutingInvalidPolicy": "组网路由策略校验失败，备份未导出。",

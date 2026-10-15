@@ -31,6 +31,9 @@ impl MockConn {
 }
 
 impl Conn for MockConn {
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+        self.read_line_strict()
+    }
     fn read_line(&mut self) -> String {
         self.reads.lock().unwrap().pop_front().unwrap_or_default()
     }
@@ -1946,6 +1949,9 @@ fn refused_dns_frame_retiring_only_a_reservation_does_not_block_the_next_start()
         retire_at: usize,
     }
     impl Conn for RetireWhileReading<'_> {
+        fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+            Ok(Some(self.read_line()))
+        }
         fn read_line(&mut self) -> String {
             if self.reads == self.retire_at {
                 let mut state = self.state.lock().unwrap();
@@ -2046,4 +2052,114 @@ fn refused_dns_frame_retiring_only_a_reservation_does_not_block_the_next_start()
         assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
         assert!(resolved.calls.lock().unwrap().is_empty());
     }
+}
+
+// Exercise the real LineConn framing instead of the pre-split command mock.
+struct CommandIo<R> {
+    input: R,
+    output: Vec<u8>,
+}
+
+impl<R: Read> Read for CommandIo<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.input.read(bytes)
+    }
+}
+
+impl<R> Write for CommandIo<R> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn handle_unauthorized_wire<R: Read + Send>(input: R) -> LineConn<CommandIo<R>> {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(9999, 9999);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState::new());
+    let mut conn = LineConn::new(CommandIo {
+        input,
+        output: Vec::new(),
+    });
+    handle(&state, &deps, &mut conn);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+    assert!(systemd.calls.lock().unwrap().is_empty());
+    assert!(fp.killed.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+    conn
+}
+
+#[test]
+fn real_command_framing_preserves_ping_version_and_authorization() {
+    use std::io::Cursor;
+    for ending in ["\n", "\r\n"] {
+        let ping = handle_unauthorized_wire(Cursor::new(format!("ping{ending}")));
+        assert!(String::from_utf8_lossy(&ping.inner.get_ref().output)
+            .starts_with("OK pong uid=9999 "));
+        let version = handle_unauthorized_wire(Cursor::new(format!("version{ending}")));
+        assert_eq!(
+            version.inner.get_ref().output,
+            format!("OK {PROTO_VERSION}\n").as_bytes()
+        );
+    }
+    for frame in [b"status\n".as_slice(), b"\n".as_slice()] {
+        let conn = handle_unauthorized_wire(Cursor::new(frame));
+        assert_eq!(conn.inner.get_ref().output, b"ERR unauthorized\n");
+    }
+    let eof = handle_unauthorized_wire(Cursor::new(b""));
+    assert!(eof.inner.get_ref().output.is_empty());
+    for frame in [
+        b"ping".as_slice(),
+        b"version\r".as_slice(),
+        b"\xff\n".as_slice(),
+    ] {
+        let conn = handle_unauthorized_wire(Cursor::new(frame));
+        assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
+    }
+}
+
+#[test]
+fn command_limit_is_enforced_before_auth_and_does_not_dispatch_a_suffix() {
+    use std::io::Cursor;
+    let mut exact = vec![b'x'; MAX_COMMAND_LINE_BYTES];
+    exact.extend_from_slice(b"\n");
+    let conn = handle_unauthorized_wire(Cursor::new(exact));
+    assert_eq!(conn.inner.get_ref().output, b"ERR unauthorized\n");
+    let mut overlong = vec![b'x'; MAX_COMMAND_LINE_BYTES + 1];
+    overlong.extend_from_slice(b"\nping\n");
+    let conn = handle_unauthorized_wire(Cursor::new(overlong));
+    assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
+}
+
+#[test]
+fn continuous_unterminated_command_stops_after_limit_plus_one_bytes() {
+    struct Continuous {
+        supplied: usize,
+    }
+    impl Read for Continuous {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            // No EOF and no timeout: a bound must stop this continuously ready stream.
+            assert!(
+                self.supplied <= MAX_COMMAND_LINE_BYTES,
+                "reader exceeded the command budget"
+            );
+            bytes[0] = b'x';
+            self.supplied += 1;
+            Ok(1)
+        }
+    }
+    let conn = handle_unauthorized_wire(Continuous { supplied: 0 });
+    assert_eq!(conn.inner.get_ref().input.supplied, MAX_COMMAND_LINE_BYTES + 1);
+    assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
 }

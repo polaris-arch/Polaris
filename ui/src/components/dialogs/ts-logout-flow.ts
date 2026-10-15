@@ -1,4 +1,4 @@
-import type { ProxyStatus } from '@/contracts/types';
+import type { ProxyStatus, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '@/contracts/types';
 
 export interface MainCoreLogoutOwner {
   readonly serverId: string;
@@ -21,7 +21,10 @@ export function isMainCoreLogoutError(error: unknown): boolean {
 export function sameRunningCore(before: ProxyStatus, now: ProxyStatus): boolean {
   if (!before.running || !now.running || before.starting || now.starting) return false;
   const readyAt = before.startTime;
-  return typeof readyAt === 'number' && Number.isSafeInteger(readyAt) && readyAt > 0
+  const generation = before.mainGeneration;
+  return typeof generation === 'number' && Number.isSafeInteger(generation) && generation > 0
+    && generation === now.mainGeneration
+    && typeof readyAt === 'number' && Number.isSafeInteger(readyAt) && readyAt > 0
     && readyAt === now.startTime
     && before.pid === now.pid;
 }
@@ -53,14 +56,25 @@ export function captureMainCoreOwner(
   selectedId: string | null,
   status: ProxyStatus | null,
 ): MainCoreLogoutOwner | null {
-  return status && sameRunningCore(status, status) ? { serverId, selectedId, status } : null;
+  return status && sameRunningCore(status, status) && sameSelectionContext(status, status, selectedId)
+    ? { serverId, selectedId, status } : null;
+}
+
+function sameSelectionContext(before: ProxyStatus, now: ProxyStatus, selectedId: string | null): boolean {
+  const a = before.ownedStopContext;
+  const b = now.ownedStopContext;
+  return a != null && b != null && typeof a === 'object' && typeof b === 'object'
+    && Number.isSafeInteger(a.selectionIntentGeneration) && a.selectionIntentGeneration >= 0
+    && Number.isSafeInteger(b.selectionIntentGeneration) && b.selectionIntentGeneration >= 0
+    && a.selectedServerId === selectedId && b.selectedServerId === selectedId
+    && a.selectionIntentGeneration === b.selectionIntentGeneration;
 }
 
 export interface OwnedCoreStopIo {
   selectedId: () => string | null;
   serverPresent: (id: string) => boolean;
   status: () => Promise<ProxyStatus>;
-  stop: () => Promise<void>;
+  stopExpected: (expected: ExpectedMainCoreStop) => Promise<ExpectedMainCoreStopResult>;
 }
 
 /** Stops only the captured run; a replacement core or a changed selection is left alone. */
@@ -68,16 +82,33 @@ export async function stopOwnedCore(
   owner: MainCoreLogoutOwner,
   io: OwnedCoreStopIo,
 ): Promise<'stopped' | 'changed' | 'stopFailed'> {
+  const expected = owner.status.mainGeneration;
+  if (typeof expected !== 'number' || !Number.isSafeInteger(expected) || expected <= 0) return 'changed';
   if (io.selectedId() !== owner.selectedId || !io.serverPresent(owner.serverId)) return 'changed';
   let current: ProxyStatus;
   try { current = await io.status(); } catch { return 'changed'; }
-  if (!sameRunningCore(owner.status, current) || io.selectedId() !== owner.selectedId
+  if (!sameRunningCore(owner.status, current) || !sameSelectionContext(owner.status, current, owner.selectedId)
+    || io.selectedId() !== owner.selectedId
     || !io.serverPresent(owner.serverId)) return 'changed';
-  try { await io.stop(); } catch { return 'stopFailed'; }
+  let stopGeneration: number;
+  const context = owner.status.ownedStopContext;
+  if (!context) return 'changed';
+  try {
+    const receipt = await io.stopExpected({ expectedMainGeneration: expected,
+      expectedSelectedServerId: context.selectedServerId,
+      expectedSelectionIntentGeneration: context.selectionIntentGeneration });
+    if (receipt.kind === 'changed') return 'changed';
+    if (receipt.kind !== 'stopped') return 'stopFailed';
+    if (receipt.expectedMainGeneration !== owner.status.mainGeneration
+      || !Number.isSafeInteger(receipt.stopMainGeneration) || receipt.stopMainGeneration <= expected) return 'stopFailed';
+    stopGeneration = receipt.stopMainGeneration;
+  } catch { return 'stopFailed'; }
   let stopped: ProxyStatus;
   try { stopped = await io.status(); } catch { return 'stopFailed'; }
-  if (stopped.running || stopped.starting || io.selectedId() !== owner.selectedId
-    || !io.serverPresent(owner.serverId)) return 'stopFailed';
+  if (!Number.isSafeInteger(stopped.mainGeneration) || stopped.mainGeneration !== stopGeneration
+    || !sameSelectionContext(owner.status, stopped, owner.selectedId)
+    || io.selectedId() !== owner.selectedId || !io.serverPresent(owner.serverId)) return 'changed';
+  if (stopped.running || stopped.starting) return 'stopFailed';
   return 'stopped';
 }
 

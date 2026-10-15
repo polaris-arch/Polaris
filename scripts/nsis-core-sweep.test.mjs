@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -260,8 +260,8 @@ test('脚本真值里的顺序：先筛后杀、先持句柄再核启动时间�
   };
   for (const [first, second, why] of [
     ['PolarisIsInstalledCore $root $p.ExecutablePath', '$proc.Kill()', '路径判据排在结束动作之后'],
-    ['$proc.StartTime - $p.CreationDate', '$proc.Kill()', '启动时间核对排在结束动作之后'],
-    ['$null = $proc.Handle', '$proc.StartTime - $p.CreationDate', '启动时间在取得句柄之前核对'],
+    ['$born = $proc.StartTime.Ticks', '$proc.Kill()', '启动时间核对排在结束动作之后'],
+    ['$null = $proc.Handle', '$born = $proc.StartTime.Ticks', '启动时间在取得句柄之前核对'],
   ]) {
     const psLines = swap(first, second);
     assert.ok(nsisCoreSweepViolations(withScript(psLines), psLines).some((line) => line.includes(why)), why);
@@ -491,3 +491,51 @@ test(
     }
   }
 );
+
+test('终止句柄自身绑定映像、精确出生时间和 Dispose，禁止宽泛两秒容差', () => {
+  for (const needle of [
+    'PolarisIsInstalledCore $root $proc.Image',
+    'if (($born - ($born % 10)) -ne ($listed - ($listed % 10)))',
+    'if (!QueryFullProcessImageName(handle,0,path,ref size))',
+    'if (!StopOwned(handle,1))',
+  ]) {
+    const ps = scriptWithout(needle);
+    assert.ok(nsisCoreSweepViolations(withScript(ps), ps).length > 0, needle);
+  }
+  assert.ok(!NSIS_SWEEP_PS_LINES.some(line => line.includes('TotalSeconds')));
+  assert.ok(NSIS_SWEEP_PS_LINES.some(line => line.includes('$proc.Dispose()')));
+});
+
+// This executes the installer script and Win32 handle queries on Windows. CIM
+// is the only injected observation: the process/image/handle are real OS objects.
+test('Windows 实际句柄拒绝旧 CIM 路径及两秒内的出生身份错配', { skip: !onWindows }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'polaris-owned-handle-'));
+  const install = join(dir, 'installed');
+  const installed = join(install, 'resources', 'win', 'sing-box.exe');
+  const foreign = join(dir, 'foreign', 'sing-box.exe');
+  mkdirSync(dirname(installed), { recursive: true }); mkdirSync(dirname(foreign), { recursive: true });
+  copyFileSync(process.execPath, installed); copyFileSync(process.execPath, foreign);
+  try {
+    for (const kind of ['installed', 'foreign-image', 'wrong-birth']) {
+      const child = spawn(kind === 'foreign-image' ? foreign : installed, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      try {
+        await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+        let lines = scriptWrittenByHook(real);
+        const enumeration = `  foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'sing-box.exe'")) {`;
+        assert.equal(lines.filter(line => line === enumeration).length, 1);
+        // Present a stale, once-eligible CIM record. The held handle must still
+        // identify its actual executable and exact creation microsecond.
+        lines = lines.map(line => line === enumeration ? `  foreach ($p in @(& { $a = Get-CimInstance Win32_Process -Filter "ProcessId = ${child.pid}"; if (-not $a) { throw 'fixture process missing' }; [pscustomobject]@{ ProcessId = $a.ProcessId; ExecutablePath = $env:POLARIS_TEST_CIM_IMAGE; CreationDate = $a.CreationDate.AddMilliseconds(${kind === 'wrong-birth' ? 1 : 0}) } })) {` : line);
+        const script = join(dir, `${kind}.ps1`); writeFileSync(script, lines.join('\r\n') + '\r\n', 'ascii');
+        const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
+          encoding: 'utf8', timeout: 25000,
+          env: { ...process.env, POLARIS_SWEEP_ROOT: install, POLARIS_TEST_CIM_IMAGE: installed },
+        });
+        assert.equal(result.error, undefined, `${kind}: ${result.error}`);
+        assert.equal(result.status, 0, `${kind}: ${result.stderr}`);
+        let alive = true; try { process.kill(child.pid, 0); } catch { alive = false; }
+        assert.equal(alive, kind !== 'installed', `${kind}: actual process handle identity`);
+      } finally { child.kill(); }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});

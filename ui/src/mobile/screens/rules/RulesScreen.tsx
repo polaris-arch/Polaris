@@ -483,9 +483,6 @@ export function MobileRulesScreen(): ReactElement {
           [plane]: { ...currentEffect, enabled: currentEffect.enabled === false },
         },
       };
-      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
-      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
-      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       const stageRule =
         plane === 'dns'
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
@@ -500,12 +497,20 @@ export function MobileRulesScreen(): ReactElement {
         });
         return;
       }
+      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
+      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
+      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       try {
         await api.rules.update(next, plane);
       } catch (err) {
         // 开关弹回原位是静默的。停用了以为停用了、其实规则还在生效 → 必须报。
         console.error('[MobileRulesScreen] toggle failed:', err);
-        useAppStore.setState(plane === 'dns' ? { dnsRules: prev } : { rules: prev });
+        useAppStore.setState((state) => {
+          const current = plane === 'dns' ? state.dnsRules : state.rules;
+          const original = prev.find((r) => r.id === next.id);
+          const restored = current.map((r) => r === next && original ? original : r);
+          return plane === 'dns' ? { dnsRules: restored } : { rules: restored };
+        });
         toast.error(tr('rules.saveFailed'));
         // 只回滚不报，开关就是「弹回去了、什么都没说」——与「功能坏了」完全同形。
         reportWriteError(`rule:${rule.id}`, tr('rules.saveFailed'));

@@ -12,6 +12,9 @@ run.sh 那行 echo 对退出码没有任何强制力。escape 腿把三个 WEBKI
 那不是生产默认路径，故它的绿不覆盖 GPU/DMABUF/合成向量，本脚本每轮明说这件事。
 """
 
+import hashlib
+import json
+import math
 import pathlib
 import re
 import sys
@@ -85,6 +88,49 @@ EXPECT = {
 }
 
 
+def window_complete(evidence: pathlib.Path) -> bool:
+    """Producer/consumer contract: monotonic full window and the same live app identity.
+
+    Hashes bind the final copied log and timeline to the completed collection, so
+    a truncated export cannot reuse an otherwise successful observation marker.
+    """
+    try:
+        record = json.loads((evidence / "observation.json").read_text())
+        start, end = record["start"], record["end"]
+        warmup, requested = record["warmup"], record["requested"]
+        if not all(type(n) in (int, float) and math.isfinite(n) for n in (start, end, warmup, requested)):
+            return False
+        if warmup < 0 or requested <= 0 or end - start < warmup + requested:
+            return False
+        identity = record["identity"]
+        if not re.fullmatch(r"[1-9][0-9]*:[0-9]+", identity) or record["final_identity"] != identity:
+            return False
+        if record["completed"] is not True:
+            return False
+        for name in ("polaris.log", "timeline.tsv"):
+            if hashlib.sha256((evidence / name).read_bytes()).hexdigest() != record["sha256"][name]:
+                return False
+        rows = (evidence / "timeline.tsv").read_text().splitlines()
+        if rows[0] != "t\twebproc\twindow\tcolors\tlog_lines\tidentity":
+            return False
+        previous = 0.0
+        for row in rows[1:]:
+            cols = row.split("\t")
+            if len(cols) != 6 or cols[5] != identity:
+                return False
+            elapsed = float(cols[0])
+            if not math.isfinite(elapsed) or elapsed <= previous or elapsed > end - start + 0.001:
+                return False
+            if not (evidence / f"t{cols[0]}.png").is_file():
+                return False
+            if not cols[4].isdigit() or int(cols[4]) > len((evidence / "polaris.log").read_text().splitlines()):
+                return False
+            previous = elapsed
+        return previous >= warmup + requested
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return False
+
+
 def check(evidence: pathlib.Path) -> int:
     scen = evidence.name
     if scen not in EXPECT:
@@ -103,6 +149,9 @@ def check(evidence: pathlib.Path) -> int:
         return 2
     if "sing-box 已就绪" not in log:
         print(f"[{scen}] 证据不可用：内核未启动 ⇒ 心跳不可能跑")
+        return 2
+    if not window_complete(evidence):
+        print(f"[{scen}] 证据不可用：G2 观测窗口或进程身份不完整")
         return 2
     shots = len(list(evidence.glob("t*.png")))
     if shots < 4:

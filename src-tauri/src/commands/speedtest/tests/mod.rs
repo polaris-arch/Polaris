@@ -570,22 +570,17 @@ fn dirty_when_fingerprint_differs_from_running_snapshot() {
     );
 }
 
-/// **快照无此 id → 不 dirty**（新增未入核：那是 notInPool 那条腿的射程）。
-/// **变异锁**：把第一条 `is_some_and` 松成「快照缺失也算 dirty」→ 转红：那会把「新增未重启」的节点
-/// 指引到「应用更改」，与 notInPool 的「刷新订阅 / 重启核」两条修法互相打架。
+/// Unknown connection identity cannot authorize measuring an old pool exit.
 #[test]
-fn not_dirty_when_snapshot_lacks_the_node() {
+fn missing_connection_identity_fails_closed_but_pool_membership_keeps_priority() {
     let snap = fp_map(&[("a", "fp-a")]);
     let cur = fp_map(&[("a", "fp-a"), ("newbie", "fp-n")]);
-    assert!(partition_dirty(&ids(&["newbie"]), &snap, &cur).is_empty());
-}
-
-/// **当前配置无此 id → 不 dirty**（拿不到「新」一侧就没有比对基准 → 保守照旧）。
-/// **变异锁**：把 `is_some_and` 改成 `is_none_or`（缺失当成「不等」）→ 转红。
-#[test]
-fn not_dirty_when_current_config_lacks_the_node() {
-    let snap = fp_map(&[("gone", "fp-g")]);
-    assert!(partition_dirty(&ids(&["gone"]), &snap, &BTreeMap::new()).is_empty());
+    let dirty = partition_dirty(&ids(&["newbie"]), &snap, &cur);
+    assert_eq!(dirty, id_set(&["newbie"]));
+    let partition = partition_pool(&ids(&["newbie"]), &BTreeMap::new(), &dirty, &BTreeSet::new());
+    assert_eq!(partition.not_in_pool, ids(&["newbie"]));
+    assert!(partition.dirty.is_empty());
+    assert_eq!(partition_dirty(&ids(&["a"]), &snap, &BTreeMap::new()), id_set(&["a"]));
 }
 
 /// 只筛**请求集内**的节点：配置里别的节点脏了不影响本波。
@@ -3048,6 +3043,7 @@ fn pool_events(origin: SpeedTestOrigin) -> RunEvents {
         fp_map(&[("a", "fp-a"), ("b", "fp-b"), ("c", "fp-c")]),
         None,
     )
+    .with_connection_fingerprints(fp_map(&[("a", "fp-a"), ("b", "fp-b"), ("c", "fp-c")]))
 }
 
 /// 跑一轮三节点的池路径，事件经盖章出口收集。
@@ -4732,6 +4728,7 @@ fn ledger_view<'a>(fps: &'a BTreeMap<String, String>) -> measurement_ledger::Rea
     measurement_ledger::ReadContext {
         main_generation: Some(7),
         fingerprints: fps,
+        main_connections: fps,
         network_epoch: Some(5),
         url_digest: Box::leak(
             polaris_updater::sha256_hex(DEFAULT_SPEED_TEST_URL.as_bytes()).into_boxed_str(),
@@ -6812,4 +6809,33 @@ async fn a_scheduled_round_with_nothing_testable_opens_no_readback() {
     assert!(matches!(round, ScheduledRound::Ran(_)));
     assert!(collected.is_empty(), "对照：确实一个节点都没测");
     assert_eq!(bench.readbacks_opened.load(Ordering::SeqCst), 0);
+}
+
+
+#[test]
+fn saved_unapplied_tls_sni_and_ws_changes_are_dirty_without_staged_drafts() {
+    use crate::runtime::node_fingerprints::measurement_table_json;
+    let base = json!({"servers": [{"id":"a", "name":"A", "protocol":"trojan",
+        "address":"example.test", "port":443, "password":"fixture", "network":"ws",
+        "security":"tls", "tlsSettings":{"serverName":"old.test"}, "wsSettings":{"path":"/old"}}]});
+    let running = measurement_table_json(&base);
+    assert!(partition_dirty(&ids(&["a"]), &running, &running).is_empty());
+    for (key, value) in [
+        ("security", json!("none")),
+        ("tlsSettings", json!({"serverName":"new.test"})),
+        ("wsSettings", json!({"path":"/new"})),
+    ] {
+        let mut desired = base.clone();
+        desired["servers"][0][key] = value;
+        assert_eq!(current_server_fingerprints(&base), current_server_fingerprints(&desired));
+        let dirty = partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired));
+        assert_eq!(dirty, id_set(&["a"]));
+        let partition = partition_pool(&ids(&["a"]), &fp_map(&[("a", "tag-a")]), &dirty, &BTreeSet::new());
+        assert!(partition.testable.is_empty(), "saved changes must not measure the old running exit");
+    }
+    for key in ["name", "providerName", "updatedAt", "subscriptionId"] {
+        let mut desired = base.clone();
+        desired["servers"][0][key] = json!("display-only");
+        assert!(partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired)).is_empty());
+    }
 }

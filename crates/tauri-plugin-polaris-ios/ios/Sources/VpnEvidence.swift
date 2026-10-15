@@ -232,3 +232,44 @@ func vpnSessionEvidence(profileIdentity: [String: Any]?, report: [String: Any]?,
     }
     return result
 }
+
+/// A repeat host Stop may observe the existing terminal report, but cannot
+/// mint a new prepareStop/retirement receipt or change its durable request ID.
+func vpnIdempotentStopIsConfirmed(evidence: [String: Any], expectedGeneration: UInt64?) -> Bool {
+    guard evidence["active"] as? Bool == false,
+          evidence["running"] as? Bool == false,
+          let status = evidence["status"] as? Int, status == 0 || status == 1,
+          evidence["ownership"] as? String == "ownedSessionReported",
+          evidence["lifecycle"] as? String == "stopped",
+          evidence["runtimeStopped"] as? Bool == true,
+          evidence["cleanupError"] == nil, evidence["lastError"] == nil,
+          evidence["uncertainSettingsGeneration"] == nil else { return false }
+    if let expectedGeneration {
+        guard expectedGeneration < UInt64.max,
+              let stopped = evidence["extensionGeneration"] as? NSNumber,
+              stopped.uint64Value == expectedGeneration + 1 else { return false }
+    }
+    return true
+}
+
+/// Called only with a raw session snapshot (host-only uncertainty excluded).
+/// Provider/preference errors remain in that snapshot and cannot be cleared.
+func vpnRecoverRepeatedStop(evidence: [String: Any], expectedGeneration: UInt64?,
+                            uncertainSession: inout String?, uncertainReason: inout String?) -> Bool {
+    guard vpnIdempotentStopIsConfirmed(evidence: evidence, expectedGeneration: expectedGeneration) else { return false }
+    if let uncertainSession, uncertainSession != evidence["sessionId"] as? String { return false }
+    uncertainSession = nil
+    uncertainReason = nil
+    return true
+}
+
+/// The actual host Stop catch records its own failure without rebinding an
+/// already uncertain different session (or a broader unscoped uncertainty).
+func vpnRecordStopFailure(sessionID: String?, reason: String,
+                          uncertainSession: inout String?, uncertainReason: inout String?) {
+    if uncertainSession != nil || uncertainReason != nil {
+        guard uncertainSession == sessionID else { return }
+    }
+    uncertainSession = sessionID
+    uncertainReason = reason
+}

@@ -293,6 +293,31 @@
   FileWrite $R6 `  return $$false$\r$\n`
   FileWrite $R6 `}$\r$\n`
   FileWrite $R6 `try {$\r$\n`
+  FileWrite $R6 `  Add-Type -TypeDefinition @'$\r$\n`
+  FileWrite $R6 `using System;$\r$\n`
+  FileWrite $R6 `using System.Text;$\r$\n`
+  FileWrite $R6 `using System.ComponentModel;$\r$\n`
+  FileWrite $R6 `using System.Runtime.InteropServices;$\r$\n`
+  FileWrite $R6 `using Microsoft.Win32.SafeHandles;$\r$\n`
+  FileWrite $R6 `public sealed class PolarisOwnedProcess : IDisposable {$\r$\n`
+  FileWrite $R6 `  readonly SafeProcessHandle handle;$\r$\n`
+  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int pid);$\r$\n`
+  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(SafeProcessHandle h, out long created, out long exited, out long kernel, out long user);$\r$\n`
+  FileWrite $R6 `  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(SafeProcessHandle h, uint flags, StringBuilder path, ref uint size);$\r$\n`
+  FileWrite $R6 `  [DllImport("kernel32.dll", EntryPoint="TerminateProcess", SetLastError=true)] static extern bool StopOwned(SafeProcessHandle h, uint code);$\r$\n`
+  FileWrite $R6 `  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(SafeProcessHandle h, uint ms);$\r$\n`
+  FileWrite $R6 `  public PolarisOwnedProcess(int pid) {$\r$\n`
+  FileWrite $R6 `    handle = OpenProcess(0x00101001, false, pid);$\r$\n`
+  FileWrite $R6 `    if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
+  FileWrite $R6 `  }$\r$\n`
+  FileWrite $R6 `  public IntPtr Handle { get { return handle.DangerousGetHandle(); } }$\r$\n`
+  FileWrite $R6 `  public DateTime StartTime { get { long c,e,k,u; if (!GetProcessTimes(handle,out c,out e,out k,out u)) throw new Win32Exception(Marshal.GetLastWin32Error()); return DateTime.FromFileTimeUtc(c); } }$\r$\n`
+  FileWrite $R6 `  public string Image { get { uint size=32768; var path=new StringBuilder((int)size); if (!QueryFullProcessImageName(handle,0,path,ref size)) throw new Win32Exception(Marshal.GetLastWin32Error()); return path.ToString(); } }$\r$\n`
+  FileWrite $R6 `  public void Kill() { if (!StopOwned(handle,1)) throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
+  FileWrite $R6 `  public bool WaitForExit(int ms) { uint r=WaitForSingleObject(handle,(uint)ms); if (r==0) return true; if (r==258) return false; throw new Win32Exception(Marshal.GetLastWin32Error()); }$\r$\n`
+  FileWrite $R6 `  public void Dispose() { handle.Dispose(); }$\r$\n`
+  FileWrite $R6 `}$\r$\n`
+  FileWrite $R6 `'@$\r$\n`
   FileWrite $R6 `  $$root = PolarisSweepRoot $$env:POLARIS_SWEEP_ROOT$\r$\n`
   FileWrite $R6 `  if (-not $$root) { exit 3 }$\r$\n`
   FileWrite $R6 `  $$left = 0$\r$\n`
@@ -301,15 +326,19 @@
   FileWrite $R6 `      if (-not $$p.ExecutablePath) { continue }$\r$\n`
   FileWrite $R6 `      if (-not (PolarisIsInstalledCore $$root $$p.ExecutablePath)) { continue }$\r$\n`
   FileWrite $R6 `    } catch { continue }$\r$\n`
+  FileWrite $R6 `    $$proc = $$null$\r$\n`
   FileWrite $R6 `    try {$\r$\n`
-  FileWrite $R6 `      $$proc = [System.Diagnostics.Process]::GetProcessById([int]$$p.ProcessId)$\r$\n`
+  FileWrite $R6 `      $$proc = New-Object PolarisOwnedProcess ([int]$$p.ProcessId)$\r$\n`
   FileWrite $R6 `      $$null = $$proc.Handle$\r$\n`
-  FileWrite $R6 `      if ([Math]::Abs(($$proc.StartTime - $$p.CreationDate).TotalSeconds) -gt 2) { continue }$\r$\n`
+  FileWrite $R6 `      if (-not (PolarisIsInstalledCore $$root $$proc.Image)) { continue }$\r$\n`
+  FileWrite $R6 `      $$born = $$proc.StartTime.Ticks$\r$\n`
+  FileWrite $R6 `      $$listed = $$p.CreationDate.ToUniversalTime().Ticks$\r$\n`
+  FileWrite $R6 `      if (($$born - ($$born % 10)) -ne ($$listed - ($$listed % 10))) { continue }$\r$\n`
   FileWrite $R6 `      $$proc.Kill()$\r$\n`
   FileWrite $R6 `      if (-not $$proc.WaitForExit(5000)) { $$left++ }$\r$\n`
   FileWrite $R6 `    } catch {$\r$\n`
   FileWrite $R6 `      if (Get-Process -Id $$p.ProcessId -ErrorAction SilentlyContinue) { $$left++ }$\r$\n`
-  FileWrite $R6 `    }$\r$\n`
+  FileWrite $R6 `    } finally { if ($$null -ne $$proc) { $$proc.Dispose() } }$\r$\n`
   FileWrite $R6 `  }$\r$\n`
   FileWrite $R6 `  if ($$left -gt 0) { exit 2 }$\r$\n`
   FileWrite $R6 `  exit 0$\r$\n`

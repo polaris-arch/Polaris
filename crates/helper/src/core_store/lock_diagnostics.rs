@@ -4,6 +4,7 @@ use super::{File, LockObservation};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::OnceLock;
 use std::thread::ThreadId;
 use std::time::Instant;
 
@@ -11,6 +12,15 @@ const MAX_EVENTS: usize = 512;
 const MAX_PROCESSES: usize = 64;
 const MAX_FDS: usize = 512;
 const MAX_PEERS: usize = 32;
+const MAX_RACE_OBSERVATIONS: usize = 32;
+
+// One epoch for all threads in this test process. Initialization does not hold
+// a lock across any acquisition, spawn, observation or File close. PID remains
+// part of every record: this epoch does not establish cross-process ordering.
+static CLOCK: OnceLock<Instant> = OnceLock::new();
+fn monotonic_ns() -> u128 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_nanos()
+}
 
 #[cfg(target_os = "macos")]
 pub(super) fn spawn_origin(origin: &'static str, phase: &'static str, child_pid: Option<u32>) {
@@ -19,12 +29,14 @@ pub(super) fn spawn_origin(origin: &'static str, phase: &'static str, child_pid:
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|elapsed| elapsed.as_nanos());
+    let monotonic_ns = monotonic_ns();
+    let correlation = crate::platform::macos::exec::test_spawn_correlation();
     // Source-owned category/PID/time only; never arguments, paths or env.
     // This is observation in the unit-test process, not production logging,
     // process authority or serialization of spawn and lock acquisition.
     let _ = writeln!(
         std::io::stderr().lock(),
-        "TEST_SPAWN_ORIGIN origin={origin} phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} scope=test-process-only",
+        "TEST_SPAWN_ORIGIN origin={origin} phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} monotonic_ns={monotonic_ns} correlation={correlation:?} scope=test-process-only",
         std::process::id()
     );
 }
@@ -36,7 +48,6 @@ struct History {
 }
 thread_local! {
     static HISTORY: RefCell<History> = RefCell::new(History::default());
-    static CLOCK: Instant = Instant::now();
 }
 
 #[derive(Clone, Copy)]
@@ -67,7 +78,7 @@ fn record(phase: &'static str, observation: &LockObservation) {
         phase,
         pid: std::process::id(),
         thread: std::thread::current().id(),
-        elapsed_ns: CLOCK.with(|start| start.elapsed().as_nanos()),
+        elapsed_ns: monotonic_ns(),
         fd: observation.fd,
         dev: observation.dev,
         inode: observation.inode,
@@ -139,12 +150,36 @@ impl fmt::Debug for Peer {
             .finish()
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RaceStage {
+    ParentChanged,
+    #[cfg(target_os = "linux")]
+    DescriptorMetadata,
+    #[cfg(target_os = "linux")]
+    DescriptorIdentity,
+    #[cfg(target_os = "macos")]
+    DescriptorInfo,
+    IdentityOrImageChanged,
+}
+
 #[derive(Default)]
 struct Native {
     peers: Vec<Peer>,
     unavailable: usize,
     raced: usize,
+    race_observations: Vec<(RaceStage, u32, Option<i32>)>,
+    race_observations_lost: usize,
     truncated: bool,
+}
+impl Native {
+    fn record_race(&mut self, stage: RaceStage, pid: u32, fd: Option<i32>) {
+        self.raced += 1;
+        if self.race_observations.len() < MAX_RACE_OBSERVATIONS {
+            self.race_observations.push((stage, pid, fd));
+        } else {
+            self.race_observations_lost += 1;
+        }
+    }
 }
 pub(super) struct Snapshot {
     pid: u32,
@@ -158,7 +193,7 @@ impl fmt::Display for Snapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{{scope=self-and-direct-children,pid={},sample-start-ns={},sample-end-ns={},calling-thread-events={:?},events-lost={},peers={:?},native-unavailable={},native-raced={},native-truncated={},claim=descriptor-observation-only}}",
+            "{{scope=self-and-direct-children,clock=process-monotonic,pid={},sample-start-ns={},sample-end-ns={},calling-thread-events={:?},events-lost={},peers={:?},native-unavailable={},native-raced={},native-race-observations={:?},native-race-observations-lost={},native-truncated={},claim=descriptor-observation-only}}",
             self.pid,
             self.sample_start_ns,
             self.sample_end_ns,
@@ -167,13 +202,15 @@ impl fmt::Display for Snapshot {
             self.native.peers,
             self.native.unavailable,
             self.native.raced,
+            self.native.race_observations,
+            self.native.race_observations_lost,
             self.native.truncated
         )
     }
 }
 pub(super) fn snapshot(wanted: &LockObservation) -> Snapshot {
     let pid = std::process::id();
-    let sample_start_ns = CLOCK.with(|start| start.elapsed().as_nanos());
+    let sample_start_ns = monotonic_ns();
     let (events, events_lost) = HISTORY.with(|history| {
         let history = history.borrow();
         let events = history
@@ -194,7 +231,7 @@ pub(super) fn snapshot(wanted: &LockObservation) -> Snapshot {
     Snapshot {
         pid,
         sample_start_ns,
-        sample_end_ns: CLOCK.with(|start| start.elapsed().as_nanos()),
+        sample_end_ns: monotonic_ns(),
         events,
         events_lost,
         native,
@@ -298,7 +335,7 @@ mod platform {
                 continue;
             };
             if child != pid && before.ppid != pid {
-                result.raced += 1;
+                result.record_race(RaceStage::ParentChanged, child, None);
                 continue;
             }
             let Ok(fds) = fs::read_dir(format!("/proc/{child}/fd")) else {
@@ -324,7 +361,7 @@ mod platform {
                     continue;
                 };
                 let Ok(meta) = fs::metadata(entry.path()) else {
-                    result.raced += 1;
+                    result.record_race(RaceStage::DescriptorMetadata, child, Some(fd));
                     continue;
                 };
                 if meta.dev() != dev || meta.ino() != inode {
@@ -344,7 +381,7 @@ mod platform {
                         .and_then(|v| v.trim().parse::<u64>().ok())
                 });
                 if actual_inode != Some(inode) {
-                    result.raced += 1;
+                    result.record_race(RaceStage::DescriptorIdentity, child, Some(fd));
                     continue;
                 }
                 let flags = info.lines().find_map(|l| {
@@ -377,7 +414,7 @@ mod platform {
                 || fs::read_link(format!("/proc/{child}/exe")).ok() != image
             {
                 result.peers.truncate(first);
-                result.raced += 1;
+                result.record_race(RaceStage::IdentityOrImageChanged, child, None);
             }
         }
         result
@@ -474,7 +511,7 @@ mod platform {
                     continue;
                 };
                 if child != pid && before.ppid != pid {
-                    result.raced += 1;
+                    result.record_race(RaceStage::ParentChanged, child, None);
                     continue;
                 }
                 let child_image = image(child);
@@ -512,7 +549,7 @@ mod platform {
                         size_of::<VnodeFd>() as i32,
                     ) != size_of::<VnodeFd>() as i32
                     {
-                        result.raced += 1;
+                        result.record_race(RaceStage::DescriptorInfo, child, Some(fd.proc_fd));
                         continue;
                     }
                     if u64::from(info.vnode.vi_stat.vst_dev) != dev
@@ -539,7 +576,7 @@ mod platform {
                 }
                 if identity(child) != Some(before) || image(child) != child_image {
                     result.peers.truncate(first);
-                    result.raced += 1;
+                    result.record_race(RaceStage::IdentityOrImageChanged, child, None);
                 }
             }
             result

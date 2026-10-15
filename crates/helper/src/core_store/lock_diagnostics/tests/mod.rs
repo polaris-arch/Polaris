@@ -90,9 +90,10 @@ fn control_origin(phase: &str, child_pid: Option<u32>) {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|elapsed| elapsed.as_nanos());
+    let monotonic_ns = monotonic_ns();
     writeln!(
         io::stderr().lock(),
-        "LOCK_CONTROL_ORIGIN origin=isolated-inherited-cloexec phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} scope=test-only-not-production",
+        "LOCK_CONTROL_ORIGIN origin=isolated-inherited-cloexec phase={phase} parent_pid={} child_pid={child_pid:?} unix_ns={unix_ns:?} monotonic_ns={monotonic_ns} scope=test-only-not-production",
         std::process::id()
     )
     .unwrap();
@@ -281,4 +282,27 @@ fn flock_fields_require_exact_native_kind_device_inode_and_closed_mode() {
         platform::flock(&raw.replace("WRITE", "READ"), dev, 99),
         Some((false, 123))
     );
+}
+
+// Pure source-level regression coverage; these tests do not spawn processes or
+// inspect host descriptors. The cross-thread sample uses the same static epoch.
+#[test]
+fn diagnostic_clock_uses_one_epoch_across_threads() {
+    let before = monotonic_ns();
+    let child = std::thread::spawn(monotonic_ns).join().unwrap();
+    let after = monotonic_ns();
+    assert!(before <= child && child <= after);
+}
+
+#[test]
+fn diagnostic_races_keep_bounded_closed_context_and_total_count() {
+    let mut native = Native::default();
+    for _ in 0..MAX_RACE_OBSERVATIONS + 3 {
+        native.record_race(RaceStage::ParentChanged, 42, Some(7));
+    }
+    assert_eq!(native.raced, MAX_RACE_OBSERVATIONS + 3);
+    assert_eq!(native.race_observations.len(), MAX_RACE_OBSERVATIONS);
+    assert_eq!(native.race_observations_lost, 3);
+    assert!(native.race_observations.iter().all(|entry|
+        *entry == (RaceStage::ParentChanged, 42, Some(7))));
 }

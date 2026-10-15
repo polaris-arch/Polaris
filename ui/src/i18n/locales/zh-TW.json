@@ -1821,6 +1821,7 @@
       "readFailed": "無法讀取備份檔案",
       "invalidFormat": "這不是有效的 Polaris 備份檔案",
       "invalidArgs": "請至少選擇一個要復原的類別",
+      "sharedDependencyConflict": "所選類別與未選類別使用的共用資源衝突，未儲存任何變更。請檢查類別選擇後重試。",
       "saveFailed": "無法儲存復原後的設定",
       "meshRoutingRequiresTrustedRestore": "組網路由策略還原需要可信舊範圍證明，目前已阻止寫入。",
       "meshRoutingInvalidPolicy": "組網路由策略驗證失敗，備份未匯出。",

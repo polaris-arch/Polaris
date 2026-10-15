@@ -1,3 +1,4 @@
+import { subscriptionExpiryDate } from '@/domain/subscription-expiry';
 import type { ReactNode } from 'react';
 /**
  * 节点屏视图模型 —— **呈现层与接线层之间的唯一契约**。
@@ -477,7 +478,7 @@ export function buildSubSummary(args: {
 
   const info = sub.userInfo;
   const usageRaw = subUsage(info);
-  const expireSec = info?.expire;
+  const expiryDate = subscriptionExpiryDate(info?.expire);
   const updatedText = relativeTimeTextIso(sub.lastUpdated, t);
   return {
     name: sub.name,
@@ -495,8 +496,8 @@ export function buildSubSummary(args: {
           }
         : undefined,
     expiry:
-      typeof expireSec === 'number' && expireSec > 0
-        ? t('nodes.subExpiry', { date: new Date(expireSec * 1000).toISOString().slice(0, 10) })
+      expiryDate !== null
+        ? t('nodes.subExpiry', { date: expiryDate })
         : undefined,
     /* `relativeTimeTextIso` 解析不出来时返回空串（那是「这条时间戳读不动」，不是「刚刚」）
        ⇒ 空串同样落成缺席，绝不回落成一个看起来对的相对时间。 */

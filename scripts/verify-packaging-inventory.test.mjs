@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cronetFixture, fixtureManifest } from './lib/cronet-payload.test.mjs';
+import { assetNames } from './release-assets.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
 import { createHash } from 'node:crypto';
 import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers } from './desktop-core/release-consumer.mjs';
@@ -17,7 +18,7 @@ const count = Number(readFileSync(join(repo, 'src-tauri/build.rs'), 'utf8')
 assert.ok(count > 0, 'fixture count must come from the actual build source');
 
 // Inert staging members exercise the actual inventory CLI, not production packages.
-function fixture(t, label, extra = []) {
+function fixture(t, label, extra = [], mutate = () => {}) {
   const root = mkdtempSync(join(tmpdir(), 'polaris-cleaner-inventory-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const core = label === 'windows' ? 'win' : 'linux';
@@ -42,6 +43,7 @@ function fixture(t, label, extra = []) {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, 'inert inventory fixture');
   }
+  mutate(root);
   const result = spawnSync(process.execPath, [verifier, 'inventory', '--label', label, '--root', root], { encoding: 'utf8' });
   return { code: result.status, output: result.stdout + result.stderr };
 }
@@ -121,3 +123,71 @@ for (const fault of ['source replacement', 'symlink', 'missing pin', 'wrong arch
     const result = f.run(); assert.equal(result.code, 1, result.output); assert.match(result.output, /Cronet|cronetLibrarySha256/);
   });
 }
+
+// S02: complete valid fixture plus unseen members must never become a green inventory.
+test('depth 25 hard-fails instead of silently discarding unregistered content', t => {
+  const member = `${Array(25).fill('deep').join('/')}/unregistered.txt`;
+  const r = fixture(t, 'windows', [cleaner, member]);
+  assert.equal(r.code, 1, r.output);
+  assert.match(r.output, /depth limit 24 exceeded/);
+});
+test('depth 24 is traversed and reported as an unregistered resource', t => {
+  const member = `_up_/${Array(23).fill('deep').join('/')}/unregistered.txt`;
+  const r = fixture(t, 'windows', [cleaner, member]);
+  assert.equal(r.code, 1, r.output);
+  assert.doesNotMatch(r.output, /depth limit/);
+  assert.ok(r.output.includes(member), r.output);
+});
+test('symlink ancestor cycle hard-fails without hiding the loop', { skip: process.platform === 'win32' }, t => {
+  const r = fixture(t, 'windows', [cleaner], root => symlinkSync(root, join(root, 'loop')));
+  assert.equal(r.code, 1, r.output);
+  assert.match(r.output, /symlink cycle/);
+});
+test('separate directory aliases are enumerated rather than globally deduplicated', { skip: process.platform === 'win32' }, t => {
+  const r = fixture(t, 'windows', [cleaner], root => symlinkSync(join(root, '_up_/resources/win'), join(root, '_up_/alias')));
+  assert.equal(r.code, 1, r.output);
+  assert.match(r.output, /_up_\/alias\/polaris-cleaner.exe/);
+  assert.doesNotMatch(r.output, /symlink cycle/);
+});
+
+// G-R1: the real assets caller scans bundle/, including deep retained staging.
+function linuxAssetFixture(t, extraDepth = 0) {
+  const root = mkdtempSync(join(tmpdir(), 'polaris-linux-assets-depth-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const version = JSON.parse(readFileSync(join(repo, 'src-tauri/tauri.conf.json'), 'utf8')).version;
+  for (const name of assetNames(version, 'linux')) {
+    const target = join(root, name.endsWith('.deb') ? 'deb' : 'appimage', name);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'inert asset bytes');
+  }
+  for (const staging of [
+    'deb/Polaris-package/data/usr/lib/Polaris/_up_/resources/dashboard/assets/main.js',
+    'appimage/Polaris.AppDir/usr/lib/Polaris/_up_/resources/dashboard/assets/main.js',
+  ]) {
+    const target = join(root, staging);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'inert staging resource');
+  }
+  if (extraDepth) {
+    const target = join(root, ...Array(extraDepth).fill('deep'), 'member.txt');
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, 'inert depth boundary member');
+  }
+  const result = spawnSync(process.execPath,
+    [verifier, 'assets', '--label', 'linux', '--dir', root], { encoding: 'utf8' });
+  return { code: result.status, output: result.stdout + result.stderr };
+}
+test('Linux assets gate accepts realistic deep deb and AppDir staging', t => {
+  const result = linuxAssetFixture(t);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /verify-packaging assets/);
+});
+test('Linux assets gate visits its explicit depth 24 boundary', t => {
+  const result = linuxAssetFixture(t, 24);
+  assert.equal(result.code, 0, result.output);
+});
+test('Linux assets gate still fails closed beyond its depth 24 budget', t => {
+  const result = linuxAssetFixture(t, 25);
+  assert.equal(result.code, 1, result.output);
+  assert.match(result.output, /depth limit 24 exceeded/);
+});

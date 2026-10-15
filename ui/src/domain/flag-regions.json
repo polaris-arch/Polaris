@@ -5,7 +5,7 @@
     "zh": ["中国", "中國", "回国", "回國", "上海", "北京", "广州", "深圳", "杭州"],
     "en": ["china", "shanghai", "beijing", "guangzhou", "shenzhen"],
     "noAlpha2": true,
-    "patterns": ["(?<![a-z])cn(?!2)(?![a-z])"]
+    "patterns": ["cn(?!2)(?![a-z])"]
   },
   { "code": "hk", "label": "Hong Kong", "zh": ["香港"], "en": ["hong kong", "hkg"] },
   { "code": "mo", "label": "Macao", "zh": ["澳门", "澳門"], "en": ["macau", "macao"] },

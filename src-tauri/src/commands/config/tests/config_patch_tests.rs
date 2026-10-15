@@ -366,3 +366,66 @@ fn backup_import_of_unchanged_class_still_overrides_concurrent_same_class_edit()
     let reopened = ConfigManager::new(dir.clone()).load_full().unwrap();
     assert_eq!(reopened["servers"][0]["id"], json!("manual-original"));
 }
+
+#[test]
+fn takeover_consumes_latest_fake_ip_flag_without_overwriting_dns_edits() {
+    let dir = temp_dir("takeover-latest-dns");
+    let manager = ConfigManager::new(dir.clone());
+    manager
+        .update(|config| {
+            config["dnsConfig"]["enableFakeIp"] = json!(false);
+            config["dnsConfig"]["fakeIpTunAutoEnable"] = json!(true);
+            config["dnsConfig"]["concurrent"] = json!("latest-dns-edit");
+            config["subscriptionUserAgent"] = json!("latest-scheduler-edit");
+            Decision::Write(())
+        })
+        .unwrap();
+    let corrected = std::cell::Cell::new(false);
+    let (_, saved, _) = config_takeover_edit(&manager, ProxyModeType::Tun, &corrected).unwrap();
+    assert!(corrected.get());
+    assert_eq!(saved["dnsConfig"]["enableFakeIp"], json!(true));
+    assert_eq!(saved["dnsConfig"]["concurrent"], json!("latest-dns-edit"));
+    assert_eq!(
+        saved["subscriptionUserAgent"],
+        json!("latest-scheduler-edit")
+    );
+    let corrected_again = std::cell::Cell::new(false);
+    config_takeover_edit(&manager, ProxyModeType::Tun, &corrected_again).unwrap();
+    assert!(!corrected_again.get());
+}
+
+#[test]
+fn partial_backup_shared_dependency_conflict_leaves_every_category_and_disk_unchanged() {
+    let dir = temp_dir("backup-dependency-conflict");
+    let manager = ConfigManager::new(dir.clone());
+    manager.update(|config| {
+        config["customRuleSets"] = json!([{"id":"shared", "name":"local", "rules":["local.example"]}]);
+        config["trafficRules"] = json!([{"id":"route-kept", "type":"ruleSet", "values":["shared"], "action":"direct", "enabled":true}]);
+        config["routeRuleOrder"] = json!(["route-kept"]);
+        Decision::Write(())
+    }).unwrap();
+    let before = manager.current().unwrap();
+    let disk_before = std::fs::read(manager.path()).unwrap();
+    let backup = json!({
+        "customRuleSets":[{"id":"shared", "name":"foreign", "rules":["foreign.example"]}],
+        "dnsRules":[{"id":"dns-imported", "type":"domain", "values":["new.example"], "enabled":true,
+            "effects":{"dns":{"enabled":true,"resolver":"direct","answerMode":"real"}}}],
+        "dnsRuleOrder":["dns-imported"], "logLevel":"debug"
+    });
+    let error = match backup_import_save_core(
+        &manager,
+        &backup,
+        &[BackupCategory::DnsRules, BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("partial shared-resource replacement must reject the whole transaction"),
+    };
+    assert!(
+        matches!(error, polaris_store::StoreError::Validation(ref code) if code == SHARED_DEPENDENCY_CONFLICT)
+    );
+    assert_eq!(manager.current().unwrap(), before);
+    assert_eq!(std::fs::read(manager.path()).unwrap(), disk_before);
+}

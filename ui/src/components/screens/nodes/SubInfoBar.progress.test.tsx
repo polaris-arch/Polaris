@@ -125,3 +125,10 @@ describe('SubInfoBar 更新进度', () => {
     expect(html).not.toContain('backend diagnostic must not win');
   });
 });
+
+
+it.each([0, 1e13, 18446744073709551615])('renders external expiry %s without throwing', (expire) => {
+  const html = renderToStaticMarkup(<SubInfoBar subscription={{ ...SUB, userInfo: { expire } }} nodeCount={2} config={{}} />);
+  expect(html).toContain(SUB.name);
+  expect(html).not.toContain('nodes.subExpiry');
+});

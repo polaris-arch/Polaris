@@ -1385,9 +1385,10 @@ fn assemble(
     s
 }
 
-/// 追加 TLS 查询参数（sni/alpn/fp/allowInsecure），与 [`parse_tls_settings`] 读取项对称。
+/// 追加 TLS 查询参数（sni/alpn/fp/allowInsecure/pcs），与 [`parse_tls_settings`] 读取项对称。
 fn push_tls_params(q: &mut QueryString, tls: &TlsSettings) {
     q.push_opt("sni", tls.server_name.clone());
+    q.push_opt("pcs", tls.certificate_sha256.clone());
     if let Some(alpn) = &tls.alpn {
         if !alpn.is_empty() {
             q.push("alpn", alpn.join(","));
@@ -1462,6 +1463,29 @@ fn push_security_params(q: &mut QueryString, c: &ServerConfig, mode: &SecurityMo
 /// 支持 vless/vmess/trojan/ss/hysteria2/tuic/anytls/snell/socks/http(s)/naive。
 /// WireGuard/Tailscale/SSH/Custom 无标准 share-link 文法 → `Err`（诚实拒绝，不编造 `polaris://` 假链）。
 pub fn encode_share_url(c: &ServerConfig) -> Result<String, String> {
+    if let Some(tls) = &c.tls_settings {
+        // There is no supported URI grammar for the SPKI pin. Never silently remove a
+        // security constraint, including on protocols whose URI cannot carry TLS pins.
+        if tls.certificate_public_key_sha256.as_ref().is_some_and(|pin| !pin.is_empty()) {
+            return Err("分享链接无法保留公钥证书固定，请使用配置导出".into());
+        }
+        if let Some(pin) = tls.certificate_sha256.as_deref().filter(|pin| !pin.is_empty()) {
+            let carries_pin = match c.protocol {
+                Protocol::Hysteria2 | Protocol::Tuic => true,
+                Protocol::Vless | Protocol::Vmess => c.security.as_ref().is_some_and(SecurityMode::is_tls),
+                Protocol::Trojan | Protocol::Anytls => c.security.as_ref().is_none_or(SecurityMode::is_tls),
+                _ => false,
+            };
+            if !carries_pin {
+                return Err("此协议的分享链接无法保留证书固定，请使用配置导出".into());
+            }
+            // Import drops invalid entries. Refuse an export that would not round-trip
+            // every pin, rather than emitting a link with a weakened constraint.
+            if pin.split(',').any(|item| keep_valid_cert_pins(item).is_none()) {
+                return Err("证书固定格式无效，无法生成无损分享链接".into());
+            }
+        }
+    }
     match c.protocol {
         // hysteria v1 野外确有 `hysteria://` 文法，但**各家不兼容**（auth/upmbps/obfs 的键名与
         // 大小写各写各的），编一个只有本仓认得的链等于制造一条假的互操作承诺。
@@ -1800,6 +1824,12 @@ fn encode_vmess(c: &ServerConfig) -> Result<String, String> {
     if c.security.as_ref().is_some_and(SecurityMode::is_tls) {
         obj.insert("tls".into(), json!("tls"));
         if let Some(tls) = &c.tls_settings {
+            if let Some(pin) = &tls.certificate_sha256 {
+                obj.insert("pcs".into(), json!(pin));
+            }
+            if let Some(insecure) = tls.allow_insecure {
+                obj.insert("allowInsecure".into(), json!(insecure));
+            }
             if let Some(sni) = &tls.server_name {
                 obj.insert("sni".into(), json!(sni));
             }

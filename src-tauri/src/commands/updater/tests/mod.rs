@@ -2897,3 +2897,22 @@ fn android_update_assets_are_wired() {
         );
     }
 }
+
+#[test]
+fn full_uninstall_prepares_all_desktop_owners_before_any_destructive_step() {
+    let source = crate::test_support::crate_code("commands/updater/uninstall.rs");
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(&source, "pub async fn app_uninstall_all(");
+    let ready = body.find("prepare_desktop_exit(&app).await").unwrap();
+    let destructive = body
+        .find("with_helper_service_mutation_core_guard")
+        .unwrap();
+    assert!(ready < destructive);
+    let refusal = &body[ready..destructive];
+    assert!(refusal.contains("return Ok(ApiResponse::err_with_code("));
+    assert!(refusal.contains("UNINSTALL_RESTART_REQUIRED"));
+    assert!(
+        body.contains("let _exit_ready ="),
+        "the Ready guard spans helper scripts and config removal"
+    );
+}

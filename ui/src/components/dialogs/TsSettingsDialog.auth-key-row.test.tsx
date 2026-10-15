@@ -65,7 +65,7 @@ const seed = (servers: ServerConfig[]) => {
 const render = (servers: ServerConfig[]): string => {
   seed(servers);
   // 本弹窗现在按 serverId 寻址（不再自查 protocol==='tailscale'）；固定节点 id 与 tsNode() 保持一致。
-  return renderToStaticMarkup(<TsSettingsDialog serverId="ts1" />);
+  return renderToStaticMarkup(<TsSettingsDialog instanceId="test-ts-settings" serverId="ts1" />);
 };
 
 describe('TsSettingsDialog：Auth Key 状态行只渲染布尔事实', () => {
@@ -143,21 +143,21 @@ describe('TsSettingsDialog：按 serverId 寻址（不再是单例，不许自�
 
   it('正向：两个 TS 节点，携 ts-b 的 serverId 渲染出的是 ts-b 的 hostname', () => {
     seed(twoNodes);
-    const html = renderToStaticMarkup(<TsSettingsDialog serverId="ts-b" />);
+    const html = renderToStaticMarkup(<TsSettingsDialog instanceId="test-ts-settings" serverId="ts-b" />);
     expect(html).toContain('value="host-b"');
     expect(html).not.toContain('value="host-a"');
   });
 
   it('反向对照：携 ts-a 的 serverId 时渲染出的是 ts-a（证明上一条断言真的挂在寻址上，不是巧合）', () => {
     seed(twoNodes);
-    const html = renderToStaticMarkup(<TsSettingsDialog serverId="ts-a" />);
+    const html = renderToStaticMarkup(<TsSettingsDialog instanceId="test-ts-settings" serverId="ts-a" />);
     expect(html).toContain('value="host-a"');
     expect(html).not.toContain('value="host-b"');
   });
 
   it('serverId 取不到（节点已删 / id 不匹配）→ 空态，绝不回落到任意一个既有节点', () => {
     seed(twoNodes);
-    const html = renderToStaticMarkup(<TsSettingsDialog serverId="ts-missing" />);
+    const html = renderToStaticMarkup(<TsSettingsDialog instanceId="test-ts-settings" serverId="ts-missing" />);
     expect(html).toContain('ts.noNode');
     expect(html).not.toContain('host-a');
     expect(html).not.toContain('host-b');

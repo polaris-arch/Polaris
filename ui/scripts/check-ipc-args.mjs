@@ -143,6 +143,8 @@ function parseRustCommands(ownerFiles) {
         if (rawName === '_' || rawName === 'self') continue;
         // 注入参数（Tauri 自动填，不是 JS 参数袋键）。
         if (/\bAppHandle\b|\bState\s*<|\bWebviewWindow\b|\bWindow\b|\bAppRuntime\b/.test(type)) continue;
+        // The SDK's raw request is injected too; do not exempt domain Request types.
+        if (/^tauri::ipc::Request\s*</.test(type)) continue;
         const key = camel(rawName);
         if (!key) continue;
         if (/^Option\s*</.test(type)) optional.add(key);

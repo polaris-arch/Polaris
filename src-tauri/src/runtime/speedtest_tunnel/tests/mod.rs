@@ -357,47 +357,17 @@ async fn https_target_performs_tls_handshake_inside_the_tunnel() {
     );
 }
 
-/// 🔵 **边界门**：不校验证书的 verifier 只许留在本模块。
-///
-/// 泄漏到订阅拉取 / 内核下载 / 更新 / 解锁检测任何一条链上都是真实的安全降级（那些链路要读并
-/// **信任**内容，而测速只看状态码与时刻）。独立函数只是让泄漏「需要显式复制一段代码」，本门让它
-/// **直接转红**。
-///
-/// 牙：在 `src-tauri/src/` 任何其它文件里写 `with_custom_certificate_verifier(` → 本门转红。
+/// The production factory must use the platform verifier with an explicit
+/// provider; custom roots exist only in the test module. No bypass remains.
 #[test]
-fn dangerous_tls_verifier_stays_in_this_module() {
-    const NEEDLE: &str = "with_custom_certificate_verifier";
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let module_root = root.join("runtime").join("speedtest_tunnel");
-    let mut offenders = Vec::new();
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("读 src 目录") {
-            let path = entry.expect("目录项").path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            // 豁免面按**模块归属**判，不按文件名判：本模块 = `speedtest_tunnel.rs`
-            // ∪ `speedtest_tunnel/` 目录下的一切（含本测试文件 `speedtest_tunnel/tests/mod.rs`）。
-            // 旧写法 `ends_with("speedtest_tunnel.rs")` 在测试外移后失效 —— 本用例自身的源码
-            // 里就写着这个针，文件名却变成了 `mod.rs`，于是门被自己的取材面绊倒。
-            let owned_by_this_module =
-                path.starts_with(&module_root) || path.ends_with("speedtest_tunnel.rs");
-            if path.extension().is_some_and(|e| e == "rs")
-                && !owned_by_this_module
-                && std::fs::read_to_string(&path)
-                    .is_ok_and(|src| src.contains(&format!("{NEEDLE}(")))
-            {
-                offenders.push(path.display().to_string());
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "不校验证书的 TLS verifier 只允许出现在测速隧道模块（其它链路要信任内容）。越界:\n{}",
-        offenders.join("\n")
-    );
+fn https_measurements_require_platform_certificate_verification() {
+    let source = include_str!("../../speedtest_tunnel.rs");
+    let production = source.split("pub(crate) mod mock_proxy").next().unwrap();
+    let code = polaris_source_probe::mask_comments_and_strings(production);
+    assert!(code.contains("rustls_platform_verifier::Verifier::new("));
+    assert!(!code.contains("ServerCertVerified::assertion("));
+    assert!(!code.contains("MeasureOnlyVerifier"));
+    assert!(!code.contains("new_with_extra_roots"));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -647,4 +617,352 @@ async fn the_source_port_is_announced_before_any_byte_is_sent() {
         1,
         "对照：登记之后 CONNECT 确实发出去了"
     );
+}
+
+#[tokio::test]
+async fn interim_responses_preserve_final_status_and_warmup_body() {
+    // Coalesced and fragmented 103 heads both lead to the final response. The
+    // delayed body contains a fake error head and must be drained before GET 2.
+    for first in [
+        GetReply::raw("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"),
+        GetReply::split(
+            "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 103 Early Hints\r\n",
+            "\r\nHTTP/1.1 204 No Content\r\n\r\n",
+        ),
+        GetReply::split(
+            "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n",
+            "HTTP/1.1 500 X\r\n\r\n.",
+        ),
+    ] {
+        let (port, observed) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets: vec![
+                first,
+                GetReply::split(
+                    "HTTP/1.1 103 Early Hints\r\n\r\n",
+                    "HTTP/1.1 204 No Content\r\n\r\n",
+                ),
+            ],
+        })
+        .await;
+        assert!(measure_detailed(port, &http_target(), Duration::from_secs(5))
+            .await
+            .is_ok());
+        assert_eq!(observed.lock().unwrap().request_lines.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn interim_responses_do_not_hide_final_failures_or_upgrades() {
+    use crate::commands::speedtest::{FailKind, FailPhase, MeasureFailure};
+    for (final_reply, kind) in [
+        ("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 403 Forbidden\r\n\r\n", FailKind::HttpStatus(403)),
+        ("HTTP/1.1 101 Switching Protocols\r\n\r\n", FailKind::Transport),
+    ] {
+        for measured_leg in [false, true] {
+            let mut gets = Vec::new();
+            if measured_leg {
+                gets.push(GetReply::ok());
+            }
+            gets.push(GetReply::raw(final_reply));
+            let (port, _) = spawn_mock_proxy(Script {
+                connect_reply: Some(OK_204),
+                gets,
+            })
+            .await;
+            let phase = if measured_leg {
+                FailPhase::Measure
+            } else {
+                FailPhase::Warmup
+            };
+            assert_eq!(measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
+                Err(MeasureFailure::new(phase, kind)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn interim_only_eof_is_transport_failure_on_either_get() {
+    use crate::commands::speedtest::{FailKind, FailPhase, MeasureFailure};
+    for measured_leg in [false, true] {
+        let mut gets = Vec::new();
+        if measured_leg {
+            gets.push(GetReply::ok());
+        }
+        gets.push(GetReply::raw("HTTP/1.1 103 Early Hints\r\n\r\n").hanging_up());
+        let (port, _) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets,
+        })
+        .await;
+        let phase = if measured_leg {
+            FailPhase::Measure
+        } else {
+            FailPhase::Warmup
+        };
+        assert_eq!(measure_detailed(port, &http_target(), Duration::from_secs(5)).await,
+            Err(MeasureFailure::new(phase, FailKind::Transport)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn interim_responses_share_the_original_deadline() {
+    let (mut peer, mut client) = tokio::io::duplex(4096);
+    let producer = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if peer
+                .write_all(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let mut buf = Vec::new();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(5),
+        read_response_status(&mut client, &mut buf),
+    )
+    .await
+    .is_err());
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    producer.abort();
+}
+
+#[tokio::test]
+async fn interim_and_final_heads_share_a_hard_byte_limit() {
+    let interim = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+    let mut bytes = interim.repeat(MAX_HEAD_BYTES / interim.len() + 1);
+    bytes.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+    assert_eq!(read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await, None);
+
+    // Final head exactly on the aggregate boundary is accepted; one byte over
+    // the boundary is rejected even when the complete head is already buffered.
+    for extra in [0, 1] {
+        let mut bytes = interim.to_vec();
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\r\nX: ");
+        bytes.resize(MAX_HEAD_BYTES - 4 + extra, b'x');
+        bytes.extend_from_slice(b"\r\n\r\n");
+        let expected = (extra == 0).then_some(200);
+        assert_eq!(read_response_status(&mut bytes.as_slice(), &mut Vec::new()).await, expected);
+        assert_eq!(read_response_status(&mut &b""[..], &mut bytes).await, expected);
+    }
+}
+
+// Public test-only credentials for an offline mock origin; never install this CA.
+// Fixtures are valid 2020-2040 (EXPIRED ends in 2021), P-256, SAN speed.example.test.
+#[cfg(not(target_os = "android"))]
+mod authenticated_tls {
+    use super::*;
+    const CA: &str = concat!(
+        "3082019f30820144a003020102020101300a06082a8648ce3d04030230353133303106035504030c2a506f6c61726973206d",
+        "6561737572656d656e7420746573742043412c206e6576657220696e7374616c6c301e170d3230303130313030303030305a",
+        "170d3430303130313030303030305a30353133303106035504030c2a506f6c61726973206d6561737572656d656e74207465",
+        "73742043412c206e6576657220696e7374616c6c3059301306072a8648ce3d020106082a8648ce3d03010703420004fdc353",
+        "8bdea005b069f2e408fdab9d994aa1fa35c19f39b4141187584775981478c2d4bc3da4253237b63543e535225fd8d126b16b",
+        "3fa7f08c83e9a79cfc2973a345304330120603551d130101ff040830060101ff020100300e0603551d0f0101ff0404030201",
+        "86301d0603551d0e04160414464190e268565c52bbf6d3809945532c12ae9047300a06082a8648ce3d040302034900304602",
+        "2100f0d5ec84aa779621fce1784f4a77f09d8493c18560ef73204c12498d8f11a304022100f74c5bb2c97b253ed2f40a6202",
+        "585ac964c8c34eaf2683fa92aeded8aa92b91f",
+    );
+    const LEAF: &str = concat!(
+        "308201b73082015ca003020102020102300a06082a8648ce3d04030230353133303106035504030c2a506f6c61726973206d",
+        "6561737572656d656e7420746573742043412c206e6576657220696e7374616c6c301e170d3230303130313030303030305a",
+        "170d3430303130313030303030305a301d311b301906035504030c1273706565642e6578616d706c652e7465737430593013",
+        "06072a8648ce3d020106082a8648ce3d03010703420004f1775a6aef7361fe89a071d4d9cf12334170bbfc8e7bb49ca217cd",
+        "b831d4b6af0667f3cee97ba0d6ac123ba26076db4411e9cea83b06ac79a99602a979918236a3753073300c0603551d130101",
+        "ff04023000301d0603551d1104163014821273706565642e6578616d706c652e7465737430130603551d25040c300a06082b",
+        "06010505070301300e0603551d0f0101ff040403020780301f0603551d23041830168014464190e268565c52bbf6d3809945",
+        "532c12ae9047300a06082a8648ce3d0403020349003046022100b94c7103130e86de8c02a6dcaafcce4b0c0c12c07f71c355",
+        "061831a6a7d9eac2022100bab4908b3c6a3587d2bca9a96ea5c8731aac5b84d9b3c6de0e4a28f24a398ea4",
+    );
+    const SELF_SIGNED: &str = concat!(
+        "3082019e30820144a003020102020103300a06082a8648ce3d040302301d311b301906035504030c1273706565642e657861",
+        "6d706c652e74657374301e170d3230303130313030303030305a170d3430303130313030303030305a301d311b3019060355",
+        "04030c1273706565642e6578616d706c652e746573743059301306072a8648ce3d020106082a8648ce3d03010703420004f1",
+        "775a6aef7361fe89a071d4d9cf12334170bbfc8e7bb49ca217cdb831d4b6af0667f3cee97ba0d6ac123ba26076db4411e9ce",
+        "a83b06ac79a99602a979918236a3753073300c0603551d130101ff04023000301d0603551d1104163014821273706565642e",
+        "6578616d706c652e7465737430130603551d25040c300a06082b06010505070301300e0603551d0f0101ff04040302078030",
+        "1f0603551d23041830168014bd9bae0e8e04bbd72048507167468802c1ec640f300a06082a8648ce3d040302034800304502",
+        "2074e26707a88eeaf3c1d49c67e1d65564ab22cc12df8db2414823d5d4bb3d00cc022100f0347b2bb1d2b7633a3a8e2dd832",
+        "ef54adf7ce7bf9cbe43005902eda45ae691c",
+    );
+    const EXPIRED: &str = concat!(
+        "308201b63082015ca003020102020104300a06082a8648ce3d04030230353133303106035504030c2a506f6c61726973206d",
+        "6561737572656d656e7420746573742043412c206e6576657220696e7374616c6c301e170d3230303130313030303030305a",
+        "170d3231303130313030303030305a301d311b301906035504030c1273706565642e6578616d706c652e7465737430593013",
+        "06072a8648ce3d020106082a8648ce3d03010703420004f1775a6aef7361fe89a071d4d9cf12334170bbfc8e7bb49ca217cd",
+        "b831d4b6af0667f3cee97ba0d6ac123ba26076db4411e9cea83b06ac79a99602a979918236a3753073300c0603551d130101",
+        "ff04023000301d0603551d1104163014821273706565642e6578616d706c652e7465737430130603551d25040c300a06082b",
+        "06010505070301300e0603551d0f0101ff040403020780301f0603551d23041830168014464190e268565c52bbf6d3809945",
+        "532c12ae9047300a06082a8648ce3d040302034800304502201cbb76d6318af522a69796fc00612ce3b0bbc10795d637744d",
+        "0657bd29d12b77022100b3e6d42b5f0b85c1c45ecf1d73b800286cff2d897d23c9b5d7f1b4530146ea65",
+    );
+    const KEY: &str = concat!(
+        "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b020101042041e9f9428944019db69773a87242",
+        "a6ae1f7d438994378958ecb9e76416c388f6a14403420004f1775a6aef7361fe89a071d4d9cf12334170bbfc8e7bb49ca217",
+        "cdb831d4b6af0667f3cee97ba0d6ac123ba26076db4411e9cea83b06ac79a99602a979918236",
+    );
+
+    fn der(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn trusted_config() -> Arc<rustls::ClientConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(
+            [rustls::pki_types::CertificateDer::from(der(CA))], provider.clone(),
+        ).expect("offline fixture CA");
+        verified_tls_client_config(provider, verifier).expect("verified TLS configuration")
+    }
+
+    async fn tls_origin(cert: &str) -> (
+        u16,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(der(cert))],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(KEY)))).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            while !header.ends_with(b"\r\n\r\n") {
+                if socket.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                header.push(byte[0]);
+                assert!(header.len() <= MAX_HEAD_BYTES);
+            }
+            // CONNECT discloses only the origin authority, never path/query.
+            assert!(!String::from_utf8_lossy(&header).contains("fixture-token"));
+            socket.write_all(OK_204.as_bytes()).await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+            let Ok(mut tls) = acceptor.accept(socket).await else {
+                return;
+            };
+            for _ in 0..2 {
+                header.clear();
+                while !header.ends_with(b"\r\n\r\n") {
+                    if tls.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    header.push(byte[0]);
+                    assert!(header.len() <= MAX_HEAD_BYTES);
+                }
+                observed.lock().unwrap().push(String::from_utf8(header.clone()).unwrap());
+                if tls
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (port, requests, task)
+    }
+
+    async fn finish(task: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_origin_receives_the_complete_authenticated_query() {
+        let (port, requests, task) = tls_origin(LEAF).await;
+        let target = SpeedTestTarget::parse(
+            "https://speed.example.test/private?signature=fixture-token%2Bvalue",
+        )
+        .unwrap();
+        let config = trusted_config();
+        let result = crate::commands::speedtest::measure_warm_ttfb(
+            Duration::from_secs(5), Duration::from_secs(5),
+            open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
+        ).await;
+        assert!(result.is_ok(), "trusted offline origin should complete both GETs");
+        finish(task).await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.starts_with("GET /private?signature=fixture-token%2Bvalue HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("proxy-authorization"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_hostname_self_signed_and_expired_certificates_receive_no_get() {
+        for (cert, host) in [
+            (LEAF, "wrong.example.test"),
+            (SELF_SIGNED, "speed.example.test"),
+            (EXPIRED, "speed.example.test"),
+        ] {
+            let (port, requests, task) = tls_origin(cert).await;
+            let target =
+                SpeedTestTarget::parse(&format!("https://{host}/private?signature=fixture-token"))
+                    .unwrap();
+            let config = trusted_config();
+            let result = tokio::time::timeout(Duration::from_secs(5),
+                open_tunnel_with_tls_config(port, None, &target, &|_| {}, move || Some(config)),
+            ).await.unwrap();
+            assert!(matches!(result, Err(TunnelError::Transport)));
+            finish(task).await;
+            assert!(requests.lock().unwrap().is_empty(), "unauthenticated peer must receive no GET");
+        }
+    }
+
+    #[tokio::test]
+    async fn production_trust_store_rejects_the_uninstalled_test_ca_before_get() {
+        let (port, requests, task) = tls_origin(LEAF).await;
+        let target =
+            SpeedTestTarget::parse("https://speed.example.test/private?signature=fixture-token")
+                .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            open_tunnel(port, None, &target, &|_| {}),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(TunnelError::Transport)));
+        finish(task).await;
+        assert!(requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn interim_only_responses_time_out_in_the_current_get_phase() {
+    use crate::commands::speedtest::{FailKind, FailPhase, MeasureFailure};
+    for measured_leg in [false, true] {
+        let mut gets = Vec::new();
+        if measured_leg {
+            gets.push(GetReply::ok());
+        }
+        gets.push(GetReply::raw("HTTP/1.1 103 Early Hints\r\n\r\n"));
+        let (port, _) = spawn_mock_proxy(Script {
+            connect_reply: Some(OK_204),
+            gets,
+        })
+        .await;
+        let phase = if measured_leg {
+            FailPhase::Measure
+        } else {
+            FailPhase::Warmup
+        };
+        assert_eq!(
+            measure_detailed(port, &http_target(), Duration::from_millis(200)).await,
+            Err(MeasureFailure::new(phase, FailKind::Timeout))
+        );
+    }
 }

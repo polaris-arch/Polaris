@@ -86,6 +86,34 @@ fn identity(rt: &ProxyRuntime, cfg: &Value, run: u64) -> ResultIdentity {
     }
 }
 
+/// Carry both production identity axes independently: node dirty fingerprint
+/// and the full loaded connection digest. Negative identities keep their fields.
+fn record_config(
+    ledger: &MeasurementLedger,
+    rt: &ProxyRuntime,
+    cfg: &Value,
+    node: &str,
+    measured: crate::commands::speedtest::Measured,
+    mut receipt: ResultIdentity,
+    at: u64,
+) -> bool {
+    let _ = rt;
+    if receipt.node_fingerprint.is_none() {
+        receipt.node_fingerprint = crate::commands::speedtest::current_server_fingerprints(cfg)
+            .get(node)
+            .cloned();
+    }
+    ledger.record_connection_at(
+        node,
+        measured,
+        receipt,
+        crate::runtime::node_fingerprints::measurement_table_json(cfg)
+            .get(node)
+            .cloned(),
+        at,
+    )
+}
+
 /// 一轮测速的结果入账：`(节点, 延迟)`，同一个运行号、同一个入账时刻。
 fn round(
     ledger: &MeasurementLedger,
@@ -96,7 +124,8 @@ fn round(
     results: &[(&str, u32)],
 ) {
     for (node, latency_ms) in results {
-        ledger.record_at(node, Ok(*latency_ms), identity(rt, cfg, run), at);
+        let receipt = identity(rt, cfg, run);
+        record_config(&ledger, &rt, &cfg, node, Ok(*latency_ms), receipt, at);
     }
 }
 
@@ -478,15 +507,18 @@ async fn results_that_may_not_be_selected_never_move_the_exit() {
     ];
     for (label, bad) in cases {
         let ledger = MeasurementLedger::new();
-        ledger.record_at("node-b", Ok(10), bad, MONO);
+        record_config(&ledger, &rt, &cfg, "node-b", Ok(10), bad, MONO);
         // `node-c` 真测了没通。
-        ledger.record_at(
+        record_config(
+            &ledger,
+            &rt,
+            &cfg,
             "node-c",
             Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
             good(1),
             MONO,
         );
-        ledger.record_at("node-a", Ok(5), good(1), MONO);
+        record_config(&ledger, &rt, &cfg, "node-a", Ok(5), good(1), MONO);
         let mut reads = readings(&ledger);
         // 读回不符的结果算「有当前结果」，其余三种不算：用调度器的一轮收尾来过首轮闸门。
         reads
@@ -501,7 +533,7 @@ async fn results_that_may_not_be_selected_never_move_the_exit() {
         );
         assert_eq!(exit_on_disk(&rt), "node-a", "{label}：无候选时出口不动");
         // 正向对照：同一个节点换成一条合格的结果，立刻成为落点。
-        ledger.record_at("node-b", Ok(10), good(2), MONO);
+        record_config(&ledger, &rt, &cfg, "node-b", Ok(10), good(2), MONO);
         let plan = assess(&rt, &reads, None).await.expect(label);
         assert_eq!(plan.candidate.id, "node-b", "{label}");
     }
@@ -601,7 +633,10 @@ async fn a_stopped_data_source_after_the_first_round_is_reported_not_settled() {
     let cfg = running(&rt, &auto_config("node-b", Some("sub")));
     let ledger = MeasurementLedger::new();
     for (run, at) in [(1, MONO), (2, MONO + 30 * MINUTE)] {
-        ledger.record_at(
+        record_config(
+            &ledger,
+            &rt,
+            &cfg,
             "node-b",
             Ok(40),
             ResultIdentity {
@@ -939,7 +974,9 @@ async fn the_transaction_yields_when_the_auto_intent_it_acted_on_is_gone() {
     ] {
         let (rt, _dir) = test_runtime();
         let cfg = running(&rt, &auto_config("node-a", intent));
-        let fingerprint = current_server_fingerprints(&cfg).remove("node-b").unwrap();
+        let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&cfg)
+            .remove("node-b")
+            .unwrap();
         let api = AttestingManagementApi::new("Node A");
         let outcome = rt
             .auto_hot_switch_transaction_with_api(
@@ -1460,7 +1497,10 @@ async fn switch_now_goes_exactly_where_the_decision_points() {
         let cfg = running(&rt, &auto_config("node-b", Some("sub")));
         let ledger = MeasurementLedger::new();
         if seed {
-            ledger.record_at(
+            record_config(
+                &ledger,
+                &rt,
+                &cfg,
                 "node-b",
                 Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
                 identity(&rt, &cfg, 1),
@@ -1951,11 +1991,17 @@ fn refresh_receipts(
     run: u64,
     results: &[(&str, u32)],
 ) {
-    let fingerprints = crate::commands::speedtest::current_server_fingerprints(cfg);
     for (node, latency) in results {
-        let mut receipt = identity(rt, cfg, run);
-        receipt.node_fingerprint = fingerprints.get(*node).cloned();
-        assert!(ledger.record_at(node, Ok(*latency), receipt, MONO));
+        let receipt = identity(rt, cfg, run);
+        assert!(record_config(
+            &ledger,
+            &rt,
+            &cfg,
+            node,
+            Ok(*latency),
+            receipt,
+            MONO
+        ));
     }
 }
 
@@ -2005,10 +2051,21 @@ fn refresh_fallback_rescues_a_barred_node_only_when_other_nodes_are_ineligible()
             "expired" => {
                 let mut old = identity(&rt, &cfg, 2);
                 old.measured_at = WALL - 61 * MINUTE;
-                assert!(ledger.record_at("node-b", Ok(1), old, MONO));
+                assert!(record_config(
+                    &ledger,
+                    &rt,
+                    &cfg,
+                    "node-b",
+                    Ok(1),
+                    old,
+                    MONO
+                ));
             }
             "failed" => {
-                assert!(ledger.record_at(
+                assert!(record_config(
+                    &ledger,
+                    &rt,
+                    &cfg,
                     "node-b",
                     Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
                     identity(&rt, &cfg, 2),
@@ -2051,7 +2108,15 @@ fn refresh_fallback_never_rescues_an_ineligible_barred_node() {
             "expired" => {
                 let mut old = identity(&rt, &cfg, 2);
                 old.measured_at = WALL - 61 * MINUTE;
-                assert!(ledger.record_at("node-c", Ok(1), old, MONO));
+                assert!(record_config(
+                    &ledger,
+                    &rt,
+                    &cfg,
+                    "node-c",
+                    Ok(1),
+                    old,
+                    MONO
+                ));
             }
             "changed" => cfg["servers"][1]["port"] = serde_json::json!(19002),
             "deleted" => cfg["servers"]
@@ -2069,7 +2134,15 @@ fn refresh_fallback_never_rescues_an_ineligible_barred_node() {
                 } else {
                     bad.instance = CoreInstance::Temp;
                 }
-                assert!(ledger.record_at("node-c", Ok(1), bad, MONO));
+                assert!(record_config(
+                    &ledger,
+                    &rt,
+                    &cfg,
+                    "node-c",
+                    Ok(1),
+                    bad,
+                    MONO
+                ));
             }
             _ => unreachable!(),
         }
@@ -2226,8 +2299,8 @@ fn failover_fixture() -> (
         &cfg,
         Some("node-a"),
         &snapshot.id_to_tag,
-        &snapshot.dirty_fingerprints,
-        &crate::commands::speedtest::current_server_fingerprints(&cfg),
+        &snapshot.measurement_fingerprints,
+        &crate::runtime::node_fingerprints::measurement_table_json(&cfg),
         &BTreeSet::new(),
         &BTreeSet::new(),
         Some(&scope),
@@ -2594,8 +2667,8 @@ async fn failover_fallback_rescue_never_reintroduces_scoped_or_runtime_ineligibl
             &cfg,
             Some("node-a"),
             &snapshot.id_to_tag,
-            &snapshot.dirty_fingerprints,
-            &crate::commands::speedtest::current_server_fingerprints(&cfg),
+            &snapshot.measurement_fingerprints,
+            &crate::runtime::node_fingerprints::measurement_table_json(&cfg),
             &staged,
             &not_ready,
             Some(&scope),

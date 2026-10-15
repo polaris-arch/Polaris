@@ -1390,3 +1390,51 @@ fn n4_canary_inbound_cannot_be_borrowed_on_android() {
         "兜底之后不该再有引用 canary 入站的规则"
     );
 }
+
+#[test]
+fn dns_and_environment_and_fakeip_predicates_are_headless_children() {
+    let mut rule = dns_rule("and-env", "corp.example", Some("np"), json!({"type": "fakeIp"}));
+    rule["combineMode"] = json!("and");
+    rule["conditions"] = json!([
+        {"type":"domain", "values":["api.corp.example"]},
+        {"type":"domainRegex", "values":["^api\\."]}
+    ]);
+    let cfg = config(json!({
+        "networkProfiles": [profile("np", &["10.20.0.0/16"], &[], "system")],
+        "dnsRules": [rule]
+    }));
+    let out = generate(&cfg, "linux", false);
+    let rules = rules_mentioning(&out, "dns", "api.corp.example");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0], &json!({
+        "type":"logical", "mode":"and", "action":"route", "server":"fakeip",
+        "rules":[
+            {"domain":["api.corp.example"]}, {"domain_regex":["^api\\."]},
+            {"query_type":["A","AAAA"]}, {"dns_server_address":{"dns-local":["10.20.0.0/16"]}}
+        ]
+    }));
+}
+
+#[test]
+fn dns_post_prune_descends_logical_predicates_and_drops_whole_bad_parent() {
+    let cfg = config(json!({}));
+    let mut generated = generate_sing_box_config_with_report(&cfg, &BTreeMap::new(), &deps("linux", false, "/x")).unwrap().config;
+    let rules = generated.dns.as_mut().unwrap().rules.get_or_insert_with(Vec::new);
+    let before = rules.len();
+    for tag in [LOCAL_DNS_TAG, "dns-missing", "dns-remote"] {
+        rules.push(DnsRule {
+            type_field: Some("logical".into()), mode: Some("and".into()),
+            rules: Some(vec![
+                DnsRule { domain: Some(vec![format!("{tag}.example")]), ..Default::default() },
+                DnsRule { dns_server_address: Some(BTreeMap::from([(tag.into(), vec!["10.0.0.0/8".into()])])), ..Default::default() },
+            ]), action: Some("reject".into()), ..Default::default()
+        });
+    }
+    let pruned = prune_invalid_env_condition_refs(&mut generated);
+    assert_eq!(pruned.len(), 2);
+    let rules = generated.dns.unwrap().rules.unwrap();
+    assert_eq!(rules.len(), before + 1);
+    let survivor = rules.last().unwrap();
+    assert_eq!(survivor.rules.as_ref().unwrap().len(), 2);
+    assert_eq!(survivor.action.as_deref(), Some("reject"));
+}

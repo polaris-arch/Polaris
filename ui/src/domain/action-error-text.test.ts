@@ -35,3 +35,7 @@ describe('structured action error text', () => {
     expect(serverSwitchErrorText('futureCode', t)).toBe('translated:home.switchError');
   });
 });
+
+it('maps shared dependency conflicts to actionable localized backup copy', () => {
+  expect(backupErrorText('sharedDependencyConflict', t)).toBe('translated:backupImport.error.sharedDependencyConflict');
+});

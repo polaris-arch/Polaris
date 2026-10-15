@@ -75,6 +75,11 @@ pub struct DnsServer {
 /// `dns.rules[]`（`singbox-config-types.ts:41 SingBoxDnsRule`）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsRule {
+    /// Logical DNS matcher. Actions belong only to this outer rule; children are headless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<DnsRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clash_mode: Option<String>,
     /// `rule_set`：sing-box DNS rule 是 `string | string[]`（OneOrMany）。

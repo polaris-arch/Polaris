@@ -272,3 +272,15 @@ fn validate_rule_rejects_ipv6_keyword_rule() {
     );
     assert!(res.errors.iter().any(|e| e.contains("domainKeyword")));
 }
+
+#[test]
+fn embedded_ipv4_is_only_legal_at_the_textual_ipv6_tail() {
+    for value in ["192.0.2.1::/64", "1:192.0.2.1::/64", "::192.0.2.1:1/64",
+        "1:2:3:4:5:6::192.0.2.1/128", "1:2:3:4:5:192.0.2.1/128"] {
+        assert!(!is_valid_ip_cidr(value), "must reject {value}");
+    }
+    for value in ["::192.0.2.1/128", "::ffff:192.0.2.1/128",
+        "1:2:3:4:5::192.0.2.1/128", "1:2:3:4:5:6:192.0.2.1/128"] {
+        assert!(is_valid_ip_cidr(value), "must accept {value}");
+    }
+}

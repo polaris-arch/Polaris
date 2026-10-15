@@ -66,7 +66,7 @@
  * 退出码：0 = 全部不变量成立；1 = 有违反（逐条打印）；2 = 用法错误（缺必填参数）。
  */
 
-import { readFileSync, existsSync, lstatSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs';
+import { readFileSync, existsSync, lstatSync, realpathSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
@@ -2490,7 +2490,10 @@ function checkAssets(label, dir, namesOnly = false) {
   }
   // 命名契约按**文件名**判，体积/摘要两道内容门要按**路径**读 —— 故收全路径再投影出名字，
   // 而不是像原来那样只收名字（dist-release 下平铺与嵌套并存，名字回不去路径）。
-  const paths = walk2(abs);
+  // Linux passes the whole bundle directory, including deb/AppDir staging.
+  // Its dashboard assets are ten directories deep; share inventory's explicit
+  // budget and fail closed beyond it rather than truncating a legitimate caller.
+  const paths = walk2(abs, [], 0, 24);
   const names = paths.map((p) => basename(p));
   const pathOf = (n) => paths.find((p) => basename(p) === n);
   // Pin version, spelling and inventory together; old-name copies and unregistered assets fail closed.
@@ -2693,34 +2696,30 @@ function checkAssets(label, dir, namesOnly = false) {
   if (label === 'release' || label === 'release-all') checkSha256Sums(names, pathOf, namesOnly);
 }
 
-/**
- * 递归收集文件**全路径**（命名契约用 `basename` 投影，内容门直接拿路径读）。
- * 无名字过滤 —— 与 [`walk`]（按名字白名单收 6 个二进制）互补，inventory 模式要的正是全枚举。
- *
- * 🔴 **深度上限必须可调**：deb 的资源根在 bundle 根下第 6 层
- * （`deb/<pkg>/data/usr/lib/<Product>/`），再进 `_up_/resources/dashboard/assets/<file>` 就是第 11 层。
- * 旧写死的 `depth > 8` 对 assets 模式够用（那几个目录都很浅），换成清点整棵资源树就会**静默截断**——
- * 而截断的方向是「少看见文件」，正是白名单门最怕的假绿。故上限提到参数位，调用方按射程显式给。
- * 默认值保持 8：既有调用方（`checkAssets`）的行为一字不变。
- *
- * 🔴 **软链必须跟进**（与 [`walk`] 同一条教训，2026-08-05 mac CI 实证）：`Dirent.isDirectory()`
- * 对指向目录的软链恒为 false ⇒ 整棵子树被跳过。macOS 的 `.app` 里资源可能是软链，
- * 而「跳过一棵子树」在白名单门下就是「白名单外的东西没被看见」。改用 `statSync`（跟随软链）判类型，
- * 断链跳过（`statSync` 抛），环路由深度上限兜住。
+/** Full inventory walk: fail closed on incomplete traversal. Dirent avoids a stat
+ * for ordinary files; only directories and symlinks require identity/type lookup.
+ * Ancestor inode identities detect loops without hiding distinct alias paths.
  */
-function walk2(dir, out = [], depth = 0, maxDepth = 8) {
-  if (depth > maxDepth) return out;
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, e.name);
-    let st;
-    try {
-      st = statSync(full);
-    } catch {
-      continue; // 断链：不是文件也不是目录，两个模式都无从判定
+function walk2(dir, out = [], depth = 0, maxDepth = 8, ancestors = new Set()) {
+  if (depth > maxDepth) throw new InputError(`inventory depth limit ${maxDepth} exceeded: ${dir}`);
+  const identity = statSync(dir);
+  const key = `${identity.dev}:${identity.ino}`;
+  const canonical = realpathSync(dir);
+  if (ancestors.has(key) || ancestors.has(canonical)) throw new InputError(`inventory symlink cycle: ${dir}`);
+  ancestors.add(key);
+  ancestors.add(canonical);
+  try {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      const st = e.isSymbolicLink() ? statSync(full) : e;
+      if (st.isDirectory()) walk2(full, out, depth + 1, maxDepth, ancestors);
+      else if (st.isFile()) out.push(full);
+      else throw new InputError(`inventory unsupported member: ${full}`);
     }
-    if (st.isDirectory()) walk2(full, out, depth + 1, maxDepth);
-    else if (st.isFile()) out.push(full);
-  }
+  } catch (error) {
+    if (error instanceof InputError) throw error;
+    throw new InputError(`inventory cannot enumerate ${dir}: ${error.message}`);
+  } finally { ancestors.delete(key); ancestors.delete(canonical); }
   return out;
 }
 

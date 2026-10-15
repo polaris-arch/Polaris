@@ -1827,6 +1827,7 @@ fn publish(planner: &Planner) {
 pub(crate) struct LedgerView {
     generation: Option<u64>,
     fingerprints: BTreeMap<String, String>,
+    main_connections: BTreeMap<String, String>,
     network_epoch: Option<u64>,
     pub(crate) url_digest: String,
     mobile: bool,
@@ -1842,15 +1843,16 @@ impl LedgerView {
         Self {
             generation,
             fingerprints: current_server_fingerprints(config),
+            main_connections: crate::runtime::node_fingerprints::measurement_table_json(config),
             network_epoch,
             url_digest: polaris_updater::sha256_hex(resolve_speed_test_url(config).as_bytes()),
             mobile: is_mobile(platform),
         }
     }
 
-    /// 当前配置里逐节点的参数指纹。
-    pub(crate) const fn fingerprints(&self) -> &BTreeMap<String, String> {
-        &self.fingerprints
+    /// 当前配置中主核测量连接的完整身份（包括策略及依赖）。
+    pub(crate) const fn main_connections(&self) -> &BTreeMap<String, String> {
+        &self.main_connections
     }
 
     pub(crate) fn read<'a>(
@@ -1862,6 +1864,7 @@ impl LedgerView {
         ReadContext {
             main_generation: self.generation,
             fingerprints: &self.fingerprints,
+            main_connections: &self.main_connections,
             network_epoch: self.network_epoch,
             url_digest: &self.url_digest,
             now_ms,

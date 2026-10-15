@@ -23,8 +23,8 @@ use polaris_helper_proto::Platform;
 use polaris_switch_engine::{HotSwitchOutcome, SwitchDecision, SwitchExecutor};
 
 use crate::commands::speedtest::{
-    current_server_fingerprints, probe_runtime_candidates, resolve_speed_test_url,
-    speed_test_data_settled, speed_test_in_flight, RuntimeProbeBatch,
+    probe_runtime_candidates, resolve_speed_test_url, speed_test_data_settled,
+    speed_test_in_flight, RuntimeProbeBatch,
 };
 use crate::runtime::auto_select::{
     self, Cause, CommitFailure, Decision as SelectDecision, Epoch, Evaluation, Facts, Intent, Leg,
@@ -44,6 +44,7 @@ use crate::runtime::measurement_scheduler::{
     self, entry_freshness_cap_ms, plan_subscriptions, Idle, LedgerView, Pause, Signals, SubPlan,
     Verdict,
 };
+use crate::runtime::node_fingerprints::measurement_table_json;
 use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
 
@@ -330,6 +331,16 @@ impl ProxyRuntime {
         if self.selector_reconcile.is_required() {
             return AutoHotSwitchOutcome::NotEligible;
         }
+        // The caller must carry the exact loaded measurement connection identity.
+        // A clean node-only projection cannot authorize a changed detour/bind policy.
+        if self
+            .speed_measurement_fingerprints()
+            .get(&candidate.id)
+            .map(String::as_str)
+            != Some(expected_candidate_fingerprint)
+        {
+            return AutoHotSwitchOutcome::NotEligible;
+        }
         let staged = self.config.staged_node_mask();
         if staged.pending
             && (!staged.scope_known || staged.node_ids.contains(candidate.id.as_str()))
@@ -412,9 +423,13 @@ impl ProxyRuntime {
             }) {
                 return Decision::Skip(None);
             }
-            if latest.get("selectedServerId").and_then(Value::as_str) != Some(expected_current_id)
-                || current_server_fingerprints(latest).get(&target_id)
+            if self.gate.generation() != generation
+                || !self.core_running()
+                || self.speed_measurement_fingerprints().get(&target_id)
                     != Some(&expected_fingerprint)
+                || latest.get("selectedServerId").and_then(Value::as_str)
+                    != Some(expected_current_id)
+                || measurement_table_json(latest).get(&target_id) != Some(&expected_fingerprint)
             {
                 return Decision::Skip(None);
             }
@@ -482,11 +497,13 @@ impl ProxyRuntime {
                 .with_current(|latest| {
                     latest.get("selectedServerId").and_then(Value::as_str)
                         == Some(candidate.id.as_str())
-                        && current_server_fingerprints(latest).get(&candidate.id)
+                        && measurement_table_json(latest).get(&candidate.id)
                             == Some(&expected_fingerprint)
                 })
                 .unwrap_or(false);
-        if attested && target_still_clean {
+        let loaded_still_matches =
+            self.speed_measurement_fingerprints().get(&candidate.id) == Some(&expected_fingerprint);
+        if attested && target_still_clean && loaded_still_matches {
             // 只有管理面回读与配置 CAS 双重自证后，才把候选提交为 R 的真实选择并刷新依赖出口的
             // 派生状态。PUT 成功但随后回滚的瞬态不应污染 current_config / 解锁 / 出口 IP 缓存。
             self.commit_applied(&new_runtime);
@@ -843,7 +860,7 @@ impl ProxyRuntime {
             log::warn!("自动故障切换：主核探测池未就绪，拒绝回退裸 TCP 候选探测");
             return false;
         };
-        let current_fingerprints = current_server_fingerprints(&config);
+        let current_fingerprints = measurement_table_json(&config);
         let not_ready_ids: BTreeSet<String> = config
             .get("servers")
             .and_then(Value::as_array)
@@ -877,7 +894,7 @@ impl ProxyRuntime {
             &config,
             Some(&current_id),
             &targets.id_to_tag,
-            &targets.fingerprints,
+            &self.speed_measurement_fingerprints(),
             &current_fingerprints,
             &staged.node_ids,
             &not_ready_ids,
@@ -1865,7 +1882,7 @@ impl ProxyRuntime {
                 guard.as_ref().map(|snapshot| {
                     (
                         snapshot.id_to_tag.clone(),
-                        snapshot.dirty_fingerprints.clone(),
+                        snapshot.measurement_fingerprints.clone(),
                     )
                 })
             })?;
@@ -1895,7 +1912,7 @@ impl ProxyRuntime {
                     Some(current_id),
                     &id_to_tag,
                     &running_fingerprints,
-                    auto.view.fingerprints(),
+                    auto.view.main_connections(),
                     &staged.node_ids,
                     &not_ready,
                     Some(&scope),
@@ -2091,7 +2108,7 @@ impl ProxyRuntime {
                 Some(SelectPlan {
                     subscription: auto.subscription.clone(),
                     current_id: view.selected.clone()?,
-                    fingerprint: auto.view.fingerprints().get(&target)?.clone(),
+                    fingerprint: auto.view.main_connections().get(&target)?.clone(),
                     candidate: runtime_candidate,
                     cause,
                     latency_ms,

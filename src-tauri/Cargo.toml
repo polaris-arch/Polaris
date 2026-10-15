@@ -82,6 +82,9 @@ polaris-dns-race           = { path = "../crates/dns-race" }
 # 直接 Err「unknown proxy scheme」→「经代理更新订阅」整条链断（见 runtime/http.rs 该函数文档）。
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# CONNECT measurement HTTPS uses the same platform identity verification as reqwest.
+# Already present in polaris's Cargo.lock dependency list; no new package/version.
+rustls-platform-verifier = { version = "0.7", default-features = false }
 async-trait.workspace = true
 # futures = async 组合子。消费点之一：测速分波时用 `join_all` 并行热切 K 个探测槽（串行热切要
 # 逐槽等一次 gRPC 往返，K=16 时白摊在每一波上）；另有逐条关闭连接的 `buffer_unordered` 有界并发。已在 workspace 依赖表里（unlock crate 用它齐射
@@ -106,27 +109,11 @@ nix = { version = "0.31.3", features = ["fs", "net", "process", "signal", "user"
 [target."cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))".dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
-# ── Android：把平台证书校验器初始化出来（见 `src/android_tls.rs` 模块文档）──
-#
-# **Cargo.lock 零新增包**：两个都已在依赖图里 —— `rustls-platform-verifier 0.7.0` 是
-# `reqwest 0.13.4` 的无条件依赖（其 `rustls-no-provider` feature 含 `dep:rustls-platform-verifier`，
-# 见 reqwest-0.13.4/Cargo.toml:174-176），`jni 0.22.4` 又是前者在 android target 上的依赖。
-# 此处只是把这两条边显式化，好让本包能调 `rustls_platform_verifier::android::init_with_env`
-# （同 tokio-rustls / objc2-foundation 的处理：lock 里只多一行「polaris 依赖它」，无 [[package]] 新增）。
-#
-# 没有「已装依赖 / stdlib / 平台原生 API」能替代：要初始化的正是**这个 crate 自己的**全局态
-# （`rustls_platform_verifier::android::GLOBAL` 那个 OnceCell），只有它自己的 API 够得着。
-#
-# 🔴 `jni` **必须钉 0.22**：lock 里同时存在 0.21.1（tao 的）与 0.22.4（本条的），两者的 `Env` /
-# `JObject` 是不同类型；挑错了不是编译期报错就是链接期才炸。选 0.22 不是二选一，是被
-# `init_with_env(&mut Env, JObject)` 的签名唯一确定的。
-#
-# 两个都 `default-features = false`：jni 的 default 是空集，但显式写住 —— 它的 `invocation`
-# feature 会拉进 java-locator / libloading（那是「从 native 进程里创建 JVM」的场景，Android 恒不需要）。
-# rustls-platform-verifier 的 default 也是空集，`ffi-testing` / `dbg` 一个都不要。
+# Android's existing platform-verifier initialization still needs jni 0.22:
+# its Env/JObject types must match rustls-platform-verifier 0.7's Android API.
+# The verifier dependency is now shared above; no lockfile change is needed.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22.4", default-features = false }
-rustls-platform-verifier = { version = "0.7", default-features = false }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 tauri-plugin-polaris-ios = { path = "../crates/tauri-plugin-polaris-ios" }

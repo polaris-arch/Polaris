@@ -1885,7 +1885,7 @@ async fn start_lands_custom_rule_files_before_generate() {
 fn public_start_arms_network_settle_before_any_await() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) async fn start_guarded_with_completion(",
+        "    async fn start_guarded_with_attribution(",
     );
     let arm = body
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")

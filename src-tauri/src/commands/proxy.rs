@@ -143,15 +143,84 @@ fn start_err_response(e: StartError) -> ApiResponse<()> {
 pub async fn proxy_stop(
     app: AppHandle,
     state: State<'_, AppRuntime>,
-) -> Result<ApiResponse<()>, ()> {
+    request: tauri::ipc::Request<'_>,
+) -> Result<ApiResponse<Value>, ()> {
+    let expected = match request.body() {
+        tauri::ipc::InvokeBody::Json(args) => stop_expectation(args),
+        tauri::ipc::InvokeBody::Raw(_) => Err("proxy stop arguments must be an object"),
+    };
+    let expected = match expected {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Ok(ApiResponse::err_with_code(
+                error,
+                "PROXY_STOP_EXPECTATION_INVALID",
+            ))
+        }
+    };
     let proxy = state.proxy.clone();
+    if let Some(expected) = expected {
+        return Ok(match proxy.stop_expected(expected).await {
+            Ok(result) => {
+                if matches!(
+                    result,
+                    crate::runtime::proxy::ExpectedCoreStopResult::Stopped { .. }
+                ) {
+                    let _ = app.emit(EVENT_PROXY_STOPPED, json!({}));
+                }
+                ApiResponse::ok(json!(result))
+            }
+            Err(error) => ApiResponse::err(error),
+        });
+    }
     Ok(match proxy.stop().await {
         Ok(()) => {
             let _ = app.emit(EVENT_PROXY_STOPPED, json!({}));
-            ok_void()
+            ApiResponse {
+                success: true,
+                data: None,
+                error: None,
+                code: None,
+            }
         }
         Err(e) => ApiResponse::err(e),
     })
+}
+
+fn stop_expectation(
+    args: &Value,
+) -> Result<Option<crate::runtime::proxy::ExpectedCoreStopRequest>, &'static str> {
+    let args = args
+        .as_object()
+        .ok_or("proxy stop arguments must be an object")?;
+    let owned = [
+        "expectedMainGeneration",
+        "expectedSelectedServerId",
+        "expectedSelectionIntentGeneration",
+    ];
+    if !owned.iter().any(|name| args.contains_key(*name)) {
+        return Ok(None);
+    }
+    let generation = args
+        .get("expectedMainGeneration")
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+        .ok_or("invalid expected main generation")?;
+    let selection = match args.get("expectedSelectedServerId") {
+        Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        _ => return Err("invalid expected selection"),
+    };
+    let intent = args
+        .get("expectedSelectionIntentGeneration")
+        .and_then(Value::as_u64)
+        .filter(|v| *v <= 9_007_199_254_740_991)
+        .ok_or("invalid expected selection intent")?;
+    Ok(Some(crate::runtime::proxy::ExpectedCoreStopRequest {
+        expected_main_generation: generation,
+        expected_selected_server_id: selection,
+        expected_selection_intent_generation: intent,
+    }))
 }
 
 /// 上游 `PROXY_GET_STATUS`：取代理运行状态。
@@ -161,7 +230,7 @@ pub async fn proxy_stop(
 )]
 #[tauri::command]
 pub fn proxy_get_status(state: State<'_, AppRuntime>) -> ApiResponse<ProxyStatus> {
-    ApiResponse::ok(state.proxy().status())
+    ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
 }
 
 /// `PROXY_GET_PENDING_CHANGES`：待应用节点差集（config 相对运行核起核快照）。
@@ -188,9 +257,9 @@ pub async fn proxy_apply_pending_changes(
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<Value>, ()> {
     let proxy = state.proxy.clone();
-    let status = proxy.apply_pending().await;
+    let (status, apply_id) = proxy.apply_pending_owned().await;
     Ok(ApiResponse::ok(
-        json!({ "ok": status != "skipped", "status": status }),
+        json!({ "ok": status != "skipped", "status": status, "applyId": apply_id }),
     ))
 }
 

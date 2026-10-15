@@ -65,6 +65,31 @@ export const NSIS_SWEEP_PS_LINES = [
   String.raw`  return $false`,
   String.raw`}`,
   String.raw`try {`,
+  String.raw`  Add-Type -TypeDefinition @'`,
+  String.raw`using System;`,
+  String.raw`using System.Text;`,
+  String.raw`using System.ComponentModel;`,
+  String.raw`using System.Runtime.InteropServices;`,
+  String.raw`using Microsoft.Win32.SafeHandles;`,
+  String.raw`public sealed class PolarisOwnedProcess : IDisposable {`,
+  String.raw`  readonly SafeProcessHandle handle;`,
+  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern SafeProcessHandle OpenProcess(uint access, bool inherit, int pid);`,
+  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetProcessTimes(SafeProcessHandle h, out long created, out long exited, out long kernel, out long user);`,
+  String.raw`  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool QueryFullProcessImageName(SafeProcessHandle h, uint flags, StringBuilder path, ref uint size);`,
+  String.raw`  [DllImport("kernel32.dll", EntryPoint="TerminateProcess", SetLastError=true)] static extern bool StopOwned(SafeProcessHandle h, uint code);`,
+  String.raw`  [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(SafeProcessHandle h, uint ms);`,
+  String.raw`  public PolarisOwnedProcess(int pid) {`,
+  String.raw`    handle = OpenProcess(0x00101001, false, pid);`,
+  String.raw`    if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
+  String.raw`  }`,
+  String.raw`  public IntPtr Handle { get { return handle.DangerousGetHandle(); } }`,
+  String.raw`  public DateTime StartTime { get { long c,e,k,u; if (!GetProcessTimes(handle,out c,out e,out k,out u)) throw new Win32Exception(Marshal.GetLastWin32Error()); return DateTime.FromFileTimeUtc(c); } }`,
+  String.raw`  public string Image { get { uint size=32768; var path=new StringBuilder((int)size); if (!QueryFullProcessImageName(handle,0,path,ref size)) throw new Win32Exception(Marshal.GetLastWin32Error()); return path.ToString(); } }`,
+  String.raw`  public void Kill() { if (!StopOwned(handle,1)) throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
+  String.raw`  public bool WaitForExit(int ms) { uint r=WaitForSingleObject(handle,(uint)ms); if (r==0) return true; if (r==258) return false; throw new Win32Exception(Marshal.GetLastWin32Error()); }`,
+  String.raw`  public void Dispose() { handle.Dispose(); }`,
+  String.raw`}`,
+  String.raw`'@`,
   String.raw`  $root = PolarisSweepRoot $env:POLARIS_SWEEP_ROOT`,
   String.raw`  if (-not $root) { exit 3 }`,
   String.raw`  $left = 0`,
@@ -73,15 +98,19 @@ export const NSIS_SWEEP_PS_LINES = [
   String.raw`      if (-not $p.ExecutablePath) { continue }`,
   String.raw`      if (-not (PolarisIsInstalledCore $root $p.ExecutablePath)) { continue }`,
   String.raw`    } catch { continue }`,
+  String.raw`    $proc = $null`,
   String.raw`    try {`,
-  String.raw`      $proc = [System.Diagnostics.Process]::GetProcessById([int]$p.ProcessId)`,
+  String.raw`      $proc = New-Object PolarisOwnedProcess ([int]$p.ProcessId)`,
   String.raw`      $null = $proc.Handle`,
-  String.raw`      if ([Math]::Abs(($proc.StartTime - $p.CreationDate).TotalSeconds) -gt 2) { continue }`,
+  String.raw`      if (-not (PolarisIsInstalledCore $root $proc.Image)) { continue }`,
+  String.raw`      $born = $proc.StartTime.Ticks`,
+  String.raw`      $listed = $p.CreationDate.ToUniversalTime().Ticks`,
+  String.raw`      if (($born - ($born % 10)) -ne ($listed - ($listed % 10))) { continue }`,
   String.raw`      $proc.Kill()`,
   String.raw`      if (-not $proc.WaitForExit(5000)) { $left++ }`,
   String.raw`    } catch {`,
   String.raw`      if (Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue) { $left++ }`,
-  String.raw`    }`,
+  String.raw`    } finally { if ($null -ne $proc) { $proc.Dispose() } }`,
   String.raw`  }`,
   String.raw`  if ($left -gt 0) { exit 2 }`,
   String.raw`  exit 0`,
@@ -153,10 +182,11 @@ export const NSIS_SWEEP_PS_REQUIRED = [
   ['if (-not $p.ExecutablePath) { continue }', '取不到映像路径的进程必须跳过'],
   ['if (-not (PolarisIsInstalledCore $root $p.ExecutablePath)) { continue }', '只结束通过路径判据的进程'],
   ['$null = $proc.Handle', '结束前必须先持有进程句柄（此后 PID 不会被复用）'],
-  [
-    'if ([Math]::Abs(($proc.StartTime - $p.CreationDate).TotalSeconds) -gt 2) { continue }',
-    '结束前必须核对启动时间（枚举到取得句柄之间 PID 可能已被复用）',
-  ],
+  ['if (-not (PolarisIsInstalledCore $root $proc.Image)) { continue }', '实际终止句柄的映像必须再次匹配安装目录'],
+  ['if (($born - ($born % 10)) -ne ($listed - ($listed % 10))) { continue }', 'CIM 只有微秒精度；仅允许同一微秒的出生身份'],
+  ['return DateTime.FromFileTimeUtc(c);', '出生时间必须从被持有的同一个句柄读取'],
+  ['if (!QueryFullProcessImageName(handle,0,path,ref size))', '映像必须从被持有的同一个句柄读取'],
+  ['if (!StopOwned(handle,1))', '终止必须作用于已验证的同一个句柄'],
   ['$proc.Kill()', '缺结束动作'],
   ['$proc.WaitForExit(5000)', '结束后必须等进程真的退出（映像占用在退出后才释放）'],
   ['} catch { exit 1 }', '任何未预料的错误都必须以非零退出码收场，而不是抛给安装器'],
@@ -165,8 +195,10 @@ export const NSIS_SWEEP_PS_REQUIRED = [
 /** 这些片段在脚本真值里的先后顺序不可换（前者必须先于后者）。 */
 const PS_ORDER = [
   ['PolarisIsInstalledCore $root $p.ExecutablePath', '$proc.Kill()', '路径判据排在结束动作之后'],
-  ['$null = $proc.Handle', '$proc.StartTime - $p.CreationDate', '启动时间在取得句柄之前核对（核对与结束之间又留出了 PID 复用窗口）'],
-  ['$proc.StartTime - $p.CreationDate', '$proc.Kill()', '启动时间核对排在结束动作之后'],
+  ['$null = $proc.Handle', '$born = $proc.StartTime.Ticks', '启动时间在取得句柄之前核对（核对与结束之间又留出了 PID 复用窗口）'],
+  ['$born = $proc.StartTime.Ticks', '$proc.Kill()', '启动时间核对排在结束动作之后'],
+  ['PolarisIsInstalledCore $root $proc.Image', '$proc.Kill()', '实际句柄映像核对排在结束动作之后'],
+  ['if (($born - ($born % 10))', '$proc.Kill()', '精确出生身份核对排在结束动作之后'],
 ];
 
 /** 宏体里除 `FileWrite` 外必须逐字出现的 NSIS 行（整行相等）。 */
@@ -401,7 +433,7 @@ export function nsisCoreSweepViolations(rawSource, psLines = NSIS_SWEEP_PS_LINES
   const killsEverywhere = allCode.filter((line) => /\.Kill\(/.test(line)).length;
   if (killsEverywhere > 1) out.push(`代码面里 .Kill( 共 ${killsEverywhere} 处，只允许 ${NSIS_SWEEP_MACRO} 里那 1 处`);
   for (const [pattern, what] of NSIS_SWEEP_FORBIDDEN) {
-    const hit = allCode.find((line) => pattern.test(line));
+    const hit = allCode.find((line) => pattern.test(line) && !(what.includes('Terminate') && renderNsisFileWrites().includes(line) && line.includes('EntryPoint="TerminateProcess"')));
     if (hit) out.push(`代码面出现 ${what}：${hit}`);
   }
 

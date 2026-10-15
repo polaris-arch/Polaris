@@ -80,6 +80,11 @@ export const configApi = {
     return invoke(IPC_CHANNELS.CONFIG_PATCH, { patch });
   },
 
+  /** 在后端最新配置写事务内切换接管并消费 FakeIP-TUN 一次性标志。 */
+  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>): Promise<{ config: UserConfig; corrected: boolean }> {
+    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode });
+  },
+
   /** 在后端最新配置上按实体主键原子 upsert/delete；同一数组的并发编辑不会整字段互相覆盖。 */
   async mutateEntities(
     mutations: readonly {

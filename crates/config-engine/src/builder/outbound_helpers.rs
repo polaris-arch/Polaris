@@ -49,19 +49,20 @@ pub fn parse_ws_early_data(raw_path: &str) -> WsEarlyData {
     let query = &path[q_idx + 1..];
 
     // 手写 query 解析（避免 url crate）。
-    let mut params: Vec<(String, String)> = Vec::new();
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            params.push((url_decode(k), url_decode(v)));
-        } else if !pair.is_empty() {
-            params.push((url_decode(pair), String::new()));
-        }
-    }
+    // Keep each original segment: decoding/re-encoding unrelated parameters changes the
+    // WebSocket request target (escaped &, #, Unicode, duplicate keys and bare flags).
+    let params: Vec<(&str, String, String)> = query
+        .split('&')
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (pair, url_decode(key), url_decode(value))
+        })
+        .collect();
 
     let ed_raw = params
         .iter()
-        .find(|(k, _)| k == "ed")
-        .map(|(_, v)| v.as_str());
+        .find(|(_, k, _)| k == "ed")
+        .map(|(_, _, v)| v.as_str());
     let ed_raw = match ed_raw {
         Some(e) => e,
         None => {
@@ -85,15 +86,15 @@ pub fn parse_ws_early_data(raw_path: &str) -> WsEarlyData {
 
     let eh = params
         .iter()
-        .find(|(k, _)| k == "eh")
-        .map(|(_, v)| v.clone())
+        .find(|(_, k, _)| k == "eh")
+        .map(|(_, _, v)| v.clone())
         .unwrap_or_else(|| DEFAULT_EARLY_DATA_HEADER.to_string());
 
     // 重建 path（去掉 ed/eh，保留其它 query）。
-    let rest: Vec<String> = params
+    let rest: Vec<&str> = params
         .iter()
-        .filter(|(k, _)| k != "ed" && k != "eh")
-        .map(|(k, v)| format!("{k}={v}"))
+        .filter(|(_, k, _)| k != "ed" && k != "eh")
+        .map(|(raw, _, _)| *raw)
         .collect();
     let new_path = if rest.is_empty() {
         pathname.to_string()
@@ -109,7 +110,7 @@ pub fn parse_ws_early_data(raw_path: &str) -> WsEarlyData {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -117,15 +118,15 @@ fn url_decode(s: &str) -> String {
             if let Ok(b) =
                 u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
             {
-                out.push(b as char);
+                out.push(b);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 协议 TLS 是否在 QUIC 内自管（hy2/tuic）。上游 `isQuicManagedTls`。

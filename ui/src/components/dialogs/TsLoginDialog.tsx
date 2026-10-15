@@ -210,7 +210,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
             selectedId: () => useAppStore.getState().selectedServerId,
             serverPresent: (serverId) => useAppStore.getState().servers.some((s) => s.id === serverId),
             status: () => api.proxy.getStatus(),
-            stop: () => useAppStore.getState().stopProxy(),
+            stopExpected: (expected) => api.proxy.stopExpected(expected),
           });
           if (stopped === 'stopped') await submitRef.current();
           else if (stopped === 'changed') toast.info(t('ts.switchStopChanged'));

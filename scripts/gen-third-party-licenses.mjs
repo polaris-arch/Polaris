@@ -35,7 +35,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'THIRD-PARTY-LICENSES.md');
@@ -115,6 +115,24 @@ function rustDeps() {
     }));
 }
 
+// Traverse every tree occurrence: pnpm may abbreviate one occurrence while another
+// occurrence of the same instance contains additional dependency edges.
+export function collectJsInstances(tree) {
+  const found = new Map();
+  const visited = new WeakSet();
+  const walk = (node) => {
+    if (!node || typeof node !== 'object' || visited.has(node)) return;
+    visited.add(node);
+    for (const [name, value] of Object.entries(node.dependencies ?? {})) {
+      const key = JSON.stringify([name, value.version ?? '', value.path ?? '']);
+      if (!found.has(key)) found.set(key, { name, value });
+      walk(value);
+    }
+  };
+  for (const project of Array.isArray(tree) ? tree : [tree]) walk(project);
+  return [...found.values()];
+}
+
 function jsDeps() {
   // pnpm 布局：传递依赖住在 `node_modules/.pnpm/<name>@<ver>/node_modules/<name>`，顶层
   // `node_modules/<name>` 只有直接依赖的软链。按 `node_modules/<name>` 逐层找会**只捞到直接依赖**
@@ -131,17 +149,7 @@ function jsDeps() {
     throw e;
   }
   const tree = JSON.parse(raw);
-  const found = new Map();
-  const walk = (node) => {
-    for (const [name, v] of Object.entries(node.dependencies ?? {})) {
-      if (found.has(name)) continue;
-      found.set(name, v);
-      walk(v);
-    }
-  };
-  for (const proj of Array.isArray(tree) ? tree : [tree]) walk(proj);
-
-  return [...found.entries()].map(([name, v]) => {
+  return collectJsInstances(tree).map(({ name, value: v }) => {
     const dir = v.path ?? '';
     let p = {};
     const manifest = join(dir, 'package.json');
@@ -198,7 +206,7 @@ function vendoredAssets() {
   });
 }
 
-function render(pkgs) {
+export function render(pkgs) {
   const sorted = pkgs.sort((a, b) =>
     a.ecosystem === b.ecosystem ? a.name.localeCompare(b.name) : a.ecosystem.localeCompare(b.ecosystem),
   );
@@ -271,6 +279,7 @@ function render(pkgs) {
   return lines.join('\n');
 }
 
+function main() {
 const content = render([...rustDeps(), ...jsDeps(), ...vendoredAssets()]);
 
 if (CHECK) {
@@ -288,3 +297,6 @@ if (CHECK) {
   const kb = (Buffer.byteLength(content) / 1024).toFixed(0);
   console.log(`ok: ${OUT} 已生成（${kb}KB）`);
 }
+
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();

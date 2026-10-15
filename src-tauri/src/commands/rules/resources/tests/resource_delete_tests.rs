@@ -94,3 +94,56 @@ fn deferred_delete_never_unlinks_the_catalog_cache() {
     assert!(catalog.exists(), "配置篡改也不得借资源删除清掉目录缓存");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+fn resource_rule(id: &str, enabled: bool) -> Value {
+    json!({"id":id, "type":"ruleSet", "values":["res:res_a"], "action":"proxy", "enabled":enabled})
+}
+
+#[test]
+fn dns_only_and_both_sides_are_counted_using_the_same_delete_scan_even_if_file_is_missing() {
+    let mut cfg = cfg_with_resource();
+    cfg["trafficRules"] = json!([]);
+    cfg["dnsRules"] = json!([resource_rule("dns-1", true)]);
+    // There is deliberately no resource file: references are configuration facts, not file probes.
+    let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
+    let refs = resource_refs(&uc, "res_a");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id, "dns-1");
+    assert!(refs[0].label.starts_with("DNS · "));
+    match plan_resource_delete(&cfg, "res_a", false) {
+        ResourceDeletePlan::NeedConfirm(delete_refs) => assert_eq!(delete_refs, refs),
+        other => panic!("DNS-only reference bypassed confirmation: {other:?}"),
+    }
+    cfg["trafficRules"] = json!([resource_rule("traffic-1", true)]);
+    let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
+    assert_eq!(resource_refs(&uc, "res_a").len(), 2);
+    assert!(matches!(plan_resource_delete(&cfg, "res_a", true), ResourceDeletePlan::Proceed));
+    cfg["trafficRules"] = json!([resource_rule("traffic-1", false)]);
+    cfg["dnsRules"] = json!([resource_rule("dns-1", false)]);
+    assert!(matches!(plan_resource_delete(&cfg, "res_a", false), ResourceDeletePlan::Proceed));
+}
+
+#[test]
+fn shared_legacy_rule_arrays_are_counted_once_and_explicit_empty_arrays_override_fallback() {
+    for legacy in ["customRules", "policyRules"] {
+        let mut cfg = cfg_with_resource();
+        cfg[legacy] = json!([resource_rule("shared", true)]);
+        let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
+        assert_eq!(resource_refs(&uc, "res_a").len(), 1, "{legacy}");
+        cfg["trafficRules"] = json!([]);
+        let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap();
+        assert_eq!(resource_refs(&uc, "res_a").len(), 1, "DNS fallback: {legacy}");
+        cfg["dnsRules"] = json!([]);
+        let uc: UserConfig = serde_json::from_value(cfg).unwrap();
+        assert!(resource_refs(&uc, "res_a").is_empty());
+    }
+}
+
+#[test]
+fn resource_list_and_delete_use_the_identical_effective_rule_scan() {
+    let code = crate::test_support::crate_code("commands/rules/resources.rs");
+    assert!(code.contains("referenced_by: resource_refs(&uc, &r.id).len()"));
+    assert!(code.contains("referenced_by: resource_refs(&uc, &id).len()"));
+    assert!(code.contains("let refs = resource_refs(&uc, id)"));
+}

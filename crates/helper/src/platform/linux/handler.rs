@@ -48,6 +48,10 @@ pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
 /// 5 秒读超时（移植自 Go `conn.SetReadDeadline(time.Now().Add(5 * time.Second))`，:335）。
 pub const READ_TIMEOUT_SECS: u64 = polaris_helper_proto::codec::READ_TIMEOUT_SECS;
 
+/// Commands are short protocol keywords, not argument frames. Bound this line
+/// before authentication; include room for CRLF and future command names.
+const MAX_COMMAND_LINE_BYTES: usize = 64;
+
 /// handler 依赖（注入所有外部副作用，便于测试 mock）。
 pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps, SD: SystemdOps> {
     /// 锁定的 root-owned 受管核目录（start 只跑 coreDir/sing-box）。
@@ -77,6 +81,9 @@ pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps,
 ///
 /// 对应 Go `handle(conn net.Conn)`：读行 + 写行 + 取对端凭据。
 pub trait Conn: Send {
+    /// Read a complete command with a small bound before UID authorization.
+    /// EOF, malformed UTF-8, truncation and overflow cannot become commands.
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError>;
     /// 读一行（trim 尾部 \n/\r）。EOF / 读失败返回 ""（对齐 Go readLine 的 ReadString 行为）。
     fn read_line(&mut self) -> String;
     /// Exact-birth framing distinguishes EOF from an empty/extra line and
@@ -110,9 +117,20 @@ impl<RW: Read + Write> LineConn<RW> {
 }
 
 impl<RW: Read + Write + Send> Conn for LineConn<RW> {
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+        line_io::read_line_terminated_bounded(&mut self.inner, MAX_COMMAND_LINE_BYTES)
+            .map_err(|_| StrictReadError)
+    }
+
     fn read_line(&mut self) -> String {
         // Conn 契约：EOF/读失败与空行一律 ""（对齐 Go readLine 的 ReadString 行为）。
-        line_io::read_line_trimmed(&mut self.inner).unwrap_or_default()
+        line_io::read_line_trimmed_bounded(
+            &mut self.inner,
+            polaris_helper_proto::codec::MAX_FRAME_BYTES,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 
     fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
@@ -150,7 +168,14 @@ pub fn handle<P, S, D, SD>(
     };
 
     // 2. 读 command 行（linux 无 token 行，:343）。
-    let command = conn.read_line();
+    let command = match conn.read_command_line() {
+        Ok(Some(command)) => command,
+        Ok(None) => return,
+        Err(_) => {
+            let _ = conn.write_line("ERR unknown");
+            return;
+        }
+    };
 
     // 3. ping / version 在鉴权前（任何持 socket 者可探活，:345-352）。
     match command.as_str() {

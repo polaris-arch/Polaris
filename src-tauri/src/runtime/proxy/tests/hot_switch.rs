@@ -2266,7 +2266,7 @@ async fn auto_failover_hot_switch_preserves_saved_but_unapplied_config() {
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&disk)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&disk)
         .remove("node-b")
         .expect("candidate fingerprint");
     let api = AttestingManagementApi::new("Node A");
@@ -2345,7 +2345,7 @@ async fn auto_failover_cannot_commit_a_split_ts_to_ordinary_selector_only() {
         rt.candidate_switch_plan(&running, &candidate),
         CandidateSwitchPlan::NeedsRestart
     ));
-    let fingerprint = current_server_fingerprints(&running)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&running)
         .remove("node-a")
         .unwrap();
     let api = AttestingManagementApi::new("TS Mesh");
@@ -2381,7 +2381,7 @@ async fn auto_failover_selector_failure_rolls_back_without_restart() {
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&config)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .expect("candidate fingerprint");
     let api = AttestingManagementApi::rejecting("Node A", "Node B");
@@ -2432,7 +2432,7 @@ async fn auto_failover_does_not_rollback_new_same_target_user_intent() {
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&config)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .expect("candidate fingerprint");
     let rt_for_user = Arc::clone(&rt);
@@ -2485,7 +2485,7 @@ async fn superseded_auto_put_forces_reassert_even_when_new_config_equals_old_run
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&config)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .expect("candidate fingerprint");
     let rt_for_user = Arc::clone(&rt);
@@ -2555,7 +2555,7 @@ async fn auto_failover_double_failure_enters_recoverable_selector_reconciliation
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&config)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .expect("candidate fingerprint");
 
@@ -2620,7 +2620,7 @@ async fn auto_failover_rolls_back_when_candidate_changes_during_selector_put() {
         name: "Node B".to_string(),
         tag: "Node B".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&config)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .expect("candidate fingerprint");
     let config_manager = Arc::clone(&rt.config);
@@ -3067,7 +3067,7 @@ async fn dropped_candidate_is_exactly_what_the_commit_transaction_refuses() {
         name: "WG Force".to_string(),
         tag: "WG Force".to_string(),
     };
-    let fingerprint = current_server_fingerprints(&cfg)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&cfg)
         .remove("wg-force")
         .expect("candidate fingerprint");
     let api = AttestingManagementApi::new("Node A");
@@ -3490,7 +3490,7 @@ fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() 
             && started.contains("restart_deferred.store(false"),
         "起核就绪腿必须与写 startup_snapshot 同刻清账 —— 否则核已按新配置起来了，条上还挂着「待应用」"
     );
-    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
+    let stopped = method_body(&src, "    async fn stop_inner_attributed(");
     assert!(
         stopped.contains("restart_deferred.store(false"),
         "停核腿必须复位欠账 —— 否则停核期间挂着一条谈不上「待应用」的提示，且下次起核前无人清"
@@ -3519,15 +3519,12 @@ fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
         "分子侧（落盘/切节点）必须推 —— 否则改完配置条根本不出现"
     );
     // 分母侧（运行核换了）：start 成功终态 / stop 拆除终态。
-    let started = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
+    let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     assert!(
         started.contains("self.push_pending_changes();"),
         "起核就绪腿必须推 —— 否则「立即应用」引发的重启落地后没人告诉 UI 差集已清，条停在「立即应用」"
     );
-    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
+    let stopped = method_body(&src, "    async fn stop_inner_attributed(");
     assert!(
         stopped.contains("self.push_pending_changes();"),
         "停核腿必须推 —— 重启内嵌的这次停核不经命令层，只靠前端 proxyStopped 的 pull 是漏的一半"
@@ -4217,7 +4214,7 @@ async fn real_core_auto_failover_attests_without_applying_saved_debt() {
         name: "Node B".to_string(),
         tag,
     };
-    let fingerprint = current_server_fingerprints(&disk)
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&disk)
         .remove("node-b")
         .expect("candidate fingerprint");
 
@@ -5543,4 +5540,95 @@ fn measurement_getter_uses_the_running_snapshot_interface_identity() {
         frozen,
         "reading D must never restamp the actual running core"
     );
+}
+
+#[tokio::test]
+async fn auto_failover_rejects_current_node_fingerprint_when_loaded_connection_differs() {
+    let (rt, _dir) = test_runtime();
+    let runtime = two_node_config(7890, "node-a");
+    rt.config.save_full(&runtime).unwrap();
+    mark_running_with_snapshot(&rt, &runtime);
+    let mut changed = runtime.clone();
+    changed["servers"][1]["address"] = serde_json::json!("changed.example");
+    rt.config.save_full(&changed).unwrap();
+    let candidate = RuntimeCandidate {
+        id: "node-b".into(),
+        name: "Node B".into(),
+        tag: "Node B".into(),
+    };
+    let expected = crate::runtime::node_fingerprints::measurement_table_json(&changed)
+        .remove("node-b")
+        .unwrap();
+    let api = AttestingManagementApi::new("Node A");
+    assert_eq!(
+        rt.auto_hot_switch_transaction_with_api(
+            rt.core_generation(),
+            "node-a",
+            &candidate,
+            &expected,
+            None,
+            &api
+        )
+        .await,
+        AutoHotSwitchOutcome::NotEligible
+    );
+    assert_eq!(*api.selected.lock().unwrap(), "Node A");
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
+}
+
+#[tokio::test]
+async fn owned_stop_cannot_follow_a_completed_same_generation_selector_hot_switch() {
+    let (rt, _dir) = test_runtime();
+    let config = two_node_config(7890, "node-a");
+    rt.config.save_full(&config).unwrap();
+    rt.bump_generation();
+    mark_running_with_snapshot(&rt, &config);
+    let before = rt.status_with_owned_stop_context().unwrap();
+    let context = before.owned_stop_context.unwrap();
+    let request = ExpectedCoreStopRequest {
+        expected_main_generation: before.main_generation,
+        expected_selected_server_id: context.selected_server_id,
+        expected_selection_intent_generation: context.selection_intent_generation,
+    };
+    let generation = rt.core_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let candidate = RuntimeCandidate {
+        id: "node-b".into(),
+        name: "Node B".into(),
+        tag: "Node B".into(),
+    };
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
+        .remove("node-b")
+        .unwrap();
+    let api = AttestingManagementApi::new("Node A");
+    assert_eq!(
+        rt.auto_hot_switch_transaction_with_api(
+            generation,
+            "node-a",
+            &candidate,
+            &fingerprint,
+            None,
+            &api
+        )
+        .await,
+        AutoHotSwitchOutcome::Applied
+    );
+    assert_eq!(
+        rt.core_generation(),
+        generation,
+        "real selector-only transaction keeps the main generation"
+    );
+    assert_eq!(
+        rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
+        "node-b"
+    );
+    assert_eq!(
+        rt.stop_expected(request).await.unwrap(),
+        ExpectedCoreStopResult::Changed
+    );
+    assert!(rt.status().running);
+    assert_eq!(rt.core_generation(), generation);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
 }

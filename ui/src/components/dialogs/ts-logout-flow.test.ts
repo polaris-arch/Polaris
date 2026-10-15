@@ -1,22 +1,27 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '@/contracts/types';
 import { captureMainCoreOwner, isMainCoreLogoutError, sameRunningCore, stopOwnedCore, stopOwnedCoreThenLogout, tsNodeHoldByRunningCore } from './ts-logout-flow';
 
-const running = { running: true, pid: 123, startTime: 456 };
-const stopped = { running: false };
+const context = { selectedServerId: 'other-node', selectionIntentGeneration: 0 };
+const running = { running: true, pid: 123, startTime: 456, mainGeneration: 7, ownedStopContext: context };
+const stopped = { running: false, mainGeneration: 8, ownedStopContext: context };
 const owner = { serverId: 'ts-a', selectedId: 'other-node', status: running };
 
 function fixture() {
   let status = running;
   let selected: string | null = 'other-node';
   let present = true;
-  const stop = vi.fn(async () => { status = stopped as typeof running; });
+  const stop = vi.fn(async (_expected: ExpectedMainCoreStop): Promise<ExpectedMainCoreStopResult> => {
+    status = stopped as typeof running;
+    return { kind: 'stopped' as const, expectedMainGeneration: 7, stopMainGeneration: 8 };
+  });
   const logout = vi.fn(async (_id: string) => {});
   return { stop, logout,
     setStatus: (next: typeof running) => { status = next; },
     setSelected: (next: string | null) => { selected = next; },
     setPresent: (next: boolean) => { present = next; },
     io: { selectedId: () => selected, serverPresent: () => present,
-      status: async () => status, stop, logout },
+      status: async () => status, stopExpected: stop, logout },
   };
 }
 
@@ -30,7 +35,7 @@ describe('mobile Tailscale logout with a main-core owner', () => {
   it('stops the same running core and logs out the captured TS id once', async () => {
     const f = fixture();
     expect(await stopOwnedCoreThenLogout(owner, f.io)).toEqual({ kind: 'loggedOut' });
-    expect(f.stop).toHaveBeenCalledOnce();
+    expect(f.stop).toHaveBeenCalledExactlyOnceWith({ expectedMainGeneration: 7, expectedSelectedServerId: 'other-node', expectedSelectionIntentGeneration: 0 });
     expect(f.logout).toHaveBeenCalledExactlyOnceWith('ts-a');
   });
 
@@ -73,8 +78,11 @@ describe('mobile Tailscale logout with a main-core owner', () => {
     expect(failedStop.logout).not.toHaveBeenCalled();
 
     const restarted = fixture();
-    restarted.stop.mockImplementationOnce(async () => restarted.setStatus({ ...running, startTime: 789 }));
-    expect(await stopOwnedCoreThenLogout(owner, restarted.io)).toEqual({ kind: 'stopFailed' });
+    restarted.stop.mockImplementationOnce(async () => {
+      restarted.setStatus({ ...running, startTime: 789, mainGeneration: 9 });
+      return { kind: 'stopped', expectedMainGeneration: 7, stopMainGeneration: 8 };
+    });
+    expect(await stopOwnedCoreThenLogout(owner, restarted.io)).toEqual({ kind: 'changed' });
     expect(restarted.logout).not.toHaveBeenCalled();
 
     const refused = fixture();
@@ -143,7 +151,63 @@ describe('shared pre-notice helpers for a node held by the running core', () => 
     expect(reselected.stop).not.toHaveBeenCalled();
 
     const stillRunning = fixture();
-    stillRunning.stop.mockImplementationOnce(async () => {});
-    expect(await stopOwnedCore(owner, stillRunning.io)).toBe('stopFailed');
+    stillRunning.stop.mockResolvedValueOnce({ kind: 'stopped', expectedMainGeneration: 7, stopMainGeneration: 8 });
+    expect(await stopOwnedCore(owner, stillRunning.io)).toBe('changed');
+  });
+});
+
+
+describe('atomic expected-generation stop receipt', () => {
+  it('does not log out when replacement happens after the final UI status read', async () => {
+    const f = fixture();
+    f.stop.mockImplementationOnce(async () => {
+      f.setStatus({ ...running, mainGeneration: 9 });
+      return { kind: 'changed' };
+    });
+    expect(await stopOwnedCoreThenLogout(owner, f.io)).toEqual({ kind: 'changed' });
+    expect(f.stop).toHaveBeenCalledExactlyOnceWith({ expectedMainGeneration: 7, expectedSelectedServerId: 'other-node', expectedSelectionIntentGeneration: 0 });
+    expect(f.logout).not.toHaveBeenCalled();
+  });
+
+  it('refuses same-PID replacements and missing/invalid generation receipts', async () => {
+    for (const mainGeneration of [undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 8]) {
+      const f = fixture();
+      f.setStatus({ ...running, mainGeneration } as typeof running);
+      expect(await stopOwnedCoreThenLogout(owner, f.io)).toEqual({ kind: 'changed' });
+      expect(f.stop).not.toHaveBeenCalled();
+      expect(f.logout).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('owned stop generation and selector binding after retirement', () => {
+  it.each([undefined, NaN, 0, 1.5, 10, 9_007_199_254_740_992])('rejects supplementary stopped generation %s', async (generation) => {
+    const f = fixture();
+    f.stop.mockImplementationOnce(async () => {
+      // A successor may reuse the old PID and selection and stop again.
+      f.setStatus({ ...running, running: false, mainGeneration: generation } as typeof running);
+      return {kind:'stopped',expectedMainGeneration:7,stopMainGeneration:8};
+    });
+    expect(await stopOwnedCoreThenLogout(owner, f.io)).toEqual({kind:'changed'});
+    expect(f.logout).not.toHaveBeenCalled();
+  });
+  it('requires the exact stopped generation and same captured selection epoch', async () => {
+    const matching = fixture();
+    expect(await stopOwnedCoreThenLogout(owner, matching.io)).toEqual({kind:'loggedOut'});
+    const aba = fixture();
+    aba.stop.mockImplementationOnce(async () => {
+      aba.setStatus({ ...running, running:false, mainGeneration:8,
+        ownedStopContext:{...context,selectionIntentGeneration:2} });
+      return {kind:'stopped',expectedMainGeneration:7,stopMainGeneration:8};
+    });
+    expect(await stopOwnedCoreThenLogout(owner, aba.io)).toEqual({kind:'changed'});
+    expect(aba.logout).not.toHaveBeenCalled();
+  });
+  it('cannot capture or submit an owner with missing or changed backend selection context', async () => {
+    expect(captureMainCoreOwner('ts-a','other-node',{...running,ownedStopContext:undefined})).toBeNull();
+    expect(captureMainCoreOwner('ts-a','new-node',running)).toBeNull();
+    const f=fixture(); f.setStatus({...running,ownedStopContext:{...context,selectionIntentGeneration:1}});
+    expect(await stopOwnedCoreThenLogout(owner,f.io)).toEqual({kind:'changed'});
+    expect(f.stop).not.toHaveBeenCalled();
   });
 });

@@ -212,12 +212,13 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// 残余本身若含字面量 `HTTP/` 仍会误判。预热那次的响应体现由 [`WarmTunnel::drain_body`] 按
 /// `Content-Length` / chunked 排空，排不干净即判预热失败；调用方关掉那一步时，这条退回 上游 同款的
 /// **已知有界残留**（默认端点是 204、规范无 body，自配端点才可能命中）。锚定本身两种情况下都保留。
+#[cfg(test)]
 fn find_response_head(buf: &[u8]) -> Option<&[u8]> {
     let (start, end) = response_head_range(buf)?;
     Some(&buf[start..end])
 }
 
-/// [`find_response_head`] 的下标版：`(头起点, 头终点)`，终点之后就是响应体已读到的部分。
+/// 响应头的 `(头起点, 头终点)`；终点之后就是响应体已读到的部分。
 fn response_head_range(buf: &[u8]) -> Option<(usize, usize)> {
     let anchor = find_subslice(buf, b"HTTP/")?;
     let end = find_subslice(&buf[anchor..], b"\r\n\r\n")?;
@@ -514,17 +515,35 @@ async fn read_response_status<S: AsyncRead + Unpin>(
     buf: &mut Vec<u8>,
 ) -> Option<u16> {
     let mut chunk = [0u8; READ_CHUNK];
+    // One bounded header budget includes every interim response. Draining 1xx
+    // must not let a peer stream an unbounded number of small heads. The caller's
+    // original cold/reuse deadline remains in force throughout this loop.
+    let mut consumed = 0usize;
     loop {
-        if let Some(head) = find_response_head(buf) {
-            // 畸形状态行 → None（**不得**当成功：见 [`parse_http_status_code`] 文档）。
-            return parse_http_status_code(head);
+        if let Some((start, end)) = response_head_range(buf) {
+            if consumed.checked_add(end)? > MAX_HEAD_BYTES {
+                return None;
+            }
+            let code = parse_http_status_code(&buf[start..end])?;
+            if code == 101 {
+                return None; // Protocol upgrades cannot carry the next HTTP GET.
+            }
+            if code < 200 {
+                consumed += end;
+                buf.drain(..end);
+                continue;
+            }
+            // Keep the final head and already-read body for drain_body().
+            return Some(code);
         }
-        if buf.len() >= MAX_HEAD_BYTES {
+        let remaining = MAX_HEAD_BYTES.checked_sub(consumed + buf.len())?;
+        if remaining == 0 {
             return None;
         }
-        let n = conn.read(&mut chunk).await.ok()?;
+        let read_len = chunk.len().min(remaining);
+        let n = conn.read(&mut chunk[..read_len]).await.ok()?;
         if n == 0 {
-            return None; // 对端在响应头收齐前关闭（上游的 `early-close`）
+            return None; // EOF after only interim responses is not success.
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -554,6 +573,18 @@ pub async fn open_tunnel(
     target: &SpeedTestTarget,
     announce: &(dyn Fn(u16) + Sync),
 ) -> Result<SpeedTestTunnel, TunnelError> {
+    open_tunnel_with_tls_config(proxy_port, auth, target, announce, tls_client_config).await
+}
+
+// The only production caller supplies the platform-verifying configuration.
+// Tests inject a private test CA without altering the host's trust store.
+async fn open_tunnel_with_tls_config(
+    proxy_port: u16,
+    auth: Option<&InboundUser>,
+    target: &SpeedTestTarget,
+    announce: &(dyn Fn(u16) + Sync),
+    tls_config: impl FnOnce() -> Option<Arc<rustls::ClientConfig>> + Send,
+) -> Result<SpeedTestTunnel, TunnelError> {
     let io = |_| TunnelError::Transport;
     let mut sock = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
@@ -581,7 +612,7 @@ pub async fn open_tunnel(
     // 不会再写）→ 与 上游 一致地丢弃（node 的 'connect' 事件同样把 `head` 参数弃之不用）。
 
     if target.https {
-        let config = tls_client_config().ok_or(TunnelError::Transport)?;
+        let config = tls_config().ok_or(TunnelError::Transport)?;
         let server_name = rustls::pki_types::ServerName::try_from(target.sni_host())
             .map_err(|_| TunnelError::Transport)?
             .to_owned();
@@ -595,98 +626,38 @@ pub async fn open_tunnel(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ③ 隧道内 TLS（仅 https 测速目标；**不校验证书**，理由见下）
+//  ③ 隧道内 TLS：所有 HTTPS 目标都先验证服务端身份，再发送路径与 query。
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// 隧道内 TLS 的 client 配置（进程内建一次）。
-///
-/// 用**显式** provider（`builder_with_provider`）而不是 `ClientConfig::builder()`：后者读进程全局
-/// 默认 provider，未安装时**直接 panic**。测速是热路径且可能先于任何 reqwest client 跑起来
-/// （`runtime/http.rs::install_ring_provider` 只在建 `HttpRuntime` 时才装），依赖全局状态等于把一个
-/// 顺序耦合埋进 panic 路径。显式传 provider 后本模块与全局状态无关。
+/// Trust follows the platform (including installed private CAs), just like the
+/// application's existing reqwest clients. Paths and queries may contain
+/// credentials, so no HTTPS measurement mode bypasses certificate validation.
+/// An unavailable trust store fails closed without logging the target URL.
 fn tls_client_config() -> Option<Arc<rustls::ClientConfig>> {
-    static CONFIG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .ok()?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(MeasureOnlyVerifier(provider)))
-                .with_no_client_auth();
-            Some(Arc::new(cfg))
-        })
-        .clone()
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Some(config.clone());
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = rustls_platform_verifier::Verifier::new(provider.clone()).ok()?;
+    let config = verified_tls_client_config(provider, verifier)?;
+    // Do not cache a failed initialization (e.g. platform trust not ready yet).
+    Some(CONFIG.get_or_init(|| config).clone())
 }
 
-/// **不校验服务端证书**的 verifier —— 只允许测速隧道用。
-///
-/// # 为什么可以不校验（以及为什么这不是安全降级）
-///
-/// 测速隧道从不读、也从不发任何内容数据：它发一个固定的 `GET <测速路径>`，只看响应**头**的状态码与
-/// 到达时刻，body 一个字节都不读。它量的是**可达性与往返时延**，不是内容可信度 —— 中间人能做的最坏
-/// 情形是让延迟数字变好看，而延迟数字本来就由被测节点全权决定（节点自己就是那条链路）。
-/// 上游 在同一位置作同一决定（`tls.connect({ rejectUnauthorized: false })`，
-/// `SpeedTestService.ts:1046`），注释写明「测速仅量可达性+TTFB，不校验证书（与 HTTP 路径等价）」。
-///
-/// 附带收益（诚实登记为收益而非动机）：不校验就不需要根证书源，省掉 `rustls-native-certs` /
-/// `webpki-roots` 依赖与它们的平台 I/O。
-///
-/// # 边界必须有牙
-///
-/// 这个 verifier **只能**留在测速隧道里。泄漏到订阅拉取 / 内核下载 / 更新 / 解锁检测任何一条链上都是
-/// 真实的安全降级（那些链路要读并**信任**内容）。边界由门
-/// `dangerous_tls_verifier_stays_in_this_module` 守：全仓扫 `with_custom_certificate_verifier`，
-/// 出现在本文件之外即转红。
-#[derive(Debug)]
-struct MeasureOnlyVerifier(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for MeasureOnlyVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    /// 签名**照常验**（只放行「证书链不可信」，不放行「握手被伪造」）—— 少验一样是白费力气，
-    /// 但多留一层就少一层被误当通用 client 复制走的诱因。
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+/// Explicit provider avoids initialization-order panics. Taking the concrete
+/// platform verifier prevents accidentally passing an accept-all verifier here.
+fn verified_tls_client_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: rustls_platform_verifier::Verifier,
+) -> Option<Arc<rustls::ClientConfig>> {
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    Some(Arc::new(config))
 }
 
 #[cfg(test)]

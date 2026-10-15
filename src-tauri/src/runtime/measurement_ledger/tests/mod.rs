@@ -45,6 +45,7 @@ fn context<'a>(
     ReadContext {
         main_generation: Some(7),
         fingerprints,
+        main_connections: fingerprints,
         network_epoch: Some(3),
         url_digest: URL,
         now_ms,
@@ -631,4 +632,122 @@ fn an_entry_keeps_the_monotonic_time_and_period_factor_it_was_recorded_with() {
     ledger.set_period_factor(0);
     ledger.record_at("c", Ok(1), identity(1, 3, 0), 3_000);
     assert_eq!(entry("c").period_factor, 1, "倍数不低于 1");
+}
+
+#[test]
+fn saved_unapplied_connection_edits_exclude_main_receipts_in_the_same_generation() {
+    use crate::commands::speedtest::current_server_fingerprints;
+    use crate::runtime::node_fingerprints::measurement_table_json;
+    use serde_json::json;
+    let base = json!({"servers": [{"id":"a", "name":"A", "protocol":"trojan",
+        "address":"example.test", "port":443, "password":"fixture", "network":"ws",
+        "security":"tls", "tlsSettings":{"serverName":"old.test"}, "wsSettings":{"path":"/old"}}]});
+    let legacy = current_server_fingerprints(&base);
+    let running = measurement_table_json(&base);
+    let ledger = MeasurementLedger::new();
+    let mut receipt = identity(1, 1, 100);
+    receipt.node_fingerprint = legacy.get("a").cloned();
+    ledger.record_connection_at("a", Ok(25), receipt, running.get("a").cloned(), 100);
+    let mut read = context(&legacy, 101, None);
+    read.main_connections = &running;
+    assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    for (key, value) in [
+        ("security", json!("none")),
+        ("tlsSettings", json!({"serverName":"new.test"})),
+        ("wsSettings", json!({"path":"/new"})),
+    ] {
+        // Models persisted D with deferRestart; R, generation, network and all
+        // receipt timing gates stay unchanged. No staged draft is consulted.
+        let mut desired = base.clone();
+        desired["servers"][0][key] = value;
+        let current = current_server_fingerprints(&desired);
+        assert_eq!(current, legacy, "subscription dedup semantics stay unchanged");
+        let connections = measurement_table_json(&desired);
+        let read = ReadContext {
+            main_connections: &connections,
+            ..context(&current, 101, None)
+        };
+        assert_eq!(exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+            Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint)));
+        assert!(ledger.current_results(&ids(&["a"]), &read).is_empty(),
+            "an old running receipt cannot satisfy desired-configuration coverage");
+    }
+    for key in ["name", "providerName", "updatedAt", "subscriptionId"] {
+        let mut desired = base.clone();
+        desired["servers"][0][key] = json!("display-only");
+        let connections = measurement_table_json(&desired);
+        let read = ReadContext {
+            main_connections: &connections,
+            ..context(&legacy, 101, None)
+        };
+        assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    }
+    // Full Apply still invalidates the receipt even when the connection digest
+    // is unchanged: the existing generation gate remains authoritative.
+    let read = ReadContext {
+        main_generation: Some(8),
+        main_connections: &running,
+        ..context(&legacy, 101, None)
+    };
+    assert_eq!(exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance)));
+}
+
+#[test]
+fn unknown_or_changed_connection_identity_is_not_a_current_candidate_or_failure() {
+    for measured in [Ok(20), Err(TIMED_OUT)] {
+        for recorded in [None, Some("old-connection".to_owned())] {
+            let ledger = MeasurementLedger::new();
+            ledger.record_connection_at("a", measured, identity(1, 1, 100), recorded, 100);
+            let legacy = fingerprints(&["a"]);
+            for current in [
+                BTreeMap::new(),
+                BTreeMap::from([("a".to_owned(), "desired-connection".to_owned())]),
+            ] {
+                let read = ReadContext {
+                    main_connections: &current,
+                    ..context(&legacy, 101, None)
+                };
+                let result = ledger.candidates(&ids(&["a"]), &read);
+                assert!(result.selectable.is_empty());
+                assert_eq!(exclusion_of(&result, "a"),
+                    Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint)));
+                assert!(ledger.current_results(&ids(&["a"]), &read).is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn main_candidate_identity_includes_detour_connections_and_rejects_temp_scope() {
+    use crate::commands::speedtest::current_server_fingerprints;
+    use crate::runtime::node_fingerprints::measurement_connections_json;
+    use serde_json::json;
+    let base = json!({"servers": [
+        {"id":"a", "name":"A", "protocol":"trojan", "address":"a.test", "port":443,
+         "password":"fixture", "detour":"b"},
+        {"id":"b", "name":"B", "protocol":"trojan", "address":"b.test", "port":443,
+         "password":"fixture", "security":"tls", "tlsSettings":{"serverName":"old.test"}}
+    ]});
+    let legacy = current_server_fingerprints(&base);
+    let running = measurement_connections_json(&base);
+    assert_ne!(running.main.get("a"), running.temp.get("a"));
+    let ledger = MeasurementLedger::new();
+    let mut receipt = identity(1, 1, 100);
+    receipt.node_fingerprint = legacy.get("a").cloned();
+    ledger.record_connection_at("a", Ok(20), receipt, running.main.get("a").cloned(), 100);
+    let mut desired = base.clone();
+    desired["servers"][1]["tlsSettings"]["serverName"] = json!("new.test");
+    let current = measurement_connections_json(&desired);
+    let read = ReadContext {
+        main_connections: &current.main,
+        ..context(&legacy, 101, None)
+    };
+    assert!(ledger.candidates(&ids(&["a"]), &read).selectable.is_empty());
+    let wrong_scope = ReadContext {
+        main_connections: &running.temp,
+        ..context(&legacy, 101, None)
+    };
+    assert!(ledger.candidates(&ids(&["a"]), &wrong_scope).selectable.is_empty(),
+        "temp identities cannot validate main receipts");
 }

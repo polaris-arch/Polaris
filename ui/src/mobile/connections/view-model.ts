@@ -435,3 +435,21 @@ export function fmtLogTs(ts: string): string {
   const p = (n: number): string => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+
+/** Roll back only failed/unknown close intents still present in the authoritative feed. */
+export function restoreFailedClosingRows(
+  feed: ActiveFeed,
+  current: readonly ConnRowVM[],
+  snapshot: readonly ConnRowVM[],
+  failedIds: readonly string[],
+): ConnRowVM[] {
+  const failed = new Set(failedIds);
+  for (const id of failed) feed.closing.delete(id);
+  const restored = [...current];
+  snapshot.forEach((row, index) => {
+    if (failed.has(row.id) && feed.index.has(row.id) && !restored.some((existing) => existing.id === row.id)) {
+      restored.splice(Math.min(index, restored.length), 0, row);
+    }
+  });
+  return restored;
+}

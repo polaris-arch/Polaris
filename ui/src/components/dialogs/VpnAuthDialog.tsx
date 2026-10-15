@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
@@ -9,6 +9,7 @@ import { Modal } from './Modal';
 import { useDialogStore } from './dialog-store';
 
 interface Props {
+  instanceId: string;
   protocol: 'openconnect' | 'openvpn';
   serverId: string;
 }
@@ -23,9 +24,10 @@ function VpnIcon() {
   );
 }
 
-export function VpnAuthDialog({ protocol, serverId }: Props) {
+export function VpnAuthDialog({ instanceId, protocol, serverId }: Props) {
   const { t } = useTranslation();
-  const close = useDialogStore((state) => state.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const serverName = useAppStore(
     (state) => state.servers.find((server) => server.id === serverId)?.name
   );
@@ -105,7 +107,12 @@ export function VpnAuthDialog({ protocol, serverId }: Props) {
       } else if (protocol === 'openvpn' && openVpn?.challenge) {
         await api.vpn.submitOpenVpn(serverId, challengeId, username, password, secret);
       }
-      close();
+      const latest = useVpnStatusStore.getState();
+      const currentId = protocol === 'openconnect'
+        ? latest.openConnect[serverId]?.authChallenge?.id
+        : latest.openVpn[serverId]?.challenge?.id;
+      // A fresh challenge on the same mounted endpoint is not this submission's dialog outcome.
+      if (!currentId || currentId === challengeId) close();
     } catch (error) {
       console.error('[VpnAuthDialog] submit failed:', error);
       toast.error(t('vpnAuth.submitFailed'));

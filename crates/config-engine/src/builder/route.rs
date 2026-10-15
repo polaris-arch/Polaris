@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::builder::custom_rule_files::uses_fake_ip;
 use crate::builder::custom_rules::{build_custom_rules, CustomRulesDeps};
 use crate::builder::endpoint_routes::{
-    collect_targeted_mixed, force_route_emission_order_key, force_route_leg,
-    mesh_force_routed_servers, mesh_forced_route_cidrs, mesh_node_carries_full_tunnel,
-    settle_force_route_claims, settled_force_route_cidrs, should_force_route_subnets,
+    collect_targeted_mixed, engaged_mesh_forced_route_cidrs, force_route_emission_order_key,
+    force_route_leg, mesh_node_carries_full_tunnel, settle_force_route_claims,
+    settled_force_route_cidrs, should_force_route_subnets,
     tailnet_rule_file_base, ForceRouteLeg, MeshRouteCandidate, MeshRouteEmissionCandidate,
     MeshRouteSource, ObservedTailnetAddresses, SourcedCidr, MAX_MESH_ROUTE_REPORT_CANDIDATES,
     MAX_MESH_ROUTE_REPORT_CIDRS, MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES, TAILNET_CGNAT,
@@ -45,7 +45,7 @@ use crate::user_config::proxy_mode::ProxyMode;
 use crate::user_config::region_routing::{
     effective_region_routing, region_foreign_geo, region_local_geo,
 };
-use crate::user_config::rule::RuleAction;
+use crate::user_config::rule::{RuleAction, RuleResourceFormat};
 use crate::user_config::rules::rule_ip_cidrs;
 use crate::user_config::server_config::{is_mesh_node, Protocol, ServerConfig};
 use crate::user_config::system_proxy_bypass::{bypass_lan_cidrs, effective_bypass_lan};
@@ -308,12 +308,10 @@ pub fn build_route_config_with_report(
     let rule_targeted_server_ids = collect_targeted_mixed(&custom_rules_eff, &app_rules_eff);
 
     // mesh 重叠提醒（layer-2 兜底，非阻断）。基准只取「本轮实际会发射 force-route」的节点（与块 0c 同 gate）。
-    let mesh_cidrs_for_warn = mesh_forced_route_cidrs(
-        &mesh_force_routed_servers(
-            &config.servers,
-            config.selected_server_id.as_deref(),
-            &rule_targeted_server_ids,
-        ),
+    let mesh_cidrs_for_warn = engaged_mesh_forced_route_cidrs(
+        &config.servers,
+        config.selected_server_id.as_deref(),
+        &rule_targeted_server_ids,
         &deps.observed_tailnet_addresses,
     );
     if !mesh_cidrs_for_warn.is_empty() {
@@ -1898,19 +1896,27 @@ pub(super) fn add_local_geo_rule_set(
     let local = find_builtin(tag)
         .map(|builtin| format!("{}/{}", deps.runtime_rules_dir, builtin.file_name))
         .filter(|path| (deps.is_valid_srs_fn)(path))
+        .map(|path| (path, "binary"))
         .or_else(|| {
-            config
+            let resource = config
                 .rule_resources
                 .iter()
-                .find(|resource| resource.id == tag)
-                .map(|resource| format!("{}/{}", deps.rule_resources_path, resource.file_name))
-                .filter(|path| (deps.is_valid_srs_fn)(path))
+                .find(|resource| resource.id == tag)?;
+            let path = format!("{}/{}", deps.rule_resources_path, resource.file_name);
+            let (available, format) = match resource.format {
+                RuleResourceFormat::Binary => ((deps.is_valid_srs_fn)(&path), "binary"),
+                RuleResourceFormat::Source => (
+                    crate::builder::custom_rule_files::ext_rule_file_exists(&path),
+                    "source",
+                ),
+            };
+            available.then_some((path, format))
         });
-    if let Some(path) = local {
+    if let Some((path, format)) = local {
         rs.push(RuleSet {
             tag: tag.to_string(),
             type_field: "local".to_string(),
-            format: "binary".to_string(),
+            format: format.to_string(),
             path: Some(path),
             url: None,
             http_client: None,

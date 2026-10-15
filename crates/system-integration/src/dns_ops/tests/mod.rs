@@ -7,6 +7,8 @@ struct MockDnsOps {
     dns_state: RefCell<BTreeMap<String, Vec<String>>>,
     apply_calls: RefCell<Vec<(String, Vec<String>)>>,
     apply_fail_targets: Vec<String>,
+    read_fail_targets: Vec<String>,
+    restore_fail_targets: Vec<String>,
     list_fails: bool,
     effective: RefCell<Vec<String>>,
     /// 模拟平台是否接管（mac=true / win·linux=false）。
@@ -28,6 +30,8 @@ impl Default for MockDnsOps {
             dns_state: RefCell::new(BTreeMap::new()),
             apply_calls: RefCell::new(Vec::new()),
             apply_fail_targets: Vec::new(),
+            read_fail_targets: Vec::new(),
+            restore_fail_targets: Vec::new(),
             list_fails: false,
             effective: RefCell::new(vec!["192.168.1.1".into()]),
             takeover: true,
@@ -49,6 +53,11 @@ impl SystemDnsOps for MockDnsOps {
         Ok(self.targets.clone())
     }
     fn read_dns(&self, target: &str) -> Result<Vec<String>, crate::error::SystemIntegrationError> {
+        if self.read_fail_targets.iter().any(|name| name == target) {
+            return Err(crate::error::SystemIntegrationError::dns(
+                "read unavailable",
+            ));
+        }
         Ok(self
             .dns_state
             .borrow()
@@ -75,6 +84,13 @@ impl SystemDnsOps for MockDnsOps {
         }
         if self.apply_fail_targets.iter().any(|t| t == target) {
             return Err(crate::error::SystemIntegrationError::dns("apply failed"));
+        }
+        if self.restore_fail_targets.iter().any(|name| name == target)
+            && ips != [controlled_tun_dns_ip().to_string()]
+        {
+            return Err(crate::error::SystemIntegrationError::dns(
+                "restore unavailable",
+            ));
         }
         // 模拟真实写入状态。
         self.dns_state
@@ -162,8 +178,11 @@ fn set_dns_rolls_back_on_apply_failure() {
     };
     let mut c = controller(ops).with_noop_sleeper();
     c.set_dns();
-    // apply 耗尽重试仍失败 → 兜底还原 → marker 清。
-    assert!(!c.has_marker(), "rollback cleared marker");
+    // Both takeover and rollback failed: the durable snapshot remains recoverable.
+    assert!(
+        c.has_marker(),
+        "failed rollback must retain recovery intent"
+    );
     assert_eq!(
         c.ops.apply_calls.borrow().len(),
         4,
@@ -808,4 +827,131 @@ fn linux_reads_real_link_dns_and_falls_back_without_resolved() {
     );
     let ops = dns_ops_for(Platform::Linux, runner);
     assert_eq!(ops.read_effective_resolvers().unwrap(), vec!["fd00::53"]);
+}
+
+#[test]
+fn unreadable_dns_is_not_saved_as_dhcp_and_cannot_authorize_any_apply() {
+    let ops = MockDnsOps {
+        targets: vec!["A".into(), "B".into()],
+        read_fail_targets: vec!["B".into()],
+        ..Default::default()
+    };
+    let mut c = controller(ops).with_noop_sleeper();
+    c.set_dns();
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert!(!c.has_marker());
+}
+
+struct FailingMarkerFs {
+    inner: MemFs,
+    write_fails: std::cell::Cell<bool>,
+    remove_fails: std::cell::Cell<bool>,
+}
+impl MarkerFs for FailingMarkerFs {
+    fn write_marker(&self, path: &str, data: &str) -> std::io::Result<()> {
+        if self.write_fails.get() {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        self.inner.write_marker(path, data)
+    }
+    fn read_marker(&self, path: &str) -> Option<String> {
+        self.inner.read_marker(path)
+    }
+    fn remove_marker(&self, path: &str) -> std::io::Result<()> {
+        if self.remove_fails.get() {
+            return Err(std::io::Error::other("injected remove failure"));
+        }
+        self.inner.remove_marker(path)
+    }
+}
+
+#[test]
+fn marker_persistence_failure_prevents_initial_and_reconcile_mutations() {
+    let fs = FailingMarkerFs {
+        inner: MemFs::new(),
+        write_fails: true.into(),
+        remove_fails: false.into(),
+    };
+    let mut c = SystemDnsController::new(
+        MockDnsOps {
+            targets: vec!["A".into()],
+            ..Default::default()
+        },
+        DnsMarker::new(fs, "/dns-marker.json"),
+    )
+    .with_noop_sleeper();
+    c.set_dns();
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert!(c.original.is_none());
+    c.marker.fs.write_fails.set(false);
+    c.set_dns();
+    let old = c.marker.fs.read_marker(c.marker.path()).unwrap();
+    c.ops.targets.push("B".into());
+    c.ops.apply_calls.borrow_mut().clear();
+    c.marker.fs.write_fails.set(true);
+    c.reconcile_dns();
+    assert!(c.ops.apply_calls.borrow().is_empty());
+    assert_eq!(c.marker.fs.read_marker(c.marker.path()).unwrap(), old);
+}
+
+#[test]
+fn partial_takeover_and_failed_rollback_retain_snapshot_until_successful_recovery() {
+    let mut c = controller(MockDnsOps {
+        targets: vec!["A".into(), "B".into()],
+        dns_state: RefCell::new(BTreeMap::from([
+            ("A".into(), vec!["192.168.1.2".into()]),
+            ("B".into(), Vec::new()),
+        ])),
+        apply_fail_targets: vec!["B".into()],
+        restore_fail_targets: vec!["A".into()],
+        ..Default::default()
+    })
+    .with_noop_sleeper();
+    c.set_dns();
+    assert!(c.has_marker());
+    assert_eq!(
+        c.marker.read().unwrap().original["A"],
+        vec!["192.168.1.2".to_string()]
+    );
+    assert_eq!(
+        c.ops.dns_state.borrow()["A"],
+        vec![controlled_tun_dns_ip().to_string()]
+    );
+    c.ops.apply_fail_targets.clear();
+    c.ops.restore_fail_targets.clear();
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert_eq!(
+        c.ops.dns_state.borrow()["A"],
+        vec!["192.168.1.2".to_string()]
+    );
+    assert!(
+        c.ops.dns_state.borrow()["B"].is_empty(),
+        "observed DHCP must remain DHCP"
+    );
+}
+
+#[test]
+fn failed_marker_removal_keeps_original_and_recovery_authority() {
+    let fs = FailingMarkerFs {
+        inner: MemFs::new(),
+        write_fails: false.into(),
+        remove_fails: true.into(),
+    };
+    let mut c = SystemDnsController::new(
+        MockDnsOps {
+            targets: vec!["A".into()],
+            ..Default::default()
+        },
+        DnsMarker::new(fs, "/dns-marker.json"),
+    )
+    .with_noop_sleeper();
+    c.set_dns();
+    c.restore_dns();
+    assert!(c.has_marker());
+    assert!(c.original.is_some());
+    c.marker.fs.remove_fails.set(false);
+    c.restore_dns();
+    assert!(!c.has_marker());
+    assert!(c.original.is_none());
 }

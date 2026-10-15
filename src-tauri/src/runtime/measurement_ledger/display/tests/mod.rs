@@ -47,6 +47,7 @@ fn context(fingerprints: &BTreeMap<String, String>) -> ReadContext<'_> {
     ReadContext {
         main_generation: Some(7),
         fingerprints,
+        main_connections: Box::leak(Box::new(connections())),
         network_epoch: Some(3),
         url_digest: "url",
         now_ms: 200,
@@ -69,6 +70,7 @@ fn display_does_not_replace_candidates_with_a_newer_system_measurement() {
     record(&ledger, "a", Ok(5), identity(2, MeasurePath::System), 200);
     let read = context(&fingerprints);
     let before = ledger.candidates(&["a".to_owned()], &read);
+    assert_eq!(before.selectable.len(), 1);
     let rows = ledger.display_rows(&read, Some("config"), &connection_view(&connections()));
     assert_eq!(rows["a"]["candidate"]["latency"], 30);
     assert_eq!(rows["a"]["system"]["latency"], 5);

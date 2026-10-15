@@ -544,8 +544,22 @@ export interface PendingNodeChanges {
  * `errorCode`/`message` 仅 `failed` 时出现；`errorCode` 可能缺失（后端「无可诚实断言的分类」那一类），
  * 但 `message` 恒在 —— 没有它，条只能显示一个说不清的红。
  */
+export interface ExpectedMainCoreStop {
+  expectedMainGeneration: number;
+  expectedSelectedServerId: string | null;
+  expectedSelectionIntentGeneration: number;
+}
+
+export type ExpectedMainCoreStopResult =
+  | { kind: 'stopped'; expectedMainGeneration: number; stopMainGeneration: number }
+  | { kind: 'changed' };
+
 export interface ProxyLifecycleEvent {
   phase: 'ready' | 'stopped' | 'failed';
+  kind: 'start' | 'stop' | 'restart' | 'unknown';
+  mainGeneration: number;
+  terminal: boolean;
+  applyId?: number;
   errorCode?: string;
   message?: string;
 }

@@ -541,6 +541,9 @@ fn truthy(v: Option<&Value>) -> bool {
     }
 }
 
+/// 部分恢复的共享依赖冲突。事务调用方必须中止落盘，并映射到明确的用户面冲突提示。
+pub const SHARED_DEPENDENCY_CONFLICT: &str = "backup_shared_dependency_conflict";
+
 /// [`merge_categories`] 的结果。
 #[derive(Debug, Clone)]
 pub struct MergeOutcome {
@@ -548,6 +551,9 @@ pub struct MergeOutcome {
     pub config: Value,
     /// 选了但备份该类为空、被跳过的类（供 UI 提示）。
     pub skipped: Vec<BackupCategory>,
+    /// 部分恢复遇到的同 ID 异内容依赖（`table:id`）。非空时 `config` 原样等于 current，
+    /// 调用方必须中止整个导入事务，不能当成功或空类别跳过。
+    pub conflicts: Vec<String>,
 }
 
 /// 把 1.0/1.1/裸配置的共享规则临时提升为当前独立集合，供选择性导入读取。
@@ -576,7 +582,8 @@ fn normalize_policy_backup(backup: &Value) -> Value {
 /// 上游 `mergeCategories`。
 ///
 /// 空跳过是防误删的红线：用户勾了「手动节点」但备份里一个手动节点都没有 → 保留 current 的手动节点、
-/// 记 skipped，**绝不用空数组覆盖**。
+/// 记 skipped，**绝不用空数组覆盖**。只有一个规则平面真正恢复时，共享资源按 ID 合并；
+/// 同 ID 异内容返回 conflicts 并保留整个 current，调用方必须拒绝落盘并提示冲突。
 #[must_use]
 pub fn merge_categories(
     current: &Value,
@@ -679,33 +686,44 @@ pub fn merge_categories(
     let custom_applied =
         sel(BackupCategory::CustomRules) && !skipped.contains(&BackupCategory::CustomRules);
     let dns_applied = sel(BackupCategory::DnsRules) && !skipped.contains(&BackupCategory::DnsRules);
-    if custom_applied {
-        // 流量规则保持旧导入语义：字段缺失按空数组处理。
-        set(
-            &mut result,
-            "customRuleSets",
-            arr_or_empty(backup, "customRuleSets"),
-        );
-        set(
-            &mut result,
-            "ruleResources",
-            arr_or_empty(backup, "ruleResources"),
-        );
-    } else if dns_applied {
-        // DNS-only 导入仅在备份显式带来依赖时替换，避免旧备份误清空。
-        if backup.get("customRuleSets").is_some_and(Value::is_array) {
-            set(
-                &mut result,
-                "customRuleSets",
-                arr_or_empty(backup, "customRuleSets"),
-            );
+    if custom_applied || dns_applied {
+        let mut conflicts = BTreeSet::new();
+        for key in ["customRuleSets", "ruleResources"] {
+            if custom_applied && dns_applied {
+                // 两个平面都真正替换时，沿用完整恢复的整表替换语义。
+                set(&mut result, key, arr_or_empty(backup, key));
+            } else if let Some(incoming) = backup.get(key).and_then(Value::as_array) {
+                // 另一个平面未选或空跳过：保留其所有依赖。按 id 合并复用 networkProfiles
+                // 的顺序模型，但同 id 异内容不能静默覆盖，否则未选规则语义仍会改变。
+                let mut merged = arr_or_empty(current, key)
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for resource in incoming {
+                    let Some(id) = resource.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    match merged
+                        .iter()
+                        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+                    {
+                        Some(existing) if existing != resource => {
+                            conflicts.insert(format!("{key}:{id}"));
+                        }
+                        Some(_) => {} // 相同内容复用当前行，不制造重复 ID。
+                        None => merged.push(resource.clone()),
+                    }
+                }
+                set(&mut result, key, Value::Array(merged));
+            }
         }
-        if backup.get("ruleResources").is_some_and(Value::is_array) {
-            set(
-                &mut result,
-                "ruleResources",
-                arr_or_empty(backup, "ruleResources"),
-            );
+        if !conflicts.is_empty() {
+            // 不返回已经替换了一部分规则/节点的中间态，便于所有调用方安全拒绝整笔恢复。
+            return MergeOutcome {
+                config: current.clone(),
+                skipped: Vec::new(),
+                conflicts: conflicts.into_iter().collect(),
+            };
         }
     }
 
@@ -828,6 +846,7 @@ pub fn merge_categories(
     MergeOutcome {
         config: result,
         skipped,
+        conflicts: Vec::new(),
     }
 }
 

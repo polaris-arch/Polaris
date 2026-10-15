@@ -421,82 +421,49 @@ describe('composeBarView —— coreRunning 闸门', () => {
  * 自驱的去抖重启，两条都不发 ⇒ 条此前只能等 12s 兜底轮询。而「差集变空」**不能**代替它 ——
  * 起核失败时差集同样为空，拿它判成功会把失败报成成功。
  */
-describe('applyStateOnLifecycle —— 收场判据必须能区分成功与失败', () => {
-  /** 与真实调用形一致（`t(key)`，无兜底参）；返键名即可，本组只关心「取的是键还是后端串」。 */
+describe('applyStateOnLifecycle ownership', () => {
   const t = (key: string) => key;
-
-  // 变异对照：去掉 `current !== 'applying'` 早退 → 本条转红。托盘启停 / 后台自愈的结局不该
-  // 被算成「本次 apply 的收场」（会把一条与用户动作无关的失败画成红）。
-  it('不在 applying 态 → 一律 null（别人的起停不是本次 apply 的事）', () => {
-    for (const p of ['idle', 'failed'] as ApplyPhase[]) {
-      expect(applyStateOnLifecycle(p, { phase: 'ready' }, t)).toBeNull();
-      expect(applyStateOnLifecycle(p, { phase: 'failed', message: 'x' }, t)).toBeNull();
-      expect(applyStateOnLifecycle(p, { phase: 'stopped' }, t)).toBeNull();
-    }
+  const current = { phase: 'applying' as const, reason: null, applyId: 7, mainGeneration: 10 };
+  const event = { kind: 'restart' as const, terminal: true, applyId: 7, mainGeneration: 11 };
+  it('keeps unrelated or missing-attribution outcomes applying while tracking their generation', () => {
+    expect(applyStateOnLifecycle({ phase: 'idle', reason: null }, { ...event, phase: 'ready' }, t)).toBeNull();
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'ready', applyId: 8 }, t)).toEqual({ ...current, mainGeneration: 11 });
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'ready', applyId: undefined }, t)).toEqual({ ...current, mainGeneration: 11 });
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', mainGeneration: 9 }, t)).toBeNull();
   });
-
-  // 变异对照：让 ready 落 'failed' 或返回 null → 转红（前者凭空报错，后者退回等 12s 轮询）。
-  it('ready → 成功收场', () => {
-    expect(applyStateOnLifecycle('applying', { phase: 'ready' }, t)).toEqual({
-      phase: 'idle',
-      reason: null,
-    });
+  it.each(['ready', 'failed'] as const)('advances the floor before rejecting another apply and ignores delayed owned %s', (phase) => {
+    const observed = applyStateOnLifecycle(current, { ...event, applyId: 8, mainGeneration: 12, phase: 'ready' }, t)!;
+    expect(observed).toEqual({ ...current, mainGeneration: 12 });
+    // Same sequence applies to buffered events delivered before the Apply receipt is bound.
+    expect(applyStateOnLifecycle(observed, { ...event, phase, mainGeneration: 11 }, t)).toBeNull();
+    expect(applyStateOnLifecycle(observed, { ...event, phase, mainGeneration: 13 }, t))
+      .toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null });
   });
-
-  // **这一条是本通道相对「差集变空」的全部价值**。
-  // 变异对照：把 failed 腿删掉（只按 ready/stopped 分派）→ 转红 ⇒ 起核失败会被当成功静默收场。
-  //
-  // 无稳定码时不把后端诊断文字直接画到 UI：它可能携带路径、PID、命令或固定语言。
-  // 状态条仍会落成明确的「应用失败」，详细诊断由日志承担。
-  it('failed 且无 errorCode → 落失败态，不渲染后端诊断 message', () => {
-    expect(
-      applyStateOnLifecycle('applying', { phase: 'failed', message: '核起不来：端口被占' }, t)
-    ).toEqual({ phase: 'failed', reason: null });
+  it('tracks an unattributed start without completing a deferred Apply or lowering its floor', () => {
+    const observed = applyStateOnLifecycle(current, { ...event, kind: 'start', phase: 'ready', applyId: undefined, mainGeneration: 12 }, t)!;
+    expect(observed).toEqual({ ...current, mainGeneration: 12 });
+    expect(applyStateOnLifecycle(observed, { ...event, phase: 'ready', applyId: 8, mainGeneration: 11 }, t)).toBeNull();
+    expect(applyStateOnLifecycle(observed, { ...event, phase: 'ready', applyId: 8, mainGeneration: 12 }, t)).toBeNull();
+    const stopped = applyStateOnLifecycle(observed, { ...event, phase: 'stopped', terminal: false, mainGeneration: 13 }, t)!;
+    expect(stopped).toEqual({ ...current, mainGeneration: 13 });
+    expect(applyStateOnLifecycle(stopped, { ...event, phase: 'ready', mainGeneration: 14 }, t)).toEqual({ phase: 'idle', reason: null });
   });
-
-  // 有码且前端有键 ⇒ 取键，**压过**后端那串中文 message。
-  // 变异对照：把优先级换回 `message || t(key)` → 本条转红（拿到的是中文串），
-  // 而那正是 ru/fa 用户看到「应用失败：核崩了」的成因。
-  it('failed 且 errorCode 有对应键 → 用键，压过后端中文 message', () => {
-    expect(
-      applyStateOnLifecycle(
-        'applying',
-        { phase: 'failed', errorCode: 'HELPER_NOT_INSTALLED', message: 'helper 尚未安装' },
-        t
-      )
-    ).toEqual({ phase: 'failed', reason: 'errors.helperNotInstalledDesc' });
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])('invalid generation %s cannot advance the floor or complete Apply', (mainGeneration) => {
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'ready', mainGeneration }, t)).toBeNull();
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', applyId: 8, mainGeneration }, t)).toBeNull();
   });
-
-  // STARTUP_FAILED 也必须走稳定的五语键；后端 stderr 仅进日志。
-  it('failed 且 STARTUP_FAILED → 使用本地化键，不渲染 stderr', () => {
-    expect(
-      applyStateOnLifecycle(
-        'applying',
-        { phase: 'failed', errorCode: 'STARTUP_FAILED', message: 'sing-box 启动期退出: bad config' },
-        t
-      )
-    ).toEqual({ phase: 'failed', reason: 'errors.startupFailed' });
+  it.each(['ready', 'failed'] as const)('keeps intermediate stopped until owned %s', (phase) => {
+    const stopped = applyStateOnLifecycle(current, { ...event, phase: 'stopped', terminal: false }, t)!;
+    expect(stopped.phase).toBe('applying');
+    expect(applyStateOnLifecycle(stopped, { ...event, phase, mainGeneration: 12 }, t)).toEqual({ phase: phase === 'ready' ? 'idle' : 'failed', reason: null });
   });
-
-  // 缺码、空 message 与非空 message 都必须收敛为同一个无诊断文字终态。
-  it('failed 但没有可用本地化原因 → reason 归 null', () => {
-    expect(applyStateOnLifecycle('applying', { phase: 'failed' }, t)).toEqual({
-      phase: 'failed',
-      reason: null,
-    });
-    expect(applyStateOnLifecycle('applying', { phase: 'failed', message: '   ' }, t)).toEqual({
-      phase: 'failed',
-      reason: null,
-    });
+  it('a newer explicit stop cancels neutrally and later starts are unrelated', () => {
+    const stopped = applyStateOnLifecycle(current, { ...event, kind: 'stop', phase: 'stopped', applyId: undefined }, t)!;
+    expect(stopped).toEqual({ phase: 'idle', reason: null });
+    expect(applyStateOnLifecycle(stopped, { ...event, phase: 'ready', mainGeneration: 12 }, t)).toBeNull();
   });
-
-  // 变异对照：把 stopped 归到 failed 腿 → 转红。停核可能正是用户自己点的、也可能是重启的停核腿
-  // 刚跑完（起核还在路上），判失败会红得毫无道理。
-  it('stopped → 回 idle，绝不判失败', () => {
-    expect(applyStateOnLifecycle('applying', { phase: 'stopped' }, t)).toEqual({
-      phase: 'idle',
-      reason: null,
-    });
+  it.each([['HELPER_NOT_INSTALLED', 'errors.helperNotInstalledDesc'], ['STARTUP_FAILED', 'errors.startupFailed'], [undefined, null]])('localizes owned failure %s without diagnostics', (errorCode, reason) => {
+    expect(applyStateOnLifecycle(current, { ...event, phase: 'failed', errorCode: errorCode ?? undefined, message: 'private diagnostic' }, t)).toEqual({ phase: 'failed', reason });
   });
 });
 
@@ -515,7 +482,7 @@ describe('接线：条真的订阅了 lifecycle 通道并走纯函数判定', ()
   ).replace(/^\s*(\/\/|\*|\/\*).*$/gm, ''); // 去整行注释：注释里也逐字写着这些调用
 
   it('订阅了 api.proxy.onLifecycle', () => {
-    expect(SRC).toContain('api.proxy.onLifecycle(');
+    expect(SRC).toContain('api.proxy.onLifecycleReady(');
   });
 
   it('收场判定走 applyStateOnLifecycle，而不是在组件里另写一套', () => {
@@ -523,7 +490,7 @@ describe('接线：条真的订阅了 lifecycle 通道并走纯函数判定', ()
   });
 
   it('订阅被卸载时解绑（漏了就是每次重挂多一个监听器）', () => {
-    expect(SRC).toContain('offLifecycle()');
+    expect(SRC).toContain('offLifecycle?.()');
   });
 });
 

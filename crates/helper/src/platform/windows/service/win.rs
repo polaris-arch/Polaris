@@ -21,7 +21,10 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, FALSE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+    FALSE, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
+};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -49,9 +52,6 @@ const FILE_FLAG_FIRST_PIPE_INSTANCE: FILE_FLAGS_AND_ATTRIBUTES = 0x0008_0000;
 
 /// SDDL_REVISION_1（ConvertStringSecurityDescriptor 的 revision 参数）。
 const SDDL_REVISION_1: u32 = 1;
-
-/// ERROR_PIPE_CONNECTED（ConnectNamedPipe 时客户端已先连上）。
-const ERROR_PIPE_CONNECTED: u32 = 230;
 
 /// ERROR_BROKEN_PIPE（ReadFile 时客户端关闭，正常 EOF）。
 const ERROR_BROKEN_PIPE: u32 = 109;
@@ -283,7 +283,8 @@ fn connect_pipe(h: HANDLE) -> bool {
     if ok != 0 {
         return true;
     }
-    // ERROR_PIPE_CONNECTED（230）= 客户端在 CreateNamedPipe 与 ConnectNamedPipe 之间已连上 → 视为成功。
+    // ERROR_PIPE_CONNECTED = client connected between CreateNamedPipe and ConnectNamedPipe.
+    // Import the SDK constant: this is a connected pipe, not an accept failure.
     let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
     err == ERROR_PIPE_CONNECTED
 }
@@ -617,30 +618,46 @@ extern "system" fn ctrl_handler(
     _evt_data: *mut std::ffi::c_void,
     _ctx: *mut std::ffi::c_void,
 ) -> u32 {
-    match ctrl {
-        SERVICE_CONTROL_STOP | windows_sys::Win32::System::Services::SERVICE_CONTROL_SHUTDOWN => {
-            if let Some(helper) = SERVICE_HELPER.get() {
-                if let Err(error) = helper.begin_shutdown() {
-                    log::error!("service admission fence remains unknown: {error}");
-                }
-            } else {
+    handle_control(
+        ctrl,
+        || {
+            let Some(helper) = SERVICE_HELPER.get() else {
                 log::error!("service shutdown rejected: helper custody not registered");
-                return 1;
+                return false;
+            };
+            if let Err(error) = helper.begin_shutdown() {
+                log::error!("service admission fence remains unknown: {error}");
             }
+            // Existing custody is retained while the service drain retries.
+            true
+        },
+        || {
             STOP_REQUESTED.store(true, Ordering::SeqCst);
-            // 诚实上报中间态：此前从不上报 STOP_PENDING，SCM 记录仍是 RUNNING，`sc stop` 直接
-            // 返回成功而进程还在跑 —— 比「卡在 STOP_PENDING」更静默。
             let h = STATUS_HANDLE.load(Ordering::SeqCst);
             if h != 0 {
                 let _ = set_status(h as SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, 0);
             }
-            // 🔴 **只置标志是不够的**：accept 循环此刻阻塞在 `ConnectNamedPipe(h, NULL)`
-            //（同步、无 overlapped），而 `STOP_REQUESTED` 只在**拿到/放弃一个连接之后**才被求值
-            // ⇒ 没有下一个客户端连上来就永远回不到判定点。
+            // A synchronous ConnectNamedPipe needs a self-connection to wake.
             wake_accept_loop();
-            1 // NO_ERROR
+        },
+    )
+}
+
+/// Test the SCM result contract without mutating process-wide service state.
+fn handle_control(
+    ctrl: u32,
+    begin_shutdown: impl FnOnce() -> bool,
+    request_stop: impl FnOnce(),
+) -> u32 {
+    match ctrl {
+        SERVICE_CONTROL_STOP | windows_sys::Win32::System::Services::SERVICE_CONTROL_SHUTDOWN => {
+            if !begin_shutdown() {
+                return ERROR_SERVICE_CANNOT_ACCEPT_CTRL;
+            }
+            request_stop();
+            NO_ERROR
         }
-        _ => 0, // 未声明接受的控制码 → 忽略
+        _ => NO_ERROR, // Preserve the existing handling of other control codes.
     }
 }
 

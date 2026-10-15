@@ -31,12 +31,36 @@ pub fn read_line_trimmed_bounded<R: BufRead>(
     buf: &mut R,
     limit: usize,
 ) -> Result<Option<String>, BoundedLineError> {
+    read_line_bounded(buf, limit, false)
+}
+
+/// Read a bounded, newline-terminated protocol line. A partial line at EOF is an
+/// error, while EOF before any bytes is `None`. The limit counts bytes before LF,
+/// including the optional CR; no caller may dispatch a truncated command.
+pub fn read_line_terminated_bounded<R: BufRead>(
+    buf: &mut R,
+    limit: usize,
+) -> Result<Option<String>, BoundedLineError> {
+    read_line_bounded(buf, limit, true)
+}
+
+fn read_line_bounded<R: BufRead>(
+    buf: &mut R,
+    limit: usize,
+    require_terminator: bool,
+) -> Result<Option<String>, BoundedLineError> {
     let mut line = Vec::with_capacity(limit.min(8 * 1024));
     loop {
         let available = buf.fill_buf().map_err(BoundedLineError::Io)?;
         if available.is_empty() {
             if line.is_empty() {
                 return Ok(None);
+            }
+            if require_terminator {
+                return Err(BoundedLineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "protocol line is missing its newline",
+                )));
             }
             break;
         }
@@ -73,8 +97,8 @@ pub fn read_line_trimmed_bounded<R: BufRead>(
 ///   空行（仅 `\n`）返回 `Some("")`，与 EOF 的 `None` **可区分**（Go 源同样区分：
 ///   EOF 时 `ReadString` 带 err，空行不带）。
 ///
-/// 需要「EOF 与空行都当空串」的调用方（linux `Conn::read_line` 的契约）用
-/// `read_line_trimmed(..).unwrap_or_default()`。
+/// Legacy callers may collapse EOF and an empty line with `unwrap_or_default()`.
+/// Socket protocol entry points must use the bounded readers above instead.
 #[must_use]
 pub fn read_line_trimmed<R: BufRead>(buf: &mut R) -> Option<String> {
     let mut line = String::new();

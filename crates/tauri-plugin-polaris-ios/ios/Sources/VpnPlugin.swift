@@ -261,13 +261,24 @@ final class VpnPlugin: Plugin {
                               args.expectedConfigDigest == nil || values?["configDigest"] as? String == args.expectedConfigDigest
                         else { throw vpnError("CleanupUnknown: Stop addresses a different original start session") }
                         op.identity = values
-                        try self.writeStopIntent(op)
                         let status = manager.connection.status
-                        if status == .invalid || status == .disconnected { self.finishStopped(op); return }
+                        if status == .invalid || status == .disconnected {
+                            // No new native stop was submitted. Preserve the prior durable
+                            // request/report identity rather than poisoning it with this nonce.
+                            let prior = try self.snapshot(manager, includeHostUncertainty: false)
+                            guard vpnRecoverRepeatedStop(evidence: prior,
+                                expectedGeneration: args.expectedExtensionGeneration,
+                                uncertainSession: &self.uncertainSession, uncertainReason: &self.uncertainReason)
+                            else { throw vpnError("CleanupUnknown: The disconnected session has no matching completed Stop") }
+                            self.finish(op, snapshot: prior)
+                            return
+                        }
+                        try self.writeStopIntent(op)
                         self.prepareStop(op)
                     } catch {
-                        self.uncertainSession = (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["sessionID"] as? String
-                        self.uncertainReason = error.localizedDescription
+                        vpnRecordStopFailure(sessionID: (op.manager?.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["sessionID"] as? String,
+                            reason: error.localizedDescription, uncertainSession: &self.uncertainSession,
+                            uncertainReason: &self.uncertainReason)
                         self.finish(op, error: error)
                     }
                 }

@@ -13,7 +13,7 @@
  * R1：`key` 绑编辑目标 id（见导出包装）+ useState 同步初始化。
  */
 
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
@@ -59,14 +59,16 @@ function WarpIcon() {
 /* 字段表 / 端点解析 / 提交前校验住在 `./warp-spec`（零 React，两个客户端共用；见那份文件头注）。
    桌面「多 VPN 兼容」批新加的 `ON_DEMAND_FIELD` 与草稿里的 `onDemand` 初值已随表搬进那份文件。 */
 interface WarpFormProps {
+  instanceId: string;
   editNode?: ServerConfig;
   servers: ServerConfig[];
 }
 
-function WarpForm({ editNode, servers }: WarpFormProps) {
+function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   /** staged-only 差集的两个入参（展示面 effective + 操作面磁盘镜像），判据与节点卡同一函数。 */
@@ -112,7 +114,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('warp.discardTitle'),
@@ -120,7 +122,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
         confirmLabel: t('warp.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -209,6 +211,7 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
       wireguardSettings: settings,
     };
     applyDetour(server, currentDetour);
+    applyOnDemand(server, draft.onDemand);
     const bindInterface = String(draft.bindInterface ?? '').trim();
     if (bindInterface) server.bindInterface = bindInterface;
     else delete server.bindInterface;
@@ -409,12 +412,12 @@ function WarpForm({ editNode, servers }: WarpFormProps) {
   );
 }
 
-export function WarpDialog({ edit }: { edit?: boolean }) {
+export function WarpDialog({ instanceId, edit }: { instanceId: string; edit?: boolean }) {
   // 展示面：编辑基准 + WARP 单例槽判据（含暂存节点更保守：暂存里已有 WARP 时不再发远端注册）。
   const servers = useEffectiveServers();
   const editNode = edit ? findWarpNode(servers) : undefined;
   // R1：key 绑「edit + 目标节点 id」—— 注册态↔编辑态切换重挂重init。
-  return <WarpForm key={editNode?.id ?? (edit ? 'edit' : 'new')} editNode={editNode} servers={servers} />;
+  return <WarpForm instanceId={instanceId} key={editNode?.id ?? (edit ? 'edit' : 'new')} editNode={editNode} servers={servers} />;
 }
 
 export default WarpDialog;

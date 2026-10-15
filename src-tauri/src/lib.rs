@@ -1126,6 +1126,7 @@ pub fn run() {
             config_get,
             config_save,
             config_patch,
+            config_set_takeover,
             config_mutate_entities,
             config_classify_staged,
             config_set_staged_pending,

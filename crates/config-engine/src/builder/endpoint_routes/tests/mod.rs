@@ -890,3 +890,16 @@ fn selector_fallback_tracks_tailcat_emit_check() {
         "region 与 servers 同时设的 Tailcat 会被剔除 → 兜底可能触发"
     );
 }
+
+#[test]
+fn engaged_route_union_does_not_reapply_an_empty_engagement_context() {
+    let mut node = wg_server("wg", &["10.20.0.0/16"], Some(false));
+    node.wireguard_settings.as_mut().unwrap().always_route_subnets = Some(false);
+    let observed = ObservedTailnetAddresses::new();
+    let expected = vec!["10.20.0.0/16".to_string()];
+    assert_eq!(engaged_mesh_forced_route_cidrs(&[node.clone()], Some("wg"), &BTreeSet::new(), &observed), expected);
+    assert_eq!(engaged_mesh_forced_route_cidrs(&[node.clone()], None, &BTreeSet::from(["wg".into()]), &observed), expected);
+    assert!(engaged_mesh_forced_route_cidrs(&[node.clone()], None, &BTreeSet::new(), &observed).is_empty());
+    node.wireguard_settings.as_mut().unwrap().always_route_subnets = Some(true);
+    assert_eq!(engaged_mesh_forced_route_cidrs(&[node], None, &BTreeSet::new(), &observed), expected);
+}

@@ -113,6 +113,9 @@ pub(crate) struct ReadContext<'a> {
     pub(crate) main_generation: Option<u64>,
     /// 当前配置里逐节点的参数指纹。
     pub(crate) fingerprints: &'a BTreeMap<String, String>,
+    /// Desired main-core connection identities, separate from subscription IDs.
+    /// Candidate receipts without a matching identity are never eligible.
+    pub(crate) main_connections: &'a BTreeMap<String, String>,
     /// 当前网络代次；未知时为 `None`。
     pub(crate) network_epoch: Option<u64>,
     /// 当前测速 URL 的摘要。
@@ -252,7 +255,10 @@ impl MeasurementLedger {
         identity: ResultIdentity,
         recorded_mono: u64,
     ) -> bool {
-        self.record_connection_at(node_id, measured, identity, None, recorded_mono)
+        // Legacy unit fixtures use one synthetic token for both identities.
+        // Production always supplies the actual connection digest explicitly.
+        let connection_digest = identity.node_fingerprint.clone();
+        self.record_connection_at(node_id, measured, identity, connection_digest, recorded_mono)
     }
 
     pub(crate) fn record_connection_at(
@@ -499,6 +505,13 @@ fn classify(
     }
     if let Some(stale) = ledger_stale(entry, node_id, context) {
         return Err(Exclusion::Stale(stale));
+    }
+    if entry.connection_digest.as_ref().is_none_or(|measured| {
+        context.main_connections.get(node_id) != Some(measured)
+    }) {
+        return Err(Exclusion::Stale(LedgerStale::Identity(
+            StaleReason::NodeFingerprint,
+        )));
     }
     let current = CurrentState {
         main_generation: context.main_generation,

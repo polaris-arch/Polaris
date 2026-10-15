@@ -32,6 +32,7 @@ export function backupErrorText(
     case 'readFailed': return t('backupImport.error.readFailed');
     case 'invalidFormat': return t('backupImport.error.invalidFormat');
     case 'invalidArgs': return t('backupImport.error.invalidArgs');
+    case 'sharedDependencyConflict': return t('backupImport.error.sharedDependencyConflict');
     case 'saveFailed': return t('backupImport.error.saveFailed');
     case 'meshRoutingRequiresTrustedRestore': return t('backupImport.error.meshRoutingRequiresTrustedRestore');
     case 'meshRoutingInvalidPolicy': return t('backupImport.error.meshRoutingInvalidPolicy');

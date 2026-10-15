@@ -41,17 +41,68 @@ fn put_u16(out: &mut [u8], off: usize, v: u16) {
 /// （上游 `skipName` 的 `guard` 同义）。
 fn skip_name(buf: &[u8], offset: usize) -> Option<usize> {
     let mut off = offset;
+    let mut end = None;
     for _ in 0..=buf.len() {
         let len = *buf.get(off)?;
         if len == 0 {
-            return Some(off + 1); // root，名字结束
+            return Some(end.unwrap_or(off + 1));
         }
         if len & 0xc0 == 0xc0 {
-            return Some(off + 2); // 压缩指针占 2 字节，名字到此结束
+            let target = (((len & 0x3f) as usize) << 8) | *buf.get(off + 1)? as usize;
+            // Compression points at a prior name; reject forward/self pointers and cycles.
+            if target >= off {
+                return None;
+            }
+            end.get_or_insert(off + 2);
+            off = target;
+        } else {
+            if len & 0xc0 != 0 {
+                return None;
+            }
+            off = off.checked_add(1 + len as usize)?;
+            if off >= buf.len() {
+                return None;
+            }
         }
-        off += 1 + len as usize;
     }
     None
+}
+
+/// One bounded RR walk for both classification and decoy extraction. Validate the entire
+/// message before either caller can use an early answer; a good first RR cannot mask a
+/// truncated later answer/authority/additional record. Unknown types (including CNAME)
+/// retain their wire bytes and only require a complete RDATA span.
+fn visit_answer_records(
+    resp: &[u8],
+    mut visit: impl FnMut(u16, u16, &[u8]),
+) -> Option<()> {
+    let qd = u16_at(resp, 4)?;
+    let an = u16_at(resp, 6)?;
+    let ns = u16_at(resp, 8)?;
+    let ar = u16_at(resp, 10)?;
+    let mut off = 12usize;
+    for _ in 0..qd {
+        off = skip_name(resp, off)?.checked_add(4)?;
+        resp.get(..off)?;
+    }
+    for index in 0..usize::from(an) + usize::from(ns) + usize::from(ar) {
+        off = skip_name(resp, off)?;
+        let rtype = u16_at(resp, off)?;
+        let klass = u16_at(resp, off + 2)?;
+        let rdlength = usize::from(u16_at(resp, off + 8)?);
+        let start = off.checked_add(10)?;
+        off = start.checked_add(rdlength)?;
+        let rdata = resp.get(start..off)?;
+        if klass == CLASS_IN
+            && ((rtype == TYPE_A && rdlength != 4) || (rtype == TYPE_AAAA && rdlength != 16))
+        {
+            return None;
+        }
+        if index < usize::from(an) {
+            visit(rtype, klass, rdata);
+        }
+    }
+    Some(())
 }
 
 /// DNS query 的首个 question。上游 `DnsQuestion`。
@@ -137,35 +188,18 @@ fn classify_inner(resp: &[u8], qtype: u16) -> Option<DnsResponseClass> {
         return Some(DnsResponseClass::Fail);
     }
     let rcode = flags & 0x000f;
-    if rcode == RCODE_NXDOMAIN {
-        return Some(DnsResponseClass::Empty);
+    if rcode != RCODE_NOERROR && rcode != RCODE_NXDOMAIN {
+        return Some(DnsResponseClass::Fail);
     }
-    if rcode != RCODE_NOERROR {
-        return Some(DnsResponseClass::Fail); // SERVFAIL/REFUSED/…
-    }
-    let qd = u16_at(resp, 4)?;
-    let an = u16_at(resp, 6)?;
-    let mut off = 12usize;
-    for _ in 0..qd {
-        off = skip_name(resp, off)? + 4;
-    }
-    for _ in 0..an {
-        off = skip_name(resp, off)?;
-        if off + 10 > resp.len() {
-            return Some(DnsResponseClass::Fail);
-        }
-        let rtype = u16_at(resp, off)?;
-        let klass = u16_at(resp, off + 2)?;
-        let rdlength = u16_at(resp, off + 8)?;
-        if rtype == qtype && klass == CLASS_IN {
-            return Some(DnsResponseClass::Hit);
-        }
-        off = off + 10 + rdlength as usize;
-        if off > resp.len() {
-            return Some(DnsResponseClass::Fail);
-        }
-    }
-    Some(DnsResponseClass::Empty) // NOERROR 无该 qtype 记录（NODATA）
+    let mut hit = false;
+    visit_answer_records(resp, |rtype, klass, _| {
+        hit |= rtype == qtype && klass == CLASS_IN;
+    })?;
+    Some(if rcode == RCODE_NXDOMAIN || !hit {
+        DnsResponseClass::Empty
+    } else {
+        DnsResponseClass::Hit
+    })
 }
 
 /// 从 DNS 响应抽出全部 A(4B)/AAAA(16B) 记录的 rdata **原始网络字节**（供 decoy 段匹配）。
@@ -176,38 +210,16 @@ pub fn extract_answer_ip_bytes(resp: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn extract_inner(resp: &[u8]) -> Option<Vec<Vec<u8>>> {
-    if resp.len() < 12 {
-        return Some(Vec::new());
+    let flags = u16_at(resp, 2)?;
+    if flags & 0x8000 == 0 || flags & 0x0200 != 0 || flags & 0x000f != RCODE_NOERROR {
+        return None;
     }
-    if u16_at(resp, 2)? & 0x000f != 0 {
-        return Some(Vec::new()); // RCODE != 0
-    }
-    let qd = u16_at(resp, 4)?;
-    let an = u16_at(resp, 6)?;
-    let mut off = 12usize;
-    for _ in 0..qd {
-        off = skip_name(resp, off)? + 4;
-    }
-    let mut ips: Vec<Vec<u8>> = Vec::new();
-    for _ in 0..an {
-        off = skip_name(resp, off)?;
-        if off + 10 > resp.len() {
-            return None;
+    let mut ips = Vec::new();
+    visit_answer_records(resp, |rtype, klass, rdata| {
+        if klass == CLASS_IN && (rtype == TYPE_A || rtype == TYPE_AAAA) {
+            ips.push(rdata.to_vec());
         }
-        let rtype = u16_at(resp, off)?;
-        let klass = u16_at(resp, off + 2)?;
-        let rdlength = u16_at(resp, off + 8)? as usize;
-        let rdata = off + 10;
-        if rdata + rdlength > resp.len() {
-            return None;
-        }
-        if klass == CLASS_IN
-            && ((rtype == TYPE_A && rdlength == 4) || (rtype == TYPE_AAAA && rdlength == 16))
-        {
-            ips.push(resp[rdata..rdata + rdlength].to_vec());
-        }
-        off = rdata + rdlength;
-    }
+    })?;
     Some(ips)
 }
 

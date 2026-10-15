@@ -3293,3 +3293,10 @@ describe('mobile consequence badges with the real two-action row width', () => {
     });
   }
 });
+
+
+it.each([0, 1e13, 18446744073709551615])('invalid mobile expiry %s cannot interrupt summary rendering', (expire) => {
+  const summary = buildSubSummary({ t: (key) => key, sub: { id: 'invalid-expiry', name: 'Still visible', url: 'https://example.invalid', userInfo: { expire } } as SubscriptionConfig, nodeCount: 1, progress: undefined, config: undefined });
+  expect(summary.name).toBe('Still visible');
+  expect(summary.expiry).toBeUndefined();
+});

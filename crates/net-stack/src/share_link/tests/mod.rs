@@ -1586,3 +1586,60 @@ fn vmess_json_pcs_maps_to_certificate_sha256() {
         Some(PIN_HEX)
     );
 }
+
+#[test]
+fn certificate_pins_roundtrip_through_every_supported_tls_encoder() {
+    let pins = format!("{},{}", "ab".repeat(32), "cd".repeat(32));
+    for protocol in [Protocol::Vless, Protocol::Vmess, Protocol::Trojan,
+        Protocol::Hysteria2, Protocol::Tuic, Protocol::Anytls] {
+        for insecure in [false, true] {
+            let source = ServerConfig {
+                protocol,
+                address: "pin.example.com".into(),
+                port: 443,
+                uuid: Some(U.into()),
+                password: Some("secret".into()),
+                security: Some(SecurityMode::Tls),
+                tls_settings: Some(TlsSettings {
+                    server_name: Some("sni.example.com".into()),
+                    alpn: Some(vec!["h2".into(), "http/1.1".into()]),
+                    fingerprint: Some("chrome".into()),
+                    allow_insecure: Some(insecure),
+                    certificate_sha256: Some(pins.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let encoded = encode_share_url(&source).unwrap();
+            let restored = parse_ok(&encoded);
+            let tls = restored.tls_settings.unwrap();
+            assert_eq!(tls.certificate_sha256.as_deref(), Some(pins.as_str()), "{protocol:?}");
+            assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"), "{protocol:?}");
+            assert_eq!(tls.alpn, source.tls_settings.as_ref().unwrap().alpn, "{protocol:?}");
+            assert_eq!(tls.allow_insecure == Some(true), insecure, "{protocol:?}");
+        }
+    }
+}
+
+#[test]
+fn unsupported_or_invalid_pin_shapes_refuse_export_instead_of_dropping_security() {
+    for protocol in [Protocol::Http, Protocol::Socks, Protocol::Naive, Protocol::Shadowsocks,
+        Protocol::Snell, Protocol::Vless, Protocol::Vmess] {
+        let source = ServerConfig {
+            protocol,
+            tls_settings: Some(TlsSettings {
+                certificate_sha256: Some("ab".repeat(32)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(encode_share_url(&source).is_err(), "{protocol:?}");
+    }
+    let mut source = parse_ok(&format!("vless://{U}@pin.example.com:443?security=tls"));
+    source.tls_settings.as_mut().unwrap().certificate_public_key_sha256 = Some("ab".repeat(32));
+    assert!(encode_share_url(&source).is_err());
+    let tls = source.tls_settings.as_mut().unwrap();
+    tls.certificate_public_key_sha256 = None;
+    tls.certificate_sha256 = Some(format!("{},bad-pin", "ab".repeat(32)));
+    assert!(encode_share_url(&source).is_err());
+}

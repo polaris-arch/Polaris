@@ -11,6 +11,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   computeTestMatch,
+  matchConditionValues,
+  parseConditionValues,
+  formatConditionValues,
   invalidCondValues,
   matchRuleValueOptions,
   offPoolSelectedOptions,
@@ -464,5 +467,22 @@ describe('接线：useLazyPool 的「只拉一次」由 in-flight 标记守，�
     // 那个形态与 in-flight 去重直接冲突：唯一那趟请求的结果被丢掉，而标记又不许再发。
     expect(body, '又出现了 effect 作用域的 alive 变量').not.toMatch(/let alive = true/);
     expect(body, 'alive 不是卸载态 ref').toMatch(/alive\.current = false/);
+  });
+});
+
+
+describe('typed regex draft round trip', () => {
+  it.each(['^\\D+$', '^\\W+$', '^\\S+$'])('preserves uppercase escape %s in entity and draft paths', (expression) => {
+    const input = expression.includes('W') ? '...' : 'a.com';
+    expect(matchConditionValues([{ type: 'domainRegex', values: [expression] }], 'and', input)).toBe('hit');
+    expect(computeTestMatch([{ t: 'domainRegex', v: expression }], 'and', input)).toBe('hit');
+  });
+  it('preserves comma syntax in every regex while retaining ordinary CSV', () => {
+    const expressions = ['^[a,b]\\.example$', '^a{1,3}\\.example$', '^a\\,b$'];
+    const draft = formatConditionValues('domainRegex', expressions);
+    expect(parseConditionValues('domainRegex', draft)).toEqual(expressions);
+    expect(invalidCondValues([{ t: 'domainRegex', v: draft }])).toEqual([]);
+    expect(parseConditionValues('domain', 'a.example, B.example\nc.example')).toEqual(['a.example', 'B.example', 'c.example']);
+    expect(computeTestMatch([{ t: 'domain', v: 'EXAMPLE.COM' }], 'and', 'example.com')).toBe('hit');
   });
 });

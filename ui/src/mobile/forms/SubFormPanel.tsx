@@ -573,6 +573,8 @@ export function SubCreateTaskPanel({
 
   useEffect(() => {
     if (!snapshot?.terminal) return;
+    cancelInFlight.current = false;
+    setCancelling(false);
     const attemptKey =
       snapshot.phase === 'succeeded' ? `${snapshot.revision}:${publishAttempt}` : `${snapshot.revision}`;
     if (handledAttempt.current === attemptKey) return;
@@ -660,7 +662,7 @@ export function SubCreateTaskPanel({
           try {
             const next = await cancel(operationId);
             /* 只有终态 cancelled 帧才关面板（上面那条 effect）；非终态回执 ⇒ 解锁，允许再点。 */
-            if (!next.terminal && hasInstance(instanceId)) {
+            if ((!next.terminal || next.phase === 'failed') && hasInstance(instanceId)) {
               cancelInFlight.current = false;
               setCancelling(false);
             }

@@ -45,7 +45,7 @@ const TRAY_BLUR_DISMISS_JS: &str = r#"
   window.addEventListener('blur', function () {
     try {
       var i = window.__TAURI_INTERNALS__;
-      if (i && typeof i.invoke === 'function') { i.invoke('tray_hide'); }
+      if (i && typeof i.invoke === 'function') { i.invoke('tray_hide', { reason: 'blur' }); }
     } catch (e) {}
   });
 })();
@@ -155,6 +155,14 @@ pub(super) fn log_open_probe(app: &AppHandle, stage: &str, take: bool) {
 /// （Focused(false) / 点图标 toggle / tray_hide / tray_show_main / tray_enter_lightweight / 全局 monitor
 /// handler）都走此函数，保证 monitor 与浮层可见性同生命周期（show 装、任一 hide 拆），不泄漏。
 pub(super) fn hide_overlay(app: &AppHandle) {
+    hide_overlay_with_reason(app, true);
+}
+
+pub(super) fn hide_overlay_on_blur(app: &AppHandle) {
+    hide_overlay_with_reason(app, false);
+}
+
+fn hide_overlay_with_reason(app: &AppHandle, explicit: bool) {
     let should_reclaim = app.get_webview_window(TRAY_LABEL).is_some_and(|w| {
         let was_visible = w.is_visible().unwrap_or(false);
         if was_visible {
@@ -164,15 +172,18 @@ pub(super) fn hide_overlay(app: &AppHandle) {
         }
         was_visible
     });
-    // 冷建阶段的 Focused(false)/DOM blur 属于宿主装配噪声：窗口从未显示，不能据此取消首击请求，
-    // 更不能写 last_hidden 让随后真正的托盘点击落入 300ms 去抖。只有可见→隐藏才是一次菜单 dismiss。
-    if !should_reclaim {
-        return;
-    }
     if let Some(state) = app.try_state::<TrayOverlay>() {
         if let Ok(mut lifecycle) = state.lifecycle.lock() {
-            lifecycle.hide();
+            lifecycle.dismiss(should_reclaim, explicit);
         }
+    }
+    // Only a real visible→hidden transition owns debounce/monitor/reclaim work.
+    // Explicit cancellation above still applies when no window exists yet.
+    if !should_reclaim {
+        if explicit {
+            clear_open_probe(app);
+        }
+        return;
     }
     clear_open_probe(app);
     mark_hidden(app);
@@ -284,7 +295,7 @@ fn build_overlay(app: &AppHandle, generation: u64) -> Option<tauri::WebviewWindo
     // Win 直读注册表真值、Linux 留窗口探测链，均见 lib.rs 的 system_dark_bg。）
     let app_handle = app.clone();
     win.on_window_event(move |event| match event {
-        WindowEvent::Focused(false) => hide_overlay(&app_handle),
+        WindowEvent::Focused(false) => hide_overlay_on_blur(&app_handle),
         // 腿 B 的**跨平台**半边。tao 0.35.3 把 Windows 的 `WM_DPICHANGED` 与 macOS 的
         // `windowDidChangeBackingProperties` 都归一到这一个事件 —— 也就是「混合 DPI 多显示器把窗
         // 拖过去」那一档，而那正是 Windows 上最常见的形态（主屏 150% + 副屏 100%）。

@@ -75,6 +75,21 @@ pub async fn app_uninstall_all(
     app: AppHandle,
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<UninstallReport>, ()> {
+    // Full removal destroys the recovery markers, unlike helper-only removal.
+    // Keep the Ready guard through the whole destructive chain so another exit
+    // cannot commit while helper scripts still need this configuration tree.
+    #[cfg(desktop)]
+    let _exit_ready = match crate::exit_lifecycle::prepare_desktop_exit(&app).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            log::error!("完全卸载前本地内核或系统代理恢复未确认: {error}");
+            return Ok(ApiResponse::err_with_code(
+                "后台连接或系统代理恢复尚未确认；本次未删除配置，请重启应用后重试卸载",
+                "UNINSTALL_RESTART_REQUIRED",
+            ));
+        }
+    };
+    let full_prepared = cfg!(desktop);
     let helper = state.helper.clone();
     let config_dir = state.config().dir().to_path_buf();
     // `app_cache_dir()/updates` = 应用更新包的唯一落点（见 `update_download`）。它在**配置目录之外**，
@@ -106,7 +121,21 @@ pub async fn app_uninstall_all(
                 exe: std::env::current_exe().ok(),
                 appimage: std::env::var_os("APPIMAGE").map(PathBuf::from),
             };
-            uninstall::run_uninstall(&ops, stop)
+            let mut report = uninstall::run_uninstall(&ops, stop);
+            if full_prepared {
+                if let Some(step) = report
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.step == uninstall::UninstallStep::StopCore)
+                {
+                    if matches!(step.outcome, uninstall::StepOutcome::Skipped { .. }) {
+                        step.outcome = uninstall::StepOutcome::done(
+                            "已确认本地内核退场与系统代理恢复，启动入口已关闭",
+                        );
+                    }
+                }
+            }
+            report
         })
         .await
     })

@@ -999,8 +999,11 @@ fn apply_shadow_tls_postprocess(
             .extra
             .remove("bind_interface")
             .and_then(|value| value.as_str().map(str::to_owned));
-        let stls_outbound = build_shadow_tls_outbound(srv, bind_interface.as_deref())
+        let mut stls_outbound = build_shadow_tls_outbound(srv, bind_interface.as_deref())
             .expect("shadow_tls_settings was checked above");
+        // The wrapper owns the TCP dial, including the already-resolved proxy chain.
+        // Move it rather than resolving again; existing cycle/dangling pruning stays authoritative.
+        stls_outbound.detour = ob.detour.take();
         let stls_tag = stls_outbound.tag.clone();
         stls_outbounds.push(stls_outbound);
 

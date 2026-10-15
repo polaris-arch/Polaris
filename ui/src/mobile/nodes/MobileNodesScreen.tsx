@@ -161,7 +161,16 @@ export function MobileNodesScreen(): ReactElement {
   const [tab, setTab] = useState<string | null>(null);
   /* 冷启动落点与桌面同一条判据（`initialNodesTab`），不另猜一个。`groups` 还没水合时它返回
      `null` —— 那时定位没有信息量，落成空串即「一个都不选中」，等 groups 到齐再自然命中。 */
-  const activeTab = tab ?? initialNodesTab(groups, selectedServerId) ?? '';
+  const activeTab = tab !== null && groups.some((group) => group.id === tab)
+    ? tab
+    : tab !== null
+      ? groups[0]?.id ?? ''
+      : initialNodesTab(groups, selectedServerId) ?? '';
+  useEffect(() => {
+    if (tab !== null && groups.length > 0 && !groups.some((group) => group.id === tab)) {
+      setTab(groups[0].id);
+    }
+  }, [groups, tab]);
   const activeGroup = groups.find((g) => g.id === activeTab);
   const activeSub = subscriptions.find((s) => s.id === activeTab);
 
@@ -481,9 +490,16 @@ export function MobileNodesScreen(): ReactElement {
   }, []);
 
   const selectAll = useCallback(() => {
-    const all = selectedIds.size === visibleServers.length && visibleServers.length > 0;
-    setSelectedIds(all ? new Set() : new Set(visibleServers.map((x) => x.id)));
-  }, [visibleServers, selectedIds.size]);
+    const all = visibleServers.length > 0 && visibleServers.every((server) => selectedIds.has(server.id));
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      for (const server of visibleServers) {
+        if (all) next.delete(server.id);
+        else next.add(server.id);
+      }
+      return next;
+    });
+  }, [visibleServers, selectedIds]);
 
   /* 「全部测速」的射程是**全部**节点，不是当前分组里可见的那批 —— 拿可见数去禁用它，
      会在「当前 tab 恰好一个可测节点都没有」时把一个本来有目标的动作锁死。 */
@@ -800,7 +816,7 @@ export function MobileNodesScreen(): ReactElement {
         setBatchMode(true);
         setSelectedIds(new Set());
       }}
-      selectedIds={selectedIds}
+      selectedIds={new Set(visibleServers.filter((server) => selectedIds.has(server.id)).map((server) => server.id))}
       onToggleSelect={toggleSelect}
       onSelectAll={selectAll}
       onBatchCopyLinks={() =>

@@ -35,6 +35,36 @@ import io.nekohasekai.libbox.OutboundGroupIterator
 import io.nekohasekai.libbox.StatusMessage
 import io.nekohasekai.libbox.StringIterator
 
+/** Serializes callback publication with invalidation, like StatsBridge's service epoch. */
+internal class ServiceNotificationEpoch {
+    private var generation = 0L
+    private var active = false
+
+    @Synchronized fun begin(): Long {
+        generation += 1
+        active = true
+        return generation
+    }
+
+    @Synchronized fun invalidate(): Long {
+        generation += 1
+        active = false
+        return generation
+    }
+
+    @Synchronized fun runIfCurrent(token: Long, action: () -> Unit): Boolean {
+        if (!active || generation != token) return false
+        action()
+        return true
+    }
+
+    @Synchronized fun runIfGeneration(token: Long, action: () -> Unit): Boolean {
+        if (generation != token) return false
+        action()
+        return true
+    }
+}
+
 /**
  * 前台服务通知。
  *
@@ -52,20 +82,23 @@ import io.nekohasekai.libbox.StringIterator
  */
 class ServiceNotification(private val service: Service) {
     private val handler = Handler(Looper.getMainLooper())
+    private val epoch = ServiceNotificationEpoch()
     private var commandClient: CommandClient? = null
     private var screenReceiverRegistered = false
 
-    private var state: ServiceState = ServiceState.Starting
+    @Volatile private var state: ServiceState = ServiceState.Starting
     private var profileName: String = ""
     private var trafficLine: String? = null
 
     private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
+        override fun onReceive(context: Context, intent: Intent) = synchronized(epoch) {
+            if (state != ServiceState.Started) return@synchronized
             // 熄屏时没人看得到速率，却每秒唤醒一次进程去刷它。上游同款处置。
             when (intent.action) {
                 Intent.ACTION_SCREEN_ON -> connectStatusClient()
                 Intent.ACTION_SCREEN_OFF -> disconnectStatusClient()
             }
+            Unit
         }
     }
 
@@ -101,7 +134,10 @@ class ServiceNotification(private val service: Service) {
     }
 
     /** 首次调用会把服务提到前台；之后每次只是更新同一条通知。 */
-    fun show(state: ServiceState, profileName: String) {
+    fun show(state: ServiceState, profileName: String) = synchronized(epoch) {
+        disconnectStatusClient()
+        epoch.begin()
+        trafficLine = null
         this.state = state
         this.profileName = profileName
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -118,20 +154,33 @@ class ServiceNotification(private val service: Service) {
         service.startForeground(NOTIFICATION_ID, build())
     }
 
-    fun onStarted() {
+    fun onStarted() = synchronized(epoch) {
+        if (state != ServiceState.Starting) return@synchronized
         state = ServiceState.Started
         PolarisApplication.notification.notify(NOTIFICATION_ID, build())
         registerScreenReceiver()
         connectStatusClient()
     }
 
-    fun close() {
-        disconnectStatusClient()
-        if (screenReceiverRegistered) {
-            runCatching { service.unregisterReceiver(screenReceiver) }
-            screenReceiverRegistered = false
+    /** Stop invalidates immediately, before BoxService queues foreground removal. */
+    fun invalidateForStop(): Long = synchronized(epoch) {
+        state = ServiceState.Stopping
+        trafficLine = null
+        val token = epoch.invalidate()
+        handler.removeCallbacksAndMessages(null)
+        token
+    }
+
+    fun close(expectedEpoch: Long) {
+        epoch.runIfGeneration(expectedEpoch) {
+            state = ServiceState.Stopped
+            disconnectStatusClient()
+            if (screenReceiverRegistered) {
+                runCatching { service.unregisterReceiver(screenReceiver) }
+                screenReceiverRegistered = false
+            }
+            ServiceCompat.stopForeground(service, ServiceCompat.STOP_FOREGROUND_REMOVE)
         }
-        ServiceCompat.stopForeground(service, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }
 
     private fun build(): android.app.Notification {
@@ -161,40 +210,47 @@ class ServiceNotification(private val service: Service) {
         screenReceiverRegistered = true
     }
 
-    @Synchronized
-    private fun connectStatusClient() {
-        if (commandClient != null) return
+    private fun connectStatusClient(): Unit = synchronized(epoch) {
+        if (state != ServiceState.Started || commandClient != null) return@synchronized
+        val token = epoch.begin()
         val options = CommandClientOptions().apply {
             addCommand(Libbox.CommandStatus)
             statusInterval = STATUS_INTERVAL_NANOS
         }
-        val client = Libbox.newCommandClient(StatusHandler(), options)
+        val client = Libbox.newCommandClient(StatusHandler(token), options)
         commandClient = client
-        // connect() 会去连内核的 unix socket，起服务那一刻它还没 listen，所以只在 Started 之后调。
+        // Each client captures its own epoch, including screen-off/reconnect cycles.
         runCatching { client.connect() }.onFailure { Log.w(TAG, "订阅状态失败", it) }
+        Unit
     }
 
-    @Synchronized
     private fun disconnectStatusClient() {
-        val client = commandClient ?: return
-        commandClient = null
-        runCatching { client.disconnect() }
+        val client = synchronized(epoch) {
+            epoch.invalidate()
+            handler.removeCallbacksAndMessages(null)
+            trafficLine = null
+            commandClient.also { commandClient = null }
+        }
+        runCatching { client?.disconnect() }
     }
 
-    private inner class StatusHandler : CommandClientHandler {
+    private inner class StatusHandler(private val token: Long) : CommandClientHandler {
         override fun connected() {}
 
         override fun disconnected(message: String?) {
-            trafficLine = null
+            handler.post {
+                epoch.runIfCurrent(token) { trafficLine = null }
+            }
         }
 
         override fun writeStatus(message: StatusMessage) {
             val line = "↑ ${Libbox.formatBytes(message.uplink)}/s  ↓ ${Libbox.formatBytes(message.downlink)}/s"
-            // 回调在 gomobile 自己的线程上；通知只能在有 Looper 的线程刷，切回主线程。
             handler.post {
-                trafficLine = line
-                if (state == ServiceState.Started) {
-                    PolarisApplication.notification.notify(NOTIFICATION_ID, build())
+                epoch.runIfCurrent(token) {
+                    if (state == ServiceState.Started) {
+                        trafficLine = line
+                        PolarisApplication.notification.notify(NOTIFICATION_ID, build())
+                    }
                 }
             }
         }

@@ -329,7 +329,7 @@ fn test_runtime() -> (Arc<ProxyRuntime>, TestDir) {
 
 /// 同 [`test_runtime`]，但收口器换成 [`RecordingClearer`] mock，额外返回其调用计数句柄——
 /// 用于断言「失败腿是否真调到了 ensure_cleared」。
-fn test_runtime_recording() -> (
+pub(crate) fn test_runtime_recording() -> (
     Arc<ProxyRuntime>,
     TestDir,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -729,6 +729,7 @@ type ExitBlockedMarks = Arc<Mutex<Vec<String>>>;
 struct RecordingErrorEmitter {
     events: ErrorEvents,
     error_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    coex_hook: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     invalid_frames: InvalidNodeFrames,
     residual: ResidualEvents,
     ts_status: TsStatusEvents,
@@ -839,6 +840,11 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
     }
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent) {
         self.lifecycle.lock().unwrap().push(event.clone());
+    }
+    fn emit_coex_state(&self, state: Value) {
+        if let Some(hook) = &self.coex_hook {
+            hook(state);
+        }
     }
     fn emit_network_profile_match_changed(&self) {
         self.network_match_changed.fetch_add(1, Ordering::SeqCst);
@@ -1177,4 +1183,96 @@ fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
         ),
     );
     (binary, counter)
+}
+
+/// Real DNS controller + durable temp marker, injected only at the OS-operation boundary.
+/// Used by proxy and the actual desktop ExitCleanupState preparation regressions.
+pub(crate) struct DnsRecoveryFixture {
+    pub fail_restore: Arc<AtomicBool>,
+    pub marker: PathBuf,
+    pub original_marker: Vec<u8>,
+    pub writes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(crate) fn install_dns_recovery_fixture(rt: &ProxyRuntime) -> DnsRecoveryFixture {
+    use polaris_system_integration::dns_ops::{DnsMarker, SystemDnsController, SystemDnsOps};
+    struct DnsOps {
+        fail: Arc<AtomicBool>,
+        state: Mutex<Vec<String>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SystemDnsOps for DnsOps {
+        fn takeover_supported(&self) -> bool {
+            true
+        }
+        fn list_targets(
+            &self,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(vec!["fixture-service".into()])
+        }
+        fn read_dns(
+            &self,
+            _: &str,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(self.state.lock().unwrap().clone())
+        }
+        fn read_effective_resolvers(
+            &self,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(self.state.lock().unwrap().clone())
+        }
+        fn apply_dns(
+            &self,
+            _: &str,
+            ips: &[String],
+        ) -> Result<(), polaris_system_integration::error::SystemIntegrationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) && ips == ["192.0.2.53".to_owned()] {
+                return Err(
+                    polaris_system_integration::error::SystemIntegrationError::dns(
+                        "injected restore failure",
+                    ),
+                );
+            }
+            *self.state.lock().unwrap() = ips.to_vec();
+            Ok(())
+        }
+    }
+    let fail_restore = Arc::new(AtomicBool::new(true));
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let marker = rt.config.dir().join("system-dns.marker.json");
+    let mut controller = SystemDnsController::new(
+        DnsOps {
+            fail: Arc::clone(&fail_restore),
+            state: Mutex::new(vec!["192.0.2.53".into()]),
+            writes: Arc::clone(&writes),
+        },
+        DnsMarker::new(
+            polaris_system_integration::StdMarkerFs,
+            marker.to_string_lossy().into_owned(),
+        ),
+    );
+    controller.set_dns();
+    let original_marker = std::fs::read(&marker).unwrap();
+    let controller = Arc::new(Mutex::new(controller));
+    rt.set_test_dns_restore(Arc::new(move || {
+        let mut controller = controller
+            .lock()
+            .map_err(|_| "fixture DNS controller poisoned")?;
+        controller.restore_dns();
+        if controller.has_marker() {
+            Err("DNS restoration retained its original marker".into())
+        } else {
+            Ok(())
+        }
+    }));
+    DnsRecoveryFixture {
+        fail_restore,
+        marker,
+        original_marker,
+        writes,
+    }
 }

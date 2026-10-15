@@ -16,6 +16,7 @@ fn poisoned_scheduler_lock_recovers_and_running_guard_still_resets() {
     lock_inner(&scheduler.inner).is_running = true;
     drop(RunningGuard {
         inner: Arc::clone(&scheduler.inner),
+        armed: true,
     });
     assert!(!lock_inner(&scheduler.inner).is_running);
 }
@@ -331,4 +332,164 @@ fn every_autoupdate_trigger_waits_for_proxy_network_settle_before_http() {
         wait < load && load < request,
         "稳定门必须先于选订阅与真 HTTP 请求"
     );
+}
+
+
+#[test]
+fn ready_event_during_active_round_is_coalesced_and_drained_without_overlapping_runner() {
+    let scheduler = SubscriptionScheduler::new();
+    lock_inner(&scheduler.inner).is_running = true;
+    let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+    {
+        let mut inner = lock_inner(&scheduler.inner);
+        // A ready event can precede selection setting pending_proxy_catchup.
+        assert!(!inner.request_proxy_ready());
+        assert!(!inner.request_proxy_ready());
+        inner.pending_proxy_catchup = true;
+    }
+    assert!(guard.finish_or_repeat());
+    assert!(lock_inner(&scheduler.inner).is_running, "catch-up retains the same gate");
+    assert!(!lock_inner(&scheduler.inner).proxy_ready_requested, "duplicate wakes coalesce");
+    lock_inner(&scheduler.inner).pending_proxy_catchup = false;
+    assert!(!guard.finish_or_repeat());
+    assert!(!lock_inner(&scheduler.inner).is_running);
+    // A successor may acquire before this old guard is dropped; Drop must not unlock it.
+    lock_inner(&scheduler.inner).is_running = true;
+    drop(guard);
+    assert!(lock_inner(&scheduler.inner).is_running);
+}
+
+#[test]
+fn ready_event_after_release_starts_catchup_only_when_pending() {
+    let scheduler = SubscriptionScheduler::new();
+    let mut inner = lock_inner(&scheduler.inner);
+    assert!(!inner.request_proxy_ready());
+    inner.pending_proxy_catchup = true;
+    assert!(inner.request_proxy_ready());
+    assert!(inner.proxy_ready_requested);
+}
+
+#[test]
+fn catchup_reselects_live_proxy_config_and_backoff_after_a_direct_round() {
+    let now = 100_000_000;
+    let mut cfg = base_cfg(json!([
+        {"id":"direct", "autoUpdate":true, "updateViaProxy":false},
+        {"id":"proxied", "autoUpdate":true, "updateViaProxy":true}
+    ]));
+    cfg["subscriptionProxyPolicy"] = json!("follow");
+    let mut backoff = BackoffTracker::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
+    let first = select_due(&cfg, now, &backoff, false, true);
+    assert_eq!(first.due_ids, ["direct"]);
+    assert!(first.pending_proxy_catchup);
+    backoff.record_failure("direct", now);
+    let catchup = select_due(&cfg, now + 1, &backoff, true, true);
+    assert_eq!(catchup.due_ids, ["proxied"]);
+    assert!(!catchup.pending_proxy_catchup);
+    cfg["subscriptions"][1]["autoUpdate"] = json!(false);
+    assert!(select_due(&cfg, now + 1, &backoff, true, true).due_ids.is_empty());
+    cfg["autoUpdateSubscriptionOnStart"] = json!(false);
+    assert_eq!(select_due(&cfg, now + 1, &backoff, true, true), DueSelection::default());
+}
+
+#[test]
+fn production_round_drains_wakes_and_reloads_live_selection_under_one_gate() {
+    let code = crate_code("runtime/subscription_scheduler.rs");
+    let body = crate::commands::guard_scan::impl_method_body(
+        &code,
+        "    async fn run_due_updates(self: &Arc<Self>, app: &AppHandle, ignore_staleness: bool) {",
+    );
+    let loop_at = body.find("loop {").unwrap();
+    assert!(loop_at < body.find("state.config().load_full()").unwrap());
+    assert!(loop_at < body.find("state.proxy().status().running").unwrap());
+    assert!(body.contains("guard.finish_or_repeat()"));
+    assert!(body.contains("inner.record_selection(&sel, ignore_staleness)"));
+    assert_eq!(body.matches("inner.is_running = true").count(), 1);
+}
+
+
+#[test]
+fn periodic_selection_cannot_erase_a_queued_catchup_including_manual_only_interval() {
+    let now = rfc3339_to_epoch_ms("2024-01-01T12:00:00Z").unwrap();
+    for interval in [0, 12] {
+        for ready_before_selection in [false, true] {
+            let scheduler = SubscriptionScheduler::new();
+            let mut config = base_cfg(json!([{
+                "id":"proxied", "autoUpdate":true, "updateViaProxy":true,
+                "lastUpdated":"2024-01-01T11:00:00Z"
+            }]));
+            config["subscriptionUpdateIntervalHours"] = json!(interval);
+            config["subscriptionProxyPolicy"] = json!("follow");
+            {
+                let mut inner = lock_inner(&scheduler.inner);
+                // Startup owes a catch-up: the one-hour-old item clears the ten-minute
+                // startup floor, but the proxy is still down.
+                let startup = select_due(&config, now, &inner.backoff, false, true);
+                assert!(startup.pending_proxy_catchup);
+                assert!(startup.due_ids.is_empty());
+                inner.record_selection(&startup, true);
+                inner.is_running = true;
+                if ready_before_selection {
+                    assert!(!inner.request_proxy_ready());
+                }
+                // The timer takes the gate while the proxy becomes ready. A periodic
+                // selection has no due work under either 12h or manual-only interval.
+                let periodic = select_due(&config, now, &inner.backoff, true, false);
+                assert_eq!(periodic, DueSelection::default());
+                inner.record_selection(&periodic, false);
+                assert!(inner.pending_proxy_catchup, "periodic selection erased startup intent");
+                if !ready_before_selection {
+                    assert!(!inner.request_proxy_ready());
+                }
+            }
+            let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+            assert!(guard.finish_or_repeat());
+            {
+                let mut inner = lock_inner(&scheduler.inner);
+                assert!(inner.is_running, "catch-up must retain the same runner gate");
+                assert!(!inner.proxy_ready_requested, "one pass consumes duplicate ready events");
+                let catchup = select_due(&config, now, &inner.backoff, true, true);
+                assert_eq!(catchup.due_ids, ["proxied"]);
+                inner.record_selection(&catchup, true);
+                assert!(!inner.pending_proxy_catchup);
+            }
+            assert!(!guard.finish_or_repeat());
+            assert!(!lock_inner(&scheduler.inner).is_running);
+        }
+    }
+}
+
+#[test]
+fn idle_ready_event_still_sees_pending_intent_after_an_empty_periodic_pass() {
+    let scheduler = SubscriptionScheduler::new();
+    let config = base_cfg(json!([{
+        "id":"proxied", "autoUpdate":true, "updateViaProxy":true,
+        "lastUpdated":"2024-01-01T11:00:00Z"
+    }]));
+    let now = rfc3339_to_epoch_ms("2024-01-01T12:00:00Z").unwrap();
+    let mut inner = lock_inner(&scheduler.inner);
+    let startup = select_due(&config, now, &inner.backoff, false, true);
+    inner.record_selection(&startup, true);
+    let periodic = select_due(&config, now, &inner.backoff, true, false);
+    assert_eq!(periodic, DueSelection::default());
+    inner.record_selection(&periodic, false);
+    assert!(inner.request_proxy_ready(), "idle ready must schedule the still-owed catch-up");
+}
+
+#[test]
+fn recorded_selection_cannot_consume_an_independent_ready_event() {
+    let scheduler = SubscriptionScheduler::new();
+    {
+        let mut inner = lock_inner(&scheduler.inner);
+        inner.is_running = true;
+        assert!(!inner.request_proxy_ready());
+        // Even a startup-mode selection may clear pending after the event. It has not
+        // consumed the independently queued wake, which still gets one same-gate pass.
+        let selection = select_due(&base_cfg(json!([])), 1000, &inner.backoff, true, true);
+        inner.record_selection(&selection, true);
+        assert!(!inner.pending_proxy_catchup);
+    }
+    let mut guard = RunningGuard { inner: Arc::clone(&scheduler.inner), armed: true };
+    assert!(guard.finish_or_repeat());
+    assert!(lock_inner(&scheduler.inner).is_running);
+    assert!(!guard.finish_or_repeat(), "a consumed wake must not create an unbounded loop");
 }

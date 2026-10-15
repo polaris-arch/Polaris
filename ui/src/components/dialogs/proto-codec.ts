@@ -85,6 +85,52 @@ function str(v: FormValue): string | undefined {
   return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined;
 }
 
+/** Opaque credentials: only the empty string means absent; whitespace is significant. */
+function credential(v: FormValue): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+/** Paired argument text codec. Quotes/backslashes describe argv only; no shell is run. */
+function torArgsToText(args: readonly string[] | undefined): string {
+  return (args ?? []).map((arg) =>
+    /^[A-Za-z0-9_./:=+,-]+$/.test(arg) ? arg : "'" + arg.replaceAll("'", "'\\''") + "'",
+  ).join(' ');
+}
+
+function textToTorArgs(value: FormValue): string[] | undefined {
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const args: string[] = [];
+  let arg = '';
+  let started = false;
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      arg += char;
+      escaped = false;
+    } else if (char === '\\' && quote !== "'") {
+      escaped = true;
+      started = true;
+    } else if (quote) {
+      if (char === quote) quote = undefined;
+      else arg += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (/\s/u.test(char)) {
+      if (started) args.push(arg);
+      arg = '';
+      started = false;
+    } else {
+      arg += char;
+      started = true;
+    }
+  }
+  if (quote || escaped) throw new Error('Tor arguments contain an unfinished quote or escape.');
+  if (started) args.push(arg);
+  return args.length ? args : undefined;
+}
+
 /**
  * 多行文本 → CIDR 数组。空行/空白丢弃；一项不剩返回 `undefined`（删键而非写空数组）。
  *
@@ -707,7 +753,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
     toConfig(draft, base) {
       return {
         ...base,
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         network: str(draft.net) as Network | undefined,
         security: str(draft.sec) as Security | undefined,
         ...transportPatch(draft, base),
@@ -744,7 +790,11 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return d;
     },
     toConfig(draft, base) {
-      const stlsPwd = str(draft.stlsPwd);
+      // Preserve an imported opaque secret on edit, including whitespace-only bytes.
+      // Newly enabling ShadowTLS still requires the existing nonblank completeness gate.
+      const rawStlsPwd = credential(draft.stlsPwd);
+      const stlsPwd = str(draft.stlsPwd) || rawStlsPwd === base.shadowTlsSettings?.password
+        ? rawStlsPwd : undefined;
       const stlsSni = str(draft.stlsSni);
       return {
         ...base,
@@ -752,7 +802,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         shadowsocksSettings: {
           ...base.shadowsocksSettings,
           method: str(draft.method) ?? '',
-          password: str(draft.pwd) ?? '',
+          password: credential(draft.pwd) ?? '',
           // SIP003 插件：留空 → 删键（后端 `ob.plugin = ss.plugin.clone()` 原样透传 Option，
           // 写空串会让内核收到 `"plugin": ""` 并去找一个叫空串的插件）。两键各自独立。
           plugin: str(draft.plugin),
@@ -818,7 +868,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           ...extra,
           server: openconnectServer(base),
           username: str(draft.user),
-          password: str(draft.pwd),
+          password: credential(draft.pwd),
           flavor: str(draft.flavor),
           auth_group: str(draft.authGroup),
           token: str(draft.token) ?? objectToken,
@@ -847,7 +897,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.cipher = cfg.openvpnClientSettings?.cipher ?? '';
       d.ovpnAuth = cfg.openvpnClientSettings?.auth ?? '';
       d.mtu = cfg.openvpnClientSettings?.mtu;
-      d.redirectGw = cfg.openvpnClientSettings?.redirect_gateway === true;
+      d.redirectGw = cfg.openvpnClientSettings?.redirect_gateway !== false;
       d.sysIface = cfg.openvpnClientSettings?.system === true;
       d.meshRoutes = (cfg.meshRoutes ?? []).join('\n');
       d.extraJson = bagToText(bagOf(cfg.openvpnClientSettings));
@@ -869,7 +919,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           server: base.address || undefined,
           server_port: base.port || undefined,
           username: str(draft.user),
-          password: str(draft.pwd),
+          password: credential(draft.pwd),
           network: str(draft.network),
           cipher: str(draft.cipher),
           auth: str(draft.ovpnAuth),
@@ -877,7 +927,10 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           // 关闭时**显式写 false**，不留缺省：这个开关的关态正是「只走声明的内网段、其余直连」那个
           // 用法的表达，而 `meshAllowsInternet` 判的就是它显式为 false。写 undefined 会让谓词按缺省
           // 判「承载全隧道」⇒ 用户关了开关，出口兜底却不生效。
-          redirect_gateway: draft.redirectGw === true ? true : false,
+          redirect_gateway: draft.redirectGw === true
+            ? (base.openvpnClientSettings && base.openvpnClientSettings.redirect_gateway === undefined
+              ? undefined : true)
+            : false,
           system: draft.sysIface === true ? true : undefined,
           tls: extra.mode === 'static_key' ? undefined : {
             ...textToBag(draft.ovpnTlsExtraJson, 'ovpnTlsExtraJson'),
@@ -916,7 +969,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         username: str(draft.user),
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         meshRoutes: cidrLines(draft.meshRoutes),
         tlsSettings: mergeTls(base.tlsSettings, {
           serverName: str(draft.sni),
@@ -961,10 +1014,10 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         ...base,
         hysteriaSettings: {
           ...modeledOf(base.hysteriaSettings),
-          authStr: str(draft.authStr),
+          authStr: credential(draft.authStr),
           upMbps: num(draft.up),
           downMbps: num(draft.down),
-          obfs: str(draft.obfs),
+          obfs: credential(draft.obfs),
           serverPorts: str(draft.ports),
           hopInterval: str(draft.hopInterval),
           ...textToBag(draft.extraJson, 'extraJson'),
@@ -989,20 +1042,20 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       const d = base0('tor');
       d.torExec = cfg.torSettings?.executablePath ?? '';
       d.torDataDir = cfg.torSettings?.dataDirectory ?? '';
-      d.torArgs = cfg.torSettings?.extraArgs?.join(' ') ?? '';
+      d.torArgs = torArgsToText(cfg.torSettings?.extraArgs);
       d.torrcText = torrcToText(cfg.torSettings?.torrc);
       d.extraJson = bagToText(bagOf(cfg.torSettings));
       return d;
     },
     toConfig(draft, base) {
-      const args = str(draft.torArgs);
+      const args = textToTorArgs(draft.torArgs);
       return {
         ...base,
         torSettings: {
           ...modeledOf(base.torSettings),
           executablePath: str(draft.torExec),
           dataDirectory: str(draft.torDataDir),
-          extraArgs: args ? args.split(/\s+/).filter(Boolean) : undefined,
+          extraArgs: args,
           torrc: textToTorrc(draft.torrcText),
           ...textToBag(draft.extraJson, 'extraJson'),
         },
@@ -1077,7 +1130,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       const isGecko = obfsType === 'gecko';
       return {
         ...base,
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         hysteria2Settings: {
           ...base.hysteria2Settings,
           upMbps: num(draft.up),
@@ -1094,7 +1147,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
             ? {
                 ...base.hysteria2Settings?.obfs,
                 type: obfsType as 'salamander' | 'gecko',
-                password: str(draft.obfspwd),
+                password: credential(draft.obfspwd),
                 // 随机填充包长仅 gecko 有意义——salamander 清空防脏下发（对齐后端 build 只在 gecko 读 min/max）。
                 minPacketSize: isGecko ? num(draft.obfsMin) : undefined,
                 maxPacketSize: isGecko ? num(draft.obfsMax) : undefined,
@@ -1138,7 +1191,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         uuid: str(draft.uuid),
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         tuicSettings: {
           ...base.tuicSettings,
           congestionControl: str(draft.cc) as 'bbr' | 'cubic' | 'new_reno' | undefined,
@@ -1174,7 +1227,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         username: str(draft.user),
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
       };
     },
   },
@@ -1195,7 +1248,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         username: str(draft.user),
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         security: draft.tls === true ? 'tls' : 'none',
         // HIGH-1：门谓词是 `whenHttpTls`（http 的开关键是 `tls`，用 `whenTls` 会恒 false）。关 TLS 时
         // 整块清除 tlsSettings（含 base 未建模项），否则 Rust 的 `tls_settings.is_some()` 会绕过
@@ -1237,7 +1290,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       const pbk = str(draft.pbk);
       return {
         ...base,
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         security: draft.sec === 'reality' ? 'reality' : 'tls',
         // TLS 恒开（后端 TLS_PROTOCOLS 强制），两档 sec 下都要下发，故无需 HIGH-1 式清除门 ——
         // 选 reality 时后端仍从 `tlsSettings` 取 server_name/insecure/utls（只是换成 reality 版 TLS 块）。
@@ -1278,7 +1331,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       return {
         ...base,
         username: str(draft.user),
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         // serverName + ECH 两项建模。naive 分支自造的 TLS 块把 insecure/alpn/utls/engine/spoof/fragment
         // 全写死 None（真下发这几个键随包核会点名 FATAL），**唯独 ech 到得了内核**：
         // `apply_anti_censorship_options` 在该分支之后运行、只看 `ob.tls.is_some()` 就会覆盖上去，
@@ -1313,7 +1366,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       const version = draft.version === '6' ? 6 : 4;
       return {
         ...base,
-        password: str(draft.pwd),
+        password: credential(draft.pwd),
         snellSettings: {
           ...base.snellSettings,
           version,
@@ -1353,10 +1406,10 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         sshSettings: {
           ...base.sshSettings,
           user: str(draft.user),
-          password: str(draft.pwd),
+          password: credential(draft.pwd),
           privateKey: str(draft.privateKey),
           privateKeyPath: str(draft.privateKeyPath),
-          privateKeyPassphrase: str(draft.privateKeyPassphrase),
+          privateKeyPassphrase: credential(draft.privateKeyPassphrase),
           // 五个 `Vec<String>` 同一写法：留空 → 删键（后端 `.clone()` 原样透传 Option ⇒
           // 下发空数组等于显式声明「一个算法都不接受」，与「用默认算法集」不是一回事）。
           hostKey: listFromText(draft.hostKey),

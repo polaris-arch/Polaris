@@ -341,7 +341,7 @@ impl EnvCondition {
         BTreeMap::from([(self.tag.clone(), self.values.clone())])
     }
 
-    /// 写到一条 DNS 规则上（DNS builder 只产出默认规则，没有 logical）。
+    /// 写到一条默认 DNS matcher 上；logical 调用方将它作为无动作的子条件。
     pub fn apply_to_dns_rule(&self, rule: &mut DnsRule) {
         match self.kind {
             EnvKind::ServerAddress => rule.dns_server_address = Some(self.map()),
@@ -678,6 +678,19 @@ fn route_rule_bad_ref(servers: &[DnsServer], rule: &RouteRule) -> Option<EnvRefE
     })
 }
 
+fn dns_rule_bad_ref(servers: &[DnsServer], rule: &DnsRule) -> Option<EnvRefError> {
+    first_bad_ref(
+        servers,
+        env_tags(rule.dns_server_address.as_ref(), rule.dns_search_domain.as_ref()),
+    )
+    .or_else(|| {
+        rule.rules
+            .iter()
+            .flatten()
+            .find_map(|child| dns_rule_bad_ref(servers, child))
+    })
+}
+
 /// 生成末尾的后置剪枝（第二道防线）：遍历 `route.rules`（递归进 logical）与 `dns.rules`，任何环境项
 /// 引用不合格 ⇒ 剔除**整条顶层规则**。看的是最终 JSON，与哪条 builder 路径产出无关，兜住将来新增的规则腿。
 pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEnvRule> {
@@ -706,13 +719,7 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
     }
     if let Some(rules) = cfg.dns.as_mut().and_then(|dns| dns.rules.as_mut()) {
         rules.retain(|rule| {
-            match first_bad_ref(
-                &servers,
-                env_tags(
-                    rule.dns_server_address.as_ref(),
-                    rule.dns_search_domain.as_ref(),
-                ),
-            ) {
+            match dns_rule_bad_ref(&servers, rule) {
                 Some(err) => {
                     record(err);
                     false

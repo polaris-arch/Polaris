@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use crate::builder::endpoint_routes::{
-    collect_rule_targeted_server_ids, mesh_force_routed_servers, mesh_forced_route_cidrs,
+    collect_rule_targeted_server_ids, engaged_mesh_forced_route_cidrs,
     ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
@@ -393,12 +393,10 @@ fn build_tun_inbound(
             }
         }
     }
-    let engaged_mesh = mesh_forced_route_cidrs(
-        &mesh_force_routed_servers(
-            &config.servers,
-            config.selected_server_id.as_deref(),
-            &rule_targeted,
-        ),
+    let engaged_mesh = engaged_mesh_forced_route_cidrs(
+        &config.servers,
+        config.selected_server_id.as_deref(),
+        &rule_targeted,
         &deps.observed_tailnet_addresses,
     );
 

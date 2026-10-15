@@ -1026,3 +1026,42 @@ fn reality_node_fingerprint_is_not_stored() {
     assert_eq!(pin_of(0), None, "reality 节点的 pin 必须剔除");
     assert_eq!(pin_of(1).as_deref(), Some(pin), "TLS 节点的 pin 必须保留");
 }
+
+#[test]
+fn merge_sequence_first_wins_with_explicit_and_nested_overrides() {
+    let doc = try_load_clash_doc(r#"
+first: &first {password: A, server: first.example}
+second: &second {password: B, port: 443}
+node:
+  <<: [*first, *second]
+explicit:
+  <<: [*first, *second]
+  password: explicit
+nested:
+  <<: [{<<: [*first, *second], name: inner}, {name: later}]
+"#).unwrap();
+    assert_eq!(doc["node"]["password"].as_str(), Some("A"));
+    assert_eq!(doc["node"]["server"].as_str(), Some("first.example"));
+    assert_eq!(doc["node"]["port"].as_u64(), Some(443));
+    assert_eq!(doc["explicit"]["password"].as_str(), Some("explicit"));
+    assert_eq!(doc["nested"]["password"].as_str(), Some("A"));
+    assert_eq!(doc["nested"]["name"].as_str(), Some("inner"));
+}
+
+#[test]
+fn provider_utf8_limits_never_split_names_or_warning_patterns() {
+    let name = "中".repeat(86); // 258 bytes crosses the 256-byte name limit.
+    assert_eq!(safe_name(&name), "中".repeat(85));
+    assert_eq!(safe_name(&"x".repeat(300)).len(), MAX_FILTER_NAME_LEN);
+    let servers = vec![ServerConfig { name: name.clone(), ..Default::default() }];
+    let mut warnings = Vec::new();
+    let invalid = format!("({}", "中".repeat(80));
+    let kept = apply_provider_filters(servers.clone(), Some(&invalid), Some(&invalid),
+        &mut |warning| warnings.push(warning), "utf8-provider");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].name, name);
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().all(|warning| warning.ends_with(&format!("({}", "中".repeat(26)))));
+    let filtered = apply_provider_filters(servers, Some("^中+$"), None, &mut |_| {}, "next-provider");
+    assert_eq!(filtered.len(), 1, "one provider's warning must not abort the next provider");
+}

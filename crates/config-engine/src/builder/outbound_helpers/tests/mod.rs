@@ -91,3 +91,19 @@ fn pruned_default() {
     );
     assert_eq!(pruned_selector_default(None, &remaining), Some("a".into()));
 }
+
+#[test]
+fn ws_early_data_preserves_non_control_query_bytes() {
+    let raw = "/socket?token=a%26b&ed=2048&token=%23&unicode=%E4%B8%AD&literal=中文&flag&empty=&x=1+2&eh=X%2DHeader";
+    let result = parse_ws_early_data(raw);
+    assert_eq!(result.path, "/socket?token=a%26b&token=%23&unicode=%E4%B8%AD&literal=中文&flag&empty=&x=1+2");
+    assert_eq!(result.max_early_data, Some(2048));
+    assert_eq!(result.early_data_header_name.as_deref(), Some("X-Header"));
+    for raw in ["/x?token=a%26b&flag", "/x?ed=no&token=%23", "/x?ed=0&ed=4"] {
+        assert_eq!(parse_ws_early_data(raw).path, raw);
+    }
+    let encoded = parse_ws_early_data("/x?%65d=12&ed=30&%65h=%E4%B8%AD&z=%26");
+    assert_eq!(encoded.max_early_data, Some(12));
+    assert_eq!(encoded.early_data_header_name.as_deref(), Some("中"));
+    assert_eq!(encoded.path, "/x?z=%26");
+}

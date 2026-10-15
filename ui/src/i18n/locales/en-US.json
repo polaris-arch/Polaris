@@ -1821,6 +1821,7 @@
       "readFailed": "Could not read the backup file",
       "invalidFormat": "This is not a valid Polaris backup file",
       "invalidArgs": "Choose at least one category to restore",
+      "sharedDependencyConflict": "The selected categories conflict with shared resources used by unselected categories. No changes were saved. Review your category selection and try again.",
       "saveFailed": "Could not save the restored configuration",
       "meshRoutingRequiresTrustedRestore": "Mesh routing policy restore needs trusted proof of the old ranges; no changes were saved.",
       "meshRoutingInvalidPolicy": "Mesh routing policy validation failed; the backup was not exported.",

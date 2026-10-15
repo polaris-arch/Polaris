@@ -20,7 +20,7 @@ use polaris_config_engine::builder::endpoint_routes::{
     is_mesh_node_unroutable, mesh_node_carries_full_tunnel,
 };
 use polaris_config_engine::builder::route::subscription_update_route_uses_proxy;
-use polaris_config_engine::user_config::dns_constants::{is_direct_selection, DIRECT_SERVER_ID};
+use polaris_config_engine::user_config::dns_constants::{is_sentinel_selection, DIRECT_SERVER_ID};
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_config_engine::user_config::UserConfig;
 use polaris_net_stack::singbox_import::ImportOrigin;
@@ -82,8 +82,8 @@ fn primary_fetch_retry_delay(kind: SubscriptionErrorKind, retries_done: u8) -> O
 /// 我们短路 parse/reconcile，**新格式永远拿不到**，用户只看到「无变化」且无从排查。
 ///
 /// 判据只看 UA 是否**真的变了**（`None`/`""`/纯空白按同一口径归一，与
-/// [`resolve_subscription_ua`] 的 falsy 语义一致）：URL/名字等其它字段的编辑不该白扔验证器。
-/// URL 变了不需要在此处理 —— 那是另一个资源，服务端本来就不会拿旧 ETag 判 304。
+/// [`resolve_subscription_ua`] 的 falsy 语义一致）：名字等不影响响应身份的编辑不该白扔验证器。
+/// URL 变化也必须清除验证器；不同来源可能使用相同的 ETag，不能跨源复用。
 ///
 /// **本函数只管 per-sub 那一级**。全局 `config.subscriptionUserAgent` 改动走 config 写命令、
 /// 不经本函数 → 那条腿由 [`invalidate_validators_on_global_ua_change`] 在 config 写入侧收口
@@ -164,7 +164,7 @@ pub(crate) fn invalidate_validators_on_global_ua_change(
 /// 上游 `SUBSCRIPTION_UPDATE`：更新订阅元数据（按 id）。
 ///
 /// **前端整体替换该记录**（`SubDialog` 用 `{...base, …}` 回传），故 etag/lastModified 等后端字段
-/// 靠 spread 幸存 —— 唯独 UA 变更必须主动作废验证器，见 [`ua_changed`]。
+/// 靠 spread 幸存 —— URL 或 UA 变更必须主动作废验证器，见 [`ua_changed`]。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -199,8 +199,10 @@ pub fn subscription_update(
             .get_mut("subscriptions")
             .and_then(Value::as_array_mut)
             .expect("subscription index came from the same array");
-        if ua_changed(&arr[idx], &subscription) {
-            // UA 换了 = 响应变体可能整个换掉 → 旧验证器作废，下次走全量 GET。
+        if ua_changed(&arr[idx], &subscription)
+            || subscription_url_changed(&arr[idx], &subscription)
+        {
+            // URL 或 UA 换了 = 响应身份变化 → 旧验证器作废，下次走全量 GET。
             set_or_remove(&mut subscription, "etag", None);
             set_or_remove(&mut subscription, "lastModified", None);
         }
@@ -253,6 +255,7 @@ fn apply_subscription_delete(cfg: &mut Value, subscription_id: &str) -> Result<(
     let selected_gone = cfg
         .get("selectedServerId")
         .and_then(Value::as_str)
+        .filter(|sid| !is_sentinel_selection(Some(sid)))
         .map(|sid| {
             cfg.get("servers")
                 .and_then(Value::as_array)
@@ -679,6 +682,7 @@ async fn perform_subscription_update_inner(
         None => return update_failure("订阅缺少 URL"),
     };
     let user_agent = resolve_subscription_ua(&cfg, &sub);
+    let fetch_identity = SubscriptionFetchIdentity::new(&cfg, &sub);
     let want_proxy = want_proxy_for_sub(&cfg, &sub);
     // 条件 GET：provider 型订阅豁免（主正文 304 掩盖 provider 独立变化）；否则带上次验证器。
     let conditional = if sub.get("hasProviders").and_then(Value::as_bool) == Some(true) {
@@ -748,6 +752,9 @@ async fn perform_subscription_update_inner(
         let apply_started = std::time::Instant::now();
         let transaction_started = std::time::Instant::now();
         let result = state.config().update(|cfg| {
+            if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
+                return Decision::Skip(Err(error));
+            }
             let Some(s) = find_subscription_mut(cfg, subscription_id) else {
                 return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
             };
@@ -795,8 +802,8 @@ async fn perform_subscription_update_inner(
     // 拉取期间可能已有别的写入落盘；对账、删除 journal 与保存必须在同一写临界区，以最新配置为基准。
     // 这里统一走 deferred-cleanup 形态：无删除时不会生成 journal，有删除时则保证旧核退出前不清理资产。
     let transaction = state.config().update_deferred_cleanup(|cfg| {
-        if find_subscription(cfg, subscription_id).is_none() {
-            return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
+        if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
+            return Decision::Skip(Err(error));
         }
         let old_selected = cfg
             .get("selectedServerId")
@@ -889,6 +896,40 @@ async fn perform_subscription_update_inner(
         false,
         user_info.as_ref(),
     )
+}
+
+/// Response identity is captured before await and checked under the configuration writer lock.
+/// Labels, timestamps and unrelated preferences may change without invalidating a response.
+#[derive(Debug, PartialEq, Eq)]
+struct SubscriptionFetchIdentity {
+    url: Option<String>,
+    user_agent: String,
+}
+
+impl SubscriptionFetchIdentity {
+    fn new(cfg: &Value, sub: &Value) -> Self {
+        Self {
+            url: sub.get("url").and_then(Value::as_str).map(str::to_owned),
+            user_agent: resolve_subscription_ua(cfg, sub).unwrap_or_else(|| {
+                polaris_net_stack::subscription::default_subscription_user_agent(env!(
+                    "CARGO_PKG_VERSION"
+                ))
+            }),
+        }
+    }
+
+    fn check_current(&self, cfg: &Value, id: &str) -> Result<(), String> {
+        let current =
+            find_subscription(cfg, id).ok_or_else(|| format!("订阅不存在: {id}"))?;
+        if self != &Self::new(cfg, &current) {
+            return Err("拉取期间订阅 URL 或生效 UA 已变化，旧响应未写入，请重试更新".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn subscription_url_changed(old: &Value, new: &Value) -> bool {
+    old.get("url").and_then(Value::as_str) != new.get("url").and_then(Value::as_str)
 }
 
 /// 按 id 取订阅记录（只读克隆）。
@@ -1153,7 +1194,7 @@ fn prefer_auto_exit_after_removal(
                     .any(|server| server.get("id").and_then(Value::as_str) == Some(id))
             })
     };
-    let old = old_selected.filter(|id| !id.is_empty() && !is_direct_selection(Some(id)))?;
+    let old = old_selected.filter(|id| !id.is_empty() && !is_sentinel_selection(Some(id)))?;
     if exists(cfg, old) || cfg.get("selectedServerId").and_then(Value::as_str) == Some(old) {
         return None;
     }
@@ -1341,13 +1382,13 @@ fn reconcile_subscription_servers(
 
     // 悬挂 selectedServerId：按**实际结果 id 集**校验，仅当选中 id 真不在最终 servers 才兜底。
     // 此前按「指纹缺失」判：碰撞丢 id 时选中项指纹仍在却指向已消失 id → 漏判、留悬空引用。直连哨兵
-    // `__direct__` 与空值不是节点 id，不参与存在性校验（否则会被误兜底）。
+    // direct / block 哨兵与空值不是节点 id，不参与存在性校验（否则会被误兜底）。
     let selected = cfg
         .get("selectedServerId")
         .and_then(Value::as_str)
         .map(str::to_owned);
     if let Some(sid) = selected {
-        if !sid.is_empty() && !is_direct_selection(Some(&sid)) {
+        if !sid.is_empty() && !is_sentinel_selection(Some(&sid)) {
             let fallback = cfg
                 .get("servers")
                 .and_then(Value::as_array)

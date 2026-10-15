@@ -16,9 +16,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use polaris_config_engine::user_config::ProxyModeType;
 use polaris_store::backup::{
     merge_categories, sanitize_cross_platform_rules, sanitize_unavailable_interface_bindings,
-    BackupCategory,
+    BackupCategory, SHARED_DEPENDENCY_CONFLICT,
 };
 use polaris_store::fs::StdFs;
 use serde::Deserialize;
@@ -473,22 +474,49 @@ fn config_patch_core(
     config: &ConfigManager,
     patch: serde_json::Map<String, Value>,
 ) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_edit_core(config, move |next| {
+        if patch.is_empty() {
+            return false;
+        }
+        next.as_object_mut()
+            .expect("validated UserConfig root must be an object")
+            .extend(patch);
+        true
+    })
+}
+
+fn config_takeover_core(
+    config: &ConfigManager,
+    mode: ProxyModeType,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_takeover_edit(config, mode, &std::cell::Cell::new(false))
+}
+
+fn config_takeover_edit(
+    config: &ConfigManager,
+    mode: ProxyModeType,
+    corrected: &std::cell::Cell<bool>,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_edit_core(config, move |next| {
+        next["proxyModeType"] = json!(mode);
+        corrected.set(crate::tray::apply_fake_ip_tun_entry(next));
+        true
+    })
+}
+
+fn config_edit_core(
+    config: &ConfigManager,
+    edit: impl FnOnce(&mut Value) -> bool,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
     let ((old_selected, changed, transaction_view), saved) =
         config.update_deferred_cleanup(|current| {
             let old_selected = current
                 .get("selectedServerId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if patch.is_empty() {
-                return Decision::Skip((old_selected, false, current.clone()));
-            }
-
             let mut next = current.clone();
-            let root = next
-                .as_object_mut()
-                .expect("validated UserConfig root must be an object");
-            for (key, value) in patch {
-                root.insert(key, value);
+            if !edit(&mut next) {
+                return Decision::Skip((old_selected, false, current.clone()));
             }
 
             // 补丁入口同样经过全量保存的字段所有权与派生投影规则；否则换一个写入口就能绕过隐私保护、
@@ -533,14 +561,52 @@ pub fn config_patch(
             crate::i18n::key::NATIVE_UNKNOWN_ERROR,
         ));
     };
-    match config_patch_core(state.config(), patch) {
+    let result = config_patch_core(state.config(), patch);
+    config_edit_response(&app, &state, result)
+}
+
+pub(crate) fn config_takeover(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    mode: &str,
+) -> ApiResponse<Value> {
+    let result = serde_json::from_value::<ProxyModeType>(json!(mode))
+        .map_err(|_| polaris_store::StoreError::validation("invalid takeover mode"))
+        .and_then(|mode| config_takeover_core(state.config(), mode));
+    config_edit_response(&app, &state, result)
+}
+
+/// Home and native tray share the same lock-local takeover edit.
+#[allow(clippy::needless_pass_by_value, reason = "Tauri IPC owns its payload")]
+#[tauri::command]
+pub fn config_set_takeover(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    mode: ProxyModeType,
+) -> ApiResponse<Value> {
+    let corrected = std::cell::Cell::new(false);
+    let result = config_takeover_edit(state.config(), mode, &corrected);
+    let response = config_edit_response(&app, &state, result);
+    if response.success {
+        ApiResponse::ok(json!({"config": response.data, "corrected": corrected.get()}))
+    } else {
+        response
+    }
+}
+
+fn config_edit_response(
+    app: &AppHandle,
+    state: &AppRuntime,
+    result: Result<(Option<String>, Value, bool), polaris_store::StoreError>,
+) -> ApiResponse<Value> {
+    match result {
         Ok((old_selected, cfg, changed)) => {
             if changed {
-                broadcast_config_changed(&app, &cfg);
+                broadcast_config_changed(app, &cfg);
             }
             invalidate_unlock_on_exit_change(
                 state.unlock(),
-                &BroadcastSink::new(&app),
+                &BroadcastSink::new(app),
                 state.proxy().status().running,
                 old_selected.as_deref(),
                 cfg.get("selectedServerId").and_then(Value::as_str),
@@ -837,6 +903,11 @@ pub(crate) fn backup_import_save_core(
             .and_then(Value::as_str)
             .map(str::to_string);
         let outcome = merge_categories(latest, backup, selected);
+        if !outcome.conflicts.is_empty() {
+            return Decision::Skip(Err(polaris_store::StoreError::validation(
+                SHARED_DEPENDENCY_CONFLICT,
+            )));
+        }
         let mut next = outcome.config;
         let effective_selected: Vec<BackupCategory> = selected
             .iter()
@@ -1387,7 +1458,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// hex → 字节。非偶长度/非法字符 → None。
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())

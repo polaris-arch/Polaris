@@ -47,7 +47,7 @@
 //! - **`dirty`**（上游 `:688` `probe.isDirty`，判据 `ProxyManager.ts:3446-3450`）：节点**已编辑但未生效**
 //!   —— 用户改了地址/端口/凭据/传输，运行核仍跑**起核那一刻**的旧参数。经其槽量到的是**旧参数出口**的
 //!   latency，却挂在**新参数**的节点名下 ⇒ 失真数值（比缺席更有害：用户照着一个「已经不存在的配置」的
-//!   延迟去选节点）。判据见 [`partition_dirty`]：`起核快照指纹存在 && 与当前指纹不等`。
+//!   延迟去选节点）。判据见 [`partition_dirty`]：运行与当前连接摘要必须都存在且一致。
 //! - **`tsNotReady`**（上游 `:692` `!probe.tsNodeReady`）：协议为 `tailscale` 但 TS 尚未登录就绪的节点。
 //!   此时运行核对该出口**已让位到直连**（`login_fallback`），经其槽量到的是**直连** RTT —— 记进该节点名下
 //!   即失真数值；连不通则记假 `-1`。判据见 [`ts_node_ready`]。
@@ -1603,14 +1603,8 @@ fn partition_pool(
     out
 }
 
-/// 用户配置里逐节点的**当前**指纹（dirty 判据的「新」一侧）。
-///
-/// 键 = 节点 id，值 = [`server_fingerprint`]（`protocol|address|port|cred|network`，与运行核起核时写进
-/// [`SwitchSnapshot::fingerprints`](crate::runtime::proxy::SpeedProbeTargets::fingerprints) 的**同一个公式**
-/// —— 两侧必须同源，各算各的公式必然漂移，而漂移的表现是「永远 dirty」或「永远不 dirty」，两种都静默）。
-///
-/// 解析不出 [`ServerConfig`] 的条目（配置损坏 / 未来字段）→ 直接跳过：**没有指纹 ⇒ 不判 dirty**，
-/// 保守方向正确（照旧测，与本腿接线前逐字节一致），绝不因为解析失败就把一个正常节点筛掉。
+/// Legacy subscription-compatible identity retained in result envelopes. This
+/// is deliberately not the connection identity used by dirty/candidate gates.
 pub(crate) fn current_server_fingerprints(config: &Value) -> BTreeMap<String, String> {
     config
         .get("servers")
@@ -1627,21 +1621,11 @@ pub(crate) fn current_server_fingerprints(config: &Value) -> BTreeMap<String, St
         .unwrap_or_default()
 }
 
-/// 请求集里「**已编辑未生效**」的节点 id（[`partition_pool`] 的 `dirty_pending` 入参）。
-///
-/// 判据 1:1 上游 `MainCoreProbe.isDirty`（`ProxyManager.ts:3446-3450`）：
-/// `snapshot.get(id) !== undefined && snapshot.get(id) !== serverFingerprint(server)`。
-///
-/// 两条 `is_some_and` 缺一不可：
-/// - **快照无此 id** ⇒ 不判 dirty。那是「新增未入核」，由 `hasTag`/`notInPool` 那条腿管（指引「重启纳入」）；
-///   在此处误判成 dirty 会把用户指向「应用更改」——对一个核里根本没有的节点，应用更改确实也能纳入，但
-///   与既有的 notInPool 语义打架、且 `partition_pool` 的腿序已保证它先被 notInPool 接走，此处再判即死码。
-/// - **当前配置无此 id** ⇒ 不判 dirty（保守：拿不到「新」一侧就没有比对基准，照旧测）。真实可达形态是
-///   「请求集点名了一个刚被删除的节点」，此时它多半也已不在 `id_to_tag` 里 → 走 notInPool。
-///
-/// **为什么当前指纹取自 `ConfigManager` 最新 config 而不是运行核的 `current_config`**：对齐 上游的
-/// F-B 修正（`:3444` 注释）—— 「订阅 OFF 自动刷新」这类路径不经 `switch_mode`，运行核侧的 config 镜像会
-/// 滞后 ⇒ 拿它当「新」一侧会**漏判 dirty**，于是照旧测出旧参数出口的失真值。
+/// Requested nodes whose running connection cannot represent the desired one.
+/// Both inputs use the dedicated main-core measurement digest (including TLS,
+/// transport, resolved interface and detour chain), never subscription dedup.
+/// Missing identity fails closed. `partition_pool` still checks pool membership
+/// first, so a genuinely new node remains `notInPool`, not an edited-node error.
 fn partition_dirty(
     requested: &[String],
     snapshot_fingerprints: &BTreeMap<String, String>,
@@ -1650,12 +1634,9 @@ fn partition_dirty(
     requested
         .iter()
         .filter(|id| {
-            let Some(snap) = snapshot_fingerprints.get(id.as_str()) else {
-                return false;
-            };
-            current_fingerprints
+            snapshot_fingerprints
                 .get(id.as_str())
-                .is_some_and(|cur| cur != snap)
+                .is_none_or(|running| current_fingerprints.get(id.as_str()) != Some(running))
         })
         .cloned()
         .collect()
@@ -2441,7 +2422,6 @@ pub async fn server_speed_test(
     let url = resolve_speed_test_url(&config);
     let all = all_server_ids(&config);
     let tailscale_ids = tailscale_server_ids(&config);
-    let current_fingerprints = current_server_fingerprints(&config);
 
     // §15 主核探测池分波测速（池就绪 → 「批量比较多节点延迟选优」核心路径）：把请求的 N 个节点按 K 分波，
     // 逐波经 gRPC select_outbound 热切各槽到本波节点、经 probe-in-k 端口量 warm-TTFB。详见模块文档路径①。
@@ -2450,8 +2430,13 @@ pub async fn server_speed_test(
         // 波前预筛第三腿（dirty）的入参：起核快照指纹 vs **ConfigManager 最新** config 的当前指纹。
         // 当前侧取自 `config`（本函数开头刚读的最新配置），不取运行核的 config 镜像 —— 后者在「订阅 OFF
         // 自动刷新」这类不经 switch_mode 的路径上会滞后 ⇒ 漏判 dirty（对齐 上游 F-B 修正）。
-        let dirty_pending =
-            partition_dirty(&requested, &targets.fingerprints, &current_fingerprints);
+        let connection_fingerprints =
+            crate::runtime::node_fingerprints::measurement_table_json(&config);
+        let dirty_pending = partition_dirty(
+            &requested,
+            &proxy.speed_measurement_fingerprints(),
+            &connection_fingerprints,
+        );
         // 波前预筛第二腿的入参：**取值在 await 之前**（`State` 不跨 await 持有）。TS 状态活态读 mesh 末帧
         // 缓存（`ts_status_event`），判据见 [`ts_node_ready`]。
         let ts_pending = partition_ts_not_ready(&requested, &tailscale_ids, &|id| {
@@ -2466,8 +2451,6 @@ pub async fn server_speed_test(
                     .map(|r| (id.clone(), r))
             })
             .collect();
-        let connection_fingerprints =
-            crate::runtime::node_fingerprints::measurement_table_json(&config);
         let prefilter = PoolPrefilter {
             dirty: &dirty_pending,
             ts_pending: &ts_pending,
@@ -3517,8 +3500,8 @@ pub(crate) async fn run_scheduled_round(
         };
         let dirty = partition_dirty(
             targets,
-            &probe.fingerprints,
-            &current_server_fingerprints(&config),
+            &proxy.speed_measurement_fingerprints(),
+            &crate::runtime::node_fingerprints::measurement_table_json(&config),
         );
         let ts_pending = partition_ts_not_ready(targets, &tailscale_server_ids(&config), &|id| {
             ts_node_ready(state.mesh().ts_status_event(id).as_ref())

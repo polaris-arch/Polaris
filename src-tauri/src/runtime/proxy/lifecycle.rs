@@ -83,6 +83,38 @@ pub(super) enum RestartLeg {
     Superseded,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedStopContext {
+    pub selected_server_id: Option<String>,
+    pub selection_intent_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedCoreStopRequest {
+    pub expected_main_generation: u64,
+    pub expected_selected_server_id: Option<String>,
+    pub expected_selection_intent_generation: u64,
+}
+
+/// Minted by the saved-writer/selection comparison; contains no external publication.
+pub(super) struct OwnedStopClaim {
+    pub(super) generation: u64,
+    coex: Option<super::coex_observer::ClaimPublication>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ExpectedCoreStopResult {
+    Stopped {
+        #[serde(rename = "expectedMainGeneration")]
+        expected_main_generation: u64,
+        #[serde(rename = "stopMainGeneration")]
+        stop_main_generation: u64,
+    },
+    Changed,
+}
+
 /// `event:proxyLifecycle` 的载荷：**这一次核起停尝试的真实结局**。
 ///
 /// # 三个 phase 的判据（都是可诚实断言的控制流位置，不猜）
@@ -105,17 +137,59 @@ pub(super) enum RestartLeg {
 #[serde(rename_all = "camelCase")]
 pub struct ProxyLifecycleEvent {
     pub phase: &'static str,
+    pub kind: &'static str,
+    pub main_generation: u64,
+    pub terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
+#[cfg(test)]
+pub(super) type TestRestartAfterClaim = Arc<dyn Fn(u64) + Send + Sync>;
+
+#[derive(Clone, Copy)]
+pub(super) struct LifecycleAttribution {
+    kind: &'static str,
+    apply_id: Option<u64>,
+}
+impl LifecycleAttribution {
+    const START: Self = Self {
+        kind: "start",
+        apply_id: None,
+    };
+    pub(super) const STOP: Self = Self {
+        kind: "stop",
+        apply_id: None,
+    };
+    pub(super) const fn restart(apply_id: Option<u64>) -> Self {
+        Self {
+            kind: "restart",
+            apply_id,
+        }
+    }
+}
+
 impl ProxyLifecycleEvent {
+    pub(super) fn attributed(mut self, attribution: LifecycleAttribution, generation: u64) -> Self {
+        self.kind = attribution.kind;
+        self.main_generation = generation;
+        self.terminal = self.phase != "stopped" || attribution.kind != "restart";
+        self.apply_id = attribution.apply_id;
+        self
+    }
+
     /// 核已就绪（无失败信息）。
     pub(super) fn ready() -> Self {
         Self {
             phase: "ready",
+            kind: "unknown",
+            main_generation: 0,
+            terminal: true,
+            apply_id: None,
             error_code: None,
             message: None,
         }
@@ -125,6 +199,10 @@ impl ProxyLifecycleEvent {
     pub(super) fn stopped() -> Self {
         Self {
             phase: "stopped",
+            kind: "unknown",
+            main_generation: 0,
+            terminal: true,
+            apply_id: None,
             error_code: None,
             message: None,
         }
@@ -134,6 +212,10 @@ impl ProxyLifecycleEvent {
     pub(super) fn failed(err: &StartError) -> Self {
         Self {
             phase: "failed",
+            kind: "unknown",
+            main_generation: 0,
+            terminal: true,
+            apply_id: None,
             error_code: err.code.map(str::to_string),
             message: Some(err.message.clone()),
         }
@@ -494,7 +576,7 @@ impl ProxyRuntime {
             self.mesh
                 .assert_tailscale_main_claims_drained(&state_gate)?;
         }
-        self.restore_system_proxy_for_exit().await
+        self.restore_system_takeover_confirmed().await
     }
 
     /// 启动 sing-box（上游 `proxy:start`）。
@@ -524,10 +606,21 @@ impl ProxyRuntime {
     }
 
     /// 重启的起核腿必须持有刚完成的 stop 世代；普通显式 start 不受此限制。
+    #[cfg(test)]
     pub(super) async fn start_guarded(
         self: &Arc<Self>,
         config: Value,
         expected_generation: Option<u64>,
+    ) -> StartLeg {
+        self.start_guarded_attributed(config, expected_generation, LifecycleAttribution::START)
+            .await
+    }
+
+    async fn start_guarded_attributed(
+        self: &Arc<Self>,
+        config: Value,
+        expected_generation: Option<u64>,
+        attribution: LifecycleAttribution,
     ) -> StartLeg {
         let (mut receiver, claim) =
             match self.guarded_start_completion(&config, expected_generation) {
@@ -536,7 +629,12 @@ impl ProxyRuntime {
             };
         if let Some(claim) = claim {
             let leg = self
-                .start_guarded_with_completion(config, expected_generation, Some(&claim))
+                .start_guarded_with_attribution(
+                    config,
+                    expected_generation,
+                    Some(&claim),
+                    attribution,
+                )
                 .await;
             claim.finish_dispatch();
             self.prune_normal_producers();
@@ -576,6 +674,22 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
         completion: Option<&super::prerequisite::NormalStartClaim>,
+    ) -> StartLeg {
+        self.start_guarded_with_attribution(
+            config,
+            expected_generation,
+            completion,
+            LifecycleAttribution::START,
+        )
+        .await
+    }
+
+    async fn start_guarded_with_attribution(
+        self: &Arc<Self>,
+        config: Value,
+        expected_generation: Option<u64>,
+        completion: Option<&super::prerequisite::NormalStartClaim>,
+        attribution: LifecycleAttribution,
     ) -> StartLeg {
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
@@ -888,13 +1002,12 @@ impl ProxyRuntime {
             self.publish_committed_ready_main(my_gen, || {
                 // 与 stopped 腿同一配对纪律：差集与生命周期描述同一次终态跃迁，必须相邻发布。
                 self.push_pending_changes();
-                self.push_lifecycle(&ProxyLifecycleEvent::ready());
+                self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));
                 self.coex_committed_ready(my_gen);
             });
         }
-        // **起核失败的唯一广播点**（`event:proxyLifecycle{phase:'failed'}`）。挂这里而不是各失败腿，
-        // 理由同上面两条收口：这是全部起核入口（IPC / 托盘 / 启动自动连接 / `restart` 的 start 腿）
-        // 的汇流点，新增失败腿只要照常 `?` 就自动有事件，没有哪条腿能悄悄失败。
+        // Explicit Start failures converge here. Restart delegates failure publication to
+        // restart_with_apply, which also owns dispatch/admission/teardown errors and the Apply ID.
         //
         // **它补的是 `event:proxyError` 盖不住的那一类**：`set_error` 头注明列「config 生成 / 写盘 /
         // spawn 失败」不经它，理由是「有 command 在 await，调用方已拿到真错」—— 而**去抖重启这条路
@@ -906,7 +1019,11 @@ impl ProxyRuntime {
         // 会后发覆盖。漏发才是更坏的失效（条永远停在转圈），故取「宁可多发一条可被覆盖的」。
         if let Err(e) = &r {
             self.coex.fail_start(my_gen);
-            self.push_lifecycle(&ProxyLifecycleEvent::failed(e));
+            if attribution.kind != "restart" {
+                self.push_lifecycle(
+                    &ProxyLifecycleEvent::failed(e).attributed(attribution, my_gen),
+                );
+            }
         }
         let terminal_settle_ms = t_terminal_settle.elapsed().as_millis();
         log::info!(
@@ -942,6 +1059,150 @@ impl ProxyRuntime {
     /// 用户全网走直连。故这条收口也一并让位，由接管方自己的终态负责。
     pub async fn stop(self: &Arc<Self>) -> Result<(), String> {
         self.stop_with_confirmation(false).await
+    }
+
+    /// An owned action may stop only the run captured before its confirmation.
+    /// Serialize with selector changes and acquire state custody before atomically
+    /// comparing D/intent/main generation and claiming Stop. Retain custody through cleanup.
+    pub async fn stop_expected(
+        self: &Arc<Self>,
+        expected: ExpectedCoreStopRequest,
+    ) -> Result<ExpectedCoreStopResult, String> {
+        if expected.expected_main_generation == 0
+            || expected.expected_main_generation > 9_007_199_254_740_991
+            || expected.expected_selection_intent_generation > 9_007_199_254_740_991
+        {
+            return Err("invalid expected stop context".into());
+        }
+        // Same serialization as selector PUT/commit. New selection writers may
+        // publish D while we wait; they cannot apply a new R selection while this
+        // operation owns switch_serial. Claim only after the state gate is held.
+        let _switch = self.switch_serial.lock().await;
+        let state_gate = self.mesh.tailscale_state_gate().await;
+        let Some(claim) = self.claim_owned_stop_memory(&expected)? else {
+            return Ok(ExpectedCoreStopResult::Changed);
+        };
+        let generation = claim.generation;
+        self.publish_owned_stop_claim(claim);
+        if self.gate.generation() != generation {
+            return Ok(ExpectedCoreStopResult::Changed);
+        }
+        #[cfg(target_os = "ios")]
+        tauri_plugin_polaris_ios::revoke_pending_start_through(
+            expected.expected_main_generation,
+            generation,
+        )
+        .await?;
+        if self.gate.generation() != generation {
+            return Ok(ExpectedCoreStopResult::Changed);
+        }
+        if self.stop_inner_under_gate(generation, &state_gate).await? != Some(generation) {
+            return Ok(ExpectedCoreStopResult::Changed);
+        }
+        if self.gate.generation() != generation {
+            return Ok(ExpectedCoreStopResult::Changed);
+        }
+        self.restore_system_takeover_confirmed().await?;
+        let still_selected = self
+            .config
+            .try_with_saved_commit(|current| {
+                self.selector_reconcile.with_intent_claim(|intent| {
+                    intent == expected.expected_selection_intent_generation
+                        && current.get("selectedServerId").and_then(Value::as_str)
+                            == expected.expected_selected_server_id.as_deref()
+                        && self.gate.generation() == generation
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        if !still_selected {
+            return Ok(ExpectedCoreStopResult::Changed);
+        }
+        self.process_deferred_config_deletions_under_gate(&state_gate);
+        Ok(ExpectedCoreStopResult::Stopped {
+            expected_main_generation: expected.expected_main_generation,
+            stop_main_generation: generation,
+        })
+    }
+
+    /// Caller owns switch_serial and the TS state gate. The writer callback only
+    /// compares/commits memory; even the coex invalidation is prepared without a sink.
+    pub(super) fn claim_owned_stop_memory(
+        &self,
+        expected: &ExpectedCoreStopRequest,
+    ) -> Result<Option<OwnedStopClaim>, String> {
+        self.config
+            .try_with_saved_commit(|current| {
+                self.selector_reconcile.with_intent_claim(|intent| {
+                    if intent != expected.expected_selection_intent_generation
+                        || current.get("selectedServerId").and_then(Value::as_str)
+                            != expected.expected_selected_server_id.as_deref()
+                    {
+                        return None;
+                    }
+                    // writer/cache -> intent -> crash -> gate publication/generation.
+                    // The raw gate claim and observer preparation have no external sink.
+                    let mut crash = self.crash_lock();
+                    let generation = self.gate.claim_generation(
+                        Some(expected.expected_main_generation),
+                        LifecycleKind::Stop,
+                    )?;
+                    let coex = self.coex.prepare_claim(generation, false);
+                    crash.mark_user_aborted();
+                    Some(OwnedStopClaim { generation, coex })
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// No saved-writer/cache/intent/crash guard survives into this method.
+    /// Generation publication excludes a newer lifecycle owner while the sink runs;
+    /// the observer token additionally rejects a newer same-generation invalidation.
+    pub(super) fn publish_owned_stop_claim(&self, claim: OwnedStopClaim) -> bool {
+        self.gen_changed.notify_waiters();
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() != claim.generation {
+            return false;
+        }
+        claim
+            .coex
+            .is_some_and(|publication| self.coex.publish_claim(publication))
+    }
+
+    /// Warm, nonblocking writer/cache -> selector-intent snapshot. Refuse while a
+    /// real configuration writer is active or cache is unavailable: cache.read alone
+    /// can pair old D with the intent already registered by an unpublished writer.
+    /// The fence callback only reads memory; platform observations run after it.
+    pub(crate) fn status_with_owned_stop_context(&self) -> Result<ProxyStatus, String> {
+        let mut status = self
+            .config
+            .try_with_saved_commit(|config| {
+                self.selector_reconcile.with_intent_claim(|intent| {
+                    let mut status = self
+                        .status
+                        .read()
+                        .map_err(|_| "proxy status unavailable".to_owned())?
+                        .clone();
+                    status.main_generation = self.gate.generation();
+                    status.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+                    status.owned_stop_context = Some(OwnedStopContext {
+                        selected_server_id: config
+                            .get("selectedServerId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        selection_intent_generation: intent,
+                    });
+                    Ok::<_, String>(status)
+                })
+            })
+            .map_err(|error| error.to_string())??;
+        status.uptime = status
+            .start_time
+            .map(|t0| now_ms().saturating_sub(t0) / 1_000);
+        #[cfg(target_os = "android")]
+        {
+            status.reconnect_required = native_reconnect_required(self.config.dir());
+        }
+        Ok(status)
     }
 
     #[cfg(any(windows, test))]
@@ -1094,6 +1355,15 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         claim: StopClaim<'_>,
     ) -> Result<Option<u64>, String> {
+        self.stop_inner_attributed(claim, LifecycleAttribution::STOP)
+            .await
+    }
+
+    async fn stop_inner_attributed(
+        self: &Arc<Self>,
+        claim: StopClaim<'_>,
+        attribution: LifecycleAttribution,
+    ) -> Result<Option<u64>, String> {
         // Restart claims here; an explicit user stop already claimed at its entry before await.
         let my_gen = match &claim {
             StopClaim::Request(expected) => {
@@ -1191,7 +1461,7 @@ impl ProxyRuntime {
         // 前端确有 pull 兜底；但**重启内嵌的这次停核不经命令层**，只靠那条 pull 就是漏的一半。
         // `push_lifecycle(stopped)` 同上必须相邻：核停了就谈不上「正在应用」，条该离开转圈态。
         self.push_pending_changes();
-        self.push_lifecycle(&ProxyLifecycleEvent::stopped());
+        self.push_lifecycle(&ProxyLifecycleEvent::stopped().attributed(attribution, my_gen));
         // A restart's stop leg may await while a newer Apply queues its own full snapshot.
         // Only the terminal Stop outcome discards pending work; clearing here loses that Apply.
         // 核停 → 热切换基准失效（上游 :1386-1388）。留着会让下次 switch_mode 拿「上一个核」的
@@ -1313,9 +1583,14 @@ impl ProxyRuntime {
         config: Value,
         claimed_generation: u64,
         legacy_lease: Option<LegacyStartLease>,
+        apply_id: Option<u64>,
     ) -> Result<ProxyStatus, StartError> {
         let result = match self
-            .restart_with_claim(config, StopClaim::AlreadyClaimed(claimed_generation))
+            .restart_with_apply(
+                config,
+                StopClaim::AlreadyClaimed(claimed_generation),
+                apply_id,
+            )
             .await
         {
             RestartLeg::Finished(result, _) => result,
@@ -1330,6 +1605,16 @@ impl ProxyRuntime {
         config: Value,
         claim: StopClaim<'_>,
     ) -> RestartLeg {
+        self.restart_with_apply(config, claim, None).await
+    }
+
+    async fn restart_with_apply(
+        self: &Arc<Self>,
+        config: Value,
+        claim: StopClaim<'_>,
+        apply_id: Option<u64>,
+    ) -> RestartLeg {
+        let attribution = LifecycleAttribution::restart(apply_id);
         let claimed = match &claim {
             StopClaim::AlreadyClaimed(generation)
             | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
@@ -1337,12 +1622,28 @@ impl ProxyRuntime {
         };
         let leg = match self.restart_dispatch(claimed) {
             Ok(producer) => {
-                let leg = self.restart_inner(config, claim).await;
+                let leg = self.restart_inner(config, claim, attribution).await;
                 producer.finish_dispatch();
                 self.prune_normal_producers();
                 leg
             }
             Err(error) => RestartLeg::Finished(Err(error), claimed),
+        };
+        // The restart owner is the single failure publication point: dispatch,
+        // admission, teardown and start errors all converge here exactly once.
+        // A superseded generation is not this operation's failure.
+        let leg = match leg {
+            RestartLeg::Finished(_, Some(generation)) if self.gate.generation() != generation => {
+                RestartLeg::Superseded
+            }
+            RestartLeg::Finished(Err(error), Some(generation)) => {
+                if self.publish_owned_restart_failure(&error, attribution, generation) {
+                    RestartLeg::Finished(Err(error), Some(generation))
+                } else {
+                    RestartLeg::Superseded
+                }
+            }
+            leg => leg,
         };
         // finish 恒执行。最新 owner 若为 Stop，旧 restart 归零时须按停止终态丢弃 pending；
         // 若为新显式 Start，则保留其 pending 排空。判定与 end 在 gate 同一把锁内。
@@ -1365,8 +1666,34 @@ impl ProxyRuntime {
         }
     }
 
+    fn publish_owned_restart_failure(
+        &self,
+        error: &StartError,
+        attribution: LifecycleAttribution,
+        generation: u64,
+    ) -> bool {
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.generation() != generation {
+            return false;
+        }
+        self.push_lifecycle(
+            &ProxyLifecycleEvent::failed(error).attributed(attribution, generation),
+        );
+        true
+    }
+
     /// [`restart`](Self::restart) 内层：瞬态停核 + 重建。外层 begin/finish 由 `restart` 持有（depth≥1 不变式）。
-    async fn restart_inner(self: &Arc<Self>, config: Value, claim: StopClaim<'_>) -> RestartLeg {
+    async fn restart_inner(
+        self: &Arc<Self>,
+        config: Value,
+        claim: StopClaim<'_>,
+        attribution: LifecycleAttribution,
+    ) -> RestartLeg {
+        let already_claimed = match &claim {
+            StopClaim::AlreadyClaimed(generation)
+            | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+            StopClaim::Request(_) => None,
+        };
         // A marker can be published while an already claimed timer is waiting
         // to execute. Recheck before stop_inner so rejection keeps the old core.
         if let Err(error) = self.admit_legacy_start() {
@@ -1391,12 +1718,12 @@ impl ProxyRuntime {
                 Err(_) => {
                     return RestartLeg::Finished(
                         Err(StartError::from("Main admission poisoned".to_owned())),
-                        None,
+                        already_claimed,
                     )
                 }
             };
             if let Err(error) = starts.assert_unpaused() {
-                return RestartLeg::Finished(Err(StartError::from(error)), None);
+                return RestartLeg::Finished(Err(StartError::from(error)), already_claimed);
             }
             let _crash = self.crash_lock();
             let closing = match self.desktop_shutdown.lock() {
@@ -1406,7 +1733,7 @@ impl ProxyRuntime {
                         Err(StartError::from(
                             "proxy shutdown admission poisoned".to_owned(),
                         )),
-                        None,
+                        already_claimed,
                     )
                 }
             };
@@ -1459,10 +1786,12 @@ impl ProxyRuntime {
             | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
             StopClaim::Request(None) => None,
         };
-        let stop_generation = match self.stop_inner(claim).await {
+        let stop_generation = match self.stop_inner_attributed(claim, attribution).await {
             Ok(Some(generation)) => generation,
             Ok(None) => return RestartLeg::Superseded,
-            Err(error) => return RestartLeg::Finished(Err(error.into()), claimed_stop_on_error),
+            Err(error) => {
+                return RestartLeg::Finished(Err(StartError::from(error)), claimed_stop_on_error)
+            }
         };
         // 两处接管方式判据都取**本平台生效值**（[`ProxyModeType::effective_on`]）：Android 上
         // 新旧两侧恒 `Tun` ⇒ 「离开 systemProxy」永不成立（那里没有系统代理可收）、
@@ -1479,7 +1808,10 @@ impl ProxyRuntime {
             self.wait_for_retiring_tun_route(retiring_tun_interface.as_ref())
                 .await;
         }
-        match self.start_guarded(config, Some(stop_generation)).await {
+        match self
+            .start_guarded_attributed(config, Some(stop_generation), attribution)
+            .await
+        {
             StartLeg::Superseded => RestartLeg::Superseded,
             StartLeg::Finished(result, generation) => {
                 let owned = generation.unwrap_or(stop_generation);
@@ -1597,10 +1929,22 @@ impl ProxyRuntime {
                                 else {
                                     return;
                                 };
+                                #[cfg(test)]
+                                {
+                                    let hook = me.test_restart_after_claim.lock().unwrap().clone();
+                                    if let Some(hook) = hook {
+                                        hook(claimed_generation);
+                                    }
+                                }
                                 let cfg = match snapshot.or_else(|| me.config.current().ok()) {
                                     Some(c) => c,
                                     None => {
                                         log::warn!("去抖重启：无可用配置 → 放弃");
+                                        me.publish_owned_restart_failure(
+                                            &StartError::from("去抖重启缺少配置".to_owned()),
+                                            LifecycleAttribution::restart(force_id),
+                                            claimed_generation,
+                                        );
                                         me.finish_preclaimed_restart(claimed_generation);
                                         me.apply_lifecycle_end(
                                             me.gate.end_restart_after(Some(claimed_generation)),
@@ -1610,7 +1954,12 @@ impl ProxyRuntime {
                                     }
                                 };
                                 if let Err(e) = me
-                                    .restart_claimed(cfg, claimed_generation, legacy_lease)
+                                    .restart_claimed(
+                                        cfg,
+                                        claimed_generation,
+                                        legacy_lease,
+                                        force_id,
+                                    )
                                     .await
                                 {
                                     log::error!("去抖重启失败: {e}");

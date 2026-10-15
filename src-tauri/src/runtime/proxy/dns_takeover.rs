@@ -12,6 +12,9 @@ use serde_json::Value;
 
 use super::{code, ProxyRuntime};
 
+#[cfg(test)]
+pub(crate) type TestDnsRestore = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 impl ProxyRuntime {
     // ── C7 系统 DNS 接管/还原/刷缓存（装配 + 命令收口 + 生命周期接线）─────────────────────────
     //
@@ -84,31 +87,77 @@ impl ProxyRuntime {
 
     /// C7：系统 DNS 还原的同步核（持锁 → `restore_dns` → 报告 marker 是否已清）。
     pub(crate) fn restore_system_dns_locked(&self) -> bool {
-        if Platform::current() == Platform::Linux {
-            return match self.linux_resolved_controller.lock() {
-                Ok(mut controller) => match controller.restore() {
-                    Ok(()) => true,
-                    Err(error) => {
-                        log::error!("Linux 系统 DNS 还原失败（保留 marker 供下次重试）：{error}");
-                        false
-                    }
-                },
-                Err(error) => {
-                    log::error!("Linux DNS 控制器锁中毒，无法还原：{error}");
-                    false
-                }
-            };
-        }
-        match self.dns_controller.lock() {
-            Ok(mut c) => {
-                c.restore_dns();
-                !c.has_marker()
-            }
-            Err(e) => {
-                log::error!("dns_controller 锁中毒: {e} → 跳过系统 DNS 还原");
+        match self.restore_system_dns_confirmed_locked() {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("系统 DNS 恢复未确认: {error}");
                 false
             }
         }
+    }
+
+    fn restore_system_dns_confirmed_locked(&self) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let restore = self
+                .test_dns_restore
+                .lock()
+                .map_err(|_| "DNS test port poisoned")?
+                .clone();
+            if let Some(restore) = restore {
+                return restore();
+            }
+        }
+        if Platform::current() == Platform::Linux {
+            let mut controller = self
+                .linux_resolved_controller
+                .lock()
+                .map_err(|error| format!("Linux DNS 控制器锁中毒: {error}"))?;
+            controller
+                .restore()
+                .map_err(|error| format!("Linux DNS 恢复失败: {error}"))?;
+            if controller.has_marker() {
+                return Err("Linux DNS 恢复仍保留 marker".into());
+            }
+            return Ok(());
+        }
+        let mut controller = self
+            .dns_controller
+            .lock()
+            .map_err(|error| format!("DNS 控制器锁中毒: {error}"))?;
+        controller.restore_dns();
+        if controller.has_marker() {
+            return Err("DNS 恢复未完成或恢复 marker 无法确认已清除".into());
+        }
+        Ok(())
+    }
+
+    /// Strict exit/account retirement must retain any unresolved recovery authority.
+    pub(super) async fn restore_system_dns_confirmed(self: &Arc<Self>) -> Result<(), String> {
+        let this = Arc::clone(self);
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
+            this.restore_system_dns_confirmed_locked()
+        })
+        .await
+        .map_err(|error| format!("DNS restore worker failed: {error}"))?
+    }
+
+    pub(super) async fn restore_system_takeover_confirmed(self: &Arc<Self>) -> Result<(), String> {
+        let dns = self.restore_system_dns_confirmed().await;
+        let proxy = self.restore_system_proxy_for_exit().await;
+        let errors: Vec<String> = [dns, proxy].into_iter().filter_map(Result::err).collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_dns_restore(&self, restore: TestDnsRestore) {
+        *self.test_dns_restore.lock().unwrap() = Some(restore);
     }
 
     /// C7：是否存在系统 DNS 接管 marker（命令层/诊断查询）。

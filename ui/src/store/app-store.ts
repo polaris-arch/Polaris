@@ -600,6 +600,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       old.loggedIn === event.loggedIn &&
       old.expired === event.expired &&
       old.authURL === event.authURL &&
+      old.canShareFiles === event.canShareFiles &&
+      old.waitingFileCount === event.waitingFileCount &&
+      old.receivingFileCount === event.receivingFileCount &&
+      old.unreadFileCount === event.unreadFileCount &&
       JSON.stringify(old.details) === JSON.stringify(event.details) &&
       old.peers.length === event.peers.length &&
       old.peers.every((p, i) => {

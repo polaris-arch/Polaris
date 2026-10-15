@@ -1,5 +1,53 @@
 use super::*;
 
+#[tokio::test]
+async fn expected_stop_mismatch_does_not_claim_a_generation_or_stop_a_replacement() {
+    let (rt, _dir) = test_runtime();
+    rt.bump_generation();
+    let captured = owned_stop_request(&rt);
+    let successor = rt.bump_generation();
+    assert_eq!(
+        rt.stop_expected(captured).await.unwrap(),
+        super::super::ExpectedCoreStopResult::Changed
+    );
+    assert_eq!(rt.core_generation(), successor);
+    assert!(!rt.gate.is_busy());
+}
+
+#[tokio::test]
+async fn expected_stop_superseded_while_waiting_for_state_gate_returns_changed() {
+    let (rt, _dir) = test_runtime();
+    let captured = rt.bump_generation();
+    let expected = owned_stop_request(&rt);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.stop_expected(expected).await })
+    };
+    for _ in 0..10_000 {
+        if rt.switch_serial.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rt.switch_serial.try_lock().is_err(),
+        "owned Stop must wait under selector serialization"
+    );
+    assert_eq!(
+        rt.core_generation(),
+        captured,
+        "no Stop claim before the awaited state gate"
+    );
+    let successor = rt.bump_generation();
+    drop(gate);
+    assert_eq!(
+        stop.await.unwrap().unwrap(),
+        super::super::ExpectedCoreStopResult::Changed
+    );
+    assert_eq!(rt.core_generation(), successor);
+}
+
 #[test]
 fn native_reconnect_marker_is_a_read_only_status_projection() {
     let (_rt, dir) = test_runtime();
@@ -117,49 +165,34 @@ async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
 /// 跃迁的两个投影。分开放（哪怕只是挪到同方法的另一段）就会出现「差集清了但态没翻」或反过来 ——
 /// 而这两种不一致在真机上都表现为「点了没反应」，正是本轮要根除的形态。
 ///
-/// `failed` **刻意不在这一对里**（因果在 `push_lifecycle` 头注：起核失败不改变差集的分母），
-/// 但它必须落在 `start` 包装的 `Err` 腿 —— 那是全部起核入口的唯一汇流点。挪进任一条具体失败腿
-/// 就会漏掉别的入口，而漏掉的那些正是「没人在 await」的托盘 / 自动连接 / 去抖重启。
+/// `failed` 不改变差集分母，不属于本配对守卫。显式 Start 的失败由 Start 包装发出；
+/// owned Restart 的 dispatch/admission/stop/start 失败由 restart_with_apply 集中发出。
+/// 其单一终态和 supersession 由真实 Start、Apply/debounce 故障及让位回归断言。
 ///
 /// 变异对照：把 `start` 成功腿里那两行的顺序颠倒、或在中间插一条语句 → 第一条转红；
-/// 删掉 `start` 包装里的 `failed` 腿 → 第三条转红。
 #[test]
 fn lifecycle_push_is_paired_with_the_diff_push() {
     let src = module_code("runtime/proxy");
     const DIFF: &str = "self.push_pending_changes();";
 
-    let started = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
+    let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     assert!(
         line_immediately_followed_by(
             &started,
             DIFF,
-            "self.push_lifecycle(&ProxyLifecycleEvent::ready());"
+            "self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));"
         ),
         "起核就绪腿：`ready` 必须紧跟差集 PUSH —— 两者描述同一次跃迁，拆开即引入可分叉的第二个时点"
     );
 
-    let stopped = method_body(&src, "    pub(super) async fn stop_inner(");
+    let stopped = method_body(&src, "    async fn stop_inner_attributed(");
     assert!(
         line_immediately_followed_by(
             &stopped,
             DIFF,
-            "self.push_lifecycle(&ProxyLifecycleEvent::stopped());"
+            "self.push_lifecycle(&ProxyLifecycleEvent::stopped().attributed(attribution, my_gen));"
         ),
         "停核拆除腿：`stopped` 必须紧跟差集 PUSH（与起核腿严格对偶）"
-    );
-
-    let start_wrap = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
-    assert!(
-        start_wrap.contains("if let Err(e) = &r {")
-            && start_wrap.contains("self.push_lifecycle(&ProxyLifecycleEvent::failed(e));"),
-        "`failed` 必须挂在 `start` 包装的 Err 腿（全部起核入口的唯一汇流点）——\
-             挪进具体失败腿会漏掉托盘 / 自动连接 / 去抖重启这些「没人在 await」的入口"
     );
 }
 
@@ -180,13 +213,12 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
         "start_inner 必须等待系统代理启用腿"
     );
     assert!(
-        !inner.contains("self.push_lifecycle(&ProxyLifecycleEvent::ready());"),
+        !inner.contains(
+            "self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));"
+        ),
         "start_inner 尚未归还 starting 计数，不得提前发布 ready"
     );
-    let started = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
+    let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     let inner_return = started
         .find("let r = self.start_inner(config, my_gen, &_tailscale_gate).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
@@ -194,7 +226,7 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
         .find("drop(inflight);")
         .expect("ready 前必须归还 starting 计数");
     let ready = started
-        .find("self.push_lifecycle(&ProxyLifecycleEvent::ready());")
+        .find("self.push_lifecycle(&ProxyLifecycleEvent::ready().attributed(attribution, my_gen));")
         .expect("start 成功终态必须发布 ready 生命周期");
     assert!(
         inner_return < drop_inflight && drop_inflight < ready,
@@ -756,7 +788,7 @@ async fn unsuperseded_stop_completes_the_whole_teardown() {
 #[test]
 fn stop_teardown_yields_after_every_await() {
     let src = module_code("runtime/proxy");
-    let body = method_body(&src, "    pub(super) async fn stop_inner(");
+    let body = method_body(&src, "    async fn stop_inner_attributed(");
     let mut marks: Vec<(usize, &str)> = body
         .match_indices(".await")
         .map(|(i, _)| (i, "await"))
@@ -999,7 +1031,7 @@ fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
     let body = method_body(&module_code("runtime/proxy"), "    async fn restart_inner(");
     let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
     let stop = compact
-        .find("letstop_generation=matchself.stop_inner(claim).await{")
+        .find("letstop_generation=matchself.stop_inner_attributed(claim,attribution).await{")
         .unwrap();
     let clear = compact
         .find("ifshould_clear_system_proxy_between_restart(old_mode,new_mode,platform)")
@@ -1008,7 +1040,7 @@ fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
              且把**平台**一并喂进去（该谓词按本平台生效值判断，见其文档）",
         );
     let start = compact
-        .find("self.start_guarded(config,Some(stop_generation)).await")
+        .find("self.start_guarded_attributed(config,Some(stop_generation),attribution).await")
         .unwrap();
     assert!(
         stop < clear && clear < start,
@@ -1273,6 +1305,7 @@ fn proxy_status_serializes_camel_case_contract() {
     let s = ProxyStatus {
         running: true,
         main_generation: 7,
+        owned_stop_context: None,
         pid: 42,
         start_time: Some(1_700_000_000_000),
         uptime: Some(90),
@@ -1411,6 +1444,9 @@ async fn start_failure_is_observable_even_when_it_never_reaches_set_error() {
         "起核失败必发且只发一条 lifecycle，实际：{seen:?}"
     );
     assert_eq!(seen[0].phase, "failed");
+    assert_eq!(seen[0].kind, "start");
+    assert!(seen[0].terminal);
+    assert_eq!(seen[0].apply_id, None);
     assert!(
         seen[0]
             .message
@@ -1454,12 +1490,12 @@ fn lifecycle_payload_contract_keys() {
     let ready = serde_json::to_value(ProxyLifecycleEvent::ready()).expect("可序列化");
     assert_eq!(
         ready,
-        serde_json::json!({ "phase": "ready" }),
-        "ready 帧只该有 phase —— 多一个 null 的 error 键就够前端写出错误的判据"
+        serde_json::json!({ "phase": "ready", "kind": "unknown", "mainGeneration": 0, "terminal": true }),
+        "未归属的构造帧必须明确 unknown/0，不能被当作生产成功；错误键仍省略"
     );
     assert_eq!(
         serde_json::to_value(ProxyLifecycleEvent::stopped()).expect("可序列化"),
-        serde_json::json!({ "phase": "stopped" })
+        serde_json::json!({ "phase": "stopped", "kind": "unknown", "mainGeneration": 0, "terminal": true })
     );
     let failed = serde_json::to_value(ProxyLifecycleEvent::failed(&StartError::coded(
         "核起不来",
@@ -1470,6 +1506,7 @@ fn lifecycle_payload_contract_keys() {
         failed,
         serde_json::json!({
             "phase": "failed",
+            "kind": "unknown", "mainGeneration": 0, "terminal": true,
             "errorCode": code::ROOT_ORPHAN_BLOCKED,
             "message": "核起不来",
         })
@@ -1483,7 +1520,7 @@ fn lifecycle_payload_contract_keys() {
     .expect("可序列化");
     assert_eq!(
         uncoded,
-        serde_json::json!({ "phase": "failed", "message": "写盘失败" }),
+        serde_json::json!({ "phase": "failed", "message": "写盘失败", "kind": "unknown", "mainGeneration": 0, "terminal": true }),
         "无码不等于无消息 —— 省掉 message 会让条只能显示一个说不清的红"
     );
 }
@@ -2041,10 +2078,7 @@ fn tailscale_state_remains_owned_during_helper_start_before_pid_publication() {
 #[test]
 fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
     let src = module_code("runtime/proxy");
-    let start = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
+    let start = method_body(&src, "    async fn start_guarded_with_attribution(");
     let compact: String = start.chars().filter(|ch| !ch.is_whitespace()).collect();
     let gate = compact
         .find("self.mesh.tailscale_state_gate().await")
@@ -2093,10 +2127,7 @@ fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
         .find("self.claim_generation(expected,LifecycleKind::Start)")
         .expect("claim must publish generation under custody");
     assert!(custody_lock < claim_generation);
-    let started = method_body(
-        &src,
-        "    pub(super) async fn start_guarded_with_completion(",
-    );
+    let started = method_body(&src, "    async fn start_guarded_with_attribution(");
     let compact: String = started.chars().filter(|ch| !ch.is_whitespace()).collect();
     let custody = compact
         .find("self.claim_android_global_start_generation_expected(completion.map(|claim|claim.expected),)")
@@ -2108,4 +2139,467 @@ fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
         .rfind("self.admit_direct_slot()")
         .expect("Start must recheck admission under the TS gate");
     assert!(custody < gate_recheck && gate_recheck < sweep);
+}
+
+#[test]
+fn apply_lifecycle_keeps_one_request_and_marks_restart_stop_intermediate() {
+    let attribution = super::super::lifecycle::LifecycleAttribution::restart(Some(91));
+    let stopped = ProxyLifecycleEvent::stopped().attributed(attribution, 17);
+    let ready = ProxyLifecycleEvent::ready().attributed(attribution, 18);
+    assert_eq!(stopped.apply_id, Some(91));
+    assert_eq!(ready.apply_id, stopped.apply_id);
+    assert_eq!(stopped.kind, "restart");
+    assert!(!stopped.terminal);
+    assert!(ready.terminal);
+    assert_eq!(stopped.main_generation, 17);
+    assert_eq!(ready.main_generation, 18);
+    let stop = ProxyLifecycleEvent::stopped()
+        .attributed(super::super::lifecycle::LifecycleAttribution::STOP, 19);
+    assert!(stop.terminal);
+    assert_eq!(stop.kind, "stop");
+    assert_eq!(stop.apply_id, None);
+}
+
+fn owned_stop_request(rt: &ProxyRuntime) -> ExpectedCoreStopRequest {
+    // Normal captures follow configuration initialization. Cold-cache refusal is
+    // exercised separately and must not be warmed by the status command itself.
+    rt.config.current().unwrap();
+    let status = rt.status_with_owned_stop_context().unwrap();
+    let context = status.owned_stop_context.unwrap();
+    ExpectedCoreStopRequest {
+        expected_main_generation: status.main_generation,
+        expected_selected_server_id: context.selected_server_id,
+        expected_selection_intent_generation: context.selection_intent_generation,
+    }
+}
+
+#[tokio::test]
+async fn owned_stop_dns_failure_never_returns_stopped_and_same_marker_recovers_on_retry() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.bump_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    assert!(rt.stop_expected(owned_stop_request(&rt)).await.is_err());
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    let request = owned_stop_request(&rt);
+    let before = request.expected_main_generation;
+    assert_eq!(
+        rt.stop_expected(request).await.unwrap(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: before,
+            stop_main_generation: before + 1
+        }
+    );
+    assert!(!dns.marker.exists());
+}
+
+#[tokio::test]
+async fn strict_owned_stop_propagates_dns_worker_panic_and_lock_failure() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.bump_generation();
+    rt.set_test_dns_restore(Arc::new(|| panic!("injected blocking worker failure")));
+    assert!(rt.stop_expected(owned_stop_request(&rt)).await.is_err());
+    // The panic must be a failed strict receipt, never a fabricated Stopped.
+    rt.set_test_dns_restore(Arc::new(|| Err("injected DNS lock/marker failure".into())));
+    assert!(rt.stop_expected(owned_stop_request(&rt)).await.is_err());
+}
+
+#[tokio::test]
+async fn selector_publication_while_owned_stop_waits_for_state_gate_cannot_kill_or_restore() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    rt.bump_generation();
+    let request = owned_stop_request(&rt);
+    let generation = rt.core_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let held = rt.mesh.tailscale_state_gate().await;
+    let stop = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.stop_expected(request).await })
+    };
+    for _ in 0..10_000 {
+        if rt.switch_serial.try_lock().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rt.switch_serial.try_lock().is_err(),
+        "owned Stop must wait under selector serialization"
+    );
+    crate::commands::server::server_switch_core(
+        &rt.config,
+        "node-b",
+        |_| Ok(()),
+        || rt.register_selector_intent(),
+    )
+    .unwrap();
+    assert_eq!(rt.core_generation(), generation);
+    drop(held);
+    assert_eq!(
+        stop.await.unwrap().unwrap(),
+        ExpectedCoreStopResult::Changed
+    );
+    assert!(rt.status().running);
+    assert_eq!(rt.core_generation(), generation);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+}
+
+#[tokio::test]
+async fn dispatched_apply_early_failures_emit_one_owned_terminal_without_teardown() {
+    for poison_dispatch in [false, true] {
+        let (rt, dir, _errors, events) = test_runtime_recording_lifecycle();
+        rt.config
+            .save_full(&two_node_config(7890, "node-a"))
+            .unwrap();
+        mark_running(&rt);
+        let weak = Arc::downgrade(&rt);
+        let marker = dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE);
+        let claimed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::clone(&claimed);
+        *rt.test_restart_after_claim.lock().unwrap() = Some(Arc::new(move |generation| {
+            observed.store(generation, Ordering::SeqCst);
+            if poison_dispatch {
+                let rt = weak.upgrade().unwrap();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _guard = rt.normal_start.lock().unwrap();
+                    panic!("injected dispatch admission failure");
+                }));
+            } else {
+                std::fs::write(&marker, b"injected invalid admission marker").unwrap();
+            }
+        }));
+        let (status, id) = rt.apply_pending_owned().await;
+        assert_eq!(status, "applied");
+        let id = id.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !events.lock().unwrap().is_empty() && !rt.gate.is_busy() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let frames = events.lock().unwrap().clone();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].phase, "failed");
+        assert_eq!(frames[0].kind, "restart");
+        assert!(frames[0].terminal);
+        assert_eq!(frames[0].apply_id, Some(id));
+        assert_eq!(frames[0].main_generation, claimed.load(Ordering::SeqCst));
+        assert!(frames[0]
+            .message
+            .as_ref()
+            .is_some_and(|message| !message.is_empty()));
+        assert!(
+            rt.status().running,
+            "admission failure must not tear down the old run"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dispatched_apply_superseded_after_claim_does_not_publish_failure() {
+    let (rt, _dir, _errors, events) = test_runtime_recording_lifecycle();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    let weak = Arc::downgrade(&rt);
+    let seen = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&seen);
+    *rt.test_restart_after_claim.lock().unwrap() = Some(Arc::new(move |_| {
+        weak.upgrade().unwrap().bump_generation();
+        signal.store(true, Ordering::SeqCst);
+    }));
+    assert_eq!(rt.apply_pending_owned().await.0, "applied");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if seen.load(Ordering::SeqCst) && !rt.gate.is_busy() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn strict_dns_facade_propagates_the_real_controller_poison_without_clearing_marker() {
+    let (rt, dir, _) = test_runtime_recording();
+    let marker = dir.join("system-dns.marker.json");
+    std::fs::write(&marker, b"preserved recovery evidence").unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if Platform::current() == Platform::Linux {
+            let _guard = rt.linux_resolved_controller.lock().unwrap();
+            panic!("injected controller poison");
+        } else {
+            let _guard = rt.dns_controller.lock().unwrap();
+            panic!("injected controller poison");
+        }
+    }));
+    assert!(rt.restore_system_dns_confirmed().await.is_err());
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"preserved recovery evidence"
+    );
+}
+
+#[tokio::test]
+async fn exact_owned_stop_accepts_explicit_null_selection_and_zero_intent() {
+    for selected in [None, Some("node-a")] {
+        let (rt, _dir, _) = test_runtime_recording();
+        let mut config = two_node_config(7890, "node-a");
+        config["selectedServerId"] = serde_json::to_value(selected).unwrap();
+        rt.config.save_full(&config).unwrap();
+        rt.bump_generation();
+        let request = owned_stop_request(&rt);
+        assert_eq!(request.expected_selected_server_id.as_deref(), selected);
+        assert_eq!(request.expected_selection_intent_generation, 0);
+        let generation = request.expected_main_generation;
+        let dns = install_dns_recovery_fixture(&rt);
+        dns.fail_restore.store(false, Ordering::SeqCst);
+        assert_eq!(
+            rt.stop_expected(request).await.unwrap(),
+            ExpectedCoreStopResult::Stopped {
+                expected_main_generation: generation,
+                stop_main_generation: generation + 1
+            }
+        );
+        assert!(!dns.marker.exists());
+    }
+}
+
+#[tokio::test]
+async fn actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_claim() {
+    use std::sync::mpsc;
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    rt.bump_generation();
+    let prior = owned_stop_request(&rt);
+    let generation = rt.core_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    let (registered_tx, registered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer_rt = Arc::clone(&rt);
+    let writer = std::thread::spawn(move || {
+        crate::commands::server::server_switch_core(
+            &writer_rt.config,
+            "node-b",
+            |_| Ok(()),
+            || {
+                let intent = writer_rt.register_selector_intent();
+                // Real ConfigManager update owns write_lock and a private modified D here.
+                // select_in_place has registered B's intent, but update has not published B.
+                registered_tx.send(intent).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                intent
+            },
+        )
+    });
+    let unpublished_intent = registered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let cached_selected = rt
+        .config
+        .with_current(|saved| saved["selectedServerId"].as_str().map(str::to_owned))
+        .unwrap();
+    let captured_during_writer = rt.status_with_owned_stop_context();
+    let prior_stop = rt.stop_expected(prior).await;
+    // This is the real mixed tuple visible in the old cache-only implementation,
+    // not a simulated writer: cache still has A while the held writer registered B.
+    let mixed_stop = rt
+        .stop_expected(ExpectedCoreStopRequest {
+            expected_main_generation: generation,
+            expected_selected_server_id: cached_selected.clone(),
+            expected_selection_intent_generation: unpublished_intent,
+        })
+        .await;
+    let second_capture = rt.status_with_owned_stop_context();
+    let unchanged = rt.core_generation() == generation
+        && rt.status().running
+        && dns.writes.load(Ordering::SeqCst) == writes
+        && std::fs::read(&dns.marker).unwrap() == dns.original_marker;
+    // Release before assertions, including on a regressed implementation's Err path.
+    release_tx.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    assert_eq!(cached_selected.as_deref(), Some("node-a"));
+    assert!(captured_during_writer.is_err() && second_capture.is_err());
+    assert!(prior_stop.is_err() && mixed_stop.is_err());
+    assert!(
+        unchanged,
+        "writer-in-flight refusal must precede generation claim, kill and DNS work"
+    );
+    let published = rt.status_with_owned_stop_context().unwrap();
+    assert_eq!(published.main_generation, generation);
+    assert_eq!(
+        published.owned_stop_context.unwrap(),
+        OwnedStopContext {
+            selected_server_id: Some("node-b".into()),
+            selection_intent_generation: unpublished_intent
+        }
+    );
+}
+
+#[tokio::test]
+async fn owned_stop_cold_saved_cache_refuses_capture_and_claim_without_loading_disk() {
+    let (rt, dir, _) = test_runtime_recording();
+    mark_running(&rt);
+    rt.bump_generation();
+    let generation = rt.core_generation();
+    let dns = install_dns_recovery_fixture(&rt);
+    let writes = dns.writes.load(Ordering::SeqCst);
+    assert!(!dir.join("config.json").exists());
+    assert!(rt.status_with_owned_stop_context().is_err());
+    assert!(rt
+        .stop_expected(ExpectedCoreStopRequest {
+            expected_main_generation: generation,
+            expected_selected_server_id: None,
+            expected_selection_intent_generation: 0,
+        })
+        .await
+        .is_err());
+    assert_eq!(rt.core_generation(), generation);
+    assert!(rt.status().running);
+    assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+    assert!(
+        !dir.join("config.json").exists(),
+        "the fence may not load, migrate or publish a cold cache"
+    );
+    rt.config.current().unwrap();
+    assert!(
+        rt.status_with_owned_stop_context().is_ok(),
+        "normal initialization can warm the saved context"
+    );
+}
+
+/// Uses set_error_emitter's actual Observer -> ProxyErrorEmitter bridge. This
+/// override is deliberately not the trait's default no-op coex implementation.
+fn install_owned_stop_boundary_sink(rt: &Arc<ProxyRuntime>) -> Arc<Mutex<Vec<Value>>> {
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&frames);
+    let weak = Arc::downgrade(rt);
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        coex_hook: Some(Arc::new(move |wire| {
+            let rt = weak.upgrade().unwrap();
+            // Reenters the actual configuration API/projection guard and tries
+            // the real writer/cache fence. A sink under the old fence fails here.
+            assert!(rt.config.try_with_saved_commit(|_| ()).is_ok());
+            assert!(rt.crash_recovery.try_lock().is_ok());
+            rt.selector_reconcile.with_intent_claim(|_| ());
+            seen.lock().unwrap().push(wire);
+        })),
+        ..Default::default()
+    }));
+    frames
+}
+
+#[tokio::test]
+async fn accepted_owned_stop_delivers_real_coex_sink_after_saved_and_selection_locks() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    rt.bump_generation();
+    let expected = owned_stop_request(&rt);
+    let generation = expected.expected_main_generation + 1;
+    let dns = install_dns_recovery_fixture(&rt);
+    dns.fail_restore.store(false, Ordering::SeqCst);
+    let frames = install_owned_stop_boundary_sink(&rt);
+    assert_eq!(
+        rt.stop_expected(expected).await.unwrap(),
+        ExpectedCoreStopResult::Stopped {
+            expected_main_generation: generation - 1,
+            stop_main_generation: generation,
+        }
+    );
+    let events = frames.lock().unwrap();
+    assert!(
+        !events.is_empty(),
+        "the accepted claim must reach the non-no-op production bridge"
+    );
+    assert_eq!(
+        events[0]["binding"]["lifecycleGeneration"]["value"],
+        serde_json::json!(generation.to_string())
+    );
+    assert_eq!(events[0]["binding"]["lifecyclePhase"], "stopped");
+    assert_eq!(events[0]["freshness"], "unavailable");
+}
+
+#[test]
+fn real_coex_boundary_sink_negative_control_rejects_dispatch_inside_saved_fence() {
+    let (rt, _dir, _) = test_runtime_recording();
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    let generation = rt.bump_generation();
+    let frames = install_owned_stop_boundary_sink(&rt);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.config
+            .try_with_saved_commit(|_| {
+                // Deliberately replay the prohibited boundary through the same real
+                // sink. A no-op recording emitter would not detect this control.
+                rt.coex.claim(generation, false);
+            })
+            .unwrap();
+    }));
+    assert!(
+        failure.is_err(),
+        "the boundary test must fail for an external sink inside the writer fence"
+    );
+    assert!(frames.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deferred_owned_stop_coex_publication_cannot_replay_over_new_owner_or_invalidation() {
+    for newer_owner in [true, false] {
+        let (rt, _dir, _) = test_runtime_recording();
+        rt.config
+            .save_full(&two_node_config(7890, "node-a"))
+            .unwrap();
+        mark_running(&rt);
+        rt.bump_generation();
+        let expected = owned_stop_request(&rt);
+        let frames = install_owned_stop_boundary_sink(&rt);
+        let _switch = rt.switch_serial.lock().await;
+        let _state = rt.mesh.tailscale_state_gate().await;
+        let claim = rt.claim_owned_stop_memory(&expected).unwrap().unwrap();
+        let old_generation = claim.generation;
+        assert!(
+            frames.lock().unwrap().is_empty(),
+            "the actual memory-claim helper must not invoke its sink"
+        );
+        assert_eq!(rt.coex_state()["freshness"], "unavailable");
+        if newer_owner {
+            assert!(rt.bump_generation() > old_generation);
+        } else {
+            rt.coex.watcher_unavailable();
+        }
+        let latest = rt.coex_state();
+        let delivered = frames.lock().unwrap().clone();
+        assert!(!delivered.is_empty());
+        assert!(!rt.publish_owned_stop_claim(claim));
+        assert_eq!(*frames.lock().unwrap(), delivered);
+        assert_eq!(rt.coex_state(), latest);
+        if newer_owner {
+            // A late older gate wrapper must not rebind/invalidate the newer owner.
+            rt.coex.claim(old_generation, true);
+            rt.coex.invalidate_generation(old_generation);
+            assert_eq!(rt.coex_state(), latest);
+            assert_eq!(*frames.lock().unwrap(), delivered);
+        }
+    }
 }

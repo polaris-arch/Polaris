@@ -328,7 +328,33 @@ struct Inner {
     backoff: BackoffTracker,
     is_running: bool,
     pending_proxy_catchup: bool,
+    // A ready event may arrive before selection records the skipped proxy subscriptions.
+    proxy_ready_requested: bool,
     started: bool,
+}
+
+impl Inner {
+    fn record_selection(&mut self, selection: &DueSelection, ignore_staleness: bool) {
+        // Periodic selection can be empty because of the interval (including manual-only),
+        // even though a previous startup pass still owes a proxy-ready catch-up.
+        if ignore_staleness {
+            self.pending_proxy_catchup = selection.pending_proxy_catchup;
+        } else {
+            self.pending_proxy_catchup |= selection.pending_proxy_catchup;
+        }
+    }
+
+    fn request_proxy_ready(&mut self) -> bool {
+        if self.is_running {
+            self.proxy_ready_requested = true;
+            return false;
+        }
+        if !self.pending_proxy_catchup {
+            return false;
+        }
+        self.proxy_ready_requested = true;
+        true
+    }
 }
 
 fn lock_inner(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
@@ -349,6 +375,7 @@ impl SubscriptionScheduler {
                 backoff: BackoffTracker::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS),
                 is_running: false,
                 pending_proxy_catchup: false,
+                proxy_ready_requested: false,
                 started: false,
             })),
         }
@@ -396,15 +423,10 @@ impl SubscriptionScheduler {
         });
     }
 
-    /// 代理就绪补更：仅当有挂起标记且当前空闲。
+    /// Coalesce readiness under the same lock as completion. An active round drains it.
     async fn on_proxy_started(self: &Arc<Self>, app: &AppHandle) {
-        {
-            let mut inner = lock_inner(&self.inner);
-            // isRunning 时不清 flag：已有更新在途，保留挂起标记待后续触发。
-            if !inner.pending_proxy_catchup || inner.is_running {
-                return;
-            }
-            inner.pending_proxy_catchup = false;
+        if !lock_inner(&self.inner).request_proxy_ready() {
+            return;
         }
         self.run_due_updates(app, true).await;
     }
@@ -420,82 +442,90 @@ impl SubscriptionScheduler {
             inner.is_running = true;
         }
         // 无论中途 return/panic 都要清 is_running（用 guard）。
-        let _guard = RunningGuard {
+        let mut guard = RunningGuard {
             inner: self.inner.clone(),
+            armed: true,
         };
-
-        let state = app.state::<AppRuntime>();
-        // Windows 冷启动实证：8s 启动补更与 TUN post-start 连接 flush（当时为 `CloseAllConnections`，
-        // 现为快照逐条 `CloseConnection`）两次落在同一毫秒，reqwest 新连接被 RST 后只剩笼统的
-        // 「error sending request」。等待代理运行时的统一
-        // 稳定门，覆盖起核、selector 校正与单次 flush；不靠再调一个会随机器快慢漂移的固定 sleep。
-        log::debug!(
-            "[订阅自动更新] 进入代理网络稳定门：pending={} ignoreStaleness={ignore_staleness}",
-            state.proxy().network_settle_pending()
-        );
-        state.proxy().wait_for_network_settled().await;
-        log::debug!("[订阅自动更新] 代理网络稳定门已放行");
-        let config = match state.config().load_full() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let proxy_running = state.proxy().status().running;
-        let now = now_ms();
-
-        // 选到期 + 剪退避（读退避在锁内，尽量短持）。
-        let selection = {
-            let mut inner = lock_inner(&self.inner);
-            let active: std::collections::HashSet<String> = config
-                .get("subscriptions")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|s| s.get("id").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            inner.backoff.prune(&active);
-            let sel = select_due(
-                &config,
-                now,
-                &inner.backoff,
-                proxy_running,
-                ignore_staleness,
+        let mut ignore_staleness = ignore_staleness;
+        loop {
+            let state = app.state::<AppRuntime>();
+            // Windows 冷启动实证：8s 启动补更与 TUN post-start 连接 flush（当时为 `CloseAllConnections`，
+            // 现为快照逐条 `CloseConnection`）两次落在同一毫秒，reqwest 新连接被 RST 后只剩笼统的
+            // 「error sending request」。等待代理运行时的统一
+            // 稳定门，覆盖起核、selector 校正与单次 flush；不靠再调一个会随机器快慢漂移的固定 sleep。
+            log::debug!(
+                "[订阅自动更新] 进入代理网络稳定门：pending={} ignoreStaleness={ignore_staleness}",
+                state.proxy().network_settle_pending()
             );
-            inner.pending_proxy_catchup = sel.pending_proxy_catchup;
-            sel
-        };
-        log::debug!(
-            "[订阅自动更新] 到期选择完成：due={} pendingProxyCatchup={}",
-            selection.due_ids.len(),
-            selection.pending_proxy_catchup
-        );
+            state.proxy().wait_for_network_settled().await;
+            log::debug!("[订阅自动更新] 代理网络稳定门已放行");
+            let config = match state.config().load_full() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let proxy_running = state.proxy().status().running;
+            let now = now_ms();
 
-        // 逐个更新（不持调度器锁跨 await）。
-        for id in selection.due_ids {
-            let result = perform_subscription_update(app, state.inner(), &id).await;
-            let ok = result.get("success").and_then(Value::as_bool) == Some(true);
-            // 失败落日志（对齐 上游 SubScheduler logManager.addLog('warn', ...)：后台失败的用户可见面 =
-            // 日志）+ 发事件让渲染端弹 toast（补 上游 无、Polaris 原本静默的缺口——退避已限频，不刷屏）。
-            let name = sub_name(&config, &id).to_string();
-            if !ok {
-                let err = result
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("订阅更新失败");
-                log::warn!("[订阅自动更新] 订阅「{name}」更新失败: {err}");
-            }
-            crate::events::broadcast(
-                app,
-                EVENT_SUBSCRIPTION_AUTOUPDATE,
-                build_autoupdate_payload(&id, &name, &result),
+            // 选到期 + 剪退避（读退避在锁内，尽量短持）。
+            let selection = {
+                let mut inner = lock_inner(&self.inner);
+                let active: std::collections::HashSet<String> = config
+                    .get("subscriptions")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.get("id").and_then(Value::as_str).map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                inner.backoff.prune(&active);
+                let sel = select_due(
+                    &config,
+                    now,
+                    &inner.backoff,
+                    proxy_running,
+                    ignore_staleness,
+                );
+                inner.record_selection(&sel, ignore_staleness);
+                sel
+            };
+            log::debug!(
+                "[订阅自动更新] 到期选择完成：due={} pendingProxyCatchup={}",
+                selection.due_ids.len(),
+                selection.pending_proxy_catchup
             );
-            let mut inner = lock_inner(&self.inner);
-            if ok {
-                inner.backoff.record_success(&id);
-            } else {
-                inner.backoff.record_failure(&id, now);
+
+            // 逐个更新（不持调度器锁跨 await）。
+            for id in selection.due_ids {
+                let result = perform_subscription_update(app, state.inner(), &id).await;
+                let ok = result.get("success").and_then(Value::as_bool) == Some(true);
+                // 失败落日志（对齐 上游 SubScheduler logManager.addLog('warn', ...)：后台失败的用户可见面 =
+                // 日志）+ 发事件让渲染端弹 toast（补 上游 无、Polaris 原本静默的缺口——退避已限频，不刷屏）。
+                let name = sub_name(&config, &id).to_string();
+                if !ok {
+                    let err = result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("订阅更新失败");
+                    log::warn!("[订阅自动更新] 订阅「{name}」更新失败: {err}");
+                }
+                crate::events::broadcast(
+                    app,
+                    EVENT_SUBSCRIPTION_AUTOUPDATE,
+                    build_autoupdate_payload(&id, &name, &result),
+                );
+                let mut inner = lock_inner(&self.inner);
+                if ok {
+                    inner.backoff.record_success(&id);
+                } else {
+                    inner.backoff.record_failure(&id, now);
+                }
             }
+            if !guard.finish_or_repeat() {
+                break;
+            }
+            // A catch-up is a fresh selection: reload live proxy/config and respect backoff.
+            ignore_staleness = true;
         }
     }
 }
@@ -503,10 +533,31 @@ impl SubscriptionScheduler {
 /// 清 is_running 的 RAII 守卫（中途 return/panic 均复位）。
 struct RunningGuard {
     inner: Arc<Mutex<Inner>>,
+    armed: bool,
 }
+
+impl RunningGuard {
+    fn finish_or_repeat(&mut self) -> bool {
+        let mut inner = lock_inner(&self.inner);
+        // A ready event is independent work intent. The latest selection may have
+        // cleared pending (or found no interval-due items), but cannot consume that wake.
+        let repeat = inner.proxy_ready_requested;
+        inner.proxy_ready_requested = false;
+        if !repeat {
+            // Releasing ownership and deciding there is no wake to drain are one atomic step.
+            // Disarm Drop before another trigger can acquire the gate.
+            inner.is_running = false;
+            self.armed = false;
+        }
+        repeat
+    }
+}
+
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        lock_inner(&self.inner).is_running = false;
+        if self.armed {
+            lock_inner(&self.inner).is_running = false;
+        }
     }
 }
 

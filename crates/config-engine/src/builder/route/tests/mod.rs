@@ -1908,3 +1908,23 @@ fn non_block_exit_keeps_update_in_on_proxy_selector() {
         );
     }
 }
+
+#[test]
+fn selected_opt_in_mesh_keeps_force_route_when_always_route_is_false() {
+    let mut config = UserConfig::default();
+    config.proxy_mode = ProxyMode::Global;
+    config.selected_server_id = Some("wg".into());
+    config.servers = vec![crate::user_config::server_config::ServerConfig {
+        id: "wg".into(), name: "WG".into(), protocol: Protocol::Wireguard,
+        address: "203.0.113.1".into(), port: 51820,
+        wireguard_settings: Some(Box::new(crate::user_config::server_config::WireGuardSettings {
+            allowed_ips: vec!["10.20.0.0/16".into()], allow_internet: Some(true),
+            always_route_subnets: Some(false), ..Default::default()
+        })), ..Default::default()
+    }];
+    let pending = [Endpoint { type_field: "wireguard".into(), tag: "WG".into(), ..Default::default() }];
+    let ids = BTreeMap::from([("wg".to_string(), "WG".to_string())]);
+    let route = build_route_config(&config, &ids, &deps_default(&pending));
+    assert!(route.rules.iter().any(|rule| rule.outbound.as_deref() == Some("WG")
+        && rule.ip_cidr.as_ref().is_some_and(|cidrs| cidrs.contains(&"10.20.0.0/16".to_string()))));
+}

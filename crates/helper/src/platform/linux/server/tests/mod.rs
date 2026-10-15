@@ -308,10 +308,10 @@ fn reap_group_wait_returns_immediately_when_empty() {
 }
 
 #[test]
-fn forward_fn_points_to_set_forward_prod() {
-    // 验证闭包指针 = set_forward_prod（不 panic 即接线正确）。
-    let f = forward_fn();
-    f(false); // best-effort 写 /proc（非 root 静默失败）
+fn forward_fn_satisfies_injection_contract_without_host_writes() {
+    // Check the HandlerDeps callback contract without invoking the host writer.
+    let forward: fn(bool) = forward_fn();
+    let _: &(dyn Fn(bool) + Send + Sync) = &forward;
 }
 
 /// 静态断言：ServerError 实现了 std::error::Error + Display。

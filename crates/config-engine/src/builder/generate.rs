@@ -798,16 +798,23 @@ fn close_dns_rule_set_graph(
 
 /// 收集 DNS 规则实际引用的 tag；只看已生成的结果，因而天然遵守 DNS builder 的模式/条件/文件有效性门。
 fn dns_rule_set_references(dns: &DnsConfig) -> BTreeSet<String> {
-    dns.rules
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .flat_map(|rule| match rule.rule_set.as_ref() {
-            Some(OneOrMany::One(tag)) => vec![tag.clone()],
-            Some(OneOrMany::Many(tags)) => tags.clone(),
-            None => vec![],
-        })
-        .collect()
+    fn collect(rule: &DnsRule, tags: &mut BTreeSet<String>) {
+        match &rule.rule_set {
+            Some(OneOrMany::One(tag)) => {
+                tags.insert(tag.clone());
+            }
+            Some(OneOrMany::Many(values)) => tags.extend(values.iter().cloned()),
+            None => {}
+        }
+        for child in rule.rules.iter().flatten() {
+            collect(child, tags);
+        }
+    }
+    let mut tags = BTreeSet::new();
+    for rule in dns.rules.iter().flatten() {
+        collect(rule, &mut tags);
+    }
+    tags
 }
 
 /// 最后一层 fail-closed：若今后 DNS builder 新增了无法投影的引用，也只能丢掉该 DNS 规则，
@@ -826,6 +833,17 @@ fn retain_defined_dns_rule_sets(
     defined: &BTreeSet<String>,
     pruned: &mut BTreeSet<String>,
 ) -> bool {
+    if let Some(children) = rule.rules.as_mut() {
+        let before = children.len();
+        children.retain_mut(|child| retain_defined_dns_rule_sets(child, defined, pruned));
+        // Same fail-closed policy as route logical pruning: an incomplete AND cannot
+        // become a broader matcher; an empty OR cannot become unconditional.
+        if children.is_empty()
+            || (rule.mode.as_deref() == Some("and") && children.len() < before)
+        {
+            return false;
+        }
+    }
     let Some(rule_set) = rule.rule_set.as_ref() else {
         return true;
     };

@@ -136,34 +136,19 @@ fn answer_response_uses_compression_pointer() {
 }
 
 #[test]
-fn skip_name_rejects_unterminated_name_and_never_follows_pointers() {
-    // 无 root 标签、长度字节把 off 推出界的畸形名 → **必须** None（不死循环、不 panic）。
-    // 旧断言 `is_none() || unwrap() <= len+2` 是恒真式（任何 Some(≤10) 都能过），锁不住任何东西。
-    assert_eq!(skip_name(&[1u8; 8], 0), None, "无 root 终止 → None");
-    assert_eq!(
-        skip_name(&[3u8, b'a', b'b'], 0),
-        None,
-        "标签长度越界 → None"
-    );
-    assert_eq!(skip_name(&[], 0), None, "空 buf → None");
-
-    // 正常名：`3 a b c 0` → 名字后偏移 = 5。
+fn skip_name_validates_compressed_names_without_looping() {
+    assert_eq!(skip_name(&[1u8; 8], 0), None);
+    assert_eq!(skip_name(&[3u8, b'a', b'b'], 0), None);
+    assert_eq!(skip_name(&[], 0), None);
     assert_eq!(skip_name(&[3, b'a', b'b', b'c', 0], 0), Some(5));
-    // 根标签单字节名 → 1。
     assert_eq!(skip_name(&[0], 0), Some(1));
-
-    // 【核心语义：压缩指针**不追随**】自指指针 0xC000（指向自己）→ 恒返回 off+2、绝不解引用。
-    // 变异验证：把 `skip_name` 的 `return Some(off + 2)` 改成 `off = (指针目标) as usize; continue`
-    // → 本断言立刻死循环/超时转红。
-    assert_eq!(
-        skip_name(&[0xC0, 0x00], 0),
-        Some(2),
-        "指针占 2 字节且不追随"
-    );
-    // 指针出现在标签之后：`1 a C0 00` → 2(标签) + 2(指针) = 4。
-    assert_eq!(skip_name(&[1, b'a', 0xC0, 0x00], 0), Some(4));
-    // 指针目标落在缓冲区外也不追随（不越界读、不 panic）。
-    assert_eq!(skip_name(&[0xC0, 0xFF], 0), Some(2));
+    // A complete backwards compression pointer returns the position after its wire bytes.
+    assert_eq!(skip_name(&[1, b'a', 0, 0xc0, 0], 3), Some(5));
+    // A malformed name cannot become a classified HIT merely because its RR header fits.
+    assert_eq!(skip_name(&[0xc0], 0), None);
+    assert_eq!(skip_name(&[0xc0, 0], 0), None); // self pointer
+    assert_eq!(skip_name(&[1, b'a', 0xc0, 0], 0), None); // backwards cycle
+    assert_eq!(skip_name(&[0xc0, 0xff], 0), None); // forward/out of range
 }
 
 #[test]
@@ -207,4 +192,43 @@ fn answer_response_resets_qdcount_to_one() {
     assert_eq!(u16_at(&resp, 6), Some(1), "ANCOUNT=1");
     // 重置后整包自洽 → 仍可被自己的分类器判 HIT（QDCOUNT=2 时 skip_name 会多跳一个 question 而错位）。
     assert_eq!(classify_dns_response(&resp, TYPE_A), DnsResponseClass::Hit);
+}
+
+#[test]
+fn rr_walk_rejects_truncated_or_wrong_sized_answers_before_classifying_hit() {
+    let query = encode_dns_query("safe.example", TYPE_A, 7);
+    let valid = a_response(&query, &[[1, 1, 1, 1], [8, 8, 8, 8]]);
+    for cut in 1..=4 {
+        let malformed = &valid[..valid.len() - cut];
+        assert_eq!(classify_dns_response(malformed, TYPE_A), DnsResponseClass::Fail);
+        assert!(extract_answer_ip_bytes(malformed).is_empty());
+    }
+    for (rtype, size) in [(TYPE_A, 3), (TYPE_A, 5), (TYPE_AAAA, 15), (TYPE_AAAA, 17)] {
+        let response = build_answer_response(&query, &[AnswerRecord { rtype, rdata: vec![1; size] }]);
+        assert_eq!(classify_dns_response(&response, rtype), DnsResponseClass::Fail);
+        assert!(extract_answer_ip_bytes(&response).is_empty());
+    }
+    // Also validate the remainder after a good answer and after an NXDOMAIN header.
+    let mut bad_additional = a_response(&query, &[[1, 1, 1, 1]]);
+    put_u16(&mut bad_additional, 10, 1);
+    bad_additional.push(0xc0); // Incomplete compressed NAME.
+    assert_eq!(classify_dns_response(&bad_additional, TYPE_A), DnsResponseClass::Fail);
+    put_u16(&mut bad_additional, 2, 0x8183);
+    assert_eq!(classify_dns_response(&bad_additional, TYPE_A), DnsResponseClass::Fail);
+}
+
+#[test]
+fn rr_walk_keeps_complete_cname_and_multiple_addresses() {
+    let query = encode_dns_query("safe.example", TYPE_A, 7);
+    let response = build_answer_response(&query, &[
+        AnswerRecord { rtype: 5, rdata: vec![0xc0, 0x0c] },
+        AnswerRecord { rtype: TYPE_A, rdata: vec![1, 1, 1, 1] },
+        AnswerRecord { rtype: TYPE_A, rdata: vec![8, 8, 8, 8] },
+    ]);
+    assert_eq!(classify_dns_response(&response, TYPE_A), DnsResponseClass::Hit);
+    assert_eq!(extract_answer_ip_bytes(&response), vec![vec![1, 1, 1, 1], vec![8, 8, 8, 8]]);
+    let mut missing_question = query;
+    put_u16(&mut missing_question, 2, 0x8180);
+    missing_question.pop();
+    assert_eq!(classify_dns_response(&missing_question, TYPE_A), DnsResponseClass::Fail);
 }

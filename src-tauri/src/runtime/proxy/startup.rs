@@ -2216,6 +2216,7 @@ impl ProxyRuntime {
 
         let new_status = ProxyStatus {
             main_generation: my_gen,
+            owned_stop_context: None, // IPC read-time context; never a stored selector mirror.
             running: true,
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,

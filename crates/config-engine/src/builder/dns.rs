@@ -128,6 +128,7 @@ pub fn is_lan_dns_ip(value: &str) -> bool {
 
 #[derive(Default, Clone)]
 struct DnsEffectMatcher {
+    all_of: Vec<DnsEffectMatcher>,
     domains: Vec<String>,
     suffixes: Vec<String>,
     keywords: Vec<String>,
@@ -136,16 +137,9 @@ struct DnsEffectMatcher {
 }
 
 impl DnsEffectMatcher {
-    fn append(&mut self, mut other: Self) {
-        self.domains.append(&mut other.domains);
-        self.suffixes.append(&mut other.suffixes);
-        self.keywords.append(&mut other.keywords);
-        self.regexes.append(&mut other.regexes);
-        self.rule_sets.append(&mut other.rule_sets);
-    }
-
     fn is_empty(&self) -> bool {
-        self.domains.is_empty()
+        self.all_of.is_empty()
+            && self.domains.is_empty()
             && self.suffixes.is_empty()
             && self.keywords.is_empty()
             && self.regexes.is_empty()
@@ -154,6 +148,14 @@ impl DnsEffectMatcher {
 }
 
 fn dns_rule_from_matcher(matcher: DnsEffectMatcher) -> DnsRule {
+    if !matcher.all_of.is_empty() {
+        return DnsRule {
+            type_field: Some("logical".into()),
+            mode: Some("and".into()),
+            rules: Some(matcher.all_of.into_iter().map(dns_rule_from_matcher).collect()),
+            ..Default::default()
+        };
+    }
     DnsRule {
         rule_set: if matcher.rule_sets.is_empty() {
             None
@@ -245,7 +247,15 @@ fn append_dns_policy_action(
                 return;
             }
             let mut rule = dns_rule_from_matcher(matcher);
-            rule.query_type = Some(vec!["A".into(), "AAAA".into()]);
+            let query_types = Some(vec!["A".into(), "AAAA".into()]);
+            if let Some(children) = rule.rules.as_mut() {
+                children.push(DnsRule {
+                    query_type: query_types,
+                    ..Default::default()
+                });
+            } else {
+                rule.query_type = query_types;
+            }
             rule.action = Some("route".into());
             rule.server = Some("fakeip".into());
             out.push(rule);
@@ -263,7 +273,15 @@ fn append_dns_policy_action(
                 return;
             }
             let mut hosts_rule = dns_rule_from_matcher(matcher.clone());
-            hosts_rule.preferred_by = Some(vec![hosts_tag.clone()]);
+            let preferred_by = Some(vec![hosts_tag.clone()]);
+            if let Some(children) = hosts_rule.rules.as_mut() {
+                children.push(DnsRule {
+                    preferred_by,
+                    ..Default::default()
+                });
+            } else {
+                hosts_rule.preferred_by = preferred_by;
+            }
             hosts_rule.action = Some("route".into());
             hosts_rule.server = Some(hosts_tag);
             out.push(hosts_rule);
@@ -1362,7 +1380,12 @@ pub fn build_dns_config(
             .find(|resource| resource.id == resource_id)
             .is_some_and(|resource| {
                 let path = format!("{}/{}", deps.rule_resources_path, resource.file_name);
-                (deps.is_valid_srs_fn)(&path)
+                match resource.format {
+                    crate::user_config::rule::RuleResourceFormat::Binary => {
+                        (deps.is_valid_srs_fn)(&path)
+                    }
+                    crate::user_config::rule::RuleResourceFormat::Source => (deps.exists_fn)(&path),
+                }
             })
     };
     let geo_tag_available = |tag: &str| {
@@ -1497,20 +1520,15 @@ pub fn build_dns_config(
 
         let matchers: Vec<DnsEffectMatcher> =
             if rule.combine_mode == Some(crate::user_config::rule::CombineMode::And) {
-                let mut merged = DnsEffectMatcher::default();
-                let mut complete = true;
-                for condition in &conditions {
-                    if let Some(matcher) = matcher_for(condition) {
-                        merged.append(matcher);
-                    } else {
-                        complete = false;
-                        break;
-                    }
-                }
-                if complete && !merged.is_empty() {
-                    vec![merged]
-                } else {
-                    vec![]
+                // Default DNS domain fields are OR in the core. Each user condition
+                // needs its own headless child to preserve AND (including repeated types).
+                match conditions.iter().map(matcher_for).collect::<Option<Vec<_>>>() {
+                    Some(mut children) if children.len() == 1 => vec![children.remove(0)],
+                    Some(children) if !children.is_empty() => vec![DnsEffectMatcher {
+                        all_of: children,
+                        ..Default::default()
+                    }],
+                    _ => vec![], // Any unresolved AND condition makes the whole rule unavailable.
                 }
             } else {
                 conditions.iter().filter_map(matcher_for).collect()
@@ -1535,7 +1553,13 @@ pub fn build_dns_config(
                 if let Some(env) = env {
                     for emitted in &mut dns_rules[start..] {
                         if emitted.action.as_deref() != Some("respond") {
-                            env.apply_to_dns_rule(emitted);
+                            if let Some(children) = emitted.rules.as_mut() {
+                                let mut condition = DnsRule::default();
+                                env.apply_to_dns_rule(&mut condition);
+                                children.push(condition);
+                            } else {
+                                env.apply_to_dns_rule(emitted);
+                            }
                         }
                     }
                 }

@@ -53,6 +53,7 @@ import {
   createClosedFeed,
   matchConnRow,
   resetActiveFeed,
+  restoreFailedClosingRows,
   sortConnRows,
   type ConnRowVM,
 } from './view-model';
@@ -1594,4 +1595,17 @@ describe('⑫ 批 13：加规则 / 可折叠分组 / 旧日志三格', () => {
       'mobileRules.formUnavailable',
     );
   });
+});
+
+
+it('failed/unknown close rollback restores paused rows while retaining success suppression', () => {
+  const feed = createActiveFeed();
+  const rows = [{ id: 'a' }, { id: 'b' }, { id: 'c' }] as ConnRowVM[];
+  rows.forEach((row) => feed.index.set(row.id, { id: row.id } as ConnectionEntry));
+  rows.forEach((row) => feed.closing.add(row.id));
+  const restored = restoreFailedClosingRows(feed, [], rows, ['a', 'c']);
+  expect(restored.map((row) => row.id)).toEqual(['a', 'c']);
+  expect([...feed.closing]).toEqual(['b']);
+  feed.index.delete('a');
+  expect(restoreFailedClosingRows(feed, [], rows, ['a'])).toEqual([]);
 });
