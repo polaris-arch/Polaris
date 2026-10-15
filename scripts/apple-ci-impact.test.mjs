@@ -4,6 +4,22 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { appleRequired } from './apple-ci-impact.mjs';
 
+function aggregateScript() {
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  const gate = risk.slice(risk.indexOf('\n  gate:\n'));
+  return gate.slice(gate.indexOf('        run: |\n') + '        run: |\n'.length)
+    .split('\n').map((line) => line.slice(10)).join('\n');
+}
+
+function aggregateEnvironment() {
+  return { CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
+    NATIVE_VALIDATION_REQUIRED: 'false', NATIVE_VALIDATION_RESULT: 'skipped',
+    DESKTOP_CORE_REQUIRED: 'false', DESKTOP_CORE_RESULT: 'skipped',
+    PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped', PACKAGE_REQUIRED: 'false',
+    PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped',
+    APPLE_DEFERRED: 'false' };
+}
+
 test('real Apple and shared producer/application edits select the final App leg', () => {
   for (const path of ['src-tauri/gen/apple/project.yml', 'src-tauri/src/lib.rs',
     'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
@@ -100,15 +116,8 @@ test('one native host rejects mismatched tools before setup without carrier tran
 });
 
 test('actual aggregate shell refuses every selected non-success Apple status', () => {
-  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
-  const gate = risk.slice(risk.indexOf('\n  gate:\n'));
-  const body = gate.slice(gate.indexOf('        run: |\n') + '        run: |\n'.length)
-    .split('\n').map((line) => line.slice(10)).join('\n');
-  const base = { CLASSIFY_RESULT: 'success', PC_RUNTIME_POLICY_RESULT: 'success', UNREGISTERED: '',
-    NATIVE_VALIDATION_REQUIRED: 'false', NATIVE_VALIDATION_RESULT: 'skipped',
-    DESKTOP_CORE_REQUIRED: 'false', DESKTOP_CORE_RESULT: 'skipped',
-    PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped',
-    PACKAGE_REQUIRED: 'false', PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped' };
+  const body = aggregateScript();
+  const base = aggregateEnvironment();
   const check = (script) => {
     const invoke = (required, result) => spawnSync('bash', ['-c', script], {
       env: { ...process.env, ...base, APPLE_REQUIRED: required, APPLE_RESULT: result }, encoding: 'utf8',
@@ -123,4 +132,50 @@ test('actual aggregate shell refuses every selected non-success Apple status', (
   const permissive = body.replace('[ "$APPLE_RESULT" != success ]', '[ "$APPLE_RESULT" = failure ]');
   assert.notEqual(permissive, body);
   assert.throws(() => check(permissive));
+});
+
+test('temporary Apple deferral is manual branch-only and keeps publication and source scope guards', () => {
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  const input = risk.slice(risk.indexOf('      defer_apple:'), risk.indexOf('\npermissions:'));
+  assert.match(input, /type: boolean\n\s+default: false/);
+  const validation = risk.split('      - name: Validate manual Apple deferral scope\n')[1]
+    .split('      - uses:')[0];
+  assert.match(validation, /if: github.event_name == 'workflow_dispatch' && inputs.defer_apple/);
+  const script = validation.split('        run: |\n')[1].split('\n').map(line => line.slice(10)).join('\n');
+  for (const ref of ['refs/heads/collab/ui01-status-20261010', 'refs/heads/main']) {
+    assert.equal(spawnSync('bash', ['-c', script], { env: { ...process.env, VALIDATION_REF: ref } }).status, 0);
+  }
+  for (const ref of ['refs/tags/v1.0.0', 'refs/tags/anything', '', 'refs/heads/']) {
+    assert.equal(spawnSync('bash', ['-c', script], { env: { ...process.env, VALIDATION_REF: ref } }).status, 1);
+  }
+  assert.match(risk, /if: needs\.classify\.outputs\.apple == 'true' && !\(github\.event_name == 'workflow_dispatch' && inputs\.defer_apple\)/);
+  assert.match(risk, /APPLE_REQUIRED: \$\{\{ needs\.classify\.outputs\.apple \}\}/);
+  assert.match(risk, /upload_artifacts: false/);
+  assert.match(risk, /light_build: true/);
+  assert.doesNotMatch(risk, /gh release (create|upload|edit)|download-artifact[^\n]*apple/);
+});
+
+test('deferred Apple never passes the full aggregate and never conceals non-Apple failures', () => {
+  const script = aggregateScript();
+  const invoke = overrides => spawnSync('bash', ['-c', script], { encoding: 'utf8',
+    env: { ...process.env, ...aggregateEnvironment(), APPLE_DEFERRED: 'true',
+      APPLE_REQUIRED: 'true', APPLE_RESULT: 'skipped', GITHUB_STEP_SUMMARY: '/dev/null', ...overrides } });
+  for (const result of ['skipped', 'success', 'failure', 'cancelled', '']) {
+    const value = invoke({ APPLE_RESULT: result });
+    assert.equal(value.status, 1);
+    assert.match(value.stdout, /APPLE_VALIDATION=NOT_VALIDATED/);
+    assert.match(value.stdout, /Non-Apple selected legs passed/);
+    assert.doesNotMatch(value.stdout, /发布风险门通过：/);
+  }
+  assert.equal(invoke({ APPLE_REQUIRED: 'false' }).status, 1);
+  for (const prefix of ['DESKTOP_CORE', 'PREFLIGHT', 'PACKAGE', 'ANDROID']) {
+    for (const result of ['failure', 'skipped', 'cancelled']) {
+      const value = invoke({ [`${prefix}_REQUIRED`]: 'true', [`${prefix}_RESULT`]: result });
+      assert.equal(value.status, 1);
+      assert.doesNotMatch(value.stdout, /Non-Apple selected legs passed/);
+    }
+  }
+  const full = invoke({ APPLE_DEFERRED: 'false', APPLE_RESULT: 'success' });
+  assert.equal(full.status, 0);
+  assert.doesNotMatch(full.stdout, /NOT_VALIDATED/);
 });

@@ -21,6 +21,10 @@ on:
         options: [ordinary, native-payload]
         default: ordinary
         required: true
+      defer_apple:
+        description: '临时只验证非Apple；Apple未验证，完整风险门仍不通过，不发布产物'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -66,6 +70,19 @@ jobs:
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
       native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
     steps:
+      - name: Validate manual Apple deferral scope
+        if: github.event_name == 'workflow_dispatch' && inputs.defer_apple
+        shell: bash
+        env:
+          VALIDATION_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Reuse the existing no-upload/light-build and tag-only publication
+          # guards below. Deferral cannot enter a tag publication DAG.
+          case "$VALIDATION_REF" in
+            refs/heads/?*) ;;
+            *) echo '::error::Apple deferral is validation-only on an explicit branch'; exit 1 ;;
+          esac
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -386,7 +403,7 @@ jobs:
   apple:
     name: apple unsigned App and PacketTunnel gate
     needs: classify
-    if: needs.classify.outputs.apple == 'true'
+    if: needs.classify.outputs.apple == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.defer_apple)
     permissions:
       contents: read
     uses: ./.github/workflows/apple.yml
@@ -414,12 +431,17 @@ jobs:
       ANDROID_RESULT: ${{ needs.android.result }}
       APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
       APPLE_RESULT: ${{ needs.apple.result }}
+      APPLE_DEFERRED: ${{ github.event_name == 'workflow_dispatch' && inputs.defer_apple && 'true' || 'false' }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
         shell: bash
         run: |
           set -euo pipefail
+          if [ "${APPLE_DEFERRED:-false}" = true ]; then
+            echo '::warning::APPLE_VALIDATION=NOT_VALIDATED; explicit temporary deferral, no Apple workflow/artifact import or publication'
+            printf '%s\n' 'Apple: **NOT_VALIDATED** (explicit temporary deferral).' 'Non-Apple checks still run; this is not complete candidate acceptance or publication clearance.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
           [ "$CLASSIFY_RESULT" = success ] || {
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
           [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
@@ -453,6 +475,10 @@ jobs:
           # 「没被选中」由分类器的登记表负责，而登记根内的未登记 scope 已 fail-closed 成 android=true。
           if [ "$ANDROID_REQUIRED" = true ] && [ "$ANDROID_RESULT" != success ]; then
             echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
+            exit 1
+          fi
+          if [ "${APPLE_DEFERRED:-false}" = true ]; then
+            echo 'Non-Apple selected legs passed; Apple remains NOT_VALIDATED. Full release risk gate is not passed.'
             exit 1
           fi
           if [ "$APPLE_REQUIRED" = true ] && [ "$APPLE_RESULT" != success ]; then
