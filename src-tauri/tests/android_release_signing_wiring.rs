@@ -1726,3 +1726,114 @@ fn key_material_can_never_enter_the_repository() {
         );
     }
 }
+
+/// Source contract only: the real transition controls run in the Android behavior gate.
+/// Keep daemon lifetime separate from configuration/facts execution and from other builds.
+#[test]
+fn behavior_oracle_ci_daemon_is_scoped_and_never_reuses_configuration() {
+    let raw = polaris_source_probe::repo_file!(BEHAVIOR_GATE_SCRIPT);
+    let gate = code_face(BEHAVIOR_GATE_SCRIPT, &raw);
+    for required in [
+        "DAEMON_FLAGS=(--no-daemon)",
+        r#"case "${POLARIS_GATE_CI_DAEMON:-0}" in"#,
+        r#"[ "${CI:-}" = true ] && [ "${GITHUB_ACTIONS:-}" = true ] || die "daemon reuse is CI-only""#,
+        r#"export GRADLE_USER_HOME="$WORK/gradle-home""#,
+        "for part in caches wrapper jdks; do",
+        "DAEMON_FLAGS=(--daemon)",
+        r#"GRADLE_COMMON=(./gradlew --offline "${DAEMON_FLAGS[@]}" --no-configuration-cache --init-script "$ORACLE_INIT")"#,
+        r#"DRY=("${GRADLE_COMMON[@]}" :app:assembleArm64Release --dry-run)"#,
+        r#"DRY_DEBUG=("${GRADLE_COMMON[@]}" :app:assembleArm64Debug --dry-run)"#,
+        r#"FACTS=("${GRADLE_COMMON[@]}" :app:printPolarisReleaseFacts)"#,
+        "INVOCATIONS=$((INVOCATIONS + 1))",
+        r#"export POLARIS_ORACLE_INVOCATION="$nonce""#,
+        "gradle.settingsEvaluated {",
+        r#"println("POLARIS_ORACLE_CONFIG\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))"#,
+        r#"println("POLARIS_ORACLE_EXEC\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))"#,
+        r#"|| die "fresh configuration missing: $log""#,
+        r#"|| die "facts task did not execute: $log""#,
+        r#"( cd "$GRADLE_DIR" && ./gradlew --offline --stop ) >"$WORK/daemon-stop.log" 2>&1 || cleanup_rc=2"#,
+        "trap on_exit EXIT",
+        "trap 'EXIT_SEALED=signal; exit 130' INT",
+        "trap 'EXIT_SEALED=signal; exit 143' TERM",
+        r#"[ "$rc" -ne 0 ] || rc=$cleanup_rc"#,
+        r#"if [ "$rc" -eq 0 ]; then rm -rf -- "$WORK"; fi"#,
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing daemon/configuration contract: {required}"
+        );
+    }
+    let cleanup = gate
+        .split("on_exit() {")
+        .nth(1)
+        .unwrap()
+        .split("trap on_exit EXIT")
+        .next()
+        .unwrap();
+    assert!(cleanup.find("restore\n").unwrap() < cleanup.find("./gradlew --offline --stop").unwrap());
+    assert!(cleanup.find("./gradlew --offline --stop").unwrap() < cleanup.find("rm -rf").unwrap());
+    assert!(!gate.contains("--configuration-cache "));
+}
+
+#[test]
+fn behavior_oracle_keeps_all_eighteen_scenarios_and_environment_transition_controls() {
+    let raw = polaris_source_probe::repo_file!(BEHAVIOR_GATE_SCRIPT);
+    let gate = code_face(BEHAVIOR_GATE_SCRIPT, &raw);
+    let scenarios: Vec<_> = gate
+        .lines()
+        .filter(|line| line.starts_with("gradle_run \"") || line.starts_with("gradle_run_signed \""))
+        .map(|line| line.split('"').nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        scenarios,
+        [
+            "$WORK/1-bare.log",
+            "$WORK/2-hatch.log",
+            "$WORK/5b-arm-flavors.log",
+            "$WORK/2b-facts.log",
+            "$WORK/3-props.log",
+            "$WORK/3b-facts.log",
+            "$WORK/4-env.log",
+            "$WORK/4b-facts.log",
+            "$WORK/4-reset-facts.log",
+            "$WORK/4c-env.log",
+            "$WORK/6-debug.log",
+            "$WORK/7-facts.log",
+            "$WORK/8-missing.log",
+            "$WORK/9-facts.log",
+            "$WORK/9-dry.log",
+            "$WORK/10-facts.log",
+            "$WORK/10-dry.log",
+            "$WORK/10c-dry.log",
+            "$WORK/10c-facts.log",
+            "$WORK/10-reset-dry.log",
+            "$WORK/10-reset-facts.log",
+        ]
+    );
+    for required in [
+        r#"gradle_run "$WORK/4-env.log" env ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${DRY[@]}""#,
+        r#"gradle_run "$WORK/4-reset-facts.log" "${FACTS[@]}""#,
+        r#"expect_has "环境属性未串到下一场景" "$WORK/4-reset-facts.log" $'hatchAllPropertyKeys\t<none>'"#,
+        r#"expect_rc "撤销凭据后 release 再次拒绝" nonzero"#,
+        r#"expect_has "签名环境未串到下一场景" "$WORK/10-reset-dry.log" "$MSG_REFUSE""#,
+        r#"expect_has "签名容器已恢复空壳" "$WORK/10-reset-facts.log" $'POLARIS_FACT\tsigningStoreFile\t<none>\tfalse\tfalse'"#,
+        r#"cmp -s -- "$WORK/original-rules.txt" "$WORK/restored-rules.txt""#,
+        r#"[ "$INVOCATIONS" -eq 21 ] || die"#,
+        r#"cmp -s -- "$PROPS_BAK" "$PROPS" || cleanup_rc=2"#,
+        r#"cmp -s -- "$RULE_BAK" "$SACRIFICIAL_RULE" || cleanup_rc=2"#,
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing scenario/isolation contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn android_workflow_explicitly_opts_in_both_oracles_and_retains_original_stage1() {
+    let workflow = polaris_source_probe::repo_file!(ANDROID_WORKFLOW);
+    assert_eq!(workflow.matches("          POLARIS_GATE_CI_DAEMON: \"1\"\n        run: bash scripts/gate-android-release-behavior.sh").count(), 2);
+    assert_eq!(workflow.matches("            ${{ runner.temp }}/release-stage1.log").count(), 1);
+    assert!(workflow.contains("stage1_log=\"$RUNNER_TEMP/release-stage1.log\""));
+    assert!(workflow.contains(">\"$stage1_log\" 2>&1"));
+}

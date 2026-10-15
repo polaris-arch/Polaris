@@ -547,6 +547,8 @@ jobs:
         run: node scripts/verify-wry-keep-rules.mjs
 
       - name: release 构建行为裁判（gradle 配置期实证）
+        env:
+          POLARIS_GATE_CI_DAEMON: "1"
         run: bash scripts/gate-android-release-behavior.sh
 
       # APK 不会上传；验证结论与 mapping 才是这条非发布腿的输出。
@@ -568,7 +570,10 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DefaultNetworkObservationTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.NetworkMonitorSessionTest.xml
             ${{ runner.temp }}/s5-android-unit-results.json
-          # 一个文件都没命中 = R8 没跑或产物路径变了，那正是本步要抓的事，不许静默绿。
+            ${{ runner.temp }}/release-stage1.log
+          # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.
+          # APK/R8/S5 gates still validate their own required evidence independently.
+          # No evidence at all is an error; a stage1 log alone never proves R8/S5 passed.
           if-no-files-found: error
           retention-days: 90
 
@@ -1040,6 +1045,8 @@ jobs:
 
       # publish_release=true 时 unsigned 验证腿不运行；配置期判据必须由 signed job 自己承担。
       - name: release 构建行为裁判（gradle 配置期实证）
+        env:
+          POLARIS_GATE_CI_DAEMON: "1"
         run: bash scripts/gate-android-release-behavior.sh
 
       # signed release 本身就是最强的 R8 取材点：configuration/seeds 必须来自将要发布的这次构建。

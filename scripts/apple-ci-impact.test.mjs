@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
+import { runInNewContext } from 'node:vm';
 import { appleRequired } from './apple-ci-impact.mjs';
 
 function aggregateScript() {
@@ -24,6 +25,7 @@ test('real Apple and shared producer/application edits select the final App leg'
   for (const path of ['src-tauri/gen/apple/project.yml', 'src-tauri/src/lib.rs',
     'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/apple_rust.py',
+    'scripts/mobile-core/apple_cache.py', 'scripts/mobile-core/test_apple_cache.py',
     'src-tauri/capabilities/default.json', 'src-tauri/capabilities/tray.json',
     'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs',
     'ui/src/App.tsx', 'Cargo.lock', 'src-tauri/tauri.ios.conf.json', '.github/workflows/apple.yml']) {
@@ -47,12 +49,13 @@ test('selected Apple failure/skip is consumed by the existing aggregate gate', (
   assert.match(risk, /node scripts\/apple-ci-impact\.mjs --full/);
 });
 
-test('Apple workflow keeps one admitted host and two complete isolated arm64 carrier outputs', () => {
+test('Apple workflow keeps one admitted host, mandatory device and optional isolated simulator output', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
   assert.match(workflow, /runs-on: xcode-27/);
-  assert.match(workflow, /targets: aarch64-apple-ios,aarch64-apple-ios-sim\n/);
-  assert.match(workflow, /key: apple-whole-host-arm64-only-xcode27\.1-27A9275/);
-  assert.doesNotMatch(workflow, /sim-amd64|sim_amd64|x86_64-apple-ios|three-slot|three-slice/);
+  assert.match(workflow, /targets: \$\{\{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' \|\| 'aarch64-apple-ios' \}\}/);
+  assert.match(workflow, /POLARIS_APPLE_SCOPE: \$\{\{ inputs.include_simulator && 'device-and-simulator' \|\| 'device-only' \}\}/);
+  assert.equal((workflow.match(/include_simulator:\n\s+description:[^\n]+\n\s+type: boolean\n\s+default: false/g) || []).length, 2);
+  assert.doesNotMatch(workflow, /Swatinem\/rust-cache|sim-amd64|sim_amd64|x86_64-apple-ios|three-slot|three-slice/);
   for (const action of ['prepare', 'build', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot']) {
     assert.match(workflow, new RegExp(`ci_apple.py ${action}`));
   }
@@ -60,17 +63,42 @@ test('Apple workflow keeps one admitted host and two complete isolated arm64 car
   assert.equal((workflow.match(/ci_apple.py build/g) || []).length, 1);
   assert.equal((workflow.match(/ci_apple.py carrier --slot/g) || []).length, 2);
   assert.match(workflow, /unsigned-chain:\n\s+needs: component\n\s+if: always\(\)/);
-  for (const slot of ['device-arm64', 'sim-arm64']) {
+  const blocks = workflow.split(/^ {6}- /m).slice(1);
+  for (const [slot, short] of [['device-arm64', 'device'], ['sim-arm64', 'sim']]) {
     const id = slot.replaceAll('-', '_');
     const start = workflow.indexOf('id: ' + id + '\n');
     const original = workflow.indexOf('id: original_' + id + '\n', start);
-    const summary = workflow.indexOf('/summaries/' + slot + '/', original);
-    const retire = workflow.indexOf('retire-slot --slot "' + slot + '"', summary);
-    assert.ok(start >= 0 && original > start && summary > original && retire > summary);
-    assert.match(workflow.slice(start, original), /!cancelled\(\) && steps.shared_ready.conclusion == 'success'/);
-    assert.match(workflow.slice(summary, retire), new RegExp('steps.original_' + id + ".conclusion == 'success'"));
+    const summary = workflow.indexOf('id: summary_' + id + '\n', original);
+    const exported = workflow.indexOf('id: rust_' + short + '_export\n', summary);
+    const saved = workflow.indexOf('id: rust_' + short + '_save\n', exported);
+    const returned = workflow.indexOf('id: rust_' + short + '_return\n', saved);
+    const retire = workflow.indexOf('retire-slot --slot "' + slot + '"', returned);
+    assert.ok(start >= 0 && original > start && summary > original && exported > summary &&
+      saved > exported && returned > saved && retire > returned);
+    const exporting = blocks.find(block => block.includes(`id: rust_${short}_export\n`));
+    for (const required of [id, 'original_' + id, 'summary_' + id]) {
+      assert.ok(exporting.includes(`steps.${required}.conclusion == 'success'`));
+    }
+    const saving = blocks.find(block => block.includes(`id: rust_${short}_save\n`));
+    assert.match(saving, /uses: actions\/cache\/save@v5/);
+    assert.ok(saving.includes(`path: target/apple-ci-cache/${slot}`));
+    assert.ok(saving.includes(`key: \${{ steps.rust_${short}_restore.outputs.cache-primary-key }}`));
+    const returning = blocks.find(block => block.includes(`id: rust_${short}_return\n`));
+    assert.match(returning, /!cancelled\(\)/);
+    assert.doesNotMatch(returning, /_save.conclusion/);
+    const retiring = blocks.find(block => block.includes(`id: retire_${id}\n`));
+    assert.ok(retiring.includes(`steps.rust_${short}_export.conclusion == 'skipped' || steps.rust_${short}_return.conclusion == 'success'`));
   }
-  assert.match(workflow, /if: always\(\)/);
+  const simBlocks = blocks.filter(block => block.includes('--slot "sim-arm64"') ||
+    block.includes('path: target/apple-ci-cache/sim-arm64') || /name: apple-carrier-(?:original|summary)-sim-arm64/.test(block));
+  assert.equal(simBlocks.length, 11); // Includes the separately conditional aggregate download.
+  for (const block of simBlocks) assert.match(block, /if: \$\{\{ inputs.include_simulator(?: && | \}\})/);
+  const aggregate = blocks.find(block => block.includes('name: Strict declared-scope'));
+  assert.match(aggregate, /COMPONENT_RESULT: \$\{\{ needs.component.result \}\}/);
+  assert.match(aggregate, /\[ "\$COMPONENT_RESULT" = success \] \|\| \{\n\s+echo [^\n]+; exit 1; \}/);
+  assert.ok(aggregate.indexOf('[ "$COMPONENT_RESULT" = success ]') < aggregate.indexOf('ci_apple.py aggregate'));
+  assert.match(aggregate, /aggregate --scope "\$POLARIS_APPLE_SCOPE"/);
+  assert.match(aggregate, /sim-arm64: not requested/);
   assert.match(workflow, /contents: read/);
   assert.doesNotMatch(workflow, /contents: write|secrets:|publish_release|codesign --sign/);
   const hook = readFileSync(new URL('../src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
@@ -78,35 +106,40 @@ test('Apple workflow keeps one admitted host and two complete isolated arm64 car
   assert.match(hook, /mobile-core\/apple_rust\.py/);
 });
 
-test('shared prerequisite failure builds no carriers while first carrier failure leaves later slots selected', () => {
+test('shared failure builds no carriers; optional simulator requires safe device retirement, not device success', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
-  const shared = workflow.slice(workflow.indexOf('id: shared_ready'), workflow.indexOf('id: device_arm64'));
-  const condition = shared.match(/if: (.+)/)[1];
-  const prerequisites = [...condition.matchAll(/steps\.(\w+)\.conclusion == 'success'/g)].map(m => m[1]);
+  const blocks = workflow.split(/^ {6}- /m).slice(1);
+  const condition = id => blocks.find(block => block.includes(`id: ${id}\n`)).match(/if: \$\{\{ (.+) \}\}/)[1];
+  const shared = condition('shared_ready');
+  const prerequisites = [...shared.matchAll(/steps\.(\w+)\.conclusion == 'success'/g)].map(m => m[1]);
   for (const required of ['shared_component', 'component_payload', 'component_manifest',
-    'component_original', 'local_component', 'protoc', 'rust_cache']) {
+    'component_original', 'local_component', 'protoc', 'rust_cache', 'rust_registry_restore', 'rust_device_ready']) {
     assert.ok(prerequisites.includes(required));
   }
-  const nativeConditions = ['device_arm64', 'sim_arm64'].map(id => {
-    const block = workflow.slice(workflow.indexOf('id: ' + id + '\n'));
-    return block.match(/if: (.+)/)[1];
+  const ids = [...workflow.matchAll(/id: ([\w_]+)\n/g)].map(match => match[1]);
+  const success = Object.fromEntries(ids.map(id => [id, { conclusion: 'success' }]));
+  const evaluate = (text, steps, includeSimulator, cancelled = false) => runInNewContext(text, {
+    steps, inputs: { include_simulator: includeSimulator }, cancelled: () => cancelled,
   });
-  for (const text of nativeConditions) {
-    assert.match(text, /!cancelled\(\) && steps.shared_ready.conclusion == 'success'/);
-    assert.doesNotMatch(text, /steps\.(device_arm64|sim_arm64)\./);
-  }
-  const selectedCount = statuses => {
-    const ready = prerequisites.every(id => statuses[id] === 'success');
-    return nativeConditions.filter(text => ready && text.includes('steps.shared_ready')).length;
+  const selectedCount = (steps, includeSimulator) => {
+    const ready = evaluate(shared, steps, includeSimulator);
+    const state = { ...steps, shared_ready: { conclusion: ready ? 'success' : 'skipped' } };
+    return ['device_arm64', 'sim_arm64'].filter(id => evaluate(condition(id), state, includeSimulator)).length;
   };
-  const success = Object.fromEntries(prerequisites.map(id => [id, 'success']));
-  assert.equal(selectedCount(success), 2);
+  assert.equal(selectedCount(success, false), 1);
+  assert.equal(selectedCount(success, true), 2);
   for (const id of prerequisites) {
-    for (const state of ['failure', 'skipped', 'cancelled']) {
-      assert.equal(selectedCount({ ...success, [id]: state }), 0);
+    for (const state of ['failure', 'skipped', 'cancelled', '']) {
+      assert.equal(selectedCount({ ...success, [id]: { conclusion: state } }, true), 0);
     }
   }
-  assert.equal(selectedCount({ ...success, device_arm64: 'failure' }), 2);
+  assert.equal(selectedCount({ ...success, device_arm64: { conclusion: 'failure' } }, true), 2);
+  assert.match(condition('rust_sim_restore'), /steps.retire_device_arm64.conclusion == 'success'/);
+  for (const state of ['failure', 'cancelled', 'skipped', '']) {
+    assert.equal(evaluate(condition('rust_sim_restore'), { ...success, retire_device_arm64: { conclusion: state } }, true), false);
+  }
+  assert.equal(evaluate(condition('sim_arm64'), success, false), false);
+  assert.equal(evaluate(condition('sim_arm64'), success, true, true), false);
 });
 
 test('one native host rejects mismatched tools before setup without carrier transport', () => {

@@ -142,7 +142,10 @@ fi
 # 303 → 307: finite Apple selection/runner/actual aggregate negative controls.
 # 307 → 489: retained actual 77b Linux classification 480 passes plus nine
 # mandatory workflow-efficiency controls; authored controls are not yet run.
-if [ "$pass" -lt 489 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 489）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+# 489 → 493: desktop helper target/staging controls (+3) and exact-path classifier control (+1).
+# Apple changes existing Node cases (+0); Android adds no Node cases (+0).
+# Static registration count only; unified CI must verify actual TAP passes. Python/Vitest excluded.
+if [ "$pass" -lt 493 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 493）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

@@ -369,3 +369,14 @@ test('compiled core identity entry selects all four desktop packaging targets', 
   assert.equal(result.android, false);
   assert.deepEqual(result.unregisteredScopes, []);
 });
+
+
+test('workflow efficiency contract alone triggers all desktop installers without widening kernel or Android scope', () => {
+  assert.deepEqual(compact(['scripts/ci-workflow-efficiency.test.mjs']), {
+    kernel: false, platforms: [...ALL_PACKAGE_PLATFORMS], preflight: true, hasPackage: true,
+  });
+  assert.equal(classifyImpact(['scripts/ci-workflow-efficiency.test.mjs']).android, false);
+  for (const path of ['scripts/ci-workflow-efficiency.test.mjs.bak', 'docs/ci-workflow-efficiency.test.mjs']) {
+    assert.deepEqual(compact([path]), { kernel: false, platforms: [], preflight: false, hasPackage: false });
+  }
+});

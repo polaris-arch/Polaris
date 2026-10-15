@@ -320,6 +320,108 @@ esac
     expect(pkgJob).toContain('light_build: true');
   });
 
+  it('Apple 默认 device-only，typed 手动 opt-in 才增加 simulator 并强制选中 Apple 腿', () => {
+    const apple = read('apple.yml');
+    const inputs = apple.slice(0, apple.indexOf('\npermissions:'));
+    const inputBlocks = [...inputs.matchAll(/^ {6}include_simulator:\n([\s\S]*?)(?=^ {6}\w+:|^ {2}\w+:)/gm)];
+    expect(inputBlocks).toHaveLength(2);
+    for (const [, block] of inputBlocks) {
+      expect(block).toContain('type: boolean');
+      expect(block).toContain('default: false');
+    }
+    expect(apple).toContain("POLARIS_APPLE_SCOPE: ${{ inputs.include_simulator && 'device-and-simulator' || 'device-only' }}");
+    expect(apple).toContain("targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}");
+    const rootInput = risk.slice(risk.indexOf('      apple_include_simulator:'), risk.indexOf('      defer_apple:'));
+    expect(rootInput).toContain('type: boolean');
+    expect(rootInput).toContain('default: false');
+    const caller = jobSection(risk, 'apple', 'release-risk.yml');
+    const passed = caller.match(/^ {6}include_simulator: \$\{\{ (.+) \}\}$/m);
+    expect(passed).not.toBeNull();
+    for (const event of ['pull_request', 'push', 'merge_group', 'workflow_dispatch']) {
+      for (const selected of [false, true]) {
+        expect(runInNewContext(passed![1], { github: { event_name: event }, inputs: { apple_include_simulator: selected } }))
+          .toBe(event === 'workflow_dispatch' && selected);
+      }
+    }
+    expect(caller).toContain('name: apple unsigned App and PacketTunnel gate');
+    expect(caller).toContain("needs.classify.outputs.apple == 'true'");
+    const classify = jobSection(risk, 'classify', 'release-risk.yml');
+    expect(classify).toContain("POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}");
+    expect(classifyScript(risk)).toContain('if [ "${POLARIS_APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then\n  printf \'true\\n\' > "$apple_result"\nfi');
+    expect(classify).toContain('[ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ]');
+    expect(risk).toContain('Apple sim-arm64: not requested.');
+    expect(risk).toContain('Full release risk gate is not passed.');
+  });
+
+  it('Apple 单 host 串行保全，所有 simulator 操作显式条件化且 cache 不替代真实 carrier', () => {
+    const apple = read('apple.yml');
+    const component = jobSection(apple, 'component', 'apple.yml');
+    expect(component).not.toMatch(/strategy:|matrix:/);
+    expect(component.match(/ci_apple.py build/g)).toHaveLength(1);
+    const blocks = component.split(/^ {6}- /m).slice(1);
+    const simulator = blocks.filter((block) => block.includes('--slot "sim-arm64"') ||
+      block.includes('path: target/apple-ci-cache/sim-arm64') ||
+      /name: apple-carrier-(?:original|summary)-sim-arm64/.test(block));
+    expect(simulator).toHaveLength(10);
+    for (const block of simulator) {
+      expect(block).toMatch(/if: \$\{\{ inputs.include_simulator && !cancelled\(\)/);
+      expect(block).not.toContain('continue-on-error');
+    }
+    const device = blocks.find((block) => block.includes('id: device_arm64\n'))!;
+    expect(device).toContain('ci_apple.py carrier --slot "device-arm64"');
+    expect(device).not.toContain('inputs.include_simulator');
+    expect(device).not.toContain('cache-hit');
+    expect(component).not.toContain('Swatinem/rust-cache');
+    for (const [slot, short] of [['device-arm64', 'device'], ['sim-arm64', 'sim']]) {
+      const id = slot.replaceAll('-', '_');
+      const original = component.indexOf(`id: original_${id}\n`);
+      const summary = component.indexOf(`id: summary_${id}\n`);
+      const exported = component.indexOf(`id: rust_${short}_export\n`);
+      const saved = component.indexOf(`id: rust_${short}_save\n`);
+      const returned = component.indexOf(`id: rust_${short}_return\n`);
+      const retired = component.indexOf(`id: retire_${id}\n`);
+      expect(original).toBeGreaterThan(0);
+      expect(summary).toBeGreaterThan(original);
+      expect(exported).toBeGreaterThan(summary);
+      expect(saved).toBeGreaterThan(exported);
+      expect(returned).toBeGreaterThan(saved);
+      expect(retired).toBeGreaterThan(returned);
+      const exportBlock = blocks.find((block) => block.includes(`id: rust_${short}_export\n`))!;
+      expect(exportBlock).toContain(`steps.${id}.conclusion == 'success'`);
+      expect(exportBlock).toContain(`steps.original_${id}.conclusion == 'success'`);
+      expect(exportBlock).toContain(`steps.summary_${id}.conclusion == 'success'`);
+      const saveBlock = blocks.find((block) => block.includes(`id: rust_${short}_save\n`))!;
+      expect(saveBlock).toContain('uses: actions/cache/save@v5');
+      expect(saveBlock).toContain(`path: target/apple-ci-cache/${slot}`);
+      expect(saveBlock).toContain(`key: \${{ steps.rust_${short}_restore.outputs.cache-primary-key }}`);
+      const returnBlock = blocks.find((block) => block.includes(`id: rust_${short}_return\n`))!;
+      expect(returnBlock).toContain('!cancelled()');
+      expect(returnBlock).not.toContain(`steps.rust_${short}_save.conclusion`);
+      const retireBlock = blocks.find((block) => block.includes(`id: retire_${id}\n`))!;
+      expect(retireBlock).toContain(`steps.rust_${short}_export.conclusion == 'skipped' || steps.rust_${short}_return.conclusion == 'success'`);
+    }
+    const simRestore = blocks.find((block) => block.includes('id: rust_sim_restore\n'))!;
+    expect(simRestore).toContain("steps.retire_device_arm64.conclusion == 'success'");
+    expect(component).toContain('${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-release-');
+    expect(component).toContain('${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-sim-release-');
+  });
+
+  it('Apple aggregate 先拒绝上游失败，再验证显式 scope 的 summary 完整集', () => {
+    const apple = read('apple.yml');
+    const chain = apple.slice(apple.indexOf('\n  unsigned-chain:\n'));
+    expect(chain).toContain('needs: component\n    if: always()');
+    expect(chain).toContain('COMPONENT_RESULT: ${{ needs.component.result }}');
+    const blocks = chain.split(/^ {6}- /m).slice(1);
+    const simDownload = blocks.find((block) => block.includes('name: apple-carrier-summary-sim-arm64'))!;
+    expect(simDownload).toContain('if: ${{ inputs.include_simulator }}');
+    const aggregate = blocks.find((block) => block.includes('name: Strict declared-scope'))!;
+    expect(hasStrictResultGate(aggregate, 'COMPONENT_RESULT')).toBe(true);
+    expect(aggregate.indexOf('[ "$COMPONENT_RESULT" = success ]')).toBeLessThan(aggregate.indexOf('ci_apple.py aggregate'));
+    expect(aggregate).toContain('aggregate --scope "$POLARIS_APPLE_SCOPE"');
+    expect(aggregate).toContain('sim-arm64: not requested.');
+    expect(aggregate).not.toContain('continue-on-error');
+  });
+
   it('Android 复用调用 job 满足嵌套发布 job 的权限上限', () => {
     const androidJob = jobSection(risk, 'android', 'release-risk.yml');
     expect(androidJob).toContain('uses: ./.github/workflows/android.yml');

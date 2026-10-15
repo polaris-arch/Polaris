@@ -21,6 +21,10 @@ on:
         options: [ordinary, native-payload]
         default: ordinary
         required: true
+      apple_include_simulator:
+        description: 'ordinary 验证额外编译 sim-arm64 App/PacketTunnel；不能与 defer_apple 同用'
+        type: boolean
+        default: false
       defer_apple:
         description: '临时只验证非Apple；Apple未验证，完整风险门仍不通过，不发布产物'
         type: boolean
@@ -70,6 +74,16 @@ jobs:
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
       native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
     steps:
+      - name: Validate manual Apple simulator scope
+        if: github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator
+        shell: bash
+        env:
+          VALIDATION_MODE: ${{ inputs.mode }}
+          APPLE_DEFERRED: ${{ inputs.defer_apple && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          [ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ] || {
+            echo '::error::Simulator opt-in requires ordinary validation without Apple deferral'; exit 1; }
       - name: Validate manual Apple deferral scope
         if: github.event_name == 'workflow_dispatch' && inputs.defer_apple
         shell: bash
@@ -116,6 +130,7 @@ jobs:
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
           POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.mode == 'native-payload' && '1' || '0' }}
+          POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
         run: |
           set -euo pipefail
           # Technical payload mode is explicit, branch-only and never publishing.
@@ -166,6 +181,11 @@ jobs:
             node scripts/apple-ci-impact.mjs --full < /dev/null > "$apple_result"
           fi
 
+          # Explicit simulator opt-in selects the Apple leg even for an empty
+          # path diff; requested validation cannot silently disappear.
+          if [ "${POLARIS_APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
+            printf 'true\n' > "$apple_result"
+          fi
           jq . "$result"
           {
             echo "kernel=$(jq -r '.kernel' "$result")"
@@ -411,6 +431,7 @@ jobs:
     with:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.classify.outputs.candidate }}
+      include_simulator: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator }}
 
   gate:
     name: release risk gate
@@ -433,6 +454,7 @@ jobs:
       APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
       APPLE_RESULT: ${{ needs.apple.result }}
       APPLE_DEFERRED: ${{ github.event_name == 'workflow_dispatch' && inputs.defer_apple && 'true' || 'false' }}
+      APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
@@ -485,5 +507,13 @@ jobs:
           if [ "$APPLE_REQUIRED" = true ] && [ "$APPLE_RESULT" != success ]; then
             echo "::error::Apple App/PacketTunnel 腿未通过：$APPLE_RESULT"
             exit 1
+          fi
+          if [ "$APPLE_REQUIRED" = true ]; then
+            printf '%s\n' 'Apple device-arm64: unsigned App + PacketTunnel compile/link passed.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            if [ "${APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
+              printf '%s\n' 'Apple sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            else
+              printf '%s\n' 'Apple sim-arm64: not requested.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
           fi
           echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT apple=$APPLE_RESULT"

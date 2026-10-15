@@ -1,6 +1,7 @@
 """Inert same-run handoff controls; no compiler, carrier or remote API."""
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,12 +15,229 @@ class AppleHandoffControls(unittest.TestCase):
     ctx = {'candidate': 'a' * 40, 'runId': '123', 'attempt': '1', 'repository': 'polaris-arch/Polaris'}
     app = {'candidate': 'a' * 40, 'files': {'synthetic.py': {'bytes': 1, 'sha256': 'b' * 64}}}
 
+    def setUp(self):
+        environment = mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'})
+        environment.start(); self.addCleanup(environment.stop)
+
+    def test_scope_defaults_to_device_and_only_explicit_opt_in_selects_both(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(handoff.required_slots(), ('device-arm64',))
+            self.assertEqual(handoff.scope_fields(),
+                             {'carrierScope': 'device-only', 'requiredSlots': ['device-arm64']})
+        self.assertEqual(handoff.SLOTS, ('device-arm64', 'sim-arm64'))
+        self.assertEqual(handoff.required_slots('device-and-simulator'), handoff.SLOTS)
+        with mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'}):
+            self.assertEqual(handoff.required_slots(), handoff.SLOTS)
+            self.assertEqual(handoff.required_slots('device-only'), ('device-arm64',))
+        for scope in ('', 'sim-only', 'device', 'both', 'true', 'false', 'DEVICE-ONLY',
+                      'device-only ', ['device-arm64'], ('device-arm64',), True, 1):
+            with self.subTest(scope=scope), self.assertRaisesRegex(RuntimeError, 'unknown Apple carrier scope'):
+                handoff.required_slots(scope)
+        for scope in ('', 'sim-only', 'true'):
+            with mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
+                    self.assertRaisesRegex(RuntimeError, 'unknown Apple carrier scope'):
+                handoff.required_slots()
+
+    def test_aggregate_requires_explicit_valid_scope_before_paths_or_receipts(self):
+        with mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'}), \
+                mock.patch.object(handoff, 'Path') as path, \
+                mock.patch.object(handoff, 'read_receipt') as read, \
+                mock.patch.object(handoff, 'write_json') as write:
+            for scope in (None, '', 'unknown', 'sim-only', True, False, 0, [], ['device-arm64']):
+                with self.subTest(scope=scope), self.assertRaisesRegex(RuntimeError, 'explicit aggregate scope required'):
+                    handoff.aggregate('/inert', '/inert-output', scope=scope)
+            path.assert_not_called(); read.assert_not_called(); write.assert_not_called()
+
+    @staticmethod
+    def scope_mutations(row):
+        cases = []
+        for field in ('carrierScope', 'requiredSlots'):
+            changed = copy.deepcopy(row); del changed[field]
+            cases.append(('missing-' + field, changed))
+        for value in (None, '', 'unknown', 'sim-only', True):
+            changed = copy.deepcopy(row); changed['carrierScope'] = value
+            cases.append(('scope-' + repr(value), changed))
+        slots = row['requiredSlots']
+        for value in (None, [], 'device-arm64', slots + ['sim-amd64'], slots + [slots[0]],
+                      ['sim-arm64'], ['unknown'], ['sim-arm64', 'device-arm64'],
+                      ['device-arm64', 'sim-arm64'] if len(slots) == 1 else ['device-arm64']):
+            changed = copy.deepcopy(row); changed['requiredSlots'] = value
+            cases.append(('slots-' + repr(value), changed))
+        return cases
+
+    def scoped_aggregate_fixture(self, base, scope):
+        folder = base / 'aggregate'; (folder / 'component').mkdir(parents=True)
+        original_root = base / 'original'; original_root.mkdir()
+        manifest = self.signed({'schema': 'polaris-apple-component-handoff-v2',
+            **handoff.scope_fields(scope), 'context': self.ctx, 'producerJob': 'component',
+            'App': self.app, 'sourceContract': {'source': 'fixed'}, 'componentFingerprint': 'c' * 64})
+        manifest_path = folder / 'component/component-handoff.json'
+        manifest_path.write_text(json.dumps(manifest))
+        transport = self.signed({'schema': 'polaris-apple-handoff-transport-v1',
+            'context': self.ctx, 'manifest': file_pin(manifest_path), 'archive': {'bytes': 1, 'sha256': 'e' * 64}})
+        for path in (folder / 'component/component-transport.json', original_root / 'component-transport.json'):
+            path.write_text(json.dumps(transport))
+        for slot in handoff.required_slots(scope):
+            work = original_root / slot; work.mkdir()
+            target = 'aarch64-apple-ios' if slot == 'device-arm64' else 'aarch64-apple-ios-sim'
+            rust = self.signed({'schema': 'polaris-formal-apple-rust-v1', 'App': self.app,
+                'target': target, 'tools': {'fixed': 'bytes'}, 'rustc': 'fixed-version',
+                'linkInputSha256': 'f' * 64, 'devicePassed': False})
+            rust_path = work / 'rust-original.json'
+            rust_path.write_text(json.dumps(rust, indent=2) + '\n')
+            receipt = self.signed({'schema': 'polaris-mobile-apple-carrier-v1',
+                'App': self.app, 'producerCandidate': self.ctx['candidate'],
+                'selectedTarget': 'ios-arm64' if slot == 'device-arm64' else 'ios-arm64-simulator',
+                'componentFingerprint': 'c' * 64, 'linkInputSha256': 'f' * 64,
+                'rustInput': {'receipt': str(rust_path), **file_pin(rust_path)},
+                'AppCarrierValidated': True, 'AppAccepted': False,
+                'devicePassed': False, 'signatureTrustValidated': False})
+            (work / 'app-carrier.json').write_text(json.dumps(receipt, indent=2) + '\n')
+            handoff.carrier_summary(original_root, slot)
+            (original_root / 'summaries' / slot).rename(folder / slot)
+        return folder, original_root
+
+    def test_scoped_export_and_aggregate_roundtrip_preserves_originals_and_no_device_claim(self):
+        for scope in ('device-only', 'device-and-simulator'):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
+                    mock.patch.object(handoff, 'context', return_value=self.ctx), \
+                    mock.patch.object(handoff, 'producer_code', return_value=self.app), \
+                    mock.patch.object(handoff, 'load', return_value={'source': 'fixed'}), \
+                    mock.patch('consume.app_identity', return_value=self.app):
+                base = Path(temporary)
+                folder, original_root = self.scoped_aggregate_fixture(base, scope)
+                originals = {path: path.read_bytes() for path in original_root.rglob('*') if path.is_file()}
+                output = base / 'chain.json'
+                handoff.aggregate(folder, output, scope=scope)
+                chain = json.loads(output.read_bytes())
+                slots = list(handoff.required_slots(scope))
+                self.assertEqual(chain['schema'], 'polaris-apple-unsigned-chain-v3')
+                self.assertEqual(chain['carrierScope'], scope)
+                self.assertEqual(chain['requiredSlots'], slots)
+                self.assertEqual(chain['validatedSlots'], slots)
+                self.assertEqual(chain['completeSlots'], slots)
+                self.assertEqual(chain['notRequestedSlots'], ['sim-arm64'] if len(slots) == 1 else [])
+                self.assertEqual(list(chain['carriers']), slots)
+                for flag in ('devicePassed', 'signatureTrustValidated', 'publicationEligible'):
+                    self.assertIs(chain[flag], False)
+                for slot in slots:
+                    row = chain['carriers'][slot]
+                    self.assertEqual(row['schema'], 'polaris-apple-carrier-handoff-v2')
+                    self.assertEqual(row['carrierScope'], scope); self.assertEqual(row['requiredSlots'], slots)
+                    self.assertEqual((folder / slot / 'summary-app-carrier.json').read_bytes(),
+                                     originals[original_root / slot / 'app-carrier.json'])
+                    self.assertEqual((folder / slot / 'summary-rust-receipt.json').read_bytes(),
+                                     originals[original_root / slot / 'rust-original.json'])
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                with self.assertRaises(TypeError):
+                    handoff.aggregate(folder, base / 'implicit.json')
+                other = 'device-and-simulator' if scope == 'device-only' else 'device-only'
+                with self.assertRaisesRegex(RuntimeError, 'exactly component'):
+                    handoff.aggregate(folder, base / 'cross-scope.json', scope=other)
+                for absent in slots:
+                    original = folder / absent; moved = base / ('held-' + absent)
+                    original.rename(moved)
+                    with self.subTest(missing=absent), self.assertRaisesRegex(RuntimeError, 'exactly component'):
+                        handoff.aggregate(folder, base / 'missing.json', scope=scope)
+                    moved.rename(original)
+                extra = folder / ('sim-arm64' if scope == 'device-only' else 'sim-amd64'); extra.mkdir()
+                with self.assertRaisesRegex(RuntimeError, 'exactly component'):
+                    handoff.aggregate(folder, base / 'extra.json', scope=scope)
+
+    def test_scoped_manifest_rejects_missing_extra_duplicate_inverted_unknown_and_fingerprint_changes(self):
+        for scope in ('device-only', 'device-and-simulator'):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temporary:
+                root, checkout = Path(temporary) / 'root', Path(temporary) / 'checkout'
+                root.mkdir(); checkout.mkdir(); (root / 'object.o').write_bytes(b'original')
+                manifest = self.manifest(root, checkout)
+                manifest.update(schema='polaris-apple-component-handoff-v2', **handoff.scope_fields(scope))
+                self.signed(manifest)
+                self.assertEqual(self.validate(manifest, root, checkout, scope=scope), manifest)
+                with mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}):
+                    self.assertEqual(self.validate(manifest, root, checkout, scope=None), manifest)
+                for label, changed in self.scope_mutations(manifest):
+                    self.signed(changed)
+                    with self.subTest(mutation=label), self.assertRaisesRegex(RuntimeError, 'declared scope/requiredSlots'):
+                        self.validate(changed, root, checkout, scope=scope)
+                changed = copy.deepcopy(manifest)
+                other = 'device-and-simulator' if scope == 'device-only' else 'device-only'
+                changed.update(handoff.scope_fields(other))
+                with self.assertRaisesRegex(RuntimeError, 'manifest changed'):
+                    self.validate(changed, root, checkout, scope=other)
+                legacy = self.manifest(root, checkout)
+                with self.assertRaisesRegex(RuntimeError, 'legacy Apple handoff requires exact two-slot scope'):
+                    self.validate(legacy, root, checkout, scope='device-only')
+                legacy.update(handoff.scope_fields('device-and-simulator')); self.signed(legacy)
+                with self.assertRaisesRegex(RuntimeError, 'legacy Apple handoff requires exact two-slot scope'):
+                    self.validate(legacy, root, checkout, scope='device-and-simulator')
+
+    def test_freeze_rejects_prepared_scope_changes_before_reading_or_packaging_component(self):
+        for scope in ('device-only', 'device-and-simulator'):
+            tools = handoff.scope_fields(scope)
+            for label, changed in self.scope_mutations(tools):
+                with self.subTest(scope=scope, mutation=label), tempfile.TemporaryDirectory() as temporary, \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
+                        mock.patch.object(handoff, 'read_receipt', return_value=changed) as read, \
+                        mock.patch.object(handoff, 'lease') as lease, \
+                        mock.patch.object(handoff, 'write_payload') as package, \
+                        self.assertRaisesRegex(RuntimeError, 'prepared Apple carrier scope differs before freeze'):
+                    handoff.freeze(Path(temporary))
+                read.assert_called_once_with(Path(temporary).resolve() / 'tools.json')
+                lease.assert_not_called(); package.assert_not_called()
+
+    def test_aggregate_rejects_forged_scope_and_forbidden_flags_without_rewriting_native_receipts(self):
+        for scope in ('device-only', 'device-and-simulator'):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
+                    mock.patch.object(handoff, 'context', return_value=self.ctx), \
+                    mock.patch.object(handoff, 'producer_code', return_value=self.app), \
+                    mock.patch.object(handoff, 'load', return_value={'source': 'fixed'}), \
+                    mock.patch('consume.app_identity', return_value=self.app):
+                base = Path(temporary)
+                folder, original_root = self.scoped_aggregate_fixture(base, scope)
+                saved = {path: path.read_bytes() for path in base.rglob('*') if path.is_file()}
+                targets = [folder / 'component/component-handoff.json',
+                           *[folder / slot / ('carrier-' + slot + '.json') for slot in handoff.required_slots(scope)]]
+                with mock.patch.object(handoff, 'write_json') as write:
+                    for path in targets:
+                        original = json.loads(saved[path])
+                        mutations = self.scope_mutations(original)
+                        legacy = copy.deepcopy(original)
+                        legacy['schema'] = legacy['schema'].replace('-v2', '-v1')
+                        mutations.append(('legacy-with-scope-fields', legacy))
+                        mixed = copy.deepcopy(legacy)
+                        del mixed['carrierScope']; del mixed['requiredSlots']
+                        mutations.append(('legacy-mixed-with-scoped-wrappers', mixed))
+                        if path.parent.name != 'component':
+                            for flag in ('devicePassed', 'signatureTrustValidated', 'publicationEligible'):
+                                for value in (True, None, 0, ''):
+                                    changed = copy.deepcopy(original); changed[flag] = value
+                                    mutations.append((flag + '-' + repr(value), changed))
+                                changed = copy.deepcopy(original); del changed[flag]
+                                mutations.append(('missing-' + flag, changed))
+                        for label, changed in mutations:
+                            self.signed(changed); path.write_text(json.dumps(changed))
+                            if path.parent.name == 'component':
+                                transport_path = folder / 'component/component-transport.json'
+                                transport = json.loads(saved[transport_path]); transport['manifest'] = file_pin(path)
+                                self.signed(transport); transport_path.write_text(json.dumps(transport))
+                            with self.subTest(scope=scope, target=path.name, mutation=label), self.assertRaises(RuntimeError):
+                                handoff.aggregate(folder, base / 'rejected.json', scope=scope)
+                            write.assert_not_called()
+                            for native, raw in saved.items():
+                                if native.name in ('app-carrier.json', 'rust-original.json',
+                                                   'summary-app-carrier.json', 'summary-rust-receipt.json'):
+                                    self.assertEqual(native.read_bytes(), raw)
+                            for target, raw in saved.items(): target.write_bytes(raw)
+
     def test_two_arm64_same_host_exports_preserve_each_original_and_reject_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'component-transport.json').write_text(json.dumps({'original': 'same-run'}))
             retained = {}
-            with mock.patch.object(handoff, 'context', return_value=self.ctx):
+            with mock.patch.object(handoff, 'context', return_value=self.ctx), \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'}):
                 for slot in handoff.SLOTS:
                     work = root / slot; work.mkdir(mode=0o700)
                     rust = work / 'rust-original.json'; rust.write_text(json.dumps({'slot': slot}))
@@ -84,11 +302,11 @@ class AppleHandoffControls(unittest.TestCase):
         row['fingerprint'] = receipt_digest({k: v for k, v in row.items() if k != 'fingerprint'})
         return row
 
-    def validate(self, manifest, root, checkout):
+    def validate(self, manifest, root, checkout, *, scope='device-and-simulator'):
         with mock.patch.object(handoff, 'producer_code', return_value=self.app), \
                 mock.patch.object(handoff, 'load', return_value={'source': 'fixed'}), \
                 mock.patch.object(handoff, 'context', return_value=self.ctx):
-            return handoff.validate_manifest(manifest, root, checkout)
+            return handoff.validate_manifest(manifest, root, checkout, scope=scope)
 
     def test_manifest_has_no_path_relabelling_and_original_pin_is_rechecked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,6 +369,7 @@ class AppleHandoffControls(unittest.TestCase):
                 'manifest': {'bytes': len(raw), 'sha256': __import__('hashlib').sha256(raw).hexdigest()}})
             (folder / 'component-transport.json').write_text(json.dumps(transport))
             with mock.patch.object(handoff, 'context', return_value=self.ctx), \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'}), \
                     self.assertRaisesRegex(RuntimeError, 'host layout/context'):
                 handoff.import_bundle(folder, root)
             self.assertFalse((root / 'object.o').exists())
@@ -160,12 +379,14 @@ class AppleHandoffControls(unittest.TestCase):
         import ci_apple
         from contextlib import nullcontext
         with tempfile.TemporaryDirectory() as tmp:
-            for slot in handoff.SLOTS:
+            for scope, slot in (('device-only', 'device-arm64'),
+                                ('device-and-simulator', 'device-arm64'),
+                                ('device-and-simulator', 'sim-arm64')):
                 # This is an independent argument-dispatch control, not the
                 # full same-host build/evidence lifecycle. Isolate each scope
                 # rather than pretending its incomplete staging was preserved.
-                root = Path(tmp) / slot
-                root.mkdir(mode=0o700)
+                root = Path(tmp) / scope / slot
+                root.mkdir(mode=0o700, parents=True)
                 (root / 'component-handoff.json').write_text('{}')
                 paths = {name: str(root / name) for name in ('source', 'go', 'gomobile', 'gobind', 'developer',
                                                             'component-work', 'cache', 'rust-target')}
@@ -173,6 +394,7 @@ class AppleHandoffControls(unittest.TestCase):
                 (root / 'import-observation.json').write_text(json.dumps({
                     'completed': True, 'context': self.ctx}))
                 with mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
                         mock.patch.object(handoff, 'context', return_value=self.ctx), \
                         mock.patch.object(ci_apple, 'phase_timing', return_value=nullcontext()), \
                         mock.patch.object(ci_apple, 'private_dir', side_effect=lambda p: p), \
@@ -400,7 +622,7 @@ class AppleHandoffControls(unittest.TestCase):
     def test_exact_two_arm64_aggregate_rejects_missing_extra_legacy_and_identity_changes(self):
         self.assertEqual(handoff.SLOTS, ('device-arm64', 'sim-arm64'))
         with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp); (folder / 'component').mkdir()
+            folder = Path(tmp) / 'aggregate'; (folder / 'component').mkdir(parents=True)
             manifest = self.signed({'schema': 'polaris-apple-component-handoff-v1',
                 'context': self.ctx, 'producerJob': 'component', 'App': self.app,
                 'sourceContract': {'source': 'fixed'}, 'componentFingerprint': 'c' * 64})
@@ -442,7 +664,10 @@ class AppleHandoffControls(unittest.TestCase):
                     mock.patch.object(handoff, 'load', return_value={'source': 'fixed'}), \
                     mock.patch('consume.app_identity', return_value=self.app), \
                     mock.patch.object(handoff, 'write_json') as write:
-                handoff.aggregate(folder, folder / 'unused.json')
+                handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
+                self.assertEqual(write.call_args.args[1]['schema'], 'polaris-apple-unsigned-chain-v2')
+                self.assertNotIn('carrierScope', write.call_args.args[1])
+                self.assertNotIn('requiredSlots', write.call_args.args[1])
                 self.assertEqual(write.call_args.args[1]['completeSlots'], ['device-arm64', 'sim-arm64'])
                 self.assertEqual(set(write.call_args.args[1]['carriers']), set(handoff.SLOTS))
                 self.assertFalse(write.call_args.args[1]['publicationEligible'])
@@ -465,34 +690,34 @@ class AppleHandoffControls(unittest.TestCase):
                             write.reset_mock()
                             with self.subTest(slot=slot, flag=flag, mutation=mutation), \
                                     self.assertRaisesRegex(RuntimeError, 'slot/context/component/scope'):
-                                handoff.aggregate(folder, folder / 'unused.json')
+                                handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                             write.assert_not_called()
                             restore()
                 for extra in ('sim-amd64', 'legacy-summary'):
                     path = folder / extra; path.mkdir()
                     with self.subTest(extra=extra), self.assertRaisesRegex(RuntimeError, 'exactly component'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     path.rmdir()
-                missing = folder / 'sim-arm64'; moved = folder / 'old-sim-arm64'
+                missing = folder / 'sim-arm64'; moved = folder.parent / 'preserved-sim-arm64'
                 missing.rename(moved)
                 with self.assertRaisesRegex(RuntimeError, 'exactly component'):
-                    handoff.aggregate(folder, folder / 'unused.json')
+                    handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                 moved.rename(missing)
                 victim = folder / 'sim-arm64/carrier-sim-arm64.json'; victim.unlink()
                 with self.assertRaisesRegex(RuntimeError, 'bounded regular original receipt required:.*bytes=0'):
-                    handoff.aggregate(folder, folder / 'unused.json')
+                    handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                 restore()
                 for name in ('summary-app-carrier.json', 'summary-rust-receipt.json'):
                     actual = folder / 'sim-arm64' / name
                     actual.write_bytes(actual.read_bytes() + b' ')
                     with self.subTest(original=name), self.assertRaisesRegex(RuntimeError, 'receipt bytes differ'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     restore()
                 for key, value in [('attempt', '2'), ('runId', '124'), ('candidate', 'b' * 40)]:
                     changed = copy.deepcopy(wrappers['sim-arm64'])
                     changed['context'] = {**self.ctx, key: value}; update_wrapper(changed)
                     with self.subTest(context=key), self.assertRaisesRegex(RuntimeError, 'slot/context/component'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     restore()
                 for key, value in [('selectedTarget', 'ios-arm64'), ('selectedTarget', 'ios-x86_64-simulator'),
                                    ('componentFingerprint', 'd' * 64), ('producerCandidate', 'b' * 40),
@@ -502,7 +727,7 @@ class AppleHandoffControls(unittest.TestCase):
                     changed = copy.deepcopy(wrappers['sim-arm64']); changed['receipt'][key] = value
                     update_wrapper(changed)
                     with self.subTest(receipt=key, value=value), self.assertRaisesRegex(RuntimeError, 'carrier identity/scope'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     restore()
                 for key, value in [('target', 'aarch64-apple-ios'), ('target', 'x86_64-apple-ios'),
                                    ('tools', {'fixed': 'different'}), ('rustc', 'different-version'),
@@ -513,7 +738,7 @@ class AppleHandoffControls(unittest.TestCase):
                     changed = copy.deepcopy(wrappers['sim-arm64']); changed['receipt']['rustInput'] = file_pin(rust_path)
                     update_wrapper(changed)
                     with self.subTest(rust=key, value=value), self.assertRaisesRegex(RuntimeError, 'aggregate (Rust|actual Rust)'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     restore()
                 for key, value in [('sourceContract', {'source': 'different'}),
                                    ('App', {**self.app, 'files': {'different': 'source'}}),
@@ -522,15 +747,16 @@ class AppleHandoffControls(unittest.TestCase):
                     mp.write_text(json.dumps(changed))
                     moved_transport = copy.deepcopy(transport); moved_transport['manifest'] = file_pin(mp)
                     self.signed(moved_transport); tp.write_text(json.dumps(moved_transport))
-                    with self.subTest(manifest=key), self.assertRaisesRegex(RuntimeError, 'component/source'):
-                        handoff.aggregate(folder, folder / 'unused.json')
+                    with self.subTest(manifest=key), self.assertRaisesRegex(RuntimeError,
+                            'declared scope/requiredSlots' if key == 'schema' else 'component/source'):
+                        handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                     restore()
                 changed = copy.deepcopy(wrappers['sim-arm64']); changed['schema'] = 'polaris-apple-carrier-handoff-v0'
                 update_wrapper(changed)
-                with self.assertRaisesRegex(RuntimeError, 'slot/context/component'):
-                    handoff.aggregate(folder, folder / 'unused.json')
+                with self.assertRaisesRegex(RuntimeError, 'declared scope/requiredSlots'):
+                    handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
                 restore()
-                handoff.aggregate(folder, folder / 'unused.json')
+                handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
 
 
 if __name__ == '__main__':

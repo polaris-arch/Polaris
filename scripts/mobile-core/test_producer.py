@@ -303,9 +303,10 @@ class ProducerCalls(unittest.TestCase):
         observed = producer.component_revalidation_observation(receipt, current, pin, True)
         self.assertEqual(observed['comparisonPolicy'], producer.ANDROID_BUILD_CODE_POLICY)
         self.assertEqual(observed['currentVerifier'], current['producer'])
-        self.assertEqual(len(observed['currentVerifier']['files']), 21)
+        self.assertEqual(len(observed['currentVerifier']['files']), 22)
         self.assertEqual(set(observed['currentVerifier']['files']), set(producer.PRODUCER_FILES))
-        for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py'):
+        for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
+                       'scripts/mobile-core/apple_cache.py'):
             self.assertEqual(observed['currentVerifier']['files'][helper], current['producer']['files'][helper])
         self.assertEqual(observed['originalProducerCandidate'], 'a'*40)
         self.assertEqual(observed['originalReceipt'], pin)

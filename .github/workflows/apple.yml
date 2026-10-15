@@ -1,18 +1,27 @@
 name: Apple unsigned App and PacketTunnel
 
-# One admitted host produces the component once and consumes both arm64 slots.
-# Keep exact tools, per-slot originals/exports, and strict complete-slot aggregation.
+# One admitted host produces the two-slice component once. Device App and
+# PacketTunnel are required; the simulator carrier is an explicit manual opt-in.
+# Keep exact tools, originals/exports, and strict declared-scope aggregation.
 on:
   workflow_call:
     inputs:
       candidate:
         type: string
         required: true
+      include_simulator:
+        description: Also compile the unsigned sim-arm64 App and PacketTunnel
+        type: boolean
+        default: false
       preserve_run:
         type: boolean
         default: false
   workflow_dispatch:
     inputs:
+      include_simulator:
+        description: Also compile the unsigned sim-arm64 App and PacketTunnel
+        type: boolean
+        default: false
       preserve_run:
         type: boolean
         default: false
@@ -23,6 +32,7 @@ permissions:
 env:
   PYTHONDONTWRITEBYTECODE: '1'
   POLARIS_APP_CANDIDATE: ${{ inputs.candidate || github.sha }}
+  POLARIS_APPLE_SCOPE: ${{ inputs.include_simulator && 'device-and-simulator' || 'device-only' }}
 
 concurrency:
   group: apple-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'merge_group') && github.run_id || 'tip' }}
@@ -47,8 +57,8 @@ jobs:
           node-version: '26'
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Exact tool/source and two-slot arm64 resolved configuration admission
+          targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}
+      - name: Exact tool/source and declared arm64 carrier configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
       - name: Scoped frontend tool
         shell: bash
@@ -106,16 +116,35 @@ jobs:
         id: protoc
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
         run: node scripts/fetch-protoc.mjs
-      - uses: Swatinem/rust-cache@v2
+      - name: Admit bounded dependency cache transport and bind actual tools/configuration
         id: rust_cache
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py prepare
+      - name: Restore Cargo registry downloads separately from target dependencies
+        id: rust_registry_restore
+        uses: actions/cache/restore@v5
+        if: ${{ !cancelled() && steps.rust_cache.conclusion == 'success' }}
         with:
-          key: apple-whole-host-arm64-only-xcode27.1-27A9275
-          workspaces: . -> ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/cache/rust-target
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: apple-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache.outputs.identity }}
+      - name: Restore device-arm64 release dependencies at their stable transport path
+        id: rust_device_restore
+        uses: actions/cache/restore@v5
+        if: ${{ !cancelled() && steps.rust_cache.conclusion == 'success' }}
+        with:
+          path: target/apple-ci-cache/device-arm64
+          key: apple-rust-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-release-${{ steps.rust_cache.outputs.identity }}
+      - name: Move restored device dependencies into the actual Cargo target directory
+        id: rust_device_ready
+        if: ${{ !cancelled() && steps.rust_device_restore.conclusion == 'success' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "device-arm64" --restored "${{ steps.rust_device_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Require all shared carrier prerequisites
         id: shared_ready
-        if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
         run: echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
 
       - name: Real device-arm64 Rust and unsigned App plus PacketTunnel
@@ -134,40 +163,99 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v7
+        id: summary_device_arm64
         if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' }}
         with:
           name: apple-carrier-summary-device-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/summaries/device-arm64/
           if-no-files-found: error
           retention-days: 7
+      - name: Stage device dependencies without copying accepted App products
+        id: rust_device_export
+        if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_device_restore.outputs.cache-hit != 'true' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py export --slot "device-arm64"
+      - name: Save device-arm64 release dependencies before retirement
+        id: rust_device_save
+        uses: actions/cache/save@v5
+        if: ${{ !cancelled() && steps.rust_device_export.conclusion == 'success' }}
+        with:
+          path: target/apple-ci-cache/device-arm64
+          key: ${{ steps.rust_device_restore.outputs.cache-primary-key }}
+      - name: Return staged device dependencies even if cache upload failed
+        id: rust_device_return
+        if: ${{ !cancelled() && steps.rust_device_export.conclusion == 'success' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "device-arm64" --restored staged
+      - name: Check Cargo registry cache archive headroom
+        id: rust_registry_ready
+        if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_registry_restore.outputs.cache-hit != 'true' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py registry-ready
+      - name: Save registry downloads separately from target dependencies
+        uses: actions/cache/save@v5
+        if: ${{ !cancelled() && steps.rust_registry_ready.conclusion == 'success' }}
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.rust_registry_restore.outputs.cache-primary-key }}
       - name: Retire device-arm64 rebuildable intermediates after original upload
-        if: ${{ !cancelled() && steps.original_device_arm64.conclusion == 'success' }}
+        id: retire_device_arm64
+        if: ${{ !cancelled() && steps.original_device_arm64.conclusion == 'success' && (steps.rust_device_export.conclusion == 'skipped' || steps.rust_device_return.conclusion == 'success') }}
         run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "device-arm64"
+
+      - name: Restore sim-arm64 release dependencies after device retirement
+        id: rust_sim_restore
+        uses: actions/cache/restore@v5
+        if: ${{ inputs.include_simulator && !cancelled() && steps.retire_device_arm64.conclusion == 'success' }}
+        with:
+          path: target/apple-ci-cache/sim-arm64
+          key: apple-rust-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-sim-release-${{ steps.rust_cache.outputs.identity }}
+      - name: Move restored simulator dependencies into the actual Cargo target directory
+        id: rust_sim_ready
+        if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_restore.conclusion == 'success' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "sim-arm64" --restored "${{ steps.rust_sim_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Real sim-arm64 Rust and unsigned App plus PacketTunnel
         id: sim_arm64
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
+        if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "sim-arm64"
       - name: Preserve sim-arm64 originals before another target touches staging
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
+        if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py evidence --slot "sim-arm64"
       - uses: actions/upload-artifact@v7
         id: original_sim_arm64
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
+        if: ${{ inputs.include_simulator && !cancelled() && steps.shared_ready.conclusion == 'success' && steps.rust_sim_ready.conclusion == 'success' }}
         with:
           name: apple-carrier-original-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-original-sim-arm64-evidence.zip
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.sim_arm64.conclusion == 'success' }}
+        id: summary_sim_arm64
+        if: ${{ inputs.include_simulator && !cancelled() && steps.sim_arm64.conclusion == 'success' }}
         with:
           name: apple-carrier-summary-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/summaries/sim-arm64/
           if-no-files-found: error
           retention-days: 7
+      - name: Stage simulator dependencies without copying accepted App products
+        id: rust_sim_export
+        if: ${{ inputs.include_simulator && !cancelled() && steps.sim_arm64.conclusion == 'success' && steps.original_sim_arm64.conclusion == 'success' && steps.summary_sim_arm64.conclusion == 'success' && steps.rust_sim_restore.outputs.cache-hit != 'true' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py export --slot "sim-arm64"
+      - name: Save sim-arm64 release dependencies before retirement
+        id: rust_sim_save
+        uses: actions/cache/save@v5
+        if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_export.conclusion == 'success' }}
+        with:
+          path: target/apple-ci-cache/sim-arm64
+          key: ${{ steps.rust_sim_restore.outputs.cache-primary-key }}
+      - name: Return staged simulator dependencies even if cache upload failed
+        id: rust_sim_return
+        if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_export.conclusion == 'success' }}
+        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "sim-arm64" --restored staged
       - name: Retire sim-arm64 rebuildable intermediates after original upload
-        if: ${{ !cancelled() && steps.original_sim_arm64.conclusion == 'success' }}
+        id: retire_sim_arm64
+        if: ${{ inputs.include_simulator && !cancelled() && steps.original_sim_arm64.conclusion == 'success' && (steps.rust_sim_export.conclusion == 'skipped' || steps.rust_sim_return.conclusion == 'success') }}
         run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "sim-arm64"
 
       - name: Preserve same-host retirement observations
@@ -175,7 +263,9 @@ jobs:
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
         with:
           name: apple-host-retirement-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/retirement-*.json
+          path: |
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/retirement-*.json
+            ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-cache-*.json
           if-no-files-found: warn
           retention-days: 7
 
@@ -197,11 +287,26 @@ jobs:
           name: apple-carrier-summary-device-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/device-arm64
       - uses: actions/download-artifact@v8
+        if: ${{ inputs.include_simulator }}
         with:
           name: apple-carrier-summary-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/sim-arm64
-      - name: Strict complete-slot same-run candidate/source/component aggregate
-        run: python3 -B scripts/mobile-core/ci_apple.py aggregate --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
+      - name: Strict declared-scope same-run candidate/source/component aggregate
+        env:
+          COMPONENT_RESULT: ${{ needs.component.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$COMPONENT_RESULT" = success ] || {
+            echo "::error::Apple component/carrier/original upload chain did not complete: $COMPONENT_RESULT"; exit 1; }
+          python3 -B scripts/mobile-core/ci_apple.py aggregate --scope "$POLARIS_APPLE_SCOPE" --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
+          printf '%s\n' 'device-arm64: unsigned App + PacketTunnel compile/link passed.' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$POLARIS_APPLE_SCOPE" = device-and-simulator ]; then
+            printf '%s\n' 'sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'sim-arm64: not requested.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '%s\n' 'Shared Libbox component retains both arm64 slices. No signing, device execution or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

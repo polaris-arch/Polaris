@@ -262,6 +262,7 @@ describe('界面写出口与意图的位置逐处登记', () => {
     const QUOTED: Record<string, [number, string]> = {
       'contracts/user-config-fields.ts': [1, 'UserConfig 的字段名表（与 Rust 侧对拍用）'],
       'lib/staged-config.ts': [1, '暂存条目的 configKey：标识「切换节点」这一类条目，不写值'],
+      'store/app-store.ts': [1, 'ConfigProjection 的 Pick 类型键；下方 AST 限定为类型，不许可运行时按键写入'],
     };
     const found: Record<string, number> = {};
     for (const file of sources(SRC)) {
@@ -274,6 +275,46 @@ describe('界面写出口与意图的位置逐处登记', () => {
     expect(found).toEqual(
       Object.fromEntries(Object.entries(QUOTED).map(([file, [count]]) => [file, count])),
     );
+  });
+
+  function projectionTypeOwnsQuotedKey(source: string): boolean {
+    const ast = parse(source, { sourceType: 'module', plugins: ['typescript'] });
+    const aliases = ast.program.body.filter((node) => node.type === 'TSTypeAliasDeclaration' && node.id.name === 'ConfigProjection');
+    if (aliases.length !== 1 || aliases[0].type !== 'TSTypeAliasDeclaration') return false;
+    const type = aliases[0].typeAnnotation;
+    if (type.type !== 'TSTypeReference' || type.typeName.type !== 'Identifier' || type.typeName.name !== 'Pick') return false;
+    const parameters = type.typeParameters?.params;
+    if (parameters?.length !== 2 || parameters[0].type !== 'TSTypeReference'
+      || parameters[0].typeName.type !== 'Identifier' || parameters[0].typeName.name !== 'AppState'
+      || parameters[1].type !== 'TSUnionType') return false;
+    const keys = parameters[1].types;
+    if (keys.some((key) => key.type !== 'TSLiteralType' || key.literal.type !== 'StringLiteral')) return false;
+    const values = keys.map((key) => key.type === 'TSLiteralType' && key.literal.type === 'StringLiteral' ? key.literal.value : '');
+    if (values.join(',') !== 'config,servers,selectedServerId,rules,dnsRules') return false;
+    let quoted = 0;
+    function visit(value: unknown): void {
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) { value.forEach(visit); return; }
+      const node = value as Record<string, unknown>;
+      if (node.type === 'StringLiteral' && node.value === 'selectedServerId') quoted += 1;
+      for (const [key, child] of Object.entries(node)) if (key !== 'extra') visit(child);
+    }
+    visit(ast.program);
+    return quoted === 1;
+  }
+
+  it('app-store 唯一引号键确属 ConfigProjection 类型，不能把登记借给运行时写入', () => {
+    const source = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
+    expect(projectionTypeOwnsQuotedKey(source)).toBe(true);
+    const declaration = "type ConfigProjection = Pick<AppState, 'config' | 'servers' | 'selectedServerId' | 'rules' | 'dnsRules'>;";
+    expect(projectionTypeOwnsQuotedKey(declaration)).toBe(true);
+    for (const mutation of [
+      declaration.replace('ConfigProjection', 'UnusedProjection'),
+      declaration.replace('AppState', 'StagedState'),
+      declaration.replace("'selectedServerId' | ", '') + " setValue('selectedServerId', next);",
+      declaration + " patch({ ['selectedServerId']: next });",
+      declaration.replace("'rules'", "'selectedServerId'"),
+    ]) expect(projectionTypeOwnsQuotedKey(mutation), mutation).toBe(false);
   });
 
   it('界面不写选择意图，也不绕过封装直接调意图命令', () => {

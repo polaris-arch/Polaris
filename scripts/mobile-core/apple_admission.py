@@ -1,4 +1,4 @@
-"""Resolved two-slot arm64 Xcode configuration admission; never compiles or signs."""
+"""Resolved selected-slot arm64 Xcode configuration admission; never compiles or signs."""
 import json
 from pathlib import Path
 import re
@@ -112,13 +112,16 @@ def _read_rows(command, env, slot, root, query):
     return rows
 
 
-def preflight(root, env):
+def preflight(root, env, *, expected_slots):
     """Query the exact archive scheme/destination, plus explicit extension target.
 
     Main-only scheme output is expected on Xcode. The extension's explicit
     target query uses the identical project/configuration/SDK/ARCHS; it does
     not claim to be a second scheme or perform an archive.
     """
+    from apple_handoff import SCOPES
+    require(isinstance(expected_slots, tuple) and expected_slots in SCOPES.values(),
+            'closed explicit Apple carrier slots required')
     project = ROOT / 'src-tauri/gen/apple/polaris.xcodeproj'
     minimum = json.loads((ROOT / 'src-tauri/tauri.ios.conf.json').read_bytes())['bundle']['iOS']['minimumSystemVersion']
     require(isinstance(minimum, str) and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?', minimum),
@@ -128,6 +131,8 @@ def preflight(root, env):
     pins = [file_pin(path) for path in inputs]
     observations = {}
     for slot, sdk, arch in SLOTS:
+        if slot not in expected_slots:
+            continue
         common = ['-project', project, '-configuration', 'release', '-sdk', sdk,
                   '-showBuildSettings', '-json', 'ARCHS=' + arch, 'ONLY_ACTIVE_ARCH=YES',
                   'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO']
@@ -146,7 +151,9 @@ def preflight(root, env):
         require(observations[slot]['polaris_PacketTunnel'] == extension_settings['polaris_PacketTunnel'],
                 'scheme and explicit extension settings differ')
     require([file_pin(path) for path in inputs] == pins, 'Apple admission inputs changed during inspection')
-    result = {'schema': 'polaris-apple-build-settings-admission-v1', 'slots': observations,
+    require(tuple(observations) == expected_slots, 'Apple admission observed slots differ')
+    result = {'schema': 'polaris-apple-build-settings-admission-v2', 'slots': observations,
+              'requiredSlots': list(expected_slots), 'observedSlots': list(observations),
               'inputPins': pins, 'scope': 'resolved configuration only; no compiler/carrier/device acceptance'}
     write_json(Path(root) / 'build-settings-admission.json', result)
     return result

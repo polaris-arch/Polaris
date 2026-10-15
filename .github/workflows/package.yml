@@ -1024,7 +1024,7 @@ jobs:
       # 必须排在 `Build installers` **之前**：bundler 在打包时读 `../resources/<平台>/` 整目录，
       # 之后再铺就赶不上这一趟。conf 侧无需改动（引的本就是整个目录，不是逐文件）。
       #
-      # `--target` 恒显式传：mac x64 腿必须出 x86_64 的 helper，跟着宿主走会静默塞进 arm64 那份。
+      # mac 两腿显式传 `--target`（尤其 x64 不可跟随 arm64 宿主）；Linux/Windows 先核宿主再共享 App target。
       # 平台目录名的真值在 scripts/verify-packaging.mjs 的 LABEL_TO_CORE；这里的 case 是它的影子，
       # 故默认分支硬失败 —— 新增平台忘了补这里，得到的是红，不是一个静默少 helper 的包。
       - name: Build and stage privileged helper
@@ -1038,8 +1038,21 @@ jobs:
             macos-x64)   res_dir=mac-x64;    bin=polaris-helper ;;
             *) echo "::error::label '${{ matrix.label }}' 未登记 helper 落位目录（真值见 verify-packaging.mjs 的 LABEL_TO_CORE）"; exit 1 ;;
           esac
-          cargo build --release -p polaris-helper --bin polaris-helper --target "${{ matrix.rust_target }}"
-          src="target/${{ matrix.rust_target }}/release/$bin"
+          target_args=(--target "${{ matrix.rust_target }}")
+          output_dir="target/${{ matrix.rust_target }}/release"
+          case "${{ matrix.label }}" in
+            linux|windows)
+              host="$(rustc -vV | sed -n 's/^host: //p')"
+              if [ "$host" != "${{ matrix.rust_target }}" ]; then
+                echo "::error::helper host '$host' differs from matrix target '${{ matrix.rust_target }}'"
+                exit 1
+              fi
+              target_args=()
+              output_dir=target/release
+              ;;
+          esac
+          cargo build --release -p polaris-helper --bin polaris-helper "${target_args[@]}"
+          src="$output_dir/$bin"
           [ -f "$src" ] || { echo "::error::helper 构建产物不存在：$src"; exit 1; }
           mkdir -p "resources/$res_dir"
           cp "$src" "resources/$res_dir/$bin"
@@ -1051,8 +1064,8 @@ jobs:
           fi
           ls -l "resources/$res_dir/$bin"
           if [ "${{ matrix.label }}" = windows ]; then
-            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner --target "${{ matrix.rust_target }}"
-            cp "target/${{ matrix.rust_target }}/release/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
+            cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner "${target_args[@]}"
+            cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe
           fi
           node scripts/prepare-core-identity.mjs --platform="$res_dir"
           printf 'POLARIS_CORE_IDENTITY_FILE=%s/resources/%s/core-manifest.json\n' "$GITHUB_WORKSPACE" "$res_dir" >> "$GITHUB_ENV"

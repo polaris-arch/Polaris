@@ -99,39 +99,82 @@ class AppleAdmission(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             admission.checked_build_settings(rows('iphoneos'), 'iphoneos', 'x86_64', '17.0')
 
-    def test_preflight_explicit_extension_queries_full_slot_set_and_source_stability(self):
-        calls, saved = [], []
-        def fake_run(command, **kwargs):
-            calls.append((command, kwargs)); sdk = command[command.index('-sdk')+1]
-            arch = next(value.split('=',1)[1] for value in command if str(value).startswith('ARCHS='))
-            sample = rows(sdk, arch)
-            return json.dumps(sample[1:] if '-target' in command else sample[:1])
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            conf = root/'src-tauri/tauri.ios.conf.json'; conf.parent.mkdir(parents=True)
-            conf.write_text(json.dumps({'bundle': {'iOS': {'minimumSystemVersion':'17.0'}}}))
-            with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
-                    patch.object(admission, 'file_pin', return_value={'bytes':1,'sha256':'same'}), \
-                    patch.object(admission, 'write_json', side_effect=lambda *args: saved.append(args)):
-                observed = admission.preflight(root, {'DEVELOPER_DIR':'selected'})
-            self.assertEqual(set(observed['slots']), {slot for slot,_,_ in admission.SLOTS})
-            self.assertEqual(len(calls), 4)
-            self.assertEqual(len(saved), 5); self.assertNotIn('DO_NOT_EXPORT', json.dumps(observed))
-            self.assertEqual({path.name for path, _ in saved[:-1]},
-                             {'build-settings-' + slot + '-' + query + '.json'
-                              for slot, _, _ in admission.SLOTS for query in ('scheme', 'extension')})
-            for command, kwargs in calls:
-                self.assertIn('-showBuildSettings', command); self.assertNotIn('archive', command)
-                self.assertEqual(command[command.index('-configuration')+1], 'release')
-                self.assertEqual(kwargs['env'], {'DEVELOPER_DIR':'selected'})
-                if '-scheme' in command: self.assertIn('-destination', command)
-                else: self.assertEqual(command[command.index('-target')+1], 'polaris_PacketTunnel')
-            with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
-                    patch.object(admission, 'file_pin', side_effect=[{'bytes':1}]*3+[{'bytes':2}]*3), \
-                    patch.object(admission, 'write_json') as write, self.assertRaisesRegex(RuntimeError,'inputs changed'):
-                admission.preflight(root, {})
-            self.assertEqual(write.call_count, 4)
-            self.assertNotIn('build-settings-admission.json', [call.args[0].name for call in write.call_args_list])
+    def test_preflight_queries_app_and_extension_for_exact_single_or_double_scope(self):
+        for slots in (('device-arm64',), ('device-arm64', 'sim-arm64')):
+            calls, saved = [], []
+            def fake_run(command, **kwargs):
+                calls.append((command, kwargs)); sdk = command[command.index('-sdk') + 1]
+                arch = next(value.split('=', 1)[1] for value in command if str(value).startswith('ARCHS='))
+                sample = rows(sdk, arch)
+                return json.dumps(sample[1:] if '-target' in command else sample[:1])
+            with self.subTest(slots=slots), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                conf = root / 'src-tauri/tauri.ios.conf.json'; conf.parent.mkdir(parents=True)
+                conf.write_text(json.dumps({'bundle': {'iOS': {'minimumSystemVersion': '17.0'}}}))
+                with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
+                        patch.object(admission, 'file_pin', return_value={'bytes': 1, 'sha256': 'same'}), \
+                        patch.object(admission, 'write_json', side_effect=lambda *args: saved.append(args)):
+                    observed = admission.preflight(root, {'DEVELOPER_DIR': 'selected'}, expected_slots=slots)
+                self.assertEqual(observed['schema'], 'polaris-apple-build-settings-admission-v2')
+                self.assertEqual(tuple(observed['slots']), slots)
+                self.assertEqual(observed['requiredSlots'], list(slots))
+                self.assertEqual(observed['observedSlots'], list(slots))
+                for settings in observed['slots'].values():
+                    self.assertEqual(set(settings), {'polaris_iOS', 'polaris_PacketTunnel'})
+                self.assertEqual(len(calls), 2 * len(slots))
+                self.assertEqual(len(saved), 2 * len(slots) + 1)
+                self.assertNotIn('DO_NOT_EXPORT', json.dumps(observed))
+                self.assertEqual({path.name for path, _ in saved[:-1]},
+                                 {'build-settings-' + slot + '-' + query + '.json'
+                                  for slot in slots for query in ('scheme', 'extension')})
+                self.assertEqual([command[command.index('-sdk') + 1] for command, _ in calls],
+                                 ['iphoneos', 'iphoneos'] +
+                                 (['iphonesimulator', 'iphonesimulator'] if len(slots) == 2 else []))
+                for command, kwargs in calls:
+                    self.assertIn('-showBuildSettings', command); self.assertNotIn('archive', command)
+                    self.assertEqual(command[command.index('-configuration') + 1], 'release')
+                    self.assertEqual(kwargs['env'], {'DEVELOPER_DIR': 'selected'})
+                    if '-scheme' in command: self.assertIn('-destination', command)
+                    else: self.assertEqual(command[command.index('-target') + 1], 'polaris_PacketTunnel')
+                with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
+                        patch.object(admission, 'file_pin', side_effect=[{'bytes': 1}] * 3 + [{'bytes': 2}] * 3), \
+                        patch.object(admission, 'write_json') as write, self.assertRaisesRegex(RuntimeError, 'inputs changed'):
+                    admission.preflight(root, {}, expected_slots=slots)
+                self.assertEqual(write.call_count, 2 * len(slots))
+                self.assertNotIn('build-settings-admission.json', [call.args[0].name for call in write.call_args_list])
+
+    def test_preflight_requires_explicit_closed_ordered_slots_before_reading_or_querying(self):
+        invalid = ((), ('sim-arm64',), ('sim-arm64', 'device-arm64'),
+                   ('device-arm64', 'device-arm64'), ('device-arm64', 'sim-amd64'),
+                   ('device-arm64', 'sim-arm64', 'sim-amd64'), ('unknown',),
+                   ['device-arm64'], 'device-arm64', None)
+        with patch.object(admission, 'run') as query, patch.object(admission, 'file_pin') as pin, \
+                patch.object(admission, 'write_json') as write:
+            for slots in invalid:
+                with self.subTest(slots=slots), self.assertRaisesRegex(RuntimeError, 'closed explicit Apple carrier slots'):
+                    admission.preflight(Path('/inert'), {}, expected_slots=slots)
+            with self.assertRaises(TypeError):
+                admission.preflight(Path('/inert'), {})
+        query.assert_not_called(); pin.assert_not_called(); write.assert_not_called()
+
+    def test_each_selected_scope_requires_the_explicit_packet_tunnel_query(self):
+        for slots in (('device-arm64',), ('device-arm64', 'sim-arm64')):
+            for rejected_sdk in ('iphoneos', 'iphonesimulator') if len(slots) == 2 else ('iphoneos',):
+                def fake_run(command, **kwargs):
+                    sdk = command[command.index('-sdk') + 1]
+                    if '-target' in command:
+                        return json.dumps([] if sdk == rejected_sdk else rows(sdk)[1:])
+                    return json.dumps(rows(sdk)[:1])
+                with self.subTest(slots=slots, sdk=rejected_sdk), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    conf = root / 'src-tauri/tauri.ios.conf.json'; conf.parent.mkdir(parents=True)
+                    conf.write_text(json.dumps({'bundle': {'iOS': {'minimumSystemVersion': '17.0'}}}))
+                    with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
+                            patch.object(admission, 'file_pin', return_value={'bytes': 1, 'sha256': 'same'}), \
+                            patch.object(admission, 'write_json') as write, \
+                            self.assertRaisesRegex(RuntimeError, 'actual Apple target set differs'):
+                        admission.preflight(root, {}, expected_slots=slots)
+                    self.assertNotIn('build-settings-admission.json', [call.args[0].name for call in write.call_args_list])
 
     def test_full_scheme_still_queries_extension_and_rejects_disagreement(self):
         calls = []
@@ -152,11 +195,11 @@ class AppleAdmission(unittest.TestCase):
             with patch.object(admission, 'ROOT', root), patch.object(admission, 'run', side_effect=fake_run), \
                     patch.object(admission, 'file_pin', return_value={'bytes': 1, 'sha256': 'same'}), \
                     patch.object(admission, 'write_json') as write:
-                observed = admission.preflight(root, {})
+                observed = admission.preflight(root, {}, expected_slots=('device-arm64', 'sim-arm64'))
                 self.assertEqual(set(observed['slots']), {'device-arm64', 'sim-arm64'})
                 self.assertEqual(len(calls), 4)
                 self.assertEqual(sum('-target' in command for command in calls), 2)
                 differing = True; write.reset_mock()
                 with self.assertRaisesRegex(RuntimeError, 'scheme and explicit extension settings differ'):
-                    admission.preflight(root, {})
+                    admission.preflight(root, {}, expected_slots=('device-arm64', 'sim-arm64'))
                 self.assertNotIn('build-settings-admission.json', [call.args[0].name for call in write.call_args_list])

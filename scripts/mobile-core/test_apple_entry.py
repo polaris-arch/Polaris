@@ -40,6 +40,138 @@ def fat_archive(arm_platform=7, intel_platform=7):
 
 
 class AppleEntryTests(unittest.TestCase):
+    def setUp(self):
+        environment = mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'})
+        environment.start(); self.addCleanup(environment.stop)
+
+    def test_default_scope_does_not_dispatch_simulator_or_unknown_carriers(self):
+        with mock.patch.dict(ci_apple.os.environ, {}, clear=True), \
+                mock.patch.object(ci_apple, 'location') as location, \
+                mock.patch.object(ci_apple, 'run') as dispatch, \
+                mock.patch('apple_handoff.carrier_summary') as summary:
+            self.assertEqual(ci_apple.required_slots(), ('device-arm64',))
+            for slot in ('sim-arm64', 'sim-amd64', '', None):
+                with self.subTest(slot=slot), self.assertRaisesRegex(RuntimeError, 'unrequested Apple carrier slot'):
+                    ci_apple.carrier(slot)
+            location.assert_not_called(); dispatch.assert_not_called(); summary.assert_not_called()
+        with mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'}):
+            self.assertEqual(ci_apple.required_slots(), ('device-arm64', 'sim-arm64'))
+
+    def test_default_scope_rejects_unrequested_retirement_before_location_or_deletion(self):
+        with mock.patch.dict(ci_apple.os.environ, {}, clear=True), \
+                mock.patch.object(ci_apple, 'location') as location, \
+                mock.patch.object(ci_apple, 'slot_locks') as locks, \
+                mock.patch.object(ci_apple.shutil, 'rmtree') as remove:
+            for slot in ('sim-arm64', 'sim-amd64', '', None):
+                with self.subTest(slot=slot), self.assertRaisesRegex(RuntimeError, 'unrequested Apple retirement slot'):
+                    ci_apple.retire_slot(slot)
+            location.assert_not_called(); locks.assert_not_called(); remove.assert_not_called()
+
+    def test_prepare_passes_trusted_required_slots_to_admission_before_tool_install(self):
+        candidate = 'a' * 40
+        developer = Path('/selected/Contents/Developer')
+        for scope, slots in ((None, ('device-arm64',)),
+                             ('device-and-simulator', ('device-arm64', 'sim-arm64'))):
+            env = {'POLARIS_APP_CANDIDATE': candidate}
+            if scope is not None: env['POLARIS_APPLE_SCOPE'] = scope
+            with self.subTest(scope=scope), mock.patch.dict(ci_apple.os.environ, env, clear=True), \
+                    mock.patch.object(ci_apple, 'producer_code', return_value={}), \
+                    mock.patch.object(ci_apple, 'location', return_value=Path('/isolated/entry')), \
+                    mock.patch.object(ci_apple, 'run', return_value=candidate), \
+                    mock.patch.object(ci_apple, 'selected_apple_tools', return_value=(developer, {'selected': 'tools'}, 'Xcode')), \
+                    mock.patch('apple_admission.preflight') as admission, \
+                    mock.patch.object(ci_apple, 'private_dir', side_effect=RuntimeError('stop before tool install')), \
+                    self.assertRaisesRegex(RuntimeError, '^stop before tool install$'):
+                ci_apple.prepare()
+            admission.assert_called_once_with(Path('/isolated/entry'), {'selected': 'tools'}, expected_slots=slots)
+
+    def test_build_rejects_prepared_scope_changes_before_frontend_or_native_dispatch(self):
+        for scope in ('device-only', 'device-and-simulator'):
+            other = 'device-and-simulator' if scope == 'device-only' else 'device-only'
+            fields = ci_apple.scope_fields(scope)
+            invalid = ({}, ci_apple.scope_fields(other),
+                       {**fields, 'requiredSlots': []}, {**fields, 'requiredSlots': ['sim-arm64']})
+            for tools in invalid:
+                with self.subTest(scope=scope, tools=tools), \
+                        mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': scope}), \
+                        mock.patch.object(ci_apple, 'location', return_value=Path('/inert')), \
+                        mock.patch.object(ci_apple, 'read_receipt', return_value=tools), \
+                        mock.patch.object(ci_apple, 'phase_timing') as phase, \
+                        mock.patch.object(ci_apple, 'run') as dispatch, \
+                        mock.patch('apple_handoff.freeze') as freeze, \
+                        self.assertRaisesRegex(RuntimeError, 'prepared Apple carrier scope differs before build'):
+                    ci_apple.build()
+                phase.assert_not_called(); dispatch.assert_not_called(); freeze.assert_not_called()
+
+    def test_import_passes_same_required_slots_to_app_and_extension_admission(self):
+        from contextlib import nullcontext
+        for scope, slots in ((None, ('device-arm64',)),
+                             ('device-and-simulator', ('device-arm64', 'sim-arm64'))):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                env = {'GITHUB_ENV': str(root / 'github-env')}
+                if scope is not None: env['POLARIS_APPLE_SCOPE'] = scope
+                paths = {'rust-target': str(root / 'rust-target'), 'developer': '/selected/Developer'}
+                with mock.patch.dict(ci_apple.os.environ, env, clear=True), \
+                        mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(ci_apple, 'selected_apple_tools'), \
+                        mock.patch.object(ci_apple, 'phase_timing', return_value=nullcontext()), \
+                        mock.patch('apple_handoff.import_bundle', return_value={'paths': paths, 'rustc': 'exact'}) as restore, \
+                        mock.patch.object(ci_apple, 'private_dir'), \
+                        mock.patch('apple_admission.preflight') as admission, \
+                        mock.patch.object(ci_apple, 'run', return_value='exact'):
+                    ci_apple.import_carrier(root / 'download')
+                restore.assert_called_once_with(root / 'download', root)
+                admission.assert_called_once_with(root, {**env, 'DEVELOPER_DIR': paths['developer']}, expected_slots=slots)
+
+    def test_unrequested_evidence_scope_rejects_before_lease_or_snapshot(self):
+        with mock.patch.dict(ci_apple.os.environ, {}, clear=True), \
+                mock.patch.object(ci_apple, 'location', return_value=Path('/inert')), \
+                mock.patch.object(ci_apple, 'private_dir') as private, \
+                mock.patch.object(ci_apple, 'lease') as lease, \
+                mock.patch.object(ci_apple, 'preserve_linked_archive') as preserve:
+            for slot in ('sim-arm64', 'sim-amd64', ''):
+                with self.subTest(slot=slot), self.assertRaisesRegex(RuntimeError, 'unrequested Apple evidence slot'):
+                    ci_apple.evidence(slot=slot)
+            with mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_CARRIER_SLOT': 'sim-arm64'}), \
+                    self.assertRaisesRegex(RuntimeError, 'unrequested Apple evidence slot'):
+                ci_apple.evidence()
+            private.assert_not_called(); lease.assert_not_called(); preserve.assert_not_called()
+
+    def test_evidence_records_only_required_slots_and_default_ignores_unrequested_sim_receipts(self):
+        from contextlib import nullcontext
+        for scope in ('device-only', 'device-and-simulator'):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                (root / 'cache').mkdir(mode=0o700)
+                for slot, target in (('device-arm64', 'aarch64-apple-ios'),
+                                     ('sim-arm64', 'aarch64-apple-ios-sim')):
+                    work = root / slot; work.mkdir()
+                    receipt = work / ('rust-' + target + '.json')
+                    receipt.write_text(json.dumps({'target': target}) if scope != 'device-only' or slot == 'device-arm64'
+                                       else 'unrequested malformed simulator receipt')
+                    native = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
+                    native.parent.mkdir(parents=True); native.write_bytes(('original-' + target).encode())
+                with mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': scope}, clear=True), \
+                        mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
+                        mock.patch('builtins.print'):
+                    ci_apple.evidence()
+                with zipfile.ZipFile(root / 'apple-original-evidence.zip') as archive:
+                    index = json.loads(archive.read('EVIDENCE-INDEX.json'))
+                    slots = ['device-arm64'] if scope == 'device-only' else ['device-arm64', 'sim-arm64']
+                    self.assertEqual(index['schema'], 'polaris-apple-original-evidence-v2')
+                    self.assertEqual(index['carrierScope'], scope); self.assertEqual(index['requiredSlots'], slots)
+                    self.assertFalse(index['receiptReadErrors'])
+                    self.assertIs(index['devicePassed'], False); self.assertIs(index['publicationEligible'], False)
+                    for slot, target in (('device-arm64', 'aarch64-apple-ios'),
+                                         ('sim-arm64', 'aarch64-apple-ios-sim')):
+                        member = 'cache/rust-target/' + target + '/release/libpolaris_lib.a'
+                        self.assertEqual(member in archive.namelist(), slot in slots)
+                        self.assertEqual(slot + '/rust-' + target + '.json' in archive.namelist(), slot in slots)
+                        if slot in slots:
+                            self.assertEqual(archive.read(member), (root / member).read_bytes())
+
     def same_host_slot_fixture(self, root, slot, raw):
         work = root / slot; work.mkdir(mode=0o700)
         (root / 'cache').mkdir(mode=0o700, exist_ok=True)
@@ -193,6 +325,7 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertEqual(raw.read_bytes(), b'failed original output')
                 self.assertFalse(list(root.glob('evidence-*-pin.json')))
 
+    @mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'})
     def test_slot_evidence_freezes_shared_staging_before_next_arm64_platform_overwrite(self):
         from contextlib import nullcontext
         import apple_handoff
@@ -245,6 +378,7 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertTrue((work / 'original-linked-rust-archive.a').exists())
                 self.assertTrue((work / 'original-rust-entry.log').exists())
 
+    @mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'})
     def test_failed_slot_pack_preserves_bad_receipt_and_cache_without_false_retirement(self):
         from contextlib import nullcontext
         import apple_handoff
@@ -279,6 +413,7 @@ class AppleEntryTests(unittest.TestCase):
                     self.assertEqual(package.read('device-arm64/original-linked-rust-archive.a'),
                                      b'wrong linked staging')
 
+    @mock.patch.dict(ci_apple.os.environ, {'POLARIS_APPLE_SCOPE': 'device-and-simulator'})
     def test_unsafe_staging_preservation_blocks_shared_replacement_before_native_dispatch(self):
         from contextlib import nullcontext
         import apple_handoff
@@ -559,7 +694,7 @@ class AppleEntryTests(unittest.TestCase):
             with self.subTest(platform=platform, arch=arch, profile=profile), self.assertRaises(RuntimeError):
                 apple_rust.target_for(platform, arch, profile)
 
-    def test_candidate_chain_has_exactly_two_arm64_carriers(self):
+    def test_supported_carriers_keep_both_arm64_capabilities_and_reject_intel(self):
         self.assertEqual(ci_apple.CARRIERS, [('device-arm64', None), ('sim-arm64', 'arm64')])
         with mock.patch.object(ci_apple, 'location') as location, self.assertRaises(RuntimeError):
             ci_apple.carrier('sim-amd64')

@@ -27,6 +27,7 @@ const probe = vi.hoisted(() => ({
   limits: undefined as unknown,
   enable: null as (() => void | Promise<void>) | null,
   commit: null as (() => unknown) | null,
+  enableOperations: [] as Promise<void>[],
   patch: vi.fn<(patch: Partial<UserConfig>) => Promise<UserConfig>>(),
   get: vi.fn<() => Promise<UserConfig>>(),
   backend: null as UserConfig | null,
@@ -63,7 +64,12 @@ vi.mock('@/hooks/use-periodic-speed-test-fields', async (original) => {
     usePeriodicSpeedTestFields: (...args: Parameters<typeof real.usePeriodicSpeedTestFields>) => {
       const fields = real.usePeriodicSpeedTestFields(...args);
       probe.commit = fields.commit;
-      return fields;
+      return { ...fields, enableGlobal: () => {
+        // Observe the real operation without changing the UI callback's return contract.
+        const operation = fields.enableGlobal();
+        probe.enableOperations.push(operation);
+        return operation;
+      } };
     },
   };
 });
@@ -105,6 +111,7 @@ beforeEach(() => {
   probe.limits = LIMITS;
   probe.enable = null;
   probe.commit = null;
+  probe.enableOperations = [];
   probe.patch.mockReset();
   probe.backend = null;
   probe.get.mockReset().mockImplementation(async () => {
@@ -154,13 +161,52 @@ describe.each(Object.entries(surfaces))('订阅表单的全局关闭提示（%s�
     expect(render()).toContain(hint());
     expect(probe.enable).not.toBeNull();
 
-    await probe.enable?.();
+    probe.enable?.();
+    expect(probe.enableOperations).toHaveLength(1);
+    await probe.enableOperations[0];
 
     expect(probe.patch).toHaveBeenCalledExactlyOnceWith({ periodicSpeedTestEnabled: true });
     expect(probe.get).toHaveBeenCalledTimes(1);
     expect(probe.backend?.periodicSpeedTestEnabled).toBe(true);
     expect(useAppStore.getState().config).toBe(probe.backend);
-    await vi.waitFor(() => expect(useAppStore.getState().config?.periodicSpeedTestEnabled).toBe(true));
+    expect(useAppStore.getState().config?.periodicSpeedTestEnabled).toBe(true);
+    Object.assign(useAppStore.getInitialState(), useAppStore.getState());
+    expect(render()).not.toContain(hint());
+  });
+
+  it('真实开启操作等待权威 GET，不能把 patch 回包或 void 点击返回当作完成', async () => {
+    seed({ periodicSpeedTestEnabled: false, subscriptions: [sub(true)] });
+    const before = useAppStore.getState().config;
+    let releaseRead!: (config: UserConfig) => void;
+    let enteredRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { enteredRead = resolve; });
+    const read = new Promise<UserConfig>((resolve) => { releaseRead = resolve; });
+    probe.patch.mockImplementation(async (patch) => {
+      if (!probe.backend) throw Error('backend fixture not seeded');
+      probe.backend = { ...probe.backend, ...patch };
+      return probe.backend;
+    });
+    probe.get.mockImplementation(() => { enteredRead(); return read; });
+    expect(render()).toContain(hint());
+    expect(probe.enable).not.toBeNull();
+    probe.enable?.();
+    expect(probe.enableOperations).toHaveLength(1);
+    const operation = probe.enableOperations[0];
+    let settled = false;
+    const completion = operation.then(() => { settled = true; });
+    try {
+      await Promise.race([readStarted, completion]);
+      expect(probe.patch).toHaveBeenCalledExactlyOnceWith({ periodicSpeedTestEnabled: true });
+      expect(probe.get).toHaveBeenCalledTimes(1);
+      expect(settled).toBe(false);
+      expect(useAppStore.getState().config).toBe(before);
+      expect(render()).toContain(hint());
+    } finally {
+      releaseRead(probe.backend!);
+      await completion;
+    }
+    expect(settled).toBe(true);
+    expect(useAppStore.getState().config).toBe(probe.backend);
     Object.assign(useAppStore.getInitialState(), useAppStore.getState());
     expect(render()).not.toContain(hint());
   });

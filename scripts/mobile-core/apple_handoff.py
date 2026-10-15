@@ -19,6 +19,40 @@ SLOTS = ('device-arm64', 'sim-arm64')
 MAX_FILES, MAX_BYTES = 65536, 4 * 1024 ** 3
 
 
+# Closed execution profiles. Component receipts still prove both Libbox slices;
+# these profiles describe only the App + PacketTunnel carrier obligations.
+SCOPES = {'device-only': ('device-arm64',), 'device-and-simulator': SLOTS}
+
+
+def required_slots(scope=None):
+    scope = os.environ.get('POLARIS_APPLE_SCOPE', 'device-only') if scope is None else scope
+    require(isinstance(scope, str) and scope in SCOPES, 'unknown Apple carrier scope')
+    return SCOPES[scope]
+
+
+def scope_fields(scope=None):
+    slots = required_slots(scope)
+    return {'carrierScope': next(name for name, expected in SCOPES.items() if slots == expected),
+            'requiredSlots': list(slots)}
+
+
+def validate_scope_record(row, kind, scope=None):
+    expected = scope_fields(scope)
+    schema = row.get('schema')
+    if schema == 'polaris-apple-' + kind + '-v1':
+        # Historical wrappers mean exactly two carriers. Never reinterpret them
+        # as the new default, even if somebody adds a single-slot declaration.
+        require(expected['requiredSlots'] == list(SLOTS) and
+                'carrierScope' not in row and 'requiredSlots' not in row,
+                'legacy Apple handoff requires exact two-slot scope')
+        return False
+    require(schema == 'polaris-apple-' + kind + '-v2' and
+            row.get('carrierScope') == expected['carrierScope'] and
+            row.get('requiredSlots') == expected['requiredSlots'],
+            'Apple handoff declared scope/requiredSlots differs')
+    return True
+
+
 def transport_pin(path):
     path = Path(path)
     require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= MAX_BYTES,
@@ -253,9 +287,9 @@ def restore_payload(archive, inventories, root, checkout):
             require(selected_row(base / name, base) == row, 'restored directory/file/link inventory differs')
 
 
-def validate_manifest(manifest, root, checkout, expected=None):
-    require(manifest.get('schema') == 'polaris-apple-component-handoff-v1' and
-            manifest.get('fingerprint') == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
+def validate_manifest(manifest, root, checkout, expected=None, *, scope=None):
+    validate_scope_record(manifest, 'component-handoff', scope)
+    require(manifest.get('fingerprint') == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
             'Apple handoff manifest changed')
     require(manifest['context'] == (expected or context()) and manifest['producerJob'] == 'component',
             'handoff is not this run/attempt/component job')
@@ -288,6 +322,8 @@ def validate_manifest(manifest, root, checkout, expected=None):
 def freeze(root):
     root = Path(root).resolve(strict=True)
     tools = read_receipt(root / 'tools.json')
+    require(all(tools.get(k) == v for k, v in scope_fields().items()),
+            'prepared Apple carrier scope differs before freeze')
     component = root / 'component'
     receipt = read_receipt(component / 'component-receipt.json')
     require(receipt['input']['producer'] == producer_code() and receipt['input']['sourceContract'] == load(),
@@ -324,7 +360,7 @@ def freeze(root):
         require(sum(len(v) for v in rows.values()) <= MAX_FILES and
                 sum(row.get('bytes', 0) for v in rows.values() for row in v.values()) <= MAX_BYTES,
                 'selected Apple handoff too large')
-        facts = {'schema': 'polaris-apple-component-handoff-v1', 'context': context(),
+        facts = {'schema': 'polaris-apple-component-handoff-v2', **scope_fields(), 'context': context(),
                  'producerJob': os.environ['GITHUB_JOB'], 'root': str(root), 'checkout': str(ROOT),
                  'App': producer_code(), 'sourceContract': load(), 'files': rows,
                  'componentReceipt': file_pin(component / 'component-receipt.json'),
@@ -366,6 +402,7 @@ def import_bundle(folder, root):
         require({'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()} == transport['manifest'],
                 'handoff manifest bytes differ')
         facts = decode(raw, maximum=16 * 1024 ** 2)
+        validate_scope_record(facts, 'component-handoff')
         require(facts['context'] == context() and facts['root'] == str(root.resolve()) and
                 facts['checkout'] == str(ROOT.resolve()), 'host layout/context differs before extraction')
         expected = {namespace + '/' + name for namespace, rows in facts['files'].items() for name in rows}
@@ -414,13 +451,13 @@ def verify_import(component, cache, source, go, gomobile, gobind, developer):
 
 
 def carrier_summary(root, slot):
-    require(slot in SLOTS, 'unknown Apple slot')
+    require(slot in required_slots(), 'unrequested Apple carrier slot')
     root = Path(root)
     receipt_path = root / slot / 'app-carrier.json'
     receipt = read_receipt(receipt_path)
     require(receipt['App']['candidate'] == context()['candidate'] and receipt['devicePassed'] is False,
             'carrier candidate/device scope differs')
-    row = {'schema': 'polaris-apple-carrier-handoff-v1', 'context': context(), 'slot': slot,
+    row = {'schema': 'polaris-apple-carrier-handoff-v2', **scope_fields(), 'context': context(), 'slot': slot,
            'componentTransport': read_receipt(root / 'component-transport.json'),
            'receipt': receipt, 'receiptPin': file_pin(receipt_path),
            'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False}
@@ -443,10 +480,12 @@ def carrier_summary(root, slot):
                 'original summary bytes changed during export')
 
 
-def aggregate(folder, output):
+def aggregate(folder, output, *, scope):
+    require(isinstance(scope, str) and scope in SCOPES, 'explicit aggregate scope required')
+    slots = required_slots(scope)
     folder = Path(folder)
-    require({p.name for p in folder.iterdir()} == {'component', *SLOTS},
-            'aggregate requires exactly component, device-arm64 and sim-arm64 slots')
+    require({p.name for p in folder.iterdir()} == {'component', *slots},
+            'aggregate requires exactly component and declared carrier slots')
     rows = {}
     from consume import app_identity
     current_app = app_identity()
@@ -458,14 +497,16 @@ def aggregate(folder, output):
             transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}),
             'aggregate component run differs')
     manifest = read_receipt(manifest_path)
-    require(manifest.get('schema') == 'polaris-apple-component-handoff-v1' and
-            manifest['App'] == producer_code() and manifest['sourceContract'] == load() and
+    scoped = validate_scope_record(manifest, 'component-handoff', scope)
+    require(manifest['App'] == producer_code() and manifest['sourceContract'] == load() and
             manifest['context'] == context() and manifest['producerJob'] == 'component' and
             manifest['fingerprint'] == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
             'aggregate original component/source differs')
-    for slot in SLOTS:
+    for slot in slots:
         row = read_receipt(folder / slot / ('carrier-' + slot + '.json'))
-        require(row['schema'] == 'polaris-apple-carrier-handoff-v1' and row['slot'] == slot and
+        require(validate_scope_record(row, 'carrier-handoff', scope) == scoped,
+                'aggregate mixed legacy/scoped wrappers')
+        require(row['slot'] == slot and
                 row['context'] == context() and row['componentTransport'] == transport and
                 row.get('devicePassed') is False and row.get('signatureTrustValidated') is False and
                 row.get('publicationEligible') is False and
@@ -498,9 +539,12 @@ def aggregate(folder, output):
                 receipt.get('devicePassed') is False and receipt.get('signatureTrustValidated') is False,
                 'aggregate actual carrier identity/scope differs')
         rows[slot] = row
-    require({p.name for p in folder.iterdir()} == {'component', *SLOTS}, 'aggregate contains extra slot')
-    facts = {'schema': 'polaris-apple-unsigned-chain-v2', 'context': context(), 'App': producer_code(),
-             'componentTransport': transport, 'carriers': rows, 'completeSlots': list(SLOTS),
+    require({p.name for p in folder.iterdir()} == {'component', *slots}, 'aggregate contains extra slot')
+    facts = {'schema': 'polaris-apple-unsigned-chain-v3' if scoped else 'polaris-apple-unsigned-chain-v2', 'context': context(), 'App': producer_code(),
+             'componentTransport': transport, 'carriers': rows, 'completeSlots': list(slots),
              'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False}
+    if scoped:
+        facts.update(scope_fields(scope), validatedSlots=list(slots),
+                     notRequestedSlots=[slot for slot in SLOTS if slot not in slots])
     facts['fingerprint'] = receipt_digest(facts)
     write_json(output, facts)

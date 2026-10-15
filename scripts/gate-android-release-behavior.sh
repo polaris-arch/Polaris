@@ -128,7 +128,7 @@
 #
 #   · gradle 跑不起来（缺 JDK / 缺 SDK / 缺生成物 / 超时）⇒ **抛并点名**，不许 skip、
 #     不许当作通过。「没跑」与「跑过且通过」必须可分辨。
-#   · 一律 `--offline --no-daemon`（不留守护进程，不碰网络）。
+#   · 一律 offline、禁 configuration-cache；本地 no-daemon，CI 显式选择本批独立 daemon，退出必 stop。
 #   · 禁 kill/pkill。
 #   · 每条断言取材前先自检取材面非空；rc 一律直接取，不经管道。
 #
@@ -196,7 +196,7 @@ restore() {
   [ -f "$PROPS_BAK" ] && cp -- "$PROPS_BAK" "$PROPS"
   [ -f "$RULE_BAK" ] && cp -- "$RULE_BAK" "$SACRIFICIAL_RULE"
   # ⑨ 的探针文件从不属于工作树：中断路径上也必须消失，否则它会永久改掉 R8 的规则集。
-  rm -f -- "$PROBE_RULE"
+  if [ "$FIXTURES_OWNED" -eq 1 ]; then rm -f -- "$PROBE_RULE"; fi
   return 0
 }
 
@@ -212,22 +212,36 @@ restore() {
 # 今天把 rc 的**产生**收到两个出口：`die()`（前提不成立，rc=2）与 `finish()`（判据结论，
 # rc=0/1/2）。两者都在这里盖一个章，EXIT 上验章：没盖章就走到 EXIT ⇒ 退出码是**别的东西**
 # 给的，一律改判 rc=2（裁判坏了，不是判据红了 —— 与 A1 的对账不平同一档）。
+FIXTURES_OWNED=0
+DAEMON_ACTIVE=0
+INVOCATIONS=0
 EXIT_SEALED=""
 on_exit() {
-  local rc=$?
+  local rc=$? cleanup_rc=0
+  trap - EXIT INT TERM
   restore
-  [ -n "$EXIT_SEALED" ] && return 0
-  echo >&2
-  echo "::error::gate-android-release-behavior: **裁判没跑完** —— 退出码不是 die/finish 给的（实得 rc=$rc）。" >&2
-  echo "本裁判的 rc 只许从两个出口出来：die()（前提不成立）与 finish()（判据结论），" >&2
-  echo "两者都会在退出前给 EXIT_SEALED 盖章。走到这里说明中途有别的东西退出了脚本 ——" >&2
-  echo "末尾那句 finish 被删掉、或某处插了一句 exit。那一形下判据一条都没定罪，" >&2
-  echo "而 rc 可以是 0，与「跑完且全过」在 shell 层逐字不可分辨。" >&2
-  exit 2
+  if [ -f "$PROPS_BAK" ]; then cmp -s -- "$PROPS_BAK" "$PROPS" || cleanup_rc=2; fi
+  if [ -f "$RULE_BAK" ]; then cmp -s -- "$RULE_BAK" "$SACRIFICIAL_RULE" || cleanup_rc=2; fi
+  if [ "$FIXTURES_OWNED" -eq 1 ]; then [ ! -e "$PROBE_RULE" ] || cleanup_rc=2; fi
+  if [ "$DAEMON_ACTIVE" -eq 1 ]; then
+    # This user home owns only this invocation's daemon registry. Never stop another build's daemon.
+    ( cd "$GRADLE_DIR" && ./gradlew --offline --stop ) >"$WORK/daemon-stop.log" 2>&1 || cleanup_rc=2
+  fi
+  if [ -z "$EXIT_SEALED" ]; then
+    echo "::error::gate-android-release-behavior: 裁判没跑完（rc=$rc）" >&2
+    rc=2
+  fi
+  if [ "$cleanup_rc" -ne 0 ]; then
+    echo "::error::fixture restore or isolated daemon stop failed; evidence: $WORK" >&2
+    # A cleanup failure may turn success red, but must never overwrite the original failure.
+    [ "$rc" -ne 0 ] || rc=$cleanup_rc
+  fi
+  if [ "$rc" -eq 0 ]; then rm -rf -- "$WORK"; fi
+  exit "$rc"
 }
-# INT/TERM 仍只还原（保持既有语义：还原完继续走，最终仍会落到 EXIT 上验章）。
 trap on_exit EXIT
-trap restore INT TERM
+trap 'EXIT_SEALED=signal; exit 130' INT
+trap 'EXIT_SEALED=signal; exit 143' TERM
 
 FAILED=0
 # 每一行判据结论同时走两条通道：stdout（给人看）与 $TRANSCRIPT（给对账看）。
@@ -281,7 +295,6 @@ finish() {
   fi
   if [ "$FAILED" -eq 0 ]; then
     echo "gate-android-release-behavior: 全部行为断言通过（日志在 $WORK）"
-    rm -rf -- "$WORK"
     exit 0
   fi
   echo "::error::gate-android-release-behavior: $FAILED 条行为断言失败；gradle 日志留在 $WORK"
@@ -353,8 +366,66 @@ done
 # ⑨ 的探针文件必须从「不在场」出发：上一轮中断留下来的话，⑦ 的集合恰等会红在一个假原因上。
 [ -e "$PROBE_RULE" ] && die "$PROBE_RULE 已经在场 —— 上一轮的探针没清干净，先删掉它再跑。"
 
+FIXTURES_OWNED=1
 cp -- "$PROPS" "$PROPS_BAK" || die "备份 gradle.properties 失败"
 cp -- "$SACRIFICIAL_RULE" "$RULE_BAK" || die "备份 proguard-tauri.pro 失败"
+
+# CI opt-in only. Share dependency/distribution bytes, not daemon registries or configuration cache.
+# Keep the host's Gradle worker/JVM policy; do not introduce an unbounded parallelism override.
+DAEMON_FLAGS=(--no-daemon)
+case "${POLARIS_GATE_CI_DAEMON:-0}" in
+  0) ;;
+  1)
+    [ "${CI:-}" = true ] && [ "${GITHUB_ACTIONS:-}" = true ] || die "daemon reuse is CI-only"
+    ORIGINAL_GRADLE_HOME="${GRADLE_USER_HOME:-$HOME/.gradle}"
+    ORIGINAL_GRADLE_HOME="$(cd "$ORIGINAL_GRADLE_HOME" && pwd -P)" || die "Gradle user home missing"
+    export GRADLE_USER_HOME="$WORK/gradle-home"
+    mkdir -p "$GRADLE_USER_HOME" || die "cannot create isolated Gradle user home"
+    for part in caches wrapper jdks; do
+      if [ -d "$ORIGINAL_GRADLE_HOME/$part" ]; then
+        ln -s "$ORIGINAL_GRADLE_HOME/$part" "$GRADLE_USER_HOME/$part" || die "cannot reuse Gradle $part"
+      fi
+    done
+    if [ -f "$ORIGINAL_GRADLE_HOME/gradle.properties" ]; then
+      cp -- "$ORIGINAL_GRADLE_HOME/gradle.properties" "$GRADLE_USER_HOME/gradle.properties" || die "cannot preserve Gradle host policy"
+    fi
+    DAEMON_FLAGS=(--daemon)
+    DAEMON_ACTIVE=1
+    ;;
+  *) die "POLARIS_GATE_CI_DAEMON must be 0 or 1" ;;
+esac
+
+# A per-invocation nonce proves configuration actually ran with this process's environment.
+# Facts also need an execution marker; UP-TO-DATE / FROM-CACHE / SKIPPED is not evidence.
+ORACLE_INIT="$WORK/oracle.init.gradle"
+cat >"$ORACLE_INIT" <<'GRADLE'
+gradle.settingsEvaluated {
+    println("POLARIS_ORACLE_CONFIG\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))
+}
+gradle.beforeProject { project ->
+    if (project.path == ':app') {
+        project.tasks.matching { it.name == 'printPolarisReleaseFacts' }.configureEach {
+            doLast {
+                println("POLARIS_ORACLE_EXEC\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))
+            }
+        }
+    }
+}
+GRADLE
+GRADLE_COMMON=(./gradlew --offline "${DAEMON_FLAGS[@]}" --no-configuration-cache --init-script "$ORACLE_INIT")
+run_oracle() {
+  local log="$1"; shift
+  INVOCATIONS=$((INVOCATIONS + 1))
+  local nonce="${WORK##*/}-$INVOCATIONS" arg facts=0
+  for arg in "$@"; do [ "$arg" != :app:printPolarisReleaseFacts ] || facts=1; done
+  ( cd "$GRADLE_DIR" && export POLARIS_ORACLE_INVOCATION="$nonce" && "$@" ) >"$log" 2>&1
+  RC=$?
+  command grep -Fxq -- "$(printf 'POLARIS_ORACLE_CONFIG\t%s' "$nonce")" "$log" || die "fresh configuration missing: $log"
+  if [ "$facts" -eq 1 ]; then
+    command grep -Fxq -- "$(printf 'POLARIS_ORACLE_EXEC\t%s' "$nonce")" "$log" || die "facts task did not execute: $log"
+  fi
+  return 0
+}
 
 # ══ 跑一轮 gradle；rc 直接取，日志落盘供断言取材 ═══════════════════════════════
 #
@@ -367,8 +438,7 @@ gradle_run() {
     -u POLARIS_KEYSTORE_FILE -u POLARIS_KEYSTORE_PASSWORD -u POLARIS_KEY_PASSWORD
     -u POLARIS_KEY_ALIAS -u POLARIS_ALLOW_UNSIGNED
     -u ORG_GRADLE_PROJECT_polarisAllowUnsigned)
-  ( cd "$GRADLE_DIR" && "${clean_env[@]}" "$@" ) >"$log" 2>&1
-  RC=$?
+  run_oracle "$log" "${clean_env[@]}" "$@"
   return 0
 }
 
@@ -379,14 +449,13 @@ FAKE_KEYSTORE="$WORK/not-a-real-keystore.bin"
 FAKE_SECRET="gate-probe-placeholder-not-a-secret"
 gradle_run_signed() {
   local log="$1" keystore="$2"; shift 2
-  ( cd "$GRADLE_DIR" && env \
+  run_oracle "$log" env \
       -u POLARIS_ALLOW_UNSIGNED -u ORG_GRADLE_PROJECT_polarisAllowUnsigned \
       POLARIS_KEYSTORE_FILE="$keystore" \
       POLARIS_KEYSTORE_PASSWORD="$FAKE_SECRET" \
       POLARIS_KEY_PASSWORD="$FAKE_SECRET" \
       POLARIS_KEY_ALIAS="$FAKE_SECRET" \
-      "$@" ) >"$log" 2>&1
-  RC=$?
+      "$@"
   return 0
 }
 
@@ -410,9 +479,9 @@ expect_has()    { local n; n=$(count_in "$2" "$3"); [ "$n" -gt 0 ] && ok "$1" ||
 expect_absent() { local n; n=$(count_in "$2" "$3"); [ "$n" -eq 0 ] && ok "$1" || bad "$1：$2 里出现了 \`$3\`（$n 次），本不该有"; }
 expect_count()  { local n; n=$(count_in "$2" "$3"); [ "$n" -eq "$4" ] && ok "$1（$n 次）" || bad "$1：\`$3\` 命中 $n 次，期望 $4 次"; }
 
-DRY=(./gradlew --offline --no-daemon :app:assembleArm64Release --dry-run)
-DRY_DEBUG=(./gradlew --offline --no-daemon :app:assembleArm64Debug --dry-run)
-FACTS=(./gradlew --offline --no-daemon :app:printPolarisReleaseFacts)
+DRY=("${GRADLE_COMMON[@]}" :app:assembleArm64Release --dry-run)
+DRY_DEBUG=("${GRADLE_COMMON[@]}" :app:assembleArm64Debug --dry-run)
+FACTS=("${GRADLE_COMMON[@]}" :app:printPolarisReleaseFacts)
 
 # 三条“指名到点”的针。它们是失败信息的原文片段，不是变量名 —— 守的是「说了什么」。
 MSG_REFUSE="Android release 签名凭据缺失"
@@ -445,7 +514,7 @@ expect_count "minifyArm64ReleaseWithR8 在任务图里" "$WORK/2-hatch.log" "min
 expect_has "任务图确实是 release 那条（取材自检）" "$WORK/2-hatch.log" ":app:assembleArm64Release"
 
 echo "══ ⑤b ARMv7 与 universal 同走完整 release/R8 任务图 ══"
-gradle_run "$WORK/5b-arm-flavors.log" ./gradlew --offline --no-daemon \
+gradle_run "$WORK/5b-arm-flavors.log" "${GRADLE_COMMON[@]}" \
   :app:assembleArmRelease :app:assembleUniversalRelease --dry-run \
   -PpolarisAllowUnsigned=true -PtargetList=aarch64,armv7 -ParchList=arm64,arm -PabiList=arm64-v8a,armeabi-v7a
 expect_rc "ARMv7/universal release 任务图可解析" 0
@@ -472,20 +541,20 @@ expect_has "逃生门保持关闭" "$WORK/3b-facts.log" "hatchOpen	false"
 cp -- "$PROPS_BAK" "$PROPS"
 
 echo "══ ④ ORG_GRADLE_PROJECT_ 环境变量 ⇒ 仍然必须硬失败 ══"
-( cd "$GRADLE_DIR" && env -u POLARIS_KEYSTORE_FILE -u POLARIS_KEYSTORE_PASSWORD \
-    -u POLARIS_KEY_PASSWORD -u POLARIS_KEY_ALIAS -u POLARIS_ALLOW_UNSIGNED \
-    ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${DRY[@]}" ) >"$WORK/4-env.log" 2>&1
-RC=$?
+gradle_run "$WORK/4-env.log" env ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${DRY[@]}"
 expect_rc "ORG_GRADLE_PROJECT_ 打不开逃生门" nonzero
 expect_has "仍然报「凭据缺失」" "$WORK/4-env.log" "$MSG_REFUSE"
 expect_absent "没有出逃生门警告" "$WORK/4-env.log" "$MSG_HATCH"
-( cd "$GRADLE_DIR" && env -u POLARIS_KEYSTORE_FILE -u POLARIS_KEYSTORE_PASSWORD \
-    -u POLARIS_KEY_PASSWORD -u POLARIS_KEY_ALIAS -u POLARIS_ALLOW_UNSIGNED \
-    ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${FACTS[@]}" ) >"$WORK/4b-facts.log" 2>&1
-RC=$?
+gradle_run "$WORK/4b-facts.log" env ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${FACTS[@]}"
 expect_rc "事实任务跑得动" 0
 expect_has "gradle 确实收到了这个属性（正向对照）" "$WORK/4b-facts.log" "hatchAllPropertyKeys	polarisAllowUnsigned"
 expect_has "逃生门保持关闭" "$WORK/4b-facts.log" "hatchOpen	false"
+
+# Transition negative control: ORG_GRADLE_PROJECT_* must not leak to the next request.
+gradle_run "$WORK/4-reset-facts.log" "${FACTS[@]}"
+expect_rc "环境属性撤销后事实任务仍执行" 0
+expect_has "环境属性未串到下一场景" "$WORK/4-reset-facts.log" $'hatchAllPropertyKeys\t<none>'
+expect_has "逃生门保持关闭" "$WORK/4-reset-facts.log" $'hatchOpen\tfalse'
 
 echo "══ ④b 别的环境变量也不是逃生门的来源 ══"
 # 验收员的 M01 变异就是给读取点接一句 `|| System.getenv("POLARIS_ALLOW_UNSIGNED") == "true"`。
@@ -495,10 +564,7 @@ echo "══ ④b 别的环境变量也不是逃生门的来源 ══"
 # 两侧各守一头，中间那条缝（在逃生门分支之前插一句
 # `if (System.getenv("POLARIS_XXX") == "true") return@Action`）**今天没有门**，
 # 实测两侧同时全绿。登记在头注天花板表的「看不见 ⑤」，本处不复写。
-( cd "$GRADLE_DIR" && env -u POLARIS_KEYSTORE_FILE -u POLARIS_KEYSTORE_PASSWORD \
-    -u POLARIS_KEY_PASSWORD -u POLARIS_KEY_ALIAS \
-    POLARIS_ALLOW_UNSIGNED=true "${DRY[@]}" ) >"$WORK/4c-env.log" 2>&1
-RC=$?
+gradle_run "$WORK/4c-env.log" env POLARIS_ALLOW_UNSIGNED=true "${DRY[@]}"
 expect_rc "POLARIS_ALLOW_UNSIGNED 环境变量打不开逃生门" nonzero
 expect_has "仍然报「凭据缺失」" "$WORK/4c-env.log" "$MSG_REFUSE"
 
@@ -654,6 +720,25 @@ gradle_run_signed "$WORK/10c-facts.log" "$MISSING_KEYSTORE" "${FACTS[@]}"
 expect_rc "事实任务仍跑得动" 0
 expect_has "此时 AGP 手里的 storeFile 是空的（空壳配置，正向对照）" \
   "$WORK/10c-facts.log" $'POLARIS_FACT\tsigningStoreFile\t<none>\tfalse\tfalse'
+
+# Transition negative controls: signed -> completely absent credentials, on the same daemon.
+gradle_run "$WORK/10-reset-dry.log" "${DRY[@]}"
+expect_rc "撤销凭据后 release 再次拒绝" nonzero
+expect_has "签名环境未串到下一场景" "$WORK/10-reset-dry.log" "$MSG_REFUSE"
+expect_absent "撤销凭据不是通过逃生门" "$WORK/10-reset-dry.log" "$MSG_HATCH"
+gradle_run "$WORK/10-reset-facts.log" "${FACTS[@]}"
+expect_rc "撤销凭据后事实任务仍执行" 0
+expect_has "签名容器已恢复空壳" "$WORK/10-reset-facts.log" $'POLARIS_FACT\tsigningStoreFile\t<none>\tfalse\tfalse'
+expect_has "所有临时属性已清除" "$WORK/10-reset-facts.log" $'hatchAllPropertyKeys\t<none>'
+expect_absent "额外规则文件未串到最后场景" "$WORK/10-reset-facts.log" "$FACT_FILE_PREFIX$PROBE_RULE"
+command grep -F -- "$FACT_FILE_PREFIX" "$WORK/10-reset-facts.log" | sort >"$WORK/restored-rules.txt"
+sort "$WORK/7-listed.txt" >"$WORK/original-rules.txt"
+if cmp -s -- "$WORK/original-rules.txt" "$WORK/restored-rules.txt"; then
+  ok "规则文件清单与字节数已恢复，未串到后续场景"
+else
+  bad "规则文件清单或字节数在变异后没有恢复"
+fi
+[ "$INVOCATIONS" -eq 21 ] || die "expected 18 original scenarios plus 3 transition controls; got $INVOCATIONS"
 
 echo "══ 还原自检 ══"
 if cmp -s -- "$PROPS_BAK" "$PROPS"; then ok "gradle.properties 已还原"; else bad "gradle.properties 没还原干净"; fi

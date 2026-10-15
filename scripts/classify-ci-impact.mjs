@@ -161,7 +161,7 @@ export const PACKAGE_IMPACT_SCOPES = Object.freeze({
     kernel: false,
     platforms: ALL,
     why:
-      '随包特权 helper 二进制本体：package.yml 单独 `cargo build -p polaris-helper --target …` 后铺进 '
+      '随包特权 helper 二进制本体：package.yml 单独构建 polaris-helper（mac 显式 target；Linux/Windows 核对宿主后共享 App target）后铺进 '
       + 'resources/<平台>/，是包内资产（2026-08-10 三平台出过不含它的包）。',
   },
   'crates/helper/src/platform/linux/': {
@@ -1118,6 +1118,7 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/classify-ci-impact.mjs',
   'scripts/classify-ci-impact.test.mjs',
   'scripts/gate-node-test.sh',
+  'scripts/ci-workflow-efficiency.test.mjs',
   'scripts/assert-pc-runtime-release.mjs',
   'scripts/assert-pc-runtime-release.test.mjs',
   'scripts/fetch-dashboard.mjs',

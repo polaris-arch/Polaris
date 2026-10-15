@@ -193,8 +193,9 @@ fails without fallback on any other build or SDK. This SDK
 declares the viewport's iOS27.1 APIs; their runtime availability guards and the
 iOS17.0 App deployment target remain. Its one fixed `~/Code/polaris-mobile-apple-ci`
 root has one component slot, one cache (20GiB maximum including a shared Rust
-target), and the two finite device-arm64/sim-arm64 App slots, built sequentially
-under the
+target). The default App scope is device-arm64; `include_simulator: true`
+(or Release Risk manual `apple_include_simulator: true`) additionally selects
+sim-arm64, sequentially under the
 existing 16GiB peak/1GiB margin reservation and cache lease. No signing secrets,
 simulator boot, device deployment or mobile publication are part of that graph.
 The hosted preview advertises 14GiB storage; actual free space must still pass
@@ -202,7 +203,12 @@ the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runne
 is an environment failure, never grounds to weaken the reservation or skip a
 selected leg. The eventual unified run must establish actual runner resources.
 
-The shared component and both carrier legs run in the same admitted hosted job.
+The shared component and all requested carriers run in the same admitted hosted job.
+The public Libbox component still contains both device and simulator ARM64
+slices. Component two-slice validation does not claim simulator App validation.
+Default success proves only the unsigned device-arm64 App + PacketTunnel
+compile/link checks; it requires no connected device and proves neither signing
+trust nor execution on an iPhone. Simulator App compilation is manual opt-in.
 The official selected RC rollout must finish before dispatch; early admission
 does not pin a rolling hosted image. The local-import adapter reuses the frozen
 component and the existing complete original-source/compiler/SDK byte verifier,
@@ -215,8 +221,16 @@ Each slot exports create-new summary files under summaries/<slot>. Its original
 linked Rust archive is copied and checked before another arm64 platform can
 replace staging; success and failure originals have distinct slot ZIP names.
 A failed slot does not suppress the remaining selected slots, and the final
-aggregate still requires both exact same-run/source/component results, including
-actual final App/PacketTunnel verification for each platform.
+aggregate independently receives the declared scope and requires exactly its
+`requiredSlots`, including actual final App/PacketTunnel verification for every
+requested platform. Missing, extra, skipped or failed required slots cannot pass.
+The upstream host job must succeed, including original and summary uploads.
+New component/carrier handoff wrappers use v2 with fingerprint-bound
+`carrierScope`/`requiredSlots`; new unsigned-chain v3 reports `validatedSlots`,
+`completeSlots`, and `notRequestedSlots`. A default sim-arm64 slot is not
+requested, never passed. Historical v1 wrappers and unsigned-chain v2 retain
+strict two-carrier semantics and cannot be relabelled device-only. Original
+component/App/Rust receipts are retained byte-for-byte.
 Shared component uploads, protobuf setup, cache setup and local verification
 must all succeed before any carrier is selected; a carrier failure does not
 change that shared readiness for later slots. Slot ZIPs retain the independent
@@ -230,6 +244,17 @@ rebuildable Rust target triple and derived-data. A surviving child-held lock or
 incomplete original preservation prevents retirement. Component inputs, shared
 host dependencies, receipts, logs, IPA and original ZIPs remain, with the fixed
 20GiB cache bound and existing build reservation unchanged.
+
+Rust registry and dependency caches are reported separately. Each target/profile
+uses an explicit restore/save path through a stable ignored cache staging
+directory, rather than archiving a run-id-specific absolute Cargo target path.
+Dependency directories move on the same filesystem without a second snapshot;
+save follows successful carrier/original/summary upload and precedes retirement.
+Cache keys bind scope, target, profile, actual Rust toolchain, selected Xcode/SDK
+and source-owned build inputs. Cache hits never skip Cargo, link, or original
+receipt verification and never substitute an accepted App product. Cache
+compression also requires disk headroom; no warm-hit or speedup is claimed until
+an actual subsequent run establishes it.
 
 CPU/affinity/quota, load and memory observations guide child Go/Rust/Xcode
 concurrency. The 2GiB/compiler plus 1GiB headroom is an unmeasured estimate,
@@ -365,8 +390,8 @@ The carrier parser bounds its single nonempty MH_EXECUTE payload inside one
 `__LINKEDIT` segment and disjoint from sections/other tables, retaining an
 opaque payload SHA256 and `trustValidated=false`. It does not interpret the
 CodeDirectory, calculate CDHash, validate a signer or assert signature trust.
-These structural controls do not substitute for actual device-arm64 and
-sim-arm64 final carrier verification. Historical Intel simulator observations
+These structural controls do not substitute for actual device-arm64 final
+carrier verification, or sim-arm64 final verification when explicitly requested. Historical Intel simulator observations
 are outside the current contract.
 
 `scripts/libbox-patches` and the old Apple six-patch declarations remain

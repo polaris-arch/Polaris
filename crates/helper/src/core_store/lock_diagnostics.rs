@@ -22,6 +22,61 @@ fn monotonic_ns() -> u128 {
     CLOCK.get_or_init(Instant::now).elapsed().as_nanos()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LeaseStage {
+    OriginalsHeld,
+    ClonesHeld,
+    AllLocalLeasesDropped,
+}
+
+impl LeaseStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::OriginalsHeld => "originals-held",
+            Self::ClonesHeld => "clones-held",
+            Self::AllLocalLeasesDropped => "all-local-leases-dropped",
+        }
+    }
+}
+
+pub(super) struct LeaseStageOrigin {
+    phase: LeaseStage,
+    pid: u32,
+    unix_ns: Option<u128>,
+    monotonic_ns: u128,
+    nonce: Option<String>,
+}
+
+pub(super) fn lease_stage_origin(phase: LeaseStage, nonce: &str) -> LeaseStageOrigin {
+    use std::io::Write;
+    let origin = LeaseStageOrigin {
+        phase,
+        pid: std::process::id(),
+        unix_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_nanos()),
+        monotonic_ns: monotonic_ns(),
+        nonce: (nonce.len() == 64
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then(|| nonce.to_owned()),
+    };
+    // Same process epoch as the contender snapshot; no descriptor or lease is
+    // opened, duplicated, locked, unlocked or reconfigured by this observation.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "LEASE_FIXTURE_STAGE protocol=lease-stage-v1 phase={} pid={} unix_ns={:?} monotonic_ns={} nonce={:?} scope=test-process-only",
+        origin.phase.name(),
+        origin.pid,
+        origin.unix_ns,
+        origin.monotonic_ns,
+        origin.nonce
+    );
+    origin
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn spawn_origin(origin: &'static str, phase: &'static str, child_pid: Option<u32>) {
     use std::io::Write;

@@ -1502,7 +1502,7 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
    * 桌面把这些解释挂在 `InfoIcon` 的 `tip` 上，触屏没有 hover。机制详情已改为可点 i，关键说明仍常驻。逐条登记它落在**哪一页**，
    * 断言那句话真的出现在那一页的 DOM 里。**这是一份计数，不是印象**（§4.12 的验收口径）。
    */
-  const RESIDENT: readonly [MobileSettingsPageId, string][] = [
+  const EXPLANATION_BASELINE: readonly [MobileSettingsPageId, string][] = [
     ['general', 'settings.general.autoConnectDesc'],
     ['general', 'settings.general.autoCheckUpdateDesc'],
     ['general', 'mobileHelp.disableLogs'],
@@ -1522,6 +1522,7 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['dns', 'settings.dns.fakeIpDesc'],
     ['dns', 'settings.dns.remoteDnsDesc'],
     ['dns', 'settings.dns.domesticDnsDesc'],
+    ['dns', 'settings.dns.takeoverSystemDnsDesc'],
     ['dns', 'settings.advanced.optimisticCacheDesc'],
     ['dns', 'settings.advanced.dnsTimeoutDesc'],
     ['dns', 'settings.dns.raceStrategyDesc'],
@@ -1534,8 +1535,67 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['update', 'mobileSettings.update.ruleResourceAutoDesc'],
   ];
 
-  it('自检：登记表有量级（表被清空会让下面那条恒绿）', () => {
-    expect(RESIDENT.length).toBeGreaterThanOrEqual(30);
+  type ExplanationResponsibility = {
+    page: MobileSettingsPageId;
+    key: string;
+    disposition: 'resident' | 'desktop-only';
+    reason?: string;
+  };
+  // This is the single authorized exclusion, not an extensible escape hatch.
+  const TAKEOVER_KEY = 'settings.dns.takeoverSystemDnsDesc';
+  const TAKEOVER_REASON = 'POL-U24: mobile VPN service owns DNS; desktop OS DNS takeover is not a mobile control';
+  const RESPONSIBILITIES: readonly ExplanationResponsibility[] = EXPLANATION_BASELINE.map<ExplanationResponsibility>(([page, key]) =>
+    page === 'dns' && key === TAKEOVER_KEY
+      ? { page, key, disposition: 'desktop-only', reason: TAKEOVER_REASON }
+      : { page, key, disposition: 'resident' },
+  );
+  const identity = ({ page, key }: Pick<ExplanationResponsibility, 'page' | 'key'>): string => `${page}:${key}`;
+
+  function responsibilityErrors(entries: readonly ExplanationResponsibility[]): string[] {
+    const errors: string[] = [];
+    const expected = EXPLANATION_BASELINE.map(([page, key]) => identity({ page, key })).sort();
+    const actual = entries.map(identity).sort();
+    if (EXPLANATION_BASELINE.length !== 30 || new Set(expected).size !== 30) errors.push('baseline must contain 30 unique responsibilities');
+    if (entries.length !== 30 || new Set(actual).size !== 30) errors.push('responsibilities must be complete and unique');
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) errors.push('responsibility identities differ from the frozen baseline');
+    const residents = entries.filter((entry) => entry.disposition === 'resident');
+    const excluded = entries.filter((entry) => entry.disposition === 'desktop-only');
+    if (residents.length !== 29 || excluded.length !== 1 || residents.length + excluded.length !== entries.length) {
+      errors.push('required partition is 29 resident plus one desktop-only');
+    }
+    if (residents.some((entry) => entry.reason !== undefined)) errors.push('resident entries must not carry exclusion reasons');
+    const allowed = excluded[0];
+    if (!allowed || allowed.page !== 'dns' || allowed.key !== TAKEOVER_KEY || allowed.reason !== TAKEOVER_REASON) {
+      errors.push('only the exact POL-U24 takeover exclusion is authorized');
+    }
+    return errors;
+  }
+
+  const RESIDENT: readonly [MobileSettingsPageId, string][] = RESPONSIBILITIES
+    .filter((entry) => entry.disposition === 'resident')
+    .map<[MobileSettingsPageId, string]>(({ page, key }) => [page, key]);
+
+  it('30项说明责任完整且唯一：29项常驻 + 唯一POL-U24桌面排除', () => {
+    expect(responsibilityErrors(RESPONSIBILITIES)).toEqual([]);
+  });
+
+  it('责任清册负控：删项、重复凑数、扩大或挪用排除、丢理由都不能通过', () => {
+    expect(responsibilityErrors([])).not.toEqual([]);
+    for (const resident of RESPONSIBILITIES.filter((entry) => entry.disposition === 'resident')) {
+      expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry !== resident)), identity(resident)).not.toEqual([]);
+      const other = RESPONSIBILITIES.find((entry) => entry.disposition === 'resident' && entry !== resident)!;
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident ? other : entry)), 'duplicate cannot replace a missing responsibility').not.toEqual([]);
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
+        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON } : entry)), 'cannot enlarge the exclusion').not.toEqual([]);
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
+        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON }
+        : entry.disposition === 'desktop-only' ? { ...entry, disposition: 'resident', reason: undefined } : entry)), 'cannot swap the exclusion while keeping 29+1').not.toEqual([]);
+    }
+    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
+      ? { ...entry, reason: undefined } : entry))).not.toEqual([]);
+    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
+      ? { ...entry, reason: 'unsupported' } : entry))).not.toEqual([]);
+    expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry.disposition !== 'desktop-only'))).not.toEqual([]);
   });
 
   it('逐条都落在了对应页面的 DOM 上', () => {
@@ -1972,10 +2032,23 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
     expect(applied).toBe(true);
   });
 
+  function desktopTakeoverLeaks(markup: string, writeIds: readonly string[]): string[] {
+    const leaks: string[] = [];
+    if (markup.includes('data-setting="takeover-system-dns"')) leaks.push('control');
+    if (markup.includes(copy('settings.dns.takeoverSystemDnsDesc'))) leaks.push('explanation');
+    if (writeIds.includes('takeover-system-dns')) leaks.push('write-site');
+    return leaks;
+  }
+
   it('mobile excludes desktop DNS takeover from controls, explanation and write sites', () => {
-    expect(MARKUP.dns).not.toContain('data-setting="takeover-system-dns"');
-    expect(MARKUP.dns).not.toContain(copy('settings.dns.takeoverSystemDnsDesc'));
-    expect(siteIdsOf('dns')).not.toContain('takeover-system-dns');
+    expect(desktopTakeoverLeaks(MARKUP.dns, siteIdsOf('dns'))).toEqual([]);
+  });
+
+  it('POL-U24 negative controls reject a returning desktop control, explanation or writer', () => {
+    expect(desktopTakeoverLeaks('<div data-setting="takeover-system-dns"></div>', [])).toEqual(['control']);
+    expect(desktopTakeoverLeaks(copy('settings.dns.takeoverSystemDnsDesc'), [])).toEqual(['explanation']);
+    expect(desktopTakeoverLeaks('', ['takeover-system-dns'])).toEqual(['write-site']);
+    expect(desktopTakeoverLeaks('<div data-setting="optimistic-cache"></div>', ['optimistic-cache'])).toEqual([]);
   });
 
   /*

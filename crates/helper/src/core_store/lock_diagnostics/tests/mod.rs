@@ -1,5 +1,7 @@
 use super::*;
-use crate::core_store::{CoreStore, LockFailure, OwnerPolicy};
+use crate::core_store::{
+    acquire_lock, lock_error, CoreStore, LockFailure, LockObservation, LockRole, OwnerPolicy,
+};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -319,6 +321,104 @@ fn diagnostic_races_keep_bounded_closed_context_and_total_count() {
         .race_observations
         .iter()
         .all(|entry| *entry == (RaceStage::ParentChanged, 42, Some(7))));
+}
+
+#[test]
+fn native_retain_and_mutation_contention_keep_original_descriptor_snapshots() {
+    let unique = tempfile::NamedTempFile::new().unwrap();
+    let open = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(unique.path())
+            .unwrap()
+    };
+    let holder = open();
+    holder.try_lock_shared().unwrap();
+    let contender = open();
+    let fd = contender.as_raw_fd();
+    for role in [LockRole::RetainExclusive, LockRole::StoreMutationExclusive] {
+        let error = acquire_lock(&contender, role).unwrap_err();
+        let snapshot = observed(&error);
+        let failure = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<LockFailure>()
+            .unwrap();
+        assert!(matches!(&failure.cause, std::fs::TryLockError::WouldBlock));
+        assert_eq!(failure.observation.fd, Some(fd));
+        assert_eq!(
+            failure.observation.inode,
+            LockObservation::from_file(&contender).inode
+        );
+        assert_eq!(snapshot.pid, std::process::id());
+        assert!(snapshot
+            .to_string()
+            .contains("claim=descriptor-observation-only"));
+        assert!(error.to_string().contains(role.name()));
+    }
+    // The original shared holder remains alive throughout both observations.
+    // No explicit unlock, timer, descriptor flag mutation or retirement occurs.
+    drop(holder);
+}
+
+#[test]
+fn non_native_errors_preserve_cause_without_a_holder_snapshot() {
+    for role in [LockRole::RetainExclusive, LockRole::StoreMutationExclusive] {
+        for cause in [
+            io::Error::from_raw_os_error(nix::libc::EACCES),
+            io::Error::new(io::ErrorKind::WouldBlock, "wrapped-io-would-block"),
+            io::Error::other("original-other-cause"),
+        ] {
+            let kind = cause.kind();
+            let os_code = cause.raw_os_error();
+            let message = cause.to_string();
+            let error = lock_error(
+                role,
+                LockObservation::default(),
+                std::fs::TryLockError::Error(cause),
+            );
+            assert_eq!(error.kind(), kind);
+            let failure = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<LockFailure>()
+                .unwrap();
+            assert!(failure.holder_snapshot.is_none());
+            let source = std::error::Error::source(failure)
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap();
+            assert_eq!(source.raw_os_error(), os_code);
+            assert_eq!(source.to_string(), message);
+        }
+    }
+}
+
+#[test]
+fn lease_stage_vocabulary_nonce_and_clock_stay_closed_and_observational() {
+    let nonce = "a".repeat(64);
+    let phases = [
+        (LeaseStage::OriginalsHeld, "originals-held"),
+        (LeaseStage::ClonesHeld, "clones-held"),
+        (
+            LeaseStage::AllLocalLeasesDropped,
+            "all-local-leases-dropped",
+        ),
+    ];
+    for (phase, name) in phases {
+        let before = monotonic_ns();
+        let origin = lease_stage_origin(phase, &nonce);
+        let after = monotonic_ns();
+        assert_eq!(phase.name(), name);
+        assert_eq!(origin.phase, phase);
+        assert_eq!(origin.pid, std::process::id());
+        assert_eq!(origin.nonce.as_deref(), Some(nonce.as_str()));
+        assert!(before <= origin.monotonic_ns && origin.monotonic_ns <= after);
+    }
+    assert!(lease_stage_origin(LeaseStage::OriginalsHeld, "not-a-nonce")
+        .nonce
+        .is_none());
 }
 
 #[test]

@@ -22,6 +22,8 @@ from consume import materialize_apple_resources
 from fork_input import ROOT, canonical, decode, load, require, sha
 from producer import lease, slot_locks, private_dir, producer_code, run, write_json
 
+from apple_handoff import required_slots, scope_fields
+
 CARRIERS = [('device-arm64', None), ('sim-arm64', 'arm64')]
 
 # Existing selected-original and individual-artifact limits remain unchanged.
@@ -142,7 +144,7 @@ def admit():
     require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
     developer, _, xcode = selected_apple_tools(value)
     facts = {'schema': 'polaris-apple-runner-tool-admission-v1',
-             'candidate': expected, 'xcode': xcode, 'developer': str(developer),
+             **scope_fields(), 'candidate': expected, 'xcode': xcode, 'developer': str(developer),
              'iPhoneSDK': value['apple']['iPhoneSDK'], 'simulatorSDK': value['apple']['simulatorSDK'],
              'compilerByteIdentityChecked': False, 'carrierAccepted': False, 'devicePassed': False,
              'scope': 'exact version/build/SDK admission only; original compiler byte verification still mandatory'}
@@ -158,7 +160,7 @@ def prepare():
     require(run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip() == expected, 'hosted App candidate differs')
     developer, env, xcode = selected_apple_tools(value)
     from apple_admission import preflight
-    preflight(root, env)
+    preflight(root, env, expected_slots=required_slots())
     tools = private_dir(root / 'tools')
     tool_cache = private_dir(root / 'tool-cache')
     go = Path(shutil.which('go')).resolve(strict=True)
@@ -181,7 +183,7 @@ def prepare():
              'rust-target': str(private_dir(root / 'cache/rust-target'))}
     prepare_source(paths['source'], value)
     require(producer_code() == identity, 'App producer source changed during preparation')
-    facts = {'App': identity, 'paths': paths, 'xcode': xcode,
+    facts = {**scope_fields(), 'App': identity, 'paths': paths, 'xcode': xcode,
              'tools': {name: file_pin(paths[name]) for name in ('go', 'gomobile', 'gobind')},
              'rustc': run(['rustc', '-vV']), 'devicePassed': False}
     facts['fingerprint'] = sha(canonical(facts))
@@ -193,7 +195,10 @@ def prepare():
 
 def build():
     root = location()
-    paths = read_receipt(root / 'tools.json')['paths']
+    tools = read_receipt(root / 'tools.json')
+    require(all(tools.get(k) == v for k, v in scope_fields().items()),
+            'prepared Apple carrier scope differs before build')
+    paths = tools['paths']
     # The existing Tauri beforeBuild commands belong before source/link freeze.
     # Their outputs are ignored generated UI/resources, not mutations of PBX/Cargo.
     with phase_timing('frontend-resources'):
@@ -232,7 +237,7 @@ def import_carrier(folder):
     private_dir(paths['rust-target'])
     env = dict(os.environ, DEVELOPER_DIR=paths['developer'])
     from apple_admission import preflight
-    preflight(root, env)
+    preflight(root, env, expected_slots=required_slots())
     require(run(['rustc', '-vV']) == tools['rustc'], 'actual consumer Rust toolchain differs')
     with Path(os.environ['GITHUB_ENV']).open('a') as stream:
         stream.write('POLARIS_FORMAL_APPLE_ROOT=' + str(root) + '\nDEVELOPER_DIR=' + paths['developer'] + '\n')
@@ -257,7 +262,7 @@ def import_local():
 
 def carrier(slot):
     from apple_handoff import carrier_summary, context
-    require(slot in dict(CARRIERS), 'exact carrier slot required')
+    require(slot in required_slots(), 'unrequested Apple carrier slot')
     root = location()
     # Local verification precedes the common Rust cache restore. Every actual
     # carrier also rechecks the original component bytes before compilation.
@@ -353,9 +358,9 @@ def preserve_linked_archive(root, slot, receipt_path=None):
 
 def evidence(*, publish_env=False, slot=None):
     root = location()
-    require(slot is None or slot in dict(CARRIERS), 'unknown Apple evidence slot')
+    require(slot is None or slot in required_slots(), 'unrequested Apple evidence slot')
     scoped_slot = slot or os.environ.get('POLARIS_APPLE_CARRIER_SLOT')
-    require(scoped_slot is None or scoped_slot in dict(CARRIERS), 'unknown Apple evidence slot')
+    require(scoped_slot is None or scoped_slot in required_slots(), 'unrequested Apple evidence slot')
     output = root / ('apple-original-' + slot + '-evidence.zip' if slot else 'apple-original-evidence.zip')
     # Even preparation/import failures may precede the normal GITHUB_ENV write.
     # Publish only the fixed owned evidence path for the following upload step.
@@ -411,7 +416,7 @@ def evidence(*, publish_env=False, slot=None):
                     receipt_errors['native-input:' + str(len(receipt_errors))] = 'original input missing in failed partial work'
             if 'generatorOutputRoot' in origins:
                 paths.update(path for path in Path(origins['generatorOutputRoot']).rglob('*') if path.is_file())
-        for current_slot, _ in CARRIERS:
+        for current_slot in required_slots():
             if scoped_slot and current_slot != scoped_slot:
                 continue
             work = root / current_slot
@@ -494,7 +499,7 @@ def evidence(*, publish_env=False, slot=None):
                 with package.open(info, 'w', force_zip64=True) as member:
                     copy_pinned_evidence(path, member, pin)
                 rows[name] = {'originalPath': str(path), **pin}
-            index = {'schema': 'polaris-apple-original-evidence-v1', 'files': rows,
+            index = {'schema': 'polaris-apple-original-evidence-v2', **scope_fields(), 'files': rows,
                      'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
                      'componentAccepted': origins is not None and not receipt_errors and
                                           (not scoped_slot or imported),
@@ -534,7 +539,7 @@ def retire_slot(slot):
     """
     from apple_handoff import context, transport_pin
     from apple_rust import target_for
-    require(slot in dict(CARRIERS), 'unknown Apple retirement slot')
+    require(slot in required_slots(), 'unrequested Apple retirement slot')
     root = location()
     target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
                         'arm64', 'release')
@@ -586,11 +591,15 @@ def retire_slot(slot):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot'])
+    parser.add_argument('--scope', choices=('device-only', 'device-and-simulator'))
     parser.add_argument('--handoff', type=Path)
     parser.add_argument('--slot', choices=[slot for slot, _ in CARRIERS])
     parser.add_argument('--summaries', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.scope is not None:
+        require(scope_fields(args.scope) == scope_fields(), 'CLI/environment Apple scope differs')
+    required_slots()  # Reject unknown environment scope before work or evidence.
     if args.action == 'import':
         require(args.handoff is not None, 'handoff folder required')
         import_carrier(args.handoff)
@@ -600,7 +609,8 @@ if __name__ == '__main__':
     elif args.action == 'aggregate':
         require(args.summaries is not None and args.output is not None, 'aggregate inputs/output required')
         from apple_handoff import aggregate
-        aggregate(args.summaries, args.output)
+        require(args.scope is not None, 'explicit aggregate scope required')
+        aggregate(args.summaries, args.output, scope=args.scope)
     elif args.action == 'evidence':
         evidence(publish_env=True, slot=args.slot)
     elif args.action == 'retire-slot':

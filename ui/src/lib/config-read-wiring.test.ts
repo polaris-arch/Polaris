@@ -27,6 +27,7 @@
  * 新增/挪走一个读点则必然转红。
  */
 import { describe, it, expect } from 'vitest';
+import { parse } from '@babel/parser';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -448,13 +449,6 @@ interface MirrorSite {
 }
 
 const MIRROR_SITES: readonly MirrorSite[] = [
-  {
-    file: 'store/app-store.ts',
-    shape: 'useAppStore.setState({config,configPublication:{epoch,reason…',
-    count: 1,
-    surface: 'operation',
-    why: '镜像自身：唯一权威发布把同一 raw config 的 servers/rules 同步写入扁平镜像，绝不从 staged 投影发布。',
-  },
   {
     file: 'components/screens/rules/RulesScreen.tsx',
     shape: "useAppStore.setState((state)=>{constcurrent=plane==='dns'?st…",
@@ -1212,6 +1206,204 @@ describe('T5：整份 state 别名不得成为隐形读点', () => {
         src,
         `${a.file}:${a.line} 的 \`${a.name}\` 是整份 state 别名，从它读 config 会绕过判据面；改用 getEffectiveConfig() 或直接 useAppStore.getState().config`
       ).not.toMatch(new RegExp(`\\b${a.name}\\s*\\??\\.\\s*config\\b`));
+    }
+  });
+});
+
+// The publisher now prepares raw mirrors before it can advance publication state.
+// Its spread no longer reads .servers/.rules inside a scanner call; guard that
+// producer's real AST/dataflow here instead of retaining a fictional MIRROR_SITES row.
+type PublicationNode = Record<string, unknown>;
+function publicationNodes(value: unknown): PublicationNode[] {
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) return value.flatMap(publicationNodes);
+  const node = value as PublicationNode;
+  return [node, ...Object.entries(node)
+    .filter(([key]) => !['loc', 'extra', 'leadingComments', 'trailingComments', 'innerComments'].includes(key))
+    .flatMap(([, child]) => publicationNodes(child))];
+}
+function publicationShape(value: unknown): string {
+  function clean(input: unknown): unknown {
+    if (Array.isArray(input)) return input.map(clean);
+    if (!input || typeof input !== 'object') return input;
+    return Object.fromEntries(Object.entries(input as PublicationNode)
+      .filter(([key]) => !['start', 'end', 'loc', 'extra', 'leadingComments', 'trailingComments', 'innerComments'].includes(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, clean(child)]));
+  }
+  return JSON.stringify(clean(value));
+}
+function rawPublicationIsConnected(source: string): boolean {
+  const body = parse(source, { sourceType: 'module', plugins: ['typescript'] }).program.body;
+  const nodes = publicationNodes(body);
+  const named = (node: unknown, name: string) => {
+    const value = node as PublicationNode | null;
+    return value?.type === 'Identifier' && value.name === name;
+  };
+  const functions = (name: string) => body.filter((node) => node.type === 'FunctionDeclaration' && node.id?.name === name);
+  for (const name of ['prepareConfigPublication', 'publishConfig', 'pumpConfigRefresh']) {
+    if (nodes.filter((node) => node.type === 'FunctionDeclaration' && named(node.id, name)).length !== 1
+      || nodes.some((node) => node.type === 'VariableDeclarator' && named(node.id, name))) return false;
+    if (nodes.some((node) => ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(String(node.type))
+      && (node.params as unknown[]).some((parameter) => named(parameter, name)))) return false;
+  }
+  const prepare = functions('prepareConfigPublication');
+  const publish = functions('publishConfig');
+  const pump = functions('pumpConfigRefresh');
+  if (prepare.length !== 1 || publish.length !== 1 || pump.length !== 1) return false;
+  const expression = (text: string) => {
+    const statement = parse(`const expected = ${text};`, { sourceType: 'module', plugins: ['typescript'] }).program.body[0];
+    return statement.type === 'VariableDeclaration' ? statement.declarations[0].init : null;
+  };
+  const same = (node: unknown, text: string) => publicationShape(node) === publicationShape(expression(text));
+  // Intentionally a bounded contract for the current implementation, not a JS
+  // interpreter: only these directly executed statement lists are supported.
+  // Descendant-call presence cannot prove execution or exclude mutating calls.
+  const sameStatements = (actual: unknown, text: string) => {
+    const expected = parse(`async function expected() { ${text} }`, { sourceType: 'module', plugins: ['typescript'] }).program.body[0];
+    return expected.type === 'FunctionDeclaration'
+      && publicationShape(actual) === publicationShape(expected.body.body);
+  };
+  if (prepare[0].type !== 'FunctionDeclaration' || !sameStatements(prepare[0].body.body, `
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
+      throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+    }
+    const projection = {
+      config,
+      servers: config.servers ?? [], selectedServerId: config.selectedServerId,
+      rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
+      dnsRules: config.dnsRules ?? [],
+    };
+    if (!Array.isArray(projection.servers) || !Array.isArray(projection.rules) || !Array.isArray(projection.dnsRules)
+      || (projection.selectedServerId != null && typeof projection.selectedServerId !== 'string')) {
+      throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+    }
+    return projection;
+  `)) return false;
+  if (publish[0].type !== 'FunctionDeclaration' || !sameStatements(publish[0].body.body, `
+    const publication = { config, epoch, reason, serial: ++publicationSerial };
+    configReadGeneration.published();
+    useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } });
+    return publication;
+  `)) return false;
+
+  const prepareNodes = publicationNodes(prepare[0]);
+  const projections = prepareNodes.filter((node) => node.type === 'VariableDeclarator' && named(node.id, 'projection'));
+  if (projections.length !== 1 || !same(projections[0].init, `({
+    config,
+    servers: config.servers ?? [], selectedServerId: config.selectedServerId,
+    rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
+    dnsRules: config.dnsRules ?? [],
+  })`)) return false;
+  if (prepare[0].type !== 'FunctionDeclaration' || prepare[0].params.length !== 1 || !named(prepare[0].params[0], 'config')) return false;
+  const returns = prepareNodes.filter((node) => node.type === 'ReturnStatement');
+  if (returns.length !== 1 || !named(returns[0].argument, 'projection')) return false;
+  if (publish[0].type !== 'FunctionDeclaration') return false;
+  const parameters = publish[0].params;
+  if (parameters.length !== 4 || !named(parameters[0], 'config') || !named(parameters[1], 'epoch')
+    || !named(parameters[2], 'reason') || parameters[3].type !== 'AssignmentPattern'
+    || !named(parameters[3].left, 'projection') || !same(parameters[3].right, 'prepareConfigPublication(config)')) return false;
+  const publishNodes = publicationNodes(publish[0]);
+  const setters = publishNodes.filter((node) => node.type === 'CallExpression' && same(node.callee, 'useAppStore.setState'));
+  if (setters.length !== 1 || !same(setters[0], 'useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } })')) return false;
+  const pumpNodes = publicationNodes(pump[0]);
+  if (pump[0].type !== 'FunctionDeclaration') return false;
+  const launches = pump[0].body.body.filter((statement) => statement.type === 'ExpressionStatement'
+    && statement.expression.type === 'UnaryExpression' && statement.expression.operator === 'void'
+    && statement.expression.argument.type === 'CallExpression'
+    && statement.expression.argument.callee.type === 'ArrowFunctionExpression'
+    && statement.expression.argument.callee.async);
+  if (launches.length !== 1) return false;
+  const launch = launches[0];
+  if (launch.type !== 'ExpressionStatement' || launch.expression.type !== 'UnaryExpression'
+    || launch.expression.argument.type !== 'CallExpression'
+    || launch.expression.argument.callee.type !== 'ArrowFunctionExpression'
+    || launch.expression.argument.callee.body.type !== 'BlockStatement') return false;
+  const executedTries = launch.expression.argument.callee.body.body.filter((statement) => statement.type === 'TryStatement');
+  const tries = pumpNodes.filter((node) => node.type === 'TryStatement');
+  if (tries.length !== 1 || executedTries.length !== 1 || tries[0] !== executedTries[0]) return false;
+  const statements = ((tries[0].block as PublicationNode).body as PublicationNode[]);
+  const publicationStatement = statements.findIndex((statement) => statement.type === 'VariableDeclaration'
+    && (statement.declarations as PublicationNode[]).some((declaration) => named(declaration.id, 'publication')));
+  // No extra call (Object.assign, alias mutator, helper, etc.) can be inserted
+  // between acquiring raw config, preparing its mirrors and publishing them.
+  if (publicationStatement < 0 || !sameStatements(statements.slice(0, publicationStatement + 1), `
+    const config = await api.config.get();
+    if (!current()) return;
+    const projection = prepareConfigPublication(config);
+    if (!current()) return;
+    if (session.scope === 'main') await hydrateStagedConfig(config, current);
+    if (!current()) return;
+    refreshNeeded = false;
+    publicationStarted = true;
+    const publication = publishConfig(config, flight.epoch, reason, projection);
+  `)) return false;
+  const declarations = statements.filter((node) => node.type === 'VariableDeclaration')
+    .flatMap((node) => node.declarations as PublicationNode[]);
+  const binding = (name: string, text: string) => {
+    const found = declarations.filter((node) => named(node.id, name));
+    return found.length === 1 && same(found[0].init, text);
+  };
+  if (!binding('config', 'await api.config.get()')
+    || !binding('projection', 'prepareConfigPublication(config)')
+    || !binding('publication', 'publishConfig(config, flight.epoch, reason, projection)')) return false;
+  // These must be the bindings on the executed GET branch, in that order, not an
+  // unused helper or a second shadowed projection with a reassuring name.
+  const names = declarations.map((node) => (node.id as PublicationNode).name);
+  if (!(names.indexOf('config') < names.indexOf('projection') && names.indexOf('projection') < names.indexOf('publication'))) return false;
+  for (const name of ['config', 'projection', 'publication']) {
+    if (pumpNodes.filter((node) => node.type === 'VariableDeclarator' && named(node.id, name)).length !== 1) return false;
+  }
+  const calls = pumpNodes.filter((node) => node.type === 'CallExpression');
+  for (const callee of ['prepareConfigPublication', 'publishConfig', 'api.config.get']) {
+    if (calls.filter((node) => same(node.callee, callee)).length !== 1) return false;
+  }
+  // Do not allow an intervening reassignment or property mutation to change raw
+  // config/projection provenance after the structurally checked declarations.
+  const protectedNodes = [...prepareNodes, ...publishNodes, ...pumpNodes];
+  for (const node of protectedNodes) {
+    const target = node.type === 'AssignmentExpression' ? node.left
+      : node.type === 'UpdateExpression' || (node.type === 'UnaryExpression' && node.operator === 'delete') ? node.argument : null;
+    if (publicationNodes(target).some((part) => named(part, 'config') || named(part, 'projection'))) return false;
+  }
+  // No extra top-level duplicate helper can satisfy the named checks above.
+  return nodes.length > 0;
+}
+
+describe('M4：权威 raw config 投影与实际 publication 的 AST 接线', () => {
+  const source = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
+  it('GET 的同一 raw config 经预校验投影到实际发布，保留 legacy rules 回退', () => {
+    expect(rawPublicationIsConnected(source)).toBe(true);
+  });
+  it('拒绝 effective 来源、缺失镜像、断线 helper、覆盖和旁路发布', () => {
+    const mutations = [
+      source.replace('servers: config.servers ?? []', 'servers: getEffectiveConfig().servers ?? []'),
+      source.replace('rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? []', 'rules: config.trafficRules ?? []'),
+      source.replace('dnsRules: config.dnsRules ?? [],', ''),
+      source.replace('return projection;', 'return { ...projection, config: getEffectiveConfig() };'),
+      source.replace('projection = prepareConfigPublication(config)', 'projection = getEffectiveConfig()'),
+      source.replace('...projection, configPublication:', '...getEffectiveConfig(), configPublication:'),
+      source.replace('const config = await api.config.get();', 'const config = getEffectiveConfig();'),
+      source.replace('const projection = prepareConfigPublication(config);', 'const projection = prepareConfigPublication(getEffectiveConfig());'),
+      source.replace('publishConfig(config, flight.epoch, reason, projection)', 'publishConfig(config, flight.epoch, reason, getEffectiveConfig())'),
+      source.replace('const projection = prepareConfigPublication(config);', 'const projection = prepareConfigPublication(config); projection.servers = getEffectiveConfig().servers;'),
+      source.replace('function prepareConfigPublication(', 'function unusedPrepareConfigPublication('),
+      source.replace('useAppStore.setState({ ...projection,', 'unusedSetState({ ...projection,'),
+      source.replace('void (async () => {', 'const unusedRead = (async () => {').replace('  })();\n}\n\n/** One listener', '  });\n}\n\n/** One listener'),
+      source.replace('const config = await api.config.get();', 'const prepareConfigPublication = getEffectiveConfig; const config = await api.config.get();'),
+      source.replace(
+        'useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } });',
+        'const unusedPublish = () => { useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } }); };',
+      ),
+      source.replace(
+        'const projection = prepareConfigPublication(config);',
+        'const projection = prepareConfigPublication(config); Object.assign(projection, { servers: getEffectiveConfig().servers });',
+      ),
+
+    ];
+    for (const mutation of mutations) {
+      expect(mutation).not.toBe(source);
+      expect(rawPublicationIsConnected(mutation)).toBe(false);
     }
   });
 });

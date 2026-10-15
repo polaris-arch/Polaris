@@ -1306,7 +1306,13 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
         (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
       ),
       '${{ runner.temp }}/s5-android-unit-results.json',
+      '${{ runner.temp }}/release-stage1.log',
     ]);
+    const stage1 = stepBlock(releaseCheck, 'Build unsigned release-profile validation APK');
+    expect(stage1).toContain('stage1_log="$RUNNER_TEMP/release-stage1.log"');
+    expect(stage1).toContain('>"$stage1_log" 2>&1');
+    const validationEvidence = stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）');
+    expect(executable(validationEvidence)).toMatch(/^ {8}if: always\(\)$/m);
     const formalEvidence = [
       '${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar',
       '${{ steps.libbox_input.outputs.work }}/staging/stage.aar',

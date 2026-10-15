@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -232,4 +232,137 @@ with tempfile.TemporaryDirectory(prefix='wire-outer-control-') as tmp:
   const observed = JSON.parse(execFileSync('python3', ['-B', '-c', source,
     `${root}scripts/desktop-core/release-archive.py`], { encoding: 'utf8', timeout: 30000 }));
   assert.equal(observed.negativeCases, 8);
+});
+
+// Exercise the actual workflow shell with inert command shims, never real Rust builds.
+function helperRunBlock(source = yaml('package')) {
+  const step = source.split('      - name: Build and stage privileged helper\n')[1]?.split('\n      - name:')[0];
+  const run = step?.split('        run: |\n')[1]?.split('\n').filter((line) => line.startsWith('          '))
+    .map((line) => line.slice(10)).join('\n');
+  assert(run?.startsWith('set -euo pipefail'), 'helper step/run must exist and fail closed');
+  return run;
+}
+const helperPlatforms = [
+  ['linux', 'x86_64-unknown-linux-gnu', 'Linux', 'linux', 'polaris-helper'],
+  ['windows', 'x86_64-pc-windows-msvc', 'Windows', 'win', 'polaris-helper.exe'],
+  ['macos-arm64', 'aarch64-apple-darwin', 'macOS', 'mac-arm64', 'polaris-helper'],
+  ['macos-x64', 'x86_64-apple-darwin', 'macOS', 'mac-x64', 'polaris-helper'],
+];
+function runHelperFixture(platform, { host = platform[1], source = helperRunBlock(), fail = '', missing = '' } = {}) {
+  const [label, target, os] = platform;
+  const directory = mkdtempSync(join(tmpdir(), 'polaris-helper-target-'));
+  try {
+    const binDir = join(directory, 'bin'), log = join(directory, 'calls.jsonl');
+    mkdirSync(binDir); writeFileSync(log, '');
+    const shim = `#!${process.execPath}
+const fs = require('node:fs'), path = require('node:path');
+const tool = path.basename(process.argv[1]), args = process.argv.slice(2);
+fs.appendFileSync(process.env.CALL_LOG, JSON.stringify({ tool, args, buildId: process.env.POLARIS_BUILD_ID }) + '\\n');
+if (tool === process.env.FAIL_TOOL) process.exit(7);
+if (tool === 'rustc') { process.stdout.write(process.env.RUSTC_OUTPUT); }
+if (tool === 'cargo') {
+  const at = args.indexOf('--target'), target = at < 0 ? '' : args[at + 1];
+  const binary = args[args.indexOf('--bin') + 1] + (process.env.FIXTURE_OS === 'Windows' ? '.exe' : '');
+  if (binary !== process.env.MISSING_BINARY) {
+    const output = path.join('target', target, 'release', binary);
+    fs.mkdirSync(path.dirname(output), { recursive: true }); fs.writeFileSync(output, 'inert ' + binary);
+  }
+}
+if (tool === 'cp') fs.copyFileSync(args[0], args[1]);
+`;
+    for (const tool of ['rustc', 'cargo', 'cp', 'codesign', 'node']) writeFileSync(join(binDir, tool), shim, { mode: 0o755 });
+    const rendered = source.replaceAll('${{ matrix.label }}', label)
+      .replaceAll('${{ matrix.rust_target }}', target).replaceAll('${{ runner.os }}', os);
+    assert.doesNotMatch(rendered, /\$\{\{/);
+    const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', rendered], {
+      cwd: directory, encoding: 'utf8', timeout: 15000,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CALL_LOG: log,
+        RUSTC_OUTPUT: host === null ? 'rustc fixture\n' : `rustc fixture\nhost: ${host}\n`,
+        FIXTURE_OS: os, FAIL_TOOL: fail, MISSING_BINARY: missing,
+        POLARIS_BUILD_ID: candidate, GITHUB_WORKSPACE: directory, GITHUB_ENV: join(directory, 'env') },
+    });
+    assert.ifError(result.error);
+    return { status: result.status, stderr: result.stderr, stdout: result.stdout,
+      calls: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line)),
+      identity: existsSync(join(directory, 'env')) ? readFileSync(join(directory, 'env'), 'utf8') : '', directory };
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+function assertHelperFixture(platform, options = {}) {
+  const [label, target, os, res, binary] = platform;
+  const result = runHelperFixture(platform, options);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const mac = os === 'macOS', builds = result.calls.filter(({ tool }) => tool === 'cargo');
+  const targetArgs = mac ? ['--target', target] : [];
+  assert.deepEqual(builds.map(({ args }) => args), [
+    ['build', '--release', '-p', 'polaris-helper', '--bin', 'polaris-helper', ...targetArgs],
+    ...(label === 'windows' ? [['build', '--release', '-p', 'polaris-windows-cleaner', '--bin', 'polaris-cleaner']] : []),
+  ]);
+  assert(builds.every(({ buildId }) => buildId === candidate));
+  const output = mac ? `target/${target}/release` : 'target/release';
+  assert.deepEqual(result.calls.filter(({ tool }) => tool === 'cp').map(({ args }) => args), [
+    [`${output}/${binary}`, `resources/${res}/${binary}`],
+    ...(label === 'windows' ? [[`${output}/polaris-cleaner.exe`, 'resources/win/polaris-cleaner.exe']] : []),
+  ]);
+  const tools = result.calls.map(({ tool }) => tool);
+  assert.deepEqual(tools, mac ? ['cargo', 'cp', 'codesign', 'codesign', 'node']
+    : label === 'windows' ? ['rustc', 'cargo', 'cp', 'cargo', 'cp', 'node'] : ['rustc', 'cargo', 'cp', 'node']);
+  assert.deepEqual(result.calls.filter(({ tool }) => tool === 'rustc').map(({ args }) => args), mac ? [] : [['-vV']]);
+  if (!mac) assert(tools.indexOf('rustc') < tools.indexOf('cargo'));
+  assert.equal(tools.at(-1), 'node', 'identity prepared only after every staged binary');
+  assert.deepEqual(result.calls.at(-1).args, ['scripts/prepare-core-identity.mjs', `--platform=${res}`]);
+  assert.equal(result.identity, `POLARIS_CORE_IDENTITY_FILE=${result.directory}/resources/${res}/core-manifest.json\n`);
+  assert.deepEqual(result.calls.filter(({ tool }) => tool === 'codesign').map(({ args }) => args),
+    mac ? Array.from({ length: 2 }, () => ['--verify', '--strict', `resources/${res}/${binary}`]) : []);
+}
+
+test('desktop helper uses checked native host output while both mac architectures keep explicit targets', () => {
+  for (const platform of helperPlatforms) assertHelperFixture(platform,
+    { host: platform[2] === 'macOS' ? 'aarch64-apple-darwin' : platform[1] });
+  const source = yaml('package');
+  assert(source.indexOf('      - name: Build and stage privileged helper\n') < source.indexOf('      - name: Build installers\n'));
+  assert.match(source, /POLARIS_BUILD_ID: \$\{\{ needs.setup.outputs.candidate \}\}/);
+});
+
+test('helper host mismatch, absent host, unknown platform and failed staging stop before identity', () => {
+  for (const platform of helperPlatforms.slice(0, 2)) {
+    for (const host of ['wrong-triple', null, `${platform[1]}\nhost: ${platform[1]}`]) {
+      const result = runHelperFixture(platform, { host });
+      assert.notEqual(result.status, 0); assert.match(result.stdout, /helper host [\s\S]* differs/);
+      assert.deepEqual(result.calls.map(({ tool }) => tool), ['rustc']);
+      assert.equal(result.identity, '');
+    }
+  }
+  const unknown = runHelperFixture(['unknown', 'x86_64-unknown-linux-gnu', 'Linux']);
+  assert.notEqual(unknown.status, 0); assert.deepEqual(unknown.calls, []);
+  for (const fail of ['rustc', 'cargo', 'cp', 'node']) {
+    const result = runHelperFixture(helperPlatforms[0], { fail });
+    assert.notEqual(result.status, 0); assert.equal(result.identity, '');
+    assert.equal(result.calls.at(-1).tool, fail);
+  }
+  const unsigned = runHelperFixture(helperPlatforms[3], { fail: 'codesign' });
+  assert.notEqual(unsigned.status, 0); assert.equal(unsigned.identity, '');
+  assert(!unsigned.calls.some(({ tool }) => tool === 'node'));
+  for (const missing of ['polaris-helper.exe', 'polaris-cleaner.exe']) {
+    const result = runHelperFixture(helperPlatforms[1], { missing });
+    assert.notEqual(result.status, 0); assert.equal(result.identity, '');
+    assert(!result.calls.some(({ tool }) => tool === 'node'));
+  }
+});
+
+test('helper target/path controls reject old split-target mode, host drift and incomplete cleaner staging', () => {
+  const source = helperRunBlock();
+  for (const [platform, before, after] of [
+    [helperPlatforms[0], 'target_args=()', 'target_args=(--target "${{ matrix.rust_target }}")'],
+    [helperPlatforms[1], 'output_dir=target/release', 'output_dir="target/${{ matrix.rust_target }}/release"'],
+    [helperPlatforms[3], 'target_args=(--target "${{ matrix.rust_target }}")', 'target_args=()'],
+    [helperPlatforms[1], 'cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe', ':'],
+  ]) {
+    const changed = source.replace(before, after); assert.notEqual(changed, source);
+    assert.throws(() => assertHelperFixture(platform, { source: changed }));
+  }
+  const unchecked = source.replace('if [ "$host" != "${{ matrix.rust_target }}" ]; then', 'if false; then');
+  assert.notEqual(unchecked, source);
+  // The rejection oracle itself must distinguish an unchecked host from the real run block.
+  const accepted = runHelperFixture(helperPlatforms[0], { host: 'wrong-triple', source: unchecked });
+  assert.equal(accepted.status, 0); assert(accepted.calls.some(({ tool }) => tool === 'cargo'));
 });
