@@ -26,6 +26,7 @@ GROUPS = ('deps', 'build', '.fingerprint')
 MAX_BYTES, MAX_ENTRIES = 4 * 1024 ** 3, 131072
 REGISTRY_MAX_BYTES = 2 * 1024 ** 3
 HEADROOM = 1024 ** 3
+SAMPLE_LIMIT, SAMPLE_PATH_BYTES = 64, 1024
 # Actual Cargo.toml package=polaris and lib=polaris_lib. Keep all their compiled
 # outputs in the original target, including the hashed static archive in deps.
 APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.)')
@@ -38,18 +39,38 @@ class ExternalCacheAlias(RuntimeError):
         self.entries = entries
 
 
-def checked_tree(path, *, maximum=MAX_BYTES):
+class UncacheableSymlink(RuntimeError):
+    """Local dependency entry contains a link; leave the whole entry native."""
+    def __init__(self, entries):
+        super().__init__('cache symlink entry left uncached')
+        self.entries = entries
+
+
+def checked_tree(path, *, maximum=MAX_BYTES, local_export=False):
     """Bounded owned regular bytes; hardlink aliases must all stay in this tree."""
     path = Path(path)
-    require(path.resolve(strict=True) == path, 'cache ancestry cannot be redirected')
+    # Only local export may classify a candidate link without resolving it.
+    # Restored payloads and registry trees retain the strict ancestry contract.
+    ancestry = path.parent if local_export else path
+    require(ancestry.resolve(strict=True) == ancestry, 'cache ancestry cannot be redirected')
+    if local_export:
+        parent = ancestry.lstat()
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid(),
+                'cache parent ownership/type differs')
     size, entries, aliases = 0, 0, {}
+    symlink_entry = False
     pending = [path]
     while pending:
         current = pending.pop()
         info = current.lstat()
         entries += 1
         require(entries <= MAX_ENTRIES and info.st_uid == os.getuid(), 'cache ownership/count differs')
-        require(not stat.S_ISLNK(info.st_mode), 'cache symlink refused')
+        if stat.S_ISLNK(info.st_mode):
+            require(local_export, 'cache symlink refused')
+            symlink_entry = True
+            # Never inspect the link target. Finish checking all non-link siblings
+            # so ownership, special files and scan budgets cannot become skips.
+            continue
         if stat.S_ISDIR(info.st_mode):
             with os.scandir(current) as children:
                 for child in children:
@@ -63,6 +84,8 @@ def checked_tree(path, *, maximum=MAX_BYTES):
             aliases[key] = (seen + 1, links)
             size += info.st_size
             require(size <= maximum, 'cache bytes exceed transport bound')
+    if symlink_entry:
+        raise UncacheableSymlink(entries)
     if any(seen != links for seen, links in aliases.values()):
         raise ExternalCacheAlias(entries)
     return size, entries
@@ -233,6 +256,15 @@ def bounded_children(folder):
     return sorted(children)
 
 
+def cache_sample(samples, relative):
+    """Bound diagnostics by count and UTF-8 bytes; never include link targets."""
+    if len(samples) >= SAMPLE_LIMIT:
+        return True
+    raw = str(relative).encode('utf-8', errors='replace')
+    samples.append(raw[:SAMPLE_PATH_BYTES].decode('utf-8', errors='ignore'))
+    return len(raw) > SAMPLE_PATH_BYTES
+
+
 def export_cache(slot):
     root = location()
     stage = private_dir(ROOT / STAGE)
@@ -249,25 +281,40 @@ def export_cache(slot):
         require(not payload.exists() and not payload.is_symlink(), 'prior dependency payload retained')
         sources, size, count, skipped_aliases = [], 0, 0, []
         examined, skipped_alias_count = 0, 0
+        skipped_symlinks, skipped_symlink_count = [], 0
+        alias_truncated, symlink_truncated = False, False
         for role in roles:
+            base = native_base(root, slot, role)
+            # Admit the fixed role ancestry even when no GROUP/candidate exists.
+            # A legitimate missing native directory stays missing; no mkdir here.
+            require(not base.is_symlink() and base.resolve(strict=False) == base,
+                    'native dependency base/ancestry redirected')
             for group in GROUPS:
-                folder = native_base(root, slot, role) / group
+                folder = base / group
+                require(not folder.is_symlink(), 'native dependency directory redirected')
                 if not folder.exists():
                     continue
-                require(not folder.is_symlink() and folder.is_dir(), 'native dependency directory redirected')
+                require(folder.is_dir(), 'native dependency directory redirected')
                 for source in bounded_children(folder):
                     examined += 1
                     require(examined <= MAX_ENTRIES, 'examined cache entries exceed bound')
                     if APP_ENTRY.match(source.name):
                         continue
                     try:
-                        amount, entries = checked_tree(source)
+                        amount, entries = checked_tree(source, local_export=True)
+                    except UncacheableSymlink as link:
+                        examined += link.entries - 1
+                        require(examined <= MAX_ENTRIES, 'examined cache entries exceed bound')
+                        skipped_symlink_count += 1
+                        symlink_truncated = cache_sample(skipped_symlinks,
+                            source.relative_to(root / 'cache/rust-target')) or symlink_truncated
+                        continue
                     except ExternalCacheAlias as alias:
                         examined += alias.entries - 1
                         require(examined <= MAX_ENTRIES, 'examined cache entries exceed bound')
                         skipped_alias_count += 1
-                        if len(skipped_aliases) < 64:
-                            skipped_aliases.append(str(source.relative_to(root / 'cache/rust-target')))
+                        alias_truncated = cache_sample(skipped_aliases,
+                            source.relative_to(root / 'cache/rust-target')) or alias_truncated
                         continue
                     examined += entries - 1
                     require(examined <= MAX_ENTRIES, 'examined cache entries exceed bound')
@@ -284,7 +331,10 @@ def export_cache(slot):
         transfer(plan)
         note(root, 'export', slot, dependencyBytes=size, movedEntries=len(plan), freeBytes=free,
              uncachedExternalAliasEntries=skipped_aliases, uncachedExternalAliasCount=skipped_alias_count,
-             uncachedExternalAliasSampleLimit=64, examinedEntries=examined,
+             uncachedExternalAliasSampleLimit=SAMPLE_LIMIT, uncachedExternalAliasTruncated=alias_truncated,
+             uncachedSymlinkEntries=skipped_symlinks, uncachedSymlinkEntryCount=skipped_symlink_count,
+             uncachedSymlinkSampleLimit=SAMPLE_LIMIT, uncachedSymlinkTruncated=symlink_truncated,
+             examinedEntries=examined,
              archiveHeadroomBytes=size * 9 // 8 + count * 4096,
              scopeNote='same-filesystem dependency moves after original and summary upload; no App products')
 

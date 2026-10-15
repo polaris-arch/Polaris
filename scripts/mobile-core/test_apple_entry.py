@@ -1512,5 +1512,362 @@ class AppleDependencyCacheTests(unittest.TestCase):
                 apple_cache.import_cache('device-arm64', 'miss')
 
 
+    def test_local_export_leaves_whole_nested_symlink_entry_and_returns_safe_original_inodes(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+            source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+            build = dep.parent.parent / 'build'; build.mkdir()
+            skipped = build / 'linked-crate-0123456789abcdef'
+            (skipped / 'out').mkdir(parents=True)
+            sibling = skipped / 'ordinary-output'; sibling.write_bytes(b'keep the whole dependency entry')
+            link = skipped / 'out/link'; link.symlink_to('../ordinary-output')
+            safe = build / 'safe-crate-0123456789abcdef'; safe.mkdir()
+            (safe / 'output').write_bytes(b'cache this complete dependency')
+            originals = [app, final, root / 'apple-original-device-arm64-evidence.zip',
+                         root / 'evidence-device-arm64-pin.json',
+                         root / 'summaries/device-arm64/carrier-device-arm64.json']
+            preserved = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mode) for p in originals}
+            inodes = {p: p.stat().st_ino for p in (dep, safe, safe / 'output', sibling)}
+            p1, p2, p3, p4 = self.patched(source, root, context)
+            with p1, p2, p3, p4:
+                apple_cache.export_cache('device-arm64')
+                self.assertTrue(link.is_symlink()); self.assertEqual(sibling.read_bytes(), b'keep the whole dependency entry')
+                self.assertFalse(dep.exists()); self.assertFalse(safe.exists())
+                self.assertFalse((stage / 'device-arm64/target/build' / skipped.name).exists())
+                observation = json.loads((root / 'apple-cache-export-device-arm64.json').read_text())
+                self.assertEqual(observation['uncachedSymlinkEntries'],
+                                 [str(skipped.relative_to(root / 'cache/rust-target'))])
+                self.assertEqual(observation['uncachedSymlinkEntryCount'], 1)
+                self.assertEqual(observation['uncachedSymlinkSampleLimit'], 64)
+                self.assertIs(observation['uncachedSymlinkTruncated'], False)
+                self.assertIs(observation['carrierAccepted'], False); self.assertIs(observation['devicePassed'], False)
+                self.assertEqual({p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mode) for p in originals}, preserved)
+                apple_cache.import_cache('device-arm64', 'staged')
+            self.assertEqual({p: p.stat().st_ino for p in inodes}, inodes)
+            self.assertEqual({p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mode) for p in originals}, preserved)
+            self.assertTrue(link.is_symlink()); self.assertFalse((stage / 'device-arm64').exists())
+
+    def test_local_top_and_nested_links_never_dereference_internal_external_dangling_or_cycle_targets(self):
+        for nested in (False, True):
+            for kind in ('internal', 'external', 'dangling', 'cycle'):
+                with self.subTest(nested=nested, kind=kind), tempfile.TemporaryDirectory() as tmp, \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                    source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                    external = root / 'private-link-target'; external.write_bytes(b'do not inspect target contents')
+                    if nested:
+                        candidate = dep.parent.parent / 'build/linked-crate-0123456789abcdef'
+                        (candidate / 'out').mkdir(parents=True)
+                        (candidate / 'sibling').write_bytes(b'uncached sibling')
+                        link = candidate / 'out/link'
+                        internal = '../sibling'
+                    else:
+                        candidate = dep.parent / 'liblinked-0123456789abcdef.rlib'
+                        link = candidate; internal = app.name
+                    target = {'internal': internal, 'external': str(external),
+                              'dangling': str(root / 'missing-target'), 'cycle': link.name}[kind]
+                    link.symlink_to(target)
+                    real_resolve, real_scandir, real_stat = Path.resolve, os.scandir, os.stat
+                    def guarded_resolve(path, *args, **kwargs):
+                        if path in (candidate, link, external):
+                            raise AssertionError('local candidate or link target was resolved')
+                        return real_resolve(path, *args, **kwargs)
+                    def guarded_scandir(path):
+                        if Path(path) in (link, external):
+                            raise AssertionError('link target was enumerated')
+                        return real_scandir(path)
+                    def guarded_stat(path, *args, **kwargs):
+                        if Path(path) in (link, external) and kwargs.get('follow_symlinks', True):
+                            raise AssertionError('link target was stat-ed')
+                        return real_stat(path, *args, **kwargs)
+                    with mock.patch.object(Path, 'resolve', guarded_resolve), \
+                            mock.patch.object(apple_cache.os, 'scandir', side_effect=guarded_scandir), \
+                            mock.patch.object(apple_cache.os, 'stat', side_effect=guarded_stat), \
+                            mock.patch.object(apple_cache.os, 'readlink', side_effect=AssertionError('link target read')), \
+                            mock.patch.object(Path, 'open', side_effect=AssertionError('file contents read')), \
+                            self.assertRaises(apple_cache.UncacheableSymlink) as rejected:
+                        apple_cache.checked_tree(candidate, local_export=True)
+                    self.assertEqual(rejected.exception.entries, 4 if nested else 1)
+                    self.assertEqual(str(rejected.exception), 'cache symlink entry left uncached')
+                    p1, p2, p3, p4 = self.patched(source, root, context)
+                    with p1, p2, p3, p4:
+                        apple_cache.export_cache('device-arm64')
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(external.read_bytes(), b'do not inspect target contents')
+                    observation = json.loads((root / 'apple-cache-export-device-arm64.json').read_text())
+                    self.assertEqual(observation['uncachedSymlinkEntryCount'], 1)
+                    self.assertEqual(observation['uncachedSymlinkEntries'],
+                                     [str(candidate.relative_to(root / 'cache/rust-target'))])
+                    if nested:
+                        self.assertEqual((candidate / 'sibling').read_bytes(), b'uncached sibling')
+
+    def test_external_alias_and_symlink_skips_coexist_without_relaxing_internal_hardlinks(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+            source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+            os.link(dep, root / 'external-dependency-alias')
+            skipped = dep.parent / 'liblinked-0123456789abcdef.rlib'; skipped.symlink_to(app.name)
+            original_inode = (host / 'build-script-build').stat().st_ino
+            p1, p2, p3, p4 = self.patched(source, root, context)
+            with p1, p2, p3, p4:
+                apple_cache.export_cache('device-arm64')
+                row = json.loads((root / 'apple-cache-export-device-arm64.json').read_text())
+                self.assertEqual(row['uncachedExternalAliasCount'], 1)
+                self.assertEqual(row['uncachedExternalAliasEntries'],
+                                 [str(dep.relative_to(root / 'cache/rust-target'))])
+                self.assertIs(row['uncachedExternalAliasTruncated'], False)
+                self.assertEqual(row['uncachedSymlinkEntryCount'], 1)
+                self.assertEqual(row['uncachedSymlinkEntries'],
+                                 [str(skipped.relative_to(root / 'cache/rust-target'))])
+                staged = stage / 'device-arm64/host/build' / host.name
+                self.assertEqual((staged / 'build-script-build').stat().st_ino, original_inode)
+                self.assertEqual((staged / 'build-script-build').stat().st_nlink, 2)
+                self.assertTrue(dep.exists()); self.assertTrue(skipped.is_symlink())
+                apple_cache.import_cache('device-arm64', 'staged')
+            self.assertEqual((host / 'build-script-build').stat().st_ino, original_inode)
+            self.assertEqual(dep.read_bytes(), b'compiled dependency')
+            self.assertEqual(app.read_bytes(), b'App native archive')
+
+    def test_restored_hit_staged_return_and_registry_symlinks_remain_strict_before_transfer(self):
+        for restored in ('hit', 'staged'):
+            for position in ('payload', 'top', 'nested'):
+                with self.subTest(restored=restored, position=position), tempfile.TemporaryDirectory() as tmp, \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                    source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                    p1, p2, p3, p4 = self.patched(source, root, context)
+                    with p1, p2, p3, p4:
+                        apple_cache.export_cache('device-arm64')
+                        payload = stage / 'device-arm64'
+                        if position == 'payload':
+                            payload.rename(stage / 'held-payload'); payload.symlink_to('held-payload')
+                        elif position == 'top':
+                            (payload / 'injected-link').symlink_to(app)
+                        else:
+                            (payload / 'host/build' / host.name / 'injected-link').symlink_to(app)
+                        with mock.patch.object(apple_cache, 'transfer') as transfer, \
+                                mock.patch.object(apple_cache.os, 'rename') as move, \
+                                self.assertRaisesRegex(RuntimeError, 'symlink|redirected'):
+                            apple_cache.import_cache('device-arm64', restored)
+                        transfer.assert_not_called(); move.assert_not_called()
+                    self.assertFalse(dep.exists()); self.assertEqual(app.read_bytes(), b'App native archive')
+                    self.assertEqual(final.read_bytes(), b'original final staticlib')
+        for position in ('root', 'nested'):
+            with self.subTest(registry=position), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve(); home = root / 'home'; home.mkdir()
+                folder = home / '.cargo/registry/index'; folder.mkdir(parents=True)
+                (folder / 'ordinary').write_bytes(b'registry bytes')
+                if position == 'root':
+                    folder.rename(home / 'held-index'); folder.symlink_to(home / 'held-index')
+                else:
+                    (folder / 'injected-link').symlink_to(root / 'missing-registry-target')
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.object(apple_cache, 'location', return_value=root), \
+                        mock.patch.object(apple_cache, 'check_space') as space, \
+                        mock.patch.object(apple_cache, 'note') as note, \
+                        self.assertRaisesRegex(RuntimeError, 'symlink|redirected'):
+                    apple_cache.registry_ready()
+                space.assert_not_called(); note.assert_not_called()
+
+    def test_export_redirected_stage_native_ancestor_base_and_group_are_hard_failures(self):
+        for position in ('stage', 'native-ancestor', 'native-base', 'group', 'dangling-group'):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                redirected = {'stage': stage, 'native-ancestor': root / 'cache/rust-target',
+                              'native-base': dep.parent.parent, 'group': dep.parent,
+                              'dangling-group': dep.parent}[position]
+                retained = redirected.with_name(redirected.name + '-retained')
+                redirected.rename(retained)
+                redirected.symlink_to(retained if position != 'dangling-group' else retained.with_name('missing-group'))
+                p1, p2, p3, p4 = self.patched(source, root, context)
+                with p1, p2, p3, p4, mock.patch.object(apple_cache, 'transfer') as transfer, \
+                        mock.patch.object(apple_cache.os, 'rename') as move, self.assertRaises(RuntimeError) as rejected:
+                    apple_cache.export_cache('device-arm64')
+                self.assertNotIsInstance(rejected.exception, apple_cache.UncacheableSymlink)
+                self.assertNotIsInstance(rejected.exception, apple_cache.ExternalCacheAlias)
+                self.assertIn('redirect', str(rejected.exception))
+                transfer.assert_not_called(); move.assert_not_called()
+                self.assertFalse((stage / 'device-arm64').exists())
+
+    def test_local_symlink_classification_never_masks_owner_special_alias_change_or_tree_limits(self):
+        from contextlib import ExitStack, contextmanager
+        import socket
+        import stat
+        for failure in ('parent-owner', 'parent-type', 'child-owner', 'fifo', 'socket', 'bytes', 'count', 'alias-change'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp, ExitStack() as held:
+                root = Path(tmp).resolve(); candidate = root / 'candidate'; candidate.mkdir()
+                bad = candidate / 'ordinary'
+                if failure == 'fifo':
+                    os.mkfifo(bad)
+                elif failure == 'socket':
+                    endpoint = held.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)); endpoint.bind(str(bad))
+                else:
+                    bad.write_bytes(b'four')
+                if failure == 'alias-change':
+                    os.link(bad, candidate / 'second')
+                (candidate / 'link').symlink_to('unread-dangling-target')
+                original_scan, original_lstat = os.scandir, Path.lstat
+                @contextmanager
+                def links_last(path):
+                    with original_scan(path) as scanned:
+                        children = list(scanned)
+                    # checked_tree uses a LIFO queue: encounter the link first,
+                    # then prove the remaining ordinary siblings still get checked.
+                    yield iter(sorted(children, key=lambda row: row.name == 'link'))
+                def observed_lstat(path):
+                    info = original_lstat(path); values = list(info)
+                    if failure == 'parent-owner' and path == root or failure == 'child-owner' and path == bad:
+                        values[4] = os.getuid() + 1
+                    if failure == 'parent-type' and path == root:
+                        values[0] = stat.S_IFREG | 0o600
+                    if failure == 'alias-change' and path == candidate / 'second':
+                        values[3] += 1
+                    return os.stat_result(values)
+                with mock.patch.object(apple_cache.os, 'scandir', side_effect=links_last), \
+                        mock.patch.object(Path, 'lstat', observed_lstat), \
+                        mock.patch.object(apple_cache, 'MAX_ENTRIES', 2 if failure == 'count' else apple_cache.MAX_ENTRIES), \
+                        self.assertRaises(RuntimeError) as rejected:
+                    apple_cache.checked_tree(candidate, maximum=3 if failure == 'bytes' else apple_cache.MAX_BYTES,
+                                             local_export=True)
+                self.assertNotIsInstance(rejected.exception, apple_cache.UncacheableSymlink)
+                self.assertNotIsInstance(rejected.exception, apple_cache.ExternalCacheAlias)
+                expected = {'parent-owner': 'ownership', 'parent-type': 'ownership/type', 'child-owner': 'ownership',
+                            'fifo': 'regular', 'socket': 'regular', 'bytes': 'bytes', 'count': 'count',
+                            'alias-change': 'links changed'}[failure]
+                self.assertIn(expected, str(rejected.exception))
+                self.assertTrue((candidate / 'link').is_symlink())
+
+    def test_skips_share_global_scan_budget_and_all_uncacheable_sources_never_create_payload(self):
+        for failure in ('combined-count', 'combined-bytes', 'all-skipped'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                if failure == 'all-skipped':
+                    os.link(dep, root / 'external-dependency-alias')
+                    (host / 'link').symlink_to('missing-target')
+                else:
+                    for name in ('aaa-skipped', 'bbb-skipped'):
+                        entry = host.parent / name; (entry / 'out').mkdir(parents=True)
+                        (entry / 'sibling').write_bytes(b'keep local')
+                        (entry / 'out/link').symlink_to('../sibling')
+                p1, p2, p3, p4 = self.patched(source, root, context)
+                with p1, p2, p3, p4, \
+                        mock.patch.object(apple_cache, 'MAX_ENTRIES', 8 if failure == 'combined-count' else apple_cache.MAX_ENTRIES), \
+                        mock.patch.object(apple_cache, 'MAX_BYTES', 1 if failure == 'combined-bytes' else apple_cache.MAX_BYTES), \
+                        mock.patch.object(apple_cache, 'transfer') as transfer, \
+                        mock.patch.object(apple_cache.os, 'rename') as move, self.assertRaises(RuntimeError) as rejected:
+                    apple_cache.export_cache('device-arm64')
+                reason = {'combined-count': 'examined cache entries exceed bound',
+                          'combined-bytes': 'combined dependency cache exceeds bound',
+                          'all-skipped': 'no dependency entries available for cache export'}[failure]
+                self.assertIn(reason, str(rejected.exception))
+                transfer.assert_not_called(); move.assert_not_called()
+                self.assertFalse((stage / 'device-arm64').exists())
+                self.assertFalse((root / 'apple-cache-export-device-arm64.json').exists())
+                self.assertEqual(dep.read_bytes(), b'compiled dependency')
+                self.assertEqual(app.read_bytes(), b'App native archive')
+                self.assertEqual(final.read_bytes(), b'original final staticlib')
+
+    def test_uncached_symlink_and_alias_samples_are_utf8_bounded_escaped_and_single_line(self):
+        from contextlib import redirect_stdout
+        self.assertEqual(apple_cache.SAMPLE_LIMIT, 64); self.assertEqual(apple_cache.SAMPLE_PATH_BYTES, 1024)
+        short = 'aarch64-apple-ios/release/deps/libserde-0123456789abcdef.rlib'
+        samples = []
+        self.assertIs(apple_cache.cache_sample(samples, short), False); self.assertEqual(samples, [short])
+        samples = []; truncated = False
+        for index in range(70):
+            relative = 'release/build/' + ('雪' * 400 + '\n\r\x1b' if index == 0 else 'entry-' + str(index))
+            truncated = apple_cache.cache_sample(samples, relative) or truncated
+        self.assertIs(truncated, True); self.assertEqual(len(samples), 64)
+        self.assertTrue(all(isinstance(sample, str) and len(sample.encode('utf-8')) <= 1024 for sample in samples))
+        self.assertTrue(all(sample.encode('utf-8').decode('utf-8') == sample for sample in samples))
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+            source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+            link_target = '/private/never-print-or-read-this-link-target'
+            for index in range(70):
+                suffix = str(index).zfill(3) + '-雪\n\r\x1b'
+                (dep.parent / ('symlink-' + suffix)).symlink_to(link_target)
+                alias = dep.parent / ('alias-' + suffix); alias.write_bytes(b'not reusable with external alias')
+                os.link(alias, root / ('external-alias-' + str(index)))
+            p1, p2, p3, p4 = self.patched(source, root, context)
+            output = io.StringIO()
+            with p1, p2, p3, p4, redirect_stdout(output):
+                apple_cache.export_cache('device-arm64')
+            text = output.getvalue()
+            self.assertEqual(len(text.splitlines()), 1)
+            self.assertNotIn('\r', text); self.assertNotIn('\x1b', text); self.assertNotIn(link_target, text)
+            self.assertIn('\\n', text); self.assertIn('\\r', text); self.assertIn('\\u001b', text)
+            self.assertLessEqual(len(text.encode('utf-8')), 2 * 64 * 1024 * 6 + 16384)
+            prefix = 'APPLE_DEPENDENCY_CACHE='
+            self.assertTrue(text.startswith(prefix))
+            row = json.loads(text[len(prefix):])
+            self.assertEqual(row, json.loads((root / 'apple-cache-export-device-arm64.json').read_text()))
+            for label, count_key in (('Symlink', 'uncachedSymlinkEntryCount'),
+                                     ('ExternalAlias', 'uncachedExternalAliasCount')):
+                self.assertEqual(row[count_key], 70)
+                self.assertEqual(row['uncached' + label + 'SampleLimit'], 64)
+                self.assertIs(row['uncached' + label + 'Truncated'], True)
+                bounded = row['uncached' + label + 'Entries']
+                self.assertEqual(len(bounded), 64)
+                self.assertTrue(all(isinstance(value, str) and not value.startswith('/') and
+                                    len(value.encode('utf-8')) <= 1024 for value in bounded))
+                self.assertNotIn(str(Path.home()), json.dumps(bounded))
+            self.assertIs(row['carrierAccepted'], False); self.assertIs(row['devicePassed'], False)
+
+    def test_export_rejects_dangling_and_empty_native_role_ancestry_before_group_shortcuts(self):
+        for position in ('host-base', 'target-base', 'target-ancestor', 'shared-ancestor'):
+            for destination in ('dangling', 'empty'):
+                with self.subTest(position=position, destination=destination), tempfile.TemporaryDirectory() as tmp, \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                    source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                    redirected = {'host-base': host.parent.parent, 'target-base': dep.parent.parent,
+                                  'target-ancestor': dep.parent.parent.parent,
+                                  'shared-ancestor': root / 'cache/rust-target'}[position]
+                    redirected.rename(redirected.with_name(redirected.name + '-retained'))
+                    target = root / 'empty-or-missing-native-target'
+                    if destination == 'empty':
+                        target.mkdir()
+                    redirected.symlink_to(target)
+                    # In each role-specific case, the other role still has valid
+                    # cache candidates: it must not hide this unsafe empty root.
+                    if position == 'host-base':
+                        self.assertTrue(dep.is_file())
+                    elif position != 'shared-ancestor':
+                        self.assertTrue((host / 'build-script-build').is_file())
+                    original = root / 'apple-original-device-arm64-evidence.zip'
+                    original_pin = transport_pin(original)
+                    p1, p2, p3, p4 = self.patched(source, root, context)
+                    with p1, p2, p3, p4, mock.patch.object(apple_cache, 'transfer') as transfer, \
+                            mock.patch.object(apple_cache.os, 'rename') as move, \
+                            self.assertRaisesRegex(RuntimeError, 'base/ancestry redirected') as rejected:
+                        apple_cache.export_cache('device-arm64')
+                    self.assertNotIsInstance(rejected.exception, apple_cache.UncacheableSymlink)
+                    self.assertNotIsInstance(rejected.exception, apple_cache.ExternalCacheAlias)
+                    transfer.assert_not_called(); move.assert_not_called()
+                    self.assertFalse((stage / 'device-arm64').exists())
+                    self.assertFalse((root / 'apple-cache-export-device-arm64.json').exists())
+                    self.assertEqual(transport_pin(original), original_pin)
+                    self.assertTrue(redirected.is_symlink())
+                    if destination == 'empty':
+                        self.assertEqual(list(target.iterdir()), [])
+                    else:
+                        self.assertFalse(target.exists())
+
+    def test_export_allows_legitimately_missing_native_role_directories_without_creating_them(self):
+        for position in ('host-base', 'target-base', 'target-ancestor'):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}):
+                source, root, stage, context, dep, app, final, host = self.fixture(Path(tmp).resolve())
+                absent = {'host-base': host.parent.parent, 'target-base': dep.parent.parent,
+                          'target-ancestor': dep.parent.parent.parent}[position]
+                absent.rename(absent.with_name(absent.name + '-retained'))
+                p1, p2, p3, p4 = self.patched(source, root, context)
+                with p1, p2, p3, p4:
+                    apple_cache.export_cache('device-arm64')
+                    self.assertFalse(absent.exists()); self.assertFalse(absent.is_symlink())
+                    observation = json.loads((root / 'apple-cache-export-device-arm64.json').read_text())
+                    self.assertGreater(observation['movedEntries'], 0)
+                    self.assertEqual(observation['uncachedSymlinkEntryCount'], 0)
+                    apple_cache.import_cache('device-arm64', 'staged')
+                self.assertFalse(absent.exists()); self.assertFalse(absent.is_symlink())
+                self.assertFalse((stage / 'device-arm64').exists())
+
 if __name__ == '__main__':
     unittest.main()
