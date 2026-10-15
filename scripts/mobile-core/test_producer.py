@@ -306,7 +306,7 @@ class ProducerCalls(unittest.TestCase):
         self.assertEqual(len(observed['currentVerifier']['files']), 22)
         self.assertEqual(set(observed['currentVerifier']['files']), set(producer.PRODUCER_FILES))
         for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
-                       'scripts/mobile-core/apple_cache.py'):
+                       'scripts/mobile-core/apple-cache.py'):
             self.assertEqual(observed['currentVerifier']['files'][helper], current['producer']['files'][helper])
         self.assertEqual(observed['originalProducerCandidate'], 'a'*40)
         self.assertEqual(observed['originalReceipt'], pin)

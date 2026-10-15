@@ -25,7 +25,7 @@ test('real Apple and shared producer/application edits select the final App leg'
   for (const path of ['src-tauri/gen/apple/project.yml', 'src-tauri/src/lib.rs',
     'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/apple_rust.py',
-    'scripts/mobile-core/apple_cache.py', 'scripts/mobile-core/test_apple_cache.py',
+    'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/test_apple_entry.py',
     'src-tauri/capabilities/default.json', 'src-tauri/capabilities/tray.json',
     'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs',
     'ui/src/App.tsx', 'Cargo.lock', 'src-tauri/tauri.ios.conf.json', '.github/workflows/apple.yml']) {

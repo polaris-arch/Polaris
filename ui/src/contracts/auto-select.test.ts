@@ -283,7 +283,7 @@ describe('界面写出口与意图的位置逐处登记', () => {
     if (aliases.length !== 1 || aliases[0].type !== 'TSTypeAliasDeclaration') return false;
     const type = aliases[0].typeAnnotation;
     if (type.type !== 'TSTypeReference' || type.typeName.type !== 'Identifier' || type.typeName.name !== 'Pick') return false;
-    const parameters = type.typeParameters?.params;
+    const parameters = type.typeArguments?.params;
     if (parameters?.length !== 2 || parameters[0].type !== 'TSTypeReference'
       || parameters[0].typeName.type !== 'Identifier' || parameters[0].typeName.name !== 'AppState'
       || parameters[1].type !== 'TSUnionType') return false;

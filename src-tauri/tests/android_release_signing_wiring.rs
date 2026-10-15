@@ -1770,7 +1770,9 @@ fn behavior_oracle_ci_daemon_is_scoped_and_never_reuses_configuration() {
         .split("trap on_exit EXIT")
         .next()
         .unwrap();
-    assert!(cleanup.find("restore\n").unwrap() < cleanup.find("./gradlew --offline --stop").unwrap());
+    assert!(
+        cleanup.find("restore\n").unwrap() < cleanup.find("./gradlew --offline --stop").unwrap()
+    );
     assert!(cleanup.find("./gradlew --offline --stop").unwrap() < cleanup.find("rm -rf").unwrap());
     assert!(!gate.contains("--configuration-cache "));
 }
@@ -1781,7 +1783,9 @@ fn behavior_oracle_keeps_all_eighteen_scenarios_and_environment_transition_contr
     let gate = code_face(BEHAVIOR_GATE_SCRIPT, &raw);
     let scenarios: Vec<_> = gate
         .lines()
-        .filter(|line| line.starts_with("gradle_run \"") || line.starts_with("gradle_run_signed \""))
+        .filter(|line| {
+            line.starts_with("gradle_run \"") || line.starts_with("gradle_run_signed \"")
+        })
         .map(|line| line.split('"').nth(1).unwrap())
         .collect();
     assert_eq!(
@@ -1833,7 +1837,12 @@ fn behavior_oracle_keeps_all_eighteen_scenarios_and_environment_transition_contr
 fn android_workflow_explicitly_opts_in_both_oracles_and_retains_original_stage1() {
     let workflow = polaris_source_probe::repo_file!(ANDROID_WORKFLOW);
     assert_eq!(workflow.matches("          POLARIS_GATE_CI_DAEMON: \"1\"\n        run: bash scripts/gate-android-release-behavior.sh").count(), 2);
-    assert_eq!(workflow.matches("            ${{ runner.temp }}/release-stage1.log").count(), 1);
+    assert_eq!(
+        workflow
+            .matches("            ${{ runner.temp }}/release-stage1.log")
+            .count(),
+        1
+    );
     assert!(workflow.contains("stage1_log=\"$RUNNER_TEMP/release-stage1.log\""));
     assert!(workflow.contains(">\"$stage1_log\" 2>&1"));
 }

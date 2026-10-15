@@ -1321,7 +1321,7 @@ function rawPublicationIsConnected(source: string): boolean {
     || launch.expression.argument.callee.body.type !== 'BlockStatement') return false;
   const executedTries = launch.expression.argument.callee.body.body.filter((statement) => statement.type === 'TryStatement');
   const tries = pumpNodes.filter((node) => node.type === 'TryStatement');
-  if (tries.length !== 1 || executedTries.length !== 1 || tries[0] !== executedTries[0]) return false;
+  if (tries.length !== 1 || executedTries.length !== 1 || !Object.is(tries[0], executedTries[0])) return false;
   const statements = ((tries[0].block as PublicationNode).body as PublicationNode[]);
   const publicationStatement = statements.findIndex((statement) => statement.type === 'VariableDeclaration'
     && (statement.declarations as PublicationNode[]).some((declaration) => named(declaration.id, 'publication')));

@@ -119,7 +119,7 @@ jobs:
       - name: Admit bounded dependency cache transport and bind actual tools/configuration
         id: rust_cache
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py prepare
+        run: python3 -B scripts/mobile-core/apple-cache.py prepare
       - name: Restore Cargo registry downloads separately from target dependencies
         id: rust_registry_restore
         uses: actions/cache/restore@v5
@@ -140,7 +140,7 @@ jobs:
       - name: Move restored device dependencies into the actual Cargo target directory
         id: rust_device_ready
         if: ${{ !cancelled() && steps.rust_device_restore.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "device-arm64" --restored "${{ steps.rust_device_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
+        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "device-arm64" --restored "${{ steps.rust_device_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Require all shared carrier prerequisites
         id: shared_ready
@@ -173,7 +173,7 @@ jobs:
       - name: Stage device dependencies without copying accepted App products
         id: rust_device_export
         if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_device_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py export --slot "device-arm64"
+        run: python3 -B scripts/mobile-core/apple-cache.py export --slot "device-arm64"
       - name: Save device-arm64 release dependencies before retirement
         id: rust_device_save
         uses: actions/cache/save@v5
@@ -184,11 +184,11 @@ jobs:
       - name: Return staged device dependencies even if cache upload failed
         id: rust_device_return
         if: ${{ !cancelled() && steps.rust_device_export.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "device-arm64" --restored staged
+        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "device-arm64" --restored staged
       - name: Check Cargo registry cache archive headroom
         id: rust_registry_ready
         if: ${{ !cancelled() && steps.device_arm64.conclusion == 'success' && steps.original_device_arm64.conclusion == 'success' && steps.summary_device_arm64.conclusion == 'success' && steps.rust_registry_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py registry-ready
+        run: python3 -B scripts/mobile-core/apple-cache.py registry-ready
       - name: Save registry downloads separately from target dependencies
         uses: actions/cache/save@v5
         if: ${{ !cancelled() && steps.rust_registry_ready.conclusion == 'success' }}
@@ -213,7 +213,7 @@ jobs:
       - name: Move restored simulator dependencies into the actual Cargo target directory
         id: rust_sim_ready
         if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_restore.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "sim-arm64" --restored "${{ steps.rust_sim_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
+        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "sim-arm64" --restored "${{ steps.rust_sim_restore.outputs.cache-hit == 'true' && 'hit' || 'miss' }}"
 
       - name: Real sim-arm64 Rust and unsigned App plus PacketTunnel
         id: sim_arm64
@@ -241,7 +241,7 @@ jobs:
       - name: Stage simulator dependencies without copying accepted App products
         id: rust_sim_export
         if: ${{ inputs.include_simulator && !cancelled() && steps.sim_arm64.conclusion == 'success' && steps.original_sim_arm64.conclusion == 'success' && steps.summary_sim_arm64.conclusion == 'success' && steps.rust_sim_restore.outputs.cache-hit != 'true' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py export --slot "sim-arm64"
+        run: python3 -B scripts/mobile-core/apple-cache.py export --slot "sim-arm64"
       - name: Save sim-arm64 release dependencies before retirement
         id: rust_sim_save
         uses: actions/cache/save@v5
@@ -252,7 +252,7 @@ jobs:
       - name: Return staged simulator dependencies even if cache upload failed
         id: rust_sim_return
         if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_export.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/apple_cache.py import --slot "sim-arm64" --restored staged
+        run: python3 -B scripts/mobile-core/apple-cache.py import --slot "sim-arm64" --restored staged
       - name: Retire sim-arm64 rebuildable intermediates after original upload
         id: retire_sim_arm64
         if: ${{ inputs.include_simulator && !cancelled() && steps.original_sim_arm64.conclusion == 'success' && (steps.rust_sim_export.conclusion == 'skipped' || steps.rust_sim_return.conclusion == 'success') }}
