@@ -2679,13 +2679,13 @@ fn pool_leg_wires_ts_prefilter_before_running_waves() {
 ///
 /// # 为什么必须是源码扫描
 ///
-/// 上面那批 `partition_dirty` / `current_server_fingerprints` 单测全是**注入式**的：喂现成的两张
-/// 指纹表。把命令层那句 `partition_dirty(...)` 删掉、`prefilter.dirty` 改传 `&BTreeSet::new()`，
+/// 上面那批 `partition_dirty` 单测是**注入式**的：喂现成的两张连接摘要表。
+/// 把命令层那句 `partition_dirty(...)` 删掉、`prefilter.dirty` 改传 `&BTreeSet::new()`，
 /// **那批测试一条都不会红** —— 预筛整个死掉，已编辑未生效的节点照旧被测出旧参数出口的失真值，而
 /// gate 全绿。同 TS 腿那条守卫的形态。
 ///
-/// 牙：① 删掉 `partition_dirty(` 调用 ② 把「新」一侧从 `current_fingerprints`（ConfigManager 最新
-/// config）换成运行核 config 镜像 ③ 把「旧」一侧从 `targets.fingerprints`（起核快照）换成别的
+/// 牙：① 删掉 `partition_dirty(` 调用 ② 把「新」一侧从 `connection_fingerprints`（ConfigManager
+/// 最新 config 的完整连接摘要）换成运行核镜像 ③ 把「旧」一侧的已加载完整连接摘要换成别的
 /// ④ 把预筛挪到 `run_pool_speed_test` 之后 —— 均转红。
 #[test]
 fn pool_leg_wires_dirty_prefilter_before_running_waves() {
@@ -2696,12 +2696,14 @@ fn pool_leg_wires_dirty_prefilter_before_running_waves() {
     let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
 
     assert!(
-            body.contains("let current_fingerprints = current_server_fingerprints(&config);"),
+            compact.contains("letconnection_fingerprints=crate::runtime::node_fingerprints::measurement_table_json(&config);"),
             "「新」一侧必须取自 ConfigManager 最新 config（运行核 config 镜像在订阅自动刷新路径上滞后 ⇒ 漏判 dirty）"
         );
+    assert!(compact.contains("letsaved=matchstate.config().current(){"));
+    assert!(compact.contains("letconfig=matchstate.config().current(){"));
     let prefilter = compact
-        .find("partition_dirty(&requested,&targets.fingerprints,&current_fingerprints)")
-        .expect("池路径必须现场算 dirty 集：「旧」= 起核快照指纹，「新」= 当前配置指纹");
+        .find("partition_dirty(&requested,&proxy.speed_measurement_fingerprints(),&connection_fingerprints,)")
+        .expect("池路径必须现场算 dirty 集：「旧」= 起核完整连接摘要，「新」= 当前配置完整连接摘要");
     let run = compact
         .find(
             "run_pool_speed_test(&app,&proxy,&targets,&requested,&url,\

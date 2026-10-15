@@ -11,10 +11,55 @@ static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod lock_diagnostics;
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-type MutationLock = lock_diagnostics::MutationLock;
-#[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
-type MutationLock = File;
+// Store mutation authority ends with this scope, not with the last incidental
+// fork-inherited descriptor. This guard is never used for a version/runtime
+// lease: those intentionally remain locked while any reader retains them.
+struct MutationLock {
+    file: Option<File>,
+    owner_pid: u32,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    observation: LockObservation,
+}
+impl MutationLock {
+    fn new(file: File) -> Self {
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let observation = LockObservation::from_file(&file);
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        lock_diagnostics::record("acquired", &observation);
+        Self {
+            file: Some(file),
+            owner_pid: std::process::id(),
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            observation,
+        }
+    }
+}
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        // Only the creating process owns the mutation scope. A fork child's
+        // Drop must only close its reference, never unlock the parent's scope.
+        let owner = self.owner_pid == std::process::id();
+        if owner {
+            if let Some(file) = &self.file {
+                if let Err(error) = File::unlock(file) {
+                    // No retry or panic in cleanup. Close is still attempted;
+                    // inherited references can then prolong the lock, so a
+                    // failed unlock is not reported as successful release.
+                    log::warn!(
+                        "core-store mutation unlock failed kind={:?} os_code={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                }
+            }
+        }
+        drop(self.file.take());
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        if owner {
+            lock_diagnostics::record("parent-file-closed", &self.observation);
+        }
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn observe_test_spawn(
@@ -429,9 +474,7 @@ impl CoreStore {
         crate::platform::windows::winproc::seal_store_object(&path, false)?;
         self.owner.check(&path)?;
         acquire_lock(&file, LockRole::StoreMutationExclusive)?;
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-        let file = lock_diagnostics::MutationLock::new(file);
-        Ok(file)
+        Ok(MutationLock::new(file))
     }
     pub fn open(root: &Path, owner: OwnerPolicy) -> io::Result<Self> {
         owner.check(root)?;

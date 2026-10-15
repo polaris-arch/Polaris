@@ -1621,7 +1621,14 @@ fn tailcat_http_client_is_region_only_and_follows_detour() {
 
 #[test]
 fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
-    for case in ["chain", "none", "missing", "cycle"] {
+    // Only a node with no declared detour receives its local bind. The wrapper moves
+    // that already-emitted bind; it must not restore a child's ignored local policy.
+    for (case, wrapper_bind, upstream_bind) in [
+        ("chain", None, Some("en8")),
+        ("none", Some("en7"), Some("en8")),
+        ("missing", None, Some("en8")),
+        ("cycle", None, None),
+    ] {
         let mut inner = ss_server("inner", "Inner");
         inner.bind_interface = Some("en7".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
@@ -1631,6 +1638,7 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
             port: Some(443),
         });
         let mut upstream = ss_server("upstream", "Upstream");
+        upstream.bind_interface = Some("en8".into());
         inner.detour = match case {
             "none" => None,
             "missing" => Some("absent".into()),
@@ -1651,7 +1659,7 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
             .iter()
             .find(|o| o.tag == "stls-out-inner")
             .unwrap();
-        assert_eq!(inner.detour.as_deref(), Some("stls-out-inner"));
+        assert_eq!(inner.detour.as_deref(), Some("stls-out-inner"), "{case}");
         assert_eq!(
             wrapper.detour.as_deref(),
             if case == "chain" {
@@ -1661,13 +1669,28 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
             },
             "{case}"
         );
-        assert!(inner.extra.get("bind_interface").is_none());
+        assert!(inner.extra.get("bind_interface").is_none(), "{case}");
         assert_eq!(
             wrapper
                 .extra
                 .get("bind_interface")
                 .and_then(serde_json::Value::as_str),
-            Some("en7")
+            wrapper_bind,
+            "{case}: wrapper must inherit only an emitted physical-root binding"
+        );
+        let upstream = result
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "Upstream")
+            .unwrap();
+        assert!(upstream.detour.is_none(), "{case}");
+        assert_eq!(
+            upstream
+                .extra
+                .get("bind_interface")
+                .and_then(serde_json::Value::as_str),
+            upstream_bind,
+            "{case}: a chain must retain the upstream physical root's own binding"
         );
     }
 }

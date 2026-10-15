@@ -60,6 +60,10 @@ cargo test --bin polaris -- --ignored real_https_get_handshakes_and_returns_body
 # 路由表（只读，安全）
 cargo test --bin polaris -- --ignored live_route_planner_returns_a_real_interface
 
+# Windows 现有 Polaris TUN 适配器枚举（只读；不创建、不删除网卡）
+# 先将 POLARIS_TEST_ADAPTER_NAME 设为已经存在的 polaris-* 适配器名。
+cargo test -p polaris-helper -- --ignored live_existing_polaris_adapter_is_visible
+
 # Windows 路由（只读，安全；只在 Windows 上编译）
 cargo test -p polaris-helper -- --ignored live_best_route_interface_alias_supports_both_families
 

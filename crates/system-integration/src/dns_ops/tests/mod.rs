@@ -294,12 +294,27 @@ fn set_dns_permission_error_aborts_without_retry() {
     };
     let mut c = controller(ops).with_noop_sleeper();
     c.set_dns();
-    assert!(!c.has_marker(), "权限错误 → 回滚兜底 → marker 清");
+    assert!(
+        c.has_marker(),
+        "接管及回滚都遭权限拒绝，必须保留恢复 intent"
+    );
+    assert_eq!(
+        c.ops.dns_state.borrow()["Wi-Fi"],
+        vec!["192.168.1.1".to_string()]
+    );
     assert_eq!(
         c.ops.apply_calls.borrow().len(),
         2,
         "重试阶段仅 1 次尝试（不重试）+ 回滚还原 1 次（本身也不重试）= 2 次；\
              若误重试则耗尽 3 次 attempt + 回滚 ≥ 4 次"
+    );
+    *c.ops.transient_fail_count.borrow_mut() = 0;
+    c.restore_dns();
+    assert!(!c.has_marker(), "权限恢复后的真实还原成功才清恢复 intent");
+    assert_eq!(c.ops.apply_calls.borrow().len(), 3);
+    assert_eq!(
+        c.ops.dns_state.borrow()["Wi-Fi"],
+        vec!["192.168.1.1".to_string()]
     );
 }
 

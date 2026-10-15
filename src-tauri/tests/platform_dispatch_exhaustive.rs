@@ -2409,9 +2409,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/commands/updater/uninstall.rs",
         "desktop",
-        2,
+        4,
         IosSide::WithAndroid,
-        "应用自卸载（`plan_app_removal` 那条链）。两个移动平台同侧：应用的安装/卸载由商店与\
+        "应用自卸载（`plan_app_removal` 与确认后统一清理链的四个 desktop 分派）。两个移动平台同侧：应用的安装/卸载由商店与\
          系统持有，应用侧没有可执行的卸载动作。",
     ),
     (
@@ -3012,9 +3012,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
-        7,
+        8,
         IosSide::DiffersUndecided,
-        "新增七处 Android reconnect、主核 claim/drain/stop 用原 JNI instance；iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
+        "八处 Android reconnect、主核 claim/drain/stop 含新增 owned Stop 状态的 reconnect marker 投影；原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
     ),
     (
         "src-tauri/src/runtime/proxy/process_supervision.rs",
@@ -3091,7 +3091,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS在合法payload后拒绝独立probe构造；Android既有bridge保持，结果不冒充支持或owner清除。"),
     ("src-tauri/src/commands/server.rs", "target_os = \"ios\"", 3, IosSide::DiffersRight, "iOS普通TS login消费normal NE Ready与本次fresh STATUS；显式replaceIdentity才走同attempt旧Ready→exact Stop→scoped/SDK认证退休→目标CAS→fresh normal Ready，不从缓存存在推replacement意图。单独logout消费旧normal prerequisite并结束停止，保Taildrop且不递归删目录；PC/Android保原独立producer及真实TSgate认证退休。saved AuthKey产品选择、实际iOS编译/运行仍待，普通presentation不提供owner证明。"),
     ("src-tauri/src/commands/speedtest.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "iOS测速先持真实run单飞身份等待正常主 NE prerequisite，再用ticket绑定池/回退I/O；若就绪后已停只退出，绝不构造临时Go owner。PCAndroid临时原路保留。"),
-    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"ios\"", 4, IosSide::DiffersRight, "iOS 原用户 Stop 仍撤销 captured previous generation 上界内 native pending start；新增 claimed action 的 exact-current producer cancel 收口，await 原 future 后走同一 normal Stop。superseded Ok(None) 不授权下一 Start，取消不影响已有正常连接的只读 observer；Android 保原 claim/bridge Stop，未伪造 NE 全域清理。"),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"ios\"", 5, IosSide::DiffersRight, "iOS 新增 owned Stop 先按 captured expected_main_generation 撤销原 pending Start，再确认同一 owned generation；原用户 Stop 仍撤销 captured previous generation 上界内 native pending start；新增 claimed action 的 exact-current producer cancel 收口，await 原 future 后走同一 normal Stop。superseded Ok(None) 不授权下一 Start，取消不影响已有正常连接的只读 observer；Android 保原 claim/bridge Stop，未伪造 NE 全域清理。"),
     ("src-tauri/src/runtime/proxy/prerequisite.rs", "target_os = \"ios\"", 10, IosSide::DiffersRight, "iOS 原 normal ticket/observe_session 保留，新增 saved/candidate 预检、原 managed lease、冷 manager+nonce observe 的同 attempt/G0 登记、旧 Ready exact Stop→完整 scoped writer退休→Bound auth-only或sealed无写幂等→目标CAS。两次 normal birth 均持原 generation/cancel，fresh Ready 才第一次 presentation绑定；Android 保自己的 normal producer，绝不消费 iOS SDK回执或外来token。本批lease/candidate预检已复用原方法供PC/Android，撤两个iOS-only属性并新增hot live Ready helper，11→10仅真实净计数；共享纯helper不扩大writer准入。源码合同不替代实际 iOS 编译/运行。"),
     ("src-tauri/src/runtime/proxy/prerequisite.rs", "all(test, not(target_os = \"ios\"))", 3, IosSide::WithAndroid, "纯trait/mock模块与两个ready-commit fixture accessor只在host测试编译；生产release两移动端同不编译。iOS opaque native receipt不可由host mock伪造，iOS原生状态机/SDK门另由独立收据覆盖，真机验收仍未执行。"),
     ("src-tauri/src/commands/window.rs", "not(any(target_os = \"android\", target_os = \"ios\"))", 1, IosSide::WithAndroid, "桌面restart仍持Ready完成四owner drain；iOS只重启host并保留NE，Android原腿不变。"),
@@ -3800,13 +3800,16 @@ fn cfg_axis_platform_dispatch_is_registered() {
 /// Undecided 25→26、具名 geo 债 2→3。没有新增运行能力或将 iOS 资源布局债改判。
 /// helper core_store receipt 的 Linux/Mac O_NOFOLLOW 属性是两移动端同不编译，
 /// 且 PayloadDir 的移动构造仍 Unsupported；它不产生本移动分叉轴上的新债。
+// cc681 actual missing sites: uninstall desktop +2; exact owned iOS Stop +1;
+// Android reconnect-status projection +1 retains its existing undecided group.
+// This adds one debt site; no existing iOS verdict is upgraded or erased.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 279),
-    ("DiffersUndecided", 26),
+    ("DiffersRight", 280),
+    ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
-    ("WithAndroid", 89),
+    ("WithAndroid", 91),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -3868,7 +3871,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
-        7,
+        8,
     ),
     (
         "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",

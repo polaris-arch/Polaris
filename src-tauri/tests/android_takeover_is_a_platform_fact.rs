@@ -105,20 +105,10 @@ const RAW_READ_EXEMPTIONS: &[Exemption] = &[];
 type RawJsonSite = (&'static str, &'static str, usize, &'static str);
 const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     (
-        "src-tauri/src/app_tray.rs",
-        "cfg[\"proxyModeType\"] = serde_json::Value::String(kind.to_string())",
+        "src-tauri/src/commands/config.rs",
+        "next[\"proxyModeType\"] = json!(mode)",
         1,
-        "原生兜底托盘菜单「切接管方式」的落盘腿 —— 这是**写**不是读，写的是用户在菜单里点的那一档。\
-         Android 不可达：`MenuAction::Takeover` 与整棵原生菜单都在 `#[cfg(desktop)]` 之下\
-         （移动端 `tauri::menu` 模块整个不存在），且该平台上「系统代理 vs TUN」这个维度不存在\
-         （见 app_tray.rs 头注那张能力裁定表）。",
-    ),
-    (
-        "src-tauri/src/app_tray.rs",
-        "for key in [\"proxyModeType\", \"dnsConfig\", \"dnsDefaults\"]",
-        1,
-        "同上那条落盘腿的原子补丁键清单（proxyModeType + FakeIP-TUN 纠正一起落盘，不许拆）。\
-         `#[cfg(desktop)]`，Android 不可达。",
+        "config_takeover_edit 把已解析的 ProxyModeType 用户输入写入最新配置，不是从原始状态作平台判据；Android 运行态仍由 effective_on 强制 TUN。",
     ),
     (
         "src-tauri/src/app_tray.rs",

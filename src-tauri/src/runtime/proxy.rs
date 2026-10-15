@@ -215,9 +215,7 @@ use polaris_switch_engine::DebouncedRestart;
 #[cfg(test)]
 use polaris_switch_engine::{ManagementApi, ManagementError};
 use serde_json::Value;
-// B7 跟随面：同上，仅 `proxy/tests/` 消费。
-#[cfg(test)]
-use crate::commands::speedtest::current_server_fingerprints;
+
 use crate::runtime::auto_switch::AutoNodeSwitchedPayload;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]

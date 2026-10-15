@@ -1,5 +1,5 @@
 // Explicit release acquisition for build resources. Never executes target code.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync,
   openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -299,6 +299,10 @@ function quotaDetail(response, token) {
   }).join(', ');
 }
 const validETag = (value) => typeof value === 'string' && /^(?:W\/)?"[\x21\x23-\x7e]{1,256}"$/.test(value);
+// If-None-Match uses weak comparison (RFC 9110 section 13.1.2).
+// Header names are case-insensitive; opaque validator bytes are not.
+const matchingETag = (left, right) => validETag(left) && validETag(right)
+  && left.replace(/^W\//, '') === right.replace(/^W\//, '');
 // Keep only a closed code vocabulary. Never copy error messages, addresses,
 // URLs, signed queries or a raw cause into the public diagnostic. Mixed,
 // unknown, cyclic or clipped cause graphs cannot authorize recovery.
@@ -339,7 +343,7 @@ const transportDetail = (observation) => `${observation.kind}; codes=${observati
 export function releasePublicReader(options = {}) {
   const quotaBudget = { available: true };
   const transportBudget = { available: true };
-  const metadataCache = new Map(), observationBudget = { available: true };
+  const metadataCache = new Map(), observationBudget = { available: true }, conditionalObservationBudget = { available: true };
   const apiToken = releaseAPIToken(options.env ?? RELEASE_API_ENV);
   const now = options.now ?? Date.now;
   const supplied = options.deadlineMs ?? process.env.POLARIS_RELEASE_JOB_DEADLINE_MS;
@@ -348,7 +352,7 @@ export function releasePublicReader(options = {}) {
     && Number.isSafeInteger(deadlineMs) && deadlineMs > 0 && deadlineMs <= now() + 180 * 60 * 1000,
   'Invalid absolute release-consumer deadline');
   return (url, limit, asset = false) => publicBytes(url, limit, asset,
-    { ...options, apiToken, quotaBudget, transportBudget, deadlineMs, metadataCache, observationBudget });
+    { ...options, apiToken, quotaBudget, transportBudget, deadlineMs, metadataCache, observationBudget, conditionalObservationBudget });
 }
 function primaryQuotaDelay(response, endpoint, asset, now, authenticated) {
   const reset = response.headers.get('x-ratelimit-reset'), retry = response.headers.get('retry-after');
@@ -400,9 +404,19 @@ export async function publicBytes(url, limit, asset = false, options = {}) {
     if (response.status === 304) {
       await cancelBody();
       const etag = response.headers.get('etag');
-      demand(metadata && cached && (etag === null || etag === cached.etag)
-        && cached.bytes.length === cached.size && cached.size <= limit && digest(cached.bytes) === cached.sha256,
-      'Release conditional response has no intact matching metadata');
+      const intact = Boolean(cached && cached.bytes.length === cached.size && digest(cached.bytes) === cached.sha256);
+      const withinLimit = Boolean(cached && cached.size <= limit);
+      const validator = etag === null ? 'absent' : !validETag(etag) ? 'invalid'
+        : !cached || !matchingETag(etag, cached.etag) ? 'different'
+          : etag === cached.etag ? 'exact' : 'weak-equivalent';
+      // Categorical diagnostics never expose validators, credentials or bodies.
+      demand(metadata && cached && ['absent', 'exact', 'weak-equivalent'].includes(validator)
+        && intact && withinLimit,
+      `Release conditional response has no intact matching metadata (${location}; status=304; cached=${Boolean(cached)}; validator=${validator}; intact=${intact}; withinLimit=${withinLimit})`);
+      if (validator === 'weak-equivalent' && options.conditionalObservationBudget?.available) {
+        options.conditionalObservationBudget.available = false;
+        (options.report ?? console.error)(`Release conditional observation (${location}; status=304; validator=weak-equivalent; intact=true; withinLimit=true)`);
+      }
       return Buffer.from(cached.bytes);
     }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -523,7 +537,8 @@ function actualBuildInfo(raw) {
   const acquisition = deps.filter((d) => d.module.startsWith('github.com/sagernet/cronet-go/lib/'));
   return { settings, normalModules: deps.filter((d) => !acquisition.includes(d)), prebuiltAcquisitionModules: acquisition, localReplacement: replacements[0] };
 }
-export function verifyReleaseCore(path, row, key, run = execFileSync, host = process.platform) {
+export function verifyReleaseCore(path, row, key, run = execFileSync, host = process.platform,
+  signatureRun = run === execFileSync ? undefined : run) {
   const bytes = checkedBytes(path, row.core); const target = RELEASE_TARGETS[key]; coreHeader(bytes, target);
   const options = { encoding: 'utf8', env: { ...process.env, GOTOOLCHAIN: 'local', GOWORK: 'off' }, maxBuffer: 8 * 1024 * 1024 };
   const graph = actualBuildInfo(String(run('go', ['version', '-m', path], options)).trimEnd() + '\n');
@@ -536,7 +551,7 @@ export function verifyReleaseCore(path, row, key, run = execFileSync, host = pro
   demand(String(run('go', ['tool', 'buildid', path], options)).trim() === row.buildID, 'Actual release BuildID differs');
   const signature = releaseMacCodeSignature(row, key);
   if (host === 'darwin' && signature) {
-    same(observeMacCodeSignature(path, key, run === execFileSync ? undefined : run), signature, 'Actual release Mac signature state/CDHash differs');
+    same(observeMacCodeSignature(path, key, signatureRun), signature, 'Actual release Mac signature state/CDHash differs');
     checkedBytes(path, row.core); // Inspection must preserve the original downloaded bytes.
   }
   return graph;
@@ -570,14 +585,14 @@ export function verifyReleaseProvenance(bytes, row, key) {
   return nativeProducer;
 }
 function equalKeys(value, keys) { return canonical(Object.keys(value).sort()) === canonical([...keys].sort()); }
-function verifyExtracted(directory, rootName, row, key, run, host) {
+function verifyExtracted(directory, rootName, row, key, run, host, signatureRun) {
   const root = join(directory, rootName);
   const { archive, core, sidecar } = row;
   verifyReleaseProvenance(readFileSync(join(root, 'provenance.json')), row, key);
   const sums = Object.keys(archive.members).filter((n) => n !== `${rootName}/SHA256SUMS`).sort()
     .map((n) => `${archive.members[n]}  ${n.slice(rootName.length + 1)}\n`).join('');
   demand(readFileSync(join(root, 'SHA256SUMS'), 'utf8') === sums, 'Inner checksum inventory differs');
-  verifyReleaseCore(join(root, core.member), row, key, run, host);
+  verifyReleaseCore(join(root, core.member), row, key, run, host, signatureRun);
   if (sidecar) inspectCronetBytes(checkedBytes(join(root, sidecar.member), sidecar), key);
   return root;
 }
@@ -679,11 +694,15 @@ function replaceDirectories(resources, work, keys, rename) {
 export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_TARGETS), options = {}) {
   demand(keys.length && new Set(keys).size === keys.length && keys.every((k) => Object.hasOwn(RELEASE_TARGETS, k)), 'Unknown/duplicate App architecture selection');
   const contract = loadReleaseContract(root, manifest), invoke = options.run ?? execFileSync, read = options.read ?? releasePublicReader();
-  const run = (command, args, settings = {}) => {
+  const withoutAPIToken = (execute) => (command, args, settings = {}) => {
     const env = { ...(settings.env ?? process.env) };
     delete env.POLARIS_RELEASE_API_TOKEN;
-    return invoke(command, args, { ...settings, env });
+    return execute(command, args, { ...settings, env });
   };
+  const run = withoutAPIToken(invoke);
+  // codesign --display writes CDHash to stderr even on success. execFileSync
+  // returns stdout only; preserve the observer's status/stdout/stderr contract.
+  const signatureRun = invoke === execFileSync ? withoutAPIToken(spawnSync) : run;
   const adapter = adapterIdentity(root, run);
   const resources = join(root, 'resources'); mkdirSync(resources, { recursive: true }); regularPath(resources, true);
   const lock = join(resources, '.release-consumer.lock');
@@ -712,7 +731,7 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
       const extracted = join(work, `unpacked-${key}`), rootName = validateRow(contract, key, row);
       run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, extracted],
         { input: JSON.stringify({ archive: row.archive, root: rootName, target: row.target }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
-      const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform);
+      const source = verifyExtracted(extracted, rootName, row, key, run, options.host ?? process.platform, signatureRun);
       const dest = join(stage, key); mkdirSync(dest);
       const existing = join(resources, key);
       if (existsSync(existing)) { directoryTree(existing); cpSync(existing, dest, { recursive: true }); }

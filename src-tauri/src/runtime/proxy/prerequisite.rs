@@ -1231,17 +1231,21 @@ impl ProxyRuntime {
             watch::Receiver<NormalStartCompletion>,
             Option<NormalStartClaim>,
         ),
-        StartLeg,
+        Box<StartLeg>,
     > {
-        let config_digest = digest(config)
-            .map_err(|error| StartLeg::Finished(Err(StartError::from(error.to_string())), None))?;
+        let config_digest = digest(config).map_err(|error| {
+            Box::new(StartLeg::Finished(
+                Err(StartError::from(error.to_string())),
+                None,
+            ))
+        })?;
         let mut current = self.normal_start.lock().map_err(|_| {
-            StartLeg::Finished(
+            Box::new(StartLeg::Finished(
                 Err(StartError::from(
                     "normal Start completion poisoned".to_owned(),
                 )),
                 None,
-            )
+            ))
         })?;
         current
             .assert_unpaused()
@@ -1249,10 +1253,10 @@ impl ProxyRuntime {
                 polaris_core_supervisor::config_gate::assert_check_producer_registration()
                     .map_err(|e| e.to_string())
             })
-            .map_err(|e| StartLeg::Finished(Err(StartError::from(e)), None))?;
+            .map_err(|e| Box::new(StartLeg::Finished(Err(StartError::from(e)), None)))?;
         let base = self.core_generation();
         if expected.is_some_and(|expected| expected != base) {
-            return Err(StartLeg::Superseded);
+            return Err(Box::new(StartLeg::Superseded));
         }
         if let Some(start) = current.as_ref() {
             let active = matches!(&*start.completion.borrow(), NormalStartCompletion::Pending(generation) | NormalStartCompletion::Starting(generation) if *generation == base);
@@ -1260,7 +1264,7 @@ impl ProxyRuntime {
                 return if start.digest == config_digest {
                     Ok((start.completion.subscribe(), None))
                 } else {
-                    Err(StartLeg::Superseded)
+                    Err(Box::new(StartLeg::Superseded))
                 };
             }
         }

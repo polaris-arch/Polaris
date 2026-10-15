@@ -73,7 +73,7 @@ impl fmt::Debug for ScopeEvent {
             .finish()
     }
 }
-fn record(phase: &'static str, observation: &LockObservation) {
+pub(super) fn record(phase: &'static str, observation: &LockObservation) {
     let event = ScopeEvent {
         phase,
         pid: std::process::id(),
@@ -93,33 +93,6 @@ fn record(phase: &'static str, observation: &LockObservation) {
         }
         history.events.push_back(event);
     });
-}
-
-pub(super) struct MutationLock {
-    file: Option<File>,
-    observation: LockObservation,
-    owner_pid: u32,
-}
-impl MutationLock {
-    pub(super) fn new(file: File) -> Self {
-        let observation = LockObservation::from_file(&file);
-        record("acquired", &observation);
-        Self {
-            file: Some(file),
-            observation,
-            owner_pid: std::process::id(),
-        }
-    }
-}
-impl Drop for MutationLock {
-    fn drop(&mut self) {
-        // Close the same File at the same scope boundary. Never unlock an OFD
-        // still shared with a child and never extend the production lease.
-        drop(self.file.take());
-        if self.owner_pid == std::process::id() {
-            record("parent-file-closed", &self.observation);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

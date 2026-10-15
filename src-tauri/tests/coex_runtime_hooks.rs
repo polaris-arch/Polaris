@@ -55,7 +55,9 @@ fn successful_claims_ready_failure_and_crash_hooks_remain_reachable() {
             .unwrap()
             < debounced.find("self.coex.claim(generation,false)").unwrap()
     );
-    let start = body(&lifecycle, "async fn start_guarded_with_completion(");
+    let wrapper = body(&lifecycle, "async fn start_guarded_with_completion(");
+    assert!(wrapper.contains("self.start_guarded_with_attribution(config,expected_generation,completion,LifecycleAttribution::START,)"));
+    let start = body(&lifecycle, "async fn start_guarded_with_attribution(");
     assert!(start.contains("publish_committed_ready_main(my_gen,||{"));
     assert!(start.contains("self.coex_committed_ready(my_gen)"));
     assert!(start.contains("self.coex.fail_start(my_gen)"));

@@ -720,13 +720,16 @@ fn cache_prepare_preserves_bytes_and_uses_confdir_owner() {
     use std::os::unix::fs::MetadataExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let cache = dir.path().join(CHOWN_FILES[0]);
+    // macOS TMPDIR may traverse /var -> /private/var. Resolve fixture ancestors,
+    // then exercise the production no-follow boundary at the actual cache leaf.
+    let root = dir.path().canonicalize().unwrap();
+    let cache = root.join(CHOWN_FILES[0]);
     std::fs::write(&cache, b"keep-cache-bytes").unwrap();
 
-    sys::prepare_cache_for_user(dir.path().to_str().unwrap()).unwrap();
+    sys::prepare_cache_for_user(root.to_str().unwrap()).unwrap();
 
     assert_eq!(std::fs::read(&cache).unwrap(), b"keep-cache-bytes");
-    let dir_meta = std::fs::metadata(dir.path()).unwrap();
+    let dir_meta = std::fs::metadata(&root).unwrap();
     let cache_meta = std::fs::metadata(&cache).unwrap();
     assert_eq!(cache_meta.uid(), dir_meta.uid());
     assert_eq!(cache_meta.gid(), dir_meta.gid());
@@ -736,13 +739,23 @@ fn cache_prepare_preserves_bytes_and_uses_confdir_owner() {
 #[test]
 fn cache_prepare_refuses_symlink_without_touching_target() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("target");
+    // macOS TMPDIR may traverse /var -> /private/var. Resolve fixture ancestors,
+    // then exercise the production no-follow boundary at the actual cache leaf.
+    let root = dir.path().canonicalize().unwrap();
+    let target = root.join("target");
     std::fs::write(&target, b"untouched").unwrap();
-    std::os::unix::fs::symlink(&target, dir.path().join(CHOWN_FILES[0])).unwrap();
+    std::os::unix::fs::symlink(&target, root.join(CHOWN_FILES[0])).unwrap();
 
-    let error = sys::prepare_cache_for_user(dir.path().to_str().unwrap()).unwrap_err();
+    let error = sys::prepare_cache_for_user(root.to_str().unwrap()).unwrap_err();
 
-    assert!(error.contains("安全打开 cache.db 失败"), "{error}");
+    assert!(
+        error.starts_with("prepare pinned runtime cache: "),
+        "{error}"
+    );
+    assert!(std::fs::symlink_metadata(root.join(CHOWN_FILES[0]))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(std::fs::read(target).unwrap(), b"untouched");
 }
 

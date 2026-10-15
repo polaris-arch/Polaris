@@ -167,9 +167,20 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
     unsafe {
         nix::libc::alarm(20);
     }
-    let (_root, store) = store();
-    let owner = store.mutation_lock().unwrap();
-    let fd = owner.file.as_ref().unwrap().as_raw_fd();
+    let (root, store) = store();
+    // Negative control for raw File close semantics, independent of the
+    // production scope guard. Do not change its expected inherited contention.
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.path().join(".core-store.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    let observation = LockObservation::from_file(&owner);
+    record("acquired", &observation);
+    let fd = owner.as_raw_fd();
     let (mut parent, child) = UnixStream::pair().unwrap();
     parent
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -208,6 +219,7 @@ fn inherited_cloexec_description_remains_observable_after_parent_file_closes() {
         "actual inherited descriptor must retain CLOEXEC before exec"
     );
     drop(owner);
+    record("parent-file-closed", &observation);
     let error = failure(&store);
     let snapshot = observed(&error);
     control_origin("forced-fork-after-parent-file-drop", Some(pid as u32));
@@ -307,4 +319,105 @@ fn diagnostic_races_keep_bounded_closed_context_and_total_count() {
         .race_observations
         .iter()
         .all(|entry| *entry == (RaceStage::ParentChanged, 42, Some(7))));
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "isolated fork control; child Drop only gets PID and closes inherited File"
+)]
+fn mutation_scope_release_and_child_drop_preserve_authority_boundaries() {
+    const PROBE: &str = "POLARIS_MUTATION_SCOPE_PROBE";
+    if std::env::var(PROBE).as_deref() != Ok("isolated-v1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "core_store::lock_diagnostics::tests::mutation_scope_release_and_child_drop_preserve_authority_boundaries",
+                "--nocapture",
+            ])
+            .env(PROBE, "isolated-v1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated mutation scope control failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // SAFETY: the deadline applies only to this exact isolated control.
+    unsafe { nix::libc::alarm(20) };
+    let (_keep_root, keep_store) = store();
+    let (_drop_root, drop_store) = store();
+    let keep_owner = keep_store.mutation_lock().unwrap();
+    let drop_owner = drop_store.mutation_lock().unwrap();
+    let inherited_fd = keep_owner.file.as_ref().unwrap().as_raw_fd();
+    let (mut parent, child) = UnixStream::pair().unwrap();
+    parent
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    parent
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let child_fd = child.as_raw_fd();
+    // SAFETY: fork occurs only in the isolated fixture. In the child the actual
+    // production guard's non-owner Drop performs getpid/close only, skipping
+    // unlock, logging and thread-local observations. Everything else below is
+    // libc alarm/fcntl/read/write/_exit; no allocator or inherited mutex is used.
+    let pid = unsafe { nix::libc::fork() };
+    assert!(pid >= 0, "controlled fork failed");
+    if pid == 0 {
+        unsafe {
+            nix::libc::alarm(10);
+            drop(drop_owner);
+            let flags = nix::libc::fcntl(inherited_fd, nix::libc::F_GETFD);
+            let ready = [u8::from(flags >= 0 && flags & nix::libc::FD_CLOEXEC != 0)];
+            if nix::libc::write(child_fd, ready.as_ptr().cast(), 1) != 1 {
+                nix::libc::_exit(91);
+            }
+            let mut release = [0u8];
+            if nix::libc::read(child_fd, release.as_mut_ptr().cast(), 1) != 1 {
+                nix::libc::_exit(92);
+            }
+            // Parent has now dropped its original scope, but this descriptor
+            // must still exist: success cannot be attributed to exec/exit.
+            let still_open = [u8::from(
+                nix::libc::fcntl(inherited_fd, nix::libc::F_GETFD) >= 0,
+            )];
+            if nix::libc::write(child_fd, still_open.as_ptr().cast(), 1) != 1 {
+                nix::libc::_exit(93);
+            }
+            if nix::libc::read(child_fd, release.as_mut_ptr().cast(), 1) != 1 {
+                nix::libc::_exit(94);
+            }
+            nix::libc::_exit(0);
+        }
+    }
+    let mut cleanup = ChildCleanup(Some(pid));
+    drop(child);
+    let mut ready = [0u8];
+    parent.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    // A real child-side Drop must not unlock the still-live parent scope.
+    assert_eq!(failure(&drop_store).kind(), io::ErrorKind::WouldBlock);
+    // Genuine scope contention remains immediate and nonblocking.
+    assert_eq!(failure(&keep_store).kind(), io::ErrorKind::WouldBlock);
+    drop(drop_owner);
+    let _next_drop_scope = drop_store.mutation_lock().unwrap();
+    drop(keep_owner);
+    // One fresh acquisition while the pre-exec child remains behind its
+    // barrier and retains the old description; no retries or sleeps.
+    let _next_keep_scope = keep_store.mutation_lock().unwrap();
+    parent.write_all(&[1]).unwrap();
+    parent.read_exact(&mut ready).unwrap();
+    assert_eq!(
+        ready,
+        [1],
+        "child must still retain the inherited descriptor"
+    );
+    assert_eq!(failure(&keep_store).kind(), io::ErrorKind::WouldBlock);
+    parent.write_all(&[1]).unwrap();
+    let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None).unwrap();
+    cleanup.0 = None;
+    assert!(matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)));
 }

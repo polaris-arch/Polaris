@@ -262,7 +262,7 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "src-tauri/src/runtime/speedtest_tunnel.rs",
-        "open_tunnel",
+        "open_tunnel_with_tls_config",
         Some("connect_request(auth)"),
         "测速 CONNECT 隧道（probe-in-k / probe-proxy-in / mixed / 临时核入站）",
     ),
@@ -300,6 +300,7 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
     ("measure_inbound", 3),
     ("measure_slot", 3),
     ("open_tunnel", 1),
+    ("open_tunnel_with_tls_config", 1),
     ("probe_through_proxy", 1),
     ("probe_proxy_connectivity", 1),
 ];

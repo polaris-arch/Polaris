@@ -404,7 +404,11 @@ fn partial_backup_shared_dependency_conflict_leaves_every_category_and_disk_unch
         config["routeRuleOrder"] = json!(["route-kept"]);
         Decision::Write(())
     }).unwrap();
-    let before = manager.current().unwrap();
+    // Establish the real reload-normalized baseline before the rejected import.
+    // Store load synchronizes legacy rule mirrors; that migration is fixture setup.
+    let before = manager.load_full().unwrap();
+    assert_eq!(before["customRules"], before["trafficRules"]);
+    assert_eq!(before["policyRules"], before["trafficRules"]);
     let disk_before = std::fs::read(manager.path()).unwrap();
     let backup = json!({
         "customRuleSets":[{"id":"shared", "name":"foreign", "rules":["foreign.example"]}],

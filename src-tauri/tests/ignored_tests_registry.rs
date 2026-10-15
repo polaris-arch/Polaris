@@ -162,6 +162,11 @@ const REGISTRY: &[Entry] = &[
     },
     // ── LiveHostState ──
     Entry {
+        file: "crates/helper/src/platform/windows/wintun/win_impl/tests/enumeration.rs",
+        test: "live_existing_polaris_adapter_is_visible",
+        class: Class::LiveHostState,
+    },
+    Entry {
         file: "src-tauri/src/runtime/route_binding/tests/mod.rs",
         test: "live_route_planner_returns_a_real_interface",
         class: Class::LiveHostState,

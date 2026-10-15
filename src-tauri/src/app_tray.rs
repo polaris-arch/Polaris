@@ -1062,8 +1062,7 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
                 // Read/transform/save the latest config under the same writer boundary.
-                let response =
-                    commands::config::config_takeover(app.clone(), state, &kind.to_string());
+                let response = commands::config::config_takeover(app.clone(), state, kind);
                 notify_menu_response_failure(&app, lang, i18n::key::TRAY_GROUP_TAKEOVER, &response);
             });
         }

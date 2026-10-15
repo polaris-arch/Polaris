@@ -125,7 +125,7 @@ fn round(
 ) {
     for (node, latency_ms) in results {
         let receipt = identity(rt, cfg, run);
-        record_config(&ledger, &rt, &cfg, node, Ok(*latency_ms), receipt, at);
+        record_config(ledger, rt, cfg, node, Ok(*latency_ms), receipt, at);
     }
 }
 
@@ -1946,7 +1946,15 @@ fn production_refresh_fallback_uses_current_receipts_and_surviving_members() {
     for (id, latency) in [("me04-refresh-slow", 80), ("me04-refresh-fast", 20)] {
         let mut receipt = identity(&rt, &saved, 1);
         receipt.measured_at = now_ms();
-        assert!(ledger.record(id, Ok(latency), receipt));
+        assert!(record_config(
+            ledger,
+            &rt,
+            &saved,
+            id,
+            Ok(latency),
+            receipt,
+            crate::runtime::measurement_ledger::mono_now_ms()
+        ));
     }
     assert_eq!(
         rt.auto_select_fallback(&saved).unwrap().node_id,
@@ -1994,9 +2002,9 @@ fn refresh_receipts(
     for (node, latency) in results {
         let receipt = identity(rt, cfg, run);
         assert!(record_config(
-            &ledger,
-            &rt,
-            &cfg,
+            ledger,
+            rt,
+            cfg,
             node,
             Ok(*latency),
             receipt,

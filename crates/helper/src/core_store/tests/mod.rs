@@ -143,7 +143,19 @@ fn busy_leases_allow_new_install_but_prevent_retirement() {
         fs::read_dir(root.path().join("manifests")).unwrap().count(),
         5
     );
+    // A shared open-description reference survives the original VerifiedCore.
+    // Mutation-scope unlock must never release these distinct runtime leases.
+    let inherited_leases: Vec<File> = leases
+        .iter()
+        .map(|core| core._lease.try_clone().unwrap())
+        .collect();
     drop(leases);
+    assert!(store.retain_latest_three(&[]).unwrap().is_empty());
+    assert_eq!(
+        fs::read_dir(root.path().join("manifests")).unwrap().count(),
+        5
+    );
+    drop(inherited_leases);
     eprintln!("busy-lease stage=retire-after-drop held_leases=0");
     let retired = store.retain_latest_three(&[]).unwrap_or_else(|error| {
         panic!(
@@ -368,4 +380,21 @@ fn flat_retirement_preserves_unknown_or_busy_cohorts_and_all_versioned_inputs() 
     );
     let id = CoreId::parse(&manifest.id).unwrap();
     assert!(store.verify_for_start(&id).is_ok());
+}
+
+#[test]
+fn mutation_scope_releases_on_error_and_unwind() {
+    let (_root, store, _uid) = store();
+    let error = (|| -> io::Result<()> {
+        let _scope = store.mutation_lock()?;
+        Err(io::Error::other("controlled mutation error"))
+    })();
+    assert!(error.is_err());
+    drop(store.mutation_lock().unwrap());
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = store.mutation_lock().unwrap();
+        panic!("controlled mutation unwind");
+    }));
+    assert!(unwound.is_err());
+    let _next_scope = store.mutation_lock().unwrap();
 }

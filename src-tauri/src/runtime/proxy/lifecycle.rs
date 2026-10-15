@@ -625,7 +625,7 @@ impl ProxyRuntime {
         let (mut receiver, claim) =
             match self.guarded_start_completion(&config, expected_generation) {
                 Ok(completion) => completion,
-                Err(leg) => return leg,
+                Err(leg) => return *leg,
             };
         if let Some(claim) = claim {
             let leg = self

@@ -1,7 +1,7 @@
 // Synthetic bytes and mocked public HTTP/Go metadata. No Git init, HTTP, core or C API execution.
 import { writeSelectedCoreManifest } from '../lib/core-identity.mjs';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import childProcess, { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync,
@@ -1226,9 +1226,9 @@ test('all five fresh second-snapshot 304 checks preserve strict receipts without
   const read = releasePublicReader({ env: {}, report: () => {}, fetch: async (url, options) => {
     assert(f.transport.has(url)); const count = (counts.get(url) ?? 0) + 1; counts.set(url, count);
     if (url.startsWith('https://api.github.com/')) {
-      assert.equal(options.headers['If-None-Match'], count === 1 ? undefined : '"one"');
-      return count === 1 ? new Response(f.transport.get(url), { headers: { etag: '"one"' } })
-        : new Response(null, { status: 304, headers: { etag: '"one"' } });
+      assert.equal(options.headers['If-None-Match'], count === 1 ? undefined : 'W/"one"');
+      return count === 1 ? new Response(f.transport.get(url), { headers: { ETag: 'W/"one"' } })
+        : new Response(null, { status: 304, headers: { eTaG: '"one"' } });
     }
     assert.equal(options.headers.Authorization, undefined); assert.equal(options.headers['If-None-Match'], undefined);
     return new Response(f.transport.get(url));
@@ -1258,3 +1258,96 @@ test('dedicated opaque Bearer credentials accept standard punctuation without ex
     (error) => error.message === 'Invalid dedicated release API credential');
   }
 });
+
+// Exercise the production reader entry and WHATWG header normalization, rather
+// than calling a validator helper or substituting cached JSON for HTTP responses.
+test('conditional HTTP accepts only equal opaque validators across weak/strong and header-name changes', async () => {
+  for (const [first, second] of [['W/"Opaque"', '"Opaque"'], ['"Opaque"', 'W/"Opaque"'],
+    ['W/"Opaque"', 'W/"Opaque"'], ['"Opaque"', null]]) {
+    const calls = [], reports = [];
+    const read = releasePublicReader({ env: {}, report: (s) => reports.push(s), fetch: async (url, options) => {
+      calls.push({ url, headers: new Headers(options.headers), redirect: options.redirect });
+      return calls.length === 1 ? new Response('abc', { headers: { ETag: first } })
+        : new Response(null, { status: 304, headers: second === null ? {} : { eTaG: second } });
+    } });
+    const firstBytes = await read(transportURL, 3); firstBytes.fill(0);
+    const secondBytes = await read(transportURL, 3); assert.equal(secondBytes.toString(), 'abc'); secondBytes.fill(0);
+    assert.equal((await read(transportURL, 3)).toString(), 'abc');
+    assert.equal(calls.length, 3); assert(calls.every((c) => c.url === transportURL && c.redirect === 'manual'));
+    assert.equal(calls[0].headers.get('if-none-match'), null);
+    assert(calls.slice(1).every((c) => c.headers.get('if-none-match') === first));
+    assert(reports.every((s) => !s.includes('Opaque') && !s.includes('abc')));
+    assert.equal(reports.filter((s) => s.includes('validator=weak-equivalent')).length,
+      second !== null && first !== second ? 1 : 0);
+  }
+  for (const second of ['W/"opaque"', 'W/"other"', 'w/"Opaque"', '"Opaque", "other"', '*', 'invalid']) {
+    let count = 0;
+    const read = releasePublicReader({ env: {}, report: () => {}, fetch: async () => ++count === 1
+      ? new Response('abc', { headers: { ETag: 'W/"Opaque"' } })
+      : new Response(null, { status: 304, headers: { ETAG: second } }) });
+    await read(transportURL, 3);
+    await assert.rejects(read(transportURL, 3), (e) => /no intact matching metadata/.test(e.message)
+      && !e.message.includes('Opaque') && !e.message.includes('W/') && !e.message.includes('abc'));
+    assert.equal(count, 2);
+  }
+});
+test('conditional cache requires the exact URL and intact bytes even for weak-equivalent 304', async () => {
+  const bytes = Buffer.from('abc'), cache = new Map([[transportURL,
+    { etag: 'W/"one"', bytes, size: 3, sha256: digest(bytes) }]]);
+  const options = { env: {}, metadataCache: cache, fetch: async () =>
+    new Response(null, { status: 304, headers: { ETag: '"one"' } }) };
+  await assert.rejects(publicBytes(transportURL + '/releases/17', 3, false, options), /cached=false/);
+  await assert.rejects(publicBytes(transportURL, 2, false, options), /withinLimit=false/);
+  bytes[0] ^= 1;
+  await assert.rejects(publicBytes(transportURL, 3, false, options), /intact=false/);
+});
+// Retain the real consumeRelease -> verifyExtracted -> verifyReleaseCore ->
+// strict signature observer chain. Only OS process boundaries are substituted.
+// A successful execFileSync result contains stdout only, as on the failed runner.
+test('default native consumer captures codesign stderr/status without exposing the dedicated API token', async () => withFixture(async (f) => {
+  const original = { execFileSync: childProcess.execFileSync, spawnSync: childProcess.spawnSync };
+  const previous = process.env.POLARIS_RELEASE_API_TOKEN;
+  const key = 'mac-arm64', display = f.contract.platforms[key].signatureObservation.core.codeSignatureInspection;
+  let observed = [], scenario = { status: 0, stdout: '', stderr: display };
+  process.env.POLARIS_RELEASE_API_TOKEN = 'never_log_native_fixture_secret';
+  childProcess.execFileSync = (command, args, settings) => {
+    assert.equal(settings.env.POLARIS_RELEASE_API_TOKEN, undefined);
+    if (command === 'codesign') {
+      observed.push(['stdout-only', ...args]);
+      return ''; // This reproduces the broken wrapper's lost successful stderr.
+    }
+    return ['python', 'python3'].includes(command) ? original.execFileSync(command, args, settings)
+      : f.run(command, args, settings);
+  };
+  childProcess.spawnSync = (command, args, settings) => {
+    assert.equal(settings.env.POLARIS_RELEASE_API_TOKEN, undefined);
+    assert.equal(settings.encoding, 'utf8'); assert.equal(settings.stdio, 'pipe');
+    assert.equal(command, 'codesign'); observed.push([command, ...args]);
+    if (args[0] === '--verify') {
+      assert.deepEqual(args.slice(0, -1), ['--verify', '--strict']);
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    assert.deepEqual(args.slice(0, -1), ['--display', '--verbose=4']); return scenario;
+  };
+  syncBuiltinESMExports();
+  try {
+    for (const bad of [{ status: 0, stdout: '', stderr: '' },
+      { status: 0, stdout: '', stderr: display + display },
+      { status: 1, stdout: '', stderr: display },
+      { status: 0, stdout: '', stderr: `CDHash=${'5'.repeat(40)}\n` }]) {
+      scenario = bad;
+      await assert.rejects(consumeRelease(f.root, f.manifest, [key], { read: f.read, host: 'darwin' }), /CDHash/);
+      assert.deepEqual(resources(f), {});
+    }
+    scenario = { status: 0, stdout: '', stderr: display };
+    const receipts = await consumeRelease(f.root, f.manifest, [key], { read: f.read, host: 'darwin' });
+    assert.deepEqual(receipts[key].macCodeSignature, { state: 'signed', cdHash: '4'.repeat(40) });
+    assert(!JSON.stringify(receipts).includes('never_log_native_fixture_secret'));
+    assert(observed.some(([command, flag]) => command === 'codesign' && flag === '--display'));
+    assert(observed.every(([command, ...args]) => command === 'codesign' && !args.includes('--sign')));
+  } finally {
+    Object.assign(childProcess, original); syncBuiltinESMExports();
+    if (previous === undefined) delete process.env.POLARIS_RELEASE_API_TOKEN;
+    else process.env.POLARIS_RELEASE_API_TOKEN = previous;
+  }
+}));

@@ -78,6 +78,14 @@ type Site = (Class, &'static str, &'static str);
 /// 登记表：文件 → 按出现顺序逐处的登记。
 const WRITES: &[(&str, &[Site])] = &[
     (
+        "src-tauri/src/runtime/proxy/lifecycle.rs",
+        &[(
+            Class::Projection,
+            "status_with_owned_stop_context",
+            "只把 saved-writer/intent fence 内读取的 selectedServerId 放入 owned Stop 状态凭据，不写配置、不清选择意图",
+        )],
+    ),
+    (
         "crates/config-engine/src/builder/generate.rs",
         &[
             (
