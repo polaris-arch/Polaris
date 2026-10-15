@@ -160,14 +160,16 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       const c = code(get(rel));
       expect(c, '没有消费共用实现').toContain("from '@/lib/confirm-twice'");
       expect(c).toMatch(/useConfirmTwice\(\)/);
-      expect(c, '删除确认必须绑定 plane 和完整实体快照').toContain(
-        'const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`',
-      );
-      expect(c).toContain('confirmTwice(deleteIntentKey,');
       // 变异对照：把任一处改回 openDialog({ kind: 'confirm', ... }) → 本条转红。
       expect(c, '破坏性操作又走回弹窗了').not.toContain("kind: 'confirm'");
     });
   }
+
+  it('RulesScreen 的删除确认与武装态绑定同一 plane 和完整规则快照', () => {
+    const c = code(get('components/screens/rules/RulesScreen.tsx'));
+    expect(c).toContain('confirmTwice(`${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`,');
+    expect(c).toContain('deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}');
+  });
 
   it('NodesScreen 的删节点 / 批删走原地二次点击（原型 :4140 node-del / :4137 batch-del）', () => {
     const c = code(get('components/screens/nodes/use-node-deletion.ts'));

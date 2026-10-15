@@ -453,7 +453,9 @@ describe('声明的采样面 == 实际采样面', () => {
     expect(() => assertPointDeclared({ ...inside, viewport: { width: 380, height: 844, dpr: 1 } })).toThrow(
       /380x844@1/,
     );
-    expect(() => assertPointDeclared({ ...inside, rootAttrs: { dir: 'rtl' } })).toThrow(/rtl/);
+    // RTL 已进入正式采样面；负控必须使用已声明轴上的未声明值。
+    expect(() => assertPointDeclared({ ...inside, rootAttrs: { dir: 'rtl' } })).not.toThrow();
+    expect(() => assertPointDeclared({ ...inside, rootAttrs: { 'data-theme': 'sepia' } })).toThrow(/sepia/);
     expect(() => assertPointDeclared({ ...inside, rootAttrs: { 'data-density': 'compact' } })).toThrow(
       /整条轴都没声明/,
     );

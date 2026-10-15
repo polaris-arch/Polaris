@@ -6,6 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { SpeedTestScheduleStatus } from '@/contracts/speed-test';
 import type { SubscriptionConfig, UserConfig } from '@/contracts/types';
+import { DEMO_CONFIG } from '../../harness-fixture';
 import i18n, { i18nReady } from '@/i18n';
 import { useAppStore } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
@@ -27,6 +28,8 @@ const probe = vi.hoisted(() => ({
   enable: null as (() => void | Promise<void>) | null,
   commit: null as (() => unknown) | null,
   patch: vi.fn<(patch: Partial<UserConfig>) => Promise<UserConfig>>(),
+  get: vi.fn<() => Promise<UserConfig>>(),
+  backend: null as UserConfig | null,
 }));
 
 vi.mock('@/hooks/use-speed-test-schedule', () => ({
@@ -66,7 +69,7 @@ vi.mock('@/hooks/use-periodic-speed-test-fields', async (original) => {
 });
 vi.mock('@/ipc', async (original) => {
   const real = await original<typeof import('@/ipc')>();
-  return { ...real, api: { ...real.api, config: { ...real.api.config, patch: probe.patch } } };
+  return { ...real, api: { ...real.api, config: { ...real.api.config, patch: probe.patch, get: probe.get } } };
 });
 
 const { SubFormPanel } = await import('@/mobile/forms/SubFormPanel');
@@ -87,7 +90,9 @@ const sub = (periodicSpeedTest?: boolean): SubscriptionConfig => ({
 });
 
 function seed(config: Partial<UserConfig>): void {
-  useAppStore.setState({ config: config as UserConfig });
+  probe.backend = { ...DEMO_CONFIG, servers: [], subscriptions: [], selectedServerId: null,
+    customRules: [], policyRules: [], trafficRules: [], dnsRules: [], ...config };
+  useAppStore.setState({ config: probe.backend });
   Object.assign(useAppStore.getInitialState(), useAppStore.getState());
 }
 
@@ -101,6 +106,11 @@ beforeEach(() => {
   probe.enable = null;
   probe.commit = null;
   probe.patch.mockReset();
+  probe.backend = null;
+  probe.get.mockReset().mockImplementation(async () => {
+    if (!probe.backend) throw Error('backend fixture not seeded');
+    return probe.backend;
+  });
   useStagedConfigStore.setState({ entries: [] });
   Object.assign(useStagedConfigStore.getInitialState(), useStagedConfigStore.getState());
 });
@@ -136,16 +146,20 @@ describe.each(Object.entries(surfaces))('订阅表单的全局关闭提示（%s�
 
   it('点「开启全局周期测速」直接把全局开关打开并保存，提示随之消失', async () => {
     seed({ periodicSpeedTestEnabled: false, subscriptions: [sub(true)] });
-    probe.patch.mockImplementation(async (patch) => ({
-      ...(useAppStore.getState().config as UserConfig),
-      ...patch,
-    }));
+    probe.patch.mockImplementation(async (patch) => {
+      if (!probe.backend) throw Error('backend fixture not seeded');
+      probe.backend = { ...probe.backend, ...patch };
+      return probe.backend;
+    });
     expect(render()).toContain(hint());
     expect(probe.enable).not.toBeNull();
 
     await probe.enable?.();
 
     expect(probe.patch).toHaveBeenCalledExactlyOnceWith({ periodicSpeedTestEnabled: true });
+    expect(probe.get).toHaveBeenCalledTimes(1);
+    expect(probe.backend?.periodicSpeedTestEnabled).toBe(true);
+    expect(useAppStore.getState().config).toBe(probe.backend);
     await vi.waitFor(() => expect(useAppStore.getState().config?.periodicSpeedTestEnabled).toBe(true));
     Object.assign(useAppStore.getInitialState(), useAppStore.getState());
     expect(render()).not.toContain(hint());

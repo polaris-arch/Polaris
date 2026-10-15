@@ -380,7 +380,7 @@ const EXPECTED_SWITCHES: Record<MobileSettingsPageId, readonly string[]> = {
     'periodic-speed-test',
   ],
   // race 档在夹具里是「单上游」⇒ 竞速池那三颗不渲染（⑫ 另有一份 race 开着的夹具逐值对拍）。
-  dns: ['fake-ip', 'takeover-system-dns', 'optimistic-cache', 'fakeip-filter', 'block-browser-doh'],
+  dns: ['fake-ip', 'optimistic-cache', 'fakeip-filter', 'block-browser-doh'],
   // `tun-bypass-lan` 2026-09-25（A6）落地：「绕过局域网」在 Android 上有了消费方（`inbounds.rs` 的
   // android 臂在开关开着时发清单网段子集）。此前它登记为 platform-absent，依据只覆盖回环前缀。
   tun: ['tun-auto-route', 'tun-ipv6', 'tun-bypass-lan'],
@@ -1522,7 +1522,6 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['dns', 'settings.dns.fakeIpDesc'],
     ['dns', 'settings.dns.remoteDnsDesc'],
     ['dns', 'settings.dns.domesticDnsDesc'],
-    ['dns', 'settings.dns.takeoverSystemDnsDesc'],
     ['dns', 'settings.advanced.optimisticCacheDesc'],
     ['dns', 'settings.advanced.dnsTimeoutDesc'],
     ['dns', 'settings.dns.raceStrategyDesc'],
@@ -1734,7 +1733,6 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'remote-dns',
       'domestic-dns',
       'dns-timeout',
-      'takeover-system-dns',
       'optimistic-cache',
       'race-strategy',
       'node-resolver-single',
@@ -1849,27 +1847,135 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
     }
   });
 
-  it('每一处 `update(` 都挂在 `commit(` 上（不许有裸写：写失败会静默）', () => {
-    for (const page of WRITING_PAGES) {
-      const src = stripComments(readFileSync(join(HERE, `${pageFile(page)}`), 'utf8'));
-      const calls = [...src.matchAll(/\bupdate\(/g)];
-      expect(calls.length, `${page} 页一个写调用都没解析到 —— 判据面塌了`).toBeGreaterThan(0);
-      for (const m of calls) {
-        const before = src.slice(Math.max(0, (m.index ?? 0) - 140), m.index);
-        // 两种合法形态：① 直接是 `commit(…, update(…))` 的实参；
-        // ② `(v) => update({ … })` 这个**闭包**，它被交给同文件里的 `toggleRow`，由那一处统一 commit。
-        const wrapped = /commit\(\s*(?:'[a-z0-9-]+'|[A-Za-z]\w*)\s*,\s*$/.test(before);
-        const thunk = /\(v\)\s*=>\s*$/.test(before) && src.includes('commit(id, patch(v))');
-        // ③ 「先写执行侧、成功后落配置」的链：`commit('<id>', xxxApi.set(v).then(() => update(…)))` ——
-        // 整条链是 commit 的实参，任一步 reject 都落到同一行红字（`auto-start` 那一行，⑤b）。
-        const chained =
-          /commit\(\s*'[a-z0-9-]+'\s*,\s*[A-Za-z]\w*(?:\.\w+)*\([^()]*\)\.then\(\(\)\s*=>\s*$/.test(before);
-        expect(
-          wrapped || thunk || chained,
-          `${page} 页有一处 \`update(\` 没有接失败回显（片段：…${before.slice(-50)}update( ）`,
-        ).toBe(true);
+  /** Follow actual promise-expression edges, never a nearby occurrence of commit. */
+  function unguardedUpdates(file: string, source: string): string[] {
+    const sf = ts.parseSourceFile(file, source);
+    const calls: ts.CallExpression[] = [];
+    const functions: ts.FunctionDeclaration[] = [];
+    const wrappers = new Set<string>();
+    const walk = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node);
+      if (ts.isFunctionDeclaration(node)) functions.push(node);
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) &&
+          node.moduleSpecifier.text === './committed-appearance') {
+        const bindings = node.importClause?.namedBindings;
+        if (bindings && ts.isNamedImports(bindings)) {
+          for (const binding of bindings.elements) {
+            const imported = (binding.propertyName ?? binding.name).text;
+            if (imported === 'commitThemeChoice' || imported === 'commitLanguageChoice') wrappers.add(binding.name.text);
+          }
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(sf);
+    const named = (node: ts.Node | undefined, name: string): boolean =>
+      node !== undefined && ts.isIdentifier(node) && node.text === name;
+    const covered = new Set<ts.CallExpression>();
+    const follow = (node: ts.Node | undefined): void => {
+      if (!node) return;
+      if (ts.isParenthesizedExpression(node)) { follow(node.expression); return; }
+      if (!ts.isCallExpression(node)) return;
+      if (named(node.expression, 'update')) { covered.add(node); return; }
+      // Only the imported rejection-preserving ordering helpers qualify.
+      if (ts.isIdentifier(node.expression) && wrappers.has(node.expression.text) && node.arguments.length === 2) {
+        follow(node.arguments[0]);
+        return;
+      }
+      // finally preserves the receiver's rejection; it cannot recover it.
+      if (ts.isPropertyAccessExpression(node.expression) && named(node.expression.name, 'finally') &&
+          node.arguments.length === 1) {
+        follow(node.expression.expression);
+        return;
+      }
+      // A success-only .then returns its expression-bodied callback's promise.
+      // A rejection callback / .catch is deliberately not accepted.
+      if (ts.isPropertyAccessExpression(node.expression) && named(node.expression.name, 'then') &&
+          node.arguments.length === 1) {
+        follow(node.expression.expression);
+        const callback = node.arguments[0];
+        if (ts.isArrowFunction(callback) && !ts.isBlock(callback.body)) follow(callback.body);
+      }
+    };
+    for (const call of calls) {
+      if (named(call.expression, 'commit') && call.arguments.length >= 2) follow(call.arguments[1]);
+    }
+    // toggleRow's fifth argument is a deferred write. Verify the relay's exact
+    // parameter-to-commit edge before accepting expression-bodied callbacks.
+    const toggle = functions.find((fn) => named(fn.name, 'toggleRow'));
+    let toggleRelays = false;
+    if (toggle?.body && named(toggle.parameters[0]?.name, 'id') && named(toggle.parameters[4]?.name, 'patch')) {
+      const checkRelay = (node: ts.Node): void => {
+        if (ts.isCallExpression(node) && named(node.expression, 'commit') && named(node.arguments[0], 'id')) {
+          const write = node.arguments[1];
+          if (write && ts.isCallExpression(write) && named(write.expression, 'patch') &&
+              write.arguments.length === 1 && named(write.arguments[0], 'v')) toggleRelays = true;
+        }
+        ts.forEachChild(node, checkRelay);
+      };
+      checkRelay(toggle.body);
+    }
+    if (toggleRelays) {
+      for (const call of calls) {
+        if (!named(call.expression, 'toggleRow')) continue;
+        const callback = call.arguments[4];
+        if (callback && ts.isArrowFunction(callback) && !ts.isBlock(callback.body)) follow(callback.body);
       }
     }
+    const updates = calls.filter((call) => named(call.expression, 'update'));
+    expect(updates.length, `${file}: no update call parsed`).toBeGreaterThan(0);
+    return updates.filter((call) => !covered.has(call)).map((call) => source.slice(call.pos, call.end));
+  }
+
+  it('每一处 `update(` 都挂在 `commit(` 上（不许有裸写：写失败会静默）', () => {
+    for (const page of WRITING_PAGES) {
+      const file = join(HERE, pageFile(page));
+      expect(unguardedUpdates(file, readFileSync(file, 'utf8')), `${page} has unguarded writes`).toEqual([]);
+    }
+  });
+
+  it('write-chain AST controls reject detached writes, swallowed failures and lookalike helpers', () => {
+    const header = "import { commitThemeChoice, commitLanguageChoice } from './committed-appearance';\n";
+    const valid = [
+      "commit('theme', update({}));",
+      "commit('theme', commitThemeChoice(update({}), () => apply()));",
+      "commit('language', commitLanguageChoice(update({}), () => apply()));",
+      "commit('auto-start', api.set(true).then(() => update({})));",
+      "commit('auto-start', api.set(true).then(() => update({})).finally(() => refresh()));",
+    ];
+    valid.forEach((body, index) => expect(unguardedUpdates(`valid-write-${index}.tsx`, header + body)).toEqual([]));
+    const toggleRelay = "function toggleRow(id, label, desc, checked, patch) { return <Switch onChange={(v) => commit(id, patch(v))} />; } ";
+    const toggleWrite = "toggleRow('theme', '', '', true, (v) => update({ value: v }));";
+    expect(unguardedUpdates('valid-toggle-write.tsx', toggleRelay + toggleWrite)).toEqual([]);
+    expect(unguardedUpdates('swallowed-toggle-write.tsx', toggleRelay.replace('patch(v)', 'patch(v).catch(() => undefined)') + toggleWrite)).toHaveLength(1);
+    const invalid = [
+      "commit('theme', Promise.resolve()); update({});",
+      "commit('theme', commitThemeChoice(update({}).catch(() => undefined), () => apply()));",
+      "commit('theme', commitThemeChoice(update({}), () => apply()).catch(() => undefined));",
+      "commit('theme', unknownWrapper(update({})));",
+      "commit('theme', api.set(true).then(() => update({}), () => undefined));",
+      "const callback = () => update({}); commit('theme', unrelated());",
+      "toggleRow('theme', '', '', true, (v) => update({ value: v }));",
+    ];
+    invalid.forEach((body, index) => expect(unguardedUpdates(`invalid-write-${index}.tsx`, header + body)).toHaveLength(1));
+    expect(unguardedUpdates('lookalike-write.tsx', "function commitThemeChoice(p) { return p.catch(() => undefined); } commit('theme', commitThemeChoice(update({}), () => {}));")).toHaveLength(1);
+  });
+
+  it('appearance ordering helpers preserve write rejection for commit feedback', async () => {
+    const { createCommittedChoice } = await import('./committed-appearance');
+    const choose = createCommittedChoice();
+    const failure = new Error('write refused');
+    let applied = false;
+    await expect(choose(Promise.reject(failure), () => { applied = true; })).rejects.toBe(failure);
+    expect(applied).toBe(false);
+    await choose(Promise.resolve(), () => { applied = true; });
+    expect(applied).toBe(true);
+  });
+
+  it('mobile excludes desktop DNS takeover from controls, explanation and write sites', () => {
+    expect(MARKUP.dns).not.toContain('data-setting="takeover-system-dns"');
+    expect(MARKUP.dns).not.toContain(copy('settings.dns.takeoverSystemDnsDesc'));
+    expect(siteIdsOf('dns')).not.toContain('takeover-system-dns');
   });
 
   /*
@@ -2099,7 +2205,6 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
     const race = dnsMarkup({ resolveNodeDomainsAhead: true });
     expect(switchRows(race)).toEqual([
       'fake-ip',
-      'takeover-system-dns',
       'optimistic-cache',
       'race-pool-ali',
       'race-pool-dnspod',

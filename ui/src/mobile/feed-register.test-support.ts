@@ -74,8 +74,8 @@ export interface FeedEntry {
 
 /* ───────────── 写入方锚（多格共用的写在这里，改一处就够）───────────── */
 
-/** 配置镜像的唯一写入方：冷启动一次 + `event:configChanged` 广播重拉。 */
-const CONFIG_FED: Anchor = { file: 'ui/src/mobile/config-sync.ts', mustContain: 'loadConfig(true)' };
+/** 移动根持有共享 main feed；config-sync.test.tsx 验证真实导入、返回 cleanup 与首拉/广播发布。 */
+const CONFIG_FED: Anchor = { file: 'ui/src/mobile/config-sync.ts', mustContain: "return acquireConfigSync({ scope: 'main' });" };
 /** 连接态：事件三条腿 + 30s 兜底轮询都收敛到这一次重拉。 */
 const PROXY_STATUS_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'store().refreshProxyStatus()' };
 /** 🔴 W-23 的那条腿。摘掉它，`tailscaleStatuses` / `tailscaleLoginStates` 两格立刻没有写入方。 */

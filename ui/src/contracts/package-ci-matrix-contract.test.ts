@@ -638,8 +638,41 @@ import ast,json,sys
 request=json.load(sys.stdin)
 tree=ast.parse(request['source'])
 function=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run')
-handlers=[n for n in ast.walk(function) if isinstance(n,ast.ExceptHandler)
-          and isinstance(n.type,ast.Name) and n.type.id=='BaseException' and n.name]
+# Select the lifecycle try itself, not the first exception handler in run.
+# Nested function bodies (e.g. drain), spawn and final log projection are
+# separate failure domains and must not change the primary cleanup target.
+def local_nodes(node):
+ yield node
+ for child in ast.iter_child_nodes(node):
+  if not isinstance(child,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef,ast.Lambda)):
+   yield from local_nodes(child)
+def lifecycle_tries():
+ matches=[]
+ for node in local_nodes(function):
+  if not isinstance(node,ast.Try): continue
+  calls=[s.value for s in node.body if isinstance(s,ast.Expr) and isinstance(s.value,ast.Call)]
+  registered=any(isinstance(c.func,ast.Name) and c.func.id=='register_group'
+                 and len(c.args)==1 and isinstance(c.args[0],ast.Attribute)
+                 and c.args[0].attr=='pid' and isinstance(c.args[0].value,ast.Name)
+                 and c.args[0].value.id=='process' and not c.keywords for c in calls)
+  drained=any(isinstance(c.func,ast.Name) and c.func.id=='drain' for c in calls)
+  if registered and drained: matches.append(node)
+ return matches
+candidates=lifecycle_tries()
+if len(candidates)!=1:
+ print(json.dumps({'valid':False}));sys.exit(0)
+if request['mutation']=='missing-lifecycle':
+ candidates[0].body=[s for s in candidates[0].body
+                     if not (isinstance(s,ast.Expr) and isinstance(s.value,ast.Call)
+                             and isinstance(s.value.func,ast.Name) and s.value.func.id=='drain')]
+if request['mutation']=='duplicate-lifecycle':
+ import copy
+ function.body.append(copy.deepcopy(candidates[0]))
+candidates=lifecycle_tries()
+if len(candidates)!=1:
+ print(json.dumps({'valid':False}));sys.exit(0)
+handlers=[h for h in candidates[0].handlers if isinstance(h.type,ast.Name)
+          and h.type.id=='BaseException' and h.name]
 if len(handlers)!=1:
  print(json.dumps({'valid':False}));sys.exit(0)
 handler=handlers[0]
@@ -660,7 +693,7 @@ print(json.dumps({'valid':bare and not replacement and bound,
     };
     expect(primaryPolicy()).toEqual({ valid: true, bareReraise: true,
       replacementRaise: false, noteBoundToPrimary: true });
-    for (const mutation of ['silence', 'replace', 'wrong-note']) {
+    for (const mutation of ['silence', 'replace', 'wrong-note', 'missing-lifecycle', 'duplicate-lifecycle']) {
       expect(primaryPolicy(mutation).valid, mutation).toBe(false);
     }
     const cleanupControls = readFileSync(join(REPO_ROOT, 'scripts/mobile-core/test_apple_progress.py'), 'utf8');

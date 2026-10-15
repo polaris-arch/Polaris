@@ -145,15 +145,40 @@ function invalidateLoadConfig(reason: string): number {
   return ++requestedEpoch;
 }
 
-function publishConfig(config: UserConfig, epoch: number, reason: string): ConfigPublication {
-  const publication = { config, epoch, reason, serial: ++publicationSerial };
-  configReadGeneration.published();
-  useAppStore.setState({
-    config, configPublication: { epoch, reason, serial: publication.serial },
+const configRefreshMessages = {
+  CONFIG_REFRESH_CANCELLED: () => i18n.t('errors.configRefreshCancelled'),
+  CONFIG_REFRESH_SCOPE_MISMATCH: () => i18n.t('errors.configRefreshScopeMismatch'),
+  CONFIG_REFRESH_INVALID_RESPONSE: () => i18n.t('errors.configRefreshInvalidResponse'),
+} as const;
+function configRefreshError(code: keyof typeof configRefreshMessages): Error & { code: string } {
+  return Object.assign(new Error(configRefreshMessages[code]()), { code });
+}
+
+type ConfigProjection = Pick<AppState, 'config' | 'servers' | 'selectedServerId' | 'rules' | 'dnsRules'>;
+function prepareConfigPublication(config: UserConfig): ConfigProjection {
+  // IPC can resolve malformed data (including undefined outside Tauri). Prepare
+  // every mirror before changing publication serial, generation or store state.
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+  }
+  const projection = {
+    config,
     servers: config.servers ?? [], selectedServerId: config.selectedServerId,
     rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
     dnsRules: config.dnsRules ?? [],
-  });
+  };
+  if (!Array.isArray(projection.servers) || !Array.isArray(projection.rules) || !Array.isArray(projection.dnsRules)
+    || (projection.selectedServerId != null && typeof projection.selectedServerId !== 'string')) {
+    throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+  }
+  return projection;
+}
+
+function publishConfig(config: UserConfig, epoch: number, reason: string,
+  projection = prepareConfigPublication(config)): ConfigPublication {
+  const publication = { config, epoch, reason, serial: ++publicationSerial };
+  configReadGeneration.published();
+  useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } });
   return publication;
 }
 
@@ -167,9 +192,9 @@ function releaseUnusedSession(session: ConfigSession): void {
   useAppStore.setState({ configLoading: false });
 }
 
-function settleConfigWaiters(session: ConfigSession, result: ConfigPublication | null, error?: unknown): void {
+function settleConfigWaiters(session: ConfigSession, result: ConfigPublication | null, error?: unknown, maximumEpoch = Infinity): void {
   for (const waiter of configWaiters) {
-    if (waiter.session !== session || (result && waiter.minimumEpoch > result.epoch)) continue;
+    if (waiter.session !== session || waiter.minimumEpoch > (result?.epoch ?? maximumEpoch)) continue;
     configWaiters.delete(waiter);
     waiter.cleanup();
     session.requests--;
@@ -202,7 +227,7 @@ function ensureConfigListener(session: ConfigSession): Promise<void> {
 }
 
 function getConfigSession(scope = configScope ?? 'main'): ConfigSession {
-  if (configScope && configScope !== scope) throw new Error('Mixed main/tray config scopes in one WebView');
+  if (configScope && configScope !== scope) throw configRefreshError('CONFIG_REFRESH_SCOPE_MISMATCH');
   configScope = scope;
   if (!configSession) {
     configSession = { scope, leases: 0, requests: 0, ready: null, off: null };
@@ -225,21 +250,29 @@ function pumpConfigRefresh(): void {
     && configReadGeneration.isCurrent(readGeneration);
   useAppStore.setState({ configLoading: true });
   let completed = false;
+  let publicationStarted = false;
   void (async () => {
     try {
       const config = await api.config.get();
       if (!current()) return;
+      const projection = prepareConfigPublication(config);
+      if (!current()) return;
       if (session.scope === 'main') await hydrateStagedConfig(config, current);
       if (!current()) return;
-      completed = true;
       refreshNeeded = false;
-      const publication = publishConfig(config, flight.epoch, reason);
+      publicationStarted = true;
+      const publication = publishConfig(config, flight.epoch, reason, projection);
+      completed = true;
       settleConfigWaiters(session, publication);
     } catch (error) {
-      if (current()) {
+      // A publish/observer exception belongs to this flight even though our own
+      // publication advanced the generation. Do not turn it into an endless retry.
+      if (publicationStarted || current()) {
         completed = true;
-        refreshNeeded = false;
-        settleConfigWaiters(session, null, error);
+        // An observer may synchronously request a newer epoch (or reacquire a
+        // different session) before throwing. Keep that real tail-read intent.
+        if (session === configSession && flight.epoch === requestedEpoch) refreshNeeded = false;
+        settleConfigWaiters(session, null, error, flight.epoch);
         console.error('[app-store] loadConfig failed:', error);
       }
     } finally {
@@ -274,7 +307,7 @@ export function acquireConfigSync({ scope }: { scope: ConfigScope }): () => void
 
 /** A fresh caller requires a GET started at/after this synchronous barrier. */
 export function refreshConfig({ fresh = false, reason = 'refresh', signal }: { fresh?: boolean; reason?: string; signal?: AbortSignal } = {}): Promise<ConfigPublication> {
-  if (signal?.aborted) return Promise.reject(new Error('Config refresh cancelled'));
+  if (signal?.aborted) return Promise.reject(configRefreshError('CONFIG_REFRESH_CANCELLED'));
   const session = getConfigSession();
   const minimumEpoch = fresh ? invalidateLoadConfig(reason) : requestedEpoch;
   if (!loadConfigInflight) refreshReason = reason;
@@ -284,7 +317,7 @@ export function refreshConfig({ fresh = false, reason = 'refresh', signal }: { f
       if (!configWaiters.delete(waiter)) return;
       waiter.cleanup();
       session.requests--;
-      reject(new Error('Config refresh cancelled'));
+      reject(configRefreshError('CONFIG_REFRESH_CANCELLED'));
       releaseUnusedSession(session);
     };
     const waiter: ConfigWaiter = { session, minimumEpoch, resolve, reject,

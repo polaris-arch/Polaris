@@ -111,9 +111,12 @@ function mountAndSubmit(
     rules: state.rules ?? [],
     dnsRules: state.dnsRules ?? [],
     servers: [NODE] as never,
-    config: CONFIG,
+    // Authoritative config publications derive the mirrors from these collections.
+    config: { ...CONFIG, trafficRules: state.rules ?? [], dnsRules: state.dnsRules ?? [] },
   });
   mirror();
+  expect(useAppStore.getState().rules).toEqual(state.rules ?? []);
+  expect(useAppStore.getState().dnsRules).toEqual(state.dnsRules ?? []);
   renderToStaticMarkup(element);
   expect(probe.onSubmit, '外壳没拿到提交闭包 —— 探针抓空了，下面每条都会在 null 上断言').not.toBeNull();
   probe.onSubmit?.();

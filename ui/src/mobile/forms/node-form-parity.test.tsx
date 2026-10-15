@@ -17,8 +17,8 @@ import { MOBILE_FIELD_HINT_SUMMARIES } from './FormFields';
  *  · `FormSheet` —— 外壳：换成探针，抓 `onSubmit`，并把 children 原样画出来；
  *  · `FormGroup` —— 折叠段：恒展开（本仓 vitest 是 `environment:'node'`、点不了组头；
  *    被验的是组里的字段，不是折叠这件事 —— 折叠另有 `reveal.test.ts` 与各屏门）；
- *  · `@/ipc` 的 `api.server.add/update/tailcatKeypair` 与 `api.proxy.probeOutbound` —— 被验的是
- *    「**交给它什么**」；
+ *  · `@/ipc` 的节点写入与写后 `config.get` —— 同一 backend fixture 保存并返回完整新快照，
+ *    被验的是「**交给它什么**」与真 store 的写后刷新；
  *  · `protoCodec[*].fromConfig` —— **只在 ⑥-c 一条里**叠一层草稿补丁，模拟「用户在扩展 JSON 里删掉了
  *    一个键」（SSR 下无法真的输入）。`toConfig` 与面板的装配逻辑全是真身；⑥-c 还带一条正面对照
  *    证明补丁真的打上了（不打补丁时那个键**应当**被保留）。
@@ -28,7 +28,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { ReactElement, ReactNode } from 'react';
 import { readFileSync } from 'node:fs';
 
-import type { ServerConfig } from '@/contracts/types';
+import type { ServerConfig, UserConfig } from '@/contracts/types';
+import { DEMO_CONFIG } from '../../../harness-fixture';
 import i18n, { i18nReady } from '@/i18n';
 import { PROTO_OPTIONS, allFields, nodeFormGroups, type NodeProto } from '@/components/dialogs/node-spec';
 import { draftFromSpecs } from '@/components/dialogs/field-spec';
@@ -53,6 +54,8 @@ const probe = vi.hoisted(() => ({
   draftPatch: null as null | Record<string, unknown>,
   add: [] as unknown[],
   update: [] as unknown[],
+  backend: null as UserConfig | null,
+  get: vi.fn<() => Promise<UserConfig>>(),
 }));
 
 vi.mock('./FormSheet', () => ({
@@ -77,14 +80,21 @@ vi.mock('@/ipc', async (importOriginal) => {
     ...real,
     api: {
       ...real.api,
+      config: { ...real.api.config, get: probe.get },
       server: {
         ...real.api.server,
         add: (s: unknown): Promise<void> => {
           probe.add.push(s);
+          if (!probe.backend) throw Error('backend fixture not seeded');
+          const saved = { ...(s as Omit<ServerConfig, 'id'>), id: 'added-server' };
+          probe.backend = { ...probe.backend, servers: [...probe.backend.servers, saved] };
           return Promise.resolve();
         },
         update: (s: unknown): Promise<void> => {
           probe.update.push(s);
+          if (!probe.backend) throw Error('backend fixture not seeded');
+          const saved = s as ServerConfig;
+          probe.backend = { ...probe.backend, servers: probe.backend.servers.map((server) => server.id === saved.id ? saved : server) };
           return Promise.resolve();
         },
       },
@@ -123,6 +133,12 @@ function reset(): void {
   probe.draftPatch = null;
   probe.add = [];
   probe.update = [];
+  probe.backend = { ...DEMO_CONFIG, servers: [], subscriptions: [], selectedServerId: null,
+    customRules: [], policyRules: [], trafficRules: [], dnsRules: [] };
+  probe.get.mockReset().mockImplementation(async () => {
+    if (!probe.backend) throw Error('backend fixture not seeded');
+    return probe.backend;
+  });
   useMobileFormStore.getState().closeAll();
   useStagedConfigStore.setState({ entries: [] });
   useAppStore.setState({ servers: [], config: null });
@@ -145,7 +161,9 @@ const renderNew = (proto: NodeProto): string =>
   renderToStaticMarkup(<NodeFormPanel instanceId="nf-new" initialProto={proto} />);
 
 const renderEdit = (base: ServerConfig): string => {
-  useAppStore.setState({ servers: [base] });
+  probe.backend = { ...probe.backend!, servers: [base] };
+  useAppStore.setState({ config: probe.backend });
+  expect(useAppStore.getState().servers).toEqual([base]);
   mirror();
   return renderToStaticMarkup(<NodeFormPanel instanceId="nf-edit" serverId={base.id} />);
 };
@@ -379,6 +397,10 @@ describe('⑥ 提交：抓住真的提交闭包，看写出去的 ServerConfig',
     expect(out.address).toBe('');
     expect(out.port).toBe(0);
     expect(out.tailcatSettings?.serverPublicKey).toBe(KEY('A'));
+    expect(probe.get).toHaveBeenCalledTimes(1);
+    expect(probe.backend?.servers).toEqual([out]);
+    expect(useAppStore.getState().config).toBe(probe.backend);
+    expect(useAppStore.getState().servers).toEqual([out]);
   });
 
   const TOR_BASE = {

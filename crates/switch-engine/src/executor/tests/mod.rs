@@ -587,7 +587,10 @@ async fn execute_skip_and_snapshot_failure_paths_never_start_close_futures() {
             assert_eq!(outcome, HotSwitchOutcome::Applied { disconnect: None });
         }
         let state = api.state.lock().unwrap();
-        assert_eq!(state.snapshot_calls, usize::from(scenario == "snapshot-fails"));
+        assert_eq!(
+            state.snapshot_calls,
+            usize::from(scenario == "snapshot-fails")
+        );
         assert!(state.attempted.is_empty());
         assert_eq!(state.active, 0);
     }

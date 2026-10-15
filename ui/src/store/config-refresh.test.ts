@@ -92,6 +92,165 @@ describe('one ready-registered per-WebView feed with fresh tail barriers', () =>
     const retry = store.refreshConfig(); await started(4); reads[3].resolve(cfg('retry')); await retry;
   });
 
+  it.each([
+    undefined, null, false, 0, 'not-config', [],
+    { servers: {} }, { trafficRules: 'not-rules' }, { dnsRules: 0 }, { selectedServerId: 0 },
+  ])('rejects malformed resolved data without publishing or an automatic GET loop: %j', async (raw) => {
+    const seed = cfg('seed'); store.useAppStore.setState({ config: seed });
+    const release = acquire();
+    const errors: unknown[] = [];
+    const requests = [store.refreshConfig(), store.refreshConfig()].map((request) => request.catch((error) => { errors.push(error); return error; }));
+    await started(1);
+    const generation = readOrder.configReadGeneration.current();
+    const publication = store.useAppStore.getState().configPublication!;
+    const published = vi.spyOn(readOrder.configReadGeneration, 'published');
+    // All subsequent GETs remain held. A regression fails the bounded-count
+    // assertion rather than spinning immediate malformed promises until OOM.
+    reads[0].resolve(raw as unknown as UserConfig); await tick();
+    expect(native.get).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(2);
+    for (const error of await Promise.all(requests)) expect(error).toMatchObject({ code: 'CONFIG_REFRESH_INVALID_RESPONSE' });
+    expect(native.hydrate).not.toHaveBeenCalled();
+    expect(published).not.toHaveBeenCalled();
+    expect(readOrder.configReadGeneration.current()).toBe(generation);
+    expect(store.useAppStore.getState().config).toBe(seed);
+    expect(store.useAppStore.getState().configPublication).toBe(publication);
+    expect(store.useAppStore.getState().configLoading).toBe(false);
+    await tick(); expect(native.get).toHaveBeenCalledTimes(1);
+
+    // A later genuine event recovers; failed preparation did not consume a serial.
+    signal(); const recovered = store.refreshConfig(); await started(2);
+    const good = cfg('recovered'); reads[1].resolve(good);
+    expect((await recovered).config).toBe(good);
+    expect(store.useAppStore.getState().configPublication?.serial).toBe(publication.serial + 1);
+    release(); expect(listeners.size).toBe(0); // no leaked requester keeps the session alive
+  });
+
+  it('preserves nullish optional collection fallback when preparing mirrors', async () => {
+    const fallback = [{ id: 'legacy-rule' }] as UserConfig['customRules'];
+    const value = { ...cfg('legacy'), servers: null, trafficRules: null, policyRules: null,
+      customRules: fallback, dnsRules: null } as unknown as UserConfig;
+    const waiting = store.refreshConfig(); await started(1); reads[0].resolve(value);
+    expect((await waiting).config).toBe(value);
+    expect(store.useAppStore.getState()).toMatchObject({ servers: [], rules: fallback, dnsRules: [] });
+    expect(native.get).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['transport', 'projection', 'publication'])('%s exceptions settle every current waiter, release requests and recover on demand', async (phase) => {
+    const seed = cfg('seed'); store.useAppStore.setState({ config: seed });
+    const release = acquire();
+    const failure = Error(`${phase} failed`), value = cfg('valid-payload');
+    const errors: unknown[] = [];
+    const controllers = [new AbortController(), new AbortController()];
+    const cleanup = controllers.map((controller) => vi.spyOn(controller.signal, 'removeEventListener'));
+    const requests = controllers.map((controller) => store.refreshConfig({ signal: controller.signal }).catch((error) => { errors.push(error); return error; }));
+    await started(1);
+    const generation = readOrder.configReadGeneration.current();
+    const serial = store.useAppStore.getState().configPublication!.serial;
+    if (phase === 'projection') Object.defineProperty(value, 'dnsRules', { get: () => { throw failure; } });
+    const off = store.useAppStore.subscribe((state, previous) => {
+      // Throw only from the actual publication notification, not loading updates.
+      if (phase === 'publication' && state.config === value && state.configPublication !== previous.configPublication) throw failure;
+    });
+    releases.push(off);
+    if (phase === 'transport') reads[0].reject(failure); else reads[0].resolve(value);
+    await tick();
+    expect(native.get).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(2);
+    expect(await Promise.all(requests)).toEqual([failure, failure]);
+    for (const removed of cleanup) expect(removed).toHaveBeenCalledExactlyOnceWith('abort', expect.any(Function));
+    expect(store.useAppStore.getState().configLoading).toBe(false);
+    if (phase !== 'publication') {
+      expect(readOrder.configReadGeneration.current()).toBe(generation);
+      expect(store.useAppStore.getState().config).toBe(seed);
+      expect(store.useAppStore.getState().configPublication?.serial).toBe(serial);
+    } else {
+      // Zustand has already committed before notifying subscribers. Do not roll
+      // back an observed valid value; reject the refresh and stop automatic retries.
+      expect(store.useAppStore.getState().config).toBe(value);
+      expect(store.useAppStore.getState().configPublication?.serial).toBe(serial + 1);
+    }
+    await tick(); expect(native.get).toHaveBeenCalledTimes(1);
+    off(); release(); expect(listeners.size).toBe(0); // requests and abort handlers are gone
+    controllers.forEach((controller) => controller.abort());
+    const retry = store.refreshConfig(); await started(2);
+    const good = cfg('retry'); reads[1].resolve(good);
+    const publication = await retry;
+    expect(publication.config).toBe(good);
+    expect(publication.serial).toBe(serial + (phase === 'publication' ? 2 : 1));
+    expect(listeners.size).toBe(0); expect(native.get).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['signal', 'fresh'])('a publication exception retains a synchronously requested newer %s epoch', async (kind) => {
+    acquire();
+    const failure = Error('observer failed'), value = cfg('first-publication');
+    const errors: unknown[] = [];
+    const old = store.refreshConfig().catch((error) => { errors.push(error); return error; });
+    let fresh: Promise<import('./app-store').ConfigPublication> | undefined;
+    let freshFinished = false;
+    const off = store.useAppStore.subscribe((state, previous) => {
+      if (state.config !== value || state.configPublication === previous.configPublication) return;
+      if (kind === 'signal') signal(); // deliberately no new waiter: the lease still needs this tail
+      else fresh = store.refreshConfig({ fresh: true }).then((result) => { freshFinished = true; return result; });
+      expect(native.get).toHaveBeenCalledTimes(1); // the old native flight still owns the slot
+      throw failure;
+    });
+    releases.push(off);
+    await started(1); reads[0].resolve(value); await tick();
+    expect(errors).toEqual([failure]); expect(await old).toBe(failure);
+    expect(native.get).toHaveBeenCalledTimes(2); expect(freshFinished).toBe(false);
+    expect(store.useAppStore.getState().configLoading).toBe(true);
+    off(); const good = cfg('new-epoch'); reads[1].resolve(good);
+    if (kind === 'fresh') expect((await fresh!).config).toBe(good);
+    await tick(); expect(store.useAppStore.getState().config).toBe(good);
+    expect(store.useAppStore.getState().configLoading).toBe(false);
+    expect(native.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('abort/dispose/reacquire inside a failing publication cannot retire the new session', async () => {
+    const release = acquire(), controller = new AbortController(), value = cfg('retiring');
+    const cancelled = store.refreshConfig({ signal: controller.signal }).catch((error) => error);
+    let replacement: Promise<import('./app-store').ConfigPublication> | undefined;
+    const off = store.useAppStore.subscribe((state, previous) => {
+      if (state.config !== value || state.configPublication === previous.configPublication) return;
+      controller.abort(); release(); acquire(); replacement = store.refreshConfig();
+      expect(native.get).toHaveBeenCalledTimes(1);
+      throw Error('retired observer failed');
+    });
+    releases.push(off);
+    await started(1); reads[0].resolve(value); await tick();
+    expect(native.get).toHaveBeenCalledTimes(2); expect(listeners.size).toBe(1);
+    expect(await cancelled).toMatchObject({ code: 'CONFIG_REFRESH_CANCELLED' });
+    expect(store.useAppStore.getState().configLoading).toBe(true);
+    off(); reads[1].resolve(cfg('replacement'));
+    expect((await replacement!).config.selectedServerId).toBe('replacement');
+    expect(listeners.size).toBe(1); expect(native.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancellation, scope mismatch and invalid-response errors keep localized messages and stable codes', async () => {
+    const { default: i18n, i18nReady, syncLanguageChoice } = await import('../i18n');
+    await i18nReady;
+    const release = store.acquireConfigSync({ scope: 'tray' }); releases.push(release);
+    const messages: string[] = [];
+    for (const language of ['en-US', 'zh-CN']) {
+      syncLanguageChoice(language);
+      await vi.waitFor(() => expect(i18n.language).toBe(language));
+      const controller = new AbortController(); controller.abort();
+      const cancelled = await store.refreshConfig({ signal: controller.signal }).catch((error) => error);
+      expect(cancelled).toMatchObject({ code: 'CONFIG_REFRESH_CANCELLED', message: i18n.t('errors.configRefreshCancelled') });
+      expect(cancelled.message).not.toBe('errors.configRefreshCancelled'); messages.push(cancelled.message);
+      expect(() => store.acquireConfigSync({ scope: 'main' })).toThrow(expect.objectContaining({
+        code: 'CONFIG_REFRESH_SCOPE_MISMATCH', message: i18n.t('errors.configRefreshScopeMismatch'),
+      }));
+      const errors: unknown[] = [];
+      const invalid = store.refreshConfig().catch((error) => { errors.push(error); return error; });
+      const count = messages.length; await started(count); reads[count - 1].resolve(undefined as unknown as UserConfig);
+      await tick(); expect(native.get).toHaveBeenCalledTimes(count); expect(errors).toHaveLength(1);
+      expect(await invalid).toMatchObject({ code: 'CONFIG_REFRESH_INVALID_RESPONSE', message: i18n.t('errors.configRefreshInvalidResponse') });
+    }
+    expect(messages[0]).not.toBe(messages[1]); expect(native.hydrate).not.toHaveBeenCalled();
+  });
+
   it('idle ordinary requests revalidate instead of caching a completed promise', async () => {
     const first = store.refreshConfig(); await started(1); reads[0].resolve(cfg('one')); await first;
     const next = store.refreshConfig(); await started(2); reads[1].resolve(cfg('two'));
@@ -123,7 +282,7 @@ describe('one ready-registered per-WebView feed with fresh tail barriers', () =>
     const controller = new AbortController();
     const cancelled = store.refreshConfig({ signal: controller.signal }).catch((error) => error);
     const remaining = store.refreshConfig(); await started(1); controller.abort();
-    expect((await cancelled).message).toContain('cancelled'); reads[0].resolve(cfg('remaining'));
+    expect(await cancelled).toMatchObject({ code: 'CONFIG_REFRESH_CANCELLED' }); reads[0].resolve(cfg('remaining'));
     expect((await remaining).config.selectedServerId).toBe('remaining'); expect(listeners.size).toBe(0);
   });
 
@@ -164,7 +323,7 @@ describe('one ready-registered per-WebView feed with fresh tail barriers', () =>
     const release = store.acquireConfigSync({ scope: 'tray' }); releases.push(release);
     const waiting = store.refreshConfig(); await started(1); reads[0].resolve(cfg('tray')); await waiting;
     expect(native.hydrate).not.toHaveBeenCalled();
-    expect(() => store.acquireConfigSync({ scope: 'main' })).toThrow('Mixed main/tray');
+    expect(() => store.acquireConfigSync({ scope: 'main' })).toThrow(expect.objectContaining({ code: 'CONFIG_REFRESH_SCOPE_MISMATCH' }));
   });
 
   it('a delayed write reply cannot overwrite a newer external publication, and settlement starts a fresh GET', async () => {

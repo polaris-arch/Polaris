@@ -196,7 +196,8 @@ fn on_changed_param_lists(path: &str, src: &str) -> Vec<String> {
     // 提到的 `` `configApi.onChanged` ``）会喂饱/顶红判据（与 Rust 侧剥行注释同一理由）。
     // Both APIs are the same payload-free native signal. Normalize only the
     // member spelling; callback syntax and every negative control stay strict.
-    let src = strip_line_comments(&strip_block_comments(src)).replace(".onChangedReady(", ".onChanged(");
+    let src =
+        strip_line_comments(&strip_block_comments(src)).replace(".onChangedReady(", ".onChanged(");
     // **自曝**：`strip_block_comments` 找不到闭合就不清空、原样保留——那份「不作为」必须
     // 自己被看见，不能只在剩余文本恰好含 `.onChanged(` 时才被间接带出来（那是零信号的巧合绿）。
     // 扫一遍剥完的文本，任何一行 trim 后仍以 `/*`/`{/*` 开头，说明这正是一次未闭合起笔被原样吐回。
@@ -304,17 +305,39 @@ fn every_consumer_discards_the_payload() {
         roster.len()
     );
 
-    assert_eq!(roster.len(), 1, "one native config listener per WebView: {roster:?}");
+    assert_eq!(
+        roster.len(),
+        1,
+        "one native config listener per WebView: {roster:?}"
+    );
     assert_eq!(roster[0].0, "ui/src/store/app-store.ts");
-    let store = files.iter().find(|(path, _)| path == "ui/src/store/app-store.ts").unwrap();
+    let store = files
+        .iter()
+        .find(|(path, _)| path == "ui/src/store/app-store.ts")
+        .unwrap();
     let store_code = strip_line_comments(&strip_block_comments(&store.1));
     assert!(store_code.contains("api.config.onChangedReady(() =>"));
     // The four real entry types must consume the feed, not just define an unused helper.
-    for path in ["ui/src/App.tsx", "ui/src/mobile/config-sync.ts", "ui/src/components/screens/settings/use-config.ts", "ui/src/tray/TrayMenu.tsx"] {
-        let src = &files.iter().find(|(candidate, _)| candidate == path).unwrap().1;
+    for path in [
+        "ui/src/App.tsx",
+        "ui/src/mobile/config-sync.ts",
+        "ui/src/components/screens/settings/use-config.ts",
+        "ui/src/tray/TrayMenu.tsx",
+    ] {
+        let src = &files
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .unwrap()
+            .1;
         let code = strip_line_comments(&strip_block_comments(src));
-        assert!(code.contains("acquireConfigSync({ scope:"), "{path} does not acquire the shared feed");
-        assert!(!code.contains(".onChanged(") && !code.contains(".onChangedReady("), "{path} duplicates the native signal");
+        assert!(
+            code.contains("acquireConfigSync({ scope:"),
+            "{path} does not acquire the shared feed"
+        );
+        assert!(
+            !code.contains(".onChanged(") && !code.contains(".onChangedReady("),
+            "{path} duplicates the native signal"
+        );
     }
 
     // 正面断言②：逐个断言形态。新增消费方自动进面，不需要有人回来改任何清单。
@@ -430,16 +453,32 @@ fn block_comment_mentioning_on_changed_is_not_counted() {
     );
 }
 
-
 #[test]
 fn ready_signal_scanner_retains_payload_negative_controls() {
-    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady(() => refresh());"), vec!["()"]);
-    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady((...args: unknown[]) => consume(args));"), vec!["(...args: unknown[])"]);
-    assert_eq!(on_changed_param_lists("fixture.ts", "api.config.onChangedReady(async (payload: unknown) => consume(payload));"), vec!["(payload: unknown)"]);
+    assert_eq!(
+        on_changed_param_lists("fixture.ts", "api.config.onChangedReady(() => refresh());"),
+        vec!["()"]
+    );
+    assert_eq!(
+        on_changed_param_lists(
+            "fixture.ts",
+            "api.config.onChangedReady((...args: unknown[]) => consume(args));"
+        ),
+        vec!["(...args: unknown[])"]
+    );
+    assert_eq!(
+        on_changed_param_lists(
+            "fixture.ts",
+            "api.config.onChangedReady(async (payload: unknown) => consume(payload));"
+        ),
+        vec!["(payload: unknown)"]
+    );
     for invalid in [
         "api.config.onChangedReady(namedCallback);",
         "api.config.onChangedReady(function () { consume(arguments[0]); });",
     ] {
-        assert!(std::panic::catch_unwind(|| on_changed_param_lists("fixture.ts", invalid)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| on_changed_param_lists("fixture.ts", invalid)).is_err()
+        );
     }
 }

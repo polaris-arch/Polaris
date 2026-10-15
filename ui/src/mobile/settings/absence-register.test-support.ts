@@ -434,7 +434,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'ListEditor.tsx|k:common.confirm',
       disposition: {
         kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: 'commit(parseBulkEntries(importDraft, [...draft]));' },
+        mobile: { file: 'ui/src/mobile/settings/SettingsChrome.tsx', mustContain: 'commit(parseBulkEntries(importDraft, [...draft], undefined, entryIdentity));' },
       },
       note:
         '批量导入的确认。解析与去重走 `@/domain/list-entries` 的 `parseBulkEntries` —— ' +
