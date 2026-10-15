@@ -27,7 +27,7 @@ def plan(platform, value, *, gomobile, output, bootclasspath=None):
             'requiredOutputChecks': (['four exact ABI native ELF', 'API24 Android ident',
                 '16KiB PT_LOAD', 'complete JNI/Java API', 'actual Go BuildInfo/module/replacement',
                 'actual BuildID and source/tool input binding', 'final APK/R8/alignment']
-                if platform == 'android' else ['three exact iOS architecture slices',
+                if platform == 'android' else ['two exact arm64 iOS platform slices',
                 'static archives and generated Objective-C/Swift API', 'source/module/runtime inputs',
                 'actual SDK/compiler identities and BuildID', 'final App/PacketTunnel static-link provenance']),
             'producerReceipt': None, 'AppAccepted': False, 'devicePassed': False,

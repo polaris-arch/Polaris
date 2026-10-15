@@ -24,7 +24,8 @@ const view = vi.hoisted(() => ({
   manualCompletionUnverified: false,
 }));
 
-vi.mock('react-i18next', () => ({
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(),
   useTranslation: () => ({ t: (key: string, options?: Record<string, unknown>) => view.i18n.t(key, options) }),
 }));
 // 卡片下半的通道下拉框用 portal 挂到 `document.body`，node 环境没有 document；它与本条无关，换成空壳。
@@ -76,6 +77,7 @@ describe('AppUpdateCard · 便携版手动覆盖卡', () => {
       instances.set(lng, instance);
     }
     ({ default: AppUpdateCard } = await import('./AppUpdateCard'));
+    await (await import('@/i18n')).i18nReady;
   });
 
   function render(lng: string, us: string, errMsg: string): string {

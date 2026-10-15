@@ -28,8 +28,7 @@ def target_for(platform, arches, configuration):
     require(configuration == 'release', 'formal App hook requires release configuration')
     require(len(arches.split()) == 1, 'one actual Apple architecture required')
     targets = {('iphoneos', 'arm64'): 'aarch64-apple-ios',
-               ('iphonesimulator', 'arm64'): 'aarch64-apple-ios-sim',
-               ('iphonesimulator', 'x86_64'): 'x86_64-apple-ios'}
+               ('iphonesimulator', 'arm64'): 'aarch64-apple-ios-sim'}
     require((platform, arches) in targets, 'unsupported actual App platform/architecture')
     return targets[(platform, arches)]
 
@@ -37,7 +36,7 @@ def target_for(platform, arches, configuration):
 def selected_wire_bytes(raw, triple):
     """Inspect every fat entry, then select the actual Cargo architecture/platform."""
     specs = {'aarch64-apple-ios': (0x100000c, 2),
-             'aarch64-apple-ios-sim': (0x100000c, 7), 'x86_64-apple-ios': (0x1000007, 7)}
+             'aarch64-apple-ios-sim': (0x100000c, 7)}
     require(triple in specs and len(raw) <= 1024 ** 3, 'bounded selected wire target required')
     parser = module('apple_selected_wire_carrier', 'scripts/apple-carrier.py')
     helper = module('apple_selected_wire_info', 'scripts/libbox-patches/android-source.py')
@@ -121,8 +120,8 @@ def build_reserved():
                TAURI_ENV_ARCH=triple.split('-')[0], TAURI_ENV_PLATFORM='ios', TAURI_ENV_FAMILY='unix',
                TAURI_IOS_PROJECT_PATH=str(ROOT / 'src-tauri/gen/apple'))
     suffix = triple.replace('-', '_')
-    slice_name = ('ios-arm64' if os.environ['PLATFORM_NAME'] == 'iphoneos' else
-                  'ios-arm64-simulator' if os.environ['ARCHS'] == 'arm64' else 'ios-x86_64-simulator')
+    slice_name = {'aarch64-apple-ios': 'ios-arm64',
+                  'aarch64-apple-ios-sim': 'ios-arm64-simulator'}[triple]
     selected = link['componentOutput']['slices'][slice_name]
     library = Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox'
     library = library.resolve(strict=True)
@@ -210,8 +209,8 @@ def verify():
             receipt.get('swiftExportPolicy') == {name: file_pin(ROOT / name) for name in SWIFT_EXPORT_POLICY} and
             Path(os.environ['SDKROOT']).resolve(strict=True) == Path(receipt['sdk']) and
             receipt['devicePassed'] is False, 'actual compiled Rust/Xcode input differs')
-    slice_name = ('ios-arm64' if os.environ['PLATFORM_NAME'] == 'iphoneos' else
-                  'ios-arm64-simulator' if os.environ['ARCHS'] == 'arm64' else 'ios-x86_64-simulator')
+    slice_name = {'aarch64-apple-ios': 'ios-arm64',
+                  'aarch64-apple-ios-sim': 'ios-arm64-simulator'}[triple]
     selected = link['componentOutput']['slices'][slice_name]
     original = (Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework/Libbox').resolve(strict=True)
     thin, selection = selected_wire_bytes(original.read_bytes(), triple)

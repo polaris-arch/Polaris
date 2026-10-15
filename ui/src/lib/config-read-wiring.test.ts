@@ -424,6 +424,20 @@ interface MirrorSite {
 
 const MIRROR_SITES: readonly MirrorSite[] = [
   {
+    file: 'components/screens/rules/RulesScreen.tsx',
+    shape: "useAppStore.setState((state)=>{constcurrent=plane==='dns'?st…",
+    count: 1,
+    surface: 'operation',
+    why: '镜像自身：失败回滚读取最新磁盘 route/dns 规则镜像，按引用身份仅恢复本次乐观 next，保留后来更新；不得以 effective 暂存值回写磁盘镜像。',
+  },
+  {
+    file: 'mobile/screens/rules/RulesScreen.tsx',
+    shape: "useAppStore.setState((state)=>{constcurrent=plane==='dns'?st…",
+    count: 1,
+    surface: 'operation',
+    why: '镜像自身：移动失败回滚读取最新磁盘 route/dns 规则镜像，按引用身份仅恢复本次乐观 next，保留后来更新；不得整表恢复旧 prev 或烧入 effective 暂存值。',
+  },
+  {
     file: "mobile/MeasurementLabel.tsx",
     shape: "useAppStore(state=>state.config?.servers.find(server=>server…",
     count: 1,

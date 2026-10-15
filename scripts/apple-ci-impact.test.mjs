@@ -47,17 +47,20 @@ test('selected Apple failure/skip is consumed by the existing aggregate gate', (
   assert.match(risk, /node scripts\/apple-ci-impact\.mjs --full/);
 });
 
-test('Apple workflow keeps one admitted host and three complete isolated carrier outputs', () => {
+test('Apple workflow keeps one admitted host and two complete isolated arm64 carrier outputs', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
   assert.match(workflow, /runs-on: xcode-27/);
+  assert.match(workflow, /targets: aarch64-apple-ios,aarch64-apple-ios-sim\n/);
+  assert.match(workflow, /key: apple-whole-host-arm64-only-xcode27\.1-27A9275/);
+  assert.doesNotMatch(workflow, /sim-amd64|sim_amd64|x86_64-apple-ios|three-slot|three-slice/);
   for (const action of ['prepare', 'build', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot']) {
     assert.match(workflow, new RegExp(`ci_apple.py ${action}`));
   }
   assert.doesNotMatch(workflow, /\n  carrier:\n/);
   assert.equal((workflow.match(/ci_apple.py build/g) || []).length, 1);
-  assert.equal((workflow.match(/ci_apple.py carrier --slot/g) || []).length, 3);
+  assert.equal((workflow.match(/ci_apple.py carrier --slot/g) || []).length, 2);
   assert.match(workflow, /unsigned-chain:\n\s+needs: component\n\s+if: always\(\)/);
-  for (const slot of ['device-arm64', 'sim-arm64', 'sim-amd64']) {
+  for (const slot of ['device-arm64', 'sim-arm64']) {
     const id = slot.replaceAll('-', '_');
     const start = workflow.indexOf('id: ' + id + '\n');
     const original = workflow.indexOf('id: original_' + id + '\n', start);
@@ -84,26 +87,26 @@ test('shared prerequisite failure builds no carriers while first carrier failure
     'component_original', 'local_component', 'protoc', 'rust_cache']) {
     assert.ok(prerequisites.includes(required));
   }
-  const nativeConditions = ['device_arm64', 'sim_arm64', 'sim_amd64'].map(id => {
+  const nativeConditions = ['device_arm64', 'sim_arm64'].map(id => {
     const block = workflow.slice(workflow.indexOf('id: ' + id + '\n'));
     return block.match(/if: (.+)/)[1];
   });
   for (const text of nativeConditions) {
     assert.match(text, /!cancelled\(\) && steps.shared_ready.conclusion == 'success'/);
-    assert.doesNotMatch(text, /steps\.(device_arm64|sim_arm64|sim_amd64)\./);
+    assert.doesNotMatch(text, /steps\.(device_arm64|sim_arm64)\./);
   }
   const selectedCount = statuses => {
     const ready = prerequisites.every(id => statuses[id] === 'success');
     return nativeConditions.filter(text => ready && text.includes('steps.shared_ready')).length;
   };
   const success = Object.fromEntries(prerequisites.map(id => [id, 'success']));
-  assert.equal(selectedCount(success), 3);
+  assert.equal(selectedCount(success), 2);
   for (const id of prerequisites) {
     for (const state of ['failure', 'skipped', 'cancelled']) {
       assert.equal(selectedCount({ ...success, [id]: state }), 0);
     }
   }
-  assert.equal(selectedCount({ ...success, device_arm64: 'failure' }), 3);
+  assert.equal(selectedCount({ ...success, device_arm64: 'failure' }), 2);
 });
 
 test('one native host rejects mismatched tools before setup without carrier transport', () => {

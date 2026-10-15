@@ -1,3 +1,4 @@
+import { prepareRuleAppend } from '@/lib/use-rule-append';
 import { useQualifiedLatencies } from '../use-qualified-latencies';
 import { requestIOSMeasurementConsent } from '../MeasurementStartNotice';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
@@ -74,7 +75,6 @@ import {
 import { ruleSubjectForValue, ruleTypeNameKey, type RuleSubject } from '@/domain/rules';
 import {
   analyzeRuleCoverage,
-  appendSubjectToRule,
   isShadowedTarget,
   matchAppendTargets,
   ruleAppendTargets,
@@ -732,8 +732,7 @@ export function MobileHomeScreen(): ReactElement {
       const subject = ruleSubject;
       if (subject === null) return;
       void runWrite('rule-add', async () => {
-        const base = rules.find((rule) => rule.id === target.ruleId) ?? null;
-        const next = base === null ? null : appendSubjectToRule(base, target, subject);
+        const { base, next, stagingNow: stagingEnabled } = prepareRuleAppend(target, subject);
         if (next === null) throw new Error(t('rules.appendFail'));
         const label = next.remarks?.trim() || t(ruleTypeNameKey(next.type));
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
@@ -745,7 +744,7 @@ export function MobileHomeScreen(): ReactElement {
             nextValue: next,
           });
         } else {
-          await api.rules.update(next, 'route');
+          await api.rules.update(next, 'route', base);
           void loadConfig(true);
         }
       }).then(() => {

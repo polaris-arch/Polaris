@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 
 #[test]
 fn labels_are_closed_and_unknown_names_are_not_emitted() {

@@ -2021,7 +2021,6 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
 				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -2102,13 +2101,12 @@
 					"@executable_path/Frameworks",
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.app;
 				PRODUCT_NAME = "Polaris";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
-				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 			};
 			name = debug;
 		};
@@ -2180,8 +2178,11 @@
 		BE511D40453904F4CF76CE66 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				VALID_ARCHS = arm64;
-				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				LD_GENERATE_MAP_FILE = YES;
 				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
@@ -2208,8 +2209,11 @@
 		DE54A0F0E14E3A71E2B7BBEA /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				VALID_ARCHS = arm64;
-				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				LD_GENERATE_MAP_FILE = YES;
 				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
@@ -2313,13 +2317,12 @@
 					"@executable_path/Frameworks",
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.app;
 				PRODUCT_NAME = "Polaris";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
-				"VALID_ARCHS[sdk=iphonesimulator*]" = "arm64 x86_64";
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 			};
 			name = release;
 		};

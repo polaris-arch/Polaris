@@ -26,10 +26,16 @@ Formal binding plans are explicit:
   requirement, Java17 and pinned r30-beta3 NDK. The producer uses a private SDK
   view containing only that NDK; ambient installed NDK28 cannot win a fallback
   lookup. It does not invoke the helper that also builds API21/no-Naive legacy.
-- Apple: only `ios/arm64, iossimulator/arm64, iossimulator/amd64`, static
-  XCFramework, library deployment minimum15 and App minimum17. No default
-  macOS/tvOS targets. Actual selected Xcode/SDK/compiler identities must be
-  collected before execution and checked by the eventual producer.
+- Apple: exactly `ios/arm64, iossimulator/arm64`, one static XCFramework
+  with exactly two libraries: iOS device (no variant) and iOS simulator
+  (`simulator` variant), each containing only arm64. The observation slice keys
+  are `ios-arm64` and `ios-arm64-simulator`; each `LibraryIdentifier` must be a
+  safe basename, without requiring those exact directory names. The finite App
+  slots are `device-arm64` and `sim-arm64`.
+  Library deployment minimum15 and App minimum17 remain distinct. Intel
+  simulator, macOS and tvOS are outside the formal target set. Xcode **27.1**,
+  build **27A9275**, and both iOS/Simulator SDKs **27.1** are mandatory; actual
+  selected compiler/SDK identities are checked without version fallback.
 - Tags are copied from the actual source-owned libbox declaration, including
   gvisor, Naive, Tailscale and Apple-only DHCP/low-memory flags. The Go module
   remains `github.com/sagernet/sing-box`; only outer assets use `polaris-box-*`.
@@ -57,8 +63,15 @@ exclusive producer lease. Tests are authored in `test_inputs.py` and unexecuted.
 The explicit planning entry is `bash scripts/plan-mobile-core.sh android` or
 `apple`, followed by `--source`, `--gomobile`, `--output`, and Android's
 `--bootclasspath`. Supply the existing exact source checkout and isolated tool
-paths. Planning does not resolve or download an SDK. Existing legacy build entry
-bytes are kept intact so old frozen receipt/script identities remain resolvable.
+paths. Planning does not resolve or download an SDK. The legacy Apple
+`ios-libbox.py build` entry, including `--historical` and `--component --phase
+assemble/publish`, is retired and refuses before reading source, policy or tools
+or creating output. Its `build-libbox-ios.sh` wrapper reaches the same refusal.
+The existing historical `verify` / `check-inputs` and explicit C2/C3 diagnostic
+entries remain available within their original evidence scopes. Historical
+policies and raw receipts are never rewritten or relabeled; the verifier keeps
+the old build-only pins and the fixed pre-retirement b66 historical-only
+producer pin, rather than treating the retired driver as a new producer.
 
 The formal producer entry is now `bash scripts/build-mobile-core.sh android`
 or `apple`, with required `--source`, `--go`, `--gomobile`, `--gobind`, `--work`
@@ -78,7 +91,7 @@ init` is never invoked because v0.1.13 would install gobind@latest.
 `artifacts.py` is the shared fresh/cache predicate: four exact Android ABIs,
 API24 ident notes, 16KiB PT_LOAD, actual dynamic runtime/JNI exports, generated
 Java API, original Go BuildInfo/module/replacement/BuildID; Apple has exactly
-three static architecture slices, bounded ar/Mach-O parsing, safe framework
+two arm64 platform slices, bounded ar/Mach-O parsing, safe framework
 internal links, generated Objective-C API and real deployment/platform facts.
 `-x -work` preserves actual compiler objects and logs. `native_inputs.py` records
 those byte identities plus original external static archives, and maps every
@@ -86,6 +99,13 @@ non-Go Apple archive member to actual compiler/runtime origins with multiplicity
 Cache hits reread original native inputs, original log and the complete output.
 A changed producer commit can reuse identical producer code/tools while keeping
 the original component receipt's candidate and BuildID unchanged.
+Apple cache identity includes the exact arm64-only target set in the source/tool
+fingerprints and cache namespace. A historical three-target cache is not a
+fallback or migration source for this contract. Its receipt and native-input
+bytes remain original; formal consumption requires the exact current two-target
+inventory, including rejection of an extra Intel simulator entry or member.
+Device arm64 and simulator arm64 are separate platform identities even though
+the CPU is the same.
 Before that input is frozen, exact remote module versions already covered by
 the source `go.sum` are admitted into the same module cache if their directories
 are missing. Go1.25.5's `go list -m -json` reports those directories according to
@@ -153,9 +173,9 @@ Apple's explicit uniform Mac entry is `python3 -B
 scripts/mobile-core/build_apple_app.py` with the same source/tool/slot arguments.
 It builds/revalidates the static SDK, freezes an App-specific link context, runs
 the pure measurement-state Swift controls, and compiles/archives App and
-PacketTunnel. `--simulator` selects a simulator link probe (`--simulator-arch`
-arm64 or amd64); omit it for the unsigned device compile/link probe, or supply an
-explicit `--signing-team` for that team's signing observation. Xcode's extension
+PacketTunnel. `--simulator` selects the arm64 simulator link probe
+(`--simulator-arch arm64` only); omit it for the unsigned device compile/link
+probe, or supply an explicit `--signing-team` for that team's signing observation. Xcode's extension
 pre-link hook verifies the exact link-context SHA and original static input.
 `carriers.py` checks final Go carrier/module/BuildID, the actual original or
 byte-equal DerivedData static archive and generated headers, linker-map member
@@ -173,8 +193,8 @@ fails without fallback on any other build or SDK. This SDK
 declares the viewport's iOS27.1 APIs; their runtime availability guards and the
 iOS17.0 App deployment target remain. Its one fixed `~/Code/polaris-mobile-apple-ci`
 root has one component slot, one cache (20GiB maximum including a shared Rust
-target), and the three
-finite device-arm64/sim-arm64/sim-amd64 App slots, built sequentially under the
+target), and the two finite device-arm64/sim-arm64 App slots, built sequentially
+under the
 existing 16GiB peak/1GiB margin reservation and cache lease. No signing secrets,
 simulator boot, device deployment or mobile publication are part of that graph.
 The hosted preview advertises 14GiB storage; actual free space must still pass
@@ -182,7 +202,7 @@ the unchanged 16GiB peak plus 1GiB margin admission. A smaller/unavailable runne
 is an environment failure, never grounds to weaken the reservation or skip a
 selected leg. The eventual unified run must establish actual runner resources.
 
-The component and all three carriers now run in the same admitted hosted job.
+The shared component and both carrier legs run in the same admitted hosted job.
 The official selected RC rollout must finish before dispatch; early admission
 does not pin a rolling hosted image. The local-import adapter reuses the frozen
 component and the existing complete original-source/compiler/SDK byte verifier,
@@ -195,7 +215,8 @@ Each slot exports create-new summary files under summaries/<slot>. Its original
 linked Rust archive is copied and checked before another arm64 platform can
 replace staging; success and failure originals have distinct slot ZIP names.
 A failed slot does not suppress the remaining selected slots, and the final
-aggregate still requires all three exact same-run/source/component results.
+aggregate still requires both exact same-run/source/component results, including
+actual final App/PacketTunnel verification for each platform.
 Shared component uploads, protobuf setup, cache setup and local verification
 must all succeed before any carrier is selected; a carrier failure does not
 change that shared readiness for later slots. Slot ZIPs retain the independent
@@ -305,17 +326,18 @@ It does not require a running Tauri CLI options server or regenerate tracked
 PBX/Cargo files. The original CLI development hook remains. The release wire
 check consumes a receipt-bound thin archive selected from the fully inspected
 original container by the actual Cargo CPU and iOS/device or simulator platform.
-The original bind log records a single-input device `lipo -create` and a
-two-input simulator merge; the failed run retained no staging binary, so its
-actual fat count remains unobserved. The parser admits the format's one-entry
-wrapper only under the exact device inventory, and validates each header against
-every code member, while the formal consumer requires the exact Info.plist
-device arm64 and simulator arm64+x86_64 inventories and all three final targets.
-For the fat simulator SDK it independently selects arm64 or x86_64, retains the
-original archive pin plus exact offset/length and thin bytes, and rechecks them
-before Xcode link. The Rust release guard validates every code member's Cargo
-CPU/subtype and platform before scanning that selected archive's descriptor;
-a whole fat input is rejected. Original component/producer bytes are unchanged. SDK origins, real Rust input, final carriers, link maps and original
+The formal consumer requires exactly two Info.plist entries: device arm64 and
+simulator arm64, each with one arm64 architecture. The bounded parser can retain
+its structural handling of thin archives and supported one-entry fat wrappers;
+that capability does not authorize a multi-architecture simulator component.
+The target-specific extraction retains the original archive pin plus exact
+offset/length and thin bytes, and rechecks them before Xcode link. The Rust
+release guard validates every code member's Cargo CPU/subtype and platform
+before scanning that selected archive's descriptor; a whole fat input is
+rejected at that boundary. Sharing the arm64 CPU never makes device and
+simulator archives interchangeable. Earlier two-input simulator merge logs and
+three-target receipts remain historical evidence only, without new acceptance.
+SDK origins, real Rust input, final carriers, link maps and original
 logs are retained in one indexed evidence ZIP; entire caches/checkout/target
 copies are excluded. Failed chains retain partial evidence without acceptance,
 including actual unaccepted staging frameworks when inspection failed before
@@ -343,10 +365,13 @@ The carrier parser bounds its single nonempty MH_EXECUTE payload inside one
 `__LINKEDIT` segment and disjoint from sections/other tables, retaining an
 opaque payload SHA256 and `trustValidated=false`. It does not interpret the
 CodeDirectory, calculate CDHash, validate a signer or assert signature trust.
-The new structural controls are not actual device/x64-simulator carrier builds.
+These structural controls do not substitute for actual device-arm64 and
+sim-arm64 final carrier verification. Historical Intel simulator observations
+are outside the current contract.
 
-`scripts/libbox-patches` and the old Apple six-patch entry remain historical
-alpha8 compatibility inputs. Their raw receipts are not relabeled; the small
+`scripts/libbox-patches` and the old Apple six-patch declarations remain
+historical alpha8 compatibility inputs; their production build entry is retired.
+Their raw receipts are not relabeled; the small
 `historical-ci-fragments.json` pins only retired caller fragments for existing
 negative tests. New formal source controls live in `test_inputs.py` and
 `test_outputs.py` and enter the existing host Node gate through

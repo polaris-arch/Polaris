@@ -793,27 +793,26 @@
     }
   },
   "sourceCompatibility": {
-    "method": "Source-only current graph observation. Original actual serializer/export states and producer provenance retained; serializer/command sources remain byte-exact. Three changed lifecycle-control callers and the controlled-clock facade test do not regenerate the original exported states. No new export run claimed.",
+    "method": "Source-only comparison of all nine source files against the original producer hashes. Original producer and actual exported states are retained unchanged. Observer publication and lifecycle ownership behavior have changed; this is not a current serializer execution or a claim that the current graph reproduces these historical states. Re-export and comparison on the final combined CI commit remain required.",
     "sourceSha256": {
-      "src-tauri/src/runtime/proxy/coex_observer.rs": "fcb6b5da4966184b0f5f9b5065f1d09a453446f95a77b9c50bfb329965b05ca1",
+      "src-tauri/src/runtime/proxy/coex_observer.rs": "f3590eadebb44c3fc7f83aad3e2b645636b4751283cfe02c3df918353d6661b3",
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "ac87a23f5ca82b17322c7ac22dd4014be2906d743fa1d3b9e8e8ec48ae70eb45",
-      "src-tauri/src/runtime/proxy.rs": "162c9ca316c926467bd61a4abe7568b22306de2c039884ad3d3db7258aea3f7f",
-      "src-tauri/src/runtime/proxy/lifecycle.rs": "c7f2777ac3713c4bcb3cb8aa20b373f3af547709ae063d0bc57a57b2f8fe75d5",
-      "src-tauri/src/runtime/proxy/startup.rs": "7652243e0a6291388f386951e7f16875890a967f6f6ac08aeb15e4d9549cbe54",
+      "src-tauri/src/runtime/proxy.rs": "5373aba523f8f1ad954a594c6c9ffbebe6e3432eb2a4dbbc481cbfc165030b1e",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "30b7254f58ea0fc40f005b48673bd1510582bd837d6b07cecdfc214480399456",
+      "src-tauri/src/runtime/proxy/startup.rs": "fbd1b4dd27b06dc1e183a0df56461057053c39e59b2ea95c421f895950cef32b",
       "src-tauri/src/runtime/proxy/hot_switch.rs": "6edfcebd745765fa1c3ff52b45bcea2432f7e780e95506f62650aed2cf64e4dc",
       "src-tauri/src/runtime/proxy/recovery.rs": "114bfa398e3c2bbf93b46c6b352ce6f63c424dfa1720b685b66b7190626e028d",
       "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",
       "src-tauri/src/commands/coexistence_snapshot.rs": "8415766265c51972da7aac5cc38fd17811703c64dd2fe9f8e439955752455a4b"
     },
     "unchangedOriginalSources": [
-      "src-tauri/src/runtime/proxy/coex_observer.rs",
-      "src-tauri/src/runtime/proxy/lifecycle.rs",
       "src-tauri/src/runtime/proxy/recovery.rs",
       "src-tauri/src/runtime/proxy/network_monitor.rs",
       "src-tauri/src/commands/coexistence_snapshot.rs"
     ],
     "changedControlSources": [
       "src-tauri/src/runtime/proxy.rs",
+      "src-tauri/src/runtime/proxy/lifecycle.rs",
       "src-tauri/src/runtime/proxy/startup.rs",
       "src-tauri/src/runtime/proxy/hot_switch.rs"
     ],
@@ -821,6 +820,21 @@
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs"
     ],
     "originalStatesCanonicalSha256": "285de8e6e9ff31d6a499e4e606f36661d8bda0a2b0866c3c13c06e52cf63d874",
-    "newSerializerExecution": false
+    "newSerializerExecution": false,
+    "changedObserverSources": [
+      "src-tauri/src/runtime/proxy/coex_observer.rs"
+    ],
+    "currentStatesReexported": false,
+    "sourceReview": {
+      "src-tauri/src/runtime/proxy/coex_observer.rs": "Observer behavior changed: claim is split into prepare_claim and publish_claim; generation/revision ownership fences prevent older claims and publications. State wire projection remains source-identical, but current sequence/concurrency behavior is not proven by historical states.",
+      "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "Controlled-clock facade test now holds the next sample until stale is observed and then checks latest. The original_hook_ready_drives_worker_event_and_state export entry itself is source-identical; it has not been rerun for this candidate.",
+      "src-tauri/src/runtime/proxy.rs": "Runtime control graph changed: owned stop context/types, measurement identity state and test hooks accompany lifecycle/startup changes. This is not an unchanged facade.",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "Lifecycle behavior changed: generation/apply attribution, expected-stop admission, split coex claim publication, and confirmed takeover cleanup. Historical output does not establish current race or terminal publication correctness.",
+      "src-tauri/src/runtime/proxy/startup.rs": "Startup control changed: protected-core reconciliation and helper birth custody, measurement identity, owned stop context, and N1 block-sentinel exit attestation. Hash includes the frozen N1 after source.",
+      "src-tauri/src/runtime/proxy/hot_switch.rs": "Hot-switch running-input graph adds measurement_fingerprints and derives them from the current user config; no new runtime export was executed.",
+      "src-tauri/src/runtime/proxy/recovery.rs": "Byte-identical to original producer recovery source.",
+      "src-tauri/src/runtime/proxy/network_monitor.rs": "Byte-identical to original producer network-monitor source.",
+      "src-tauri/src/commands/coexistence_snapshot.rs": "Byte-identical to original producer coexistence snapshot command source."
+    }
   }
 }

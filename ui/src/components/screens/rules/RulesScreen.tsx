@@ -1,3 +1,4 @@
+import { configCanonicalText } from '@/lib/staged-config';
 /**
  * RulesScreen —— 自定义规则屏（1:1 提取自原型 polaris-prototype.html L1869-1919 #s-rules）。
  *
@@ -417,7 +418,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
    */
   const requestDelete = useCallback(
     (rule: Rule) => {
-      confirmTwice(`${RULE_DEL_PREFIX}${rule.id}`, () => {
+      confirmTwice(`${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`, () => {
         void (async () => {
           try {
             await deleteRule(rule);
@@ -430,7 +431,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         })();
       });
     },
-    [confirmTwice, deleteRule, t],
+    [confirmTwice, deleteRule, t, plane],
   );
 
   const handleRegionChange = useCallback(
@@ -762,7 +763,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
                   onEdit={(r) => openDialog({ kind: 'rule', ruleId: r.id, initialPlane: plane })}
                   onDuplicate={handleDuplicate}
                   onDelete={requestDelete}
-                  deleteConfirming={armed === `${RULE_DEL_PREFIX}${rule.id}`}
+                  deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}
                   onDragStart={(r) => setDragId(r.id)}
                   onDragOver={(_, e) => e.preventDefault()}
                   onDrop={handleDrop}

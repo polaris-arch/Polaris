@@ -25,11 +25,17 @@
  *  - `WgDialog` 真实的运行时取值：该模块在 node 环境 import 即炸（`document is not defined`，
  *    模块加载期就有依赖碰 DOM），所以 `wgSpec()` 的返回值测不到。下面第二组用源码结构门钉职责边界。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { FieldRenderer, type FieldSpec } from './FieldSpec';
+
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(),
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+await (await import('@/i18n')).i18nReady;
 
 const SPEC: FieldSpec = {
   t: 'switch',
@@ -39,7 +45,7 @@ const SPEC: FieldSpec = {
   disabledHint: 'wg.reverseMeshWarp',
 };
 
-/** i18n 未初始化时返回键名；本组只验证结构切换，译文完整性由 i18n coverage 负责。 */
+/** 确定性 t 返回键名；不依赖全局 i18n 是否已初始化，译文完整性由 i18n coverage 负责。 */
 const render = (spec: FieldSpec, value: unknown = false) =>
   renderToStaticMarkup(<FieldRenderer spec={spec} value={value as never} onChange={() => {}} />);
 

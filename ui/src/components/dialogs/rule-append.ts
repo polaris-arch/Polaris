@@ -6,6 +6,7 @@
  * 最终却仍写成域名规则。
  */
 import type { Rule, RuleCondition, RuleType } from '@/contracts/types';
+import { configCanonicalText } from '@/lib/staged-config';
 import {
   RULE_TYPE_IDS,
   RULE_TYPES,
@@ -40,6 +41,7 @@ export type AppendBlock = 'contains' | 'andMode' | 'valueUnfit';
 /** 一个“往哪条规则的哪个条件里追加”的目标；每条规则至少产生一项。 */
 export interface RuleAppendTarget {
   readonly ruleId: string;
+  readonly snapshot: Rule;
   readonly ruleIndex: number;
   readonly remarks: string;
   readonly enabled: boolean;
@@ -83,6 +85,7 @@ export function ruleAppendTargets(
       .map((term) => term.toLowerCase());
     const base = {
       ruleId: rule.id,
+      snapshot: rule,
       ruleIndex,
       remarks,
       enabled: rule.enabled === true,
@@ -160,7 +163,8 @@ export function appendSubjectToRule(
   subject: RuleSubject,
 ): Rule | null {
   const value = subject.value.trim();
-  if (!value || base.id !== target.ruleId || target.block !== null) return null;
+  if (!value || base.id !== target.ruleId || target.block !== null ||
+      configCanonicalText(base) !== configCanonicalText(target.snapshot)) return null;
   const conds = ruleConditions(base).filter((cond): cond is RuleCondition => !!cond);
   const appendable = new Set(appendableRuleTypes(subject));
   if (!validateRuleValue(target.type, value)) return null;

@@ -250,7 +250,7 @@ export default function PendingChangesBar() {
     applyRequest.current = request;
     setApply(initial);
     try {
-      if (!lifecycleReady.current) throw new Error('Lifecycle listener unavailable');
+      if (!lifecycleReady.current) throw new Error('APPLY_LIFECYCLE_LISTENER_UNAVAILABLE');
       await lifecycleReady.current;
       if (applyRequest.current !== request) return;
       const result = await useStagedConfigStore.getState().applyNow();

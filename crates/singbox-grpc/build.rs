@@ -11,7 +11,7 @@ include!("apple_wire_check.rs");
 
 // 符号表与 vendored proto 原文均取自 `proto_wire_check`（此前 build.rs / tests 各存一份，
 // 两处注释都写着「一处漏加，另一处就白守」；运行期换核检查要用第三次，故下沉共用）。
-use proto_wire_check::{CHECKED_SYMBOLS, PROTO_SRC};
+use proto_wire_check::WireVerdict;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_proto_matches_bundled_core();
@@ -138,12 +138,21 @@ fn assert_proto_matches_bundled_core() {
     }
 
     for (_, core) in &survey.present {
-        for (kind, name) in CHECKED_SYMBOLS {
-            if let Err(report) =
-                proto_wire_check::check_core_against_proto(core, PROTO_SRC, *kind, name)
-            {
-                panic!("{report}");
-            }
+        let bytes = std::fs::read(core)
+            .unwrap_or_else(|error| panic!("读不到随包核 {}：{error}", core.display()));
+        // Unlike optional runtime replacement, packaging must fail closed when
+        // evidence is missing. Parse each core once for the entire shared table.
+        match proto_wire_check::verdict_for_core_bytes(&bytes) {
+            WireVerdict::Match => {}
+            WireVerdict::Mismatch(report) => panic!(
+                "vendored proto 与随包内核的 wire 契约不一致：{}\n{report}\n\
+                 修复：以随包核的 descriptor 为准改 crates/singbox-grpc/proto/started_service.proto",
+                core.display()
+            ),
+            WireVerdict::Unobservable(report) => panic!(
+                "无法验证随包内核 wire 契约，拒绝出包：{}：{report}",
+                core.display()
+            ),
         }
     }
 }

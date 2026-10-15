@@ -14,6 +14,16 @@ use polaris_config_engine::user_config::{all_presets_dto, validate_rule};
 /// 规则兜底校验失败错误码（上游 `assertValidRule`）。前端据此把「规则非法」与「保存失败」分流：
 /// 前者提示用户改表单、不重试；后者是 IO/写盘失败、可重试。D4 提交门权威即 add/update 的本校验。
 const ERR_RULE_INVALID: &str = "RULE_INVALID";
+const ERR_RULE_CONFLICT: &str = "RULE_CONFLICT";
+
+/// Guard only the selected entity, not unrelated rules or collection ordering.
+/// Called under the ConfigManager writer fence against its effective snapshot.
+fn expected_rule_matches(current: &Value, expected: Option<&Value>, required: bool) -> bool {
+    match expected {
+        Some(value) => value.is_object() && value == current,
+        None => !required,
+    }
+}
 
 /// 服务端权威规则校验（上游 `validateRule`）：结构须能反序列化为 `Rule`，且每个条件有 ≥1 个
 /// 非空值、全部值按类型合法。成功 `Ok(())`；失败返错误串（分号连接各条件错误），调用方包 `RULE_INVALID` 信封。
@@ -191,6 +201,8 @@ pub fn rules_update(
     state: State<'_, AppRuntime>,
     rule: Value,
     plane: String,
+    expected_rule: Option<Value>,
+    require_expected: Option<bool>,
 ) -> ApiResponse<()> {
     let (collection_key, order_key) = match plane_keys(&plane) {
         Ok(keys) => keys,
@@ -219,6 +231,9 @@ pub fn rules_update(
         else {
             return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
         };
+        if !expected_rule_matches(&rules[idx], expected_rule.as_ref(), require_expected.unwrap_or(false)) {
+            return Decision::Skip(Err(("Rule changed; reopen and retry".to_string(), Some(ERR_RULE_CONFLICT))));
+        }
         rules[idx] = rule;
         sync_plane_order(cfg, order_key, &rules);
         write_plane_rules(cfg, collection_key, rules);
@@ -246,6 +261,8 @@ pub fn rules_delete(
     state: State<'_, AppRuntime>,
     rule_id: String,
     plane: String,
+    expected_rule: Option<Value>,
+    require_expected: Option<bool>,
 ) -> ApiResponse<()> {
     let (collection_key, order_key) = match plane_keys(&plane) {
         Ok(keys) => keys,
@@ -259,6 +276,9 @@ pub fn rules_delete(
         else {
             return Decision::Skip(Err(format!("Rule not found: {rule_id}")));
         };
+        if !expected_rule_matches(&rules[idx], expected_rule.as_ref(), require_expected.unwrap_or(false)) {
+            return Decision::Skip(Err("Rule changed; reopen and retry".to_string()));
+        }
         rules.remove(idx);
         sync_plane_order(cfg, order_key, &rules);
         write_plane_rules(cfg, collection_key, rules);
@@ -268,7 +288,7 @@ pub fn rules_delete(
             broadcast_config_changed(&app, &cfg);
             ok_void()
         }
-        Ok((Err(error), None)) => ApiResponse::err(error),
+        Ok((Err(error), None)) => ApiResponse::err_with_code(error, ERR_RULE_CONFLICT),
         Ok(_) => unreachable!("rules_delete decision and persistence must agree"),
         Err(e) => ApiResponse::err(format!("{e}")),
     }

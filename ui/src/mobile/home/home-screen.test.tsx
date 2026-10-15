@@ -318,6 +318,7 @@ const SUBJECT_VM: HomeScreenViewProps['ruleSubject'] = {
 /** 「合并进已有规则」的一行候选（可追加，非影子，规则启用中）。 */
 const appendRow = (over: Partial<RuleAppendTarget> = {}): AppendTargetVM => ({
   target: {
+    snapshot: { id: 'r1', type: 'domain', values: ['netflix.com'], action: 'proxy', enabled: true, remarks: '流媒体解锁' },
     ruleId: 'r1',
     ruleIndex: 0,
     remarks: '流媒体解锁',

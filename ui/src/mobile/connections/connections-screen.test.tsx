@@ -1588,7 +1588,7 @@ describe('⑫ 批 13：加规则 / 可折叠分组 / 旧日志三格', () => {
     expect(body, '那一行没有 onSelect ⇒ 点开什么都不发生').toContain('onSelect:');
     // 两颗动作各自兑现：新建 → 表单层（带预设）；加入已有 → 选择器 → 追加腿。
     expect(WIRING).toContain("openMobileForm({ kind: 'rule', preset:");
-    expect(WIRING).toContain("await api.rules.update(next, 'route');");
+    expect(WIRING).toContain("await api.rules.update(next, 'route', base);");
     // 判据整层复用，不在本屏重写一份。
     expect(WIRING).toContain("from '@/components/dialogs/rule-append'");
     expect(WIRING, '那句「表单层还没有」的理由已经不成立，却还在渲染').not.toContain(

@@ -1,6 +1,6 @@
 //! Test-only observations of the original mutation File and matching descriptors.
 //! No unlock, duplicate, flag change, subprocess, retry or lock-policy decision.
-use super::{File, LockObservation};
+use super::LockObservation;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
@@ -214,7 +214,7 @@ pub(super) fn snapshot(wanted: &LockObservation) -> Snapshot {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
-    use std::fs;
+    use std::fs::{self, File};
     use std::io::{self, Read};
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;

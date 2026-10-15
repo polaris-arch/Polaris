@@ -32,6 +32,7 @@ export interface ListEditorProps {
   importLabel?: string;
   /** 上限（如 dns-custom 最多 1 个）；超过禁用添加按钮 */
   max?: number;
+  entryIdentity?: (value: string) => string;
   /** 是否使用等宽字体（默认 true，对齐 .input.mono） */
   mono?: boolean;
   /** 额外挂在 .cidr-list 根上的 class（如 race-custom） */
@@ -58,6 +59,7 @@ export function ListEditor({
   addLabel = 'Add',
   importLabel = 'Bulk import',
   max,
+  entryIdentity,
   mono = true,
   className,
   id,
@@ -111,7 +113,7 @@ export function ListEditor({
   }
 
   function applyImport() {
-    commit(parseBulkEntries(importDraft, [...draft], max));
+    commit(parseBulkEntries(importDraft, [...draft], max, entryIdentity));
     setImportDraft('');
     setImportOpen(false);
   }

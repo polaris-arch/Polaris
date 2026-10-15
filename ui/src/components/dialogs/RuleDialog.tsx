@@ -1,3 +1,4 @@
+import { configCanonicalText } from '@/lib/staged-config';
 import { formatConditionValues } from './rule-cond';
 /**
  * RuleDialog —— 自定义规则增删改弹窗（第二复杂表单，原型 #rule-dialog :2722）。
@@ -291,9 +292,10 @@ function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', pl
    * 三条腿（撤销条目 / 暂存删除条目 / 直落盘）全在 `useRuleDelete` 里，与列表行内那颗垃圾桶共用；
    * 本处只留两件弹窗自己的事：成功即关窗、失败发一条右下角 toast（不关窗，让用户看得见原因）。
    */
+  const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`;
   const requestDelete = () => {
     if (!base) return;
-    confirmTwice(RULE_DEL_KEY, () => {
+    confirmTwice(deleteIntentKey, () => {
       void (async () => {
         try {
           await deleteRule(base);
@@ -347,11 +349,11 @@ function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', pl
           {isEdit && (
             <button
               type="button"
-              className={cn('btn ghost', armed === RULE_DEL_KEY && 'confirming')}
+              className={cn('btn ghost', armed === deleteIntentKey && 'confirming')}
               style={{ marginRight: 'auto', color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
               onClick={requestDelete}
             >
-              {armed === RULE_DEL_KEY
+              {armed === deleteIntentKey
                 ? t('rules.deleteConfirmAgain')
                 : t('rules.delete')}
             </button>

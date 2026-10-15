@@ -1,6 +1,6 @@
 name: Apple unsigned App and PacketTunnel
 
-# One admitted host produces the component once and consumes all three slots.
+# One admitted host produces the component once and consumes both arm64 slots.
 # Keep exact tools, per-slot originals/exports, and strict complete-slot aggregation.
 on:
   workflow_call:
@@ -47,8 +47,8 @@ jobs:
           node-version: '26'
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-      - name: Exact tool/source and three-slot resolved configuration admission
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Exact tool/source and two-slot arm64 resolved configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
       - name: Scoped frontend tool
         shell: bash
@@ -65,7 +65,7 @@ jobs:
           restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
-      - name: Frontend resources and three-slice component produced once
+      - name: Frontend resources and two-slice arm64 component produced once
         id: shared_component
         run: python3 -B scripts/mobile-core/ci_apple.py build
       - uses: actions/upload-artifact@v7
@@ -110,7 +110,7 @@ jobs:
         id: rust_cache
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
         with:
-          key: apple-whole-host-xcode27.1-27A9275
+          key: apple-whole-host-arm64-only-xcode27.1-27A9275
           workspaces: . -> ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/cache/rust-target
 
       - name: Require all shared carrier prerequisites
@@ -170,32 +170,6 @@ jobs:
         if: ${{ !cancelled() && steps.original_sim_arm64.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "sim-arm64"
 
-      - name: Real sim-amd64 Rust and unsigned App plus PacketTunnel
-        id: sim_amd64
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py carrier --slot "sim-amd64"
-      - name: Preserve sim-amd64 originals before another target touches staging
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py evidence --slot "sim-amd64"
-      - uses: actions/upload-artifact@v7
-        id: original_sim_amd64
-        if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
-        with:
-          name: apple-carrier-original-sim-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/apple-original-sim-amd64-evidence.zip
-          if-no-files-found: error
-          retention-days: 7
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.sim_amd64.conclusion == 'success' }}
-        with:
-          name: apple-carrier-summary-sim-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.POLARIS_FORMAL_APPLE_ROOT }}/summaries/sim-amd64/
-          if-no-files-found: error
-          retention-days: 7
-      - name: Retire sim-amd64 rebuildable intermediates after original upload
-        if: ${{ !cancelled() && steps.original_sim_amd64.conclusion == 'success' }}
-        run: python3 -B scripts/mobile-core/ci_apple.py retire-slot --slot "sim-amd64"
-
       - name: Preserve same-host retirement observations
         uses: actions/upload-artifact@v7
         if: ${{ !cancelled() && steps.shared_ready.conclusion == 'success' }}
@@ -226,10 +200,6 @@ jobs:
         with:
           name: apple-carrier-summary-sim-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/apple-chain/sim-arm64
-      - uses: actions/download-artifact@v8
-        with:
-          name: apple-carrier-summary-sim-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/apple-chain/sim-amd64
       - name: Strict complete-slot same-run candidate/source/component aggregate
         run: python3 -B scripts/mobile-core/ci_apple.py aggregate --summaries "$RUNNER_TEMP/apple-chain" --output "$RUNNER_TEMP/apple-chain.json"
       - uses: actions/upload-artifact@v7

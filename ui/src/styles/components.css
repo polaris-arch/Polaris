@@ -1133,6 +1133,7 @@
 .cidr-eff-list{ list-style:none; margin:6px 0 0; padding:0; display:flex; flex-direction:column; gap:2px; }
 .cidr-eff-list li{ font-size:11.5px; color:hsl(var(--fg-dim)); }
 :root[data-os="lin"] .plat-warn{ display:flex; }
+.plat-warn.mesh-route-warning{ display:flex; }
 .webrtc-note{ display:none; margin-top:7px; font-size:11px; color:hsl(var(--warn)); }
 .webrtc-row.disabled .webrtc-note{ display:block; }
 .webrtc-row.disabled #webrtc-seg{ opacity:.42; pointer-events:none; }

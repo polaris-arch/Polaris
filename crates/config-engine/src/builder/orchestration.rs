@@ -307,20 +307,7 @@ pub fn config_generation_norm(
     sorted_rr.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
     proj.insert("ruleResources".into(), serde_json::Value::Array(sorted_rr));
 
-    // servers 投影：server_ids 过滤 + id 排序 + server_fingerprint。
-    let mut servers_proj: Vec<serde_json::Value> = config
-        .servers
-        .iter()
-        .filter(|s| server_ids.map(|ids| ids.contains(&s.id)).unwrap_or(true))
-        .map(|s| serde_json::Value::String(server_fingerprint(s)))
-        .collect();
-    servers_proj.sort_by(|a, b| {
-        // server_fingerprint 已含 id，但 Polaris 按 server.id 排序后再 fingerprint。
-        // 此处直接对 fingerprint 串排序（等价：fingerprint 内含 id，排序结果一致）。
-        a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or(""))
-    });
-    // 注意：Polaris 先按 server.id.localeCompare 排序再 map fingerprint。
-    // 为字节精确对齐，需先按 id 排序。修正：
+    // servers 投影：过滤后按 id 稳定排序，每个节点只计算一次指纹。
     let mut servers_with_id: Vec<(&str, String)> = config
         .servers
         .iter()
@@ -333,8 +320,6 @@ pub fn config_generation_norm(
         .map(|(_, fp)| serde_json::Value::String(fp))
         .collect();
     proj.insert("servers".into(), serde_json::Value::Array(servers_final));
-    // 消除未使用警告（servers_proj 被 servers_final 替代）。
-    let _ = servers_proj;
 
     stable_stringify(&serde_json::Value::Object(proj))
 }

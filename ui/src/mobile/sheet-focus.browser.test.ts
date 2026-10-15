@@ -9,7 +9,8 @@ import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { MobileSelect } from '/src/mobile/MobileSelect';
 import { MobileInfo } from '/src/mobile/MobileInfo';
-import { SelectSheetPanel, SelectSheetTrigger } from '/src/mobile/screens/rules/Primitives';
+import { ActionSheet, SelectSheetPanel, SelectSheetTrigger } from '/src/mobile/screens/rules/Primitives';
+import { RuleRow } from '/src/mobile/screens/rules/RuleRow';
 import { FormSheet } from '/src/mobile/forms/FormSheet';
 import { MobileShell } from '/src/mobile/MobileShell';
 import { MobileToaster } from '/src/mobile/MobileToaster';
@@ -29,15 +30,28 @@ const options=Array.from({length:40},(_,index)=>({id:String(index),label:'Option
 const defaults=new Set(['items']);
 const groups=[{id:'items',label:'Choices',options:options.map(option=>({value:option.id,label:option.label}))}];
 function App(){
- const [open,setOpen]=useState(false),[value,setValue]=useState('32'),[formClosed,setFormClosed]=useState(false);
+ const [open,setOpen]=useState(false),[value,setValue]=useState('32'),[formClosed,setFormClosed]=useState(false),[actionOpen,setActionOpen]=useState(false);
  return <><MobileShell active="home" onSelect={()=>{}} toastHost={<MobileToaster/>}><p>Screen fixture</p></MobileShell>{formClosed?<p>Form closed</p>:<FormSheet title="Editing fixture" closeLabel="Close form" cancelLabel="Cancel edit" submitLabel="Save" onSubmit={()=>{}} onRequestClose={()=>setFormClosed(true)}>
   <input aria-label="Fixture text" />
+  <button onClick={()=>setActionOpen(true)}>Open actions</button>
+  {actionOpen && <ActionSheet title="Rule actions" closeLabel="Close actions" onClose={()=>setActionOpen(false)} actions={[{id:'first',label:'First action'},{id:'last',label:'Last action'}]} body={<MobileInfo title="Nested explanation" summary="Nested details" details={<p>Top-layer details</p>}/>} />
   <MobileSelect aria-label="Simple choice" value={value} onChange={event=>setValue(event.currentTarget.value)}>{options.map(option=><option key={option.id} value={option.id}>{option.label}</option>)}</MobileSelect>
   <SelectSheetTrigger label="Grouped choice" value={value} options={options} open={open} onOpen={()=>setOpen(true)}/>
   <SelectSheetPanel label="Grouped choice" value={value} groups={groups} openGroupIds={defaults} open={open} onClose={()=>setOpen(false)} onSelect={id=>{setValue(id);setOpen(false);}} closeLabel="Close choice" note={<MobileInfo title="Choice explanation" summary="Short explanation" details={<p>Complete explanation</p>}/>}/>
  </FormSheet>}</>;
 }
-createRoot(document.getElementById('root')).render(<App/>);
+
+window.__reorders=[];
+function DragFixture() {
+ const [rows,setRows]=useState(['a','b','c','d']);
+ return <div id="drag-list" style={{height:400,overflow:'auto',paddingTop:100}}>{rows.map((id,index)=><RuleRow key={id}
+  rule={{id,type:'domain',values:[id+'.example'],action:'proxy',enabled:true,remarks:id}}
+  index={index} enabled plane="route" isFirst={index===0} isLast={index===3} deleteConfirming={false} sheetOpen={false}
+  t={key=>key} onOpenSheet={()=>{}} onToggle={()=>{}} onMove={()=>{}} onDuplicate={()=>{}} onDelete={()=>{}}
+  error={id==='b'?'Variable height '.repeat(20):undefined}
+  onReorder={(rule,to)=>{window.__reorders.push({id:rule.id,to});setRows(old=>{const next=old.filter(id=>id!==rule.id);next.splice(to,0,rule.id);return next;});}} />)}</div>;
+}
+createRoot(document.getElementById('root')).render(location.search.includes('drag')?<DragFixture/>:<App/>);
 `;
 let server: ViteDevServer; let browser: Browser; let origin: string;
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('shared sheet focus in real Chromium', () => {
@@ -150,4 +164,58 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('shared sheet focus in
       await page.close();
     }
   }, 30_000);
+
+  it('ActionSheet traps focus, yields Escape to nested details, and restores its trigger', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    try {
+      await page.goto(origin + '/__sheet-focus');
+      const trigger = page.getByRole('button', { name: 'Open actions', exact: true });
+      await trigger.click();
+      const sheet = page.getByRole('dialog', { name: 'Rule actions', exact: true });
+      await page.waitForFunction(() => document.querySelector('[aria-label="Rule actions"]')?.contains(document.activeElement));
+      for (let i = 0; i < 6; i++) {
+        await page.keyboard.press(i % 2 ? 'Shift+Tab' : 'Tab');
+        expect(await sheet.evaluate(el => el.contains(document.activeElement))).toBe(true);
+      }
+      await sheet.locator('.m-info-trigger').click();
+      await page.keyboard.press('Escape');
+      expect(await sheet.count()).toBe(1);
+      await page.keyboard.press('Escape');
+      await sheet.waitFor({ state: 'detached' });
+      expect(await trigger.evaluate(el => el === document.activeElement)).toBe(true);
+    } finally { await page.close(); }
+  });
+  it('pointer drag uses layout rectangles with unequal heights, edge grabs, scroll and cancellation', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    try {
+      await page.goto(origin + '/__sheet-focus?drag');
+      const rows = page.locator('#drag-list > .mr-row');
+      await rows.first().waitFor();
+      await page.locator('#drag-list').evaluate(el => { el.scrollTop = 60; });
+      const second = await rows.nth(1).boundingBox();
+      const grip = await rows.nth(0).locator('.mr-grip').boundingBox();
+      if (!second || !grip) throw new Error('missing real row geometry');
+      const x = grip.x + grip.width / 2;
+      await page.mouse.move(x, grip.y + 2); await page.mouse.down();
+      await page.waitForTimeout(350);
+      await page.mouse.move(x, second.y + second.height / 2 - 1);
+      await page.mouse.up();
+      expect(await page.evaluate(() => (window as any).__reorders)).toEqual([]);
+      const currentGrip = await rows.nth(0).locator('.mr-grip').boundingBox();
+      if (!currentGrip) throw new Error('missing grip');
+      await page.mouse.move(x, currentGrip.y + 2); await page.mouse.down();
+      await page.waitForTimeout(350);
+      await page.mouse.move(x, second.y + second.height / 2 + 2);
+      await page.mouse.up();
+      expect(await page.evaluate(() => (window as any).__reorders)).toEqual([{id:'a',to:1}]);
+      const nextGrip = await rows.nth(1).locator('.mr-grip').boundingBox();
+      if (!nextGrip) throw new Error('missing moved grip');
+      await page.mouse.move(nextGrip.x + 2, nextGrip.y + 2); await page.mouse.down();
+      await page.waitForTimeout(350);
+      await rows.nth(1).locator('.mr-grip').dispatchEvent('pointercancel');
+      await page.mouse.up();
+      expect(await page.locator('.mr-row.dragging').count()).toBe(0);
+      expect(await page.evaluate(() => (window as any).__reorders)).toEqual([{id:'a',to:1}]);
+    } finally { await page.close(); }
+  });
 });

@@ -216,3 +216,39 @@ fn traffic_rules_target_is_hot_switch_axis_and_legacy_mirror_is_ignored() {
         "effects.route.targetServerId 也必须留给 selector 热切换"
     );
 }
+
+#[test]
+fn norm_server_projection_preserves_id_order_filter_and_duplicate_order() {
+    use crate::user_config::server_config::ServerConfig;
+    let mut config = UserConfig::default();
+    config.servers = ["z", "a", "a", "m"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| ServerConfig {
+            id: id.into(),
+            name: format!("node-{index}"),
+            address: format!("192.0.2.{}", index + 1),
+            port: 443,
+            ..Default::default()
+        })
+        .collect();
+    let selected = BTreeSet::from(["a".to_owned(), "z".to_owned()]);
+    let empty = BTreeSet::new();
+    for filter in [None, Some(&selected), Some(&empty)] {
+        let mut expected: Vec<_> = config.servers.iter()
+            .filter(|server| filter.is_none_or(|ids| ids.contains(&server.id)))
+            .collect();
+        expected.sort_by(|left, right| left.id.cmp(&right.id));
+        let expected: Vec<_> = expected.into_iter().map(server_fingerprint).collect();
+        let actual: serde_json::Value =
+            serde_json::from_str(&config_generation_norm(&config, filter)).unwrap();
+        assert_eq!(actual["servers"], serde_json::json!(expected));
+    }
+    let before = config_generation_norm(&config, None);
+    config.servers[0].address = "198.51.100.1".into();
+    assert_ne!(before, config_generation_norm(&config, None));
+    config.servers.clear();
+    let actual: serde_json::Value =
+        serde_json::from_str(&config_generation_norm(&config, None)).unwrap();
+    assert_eq!(actual["servers"], serde_json::json!([]));
+}

@@ -95,8 +95,8 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
 const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   // W-a：设置页漏斗。只认对象字面量实参 —— `update(idx, next)` 那种同名的列表编辑器局部函数不是写 config。
   ['W-a', /(?<![.\w$])update\s*\(\s*\{/g],
-  // W-b：通用 config 写（版本化整份 save / 原子 patch / 实体事务 / store 包装）。
-  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
+  // W-b：config 写（版本化整份 save / 原子 patch / 实体事务 / 原子 takeover / store 包装）。
+  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities|setTakeover)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
   // W-d：专用 IPC 写腿 —— 前端发的是「加一个节点」而不是「写 servers 键」，但落盘的是同一份 config。
   [
     'W-d',
@@ -385,9 +385,9 @@ const SITES: readonly Site[] = [
   },
   {
     file: 'components/screens/home/HomeScreen.tsx',
-    callee: 'saveConfig(',
+    callee: 'api.config.setTakeover(',
     route: 'direct',
-    why: 'W-1 切节点（直连哨兵写 selectedServerId）+ W-2 系统代理接管（proxyModeType 有 OS 活态回读）；同批被 applyFakeIpTunEntry 连带纠正的 dnsConfig 是这次原子模式切换的一半，拆开暂存会让 UI 与 OS 活态分叉',
+    why: 'W-2：专用后端原子事务同时更新 proxyModeType 与 FakeIP-TUN 纠正，系统代理接管有 OS 活态回读；不能拆成暂存键。Home 已不调用 saveConfig，实际 setTakeover 写腿必须留在扫描与登记面内',
   },
   {
     file: 'components/screens/logs/LogsScreen.tsx',
@@ -983,6 +983,17 @@ const SITES: readonly Site[] = [
 const key = (s: { file: string; callee: string }) => `${s.file} | ${s.callee}`;
 
 describe('守卫自检：扫到的确实是源码（防扫空 / 过滤过头 → 断言恒真）', () => {
+  it('原子 takeover 两种 API 拼写都在写面内，读取与同名普通函数不误报', () => {
+    const writes = (source: string) => PATTERNS.flatMap(([, pattern]) =>
+      [...code(source).matchAll(pattern)].map(match => match[0].replace(/\s+/g, '')),
+    );
+    expect(writes('api.config.setTakeover(next); configApi . setTakeover(next);')).toEqual([
+      'api.config.setTakeover(', 'configApi.setTakeover(',
+    ]);
+    expect(writes('api.config.get(); configApi.getValue(key); setTakeover(next); other.setTakeover(next);')).toEqual([]);
+    expect(writes('// api.config.setTakeover(next);')).toEqual([]);
+  });
+
   it('测试文件与 api-client 定义处（barrel + ipc/api/ 目录）都被排除在扫描面外', () => {
     expect(FILES.some((p) => /\.(test|spec)\.tsx?$/.test(p))).toBe(false);
     expect(HITS.some((h) => h.file.endsWith('ipc/api-client.ts') || h.file.includes('ipc/api/'))).toBe(

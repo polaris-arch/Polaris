@@ -1,11 +1,16 @@
 """Inert controls for per-invocation original-byte reuse; no native build."""
 from collections import Counter
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
+import json
 import os
 import plistlib
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import artifacts
 import carriers
@@ -171,7 +176,7 @@ class AppleReadReuse(unittest.TestCase):
                 ('go.o', fixtures.mach_object(target, fixtures.inline('path\tsynthetic/main\nmod\tgithub.com/sagernet/sing-box\t(devel)\t\n'), expected_id)),
                 ('native.o', fixtures.mach_object(target))])
         device = single_fat_archive(archive('ios-arm64'))
-        sim = fixtures.fat(archive('ios-x86_64-simulator'), archive('ios-arm64-simulator'))
+        sim = single_fat_archive(archive('ios-arm64-simulator'))
         entries, binaries, headers = [], [], []
         symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                    'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
@@ -182,7 +187,7 @@ class AppleReadReuse(unittest.TestCase):
         header += '\n'.join('- (NSString* _Nonnull)get' + name + ';' for name in getters) + '\n@end\n'
         for identifier, variant, arches, raw in [
                 ('ios-arm64', None, ['arm64'], device),
-                ('ios-arm64_x86_64-simulator', 'simulator', ['arm64', 'x86_64'], sim)]:
+                ('ios-arm64-simulator', 'simulator', ['arm64'], sim)]:
             entry = {'LibraryIdentifier': identifier, 'LibraryPath': 'Libbox.framework',
                      'SupportedPlatform': 'ios', 'SupportedArchitectures': arches}
             if variant: entry['SupportedPlatformVariant'] = variant
@@ -207,8 +212,7 @@ class AppleReadReuse(unittest.TestCase):
             for path in binaries + headers:
                 self.assertEqual(reads[path], 2, 'first parse/pin plus final fresh boundary, not per-slice hashing')
             sim_arm = result['slices']['ios-arm64-simulator']['binary']
-            sim_intel = result['slices']['ios-x86_64-simulator']['binary']
-            self.assertEqual(sim_arm, sim_intel)
+            self.assertEqual(set(result['slices']), {'ios-arm64', 'ios-arm64-simulator'})
             self.assertEqual(sim_arm, file_pin(binaries[1]))
             inventory = {r['path']: r for r in result['inventory']}
             self.assertEqual(sim_arm, {k: inventory[binaries[1].relative_to(framework).as_posix()][k]
@@ -242,6 +246,175 @@ class AppleReadReuse(unittest.TestCase):
             with patch.object(Path, 'open', new=opened), \
                     self.assertRaisesRegex(RuntimeError, 'size changed'):
                 read_pinned(path)
+
+    @contextmanager
+    def final_carrier_fixture(self, root, target, *, sdk_version=None):
+        """Real ZIP/plist/Mach-O/linkmap predicates; source/component boundary is isolated."""
+        value = load()
+        simulator = target != 'ios-arm64'
+        arch = 'arm64'
+        if sdk_version is not None:
+            value['apple']['simulatorSDK' if simulator else 'iPhoneSDK'] = sdk_version
+        sdk = carriers.apple_version_raw(value['apple']['simulatorSDK' if simulator else 'iPhoneSDK'])
+        fixtures = module('final_native_platform_fixture', 'scripts/apple-carrier.test.py')
+        framework, binary, header, derived, selected = self.link_fixture(root)
+        current = {'candidate': 'a' * 40}
+        binding = {'producer': current, 'moduleGraph': [{'Path': value['goModule'], 'Main': True}]}
+        build_id = 'polaris-mobile-' + artifacts.receipt_digest(binding)
+        tags = set(value['apple']['tags']) | {'ios'} | ({'iossimulator'} if simulator else set())
+        raw_info = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
+        raw_info += ''.join('build\t' + key + '=' + val + '\n' for key, val in {
+            'GOOS': 'ios', 'GOARCH': arch, 'CGO_ENABLED': '1', '-buildmode': 'c-archive',
+            '-trimpath': 'true', '-tags': ','.join(sorted(tags))}.items())
+        def native_binary(role, *, load_commands=()):
+            return fixtures.mach_object(target,
+                fixtures.inline(raw_info) if role == 'extension' else None,
+                build_id if role == 'extension' else None,
+                kind=2, minimum=17 << 16, sdk=sdk, load_commands=load_commands)
+        native = {role: native_binary(role) for role in ('app', 'extension')}
+        receipt = {'input': binding, 'output': {'slices': {target: selected}}, 'fingerprint': 'b' * 64}
+        receipt_path = root / 'component-receipt.json'; receipt_path.write_text(json.dumps(receipt))
+        link = {'schema': 'polaris-mobile-apple-link-input-v1', 'staticOnly': True,
+                'App': current, 'resources': {}, 'framework': str(framework),
+                'componentFingerprint': receipt['fingerprint'], 'componentOutput': receipt['output'],
+                'componentReceiptSha256': file_pin(receipt_path)['sha256']}
+        link['fingerprint'] = artifacts.receipt_digest(link)
+        link_path = root / 'link.json'; link_path.write_text(json.dumps(link))
+        link_sha = file_pin(link_path)['sha256']
+        linkmap = root / 'linkmap.txt'
+        linkmap.write_text(self.link_text([(1, binary, 'go.o'), (2, binary, 'native.o')]))
+        app_root = 'Payload/Polaris.app/'
+        extension_root = app_root + 'PlugIns/PacketTunnel.appex/'
+        common = {'UIDeviceFamily': [1, 2], 'MinimumOSVersion': '17.0',
+                  'CFBundleSupportedPlatforms': ['iPhoneSimulator' if simulator else 'iPhoneOS'],
+                  'PolarisAppGroup': 'group.example.polaris'}
+        plists = {app_root + 'Info.plist': plistlib.dumps({**common, 'CFBundleIdentifier': 'example.polaris',
+                                                        'CFBundleExecutable': 'Polaris'}),
+                  extension_root + 'Info.plist': plistlib.dumps({**common,
+                      'CFBundleIdentifier': 'example.polaris.PacketTunnel', 'CFBundleExecutable': 'PacketTunnel',
+                      'NSExtension': {'NSExtensionPointIdentifier': 'com.apple.networkextension.packet-tunnel'}})}
+        paths = {'app': app_root + 'Polaris', 'extension': extension_root + 'PacketTunnel'}
+        ipa = root / 'final.ipa'
+        def inspect(binaries=None, info=None):
+            with zipfile.ZipFile(ipa, 'w') as package:
+                for path, raw in (plists if info is None else info).items(): package.writestr(path, raw)
+                for role, raw in (native if binaries is None else binaries).items(): package.writestr(paths[role], raw)
+            return carriers.apple(ipa, link_path, link_sha, linkmap, receipt_path, root, derived,
+                                  arch if simulator else None)
+        with patch('carriers.verify_original', return_value=receipt) as original, \
+                patch('carriers.app_identity', return_value=current), \
+                patch('carriers.apple_resources', return_value={}), patch('carriers.load', return_value=value):
+            yield {'inspect': inspect, 'native': native, 'plists': plists, 'ipa': ipa, 'original': original,
+                   'receipt': receipt, 'link': link, 'target': target, 'native_binary': native_binary}
+
+    def test_final_carrier_refuses_unsupported_arch_before_reading_any_input(self):
+        for arch in ('amd64', 'x86_64', 'armv7', '', 'ARM64'):
+            with self.subTest(arch=arch), patch('carriers.file_pin') as pin, \
+                    patch('carriers.verify_original') as original, \
+                    self.assertRaisesRegex(RuntimeError, 'only device-arm64 and sim-arm64'):
+                carriers.apple(None, None, None, None, None, None, None, arch)
+            pin.assert_not_called()
+            original.assert_not_called()
+
+    def test_final_native_admission_accepts_exact_two_slots_and_preserves_scope(self):
+        self.assertEqual(set(artifacts.APPLE), {'ios-arm64', 'ios-arm64-simulator'})
+        for target in artifacts.APPLE:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target) as fixture:
+                observed = fixture['inspect']()
+                self.assertEqual(observed['selectedTarget'], target)
+                self.assertTrue(observed['AppCarrierValidated'])
+                self.assertFalse(observed['AppAccepted'] or observed['devicePassed'] or observed['signatureTrustValidated'])
+                self.assertEqual(set(observed['binaries']), {'app', 'extension'})
+                self.assertEqual(len(observed['linkedOriginalStaticMembers']), 2)
+                for role, raw in fixture['native'].items():
+                    self.assertEqual(observed['binaries'][role]['sha256'], sha(raw))
+                fixture['original'].assert_called_once()
+
+    def test_final_app_and_extension_reject_native_only_platform_minimum_and_sdk_mutations(self):
+        parser = module('final_native_platform_parser', 'scripts/apple-carrier.py')
+        helper = module('final_native_platform_info', 'scripts/libbox-patches/android-source.py')
+        for target, (_, platform, _, _) in artifacts.APPLE.items():
+            with tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target) as fixture:
+                frozen = deepcopy((fixture['receipt'], fixture['link']))
+                for role, raw in fixture['native'].items():
+                    parsed = parser.container(raw, helper)
+                    offset = next(row['offset'] for row in parsed['loadCommands'] if row['command'] == 0x32)
+                    controls = [('platform', 8, 7 if platform == 2 else 2),
+                                ('missing', 0, 0x1b),  # Same-width LC_UUID keeps all section/Go bytes intact.
+                                ('component-minimum', 12, 15 << 16), ('higher-minimum', 12, 18 << 16),
+                                ('minimum-patch', 12, (17 << 16) | 1),
+                                ('missing-sdk', 16, 0), ('older-sdk', 16, 27 << 16),
+                                ('sdk-patch', 16, (27 << 16) | (1 << 8) | 1)]
+                    for label, field, changed in controls:
+                        mutated = bytearray(raw); struct.pack_into('<I', mutated, offset + field, changed)
+                        binaries = dict(fixture['native'], **{role: bytes(mutated)})
+                        # Confirm this control changed native metadata alone,
+                        # preserving the extension's source metadata and BuildID.
+                        self.assertEqual(parser.container(bytes(mutated), helper)['sections'], parsed['sections'])
+                        with self.subTest(target=target, role=role, mutation=label), \
+                                self.assertRaisesRegex(RuntimeError, 'actual ' + role + ' native platform/deployment/SDK differs'):
+                            fixture['inspect'](binaries)
+                        with zipfile.ZipFile(fixture['ipa']) as package:
+                            self.assertEqual({name: package.read(name) for name in fixture['plists']}, fixture['plists'])
+                    # Every rejection, including reusing this call boundary,
+                    # still goes through original component verification.
+                self.assertEqual(fixture['original'].call_count, 2 * len(controls))
+                self.assertEqual((fixture['receipt'], fixture['link']), frozen)
+
+    def test_final_app_and_extension_refuse_intel_native_bytes_with_arm64_declarations(self):
+        for target in artifacts.APPLE:
+            with tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target) as fixture:
+                for role, raw in fixture['native'].items():
+                    changed = bytearray(raw)
+                    struct.pack_into('<2I', changed, 4, 0x1000007, 3)
+                    binaries = dict(fixture['native'], **{role: bytes(changed)})
+                    with self.subTest(target=target, role=role), \
+                            self.assertRaisesRegex(RuntimeError, 'selected thin MH_EXECUTE'):
+                        fixture['inspect'](binaries)
+                self.assertEqual(fixture['original'].call_count, 2)
+
+    def test_final_app_and_extension_refuse_duplicate_native_platform_commands(self):
+        for target, (_, platform, _, _) in artifacts.APPLE.items():
+            with tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target) as fixture:
+                duplicate = struct.pack('<6I', 0x32, 24, platform, 17 << 16, (27 << 16) | (1 << 8), 0)
+                for role in fixture['native']:
+                    binaries = dict(fixture['native'], **{
+                        role: fixture['native_binary'](role, load_commands=[duplicate])})
+                    with self.subTest(target=target, role=role), self.assertRaisesRegex(RuntimeError, 'duplicate platform command'):
+                        fixture['inspect'](binaries)
+
+    def test_final_plist_minimum_and_platform_still_must_match_current_admission(self):
+        for target in artifacts.APPLE:
+            with tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target) as fixture:
+                for path, raw in fixture['plists'].items():
+                    for field, bad in [('MinimumOSVersion', '15.0'), ('MinimumOSVersion', '18.0'),
+                                       ('CFBundleSupportedPlatforms', ['iPhoneSimulator' if target == 'ios-arm64' else 'iPhoneOS'])]:
+                        changed = plistlib.loads(raw); changed[field] = bad
+                        info = dict(fixture['plists'], **{path: plistlib.dumps(changed)})
+                        with self.subTest(target=target, path=path, field=field, bad=bad), \
+                                self.assertRaisesRegex(RuntimeError, 'actual device carrier scope differs'):
+                            fixture['inspect'](info=info)
+
+    def test_final_native_sdk_uses_selected_current_contract_including_patch(self):
+        # Deliberately distinguish device/simulator SDK declarations, rather
+        # than letting today's equal versions hide a wrong field selection.
+        for target in artifacts.APPLE:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary, \
+                    self.final_carrier_fixture(Path(temporary).resolve(), target, sdk_version='27.2.3') as fixture:
+                self.assertTrue(fixture['inspect']()['AppCarrierValidated'])
+
+    def test_apple_version_encoding_keeps_minor_patch_and_rejects_unrepresentable_values(self):
+        self.assertEqual(carriers.apple_version_raw('17.0'), 17 << 16)
+        self.assertEqual(carriers.apple_version_raw('17.0.0'), 17 << 16)
+        self.assertEqual(carriers.apple_version_raw('27.2.3'), (27 << 16) | (2 << 8) | 3)
+        for value in ('17', '17.0.0.1', '17.-1', '17.256', '65536.0', '0.0', '17.0beta', None):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                carriers.apple_version_raw(value)
 
 
 if __name__ == '__main__':

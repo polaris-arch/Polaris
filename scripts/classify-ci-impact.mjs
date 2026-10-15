@@ -810,6 +810,11 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/speedtest_tunnel/tests/mod.rs':
+    '宿主 TLS 测试模块：父 speedtest_tunnel.rs 以 cfg(test) 挂载，authenticated_tls 由 cfg(not(target_os = "android")) 限定非 Android 宿主。'
+    + 'ci.yml 的宿主 cargo test --workspace 执行回环 TLS/证书认证回归；APK 不构建或运行 test target。'
+    + 'Android cargo check -p polaris 不带 --all-targets，不能宣称覆盖这些宿主 TLS 测试；'
+    + '生产 Android TLS、bridge 与 APK 打包触发面保持独立，实际设备 TLS 验收仍未由本登记证明。',
   'src-tauri/src/runtime/geo_seed/tests/resolve_tests.rs':
     '测试源码：唯一 target_os 条件把真实 iOS 资产布局/28 文件播种回归限定在非 Android 宿主；'
     + 'ci.yml 的宿主 cargo test --workspace 实际执行这些资源解析与播种用例。Android bundled-geo'

@@ -1,3 +1,4 @@
+import { prepareRuleAppend } from '@/lib/use-rule-append';
 /**
  * 移动端「连接」屏 —— 四合一入口（IA spec §1.1 第 7/8 行 + §2.3）。
  *
@@ -60,7 +61,6 @@ import { redactSensitive, shouldRedactLogs } from '@/domain/privacy';
 import { ruleTypeNameKey, type RuleSubject } from '@/domain/rules';
 import {
   analyzeRuleCoverage,
-  appendSubjectToRule,
   isShadowedTarget,
   ruleAppendTargets,
   sortAppendTargets,
@@ -69,7 +69,6 @@ import {
 import { closeMobileForm, openMobileForm } from '../forms/form-store';
 import {
   TOPOLOGY_OTHERS_KEY,
-  type Rule,
   type ConnectionsAggregate,
   type ConnectionsClosedUpdate,
   type ConnectionsDetailUpdate,
@@ -1030,8 +1029,7 @@ export function MobileConnectionsScreen(): ReactElement {
   const onAppendToRule = useCallback(
     (subject: RuleSubject, target: RuleAppendTarget) => {
       setSheet(null);
-      const base: Rule | null = rules.find((rule) => rule.id === target.ruleId) ?? null;
-      const next = base ? appendSubjectToRule(base, target, subject) : null;
+      const { base, next, stagingNow: stagingEnabled } = prepareRuleAppend(target, subject);
       if (!next) {
         /* `null` = 无事可做 / 目标漂移 / 目标置灰。三种都不该走写腿，但**必须说话** ——
            静默返回与「点了没反应」在用户那里是同一件事。 */
@@ -1051,7 +1049,7 @@ export function MobileConnectionsScreen(): ReactElement {
         return; // 零 IPC 写、零磁盘写
       }
       void runWrite('screen', 'rules.appendFail', async () => {
-        await api.rules.update(next, 'route');
+        await api.rules.update(next, 'route', base);
         /* 写后端即刷 store：`store.config` 只由 loadConfig/saveConfig 写，不刷则下一次打开这张
            选择器看到的还是旧规则（后端广播是慢路径）。 */
         await loadConfig(true);

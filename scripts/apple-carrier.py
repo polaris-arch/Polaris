@@ -386,13 +386,13 @@ def archive(data, helper):
         string_bytes = struct.unpack_from('<I', symbol_payload, 4 + table_bytes)[0]
         string_offset = 8 + table_bytes
         bounds(string_offset, string_bytes, len(symbol_payload), 'BSD symbol strings')
-        strings = symbol_payload[string_offset:string_offset + string_bytes]
         tail = symbol_payload[string_offset + string_bytes:]
         require(len(tail) < 8 and not tail.strip(b'\0'), 'BSD symbol table padding')
         code_offsets = {m['headerOffset'] for m in members if m['classification'] == 'code'}
         for offset in range(4, 4 + table_bytes, 8):
             name_offset, member_offset = struct.unpack_from('<2I', symbol_payload, offset)
-            require(name_offset < len(strings) and b'\0' in strings[name_offset:]
+            require(name_offset < string_bytes and
+                    symbol_payload.find(b'\0', string_offset + name_offset, string_offset + string_bytes) != -1
                     and member_offset in code_offsets, 'BSD symbol/member binding')
     return {'kind': 'bsd-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'members': members}
 
@@ -401,9 +401,9 @@ def container(data, helper):
     if data.startswith(FAT):
         bounds(0, 8, len(data), 'fat header')
         count = struct.unpack_from('>I', data, 4)[0]
-        # A valid single-target fat wrapper has one entry; the formal
-        # simulator wrapper requires two. Consumers still require their exact
-        # declared target inventory, never merely an arbitrary bounded count.
+        # A valid single-target fat wrapper has one entry. Historical/diagnostic
+        # wrappers may have two; formal consumers require their exact arm64
+        # platform inventory, never merely an arbitrary bounded count.
         require(count in (1, 2), 'unsupported fat slice count')
         header_end = 8 + count * 20
         bounds(8, count * 20, len(data), 'fat table')

@@ -78,8 +78,7 @@ targets:
         ENABLE_BITCODE: false
         ARCHS: [arm64]
         VALID_ARCHS: arm64
-        VALID_ARCHS[sdk=iphonesimulator*]: arm64 x86_64
-        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        VALID_ARCHS[sdk=iphonesimulator*]: arm64
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
@@ -108,7 +107,6 @@ targets:
         name: Build Rust Code
         basedOnDependencyAnalysis: false
         outputFiles:
-          - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
   polaris_PacketTunnel:
     type: app-extension
@@ -118,8 +116,9 @@ targets:
         excludes: [Info.plist, PacketTunnel.entitlements]
     settings:
       base:
+        ARCHS: [arm64]
         VALID_ARCHS: arm64
-        VALID_ARCHS[sdk=iphonesimulator*]: arm64 x86_64
+        VALID_ARCHS[sdk=iphonesimulator*]: arm64
         LD_GENERATE_MAP_FILE: YES
         LD_MAP_FILE_PATH: $(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel

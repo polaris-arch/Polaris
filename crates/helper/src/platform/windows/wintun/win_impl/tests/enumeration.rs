@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::NetworkManagement::IpHelper::GAA_FLAG_SKIP_FRIENDLY_NAME;
 

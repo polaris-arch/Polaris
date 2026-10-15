@@ -68,7 +68,7 @@ import {
   type WarpPlan,
 } from '@/components/dialogs/warp-spec';
 import { applyDetour, endpointDetourOptions, DETOUR_NONE } from '@/components/dialogs/detour-options';
-import { buildWarpSettings } from '@/components/dialogs/wg-logic';
+import { buildWarpSettings, workersInputInvalid } from '@/components/dialogs/wg-logic';
 import { buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAttempt } from '@/components/dialogs/warp-registration';
 import { findWarpNode } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
@@ -252,6 +252,11 @@ export function WarpPanel({
          `TsSettingsPanel` 的两条校验腿同形（2026-09-06 复审 minor）。 */
       revealAdvanced();
       setNotice({ tone: 'err', text: t('warp.errEndpoint') });
+      return;
+    }
+    if (workersInputInvalid(draft.workers)) {
+      revealAdvanced();
+      setNotice({ tone: 'err', text: t('wg.errWorkers') });
       return;
     }
     setSubmitting(true);
@@ -463,6 +468,7 @@ export function WarpPanel({
             }}
           >
             <MobileFields fields={spec} values={draft} onChange={setField} t={t} />
+            {workersInputInvalid(draft.workers) && <p className="m-form-err" role="alert">{t('wg.errWorkers')}</p>}
           </FormGroup>
           </fieldset>
 

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import json
+import os
 import sys
 
 import producer
@@ -197,6 +198,24 @@ class ProducerCalls(unittest.TestCase):
         extra['producer']['files']['scripts/new-component-input.py'] = {'bytes': 1, 'sha256': 'c'*64}
         self.assertFalse(producer.equivalent_binding(original, extra))
 
+    def test_apple_target_contract_changes_binding_and_never_relabels_legacy_receipt(self):
+        current = self.android_projection_binding()
+        current.update(platform='apple', sourceContract=load())
+        original = json.loads(json.dumps(current))
+        original['sourceContract']['apple']['targets'].append('iossimulator/amd64')
+        original['sourceContract']['apple']['slices'].append('ios-x86_64-simulator')
+        receipt = {'input': original, 'output': {'slices': original['sourceContract']['apple']['slices']},
+                   'fingerprint': 'c' * 64}
+        frozen = json.dumps(receipt, sort_keys=True)
+        self.assertFalse(producer.equivalent_binding(original, current))
+        self.assertNotEqual(producer.receipt_digest(original), producer.receipt_digest(current))
+        observation = producer.component_revalidation_observation(
+            receipt, current, {'bytes': len(frozen), 'sha256': producer.sha(frozen.encode())}, False)
+        self.assertFalse(observation['reused'])
+        self.assertEqual(observation['originalBuildID'], 'polaris-mobile-' + producer.receipt_digest(original))
+        self.assertEqual(json.dumps(receipt, sort_keys=True), frozen)
+        self.assertEqual(producer.OBSERVATION_SLOTS, frozenset(('device-arm64', 'sim-arm64')))
+
     def test_android_projection_requires_complete_pins_and_known_policy(self):
         binding = self.android_projection_binding()
         with self.assertRaisesRegex(RuntimeError, 'unknown Android build code policy'):
@@ -260,6 +279,7 @@ class ProducerCalls(unittest.TestCase):
                     # Pinned gomobile's framework name comes from output basename.
                     module = out.stem
                     self.assertEqual(module, 'Libbox')
+                    self.assertEqual(command[command.index('-target') + 1], 'ios/arm64,iossimulator/arm64')
                     out.mkdir(); (out / (module + '.h')).write_bytes(b'inert generated API')
                     generated = Path(cwd) / 'build/ios'; generated.mkdir(parents=True)
                     (generated / 'generated.m').write_bytes(b'inert generated Objective-C')
@@ -407,3 +427,107 @@ class ProducerCalls(unittest.TestCase):
                     with producer.slot_locks(root/'one', root/'other-cache'): pass
                 with self.assertRaises(BlockingIOError):
                     with producer.slot_locks(root/'two', root/'cache'): pass
+
+
+class ProducerLeaseLifecycle(unittest.TestCase):
+    def test_contended_second_lock_closes_new_fds_and_keeps_only_outer_active_locks(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(producer, 'ACTIVE_FDS', []):
+            root = Path(temporary).resolve()
+            with producer.slot_locks(root / 'owner', root / 'z-cache'):
+                outer = list(producer.ACTIVE_FDS)
+                opened, waiting = [], []
+                real_open, real_flock = os.open, producer.fcntl.flock
+                def open_lock(path, *args, **kwargs):
+                    fd = real_open(path, *args, **kwargs)
+                    opened.append(fd)
+                    return fd
+                def flock(fd, operation):
+                    waiting.append(fd)
+                    self.assertNotIn(fd, producer.ACTIVE_FDS)
+                    return real_flock(fd, operation)
+                with patch.object(producer.os, 'open', side_effect=open_lock), \
+                        patch.object(producer.fcntl, 'flock', side_effect=flock), \
+                        self.assertRaises(BlockingIOError):
+                    with producer.slot_locks(root / 'a-work', root / 'z-cache'):
+                        self.fail('contended slot admitted')
+                self.assertEqual(len(opened), 2)
+                self.assertEqual(waiting, opened)
+                self.assertEqual(producer.ACTIVE_FDS, outer)
+                for fd in opened:
+                    with self.assertRaises(OSError): os.fstat(fd)
+                for fd in outer: os.fstat(fd)
+                # The first inner lock was acquired, then released on failure.
+                with producer.slot_locks(root / 'a-work', root / 'b-cache'): pass
+            self.assertEqual(producer.ACTIVE_FDS, [])
+
+    def test_invalid_inode_or_fstat_failure_closes_every_opened_descriptor(self):
+        for failure in ('inode', 'fstat'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(producer, 'ACTIVE_FDS', []):
+                root = Path(temporary).resolve()
+                work, cache = producer.private_dir(root / 'a-work'), producer.private_dir(root / 'z-cache')
+                if failure == 'inode':
+                    original = root / 'retained'; original.write_bytes(b'owned fixture')
+                    os.link(original, cache / '.mobile-producer.lock')
+                opened = []
+                real_open, real_fstat = os.open, os.fstat
+                def open_lock(path, *args, **kwargs):
+                    fd = real_open(path, *args, **kwargs); opened.append(fd); return fd
+                def fstat(fd):
+                    if failure == 'fstat' and len(opened) == 2 and fd == opened[-1]:
+                        raise OSError('inert fstat failure')
+                    return real_fstat(fd)
+                with patch.object(producer.os, 'open', side_effect=open_lock), \
+                        patch.object(producer.os, 'fstat', side_effect=fstat), \
+                        self.assertRaises((RuntimeError, OSError)):
+                    with producer.slot_locks(work, cache): self.fail('invalid lock admitted')
+                self.assertEqual(len(opened), 2)
+                self.assertEqual(producer.ACTIVE_FDS, [])
+                for fd in opened:
+                    with self.assertRaises(OSError): real_fstat(fd)
+                with producer.slot_locks(work, root / 'another-cache'): pass
+
+    def test_evidence_reservation_reuses_ledger_but_cannot_authorize_a_build(self):
+        import budget
+        value = load()
+        build_peak = value['budget']['buildPeakReserveBytes']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            active, nested = [], []
+            with patch.dict(os.environ, {'POLARIS_BUILD_BUDGET_ROOT': str(root / 'budget')}, clear=True), \
+                    patch.object(budget.os, 'statvfs', return_value=SimpleNamespace(f_bavail=10 * 1024 ** 3, f_frsize=1)):
+                with budget.reservation(root / 'evidence', value, active, reserve_bytes=1024 ** 2):
+                    fd = active[0]
+                    self.assertEqual(json.loads(os.pread(fd, 8192, 0))['reserveBytes'], 1024 ** 2)
+                    with budget.reservation(root / 'nested', value, nested, reserve_bytes=1024):
+                        self.assertEqual(nested, [fd])
+                        self.assertEqual(len(list((root / 'budget').glob('*.reservation'))), 1)
+                    self.assertEqual(nested, [])
+                    with self.assertRaisesRegex(RuntimeError, 'inherited reservation identity differs'):
+                        with budget.reservation(root / 'native-build', value, nested):
+                            self.fail('evidence reservation authorized native build')
+                    self.assertEqual(active, [fd]); os.fstat(fd)
+                with self.assertRaisesRegex(RuntimeError, 'peak reservations exhaust free space'):
+                    with budget.reservation(root / 'native-build', value, active):
+                        self.fail('actual build reserve reduced')
+                self.assertEqual(active, [])
+            self.assertEqual(value['budget']['buildPeakReserveBytes'], build_peak)
+
+    def test_evidence_reservation_keeps_live_group_and_outstanding_slot_exclusion(self):
+        import budget
+        value = load()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            active = []
+            with patch.dict(os.environ, {'POLARIS_BUILD_BUDGET_ROOT': str(root / 'budget')}, clear=True), \
+                    patch.object(budget.os, 'statvfs', return_value=SimpleNamespace(f_bavail=10 * 1024 ** 3, f_frsize=1)):
+                with budget.reservation(root / 'old-work', value, active, reserve_bytes=9 * 1024 ** 3):
+                    fd = active[0]
+                    row = json.loads(os.pread(fd, 8192, 0)); row['groups'] = [123456]
+                    os.ftruncate(fd, 0); os.pwrite(fd, producer.canonical(row), 0)
+                with patch.object(budget, 'group_alive', return_value=True):
+                    with self.assertRaisesRegex(RuntimeError, 'retained live/unknown native session'):
+                        with budget.reservation(root / 'old-work', value, active, reserve_bytes=1024): pass
+                    with self.assertRaisesRegex(RuntimeError, 'peak reservations exhaust free space'):
+                        with budget.reservation(root / 'evidence', value, active, reserve_bytes=1024): pass
+                self.assertEqual(active, [])

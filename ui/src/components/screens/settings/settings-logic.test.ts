@@ -1128,9 +1128,10 @@ describe('updateCardPatch —— 态与随行事实同帧落地', () => {
  */
 function stripTsComments(file: string, raw: string): string {
   const sf = ts.parseSourceFile(file, raw);
-  const out = [...raw];
+  // TS pos/end are UTF-16 code-unit offsets, including after non-BMP text.
+  const out = raw.split('');
   const blank = (pos: number, end: number) => {
-    for (let i = pos; i < end; i++) if (out[i] !== '\n') out[i] = ' ';
+    for (let i = pos; i < end; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
   };
   // TypeScript 7 的原生 AST 不再暴露 `Node.getChildren()`。逐节点收集完整起点/终点附着的
   // leading/trailing comment ranges；JSX `{/* … */}` 同样会附着在相邻 JSX 节点范围上。
@@ -1168,9 +1169,10 @@ function stripTsComments(file: string, raw: string): string {
  */
 function stripTsStrings(file: string, raw: string): string {
   const sf = ts.parseSourceFile(file, raw);
-  const out = [...raw];
+  // TS pos/end are UTF-16 code-unit offsets, including after non-BMP text.
+  const out = raw.split('');
   const blank = (pos: number, end: number) => {
-    for (let i = pos; i < end; i++) if (out[i] !== '\n') out[i] = ' ';
+    for (let i = pos; i < end; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = ' ';
   };
   const walk = (n: ts.Node) => {
     if (
@@ -1189,6 +1191,45 @@ function stripTsStrings(file: string, raw: string): string {
   walk(sf);
   return out.join('');
 }
+
+describe('源码屏蔽器保留 UTF-16 偏移（POL-U35）', () => {
+  const file = '__mask_unicode_probe.tsx';
+  const raw = [
+    'const prefix = "🧭"; const REAL_before = true;',
+    '// 🚀 FAKE_line REAL_before',
+    'const quoted = "🧪 FAKE_string"; /* 🐾 FAKE_block */',
+    'const template = `🌍 FAKE_head ${REAL_expression} 🛰 FAKE_tail`;',
+    'const view = <div title="🪐 FAKE_attribute">🌈 FAKE_text{/* 🦊 FAKE_jsx */}{REAL_jsx}</div>;',
+    'const REAL_after = REAL_before;',
+  ].join('\r\n');
+
+  const preservesOffsets = (masked: string) => {
+    expect(masked).toHaveLength(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === '\n' || raw[i] === '\r') expect(masked[i]).toBe(raw[i]);
+    }
+    for (const needle of ['REAL_before', 'REAL_expression', 'REAL_jsx', 'REAL_after']) {
+      const start = raw.indexOf(needle);
+      expect(masked.slice(start, start + needle.length), needle).toBe(needle);
+    }
+  };
+
+  it('emoji 前后、行/块/JSX 注释只屏蔽注释，保留真实代码与字符串', () => {
+    const masked = stripTsComments(file, raw);
+    preservesOffsets(masked);
+    expect(masked).not.toMatch(/FAKE_line|FAKE_block|FAKE_jsx/);
+    expect(masked).toContain('"🧪 FAKE_string"');
+    expect(masked).toContain('🌈 FAKE_text');
+  });
+
+  it('字符串、模板片段与 JSX 文本按 UTF-16 屏蔽，模板/JSX 表达式仍可见', () => {
+    const masked = stripTsStrings(file, stripTsComments(file, raw));
+    preservesOffsets(masked);
+    expect(masked).not.toMatch(/FAKE_|🧭|🧪|🌍|🛰|🪐|🌈/);
+    expect(masked).toContain('const REAL_before = true;');
+    expect(masked).toContain('const REAL_after = REAL_before;');
+  });
+});
 
 /**
  * 组件里每个 `const <名> = <初始化式>` 的**标识符依赖**（经 TS parser 取 `VariableDeclaration`
@@ -1256,7 +1297,7 @@ async function readTsx() {
   const src = stripTsComments(files.join(','), raw);
   // 剥注释自检（正负对照）：本文件必有块注释 ⇒ 剥完必须**真的不一样**，且注释标记没了、
   // 代码骨架还在（不能把整份剥成空白还一路绿）。
-  // 不写 `src.length === raw.length`：`blank()` 是原地单字符替换，那条恒真、零信息量。
+  // UTF-16 长度与换行偏移由上面的 emoji 回归单独校验；这里检查真实取材没有塌空。
   expect(src, '剥注释后与原文逐字相同 ⇒ 什么都没剥掉').not.toBe(raw);
   expect(raw.includes('/**'), '取材文件本应含块注释（否则本自检无信息量）').toBe(true);
   expect(src.includes('/**'), '注释未被剥掉').toBe(false);

@@ -1016,6 +1016,8 @@ export function ActionSheet({
   /* 系统返回键关掉的就是这一层。三个调用点（规则行 / 资源行 / DNS 溢出）都只在打开时才渲染
      本组件 ⇒ 恒 `true`；登记住在组件里，故第四个调用点自动带上。 */
   useDismissableLayer(true, onClose);
+  const panel = useRef<HTMLDivElement>(null);
+  useSheetFocus(panel, true, onClose);
   return (
     <div
       className="mr-sheet-scrim"
@@ -1026,7 +1028,7 @@ export function ActionSheet({
          点在面板本体上不冒泡到这里。 */
       onClick={onClose}
     >
-      <div className="mr-sheet" onClick={(e) => e.stopPropagation()}>
+      <div ref={panel} tabIndex={-1} className="mr-sheet" onClick={(e) => e.stopPropagation()}>
         <div className="mr-sheet-grip" />
         <SheetHeading title={title} onClose={onClose} closeLabel={closeLabel} titleClassName="mr-sheet-h" />
         {body != null && <div className="mr-note">{body}</div>}

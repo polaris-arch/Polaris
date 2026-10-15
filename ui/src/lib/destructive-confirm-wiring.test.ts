@@ -160,6 +160,10 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       const c = code(get(rel));
       expect(c, '没有消费共用实现').toContain("from '@/lib/confirm-twice'");
       expect(c).toMatch(/useConfirmTwice\(\)/);
+      expect(c, '删除确认必须绑定 plane 和完整实体快照').toContain(
+        'const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`',
+      );
+      expect(c).toContain('confirmTwice(deleteIntentKey,');
       // 变异对照：把任一处改回 openDialog({ kind: 'confirm', ... }) → 本条转红。
       expect(c, '破坏性操作又走回弹窗了').not.toContain("kind: 'confirm'");
     });
@@ -199,8 +203,12 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       const c = code(get(rel));
       expect(c, '没有消费共用实现').toContain("from '@/lib/confirm-twice'");
       expect(c).toMatch(/useConfirmTwice\(\)/);
+      expect(c, '删除确认必须绑定 plane 和完整实体快照').toContain(
+        'const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`',
+      );
+      expect(c).toContain('confirmTwice(deleteIntentKey,');
       expect(c, '武装态必须真的接到 armed 上（只调 confirmTwice 不渲染 = 隐形闸门）').toMatch(
-        /armed === [A-Z_]+_KEY/,
+        /armed === deleteIntentKey/,
       );
     });
   }
@@ -218,7 +226,7 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     ['components/screens/resources/ResourcesScreen.tsx', /armed === GEO_RESET_KEY && 'confirming'/],
     ['components/screens/resources/ResourcesScreen.tsx', /deleteConfirming && 'confirming'/],
     ['components/screens/app-policy/AppPolicyScreen.tsx', /confirming && 'confirming'/],
-    ['components/dialogs/RuleDialog.tsx', /armed === RULE_DEL_KEY && 'confirming'/],
+    ['components/dialogs/RuleDialog.tsx', /armed === deleteIntentKey && 'confirming'/],
     // 规则行内删除：状态在 RulesScreen（单槽），翻红在 RuleItem —— 两段都要钉，只钉一头就留下
     // 「state 有了但没传下去」或「传下去了但没挂 class」两种隐形闸门（同 NodesScreen / NodeCard 那对）。
     ['components/screens/rules/RuleItem.tsx', /cn\('nd-a err', deleteConfirming && 'confirming'\)/],
@@ -239,10 +247,10 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
    */
   it('RulesScreen 把 armed / 删除回调都真的传给了 RuleItem（原型 :4097 rule-del）', () => {
     const c = code(get('components/screens/rules/RulesScreen.tsx'));
-    expect(c, '行内删除没走 confirmTwice').toMatch(/confirmTwice\(`\$\{RULE_DEL_PREFIX\}\$\{rule\.id\}`/);
+    expect(c, '行内删除没走 confirmTwice').toMatch(/confirmTwice\(`\$\{RULE_DEL_PREFIX\}\$\{plane\}:\$\{configCanonicalText\(rule\)\}`/);
     expect(c, '删除回调没接到行上（按钮整个不渲染）').toContain('onDelete={requestDelete}');
     expect(c, '武装态没传下去 —— 按钮永远不翻红').toContain(
-      'deleteConfirming={armed === `${RULE_DEL_PREFIX}${rule.id}`}',
+      'deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}',
     );
   });
 });

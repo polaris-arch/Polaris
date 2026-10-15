@@ -68,14 +68,14 @@ class AppleProgress(unittest.TestCase):
                     'os.write(1,b"INJECTED_SECRET_ORIGINAL_TEXT")')
             with patch.object(producer, 'register_group'), patch.object(producer, 'group_alive', return_value=False):
                 returned = producer.run([sys.executable, '-c', code], log=Path(temporary)/'native.log',
-                    observation_fd=fd, observation_phase='rust-target-build', observation_slot='sim-amd64')
+                    observation_fd=fd, observation_phase='rust-target-build', observation_slot='sim-arm64')
             events.seek(0); raw = events.read().decode()
             self.assertNotIn('INJECTED_SECRET', raw); self.assertNotIn(temporary, raw)
             self.assertIn('closed\n', returned); self.assertNotIn('LEAK', returned)
             rows = [json.loads(line.split('=', 1)[1]) for line in raw.splitlines()]
             self.assertEqual(rows[-1]['event'], 'end'); self.assertGreater(rows[-1]['stdoutBytes'], 0)
             self.assertIsNone(rows[-1]['peakRSSBytes']); self.assertFalse(rows[-1]['processRunning'])
-            self.assertEqual(rows[-1]['slot'], 'sim-amd64')
+            self.assertEqual(rows[-1]['slot'], 'sim-arm64')
 
     def test_cleanup_failures_do_not_replace_original_or_release_live_group(self):
         class BadLog:

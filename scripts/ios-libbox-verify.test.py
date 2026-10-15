@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test pure final admission, or explicitly test a real historical framework."""
+"""Test retired production and readonly admission, or a real historical framework."""
 import argparse
 import copy
 from contextlib import ExitStack, redirect_stdout
@@ -165,8 +165,8 @@ def preflight_tests():
         with ExitStack() as stack:
             for owner, name in [(builder, 'run'), (builder, 'source_check'),
                                 (builder, 'framework_evidence'), (builder.platform, 'system'),
-                                (builder.platform, 'machine'), (builder.shutil, 'which'),
-                                (builder.shutil, 'copyfile'), (builder.tempfile, 'TemporaryDirectory'),
+                                (builder.platform, 'machine'), (shutil, 'which'),
+                                (shutil, 'copyfile'), (tempfile, 'TemporaryDirectory'),
                                 (Path, 'mkdir'), (Path, 'write_text'), (Path, 'write_bytes'),
                                 (archive_checker.zipfile, 'ZipFile')]:
                 stack.enter_context(mock.patch.object(owner, name,
@@ -186,12 +186,51 @@ def preflight_tests():
                 rejected(action, expected)
                 count += 1
 
-    actions = [lambda: builder.build(None), lambda: builder.verify(missing, missing, native=None),
+    actions = [lambda: builder.verify(missing, missing, native=None),
                builder.inputs, lambda: archive_checker.verify_archive(missing),
-               lambda: builder.main(['build']), lambda: builder.main(['verify', '--framework', str(missing), '--receipt', str(missing)]),
+               lambda: builder.main(['verify', '--framework', str(missing), '--receipt', str(missing)]),
                lambda: archive_checker.main([str(missing)])]
     no_side_effects(actions, 'Apple final artifact evidence not implemented')
+    # Every legacy production route refuses before any policy/source/tool read,
+    # component import, or mutable output. Historical reads remain independent.
+    retired = [lambda: builder.build(None),
+               lambda: builder.build(missing, offline=True, historical=True),
+               lambda: builder.build_component(SimpleNamespace()),
+               lambda: builder.main(['build']),
+               lambda: builder.main(['build', str(missing), '--historical', '--offline']),
+               lambda: builder.main(['build', '--phase', 'publish']),
+               lambda: builder.main(['build', '--component']),
+               lambda: builder.main(['build', '--component', '--phase', 'assemble',
+                                      '--build-policy', str(missing), '--evidence-dir', str(missing)]),
+               lambda: builder.main(['build', '--component', '--phase', 'publish',
+                                      '--tools', str(missing), '--output-root', str(missing)]),
+               lambda: builder.main(['build', '--component', '--historical'])]
+    with ExitStack() as stack:
+        forbidden = []
+        for owner, name in [(builder, 'inputs'), (builder, 'final_preflight'),
+                            (builder, 'artifact_preflight'), (builder, 'component_module'),
+                            (builder, 'source_helpers'), (builder, 'source_check'),
+                            (builder, 'approved_component_inputs'), (builder, 'run'),
+                            (builder.subprocess, 'run'), (builder.platform, 'system'),
+                            (builder.platform, 'machine'), (shutil, 'which'), (shutil, 'copyfile'),
+                            (tempfile, 'TemporaryDirectory'), (Path, 'read_text'),
+                            (Path, 'read_bytes'), (Path, 'open'), (Path, 'mkdir'),
+                            (Path, 'write_text'), (Path, 'write_bytes')]:
+            forbidden.append(stack.enter_context(mock.patch.object(owner, name,
+                side_effect=AssertionError('Retired production reached ' + name))))
+        for action in retired:
+            rejected(action, builder.LEGACY_BUILD_RETIRED)
+            count += 1
+        assert all(call.call_count == 0 for call in forbidden)
     manifest, version = builder.inputs(historical=True)
+    historical_paths = [builder.MANIFEST, *[builder.PATCH_DIR / row['file'] for row in manifest['patches']]]
+    historical_hashes = {path: builder.digest(path.read_bytes()) for path in historical_paths}
+    with mock.patch.object(builder, 'run', side_effect=AssertionError('Historical input check executed a tool')), \
+            redirect_stdout(io.StringIO()) as output:
+        builder.main(['check-inputs', '--historical'])
+    assert 'historical-only six-patch hashes and source manifest' in output.getvalue()
+    assert historical_hashes == {path: builder.digest(path.read_bytes()) for path in historical_paths}
+    count += 1
     shared, core, policy = builder.final_preflight()
     assert len(shared['patches']) == 8 and shared['dependencyPatches'] == []
     assert core['sourceBuild']['dependencyModules'] == [] and policy['moduleInventory']['patched'] == []
@@ -199,9 +238,9 @@ def preflight_tests():
     assert policy['binding']['gomobileVersion'] == 'v0.1.12' != shared['gomobileVersion']
     with ExitStack() as stack:
         for owner, name in [(builder, 'run'), (builder, 'source_check'), (builder, 'framework_evidence'),
-                            (builder.platform, 'system'), (builder.platform, 'machine'), (builder.shutil, 'which'),
+                            (builder.platform, 'system'), (builder.platform, 'machine'), (shutil, 'which'),
                             (Path, 'mkdir'), (Path, 'write_text'), (Path, 'write_bytes'),
-                            (builder.tempfile, 'TemporaryDirectory'), (archive_checker.zipfile, 'ZipFile')]:
+                            (tempfile, 'TemporaryDirectory'), (archive_checker.zipfile, 'ZipFile')]:
             stack.enter_context(mock.patch.object(owner, name, side_effect=AssertionError('Source admission reached ' + name)))
         assert builder.final_preflight() == (shared, core, policy)
         with redirect_stdout(io.StringIO()) as output:
@@ -391,10 +430,25 @@ def preflight_tests():
                 count += 1
             new = copy.deepcopy(receipt)
             new['evidenceScope'] = 'historical-only'
-            new['buildScriptSha256'] = builder.digest(builder.SCRIPT.read_bytes())
-            new['buildEntrySha256'] = builder.digest((builder.ROOT / 'scripts/build-libbox-ios.sh').read_bytes())
+            new['buildScriptSha256'] = builder.HISTORICAL_ONLY_SCRIPT_SHA256
+            new['buildEntrySha256'] = builder.HISTORICAL_ENTRY_SHA256
             receipt_path.write_text(json.dumps(new))
+            original_historical = receipt_path.read_bytes()
             assert builder.verify(missing, receipt_path, historical=True) == new
+            assert receipt_path.read_bytes() == original_historical
+            count += 1
+            # Retirement cannot manufacture a historical producer identity.
+            for producer in (builder.digest(builder.SCRIPT.read_bytes()), '0' * 64,
+                             builder.HISTORICAL_SCRIPT_SHA256):
+                bad = copy.deepcopy(new)
+                bad['buildScriptSha256'] = producer
+                receipt_path.write_text(json.dumps(bad))
+                rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildScriptSha256')
+                count += 1
+            bad = copy.deepcopy(new)
+            bad['buildEntrySha256'] = '0' * 64
+            receipt_path.write_text(json.dumps(bad))
+            rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildEntrySha256')
             count += 1
             new['evidenceScope'] = 'build-only'
             receipt_path.write_text(json.dumps(new))
@@ -483,7 +537,7 @@ def preflight_tests():
     count += 1
     with mock.patch.object(builder, 'observe_component', side_effect=AssertionError('component observer reached')), \
             mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')):
-        rejected(lambda: builder.main(['build']), 'artifact evidence not implemented')
+        rejected(lambda: builder.main(['build']), builder.LEGACY_BUILD_RETIRED)
         rejected(lambda: builder.main(['verify']), 'artifact evidence not implemented')
     count += 2
     print(f'{count} source-admission/producer/structure unit cases passed; no Framework or App built.')

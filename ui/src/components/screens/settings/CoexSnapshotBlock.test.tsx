@@ -13,7 +13,11 @@ const t = (key: string) => {
 };
 const collect = vi.hoisted(() => vi.fn());
 vi.mock('@/ipc', () => ({ api: { system: { coexReadonlySnapshot: collect } } }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t }) }));
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(), useTranslation: () => ({ t }) }));
+// Initialization must settle (or fail this suite), never leak an unhandled rejection.
+await (await import('@/i18n')).i18nReady;
+
 const { CoexSnapshotBlock, renderCoexFacts } = await import('./CoexSnapshotBlock');
 const known = <T,>(value: T): { status: 'known'; value: T } => ({ status: 'known', value });
 const unknown = (reason: string): { status: 'unknown'; reason: string } => ({ status: 'unknown', reason });

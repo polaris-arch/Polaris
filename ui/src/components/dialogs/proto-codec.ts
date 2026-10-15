@@ -60,7 +60,8 @@ export type ProtoCodecErrorCode =
   | 'customJsonTypeRequired'
   | 'certPinInvalid'
   | 'derpServerInvalid'
-  | 'extraJsonInvalid';
+  | 'extraJsonInvalid'
+  | 'torArgsInvalid';
 
 /**
  * 编解码层只抛稳定错误码；面向用户的文案由 NodeDialog 按当前 locale 渲染。
@@ -126,7 +127,7 @@ function textToTorArgs(value: FormValue): string[] | undefined {
       started = true;
     }
   }
-  if (quote || escaped) throw new Error('Tor arguments contain an unfinished quote or escape.');
+  if (quote || escaped) throw new ProtoCodecError('torArgsInvalid', undefined, 'torArgs');
   if (started) args.push(arg);
   return args.length ? args : undefined;
 }
@@ -224,7 +225,7 @@ function withHostHeader(
  * 全部丢完 → `undefined`（删键），同 `listFromText` 对 `" , , "` 的处理。
  */
 function headersFromText(v: FormValue): Record<string, string[]> | undefined {
-  const out: Record<string, string[]> = {};
+  const out: Record<string, string[]> = Object.create(null);
   for (const line of (str(v) ?? '').split('\n')) {
     const at = line.indexOf(':');
     if (at <= 0) continue;

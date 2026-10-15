@@ -1,3 +1,4 @@
+import { appRuleDisabled } from '@/components/screens/app-policy/app-policy-logic';
 /**
  * 移动端「规则」屏 —— 四合一入口（IA spec §1.2 / §2.2）。
  *
@@ -173,6 +174,7 @@ export function MobileRulesScreen(): ReactElement {
   /* 核起停会改变引擎算出来的 force-route 段集（未运行时报告是空的），故列进下面那条拉取的依赖。 */
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const { armed, confirmTwice } = useConfirmTwice();
+  const deleteSnapshot = useRef<{ key: string; rule: Rule } | null>(null);
 
   /**
    * 写失败的**行内**回显（键 → 已翻译的文案）。
@@ -501,7 +503,7 @@ export function MobileRulesScreen(): ReactElement {
       const optimistic = prev.map((r) => (r.id === next.id ? next : r));
       useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       try {
-        await api.rules.update(next, plane);
+        await api.rules.update(next, plane, rule);
       } catch (err) {
         // 开关弹回原位是静默的。停用了以为停用了、其实规则还在生效 → 必须报。
         console.error('[MobileRulesScreen] toggle failed:', err);
@@ -558,10 +560,13 @@ export function MobileRulesScreen(): ReactElement {
   const requestDeleteRule = useCallback(
     (plane: 'route' | 'dns', rule: Rule) => {
       clearWriteError(`rule:${rule.id}`);
-      confirmTwice(`${RULE_DEL_PREFIX}${rule.id}`, () => {
+      const confirmationKey = `${RULE_DEL_PREFIX}${plane}:${rule.id}`;
+      if (armed !== confirmationKey) deleteSnapshot.current = { key: confirmationKey, rule };
+      const expected = deleteSnapshot.current?.key === confirmationKey ? deleteSnapshot.current.rule : rule;
+      confirmTwice(confirmationKey, () => {
         void (async () => {
           try {
-            await (plane === 'dns' ? deleteDnsRule : deleteRouteRule)(rule);
+            await (plane === 'dns' ? deleteDnsRule : deleteRouteRule)(expected);
             setSheetRuleId(null);
           } catch (err) {
             console.error('[MobileRulesScreen] delete failed:', err);
@@ -572,7 +577,7 @@ export function MobileRulesScreen(): ReactElement {
         })();
       });
     },
-    [confirmTwice, deleteDnsRule, deleteRouteRule, tr, clearWriteError, reportWriteError],
+    [armed, confirmTwice, deleteDnsRule, deleteRouteRule, tr, clearWriteError, reportWriteError],
   );
 
   const handleRegionChange = useCallback(
@@ -676,6 +681,7 @@ export function MobileRulesScreen(): ReactElement {
     (preset: AppPreset): { text: string; tone: AppRowModel['policyTone']; value: string } => {
       const rule = appRuleById.get(preset.id);
       if (!rule) return { text: tr('appPolicy.followGlobal'), tone: 'follow', value: 'follow' };
+      if (appRuleDisabled(rule)) return { text: tr('rules.disabledBadge'), tone: 'follow', value: 'disabled' };
       if (rule.action === 'direct') {
         return { text: tr('appPolicy.action.direct'), tone: 'direct', value: 'direct' };
       }
@@ -1527,7 +1533,7 @@ export function MobileRulesScreen(): ReactElement {
           meshOverlapPrevious: plane === 'route' && meshRoute.previous,
           routeInactive: plane === 'route' && modeInactive && route !== null,
           networkProfileBadge: ruleProfileBadge(rule, badgeProfiles, resolvedProbes),
-          deleteConfirming: armed === `${RULE_DEL_PREFIX}${rule.id}`,
+          deleteConfirming: armed === `${RULE_DEL_PREFIX}${plane}:${rule.id}`,
           sheetOpen: sheetRuleId === rule.id,
           onOpenSheet: (r) => setSheetRuleId(r ? r.id : null),
           onToggle: (r) => void handleToggle(plane, r),

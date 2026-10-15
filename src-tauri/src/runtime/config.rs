@@ -274,15 +274,23 @@ fn reconcile_tailscale_credentials(
     let Some(nodes) = incoming.get_mut("servers").and_then(Value::as_array_mut) else {
         return Ok(());
     };
+    // Keep a duplicate marker instead of silently choosing a credential owner.
+    // None is a real key here: absent/non-string IDs matched one another before.
+    let mut previous_by_id: std::collections::HashMap<Option<&str>, Option<&Value>> =
+        std::collections::HashMap::new();
+    for old in previous
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        previous_by_id
+            .entry(old.get("id").and_then(Value::as_str))
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(old));
+    }
     for node in nodes {
         let id = node.get("id").and_then(Value::as_str).map(str::to_owned);
-        let current: Vec<_> = previous
-            .get("servers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|old| old.get("id").and_then(Value::as_str) == id.as_deref())
-            .collect();
         let intent = node
             .as_object_mut()
             .and_then(|object| object.remove("tailscaleCredentialIntent"));
@@ -293,10 +301,10 @@ fn reconcile_tailscale_credentials(
             settings.remove("retainedAuthKeyAvailable");
             settings.remove("tailscaleCredentialRevision");
         }
-        let current = match current.as_slice() {
-            [current] => Some(*current),
-            [] => None,
-            _ => return Err(StoreError::validation("credentialRevisionChanged")),
+        let current = match previous_by_id.get(&id.as_deref()) {
+            Some(Some(current)) => Some(*current),
+            None => None,
+            Some(None) => return Err(StoreError::validation("credentialRevisionChanged")),
         };
         if let Some(intent) = intent {
             let object = intent

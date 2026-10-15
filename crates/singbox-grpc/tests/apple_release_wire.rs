@@ -70,21 +70,12 @@ fn selected_slice_must_match_cargo_cpu_and_platform_before_descriptor_scan() {
     for (target, cpu, subtype, platform) in [
         ("aarch64-apple-ios", 0x0100_000c, 0, 2),
         ("aarch64-apple-ios-sim", 0x0100_000c, 0, 7),
-        ("x86_64-apple-ios", 0x0100_0007, 3, 7),
     ] {
         let actual = object_archive(cpu, subtype, platform);
         assert!(apple_wire_check::check_bytes_for_target(&actual, target)
             .unwrap_err()
             .contains("descriptor unavailable"));
-        let wrong_cpu = object_archive(
-            if cpu == 0x0100_000c {
-                0x0100_0007
-            } else {
-                0x0100_000c
-            },
-            subtype,
-            platform,
-        );
+        let wrong_cpu = object_archive(0x0100_0007, 3, platform);
         assert!(apple_wire_check::check_bytes_for_target(&wrong_cpu, target)
             .unwrap_err()
             .contains("CPU/subtype/type"));
@@ -98,11 +89,20 @@ fn selected_slice_must_match_cargo_cpu_and_platform_before_descriptor_scan() {
 }
 
 #[test]
+fn intel_ios_simulator_target_is_outside_the_formal_arm64_scope() {
+    let archive = object_archive(0x0100_0007, 3, 7);
+    assert_eq!(
+        apple_wire_check::check_bytes_for_target(&archive, "x86_64-apple-ios").unwrap_err(),
+        "unsupported actual Cargo Apple target"
+    );
+}
+
+#[test]
 fn a_whole_fat_container_cannot_supply_the_first_architectures_descriptor() {
     let mut raw = b"\xca\xfe\xba\xbe".to_vec();
     raw.extend_from_slice(&object_archive(0x0100_000c, 0, 7));
     assert!(
-        apple_wire_check::check_bytes_for_target(&raw, "x86_64-apple-ios")
+        apple_wire_check::check_bytes_for_target(&raw, "aarch64-apple-ios-sim")
             .unwrap_err()
             .contains("selected thin")
     );
@@ -139,7 +139,6 @@ fn exact_bsd_symbol_names_do_not_hide_wrong_objects_or_replace_wire_proof() {
     for (target, cpu, subtype, platform) in [
         ("aarch64-apple-ios", 0x0100_000c, 0, 2),
         ("aarch64-apple-ios-sim", 0x0100_000c, 0, 7),
-        ("x86_64-apple-ios", 0x0100_0007, 3, 7),
     ] {
         for name in ["__.SYMDEF", "__.SYMDEF SORTED"] {
             let object = object_archive(cpu, subtype, platform);

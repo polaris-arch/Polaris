@@ -1,3 +1,21 @@
+# 当前 Apple arm64-only 正式构建入口
+
+本节说明当前正式契约。下方分隔标题之后的全文保留为旧阶段记录，其中的“当前”“本轮”“默认 final”、版本、命令和验收结论均属于记录当时，不是今天的生产操作说明，也不新增验收。
+
+- 正式共享组件入口：`bash scripts/build-mobile-core.sh apple`，按 [mobile-core 当前说明](../scripts/mobile-core/README.md) 提供 `--source --go --gomobile --gobind --developer --work --cache` 的明确路径。
+- 仅有两个平台目标：`ios/arm64`（`device-arm64`）和 `iossimulator/arm64`（`sim-arm64`）。XCFramework 必须恰有两个 library：iOS device（无 variant）和 iOS simulator（`simulator` variant），各仅含 arm64。`ios-arm64` / `ios-arm64-simulator` 是观测 slices 的键；`LibraryIdentifier` 只要求安全 basename，不额外固定目录名。Intel simulator、macOS 和 tvOS 不在正式范围。
+- 共享静态组件最低 iOS15；App/PacketTunnel 最低 iOS17。严格固定 Xcode27.1 / build27A9275，以及 iOS 与 Simulator SDK27.1；不能回退版本或混用平台。
+- 本地 App 入口为 `python3 -B scripts/mobile-core/build_apple_app.py`：设备 leg 不加 `--simulator`，模拟器 leg 使用 `--simulator --simulator-arch arm64`。托管流程先准备并核验同一共享组件，再按顺序构建设备和 arm64 模拟器两个 leg；每个 leg 都须完成实际最终 App/PacketTunnel 静态链接与来源核验。共享组件成功不等于两个 App leg 通过。
+- source/tool 指纹和缓存命名空间包含精确目标集合。旧三目标缓存、receipt、native-input 或 Intel simulator 产物不得通过改名、删字段或重写历史证据转换为本契约；device/simulator 虽同为 arm64，平台身份仍不同。
+- `ios-libbox.py build` 的所有生产模式已退休，包括 `--historical` 与 `--component --phase assemble/publish`；旧 `build-libbox-ios.sh` 也会在读源、policy、工具或产生输出之前被拒绝。下方历史构建命令仅作原始记录，不是可继续执行的生产替代入口。
+- 历史 `verify --historical` / `check-inputs --historical` 与显式 C2/C3 观察诊断保留原有范围。旧 build-only producer pins 和固定 b66 historical-only producer pin 只用于原 receipt 的只读核验；历史 policy/receipt bytes 不改写，退休驱动不生成新的历史 receipt。
+
+这次调整只提交源码和静态检查，没有执行构建、测试、CI、签名、安装、设备验证或发布；不据此授予 AppAccepted、devicePassed 或 publicationEligible。
+
+# 历史存档：b66 基线及此前阶段原文（2026-10-15 保留）
+
+以下内容逐字保留，仅用于理解旧来源、收据和阶段限制。日期表示本次归档说明时间，不替代原证据的日期；所有旧生产命令均受上方退休说明约束。
+
 # iOS 源码编译（准备中）
 
 ## 统一 main 的源码收口边界

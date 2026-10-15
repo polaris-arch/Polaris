@@ -287,7 +287,3 @@ fn kill_process_inner(_pid: u32) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, target_os = "macos"))]
-#[path = "exec/tests/spawn_diagnostic.rs"]
-mod spawn_diagnostic_tests;

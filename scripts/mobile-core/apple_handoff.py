@@ -15,7 +15,7 @@ from artifacts import file_pin, read_receipt, receipt_digest, tree_inventory
 from fork_input import ROOT, decode, load, require
 from producer import lease, private_dir, producer_code, run, write_json
 
-SLOTS = ('device-arm64', 'sim-arm64', 'sim-amd64')
+SLOTS = ('device-arm64', 'sim-arm64')
 MAX_FILES, MAX_BYTES = 65536, 4 * 1024 ** 3
 
 
@@ -351,7 +351,7 @@ def freeze(root):
 def import_bundle(folder, root):
     folder, root = Path(folder), private_dir(root)
     transport = read_receipt(folder / 'component-transport.json')
-    require(transport['schema'] == 'polaris-apple-handoff-transport-v1' and transport['context'] == context() and
+    require(transport.get('schema') == 'polaris-apple-handoff-transport-v1' and transport['context'] == context() and
             transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}) and
             transport_pin(folder / 'component-handoff.zip') == transport['archive'], 'handoff transport changed')
     write_json(root / 'import-observation.json', {'schema': 'polaris-apple-import-observation-v1',
@@ -445,17 +445,21 @@ def carrier_summary(root, slot):
 
 def aggregate(folder, output):
     folder = Path(folder)
+    require({p.name for p in folder.iterdir()} == {'component', *SLOTS},
+            'aggregate requires exactly component, device-arm64 and sim-arm64 slots')
     rows = {}
     from consume import app_identity
     current_app = app_identity()
     compiler_identity = None
     transport = read_receipt(folder / 'component' / 'component-transport.json')
     manifest_path = folder / 'component' / 'component-handoff.json'
-    require(transport['context'] == context() and file_pin(manifest_path) == transport['manifest'] and
+    require(transport.get('schema') == 'polaris-apple-handoff-transport-v1' and
+            transport['context'] == context() and file_pin(manifest_path) == transport['manifest'] and
             transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}),
             'aggregate component run differs')
     manifest = read_receipt(manifest_path)
-    require(manifest['App'] == producer_code() and manifest['sourceContract'] == load() and
+    require(manifest.get('schema') == 'polaris-apple-component-handoff-v1' and
+            manifest['App'] == producer_code() and manifest['sourceContract'] == load() and
             manifest['context'] == context() and manifest['producerJob'] == 'component' and
             manifest['fingerprint'] == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
             'aggregate original component/source differs')
@@ -463,8 +467,10 @@ def aggregate(folder, output):
         row = read_receipt(folder / slot / ('carrier-' + slot + '.json'))
         require(row['schema'] == 'polaris-apple-carrier-handoff-v1' and row['slot'] == slot and
                 row['context'] == context() and row['componentTransport'] == transport and
+                row.get('devicePassed') is False and row.get('signatureTrustValidated') is False and
+                row.get('publicationEligible') is False and
                 row['fingerprint'] == receipt_digest({k: v for k, v in row.items() if k != 'fingerprint'}),
-                'aggregate slot/context/component differs')
+                'aggregate slot/context/component/scope differs')
         require(file_pin(folder / slot / 'summary-app-carrier.json') == row['receiptPin'] and
                 read_receipt(folder / slot / 'summary-app-carrier.json') == row['receipt'],
                 'aggregate original carrier receipt bytes differ')
@@ -475,20 +481,19 @@ def aggregate(folder, output):
         rust = read_receipt(rust_path)
         require(rust['schema'] == 'polaris-formal-apple-rust-v1' and rust['App'] == current_app and
                 rust['fingerprint'] == receipt_digest({k: v for k, v in rust.items() if k != 'fingerprint'}) and
-                rust['target'] == {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim',
-                                   'sim-amd64': 'x86_64-apple-ios'}[slot] and
+                rust['target'] == {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim'}[slot] and
                 rust['linkInputSha256'] == receipt['linkInputSha256'] and rust['devicePassed'] is False,
                 'aggregate Rust target/App/link identity differs')
         if compiler_identity is None:
             compiler_identity = {'tools': rust['tools'], 'rustc': rust['rustc']}
         require(compiler_identity == {'tools': rust['tools'], 'rustc': rust['rustc']},
                 'aggregate actual Rust tool bytes/version differ')
-        require(receipt['fingerprint'] == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}) and
+        require(receipt.get('schema') == 'polaris-mobile-apple-carrier-v1' and
+                receipt['fingerprint'] == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}) and
                 receipt['App'] == current_app and
                 receipt['producerCandidate'] == context()['candidate'] and
                 receipt['componentFingerprint'] == manifest['componentFingerprint'] and
-                receipt['selectedTarget'] == {'device-arm64': 'ios-arm64', 'sim-arm64': 'ios-arm64-simulator',
-                                               'sim-amd64': 'ios-x86_64-simulator'}[slot] and
+                receipt['selectedTarget'] == {'device-arm64': 'ios-arm64', 'sim-arm64': 'ios-arm64-simulator'}[slot] and
                 receipt.get('AppCarrierValidated') is True and receipt.get('AppAccepted') is False and
                 receipt.get('devicePassed') is False and receipt.get('signatureTrustValidated') is False,
                 'aggregate actual carrier identity/scope differs')

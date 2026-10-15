@@ -758,10 +758,40 @@ jobs:
       - name: Build
         run: cargo build --workspace --verbose
 
+      - name: Coex export checker fixtures
+        if: runner.os == 'Linux'
+        run: node --test scripts/check-coex-runtime-export.test.mjs
+
+      - name: Prepare current Coex source evidence
+        if: runner.os == 'Linux'
+        id: coex_prepare
+        run: node scripts/check-coex-runtime-export.mjs prepare
+
       - name: Test
+        # Keep the actual gate command byte-identical to gate-rust.sh. Linux capture
+        # supplies the fresh export env to this one existing full-workspace execution.
+        # The static shell routes macOS/Windows to bash/pwsh with native failure propagation.
+        shell: node scripts/check-coex-runtime-export.mjs capture {0}
+        env:
+          COEX_EVIDENCE_DIR: ${{ steps.coex_prepare.outputs.directory }}
         # `--no-fail-fast`（2026-08-05）：默认行为是**某个 crate 挂了就不再跑后面的 crate**，
         # 于是一次 run 只能看见「第一个」失败。修 Windows 腿时这一条把成本放大成 N 倍——
         # 每修一条要再等一整轮（Windows 冷编译约 20 分钟），而那一轮又只暴露下一条。
         # 实测连剥四层（checkout 保留名 → uninstall+dns → launchd → helper-client）才见底。
         # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
         run: cargo test --workspace --no-fail-fast
+
+      - name: Verify current Coex serializer evidence
+        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        env:
+          COEX_EVIDENCE_DIR: ${{ steps.coex_prepare.outputs.directory }}
+        run: node scripts/check-coex-runtime-export.mjs verify
+
+      - name: Preserve current Coex export and original test logs
+        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coex-runtime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.coex_prepare.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 14

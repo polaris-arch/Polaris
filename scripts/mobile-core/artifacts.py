@@ -17,8 +17,7 @@ from fork_input import ROOT, canonical, decode, require, sha, validate
 ABI = {'arm64-v8a': (2, 183, 'arm64'), 'armeabi-v7a': (1, 40, 'arm'),
        'x86': (1, 3, '386'), 'x86_64': (2, 62, 'amd64')}
 APPLE = {'ios-arm64': (0x100000c, 2, 'arm64', None),
-         'ios-arm64-simulator': (0x100000c, 7, 'arm64', 'simulator'),
-         'ios-x86_64-simulator': (0x1000007, 7, 'amd64', 'simulator')}
+         'ios-arm64-simulator': (0x100000c, 7, 'arm64', 'simulator')}
 MAX_ARTIFACT = 1024 ** 3
 MAX_RECEIPT = 16 * 1024 ** 2
 # Normalized origins remove the measured member x candidate expansion;
@@ -111,7 +110,7 @@ def receipt_lexical_budget(raw):
 
 
 def receipt_limit(value):
-    # Full three-slice member/origin inventories exceed the small-control
+    # Full Apple member/origin inventories can exceed the small-control
     # envelope. Keep those original fields, with a separate finite budget.
     require(isinstance(value, dict), 'receipt must be an object')
     if value.get('schema') == 'polaris-mobile-component-v1' and value.get('platform') == 'apple':
@@ -241,10 +240,12 @@ def component_output_identity(output):
     Only that absolute filename is observational; the version, entire module
     body, parsed facts, native bytes, BuildID, JNI/API and all other output
     fields still participate in equality. Neither original output is mutated.
+    Non-AAR outputs need no normalization and are returned as borrowed, read-only
+    comparison values; callers still re-inspect the current original bytes.
     """
+    if output.get('format') != 'AAR':
+        return output
     result = json.loads(json.dumps(output))
-    if result.get('format') != 'AAR':
-        return result
     require(isinstance(result.get('nativeLibraries'), dict), 'AAR native observation inventory missing')
     for name, row in result['nativeLibraries'].items():
         require(isinstance(row, dict), 'AAR native observation row differs')
@@ -497,11 +498,11 @@ def framework_entry_targets(entry):
     require(entry.get('SupportedPlatform') == 'ios' and
             entry.get('SupportedPlatformVariant') in (None, 'simulator'), 'framework must contain only device/simulator iOS')
     architectures = entry.get('SupportedArchitectures')
-    expected = ['arm64', 'x86_64'] if entry.get('SupportedPlatformVariant') == 'simulator' else ['arm64']
+    expected = ['arm64']
     require(isinstance(architectures, list) and all(isinstance(arch, str) for arch in architectures) and
             len(architectures) == len(expected) and set(architectures) == set(expected),
             'framework declared architecture inventory differs')
-    return ({'ios-arm64-simulator', 'ios-x86_64-simulator'} if len(expected) == 2 else {'ios-arm64'})
+    return ({'ios-arm64-simulator'} if entry.get('SupportedPlatformVariant') == 'simulator' else {'ios-arm64'})
 
 
 def objc_validation_getter_contract(header):
@@ -652,7 +653,7 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
                 'members': [{**{k: v for k, v in m.items() if k != 'machO'},
                              'goCarrier': any('buildInfo' in s for s in m['machO']['sections'])} for m in members]}
         require(entry_targets == expected_targets, 'actual framework target inventory differs')
-    require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly three architecture slices')
+    require(set(observed) == set(APPLE), 'formal Apple inventory must contain exactly two arm64 platform slices')
     inventory = tree_inventory(framework, pinned=pinned, observations=reads)
     require([{k: v for k, v in row.items() if k not in ('bytes', 'sha256')} for row in inventory] == layout,
             'framework layout changed during original-byte inspection')

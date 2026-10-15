@@ -31,6 +31,7 @@ import {
   PROTO_OPTIONS,
   ND_SPEC,
   allFields,
+  nodeFieldGroup,
   whenTls,
   whenHttpTls,
   whenReality,
@@ -3166,7 +3167,12 @@ describe('edit-only codec fidelity: opaque credentials, argv and OpenVPN policy'
     expect(protoCodec.tor.toConfig({ torArgs: '--DataDirectory "/tmp/tor data" \'\' a\\ b' }, SAMPLES.tor)
       .torSettings?.extraArgs).toEqual(['--DataDirectory', '/tmp/tor data', '', 'a b']);
     for (const text of ['"unfinished', "'unfinished", 'trailing\\']) {
-      expect(() => protoCodec.tor.toConfig({ torArgs: text }, SAMPLES.tor)).toThrow(/unfinished quote or escape/);
+      let error: unknown;
+      try { protoCodec.tor.toConfig({ torArgs: text }, SAMPLES.tor); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(ProtoCodecError);
+      expect(error).toMatchObject({ code: 'torArgsInvalid', field: 'torArgs' });
+      expect((error as ProtoCodecError).detail).toBeUndefined();
+      expect(nodeFieldGroup('tor', (error as ProtoCodecError).field!)).toBe('advanced');
     }
   });
 
@@ -3222,4 +3228,19 @@ it('edit-only ShadowTLS preserves imported whitespace-only credentials without r
     .shadowTlsSettings?.password).toBe('   ');
   expect(protoCodec.shadowsocks.toConfig(draft, { ...source, shadowTlsSettings: undefined })
     .shadowTlsSettings).toBeUndefined();
+});
+
+
+it('headers with Object prototype names remain own arrays and round-trip duplicate values', () => {
+  const source = SAMPLES['masque-client'];
+  const draft = { ...protoCodec['masque-client'].fromConfig(source), headers: 'constructor: a\ntoString: b\n__proto__: c\nconstructor: d' };
+  const saved = protoCodec['masque-client'].toConfig(draft, source);
+  const headers = saved.masqueClientSettings!.headers!;
+  expect(Object.getPrototypeOf(headers)).toBeNull();
+  expect(Object.keys(headers)).toEqual(['constructor', 'toString', '__proto__']);
+  expect(headers.constructor).toEqual(['a', 'd']);
+  expect(headers.toString).toEqual(['b']);
+  expect(headers.__proto__).toEqual(['c']);
+  const roundTrip = protoCodec['masque-client'].fromConfig(saved);
+  expect(protoCodec['masque-client'].toConfig(roundTrip, saved).masqueClientSettings?.headers).toEqual(headers);
 });

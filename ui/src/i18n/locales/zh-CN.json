@@ -1937,7 +1937,8 @@
       "customJsonTypeRequired": "自定义协议 JSON 缺少必填的 \"type\" 字段",
       "certPinInvalid": "证书固定值无效：{{detail}}（需为 SHA-256 摘要的十六进制或 Base64）",
       "derpServerInvalid": "DERP 服务器行不是合法 JSON：{{detail}}",
-      "extraJsonInvalid": "扩展配置必须是合法的 JSON 对象（留空表示不设置）"
+      "extraJsonInvalid": "扩展配置必须是合法的 JSON 对象（留空表示不设置）",
+      "torArgsInvalid": "Tor 参数中存在未闭合的引号或末尾反斜杠。请闭合引号或转义反斜杠。"
     },
     "field": {
       "aid": "AlterID",

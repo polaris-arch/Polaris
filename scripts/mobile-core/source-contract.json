@@ -80,13 +80,11 @@
   "apple": {
     "targets": [
       "ios/arm64",
-      "iossimulator/arm64",
-      "iossimulator/amd64"
+      "iossimulator/arm64"
     ],
     "slices": [
       "ios-arm64",
-      "ios-arm64-simulator",
-      "ios-x86_64-simulator"
+      "ios-arm64-simulator"
     ],
     "minimumOS": "15.0",
     "appMinimumOS": "17.0",

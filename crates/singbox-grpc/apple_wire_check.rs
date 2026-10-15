@@ -42,7 +42,6 @@ mod apple_wire_check {
         let (cpu, subtype, platform) = match target {
             "aarch64-apple-ios" => (0x0100_000c, 0, 2),
             "aarch64-apple-ios-sim" => (0x0100_000c, 0, 7),
-            "x86_64-apple-ios" => (0x0100_0007, 3, 7),
             _ => return Err("unsupported actual Cargo Apple target".into()),
         };
         if !bytes.starts_with(b"!<arch>\n") || bytes.len() > 1024 * 1024 * 1024 {

@@ -165,10 +165,12 @@ def source_status_observation():
                     reason = reason or 'hash-budget-or-deadline'; continue
                 if not path.resolve(strict=True).is_relative_to(ROOT.resolve(strict=True)):
                     reason = reason or 'redirected-path'; continue
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                # A regular file may become a FIFO between lstat and open.
+                # Never wait for its writer; validate the opened object too.
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 with os.fdopen(fd, 'rb') as stream:
                     actual = os.fstat(stream.fileno())
-                    if (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino):
+                    if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (info.st_dev, info.st_ino):
                         reason = reason or 'changed-file'; continue
                     digest, count = hashlib.sha256(), 0
                     while True:

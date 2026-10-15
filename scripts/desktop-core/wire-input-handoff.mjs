@@ -50,15 +50,16 @@ function checkWireArtifact(candidate, context, artifactName, env = process.env, 
     && metadata.size_in_bytes <= 512 * 1024 * 1024, 'Wire artifact ZIP size limit');
   return metadata;
 }
-function downloadWireArtifact(root, destination, candidate, context, name) {
-  const metadata = checkWireArtifact(candidate, context, name);
+export function downloadWireArtifact(root, destination, candidate, context, name, options = {}) {
+  const run = options.run ?? execFileSync, env = options.env ?? process.env;
+  const metadata = checkWireArtifact(candidate, context, name, env, run);
   demand(!present(destination), 'Fresh wire transport destination required'); regularPath(dirname(destination), true);
   const temporary = mkdtempSync(join(dirname(destination), '.wire-download-'));
   try {
     const zip = join(temporary, 'artifact.zip'), fd = openSync(zip, 'wx', 0o600);
-    try { execFileSync('gh', ['api', `/repos/${context.repository}/actions/artifacts/${metadata.id}/zip`],
-      { stdio: ['ignore', fd, 'pipe'], timeout: 300000, maxBuffer: 1024 * 1024 }); } finally { closeSync(fd); }
-    execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B',
+    try { run('gh', ['api', `/repos/${context.repository}/actions/artifacts/${metadata.id}/zip`],
+      { env, stdio: ['ignore', fd, 'pipe'], timeout: 300000, maxBuffer: 1024 * 1024 }); } finally { closeSync(fd); }
+    run(process.platform === 'win32' ? 'python' : 'python3', ['-B',
       join(root, 'scripts/desktop-core/release-archive.py'), zip, destination],
     { input: JSON.stringify({ wireTransport: { bytes: metadata.size_in_bytes, sha256: metadata.digest.slice(7) } }),
       encoding: 'utf8', timeout: 300000, maxBuffer: 1024 * 1024 });
@@ -277,9 +278,11 @@ async function main() {
     demand(values['artifact-name'], 'Exact wire handoff artifact required');
     const context = current(root, values.candidate, process.env, execFileSync);
     same(values['artifact-name'], coreWireHandoffName(values.candidate, context), 'Wire handoff artifact identity differs');
+    // Download checks inside its own boundary once. Separate check/import
+    // invocations still perform their own current-attempt API validation.
+    if (command === 'download') { downloadWireArtifact(root, resolve(values['bundle-dir']), values.candidate, context, values['artifact-name']); return; }
     checkWireArtifact(values.candidate, context, values['artifact-name']);
     if (command === 'check') return;
-    if (command === 'download') { downloadWireArtifact(root, resolve(values['bundle-dir']), values.candidate, context, values['artifact-name']); return; }
     const artifact = resolve(values['bundle-dir']), temporary = mkdtempSync(join(dirname(artifact), '.core-wire-import-'));
     try { const payload = unpackCoreWireHandoff(artifact, join(temporary, 'unpacked'));
       const result = importCoreWireHandoff(root, manifest, payload, values.candidate, values['artifact-name']);

@@ -2311,7 +2311,7 @@ async fn probe_through_proxy(
     auth: Option<&InboundUser>,
     target_url: &str,
 ) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let Some(request) = connectivity_probe_request(target_url, auth) else {
         return false;
     };
@@ -2319,15 +2319,79 @@ async fn probe_through_proxy(
     let probe = async {
         let mut stream = tokio::net::TcpStream::connect(&addr).await.ok()?;
         stream.write_all(request.as_bytes()).await.ok()?;
-        // 只需状态行（`HTTP/1.1 204 No Content`）；读一小段即可解析首行。
-        let mut buf = [0u8; 64];
-        let n = stream.read(&mut buf).await.ok()?;
-        let text = std::str::from_utf8(&buf[..n]).ok()?;
-        let code: u32 = text.split_whitespace().nth(1)?.parse().ok()?;
-        Some((200..400).contains(&code))
+        read_probe_status(&mut stream).await
     };
     matches!(
         tokio::time::timeout(Duration::from_millis(CONNECTIVITY_TIMEOUT_MS), probe).await,
         Ok(Some(true))
     )
+}
+
+
+/// Read one bounded, complete HTTP status line. The caller's single deadline covers
+/// connect, write and every fragment, so slow peers cannot renew their budget.
+async fn read_probe_status<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Option<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut line = Vec::with_capacity(64);
+    let mut chunk = [0_u8; 128];
+    loop {
+        let remaining = (1024 - line.len()).min(chunk.len());
+        if remaining == 0 {
+            return None;
+        }
+        let count = stream.read(&mut chunk[..remaining]).await.ok()?;
+        if count == 0 {
+            return None;
+        }
+        if let Some(end) = chunk[..count].iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&chunk[..=end]);
+            break;
+        }
+        line.extend_from_slice(&chunk[..count]);
+    }
+    let text = std::str::from_utf8(&line).ok()?.strip_suffix("\r\n")?;
+    let mut parts = text.splitn(3, ' ');
+    if !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1") {
+        return None;
+    }
+    let status = parts.next()?;
+    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let code: u16 = status.parse().ok()?;
+    Some((200..400).contains(&code))
+}
+
+#[cfg(test)]
+mod fragmented_probe_tests {
+    use super::read_probe_status;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn complete_line_required_across_fragments() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        tokio::spawn(async move {
+            for fragment in ["HTTP/1.", "1 2", "04 No Content\r", "\n"] {
+                writer.write_all(fragment.as_bytes()).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(read_probe_status(&mut reader).await, Some(true));
+        let mut truncated = &b"HTTP/1.1 204"[..];
+        assert_eq!(read_probe_status(&mut truncated).await, None);
+        let mut rejected = &b"HTTP/1.1 407 Authentication Required\r\n"[..];
+        assert_eq!(read_probe_status(&mut rejected).await, Some(false));
+        let oversized = vec![b'x'; 1025];
+        assert_eq!(read_probe_status(&mut oversized.as_slice()).await, None);
+    }
+
+    #[tokio::test]
+    async fn incomplete_slow_stream_obeys_one_outer_deadline() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"HTTP/1.1 2").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(5), read_probe_status(&mut reader))
+            .await.is_err());
+        drop(writer);
+    }
 }

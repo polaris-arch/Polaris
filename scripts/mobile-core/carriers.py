@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, canonical, load, require, sha
-from artifacts import receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt, inspection_stage
+from artifacts import APPLE, receipt_digest, file_pin, module, zip_entries, check_buildinfo, read_receipt, inspection_stage
 from producer import lease, run, write_json
 from consume import app_identity, apple_resources, verify_original
 
@@ -140,7 +140,19 @@ def verify_apple_resources(archive, app_root, expected):
     return observed
 
 
+def apple_version_raw(version):
+    """Encode the exact deployment/SDK version in LC_BUILD_VERSION form."""
+    require(isinstance(version, str) and re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', version),
+            'explicit Apple deployment/SDK version required')
+    parts = [int(part) for part in version.split('.')]
+    parts += [0] * (3 - len(parts))
+    require(0 < parts[0] <= 0xffff and all(0 <= part <= 0xff for part in parts[1:]),
+            'Apple deployment/SDK version out of range')
+    return parts[0] << 16 | parts[1] << 8 | parts[2]
+
+
 def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, simulator_arch=None):
+    require(simulator_arch in (None, 'arm64'), 'formal Apple supports only device-arm64 and sim-arm64')
     require(file_pin(link_path)['sha256'] == link_sha, 'fixed Apple link input bytes differ')
     link = read_receipt(Path(link_path))
     require(link['schema'] == 'polaris-mobile-apple-link-input-v1' and link['staticOnly'] is True and
@@ -154,6 +166,12 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
     require(current == link['App'] and apple_resources() == link['resources'],
             'App source/resources changed after link context was frozen')
     value = load()
+    target = 'ios-arm64-simulator' if simulator_arch else 'ios-arm64'
+    cpu, platform, _, _ = APPLE[target]
+    # Final App/PacketTunnel admission is distinct from the component's iOS15
+    # deployment floor. Require current native facts, even with correct plists.
+    minimum = apple_version_raw(value['apple']['appMinimumOS'])
+    sdk = apple_version_raw(value['apple']['simulatorSDK' if simulator_arch else 'iPhoneSDK'])
     helper = module('final_mobile_info', 'scripts/libbox-patches/android-source.py')
     parser = module('final_mobile_carrier', 'scripts/apple-carrier.py')
     with inspection_stage('ipa-parse'):
@@ -176,12 +194,15 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
             for name, root, info in [('app', app_root, app), ('extension', extension_root, extension)]:
                 require(info['UIDeviceFamily'] == [1, 2] and info['CFBundleSupportedPlatforms'] ==
                         (['iPhoneSimulator'] if simulator_arch else ['iPhoneOS']) and
-                        tuple(map(int, info['MinimumOSVersion'].split('.'))) >= (17, 0), 'actual device carrier scope differs')
+                        apple_version_raw(info['MinimumOSVersion']) == minimum, 'actual device carrier scope differs')
                 raw = archive.read(root + info['CFBundleExecutable'])
                 parsed = parser.container(raw, helper)
-                cpu = 0x1000007 if simulator_arch == 'amd64' else 0x100000c
                 require(parsed['kind'] == 'Mach-O64' and parsed['cpu'] == cpu and parsed['filetype'] == 2,
                         'actual App binary target must be the selected thin MH_EXECUTE')
+                commands = parsed['platformCommands']
+                require(len(commands) == 1 and commands[0]['platform'] == platform and
+                        commands[0]['minOSRaw'] == minimum and commands[0]['sdkRaw'] == sdk,
+                        'actual ' + name + ' native platform/deployment/SDK differs')
                 rows[name] = {'bytes': len(raw), 'sha256': sha(raw), 'bundleIdentifier': info['CFBundleIdentifier']}
                 if name == 'extension':
                     infos = [s['buildInfo'] for s in parsed['sections'] if 'buildInfo' in s]
@@ -195,7 +216,6 @@ def apple(ipa, link_path, link_sha, linkmap, receipt_path, scratch, derived, sim
                     'build-only static SDK must not be copied into the installed App')
     original_map = Path(linkmap).read_bytes()
     text = original_map.decode('utf-8')
-    target = ('ios-x86_64-simulator' if simulator_arch == 'amd64' else 'ios-arm64-simulator') if simulator_arch else 'ios-arm64'
     selected = receipt['output']['slices'][target]
     consumed = static_linkmap(text, link['framework'], selected, derived)
     require(app_identity() == current and file_pin(link_path)['sha256'] == link_sha,
@@ -217,7 +237,7 @@ def main():
     for name in ('component', 'r8', 'link-input', 'linkmap', 'go', 'javap', 'readelf', 'derived-data'):
         parser.add_argument('--' + name, type=Path)
     parser.add_argument('--link-input-sha256')
-    parser.add_argument('--simulator-arch', choices=['arm64', 'amd64'])
+    parser.add_argument('--simulator-arch', choices=['arm64'])
     parser.add_argument('--abi', choices=['arm64-v8a', 'armeabi-v7a', 'universal'], default='arm64-v8a')
     args = parser.parse_args()
     require(args.scratch.is_dir() and not args.scratch.is_symlink(), 'fixed owned scratch required')

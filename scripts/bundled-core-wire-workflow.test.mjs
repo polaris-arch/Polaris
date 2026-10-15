@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { downloadWireArtifact, coreWireHandoffName } from './desktop-core/wire-input-handoff.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
@@ -201,4 +203,61 @@ test('every production consumption job seeds an absolute deadline before tools a
     assert.match(setter.body, /POLARIS_RELEASE_JOB_DEADLINE_MS=/);
     assert(timeout > 61 && timeout <= 180, 'bounded primary wait must fit within a finite job limit');
   }
+});
+
+
+test('one download authenticates its metadata once and retains ZIP digest verification', () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'polaris-wire-download-test-'));
+  const candidate = 'a'.repeat(40), sha256 = 'b'.repeat(64);
+  const context = { repository: 'example/polaris', runId: '42', attempt: '3' };
+  const name = coreWireHandoffName(candidate, context);
+  const metadata = { id: 71, name, expired: false, digest: `sha256:${sha256}`,
+    size_in_bytes: 1234, workflow_run: { id: 42, head_sha: candidate } };
+  const env = { CORE_WIRE_INPUT_ARTIFACT_ID: '71', CORE_WIRE_INPUT_ARTIFACT_DIGEST: sha256,
+    GITHUB_SHA: candidate, GITHUB_EVENT_NAME: 'push' };
+  const calls = [];
+  const run = (tool, args, options) => {
+    calls.push({ tool, args, options });
+    if (tool === 'gh' && !args[1].endsWith('/zip')) return JSON.stringify(metadata);
+    return '';
+  };
+  try {
+    downloadWireArtifact(root, join(scratch, 'download'), candidate, context, name, { env, run });
+    assert.equal(calls.length, 3);
+    assert.equal(calls.filter(({ tool, args }) => tool === 'gh' && !args[1].endsWith('/zip')).length, 1);
+    assert.deepEqual(calls[1].args, ['api', '/repos/example/polaris/actions/artifacts/71/zip']);
+    assert.deepEqual(JSON.parse(calls[2].options.input), { wireTransport: { bytes: 1234, sha256 } });
+    assert.equal(calls[1].options.env, env);
+    assert.equal(calls[2].args.at(-1), join(scratch, 'download'));
+    assert.equal(existsSync(calls[2].args.at(-2)), false, 'temporary ZIP retired after verification boundary');
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+});
+
+for (const fault of ['id', 'digest', 'run', 'head', 'attempt', 'size']) {
+  test(`download refuses ${fault} metadata before requesting ZIP`, () => {
+    const candidate = 'a'.repeat(40), sha256 = 'b'.repeat(64);
+    const context = { repository: 'example/polaris', runId: '42', attempt: '3' };
+    const name = coreWireHandoffName(candidate, context);
+    const metadata = { id: 71, name, expired: false, digest: `sha256:${sha256}`,
+      size_in_bytes: 1234, workflow_run: { id: 42, head_sha: candidate } };
+    if (fault === 'id') metadata.id = 72;
+    if (fault === 'digest') metadata.digest = `sha256:${'c'.repeat(64)}`;
+    if (fault === 'run') metadata.workflow_run.id = 43;
+    if (fault === 'head') metadata.workflow_run.head_sha = 'd'.repeat(40);
+    if (fault === 'attempt') metadata.name = coreWireHandoffName(candidate, { ...context, attempt: '2' });
+    if (fault === 'size') metadata.size_in_bytes = 512 * 1024 * 1024 + 1;
+    const calls = [];
+    assert.throws(() => downloadWireArtifact(root, join(tmpdir(), 'never-created-wire-download'), candidate, context, name,
+      { env: { CORE_WIRE_INPUT_ARTIFACT_ID: '71', CORE_WIRE_INPUT_ARTIFACT_DIGEST: sha256,
+        GITHUB_SHA: candidate, GITHUB_EVENT_NAME: 'push' },
+      run: (tool, args) => { calls.push({ tool, args }); return JSON.stringify(metadata); } }), /pin differs|size limit/);
+    assert.equal(calls.length, 1);
+    assert.ok(!calls[0].args[1].endsWith('/zip'));
+  });
+}
+
+
+test('CLI download owns its one check; check/import keep a separate validation boundary', () => {
+  const source = readFileSync(join(root, 'scripts/desktop-core/wire-input-handoff.mjs'), 'utf8');
+  assert.match(source, /if \(command === 'download'\) \{ downloadWireArtifact\([^\n]+; return; \}\n    checkWireArtifact\(values\.candidate, context, values\['artifact-name'\]\);\n    if \(command === 'check'\) return;/);
 });

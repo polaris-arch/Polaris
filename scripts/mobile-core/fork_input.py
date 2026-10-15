@@ -13,7 +13,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
 ANDROID_TARGETS = ['android/arm64', 'android/arm', 'android/386', 'android/amd64']
-APPLE_TARGETS = ['ios/arm64', 'iossimulator/arm64', 'iossimulator/amd64']
+APPLE_TARGETS = ['ios/arm64', 'iossimulator/arm64']
 ANDROID_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
 
 
@@ -73,9 +73,9 @@ def validate(value):
             android.get('ndkSourceRevision') == '30.0.16138531-beta3' and android['ndkPackage'] == 'android-ndk-r30-beta3',
             'formal Android NDK differs')
     require(apple['targets'] == APPLE_TARGETS and
-            apple['slices'] == ['ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator'] and
+            apple['slices'] == ['ios-arm64', 'ios-arm64-simulator'] and
             apple['minimumOS'] == '15.0' and apple['appMinimumOS'] == '17.0' and
-            apple['macOSTvOSIncluded'] is False, 'formal Apple requires exactly three iOS architecture slices')
+            apple['macOSTvOSIncluded'] is False, 'formal Apple requires exactly two arm64 iOS platform slices')
     require(apple['frameworkName'] == 'Libbox.xcframework' and
             android['libname'] == apple['libname'] == 'box' and android['javaPackage'] == 'io.nekohasekai',
             'existing SDK bindings must be retained')

@@ -257,7 +257,7 @@ def open_lock(path):
     return fd
 
 
-def inherited(fd, work, value, root):
+def inherited(fd, work, reserve, root):
     gate = open_lock(root / '.admission.lock')
     try:
         fcntl.flock(gate, fcntl.LOCK_SH)
@@ -271,7 +271,7 @@ def inherited(fd, work, value, root):
                 stat.S_IMODE(info.st_mode) == 0o600 and not path.is_symlink() and
                 row['filesystem'] == info.st_dev and Path(row['work']).stat().st_dev == info.st_dev and
                 row['schema'] == 'polaris-mobile-filesystem-reservation-v1' and
-                row['reserveBytes'] >= value['budget']['buildPeakReserveBytes'], 'inherited reservation identity differs')
+                row['reserveBytes'] >= reserve, 'inherited reservation identity differs')
         # On an inherited open-file description this retains the existing lock;
         # another description cannot steal a live reservation.
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -280,7 +280,11 @@ def inherited(fd, work, value, root):
 
 
 @contextlib.contextmanager
-def reservation(work, value, active_fds):
+def reservation(work, value, active_fds, *, reserve_bytes=None):
+    # Compilation keeps its unchanged contract peak. Evidence callers provide
+    # their separately bounded write peak through this same ledger/lock protocol.
+    reserve = value['budget']['buildPeakReserveBytes'] if reserve_bytes is None else reserve_bytes
+    require(type(reserve) is int and reserve > 0, 'reservation byte requirement invalid')
     work = directory(work)
     # Hosted and local builders use the same child-held ledger descriptor.
     # A free-space observation alone cannot admit/transport a reservation.
@@ -293,7 +297,7 @@ def reservation(work, value, active_fds):
     if prior is not None:
         require(prior.isdigit(), 'reservation descriptor invalid')
         fd = int(prior)
-        inherited(fd, work, value, root)
+        inherited(fd, work, reserve, root)
         added = fd not in active_fds
         if added:
             active_fds.append(fd)
@@ -332,7 +336,6 @@ def reservation(work, value, active_fds):
                     outstanding += json.loads(os.pread(other, 8192, 0))['reserveBytes']
             finally:
                 os.close(other)
-        reserve = value['budget']['buildPeakReserveBytes']
         space = os.statvfs(work)
         require(space.f_bavail * space.f_frsize >= outstanding + reserve + 1024 ** 3,
                 'shared filesystem peak reservations exhaust free space')

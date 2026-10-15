@@ -110,12 +110,12 @@ def main():
     for name in ('source', 'go', 'gomobile', 'gobind', 'developer', 'work', 'cache'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--simulator', action='store_true')
-    parser.add_argument('--simulator-arch', choices=['arm64', 'amd64'], default='arm64')
+    parser.add_argument('--simulator-arch', choices=['arm64'], default='arm64')
     parser.add_argument('--signing-team', help='Explicit device signing identity; omit for unsigned compile/link probe')
-    parser.add_argument('--component-work', type=Path, help='One fixed shared three-slice component slot')
+    parser.add_argument('--component-work', type=Path, help='One fixed shared two-slice arm64 component slot')
     parser.add_argument('--rust-target', type=Path, help='One fixed Rust target shared under the actual cache lease')
     parser.add_argument('--imported-component', action='store_true', help='Verify same-run frozen component handoff; never reproduce it')
-    parser.add_argument('--slot', choices=['device-arm64', 'sim-arm64', 'sim-amd64'])
+    parser.add_argument('--slot', choices=['device-arm64', 'sim-arm64'])
     parser.add_argument('--progress-fd', type=int, help='Explicit parent stdout descriptor for fixed phase events')
     args = parser.parse_args()
     value = load()
@@ -173,7 +173,7 @@ def main():
         env['PATH'] = str(ROOT / 'ui/node_modules/.bin') + os.pathsep + env.get('PATH', '')
         platform = 'iphonesimulator' if args.simulator else 'iphoneos'
         env.update(PLATFORM_NAME=platform, CONFIGURATION='release',
-                   ARCHS='x86_64' if args.simulator and args.simulator_arch == 'amd64' else 'arm64')
+                   ARCHS='arm64')
         env['SDKROOT'] = run(['xcrun', '--sdk', platform, '--show-sdk-path'], env=env).strip()
         from budget import native_capacity, native_environment
         observation = native_capacity()
@@ -197,7 +197,7 @@ def main():
                    '-destination', 'generic/platform=iOS Simulator' if args.simulator else 'generic/platform=iOS',
                    '-archivePath', archive, 'archive', 'LD_GENERATE_MAP_FILE=YES']
         if args.simulator:
-            command += ['ARCHS=' + ('x86_64' if args.simulator_arch == 'amd64' else 'arm64'), 'ONLY_ACTIVE_ARCH=YES']
+            command += ['ARCHS=arm64', 'ONLY_ACTIVE_ARCH=YES']
         if args.signing_team:
             require(not args.simulator and args.signing_team.isalnum(), 'explicit device signing team differs')
             command += ['DEVELOPMENT_TEAM=' + args.signing_team]

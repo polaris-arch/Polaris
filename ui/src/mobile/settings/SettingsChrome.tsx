@@ -448,6 +448,8 @@ export function MobileListEditor({
   confirmLabel,
   cancelLabel,
   emptyLabel,
+  entryIdentity,
+  onValidate,
 }: {
   id: string;
   value: readonly string[];
@@ -462,6 +464,8 @@ export function MobileListEditor({
   cancelLabel: string;
   /** 空清单时的一句话。**不是缺席声明** —— 清单可编辑，只是现在是空的。 */
   emptyLabel: string;
+  entryIdentity?: (value: string) => string;
+  onValidate?: (value: readonly string[]) => void;
 }): ReactElement {
   const [draft, setDraft] = useState<readonly string[]>(value);
   const seeded = useRef<readonly string[]>(value);
@@ -476,6 +480,7 @@ export function MobileListEditor({
   /** 提交到父级。与 `value` 逐项相同就**不写** —— 免一次无谓落盘（同桌面那份）。 */
   function commit(next: readonly string[]): void {
     setDraft(next);
+    onValidate?.(next);
     if (!sameEntries(next, value)) onChange([...next]);
   }
 
@@ -523,7 +528,7 @@ export function MobileListEditor({
             <MobileButton
               tone="primary"
               onClick={() => {
-                commit(parseBulkEntries(importDraft, [...draft]));
+                commit(parseBulkEntries(importDraft, [...draft], undefined, entryIdentity));
                 setImportDraft('');
                 setImportOpen(false);
               }}

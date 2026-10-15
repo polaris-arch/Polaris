@@ -21,7 +21,8 @@ vi.mock('react', async (original) => ({
   },
   useEffect: (effect: () => void) => { h.effect ??= effect; },
 }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(), useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('@/ipc/api-client', () => ({ helperApi: {
   getStatus: vi.fn(), install: vi.fn(), uninstall: vi.fn(),
   onUpgradeable: (f: () => void) => { h.refresh = f; return () => {}; },
@@ -30,6 +31,9 @@ vi.mock('@/lib/error-handler', () => ({ toast: { error: vi.fn() } }));
 vi.mock('@/lib/confirm-twice', () => ({ useConfirmTwice: () => ({
   armed: null, confirmTwice: (_key: string, action: () => void) => action(),
 }) }));
+// Initialization must settle (or fail this suite), never leak an unhandled rejection.
+await (await import('@/i18n')).i18nReady;
+
 const { helperApi } = await import('@/ipc/api-client');
 const { toast } = await import('@/lib/error-handler');
 const { default: Screen } = await import('./SettingsHelper');

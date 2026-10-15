@@ -65,7 +65,7 @@ use polaris_config_engine::builder::{
 };
 use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
-use polaris_config_engine::user_config::dns_constants::{is_direct_selection, DIRECT_TAG};
+use polaris_config_engine::user_config::dns_constants::{is_direct_selection, is_sentinel_selection, BLOCK_TAG, DIRECT_TAG};
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_proxy_port};
 use polaris_config_engine::user_config::server_config::ServerConfig;
@@ -4422,6 +4422,17 @@ pub(super) fn attest_effective_exit(
     if is_direct_selection(started_with) {
         return ExitAttestation::Match;
     }
+    if is_sentinel_selection(started_with) {
+        let expected = BLOCK_TAG;
+        return match effective_exit_tag(singbox_config) {
+            Some(actual) if actual == expected => ExitAttestation::Match,
+            Some(actual) => ExitAttestation::WrongExit {
+                expected_tag: expected.to_string(),
+                actual_tag: actual,
+            },
+            None => ExitAttestation::UnresolvedExit { expected_tag: expected.to_string() },
+        };
+    }
     // 未选中任何节点 → 无可对账的意图（generate 侧另有校验）。
     let Some(selected_id) = started_with else {
         return ExitAttestation::Match;
@@ -4472,4 +4483,27 @@ pub(super) fn server_ids(config: &Value) -> std::collections::HashSet<String> {
         }
     }
     set
+}
+
+
+#[cfg(test)]
+mod block_sentinel_attestation_tests {
+    use super::*;
+
+    #[test]
+    fn intentional_block_is_not_an_unknown_node_but_wrong_and_stale_exits_still_fail() {
+        let cfg: UserConfig = serde_json::from_value(serde_json::json!({
+            "servers": [], "selectedServerId": "__block__", "proxyMode": "global"
+        })).unwrap();
+        let core = |tag: &str| -> SingBoxConfig {
+            serde_json::from_value(serde_json::json!({ "inbounds": [], "outbounds": [],
+                "route": { "rules": [], "final": tag } })).unwrap()
+        };
+        assert_eq!(attest_effective_exit(&cfg, &core(BLOCK_TAG), Some("__block__")), ExitAttestation::Match);
+        assert!(matches!(attest_effective_exit(&cfg, &core(DIRECT_TAG), Some("__block__")), ExitAttestation::WrongExit { .. }));
+        assert!(matches!(attest_effective_exit(&cfg, &core(BLOCK_TAG), Some("other")), ExitAttestation::StaleSelection { .. }));
+        let mut unknown = cfg;
+        unknown.selected_server_id = Some("missing".to_string());
+        assert!(matches!(attest_effective_exit(&unknown, &core(BLOCK_TAG), Some("missing")), ExitAttestation::UnknownSelection { .. }));
+    }
 }

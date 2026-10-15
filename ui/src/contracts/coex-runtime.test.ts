@@ -4,19 +4,37 @@ import { createHash } from 'node:crypto';
 import fixture from './coex-runtime.rust.fixture.json';
 import { decodeCoexRuntimeState } from './coex-runtime';
 const latest = () => structuredClone(fixture.states.latest);
-describe('actual runtime Rust serializer boundary', () => {
-  it('pins original serializer sources and the current graph without relabeling actual exported states', () => {
-    expect(fixture.sourceCompatibility.newSerializerExecution).toBe(false);
-    for (const path of fixture.sourceCompatibility.changedTestSources) {
-      expect(fixture.sourceCompatibility.unchangedOriginalSources).not.toContain(path);
-      expect(fixture.sourceCompatibility.sourceSha256[path as keyof typeof fixture.sourceCompatibility.sourceSha256])
+describe('historical actual Rust export and current source boundary', () => {
+  it('pins the historical export and partitions the complete current nine-source graph', () => {
+    const compatibility = fixture.sourceCompatibility;
+    expect(compatibility.newSerializerExecution).toBe(false);
+    expect(compatibility.currentStatesReexported).toBe(false);
+    // Preserve original historical identity; a source refresh is never a serializer run.
+    expect(createHash('sha256').update(JSON.stringify(fixture.producer)).digest('hex'))
+      .toBe('eed3e1a21b6913fb5cc8f1525b0a15bf13119518960b42fd7767d29448135fd7');
+    expect(createHash('sha256').update(JSON.stringify(fixture.states)).digest('hex'))
+      .toBe(compatibility.originalStatesCanonicalSha256);
+    const changed = [...compatibility.changedObserverSources,
+      ...compatibility.changedControlSources, ...compatibility.changedTestSources];
+    const classified = [...changed, ...compatibility.unchangedOriginalSources];
+    const sourcePaths = Object.keys(fixture.producer.sourceSha256).sort();
+    expect(sourcePaths).toHaveLength(9);
+    expect(classified).toHaveLength(9);
+    expect(new Set(classified).size).toBe(9);
+    expect([...classified].sort()).toEqual(sourcePaths);
+    expect(Object.keys(compatibility.sourceSha256).sort()).toEqual(sourcePaths);
+    expect(Object.keys(compatibility.sourceReview).sort()).toEqual(sourcePaths);
+    expect(compatibility.changedObserverSources).toContain('src-tauri/src/runtime/proxy/coex_observer.rs');
+    expect(compatibility.changedControlSources).toContain('src-tauri/src/runtime/proxy/lifecycle.rs');
+    for (const path of changed) {
+      expect(compatibility.sourceSha256[path as keyof typeof compatibility.sourceSha256])
         .not.toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
     }
-    for (const path of fixture.sourceCompatibility.unchangedOriginalSources) {
-      expect(fixture.sourceCompatibility.sourceSha256[path as keyof typeof fixture.sourceCompatibility.sourceSha256])
+    for (const path of compatibility.unchangedOriginalSources) {
+      expect(compatibility.sourceSha256[path as keyof typeof compatibility.sourceSha256])
         .toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);
     }
-    for (const [path, sha] of Object.entries(fixture.sourceCompatibility.sourceSha256)) {
+    for (const [path, sha] of Object.entries(compatibility.sourceSha256)) {
       expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
     }
   });

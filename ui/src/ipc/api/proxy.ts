@@ -28,11 +28,11 @@ export const proxyApi = {
 
   async stopExpected(expected: ExpectedMainCoreStop): Promise<ExpectedMainCoreStopResult> {
     if (!Number.isSafeInteger(expected.expectedMainGeneration) || expected.expectedMainGeneration <= 0) {
-      throw new Error('Invalid expected main generation');
+      throw new Error('INVALID_EXPECTED_MAIN_GENERATION');
     }
     if (!Number.isSafeInteger(expected.expectedSelectionIntentGeneration) || expected.expectedSelectionIntentGeneration < 0
       || !(expected.expectedSelectedServerId === null || (typeof expected.expectedSelectedServerId === 'string' && expected.expectedSelectedServerId.length > 0))) {
-      throw new Error('Invalid expected selection context');
+      throw new Error('INVALID_EXPECTED_SELECTION_CONTEXT');
     }
     return invoke(IPC_CHANNELS.PROXY_STOP, expected);
   },

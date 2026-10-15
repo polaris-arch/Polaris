@@ -14,7 +14,7 @@ class AppleHandoffControls(unittest.TestCase):
     ctx = {'candidate': 'a' * 40, 'runId': '123', 'attempt': '1', 'repository': 'polaris-arch/Polaris'}
     app = {'candidate': 'a' * 40, 'files': {'synthetic.py': {'bytes': 1, 'sha256': 'b' * 64}}}
 
-    def test_three_same_host_exports_preserve_each_original_and_reject_repeat(self):
+    def test_two_arm64_same_host_exports_preserve_each_original_and_reject_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'component-transport.json').write_text(json.dumps({'original': 'same-run'}))
@@ -188,7 +188,7 @@ class AppleHandoffControls(unittest.TestCase):
                     self.assertEqual('--simulator' in command, slot != 'device-arm64')
                     if slot != 'device-arm64':
                         self.assertEqual(command[command.index('--simulator-arch') + 1],
-                                         'amd64' if slot == 'sim-amd64' else 'arm64')
+                                         'arm64')
                     summary.assert_called_once_with(root, slot)
 
     def test_real_payload_roundtrip_umask022_preserves_private_slots_empty_dirs_and_component_predicate(self):
@@ -231,12 +231,11 @@ class AppleHandoffControls(unittest.TestCase):
                 return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info), build_id)),
                                          ('native.o', native)])
             device = single_fat_archive(archive('ios-arm64', 'arm64', False))
-            simulator = fixtures.fat(archive('ios-x86_64-simulator', 'amd64', True),
-                                    archive('ios-arm64-simulator', 'arm64', True))
+            simulator = archive('ios-arm64-simulator', 'arm64', True)
             framework = component / 'Libbox.xcframework'; framework.mkdir(mode=0o755)
             entries = []
             for identifier, variant, arches, raw in [('ios-arm64', None, ['arm64'], device),
-                    ('ios-arm64_x86_64-simulator', 'simulator', ['arm64', 'x86_64'], simulator)]:
+                    ('ios-arm64-simulator', 'simulator', ['arm64'], simulator)]:
                 entry = {'LibraryIdentifier': identifier, 'LibraryPath': 'Libbox.framework',
                          'SupportedPlatform': 'ios', 'SupportedArchitectures': arches}
                 if variant: entry['SupportedPlatformVariant'] = variant
@@ -398,7 +397,8 @@ class AppleHandoffControls(unittest.TestCase):
                     handoff.restore_payload(package, rows, root, checkout)
                 self.assertFalse(any((root / name).is_symlink() for name in links))
 
-    def test_exact_three_slot_aggregate_rejects_missing_wrong_target_and_other_attempt(self):
+    def test_exact_two_arm64_aggregate_rejects_missing_extra_legacy_and_identity_changes(self):
+        self.assertEqual(handoff.SLOTS, ('device-arm64', 'sim-arm64'))
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp); (folder / 'component').mkdir()
             manifest = self.signed({'schema': 'polaris-apple-component-handoff-v1',
@@ -407,25 +407,35 @@ class AppleHandoffControls(unittest.TestCase):
             mp = folder / 'component/component-handoff.json'; mp.write_text(json.dumps(manifest))
             transport = self.signed({'schema': 'polaris-apple-handoff-transport-v1',
                 'context': self.ctx, 'manifest': file_pin(mp), 'archive': {'bytes': 1, 'sha256': 'e' * 64}})
-            (folder / 'component/component-transport.json').write_text(json.dumps(transport))
+            tp = folder / 'component/component-transport.json'; tp.write_text(json.dumps(transport))
             wrappers = {}
-            for slot, target in zip(handoff.SLOTS, ('ios-arm64', 'ios-arm64-simulator', 'ios-x86_64-simulator')):
+            for slot, target in zip(handoff.SLOTS, ('ios-arm64', 'ios-arm64-simulator')):
                 (folder / slot).mkdir()
-                rust_target = {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim',
-                               'sim-amd64': 'x86_64-apple-ios'}[slot]
+                rust_target = {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim'}[slot]
                 rust = self.signed({'schema': 'polaris-formal-apple-rust-v1', 'App': self.app,
                     'target': rust_target, 'tools': {'fixed': 'bytes'}, 'rustc': 'fixed-version',
                     'linkInputSha256': 'f' * 64, 'devicePassed': False})
                 rust_path = folder / slot / 'summary-rust-receipt.json'; rust_path.write_text(json.dumps(rust))
-                receipt = self.signed({'App': self.app, 'producerCandidate': self.ctx['candidate'],
+                receipt = self.signed({'schema': 'polaris-mobile-apple-carrier-v1',
+                    'App': self.app, 'producerCandidate': self.ctx['candidate'],
                     'selectedTarget': target, 'componentFingerprint': 'c' * 64,
                     'linkInputSha256': 'f' * 64, 'rustInput': file_pin(rust_path),
                     'AppCarrierValidated': True, 'AppAccepted': False,
                     'devicePassed': False, 'signatureTrustValidated': False})
                 actual = folder / slot / 'summary-app-carrier.json'; actual.write_text(json.dumps(receipt))
                 row = self.signed({'schema': 'polaris-apple-carrier-handoff-v1', 'context': self.ctx,
-                    'slot': slot, 'componentTransport': transport, 'receipt': receipt, 'receiptPin': file_pin(actual)})
+                    'slot': slot, 'componentTransport': transport, 'receipt': receipt, 'receiptPin': file_pin(actual),
+                    'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False})
                 wrappers[slot] = row
+                (folder / slot / ('carrier-' + slot + '.json')).write_text(json.dumps(row))
+            original_files = {path: path.read_bytes() for path in folder.rglob('*') if path.is_file()}
+            def restore():
+                for path, raw in original_files.items():
+                    path.write_bytes(raw)
+            def update_wrapper(row, slot='sim-arm64'):
+                actual = folder / slot / 'summary-app-carrier.json'
+                self.signed(row['receipt']); actual.write_text(json.dumps(row['receipt']))
+                row['receiptPin'] = file_pin(actual); self.signed(row)
                 (folder / slot / ('carrier-' + slot + '.json')).write_text(json.dumps(row))
             with mock.patch.object(handoff, 'context', return_value=self.ctx), \
                     mock.patch.object(handoff, 'producer_code', return_value=self.app), \
@@ -433,31 +443,94 @@ class AppleHandoffControls(unittest.TestCase):
                     mock.patch('consume.app_identity', return_value=self.app), \
                     mock.patch.object(handoff, 'write_json') as write:
                 handoff.aggregate(folder, folder / 'unused.json')
-                self.assertEqual(write.call_args.args[1]['completeSlots'], list(handoff.SLOTS))
-                actual_pin_path = folder / 'device-arm64/summary-app-carrier.json'
-                original_bytes = actual_pin_path.read_bytes()
-                actual_pin_path.write_bytes(original_bytes + b' ')
-                with self.assertRaisesRegex(RuntimeError, 'receipt bytes differ'):
+                self.assertEqual(write.call_args.args[1]['completeSlots'], ['device-arm64', 'sim-arm64'])
+                self.assertEqual(set(write.call_args.args[1]['carriers']), set(handoff.SLOTS))
+                self.assertFalse(write.call_args.args[1]['publicationEligible'])
+                for slot in handoff.SLOTS:
+                    for flag in ('devicePassed', 'signatureTrustValidated', 'publicationEligible'):
+                        for mutation, value in [('true', True), ('missing', None), ('zero', 0), ('null', None)]:
+                            changed = copy.deepcopy(wrappers[slot])
+                            if mutation == 'missing':
+                                del changed[flag]
+                            else:
+                                changed[flag] = value
+                            update_wrapper(changed, slot)
+                            # Scope is the only changed admission fact: native
+                            # receipts, byte pins and all run/source identities
+                            # remain valid and original while the wrapper is
+                            # independently re-fingerprinted.
+                            for name in ('summary-app-carrier.json', 'summary-rust-receipt.json'):
+                                original = folder / slot / name
+                                self.assertEqual(original.read_bytes(), original_files[original])
+                            write.reset_mock()
+                            with self.subTest(slot=slot, flag=flag, mutation=mutation), \
+                                    self.assertRaisesRegex(RuntimeError, 'slot/context/component/scope'):
+                                handoff.aggregate(folder, folder / 'unused.json')
+                            write.assert_not_called()
+                            restore()
+                for extra in ('sim-amd64', 'legacy-summary'):
+                    path = folder / extra; path.mkdir()
+                    with self.subTest(extra=extra), self.assertRaisesRegex(RuntimeError, 'exactly component'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    path.rmdir()
+                missing = folder / 'sim-arm64'; moved = folder / 'old-sim-arm64'
+                missing.rename(moved)
+                with self.assertRaisesRegex(RuntimeError, 'exactly component'):
                     handoff.aggregate(folder, folder / 'unused.json')
-                actual_pin_path.write_bytes(original_bytes)
-                victim = folder / 'sim-amd64/carrier-sim-amd64.json'
-                original = victim.read_bytes(); victim.unlink()
+                moved.rename(missing)
+                victim = folder / 'sim-arm64/carrier-sim-arm64.json'; victim.unlink()
                 with self.assertRaisesRegex(RuntimeError, 'bounded regular original receipt required:.*bytes=0'):
                     handoff.aggregate(folder, folder / 'unused.json')
-                victim.write_bytes(original)
-                changed = copy.deepcopy(wrappers['sim-amd64'])
-                changed['receipt']['selectedTarget'] = 'ios-arm64'
-                self.signed(changed['receipt']); self.signed(changed)
-                (folder / 'sim-amd64/summary-app-carrier.json').write_text(json.dumps(changed['receipt']))
-                changed['receiptPin'] = file_pin(folder / 'sim-amd64/summary-app-carrier.json'); self.signed(changed)
-                victim.write_text(json.dumps(changed))
-                with self.assertRaisesRegex(RuntimeError, 'carrier identity/scope'):
-                    handoff.aggregate(folder, folder / 'unused.json')
-                changed = copy.deepcopy(wrappers['sim-arm64']); changed['context'] = {**self.ctx, 'attempt': '2'}
-                self.signed(changed)
-                (folder / 'sim-arm64/carrier-sim-arm64.json').write_text(json.dumps(changed))
+                restore()
+                for name in ('summary-app-carrier.json', 'summary-rust-receipt.json'):
+                    actual = folder / 'sim-arm64' / name
+                    actual.write_bytes(actual.read_bytes() + b' ')
+                    with self.subTest(original=name), self.assertRaisesRegex(RuntimeError, 'receipt bytes differ'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    restore()
+                for key, value in [('attempt', '2'), ('runId', '124'), ('candidate', 'b' * 40)]:
+                    changed = copy.deepcopy(wrappers['sim-arm64'])
+                    changed['context'] = {**self.ctx, key: value}; update_wrapper(changed)
+                    with self.subTest(context=key), self.assertRaisesRegex(RuntimeError, 'slot/context/component'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    restore()
+                for key, value in [('selectedTarget', 'ios-arm64'), ('selectedTarget', 'ios-x86_64-simulator'),
+                                   ('componentFingerprint', 'd' * 64), ('producerCandidate', 'b' * 40),
+                                   ('App', {**self.app, 'files': {'different': 'source'}}),
+                                   ('schema', 'polaris-mobile-apple-carrier-v0'), ('AppAccepted', True),
+                                   ('devicePassed', True), ('signatureTrustValidated', True)]:
+                    changed = copy.deepcopy(wrappers['sim-arm64']); changed['receipt'][key] = value
+                    update_wrapper(changed)
+                    with self.subTest(receipt=key, value=value), self.assertRaisesRegex(RuntimeError, 'carrier identity/scope'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    restore()
+                for key, value in [('target', 'aarch64-apple-ios'), ('target', 'x86_64-apple-ios'),
+                                   ('tools', {'fixed': 'different'}), ('rustc', 'different-version'),
+                                   ('App', {**self.app, 'files': {'different': 'source'}})]:
+                    rust_path = folder / 'sim-arm64/summary-rust-receipt.json'
+                    rust = json.loads(rust_path.read_bytes()); rust[key] = value
+                    self.signed(rust); rust_path.write_text(json.dumps(rust))
+                    changed = copy.deepcopy(wrappers['sim-arm64']); changed['receipt']['rustInput'] = file_pin(rust_path)
+                    update_wrapper(changed)
+                    with self.subTest(rust=key, value=value), self.assertRaisesRegex(RuntimeError, 'aggregate (Rust|actual Rust)'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    restore()
+                for key, value in [('sourceContract', {'source': 'different'}),
+                                   ('App', {**self.app, 'files': {'different': 'source'}}),
+                                   ('schema', 'polaris-apple-component-handoff-v0')]:
+                    changed = copy.deepcopy(manifest); changed[key] = value; self.signed(changed)
+                    mp.write_text(json.dumps(changed))
+                    moved_transport = copy.deepcopy(transport); moved_transport['manifest'] = file_pin(mp)
+                    self.signed(moved_transport); tp.write_text(json.dumps(moved_transport))
+                    with self.subTest(manifest=key), self.assertRaisesRegex(RuntimeError, 'component/source'):
+                        handoff.aggregate(folder, folder / 'unused.json')
+                    restore()
+                changed = copy.deepcopy(wrappers['sim-arm64']); changed['schema'] = 'polaris-apple-carrier-handoff-v0'
+                update_wrapper(changed)
                 with self.assertRaisesRegex(RuntimeError, 'slot/context/component'):
                     handoff.aggregate(folder, folder / 'unused.json')
+                restore()
+                handoff.aggregate(folder, folder / 'unused.json')
 
 
 if __name__ == '__main__':

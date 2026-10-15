@@ -701,18 +701,20 @@ class FormalOutputs(unittest.TestCase):
 
     def test_framework_declares_exact_device_and_simulator_architectures(self):
         device = {'SupportedPlatform': 'ios', 'SupportedArchitectures': ['arm64']}
-        simulator = {**device, 'SupportedPlatformVariant': 'simulator', 'SupportedArchitectures': ['x86_64', 'arm64']}
+        simulator = {**device, 'SupportedPlatformVariant': 'simulator'}
         self.assertEqual(framework_entry_targets(device), {'ios-arm64'})
-        self.assertEqual(framework_entry_targets(simulator), {'ios-arm64-simulator', 'ios-x86_64-simulator'})
+        self.assertEqual(framework_entry_targets(simulator), {'ios-arm64-simulator'})
         for bad in [{**device, 'SupportedArchitectures': []}, {**device, 'SupportedArchitectures': ['arm64', 'x86_64']},
-                    {**simulator, 'SupportedArchitectures': ['arm64']},
+                    {**simulator, 'SupportedArchitectures': ['arm64', 'x86_64']},
+                    {**simulator, 'SupportedArchitectures': ['x86_64']},
                     {**simulator, 'SupportedArchitectures': ['arm64', 'arm64']},
                     {**simulator, 'SupportedArchitectures': ['arm64', 'x86_64', 'armv7']},
-                    {**device, 'SupportedPlatform': 'macos'}]:
+                    {**device, 'SupportedPlatform': 'macos'},
+                    {**simulator, 'SupportedPlatformVariant': 'maccatalyst'}]:
             with self.subTest(entry=bad), self.assertRaises(RuntimeError):
                 framework_entry_targets(bad)
 
-    def test_framework_content_predicate_accepts_single_device_fat_and_exact_two_simulator_targets(self):
+    def test_framework_content_predicate_requires_exact_two_arm64_platform_slices(self):
         fixtures = module('formal_mobile_framework_fixtures', 'scripts/apple-carrier.test.py')
         from test_apple_entry import single_fat_archive
         raw_info = 'path\tsynthetic/main\nmod\tgithub.com/sagernet/sing-box\t(devel)\t\n'
@@ -721,13 +723,13 @@ class FormalOutputs(unittest.TestCase):
             return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info), expected_id)),
                                      ('native.o', fixtures.mach_object(target))])
         device = single_fat_archive(archive('ios-arm64'))
-        simulator = fixtures.fat(archive('ios-x86_64-simulator'), archive('ios-arm64-simulator'))
+        simulator = archive('ios-arm64-simulator')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             framework = root / 'Libbox.xcframework'; framework.mkdir()
             entries = []
             for identifier, variant, arches, raw in [('ios-arm64', None, ['arm64'], device),
-                    ('ios-arm64_x86_64-simulator', 'simulator', ['arm64', 'x86_64'], simulator)]:
+                    ('ios-arm64-simulator', 'simulator', ['arm64'], simulator)]:
                 entry = {'LibraryIdentifier': identifier, 'LibraryPath': 'Libbox.framework',
                          'SupportedPlatform': 'ios', 'SupportedArchitectures': arches}
                 if variant: entry['SupportedPlatformVariant'] = variant
@@ -744,7 +746,7 @@ class FormalOutputs(unittest.TestCase):
             with patch('artifacts.check_buildinfo') as buildinfo:
                 output = inspect_framework(framework, self.value, [], expected_id)
                 self.assertEqual(set(output['slices']), set(self.value['apple']['slices']))
-                self.assertEqual(buildinfo.call_count, 3)
+                self.assertEqual(buildinfo.call_count, 2)
                 for row in output['slices'].values():
                     self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
                 original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
@@ -754,16 +756,36 @@ class FormalOutputs(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'immutable getter'):
                     inspect_framework(framework, self.value, [], expected_id)
                 original_header.write_text(text)
-                entries[1]['SupportedArchitectures'] = ['arm64']
+                paths = [framework / entry['LibraryIdentifier'] / 'Libbox.framework/Libbox' for entry in entries]
+                # Admit the actual format, never assume the generator must emit
+                # a thin archive or reject a valid one-entry fat wrapper.
+                for device_fat in (False, True):
+                    for simulator_fat in (False, True):
+                        for path, target, wrap in zip(paths, self.value['apple']['slices'],
+                                                      (device_fat, simulator_fat)):
+                            raw = archive(target)
+                            path.write_bytes(single_fat_archive(raw) if wrap else raw)
+                        self.assertEqual(set(inspect_framework(framework, self.value, [], expected_id)['slices']),
+                                         {'ios-arm64', 'ios-arm64-simulator'})
+                paths[0].write_bytes(device); paths[1].write_bytes(simulator)
+                for bad_entries in [entries[:1], [entries[0], entries[0]], entries + [dict(entries[1])],
+                                    [entries[0], {**entries[1], 'SupportedPlatformVariant': 'maccatalyst'}]]:
+                    info.write_bytes(plistlib.dumps({'AvailableLibraries': bad_entries}))
+                    with self.subTest(entries=bad_entries), self.assertRaises(RuntimeError):
+                        inspect_framework(framework, self.value, [], expected_id)
+                entries[1]['SupportedArchitectures'] = ['arm64', 'x86_64']
                 info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
                 with self.assertRaisesRegex(RuntimeError, 'declared architecture inventory'):
                     inspect_framework(framework, self.value, [], expected_id)
-                entries[1]['SupportedArchitectures'] = ['arm64', 'x86_64']
+                entries[1]['SupportedArchitectures'] = ['arm64']
                 info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
-                sim = framework / entries[1]['LibraryIdentifier'] / 'Libbox.framework/Libbox'
-                sim.write_bytes(single_fat_archive(archive('ios-arm64-simulator')))
-                with self.assertRaisesRegex(RuntimeError, 'static slice inventory'):
-                    inspect_framework(framework, self.value, [], expected_id)
+                sim = paths[1]
+                for bad, reason in [(fixtures.fat(archive('ios-x86_64-simulator'), simulator), 'static slice inventory'),
+                                    (archive('ios-x86_64-simulator'), 'unknown/duplicate Apple architecture'),
+                                    (archive('ios-arm64'), 'deployment/platform')]:
+                    sim.write_bytes(bad)
+                    with self.subTest(reason=reason), self.assertRaisesRegex(RuntimeError, reason):
+                        inspect_framework(framework, self.value, [], expected_id)
                 sim.write_bytes(simulator)
                 bad = bytearray(device); struct.pack_into('>I', bad, 8, 0x1000007)
                 (framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Libbox').write_bytes(bad)
@@ -867,8 +889,132 @@ class FormalOutputs(unittest.TestCase):
                 component_output_identity(wrong)
         bad = deepcopy(observed); bad['nativeLibraries'][name]['goBuildInfo'] += '\t=>\t./other-source\t(devel)\n'
         self.assertNotEqual(component_output_identity(original), component_output_identity(bad))
-        framework = {'format': 'static-XCFramework', 'goBuildInfo': {'moduleRaw': 'raw original'}}
-        self.assertEqual(component_output_identity(framework), framework)
+
+    def test_non_aar_identity_borrows_unmodified_output_without_json_roundtrips(self):
+        framework = {'format': 'static-XCFramework', 'goBuildInfo': {'moduleRaw': 'raw original'},
+                     'slices': {'ios-arm64': {'members': [{'name': 'go.o', 'sha256': 'a' * 64}]}}}
+        frozen = deepcopy(framework)
+        with patch.object(artifacts.json, 'dumps', side_effect=AssertionError('redundant JSON serialization')), \
+                patch.object(artifacts.json, 'loads', side_effect=AssertionError('redundant JSON parsing')):
+            self.assertIs(component_output_identity(framework), framework)
+            self.assertEqual(component_output_identity(framework), frozen)
+            for field in ('goBuildInfo', 'slices'):
+                changed = deepcopy(framework)
+                changed[field] = {'changed': True}
+                self.assertNotEqual(component_output_identity(framework), component_output_identity(changed))
+        self.assertEqual(framework, frozen)
+
+    def test_apple_identity_reuse_keeps_each_consumer_and_producer_reinspection(self):
+        from consume import verify_original
+        from producer import verify_receipt
+        output = {'format': 'static-XCFramework', 'inventory': [{'path': 'original', 'sha256': 'a' * 64}],
+                  'slices': {target: {'members': [{'name': 'go.o', 'sha256': 'b' * 64}]}
+                             for target in self.value['apple']['slices']}}
+        binding = {'platform': 'apple', 'sourceContract': self.value, 'sourceOverlay': 0,
+                   'sourceObservation': {'sourceCommit': self.value['sourceCommit'], 'sourceTree': self.value['sourceTree']},
+                   'moduleGraph': []}
+        receipt = {'schema': 'polaris-mobile-component-v1', 'platform': 'apple', 'input': binding,
+                   'output': output, 'nativeInputs': {}, 'sourceOverlay': 0, 'AppAccepted': False, 'devicePassed': False}
+        receipt['fingerprint'] = artifacts.receipt_digest(receipt)
+        frozen, observed = deepcopy(receipt), deepcopy(output)
+        with patch('consume.load', return_value=self.value), patch('consume.read_receipt', return_value=receipt), \
+                patch('consume.inspect_framework', return_value=observed) as consumer_inspection, \
+                patch('producer.inspect_framework', return_value=observed) as producer_inspection, \
+                patch('native_inputs.verify') as original_inputs:
+            for _ in range(2):
+                self.assertIs(verify_original('/Libbox.xcframework', '/receipt.json', 'apple', {}, Path('/scratch')), receipt)
+                self.assertIs(verify_receipt('/Libbox.xcframework', receipt, self.value, binding, {}, None, Path('/scratch')), receipt)
+            for field, changed in [('inventory', []), ('slices', {})]:
+                observed[field] = changed
+                with self.assertRaisesRegex(RuntimeError, 'actual component bytes/API/native identity differ'):
+                    verify_original('/Libbox.xcframework', '/receipt.json', 'apple', {}, Path('/scratch'))
+                with self.assertRaisesRegex(RuntimeError, 'cached component native/content'):
+                    verify_receipt('/Libbox.xcframework', receipt, self.value, binding, {}, None, Path('/scratch'))
+                observed[field] = deepcopy(output[field])
+            self.assertEqual(consumer_inspection.call_count, 4)
+            self.assertEqual(producer_inspection.call_count, 4)
+            self.assertEqual(original_inputs.call_count, 8)
+        self.assertEqual(receipt, frozen)
+
+    def test_apple_consumer_link_and_original_reinspection_refuse_legacy_or_tampered_inventory(self):
+        from contextlib import nullcontext
+        import consume
+        from test_apple_read_reuse import AppleReadReuse
+        fixtures = module('two_target_consumer_fixture', 'scripts/apple-carrier.test.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            framework, binaries, _, expected_id = AppleReadReuse().framework_fixture(root)
+            work = root / 'work'; work.mkdir()
+            cache = root / 'cache'; cache.mkdir()
+            binding = {'platform': 'apple', 'sourceContract': self.value, 'sourceOverlay': 0,
+                       'sourceObservation': {'sourceCommit': self.value['sourceCommit'],
+                                             'sourceTree': self.value['sourceTree']}, 'moduleGraph': []}
+            # Native-origin verification is isolated; the full framework/native
+            # parser, source-contract comparison and every consumer boundary run.
+            with patch('artifacts.check_buildinfo'), patch('native_inputs.verify'), \
+                    patch('consume.lease', return_value=nullcontext((work, cache))), \
+                    patch('consume.app_identity', return_value={'candidate': 'a' * 40}), \
+                    patch('consume.apple_resources', return_value={}):
+                output = inspect_framework(framework, self.value, [], expected_id)
+                receipt = {'schema': 'polaris-mobile-component-v1', 'platform': 'apple',
+                           'input': binding, 'output': output, 'nativeInputs': {'cache': str(cache)},
+                           'sourceOverlay': 0, 'AppAccepted': False, 'devicePassed': False}
+                receipt['fingerprint'] = artifacts.receipt_digest(receipt)
+                receipt_path = root / 'original-receipt.json'; write_json(receipt_path, receipt)
+                receipt_bytes = receipt_path.read_bytes()
+                self.assertEqual(consume.verify_original(framework, receipt_path, 'apple', {}, work), receipt)
+                link_path = root / 'original-link.json'
+                link = consume.apple_link(framework, receipt_path, link_path, work, cache)
+                link_bytes = link_path.read_bytes()
+                self.assertEqual(consume.verify_link(link_path, sha(link_bytes), work), link)
+                mutations = {}
+                legacy = deepcopy(receipt)
+                legacy['input']['sourceContract']['apple']['targets'].append('iossimulator/amd64')
+                legacy['input']['sourceContract']['apple']['slices'].append('ios-x86_64-simulator')
+                mutations['legacy-contract'] = legacy
+                extra = deepcopy(receipt)
+                extra['output']['slices']['ios-x86_64-simulator'] = deepcopy(output['slices']['ios-arm64-simulator'])
+                mutations['extra-intel-output'] = extra
+                missing = deepcopy(receipt); del missing['output']['slices']['ios-arm64-simulator']
+                mutations['missing-simulator'] = missing
+                changed = deepcopy(receipt); changed['output']['slices']['ios-arm64-simulator']['binary']['sha256'] = 'f' * 64
+                mutations['native-pin'] = changed
+                for label, changed in mutations.items():
+                    changed['fingerprint'] = artifacts.receipt_digest({k: v for k, v in changed.items() if k != 'fingerprint'})
+                    bad_receipt = root / (label + '-receipt.json'); write_json(bad_receipt, changed)
+                    bad_link = deepcopy(link)
+                    bad_link.update(componentReceipt=str(bad_receipt), componentReceiptSha256=artifacts.file_pin(bad_receipt)['sha256'],
+                                    componentFingerprint=changed['fingerprint'], componentOutput=changed['output'],
+                                    producerInput=changed['input'])
+                    bad_link['fingerprint'] = artifacts.receipt_digest({k: v for k, v in bad_link.items() if k != 'fingerprint'})
+                    bad_path = root / (label + '-link.json'); write_json(bad_path, bad_link)
+                    destination = root / (label + '-new-link.json')
+                    actions = [lambda: consume.verify_original(framework, bad_receipt, 'apple', {}, work),
+                               lambda: consume.apple_link(framework, bad_receipt, destination, work, cache),
+                               lambda: consume.verify_link(bad_path, artifacts.file_pin(bad_path)['sha256'], work)]
+                    for action in actions:
+                        with self.subTest(mutation=label), self.assertRaises(RuntimeError):
+                            action()
+                    self.assertFalse(destination.exists())
+                # A current two-target declaration cannot conceal legacy native
+                # Intel bytes or an arm64 slice for the wrong Apple platform.
+                original_simulator = binaries[1].read_bytes()
+                arm = fixtures.archive([('native.o', fixtures.mach_object('ios-arm64-simulator'))])
+                intel = fixtures.archive([('native.o', fixtures.mach_object('ios-x86_64-simulator'))])
+                for label, raw in [('legacy-fat', fixtures.fat(intel, arm)),
+                                   ('wrong-platform', binaries[0].read_bytes())]:
+                    binaries[1].write_bytes(raw)
+                    destination = root / (label + '-new-link.json')
+                    for action in [lambda: consume.verify_original(framework, receipt_path, 'apple', {}, work),
+                                   lambda: consume.apple_link(framework, receipt_path, destination, work, cache),
+                                   lambda: consume.verify_link(link_path, sha(link_bytes), work)]:
+                        with self.subTest(native=label), self.assertRaises(RuntimeError):
+                            action()
+                    self.assertFalse(destination.exists())
+                binaries[1].write_bytes(original_simulator)
+                self.assertEqual(receipt_path.read_bytes(), receipt_bytes)
+                self.assertEqual(link_path.read_bytes(), link_bytes)
+                self.assertEqual(consume.verify_link(link_path, sha(link_bytes), work), link)
 
     def test_consumer_and_producer_reinspection_keep_the_original_receipt_identity(self):
         from consume import verify_original

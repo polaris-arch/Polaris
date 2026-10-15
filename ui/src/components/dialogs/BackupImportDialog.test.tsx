@@ -33,7 +33,8 @@ vi.mock('react', async (importOriginal) => {
   };
 });
 
-vi.mock('react-i18next', () => ({
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(),
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) =>
       vars?.categories ? `${key}: ${vars.categories}` : key,
@@ -58,6 +59,9 @@ vi.mock('@/ipc', () => ({ api: { backup: { importPick: vi.fn(), importApply: vi.
 vi.mock('@/lib/error-handler', () => ({
   toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
+
+// Initialization must settle (or fail this suite), never leak an unhandled rejection.
+await (await import('@/i18n')).i18nReady;
 
 const { api } = await import('@/ipc');
 const { toast } = await import('@/lib/error-handler');

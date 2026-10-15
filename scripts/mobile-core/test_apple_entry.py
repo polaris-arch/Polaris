@@ -54,6 +54,145 @@ class AppleEntryTests(unittest.TestCase):
         (work / 'original-rust-entry.log').write_text('inert compiler observation')
         return work, native, linked
 
+    def test_evidence_uses_bounded_disk_reservation_below_unchanged_build_peak(self):
+        import os
+        import budget
+        import producer
+        import apple_handoff
+        from types import SimpleNamespace
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                work, native, linked = self.same_host_slot_fixture(root, 'device-arm64', b'!<arch>\nnative')
+                derived = work / 'derived-data'; derived.mkdir()
+                (derived / 'object').write_bytes(b'rebuildable but not yet retired')
+                streams = {'original-device-arm64.log.stdout.raw': b'out\x00\xffunfinished',
+                           'original-device-arm64.log.stderr.raw': b'err\xfe\x00uncombined'}
+                for name, raw in streams.items(): (root / name).write_bytes(raw)
+                if failed: linked.write_bytes(b'unaccepted actual linked archive')
+                value = ci_apple.load()
+                build_peak = value['budget']['buildPeakReserveBytes']
+                free_bytes = 10 * 1024 ** 3
+                self.assertLess(ci_apple.EVIDENCE_RESERVE_BYTES + 1024 ** 3, free_bytes)
+                self.assertGreater(build_peak + 1024 ** 3, free_bytes)
+                with mock.patch.object(ci_apple, 'ROOT', root), \
+                        mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}), \
+                        mock.patch.dict(os.environ, {'POLARIS_BUILD_BUDGET_ROOT': str(root / 'budget')}, clear=True), \
+                        mock.patch.object(budget.os, 'statvfs', return_value=SimpleNamespace(f_bavail=free_bytes, f_frsize=1)):
+                    with self.assertRaisesRegex(RuntimeError, 'peak reservations exhaust free space'):
+                        with producer.lease(root / 'actual-build', root / 'cache', value):
+                            self.fail('native build admitted below unchanged peak')
+                    ci_apple.evidence(slot='device-arm64')
+                    archive = root / 'apple-original-device-arm64-evidence.zip'
+                    with zipfile.ZipFile(archive) as package:
+                        for name, raw in streams.items(): self.assertEqual(package.read(name), raw)
+                        self.assertEqual(package.read('device-arm64/original-linked-rust-archive.a'), linked.read_bytes())
+                        index = json.loads(package.read('EVIDENCE-INDEX.json'))
+                        self.assertEqual(bool(index['receiptReadErrors']), failed)
+                    if failed:
+                        with self.assertRaisesRegex(RuntimeError, 'incomplete or changed'):
+                            ci_apple.retire_slot('device-arm64')
+                    self.assertTrue(native.exists() and derived.exists())
+                    for name, raw in streams.items(): self.assertEqual((root / name).read_bytes(), raw)
+                    row = json.loads((root / 'budget' / (producer.sha(str(root / 'evidence-work').encode()) + '.reservation')).read_bytes())
+                    self.assertEqual(row['reserveBytes'], ci_apple.EVIDENCE_RESERVE_BYTES)
+                    self.assertEqual(row['groups'], [])
+                    self.assertEqual(value['budget']['buildPeakReserveBytes'], build_peak)
+                    self.assertEqual(producer.ACTIVE_FDS, [])
+
+    def test_insufficient_evidence_space_or_active_cache_refuses_before_snapshot_or_zip(self):
+        import os
+        import budget
+        import producer
+        import apple_handoff
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        for blocked in ('space', 'cache', 'retained-group'):
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                work, native, linked = self.same_host_slot_fixture(root, 'device-arm64', b'!<arch>\nretained')
+                raw_path = root / 'original-device-arm64.log.stderr.raw'; raw_path.write_bytes(b'failed raw\x00\xff')
+                free_bytes = (ci_apple.EVIDENCE_RESERVE_BYTES + 1024 ** 3 - 1
+                              if blocked == 'space' else 10 * 1024 ** 3)
+                with mock.patch.object(ci_apple, 'ROOT', root), \
+                        mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}), \
+                        mock.patch.dict(os.environ, {'POLARIS_BUILD_BUDGET_ROOT': str(root / 'budget')}, clear=True), \
+                        mock.patch.object(budget.os, 'statvfs', return_value=SimpleNamespace(f_bavail=free_bytes, f_frsize=1)):
+                    if blocked == 'retained-group':
+                        with budget.reservation(root / 'evidence-work', ci_apple.load(), producer.ACTIVE_FDS,
+                                                reserve_bytes=ci_apple.EVIDENCE_RESERVE_BYTES):
+                            fd = int(os.environ['POLARIS_BUILD_RESERVATION_FD'])
+                            row = json.loads(os.pread(fd, 8192, 0)); row['groups'] = [123456]
+                            os.ftruncate(fd, 0); os.pwrite(fd, producer.canonical(row), 0)
+                    held = (producer.slot_locks(root / 'active-native-work', root / 'cache')
+                            if blocked == 'cache' else nullcontext())
+                    live = (mock.patch.object(budget, 'group_alive', return_value=True)
+                            if blocked == 'retained-group' else nullcontext())
+                    with held, live, self.assertRaises((RuntimeError, BlockingIOError)):
+                        ci_apple.evidence(slot='device-arm64')
+                self.assertFalse((root / 'apple-original-device-arm64-evidence.zip').exists())
+                self.assertFalse((work / 'original-linked-rust-archive.a').exists())
+                self.assertFalse((root / 'staging-preservation-device-arm64.json').exists())
+                self.assertEqual(raw_path.read_bytes(), b'failed raw\x00\xff')
+                self.assertEqual(native.read_bytes(), b'!<arch>\nretained')
+                self.assertEqual(linked.read_bytes(), native.read_bytes())
+                self.assertEqual(producer.ACTIVE_FDS, [])
+
+    def test_evidence_zip_and_copy_hard_bounds_keep_failed_originals(self):
+        from artifacts import file_pin
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / 'original.raw'; original.write_bytes(b'unchanged original')
+            pin = file_pin(original)
+            output = io.BytesIO()
+            with mock.patch.object(ci_apple, 'EVIDENCE_ZIP_BYTES', 8):
+                writer = ci_apple.BoundedEvidenceZip(output)
+                writer.write(b'12345678')
+                with self.assertRaisesRegex(RuntimeError, 'ZIP exceeds reserved byte budget'):
+                    writer.write(b'9')
+                self.assertEqual(output.getvalue(), b'12345678')
+                writer.seek(0); writer.write(b'AB')
+                self.assertEqual(output.getvalue(), b'AB345678')
+            original.write_bytes(b'a larger changed original')
+            output = io.BytesIO()
+            with self.assertRaisesRegex(RuntimeError, 'bounded regular original evidence required'):
+                ci_apple.copy_pinned_evidence(original, output, pin)
+            self.assertEqual(output.getvalue(), b'')
+            self.assertEqual(original.read_bytes(), b'a larger changed original')
+            original.write_bytes(b'initial bytes')
+            pin = file_pin(original)
+            class GrowingOutput(io.BytesIO):
+                def write(self, raw):
+                    with original.open('ab') as source: source.write(b'growth')
+                    return super().write(raw)
+            output = GrowingOutput()
+            with self.assertRaisesRegex(RuntimeError, 'grew during preservation'):
+                ci_apple.copy_pinned_evidence(original, output, pin)
+            self.assertEqual(output.getvalue(), b'initial bytes')
+            self.assertEqual(original.read_bytes(), b'initial bytesgrowth')
+
+    def test_evidence_inventory_content_and_index_bounds_leave_sources_intact(self):
+        from contextlib import nullcontext
+        cases = [('EVIDENCE_ENTRIES', 0, 'entry budget'),
+                 ('EVIDENCE_PATH_BYTES', 1, 'path budget'),
+                 ('EVIDENCE_CONTENT_BYTES', 1, 'exceeds 4GiB budget'),
+                 ('EVIDENCE_INDEX_BYTES', 1, 'index exceeds bound')]
+        for constant, bound, reason in cases:
+            with self.subTest(bound=constant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                component = root / 'component'; component.mkdir()
+                raw = component / 'original-failed.log'; raw.write_bytes(b'failed original output')
+                with mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(ci_apple, 'lease', return_value=nullcontext()), \
+                        mock.patch.object(ci_apple, constant, bound), \
+                        mock.patch.dict('os.environ', {}, clear=True), \
+                        self.assertRaisesRegex(RuntimeError, reason):
+                    ci_apple.evidence()
+                self.assertEqual(raw.read_bytes(), b'failed original output')
+                self.assertFalse(list(root.glob('evidence-*-pin.json')))
+
     def test_slot_evidence_freezes_shared_staging_before_next_arm64_platform_overwrite(self):
         from contextlib import nullcontext
         import apple_handoff
@@ -62,7 +201,7 @@ class AppleEntryTests(unittest.TestCase):
             work, native, linked = self.same_host_slot_fixture(root, 'device-arm64', b'!<arch>\ndevice')
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
                 first = (root / 'apple-original-device-arm64-evidence.zip').read_bytes()
@@ -86,7 +225,7 @@ class AppleEntryTests(unittest.TestCase):
             (derived / 'rebuildable-object').write_bytes(b'object')
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
                 with mock.patch.object(ci_apple, 'slot_locks', side_effect=RuntimeError('active native cache')):
@@ -94,7 +233,7 @@ class AppleEntryTests(unittest.TestCase):
                         ci_apple.retire_slot('device-arm64')
                 self.assertTrue(native.exists() and derived.exists())
                 original = native.read_bytes(); native.write_bytes(b'changed')
-                with mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args: nullcontext()):
+                with mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args, **kwargs: nullcontext()):
                     with self.assertRaisesRegex(RuntimeError, 'missing from preserved'):
                         ci_apple.retire_slot('device-arm64')
                     self.assertTrue(native.exists() and derived.exists())
@@ -115,8 +254,8 @@ class AppleEntryTests(unittest.TestCase):
             linked.write_bytes(b'wrong linked staging')
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
-                    mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
+                    mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
                 with zipfile.ZipFile(root / 'apple-original-device-arm64-evidence.zip') as package:
@@ -152,7 +291,7 @@ class AppleEntryTests(unittest.TestCase):
                 'completed': True, 'context': {'runId': '1'}}))
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}), \
                     mock.patch.object(ci_apple, 'run') as dispatch:
                 ci_apple.evidence(slot='device-arm64')
@@ -160,7 +299,8 @@ class AppleEntryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'replacement blocked'):
                     ci_apple.carrier('sim-arm64')
                 dispatch.assert_not_called()
-                ci_apple.ensure_previous_staging_preserved(root, 'sim-amd64')
+                with self.assertRaisesRegex(RuntimeError, 'unknown Apple staging slot'):
+                    ci_apple.ensure_previous_staging_preserved(root, 'sim-amd64')
 
     def test_claimed_staging_absence_marks_error_and_retains_target_but_empty_path_can_be_reused(self):
         from contextlib import nullcontext
@@ -172,8 +312,8 @@ class AppleEntryTests(unittest.TestCase):
             linked.unlink()  # The existing Rust receipt still claims these bytes.
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
-                    mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
+                    mock.patch.object(ci_apple, 'slot_locks', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
                 with zipfile.ZipFile(root / 'apple-original-device-arm64-evidence.zip') as package:
@@ -197,7 +337,7 @@ class AppleEntryTests(unittest.TestCase):
             root = Path(temporary).resolve()
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
                 with zipfile.ZipFile(root / 'apple-original-device-arm64-evidence.zip') as package:
@@ -220,7 +360,7 @@ class AppleEntryTests(unittest.TestCase):
             (root / 'original-sim-arm64.log.stdout.raw').write_bytes(b'unrelated slot')
             with mock.patch.object(ci_apple, 'ROOT', root), \
                     mock.patch.object(ci_apple, 'location', return_value=root), \
-                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args: nullcontext()), \
+                    mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
                     mock.patch.object(apple_handoff, 'context', return_value={'runId': '1'}):
                 ci_apple.evidence(slot='device-arm64')
             with zipfile.ZipFile(root / 'apple-original-device-arm64-evidence.zip') as package:
@@ -403,23 +543,40 @@ class AppleEntryTests(unittest.TestCase):
             identity.assert_called_once_with(status_log=root / 'source-status-before-rust.json')
             link.assert_not_called()
 
-    def test_exact_three_actual_target_mappings(self):
+    def test_exact_two_arm64_actual_target_mappings(self):
         self.assertEqual(apple_rust.target_for('iphoneos', 'arm64', 'release'), 'aarch64-apple-ios')
         self.assertEqual(apple_rust.target_for('iphonesimulator', 'arm64', 'release'), 'aarch64-apple-ios-sim')
-        self.assertEqual(apple_rust.target_for('iphonesimulator', 'x86_64', 'release'), 'x86_64-apple-ios')
 
-    def test_host_arch_does_not_replace_explicit_intel_simulator(self):
-        with mock.patch.dict(apple_rust.os.environ, {'HOST_ARCH': 'arm64'}):
-            self.assertEqual(apple_rust.target_for('iphonesimulator', 'x86_64', 'release'), 'x86_64-apple-ios')
+    def test_host_arch_cannot_enable_intel_simulator(self):
+        for host in ('arm64', 'x86_64'):
+            with mock.patch.dict(apple_rust.os.environ, {'HOST_ARCH': host}), self.assertRaises(RuntimeError):
+                apple_rust.target_for('iphonesimulator', 'x86_64', 'release')
 
     def test_partial_or_wrong_platform_arch_profile_refuses(self):
         for platform, arch, profile in [('iphoneos', 'x86_64', 'release'), ('macosx', 'arm64', 'release'),
+                                        ('iphonesimulator', 'x86_64', 'release'),
                                         ('iphonesimulator', 'arm64 x86_64', 'release'), ('iphoneos', 'arm64', 'debug')]:
             with self.subTest(platform=platform, arch=arch, profile=profile), self.assertRaises(RuntimeError):
                 apple_rust.target_for(platform, arch, profile)
 
-    def test_candidate_chain_has_all_three_finite_carriers(self):
-        self.assertEqual(ci_apple.CARRIERS, [('device-arm64', None), ('sim-arm64', 'arm64'), ('sim-amd64', 'amd64')])
+    def test_candidate_chain_has_exactly_two_arm64_carriers(self):
+        self.assertEqual(ci_apple.CARRIERS, [('device-arm64', None), ('sim-arm64', 'arm64')])
+        with mock.patch.object(ci_apple, 'location') as location, self.assertRaises(RuntimeError):
+            ci_apple.carrier('sim-amd64')
+        location.assert_not_called()
+
+    def test_legacy_intel_app_cli_rejects_before_source_or_work(self):
+        required = [argument for name in ('source', 'go', 'gomobile', 'gobind', 'developer', 'work', 'cache')
+                    for argument in ('--' + name, '/inert/' + name)]
+        for selected in (['--simulator', '--simulator-arch', 'amd64'], ['--slot', 'sim-amd64']):
+            with mock.patch.object(build_apple_app.sys, 'argv', ['build_apple_app.py', *required, *selected]), \
+                    mock.patch.object(build_apple_app.sys, 'stderr', io.StringIO()), \
+                    mock.patch.object(build_apple_app, 'load') as load, \
+                    mock.patch.object(build_apple_app, 'private_dir') as work, \
+                    mock.patch.object(build_apple_app, 'run') as run, self.assertRaises(SystemExit) as rejected:
+                build_apple_app.main()
+            self.assertEqual(rejected.exception.code, 2)
+            load.assert_not_called(); work.assert_not_called(); run.assert_not_called()
 
     def test_local_entry_does_not_claim_hosted_admission(self):
         with mock.patch.dict(ci_apple.os.environ, {'GITHUB_ACTIONS': 'false'}), self.assertRaises(RuntimeError):
@@ -589,23 +746,27 @@ class AppleEntryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'input differs'):
                     apple_rust.verify()
 
-    def test_fat_simulator_selects_exact_cargo_architecture_not_first_descriptor(self):
+    def test_arm64_wire_selection_keeps_full_container_validation_and_rejects_intel_target(self):
         raw, arm, intel = fat_archive()
-        actual, selection = apple_rust.selected_wire_bytes(raw, 'x86_64-apple-ios')
-        self.assertEqual(actual, intel)
-        self.assertEqual(selection['offset'], 64 + len(arm))
-        self.assertEqual(apple_rust.selected_wire_bytes(raw, 'aarch64-apple-ios-sim')[0], arm)
+        # Generic fat parsing still inspects legacy Intel bytes; formal Cargo
+        # selection can only select the current arm64 platform.
+        actual, selection = apple_rust.selected_wire_bytes(raw, 'aarch64-apple-ios-sim')
+        self.assertEqual(actual, arm)
+        self.assertEqual(selection['offset'], 64)
+        self.assertEqual(apple_rust.selected_wire_bytes(arm, 'aarch64-apple-ios-sim')[0], arm)
+        with self.assertRaisesRegex(RuntimeError, 'bounded selected wire target'):
+            apple_rust.selected_wire_bytes(raw, 'x86_64-apple-ios')
         with self.assertRaisesRegex(RuntimeError, 'exact Cargo'):
             apple_rust.selected_wire_bytes(raw, 'aarch64-apple-ios')
         wrong_header = bytearray(raw); struct.pack_into('>I', wrong_header, 8, 0x1000007)
         with self.assertRaises(RuntimeError):
-            apple_rust.selected_wire_bytes(bytes(wrong_header), 'x86_64-apple-ios')
+            apple_rust.selected_wire_bytes(bytes(wrong_header), 'aarch64-apple-ios-sim')
         overlap = bytearray(raw); struct.pack_into('>I', overlap, 36, 64)
         with self.assertRaises(RuntimeError):
-            apple_rust.selected_wire_bytes(bytes(overlap), 'x86_64-apple-ios')
+            apple_rust.selected_wire_bytes(bytes(overlap), 'aarch64-apple-ios-sim')
         for invalid in [raw[:-1], b'!<arch>\n', b'\xcf\xfa\xed\xfe']:
             with self.subTest(raw=invalid[:8]), self.assertRaises(RuntimeError):
-                apple_rust.selected_wire_bytes(invalid, 'x86_64-apple-ios')
+                apple_rust.selected_wire_bytes(invalid, 'aarch64-apple-ios-sim')
 
     def test_real_resource_materialization_and_final_carrier_require_28_geo_and_licenses(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -677,7 +838,7 @@ class AppleEntryTests(unittest.TestCase):
     def test_failed_staging_sdk_original_bytes_are_retained_without_acceptance(self):
         from contextlib import contextmanager
         @contextmanager
-        def held(*args):
+        def held(*args, **kwargs):
             yield
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -706,7 +867,7 @@ class AppleEntryTests(unittest.TestCase):
     def test_unreadable_component_receipt_does_not_block_original_evidence_packaging(self):
         from contextlib import contextmanager
         @contextmanager
-        def held(*args):
+        def held(*args, **kwargs):
             yield
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

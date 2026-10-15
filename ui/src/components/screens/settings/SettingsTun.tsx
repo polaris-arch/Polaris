@@ -79,6 +79,12 @@ function hasInvalidEntry(
   return list.some((v) => v.trim() !== '' && !isValid(v));
 }
 
+/** The actual inputs of the backend preview, plus observable running/mesh generations. */
+export function tunPreviewIdentity(config: UserConfig, observationKey: string, generation: string): string {
+  const { language: _language, uiTheme: _theme, ...savedBuilderInput } = config;
+  return JSON.stringify([savedBuilderInput, observationKey, generation]);
+}
+
 export default function SettingsTun({ config, update }: SettingsTunProps) {
   const { t } = useTranslation();
   const navigate = useNavStore((s) => s.navigate);
@@ -108,13 +114,18 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
   // 生效排除面预览：**跑真 builder 读回**，不在前端另算一份（判据由代码持有）。
   // 依赖键只取真正影响排除面的输入，避免 config 引用每变一次就打一次 IPC。
   const [preview, setPreview] = useState<TunExclusionPreview | null>(null);
-  const previewKey = JSON.stringify([
-    config.proxyModeType,
-    bypassLan.checked,
-    bypassList,
-    inboundExcludeCidrs,
-    config.enableIPv6,
-  ]);
+  const observationKey = useAppStore((s) => JSON.stringify(
+    Object.entries(s.tailscaleStatuses).sort(([a], [b]) => a.localeCompare(b)).map(([id, status]) => [id,
+      status?.tailscaleIPs ?? null,
+      status?.details?.userGroups?.map(group => group.peers.map(peer => peer.details?.tailscaleIPs ?? null)) ?? null,
+      status?.peers?.map(peer => peer.details?.tailscaleIPs ?? null) ?? null,
+    ]),
+  ));
+  const previewGeneration = useAppStore((s) => JSON.stringify([
+    s.proxyStatus?.running, s.proxyStatus?.startTime,
+  ]));
+  const savedConfig = useAppStore((s) => s.config);
+  const previewKey = savedConfig ? tunPreviewIdentity(savedConfig, observationKey, previewGeneration) : 'saved-config-unavailable';
   useEffect(() => {
     let cancelled = false;
     api.config
@@ -162,7 +173,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
 
   // SettingsPage's `config` includes staged replay. Saved config only triggers refreshes and
   // resolves displayed names; the report's own R version and load evidence determine its scope.
-  const savedConfig = useAppStore((s) => s.config);
+  // savedConfig above is also the authoritative preview input.
   // This command returns one backend-produced running/persisted evidence snapshot. Refresh only
   // when the saved config or core generation changes, plus explicit user refresh; never derive
   // ownership from the staged SettingsPage draft or poll each mesh status frame.

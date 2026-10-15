@@ -42,7 +42,7 @@ OBSERVATION_PHASES = frozenset((
     'rust-target-build', 'host-swift-controls', 'app-extension-archive',
     'final-carrier-inspection', 'carrier-command', 'build-settings-admission',
     'tool-prepare', 'frontend-dashboard', 'frontend-build'))
-OBSERVATION_SLOTS = frozenset(('device-arm64', 'sim-arm64', 'sim-amd64'))
+OBSERVATION_SLOTS = frozenset(('device-arm64', 'sim-arm64'))
 
 
 def progress_write(fd, prefix, row):
@@ -267,22 +267,25 @@ def slot_locks(work, cache):
     try:
         for root in sorted({work, cache}):
             fd = os.open(root / '.mobile-producer.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            # Own cleanup immediately: identity/flock failures still close the
+            # new descriptor. Only acquired locks belong in native pass_fds.
+            handles.append(fd)
             info = os.fstat(fd)
             require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1,
                     'producer lock identity differs')
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            handles.append(fd)
             ACTIVE_FDS.append(fd)
         yield work, cache
     finally:
         for fd in reversed(handles):
-            ACTIVE_FDS.remove(fd)
+            if fd in ACTIVE_FDS:
+                ACTIVE_FDS.remove(fd)
             os.close(fd)
 
 
 @contextlib.contextmanager
-def lease(work, cache, value):
-    with reservation(work, value, ACTIVE_FDS):
+def lease(work, cache, value, *, reserve_bytes=None):
+    with reservation(work, value, ACTIVE_FDS, reserve_bytes=reserve_bytes):
         with slot_locks(work, cache) as paths:
             require(paths[0].stat().st_dev == paths[1].stat().st_dev, 'work/cache must use one reserved filesystem')
             try:

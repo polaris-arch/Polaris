@@ -3,9 +3,11 @@
 import argparse
 import contextlib
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -14,13 +16,64 @@ import zipfile
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from artifacts import file_pin, read_receipt
+from artifacts import MAX_ARTIFACT, MAX_RECEIPT, file_pin, read_receipt, receipt_chunks
 from ci_android import prepare_source
 from consume import materialize_apple_resources
 from fork_input import ROOT, canonical, decode, load, require, sha
 from producer import lease, slot_locks, private_dir, producer_code, run, write_json
 
-CARRIERS = [('device-arm64', None), ('sim-arm64', 'arm64'), ('sim-amd64', 'amd64')]
+CARRIERS = [('device-arm64', None), ('sim-arm64', 'arm64')]
+
+# Existing selected-original and individual-artifact limits remain unchanged.
+# Reserve new disk writes only: one bounded ZIP, one linked staging snapshot,
+# and all index/sidecar/temp metadata. The shared ledger adds its normal 1 GiB
+# filesystem headroom and still excludes other reservations/native descendants.
+EVIDENCE_CONTENT_BYTES = 4 * 1024 ** 3
+EVIDENCE_ENTRIES = 16384
+EVIDENCE_PATH_BYTES = 4096
+EVIDENCE_INDEX_BYTES = MAX_RECEIPT
+EVIDENCE_METADATA_BYTES = 8 * MAX_RECEIPT
+# Conservative deflate expansion, both ZIP names/headers, ZIP64 and end records.
+# The writer also enforces this hard limit before each physical write.
+EVIDENCE_ZIP_BYTES = ((EVIDENCE_CONTENT_BYTES + EVIDENCE_INDEX_BYTES) * 9 // 8 +
+                      (EVIDENCE_ENTRIES + 1) * (2 * EVIDENCE_PATH_BYTES + 1024) + 1024)
+EVIDENCE_RESERVE_BYTES = EVIDENCE_ZIP_BYTES + MAX_ARTIFACT + EVIDENCE_METADATA_BYTES
+
+
+class BoundedEvidenceZip:
+    """Keep even partial/failed ZIP writes inside the admitted disk envelope."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, raw):
+        require(self.stream.tell() + len(raw) <= EVIDENCE_ZIP_BYTES,
+                'original evidence ZIP exceeds reserved byte budget')
+        return self.stream.write(raw)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def copy_pinned_evidence(path, output, pin):
+    """Copy only the pinned regular bytes; growth cannot consume extra reserve."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        before = os.fstat(source.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_size == pin['bytes'] and
+                0 <= before.st_size <= MAX_ARTIFACT, 'bounded regular original evidence required')
+        digest, count = hashlib.sha256(), 0
+        while True:
+            raw = source.read(min(1024 ** 2, pin['bytes'] - count + 1))
+            if not raw:
+                break
+            count += len(raw)
+            require(count <= pin['bytes'], 'original evidence grew during preservation')
+            output.write(raw)
+            digest.update(raw)
+        after = os.fstat(source.fileno())
+    require({'bytes': count, 'sha256': digest.hexdigest()} == pin and
+            (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns),
+            'original evidence changed during preservation')
 
 
 @contextlib.contextmanager
@@ -239,12 +292,11 @@ def carrier(slot):
 
 def ensure_previous_staging_preserved(root, slot):
     from apple_handoff import context, transport_pin
+    require(slot in dict(CARRIERS), 'unknown Apple staging slot')
     for previous, _ in CARRIERS:
         if previous == slot:
             break
-        # Only the two arm64 platforms share a writable staging filename.
-        if (previous == 'sim-amd64') != (slot == 'sim-amd64'):
-            continue
+        # Both formal platforms share Externals/arm64 staging.
         marker = root / ('staging-preservation-' + previous + '.json')
         if marker.exists():
             facts = read_receipt(marker)
@@ -257,10 +309,10 @@ def ensure_previous_staging_preserved(root, slot):
 def preserve_linked_archive(root, slot, receipt_path=None):
     """Freeze writable Externals staging before another arm64 platform uses it."""
     from apple_rust import target_for
+    require(slot in dict(CARRIERS), 'unknown Apple staging slot')
     target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
-                        'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
-    original = ROOT / 'src-tauri/gen/apple/Externals' / (
-        'x86_64' if slot == 'sim-amd64' else 'arm64') / 'release/libapp.a'
+                        'arm64', 'release')
+    original = ROOT / 'src-tauri/gen/apple/Externals/arm64/release/libapp.a'
     require(original.resolve(strict=False) == original, 'linked archive path cannot be redirected')
     work = private_dir(root / slot)
     if not original.exists():
@@ -275,8 +327,8 @@ def preserve_linked_archive(root, slot, receipt_path=None):
     # not cause these unaccepted bytes to disappear when the next slot runs.
     actual = file_pin(original, allow_empty=True)
     copy = work / 'original-linked-rust-archive.a'
-    with original.open('rb') as source, copy.open('xb') as output:
-        shutil.copyfileobj(source, output)
+    with copy.open('xb') as output:
+        copy_pinned_evidence(original, output, actual)
     shutil.copystat(original, copy)
     require(file_pin(original, allow_empty=True) == actual and file_pin(copy, allow_empty=True) == actual,
             'linked Rust archive changed during preservation')
@@ -313,7 +365,8 @@ def evidence(*, publish_env=False, slot=None):
     cache = private_dir(root / 'cache')
     # Both failed and successful builds retain original evidence. Package only
     # selected bytes, never an entire cache, repeated checkout or target tree.
-    with lease(private_dir(root / 'evidence-work'), cache, load()):
+    with lease(private_dir(root / 'evidence-work'), cache, load(),
+               reserve_bytes=EVIDENCE_RESERVE_BYTES):
         require(not output.exists(), 'previous original evidence must not be overwritten')
         if slot:
             from apple_handoff import context
@@ -372,7 +425,7 @@ def evidence(*, publish_env=False, slot=None):
             # its actual archive as unaccepted evidence under the same budget.
             from apple_rust import target_for
             target = target_for('iphoneos' if current_slot == 'device-arm64' else 'iphonesimulator',
-                                'x86_64' if current_slot == 'sim-amd64' else 'arm64', 'release')
+                                'arm64', 'release')
             archive = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
             if archive.is_file():
                 paths.add(archive)
@@ -380,7 +433,7 @@ def evidence(*, publish_env=False, slot=None):
                 try:
                     target = read_receipt(receipt)['target']
                     require(isinstance(target, str) and target in
-                            ('aarch64-apple-ios', 'aarch64-apple-ios-sim', 'x86_64-apple-ios'),
+                            ('aarch64-apple-ios', 'aarch64-apple-ios-sim'),
                             'original Rust target differs')
                 except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
                     receipt_errors[receipt.relative_to(root).as_posix()] = str(error)
@@ -395,7 +448,7 @@ def evidence(*, publish_env=False, slot=None):
             work = root / slot
             from apple_rust import target_for
             target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
-                                'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+                                'arm64', 'release')
             accepted = work / ('rust-' + target + '.json')
             try:
                 preserved = preserve_linked_archive(root, slot, accepted if accepted.is_file() else None)
@@ -410,26 +463,36 @@ def evidence(*, publish_env=False, slot=None):
             if observation.is_file():
                 observed = read_receipt(observation)
                 staging_safe = observed.get('preservationComplete') is True
+        require(len(paths) <= EVIDENCE_ENTRIES, 'selected original evidence entry budget exceeded')
         rows, total = {}, 0
-        with zipfile.ZipFile(output, 'x', compression=zipfile.ZIP_DEFLATED) as package:
+        with output.open('xb') as raw_output, \
+                zipfile.ZipFile(BoundedEvidenceZip(raw_output), 'w', compression=zipfile.ZIP_DEFLATED) as package:
             for path in sorted(paths):
                 require(path.resolve(strict=True).is_relative_to(root),
                         'original Apple evidence escaped its fixed slots')
                 name = path.relative_to(root).as_posix()
+                require(len(name.encode('utf-8')) <= EVIDENCE_PATH_BYTES,
+                        'original evidence ZIP path budget exceeded')
                 if path.is_symlink():
                     require(any(path.is_relative_to(framework) for framework in frameworks),
                             'only actual component/staged framework links may be retained')
-                    import stat
+                    link = os.readlink(path)
+                    raw_link = link.encode('utf-8')
+                    total += len(raw_link)
+                    require(total <= EVIDENCE_CONTENT_BYTES, 'selected original evidence exceeds 4GiB budget')
                     info = zipfile.ZipInfo(name)
                     info.create_system = 3
                     info.external_attr = (stat.S_IFLNK | 0o777) << 16
-                    package.writestr(info, os.readlink(path))
-                    rows[name] = {'originalPath': str(path), 'link': os.readlink(path)}
+                    package.writestr(info, raw_link)
+                    rows[name] = {'originalPath': str(path), 'link': link}
                     continue
                 pin = file_pin(path, allow_empty=True)
                 total += pin['bytes']
-                require(total <= 4 * 1024 ** 3, 'selected original evidence exceeds 4GiB budget')
-                package.write(path, name)
+                require(total <= EVIDENCE_CONTENT_BYTES, 'selected original evidence exceeds 4GiB budget')
+                info = zipfile.ZipInfo.from_file(path, arcname=name)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with package.open(info, 'w', force_zip64=True) as member:
+                    copy_pinned_evidence(path, member, pin)
                 rows[name] = {'originalPath': str(path), **pin}
             index = {'schema': 'polaris-apple-original-evidence-v1', 'files': rows,
                      'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
@@ -445,7 +508,13 @@ def evidence(*, publish_env=False, slot=None):
                                       if name.endswith('.json') and 'bytes' in row},
                      'stagedComponentIsAccepted': False,
                      'devicePassed': False, 'publicationEligible': False}
-            package.writestr('EVIDENCE-INDEX.json', json.dumps(index, indent=2) + '\n')
+            # Use the same bounded receipt serializer as sidecars. Retirement
+            # reads at most this index bound; never emit an unretirable index.
+            require(sum(len(raw) for raw in receipt_chunks(index, pretty=True)) <= EVIDENCE_INDEX_BYTES,
+                    'original evidence index exceeds bound')
+            with package.open('EVIDENCE-INDEX.json', 'w', force_zip64=True) as member:
+                for raw in receipt_chunks(index, pretty=True):
+                    member.write(raw)
         if slot:
             from apple_handoff import context, transport_pin
             write_json(root / ('evidence-' + slot + '-pin.json'), {
@@ -468,7 +537,7 @@ def retire_slot(slot):
     require(slot in dict(CARRIERS), 'unknown Apple retirement slot')
     root = location()
     target = target_for('iphoneos' if slot == 'device-arm64' else 'iphonesimulator',
-                        'x86_64' if slot == 'sim-amd64' else 'arm64', 'release')
+                        'arm64', 'release')
     archive = root / ('apple-original-' + slot + '-evidence.zip')
     with slot_locks(private_dir(root / ('retirement-' + slot)), private_dir(root / 'cache')):
         pin = read_receipt(root / ('evidence-' + slot + '-pin.json'))

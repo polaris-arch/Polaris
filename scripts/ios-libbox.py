@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apple shared-source admission, carrier inspection and explicit six-patch history."""
+"""Apple source diagnostics and historical verification; legacy production retired."""
 import argparse
 import hashlib
 import importlib.util
@@ -9,10 +9,8 @@ from pathlib import Path
 import platform
 import plistlib
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 
 sys.dont_write_bytecode = True
 
@@ -42,6 +40,10 @@ APPLE_TARGETS = {
 HISTORICAL_MANIFEST_SHA256 = '1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942'
 HISTORICAL_SCRIPT_SHA256 = '2c8dd8e6ad7a8b2c1906f3cf51f5a9787ebc077d7a04d110cd4b298a45f5657e'
 HISTORICAL_ENTRY_SHA256 = '1768d8b0e0426ce5d036533fd6b85379e975dfb968739d69bdabea242923790e'
+# Frozen pre-retirement b66 producer, retained only for its historical-only receipts.
+HISTORICAL_ONLY_SCRIPT_SHA256 = '6bd4ee1f7197ee063f791b7ffed39492fec203cbe15d68cd4c4de6170a5855c2'
+LEGACY_BUILD_RETIRED = ('Legacy Apple production retired; use bash scripts/build-mobile-core.sh apple '
+                       'for the device-arm64/sim-arm64 contract')
 LINKER_FLAGS = ('-X github.com/sagernet/sing-box/constant.Version={version} '
                 '-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid=')
 
@@ -215,39 +217,8 @@ def approved_component_inputs(component, args):
 
 
 def build_component(args):
-    require(not args.historical and args.source is None and not args.offline,
-            'component build cannot use historical/source/offline options')
-    require(args.phase in ('assemble', 'publish'), 'explicit component assemble/publish phase required')
-    final_preflight()
-    component = component_module()
-    policy, tools = approved_component_inputs(component, args)
-    require(args.source_receipt is not None and args.apple_input is not None, 'original source receipt/Apple input required')
-    raw = component.read_json(args.source_receipt)
-    require(isinstance(raw, dict), 'original source receipt object required')
-    source_receipt, apple_input = raw.get('sourceReceipt', raw), component.read_json(args.apple_input)
-    if args.phase == 'assemble':
-        require(args.evidence_dir is not None and args.staged_generation is None and args.output_root is None
-                and args.output_fingerprint is None and not any((args.previous_build_policy, args.previous_build_policy_sha256,
-                                                               args.previous_tools, args.previous_tools_sha256)),
-                'assemble requires fresh evidence only; publish inputs forbidden')
-        # First assembly is retained for independent inventory/command approval.
-        # It is never repeated to manufacture a receipt with different scratch argv.
-        require(policy.get('componentInventory') == [] and policy.get('assembly') == {},
-                'first assembly requires pending inventory/assembly policy')
-        return component.assemble_component(apple_input, source_receipt, policy, tools, args.evidence_dir)
-    require(args.evidence_dir is None and isinstance(args.staged_generation, Path)
-            and args.staged_generation.is_absolute() and args.staged_generation.is_dir()
-            and not args.staged_generation.is_symlink() and args.staged_generation.resolve(strict=True) == args.staged_generation
-            and args.output_root is not None and isinstance(args.output_fingerprint, str)
-            and re.fullmatch('[0-9a-f]{64}', args.output_fingerprint), 'retained stage/output/fingerprint required')
-    previous = (args.previous_build_policy, args.previous_build_policy_sha256, args.previous_tools, args.previous_tools_sha256)
-    require(not any(previous) or all(previous), 'complete approved previous policy/tools required')
-    previous_policy = approved_component_json(component, previous[0], previous[1], 'previous build policy') if all(previous) else None
-    previous_tools = approved_component_json(component, previous[2], previous[3], 'previous tools') if all(previous) else None
-    receipt = component.make_receipt(args.staged_generation / 'Libbox.xcframework', source_receipt, apple_input, policy, tools)
-    require(receipt['outputFingerprint'] == args.output_fingerprint, 'approved component output fingerprint differs')
-    return component.publish_component(args.staged_generation, receipt, args.output_root, build_policy=policy, tools=tools,
-                                       previous_policy=previous_policy, previous_tools=previous_tools)
+    """Retired before policy, component imports, source inputs or output access."""
+    raise RuntimeError(LEGACY_BUILD_RETIRED)
 
 
 def component_for_link(args, resolve=False):
@@ -377,12 +348,12 @@ def verify(framework, receipt_path, native=False, historical=False):
     receipt = json.loads(receipt_path.read_text())
     require(receipt['schemaVersion'] == 1 and receipt['evidenceScope'] in ('build-only', 'historical-only'),
             'Invalid historical receipt evidence scope')
-    # Preserve the exact old receipt and its producer identity. Only newly
-    # generated historical receipts bind this revised driver; neither is final.
+    # Preserve the exact old receipts and their independently frozen producers.
+    # This retired driver produces none; neither historical scope is final.
     if receipt['evidenceScope'] == 'build-only':
         producer, entry = HISTORICAL_SCRIPT_SHA256, HISTORICAL_ENTRY_SHA256
     else:
-        producer, entry = digest(SCRIPT.read_bytes()), digest((ROOT / 'scripts/build-libbox-ios.sh').read_bytes())
+        producer, entry = HISTORICAL_ONLY_SCRIPT_SHA256, HISTORICAL_ENTRY_SHA256
     require(receipt['buildScriptSha256'] == producer, 'Receipt mismatch: buildScriptSha256')
     require(receipt['buildEntrySha256'] == entry, 'Receipt mismatch: buildEntrySha256')
     for key, value in [('sourceCommit', manifest['sourceCommit']), ('officialTag', f'v{version}'),
@@ -413,126 +384,17 @@ def verify(framework, receipt_path, native=False, historical=False):
 
 
 def build(source, offline=False, historical=False):
-    manifest, version = inputs(historical=historical)
-    require(platform.system() == 'Darwin', 'iOS Libbox must be built on macOS with Xcode')
-    source = source or Path.home() / f'Code/sing-box-ios-v{version}'
-    source = source.expanduser().resolve()
-    source_check(source, manifest, version)
-    host_arch = {'arm64': 'arm64', 'x86_64': 'amd64'}.get(platform.machine())
-    require(host_arch is not None, 'Unsupported Mac host architecture')
-    cached = Path.home() / f'go/pkg/mod/golang.org/toolchain@v0.0.1-go{manifest["goVersion"]}.darwin-{host_arch}/bin/go'
-    go = Path(os.environ.get('LIBBOX_GO', str(cached if cached.is_file() else shutil.which('go') or '')))
-    go_version = run([go, 'version'], capture=True).strip()
-    require(f' go{manifest["goVersion"]} ' in go_version, f'Wrong Go toolchain: {go_version}')
-    xcode = run(['xcodebuild', '-version'], capture=True).splitlines()
-    toolchain = {'goVersion': manifest['goVersion'], 'go': go_version,
-                 'xcodeVersion': xcode[0].removeprefix('Xcode '), 'xcodeBuild': xcode[1].removeprefix('Build version '),
-                 'iosSDKVersion': run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-version'], capture=True).strip(),
-                 'simulatorSDKVersion': run(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-version'], capture=True).strip()}
-    for key in ['xcodeVersion', 'xcodeBuild', 'iosSDKVersion', 'simulatorSDKVersion']:
-        require(toolchain[key] == manifest[key], f'Installed {key} differs from pinned iOS toolchain')
-    env = os.environ.copy()
-    env.update({'GOTOOLCHAIN': 'local', 'GOWORK': 'off', 'GOFLAGS': '', 'GOEXPERIMENT': '',
-                'GOPROXY': 'off' if offline else 'https://proxy.golang.org', 'GOSUMDB': 'sum.golang.org', 'CGO_CFLAGS': '', 'CGO_CPPFLAGS': '',
-                'CGO_CXXFLAGS': '', 'CGO_LDFLAGS': ''})
-    for name in ['GOOS', 'GOARCH', 'GOARM', 'GOAMD64', 'GOARM64', 'CC', 'CXX', 'CGO_ENABLED',
-                 'ANDROID_HOME', 'ANDROID_NDK_HOME', 'NDK_HOME', 'JAVA_HOME']:
-        env.pop(name, None)
-    with tempfile.TemporaryDirectory(prefix='polaris-ios-libbox-', dir=Path.home() / 'Code') as temp:
-        checkout = Path(temp)
-        run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source, checkout])
-        run(['git', 'checkout', '--quiet', '--detach', manifest['sourceCommit']], cwd=checkout)
-        source_settings(checkout, manifest)
-        for patch in manifest['patches']:
-            run(['git', 'apply', '--check', PATCH_DIR / patch['file']], cwd=checkout)
-            run(['git', 'apply', PATCH_DIR / patch['file']], cwd=checkout)
-        run(['git', 'add', '--all'], cwd=checkout)
-        source_tree = run(['git', 'write-tree'], cwd=checkout, capture=True).strip()
-        require(source_tree == manifest['patchedSourceTree'], 'Patched source tree differs from frozen iOS candidate')
-        # Install the fork from the source module into an isolated bin directory.
-        # The supplied stock core and user's existing mobile tools are never modified.
-        tools_dir = checkout / '.ios-tools'
-        tools_dir.mkdir()
-        env['GOBIN'] = str(tools_dir)
-        env['PATH'] = os.pathsep.join([str(tools_dir), str(go.parent), os.environ['PATH']])
-        run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile', 'github.com/sagernet/gomobile/cmd/gobind'], cwd=checkout, env=env)
-        for name in ['gomobile', 'gobind']:
-            binary = tools_dir / name
-            info = run([go, 'version', '-m', binary], capture=True)
-            require(f'github.com/sagernet/gomobile\t{manifest["gomobileVersion"]}\t' in info, f'Wrong {name} fork')
-            require(f'go{manifest["goVersion"]}' in info.splitlines()[0], f'Wrong {name} Go compiler')
-            toolchain[name] = {'version': manifest['gomobileVersion'], 'sha256': digest(binary.read_bytes()), 'buildInfo': info.strip()}
-        tests = []
-        # Run only tests supplied by the audited frozen patches. Exclude the two
-        # API tests that bind a wildcard listener and the dialer test issuing a
-        # native setsockopt on a synthetic descriptor. Remaining network fixtures
-        # use loopback/temporary Unix sockets and never start a system TUN.
-        excluded = {'TestCloseAfterHTTPServerServesClosesListenerOnce': 'Wildcard HTTP listener fixture',
-                    'TestCloseBeforeHTTPServeStillClosesListener': 'Wildcard HTTP listener fixture',
-                    'TestNamedInterfaceBindingPreservesNonAndroidAndAutomaticDialers': 'Native setsockopt with synthetic descriptor',
-                    'TestUnstartedTUNValidationCannotDeleteOtherInstanceRules': 'Linux fake iptables fixture; Darwin auto_redirect construction rejects invalid argument'}
-        test_names = sorted({name for patch in manifest['patches']
-                             for name in re.findall(r'^\+func (Test\w+)\(', (PATCH_DIR / patch['file']).read_text(), re.M)} - set(excluded))
-        test_pattern = '^(' + '|'.join(test_names) + ')$'
-        def test(arguments):
-            command = [go, 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', '-run', test_pattern, *arguments]
-            run(command, cwd=checkout, env=env)
-            tests.append({'arguments': [str(x) for x in arguments], 'testPattern': test_pattern, 'passed': True})
-        test(['.', './daemon', './adapter/endpoint', './adapter/inbound', './adapter/outbound',
-              './adapter/service', './adapter/certificate', './common/construction', './common/certificate',
-              './log', './route', './dns', './service/api', './service/ssmapi', './service/ccm', './service/ocm',
-              './experimental/clashmode', './common/dialer'])
-        files = run([go, 'list', '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-        test([*files, *[checkout / 'experimental/libbox' / name for name in [
-            'command_server_transient_test.go', 'interface_binding_test.go', 'config_validation_test.go',
-            'config_construction_persistence_test.go']]])
-        for tags in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
-            files = run([go, 'list', '-tags', tags, '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-            names = ['config_validation_test.go', 'config_construction_persistence_test.go']
-            if tags == 'with_ccm,with_ocm':
-                names.append('config_optional_persistence_test.go')
-            test(['-tags', tags, *files, *[checkout / 'experimental/libbox' / name for name in names]])
-        require(not run(['git', 'diff', '--name-only'], cwd=checkout, capture=True).strip(), 'Go tooling changed pinned source or module locks')
-        flags = LINKER_FLAGS.format(version=version)
-        command = [tools_dir / 'gomobile', 'bind', '-v', '-o', checkout / 'Libbox.xcframework',
-                   '-target', manifest['bindTarget'], '-libname=box',
-                   '-tags-not-macos=' + ','.join(manifest['nonMacOSTags']),
-                   '-iosversion=' + manifest['iosMinimumVersion'], '-trimpath', '-buildvcs=false',
-                   '-ldflags', flags, '-tags', ','.join(manifest['buildTags']), './experimental/libbox']
-        print(f'Building historical-only iOS Libbox {version} from {manifest["sourceCommit"]}', flush=True)
-        run(command, cwd=checkout, env=env)
-        framework = checkout / 'Libbox.xcframework'
-        receipt = {'schemaVersion': 1, 'evidenceScope': 'historical-only',
-                   'frozenPatchCommit': manifest['frozenPatchCommit'],
-                   'sharedGoCommit': manifest['sharedGoCommit'],
-                   'replacementReviewCommit': manifest['replacementReviewCommit'],
-                   'sourceCommit': manifest['sourceCommit'], 'officialTag': f'v{version}', 'patchedSourceTree': source_tree,
-                   'sourceManifestSha256': digest(MANIFEST.read_bytes()), 'buildScriptSha256': digest(SCRIPT.read_bytes()),
-                   'buildEntrySha256': digest((ROOT / 'scripts/build-libbox-ios.sh').read_bytes()),
-                   'patches': manifest['patches'], 'toolchain': toolchain, 'buildTags': manifest['buildTags'],
-                   'nonMacOSTags': manifest['nonMacOSTags'], 'bindTarget': manifest['bindTarget'],
-                   'iosMinimumVersion': manifest['iosMinimumVersion'], 'linkerFlags': flags,
-                   'sourceTests': tests, 'excludedSourceTests': excluded, 'validationCleanupContract': manifest['validationCleanupContract'],
-                   'unresolvedRuntimeEvidence': manifest['unresolvedRuntimeEvidence'],
-                   'framework': framework_evidence(framework, manifest, version, native=True)}
-        pending_receipt = checkout / 'libbox-build-receipt.json'
-        pending_receipt.write_text(json.dumps(receipt, indent=2) + '\n')
-        verify(framework, pending_receipt, native=True, historical=True)
-        OUTPUT.mkdir(parents=True, exist_ok=True)
-        # Copy only after all build, API, tags, and receipt checks pass.
-        run(['rsync', '-a', '--delete', str(framework) + '/', str(OUTPUT / 'Libbox.xcframework') + '/'])
-        shutil.copyfile(pending_receipt, RECEIPT)
-        verify(OUTPUT / 'Libbox.xcframework', RECEIPT, native=True, historical=True)
-        print(f'Verified historical-only iOS XCFramework and build receipt: {RECEIPT}', flush=True)
+    """No historical flag can reopen the retired production path."""
+    raise RuntimeError(LEGACY_BUILD_RETIRED)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
-    builder = sub.add_parser('build')
+    builder = sub.add_parser('build', help='Retired; use scripts/build-mobile-core.sh apple')
     builder.add_argument('source', nargs='?', type=Path)
-    builder.add_argument('--offline', action='store_true', help='Require all locked modules to be cached')
-    builder.add_argument('--component', action='store_true', help='Explicit M1 assemble/publish; no final App admission')
+    builder.add_argument('--offline', action='store_true', help='Retired build compatibility argument; production always refuses')
+    builder.add_argument('--component', action='store_true', help='Retired M1 assemble/publish; production always refuses')
     builder.add_argument('--phase', choices=('assemble', 'publish'))
     for flag in ('source-receipt', 'apple-input', 'evidence-dir', 'staged-generation', 'output-root',
                  'previous-build-policy', 'previous-tools'):
@@ -580,7 +442,7 @@ def main(argv=None):
                 command.add_argument('--' + flag, required=True)
     for command in (builder, checker, input_checker):
         command.add_argument('--historical', action='store_true',
-                             help='Explicitly use the frozen six-patch history; never final source evidence')
+                             help='Verify frozen six-patch history only; build stays retired')
     args = parser.parse_args(argv)
     if args.action == 'observe-component':
         observation = observe_component(args.checkout, args.source_receipt, args.go, args.mobile_bin, args.developer_dir, args.evidence_dir)
@@ -609,10 +471,6 @@ def main(argv=None):
         if args.component:
             print(json.dumps(build_component(args), sort_keys=True))
         else:
-            require(not any((args.phase, args.source_receipt, args.apple_input, args.evidence_dir, args.staged_generation,
-                             args.output_root, args.build_policy, args.build_policy_sha256, args.tools, args.tools_sha256,
-                             args.output_fingerprint, args.previous_build_policy, args.previous_build_policy_sha256,
-                             args.previous_tools, args.previous_tools_sha256)), 'component build requires explicit --component')
             build(args.source, args.offline, historical=args.historical)
     elif args.action == 'verify':
         if args.component_for_link:

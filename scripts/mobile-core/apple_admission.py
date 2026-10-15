@@ -1,4 +1,4 @@
-"""Resolved three-slot Xcode configuration admission; never compiles or signs."""
+"""Resolved two-slot arm64 Xcode configuration admission; never compiles or signs."""
 import json
 from pathlib import Path
 import re
@@ -8,8 +8,7 @@ from fork_input import ROOT, require, sha
 from producer import run, write_json
 
 SLOTS = (('device-arm64', 'iphoneos', 'arm64'),
-         ('sim-arm64', 'iphonesimulator', 'arm64'),
-         ('sim-amd64', 'iphonesimulator', 'x86_64'))
+         ('sim-arm64', 'iphonesimulator', 'arm64'))
 TARGETS = ('polaris_iOS', 'polaris_PacketTunnel')
 SETTINGS_BYTES = 2 * 1024 ** 2
 
@@ -58,8 +57,7 @@ def retain_architecture_rows(root, slot, query, rows, raw):
 
 
 def checked_build_settings(rows, sdk, arch, minimum, *, expected_targets=TARGETS):
-    require(sdk in ('iphoneos', 'iphonesimulator') and arch in ('arm64', 'x86_64') and
-            (sdk != 'iphoneos' or arch == 'arm64'), 'invalid admitted Apple slot')
+    require(sdk in ('iphoneos', 'iphonesimulator') and arch == 'arm64', 'invalid admitted Apple slot')
     require(isinstance(rows, list) and len(rows) == len(expected_targets),
             'actual Apple target set differs')
     selected = {}
@@ -79,7 +77,7 @@ def checked_build_settings(rows, sdk, arch, minimum, *, expected_targets=TARGETS
             if len(fields[key]) != len(set(fields[key])):
                 raise RuntimeError(architecture_rejection(row['target'], key, value, 'duplicate-token'))
         effective = (set(fields['ARCHS']) & set(fields['VALID_ARCHS'])) - set(fields['EXCLUDED_ARCHS'])
-        require(fields['ARCHS'] == [arch] and effective == {arch},
+        require(fields['ARCHS'] == [arch] and fields['VALID_ARCHS'] == ['arm64'] and effective == {arch},
                 'selected Apple architecture is excluded by actual build settings')
         require(settings.get('PLATFORM_NAME') == sdk and settings.get('CONFIGURATION') == 'release',
                 'actual Apple platform/configuration differs')
@@ -139,11 +137,14 @@ def preflight(root, env):
         require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows),
                 'actual Apple build-settings array required')
         targets = [row.get('target') for row in rows]
+        extension = _read_rows(['xcodebuild', '-target', 'polaris_PacketTunnel', *common], env, slot, root, 'extension')
+        extension_settings = checked_build_settings(extension, sdk, arch, minimum,
+                                                    expected_targets=('polaris_PacketTunnel',))
         if targets == ['polaris_iOS']:
-            extension = _read_rows(['xcodebuild', '-target', 'polaris_PacketTunnel', *common], env, slot, root, 'extension')
-            checked_build_settings(extension, sdk, arch, minimum, expected_targets=('polaris_PacketTunnel',))
             rows += extension
         observations[slot] = checked_build_settings(rows, sdk, arch, minimum)
+        require(observations[slot]['polaris_PacketTunnel'] == extension_settings['polaris_PacketTunnel'],
+                'scheme and explicit extension settings differ')
     require([file_pin(path) for path in inputs] == pins, 'Apple admission inputs changed during inspection')
     result = {'schema': 'polaris-apple-build-settings-admission-v1', 'slots': observations,
               'inputPins': pins, 'scope': 'resolved configuration only; no compiler/carrier/device acceptance'}

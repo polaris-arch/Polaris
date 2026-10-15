@@ -42,15 +42,26 @@ export function groupServersBySubscription(
    */
   includeEmptyGroups = false
 ): ServerGroup[] {
-  const knownIds = new Set(subscriptions.map((s) => s.id));
+  const buckets = new Map<string, ServerConfig[]>();
+  for (const sub of subscriptions) buckets.set(sub.id, []);
   const groups: ServerGroup[] = [];
 
   // 自建 = 无归属 或 归属订阅已不存在（孤儿不丢，并入自建）；再按 endpoint 数据模型拆出「组网」。
   // 路由能力仍由 isMeshNode/meshRoutes 判定，不能拿来决定 UI 桶，否则从组网入口创建的企业 VPN
   // 在不填内网段时会保存后“消失”到自建 Tab。
-  const manualAll = servers.filter((s) => !s.subscriptionId || !knownIds.has(s.subscriptionId));
-  const manual = manualAll.filter((s) => !landsInEndpoints(s.protocol));
-  const mesh = manualAll.filter((s) => landsInEndpoints(s.protocol));
+  const manual: ServerConfig[] = [];
+  const mesh: ServerConfig[] = [];
+  for (const server of servers) {
+    const bucket = buckets.get(server.subscriptionId ?? '');
+    // A falsy subscription ID has always belonged to manual/mesh. If an
+    // empty-ID subscription exists, the old filter also included it there.
+    if (!server.subscriptionId || !bucket) {
+      (landsInEndpoints(server.protocol) ? mesh : manual).push(server);
+    }
+    if (bucket && server.subscriptionId !== undefined && server.subscriptionId !== null) {
+      bucket.push(server);
+    }
+  }
   // 自建常驻：节点列表页（includeEmptyGroups）即使无自建节点也保留空的「自建」tab 作默认落地。
   if (manual.length > 0 || includeEmptyGroups) {
     groups.push({ id: 'manual', name: 'manual', isManual: true, servers: manual });
@@ -60,7 +71,8 @@ export function groupServersBySubscription(
   }
 
   for (const sub of subscriptions) {
-    const subServers = servers.filter((s) => s.subscriptionId === sub.id);
+    // Each output group keeps its own array, even for duplicate subscription IDs.
+    const subServers = [...buckets.get(sub.id)!];
     if (subServers.length > 0 || includeEmptyGroups) {
       groups.push({ id: sub.id, name: sub.name, isManual: false, servers: subServers });
     }

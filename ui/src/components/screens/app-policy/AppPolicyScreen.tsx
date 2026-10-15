@@ -1,3 +1,4 @@
+import { appRuleForPick, appRuleDisabled } from './app-policy-logic';
 /**
  * AppPolicyScreen —— 应用分流屏（1:1 提取自原型 polaris-prototype.html L1922-1963 #s-apppolicy）。
  *
@@ -257,8 +258,7 @@ export function AppPolicyScreen() {
 
   /** 单一策略提交点（原型 nodeSelMenu onPick 同口径：一次调用把 action+targetServerId 一并落地）。 */
   const setAppPolicy = (appId: string, action: RuleAction, targetServerId: string | undefined) => {
-    const existing = ruleByAppId.get(appId);
-    void applyRule(appId, { action, enabled: existing?.enabled ?? true, targetServerId });
+    void applyRule(appId, appRuleForPick(appId, action, targetServerId));
   };
 
   /** 移除自定义应用（原型 apCardHtml/apRowHtml 的 RM_BTN，仅 custom 项渲染）：同时清掉该应用的
@@ -360,7 +360,8 @@ export function AppPolicyScreen() {
           </div>
         </div>
         <div className="acts">
-          <span
+          <button
+            type="button"
             className={cn('swt', enabled && 'on')}
             role="switch"
             aria-checked={enabled}
@@ -697,6 +698,7 @@ function AppCard({
       <PolicySelector
         appId={preset.id}
         action={rule?.action ?? 'proxy'}
+        disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
         servers={servers}
         subscriptions={subscriptions}
@@ -757,6 +759,7 @@ function ApRow({
       <PolicySelector
         appId={preset.id}
         action={rule?.action ?? 'proxy'}
+        disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
         servers={servers}
         subscriptions={subscriptions}
@@ -825,6 +828,7 @@ function CheckMark() {
 function PolicySelector({
   appId,
   action,
+  disabledRule,
   targetServerId,
   servers,
   subscriptions,
@@ -832,6 +836,7 @@ function PolicySelector({
 }: {
   appId: string;
   action: RuleAction;
+  disabledRule?: boolean;
   targetServerId?: string;
   servers: ServerConfig[];
   subscriptions: SubscriptionConfig[];
@@ -899,7 +904,9 @@ function PolicySelector({
     setOpen(false);
   };
 
-  const view = appPolicyView(action, targetServerId, servers, t);
+  const view = disabledRule
+    ? { cls: '', dot: '', label: t('rules.disabledBadge') }
+    : appPolicyView(action, targetServerId, servers, t);
   const curKind: RuleAction | 'node' = action === 'proxy' && targetServerId ? 'node' : action;
 
   return (

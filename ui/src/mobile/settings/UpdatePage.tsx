@@ -285,6 +285,15 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
   const target = versionSkipped ? null : check.target;
   /* 已落位的包（本页下的，或后台自动下载腿下的）。安装那颗按钮的对象就是它。 */
   const staged = dl.phase === 'downloaded' ? dl.path : null;
+  const installIdentity = JSON.stringify([staged, dl.info, target]);
+  const currentInstallIdentity = useRef(installIdentity);
+  currentInstallIdentity.current = installIdentity;
+  useEffect(() => {
+    if (installAttempt.current) installAttempt.current.active = false;
+    installAttempt.current = null;
+    setHandedOff(false);
+    setInstalling(false);
+  }, [installIdentity]);
   const busy = dl.phase === 'downloading';
   const progressView = useProgressDisclosure(busy || check.phase === 'checking');
 
@@ -420,6 +429,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
                   onClick={() => {
                     if (installAttempt.current?.active) return;
                     const attempt = { active: true };
+                    const isCurrentAttempt = () => attempt.active && currentInstallIdentity.current === installIdentity;
                     installAttempt.current = attempt;
                     setInstalling(true);
                     setHandedOff(false);
@@ -431,19 +441,20 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
                       'app-update',
                       updateApi.requestInstallPermission().then((permission) => {
                         // Leaving this page withdraws this click's installation intent.
-                        if (!attempt.active) return;
+                        if (!isCurrentAttempt()) return;
                         const authorization = classifyInstallPermission(permission);
                         if (authorization.kind === 'refused') throw new Error(authorization.reason);
                         return updateApi.install(staged).then((result) => {
                           const outcome = classifyInstallHandoff(result);
                           if (outcome.kind === 'refused') throw new Error(outcome.reason);
-                          if (attempt.active) setHandedOff(true);
+                          if (isCurrentAttempt()) setHandedOff(true);
                         });
                       }).finally(() => {
                         if (installAttempt.current === attempt) installAttempt.current = null;
-                        if (attempt.active) setInstalling(false);
+                        if (isCurrentAttempt()) setInstalling(false);
                       }),
                       handoffText,
+                      isCurrentAttempt,
                     );
                   }}
                 >
