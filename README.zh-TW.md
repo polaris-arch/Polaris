@@ -22,15 +22,15 @@
 |---|---|
 | 接管方式 | TUN · 系統代理 · 本機連接埠 |
 | 分流 | 智慧 / 全域 / 直連 · 自訂規則 · 應用程式分流 · 地區分流（含回國） |
-| 通訊協定 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| 組網 | WireGuard · Tailscale · WARP；OpenConnect / OpenVPN 宣告了內網網段後同樣歸入 |
+| 通訊協定 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN · MASQUE[^masque] |
+| 組網 | WireGuard · Tailscale · WARP（WireGuard）；OpenConnect / OpenVPN 設定了內網網段時也用於內網存取 |
 | DNS | FakeIP · DoH / DoT · 解析競速 · IPv6 策略 · 洩漏防護 |
 | 診斷 | 連線拓撲 · 即時記錄 · 節點測速與進度 · 規則命中顯示 · 串流與 AI 解鎖偵測 |
 | 維運 | 訂閱管理 · 設定備份還原與確認 · 隱私鎖 · 系統匣常駐 |
 | 應用程式更新 | 正式版 / 測試版通道 · 可重新下載目前版本 · 安裝檔摘要驗證 |
-| 記憶體最佳化 | 介面隱藏或最小化 10 分鐘後自動釋放主 WebView；統計、連線與記錄按需訂閱 |
+| 桌面記憶體最佳化 | 介面隱藏或最小化 10 分鐘後自動釋放主 WebView；統計、連線與記錄按需訂閱 |
 
-**MASQUE 相容性**: MASQUE 使用 sing-box 自有實作，不支援 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制僅針對該接入方式。
+[^masque]: MASQUE 使用 sing-box 自有實作，不支援 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制僅針對該接入方式。
 
 <table>
 <tr>
@@ -83,6 +83,8 @@ SmartScreen 提示時選擇「其他資訊」→「仍要執行」。
 
 ## 建置
 
+以下供維護者建置目前原始碼，範例為 Linux；不代表上文 v1.0.0 下載包的建置輸入或安裝驗收。平台打包約定見下方建置文件。
+
 需要 Rust stable、Node.js 24+（CI 目前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
@@ -118,8 +120,10 @@ crates/      domain crates（config-engine / core-supervisor / helper / updater 
 resources/   sing-box 核心 + libcronet（建置期拉取，不入庫）
 ```
 
-核心以 sidecar 子行程執行，經 gRPC 管理面通訊。需要特權的 TUN 起核與系統接管委託三平台
+桌面端（Windows / macOS / Linux）核心以 sidecar 子行程執行，經 gRPC 管理面通訊。需要特權的 TUN 起核與系統接管委託三平台
 Rust helper；無需 helper 的 System Proxy 路徑由應用程式側 `system-integration` 直接管理並負責回復。
+
+Android 將 libbox 載入應用程式行程，採用行動端 VPN 整合，不使用上述桌面 sidecar/helper 路徑。
 
 ## 文件
 
@@ -127,7 +131,7 @@ Rust helper；無需 helper 的 System Proxy 路徑由應用程式側 `system-in
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 目前分層、執行交易、DNS/路由、特權邊界與大檔案判定準則 |
 | [docs/build-and-package.md](docs/build-and-package.md) | 建置、CI、打包不變量、更新器選檔契約 |
-| [docs/troubleshooting.zh-TW.md](docs/troubleshooting.zh-TW.md) | 不簽章說明、白畫面 / 花屏 / GPU 當機排障 |
+| [docs/troubleshooting.zh-TW.md](docs/troubleshooting.zh-TW.md) | MASQUE 相容限制、不簽章說明、白畫面 / 花屏 / GPU 當機排障 |
 
 截圖由 `node scripts/capture-screenshots.mjs` 產生：無頭 Chrome 算繪前端建置產物 + 注入樁資料，
 不需要安裝應用程式或啟動核心。

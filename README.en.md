@@ -22,15 +22,15 @@
 |---|---|
 | Traffic capture | TUN · System proxy · Local port |
 | Routing | Smart / Global / Direct · Custom rules · Per-app routing · Region routing (incl. back-to-China) |
-| Protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| Mesh | WireGuard · Tailscale · WARP; OpenConnect / OpenVPN also count once they declare internal subnets |
+| Protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN · MASQUE[^masque] |
+| Mesh | WireGuard · Tailscale · WARP (WireGuard); OpenConnect / OpenVPN also provide internal-network access when internal subnets are configured |
 | DNS | FakeIP · DoH / DoT · Resolver racing · IPv6 strategy · Leak protection |
 | Diagnostics | Connection topology · Live logs · Node speed tests with progress · Rule-hit display · Streaming and AI unlock detection |
 | Operations | Subscription management · Config backup and restore with confirmation · Privacy lock · Tray residency |
 | App updates | Stable / Testing channels · Re-download the current version · Installer digest verification |
-| Memory optimization | Releases the main WebView after the UI stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
+| Desktop memory optimization | Releases the main WebView after the UI stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
 
-**MASQUE compatibility**: MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
+[^masque]: MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
 
 <table>
 <tr>
@@ -79,6 +79,8 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 
 ## Build
 
+This section is for maintainers building the current source, with Linux as the example. It does not describe the build inputs or installation acceptance of the v1.0.0 downloads above. See the build guide below for platform packaging conventions.
+
 Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
@@ -112,7 +114,9 @@ crates/      domain crates (config-engine / core-supervisor / helper / updater /
 resources/   sing-box core + libcronet (fetched at build time, not committed)
 ```
 
-The core runs as a sidecar child process and is managed over a gRPC control plane. Privileged work — starting the core for TUN and system takeover — is delegated to the Rust helpers on all three platforms; the System Proxy path, which needs no helper, is managed directly by the app-side `system-integration` crate, which also owns the rollback.
+On desktop (Windows / macOS / Linux), the core runs as a sidecar child process and is managed over a gRPC control plane. Privileged work — starting the core for TUN and system takeover — is delegated to the Rust helpers on all three platforms; the System Proxy path, which needs no helper, is managed directly by the app-side `system-integration` crate, which also owns the rollback.
+
+Android loads libbox into the application process and uses mobile VPN integration rather than the desktop sidecar/helper path described above.
 
 ## Documentation
 
@@ -120,7 +124,7 @@ The core runs as a sidecar child process and is managed over a gRPC control plan
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Current layering, runtime transactions, DNS / routing, privilege boundaries, and the criteria for splitting large files (Chinese only) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | Build, CI, packaging invariants, updater package-selection contract |
-| [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | Unsigned-build notes, white screen / corrupted rendering / GPU crash triage |
+| [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | MASQUE compatibility limits, unsigned-build notes, white screen / corrupted rendering / GPU crash triage |
 
 Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chrome renders the built frontend with injected stub data — no app install and no running core required.
 

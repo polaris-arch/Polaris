@@ -22,15 +22,15 @@
 |---|---|
 | 接管方式 | TUN · 系统代理 · 本地端口 |
 | 分流 | 智能 / 全局 / 直连 · 自定义规则 · 应用分流 · 地区分流（含回国） |
-| 协议 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| 组网 | WireGuard · Tailscale · WARP；OpenConnect / OpenVPN 声明了内网段后同样归入 |
+| 协议 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN · MASQUE[^masque] |
+| 组网 | WireGuard · Tailscale · WARP（WireGuard）；OpenConnect / OpenVPN 配置了内网网段时也用于内网访问 |
 | DNS | FakeIP · DoH / DoT · 解析竞速 · IPv6 策略 · 泄漏防护 |
 | 诊断 | 连接拓扑 · 实时日志 · 节点测速与进度 · 规则命中展示 · 流媒体与 AI 解锁检测 |
 | 运维 | 订阅管理 · 配置备份恢复与确认 · 隐私锁 · 托盘驻留 |
 | 应用更新 | 正式版 / 测试版通道 · 可重新下载当前版本 · 安装包摘要校验 |
-| 内存优化 | 界面隐藏或最小化 10 分钟后自动释放主 WebView；统计、连接与日志按需订阅 |
+| 桌面内存优化 | 界面隐藏或最小化 10 分钟后自动释放主 WebView；统计、连接与日志按需订阅 |
 
-**MASQUE 兼容性**: MASQUE 使用 sing-box 自有实现，不支持 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制仅针对该接入方式。
+[^masque]: MASQUE 使用 sing-box 自有实现，不支持 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制仅针对该接入方式。
 
 <table>
 <tr>
@@ -83,6 +83,8 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 
 ## 构建
 
+以下供维护者构建当前源码，示例为 Linux；不代表上文 v1.0.0 下载包的构建输入或安装验收。平台打包约定见下方构建文档。
+
 需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
@@ -118,8 +120,10 @@ crates/      domain crates（config-engine / core-supervisor / helper / updater 
 resources/   sing-box 内核 + libcronet（构建期拉取，不入库）
 ```
 
-内核以 sidecar 子进程运行，经 gRPC 管理面通信。需要特权的 TUN 起核与系统接管委托三平台
+桌面端（Windows / macOS / Linux）内核以 sidecar 子进程运行，经 gRPC 管理面通信。需要特权的 TUN 起核与系统接管委托三平台
 Rust helper；无需 helper 的 System Proxy 路径由应用侧 `system-integration` 直接管理并负责回滚。
+
+Android 将 libbox 载入应用进程，采用移动端 VPN 集成，不使用上述桌面 sidecar/helper 路径。
 
 ## 文档
 
@@ -127,7 +131,7 @@ Rust helper；无需 helper 的 System Proxy 路径由应用侧 `system-integrat
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 当前分层、运行事务、DNS/路由、特权边界与大文件判定准则 |
 | [docs/build-and-package.md](docs/build-and-package.md) | 构建、CI、打包不变量、更新器选包契约 |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | 不签名说明、白屏 / 花屏 / GPU 崩溃排障 |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | MASQUE 兼容限制、不签名说明、白屏 / 花屏 / GPU 崩溃排障 |
 
 截图由 `node scripts/capture-screenshots.mjs` 生成：无头 Chrome 渲染前端构建产物 + 注入桩数据，
 不需要装应用或起内核。
