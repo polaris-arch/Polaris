@@ -514,6 +514,11 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tls_fingerprints.rs': {
+    why: 'The shared capability parser now explicitly compiles from_native for Android/iOS and host tests. '
+      + 'Its loaded-container identity and schema handling enter the Android Rust cdylib and must be compiled in the APK leg. '
+      + 'Host parser controls cover invalid/unknown reports and byte identity; they do not attest device JNI execution or new kernel profiles.',
+  },
   'src-tauri/src/runtime/proxy/tls_capabilities.rs': {
     why: 'Actual Android TLS capability snapshots use the loaded-libbox JNI result and retained native byte identity. '
       + 'These production cfg branches enter the APK Rust cdylib; Android check and APK compilation cover their types/linkage. '
