@@ -612,6 +612,8 @@ fn no_file_shaped_test_modules_anywhere() {
 const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/test_producer.py",
     "scripts/mobile-core/apple_rust.py",
+    "scripts/mobile-core/apple_tls_fingerprint.py",
+    "scripts/mobile-core/test_apple_tls_fingerprint.py",
     "scripts/mobile-core/test_apple_entry.py",
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",

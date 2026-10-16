@@ -45,6 +45,33 @@ fn loaded_identity_binds_bytes_and_report_without_inventing_source_evidence() {
 }
 
 #[test]
+fn native_report_keeps_actual_container_scope_and_unknown_capabilities_separate() {
+    let raw = document().to_string();
+    let digest = "a".repeat(64);
+    let loaded = Snapshot::from_native(Some(&raw), &digest, "loaded-jni-so");
+    assert!(loaded.document.is_some());
+    assert_eq!(loaded.observation_scope, "loaded-libbox");
+    assert_eq!(loaded.byte_identity_scope, "loaded-jni-so");
+    assert_eq!(loaded.binary_sha256.as_deref(), Some(digest.as_str()));
+    assert_ne!(
+        loaded.identity,
+        Snapshot::from_native(Some(&raw), &"b".repeat(64), "packet-tunnel-executable").identity
+    );
+    for raw in [None, Some("not a capability report")] {
+        let unknown = Snapshot::from_native(raw, &digest, "packet-tunnel-executable");
+        assert!(unknown.document.is_none());
+        assert!(unknown.identity.is_none());
+        assert_eq!(unknown.binary_sha256.as_deref(), Some(digest.as_str()));
+        assert_eq!(unknown.byte_identity_scope, "packet-tunnel-executable");
+        assert!(unknown.unavailable_reason.is_some());
+    }
+    let invalid = Snapshot::from_native(Some(&raw), "invalid-digest", "loaded-jni-so");
+    assert!(invalid.document.is_none());
+    assert!(invalid.binary_sha256.is_none());
+    assert!(invalid.identity.is_none());
+}
+
+#[test]
 fn final_generated_profile_admission_and_legacy_fallback() {
     let snapshot = Snapshot::from_loaded(&document().to_string(), &"a".repeat(64)).unwrap();
     let config =

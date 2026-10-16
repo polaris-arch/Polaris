@@ -80,6 +80,7 @@ impl Snapshot {
             unavailable_reason: Some(reason.into()),
         }
     }
+    #[cfg(any(test, target_os = "android", target_os = "ios"))]
     pub(crate) fn from_native(raw: Option<&str>, binary_sha256: &str, scope: &str) -> Self {
         if binary_sha256.len() != 64
             || !binary_sha256
@@ -387,7 +388,7 @@ async fn open_observation(path: &Path) -> Result<CliObservation, String> {
 
 enum ProbeFile {
     Native,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     ScriptFixture,
 }
 
@@ -427,7 +428,7 @@ impl CliProbeCache {
         });
         let permit_fixture = match file_kind {
             ProbeFile::Native => false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             ProbeFile::ScriptFixture => true,
         };
         let queried = if wrapper && !permit_fixture {
@@ -462,7 +463,7 @@ impl CliProbeCache {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn query_cli(path: &Path) -> Snapshot {
     match open_observation(path).await {
         Ok(entry) => query_observation(&entry).await.snapshot,

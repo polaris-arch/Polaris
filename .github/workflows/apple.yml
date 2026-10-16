@@ -150,6 +150,7 @@ jobs:
           echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
           xcrun swiftc -parse-as-library \
             src-tauri/gen/apple/PacketTunnel/TunnelLifecycle.swift \
+            crates/tauri-plugin-polaris-ios/ios/Sources/VpnEvidence.swift \
             crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift \
             -o "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"
           "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"

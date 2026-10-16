@@ -514,6 +514,11 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/proxy/tls_capabilities.rs': {
+    why: 'Actual Android TLS capability snapshots use the loaded-libbox JNI result and retained native byte identity. '
+      + 'These production cfg branches enter the APK Rust cdylib; Android check and APK compilation cover their types/linkage. '
+      + 'Host report/identity tests do not attest device JNI execution, ClientHello or final new-kernel profiles.',
+  },
   'scripts/release-assets.mjs': {
     why: 'Android 正式三包构建与聚合直接消费资产名、实际 ABI 集合及已验签字节摘要判据，须重验 APK 来源、内容与发布清单。',
   },
@@ -886,6 +891,10 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/runtime/proxy/tests/lifecycle.rs':
     '桌面-only managed marker/legacy lease 生命周期测试，cfg(not android) 不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
+  'src-tauri/src/runtime/proxy/tests/process_supervision/startup_observation.rs':
+    'Exact desktop-only cfg(test) readiness and retained CLI-instance fixtures exclude both Android and iOS. '
+    + 'Host polaris lib tests cover these cases; Android target cargo check and APK builds do not compile this test module '
+    + 'or attest mobile lifecycle behavior.',
   'src-tauri/src/runtime/proxy/tests/process_supervision.rs':
     '桌面-only helper attempt/lease 负例属于 cfg(test) 测试目标，不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',

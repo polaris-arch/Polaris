@@ -2269,6 +2269,7 @@ fn refresh_fallback_aligns_existing_epoch_before_reading_the_bar() {
     rt.auto_select_fallback_from(&cfg, &readings(&ledger));
     rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
     rt.gate.bump_generation();
+    *rt.test_measurement_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
     refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
     assert_eq!(
         rt.auto_select_fallback_from(&cfg, &readings(&ledger))

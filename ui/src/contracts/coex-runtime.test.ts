@@ -26,6 +26,8 @@ describe('historical actual Rust export and current source boundary', () => {
     expect(Object.keys(compatibility.sourceReview).sort()).toEqual(sourcePaths);
     expect(compatibility.changedObserverSources).toContain('src-tauri/src/runtime/proxy/coex_observer.rs');
     expect(compatibility.changedControlSources).toContain('src-tauri/src/runtime/proxy/lifecycle.rs');
+    expect(compatibility.changedControlSources).toContain('src-tauri/src/runtime/proxy/recovery.rs');
+    expect(compatibility.unchangedOriginalSources).not.toContain('src-tauri/src/runtime/proxy/recovery.rs');
     for (const path of changed) {
       expect(compatibility.sourceSha256[path as keyof typeof compatibility.sourceSha256])
         .not.toBe(fixture.producer.sourceSha256[path as keyof typeof fixture.producer.sourceSha256]);

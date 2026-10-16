@@ -1335,7 +1335,7 @@ pub async fn shutdown_for_exit() -> Result<(), String> {
     PC_TEMP_CORE_CUSTODY.retry_close().await
 }
 
-/// 临时核**入站→出站** 1:1 绑定的一个节点（[`plan_temp_core_with_bindings`] 产出，[`build_temp_core_config`] 消费）。
+/// 临时核**入站→出站** 1:1 绑定的一个节点（[`plan_temp_core_with_utls_policy`] 产出，[`build_temp_core_config`] 消费）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TempNode {
     /// 节点 id（结果回填键 + `event:speedTestResult` 的 serverId）。
@@ -1377,7 +1377,7 @@ pub enum UnusableReason {
     BuildFailed(&'static str),
 }
 
-/// [`plan_temp_core_with_bindings`] 的产出：可测节点（保序）+ 各原因的缺席列表（保序）。
+/// [`plan_temp_core_with_utls_policy`] 的产出：可测节点（保序）+ 各原因的缺席列表（保序）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TempCorePlan {
     /// 进临时核真测的节点。
@@ -1446,6 +1446,7 @@ pub fn plan_temp_core(servers: &[ServerConfig], env: &CoreBuildEnv) -> TempCoreP
 ///
 /// 临时核只在主核停止时运行，不需要 TUN 启动前的按目的路由推导；但显式策略属于用户配置，测速路径
 /// 必须与真实连接一致。映射只按节点 id 取值，空值继续交给操作系统逐目的选路。
+#[cfg(test)]
 #[must_use]
 pub fn plan_temp_core_with_bindings(
     servers: &[ServerConfig],
@@ -1514,7 +1515,7 @@ pub fn plan_temp_core_with_utls_policy(
     out
 }
 
-/// 缺席节点的**按原因汇总**日志（唯一出口，[`plan_temp_core_with_bindings`] 收尾调一次）。
+/// 缺席节点的**按原因汇总**日志（唯一出口，[`plan_temp_core_with_utls_policy`] 收尾调一次）。
 ///
 /// 全量列 id 在 116 节点的订阅上是一行几 KB，而排查只需要「是不是集中在某一类」——故只报两类计数
 /// 加前 5 个带原因的样本，与每轮汇总行的取样口径同源。
@@ -2679,7 +2680,7 @@ pub struct TempCoreSession;
 impl TempCoreSession {
     /// 跑一**轮**临时核测速：把可测集切成规模有界的批，逐批起一个自己的核，最后发**唯一**一条终态事件。
     ///
-    /// - `nodes`：[`plan_temp_core_with_bindings`] 裁出的可测节点（保序）；空 → 调用方不该进来（此处防御性返 `Ran` 空）。
+    /// - `nodes`：[`plan_temp_core_with_utls_policy`] 裁出的可测节点（保序）；空 → 调用方不该进来（此处防御性返 `Ran` 空）。
     /// - `superseded`：让位判据（生产 = [`is_temp_core_superseded`] 闭包，见模块文档）。
     /// - `measure`：按端口量 warm-TTFB（命令层注入，复用与主核路径**同一个**测量口径 ⇒ 两条腿的数值可比）。
     /// - `emit`：逐节点事件 + 心跳 + 终态（命令层注入 `AppHandle::emit`）。

@@ -56,6 +56,8 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::ExecBit, 1,
+        "FIFO fixture directory mode 0700 permits private traversal; no executable file is written"),
     ("crates/helper/src/pinned_core/tests/mod.rs", Kind::ExecBit, 1,
         "Private root/source directories for inert content status fixtures"),
     ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,

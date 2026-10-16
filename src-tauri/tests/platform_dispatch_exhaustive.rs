@@ -1482,6 +1482,12 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    (
+        "crates/config-engine/src/user_config/utls.rs",
+        "\"windows\" => \"win32\", \"macos\" => \"darwin\", other => other,",
+        1,
+        "Only host OS spellings windows/macos become existing builder aliases. iOS and unknown platform strings remain unchanged; ios is never relabeled darwin to enable a foreign native TLS engine.",
+    ),
     ("crates/helper-proto/src/core_manifest.rs",
      "\"linux\" => Platform::Linux, \"win\" => Platform::Win, \"mac-x64\" | \"mac-arm64\" => Platform::Mac, _ => return Err(\"core-platform-invalid\"),", 1,
      "The core manifest source-contract axis accepts exactly the four desktop App rows. Android/iOS and unknown strings return an error; the cleaner and complete payload checks then use the resolved desktop platform."),
@@ -2310,6 +2316,112 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    // Current uTLS capability/byte-identity sites; existing iOS debt verdicts remain unchanged.
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        4,
+        IosSide::WithAndroid,
+        "Both mobile platforms retain/query native container digests rather than a desktop CLI source handle. The shared metadata does not prove a handshake or independent temporary CLI support.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        6,
+        IosSide::WithAndroid,
+        "Retained CLI run/source handles, desktop selection observation and direct/helper executable byte checks are desktop-only. iOS and Android both use native loaded-container identity instead.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "The temporary digest producer queries the Android loaded-libbox bridge. iOS has no Android JNI bridge and retains its separate platform path.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Loaded TLS capability query calls the actual Android bridge. iOS queries PacketTunnel through its own bridge; the Android-only call cannot be reused as iOS evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        1,
+        IosSide::WithAndroid,
+        "tls_ready_binary_for_pid derives desktop retained Child/helper CLI identity. Neither mobile platform may use a pathname/PID as proof of a loaded native container.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Both mobile start paths capture the actual platform-native main identity, without granting a desktop executable-source handle or substituting a CLI query.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        5,
+        IosSide::WithAndroid,
+        "CLI capability capture, proven source handles and retained run attachment surround desktop birth. Android and iOS both exclude this separate process birth path.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Both mobile temporary-capability callers query the current native container; neither treats an arbitrary CLI binary path as its loaded libbox.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        4,
+        IosSide::WithAndroid,
+        "Desktop capability resolution binds retained Child custody or admitted CLI file identity. Both mobile platforms exclude these desktop methods and use their own native query.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android reads actual loaded libbox capabilities and byte identity via JNI; iOS must use the PacketTunnel query below, never this JNI response.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "iOS reads PacketTunnel capability bytes with its own loaded native container identity. This platform query is not an Android JNI result or proof of a network negotiation.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        2,
+        IosSide::WithAndroid,
+        "Desktop temporary CLI capability probing and cached executable-digest recheck exclude both mobile platforms. iOS cannot borrow desktop process evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android temporary measurements consume its loaded-libbox capability bridge; iOS has no independent temporary CLI and takes its explicit unavailable branch.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "The iOS temporary CLI capability branch explicitly reports unavailable. It neither invents Android support nor changes the existing independent-temp restriction.",
+    ),
+    (
+        "src-tauri/src/runtime/tls_fingerprints.rs",
+        "any(test, target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "from_native parses loaded-container reports for both mobile platforms; host tests retain the same parser seam. Production desktop uses its CLI path, and parser availability does not attest native execution.",
+    ),
     (
         "src-tauri/src/runtime/startup_tasks.rs",
         "desktop",
@@ -3806,10 +3918,10 @@ fn cfg_axis_platform_dispatch_is_registered() {
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 280),
+    ("DiffersRight", 286),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
-    ("WithAndroid", 91),
+    ("WithAndroid", 116),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

@@ -303,6 +303,21 @@ interface PromiseRow {
  */
 const REGISTRY: readonly PromiseRow[] = [
   {
+    snippet: '其他选项仅覆盖生成配置，不修改节点',
+    evidence: {
+      kind: 'anchors',
+      items: [
+        { file: 'crates/config-engine/src/builder/outbounds.rs', needle: 'config.utls_policy.as_deref(),' },
+        { file: 'crates/config-engine/src/user_config/utls.rs', needle: 'let mut effective = Cow::Borrowed(server);' },
+        {
+          file: 'crates/config-engine/src/user_config/utls',
+          needle: 'fn node_intent_global_policy_protocol_matrix_keeps_stored_nodes_unchanged()',
+          withTests: true,
+        },
+      ],
+    },
+  },
+  {
     snippet: '应用运行期间按周期测速；应用被系统暂停后，回来时自动补测',
     evidence: {
       kind: 'anchors',

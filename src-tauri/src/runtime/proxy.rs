@@ -2054,9 +2054,9 @@ impl ProxyRuntime {
             }
             // Metadata/handle checks only. Launch and acquisition still go through
             // the original resolver's full installation content verification.
-            return (source.is_current() && cli.matches(source.path()))
+            (source.is_current() && cli.matches(source.path()))
                 .then(|| cli.snapshot.binary_sha256.clone())
-                .flatten();
+                .flatten()
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {

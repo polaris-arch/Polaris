@@ -3028,7 +3028,7 @@ fn a_failed_result_carries_cause_but_no_milliseconds() {
 // 身份块、序号与流的形态（经生产同一个盖章出口 `RunEvents::sink` 收集事件）。
 // ══════════════════════════════════════════════════════════════════════════
 
-const IDENTITY_KEYS: [&str; 13] = [
+const IDENTITY_KEYS: [&str; 14] = [
     "run",
     "seq",
     "origin",
@@ -3039,6 +3039,7 @@ const IDENTITY_KEYS: [&str; 13] = [
     "context",
     "instance",
     "configDigest",
+    "coreBinarySha256",
     "nodeFingerprint",
     "networkEpoch",
     "measuredAt",
@@ -3121,7 +3122,9 @@ fn assert_identity_complete(payload: &Value) {
 /// 池路径：每条逐节点结果都带齐身份块，标 `connected` / `candidate`，手动运行顶层有 `runId`。
 #[tokio::test]
 async fn pool_results_carry_a_complete_connected_identity() {
-    let mut events = pool_events(SpeedTestOrigin::Manual);
+    let digest = "a".repeat(64);
+    let mut events =
+        pool_events(SpeedTestOrigin::Manual).with_core_binary_sha256(Some(digest.clone()));
     let collected = collect_pool_round(&mut events).await;
     let results = result_events(&collected);
     assert_eq!(results.len(), 3);
@@ -3138,6 +3141,7 @@ async fn pool_results_carry_a_complete_connected_identity() {
             json!({ "kind": "main", "generation": 7, "startTime": 100 })
         );
         assert_eq!(identity["configDigest"], json!("cfg-digest"));
+        assert_eq!(identity["coreBinarySha256"], json!(digest));
         assert_eq!(identity["networkEpoch"], json!(5));
         let id = payload["serverId"].as_str().unwrap();
         assert_eq!(identity["nodeFingerprint"], json!(format!("fp-{id}")));
@@ -3190,6 +3194,11 @@ async fn fallback_result_carries_a_system_path_identity() {
     assert_eq!(identity["context"], json!("connected"));
     assert_eq!(identity["nodeFingerprint"], Value::Null);
     assert_eq!(identity["networkEpoch"], Value::Null, "未知就是 null");
+    assert_eq!(
+        identity["coreBinarySha256"],
+        Value::Null,
+        "未知核摘要就是 null"
+    );
 }
 
 /// 出口伴测：身份块齐全、运行号在身份块里，事件顶层**不带** `runId`，既有两个字段原样。
@@ -3220,6 +3229,7 @@ fn companion_result_has_identity_but_no_top_level_run_id() {
     assert_eq!(identity["path"], json!("system"));
     assert_eq!(identity["context"], json!("connected"));
     assert_eq!(identity["networkEpoch"], json!(2));
+    assert_eq!(identity["coreBinarySha256"], Value::Null);
 }
 
 /// 非手动来源只发逐节点结果：进度与终态被盖章出口丢弃，结果顶层不带 `runId`。

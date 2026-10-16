@@ -223,7 +223,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
             <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
               {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
-                <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
+                <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
               ))}
             </MobileSelect>
           }

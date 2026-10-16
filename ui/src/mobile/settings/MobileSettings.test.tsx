@@ -1781,6 +1781,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'block-quic',
       'webrtc-leak',
       'tls-fragment',
+      'utls-policy',
       'auto-switch-node',
       'mesh-login-fallback',
       'interrupt-on-switch',

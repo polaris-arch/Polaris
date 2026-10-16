@@ -512,7 +512,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
           >
             {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
-              <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
+              <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
             ))}
           </Select>
         </SetRow>

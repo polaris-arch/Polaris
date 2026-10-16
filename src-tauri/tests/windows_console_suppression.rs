@@ -396,7 +396,7 @@ fn only_one_production_site_spawns_sing_box_check() {
         sites.join("\n")
     );
     for (file, argv) in [
-        (HOME, ".arg(\"check\")"),
+        (HOME, ".args([\"--disable-color\", \"check\", \"-c\"])"),
         (
             LINUX,
             ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
