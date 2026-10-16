@@ -317,7 +317,8 @@ class ProducerCalls(unittest.TestCase):
             actual_producer = producer.producer_code()
         self.assertEqual(actual_producer['files'][helper], actual_pin)
         import consume
-        with patch.object(consume, 'source_status_observation', return_value={'complete': True, 'clean': True}), \
+        with patch.object(consume, 'source_status_observation',
+                          return_value={'complete': True, 'clean': True, 'paths': [], 'reason': None}), \
                 patch.object(consume, 'run', return_value='b'*40):
             actual_consumer = consume.app_identity()
         self.assertEqual(actual_consumer['consumerCode'][helper], actual_pin)
