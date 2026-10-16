@@ -74,3 +74,8 @@ macOS has no equivalent switch (WKWebView exposes no public API; WebKit #26651 h
 Settings › Helper displays the selected core version, CoreID, source identity, and installed content state. Install or update when the selected content is absent; use Repair when verification fails. A bundled-content mismatch requires reinstalling Polaris. Uploading a different core or editing the manifest does not repair its compiled identity.
 
 Installation defers helper replacement when another user's core is active or old helper custody cannot be established as empty. Ask the owner to disconnect normally, or arrange an administrator maintenance window, then retry. Unknown native state preserves files and custody. A newer compatible helper may report a different BuildID; runtime version text is diagnostic and does not establish CoreID verification.
+
+
+## MASQUE compatibility
+
+MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.

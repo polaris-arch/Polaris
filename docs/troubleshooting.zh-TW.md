@@ -77,3 +77,8 @@ macOS 無對應開關（WKWebView 未提供公開 API，WebKit #26651 長期未�
 
 > 兩處開關是同一個鍵：`hardwareAcceleration`（正向語義，預設 `true`=開）。改動均需**整個應用程式重新啟動**才生效
 > —— 環境變數只在 webview 建立那一刻被讀取。
+
+
+## MASQUE 相容性
+
+MASQUE 使用 sing-box 自有實作，不支援 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制僅針對該接入方式。

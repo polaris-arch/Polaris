@@ -25,10 +25,12 @@
 | Protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
 | Mesh | WireGuard · Tailscale · WARP; OpenConnect / OpenVPN also count once they declare internal subnets |
 | DNS | FakeIP · DoH / DoT · Resolver racing · IPv6 strategy · Leak protection |
-| Diagnostics | Connection topology · Live logs · Node speed tests · Streaming and AI unlock detection |
-| Operations | Subscription management · Config backup and restore · Privacy lock · Tray residency |
+| Diagnostics | Connection topology · Live logs · Node speed tests with progress · Rule-hit display · Streaming and AI unlock detection |
+| Operations | Subscription management · Config backup and restore with confirmation · Privacy lock · Tray residency |
 | App updates | Stable / Testing channels · Re-download the current version · Installer digest verification |
 | Memory optimization | Releases the main WebView after the UI stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
+
+**MASQUE compatibility**: MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
 
 <table>
 <tr>
@@ -45,14 +47,16 @@
 
 Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+The files below are [published v1.0.0 assets](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); use the version and filenames on the selected Release. Desktop packages cover macOS Apple Silicon / Intel, Windows x64, and Linux amd64. This release provides a signed Android ARM64 APK. Check downloads against `SHA256SUMS` on the same release page.
+
 | Platform | File |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac.dmg` / `Polaris_1.0.0_x64-mac.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`; portable build: `Polaris_1.0.0_x64-win-Portable.zip` |
-| Linux | `Polaris_1.0.0_amd64-linux.deb` / `Polaris_1.0.0_amd64-linux.AppImage` |
-| Android | `Polaris_1.0.0_arm64-v8a-android.apk` / `Polaris_1.0.0_armeabi-v7a-android.apk` / `Polaris_1.0.0_universal-android.apk` (universal: ARMv8/ARMv7 only) |
+| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
+| Windows | `Polaris_1.0.0_x64-win-setup.exe`; portable build: `polaris-portable-v1.0.0.zip` |
+| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
+| Android | `polaris-1.0.0-android-arm64.apk` |
 
-Packages are not signed with a paid code-signing certificate, so the first launch needs a manual approval step on each platform.
+Desktop packages are not signed with a paid code-signing certificate, so the first launch may need manual approval.
 
 The Windows installer does not bundle the WebView2 Runtime; it is fetched online when the system lacks it. On stripped-down / LTSC images or portable setups without the Runtime, install [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) from Microsoft first. Polaris does not ship an offline WebView2 installer.
 
@@ -80,9 +84,9 @@ Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go,
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # frontend dependencies
-# sing-box core: the four-platform bundle built from the pinned source and patches (output of the "Desktop Core Sources" CI workflow for the same commit)
-node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
-# How to obtain the bundle, or build only the host platform's core: docs/build-and-package.en.md, "Two ways to obtain the core bundle"
+# Desktop core: consume the pinned release selected by core-manifest.json desktopRelease
+node scripts/fetch-core.mjs --platform=linux
+# Native acceptance bundles and local resource preparation: docs/build-and-package.en.md
 node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
 node scripts/fetch-dashboard.mjs   # fetch the built-in dashboard
 tauri build --config src-tauri/tauri.linux.conf.json
@@ -104,7 +108,7 @@ cd ui && npx pnpm@11.24.0 test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 main process
-crates/      18 domain crates (config-engine / core-supervisor / helper / updater / …)
+crates/      domain crates (config-engine / core-supervisor / helper / updater / …)
 resources/   sing-box core + libcronet (fetched at build time, not committed)
 ```
 
@@ -124,7 +128,7 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | Proxy core (sidecar child process) |
+| [polaris-box](https://github.com/polaris-arch/polaris-box) / [sing-box](https://github.com/SagerNet/sing-box) | sing-box-based polaris-box desktop core; source and version are selected by the build manifest |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Built-in dashboard |

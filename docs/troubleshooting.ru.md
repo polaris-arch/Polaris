@@ -68,3 +68,8 @@ $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--disable-gpu"; .\Polaris.exe
 `~/Library/Application Support/com.polaris.app/polaris/logs/` (на Linux `~/.config/...`, на Windows `%APPDATA%\...`, каталог с тем же именем `logs/`).
 
 > Оба переключателя — один и тот же ключ: `hardwareAcceleration` (прямая семантика, по умолчанию `true` = включено). Любое изменение вступает в силу только после **полного перезапуска приложения** — переменные окружения читаются лишь в момент создания webview.
+
+
+## Совместимость MASQUE
+
+MASQUE использует собственную реализацию sing-box и не поддерживает подключение к официальному сервису MASQUE Cloudflare, включая WARP через MASQUE. Ограничение относится именно к этому способу подключения.

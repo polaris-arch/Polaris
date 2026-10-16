@@ -16,10 +16,10 @@ Implementation lands in batches per system design §H (B0 scaffolding → B10 re
 
 | Tool | Version | Purpose |
 |---|---|---|
-| Rust | stable (edition 2021) | Backend + 18 domain crates under `crates/` (plus `source-probe`, which is dev-only: it appears solely in `[dev-dependencies]` and never in a lib/bin dependency graph) |
+| Rust | stable (edition 2021) | Backend + domain crates under `crates/` (plus `source-probe`, which is dev-only: it appears solely in `[dev-dependencies]` and never in a lib/bin dependency graph) |
 | Node.js | 24+ (CI pins 26) | Frontend build + fetch scripts |
 | pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`); the `beforeBuildCommand` of `tauri build` calls `pnpm` directly, so it must be on PATH |
-| Go | `goVersion` in `scripts/libbox-patches/source-manifest.json` | Building the desktop core from source, and reading binary build information when consuming a core bundle |
+| Go | `goVersion` in the source manifest for the selected build path | Source builds and binary build-information inspection; desktop and mobile inputs are separate |
 | [Tauri CLI 2](https://v2.tauri.app/) | Pinned by `scripts/tauri-cli.version` | `tauri build` packaging with the global CLI |
 
 Install the global CLI from the repository root. The CLI is no longer a `ui/` devDependency; desktop and Android CI install the same pinned version.
@@ -72,51 +72,52 @@ create a second compatibility layer.
 
 ### Fetching assets (sing-box core / cronet / dashboard)
 
-The three resource types have distinct provenance and integrity contracts; they must not be described collectively as “official releases plus manifest SHA”.
-
-- `fetch-core` does not download upstream Release archives. The desktop core is built natively on each of the four platforms from the sing-box source commit pinned in `scripts/libbox-patches/source-manifest.json` plus this repository's patches (Windows additionally applies `scripts/core-patches/windows-dns-refresh.patch`); its version is `sourceBuild.version` in `core-manifest.json`. The script places the verified four-platform core bundle into `resources/<platform>/`.
-- `fetch-cronet` downloads platform modules from the Go module proxy, then verifies the extracted dynamic library with `cronetLibrarySha256`.
-- `fetch-dashboard` fetches the sing-box `gh-pages` dashboard artifact and **currently has no SHA256 pin**.
-
-All are fetched on demand and never committed. **They must be run before packaging** because the Tauri bundle `resources` field references them. A missing core or Cronet pin is a hard failure: native executable resources are never fetched without verification.
+Current desktop packaging starts from `desktopRelease` in `src-tauri/core-manifest.json` and consumes the pinned
+[polaris-box](https://github.com/polaris-arch/polaris-box) release through `scripts/desktop-core/release-contract.json`.
+The source commit, tag object, asset index, and digests are pinned. Do not substitute the fork's latest default-branch
+commit, the historical `sourceBuild`, or the mobile `scripts/libbox-patches/source-manifest.json` for this desktop selection.
+These build inputs do not establish native App acceptance or publication of an App candidate.
 
 ```bash
-# sing-box cores for four platforms: consume the core bundle (version = sourceBuild.version in core-manifest.json; do not re-pin it here)
+# Prepare local Linux resources; other platforms: win, mac-x64, mac-arm64
+node scripts/fetch-core.mjs --platform=linux
+node scripts/fetch-cronet.mjs --platform=linux
+node scripts/fetch-dashboard.mjs
+```
+
+`fetch-core` verifies the pinned release inputs and places resources in `resources/<platform>/`. Linux / Windows
+Cronet libraries must also match their manifest digests; macOS uses static inputs. `fetch-dashboard` obtains the
+sing-box `gh-pages` dashboard and currently has no SHA256 pin. Resources are not committed and must be prepared
+before packaging. This build-time fetch is not an in-app online core replacement feature.
+
+#### Release packaging and native acceptance bundles
+
+`.github/workflows/desktop-core.yml` selects its path from the frozen manifest: release-selection mode verifies pinned
+assets on four native platforms; source mode builds from pinned source. The native inputs form a candidate-specific
+bundle, consumed by `package.yml` as follows:
+
+```bash
 node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
-node scripts/fetch-cronet.mjs     # libcronet (linux/windows only; on macOS it is statically linked into the core)
-node scripts/fetch-dashboard.mjs  # sing-box dashboard (gh-pages artifact)
 ```
 
-Use `node scripts/fetch-cronet.mjs --platform=linux` or `--platform=win` to fetch only the current packaging leg. Versions are always resolved from the `go.mod` of the sing-box tag named by `bundledCoreVersion`; Linux and Windows may use their respective upstream `require` versions. `--check-only` downloads no library, but verifies that the tag is readable, both exact requires exist, and both SHA-256 pins are complete and well-formed.
+Supply `--bundle-dir` and `--candidate` together. The current `desktopRelease` path verifies the native acceptance bundle
+before consuming the pinned assets. A local single-platform download does not replace release acceptance. Use the actual
+artifact name and candidate commit returned by the workflow, never receipts for another commit. The current manifest has
+`desktopRelease`; do not use the old `--producer` example directly. Source production applies only without that selection.
 
-The core bundle is produced by `.github/workflows/desktop-core.yml`: four native runners (Linux / Windows / macOS x64 / macOS arm64) each run `node scripts/fetch-core.mjs --producer --platform=<linux|win|mac-x64|mac-arm64> --bundle-dir=<dir> --candidate=<commit SHA>`, and `--assemble` then writes `bundle.json` for the combined outputs. `--producer` accepts exactly one platform and never cross-builds. Consumption requires `--candidate` to equal the current `HEAD` with no modified tracked files; even when `--platform` selects a single platform to place, all four binaries and receipts are verified first. A missing bundle or incomplete `sourceBuild` pins is a hard failure: there is no fallback to official Release assets or an old cache.
+`tauri.conf.json` has no `build.beforeBundleCommand`; `tauri build` does not prepare these resources for you.
+After fetching, CI runs `node scripts/verify-packaging.mjs confs` to check that resources exist and are nonempty.
+Payload / asset checks and native acceptance are still required. A successful download, digest verification, and runtime
+acceptance are separate checks.
 
-#### Two ways to obtain the core bundle
-
-**The full four-platform bundle (for packaging and releases).** `desktop-core.yml` can only be called by other workflows. In a repository you control (or a fork), trigger `release-risk.yml` or `package.yml` manually; both call `desktop-core.yml`. When the run finishes, download the artifact named `desktop-core-bundle-<commit SHA>-<run id>-<run attempt>`; the extracted directory is the `--bundle-dir`. Artifacts are kept for 7 days and are only valid for the commit that produced them.
-
-```bash
-gh run download <run id> --name 'desktop-core-bundle-<commit SHA>-<run id>-<run attempt>' --dir <core-bundle-dir>
-```
-
-**Only the core for the host platform (for local development).** Without a four-platform bundle you can produce just the host platform's core and place it in the resource directory by hand. This path skips the four-platform consistency checks; use it for local development and debugging only, never for release packages.
-
-```bash
-# Requires Go (goVersion in source-manifest.json), Python 3, git, and access to github.com for the upstream source
-# HEAD must equal --candidate and the working tree must have no modified tracked files
-node scripts/fetch-core.mjs --producer --platform=linux --bundle-dir=<dir> --candidate="$(git rev-parse HEAD)"
-mkdir -p resources/linux && cp <dir>/linux/sing-box resources/linux/sing-box
-```
-
-`--platform` is one of `linux`, `win`, `mac-x64`, `mac-arm64` and must match the host (there is no cross-platform build); on Windows the file is `sing-box.exe`. If the installed Go is not the version the manifest requires, set `GOTOOLCHAIN=go<version>` to let Go fetch the matching toolchain.
-
-All three commands above must be run manually: `tauri.conf.json` has **no** `build.beforeBundleCommand`, so `tauri build` does not fetch anything for you. (This section previously described a `beforeBundleCommand` safety net; that key never existed, which made `scripts/verify-dashboard-resources.mjs` an orphan that never ran. The script has been deleted.)
-
-The safety net is now `node scripts/verify-packaging.mjs confs`, which CI runs after the fetch steps and before the Rust build (`.github/workflows/package.yml`). It asserts that every resource path referenced by a conf exists **and has content**: empty directories and zero-byte files both fail the check (existence is not content; a failed fetch or extraction typically leaves exactly those two shapes). It is pure static analysis with no build dependency, so any developer machine can reproduce it.
-
-When upgrading the core, first update `bundledCoreVersion`, `scripts/libbox-patches/source-manifest.json`, and the `sourceBuild` / `windowsBuild` pins in `core-manifest.json` (`coreArchiveSha256` is now kept only for its key set, which enumerates the bundled platforms), then run `node scripts/fetch-cronet.mjs --check-only`. If upstream `go.mod` changes a Cronet dependency, update only the affected platform's `cronetLibrarySha256`, then re-fetch and verify that platform with `--force --platform=<linux or win>`; never write a second Cronet version into the manifest.
+To change the desktop core selection, maintainers must review `desktopRelease`, the release contract and its digest,
+and the actual pinned release assets together. Mobile source manifests and historical source-mode inputs are maintained
+separately. Changing only `bundledCoreVersion` or the old `sourceBuild` does not update the desktop selection.
+The core ships with the App; this guide does not expose independent user core upload, online replacement, or rollback.
 
 ### Producing installers
+
+The artifact names, asset tables, and three Android APKs described here are the build and release conventions of the current `main` source, for maintainers preparing candidate packages. They are not the current public download list and do not establish that a candidate has been published or passed installation acceptance. For published downloads, use the [README installation guide](../README.en.md#install) and the actual assets on [v1.0.0 Release](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0).
 
 ```bash
 # 1) Fetch assets (see above)
@@ -213,7 +214,7 @@ Six workflows divide the work (`.github/workflows/`):
   The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`); `scripts/gate-rust-ci-parity.test.mjs` keeps it in step with `ci.yml`. Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
 - **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml` (without uploading artifacts), and `android.yml` only for the affected faces.
-- **`desktop-core.yml`** — call-only: four native runners build the desktop core from source and assemble the core bundle.
+- **`desktop-core.yml`** — call-only: four native runners verify the pinned release inputs, or build pinned source in source mode, and assemble the candidate bundle.
 - **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. Its job is "can we produce a distributable installer". On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
 - **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; when called for a release it produces the signed APK.
 

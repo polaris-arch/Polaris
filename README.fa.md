@@ -27,12 +27,14 @@
 | پروتکل‌ها | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
 | شبکه خصوصی | WireGuard · Tailscale · WARP؛ OpenConnect و OpenVPN نیز پس از اعلام زیرشبکه‌های داخلی در همین دسته قرار می‌گیرند |
 | DNS | FakeIP · DoH / DoT · رقابت هم‌زمان بین حل‌کننده‌ها · راهبرد IPv6 · محافظت در برابر نشت |
-| عیب‌یابی | توپولوژی اتصال‌ها · گزارش زنده · سنجش سرعت گره‌ها · تشخیص باز بودن سرویس‌های پخش و هوش مصنوعی |
-| بهره‌برداری | مدیریت اشتراک · پشتیبان‌گیری و بازیابی پیکربندی · قفل حریم خصوصی · ماندگاری در سینی سیستم |
+| عیب‌یابی | توپولوژی اتصال‌ها · گزارش زنده · سنجش سرعت گره‌ها همراه با پیشرفت · نمایش قوانین تطبیق‌یافته · تشخیص باز بودن سرویس‌های پخش و هوش مصنوعی |
+| بهره‌برداری | مدیریت اشتراک · پشتیبان‌گیری و بازیابی پیکربندی با تأیید · قفل حریم خصوصی · ماندگاری در سینی سیستم |
 | به‌روزرسانی برنامه | کانال پایدار / آزمایشی · دانلود دوبارهٔ نسخهٔ فعلی · بررسی چکیدهٔ نصب‌کننده |
 | بهینه‌سازی حافظه | آزادسازی WebView اصلی پس از ۱۰ دقیقه پنهان یا کمینه بودن رابط؛ آمار، اتصال‌ها و گزارش‌ها تنها هنگام نیاز مشترک می‌شوند |
 
 </div>
+
+**سازگاری MASQUE**: MASQUE از پیاده‌سازی خود sing-box استفاده می‌کند و از اتصال رسمی MASQUE کلادفلر، از جمله WARP از طریق MASQUE، پشتیبانی نمی‌کند. این محدودیت فقط مربوط به همین روش اتصال است.
 
 <table>
 <tr>
@@ -51,14 +53,16 @@
 
 بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
 
+فایل‌های زیر [دارایی‌های منتشرشدهٔ v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) هستند؛ نسخه و نام فایل را با انتشار انتخاب‌شده تطبیق دهید. بسته‌های دسکتاپ برای macOS Apple Silicon / Intel، ‏Windows x64 و Linux amd64 ارائه شده‌اند. این انتشار برای Android یک APK امضاشدهٔ ARM64 دارد. فایل دانلودشده را با `SHA256SUMS` در همان صفحه بررسی کنید.
+
 | سکو | فایل |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac.dmg` / `Polaris_1.0.0_x64-mac.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `Polaris_1.0.0_x64-win-Portable.zip` |
-| Linux | `Polaris_1.0.0_amd64-linux.deb` / `Polaris_1.0.0_amd64-linux.AppImage` |
-| Android | `Polaris_1.0.0_arm64-v8a-android.apk` / `Polaris_1.0.0_armeabi-v7a-android.apk` / `Polaris_1.0.0_universal-android.apk` (universal: فقط ARMv8/ARMv7) |
+| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
+| Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-v1.0.0.zip` |
+| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
+| Android | `polaris-1.0.0-android-arm64.apk` |
 
-بسته‌ها با گواهی پولی امضای کد امضا نمی‌شوند، بنابراین نخستین اجرا روی هر سکو نیازمند یک گام تأیید دستی است.
+بسته‌های دسکتاپ با گواهی پولی امضای کد امضا نمی‌شوند؛ اجرای نخست ممکن است به تأیید دستی نیاز داشته باشد.
 
 نصب‌کننده ویندوز، WebView2 Runtime را در خود جای نمی‌دهد؛ اگر سیستم فاقد آن باشد، به‌صورت برخط دریافت می‌شود. کاربران نسخه‌های سبک‌شده / LTSC یا نسخه قابل حمل که Runtime را ندارند، ابتدا [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) را از سایت مایکروسافت نصب کنند. Polaris نصب‌کننده آفلاین WebView2 ارائه نمی‌دهد.
 
@@ -93,9 +97,9 @@ xattr -cr /Applications/Polaris.app
 ```bash
 npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
 pnpm --dir ui install --frozen-lockfile   # وابستگی‌های رابط کاربری
-# هسته sing-box: بسته چهارسکویی ساخته‌شده از کد منبع و وصله‌های قفل‌شده (خروجی workflow «Desktop Core Sources» در CI برای همین commit)
-node scripts/fetch-core.mjs --bundle-dir=<core-bundle-dir> --candidate="$(git rev-parse HEAD)"
-# روش دریافت بستهٔ هسته یا ساخت هسته فقط برای سکوی فعلی: docs/build-and-package.en.md، بخش "Two ways to obtain the core bundle"
+# هستهٔ دسکتاپ: انتشار ثابت تعیین‌شده در desktopRelease فایل core-manifest.json
+node scripts/fetch-core.mjs --platform=linux
+# بسته‌های بررسی بومی و آماده‌سازی منابع: docs/build-and-package.en.md
 node scripts/fetch-cronet.mjs --platform=linux  # دریافت libcronet.so در کنار هسته Linux
 node scripts/fetch-dashboard.mjs   # دریافت پنل داخلی
 tauri build --config src-tauri/tauri.linux.conf.json
@@ -125,7 +129,7 @@ cd ui && npx pnpm@11.24.0 test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   فرایند اصلی Tauri 2
-crates/      ۱۸ crate دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
+crates/      crateهای دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
 resources/   هسته sing-box + libcronet (در زمان ساخت دریافت می‌شوند، در مخزن نیستند)
 ```
 
@@ -147,7 +151,7 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 | پروژه | نقش |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | هسته پروکسی (فرایند فرزند sidecar) |
+| [polaris-box](https://github.com/polaris-arch/polaris-box) / [sing-box](https://github.com/SagerNet/sing-box) | هستهٔ دسکتاپ polaris-box بر پایهٔ sing-box؛ منبع و نسخه در مانیفست ساخت تعیین می‌شود |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | بستر اجرای دسکتاپ |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet برای NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | پنل داخلی |
