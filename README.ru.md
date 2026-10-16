@@ -58,6 +58,16 @@
 
 Скачайте пакет для своей платформы со страницы [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+### Пакеты Android
+
+Текущие сборки Android используют имена из [release-assets.mjs](scripts/release-assets.mjs); `<version>` — версия приложения. Universal включает только ARM64 / ARMv7, без x86. Наличие загрузок определяется файлами выбранного релиза.
+
+| Архитектура | Файл |
+|---|---|
+| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| Universal | `Polaris_<version>_universal-android.apk` |
+
 ### Опубликованные файлы v1.0.0
 
 Ниже перечислены [опубликованные файлы v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); версию и имена файлов сверяйте с выбранным релизом. Настольные пакеты доступны для macOS Apple Silicon / Intel, Windows x64 и Linux amd64. В этом релизе для Android опубликован подписанный APK ARM64. Проверьте загрузки по файлу `SHA256SUMS` на странице релиза.
@@ -67,7 +77,6 @@
 | macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
 | Windows | `Polaris_1.0.0_x64-win-setup.exe`; портативная сборка — `polaris-portable-v1.0.0.zip` |
 | Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
 
 Настольные пакеты не подписываются платным сертификатом подписи кода; при первом запуске может потребоваться ручное разрешение.
 

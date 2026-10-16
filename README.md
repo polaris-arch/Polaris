@@ -58,6 +58,16 @@
 
 从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包。
 
+### Android 安装包
+
+当前 Android 构建产物按 [release-assets.mjs](scripts/release-assets.mjs) 命名如下，`<version>` 为应用版本。universal 仅含 ARM64 / ARMv7，不含 x86；下载时以所选 Release 的实际附件为准。
+
+| 架构 | 文件 |
+|---|---|
+| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| Universal | `Polaris_<version>_universal-android.apk` |
+
 ### v1.0.0 已发布下载
 
 以下为 [v1.0.0 已发布资产](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0)；版本与文件名以所选 Release 为准。桌面提供 macOS Apple Silicon / Intel、Windows x64、Linux amd64；该版本 Android 提供正式签名的 ARM64 APK。可用同页 `SHA256SUMS` 核对下载文件。
@@ -67,7 +77,6 @@
 | macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
 | Windows | `Polaris_1.0.0_x64-win-setup.exe`；免安装用 `polaris-portable-v1.0.0.zip` |
 | Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
 
 桌面安装包当前不做付费代码签名，首次启动需按平台放行。
 

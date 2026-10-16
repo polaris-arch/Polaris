@@ -64,6 +64,16 @@
 
 بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
 
+### بسته‌های Android
+
+نام بسته‌های فعلی Android مطابق [release-assets.mjs](scripts/release-assets.mjs) است؛ `<version>` نسخه برنامه را نشان می‌دهد. Universal فقط ARM64 / ARMv7 را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد.
+
+| معماری | فایل |
+|---|---|
+| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| Universal | `Polaris_<version>_universal-android.apk` |
+
 ### دانلودهای منتشرشده v1.0.0
 
 فایل‌های زیر [دارایی‌های منتشرشدهٔ v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) هستند؛ نسخه و نام فایل را با انتشار انتخاب‌شده تطبیق دهید. بسته‌های دسکتاپ برای macOS Apple Silicon / Intel، ‏Windows x64 و Linux amd64 ارائه شده‌اند. این انتشار برای Android یک APK امضاشدهٔ ARM64 دارد. فایل دانلودشده را با `SHA256SUMS` در همان صفحه بررسی کنید.
@@ -73,7 +83,6 @@
 | macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
 | Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-v1.0.0.zip` |
 | Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
 
 بسته‌های دسکتاپ با گواهی پولی امضای کد امضا نمی‌شوند؛ اجرای نخست ممکن است به تأیید دستی نیاز داشته باشد.
 

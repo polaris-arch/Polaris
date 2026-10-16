@@ -58,6 +58,16 @@
 
 Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+### Android packages
+
+Current Android builds use the names in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the app version. Universal includes ARM64 / ARMv7 only, not x86. Download availability depends on the actual assets of the selected Release.
+
+| Architecture | File |
+|---|---|
+| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| Universal | `Polaris_<version>_universal-android.apk` |
+
 ### Published v1.0.0 downloads
 
 The files below are [published v1.0.0 assets](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); use the version and filenames on the selected Release. Desktop packages cover macOS Apple Silicon / Intel, Windows x64, and Linux amd64. This release provides a signed Android ARM64 APK. Check downloads against `SHA256SUMS` on the same release page.
@@ -67,7 +77,6 @@ The files below are [published v1.0.0 assets](https://github.com/polaris-arch/Po
 | macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
 | Windows | `Polaris_1.0.0_x64-win-setup.exe`; portable build: `polaris-portable-v1.0.0.zip` |
 | Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
 
 Desktop packages are not signed with a paid code-signing certificate, so the first launch may need manual approval.
 

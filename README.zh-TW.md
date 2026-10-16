@@ -58,6 +58,16 @@
 
 從 [Releases](https://github.com/polaris-arch/Polaris/releases) 下載對應平台的安裝檔。
 
+### Android 安裝包
+
+目前 Android 建置產物依 [release-assets.mjs](scripts/release-assets.mjs) 命名如下，`<version>` 為應用程式版本。universal 僅含 ARM64 / ARMv7，不含 x86；下載時以所選 Release 的實際附件為準。
+
+| 架構 | 檔案 |
+|---|---|
+| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
+| Universal | `Polaris_<version>_universal-android.apk` |
+
 ### v1.0.0 已發布下載
 
 以下為 [v1.0.0 已發布資產](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0)；版本與檔名以所選 Release 為準。桌面提供 macOS Apple Silicon / Intel、Windows x64、Linux amd64；此版本 Android 提供正式簽署的 ARM64 APK。可用同頁 `SHA256SUMS` 核對下載檔案。
@@ -67,7 +77,6 @@
 | macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
 | Windows | `Polaris_1.0.0_x64-win-setup.exe`；免安裝版用 `polaris-portable-v1.0.0.zip` |
 | Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
 
 桌面安裝檔目前不做付費程式碼簽章，首次啟動需依平台放行。
 
