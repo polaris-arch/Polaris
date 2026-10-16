@@ -445,9 +445,12 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
         interfaces = {}
         for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult', 'ExchangeContext', 'LocalDNSTransport', 'Func']:
             interfaces[name] = run([tools['javap'], '-constants', '-classpath', str(classes), 'io.nekohasekai.libbox.' + name])
-        required = {'Libbox': ['newTransientCommandServer(', 'newStrictCommandServer(', 'interfaceUpdateListenerIdentity(',
+        required = {'Libbox': ['newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(', 'interfaceUpdateListenerIdentity(',
                     'checkConfigWithResult(', 'java.lang.String version()'],
                     'CommandServer': ['startOrReloadService(', 'public native java.lang.String exportTailscaleStoreRetirement();',
+                                      'public native java.lang.String exportTailscaleDirectoryCapability();',
+                                      'public native java.lang.String exportTailscaleDirectoryRetirement();',
+                                      'activateTailscaleDirectoryDomain(',
                                       'void wakeNow()', 'void recordScreenState(boolean)'],
                     'PlatformInterface': ['void bindInterfaceControl(int, java.lang.String)'],
                     'ConfigValidationResult': ['getRequestID()', 'getConfigDigest()', 'getContractVersion()', 'getValidation()',
@@ -612,7 +615,9 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
             # Match read_text's universal newline behavior in the stable output.
             headers[header_path.name] = header_raw.decode().replace('\r\n', '\n').replace('\r', '\n')
         header = '\n'.join(headers.values())
-        for symbol in ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+        for symbol in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                       'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement',
+                       'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                        'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                        'getTailscaleStoreRetirement', 'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
             require(symbol in header, 'generated Objective-C API missing: ' + symbol)

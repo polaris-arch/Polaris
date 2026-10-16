@@ -46,6 +46,7 @@ pub mod subscription_parse;
 pub mod subscription_scheduler;
 pub mod taildrop;
 pub mod tailscale_login_core;
+mod tailscale_directory;
 pub mod tailscale_status;
 pub mod uninstall;
 pub mod unlock;

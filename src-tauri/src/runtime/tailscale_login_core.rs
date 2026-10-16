@@ -2009,7 +2009,8 @@ pub(crate) fn canonical_tailscale_claim_directory(directory: &Path) -> Result<Pa
     let unknown = |_| "nativeRetirementUnknown".to_owned();
     let root = directory
         .parent()
-        .filter(|root| root.file_name() == Some(std::ffi::OsStr::new("tailscale")))
+        .filter(|root| root.file_name() == Some(std::ffi::OsStr::new("tailscale"))
+            || cfg!(any(target_os = "ios", test)) && root.file_name() == Some(std::ffi::OsStr::new("tailscale-g4-v1")))
         .ok_or("nativeRetirementUnknown")?;
     let config = root.parent().ok_or("nativeRetirementUnknown")?;
     let canonical = nearest_existing(directory).map_err(unknown)?;
@@ -3327,6 +3328,9 @@ impl LoginCoreRegistry {
             return Err("Tailscale main reservation has wrong registry or gate".into());
         }
         let state_root = root.join("tailscale");
+        // Booking is keyed by node ID, not the chosen path. main_claims,
+        // main_owns and state_in_use therefore exclude both logical and physical
+        // candidates throughout Start -> Ready, before actual-scope refinement.
         let mut directories = HashMap::new();
         let mut endpoints = HashMap::new();
         for ep in generated
@@ -3350,7 +3354,12 @@ impl LoginCoreRegistry {
                 .filter(|name| !name.is_empty() && *name != "." && *name != "..")
                 .ok_or("Tailscale endpoint has an invalid state_directory ID")?
                 .to_owned();
-            if directories.insert(id.clone(), path.to_path_buf()).is_some() {
+            #[cfg(target_os = "ios")]
+            let actual = crate::runtime::tailscale_directory::DirectoryLease::actual_directory(root, &id)
+                .map_err(|error| error.to_string())?;
+            #[cfg(not(target_os = "ios"))]
+            let actual = path.to_path_buf();
+            if directories.insert(id.clone(), actual).is_some() {
                 return Err("Tailscale endpoint state_directory is duplicated".into());
             }
             let relevant = ["tag", "auth_key", "control_url", "hostname", "ephemeral"]
@@ -3402,6 +3411,36 @@ impl LoginCoreRegistry {
             registered: true,
             external_possible: false,
         })
+    }
+
+    /// Bind reservation paths to the actual original constructor census after
+    /// managed mapping (or an admitted whole-config legacy fallback). This only
+    /// updates local claims; it cannot mint a retirement or directory capability.
+    #[cfg(target_os = "ios")]
+    pub(crate) fn bind_main_actual_scope(
+        &self, token: &MainBirthToken, gate: &tokio::sync::MutexGuard<'_, ()>, root: &Path,
+        digest: &str, runs: &[tauri_plugin_polaris_ios::TailscaleStoreRetirementInstance],
+    ) -> Result<(), String> {
+        use tauri_plugin_polaris_ios::TailscaleWriterState;
+        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) { return Err("nativeRetirementUnknown".into()); }
+        let active: Vec<_> = runs.iter().filter(|run| run.config_digest == digest && run.terminal == TailscaleWriterState::Unknown).collect();
+        let [active] = active.as_slice() else { return Err("nativeRetirementUnknown".into()); };
+        let mut main = self.shared.main.lock().map_err(|_| "nativeRetirementUnknown")?;
+        let claim = main.as_mut().filter(|claim| claim.token.same(token)).ok_or("nativeRetirementUnknown")?;
+        if active.nodes.len() != claim.directories.len() { return Err("nativeRetirementUnknown".into()); }
+        let mut actual = HashMap::new();
+        for id in claim.directories.keys() {
+            let tag = claim.endpoints.get(id).and_then(|ep| ep.get("tag")).and_then(serde_json::Value::as_str).ok_or("nativeRetirementUnknown")?;
+            let nodes: Vec<_> = active.nodes.iter().filter(|node| node.tag == tag).collect();
+            let [node] = nodes.as_slice() else { return Err("nativeRetirementUnknown".into()); };
+            let logical = canonical_tailscale_claim_directory(&root.join("tailscale").join(id))?;
+            let physical = canonical_tailscale_claim_directory(&root.join("tailscale-g4-v1").join(id))?;
+            let selected = Path::new(&node.state_directory);
+            if selected != logical.as_path() && selected != physical.as_path() || selected.join("tailscaled.state") != Path::new(&node.state_file) { return Err("nativeRetirementUnknown".into()); }
+            actual.insert(id.clone(), selected.to_path_buf());
+        }
+        claim.directories = actual;
+        Ok(())
     }
 
     /// Registry-local compare-and-remove only. This does not prove that an OS,
@@ -4486,6 +4525,13 @@ impl LoginCoreRegistry {
             &mut Option<attempts::AndroidActionActivity>,
         >,
     ) -> StartLoginOutcome {
+        // Preserve the legacy iOS fallback, but revoke every prior managed
+        // directory proof durably before any prepare/check/spawn filesystem IO.
+        #[cfg(target_os = "ios")]
+        if let Err(error) = crate::runtime::tailscale_directory::DirectoryLease::poison_domain(user_data) {
+            return StartLoginOutcome::Failed(format!("CleanupUnknown: legacy domain revocation failed: {error}"));
+        }
+
         #[cfg(target_os = "android")]
         let warm = warm_activity.is_some();
         #[cfg(not(target_os = "android"))]

@@ -5,9 +5,9 @@ import Tauri
 import WebKit
 import UIKit
 
-private struct StartArgs: Decodable { let configContent: String; let requestID: String }
+private struct StartArgs: Decodable { let configContent: String; let requestID: String; let managedBootstrap: Bool?; let expectedDirectorySourceIdentity: String? }
 private struct StopArgs: Decodable {
-    let requestID: String; let observationNonce: String
+    let requestID: String; let observationNonce: String; let stopOnly: Bool?
     let expectedStartRequestID: String?; let expectedSessionID: String?
     let expectedConfigDigest: String?; let expectedExtensionGeneration: UInt64?
 }
@@ -32,6 +32,9 @@ private final class VpnOperation {
     var started = false
     var completed = false
     var readingReady = false
+    var managedConfig: String?
+    var expectedDirectorySourceIdentity: String?
+    var managedActivationPending = false
     var identity: [String: Any]?
     var startIntent: VpnStartIntent?
     var observer: NSObjectProtocol?
@@ -79,7 +82,9 @@ final class VpnPlugin: Plugin {
         else { throw vpnError("App Group is unavailable. Sign the iOS App and Packet Tunnel with the same group.") }
         let directory = container.appendingPathComponent("polaris", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
+        // Export the same filesystem spelling used by the provider and Go domain.
+        // Resolving an existing URL neither moves nor migrates its contents.
+        return directory.resolvingSymlinksInPath()
     }
     @objc func sharedDirectory(_ invoke: Invoke) {
         do { invoke.resolve(["path": try directory().path]) } catch { invoke.reject(error.localizedDescription) }
@@ -188,7 +193,17 @@ final class VpnPlugin: Plugin {
                         op.identity = configuration.providerConfiguration
                         try self.requireForeground()
                         // Config bytes are written only after the previous manager is inactive.
-                        try Data(args.configContent.utf8).write(to: configURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                        if args.managedBootstrap == true {
+                            guard let source = args.expectedDirectorySourceIdentity, source.utf8.count == 40,
+                                  source.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                                throw vpnError("StartupFailed: Managed producer source identity is absent")
+                            }
+                            op.expectedDirectorySourceIdentity = source
+                            op.managedConfig = args.configContent
+                            op.managedActivationPending = true
+                        } else {
+                            try Data(args.configContent.utf8).write(to: configURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                        }
                         manager.isEnabled = true
                         // Persist before handing the write to NE; its OS side
                         // effect can outlive the callback and this host process.
@@ -222,10 +237,10 @@ final class VpnPlugin: Plugin {
                                             op.started = true
                                             op.startIntent?.submitted(expected)
                                             self.submittedStart = op.startIntent
-                                            try manager.connection.startVPNTunnel(options: [
-                                                "sessionID": sessionID as NSString, "requestID": op.requestID as NSString,
-                                                "configContent": args.configContent as NSString
-                                            ])
+                                            let options = vpnStartOptions(sessionID: sessionID, requestID: op.requestID,
+                                                config: args.configContent, managed: args.managedBootstrap == true)
+                                            try manager.connection.startVPNTunnel(options: options)
+                                            if args.managedBootstrap == true { self.beginManagedActivation(op) }
                                             self.check(op, wanted: .connected, allowInitialDisconnected: true)
                                         } catch {
                                             let message = error.localizedDescription
@@ -265,6 +280,7 @@ final class VpnPlugin: Plugin {
                         op.identity = values
                         let status = manager.connection.status
                         if status == .invalid || status == .disconnected {
+                            if args.stopOnly == true { self.finishOrdinaryStop(op); return }
                             // No new native stop was submitted. Preserve the prior durable
                             // request/report identity rather than poisoning it with this nonce.
                             let prior = try self.snapshot(manager, includeHostUncertainty: false)
@@ -346,6 +362,77 @@ final class VpnPlugin: Plugin {
         }
     }
 
+    private func beginManagedActivation(_ op: VpnOperation) {
+        guard current(op), let manager = op.manager, let identity = op.identity,
+              let session = manager.connection as? NETunnelProviderSession,
+              let expectedSource = op.expectedDirectorySourceIdentity else { return }
+        let nonce = freshVpnRequestID("g4-bootstrap")
+        var query = identity; query["command"] = "bootstrapCapability"; query["observationNonce"] = nonce
+        func fail(_ message: String) {
+            guard self.current(op) else { return }
+            self.uncertainSession = identity["sessionID"] as? String
+            self.uncertainReason = message
+            if let intent = op.startIntent { self.stopSubmittedStart(intent, stopRequestID: freshVpnRequestID("g4-bootstrap-failed")) }
+            self.finish(op, error: vpnError(message), noStoreEligible: false)
+        }
+        func poll(_ attempts: Int) {
+            guard self.current(op), op.managedActivationPending else { return }
+            guard attempts < 40 else { fail("StartupFailed: Original provider did not prove the managed directory ABI/source"); return }
+            do {
+                try session.sendProviderMessage(JSONSerialization.data(withJSONObject: query)) { data in
+                    DispatchQueue.main.async {
+                        guard self.current(op), op.managedActivationPending else { return }
+                        guard let data, let observation = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { poll(attempts + 1) }; return
+                        }
+                        do {
+                            let root = try self.directory().resolvingSymlinksInPath().path
+                            guard let proof = vpnManagedBootstrapCapability(observation: observation, expectedIdentity: identity,
+                                nonce: nonce, expectedSource: expectedSource, root: root),
+                                let generation = proof["extensionGeneration"] as? NSNumber,
+                                let ownerNonce = proof["ownerNonce"] as? String else {
+                                fail("StartupFailed: Original provider capability/source binding differs"); return
+                            }
+                            // Recheck the actual saved manager immediately before disclosing config.
+                            self.loadManager(create: false) { result in
+                                guard self.current(op), op.managedActivationPending else { return }
+                                do {
+                                    guard let current = try result.get().manager,
+                                          current.connection.status == .connecting || current.connection.status == .connected,
+                                          vpnIdentityMatches(identity, (current.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration),
+                                          let actualSession = current.connection as? NETunnelProviderSession,
+                                          let config = op.managedConfig else { throw vpnError("Managed activation owner changed") }
+                                    let activationNonce = freshVpnRequestID("g4-activate")
+                                    var activation = identity
+                                    activation["command"] = "activateManaged"
+                                    activation["observationNonce"] = activationNonce
+                                    activation["extensionGeneration"] = generation
+                                    activation["ownerNonce"] = ownerNonce
+                                    activation["sourceIdentity"] = expectedSource
+                                    activation["configContent"] = config
+                                    try actualSession.sendProviderMessage(JSONSerialization.data(withJSONObject: activation)) { data in
+                                        DispatchQueue.main.async {
+                                            guard self.current(op), op.managedActivationPending else { return }
+                                            guard let data, let observed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                                  vpnLiveEvidence(profileIdentity: identity, expectedIdentity: identity,
+                                                    observation: observed, nonce: activationNonce, expectedGeneration: generation.uint64Value) != nil else {
+                                                fail("StartupFailed: Managed activation did not return the original owner terminal"); return
+                                            }
+                                            op.managedConfig = nil
+                                            op.managedActivationPending = false
+                                            self.check(op, wanted: .connected, allowInitialDisconnected: true)
+                                        }
+                                    }
+                                } catch { fail("StartupFailed: " + error.localizedDescription) }
+                            }
+                        } catch { fail("StartupFailed: " + error.localizedDescription) }
+                    }
+                }
+            } catch { fail("StartupFailed: Managed bootstrap IPC failed: " + error.localizedDescription) }
+        }
+        poll(0)
+    }
+
     @objc func observeSession(_ invoke: Invoke) {
         do {
             let args = try invoke.parseArgs(ObserveArgs.self)
@@ -366,6 +453,43 @@ final class VpnPlugin: Plugin {
                             nonce: args.observationNonce, expectedGeneration: args.extensionGeneration) { result in
                             switch result {
                             case .success(let snapshot): invoke.resolve(["observationNonce": args.observationNonce, "snapshot": snapshot])
+                            case .failure(let error): invoke.reject(error.localizedDescription)
+                            }
+                        }
+                    } catch { invoke.reject(error.localizedDescription) }
+                }
+            }
+        } catch { invoke.reject(error.localizedDescription) }
+    }
+
+    // This separate adapter permits an observed generation advance, never a
+    // different identity. Rust must validate the complete original-run custody
+    // extension before replacing its existing ReadySessionReceipt.
+    @objc func observeReloadSession(_ invoke: Invoke) {
+        do {
+            let args = try invoke.parseArgs(ObserveArgs.self)
+            guard args.extensionGeneration > 0, !args.observationNonce.isEmpty,
+                  vpnIdentityMatches(args.identity, args.identity) else { throw vpnError("ReadyUnknown: Session observation binding is empty") }
+            DispatchQueue.main.async {
+                var completed = false
+                let deadline = DispatchWorkItem {
+                    guard !completed else { return }; completed = true
+                    invoke.reject("ReadyUnknown: Loading the bound VPN profile timed out")
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: deadline)
+                self.loadManager(create: false) { result in
+                    guard !completed else { return }; completed = true; deadline.cancel()
+                    do {
+                        guard let manager = try result.get().manager else { throw vpnError("ReadyUnknown: VPN profile is unavailable") }
+                        self.readLiveSession(manager, expectedIdentity: args.identity,
+                            nonce: args.observationNonce) { result in
+                            switch result {
+                            case .success(let snapshot):
+                                guard let generation = snapshot["extensionGeneration"] as? NSNumber,
+                                      generation.uint64Value >= args.extensionGeneration else {
+                                    invoke.reject("ReadyUnknown: Reload observation regressed its original generation"); return
+                                }
+                                invoke.resolve(["observationNonce": args.observationNonce, "snapshot": snapshot])
                             case .failure(let error): invoke.reject(error.localizedDescription)
                             }
                         }
@@ -491,7 +615,7 @@ final class VpnPlugin: Plugin {
                 guard self.current(op) else { return }
                 do {
                     guard let currentManager = try result.get().manager, let expected = op.identity,
-                          vpnIdentityMatches(expected, (currentManager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                          vpnMaySubmitOrdinaryStop(expected: expected, actual: (currentManager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
                     else { throw vpnError("CleanupUnknown: The current manager changed before Stop") }
                     op.manager = currentManager
                     self.observe(op, wanted: .disconnected)
@@ -529,6 +653,7 @@ final class VpnPlugin: Plugin {
         let status = manager.connection.status
         if wanted == .disconnected, status == .disconnected || status == .invalid { finishStopped(op); return }
         if wanted == .connected, status == .connected {
+            guard !op.managedActivationPending else { return }
             guard !op.readingReady, let identity = op.identity else { return }
             op.readingReady = true
             readLiveSession(manager, expectedIdentity: identity, nonce: freshVpnRequestID("start-observe")) { result in
@@ -552,8 +677,30 @@ final class VpnPlugin: Plugin {
             }
         }
     }
+    /// This outcome only says the addressed NE connection is no longer active.
+    /// It does not claim Go writers, directory IO, or settings have drained.
+    private func finishOrdinaryStop(_ op: VpnOperation) {
+        guard current(op), !op.readingStopped, let expected = op.identity else { return }
+        op.readingStopped = true
+        loadManager(create: false) { result in
+            guard self.current(op) else { return }
+            do {
+                guard let manager = try result.get().manager,
+                      manager.connection.status == .disconnected || manager.connection.status == .invalid,
+                      vpnIdentityMatches(expected, (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration)
+                else { throw vpnError("CleanupUnknown: Original ordinary Stop owner changed or remains active") }
+                self.finish(op, snapshot: ["status": manager.connection.status.rawValue,
+                    "running": false, "active": false, "profileExists": true,
+                    "ownership": "ownedSessionUnproven", "sessionId": expected["sessionID"] as? String ?? "",
+                    "requestId": expected["requestID"] as? String ?? "", "configDigest": expected["configDigest"] as? String ?? "",
+                    "cleanupEvidence": "CleanupUnknown"])
+            } catch { self.finish(op, error: error) }
+        }
+    }
+
     private func finishStopped(_ op: VpnOperation) {
         guard current(op), !op.awaitingStopObservation, !op.readingStopped else { return }
+        if op.stopArgs?.stopOnly == true { finishOrdinaryStop(op); return }
         if let observation = op.stopObservation, let expected = op.identity, let args = op.stopArgs {
             op.readingStopped = true
             loadManager(create: false) { result in
@@ -573,6 +720,11 @@ final class VpnPlugin: Plugin {
                         expectedGeneration: args.expectedExtensionGeneration)
                         ?? vpnSessionEvidence(profileIdentity: expected, report: report, stopRequestID: args.requestID)
                     snapshot.merge(evidence) { _, live in live }
+                    if let directory = vpnDirectoryRetirementEvidence(profileIdentity: expected, expectedIdentity: expected,
+                        observation: observation, nonce: args.observationNonce, stopRequestID: args.requestID,
+                        expectedGeneration: args.expectedExtensionGeneration) {
+                        snapshot.merge(directory) { _, live in live }
+                    }
                     if let failure = vpnStopFailure(evidence: snapshot, profileExists: true) { throw vpnError(failure) }
                     self.uncertainSession = nil; self.uncertainReason = nil
                     self.finish(op, snapshot: snapshot)
@@ -664,6 +816,7 @@ final class VpnPlugin: Plugin {
     private func finish(_ op: VpnOperation, error: Error? = nil, snapshot: [String: Any]? = nil, noStoreEligible: Bool = true) {
         guard operation === op, generation == op.generation, !op.completed else { return }
         op.completed = true
+        op.managedConfig = nil
         op.startIntent?.finish()
         operation = nil
         op.deadline?.cancel()

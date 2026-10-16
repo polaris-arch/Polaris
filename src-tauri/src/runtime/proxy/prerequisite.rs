@@ -515,7 +515,7 @@ async fn validate_with_probe(
 impl MainReadinessProbe for ProxyRuntime {
     async fn observe(&self, core: &ReadyMainCore) -> Result<(), MainPrerequisiteError> {
         #[cfg(target_os = "ios")]
-        tauri_plugin_polaris_ios::observe_session(&core.ios_receipt)
+        tauri_plugin_polaris_ios::refresh_ready_session(&core.ios_receipt)
             .await
             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
         // A fresh actual unary RPC is required. TCP/channel construction alone grants nothing.
@@ -949,6 +949,7 @@ impl ProxyRuntime {
                         origin: super::IosMainOrigin::Observed(observed),
                         main_token: None,
                         ready: None,
+                        stop_target: None,
                         stopped: None,
                     });
                     Ok(())
@@ -980,7 +981,7 @@ impl ProxyRuntime {
             .retire_tailscale_other_attempts_under_gate(id, &gate, attempt)
             .await?;
         let tag = ticket.target_tag(id).ok_or("profileBindingUnknown")?;
-        let (fingerprint, revision) = {
+        let (fingerprint, revision, sealed_directory) = {
             use tauri_plugin_polaris_ios::{
                 TailscaleProfileState, TailscaleStateFileState, TailscaleWriterState,
             };
@@ -995,7 +996,7 @@ impl ProxyRuntime {
                 })
                 .ok_or("nativeRetirementUnknown")?;
             let ready = owner
-                .ready
+                .stop_target
                 .as_ref()
                 .filter(|ready| ready.request_id() == ticket.core.ios_receipt.request_id())
                 .ok_or("nativeRetirementUnknown")?;
@@ -1057,7 +1058,7 @@ impl ProxyRuntime {
             } else {
                 None
             };
-            (fingerprint, node.state_file_revision.clone())
+            (fingerprint, node.state_file_revision.clone(), node.state_directory.clone())
         };
         attempt
             .while_active(|| {
@@ -1079,12 +1080,13 @@ impl ProxyRuntime {
                         .update_tailscale_credential(saved, id, |current| {
                             if self
                                 .mesh
-                                .tailscale_retire_auth_under_gate(
+                                .tailscale_retire_auth_at_directory_under_gate(
                                     id,
                                     &gate,
                                     Some(attempt),
                                     provenance,
                                     Some(&revision),
+                                    Some(&sealed_directory),
                                 )
                                 .is_err()
                             {

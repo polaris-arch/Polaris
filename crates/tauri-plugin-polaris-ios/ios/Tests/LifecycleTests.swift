@@ -3,6 +3,10 @@ import Foundation
 @main
 struct LifecycleTests {
     static func main() throws {
+        try directoryRetirementCases()
+        try reloadCustodyCases()
+        managedBootstrapCases()
+        ordinaryStopDispatchCases()
         let identity = TunnelIdentity(sessionID: "session-a", requestID: "start-a", configDigest: "digest-a")
         let lifecycle = TunnelLifecycle()
         let start = try lifecycle.start(identity)
@@ -385,4 +389,190 @@ struct LifecycleTests {
         assert(attempted.noStoreTerminal() == nil)
         print("iOS TS Store retirement seam cases passed: deferred original Stop, full two-run census, exact nonce/generation, canonical paths, active Unknown, old-file exclusion, actual non-submission intent")
     }
+    static func directoryRetirementCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let identity = TunnelIdentity(sessionID: "directory-session", requestID: "directory-start", configDigest: digest)
+        let profile: [String: Any] = ["sessionID": identity.sessionID, "requestID": identity.requestID, "configDigest": digest]
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/managed/ts-a", "directoryIdentity": "unix:1:2:1:3",
+            "incarnation": String(repeating: "c", count: 32), "directoryEpoch": String(repeating: "e", count: 32), "writerState": "Unknown", "censusVersion": 1, "failure": ""]
+        func export(_ nodes: [[String: Any]], terminal: String = "Unknown") throws -> String {
+            let value: [String: Any] = ["contractVersion": "polaris-ts-directory-retirement-v1", "globalCleanupEvidence": "CleanupUnknown",
+                "instances": [["runNonce": String(repeating: "b", count: 64), "configDigest": digest,
+                "terminal": terminal, "censusComplete": true, "nodes": nodes]]]
+            return String(data: try JSONSerialization.data(withJSONObject: value), encoding: .utf8)!
+        }
+        let original = try export([node])
+        var drained = node; drained["writerState"] = "SealedDrained"
+        let terminal = try export([drained], terminal: "SealedDrained")
+        let lifecycle = TunnelLifecycle()
+        let generation = try lifecycle.start(identity)
+        lifecycle.retainTailscaleDirectoryScope(original, identity: identity)
+        assert(lifecycle.complete(generation, phase: "running", stopped: false))
+        var response: TunnelObservation?
+        assert(lifecycle.prepareStop(identity: identity, requestID: "stop-a", nonce: "nonce-a",
+            expectedGeneration: generation, observation: { response = $0 }))
+        // Admission cannot replace the frozen census between prepareStop and stop.
+        lifecycle.retainTailscaleDirectoryScope("late-live", identity: identity)
+        let stopping = lifecycle.stop()!
+        lifecycle.retainTailscaleDirectoryScope(terminal, identity: identity, terminal: true)
+        lifecycle.retainTailscaleDirectoryScope("late-close", identity: identity, terminal: true)
+        assert(lifecycle.complete(stopping, phase: "stopped", stopped: true))
+        let observation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(response!)) as! [String: Any]
+        func evidence(_ observed: [String: Any], nonce: String = "nonce-a") -> [String: Any]? {
+            vpnDirectoryRetirementEvidence(profileIdentity: profile, expectedIdentity: profile,
+                observation: observed, nonce: nonce, stopRequestID: "stop-a", expectedGeneration: generation)
+        }
+        assert(evidence(observation)?["tailscaleDirectoryRetirement"] != nil)
+        assert(evidence(observation)?["tailscaleStoreRetirement"] == nil)
+        assert(evidence(observation, nonce: "replay") == nil)
+        let report = observation["report"] as! [String: Any]
+        assert(report["stopOriginalDirectoryScope"] as? String == original)
+        assert(report["tailscaleDirectoryScope"] as? String == terminal)
+        assert(vpnSessionEvidence(profileIdentity: profile, report: report)["tailscaleDirectoryRetirement"] == nil)
+        for (field, replacement) in [("incarnation", String(repeating: "d", count: 32)),
+                                     ("directoryIdentity", "unix:1:2:1:4"), ("directoryEpoch", String(repeating: "f", count: 32)),
+                                     ("writerState", "Unknown"), ("failure", "timeout")] {
+            var changed = drained; changed[field] = replacement
+            var badReport = report; badReport["tailscaleDirectoryScope"] = try export([changed], terminal: "SealedDrained")
+            var bad = observation; bad["report"] = badReport
+            assert(evidence(bad) == nil)
+        }
+        for field in ["stopOriginalDirectoryScope", "tailscaleDirectoryScope"] {
+            var badReport = report; badReport.removeValue(forKey: field)
+            var bad = observation; bad["report"] = badReport
+            assert(evidence(bad) == nil)
+        }
+        var badReport = report; badReport["lifecycle"] = "uncertain"
+        var bad = observation; bad["report"] = badReport
+        assert(evidence(bad) == nil)
+        var missingEpoch = drained; missingEpoch.removeValue(forKey: "directoryEpoch")
+        let missingEpochExport = try export([missingEpoch], terminal: "SealedDrained")
+        assert(vpnTailscaleDirectoryExport(raw: missingEpochExport, configDigest: digest, terminal: true) == nil)
+        var multiObservation = observation
+        var multiReport = report
+        for key in ["stopOriginalDirectoryScope", "tailscaleDirectoryScope"] {
+            var value = try JSONSerialization.jsonObject(with: Data((report[key] as! String).utf8)) as! [String: Any]
+            var runs = value["instances"] as! [[String: Any]]
+            var old = runs[0]; old["runNonce"] = String(repeating: "f", count: 64)
+            old["configDigest"] = String(repeating: "d", count: 64)
+            runs.insert(old, at: 0); value["instances"] = runs
+            multiReport[key] = String(data: try JSONSerialization.data(withJSONObject: value), encoding: .utf8)!
+        }
+        multiObservation["report"] = multiReport
+        assert(evidence(multiObservation) != nil)
+        let unknown = TunnelLifecycle()
+        let first = try unknown.start(identity)
+        unknown.retainTailscaleDirectoryScope(original, identity: identity)
+        assert(unknown.complete(first, phase: "running", stopped: false))
+        assert(unknown.prepareStop(identity: identity, requestID: "stop-b", nonce: "nonce-b", observation: { _ in }))
+        let final = unknown.stop()!
+        unknown.retainTailscaleDirectoryScope(original, identity: identity, terminal: true)
+        unknown.retainTailscaleDirectoryScope(terminal, identity: identity, terminal: true)
+        assert(unknown.complete(final, phase: "stopped", stopped: true))
+        assert(unknown.report().tailscaleDirectoryScope == original)
+    }
+
+    static func reloadCustodyCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let profile: [String: Any] = ["sessionID": "reload-session", "requestID": "reload-start", "configDigest": digest]
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/managed/ts-a", "stateFile": "/managed/ts-a/tailscaled.state",
+            "writerState": "Unknown", "stateFileState": "Unknown", "stateFileRevision": "", "profileState": "Unknown", "profileFingerprint": ""]
+        let current: [String: Any] = ["runNonce": String(repeating: "b", count: 64), "configDigest": digest,
+            "terminal": "Unknown", "censusComplete": false, "nodes": [node]]
+        var historical = current
+        historical["runNonce"] = String(repeating: "c", count: 64)
+        historical["configDigest"] = String(repeating: "d", count: 64)
+        var oldNode = node; oldNode["writerState"] = "SealedDrained"
+        historical["nodes"] = [oldNode]; historical["terminal"] = "SealedDrained"; historical["censusComplete"] = true
+        let export: [String: Any] = ["contractVersion": "polaris-ts-auth-writer-retirement-v1",
+            "globalCleanupEvidence": "CleanupUnknown", "instances": [historical, current]]
+        let raw = String(data: try JSONSerialization.data(withJSONObject: export), encoding: .utf8)!
+        var report: [String: Any] = ["identity": profile, "generation": 2, "lifecycle": "running",
+            "runtimeStopped": false, "cleanupEvidence": "CleanupUnknown", "tailscaleStoreScope": raw]
+        var observation: [String: Any] = ["observationNonce": "reload-nonce", "report": report]
+        // Existing strict observation still rejects stale generation. Only the
+        // dedicated reload adapter may pass a candidate to Rust custody checks.
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce", expectedGeneration: 1) == nil)
+        let fresh = vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce")
+        assert(fresh?["tailscaleStoreScope"] != nil)
+        assert(fresh?["tailscaleStoreRetirement"] == nil)
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "replayed") == nil)
+        var wrong = profile; wrong["sessionID"] = "another-owner"
+        report["identity"] = wrong; observation["report"] = report
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce") == nil)
+    }
+
+    static func ordinaryStopDispatchCases() {
+        let original: [String: Any] = ["sessionID": "a", "requestID": "start-a", "configDigest": String(repeating: "a", count: 64)]
+        var submissions = 0
+        // Same production dispatch predicate, independent of unavailable live
+        // evidence: a blocked reload/timeout/wrong nonce cannot suppress Stop.
+        for _ in ["reloadAccepted", "observation-timeout", "wrong-nonce"] {
+            if vpnMaySubmitOrdinaryStop(expected: original, actual: original) { submissions += 1 }
+        }
+        assert(submissions == 3)
+        var successor = original; successor["sessionID"] = "b"
+        assert(!vpnMaySubmitOrdinaryStop(expected: original, actual: successor))
+        successor = original; successor["requestID"] = "start-b"
+        assert(!vpnMaySubmitOrdinaryStop(expected: original, actual: successor))
+        successor = original; successor["configDigest"] = String(repeating: "b", count: 64)
+        assert(!vpnMaySubmitOrdinaryStop(expected: original, actual: successor))
+        assert(!vpnMaySubmitOrdinaryStop(expected: original, actual: nil))
+    }
+
+    static func managedBootstrapCases() {
+        let identity: [String: Any] = ["sessionID": "s", "requestID": "r", "configDigest": String(repeating: "a", count: 64)]
+        let source = String(repeating: "b", count: 40)
+        let capability: [String: Any] = ["contractVersion": "polaris-ts-directory-capability-v1",
+            "sourceABI": "polaris-g4-directory-v1", "sourceIdentity": source,
+            "managedRoot": "/group/polaris/tailscale-g4-v1", "logicalRoot": "/group/polaris/tailscale",
+            "ownerNonce": String(repeating: "c", count: 32), "participating": true]
+        let observation: [String: Any] = ["contractVersion": "polaris-ios-g4-bootstrap-v1", "identity": identity,
+            "extensionGeneration": 1, "observationNonce": "fresh", "capability": capability]
+        func proof(_ candidate: [String: Any], nonce: String = "fresh") -> [String: Any]? {
+            vpnManagedBootstrapCapability(observation: candidate, expectedIdentity: identity,
+                nonce: nonce, expectedSource: source, root: "/group/polaris")
+        }
+        assert(proof(observation) != nil)
+        // Both actual root resolvers return resolved URLs before exporting paths.
+        // This source-only seam checks the resulting exact-root handshake: an
+        // alias spelling cannot substitute for the canonical root even if the
+        // OS would resolve both to the same inode. No state is created/moved here.
+        let canonicalRoot = URL(fileURLWithPath: "/private/var/group/polaris", isDirectory: true).resolvingSymlinksInPath().path
+        var canonicalCapability = capability
+        canonicalCapability["managedRoot"] = canonicalRoot + "/tailscale-g4-v1"
+        canonicalCapability["logicalRoot"] = canonicalRoot + "/tailscale"
+        var canonicalObservation = observation; canonicalObservation["capability"] = canonicalCapability
+        assert(vpnManagedBootstrapCapability(observation: canonicalObservation, expectedIdentity: identity,
+            nonce: "fresh", expectedSource: source, root: canonicalRoot) != nil)
+        assert(vpnManagedBootstrapCapability(observation: canonicalObservation, expectedIdentity: identity,
+            nonce: "fresh", expectedSource: source, root: canonicalRoot + "/.") == nil)
+        assert(proof(observation, nonce: "old") == nil)
+        var zeroGeneration = observation; zeroGeneration["extensionGeneration"] = 0
+        assert(proof(zeroGeneration) == nil)
+        var missingCapability = observation; missingCapability.removeValue(forKey: "capability")
+        assert(proof(missingCapability) == nil)
+        for (field, replacement) in [("sourceABI", "legacy"), ("sourceIdentity", String(repeating: "d", count: 40)),
+                                     ("ownerNonce", ""), ("managedRoot", "/other/tailscale-g4-v1"),
+                                     ("logicalRoot", "/other/tailscale")] {
+            var bad = observation; var inner = capability; inner[field] = replacement; bad["capability"] = inner
+            assert(proof(bad) == nil)
+        }
+        var bad = observation; var inner = capability; inner["participating"] = false; bad["capability"] = inner
+        assert(proof(bad) == nil)
+        bad = observation; var wrongOwner = identity; wrongOwner["sessionID"] = "other"; bad["identity"] = wrongOwner
+        assert(proof(bad) == nil)
+        let managed = vpnStartOptions(sessionID: "s", requestID: "r", config: "secret target config", managed: true)
+        assert(managed["configContent"] == nil)
+        assert(managed.count == 3)
+        assert(managed["directoryBootstrapVersion"] as? String == "polaris-ios-g4-bootstrap-v1")
+        let legacy = vpnStartOptions(sessionID: "s", requestID: "r", config: "legacy config", managed: false)
+        assert(legacy["configContent"] as? String == "legacy config")
+        assert(legacy["directoryBootstrapVersion"] == nil)
+    }
+
 }

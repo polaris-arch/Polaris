@@ -15,6 +15,7 @@
 use std::path::{Component, Path, PathBuf};
 
 pub mod retirement;
+pub mod directory_retirement;
 
 mod cached_session;
 pub use cached_session::{

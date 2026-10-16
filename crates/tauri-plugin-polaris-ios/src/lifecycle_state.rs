@@ -66,6 +66,12 @@ impl LifecycleState {
             && shared_generation > self.revoked_shared_generation
     }
 
+    /// Stop-only admission may address a revoked original readiness owner, but
+    /// never a replaced generation or a pending native dispatch.
+    pub(crate) fn accepts_stop_target(&self, generation: u64) -> bool {
+        self.generation == generation && !self.pending && self.pending_start.is_none()
+    }
+
     /// Losing the Rust receiver cannot undo native work. Keep its exact request
     /// addressable by user Stop until an actual native terminal callback arrives.
     pub(crate) fn abandon(&mut self, generation: u64) -> bool {

@@ -393,6 +393,19 @@ class FormalOutputs(unittest.TestCase):
     def test_trimpath_does_not_invent_absent_ldflags(self):
         self.check(self.facts())
 
+    def test_reported_ldflags_bind_exact_directory_source_identity(self):
+        from fork_input import linker_flags
+        expected = linker_flags(self.value, 'a' * 64)
+        facts = self.facts()
+        facts['settings']['-ldflags'] = expected
+        self.check(facts)
+        injection = ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + self.value['sourceCommit']
+        for bad in [expected.replace(injection, ''),
+                    expected.replace(injection, injection[:-40] + '0' * 40)]:
+            facts['settings']['-ldflags'] = bad
+            with self.assertRaisesRegex(RuntimeError, 'ldflags differ'):
+                self.check(facts)
+
     def test_actual_buildid_cannot_reuse_cli_or_other_input(self):
         for bad in ['', 'CLI-BuildID', 'polaris-mobile-' + 'b' * 64]:
             with self.subTest(id=bad), self.assertRaises(RuntimeError):
@@ -738,7 +751,8 @@ class FormalOutputs(unittest.TestCase):
                 (lib / 'Headers').mkdir()
                 (lib / 'Libbox').write_bytes(raw)
                 (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
-                symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+                symbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                    'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                     'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                     'wakeNow', 'recordScreenState']
                 (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header())
@@ -751,6 +765,12 @@ class FormalOutputs(unittest.TestCase):
                     self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
                 original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
                 text = original_header.read_text()
+                for missing in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                                'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement']:
+                    original_header.write_text(text.replace(missing, 'omittedAPI'))
+                    with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, 'API missing'):
+                        inspect_framework(framework, self.value, [], expected_id)
+                original_header.write_text(text)
                 original_header.write_text(text.replace('- (NSString* _Nonnull)getTailscaleStoreRetirement;',
                                                        '// - (NSString* _Nonnull)getTailscaleStoreRetirement;'))
                 with self.assertRaisesRegex(RuntimeError, 'immutable getter'):

@@ -70,7 +70,7 @@ import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
-import { hasDesktopSource, desktopSourceBaseline, validateSourcePins, desktopSourceManifestPath, validateSourceManifest, verifyHash, digest, requireGraph } from './desktop-core/source-graph.mjs';
+import { hasDesktopSource, desktopSourceBaseline, validateSourcePins, desktopSourceManifestPath, validateSourceManifest, verifyHash, digest, requireGraph, kernelSourceRepository } from './desktop-core/source-graph.mjs';
 import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -130,7 +130,7 @@ function resolveCronetVersionsFromGoMod() {
     const source = JSON.parse(readFileSync(path, 'utf8'));
     validateSourceManifest(source, spec);
     // Preserve raw bytes. UTF-8/newline normalization must not change the hash.
-    const url = `https://raw.githubusercontent.com/polaris-arch/polaris-box/${source.sourceCommit}/go.mod`;
+    const url = `https://raw.githubusercontent.com/${kernelSourceRepository(source.sourceURL)}/${source.sourceCommit}/go.mod`;
     const bytes = execFileSync('curl', ['-fsSL', '--retry', '3', url]);
     requireGraph(digest(bytes) === spec.mainGoModSha256, 'Fork Cronet go.mod SHA-256 differs');
     text = bytes.toString('utf8');

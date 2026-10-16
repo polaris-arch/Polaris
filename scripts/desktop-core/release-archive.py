@@ -6,6 +6,7 @@ import io
 import json
 import re
 import stat
+import shlex
 import sys
 import tarfile
 import zipfile
@@ -144,9 +145,147 @@ def extract_wire_transport(path, destination, record):
         (destination / name).chmod(0o600)
 
 
+def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_identity, build_replacements):
+    """Hash the full Git tree from source tar bytes without extracting anything.
+
+    This independently links the downloaded source archive to the public commit
+    tree. Tar metadata is never trusted as a commit assertion. Symlink targets
+    are hashed as Git blob bytes and are never followed.
+    """
+    require(re.fullmatch(r'[a-f0-9]{40}', commit) and re.fullmatch(r'[a-f0-9]{40}', expected_tree),
+            'invalid source object identity')
+    source = Path(path)
+    require(0 < record['bytes'] <= 512 * 1024 * 1024
+            and source.stat().st_size == record['bytes'], 'source archive size differs')
+    data = source.read_bytes()
+    require(hashlib.sha256(data).hexdigest() == record['sha256'], 'source archive SHA differs')
+    with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+        expanded = compressed.read(1024 ** 3 + 1)
+    require(len(expanded) <= 1024 ** 3, 'source tar expanded size limit')
+    prefix = 'sing-box-polaris-source-' + commit
+    entries, seen, source_files = {}, set(), {}
+    def object_hash(kind, content):
+        return hashlib.sha1(kind.encode() + b' ' + str(len(content)).encode() + b'\0' + content).digest()
+    with tarfile.open(fileobj=io.BytesIO(expanded), mode='r:') as archive:
+        for count, info in enumerate(archive, 1):
+            require(count <= 200000 and (info.isfile() or info.isdir() or info.issym()),
+                    'source special/gitlink or entry limit')
+            name = info.name.removesuffix('/') if info.isdir() else info.name
+            parts = name.split('/')
+            require(parts[0] == prefix and all(p and p not in ['.', '..'] and '\0' not in p for p in parts)
+                    and name not in seen, 'source archive path/duplicate differs')
+            seen.add(name)
+            if len(parts) == 1:
+                require(info.isdir(), 'source prefix must be directory')
+                continue
+            node = entries
+            for part in parts[1:-1]:
+                node = node.setdefault(part, {})
+                require(isinstance(node, dict), 'source file/directory collision')
+            leaf = parts[-1]
+            if info.isdir():
+                require(isinstance(node.setdefault(leaf, {}), dict), 'source directory/file collision')
+                continue
+            require(leaf not in node and info.mode & 0o7000 == 0 and info.size <= 200 * 1024 * 1024,
+                    'source duplicate/oversized/special-mode file')
+            if info.issym():
+                content, mode = info.linkname.encode('utf-8'), b'120000'
+            else:
+                with archive.extractfile(info) as stream:
+                    content = stream.read(info.size + 1)
+                require(len(content) == info.size, 'source file length differs')
+                mode = b'100755' if info.mode & 0o111 else b'100644'
+            node[leaf] = (mode, object_hash('blob', content))
+            if parts[1:] in [['go.mod'], ['go.sum']]:
+                require(info.isfile(), 'source module files must be regular')
+                source_files[leaf] = content
+    # Git archive records gitlinks as empty directories, never submodule
+    # contents. Only separately fetched public Git tree objects may fill them.
+    require(isinstance(gitlinks, list) and len(gitlinks) <= 1024, 'source gitlink inventory invalid')
+    linked = set()
+    for link in gitlinks:
+        name, oid = link['path'], link['sha']
+        parts = name.split('/')
+        require(all(p and p not in ['.', '..'] and '\0' not in p for p in parts)
+                and name not in linked and re.fullmatch(r'[a-f0-9]{40}', oid), 'source gitlink identity invalid')
+        linked.add(name)
+        node = entries
+        for part in parts[:-1]:
+            require(part in node and isinstance(node[part], dict), 'source gitlink parent absent')
+            node = node[part]
+        require(node.get(parts[-1]) == {}, 'source gitlink is not an empty archive directory')
+        node[parts[-1]] = (b'160000', bytes.fromhex(oid))
+    def tree_hash(node):
+        require(node, 'empty source directory/gitlink cannot prove a Git tree')
+        rows = []
+        for name, value in node.items():
+            raw = name.encode('utf-8')
+            directory = isinstance(value, dict)
+            mode, oid = (b'40000', tree_hash(value)) if directory else value
+            rows.append((raw + (b'/' if directory else b''), mode + b' ' + raw + b'\0' + oid))
+        return object_hash('tree', b''.join(value for _, value in sorted(rows)))
+    observed = tree_hash(entries).hex()
+    require(observed == expected_tree, 'downloaded source archive Git tree differs')
+    for name, field in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
+        require(name in source_files and hashlib.sha256(source_files[name]).hexdigest() == source_identity[field],
+                'downloaded source module bytes differ')
+    require(source_identity['sourceOverlay'] == 0, 'source overlay unsupported')
+    for replacement in source_identity['replacements']:
+        require(replacement['path'].startswith('./'), 'source replacement path differs')
+        node = entries
+        for part in replacement['path'][2:].split('/'):
+            require(part not in ['', '.', '..'] and isinstance(node, dict) and part in node,
+                    'source replacement subtree missing')
+            node = node[part]
+        require(isinstance(node, dict) and tree_hash(node).hex() == replacement['tree'],
+                'downloaded local replacement tree differs')
+    # Check actual linked replacements against actual source go.mod/go.sum,
+    # rather than treating a normalized producer record as source proof.
+    declared, block = [], False
+    for raw in source_files['go.mod'].decode('utf-8').splitlines():
+        line = raw.split('//', 1)[0].strip()
+        if not line:
+            continue
+        directive = re.fullmatch(r'replace\s+(.+)', line)
+        if directive:
+            line = directive.group(1).strip()
+            if line == '(':
+                block = True
+                continue
+        elif not block:
+            continue
+        elif line == ')':
+            block = False
+            continue
+        tokens = shlex.split(line)
+        require(tokens.count('=>') == 1, 'source replacement syntax unsupported')
+        arrow = tokens.index('=>')
+        require(arrow in [1, 2] and len(tokens) - arrow in [2, 3], 'source replacement syntax unsupported')
+        declared.append((tokens[:arrow], tokens[arrow + 1:]))
+    sums = set(source_files['go.sum'].decode('utf-8').splitlines())
+    for observed_replacement in build_replacements:
+        module, version = observed_replacement['module'], observed_replacement['version']
+        target = observed_replacement['replacement']
+        specific = [(old, new) for old, new in declared if old == [module, version]]
+        matches = specific or [(old, new) for old, new in declared if old == [module]]
+        require(len(matches) == 1, 'linked replacement absent/ambiguous in source go.mod')
+        new = matches[0][1]
+        require(new[0] == target['module'], 'linked replacement module differs from source')
+        if new[0].startswith('./'):
+            require(len(new) == 1 and target['version'] == '(devel)' and target['h1'] == '',
+                    'linked local replacement identity differs')
+        else:
+            require(len(new) == 2 and new[1] == target['version']
+                    and f"{new[0]} {new[1]} {target['h1']}" in sums,
+                    'linked remote replacement version/checksum differs from source')
+    return observed
+
+
 if __name__ == '__main__':
     request = json.load(sys.stdin)
-    if 'wireTransport' in request:
+    if 'sourceArchive' in request:
+        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'])
+    elif 'wireTransport' in request:
         extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])
     else:
         extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], request.get('target'))

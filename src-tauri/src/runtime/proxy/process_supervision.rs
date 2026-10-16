@@ -121,6 +121,7 @@ pub(super) fn verify_writer_census(
         return Err(unknown());
     }
     let mut owns_current = false;
+    let mut current_candidates = 0;
     for (nonce, (run, nodes)) in &before {
         let (terminal, terminal_nodes) = after.get(nonce).ok_or_else(unknown)?;
         if run.digest != terminal.digest
@@ -131,14 +132,15 @@ pub(super) fn verify_writer_census(
         {
             return Err(unknown());
         }
-        if run.digest == digest {
-            if nodes != &expected {
-                return Err(unknown());
-            }
-            owns_current = true;
+        // Historical runs keep their own exact scope. A logical profile can
+        // select P and later L without changing its digest; only the current
+        // nonterminal original run anchors the currently reserved main scope.
+        if run.digest == digest && !run.terminal {
+            current_candidates += 1;
+            owns_current = nodes == &expected;
         }
     }
-    if !owns_current {
+    if !owns_current || current_candidates != 1 {
         return Err(unknown());
     }
     Ok(())
@@ -764,10 +766,14 @@ impl ProxyRuntime {
                 .read()
                 .map_err(|_| "nativeRetirementUnknown")?
                 .clone();
-            let Some(owner) = owner else {
+            let Some(mut owner) = owner else {
                 // An ordinary Stop without the original birth cannot release a TS claim.
                 return tauri_plugin_polaris_ios::stop().await.map(|_| ());
             };
+            // A successfully consumed original Stop already retired this owner.
+            // Keep its exact target/receipt for journal retry; do not re-observe a
+            // stopped provider or manufacture a new terminal census.
+            if owner.main_token.is_none() && owner.stopped.is_some() { return Ok(()); }
             if let super::IosMainOrigin::LocalStart(start) = &owner.origin {
                 if start
                     .no_store_terminal()
@@ -793,17 +799,55 @@ impl ProxyRuntime {
                     return Ok(());
                 }
             }
-            let stopped = match &owner.origin {
-                super::IosMainOrigin::Observed(observed) => {
-                    tauri_plugin_polaris_ios::stop_observed(observed).await?
-                }
-                super::IosMainOrigin::LocalStart(start) => match &owner.ready {
-                    Some(ready) => tauri_plugin_polaris_ios::stop_session(ready).await?,
-                    None => tauri_plugin_polaris_ios::stop_start(start).await?,
+            // Keep Stop-only custody across native dispatch failures. It never
+            // revives Ready. Fresh census is optional cleanup evidence: native
+            // falls back to the bound original owner when observation fails.
+            let original_owner = owner.clone();
+            let target = match &owner.stop_target {
+                Some(target) => Some((**target).clone()),
+                None => match &owner.origin {
+                    super::IosMainOrigin::Observed(observed) => Some(
+                        tauri_plugin_polaris_ios::prepare_observed_stop(observed).await?),
+                    super::IosMainOrigin::LocalStart(_) => match &owner.ready {
+                        Some(ready) => Some(tauri_plugin_polaris_ios::prepare_ready_stop(ready).await?),
+                        None => None,
+                    },
                 },
             };
+            owner.stop_target = target.map(|target| {
+                if let Some(token) = &owner.main_token {
+                    if target.cleanup_proof_eligible()
+                        && self.mesh.bind_tailscale_main_actual_scope(
+                            token, ts_gate, target.config_digest(), target.original_instances(),
+                        ).is_err()
+                    {
+                        return Arc::new(target.without_cleanup_proof());
+                    }
+                }
+                Arc::new(target)
+            });
+            {
+                let mut slot = self.ios_ready_session.write().map_err(|_| "nativeRetirementUnknown")?;
+                let current = slot.as_mut().filter(|current| current.same_origin(&original_owner))
+                    .ok_or("nativeRetirementUnknown")?;
+                *current = owner.clone();
+            }
+            let stopped = match owner.stop_target.as_ref() {
+                Some(target) => tauri_plugin_polaris_ios::stop_target(target).await?,
+                None => match &owner.origin {
+                    super::IosMainOrigin::LocalStart(start) => tauri_plugin_polaris_ios::stop_start(start).await?,
+                    _ => return Err("nativeRetirementUnknown".into()),
+                },
+            };
+            // Ordinary Stop has been submitted, but uncertainty cannot release
+            // the registry claim, store a positive stopped receipt, or advance
+            // a deletion journal. Retain the target for a safe same-owner retry.
+            if owner.stop_target.as_ref().is_some_and(|target| !target.cleanup_proof_eligible()) {
+                return Err("nativeRetirementUnknown".into());
+            }
             match &owner.origin {
-                super::IosMainOrigin::Observed(observed) => {
+                super::IosMainOrigin::Observed(_) => {
+                    let observed = owner.stop_target.as_ref().ok_or("nativeRetirementUnknown")?;
                     let receipt = stopped.retirement().ok_or("nativeRetirementUnknown")?;
                     if receipt.start_request_id() != observed.request_id()
                         || receipt.config_digest() != observed.config_digest()
@@ -813,10 +857,10 @@ impl ProxyRuntime {
                         return Err("nativeRetirementUnknown".into());
                     }
                     let original = native_writer_scopes(observed.original_instances());
-                    let current = original
-                        .iter()
-                        .find(|run| run.digest == owner.config_digest)
-                        .ok_or("nativeRetirementUnknown")?;
+                    let mut anchors = original.iter()
+                        .filter(|run| run.digest == owner.config_digest && !run.terminal);
+                    let current = anchors.next().ok_or("nativeRetirementUnknown")?;
+                    if anchors.next().is_some() { return Err("nativeRetirementUnknown".into()); }
                     let expected: Vec<_> = current
                         .nodes
                         .iter()
@@ -839,7 +883,7 @@ impl ProxyRuntime {
                         }
                         let expected = self.mesh.tailscale_main_scope_if_token(token, ts_gate)?;
                         let retired = native_writer_scopes(receipt.instances());
-                        if let Some(ready) = &owner.ready {
+                        if let Some(ready) = &owner.stop_target {
                             if receipt.session_id() != ready.session_id()
                                 || receipt.source_extension_generation()
                                     != ready.extension_generation()
@@ -1972,4 +2016,88 @@ pub(super) fn pid_identity_verdict(baseline: Option<&str>, current: Option<&str>
 #[cfg(windows)]
 pub(crate) fn pid_alive(pid: u32) -> bool {
     crate::runtime::windows_process::is_alive(pid)
+}
+
+#[cfg(test)]
+mod reload_stop_custody_tests {
+    use super::{verify_writer_census, WriterNodeScope, WriterRunScope};
+
+    fn run(nonce: char, terminal: bool) -> WriterRunScope {
+        WriterRunScope {
+            nonce: nonce.to_string().repeat(64), digest: "d".repeat(64), terminal,
+            complete: true,
+            nodes: vec![WriterNodeScope { tag: "ts".into(), directory: "/state/tailscale/node".into(), file: "/state/tailscale/node/tailscaled.state".into(), terminal }],
+        }
+    }
+
+    #[test]
+    fn refreshed_original_accepts_reload_stop_while_start_only_census_rejects_it() {
+        let original = vec![run('a', true), run('b', false)];
+        let terminal = vec![run('a', true), run('b', true)];
+        let expected = vec![("ts".into(), "/state/tailscale/node".into(), "/state/tailscale/node/tailscaled.state".into())];
+        assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &expected).is_ok());
+        assert!(verify_writer_census(&original[..1], &terminal, &"d".repeat(64), &expected).is_err());
+        assert!(verify_writer_census(&original, &terminal[1..], &"d".repeat(64), &expected).is_err());
+        let mut unknown = terminal.clone(); unknown[0].terminal = false;
+        assert!(verify_writer_census(&original, &unknown, &"d".repeat(64), &expected).is_err());
+    }
+
+    #[test]
+    fn same_digest_physical_to_logical_history_keeps_each_nonce_scope() {
+        let mut historical = run('a', true);
+        historical.nodes[0].directory = "/state/tailscale-g4-v1/node".into();
+        historical.nodes[0].file = "/state/tailscale-g4-v1/node/tailscaled.state".into();
+        let original = vec![historical.clone(), run('b', false)];
+        let terminal = vec![historical, run('b', true)];
+        let expected = vec![("ts".into(), "/state/tailscale/node".into(), "/state/tailscale/node/tailscaled.state".into())];
+        assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &expected).is_ok());
+        let mut rewritten = terminal.clone();
+        rewritten[0].nodes = rewritten[1].nodes.clone();
+        assert!(verify_writer_census(&original, &rewritten, &"d".repeat(64), &expected).is_err());
+        let old_scope = vec![("ts".into(), "/state/tailscale-g4-v1/node".into(), "/state/tailscale-g4-v1/node/tailscaled.state".into())];
+        assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &old_scope).is_err());
+        let mut missing = terminal.clone(); missing.remove(0);
+        assert!(verify_writer_census(&original, &missing, &"d".repeat(64), &expected).is_err());
+    }
+
+    #[test]
+    fn ios_managed_start_keeps_logical_bytes_off_shared_disk_and_fallback_revokes_first() {
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("start_managed_prepared(&start)"));
+        assert!(startup.contains("#[cfg(not(target_os = \"ios\"))]\n            std::fs::write(config_path, &json)"));
+        let login = include_str!("../tailscale_login_core.rs");
+        let launch = login.split("async fn launch_attempt(").nth(1).unwrap();
+        assert!(launch.find("DirectoryLease::poison_domain(user_data)").unwrap() < launch.find("let _start_guard").unwrap());
+    }
+
+    #[test]
+    fn failed_cleanup_refinement_still_dispatches_and_retains_claims() {
+        // Source wiring negative control; native tests exercise nonce, reload,
+        // dispatch failure/retry and successor rejection. None are run here.
+        let source = include_str!("process_supervision.rs");
+        let production = source.split("#[cfg(test)]\nmod reload_stop_custody_tests").next().unwrap();
+        let prepare = production.find("let target = match &owner.stop_target").unwrap();
+        let downgrade = production[prepare..].find("target.without_cleanup_proof()").unwrap() + prepare;
+        let persist = production[downgrade..].find("*current = owner.clone()").unwrap() + downgrade;
+        let dispatch = production[persist..].find("stop_target(target).await?").unwrap() + persist;
+        let retain = production[dispatch..].find("!target.cleanup_proof_eligible()").unwrap() + dispatch;
+        let release = production[retain..].find("release_tailscale_main_states_if_token").unwrap() + retain;
+        assert!(prepare < downgrade && downgrade < persist && persist < dispatch && dispatch < retain && retain < release);
+        assert!(production[prepare..downgrade].contains(").is_err()"));
+        assert!(!production[prepare..dispatch].contains("owner.ready ="));
+    }
+
+    #[test]
+    fn production_stop_uses_distinct_stop_target_without_republishing_ready() {
+        // Wiring guard only; actual native nonce/reload state-machine tests live
+        // beside StopSessionTarget. This is not an executed integration claim.
+        let source = include_str!("process_supervision.rs");
+        let production = source.split("#[cfg(test)]\nmod reload_stop_custody_tests").next().unwrap();
+        assert!(production.contains("prepare_ready_stop(ready)"));
+        assert!(production.contains("prepare_observed_stop(observed)"));
+        assert!(production.contains("stop_target(target)"));
+        assert!(!production.contains("owner.ready = Some("));
+        assert!(include_str!("pending_changes.rs").contains("owner.stop_target.as_ref()?"));
+        assert!(include_str!("prerequisite.rs").contains(".stop_target"));
+    }
 }

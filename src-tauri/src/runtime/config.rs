@@ -35,7 +35,7 @@ use crate::commands::config::config_version;
 use crate::runtime::proxy::mesh_apply::{self, ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
 
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
-const DEFERRED_DELETIONS_VERSION: u8 = 1;
+const DEFERRED_DELETIONS_VERSION: u8 = 2;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
 const STAGED_PENDING_VERSION: u8 = 1;
 
@@ -605,6 +605,9 @@ pub(crate) enum DeferredConfigDeletion {
     },
     TailscaleState {
         server_id: String,
+    },
+    TailscaleDirectory {
+        intent: polaris_mesh::tailscale_state::directory_retirement::DirectoryDeletionIntent,
     },
     WarpDevice {
         server_id: String,
@@ -2001,7 +2004,7 @@ impl ConfigManager {
             // erase a newly bound epoch after replacement/recovery. S3c owns
             // exact-epoch effects, so this path must not stage TS state work.
             additions
-                .retain(|entry| !matches!(entry, DeferredConfigDeletion::TailscaleState { .. }));
+                .retain(|entry| !matches!(entry, DeferredConfigDeletion::TailscaleState { .. } | DeferredConfigDeletion::TailscaleDirectory { .. }));
         }
         self.stage_deferred_deletion_entries_locked(additions)?;
         self.save_canonical_with_icon_reconcile(canonical, false)
@@ -2163,7 +2166,7 @@ impl ConfigManager {
         let text = StdFs.read_to_string(&path)?;
         let journal: DeferredDeletionJournal =
             serde_json::from_str(&text).map_err(StoreError::from_parse)?;
-        if journal.version != DEFERRED_DELETIONS_VERSION {
+        if journal.version != 1 && journal.version != DEFERRED_DELETIONS_VERSION {
             return Err(StoreError::validation(format!(
                 "unsupported deferred deletion journal version: {}",
                 journal.version
@@ -2178,10 +2181,10 @@ impl ConfigManager {
     ) -> Result<(), StoreError> {
         let path = self.deferred_deletions_path();
         if journal.entries.is_empty() {
-            return StdFs.remove(&path);
+            return durable_remove(&path).map(|_| ());
         }
         let content = serde_json::to_string_pretty(journal).map_err(StoreError::from)?;
-        polaris_store::atomic_write_plan(&path, &random_tmp_suffix(), &content).execute(&StdFs)
+        durable_atomic_write(&path, &content, &random_tmp_suffix()).map(|_| ())
     }
 
     #[cfg(test)]
@@ -2215,10 +2218,50 @@ impl ConfigManager {
         }
         let mut journal = self.load_deferred_deletions_locked()?;
         for entry in additions {
+            // Bind only newly created intents, never upgrade a historical serverId-only
+            // journal by guessing which current filesystem object it referred to.
+            #[cfg(target_os = "ios")]
+            let entry = match entry {
+                DeferredConfigDeletion::TailscaleState { ref server_id } => {
+                    match crate::runtime::tailscale_directory::DirectoryLease::acquire(&self.dir, server_id, false)
+                        .and_then(|lease| lease.snapshot_intent()) {
+                        Ok(intent) => DeferredConfigDeletion::TailscaleDirectory { intent },
+                        Err(_) => entry,
+                    }
+                },
+                other => other,
+            };
+            let new_ts_id = match &entry {
+                DeferredConfigDeletion::TailscaleState { server_id } => Some(server_id.as_str()),
+                DeferredConfigDeletion::TailscaleDirectory { intent } => Some(intent.server_id.as_str()),
+                _ => None,
+            };
+            if let Some(id) = new_ts_id {
+                // A fresh explicit deletion supersedes older same-ID intent,
+                // including delete/re-add/delete before the next Apply boundary.
+                // Never reuse the old intent nonce for a new deletion decision.
+                journal.entries.retain(|old| match old {
+                    DeferredConfigDeletion::TailscaleState { server_id } => server_id != id,
+                    DeferredConfigDeletion::TailscaleDirectory { intent } => {
+                        if intent.server_id != id { return true; }
+                        #[cfg(unix)]
+                        {
+                            // Never erase the durable recovery record of a partially
+                            // committed deletion when another same-ID edit arrives.
+                            crate::runtime::tailscale_directory::DirectoryLease::acquire_intent(&self.dir, intent)
+                                .and_then(|lease| lease.committed_intent(intent)).unwrap_or(true)
+                        }
+                        #[cfg(not(unix))]
+                        { true }
+                    },
+                    _ => true,
+                });
+            }
             if !journal.entries.contains(&entry) {
                 journal.entries.push(entry);
             }
         }
+        journal.version = DEFERRED_DELETIONS_VERSION;
         self.save_deferred_deletions_locked(&journal)
     }
 
@@ -2246,7 +2289,7 @@ impl ConfigManager {
         let mut remaining = Vec::new();
         for entry in journal.entries {
             if mesh_guard::has_managed_fields(&current)
-                && matches!(&entry, DeferredConfigDeletion::TailscaleState { .. })
+                && matches!(&entry, DeferredConfigDeletion::TailscaleState { .. } | DeferredConfigDeletion::TailscaleDirectory { .. })
             {
                 // A pre-opt-in journal may still contain old serverId-only
                 // entries. Retain, but never execute them under managed mode.
@@ -2255,8 +2298,23 @@ impl ConfigManager {
                 continue;
             }
             if deferred_deletion_is_cancelled(&entry, &current) {
-                summary.cancelled += 1;
-                continue;
+                // A re-added node cancels an unstarted deletion, but cannot erase
+                // the only recovery record for an already quarantined old object.
+                // Commit recovery is still bound to the old filesystem identity.
+                #[cfg(unix)]
+                if let DeferredConfigDeletion::TailscaleDirectory { intent } = &entry {
+                    match crate::runtime::tailscale_directory::DirectoryLease::acquire_intent(&self.dir, intent)
+                        .and_then(|lease| lease.committed_intent(intent)) {
+                        Ok(false) => { summary.cancelled += 1; continue; },
+                        Ok(true) => {},
+                        Err(_) => { summary.retrying += 1; remaining.push(entry); continue; },
+                    }
+                } else {
+                    summary.cancelled += 1;
+                    continue;
+                }
+                #[cfg(not(unix))]
+                { summary.cancelled += 1; continue; }
             }
             match apply(&entry, &current) {
                 Ok(()) => summary.applied += 1,
@@ -2564,6 +2622,7 @@ fn deferred_deletion_is_cancelled(entry: &DeferredConfigDeletion, current: &Valu
                             .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tailscale"))
                 })
             }),
+        DeferredConfigDeletion::TailscaleDirectory { intent } => collection_ids(current, "servers").contains(&intent.server_id),
         DeferredConfigDeletion::WarpDevice {
             device_id, token, ..
         } => current

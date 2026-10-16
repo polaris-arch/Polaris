@@ -1356,6 +1356,7 @@ struct IosMainCustody {
     config_digest: String,
     main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     ready: Option<tauri_plugin_polaris_ios::ReadySessionReceipt>,
+    stop_target: Option<Arc<tauri_plugin_polaris_ios::StopSessionTarget>>,
     stopped: Option<Arc<tauri_plugin_polaris_ios::StoppedSessionReceipt>>,
 }
 

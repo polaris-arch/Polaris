@@ -46,14 +46,14 @@ def decode(raw, maximum=65536):
 def validate(value):
     require(value.get('schema') == 'polaris-mobile-fork-input-v1' and value.get('role') == 'mobile',
             'formal mobile source role is required')
-    require(value.get('repository') == 'polaris-arch/polaris-box' and value.get('repositoryId') == 1407705262
-            and value.get('sourceURL') == 'https://github.com/polaris-arch/polaris-box', 'mobile source repository differs')
+    require(value.get('repository') == 'polaris-arch/sing-box-polaris' and value.get('repositoryId') == 1421657509
+            and value.get('sourceURL') == 'https://github.com/polaris-arch/sing-box-polaris', 'mobile source repository differs')
     require(value.get('goModule') == 'github.com/sagernet/sing-box', 'file branding must not rename the Go module')
     for key, width in [('sourceCommit', 40), ('sourceTree', 40), ('sourceTagObject', 40),
                        ('goModSha256', 64), ('goSumSha256', 64)]:
         require(isinstance(value.get(key), str) and re.fullmatch('[0-9a-f]{%d}' % width, value[key]),
                 'actual immutable source field required: ' + key)
-    require(re.fullmatch(r'\d+\.\d+\.\d+-alpha\.\d+', value.get('version', '')) and
+    require(re.fullmatch(r'\d+\.\d+\.\d+-polaris-alpha\.\d+', value.get('version', '')) and
             value.get('sourceTag') == 'v' + value['version'], 'mobile source tag/version differs')
     require(type(value.get('sourceOverlay')) is int and value['sourceOverlay'] == 0 and
             value.get('patches') == [] and value.get('dependencyPatches') == [],
@@ -144,8 +144,11 @@ def linker_flags(value, input_fingerprint):
     validate(value)
     require(isinstance(input_fingerprint, str) and re.fullmatch('[0-9a-f]{64}', input_fingerprint),
             'actual binding input fingerprint required')
+    # The producer verifies clean HEAD/tree before and after bind. Inject that
+    # exact pinned commit, never a tag description, dirty tree or future SHA.
     # Version is explicit. Never use ReadTag/git describe or a reused CLI BuildID.
     return ('-X github.com/sagernet/sing-box/constant.Version=' + value['version'] +
+            ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + value['sourceCommit'] +
             ' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w' +
             ' -buildid=polaris-mobile-' + input_fingerprint)
 

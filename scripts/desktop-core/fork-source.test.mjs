@@ -13,7 +13,7 @@ import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, desktopSourceManifest
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const candidate = 'c'.repeat(40);
-const forkURL = 'https://github.com/polaris-arch/polaris-box';
+const forkURL = 'https://github.com/polaris-arch/sing-box-polaris';
 const upstreamURL = 'https://github.com/SagerNet/sing-box.git';
 const write = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
 const json = (path) => JSON.parse(readFileSync(path));
@@ -667,4 +667,13 @@ test('four original technical native metadata fixtures stay production-inadmissi
     } else assert.throws(() => validateBuildInfo(row.raw, source, row.key, spec), /Undeclared embedded module replacement/);
     assert.throws(() => validateSourceReceipt({ schema: row.schema }, source, spec), /Unsupported source receipt schema/);
   }
+});
+
+
+test('historical fork source remains bound to its original repository', () => {
+  const f = fixture();
+  try {
+    f.source.sourceURL = 'https://github.com/polaris-arch/polaris-box';
+    assert.deepEqual(validateSourceManifest(f.source, f.manifest.desktopSourceBuild), []);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
