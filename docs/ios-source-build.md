@@ -1,16 +1,38 @@
-# 当前 Apple arm64-only 正式构建入口
+# iOS 源码构建（ARM64，自行签名）
 
-本节说明当前正式契约。下方分隔标题之后的全文保留为旧阶段记录，其中的“当前”“本轮”“默认 final”、版本、命令和验收结论均属于记录当时，不是今天的生产操作说明，也不新增验收。
+项目保留 iOS 源码与编译入口，不在 GitHub Releases 发布 iOS 安装包。以下步骤说明当前源码的设备 ARM64 无签名编译/链接路径，不表示签名、安装、Network Extension 授权或实际 VPN 流量已验收。
 
-- 正式共享组件入口：`bash scripts/build-mobile-core.sh apple`，按 [mobile-core 当前说明](../scripts/mobile-core/README.md) 提供 `--source --go --gomobile --gobind --developer --work --cache` 的明确路径。
-- 仅有两个平台目标：`ios/arm64`（`device-arm64`）和 `iossimulator/arm64`（`sim-arm64`）。XCFramework 必须恰有两个 library：iOS device（无 variant）和 iOS simulator（`simulator` variant），各仅含 arm64。`ios-arm64` / `ios-arm64-simulator` 是观测 slices 的键；`LibraryIdentifier` 只要求安全 basename，不额外固定目录名。Intel simulator、macOS 和 tvOS 不在正式范围。
-- 共享静态组件最低 iOS15；App/PacketTunnel 最低 iOS17。严格固定 Xcode27.1 / build27A9275，以及 iOS 与 Simulator SDK27.1；不能回退版本或混用平台。
-- 本地 App 入口为 `python3 -B scripts/mobile-core/build_apple_app.py`：设备 leg 不加 `--simulator`，模拟器 leg 使用 `--simulator --simulator-arch arm64`。托管流程先准备并核验同一共享组件，再按顺序构建设备和 arm64 模拟器两个 leg；每个 leg 都须完成实际最终 App/PacketTunnel 静态链接与来源核验。共享组件成功不等于两个 App leg 通过。
-- source/tool 指纹和缓存命名空间包含精确目标集合。旧三目标缓存、receipt、native-input 或 Intel simulator 产物不得通过改名、删字段或重写历史证据转换为本契约；device/simulator 虽同为 arm64，平台身份仍不同。
-- `ios-libbox.py build` 的所有生产模式已退休，包括 `--historical` 与 `--component --phase assemble/publish`；旧 `build-libbox-ios.sh` 也会在读源、policy、工具或产生输出之前被拒绝。下方历史构建命令仅作原始记录，不是可继续执行的生产替代入口。
-- 历史 `verify --historical` / `check-inputs --historical` 与显式 C2/C3 观察诊断保留原有范围。旧 build-only producer pins 和固定 b66 historical-only producer pin 只用于原 receipt 的只读核验；历史 policy/receipt bytes 不改写，退休驱动不生成新的历史 receipt。
+在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.25.5、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
 
-这次调整只提交源码和静态检查，没有执行构建、测试、CI、签名、安装、设备验证或发布；不据此授予 AppAccepted、devicePassed 或 publicationEligible。
+当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)；下述移动端 alpha.12 固定来源仍以现有 source-contract 为准。新仓导航不表示来源清单已经迁移，也不提供新的已发布移动组件或 IPA 下载。
+
+核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 polaris-box v1.15.0-alpha.12 的固定 commit 577d4b9a089b71d2f0a4ca334b87264b55c10478。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。
+
+在 Polaris 仓库根目录：
+
+```sh
+rustup target add aarch64-apple-ios
+pnpm --dir ui install --frozen-lockfile
+node scripts/fetch-dashboard.mjs
+pnpm --dir ui build
+python3 -B scripts/mobile-core/build_apple_app.py \
+  --source "$CORE_SOURCE" \
+  --go "$GO_BIN" --gomobile "$GOMOBILE_BIN" --gobind "$GOBIND_BIN" \
+  --developer "$DEVELOPER_DIR" \
+  --work "$APPLE_WORK" --cache "$APPLE_CACHE"
+```
+
+上述变量须替换/设置成真实明确路径；`DEVELOPER_DIR` 指向选定 Xcode 的 `Contents/Developer`。work/cache 为固定用户自有目录，须位于同一文件系统并满足构建器资源准入；不覆盖已有归档或挪用历史 receipt。入口会生产或重新核验共享组件，再构建并核验设备 App/PacketTunnel；无需额外先跑一次组件构建器。不传 `--signing-team` 即无签名编译/链接。
+
+共享静态组件包含设备与模拟器两个 arm64 slice，最低 iOS 15；App/PacketTunnel最低 iOS 17。默认 Apple托管工作流只要求 device-arm64；模拟器 App 构建是现有手动选项，不由共享双 slice成功自动推出。Intel simulator/macOS/tvOS 不属于本 iOS正式目标。
+
+真机安装须另行准备用户自己的 Apple开发签名身份、已注册设备和匹配的 profiles；主 App与 PacketTunnel使用同一 Team及共同App Group，并具备 Packet Tunnel entitlement。选择自己可注册的 Bundle ID，主 App与 Tauri identifier一致，扩展 ID 加 `.PacketTunnel`；修改 `src-tauri/gen/apple/project.yml` 后，在该文件所在目录运行 `xcodegen generate`，并核对两个 target。现有 `--signing-team` 只选择 Team，不能替代这些条件。实际设备授权、连接/停止、DNS/IPv4/IPv6 及后台生命周期需另验。不要提交证书、profiles 或构建产物。
+
+旧 `build-libbox-ios.sh` 与 `ios-libbox.py build`（包括 `--historical`）均已退休并拒绝生产构建。下方历史记录中的旧版本、旧命令和验收结论只属于当时，不是当前操作步骤，也不能替代当前源码、工具及产物核验。
+
+
+<details>
+<summary>历史构建记录（旧命令不可作为现行生产入口）</summary>
 
 # 历史存档：b66 基线及此前阶段原文（2026-10-15 保留）
 
@@ -139,3 +161,5 @@ Android 正分片修复 SDK 取消不等待晚 callback、callback 直写 `Excha
 - iOS 尚无主 App 启动前的 Libbox 配置预检查。主 App 不链接 Libbox，在扩展里先 CheckConfig 再启动主核仍缺构造工作目录隔离与清理证明；冻结契约返回 CleanupUnknown，不能据此认定构造 owner 已退出或已支持 Android 同款节点预剥离。
 - iPhone Duo：Xcode27.1/SDK27.1 已具备 device type 与原生 verticalBarEdge/reservedRegions API；当前仅有26.5/27.0 runtimes，Duo要求27.1 runtime，下载当前不可用。连续单页面/草稿布局、原生四边安全区、键盘、字号和reserved-region消费已接线；外屏/内屏连续切换、半折区域避让仍未在实际Duo模拟器或真机验收。不能用近似视口夹具替代。
 - iPad 分屏仍待验证；已有普通横竖屏验收不覆盖分屏或 Duo 折叠区。
+
+</details>
