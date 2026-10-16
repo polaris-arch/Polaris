@@ -37,6 +37,7 @@ mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
+mod tls_capabilities;
 // `pub(crate)`：`pipe_to_log` 是全 app 唯一一份子进程排空实现，瞬态登录核
 // （`runtime::tailscale_login_core`）与测速临时核（`runtime::speedtest`）都用它。
 pub(crate) mod core_log;
@@ -1685,6 +1686,9 @@ pub struct ProxyRuntime {
             polaris_system_integration::StdMarkerFs,
         >,
     >,
+    /// Actual ready-core bytes, scoped to the generation which observed them.
+    captured_core_sha256: Mutex<Option<(u64, String)>>,
+    captured_temp_core_sha256: Mutex<Option<String>>,
     /// 起核用的核二进制路径覆盖（**仅单测置位**，同 `stale_sweep_disabled` 的先例；生产恒 `None`）。
     ///
     /// 「起核可取消」的门必须有个**真能 spawn 的**假核（起来就死 / 起来但永不就绪），否则退避中断与
@@ -1877,6 +1881,8 @@ impl ProxyRuntime {
             test_restart_after_claim: Mutex::new(None),
             network_watcher: Mutex::new(None),
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
+            captured_core_sha256: Mutex::new(None),
+            captured_temp_core_sha256: Mutex::new(None),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
@@ -1950,6 +1956,21 @@ impl ProxyRuntime {
     /// 返回 `Some` ⟺ 核运行且起核时成功注入了探测池（`probe_pool_ports` 非空）；否则 `None`（测速回退活跃出口）。
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
+    pub(crate) fn remember_temp_core_sha256(&self, digest: Option<String>) {
+        if let Ok(mut value) = self.captured_temp_core_sha256.lock() {
+            *value = digest;
+        }
+    }
+
+    pub(crate) fn measurement_core_sha256(&self) -> Option<String> {
+        if !self.status().running {
+            return self.captured_temp_core_sha256.lock().ok()?.clone();
+        }
+        let captured = self.captured_core_sha256.lock().ok()?;
+        let (generation, digest) = captured.as_ref()?;
+        (*generation == self.core_generation()).then(|| digest.clone())
+    }
+
     pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
         self.switch_snapshot
             .read()
@@ -2090,3 +2111,9 @@ impl ProxyRuntime {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(target_os = "android")]
+pub(crate) async fn temp_tls_fingerprint_capabilities() -> crate::runtime::tls_fingerprints::Snapshot
+{
+    android_bridge::tls_fingerprint_capabilities().await
+}

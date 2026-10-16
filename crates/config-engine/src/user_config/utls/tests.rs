@@ -217,3 +217,23 @@ fn legacy_reality_dormant_engine_is_preserved_without_emitting_a_native_engine()
     assert_eq!(output["tls"]["utls"]["fingerprint"], "chrome");
     assert_eq!(serde_json::to_value(&node).unwrap(), original);
 }
+
+#[test]
+fn legacy_dormant_engine_case_uses_the_exact_existing_emission_gate() {
+    let mut node = server(Protocol::Vless);
+    node.tls_settings = Some(TlsSettings {
+        engine: Some("APPLE".into()),
+        ..Default::default()
+    });
+    let effective = effective_server_for_platform(&node, None, "darwin").unwrap();
+    let output = serde_json::to_value(build_proxy_outbound(
+        effective.as_ref(),
+        "node",
+        &DomainResolver::Tag("dns-bootstrap".into()),
+        "x64",
+        "darwin",
+    ))
+    .unwrap();
+    assert!(output["tls"].get("engine").is_none());
+    assert_eq!(output["tls"]["utls"]["fingerprint"], "chrome");
+}

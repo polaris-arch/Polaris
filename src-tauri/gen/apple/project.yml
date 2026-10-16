@@ -123,6 +123,7 @@ targets:
         LD_MAP_FILE_PATH: $(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel
         PRODUCT_NAME: PolarisPacketTunnel
+        OTHER_LDFLAGS: $(inherited) "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args"
         APPLICATION_EXTENSION_API_ONLY: true
         FRAMEWORK_SEARCH_PATHS: $(inherited) "$(POLARIS_LIBBOX_GENERATION_ROOT)"
         SKIP_INSTALL: true
@@ -153,8 +154,21 @@ targets:
     preBuildScripts:
       - name: Verify iOS Core
         script: |
+          set -e
           python3 "$SRCROOT/../../../scripts/mobile-core/consume.py" verify-link \
             --link-input "${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}" \
             --link-input-sha256 "${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}" \
             --scratch "${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}"
+          python3 "$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py" prepare
         basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json
+    postBuildScripts:
+      - name: Verify TLS Capability Link
+        script: |
+          python3 "$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py" verify
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json

@@ -1,3 +1,5 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
+import { isUtlsField, nodeUtlsOptions } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
@@ -82,6 +84,7 @@ function Hint({ hintKey, title, t, disabled = false }: {
 export function MobileField({ spec, value, onChange, t }: MobileFieldProps): ReactElement {
   const fid = useId();
   const [secretVisible, setSecretVisible] = useState(false);
+  const tlsFingerprints = useTlsFingerprints(isUtlsField(spec.k));
   const label = t(spec.label);
 
   switch (spec.t) {
@@ -129,7 +132,7 @@ export function MobileField({ spec, value, onChange, t }: MobileFieldProps): Rea
             value={typeof value === 'string' ? value : ''}
             onChange={(e) => onChange(e.target.value)}
           >
-            {normalizeSelectOptions(spec.options, value, t).map((o) => (
+            {normalizeSelectOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints) : spec.options, value, t).map((o) => (
               <option key={o.value} value={o.value} disabled={o.disabled === true}>
                 {o.label}
               </option>

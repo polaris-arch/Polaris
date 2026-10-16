@@ -457,6 +457,33 @@ final class VpnPlugin: Plugin {
         } catch { deadline.cancel(); finish(.failure(vpnError("ReadyUnknown: " + error.localizedDescription))) }
     }
 
+    @objc func tlsFingerprintCapabilities(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            var completed = false
+            let finish: (Data?) -> Void = { data in
+                guard !completed else { return }; completed = true
+                guard let data = data, data.count <= 131072,
+                      let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (reply["document"] is String || reply["document"] is NSNull), reply["binarySha256"] is String
+                else { invoke.reject("Loaded PacketTunnel TLS capabilities unavailable"); return }
+                invoke.resolve(reply)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { finish(nil) }
+            self.loadManager(create: false) { result in
+                guard !completed else { return }
+                do {
+                    guard let manager = try result.get().manager,
+                          manager.connection.status == .connected,
+                          let session = manager.connection as? NETunnelProviderSession
+                    else { finish(nil); return }
+                    try session.sendProviderMessage(Data("tls-fingerprints".utf8)) { data in
+                        DispatchQueue.main.async { finish(data) }
+                    }
+                } catch { finish(nil) }
+            }
+        }
+    }
+
     @objc func status(_ invoke: Invoke) {
         DispatchQueue.main.async {
             var completed = false

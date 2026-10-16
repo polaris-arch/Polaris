@@ -1973,3 +1973,37 @@ pub(super) fn pid_identity_verdict(baseline: Option<&str>, current: Option<&str>
 pub(crate) fn pid_alive(pid: u32) -> bool {
     crate::runtime::windows_process::is_alive(pid)
 }
+
+// Capability menus must inspect the actual helper/direct image while connected,
+// and the same resolver used by startup while disconnected.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl ProxyRuntime {
+    pub(super) fn tls_ready_binary_for_pid(
+        &self,
+        pid: u32,
+        via_helper: bool,
+    ) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let image = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
+            if image.is_file() {
+                return Some(image);
+            }
+        }
+        running_exe_path(pid).or_else(|| {
+            via_helper
+                .then(|| helper_reported_core_image(Some(self.helper.as_ref()), pid))
+                .flatten()
+        })
+    }
+
+    pub(crate) fn tls_capability_binary(&self) -> Result<std::path::PathBuf, String> {
+        let status = self.status();
+        if status.running {
+            return self
+                .tls_ready_binary_for_pid(status.pid, self.core_via_helper.load(Ordering::SeqCst))
+                .ok_or_else(|| "Running core image could not be observed".to_owned());
+        }
+        self.core_binary_for_start()
+    }
+}

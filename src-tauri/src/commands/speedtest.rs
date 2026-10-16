@@ -917,6 +917,8 @@ pub(crate) struct ResultIdentity {
     pub(crate) instance: CoreInstance,
     /// 主核：起核时捕获的已发射配置摘要。临时核：空。
     pub(crate) config_digest: Option<String>,
+    /// CLI/JNI bytes, or the containing PacketTunnel executable for static libbox.
+    pub(crate) core_binary_sha256: Option<String>,
     /// 该节点测量时所依据的参数指纹。
     pub(crate) node_fingerprint: Option<String>,
     /// 网络代次。`None` 是「未知」，不得解释为「未变」。
@@ -951,6 +953,7 @@ impl ResultIdentity {
             "context": context,
             "instance": instance,
             "configDigest": self.config_digest,
+            "coreBinarySha256": self.core_binary_sha256,
             "nodeFingerprint": self.node_fingerprint,
             "networkEpoch": self.network_epoch,
             "measuredAt": self.measured_at,
@@ -1020,6 +1023,7 @@ impl RunEvents {
                 url_digest: polaris_updater::sha256_hex(request.url.as_bytes()),
                 instance,
                 config_digest,
+                core_binary_sha256: None,
                 node_fingerprint: None,
                 network_epoch: None,
                 measured_at: 0,
@@ -1040,6 +1044,11 @@ impl RunEvents {
             static_bound: 0,
             system_path: 0,
         }
+    }
+
+    pub(crate) fn with_core_binary_sha256(mut self, digest: Option<String>) -> Self {
+        self.identity.core_binary_sha256 = digest;
+        self
     }
 
     pub(crate) fn with_connection_fingerprints(
@@ -2119,6 +2128,8 @@ async fn run_temp_core_speed_test(
 
     let proxy = state.proxy.clone();
     let user_config = user_config_for_temp_core(config);
+    let temp_core_sha256 = proxy.tls_fingerprint_capabilities().await.binary_sha256;
+    proxy.remember_temp_core_sha256(temp_core_sha256.clone());
     let bind_interfaces: BTreeMap<String, String> = servers
         .iter()
         .filter_map(|server| {
@@ -2240,7 +2251,9 @@ async fn run_temp_core_speed_test(
         exclusions,
         temp_core_log_level(config, privacy_mode),
     );
-    let deps = deps.with_cancel(cancel.clone());
+    let deps = deps
+        .with_cancel(cancel.clone())
+        .with_expected_core_sha256(temp_core_sha256.clone());
 
     // 临时核腿的每条结果都标「未连接测量」：实例只标种类、不带世代与配置摘要；节点指纹取当前配置
     // 按同一公式算出的那一份。网络代次只在主核运行期间计数，这里留空（未知）。
@@ -2259,6 +2272,7 @@ async fn run_temp_core_speed_test(
         current_server_fingerprints(config),
         None,
     )
+    .with_core_binary_sha256(temp_core_sha256.clone())
     .with_connection_fingerprints(crate::runtime::node_fingerprints::measurement_temp_table(
         &servers,
         &user_config,
@@ -2690,6 +2704,7 @@ pub async fn server_speed_test(
         BTreeMap::new(),
         context.clone(),
     )
+    .with_core_binary_sha256(proxy.measurement_core_sha256())
     .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_display_skipped(
         &request.targets,
@@ -3042,6 +3057,7 @@ async fn run_pool_speed_test(
         targets.fingerprints.clone(),
         context.cloned(),
     )
+    .with_core_binary_sha256(proxy.measurement_core_sha256())
     .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_skipped(vec![
         ("notInPool", not_in_pool.len()),
@@ -3192,6 +3208,7 @@ pub(crate) async fn probe_runtime_candidates(
         targets.fingerprints.clone(),
         None,
     )
+    .with_core_binary_sha256(proxy.measurement_core_sha256())
     .with_connection_fingerprints(proxy.speed_measurement_fingerprints())
     .with_readback(&readback);
     let mut sink = events.sink(|_, _| {});
@@ -3390,6 +3407,8 @@ pub(crate) struct ScheduledRoundInput<'a> {
     pub(crate) concurrency: usize,
     pub(crate) instance: CoreInstance,
     pub(crate) config_digest: Option<String>,
+    /// CLI/JNI bytes, or the containing PacketTunnel executable for static libbox.
+    pub(crate) core_binary_sha256: Option<String>,
     pub(crate) fingerprints: BTreeMap<String, String>,
     pub(crate) connection_fingerprints: BTreeMap<String, String>,
     pub(crate) skipped_fingerprints: BTreeMap<String, String>,
@@ -3492,6 +3511,7 @@ where
     ])
     .with_ledger(deps.ledger)
     .with_foreground_epoch(foreground_epoch)
+    .with_core_binary_sha256(input.core_binary_sha256)
     .with_connection_fingerprints(input.connection_fingerprints)
     .with_display_skipped(
         input.targets,
@@ -3639,6 +3659,7 @@ pub(crate) async fn run_scheduled_round(
         config_digest: proxy.ready_main_emission_digest(gen0),
         fingerprints: probe.fingerprints.clone(),
         connection_fingerprints: proxy.speed_measurement_fingerprints(),
+        core_binary_sha256: proxy.measurement_core_sha256(),
         skipped_fingerprints: crate::runtime::node_fingerprints::measurement_table_json(&config),
     };
     let deps = ScheduledRoundDeps {

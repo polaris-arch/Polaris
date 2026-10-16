@@ -307,6 +307,7 @@ async fn production_data_settled_waits_for_new_results_and_the_real_gate_release
         "settled",
         Ok(1),
         ResultIdentity {
+            core_binary_sha256: None,
             run: 1,
             seq: 1,
             origin: SpeedTestOrigin::Manual,
@@ -340,6 +341,7 @@ async fn production_data_settled_waits_for_new_results_and_the_real_gate_release
         "settled",
         Ok(2),
         ResultIdentity {
+            core_binary_sha256: None,
             run: 2,
             seq: 1,
             origin: SpeedTestOrigin::Manual,
@@ -3595,6 +3597,7 @@ fn network_epoch_change_needs_both_sides_known() {
 
 fn identity(run: u64, seq: u64) -> ResultIdentity {
     ResultIdentity {
+        core_binary_sha256: None,
         run,
         seq,
         origin: SpeedTestOrigin::Manual,
@@ -4002,6 +4005,7 @@ impl ScheduleBench {
         let clock = Arc::clone(&self.clock);
         drive_scheduled_round(
             ScheduledRoundInput {
+                core_binary_sha256: None,
                 targets,
                 scope: "s1,s2".to_string(),
                 url: DEFAULT_SPEED_TEST_URL,
@@ -4209,6 +4213,7 @@ async fn a_gap_between_results_over_the_threshold_discards_the_rest_as_frozen() 
         let mut collected: Vec<(String, Value)> = Vec::new();
         let round = drive_scheduled_round(
             ScheduledRoundInput {
+                core_binary_sha256: None,
                 targets: &targets,
                 scope: "s1".to_string(),
                 url: DEFAULT_SPEED_TEST_URL,
@@ -4755,6 +4760,7 @@ fn binding_of<'a>(collected: &'a [(String, Value)], id: &str) -> &'a Value {
 
 fn ledger_view<'a>(fps: &'a BTreeMap<String, String>) -> measurement_ledger::ReadContext<'a> {
     measurement_ledger::ReadContext {
+        core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints: fps,
         main_connections: fps,

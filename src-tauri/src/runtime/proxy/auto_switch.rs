@@ -1267,6 +1267,7 @@ impl AutoView {
         generation: Option<u64>,
         network_epoch: Option<u64>,
         platform: Platform,
+        core_binary_sha256: Option<String>,
     ) -> Self {
         let plan = plan_subscriptions(config, &BTreeSet::from([subscription.to_string()]));
         let members = auto_select::subscription_members(config, subscription);
@@ -1288,7 +1289,8 @@ impl AutoView {
             subscription: subscription.to_string(),
             members,
             tailscale,
-            view: LedgerView::new(config, generation, network_epoch, platform),
+            view: LedgerView::new(config, generation, network_epoch, platform)
+                .with_core_binary_sha256(core_binary_sha256),
             plan,
         }
     }
@@ -1355,6 +1357,7 @@ impl ProxyRuntime {
                         generation,
                         network_epoch,
                         platform,
+                        self.measurement_core_sha256(),
                     )),
                     Intent::Manual | Intent::Unrecognized => None,
                 };
@@ -1484,6 +1487,7 @@ impl ProxyRuntime {
             core_running.then_some(generation),
             self.network_epoch(),
             self.helper.platform(),
+            self.measurement_core_sha256(),
         );
         let selected = selected_of(config);
         let read = auto.read(&auto.members, readings);
@@ -1533,6 +1537,7 @@ impl ProxyRuntime {
             Some(generation),
             network_epoch,
             platform,
+            self.measurement_core_sha256(),
         );
         let read = auto.read(&auto.members, readings);
         let ranked = auto_select::rank(&read.selectable);

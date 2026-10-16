@@ -1950,6 +1950,7 @@
 				B395AB4CF19394B13456AAB7 /* Verify iOS Core */,
 				96276B9221C4C6E0F0973B08 /* Sources */,
 				1B94AE1CA1BAC15E15C09099 /* Frameworks */,
+				6BA4F5A019704F91829A51D3 /* Verify TLS Capability Link */,
 			);
 			buildRules = (
 			);
@@ -2041,10 +2042,24 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
+				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",
+				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "python3 \"$SRCROOT/../../../scripts/mobile-core/consume.py\" verify-link \\\n  --link-input \"${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}\" \\\n  --link-input-sha256 \"${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}\" \\\n  --scratch \"${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}\"\n";
+			shellScript = "set -e\npython3 \"$SRCROOT/../../../scripts/mobile-core/consume.py\" verify-link \\\n  --link-input \"${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}\" \\\n  --link-input-sha256 \"${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}\" \\\n  --scratch \"${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}\"\npython3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" prepare\n";
+		};
+		6BA4F5A019704F91829A51D3 /* Verify TLS Capability Link */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)", "$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",);
+			name = "Verify TLS Capability Link";
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "python3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" verify\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -2192,6 +2207,7 @@
 					"$(inherited)",
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
+				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -2223,6 +2239,7 @@
 					"$(inherited)",
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
+				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

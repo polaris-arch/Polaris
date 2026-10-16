@@ -47,6 +47,7 @@ pub mod subscription_scheduler;
 pub mod taildrop;
 pub mod tailscale_login_core;
 pub mod tailscale_status;
+pub(crate) mod tls_fingerprints;
 pub mod uninstall;
 pub mod unlock;
 pub mod update_install;

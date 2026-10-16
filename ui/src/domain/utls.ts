@@ -1,27 +1,15 @@
 import type { TlsSettings } from '@/contracts/types/protocol-settings';
 
-/** IDs accepted by the pinned desktop and mobile kernel, not library constants. */
-export const UTLS_PROFILE_OPTIONS: readonly (readonly [string, string])[] = [
-  ['random', 'Random'],
-  ['randomized', 'Randomized'],
-  ...[
-    ['chrome', 'Chrome'], ['firefox', 'Firefox'], ['safari', 'Safari'], ['edge', 'Edge'],
-    ['360', '360'], ['qq', 'QQ'], ['ios', 'iOS'], ['android', 'Android'],
-  ].sort((a, b) => a[1].localeCompare(b[1], 'en', { numeric: true, sensitivity: 'base' }))
-    .map(([value, label]) => [value, label] as const),
-];
-
+/** Intent controls only. Profiles always come from the actual core report. */
 export const NODE_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
   ['', 'node.utls.legacy'],
   ['@default', 'node.utls.default'],
   ['none', 'node.utls.disabled'],
-  ...UTLS_PROFILE_OPTIONS,
 ];
 export const SHADOW_UTLS_OPTIONS = NODE_UTLS_OPTIONS.filter(([v]) => v !== 'none');
 export const GLOBAL_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
   ['follow', 'settings.utls.follow'],
   ['default', 'node.utls.default'],
-  ...UTLS_PROFILE_OPTIONS,
 ];
 
 type Intent = Pick<TlsSettings, 'utlsMode' | 'fingerprint'>;
@@ -43,8 +31,74 @@ export function utlsPatch(value: string, base: Intent | undefined): Intent {
   return { utlsMode: 'profile', fingerprint: value.trim().toLowerCase() };
 }
 
-/** Keep an imported future/unknown policy visible until explicit user selection. */
-export function globalUtlsOptions(current: string | undefined): readonly (readonly [string, string])[] {
-  return current && !GLOBAL_UTLS_OPTIONS.some(([value]) => value === current)
-    ? [...GLOBAL_UTLS_OPTIONS, [current, current] as const] : GLOBAL_UTLS_OPTIONS;
+
+export interface TlsFingerprintProfile {
+  id: string;
+  displayName: string;
+  client: string;
+  templateVersion: string;
+  selection: 'profile' | 'process-browser' | 'process-seeded-generator';
+  templateOffersX25519MLKEM768: boolean | null;
+}
+export interface TlsFingerprintCapabilities {
+  schema: 'polaris-tls-fingerprint-capabilities-v1';
+  enabled: boolean;
+  coreVersion: string;
+  sourceCommit: string;
+  sourceModified: boolean | null;
+  goVersion: string;
+  requiredGoVersion: string;
+  buildTags: string;
+  os: string;
+  arch: string;
+  modules: readonly { path: string; version: string; sum: string; replace?: unknown }[];
+  defaultFingerprint: string;
+  profiles: readonly TlsFingerprintProfile[];
+  legacyChromeAliases: readonly string[];
+  shadowTLSSessionIDWithECHSupported: false;
+  curvePreferencesSupported: false;
+  realityX25519MLKEM768: string;
+  randomSemantics: string;
+  randomizedSemantics: string;
+  negotiationEvidence: string;
+}
+export interface TlsFingerprintSnapshot {
+  /** CLI random-template facts belong to its probe process; never a live handshake. */
+  observationScope: 'cli-probe-process' | 'loaded-libbox' | 'unavailable';
+  byteIdentityScope: 'cli-executable' | 'loaded-jni-so' | 'packet-tunnel-executable' | 'loaded-native-container' | 'unavailable';
+  identity: string | null;
+  binarySha256: string | null;
+  document: TlsFingerprintCapabilities | null;
+  unavailableReason: string | null;
+}
+
+type Option = readonly [string, string];
+function advertisedProfiles(snapshot?: TlsFingerprintSnapshot): readonly Option[] {
+  const doc = snapshot?.document;
+  if (!snapshot?.identity || !doc?.enabled || doc.schema !== 'polaris-tls-fingerprint-capabilities-v1') return [];
+  const priority = (id: string) => id === 'random' ? 0 : id === 'randomized' ? 1 : 2;
+  return [...doc.profiles].sort((a, b) => priority(a.id) - priority(b.id)
+    || a.displayName.localeCompare(b.displayName, 'en', { numeric: true, sensitivity: 'base' })
+    || a.id.localeCompare(b.id, 'en', { numeric: true }))
+    .map(p => [p.id, p.templateVersion && p.selection === 'profile'
+      ? `${p.displayName} (${p.templateVersion})` : p.displayName] as const);
+}
+
+/** Shared by desktop/mobile fields. No discovered report means no invented presets.
+ * Existing/imported values remain visible through normalizeSelectOptions. */
+export function nodeUtlsOptions(shadow: boolean, snapshot?: TlsFingerprintSnapshot): readonly Option[] {
+  const base: Option[] = [['', 'node.utls.legacy']];
+  if (snapshot?.document?.enabled !== false) base.push(['@default', 'node.utls.default']);
+  if (!shadow) base.push(['none', 'node.utls.disabled']);
+  return [...base, ...advertisedProfiles(snapshot)];
+}
+export function isUtlsField(key: string): boolean { return key === 'fp' || key === 'stlsFp'; }
+
+/** Keep an unsupported current policy visible; never rewrite persisted intent. */
+export function globalUtlsOptions(current: string | undefined, snapshot?: TlsFingerprintSnapshot): readonly Option[] {
+  const options: Option[] = [['follow', 'settings.utls.follow']];
+  if (snapshot?.document?.enabled !== false) options.push(['default', 'node.utls.default']);
+  options.push(...advertisedProfiles(snapshot));
+  return current && !options.some(([value]) => value === current)
+    ? [...options, [current, current] as const] : options;
 }

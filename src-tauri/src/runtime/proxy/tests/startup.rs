@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::proxy::startup::kernel_gate_cache_record;
 use polaris_config_engine::singbox::RouteRule;
 use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, BLOCK_TAG};
 use polaris_core_supervisor::{PortAllocator, PortExclusions};
@@ -3589,6 +3590,7 @@ fn kernel_gate_cache_round_trips_atomically_and_corruption_is_a_miss() {
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path: dir.join("sing-box").to_string_lossy().into_owned(),
         binary_len: 42,
+        binary_sha256: "b".repeat(64),
         binary_modified_ns: 123,
         config_sha256: "a".repeat(64),
     };
@@ -4641,4 +4643,27 @@ fn occupied_helper_capability_has_a_dedicated_content_resource_error() {
         birth_capability_error_code(&error),
         code::HELPER_CORE_OCCUPIED
     );
+}
+
+#[test]
+fn accepted_config_cache_changes_when_core_bytes_change_with_same_path_size_and_mtime() {
+    let dir = fresh_test_dir();
+    let core = dir.join("core");
+    std::fs::write(&core, b"original").unwrap();
+    let modified = std::fs::metadata(&core).unwrap().modified().unwrap();
+    let config = test_singbox_config(vec![], vec![]);
+    let before = kernel_gate_cache_record(&core, &config).unwrap();
+    std::fs::write(&core, b"replaced").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&core)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let after = kernel_gate_cache_record(&core, &config).unwrap();
+    assert_eq!(before.binary_path, after.binary_path);
+    assert_eq!(before.binary_len, after.binary_len);
+    assert_eq!(before.binary_modified_ns, after.binary_modified_ns);
+    assert_ne!(before.binary_sha256, after.binary_sha256);
+    assert_ne!(before, after);
 }

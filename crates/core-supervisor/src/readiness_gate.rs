@@ -11,7 +11,7 @@
 //!    顺序安全：API 监听随核进程而生灭，端口可连 ⟹ 核存活。
 //! 3. 满轮后末轮再判一次（boundary check），不漏判就绪/退出。
 //!
-//! 纯逻辑：所有 I/O（is_ready/is_alive/sleep/is_superseded）由调用方注入，便于无进程/端口/计时器单测。
+//! 纯逻辑：所有 I/O（is_ready/observe_process/sleep/is_superseded）由调用方注入，便于无进程/端口/计时器单测。
 
 use std::future::Future;
 
@@ -21,7 +21,7 @@ use crate::ChildObservation;
 ///
 /// - `Ready`：管理 API 端口可连（核已就绪）。
 /// - `Dead`：进程已退出（起核期死，立即判定，不等满 timeout）。
-/// - `Timeout`：进程在但管理 API 未在预期内绑定。
+/// - `Timeout`：尚未确认进程退出，但管理 API 未在预算内绑定（含持续 Unknown）。
 /// - `Superseded`：就绪等待期内被更新的 start/stop 接管（issue #176），应静默让位（不重试、不清理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreReadyOutcome {
@@ -70,7 +70,7 @@ pub struct CoreReadyDeps<'a> {
     pub sleep: Box<dyn Fn(Duration) -> PinSleepFuture<'a> + Send + Sync + 'a>,
     /// 本次起核是否已被更新的 start/stop 接管（issue #176，可选；缺省视作未接管）。
     pub is_superseded: Option<Box<dyn Fn() -> bool + Send + Sync + 'a>>,
-    /// 每次「未就绪 + 进程仍活 → 即将 sleep 重试」时回调一次（上游 `onRetry`，core-readiness.ts:906）。
+    /// 每次「未就绪 + 尚未确认退出 → 即将 sleep 重试」时回调一次（上游 `onRetry`，core-readiness.ts:906）。
     /// 供上层累计「本次 start 的就绪重试次数」（DiagnosticCounters 慢起轴 `lastStartReadyRetries`）。
     /// 可选；缺省不计。**纯观测回调**：绝不参与轮询判定/顺序——本状态机逻辑与既有测试完全不变。
     pub on_retry: Option<Box<dyn Fn() + Send + Sync + 'a>>,
@@ -85,18 +85,12 @@ use std::time::Duration;
 impl<'a> CoreReadyDeps<'a> {
     /// 构造一个最小的依赖集（is_superseded = None）。
     pub fn new(
-        is_alive: impl Fn() -> bool + Send + Sync + 'a,
+        observe_process: impl Fn() -> ChildObservation + Send + Sync + 'a,
         is_ready: impl Fn() -> PinReadyFuture<'a> + Send + Sync + 'a,
         sleep: impl Fn(Duration) -> PinSleepFuture<'a> + Send + Sync + 'a,
     ) -> Self {
         Self {
-            observe_process: Box::new(move || {
-                if is_alive() {
-                    ChildObservation::Alive
-                } else {
-                    ChildObservation::Exited
-                }
-            }),
+            observe_process: Box::new(observe_process),
             is_ready: Box::new(is_ready),
             sleep: Box::new(sleep),
             is_superseded: None,
@@ -296,7 +290,7 @@ pub async fn wait_for_core_ready(
             ChildObservation::Absent => return CoreReadyOutcome::Superseded,
             ChildObservation::Alive | ChildObservation::Unknown => {}
         }
-        // 未就绪 + 进程仍活 → 即将 sleep 后重试：计一次就绪重试（上游 onRetry，:906）。
+        // 未就绪 + 尚未确认退出 → 即将 sleep 后重试：计一次就绪重试（上游 onRetry，:906）。
         // 纯观测，位于判定之后、sleep 之前，绝不改变任何 return 分支。
         if let Some(cb) = deps.on_retry.as_ref() {
             cb();

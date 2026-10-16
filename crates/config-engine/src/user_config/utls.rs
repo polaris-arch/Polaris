@@ -17,9 +17,15 @@ pub enum UtlsMode {
     Profile,
 }
 
-/// JSON IDs implemented by the pinned kernel, including its historical aliases.
+/// Recognized JSON IDs. Runtime capability reports/checks decide actual support.
 pub const SUPPORTED_PROFILES: &[&str] = &[
     "chrome",
+    "chrome_155",
+    "chrome_133",
+    "firefox_148",
+    "firefox_120",
+    "safari_26_3",
+    "safari_16_0",
     "firefox",
     "edge",
     "safari",
@@ -168,14 +174,12 @@ pub fn effective_server_for_platform<'a>(
                 "REALITY requires uTLS; choose the core default or a supported fingerprint.",
             );
         }
-        let engine = tls
-            .and_then(|t| t.engine.as_deref())
-            .and_then(normalize_token);
+        let engine = tls.and_then(|t| t.engine.as_deref());
         // Reality always uses the Go implementation in the existing builder.
         // Preserve its dormant engine field on legacy round trips; only an
         // engine actually emitted for ordinary TLS can conflict with uTLS.
         if !reality
-            && crate::builder::outbound_helpers::should_emit_tls_engine(engine.as_deref(), platform)
+            && crate::builder::outbound_helpers::should_emit_tls_engine(engine, platform)
             && utls.is_some()
         {
             return Err("uTLS requires the Go TLS engine; disable uTLS or select Go TLS.");

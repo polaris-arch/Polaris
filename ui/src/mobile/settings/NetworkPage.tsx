@@ -1,3 +1,4 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * 设置 → 网络（移动端）。桌面对照：`components/screens/settings/SettingsNetwork.tsx`（六块）。
  *
@@ -49,6 +50,7 @@ const DEFAULT_SPEED_TEST_URL = 'http://www.gstatic.com/generate_204';
 
 export function NetworkPage({ config, update, commit }: MobileSettingsPageProps): ReactElement {
   const { t } = useTranslation();
+  const tlsFingerprints = useTlsFingerprints();
   const interfaces = useNetworkInterfaces();
   const directInterface = config.networkInterfaces?.direct ?? '';
   const proxyInterface = config.networkInterfaces?.proxy ?? '';
@@ -220,7 +222,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
           control={
             <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
-              {globalUtlsOptions(config.utlsPolicy).map(([value, label]) => (
+              {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
                 <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
               ))}
             </MobileSelect>

@@ -5,6 +5,7 @@ use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use crate::runtime::helper::HelperStopTarget;
 use crate::runtime::proxy::mesh_apply::owner_proof::{
@@ -23,7 +24,7 @@ pub(crate) struct DirectCoreSlot {
     backend: BackendFence,
     helper_start: Option<HelperStartAttempt>,
     state: SlotState,
-    observation_unknown_logged: bool,
+    last_unknown_log: Option<Instant>,
     #[cfg(test)]
     observation_wait: Option<ObservationWait>,
 }
@@ -35,7 +36,7 @@ impl Default for DirectCoreSlot {
             backend: BackendFence::DirectOnly,
             helper_start: None,
             state: SlotState::Empty,
-            observation_unknown_logged: false,
+            last_unknown_log: None,
             #[cfg(test)]
             observation_wait: None,
         }
@@ -829,6 +830,7 @@ impl DirectCoreSlot {
         if !self.is_empty() {
             return Err(Box::new(run));
         }
+        self.last_unknown_log = None;
         self.state = SlotState::Running(run);
         Ok(())
     }
@@ -1098,7 +1100,6 @@ impl DirectCoreSlot {
                 let result = run.try_wait_with(wait);
                 match result {
                     Ok(status) => {
-                        self.observation_unknown_logged = false;
                         if status.is_some() {
                             ChildObservation::Exited
                         } else {
@@ -1106,11 +1107,14 @@ impl DirectCoreSlot {
                         }
                     }
                     Err(error) => {
-                        if !self.observation_unknown_logged {
+                        if self
+                            .last_unknown_log
+                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                        {
                             log::warn!(
                                 "direct native observation unknown; retaining run state: {error}"
                             );
-                            self.observation_unknown_logged = true;
+                            self.last_unknown_log = Some(Instant::now());
                         }
                         ChildObservation::Unknown
                     }

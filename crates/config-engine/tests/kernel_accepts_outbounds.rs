@@ -2147,3 +2147,134 @@ fn bundled_core_accepts_cert_pinned_tls_outbounds() {
         "冒号 hex 居然没在 decode 阶段被拒 —— 上面那条绿因此不说明内核读过这个键；实得：{diag}"
     );
 }
+
+/// Admission uses the final downloaded binary, not a library constant. This is
+/// decode/initialization coverage only; it cannot attest ClientHello or PQ use.
+#[test]
+fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::dns::DomainResolver;
+    use polaris_config_engine::user_config::protocol_settings::TlsSettings;
+    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode};
+    use polaris_config_engine::user_config::utls::{
+        effective_server_for_platform, UtlsMode, SUPPORTED_PROFILES,
+    };
+    let Some(core) = core_or_skip("uTLS JSON profile admission") else {
+        return;
+    };
+    let dir = test_temp_dir("polaris-kgate-utls-");
+    let path = dir.path().join("profile.json");
+    let target = support::core_locator::kernel_gate_target();
+    let build = support::core_locator::CORE_MATRIX
+        .iter()
+        .find(|row| row.gate_target == target)
+        .unwrap();
+    let platform = if build.goos == "windows" {
+        "win32"
+    } else {
+        build.goos
+    };
+    let arch = if build.goarch == "amd64" {
+        "x64"
+    } else {
+        build.goarch
+    };
+    // Query the exact final bytes. Old CLI versions lack this command: their
+    // historical IDs still get actual check coverage, without advertising new IDs.
+    let output = support::core_locator::command_for_core_target(&target, &core)
+        .args(["tools", "tls-fingerprints"])
+        .output()
+        .unwrap();
+    let legacy_profiles: Vec<&str> = SUPPORTED_PROFILES
+        .iter()
+        .copied()
+        .filter(|id| {
+            ![
+                "chrome_155",
+                "chrome_133",
+                "firefox_148",
+                "firefox_120",
+                "safari_26_3",
+                "safari_16_0",
+            ]
+            .contains(id)
+        })
+        .collect();
+    let reported: Option<Value> = output
+        .status
+        .success()
+        .then(|| serde_json::from_slice::<Value>(&output.stdout).expect("actual TLS report JSON"));
+    let actual_profiles: Vec<&str> = match &reported {
+        Some(report) => {
+            assert_eq!(report["schema"], "polaris-tls-fingerprint-capabilities-v1");
+            assert_eq!(report["enabled"], true, "final core must include with_utls");
+            assert_eq!(report["os"], build.goos);
+            assert_eq!(report["arch"], build.goarch);
+            report["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_str().unwrap())
+                .chain(
+                    report["legacyChromeAliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap()),
+                )
+                .collect()
+        }
+        None => legacy_profiles,
+    };
+    let mut last = Value::Null;
+    let intents = std::iter::once((Some(UtlsMode::Disabled), None))
+        .chain(std::iter::once((Some(UtlsMode::Default), None)))
+        .chain(
+            actual_profiles
+                .iter()
+                .map(|profile| (Some(UtlsMode::Profile), Some(*profile))),
+        );
+    for (mode, fingerprint) in intents {
+        let server = ServerConfig {
+            id: "utls-native".into(),
+            name: "uTLS admission".into(),
+            protocol: Protocol::Vless,
+            address: "127.0.0.1".into(),
+            port: 443,
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            security: Some(SecurityMode::Tls),
+            tls_settings: Some(TlsSettings {
+                server_name: Some("example.com".into()),
+                utls_mode: mode,
+                fingerprint: fingerprint.map(str::to_owned),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let effective = effective_server_for_platform(&server, Some("follow"), platform).unwrap();
+        let outbound = build_proxy_outbound(
+            effective.as_ref(),
+            "utls-native",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            arch,
+            platform,
+        );
+        let config = json!({"log":{"disabled":true},
+            "dns":{"servers":[{"type":"local","tag":"dns-bootstrap"}]},
+            "outbounds":[outbound]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let (ok, diagnostic) = check(&core, &path);
+        assert!(ok, "actual core rejected admitted uTLS mode={mode:?} fingerprint={fingerprint:?}: {diagnostic}");
+        last = config;
+    }
+    // A negative control ensures the native initializer actually reads profile
+    // names instead of accepting every string while deferring all validation.
+    last["outbounds"][0]["tls"]["utls"] =
+        json!({"enabled":true,"fingerprint":"polaris-definitely-unsupported-profile"});
+    std::fs::write(&path, serde_json::to_vec_pretty(&last).unwrap()).unwrap();
+    let (ok, diagnostic) = check(&core, &path);
+    assert!(
+        !ok && diagnostic.to_ascii_lowercase().contains("fingerprint"),
+        "actual core did not reject an unknown uTLS fingerprint: {diagnostic}"
+    );
+}

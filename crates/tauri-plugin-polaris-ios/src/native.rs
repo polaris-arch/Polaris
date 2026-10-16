@@ -821,3 +821,23 @@ pub fn started() -> bool {
 
 #[cfg(test)]
 mod retirement_tests;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TLSFingerprintCapabilitiesResponse {
+    pub document: Option<String>,
+    pub binary_sha256: String,
+}
+
+/// Queries the actual PacketTunnel extension; disconnected/old extensions are unknown.
+pub async fn tls_fingerprint_capabilities() -> Result<TLSFingerprintCapabilitiesResponse, String> {
+    call(
+        "tlsFingerprintCapabilities",
+        serde_json::json!({}),
+        5,
+        None,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message)
+}

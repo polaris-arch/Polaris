@@ -1783,3 +1783,37 @@ fn global_utls_policy_reaches_main_and_shadow_physical_outbound() {
     }
     assert_eq!(serde_json::to_value(&config.servers).unwrap(), before);
 }
+
+#[test]
+fn preexcluded_node_does_not_fail_the_remaining_outbound_utls_policy() {
+    use crate::user_config::protocol_settings::TlsSettings;
+    use crate::user_config::server_config::SecurityMode;
+    let mut excluded = ServerConfig {
+        id: "excluded-utls".into(),
+        protocol: Protocol::Vless,
+        security: Some(SecurityMode::Tls),
+        tls_settings: Some(TlsSettings {
+            fingerprint: Some("unsupported-profile".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    excluded.address = "example.com".into();
+    excluded.port = 443;
+    let config = UserConfig {
+        servers: vec![excluded],
+        ..Default::default()
+    };
+    let mut deps = deps_default();
+    deps.gate_invalid_nodes
+        .insert("excluded-utls".into(), "fixture-preexcluded");
+    let generated = build_outbounds(&config, &mut deps).unwrap();
+    assert!(!generated
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == "proxy-excluded-utls"));
+    assert_eq!(
+        deps.gate_invalid_nodes["excluded-utls"],
+        "fixture-preexcluded"
+    );
+}

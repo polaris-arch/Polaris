@@ -333,13 +333,6 @@ pub fn build_outbounds_with_runtime_bindings(
     }
 
     for server in &config.servers {
-        let effective = crate::user_config::utls::effective_server_for_platform(
-            server,
-            config.utls_policy.as_deref(),
-            &deps.platform,
-        )
-        .map_err(|reason| format!("uTLS: {} ({reason})", server.id))?;
-        let server = effective.as_ref();
         let tag = id_to_tag
             .get(&server.id)
             .cloned()
@@ -367,6 +360,14 @@ pub fn build_outbounds_with_runtime_bindings(
         if deps.gate_invalid_nodes.contains_key(&server.id) {
             continue;
         }
+
+        let effective = crate::user_config::utls::effective_server_for_platform(
+            server,
+            config.utls_policy.as_deref(),
+            &deps.platform,
+        )
+        .map_err(|reason| format!("uTLS: {} ({reason})", server.id))?;
+        let server = effective.as_ref();
 
         let downgrade_mesh = crate::builder::endpoint_routes::mesh_uses_system_interface(server)
             && !deps.system_interface_available;

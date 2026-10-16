@@ -1856,6 +1856,7 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
         deps: TempCoreDeps {
             #[cfg(not(target_os = "android"))]
             pc_custody: Arc::new(PcTempCoreCustody::default()),
+            expected_core_sha256: None,
             spawner: Arc::new(FakeSpawner {
                 terminated: Arc::clone(&terminated),
                 spawns: Arc::clone(&spawns),

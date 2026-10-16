@@ -675,6 +675,42 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * **异常消息原样回传，绝不翻译或加前缀** —— Rust 侧 `parse_kernel_rejection` 的
      * `decode config: ` marker 就锚在这串的开头，加一个字都会把归因锚点破坏掉。
      */
+    /** Read the loaded libbox, including old AARs which lack this method. */
+    @Command
+    fun tlsFingerprintCapabilities(invoke: Invoke) {
+        Thread({
+            try {
+                val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libgojni.so").canonicalFile
+                // A packaged file by itself is not proof of the loaded JNI image.
+                val mapped = java.io.File("/proc/self/maps").useLines { lines ->
+                    lines.any { it.trimEnd().endsWith(" " + library.path) }
+                }
+                require(mapped && library.isFile) { "Loaded libbox image could not be identified" }
+                fun digest(): String {
+                    val hash = java.security.MessageDigest.getInstance("SHA-256")
+                    library.inputStream().use { input ->
+                        val buffer = ByteArray(65536)
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            hash.update(buffer, 0, count)
+                        }
+                    }
+                    return hash.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+                }
+                val before = digest()
+                val method = runCatching { Libbox::class.java.getMethod("tlsFingerprintCapabilities") }.getOrNull()
+                val document = method?.invoke(null) as? String
+                require((document?.toByteArray(Charsets.UTF_8)?.size ?: 0) <= 65536 && before == digest()) {
+                    "Loaded core identity changed or capability report exceeds budget"
+                }
+                invoke.resolve(JSObject().put("document", document ?: org.json.JSONObject.NULL).put("binarySha256", before))
+            } catch (error: Throwable) {
+                invoke.reject("Loaded libbox TLS capabilities unavailable: " + (error.cause?.message ?: error.message))
+            }
+        }, "polaris-tls-capabilities").start()
+    }
+
     @Command
     fun checkConfig(invoke: Invoke) {
         val cfg = invoke.parseArgs(CheckArgs::class.java).configContent

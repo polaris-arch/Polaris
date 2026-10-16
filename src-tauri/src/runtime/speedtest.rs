@@ -2515,6 +2515,7 @@ pub fn emit_speed_test_done(
 
 /// 临时核会话的注入依赖（生产 [`TempCoreDeps::production`]，测试注入 mock spawner / 假核路径）。
 pub struct TempCoreDeps {
+    pub expected_core_sha256: Option<String>,
     #[cfg(not(target_os = "android"))]
     pc_custody: Arc<PcTempCoreCustody>,
     /// 瞬态 sing-box spawn（复用 `tailscale_login_core` 的瞬态核进程抽象）。
@@ -2556,6 +2557,7 @@ impl TempCoreDeps {
         Self {
             #[cfg(not(target_os = "android"))]
             pc_custody: PC_TEMP_CORE_CUSTODY.clone(),
+            expected_core_sha256: None,
             spawner: Arc::new(TokioLoginCoreSpawner),
             checker: Arc::new(SingBoxConfigChecker),
             resolve_binary: Arc::new(crate::runtime::proxy::resolve_core_binary),
@@ -2578,6 +2580,11 @@ impl TempCoreDeps {
 
     /// 换上本轮运行的取消句柄（命令层在准入后调）。
     #[must_use]
+    pub fn with_expected_core_sha256(mut self, digest: Option<String>) -> Self {
+        self.expected_core_sha256 = digest;
+        self
+    }
+
     pub fn with_cancel(mut self, cancel: SpeedTestCancel) -> Self {
         self.cancel = cancel;
         self
@@ -2987,6 +2994,28 @@ impl TempCoreSession {
         // 而不是另读一次配置 —— 它就是本次真正下发给核的那一档（`temp_core_log_level` 的产出）。
         let keep_config = matches!(deps.log_level.as_str(), "debug" | "trace");
         let cfg = build_temp_core_config(nodes, &ports, &deps.log_level);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let tls_capabilities = crate::runtime::tls_fingerprints::probe_cli(&binary).await;
+        #[cfg(target_os = "android")]
+        let tls_capabilities = crate::runtime::proxy::temp_tls_fingerprint_capabilities().await;
+        #[cfg(target_os = "ios")]
+        let tls_capabilities = crate::runtime::tls_fingerprints::Snapshot::unavailable(
+            "iOS temporary CLI is unavailable",
+        );
+        if deps.expected_core_sha256.is_some()
+            && deps.expected_core_sha256 != tls_capabilities.binary_sha256
+        {
+            return BatchOutcome::Failed {
+                detail: "Temporary-core bytes differ from the measurement identity".into(),
+                oversized: false,
+            };
+        }
+        if let Err(detail) = tls_capabilities.validate_config(&cfg) {
+            return BatchOutcome::Failed {
+                detail,
+                oversized: false,
+            };
+        }
         // Defense at the actual final config boundary, even for callers that bypass the planner.
         let system_tags: Vec<String> = cfg
             .get("endpoints")
@@ -3051,6 +3080,16 @@ impl TempCoreSession {
             };
         }
 
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(expected) = tls_capabilities.binary_sha256.as_deref() {
+            if crate::runtime::tls_fingerprints::binary_digest(&binary).as_deref() != Ok(expected) {
+                retire_temp_config(&config_path, keep_config);
+                return BatchOutcome::Failed {
+                    detail: "Core bytes changed after temporary-core validation".into(),
+                    oversized: false,
+                };
+            }
+        }
         // ── 两条流的去向写在请求里（**必填**，见 `StdioPolicy`）────────────────────────────
         //
         // # 这几行补的是全仓唯一一条「管道被 piped 却从不排空」的腿

@@ -474,7 +474,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
-             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
+             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
              'scripts/mobile-core/apple-cache.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
@@ -484,7 +484,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/apple-cache.py',
-    'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py',
+    'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
     'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
 })

@@ -497,7 +497,7 @@ pub(super) const SINGBOX_STARTUP_LOG: &str = "singbox-startup.log";
 /// `sing-box check` 成功缓存。只缓存“同一核二进制 + 除运行期随机端口外完全相同的生成配置”；
 /// 任一结构字段或核身份变化都重新真跑 check。
 pub(super) const KERNEL_GATE_CACHE_FILE: &str = "singbox-check-cache.json";
-pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 1;
+pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 2;
 
 /// 一次已成功 `sing-box check` 的可持久身份。
 ///
@@ -510,6 +510,7 @@ pub(super) struct KernelGateCacheRecord {
     pub(super) schema: u32,
     pub(super) binary_path: String,
     pub(super) binary_len: u64,
+    pub(super) binary_sha256: String,
     pub(super) binary_modified_ns: u64,
     pub(super) config_sha256: String,
 }
@@ -575,7 +576,7 @@ pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
     }
 }
 
-fn kernel_gate_cache_record(
+pub(super) fn kernel_gate_cache_record(
     binary: &Path,
     config: &SingBoxConfig,
 ) -> Option<KernelGateCacheRecord> {
@@ -598,6 +599,7 @@ fn kernel_gate_cache_record(
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path,
         binary_len: metadata.len(),
+        binary_sha256: crate::runtime::tls_fingerprints::binary_digest(binary).ok()?,
         binary_modified_ns: modified_ns,
         config_sha256: polaris_updater::verify::sha256_hex(&normalized),
     })
@@ -2242,6 +2244,23 @@ impl ProxyRuntime {
             error: None,
             error_code: None,
         };
+        // The libbox query now reaches the ready extension on iOS. Old query
+        // support stays unknown; it is never promoted to cache-eligible evidence.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let ready_tls = match self.tls_ready_binary_for_pid(pid, via_helper) {
+            Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
+            None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                "Running core image could not be observed",
+            ),
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
+        if self.gate.generation() != my_gen {
+            return Ok(self.status());
+        }
+        if let Ok(mut identity) = self.captured_core_sha256.lock() {
+            *identity = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
+        }
         // 热切换基准：**与 running 状态同生共死**（此处置、stop 清）→「快照在 ⟺ 核在跑」。
         // 上游 在生成期就回填，但那样起核失败时会留下描述「不存在的核」的快照；此处收紧到就绪后。
         #[cfg(all(target_os = "android", debug_assertions))]
@@ -2908,7 +2927,7 @@ impl ProxyRuntime {
         #[cfg(test)]
         let ready_retry_count = Arc::clone(&self.ready_retry_count);
         let deps = CoreReadyDeps {
-            // 子进程存活：直起走 try_wait 非阻塞收割（Ok(None)=仍在跑；child 被 stop 取走→不活）；
+            // 直起保留 try_wait 三态；Stop 已取走 custody 时让位，不折成进程死亡。
             // helper 核走 pid 探活（kill(pid,0)，root 核跨用户 EPERM 亦判活）。
             observe_process: Box::new({
                 let alive_probe_count = Arc::clone(&alive_probe_count);
@@ -3670,6 +3689,7 @@ impl ProxyRuntime {
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
+        let capabilities = self.tls_fingerprint_capabilities_for(binary).await;
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
         loop {
@@ -3683,6 +3703,14 @@ impl ProxyRuntime {
                 runtime_bind_interfaces,
             )
             .map_err(|e| format!("sing-box 配置生成失败: {e}"))?;
+            capabilities.validate_config(
+                &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
+            )?;
+            if let (Some(bin), Some(before)) = (binary, capabilities.binary_sha256.as_deref()) {
+                if crate::runtime::tls_fingerprints::binary_digest(bin)?.as_str() != before {
+                    return Err("Core bytes changed after capability query; retry startup".into());
+                }
+            }
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
             std::fs::write(config_path, &json)

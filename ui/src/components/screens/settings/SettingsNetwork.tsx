@@ -1,3 +1,4 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * SettingsNetwork —— 网络子页（原型 [data-sec="network"] L2119-2169）。
  *
@@ -509,7 +510,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             aria-label={t('settings.utls.label')}
             onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
           >
-            {globalUtlsOptions(config.utlsPolicy).map(([value, label]) => (
+            {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
               <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
             ))}
           </Select>

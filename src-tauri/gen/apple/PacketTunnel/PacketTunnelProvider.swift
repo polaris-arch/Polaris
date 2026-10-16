@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Libbox
 import NetworkExtension
@@ -171,6 +172,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     func logDebugMessage(_ message: String) { logger.debug("\(message, privacy: .private)") }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        if messageData == Data("tls-fingerprints".utf8) {
+            // Optional symbol permits old static libbox. Hash the containing
+            // executable, never relabel an input archive hash as loaded bytes.
+            guard let executable = Bundle.main.executableURL else { completionHandler?(nil); return }
+            worker.async {
+                do {
+                    func digest() throws -> String {
+                        let file = try FileHandle(forReadingFrom: executable)
+                        defer { try? file.close() }
+                        var hash = SHA256()
+                        while let bytes = try file.read(upToCount: 65536), !bytes.isEmpty { hash.update(data: bytes) }
+                        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+                    }
+                    let before = try digest()
+                    var document: String?
+                    if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "LibboxTLSFingerprintCapabilities") {
+                        typealias Query = @convention(c) (AutoreleasingUnsafeMutablePointer<NSError?>?) -> NSString?
+                        let query = unsafeBitCast(symbol, to: Query.self)
+                        var error: NSError?
+                        document = query(&error) as String?
+                        if error != nil { document = nil }
+                    }
+                    guard (document?.utf8.count ?? 0) <= 65536, before == (try digest())
+                    else { completionHandler?(nil); return }
+                    let reply: [String: Any] = ["document": document as Any? ?? NSNull(), "binarySha256": before]
+                    completionHandler?(try JSONSerialization.data(withJSONObject: reply))
+                } catch { completionHandler?(nil) }
+            }
+            return
+        }
         if messageData != Data("status".utf8) {
             guard let object = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any],
                   let command = object["command"] as? String,

@@ -55,6 +55,7 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
     rt.config.save_full(cfg).expect("seed D");
     let saved = rt.config.current().unwrap();
     mark_running_with_snapshot(rt, &saved);
+    *rt.captured_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
     rt.switch_snapshot
         .write()
         .unwrap()
@@ -68,6 +69,7 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
 /// 一条当前核世代、探针槽路径测得的结果的身份块；测量的墙钟时刻就是注入的「现在」。
 fn identity(rt: &ProxyRuntime, cfg: &Value, run: u64) -> ResultIdentity {
     ResultIdentity {
+        core_binary_sha256: rt.measurement_core_sha256(),
         run,
         seq: 1,
         origin: SpeedTestOrigin::Schedule,

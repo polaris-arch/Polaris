@@ -1,3 +1,5 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
+import { isUtlsField, nodeUtlsOptions } from '@/domain/utls';
 /**
  * 数据驱动表单基建 —— FieldSpec 描述符 + 单一 FieldRenderer（§1.4 表单层）。
  *
@@ -68,6 +70,7 @@ export interface FieldRendererProps {
 export function FieldRenderer({ spec, value, onChange }: FieldRendererProps) {
   const { t } = useTranslation();
   const [secretVisible, setSecretVisible] = useState(false);
+  const tlsFingerprints = useTlsFingerprints(isUtlsField(spec.k));
   const label = t(spec.label);
   const fid = `nd-f-${spec.k}`;
 
@@ -117,7 +120,7 @@ export function FieldRenderer({ spec, value, onChange }: FieldRendererProps) {
 
   if (spec.t === 'select') {
     // 传 value：当前值落在选项集外时并入选项，避免「一碰下拉就被迫改值」（见 toCselOptions 注释）。
-    const opts = toCselOptions(spec.options, value, t);
+    const opts = toCselOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints) : spec.options, value, t);
     return (
       <div className="fld">
         {selectLabelEl}
