@@ -20,6 +20,8 @@ struct TunnelReport: Encodable {
     let operationRequestID: String?
     let stopSourceGeneration: UInt64?
     let tailscaleStoreScope: String?
+    let tailscaleDirectoryScope: String?
+    let stopOriginalDirectoryScope: String?
     let uncertainSettingsGeneration: UInt64?
     // Neither a nil Go instance nor NE disconnected proves resource disposal.
     let cleanupEvidence = "CleanupUnknown"
@@ -47,6 +49,9 @@ final class TunnelLifecycle {
     private var uncertainSettingsGeneration: UInt64?
     private var stopSourceGeneration: UInt64?
     private var tailscaleStoreScope: String?
+    private var tailscaleDirectoryScope: String?
+    private var stopOriginalDirectoryScope: String?
+    private var directoryTerminalRetained = false
     private var stopObservation: (nonce: String, callback: (TunnelObservation) -> Void)?
 
     func start(_ identity: TunnelIdentity) throws -> UInt64 {
@@ -61,6 +66,9 @@ final class TunnelLifecycle {
         runtimeStopped = false
         stopSourceGeneration = nil
         tailscaleStoreScope = nil
+        tailscaleDirectoryScope = nil
+        stopOriginalDirectoryScope = nil
+        directoryTerminalRetained = false
         lastError = nil
         return generation
     }
@@ -96,6 +104,8 @@ final class TunnelLifecycle {
         }
         operationRequestID = requestID
         stopSourceGeneration = generation
+        // Freeze the original census before Stop, never reconstruct it from terminal data.
+        stopOriginalDirectoryScope = phase == "running" && !quarantined ? tailscaleDirectoryScope : nil
         return true
     }
 
@@ -105,6 +115,21 @@ final class TunnelLifecycle {
         lock.lock(); defer { lock.unlock() }
         guard self.identity == identity, value.utf8.count <= 256 * 1024 else { return }
         tailscaleStoreScope = value
+    }
+
+    /// The original worker owns this export. Terminal data is write-once for
+    /// this Stop; late retries cannot replace Unknown with an invented success.
+    func retainTailscaleDirectoryScope(_ value: String, identity: TunnelIdentity, terminal: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        guard self.identity == identity else { return }
+        if terminal {
+            guard stopPending, !directoryTerminalRetained else { return }
+            directoryTerminalRetained = true
+        } else {
+            guard !stopPending, stopObservation == nil,
+                  phase == "starting" || phase == "running" || phase == "reloadAccepted" else { return }
+        }
+        tailscaleDirectoryScope = value.utf8.count <= 256 * 1024 ? value : nil
     }
 
     func currentGeneration() -> UInt64 { lock.lock(); defer { lock.unlock() }; return generation }
@@ -177,6 +202,8 @@ final class TunnelLifecycle {
         return TunnelReport(identity: identity, generation: generation, lifecycle: phase,
                             runtimeStopped: runtimeStopped, operationRequestID: operationRequestID,
                             stopSourceGeneration: stopSourceGeneration, tailscaleStoreScope: tailscaleStoreScope,
+                            tailscaleDirectoryScope: tailscaleDirectoryScope,
+                            stopOriginalDirectoryScope: directoryTerminalRetained ? stopOriginalDirectoryScope : nil,
                             uncertainSettingsGeneration: uncertainSettingsGeneration,
                             cleanupError: cleanupError, lastError: lastError)
     }

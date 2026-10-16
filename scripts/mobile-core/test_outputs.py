@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from fork_input import ROOT, canonical, load, sha
+from fork_input import ROOT, canonical, load, sha, validate
 from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
@@ -25,7 +25,7 @@ from producer import write_json
 
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
-        self.value = load()
+        self.value = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
 
     def test_native_capacity_caps_current_runner_by_load_affinity_quota_and_memory(self):
         facts = {'logicalCPUs': 16, 'affinityCPUs': 8, 'quotaCPUs': 4.5, 'load1': 1.1,
@@ -390,8 +390,68 @@ class FormalOutputs(unittest.TestCase):
                         expected_id='polaris-mobile-' + 'a' * 64, actual_id=kwargs.pop('actual_id', 'polaris-mobile-' + 'a' * 64),
                         **kwargs)
 
+    def test_final_go_meta_buildinfo_preserves_actual_devel_and_rejects_invented_sum(self):
+        from test_source_policy import future_mobile_fixture
+        value, _ = future_mobile_fixture()
+        old = self.value
+        self.value = value
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp).resolve(); meta_dir = source / 'third_party/metacubex-utls'
+                meta_dir.mkdir(parents=True)
+                tun_dir = source / 'third_party/sing-tun'; tun_dir.mkdir()
+                facts = self.facts(); facts['goVersion'] = value['goVersion']
+                facts['modules'][value['goModule']]['replacement'] = str(source)
+                meta = value['sourcePolicy']['metacubex']
+                facts['modules'][meta['module']] = {'kind': 'dep', 'version': meta['version'], 'sum': '',
+                    'replacement': meta['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
+                facts['modules']['github.com/sagernet/sing-tun'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': '',
+                    'replacement': './third_party/sing-tun', 'replacementVersion': '(devel)', 'replacementSum': ''}
+                graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
+                    {'Path': value['goModule'], 'Main': True, 'Dir': str(source)},
+                    {'Path': meta['module'], 'Version': meta['version'],
+                     'Replace': {'Path': meta['replacementPath'], 'Dir': str(meta_dir)}},
+                    {'Path': 'github.com/sagernet/sing-tun', 'Version': 'v1.0.0',
+                     'Replace': {'Path': './third_party/sing-tun', 'Dir': str(tun_dir)}}]
+                def check(actual, source_graph=None):
+                    check_buildinfo(actual, value, graph if source_graph is None else source_graph, os_name='android', arch='arm64', mode='c-shared',
+                        expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+                check(facts)
+                for case in ('duplicate', 'unlinked-local', 'missing-local', 'graph-sum', 'graph-version', 'graph-directory'):
+                    changed_graph = deepcopy(graph)
+                    if case == 'duplicate': changed_graph.append(deepcopy(changed_graph[-1]))
+                    elif case == 'unlinked-local': changed_graph.append({'Path': 'example.invalid/unlinked',
+                        'Replace': {'Path': '../outside', 'Dir': str(source.parent / 'outside')}})
+                    elif case == 'missing-local': changed_graph.pop()
+                    elif case == 'graph-sum': changed_graph[-2]['Sum'] = meta['upstreamH1']
+                    elif case == 'graph-version': changed_graph[-2]['Version'] = 'v1.8.7'
+                    else: changed_graph[-2]['Replace']['Dir'] = str(source / 'outside')
+                    with self.subTest(case=case), self.assertRaises(RuntimeError): check(facts, changed_graph)
+                for field, bad in [('replacement', './outside'), ('replacementVersion', ''),
+                                   ('replacementSum', meta['upstreamH1']), ('sum', meta['upstreamH1']),
+                                   ('version', 'v1.8.7')]:
+                    changed = deepcopy(facts); changed['modules'][meta['module']][field] = bad
+                    with self.subTest(field=field), self.assertRaises(RuntimeError): check(changed)
+                changed = deepcopy(facts); changed['goVersion'] = '1.25.5'
+                with self.assertRaisesRegex(RuntimeError, 'Go version'): check(changed)
+        finally:
+            self.value = old
+
     def test_trimpath_does_not_invent_absent_ldflags(self):
         self.check(self.facts())
+
+    def test_reported_ldflags_bind_exact_directory_source_identity(self):
+        from fork_input import linker_flags
+        expected = linker_flags(self.value, 'a' * 64)
+        facts = self.facts()
+        facts['settings']['-ldflags'] = expected
+        self.check(facts)
+        injection = ' -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + self.value['sourceCommit']
+        for bad in [expected.replace(injection, ''),
+                    expected.replace(injection, injection[:-40] + '0' * 40)]:
+            facts['settings']['-ldflags'] = bad
+            with self.assertRaisesRegex(RuntimeError, 'ldflags differ'):
+                self.check(facts)
 
     def test_actual_buildid_cannot_reuse_cli_or_other_input(self):
         for bad in ['', 'CLI-BuildID', 'polaris-mobile-' + 'b' * 64]:
@@ -738,7 +798,8 @@ class FormalOutputs(unittest.TestCase):
                 (lib / 'Headers').mkdir()
                 (lib / 'Libbox').write_bytes(raw)
                 (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
-                symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+                symbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                    'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                     'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                     'wakeNow', 'recordScreenState']
                 (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header())
@@ -751,6 +812,12 @@ class FormalOutputs(unittest.TestCase):
                     self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
                 original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
                 text = original_header.read_text()
+                for missing in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                                'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement']:
+                    original_header.write_text(text.replace(missing, 'omittedAPI'))
+                    with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, 'API missing'):
+                        inspect_framework(framework, self.value, [], expected_id)
+                original_header.write_text(text)
                 original_header.write_text(text.replace('- (NSString* _Nonnull)getTailscaleStoreRetirement;',
                                                        '// - (NSString* _Nonnull)getTailscaleStoreRetirement;'))
                 with self.assertRaisesRegex(RuntimeError, 'immutable getter'):

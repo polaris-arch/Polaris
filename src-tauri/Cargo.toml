@@ -106,7 +106,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 [target."cfg(unix)".dependencies]
 nix = { version = "0.31.3", features = ["fs", "net", "process", "signal", "user"] }
 
-[target."cfg(all(target_os = \"linux\", target_arch = \"x86_64\"))".dependencies]
+# Directory lease and fd-relative deletion are required on every Unix target.
 rustix = { version = "1.1.4", features = ["fs"] }
 
 # Android's existing platform-verifier initialization still needs jni 0.22:

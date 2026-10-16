@@ -820,6 +820,18 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tailscale_directory.rs':
+    'G4 directory identity/terminal-epoch predicates are shared Rust bookkeeping; iOS alone admits native directory retirement. '
+    + 'Android target cargo check covers the Unix lease type surface, while host tests cover directory identity controls. '
+    + 'APK packaging does not execute filesystem custody or prove Android runtime deletion; no JNI, resource or Gradle contract changes.',
+  'src-tauri/src/runtime/tailscale_directory/':
+    'The canonical Unix lease implementation is compiled by both Android and Unix hosts; iOS-only mapping/retirement stays cfg-scoped. '
+    + 'Host-only tests remain behind cfg(test), outside APK targets. Android cargo check covers production types, not device lease or deletion behavior. '
+    + 'This module changes no APK asset, ABI or packaging input; real runtime validation remains separate.',
+  'src-tauri/src/runtime/proxy/process_supervision/tests/':
+    'Canonical cfg(test) G4 reload/Stop custody source guards and host fixtures, excluded from APK production. '
+    + 'Host cargo test --workspace owns these regressions; Android cargo check and APK builds do not compile this test target '
+    + 'or establish iOS provider/Go writer termination.',
   'src-tauri/src/runtime/speedtest_tunnel/tests/mod.rs':
     '宿主 TLS 测试模块：父 speedtest_tunnel.rs 以 cfg(test) 挂载，authenticated_tls 由 cfg(not(target_os = "android")) 限定非 Android 宿主。'
     + 'ci.yml 的宿主 cargo test --workspace 执行回环 TLS/证书认证回归；APK 不构建或运行 test target。'

@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, requireGraph as demand } from './source-graph.mjs';
+import { contractPublicAssets, validateUpstreamReadback } from './upstream-release.mjs';
 import { ADAPTER_FILES, consumeRelease, loadReleaseContract, portableCanonical,
-  regularPath, RELEASE_TARGETS, verifyPackagedRelease } from './release-consumer.mjs';
+  regularPath, releaseRepositoryId, RELEASE_TARGETS, verifyPackagedRelease } from './release-consumer.mjs';
 
 const HOSTS = { linux: ['linux', 'x64'], win: ['win32', 'x64'],
   'mac-x64': ['darwin', 'x64'], 'mac-arm64': ['darwin', 'arm64'] };
@@ -49,11 +50,12 @@ export function verifyNativeReleaseGate(gate, contract, selection, expectedAdapt
     && gate.readback.contractSha256 === selection.contractSha256, 'Native readback contract differs');
   same(receipt.publicReadback, gate.readback.before, 'Native readback snapshot differs');
   const snapshot = receipt.publicReadback;
-  demand(snapshot.repositoryId === 1407705262 && snapshot.releaseId === contract.releaseId
+  validateUpstreamReadback(snapshot, contract);
+  demand(snapshot.repositoryId === releaseRepositoryId(contract) && snapshot.releaseId === contract.releaseId
     && snapshot.tag === contract.tagObject && snapshot.sourceCommit === contract.sourceCommit
     && snapshot.sourceTree === contract.sourceTree, 'Native public source identity differs');
   same(snapshot.assets.map(({ name, id, bytes, url }) => ({ name, id, bytes, url })),
-    [contract.assetIndex, ...Object.values(contract.platforms).map((row) => row.releaseAsset)]
+    contractPublicAssets(contract)
       .map((pin) => ({ name: pin.name, id: pin.assetId, bytes: pin.bytes, url: pin.url })), 'Native public asset inventory differs');
   demand(gate.indexSha256 === contract.assetIndex.sha256
     && gate.inspection === 'download-extract-buildinfo-buildid-cronet-native-signature'
@@ -95,7 +97,7 @@ async function main() {
     const facts = { schema: 'polaris-app-native-release-gate-v1', candidate: values.candidate, context,
       contractSha256: manifest.desktopRelease.contractSha256, platform: key, host: process.platform, arch: process.arch,
       receipt: receipts[key], readback: parse(join(root, 'resources/.release-receipts/public-readback.json')),
-      indexSha256: digest(readFileSync(join(root, 'resources/.release-receipts/polaris-box-assets.json'))),
+      indexSha256: digest(readFileSync(join(root, 'resources/.release-receipts', contract.assetIndex.name))),
       inspection: 'download-extract-buildinfo-buildid-cronet-native-signature',
       actualAppAcceptance: 'pending load, gvisor/mixed, feature and final carrier' };
     const gate = { ...facts, fingerprint: digest(portableCanonical(facts)) };

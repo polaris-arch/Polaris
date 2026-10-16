@@ -7,6 +7,11 @@ struct LifecycleTests {
         assert(tlsCapabilityImageMatches(executable.path, executable: executable))
         assert(!tlsCapabilityImageMatches("/other/PacketTunnel", executable: executable))
         assert(!tlsCapabilityImageMatches("/app/Frameworks/Other.framework/Other", executable: executable))
+
+        try directoryRetirementCases()
+        try reloadCustodyCases()
+        managedBootstrapCases()
+        try ordinaryStopDispatchCases()
         let identity = TunnelIdentity(sessionID: "session-a", requestID: "start-a", configDigest: "digest-a")
         let lifecycle = TunnelLifecycle()
         let start = try lifecycle.start(identity)
@@ -389,4 +394,437 @@ struct LifecycleTests {
         assert(attempted.noStoreTerminal() == nil)
         print("iOS TS Store retirement seam cases passed: deferred original Stop, full two-run census, exact nonce/generation, canonical paths, active Unknown, old-file exclusion, actual non-submission intent")
     }
+    static func directoryRetirementCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let identity = TunnelIdentity(sessionID: "directory-session", requestID: "directory-start", configDigest: digest)
+        let profile: [String: Any] = ["sessionID": identity.sessionID, "requestID": identity.requestID, "configDigest": digest]
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/managed/ts-a", "directoryIdentity": "unix:1:2:1:3",
+            "incarnation": String(repeating: "c", count: 32), "directoryEpoch": String(repeating: "e", count: 32), "writerState": "Unknown", "censusVersion": 1, "failure": ""]
+        func export(_ nodes: [[String: Any]], terminal: String = "Unknown") throws -> String {
+            let value: [String: Any] = ["contractVersion": "polaris-ts-directory-retirement-v1", "globalCleanupEvidence": "CleanupUnknown",
+                "instances": [["runNonce": String(repeating: "b", count: 64), "configDigest": digest,
+                "terminal": terminal, "censusComplete": true, "nodes": nodes]]]
+            return String(data: try JSONSerialization.data(withJSONObject: value), encoding: .utf8)!
+        }
+        let original = try export([node])
+        var drained = node; drained["writerState"] = "SealedDrained"
+        let terminal = try export([drained], terminal: "SealedDrained")
+        let lifecycle = TunnelLifecycle()
+        let generation = try lifecycle.start(identity)
+        lifecycle.retainTailscaleDirectoryScope(original, identity: identity)
+        assert(lifecycle.complete(generation, phase: "running", stopped: false))
+        var response: TunnelObservation?
+        assert(lifecycle.prepareStop(identity: identity, requestID: "stop-a", nonce: "nonce-a",
+            expectedGeneration: generation, observation: { response = $0 }))
+        // Admission cannot replace the frozen census between prepareStop and stop.
+        lifecycle.retainTailscaleDirectoryScope("late-live", identity: identity)
+        let stopping = lifecycle.stop()!
+        lifecycle.retainTailscaleDirectoryScope(terminal, identity: identity, terminal: true)
+        lifecycle.retainTailscaleDirectoryScope("late-close", identity: identity, terminal: true)
+        assert(lifecycle.complete(stopping, phase: "stopped", stopped: true))
+        let observation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(response!)) as! [String: Any]
+        func evidence(_ observed: [String: Any], nonce: String = "nonce-a") -> [String: Any]? {
+            vpnDirectoryRetirementEvidence(profileIdentity: profile, expectedIdentity: profile,
+                observation: observed, nonce: nonce, stopRequestID: "stop-a", expectedGeneration: generation)
+        }
+        assert(evidence(observation)?["tailscaleDirectoryRetirement"] != nil)
+        assert(evidence(observation)?["tailscaleStoreRetirement"] == nil)
+        assert(evidence(observation, nonce: "replay") == nil)
+        let report = observation["report"] as! [String: Any]
+        assert(report["stopOriginalDirectoryScope"] as? String == original)
+        assert(report["tailscaleDirectoryScope"] as? String == terminal)
+        assert(vpnSessionEvidence(profileIdentity: profile, report: report)["tailscaleDirectoryRetirement"] == nil)
+        for (field, replacement) in [("incarnation", String(repeating: "d", count: 32)),
+                                     ("directoryIdentity", "unix:1:2:1:4"), ("directoryEpoch", String(repeating: "f", count: 32)),
+                                     ("writerState", "Unknown"), ("failure", "timeout")] {
+            var changed = drained; changed[field] = replacement
+            var badReport = report; badReport["tailscaleDirectoryScope"] = try export([changed], terminal: "SealedDrained")
+            var bad = observation; bad["report"] = badReport
+            assert(evidence(bad) == nil)
+        }
+        for field in ["stopOriginalDirectoryScope", "tailscaleDirectoryScope"] {
+            var badReport = report; badReport.removeValue(forKey: field)
+            var bad = observation; bad["report"] = badReport
+            assert(evidence(bad) == nil)
+        }
+        var badReport = report; badReport["lifecycle"] = "uncertain"
+        var bad = observation; bad["report"] = badReport
+        assert(evidence(bad) == nil)
+        var missingEpoch = drained; missingEpoch.removeValue(forKey: "directoryEpoch")
+        let missingEpochExport = try export([missingEpoch], terminal: "SealedDrained")
+        assert(vpnTailscaleDirectoryExport(raw: missingEpochExport, configDigest: digest, terminal: true) == nil)
+        var multiObservation = observation
+        var multiReport = report
+        for key in ["stopOriginalDirectoryScope", "tailscaleDirectoryScope"] {
+            var value = try JSONSerialization.jsonObject(with: Data((report[key] as! String).utf8)) as! [String: Any]
+            var runs = value["instances"] as! [[String: Any]]
+            var old = runs[0]; old["runNonce"] = String(repeating: "f", count: 64)
+            old["configDigest"] = String(repeating: "d", count: 64)
+            runs.insert(old, at: 0); value["instances"] = runs
+            multiReport[key] = String(data: try JSONSerialization.data(withJSONObject: value), encoding: .utf8)!
+        }
+        multiObservation["report"] = multiReport
+        assert(evidence(multiObservation) != nil)
+        let unknown = TunnelLifecycle()
+        let first = try unknown.start(identity)
+        unknown.retainTailscaleDirectoryScope(original, identity: identity)
+        assert(unknown.complete(first, phase: "running", stopped: false))
+        assert(unknown.prepareStop(identity: identity, requestID: "stop-b", nonce: "nonce-b", observation: { _ in }))
+        let final = unknown.stop()!
+        unknown.retainTailscaleDirectoryScope(original, identity: identity, terminal: true)
+        unknown.retainTailscaleDirectoryScope(terminal, identity: identity, terminal: true)
+        assert(unknown.complete(final, phase: "stopped", stopped: true))
+        assert(unknown.report().tailscaleDirectoryScope == original)
+    }
+
+    static func reloadCustodyCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let profile: [String: Any] = ["sessionID": "reload-session", "requestID": "reload-start", "configDigest": digest]
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/managed/ts-a", "stateFile": "/managed/ts-a/tailscaled.state",
+            "writerState": "Unknown", "stateFileState": "Unknown", "stateFileRevision": "", "profileState": "Unknown", "profileFingerprint": ""]
+        let current: [String: Any] = ["runNonce": String(repeating: "b", count: 64), "configDigest": digest,
+            "terminal": "Unknown", "censusComplete": false, "nodes": [node]]
+        var historical = current
+        historical["runNonce"] = String(repeating: "c", count: 64)
+        historical["configDigest"] = String(repeating: "d", count: 64)
+        var oldNode = node; oldNode["writerState"] = "SealedDrained"
+        historical["nodes"] = [oldNode]; historical["terminal"] = "SealedDrained"; historical["censusComplete"] = true
+        let export: [String: Any] = ["contractVersion": "polaris-ts-auth-writer-retirement-v1",
+            "globalCleanupEvidence": "CleanupUnknown", "instances": [historical, current]]
+        let raw = String(data: try JSONSerialization.data(withJSONObject: export), encoding: .utf8)!
+        var report: [String: Any] = ["identity": profile, "generation": 2, "lifecycle": "running",
+            "runtimeStopped": false, "cleanupEvidence": "CleanupUnknown", "tailscaleStoreScope": raw]
+        var observation: [String: Any] = ["observationNonce": "reload-nonce", "report": report]
+        // Existing strict observation still rejects stale generation. Only the
+        // dedicated reload adapter may pass a candidate to Rust custody checks.
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce", expectedGeneration: 1) == nil)
+        let fresh = vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce")
+        assert(fresh?["tailscaleStoreScope"] != nil)
+        assert(fresh?["tailscaleStoreRetirement"] == nil)
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "replayed") == nil)
+        var wrong = profile; wrong["sessionID"] = "another-owner"
+        report["identity"] = wrong; observation["report"] = report
+        assert(vpnLiveEvidence(profileIdentity: profile, expectedIdentity: profile,
+            observation: observation, nonce: "reload-nonce") == nil)
+    }
+
+    // Inert managers and a bounded virtual clock drive the production-used
+    // dispatch seam. No NE, provider IPC, Go worker or real timer is executed.
+    private final class StopManager {
+        let identity: [String: Any]
+        var stops = 0
+        init(_ identity: [String: Any]) { self.identity = identity }
+    }
+    private final class StopClock {
+        private(set) var now: TimeInterval = 0
+        private(set) var delays = [TimeInterval]()
+        private var jobs = [(TimeInterval, () -> Void)]()
+        func schedule(_ delay: TimeInterval, _ action: @escaping () -> Void) {
+            delays.append(delay); jobs.append((now + delay, action))
+        }
+        func advance(to target: TimeInterval) {
+            assert(target >= now)
+            var executed = 0
+            while let index = jobs.indices.min(by: { jobs[$0].0 < jobs[$1].0 }), jobs[index].0 <= target {
+                let job = jobs.remove(at: index)
+                now = job.0; executed += 1; assert(executed <= 8)
+                job.1()
+            }
+            now = target
+        }
+    }
+    private final class StopDispatchFixture {
+        let original: StopManager
+        var selected: StopManager
+        let clock = StopClock()
+        var current = true
+        var automaticReload = true
+        var observationThrows = false
+        var awaitingObservation = true
+        var observation: [String: Any]?
+        var observationPublications = 0
+        var reloads = 0
+        var failures = 0
+        var callback: ((Data?) -> Void)?
+        var reloadCallbacks = [(Result<StopManager, Error>) -> Void]()
+        var lifecycle: TunnelLifecycle?
+        var workerStopToken: UInt64?
+        init(_ identity: [String: Any]) {
+            let original = StopManager(identity)
+            self.original = original; selected = original
+        }
+        func begin() {
+            vpnPrepareOrdinaryStop(expected: original.identity, nonce: "dispatch-nonce",
+                stopRequestID: "dispatch-stop", expectedGeneration: 1,
+                isCurrent: { self.current },
+                schedule: { self.clock.schedule($0, $1) },
+                observe: { reply in
+                    if self.observationThrows { throw NSError(domain: "inert-observation", code: 1) }
+                    self.callback = reply
+                    if let lifecycle = self.lifecycle {
+                        let identity = TunnelIdentity(sessionID: self.original.identity["sessionID"] as! String,
+                            requestID: self.original.identity["requestID"] as! String, configDigest: self.original.identity["configDigest"] as! String)
+                        assert(lifecycle.prepareStop(identity: identity, requestID: "dispatch-stop", nonce: "dispatch-nonce",
+                            expectedGeneration: 1, observation: { reply(try? JSONEncoder().encode($0)) }))
+                    }
+                },
+                reload: { reply in
+                    self.reloads += 1; self.reloadCallbacks.append(reply)
+                    if self.automaticReload { reply(.success(self.selected)) }
+                },
+                identity: { $0.identity },
+                retainObservation: {
+                    self.observation = $0; self.observationPublications += 1; self.awaitingObservation = false
+                },
+                dispatch: {
+                    $0.stops += 1
+                    if let lifecycle = self.lifecycle { self.workerStopToken = lifecycle.stop() }
+                },
+                failure: { _ in self.failures += 1 })
+        }
+        func assertNoScopedProof() {
+            let observed = observation ?? [:]
+            assert(vpnRetirementEvidence(profileIdentity: original.identity, expectedIdentity: original.identity,
+                observation: observed, nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) == nil)
+            assert(vpnDirectoryRetirementEvidence(profileIdentity: original.identity, expectedIdentity: original.identity,
+                observation: observed, nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) == nil)
+        }
+    }
+
+    static func ordinaryStopDispatchCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let original: [String: Any] = ["sessionID": "a", "requestID": "start-a", "configDigest": digest]
+        var successor = original; successor["sessionID"] = "successor"
+        func raw(_ value: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: value) }
+        func text(_ value: [String: Any]) throws -> String { String(data: try raw(value), encoding: .utf8)! }
+        let run = String(repeating: "b", count: 64)
+        let store: [String: Any] = ["contractVersion": "polaris-ts-auth-writer-retirement-v1",
+            "globalCleanupEvidence": "CleanupUnknown", "instances": [["runNonce": run, "configDigest": digest,
+            "terminal": "NoStoreConstruction", "censusComplete": true, "nodes": [[String: Any]]()]]]
+        let node: [String: Any] = ["tag": "ts-a", "stateDirectory": "/managed/ts-a", "directoryIdentity": "unix:1:2:1:3",
+            "incarnation": String(repeating: "c", count: 32), "directoryEpoch": String(repeating: "e", count: 32),
+            "writerState": "Unknown", "censusVersion": 1, "failure": ""]
+        func directory(_ terminal: Bool) throws -> String {
+            var scopedNode = node
+            scopedNode["writerState"] = terminal ? "SealedDrained" : "Unknown"
+            return try text(["contractVersion": "polaris-ts-directory-retirement-v1", "globalCleanupEvidence": "CleanupUnknown",
+                "instances": [["runNonce": run, "configDigest": digest, "terminal": terminal ? "SealedDrained" : "Unknown",
+                "censusComplete": true, "nodes": [scopedNode]]]])
+        }
+        let terminalReport: [String: Any] = ["identity": original, "operationRequestID": "dispatch-stop",
+            "lifecycle": "stopped", "runtimeStopped": true, "cleanupEvidence": "CleanupUnknown",
+            "stopSourceGeneration": 1, "generation": 2, "tailscaleStoreScope": try text(store),
+            "stopOriginalDirectoryScope": try directory(false), "tailscaleDirectoryScope": try directory(true)]
+        let valid: [String: Any] = ["observationNonce": "dispatch-nonce", "report": terminalReport]
+        let validBytes = try raw(valid)
+
+        // No provider reply before the fallback: Stop is dispatched once, but
+        // the original terminal-response channel remains open while active.
+        let timeout = StopDispatchFixture(original); timeout.begin()
+        assert(timeout.clock.delays == [2])
+        timeout.clock.advance(to: 1.999)
+        assert(timeout.original.stops == 0 && timeout.reloads == 0 && timeout.awaitingObservation)
+        timeout.clock.advance(to: 2)
+        assert(timeout.original.stops == 1 && timeout.reloads == 1 && timeout.failures == 0)
+        assert(timeout.awaitingObservation && timeout.observation == nil && timeout.observationPublications == 0)
+        timeout.assertNoScopedProof()
+        timeout.callback?(validBytes)
+        let terminal = timeout.observation!
+        assert(vpnRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: terminal,
+            nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) != nil)
+        assert(vpnDirectoryRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: terminal,
+            nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) != nil)
+        timeout.callback?(validBytes); timeout.callback?(nil); timeout.clock.advance(to: 4)
+        assert(timeout.original.stops == 1 && timeout.reloads == 2 && timeout.observationPublications == 1)
+        assert(!timeout.awaitingObservation)
+
+        // Real protocol ordering through the existing production lifecycle:
+        // prepareStop registers its callback without ACK; fallback submits NE
+        // Stop; the normal worker then publishes exports and completes Stop.
+        let lifecycle = TunnelLifecycle()
+        let boundIdentity = TunnelIdentity(sessionID: "a", requestID: "start-a", configDigest: digest)
+        let generation = try lifecycle.start(boundIdentity)
+        assert(generation == 1)
+        lifecycle.retainTailscaleStoreScope(try text(store), identity: boundIdentity)
+        lifecycle.retainTailscaleDirectoryScope(try directory(false), identity: boundIdentity)
+        assert(lifecycle.complete(generation, phase: "running", stopped: false))
+        let worker = StopDispatchFixture(original); worker.lifecycle = lifecycle; worker.begin()
+        assert(worker.callback != nil && worker.observation == nil && worker.workerStopToken == nil)
+        worker.clock.advance(to: 2)
+        assert(worker.original.stops == 1 && worker.workerStopToken != nil && worker.awaitingObservation)
+        assert(worker.observationPublications == 0)
+        lifecycle.retainTailscaleStoreScope(try text(store), identity: boundIdentity)
+        lifecycle.retainTailscaleDirectoryScope(try directory(true), identity: boundIdentity, terminal: true)
+        assert(lifecycle.complete(worker.workerStopToken!, phase: "stopped", stopped: true))
+        let completed = worker.observation!
+        assert(vpnRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: completed,
+            nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: generation) != nil)
+        assert(vpnDirectoryRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: completed,
+            nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: generation) != nil)
+        worker.callback?(validBytes); worker.callback?(nil); worker.clock.advance(to: 4)
+        assert(worker.original.stops == 1 && worker.reloads == 2 && worker.observationPublications == 1 && !worker.awaitingObservation)
+
+        // An ended/expired host operation rejects even a valid original reply.
+        // The actual plugin's existing 25-second deadline closes isCurrent.
+        let ended = StopDispatchFixture(original); ended.begin(); ended.clock.advance(to: 2)
+        ended.current = false; ended.callback?(validBytes)
+        assert(ended.original.stops == 1 && ended.reloads == 1 && ended.observation == nil)
+        ended.assertNoScopedProof()
+
+        var wrongNonce = valid; wrongNonce["observationNonce"] = "old-nonce"
+        var wrongOwnerReport = terminalReport; wrongOwnerReport["identity"] = successor
+        var reloadReport = terminalReport; reloadReport["lifecycle"] = "reloadAccepted"; reloadReport["runtimeStopped"] = false
+        var failedReport = terminalReport; failedReport["cleanupError"] = "Close failed"
+        var incompleteReport = terminalReport; incompleteReport["tailscaleDirectoryScope"] = "{}"; incompleteReport["tailscaleStoreScope"] = "{}"
+        var wrongRequest = terminalReport; wrongRequest["operationRequestID"] = "old-stop"
+        var wrongTransition = terminalReport; wrongTransition["generation"] = 3
+        var wrongSource = terminalReport; wrongSource["stopSourceGeneration"] = 2; wrongSource["generation"] = 3
+        // Invalid/non-terminal input does not consume the original terminal
+        // slot. A matching terminal with error/Unknown remains write-once and
+        // cannot be rewritten into a success by a later duplicate.
+        let invalidReplies: [(Data, Bool)] = [(Data("not JSON".utf8), true), (try raw(wrongNonce), true),
+            (try raw(["observationNonce": "dispatch-nonce"]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": wrongOwnerReport]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": reloadReport]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": wrongRequest]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": wrongTransition]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": wrongSource]), true),
+            (try raw(["observationNonce": "dispatch-nonce", "report": failedReport]), false),
+            (try raw(["observationNonce": "dispatch-nonce", "report": incompleteReport]), false)]
+        for (reply, mayAcceptOriginalTerminal) in invalidReplies {
+            let fixture = StopDispatchFixture(original); fixture.begin(); fixture.callback?(reply)
+            assert(fixture.original.stops == 1 && fixture.failures == 0)
+            fixture.assertNoScopedProof()
+            fixture.callback?(validBytes); fixture.clock.advance(to: 3)
+            assert(fixture.original.stops == 1 && fixture.reloads == 2)
+            if mayAcceptOriginalTerminal {
+                assert(fixture.observationPublications == 2)
+                assert(vpnRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: fixture.observation!,
+                    nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) != nil)
+                assert(vpnDirectoryRetirementEvidence(profileIdentity: original, expectedIdentity: original, observation: fixture.observation!,
+                    nonce: "dispatch-nonce", stopRequestID: "dispatch-stop", expectedGeneration: 1) != nil)
+            } else {
+                assert(fixture.observationPublications == 1)
+                fixture.assertNoScopedProof()
+            }
+        }
+
+        // Re-loading the manager is mandatory even for timeout/valid evidence.
+        // A successor is never stopped using the predecessor's dispatch state.
+        var changedStart = original; changedStart["requestID"] = "start-b"
+        var changedDigest = original; changedDigest["configDigest"] = String(repeating: "b", count: 64)
+        for changedOwner in [successor, changedStart, changedDigest] {
+            for replyFirst in [false, true] {
+                let replaced = StopDispatchFixture(original); replaced.begin(); replaced.selected = StopManager(changedOwner)
+                if replyFirst { replaced.callback?(validBytes) } else { replaced.clock.advance(to: 2) }
+                assert(replaced.original.stops == 0 && replaced.selected.stops == 0 && replaced.failures == 1)
+                replaced.callback?(validBytes); replaced.clock.advance(to: 3)
+                assert(replaced.reloads == 1 && replaced.failures == 1)
+            }
+        }
+        let pendingReload = StopDispatchFixture(original); pendingReload.automaticReload = false; pendingReload.begin()
+        pendingReload.clock.advance(to: 2); pendingReload.selected = StopManager(successor)
+        pendingReload.reloadCallbacks[0](.success(pendingReload.selected))
+        assert(pendingReload.original.stops == 0 && pendingReload.selected.stops == 0 && pendingReload.failures == 1)
+        let superseded = StopDispatchFixture(original); superseded.automaticReload = false; superseded.begin()
+        superseded.clock.advance(to: 2); superseded.current = false
+        superseded.reloadCallbacks[0](.success(superseded.original)); superseded.callback?(validBytes)
+        assert(superseded.original.stops == 0 && superseded.failures == 0); superseded.assertNoScopedProof()
+        // A manager successor after fallback also blocks terminal publication.
+        let changedAfterDispatch = StopDispatchFixture(original); changedAfterDispatch.begin()
+        changedAfterDispatch.clock.advance(to: 2); changedAfterDispatch.selected = StopManager(successor)
+        changedAfterDispatch.callback?(validBytes)
+        assert(changedAfterDispatch.original.stops == 1 && changedAfterDispatch.selected.stops == 0)
+        assert(changedAfterDispatch.failures == 1 && changedAfterDispatch.observationPublications == 0)
+        changedAfterDispatch.assertNoScopedProof()
+        changedAfterDispatch.selected = changedAfterDispatch.original; changedAfterDispatch.callback?(validBytes)
+        assert(changedAfterDispatch.observationPublications == 0 && changedAfterDispatch.reloads == 2)
+        let duplicateReload = StopDispatchFixture(original); duplicateReload.automaticReload = false; duplicateReload.begin()
+        duplicateReload.clock.advance(to: 2)
+        duplicateReload.reloadCallbacks[0](.success(duplicateReload.original))
+        duplicateReload.reloadCallbacks[0](.success(duplicateReload.original))
+        assert(duplicateReload.original.stops == 1)
+        duplicateReload.callback?(validBytes); duplicateReload.callback?(validBytes)
+        assert(duplicateReload.reloadCallbacks.count == 2)
+        duplicateReload.reloadCallbacks[1](.success(duplicateReload.original))
+        duplicateReload.reloadCallbacks[1](.success(duplicateReload.original))
+        duplicateReload.reloadCallbacks[1](.success(StopManager(successor)))
+        duplicateReload.clock.advance(to: 3)
+        assert(duplicateReload.original.stops == 1 && duplicateReload.failures == 0 && duplicateReload.reloads == 2)
+        assert(duplicateReload.observationPublications == 1)
+        let endedWhileReading = StopDispatchFixture(original); endedWhileReading.automaticReload = false; endedWhileReading.begin()
+        endedWhileReading.clock.advance(to: 2); endedWhileReading.reloadCallbacks[0](.success(endedWhileReading.original))
+        endedWhileReading.callback?(validBytes); endedWhileReading.current = false
+        endedWhileReading.reloadCallbacks[1](.success(endedWhileReading.original))
+        assert(endedWhileReading.original.stops == 1 && endedWhileReading.observationPublications == 0)
+        endedWhileReading.assertNoScopedProof()
+        let observationFailure = StopDispatchFixture(original); observationFailure.observationThrows = true; observationFailure.begin()
+        observationFailure.clock.advance(to: 3)
+        assert(observationFailure.original.stops == 1 && observationFailure.reloads == 1)
+        observationFailure.assertNoScopedProof()
+        let missingIdentity = StopDispatchFixture([:]); missingIdentity.begin(); missingIdentity.clock.advance(to: 2)
+        assert(missingIdentity.original.stops == 0 && missingIdentity.failures == 1)
+        let reloadFailure = StopDispatchFixture(original); reloadFailure.automaticReload = false; reloadFailure.begin()
+        reloadFailure.clock.advance(to: 2)
+        reloadFailure.reloadCallbacks[0](.failure(NSError(domain: "inert-reload", code: 1)))
+        reloadFailure.reloadCallbacks[0](.success(reloadFailure.original))
+        assert(reloadFailure.original.stops == 0 && reloadFailure.failures == 1)
+        reloadFailure.assertNoScopedProof()
+    }
+
+    // Validator/options coverage only; does not execute provider startup or IPC.
+    static func managedBootstrapCases() {
+        let identity: [String: Any] = ["sessionID": "s", "requestID": "r", "configDigest": String(repeating: "a", count: 64)]
+        let source = String(repeating: "b", count: 40)
+        let capability: [String: Any] = ["contractVersion": "polaris-ts-directory-capability-v1",
+            "sourceABI": "polaris-g4-directory-v1", "sourceIdentity": source,
+            "managedRoot": "/group/polaris/tailscale-g4-v1", "logicalRoot": "/group/polaris/tailscale",
+            "ownerNonce": String(repeating: "c", count: 32), "participating": true]
+        let observation: [String: Any] = ["contractVersion": "polaris-ios-g4-bootstrap-v1", "identity": identity,
+            "extensionGeneration": 1, "observationNonce": "fresh", "capability": capability]
+        func proof(_ candidate: [String: Any], nonce: String = "fresh") -> [String: Any]? {
+            vpnManagedBootstrapCapability(observation: candidate, expectedIdentity: identity,
+                nonce: nonce, expectedSource: source, root: "/group/polaris")
+        }
+        assert(proof(observation) != nil)
+        // Both actual root resolvers return resolved URLs before exporting paths.
+        // This source-only seam checks the resulting exact-root handshake: an
+        // alias spelling cannot substitute for the canonical root even if the
+        // OS would resolve both to the same inode. No state is created/moved here.
+        let canonicalRoot = URL(fileURLWithPath: "/private/var/group/polaris", isDirectory: true).resolvingSymlinksInPath().path
+        var canonicalCapability = capability
+        canonicalCapability["managedRoot"] = canonicalRoot + "/tailscale-g4-v1"
+        canonicalCapability["logicalRoot"] = canonicalRoot + "/tailscale"
+        var canonicalObservation = observation; canonicalObservation["capability"] = canonicalCapability
+        assert(vpnManagedBootstrapCapability(observation: canonicalObservation, expectedIdentity: identity,
+            nonce: "fresh", expectedSource: source, root: canonicalRoot) != nil)
+        assert(vpnManagedBootstrapCapability(observation: canonicalObservation, expectedIdentity: identity,
+            nonce: "fresh", expectedSource: source, root: canonicalRoot + "/.") == nil)
+        assert(proof(observation, nonce: "old") == nil)
+        var zeroGeneration = observation; zeroGeneration["extensionGeneration"] = 0
+        assert(proof(zeroGeneration) == nil)
+        var missingCapability = observation; missingCapability.removeValue(forKey: "capability")
+        assert(proof(missingCapability) == nil)
+        for (field, replacement) in [("sourceABI", "legacy"), ("sourceIdentity", String(repeating: "d", count: 40)),
+                                     ("ownerNonce", ""), ("managedRoot", "/other/tailscale-g4-v1"),
+                                     ("logicalRoot", "/other/tailscale")] {
+            var bad = observation; var inner = capability; inner[field] = replacement; bad["capability"] = inner
+            assert(proof(bad) == nil)
+        }
+        var bad = observation; var inner = capability; inner["participating"] = false; bad["capability"] = inner
+        assert(proof(bad) == nil)
+        bad = observation; var wrongOwner = identity; wrongOwner["sessionID"] = "other"; bad["identity"] = wrongOwner
+        assert(proof(bad) == nil)
+        let managed = vpnStartOptions(sessionID: "s", requestID: "r", config: "secret target config", managed: true)
+        assert(managed["configContent"] == nil)
+        assert(managed.count == 3)
+        assert(managed["directoryBootstrapVersion"] as? String == "polaris-ios-g4-bootstrap-v1")
+        let legacy = vpnStartOptions(sessionID: "s", requestID: "r", config: "legacy config", managed: false)
+        assert(legacy["configContent"] as? String == "legacy config")
+        assert(legacy["directoryBootstrapVersion"] == nil)
+    }
+
 }

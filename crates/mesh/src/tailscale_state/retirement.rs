@@ -95,6 +95,17 @@ impl TailscaleStoreExport {
         self.validate_binding(terminal, |instance| instance.config_digest == digest)
     }
 
+    /// Validate reload history grammar; authority still requires independently
+    /// captured owner custody and exact run-by-run comparison at consumption.
+    pub fn validate_history(&self, digest: &str, terminal: bool) -> Result<(), String> {
+        if !hex64(digest) || !self.instances.iter().any(|run| run.config_digest == digest) {
+            return Err(
+                "CleanupUnknown: Current config anchor absent from original history".into(),
+            );
+        }
+        self.validate_binding(terminal, |instance| hex64(&instance.config_digest))
+    }
+
     /// Validate the whole export against independently captured same-host run
     /// metadata. Callers retain the provenance and authority of those captures.
     pub fn validate_observed_runs(
@@ -221,3 +232,6 @@ impl TailscaleStoreExport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

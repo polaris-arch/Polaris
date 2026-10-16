@@ -1819,6 +1819,7 @@ impl ProxyRuntime {
                                 ),
                                 main_token: main_claim_token.clone(),
                                 ready: None,
+                                stop_target: None,
                                 stopped: None,
                             });
                             Ok(start)
@@ -1835,8 +1836,26 @@ impl ProxyRuntime {
                     // Original native request, full main token/config and callback cell
                     // are retained before the single native dispatcher can submit.
                     main_reservation.arm_external_start();
-                    match tauri_plugin_polaris_ios::start_prepared(&start).await {
+                    match async {
+                        let ready =
+                            tauri_plugin_polaris_ios::start_managed_prepared(&start).await?;
+                        // Reload can complete between Ready and host publication.
+                        // Keep the same original start while capturing its full history.
+                        tauri_plugin_polaris_ios::refresh_ready_session(&ready).await
+                    }
+                    .await
+                    {
                         Ok(receipt) => {
+                            if let Some(token) = &main_claim_token {
+                                self.mesh
+                                    .bind_tailscale_main_actual_scope(
+                                        token,
+                                        ts_gate,
+                                        receipt.config_digest(),
+                                        receipt.original_instances(),
+                                    )
+                                    .map_err(StartError::from)?;
+                            }
                             self.gate.with_current_generation(my_gen, |_live| {
                                 if let Ok(mut ready) = self.ios_ready_session.write() {
                                     if let Some(owner) = ready
@@ -3767,6 +3786,10 @@ impl ProxyRuntime {
             }
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
+            // The iOS managed Start keeps logical bytes in memory until the
+            // fresh original provider proves its bundled source/owner capability.
+            // No runtime-config file is exposed to an older shared-profile reader.
+            #[cfg(not(target_os = "ios"))]
             std::fs::write(config_path, &json)
                 .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
 

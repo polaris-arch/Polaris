@@ -48,9 +48,15 @@ jobs:
           ref: ${{ inputs.candidate || github.sha }}
       - name: Reject a mismatched runner before installing tools or transporting inputs
         run: python3 -B scripts/mobile-core/ci_apple.py admit
+      - name: Select the validated mobile Go toolchain
+        id: mobile-go
+        run: |
+          set -euo pipefail
+          version="$(python3 -B scripts/mobile-core/fork_input.py --go-version)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.25.5'
+          go-version: ${{ steps.mobile-go.outputs.version }}
           cache: false
       - uses: actions/setup-node@v7
         with:
@@ -60,6 +66,18 @@ jobs:
           targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}
       - name: Exact tool/source and declared arm64 carrier configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
+      - name: Execute pure Swift lifecycle and G4 receipt seams
+        shell: bash
+        run: |
+          set -euo pipefail
+          # @main executable, not a SwiftPM test target. Keep assert enabled.
+          # Host-only predicates: no simulator, App launch, NE, or Go core run.
+          xcrun swiftc -Onone -parse-as-library \
+            src-tauri/gen/apple/PacketTunnel/TunnelLifecycle.swift \
+            crates/tauri-plugin-polaris-ios/ios/Sources/VpnEvidence.swift \
+            crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift \
+            -o "$RUNNER_TEMP/polaris-ios-lifecycle-tests"
+          "$RUNNER_TEMP/polaris-ios-lifecycle-tests"
       - name: Scoped frontend tool
         shell: bash
         run: |

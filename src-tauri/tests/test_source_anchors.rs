@@ -622,6 +622,8 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/native_inputs.py",
     "scripts/mobile-core/build_apple_app.py",
     "scripts/mobile-core/fork_input.py",
+    "scripts/mobile-core/source_policy.py",
+    "scripts/mobile-core/test_source_policy.py",
     "scripts/mobile-core/android_sdk.py",
     "scripts/mobile-core/test_inputs.py",
     "scripts/mobile-core/apple_admission.py",

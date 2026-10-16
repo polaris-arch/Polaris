@@ -108,6 +108,7 @@ function fixture(options = {}) {
       localReplacement: { module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '' } },
       consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\nRevision: ${commit}\n`, fixtureOnly: true };
     const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
+    if (options.coreMarker !== undefined) coreBytes[255] = options.coreMarker;
     const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
       [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
     const finalPackageCronetSmoke = { os: t.os, arch: t.arch, go: raw.goVersion, gvisorCompiled: true,
@@ -1350,4 +1351,50 @@ test('default native consumer captures codesign stderr/status without exposing t
     if (previous === undefined) delete process.env.POLARIS_RELEASE_API_TOKEN;
     else process.env.POLARIS_RELEASE_API_TOKEN = previous;
   }
+}));
+
+
+test('historical producer Go remains closed and cannot be relabeled as final-source policy', () => {
+  const { root, contract } = fixture();
+  try {
+    assert.equal(validateReleaseContract(contract), contract);
+    const wrongGo = structuredClone(contract);
+    wrongGo.platforms.linux.sourceFingerprint.goVersion = 'go1.27.2';
+    assert.throws(() => validateReleaseContract(wrongGo), /source facts|toolchain/);
+    const relabeled = structuredClone(contract);
+    relabeled.sourcePolicy = { sourceCommit: contract.sourceCommit, sourceTree: contract.sourceTree };
+    assert.throws(() => validateReleaseContract(relabeled), /Historical release/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Same tag/version is intentionally insufficient: actual contract, archived
+// bytes and acquisition receipts must change together. Native payloads are inert.
+test('same-version repack rejects old receipts and stamps before admitting new core bytes', async () => withFixture(async old => {
+  const next = fixture({ coreMarker: 7 });
+  try {
+    await consumeRelease(old.root, old.manifest, ['linux'], old);
+    const core = join(old.root, 'resources/linux/sing-box');
+    const previousBytes = readFileSync(core);
+    const stamp = JSON.stringify({ 'core:linux': old.contract.version, 'cronet:linux': old.contract.version });
+    write(join(old.root, 'resources/.fetch-stamp.json'), stamp);
+    assert.equal(next.contract.version, old.contract.version);
+    assert.equal(next.contract.tag, old.contract.tag);
+    assert.notEqual(next.contract.platforms.linux.core.sha256, old.contract.platforms.linux.core.sha256);
+    const contractBytes = readFileSync(join(next.root, next.manifest.desktopRelease.contractPath));
+    write(join(old.root, old.manifest.desktopRelease.contractPath), contractBytes);
+    assert.throws(() => verifyPackagedRelease(old.root, old.manifest, 'linux', core, old.run), /contract SHA/);
+    assert.throws(() => verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run), /consumption receipt/);
+    const before = resources(old);
+    const staleArchive = async (...args) => args[0] === next.contract.platforms.linux.releaseAsset.url
+      ? old.read(...args) : next.read(...args);
+    await assert.rejects(consumeRelease(old.root, next.manifest, ['linux'], { ...next, read: staleArchive }), /archive SHA/);
+    assert.deepEqual(resources(old), before, 'failed repack preserves all previous resources');
+    const receipts = await consumeRelease(old.root, next.manifest, ['linux'], next);
+    assert.equal(receipts.linux.contractSha256, next.manifest.desktopRelease.contractSha256);
+    assert.notDeepEqual(readFileSync(core), previousBytes);
+    assert.equal(digest(readFileSync(core)), next.contract.platforms.linux.core.sha256);
+    assert.equal(readFileSync(join(old.root, 'resources/.fetch-stamp.json'), 'utf8'), stamp,
+      'legacy version stamps are neither authority nor silently rewritten');
+    verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run);
+  } finally { rmSync(next.root, { recursive: true, force: true }); }
 }));

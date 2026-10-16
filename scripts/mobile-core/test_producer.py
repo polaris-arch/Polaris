@@ -279,6 +279,23 @@ class ProducerCalls(unittest.TestCase):
         self.assertEqual(json.dumps(receipt, sort_keys=True), frozen)
         self.assertEqual(producer.OBSERVATION_SLOTS, frozenset(('device-arm64', 'sim-arm64')))
 
+    def test_same_version_new_source_policy_or_tool_bytes_cannot_reuse_old_component(self):
+        from test_source_policy import future_mobile_fixture
+        value, _ = future_mobile_fixture()
+        original = self.android_projection_binding(); original['sourceContract'] = value
+        frozen = json.dumps(original, sort_keys=True)
+        for field in ('sourceCommit', 'sourceTree', 'metacubex-binding', 'go-tool-bytes'):
+            current = json.loads(frozen)
+            if field in ('sourceCommit', 'sourceTree'):
+                current['sourceContract'][field] = '0' * 40
+            elif field == 'metacubex-binding':
+                current['sourceContract']['sourcePolicy']['metacubex']['bindingSha256'] = '0' * 64
+            else:
+                current['tools']['compiler']['sha256'] = '0' * 64
+            self.assertEqual(current['sourceContract']['version'], original['sourceContract']['version'])
+            with self.subTest(field=field): self.assertFalse(producer.equivalent_binding(original, current))
+        self.assertEqual(json.dumps(original, sort_keys=True), frozen)
+
     def test_android_projection_requires_complete_pins_and_known_policy(self):
         binding = self.android_projection_binding()
         with self.assertRaisesRegex(RuntimeError, 'unknown Android build code policy'):
@@ -304,10 +321,11 @@ class ProducerCalls(unittest.TestCase):
         observed = producer.component_revalidation_observation(receipt, current, pin, True)
         self.assertEqual(observed['comparisonPolicy'], producer.ANDROID_BUILD_CODE_POLICY)
         self.assertEqual(observed['currentVerifier'], current['producer'])
-        self.assertEqual(len(observed['currentVerifier']['files']), 23)
+        self.assertEqual(len(observed['currentVerifier']['files']), 24)
         self.assertEqual(set(observed['currentVerifier']['files']), set(producer.PRODUCER_FILES))
         for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
-                       'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/apple_tls_fingerprint.py'):
+                       'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
+                       'scripts/mobile-core/source_policy.py'):
             self.assertEqual(observed['currentVerifier']['files'][helper], current['producer']['files'][helper])
         # The added inventory member is an actual pinned link helper, not a
         # dummy entry introduced merely to match the new file count.
@@ -322,6 +340,9 @@ class ProducerCalls(unittest.TestCase):
                 patch.object(consume, 'run', return_value='b'*40):
             actual_consumer = consume.app_identity()
         self.assertEqual(actual_consumer['consumerCode'][helper], actual_pin)
+        helper = 'scripts/mobile-core/source_policy.py'
+        self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
+        self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
         for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
             source = (producer.ROOT / project).read_text()
             for action in ('prepare', 'verify'):
@@ -467,6 +488,21 @@ class ProducerCalls(unittest.TestCase):
             self.assertGreater(len(set(capacities)), 1)
             self.assertTrue(all(go == cargo and go in ('1', '2') for go, cargo in bind_caps))
 
+    def test_generator_buildinfo_requires_actual_command_compiler_and_unreplaced_module(self):
+        from test_source_policy import future_mobile_fixture
+        value, _ = future_mobile_fixture()
+        for name in ('gomobile', 'gobind'):
+            raw = ('/tools/' + name + ': go1.27.2\n\tpath\tgithub.com/sagernet/gomobile/cmd/' + name +
+                   '\n\tmod\tgithub.com/sagernet/gomobile\tv0.1.13\th1:' + 'A' * 43 + '=\n')
+            producer.generator_buildinfo(raw, name, value)
+            for changed in (raw.replace('go1.27.2', 'go1.25.5'), raw.replace('/cmd/' + name, '/cmd/other'),
+                            raw.replace('v0.1.13', 'v0.1.12'), raw.replace('h1:', 'missing:'),
+                            raw + '\t=>\t./unreviewed\t(devel)\t\n',
+                            raw + '\tpath\tgithub.com/sagernet/gomobile/cmd/' + name + '\n',
+                            raw.replace('\tmod\t', '\tdep\t')):
+                with self.subTest(name=name, changed=changed), self.assertRaises(RuntimeError):
+                    producer.generator_buildinfo(changed, name, value)
+
     def test_tool_receipt_binds_actual_javac_resolution_version_and_binary(self):
         value = load()
         with tempfile.TemporaryDirectory() as temporary:
@@ -488,7 +524,10 @@ class ProducerCalls(unittest.TestCase):
                 if parts[0].endswith('/java'): return 'openjdk 17.0.13 fixture'
                 if parts[0].endswith('/javac'): return version[0]
                 if parts[1:] == ['version']: return 'go version go'+value['goVersion']+' linux/amd64'
-                if parts[1:3] == ['version', '-m']: return 'github.com/sagernet/gomobile '+value['gomobileVersion']+'\n'
+                if parts[1:3] == ['version', '-m']:
+                    name = Path(parts[-1]).name
+                    return (parts[-1] + ': go' + value['goVersion'] + '\n\tpath\tgithub.com/sagernet/gomobile/cmd/' + name +
+                            '\n\tmod\tgithub.com/sagernet/gomobile\t' + value[name + 'Version'] + '\th1:' + 'A' * 43 + '=\n')
                 return 'inert compiler version'
             with patch.object(producer, 'run', run):
                 _, facts = producer.tool_facts(args, value, {})
@@ -501,6 +540,35 @@ class ProducerCalls(unittest.TestCase):
                 selected[0] = str(root/'go')
                 with self.assertRaisesRegex(RuntimeError, 'resolution differs'):
                     producer.tool_facts(args, value, {})
+
+    def test_tool_receipt_refuses_changed_tool_bytes_during_observation(self):
+        value = load()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ('go', 'gomobile', 'gobind'):
+                (root / name).write_bytes(('inert ' + name).encode())
+            args = SimpleNamespace(platform='apple', go=root/'go', gomobile=root/'gomobile', gobind=root/'gobind')
+            def run(command, **_):
+                parts = [str(p) for p in command]
+                if parts[1:] == ['version']:
+                    (root / 'go').write_bytes(b'changed after Go observation')
+                    return 'go version go' + value['goVersion'] + ' darwin/arm64'
+                if parts[1:3] == ['version', '-m']:
+                    name = Path(parts[-1]).name
+                    return (parts[-1] + ': go' + value['goVersion'] + '\n\tpath\tgithub.com/sagernet/gomobile/cmd/' + name +
+                            '\n\tmod\tgithub.com/sagernet/gomobile\tv0.1.13\th1:' + 'A' * 43 + '=\n')
+                if parts == ['xcodebuild', '-version']:
+                    return 'Xcode ' + value['apple']['xcodeVersion'] + '\nBuild version ' + value['apple']['xcodeBuild']
+                if '--show-sdk-version' in parts:
+                    return value['apple']['iPhoneSDK' if 'iphoneos' in parts else 'simulatorSDK']
+                if '--show-sdk-path' in parts:
+                    return str(root)
+                if '--find' in parts:
+                    return str(root / 'go')
+                return 'inert compiler observation'
+            (root / 'SDKSettings.json').write_bytes(b'inert SDK settings')
+            with patch.object(producer, 'run', side_effect=run), self.assertRaisesRegex(RuntimeError, 'bytes changed'):
+                producer.tool_facts(args, value, {})
 
     def test_work_and_shared_cache_have_exclusive_generator_custody(self):
         with tempfile.TemporaryDirectory() as temporary:

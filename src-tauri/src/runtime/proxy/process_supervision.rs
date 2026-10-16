@@ -121,6 +121,7 @@ pub(super) fn verify_writer_census(
         return Err(unknown());
     }
     let mut owns_current = false;
+    let mut current_candidates = 0;
     for (nonce, (run, nodes)) in &before {
         let (terminal, terminal_nodes) = after.get(nonce).ok_or_else(unknown)?;
         if run.digest != terminal.digest
@@ -131,14 +132,15 @@ pub(super) fn verify_writer_census(
         {
             return Err(unknown());
         }
-        if run.digest == digest {
-            if nodes != &expected {
-                return Err(unknown());
-            }
-            owns_current = true;
+        // Historical runs keep their own exact scope. A logical profile can
+        // select P and later L without changing its digest; only the current
+        // nonterminal original run anchors the currently reserved main scope.
+        if run.digest == digest && !run.terminal {
+            current_candidates += 1;
+            owns_current = nodes == &expected;
         }
     }
-    if !owns_current {
+    if !owns_current || current_candidates != 1 {
         return Err(unknown());
     }
     Ok(())
@@ -764,10 +766,16 @@ impl ProxyRuntime {
                 .read()
                 .map_err(|_| "nativeRetirementUnknown")?
                 .clone();
-            let Some(owner) = owner else {
+            let Some(mut owner) = owner else {
                 // An ordinary Stop without the original birth cannot release a TS claim.
                 return tauri_plugin_polaris_ios::stop().await.map(|_| ());
             };
+            // A successfully consumed original Stop already retired this owner.
+            // Keep its exact target/receipt for journal retry; do not re-observe a
+            // stopped provider or manufacture a new terminal census.
+            if owner.main_token.is_none() && owner.stopped.is_some() {
+                return Ok(());
+            }
             if let super::IosMainOrigin::LocalStart(start) = &owner.origin {
                 if start
                     .no_store_terminal()
@@ -793,17 +801,78 @@ impl ProxyRuntime {
                     return Ok(());
                 }
             }
-            let stopped = match &owner.origin {
-                super::IosMainOrigin::Observed(observed) => {
-                    tauri_plugin_polaris_ios::stop_observed(observed).await?
-                }
-                super::IosMainOrigin::LocalStart(start) => match &owner.ready {
-                    Some(ready) => tauri_plugin_polaris_ios::stop_session(ready).await?,
-                    None => tauri_plugin_polaris_ios::stop_start(start).await?,
+            // Keep Stop-only custody across native dispatch failures. It never
+            // revives Ready. Fresh census is optional cleanup evidence: native
+            // falls back to the bound original owner when observation fails.
+            let original_owner = owner.clone();
+            let target = match &owner.stop_target {
+                Some(target) => Some((**target).clone()),
+                None => match &owner.origin {
+                    super::IosMainOrigin::Observed(observed) => {
+                        Some(tauri_plugin_polaris_ios::prepare_observed_stop(observed).await?)
+                    }
+                    super::IosMainOrigin::LocalStart(_) => match &owner.ready {
+                        Some(ready) => {
+                            Some(tauri_plugin_polaris_ios::prepare_ready_stop(ready).await?)
+                        }
+                        None => None,
+                    },
                 },
             };
+            owner.stop_target = target.map(|target| {
+                if let Some(token) = &owner.main_token {
+                    if target.cleanup_proof_eligible()
+                        && self
+                            .mesh
+                            .bind_tailscale_main_actual_scope(
+                                token,
+                                ts_gate,
+                                target.config_digest(),
+                                target.original_instances(),
+                            )
+                            .is_err()
+                    {
+                        return Arc::new(target.without_cleanup_proof());
+                    }
+                }
+                Arc::new(target)
+            });
+            {
+                let mut slot = self
+                    .ios_ready_session
+                    .write()
+                    .map_err(|_| "nativeRetirementUnknown")?;
+                let current = slot
+                    .as_mut()
+                    .filter(|current| current.same_origin(&original_owner))
+                    .ok_or("nativeRetirementUnknown")?;
+                *current = owner.clone();
+            }
+            let stopped = match owner.stop_target.as_ref() {
+                Some(target) => tauri_plugin_polaris_ios::stop_target(target).await?,
+                None => match &owner.origin {
+                    super::IosMainOrigin::LocalStart(start) => {
+                        tauri_plugin_polaris_ios::stop_start(start).await?
+                    }
+                    _ => return Err("nativeRetirementUnknown".into()),
+                },
+            };
+            // Ordinary Stop has been submitted, but uncertainty cannot release
+            // the registry claim, store a positive stopped receipt, or advance
+            // a deletion journal. Retain the target for a safe same-owner retry.
+            if owner
+                .stop_target
+                .as_ref()
+                .is_some_and(|target| !target.cleanup_proof_eligible())
+            {
+                return Err("nativeRetirementUnknown".into());
+            }
             match &owner.origin {
-                super::IosMainOrigin::Observed(observed) => {
+                super::IosMainOrigin::Observed(_) => {
+                    let observed = owner
+                        .stop_target
+                        .as_ref()
+                        .ok_or("nativeRetirementUnknown")?;
                     let receipt = stopped.retirement().ok_or("nativeRetirementUnknown")?;
                     if receipt.start_request_id() != observed.request_id()
                         || receipt.config_digest() != observed.config_digest()
@@ -813,10 +882,13 @@ impl ProxyRuntime {
                         return Err("nativeRetirementUnknown".into());
                     }
                     let original = native_writer_scopes(observed.original_instances());
-                    let current = original
+                    let mut anchors = original
                         .iter()
-                        .find(|run| run.digest == owner.config_digest)
-                        .ok_or("nativeRetirementUnknown")?;
+                        .filter(|run| run.digest == owner.config_digest && !run.terminal);
+                    let current = anchors.next().ok_or("nativeRetirementUnknown")?;
+                    if anchors.next().is_some() {
+                        return Err("nativeRetirementUnknown".into());
+                    }
                     let expected: Vec<_> = current
                         .nodes
                         .iter()
@@ -839,7 +911,7 @@ impl ProxyRuntime {
                         }
                         let expected = self.mesh.tailscale_main_scope_if_token(token, ts_gate)?;
                         let retired = native_writer_scopes(receipt.instances());
-                        if let Some(ready) = &owner.ready {
+                        if let Some(ready) = &owner.stop_target {
                             if receipt.session_id() != ready.session_id()
                                 || receipt.source_extension_generation()
                                     != ready.extension_generation()
@@ -2007,3 +2079,6 @@ impl ProxyRuntime {
         self.core_binary_for_start()
     }
 }
+
+#[cfg(test)]
+mod tests;

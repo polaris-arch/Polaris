@@ -193,7 +193,7 @@ function cronetCliFixture() {
   };
   cpSync(join(ROOT, 'scripts'), join(root, 'scripts'), { recursive: true });
   const source = { schema: 'polaris-desktop-fork-source-v1', role: 'desktop',
-    sourceURL: 'https://github.com/polaris-arch/polaris-box', sourceCommit: 'a'.repeat(40), sourceTree: 'b'.repeat(40),
+    sourceURL: 'https://github.com/polaris-arch/sing-box-polaris', sourceCommit: 'a'.repeat(40), sourceTree: 'b'.repeat(40),
     sourceTag: 'polaris-v2.0.0-alpha.11-1', sourceTagObject: 'c'.repeat(40), upstreamTag: 'v2.0.0-alpha.11',
     upstreamCommit: 'd'.repeat(40), goVersion: '1.25.5', patches: [], dependencyPatches: [] };
   write('scripts/desktop-core/source-manifest.json', JSON.stringify(source));
@@ -237,7 +237,7 @@ test('actual Cronet CLI binds raw D go.mod before check-only and cache/stamp adm
     const valid = f.run('--check-only');
     assert.equal(valid.status, 0, valid.stderr);
     assert.match(valid.stdout, /v2.0.0-alpha.11/);
-    assert.deepEqual(f.calls().map((args) => args.at(-1)), [`https://raw.githubusercontent.com/polaris-arch/polaris-box/${f.source.sourceCommit}/go.mod`]);
+    assert.deepEqual(f.calls().map((args) => args.at(-1)), [`https://raw.githubusercontent.com/polaris-arch/sing-box-polaris/${f.source.sourceCommit}/go.mod`]);
     const stamp = JSON.stringify({ 'cronet:linux': `${VERSION}|${digest(f.library)}`, unrelated: 'retained' });
     f.write('resources/linux/libcronet.so', f.library);
     f.write('resources/.fetch-stamp.json', stamp);

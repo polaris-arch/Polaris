@@ -419,17 +419,34 @@ def compiler_fact(path, env):
     return {**identity, 'version': version}
 
 
+def generator_buildinfo(raw, name, value):
+    """Validate the actual installed command, not a module-name substring."""
+    lines = raw.splitlines()
+    require(lines and re.fullmatch(r'.+: go' + re.escape(value['goVersion']), lines[0]),
+            'actual mobile tool Go version differs: ' + name)
+    rows = [line.split() for line in lines[1:] if line.strip()]
+    paths = [row[1:] for row in rows if row[0] == 'path']
+    modules = [row[1:] for row in rows if row[0] == 'mod']
+    require(paths == [['github.com/sagernet/gomobile/cmd/' + name]] and
+            len(modules) == 1 and len(modules[0]) == 3 and
+            modules[0][0] == 'github.com/sagernet/gomobile' and
+            modules[0][1] == value[name + 'Version'] and
+            re.fullmatch(r'h1:[A-Za-z0-9+/]{43}=', modules[0][2]) and
+            not any(row[0] == '=>' for row in rows),
+            'actual mobile tool module differs: ' + name)
+
+
 def tool_facts(args, value, env):
     paths = {name: str(Path(getattr(args, name)).resolve(strict=True)) for name in ('go', 'gomobile', 'gobind')}
+    original_tools = {name: file_pin(path) for name, path in paths.items()}
     require(run([paths['go'], 'version'], env=env).strip().startswith('go version go' + value['goVersion'] + ' '),
             'actual Go tool version differs')
     observed = {}
     for name in ('gomobile', 'gobind'):
         raw = run([paths['go'], 'version', '-m', paths[name]], env=env)
-        require(re.search(r'\bgithub.com/sagernet/gomobile\s+' + re.escape(value[name + 'Version']) + r'\b', raw),
-                'actual mobile tool module differs: ' + name)
+        generator_buildinfo(raw, name, value)
         observed[name] = raw
-    result = {'executables': {name: file_pin(path) for name, path in paths.items()}, 'mobileBuildInfo': observed}
+    result = {'executables': original_tools, 'mobileBuildInfo': observed}
     if args.platform == 'android':
         jdk, ndk = Path(args.jdk).resolve(strict=True), Path(args.ndk).resolve(strict=True)
         java = run([jdk / 'bin/java', '--version'], env=env)
@@ -466,10 +483,12 @@ def tool_facts(args, value, env):
                          'compiler': file_pin(Path(compiler).resolve(strict=True)),
                          'compilerVersion': run([compiler, '--version'], env=env)}
         result.update(xcode=xcode, sdk=sdk)
+    require({name: file_pin(paths[name]) for name in original_tools} == original_tools,
+            'mobile tool bytes changed during observation')
     return paths, result
 
 
-PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py',
+PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
              'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',

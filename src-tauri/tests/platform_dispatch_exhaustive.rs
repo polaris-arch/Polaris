@@ -3269,7 +3269,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "all(test, not(target_os = \"android\"))",
         6,
         IosSide::WithAndroid,
-        "两 Foreign variant 与四 getter/corruption/replay assertion helper 是 Unix-only tests；独立 cfg(unix) 与本 test/non-Android 谓词合取，等价保留原构型。eval_cfg 的 test 在 release/debug 均 false，两移动端同侧；不向跨 mobile 谓词词表添加 unix。",
+        "两 Foreign variant 与四 getter/corruption/replay assertion helper 是 Unix-only tests；独立 cfg(unix) 与本 test/non-Android 谓词合取，等价保留原构型。eval_cfg 的 test 在 release/debug 均 false，两移动端同侧；此旧测试组登记保持原样；G4 的生产 Unix 合取另由封闭 target-family 映射求值。",
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",
@@ -3440,6 +3440,126 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "member_counts在Android上Temp成员恒报0：Android测速走进程内libbox，没有PC Temp custody可普查。iOS不编此腿；它错误继承桌面Temp视图的事实在同文件not(android)条目单独登记为债。",
     ),
+    // G4 source-only accounting; historical debt verdicts remain intact.
+    (
+        "src-tauri/src/runtime/config.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "G4 stages a physical, incarnation-bound iOS directory intent; other platforms retain their prior journal entries. Source accounting only; no native receipt or device acceptance is inferred.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "all(target_os = \"ios\", unix)",
+        1,
+        IosSide::DiffersRight,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"ios\", target_os = \"android\", test)",
+        1,
+        IosSide::WithAndroid,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "not(any(target_os = \"ios\", target_os = \"android\", test))",
+        1,
+        IosSide::WithAndroid,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "not(target_os = \"ios\")",
+        3,
+        IosSide::DiffersRight,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "target_os = \"ios\"",
+        5,
+        IosSide::DiffersRight,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 borrows the original iOS Stop target and scoped directory receipt through exclusive lease and durable journal acknowledgement. Other platforms retain an explicit unavailable result. This registration does not authorize global cleanup or assert a device Stop.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "target_os = \"ios\"",
+        5,
+        IosSide::DiffersRight,
+        "G4 borrows the original iOS Stop target and scoped directory receipt through exclusive lease and durable journal acknowledgement. Other platforms retain an explicit unavailable result. This registration does not authorize global cleanup or assert a device Stop.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 keeps logical iOS managed config bytes in memory until original-provider capability admission; other platforms retain the existing config-file write. Native startup acceptance remains separate.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory.rs",
+        "all(target_os = \"ios\", unix)",
+        2,
+        IosSide::DiffersRight,
+        "G4 admits iOS native directory commit/resume and terminal-history filtering; generic host fixtures do not mint native custody. Both iOS and Android satisfy the closed Unix target-family map, with iOS selecting its explicit native branch.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory.rs",
+        "any(target_os = \"ios\", test)",
+        1,
+        IosSide::DiffersRight,
+        "G4 admits iOS native directory commit/resume and terminal-history filtering; generic host fixtures do not mint native custody. Both iOS and Android satisfy the closed Unix target-family map, with iOS selecting its explicit native branch.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "any(target_os = \"ios\", test)",
+        17,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "target_os = \"ios\"",
+        2,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "any(target_os = \"ios\", test)",
+        1,
+        IosSide::DiffersRight,
+        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"ios\"",
+        3,
+        IosSide::DiffersRight,
+        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3562,6 +3682,12 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
     match p {
         "test" => Some(false),
         "debug_assertions" => Some(env.debug_assertions),
+        // Closed target-family mapping for the supported App targets.
+        "unix" => match env.target_os {
+            "ios" | "android" | "linux" | "macos" => Some(true),
+            "windows" => Some(false),
+            _ => None,
+        },
         "desktop" => Some(env.desktop),
         "mobile" => Some(env.mobile),
         _ => p
@@ -3603,6 +3729,28 @@ fn cfg_evaluator_answers_both_ways() {
         eval_cfg("any(target_os = \"android\", test)", IOS_ENV),
         Some(false)
     );
+    assert_eq!(eval_cfg("unix", IOS_ENV), Some(true));
+    assert_eq!(eval_cfg("unix", ANDROID_ENV), Some(true));
+    assert_eq!(
+        eval_cfg(
+            "unix",
+            CfgEnv {
+                target_os: "windows",
+                ..IOS_ENV
+            }
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        eval_cfg(
+            "unix",
+            CfgEnv {
+                target_os: "unregistered",
+                ..IOS_ENV
+            }
+        ),
+        None
+    );
     assert_eq!(eval_cfg("mobile", IOS_ENV), Some(true));
     assert_eq!(eval_cfg("desktop", IOS_ENV), Some(false));
     assert_eq!(eval_cfg("debug_assertions", IOS_ENV), Some(false));
@@ -3626,7 +3774,6 @@ fn cfg_evaluator_answers_both_ways() {
         "feature = \"x\"",
         "target_arch = \"arm\"",
         "windows",
-        "unix",
         "any(target_os = \"ios\", feature = \"x\")",
         "not(unknown_build_mode)",
     ] {
@@ -3704,7 +3851,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.is_empty(),
         "以下 cfg 谓词里出现了本门词表之外的原子：\n    {}\n\n\
          本门**不猜**：`eval_cfg` 的词表是封闭的（`target_os = \"…\"` / `desktop` / `mobile` / \
-         `test` / `debug_assertions` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
+         `test` / `debug_assertions` / `unix` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
          `cfg_evaluator_answers_both_ways` 里正反各钉一条，要么这条谓词根本不该落在移动轴上。",
         unknown_atoms.join("\n    ")
     );
@@ -3918,10 +4065,10 @@ fn cfg_axis_platform_dispatch_is_registered() {
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 286),
+    ("DiffersRight", 331),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
-    ("WithAndroid", 116),
+    ("WithAndroid", 118),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
