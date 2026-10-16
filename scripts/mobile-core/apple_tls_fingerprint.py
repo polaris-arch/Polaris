@@ -8,7 +8,7 @@ import re
 import sys
 
 sys.dont_write_bytecode = True
-from artifacts import file_pin, read_receipt
+from artifacts import file_pin, read_pinned, read_receipt
 from fork_input import require, sha
 from producer import run
 
@@ -40,6 +40,19 @@ def paths():
     return folder / 'PolarisTLSFingerprintLinker.args', folder / 'PolarisTLSFingerprintLinker.json'
 
 
+def framework_path(framework, path):
+    # The preceding verify-link phase admits this selected framework. Follow
+    # its versioned aliases only within that boundary; file_pin stays strict.
+    require(framework.is_dir() and not framework.is_symlink(), 'libbox framework root redirected/missing')
+    try:
+        boundary = framework.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise RuntimeError('libbox framework input missing or unresolvable') from None
+    require(resolved.is_relative_to(boundary), 'libbox input escaped selected framework')
+    return resolved
+
+
 def prepare():
     context = Path(os.environ['POLARIS_MOBILE_LINK_INPUT'])
     require(sha(context.read_bytes()) == os.environ['POLARIS_MOBILE_LINK_INPUT_SHA256'],
@@ -48,27 +61,31 @@ def prepare():
     platform = os.environ['PLATFORM_NAME']
     require(platform in ('iphoneos', 'iphonesimulator') and os.environ['ARCHS'] == 'arm64',
             'unrequested PacketTunnel TLS capability target')
-    selected = link['componentOutput']['slices']['ios-arm64' if platform == 'iphoneos' else 'ios-arm64-simulator']
-    framework = Path(link['framework']) / selected['libraryIdentifier'] / 'Libbox.framework'
-    binary = framework / 'Libbox'
+    identifier = 'ios-arm64' if platform == 'iphoneos' else 'ios-arm64-simulator'
+    selected = link['componentOutput']['slices'][identifier]
+    require(selected['libraryIdentifier'] == identifier, 'selected libbox slice differs from PacketTunnel target')
+    framework = Path(link['framework']) / identifier / 'Libbox.framework'
+    binary = framework_path(framework, framework / 'Libbox')
     require(file_pin(binary) == selected['binary'], 'actual libbox link bytes differ')
-    headers = sorted((framework / 'Headers').glob('*.h'))
+    header_root = framework_path(framework, framework / 'Headers')
+    headers = [framework_path(framework, path) for path in sorted(header_root.glob('*.h'))]
     require(0 < len(headers) <= 64 and sum(p.stat().st_size for p in headers) <= 2 * 1024 * 1024,
             'libbox generated header inventory exceeds budget')
+    header_inputs = {p.name: read_pinned(p) for p in headers}
     symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', binary])
-    present = capability_present([p.read_text() for p in headers], symbols)
+    present = capability_present([raw.decode() for raw, _ in header_inputs.values()], symbols)
     flags, receipt = paths()
     # Explicitly root this one optional function; do not change the global export policy.
     flags.write_text('-Xlinker\n-u\n-Xlinker\n' + SYMBOL + '\n' if present else '')
     receipt.write_text(json.dumps({'capabilityPresent': present, 'binary': selected['binary'],
-                                  'headers': {p.name: file_pin(p) for p in headers},
-                                  'flags': file_pin(flags), 'devicePassed': False}) + '\n')
+                                  'headers': {name: pin for name, (_, pin) in header_inputs.items()},
+                                  'flags': file_pin(flags, allow_empty=True), 'devicePassed': False}) + '\n')
 
 
 def verify():
     flags, receipt_path = paths()
     receipt = read_receipt(receipt_path)
-    require(file_pin(flags) == receipt['flags'], 'TLS capability linker flags changed')
+    require(file_pin(flags, allow_empty=True) == receipt['flags'], 'TLS capability linker flags changed')
     executable = Path(os.environ['TARGET_BUILD_DIR']) / os.environ['EXECUTABLE_PATH']
     if receipt['capabilityPresent']:
         symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', executable])
