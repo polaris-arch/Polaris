@@ -256,6 +256,8 @@ pub(crate) struct CliObservation {
     path: std::path::PathBuf,
     file: std::sync::Arc<std::fs::File>,
     stamp: String,
+    /// None means supported/stable absence; temporary failures expire for retry.
+    retry_at: Option<std::time::Instant>,
     #[cfg(windows)]
     file_id: (u64, [u8; 16]),
 }
@@ -314,16 +316,31 @@ impl CliObservation {
         &self.path
     }
 }
-static CLI_CACHE: std::sync::Mutex<Vec<CliObservation>> = std::sync::Mutex::new(Vec::new());
-static CLI_QUERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+struct CliProbeCache {
+    entries: std::sync::Mutex<Vec<CliObservation>>,
+    query: tokio::sync::Mutex<()>,
+}
+impl CliProbeCache {
+    const fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            query: tokio::sync::Mutex::const_new(()),
+        }
+    }
+    fn observed(&self, path: &Path) -> Option<CliObservation> {
+        self.entries
+            .lock()
+            .ok()?
+            .iter()
+            .find(|entry| entry.matches(path))
+            .cloned()
+    }
+}
+static CLI_CACHE: CliProbeCache = CliProbeCache::new();
+const TRANSIENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(crate) fn cached_cli(path: &Path) -> Option<CliObservation> {
-    CLI_CACHE
-        .lock()
-        .ok()?
-        .iter()
-        .find(|entry| entry.matches(path))
-        .cloned()
+    CLI_CACHE.observed(path)
 }
 pub(crate) fn cached_digest_matches(path: &Path, expected: &str) -> bool {
     cached_cli(path).is_some_and(|entry| entry.snapshot.binary_sha256.as_deref() == Some(expected))
@@ -355,6 +372,7 @@ async fn open_observation(path: &Path) -> Result<CliObservation, String> {
             path,
             file: std::sync::Arc::new(file),
             stamp,
+            retry_at: Some(std::time::Instant::now()),
             #[cfg(windows)]
             file_id,
         };
@@ -367,56 +385,111 @@ async fn open_observation(path: &Path) -> Result<CliObservation, String> {
     .map_err(|e| e.to_string())?
 }
 
+enum ProbeFile {
+    Native,
+    #[cfg(test)]
+    ScriptFixture,
+}
+
 pub(crate) async fn probe_cli(path: &Path) -> Snapshot {
-    if let Some(entry) = cached_cli(path) {
-        return entry.snapshot;
-    }
-    let _query = CLI_QUERY.lock().await;
-    if let Some(entry) = cached_cli(path) {
-        return entry.snapshot;
-    }
-    let mut entry = match open_observation(path).await {
-        Ok(entry) => entry,
-        Err(reason) => return Snapshot::unavailable(reason),
-    };
-    use std::io::{Read, Seek};
-    let mut magic = [0_u8; 2];
-    let wrapper = entry.file.try_clone().is_ok_and(|mut file| {
-        file.rewind().is_ok() && file.read_exact(&mut magic).is_ok() && &magic == b"#!"
-    });
-    entry.snapshot = if wrapper {
-        Snapshot {
-            binary_sha256: entry.snapshot.binary_sha256.clone(),
-            byte_identity_scope: "cli-executable".into(),
-            ..Snapshot::unavailable("Native-core capabilities unavailable for a script wrapper")
+    CLI_CACHE
+        .probe_at(path, std::time::Instant::now(), ProbeFile::Native)
+        .await
+}
+impl CliProbeCache {
+    async fn probe_at(
+        &self,
+        path: &Path,
+        now: std::time::Instant,
+        file_kind: ProbeFile,
+    ) -> Snapshot {
+        let fresh = |entry: &CliObservation| entry.retry_at.is_none_or(|retry| now < retry);
+        if let Some(entry) = self.observed(path).filter(fresh) {
+            return entry.snapshot;
         }
-    } else {
-        query_observation(&entry).await
-    };
-    if !entry.still_current() {
-        return Snapshot::unavailable("Core changed during capability query");
-    }
-    if let Ok(mut cache) = CLI_CACHE.lock() {
-        cache.retain(|old| old.path != path);
-        if cache.len() >= 4 {
-            cache.remove(0);
+        let _query = self.query.lock().await;
+        if let Some(entry) = self.observed(path).filter(fresh) {
+            return entry.snapshot;
         }
-        cache.push(entry.clone());
+        // A temporary query failure invalidates the result, not the proven file
+        // bytes. Retry that same retained object without hashing it again.
+        let mut entry = match self.observed(path) {
+            Some(entry) => entry,
+            None => match open_observation(path).await {
+                Ok(entry) => entry,
+                Err(reason) => return Snapshot::unavailable(reason),
+            },
+        };
+        use std::io::{Read, Seek};
+        let mut magic = [0_u8; 2];
+        let wrapper = entry.file.try_clone().is_ok_and(|mut file| {
+            file.rewind().is_ok() && file.read_exact(&mut magic).is_ok() && &magic == b"#!"
+        });
+        let permit_fixture = match file_kind {
+            ProbeFile::Native => false,
+            #[cfg(test)]
+            ProbeFile::ScriptFixture => true,
+        };
+        let queried = if wrapper && !permit_fixture {
+            QueryObservation {
+                snapshot: Snapshot {
+                    binary_sha256: entry.snapshot.binary_sha256.clone(),
+                    byte_identity_scope: "cli-executable".into(),
+                    ..Snapshot::unavailable(
+                        "Native-core capabilities unavailable for a script wrapper",
+                    )
+                },
+                retryable: false,
+            }
+        } else {
+            query_observation(&entry).await
+        };
+        entry.snapshot = queried.snapshot;
+        entry.retry_at = queried
+            .retryable
+            .then(|| std::time::Instant::now() + TRANSIENT_RETRY_DELAY);
+        if !entry.still_current() {
+            return Snapshot::unavailable("Core changed during capability query");
+        }
+        if let Ok(mut cache) = self.entries.lock() {
+            cache.retain(|old| old.path != path);
+            if cache.len() >= 4 {
+                cache.remove(0);
+            }
+            cache.push(entry.clone());
+        }
+        entry.snapshot
     }
-    entry.snapshot
 }
 
 #[cfg(test)]
 async fn query_cli(path: &Path) -> Snapshot {
     match open_observation(path).await {
-        Ok(entry) => query_observation(&entry).await,
+        Ok(entry) => query_observation(&entry).await.snapshot,
         Err(reason) => Snapshot::unavailable(reason),
     }
 }
 
-async fn query_observation(entry: &CliObservation) -> Snapshot {
+struct QueryObservation {
+    snapshot: Snapshot,
+    retryable: bool,
+}
+
+fn unsupported_capability_command(stdout: &str, stderr: &str) -> bool {
+    // Only explicit CLI dispatch rejection attests a stable old interface.
+    // Spawn/admission/cleanup/timeouts and arbitrary nonzero exits are transient.
+    [stdout, stderr]
+        .iter()
+        .flat_map(|text| text.lines())
+        .any(|line| {
+            line.contains("unknown command \"tls-fingerprints\"")
+                || line.contains("No help topic for 'tls-fingerprints'")
+        })
+}
+async fn query_observation(entry: &CliObservation) -> QueryObservation {
     let path = entry.path();
     let mut observed_digest = None;
+    let mut retryable = true;
     let result = async {
         if !entry.still_current() {
             return Err("Core file identity changed before query".into());
@@ -443,6 +516,16 @@ async fn query_observation(entry: &CliObservation) -> Snapshot {
                 stdout,
                 ..
             } => stdout,
+            polaris_core_supervisor::RawCheck::Done {
+                success: false,
+                stdout,
+                stderr,
+            } => {
+                retryable = !unsupported_capability_command(&stdout, &stderr);
+                return Err(format!(
+                    "Selected core TLS capability query rejected: {stderr}{stdout}"
+                ));
+            }
             other => {
                 return Err(format!(
                     "Selected core TLS capability query unavailable: {other:?}"
@@ -455,11 +538,17 @@ async fn query_observation(entry: &CliObservation) -> Snapshot {
         Ok(snapshot)
     };
     match result.await {
-        Ok(snapshot) => snapshot,
-        Err(reason) => Snapshot {
-            binary_sha256: observed_digest,
-            byte_identity_scope: "cli-executable".into(),
-            ..Snapshot::unavailable(reason)
+        Ok(snapshot) => QueryObservation {
+            snapshot,
+            retryable: false,
+        },
+        Err(reason) => QueryObservation {
+            snapshot: Snapshot {
+                binary_sha256: observed_digest,
+                byte_identity_scope: "cli-executable".into(),
+                ..Snapshot::unavailable(reason)
+            },
+            retryable,
         },
     }
 }

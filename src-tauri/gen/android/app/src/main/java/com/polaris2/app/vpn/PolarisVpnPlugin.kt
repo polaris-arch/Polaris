@@ -690,8 +690,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
                             val stat = android.system.Os.fstat(input.fd)
                             fun mappedIdentity(): Boolean = java.io.File("/proc/self/maps").useLines { lines ->
                                 lines.any { line ->
-                                    LoadedLibboxIdentity.matchesMapping(line, library.path, stat.st_ino,
-                                        android.system.Os.major(stat.st_dev).toLong(), android.system.Os.minor(stat.st_dev).toLong())
+                                    LoadedLibboxIdentity.matchesMapping(line, library.path, stat.st_ino, stat.st_dev)
                                 }
                             }
                             require(mappedIdentity()) { "Loaded libbox device/inode does not match the opened file" }

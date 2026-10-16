@@ -4,14 +4,25 @@ use std::path::Path;
 
 impl ProxyRuntime {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub(super) fn direct_tls_snapshot(&self, generation: u64) -> Snapshot {
+    fn direct_tls_binding(
+        &self,
+        generation: u64,
+    ) -> Result<
+        (
+            super::process_supervision::RunIdentity,
+            crate::runtime::tls_fingerprints::CliObservation,
+        ),
+        String,
+    > {
         // Same lock order as native birth: Child first, proof second.
-        let Ok(mut slot) = self.child.lock() else {
-            return Snapshot::unavailable("Core custody is unavailable");
-        };
-        let Ok(captured) = self.captured_cli_run.lock() else {
-            return Snapshot::unavailable("Core byte proof is unavailable");
-        };
+        let mut slot = self
+            .child
+            .lock()
+            .map_err(|_| "Core custody is unavailable")?;
+        let captured = self
+            .captured_cli_run
+            .lock()
+            .map_err(|_| "Core byte proof is unavailable")?;
         match captured.as_ref() {
             Some((captured_generation, identity, entry))
                 if *captured_generation == generation
@@ -20,11 +31,18 @@ impl ProxyRuntime {
                         == polaris_core_supervisor::ChildObservation::Alive
                     && entry.still_current() =>
             {
-                entry.snapshot.clone()
+                Ok((identity.clone(), entry.clone()))
             }
-            _ => Snapshot::unavailable(
-                "Running core bytes could not be bound to the retained native instance",
-            ),
+            _ => {
+                Err("Running core bytes could not be bound to the retained native instance".into())
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(super) fn direct_tls_snapshot(&self, generation: u64) -> Snapshot {
+        match self.direct_tls_binding(generation) {
+            Ok((_, entry)) => entry.snapshot,
+            Err(reason) => Snapshot::unavailable(reason),
         }
     }
 
@@ -38,7 +56,22 @@ impl ProxyRuntime {
                     .core_via_helper
                     .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return self.direct_tls_snapshot(generation);
+                let (identity, entry) = match self.direct_tls_binding(generation) {
+                    Ok(bound) => bound,
+                    Err(reason) => return Snapshot::unavailable(reason),
+                };
+                // Transient startup/query errors can recover on focus or another
+                // capability request, using the original file proof and custody.
+                let refreshed = crate::runtime::tls_fingerprints::probe_cli(entry.path()).await;
+                return match self.direct_tls_binding(generation) {
+                    Ok((current, proof))
+                        if current.same_run(&identity)
+                            && proof.snapshot.binary_sha256 == refreshed.binary_sha256 =>
+                    {
+                        refreshed
+                    }
+                    _ => Snapshot::unavailable("Core instance changed during capability retry"),
+                };
             }
             // Linux /proc/<pid>/exe identifies the loaded image even after rename.
             #[cfg(not(target_os = "linux"))]

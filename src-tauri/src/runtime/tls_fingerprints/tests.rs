@@ -154,3 +154,72 @@ async fn file_proof_rejects_atomic_replacement_even_with_equal_length_and_restor
     drop(proof);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transient_failure_retries_the_same_bytes_after_recovery_without_rehashing_or_spawning_on_every_read(
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("polaris-tls-retry-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let core = dir.join("core");
+    let raw = document().to_string();
+    std::fs::write(&core, format!("#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nprintf x >> attempts\n[ -f ready ] || exit 7\ncat <<'DOCUMENT'\n{raw}\nDOCUMENT\n")).unwrap();
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cache = CliProbeCache::new();
+    let first = cache
+        .probe_at(&core, std::time::Instant::now(), ProbeFile::ScriptFixture)
+        .await;
+    assert!(first.document.is_none());
+    let original = cache.observed(&core).unwrap();
+    assert!(original.retry_at.is_some());
+    let repeated = cache
+        .probe_at(&core, std::time::Instant::now(), ProbeFile::ScriptFixture)
+        .await;
+    assert!(repeated.document.is_none());
+    assert_eq!(std::fs::read(dir.join("attempts")).unwrap(), b"x");
+    std::fs::write(dir.join("ready"), b"condition cleared").unwrap();
+    let after_cooldown = original.retry_at.unwrap() + std::time::Duration::from_millis(1);
+    let recovered = cache
+        .probe_at(&core, after_cooldown, ProbeFile::ScriptFixture)
+        .await;
+    assert!(
+        recovered.document.is_some(),
+        "the actual supervised CLI query must succeed after recovery"
+    );
+    assert_eq!(recovered.binary_sha256, first.binary_sha256);
+    let current = cache.observed(&core).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&original.file, &current.file),
+        "same retained file proof, no second full digest read"
+    );
+    assert!(current.retry_at.is_none());
+    let stable = cache
+        .probe_at(&core, after_cooldown, ProbeFile::ScriptFixture)
+        .await;
+    assert!(stable.document.is_some());
+    assert_eq!(std::fs::read(dir.join("attempts")).unwrap(), b"xx");
+    drop((cache, original, current));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn only_explicit_old_cli_dispatch_rejection_is_stable_absence() {
+    assert!(unsupported_capability_command(
+        "",
+        "Error: unknown command \"tls-fingerprints\" for \"sing-box tools\""
+    ));
+    assert!(unsupported_capability_command(
+        "No help topic for 'tls-fingerprints'",
+        ""
+    ));
+    for transient in [
+        "validation admission is closing",
+        "cleanup remains unconfirmed",
+        "permission denied",
+        "query timed out",
+        "unexpected exit 7",
+    ] {
+        assert!(!unsupported_capability_command("", transient));
+    }
+}

@@ -9,10 +9,18 @@ internal object LoadedLibboxIdentity {
         return read()
     }
 
-    fun matchesMapping(line: String, path: String, inode: Long, major: Long, minor: Long): Boolean {
+    // Android bionic sys/sysmacros.h (android-15.0.0_r1): dev_t uses
+    // split 32-bit major/minor fields. Pure bit operations work on minSdk 24;
+    // android.system.Os exposes no public Java major/minor methods.
+    // https://android.googlesource.com/platform/bionic/+/refs/tags/android-15.0.0_r1/libc/include/sys/sysmacros.h
+    fun deviceMajor(device: Long): Long = ((device ushr 32) and 0xfffff000L) or ((device ushr 8) and 0xfffL)
+    fun deviceMinor(device: Long): Long = ((device ushr 12) and 0xffffff00L) or (device and 0xffL)
+
+    fun matchesMapping(line: String, path: String, inode: Long, deviceNumber: Long): Boolean {
         val fields = line.trim().split(Regex("\\s+"), limit = 6)
         val device = fields.getOrNull(3)?.split(':') ?: return false
         return fields.size == 6 && fields[5] == path && fields[4].toLongOrNull() == inode &&
-            device.size == 2 && device[0].toLongOrNull(16) == major && device[1].toLongOrNull(16) == minor
+            device.size == 2 && device[0].toLongOrNull(16) == deviceMajor(deviceNumber) &&
+            device[1].toLongOrNull(16) == deviceMinor(deviceNumber)
     }
 }

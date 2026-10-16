@@ -811,6 +811,8 @@ impl ProxyRuntime {
     /// 只是多漏一个进程。这类「绿而带副作用」的坑不可能靠逐条 review 兜住，只能靠这道门。
     #[cfg(test)]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
+        self.core_binary_resolution_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.core_binary_override
             .lock()
             .ok()

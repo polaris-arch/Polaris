@@ -173,8 +173,18 @@ async fn disconnected_measurements_invalidate_when_actual_selected_source_is_rep
     std::fs::write(&path, b"not executable A").unwrap();
     *rt.core_binary_override.lock().unwrap() = Some(path.clone());
     let observed = crate::runtime::tls_fingerprints::probe_cli(&path).await;
+    // Acquisition uses the existing full resolver. Ledger reads must never
+    // re-enter it (production does core+sidecar content hashing there).
+    assert_eq!(rt.core_binary_for_start().unwrap(), path);
+    let resolution_calls = rt.core_binary_resolution_calls.load(Ordering::SeqCst);
     rt.remember_temp_core_sha256(observed.binary_sha256.clone());
-    assert_eq!(rt.measurement_core_sha256(), observed.binary_sha256);
+    for _ in 0..64 {
+        assert_eq!(rt.measurement_core_sha256(), observed.binary_sha256);
+    }
+    assert_eq!(
+        rt.core_binary_resolution_calls.load(Ordering::SeqCst),
+        resolution_calls
+    );
     let next = dir.join("next-core");
     std::fs::write(&next, b"not executable B").unwrap();
     *rt.core_binary_override.lock().unwrap() = Some(next.clone());
@@ -187,5 +197,9 @@ async fn disconnected_measurements_invalidate_when_actual_selected_source_is_rep
     assert!(
         rt.measurement_core_sha256().is_none(),
         "same-path replacement does not reuse the previous measurement hash"
+    );
+    assert_eq!(
+        rt.core_binary_resolution_calls.load(Ordering::SeqCst),
+        resolution_calls
     );
 }

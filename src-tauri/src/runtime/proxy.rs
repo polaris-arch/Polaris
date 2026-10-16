@@ -1688,7 +1688,18 @@ pub struct ProxyRuntime {
     >,
     /// Actual ready-core bytes, scoped to the generation which observed them.
     captured_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     captured_temp_core_sha256: Mutex<Option<String>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_temp_cli_source: Mutex<
+        Option<(
+            core_binary::CoreSelectionObservation,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
+    >,
+    #[cfg(test)]
+    core_binary_resolution_calls: AtomicU32,
+
     #[cfg(test)]
     test_measurement_core_sha256: Mutex<Option<(u64, String)>>,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1896,7 +1907,12 @@ impl ProxyRuntime {
             #[cfg(test)]
             test_measurement_core_sha256: Mutex::new(None),
             captured_core_sha256: Mutex::new(None),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             captured_temp_core_sha256: Mutex::new(None),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_temp_cli_source: Mutex::new(None),
+            #[cfg(test)]
+            core_binary_resolution_calls: AtomicU32::new(0),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
@@ -1971,6 +1987,26 @@ impl ProxyRuntime {
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
     pub(crate) fn remember_temp_core_sha256(&self, digest: Option<String>) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            #[cfg(not(test))]
+            let source = core_binary::verified_selection_observation();
+            #[cfg(test)]
+            let source = self
+                .core_binary_override
+                .lock()
+                .ok()
+                .and_then(|path| path.clone())
+                .map(core_binary::CoreSelectionObservation::fixture);
+            let captured = source.and_then(|source| {
+                let cli = crate::runtime::tls_fingerprints::cached_cli(source.path())?;
+                (digest.is_some() && cli.snapshot.binary_sha256 == digest).then_some((source, cli))
+            });
+            if let Ok(mut slot) = self.captured_temp_cli_source.lock() {
+                *slot = captured;
+            }
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         if let Ok(mut value) = self.captured_temp_core_sha256.lock() {
             *value = digest;
         }
@@ -2007,10 +2043,17 @@ impl ProxyRuntime {
                 #[cfg(not(target_os = "linux"))]
                 return None; // A helper-reported pathname alone cannot identify loaded bytes.
             }
-            let digest = self.captured_temp_core_sha256.lock().ok()?.clone()?;
-            let binary = self.core_binary_for_start().ok()?;
-            return crate::runtime::tls_fingerprints::cached_digest_matches(&binary, &digest)
-                .then_some(digest);
+            let observed = self.captured_temp_cli_source.lock().ok()?;
+            let (source, cli) = observed.as_ref()?;
+            #[cfg(test)]
+            if self.core_binary_override.lock().ok()?.as_deref() != Some(source.path()) {
+                return None;
+            }
+            // Metadata/handle checks only. Launch and acquisition still go through
+            // the original resolver's full installation content verification.
+            return (source.is_current() && cli.matches(source.path()))
+                .then(|| cli.snapshot.binary_sha256.clone())
+                .flatten();
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
