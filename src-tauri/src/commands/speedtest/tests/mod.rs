@@ -7014,13 +7014,11 @@ fn production_result_consumers_do_not_reparse_the_wire_projection() {
     assert!(!source.contains("MeasureFailure::from_json"));
     assert!(!source.contains("BindingVerdict::parse"));
     let masked = polaris_source_probe::mask_comments_and_strings(&source);
-    let stamp: String = crate::commands::guard_scan::impl_method_body(
-        &masked,
-        "    pub(crate) fn stamp(",
-    )
-    .chars()
-    .filter(|ch| !ch.is_whitespace())
-    .collect();
+    let stamp: String =
+        crate::commands::guard_scan::impl_method_body(&masked, "    pub(crate) fn stamp(")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
     assert!(stamp.contains("result.measured.map_err(MeasureFailure::for_ledger)"));
     assert!(stamp.contains("result.binding.as_ref().and_then(|binding|binding.verdict)"));
     assert!(!stamp.contains(".as_u64()"));

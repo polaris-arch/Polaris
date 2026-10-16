@@ -1043,7 +1043,9 @@ async fn ios_auto_intent_preserves_foreground_and_receipt_epoch_gates() {
         Decision::Hold(Hold::NoCandidates)
     );
     refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 120), ("node-c", 80)]);
-    let plan = assess(&rt, &reads, None).await.expect("新代次结果允许前台择优");
+    let plan = assess(&rt, &reads, None)
+        .await
+        .expect("新代次结果允许前台择优");
     assert_eq!(plan.candidate.id, "node-c");
     assert_eq!(exit_on_disk(&rt), "node-a", "评估不提交出口");
 
@@ -2229,16 +2231,32 @@ fn refresh_fallback_requires_effective_intent_and_current_ios_receipts() {
     let ios_ledger = MeasurementLedger::new();
     let reads = readings(&ios_ledger);
     assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
-    refresh_receipts(&ios, &config, &ios_ledger, 1, &[("node-b", 80), ("node-c", 20)]);
+    refresh_receipts(
+        &ios,
+        &config,
+        &ios_ledger,
+        1,
+        &[("node-b", 80), ("node-c", 20)],
+    );
     assert_eq!(
-        ios.auto_select_fallback_from(&config, &reads).unwrap().node_id,
+        ios.auto_select_fallback_from(&config, &reads)
+            .unwrap()
+            .node_id,
         "node-c"
     );
     ios_ledger.set_foreground_epoch(1);
     assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
-    refresh_receipts(&ios, &config, &ios_ledger, 2, &[("node-b", 80), ("node-c", 20)]);
+    refresh_receipts(
+        &ios,
+        &config,
+        &ios_ledger,
+        2,
+        &[("node-b", 80), ("node-c", 20)],
+    );
     assert_eq!(
-        ios.auto_select_fallback_from(&config, &reads).unwrap().node_id,
+        ios.auto_select_fallback_from(&config, &reads)
+            .unwrap()
+            .node_id,
         "node-c"
     );
 }
