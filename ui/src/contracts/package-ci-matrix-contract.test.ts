@@ -1302,7 +1302,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       ...['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
         (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
       ),
-      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest'].map(
+      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest'].map(
         (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
       ),
       '${{ runner.temp }}/s5-android-unit-results.json',
@@ -1367,7 +1367,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation unit tests'));
     expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
-    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest']) {
+    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest']) {
       expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
     }
     expect(s5Units).toContain('python3 -I -');

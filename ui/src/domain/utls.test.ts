@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { globalUtlsOptions, nodeUtlsOptions, type TlsFingerprintSnapshot, GLOBAL_UTLS_OPTIONS, NODE_UTLS_OPTIONS, utlsDraftValue, utlsPatch } from './utls';
+import { globalUtlsOptions, nodeUtlsOptions, realityUtlsError, tlsFingerprintStatus, type TlsFingerprintSnapshot, GLOBAL_UTLS_OPTIONS, NODE_UTLS_OPTIONS, utlsDraftValue, utlsPatch } from './utls';
 
 describe('uTLS intent and shared menus', () => {
   it('preserves disabled dormant fingerprint and enabled core default on unchanged edit', () => {
@@ -47,9 +47,27 @@ it('menus reflect only actual profiles, preserve existing values, and change on 
   expect(nodeUtlsOptions(false).map(([id]) => id)).toEqual(['', '@default', 'none']);
   const next = report(['chrome_155', 'safari_26_3', 'safari_16_0', 'random']);
   expect(nodeUtlsOptions(false, next).map(([id]) => id)).toEqual(['', '@default', 'none', 'random', 'chrome_155', 'safari_16_0', 'safari_26_3']);
-  expect(nodeUtlsOptions(true, next).some(([id]) => id === 'none')).toBe(false);
+  expect(nodeUtlsOptions(true, next).some(([id]) => id === 'none')).toBe(true);
   expect(nodeUtlsOptions(false, report(['chrome_133'])).some(([id]) => id === 'chrome_155')).toBe(false);
   expect(globalUtlsOptions('safari_26_3').at(-1)).toEqual(['safari_26_3', 'safari_26_3']);
   expect(next.document?.sourceModified).toBeNull();
   expect(nodeUtlsOptions(false, next).some(([id]) => id === 'chrome_pq')).toBe(false);
+});
+
+it('disables incompatible REALITY intent and rejects unchanged historical conflicts without rewriting them', () => {
+  expect(nodeUtlsOptions(false, undefined, true).find(([id]) => id === 'none')?.[2]).toBe(true);
+  for (const tlsSettings of [{ utlsMode: 'disabled' as const }, { fingerprint: 'none' }]) {
+    const node = { security: 'reality' as const, tlsSettings };
+    const before = structuredClone(node);
+    expect(realityUtlsError(node)).toBe('node.utls.realityRequired');
+    expect(node).toEqual(before);
+    expect(realityUtlsError({ ...node, security: 'tls' })).toBeNull();
+  }
+  expect(realityUtlsError({ security: 'reality', tlsSettings: { utlsMode: 'default', fingerprint: 'none' } })).toBeNull();
+});
+it('distinguishes loading, explicit failure, and a supported report', () => {
+  const t = (key: string, options?: { reason: string }) => options ? `${key}: ${options.reason}` : key;
+  expect(tlsFingerprintStatus(undefined, t)).toBe('node.utls.loading');
+  expect(tlsFingerprintStatus({ ...report([]), unavailableReason: 'old API' }, t)).toContain('old API');
+  expect(tlsFingerprintStatus(report(['safari_26_3']), t)).toBeNull();
 });

@@ -188,6 +188,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     let before = try digest()
                     var document: String?
                     if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "LibboxTLSFingerprintCapabilities") {
+                        // dlsym may resolve a same-named export in a different image.
+                        // Bind this query to the final extension container; this is not
+                        // a claim to hash relocated in-memory executable pages.
+                        var image = Dl_info()
+                        guard dladdr(symbol, &image) != 0, let name = image.dli_fname,
+                              tlsCapabilityImageMatches(String(cString: name), executable: executable)
+                        else { completionHandler?(nil); return }
                         typealias Query = @convention(c) (AutoreleasingUnsafeMutablePointer<NSError?>?) -> NSString?
                         let query = unsafeBitCast(symbol, to: Query.self)
                         var error: NSError?

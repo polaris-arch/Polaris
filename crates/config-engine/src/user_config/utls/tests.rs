@@ -135,7 +135,7 @@ fn reality_and_native_engine_conflicts_are_explicit() {
 fn unsupported_profiles_are_retained_but_cannot_be_enabled() {
     let mut node = server(Protocol::Vless);
     node.tls_settings = Some(TlsSettings {
-        fingerprint: Some("safari_26_3".into()),
+        fingerprint: Some("polaris_unknown_fingerprint".into()),
         ..Default::default()
     });
     let before = serde_json::to_value(&node).unwrap();
@@ -147,6 +147,11 @@ fn unsupported_profiles_are_retained_but_cannot_be_enabled() {
     for profile in SUPPORTED_PROFILES {
         assert!(effective_server(&server(Protocol::Vless), Some(profile)).is_ok());
     }
+    node.tls_settings.as_mut().unwrap().fingerprint = Some("safari_26_3".into());
+    assert!(
+        effective_server(&node, None).is_ok(),
+        "Safari 26.3 is a supported positive case"
+    );
 }
 
 #[test]

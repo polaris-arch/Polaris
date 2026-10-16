@@ -1,5 +1,5 @@
 import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
-import { isUtlsField, nodeUtlsOptions } from '@/domain/utls';
+import { isUtlsField, nodeUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
@@ -38,6 +38,7 @@ import {
 
 export interface MobileFieldProps {
   readonly spec: FieldSpec;
+  readonly reality?: boolean;
   readonly value: FormValue;
   readonly onChange: (value: FormValue) => void;
   /** 已本地化的取词器（本组件不 import i18next：呈现层要能在 node 环境下被真渲染）。 */
@@ -81,7 +82,7 @@ function Hint({ hintKey, title, t, disabled = false }: {
 }
 
 /** 一个字段。`switch` 以 `never` 兜底 —— 描述符加一支而这里没补 case ⇒ 编译不过。 */
-export function MobileField({ spec, value, onChange, t }: MobileFieldProps): ReactElement {
+export function MobileField({ spec, value, onChange, t, reality = false }: MobileFieldProps): ReactElement {
   const fid = useId();
   const [secretVisible, setSecretVisible] = useState(false);
   const tlsFingerprints = useTlsFingerprints(isUtlsField(spec.k));
@@ -132,12 +133,14 @@ export function MobileField({ spec, value, onChange, t }: MobileFieldProps): Rea
             value={typeof value === 'string' ? value : ''}
             onChange={(e) => onChange(e.target.value)}
           >
-            {normalizeSelectOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints) : spec.options, value, t).map((o) => (
+            {normalizeSelectOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints, reality) : spec.options, value, t).map((o) => (
               <option key={o.value} value={o.value} disabled={o.disabled === true}>
                 {o.label}
               </option>
             ))}
           </MobileSelect>
+          {isUtlsField(spec.k) && <p className="m-form-hint" role="status">{tlsFingerprintStatus(tlsFingerprints, t)}</p>}
+          {reality && <p className="m-form-hint">{t('node.utls.realityRequired')}</p>}
           <Hint hintKey={spec.hint} title={label} t={t} />
         </div>
       );
@@ -243,6 +246,7 @@ export function MobileFields({ fields, values, onChange, t }: MobileFieldsProps)
           <MobileField
             key={f.k}
             spec={f}
+            reality={f.k === 'fp' && values.sec === 'reality'}
             value={values[f.k]}
             onChange={(v) => onChange(f.k, v)}
             t={t}

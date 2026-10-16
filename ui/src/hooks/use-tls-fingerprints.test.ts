@@ -46,3 +46,14 @@ it('coalesces readers, invalidates at core transitions, and rejects an older in-
   await Promise.resolve(); await Promise.resolve();
   expect(currentTlsFingerprints()).toBeUndefined();
 });
+
+it('refreshes after delayed native setup completes without focus or a core transition', async () => {
+  vi.stubGlobal('window', new EventTarget());
+  off = subscribeTlsFingerprints(() => {});
+  reads.pending.shift()!(observed('a'));
+  await vi.waitFor(() => expect(currentTlsFingerprints()?.binarySha256).toBe('a'.repeat(64)));
+  window.dispatchEvent(new Event('polaris-libbox-ready'));
+  expect(currentTlsFingerprints()).toBeUndefined();
+  reads.pending.shift()!(observed('b'));
+  await vi.waitFor(() => expect(currentTlsFingerprints()?.binarySha256).toBe('b'.repeat(64)));
+});

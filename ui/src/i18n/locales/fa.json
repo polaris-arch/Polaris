@@ -2436,7 +2436,10 @@
     "utls": {
       "legacy": "Unset (legacy default)",
       "default": "Core default fingerprint",
-      "disabled": "Disable uTLS (keep TLS)"
+      "disabled": "Disable uTLS (keep TLS)",
+      "loading": "Checking core fingerprint capabilities…",
+      "unavailable": "Fingerprint capabilities unavailable: {{reason}}. Existing settings are retained and checked by the core.",
+      "realityRequired": "REALITY requires uTLS. Choose the core default or a supported fingerprint."
     },
     "field": {
       "aid": "AlterID",

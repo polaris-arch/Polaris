@@ -1,5 +1,5 @@
 import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
-import { isUtlsField, nodeUtlsOptions } from '@/domain/utls';
+import { isUtlsField, nodeUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 /**
  * 数据驱动表单基建 —— FieldSpec 描述符 + 单一 FieldRenderer（§1.4 表单层）。
  *
@@ -59,6 +59,7 @@ export function toCselOptions(
 
 export interface FieldRendererProps {
   spec: FieldSpec;
+  reality?: boolean;
   value: FormValue;
   onChange: (value: FormValue) => void;
 }
@@ -67,7 +68,7 @@ export interface FieldRendererProps {
  * 唯一字段渲染器。按 spec.t 分派；enum → `<Csel>`（非原生 select、非 radix），number → 单点 R2 分支。
  * 类名对齐原型（`.fld`/`.fld-l`/`.input`/`.swt-row` 等）→ 样式复用 components.css 无需新写。
  */
-export function FieldRenderer({ spec, value, onChange }: FieldRendererProps) {
+export function FieldRenderer({ spec, value, onChange, reality = false }: FieldRendererProps) {
   const { t } = useTranslation();
   const [secretVisible, setSecretVisible] = useState(false);
   const tlsFingerprints = useTlsFingerprints(isUtlsField(spec.k));
@@ -120,7 +121,7 @@ export function FieldRenderer({ spec, value, onChange }: FieldRendererProps) {
 
   if (spec.t === 'select') {
     // 传 value：当前值落在选项集外时并入选项，避免「一碰下拉就被迫改值」（见 toCselOptions 注释）。
-    const opts = toCselOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints) : spec.options, value, t);
+    const opts = toCselOptions(isUtlsField(spec.k) ? nodeUtlsOptions(spec.k === 'stlsFp', tlsFingerprints, reality) : spec.options, value, t);
     return (
       <div className="fld">
         {selectLabelEl}
@@ -131,6 +132,8 @@ export function FieldRenderer({ spec, value, onChange }: FieldRendererProps) {
           onChange={(v) => onChange(v)}
           options={opts}
         />
+        {isUtlsField(spec.k) && <p className="fld-hint" role="status">{tlsFingerprintStatus(tlsFingerprints, t)}</p>}
+        {reality && <p className="fld-hint">{t('node.utls.realityRequired')}</p>}
       </div>
     );
   }
@@ -231,6 +234,7 @@ export function FormFields({ fields, values, onChange }: FormFieldsProps) {
           <FieldRenderer
             key={field.k}
             spec={field}
+            reality={field.k === 'fp' && values.sec === 'reality'}
             value={values[field.k]}
             onChange={(value) => onChange(field.k, value)}
           />

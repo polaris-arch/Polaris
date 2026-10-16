@@ -241,95 +241,225 @@ impl Snapshot {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn binary_digest(path: &Path) -> Result<String, String> {
     let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     polaris_updater::verify::sha256_reader_hex(f).map_err(|e| e.to_string())
 }
 
-/// Fresh hash before/after a bounded query. No mtime-only or version-only cache.
-pub(crate) async fn probe_cli(path: &Path) -> Snapshot {
-    // A script/wrapper's hash does not identify the native core it may execute.
-    // It also must not be run as a speculative capability query.
-    use std::io::Read;
-    let mut magic = [0_u8; 2];
-    if std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"#!"
+/// One bounded shared observation per file identity. The open Windows handle
+/// excludes in-place writes but permits atomic replacement; Unix also checks
+/// device/inode/ctime, not just mtime.
+#[derive(Clone, Debug)]
+pub(crate) struct CliObservation {
+    pub snapshot: Snapshot,
+    path: std::path::PathBuf,
+    file: std::sync::Arc<std::fs::File>,
+    stamp: String,
+    #[cfg(windows)]
+    file_id: (u64, [u8; 16]),
+}
+
+fn file_stamp(metadata: &std::fs::Metadata) -> String {
+    #[cfg(unix)]
     {
-        return Snapshot {
-            binary_sha256: binary_digest(path).ok(),
-            ..Snapshot::unavailable("Native-core capabilities unavailable for a script wrapper")
-        };
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        )
     }
-    query_cli(path).await
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        format!(
+            "{}:{}:{}",
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_size()
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("{:?}", metadata)
+    }
 }
-
-async fn digest_off_thread(path: &Path) -> Result<String, String> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || binary_digest(&path))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-async fn query_cli(path: &Path) -> Snapshot {
-    use tokio::io::AsyncReadExt;
-    let mut observed_digest = None;
-    let mut command = tokio::process::Command::new(path);
-    command
-        .args(["tools", "tls-fingerprints"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(target_os = "windows")]
-    command.creation_flags(0x08000000);
-    let result = async {
-        let before = digest_off_thread(path).await?;
-        observed_digest = Some(before.clone());
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        child
-            .stdout
-            .take()
-            .ok_or("Missing capability stdout")?
-            .take((MAX_DOCUMENT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_DOCUMENT {
-            return Err("TLS capability report exceeds budget".into());
+impl CliObservation {
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        #[cfg(windows)]
+        if std::fs::File::open(path)
+            .and_then(|file| crate::windows_file_id::identity(&file))
+            .ok()
+            != Some(self.file_id)
+        {
+            return false;
         }
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        let after = match digest_off_thread(path).await {
-            Ok(after) => after,
-            Err(reason) => {
-                observed_digest = None;
-                return Err(reason);
-            }
+        path == self.path
+            && self
+                .file
+                .metadata()
+                .is_ok_and(|m| file_stamp(&m) == self.stamp)
+            && std::fs::metadata(path).is_ok_and(|m| file_stamp(&m) == self.stamp)
+    }
+    pub(crate) fn still_current(&self) -> bool {
+        self.matches(&self.path)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+static CLI_CACHE: std::sync::Mutex<Vec<CliObservation>> = std::sync::Mutex::new(Vec::new());
+static CLI_QUERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) fn cached_cli(path: &Path) -> Option<CliObservation> {
+    CLI_CACHE
+        .lock()
+        .ok()?
+        .iter()
+        .find(|entry| entry.matches(path))
+        .cloned()
+}
+pub(crate) fn cached_digest_matches(path: &Path, expected: &str) -> bool {
+    cached_cli(path).is_some_and(|entry| entry.snapshot.binary_sha256.as_deref() == Some(expected))
+}
+
+async fn open_observation(path: &Path) -> Result<CliObservation, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(5); // READ | DELETE: no in-place writes; allow normal atomic updater replacement.
+        }
+        let file = options.open(&path).map_err(|e| e.to_string())?;
+        let stamp = file_stamp(&file.metadata().map_err(|e| e.to_string())?);
+        let digest = polaris_updater::verify::sha256_reader_hex(
+            file.try_clone().map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut snapshot = Snapshot::unavailable("Core has no TLS capability report");
+        snapshot.binary_sha256 = Some(digest);
+        snapshot.byte_identity_scope = "cli-executable".into();
+        #[cfg(windows)]
+        let file_id = crate::windows_file_id::identity(&file).map_err(|e| e.to_string())?;
+        let entry = CliObservation {
+            snapshot,
+            path,
+            file: std::sync::Arc::new(file),
+            stamp,
+            #[cfg(windows)]
+            file_id,
         };
-        if after != before {
+        if !entry.still_current() {
+            return Err("Core file identity changed while hashing".into());
+        }
+        Ok(entry)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) async fn probe_cli(path: &Path) -> Snapshot {
+    if let Some(entry) = cached_cli(path) {
+        return entry.snapshot;
+    }
+    let _query = CLI_QUERY.lock().await;
+    if let Some(entry) = cached_cli(path) {
+        return entry.snapshot;
+    }
+    let mut entry = match open_observation(path).await {
+        Ok(entry) => entry,
+        Err(reason) => return Snapshot::unavailable(reason),
+    };
+    use std::io::{Read, Seek};
+    let mut magic = [0_u8; 2];
+    let wrapper = entry.file.try_clone().is_ok_and(|mut file| {
+        file.rewind().is_ok() && file.read_exact(&mut magic).is_ok() && &magic == b"#!"
+    });
+    entry.snapshot = if wrapper {
+        Snapshot {
+            binary_sha256: entry.snapshot.binary_sha256.clone(),
+            byte_identity_scope: "cli-executable".into(),
+            ..Snapshot::unavailable("Native-core capabilities unavailable for a script wrapper")
+        }
+    } else {
+        query_observation(&entry).await
+    };
+    if !entry.still_current() {
+        return Snapshot::unavailable("Core changed during capability query");
+    }
+    if let Ok(mut cache) = CLI_CACHE.lock() {
+        cache.retain(|old| old.path != path);
+        if cache.len() >= 4 {
+            cache.remove(0);
+        }
+        cache.push(entry.clone());
+    }
+    entry.snapshot
+}
+
+#[cfg(test)]
+async fn query_cli(path: &Path) -> Snapshot {
+    match open_observation(path).await {
+        Ok(entry) => query_observation(&entry).await,
+        Err(reason) => Snapshot::unavailable(reason),
+    }
+}
+
+async fn query_observation(entry: &CliObservation) -> Snapshot {
+    let path = entry.path();
+    let mut observed_digest = None;
+    let result = async {
+        if !entry.still_current() {
+            return Err("Core file identity changed before query".into());
+        }
+        let before = entry
+            .snapshot
+            .binary_sha256
+            .clone()
+            .ok_or("Missing core digest")?;
+        observed_digest = Some(before.clone());
+        let result = polaris_core_supervisor::run_tls_fingerprint_query(
+            path,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if !entry.still_current() {
             observed_digest = None;
             return Err("Core bytes changed during capability query".into());
         }
-        if !status.success() {
-            return Err("Selected core has no TLS capability query".into());
-        }
-        let raw = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-        let mut snapshot = Snapshot::from_loaded(raw, &before)?;
+        let raw = match result {
+            polaris_core_supervisor::RawCheck::Done {
+                success: true,
+                stdout,
+                ..
+            } => stdout,
+            other => {
+                return Err(format!(
+                    "Selected core TLS capability query unavailable: {other:?}"
+                ))
+            }
+        };
+        let mut snapshot = Snapshot::from_loaded(&raw, &before)?;
         snapshot.observation_scope = "cli-probe-process".into();
         snapshot.byte_identity_scope = "cli-executable".into();
         Ok(snapshot)
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(5), result).await {
-        Ok(Ok(snapshot)) => snapshot,
-        Ok(Err(reason)) => Snapshot {
+    match result.await {
+        Ok(snapshot) => snapshot,
+        Err(reason) => Snapshot {
             binary_sha256: observed_digest,
             byte_identity_scope: "cli-executable".into(),
             ..Snapshot::unavailable(reason)
-        },
-        Err(_) => Snapshot {
-            ..Snapshot::unavailable("TLS capability query timed out")
         },
     }
 }

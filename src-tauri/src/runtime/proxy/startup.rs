@@ -576,9 +576,19 @@ pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn kernel_gate_cache_record(
     binary: &Path,
     config: &SingBoxConfig,
+) -> Option<KernelGateCacheRecord> {
+    let digest = crate::runtime::tls_fingerprints::binary_digest(binary).ok()?;
+    kernel_gate_cache_record_with_digest(binary, config, &digest)
+}
+
+fn kernel_gate_cache_record_with_digest(
+    binary: &Path,
+    config: &SingBoxConfig,
+    digest: &str,
 ) -> Option<KernelGateCacheRecord> {
     let metadata = std::fs::metadata(binary).ok()?;
     let modified = metadata
@@ -599,7 +609,7 @@ pub(super) fn kernel_gate_cache_record(
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path,
         binary_len: metadata.len(),
-        binary_sha256: crate::runtime::tls_fingerprints::binary_digest(binary).ok()?,
+        binary_sha256: digest.to_owned(),
         binary_modified_ns: modified_ns,
         config_sha256: polaris_updater::verify::sha256_hex(&normalized),
     })
@@ -1483,6 +1493,16 @@ impl ProxyRuntime {
             // 拿在手上，闸门按 `Ok` 与否决定跑不跑（解析不到 ⇒ 无核可问 ⇒ failOpen 跳过闸门），
             // emit 之后才在下面 `?`。每尝试解析（字面路径，成本极低）；解析不到 = 终态，不重试（非竞态失败）。
             let binary_res = self.core_binary_for_start();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let startup_cli_proof = if let Ok(path) = &binary_res {
+                // The gate below reuses this observation. Keep the same proof
+                // across every await; a later menu refresh cannot substitute it.
+                self.tls_fingerprint_capabilities_for(Some(path)).await;
+                crate::runtime::tls_fingerprints::cached_cli(path)
+            } else {
+                None
+            };
+
             // 起核前的内核闸门：生成 → 写盘 → check → 剥掉内核点名拒收的节点 → 重来，直到内核收下。
             // 首次/结构变更仍真跑 check；同一核 + 同一最终生成配置命中已接受身份时为 0 次。
             let gate = match self
@@ -1709,6 +1729,15 @@ impl ProxyRuntime {
             self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
             let main_claim_token = main_reservation.claim_token();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if startup_cli_proof
+                .as_ref()
+                .is_some_and(|entry| !entry.still_current())
+            {
+                return Err(StartError::from(
+                    "Core bytes changed after preflight; retry startup".to_owned(),
+                ));
+            }
             let pid = if cfg!(target_os = "android") {
                 // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
                 // 不 spawn、无 child、无 pid：核跑在**本进程内**的 libbox 里，由 `VpnService` 承载
@@ -1911,6 +1940,10 @@ impl ProxyRuntime {
                 // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
                 // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
                 req.working_dir = Some(self.config.dir().to_path_buf());
+                // Reuse the validated file observation; retain it across synchronous
+                // spawn and bind it to the opaque identity returned for that Child.
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                let launch_tls = startup_cli_proof.clone();
                 let direct_spawn = self.spawn_direct_native(
                     native_producer.as_ref(),
                     my_gen,
@@ -1925,6 +1958,12 @@ impl ProxyRuntime {
                 }
                 match direct_spawn {
                     Ok(Some((pid, identity))) => {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        if let Ok(mut proof) = self.captured_cli_run.lock() {
+                            *proof = launch_tls
+                                .filter(|entry| entry.still_current())
+                                .map(|entry| (my_gen, identity.clone(), entry));
+                        }
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
@@ -2247,11 +2286,24 @@ impl ProxyRuntime {
         // The libbox query now reaches the ready extension on iOS. Old query
         // support stays unknown; it is never promoted to cache-eligible evidence.
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let ready_tls = match self.tls_ready_binary_for_pid(pid, via_helper) {
-            Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
-            None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
-                "Running core image could not be observed",
-            ),
+        let ready_tls = if !via_helper {
+            self.direct_tls_snapshot(my_gen)
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                match self.tls_ready_binary_for_pid(pid, true) {
+                    Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
+                    None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                        "Loaded core image is unavailable",
+                    ),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                    "Helper loaded-image byte proof is unavailable",
+                )
+            }
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
@@ -3707,7 +3759,7 @@ impl ProxyRuntime {
                 &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
             )?;
             if let (Some(bin), Some(before)) = (binary, capabilities.binary_sha256.as_deref()) {
-                if crate::runtime::tls_fingerprints::binary_digest(bin)?.as_str() != before {
+                if !crate::runtime::tls_fingerprints::cached_digest_matches(bin, before) {
                     return Err("Core bytes changed after capability query; retry startup".into());
                 }
             }
@@ -3733,8 +3785,11 @@ impl ProxyRuntime {
             // 已接受身份缓存以「哪个核 + 哪份配置」为键。Android 上没有核文件可取身份（mtime/size）
             // ⇒ 不进缓存、每次真跑一次 check。这比伪造一个身份诚实：伪造出来的键会在换核（换 aar）
             // 之后仍然命中，等于把闸门静默关掉。
-            let cache_record =
-                binary.and_then(|bin| kernel_gate_cache_record(bin, &gen_out.config));
+            let cache_record = binary.and_then(|bin| {
+                capabilities.binary_sha256.as_deref().and_then(|digest| {
+                    kernel_gate_cache_record_with_digest(bin, &gen_out.config, digest)
+                })
+            });
             if cache_record
                 .as_ref()
                 .is_some_and(|record| self.kernel_gate_cache_hit(record))

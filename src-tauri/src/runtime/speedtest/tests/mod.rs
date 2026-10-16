@@ -4991,3 +4991,42 @@ fn temp_plan_applies_global_utls_to_node_and_shadow_without_changing_the_subscri
         )
     );
 }
+
+#[test]
+fn temp_shadow_disabled_utls_uses_the_same_standard_tls_fallback_as_main() {
+    use polaris_config_engine::user_config::protocol_settings::ShadowTlsSettings;
+    use polaris_config_engine::user_config::utls::UtlsMode;
+    for (mode, fp) in [
+        (Some(UtlsMode::Disabled), Some("chrome")),
+        (None, Some("none")),
+    ] {
+        let mut node = srv("shadow", Protocol::Shadowsocks);
+        node.shadowsocks_settings = Some(Box::new(
+            polaris_config_engine::user_config::protocol_settings::ShadowsocksSettings {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                plugin: None,
+                plugin_opts: None,
+            },
+        ));
+        node.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: mode,
+            fingerprint: fp.map(str::to_owned),
+            password: "pw".into(),
+            sni: "example.com".into(),
+            ..Default::default()
+        });
+        let before = serde_json::to_value(&node).unwrap();
+        let plan = plan_temp_core_with_utls_policy(
+            std::slice::from_ref(&node),
+            &env(),
+            &BTreeMap::new(),
+            None,
+        );
+        assert_eq!(plan.testable.len(), 1);
+        let tls = &plan.testable[0].companion_outbounds[0]["tls"];
+        assert_eq!(tls["enabled"], true);
+        assert!(tls.get("utls").is_none());
+        assert_eq!(serde_json::to_value(node).unwrap(), before);
+    }
+}

@@ -1,3 +1,4 @@
+import type { ServerConfig } from '@/contracts/types';
 import type { TlsSettings } from '@/contracts/types/protocol-settings';
 
 /** Intent controls only. Profiles always come from the actual core report. */
@@ -6,7 +7,7 @@ export const NODE_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
   ['@default', 'node.utls.default'],
   ['none', 'node.utls.disabled'],
 ];
-export const SHADOW_UTLS_OPTIONS = NODE_UTLS_OPTIONS.filter(([v]) => v !== 'none');
+export const SHADOW_UTLS_OPTIONS = NODE_UTLS_OPTIONS;
 export const GLOBAL_UTLS_OPTIONS: readonly (readonly [string, string])[] = [
   ['follow', 'settings.utls.follow'],
   ['default', 'node.utls.default'],
@@ -72,7 +73,7 @@ export interface TlsFingerprintSnapshot {
   unavailableReason: string | null;
 }
 
-type Option = readonly [string, string];
+type Option = readonly [string, string, boolean?];
 function advertisedProfiles(snapshot?: TlsFingerprintSnapshot): readonly Option[] {
   const doc = snapshot?.document;
   if (!snapshot?.identity || !doc?.enabled || doc.schema !== 'polaris-tls-fingerprint-capabilities-v1') return [];
@@ -86,10 +87,10 @@ function advertisedProfiles(snapshot?: TlsFingerprintSnapshot): readonly Option[
 
 /** Shared by desktop/mobile fields. No discovered report means no invented presets.
  * Existing/imported values remain visible through normalizeSelectOptions. */
-export function nodeUtlsOptions(shadow: boolean, snapshot?: TlsFingerprintSnapshot): readonly Option[] {
+export function nodeUtlsOptions(_shadow: boolean, snapshot?: TlsFingerprintSnapshot, reality = false): readonly Option[] {
   const base: Option[] = [['', 'node.utls.legacy']];
   if (snapshot?.document?.enabled !== false) base.push(['@default', 'node.utls.default']);
-  if (!shadow) base.push(['none', 'node.utls.disabled']);
+  base.push(['none', 'node.utls.disabled', reality]);
   return [...base, ...advertisedProfiles(snapshot)];
 }
 export function isUtlsField(key: string): boolean { return key === 'fp' || key === 'stlsFp'; }
@@ -101,4 +102,15 @@ export function globalUtlsOptions(current: string | undefined, snapshot?: TlsFin
   options.push(...advertisedProfiles(snapshot));
   return current && !options.some(([value]) => value === current)
     ? [...options, [current, current] as const] : options;
+}
+
+export function realityUtlsError(server: Pick<ServerConfig, 'security' | 'tlsSettings'>): string | null {
+  const tls = server.tlsSettings;
+  return server.security === 'reality' && (tls?.utlsMode === 'disabled'
+    || tls?.utlsMode !== 'default' && tls?.fingerprint?.trim().toLowerCase() === 'none')
+    ? 'node.utls.realityRequired' : null;
+}
+export function tlsFingerprintStatus(snapshot: TlsFingerprintSnapshot | undefined, t: (key: string, options?: { reason: string }) => string): string | null {
+  if (!snapshot) return t('node.utls.loading');
+  return snapshot.unavailableReason ? t('node.utls.unavailable', { reason: snapshot.unavailableReason }) : null;
 }

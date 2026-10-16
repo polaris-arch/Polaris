@@ -145,7 +145,14 @@ jobs:
       - name: Require all shared carrier prerequisites
         id: shared_ready
         if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
-        run: echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
+        run: |
+          set -euo pipefail
+          echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
+          xcrun swiftc -parse-as-library \
+            src-tauri/gen/apple/PacketTunnel/TunnelLifecycle.swift \
+            crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift \
+            -o "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"
+          "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"
 
       - name: Real device-arm64 Rust and unsigned App plus PacketTunnel
         id: device_arm64

@@ -17,12 +17,19 @@ FUNCTION = SYMBOL[1:]
 
 
 def capability_present(headers, symbols):
-    declarations = [text for text in headers if re.search(r'\b' + FUNCTION + r'\s*\(', text)]
+    # Inspect actual declarations only: comments cannot attest an ABI.
+    texts = [re.sub(r'/\*.*?\*/|//[^\n]*', ' ', text, flags=re.DOTALL) for text in headers]
+    texts = [re.sub(r'(?m)^[ \t]*#[^\n]*', '', text.replace('\\\n', '')) for text in texts]
+    texts = [re.sub(r'\bNS_ASSUME_NONNULL_(?:BEGIN|END)\b', '', text) for text in texts]
+    declarations = [part.strip() for text in texts for part in re.split(r'[;{}]', text)
+                    if re.search(r'\b' + FUNCTION + r'\s*\(', part)]
     defined = bool(re.search(r'\bT\s+' + SYMBOL + r'\s*$', symbols, re.MULTILINE))
     require(bool(declarations) == defined, 'libbox TLS capability declaration/definition mismatch')
-    for text in declarations:
-        require(re.search(r'NSString\s*\*\s*(?:_Nonnull\s+|_Nullable\s+)?' + FUNCTION +
-                          r'\s*\(\s*NSError\s*\*\s*(?:_Nullable\s*)?\*\s*(?:_Nullable\s*)?\w+\s*\)', text),
+    if declarations:
+        require(len(declarations) == 1, 'libbox TLS capability declaration is not unique')
+        require(re.fullmatch(r'(?:FOUNDATION_EXPORT\s+)?NSString\s*\*\s*_Nonnull\s+' + FUNCTION +
+                             r'\s*\(\s*NSError\s*\*\s*_Nullable\s*\*\s*_Nullable\s+\w+\s*\)',
+                             declarations[0]),
                 'libbox TLS capability C ABI differs from the optional Swift bridge')
     return defined
 

@@ -55,7 +55,7 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
     rt.config.save_full(cfg).expect("seed D");
     let saved = rt.config.current().unwrap();
     mark_running_with_snapshot(rt, &saved);
-    *rt.captured_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
+    *rt.test_measurement_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
     rt.switch_snapshot
         .write()
         .unwrap()

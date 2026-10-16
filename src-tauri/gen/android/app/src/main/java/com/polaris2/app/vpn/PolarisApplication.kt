@@ -77,6 +77,8 @@ class PolarisApplication : Application() {
         @Volatile
         private var setupDone = false
 
+        val isSetupComplete: Boolean get() = setupDone
+
         /**
          * 幂等且阻塞：调用返回后 libbox 要么可用，要么把首次失败的原因抛出来。
          *

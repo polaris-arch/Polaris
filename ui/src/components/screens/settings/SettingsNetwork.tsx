@@ -15,7 +15,7 @@ import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { globalUtlsOptions } from '@/domain/utls';
+import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { useTranslation } from 'react-i18next';
 import type { SpeedTestMeteredPolicy, UserConfig } from '@/contracts/types';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
@@ -130,6 +130,7 @@ function generateSecret(): string {
 }
 
 export default function SettingsNetwork({ config, update }: SettingsNetworkProps) {
+  const tlsFingerprints = useTlsFingerprints();
   // i18n 实例：面板窗口的语言由 `open_singbox_dashboard(locale)` 预写，需当前语言码。
   const { t, i18n } = useTranslation();
   const openDialog = useDialogStore((state) => state.open);
@@ -504,7 +505,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             ]}
           />
         </SetRow>
-        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')}>
+        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={tlsFingerprintStatus(tlsFingerprints, t)}>
           <Select
             value={config.utlsPolicy ?? 'follow'}
             aria-label={t('settings.utls.label')}

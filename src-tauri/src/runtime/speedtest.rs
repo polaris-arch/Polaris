@@ -3082,7 +3082,7 @@ impl TempCoreSession {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(expected) = tls_capabilities.binary_sha256.as_deref() {
-            if crate::runtime::tls_fingerprints::binary_digest(&binary).as_deref() != Ok(expected) {
+            if !crate::runtime::tls_fingerprints::cached_digest_matches(&binary, expected) {
                 retire_temp_config(&config_path, keep_config);
                 return BatchOutcome::Failed {
                     detail: "Core bytes changed after temporary-core validation".into(),

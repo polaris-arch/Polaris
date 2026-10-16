@@ -27,8 +27,12 @@ function query() {
       snapshot = info;
       publish();
     }
-  }).catch(() => {
-    if (requested === epoch) { snapshot = undefined; publish(); }
+  }).catch((error: unknown) => {
+    if (requested === epoch) {
+      snapshot = { observationScope: 'unavailable', byteIdentityScope: 'unavailable', identity: null,
+        binarySha256: null, document: null, unavailableReason: error instanceof Error ? error.message : String(error) };
+      publish();
+    }
   }).finally(() => {
     inFlight = false;
     if (requested !== epoch && listeners.size > 0) query();
@@ -40,7 +44,8 @@ export function subscribeTlsFingerprints(listener: () => void) {
     const offStarted = proxyApi.onStarted(refresh);
     const offStopped = proxyApi.onStopped(refresh);
     window.addEventListener('focus', refresh);
-    cleanup = () => { offStarted(); offStopped(); window.removeEventListener('focus', refresh); };
+    window.addEventListener('polaris-libbox-ready', refresh);
+    cleanup = () => { offStarted(); offStopped(); window.removeEventListener('focus', refresh); window.removeEventListener('polaris-libbox-ready', refresh); };
     refresh();
   }
   return () => {

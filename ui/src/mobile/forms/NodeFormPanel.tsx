@@ -1,3 +1,4 @@
+import { realityUtlsError } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
@@ -361,6 +362,13 @@ export function NodeFormPanel({
       // 同协议编辑 → base 起底保全非模型字段（R5）；改型/新增 → 干净 base 防旧协议残留。
       const codecBase = base !== undefined && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
+      const utlsError = realityUtlsError(full);
+      if (utlsError) {
+        revealGroup(nodeFieldGroup(proto, 'fp') ?? 'basic');
+        setNotice({ tone: 'err', text: t(utlsError) });
+        return;
+      }
+
       if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId !== undefined || bindInterface === '') delete full.bindInterface;
       else full.bindInterface = bindInterface;

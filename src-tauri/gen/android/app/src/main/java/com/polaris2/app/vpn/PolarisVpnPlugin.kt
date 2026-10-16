@@ -680,31 +680,43 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun tlsFingerprintCapabilities(invoke: Invoke) {
         Thread({
             try {
-                val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libbox.so").canonicalFile
-                // A packaged file by itself is not proof of the loaded JNI image.
-                val mapped = java.io.File("/proc/self/maps").useLines { lines ->
-                    lines.any { it.trimEnd().endsWith(" " + library.path) }
-                }
-                require(mapped && library.isFile) { "Loaded libbox image could not be identified" }
-                fun digest(): String {
-                    val hash = java.security.MessageDigest.getInstance("SHA-256")
-                    library.inputStream().use { input ->
-                        val buffer = ByteArray(65536)
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            hash.update(buffer, 0, count)
+                LoadedLibboxIdentity.readAfterSetup(
+                    ready = { PolarisApplication.isSetupComplete },
+                    setup = { PolarisApplication.ensureSetup() },
+                    completed = { (activity as? com.polaris2.app.MainActivity)?.notifyLibboxReady() },
+                    read = {
+                        val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libbox.so").canonicalFile
+                        java.io.FileInputStream(library).use { input ->
+                            val stat = android.system.Os.fstat(input.fd)
+                            fun mappedIdentity(): Boolean = java.io.File("/proc/self/maps").useLines { lines ->
+                                lines.any { line ->
+                                    LoadedLibboxIdentity.matchesMapping(line, library.path, stat.st_ino,
+                                        android.system.Os.major(stat.st_dev).toLong(), android.system.Os.minor(stat.st_dev).toLong())
+                                }
+                            }
+                            require(mappedIdentity()) { "Loaded libbox device/inode does not match the opened file" }
+                            fun digest(): String {
+                                input.channel.position(0)
+                                val hash = java.security.MessageDigest.getInstance("SHA-256")
+                                val buffer = ByteArray(65536)
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    hash.update(buffer, 0, count)
+                                }
+                                return hash.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+                            }
+                            val before = digest()
+                            val method = runCatching { Libbox::class.java.getMethod("tlsFingerprintCapabilities") }.getOrNull()
+                            val document = method?.invoke(null) as? String
+                            require((document?.toByteArray(Charsets.UTF_8)?.size ?: 0) <= 65536 && before == digest() && mappedIdentity() &&
+                                android.system.Os.fstat(input.fd).let { it.st_dev == stat.st_dev && it.st_ino == stat.st_ino && it.st_size == stat.st_size && it.st_mtime == stat.st_mtime && it.st_ctime == stat.st_ctime }) {
+                                "Loaded core identity changed or capability report exceeds budget"
+                            }
+                            invoke.resolve(JSObject().put("document", document ?: org.json.JSONObject.NULL).put("binarySha256", before))
                         }
-                    }
-                    return hash.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
-                }
-                val before = digest()
-                val method = runCatching { Libbox::class.java.getMethod("tlsFingerprintCapabilities") }.getOrNull()
-                val document = method?.invoke(null) as? String
-                require((document?.toByteArray(Charsets.UTF_8)?.size ?: 0) <= 65536 && before == digest()) {
-                    "Loaded core identity changed or capability report exceeds budget"
-                }
-                invoke.resolve(JSObject().put("document", document ?: org.json.JSONObject.NULL).put("binarySha256", before))
+                    },
+                )
             } catch (error: Throwable) {
                 invoke.reject("Loaded libbox TLS capabilities unavailable: " + (error.cause?.message ?: error.message))
             }

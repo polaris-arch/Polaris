@@ -18,6 +18,9 @@ pub enum UtlsMode {
 }
 
 /// Recognized JSON IDs. Runtime capability reports/checks decide actual support.
+pub const REALITY_UTLS_REQUIRED: &str =
+    "REALITY requires uTLS; choose the core default or a supported fingerprint.";
+
 pub const SUPPORTED_PROFILES: &[&str] = &[
     "chrome",
     "chrome_155",
@@ -160,19 +163,28 @@ pub fn effective_server_for_platform<'a>(
         } else {
             "none"
         };
+        let reality = server
+            .security
+            .as_ref()
+            .is_some_and(SecurityMode::is_reality);
+        // Historical profile=none has the same REALITY conflict as explicit disabled.
+        if reality
+            && node_utls(
+                tls.and_then(|t| t.utls_mode),
+                tls.and_then(|t| t.fingerprint.as_deref()),
+                legacy,
+            )
+            .is_none()
+        {
+            return Err(REALITY_UTLS_REQUIRED);
+        }
         let utls = validate(
             tls.and_then(|t| t.utls_mode),
             tls.and_then(|t| t.fingerprint.as_deref()),
             legacy,
         )?;
-        let reality = server
-            .security
-            .as_ref()
-            .is_some_and(SecurityMode::is_reality);
         if reality && utls.is_none() {
-            return Err(
-                "REALITY requires uTLS; choose the core default or a supported fingerprint.",
-            );
+            return Err(REALITY_UTLS_REQUIRED);
         }
         let engine = tls.and_then(|t| t.engine.as_deref());
         // Reality always uses the Go implementation in the existing builder.
@@ -186,9 +198,9 @@ pub fn effective_server_for_platform<'a>(
         }
     }
     if let Some(tls) = &effective.shadow_tls_settings {
-        if validate(tls.utls_mode, tls.fingerprint.as_deref(), "chrome")?.is_none() {
-            return Err("Disabling uTLS for ShadowTLS is not supported by the bundled core.");
-        }
+        // ShadowTLS keeps TLS enabled; typed disabled / link fp=none only
+        // omits uTLS and uses the kernel's standard-TLS fallback.
+        validate(tls.utls_mode, tls.fingerprint.as_deref(), "chrome")?;
     }
     Ok(effective)
 }

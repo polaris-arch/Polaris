@@ -1,5 +1,11 @@
 import Foundation
 
+// The optional C query must be exported by this extension, not another image
+// with the same symbol name. This binds on-disk container identity only.
+func tlsCapabilityImageMatches(_ loadedImage: String, executable: URL) -> Bool {
+    URL(fileURLWithPath: loadedImage).resolvingSymlinksInPath() == executable.resolvingSymlinksInPath()
+}
+
 struct TunnelIdentity: Codable, Equatable {
     let sessionID: String
     let requestID: String

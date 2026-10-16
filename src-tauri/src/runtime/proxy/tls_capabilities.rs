@@ -3,11 +3,48 @@ use crate::runtime::tls_fingerprints::Snapshot;
 use std::path::Path;
 
 impl ProxyRuntime {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(super) fn direct_tls_snapshot(&self, generation: u64) -> Snapshot {
+        // Same lock order as native birth: Child first, proof second.
+        let Ok(mut slot) = self.child.lock() else {
+            return Snapshot::unavailable("Core custody is unavailable");
+        };
+        let Ok(captured) = self.captured_cli_run.lock() else {
+            return Snapshot::unavailable("Core byte proof is unavailable");
+        };
+        match captured.as_ref() {
+            Some((captured_generation, identity, entry))
+                if *captured_generation == generation
+                    && *captured_generation == self.core_generation()
+                    && slot.observe_running(identity)
+                        == polaris_core_supervisor::ChildObservation::Alive
+                    && entry.still_current() =>
+            {
+                entry.snapshot.clone()
+            }
+            _ => Snapshot::unavailable(
+                "Running core bytes could not be bound to the retained native instance",
+            ),
+        }
+    }
+
     pub(crate) async fn tls_fingerprint_capabilities(&self) -> Snapshot {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let generation = self.core_generation();
             let status = self.status();
+            if status.running
+                && !self
+                    .core_via_helper
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return self.direct_tls_snapshot(generation);
+            }
+            // Linux /proc/<pid>/exe identifies the loaded image even after rename.
+            #[cfg(not(target_os = "linux"))]
+            if status.running {
+                return Snapshot::unavailable("Helper loaded-image byte proof is unavailable");
+            }
             let binary = match self.tls_capability_binary() {
                 Ok(path) => path,
                 Err(e) => return Snapshot::unavailable(e),

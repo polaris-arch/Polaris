@@ -119,3 +119,38 @@ fn old_loaded_library_keeps_byte_identity_without_inventing_a_capability_report(
         .binary_sha256
         .is_none());
 }
+
+#[tokio::test]
+async fn file_proof_rejects_atomic_replacement_even_with_equal_length_and_restored_mtime() {
+    let dir = std::env::temp_dir().join(format!("polaris-tls-identity-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("selected-core");
+    std::fs::write(&path, b"original").unwrap();
+    let proof = open_observation(&path).await.unwrap();
+    let before = proof.snapshot.binary_sha256.clone();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let replacement = dir.join("replacement");
+    std::fs::write(&replacement, b"replaced").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(
+        !proof.still_current(),
+        "a matching pathname/size/mtime does not identify the old bytes"
+    );
+    assert_ne!(
+        open_observation(&path)
+            .await
+            .unwrap()
+            .snapshot
+            .binary_sha256,
+        before
+    );
+    assert!(!proof.matches(&dir.join("another-selection")));
+    drop(proof);
+    std::fs::remove_dir_all(dir).unwrap();
+}

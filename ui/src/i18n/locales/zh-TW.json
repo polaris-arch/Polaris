@@ -1896,7 +1896,10 @@
     "utls": {
       "legacy": "未設定（相容原預設）",
       "default": "核心預設指紋",
-      "disabled": "關閉 uTLS（保留 TLS）"
+      "disabled": "關閉 uTLS（保留 TLS）",
+      "loading": "正在讀取核心指紋能力…",
+      "unavailable": "無法讀取指紋能力：{{reason}}。保留現有設定，由實際核心檢查。",
+      "realityRequired": "REALITY 需要 uTLS，請選擇核心預設或受支援的指紋。"
     },
     "add": "新增",
     "addTitle": "新增節點",

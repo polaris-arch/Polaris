@@ -97,6 +97,7 @@ impl CheckIo for NativeIo {}
 
 #[derive(Default)]
 struct OutputCapture {
+    max_bytes: Option<usize>,
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
     errors: Mutex<Vec<String>>,
@@ -123,9 +124,36 @@ impl OutputCapture {
                     return Err("declared validation pipe is missing".into());
                 };
                 let mut bytes = Vec::new();
-                if let Err(error) = pipe.read_to_end(&mut bytes).await {
+                let mut chunk = [0_u8; 8192];
+                let mut overflow = false;
+                loop {
+                    match pipe.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let remaining = output
+                                .max_bytes
+                                .map(|limit| limit.saturating_sub(bytes.len()))
+                                .unwrap_or(count);
+                            bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+                            // Continue draining both pipes after overflow, with bounded retained memory.
+                            overflow |= count > remaining;
+                        }
+                        Err(error) => {
+                            if let Ok(mut errors) = output.errors.lock() {
+                                errors.push(error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+                if overflow {
                     if let Ok(mut errors) = output.errors.lock() {
-                        errors.push(error.to_string());
+                        errors.push("TLS capability output exceeds budget".into());
+                    }
+                }
+                if output.max_bytes.is_some() && std::str::from_utf8(&bytes).is_err() {
+                    if let Ok(mut errors) = output.errors.lock() {
+                        errors.push("TLS capability output is not UTF-8".into());
                     }
                 }
                 let buffer = if stderr {
@@ -736,10 +764,21 @@ impl CheckCustody {
         }
     }
 
+    #[cfg(test)]
     fn spawn(
         &self,
         binary: &Path,
         config: &Path,
+        io: Arc<dyn CheckIo>,
+    ) -> Result<Result<(CheckRequestRef, Arc<OutputCapture>), String>, ValidationLifecycleError>
+    {
+        self.spawn_mode(binary, Some(config), io)
+    }
+
+    fn spawn_mode(
+        &self,
+        binary: &Path,
+        config: Option<&Path>,
         io: Arc<dyn CheckIo>,
     ) -> Result<Result<(CheckRequestRef, Arc<OutputCapture>), String>, ValidationLifecycleError>
     {
@@ -754,10 +793,14 @@ impl CheckCustody {
             identity: Arc::new(CheckRequestIdentity),
         };
         let parent = config
+            .unwrap_or(Path::new("."))
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let name = config.file_name().unwrap_or_default().to_string_lossy();
+        let name = config
+            .and_then(Path::file_name)
+            .unwrap_or_default()
+            .to_string_lossy();
         let snapshot = parent.join(format!(".polaris-check-{}-{id}-{name}", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -766,7 +809,10 @@ impl CheckCustody {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let output = Arc::new(OutputCapture::default());
+        let output = Arc::new(OutputCapture {
+            max_bytes: config.is_none().then_some(64 * 1024),
+            ..OutputCapture::default()
+        });
         let run = CheckRun {
             completion: Arc::new(CheckCompletion::default()),
             request: request.clone(),
@@ -787,35 +833,41 @@ impl CheckCustody {
         // Retain the original admission before entering the synchronous factory.
         // A panic/unreturned factory cannot become no-child from an empty slot.
         state.runs.insert(id, run);
-        let mut destination = match options.open(&snapshot) {
-            Ok(file) => file,
-            Err(error) => {
+        if let Some(config) = config {
+            let mut destination = match options.open(&snapshot) {
+                Ok(file) => file,
+                Err(error) => {
+                    drop(state);
+                    self.retire(&request)?;
+                    return Ok(Err(error.to_string()));
+                }
+            };
+            let run = state.runs.get_mut(&id).expect("admitted validation run");
+            match &mut run.tail {
+                CheckTail::PathSnapshot { created, .. } => *created = true,
+                #[cfg(target_os = "linux")]
+                CheckTail::OwnedSealedInputs { .. } => {}
+            }
+            let copied =
+                File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
+            drop(destination);
+            if let Err(error) = copied {
+                run.debt = true;
                 drop(state);
                 self.retire(&request)?;
                 return Ok(Err(error.to_string()));
             }
-        };
+        }
         let run = state.runs.get_mut(&id).expect("admitted validation run");
-        match &mut run.tail {
-            CheckTail::PathSnapshot { created, .. } => *created = true,
-            #[cfg(target_os = "linux")]
-            CheckTail::OwnedSealedInputs { .. } => {}
-        }
-        let copied =
-            File::open(config).and_then(|mut source| io::copy(&mut source, &mut destination));
-        drop(destination);
-        if let Err(error) = copied {
-            run.debt = true;
-            drop(state);
-            self.retire(&request)?;
-            return Ok(Err(error.to_string()));
-        }
         let mut builder = tokio::process::Command::new(binary);
+        if config.is_some() {
+            builder
+                .args(["--disable-color", "check", "-c"])
+                .arg(&snapshot);
+        } else {
+            builder.args(["tools", "tls-fingerprints"]);
+        }
         builder
-            .arg("--disable-color")
-            .arg("check")
-            .arg("-c")
-            .arg(&snapshot)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -1082,7 +1134,17 @@ impl CheckCustody {
         timeout: Duration,
         io: Arc<dyn CheckIo>,
     ) -> Result<RawCheck, ValidationLifecycleError> {
-        let (request, output) = match self.spawn(binary, config, io)? {
+        self.run_mode(binary, Some(config), timeout, io).await
+    }
+
+    async fn run_mode(
+        self: &Arc<Self>,
+        binary: &Path,
+        config: Option<&Path>,
+        timeout: Duration,
+        io: Arc<dyn CheckIo>,
+    ) -> Result<RawCheck, ValidationLifecycleError> {
+        let (request, output) = match self.spawn_mode(binary, config, io)? {
             Ok(started) => started,
             Err(error) => return Ok(RawCheck::SpawnFailed(error)),
         };
@@ -1289,6 +1351,17 @@ pub(super) async fn run_native_check(
     registry().settle_debts().await?;
     registry()
         .run(binary, config, timeout, Arc::new(NativeIo))
+        .await
+}
+
+/// Fixed read-only query, admitted and drained by the same exit custody as checks.
+pub async fn run_tls_fingerprint_query(
+    binary: &Path,
+    timeout: Duration,
+) -> Result<RawCheck, ValidationLifecycleError> {
+    registry().settle_debts().await?;
+    registry()
+        .run_mode(binary, None, timeout, Arc::new(NativeIo))
         .await
 }
 

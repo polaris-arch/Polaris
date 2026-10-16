@@ -3,6 +3,10 @@ import Foundation
 @main
 struct LifecycleTests {
     static func main() throws {
+        let executable = URL(fileURLWithPath: "/app/PlugIns/PacketTunnel.appex/PacketTunnel")
+        assert(tlsCapabilityImageMatches(executable.path, executable: executable))
+        assert(!tlsCapabilityImageMatches("/other/PacketTunnel", executable: executable))
+        assert(!tlsCapabilityImageMatches("/app/Frameworks/Other.framework/Other", executable: executable))
         let identity = TunnelIdentity(sessionID: "session-a", requestID: "start-a", configDigest: "digest-a")
         let lifecycle = TunnelLifecycle()
         let start = try lifecycle.start(identity)

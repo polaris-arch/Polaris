@@ -52,6 +52,8 @@ pub const INVALID_REASON_DETOUR_CASCADE: &str = "detour-cascade";
 /// 渲染端 `ui/src/domain/invalid-node-reason.ts` 未登记本 token 时**只渲染通用句**（「节点配置无效，
 /// 已在启动时跳过」），绝不把 token 原样拼给用户——那张表的回落语义就是为这种情况留的。补人话文案
 /// 需要动 `ui/src/i18n/locales/*.json`，不在本批射程内。
+pub const INVALID_REASON_REALITY_UTLS_DISABLED: &str = "reality-utls-disabled";
+
 pub const INVALID_REASON_CUSTOM_MALFORMED: &str = "custom-outbound-malformed";
 
 /// Tailscale `control_url` 非法（IP 字面量 / 缺 scheme / host 畸形）的 reason token 前缀族。
@@ -361,12 +363,26 @@ pub fn build_outbounds_with_runtime_bindings(
             continue;
         }
 
-        let effective = crate::user_config::utls::effective_server_for_platform(
+        let effective = match crate::user_config::utls::effective_server_for_platform(
             server,
             config.utls_policy.as_deref(),
             &deps.platform,
-        )
-        .map_err(|reason| format!("uTLS: {} ({reason})", server.id))?;
+        ) {
+            Ok(effective) => effective,
+            Err(crate::user_config::utls::REALITY_UTLS_REQUIRED) => {
+                if config.selected_server_id.as_deref() == Some(server.id.as_str()) {
+                    return Err(format!(
+                        "uTLS: {} ({})",
+                        server.id,
+                        crate::user_config::utls::REALITY_UTLS_REQUIRED
+                    ));
+                }
+                deps.gate_invalid_nodes
+                    .insert(server.id.clone(), INVALID_REASON_REALITY_UTLS_DISABLED);
+                continue;
+            }
+            Err(reason) => return Err(format!("uTLS: {} ({reason})", server.id)),
+        };
         let server = effective.as_ref();
 
         let downgrade_mesh = crate::builder::endpoint_routes::mesh_uses_system_interface(server)

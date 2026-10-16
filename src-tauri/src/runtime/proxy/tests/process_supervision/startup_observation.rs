@@ -127,3 +127,65 @@ async fn confirmed_exit_remains_dead_and_absent_run_yields_to_owner() {
         CoreReadyOutcome::Superseded
     );
 }
+
+#[tokio::test]
+async fn direct_capability_bytes_require_retained_run_and_replaced_files_do_not_become_running_bytes(
+) {
+    let (rt, dir) = test_runtime();
+    let path = dir.join("proof-core");
+    std::fs::write(&path, b"unexecutable old-core identity fixture").unwrap();
+    // Even an old core with no report has a proven file digest.
+    let snapshot = crate::runtime::tls_fingerprints::probe_cli(&path).await;
+    let proof = crate::runtime::tls_fingerprints::cached_cli(&path).unwrap();
+    let identity = install_observed_run(&rt);
+    let generation = rt.core_generation();
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, identity.clone(), proof));
+    assert_eq!(
+        rt.direct_tls_snapshot(generation).binary_sha256,
+        snapshot.binary_sha256
+    );
+    *rt.captured_cli_run.lock().unwrap() = Some((
+        generation,
+        RunIdentity::new(),
+        crate::runtime::tls_fingerprints::cached_cli(&path).unwrap(),
+    ));
+    assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
+    *rt.captured_cli_run.lock().unwrap() = Some((
+        generation,
+        identity.clone(),
+        crate::runtime::tls_fingerprints::cached_cli(&path).unwrap(),
+    ));
+    let replacement = dir.join("next-core");
+    std::fs::write(&replacement, b"unexecutable new-core identity fixture").unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
+    rt.captured_cli_run.lock().unwrap().take();
+    let mut run = rt.child.lock().unwrap().take_running_legacy().unwrap();
+    let child = run.child_for_test();
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_measurements_invalidate_when_actual_selected_source_is_replaced_or_changed() {
+    let (rt, dir) = test_runtime();
+    let path = dir.join("temp-proof-core");
+    std::fs::write(&path, b"not executable A").unwrap();
+    *rt.core_binary_override.lock().unwrap() = Some(path.clone());
+    let observed = crate::runtime::tls_fingerprints::probe_cli(&path).await;
+    rt.remember_temp_core_sha256(observed.binary_sha256.clone());
+    assert_eq!(rt.measurement_core_sha256(), observed.binary_sha256);
+    let next = dir.join("next-core");
+    std::fs::write(&next, b"not executable B").unwrap();
+    *rt.core_binary_override.lock().unwrap() = Some(next.clone());
+    assert!(
+        rt.measurement_core_sha256().is_none(),
+        "source selection changes invalidate old results immediately"
+    );
+    *rt.core_binary_override.lock().unwrap() = Some(path.clone());
+    std::fs::rename(&next, &path).unwrap();
+    assert!(
+        rt.measurement_core_sha256().is_none(),
+        "same-path replacement does not reuse the previous measurement hash"
+    );
+}

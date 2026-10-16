@@ -17,6 +17,17 @@ class OptionalTLSCapabilityLink(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 subject.capability_present(headers, symbols)
 
+    def test_comments_and_conflicting_real_declarations_cannot_attest_abi(self):
+        good = 'NSString* _Nonnull LibboxTLSFingerprintCapabilities(NSError* _Nullable* _Nullable error);'
+        bad = 'void LibboxTLSFingerprintCapabilities(void);'
+        symbols = 'T ' + subject.SYMBOL + '\n'
+        for header in [bad + '/* ' + good + ' */', bad + '// ' + good,
+                       good + '\n' + bad, good + '\n' + good, good + good]:
+            with self.assertRaises(RuntimeError):
+                subject.capability_present([header], symbols)
+        self.assertFalse(subject.capability_present(['/* ' + good + ' */'], ''))
+        self.assertTrue(subject.capability_present(['// irrelevant\n' + good], symbols))
+
     def test_final_definition_without_dynamic_export_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

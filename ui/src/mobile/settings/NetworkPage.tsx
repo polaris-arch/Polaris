@@ -32,7 +32,7 @@ import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-
 import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
 import type { SpeedTestMeteredPolicy } from '@/contracts/types';
-import { globalUtlsOptions } from '@/domain/utls';
+import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { MobileSelect, MobileSwitch, MobileTextInput, SettingsGroup, SettingsRow } from './SettingsChrome';
 import type { MobileSettingsPageProps } from './settings-pages';
 
@@ -218,7 +218,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
             </MobileSelect>
           }
         />
-        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={t('settings.utls.description')}
+        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={t('settings.utls.description') + ' ' + (tlsFingerprintStatus(tlsFingerprints, t) ?? '')}
           control={
             <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>

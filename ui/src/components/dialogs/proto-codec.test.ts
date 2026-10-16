@@ -1193,7 +1193,7 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
       expect(values[0], `${proto} 的 fp 首档必须是「不启用」`).toBe('');
-      expect(values).toContain('chrome');
+      expect(values).toEqual(['', '@default', 'none']);
       // 新建路径（draftFromSpecs）不得把 chrome 当默认值 seed 进草稿。
       expect(draftFromSpecs(allFields(proto)).fp).toBe('');
       const out = protoCodec[proto].toConfig(
@@ -1202,11 +1202,11 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
       );
       expect(out.tlsSettings?.fingerprint).toBeUndefined();
     }
-    // 阴性对照：vless/anytls 的后端缺省就是 chrome，那两张表照旧以 chrome 起头（本条改动没波及它们）。
+    // vless/anytls 同样保留 unset intent；协议默认由后端决定，浏览器项来自实际能力。
     for (const proto of ['vless', 'anytls'] as const) {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
-      expect(values[0]).toBe('chrome');
+      expect(values).toEqual(['', '@default', 'none']);
     }
   });
 

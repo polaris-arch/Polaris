@@ -1689,6 +1689,16 @@ pub struct ProxyRuntime {
     /// Actual ready-core bytes, scoped to the generation which observed them.
     captured_core_sha256: Mutex<Option<(u64, String)>>,
     captured_temp_core_sha256: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_measurement_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_cli_run: Mutex<
+        Option<(
+            u64,
+            process_supervision::RunIdentity,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
+    >,
     /// 起核用的核二进制路径覆盖（**仅单测置位**，同 `stale_sweep_disabled` 的先例；生产恒 `None`）。
     ///
     /// 「起核可取消」的门必须有个**真能 spawn 的**假核（起来就死 / 起来但永不就绪），否则退避中断与
@@ -1881,6 +1891,10 @@ impl ProxyRuntime {
             test_restart_after_claim: Mutex::new(None),
             network_watcher: Mutex::new(None),
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_cli_run: Mutex::new(None),
+            #[cfg(test)]
+            test_measurement_core_sha256: Mutex::new(None),
             captured_core_sha256: Mutex::new(None),
             captured_temp_core_sha256: Mutex::new(None),
             #[cfg(test)]
@@ -1963,12 +1977,50 @@ impl ProxyRuntime {
     }
 
     pub(crate) fn measurement_core_sha256(&self) -> Option<String> {
-        if !self.status().running {
-            return self.captured_temp_core_sha256.lock().ok()?.clone();
+        let status = self.status();
+        #[cfg(test)]
+        if status.running {
+            if let Some((generation, digest)) =
+                self.test_measurement_core_sha256.lock().ok()?.as_ref()
+            {
+                if *generation == self.core_generation() {
+                    return Some(digest.clone());
+                }
+            }
         }
-        let captured = self.captured_core_sha256.lock().ok()?;
-        let (generation, digest) = captured.as_ref()?;
-        (*generation == self.core_generation()).then(|| digest.clone())
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            if status.running {
+                // Direct Windows/Mac use the actual retained Child identity and
+                // the file proof bracketed around that Child's synchronous birth.
+                if !self.core_via_helper.load(Ordering::SeqCst) {
+                    return self
+                        .direct_tls_snapshot(self.core_generation())
+                        .binary_sha256;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let image = std::path::PathBuf::from(format!("/proc/{}/exe", status.pid));
+                    let cached = crate::runtime::tls_fingerprints::cached_cli(&image)?;
+                    return cached.snapshot.binary_sha256;
+                }
+                #[cfg(not(target_os = "linux"))]
+                return None; // A helper-reported pathname alone cannot identify loaded bytes.
+            }
+            let digest = self.captured_temp_core_sha256.lock().ok()?.clone()?;
+            let binary = self.core_binary_for_start().ok()?;
+            return crate::runtime::tls_fingerprints::cached_digest_matches(&binary, &digest)
+                .then_some(digest);
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            if !status.running {
+                return self.captured_temp_core_sha256.lock().ok()?.clone();
+            }
+            let captured = self.captured_core_sha256.lock().ok()?;
+            let (generation, digest) = captured.as_ref()?;
+            (*generation == self.core_generation()).then(|| digest.clone())
+        }
     }
 
     pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
