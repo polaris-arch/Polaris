@@ -64,25 +64,14 @@
 
 بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
 
-### بسته‌های Android
-
-نام بسته‌های فعلی Android مطابق [release-assets.mjs](scripts/release-assets.mjs) است؛ `<version>` نسخه برنامه را نشان می‌دهد. Universal فقط ARM64 / ARMv7 را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد.
-
-| معماری | فایل |
-|---|---|
-| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
-| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
-| Universal | `Polaris_<version>_universal-android.apk` |
-
-### دانلودهای منتشرشده v1.0.0
-
-فایل‌های زیر [دارایی‌های منتشرشدهٔ v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) هستند؛ نسخه و نام فایل را با انتشار انتخاب‌شده تطبیق دهید. بسته‌های دسکتاپ برای macOS Apple Silicon / Intel، ‏Windows x64 و Linux amd64 ارائه شده‌اند. این انتشار برای Android یک APK امضاشدهٔ ARM64 دارد. فایل دانلودشده را با `SHA256SUMS` در همان صفحه بررسی کنید.
+فرایند انتشار فعلی از نام فایل‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` نسخه برنامه بدون پیشوند `v` است. برای macOS بسته‌های جداگانه Apple Silicon / Intel، برای Windows بسته x64 و برای Linux بسته amd64 در نظر گرفته شده است. بسته‌های Android به‌ترتیب ARM64، ‏ARMv7 و universal آمده‌اند؛ universal فقط همین دو معماری ARM را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد. فایل‌ها را با `SHA256SUMS` در همان صفحه بررسی کنید.
 
 | سکو | فایل |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 بسته‌های دسکتاپ با گواهی پولی امضای کد امضا نمی‌شوند؛ اجرای نخست ممکن است به تأیید دستی نیاز داشته باشد.
 
@@ -112,20 +101,11 @@ xattr -cr /Applications/Polaris.app
 
 ## ساخت
 
-این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. این توضیحات ورودی‌های ساخت یا نتیجهٔ آزمون نصب دانلودهای v1.0.0 بالا را بیان نمی‌کند. قراردادهای بسته‌بندی سکوها در راهنمای ساخت پایین آمده است.
+این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. ساخت موفق کد منبع به معنی تأیید عملکرد بسته‌های منتشرشده نیست. وابستگی‌های سکوها، ابزارهای موبایل و قراردادهای بسته‌بندی در راهنماهای زیر آمده است.
 
-راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md). برای iOS راهنمای ساخت از کد وجود دارد، اما IPA منتشرشده‌ای ارائه نشده است. کامپایل بدون امضا و نصب روی دستگاه با امضای شخصی مراحل جداگانه‌اند و جایگزین آزمون عملکرد نیستند.
+راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md).
 
-### نام بسته‌های ساخت از کد فعلی
-
-فرایند ساخت فعلی از نام‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` جای‌نگهدار نسخه برنامه است. این‌ها قرارداد نام‌گذاری بسته‌ها هستند و با نام فایل‌های تاریخی v1.0.0 در بالا تفاوت دارند؛ امکان دانلود به فایل‌های واقعی Release انتخاب‌شده بستگی دارد. بسته universal اندروید فقط ARM64 / ARMv7 را شامل می‌شود، نه x86.
-
-| پلتفرم | نام بسته‌ها |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+برای iOS در حال حاضر IPA یا بسته جیلبریک منتشر نمی‌شود و سازگاری با جیلبریک تأیید نشده است. امضای شخصی برای دستگاه بدون جیلبریک به حساب Apple Developer Program با قابلیت Network Extension و [پروفایل‌های provisioning](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) منطبق با مجوزهای App، ‏PacketTunnel و App Group نیاز دارد. حساب رایگان [Personal Team از NE provider پشتیبانی نمی‌کند](https://developer.apple.com/forums/thread/128767) و نصب خارج از فروشگاه به‌تنهایی این مجوزها را اعطا نمی‌کند. کامپایل یا نصب موفق جایگزین آزمون عملکرد نیست.
 
 نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26)، pnpm 11.24.0، Go و [Tauri CLI 2](https://v2.tauri.app/).
 

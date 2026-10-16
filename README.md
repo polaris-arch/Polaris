@@ -58,25 +58,14 @@
 
 从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包。
 
-### Android 安装包
-
-当前 Android 构建产物按 [release-assets.mjs](scripts/release-assets.mjs) 命名如下，`<version>` 为应用版本。universal 仅含 ARM64 / ARMv7，不含 x86；下载时以所选 Release 的实际附件为准。
-
-| 架构 | 文件 |
-|---|---|
-| ARM64 | `Polaris_<version>_arm64-v8a-android.apk` |
-| ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
-| Universal | `Polaris_<version>_universal-android.apk` |
-
-### v1.0.0 已发布下载
-
-以下为 [v1.0.0 已发布资产](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0)；版本与文件名以所选 Release 为准。桌面提供 macOS Apple Silicon / Intel、Windows x64、Linux amd64；该版本 Android 提供正式签名的 ARM64 APK。可用同页 `SHA256SUMS` 核对下载文件。
+当前发布流程按 [release-assets.mjs](scripts/release-assets.mjs) 使用以下文件名，`<version>` 为应用版本（不含 `v` 前缀）。macOS 按 Apple Silicon / Intel 分包，Windows 为 x64，Linux 为 amd64；Android 依次为 ARM64、ARMv7 和 universal，universal 仅含这两种 ARM 架构，不含 x86。下载时以所选 Release 的实际附件为准，并用同页 `SHA256SUMS` 核对文件。
 
 | 平台 | 文件 |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`；免安装用 `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 桌面安装包当前不做付费代码签名，首次启动需按平台放行。
 
@@ -105,20 +94,11 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 
 ## 构建
 
-以下供维护者构建当前源码，示例为 Linux；不代表上文 v1.0.0 下载包的构建输入或安装验收。平台打包约定见下方构建文档。
+以下供维护者构建当前源码，示例为 Linux；源码构建成功不等于已发布安装包通过运行验收。平台依赖、移动端工具链与打包约定见下方构建文档。
 
-源码构建入口：[桌面与 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [移动内核与固定工具链](scripts/mobile-core/README.md)。iOS 提供源码构建说明，不提供已发布 IPA；无签名编译与自行签名真机安装是不同步骤，均不能替代运行验收。
+源码构建入口：[桌面与 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [移动内核与固定工具链](scripts/mobile-core/README.md)。
 
-### 当前源码打包命名
-
-当前构建流程按 [release-assets.mjs](scripts/release-assets.mjs) 使用以下命名，`<version>` 为应用版本占位符。它们是打包约定，不是上方 v1.0.0 的历史文件名；能否下载仍以所选 Release 的实际附件为准。Android universal 仅含 ARM64 / ARMv7，不含 x86。
-
-| 平台 | 打包命名 |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+iOS 目前不提供 IPA 或越狱包，越狱兼容性未验证。非越狱设备自行签名需具备 Network Extension 能力的 Apple Developer Program 账号，以及匹配 App、PacketTunnel 和 App Group 权限的 [provisioning profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)；免费 [Personal Team 不支持 NE provider](https://developer.apple.com/forums/thread/128767)，侧载本身不会授予这些权限。编译成功或安装成功均不能替代运行验收。
 
 需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
