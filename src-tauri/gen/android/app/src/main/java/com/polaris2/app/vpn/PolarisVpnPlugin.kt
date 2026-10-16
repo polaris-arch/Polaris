@@ -680,7 +680,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun tlsFingerprintCapabilities(invoke: Invoke) {
         Thread({
             try {
-                val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libgojni.so").canonicalFile
+                val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libbox.so").canonicalFile
                 // A packaged file by itself is not proof of the loaded JNI image.
                 val mapped = java.io.File("/proc/self/maps").useLines { lines ->
                     lines.any { it.trimEnd().endsWith(" " + library.path) }
