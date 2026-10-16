@@ -84,6 +84,20 @@ fn started(platform: Platform, plan: &BTreeMap<String, SubPlan>) -> (Planner, u6
     (planner, FIRST_ROUND_DELAY_MS)
 }
 
+#[test]
+fn native_active_proof_is_required_only_for_ios() {
+    assert!(native_active_gate(Platform::Ios));
+    for platform in [
+        Platform::Mac,
+        Platform::Win,
+        Platform::Linux,
+        Platform::Android,
+        Platform::Other,
+    ] {
+        assert!(!native_active_gate(platform), "{platform:?}");
+    }
+}
+
 fn no_entries(_: &str) -> Option<EntryView> {
     None
 }
@@ -256,7 +270,10 @@ fn the_scheduler_switch_gates_every_round() {
 }
 
 fn ios_active(active: bool) -> DeviceConditions {
-    DeviceConditions { app_active: Some(active), ..DeviceConditions::UNAVAILABLE }
+    DeviceConditions {
+        app_active: Some(active),
+        ..DeviceConditions::UNAVAILABLE
+    }
 }
 
 #[test]
@@ -268,10 +285,20 @@ fn ios_is_enabled_but_unknown_initial_activity_is_closed() {
     let mut planner = Planner::new(Platform::Ios, at(0));
     assert!(!planner.signals().foreground);
     planner.tick(&input(at(0), Some(1), &plan));
-    for conditions in [None, Some(ios_active(false)), Some(DeviceConditions::UNAVAILABLE)] {
-        let out = planner.tick(&TickInput { conditions, ..input(at(10 * MINUTE), Some(1), &plan) });
+    for conditions in [
+        None,
+        Some(ios_active(false)),
+        Some(DeviceConditions::UNAVAILABLE),
+    ] {
+        let out = planner.tick(&TickInput {
+            conditions,
+            ..input(at(10 * MINUTE), Some(1), &plan)
+        });
         assert!(out.start.is_none());
-        assert_eq!(planner.signals().verdict, Verdict::Paused(Pause::Background));
+        assert_eq!(
+            planner.signals().verdict,
+            Verdict::Paused(Pause::Background)
+        );
     }
     let out = planner.tick(&TickInput {
         conditions: Some(ios_active(true)),
@@ -732,34 +759,54 @@ fn ios_inactive_stays_closed_and_only_fresh_active_recovers_control_center() {
     let epoch = planner.foreground_epoch();
     assert!(planner.on_suspended(at(left)));
     assert_eq!(planner.foreground_epoch(), epoch + 1);
-    planner.on_round_end(at(left + 500),
-        &interrupted(InterruptReason::Cancelled, &["a"], &["b"]));
+    planner.on_round_end(
+        at(left + 500),
+        &interrupted(InterruptReason::Cancelled, &["a"], &["b"]),
+    );
     for later in [30_000, 60_000, 20 * MINUTE] {
-        assert!(planner.tick(&input(at(left + later), Some(1), &plan)).start.is_none());
-        assert_eq!(planner.signals().verdict, Verdict::Paused(Pause::Background));
+        assert!(planner
+            .tick(&input(at(left + later), Some(1), &plan))
+            .start
+            .is_none());
+        assert_eq!(
+            planner.signals().verdict,
+            Verdict::Paused(Pause::Background)
+        );
     }
     // willEnterForeground does not mean active, even if a previous reading was active.
     planner.on_resumed(at(left + 20 * MINUTE));
     assert!(!planner.signals().foreground);
-    assert!(planner.tick(&input(at(left + 20 * MINUTE), Some(1), &plan)).start.is_none());
+    assert!(planner
+        .tick(&input(at(left + 20 * MINUTE), Some(1), &plan))
+        .start
+        .is_none());
     // No paired Resumed event is required after dismissing Control Center: UIKit is authoritative.
-    let back = planner.tick(&TickInput {
-        conditions: Some(ios_active(true)),
-        ..input(at(left + 20 * MINUTE), Some(1), &plan)
-    }).start.expect("fresh active reading reopens due work");
+    let back = planner
+        .tick(&TickInput {
+            conditions: Some(ios_active(true)),
+            ..input(at(left + 20 * MINUTE), Some(1), &plan)
+        })
+        .start
+        .expect("fresh active reading reopens due work");
     assert!(back.only_missing);
 }
 
 #[test]
 fn ios_queries_running_rounds_and_missing_proof_cancels_and_invalidates_receipts() {
     let plan = plan(&[("s1", 30, &["a"])]);
-    for conditions in [None, Some(ios_active(false)), Some(DeviceConditions::UNAVAILABLE)] {
+    for conditions in [
+        None,
+        Some(ios_active(false)),
+        Some(DeviceConditions::UNAVAILABLE),
+    ] {
         let ledger = MeasurementLedger::new();
         let (mut planner, t0) = started(Platform::Ios, &plan);
         assert!(planner.wants_conditions(at(t0 + 1)));
         let epoch = planner.foreground_epoch();
         let out = planner.tick_and_sync_ledger(&TickInput {
-            conditions, ledger: &ledger, ..input(at(t0 + 1), Some(1), &plan)
+            conditions,
+            ledger: &ledger,
+            ..input(at(t0 + 1), Some(1), &plan)
         });
         assert!(out.abort);
         assert!(out.start.is_none());
@@ -779,29 +826,55 @@ fn ios_device_reply_spanning_lifecycle_or_core_change_is_discarded() {
             (7, Some(1)),
             current,
             Some(ios_active(true).into()),
-        ).is_none());
+        )
+        .is_none());
     }
-    assert_eq!(current_device_readings(
-        Platform::Ios,
-        (7, Some(1)),
-        (7, Some(1)),
-        Some(ios_active(true).into()),
-    ).unwrap().conditions.app_active, Some(true));
+    assert_eq!(
+        current_device_readings(
+            Platform::Ios,
+            (7, Some(1)),
+            (7, Some(1)),
+            Some(ios_active(true).into()),
+        )
+        .unwrap()
+        .conditions
+        .app_active,
+        Some(true)
+    );
     assert!(current_device_readings(
         Platform::Android,
         (7, Some(1)),
         (8, Some(1)),
         Some(DeviceConditions::UNAVAILABLE.into()),
-    ).is_some());
+    )
+    .is_some());
 }
 
 #[test]
 fn ios_fresh_active_does_not_override_delay_or_user_and_device_policy() {
     let plan = plan(&[("s1", 30, &["a"])]);
     for (enabled, power_save, metered, policy, verdict) in [
-        (false, false, Metered::No, MeteredPolicy::Normal, Verdict::Idle(Idle::UserDisabled)),
-        (true, true, Metered::No, MeteredPolicy::Normal, Verdict::Paused(Pause::PowerSave)),
-        (true, false, Metered::Yes, MeteredPolicy::Pause, Verdict::Paused(Pause::Metered)),
+        (
+            false,
+            false,
+            Metered::No,
+            MeteredPolicy::Normal,
+            Verdict::Idle(Idle::UserDisabled),
+        ),
+        (
+            true,
+            true,
+            Metered::No,
+            MeteredPolicy::Normal,
+            Verdict::Paused(Pause::PowerSave),
+        ),
+        (
+            true,
+            false,
+            Metered::Yes,
+            MeteredPolicy::Pause,
+            Verdict::Paused(Pause::Metered),
+        ),
     ] {
         let mut planner = Planner::new(Platform::Ios, at(0));
         for mono in [0, FIRST_ROUND_DELAY_MS - 1] {
@@ -814,7 +887,11 @@ fn ios_fresh_active_does_not_override_delay_or_user_and_device_policy() {
         let out = planner.tick(&TickInput {
             user_enabled: enabled,
             policy,
-            conditions: Some(DeviceConditions { power_save, metered, ..ios_active(true) }),
+            conditions: Some(DeviceConditions {
+                power_save,
+                metered,
+                ..ios_active(true)
+            }),
             ..input(at(FIRST_ROUND_DELAY_MS), Some(1), &plan)
         });
         assert!(out.start.is_none());
@@ -1960,7 +2037,7 @@ fn an_effective_auto_intent_puts_its_subscription_in_the_plan() {
     let on = Switches::PRODUCTION;
     let with_intent = planned(&config, on, Platform::Linux);
     assert_eq!(with_intent, plan(&[("a", 30, &["n1"])]));
-    assert!(planned(&config, on, Platform::Ios).is_empty(), "iOS 未开放");
+    assert_eq!(planned(&config, on, Platform::Ios), with_intent);
     let off = Switches {
         master: false,
         ..on
@@ -2226,9 +2303,18 @@ fn production_plan_reads_the_effective_intent_and_respects_the_platform_gate() {
         effective_plan(&config, Platform::Linux),
         plan(&[("sub", 30, &["node"])])
     );
-    assert!(effective_plan(&config, Platform::Ios).is_empty());
+    let ios_plan = effective_plan(&config, Platform::Ios);
+    assert_eq!(ios_plan, plan(&[("sub", 30, &["node"])]));
+    // A stored intent creates a plan, never native foreground proof.
+    let mut planner = Planner::new(Platform::Ios, at(0));
+    for mono in [0, FIRST_ROUND_DELAY_MS] {
+        let out = planner.tick(&input(at(mono), Some(1), &ios_plan));
+        assert_eq!(out.start, None);
+        assert!(!planner.signals().foreground);
+    }
     config.as_object_mut().unwrap().remove("selectionIntent");
     assert!(effective_plan(&config, Platform::Linux).is_empty());
+    assert!(effective_plan(&config, Platform::Ios).is_empty());
 }
 
 #[test]

@@ -1096,7 +1096,10 @@ async fn measures_all_nodes_when_never_superseded() {
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(120));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(120)
+    );
     assert_eq!(
         events
             .iter()
@@ -1128,7 +1131,10 @@ async fn genuine_timeout_is_recorded_as_minus_one() {
     )
     .await;
     assert_eq!(outcome, "completed");
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(-1));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(-1)
+    );
 }
 
 /// 让位①（发新活之前）：第 1 次询问即让位 → 一个节点都不测、零**逐节点**事件、`interrupted`。
@@ -1355,7 +1361,11 @@ async fn zero_concurrency_degrades_to_serial_not_to_nothing() {
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3, "0 并发是配置错误，不是「不测」的意思");
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(1), "串行也不得让结果与端口错位");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(1),
+        "串行也不得让结果与端口错位"
+    );
 }
 
 /// 🔴 **让位②（在飞轮询）：supersede 命中即 `abort_all` + 立刻返回，不等在飞测量收尾。**
@@ -1421,7 +1431,11 @@ async fn in_flight_polling_does_not_disturb_slow_but_uninterrupted_measurements(
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(1), "轮询不得让结果与端口错位");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(1),
+        "轮询不得让结果与端口错位"
+    );
 }
 
 /// 🔴 **逐节点回填**：先测完的节点必须在**其它节点还在飞**的时候就上屏。
@@ -1533,9 +1547,18 @@ async fn each_node_measures_through_its_own_port() {
         &mut |_: &str, _: Value| {},
     )
     .await;
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(10));
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b1111111"], json!(20));
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c1111111"], json!(30));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(10)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["b1111111"],
+        json!(20)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["c1111111"],
+        json!(30)
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -4632,7 +4655,10 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
     };
     assert_eq!(outcome, "interrupted");
     assert_eq!(results.len(), 1, "未出值的节点缺席：{results:?}");
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)[&nodes[0].id], json!(50));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)[&nodes[0].id],
+        json!(50)
+    );
     let done: Vec<&Value> = collected
         .iter()
         .filter(|(ev, _)| ev == EVENT_SPEED_TEST_DONE)
@@ -4872,11 +4898,12 @@ async fn checker_rejection_and_drop_keep_only_a_sanitized_diagnostic_projection(
     cleanup(&h.dir);
 }
 
-
 #[test]
 fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
-    use crate::commands::speedtest::{CoreInstance, FailKind, FailPhase, MeasureFailure,
-        MeasurePath, RunEvents, SpeedTestOrigin, SpeedTestRequest};
+    use crate::commands::speedtest::{
+        CoreInstance, FailKind, FailPhase, MeasureFailure, MeasurePath, RunEvents, SpeedTestOrigin,
+        SpeedTestRequest,
+    };
     use crate::runtime::measurement_ledger::MeasurementLedger;
     let ledger = Box::leak(Box::new(MeasurementLedger::new()));
     let request = SpeedTestRequest {
@@ -4886,20 +4913,35 @@ fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
         path: MeasurePath::Candidate,
         url: "https://example.invalid/".to_owned(),
     };
-    let mut events = RunEvents::new("1", &request, CoreInstance::Temp, None, BTreeMap::new(), None)
-        .with_ledger(ledger);
+    let mut events = RunEvents::new(
+        "1",
+        &request,
+        CoreInstance::Temp,
+        None,
+        BTreeMap::new(),
+        None,
+    )
+    .with_ledger(ledger);
     let local = Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local));
     let binding = Binding::static_node_pin("tag-node", false, None);
     let mut results = RoundResults::new();
     let mut progress = RoundProgress::new(1);
     let mut collected = Vec::new();
-    record_measured(&mut results, &mut progress,
+    record_measured(
+        &mut results,
+        &mut progress,
         &mut events.sink(|event, payload| collected.push((event.to_owned(), payload))),
-        "node", &local, Some(&binding));
+        "node",
+        &local,
+        Some(&binding),
+    );
     assert_eq!(results["node"], local);
     assert_eq!(collected[0].1["latency"], -1);
     assert_eq!(collected[0].1["binding"]["verdict"], "static");
     let digest = polaris_updater::sha256_hex(request.url.as_bytes());
     let entry = ledger.candidate_entry("node", &digest).unwrap();
-    assert_eq!(entry.measured, Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
+    assert_eq!(
+        entry.measured,
+        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
+    );
 }

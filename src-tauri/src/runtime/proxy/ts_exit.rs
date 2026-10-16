@@ -130,8 +130,10 @@ impl ProxyRuntime {
     ) -> Option<crate::runtime::tailscale_status::TailscaleMainCoreHold> {
         let _publication = self.gate.lock_generation_publication();
         let generation = self.gate.generation();
-        if generation == 0 || generation > 9_007_199_254_740_991
-            || self.gate.is_busy() || self.start_inflight.load(Ordering::SeqCst) != 0
+        if generation == 0
+            || generation > 9_007_199_254_740_991
+            || self.gate.is_busy()
+            || self.start_inflight.load(Ordering::SeqCst) != 0
         {
             return None;
         }
@@ -151,7 +153,9 @@ impl ProxyRuntime {
         }
         let mut server_ids = Vec::new();
         for (id, tag) in &applied.id_to_tag {
-            if tag.is_empty() { return None; }
+            if tag.is_empty() {
+                return None;
+            }
             let server = servers.get(id.as_str())?;
             if server.protocol == Protocol::Tailscale {
                 server_ids.push(id.clone());
@@ -160,8 +164,11 @@ impl ProxyRuntime {
         // Crash/error publication can clear status without a new generation. Do not return a
         // proof if it changed while snapshots were read. Generation claims are locked above.
         let after = self.status.read().ok()?.clone();
-        if !after.running || after.main_generation != generation || after.start_time != before.start_time
-            || self.start_inflight.load(Ordering::SeqCst) != 0 || self.gate.is_busy()
+        if !after.running
+            || after.main_generation != generation
+            || after.start_time != before.start_time
+            || self.start_inflight.load(Ordering::SeqCst) != 0
+            || self.gate.is_busy()
         {
             return None;
         }

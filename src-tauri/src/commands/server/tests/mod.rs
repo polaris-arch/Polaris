@@ -780,13 +780,13 @@ fn enabling_auto_is_refused_with_a_stable_code_and_writes_nothing() {
         assert_eq!(error.code(), code);
         assert_eq!(mgr.load_full().unwrap(), before, "{code}");
     }
-    // 平台闸取自运行时：iOS 关，其余开。
+    // iOS 已开放意图；拒绝路径仍由上面的注入闸覆盖，前台准入由调度器负责。
     assert_eq!(
         auto_select::closed(
             auto_select::Switches::PRODUCTION,
             polaris_helper_proto::Platform::Ios
         ),
-        Some(Gate::PlatformNotOpen)
+        None
     );
 }
 

@@ -272,6 +272,17 @@ pub(crate) const fn platform_enabled(_platform: Platform) -> bool {
     true
 }
 
+/// iOS needs a fresh didBecomeActive observation; resume alone is not proof.
+/// Keep this exhaustive so a new platform cannot silently inherit either policy.
+const fn native_active_gate(platform: Platform) -> bool {
+    match platform {
+        Platform::Ios => true,
+        Platform::Mac | Platform::Win | Platform::Linux | Platform::Android | Platform::Other => {
+            false
+        }
+    }
+}
+
 /// 只有手机按前后台判定；桌面以「进程活着且未休眠」为准。
 pub(crate) const fn is_mobile(platform: Platform) -> bool {
     match platform {
@@ -635,7 +646,7 @@ impl Planner {
             generation: None,
             ready: now,
             subs: BTreeMap::new(),
-            foreground: platform != Platform::Ios,
+            foreground: !native_active_gate(platform),
             left_at: None,
             foreground_return_at: None,
             round_trace_serial: 0,
@@ -710,7 +721,7 @@ impl Planner {
     /// 这一拍之前要不要先拉一次设备状况：有订阅到期（准入前必查），或距上次查询已久。
     pub(crate) fn wants_conditions(&self, now: Now) -> bool {
         // iOS must refresh active proof even while a round is running or paused.
-        if self.platform == Platform::Ios {
+        if native_active_gate(self.platform) {
             return !self.subs.is_empty() || self.round.is_some();
         }
         if self.subs.is_empty() || self.round.is_some() {
@@ -765,7 +776,7 @@ impl Planner {
     /// 回到前台。
     pub(crate) fn on_resumed(&mut self, now: Now) {
         // iOS Resumed is willEnterForeground, not didBecomeActive.
-        if self.platform == Platform::Ios {
+        if native_active_gate(self.platform) {
             return;
         }
         self.became_active(now);
@@ -821,8 +832,12 @@ impl Planner {
     pub(crate) fn tick(&mut self, input: &TickInput<'_>) -> TickOutput {
         let now = input.now;
         let mut out = TickOutput::default();
-        if self.platform == Platform::Ios {
-            if input.conditions.and_then(|conditions| conditions.app_active) == Some(true) {
+        if native_active_gate(self.platform) {
+            if input
+                .conditions
+                .and_then(|conditions| conditions.app_active)
+                == Some(true)
+            {
                 self.became_active(now);
             } else {
                 out.abort |= self.on_suspended(now);
@@ -1562,7 +1577,7 @@ fn current_device_readings(
     current: (u64, Option<u64>),
     readings: Option<DeviceReadings>,
 ) -> Option<DeviceReadings> {
-    if platform == Platform::Ios && requested != current {
+    if native_active_gate(platform) && requested != current {
         None
     } else {
         readings
@@ -1733,7 +1748,7 @@ impl MeasurementScheduler {
             } else {
                 None
             };
-            let (generation, network_epoch) = if platform == Platform::Ios {
+            let (generation, network_epoch) = if native_active_gate(platform) {
                 let state = app.state::<AppRuntime>();
                 let proxy = state.proxy();
                 let current_generation = proxy.status().running.then(|| proxy.core_generation());
@@ -1850,7 +1865,7 @@ impl MeasurementScheduler {
             }
             self.announce(&app, false);
             // Recovery polling runs only while there is scheduled work to admit.
-            let sleep_ms = if platform == Platform::Ios && !self.lock().planner.subs.is_empty() {
+            let sleep_ms = if native_active_gate(platform) && !self.lock().planner.subs.is_empty() {
                 output.sleep_ms.min(TICK_ACTIVE_MS)
             } else {
                 output.sleep_ms

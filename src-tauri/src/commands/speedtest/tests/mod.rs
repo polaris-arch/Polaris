@@ -1135,8 +1135,14 @@ async fn drive_waves_completes_when_never_superseded() {
 
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120));
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c"], json!(120));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a"],
+        json!(120)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["c"],
+        json!(120)
+    );
 }
 
 /// 未超代时的**真实**热切失败仍记 -1（不可测是真的）→ 检查点不得把它吞成缺席。
@@ -1157,8 +1163,14 @@ async fn drive_waves_records_genuine_select_failure_as_minus_one() {
     .await;
 
     assert_eq!(outcome, "completed");
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(-1)); // 真实不可测
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b"], json!(120));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a"],
+        json!(-1)
+    ); // 真实不可测
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["b"],
+        json!(120)
+    );
 }
 
 /// 让位①（波首）：第 1 次调用即超代 → 一个节点都不测，`interrupted`。
@@ -2007,7 +2019,10 @@ async fn fallback_completes_when_never_superseded() {
     .await;
 
     assert_eq!(outcome, "completed");
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["srv-active"],
+        json!(88)
+    );
     assert_eq!(
         events
             .iter()
@@ -3299,7 +3314,10 @@ async fn sequence_numbers_increase_strictly_and_the_terminal_event_is_last() {
     ] {
         assert!(
             events
-                .stamp(late, MeasurementEvent::Other(json!({"serverId":"a","latency":1})))
+                .stamp(
+                    late,
+                    MeasurementEvent::Other(json!({"serverId":"a","latency":1}))
+                )
                 .is_none(),
             "终态之后 {late} 不得再发"
         );
@@ -3386,7 +3404,11 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
         ["a"],
         "未出值的节点缺席"
     );
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120), "结果里没有 -1");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a"],
+        json!(120),
+        "结果里没有 -1"
+    );
     assert_eq!(
         dropped_at_done.load(Ordering::SeqCst),
         2,
@@ -4435,7 +4457,10 @@ async fn with_local_side_halving_off_the_error_is_a_transport_failure() {
     let (results, widest, halved) = waves_with_one_local_refusal(false).await;
     assert!(!halved);
     assert_eq!(widest, vec![7, 3]);
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["n0"], json!(-1));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["n0"],
+        json!(-1)
+    );
     assert_eq!(results.len(), 12);
     assert_eq!(
         speed_test_result_payload(
@@ -5366,8 +5391,15 @@ async fn an_enforced_mismatch_leaves_the_node_unmeasured_and_the_round_continues
         !results.contains_key("a"),
         "读回不符的节点不出任何数值：{results:?}"
     );
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b"], json!(120));
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c"], json!(120), "后续节点照常出值");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["b"],
+        json!(120)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["c"],
+        json!(120),
+        "后续节点照常出值"
+    );
     assert_eq!(
         result_events(&collected)
             .iter()
@@ -5405,7 +5437,11 @@ async fn an_observed_mismatch_is_published_but_never_selectable() {
         .with_readback(&readback);
     let (results, collected) = readback_round(&readback, &mut events).await;
 
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120), "只观测：数值照发");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a"],
+        json!(120),
+        "只观测：数值照发"
+    );
     let a = binding_of(&collected, "a");
     assert_eq!(a["verdict"], json!("mismatch"));
     assert_eq!(a["carriedBy"]["tag"], json!("someone-else"));
@@ -5793,7 +5829,10 @@ async fn a_user_routed_result_carried_by_the_selected_node_is_written_to_it() {
     }
     .run(ledger)
     .await;
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["srv-active"],
+        json!(88)
+    );
     let events = result_events(&collected);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["serverId"], json!("srv-active"));
@@ -5820,7 +5859,10 @@ async fn an_unread_user_routed_result_is_still_written_to_the_selected_node() {
     }
     .run(ledger)
     .await;
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["srv-active"],
+        json!(88)
+    );
     let events = result_events(&collected);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["serverId"], json!("srv-active"));
@@ -6633,7 +6675,9 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
     )
     .await;
     let took = started.elapsed();
-    let latency = crate::commands::speedtest::round_results_json(&results)["a"].as_u64().expect("测出了值");
+    let latency = crate::commands::speedtest::round_results_json(&results)["a"]
+        .as_u64()
+        .expect("测出了值");
     assert!(
         (80..80 + READBACK_WAIT_MS / 2).contains(&latency),
         "量到 {latency}ms：应是那次 GET 的 80ms 上下，不含读回的等待"
@@ -6781,7 +6825,10 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
         &readback,
     )
     .await;
-    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(-1));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a"],
+        json!(-1)
+    );
     assert_eq!(
         registered_mid_flight.load(Ordering::SeqCst),
         1,
@@ -6855,28 +6902,46 @@ fn saved_unapplied_tls_sni_and_ws_changes_are_dirty_without_staged_drafts() {
     }
 }
 
-
 /// Typed input, not the JSON projection, is the only source of ledger evidence.
 #[test]
 fn typed_results_reject_json_result_injection_and_preserve_local_failure_contract() {
     let ledger = leaked_ledger();
     let mut events = pool_events(SpeedTestOrigin::Manual).with_ledger(ledger);
-    assert!(events.stamp(
-        EVENT_SPEED_TEST_RESULT,
-        MeasurementEvent::Other(json!({"serverId":"a","latency":1,"binding":{"verdict":"confirmed"}})),
-    ).is_none());
-    assert!(ledger.candidate_entry("a", &ScheduleBench::url_digest()).is_none());
+    assert!(events
+        .stamp(
+            EVENT_SPEED_TEST_RESULT,
+            MeasurementEvent::Other(
+                json!({"serverId":"a","latency":1,"binding":{"verdict":"confirmed"}})
+            ),
+        )
+        .is_none());
+    assert!(ledger
+        .candidate_entry("a", &ScheduleBench::url_digest())
+        .is_none());
     let local = MeasureFailure::new(FailPhase::Connect, FailKind::Local);
     let binding = Binding::static_node_pin("tag-a", false, None);
-    let payload = events.stamp(
-        EVENT_SPEED_TEST_RESULT,
-        MeasurementEvent::Result(NodeResult::new("a", &Err(local), Some(5), Some(&binding))),
-    ).unwrap();
-    let entry = ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap();
-    assert_eq!(entry.measured, Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
+    let payload = events
+        .stamp(
+            EVENT_SPEED_TEST_RESULT,
+            MeasurementEvent::Result(NodeResult::new("a", &Err(local), Some(5), Some(&binding))),
+        )
+        .unwrap();
+    let entry = ledger
+        .candidate_entry("a", &ScheduleBench::url_digest())
+        .unwrap();
+    assert_eq!(
+        entry.measured,
+        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
+    );
     assert_eq!(entry.identity.binding, Some(BindingVerdict::Static));
-    assert_eq!(entry.identity.seq, 1, "rejected JSON does not consume a sequence number");
-    assert_eq!(payload["failure"], json!({"phase":"connect","kind":"transport"}));
+    assert_eq!(
+        entry.identity.seq, 1,
+        "rejected JSON does not consume a sequence number"
+    );
+    assert_eq!(
+        payload["failure"],
+        json!({"phase":"connect","kind":"transport"})
+    );
     assert_eq!(payload["latency"], -1);
     assert_eq!(payload["status"], "failed");
     assert_eq!(payload["binding"], binding.to_json());
@@ -6891,9 +6956,22 @@ fn typed_round_decisions_preserve_zero_failure_and_absence() {
         ("max".to_owned(), Ok(u32::MAX)),
         ("failed".to_owned(), Err(TIMED_OUT)),
     ]);
-    assert_eq!(round_results_json(&results), json!({"zero":0,"max":4294967295_u64,"failed":-1}));
-    let candidates = pairs(&[("zero","z"),("max","m"),("failed","f"),("missing","x"),("mismatch","y")]);
-    let probes = candidate_probes(&candidates, &results, &BTreeSet::from(["mismatch".to_owned()]));
+    assert_eq!(
+        round_results_json(&results),
+        json!({"zero":0,"max":4294967295_u64,"failed":-1})
+    );
+    let candidates = pairs(&[
+        ("zero", "z"),
+        ("max", "m"),
+        ("failed", "f"),
+        ("missing", "x"),
+        ("mismatch", "y"),
+    ]);
+    let probes = candidate_probes(
+        &candidates,
+        &results,
+        &BTreeSet::from(["mismatch".to_owned()]),
+    );
     assert_eq!(probes["zero"], CandidateProbe::Measured(0));
     assert_eq!(probes["max"], CandidateProbe::Measured(u32::MAX));
     assert_eq!(probes["failed"], CandidateProbe::Failed);
@@ -6906,19 +6984,28 @@ async fn a_foreground_epoch_change_drops_inflight_scheduled_results_before_the_l
     let bench = ScheduleBench::new(1, 1);
     let ledger = bench.ledger;
     let mut collected = Vec::new();
-    let ScheduledRound::Ran(report) = bench.run(
-        &bench.targets(1), 1, |_, _| async { true },
-        move |_| async move {
-            // Models an inactive/reactivated device during the measurement.
-            ledger.set_foreground_epoch(ledger.foreground_epoch() + 1);
-            Ok(17)
-        },
-        &mut collected,
-    ).await else { panic!("round admitted"); };
+    let ScheduledRound::Ran(report) = bench
+        .run(
+            &bench.targets(1),
+            1,
+            |_, _| async { true },
+            move |_| async move {
+                // Models an inactive/reactivated device during the measurement.
+                ledger.set_foreground_epoch(ledger.foreground_epoch() + 1);
+                Ok(17)
+            },
+            &mut collected,
+        )
+        .await
+    else {
+        panic!("round admitted");
+    };
     assert!(collected.is_empty());
     assert!(report.measured.is_empty());
     assert_eq!(report.unmeasured, vec!["n0".to_owned()]);
-    assert!(ledger.candidate_entry("n0", &ScheduleBench::url_digest()).is_none());
+    assert!(ledger
+        .candidate_entry("n0", &ScheduleBench::url_digest())
+        .is_none());
 }
 
 #[test]
@@ -6926,7 +7013,14 @@ fn production_result_consumers_do_not_reparse_the_wire_projection() {
     let source = crate::test_support::crate_source("commands/speedtest.rs");
     assert!(!source.contains("MeasureFailure::from_json"));
     assert!(!source.contains("BindingVerdict::parse"));
-    let stamp = compact_production_fn("pub(crate) fn stamp(");
+    let masked = polaris_source_probe::mask_comments_and_strings(&source);
+    let stamp: String = crate::commands::guard_scan::impl_method_body(
+        &masked,
+        "    pub(crate) fn stamp(",
+    )
+    .chars()
+    .filter(|ch| !ch.is_whitespace())
+    .collect();
     assert!(stamp.contains("result.measured.map_err(MeasureFailure::for_ledger)"));
     assert!(stamp.contains("result.binding.as_ref().and_then(|binding|binding.verdict)"));
     assert!(!stamp.contains(".as_u64()"));
@@ -6935,22 +7029,33 @@ fn production_result_consumers_do_not_reparse_the_wire_projection() {
     assert!(!scheduled.contains(".as_i64()"));
 }
 
-
 #[test]
 fn epoch_recheck_rejects_a_lifecycle_race_without_replacing_current_evidence() {
     let ledger = leaked_ledger();
     let mut old = pool_events(SpeedTestOrigin::Schedule)
-        .with_ledger(ledger).with_foreground_epoch(0);
+        .with_ledger(ledger)
+        .with_foreground_epoch(0);
     // The outer gate may have seen epoch zero. Lifecycle changes before stamp.
     ledger.set_foreground_epoch(1);
     let mut current = pool_events(SpeedTestOrigin::Schedule)
-        .with_ledger(ledger).with_foreground_epoch(1);
-    assert!(current.stamp(EVENT_SPEED_TEST_RESULT,
-        MeasurementEvent::Result(NodeResult::new("a", &Ok(17), Some(5), None))).is_some());
+        .with_ledger(ledger)
+        .with_foreground_epoch(1);
+    assert!(current
+        .stamp(
+            EVENT_SPEED_TEST_RESULT,
+            MeasurementEvent::Result(NodeResult::new("a", &Ok(17), Some(5), None))
+        )
+        .is_some());
     old.identity.run += 1; // A newer run must not bypass the epoch check.
-    assert!(old.stamp(EVENT_SPEED_TEST_RESULT,
-        MeasurementEvent::Result(NodeResult::new("a", &Err(TIMED_OUT), Some(5), None))).is_none());
-    let entry = ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap();
+    assert!(old
+        .stamp(
+            EVENT_SPEED_TEST_RESULT,
+            MeasurementEvent::Result(NodeResult::new("a", &Err(TIMED_OUT), Some(5), None))
+        )
+        .is_none());
+    let entry = ledger
+        .candidate_entry("a", &ScheduleBench::url_digest())
+        .unwrap();
     assert_eq!(entry.measured, Ok(17));
     assert_eq!(entry.foreground_epoch, 1);
     assert_eq!(old.ok, 0);
@@ -6963,12 +7068,22 @@ async fn fallback_local_failure_uses_typed_ledger_classification() {
     let mut events = pool_events(SpeedTestOrigin::Manual).with_ledger(ledger);
     let local = MeasureFailure::new(FailPhase::Connect, FailKind::Local);
     let (results, outcome) = drive_fallback_measure(
-        "a", &superseded_at(0), &SpeedTestCancel::default(), &|| Some(5),
+        "a",
+        &superseded_at(0),
+        &SpeedTestCancel::default(),
+        &|| Some(5),
         plain_once(|| async { Err(local) }),
-        &mut events.sink(|_, _| {}), &system_probe(&Readback::off()),
-    ).await;
+        &mut events.sink(|_, _| {}),
+        &system_probe(&Readback::off()),
+    )
+    .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results["a"], Err(local));
-    assert_eq!(ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap().measured,
-        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
+    assert_eq!(
+        ledger
+            .candidate_entry("a", &ScheduleBench::url_digest())
+            .unwrap()
+            .measured,
+        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
+    );
 }

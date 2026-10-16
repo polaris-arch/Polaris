@@ -563,8 +563,6 @@ impl BindingVerdict {
             Self::Observed => "observed",
         }
     }
-
-
 }
 
 /// 读回判定（纯函数）。`requested` 是请求的节点 tag，没有指定节点的测量传 `None`；
@@ -2861,7 +2859,12 @@ where
             "系统路径测量未经由选中节点 {active}（实际承载 {}），结果不记入该节点",
             binding.carried_by().unwrap_or("未读到")
         );
-        emit.result(NodeResult::new(SYSTEM_PATH_ID, &measured, epoch, Some(&binding)));
+        emit.result(NodeResult::new(
+            SYSTEM_PATH_ID,
+            &measured,
+            epoch,
+            Some(&binding),
+        ));
         return (RoundResults::new(), None);
     }
 
@@ -4482,7 +4485,12 @@ fn companion_result_payload(
     )
     .stamp(
         EVENT_SPEED_TEST_RESULT,
-        MeasurementEvent::Result(NodeResult::new(owner, &Ok(latency), network_epoch, Some(&binding))),
+        MeasurementEvent::Result(NodeResult::new(
+            owner,
+            &Ok(latency),
+            network_epoch,
+            Some(&binding),
+        )),
     )
 }
 

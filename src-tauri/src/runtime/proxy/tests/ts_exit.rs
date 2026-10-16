@@ -1170,11 +1170,17 @@ fn seed_main_core_hold(rt: &Arc<ProxyRuntime>, config: Value, ids: &[&str]) -> u
     let generation = rt.bump_generation();
     *rt.startup_snapshot.write().unwrap() = Some(config);
     *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
-        id_to_tag: ids.iter().map(|id| ((*id).to_owned(), format!("tag-{id}"))).collect(),
+        id_to_tag: ids
+            .iter()
+            .map(|id| ((*id).to_owned(), format!("tag-{id}")))
+            .collect(),
         ..Default::default()
     });
     *rt.status.write().unwrap() = ProxyStatus {
-        running: true, main_generation: generation, start_time: Some(1), ..Default::default()
+        running: true,
+        main_generation: generation,
+        start_time: Some(1),
+        ..Default::default()
     };
     generation
 }
@@ -1184,7 +1190,9 @@ fn main_core_hold_proves_empty_applied_set_without_any_status_frame() {
     let (rt, _dir) = test_runtime();
     let generation = seed_main_core_hold(&rt, polaris_store::default_config(), &[]);
     assert!(rt.mesh.tailscale_status_snapshot(true).statuses.is_empty());
-    let proof = rt.tailscale_main_core_hold().expect("Ready no-endpoint proof");
+    let proof = rt
+        .tailscale_main_core_hold()
+        .expect("Ready no-endpoint proof");
     assert_eq!(proof.main_generation, generation);
     assert!(proof.server_ids.is_empty());
     // Saving D with a new TS node does not apply it to the running instance.
@@ -1198,10 +1206,18 @@ fn main_core_hold_uses_effective_mapping_and_ignores_unapplied_disk_removal() {
     seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
     let proof = rt.tailscale_main_core_hold().unwrap();
     assert_eq!(proof.server_ids, vec!["ts1"]);
-    rt.config.save_full(&polaris_store::default_config()).unwrap();
+    rt.config
+        .save_full(&polaris_store::default_config())
+        .unwrap();
     assert_eq!(rt.tailscale_main_core_hold(), Some(proof));
     // A protocol filtered out of the actual startup must not be reported as held.
-    rt.switch_snapshot.write().unwrap().as_mut().unwrap().id_to_tag.clear();
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .id_to_tag
+        .clear();
     assert!(rt.tailscale_main_core_hold().unwrap().server_ids.is_empty());
 }
 
@@ -1243,6 +1259,7 @@ fn main_core_hold_poisoned_snapshot_lock_is_unknown() {
     let _ = std::thread::spawn(move || {
         let _guard = other.startup_snapshot.write().unwrap();
         panic!("poison fixture snapshot");
-    }).join();
+    })
+    .join();
     assert!(rt.tailscale_main_core_hold().is_none());
 }

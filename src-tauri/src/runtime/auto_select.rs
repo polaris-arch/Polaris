@@ -116,7 +116,7 @@ impl Switches {
 }
 
 /// 本平台是否开放自动选择。自动选择靠周期测速供数，所以跟着周期计划走：周期计划未启用的平台
-/// （今天是 iOS）不开放，周期计划在那里打开时一并打开。
+/// 不开放。iOS 已开放前台计划；执行仍须满足原生活跃证明与账本代次新鲜度。
 pub(crate) const fn platform_open(platform: Platform) -> bool {
     crate::runtime::measurement_scheduler::platform_enabled(platform)
 }

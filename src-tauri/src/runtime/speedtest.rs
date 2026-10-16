@@ -82,10 +82,12 @@ use polaris_core_supervisor::{
     CORE_STARTUP_PER_NODE_US,
 };
 
-use crate::commands::speedtest::{Binding, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel};
-use crate::events::channel::{EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS};
+use crate::commands::speedtest::{
+    Binding, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel,
+};
 #[cfg(test)]
 use crate::events::channel::EVENT_SPEED_TEST_RESULT;
+use crate::events::channel::{EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS};
 use crate::logging::SPEEDTEST_CORE_TARGET;
 use crate::runtime::proxy::core_log::pipe_to_log;
 #[cfg(target_os = "android")]
@@ -2414,10 +2416,7 @@ pub fn summarize_speed_test(
     absent: usize,
     absent_reason: Option<InterruptReason>,
 ) -> SpeedTestSummary {
-    let ok = results
-        .values()
-        .filter(|measured| measured.is_ok())
-        .count();
+    let ok = results.values().filter(|measured| measured.is_ok()).count();
     SpeedTestSummary {
         ok,
         failed: results.len() - ok,

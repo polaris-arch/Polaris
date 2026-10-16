@@ -131,13 +131,13 @@ fn the_intent_is_effective_only_when_switched_on_and_the_platform_is_open() {
     }
 }
 
-/// iOS 本轮不开放：意图在那里不生效，设置意图的命令据 [`closed`] 拒绝。其余四个平台开放。
+/// iOS 与其他平台共享意图开关；前台与测量新鲜度在执行层分别准入。
 #[test]
-fn ios_is_closed_and_every_other_platform_is_open() {
+fn every_platform_accepts_auto_intent_unless_the_master_switch_is_off() {
     let config = json!({ "selectionIntent": polaris_store::selection_intent_auto("sub") });
-    assert_eq!(closed(ON, Platform::Ios), Some(Gate::PlatformNotOpen));
-    assert_eq!(effective_subscription(&config, ON, Platform::Ios), None);
     for platform in [
+        Platform::Ios,
+        Platform::Other,
         Platform::Mac,
         Platform::Win,
         Platform::Linux,
@@ -150,7 +150,7 @@ fn ios_is_closed_and_every_other_platform_is_open() {
             "{platform:?}"
         );
     }
-    // 总开关先于平台：两者都不满足时报总开关。
+    // 平台开放不越过总开关。
     let off = Switches {
         master: false,
         better_leg: true,

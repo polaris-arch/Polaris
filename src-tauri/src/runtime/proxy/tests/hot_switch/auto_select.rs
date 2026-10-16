@@ -1000,45 +1000,57 @@ async fn the_transaction_yields_when_the_auto_intent_it_acted_on_is_gone() {
     }
 }
 
-/// iOS 本轮不开放：配置里即使存着自动意图也不生效 —— 故障腿不因它启用，择优腿不评估并如实报
-/// 「本平台未开放」，显式路径的裁决同样不评估，设置意图的入口据同一个判据拒绝。同一份配置在
-/// Android 上生效。
+/// iOS 的意图已开放，但后台择优仍须前台信号和当前前台代次的测量。
+/// 显式路径保持既有用户操作契约；任何路径都不能把旧代次读数当候选。
 #[tokio::test]
-async fn ios_never_acts_on_a_stored_auto_intent() {
+async fn ios_auto_intent_preserves_foreground_and_receipt_epoch_gates() {
     let (rt, _dir) = test_runtime_on(Platform::Ios);
     let cfg = running(&rt, &auto_config("node-a", Some("sub")));
     let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let reads = readings(&ledger);
-    assert!(!rt.auto_select_active());
-    assert_eq!(rt.auto_select_closed(), Some(Gate::PlatformNotOpen));
-    assert_eq!(rt.auto_select_fallback(&cfg), None);
-    assert_eq!(assess(&rt, &reads, None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::PlatformNotOpen)
-    );
-    assert_eq!(
-        rt.auto_select_explicit_from(&cfg, "sub", &reads),
-        Decision::NotEvaluated(Gate::PlatformNotOpen)
-    );
+    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 120), ("node-c", 80)]);
+    let mut reads = readings(&ledger);
+    assert!(rt.auto_select_active());
+    assert_eq!(rt.auto_select_closed(), None);
+
+    reads.signals.foreground = false;
+    assert!(assess(&rt, &reads, None).await.is_none());
+    assert_eq!(last_decision(&rt), Decision::NotEvaluated(Gate::Background));
     let status = rt.auto_select_status_from(&reads);
     assert_eq!(
         (status.intent.mode, status.mode, status.reason),
-        ("auto", "notEvaluated", Some("platformNotOpen"))
+        ("auto", "notEvaluated", Some("background"))
+    );
+    assert_eq!(
+        rt.auto_select_explicit_from(&cfg, "sub", &reads),
+        Decision::Switch {
+            target: "node-c".to_string(),
+            latency_ms: 80,
+            cause: Cause::FirstPlacement,
+        }
     );
 
-    let (rt, _dir) = test_runtime_on(Platform::Android);
-    running(&rt, &auto_config("node-a", Some("sub")));
-    assert!(rt.auto_select_active());
-    assert_eq!(rt.auto_select_closed(), None);
+    reads.signals.foreground = true;
+    assert!(assess(&rt, &reads, None).await.is_some());
+    ledger.set_foreground_epoch(1);
+    assert!(assess(&rt, &reads, None).await.is_none());
+    assert_eq!(
+        last_decision(&rt),
+        Decision::NotEvaluated(Gate::WaitingFirstRound)
+    );
+    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
+    assert_eq!(
+        rt.auto_select_explicit_from(&cfg, "sub", &reads),
+        Decision::Hold(Hold::NoCandidates)
+    );
+    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 120), ("node-c", 80)]);
+    let plan = assess(&rt, &reads, None).await.expect("新代次结果允许前台择优");
+    assert_eq!(plan.candidate.id, "node-c");
+    assert_eq!(exit_on_disk(&rt), "node-a", "评估不提交出口");
+
+    let (android, _dir) = test_runtime_on(Platform::Android);
+    running(&android, &auto_config("node-a", Some("sub")));
+    assert!(android.auto_select_active());
+    assert_eq!(android.auto_select_closed(), None);
     assert_eq!(
         Switches::PRODUCTION,
         Switches {
@@ -2192,7 +2204,7 @@ fn refresh_fallback_does_not_cross_subscriptions_even_when_only_barred_members_r
 }
 
 #[test]
-fn refresh_fallback_requires_an_effective_subscription_intent_and_open_platform() {
+fn refresh_fallback_requires_effective_intent_and_current_ios_receipts() {
     let (rt, _dir, cfg, ledger) = refresh_fixture();
     for invalid in ["manual", "missing", "empty", "all", "malformed"] {
         let mut config = cfg.clone();
@@ -2214,9 +2226,20 @@ fn refresh_fallback_requires_an_effective_subscription_intent_and_open_platform(
     }
     let (ios, _dir) = test_runtime_on(Platform::Ios);
     let config = running(&ios, &cfg);
+    let ios_ledger = MeasurementLedger::new();
+    let reads = readings(&ios_ledger);
+    assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
+    refresh_receipts(&ios, &config, &ios_ledger, 1, &[("node-b", 80), ("node-c", 20)]);
     assert_eq!(
-        ios.auto_select_fallback_from(&config, &readings(&ledger)),
-        None
+        ios.auto_select_fallback_from(&config, &reads).unwrap().node_id,
+        "node-c"
+    );
+    ios_ledger.set_foreground_epoch(1);
+    assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
+    refresh_receipts(&ios, &config, &ios_ledger, 2, &[("node-b", 80), ("node-c", 20)]);
+    assert_eq!(
+        ios.auto_select_fallback_from(&config, &reads).unwrap().node_id,
+        "node-c"
     );
 }
 
