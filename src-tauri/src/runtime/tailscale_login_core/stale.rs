@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use polaris_core_supervisor::{CoreProcess, Signal};
+use polaris_core_supervisor::CoreProcess;
+#[cfg(any(windows, test))]
+use polaris_core_supervisor::ProcessOwner;
+#[cfg(any(not(windows), test))]
+use polaris_core_supervisor::Signal;
 
 const LOGIN_CONFIG_PREFIX: &str = "tailscale-login-";
 const LOGIN_CONFIG_SUFFIX: &str = ".json";
@@ -15,7 +19,7 @@ const LOGIN_CONFIG_SUFFIX: &str = ".json";
 /// Rejects an admission that would otherwise share a state directory with a live leftover.
 pub(super) const STALE_LOGIN_CORE_ALIVE: &str = "staleLoginCoreAlive";
 
-/// SIGTERM → grace → SIGKILL window for a leftover login core.
+/// Unix signal escalation / Windows same-handle termination retry window.
 const STALE_LOGIN_KILL_GRACE: Duration = Duration::from_millis(1_500);
 
 /// `tailscale-login-<sanitized id>-<epoch>.json` → `(id, epoch)`. Any other name is not ours.
@@ -101,6 +105,7 @@ pub(super) fn is_stale_login_core(process: &CoreProcess, binary: &Path, config_d
 }
 
 /// Pids of leftover login cores, never one of this registry's own registered children.
+#[cfg(any(not(windows), test))]
 pub(super) fn stale_login_core_pids(
     candidates: &[CoreProcess],
     binary: &Path,
@@ -117,11 +122,13 @@ pub(super) fn stale_login_core_pids(
 
 /// A leftover is this user's own process. One that another user started is neither ended nor
 /// a reason to refuse; an owner that cannot be read is treated the same way.
+#[cfg(any(not(windows), test))]
 pub(super) fn owned_by_this_user(owner: Option<u32>, me: Option<u32>) -> bool {
     matches!((owner, me), (Some(owner), Some(me)) if owner == me)
 }
 
 /// Process table access for the sweep; fakes replace all three in tests.
+#[cfg(any(not(windows), test))]
 pub(super) struct StaleSweepIo<'a> {
     pub(super) scan: &'a (dyn Fn() -> Vec<CoreProcess> + Send + Sync),
     pub(super) owner: &'a (dyn Fn(u32) -> Option<u32> + Send + Sync),
@@ -130,6 +137,7 @@ pub(super) struct StaleSweepIo<'a> {
 
 /// Terminate this user's leftover login cores and confirm they are gone. A pid is signalled
 /// again only while a fresh scan still shows the same exact argv and owner under it.
+#[cfg(any(not(windows), test))]
 pub(super) async fn sweep_stale_login_cores(
     io: &StaleSweepIo<'_>,
     me: Option<u32>,
@@ -174,17 +182,100 @@ pub(super) async fn sweep_stale_login_cores(
     }
 }
 
+/// Windows keeps the scanned process object, not just its pid. Production callbacks operate
+/// only on its original held handle; tests can model births without opening real processes.
+#[cfg(any(windows, test))]
+pub(super) struct WindowsStaleSweepIo<'a> {
+    pub(super) scan: &'a (dyn Fn() -> Vec<CoreProcess> + Send + Sync),
+    pub(super) end: &'a (dyn Fn(&CoreProcess) -> bool + Send + Sync),
+    pub(super) running: &'a (dyn Fn(&CoreProcess) -> Option<bool> + Send + Sync),
+}
+
+/// End only exact login-shaped leftovers whose token SID was proven equal to ours. Unlike
+/// the main-core sweep, SYSTEM is not admitted merely because it is elevated. An unreadable
+/// owner is skipped, not reclassified as foreign or turned into a global no-owner receipt.
+///
+/// Targets are frozen once. Both termination attempts and the exit observations refer to
+/// those original objects, even if a pid is later reused for the same command line. The
+/// native end callback checks creation time again; its bool is never an exit receipt.
+#[cfg(any(windows, test))]
+pub(super) async fn sweep_windows_stale_login_cores(
+    io: &WindowsStaleSweepIo<'_>,
+    grace: Duration,
+    binary: &Path,
+    config_dir: &Path,
+    inflight: &[u32],
+) -> Result<usize, String> {
+    let mut pending = Vec::new();
+    let mut unknown = 0;
+    let mut other = 0;
+    let mut elevated = 0;
+    for process in (io.scan)() {
+        if process.pid == 0
+            || process.pid == std::process::id()
+            || inflight.contains(&process.pid)
+            || !is_stale_login_core(&process, binary, config_dir)
+        {
+            continue;
+        }
+        match process.owner {
+            ProcessOwner::SameUser => pending.push(process),
+            ProcessOwner::Unknown => unknown += 1,
+            ProcessOwner::Other => other += 1,
+            ProcessOwner::Elevated => elevated += 1,
+        }
+    }
+    // Non-target handles have already been dropped. Never print argv, SID or config secrets.
+    if unknown + other + elevated > 0 {
+        log::warn!(
+            target: super::LOGIN_CORE_LOG_TARGET,
+            "登录临时核清扫：跳过属主未知 {unknown}、其他用户 {other}、SYSTEM {elevated} 个同形进程；未证明它们已退出"
+        );
+    }
+    let selected = pending.len();
+    for _ in 0..2 {
+        pending.retain(|process| match (io.running)(process) {
+            Some(false) => false,
+            Some(true) => {
+                // Windows has no SIGTERM here. This requests termination of this one process,
+                // with a second same-handle attempt after the grace window if still needed.
+                let _ = (io.end)(process);
+                true
+            }
+            // A missing handle is unknown custody, never permission to fall back to the pid.
+            None => true,
+        });
+        if pending.is_empty() {
+            return Ok(selected);
+        }
+        // No detached task: dropping this future cannot send a late retry outside the gate.
+        tokio::time::sleep(grace).await;
+    }
+    if pending
+        .iter()
+        .all(|process| (io.running)(process) == Some(false))
+    {
+        Ok(selected)
+    } else {
+        log::warn!(
+            target: super::LOGIN_CORE_LOG_TARGET,
+            "登录临时核清扫：原进程尚未确认退出，拒绝本次准入"
+        );
+        Err(STALE_LOGIN_CORE_ALIVE.into())
+    }
+}
+
 /// Runs before a login core or a logout is admitted, under the registry's state gate.
 #[async_trait]
 pub trait StaleLoginCoreSweeper: Send + Sync {
     /// `inflight` are this registry's registered children. Returns how many leftovers ended.
+    /// Success concerns only selected, proven same-user targets; it is not global NoOwner.
     async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String>;
 }
 
-/// Production sweeper. Nothing is signalled where the process scan is empty (mobile) or where
-/// a process owner cannot be read (Windows: `process_owner_uid` is `None`, so no candidate
-/// counts as this user's). A leftover login core there is ended by the main-core sweep on the
-/// next start, which matches any `.json` config in the app config directory.
+/// Production sweeper. Windows consumes the scanner's SID owner and original process hold;
+/// Unix retains its uid/signal path. An unreadable owner is never permission to end a process.
+/// Mobile has no separate login-core processes to scan. None of these scans proves NoOwner.
 pub struct ProcessStaleLoginSweeper {
     config_dir: PathBuf,
 }
@@ -199,22 +290,40 @@ impl ProcessStaleLoginSweeper {
 #[async_trait]
 impl StaleLoginCoreSweeper for ProcessStaleLoginSweeper {
     async fn sweep(&self, binary: &Path, inflight: &[u32]) -> Result<usize, String> {
-        #[cfg(unix)]
-        let signal = crate::runtime::proxy::send_signal;
-        #[cfg(not(unix))]
-        let signal = |_: u32, _: Signal| {};
-        sweep_stale_login_cores(
-            &StaleSweepIo {
-                scan: &polaris_core_supervisor::scan_running_cores,
-                owner: &polaris_core_supervisor::process_owner_uid,
-                signal: &signal,
-            },
-            polaris_core_supervisor::process_owner_uid(std::process::id()),
-            STALE_LOGIN_KILL_GRACE,
-            binary,
-            &self.config_dir,
-            inflight,
-        )
-        .await
+        #[cfg(windows)]
+        {
+            sweep_windows_stale_login_cores(
+                &WindowsStaleSweepIo {
+                    scan: &polaris_core_supervisor::scan_running_cores,
+                    end: &|process| process.hold.terminate(),
+                    running: &|process| process.hold.is_running(),
+                },
+                STALE_LOGIN_KILL_GRACE,
+                binary,
+                &self.config_dir,
+                inflight,
+            )
+            .await
+        }
+        #[cfg(not(windows))]
+        {
+            #[cfg(unix)]
+            let signal = crate::runtime::proxy::send_signal;
+            #[cfg(not(unix))]
+            let signal = |_: u32, _: Signal| {};
+            sweep_stale_login_cores(
+                &StaleSweepIo {
+                    scan: &polaris_core_supervisor::scan_running_cores,
+                    owner: &polaris_core_supervisor::process_owner_uid,
+                    signal: &signal,
+                },
+                polaris_core_supervisor::process_owner_uid(std::process::id()),
+                STALE_LOGIN_KILL_GRACE,
+                binary,
+                &self.config_dir,
+                inflight,
+            )
+            .await
+        }
     }
 }
