@@ -367,6 +367,7 @@ fn plan_applies_explicit_bindings_to_the_physical_dialer() {
         ..Default::default()
     }));
     shadow.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -427,6 +428,7 @@ async fn real_core_accepts_bound_shadow_tls_temp_config() {
         ..Default::default()
     }));
     server.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "shape-only-secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -4943,5 +4945,48 @@ fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
     assert_eq!(
         entry.measured,
         Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
+    );
+}
+
+#[test]
+fn temp_plan_applies_global_utls_to_node_and_shadow_without_changing_the_subscription() {
+    use polaris_config_engine::user_config::protocol_settings::{ShadowTlsSettings, TlsSettings};
+    use polaris_config_engine::user_config::server_config::SecurityMode;
+    let mut node = srv("global-utls", Protocol::Vless);
+    node.security = Some(SecurityMode::Tls);
+    node.tls_settings = Some(TlsSettings::default());
+    node.shadow_tls_settings = Some(ShadowTlsSettings {
+        password: "secret".into(),
+        sni: "example.com".into(),
+        ..Default::default()
+    });
+    let before = serde_json::to_value(&node).unwrap();
+    let plan = plan_temp_core_with_utls_policy(
+        std::slice::from_ref(&node),
+        &env(),
+        &BTreeMap::new(),
+        Some("safari"),
+    );
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(
+        plan.testable[0].node["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(
+        plan.testable[0].companion_outbounds[0]["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(serde_json::to_value(&node).unwrap(), before);
+    node.tls_settings.as_mut().unwrap().engine = Some("apple".into());
+    let mut native = env();
+    native.platform = "darwin".into();
+    let invalid =
+        plan_temp_core_with_utls_policy(&[node], &native, &BTreeMap::new(), Some("safari"));
+    assert!(invalid.testable.is_empty());
+    assert_eq!(
+        invalid.unusable[0].1,
+        UnusableReason::BuildFailed(
+            "uTLS requires the Go TLS engine; disable uTLS or select Go TLS."
+        )
     );
 }

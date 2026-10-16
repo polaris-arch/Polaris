@@ -24,9 +24,13 @@ impl ScriptDeps {
         let superseded = Arc::clone(self);
         let retry = Arc::clone(self);
         CoreReadyDeps {
-            is_alive: Box::new(move || {
+            observe_process: Box::new(move || {
                 alive.alive_calls.fetch_add(1, Ordering::SeqCst);
-                alive.alive.load(Ordering::SeqCst)
+                if alive.alive.load(Ordering::SeqCst) {
+                    ChildObservation::Alive
+                } else {
+                    ChildObservation::Exited
+                }
             }),
             is_ready: Box::new(move || {
                 let idx = ready.ready_calls.fetch_add(1, Ordering::SeqCst) as usize;
@@ -183,7 +187,7 @@ async fn no_superseded_dep_treated_as_not_superseded() {
     let ready_calls = Arc::new(AtomicU32::new(0));
     let rc = ready_calls.clone();
     let deps = CoreReadyDeps {
-        is_alive: Box::new(move || true),
+        observe_process: Box::new(move || ChildObservation::Alive),
         is_ready: Box::new(move || {
             let i = rc.fetch_add(1, Ordering::SeqCst);
             // max_polls=4（200/50）：轮询调用 0..3 + boundary 调用 4。
@@ -287,11 +291,16 @@ fn deps_superseded_on_ready_call(
     let f_ready = Arc::clone(&flag);
     let f_check = flag;
     CoreReadyDeps {
-        is_alive: Box::new(move || {
+        observe_process: Box::new(move || {
             let i = alive_calls.fetch_add(1, Ordering::SeqCst) as usize;
-            *alive_script
+            if *alive_script
                 .get(i)
                 .unwrap_or_else(|| alive_script.last().unwrap_or(&true))
+            {
+                ChildObservation::Alive
+            } else {
+                ChildObservation::Exited
+            }
         }),
         is_ready: Box::new(move || {
             let f = Arc::clone(&f_ready);

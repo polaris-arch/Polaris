@@ -990,6 +990,7 @@ fn apply_ss_plugin(
                 return false;
             }
             let mut st = ShadowTlsSettings {
+                utls_mode: None,
                 password: password.unwrap(),
                 sni: host.unwrap(),
                 fingerprint: Some("chrome".to_string()),

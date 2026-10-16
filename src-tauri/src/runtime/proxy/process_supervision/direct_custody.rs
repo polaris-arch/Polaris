@@ -15,11 +15,17 @@ use polaris_core_supervisor::ChildObservation;
 use polaris_helper_proto::{HelperBirthTarget, StartNotAdmitted};
 use tokio::process::Child;
 
+#[cfg(test)]
+type ObservationWait = Box<dyn FnMut(&mut Child) -> io::Result<Option<ExitStatus>> + Send>;
+
 pub(crate) struct DirectCoreSlot {
     instance: Arc<SlotInstance>,
     backend: BackendFence,
     helper_start: Option<HelperStartAttempt>,
     state: SlotState,
+    observation_unknown_logged: bool,
+    #[cfg(test)]
+    observation_wait: Option<ObservationWait>,
 }
 
 impl Default for DirectCoreSlot {
@@ -29,6 +35,9 @@ impl Default for DirectCoreSlot {
             backend: BackendFence::DirectOnly,
             helper_start: None,
             state: SlotState::Empty,
+            observation_unknown_logged: false,
+            #[cfg(test)]
+            observation_wait: None,
         }
     }
 }
@@ -1062,29 +1071,54 @@ impl DirectCoreSlot {
         &mut self,
         expected: &RunIdentity,
     ) -> ChildObservation {
+        self.observe_running_with(Some(expected), Child::try_wait)
+    }
+
+    pub(in crate::runtime::proxy) fn startup_observation(&mut self) -> ChildObservation {
+        self.observe_running_with(None, Child::try_wait)
+    }
+
+    // Startup and the running monitor consume the same observation. The injected
+    // wait is also the test seam; it cannot extract or signal the retained Child.
+    pub(in crate::runtime::proxy) fn observe_running_with(
+        &mut self,
+        expected: Option<&RunIdentity>,
+        wait: impl FnOnce(&mut Child) -> io::Result<Option<ExitStatus>>,
+    ) -> ChildObservation {
         match &mut self.state {
-            SlotState::Running(run) if run.identity.same_run(expected) => {
-                match run.try_wait_with(Child::try_wait) {
-                    Ok(None) => ChildObservation::Alive,
-                    Ok(Some(_)) => ChildObservation::Exited,
+            SlotState::Running(run)
+                if expected.is_none_or(|identity| run.identity.same_run(identity)) =>
+            {
+                #[cfg(test)]
+                let result = match self.observation_wait.as_mut() {
+                    Some(injected) => run.try_wait_with(injected),
+                    None => run.try_wait_with(wait),
+                };
+                #[cfg(not(test))]
+                let result = run.try_wait_with(wait);
+                match result {
+                    Ok(status) => {
+                        self.observation_unknown_logged = false;
+                        if status.is_some() {
+                            ChildObservation::Exited
+                        } else {
+                            ChildObservation::Alive
+                        }
+                    }
                     Err(error) => {
-                        log::warn!(
-                            "direct native observation unknown; retaining run state: {error}"
-                        );
-                        ChildObservation::Alive
+                        if !self.observation_unknown_logged {
+                            log::warn!(
+                                "direct native observation unknown; retaining run state: {error}"
+                            );
+                            self.observation_unknown_logged = true;
+                        }
+                        ChildObservation::Unknown
                     }
                 }
             }
             SlotState::Empty | SlotState::Running(_) | SlotState::Stopping(_) => {
                 ChildObservation::Absent
             }
-        }
-    }
-
-    pub(in crate::runtime::proxy) fn is_running_alive(&mut self) -> bool {
-        match &mut self.state {
-            SlotState::Running(run) => matches!(run.try_wait_with(Child::try_wait), Ok(None)),
-            SlotState::Empty | SlotState::Stopping(_) => false,
         }
     }
 
@@ -1102,6 +1136,14 @@ impl DirectCoreSlot {
             }
             SlotState::Empty | SlotState::Running(_) | SlotState::Stopping(_) => false,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn inject_observation_wait_for_test(
+        &mut self,
+        wait: ObservationWait,
+    ) {
+        self.observation_wait = Some(wait);
     }
 
     #[cfg(test)]

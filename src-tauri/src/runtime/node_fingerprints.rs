@@ -157,8 +157,11 @@ fn measurement_seed(
     server: &ServerConfig,
     interface: Option<String>,
     temp: bool,
+    utls_policy: Option<&str>,
 ) -> Option<String> {
-    let mut value = serde_json::to_value(server).ok()?;
+    let effective =
+        polaris_config_engine::user_config::utls::effective_server(server, utls_policy).ok()?;
+    let mut value = serde_json::to_value(effective.as_ref()).ok()?;
     // The actual temp builder strips detour and installs only the requested node.
     if temp {
         value.as_object_mut()?.remove("detour");
@@ -196,6 +199,7 @@ pub(crate) fn measurement_temp_table(
                         server, config,
                     ),
                     true,
+                    config.utls_policy.as_deref(),
                 )?,
             ))
         })
@@ -221,7 +225,7 @@ pub(crate) fn measurement_table_config(
             Some((
                 server.id.clone(),
                 (
-                    measurement_seed(server, interface, false)?,
+                    measurement_seed(server, interface, false, config.utls_policy.as_deref())?,
                     server.detour.clone(),
                 ),
             ))
@@ -288,6 +292,10 @@ pub(crate) fn measurement_connections_json(config: &Value) -> MeasurementConnect
         .unwrap_or_default();
     let policy = polaris_config_engine::user_config::UserConfig {
         servers,
+        utls_policy: config
+            .get("utlsPolicy")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         subscriptions: config
             .get("subscriptions")
             .cloned()

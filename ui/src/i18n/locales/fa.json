@@ -518,6 +518,11 @@
     "switchRequiresApply": "{{node}} · ذخیره شد؛ پیش از استفاده تغییرات معلق را اعمال کنید"
   },
   "settings": {
+    "utls": {
+      "label": "Global uTLS fingerprint",
+      "description": "Follow preserves node settings. Overrides affect generated configuration only. Random selects once per core process; Randomized uses a randomized template.",
+      "follow": "Follow node"
+    },
     "coex": {
       "windowsHint": "منابع بومی جداگانه نمایش داده می‌شوند. کامل بودن و compartment ممکن است نامعلوم بماند. ارتباط رابط، انتخاب مسیر یا نتیجه ایمنی استنباط نمی‌شود.",
       "adaptersSource": "آداپتورها",
@@ -2428,6 +2433,11 @@
     "masque": "تونل IP شخصی"
   },
   "node": {
+    "utls": {
+      "legacy": "Unset (legacy default)",
+      "default": "Core default fingerprint",
+      "disabled": "Disable uTLS (keep TLS)"
+    },
     "field": {
       "aid": "AlterID",
       "alpn": "ALPN",

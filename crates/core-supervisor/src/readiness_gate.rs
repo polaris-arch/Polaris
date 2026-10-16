@@ -15,6 +15,8 @@
 
 use std::future::Future;
 
+use crate::ChildObservation;
+
 /// 核就绪轮询结局（core-readiness.ts:63 `CoreReadyOutcome`）。
 ///
 /// - `Ready`：管理 API 端口可连（核已就绪）。
@@ -60,8 +62,8 @@ pub struct CoreStartSupersededError;
 /// 所有闭包以 `&self` 借用调用，故用 trait object 风格的结构体持有闭包。生产路径注入真实 TCP 探测 + 进程探活；
 /// 测试路径注入桩函数 + 计数器。
 pub struct CoreReadyDeps<'a> {
-    /// 核进程是否存活（isAlive）。
-    pub is_alive: Box<dyn Fn() -> bool + Send + Sync + 'a>,
+    /// 保留 Alive/Exited/Unknown 以及 custody 已让位（Absent），不能把观测错误折成死亡。
+    pub observe_process: Box<dyn Fn() -> ChildObservation + Send + Sync + 'a>,
     /// 管理 API 是否可连（就绪信号，isReady）——异步 TCP 探测。
     pub is_ready: Box<dyn Fn() -> PinReadyFuture<'a> + Send + Sync + 'a>,
     /// sleep（轮询间隔）。
@@ -88,7 +90,13 @@ impl<'a> CoreReadyDeps<'a> {
         sleep: impl Fn(Duration) -> PinSleepFuture<'a> + Send + Sync + 'a,
     ) -> Self {
         Self {
-            is_alive: Box::new(is_alive),
+            observe_process: Box::new(move || {
+                if is_alive() {
+                    ChildObservation::Alive
+                } else {
+                    ChildObservation::Exited
+                }
+            }),
             is_ready: Box::new(is_ready),
             sleep: Box::new(sleep),
             is_superseded: None,
@@ -283,8 +291,10 @@ pub async fn wait_for_core_ready(
         if (deps.is_ready)().await {
             return CoreReadyOutcome::Ready;
         }
-        if !(deps.is_alive)() {
-            return settle_failure(deps, CoreReadyOutcome::Dead);
+        match (deps.observe_process)() {
+            ChildObservation::Exited => return settle_failure(deps, CoreReadyOutcome::Dead),
+            ChildObservation::Absent => return CoreReadyOutcome::Superseded,
+            ChildObservation::Alive | ChildObservation::Unknown => {}
         }
         // 未就绪 + 进程仍活 → 即将 sleep 后重试：计一次就绪重试（上游 onRetry，:906）。
         // 纯观测，位于判定之后、sleep 之前，绝不改变任何 return 分支。
@@ -301,8 +311,10 @@ pub async fn wait_for_core_ready(
     if (deps.is_ready)().await {
         return CoreReadyOutcome::Ready;
     }
-    if !(deps.is_alive)() {
-        return settle_failure(deps, CoreReadyOutcome::Dead);
+    match (deps.observe_process)() {
+        ChildObservation::Exited => return settle_failure(deps, CoreReadyOutcome::Dead),
+        ChildObservation::Absent => return CoreReadyOutcome::Superseded,
+        ChildObservation::Alive | ChildObservation::Unknown => {}
     }
     settle_failure(deps, CoreReadyOutcome::Timeout)
 }

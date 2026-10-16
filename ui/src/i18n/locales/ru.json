@@ -518,6 +518,11 @@
     "switchRequiresApply": "{{node}} · сохранено; примените ожидающие изменения"
   },
   "settings": {
+    "utls": {
+      "label": "Global uTLS fingerprint",
+      "description": "Follow preserves node settings. Overrides affect generated configuration only. Random selects once per core process; Randomized uses a randomized template.",
+      "follow": "Follow node"
+    },
     "coex": {
       "windowsHint": "Нативные источники показаны отдельно. Полнота и compartment могут оставаться неизвестными. Связь интерфейсов, выбор маршрута и безопасность не определяются.",
       "adaptersSource": "Адаптеры",
@@ -2428,6 +2433,11 @@
     "masque": "Свой IP-туннель"
   },
   "node": {
+    "utls": {
+      "legacy": "Unset (legacy default)",
+      "default": "Core default fingerprint",
+      "disabled": "Disable uTLS (keep TLS)"
+    },
     "field": {
       "aid": "AlterID",
       "alpn": "ALPN",

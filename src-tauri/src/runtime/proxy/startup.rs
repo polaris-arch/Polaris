@@ -340,7 +340,7 @@ pub(super) fn main_core_parse_unit_count(config: &SingBoxConfig) -> usize {
 ///   一个由推导系数算出来的估算值。用一个未经多点实测的公式去否决用户的连接请求，代价与置信度
 ///   完全不匹配；
 /// · 临时核那条上限的判据是「等一个可能永远不会 bind 的核，且这段时间里进程级单飞闸挡住一切后续
-///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::is_alive`
+///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::observe_process`
 ///   当场接住；用户中途点停止/重连由 `is_superseded` 接住，且轮询 sleep 本身可被世代变化打断
 ///   （见 [`ProxyRuntime::wait_ready`]）⇒ 等待随时可取消，用户不需要一个替他做主的上限。
 ///
@@ -2910,7 +2910,7 @@ impl ProxyRuntime {
         let deps = CoreReadyDeps {
             // 子进程存活：直起走 try_wait 非阻塞收割（Ok(None)=仍在跑；child 被 stop 取走→不活）；
             // helper 核走 pid 探活（kill(pid,0)，root 核跨用户 EPERM 亦判活）。
-            is_alive: Box::new({
+            observe_process: Box::new({
                 let alive_probe_count = Arc::clone(&alive_probe_count);
                 let alive_probe_elapsed_us = Arc::clone(&alive_probe_elapsed_us);
                 move || {
@@ -2919,30 +2919,43 @@ impl ProxyRuntime {
                     // 桥的起核回执就是这条腿的真值（语义与射程见 `android_bridge::core_started`）。
                     // 不能问桥要 `BoxService.state`：本闭包是**同步**的（`Fn()->bool`），跨桥往返是
                     // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
-                    let alive = if cfg!(target_os = "android") {
-                        super::android_bridge::core_started()
+                    use polaris_core_supervisor::ChildObservation;
+                    let observed = if cfg!(target_os = "android") {
+                        if super::android_bridge::core_started() {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if cfg!(target_os = "ios") {
                         #[cfg(target_os = "ios")]
                         {
-                            tauri_plugin_polaris_ios::started()
+                            if tauri_plugin_polaris_ios::started() {
+                                ChildObservation::Alive
+                            } else {
+                                ChildObservation::Exited
+                            }
                         }
                         #[cfg(not(target_os = "ios"))]
                         {
-                            false
+                            ChildObservation::Absent
                         }
                     } else if via_helper {
-                        helper_pid.is_some_and(pid_alive)
+                        if helper_pid.is_some_and(pid_alive) {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if let Ok(mut g) = child.lock() {
-                        g.is_running_alive()
+                        g.startup_observation()
                     } else {
-                        false
+                        ChildObservation::Unknown
                     };
                     alive_probe_count.fetch_add(1, Ordering::Relaxed);
                     alive_probe_elapsed_us.fetch_add(
                         started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
-                    alive
+                    observed
                 }
             }),
             // 就绪信号：管理 API 端口 TCP 可连（core-readiness.ts 原义；该口是 h2c gRPC，无 REST 可判）。

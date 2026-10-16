@@ -2008,3 +2008,109 @@ fn wireguard_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() {
     assert!(got.contains(&(json!(true), json!("eth7"))), "{got:?}");
     assert!(got.contains(&(json!(false), json!("eth6"))), "{got:?}");
 }
+
+#[test]
+fn utls_enabled_intent_survives_import_save_share_and_generation() {
+    use polaris_config_engine::user_config::utls::{effective_server, UtlsMode};
+    for protocol in ["vless", "vmess", "trojan", "anytls"] {
+        for (input, mode, expected) in [
+            (
+                json!({"enabled":false,"fingerprint":"chrome"}),
+                UtlsMode::Disabled,
+                None,
+            ),
+            (json!({"enabled":false}), UtlsMode::Disabled, None),
+            (Value::Null, UtlsMode::Disabled, None),
+            (json!({"enabled":true}), UtlsMode::Default, Some("")),
+            (
+                json!({"enabled":true,"fingerprint":""}),
+                UtlsMode::Default,
+                Some(""),
+            ),
+            (
+                json!({"enabled":true,"fingerprint":"FiReFox"}),
+                UtlsMode::Profile,
+                Some("firefox"),
+            ),
+        ] {
+            let mut tls = json!({"enabled":true,"server_name":"example.com"});
+            if !input.is_null() {
+                tls["utls"] = input;
+            }
+            let parsed = parse(json!({"outbounds":[{
+                "type":protocol,"tag":"node","server":"example.com","server_port":443,
+                "uuid":"11111111-1111-1111-1111-111111111111","password":"secret","tls":tls,
+            }]}));
+            assert_eq!(parsed.servers.len(), 1);
+            let node = &parsed.servers[0];
+            assert_eq!(node.tls_settings.as_ref().unwrap().utls_mode, Some(mode));
+            let saved: ServerConfig =
+                serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
+            let effective = effective_server(&saved, Some("follow")).unwrap();
+            let built = serde_json::to_value(build_proxy_outbound(
+                effective.as_ref(),
+                "p",
+                &DomainResolver::Tag("dns-bootstrap".into()),
+                "x64",
+                "linux",
+            ))
+            .unwrap();
+            assert_eq!(built["tls"]["enabled"], true);
+            match expected {
+                Some(profile) => assert_eq!(built["tls"]["utls"]["fingerprint"], profile),
+                None => assert!(built["tls"].get("utls").is_none()),
+            }
+            // Share formats use fp=none/chrome to represent off/core Auto.
+            let link = crate::share_link::encode_share_url(&saved).unwrap();
+            let round =
+                crate::share_link::parse_share_url(&link, &mut || "round".into(), &mut |_| {})
+                    .unwrap();
+            let effective = effective_server(&round, None).unwrap();
+            let shared = serde_json::to_value(build_proxy_outbound(
+                effective.as_ref(),
+                "p",
+                &DomainResolver::Tag("dns-bootstrap".into()),
+                "x64",
+                "linux",
+            ))
+            .unwrap();
+            match expected {
+                Some("") => assert_eq!(shared["tls"]["utls"]["fingerprint"], "chrome"),
+                Some(profile) => assert_eq!(shared["tls"]["utls"]["fingerprint"], profile),
+                None => assert!(shared["tls"].get("utls").is_none()),
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_native_tls_engine_keeps_disabled_utls_and_rejects_an_active_conflict() {
+    use polaris_config_engine::user_config::utls::effective_server_for_platform;
+    let parsed = parse(
+        json!({"outbounds":[{"type":"vless","tag":"native","server":"example.com","server_port":443,
+        "uuid":"11111111-1111-1111-1111-111111111111",
+        "tls":{"enabled":true,"engine":"apple","utls":{"enabled":false,"fingerprint":"chrome"}}}]}),
+    );
+    assert_eq!(parsed.servers.len(), 1);
+    let node = &parsed.servers[0];
+    assert_eq!(
+        node.tls_settings.as_ref().unwrap().engine.as_deref(),
+        Some("apple")
+    );
+    let effective = effective_server_for_platform(node, None, "darwin").unwrap();
+    let built = serde_json::to_value(build_proxy_outbound(
+        effective.as_ref(),
+        "p",
+        &DomainResolver::Tag("dns-bootstrap".into()),
+        "x64",
+        "darwin",
+    ))
+    .unwrap();
+    assert_eq!(built["tls"]["engine"], "apple");
+    assert!(built["tls"].get("utls").is_none());
+    assert!(effective_server_for_platform(node, Some("default"), "darwin").is_err());
+    assert!(
+        effective_server_for_platform(node, Some("default"), "linux").is_ok(),
+        "foreign engine remains dormant according to the original platform gate"
+    );
+}

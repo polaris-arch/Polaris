@@ -496,6 +496,11 @@
     "switchRequiresApply": "{{node}} · 已儲存，請套用待處理變更後使用"
   },
   "settings": {
+    "utls": {
+      "label": "全域 uTLS 指紋",
+      "description": "跟隨節點保留原設定；其他選項僅覆寫產生的設定，不修改節點。Random 在核心行程啟動時選定範本，Randomized 為隨機化範本。",
+      "follow": "跟隨節點"
+    },
     "coex": {
       "windowsHint": "各原生來源獨立顯示，完整性和 compartment 可能仍為未知。不推斷介面關聯、路由選擇或安全結論。",
       "adaptersSource": "介面卡",
@@ -1888,6 +1893,11 @@
     "masque": "自建 IP 隧道"
   },
   "node": {
+    "utls": {
+      "legacy": "未設定（相容原預設）",
+      "default": "核心預設指紋",
+      "disabled": "關閉 uTLS（保留 TLS）"
+    },
     "add": "新增",
     "addTitle": "新增節點",
     "chainHint": "先經另一節點再出站（鏈式代理）",

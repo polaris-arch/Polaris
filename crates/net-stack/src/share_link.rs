@@ -777,6 +777,7 @@ fn parse_shadowsocks(
                 params.get_ne("shadow-tls-sni"),
             ) {
                 c.shadow_tls_settings = Some(ShadowTlsSettings {
+                    utls_mode: None,
                     password: pw,
                     sni,
                     fingerprint: normalize_token(
@@ -798,6 +799,7 @@ fn parse_shadowsocks(
             params.get_ne("shadow-tls-sni"),
         ) {
             c.shadow_tls_settings = Some(ShadowTlsSettings {
+                utls_mode: None,
                 password: pw,
                 sni,
                 fingerprint: normalize_token(
@@ -822,6 +824,7 @@ fn parse_shadowsocks(
                 let host = v.get("host").and_then(|x| x.as_str());
                 if let (Some(pw), Some(host)) = (pw, host) {
                     c.shadow_tls_settings = Some(ShadowTlsSettings {
+                        utls_mode: None,
                         password: pw.to_string(),
                         sni: host.to_string(),
                         fingerprint: Some("chrome".to_string()),
@@ -1394,7 +1397,13 @@ fn push_tls_params(q: &mut QueryString, tls: &TlsSettings) {
             q.push("alpn", alpn.join(","));
         }
     }
-    q.push_opt("fp", tls.fingerprint.clone());
+    q.push_opt(
+        "fp",
+        polaris_config_engine::user_config::utls::share_fingerprint(
+            tls.utls_mode,
+            tls.fingerprint.as_deref(),
+        ),
+    );
     if tls.allow_insecure == Some(true) {
         q.push("allowInsecure", "1");
     }
@@ -1848,7 +1857,10 @@ fn encode_vmess(c: &ServerConfig) -> Result<String, String> {
             if let Some(sni) = &tls.server_name {
                 obj.insert("sni".into(), json!(sni));
             }
-            if let Some(fp) = &tls.fingerprint {
+            if let Some(fp) = polaris_config_engine::user_config::utls::share_fingerprint(
+                tls.utls_mode,
+                tls.fingerprint.as_deref(),
+            ) {
                 obj.insert("fp".into(), json!(fp));
             }
             if let Some(alpn) = &tls.alpn {

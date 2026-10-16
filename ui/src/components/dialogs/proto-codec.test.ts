@@ -519,7 +519,7 @@ describe('HIGH-1：toConfig 尊重 when 显隐 —— 隐藏字段不下发/清�
   it('#1 新建 vless（security=none 默认）→ 无 tlsSettings / realitySettings', () => {
     const draft = draftFromSpecs(allFields('vless'));
     expect(draft.sec).toBe('none'); // sec 选项首项
-    expect(draft.fp).toBe('chrome'); // fp 被 seed 成 O_FP 首项（phantom 源）
+    expect(draft.fp).toBe(''); // explicit unset preserves the legacy protocol default
     const out = protoCodec.vless.toConfig(draft, { ...META, protocol: 'vless' });
     expect(out.tlsSettings).toBeUndefined();
     expect(out.realitySettings).toBeUndefined();
@@ -840,6 +840,7 @@ describe('shadowsocks ShadowTLS 参数组（齐备才写，缺一不下发半成
       password: 'stls-pwd',
       sni: 'stls.example',
       fingerprint: 'firefox',
+      utlsMode: 'profile',
       port: 8443,
     });
     const back = protoCodec.shadowsocks.fromConfig(out);
@@ -3243,4 +3244,24 @@ it('headers with Object prototype names remain own arrays and round-trip duplica
   expect(headers.__proto__).toEqual(['c']);
   const roundTrip = protoCodec['masque-client'].fromConfig(saved);
   expect(protoCodec['masque-client'].toConfig(roundTrip, saved).masqueClientSettings?.headers).toEqual(headers);
+});
+
+
+describe('explicit uTLS edit intent', () => {
+  for (const proto of ['vless', 'vmess', 'trojan', 'http', 'anytls'] as const) {
+    it(`${proto}: keeps default/disabled/profile on an unchanged edit`, () => {
+      for (const intent of [
+        { utlsMode: 'default' as const },
+        { utlsMode: 'disabled' as const, fingerprint: 'chrome' },
+        { utlsMode: 'profile' as const, fingerprint: 'firefox' },
+      ]) {
+        const base = { ...SAMPLES[proto], security: 'tls' as const, tlsSettings: { serverName: 'example.com', ...intent } };
+        const draft = protoCodec[proto].fromConfig(base);
+        const saved = protoCodec[proto].toConfig(draft, base);
+        expect(saved.tlsSettings?.utlsMode).toBe(intent.utlsMode);
+        expect(saved.tlsSettings?.fingerprint).toBe(intent.fingerprint);
+        expect(saved.security).toBe('tls');
+      }
+    });
+  }
 });

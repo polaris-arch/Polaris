@@ -198,7 +198,7 @@ const TEMP_CORE_READY_TIMEOUT_FLOOR_MS: u64 = 10_000;
 /// · 上界：一分钟是「这东西是不是死了」的普遍心理阈值，再往上等只是把无解的等待拉长。
 ///
 /// **真会吃满这 60s 的只有一种形态：核活着、但一直不 bind 的僵核。** 另外两条腿都提前返回，
-/// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::is_alive` 接住
+/// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::observe_process` 接住
 /// （本模块传的是 `pid == 0 || pid_alive(pid)`，进程一没就停等）；用户中途点「连接」由
 /// `is_superseded` 接住（命中即停等 + 杀核）。剩下的那种僵核形态确实**没有取消按钮**
 /// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_GATE`）在此期间挡住
@@ -1452,9 +1452,33 @@ pub fn plan_temp_core_with_bindings(
     env: &CoreBuildEnv,
     bind_interfaces: &BTreeMap<String, String>,
 ) -> TempCorePlan {
+    plan_temp_core_with_utls_policy(servers, env, bind_interfaces, None)
+}
+
+#[must_use]
+pub fn plan_temp_core_with_utls_policy(
+    servers: &[ServerConfig],
+    env: &CoreBuildEnv,
+    bind_interfaces: &BTreeMap<String, String>,
+    utls_policy: Option<&str>,
+) -> TempCorePlan {
     let mut out = TempCorePlan::default();
     let mut seen_tags: BTreeSet<String> = BTreeSet::new();
     for s in servers {
+        let effective =
+            match polaris_config_engine::user_config::utls::effective_server_for_platform(
+                s,
+                utls_policy,
+                &env.platform,
+            ) {
+                Ok(effective) => effective,
+                Err(reason) => {
+                    out.unusable
+                        .push((s.id.clone(), UnusableReason::BuildFailed(reason)));
+                    continue;
+                }
+            };
+        let s = effective.as_ref();
         // Custom endpoints can carry a raw tailscale type even when the typed
         // protocol is Custom. Reject before constructing a node: constructing
         // a second tsnet identity could initialize its state_directory.
@@ -3191,7 +3215,13 @@ impl TempCoreSession {
         let probe = Arc::clone(&deps.probe_port);
         let first_port = ports[0];
         let ready_deps = CoreReadyDeps {
-            is_alive: Box::new(move || pid == 0 || pid_alive(pid)),
+            observe_process: Box::new(move || {
+                if pid == 0 || pid_alive(pid) {
+                    polaris_core_supervisor::ChildObservation::Alive
+                } else {
+                    polaris_core_supervisor::ChildObservation::Exited
+                }
+            }),
             is_ready: Box::new(move || {
                 let probe = Arc::clone(&probe);
                 Box::pin(async move {

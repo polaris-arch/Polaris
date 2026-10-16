@@ -2,6 +2,7 @@ use super::*;
 
 mod direct_stop;
 mod native_direct_stop;
+mod startup_observation;
 
 #[cfg(target_os = "linux")]
 struct BirthDaemonStream {
@@ -939,7 +940,10 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
         rt.child.lock().unwrap().take_running_legacy(),
         Err(TakeRunningError::Stopping)
     ));
-    assert!(!rt.child.lock().unwrap().is_running_alive());
+    assert_eq!(
+        rt.child.lock().unwrap().startup_observation(),
+        ChildObservation::Absent
+    );
     assert!(!rt.child.lock().unwrap().running_matches(&identity));
     assert!(!rt.child.lock().unwrap().running_exit_proven(&identity));
 

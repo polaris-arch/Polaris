@@ -31,6 +31,7 @@ import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-
 import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
 import type { SpeedTestMeteredPolicy } from '@/contracts/types';
+import { globalUtlsOptions } from '@/domain/utls';
 import { MobileSelect, MobileSwitch, MobileTextInput, SettingsGroup, SettingsRow } from './SettingsChrome';
 import type { MobileSettingsPageProps } from './settings-pages';
 
@@ -212,6 +213,16 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
               <option value="off">{t('settings.network.webrtcLeakOff')}</option>
               <option value="proxy">{t('settings.network.webrtcLeakProxy')}</option>
               <option value="block">{t('settings.network.webrtcLeakBlock')}</option>
+            </MobileSelect>
+          }
+        />
+        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={t('settings.utls.description')}
+          control={
+            <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
+              onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
+              {globalUtlsOptions(config.utlsPolicy).map(([value, label]) => (
+                <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
+              ))}
             </MobileSelect>
           }
         />

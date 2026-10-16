@@ -482,6 +482,7 @@ fn shadow_tls_postprocess_creates_outer_outbound() {
     let mut srv = ss_server("s1", "节点1");
     srv.bind_interface = Some("en7".into());
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "stls-pass".into(),
         sni: "sni.example.com".into(),
         fingerprint: Some("firefox".into()),
@@ -525,6 +526,7 @@ fn shadow_tls_postprocess_creates_outer_outbound() {
 fn shadow_tls_empty_sni_omits_server_name() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "p".into(),
         sni: String::new(), // 空 → server_name 不输出
         fingerprint: None,  // → 默认 chrome
@@ -563,6 +565,7 @@ fn shadow_tls_empty_sni_omits_server_name() {
 fn shadow_tls_empty_credentials_still_emit_unusable_outbound_json() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: String::new(), // 旧前端「开关一开就写空壳」的原样形状
         sni: String::new(),
         fingerprint: None,
@@ -599,6 +602,7 @@ fn shadow_tls_empty_credentials_still_emit_unusable_outbound_json() {
 fn shadow_tls_full_settings_emit_expected_outbound_json() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "stls-pass".into(),
         sni: "www.microsoft.com".into(),
         fingerprint: Some("firefox".into()),
@@ -637,6 +641,7 @@ fn shadow_tls_full_settings_emit_expected_outbound_json() {
 fn shadow_tls_zero_port_falls_back_to_node_port() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "p".into(),
         sni: "s.example".into(),
         fingerprint: None,
@@ -1632,6 +1637,7 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
         let mut inner = ss_server("inner", "Inner");
         inner.bind_interface = Some("en7".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: None,
             password: "wrapper-password".into(),
             sni: "cover.example.com".into(),
             fingerprint: None,
@@ -1701,6 +1707,7 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
         let mut inner = ss_server("inner", "Inner");
         inner.detour = Some("upstream".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: None,
             password: "p".into(),
             sni: "cover.example".into(),
             fingerprint: None,
@@ -1726,4 +1733,53 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
             assert!(deps.gate_invalid_nodes.contains_key("inner"));
         }
     }
+}
+
+#[test]
+fn global_utls_policy_reaches_main_and_shadow_physical_outbound() {
+    use crate::user_config::protocol_settings::{ShadowTlsSettings, TlsSettings};
+    use crate::user_config::server_config::SecurityMode;
+    let plain = ServerConfig {
+        id: "plain-utls".into(),
+        name: "plain".into(),
+        address: "example.com".into(),
+        port: 443,
+        security: Some(SecurityMode::Tls),
+        tls_settings: Some(TlsSettings::default()),
+        ..Default::default()
+    };
+    let mut wrapped = plain.clone();
+    wrapped.id = "shadow-utls".into();
+    wrapped.shadow_tls_settings = Some(ShadowTlsSettings {
+        password: "secret".into(),
+        sni: "example.com".into(),
+        ..Default::default()
+    });
+    let config = UserConfig {
+        servers: vec![plain, wrapped],
+        utls_policy: Some("safari".into()),
+        ..Default::default()
+    };
+    let before = serde_json::to_value(&config.servers).unwrap();
+    let result = build_outbounds(&config, &mut deps_default()).unwrap();
+    let nodes: Vec<_> = result
+        .outbounds
+        .iter()
+        .filter(|outbound| outbound.server.is_some())
+        .collect();
+    assert!(!nodes.is_empty());
+    for outbound in nodes {
+        assert_eq!(
+            outbound
+                .tls
+                .as_ref()
+                .unwrap()
+                .utls
+                .as_ref()
+                .unwrap()
+                .fingerprint,
+            "safari"
+        );
+    }
+    assert_eq!(serde_json::to_value(&config.servers).unwrap(), before);
 }

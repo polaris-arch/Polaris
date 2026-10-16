@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { globalUtlsOptions } from '@/domain/utls';
 import { useTranslation } from 'react-i18next';
 import type { SpeedTestMeteredPolicy, UserConfig } from '@/contracts/types';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
@@ -501,6 +502,17 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
               { value: 'block', label: t('settings.network.webrtcLeakBlock') },
             ]}
           />
+        </SetRow>
+        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')}>
+          <Select
+            value={config.utlsPolicy ?? 'follow'}
+            aria-label={t('settings.utls.label')}
+            onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
+          >
+            {globalUtlsOptions(config.utlsPolicy).map(([value, label]) => (
+              <option key={value} value={value}>{t(label, { defaultValue: label })}</option>
+            ))}
+          </Select>
         </SetRow>
         <SetRow
           label={t('settings.advanced.tlsFragment')}

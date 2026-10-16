@@ -48,6 +48,7 @@ fn fully_populated() -> UserConfig {
         dns_config: Some(DnsConfig::default()),
         rule_resources: Vec::new(),
         tls_fragment: Some(false),
+        utls_policy: Some("follow".into()),
         interrupt_connections_on_switch: Some(false),
         resolve_before_dial: Some(false),
         region_routing: Some(RegionRoutingConfig::default()),

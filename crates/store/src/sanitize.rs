@@ -133,6 +133,7 @@ fn sanitize_value_in_place(value: &mut Value) {
     string_or_remove(obj, "singboxDashboardUrl", true, true);
     string_or_remove(obj, "clashApiSecret", false, false);
     string_or_remove(obj, "speedTestUrl", false, false);
+    string_or_remove(obj, "utlsPolicy", true, true);
     // subscriptionProxyPolicy：三态，非法值删除（回落 follow）
     policy_or_remove(obj, "subscriptionProxyPolicy");
     // 已退役的内核更新设置：应用内不再更新内核，旧配置里留下的键一律删掉，不随配置继续流转。

@@ -99,8 +99,8 @@ use crate::runtime::proxy::{
     ReadyMainTicket, SpeedBindingContext, SpeedProbeTargets,
 };
 use crate::runtime::speedtest::{
-    emit_speed_test_done, is_temp_core_superseded, plan_temp_core_with_bindings, InterruptReason,
-    TempCoreDeps, TempCoreOutcome, TempCoreSession,
+    emit_speed_test_done, is_temp_core_superseded, InterruptReason, TempCoreDeps, TempCoreOutcome,
+    TempCoreSession,
 };
 use crate::runtime::speedtest_tunnel::{
     is_acceptable_status, open_tunnel, SpeedTestTarget, TunnelError, WarmTunnel,
@@ -2037,6 +2037,10 @@ fn user_config_for_temp_core(config: &Value) -> UserConfig {
                 http_port,
                 ..Default::default()
             };
+            fallback.utls_policy = config
+                .get("utlsPolicy")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             fallback.subscriptions = config
                 .get("subscriptions")
                 .cloned()
@@ -2077,7 +2081,7 @@ fn requested_server_configs(config: &Value, requested: &[String]) -> Vec<ServerC
 
 /// **临时核测速腿**（主核未运行；对齐 上游 `SpeedTestService.testServersViaProxy`，`:388-620`）。
 ///
-/// 编排：请求集 → typed 节点（保序）→ [`plan_temp_core_with_bindings`] 裁掉临时核结构性测不了的（tailscale / naive 缺
+/// 编排：请求集 → typed 节点（保序）→ [`crate::runtime::speedtest::plan_temp_core_with_utls_policy`] 裁掉临时核结构性测不了的（tailscale / naive 缺
 /// cronet / 构造失败）→ [`TempCoreSession::run`] 起核 + 就绪门 + 分批并发量 warm-TTFB + **无条件收尾** →
 /// 折成响应信封。
 ///
@@ -2122,7 +2126,12 @@ async fn run_temp_core_speed_test(
                 .map(|interface| (server.id.clone(), interface))
         })
         .collect();
-    let plan = plan_temp_core_with_bindings(&servers, &proxy.core_build_env(), &bind_interfaces);
+    let plan = crate::runtime::speedtest::plan_temp_core_with_utls_policy(
+        &servers,
+        &proxy.core_build_env(),
+        &bind_interfaces,
+        user_config.utls_policy.as_deref(),
+    );
     let skip_request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,
         targets: requested.clone(),

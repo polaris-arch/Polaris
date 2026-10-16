@@ -166,6 +166,15 @@ pub fn config_generation_norm(
         }
     }
 
+    proj.insert(
+        "utlsPolicy".into(),
+        serde_json::json!(config
+            .utls_policy
+            .as_deref()
+            .and_then(crate::user_config::normalize::normalize_token)
+            .unwrap_or_else(|| "follow".into())),
+    );
+
     // 一等流量规则投影（缺省兼容 policyRules/customRules）。targetServerId 由 selector 热切，不进 norm。
     let traffic_rules_proj = {
         let dns_rule_active = |rule: &crate::user_config::rule::Rule| match &rule.effects {

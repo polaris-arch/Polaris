@@ -496,6 +496,11 @@
     "switchRequiresApply": "{{node}} · 已保存，请应用待处理更改后使用"
   },
   "settings": {
+    "utls": {
+      "label": "全局 uTLS 指纹",
+      "description": "跟随节点保留原设置；其他选项仅覆盖生成配置，不修改节点。Random 在核心进程启动时选定模板，Randomized 为随机化模板。",
+      "follow": "跟随节点"
+    },
     "coex": {
       "windowsHint": "各原生来源独立展示，完整性和 compartment 可能仍为未知。不推断接口关联、路由选择或安全结论。",
       "adaptersSource": "适配器",
@@ -1888,6 +1893,11 @@
     "masque": "自建 IP 隧道"
   },
   "node": {
+    "utls": {
+      "legacy": "未设置（兼容原默认）",
+      "default": "核心默认指纹",
+      "disabled": "关闭 uTLS（保留 TLS）"
+    },
     "add": "添加",
     "addTitle": "添加节点",
     "chainHint": "先经另一节点再出站（链式代理）",

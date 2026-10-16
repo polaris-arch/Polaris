@@ -496,6 +496,11 @@
     "switchRequiresApply": "{{node}} · saved; apply pending changes before use"
   },
   "settings": {
+    "utls": {
+      "label": "Global uTLS fingerprint",
+      "description": "Follow preserves node settings. Overrides affect generated configuration only. Random selects once per core process; Randomized uses a randomized template.",
+      "follow": "Follow node"
+    },
     "coex": {
       "windowsHint": "Independent native observations. Completeness and compartment may remain Unknown. No interface association, route selection or safety verdict is inferred.",
       "adaptersSource": "Adapters",
@@ -1888,6 +1893,11 @@
     "masque": "Self-hosted IP tunnel"
   },
   "node": {
+    "utls": {
+      "legacy": "Unset (legacy default)",
+      "default": "Core default fingerprint",
+      "disabled": "Disable uTLS (keep TLS)"
+    },
     "add": "Add",
     "addTitle": "Add Node",
     "chainHint": "Route through another node first (chained proxy)",
