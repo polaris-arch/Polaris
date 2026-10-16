@@ -132,10 +132,10 @@ fn temp_planner_partitions_system_interfaces_without_losing_userspace_nodes() {
 /// - 把 `absent` 并进 `failed` → 第 1 组转红且三分之和溢出（`also_assert_total` 在 debug 下当场炸）。
 #[test]
 fn speed_test_summary_splits_timeout_from_never_measured() {
-    let m = |pairs: &[(&str, i64)]| -> serde_json::Map<String, Value> {
+    let m = |pairs: &[(&str, i64)]| -> RoundResults {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), json!(v)))
+            .map(|(k, v)| ((*k).to_string(), u32::try_from(*v).map_err(|_| TIMED_OUT)))
             .collect()
     };
     let intended: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| (*s).into()).collect();
@@ -171,7 +171,7 @@ fn speed_test_summary_splits_timeout_from_never_measured() {
 
     // 全员未测（让位/中断）：一个 `-1` 都不该被伪造出来。
     let s = summarize_speed_test(
-        &serde_json::Map::new(),
+        &RoundResults::new(),
         &intended,
         4,
         Some(InterruptReason::CoreExited),
@@ -1020,8 +1020,8 @@ async fn drive_round_of_one_batch<Meas, MeasFut>(
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
-) -> (serde_json::Map<String, Value>, &'static str)
+    emit: &mut dyn MeasurementEvents,
+) -> (RoundResults, &'static str)
 where
     Meas: Fn(u16) -> MeasFut,
     MeasFut: std::future::Future<Output = Measured> + Send + 'static,
@@ -1091,12 +1091,12 @@ async fn measures_all_nodes_when_never_superseded() {
         &superseded_at(0),
         &mut healthy_watch(),
         |_| async { Ok(120_u32) },
-        &mut |ev, _| events.push(ev.to_string()),
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(results["a1111111"], json!(120));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(120));
     assert_eq!(
         events
             .iter()
@@ -1124,11 +1124,11 @@ async fn genuine_timeout_is_recorded_as_minus_one() {
         &superseded_at(0),
         &mut healthy_watch(),
         |_| async { Err(TIMED_OUT) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
-    assert_eq!(results["a1111111"], json!(-1));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(-1));
 }
 
 /// 让位①（发新活之前）：第 1 次询问即让位 → 一个节点都不测、零**逐节点**事件、`interrupted`。
@@ -1148,7 +1148,7 @@ async fn interrupts_before_dispatching_without_measuring() {
         &superseded_at(1),
         &mut healthy_watch(),
         |_| async { Ok(120_u32) },
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1192,7 +1192,7 @@ async fn discards_in_flight_values_when_main_core_arrives() {
         &superseded_at(2), // 批首过、测量后命中
         &mut healthy_watch(),
         |_| async { Ok(999_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1213,7 +1213,7 @@ async fn keeps_measured_prefix_on_later_interruption() {
         &superseded_at(5),
         &mut healthy_watch(),
         |_| async { Ok(120_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1262,7 +1262,7 @@ async fn a_slow_node_does_not_block_the_rest_of_the_queue() {
                 Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT {
                 let id = payload["serverId"].as_str().unwrap().to_string();
                 elog.lock().unwrap().push(format!("emit:{id}"));
@@ -1326,7 +1326,7 @@ async fn never_exceeds_the_concurrency_limit() {
                 Ok(120_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
 
@@ -1350,12 +1350,12 @@ async fn zero_concurrency_degrades_to_serial_not_to_nothing() {
         &superseded_at(0),
         &mut healthy_watch(),
         |port| async move { Ok(u32::from(port)) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3, "0 并发是配置错误，不是「不测」的意思");
-    assert_eq!(results["a1111111"], json!(1), "串行也不得让结果与端口错位");
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(1), "串行也不得让结果与端口错位");
 }
 
 /// 🔴 **让位②（在飞轮询）：supersede 命中即 `abort_all` + 立刻返回，不等在飞测量收尾。**
@@ -1385,7 +1385,7 @@ async fn aborts_in_flight_measurements_instead_of_waiting_for_them() {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok(120_u32)
             },
-            &mut |_, _| {},
+            &mut |_: &str, _: Value| {},
         ),
     )
     .await
@@ -1416,12 +1416,12 @@ async fn in_flight_polling_does_not_disturb_slow_but_uninterrupted_measurements(
             tokio::time::sleep(Duration::from_millis(TEMP_CORE_SUPERSEDE_POLL_MS + 120)).await;
             Ok(u32::from(port))
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(results["a1111111"], json!(1), "轮询不得让结果与端口错位");
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(1), "轮询不得让结果与端口错位");
 }
 
 /// 🔴 **逐节点回填**：先测完的节点必须在**其它节点还在飞**的时候就上屏。
@@ -1453,7 +1453,7 @@ async fn reports_each_node_as_soon_as_it_finishes() {
                 Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT {
                 let id = payload["serverId"].as_str().unwrap().to_string();
                 elog.lock().unwrap().push(format!("emit:{id}"));
@@ -1499,7 +1499,7 @@ async fn progress_counter_is_strictly_monotonic() {
                 Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_PROGRESS {
                 tested_seq.push(payload["tested"].as_i64().unwrap());
                 ok_seq.push(payload["ok"].as_i64().unwrap());
@@ -1530,12 +1530,12 @@ async fn each_node_measures_through_its_own_port() {
         &superseded_at(0),
         &mut healthy_watch(),
         |port| async move { Ok(u32::from(port)) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
-    assert_eq!(results["a1111111"], json!(10));
-    assert_eq!(results["b1111111"], json!(20));
-    assert_eq!(results["c1111111"], json!(30));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a1111111"], json!(10));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b1111111"], json!(20));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c1111111"], json!(30));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1744,7 +1744,7 @@ async fn typed_capacity_spawn_stops_the_actual_speedtest_round_without_a_child()
         &three_nodes(),
         &|| false,
         |_| async { panic!("measured after admission rejection") },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
@@ -1762,7 +1762,7 @@ async fn capacity_check_stops_the_actual_speedtest_round_before_spawn_or_measure
         &three_nodes(),
         &|| false,
         |_| async { panic!("measured after admission rejection") },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
@@ -1885,7 +1885,7 @@ async fn temp_final_system_interface_guard_rejects_planner_bypass_before_spawn()
             &[node],
             &|| false,
             |_| async { Ok(50_u32) },
-            &mut |_, _| {},
+            &mut |_: &str, _: Value| {},
         )
         .await;
         let TempCoreOutcome::SystemInterfaceRequired(error) = outcome else {
@@ -1916,7 +1916,7 @@ async fn session_kills_core_and_removes_config_on_success() {
         &nodes,
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     match out {
@@ -1961,7 +1961,7 @@ async fn session_reports_failure_without_faking_results_when_not_ready() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -1980,7 +1980,7 @@ async fn session_never_spawns_when_already_superseded() {
         &three_nodes(),
         &|| true,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Superseded), "得到 {out:?}");
@@ -1998,7 +1998,7 @@ async fn session_fails_atomically_when_ports_are_short() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -2022,7 +2022,7 @@ async fn session_rejects_invalid_config_before_spawning() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     match out {
@@ -2046,7 +2046,7 @@ async fn session_cleans_up_config_when_spawn_fails() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -2063,7 +2063,7 @@ async fn session_is_noop_for_empty_node_set() {
         &[],
         &|| false,
         |_| async { Ok(1_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }));
@@ -2149,7 +2149,7 @@ async fn session_registers_inflight_pid_so_app_exit_cleanup_can_reach_it() {
                 Ok(50_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -2265,7 +2265,7 @@ async fn temp_core_drains_stderr_so_a_flooding_core_never_wedges() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -2336,7 +2336,7 @@ async fn session_reports_core_exit_as_interrupted_without_faking_results() {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(50_u32)
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2396,7 +2396,7 @@ async fn a_core_that_stops_answering_ends_the_round_as_unresponsive() {
         &superseded_at(0),
         &mut watch,
         |_| async { Err(TIMED_OUT) }, // 每个节点都判 -1
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2442,7 +2442,7 @@ async fn a_responding_core_finishes_the_round_despite_a_full_streak_of_failures(
         &superseded_at(0),
         &mut watch,
         |_| async { Err(TIMED_OUT) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(
@@ -2486,7 +2486,7 @@ async fn failures_below_the_streak_never_probe_the_core() {
         &superseded_at(0),
         &mut watch,
         |_| async { Err(TIMED_OUT) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
@@ -2511,7 +2511,7 @@ async fn superseded_round_reports_the_superseded_reason() {
         &superseded_at(1), // 发活前即让位
         &mut healthy_watch(),
         |_| async { Ok(120_u32) },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2535,7 +2535,7 @@ async fn completed_round_carries_no_reason_field() {
         &superseded_at(0),
         &mut healthy_watch(),
         |_| async { Ok(120_u32) },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2564,7 +2564,7 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -2722,7 +2722,7 @@ fn exit_flag_future(
 /// 跑一轮「核退出与测量失败**同一 tick** 就绪」的时序：测量任务自己置退出标志再返回 `None`
 /// —— 对应真机上「内核先关掉核的全部 socket（`exit_files`），在飞的 `open_tunnel` 立刻返 `None`，
 /// 而 `child.wait()` 也在同一轮就绪」。
-async fn run_core_exit_in_the_same_tick() -> (serde_json::Map<String, Value>, &'static str) {
+async fn run_core_exit_in_the_same_tick() -> (RoundResults, &'static str) {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut watch = TempCoreWatch {
         pid: 7,
@@ -2744,7 +2744,7 @@ async fn run_core_exit_in_the_same_tick() -> (serde_json::Map<String, Value>, &'
                 Err(TIMED_OUT) // …于是这次拨号立刻失败
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await
 }
@@ -2815,7 +2815,7 @@ async fn a_core_exit_seen_between_select_and_record_makes_the_node_absent() {
         },
         &mut watch,
         |_| async { Err(TIMED_OUT) },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2924,7 +2924,7 @@ async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover()
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
@@ -2937,7 +2937,7 @@ async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover()
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(
@@ -3246,7 +3246,7 @@ async fn oversized_batch_is_refused_before_spawning_and_says_why() {
         &nodes,
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &mut progress,
     )
     .await;
@@ -3410,7 +3410,7 @@ async fn no_progress_event_escapes_before_the_readiness_gate_resolves() {
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |ev, _| events.push(ev.to_string()),
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
     )
     .await;
     assert!(
@@ -3939,7 +3939,7 @@ async fn run_round(h: &Harness, nodes: &[TempNode]) -> (TempCoreOutcome, Vec<(St
         nodes,
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
     )
     .await;
     (out, events)
@@ -4334,7 +4334,7 @@ async fn superseded_between_batches_stops_the_round_before_starting_another_core
         &nodes,
         &move || trip_read.load(Ordering::SeqCst),
         |_| async { Ok(50_u32) },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT
                 && results_seen.fetch_add(1, Ordering::SeqCst) + 1 >= first_batch
             {
@@ -4434,7 +4434,7 @@ async fn superseding_a_round_that_already_lost_a_batch_still_reports_superseded(
             failed_once.load(Ordering::SeqCst)
         },
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
 
@@ -4494,7 +4494,7 @@ async fn each_batch_registers_and_releases_its_own_inflight_pid() {
                 Ok(50_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -4560,7 +4560,7 @@ async fn every_temp_core_result_is_marked_disconnected() {
                 Ok(50_u32)
             }
         },
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
     )
     .await;
     assert!(matches!(
@@ -4618,7 +4618,7 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
                 }
                 std::future::pending::<Measured>().await
             },
-            &mut |ev, payload| collected.push((ev.to_string(), payload)),
+            &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
         )
         .await
     };
@@ -4632,7 +4632,7 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
     };
     assert_eq!(outcome, "interrupted");
     assert_eq!(results.len(), 1, "未出值的节点缺席：{results:?}");
-    assert_eq!(results[&nodes[0].id], json!(50));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)[&nodes[0].id], json!(50));
     let done: Vec<&Value> = collected
         .iter()
         .filter(|(ev, _)| ev == EVENT_SPEED_TEST_DONE)
@@ -4719,7 +4719,7 @@ async fn temp_core_results_carry_a_static_node_pin_binding() {
                 Ok(120_u32)
             }
         },
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
     )
     .await;
     assert_eq!(outcome, "completed");
@@ -4803,7 +4803,7 @@ async fn diagnostic_archive_scrubs_actual_planner_outputs() {
         &plan.testable,
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
@@ -4834,7 +4834,7 @@ async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spaw
         &three_nodes(),
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
@@ -4858,7 +4858,7 @@ async fn checker_rejection_and_drop_keep_only_a_sanitized_diagnostic_projection(
         &nodes,
         &|| false,
         |_| async { Ok(50_u32) },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
@@ -4870,4 +4870,36 @@ async fn checker_rejection_and_drop_keep_only_a_sanitized_diagnostic_projection(
     assert_eq!(cfg["outbounds"][0]["type"], "trojan");
     assert_eq!(cfg["_diagnostic"]["sanitized"], true);
     cleanup(&h.dir);
+}
+
+
+#[test]
+fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
+    use crate::commands::speedtest::{CoreInstance, FailKind, FailPhase, MeasureFailure,
+        MeasurePath, RunEvents, SpeedTestOrigin, SpeedTestRequest};
+    use crate::runtime::measurement_ledger::MeasurementLedger;
+    let ledger = Box::leak(Box::new(MeasurementLedger::new()));
+    let request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: vec!["node".to_owned()],
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: "https://example.invalid/".to_owned(),
+    };
+    let mut events = RunEvents::new("1", &request, CoreInstance::Temp, None, BTreeMap::new(), None)
+        .with_ledger(ledger);
+    let local = Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local));
+    let binding = Binding::static_node_pin("tag-node", false, None);
+    let mut results = RoundResults::new();
+    let mut progress = RoundProgress::new(1);
+    let mut collected = Vec::new();
+    record_measured(&mut results, &mut progress,
+        &mut events.sink(|event, payload| collected.push((event.to_owned(), payload))),
+        "node", &local, Some(&binding));
+    assert_eq!(results["node"], local);
+    assert_eq!(collected[0].1["latency"], -1);
+    assert_eq!(collected[0].1["binding"]["verdict"], "static");
+    let digest = polaris_updater::sha256_hex(request.url.as_bytes());
+    let entry = ledger.candidate_entry("node", &digest).unwrap();
+    assert_eq!(entry.measured, Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
 }

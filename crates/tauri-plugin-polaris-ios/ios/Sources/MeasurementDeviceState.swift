@@ -11,9 +11,9 @@ final class MeasurementDeviceState {
         metered = value
     }
 
-    func snapshot(powerSave: Bool) -> [String: Any] {
+    func snapshot(powerSave: Bool, appActive: Bool = false) -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
-        var result: [String: Any] = ["powerSave": powerSave]
+        var result: [String: Any] = ["powerSave": powerSave, "appActive": appActive]
         if let metered { result["metered"] = metered }
         else { result["metered"] = NSNull() }
         return result

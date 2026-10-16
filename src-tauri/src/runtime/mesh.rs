@@ -326,6 +326,7 @@ impl MeshRuntime {
         TailscaleStatusSnapshot {
             connected,
             statuses,
+            main_core_hold: None, // STATUS cache alone cannot attest main-core custody.
         }
     }
 

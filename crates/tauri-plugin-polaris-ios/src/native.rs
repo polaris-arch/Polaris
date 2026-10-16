@@ -505,6 +505,8 @@ async fn call<T: DeserializeOwned + Send + 'static>(
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeviceConditions {
+    /// Required: old/malformed native replies fail closed.
+    pub app_active: bool,
     pub metered: Option<bool>,
     pub power_save: bool,
 }

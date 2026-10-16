@@ -75,7 +75,11 @@ fn started(platform: Platform, plan: &BTreeMap<String, SubPlan>) -> (Planner, u6
     let mut planner = Planner::new(platform, at(0));
     planner.platform_enabled = true;
     assert_eq!(planner.tick(&input(at(0), Some(1), plan)).start, None);
-    let first = planner.tick(&input(at(FIRST_ROUND_DELAY_MS), Some(1), plan));
+    let mut first_input = input(at(FIRST_ROUND_DELAY_MS), Some(1), plan);
+    if platform == Platform::Ios {
+        first_input.conditions = Some(ios_active(true));
+    }
+    let first = planner.tick(&first_input);
     assert!(first.start.is_some(), "首轮应在就绪后约定延迟到期");
     (planner, FIRST_ROUND_DELAY_MS)
 }
@@ -98,7 +102,6 @@ const READY: TickFacts = TickFacts {
     metered: Metered::No,
     policy: MeteredPolicy::Reduced,
     due: true,
-    quiet: false,
 };
 
 #[test]
@@ -222,14 +225,6 @@ fn decide_tick_truth_table() {
             },
             Verdict::Waiting,
         ),
-        (
-            "静默期内",
-            TickFacts {
-                quiet: true,
-                ..READY
-            },
-            Verdict::Waiting,
-        ),
     ];
     for (name, facts, expected) in cases {
         assert_eq!(decide_tick(&facts), expected, "{name}");
@@ -260,28 +255,29 @@ fn the_scheduler_switch_gates_every_round() {
     const { assert!(SCHEDULER_ENABLED, "出包取值") };
 }
 
-/// iOS 原生源已接线、Mac探针尚未验：此前不建周期计划，如实报未启用。
+fn ios_active(active: bool) -> DeviceConditions {
+    DeviceConditions { app_active: Some(active), ..DeviceConditions::UNAVAILABLE }
+}
+
 #[test]
-fn ios_builds_no_schedule_and_says_so() {
+fn ios_is_enabled_but_unknown_initial_activity_is_closed() {
     for platform in Platform::ALL {
-        assert_eq!(
-            platform_enabled(*platform),
-            *platform != Platform::Ios,
-            "{platform:?}"
-        );
+        assert!(platform_enabled(*platform));
     }
     let plan = plan(&[("s1", 30, &["a"])]);
     let mut planner = Planner::new(Platform::Ios, at(0));
+    assert!(!planner.signals().foreground);
     planner.tick(&input(at(0), Some(1), &plan));
-    let out = planner.tick(&input(at(10 * MINUTE), Some(1), &plan));
-    assert_eq!(out.start, None);
-    let status = planner.status(at(10 * MINUTE), true, &plan);
-    assert_eq!(status["state"], "disabled");
-    assert_eq!(status["reason"], "platformNotEnabled");
-    assert_eq!(
-        status["subscriptions"]["s1"]["blockedBy"], "platformNotEnabled",
-        "订阅里开着却不测，要说得出原因"
-    );
+    for conditions in [None, Some(ios_active(false)), Some(DeviceConditions::UNAVAILABLE)] {
+        let out = planner.tick(&TickInput { conditions, ..input(at(10 * MINUTE), Some(1), &plan) });
+        assert!(out.start.is_none());
+        assert_eq!(planner.signals().verdict, Verdict::Paused(Pause::Background));
+    }
+    let out = planner.tick(&TickInput {
+        conditions: Some(ios_active(true)),
+        ..input(at(10 * MINUTE), Some(1), &plan)
+    });
+    assert!(out.start.is_some());
 }
 
 /// 用户关掉全局总开关：任何订阅都不建计划；开了周期测速的订阅如实标「被全局开关关闭」。
@@ -706,7 +702,7 @@ fn android_stays_paused_until_resumed() {
         at(t0 + 1_500),
         &interrupted(InterruptReason::Cancelled, &["a"], &["b"]),
     );
-    for later in [2_000, IOS_QUIET_MS + 5_000, 20 * MINUTE] {
+    for later in [2_000, 35_000, 20 * MINUTE] {
         let out = planner.tick(&input(at(t0 + later), Some(1), &plan));
         assert_eq!(out.start, None, "回前台之前不发起（+{later}ms）");
         assert_eq!(out.sleep_ms, TICK_IDLE_MS);
@@ -728,29 +724,102 @@ fn android_stays_paused_until_resumed() {
     assert!(back.only_missing, "被打断的一轮只补仍缺的");
 }
 
-/// iOS：离开前台只作打断，取消在飞的一轮并静默一段时间；静默期过后不需要回前台信号即回到等待
-/// 并照常发起。（iOS 的计划本轮整体关闭，这里绕开平台开关单测这条分支。）
 #[test]
-fn ios_resumes_after_the_quiet_period_without_a_resume_signal() {
+fn ios_inactive_stays_closed_and_only_fresh_active_recovers_control_center() {
     let plan = plan(&[("s1", 30, &["a", "b"])]);
     let (mut planner, t0) = started(Platform::Ios, &plan);
     let left = t0 + 1_000;
+    let epoch = planner.foreground_epoch();
     assert!(planner.on_suspended(at(left)));
-    planner.on_round_end(
-        at(left + 500),
-        &interrupted(InterruptReason::Cancelled, &["a"], &["b"]),
-    );
-    let quiet = planner.tick(&input(at(left + IOS_QUIET_MS - 1), Some(1), &plan));
-    assert_eq!(quiet.start, None);
-    assert_eq!(
-        planner.status(at(left), true, &plan)["state"],
-        "waiting",
-        "不进入需要回前台信号才能退出的暂停"
-    );
-    assert!(planner
-        .tick(&input(at(left + IOS_QUIET_MS), Some(1), &plan))
-        .start
-        .is_some());
+    assert_eq!(planner.foreground_epoch(), epoch + 1);
+    planner.on_round_end(at(left + 500),
+        &interrupted(InterruptReason::Cancelled, &["a"], &["b"]));
+    for later in [30_000, 60_000, 20 * MINUTE] {
+        assert!(planner.tick(&input(at(left + later), Some(1), &plan)).start.is_none());
+        assert_eq!(planner.signals().verdict, Verdict::Paused(Pause::Background));
+    }
+    // willEnterForeground does not mean active, even if a previous reading was active.
+    planner.on_resumed(at(left + 20 * MINUTE));
+    assert!(!planner.signals().foreground);
+    assert!(planner.tick(&input(at(left + 20 * MINUTE), Some(1), &plan)).start.is_none());
+    // No paired Resumed event is required after dismissing Control Center: UIKit is authoritative.
+    let back = planner.tick(&TickInput {
+        conditions: Some(ios_active(true)),
+        ..input(at(left + 20 * MINUTE), Some(1), &plan)
+    }).start.expect("fresh active reading reopens due work");
+    assert!(back.only_missing);
+}
+
+#[test]
+fn ios_queries_running_rounds_and_missing_proof_cancels_and_invalidates_receipts() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    for conditions in [None, Some(ios_active(false)), Some(DeviceConditions::UNAVAILABLE)] {
+        let ledger = MeasurementLedger::new();
+        let (mut planner, t0) = started(Platform::Ios, &plan);
+        assert!(planner.wants_conditions(at(t0 + 1)));
+        let epoch = planner.foreground_epoch();
+        let out = planner.tick_and_sync_ledger(&TickInput {
+            conditions, ledger: &ledger, ..input(at(t0 + 1), Some(1), &plan)
+        });
+        assert!(out.abort);
+        assert!(out.start.is_none());
+        assert_eq!(ledger.foreground_epoch(), epoch + 1);
+        assert!(!planner.signals().foreground);
+        // A late successful receipt cannot turn this cancelled round into a full round.
+        planner.on_round_end(at(t0 + 2), &completed(&[("a", true)]));
+        assert_eq!(planner.signals().round_serial, 0);
+    }
+}
+
+#[test]
+fn ios_device_reply_spanning_lifecycle_or_core_change_is_discarded() {
+    for current in [(8, Some(1)), (9, Some(1)), (7, Some(2)), (7, None)] {
+        assert!(current_device_readings(
+            Platform::Ios,
+            (7, Some(1)),
+            current,
+            Some(ios_active(true).into()),
+        ).is_none());
+    }
+    assert_eq!(current_device_readings(
+        Platform::Ios,
+        (7, Some(1)),
+        (7, Some(1)),
+        Some(ios_active(true).into()),
+    ).unwrap().conditions.app_active, Some(true));
+    assert!(current_device_readings(
+        Platform::Android,
+        (7, Some(1)),
+        (8, Some(1)),
+        Some(DeviceConditions::UNAVAILABLE.into()),
+    ).is_some());
+}
+
+#[test]
+fn ios_fresh_active_does_not_override_delay_or_user_and_device_policy() {
+    let plan = plan(&[("s1", 30, &["a"])]);
+    for (enabled, power_save, metered, policy, verdict) in [
+        (false, false, Metered::No, MeteredPolicy::Normal, Verdict::Idle(Idle::UserDisabled)),
+        (true, true, Metered::No, MeteredPolicy::Normal, Verdict::Paused(Pause::PowerSave)),
+        (true, false, Metered::Yes, MeteredPolicy::Pause, Verdict::Paused(Pause::Metered)),
+    ] {
+        let mut planner = Planner::new(Platform::Ios, at(0));
+        for mono in [0, FIRST_ROUND_DELAY_MS - 1] {
+            let out = planner.tick(&TickInput {
+                conditions: Some(ios_active(true)),
+                ..input(at(mono), Some(1), &plan)
+            });
+            assert!(out.start.is_none());
+        }
+        let out = planner.tick(&TickInput {
+            user_enabled: enabled,
+            policy,
+            conditions: Some(DeviceConditions { power_save, metered, ..ios_active(true) }),
+            ..input(at(FIRST_ROUND_DELAY_MS), Some(1), &plan)
+        });
+        assert!(out.start.is_none());
+        assert_eq!(planner.signals().verdict, verdict);
+    }
 }
 
 /// 桌面不按前后台判定：离开前台的信号被忽略。
@@ -962,6 +1031,7 @@ fn the_metered_policy_pauses_reduces_or_ignores() {
                 conditions: Some(DeviceConditions {
                     metered,
                     power_save: false,
+                    app_active: None,
                 }),
                 policy,
                 ..input(at(mono), Some(1), &plan)
@@ -1035,6 +1105,7 @@ fn power_save_pauses_and_a_metered_flip_retests() {
         conditions: Some(DeviceConditions {
             metered,
             power_save,
+            app_active: None,
         }),
         ..input(at(mono), Some(1), &plan)
     };
@@ -1075,6 +1146,7 @@ fn metered_flips_share_the_network_retest_gap() {
         conditions: Some(DeviceConditions {
             metered,
             power_save: false,
+            app_active: None,
         }),
         ..input(at(mono), Some(1), &plan)
     };
@@ -1296,6 +1368,7 @@ fn a_new_generation_or_network_forgives_failures_so_the_retest_covers_backed_off
                 conditions: Some(DeviceConditions {
                     metered,
                     power_save: false,
+                    app_active: None,
                 }),
                 ledger,
                 ..input(now, Some(generation), &plan)
@@ -1785,6 +1858,7 @@ fn the_period_factor_follows_the_metered_state_and_policy() {
             conditions: Some(DeviceConditions {
                 metered,
                 power_save: false,
+                app_active: None,
             }),
             policy,
             ..input(at(0), Some(1), &plan)
@@ -2020,6 +2094,7 @@ fn a_metered_change_through_unavailable_is_still_a_flip() {
             conditions: Some(DeviceConditions {
                 metered,
                 power_save: false,
+                app_active: None,
             }),
             ledger: &ledger,
             ..input(at(mono), Some(1), &plan)
@@ -2088,6 +2163,7 @@ fn leaving_reduction_through_unavailable_leaves_no_gap_without_data() {
             conditions: Some(DeviceConditions {
                 metered,
                 power_save: false,
+                app_active: None,
             }),
             ledger: &ledger,
             ..input(at(mono), Some(1), &plan)
@@ -2171,6 +2247,7 @@ fn production_tick_synchronizes_reduced_factor_before_receipts_are_recorded() {
             conditions: Some(DeviceConditions {
                 metered,
                 power_save: false,
+                app_active: None,
             }),
             policy: MeteredPolicy::Reduced,
             ledger: &ledger,
@@ -2209,6 +2286,7 @@ fn s5_epoch_metered_sequence_counts_known_flips_across_unknown_and_core_generati
                 conditions: Some(DeviceConditions {
                     metered,
                     power_save: index % 2 == 0,
+                    app_active: None,
                 }),
                 ..input(at(index as u64 * 100), generation, &plan)
             });
@@ -2240,6 +2318,7 @@ fn s5_epoch_metered_round_trip_is_recorded_inside_retest_throttle_and_published(
             conditions: Some(DeviceConditions {
                 metered,
                 power_save: false,
+                app_active: None,
             }),
             ledger: &ledger,
             ..input(at(time), Some(1), &plan)
@@ -2274,6 +2353,7 @@ fn s5_epoch_resume_and_freeze_preserve_cost_sequence_and_existing_foreground_fre
                 conditions: Some(DeviceConditions {
                     metered: Metered::No,
                     power_save: false,
+                    app_active: None,
                 }),
                 ..input(at(0), Some(1), &plan)
             });
@@ -2305,6 +2385,7 @@ fn s5_native_scheduler_reading(query: u64, source: &str, seq: u64, known: bool) 
         conditions: DeviceConditions {
             metered: Metered::No,
             power_save: false,
+            app_active: None,
         },
         native_network: Some(auto_select::NativeNetworkObservation {
             query,

@@ -354,3 +354,18 @@ async fn sealed_unbound_auth_allows_only_retired_exact_bytes_and_revision() {
         .is_err());
     assert_eq!(std::fs::read(&file).unwrap(), changed);
 }
+
+#[test]
+fn status_cache_never_manufactures_main_core_custody_proof() {
+    let dir = temp_dir("hold-proof");
+    let mesh = MeshRuntime::new(dir.to_path_buf());
+    for connected in [false, true] {
+        assert!(mesh.tailscale_status_snapshot(connected).main_core_hold.is_none());
+        mesh.update_ts_status(vec![]);
+        assert!(mesh.tailscale_status_snapshot(connected).main_core_hold.is_none());
+        mesh.update_ts_status(vec![event("ts1", true)]);
+        let snapshot = mesh.tailscale_status_snapshot(connected);
+        assert!(snapshot.main_core_hold.is_none());
+        assert!(serde_json::to_value(snapshot).unwrap().get("mainCoreHold").is_none());
+    }
+}

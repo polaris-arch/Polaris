@@ -1,3 +1,4 @@
+import type { TailscaleMainCoreHold } from '@/contracts/tailscale-status';
 import type { ProxyStatus, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '@/contracts/types';
 
 export interface MainCoreLogoutOwner {
@@ -32,22 +33,28 @@ export function sameRunningCore(before: ProxyStatus, now: ProxyStatus): boolean 
 export type TsNodeHold = 'held' | 'notHeld' | 'unknown';
 
 /**
- * Whether the running proxy holds this node, for backends that stop such a proxy themselves.
- * `notHeld` needs positive proof: the proxy is neither running nor starting, or this run's
- * status frame has arrived and does not list the node. A failed read (`null`), a stream that
- * is not live, and a first frame that has not arrived are all `unknown`, never `notHeld`.
+ * Only a same-generation applied endpoint set can prove a Ready core does not hold a node.
+ * STATUS may be empty before the first frame, or never subscribed for a no-TS core; neither
+ * an empty nor a nonempty unbound cache proves custody. Unknown always keeps the notice.
  */
 export function tsNodeHoldByRunningCore(
   proxy: ProxyStatus | null,
-  snapshot: { connected: boolean; statuses: readonly { serverId: string }[] } | null,
+  snapshot: { connected: boolean; statuses: readonly { serverId: string }[]; mainCoreHold?: TailscaleMainCoreHold } | null,
   serverId: string,
 ): TsNodeHold {
-  if (proxy && !proxy.running && !proxy.starting) return 'notHeld';
-  // The cache is cleared when the core stops, so a non-empty live list is this run's frame.
-  if (snapshot?.connected && snapshot.statuses.length > 0) {
-    return snapshot.statuses.some((status) => status.serverId === serverId) ? 'held' : 'notHeld';
+  const generation = proxy?.mainGeneration;
+  const proof = snapshot?.mainCoreHold;
+  // These reads are parallel: a stopped proxy read may precede a new Ready core's snapshot.
+  // Connected or Ready proof contradicts the stopped read, even if the proof lists no target.
+  if (proxy && !proxy.running && !proxy.starting) {
+    return snapshot?.connected || proof != null ? 'unknown' : 'notHeld';
   }
-  return 'unknown';
+  if (!proxy?.running || proxy.starting || !snapshot?.connected
+    || typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation <= 0
+    || !proof || proof.mainGeneration !== generation
+    || !Array.isArray(proof.serverIds)
+    || !proof.serverIds.every((id) => typeof id === 'string' && id.length > 0)) return 'unknown';
+  return proof.serverIds.includes(serverId) ? 'held' : 'notHeld';
 }
 
 /** The run to stop is captured before asking; a core without a ready receipt cannot be named. */

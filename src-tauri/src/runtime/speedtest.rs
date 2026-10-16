@@ -82,10 +82,10 @@ use polaris_core_supervisor::{
     CORE_STARTUP_PER_NODE_US,
 };
 
-use crate::commands::speedtest::{result_payload_with_binding, Binding, Measured, SpeedTestCancel};
-use crate::events::channel::{
-    EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
-};
+use crate::commands::speedtest::{Binding, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel};
+use crate::events::channel::{EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS};
+#[cfg(test)]
+use crate::events::channel::EVENT_SPEED_TEST_RESULT;
 use crate::logging::SPEEDTEST_CORE_TARGET;
 use crate::runtime::proxy::core_log::pipe_to_log;
 #[cfg(target_os = "android")]
@@ -2064,8 +2064,8 @@ impl RoundProgress {
     /// 把方法名写成 `heartbeat` 会让读到 `record_measured` 的人以为逐节点进度也是心跳（反过来
     /// 也一样），而这两者对「进度到底动没动」的含义完全相反。心跳复用同一个通道
     /// （不新起事件通道）：对前端这就是「还在测，进度没变」，reducer 与 toast 一行都不用改。
-    fn emit_progress(&self, emit: &mut (dyn FnMut(&str, Value) + Send)) {
-        emit(EVENT_SPEED_TEST_PROGRESS, self.payload());
+    fn emit_progress(&self, emit: &mut dyn MeasurementEvents) {
+        emit.emit(EVENT_SPEED_TEST_PROGRESS, self.payload());
     }
 
     /// 登记一个中断成因。
@@ -2095,16 +2095,16 @@ pub async fn drive_temp_core_measures<Meas, MeasFut>(
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     progress: &mut RoundProgress,
-) -> (serde_json::Map<String, Value>, &'static str)
+) -> (RoundResults, &'static str)
 where
     Meas: Fn(u16) -> MeasFut,
     MeasFut: Future<Output = Measured> + Send + 'static,
 {
     // `results` 由**本薄壳**持有：内核的每一条中断腿（含 `select!` 的核退出臂）都要能把「已落账的那些」
     // 交出来，而返回值持有的话，中断臂那一刻还没有返回值可交。
-    let mut results = serde_json::Map::new();
+    let mut results = RoundResults::new();
     let reason = drive_temp_core_measures_inner(
         &mut results,
         nodes,
@@ -2132,14 +2132,14 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_temp_core_measures_inner<Meas, MeasFut>(
-    results: &mut serde_json::Map<String, Value>,
+    results: &mut RoundResults,
     nodes: &[TempNode],
     ports: &[u16],
     concurrency: usize,
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     progress: &mut RoundProgress,
 ) -> Option<InterruptReason>
 where
@@ -2310,9 +2310,9 @@ where
 /// 失败 ⇒ 记 -1（**真实**不可测，阶段与成因随事件带出）。「让位未测」的节点根本不会走到这里。
 /// 网络代次在本腿恒为未知：它只在主核运行期间计数。
 fn record_measured(
-    results: &mut serde_json::Map<String, Value>,
+    results: &mut RoundResults,
     progress: &mut RoundProgress,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     node_id: &str,
     measured: &Measured,
     binding: Option<&Binding>,
@@ -2320,14 +2320,8 @@ fn record_measured(
     if let Err(failure) = measured {
         log::debug!("临时核测速未取得有效延迟：nodeId={node_id} {failure:?}");
     }
-    results.insert(
-        node_id.to_string(),
-        json!(measured.map_or(-1_i64, i64::from)),
-    );
-    emit(
-        EVENT_SPEED_TEST_RESULT,
-        result_payload_with_binding(node_id, measured, None, binding),
-    );
+    results.insert(node_id.to_string(), *measured);
+    emit.result(NodeResult::new(node_id, measured, None, binding));
     // 计数与口径都由**轮**级的账持有（跨批累加、`total` 恒全局）：批级计数一旦出到事件里，
     // 前端会在每批测完那一帧收口（判据见 [`RoundProgress`]）。
     progress.record(measured);
@@ -2404,7 +2398,7 @@ impl InterruptReason {
 /// 下一步动作完全不同，见 [`InterruptReason`]。`None` = 本轮没被中断（`absent` 若非零，来源是波前
 /// 预筛那几类「起测即知不可测」，不是中断）。
 ///
-/// 非数值 / 越界的值一律计入 `failed`（宁可报多也不静默丢：这一层不该有非数值，出现即是缺陷信号）。
+/// Typed outcomes distinguish real failures from absent nodes; invalid wire values cannot enter.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SpeedTestSummary {
     pub ok: usize,
@@ -2415,14 +2409,14 @@ pub struct SpeedTestSummary {
 
 #[must_use]
 pub fn summarize_speed_test(
-    results: &serde_json::Map<String, Value>,
+    results: &RoundResults,
     intended: &[String],
     absent: usize,
     absent_reason: Option<InterruptReason>,
 ) -> SpeedTestSummary {
     let ok = results
         .values()
-        .filter(|v| v.as_i64().is_some_and(|ms| ms >= 0))
+        .filter(|measured| measured.is_ok())
         .count();
     SpeedTestSummary {
         ok,
@@ -2464,9 +2458,9 @@ impl SpeedTestSummary {
 /// 判据与「差集为什么必须由后端算 / 波前缺席的三类为什么不算 pending」见
 /// [`EVENT_SPEED_TEST_DONE`] 的常量文档。
 pub fn emit_speed_test_done(
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     outcome: &str,
-    results: &serde_json::Map<String, Value>,
+    results: &RoundResults,
     intended: &[String],
     reason: Option<InterruptReason>,
 ) {
@@ -2489,7 +2483,7 @@ pub fn emit_speed_test_done(
     if let Some(reason) = reason {
         payload["reason"] = Value::from(reason.as_str());
     }
-    emit(EVENT_SPEED_TEST_DONE, payload);
+    emit.emit(EVENT_SPEED_TEST_DONE, payload);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2575,7 +2569,7 @@ pub enum TempCoreOutcome {
     SystemInterfaceRequired(String),
     /// 跑完了（可能部分节点 `-1` = 真实不可测）。`outcome` 同主核路径语义。
     Ran {
-        results: serde_json::Map<String, Value>,
+        results: RoundResults,
         outcome: &'static str,
     },
     /// 起核前/就绪前失败（解析不到核 / 端口分配失败 / 写配置失败 / spawn 失败 / 未就绪）。
@@ -2613,7 +2607,7 @@ enum BatchOutcome {
     SystemInterfaceRequired(String),
     /// 走到了测量阶段。载荷是**本批**的结果（可能部分节点真实 `-1`，也可能中途被中断 ——
     /// 成因已记进 [`RoundProgress`]，不在这里重复）。
-    Ran(serde_json::Map<String, Value>),
+    Ran(RoundResults),
     /// 起核前/就绪前失败 ⇒ **本批一个数值都不产出**，节点缺席（绝不写假 `-1`），后续批照跑。
     ///
     /// `oversized` = 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`]。分批之后它在生产上不可达
@@ -2705,7 +2699,7 @@ impl TempCoreSession {
         nodes: &[TempNode],
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
     ) -> TempCoreOutcome
     where
         Meas: Fn(u16) -> MeasFut,
@@ -2713,7 +2707,7 @@ impl TempCoreSession {
     {
         if nodes.is_empty() {
             return TempCoreOutcome::Ran {
-                results: serde_json::Map::new(),
+                results: RoundResults::new(),
                 outcome: "completed",
             };
         }
@@ -2724,7 +2718,7 @@ impl TempCoreSession {
 
         let intended: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let mut progress = RoundProgress::new(nodes.len());
-        let mut results = serde_json::Map::new();
+        let mut results = RoundResults::new();
         // 「有没有任何一批走到过测量阶段」——终态事件发不发的判据（见函数文档）。
         let mut measured_any_batch = false;
         // 起核阶段失败的批：数量 + **第一条**诊断原文与它的成因分档（整轮零测量时，它就是失败
@@ -2841,7 +2835,7 @@ impl TempCoreSession {
         nodes: &[TempNode],
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
         progress: &mut RoundProgress,
     ) -> BatchOutcome
     where
@@ -2849,7 +2843,7 @@ impl TempCoreSession {
         MeasFut: Future<Output = Measured> + Send + 'static,
     {
         if nodes.is_empty() {
-            return BatchOutcome::Ran(serde_json::Map::new());
+            return BatchOutcome::Ran(RoundResults::new());
         }
         // ── 让位（起核前）：主核已在跑/已跃迁 → 根本不起临时核（双会话从源头掐掉）──
         if superseded() {
@@ -2894,7 +2888,7 @@ impl TempCoreSession {
         nodes: &[TempNode],
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
         progress: &mut RoundProgress,
         #[cfg(not(target_os = "android"))] producer: &Arc<PcTempBatchProducer>,
     ) -> BatchOutcome
@@ -3166,7 +3160,7 @@ impl TempCoreSession {
         naive_count: usize,
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
         progress: &mut RoundProgress,
         mut child: Box<dyn LoginCoreChild>,
     ) -> BatchOutcome
@@ -3306,7 +3300,7 @@ impl TempCoreSession {
                 Some(measured) => measured,
                 None => {
                     progress.note_interrupt(InterruptReason::Superseded);
-                    (serde_json::Map::new(), "interrupted")
+                    (RoundResults::new(), "interrupted")
                 }
             }
             #[cfg(target_os = "android")]

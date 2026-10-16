@@ -64,8 +64,6 @@ const AWAY_EPOCH_MS: u64 = 5 * 60_000;
 /// 一轮内相邻两条结果的墙钟间隔超过它即判设备冻结：单节点最坏耗时 12 秒加 3 秒余量。
 /// 取 `u64::MAX` 即关掉这条判据。
 const FREEZE_GAP_MS: u64 = 15_000;
-/// iOS 失去活跃后的静默期：不发起新的一轮，过后不需要回前台信号即可继续。
-const IOS_QUIET_MS: u64 = 30_000;
 /// 桌面网络代次变化后，等它这么久不再变化才补测；两次由切网触发的补测之间的最小间隔。
 const NET_SETTLE_MS: u64 = 10_000;
 const NET_RETEST_MIN_GAP_MS: u64 = 5 * 60_000;
@@ -120,12 +118,15 @@ pub(crate) struct DeviceConditions {
     pub(crate) metered: Metered,
     /// 省电模式。信号不可得时按未开启处理。
     pub(crate) power_save: bool,
+    /// Fresh UIKit applicationState; absent/failed observations never admit iOS work.
+    pub(crate) app_active: Option<bool>,
 }
 
 impl DeviceConditions {
     const UNAVAILABLE: Self = Self {
         metered: Metered::Unavailable,
         power_save: false,
+        app_active: None,
     };
 }
 
@@ -227,8 +228,6 @@ pub(crate) struct TickFacts {
     pub(crate) metered: Metered,
     pub(crate) policy: MeteredPolicy,
     pub(crate) due: bool,
-    /// iOS 失去活跃后的静默期内。
-    pub(crate) quiet: bool,
 }
 
 /// **每拍裁决**（纯函数）。次序即优先级：先判有没有计划，再判该不该暂停，最后才看到没到期。
@@ -261,20 +260,16 @@ pub(crate) const fn decide_tick(facts: &TickFacts) -> Verdict {
     if matches!(facts.metered, Metered::Yes) && matches!(facts.policy, MeteredPolicy::Pause) {
         return Verdict::Paused(Pause::Metered);
     }
-    if !facts.due || facts.quiet {
+    if !facts.due {
         return Verdict::Waiting;
     }
     Verdict::Start
 }
 
-/// 本平台是否启用周期计划。iOS 的屏幕状态/WakeNow/设备状况源已接线，但尚未取得
-/// 原约定 Mac Apple 探针的实际编译/最终链接与唤醒证据；此前 iOS 不建周期计划。
-pub(crate) const fn platform_enabled(platform: Platform) -> bool {
-    match platform {
-        Platform::Mac | Platform::Win | Platform::Linux | Platform::Android => true,
-        Platform::Ios => false,
-        Platform::Other => true,
-    }
+/// iOS periodic work is foreground-only and requires a fresh native active reading.
+/// This enables no background execution or wake service.
+pub(crate) const fn platform_enabled(_platform: Platform) -> bool {
+    true
 }
 
 /// 只有手机按前后台判定；桌面以「进程活着且未休眠」为准。
@@ -535,7 +530,6 @@ pub(crate) struct Planner {
     foreground_return_at: Option<u64>,
     round_trace_serial: u64,
     round_starts: std::collections::VecDeque<(u64, u64, u64)>,
-    quiet_until: u64,
     foreground_epoch: u64,
     /// 最近一拍的墙钟时刻，与那一拍计划睡多久。
     last_tick: (u64, u64),
@@ -641,12 +635,11 @@ impl Planner {
             generation: None,
             ready: now,
             subs: BTreeMap::new(),
-            foreground: true,
+            foreground: platform != Platform::Ios,
             left_at: None,
             foreground_return_at: None,
             round_trace_serial: 0,
             round_starts: std::collections::VecDeque::new(),
-            quiet_until: 0,
             foreground_epoch: 0,
             last_tick: (now.wall, TICK_IDLE_MS),
             network_epoch: None,
@@ -716,6 +709,10 @@ impl Planner {
 
     /// 这一拍之前要不要先拉一次设备状况：有订阅到期（准入前必查），或距上次查询已久。
     pub(crate) fn wants_conditions(&self, now: Now) -> bool {
+        // iOS must refresh active proof even while a round is running or paused.
+        if self.platform == Platform::Ios {
+            return !self.subs.is_empty() || self.round.is_some();
+        }
         if self.subs.is_empty() || self.round.is_some() {
             return false;
         }
@@ -748,15 +745,17 @@ impl Planner {
 /// 前后台信号只在手机上有来源；桌面构型里这一组没有调用方。
 #[cfg_attr(not(mobile), allow(dead_code))]
 impl Planner {
-    /// 离开前台。桌面不按前后台判定，忽略。
-    ///
-    /// Android 的暂停与恢复成对出现：进入暂停，等回前台才退出。iOS 的这个信号来自「即将失去
-    /// 活跃」，下拉控制中心也会触发而不会有对应的回前台信号，所以只作打断：取消在飞的一轮并
-    /// 静默一段时间，不进入需要回前台信号才能退出的状态。
+    /// Inactive is a closed gate until a new native active observation arrives.
     pub(crate) fn on_suspended(&mut self, now: Now) -> bool {
         match self.platform {
             Platform::Android => self.foreground = false,
-            Platform::Ios => self.quiet_until = now.mono + IOS_QUIET_MS,
+            Platform::Ios => {
+                if self.foreground {
+                    // Invalidate even short inactive intervals, including late receipts.
+                    self.foreground_epoch = self.foreground_epoch.saturating_add(1);
+                }
+                self.foreground = false;
+            }
             Platform::Mac | Platform::Win | Platform::Linux | Platform::Other => return false,
         }
         self.left_at.get_or_insert(now.wall);
@@ -765,6 +764,14 @@ impl Planner {
 
     /// 回到前台。
     pub(crate) fn on_resumed(&mut self, now: Now) {
+        // iOS Resumed is willEnterForeground, not didBecomeActive.
+        if self.platform == Platform::Ios {
+            return;
+        }
+        self.became_active(now);
+    }
+
+    fn became_active(&mut self, now: Now) {
         self.foreground = true;
         if let Some(left_at) = self.left_at.take() {
             self.foreground_return_at = Some(now.wall);
@@ -814,6 +821,13 @@ impl Planner {
     pub(crate) fn tick(&mut self, input: &TickInput<'_>) -> TickOutput {
         let now = input.now;
         let mut out = TickOutput::default();
+        if self.platform == Platform::Ios {
+            if input.conditions.and_then(|conditions| conditions.app_active) == Some(true) {
+                self.became_active(now);
+            } else {
+                out.abort |= self.on_suspended(now);
+            }
+        }
 
         // 相邻两拍的墙钟间隔远超拍长 ⇒ 进程被冻结过（休眠 / 被系统挂起 / 定时器被推迟）。
         let (last_wall, last_sleep) = self.last_tick;
@@ -977,7 +991,6 @@ impl Planner {
             metered: self.conditions.metered,
             policy: input.policy,
             due: !due.is_empty(),
-            quiet: now.mono < self.quiet_until,
         });
         match self.verdict {
             Verdict::Start => {
@@ -1095,9 +1108,10 @@ impl Planner {
                     Some(SkipReason::Frozen)
                 } else {
                     match (report.interrupted, round.abort_cause) {
+                        // Cancellation wins even if completion raced the inactive notification.
+                        (_, Some(AbortCause::Background)) => Some(SkipReason::Background),
                         (Some(InterruptReason::Preempted), _) => Some(SkipReason::Preempted),
                         (Some(_), Some(AbortCause::Budget)) => Some(SkipReason::Budget),
-                        (Some(_), Some(AbortCause::Background)) => Some(SkipReason::Background),
                         // 核换代 / 停核打断的一轮：状态在下一拍整体重置，这里不记账。
                         (Some(_), _) => return,
                         (None, _)
@@ -1482,6 +1496,7 @@ async fn android_conditions() -> DeviceReadings {
                     Metered::No
                 },
                 power_save: conditions.power_save,
+                app_active: None,
             },
             native_network: conditions.network,
         },
@@ -1504,6 +1519,7 @@ async fn ios_conditions() -> DeviceReadings {
         Ok(conditions) => DeviceConditions {
             metered: metered_of(conditions.metered),
             power_save: conditions.power_save,
+            app_active: Some(conditions.app_active),
         }
         .into(),
         Err(error) => {
@@ -1526,14 +1542,30 @@ async fn device_conditions(platform: Platform) -> DeviceReadings {
         Platform::Linux => DeviceConditions {
             metered: linux_metered().await,
             power_save: false,
+            app_active: None,
         }
         .into(),
         Platform::Win | Platform::Mac => DeviceConditions {
             metered: native_metered().await,
             power_save: false,
+            app_active: None,
         }
         .into(),
         Platform::Other => DeviceConditions::UNAVAILABLE.into(),
+    }
+}
+
+/// A query is usable only in its original lifecycle interval and core generation.
+fn current_device_readings(
+    platform: Platform,
+    requested: (u64, Option<u64>),
+    current: (u64, Option<u64>),
+    readings: Option<DeviceReadings>,
+) -> Option<DeviceReadings> {
+    if platform == Platform::Ios && requested != current {
+        None
+    } else {
+        readings
     }
 }
 
@@ -1559,6 +1591,8 @@ async fn settle(round: impl Future<Output = ScheduledRound>) -> Option<Scheduled
 }
 
 struct Shared {
+    /// Invalidates a device query that spans either lifecycle notification.
+    lifecycle_revision: u64,
     planner: Planner,
     /// 在飞一轮的取消槽。
     abort: Option<Arc<RoundAbort>>,
@@ -1588,6 +1622,7 @@ impl MeasurementScheduler {
         let epoch = tokio::time::Instant::now();
         Self {
             shared: Mutex::new(Shared {
+                lifecycle_revision: 0,
                 planner: Planner::new(
                     Platform::current(),
                     Now {
@@ -1640,11 +1675,13 @@ impl MeasurementScheduler {
     pub fn on_suspended(&self) {
         let now = self.now();
         let mut shared = self.lock();
+        shared.lifecycle_revision = shared.lifecycle_revision.wrapping_add(1);
         if shared.planner.on_suspended(now) {
             if let Some(abort) = shared.abort.as_ref() {
                 abort.abort();
             }
         }
+        measurement_ledger::global().set_foreground_epoch(shared.planner.foreground_epoch());
         publish(&shared.planner);
         drop(shared);
         self.wake.notify_one();
@@ -1654,6 +1691,7 @@ impl MeasurementScheduler {
     pub fn on_resumed(&self) {
         let now = self.now();
         let mut shared = self.lock();
+        shared.lifecycle_revision = shared.lifecycle_revision.wrapping_add(1);
         shared.planner.on_resumed(now);
         publish(&shared.planner);
         drop(shared);
@@ -1688,13 +1726,30 @@ impl MeasurementScheduler {
                     proxy.network_epoch(),
                 )
             };
-            let conditions = if self.lock().planner.wants_conditions(now) {
+            let queried_generation = generation;
+            let lifecycle_revision = self.lock().lifecycle_revision;
+            let mut conditions = if self.lock().planner.wants_conditions(now) {
                 Some(device_conditions(platform).await)
             } else {
                 None
             };
+            let (generation, network_epoch) = if platform == Platform::Ios {
+                let state = app.state::<AppRuntime>();
+                let proxy = state.proxy();
+                let current_generation = proxy.status().running.then(|| proxy.core_generation());
+                (current_generation, proxy.network_epoch())
+            } else {
+                (generation, network_epoch)
+            };
             let (output, targets) = {
                 let mut shared = self.lock();
+                // A reply from before suspend/resume cannot reopen the admission gate.
+                conditions = current_device_readings(
+                    platform,
+                    (lifecycle_revision, queried_generation),
+                    (shared.lifecycle_revision, generation),
+                    conditions,
+                );
                 let Shared { planner, plan, .. } = &mut *shared;
                 if let Some(readings) = conditions.as_ref() {
                     consume_device_readings(planner, readings);
@@ -1794,8 +1849,14 @@ impl MeasurementScheduler {
                 });
             }
             self.announce(&app, false);
+            // Recovery polling runs only while there is scheduled work to admit.
+            let sleep_ms = if platform == Platform::Ios && !self.lock().planner.subs.is_empty() {
+                output.sleep_ms.min(TICK_ACTIVE_MS)
+            } else {
+                output.sleep_ms
+            };
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(output.sleep_ms)) => {}
+                () = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
                 () = self.wake.notified() => {}
             }
         }

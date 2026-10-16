@@ -268,26 +268,15 @@ impl MeasureFailure {
         Self { phase, kind }
     }
 
-    /// [`to_json`](Self::to_json) 的逆：账本入账时从盖过章的载荷读回阶段与成因。
-    fn from_json(failure: &Value) -> Self {
-        let phase = match failure["phase"].as_str() {
-            Some("select") => FailPhase::Select,
-            Some("connect") => FailPhase::Connect,
-            Some("warmup") => FailPhase::Warmup,
-            _ => FailPhase::Measure,
-        };
-        let kind = match failure["kind"].as_str() {
-            Some("timeout") => FailKind::Timeout,
-            Some("rejected") => FailKind::Rejected,
-            Some("http_status") => FailKind::HttpStatus(
-                failure["httpStatus"]
-                    .as_u64()
-                    .and_then(|code| u16::try_from(code).ok())
-                    .unwrap_or_default(),
-            ),
-            _ => FailKind::Transport,
-        };
-        Self { phase, kind }
+    /// Keep the ledger's historical public failure classification without a JSON round trip.
+    const fn for_ledger(self) -> Self {
+        Self {
+            phase: self.phase,
+            kind: match self.kind {
+                FailKind::Local => FailKind::Transport,
+                kind => kind,
+            },
+        }
     }
 
     pub(crate) fn to_json(self) -> Value {
@@ -301,6 +290,88 @@ impl MeasureFailure {
 
 /// 单节点测量结果：毫秒数，或带阶段与成因的失败。失败不带任何毫秒数。
 pub(crate) type Measured = Result<u32, MeasureFailure>;
+
+/// Producer-owned result. JSON is only a projection at the event/API boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct NodeResult {
+    pub(crate) node_id: String,
+    pub(crate) measured: Measured,
+    pub(crate) network_epoch: Option<u64>,
+    pub(crate) binding: Option<Binding>,
+}
+
+impl NodeResult {
+    pub(crate) fn new(
+        node_id: &str,
+        measured: &Measured,
+        network_epoch: Option<u64>,
+        binding: Option<&Binding>,
+    ) -> Self {
+        Self {
+            node_id: node_id.to_owned(),
+            measured: *measured,
+            network_epoch,
+            binding: binding.cloned(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        result_payload_with_binding(
+            &self.node_id,
+            &self.measured,
+            self.network_epoch,
+            self.binding.as_ref(),
+        )
+    }
+}
+
+/// Internal round outcomes retain failure types; only response serialization uses -1.
+pub(crate) type RoundResults = BTreeMap<String, Measured>;
+
+pub(crate) fn round_results_json(results: &RoundResults) -> Value {
+    results
+        .iter()
+        .map(|(id, measured)| (id.clone(), json!(measured.map_or(-1_i64, i64::from))))
+        .collect::<serde_json::Map<String, Value>>()
+        .into()
+}
+
+/// Result events cannot be reconstructed from a serialized payload.
+// Synchronous stack-only dispatch avoids an allocation for every node result.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum MeasurementEvent {
+    Result(NodeResult),
+    Other(Value),
+}
+
+/// JSON collectors remain usable at the final boundary (including existing test collectors).
+/// Production runs insert their typed stamping sink before this boundary.
+pub(crate) trait MeasurementEvents: Send {
+    fn emit(&mut self, event: &str, payload: Value);
+    fn result(&mut self, result: NodeResult);
+}
+
+impl<F: FnMut(&str, Value) + Send + ?Sized> MeasurementEvents for F {
+    fn emit(&mut self, event: &str, payload: Value) {
+        self(event, payload);
+    }
+
+    fn result(&mut self, result: NodeResult) {
+        self(EVENT_SPEED_TEST_RESULT, result.to_json());
+    }
+}
+
+struct TypedEvents<F>(F);
+
+impl<F: FnMut(&str, MeasurementEvent) + Send> MeasurementEvents for TypedEvents<F> {
+    fn emit(&mut self, event: &str, payload: Value) {
+        (self.0)(event, MeasurementEvent::Other(payload));
+    }
+
+    fn result(&mut self, result: NodeResult) {
+        (self.0)(EVENT_SPEED_TEST_RESULT, MeasurementEvent::Result(result));
+    }
+}
 
 /// 逐节点结果事件的载荷（三条腿共用同一个形状）。
 ///
@@ -493,18 +564,7 @@ impl BindingVerdict {
         }
     }
 
-    /// [`as_str`](Self::as_str) 的逆：盖章时从载荷读回。
-    fn parse(verdict: &str) -> Option<Self> {
-        [
-            Self::Confirmed,
-            Self::Mismatch,
-            Self::Unverified,
-            Self::Static,
-            Self::Observed,
-        ]
-        .into_iter()
-        .find(|candidate| candidate.as_str() == verdict)
-    }
+
 }
 
 /// 读回判定（纯函数）。`requested` 是请求的节点 tag，没有指定节点的测量传 `None`；
@@ -865,7 +925,7 @@ pub(crate) struct ResultIdentity {
     pub(crate) network_epoch: Option<u64>,
     /// 后端出结果那一刻的 Unix 毫秒。
     pub(crate) measured_at: u64,
-    /// 读回的结论（取自结果的 `binding` 块）；没有读回为 `None`。不进身份块的 JSON。
+    /// Producer's typed readback verdict; absent when readback is off. Not part of identity JSON.
     pub(crate) binding: Option<BindingVerdict>,
 }
 
@@ -930,6 +990,8 @@ pub(crate) struct RunEvents {
     failed_samples: Vec<String>,
     /// 逐节点结果盖章后入的那本账。
     ledger: &'static MeasurementLedger,
+    /// Scheduled admission epoch, captured before measurement; never serialized.
+    foreground_epoch: Option<u64>,
     /// 本轮的读回上下文（汇总行取它的计数与流状态）。
     readback: Option<Readback>,
     /// 绑定由配置结构保证的结果条数（临时核腿）。
@@ -975,6 +1037,7 @@ impl RunEvents {
             failures: BTreeMap::new(),
             failed_samples: Vec::new(),
             ledger: measurement_ledger::global(),
+            foreground_epoch: None,
             readback: None,
             static_bound: 0,
             system_path: 0,
@@ -1016,6 +1079,11 @@ impl RunEvents {
         self
     }
 
+    fn with_foreground_epoch(mut self, epoch: u64) -> Self {
+        self.foreground_epoch = Some(epoch);
+        self
+    }
+
     /// 登记起测前即知不该测的节点数（按原因），只进汇总日志。
     fn with_skipped(mut self, skipped: Vec<(&'static str, usize)>) -> Self {
         self.skipped = skipped;
@@ -1023,13 +1091,18 @@ impl RunEvents {
     }
 
     /// 给一条事件盖章。`None` = 这条不该发（终态之后，或非手动来源的进度 / 终态）。
-    pub(crate) fn stamp(&mut self, event: &str, mut payload: Value) -> Option<Value> {
-        if self.summary.is_some() {
+    pub(crate) fn stamp(&mut self, event: &str, payload: MeasurementEvent) -> Option<Value> {
+        if self.summary.is_some()
+            || (event == EVENT_SPEED_TEST_RESULT) != matches!(&payload, MeasurementEvent::Result(_))
+        {
             return None;
         }
         // 收尾对任何来源都做：汇总照出，此后不再放行事件。向外发不发才看来源。
         if event == EVENT_SPEED_TEST_DONE {
-            let line = self.summary_line(&payload);
+            let MeasurementEvent::Other(ref done) = payload else {
+                return None;
+            };
+            let line = self.summary_line(done);
             log::info!("{line}");
             self.summary = Some(line);
         }
@@ -1038,63 +1111,67 @@ impl RunEvents {
             return None;
         }
         self.identity.seq += 1;
-        if event == EVENT_SPEED_TEST_RESULT {
+        let payload = if let MeasurementEvent::Result(result) = payload {
             let mut identity = self.identity.clone();
-            identity.node_fingerprint = payload["serverId"]
-                .as_str()
-                .and_then(|id| self.fingerprints.get(id))
-                .cloned();
-            identity.network_epoch = payload["identity"]["networkEpoch"].as_u64();
-            identity.binding = payload["binding"]["verdict"]
-                .as_str()
-                .and_then(BindingVerdict::parse);
-            if identity.binding == Some(BindingVerdict::Static) {
-                self.static_bound += 1;
-            }
+            identity.node_fingerprint = self.fingerprints.get(&result.node_id).cloned();
+            identity.network_epoch = result.network_epoch;
+            identity.binding = result.binding.as_ref().and_then(|binding| binding.verdict);
             identity.measured_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-            let system_path = payload["serverId"] == SYSTEM_PATH_ID;
+            // Record before projection, even when the external outlet is a no-op.
+            let measured = result.measured.map_err(MeasureFailure::for_ledger);
+            let connection_digest = self.connection_fingerprints.get(&result.node_id).cloned();
+            let recorded = match self.foreground_epoch {
+                Some(epoch) => self.ledger.record_connection_in_epoch_at(
+                    &result.node_id,
+                    measured,
+                    identity.clone(),
+                    connection_digest,
+                    measurement_ledger::mono_now_ms(),
+                    Some(epoch),
+                ),
+                None => self.ledger.record_connection_at(
+                    &result.node_id,
+                    measured,
+                    identity.clone(),
+                    connection_digest,
+                    measurement_ledger::mono_now_ms(),
+                ),
+            };
+            // A lifecycle transition can race the outer gate. The ledger checks
+            // again under its epoch lock; rejected old-epoch results stay private.
+            if !recorded && self.foreground_epoch.is_some() {
+                return None;
+            }
+            if identity.binding == Some(BindingVerdict::Static) {
+                self.static_bound += 1;
+            }
+            let system_path = result.node_id == SYSTEM_PATH_ID;
             if system_path {
                 self.system_path += 1;
-            } else if payload["failure"].is_object() {
-                let label = format!(
-                    "{}/{}",
-                    payload["failure"]["phase"].as_str().unwrap_or_default(),
-                    payload["failure"]["kind"].as_str().unwrap_or_default()
-                );
+            } else if let Err(failure) = result.measured {
+                let label = format!("{}/{}", failure.phase.as_str(), failure.kind.as_str());
                 *self.failures.entry(label).or_insert(0) += 1;
                 if self.failed_samples.len() < SUMMARY_FAILED_SAMPLES {
-                    self.failed_samples
-                        .extend(payload["serverId"].as_str().map(str::to_string));
+                    self.failed_samples.push(result.node_id.clone());
                 }
             } else {
                 self.ok += 1;
             }
-            // 入账旁路：盖章之后、出口之前。出口是空闭包的来源（故障切换）也因此不会漏。
-            if let Some(node_id) = payload["serverId"].as_str() {
-                let measured = match payload["latency"].as_u64() {
-                    Some(ms) if !payload["failure"].is_object() => {
-                        Ok(u32::try_from(ms).unwrap_or(u32::MAX))
-                    }
-                    _ => Err(MeasureFailure::from_json(&payload["failure"])),
-                };
-                self.ledger.record_connection_at(
-                    node_id,
-                    measured,
-                    identity.clone(),
-                    self.connection_fingerprints.get(node_id).cloned(),
-                    measurement_ledger::mono_now_ms(),
-                );
-            }
+            let mut payload = result.to_json();
             payload["identity"] = identity.to_json();
             // 归属「系统路径」的结果到此为止：已入账，不向外发（见 [`SYSTEM_PATH_ID`]）。
             if system_path {
                 return None;
             }
-        } else {
+            payload
+        } else if let MeasurementEvent::Other(mut payload) = payload {
             payload["seq"] = json!(self.identity.seq);
-        }
+            payload
+        } else {
+            return None;
+        };
         Some(if manual {
             speed_test_measurement_payload(payload, &self.run_id, self.context.as_ref())
         } else {
@@ -1106,12 +1183,12 @@ impl RunEvents {
     pub(crate) fn sink<'a>(
         &'a mut self,
         mut out: impl FnMut(&str, Value) + Send + 'a,
-    ) -> impl FnMut(&str, Value) + Send + 'a {
-        move |event, payload| {
+    ) -> impl MeasurementEvents + 'a {
+        TypedEvents(move |event: &str, payload| {
             if let Some(payload) = self.stamp(event, payload) {
                 out(event, payload);
             }
-        }
+        })
     }
 
     /// 每轮**一行**汇总，三条腿与后台探测共用这一个出口。
@@ -2227,7 +2304,7 @@ async fn run_temp_core_speed_test(
     match outcome {
         TempCoreOutcome::Ran { results, outcome } => ApiResponse::ok(json!({
             "runId": run_id,
-            "results": results,
+            "results": round_results_json(&results),
             "outcome": outcome,
             "notInPool": not_in_pool,
             "tsNotReady": plan.tailscale,
@@ -2659,7 +2736,7 @@ pub async fn server_speed_test(
     Ok(ApiResponse::ok(json!({
         "runId": run_id,
         "measurementContext": context,
-        "results": results,
+        "results": round_results_json(&results),
         // completed：本次入参已全部裁定（测的测了、缺席的进 notInPool）；interrupted：被核跃迁/崩溃打断，
         // 该节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
         "outcome": outcome,
@@ -2697,9 +2774,9 @@ async fn drive_fallback_measure<Meas, MeasFut>(
     cancel: &SpeedTestCancel,
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     probe: &SystemProbe<'_>,
-) -> (serde_json::Map<String, Value>, &'static str)
+) -> (RoundResults, &'static str)
 where
     Meas: FnOnce() -> MeasFut,
     MeasFut: Future<Output = Probed>,
@@ -2749,9 +2826,9 @@ async fn drive_fallback_measure_inner<Meas, MeasFut>(
     cancel: &SpeedTestCancel,
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     probe: &SystemProbe<'_>,
-) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
+) -> (RoundResults, Option<InterruptReason>)
 where
     Meas: FnOnce() -> MeasFut,
     MeasFut: Future<Output = Probed>,
@@ -2761,19 +2838,19 @@ where
     // 与取消竞速：取消命中即丢掉在飞的测量（本函数不 spawn，丢 future 即关 socket），不等它测完。
     let (measured, record) = tokio::select! {
         biased;
-        reason = cancel.cancelled() => return (serde_json::Map::new(), Some(reason)),
+        reason = cancel.cancelled() => return (RoundResults::new(), Some(reason)),
         measured = measure_system(probe, measure) => measured,
     };
 
     // ── 让位（测量后）：在飞期间核跃迁/崩溃 ⇒ 在飞值量的是新核/已死核的出站 → 丢弃并略过该节点 ──
     if let Some(reason) = interrupted(cancel, superseded) {
-        return (serde_json::Map::new(), Some(reason));
+        return (RoundResults::new(), Some(reason));
     }
     // 测量跨了一次网络变化 ⇒ 这个值属于哪张网说不清 → 该节点缺席（不是失败），整轮照常收尾。
     let epoch = network_epoch();
     if network_epoch_changed(epoch0, epoch) {
         log::info!("测速期间网络发生变化，节点 {active} 本轮记为未测");
-        return (serde_json::Map::new(), None);
+        return (RoundResults::new(), None);
     }
 
     let binding = probe.bind(record);
@@ -2784,15 +2861,12 @@ where
             "系统路径测量未经由选中节点 {active}（实际承载 {}），结果不记入该节点",
             binding.carried_by().unwrap_or("未读到")
         );
-        emit(
-            EVENT_SPEED_TEST_RESULT,
-            result_payload_with_binding(SYSTEM_PATH_ID, &measured, epoch, Some(&binding)),
-        );
-        return (serde_json::Map::new(), None);
+        emit.result(NodeResult::new(SYSTEM_PATH_ID, &measured, epoch, Some(&binding)));
+        return (RoundResults::new(), None);
     }
 
     // 逐节点结果 + 进度（前端 onSpeedTestResult / onSpeedTestProgress 流式回填）。
-    let mut results = serde_json::Map::new();
+    let mut results = RoundResults::new();
     let (mut tested, mut ok) = (0, 0);
     record_measured(
         &mut results,
@@ -3024,7 +3098,7 @@ async fn run_pool_speed_test(
     ApiResponse::ok(json!({
         "runId": run_id,
         "measurementContext": context,
-        "results": results,
+        "results": round_results_json(&results),
         // completed：本次入参已全部裁定（在池的测了、notInPool 如实缺席）；interrupted：被核跃迁/崩溃打断，
         // 未测节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
         "outcome": outcome,
@@ -3138,7 +3212,7 @@ async fn drive_runtime_probe<Sel, SelFut, Meas, MeasFut>(
     cancel: &SpeedTestCancel,
     select_slot: Sel,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     readback: &Readback,
 ) -> RuntimeProbeBatch
@@ -3175,16 +3249,15 @@ where
 /// 异常）与引入读回之前一样按没通计 —— 故障切换的后续判定因此在「只观测」档下与之前逐条相同。
 pub(crate) fn candidate_probes(
     candidates: &[(String, String)],
-    raw: &serde_json::Map<String, Value>,
+    raw: &RoundResults,
     mismatch_skipped: &BTreeSet<String>,
 ) -> BTreeMap<String, CandidateProbe> {
     candidates
         .iter()
         .map(|(id, _)| {
-            let probe = match raw.get(id).and_then(Value::as_i64) {
-                Some(value) => {
-                    u32::try_from(value).map_or(CandidateProbe::Failed, CandidateProbe::Measured)
-                }
+            let probe = match raw.get(id) {
+                Some(Ok(value)) => CandidateProbe::Measured(*value),
+                Some(Err(_)) => CandidateProbe::Failed,
                 None if mismatch_skipped.contains(id) => CandidateProbe::MismatchSkipped,
                 None => CandidateProbe::Failed,
             };
@@ -3349,6 +3422,7 @@ where
         return ScheduledRound::Busy(deps.gate.holder());
     };
     deps.abort.arm(guard.cancel());
+    let foreground_epoch = deps.ledger.foreground_epoch();
     let started_at = (deps.wall_clock)();
 
     let partition = partition_pool(
@@ -3405,6 +3479,7 @@ where
         ("tsNotReady", partition.ts_not_ready.len()),
     ])
     .with_ledger(deps.ledger)
+    .with_foreground_epoch(foreground_epoch)
     .with_connection_fingerprints(input.connection_fingerprints)
     .with_display_skipped(
         input.targets,
@@ -3423,12 +3498,18 @@ where
     let mut admitted: BTreeMap<String, bool> = BTreeMap::new();
     let mut frozen = false;
     let (_, reason) = {
-        let mut stamped = events.sink(out);
         let mut last_event = started_at;
         // 冻结判据：只看逐节点结果之间的墙钟间隔（首条与准入时刻比）。进程被系统冻结后，在飞的
         // 测量解冻时会表现为超时；照常记账就是把一批好节点记成失败。
-        let mut gated = |event: &str, payload: Value| {
-            if event == EVENT_SPEED_TEST_RESULT {
+        let mut gated = TypedEvents(|event: &str, payload: MeasurementEvent| {
+            let admission = if let MeasurementEvent::Result(ref result) = payload {
+                // An inactive/reactivated device must not admit results from the old epoch.
+                if deps.ledger.foreground_epoch() != foreground_epoch {
+                    guard.cancel().cancel(InterruptReason::Cancelled);
+                }
+                if guard.cancel().reason().is_some() {
+                    return;
+                }
                 let now = (deps.wall_clock)();
                 if frozen || now.saturating_sub(last_event) > deps.freeze_gap_ms {
                     if !frozen {
@@ -3442,12 +3523,17 @@ where
                     return;
                 }
                 last_event = now;
-                if let Some(id) = payload["serverId"].as_str() {
-                    admitted.insert(id.to_string(), payload["latency"].as_i64() >= Some(0));
+                Some((result.node_id.clone(), result.measured.is_ok()))
+            } else {
+                None
+            };
+            if let Some(payload) = events.stamp(event, payload) {
+                if let Some((id, ok)) = admission {
+                    admitted.insert(id, ok);
                 }
+                out(event, payload);
             }
-            stamped(event, payload);
-        };
+        });
         drive_pool_waves_traced(
             &waves,
             partition.testable.len(),
@@ -3642,10 +3728,10 @@ async fn drive_pool_waves<Sel, SelFut, Meas, MeasFut>(
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     select_slot: Sel,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     readback: &Readback,
-) -> (serde_json::Map<String, Value>, &'static str)
+) -> (RoundResults, &'static str)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
@@ -3690,11 +3776,11 @@ async fn drive_pool_waves_traced<Sel, SelFut, Meas, MeasFut>(
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     select_slot: Sel,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     trace: &mut WaveTrace,
     readback: &Readback,
-) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
+) -> (RoundResults, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
@@ -3743,19 +3829,19 @@ async fn drive_pool_waves_inner<Sel, SelFut, Meas, MeasFut>(
     network_epoch: &(dyn Fn() -> Option<u64> + Sync),
     select_slot: Sel,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     pool_ports: &[u16],
     local_side_halving: bool,
     trace: &mut WaveTrace,
     readback: &Readback,
-) -> (serde_json::Map<String, Value>, Option<InterruptReason>)
+) -> (RoundResults, Option<InterruptReason>)
 where
     Sel: Fn(usize, String) -> SelFut,
     SelFut: Future<Output = bool>,
     Meas: Fn(usize, u16) -> MeasFut,
     MeasFut: Future<Output = Probed> + Send + 'static,
 {
-    let mut results = serde_json::Map::new();
+    let mut results = RoundResults::new();
     let mut tested = 0usize;
     let mut ok = 0usize;
 
@@ -3933,10 +4019,10 @@ where
 /// 不会走到这里 —— 它们缺席，见 [`drive_pool_waves`] 的三检查点。
 #[allow(clippy::too_many_arguments)]
 fn record_measured(
-    results: &mut serde_json::Map<String, Value>,
+    results: &mut RoundResults,
     tested: &mut usize,
     ok: &mut usize,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     node_id: &str,
     measured: &Measured,
     network_epoch: Option<u64>,
@@ -3950,19 +4036,13 @@ fn record_measured(
             failure.kind.as_str()
         );
     }
-    results.insert(
-        node_id.to_string(),
-        json!(measured.map_or(-1_i64, i64::from)),
-    );
-    emit(
-        EVENT_SPEED_TEST_RESULT,
-        result_payload_with_binding(node_id, measured, network_epoch, binding),
-    );
+    results.insert(node_id.to_string(), *measured);
+    emit.result(NodeResult::new(node_id, measured, network_epoch, binding));
     *tested += 1;
     if measured.is_ok() {
         *ok += 1;
     }
-    emit(
+    emit.emit(
         EVENT_SPEED_TEST_PROGRESS,
         json!({ "tested": *tested, "ok": *ok, "total": total }),
     );
@@ -4402,7 +4482,7 @@ fn companion_result_payload(
     )
     .stamp(
         EVENT_SPEED_TEST_RESULT,
-        result_payload_with_binding(owner, &Ok(latency), network_epoch, Some(&binding)),
+        MeasurementEvent::Result(NodeResult::new(owner, &Ok(latency), network_epoch, Some(&binding))),
     )
 }
 

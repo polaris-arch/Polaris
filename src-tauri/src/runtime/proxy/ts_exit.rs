@@ -122,6 +122,55 @@ impl Drop for TsExitRecoverGuard {
 }
 
 impl ProxyRuntime {
+    /// Read-only pre-notice evidence. Never consult saved/pending D or infer absence from STATUS.
+    /// The stored Ready generation (not status()'s read-time projection) binds both snapshots
+    /// to the main core. A newly claimed Stop/Start cannot relabel an old Ready snapshot.
+    pub(crate) fn tailscale_main_core_hold(
+        &self,
+    ) -> Option<crate::runtime::tailscale_status::TailscaleMainCoreHold> {
+        let _publication = self.gate.lock_generation_publication();
+        let generation = self.gate.generation();
+        if generation == 0 || generation > 9_007_199_254_740_991
+            || self.gate.is_busy() || self.start_inflight.load(Ordering::SeqCst) != 0
+        {
+            return None;
+        }
+        let before = self.status.read().ok()?.clone();
+        if !before.running || before.main_generation != generation || before.start_time.is_none() {
+            return None;
+        }
+        let config: UserConfig = serde_json::from_value(self.running_config_snapshot()?).ok()?;
+        // startup_snapshot contains the original config; switch_snapshot was built from the
+        // effective (protocol-filtered) set actually supplied to this core. Intersect by ID.
+        let applied = self.switch_snapshot.read().ok()?.clone()?;
+        let mut servers = BTreeMap::new();
+        for server in &config.servers {
+            if server.id.is_empty() || servers.insert(server.id.as_str(), server).is_some() {
+                return None;
+            }
+        }
+        let mut server_ids = Vec::new();
+        for (id, tag) in &applied.id_to_tag {
+            if tag.is_empty() { return None; }
+            let server = servers.get(id.as_str())?;
+            if server.protocol == Protocol::Tailscale {
+                server_ids.push(id.clone());
+            }
+        }
+        // Crash/error publication can clear status without a new generation. Do not return a
+        // proof if it changed while snapshots were read. Generation claims are locked above.
+        let after = self.status.read().ok()?.clone();
+        if !after.running || after.main_generation != generation || after.start_time != before.start_time
+            || self.start_inflight.load(Ordering::SeqCst) != 0 || self.gate.is_busy()
+        {
+            return None;
+        }
+        Some(crate::runtime::tailscale_status::TailscaleMainCoreHold {
+            main_generation: generation,
+            server_ids,
+        })
+    }
+
     /// **A3 relay 每帧处理**（可测的纯接线段：解码 → 更缓存 → 逐端点 emit）。
     ///
     /// 拆成独立方法而非埋在 spawn 循环里：让「一帧全量端点快照 → 缓存更新 + `event:tailscaleStatus` 逐条发」

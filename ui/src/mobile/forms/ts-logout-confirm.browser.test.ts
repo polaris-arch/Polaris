@@ -42,17 +42,21 @@ const control=window.__tsLogoutTest={
   },
 };
 systemApi.listNetworkInterfaces=async()=>[];
-// The fixture proxy is running. Outside 'held'/'unknown' its live frame lists another node only,
-// which is positive proof that it does not hold ts-1.
-api.server.tailscaleGetStatus=async()=>{if(mode==='unknown')throw Error('status unavailable');return {connected:true,statuses:[{serverId:mode==='held'?'ts-1':'other',backendState:'Running',loggedIn:true,expired:false,peers:[],tailscaleIPs:[],canShareFiles:false,waitingFileCount:0,receivingFileCount:0,unreadFileCount:0}]};};
+// Empty STATUS is deliberate: custody is supplied by the Ready applied endpoint set.
+api.server.tailscaleGetStatus=async()=>{
+  if(mode==='unknown')throw Error('status unavailable');
+  const mainCoreHold=mode==='legacy'?undefined:{mainGeneration:mode==='restarted'?9:mode==='stale'?6:7,
+    serverIds:mode==='held'||mode==='restarted'?['ts-1']:mode==='other'?['other']:[]};
+  return {connected:true,statuses:[],mainCoreHold};
+};
 api.server.tailscaleStateExists=async()=>({'ts-1':state});
-api.server.tailscaleLogout=async()=>{control.logouts++;if(mode!=='success'&&mode!=='held'&&mode!=='unknown')throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
+api.server.tailscaleLogout=async()=>{control.logouts++;if(!['success','held','unknown','other','stale','legacy','starting','restarted'].includes(mode))throw {code:'TAILSCALE_LOGOUT_MAIN_CORE'};state=false;return {runningNeedsRestart:false};};
 api.server.tailscaleLoginPrepare=async()=>{};
 api.server.tailscaleLoginProgress=async()=>null;
 api.server.tailscaleLoginCancel=async()=>{};
 api.server.tailscaleLogin=async(server)=>{control.started.push(server);return {started:true};};
 api.server.update=async(server)=>{useAppStore.setState({servers:[server],config:{servers:[server],subscriptions:[]}});};
-api.proxy.getStatus=async()=>({running:true,starting:false,pid:321,startTime:1});
+api.proxy.getStatus=async()=>mode==='restarted'?{running:false,starting:false,mainGeneration:8}:({running:true,starting:mode==='starting',pid:321,startTime:1,mainGeneration:7});
 useAppStore.setState({servers:[node],config:{servers:[node],subscriptions:[]},selectedServerId:mode==='success'||mode==='custom'||mode==='held'||mode==='unknown'?'other':'ts-1',loadConfig:async()=>{}});
 useMobileFormStore.getState().open({kind:'ts-settings',serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><MobileFormHost/></main>);
@@ -130,6 +134,35 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('TS logout second conf
       expect(await page.evaluate(() => (window as any).__tsLogoutTest.logouts)).toBe(0);
       await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
       await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
+    } finally { await page.close(); }
+  }, 45_000);
+
+  it.each(['stale', 'legacy', 'starting', 'restarted'])('%s custody stays unknown and cancel sends no logout', async mode => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
+    page.setDefaultTimeout(6_000);
+    try {
+      await page.goto(origin + '/__ts-logout?mode=' + mode);
+      await page.getByRole('dialog', { name: 'Tailscale 设置' }).getByRole('button', { name: '退出登录' }).click();
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      const confirm = page.getByRole('dialog', { name: '断开连接并退出登录？' });
+      await confirm.getByText('暂时无法确认', { exact: false }).waitFor();
+      expect(await page.evaluate(() => (window as any).__tsLogoutTest.logouts)).toBe(0);
+      await confirm.getByRole('button', { name: '取消', exact: true }).click();
+      await confirm.waitFor({ state: 'detached' });
+      expect(await page.evaluate(() => ({ stack: (window as any).__tsLogoutTest.stack(),
+        logouts: (window as any).__tsLogoutTest.logouts }))).toEqual({ stack: ['ts-settings'], logouts: 0 });
+    } finally { await page.close(); }
+  }, 45_000);
+
+  it('a Ready core holding only another TS node skips the second notice without a STATUS frame', async () => {
+    const page = await browser.newPage({ viewport: { width: 320, height: 740 } });
+    page.setDefaultTimeout(6_000);
+    try {
+      await page.goto(origin + '/__ts-logout?mode=other');
+      await page.getByRole('dialog', { name: 'Tailscale 设置' }).getByRole('button', { name: '退出登录' }).click();
+      await page.evaluate(() => (window as any).__tsLogoutTest.confirm());
+      await page.waitForFunction(() => (window as any).__tsLogoutTest.logouts === 1);
+      expect(await page.getByRole('dialog', { name: '断开连接并退出登录？' }).count()).toBe(0);
     } finally { await page.close(); }
   }, 45_000);
 

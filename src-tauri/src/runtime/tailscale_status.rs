@@ -149,6 +149,15 @@ impl TailscaleStatusEvent {
     }
 }
 
+/// Ready main-core endpoint custody, independent of whether STATUS has emitted a frame.
+/// This is only a pre-notice hint, never permission to retire state or delete a directory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleMainCoreHold {
+    pub main_generation: u64,
+    pub server_ids: Vec<String>,
+}
+
 /// `TAILSCALE_GET_STATUS` 返回：缓存末帧 + 新鲜度（`contracts/tailscale-status.ts` `TailscaleStatusSnapshot`）。
 ///
 /// `connected` = 主核是否在运行（=状态流是否 live）。false → `statuses` 为上次已知/空（renderer 灰显动态位）。
@@ -157,6 +166,9 @@ impl TailscaleStatusEvent {
 pub struct TailscaleStatusSnapshot {
     pub connected: bool,
     pub statuses: Vec<TailscaleStatusEvent>,
+    /// Absent means unknown. An empty set is positive evidence only for this Ready generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_core_hold: Option<TailscaleMainCoreHold>,
 }
 
 /// 取对端/自身的展示 IP：首个 IPv4（不含 `:`，tailnet 100.x），无则首个，全无则空串。

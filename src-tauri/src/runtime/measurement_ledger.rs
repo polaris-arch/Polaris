@@ -227,6 +227,8 @@ impl MeasurementLedger {
 
     /// 调度器把它的前台代次同步过来。代次变了之后，此前入账的结果在移动端不再可用于选点。
     pub(crate) fn set_foreground_epoch(&self, epoch: u64) {
+        // Serialize epoch changes with admission of captured-epoch results.
+        let _inner = self.lock();
         self.foreground_epoch.store(epoch, Ordering::Release);
     }
 
@@ -275,8 +277,35 @@ impl MeasurementLedger {
         connection_digest: Option<String>,
         recorded_mono: u64,
     ) -> bool {
+        self.record_connection_in_epoch_at(
+            node_id,
+            measured,
+            identity,
+            connection_digest,
+            recorded_mono,
+            None,
+        )
+    }
+
+    /// Scheduled results carry the epoch captured before measurement. Comparison and
+    /// insertion share the same lock as epoch changes, so an old result cannot be
+    /// relabeled with a new foreground epoch or replace a current row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_connection_in_epoch_at(
+        &self,
+        node_id: &str,
+        measured: Measured,
+        identity: ResultIdentity,
+        connection_digest: Option<String>,
+        recorded_mono: u64,
+        captured_foreground_epoch: Option<u64>,
+    ) -> bool {
         let key = result_key(node_id, &identity);
         let mut inner = self.lock();
+        let foreground_epoch = self.foreground_epoch();
+        if captured_foreground_epoch.is_some_and(|captured| captured != foreground_epoch) {
+            return false;
+        }
         let stored = inner.entries.get(&key);
         if !supersedes_stored(&identity, stored.map(|entry| &entry.identity)) {
             inner.rejected_not_newer += 1;
@@ -297,7 +326,7 @@ impl MeasurementLedger {
             } else {
                 stored.and_then(|entry| entry.last_ok_at)
             },
-            foreground_epoch: self.foreground_epoch(),
+            foreground_epoch,
             recorded_mono,
             period_factor: self.period_factor.load(Ordering::Acquire),
             measured,

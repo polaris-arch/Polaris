@@ -42,6 +42,17 @@ describe('account actions say the proxy will be disconnected before it happens',
     expect(confirm).toContain("'ts.logoutStartsConnectionNote'");
   });
 
+  it('the shared pre-notice requires generation-bound applied proof, not STATUS membership', () => {
+    const hold = slice(read('./ts-logout-flow.ts'), 'export function tsNodeHoldByRunningCore(',
+      'export function captureMainCoreOwner(');
+    expect(hold).toContain('snapshot?.mainCoreHold');
+    expect(hold).toContain('proof.mainGeneration !== generation');
+    expect(hold).toContain('Number.isSafeInteger(generation)');
+    expect(hold).toContain('proxy.starting');
+    expect(hold).toContain('proof.serverIds.includes(serverId)');
+    expect(hold).not.toContain('snapshot.statuses.some');
+  });
+
   it('the Android entry marks its platform, or the account switch would stay on the renderer leg', () => {
     const entry = read('../../mobile/MobileMain.tsx');
     before(entry, "platform() === 'android'", "document.documentElement.dataset.mobileOs = 'android'");

@@ -92,7 +92,15 @@ export interface TailscaleStatusEvent {
  * TAILSCALE_GET_STATUS 返回：主进程缓存的各节点末帧 + 新鲜度。
  * connected=false 时 statuses 为「上次已知」陈旧值——renderer 据此灰显动态位(online/active)。
  */
+/** Applied Ready endpoint set; absence is unknown, not an empty set. Not deletion authority. */
+export interface TailscaleMainCoreHold {
+  mainGeneration: number;
+  serverIds: readonly string[];
+}
+
 export interface TailscaleStatusSnapshot {
+  /** Compare with the separately read Ready proxy generation before using this proof. */
+  mainCoreHold?: TailscaleMainCoreHold;
   /** 主核是否在运行（=状态流是否 live）。false → statuses 为陈旧缓存。 */
   connected: boolean;
   /** 各 serverId 的末帧（仅当前 config 在册的 TS 节点；幽灵条目已过滤）。 */

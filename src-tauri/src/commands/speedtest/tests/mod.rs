@@ -1127,7 +1127,7 @@ async fn drive_waves_completes_when_never_superseded() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1135,8 +1135,8 @@ async fn drive_waves_completes_when_never_superseded() {
 
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(results["a"], json!(120));
-    assert_eq!(results["c"], json!(120));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c"], json!(120));
 }
 
 /// 未超代时的**真实**热切失败仍记 -1（不可测是真的）→ 检查点不得把它吞成缺席。
@@ -1150,15 +1150,15 @@ async fn drive_waves_records_genuine_select_failure_as_minus_one() {
         &|| None,
         |slot, _| async move { slot != 0 }, // 槽 0 热切失败
         plain(|_| async { Ok(120_u32) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
     .await;
 
     assert_eq!(outcome, "completed");
-    assert_eq!(results["a"], json!(-1)); // 真实不可测
-    assert_eq!(results["b"], json!(120));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(-1)); // 真实不可测
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b"], json!(120));
 }
 
 /// 让位①（波首）：第 1 次调用即超代 → 一个节点都不测，`interrupted`。
@@ -1172,7 +1172,7 @@ async fn drive_waves_interrupts_at_wave_head() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1194,7 +1194,7 @@ async fn drive_waves_interrupts_after_select_without_faking_minus_one() {
         &|| None,
         |_, _| async { false }, // 超代导致的热切失败
         plain(|_| async { Ok(120_u32) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1219,7 +1219,7 @@ async fn drive_waves_discards_in_flight_measurements_after_transition() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(999_u32) }), // 跨代量出来的值
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1245,7 +1245,7 @@ async fn drive_waves_keeps_measured_prefix_on_later_interruption() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1300,7 +1300,7 @@ async fn done_event_pending_is_intended_minus_measured() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1336,7 +1336,7 @@ async fn done_event_on_a_completed_round_has_no_pending() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1372,7 +1372,7 @@ async fn a_genuine_minus_one_is_not_pending() {
                 Ok(120_u32)
             }
         }),
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1400,7 +1400,7 @@ async fn drive_waves_emits_result_and_progress_per_node() {
         &|| None,
         |_, _| async { true },
         plain(|_| async { Ok(120_u32) }),
-        &mut |ev, _| events.push(ev.to_string()),
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
         &[10000, 10001],
         &Readback::off(),
     )
@@ -1452,7 +1452,7 @@ async fn drive_waves_reports_each_node_as_soon_as_it_finishes() {
                 Ok(120_u32)
             }
         }),
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT {
                 let id = payload["serverId"].as_str().unwrap().to_string();
                 elog.lock().unwrap().push(format!("emit:{id}"));
@@ -1503,7 +1503,7 @@ async fn drive_waves_progress_counter_is_strictly_monotonic() {
                 Ok(120_u32)
             }
         }),
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_PROGRESS {
                 tested_seq.push(payload["tested"].as_i64().unwrap());
                 ok_seq.push(payload["ok"].as_i64().unwrap());
@@ -1559,7 +1559,7 @@ async fn drive_waves_never_repoints_a_slot_while_that_wave_is_still_measuring() 
                 Ok(120_u32)
             }
         }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &[10000, 10001],
         &Readback::off(),
     )
@@ -2001,13 +2001,13 @@ async fn fallback_completes_when_never_superseded() {
         &SpeedTestCancel::default(),
         &|| None,
         plain_once(|| async { Ok(88_u32) }),
-        &mut |ev, _| events.push(ev.to_string()),
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
         &system_probe(&Readback::off()),
     )
     .await;
 
     assert_eq!(outcome, "completed");
-    assert_eq!(results["srv-active"], json!(88));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
     assert_eq!(
         events
             .iter()
@@ -2035,14 +2035,14 @@ async fn fallback_records_genuine_timeout_as_minus_one() {
         &SpeedTestCancel::default(),
         &|| None,
         plain_once(|| async { Err(TIMED_OUT) }), // 真实超时/传输错
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &system_probe(&Readback::off()),
     )
     .await;
 
     assert_eq!(outcome, "completed");
     assert_eq!(
-        results["srv-active"],
+        crate::commands::speedtest::round_results_json(&results)["srv-active"],
         json!(-1),
         "真实不可测记 -1（非缺席）"
     );
@@ -2072,7 +2072,7 @@ async fn fallback_interrupts_and_omits_node_when_superseded_mid_measure() {
         &SpeedTestCancel::default(),
         &|| None,
         plain_once(|| async { Ok(88_u32) }),
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
         &system_probe(&Readback::off()),
     )
     .await;
@@ -2119,7 +2119,7 @@ async fn fallback_superseded_failure_is_absent_not_minus_one() {
         &SpeedTestCancel::default(),
         &|| None,
         plain_once(|| async { Err(TIMED_OUT) }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &system_probe(&Readback::off()),
     )
     .await;
@@ -3073,7 +3073,7 @@ async fn collect_pool_round(events: &mut RunEvents) -> Vec<(String, Value)> {
                 Ok(120_u32)
             }
         }),
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
         &[10000, 10001],
         &Readback::off(),
     )
@@ -3160,7 +3160,7 @@ async fn fallback_result_carries_a_system_path_identity() {
         &SpeedTestCancel::default(),
         &|| None,
         plain_once(|| async { Ok(88_u32) }),
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
         &system_probe(&Readback::off()),
     )
     .await;
@@ -3299,7 +3299,7 @@ async fn sequence_numbers_increase_strictly_and_the_terminal_event_is_last() {
     ] {
         assert!(
             events
-                .stamp(late, json!({"serverId":"a","latency":1}))
+                .stamp(late, MeasurementEvent::Other(json!({"serverId":"a","latency":1})))
                 .is_none(),
             "终态之后 {late} 不得再发"
         );
@@ -3352,7 +3352,7 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
                     std::future::pending::<Measured>().await // b 永不返回
                 }
             }),
-            &mut events.sink(|ev, payload| {
+            &mut events.sink(|ev: &str, payload: Value| {
                 if ev == EVENT_SPEED_TEST_DONE {
                     dropped_at_done.store(dropped.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
@@ -3386,7 +3386,7 @@ async fn cancel_ends_the_round_promptly_with_no_fake_failures() {
         ["a"],
         "未出值的节点缺席"
     );
-    assert_eq!(results["a"], json!(120), "结果里没有 -1");
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120), "结果里没有 -1");
     assert_eq!(
         dropped_at_done.load(Ordering::SeqCst),
         2,
@@ -3423,7 +3423,7 @@ async fn fallback_cancel_omits_the_node() {
         &cancel,
         &|| None,
         plain_once(std::future::pending::<Measured>),
-        &mut |ev, payload| collected.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
         &system_probe(&Readback::off()),
     )
     .await;
@@ -3467,7 +3467,7 @@ async fn a_manual_request_preempts_a_lower_priority_run_and_waits_for_it() {
             &|| None,
             |_, _| async { true },
             plain(|_| std::future::pending::<Measured>()),
-            &mut |ev, payload| collected.push((ev.to_string(), payload)),
+            &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
             &[10000, 10001],
             &Readback::off(),
         )
@@ -3535,7 +3535,7 @@ async fn a_network_change_voids_only_the_measurement_that_straddles_it() {
                 Ok(120_u32)
             }
         }),
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
         &[10000],
         &Readback::off(),
     )
@@ -3732,7 +3732,7 @@ async fn a_non_manual_round_still_finishes_and_summarises() {
     );
     assert!(line.ends_with("ms；失败样本 a, c"), "汇总行：{line}");
 
-    let late = speed_test_result_payload("c", &Ok(1), Some(5));
+    let late = MeasurementEvent::Result(NodeResult::new("c", &Ok(1), Some(5), None));
     assert_eq!(
         events.stamp(EVENT_SPEED_TEST_RESULT, late),
         None,
@@ -4366,7 +4366,7 @@ fn configured_concurrency_falls_back_to_auto_outside_the_platform_range() {
 /// （结果，各波用到的最大槽序，是否减半过）。
 async fn waves_with_one_local_refusal(
     local_side_halving: bool,
-) -> (serde_json::Map<String, Value>, Vec<usize>, bool) {
+) -> (RoundResults, Vec<usize>, bool) {
     let testable: Vec<(String, String)> = (0..12)
         .map(|n| (format!("n{n}"), format!("tag-n{n}")))
         .collect();
@@ -4400,7 +4400,7 @@ async fn waves_with_one_local_refusal(
                 }
             }
         }),
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
         &ports,
         local_side_halving,
         &mut trace,
@@ -4424,7 +4424,7 @@ async fn a_local_side_error_halves_the_wave_width_and_spares_the_node() {
     );
     assert_eq!(results.len(), 12);
     assert!(
-        results.values().all(|latency| latency == &json!(100)),
+        results.values().all(|latency| latency == &Ok(100)),
         "没有任何节点被记成失败：{results:?}"
     );
 }
@@ -4435,7 +4435,7 @@ async fn with_local_side_halving_off_the_error_is_a_transport_failure() {
     let (results, widest, halved) = waves_with_one_local_refusal(false).await;
     assert!(!halved);
     assert_eq!(widest, vec![7, 3]);
-    assert_eq!(results["n0"], json!(-1));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["n0"], json!(-1));
     assert_eq!(results.len(), 12);
     assert_eq!(
         speed_test_result_payload(
@@ -4484,7 +4484,7 @@ async fn halving_stops_at_the_floor_and_a_node_is_requeued_once() {
                     Ok(100_u32)
                 }
             }),
-            &mut |_, _| {},
+            &mut |_: &str, _: Value| {},
             &ports,
             true,
             &mut trace,
@@ -4496,7 +4496,7 @@ async fn halving_stops_at_the_floor_and_a_node_is_requeued_once() {
         assert_eq!(trace.halved, halved, "起始波宽 {width}");
         assert!(widest.iter().skip(1).all(|slot| *slot < MIN_WAVE_WIDTH));
         assert!(
-            results.values().all(|latency| latency == &json!(100)),
+            results.values().all(|latency| latency == &Ok(100)),
             "连不上本机口的节点缺席，不记 -1"
         );
         assert!(results.len() < 10, "反复撞上的节点最终缺席，队列会排空");
@@ -4512,14 +4512,8 @@ fn every_stamped_result_enters_the_ledger_regardless_of_the_outlet() {
     let failure = MeasureFailure::new(FailPhase::Warmup, FailKind::HttpStatus(403));
     {
         let mut sink = events.sink(|_, _| {});
-        sink(
-            EVENT_SPEED_TEST_RESULT,
-            speed_test_result_payload("a", &Ok(120), Some(5)),
-        );
-        sink(
-            EVENT_SPEED_TEST_RESULT,
-            speed_test_result_payload("b", &Err(failure), Some(5)),
-        );
+        sink.result(NodeResult::new("a", &Ok(120), Some(5), None));
+        sink.result(NodeResult::new("b", &Err(failure), Some(5), None));
     }
     let digest = ScheduleBench::url_digest();
     let a = ledger.candidate_entry("a", &digest).unwrap();
@@ -4536,7 +4530,7 @@ fn every_stamped_result_enters_the_ledger_regardless_of_the_outlet() {
         MeasureFailure::new(FailPhase::Connect, FailKind::Transport),
         MeasureFailure::new(FailPhase::Measure, FailKind::Timeout),
     ] {
-        assert_eq!(MeasureFailure::from_json(&failure.to_json()), failure);
+        assert_eq!(failure.for_ledger(), failure);
     }
 }
 
@@ -4689,7 +4683,7 @@ fn leaked_ledger() -> &'static MeasurementLedger {
 async fn readback_round(
     readback: &Readback,
     events: &mut RunEvents,
-) -> (serde_json::Map<String, Value>, Vec<(String, Value)>) {
+) -> (RoundResults, Vec<(String, Value)>) {
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let mut collected: Vec<(String, Value)> = Vec::new();
     let (results, outcome) = drive_pool_waves(
@@ -4708,7 +4702,7 @@ async fn readback_round(
                 }
             }
         }),
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
         &[10000, 10001],
         readback,
     )
@@ -4771,16 +4765,15 @@ fn binding_verdict_truth_table() {
             "请求 {requested:?}，读到 {carried_by:?}"
         );
     }
-    for verdict in [
-        Confirmed,
-        Mismatch,
-        Unverified,
-        Observed,
-        BindingVerdict::Static,
+    for (verdict, expected) in [
+        (Confirmed, "confirmed"),
+        (Mismatch, "mismatch"),
+        (Unverified, "unverified"),
+        (Observed, "observed"),
+        (BindingVerdict::Static, "static"),
     ] {
-        assert_eq!(BindingVerdict::parse(verdict.as_str()), Some(verdict));
+        assert_eq!(verdict.as_str(), expected);
     }
-    assert_eq!(BindingVerdict::parse("bogus"), None);
 }
 
 /// 路径与策略的对应：四种入站各一个策略；`system` 路径的策略只可能是「走用户规则」。
@@ -5103,7 +5096,7 @@ async fn readback_is_keyed_by_inbound_and_source_port() {
                 }
             }
         }),
-        &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
         &[10000, 10001],
         &readback,
     )
@@ -5373,8 +5366,8 @@ async fn an_enforced_mismatch_leaves_the_node_unmeasured_and_the_round_continues
         !results.contains_key("a"),
         "读回不符的节点不出任何数值：{results:?}"
     );
-    assert_eq!(results["b"], json!(120));
-    assert_eq!(results["c"], json!(120), "后续节点照常出值");
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["b"], json!(120));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["c"], json!(120), "后续节点照常出值");
     assert_eq!(
         result_events(&collected)
             .iter()
@@ -5412,7 +5405,7 @@ async fn an_observed_mismatch_is_published_but_never_selectable() {
         .with_readback(&readback);
     let (results, collected) = readback_round(&readback, &mut events).await;
 
-    assert_eq!(results["a"], json!(120), "只观测：数值照发");
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(120), "只观测：数值照发");
     let a = binding_of(&collected, "a");
     assert_eq!(a["verdict"], json!("mismatch"));
     assert_eq!(a["carriedBy"]["tag"], json!("someone-else"));
@@ -5467,7 +5460,7 @@ async fn an_unverified_readback_publishes_the_same_value_and_stays_selectable() 
                     source_port: Some(port),
                 }
             }),
-            &mut events.sink(|ev, payload| collected.push((ev.to_string(), payload))),
+            &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
             &[10000, 10001],
             readback,
         )
@@ -5623,7 +5616,7 @@ async fn the_witness_stream_is_gone_before_the_terminal_event() {
             &|| None,
             |_, _| async { true },
             plain(|_| std::future::pending::<Measured>()),
-            &mut |event, _| {
+            &mut |event: &str, _: Value| {
                 if event == EVENT_SPEED_TEST_DONE {
                     dropped_at_done.store(dropped.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
@@ -5678,7 +5671,7 @@ impl SystemCase {
     async fn run(
         &self,
         ledger: &'static MeasurementLedger,
-    ) -> (serde_json::Map<String, Value>, Vec<(String, Value)>) {
+    ) -> (RoundResults, Vec<(String, Value)>) {
         let (readback, witness) = self.readback();
         let mut events = RunEvents::new(
             "52",
@@ -5707,7 +5700,7 @@ impl SystemCase {
                     source_port: Some(40001),
                 }
             }),
-            &mut events.sink(|ev, payload| {
+            &mut events.sink(|ev: &str, payload: Value| {
                 if ev == EVENT_SPEED_TEST_DONE {
                     closed_at_done.store(witness.closed.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
@@ -5800,7 +5793,7 @@ async fn a_user_routed_result_carried_by_the_selected_node_is_written_to_it() {
     }
     .run(ledger)
     .await;
-    assert_eq!(results["srv-active"], json!(88));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
     let events = result_events(&collected);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["serverId"], json!("srv-active"));
@@ -5827,7 +5820,7 @@ async fn an_unread_user_routed_result_is_still_written_to_the_selected_node() {
     }
     .run(ledger)
     .await;
-    assert_eq!(results["srv-active"], json!(88));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["srv-active"], json!(88));
     let events = result_events(&collected);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["serverId"], json!("srv-active"));
@@ -6634,13 +6627,13 @@ async fn the_readback_wait_stays_outside_the_value_measured_by_the_production_pa
             let readback = readback.clone();
             async move { measure_slot(&readback, slot, port, None, DEFAULT_SPEED_TEST_URL).await }
         },
-        &mut |ev, payload| collected.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
         &pool_ports,
         &readback,
     )
     .await;
     let took = started.elapsed();
-    let latency = results["a"].as_u64().expect("测出了值");
+    let latency = crate::commands::speedtest::round_results_json(&results)["a"].as_u64().expect("测出了值");
     assert!(
         (80..80 + READBACK_WAIT_MS / 2).contains(&latency),
         "量到 {latency}ms：应是那次 GET 的 80ms 上下，不含读回的等待"
@@ -6783,12 +6776,12 @@ async fn a_failed_tunnel_still_withdraws_its_registration() {
                 probed
             }
         },
-        &mut |ev, payload| collected.push((ev.to_string(), payload)),
+        &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
         &pool_ports,
         &readback,
     )
     .await;
-    assert_eq!(results["a"], json!(-1));
+    assert_eq!(crate::commands::speedtest::round_results_json(&results)["a"], json!(-1));
     assert_eq!(
         registered_mid_flight.load(Ordering::SeqCst),
         1,
@@ -6860,4 +6853,122 @@ fn saved_unapplied_tls_sni_and_ws_changes_are_dirty_without_staged_drafts() {
             partition_dirty(&ids(&["a"]), &running, &measurement_table_json(&desired)).is_empty()
         );
     }
+}
+
+
+/// Typed input, not the JSON projection, is the only source of ledger evidence.
+#[test]
+fn typed_results_reject_json_result_injection_and_preserve_local_failure_contract() {
+    let ledger = leaked_ledger();
+    let mut events = pool_events(SpeedTestOrigin::Manual).with_ledger(ledger);
+    assert!(events.stamp(
+        EVENT_SPEED_TEST_RESULT,
+        MeasurementEvent::Other(json!({"serverId":"a","latency":1,"binding":{"verdict":"confirmed"}})),
+    ).is_none());
+    assert!(ledger.candidate_entry("a", &ScheduleBench::url_digest()).is_none());
+    let local = MeasureFailure::new(FailPhase::Connect, FailKind::Local);
+    let binding = Binding::static_node_pin("tag-a", false, None);
+    let payload = events.stamp(
+        EVENT_SPEED_TEST_RESULT,
+        MeasurementEvent::Result(NodeResult::new("a", &Err(local), Some(5), Some(&binding))),
+    ).unwrap();
+    let entry = ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap();
+    assert_eq!(entry.measured, Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
+    assert_eq!(entry.identity.binding, Some(BindingVerdict::Static));
+    assert_eq!(entry.identity.seq, 1, "rejected JSON does not consume a sequence number");
+    assert_eq!(payload["failure"], json!({"phase":"connect","kind":"transport"}));
+    assert_eq!(payload["latency"], -1);
+    assert_eq!(payload["status"], "failed");
+    assert_eq!(payload["binding"], binding.to_json());
+    assert_eq!(payload["identity"]["networkEpoch"], 5);
+    assert_eq!(payload["runId"], "41");
+}
+
+#[test]
+fn typed_round_decisions_preserve_zero_failure_and_absence() {
+    let results = RoundResults::from([
+        ("zero".to_owned(), Ok(0)),
+        ("max".to_owned(), Ok(u32::MAX)),
+        ("failed".to_owned(), Err(TIMED_OUT)),
+    ]);
+    assert_eq!(round_results_json(&results), json!({"zero":0,"max":4294967295_u64,"failed":-1}));
+    let candidates = pairs(&[("zero","z"),("max","m"),("failed","f"),("missing","x"),("mismatch","y")]);
+    let probes = candidate_probes(&candidates, &results, &BTreeSet::from(["mismatch".to_owned()]));
+    assert_eq!(probes["zero"], CandidateProbe::Measured(0));
+    assert_eq!(probes["max"], CandidateProbe::Measured(u32::MAX));
+    assert_eq!(probes["failed"], CandidateProbe::Failed);
+    assert_eq!(probes["missing"], CandidateProbe::Failed);
+    assert_eq!(probes["mismatch"], CandidateProbe::MismatchSkipped);
+}
+
+#[tokio::test]
+async fn a_foreground_epoch_change_drops_inflight_scheduled_results_before_the_ledger() {
+    let bench = ScheduleBench::new(1, 1);
+    let ledger = bench.ledger;
+    let mut collected = Vec::new();
+    let ScheduledRound::Ran(report) = bench.run(
+        &bench.targets(1), 1, |_, _| async { true },
+        move |_| async move {
+            // Models an inactive/reactivated device during the measurement.
+            ledger.set_foreground_epoch(ledger.foreground_epoch() + 1);
+            Ok(17)
+        },
+        &mut collected,
+    ).await else { panic!("round admitted"); };
+    assert!(collected.is_empty());
+    assert!(report.measured.is_empty());
+    assert_eq!(report.unmeasured, vec!["n0".to_owned()]);
+    assert!(ledger.candidate_entry("n0", &ScheduleBench::url_digest()).is_none());
+}
+
+#[test]
+fn production_result_consumers_do_not_reparse_the_wire_projection() {
+    let source = crate::test_support::crate_source("commands/speedtest.rs");
+    assert!(!source.contains("MeasureFailure::from_json"));
+    assert!(!source.contains("BindingVerdict::parse"));
+    let stamp = compact_production_fn("pub(crate) fn stamp(");
+    assert!(stamp.contains("result.measured.map_err(MeasureFailure::for_ledger)"));
+    assert!(stamp.contains("result.binding.as_ref().and_then(|binding|binding.verdict)"));
+    assert!(!stamp.contains(".as_u64()"));
+    let scheduled = compact_production_fn("pub(crate) async fn drive_scheduled_round<");
+    assert!(scheduled.contains("Some((result.node_id.clone(),result.measured.is_ok()))"));
+    assert!(!scheduled.contains(".as_i64()"));
+}
+
+
+#[test]
+fn epoch_recheck_rejects_a_lifecycle_race_without_replacing_current_evidence() {
+    let ledger = leaked_ledger();
+    let mut old = pool_events(SpeedTestOrigin::Schedule)
+        .with_ledger(ledger).with_foreground_epoch(0);
+    // The outer gate may have seen epoch zero. Lifecycle changes before stamp.
+    ledger.set_foreground_epoch(1);
+    let mut current = pool_events(SpeedTestOrigin::Schedule)
+        .with_ledger(ledger).with_foreground_epoch(1);
+    assert!(current.stamp(EVENT_SPEED_TEST_RESULT,
+        MeasurementEvent::Result(NodeResult::new("a", &Ok(17), Some(5), None))).is_some());
+    old.identity.run += 1; // A newer run must not bypass the epoch check.
+    assert!(old.stamp(EVENT_SPEED_TEST_RESULT,
+        MeasurementEvent::Result(NodeResult::new("a", &Err(TIMED_OUT), Some(5), None))).is_none());
+    let entry = ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap();
+    assert_eq!(entry.measured, Ok(17));
+    assert_eq!(entry.foreground_epoch, 1);
+    assert_eq!(old.ok, 0);
+    assert!(old.failures.is_empty());
+}
+
+#[tokio::test]
+async fn fallback_local_failure_uses_typed_ledger_classification() {
+    let ledger = leaked_ledger();
+    let mut events = pool_events(SpeedTestOrigin::Manual).with_ledger(ledger);
+    let local = MeasureFailure::new(FailPhase::Connect, FailKind::Local);
+    let (results, outcome) = drive_fallback_measure(
+        "a", &superseded_at(0), &SpeedTestCancel::default(), &|| Some(5),
+        plain_once(|| async { Err(local) }),
+        &mut events.sink(|_, _| {}), &system_probe(&Readback::off()),
+    ).await;
+    assert_eq!(outcome, "completed");
+    assert_eq!(results["a"], Err(local));
+    assert_eq!(ledger.candidate_entry("a", &ScheduleBench::url_digest()).unwrap().measured,
+        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport)));
 }

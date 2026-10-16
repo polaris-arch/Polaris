@@ -278,7 +278,9 @@ fn actual_producer_identity_round_trips_to_the_renderer_golden_without_raw_crede
     let payload = events
         .stamp(
             crate::events::channel::EVENT_SPEED_TEST_RESULT,
-            json!({"serverId":"interop", "latency":40, "identity":{"networkEpoch":3}}),
+            crate::commands::speedtest::MeasurementEvent::Result(
+                crate::commands::speedtest::NodeResult::new("interop", &Ok(40), Some(3), None),
+            ),
         )
         .unwrap();
     let entry = ledger.lock().entries.values().next().unwrap().clone();
@@ -514,7 +516,9 @@ fn admitted_manual_and_temp_prefilters_publish_all_reasons_before_the_first_real
         let result_network = if disconnected { None } else { network };
         let result = events.stamp(
             crate::events::channel::EVENT_SPEED_TEST_RESULT,
-            json!({"serverId":"a","latency":30,"identity":{"networkEpoch":result_network}}),
+            crate::commands::speedtest::MeasurementEvent::Result(
+                crate::commands::speedtest::NodeResult::new("a", &Ok(30), result_network, None),
+            ),
         );
         assert!(result.is_some());
         read.now_ms = crate::runtime::subscription_scheduler::now_ms();

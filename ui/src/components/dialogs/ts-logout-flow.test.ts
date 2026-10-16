@@ -99,32 +99,54 @@ describe('shared pre-notice helpers for a node held by the running core', () => 
   const status = (serverId: string) => ({ serverId });
 
   const live = (...ids: string[]) => ({ connected: true, statuses: ids.map(status) });
+  const applied = (...ids: string[]) => ({ connected: true, statuses: [],
+    mainCoreHold: { mainGeneration: running.mainGeneration, serverIds: ids } });
 
-  it('skips the notice only on positive proof that the proxy does not hold the node', () => {
-    // Certain: the proxy is neither running nor starting, whatever a late status read says.
-    expect(tsNodeHoldByRunningCore(stopped, live('ts-a'), 'ts-a')).toBe('notHeld');
+  it('skips the notice only on stopped or same-generation applied-set proof', () => {
+    expect(tsNodeHoldByRunningCore(stopped, { connected: false, statuses: [] }, 'ts-a')).toBe('notHeld');
     expect(tsNodeHoldByRunningCore(stopped, null, 'ts-a')).toBe('notHeld');
-    // Certain: this run's status frame has arrived and does not list the node.
-    expect(tsNodeHoldByRunningCore(running, live('ts-b'), 'ts-a')).toBe('notHeld');
-    expect(tsNodeHoldByRunningCore(null, live('ts-b'), 'ts-a')).toBe('notHeld');
+    // No TS subscription/first frame is needed for a Ready no-endpoint instance.
+    expect(tsNodeHoldByRunningCore(running, applied(), 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(running, applied('ts-b'), 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(running, applied('ts-b', 'ts-a'), 'ts-a')).toBe('held');
+    // A late or partial cache cannot override the applied set in either direction.
+    expect(tsNodeHoldByRunningCore(running, { ...applied(), statuses: [status('ts-a')] }, 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(running, { ...applied('ts-a'), statuses: [status('ts-b')] }, 'ts-a')).toBe('held');
   });
 
-  it('a live frame that lists the node is a holder', () => {
-    expect(tsNodeHoldByRunningCore(running, live('ts-b', 'ts-a'), 'ts-a')).toBe('held');
-    expect(tsNodeHoldByRunningCore(null, live('ts-a'), 'ts-a')).toBe('held');
+  it('never treats unbound, failed, starting or cross-generation reads as negative proof', () => {
+    for (const snapshot of [null, live(), live('ts-a'), live('ts-b'),
+      { ...applied(), connected: false },
+      { ...applied(), mainCoreHold: { mainGeneration: 8, serverIds: [] } }]) {
+      expect(tsNodeHoldByRunningCore(running, snapshot, 'ts-a')).toBe('unknown');
+    }
+    for (const proxy of [null, { ...running, starting: true },
+      { running: false, starting: true }, { running: true },
+      ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(mainGeneration => ({ ...running, mainGeneration }))]) {
+      expect(tsNodeHoldByRunningCore(proxy, applied(), 'ts-a')).toBe('unknown');
+    }
   });
 
-  it('a failed read, a stream that is not live and a missing first frame are never "not held"', () => {
-    // Both reads failed.
-    expect(tsNodeHoldByRunningCore(null, null, 'ts-a')).toBe('unknown');
-    // The proxy runs but its status read failed, or the stream is reconnecting (stale cache).
-    expect(tsNodeHoldByRunningCore(running, null, 'ts-a')).toBe('unknown');
-    expect(tsNodeHoldByRunningCore(running, { connected: false, statuses: [status('ts-b')] }, 'ts-a')).toBe('unknown');
-    expect(tsNodeHoldByRunningCore(null, { connected: false, statuses: [] }, 'ts-a')).toBe('unknown');
-    // The proxy runs (or is still starting) and no frame of this run has arrived yet.
-    expect(tsNodeHoldByRunningCore(running, live(), 'ts-a')).toBe('unknown');
-    expect(tsNodeHoldByRunningCore({ running: false, starting: true }, live(), 'ts-a')).toBe('unknown');
-    expect(tsNodeHoldByRunningCore({ running: false, starting: true }, null, 'ts-a')).toBe('unknown');
+  it('keeps the notice when parallel reads straddle stopped and a new Ready core', () => {
+    const stoppedOldRun = { running: false, starting: false, mainGeneration: 8 };
+    for (const serverIds of [['ts-a'], ['ts-b'], []]) {
+      const newReady = { connected: true, statuses: [], mainCoreHold: { mainGeneration: 9, serverIds } };
+      expect(tsNodeHoldByRunningCore(stoppedOldRun, newReady, 'ts-a')).toBe('unknown');
+      // An internally contradictory disconnected snapshot must not rescue the stopped shortcut.
+      expect(tsNodeHoldByRunningCore(stoppedOldRun, { ...newReady, connected: false }, 'ts-a')).toBe('unknown');
+    }
+    expect(tsNodeHoldByRunningCore(stoppedOldRun, live('ts-a'), 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore(stoppedOldRun, live(), 'ts-a')).toBe('unknown');
+    expect(tsNodeHoldByRunningCore(stoppedOldRun, null, 'ts-a')).toBe('notHeld');
+    expect(tsNodeHoldByRunningCore(stoppedOldRun, { connected: false, statuses: [] }, 'ts-a')).toBe('notHeld');
+  });
+
+  it('rejects malformed proof rather than calling it an empty endpoint set', () => {
+    for (const mainCoreHold of [{}, { mainGeneration: 7 },
+      { mainGeneration: 7, serverIds: null }, { mainGeneration: 7, serverIds: [null] },
+      { mainGeneration: 7, serverIds: [''] }, { mainGeneration: '7', serverIds: [] }]) {
+      expect(tsNodeHoldByRunningCore(running, { ...applied(), mainCoreHold } as unknown as Parameters<typeof tsNodeHoldByRunningCore>[1], 'ts-a')).toBe('unknown');
+    }
   });
 
   it('captures an owner only for a run that can be named again later', () => {

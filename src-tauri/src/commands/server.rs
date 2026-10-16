@@ -1751,7 +1751,8 @@ fn tailscale_state_exists_at(
 #[tauri::command]
 pub fn tailscale_get_status(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
     let running = state.proxy().status().running;
-    let snapshot = state.mesh().tailscale_status_snapshot(running);
+    let mut snapshot = state.mesh().tailscale_status_snapshot(running);
+    snapshot.main_core_hold = state.proxy().tailscale_main_core_hold();
     ApiResponse::ok(
         serde_json::to_value(&snapshot)
             .unwrap_or_else(|_| json!({ "connected": false, "statuses": [] })),

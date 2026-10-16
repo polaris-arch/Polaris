@@ -1351,7 +1351,7 @@ pub fn run() {
     // RunEvent 循环：① macOS dock 图标重开 ② C1 退出清理（停核 + 清系统代理）。关窗语义仍由
     // on_window_event + QuitState 决定，未改动；本回调只在**进程级真实退出**时兜安全清理。
     app.run(|app_handle, event| match event {
-        // Android onResume / iOS willEnterForeground；首启仍由调度器的 12s 补更覆盖。
+        // Android onResume / iOS willEnterForeground；iOS 仅唤醒新鲜 UIKit active 查询，不能据此准入。
         #[cfg(mobile)]
         tauri::RunEvent::WindowEvent {
             label,

@@ -145,7 +145,7 @@ impl Script {
                 &three_nodes(),
                 &|| false,
                 |_| std::future::pending::<Measured>(),
-                &mut |_, _| {},
+                &mut |_: &str, _: Value| {},
             )
             .await
         })
@@ -762,7 +762,7 @@ async fn actual_native_production_batches_retire_exit_zero_and_seven_and_admit_s
                 &three_nodes(),
                 &|| false,
                 |_| std::future::pending::<Measured>(),
-                &mut |event, payload| events.push((event.to_owned(), payload)),
+                &mut |event: &str, payload: Value| events.push((event.to_owned(), payload)),
             )
             .await;
             assert!(
@@ -1546,7 +1546,7 @@ async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
             &nodes,
             &|| false,
             |_| std::future::ready(Ok(1)),
-            &mut |_, _| {}
+            &mut |_: &str, _: Value| {}
         )
         .await,
         TempCoreOutcome::Ran { .. }

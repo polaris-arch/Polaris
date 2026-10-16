@@ -88,7 +88,9 @@ final class VpnPlugin: Plugin {
     /// Read-only conditions for the App scheduler, independent of NE lifecycle
     /// and its start/stop mutation queue. Unknown path cost stays JSON null.
     @objc func deviceConditions(_ invoke: Invoke) {
-        invoke.resolve(measurementDevice.snapshot())
+        DispatchQueue.main.async {
+            invoke.resolve(self.measurementDevice.snapshot())
+        }
     }
 
     /// Read-only status must not manufacture a manager or save preferences.
