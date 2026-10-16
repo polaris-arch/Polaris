@@ -22,8 +22,8 @@
 |---|---|
 | 接管方式 | TUN · 系统代理 / 本地端口（桌面） |
 | 分流 | 智能 / 全局 / 直连 · 自定义规则 · 应用分流 · 地区分流（智能模式，含回国） |
-| 普通代理 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[3](#tor-note) |
-| 组网接入[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[1](#masque-note) |
+| 普通代理 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| 组网接入[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
 | DNS | FakeIP · DoH / DoT · 节点域名解析竞速 |
 | 网络控制 | IPv6 开关 · 浏览器 DoH 拦截 · WebRTC 策略（仅 TUN） |
 | 诊断 | 连接拓扑 · 实时日志 · 节点测速与进度 · 规则命中展示 · 流媒体与 AI 解锁检测 |
@@ -31,17 +31,17 @@
 | 应用更新 | 正式版 / 测试版通道 · 可重新下载当前版本 · 安装包摘要校验与缺失提示 |
 | 桌面内存优化 | 启用自动轻量模式后，主窗口连续隐藏或最小化 10 分钟会释放主 WebView；统计、连接与日志按需订阅 |
 
-<a id="masque-note"></a>
+<a id="tor-note"></a>
 
-1. MASQUE 使用 sing-box 自有实现，不支持 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制仅针对该接入方式。
+1. Tor 需要可用的 Tor 可执行程序；平台上的实际运行条件须另行满足。
 
 <a id="mesh-note"></a>
 
 2. 组网添加入口包含 OpenConnect、OpenVPN 和 MASQUE；内网路由能力还取决于所配置的内网网段（meshRoutes），不能仅凭入口归类判断。
 
-<a id="tor-note"></a>
+<a id="masque-note"></a>
 
-3. Tor 需要可用的 Tor 可执行程序；平台上的实际运行条件须另行满足。
+3. MASQUE 使用 sing-box 自有实现，不支持 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制仅针对该接入方式。
 
 <table>
 <tr>

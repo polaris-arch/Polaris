@@ -22,8 +22,8 @@
 |---|---|
 | Traffic capture | TUN · System proxy / Local port (desktop) |
 | Routing | Smart / Global / Direct · Custom rules · Per-app routing · Region routing (Smart mode, incl. back-to-China) |
-| Proxy protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[3](#tor-note) |
-| Mesh connections[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[1](#masque-note) |
+| Proxy protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| Mesh connections[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
 | DNS | FakeIP · DoH / DoT · Node-domain resolver racing |
 | Network controls | IPv6 toggle · Browser DoH blocking · WebRTC policy (TUN only) |
 | Diagnostics | Connection topology · Live logs · Node speed tests with progress · Rule-hit display · Streaming and AI unlock detection |
@@ -31,17 +31,17 @@
 | App updates | Stable / Testing channels · Re-download the current version · Installer digest verification and missing-digest warnings |
 | Desktop memory optimization | With automatic lightweight mode enabled, releases the main WebView after the main window stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
 
-<a id="masque-note"></a>
+<a id="tor-note"></a>
 
-1. MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
+1. Tor requires an available Tor executable and the necessary runtime conditions on the platform.
 
 <a id="mesh-note"></a>
 
 2. OpenConnect, OpenVPN, and MASQUE are added through Mesh. Internal-network routing also depends on configured internal subnets (meshRoutes); the entry category alone does not establish that routing capability.
 
-<a id="tor-note"></a>
+<a id="masque-note"></a>
 
-3. Tor requires an available Tor executable and the necessary runtime conditions on the platform.
+3. MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
 
 <table>
 <tr>

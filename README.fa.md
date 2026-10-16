@@ -24,8 +24,8 @@
 |---|---|
 | شیوه گرفتن ترافیک | TUN · پروکسی سیستمی / پورت محلی (دسکتاپ) |
 | مسیریابی | هوشمند / سراسری / مستقیم · قوانین سفارشی · مسیریابی بر پایه برنامه · مسیریابی منطقه‌ای (حالت هوشمند، شامل بازگشت به چین) |
-| گره‌های پروکسی | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[3](#tor-note) |
-| اتصال‌های شبکه[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[1](#masque-note) |
+| گره‌های پروکسی | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| اتصال‌های شبکه[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
 | DNS | FakeIP · DoH / DoT · رقابت حل‌کننده‌های دامنهٔ گره‌ها |
 | کنترل شبکه | کلید IPv6 · مسدودسازی DoH مرورگر · سیاست WebRTC (فقط TUN) |
 | عیب‌یابی | توپولوژی اتصال‌ها · گزارش زنده · سنجش سرعت گره‌ها همراه با پیشرفت · نمایش قوانین تطبیق‌یافته · تشخیص باز بودن سرویس‌های پخش و هوش مصنوعی |
@@ -35,17 +35,17 @@
 
 </div>
 
-<a id="masque-note"></a>
+<a id="tor-note"></a>
 
-1. MASQUE از پیاده‌سازی خود sing-box استفاده می‌کند و از اتصال رسمی MASQUE کلادفلر، از جمله WARP از طریق MASQUE، پشتیبانی نمی‌کند. این محدودیت فقط مربوط به همین روش اتصال است.
+1. Tor به فایل اجرایی در دسترس Tor و شرایط لازم برای اجرا روی سکو نیاز دارد.
 
 <a id="mesh-note"></a>
 
 2. OpenConnect، ‏OpenVPN و MASQUE از بخش شبکه خصوصی افزوده می‌شوند. مسیریابی شبکهٔ داخلی به زیرشبکه‌های داخلی پیکربندی‌شده (meshRoutes) نیز وابسته است؛ صرف دسته‌بندی ورودی این قابلیت را اثبات نمی‌کند.
 
-<a id="tor-note"></a>
+<a id="masque-note"></a>
 
-3. Tor به فایل اجرایی در دسترس Tor و شرایط لازم برای اجرا روی سکو نیاز دارد.
+3. MASQUE از پیاده‌سازی خود sing-box استفاده می‌کند و از اتصال رسمی MASQUE کلادفلر، از جمله WARP از طریق MASQUE، پشتیبانی نمی‌کند. این محدودیت فقط مربوط به همین روش اتصال است.
 
 <table>
 <tr>
