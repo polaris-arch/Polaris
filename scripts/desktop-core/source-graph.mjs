@@ -207,8 +207,8 @@ export const desktopSourceManifestPath = (spec) => isForkSource(spec)
 // Exact source-candidate policy, not a release/tag/asset activation. A later
 // source revision needs its own reviewed toolchain input; never admit any Go.
 export function upstreamSourceGoVersion(contract) {
-  if (contract.sourceCommit === '1514e973812c3d3d9c6366cc85ebea98f3a1ce84') {
-    requireGraph(contract.sourceTree === '6e4f1d3e24399e28f7fcb0bb96c73043d455c19f', 'Upstream toolchain source tree differs');
+  if (contract.sourceCommit === 'b0247cc930bc892a0ea03138906b548b6e84ac50') {
+    requireGraph(contract.sourceTree === 'b4b670f51d1c48b3c0be9ab882152e3f25a5d9b4', 'Upstream toolchain source tree differs');
     return 'go1.27.2';
   }
   // The earlier upstream-native contract generation (including frozen G4 553)

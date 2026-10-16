@@ -214,12 +214,12 @@ test('branded desktop NOTICE uses actual release version while retaining the ups
   assert.throws(() => validateReleaseNotice(notice.replace(first, first.replace(contract.version, '1.15.0-alpha.12')), manifest, contract, mobile), /baseline/);
 });
 
-// These remain deliberately synthetic bytes. The real 1514 source coordinates
+// These remain deliberately synthetic bytes. The real b024 source coordinates
 // exercise admission policy, never claim publication or successful native output.
 function utlsFixture() {
   const { contract } = fixture();
-  contract.sourceCommit = '1514e973812c3d3d9c6366cc85ebea98f3a1ce84';
-  contract.sourceTree = '6e4f1d3e24399e28f7fcb0bb96c73043d455c19f';
+  contract.sourceCommit = 'b0247cc930bc892a0ea03138906b548b6e84ac50';
+  contract.sourceTree = 'b4b670f51d1c48b3c0be9ab882152e3f25a5d9b4';
   contract.producer.workflowCommit = contract.sourceCommit;
   contract.sourceArchive.name = `sing-box-polaris-source-${contract.sourceCommit}.tar.gz`;
   contract.sourceArchive.url = `https://github.com/${contract.repository}/releases/download/${contract.tag}/${contract.sourceArchive.name}`;
@@ -242,6 +242,7 @@ test('only the exact frozen new source admits Go 1.27.2; legacy G4 and v1 keep t
   for (const change of [
     c => { c.sourceTree = '0'.repeat(40); for (const row of Object.values(c.platforms)) row.sourceTree = c.sourceTree; },
     c => { c.sourceCommit = '55300c55560bcc604fd9675c5526b5713db81cc1'; c.producer.workflowCommit = c.sourceCommit; for (const row of Object.values(c.platforms)) row.sourceCommit = c.sourceCommit; },
+    c => { c.sourceCommit = '1514e973812c3d3d9c6366cc85ebea98f3a1ce84'; c.sourceTree = '6e4f1d3e24399e28f7fcb0bb96c73043d455c19f'; c.producer.workflowCommit = c.sourceCommit; for (const row of Object.values(c.platforms)) { row.sourceCommit = c.sourceCommit; row.sourceTree = c.sourceTree; } },
   ]) {
     const changed = structuredClone(contract); change(changed);
     changed.sourceArchive.name = `sing-box-polaris-source-${changed.sourceCommit}.tar.gz`;
