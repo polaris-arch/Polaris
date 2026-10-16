@@ -119,16 +119,15 @@ fn malformed_or_future_schema_is_unknown_not_a_menu_inventory() {
 #[cfg(unix)]
 #[tokio::test]
 async fn actual_query_is_bounded_and_bound_to_exact_selected_file() {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::test_support::write_executable_stand_in;
     let dir = std::env::temp_dir().join(format!("polaris-tls-probe-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let core = dir.join("core");
     let raw = document().to_string();
-    std::fs::write(&core, format!("#!/bin/sh\n[ \"$1 $2\" = 'tools tls-fingerprints' ] || exit 1\ncat <<'POLARIS_DOCUMENT'\n{raw}\nPOLARIS_DOCUMENT\n")).unwrap();
-    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable_stand_in(&core, format!("#!/bin/sh\n[ \"$1 $2\" = 'tools tls-fingerprints' ] || exit 1\ncat <<'POLARIS_DOCUMENT'\n{raw}\nPOLARIS_DOCUMENT\n"));
     let first = query_cli(&core).await;
     assert!(first.document.is_some());
-    std::fs::write(&core, "#!/bin/sh\nexit 1\n").unwrap();
+    write_executable_stand_in(&core, "#!/bin/sh\nexit 1\n");
     let old = query_cli(&core).await;
     assert!(old.document.is_none());
     assert_ne!(old.binary_sha256, first.binary_sha256);
@@ -186,13 +185,12 @@ async fn file_proof_rejects_atomic_replacement_even_with_equal_length_and_restor
 #[tokio::test]
 async fn transient_failure_retries_the_same_bytes_after_recovery_without_rehashing_or_spawning_on_every_read(
 ) {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::test_support::write_executable_stand_in;
     let dir = std::env::temp_dir().join(format!("polaris-tls-retry-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let core = dir.join("core");
     let raw = document().to_string();
-    std::fs::write(&core, format!("#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nprintf x >> attempts\n[ -f ready ] || exit 7\ncat <<'DOCUMENT'\n{raw}\nDOCUMENT\n")).unwrap();
-    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable_stand_in(&core, format!("#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\nprintf x >> attempts\n[ -f ready ] || exit 7\ncat <<'DOCUMENT'\n{raw}\nDOCUMENT\n"));
     let cache = CliProbeCache::new();
     let first = cache
         .probe_at(&core, std::time::Instant::now(), ProbeFile::ScriptFixture)
