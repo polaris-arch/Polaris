@@ -604,7 +604,9 @@ async fn windows_sweep_admits_only_proven_same_user_and_excludes_live_registered
     ])
     .observed_as("ours", vec![Some(true), Some(false)]);
     assert_eq!(
-        processes.sweep(&[windows_test_pid(24)], Duration::ZERO).await,
+        processes
+            .sweep(&[windows_test_pid(24)], Duration::ZERO)
+            .await,
         Ok(1)
     );
     assert_eq!(processes.ends(), vec!["ours"]);
@@ -852,7 +854,9 @@ async fn dropping_a_windows_sweep_cannot_send_a_late_retry() {
         let processes = processes.clone();
         tokio::spawn(async move { processes.sweep(&[], Duration::from_secs(5)).await })
     };
-    processes.ended.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), processes.ended.notified())
+        .await
+        .expect("the Windows sweep must request termination");
     sweep.abort();
     assert!(sweep.await.unwrap_err().is_cancelled());
     tokio::time::advance(Duration::from_secs(20)).await;
@@ -985,7 +989,9 @@ async fn windows_sweep_holds_the_state_gate_and_failure_preserves_logout_state()
             .await
         })
     };
-    processes.ended.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), processes.ended.notified())
+        .await
+        .expect("the Windows sweep must request termination");
     assert!(reg.start_gate.try_lock().is_err());
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let prepare = {
@@ -996,16 +1002,29 @@ async fn windows_sweep_holds_the_state_gate_and_failure_preserves_logout_state()
             reg.prepare("ts2", "late-prepare").await
         })
     };
-    entered.acquire().await.unwrap().forget();
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("the late prepare task must start")
+        .unwrap()
+        .forget();
     assert!(
         !prepare.is_finished(),
         "new admission must wait for the state gate"
     );
     assert!(!deleted.load(Ordering::SeqCst));
-    let error = logout.await.unwrap().unwrap_err();
+    // Two five-second grace windows must finish inside this paused-time budget.
+    let error = tokio::time::timeout(Duration::from_secs(15), logout)
+        .await
+        .expect("the Windows sweep must finish both grace windows")
+        .unwrap()
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
     assert_eq!(error.to_string(), STALE_LOGIN_CORE_ALIVE);
-    prepare.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), prepare)
+        .await
+        .expect("late prepare must resume after the failed sweep releases the gate")
+        .unwrap()
+        .unwrap();
     assert!(!deleted.load(Ordering::SeqCst));
     assert_eq!(std::fs::read(&state).unwrap(), b"keep-existing-identity");
     assert_eq!(processes.ends(), vec!["live", "live"]);

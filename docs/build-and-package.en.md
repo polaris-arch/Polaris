@@ -72,10 +72,12 @@ create a second compatibility layer.
 
 ### Fetching assets (sing-box core / cronet / dashboard)
 
+The current core development repository is [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). This navigation change does not rewrite frozen build inputs: the desktop Release assets and mobile alpha.12 source below remain subject to their respective manifests. Do not mechanically replace old asset URLs with download URLs under the new repository.
+
 Current desktop packaging starts from `desktopRelease` in `src-tauri/core-manifest.json` and consumes the pinned
 [polaris-box](https://github.com/polaris-arch/polaris-box) release through `scripts/desktop-core/release-contract.json`.
 The source commit, tag object, asset index, and digests are pinned. Do not substitute the fork's latest default-branch
-commit, the historical `sourceBuild`, or the mobile `scripts/libbox-patches/source-manifest.json` for this desktop selection.
+commit, the historical `sourceBuild`, or the mobile `scripts/mobile-core/source-contract.json` for this desktop selection.
 These build inputs do not establish native App acceptance or publication of an App candidate.
 
 ```bash
@@ -148,13 +150,22 @@ below, and `SHA256SUMS`. `scripts/release-assets.mjs` defines the names and inve
 `verify-packaging.mjs assets --label release-all` checks the full set, version, size and every checksum.
 Old-name copies and extra files are rejected.
 
-### Android signed release
+### Mobile source-build prerequisites
 
-| ABI | Public name |
+Desktop sidecar downloads do not supply mobile bindings. The current common inputs are defined by [source-contract.json](../scripts/mobile-core/source-contract.json) and the [mobile core build guide](../scripts/mobile-core/README.md): pinned polaris-box source, Go 1.25.5, and gomobile/gobind v0.1.13. Build and verify the component and its original receipt before App consumption.
+
+- **Android bindings**: API 24 AAR, Java 17 (CI pins 17.0.20+101), and NDK r30-beta3 (complete source revision 30.0.16138531-beta3). The AAR contains ARM64, ARMv7, x86 and x86_64; this does not widen the two-ARM-ABI signed APK scope.
+- **Android App**: Gradle uses JDK 21 and currently SDK/Build Tools 36 / 36.0.0. Rust uses 27.3.13750724 pinned by [android-rust-ndk.version](../scripts/android-rust-ndk.version), separately from the binding NDK. The App minimum is API 24.
+- **Component preparation order**: the shared entry is `bash scripts/build-mobile-core.sh android`, with explicit existing source, Go, gomobile, gobind, SDK, NDK, JDK and work/cache paths (full arguments in the mobile core guide). Then `scripts/mobile-core/consume.py materialize-android` verifies the component and receipt before materializing App inputs; CI orchestrates this through `ci_android.py prepare/build`. Copying an arbitrary AAR to `libbox.aar` does not satisfy source verification.
+- **iOS / iPadOS**: see [iOS source builds](ios-source-build.md) for the source entry, pinned Xcode/SDK, ARM64 device/simulator targets and personal signing requirements. Source-build documentation is available without a published IPA; compile/link, signing, device installation and runtime acceptance are distinct stages.
+
+### Android signed-release builds from current source
+
+| ABI | Current source packaging name (not published inventory) |
 |---|---|
 | ARMv8 | `Polaris_<version>_arm64-v8a-android.apk` |
 | ARMv7 | `Polaris_<version>_armeabi-v7a-android.apk` |
-| ARMv8 + ARMv7 | `Polaris_<version>_universal-android.apk` |
+| ARMv8 + ARMv7 (universal; no x86) | `Polaris_<version>_universal-android.apk` |
 
 After desktop draft checks, `android.yml` builds three signed release APKs:
 
@@ -199,7 +210,7 @@ It was added (2026-08-29) after a batch of stowaways that had **already shipped*
 
 ## Continuous integration
 
-Six workflows divide the work (`.github/workflows/`):
+The main workflows divide the work (`.github/workflows/`):
 
 - **`ci.yml`** — the Rust gate; its job is "is the change correct". Three parallel jobs:
   - `fmt + clippy (<os>)`: formatting and clippy (`-D warnings`); the Linux leg also runs rustdoc and resolves the Cronet sources.

@@ -71,10 +71,12 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
+当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)。仓库导航迁移不改写已冻结的构建输入：下述桌面 Release 资产与移动端 alpha.12 来源仍按各自清单核验，不得把旧资产 URL 机械替换为新仓下载地址。
+
 当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
 `scripts/desktop-core/release-contract.json` 消费固定的 [polaris-box](https://github.com/polaris-arch/polaris-box)
 发布资产。源码提交、tag 对象、资产索引与摘要由清单锁定；不要改用 fork 默认分支的最新提交，
-也不要把旧 `sourceBuild` 或移动端 `scripts/libbox-patches/source-manifest.json` 当成当前桌面选择。
+也不要把旧 `sourceBuild` 或移动端 `scripts/mobile-core/source-contract.json` 当成当前桌面选择。
 这些是构建输入约束，不代表该 App 候选已经完成原生验收或已发布。
 
 ```bash
@@ -144,13 +146,22 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 `scripts/release-assets.mjs` 定义命名及集合，`verify-packaging.mjs assets --label release-all`
 核对完整集合、版本、体积与逐项摘要，旧名副本与额外文件均拒绝。
 
-### Android 正式 release
+### 移动端源码构建前置条件
 
-| ABI | 发布名 |
+桌面 sidecar 下载不能替代移动端绑定组件。当前共同输入见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)：固定 polaris-box 源码、Go 1.25.5、gomobile/gobind v0.1.13，先生成并核验组件及原始收据，再由 App 消费。
+
+- **Android 绑定组件**：API 24 AAR，Java 17（CI 固定 17.0.20+101）、NDK r30-beta3（完整来源版本 30.0.16138531-beta3）。AAR 含 ARM64、ARMv7、x86、x86_64 四种 ABI；这不扩大正式 APK 的两种 ARM ABI 范围。
+- **Android App**：Gradle 使用 JDK 21，SDK/Build Tools 当前为 36 / 36.0.0；Rust 使用 [android-rust-ndk.version](../scripts/android-rust-ndk.version) 固定的 27.3.13750724，不能与绑定组件 NDK 混用。App 最低 API 24。
+- **组件准备顺序**：共享入口为 `bash scripts/build-mobile-core.sh android`，须显式提供已有 source、Go、gomobile、gobind、SDK、NDK、JDK、work/cache 路径（完整参数见移动内核说明）。随后由 `scripts/mobile-core/consume.py materialize-android` 核验组件和收据再写入 App 输入；CI 的 `ci_android.py prepare/build` 编排此过程。仅把任意 AAR 复制为 `libbox.aar` 不满足当前来源核验。
+- **iOS / iPadOS**：源构建入口、固定 Xcode/SDK、ARM64 设备与模拟器目标及个人签名条件见 [iOS 源码构建](ios-source-build.md)。没有已发布 IPA 不影响源码构建文档的提供；编译/链接、签名、真机安装和运行验收是不同阶段。
+
+### Android 当前源码签名发布构建
+
+| ABI | 当前源码打包名（非已发布清单） |
 |---|---|
 | ARMv8 | `Polaris_<版本>_arm64-v8a-android.apk` |
 | ARMv7 | `Polaris_<版本>_armeabi-v7a-android.apk` |
-| ARMv8 + ARMv7 | `Polaris_<版本>_universal-android.apk` |
+| ARMv8 + ARMv7（universal，不含 x86） | `Polaris_<版本>_universal-android.apk` |
 
 `android.yml` 在桌面草稿通过后构建三个正式签名 APK：
 
@@ -205,7 +216,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 
 ## 持续集成
 
-六个 workflow 分工（`.github/workflows/`）：
+主要 workflow 分工（`.github/workflows/`）：
 
 - **`ci.yml`** — Rust 门禁，职责 = 「改动是否正确」。三个并行 job：
   - `fmt + clippy (<os>)`：格式与 clippy（`-D warnings`）；Linux 腿另跑 rustdoc 与 Cronet 来源解析。

@@ -5,7 +5,7 @@
 **简体中文** · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安装)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
@@ -58,6 +58,8 @@
 
 从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包。
 
+### v1.0.0 已发布下载
+
 以下为 [v1.0.0 已发布资产](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0)；版本与文件名以所选 Release 为准。桌面提供 macOS Apple Silicon / Intel、Windows x64、Linux amd64；该版本 Android 提供正式签名的 ARM64 APK。可用同页 `SHA256SUMS` 核对下载文件。
 
 | 平台 | 文件 |
@@ -95,6 +97,19 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 ## 构建
 
 以下供维护者构建当前源码，示例为 Linux；不代表上文 v1.0.0 下载包的构建输入或安装验收。平台打包约定见下方构建文档。
+
+源码构建入口：[桌面与 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [移动内核与固定工具链](scripts/mobile-core/README.md)。iOS 提供源码构建说明，不提供已发布 IPA；无签名编译与自行签名真机安装是不同步骤，均不能替代运行验收。
+
+### 当前源码打包命名
+
+当前构建流程按 [release-assets.mjs](scripts/release-assets.mjs) 使用以下命名，`<version>` 为应用版本占位符。它们是打包约定，不是上方 v1.0.0 的历史文件名；能否下载仍以所选 Release 的实际附件为准。Android universal 仅含 ARM64 / ARMv7，不含 x86。
+
+| 平台 | 打包命名 |
+|---|---|
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
@@ -151,7 +166,7 @@ Android 将 libbox 载入应用进程，采用移动端 VPN 集成，不使用�
 
 | 项目 | 用途 |
 |---|---|
-| [polaris-box](https://github.com/polaris-arch/polaris-box) / [sing-box](https://github.com/SagerNet/sing-box) | 基于 sing-box 的 polaris-box 桌面内核；源码与版本以构建清单为准 |
+| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (官方上游)](https://github.com/SagerNet/sing-box) | 内核现行开发仓；冻结源码、版本及既有 polaris-box 资产仍以所选构建清单为准 |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | 桌面运行时 |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | NaiveProxy 的 libcronet |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | 内置面板 |

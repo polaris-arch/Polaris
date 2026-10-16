@@ -957,8 +957,70 @@ async fn real_factory_drain_panic_and_lost_launcher_do_not_release_pending_login
 }
 
 #[cfg(unix)]
+struct LoginEofTailGate {
+    reached: Option<oneshot::Sender<()>>,
+    release: oneshot::Receiver<()>,
+}
+
+/// Pause the real drainer asynchronously after its original reader has recorded EOF.
+/// Blocking a Tokio worker on the fatal-slot mutex can strand the I/O/timer work that
+/// the test itself needs before releasing that mutex.
+#[cfg(unix)]
+struct EofGatedLoginReader<R> {
+    reader: R,
+    gate: Option<LoginEofTailGate>,
+    eof: bool,
+}
+
+#[cfg(unix)]
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for EofGatedLoginReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if !this.eof {
+            let before = buffer.filled().len();
+            match std::pin::Pin::new(&mut this.reader).poll_read(context, buffer) {
+                Poll::Ready(Ok(())) if buffer.filled().len() == before => {
+                    this.eof = true;
+                    if let Some(reached) = this.gate.as_mut().and_then(|gate| gate.reached.take()) {
+                        let _ = reached.send(());
+                    }
+                }
+                result => return result,
+            }
+        }
+        let Some(gate) = this.gate.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match std::pin::Pin::new(&mut gate.release).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                // A consumed oneshot must not be polled again on the next EOF read.
+                this.gate = None;
+                Poll::Ready(result.map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "test EOF-tail release was dropped",
+                    )
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn native_login_fixture(
     fatal: Option<crate::runtime::proxy::core_log::CoreFatalSlot>,
+    tail_gate: Option<LoginEofTailGate>,
 ) -> (
     crate::test_support::TestDir,
     Arc<Shared>,
@@ -992,7 +1054,11 @@ async fn native_login_fixture(
                 Vec::new(),
             );
             let err = pipe_to_log_with_secrets_owned(
-                LoginDrainReader::new(stderr, original_drain.clone(), 1),
+                EofGatedLoginReader {
+                    reader: LoginDrainReader::new(stderr, original_drain.clone(), 1),
+                    gate: tail_gate,
+                    eof: false,
+                },
                 LOGIN_CORE_LOG_TARGET,
                 fatal,
                 None,
@@ -1034,20 +1100,26 @@ async fn native_login_fixture(
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn last_line_eof_cannot_retire_while_original_drainer_task_tail_is_blocked() {
     let fatal = Arc::new(Mutex::new(None));
-    let blocking = fatal.clone();
-    let (release, unblock) = std::sync::mpsc::channel();
-    let (locked, ready) = oneshot::channel();
-    let owner = std::thread::spawn(move || {
-        let _lock = blocking.lock().unwrap();
-        locked.send(()).unwrap();
-        let _ = unblock.recv();
-    });
-    ready.await.unwrap();
+    let (release, unblock) = oneshot::channel();
+    let (reached, ready) = oneshot::channel();
+    let fixture = native_login_fixture(
+        Some(fatal.clone()),
+        Some(LoginEofTailGate {
+            reached: Some(reached),
+            release: unblock,
+        }),
+    );
     let (_dir, shared, native, child, drain, config) =
-        native_login_fixture(Some(fatal.clone())).await;
+        tokio::time::timeout(Duration::from_secs(5), fixture)
+            .await
+            .expect("the original native child must exit while its log tail is held");
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .expect("the original stderr reader must observe EOF")
+        .unwrap();
     wait_until(|| {
         drain
             .streams
@@ -1063,7 +1135,8 @@ async fn last_line_eof_cannot_retire_while_original_drainer_task_tail_is_blocked
     assert!(native.terminal(&shared.identity, 23).is_err());
     assert!(shared.contains("ts1"));
     assert!(config.exists());
-    // EOF was observed inside read_until; the final no-newline FATAL still owns this task.
+    // The original reader saw EOF, but read_until has not returned its final FATAL line.
+    assert_eq!(*fatal.lock().unwrap(), None);
     assert!(drain
         .tasks
         .get()
@@ -1076,14 +1149,20 @@ async fn last_line_eof_cannot_retire_while_original_drainer_task_tail_is_blocked
     let joining = tokio::spawn(async move { original_drain.finished().await });
     wait_until(|| drain.tasks.get().unwrap().try_lock().is_err()).await;
     joining.abort();
-    assert!(joining.await.unwrap_err().is_cancelled());
+    assert!(tokio::time::timeout(Duration::from_secs(2), joining)
+        .await
+        .expect("cancelling the join waiter must not cancel the original drainer")
+        .unwrap_err()
+        .is_cancelled());
     assert!(native.terminal(&shared.identity, 23).is_err());
     assert!(shared
         .retire_login_tail("ts1", 23, &native, fact.clone())
         .is_err());
     release.send(()).unwrap();
-    owner.join().unwrap();
-    drain.finished().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), drain.finished())
+        .await
+        .expect("the original drainer must join after its tail is released")
+        .unwrap();
     assert_eq!(
         *fatal.lock().unwrap(),
         Some(crate::runtime::proxy::core_log::CoreFatalKind::DhcpMonitorMissing)
@@ -1096,7 +1175,7 @@ async fn last_line_eof_cannot_retire_while_original_drainer_task_tail_is_blocked
 #[cfg(unix)]
 #[tokio::test]
 async fn native_wait_and_task_join_still_preserve_custody_on_config_cleanup_failure() {
-    let (_dir, shared, native, child, drain, config) = native_login_fixture(None).await;
+    let (_dir, shared, native, child, drain, config) = native_login_fixture(None, None).await;
     drain.finished().await.unwrap();
     let fact = child.lock().await.native_exit().unwrap();
     let saved_config = config.with_extension("original");
@@ -1122,7 +1201,7 @@ async fn native_wait_and_task_join_still_preserve_custody_on_config_cleanup_fail
 #[cfg(unix)]
 #[tokio::test]
 async fn login_native_issuer_rejects_foreign_registry_birth_role_scope_status_and_temp_receipt() {
-    let (_dir, shared, native, child, drain, _config) = native_login_fixture(None).await;
+    let (_dir, shared, native, child, drain, _config) = native_login_fixture(None, None).await;
     drain.finished().await.unwrap();
     let fact = child.lock().await.native_exit().unwrap();
     let binary = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1264,9 +1343,9 @@ async fn login_drain_io_error_early_drop_and_panicked_task_are_never_normal_tail
 #[cfg(unix)]
 #[tokio::test]
 async fn equal_presented_pid_and_forged_close_watch_cannot_substitute_a_new_child_birth() {
-    let (_dir, shared, native, child, drain, config) = native_login_fixture(None).await;
+    let (_dir, shared, native, child, drain, config) = native_login_fixture(None, None).await;
     let (_other_dir, other_shared, _other_native, other_child, other_drain, _other_config) =
-        native_login_fixture(None).await;
+        native_login_fixture(None, None).await;
     drain.finished().await.unwrap();
     other_drain.finished().await.unwrap();
     let original = child.lock().await.native_exit().unwrap();

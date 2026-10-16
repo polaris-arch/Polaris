@@ -5,7 +5,7 @@
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · **Русский** · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#установка)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
@@ -58,6 +58,8 @@
 
 Скачайте пакет для своей платформы со страницы [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+### Опубликованные файлы v1.0.0
+
 Ниже перечислены [опубликованные файлы v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); версию и имена файлов сверяйте с выбранным релизом. Настольные пакеты доступны для macOS Apple Silicon / Intel, Windows x64 и Linux amd64. В этом релизе для Android опубликован подписанный APK ARM64. Проверьте загрузки по файлу `SHA256SUMS` на странице релиза.
 
 | Платформа | Файл |
@@ -91,6 +93,19 @@
 ## Сборка
 
 Раздел предназначен для разработчиков, собирающих текущий исходный код; пример приведён для Linux. Он не описывает входные данные сборки или результаты проверки установки файлов v1.0.0 выше. Правила упаковки для платформ приведены в руководстве по сборке ниже.
+
+Сборка из исходного кода: [настольные платформы и Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [мобильное ядро и фиксированные инструменты](scripts/mobile-core/README.md). Для iOS есть инструкция по сборке, но нет опубликованного IPA. Компиляция без подписи и установка на устройство с собственной подписью — отдельные этапы; они не заменяют проверку работы приложения.
+
+### Имена пакетов текущего исходного кода
+
+Текущий процесс сборки использует имена из [release-assets.mjs](scripts/release-assets.mjs); `<version>` обозначает версию приложения. Это правила упаковки, отличающиеся от исторических имён v1.0.0 выше; доступность загрузок определяется фактическими файлами выбранного релиза. Android universal содержит только ARM64 / ARMv7, без x86.
+
+| Платформа | Имена пакетов |
+|---|---|
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26), pnpm 11.24.0, Go и [Tauri CLI 2](https://v2.tauri.app/).
 
@@ -143,7 +158,7 @@ resources/   Ядро sing-box + libcronet (загружаются при сбо
 
 | Проект | Назначение |
 |---|---|
-| [polaris-box](https://github.com/polaris-arch/polaris-box) / [sing-box](https://github.com/SagerNet/sing-box) | Настольное ядро polaris-box на основе sing-box; источник и версия заданы манифестом сборки |
+| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (официальный апстрим)](https://github.com/SagerNet/sing-box) | Текущий репозиторий разработки ядра; фиксированные исходники, версия и существующие файлы polaris-box определяются выбранным манифестом сборки |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Десктопная среда выполнения |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet для NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Встроенная панель |

@@ -5,7 +5,7 @@
 [简体中文](README.md) · **English** · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
 [![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#install)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
 [![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
@@ -58,6 +58,8 @@
 
 Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+### Published v1.0.0 downloads
+
 The files below are [published v1.0.0 assets](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); use the version and filenames on the selected Release. Desktop packages cover macOS Apple Silicon / Intel, Windows x64, and Linux amd64. This release provides a signed Android ARM64 APK. Check downloads against `SHA256SUMS` on the same release page.
 
 | Platform | File |
@@ -91,6 +93,19 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 ## Build
 
 This section is for maintainers building the current source, with Linux as the example. It does not describe the build inputs or installation acceptance of the v1.0.0 downloads above. See the build guide below for platform packaging conventions.
+
+Source-build guides: [desktop and Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [mobile core and pinned toolchains](scripts/mobile-core/README.md). iOS has source-build documentation, not a published IPA. Unsigned compilation and personally signed device installation are separate steps; neither substitutes for runtime acceptance.
+
+### Current source packaging names
+
+The current build pipeline uses the names defined in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the application version placeholder. These packaging conventions differ from the historical v1.0.0 filenames above; download availability is determined by the actual assets on the selected Release. Android universal contains only ARM64 / ARMv7, not x86.
+
+| Platform | Packaging names |
+|---|---|
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
@@ -143,7 +158,7 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [polaris-box](https://github.com/polaris-arch/polaris-box) / [sing-box](https://github.com/SagerNet/sing-box) | sing-box-based polaris-box desktop core; source and version are selected by the build manifest |
+| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (official upstream)](https://github.com/SagerNet/sing-box) | Current core development repository; frozen source, version and existing polaris-box assets remain governed by the selected build manifest |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Built-in dashboard |
