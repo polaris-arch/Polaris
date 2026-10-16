@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 import ast
 import inspect
+import re
 import json
 import os
 import sys
@@ -303,11 +304,28 @@ class ProducerCalls(unittest.TestCase):
         observed = producer.component_revalidation_observation(receipt, current, pin, True)
         self.assertEqual(observed['comparisonPolicy'], producer.ANDROID_BUILD_CODE_POLICY)
         self.assertEqual(observed['currentVerifier'], current['producer'])
-        self.assertEqual(len(observed['currentVerifier']['files']), 22)
+        self.assertEqual(len(observed['currentVerifier']['files']), 23)
         self.assertEqual(set(observed['currentVerifier']['files']), set(producer.PRODUCER_FILES))
         for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
-                       'scripts/mobile-core/apple-cache.py'):
+                       'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/apple_tls_fingerprint.py'):
             self.assertEqual(observed['currentVerifier']['files'][helper], current['producer']['files'][helper])
+        # The added inventory member is an actual pinned link helper, not a
+        # dummy entry introduced merely to match the new file count.
+        helper = 'scripts/mobile-core/apple_tls_fingerprint.py'
+        actual_pin = producer.file_pin(producer.ROOT / helper)
+        with patch.object(producer, 'run', side_effect=['', 'b'*40]):
+            actual_producer = producer.producer_code()
+        self.assertEqual(actual_producer['files'][helper], actual_pin)
+        import consume
+        with patch.object(consume, 'source_status_observation', return_value={'complete': True, 'clean': True}), \
+                patch.object(consume, 'run', return_value='b'*40):
+            actual_consumer = consume.app_identity()
+        self.assertEqual(actual_consumer['consumerCode'][helper], actual_pin)
+        for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
+            source = (producer.ROOT / project).read_text()
+            for action in ('prepare', 'verify'):
+                self.assertRegex(source, re.escape(helper) + r'\\?"\s+' + action)
+
         self.assertEqual(observed['originalProducerCandidate'], 'a'*40)
         self.assertEqual(observed['originalReceipt'], pin)
         self.assertEqual(observed['originalComponentFingerprint'], 'c'*64)

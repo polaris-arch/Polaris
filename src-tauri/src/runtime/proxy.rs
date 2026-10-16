@@ -2029,7 +2029,10 @@ impl ProxyRuntime {
             if status.running {
                 // Direct Windows/Mac use the actual retained Child identity and
                 // the file proof bracketed around that Child's synchronous birth.
-                if !self.core_via_helper.load(Ordering::SeqCst) {
+                if !self
+                    .core_via_helper
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     return self
                         .direct_tls_snapshot(self.core_generation())
                         .binary_sha256;

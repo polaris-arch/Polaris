@@ -764,7 +764,7 @@ impl CheckCustody {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn spawn(
         &self,
         binary: &Path,

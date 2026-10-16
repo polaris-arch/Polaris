@@ -160,7 +160,13 @@ async fn direct_capability_bytes_require_retained_run_and_replaced_files_do_not_
     std::fs::rename(&replacement, &path).unwrap();
     assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
     rt.captured_cli_run.lock().unwrap().take();
-    let mut run = rt.child.lock().unwrap().take_running_legacy().unwrap();
+    let mut run = rt
+        .child
+        .lock()
+        .unwrap()
+        .take_running_legacy()
+        .unwrap()
+        .expect("the retained direct child must remain owned for cleanup");
     let child = run.child_for_test();
     child.start_kill().unwrap();
     child.wait().await.unwrap();

@@ -49,7 +49,7 @@ it('menus reflect only actual profiles, preserve existing values, and change on 
   expect(nodeUtlsOptions(false, next).map(([id]) => id)).toEqual(['', '@default', 'none', 'random', 'chrome_155', 'safari_16_0', 'safari_26_3']);
   expect(nodeUtlsOptions(true, next).some(([id]) => id === 'none')).toBe(true);
   expect(nodeUtlsOptions(false, report(['chrome_133'])).some(([id]) => id === 'chrome_155')).toBe(false);
-  expect(globalUtlsOptions('safari_26_3').at(-1)).toEqual(['safari_26_3', 'safari_26_3']);
+  expect(globalUtlsOptions('safari_26_3').slice(-1)[0]).toEqual(['safari_26_3', 'safari_26_3']);
   expect(next.document?.sourceModified).toBeNull();
   expect(nodeUtlsOptions(false, next).some(([id]) => id === 'chrome_pq')).toBe(false);
 });
