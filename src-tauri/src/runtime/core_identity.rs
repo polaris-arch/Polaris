@@ -259,8 +259,7 @@ pub(crate) fn stage_installation(
     Ok(stage)
 }
 
-/// Hash the same open regular object, not a path reopened after validation.
-pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<(), String> {
+fn open_payload_directory(dir: &Path) -> Result<polaris_helper::core_objects::PayloadDir, String> {
     #[cfg(unix)]
     let owner = {
         use std::os::unix::fs::MetadataExt;
@@ -272,8 +271,13 @@ pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<()
     };
     #[cfg(not(unix))]
     let owner = None;
-    let objects = polaris_helper::core_objects::PayloadDir::open(dir, owner)
-        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid payload directory")?;
+    polaris_helper::core_objects::PayloadDir::open(dir, owner)
+        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid payload directory".to_owned())
+}
+
+/// Hash the same open regular object, not a path reopened after validation.
+pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<(), String> {
+    let objects = open_payload_directory(dir)?;
     manifest
         .validate()
         .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid manifest")?;
@@ -345,19 +349,31 @@ fn bundle_file_stamp(metadata: &std::fs::Metadata) -> String {
 }
 impl BundleObservation {
     fn capture(dir: &Path, manifest: &CoreManifest) -> Result<Self, String> {
+        // Linux has a real bundled sidecar. Never open it by a blocking path
+        // before validation: reuse the original directory-relative, no-follow,
+        // nonblocking regular-file primitive and retain that exact handle.
+        #[cfg(target_os = "linux")]
+        let objects = open_payload_directory(dir)?;
         let files = manifest
             .files
             .iter()
             .map(|expected| {
                 let path = dir.join(&expected.name);
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    options.share_mode(5); // No in-place writes; normal atomic replacement remains possible.
-                }
-                let file = options.open(&path).map_err(|e| e.to_string())?;
+                #[cfg(target_os = "linux")]
+                let (file, _) = objects
+                    .open_regular(&expected.name)
+                    .map_err(|e| e.to_string())?;
+                #[cfg(not(target_os = "linux"))]
+                let file = {
+                    let mut options = std::fs::OpenOptions::new();
+                    options.read(true);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::OpenOptionsExt;
+                        options.share_mode(5); // No in-place writes; normal atomic replacement remains possible.
+                    }
+                    options.open(&path).map_err(|e| e.to_string())?
+                };
                 let stamp = bundle_file_stamp(&file.metadata().map_err(|e| e.to_string())?);
                 #[cfg(windows)]
                 let identity =
