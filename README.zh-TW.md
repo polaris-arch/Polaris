@@ -20,17 +20,28 @@
 
 | 領域 | 能力 |
 |---|---|
-| 接管方式 | TUN · 系統代理 · 本機連接埠 |
-| 分流 | 智慧 / 全域 / 直連 · 自訂規則 · 應用程式分流 · 地區分流（含回國） |
-| 通訊協定 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN · MASQUE[^masque] |
-| 組網 | WireGuard · Tailscale · WARP（WireGuard）；OpenConnect / OpenVPN 設定了內網網段時也用於內網存取 |
-| DNS | FakeIP · DoH / DoT · 解析競速 · IPv6 策略 · 洩漏防護 |
+| 接管方式 | TUN · 系統代理 / 本機連接埠（桌面） |
+| 分流 | 智慧 / 全域 / 直連 · 自訂規則 · 應用程式分流 · 地區分流（智慧模式，含回國） |
+| 一般代理 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[3](#tor-note) |
+| 組網接入[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[1](#masque-note) |
+| DNS | FakeIP · DoH / DoT · 節點網域解析競速 |
+| 網路控制 | IPv6 開關 · 瀏覽器 DoH 攔截 · WebRTC 策略（僅 TUN） |
 | 診斷 | 連線拓撲 · 即時記錄 · 節點測速與進度 · 規則命中顯示 · 串流與 AI 解鎖偵測 |
-| 維運 | 訂閱管理 · 設定備份還原與確認 · 隱私鎖 · 系統匣常駐 |
-| 應用程式更新 | 正式版 / 測試版通道 · 可重新下載目前版本 · 安裝檔摘要驗證 |
-| 桌面記憶體最佳化 | 介面隱藏或最小化 10 分鐘後自動釋放主 WebView；統計、連線與記錄按需訂閱 |
+| 維運 | 訂閱管理 · 設定備份還原與確認 · 隱私鎖 · 桌面系統匣常駐 |
+| 應用程式更新 | 正式版 / 測試版通道 · 可重新下載目前版本 · 安裝檔摘要驗證與缺失提示 |
+| 桌面記憶體最佳化 | 啟用自動輕量模式後，主視窗連續隱藏或最小化 10 分鐘會釋放主 WebView；統計、連線與記錄按需訂閱 |
 
-[^masque]: MASQUE 使用 sing-box 自有實作，不支援 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制僅針對該接入方式。
+<a id="masque-note"></a>
+
+1. MASQUE 使用 sing-box 自有實作，不支援 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制僅針對該接入方式。
+
+<a id="mesh-note"></a>
+
+2. 組網新增入口包含 OpenConnect、OpenVPN 和 MASQUE；內網路由能力仍取決於設定的內網網段（meshRoutes），不能僅憑入口分類判斷。
+
+<a id="tor-note"></a>
+
+3. Tor 需要可用的 Tor 執行檔；平台上的實際執行條件須另行滿足。
 
 <table>
 <tr>
