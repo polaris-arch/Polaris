@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · [English](README.en.md) · **繁體中文** · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安裝)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**北極星** — 基於 sing-box 的跨平台網路代理用戶端。Tauri 2（Rust + React）。
+**北極星** — 基於 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的跨平台網路代理用戶端。Tauri 2（Rust + React）。
 
 ![首頁](docs/screenshots/home.png)
 
@@ -155,7 +155,8 @@ Android 將 libbox 載入應用程式行程，採用行動端 VPN 整合，不�
 
 | 專案 | 用途 |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (官方上游)](https://github.com/SagerNet/sing-box) | 核心目前開發倉庫；凍結原始碼、版本與既有 polaris-box 資產仍以所選建置清單為準 |
+| [sing-box-polaris（實際使用的 fork）](https://github.com/polaris-arch/sing-box-polaris) | 實際使用的核心 fork；凍結原始碼、版本與 polaris-box 資產以所選建置清單為準 |
+| [sing-box（原始上游）](https://github.com/SagerNet/sing-box) | 原始上游專案與技術來源；保留致謝 |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | 桌面執行階段 |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | NaiveProxy 的 libcronet |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | 內建面板 |

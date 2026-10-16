@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · **English** · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#install)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**Polaris** — a cross-platform network proxy client built on sing-box. Tauri 2 (Rust + React).
+**Polaris** — a cross-platform network proxy client built on [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Tauri 2 (Rust + React).
 
 ![Home](docs/screenshots/home.png)
 
@@ -147,7 +147,8 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (official upstream)](https://github.com/SagerNet/sing-box) | Current core development repository; frozen source, version and existing polaris-box assets remain governed by the selected build manifest |
+| [sing-box-polaris (active fork)](https://github.com/polaris-arch/sing-box-polaris) | Core fork used by Polaris; frozen source, version, and polaris-box assets follow the selected build manifest |
+| [sing-box (original upstream)](https://github.com/SagerNet/sing-box) | Original upstream project and technical foundation; acknowledged here |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Built-in dashboard |
