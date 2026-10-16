@@ -17,10 +17,10 @@ README 只留「怎么装、怎么用」。
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| Rust | stable（edition 2021） | 后端 + `crates/` 下 18 个域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
+| Rust | stable（edition 2021） | 后端 + `crates/` 下的域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
 | Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
 | pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）；`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
-| Go | `scripts/libbox-patches/source-manifest.json` 的 `goVersion` | 桌面内核源码构建，以及消费内核包时读取二进制构建信息 |
+| Go | 所选构建路径源码清单的 `goVersion` | 源码构建与二进制构建信息检查；桌面、移动端输入分开维护 |
 | [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
 
 在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
@@ -71,74 +71,48 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
-三类资源的渠道与完整性合同不同，不能混称为「官方 release + manifest SHA」：
-
-- `fetch-core` 不下载上游 Release 压缩包。桌面内核由 `scripts/libbox-patches/source-manifest.json` 钉扎的 sing-box
-  源码提交加本仓补丁（Windows 另加 `scripts/core-patches/windows-dns-refresh.patch`）在四个平台各自原生构建，
-  版本为 `core-manifest.json` 的 `sourceBuild.version`；脚本把校验过的四平台内核包落到 `resources/<平台>/`；
-- `fetch-cronet` 从 Go module proxy 下载平台模块 zip，解压后以 `cronetLibrarySha256` 校验实际动态库；
-- `fetch-dashboard` 取 sing-box `gh-pages` 面板产物，**当前没有 SHA256 pin**。
-
-它们都按需拉取、不入库，且打包前必须跑：Tauri bundle `resources` 字段引用这些产物。core 与 cronet
-缺 pin 都会 fail，绝不无校验拉取原生可执行资源。
+当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
+`scripts/desktop-core/release-contract.json` 消费固定的 [polaris-box](https://github.com/polaris-arch/polaris-box)
+发布资产。源码提交、tag 对象、资产索引与摘要由清单锁定；不要改用 fork 默认分支的最新提交，
+也不要把旧 `sourceBuild` 或移动端 `scripts/libbox-patches/source-manifest.json` 当成当前桌面选择。
+这些是构建输入约束，不代表该 App 候选已经完成原生验收或已发布。
 
 ```bash
-# sing-box 四平台核：消费内核包（版本 = core-manifest.json 的 sourceBuild.version，勿在此重复钉）
+# 本地 Linux 资源准备；其它平台为 win、mac-x64、mac-arm64
+node scripts/fetch-core.mjs --platform=linux
+node scripts/fetch-cronet.mjs --platform=linux
+node scripts/fetch-dashboard.mjs
+```
+
+`fetch-core` 验证固定发布输入后放入 `resources/<平台>/`。Linux / Windows 的 Cronet 动态库也必须
+符合清单摘要；macOS 使用静态输入。`fetch-dashboard` 获取 sing-box `gh-pages` 面板，当前没有 SHA256 pin。
+资源不入库；Tauri 打包配置引用的文件必须事先准备好，不能把获取资源视作运行期在线换核功能。
+
+#### 发布打包与原生验收包
+
+`.github/workflows/desktop-core.yml` 按冻结清单选择路径：发布选择模式在四个平台验证固定资产，
+源码模式才从固定源码构建。原生输入汇总为候选专属内核包；`package.yml` 的消费形态为：
+
+```bash
 node scripts/fetch-core.mjs --bundle-dir=<内核包目录> --candidate="$(git rev-parse HEAD)"
-node scripts/fetch-cronet.mjs     # libcronet（仅 linux/windows；mac 静态编入核心）
-node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
 ```
 
-`node scripts/fetch-cronet.mjs --platform=linux` 或 `--platform=win` 可只拉当前打包腿；版本始终从
-`bundledCoreVersion` 对应 sing-box tag 的 `go.mod` 解析，Linux 与 Windows 可各自使用上游实际 require 的模块版本。
-`--check-only` 不下载库，但会校验 tag 可读、两个精确 require 均存在、以及两平台的 SHA-256 pin 完整且格式有效。
+`--bundle-dir` 与 `--candidate` 必须一起提供。当前 `desktopRelease` 路径先验证原生验收包，
+再消费固定资产；不能用本机仅下载一个平台的结果替代发布验收。取包时使用实际 workflow 返回的
+artifact 名称和候选提交，不复用其它提交的回执。当前清单存在 `desktopRelease`，不要照旧示例
+直接使用 `--producer`；源码生产路径只在无此发布选择时适用。
 
-内核包由 `.github/workflows/desktop-core.yml` 产出：Linux / Windows / macOS x64 / macOS arm64 四个原生 runner 各跑
-`node scripts/fetch-core.mjs --producer --platform=<linux|win|mac-x64|mac-arm64> --bundle-dir=<目录> --candidate=<提交 SHA>`，
-汇总后由 `--assemble` 写出 `bundle.json`。`--producer` 只接受恰好一个平台，不做跨平台构建。消费形态要求
-`--candidate` 等于当前 `HEAD` 且工作树没有已跟踪文件的改动；即使用 `--platform` 只落其中一个平台，也会先校验
-全部四份二进制与回执。缺内核包、或 `sourceBuild` 钉扎不完整时直接失败，没有回落到官方 Release 资产或旧缓存的路径。
+`tauri.conf.json` 没有 `build.beforeBundleCommand`；`tauri build` 不会代替手动准备上述资源。
+CI 在 fetch 后通过 `node scripts/verify-packaging.mjs confs` 检查资源存在且非空，
+产物仍须通过后续 payload / assets 与原生验收。下载成功、摘要正确和运行验收是不同检查。
 
-#### 获取内核包的两种方式
-
-**完整的四平台包（打包与发布用）。** `desktop-core.yml` 只能被其它 workflow 调用。在自己有权限的仓库（或 fork）里手动触发
-`release-risk.yml` 或 `package.yml`，它们会调用 `desktop-core.yml`；运行结束后下载名为
-`desktop-core-bundle-<提交 SHA>-<运行号>-<重试次数>` 的产物，解压出的目录就是 `--bundle-dir`。产物保留 7 天，
-且只对产出它的那个提交有效。
-
-```bash
-gh run download <运行号> --name 'desktop-core-bundle-<提交 SHA>-<运行号>-<重试次数>' --dir <内核包目录>
-```
-
-**只构建本机平台的核（本地开发用）。** 没有四平台包时，可以在本机只产出当前平台的核，再手动放到资源目录。
-这条路径跳过了四平台包的一致性校验，只用于本地开发与调试，不能用来打发布包。
-
-```bash
-# 需要 Go（source-manifest.json 的 goVersion）、Python 3、git，并能访问 github.com 取上游源码
-# HEAD 必须等于 --candidate，且工作树没有已跟踪文件的改动
-node scripts/fetch-core.mjs --producer --platform=linux --bundle-dir=<目录> --candidate="$(git rev-parse HEAD)"
-mkdir -p resources/linux && cp <目录>/linux/sing-box resources/linux/sing-box
-```
-
-`--platform` 取 `linux`、`win`、`mac-x64`、`mac-arm64` 之一，必须与本机一致（不做跨平台构建）；Windows 的文件名是
-`sing-box.exe`。本机若装的不是清单要求的 Go 版本，可设 `GOTOOLCHAIN=go<版本>` 让 Go 自行取用对应工具链。
-
-上面三条都必须手动跑：`tauri.conf.json` **没有** `build.beforeBundleCommand`，
-`tauri build` 不会替你 fetch 任何资源。
-（此前本节描述过一套 `beforeBundleCommand` 兜底，实际那个键从未存在，
-`scripts/verify-dashboard-resources.mjs` 因此是永不执行的孤儿脚本——已删除。）
-
-兜底改由 `node scripts/verify-packaging.mjs confs` 提供，它在 CI 的 fetch 之后、Rust 构建之前跑
-（`.github/workflows/package.yml`），断言 conf 引用的每一条资源路径**存在且有内容**：
-空目录与 0 字节文件一律转红（存在 ≠ 有内容；fetch / 解压失败的典型形态正是留下这两种）。
-任意开发机可复现，纯静态、无构建依赖。
-
-升级核心时，先更新 `bundledCoreVersion`、`scripts/libbox-patches/source-manifest.json` 与 `core-manifest.json` 的
-`sourceBuild` / `windowsBuild` 钉扎（`coreArchiveSha256` 现只保留其键集合作为随包平台枚举），再跑
-`node scripts/fetch-cronet.mjs --check-only`。若上游 `go.mod` 的 Cronet 依赖变化，只更新受影响平台的
-`cronetLibrarySha256`，最后以 `--force --platform=<linux 或 win>` 重拉并验证该平台库；版本不写回 manifest。
+维护者调整桌面内核选择时须同步审查 `desktopRelease`、发布契约及其摘要，并核对实际固定发布资产。
+移动端源码清单和历史 source-mode 输入分别维护，不能只改 `bundledCoreVersion` 或旧 `sourceBuild`
+就宣称桌面选择已更新。内核随 App 配套交付；本说明不提供用户独立上传、在线替换或回滚内核的入口。
 
 ### 打包出安装包
+
+本节的产物命名、资产表及下文三份 Android APK 描述的是当前 `main` 源码的构建与发布流程约定，供维护者准备候选包使用，不是现有公开下载清单，也不表示候选产物已经发布或通过安装验收。已公开的下载请以 [README 安装说明](../README.md#安装) 和 [v1.0.0 Release](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) 的实际资产为准。
 
 ```bash
 # 1) 拉资产（见上）
@@ -254,7 +228,7 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
   只对受影响的面调用 `desktop-core.yml`、`package.yml`（不上传产物）与 `android.yml`。
-- **`desktop-core.yml`** — 只被调用：四个原生 runner 从源码构建桌面内核并汇总成内核包。
+- **`desktop-core.yml`** — 只被调用：四个原生 runner 验证固定发布输入，或在源码模式下构建固定源码，再汇总候选内核包。
 - **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
   触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。职责 = 「能否产出可分发安装包」。tag 发布时建草稿 release、
   上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。
