@@ -1763,6 +1763,15 @@ pub fn build_dns_config(
         push_bypass_bucket(&mut dns_rules, via_direct, "dns-bootstrap");
     }
 
+    if crate::builder::network_env::default_dns_uses_netenv(config) {
+        if let Some(reason) = deps.probe_facts(config).dhcp_unavailable() {
+            deps.log_warn(&format!(
+                "DNS_DEFAULT_POLICY_UNAVAILABLE:{}",
+                reason.report_code()
+            ));
+        }
+    }
+
     // ── DNS 未命中策略。
     // v2 的默认动作独立于流量代理模式；legacy 配置仍保留 smart/global 的历史派生规则。
     // tailnet / probe 规则稍后从头插入，因此仍然高于这里的用户默认动作。
@@ -1897,6 +1906,79 @@ pub fn build_dns_config(
                 rewrite_ttl: None,
                 ..Default::default()
             });
+            if default_is_fake_ip {
+                // Only non-address questions can reach this action: client A/AAAA
+                // terminated at FakeIP; internal allowFakeIP=false A/AAAA terminated
+                // at the unconditional real-address shadow rule immediately above.
+                // Keep explicit DNS rules and protected LAN/mesh/bootstrap exceptions
+                // ahead of this policy, independent of the traffic proxy mode.
+                let compatible_fallback = DnsPolicyAction::Server {
+                    server_id: BUILTIN_DOMESTIC_DNS_ID.into(),
+                };
+                let fallback = config
+                    .dns_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.real_query_fallback_action.as_ref())
+                    .unwrap_or(&compatible_fallback);
+                let before = dns_rules.len();
+                let real_server = match fallback {
+                    DnsPolicyAction::Server { server_id } => {
+                        let configured = config
+                            .dns_servers
+                            .iter()
+                            .find(|server| server.id == *server_id);
+                        // Builtin generation retains legacy compatibility transports.
+                        // An explicitly disabled/Hosts resource must not silently use one.
+                        let compatible_missing = config
+                            .dns_defaults
+                            .as_ref()
+                            .is_none_or(|defaults| defaults.real_query_fallback_action.is_none());
+                        (configured.is_some_and(|server| {
+                            server.enabled && server.kind != DnsServerKind::Hosts
+                        }) || (configured.is_none() && compatible_missing)
+                            || server_id
+                                == crate::user_config::network_profile::BUILTIN_NETENV_DHCP_ID)
+                            && dns_config.servers.iter().any(|server| {
+                                server.tag == dns_server_tag(server_id)
+                                    && server.type_field.as_deref() != Some("hosts")
+                            })
+                    }
+                    _ => true,
+                };
+                if fallback.is_valid_real_query_fallback() && real_server {
+                    append_dns_policy_action(
+                        &mut dns_rules,
+                        DnsEffectMatcher::default(),
+                        fallback,
+                        None,
+                        config.dns_defaults.as_ref(),
+                        &config.dns_server_groups,
+                        &emitted_resource_tags,
+                        enable_fake_ip,
+                        "__real_query_fallback__",
+                        deps.log,
+                    );
+                }
+                if dns_rules.len() == before {
+                    // A stale/disabled resource or unsupported imported action must
+                    // never expose the query through the legacy domestic final.
+                    (deps.log)(LogLevel::Warn, "DNS_REAL_QUERY_FALLBACK_INVALID");
+                    append_dns_policy_action(
+                        &mut dns_rules,
+                        DnsEffectMatcher::default(),
+                        &DnsPolicyAction::Reject {
+                            method: DnsRejectMethod::Default,
+                        },
+                        None,
+                        config.dns_defaults.as_ref(),
+                        &config.dns_server_groups,
+                        &emitted_resource_tags,
+                        enable_fake_ip,
+                        "__real_query_fallback__",
+                        deps.log,
+                    );
+                }
+            }
         } else {
             // 没开 FakeIP（系统代理模式等）：用 geosite 规则各自拿正确 IP。
             if proxy_mode == "smart" {

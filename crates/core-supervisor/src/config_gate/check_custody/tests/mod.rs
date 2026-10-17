@@ -110,6 +110,64 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn tls_query_is_fenced_and_drained_before_normal_exit_even_after_caller_cancellation() {
+        let fixture = Fixture::new("exec /bin/sleep 2");
+        let custody = Arc::new(CheckCustody::default());
+        let binary = fixture.binary();
+        let mut query =
+            Box::pin(custody.run_mode(&binary, None, Duration::from_secs(5), Arc::new(NativeIo)));
+        assert!(poll_fn(|cx| Poll::Ready(query.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert_eq!(custody.state.lock().unwrap().runs.len(), 1);
+        drop(query);
+        custody.begin_shutdown().unwrap();
+        assert!(matches!(
+            custody.spawn_mode(&binary, None, Arc::new(NativeIo)),
+            Err(ValidationLifecycleError::Closing)
+        ));
+        custody.shutdown().await.unwrap();
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        assert_eq!(
+            std::fs::read_dir(&fixture.0).unwrap().count(),
+            1,
+            "query creates no config snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_query_timeout_retires_native_child_and_output_is_bounded_while_draining() {
+        let fixture = Fixture::new("exec /bin/sleep 2");
+        let custody = Arc::new(CheckCustody::default());
+        assert!(matches!(
+            custody
+                .run_mode(
+                    &fixture.binary(),
+                    None,
+                    Duration::from_millis(1),
+                    Arc::new(NativeIo)
+                )
+                .await
+                .unwrap(),
+            RawCheck::TimedOut { .. }
+        ));
+        assert!(custody.state.lock().unwrap().runs.is_empty());
+        let output = Arc::new(OutputCapture {
+            max_bytes: Some(4),
+            ..Default::default()
+        });
+        output
+            .read(Some(std::io::Cursor::new(vec![b'a'; 100_000])), false)
+            .unwrap();
+        output
+            .read(Some(std::io::Cursor::new(Vec::<u8>::new())), true)
+            .unwrap();
+        output.finished().await.unwrap();
+        assert_eq!(output.stdout.lock().unwrap().len(), 4);
+        assert!(matches!(output.result(true), RawCheck::OutputFailed(_)));
+    }
+
+    #[tokio::test]
     async fn cancellation_keeps_child_private_secret_snapshot_and_blocks_new_check_until_retry() {
         let fixture = Fixture::new("exec /bin/sleep 2");
         let custody = Arc::new(CheckCustody::default());

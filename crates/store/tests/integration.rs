@@ -145,7 +145,7 @@ fn corrupt_json_returns_default_without_overwriting_disk() {
 
 #[test]
 fn bad_field_sanitized_good_field_kept_on_disk_preserved() {
-    // 维度7 #7：坏字段（servers 非 array）跳过，好字段（customRules）保留；
+    // 维度7 #7：非结构性坏字段（language 非 string）跳过，好字段（customRules）保留；
     // load 不落盘 → 磁盘原文件原样保留（迁移落盘由调用方决定）。
     let dir = TempDir::new().unwrap();
     let path = cfg_path(&dir);
@@ -154,7 +154,8 @@ fn bad_field_sanitized_good_field_kept_on_disk_preserved() {
         "proxyModeType": "systemProxy",
         "logLevel": "info",
         "mixedPort": 7890,
-        "servers": "not-an-array",
+        "servers": [],
+        "language": 42,
         "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}],
         "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
     }"#;
@@ -162,14 +163,15 @@ fn bad_field_sanitized_good_field_kept_on_disk_preserved() {
 
     let res = ConfigStore::load(&StdFs, &path);
     assert!(res.loaded_from_disk);
-    // 坏字段剔除（servers → finalize 填 []）
+    // 非结构性坏字段剔除；合法空集合不变。
     assert_eq!(res.config["servers"], serde_json::json!([]));
+    assert_ne!(res.config["language"], serde_json::json!(42));
     // 好字段保留
     assert_eq!(res.config["customRules"].as_array().unwrap().len(), 1);
 
     // 磁盘原文件保留（load 纯逻辑不落盘）
     let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(on_disk.contains("\"not-an-array\""));
+    assert_eq!(on_disk, original);
 }
 
 #[test]
@@ -257,4 +259,35 @@ fn save_validates_before_writing() {
     let res = ConfigStore::save(&StdFs, &path, &bad, "deadbeefdead");
     assert!(matches!(res, Err(StoreError::Validation(_))));
     assert!(!path.exists());
+}
+
+#[test]
+fn malformed_collection_load_fails_closed_without_rewriting_disk() {
+    for key in ["servers", "subscriptions"] {
+        let dir = TempDir::new().unwrap();
+        let path = cfg_path(&dir);
+        let mut input = polaris_store::default_config();
+        let valid = input.to_string();
+        std::fs::write(&path, &valid).unwrap();
+        let positive = ConfigStore::load(&StdFs, &path);
+        assert!(
+            positive.loaded_from_disk,
+            "valid baseline: {:?}",
+            positive.error
+        );
+        assert!(positive.error.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), valid);
+        input[key] = serde_json::json!("recoverable-malformed-collection");
+        let original = input.to_string();
+        std::fs::write(&path, &original).unwrap();
+        let result = ConfigStore::load(&StdFs, &path);
+        assert!(!result.loaded_from_disk);
+        match result.error {
+            Some(StoreError::Validation(reason)) => {
+                assert_eq!(reason, format!("{key} must be an array"))
+            }
+            other => panic!("expected collection-shape rejection for {key}, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 }

@@ -146,12 +146,24 @@ pub fn attest_core_binary(
     }
 }
 
-/// 两个路径是否指向同一文件（**纯路径判定 + 尽力 canonicalize**）。
+/// Two observations refer to the same file. Linux proc-backed observations compare
+/// device/inode identity; their canonical pathname can name a replacement or deleted file.
+/// Other platforms retain lexical/canonical path comparison.
 ///
 /// 先比字面（覆盖单测与绝大多数生产情形），再比 canonicalize 后的形（覆盖 symlink /
 /// `/var`→`/private/var` 这类 macOS 特有的等价改写）。canonicalize 失败即退回字面结论，
 /// **不因 I/O 失败就误判成"不同"**（那会平白造出一条假告警）。
 fn same_file_path(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    if b.starts_with("/proc") {
+        use std::os::unix::fs::MetadataExt;
+        return match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(expected), Ok(loaded)) => {
+                expected.dev() == loaded.dev() && expected.ino() == loaded.ino()
+            }
+            _ => false,
+        };
+    }
     if a == b {
         return true;
     }

@@ -970,3 +970,26 @@ fn failed_marker_removal_keeps_original_and_recovery_authority() {
     assert!(!c.has_marker());
     assert!(c.original.is_none());
 }
+
+#[test]
+fn invisible_service_remains_owned_until_restore_succeeds() {
+    let mut c = controller(MockDnsOps {
+        targets: vec!["A".into(), "B".into()],
+        dns_state: RefCell::new(BTreeMap::from([
+            ("A".into(), vec!["10.0.0.1".into()]),
+            ("B".into(), vec!["10.0.0.2".into()]),
+        ])),
+        ..Default::default()
+    });
+    c.set_dns();
+    c.ops.targets = vec!["B".into()];
+    c.set_dns();
+    assert_eq!(c.marker.read().unwrap().original["A"], vec!["10.0.0.1"]);
+    c.ops.apply_fail_targets = vec!["A".into()];
+    assert!(!c.restore_dns_inner());
+    assert!(c.marker.read().unwrap().original.contains_key("A"));
+    c.ops.apply_fail_targets.clear();
+    assert!(c.restore_dns_inner());
+    assert!(!c.has_marker());
+    assert_eq!(c.ops.dns_state.borrow()["A"], vec!["10.0.0.1"]);
+}

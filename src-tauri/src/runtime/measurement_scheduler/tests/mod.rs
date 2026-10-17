@@ -1466,6 +1466,7 @@ fn a_new_generation_or_network_forgives_failures_so_the_retest_covers_backed_off
         let url_digest =
             polaris_updater::sha256_hex(resolve_speed_test_url(&Value::Null).as_bytes());
         let identity = |run| ResultIdentity {
+            core_binary_sha256: None,
             run,
             seq: 1,
             origin: SpeedTestOrigin::Schedule,
@@ -1851,6 +1852,7 @@ fn sample_between_rounds(
                 id,
                 measured,
                 ResultIdentity {
+                    core_binary_sha256: None,
                     run: round + 1,
                     seq: seq as u64,
                     origin: SpeedTestOrigin::Schedule,
@@ -1873,6 +1875,7 @@ fn sample_between_rounds(
             let read = ledger.candidates(
                 &members,
                 &ReadContext {
+                    core_binary_sha256: None,
                     main_generation: Some(1),
                     fingerprints: &fingerprints,
                     main_connections: &fingerprints,
@@ -2084,6 +2087,7 @@ fn the_run_loop_reads_the_auto_intent_from_the_config() {
 fn measured(run: u64, measured_at: u64) -> crate::commands::speedtest::ResultIdentity {
     use crate::commands::speedtest::{CoreInstance, MeasurePath, ResultIdentity};
     ResultIdentity {
+        core_binary_sha256: None,
         run,
         seq: 1,
         origin: SpeedTestOrigin::Schedule,
@@ -2115,6 +2119,7 @@ fn selectable_at(
         .candidates(
             &ids(&["a"]),
             &ReadContext {
+                core_binary_sha256: None,
                 main_generation: Some(1),
                 fingerprints: &fingerprints,
                 main_connections: &fingerprints,

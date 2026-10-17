@@ -367,6 +367,7 @@ fn plan_applies_explicit_bindings_to_the_physical_dialer() {
         ..Default::default()
     }));
     shadow.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -427,6 +428,7 @@ async fn real_core_accepts_bound_shadow_tls_temp_config() {
         ..Default::default()
     }));
     server.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "shape-only-secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -1854,6 +1856,7 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
         deps: TempCoreDeps {
             #[cfg(not(target_os = "android"))]
             pc_custody: Arc::new(PcTempCoreCustody::default()),
+            expected_core_sha256: None,
             spawner: Arc::new(FakeSpawner {
                 terminated: Arc::clone(&terminated),
                 spawns: Arc::clone(&spawns),
@@ -4123,6 +4126,67 @@ async fn every_batch_boundary_is_bridged_by_two_heartbeats() {
     cleanup(&h.dir);
 }
 
+/// Deterministic cache pressure inside the actual pre-spawn config-check await.
+/// Script-wrapper bytes are hashed but never executed on any desktop platform.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct EvictingCapabilityChecker {
+    replace_binary: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[async_trait]
+impl ConfigChecker for EvictingCapabilityChecker {
+    async fn check(&self, binary: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        for index in 0..4 {
+            let other = binary.with_file_name(format!("cache-pressure-{index}"));
+            // Each invocation creates distinct paths even in a multi-batch round.
+            let other = other.with_extension(uuid::Uuid::new_v4().to_string());
+            std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+            let snapshot = crate::runtime::tls_fingerprints::probe_cli(&other).await;
+            assert!(snapshot.binary_sha256.is_some());
+        }
+        assert!(
+            crate::runtime::tls_fingerprints::cached_cli(binary).is_none(),
+            "the selected binary must actually be evicted before check returns"
+        );
+        if self.replace_binary {
+            let modified = std::fs::metadata(binary).unwrap().modified().unwrap();
+            let replacement = binary.with_extension("replacement");
+            // Same length and restored mtime: only the retained file identity detects it.
+            std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            std::fs::rename(&replacement, binary).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn cache_eviction_does_not_hide_a_binary_replacement_during_check() {
+    let mut h = harness(true, false, vec![20_001, 20_002, 20_003]);
+    h.deps.checker = Arc::new(EvictingCapabilityChecker {
+        replace_binary: true,
+    });
+    let (out, events) = run_round(&h, &three_nodes()).await;
+    assert!(
+        matches!(out, TempCoreOutcome::Failed(ref detail)
+            if detail == "Core bytes changed after temporary-core validation"),
+        "the retained proof must reject a real replacement even after eviction: {out:?}"
+    );
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(
+        events.is_empty(),
+        "no measurement events may escape a rejected binary"
+    );
+    cleanup(&h.dir);
+}
+
 /// 🔴 **中间某一批就绪失败时，空窗仍然被切开** —— 就绪心跳里 `|| progress.tested() > 0` 那半个判据
 /// 的**唯一**触发路径。
 ///
@@ -4163,7 +4227,7 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
     let doomed: Vec<String> = batches[1].iter().map(|n| n.id.clone()).collect();
 
     // 第 2 批：spawn 成功、走进就绪门、耗满预算后失败（**不是** spawn 失败）。
-    let h = harness_opts(
+    let mut h = harness_opts(
         true,
         false,
         (0..TEMP_CORE_BATCH_MAX_NODES)
@@ -4174,6 +4238,14 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
             ..Default::default()
         },
     );
+    // Force the shared capability lookup to forget this batch during check.
+    // The live batch must retain its own file proof and still run all three batches.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        h.deps.checker = Arc::new(EvictingCapabilityChecker {
+            replace_binary: false,
+        });
+    }
     let (out, events) = run_round(&h, &nodes).await;
 
     let TempCoreOutcome::Ran { results, outcome } = out else {
@@ -4630,6 +4702,7 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
     h.deps.cancel = cancel.clone();
     let nodes = three_nodes();
     let mut collected: Vec<(String, Value)> = Vec::new();
+    let first_result = tokio::sync::Notify::new();
     let run = async {
         TempCoreSession::run(
             &h.deps,
@@ -4641,15 +4714,26 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
                 }
                 std::future::pending::<Measured>().await
             },
-            &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
+            &mut |ev: &str, payload: Value| {
+                if ev == EVENT_SPEED_TEST_RESULT {
+                    first_result.notify_one();
+                }
+                collected.push((ev.to_string(), payload));
+            },
         )
         .await
     };
     let trigger = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Cancel only after production has recorded the first result. A wall-clock
+        // delay can expire during startup or before the completed task is joined.
+        first_result.notified().await;
         cancel.cancel(InterruptReason::Cancelled);
     };
-    let (out, ()) = tokio::join!(run, trigger);
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(run, trigger)
+    })
+    .await
+    .expect("the round must emit its first result and finish cancellation within the test budget");
     let TempCoreOutcome::Ran { results, outcome } = out else {
         panic!("已有节点出值的一轮应以 Ran 收尾，得到 {out:?}");
     };
@@ -4846,7 +4930,7 @@ async fn diagnostic_archive_scrubs_actual_planner_outputs() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spawn() {
+async fn atomic_runtime_config_replaces_unwritable_old_inode_and_retires_secrets() {
     use std::os::unix::fs::PermissionsExt;
     let mut h = harness(true, false, vec![20001, 20002, 20003]);
     h.deps.log_level = "debug".into();
@@ -4863,10 +4947,14 @@ async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spaw
         &mut |_: &str, _: Value| {},
     )
     .await;
-    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
-    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
     assert!(!raw.exists());
-    assert!(!kept.exists());
+    let archived = std::fs::read_to_string(&kept).unwrap();
+    assert!(!archived.contains("Q6_SYNTHETIC_RAW_SECRET"));
+    assert!(!archived.contains("Q6_SYNTHETIC_OLD_SECRET"));
+    let diagnostic: Value = serde_json::from_str(&archived).unwrap();
+    assert_eq!(diagnostic["_diagnostic"]["sanitized"], true);
     cleanup(&h.dir);
 }
 
@@ -4945,3 +5033,123 @@ fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
         Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
     );
 }
+
+#[test]
+fn temp_plan_applies_global_utls_to_node_and_shadow_without_changing_the_subscription() {
+    use polaris_config_engine::user_config::protocol_settings::{ShadowTlsSettings, TlsSettings};
+    use polaris_config_engine::user_config::server_config::SecurityMode;
+    let mut node = srv("global-utls", Protocol::Vless);
+    node.security = Some(SecurityMode::Tls);
+    node.tls_settings = Some(TlsSettings::default());
+    node.shadow_tls_settings = Some(ShadowTlsSettings {
+        password: "secret".into(),
+        sni: "example.com".into(),
+        ..Default::default()
+    });
+    let before = serde_json::to_value(&node).unwrap();
+    let plan = plan_temp_core_with_utls_policy(
+        std::slice::from_ref(&node),
+        &env(),
+        &BTreeMap::new(),
+        Some("safari"),
+    );
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(
+        plan.testable[0].node["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(
+        plan.testable[0].companion_outbounds[0]["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(serde_json::to_value(&node).unwrap(), before);
+    node.tls_settings.as_mut().unwrap().engine = Some("apple".into());
+    let mut native = env();
+    native.platform = "darwin".into();
+    let invalid =
+        plan_temp_core_with_utls_policy(&[node], &native, &BTreeMap::new(), Some("safari"));
+    assert!(invalid.testable.is_empty());
+    assert_eq!(
+        invalid.unusable[0].1,
+        UnusableReason::BuildFailed(
+            "uTLS requires the Go TLS engine; disable uTLS or select Go TLS."
+        )
+    );
+}
+
+#[test]
+fn temp_shadow_disabled_utls_uses_the_same_standard_tls_fallback_as_main() {
+    use polaris_config_engine::user_config::protocol_settings::ShadowTlsSettings;
+    use polaris_config_engine::user_config::utls::UtlsMode;
+    for (mode, fp) in [
+        (Some(UtlsMode::Disabled), Some("chrome")),
+        (None, Some("none")),
+    ] {
+        let mut node = srv("shadow", Protocol::Shadowsocks);
+        node.shadowsocks_settings = Some(Box::new(
+            polaris_config_engine::user_config::protocol_settings::ShadowsocksSettings {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                plugin: None,
+                plugin_opts: None,
+            },
+        ));
+        node.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: mode,
+            fingerprint: fp.map(str::to_owned),
+            password: "pw".into(),
+            sni: "example.com".into(),
+            ..Default::default()
+        });
+        let before = serde_json::to_value(&node).unwrap();
+        let plan = plan_temp_core_with_utls_policy(
+            std::slice::from_ref(&node),
+            &env(),
+            &BTreeMap::new(),
+            None,
+        );
+        assert_eq!(plan.testable.len(), 1);
+        let tls = &plan.testable[0].companion_outbounds[0]["tls"];
+        assert_eq!(tls["enabled"], true);
+        assert!(tls.get("utls").is_none());
+        assert_eq!(serde_json::to_value(node).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn failed_runtime_config_publication_preserves_unowned_destination_before_spawn() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
+    std::fs::create_dir(&raw).unwrap();
+    std::fs::write(raw.join("sentinel"), b"unowned destination").unwrap();
+    std::fs::write(&kept, b"previous archive").unwrap();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read(raw.join("sentinel")).unwrap(),
+        b"unowned destination"
+    );
+    assert_eq!(std::fs::read(&kept).unwrap(), b"previous archive");
+    assert!(!std::fs::read_dir(&h.dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    cleanup(&h.dir);
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+mod private_temp_config_regressions;
+mod temp_config_writer_regressions;

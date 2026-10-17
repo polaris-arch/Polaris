@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::proxy::startup::kernel_gate_cache_record;
 use polaris_config_engine::singbox::RouteRule;
 use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, BLOCK_TAG};
 use polaris_core_supervisor::{PortAllocator, PortExclusions};
@@ -2051,7 +2052,7 @@ async fn uncancelled_start_still_burns_the_whole_retry_budget() {
 }
 
 #[tokio::test]
-async fn sync_custom_rule_files_updates_content_but_never_deletes() {
+async fn sync_custom_rule_files_without_native_confirmation_never_writes_or_deletes() {
     let (rt, _dir) = test_runtime();
     let crdir = rt.custom_rules_dir();
     std::fs::create_dir_all(&crdir).unwrap();
@@ -2061,11 +2062,20 @@ async fn sync_custom_rule_files_updates_content_but_never_deletes() {
     let cfg = smart_config_with_ext_rule();
     let expected = build_custom_rule_files(&cfg);
 
-    rt.sync_custom_rule_files(&cfg).await;
+    assert!(
+        !rt.sync_custom_rule_files(
+            &cfg,
+            rt.gate.generation(),
+            rt.selector_reconcile.intent_generation()
+        )
+        .await
+    );
 
-    // 期望文件被写（内容变 → 原子替换）。
-    for (name, content) in &expected {
-        assert_eq!(&std::fs::read_to_string(crdir.join(name)).unwrap(), content);
+    for name in expected.keys() {
+        assert!(
+            !crdir.join(name).exists(),
+            "no confirmation capability must not publish bytes"
+        );
     }
     // 绝不删：本轮期望集外的既存文件仍在（删除只在起核 write_custom_rule_files 清扫）。
     assert!(
@@ -3589,6 +3599,7 @@ fn kernel_gate_cache_round_trips_atomically_and_corruption_is_a_miss() {
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path: dir.join("sing-box").to_string_lossy().into_owned(),
         binary_len: 42,
+        binary_sha256: "b".repeat(64),
         binary_modified_ns: 123,
         config_sha256: "a".repeat(64),
     };
@@ -4585,12 +4596,29 @@ fn the_management_secret_has_a_single_reader() {
             })
             .count()
     }
+    // module_files includes both the module root file and its descendant directory.
+    fn belongs_to_module(path: &str, dir: &str) -> bool {
+        (path == format!("{dir}.rs") || path.starts_with(format!("{dir}/").as_str()))
+            && !path.starts_with(format!("{dir}/{dir}/").as_str())
+    }
+    for dir in ["runtime", "commands"] {
+        assert!(belongs_to_module(&format!("{dir}.rs"), dir));
+        assert!(belongs_to_module(&format!("{dir}/nested/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}/{dir}/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}_other/reader.rs"), dir));
+        assert!(!belongs_to_module("other/reader.rs", dir));
+    }
     let mut found: Vec<(String, usize, usize)> = ["runtime", "commands"]
         .into_iter()
         .flat_map(|dir| {
             crate::test_support::module_files(dir)
                 .into_iter()
-                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+                .inspect(move |(path, _)| {
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
+                })
         })
         .filter_map(|(path, source)| {
             let code = polaris_source_probe::mask_comments(&source);
@@ -4621,7 +4649,12 @@ fn the_management_secret_has_a_single_reader() {
         .flat_map(|dir| {
             crate::test_support::module_files(dir)
                 .into_iter()
-                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+                .inspect(move |(path, _)| {
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
+                })
         })
         .filter(|(_, source)| {
             polaris_source_probe::mask_comments(source).contains("fn management_endpoint(")
@@ -4640,5 +4673,69 @@ fn occupied_helper_capability_has_a_dedicated_content_resource_error() {
     assert_eq!(
         birth_capability_error_code(&error),
         code::HELPER_CORE_OCCUPIED
+    );
+}
+
+#[test]
+fn accepted_config_cache_changes_when_core_bytes_change_with_same_path_size_and_mtime() {
+    let dir = fresh_test_dir();
+    let core = dir.join("core");
+    std::fs::write(&core, b"original").unwrap();
+    let modified = std::fs::metadata(&core).unwrap().modified().unwrap();
+    let config = test_singbox_config(vec![], vec![]);
+    let before = kernel_gate_cache_record(&core, &config).unwrap();
+    std::fs::write(&core, b"replaced").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&core)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let after = kernel_gate_cache_record(&core, &config).unwrap();
+    assert_eq!(before.binary_path, after.binary_path);
+    assert_eq!(before.binary_len, after.binary_len);
+    assert_eq!(before.binary_modified_ns, after.binary_modified_ns);
+    assert_ne!(before.binary_sha256, after.binary_sha256);
+    assert_ne!(before, after);
+}
+
+/// Use the same retained-proof validator as each production gate iteration.
+/// Eviction cannot veto unchanged bytes or allow a replacement to inherit them.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement() {
+    use crate::runtime::proxy::startup::validate_startup_cli_proof;
+    use crate::runtime::tls_fingerprints::{cached_cli, probe_cli, probe_cli_observation};
+    let (_rt, dir) = test_runtime();
+    let binary = dir.join("startup-proof");
+    std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+    let proof = probe_cli_observation(&binary).await.unwrap();
+    for index in 0..4 {
+        let other = dir.join(format!("startup-cache-pressure-{index}"));
+        std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+        assert!(probe_cli(&other).await.binary_sha256.is_some());
+    }
+    assert!(
+        cached_cli(&binary).is_none(),
+        "exercise actual cache eviction"
+    );
+    validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)).unwrap();
+    assert!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, None).is_err(),
+        "a missing retained proof must not be accepted merely because cache eviction is allowed"
+    );
+    let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
+    let replacement = dir.join("startup-replacement");
+    std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    assert_eq!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)),
+        Err("Core bytes changed after capability query; retry startup".into())
     );
 }

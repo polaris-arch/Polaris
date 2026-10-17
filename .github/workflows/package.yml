@@ -1084,23 +1084,30 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pinned CLI 2.12.1 emits bundler child stdout/stderr only at Debug.
+          # This changes logging, not the Cargo arguments or DMG/Finder behavior.
+          TAURI_CLI_VERBOSITY: ${{ runner.os == 'macOS' && '1' || '' }}
+          POLARIS_TAURI_LOG: ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
         with:
-          tauriScript: tauri
+          tauriScript: ${{ runner.os == 'macOS' && 'bash scripts/macos-bundler-diagnostics.sh' || 'tauri' }}
           args: ${{ matrix.tauri_args }}
+          retryAttempts: 0
 
-      # Preserve the failed bundler's generated inputs and existing logs once.
-      # Do not rerun a failed DMG script, replace the failure, or rebuild here.
-      - name: Preserve failed macOS bundler evidence
-        if: failure() && runner.os == 'macOS' && steps.installers.outcome == 'failure'
+      # Save the original attempt's full output even when compilation/bundling
+      # fails or is cancelled. The log lives outside the directory Tauri resets.
+      # Never rerun bundle_dmg.sh or convert a failed installer into success.
+      - name: Preserve macOS bundler evidence
+        if: always() && runner.os == 'macOS' && steps.installers.outcome != 'skipped' && steps.installers.outcome != ''
         uses: actions/upload-artifact@v7
         with:
-          name: macos-bundler-failure-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
+          name: macos-bundler-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
           path: |
+            ${{ runner.temp }}/polaris-tauri-${{ matrix.label }}.log
             target/*/release/bundle/dmg/bundle_dmg.sh
             target/*/release/bundle/dmg/*.log
             target/release/bundle/dmg/bundle_dmg.sh
             target/release/bundle/dmg/*.log
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
       # Tauri 2.11 / linuxdeploy 会把 Ubuntu 22.04 的 libwayland-* 一并塞进 AppImage；在

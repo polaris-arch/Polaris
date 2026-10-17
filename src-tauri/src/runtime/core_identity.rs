@@ -259,8 +259,7 @@ pub(crate) fn stage_installation(
     Ok(stage)
 }
 
-/// Hash the same open regular object, not a path reopened after validation.
-pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<(), String> {
+fn open_payload_directory(dir: &Path) -> Result<polaris_helper::core_objects::PayloadDir, String> {
     #[cfg(unix)]
     let owner = {
         use std::os::unix::fs::MetadataExt;
@@ -272,8 +271,13 @@ pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<()
     };
     #[cfg(not(unix))]
     let owner = None;
-    let objects = polaris_helper::core_objects::PayloadDir::open(dir, owner)
-        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid payload directory")?;
+    polaris_helper::core_objects::PayloadDir::open(dir, owner)
+        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid payload directory".to_owned())
+}
+
+/// Hash the same open regular object, not a path reopened after validation.
+pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<(), String> {
+    let objects = open_payload_directory(dir)?;
     manifest
         .validate()
         .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid manifest")?;
@@ -296,7 +300,145 @@ pub(crate) fn verify_directory(dir: &Path, manifest: &CoreManifest) -> Result<()
     Ok(())
 }
 
-pub(crate) fn verify_bundled(core: &Path) -> Result<(), String> {
+/// A prior full content verification may be reused only as a lightweight
+/// invalidation observation, never as permission to launch/install a payload.
+#[derive(Clone, Debug)]
+pub(crate) struct BundleObservation {
+    files: Vec<BundleFileObservation>,
+}
+#[derive(Clone, Debug)]
+struct BundleFileObservation {
+    path: PathBuf,
+    file: std::sync::Arc<std::fs::File>,
+    stamp: String,
+    #[cfg(windows)]
+    identity: (u64, [u8; 16]),
+}
+fn bundle_file_stamp(metadata: &std::fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.mode(),
+            metadata.uid()
+        )
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}",
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_size(),
+            metadata.file_attributes()
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        format!("{:?}", metadata)
+    }
+}
+impl BundleObservation {
+    fn capture(dir: &Path, manifest: &CoreManifest) -> Result<Self, String> {
+        // Linux has a real bundled sidecar. Never open it by a blocking path
+        // before validation: reuse the original directory-relative, no-follow,
+        // nonblocking regular-file primitive and retain that exact handle.
+        #[cfg(target_os = "linux")]
+        let objects = open_payload_directory(dir)?;
+        let files = manifest
+            .files
+            .iter()
+            .map(|expected| {
+                let path = dir.join(&expected.name);
+                #[cfg(target_os = "linux")]
+                let (file, _) = objects
+                    .open_regular(&expected.name)
+                    .map_err(|e| e.to_string())?;
+                #[cfg(not(target_os = "linux"))]
+                let file = {
+                    let mut options = std::fs::OpenOptions::new();
+                    options.read(true);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::OpenOptionsExt;
+                        options.share_mode(5); // No in-place writes; normal atomic replacement remains possible.
+                    }
+                    options.open(&path).map_err(|e| e.to_string())?
+                };
+                let stamp = bundle_file_stamp(&file.metadata().map_err(|e| e.to_string())?);
+                #[cfg(windows)]
+                let identity =
+                    crate::windows_file_id::identity(&file).map_err(|e| e.to_string())?;
+                Ok(BundleFileObservation {
+                    path,
+                    file: std::sync::Arc::new(file),
+                    stamp,
+                    #[cfg(windows)]
+                    identity,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { files })
+    }
+    pub(crate) fn is_current(&self) -> bool {
+        self.files.iter().all(|observed| {
+            if !observed
+                .file
+                .metadata()
+                .is_ok_and(|m| bundle_file_stamp(&m) == observed.stamp)
+            {
+                return false;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&observed.path) else {
+                return false;
+            };
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || bundle_file_stamp(&metadata) != observed.stamp
+            {
+                return false;
+            }
+            #[cfg(windows)]
+            {
+                let actual = std::fs::File::open(&observed.path)
+                    .and_then(|file| crate::windows_file_id::identity(&file));
+                if actual.ok() != Some(observed.identity) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+}
+
+pub(crate) fn verify_directory_observed(
+    dir: &Path,
+    manifest: &CoreManifest,
+) -> Result<BundleObservation, String> {
+    // Bracket the existing full core + sidecar content check with the same
+    // retained objects. A replacement during verification cannot become a receipt.
+    manifest
+        .validate()
+        .map_err(|_| "CORE_BUNDLE_MISMATCH: invalid manifest")?;
+    let observation = BundleObservation::capture(dir, manifest)
+        .map_err(|reason| format!("CORE_BUNDLE_MISMATCH: cannot observe payload: {reason}"))?;
+    verify_directory(dir, manifest)?;
+    if !observation.is_current() {
+        return Err("CORE_BUNDLE_MISMATCH: payload changed during verification".into());
+    }
+    Ok(observation)
+}
+
+pub(crate) fn verify_bundled(core: &Path) -> Result<BundleObservation, String> {
     let dir = core
         .parent()
         .ok_or("CORE_BUNDLE_MISMATCH: missing directory")?;
@@ -314,7 +456,7 @@ pub(crate) fn verify_bundled(core: &Path) -> Result<(), String> {
     {
         return Err("CORE_BUNDLE_MISMATCH: unexpected binary name".into());
     }
-    verify_directory(dir, &manifest)
+    verify_directory_observed(dir, &manifest)
 }
 
 #[cfg(test)]

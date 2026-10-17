@@ -1424,6 +1424,11 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
         "实际执行完整监视器会话测试类。",
     ),
     (
+        "            --tests com.polaris2.app.vpn.LoadedLibboxIdentityTest \\",
+        1,
+        "实际执行冷启动等待和已加载文件身份回归测试类。",
+    ),
+    (
         "            -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon",
         1,
         "JUnit 仅跳过本 job 已完成的 Rust build，不跳过编译、测试或签名策略。",

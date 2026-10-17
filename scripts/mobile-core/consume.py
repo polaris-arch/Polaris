@@ -16,7 +16,7 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import ROOT, canonical, load, require, sha
+from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha
 from artifacts import receipt_digest, component_output_identity, file_pin, inspect_aar, inspect_framework, read_receipt
 from producer import ACTIVE_FDS, lease, run, write_json
 from budget import group_alive, register_group
@@ -74,7 +74,8 @@ def bounded_source_status(command, deadline):
     """Drain capped pipes while the child runs; never communicate/full-buffer it."""
     raw, stderr_bytes, process, reason = bytearray(), 0, None, None
     try:
-        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        require_git_root(ROOT)
+        process = subprocess.Popen(command, cwd=ROOT, env=git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True, pass_fds=tuple(ACTIVE_FDS))
         register_group(process.pid)
         with selectors.DefaultSelector() as selected:
@@ -231,12 +232,12 @@ def app_identity(*, status_log=None):
     return {'candidate': run(['git', 'rev-parse', 'HEAD'], cwd=ROOT).strip(),
             'consumerCode': {name: file_pin(ROOT / name) for name in
                 ['scripts/mobile-core/consume.py', 'scripts/mobile-core/artifacts.py',
-                 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/carriers.py',
+                 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py', 'scripts/mobile-core/carriers.py',
                  'scripts/mobile-core/source-contract.json', 'scripts/mobile-core/transaction.py',
                  'scripts/mobile-core/native_inputs.py', 'src-tauri/gen/apple/project.yml',
                  'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
                  'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',
-                 'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
+                 'scripts/release-assets.mjs', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/apple_handoff.py',
                  'scripts/mobile-core/apple_admission.py']}}
 

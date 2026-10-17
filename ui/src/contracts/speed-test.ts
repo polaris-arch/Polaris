@@ -88,6 +88,8 @@ export interface SpeedTestResultIdentity {
   context: 'connected' | 'disconnected';
   instance: SpeedTestInstance;
   configDigest: string | null;
+  /** Hash of observed CLI/JNI, or containing PacketTunnel executable; absent on historical receipts. */
+  coreBinarySha256?: string | null;
   nodeFingerprint: string | null;
   networkEpoch: number | null;
   /** 后端出结果那一刻的 Unix 毫秒。 */

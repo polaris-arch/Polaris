@@ -411,11 +411,10 @@ fn collect_hosts_deep(obj: &Value, out: &mut Vec<String>) {
         }
         Value::Object(m) => {
             for (k, v) in m {
-                if let Some(s) = v.as_str() {
-                    if HOST_KEYS.contains(&normalize_key(k).as_str()) {
-                        out.push(s.to_string());
-                    }
-                } else if v.is_object() || v.is_array() {
+                if HOST_KEYS.contains(&normalize_key(k).as_str()) {
+                    collect_host_values(v, out);
+                }
+                if v.is_object() || v.is_array() {
                     collect_hosts_deep(v, out);
                 }
             }
@@ -426,6 +425,16 @@ fn collect_hosts_deep(obj: &Value, out: &mut Vec<String>) {
 
 /// 收集 transport headers 里的 Host 值（节点伪装域名）。大小写不敏感匹配 `host` 键；值兼容
 /// string（`WebSocketSettings.headers`）与 string[]（`HttpSettings.headers`）。ws / http 共用。
+fn collect_host_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => {
+            out.extend(items.iter().filter_map(Value::as_str).map(str::to_owned))
+        }
+        _ => {}
+    }
+}
+
 fn add_host_headers(headers: Option<&Value>, out: &mut Vec<String>) {
     let Some(Value::Object(m)) = headers else {
         return;
@@ -434,17 +443,7 @@ fn add_host_headers(headers: Option<&Value>, out: &mut Vec<String>) {
         if !k.eq_ignore_ascii_case("host") {
             continue;
         }
-        match v {
-            Value::String(s) => out.push(s.clone()),
-            Value::Array(items) => {
-                for x in items {
-                    if let Some(s) = x.as_str() {
-                        out.push(s.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        collect_host_values(v, out);
     }
 }
 

@@ -22,19 +22,18 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE,
-    INVALID_HANDLE_VALUE, NO_ERROR,
+    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -43,6 +42,9 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::System::IO::CancelIoEx;
+
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
 
 /// 命名管道实例数（accept 循环预创建的并行实例）。镜像 go-winio 默认行为。
 const PIPE_INSTANCES: u32 = 4;
@@ -109,7 +111,6 @@ pub fn run_console(cfg: ServiceConfig) -> std::io::Result<()> {
     ctrl_c_handler(move || match helper_for_stop.reap_child_on_exit() {
         Ok(()) => {
             STOP_REQUESTED.store(true, Ordering::SeqCst);
-            wake_accept_loop();
         }
         Err(error) => {
             log::error!("console shutdown unconfirmed; helper custody retained: {error}");
@@ -185,8 +186,8 @@ where
         };
         // 建成了一个实例 ⇒ 从此管道名已存在，后续再带首实例 flag 必被拒。
         first = false;
-        // ConnectNamedPipe 阻塞等客户端连接。
-        if connect_pipe(h) {
+        // Poll connection admission so service stop is observed even without a client.
+        if connect_pipe_until_stopped(h, || STOP_REQUESTED.load(Ordering::SeqCst)) {
             let helper = helper.clone();
             // HANDLE = *mut c_void 非 Send；先包成 SendHandle 再 move 入 spawned 线程（句柄在
             // handle_connection 内仅本线程独占使用，CloseHandle 也在内部，无并发访问）。
@@ -272,11 +273,45 @@ fn create_pipe_instance(name_w: &[u16], sddl_w: &[u16], first: bool) -> std::io:
     Ok(h)
 }
 
+/// Polling admission has no one-shot wake race before pipe creation. Only
+/// ERROR_PIPE_CONNECTED indicates a connected client in PIPE_NOWAIT mode;
+/// nonzero success merely makes the pipe available to a future client.
+#[allow(unsafe_code, reason = "owned synchronous pipe mode and accept polling")]
+fn connect_pipe_until_stopped(h: HANDLE, mut stopped: impl FnMut() -> bool) -> bool {
+    let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;
+    if unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+        return false;
+    }
+    loop {
+        if stopped() {
+            return false;
+        }
+        let available = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+        if available == 0 {
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if error == ERROR_PIPE_CONNECTED {
+                if stopped() {
+                    return false;
+                }
+                let blocking = PIPE_WAIT | PIPE_READMODE_BYTE;
+                return unsafe {
+                    SetNamedPipeHandleState(h, &blocking, std::ptr::null(), std::ptr::null())
+                } != 0;
+            }
+            if error != ERROR_PIPE_LISTENING {
+                return false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// ConnectNamedPipe：等客户端连接。返回 true = 已连接，false = 中断/失败。
 #[allow(
     unsafe_code,
     reason = "ConnectNamedPipe synchronously borrows the live pipe HANDLE"
 )]
+#[cfg(test)]
 fn connect_pipe(h: HANDLE) -> bool {
     // SAFETY: ConnectNamedPipe 阻塞等连接（PIPE_WAIT，lpOverlapped=NULL）。返回 0 = 失败。
     let ok = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
@@ -337,7 +372,6 @@ where
         match helper.reap_child_on_exit() {
             Ok(()) => {
                 STOP_REQUESTED.store(true, Ordering::SeqCst);
-                wake_accept_loop();
             }
             Err(error) => log::error!("uninstall exit unconfirmed; helper retained: {error}"),
         }
@@ -638,7 +672,6 @@ extern "system" fn ctrl_handler(
                 let _ = set_status(h as SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, 0);
             }
             // A synchronous ConnectNamedPipe needs a self-connection to wake.
-            wake_accept_loop();
         },
     )
 }
@@ -658,48 +691,6 @@ fn handle_control(
             NO_ERROR
         }
         _ => NO_ERROR, // Preserve the existing handling of other control codes.
-    }
-}
-
-/// 唤醒阻塞在 `ConnectNamedPipe` 上的 accept 循环 —— 对自己的管道做一次连接即可。
-///
-/// # 为什么是自连接而不是 `CancelIoEx`
-///
-/// 监听句柄是 `serve` 的**函数局部变量**，`ctrl_handler` 在结构上够不到它；要用 `CancelIoEx`
-/// 就得把句柄存进 static 并处理「已被工作线程 move 走」的置空竞态。自连接不碰句柄所有权，
-/// 且被唤醒的那一帧会走进 `handle_connection` 后立刻读到 EOF（本函数连上就关）自然收尾。
-///
-/// 成功与否都不重要：目的只是让 `ConnectNamedPipe` 返回一次。管道已不存在（服务正在收尾）
-/// 时 `CreateFileW` 失败，那说明监听本来就没了，同样无需唤醒。
-///
-/// # 不修会怎样
-///
-/// 应用内卸载腿 `clear_token()` 先删了 app 侧 token，其后的状态查询因 token 为空**早返不 ping**
-/// ⇒ 没有任何客户端来解阻塞，服务留着运行中的 SYSTEM 进程 + 删不掉的 `polaris-helper.exe`
-/// 到重启（NSIS 卸载钩子同理且更彻底：app 已退出）。安装/修复腿则会被自身的状态探测解阻塞，
-/// 表现为「第一次莫名失败、第二次成功」。
-#[allow(
-    unsafe_code,
-    reason = "opens and immediately closes one self-connection HANDLE"
-)]
-fn wake_accept_loop() {
-    let name_w = wide_null(OsString::from(PIPE_NAME));
-    // SAFETY: 对本进程自己的管道名发起一次连接。所有指针参数为 NULL（无 SA / 无模板句柄），
-    // 返回 INVALID_HANDLE_VALUE 表示失败（此处失败即无需唤醒）。
-    let h = unsafe {
-        CreateFileW(
-            name_w.as_ptr(),
-            0, // 不需要任何访问权限：连上即达目的，不读不写
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if h != INVALID_HANDLE_VALUE {
-        // SAFETY: 关掉这条只用于唤醒的连接；服务端那帧随即读到 EOF 收尾。
-        unsafe { CloseHandle(h) };
     }
 }
 

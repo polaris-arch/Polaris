@@ -1,3 +1,4 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * 设置 → 网络（移动端）。桌面对照：`components/screens/settings/SettingsNetwork.tsx`（六块）。
  *
@@ -31,6 +32,7 @@ import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-
 import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
 import type { SpeedTestMeteredPolicy } from '@/contracts/types';
+import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { MobileSelect, MobileSwitch, MobileTextInput, SettingsGroup, SettingsRow } from './SettingsChrome';
 import type { MobileSettingsPageProps } from './settings-pages';
 
@@ -48,6 +50,7 @@ const DEFAULT_SPEED_TEST_URL = 'http://www.gstatic.com/generate_204';
 
 export function NetworkPage({ config, update, commit }: MobileSettingsPageProps): ReactElement {
   const { t } = useTranslation();
+  const tlsFingerprints = useTlsFingerprints();
   const interfaces = useNetworkInterfaces();
   const directInterface = config.networkInterfaces?.direct ?? '';
   const proxyInterface = config.networkInterfaces?.proxy ?? '';
@@ -212,6 +215,16 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
               <option value="off">{t('settings.network.webrtcLeakOff')}</option>
               <option value="proxy">{t('settings.network.webrtcLeakProxy')}</option>
               <option value="block">{t('settings.network.webrtcLeakBlock')}</option>
+            </MobileSelect>
+          }
+        />
+        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={t('settings.utls.description') + ' ' + (tlsFingerprintStatus(tlsFingerprints, t) ?? '')}
+          control={
+            <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
+              onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
+              {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
+                <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
+              ))}
             </MobileSelect>
           }
         />

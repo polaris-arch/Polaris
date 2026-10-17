@@ -1482,6 +1482,12 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    (
+        "crates/config-engine/src/user_config/utls.rs",
+        "\"windows\" => \"win32\", \"macos\" => \"darwin\", other => other,",
+        1,
+        "Only host OS spellings windows/macos become existing builder aliases. iOS and unknown platform strings remain unchanged; ios is never relabeled darwin to enable a foreign native TLS engine.",
+    ),
     ("crates/helper-proto/src/core_manifest.rs",
      "\"linux\" => Platform::Linux, \"win\" => Platform::Win, \"mac-x64\" | \"mac-arm64\" => Platform::Mac, _ => return Err(\"core-platform-invalid\"),", 1,
      "The core manifest source-contract axis accepts exactly the four desktop App rows. Android/iOS and unknown strings return an error; the cleaner and complete payload checks then use the resolved desktop platform."),
@@ -2310,6 +2316,142 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    // Retained CLI-observation evidence, from the b84e correction batch.
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "The gate obtains mobile capabilities from the loaded native container; both mobile platforms exclude the separate CLI observation. This is source dispatch evidence, not device execution.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        4,
+        IosSide::WithAndroid,
+        "Desktop CLI observation acquisition, snapshot selection, per-iteration retained-proof validation and the proof validator exclude both mobile platforms. Actual file replacement still fails; bounded-cache eviction does not invalidate retained evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "any(target_os = \"linux\", target_os = \"android\", target_os = \"ios\")",
+        2,
+        IosSide::WithAndroid,
+        "The Path import and capabilities-for helper remain used by Linux and both mobile callers; macOS/Windows now consume retained CLI observations directly. Android and iOS both compile their native capability branch, not a desktop process proof.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        1,
+        IosSide::WithAndroid,
+        "Desktop temporary measurement acquires and retains the exact CLI observation returned by the probe; both mobile platforms exclude this file-evidence acquisition and keep their existing native/unavailable paths.",
+    ),
+
+    // Current uTLS capability/byte-identity sites; existing iOS debt verdicts remain unchanged.
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        4,
+        IosSide::WithAndroid,
+        "Both mobile platforms retain/query native container digests rather than a desktop CLI source handle. The shared metadata does not prove a handshake or independent temporary CLI support.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        6,
+        IosSide::WithAndroid,
+        "Retained CLI run/source handles, desktop selection observation and direct/helper executable byte checks are desktop-only. iOS and Android both use native loaded-container identity instead.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "The temporary digest producer queries the Android loaded-libbox bridge. iOS has no Android JNI bridge and retains its separate platform path.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/android_bridge.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Loaded TLS capability query calls the actual Android bridge. iOS queries PacketTunnel through its own bridge; the Android-only call cannot be reused as iOS evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/process_supervision.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        1,
+        IosSide::WithAndroid,
+        "tls_ready_binary_for_pid derives desktop retained Child/helper CLI identity. Neither mobile platform may use a pathname/PID as proof of a loaded native container.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Both mobile start paths capture the actual platform-native main identity, without granting a desktop executable-source handle or substituting a CLI query.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        5,
+        IosSide::WithAndroid,
+        "CLI capability capture, proven source handles and retained run attachment surround desktop birth. Android and iOS both exclude this separate process birth path.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Both mobile temporary-capability callers query the current native container; neither treats an arbitrary CLI binary path as its loaded libbox.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        4,
+        IosSide::WithAndroid,
+        "Desktop capability resolution binds retained Child custody or admitted CLI file identity. Both mobile platforms exclude these desktop methods and use their own native query.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android reads actual loaded libbox capabilities and byte identity via JNI; iOS must use the PacketTunnel query below, never this JNI response.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "iOS reads PacketTunnel capability bytes with its own loaded native container identity. This platform query is not an Android JNI result or proof of a network negotiation.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        2,
+        IosSide::WithAndroid,
+        "Desktop temporary CLI capability probing and cached executable-digest recheck exclude both mobile platforms. iOS cannot borrow desktop process evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"android\"",
+        1,
+        IosSide::DiffersRight,
+        "Android temporary measurements consume its loaded-libbox capability bridge; iOS has no independent temporary CLI and takes its explicit unavailable branch.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "target_os = \"ios\"",
+        1,
+        IosSide::DiffersRight,
+        "The iOS temporary CLI capability branch explicitly reports unavailable. It neither invents Android support nor changes the existing independent-temp restriction.",
+    ),
+    (
+        "src-tauri/src/runtime/tls_fingerprints.rs",
+        "any(test, target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "from_native parses loaded-container reports for both mobile platforms; host tests retain the same parser seam. Production desktop uses its CLI path, and parser availability does not attest native execution.",
+    ),
     (
         "src-tauri/src/runtime/startup_tasks.rs",
         "desktop",
@@ -3157,7 +3299,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
         "all(test, not(target_os = \"android\"))",
         6,
         IosSide::WithAndroid,
-        "两 Foreign variant 与四 getter/corruption/replay assertion helper 是 Unix-only tests；独立 cfg(unix) 与本 test/non-Android 谓词合取，等价保留原构型。eval_cfg 的 test 在 release/debug 均 false，两移动端同侧；不向跨 mobile 谓词词表添加 unix。",
+        "两 Foreign variant 与四 getter/corruption/replay assertion helper 是 Unix-only tests；独立 cfg(unix) 与本 test/non-Android 谓词合取，等价保留原构型。eval_cfg 的 test 在 release/debug 均 false，两移动端同侧；此旧测试组登记保持原样；G4 的生产 Unix 合取另由封闭 target-family 映射求值。",
     ),
     (
         "src-tauri/src/runtime/speedtest.rs",
@@ -3328,6 +3470,140 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "member_counts在Android上Temp成员恒报0：Android测速走进程内libbox，没有PC Temp custody可普查。iOS不编此腿；它错误继承桌面Temp视图的事实在同文件not(android)条目单独登记为债。",
     ),
+    // G4 source-only accounting; historical debt verdicts remain intact.
+    (
+        "src-tauri/src/runtime/config.rs",
+        "any(target_os = \"ios\", windows)",
+        1,
+        IosSide::DiffersRight,
+        "New directory intents use platform-specific retained directory custody on iOS and Windows; historical unbound intents are not upgraded. Android keeps its prior path. This records source dispatch only, not device or protocol acceptance.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "all(target_os = \"ios\", unix)",
+        1,
+        IosSide::DiffersRight,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"ios\", target_os = \"android\", test)",
+        1,
+        IosSide::WithAndroid,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "not(any(target_os = \"ios\", target_os = \"android\", test))",
+        1,
+        IosSide::WithAndroid,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "not(any(target_os = \"ios\", windows))",
+        3,
+        IosSide::DiffersRight,
+        "Legacy state helpers are excluded on iOS and Windows, whose mapped directory identity and custody have separate implementations. Android keeps its existing legacy branch; no native acceptance is inferred.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "target_os = \"ios\"",
+        4,
+        IosSide::DiffersRight,
+        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "not(any(target_os = \"ios\", windows))",
+        1,
+        IosSide::DiffersRight,
+        "The explicit unsupported directory-retirement fallback is excluded on iOS and Windows only; each owns its separate bound lease path, while Android continues to reject this unavailable contract.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "target_os = \"ios\"",
+        3,
+        IosSide::DiffersRight,
+        "G4 borrows the original iOS Stop target and scoped directory receipt through exclusive lease and durable journal acknowledgement. Other platforms retain an explicit unavailable result. This registration does not authorize global cleanup or assert a device Stop.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 keeps logical iOS managed config bytes in memory until original-provider capability admission; other platforms retain the existing config-file write. Native startup acceptance remains separate.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory.rs",
+        "all(target_os = \"ios\", unix)",
+        2,
+        IosSide::DiffersRight,
+        "G4 admits iOS native directory commit/resume and terminal-history filtering; generic host fixtures do not mint native custody. Both iOS and Android satisfy the closed Unix target-family map, with iOS selecting its explicit native branch.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory.rs",
+        "any(target_os = \"ios\", test)",
+        1,
+        IosSide::DiffersRight,
+        "G4 admits iOS native directory commit/resume and terminal-history filtering; generic host fixtures do not mint native custody. Both iOS and Android satisfy the closed Unix target-family map, with iOS selecting its explicit native branch.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "any(target_os = \"ios\", test)",
+        17,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "not(target_os = \"ios\")",
+        1,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_directory/unix.rs",
+        "target_os = \"ios\"",
+        2,
+        IosSide::DiffersRight,
+        "G4 scopes mapping, marker mutation and retirement helpers/fields to iOS or host tests. Existing acquire, path lookup and committed-intent journal checks remain all-Unix production. No local compile, test or device result is claimed by this source inventory.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "any(target_os = \"ios\", test)",
+        1,
+        IosSide::DiffersRight,
+        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "not(any(target_os = \"ios\", windows))",
+        1,
+        IosSide::DiffersRight,
+        "Directory snapshots retain the logical path only outside iOS and Windows; those platforms resolve their own physical identity before the snapshot. This does not attest writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/tailscale_login_core.rs",
+        "target_os = \"ios\"",
+        3,
+        IosSide::DiffersRight,
+        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"ios\", windows)",
+        1,
+        IosSide::DiffersRight,
+        "Whole-directory logout requires a bound intent and custody on both iOS and Windows; Android retains its separate path. The iOS side and its existing verdict are unchanged.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "any(target_os = \"ios\", windows)",
+        2,
+        IosSide::DiffersRight,
+        "iOS and Windows retain exclusive directory leases until durable journal acknowledgement and reject legacy unbound intents. Each has a distinct platform commit path; Android keeps its explicit unavailable result. Source registration is not a native Stop or SYSTEM interoperability receipt.",
+    ),
 ];
 
 // ── cfg 轴的取材与求值 ──
@@ -3450,6 +3726,17 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
     match p {
         "test" => Some(false),
         "debug_assertions" => Some(env.debug_assertions),
+        // Closed target-family mapping for the supported App targets.
+        "unix" => match env.target_os {
+            "ios" | "android" | "linux" | "macos" => Some(true),
+            "windows" => Some(false),
+            _ => None,
+        },
+        "windows" => match env.target_os {
+            "windows" => Some(true),
+            "ios" | "android" | "linux" | "macos" => Some(false),
+            _ => None,
+        },
         "desktop" => Some(env.desktop),
         "mobile" => Some(env.mobile),
         _ => p
@@ -3491,6 +3778,55 @@ fn cfg_evaluator_answers_both_ways() {
         eval_cfg("any(target_os = \"android\", test)", IOS_ENV),
         Some(false)
     );
+    assert_eq!(eval_cfg("unix", IOS_ENV), Some(true));
+    assert_eq!(eval_cfg("unix", ANDROID_ENV), Some(true));
+    assert_eq!(
+        eval_cfg(
+            "unix",
+            CfgEnv {
+                target_os: "windows",
+                ..IOS_ENV
+            }
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        eval_cfg(
+            "unix",
+            CfgEnv {
+                target_os: "unregistered",
+                ..IOS_ENV
+            }
+        ),
+        None
+    );
+    assert_eq!(eval_cfg("windows", IOS_ENV), Some(false));
+    assert_eq!(eval_cfg("windows", ANDROID_ENV), Some(false));
+    for (target_os, expected) in [
+        ("windows", Some(true)),
+        ("linux", Some(false)),
+        ("macos", Some(false)),
+        ("unregistered", None),
+    ] {
+        assert_eq!(
+            eval_cfg(
+                "windows",
+                CfgEnv {
+                    target_os,
+                    ..IOS_ENV
+                }
+            ),
+            expected
+        );
+    }
+    assert_eq!(
+        cfg_side_profile("any(target_os = \"ios\", windows)"),
+        Some((false, false))
+    );
+    assert_eq!(
+        cfg_side_profile("not(any(target_os = \"ios\", windows))"),
+        Some((false, false))
+    );
     assert_eq!(eval_cfg("mobile", IOS_ENV), Some(true));
     assert_eq!(eval_cfg("desktop", IOS_ENV), Some(false));
     assert_eq!(eval_cfg("debug_assertions", IOS_ENV), Some(false));
@@ -3513,8 +3849,7 @@ fn cfg_evaluator_answers_both_ways() {
     for unknown in [
         "feature = \"x\"",
         "target_arch = \"arm\"",
-        "windows",
-        "unix",
+        "windows_unknown",
         "any(target_os = \"ios\", feature = \"x\")",
         "not(unknown_build_mode)",
     ] {
@@ -3592,7 +3927,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.is_empty(),
         "以下 cfg 谓词里出现了本门词表之外的原子：\n    {}\n\n\
          本门**不猜**：`eval_cfg` 的词表是封闭的（`target_os = \"…\"` / `desktop` / `mobile` / \
-         `test` / `debug_assertions` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
+         `test` / `debug_assertions` / `unix` / `windows` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
          `cfg_evaluator_answers_both_ways` 里正反各钉一条，要么这条谓词根本不该落在移动轴上。",
         unknown_atoms.join("\n    ")
     );
@@ -3806,10 +4141,13 @@ fn cfg_axis_platform_dispatch_is_registered() {
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 280),
+    ("DiffersRight", 331),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
-    ("WithAndroid", 91),
+    // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
+    // checked by eval_cfg for Android/iOS in both release/debug. No existing
+    // verdict or debt site changes; this does not claim device validation.
+    ("WithAndroid", 126),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

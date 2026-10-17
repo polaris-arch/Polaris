@@ -1641,6 +1641,7 @@ pub fn build_route_config_with_report(
         } else {
             // applyRuleSetPrune 操作整个 SingBoxConfig.route；这里构造只含 route 的壳（其它必填字段用最小值）。
             let mut singbox = crate::singbox::SingBoxConfig {
+                polaris_windows_directory: None,
                 log: crate::singbox::LogConfig {
                     level: "info".to_string(),
                     timestamp: false,

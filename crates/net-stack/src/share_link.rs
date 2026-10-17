@@ -777,6 +777,7 @@ fn parse_shadowsocks(
                 params.get_ne("shadow-tls-sni"),
             ) {
                 c.shadow_tls_settings = Some(ShadowTlsSettings {
+                    utls_mode: None,
                     password: pw,
                     sni,
                     fingerprint: normalize_token(
@@ -798,6 +799,7 @@ fn parse_shadowsocks(
             params.get_ne("shadow-tls-sni"),
         ) {
             c.shadow_tls_settings = Some(ShadowTlsSettings {
+                utls_mode: None,
                 password: pw,
                 sni,
                 fingerprint: normalize_token(
@@ -822,6 +824,7 @@ fn parse_shadowsocks(
                 let host = v.get("host").and_then(|x| x.as_str());
                 if let (Some(pw), Some(host)) = (pw, host) {
                     c.shadow_tls_settings = Some(ShadowTlsSettings {
+                        utls_mode: None,
                         password: pw.to_string(),
                         sni: host.to_string(),
                         fingerprint: Some("chrome".to_string()),
@@ -829,7 +832,7 @@ fn parse_shadowsocks(
                     });
                 }
             }
-            None => warn(format!("解析 shadow-tls Base64 JSON 参数失败: {raw}")),
+            None => warn("解析 shadow-tls Base64 JSON 参数失败".to_string()),
         }
     }
     Ok(c)
@@ -1394,7 +1397,13 @@ fn push_tls_params(q: &mut QueryString, tls: &TlsSettings) {
             q.push("alpn", alpn.join(","));
         }
     }
-    q.push_opt("fp", tls.fingerprint.clone());
+    q.push_opt(
+        "fp",
+        polaris_config_engine::user_config::utls::share_fingerprint(
+            tls.utls_mode,
+            tls.fingerprint.as_deref(),
+        ),
+    );
     if tls.allow_insecure == Some(true) {
         q.push("allowInsecure", "1");
     }
@@ -1720,6 +1729,23 @@ fn encode_shadowsocks(c: &ServerConfig) -> Result<String, String> {
         };
         q.push("plugin", full);
     }
+    if let Some(st) = &c.shadow_tls_settings {
+        if st.password.is_empty() || st.sni.is_empty() {
+            return Err("ShadowTLS 缺少 password/sni，无法无损分享".to_string());
+        }
+        q.push("shadow-tls-password", st.password.clone());
+        q.push("shadow-tls-sni", st.sni.clone());
+        q.push_opt(
+            "shadow-tls-fp",
+            polaris_config_engine::user_config::utls::share_fingerprint(
+                st.utls_mode,
+                st.fingerprint.as_deref(),
+            ),
+        );
+        if let Some(port) = st.port {
+            q.push("shadow-tls-port", port.to_string());
+        }
+    }
     Ok(assemble(
         "ss",
         Some(userinfo),
@@ -1848,7 +1874,10 @@ fn encode_vmess(c: &ServerConfig) -> Result<String, String> {
             if let Some(sni) = &tls.server_name {
                 obj.insert("sni".into(), json!(sni));
             }
-            if let Some(fp) = &tls.fingerprint {
+            if let Some(fp) = polaris_config_engine::user_config::utls::share_fingerprint(
+                tls.utls_mode,
+                tls.fingerprint.as_deref(),
+            ) {
                 obj.insert("fp".into(), json!(fp));
             }
             if let Some(alpn) = &tls.alpn {

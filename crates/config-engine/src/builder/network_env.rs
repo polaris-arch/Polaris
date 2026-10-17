@@ -575,6 +575,29 @@ pub fn dns_rule_uses_netenv(rule: &Rule, config: &UserConfig) -> bool {
         })
 }
 
+/// Default policy participates in the same dependency traversal as explicit rules.
+pub fn default_dns_uses_netenv(config: &UserConfig) -> bool {
+    config.config_schema_version.unwrap_or(0) >= 2
+        && config.dns_defaults.as_ref().is_some_and(|defaults| {
+            defaults.unmatched_action.as_ref().is_some_and(|action| {
+                action_refs_server(action, None, config, BUILTIN_NETENV_DHCP_ID)
+                    || (matches!(action, DnsPolicyAction::FakeIp)
+                        && defaults
+                            .real_query_fallback_action
+                            .as_ref()
+                            .is_some_and(|fallback| {
+                                fallback.is_valid_real_query_fallback()
+                                    && action_refs_server(
+                                        fallback,
+                                        None,
+                                        config,
+                                        BUILTIN_NETENV_DHCP_ID,
+                                    )
+                            }))
+            })
+        })
+}
+
 /// 本次是否需要生成 `dns-netenv`（spec §4.2「只在需要时生成」）：某条会生成的规则挂了解析为 dhcp 的
 /// 启用场景，或某条 DNS 规则的动作用到了 [`BUILTIN_NETENV_DHCP_ID`]——两者都以 dhcp transport 本机
 /// 本次可用为前提（不可用时那些规则整条剔除，生成它只会白绑一次 68）。否则一个字节都不变。
@@ -588,9 +611,10 @@ pub fn netenv_required(config: &UserConfig, facts: &ProbeFacts) -> bool {
         .filter(|r| dns_rule_is_candidate(r))
         .collect();
     let by_action = facts.dhcp_unavailable().is_none()
-        && dns_rules
-            .iter()
-            .any(|rule| dns_rule_uses_netenv(rule, config));
+        && (default_dns_uses_netenv(config)
+            || dns_rules
+                .iter()
+                .any(|rule| dns_rule_uses_netenv(rule, config)));
     if by_action {
         return true;
     }

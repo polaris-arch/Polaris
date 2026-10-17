@@ -1,3 +1,4 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * SettingsNetwork —— 网络子页（原型 [data-sec="network"] L2119-2169）。
  *
@@ -14,6 +15,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { useTranslation } from 'react-i18next';
 import type { SpeedTestMeteredPolicy, UserConfig } from '@/contracts/types';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
@@ -128,6 +130,7 @@ function generateSecret(): string {
 }
 
 export default function SettingsNetwork({ config, update }: SettingsNetworkProps) {
+  const tlsFingerprints = useTlsFingerprints();
   // i18n 实例：面板窗口的语言由 `open_singbox_dashboard(locale)` 预写，需当前语言码。
   const { t, i18n } = useTranslation();
   const openDialog = useDialogStore((state) => state.open);
@@ -501,6 +504,17 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
               { value: 'block', label: t('settings.network.webrtcLeakBlock') },
             ]}
           />
+        </SetRow>
+        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={tlsFingerprintStatus(tlsFingerprints, t)}>
+          <Select
+            value={config.utlsPolicy ?? 'follow'}
+            aria-label={t('settings.utls.label')}
+            onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
+          >
+            {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
+              <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
+            ))}
+          </Select>
         </SetRow>
         <SetRow
           label={t('settings.advanced.tlsFragment')}

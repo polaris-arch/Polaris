@@ -514,6 +514,16 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tls_fingerprints.rs': {
+    why: 'The shared capability parser now explicitly compiles from_native for Android/iOS and host tests. '
+      + 'Its loaded-container identity and schema handling enter the Android Rust cdylib and must be compiled in the APK leg. '
+      + 'Host parser controls cover invalid/unknown reports and byte identity; they do not attest device JNI execution or new kernel profiles.',
+  },
+  'src-tauri/src/runtime/proxy/tls_capabilities.rs': {
+    why: 'Actual Android TLS capability snapshots use the loaded-libbox JNI result and retained native byte identity. '
+      + 'These production cfg branches enter the APK Rust cdylib; Android check and APK compilation cover their types/linkage. '
+      + 'Host report/identity tests do not attest device JNI execution, ClientHello or final new-kernel profiles.',
+  },
   'scripts/release-assets.mjs': {
     why: 'Android 正式三包构建与聚合直接消费资产名、实际 ABI 集合及已验签字节摘要判据，须重验 APK 来源、内容与发布清单。',
   },
@@ -810,6 +820,18 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tailscale_directory.rs':
+    'G4 directory identity/terminal-epoch predicates are shared Rust bookkeeping; iOS alone admits native directory retirement. '
+    + 'Android target cargo check covers the Unix lease type surface, while host tests cover directory identity controls. '
+    + 'APK packaging does not execute filesystem custody or prove Android runtime deletion; no JNI, resource or Gradle contract changes.',
+  'src-tauri/src/runtime/tailscale_directory/':
+    'The canonical Unix lease implementation is compiled by both Android and Unix hosts; iOS-only mapping/retirement stays cfg-scoped. '
+    + 'Host-only tests remain behind cfg(test), outside APK targets. Android cargo check covers production types, not device lease or deletion behavior. '
+    + 'This module changes no APK asset, ABI or packaging input; real runtime validation remains separate.',
+  'src-tauri/src/runtime/proxy/process_supervision/tests/':
+    'Canonical cfg(test) G4 reload/Stop custody source guards and host fixtures, excluded from APK production. '
+    + 'Host cargo test --workspace owns these regressions; Android cargo check and APK builds do not compile this test target '
+    + 'or establish iOS provider/Go writer termination.',
   'src-tauri/src/runtime/speedtest_tunnel/tests/mod.rs':
     '宿主 TLS 测试模块：父 speedtest_tunnel.rs 以 cfg(test) 挂载，authenticated_tls 由 cfg(not(target_os = "android")) 限定非 Android 宿主。'
     + 'ci.yml 的宿主 cargo test --workspace 执行回环 TLS/证书认证回归；APK 不构建或运行 test target。'
@@ -886,6 +908,10 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/runtime/proxy/tests/lifecycle.rs':
     '桌面-only managed marker/legacy lease 生命周期测试，cfg(not android) 不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
+  'src-tauri/src/runtime/proxy/tests/process_supervision/startup_observation.rs':
+    'Exact desktop-only cfg(test) readiness and retained CLI-instance fixtures exclude both Android and iOS. '
+    + 'Host polaris lib tests cover these cases; Android target cargo check and APK builds do not compile this test module '
+    + 'or attest mobile lifecycle behavior.',
   'src-tauri/src/runtime/proxy/tests/process_supervision.rs':
     '桌面-only helper attempt/lease 负例属于 cfg(test) 测试目标，不进入 APK；'
     + '桌面 cargo test -p polaris --lib 实际执行，Android 交叉 cargo check 不构建此测试目标。',
@@ -973,6 +999,13 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '统计闸门，2 处 android cfg：`probe_main_window_visible` 的 android 臂恒返 `Ok(true)`。android 臂的编译面'
     + '由 `cargo check --target aarch64-linux-android -p polaris` 覆盖，非 android 臂由三平台 `cargo test` 覆盖。'
     + '它的**行为**正确性（「窗口可见性在 Android 上不可观测」）是真机事实，CI 无任何腿能验，APK 腿也不能。',
+  'src-tauri/src/runtime/proxy/tests/startup.rs':
+    'Host-only #[cfg(test)] startup regressions. The new #[cfg(not(any(target_os = "android", '
+    + 'target_os = "ios")))] guard excludes the retained CLI-file proof test from native mobile targets. '
+    + 'The proof/eviction/atomic-replacement assertions run in desktop cargo test --workspace; '
+    + 'Android impact source-coverage contracts register this exact cfg-bearing test file. '
+    + 'APK 构建不运行这些测试 and does not include test code; the Android cargo check of polaris '
+    + 'does not compile its test targets and is not claimed as execution coverage.',
   'src-tauri/src/runtime/proxy/android_bridge/tests/mod.rs':
     '`#[cfg(test)]` 面，不进任何构建产物、不改 APK 一个字节。两条断言都写成「非 Android 上必须诚实失败」，'
     + '在三平台 `cargo test --workspace` 上真跑。APK 腿根本不构建 test target'
@@ -1128,6 +1161,8 @@ const SHARED_PACKAGE_PATHS = new Set([
   'scripts/verify-packaging.mjs',
   // package.yml 的 macOS 腿真跑它（封印前与最终 dmg 开箱各一次，逐个验包内内核与 helper 的签名）；
   // 它的控制流合同与 NSIS 内核清扫、卸载提权清理两组判据的合同都由 gate-node-test.sh 列为必需测试。
+  'scripts/macos-bundler-diagnostics.sh',
+  'scripts/macos-bundler-diagnostics.test.mjs',
   'scripts/macos-nested-code.sh',
   'scripts/macos-nested-code.test.mjs',
   'scripts/nsis-core-sweep.test.mjs',

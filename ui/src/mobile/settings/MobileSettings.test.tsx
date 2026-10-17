@@ -312,6 +312,14 @@ const DNS_V2_TOP: Record<string, unknown> = {
   ],
 };
 
+const DNS_V2_FAKEIP_TOP: Record<string, unknown> = {
+  ...DNS_V2_TOP,
+  dnsDefaults: {
+    ...(DNS_V2_TOP.dnsDefaults as object),
+    unmatchedAction: { type: 'fakeIp' },
+  },
+};
+
 /** 逐页 markup（模块级求值一次；任何一页渲染抛错都会在这里当场炸，不会退化成空跑）。 */
 const MARKUP: Record<MobileSettingsPageId, string> = {} as Record<MobileSettingsPageId, string>;
 let ROOT_MARKUP = '';
@@ -348,6 +356,13 @@ function rows(markup: string): { id: string; chunk: string }[] {
     id: m[1],
     chunk: markup.slice(m.index ?? 0, i + 1 < marks.length ? marks[i + 1].index : markup.length),
   }));
+}
+
+/** Shared row lookup for all rendered-settings suites; absence must fail the assertion. */
+function rowOf(markup: string, id: string): string {
+  const row = rows(markup).find((r) => r.id === id);
+  expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
+  return row?.chunk ?? '';
 }
 
 /** 带 `role="switch"` 的行 id（顺序即 DOM 顺序）。 */
@@ -1781,6 +1796,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'block-quic',
       'webrtc-leak',
       'tls-fragment',
+      'utls-policy',
       'auto-switch-node',
       'mesh-login-fallback',
       'interrupt-on-switch',
@@ -1812,6 +1828,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       // ⚠️ 两行都只在 v2 夹具下渲染（`DNS_V2_TOP`），`dns-default-fallback` 还要 `hostsFirst` 那一档。
       'dns-default-action',
       'dns-default-fallback',
+      'dns-real-query-fallback',
     ],
     // `tun-inbound-exclude` = 连入来源排除的网段清单（2026-09-06 接线）。它与本页其余行一样
     // 走 `commit(rowId, update(...))`，故失败回显与它们同一条通道。
@@ -2103,6 +2120,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
           ? dnsMarkup({ resolveNodeDomainsAhead: true }, {}, injected)
             + dnsMarkup({}, { blockBrowserDoh: true }, injected)
             + dnsMarkup({}, DNS_V2_TOP, injected)
+            + dnsMarkup({}, DNS_V2_FAKEIP_TOP, injected)
           : '');
       // 去重：DNS 那两档共有的行会各出现一次，判的是**集合**恰等，不是出现次数。
       const shown = [
@@ -2246,12 +2264,6 @@ describe('⑪ 设置页不再读 `proxyModeType`：TUN 专属的行在错的值�
  * 免得「什么都没渲染出来」把断言骗过去。
  */
 describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规则 2）', () => {
-  const rowOf = (markup: string, id: string): string => {
-    const row = rows(markup).find((r) => r.id === id);
-    expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
-    return row?.chunk ?? '';
-  };
-
   it('自检：另一份夹具真的渲染得出来，且 race 档确实被翻到了「竞速」', () => {
     const race = dnsMarkup({ resolveNodeDomainsAhead: true });
     expect(race.length).toBeGreaterThan(400);
@@ -2754,13 +2766,7 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
   let v2NoHosts = '';
   beforeAll(() => {
     v2 = dnsMarkup({}, DNS_V2_TOP);
-    v2NoHosts = dnsMarkup({}, {
-      ...DNS_V2_TOP,
-      dnsDefaults: {
-        ...(DNS_V2_TOP.dnsDefaults as object),
-        unmatchedAction: { type: 'fakeIp' },
-      },
-    });
+    v2NoHosts = dnsMarkup({}, DNS_V2_FAKEIP_TOP);
   });
 
   it('自检：v2 夹具真的翻到了那一档（翻不到 ⇒ 下面每条都是对空气说话）', () => {
@@ -2790,6 +2796,30 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
     expect(v2NoHosts, '非 Hosts 档也画了兜底行').not.toContain('data-setting="dns-default-fallback"');
     // 正面对照：那一档主行还在（不是整块没渲染出来）。
     expect(v2NoHosts).toContain('data-setting="dns-default-action"');
+  });
+
+  it('FakeIP displays the compatible domestic real-query fallback and the saved server/reject choice', () => {
+    expect(v2).not.toContain('data-setting="dns-real-query-fallback"');
+    expect(MARKUP.dns).not.toContain('data-setting="dns-real-query-fallback"');
+    expect(rowOf(v2NoHosts, 'dns-real-query-fallback')).toContain(copy('settings.dns.builtinDomesticName'));
+    for (const [action, label] of [
+      [{ type: 'server', serverId: 'builtin-remote' }, 'settings.dns.builtinRemoteName'],
+      [{ type: 'reject', method: 'default' }, 'rules.dnsActionReject'],
+    ] as const) {
+      const html = dnsMarkup({}, {
+        ...DNS_V2_FAKEIP_TOP,
+        dnsDefaults: {
+          ...(DNS_V2_FAKEIP_TOP.dnsDefaults as object),
+          realQueryFallbackAction: action,
+        },
+      });
+      const row = rowOf(html, 'dns-real-query-fallback');
+      expect(row).toContain(copy(label));
+      expect(row).toContain(`aria-label="${copy('settings.dns.realQueryFallback')}"`);
+      expect(row).toContain('aria-haspopup="listbox"');
+    }
+    expect(src).toContain("commitRealQueryFallback('dns-real-query-fallback', next)");
+    expect(src).toContain('commit(rowId, update({ dnsDefaults: { ...defaults, realQueryFallbackAction } }))');
   });
 
   it('🔴 写腿真的落在 `dnsDefaults` 上，且 `dnsConfig` 那一半同写（只改一半 = 两份配置各说各话）', () => {
@@ -2861,9 +2891,9 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
     const panels = src.split('<SelectSheetPanel').slice(1);
     const triggers = src.split('<SelectSheetTrigger').slice(1);
     // 切片自检：切不出块（或块数变了）时下面的 `some` 会恒假/恒真，先让它自曝。
-    expect(panels.length, '切不出两张面板 —— 切片面塌了，或多了一张没登记的').toBe(2);
-    expect(triggers.length, '切不出两颗触发器').toBe(2);
-    for (const key of ['action', 'fallback']) {
+    expect(panels.length, '切不出默认策略的三张面板').toBe(3);
+    expect(triggers.length, '切不出默认策略的三颗触发器').toBe(3);
+    for (const key of ['action', 'fallback', 'realQueryFallback']) {
       expect(
         triggers.some(
           (block) =>

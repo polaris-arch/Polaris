@@ -496,6 +496,11 @@
     "switchRequiresApply": "{{node}} · 已儲存，請套用待處理變更後使用"
   },
   "settings": {
+    "utls": {
+      "label": "全域 uTLS 指紋",
+      "description": "跟隨節點保留原設定；其他選項僅覆寫產生的設定，不修改節點。Random 在核心行程啟動時選定範本，Randomized 為隨機化範本。",
+      "follow": "跟隨節點"
+    },
     "coex": {
       "windowsHint": "各原生來源獨立顯示，完整性和 compartment 可能仍為未知。不推斷介面關聯、路由選擇或安全結論。",
       "adaptersSource": "介面卡",
@@ -750,7 +755,7 @@
       "fakeIpTunOffConfirmDesc": "TUN 模式下關閉後，代理節點將收到真實 IP 而非網域。部分防濫用嚴格的機場可能因此拒絕連線（拋出無效憑證或攔截頁面），此風險無法由用戶端緩解。海外網域首次連線延遲也會增加。確認關閉？",
       "fakeIpTunOffConfirmOk": "仍然關閉",
       "fakeIpFilter": "FakeIP 例外網域",
-      "fakeIpFilterDesc": "這些網域走真實 DNS、不用假 IP。建議開啟。",
+      "fakeIpFilterDesc": "命中網域會在使用者 DNS 規則之前交給真實解析器。建議開啟。",
       "nodeResolverDnspod": "DNSPod (DoH)",
       "nodeResolverSystem": "系統 DNS",
       "takeoverSystemDns": "接管系統 DNS",
@@ -1185,6 +1190,8 @@
       "defaultDirect": "預設直連 DNS",
       "defaultProxy": "預設代理 DNS",
       "defaultUnmatched": "預設規則",
+      "realQueryFallback": "真實查詢後備",
+      "realQueryFallbackHint": "預設規則為 FakeIP 時，A/AAAA 仍回傳合成位址；其他查詢（HTTPS、SVCB、TXT 等）使用此伺服器或拒絕動作。內部解析保持原有分流；「預設代理 DNS」不是所有查詢類型的統一後備。",
       "defaultAdvanced": "保留進階動作 · {{type}}",
       "resourceInUse": "無法刪除：資源仍在使用",
       "resourceInUseDesc": "請先移除以下參照：{{refs}}",
@@ -1192,7 +1199,7 @@
       "resourceRefGroup": "伺服器群組「{{name}}」",
       "resourceRefServer": "DNS 伺服器「{{name}}」",
       "resourceRefDefault": "預設項目「{{name}}」",
-      "fakeIpDesc": "回覆假 IP 規避 DNS 污染",
+      "fakeIpDesc": "對 A/AAAA 查詢回傳合成位址，避免 DNS 污染",
       "remoteDns": "遠端 DNS",
       "remoteDnsDesc": "解析海外網域的上游",
       "domesticDns": "國內 DNS",
@@ -1219,7 +1226,7 @@
       "customDohIpOnly": "需為純 IP 形式（如 223.5.5.5 / tls://223.5.5.5:853），網域會被拒絕",
       "raceEmptyFallback": "全部關閉時回退預設競速 ali/dnspod",
       "fakeIpFilterFold": "不使用 FakeIP 的網域",
-      "fakeIpFilterHint": "這些網域解析真實 IP（如 NTP 校時、STUN、入口網路偵測）",
+      "fakeIpFilterHint": "一般例外在使用者 DNS 規則之前使用國內 DNS；入口網路偵測例外仍使用內部解析器。這會指定真實解析器，而非僅略過 FakeIP。",
       "addDomain": "新增網域",
       "browserDohTitle": "攔截瀏覽器內建 DoH",
       "browserDohDesc": "瀏覽器自帶的「安全 DNS」會繞開本應用的 DNS 接管，網域分流與 FakeIP 對它不生效。開啟後對清單內端點的 443/853 與 QUIC 發 reject，逼瀏覽器回退到系統 DNS。預設關閉。",
@@ -1230,7 +1237,7 @@
       "upstreamPreset": "上游預設",
       "raceCustomHint": "自訂上游必須是純 IP 位址（它自己不能再需要解析），並且佔用競速額度。",
       "raceCustomEmpty": "沒有自訂上游",
-      "fakeIpFilterEmpty": "沒有例外網域，所有網域都走 FakeIP",
+      "fakeIpFilterEmpty": "無自訂例外；A/AAAA 查詢可使用 FakeIP",
       "browserDohEmpty": "清單為空，不會攔截任何端點"
     }
   },
@@ -1428,7 +1435,7 @@
     "dnsActionServerHeading": "DNS 伺服器",
     "dnsActionHostsHeading": "Hosts",
     "dnsActionResponseHeading": "回應動作",
-    "dnsActionDescription_fakeIp": "回傳合成位址；不查詢上游 DNS",
+    "dnsActionDescription_fakeIp": "僅對 A/AAAA 查詢回傳合成位址；不查詢上游 DNS",
     "dnsActionDescription_reject": "終止查詢並回傳拒絕回應",
     "dnsActionDescription_predefined": "回傳手動設定的 RCODE 與資源記錄",
     "dnsActionUnavailable": "目前不可用",
@@ -1888,6 +1895,14 @@
     "masque": "自建 IP 隧道"
   },
   "node": {
+    "utls": {
+      "legacy": "未設定（相容原預設）",
+      "default": "核心預設指紋",
+      "disabled": "關閉 uTLS（保留 TLS）",
+      "loading": "正在讀取核心指紋能力…",
+      "unavailable": "無法讀取指紋能力：{{reason}}。保留現有設定，由實際核心檢查。",
+      "realityRequired": "REALITY 需要 uTLS，請選擇核心預設或受支援的指紋。"
+    },
     "add": "新增",
     "addTitle": "新增節點",
     "chainHint": "先經另一節點再出站（鏈式代理）",

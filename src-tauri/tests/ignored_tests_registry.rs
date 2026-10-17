@@ -52,6 +52,12 @@ enum Class {
     /// 被父测试以精确过滤器起出的私有子测试进程，不是可独立验收的门。
     /// 与 NotAGate 打印工具不同：它是父门负责输入、身份与收尾的执行夹具。
     PrivateChildFixture,
+    /// Native NTFS protocol interoperability with a separately built, pinned Go producer.
+    /// This is not a generic sing-box lifecycle test or an ordinary host-state probe.
+    NativeWindowsInterop,
+    /// Cross-identity interoperability creates an explicitly approved, one-shot SYSTEM task.
+    /// The privileged runner and its cleanup must own execution; ordinary tests cannot.
+    PrivilegedWindowsInterop,
 }
 
 impl Class {
@@ -66,6 +72,8 @@ impl Class {
             Class::LiveHostState => &["route", "proxy"],
             Class::NotAGate => &["非门"],
             Class::PrivateChildFixture => &["private child fixture"],
+            Class::NativeWindowsInterop => &["pinned real Go test producer"],
+            Class::PrivilegedWindowsInterop => &["explicit one-shot SYSTEM task runner"],
         }
     }
 
@@ -76,6 +84,8 @@ impl Class {
             Class::LiveHostState => "LiveHostState",
             Class::NotAGate => "NotAGate",
             Class::PrivateChildFixture => "PrivateChildFixture",
+            Class::NativeWindowsInterop => "NativeWindowsInterop",
+            Class::PrivilegedWindowsInterop => "PrivilegedWindowsInterop",
         }
     }
 }
@@ -207,6 +217,27 @@ const REGISTRY: &[Entry] = &[
         file: "crates/singbox-grpc/tests/native_clash_mode.rs",
         test: "native_core_lists_and_switches_the_two_compiled_modes",
         class: Class::RealCore,
+    },
+    // Existing native interop tests remain explicit, pinned-artifact opt-ins.
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_writer_retirement_and_stale_intent",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_crash_reopen_and_revocation",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_replaced_identity_is_retained",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_system_producer_user_consumer",
+        class: Class::PrivilegedWindowsInterop,
     },
 ];
 
@@ -489,8 +520,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        22,
-        "默认不跑的测试数从 22 变成了 {} —— 这不是自动放行的事：\
+        26,
+        "默认不跑的测试数从 26 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );

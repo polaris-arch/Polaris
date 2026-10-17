@@ -344,7 +344,13 @@ fn verify_desktop_embedded_identity(
         || receipt["sourceOwnedReplacements"] != spec["sourceOwnedReplacements"]
         || source["schema"] != "polaris-desktop-fork-source-v1"
         || source["role"] != "desktop"
-        || source["sourceURL"] != "https://github.com/polaris-arch/polaris-box"
+        || !matches!(
+            source["sourceURL"].as_str(),
+            Some(
+                "https://github.com/polaris-arch/polaris-box"
+                    | "https://github.com/polaris-arch/sing-box-polaris"
+            )
+        )
         || source["sourceTagObject"]
             .as_str()
             .is_none_or(|value| !hex_pin(value, 40))
@@ -479,7 +485,7 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
             // adapter/receipt, original bytes, full module graph and actual BuildID.
             // It observes native Mac signatures on Mac; no foreign core is run.
             let inspected = std::process::Command::new("node")
-                .args(["--input-type=module", "-e", "import fs from 'node:fs'; import {loadReleaseContract,verifyPackagedRelease} from './scripts/desktop-core/release-consumer.mjs'; const root=process.cwd(), m=JSON.parse(fs.readFileSync('src-tauri/core-manifest.json')), key=process.argv[1], core=process.argv[2], c=loadReleaseContract(root,m); verifyPackagedRelease(root,m,key,core); console.log(JSON.stringify(c.platforms[key].buildGraph.localReplacement));"])
+                .args(["--input-type=module", "-e", "import fs from 'node:fs'; import {loadReleaseContract,verifyPackagedRelease,releaseSingTunDependency} from './scripts/desktop-core/release-consumer.mjs'; const root=process.cwd(), m=JSON.parse(fs.readFileSync('src-tauri/core-manifest.json')), key=process.argv[1], core=process.argv[2], c=loadReleaseContract(root,m); verifyPackagedRelease(root,m,key,core); console.log(JSON.stringify(releaseSingTunDependency(c.platforms[key])));"])
                 .arg(core.key)
                 .arg(path)
                 .current_dir(repo_root())
@@ -747,6 +753,31 @@ fn source_owned_embedded_identity_requires_exact_root_replacement_vcs_and_build_
         &actual_build_id,
     )
     .unwrap();
+    let mut migrated_source = source.clone();
+    migrated_source["sourceURL"] =
+        serde_json::json!("https://github.com/polaris-arch/sing-box-polaris");
+    verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &migrated_source,
+        &spec,
+        &receipt,
+        &actual_build_id,
+    )
+    .unwrap();
+    for url in [
+        "https://github.com/polaris-arch/sing-box-polaris/",
+        "https://github.com/polaris-arch/sing-box-polaris-other",
+    ] {
+        migrated_source["sourceURL"] = serde_json::json!(url);
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&info),
+            &migrated_source,
+            &spec,
+            &receipt,
+            &actual_build_id,
+        )
+        .is_err());
+    }
     for changed in [
         info.replace("sing-box\tv0", "sing-box-extra\tv0"),
         info.replace("(devel)", "v1"),

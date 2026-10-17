@@ -382,12 +382,15 @@ test('capture refuses a pre-existing export or a filtered command without runnin
 test('workflow keeps the original Test command and makes verification and artifact upload unconditional after preparation', () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), '..');
   const workflow = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
-  const block = workflow.slice(workflow.indexOf('      - name: Test\n'), workflow.indexOf('      - name: Verify current Coex serializer evidence'));
+  // Scope these invariants to the ordinary test job, not later independent jobs.
+  const testJob = workflow.split('\n  test:\n')[1]?.split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
+  assert.ok(testJob, 'ordinary test job must exist');
+  const block = testJob.slice(testJob.indexOf('      - name: Test\n'), testJob.indexOf('      - name: Verify current Coex serializer evidence'));
   assert.match(block, /^        run: cargo test --workspace --no-fail-fast$/m);
   assert.match(block, /^        shell: node scripts\/check-coex-runtime-export\.mjs capture \{0\}$/m);
   assert.doesNotMatch(block, /^        shell:.*\$\{\{/m);
   assert.match(block, /COEX_EVIDENCE_DIR: \$\{\{ steps\.coex_prepare\.outputs\.directory \}\}/);
-  const tail = workflow.slice(workflow.indexOf('      - name: Verify current Coex serializer evidence'));
+  const tail = testJob.slice(testJob.indexOf('      - name: Verify current Coex serializer evidence'));
   assert.equal((tail.match(/always\(\)/g) ?? []).length, 2);
   assert.match(tail, /run: node scripts\/check-coex-runtime-export\.mjs verify/);
   assert.match(tail, /uses: actions\/upload-artifact@v7/);

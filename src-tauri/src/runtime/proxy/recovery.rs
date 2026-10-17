@@ -352,7 +352,9 @@ impl ProxyRuntime {
                 // claim 后若持久 CAS 失败，旧 Child 仍运行，监测也必须继续。
                 let classification = if direct_run_identity.is_some() {
                     match observation {
-                        ChildObservation::Alive => ExitClassification::KeepWatching,
+                        ChildObservation::Alive | ChildObservation::Unknown => {
+                            ExitClassification::KeepWatching
+                        }
                         ChildObservation::Absent => ExitClassification::Retire,
                         ChildObservation::Exited => ExitClassification::Crash,
                     }

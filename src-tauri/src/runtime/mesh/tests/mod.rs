@@ -25,8 +25,14 @@ async fn scoped_android_fs_body_rejects_unbound_changed_revision_and_missing_rea
         TailscaleWriterState,
     };
     let root = crate::test_support::TestDir::new("polaris-android-scoped-auth-fs-");
-    let mesh = MeshRuntime::new(root.join("config"));
+    let config = root.join("config");
+    let mesh = MeshRuntime::new(config.clone());
+    // This Android/PC projection test deliberately uses legacy state; a bare
+    // mkdir in the Windows physical namespace is not a native producer lease.
+    let legacy = config.join("tailscale").join("node");
+    std::fs::create_dir_all(&legacy).unwrap();
     let directory = mesh.tailscale_state_dir("node").unwrap();
+    assert_eq!(directory, legacy);
     std::fs::create_dir_all(directory.join("taildrop")).unwrap();
     std::fs::write(
         directory.join("taildrop/kept"),

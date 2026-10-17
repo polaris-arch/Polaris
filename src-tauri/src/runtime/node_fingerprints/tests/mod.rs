@@ -191,3 +191,39 @@ fn json_side_tolerates_garbage() {
         vec!["ok"]
     );
 }
+
+#[test]
+fn global_utls_policy_invalidates_main_and_temp_connection_digests_without_editing_nodes() {
+    let mut config = polaris_config_engine::user_config::UserConfig {
+        servers: vec![ServerConfig {
+            security: Some(SecurityMode::Tls),
+            ..srv("utls-node")
+        }],
+        ..Default::default()
+    };
+    let original = serde_json::to_value(&config.servers).unwrap();
+    let before = measurement_table_config(&config);
+    let temp_before = measurement_temp_table(&config.servers, &config);
+    config.utls_policy = Some("safari".into());
+    assert_ne!(before, measurement_table_config(&config));
+    assert_ne!(
+        temp_before,
+        measurement_temp_table(&config.servers, &config)
+    );
+    let raw = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        measurement_connections_json(&raw).main,
+        measurement_table_config(&config)
+    );
+    assert_eq!(
+        measurement_connections_json(&raw).temp,
+        measurement_temp_table(&config.servers, &config)
+    );
+    config.utls_policy = Some("follow".into());
+    assert_eq!(before, measurement_table_config(&config));
+    assert_eq!(
+        temp_before,
+        measurement_temp_table(&config.servers, &config)
+    );
+    assert_eq!(serde_json::to_value(&config.servers).unwrap(), original);
+}

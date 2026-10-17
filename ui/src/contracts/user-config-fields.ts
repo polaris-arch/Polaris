@@ -71,6 +71,7 @@ export const USER_CONFIG_FIELDS = [
   'dnsConfig',
   'ruleResources',
   'tlsFragment',
+  'utlsPolicy',
   'interruptConnectionsOnSwitch',
   'resolveBeforeDial',
   'regionRouting',

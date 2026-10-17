@@ -13,7 +13,7 @@
 
 ---
 
-## 五个类别
+## 七个类别
 
 | 类别 | 为什么默认不跑 | 谁来跑 |
 |---|---|---|
@@ -21,6 +21,8 @@
 | **PublicNetwork** | 需要公网连通性。CI 与本机开发环境都不保证，且本仓禁止在默认门里碰网络 | 手动，确认网络可用时 |
 | **LiveHostState** | 会读或**改写宿主机的真实状态**（路由表 / 系统代理）。跑错机器会把开发机的网络配置改掉 | 专用测试机，人在场 |
 | **PrivateChildFixture** | 由父测试供给私有输入与身份，不能作为独立门运行 | 仅由父门以精确过滤器调用并收尾 |
+| **NativeWindowsInterop** | 需要原生 NTFS、固定来源与哈希的 App 测试产物及真实 Go producer | 专用 Windows 互操作 runner，使用精确测试名 |
+| **PrivilegedWindowsInterop** | 需要显式批准的一次性 SYSTEM 任务与普通用户 consumer | 经批准的专用 Windows runner，任务清理归 runner 负责 |
 | **NotAGate** | 根本不是测试，是打印工具（如逃生门清单）。用 `#[ignore]` 只是为了不进默认门 | 需要那份清单时随手跑 |
 
 ---
@@ -79,7 +81,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（21 条）
+## 完整清单（26 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
@@ -100,6 +102,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `real_core_aggregate_relay_emits_real_frames` | `src-tauri/src/runtime/stats/tests/real_core_tests.rs` | RealCore |
 | `real_https_get_handshakes_and_returns_body` | `src-tauri/src/runtime/http/tests/mod.rs` | PublicNetwork |
 | `live_route_planner_returns_a_real_interface` | `src-tauri/src/runtime/route_binding/tests/mod.rs` | LiveHostState（只读） |
+| `live_existing_polaris_adapter_is_visible` | `crates/helper/src/platform/windows/wintun/win_impl/tests/enumeration.rs` | LiveHostState（只读，Windows-only） |
 | `live_best_route_interface_alias_supports_both_families` | `crates/helper/src/platform/windows/wintun/tests/mod.rs` | LiveHostState（只读，Windows-only） |
 | `production_macos_native_proxy_transaction_restores_after_takeover` | `crates/system-integration/src/tests/mod.rs` | LiveHostState（**写宿主机**，macOS-only） |
 | `production_macos_native_proxy_recovers_across_process_sessions` | 同上 | LiveHostState（**写宿主机**，macOS-only） |
@@ -107,6 +110,10 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
 | `unrelated_no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
 | `native_core_lists_and_switches_the_two_compiled_modes` | `crates/singbox-grpc/tests/native_clash_mode.rs` | RealCore |
+| `interop_writer_retirement_and_stale_intent` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | NativeWindowsInterop |
+| `interop_crash_reopen_and_revocation` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | NativeWindowsInterop |
+| `interop_replaced_identity_is_retained` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | NativeWindowsInterop |
+| `interop_system_producer_user_consumer` | `src-tauri/src/runtime/windows_directory/tests/mod.rs` | PrivilegedWindowsInterop |
 
 ---
 
@@ -129,4 +136,43 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 21 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 26 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+
+
+## NativeWindowsInterop 与 PrivilegedWindowsInterop 的执行边界
+
+这四条已经存在的 `#[ignore]` 现在逐条登记；本次没有新增 ignore，也没有把默认测试退出覆盖。
+`tests.rs` 迁为 `tests/mod.rs` 不改变 `runtime::windows_directory::tests::*` 的测试全名。
+默认 `cargo test` 不提供真实 Go 测试 producer，不应拿伪造或缺失产物冒充互操作通过。
+
+前三条 `interop_writer_retirement_and_stale_intent`、`interop_crash_reopen_and_revocation`、
+`interop_replaced_identity_is_retained` 由 `scripts/windows-directory/Run-WindowsDirectoryInterop.ps1`
+先校验 App/Go 产物 manifest 的 source、mode 与 SHA-256，再逐条执行 `--exact --ignored --test-threads=1`。
+在原生 NTFS Windows 测试机上准备匹配 manifest 后，示例（占位值须替换为实际产物及完整 40 位提交）：
+
+```powershell
+./scripts/windows-directory/Run-WindowsDirectoryInterop.ps1 `
+  -AppArtifactManifest C:/evidence/app-test-artifact.json `
+  -KernelArtifactManifest C:/evidence/kernel-test-artifact.json `
+  -ExpectedAppSource <app-sha40> -ExpectedKernelSource <kernel-sha40> `
+  -ValidationMode candidate
+```
+
+需要从已审核源码构建配套产物时，使用 `scripts/windows-directory/Build-And-Test.ps1`
+的显式 `-CandidateSourceCommit` 或 `-FormalContract` 模式。candidate 结果不是 formal release 验收。
+
+`interop_system_producer_user_consumer` 只能由 `scripts/windows-directory/Run-SystemBootstrap.ps1`
+执行。它要求非 SYSTEM 的已批准管理员测试用户；显式创建一次性 SYSTEM producer，并由当前用户
+运行 consumer。该 runner 同样验证 source/mode/hash，负责在退出路径删除计划任务与收尾。
+只有在已批准该特权任务的专用测试机上才可以执行：
+
+```powershell
+./scripts/windows-directory/Run-SystemBootstrap.ps1 `
+  -AppArtifactManifest C:/evidence/app-test-artifact.json `
+  -KernelArtifactManifest C:/evidence/kernel-test-artifact.json `
+  -ExpectedAppSource <app-sha40> -ExpectedKernelSource <kernel-sha40> `
+  -ValidationMode candidate -EvidenceDirectory C:/evidence/system-interop `
+  -ApproveTemporarySystemTask
+```
+
+本次源码结构修复没有运行上述四条测试，没有创建 SYSTEM 任务，也不签署 Windows 原生互操作能力。

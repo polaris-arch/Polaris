@@ -284,7 +284,9 @@ describe('A6：托盘桌面通知（开关同步 + FakeIP 纠正告知）', () =
   it('切接管方式触发 FakeIP 自动启用时真的发通知（不是又一次 TODO）', () => {
     const start = MENU.indexOf('const setTakeover');
     const body = MENU.slice(start, MENU.indexOf('\n  };', start));
-    expect(body).toContain('applyFakeIpTunEntry');
+    expect(body).toContain('api.config.setTakeover(modeType)');
+    expect(body).not.toContain('dnsConfig:');
+    expect(body).not.toContain('saveConfig(patch)');
     expect(body).toMatch(/if\s*\(corrected\)/);
     expect(body).toContain('notifyDesktop(');
   });
@@ -408,7 +410,7 @@ describe('O07 shared config with fenced ancillary hydration', () => {
   });
   it('ordinary writes use the shared settlement path while selection retains its dedicated GET fence', () => {
     expect(MENU).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
-    expect(MENU).toContain('useAppStore.getState().saveConfig(patch)');
+    expect(MENU).toContain('api.config.setTakeover(modeType)');
     expect(MENU).toContain('saved: await api.config.get(), readGeneration');
     expect(MENU).toContain('if (!configReadGeneration.isCurrent(readGeneration)) return');
     expect(MENU).toContain('acceptSelectionConfig(saved)');

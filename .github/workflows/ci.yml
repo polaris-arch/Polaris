@@ -63,6 +63,19 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      windows_launcher_diagnostics:
+        description: 'Fixed-branch Windows launcher diagnosis only; never satisfies full PR gates'
+        type: boolean
+        default: false
+      windows_directory_mode:
+        description: 'Windows directory acceptance: formal or exact candidate; release contract unchanged'
+        type: choice
+        default: formal
+        options: [formal, candidate]
+      windows_directory_candidate_source:
+        description: 'Candidate mode only: exact lowercase 40-hex kernel source commit'
+        type: string
+        default: ''
       preserve_run:
         description: '保留固定源码审计运行；不被后续普通手动运行取消'
         type: boolean
@@ -100,8 +113,58 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
 jobs:
+  cheap_format:
+    # Only an explicit manual diagnostic selection skips the ordinary gate DAG.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true }}
+    name: Cheap Rust formatting gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_mode: ${{ steps.pr_candidate.outputs.mode }}
+      candidate_source: ${{ steps.pr_candidate.outputs.source }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read explicit reviewed batch PR candidate before native compilation
+        if: >-
+          ${{ github.event_name == 'pull_request'
+              && github.repository == 'polaris-arch/Polaris'
+              && github.event.pull_request.head.repo.full_name == github.repository
+              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017' }}
+        id: pr_candidate
+        shell: bash
+        run: |
+          python3 - <<'PYCANDIDATE'
+          import json, os, re
+          from pathlib import Path
+          data = json.loads(Path('scripts/windows-directory/candidate-source.json').read_text())
+          if (not isinstance(data, dict)
+              or data.get('schema') != 'polaris-windows-directory-candidate-v1'
+              or data.get('repository') != 'polaris-arch/sing-box-polaris'
+              or not isinstance(data.get('sourceCommit'), str)
+              or not re.fullmatch(r'[0-9a-f]{40}', data['sourceCommit'])
+              or data['sourceCommit'] == '0' * 40):
+              raise SystemExit('Missing or invalid explicit batch PR candidate source')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('mode=candidate\nsource=' + data['sourceCommit'] + '\n')
+          PYCANDIDATE
+      - name: Install existing Rust formatting toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+          rustc -Vv
+          cargo fmt --version
+      - name: Check workspace formatting before native compilation
+        run: cargo fmt --all -- --check
+
   # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══
   lint:
+    needs: cheap_format
     name: fmt + clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -342,6 +405,7 @@ jobs:
   # workflow_dispatch 经 workflow_call 传进来的 payload 没有 `os`，空串必须落到「跑」这一侧。
   # 判据由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 逐入口求值钉住（含反向对照）。
   cross:
+    needs: cheap_format
     name: cross-target clippy + android face
     if: >-
       !(github.event_name == 'workflow_dispatch'
@@ -641,6 +705,7 @@ jobs:
   # 与 lint job 并行开跑：此前 Test 排在串行链的最后，前面任何一步红了它就不跑。
   # Build 与 Test 留在同一个 job：`cargo test` 复用 `cargo build` 出的依赖 rlib，拆开就是编两遍。
   test:
+    needs: cheap_format
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -756,6 +821,7 @@ jobs:
           done
 
       - name: Build
+        id: workspace_build
         run: cargo build --workspace --verbose
 
       - name: Coex export checker fixtures
@@ -768,6 +834,7 @@ jobs:
         run: node scripts/check-coex-runtime-export.mjs prepare
 
       - name: Test
+        id: workspace_tests
         # Keep the actual gate command byte-identical to gate-rust.sh. Linux capture
         # supplies the fresh export env to this one existing full-workspace execution.
         # The static shell routes macOS/Windows to bash/pwsh with native failure propagation.
@@ -781,6 +848,223 @@ jobs:
         # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
         run: cargo test --workspace --no-fail-fast
 
+      # Candidate is a test-only source; formal contract and assets stay unchanged.
+      # Explicit manual candidate diagnostics may continue after Test fails, but
+      # never after Build/setup failure or cancellation. The failed Test still
+      # fails this job; PR/SYSTEM gates retain their existing success requirement.
+      - name: Select explicit formal or candidate Windows directory source
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure')) }}
+        id: windows_directory_source
+        shell: pwsh
+        env:
+          DIRECTORY_MODE: ${{ (github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode) || needs.cheap_format.outputs.candidate_mode || 'formal' }}
+          CANDIDATE_SOURCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.windows_directory_candidate_source) || needs.cheap_format.outputs.candidate_source || '' }}
+        run: |
+          if ($env:DIRECTORY_MODE -ceq 'candidate') {
+            $source = $env:CANDIDATE_SOURCE
+          } elseif ($env:DIRECTORY_MODE -ceq 'formal' -and [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE)) {
+            $source = (Get-Content scripts/desktop-core/release-contract.json -Raw | ConvertFrom-Json -AsHashtable).platforms.win.sourceCommit
+          } else { throw 'Explicit mutually exclusive formal/candidate validation inputs required' }
+          if ($source -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase source SHA missing' }
+          "source=$source" >> $env:GITHUB_OUTPUT
+          "mode=$env:DIRECTORY_MODE" >> $env:GITHUB_OUTPUT
+      - name: Checkout exact Windows directory producer source
+        id: windows_directory_checkout
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_source.outcome == 'success' }}
+        uses: actions/checkout@v7
+        with:
+          repository: polaris-arch/sing-box-polaris
+          ref: ${{ steps.windows_directory_source.outputs.source }}
+          path: .windows-directory-kernel
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Resolve exact checked-out kernel toolchain
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_checkout.outcome == 'success' }}
+        id: windows_directory_go
+        shell: pwsh
+        run: |
+          $mod = Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw
+          $pins = [regex]::Matches($mod, '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
+          if ($pins.Count -ne 1) { throw 'Expected one exact kernel source toolchain pin' }
+          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+      - name: Setup exact kernel Go toolchain
+        id: windows_directory_go_setup
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go.outcome == 'success' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.windows_directory_go.outputs.version }}
+          cache-dependency-path: .windows-directory-kernel/go.sum
+      - name: Build and run native Windows directory producer and consumer acceptance
+        id: windows_directory_acceptance
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go_setup.outcome == 'success' }}
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+          DIRECTORY_MODE: ${{ steps.windows_directory_source.outputs.mode }}
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $previousAttempt = ''
+          $attemptPath = Join-Path $root 'validation-attempt.json'
+          if (Test-Path -LiteralPath $attemptPath) {
+            $previousAttempt = (Get-Content -LiteralPath $attemptPath -Raw | ConvertFrom-Json).attemptId
+            if ($previousAttempt -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous attempt identity' }
+          }
+          $args = @{KernelRoot='.windows-directory-kernel'; OutputDirectory=$root}
+          if ($env:DIRECTORY_MODE -ceq 'candidate') { $args.CandidateSourceCommit = $env:DIRECTORY_SOURCE }
+          elseif ($env:DIRECTORY_MODE -ceq 'formal') { $args.FormalContract = $true }
+          else { throw 'Unknown validation mode' }
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 @args
+          if ($LASTEXITCODE -ne 0) { throw 'Private TokenOwner acceptance failed' }
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve actual App source' }
+          $verified = ./scripts/ci/assert-windows-directory-acceptance.ps1 -EvidenceDirectory $root -ExpectedAppSource $appSource -ExpectedKernelSource $env:DIRECTORY_SOURCE -ValidationMode $env:DIRECTORY_MODE -PreviousAttemptId $previousAttempt
+          "attempt_id=$($verified.AttemptId)" >> $env:GITHUB_OUTPUT
+          "receipt_sha256=$($verified.ReceiptSHA256)" >> $env:GITHUB_OUTPUT
+          "app_manifest_sha256=$($verified.AppManifestSHA256)" >> $env:GITHUB_OUTPUT
+          "kernel_manifest_sha256=$($verified.KernelManifestSHA256)" >> $env:GITHUB_OUTPUT
+          "activation_manifest_sha256=$($verified.ActivationManifestSHA256)" >> $env:GITHUB_OUTPUT
+      # Explicit owner approval is limited to this batch's temporary CI SYSTEM task.
+      - name: Approved batch SYSTEM producer — fresh
+        if: >-
+          ${{ runner.os == 'Windows'
+              && github.event_name == 'pull_request'
+              && github.repository == 'polaris-arch/Polaris'
+              && github.event.pull_request.head.repo.full_name == github.repository
+              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+              && steps.windows_directory_source.outputs.mode == 'candidate' }}
+        shell: pwsh
+        env:
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+          ACCEPTANCE_ATTEMPT: ${{ steps.windows_directory_acceptance.outputs.attempt_id }}
+          ACCEPTANCE_RECEIPT_SHA256: ${{ steps.windows_directory_acceptance.outputs.receipt_sha256 }}
+          APP_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.app_manifest_sha256 }}
+          KERNEL_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.kernel_manifest_sha256 }}
+          ACTIVATION_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.activation_manifest_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $appSource -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact App source unavailable' }
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $binding = @{
+            EvidenceDirectory = $root
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = 'candidate'
+            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
+            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
+            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
+            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
+            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
+          }
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $args = @{
+            AppArtifactManifest = (Join-Path $root 'app-artifact.json')
+            KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = 'candidate'
+            EvidenceDirectory = (Join-Path $root 'system-fresh')
+          }
+          $previousSystemNonce = ''
+          $systemReceipt = Join-Path $args.EvidenceDirectory 'system-bootstrap-receipt.json'
+          if (Test-Path -LiteralPath $systemReceipt) {
+            $previousSystemNonce = (Get-Content -LiteralPath $systemReceipt -Raw | ConvertFrom-Json).nonce
+            if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
+          }
+          ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask
+          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
+          @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
+      # Explicit owner approval is limited to this batch's temporary CI SYSTEM task.
+      - name: Approved batch SYSTEM producer — prebuilt-user
+        if: >-
+          ${{ runner.os == 'Windows'
+              && github.event_name == 'pull_request'
+              && github.repository == 'polaris-arch/Polaris'
+              && github.event.pull_request.head.repo.full_name == github.repository
+              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+              && steps.windows_directory_source.outputs.mode == 'candidate' }}
+        shell: pwsh
+        env:
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+          ACCEPTANCE_ATTEMPT: ${{ steps.windows_directory_acceptance.outputs.attempt_id }}
+          ACCEPTANCE_RECEIPT_SHA256: ${{ steps.windows_directory_acceptance.outputs.receipt_sha256 }}
+          APP_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.app_manifest_sha256 }}
+          KERNEL_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.kernel_manifest_sha256 }}
+          ACTIVATION_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.activation_manifest_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $appSource -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact App source unavailable' }
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $binding = @{
+            EvidenceDirectory = $root
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = 'candidate'
+            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
+            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
+            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
+            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
+            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
+          }
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $args = @{
+            AppArtifactManifest = (Join-Path $root 'app-artifact.json')
+            KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = 'candidate'
+            EvidenceDirectory = (Join-Path $root 'system-prebuilt-user')
+          }
+          $previousSystemNonce = ''
+          $systemReceipt = Join-Path $args.EvidenceDirectory 'system-bootstrap-receipt.json'
+          if (Test-Path -LiteralPath $systemReceipt) {
+            $previousSystemNonce = (Get-Content -LiteralPath $systemReceipt -Raw | ConvertFrom-Json).nonce
+            if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
+          }
+          ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask -PrebuildUserDomain
+          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce -PrebuildUserDomain
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
+          @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
+      - name: Preserve Windows directory artifact identities and build evidence
+        if: ${{ always() && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-directory-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-directory-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Verify current Coex serializer evidence
         if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
         env:
@@ -793,5 +1077,74 @@ jobs:
         with:
           name: coex-runtime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.coex_prepare.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+
+  windows_launcher_diagnostics:
+    name: Windows launcher diagnosis (not PR acceptance)
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true
+          && github.repository == 'polaris-arch/Polaris'
+          && github.ref == 'refs/heads/collab/dots-audit-remediation-20261017' }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact diagnostic App source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate the fixed reviewed candidate
+        id: candidate
+        shell: pwsh
+        run: |
+          $candidate = Get-Content -LiteralPath scripts/windows-directory/candidate-source.json -Raw | ConvertFrom-Json -AsHashtable
+          if ($candidate.schema -cne 'polaris-windows-directory-candidate-v1' -or
+              $candidate.repository -cne 'polaris-arch/sing-box-polaris' -or
+              $candidate.sourceCommit -cne '68ffb209ded1f9337f9115741cba24f9f4c63421') {
+            throw 'Diagnostic candidate differs from the exact reviewed source'
+          }
+          "source=$($candidate.sourceCommit)" >> $env:GITHUB_OUTPUT
+      - name: Checkout exact diagnostic kernel source
+        uses: actions/checkout@v7
+        with:
+          repository: polaris-arch/sing-box-polaris
+          ref: ${{ steps.candidate.outputs.source }}
+          path: .windows-directory-kernel
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Resolve exact diagnostic kernel toolchain
+        id: kernel_go
+        shell: pwsh
+        run: |
+          $pins = [regex]::Matches((Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw), '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
+          if ($pins.Count -ne 1) { throw 'Expected one exact source toolchain pin' }
+          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+      - name: Setup exact diagnostic Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.kernel_go.outputs.version }}
+          cache-dependency-path: .windows-directory-kernel/go.sum
+      - name: Run the existing fixed launcher and acceptance target
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+          CANDIDATE_SOURCE: ${{ steps.candidate.outputs.source }}
+        run: |
+          # No preceding Rust build/test: creation failures terminate promptly.
+          # If creation succeeds, the same fixed target continues native validation;
+          # that path can be expensive and never substitutes for full PR/SYSTEM gates.
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 -KernelRoot .windows-directory-kernel -OutputDirectory (Join-Path $env:RUNNER_TEMP 'windows-launcher-diagnostics') -CandidateSourceCommit $env:CANDIDATE_SOURCE
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed launcher diagnostic attempt failed' }
+      - name: Always preserve original launcher diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-launcher-diagnostics-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-launcher-diagnostics
           if-no-files-found: error
           retention-days: 14

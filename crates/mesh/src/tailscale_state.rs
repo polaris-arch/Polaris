@@ -14,6 +14,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+pub mod directory_retirement;
 pub mod retirement;
 
 mod cached_session;

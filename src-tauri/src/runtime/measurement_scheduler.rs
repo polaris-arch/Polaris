@@ -1788,7 +1788,10 @@ impl MeasurementScheduler {
                     }
                 }
                 let targets = output.start.as_ref().map(|start| {
-                    let context = LedgerView::new(&config, generation, network_epoch, platform);
+                    let context = LedgerView::new(&config, generation, network_epoch, platform)
+                        .with_core_binary_sha256(
+                            app.state::<AppRuntime>().proxy().measurement_core_sha256(),
+                        );
                     let Shared { planner, plan, .. } = &mut *shared;
                     let cap =
                         |id: &str, entry: &LedgerEntry| entry_freshness_cap_ms(plan, id, entry);
@@ -1901,6 +1904,7 @@ fn publish(planner: &Planner) {
 /// 读账本要用的对照面（由一份配置快照与当前运行态现算）。调度器与自动选点共用这一份：
 /// 一条结果还能不能用于选点，只有这一套判据。
 pub(crate) struct LedgerView {
+    core_binary_sha256: Option<Option<String>>,
     generation: Option<u64>,
     fingerprints: BTreeMap<String, String>,
     main_connections: BTreeMap<String, String>,
@@ -1917,6 +1921,7 @@ impl LedgerView {
         platform: Platform,
     ) -> Self {
         Self {
+            core_binary_sha256: None,
             generation,
             fingerprints: current_server_fingerprints(config),
             main_connections: crate::runtime::node_fingerprints::measurement_table_json(config),
@@ -1924,6 +1929,11 @@ impl LedgerView {
             url_digest: polaris_updater::sha256_hex(resolve_speed_test_url(config).as_bytes()),
             mobile: is_mobile(platform),
         }
+    }
+
+    pub(crate) fn with_core_binary_sha256(mut self, digest: Option<String>) -> Self {
+        self.core_binary_sha256 = Some(digest);
+        self
     }
 
     /// 当前配置中主核测量连接的完整身份（包括策略及依赖）。
@@ -1938,6 +1948,7 @@ impl LedgerView {
         now_ms: u64,
     ) -> ReadContext<'a> {
         ReadContext {
+            core_binary_sha256: self.core_binary_sha256.as_ref().map(|v| v.as_deref()),
             main_generation: self.generation,
             fingerprints: &self.fingerprints,
             main_connections: &self.main_connections,

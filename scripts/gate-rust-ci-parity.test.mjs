@@ -111,8 +111,9 @@ function faceCheckerCall(text) {
   return m[1].replace(/"\$\{?[A-Za-z_]\w*\}?\/([\w.-]+)"/g, '$1').trim();
 }
 
-// 5 个门：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
+// 6 个 CI 步骤（两个 fmt 共用同一本机门）：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
 const GATES = [
+  { ci: 'Check workspace formatting before native compilation', sh: 'fmt', envVar: null },
   { ci: 'Check formatting', sh: 'fmt', envVar: null },
   { ci: 'Clippy (deny warnings)', sh: 'clippy', envVar: 'RUSTFLAGS' },
   { ci: 'Rustdoc documentation invariants (deny four lints)', sh: 'rustdoc', envVar: 'RUSTDOCFLAGS' },

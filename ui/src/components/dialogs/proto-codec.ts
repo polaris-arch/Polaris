@@ -40,6 +40,7 @@ import type {
    `Csel` / `Fold` / `InfoIcon` 连同整条桌面组件链拖进每一个 import 本模块的包（移动端也 import
    本模块）。两个符号的定义处本来就在 `./field-spec`，`FieldSpec.tsx` 只是把它们再导出一遍。 */
 import type { FormValue, FormValues } from './field-spec';
+import { utlsDraftValue, utlsPatch } from '@/domain/utls';
 import { draftFromSpecs } from './field-spec';
 import {
   allFields,
@@ -655,7 +656,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.net = lc(cfg.network) ?? 'tcp';                  // R3
       d.sec = lc(cfg.security) ?? 'none';                // R3
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = lc(cfg.tlsSettings?.fingerprint) ?? '';     // R4
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4
       d.pbk = cfg.realitySettings?.publicKey ?? '';
       d.sid = cfg.realitySettings?.shortId ?? '';
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
@@ -681,7 +682,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         tlsSettings: whenTls(draft)
           ? mergeTls(base.tlsSettings, {
               serverName: str(draft.sni),
-              fingerprint: str(draft.fp),
+              ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
               allowInsecure: draft.insecure === true ? true : undefined,
               ...tlsAdvPatch(draft, true),
             })
@@ -704,7 +705,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.net = lc(cfg.network) ?? 'tcp';                  // R3
       d.sec = lc(cfg.security) ?? 'none';                // R3
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = lc(cfg.tlsSettings?.fingerprint) ?? '';     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       transportDraft(cfg, d);
       httpDraft(cfg, d);
@@ -727,7 +728,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         tlsSettings: whenTls(draft)
           ? mergeTls(base.tlsSettings, {
               serverName: str(draft.sni),
-              fingerprint: str(draft.fp),
+              ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
               allowInsecure: draft.insecure === true ? true : undefined,
               ...tlsAdvPatch(draft, true),
             })
@@ -743,7 +744,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.net = lc(cfg.network) ?? 'tcp';                  // R3
       d.sec = lc(cfg.security) ?? 'tls';                 // R3
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = lc(cfg.tlsSettings?.fingerprint) ?? '';     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       transportDraft(cfg, d);
       httpDraft(cfg, d);
@@ -764,7 +765,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         tlsSettings: whenTls(draft)
           ? mergeTls(base.tlsSettings, {
               serverName: str(draft.sni),
-              fingerprint: str(draft.fp),
+              ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
               // `alpn` 由 `tlsAdvPatch` 统一处理（此前是这里一行）—— 同一个键跨 5 个协议，
               // 留在各协议块里必然漂移。空值语义不变：删键 → 后端补 trojan 专属缺省 `["http/1.1"]`。
               allowInsecure: draft.insecure === true ? true : undefined,
@@ -786,7 +787,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.stls = cfg.shadowTlsSettings != null;
       d.stlsPwd = cfg.shadowTlsSettings?.password ?? '';
       d.stlsSni = cfg.shadowTlsSettings?.sni ?? '';
-      d.stlsFp = lc(cfg.shadowTlsSettings?.fingerprint) ?? 'chrome';  // R4；缺省与后端消费点默认一致
+      d.stlsFp = utlsDraftValue(cfg.shadowTlsSettings);  // R4；缺省与后端消费点默认一致
       d.stlsPort = typeof cfg.shadowTlsSettings?.port === 'number' ? cfg.shadowTlsSettings.port : undefined;
       return d;
     },
@@ -820,7 +821,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
               password: stlsPwd,
               sni: stlsSni,
               // 空 → 删键；后端 `unwrap_or_else(|| "chrome")` 兜底，与草稿默认同值。
-              fingerprint: str(draft.stlsFp),
+              ...utlsPatch(String(draft.stlsFp ?? ''), base.shadowTlsSettings),
               // 空 → 删键；后端 None/0 都降级用节点主端口。
               port: num(draft.stlsPort),
             }
@@ -1240,7 +1241,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.pwd = cfg.password ?? '';
       d.tls = lc(cfg.security) === 'tls';                // R3：http isHttps（security==='tls' 严格归一）
       d.sni = cfg.tlsSettings?.serverName ?? '';         // TLS 组（门 = tls 开关，非 sec）
-      d.fp = lc(cfg.tlsSettings?.fingerprint) ?? '';     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       tlsAdvDraft(cfg, d, false);                        // http 无 ECH 控件（同 上游 http-form），见 F_HTTP_TLS_ADV
       return d;
@@ -1259,7 +1260,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
               serverName: str(draft.sni),
               // http 不在 `is_quic_managed_tls` 里 ⇒ `final_fp != "none"` 时 utls 块照常下发。
               // 空 → 删键 → 后端对非 vless/anytls 的缺省 `none` ⇒ 整个 utls 块不下发。
-              fingerprint: str(draft.fp),
+              ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
               allowInsecure: draft.insecure === true ? true : undefined,
               ...tlsAdvPatch(draft, false),
             })
@@ -1277,7 +1278,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       // 是因为那会把 'none' 原样带进草稿，再经 toCselOptions 并成第三档假选项。
       d.sec = lc(cfg.security) === 'reality' ? 'reality' : 'tls';
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = lc(cfg.tlsSettings?.fingerprint) ?? '';      // R4
+      d.fp = utlsDraftValue(cfg.tlsSettings);      // R4
       d.pbk = cfg.realitySettings?.publicKey ?? '';
       d.sid = cfg.realitySettings?.shortId ?? '';
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
@@ -1297,7 +1298,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
         // 选 reality 时后端仍从 `tlsSettings` 取 server_name/insecure/utls（只是换成 reality 版 TLS 块）。
         tlsSettings: mergeTls(base.tlsSettings, {
           serverName: str(draft.sni),
-          fingerprint: str(draft.fp),
+          ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
           allowInsecure: draft.insecure === true ? true : undefined,
           ...tlsAdvPatch(draft, true),
         }),

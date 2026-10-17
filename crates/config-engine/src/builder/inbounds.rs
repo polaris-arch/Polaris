@@ -987,8 +987,9 @@ fn drop_mobile_loopback_excludes(platform: &str, extra: &mut Vec<String>) -> Vec
 /// 调用方只在开关开着时调用；清单取 [`effective_bypass_lan`]（缺省即 `DEFAULT_BYPASS_LAN`）的网段子集。
 /// 依次过四步，每一步都有一条不做就出事的理由：
 ///
-/// 1. **严格校验**（[`is_valid_ip_cidr`]）+ **拒 `/0`**：`bypass_lan_cidrs` 只做形状粗判，
-///    `256.1.1.1/24` 会放行进内核 ⇒ sing-box `netip.ParsePrefix` 启动 FATAL；`0.0.0.0/0` / `::/0`
+/// 1. **严格校验**（[`is_valid_ip_cidr`]）+ **拒 `/0`**：在 CIDR 规范化过滤前统计原始网段，
+///    避免共享提取器先丢弃坏网段而漏报 warn。若 `256.1.1.1/24` 放行进内核，sing-box
+///    `netip.ParsePrefix` 会启动 FATAL；`0.0.0.0/0` / `::/0`
 ///    放行 ⇒ 整个地址空间排出 VPN、流量全部绕过隧道而界面仍显示已连接。剔掉的条目 warn。
 ///    **不用** [`normalize_tun_exclude_cidr`](crate::builder::tun_route_exclude::normalize_tun_exclude_cidr)：它的过宽下限（v4 < /8）会把默认清单里的
 ///    `224.0.0.0/4`（组播，mDNS/SSDP 局域网发现靠它）与 `240.0.0.0/4` 每次起核都剔掉并告警。
@@ -1010,18 +1011,19 @@ fn mobile_bypass_lan_exclude(
     fakeip_ranges: &[String],
     tun_address: &[String],
 ) -> Vec<String> {
-    let raw = bypass_lan_cidrs(&effective_bypass_lan(&UConfigBypass(config)));
+    let raw = effective_bypass_lan(&UConfigBypass(config));
     let mut dropped_invalid = 0usize;
     let normalized: Vec<String> = raw
         .iter()
+        .map(|c| c.trim())
+        .filter(|c| c.contains('/'))
         .filter_map(|c| {
-            let catch_all = c.split('/').nth(1).map(str::trim) == Some("0");
-            if is_valid_ip_cidr(c) && !catch_all {
-                Some(c.clone())
-            } else {
+            let normalized = crate::user_config::cidr::normalize_cidr(c)
+                .filter(|value| is_valid_ip_cidr(value) && !value.ends_with("/0"));
+            if normalized.is_none() {
                 dropped_invalid += 1;
-                None
             }
+            normalized
         })
         .collect();
     if dropped_invalid > 0 {

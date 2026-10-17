@@ -6,6 +6,7 @@ const CAP_MS: u64 = 60 * 60_000;
 
 fn identity(run: u64, seq: u64, measured_at: u64) -> ResultIdentity {
     ResultIdentity {
+        core_binary_sha256: None,
         run,
         seq,
         origin: SpeedTestOrigin::Schedule,
@@ -43,6 +44,7 @@ fn context<'a>(
     foreground_epoch: Option<u64>,
 ) -> ReadContext<'a> {
     ReadContext {
+        core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints,
         main_connections: fingerprints,
@@ -767,3 +769,26 @@ fn main_candidate_identity_includes_detour_connections_and_rejects_temp_scope() 
         "temp identities cannot validate main receipts"
     );
 }
+
+#[test]
+fn actual_core_bytes_gate_cache_reuse_even_without_a_generation_or_node_change() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a"]);
+    let mut receipt = identity(1, 1, 100);
+    receipt.core_binary_sha256 = Some("a".repeat(64));
+    ledger.record_connection_at("a", Ok(25), receipt, fps.get("a").cloned(), 100);
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let mut read = context(&fps, 101, None);
+    read.core_binary_sha256 = Some(Some(&a));
+    assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    for digest in [Some(b.as_str()), None] {
+        read.core_binary_sha256 = Some(digest);
+        assert_eq!(
+            exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+            Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+        );
+    }
+}
+
+mod bounded_skip_regressions;

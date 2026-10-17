@@ -688,7 +688,10 @@ pub fn merge_categories(
     let dns_applied = sel(BackupCategory::DnsRules) && !skipped.contains(&BackupCategory::DnsRules);
     if custom_applied || dns_applied {
         let mut conflicts = BTreeSet::new();
-        for key in ["customRuleSets", "ruleResources"] {
+        for key in ["customRuleSets", "ruleResources", "networkProfiles"] {
+            if key == "networkProfiles" && custom_applied && dns_applied {
+                continue;
+            }
             if custom_applied && dns_applied {
                 // 两个平面都真正替换时，沿用完整恢复的整表替换语义。
                 set(&mut result, key, arr_or_empty(backup, key));
@@ -730,7 +733,7 @@ pub fn merge_categories(
     // 网络场景随任一规则类导入：**按 id 合并**（同 id 以备份为准，其余保留 current）。备份里没带某条规则
     // 引用的场景 ⇒ 规则照常导入、`networkProfileId` 原样保留，生成侧按「引用失效」不生成（fail-closed，
     // spec §3.4-2）——**绝不**删掉引用把它变成无条件规则。
-    if custom_applied || dns_applied {
+    if custom_applied && dns_applied {
         if let Some(incoming) = backup.get("networkProfiles").and_then(Value::as_array) {
             let mut merged = arr_or_empty(&result, "networkProfiles")
                 .as_array()
@@ -769,6 +772,12 @@ pub fn merge_categories(
             );
             if let Some(v) = backup.get("dnsDefaults").filter(|value| value.is_object()) {
                 set(&mut result, "dnsDefaults", v.clone());
+            }
+            // Old DNS backups carry the historical domestic fallback. Materialize
+            // it now: selective restore is saved directly, without the load chain.
+            if crate::migrate::migrate_real_query_fallback_action(&mut result) {
+                // Match load-time protected-resource migration for sparse old backups.
+                crate::migrate::migrate_builtin_dns_resources(&mut result);
             }
         } else {
             skipped.push(BackupCategory::DnsResources);

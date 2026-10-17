@@ -505,3 +505,30 @@ fn covers(cidr: &str, ip: &str) -> bool {
         _ => false,
     }
 }
+
+#[test]
+fn mobile_bypass_counts_invalid_raw_cidrs_and_rejects_normalized_catch_all() {
+    let cfg: UserConfig = serde_json::from_str(
+        r#"{
+        "servers": [], "selectedServerId": null, "proxyModeType": "tun",
+        "enableIPv6": true, "bypassLAN": true,
+        "bypassLANList": ["192.168.50.5/24", "0.0.0.0/00", "::/000", "010.0.0.1/24", "*.local"]
+    }"#,
+    )
+    .unwrap();
+    thread_local!(static SINK: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) });
+    fn log(_: polaris_config_engine::user_config::log_level::LogLevel, message: &str) {
+        SINK.with(|s| s.borrow_mut().push(message.to_owned()));
+    }
+    for platform in ["android", "ios"] {
+        let mut d = deps(platform);
+        d.log = log;
+        assert_eq!(tun_exclude(&cfg, &d), Some(vec!["192.168.50.0/24".into()]));
+        let logs = SINK.with(|s| s.take());
+        assert!(
+            logs.iter()
+                .any(|m| m.contains("「绕过局域网」剔除 3 条非法网段")),
+            "{platform}: {logs:?}"
+        );
+    }
+}

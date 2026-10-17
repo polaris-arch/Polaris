@@ -83,6 +83,15 @@ def verify_swift_bridges(symbols):
     return list(SWIFT_BRIDGES)
 
 
+def copy_exclusive_stage(archive, stage):
+    require(not stage.exists() and not stage.is_symlink(), 'unaccepted Rust link stage retained')
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(fd, 'wb') as target, archive.open('rb') as source:
+        shutil.copyfileobj(source, target)
+        target.flush()
+        os.fsync(target.fileno())
+
+
 def build():
     root = private_dir(Path(os.environ['POLARIS_APP_WORK']))
     require(os.environ.get('POLARIS_BUILD_RESERVATION_FD') is not None,
@@ -159,8 +168,7 @@ def build_reserved():
             break
     dest.parent.mkdir(parents=True, exist_ok=True)
     stage = dest.with_name('libapp.a.formal-stage')
-    require(not stage.exists(), 'unaccepted Rust link stage retained')
-    shutil.copyfile(archive, stage)
+    copy_exclusive_stage(archive, stage)
     require(file_pin(stage) == pin, 'Rust static archive copy differs')
     os.replace(stage, dest)
     require(file_pin(dest) == pin and

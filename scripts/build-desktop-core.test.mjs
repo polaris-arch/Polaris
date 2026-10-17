@@ -181,7 +181,8 @@ test('frozen production inputs still require exact pins; force and old outputs c
     write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(missingPin));
     for (const path of ['scripts/fetch-core.mjs', 'scripts/desktop-core/build-core.mjs',
       'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/validation-origin.mjs',
-      'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/release-native-gates.mjs', 'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs']) {
+      'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs',
+      'scripts/desktop-core/release-native-gates.mjs', 'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs']) {
       write(join(f.root, path), readFileSync(join(repo, path)));
     }
     const cli = spawnSync(process.execPath, ['scripts/fetch-core.mjs', '--force', '--platform=linux'],

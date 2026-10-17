@@ -55,6 +55,7 @@ use std::path::Path;
 use std::time::Duration;
 
 mod check_custody;
+pub use check_custody::run_tls_fingerprint_query;
 #[cfg(target_os = "linux")]
 pub use check_custody::supervise_owned_sealed_check;
 pub use check_custody::{

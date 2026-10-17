@@ -240,6 +240,8 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     // clearance. Only copies in this private fixture are modified.
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
       'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
+      // release-consumer statically imports the upstream adapter even for legacy inputs.
+      'scripts/desktop-core/upstream-release.mjs',
       'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs'];
     for (const path of fixturePaths) {
       mkdirSync(dirname(join(fixture, path)), { recursive: true });

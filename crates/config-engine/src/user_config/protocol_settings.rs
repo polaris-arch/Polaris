@@ -24,6 +24,8 @@ pub struct TlsSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub fingerprint: Option<String>,
+    #[serde(rename = "utlsMode", default, skip_serializing_if = "Option::is_none")]
+    pub utls_mode: Option<crate::user_config::utls::UtlsMode>,
     /// ECH（隐藏 SNI）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ech: Option<bool>,
@@ -560,6 +562,8 @@ pub struct ShadowTlsSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub fingerprint: Option<String>,
+    #[serde(rename = "utlsMode", default, skip_serializing_if = "Option::is_none")]
+    pub utls_mode: Option<crate::user_config::utls::UtlsMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
 }

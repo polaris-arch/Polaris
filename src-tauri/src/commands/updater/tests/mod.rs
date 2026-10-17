@@ -2735,13 +2735,13 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
         "留底必须在交付之后、提交退出之前：早了记的是一次没发生的交付，晚了进程已经没了"
     );
 
-    // 函数体里别的 `.open(` 只剩形态错配那条回退（在出计划之前、与本腿无关）。
-    // 多出一处就是一条绕开准备门的打开。
+    // 两个系统打开均是自动替换之前的显式手动交付：形态错配，或 macOS 准入失败。
+    // 它们必须各自在受控分支早退，不得流入便携替换/提交退出。
     let opens: Vec<usize> = body.match_indices(".open(").map(|(i, _)| i).collect();
     assert_eq!(
         opens.len(),
-        1,
-        "update_install 体内的 `.open(` 应只有形态错配回退那一处"
+        2,
+        "系统打开只允许形态错配与 macOS 准入失败两条受控手动交付"
     );
     let reject = body.find("Err(reject) => {").expect("形态错配回退不见了");
     let advisory = body
@@ -2756,6 +2756,26 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
         !body[reject + guard..opens[0]].contains("} else {"),
         "`.open(` 必须在 `hands_to_system()` 为真的那一支里"
     );
+
+    let mac = body
+        .find("if plan.platform == update_install::InstallPlatform::Macos {")
+        .expect("macOS 手动交付必须受平台分支约束");
+    let admission = body[mac..]
+        .find("if let Err(error) = update_install::preflight_mac_admission(bundle) {")
+        .expect("只有准入失败才可手动交付")
+        + mac;
+    assert!(advisory < mac && mac < admission && admission < opens[1] && opens[1] < prepare);
+    let manual = &body[mac..prepare];
+    assert!(manual.contains("if let Some(bundle) = plan.app_bundle_path.as_deref() {"));
+    assert!(manual.contains("app.shell().open(file_path.clone(), None)"));
+    assert!(!body[admission..opens[1]].contains("} else {"));
+    let manual_return = body[opens[1]..prepare]
+        .find("return Ok(match opened {")
+        .expect("手动交付必须在关闭 Start 准入前整条早退");
+    assert!(manual_return > 0);
+    assert!(manual.contains("awaitingManualInstall"));
+    assert!(manual.contains("Err(open_error) => ApiResponse::err("));
+    assert!(!manual.contains("commit_desktop_exit"));
 
     // 交付函数本身只做「打开」：两处打开都在，且它不自己停核、不自己退出。
     let handoff = crate::commands::guard_scan::top_level_fn_body(src(), "fn open_portable_update(");

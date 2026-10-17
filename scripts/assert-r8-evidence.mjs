@@ -107,12 +107,17 @@ export const CONFIGURATION_NEEDLES = Object.freeze([
 ]);
 
 /**
- * 「这条 keep 规则真的命中了东西」的针：每项是一组必须**同时出现在 seeds.txt 同一行**上的片段。
- *
- * seeds.txt 的行形态是 `<类全名>` 或 `<类全名>: <成员签名>`。这里刻意只要求「同一行里都出现」，
- * 不逐字比对整行：R8 版本之间成员签名的排版会变，而本判据要问的是「命中没命中」，
- * 不是「排版对不对」——把排版写进判据只会逼后人把判据改宽。
+ * Exact declaring class and full signature, tolerant only of whitespace/semicolon.
  */
+export function seedMatches(line, parts) {
+  const match = /^([^:]+?)(?:\s*:\s*(.+))?$/.exec(line.trim());
+  if (!match || match[1].trim() !== parts[0]) return false;
+  if (parts.length === 1) return true;
+  const normalize = (s) => s.trim().replace(/;$/, '').replace(/\s+/g, ' ')
+    .replace(/\s*([(),])\s*/g, '$1');
+  return match[2] !== undefined && normalize(match[2]) === normalize(parts[1]);
+}
+
 export const SEED_NEEDLES = Object.freeze([
   [
     ["org.rustls.platformverifier.CertificateVerifier"],
@@ -124,11 +129,11 @@ export const SEED_NEEDLES = Object.freeze([
     "native 方法名就是 JNI 符号名的一部分，被改名即 UnsatisfiedLinkError。",
   ],
   [
-    ["com.polaris2.app.RustWebView", "clearAllBrowsingData"],
+    ["com.polaris2.app.RustWebView", "void clearAllBrowsingData()"],
     "wry 在 Rust 侧按方法名 JNI 调它；Kotlin 侧零调用点，R8 看不见引用。",
   ],
   [
-    ["com.polaris2.app.RustWebView", "getCookies"],
+    ["com.polaris2.app.RustWebView", "java.lang.String getCookies(java.lang.String)"],
     "同上；AGP 默认档那条 View getter 规则够不到它（那条限定无参 getter）。",
   ],
 ]);
@@ -307,7 +312,7 @@ export function assertR8Evidence({ configuration, seeds, ownRules }) {
     return { problems, notes };
   }
   for (const [parts, why] of SEED_NEEDLES) {
-    const matched = seedLines.filter((line) => parts.every((p) => line.includes(p)));
+    const matched = seedLines.filter((line) => seedMatches(line, parts));
     if (matched.length === 0) {
       problems.push(
         `seeds.txt 里没有同时含 ${parts.map((p) => `\`${p}\``).join(" 与 ")} 的行 —— ` +

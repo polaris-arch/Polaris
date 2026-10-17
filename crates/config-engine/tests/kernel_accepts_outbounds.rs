@@ -2147,3 +2147,243 @@ fn bundled_core_accepts_cert_pinned_tls_outbounds() {
         "冒号 hex 居然没在 decode 阶段被拒 —— 上面那条绿因此不说明内核读过这个键；实得：{diag}"
     );
 }
+
+/// Only the currently bound historical source may explain a missing report.
+/// A new report's bad JSON/schema or an ordinary execution failure never means legacy.
+fn admitted_utls_report(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    known_legacy_source: bool,
+) -> Result<Option<Value>, String> {
+    let stdout_text = std::str::from_utf8(stdout)
+        .map_err(|error| format!("TLS capability stdout UTF-8: {error}"))?
+        .replace("\r\n", "\n");
+    let stderr_text = std::str::from_utf8(stderr)
+        .map_err(|error| format!("TLS capability stderr UTF-8: {error}"))?;
+    let help = stdout_text.trim();
+    let missing = stderr_text
+        .trim()
+        .strip_prefix("Error: ")
+        .unwrap_or(stderr_text.trim());
+    let explicit_missing = !success
+        && help.is_empty()
+        && matches!(
+            missing,
+            "unknown command \"tls-fingerprints\" for \"sing-box tools\""
+                | "No help topic for 'tls-fingerprints'"
+        );
+    // The pinned 577d4b9 tools command has Short="Experimental tools" and no
+    // runnable handler. Cobra v1.10.2 can return its help with exit 0.
+    let old_tools_help = success
+        && stderr_text.trim().is_empty()
+        && help.starts_with("Experimental tools\n\nUsage:\n")
+        && help
+            .lines()
+            .any(|line| line.trim() == "sing-box tools [command]")
+        && help.contains("\nAvailable Commands:\n")
+        && help.contains("\nFlags:\n")
+        && help.ends_with(
+            "Use \"sing-box tools [command] --help\" for more information about a command.",
+        )
+        && !help.contains("tls-fingerprints");
+    if known_legacy_source && (explicit_missing || old_tools_help) {
+        return Ok(None);
+    }
+    if !success {
+        return Err("TLS capability command failed without a bound legacy response".into());
+    }
+    let report: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("actual TLS report JSON: {error}"))?;
+    if report["schema"] != "polaris-tls-fingerprint-capabilities-v1"
+        || report["enabled"] != true
+        || !report["profiles"]
+            .as_array()
+            .is_some_and(|profiles| profiles.iter().all(|profile| profile["id"].is_string()))
+        || !report["legacyChromeAliases"]
+            .as_array()
+            .is_some_and(|aliases| aliases.iter().all(Value::is_string))
+    {
+        return Err("actual TLS capability schema or profile inventory differs".into());
+    }
+    Ok(Some(report))
+}
+
+#[test]
+fn tls_report_legacy_help_requires_exact_bound_source_and_new_reports_fail_closed() {
+    let help = b"Experimental tools\n\nUsage:\n  sing-box tools [command]\n\nAvailable Commands:\n  fetch       Fetch a resource\n\nFlags:\n  -h, --help   help for tools\n\nUse \"sing-box tools [command] --help\" for more information about a command.\n";
+    assert!(admitted_utls_report(true, help, b"", true)
+        .unwrap()
+        .is_none());
+    assert!(admitted_utls_report(true, help, b"", false).is_err());
+    let missing = b"Error: unknown command \"tls-fingerprints\" for \"sing-box tools\"";
+    assert!(admitted_utls_report(false, b"", missing, true)
+        .unwrap()
+        .is_none());
+    assert!(admitted_utls_report(false, b"", missing, false).is_err());
+    for legacy in [false, true] {
+        for bad in [
+            &b"{broken"[..],
+            &b""[..],
+            &b"ordinary output"[..],
+            &br#"{"schema":"wrong","enabled":true,"profiles":[],"legacyChromeAliases":[]}"#[..],
+            &br#"{"schema":"polaris-tls-fingerprint-capabilities-v1","enabled":true,"profiles":"wrong","legacyChromeAliases":[]}"#[..],
+        ] {
+            assert!(admitted_utls_report(true, bad, b"", legacy).is_err());
+        }
+        assert!(admitted_utls_report(false, b"", b"permission denied", legacy).is_err());
+        assert!(admitted_utls_report(false, help, b"", legacy).is_err());
+    }
+    let report = br#"{"schema":"polaris-tls-fingerprint-capabilities-v1","enabled":true,"profiles":[{"id":"chrome_155"}],"legacyChromeAliases":[]}"#;
+    assert!(admitted_utls_report(true, report, b"", false)
+        .unwrap()
+        .is_some());
+}
+
+/// Admission uses the final downloaded binary, not a library constant. This is
+/// decode/initialization coverage only; it cannot attest ClientHello or PQ use.
+#[test]
+fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::dns::DomainResolver;
+    use polaris_config_engine::user_config::protocol_settings::TlsSettings;
+    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode};
+    use polaris_config_engine::user_config::utls::{
+        effective_server_for_platform, UtlsMode, SUPPORTED_PROFILES,
+    };
+    let Some(core) = core_or_skip("uTLS JSON profile admission") else {
+        return;
+    };
+    let dir = test_temp_dir("polaris-kgate-utls-");
+    let path = dir.path().join("profile.json");
+    let target = support::core_locator::kernel_gate_target();
+    let build = support::core_locator::CORE_MATRIX
+        .iter()
+        .find(|row| row.gate_target == target)
+        .unwrap();
+    let platform = if build.goos == "windows" {
+        "win32"
+    } else {
+        build.goos
+    };
+    let arch = if build.goarch == "amd64" {
+        "x64"
+    } else {
+        build.goarch
+    };
+    // Query the exact final bytes. Old CLI versions lack this command: their
+    // historical IDs still get actual check coverage, without advertising new IDs.
+    let output = support::core_locator::command_for_core_target(&target, &core)
+        .args(["tools", "tls-fingerprints"])
+        .output()
+        .unwrap();
+    let legacy_profiles: Vec<&str> = SUPPORTED_PROFILES
+        .iter()
+        .copied()
+        .filter(|id| {
+            ![
+                "chrome_155",
+                "chrome_133",
+                "firefox_148",
+                "firefox_120",
+                "safari_26_3",
+                "safari_16_0",
+            ]
+            .contains(id)
+        })
+        .collect();
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(repo_root().join("src-tauri/core-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let bound = &manifest["desktopRelease"];
+    let known_legacy_source = bound["sourceCommit"] == "577d4b9a089b71d2f0a4ca334b87264b55c10478"
+        && bound["sourceTree"] == "072dacb999c07c7948816f10efaaaf371da45eb9"
+        && bound["version"] == "1.15.0-alpha.12";
+    let reported = admitted_utls_report(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+        known_legacy_source,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let actual_profiles: Vec<&str> = match &reported {
+        Some(report) => {
+            assert_eq!(report["schema"], "polaris-tls-fingerprint-capabilities-v1");
+            assert_eq!(report["enabled"], true, "final core must include with_utls");
+            assert_eq!(report["os"], build.goos);
+            assert_eq!(report["arch"], build.goarch);
+            report["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_str().unwrap())
+                .chain(
+                    report["legacyChromeAliases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|id| id.as_str().unwrap()),
+                )
+                .collect()
+        }
+        None => legacy_profiles,
+    };
+    let mut last = Value::Null;
+    let intents = std::iter::once((Some(UtlsMode::Disabled), None))
+        .chain(std::iter::once((Some(UtlsMode::Default), None)))
+        .chain(
+            actual_profiles
+                .iter()
+                .map(|profile| (Some(UtlsMode::Profile), Some(*profile))),
+        );
+    for (mode, fingerprint) in intents {
+        let server = ServerConfig {
+            id: "utls-native".into(),
+            name: "uTLS admission".into(),
+            protocol: Protocol::Vless,
+            address: "127.0.0.1".into(),
+            port: 443,
+            uuid: Some("11111111-1111-1111-1111-111111111111".into()),
+            security: Some(SecurityMode::Tls),
+            tls_settings: Some(TlsSettings {
+                server_name: Some("example.com".into()),
+                utls_mode: mode,
+                fingerprint: fingerprint.map(str::to_owned),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let effective = effective_server_for_platform(&server, Some("follow"), platform).unwrap();
+        let outbound = build_proxy_outbound(
+            effective.as_ref(),
+            "utls-native",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            arch,
+            platform,
+        );
+        let config = json!({"log":{"disabled":true},
+            "dns":{"servers":[{"type":"local","tag":"dns-bootstrap"}]},
+            "outbounds":[outbound]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let (ok, diagnostic) = check(&core, &path);
+        assert!(ok, "actual core rejected admitted uTLS mode={mode:?} fingerprint={fingerprint:?}: {diagnostic}");
+        last = config;
+    }
+    // A negative control ensures the native initializer actually reads profile
+    // names instead of accepting every string while deferring all validation.
+    last["outbounds"][0]["tls"]["utls"] =
+        json!({"enabled":true,"fingerprint":"polaris-definitely-unsupported-profile"});
+    std::fs::write(&path, serde_json::to_vec_pretty(&last).unwrap()).unwrap();
+    let (ok, diagnostic) = check(&core, &path);
+    assert!(
+        !ok && diagnostic.to_ascii_lowercase().contains("fingerprint"),
+        "actual core did not reject an unknown uTLS fingerprint: {diagnostic}"
+    );
+}

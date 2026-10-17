@@ -5,6 +5,23 @@ import { dirname, join, resolve } from 'node:path';
 import { lstatSync, readFileSync } from 'node:fs';
 import { loadReleaseContract } from './release-consumer.mjs';
 
+// Hosting identity only. These records do not select a release or assert that
+// artifacts exist. Historical pins continue to name their original repository.
+export const KERNEL_REPOSITORIES = Object.freeze({
+  'polaris-arch/sing-box-polaris': Object.freeze({ id: 1421657509, branch: 'polaris-main' }),
+  'polaris-arch/polaris-box': Object.freeze({ id: 1407705262, historical: true }),
+});
+export function kernelRepositoryIdentity(repository) {
+  requireGraph(Object.hasOwn(KERNEL_REPOSITORIES, repository), 'Unknown kernel repository');
+  return KERNEL_REPOSITORIES[repository];
+}
+export function kernelSourceRepository(sourceURL) {
+  const repository = typeof sourceURL === 'string' && sourceURL.startsWith('https://github.com/')
+    ? sourceURL.slice('https://github.com/'.length) : '';
+  kernelRepositoryIdentity(repository);
+  return repository;
+}
+
 export const DESKTOP_TARGETS = Object.freeze({
   linux: { goos: 'linux', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
   win: { goos: 'windows', goarch: 'amd64', cgo: '0', extras: ['with_gvisor', 'with_purego'] },
@@ -187,12 +204,63 @@ export function isForkSource(spec) {
 }
 export const desktopSourceManifestPath = (spec) => isForkSource(spec)
   ? 'scripts/desktop-core/source-manifest.json' : 'scripts/libbox-patches/source-manifest.json';
+// Exact source-candidate policy, not a release/tag/asset activation. A later
+// source revision needs its own reviewed toolchain input; never admit any Go.
+// This declaration is inside the reviewed, SHA-pinned consumer contract. No
+// mutable branch, release label, environment value or pending selection admits it.
+export function reviewedSourcePolicy(context) {
+  if (!Object.hasOwn(context ?? {}, 'sourcePolicy')) return undefined;
+  const p = context.sourcePolicy;
+  const fields = ['schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
+    'goModSha256', 'goSumSha256', 'metacubex'];
+  requireGraph(p && same(Object.keys(p).sort(), fields.sort())
+    && p.schema === 'polaris-reviewed-kernel-source-v1'
+    && isTree(p.sourceCommit) && p.sourceCommit === context.sourceCommit
+    && isTree(p.sourceTree) && p.sourceTree === context.sourceTree
+    && p.goDirective === '1.27.0' && p.goVersion === '1.27.2' && p.toolchain === 'go1.27.2'
+    && isSha(p.goModSha256) && isSha(p.goSumSha256), 'Exact reviewed source/Go policy differs');
+  const m = p.metacubex;
+  const metaFields = ['module', 'version', 'replacementPath', 'replacementTree', 'replacementFileCount',
+    'bindingPath', 'bindingSha256', 'patchPath', 'patchSha256', 'upstreamCommit', 'upstreamH1', 'upstreamZipSha256'];
+  requireGraph(m && same(Object.keys(m).sort(), metaFields.sort())
+    && m.module === 'github.com/metacubex/utls' && m.version === 'v1.8.8'
+    && m.replacementPath === './third_party/metacubex-utls' && isTree(m.replacementTree)
+    && m.replacementFileCount === 355 && isTree(m.upstreamCommit)
+    && m.bindingPath === 'release/dependency-sources/metacubex-utls-replacement.json'
+    && m.patchPath === 'release/dependency-sources/metacubex-utls-reality-alpn.patch'
+    && isSha(m.bindingSha256) && isSha(m.patchSha256) && isSha(m.upstreamZipSha256)
+    && typeof m.upstreamH1 === 'string' && /^h1:[A-Za-z0-9+/]{43}=$/.test(m.upstreamH1), 'Exact reviewed Meta source policy differs');
+  return p;
+}
+export function releaseGoVersion(contract) {
+  if (contract?.schema === 'polaris-upstream-native-release-consumer-v1') return upstreamSourceGoVersion(contract);
+  requireGraph(contract?.schema === 'polaris-box-release-consumer-contract-v1'
+    && !Object.hasOwn(contract, 'sourcePolicy'), 'Historical release/toolchain policy differs');
+  return 'go1.25.5';
+}
+export function upstreamSourceGoVersion(contract) {
+  const policy = reviewedSourcePolicy(contract);
+  if (policy) return `go${policy.goVersion}`;
+  if (contract.sourceCommit === 'b0247cc930bc892a0ea03138906b548b6e84ac50') {
+    requireGraph(contract.sourceTree === 'b4b670f51d1c48b3c0be9ab882152e3f25a5d9b4', 'Upstream toolchain source tree differs');
+    return 'go1.27.2';
+  }
+  // Preserve only the frozen G4 source pair. An unknown revision must supply a
+  // complete reviewedSourcePolicy; release labels never select a Go toolchain.
+  requireGraph(contract.sourceCommit === '55300c55560bcc604fd9675c5526b5713db81cc1'
+    && contract.sourceTree === '7767ba9a9901a061ff07db7716baed7896cfefbc',
+  'Unreviewed upstream source/toolchain pair');
+  return 'go1.26.8';
+}
+
 export function desktopSourceGoVersion(root, manifest) {
   if (Object.hasOwn(manifest, 'desktopRelease')) {
     const contract = loadReleaseContract(root, manifest);
     // Go version is a producer field; all four admitted rows must agree.
-    const goVersions = new Set(Object.values(contract.platforms).map((row) => row.portablePlatformIdentity.facts.goVersion));
-    requireGraph(goVersions.size === 1 && goVersions.has('go1.25.5'), 'Release inspection Go pin differs');
+    const upstream = contract.schema === 'polaris-upstream-native-release-consumer-v1';
+    const goVersions = new Set(Object.values(contract.platforms).map((row) => upstream
+      ? row.goVersion : row.portablePlatformIdentity.facts.goVersion));
+    requireGraph(goVersions.size === 1 && goVersions.has(releaseGoVersion(contract)), 'Release inspection Go pin differs');
     return [...goVersions][0].slice(2);
   }
   const spec = validateSourcePins(manifest, 'linux', false);
@@ -317,7 +385,7 @@ export function validateSourceManifest(source, spec) {
   requireGraph(isTree(source.sourceCommit) && /^\d+\.\d+\.\d+$/.test(source.goVersion ?? ''), 'Invalid source/toolchain pin');
   if (isForkSource(spec)) {
     requireGraph(source.schema === 'polaris-desktop-fork-source-v1' && source.role === 'desktop'
-      && source.sourceURL === 'https://github.com/polaris-arch/polaris-box', 'Desktop fork repository/schema/role differs');
+      && Object.hasOwn(KERNEL_REPOSITORIES, kernelSourceRepository(source.sourceURL)), 'Desktop fork repository/schema/role differs');
     const version = /^(.*)\.polaris\.[1-9][0-9]*$/.exec(spec.version ?? '')?.[1];
     requireGraph(version && version === spec.upstreamVersion && source.upstreamTag === `v${version}` && isTree(source.upstreamCommit)
       && typeof source.sourceTag === 'string' && source.sourceTag.startsWith(`polaris-${source.upstreamTag}-`)

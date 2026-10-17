@@ -59,9 +59,11 @@ fn proxy_submodules_only_reach_back_for_whitelisted_facade_items() {
         "UnlockInvalidationProbe",
     ];
 
-    for (file, content) in module_files("runtime/proxy") {
+    let files = module_files("runtime/proxy");
+    assert!(files.iter().any(|(file, _)| file == "runtime/proxy.rs"));
+    for (file, content) in files {
         // façade 根文件本身在 §A.5 判定表里是「定义 + 再导出」的一方，不受本门约束。
-        if file == "proxy.rs" {
+        if file == "runtime/proxy.rs" {
             continue;
         }
         // 先剥行注释再取材：判据看的是**代码**，注释里出现的 `use super::…` 不是导入。

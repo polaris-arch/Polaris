@@ -143,7 +143,7 @@ impl DnsRaceRuntime {
             if runtime.clear_owned(Some(my_generation)) {
                 log::error!(
                     "[dns-race] sidecar 端口 {dead_port} 已彻底失效（watchdog 放弃重建）→ 已清注入态，\
-                     节点域名解析降级为单上游(dns-bootstrap)；重连可重建"
+                     仅后续配置生成回落至 dns-bootstrap，运行中的核心仍引用失效端口；请重连以应用并重建"
                 );
             } else {
                 log::info!(

@@ -1466,3 +1466,5 @@ fn dns_post_prune_descends_logical_predicates_and_drops_whole_bad_parent() {
     assert_eq!(survivor.rules.as_ref().unwrap().len(), 2);
     assert_eq!(survivor.action.as_deref(), Some("reject"));
 }
+
+mod audit_regressions;

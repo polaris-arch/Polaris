@@ -2,6 +2,7 @@ use super::*;
 
 mod direct_stop;
 mod native_direct_stop;
+mod startup_observation;
 
 #[cfg(target_os = "linux")]
 struct BirthDaemonStream {
@@ -939,7 +940,10 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
         rt.child.lock().unwrap().take_running_legacy(),
         Err(TakeRunningError::Stopping)
     ));
-    assert!(!rt.child.lock().unwrap().is_running_alive());
+    assert_eq!(
+        rt.child.lock().unwrap().startup_observation(),
+        ChildObservation::Absent
+    );
     assert!(!rt.child.lock().unwrap().running_matches(&identity));
     assert!(!rt.child.lock().unwrap().running_exit_proven(&identity));
 
@@ -4035,8 +4039,22 @@ fn ios_cold_and_pre_ready_consumers_keep_original_custody_and_strict_stop() {
         &module_code("runtime/proxy/process_supervision"),
         "    pub(super) async fn kill_core_and_release_main(",
     );
-    assert!(stop.contains("stop_observed(observed).await"));
     let stop_compact: String = stop.split_whitespace().collect();
+    let prepare_observed = stop_compact
+        .find("prepare_observed_stop(observed).await?")
+        .expect("observed custody must produce its own stop target");
+    let persist = stop_compact[prepare_observed..]
+        .find("*current=owner.clone()")
+        .expect("stop target must persist for same-owner retry")
+        + prepare_observed;
+    let dispatch = stop_compact[persist..]
+        .find("stop_target(target).await?")
+        .expect("persisted target must dispatch the native Stop")
+        + persist;
+    assert!(prepare_observed < persist && persist < dispatch);
+    assert!(stop_compact.contains("current.same_origin(&original_owner)"));
+    assert!(stop_compact.contains("owner.stop_target=target.map("));
+    assert!(!stop_compact.contains("stop_observed(observed).await"));
     assert!(stop_compact.contains("source_extension_generation()!=observed.extension_generation()"));
     assert!(stop_compact
         .contains("verify_pre_ready_writer_census(&retired,&owner.config_digest,&expected,)"));

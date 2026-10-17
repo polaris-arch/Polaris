@@ -833,7 +833,7 @@ mod sys {
                         continue;
                     };
                     // helper.go:401: 5s read deadline（set_read_timeout 取 &self）
-                    let _ = s.set_read_timeout(Some(READ_TIMEOUT));
+                    let accepted_at = std::time::Instant::now();
                     let svc = Arc::clone(&services);
                     // helper.go:641: go handle(conn)（每连接一线程）
                     std::thread::spawn(move || {
@@ -850,7 +850,10 @@ mod sys {
                             .ok()
                             .map(|(uid, _gid)| uid.as_raw());
                         let _ = process_connection_from_peer(
-                            s,
+                            crate::line_io::DeadlineStream::new(
+                                s,
+                                READ_TIMEOUT.saturating_sub(accepted_at.elapsed()),
+                            ),
                             writer,
                             svc.as_ref(),
                             svc.config(),

@@ -55,6 +55,7 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
     rt.config.save_full(cfg).expect("seed D");
     let saved = rt.config.current().unwrap();
     mark_running_with_snapshot(rt, &saved);
+    *rt.test_measurement_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
     rt.switch_snapshot
         .write()
         .unwrap()
@@ -68,6 +69,7 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
 /// 一条当前核世代、探针槽路径测得的结果的身份块；测量的墙钟时刻就是注入的「现在」。
 fn identity(rt: &ProxyRuntime, cfg: &Value, run: u64) -> ResultIdentity {
     ResultIdentity {
+        core_binary_sha256: rt.measurement_core_sha256(),
         run,
         seq: 1,
         origin: SpeedTestOrigin::Schedule,
@@ -2267,6 +2269,7 @@ fn refresh_fallback_aligns_existing_epoch_before_reading_the_bar() {
     rt.auto_select_fallback_from(&cfg, &readings(&ledger));
     rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
     rt.gate.bump_generation();
+    *rt.test_measurement_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
     refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
     assert_eq!(
         rt.auto_select_fallback_from(&cfg, &readings(&ledger))

@@ -39,10 +39,10 @@ pub mod stale_core;
 
 pub use config_gate::{
     assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,
-    run_check_raw, run_config_check, run_config_check_within, settle_check_cleanup,
-    shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict, KernelRejection, PeelStep,
-    RawCheck, RejectedArray, ValidationLifecycleError, CONFIG_CHECK_TIMEOUT,
-    INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
+    run_check_raw, run_config_check, run_config_check_within, run_tls_fingerprint_query,
+    settle_check_cleanup, shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict,
+    KernelRejection, PeelStep, RawCheck, RejectedArray, ValidationLifecycleError,
+    CONFIG_CHECK_TIMEOUT, INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 pub use crash_recovery::{
     classify_child_exit, restart_backoff_ms, AutoRestartOutcome, ChildObservation,

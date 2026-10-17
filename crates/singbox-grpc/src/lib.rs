@@ -249,6 +249,19 @@ impl SingBoxApiClient {
             .into_inner())
     }
 
+    /// Read active rule-set state from this authenticated core instance.
+    pub async fn get_rule_set_status(
+        &self,
+        tags: Vec<String>,
+    ) -> Result<daemon::RuleSetStatusResponse, ClientError> {
+        let mut c = self.client();
+        let mut req = self.with_auth(Request::new(daemon::RuleSetStatusRequest { tags }));
+        req.set_timeout(UNARY_DEADLINE);
+        Ok(within_unary_deadline(c.get_rule_set_status(req))
+            .await?
+            .into_inner())
+    }
+
     /// Tailscale：热重设出口节点（不重启核）。按 `endpoint_tag` 定位具体 tailscale 端点，
     /// `stable_id` = 目标出口节点的 `TailscalePeer.stableID`（对齐 proto `SetTailscaleExitNodeRequest`）。
     /// 服务端按 stableID EditPrefs{ExitNodeID}，幂等。带 [`UNARY_DEADLINE`] deadline 保证必 settle。
@@ -384,7 +397,9 @@ impl SingBoxApiClient {
     /// 首帧超时（3s）→ [`ClientError::SnapshotTimeout`]（调用方跳过断连，不阻断已成功的 PUT）。
     /// 返回快照含**已关闭的死连接**（内核历史环）——由调用方按 `closedAt` 过滤。
     pub async fn first_connection_snapshot(&self) -> Result<Vec<daemon::Connection>, ClientError> {
-        let mut c = self.client();
+        let mut c = self
+            .client()
+            .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: SNAPSHOT_INTERVAL_NS,
         }));

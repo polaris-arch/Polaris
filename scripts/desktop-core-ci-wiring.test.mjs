@@ -185,6 +185,31 @@ test('all five producer and consumer Go setup steps select the pinned desktop so
 });
 
 test('candidate checkout and App/helper identity follow PR head instead of a default merge or old source', () => {
+  // Windows directory acceptance reads the full contract, which legitimately
+  // contains empty source-policy keys; PSCustomObject cannot represent them.
+  const contract = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/release-contract.json'), 'utf8'));
+  const hasEmptyKey = (value) => value && typeof value === 'object'
+    && (Object.hasOwn(value, '') || Object.values(value).some(hasEmptyKey));
+  assert.ok(hasEmptyKey(contract), 'exercise the actual contract shape that broke PowerShell parsing');
+  function requireDirectoryInputs(ci, producer) {
+    for (const source of [ci, producer]) {
+      const read = source.split('\n').filter((line) => line.includes('release-contract.json') && line.includes('ConvertFrom-Json'));
+      assert.equal(read.length, 1, 'one full contract read per acceptance entry');
+      assert.match(read[0], /ConvertFrom-Json -AsHashtable\)\.platforms\.win/);
+    }
+    assert.match(ci, /go-version: \$\{\{ steps\.windows_directory_go\.outputs\.version \}\}/);
+    assert.match(ci, /\$pins\.Count -ne 1/);
+    assert.match(ci, /version=\$\(\$pins\[0\]\.Groups\[1\]\.Value\)/);
+    assert.doesNotMatch(ci, /go-version-file: \.windows-directory-kernel\/go\.mod/);
+    assert.match(producer, /\$actualGo -cne \$expectedGo/);
+  }
+  const ci = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+  const producer = readFileSync(join(root, 'scripts/windows-directory/Build-And-Test.ps1'), 'utf8');
+  requireDirectoryInputs(ci, producer);
+  assert.throws(() => requireDirectoryInputs(ci.replace('ConvertFrom-Json -AsHashtable', 'ConvertFrom-Json'), producer));
+  assert.throws(() => requireDirectoryInputs(ci, producer.replace('ConvertFrom-Json -AsHashtable', 'ConvertFrom-Json')));
+  assert.throws(() => requireDirectoryInputs(ci.replace('go-version: ${{ steps.windows_directory_go.outputs.version }}',
+    'go-version-file: .windows-directory-kernel/go.mod'), producer));
   candidates(files);
   assert.throws(() => candidates({ ...files, 'desktop-core': files['desktop-core'].replace('ref: ${{ inputs.candidate }}', 'ref: ${{ github.sha }}') }));
   assert.throws(() => candidates({ ...files, package: files.package.replace('POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}', 'POLARIS_BUILD_ID: ${{ github.sha }}') }));

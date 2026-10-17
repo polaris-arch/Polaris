@@ -282,6 +282,11 @@ export const updateApi = {
 // ============================================================================
 
 export const coreApi = {
+  /** Bounded capabilities query, independent of the legacy display version probe. */
+  async getTlsFingerprints(): Promise<import('@/domain/utls').TlsFingerprintSnapshot> {
+    const response = await invoke<{ tlsFingerprints: import('@/domain/utls').TlsFingerprintSnapshot }>(IPC_CHANNELS.CORE_GET_VERSION_INFO, { capabilitiesOnly: true });
+    return response.tlsFingerprints;
+  },
   async getVersionInfo(): Promise<CoreVersionInfo> {
     return invoke(IPC_CHANNELS.CORE_GET_VERSION_INFO);
   },

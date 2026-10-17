@@ -1498,7 +1498,7 @@ async fn prepare_tombstones_are_bounded_and_evicted_starts_are_rejected() {
 #[tokio::test]
 async fn login_creates_private_parent_without_prior_main_core_start() {
     let root = temp_ud();
-    let ud = root.join("not-created/app-config");
+    let ud = root.join("not-created").join("app-config");
     let reg = reg_with(
         fake_spawner(vec![], false, false),
         fake_subscriber(false),
@@ -2584,7 +2584,12 @@ fn keyless_identity_replacement_enters_the_backend_transaction_only_where_the_ba
 #[tokio::test]
 async fn logout_parks_actual_key_and_retires_only_auth_preserving_taildrop_and_history() {
     let fixture = CredentialFixture::new(true);
+    // This local auth projection fixture is legacy state, not a forged native
+    // directory capability; managed retirement is covered by real interop tests.
+    let legacy = fixture.directory.join("tailscale").join("ts1");
+    std::fs::create_dir_all(&legacy).unwrap();
     let state = fixture.mesh.tailscale_state_dir("ts1").unwrap();
+    assert_eq!(state, legacy);
     std::fs::create_dir_all(state.join("Taildrop")).unwrap();
     std::fs::write(state.join("Taildrop/user-file"), b"user-content").unwrap();
     let sealed = polaris_source_probe::repo_bytes_in(
@@ -3488,4 +3493,95 @@ async fn f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects
     pause.surrender().unwrap();
     reg.prepare("ts1", "f1-next").await.unwrap();
     std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_main_reservation_accepts_only_logical_or_exact_selected_physical_state() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = reg.state_gate().await;
+    let logical = root.join("tailscale").join("ts1");
+    let physical = crate::runtime::windows_directory::actual_directory(&root, "ts1").unwrap();
+    assert_ne!(physical, logical);
+    assert!(!physical.exists());
+    for accepted in [&logical, &physical] {
+        let generated = json!({"endpoints":[{"type":"tailscale", "state_directory":accepted}]});
+        let reservation = reg
+            .reserve_main_states(&generated, &root, &gate, reg.mint_main_birth())
+            .await
+            .unwrap();
+        assert!(reservation.claim_token().is_some());
+        drop(reservation);
+        assert_eq!(
+            reg.owner_state_under_gate("ts1", &gate),
+            TsRegistryOwnerState::Vacant
+        );
+        assert!(
+            !physical.exists(),
+            "reservation must not create native custody"
+        );
+    }
+    let duplicate = json!({"endpoints":[
+        {"type":"tailscale", "state_directory":logical},
+        {"type":"tailscale", "state_directory":physical}
+    ]});
+    assert!(
+        reg.reserve_main_states(&duplicate, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err(),
+        "logical and physical names must not book the same ID twice"
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    for rejected in [
+        root.join("other").join("ts1"),
+        physical.join("nested"),
+        root.join("tailscale-windows-v1-sibling").join("ts1"),
+        root.join("tailscale-windows-v1").join("CON"),
+    ] {
+        let generated = json!({"endpoints":[
+            {"type":"tailscale", "state_directory":logical},
+            {"type":"tailscale", "state_directory":rejected}
+        ]});
+        assert!(reg
+            .reserve_main_states(&generated, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err());
+        assert_eq!(
+            reg.owner_state_under_gate("ts1", &gate),
+            TsRegistryOwnerState::Vacant
+        );
+    }
+    std::fs::create_dir_all(&logical).unwrap();
+    std::fs::write(logical.join("sentinel"), b"legacy bytes").unwrap();
+    assert_eq!(
+        crate::runtime::windows_directory::actual_directory(&root, "ts1").unwrap(),
+        logical
+    );
+    let shadowed = json!({"endpoints":[{"type":"tailscale", "state_directory":physical}]});
+    assert!(
+        reg.reserve_main_states(&shadowed, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err(),
+        "a physical sibling is invalid once legacy state is selected"
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    assert_eq!(
+        std::fs::read(logical.join("sentinel")).unwrap(),
+        b"legacy bytes"
+    );
+    assert!(
+        crate::runtime::windows_directory::DirectoryLease::acquire(&root, "ts1", true).is_err()
+    );
 }

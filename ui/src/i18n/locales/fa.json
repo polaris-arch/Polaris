@@ -518,6 +518,11 @@
     "switchRequiresApply": "{{node}} · ذخیره شد؛ پیش از استفاده تغییرات معلق را اعمال کنید"
   },
   "settings": {
+    "utls": {
+      "label": "Global uTLS fingerprint",
+      "description": "Follow preserves node settings. Overrides affect generated configuration only. Random selects once per core process; Randomized uses a randomized template.",
+      "follow": "Follow node"
+    },
     "coex": {
       "windowsHint": "منابع بومی جداگانه نمایش داده می‌شوند. کامل بودن و compartment ممکن است نامعلوم بماند. ارتباط رابط، انتخاب مسیر یا نتیجه ایمنی استنباط نمی‌شود.",
       "adaptersSource": "آداپتورها",
@@ -772,7 +777,7 @@
       "fakeIpTunOffConfirmDesc": "در حالت TUN، پس از غیرفعال‌سازی، نودهای پروکسی به‌جای دامنه IPهای واقعی دریافت می‌کنند. برخی فروشندگان با سیاست‌های ضدسوءاستفادهٔ سخت‌گیرانه ممکن است اتصال را رد کنند (گواهی نامعتبر یا صفحهٔ مسدودسازی) و این ریسک از سمت کلاینت قابل کاهش نیست. تأخیر اولین اتصال خارجی نیز افزایش می‌یابد. به‌هرحال غیرفعال شود؟",
       "fakeIpTunOffConfirmOk": "به‌هرحال غیرفعال کن",
       "fakeIpFilter": "دامنه‌های استثنای FakeIP",
-      "fakeIpFilterDesc": "این دامنه‌ها به‌جای fake-IP از DNS واقعی استفاده می‌کنند. توصیه می‌شود.",
+      "fakeIpFilterDesc": "دامنه‌های منطبق پیش از قوانین DNS کاربر به یک تفکیک‌کنندهٔ واقعی فرستاده می‌شوند. روشن بودن توصیه می‌شود.",
       "nodeResolverDnspod": "DNSPod (DoH)",
       "nodeResolverSystem": "DNS سیستم",
       "takeoverSystemDns": "در دست گرفتن DNS سیستم",
@@ -1207,6 +1212,8 @@
       "defaultDirect": "DNS مستقیم پیش‌فرض",
       "defaultProxy": "DNS پراکسی پیش‌فرض",
       "defaultUnmatched": "قانون پیش‌فرض",
+      "realQueryFallback": "جایگزین پرس‌وجوی واقعی",
+      "realQueryFallbackHint": "وقتی قانون پیش‌فرض FakeIP باشد، پاسخ A/AAAA همچنان نشانی ساختگی است. سایر پرس‌وجوها (مانند HTTPS، SVCB و TXT) از این سرور استفاده می‌کنند یا رد می‌شوند. تفکیک پرس‌وجوهای داخلی تغییر نمی‌کند؛ DNS پراکسی پیش‌فرض، جایگزین عمومی همهٔ انواع پرس‌وجو نیست.",
       "defaultAdvanced": "حفظ اقدام پیشرفته · {{type}}",
       "resourceInUse": "حذف ممکن نیست: منبع در حال استفاده است",
       "resourceInUseDesc": "ابتدا این ارجاع‌ها را حذف کنید: {{refs}}",
@@ -1214,7 +1221,7 @@
       "resourceRefGroup": "گروه سرور «{{name}}»",
       "resourceRefServer": "سرور DNS «{{name}}»",
       "resourceRefDefault": "پیش‌فرض «{{name}}»",
-      "fakeIpDesc": "با IPهای ساختگی پاسخ می‌دهد تا از مسموم‌سازی DNS بگذرد",
+      "fakeIpDesc": "برای پرس‌وجوهای A/AAAA نشانی ساختگی برمی‌گرداند تا از مسموم‌سازی DNS جلوگیری شود",
       "remoteDns": "DNS دوردست",
       "remoteDnsDesc": "سرور بالادستی برای دامنه‌های خارج از کشور",
       "domesticDns": "DNS داخلی",
@@ -1241,7 +1248,7 @@
       "customDohIpOnly": "باید به شکل IP خالص باشد (مانند 223.5.5.5 یا tls://223.5.5.5:853)؛ نام دامنه پذیرفته نمی‌شود",
       "raceEmptyFallback": "اگر همه خاموش باشند، به رقابت پیش‌فرض ali/dnspod برمی‌گردد",
       "fakeIpFilterFold": "دامنه‌هایی که FakeIP نمی‌گیرند",
-      "fakeIpFilterHint": "این دامنه‌ها به IP واقعی تفکیک می‌شوند (همگام‌سازی زمان NTP، STUN، بررسی درگاه اسیرکننده و مانند آن)",
+      "fakeIpFilterHint": "استثناهای معمول پیش از قوانین DNS کاربر از DNS داخلی استفاده می‌کنند؛ استثناهای بررسی درگاه اسیرکننده همچنان از تفکیک‌کنندهٔ داخلی استفاده می‌کنند. این گزینه سرور واقعی را مشخص می‌کند و صرفاً FakeIP را رد نمی‌کند.",
       "addDomain": "افزودن دامنه",
       "browserDohTitle": "مسدودسازی DoH مرورگر",
       "browserDohDesc": "«DNS امن» داخلی مرورگر مدیریت DNS این برنامه را دور می‌زند، بنابراین مسیریابی بر پایهٔ دامنه و FakeIP روی آن اثری ندارد. با روشن‌کردن، نقاط انتهایی فهرست روی ۴۴۳/۸۵۳ و QUIC رد می‌شوند و مرورگر به DNS سیستم بازمی‌گردد. به‌صورت پیش‌فرض خاموش است.",
@@ -1252,7 +1259,7 @@
       "upstreamPreset": "پیش‌تنظیم سرور بالادست",
       "raceCustomHint": "آپ‌استریم‌های سفارشی باید نشانی IP خالص باشند (خودشان نباید نیاز به تفکیک نام داشته باشند) و از سهمیهٔ رقابت استفاده می‌کنند.",
       "raceCustomEmpty": "هیچ آپ‌استریم سفارشی وجود ندارد",
-      "fakeIpFilterEmpty": "استثنایی وجود ندارد؛ همهٔ دامنه‌ها از FakeIP عبور می‌کنند",
+      "fakeIpFilterEmpty": "استثنای سفارشی وجود ندارد؛ پرس‌وجوهای A/AAAA می‌توانند از FakeIP استفاده کنند",
       "browserDohEmpty": "فهرست خالی است؛ چیزی مسدود نمی‌شود"
     }
   },
@@ -1457,7 +1464,7 @@
     "dnsActionServerHeading": "سرورهای DNS",
     "dnsActionHostsHeading": "Hosts",
     "dnsActionResponseHeading": "عملیات پاسخ",
-    "dnsActionDescription_fakeIp": "بازگرداندن نشانی ساختگی بدون پرس‌وجو از DNS بالادستی",
+    "dnsActionDescription_fakeIp": "بازگرداندن نشانی ساختگی برای پرس‌وجوهای A/AAAA بدون پرس‌وجو از DNS بالادستی",
     "dnsActionDescription_reject": "توقف پرس‌وجو و بازگرداندن پاسخ رد",
     "dnsActionDescription_predefined": "بازگرداندن RCODE و رکوردهای از پیش تنظیم‌شده",
     "dnsActionUnavailable": "در حال حاضر در دسترس نیست",
@@ -2428,6 +2435,14 @@
     "masque": "تونل IP شخصی"
   },
   "node": {
+    "utls": {
+      "legacy": "Unset (legacy default)",
+      "default": "Core default fingerprint",
+      "disabled": "Disable uTLS (keep TLS)",
+      "loading": "Checking core fingerprint capabilities…",
+      "unavailable": "Fingerprint capabilities unavailable: {{reason}}. Existing settings are retained and checked by the core.",
+      "realityRequired": "REALITY requires uTLS. Choose the core default or a supported fingerprint."
+    },
     "field": {
       "aid": "AlterID",
       "alpn": "ALPN",

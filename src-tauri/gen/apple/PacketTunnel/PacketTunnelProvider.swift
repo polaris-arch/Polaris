@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Libbox
 import NetworkExtension
@@ -13,6 +14,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var commandServer: LibboxCommandServer?
     private var commandIdentity: TunnelIdentity?
     private var configContent: String?
+    private var managedBootstrap: (identity: TunnelIdentity, token: UInt64, ownerNonce: String, completion: TunnelCompletion<Error?>)?
     private var reportURL: URL?
     private let reportLock = NSLock()
     private let logger = Logger(subsystem: "com.polaris.app", category: "PacketTunnel")
@@ -20,12 +22,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let completion = TunnelCompletion<Error?>(completionHandler)
         do {
+            let bootstrap = options?["directoryBootstrapVersion"] as? String == "polaris-ios-g4-bootstrap-v1"
+            let supplied = options?["configContent"] as? String
             guard let configuration = protocolConfiguration as? NETunnelProviderProtocol,
                   let identity = identity(from: configuration.providerConfiguration),
-                  let supplied = options?["configContent"] as? String,
                   options?["sessionID"] as? String == identity.sessionID,
                   options?["requestID"] as? String == identity.requestID,
-                  digest(supplied) == identity.configDigest
+                  bootstrap ? supplied == nil : (supplied.map { digest($0) == identity.configDigest } ?? false)
             else { throw tunnelError("The tunnel start request does not match its saved session/configuration identity") }
             try prepareReportURL()
             let token = try lifecycle.start(identity)
@@ -41,11 +44,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             worker.async {
                 do {
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start was superseded") }
-                    let base = try self.sharedDirectory()
+                    let base = try self.sharedDirectory().resolvingSymlinksInPath()
                     let working = base.appendingPathComponent("tunnel", isDirectory: true)
                     let temp = working.appendingPathComponent("tmp", isDirectory: true)
                     try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
-                    guard !supplied.isEmpty else { throw tunnelError("Tunnel configuration is empty") }
+                    guard bootstrap || supplied?.isEmpty == false else { throw tunnelError("Tunnel configuration is empty") }
                     let setup = LibboxSetupOptions()
                     setup.basePath = base.path
                     setup.workingPath = working.path
@@ -56,7 +59,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     var error: NSError?
                     LibboxSetup(setup, &error)
                     if let error { throw error }
-                    guard let server = LibboxNewStrictCommandServer(self.platform, self.platform, &error) else {
+                    let ownerNonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                    let constructed = bootstrap
+                        ? LibboxNewManagedStrictCommandServer(self.platform, self.platform, base.path, ownerNonce, &error)
+                        : LibboxNewStrictCommandServer(self.platform, self.platform, &error)
+                    guard let server = constructed else {
                         throw error ?? tunnelError("Libbox command server could not be created")
                     }
                     // Construction already owns OOM/power resources. Retain the handle
@@ -66,10 +73,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if let error { throw error }
                     try server.start()
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start was superseded") }
+                    if bootstrap {
+                        // No service/run/config exists yet. Keep Start pending until
+                        // the host verifies this exact server's ABI/source and activates.
+                        self.managedBootstrap = (identity, token, ownerNonce, completion)
+                        return
+                    }
+                    guard let supplied else { throw tunnelError("Tunnel configuration is absent") }
                     try server.startOrReloadService(supplied, options: LibboxOverrideOptions())
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start finished after cancellation/timeout") }
                     self.configContent = supplied
                     self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
+                    self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
                     self.lifecycle.complete(token, phase: "running", stopped: false)
                     self.publishReport()
                     completion.finish(nil)
@@ -108,6 +123,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// remains sticky and visible even after Go detaches its Instance reference.
     private func closeCore() -> String? {
         var failure: String?
+        if let pending = managedBootstrap {
+            managedBootstrap = nil
+            pending.completion.finish(tunnelError("Managed bootstrap was stopped before activation"))
+        }
         if let commandServer {
             do { try commandServer.closeService() } catch {
                 failure = error.localizedDescription
@@ -118,6 +137,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // runs. Collect its immutable terminal before losing this exact handle.
             if let commandIdentity {
                 lifecycle.retainTailscaleStoreScope(commandServer.exportTailscaleStoreRetirement(), identity: commandIdentity)
+                lifecycle.retainTailscaleDirectoryScope(commandServer.exportTailscaleDirectoryRetirement(), identity: commandIdentity, terminal: true)
             }
             commandServer.close() // closes listener/OOM/power even if Start failed
         }
@@ -148,6 +168,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 try server.startOrReloadService(config, options: LibboxOverrideOptions())
                 if let commandIdentity = self.commandIdentity {
                     self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: commandIdentity)
+                    self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: commandIdentity)
                 }
                 guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel reload finished after cancellation/timeout") }
                 self.lifecycle.complete(token, phase: "running", stopped: false)
@@ -171,10 +192,51 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     func logDebugMessage(_ message: String) { logger.debug("\(message, privacy: .private)") }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
+        if messageData == Data("tls-fingerprints".utf8) {
+            // Optional symbol permits old static libbox. Hash the containing
+            // executable, never relabel an input archive hash as loaded bytes.
+            guard let executable = Bundle.main.executableURL else { completionHandler?(nil); return }
+            worker.async {
+                do {
+                    func digest() throws -> String {
+                        let file = try FileHandle(forReadingFrom: executable)
+                        defer { try? file.close() }
+                        var hash = SHA256()
+                        while let bytes = try file.read(upToCount: 65536), !bytes.isEmpty { hash.update(data: bytes) }
+                        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+                    }
+                    let before = try digest()
+                    var document: String?
+                    if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "LibboxTLSFingerprintCapabilities") {
+                        // dlsym may resolve a same-named export in a different image.
+                        // Bind this query to the final extension container; this is not
+                        // a claim to hash relocated in-memory executable pages.
+                        var image = Dl_info()
+                        guard dladdr(symbol, &image) != 0, let name = image.dli_fname,
+                              tlsCapabilityImageMatches(String(cString: name), executable: executable)
+                        else { completionHandler?(nil); return }
+                        typealias Query = @convention(c) (AutoreleasingUnsafeMutablePointer<NSError?>?) -> NSString?
+                        let query = unsafeBitCast(symbol, to: Query.self)
+                        var error: NSError?
+                        document = query(&error) as String?
+                        if error != nil { document = nil }
+                    }
+                    guard (document?.utf8.count ?? 0) <= 65536, before == (try digest())
+                    else { completionHandler?(nil); return }
+                    let reply: [String: Any] = ["document": document as Any? ?? NSNull(), "binarySha256": before]
+                    completionHandler?(try JSONSerialization.data(withJSONObject: reply))
+                } catch { completionHandler?(nil) }
+            }
+            return
+        }
         if messageData != Data("status".utf8) {
             guard let object = try? JSONSerialization.jsonObject(with: messageData) as? [String: Any],
                   let command = object["command"] as? String,
                   let identity = identity(from: object) else { completionHandler?(nil); return }
+            if command == "bootstrapCapability" || command == "activateManaged" {
+                worker.async { self.handleManagedBootstrap(command, object: object, identity: identity, reply: completionHandler) }
+                return
+            }
             if command == "observeSession" {
                 guard let nonce = object["observationNonce"] as? String,
                       let observation = lifecycle.observeSession(identity: identity, nonce: nonce,
@@ -199,6 +261,57 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler?(try? JSONEncoder().encode(lifecycle.report()))
     }
 
+    /// Runs only on the original worker, which also owns Start/Stop/CommandServer.
+    private func handleManagedBootstrap(_ command: String, object: [String: Any], identity: TunnelIdentity,
+                                        reply: ((Data?) -> Void)?) {
+        guard let pending = managedBootstrap, pending.identity == identity, commandIdentity == identity,
+              lifecycle.accepts(pending.token), let server = commandServer,
+              let nonce = object["observationNonce"] as? String, !nonce.isEmpty,
+              let capability = try? JSONSerialization.jsonObject(with: Data(server.exportTailscaleDirectoryCapability().utf8)) as? [String: Any],
+              capability["ownerNonce"] as? String == pending.ownerNonce else { reply?(nil); return }
+        if command == "bootstrapCapability" {
+            let response: [String: Any] = ["contractVersion": "polaris-ios-g4-bootstrap-v1",
+                "identity": ["sessionID": identity.sessionID, "requestID": identity.requestID, "configDigest": identity.configDigest],
+                "extensionGeneration": pending.token, "observationNonce": nonce, "capability": capability]
+            reply?(try? JSONSerialization.data(withJSONObject: response)); return
+        }
+        guard object["ownerNonce"] as? String == pending.ownerNonce,
+              (object["extensionGeneration"] as? NSNumber)?.uint64Value == pending.token,
+              let expectedSource = object["sourceIdentity"] as? String,
+              capability["sourceIdentity"] as? String == expectedSource,
+              capability["participating"] as? Bool == true,
+              let config = object["configContent"] as? String, !config.isEmpty,
+              digest(config) == identity.configDigest else { reply?(nil); return }
+        // One-shot, before crossing Go: neither a replay nor a late callback may
+        // activate another run under the original bootstrap approval.
+        managedBootstrap = nil
+        do {
+            try server.activateTailscaleDirectoryDomain(pending.ownerNonce, expectedSourceIdentity: expectedSource)
+            guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation was superseded") }
+            try server.startOrReloadService(config, options: LibboxOverrideOptions())
+            guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation returned after timeout/Stop") }
+            configContent = config
+            lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
+            lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
+            guard lifecycle.complete(pending.token, phase: "running", stopped: false),
+                  let observation = lifecycle.observeSession(identity: identity, nonce: nonce, expectedGeneration: pending.token) else {
+                throw tunnelError("Managed activation lost its original generation")
+            }
+            publishReport()
+            // Real tunnel settings were applied by StartOrReloadService. Only now
+            // may NE and the host observe successful original Start completion.
+            pending.completion.finish(nil)
+            reply?(try? JSONEncoder().encode(observation))
+        } catch {
+            let cleanup = closeCore()
+            lifecycle.complete(pending.token, phase: "failed", stopped: true,
+                error: error.localizedDescription, cleanup: cleanup)
+            publishReport()
+            pending.completion.finish(error)
+            reply?(nil)
+        }
+    }
+
     override func sleep(completionHandler: @escaping () -> Void) {
         let completion = TunnelCompletion<Void> { _ in completionHandler() }
         deadlines.asyncAfter(deadline: .now() + 2) { completion.finish(()) }
@@ -220,7 +333,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "PolarisAppGroup") as? String,
               let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
         else { throw tunnelError("App Group is unavailable; sign both iOS targets with the same group") }
-        return container.appendingPathComponent("polaris", isDirectory: true)
+        let directory = container.appendingPathComponent("polaris", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.resolvingSymlinksInPath()
     }
     private func prepareReportURL() throws {
         let directory = try sharedDirectory()

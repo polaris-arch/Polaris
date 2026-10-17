@@ -245,7 +245,7 @@ const PIPED_SITES: &[PipedSite] = &[
     PipedSite {
         file: "crates/core-supervisor/src/config_gate/check_custody.rs",
         // 常规平台 check 子进程的 custody owner，返回前两条流均交给 EOF 任务。
-        anchor: "fn spawn(",
+        anchor: "fn spawn_mode(",
         kind: SiteKind::Sink,
         drain_forms: &["output.read("],
     },
@@ -1118,7 +1118,7 @@ fn check_custody_starts_both_eof_readers_before_return() {
         &index,
         "crates/core-supervisor/src/config_gate/check_custody.rs",
     );
-    let spawn = block_of(owner, "fn spawn(");
+    let spawn = block_of(owner, "fn spawn_mode(");
     let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
     let factory_call = "Self::attach_child(run,&mutbuilder)";
     // 此新增形态只登记原 custody 的两条实际调用；不能把同名空 helper
@@ -1156,9 +1156,57 @@ fn check_custody_starts_both_eof_readers_before_return() {
     }
     let read = block_of(owner, "fn read<R:");
     assert!(read.contains("tokio::spawn("), "EOF reader 必须立即起任务");
+    let read_compact: String = read.chars().filter(|c| !c.is_whitespace()).collect();
+    let read_task = read_compact
+        .split_once("tokio::spawn(asyncmove{")
+        .expect("the actual asynchronous read task must exist")
+        .1
+        .split_once("});letmuttasks=")
+        .expect("reader registration must remain outside the read task")
+        .0;
+    // The capability query retains at most 64 KiB per stream, while both
+    // actual pipes keep draining after that retention budget is exhausted.
+    assert!(compact.contains("max_bytes:config.is_none().then_some(64*1024),"));
+    for required in [
+        "letmutchunk=[0_u8;8192];",
+        "letmutoverflow=false;",
+        "loop{matchpipe.read(&mutchunk).await{",
+        "Ok(0)=>break,",
+        "letremaining=output.max_bytes.map(|limit|limit.saturating_sub(bytes.len())).unwrap_or(count);",
+        "bytes.extend_from_slice(&chunk[..count.min(remaining)]);",
+        "overflow|=count>remaining;",
+        "ifoverflow{ifletOk(muterrors)=output.errors.lock(){errors.push(",
+    ] {
+        assert_eq!(
+            read_task.matches(required).count(),
+            1,
+            "bounded EOF capture lost its exact source contract: {required}"
+        );
+    }
+    let count_arm = read_task
+        .split_once("Ok(count)=>{")
+        .expect("the real read count arm must exist")
+        .1
+        .split_once("Err(error)=>{")
+        .expect("the real read error arm must remain distinct")
+        .0;
     assert!(
-        read.contains("pipe.read_to_end("),
-        "读任务必须将真实 pipe 读到 EOF"
+        !count_arm.contains("break") && !count_arm.contains("return"),
+        "a data/overflow chunk must continue draining instead of leaving the reader"
+    );
+    assert_eq!(
+        read_task.matches("break").count(),
+        2,
+        "only EOF and a pipe I/O error end the drain loop"
+    );
+    assert_eq!(
+        read_task.matches("return").count(),
+        1,
+        "only a missing pipe may return before draining"
+    );
+    assert!(
+        !read.contains("read_to_end("),
+        "bounded capture must not restore an unbounded read"
     );
 }
 
