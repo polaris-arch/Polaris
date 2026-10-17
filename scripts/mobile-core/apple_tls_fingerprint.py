@@ -9,7 +9,7 @@ import sys
 
 sys.dont_write_bytecode = True
 from artifacts import file_pin, read_pinned, read_receipt
-from fork_input import require, sha
+from fork_input import decode, require, sha
 from producer import run
 
 SYMBOL = '_LibboxTLSFingerprintCapabilities'
@@ -53,7 +53,7 @@ def framework_path(framework, path):
     return resolved
 
 
-def prepare():
+def selected_inputs():
     context = Path(os.environ['POLARIS_MOBILE_LINK_INPUT'])
     require(sha(context.read_bytes()) == os.environ['POLARIS_MOBILE_LINK_INPUT_SHA256'],
             'actual mobile link context changed before TLS capability preparation')
@@ -72,6 +72,11 @@ def prepare():
     require(0 < len(headers) <= 64 and sum(p.stat().st_size for p in headers) <= 2 * 1024 * 1024,
             'libbox generated header inventory exceeds budget')
     header_inputs = {p.name: read_pinned(p) for p in headers}
+    return binary, selected, header_inputs
+
+
+def prepare():
+    binary, selected, header_inputs = selected_inputs()
     symbols = run(['xcrun', 'nm', '--no-llvm-bc', '-gU', binary])
     present = capability_present([raw.decode() for raw, _ in header_inputs.values()], symbols)
     flags, receipt = paths()
@@ -82,9 +87,10 @@ def prepare():
                                   'flags': file_pin(flags, allow_empty=True), 'devicePassed': False}) + '\n')
 
 
-def verify():
+def verify(receipt=None):
     flags, receipt_path = paths()
-    receipt = read_receipt(receipt_path)
+    if receipt is None:
+        receipt = read_receipt(receipt_path)
     require(file_pin(flags, allow_empty=True) == receipt['flags'], 'TLS capability linker flags changed')
     executable = Path(os.environ['TARGET_BUILD_DIR']) / os.environ['EXECUTABLE_PATH']
     if receipt['capabilityPresent']:
@@ -99,7 +105,72 @@ def verify():
                       'loadedQueryExecuted': False, 'devicePassed': False}))
 
 
+def prepared_inputs():
+    """Pinned parent observation, never a lease descriptor carried through Xcode."""
+    root = Path(os.environ['POLARIS_TLS_PREPARED_ROOT'])
+    flags, receipt = root / 'PolarisTLSFingerprintLinker.args', root / 'PolarisTLSFingerprintLinker.json'
+    require(receipt.stat().st_size <= 65536 and flags.stat().st_size <= 256,
+            'prepared TLS input size budget exceeded')
+    raw, pin = read_pinned(receipt)
+    require(pin['sha256'] == os.environ['POLARIS_TLS_PREPARED_SHA256'],
+            'parent TLS capability receipt changed')
+    value = decode(raw)
+    require(type(value.get('capabilityPresent')) is bool, 'prepared TLS capability decision differs')
+    flag_raw, flag_pin = read_pinned(flags, allow_empty=True)
+    require(flag_pin == value['flags'], 'parent TLS capability flags changed')
+    binary, selected, headers = selected_inputs()
+    require(selected['binary'] == value['binary'] and
+            {name: pin for name, (_, pin) in headers.items()} == value['headers'],
+            'prepared TLS capability inputs differ from selected framework')
+    expected = ('-Xlinker\n-u\n-Xlinker\n' + SYMBOL + '\n' if value['capabilityPresent'] else '').encode()
+    require(flag_raw == expected, 'unexpected TLS capability linker flags')
+    return flag_raw, raw
+
+
+def install():
+    # Xcode's service can preserve an FD number in env after closing/reusing its
+    # descriptor. This hook only checks/copies bytes; native tools run in the
+    # admitted parent before archive and again against the final archived image.
+    flag_raw, receipt_raw = prepared_inputs()
+    flags, receipt = paths()
+    require(not flags.is_symlink() and not receipt.is_symlink(), 'TLS linker output redirected')
+    flags.write_bytes(flag_raw)
+    receipt.write_bytes(receipt_raw)
+
+
+def verify_installed():
+    flag_raw, receipt_raw = prepared_inputs()
+    flags, receipt = paths()
+    require(read_pinned(flags, allow_empty=True)[0] == flag_raw and
+            read_pinned(receipt)[0] == receipt_raw, 'installed TLS linker inputs changed')
+    print(json.dumps({'scope': 'installed TLS linker input bytes only; final native verification belongs to parent',
+                      'loadedQueryExecuted': False, 'devicePassed': False}))
+
+
+def native_action(action):
+    from budget import reservation
+    from producer import ACTIVE_FDS, private_dir
+    from fork_input import load
+    require(os.environ.get('POLARIS_BUILD_RESERVATION_FD') is not None and
+            os.environ.get('POLARIS_FORMAL_APP_BUILD') == '1',
+            'native TLS inspection must inherit admitted parent reservation')
+    with reservation(private_dir(Path(os.environ['POLARIS_APP_WORK'])), load(), ACTIVE_FDS):
+        if action == 'verify':
+            # Bind final tools to the immutable pre-archive capability decision.
+            _, receipt_raw = prepared_inputs()
+            require(Path(os.environ['DERIVED_FILE_DIR']).resolve(strict=True) ==
+                    Path(os.environ['POLARIS_TLS_PREPARED_ROOT']).resolve(strict=True),
+                    'final TLS verifier must use parent prepared inputs')
+            verify(decode(receipt_raw))
+        else:
+            prepare()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['prepare', 'verify'])
-    {'prepare': prepare, 'verify': verify}[parser.parse_args().action]()
+    parser.add_argument('action', choices=['prepare', 'verify', 'install', 'verify-installed'])
+    action = parser.parse_args().action
+    if action in ('prepare', 'verify'):
+        native_action(action)
+    else:
+        {'install': install, 'verify-installed': verify_installed}[action]()

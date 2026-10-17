@@ -1,16 +1,16 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "App44c5 complete CI collected; native clippy, UI, classifier and four desktop installers passed. Focused rustdoc/source-probe/macOS fixture repairs and exact68ff mobile source migration await independent review and new CI. App candidate/SYSTEM acceptance remains unexecuted; kernel68ff passed its workflows and is merged.",
+  "status": "Appd712 complete CI: native build/tests/clippy/rustdoc, UI, Android and desktop installers passed. Windows acceptance JSON/toolchain entry and Apple Xcode budget-descriptor boundary repairs await review/new CI. Candidate/SYSTEM and Apple archive remain unaccepted.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
       "owner": "validation",
       "baseBlob": "9b2baff2796bf95831b3c533a9448ff2926bfd30",
-      "newBlob": "425b307a5936da943f9b3d0779890b52146661b8",
-      "newSHA256": "a15f44577872db95c6b5f3a042feba4762624344682a352dcdc3e1e7a15989ef",
+      "newBlob": "2f31b73a7d65ca59ce8d138ac0c63d17ff353f8b",
+      "newSHA256": "f79c798c7134f3ae5a017f011a2f2e4141292ea9836571fdd2ba735b5af844f4",
       "mode": "100644",
-      "bytes": 69104
+      "bytes": 69623
     },
     {
       "path": "README.en.md",
@@ -877,6 +877,15 @@
       "bytes": 3331
     },
     {
+      "path": "scripts/desktop-core-ci-wiring.test.mjs",
+      "owner": "app-ci-round4",
+      "baseBlob": "a9d689b6488fda6c3334e0e3b602327b14547509",
+      "mode": "100644",
+      "newBlob": "b6cb9b3866fc2d2c0c0dc7beb401931fa7858aa1",
+      "newSHA256": "a67b001cc030238eb4765b5ad65282877d03c64ab191b5b82f1ff6faae7ad94a",
+      "bytes": 19923
+    },
+    {
       "path": "scripts/desktop-core/release-consumer.mjs",
       "owner": "delivery",
       "baseBlob": "af7d544ba71dd4af9d37c6eae30d4e94c8849ce0",
@@ -976,6 +985,33 @@
       "bytes": 14951
     },
     {
+      "path": "scripts/mobile-core/apple_tls_fingerprint.py",
+      "owner": "app-ci-round4",
+      "baseBlob": "08d76b4bea70b42506cb0c37105e30bd9e3b0c89",
+      "mode": "100644",
+      "newBlob": "6d1bcda7c9b22ee3faf15c5e7581ca7b22ce715c",
+      "newSHA256": "83387c2bef9495122a939cf2f8b3b285201c426343d70d76f354da1c9dde12c6",
+      "bytes": 9249
+    },
+    {
+      "path": "scripts/mobile-core/build_apple_app.py",
+      "owner": "app-ci-round4",
+      "baseBlob": "c531b1ed1b3884c454fabe813953525303538a2e",
+      "mode": "100644",
+      "newBlob": "9aae9a24d7772190c0016b4afbde852710e7c77d",
+      "newSHA256": "0dd0debfc5d6cd620a7e257aec3e3a4f619ea9e446311ae06efffce8758419aa",
+      "bytes": 15909
+    },
+    {
+      "path": "scripts/mobile-core/ci_apple.py",
+      "owner": "app-ci-round4",
+      "baseBlob": "0ca62d9050d43eb3af67f57e954ee3383055c9dc",
+      "mode": "100644",
+      "newBlob": "2dd771d1aa8a7f4717a8afe1f03c4a8b7e2a94dc",
+      "newSHA256": "47561c6c946467b2a8a834b1a5201b4d86fcc0e2f873e7c64eeab9292c298253",
+      "bytes": 35113
+    },
+    {
       "path": "scripts/mobile-core/consume.py",
       "owner": "delivery",
       "baseBlob": "346d70575c8082fbdc3a3ac3df21f3e183d72fec",
@@ -1030,6 +1066,15 @@
       "bytes": 27624
     },
     {
+      "path": "scripts/mobile-core/test_apple_tls_fingerprint.py",
+      "owner": "app-ci-round4",
+      "baseBlob": "ae7dfc4df0f12019d7fe1a17da8fe5095bbb5ade",
+      "mode": "100644",
+      "newBlob": "50779405679410429716d3897adc8b08fc31425e",
+      "newSHA256": "83ada42550876272296a8565db110b54db5e930f187757e09cec467015144702",
+      "bytes": 18833
+    },
+    {
       "path": "scripts/mobile-core/test_delivery_boundaries.py",
       "owner": "delivery",
       "baseBlob": null,
@@ -1052,9 +1097,9 @@
       "owner": "app-ci-round2",
       "baseBlob": "cc51c7df9e3da5f7c701056a22240602e9d173cb",
       "mode": "100644",
-      "newBlob": "cb04f92036ab98c17153fa54380fa2d64bbf54f1",
-      "newSHA256": "9648fed5d7d4908305a95f4995860c2dbe82973ef6fd44956bf514265e186e3a",
-      "bytes": 47690
+      "newBlob": "9272ab5646fa7ee76fc17bf119dac20c4ff94ef6",
+      "newSHA256": "638dde1e708eed16dd62451bd6aed6dda229745f42c0b3d0db0a6fc4f3620f1f",
+      "bytes": 47702
     },
     {
       "path": "scripts/mobile-core/test_source_policy.py",
@@ -1114,10 +1159,10 @@
       "path": "scripts/windows-directory/Build-And-Test.ps1",
       "owner": "windows-app",
       "baseBlob": null,
-      "newBlob": "7978e800e5b241d501b5e2f73c143dda30f3d219",
-      "newSHA256": "273dba682ab5f84fed0e86057d599881d8a13baf6aaf3aef6a89c1bf92f6f9f0",
+      "newBlob": "e8b8db329f76aafaf4df1248e44f2429659e410c",
+      "newSHA256": "7d6676693d88e27b5bb804041d1da485aedf7d0f0e45779dc186c73e81af33d5",
       "mode": "100644",
-      "bytes": 9697
+      "bytes": 9710
     },
     {
       "path": "scripts/windows-directory/Run-SystemBootstrap.ps1",
@@ -1154,6 +1199,24 @@
       "newSHA256": "c8258c1fa62d965c438ca9bfca181daedd9eb9af2750a798864d5aca1f44d1e0",
       "mode": "100644",
       "bytes": 11159
+    },
+    {
+      "path": "src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj",
+      "owner": "app-ci-round4",
+      "baseBlob": "c96a9af7f92e62ed238776666d25893225d9feb2",
+      "mode": "100644",
+      "newBlob": "52fe8e8f9a576f45c9208855349929a97499f613",
+      "newSHA256": "6f9200eda357edf3520a95ba4e7fc494532a6c930beb22b762d45f8867e2b91c",
+      "bytes": 103578
+    },
+    {
+      "path": "src-tauri/gen/apple/project.yml",
+      "owner": "app-ci-round4",
+      "baseBlob": "0818d6609d52b27dce6aef50d8e44a8cf14cea6e",
+      "mode": "100644",
+      "newBlob": "ac4ee334cf21ac6e4ed0308b175f9ecf780552a5",
+      "newSHA256": "a2fdc3ef328bf58fa7dcd7a1ad14335acf153dc72eb51e684ddae57fbfe36ba3",
+      "bytes": 6801
     },
     {
       "path": "src-tauri/src/commands/rules/resources.rs",

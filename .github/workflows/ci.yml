@@ -852,7 +852,7 @@ jobs:
           if ($env:DIRECTORY_MODE -ceq 'candidate') {
             $source = $env:CANDIDATE_SOURCE
           } elseif ($env:DIRECTORY_MODE -ceq 'formal' -and [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE)) {
-            $source = (Get-Content scripts/desktop-core/release-contract.json -Raw | ConvertFrom-Json).platforms.win.sourceCommit
+            $source = (Get-Content scripts/desktop-core/release-contract.json -Raw | ConvertFrom-Json -AsHashtable).platforms.win.sourceCommit
           } else { throw 'Explicit mutually exclusive formal/candidate validation inputs required' }
           if ($source -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase source SHA missing' }
           "source=$source" >> $env:GITHUB_OUTPUT
@@ -867,11 +867,20 @@ jobs:
           persist-credentials: false
           clean: true
           fetch-depth: 1
+      - name: Resolve exact checked-out kernel toolchain
+        if: runner.os == 'Windows'
+        id: windows_directory_go
+        shell: pwsh
+        run: |
+          $mod = Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw
+          $pins = [regex]::Matches($mod, '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
+          if ($pins.Count -ne 1) { throw 'Expected one exact kernel source toolchain pin' }
+          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
       - name: Setup exact kernel Go toolchain
         if: runner.os == 'Windows'
         uses: actions/setup-go@v5
         with:
-          go-version-file: .windows-directory-kernel/go.mod
+          go-version: ${{ steps.windows_directory_go.outputs.version }}
           cache-dependency-path: .windows-directory-kernel/go.sum
       - name: Build and run native Windows directory producer and consumer acceptance
         id: windows_directory_acceptance

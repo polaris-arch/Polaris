@@ -23,7 +23,7 @@ if (Test-Path -LiteralPath $validationReceipt) {
 try {
 $appRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $kernelRoot = (Resolve-Path $KernelRoot).Path
-$win = (Get-Content -LiteralPath (Join-Path $appRoot 'scripts/desktop-core/release-contract.json') -Raw | ConvertFrom-Json).platforms.win
+$win = (Get-Content -LiteralPath (Join-Path $appRoot 'scripts/desktop-core/release-contract.json') -Raw | ConvertFrom-Json -AsHashtable).platforms.win
 if ($PSCmdlet.ParameterSetName -eq 'Candidate') {
     $source = $CandidateSourceCommit; $mode = 'candidate'
 } elseif ($PSCmdlet.ParameterSetName -eq 'Formal' -and $FormalContract) {

@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import time
@@ -188,6 +189,15 @@ def main():
         # This entry runs only in the eventual single uniform Mac validation phase.
         if not args.simulator:
             timed_phase('host-swift-controls', host_swift_controls, root, env)
+        # Xcode build-service hooks cannot inherit our reservation descriptor.
+        # Inspect optional TLS ABI under the admitted parent, then pass pinned
+        # data only to Xcode; final native checks run here after archive.
+        tls_root = private_dir(root / 'tls-link-input')
+        tls_env = dict(env, DERIVED_FILE_DIR=str(tls_root))
+        run([sys_python(), ROOT / 'scripts/mobile-core/apple_tls_fingerprint.py', 'prepare'],
+            env=tls_env, log=root / 'original-tls-prepare.log', capture='none')
+        env.update(POLARIS_TLS_PREPARED_ROOT=str(tls_root),
+                   POLARIS_TLS_PREPARED_SHA256=file_pin(tls_root / 'PolarisTLSFingerprintLinker.json')['sha256'])
         derived = private_dir(root / 'derived-data')
         archive = root / 'Polaris.xcarchive'
         require(not archive.exists(), 'existing actual archive must not be overwritten')
@@ -207,6 +217,16 @@ def main():
                     log=root / 'original-app-extension-link.log', capture='none')
         apps = list((archive / 'Products/Applications').glob('*.app'))
         require(len(apps) == 1 and not apps[0].is_symlink(), 'actual archived host App required')
+        extensions = list((apps[0] / 'PlugIns').glob('*.appex'))
+        require(len(extensions) == 1 and not extensions[0].is_symlink(), 'one actual PacketTunnel archive required')
+        extension_info = plistlib.loads((extensions[0] / 'Info.plist').read_bytes())
+        executable_name = extension_info['CFBundleExecutable']
+        require(isinstance(executable_name, str) and executable_name and
+                Path(executable_name).name == executable_name, 'PacketTunnel executable name differs')
+        final_tls_env = dict(env, DERIVED_FILE_DIR=str(tls_root),
+                             TARGET_BUILD_DIR=str(extensions[0]), EXECUTABLE_PATH=executable_name)
+        run([sys_python(), ROOT / 'scripts/mobile-core/apple_tls_fingerprint.py', 'verify'],
+            env=final_tls_env, log=root / 'original-tls-final-verify.log', capture='none')
         ipa = root / ('polaris-box-' + value['version'] + '-app-link-probe.ipa')
         require(not ipa.exists(), 'existing carrier must not be overwritten')
         with zipfile.ZipFile(ipa, 'x', compression=zipfile.ZIP_DEFLATED) as package:

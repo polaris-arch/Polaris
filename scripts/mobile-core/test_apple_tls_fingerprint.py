@@ -189,6 +189,104 @@ class OptionalTLSCapabilityLink(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'flags changed|bounded regular artifact required'):
                         subject.verify()
 
+    def test_xcode_hooks_use_pinned_bytes_with_stale_reservation_fd_and_no_tools(self):
+        for platform in ('iphoneos', 'iphonesimulator'):
+            for present in (False, True):
+                with self.subTest(platform=platform, present=present), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _, _, _, _, _, env = self.versioned_framework(root, platform, present)
+                    prepared = root / 'parent-prepared'
+                    with patch.dict(os.environ, dict(env, DERIVED_FILE_DIR=str(prepared))), \
+                            patch.object(subject, 'run', return_value='T ' + (subject.SYMBOL if present else '_LibboxVersion') + '\n'):
+                        subject.prepare()
+                    env.update(POLARIS_TLS_PREPARED_ROOT=str(prepared),
+                               POLARIS_TLS_PREPARED_SHA256=subject.file_pin(prepared / 'PolarisTLSFingerprintLinker.json')['sha256'],
+                               POLARIS_BUILD_RESERVATION_FD='999999')
+                    with patch.dict(os.environ, env), \
+                            patch.object(subject, 'run', side_effect=AssertionError('Xcode must not start native sessions')), \
+                            patch('budget.register_group', side_effect=AssertionError('Xcode must not access inherited fd')):
+                        subject.install()
+                        subject.verify_installed()
+                        flags, receipt = subject.paths()
+                        self.assertEqual(flags.read_bytes(), (prepared / flags.name).read_bytes())
+                        self.assertEqual(receipt.read_bytes(), (prepared / receipt.name).read_bytes())
+                        flags.write_text('tampered installed flags')
+                        with self.assertRaisesRegex(RuntimeError, 'installed TLS linker inputs changed'):
+                            subject.verify_installed()
+
+    def test_prepared_capability_receipt_flags_and_selected_bytes_cannot_drift(self):
+        for case in ('receipt', 'flags', 'binary', 'header', 'link'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _, binary, header, _, context, env = self.versioned_framework(root, 'iphoneos', True)
+                prepared = root / 'prepared'
+                with patch.dict(os.environ, dict(env, DERIVED_FILE_DIR=str(prepared))), \
+                        patch.object(subject, 'run', return_value='T ' + subject.SYMBOL + '\n'):
+                    subject.prepare()
+                env.update(POLARIS_TLS_PREPARED_ROOT=str(prepared),
+                           POLARIS_TLS_PREPARED_SHA256=subject.file_pin(prepared / 'PolarisTLSFingerprintLinker.json')['sha256'])
+                changed = {'receipt': prepared / 'PolarisTLSFingerprintLinker.json',
+                           'flags': prepared / 'PolarisTLSFingerprintLinker.args',
+                           'binary': binary, 'header': header, 'link': context}[case]
+                changed.write_bytes(changed.read_bytes() + b'changed')
+                with patch.dict(os.environ, env), patch.object(subject, 'run') as native:
+                    with self.assertRaises(RuntimeError):
+                        subject.install()
+                    native.assert_not_called()
+
+    def test_native_actions_refuse_missing_or_closed_parent_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {'POLARIS_APP_WORK': str(Path(tmp) / 'work'),
+                   'POLARIS_BUILD_BUDGET_ROOT': str(Path(tmp) / 'budget'),
+                   'POLARIS_FORMAL_APP_BUILD': '1'}
+            with patch.dict(os.environ, env, clear=True), patch.object(subject, 'prepare') as prepare:
+                with self.assertRaisesRegex(RuntimeError, 'admitted parent reservation'):
+                    subject.native_action('prepare')
+                os.environ['POLARIS_BUILD_RESERVATION_FD'] = '999999'
+                with self.assertRaises(OSError):
+                    subject.native_action('prepare')
+                prepare.assert_not_called()
+
+    def test_native_action_keeps_real_parent_reservation_for_inert_child(self):
+        import sys
+        from budget import reservation
+        from producer import ACTIVE_FDS, private_dir, run
+        with tempfile.TemporaryDirectory() as tmp:
+            root = private_dir(Path(tmp) / 'work')
+            value = {'budget': {'buildPeakReserveBytes': 1}}
+            env = {'POLARIS_APP_WORK': str(root), 'POLARIS_FORMAL_APP_BUILD': '1',
+                   'POLARIS_BUILD_BUDGET_ROOT': str(Path(tmp) / 'budget')}
+            with patch.dict(os.environ, env, clear=True), patch('fork_input.load', return_value=value), \
+                    reservation(root, value, ACTIVE_FDS):
+                original_fd = int(os.environ['POLARIS_BUILD_RESERVATION_FD'])
+                def inert_prepare():
+                    self.assertIn(original_fd, ACTIVE_FDS)
+                    self.assertEqual(run([sys.executable, '-c', 'print("inert native-tool control")']).strip(),
+                                     'inert native-tool control')
+                with patch.object(subject, 'prepare', side_effect=inert_prepare):
+                    subject.native_action('prepare')
+                row = json.loads(os.pread(original_fd, 8192, 0))
+                self.assertEqual(row['groups'], [])
+                self.assertIn(original_fd, ACTIVE_FDS)
+
+    def test_parent_runs_native_tls_checks_around_archive_before_carrier_acceptance(self):
+        root = Path(__file__).resolve().parents[2]
+        builder = (root / 'scripts/mobile-core/build_apple_app.py').read_text()
+        before = builder.index("'original-tls-prepare.log'")
+        archive = builder.index("timed_phase('app-extension-archive'")
+        after = builder.index("'original-tls-final-verify.log'")
+        accept = builder.index("timed_phase('final-carrier-inspection'")
+        self.assertLess(before, archive)
+        self.assertLess(archive, after)
+        self.assertLess(after, accept)
+        for name in ('project.yml', 'polaris.xcodeproj/project.pbxproj'):
+            text = (root / 'src-tauri/gen/apple' / name).read_text()
+            self.assertIn('apple_tls_fingerprint.py', text)
+            self.assertIn(' verify-installed', text)
+            self.assertIn(' install', text)
+            self.assertNotIn(' prepare', text)
+
+
 
 if __name__ == '__main__':
     unittest.main()

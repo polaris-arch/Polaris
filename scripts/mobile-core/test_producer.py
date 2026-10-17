@@ -31,9 +31,9 @@ class ProducerCalls(unittest.TestCase):
             producer.run(['never-executed'], capture='none')
         spawn.assert_not_called(); opened.assert_not_called()
 
-    def test_only_fifteen_logged_nonconsumers_disable_full_capture(self):
+    def test_only_seventeen_logged_nonconsumers_disable_full_capture(self):
         directory = Path(producer.__file__).parent
-        expected = {'producer.py': 3, 'ci_apple.py': 5, 'build_apple_app.py': 6, 'apple_rust.py': 1}
+        expected = {'producer.py': 3, 'ci_apple.py': 5, 'build_apple_app.py': 8, 'apple_rust.py': 1}
         for filename, count in expected.items():
             tree = ast.parse((directory / filename).read_text())
             selected, symbols = [], []
@@ -346,7 +346,7 @@ class ProducerCalls(unittest.TestCase):
         link_helper = 'scripts/mobile-core/apple_tls_fingerprint.py'
         for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
             source = (producer.ROOT / project).read_text()
-            for action in ('prepare', 'verify'):
+            for action in ('install', 'verify-installed'):
                 self.assertRegex(source, re.escape(link_helper) + r'\\?"\s+' + action)
 
         self.assertEqual(observed['originalProducerCandidate'], 'a'*40)

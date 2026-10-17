@@ -2047,7 +2047,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\npython3 \"$SRCROOT/../../../scripts/mobile-core/consume.py\" verify-link \\\n  --link-input \"${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}\" \\\n  --link-input-sha256 \"${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}\" \\\n  --scratch \"${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}\"\npython3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" prepare\n";
+			shellScript = "set -e\npython3 \"$SRCROOT/../../../scripts/mobile-core/consume.py\" verify-link \\\n  --link-input \"${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}\" \\\n  --link-input-sha256 \"${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}\" \\\n  --scratch \"${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}\"\npython3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" install\n";
 		};
 		6BA4F5A019704F91829A51D3 /* Verify TLS Capability Link */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -2059,7 +2059,7 @@
 			outputPaths = ();
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "python3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" verify\n";
+			shellScript = "python3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" verify-installed\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
