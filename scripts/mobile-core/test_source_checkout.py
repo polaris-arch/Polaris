@@ -1,6 +1,7 @@
 """Real local Git transport controls; no Go/SDK/build/publication acceptance."""
 from copy import deepcopy
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,14 @@ from unittest.mock import patch
 import ci_android
 from fork_input import git_environment, verify_source
 from test_source_policy import future_mobile_fixture
+
+
+def fixture_git(args):
+    # Disposable repositories need no auto maintenance. Git may otherwise detach
+    # a writer that outlives a completed commit/fetch and races strict cleanup.
+    # Command-scoped settings also cover fetch-created repositories and children.
+    assert str(args[0]) == 'git'
+    return ['git', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', *args[1:]]
 
 
 class ImmutableSourceCheckout(unittest.TestCase):
@@ -42,10 +51,11 @@ class ImmutableSourceCheckout(unittest.TestCase):
                  'commit', '-qm', 'later source')
         self.tag()
         self.calls = []
-        self.real_run = ci_android.run
+        run = ci_android.run
+        self.real_run = lambda args, **kwargs: run(fixture_git(args), **kwargs)
 
     def git(self, *args):
-        return subprocess.check_output(['git', '-C', str(self.remote), *args],
+        return subprocess.check_output(fixture_git(['git', '-C', str(self.remote), *args]),
                 env=git_environment(), text=True, stderr=subprocess.PIPE).strip()
 
     def tag(self):
@@ -109,6 +119,29 @@ class ImmutableSourceCheckout(unittest.TestCase):
             ci_android.prepare_source(self.root / 'refused', self.value)
         self.assertEqual(len([c for c in self.calls if 'fetch' in c]), 1)
         self.assertFalse(any('checkout' in c for c in self.calls))
+
+    def test_low_threshold_auto_gc_is_disabled_for_fixture_writers(self):
+        self.git('config', 'gc.auto', '1')
+        self.git('config', 'gc.autoDetach', 'false')
+        self.git('config', 'maintenance.autoDetach', 'false')
+        self.git('config', 'maintenance.auto', 'true')
+        trace = self.root / 'git-trace.json'
+        env = dict(git_environment(), GIT_TRACE2_EVENT=str(trace))
+        command = ['git', '-C', str(self.remote), '-c', 'user.name=Fixture',
+                   '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'trace']
+        # A deliberately low repository threshold cannot override fixture policy.
+        subprocess.run(fixture_git(command), env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        guarded = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertFalse(any(row.get('event') == 'child_start' and
+                             any(arg in ('maintenance', 'gc') for arg in row.get('argv', []))
+                             for row in guarded))
+        trace.unlink()
+        # Negative control: same repository/threshold without the guard really
+        # starts maintenance. Detach is explicitly off, so this probe also waits.
+        subprocess.run(command, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        unguarded = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertTrue(any(row.get('event') == 'child_start' and
+                            'gc' in row.get('argv', []) for row in unguarded))
 
     def test_invalid_contract_fails_before_source_mutation(self):
         value = deepcopy(self.value)
