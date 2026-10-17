@@ -12,6 +12,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 const PLATFORM: &str = "windows-ntfs-v1";
 const ROOT: &str = "tailscale-windows-v1";

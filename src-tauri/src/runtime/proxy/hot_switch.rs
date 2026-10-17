@@ -19,6 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::MutexGuard as AsyncMutexGuard;
 
+use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::hotswitch::{
     can_skip_restart_for_added_unreferenced, plan_hot_switch, resolve_global_exit_tag,

@@ -466,7 +466,13 @@ const SITES: readonly Site[] = [
     file: 'tray/TrayMenu.tsx',
     callee: 'saveConfig(',
     route: 'direct',
-    why: 'W-1 模式/出口与 W-2 系统代理接管：只提交本动作字段；托盘虽是独立 webview，未提交字段仍由后端锁内保留',
+    why: 'W-1 模式切换：只提交 proxyMode；托盘虽是独立 webview，未提交字段仍由后端锁内保留。接管方式另走专用 setTakeover 原子事务',
+  },
+  {
+    file: 'tray/TrayMenu.tsx',
+    callee: 'api.config.setTakeover(',
+    route: 'direct',
+    why: 'W-2：与 Home 共用后端最新配置原子事务，只传用户选择的 modeType，同时完成 FakeIP-TUN 纠正与系统代理活态回读；不得把托盘陈旧 DNS 快照拆成暂存或 patch 写回',
   },
 
   {

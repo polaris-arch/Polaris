@@ -1,10 +1,14 @@
 //! Cross-process directory identity. Only whole-node deletion uses this module.
 //! Stable lock files are outside targets and are never removed or replaced.
 #![forbid(unsafe_code)]
+#[cfg(any(unix, test))]
 use polaris_mesh::tailscale_state::directory_retirement::DirectoryDeletionIntent;
+#[cfg(any(unix, test))]
 use serde::{Deserialize, Serialize};
+#[cfg(any(unix, test))]
 use std::io;
 
+#[cfg(any(unix, test))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DirectoryMarker {
@@ -19,6 +23,7 @@ pub(crate) struct DirectoryMarker {
     phase: String,
     delete_intent_nonce: String,
 }
+#[cfg(any(unix, test))]
 impl DirectoryMarker {
     fn identity(&self) -> String {
         format!(
@@ -45,6 +50,7 @@ impl DirectoryMarker {
                     && self.delete_intent_nonce == intent.delete_intent_nonce)
     }
 }
+#[cfg(any(unix, test))]
 fn unknown() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,

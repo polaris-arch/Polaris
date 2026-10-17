@@ -1,7 +1,7 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "App business source unchanged from frozen A1; candidate rebound to reviewed kernel repair commit; kernel Windows has a known failing test; overall kernel CI has not passed; full App batch pending to collect independent platform failures; no PASS claimed",
+  "status": "First full App batch at c2226c3 collected terminal Rust/platform and fixture failures; consolidated source fixes prepared with scoped formatting and lightweight contract checks; new full GitHub CI pending. Candidate rebound once to kernel repair 68ffb209; kernel CI in progress, not PASS.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
@@ -553,6 +553,24 @@
       "bytes": 37035
     },
     {
+      "path": "crates/tauri-plugin-polaris-ios/src/lifecycle_state.rs",
+      "owner": "app-ci-round1",
+      "baseBlob": "fd2b1958ec6aed23f74814c4c0dbba0b21fe5bc7",
+      "newBlob": "c06f74a3632799696f5958d80f5687014a066f70",
+      "newSHA256": "479132589fe0813461fe0d37cdd52faddd482ed5f702d5caee9f17d21ece7192",
+      "mode": "100644",
+      "bytes": 3946
+    },
+    {
+      "path": "crates/tauri-plugin-polaris-ios/src/lifecycle_state/tests/mod.rs",
+      "owner": "app-ci-round1",
+      "baseBlob": "8ec4061bb6f04443915cad1beadf718e16235beb",
+      "newBlob": "c9083da8fda8ff79e68c06cf4443f437bac8b385",
+      "newSHA256": "3c1e42b56c8e2e749c330908cdff3136ddb9b4ebf281ccf91c66137bf4c18c64",
+      "mode": "100644",
+      "bytes": 7078
+    },
+    {
       "path": "crates/unlock/src/checkers.rs",
       "owner": "libraries",
       "baseBlob": "48fec9112a4eb4e1285ebee0b115a8be5791b06f",
@@ -578,6 +596,15 @@
       "newSHA256": "6776f9c745539a1d2b9067ce2c0129eaab669b7eb9e4a67b1561ba68a52e373a",
       "mode": "100644",
       "bytes": 3910
+    },
+    {
+      "path": "scripts/assert-pc-runtime-release.test.mjs",
+      "owner": "app-ci-round1",
+      "baseBlob": "efd7a253fb95048f708adf196744e5df0b9cee4b",
+      "newBlob": "51167369a3ee378ff076538905988ba51d6b1367",
+      "newSHA256": "f06da877d837d8ef56cf512b340d617bc600d755205eb866233959efe9fcedb8",
+      "mode": "100644",
+      "bytes": 24179
     },
     {
       "path": "scripts/assert-r8-evidence.mjs",
@@ -745,10 +772,10 @@
       "path": "scripts/verify-apk.test.mjs",
       "owner": "delivery",
       "baseBlob": "2dc6a2e476952ed22832b7b80e22a30ee85d671e",
-      "newBlob": "e0ddfa6b7a2794217eec7dc319eedd3e4bb8b70d",
-      "newSHA256": "05cb00a66c060325c9f8e3e07b79a006e946c24252b00eb64e6129b0ec3e718a",
+      "newBlob": "df1e9131042f56c274740d6f4a66cfafd547d604",
+      "newSHA256": "c97a374b44f61f715111c7f8afc7cc8cca0acb9fac3575e96e4dcf3e94e5f5e3",
       "mode": "100644",
-      "bytes": 46299
+      "bytes": 47585
     },
     {
       "path": "scripts/vm-acceptance/run.sh",
@@ -799,8 +826,8 @@
       "path": "scripts/windows-directory/candidate-source.json",
       "owner": "integration-candidate-binding",
       "baseBlob": null,
-      "newBlob": "a54fae7a0fb3a966ad08c806ed4104d14a36bc2b",
-      "newSHA256": "a3cd1ba24717484d89fc8d4640001473f592fb3a5c92ce86812de81fe64b1313",
+      "newBlob": "c5658cbc1f82a74c73abf1e16f01f138934a3399",
+      "newSHA256": "3d02a3ff90c724a63fa11c90616955c174f2486f8c7fdf4e729cfe54d989dc77",
       "mode": "100644",
       "bytes": 168
     },
@@ -808,10 +835,10 @@
       "path": "src-tauri/Cargo.toml",
       "owner": "windows-app",
       "baseBlob": "b9f435f33ba3e56750960146f60941fcc018b995",
-      "newBlob": "a048fe5ce41254d9e3fc61fe2cbc590d402d37f9",
-      "newSHA256": "813818f8eb63bc15d03aa40a2fab7e8decbdffe34f5ee9b1835cf9c4096ce1d5",
+      "newBlob": "874bd2ffef9e47c39b84fbd421e5bbcd60fa23ef",
+      "newSHA256": "c8258c1fa62d965c438ca9bfca181daedd9eb9af2750a798864d5aca1f44d1e0",
       "mode": "100644",
-      "bytes": 11120
+      "bytes": 11159
     },
     {
       "path": "src-tauri/src/commands/rules/resources.rs",
@@ -844,10 +871,10 @@
       "path": "src-tauri/src/runtime.rs",
       "owner": "windows-app",
       "baseBlob": "03575f812db006844d56d318b074c9544a4a640b",
-      "newBlob": "3c9b49735ecd08cf225951d788d2df98bbf21d80",
-      "newSHA256": "eedd746ca761f992a912806a32aa2d85ce5fda7e25b733221948c48863d63aba",
+      "newBlob": "709ed867b38f72a5d72d50fcf5d4dbca0f13ae36",
+      "newSHA256": "82389d1b08f6a29a6c6416a6c0623dc31814b566c547334c028f1318e589e0d1",
       "mode": "100644",
-      "bytes": 10616
+      "bytes": 10625
     },
     {
       "path": "src-tauri/src/runtime/config.rs",
@@ -943,10 +970,10 @@
       "path": "src-tauri/src/runtime/proxy/hot_switch.rs",
       "owner": "hot-app",
       "baseBlob": "560b04ba9f7b9724c801226d85cb6dd5ebee6e3e",
-      "newBlob": "ad86e921f5f5b8e851cb4db16488e65f4aaecb29",
-      "newSHA256": "023f76deb66bb4ee38bae258ba1c42077594b57169804dfde70016553fc7b11d",
+      "newBlob": "31399b10583879df05590c00c82bb3d5b360cfdc",
+      "newSHA256": "f48e32aa1029752f8a931567468f61b9a9d36b9cb797efab5ab97ccc1054ee3d",
       "mode": "100644",
-      "bytes": 157042
+      "bytes": 157122
     },
     {
       "path": "src-tauri/src/runtime/proxy/pending_changes.rs",
@@ -1033,10 +1060,10 @@
       "path": "src-tauri/src/runtime/tailscale_directory.rs",
       "owner": "windows-app",
       "baseBlob": "79711f61a5976aae1b6c7a2dc206a759691fe974",
-      "newBlob": "629e4831d0f95388388b19f8c30a4a63142b15c7",
-      "newSHA256": "29e53e265981b8b137bea4d53e6ba4286c8b9614e53e869fec035804fabed59a",
+      "newBlob": "9ba2f7eab88afa8a7ae3f68070cc6d6a7c7c2f2c",
+      "newSHA256": "b5584e91186bc77103d45fa393fe3f6f3db57851498888e1cec0be1320b1f345",
       "mode": "100644",
-      "bytes": 4931
+      "bytes": 5075
     },
     {
       "path": "src-tauri/src/runtime/tailscale_login_core.rs",
@@ -1078,10 +1105,10 @@
       "path": "src-tauri/src/runtime/windows_directory.rs",
       "owner": "windows-app",
       "baseBlob": null,
-      "newBlob": "11f3ce52190ab4b962c1ece620f15a60517af3d4",
-      "newSHA256": "c52ff031579149fe9e84d849b88ac815ac9e48511166632ac35943b16493e2f6",
+      "newBlob": "e36cdabffb7f6f28a7ae55fe7c3bb68e7cf3fb0e",
+      "newSHA256": "1ae2f3151fb419b9ae37474531b0377500a36477b48730e5d9ae52d69cf44e7e",
       "mode": "100644",
-      "bytes": 25752
+      "bytes": 25817
     },
     {
       "path": "src-tauri/src/runtime/windows_directory/security.rs",
@@ -1136,6 +1163,51 @@
       "newSHA256": "986fd1420e08d4c0c664d010c7f7c7c35da1dc35da71606cf7fc8258b45cada9",
       "mode": "100644",
       "bytes": 45096
+    },
+    {
+      "path": "ui/src/contracts/coex-runtime.rust.fixture.json",
+      "owner": "app-ci-round1",
+      "baseBlob": "57ef7cbe68efee8eeea5b7857d7212b0fef4e9b3",
+      "newBlob": "406cd0745c8747cfb153ac8b724815c7e658d0a3",
+      "newSHA256": "34dc5e07b198b2a4531dbcad9437601cd585b8e93b7a9165016ccd7cf49ab37c",
+      "mode": "100644",
+      "bytes": 32258
+    },
+    {
+      "path": "ui/src/contracts/package-ci-matrix-contract.test.ts",
+      "owner": "app-ci-round1",
+      "baseBlob": "2a7800babc5b4f06f5ff1086ab14169c9b6f9229",
+      "newBlob": "e44f3cea3f15ab4df56fa3e1b0d2f9b5638f0488",
+      "newSHA256": "67dd892ffa8eb8aa315cad4f87c83cb0e7fd534af7c9582a77602c9e18eb6aa3",
+      "mode": "100644",
+      "bytes": 92168
+    },
+    {
+      "path": "ui/src/contracts/workflow-toolchain-pin-parity.test.ts",
+      "owner": "app-ci-round1",
+      "baseBlob": "0d25edb717cfc430e9862659cc934eb363868fea",
+      "newBlob": "5f96a5f0cd8f6e93d0f6bffe230c0a5e0d9bf1dc",
+      "newSHA256": "9095338545c6eb5f0165085629cc6393450a9825b84f6d2d3f0b8552cab54b8c",
+      "mode": "100644",
+      "bytes": 16986
+    },
+    {
+      "path": "ui/src/lib/config-write-lock.test.ts",
+      "owner": "app-ci-round1",
+      "baseBlob": "dba86b76450eca715d31aedebb12fda07408448c",
+      "newBlob": "912d3149489d150ce91512f16bb7f3b1a11afce5",
+      "newSHA256": "eda67800eef421c3c23755b180b6739a7f8d3b45b29dfefcfbf91ac4d16e42dd",
+      "mode": "100644",
+      "bytes": 8894
+    },
+    {
+      "path": "ui/src/lib/config-write-wiring.test.ts",
+      "owner": "app-ci-round1",
+      "baseBlob": "cec24469b6ecc89b395398afa82e507939daf520",
+      "newBlob": "e1bdc99caa6c2399d4964275ecb15c586201f613",
+      "newSHA256": "122b1f6ecff2124c272ca7cfb960d2a4647e5bc0b9916a4d300069ef40cb86c7",
+      "mode": "100644",
+      "bytes": 66686
     },
     {
       "path": "ui/src/mobile/MeasurementStartNotice.tsx",

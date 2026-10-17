@@ -217,6 +217,8 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
     permissions: {
       uses: APK_PERMISSION_REGISTRY.map((e) => e.name),
       declared: APK_DECLARED_PERMISSIONS.map((e) => e.name),
+      // 独立建模编译 manifest 的 signature 值，不从被测登记表复制保护级别。
+      declaredProtectionLevels: { 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 },
     },
     // 变异钩子（不是 apkViolations 的参数，仅供本文件内改夹具用）
     _members: members,
@@ -319,6 +321,32 @@ test('libc++ runtime cannot disappear from the package', () => {
 
 test('反向对照：未变异的合成 APK 全绿', () => {
   assert.deepEqual(run(), []);
+});
+
+test('compiled permission evidence remains mandatory for every ABI', () => {
+  for (const abi of Object.keys(ABIS)) {
+    for (const evidence of [undefined, null, 'signature']) {
+      const violations = run((input) => {
+        input.permissions.declaredProtectionLevels = evidence;
+      }, { abi });
+      assert.equal(violations.length, 1, `${abi}: ${violations.join(' | ')}`);
+      assert.match(violations[0], /Missing\/unparseable compiled permission protectionLevel evidence/);
+    }
+  }
+});
+
+test('compiled permission must remain exactly signature, independent of ABI and permission names', () => {
+  for (const abi of Object.keys(ABIS)) {
+    for (const level of [0, 1, 3, 0x12, '2', undefined]) {
+      const violations = run((input) => {
+        input.permissions.declaredProtectionLevels[
+          'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+        ] = level;
+      }, { abi });
+      assert.equal(violations.length, 1, `${abi}: ${violations.join(' | ')}`);
+      assert.match(violations[0], /must have exact signature protectionLevel=2/);
+    }
+  }
 });
 
 test('M1 形态：包里缺 NOTICE ⇒ 红，且恰红在 NOTICE 那一条', () => {

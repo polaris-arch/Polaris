@@ -173,7 +173,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     }
   });
 
-  it('ci.yml 三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且没有任何一个 job 能被静默关掉', () => {
+  it('ci.yml 格式前置门与三个并行 job：Linux 专属检查恰在 ubuntu 腿存在时运行，且不能静默关闭', () => {
     // 背景：2026-10-07 之前交叉 clippy / Android dep-info 对差 / 豁免反腐烂是矩阵 job 里
     // `if: runner.os == 'Linux'` 的三步 —— 「ubuntu 腿在跑」⇔「这三步在跑」由构造保证。
     // 独立成 `cross` job 后这个等价关系要靠 job 级 `if` 维持，而 android-impact-coverage-contract
@@ -182,15 +182,17 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     expect(jobs, 'ci.yml 的 job 集合变了 —— 新 job 要有人过目：它的缓存键、它能不能被关掉').toEqual([
-      'lint', 'cross', 'test',
+      'cheap_format', 'lint', 'cross', 'test',
     ]);
 
+    const cheapFormat = executable(jobBlock(ci, 'cheap_format'));
     const lint = executable(jobBlock(ci, 'lint'));
     const cross = executable(jobBlock(ci, 'cross'));
     const test = executable(jobBlock(ci, 'test'));
 
     // ① 归属：每条门恰好住在一个 job 里（检查类与构建测试类分开；Linux 专属四步都在 cross）。
     const home: [string, string][] = [
+      ['- name: Check workspace formatting before native compilation', 'cheap_format'],
       ['- name: Check formatting', 'lint'],
       ['- name: Clippy (deny warnings)', 'lint'],
       ['- name: Rustdoc documentation invariants (deny four lints)', 'lint'],
@@ -202,7 +204,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       ['- name: Build\n', 'test'],
       ['- name: Test\n', 'test'],
     ];
-    const blocks = { lint, cross, test };
+    const blocks = { cheap_format: cheapFormat, lint, cross, test };
     for (const [needle, owner] of home) {
       for (const [name, block] of Object.entries(blocks)) {
         expect(block.includes(needle), `「${needle.trim()}」应只在 ${owner} job 里（现在查的是 ${name}）`)
@@ -219,6 +221,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(block, `${name} job 挂了 continue-on-error —— 红了也不拦合入`).not.toMatch(/^ {4}continue-on-error:/m);
     }
     expect(cross).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
+
+    // The cheap formatter is a required predecessor, never a best-effort probe.
+    // It has no compiled artifacts to cache and must run even for non-Linux dispatches.
+    const requireCheapFormat = (block: string) => {
+      expect(block).not.toMatch(/^ {4}(?:if|needs|continue-on-error):/m);
+      expect(block).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
+      expect(block).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
+      expect(block).toMatch(/^ {8}run: cargo fmt --all -- --check$/m);
+      expect(block).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@|cargo (?:build|test|clippy)\b/);
+    };
+    // The reviewed PR candidate-selection step may be conditional; the formatter may not.
+    const formatStep = executable(stepBlock(cheapFormat, 'Check workspace formatting before native compilation'));
+    const formatGate = cheapFormat.slice(0, cheapFormat.indexOf('    steps:')) + '\n' + formatStep;
+    requireCheapFormat(formatGate);
+    expect(cheapFormat).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@/);
+    for (const block of [lint, cross, test]) expect(block).toMatch(/^ {4}needs: cheap_format$/m);
+    for (const mutant of [
+      formatGate.replace('    runs-on:', '    if: false\n    runs-on:'),
+      formatGate.replace('        run:', '        continue-on-error: true\n        run:'),
+      formatGate.replace('cargo fmt --all -- --check', 'cargo fmt --all -- --check || true'),
+    ]) expect(() => requireCheapFormat(mutant)).toThrow();
+
 
     // ③ cross 的 job 级 if 逐入口求值：它跑 ⇔ 同一入口下矩阵里有 ubuntu 腿（与拆分前逐格等价）。
     const crossIf = foldedJobIf(cross, 'cross');

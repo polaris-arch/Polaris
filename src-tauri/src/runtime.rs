@@ -45,7 +45,7 @@ pub mod subscription_create;
 pub mod subscription_parse;
 pub mod subscription_scheduler;
 pub mod taildrop;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 mod tailscale_directory;
 pub mod tailscale_login_core;
 pub mod tailscale_status;

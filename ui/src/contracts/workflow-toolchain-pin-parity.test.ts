@@ -50,6 +50,10 @@ const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as
 const NODE_JOBS = [
   ['ci.yml', 3], ['ui.yml', 1], ['package.yml', 5], ['release-risk.yml', 3],
 ] as const;
+// cheap_format adds an App checkout without Node; the Windows native acceptance
+// leg adds an exact kernel checkout and uses Go, not a second Node installation.
+const CHECKOUT_COUNTS = { 'ci.yml': 5, 'ui.yml': 1, 'package.yml': 5, 'release-risk.yml': 3 } as const;
+const CHECKOUT_TOTAL = Object.values(CHECKOUT_COUNTS).reduce((sum, count) => sum + count, 0);
 const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
 
 /** 每个 workflow 里 NASM 内联副本的份数（见文件头「NASM」条）。 */
@@ -98,12 +102,12 @@ describe('CI 工具链钉扎守门', () => {
     // 各桌面 source producer、草稿与汇总保有独立 checkout / Node；不能以总数相等掩盖某腿缺失。
     for (const [workflow, count] of NODE_JOBS) {
       const source = read(workflow);
-      expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(count);
+      expect(source.match(/actions\/checkout@v7/g) ?? [], workflow).toHaveLength(CHECKOUT_COUNTS[workflow]);
       expect(source.match(/actions\/setup-node@v7/g) ?? [], workflow).toHaveLength(count);
       expect([...source.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), workflow)
         .toEqual(Array(count).fill('26'));
     }
-    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(NODE_JOBS_TOTAL);
+    expect(all.match(/actions\/checkout@v7/g) ?? []).toHaveLength(CHECKOUT_TOTAL);
     expect(all.match(/actions\/setup-node@v7/g) ?? []).toHaveLength(NODE_JOBS_TOTAL);
     expect(all).not.toMatch(/actions\/(?:checkout|setup-node)@v[1-6]\b/);
     expect(read('package.yml')).toContain('actions/upload-artifact@v7');
@@ -113,6 +117,30 @@ describe('CI 工具链钉扎守门', () => {
     const buildDoc = readFileSync(join(REPO_ROOT, 'docs/build-and-package.md'), 'utf8');
     expect(readme).toContain('Node.js 24+');
     expect(buildDoc).toContain('| Node.js | 24+（CI 钉 26） |');
+  });
+
+  it('CI 的两个非 Node checkout 有独立且精确的职责，不掩盖任一 Rust job 丢失 Node', () => {
+    const ci = read('ci.yml').replace(/^\s*#.*$/gm, '');
+    const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
+    expect(jobs).toEqual(['cheap_format', 'lint', 'cross', 'test']);
+    const job = (name: string) => ci.split(`\n  ${name}:\n`)[1].split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
+    for (const [name, checkouts, nodes] of [
+      ['cheap_format', 1, 0], ['lint', 1, 1], ['cross', 1, 1], ['test', 2, 1],
+    ] as const) {
+      const block = job(name);
+      expect(block.match(/uses: actions\/checkout@v7/g) ?? [], name).toHaveLength(checkouts);
+      expect(block.match(/uses: actions\/setup-node@v7/g) ?? [], name).toHaveLength(nodes);
+      expect([...block.matchAll(/node-version:\s*['"]?(\d+)/g)].map((m) => m[1]), name)
+        .toEqual(Array(nodes).fill('26'));
+    }
+    const kernelCheckout = job('test').split('- name: Checkout exact Windows directory producer source\n')[1]
+      .split(/\n {6}- (?:name:|uses:)/)[0];
+    expect(kernelCheckout).toContain("if: runner.os == 'Windows'");
+    expect(kernelCheckout).toContain('repository: polaris-arch/sing-box-polaris');
+    expect(kernelCheckout).toContain('ref: ${{ steps.windows_directory_source.outputs.source }}');
+    expect(kernelCheckout).toContain('path: .windows-directory-kernel');
+    expect(kernelCheckout).toContain('persist-credentials: false');
+    expect(kernelCheckout).toContain('fetch-depth: 1');
   });
 
   it.each(WORKFLOWS)('%s 通过 scripts/fetch-protoc.mjs 装 protoc', (workflow) => {
