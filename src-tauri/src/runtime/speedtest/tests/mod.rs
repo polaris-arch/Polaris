@@ -4702,6 +4702,7 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
     h.deps.cancel = cancel.clone();
     let nodes = three_nodes();
     let mut collected: Vec<(String, Value)> = Vec::new();
+    let first_result = tokio::sync::Notify::new();
     let run = async {
         TempCoreSession::run(
             &h.deps,
@@ -4713,15 +4714,26 @@ async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
                 }
                 std::future::pending::<Measured>().await
             },
-            &mut |ev: &str, payload: Value| collected.push((ev.to_string(), payload)),
+            &mut |ev: &str, payload: Value| {
+                if ev == EVENT_SPEED_TEST_RESULT {
+                    first_result.notify_one();
+                }
+                collected.push((ev.to_string(), payload));
+            },
         )
         .await
     };
     let trigger = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Cancel only after production has recorded the first result. A wall-clock
+        // delay can expire during startup or before the completed task is joined.
+        first_result.notified().await;
         cancel.cancel(InterruptReason::Cancelled);
     };
-    let (out, ()) = tokio::join!(run, trigger);
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(run, trigger)
+    })
+    .await
+    .expect("the round must emit its first result and finish cancellation within the test budget");
     let TempCoreOutcome::Ran { results, outcome } = out else {
         panic!("已有节点出值的一轮应以 Ran 收尾，得到 {out:?}");
     };

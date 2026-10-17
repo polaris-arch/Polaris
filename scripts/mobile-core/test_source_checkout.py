@@ -125,11 +125,23 @@ class ImmutableSourceCheckout(unittest.TestCase):
         self.git('config', 'gc.autoDetach', 'false')
         self.git('config', 'maintenance.autoDetach', 'false')
         self.git('config', 'maintenance.auto', 'true')
+        # Git 2.55 defaults to geometric maintenance; select the GC task
+        # explicitly and trigger it by exact pack count, not sampled loose OIDs.
+        self.git('config', 'maintenance.strategy', 'gc')
+        self.git('config', 'maintenance.gc.enabled', 'true')
+        self.git('config', 'gc.autoPackLimit', '1')
+        pack_dir = self.remote / '.git/objects/pack'
+        pack_dir.mkdir(exist_ok=True)
+        for revision in ('HEAD', 'HEAD^'):
+            subprocess.run(fixture_git(['git', '-C', str(self.remote), 'pack-objects', str(pack_dir / 'pack')]),
+                           input=self.git('rev-parse', revision) + '\n', env=git_environment(),
+                           text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(len(list(pack_dir.glob('*.idx'))), 2)
         trace = self.root / 'git-trace.json'
         env = dict(git_environment(), GIT_TRACE2_EVENT=str(trace))
         command = ['git', '-C', str(self.remote), '-c', 'user.name=Fixture',
                    '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'trace']
-        # A deliberately low repository threshold cannot override fixture policy.
+        # An exact, exceeded pack threshold cannot override fixture policy.
         subprocess.run(fixture_git(command), env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         guarded = [json.loads(line) for line in trace.read_text().splitlines()]
         self.assertFalse(any(row.get('event') == 'child_start' and
@@ -140,8 +152,10 @@ class ImmutableSourceCheckout(unittest.TestCase):
         # starts maintenance. Detach is explicitly off, so this probe also waits.
         subprocess.run(command, env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         unguarded = [json.loads(line) for line in trace.read_text().splitlines()]
-        self.assertTrue(any(row.get('event') == 'child_start' and
-                            'gc' in row.get('argv', []) for row in unguarded))
+        for child in ('maintenance', 'gc'):
+            self.assertTrue(any(row.get('event') == 'child_start' and
+                                child in row.get('argv', []) for row in unguarded),
+                            f'missing {child} child: {unguarded}')
 
     def test_invalid_contract_fails_before_source_mutation(self):
         value = deepcopy(self.value)
