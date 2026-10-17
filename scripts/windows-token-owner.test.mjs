@@ -137,3 +137,66 @@ for (const [name, file, before, after, all] of negatives) {
     assert.throws(() => audit(mutated), { name: 'AssertionError' });
   });
 }
+
+const diagnosticStages = [
+  ['Select explicit formal or candidate Windows directory source', null],
+  ['Checkout exact Windows directory producer source', 'windows_directory_source'],
+  ['Resolve exact checked-out kernel toolchain', 'windows_directory_checkout'],
+  ['Setup exact kernel Go toolchain', 'windows_directory_go'],
+  ['Build and run native Windows directory producer and consumer acceptance', 'windows_directory_go_setup'],
+];
+function checkDiagnosticScheduling(workflow) {
+  assert.match(workflow, /- name: Build\n\s+id: workspace_build\n\s+run: cargo build --workspace --verbose/);
+  assert.match(workflow, /- name: Test\n\s+id: workspace_tests/);
+  assert.match(workflow, /run: cargo test --workspace --no-fail-fast/);
+  const testBlock = workflow.split('      - name: Test\n')[1].split('      - name: Select explicit')[0];
+  assert.doesNotMatch(testBlock, /continue-on-error|\bif:/);
+  for (const [name, dependency] of diagnosticStages) {
+    const block = workflow.split(`      - name: ${name}\n`)[1]?.split('      - name:')[0];
+    assert.ok(block, name);
+    const expression = block.match(/if: >-\s*\$\{\{([\s\S]*?)\}\}/)?.[1];
+    assert.ok(expression, name);
+    assert.doesNotMatch(block, /continue-on-error/);
+    // Evaluate the actual checked-in condition over the complete status/event
+    // matrix. This is a workflow-expression contract check, not a native run.
+    const evaluate = new Function('runner', 'github', 'inputs', 'steps', 'success', 'cancelled', `return (${expression});`);
+    for (const os of ['Windows', 'Linux', 'macOS'])
+      for (const event of ['workflow_dispatch', 'pull_request', 'push'])
+        for (const mode of ['candidate', 'formal'])
+          for (const succeeded of [false, true])
+            for (const wasCancelled of [false, true])
+              for (const build of ['success', 'failure', 'skipped'])
+                for (const tests of ['success', 'failure', 'skipped'])
+                  for (const preceding of ['success', 'failure', 'skipped']) {
+                    if (succeeded && wasCancelled) continue;
+                    const steps = { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } };
+                    if (dependency) steps[dependency] = { outcome: preceding };
+                    const expected = os === 'Windows' && (!dependency || preceding === 'success')
+                      && (succeeded || (!wasCancelled && event === 'workflow_dispatch' && mode === 'candidate'
+                        && build === 'success' && tests === 'failure'));
+                    assert.equal(evaluate({ os }, { event_name: event }, { windows_directory_mode: mode }, steps,
+                      () => succeeded, () => wasCancelled), expected, `${name}: ${[os,event,mode,succeeded,wasCancelled,build,tests,preceding]}`);
+                  }
+  }
+  for (const name of ['Approved batch SYSTEM producer — fresh', 'Approved batch SYSTEM producer — prebuilt-user']) {
+    // Existing exact PR approval remains the only SYSTEM route.
+    const block = workflow.split(`      - name: ${name}\n`)[1];
+    assert.ok(block, name);
+    const condition = block.split('        shell:')[0];
+    assert.match(condition, /github.event_name == 'pull_request'/);
+    assert.doesNotMatch(condition, /!cancelled\(\)|failure\(\)|workflow_dispatch/);
+  }
+}
+test('manual candidate diagnostics survive only Test failure without reducing PR gates', () => checkDiagnosticScheduling(sources.workflow));
+for (const [name, before, after] of [
+  ['PR failure bypass', "github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'", "github.event_name == 'pull_request' && inputs.windows_directory_mode == 'candidate'"],
+  ['cancelled run bypass', '!cancelled()', 'true'],
+  ['build failure bypass', "steps.workspace_build.outcome == 'success'", 'true'],
+  ['formal validation bypass', "inputs.windows_directory_mode == 'candidate'", 'true'],
+  ['failed checkout bypass', "&& steps.windows_directory_checkout.outcome == 'success'", ''],
+  ['failed Go setup bypass', "&& steps.windows_directory_go_setup.outcome == 'success'", ''],
+  ['test failure masked', 'id: workspace_tests', 'id: workspace_tests\n        continue-on-error: true'],
+]) test(`diagnostic scheduling rejects ${name}`, () => {
+  assert.ok(sources.workflow.includes(before));
+  assert.throws(() => checkDiagnosticScheduling(sources.workflow.replaceAll(before, after)));
+});

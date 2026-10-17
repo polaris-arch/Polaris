@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { nativeReleaseGoVersion } from '../native-payload-input.mjs';
 import { digest, desktopSourceGoVersion, upstreamSourceGoVersion } from './source-graph.mjs';
 import { RELEASE_TARGETS, validateReleaseContract, releasePayloadMembers, publicBytes, verifyReleaseCore, releaseSingTunDependency, validateReleaseNotice } from './release-consumer.mjs';
 import { validateUpstreamIndex, upstreamPayloadPins, contractPublicAssets, readUpstreamPublicEvidence, validateUpstreamReadback } from './upstream-release.mjs';
@@ -376,4 +377,95 @@ test('source replacement inventory cannot claim an unlinked module or invented l
     const { contract } = fixture(); change(contract.platforms.linux);
     assert.throws(() => validateReleaseContract(contract), /replacement/);
   }
+});
+
+function brandedFixture() {
+  const value = fixture();
+  for (const row of Object.values(value.contract.platforms)) {
+    row.archive.releaseName = 'sing-box-polaris-' + row.archive.name.slice('sing-box-'.length);
+    row.releaseAsset.name = row.archive.releaseName;
+    row.releaseAsset.url = `https://github.com/${value.contract.repository}/releases/download/${value.contract.tag}/${row.releaseAsset.name}`;
+  }
+  return value;
+}
+test('explicit public release names keep all four original archive layouts and byte pins', () => {
+  const legacy = fixture(), { contract, index } = brandedFixture();
+  validateReleaseContract(contract);
+  validateUpstreamIndex(index, contract);
+  for (const [key, row] of Object.entries(contract.platforms)) {
+    const { releaseName, ...archive } = row.archive;
+    assert.deepEqual(archive, legacy.contract.platforms[key].archive);
+    assert.equal(row.id, legacy.contract.platforms[key].id);
+    assert.equal(row.releaseAsset.name, releaseName);
+    assert.equal(row.releaseAsset.sha256, row.archive.sha256);
+    assert.equal(row.releaseAsset.bytes, row.archive.bytes);
+    assert.ok(contractPublicAssets(contract).includes(row.releaseAsset));
+  }
+  // Legacy absence still passes the existing immutable legacy name contract.
+  validateReleaseContract(legacy.contract);
+  validateUpstreamIndex(legacy.index, legacy.contract);
+});
+test('public release names reject explicit invalid values instead of falling back', () => {
+  const name = brandedFixture().contract.platforms.linux.archive.releaseName;
+  const invalid = [null, undefined, '', 1, false, {}, [], '../' + name, '/' + name,
+    'https://example.invalid/' + name, name.replace('linux-amd64', 'windows-amd64'),
+    name.replace('1.15.0', '1.16.0'), name.replace('sing-box-polaris-', 'sing-box-'),
+    name.replace('sing-box-polaris-', 'sing-box-polaris-polaris-'), name + '?download=1',
+    name.replaceAll('-', '\\'), name.toUpperCase(), name + '\n'];
+  for (const value of invalid) {
+    const { contract } = brandedFixture();
+    contract.platforms.linux.archive.releaseName = value;
+    assert.throws(() => validateReleaseContract(contract), /release archive name/);
+  }
+  const { contract } = fixture();
+  contract.platforms.linux.archive.publicName = name;
+  assert.throws(() => validateReleaseContract(contract), /public-name alias/);
+});
+test('branded public names cannot relax asset identity, bytes, original layout or indexed receipt binding', () => {
+  const changes = [
+    c => { c.platforms.linux.releaseAsset.name = c.platforms.linux.archive.name; },
+    c => { c.platforms.linux.releaseAsset.url = c.platforms.linux.releaseAsset.url.replace('sing-box-polaris-1.', 'sing-box-1.'); },
+    c => { c.platforms.linux.releaseAsset.sha256 = 'b'.repeat(64); },
+    c => { c.platforms.linux.releaseAsset.bytes++; },
+    c => { c.platforms.linux.releaseAsset.releaseId++; },
+    c => { c.platforms.linux.releaseAsset.assetId = c.sourceArchive.assetId; },
+    c => { c.platforms.linux.archive.name = c.platforms.linux.archive.releaseName; },
+    c => { c.platforms.linux.archive.root = c.platforms.linux.archive.root.replace('sing-box-', 'sing-box-polaris-'); },
+    c => { c.platforms.linux.id = c.platforms.linux.id.replace('sing-box-', 'sing-box-polaris-'); },
+  ];
+  for (const change of changes) {
+    const { contract } = brandedFixture(); change(contract);
+    assert.throws(() => validateReleaseContract(contract));
+  }
+  for (const change of [row => { delete row.archive.releaseName; }, row => { row.archive.releaseName += '-other'; }]) {
+    const { contract, index } = brandedFixture();
+    const altered = structuredClone(index); change(altered.platforms[0]);
+    assert.throws(() => validateUpstreamIndex(altered, contract), /indexed recipe|release archive name/);
+  }
+});
+
+test('explicit public names in unselected index recipes obey the same closed mapping', () => {
+  const { contract, index } = brandedFixture();
+  const extra = structuredClone(index.platforms[0]); extra.id += '-unselected';
+  index.platforms.push(extra);
+  validateUpstreamIndex(index, contract);
+  extra.archive.releaseName = 'https://example.invalid/archive.tar.gz';
+  assert.throws(() => validateUpstreamIndex(index, contract), /release archive name/);
+});
+
+test('native upstream payload uses its validated top-level Go version without legacy-field fallback', () => {
+  const { contract } = fixture(), row = contract.platforms.linux;
+  validateReleaseContract(contract);
+  assert.equal(Object.hasOwn(row, 'sourceFingerprint'), false);
+  assert.equal(nativeReleaseGoVersion(contract, row), row.goVersion);
+  const missing = structuredClone(row); delete missing.goVersion;
+  missing.sourceFingerprint = { goVersion: row.goVersion };
+  assert.throws(() => nativeReleaseGoVersion(contract, missing), /Go version/);
+  assert.throws(() => nativeReleaseGoVersion(contract, { ...row, goVersion: 'go1.25.5' }), /Go version/);
+  assert.throws(() => nativeReleaseGoVersion(contract, { ...row, schema: 'polaris-production-native-receipt-v1' }), /schema/);
+  const legacy = { schema: 'polaris-box-release-consumer-contract-v1' };
+  const legacyRow = { schema: 'polaris-production-native-receipt-v1', sourceFingerprint: { goVersion: 'go1.25.5' } };
+  assert.equal(nativeReleaseGoVersion(legacy, legacyRow), 'go1.25.5');
+  assert.throws(() => nativeReleaseGoVersion(legacy, { schema: legacyRow.schema, goVersion: 'go1.25.5' }), /Go version/);
+  assert.throws(() => nativeReleaseGoVersion(legacy, row), /schema/);
 });

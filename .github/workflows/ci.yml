@@ -815,6 +815,7 @@ jobs:
           done
 
       - name: Build
+        id: workspace_build
         run: cargo build --workspace --verbose
 
       - name: Coex export checker fixtures
@@ -827,6 +828,7 @@ jobs:
         run: node scripts/check-coex-runtime-export.mjs prepare
 
       - name: Test
+        id: workspace_tests
         # Keep the actual gate command byte-identical to gate-rust.sh. Linux capture
         # supplies the fresh export env to this one existing full-workspace execution.
         # The static shell routes macOS/Windows to bash/pwsh with native failure propagation.
@@ -841,8 +843,14 @@ jobs:
         run: cargo test --workspace --no-fail-fast
 
       # Candidate is a test-only source; formal contract and assets stay unchanged.
+      # Explicit manual candidate diagnostics may continue after Test fails, but
+      # never after Build/setup failure or cancellation. The failed Test still
+      # fails this job; PR/SYSTEM gates retain their existing success requirement.
       - name: Select explicit formal or candidate Windows directory source
-        if: runner.os == 'Windows'
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure')) }}
         id: windows_directory_source
         shell: pwsh
         env:
@@ -858,7 +866,12 @@ jobs:
           "source=$source" >> $env:GITHUB_OUTPUT
           "mode=$env:DIRECTORY_MODE" >> $env:GITHUB_OUTPUT
       - name: Checkout exact Windows directory producer source
-        if: runner.os == 'Windows'
+        id: windows_directory_checkout
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_source.outcome == 'success' }}
         uses: actions/checkout@v7
         with:
           repository: polaris-arch/sing-box-polaris
@@ -868,7 +881,11 @@ jobs:
           clean: true
           fetch-depth: 1
       - name: Resolve exact checked-out kernel toolchain
-        if: runner.os == 'Windows'
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_checkout.outcome == 'success' }}
         id: windows_directory_go
         shell: pwsh
         run: |
@@ -877,14 +894,23 @@ jobs:
           if ($pins.Count -ne 1) { throw 'Expected one exact kernel source toolchain pin' }
           "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
       - name: Setup exact kernel Go toolchain
-        if: runner.os == 'Windows'
+        id: windows_directory_go_setup
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go.outcome == 'success' }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.windows_directory_go.outputs.version }}
           cache-dependency-path: .windows-directory-kernel/go.sum
       - name: Build and run native Windows directory producer and consumer acceptance
         id: windows_directory_acceptance
-        if: runner.os == 'Windows'
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode == 'candidate'
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go_setup.outcome == 'success' }}
         shell: pwsh
         env:
           GOTOOLCHAIN: local

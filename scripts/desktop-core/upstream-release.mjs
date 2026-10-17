@@ -17,6 +17,18 @@ function file(value, max = 512 * 1024 * 1024) {
   demand(value && safeNativePath(value.name) && !value.name.includes('/')
     && positive(value.bytes) && value.bytes <= max && hex(value.sha256, 64), 'Upstream file pin differs');
 }
+// Public release branding is separate from the immutable candidate/archive layout.
+// Only absence is legacy compatibility; explicit invalid values never fall back.
+export function upstreamReleaseName(archive) {
+  demand(archive && typeof archive.name === 'string' && safeNativePath(archive.name)
+    && !archive.name.includes('/') && archive.name.startsWith('sing-box-')
+    && !archive.name.startsWith('sing-box-polaris-'), 'Upstream native archive name differs');
+  demand(!Object.hasOwn(archive, 'publicName'), 'Unsupported upstream public-name alias');
+  if (!Object.hasOwn(archive, 'releaseName')) return archive.name;
+  const expected = 'sing-box-polaris-' + archive.name.slice('sing-box-'.length);
+  demand(archive.releaseName === expected, 'Upstream release archive name differs');
+  return archive.releaseName;
+}
 export function upstreamAsset(pin, contract, max) {
   file(pin, max);
   demand(positive(pin.assetId) && pin.releaseId === contract.releaseId
@@ -103,7 +115,7 @@ export function validateUpstreamRow(contract, key, row, targets) {
   demand(hex(members[`${root}/LICENSE`], 64), 'Upstream native LICENSE absent');
   if (!target.sidecar) demand(row.sidecar === null && !Object.keys(members).some((name) => /\.(so|dll|dylib)$/.test(name)), 'Upstream static archive has shared payload');
   upstreamAsset(row.releaseAsset, contract);
-  same({ name: row.archive.name, bytes: row.archive.bytes, sha256: row.archive.sha256 },
+  same({ name: upstreamReleaseName(row.archive), bytes: row.archive.bytes, sha256: row.archive.sha256 },
     { name: row.releaseAsset.name, bytes: row.releaseAsset.bytes, sha256: row.releaseAsset.sha256 }, 'Upstream archive/public bytes differ');
   if (key.startsWith('mac-')) {
     const signature = row.signatureObservation;
@@ -160,6 +172,11 @@ export function validateUpstreamIndex(index, contract) {
     && index.platforms.length >= 4 && index.platforms.length <= 512
     && index.platforms.every((r) => typeof r.id === 'string' && /^[A-Za-z0-9._+-]+$/.test(r.id))
     && new Set(index.platforms.map((r) => r.id)).size === index.platforms.length, 'Upstream complete index identities differ');
+  // Additional producer recipes are not downloaded by this App selection, but
+  // an explicit public name must still obey the same closed mapping.
+  for (const row of index.platforms) {
+    if (row.archive && (Object.hasOwn(row.archive, 'releaseName') || Object.hasOwn(row.archive, 'publicName'))) upstreamReleaseName(row.archive);
+  }
   for (const name of ['repository', 'repositoryId', 'version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree', 'producer', 'legalFiles'])
     same(index[name], contract[name], `Upstream index ${name} differs`);
   const { name, bytes, sha256 } = contract.sourceArchive;

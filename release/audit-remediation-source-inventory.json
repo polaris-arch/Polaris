@@ -1,16 +1,16 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending.",
+  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending. Isolated archive.releaseName compatibility and schema-correct native Go version selection await review and real release readback; source and release pins unchanged. Targeted caaa Windows Test phase-watchdog failure blocks launcher diagnostics; narrow clock-scope fix and manual-candidate post-Test-failure collection await native CI, with failed Test/job and exact PR/SYSTEM gates preserved.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "owner": "validation",
+      "owner": "app-ci-round7",
       "baseBlob": "9b2baff2796bf95831b3c533a9448ff2926bfd30",
-      "newBlob": "98e82d87eee77c471314dd39c26793864608134b",
-      "newSHA256": "80d23f5bf7a38d997d54940e5cc80bd7f4ca84cc3faaf2207732b69030076ba5",
+      "newBlob": "d40c5020f91679b5167606aad5aeb974cf402b97",
+      "newSHA256": "f926c462c5accc71cee38b5f14ccfc599d932a6ceb7a42ee9e937c68bc4de939",
       "mode": "100644",
-      "bytes": 69715
+      "bytes": 71637
     },
     {
       "path": ".github/workflows/package.yml",
@@ -833,12 +833,12 @@
     },
     {
       "path": "docs/audit-remediation-status.md",
-      "owner": "app-ci-round6-diagnostics",
+      "owner": "app-ci-round7",
       "baseBlob": "4c2b7b3e0005eb4cd3b9e0a62a0dca91e7b0a81c",
       "mode": "100644",
-      "newBlob": "0aea4380894a36e5e570d78351786f225033e6b5",
-      "newSHA256": "dc7e1ab774ead156ee0658064c2a7e9ef3b730c5d6bcd2273cf7cf6280ecec33",
-      "bytes": 22304
+      "newBlob": "58504aef58eca3709043208b3cc550b01cf38047",
+      "newSHA256": "94d7279d0d37fcd5bf5d40d9349d852c339cf9fda7e7b432d697042bfad76789",
+      "bytes": 25471
     },
     {
       "path": "scripts/apk-permission-acquisition.test.mjs",
@@ -929,6 +929,24 @@
       "newSHA256": "53621e2e664843db4604ca2c86399fd3d6c899d6202064a7f026658bf5badebf",
       "mode": "100644",
       "bytes": 111638
+    },
+    {
+      "path": "scripts/desktop-core/upstream-release.mjs",
+      "owner": "app-ci-round7",
+      "baseBlob": "392e19f23f70d9cb5dd998ee8135b99aef9dc4e4",
+      "mode": "100644",
+      "newBlob": "fab85da450072393421d7455887ad788ca89e49f",
+      "newSHA256": "f25136c13b02e99e04a6b778be44561b3618bed4dab48fc2a12575e4ca541552",
+      "bytes": 21231
+    },
+    {
+      "path": "scripts/desktop-core/upstream-release.test.mjs",
+      "owner": "app-ci-round7",
+      "baseBlob": "0658a071bf20fdfbf68a7327dbe005d9dcf27c03",
+      "mode": "100644",
+      "newBlob": "a1035aca05ef05b67b206171c6eaff5099117d88",
+      "newSHA256": "875026536f0e5116442e9ced8ce8c3545c451cc12772af047321134865f6cd1c",
+      "bytes": 35326
     },
     {
       "path": "scripts/fetch-cronet.mjs",
@@ -1157,12 +1175,21 @@
     },
     {
       "path": "scripts/native-payload-input.mjs",
-      "owner": "delivery",
+      "owner": "app-ci-round7",
       "baseBlob": "df989f9c65e66a0ce970f0e181e919577abef04f",
-      "newBlob": "5420b8a814d882fc1b034d797a2b4cf0f23e3501",
-      "newSHA256": "629dd3afd21450a0690266ecff317e60f4a9609701f327b17219c9e29c22dc92",
+      "newBlob": "161815b5385d3b53c6f1fdf1271948e2cd9da103",
+      "newSHA256": "21cc716f673eb19a1939afb1a0d836c81b9d5f94b8381288985c57535856dc4f",
       "mode": "100644",
-      "bytes": 6868
+      "bytes": 7434
+    },
+    {
+      "path": "scripts/release-core-consumer.test.mjs",
+      "owner": "app-ci-round7",
+      "baseBlob": "6440bca8f4b5ce430dad54e1e2ebc00538b173d0",
+      "mode": "100644",
+      "newBlob": "908db45126260f9ba2743a31b984431b82a02f6e",
+      "newSHA256": "be06ed30857a4cadc57b5609b05be707fee2cd7df6893608f20428a6f91e1335",
+      "bytes": 588
     },
     {
       "path": "scripts/verify-apk.mjs",
@@ -1265,12 +1292,12 @@
     },
     {
       "path": "scripts/windows-token-owner.test.mjs",
-      "owner": "app-ci-round5",
+      "owner": "app-ci-round7",
       "baseBlob": null,
       "mode": "100644",
-      "newBlob": "513fb52c1cf3ba52be05e93ca0b43bdd76369697",
-      "newSHA256": "3cc2bfdf011ff5b64a37094dc983cb016c357efcfe30f3dedfea91cb2b6be3a8",
-      "bytes": 13429
+      "newBlob": "ab9ece6e995929b47097ce41cfd942d56c2f129c",
+      "newSHA256": "af1fee2043f08e578d1fbedea52fbd4b16e5a8dac49696d35487fe521ece741a",
+      "bytes": 17861
     },
     {
       "path": "src-tauri/Cargo.toml",
@@ -1634,12 +1661,12 @@
     },
     {
       "path": "src-tauri/src/runtime/speedtest/tests/pc_custody.rs",
-      "owner": "runtime",
+      "owner": "app-ci-round7",
       "baseBlob": "96481982c67fe760904b0fa4868906dea92ac7ba",
-      "newBlob": "e8e730c2cff9b361fe32d8efc61df3a643c98580",
-      "newSHA256": "58dfcd146945bb94871b3374b5f3f5a4cb45b7dcb771c7b68eeea208f81436fc",
+      "newBlob": "23beb7ad8aaf71bdd21e2690706961af9d2317d8",
+      "newSHA256": "3e59ba0e44a604086df2a7fbff3c91c6cb19fdf6e715e18fd56531ecbde0fd58",
       "mode": "100644",
-      "bytes": 58966
+      "bytes": 59133
     },
     {
       "path": "src-tauri/src/runtime/speedtest/tests/private_temp_config_regressions.rs",

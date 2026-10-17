@@ -274,11 +274,14 @@ async fn shutdown_notification_keeps_custody_until_same_child_close_and_prevents
     cleanup(&script.harness.dir);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn shutdown_timeout_retains_unknown_child_config_and_closed_admission() {
     let script = Script::new(true);
     let running = script.run();
     acquire(&script.wait_entered).await;
+    // Let startup finish on real time: the shared CLI probe cache may be held
+    // by another test runtime. Only the controlled close budget uses paused time.
+    tokio::time::pause();
     let custody = script.harness.deps.pc_custody.clone();
     let shutdown =
         tokio::spawn(
