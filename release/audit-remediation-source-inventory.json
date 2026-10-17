@@ -1,7 +1,7 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending. Isolated archive.releaseName compatibility and schema-correct native Go version selection await review and real release readback; source and release pins unchanged. Targeted caaa Windows Test phase-watchdog failure blocks launcher diagnostics; narrow clock-scope fix and manual-candidate post-Test-failure collection await native CI, with failed Test/job and exact PR/SYSTEM gates preserved. fc52 ordinary Windows Rust tests passed; actual private-token creation failed Win32=5 with SeImpersonate enabled. Read-only object diagnostics and explicit fixed-source manual launcher job await native execution; no ACL/service/privilege/API mutation and no PR/SYSTEM acceptance claim. 447cc50 fast manual launch still failed Win32=5. Bounded explicit observed-desktop experiment validates WinSta0/Default and equality with the current process session before the existing API; hypothesis unproven, native acceptance and PR/SYSTEM checks remain unverified.",
+  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending. Isolated archive.releaseName compatibility and schema-correct native Go version selection await review and real release readback; source and release pins unchanged. Targeted caaa Windows Test phase-watchdog failure blocks launcher diagnostics; narrow clock-scope fix and manual-candidate post-Test-failure collection await native CI, with failed Test/job and exact PR/SYSTEM gates preserved. fc52 ordinary Windows Rust tests passed; actual private-token creation failed Win32=5 with SeImpersonate enabled. Read-only object diagnostics and explicit fixed-source manual launcher job await native execution; no ACL/service/privilege/API mutation and no PR/SYSTEM acceptance claim. 447cc50 fast manual launch still failed Win32=5. Bounded explicit observed-desktop experiment validates WinSta0/Default and equality with the current process session before the existing API; hypothesis unproven, native acceptance and PR/SYSTEM checks remain unverified. Round9 explicit desktop still returned5. Offline AsUser candidate preserves private-token proof chain, compares LUID/name identity and all privilege state bits except the usage-only marker around the call, retaining raw masks and fails closed; temporary existing-privilege API execution requires explicit approval, native result pending. Pure rebase onto published DNS head0e87449c8dacf23c6cf47bd8feba86e30d8fbf58/treec7f1f5b9070672f1b585d36a572aeb19e82f8436; all32 DNS blobs preserved, reviewed AsUser implementation unchanged; native/PR/SYSTEM remain unverified.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
@@ -67,6 +67,15 @@
       "bytes": 12781
     },
     {
+      "path": "crates/config-engine/fixtures/fakeip-real-query-default-tail.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": null,
+      "newBlob": "ef40e57b4325a71388cee290ceba449ca6e64869",
+      "newSHA256": "a65c0f48511471924f4024a84d7e00f7fab0a71e16ee031aaf02bb86f7840898",
+      "mode": "100644",
+      "bytes": 184
+    },
+    {
       "path": "crates/config-engine/src/builder/custom_rules.rs",
       "owner": "libraries",
       "baseBlob": "4a7528e8d4b9668d87fbc97a285a045013d9e283",
@@ -77,12 +86,30 @@
     },
     {
       "path": "crates/config-engine/src/builder/dns.rs",
-      "owner": "libraries",
-      "baseBlob": "34d652e1afa19d75cdd03e28f5b0156817d4b7cb",
-      "newBlob": "19d40a07754fa5c7639b7807103a95d1147b92b3",
-      "newSHA256": "7038fde4150a59dfd7d5ba421449d0dc8566667053f043d5c5a5b40ad213d829",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "19d40a07754fa5c7639b7807103a95d1147b92b3",
+      "newBlob": "eab2b79e18cc2f1f612994a7686ea7cb912be6c8",
+      "newSHA256": "142682af48fa5f6002728a4a1c39d46d983417f6dbe4271806cada4ca717a80e",
       "mode": "100644",
-      "bytes": 94893
+      "bytes": 98731
+    },
+    {
+      "path": "crates/config-engine/src/builder/dns/tests/mod.rs",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "e3f76e8391192c8d50088d28bf382aaa8b27b993",
+      "newBlob": "cbf451a9d32571077e28bcb10fcd60f045de1163",
+      "newSHA256": "a8c3be17064b15d2af23f09d756c8a31f972312a24ed934a1e67886cbea40914",
+      "mode": "100644",
+      "bytes": 44202
+    },
+    {
+      "path": "crates/config-engine/src/builder/dns/tests/real_query_fallback.rs",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": null,
+      "newBlob": "67797b16b7c39c9207b0db0286da34a41a270b65",
+      "newSHA256": "aeb3aa0cc1875be36832fcd05db2d56ca6252bf1c321beba99538c83c752c3bc",
+      "mode": "100644",
+      "bytes": 13709
     },
     {
       "path": "crates/config-engine/src/builder/generate.rs",
@@ -131,21 +158,21 @@
     },
     {
       "path": "crates/config-engine/src/builder/network_env.rs",
-      "owner": "libraries",
-      "baseBlob": "86b7981f74aee81c568dec498f543c0589c96ebf",
-      "newBlob": "42966c8b9625486ab2a179081d8b9875f8abd7a3",
-      "newSHA256": "cec32453fadd523423b5ef887f1ff6eafbeb949141da06d60fdb101814666c63",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "42966c8b9625486ab2a179081d8b9875f8abd7a3",
+      "newBlob": "36ca34d1047f067e86db6452b2a6bce4774ee31f",
+      "newSHA256": "9436289ed3f8bf81538ffb3a49725aeedcdb89c7afcfe949636272e360e629d2",
       "mode": "100644",
-      "bytes": 36663
+      "bytes": 37329
     },
     {
       "path": "crates/config-engine/src/builder/network_env/tests/audit_regressions.rs",
-      "owner": "libraries",
-      "baseBlob": null,
-      "newBlob": "4d573931353cd17f1d5d968224597b045c148a59",
-      "newSHA256": "5ec25e00d90ddef2dbf79035966a5821943156150ba961f292dd18c343c4cc14",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "4d573931353cd17f1d5d968224597b045c148a59",
+      "newBlob": "80b1a4df08731e87157a2f86b51ec25261b821c0",
+      "newSHA256": "e5bb27d60a326443a6c3924772290fd16fbe25e6f402d99036c31e0dcb39b0b2",
       "mode": "100644",
-      "bytes": 1602
+      "bytes": 2804
     },
     {
       "path": "crates/config-engine/src/builder/network_env/tests/mod.rs",
@@ -230,12 +257,12 @@
     },
     {
       "path": "crates/config-engine/src/user_config/dns_policy.rs",
-      "owner": "libraries",
-      "baseBlob": "48c453a3511278a5211a2151ee1782c27a255e24",
-      "newBlob": "dfea0428480fb2cc3c7840bfe870800b164a5ba2",
-      "newSHA256": "e335c34906abf3e0eba64fe5125e6c56d90c95e77caeec03aeaeec1899862350",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "dfea0428480fb2cc3c7840bfe870800b164a5ba2",
+      "newBlob": "8ed2581f08f21949b3c427079267766c889f598d",
+      "newSHA256": "745af799be7da394ea3b7b13a6443960042fc5091003e15a0642952a755ffefd",
       "mode": "100644",
-      "bytes": 10901
+      "bytes": 11590
     },
     {
       "path": "crates/config-engine/src/user_config/dns_policy/tests/audit_regressions.rs",
@@ -248,12 +275,12 @@
     },
     {
       "path": "crates/config-engine/src/user_config/dns_policy/tests/mod.rs",
-      "owner": "app-ci-round2",
-      "baseBlob": "154c41caffd4927034e021f3b386bbfebd9d132f",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "656563d4e6260b32e9ea25a0a8db8710719b38f4",
+      "newBlob": "85beef75c62e92b9197d422fe090774c377a6777",
+      "newSHA256": "035bfdaafab8a8d146aef886a5a859ce72d729e5570720b2c12cf0359f351925",
       "mode": "100644",
-      "newBlob": "656563d4e6260b32e9ea25a0a8db8710719b38f4",
-      "newSHA256": "4be4a14d764087eaa93108ce2aa360e1014fa013f9cde99cd527dedc8ad2a40b",
-      "bytes": 817
+      "bytes": 2468
     },
     {
       "path": "crates/config-engine/src/user_config/system_proxy_bypass.rs",
@@ -608,12 +635,12 @@
     },
     {
       "path": "crates/store/src/backup.rs",
-      "owner": "libraries",
-      "baseBlob": "45a9bef7c09f4fa86db18d30d0e415d10463842f",
-      "newBlob": "d8eb40bed57431b4697f64a699850c80b48ece90",
-      "newSHA256": "104f59513a0acd8a0aa7c77aaeba1691d74d17478db857280acd0fffe6716eb4",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "d8eb40bed57431b4697f64a699850c80b48ece90",
+      "newBlob": "0bf8aed4b7425f3fb03c92c05b655d9985ee5262",
+      "newSHA256": "e47f93150eea58a85bd7570f53b73781644bac86378a2a9eb5106d2c86f7e989",
       "mode": "100644",
-      "bytes": 46049
+      "bytes": 46475
     },
     {
       "path": "crates/store/src/backup/tests/audit_regressions.rs",
@@ -626,21 +653,39 @@
     },
     {
       "path": "crates/store/src/backup/tests/mod.rs",
-      "owner": "app-ci-round2",
-      "baseBlob": "165a26cfbbf14c466171a66c289925bda5773e30",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "86a44f639cef115dd850ec6130e210acf4f79f55",
+      "newBlob": "0108196c56fa79e58f12b223e8e2089c5458226c",
+      "newSHA256": "a1e69a2309623b52891654c9b261b33f769000b22e74059dca8417b131cb2d9e",
       "mode": "100644",
-      "newBlob": "86a44f639cef115dd850ec6130e210acf4f79f55",
-      "newSHA256": "1d6fe0606868a43fb13cc254e13afff94df72fd1668b3ee0e538ca5555638226",
-      "bytes": 60940
+      "bytes": 65667
+    },
+    {
+      "path": "crates/store/src/migrate.rs",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "7200f159e172bd26ef849c8e674a4ebde2f83a07",
+      "newBlob": "d3809a5b8499da74f044400257730900f2662b7c",
+      "newSHA256": "50ac324347cd1de08d0d315fa3bd5456242fe5d9139e7775e695d1264986518e",
+      "mode": "100644",
+      "bytes": 56093
+    },
+    {
+      "path": "crates/store/src/migrate/tests/mod.rs",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "8cf17fea6150e52aeb1d3d30873bdcc7403b3a9c",
+      "newBlob": "1ee45a7f08b0bab9537b2b604b2aac04c07259ab",
+      "newSHA256": "97e0a66c7508a8e42b633048a19b48e04e534e2dddf3c69809c0dca1397b0072",
+      "mode": "100644",
+      "bytes": 28171
     },
     {
       "path": "crates/store/src/sanitize.rs",
-      "owner": "libraries",
-      "baseBlob": "5e7983604d621de0d9443c9291f3bf70eb6defd8",
-      "newBlob": "da977475cf79b93050b8f1fde3e9419d68b45a43",
-      "newSHA256": "952c57ca58506cf7f304a71b980d8cd71e293afd1d8bc7de80b955cf0fe587fb",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "da977475cf79b93050b8f1fde3e9419d68b45a43",
+      "newBlob": "b9fc9923da70f3b2ef1a1524dfbe37a2ddbce18c",
+      "newSHA256": "ce58734631ff12aea4da588cc63dfc0fe0de48e6ca6f93847dcf1122b6b2b81f",
       "mode": "100644",
-      "bytes": 38258
+      "bytes": 38413
     },
     {
       "path": "crates/store/src/sanitize/tests/audit_regressions.rs",
@@ -662,30 +707,30 @@
     },
     {
       "path": "crates/store/src/store.rs",
-      "owner": "libraries",
-      "baseBlob": "01f695312499489dfd8a4b0f87ab8f9f6bd6b432",
-      "newBlob": "0ab727d9e303b85a036a976d64585a6a0743c36a",
-      "newSHA256": "0060192849909c3a3e7912d3df1e0b7811a53c0331a40df75829c45b27cf8062",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "0ab727d9e303b85a036a976d64585a6a0743c36a",
+      "newBlob": "3caf8e0e864d493ad714a4123bc9436b3821d21e",
+      "newSHA256": "419de93e4f73cfe44fae3a49bcdffadc9183e3551215e62588eb03114169fee5",
       "mode": "100644",
-      "bytes": 18463
+      "bytes": 18710
     },
     {
       "path": "crates/store/src/tests/store_tests.rs",
-      "owner": "libraries",
-      "baseBlob": "82a18a6e96dce3e4edce0623591e4fbd8486fd63",
-      "newBlob": "c6480a72b132d843bc7e3d082d10a9a02981b3b9",
-      "newSHA256": "5a945906bb97717511281fdf9865087b798fc6beabdb3bccd033f4f6a77fe44a",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "c6480a72b132d843bc7e3d082d10a9a02981b3b9",
+      "newBlob": "2e430e6f887452687e94b00b5f91bbd24b5d7363",
+      "newSHA256": "cd19d90f5a6f4c5d7240e78cfcdfef6f0604ac1cf66a3f331b1cc65a05c828e8",
       "mode": "100644",
-      "bytes": 20576
+      "bytes": 26520
     },
     {
       "path": "crates/store/src/validate.rs",
-      "owner": "libraries",
-      "baseBlob": "3d322dda23144ec53ae589b5355a4bb2980f27f9",
-      "newBlob": "80668af16add6342d3604f9d4b1d4030da33b6db",
-      "newSHA256": "d5a7cabe104efa59aaa04cb590896d40b454b60662ac4ce4e26e35a131c17461",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "80668af16add6342d3604f9d4b1d4030da33b6db",
+      "newBlob": "0d127b63880685087318dd8f6e6fa18b15c5219e",
+      "newSHA256": "ae111dade3f4fe3e477a318182d4ca1388b2d05a4c618cf0c1657195c1399a8b",
       "mode": "100644",
-      "bytes": 19566
+      "bytes": 22217
     },
     {
       "path": "crates/store/src/validate/tests/audit_regressions.rs",
@@ -833,12 +878,21 @@
     },
     {
       "path": "docs/audit-remediation-status.md",
-      "owner": "app-ci-round9-explicit-desktop",
-      "baseBlob": "31afe2d4b3ec485b411e74a2833121b7adb5aede",
+      "owner": "app-ci-round10-dns-rebase",
+      "baseBlob": "cb670fe56b3e00b91795cf0d0eee478ca3f726fb",
       "mode": "100644",
-      "newBlob": "cb670fe56b3e00b91795cf0d0eee478ca3f726fb",
-      "newSHA256": "50bc7c713185512f16f20c5e699773b23ab332ce49dea1e43f855ff124fb75d7",
-      "bytes": 28952
+      "newBlob": "b61f5895e50fa7eaaa4ef1d7fd6f423a65bd3538",
+      "newSHA256": "01d7e7192fc3e051ee2270edd82aecf095647fbf7acb1fb4bdb41540ab47f0c7",
+      "bytes": 31558
+    },
+    {
+      "path": "docs/dns-real-query-fallback.md",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": null,
+      "newBlob": "7053fa257c9f8d0794b33426584150ffd3b559f4",
+      "newSHA256": "e11ee9929719d1512b5650c7675ab719cfe8dc3e98e56f3c9fd6d86835035279",
+      "mode": "100644",
+      "bytes": 5602
     },
     {
       "path": "scripts/apk-permission-acquisition.test.mjs",
@@ -1283,21 +1337,21 @@
     },
     {
       "path": "scripts/windows-directory/Run-WithUserTokenOwner.ps1",
-      "owner": "app-ci-round8-diagnostics",
-      "baseBlob": null,
+      "owner": "app-ci-round10-asuser-offline",
+      "baseBlob": "6599ad687a0661bfe41782dea10b673804e70eb8",
       "mode": "100644",
-      "newBlob": "6599ad687a0661bfe41782dea10b673804e70eb8",
-      "newSHA256": "6256c2d200d5691ccbdddde5b32cfef43aa86210387e0bfb67e3051fec3b98b2",
-      "bytes": 9337
+      "newBlob": "c056691159552ef99ba38d67fe76082b79e962a2",
+      "newSHA256": "34818c9f37d0a97c6c90815adc9a4edc442b001452c68e6804e55a5385426885",
+      "bytes": 9417
     },
     {
       "path": "scripts/windows-directory/UserTokenOwnerNative.cs",
-      "owner": "app-ci-round9-explicit-desktop",
-      "baseBlob": "5158f751c73629f762812b7ef3d837b47e80f90d",
+      "owner": "app-ci-round10-asuser-offline",
+      "baseBlob": "4ea9a81ffa41f7ca11f6962647af2d54d94799f5",
       "mode": "100644",
-      "newBlob": "4ea9a81ffa41f7ca11f6962647af2d54d94799f5",
-      "newSHA256": "040f2119cae442e38c70ce93c7bd1d9812c2e53991b7a0c915bbba747caa3669",
-      "bytes": 38746
+      "newBlob": "7e53869226dfa6165de33ec021dee72fd2294bec",
+      "newSHA256": "f71f1cc397b5b4922c7f2db69a15b005e5f92b51f024c7ad2e58e67d9efb5ee2",
+      "bytes": 41440
     },
     {
       "path": "scripts/windows-directory/candidate-source.json",
@@ -1310,12 +1364,12 @@
     },
     {
       "path": "scripts/windows-token-owner.test.mjs",
-      "owner": "app-ci-round9-explicit-desktop",
-      "baseBlob": "4c2e20a9de20aa44a43a2b517b6d9195d2fdd534",
+      "owner": "app-ci-round10-asuser-offline",
+      "baseBlob": "b47bfb51d45c8e8531bdebdb521ad17b780216cf",
       "mode": "100644",
-      "newBlob": "b47bfb51d45c8e8531bdebdb521ad17b780216cf",
-      "newSHA256": "d359a536cf2a6091f1cb14762cd31c15a84dbbf59dfb53162e70f9db87054b40",
-      "bytes": 30967
+      "newBlob": "53464df3755da98ed1f9461c06fead34fc348bde",
+      "newSHA256": "67b2127115c1de3501b6096459bc5284c7305317cc4a8fa06d008a5d880489b1",
+      "bytes": 37107
     },
     {
       "path": "src-tauri/Cargo.toml",
@@ -1876,6 +1930,33 @@
       "bytes": 11500
     },
     {
+      "path": "ui/src/components/dialogs/dns-action-options.ts",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "267e235e67c895e61d38f68a07338ff9336aced0",
+      "newBlob": "a09f81f8c26964657b981acc029f1b954c610151",
+      "newSHA256": "3a8c2ae9b4b0388cf65808b2bda3189b871e1feffb4b5faa256e8f00d0a41fa8",
+      "mode": "100644",
+      "bytes": 14644
+    },
+    {
+      "path": "ui/src/components/dialogs/dns-real-query-fallback.test.ts",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": null,
+      "newBlob": "7341162542683c9fef23cda5591e0a03d7b81879",
+      "newSHA256": "d53e040f904691fdc8ff21009a51c8764c55140dedec3774e9e335546fc0c27d",
+      "mode": "100644",
+      "bytes": 7605
+    },
+    {
+      "path": "ui/src/components/dialogs/dns-resource-logic.ts",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "dfd64757d981b41baf68bd0e53acc112ccb451a0",
+      "newBlob": "873ca42efcf635d7c3618479bab249dbf97fd948",
+      "newSHA256": "883b3be796c0ac0cbb84f392fd6cf618d1cab918fbbd7c878c0f8b256869ed4f",
+      "mode": "100644",
+      "bytes": 8388
+    },
+    {
       "path": "ui/src/components/dialogs/use-subscription-create-dialog-operation.ts",
       "owner": "ui",
       "baseBlob": "135171142af562b5b087a45cffc1e185906b6b29",
@@ -1892,6 +1973,24 @@
       "newSHA256": "986fd1420e08d4c0c664d010c7f7c7c35da1dc35da71606cf7fc8258b45cada9",
       "mode": "100644",
       "bytes": 45096
+    },
+    {
+      "path": "ui/src/components/screens/rules/DnsPolicyWorkspace.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "051c34166b1cee69986c5f51a87006c7d5b9517e",
+      "newBlob": "652c278fa32145e0c70014c383aeef68628e3eff",
+      "newSHA256": "83f9fda3ea2961f7dd6df98f517c7f9acbc0d0c693357379166b85e8890d451a",
+      "mode": "100644",
+      "bytes": 13083
+    },
+    {
+      "path": "ui/src/components/screens/settings/SettingsTun.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "339f4b14a35a65a042477759f26c2fde979fbee2",
+      "newBlob": "3f266565d737e81bb7cd47cb133da9c50ec6588d",
+      "newSHA256": "db8b51f4d9b08900fded82041381f57ea04b7a717d5cf0791a9192c69f8635c6",
+      "mode": "100644",
+      "bytes": 33419
     },
     {
       "path": "ui/src/contracts/coex-runtime.rust.fixture.json",
@@ -1912,6 +2011,15 @@
       "bytes": 92989
     },
     {
+      "path": "ui/src/contracts/types.ts",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "cd8de5f4e9a9a9e7fe11e858f3e6227eb210c4ba",
+      "newBlob": "b7e79fbd9fa936ae9abaed0c8eb6df30ad65e9d9",
+      "newSHA256": "30f3098d8994d7f398a5e0afaae8640806fc15b2f2e3a3ceccd4e34e3d4e97d1",
+      "mode": "100644",
+      "bytes": 45202
+    },
+    {
       "path": "ui/src/contracts/workflow-toolchain-pin-parity.test.ts",
       "owner": "app-ci-round8-diagnostics",
       "baseBlob": "0d25edb717cfc430e9862659cc934eb363868fea",
@@ -1919,6 +2027,51 @@
       "newSHA256": "9037d24583ae00a7695ba6ab635b08544b14fbd7d5c342037ba9066d4858f87d",
       "mode": "100644",
       "bytes": 17224
+    },
+    {
+      "path": "ui/src/i18n/locales/en-US.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "74b6658fbb2be486b5f7063588dc7db07416dd4d",
+      "newBlob": "4728c766531ef8a9a164b377ca3dea6ef5f01b79",
+      "newSHA256": "39762c231319e9ee66961baed38001d9065522e6517f594bff73c8d0115ea797",
+      "mode": "100644",
+      "bytes": 209428
+    },
+    {
+      "path": "ui/src/i18n/locales/fa.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "669e257d8a8fab6bfaee41ea86cda3d46aebf0b5",
+      "newBlob": "6cbca66f8235d56faea0d21f08cffc036de19fb8",
+      "newSHA256": "35dc6a67a73d5313ee6e682c3a251857ceec8eacc784ae3206718b1806e8706b",
+      "mode": "100644",
+      "bytes": 305294
+    },
+    {
+      "path": "ui/src/i18n/locales/ru.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "9dfa6cf0fedcf4df0a86e7fe98a85d2acba8a7a2",
+      "newBlob": "b3611e18020636b93a142486adb19ebfb20e8d27",
+      "newSHA256": "1e395c33ba830699c8af1348fa3cbb40c7fab9751acb27c02b964dc583e2b19e",
+      "mode": "100644",
+      "bytes": 327172
+    },
+    {
+      "path": "ui/src/i18n/locales/zh-CN.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "4167fb569d74a0cbb9be20550040f99ad801fe18",
+      "newBlob": "03f2940187542677774fd694022e065a5379c0e4",
+      "newSHA256": "d083f1700e61fbcebe1fc8c54adfe3bf86f79ad2407fe38b06c6f6c8ee46db25",
+      "mode": "100644",
+      "bytes": 194159
+    },
+    {
+      "path": "ui/src/i18n/locales/zh-TW.json",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "b5d3c180d29787d9f1fc51c7fb0db5c1b0e866f2",
+      "newBlob": "498da042ae774c1c4b2d29a60728fd03a1a62004",
+      "newSHA256": "1935d40ca7ff5df67cdab8b49650f1eb40399e441c296544996b80f275f49e7a",
+      "mode": "100644",
+      "bytes": 196439
     },
     {
       "path": "ui/src/lib/config-write-lock.test.ts",
@@ -1955,6 +2108,42 @@
       "newSHA256": "c14cfefa2ccfab8dacdc71ef7c8f006bba8f1db2668a92d79b0caadda99b533d",
       "mode": "100644",
       "bytes": 32988
+    },
+    {
+      "path": "ui/src/mobile/screens/rules/DnsSegment.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "ebac0ef8dbcd9efa7a784026699b7682f1fe7f05",
+      "newBlob": "c43050c5ce02aaea0b898847cbdf46d3d780df7f",
+      "newSHA256": "3fc171e16b61e5b029c700a005413cfef46e42f88ab564ffe53a461cb1b5d3e9",
+      "mode": "100644",
+      "bytes": 11373
+    },
+    {
+      "path": "ui/src/mobile/screens/rules/RulesScreen.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "e9b9767fca16349f975e75ed5832966bffc9c130",
+      "newBlob": "87df3d2252a31d91c8517b6f12fa79b4a18c4b34",
+      "newSHA256": "34d0ed5744248ceb3543e2283176374fb987b9afbcea6ef9d59827c751fe69c6",
+      "mode": "100644",
+      "bytes": 85657
+    },
+    {
+      "path": "ui/src/mobile/settings/DnsPage.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "271d28ee3cb16d954c53deefc72e192fda2fc9fb",
+      "newBlob": "2af293bb7d5f7c265b4931c07cb5a861104a3746",
+      "newSHA256": "ab790f2aa7a7b3d57e4619d3e229389cc89af3f6bca8544f44ed929685da468c",
+      "mode": "100644",
+      "bytes": 43851
+    },
+    {
+      "path": "ui/src/mobile/settings/MobileSettings.test.tsx",
+      "owner": "published-dns-fallback-0e87449c",
+      "baseBlob": "2bc86f34e2e622de7c9a157883fcea66e46fd3b2",
+      "newBlob": "730dbb932642643552d5880109980312b9b198db",
+      "newSHA256": "8ba8e251db26f76b9d949fcc4cd61c168defa216f161869d5ed1e53b7168bd0f",
+      "mode": "100644",
+      "bytes": 222398
     },
     {
       "path": "ui/src/tray/TrayMenu.tsx",

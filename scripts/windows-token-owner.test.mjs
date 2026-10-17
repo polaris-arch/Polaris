@@ -40,7 +40,7 @@ function audit({ parent, child, native, workflow }) {
   assert.match(native, /new AggregateException\("Acceptance launch and constructor cleanup both failed", launchError, cleanupError\)/);
   assert.match(native, /child.TokenType != 1 \|\| child.TokenId == original.TokenId \|\| child.User != original.User \|\| child.Owner != child.User/);
   assert.match(native, /before.TokenId != after.TokenId \|\| before.User != after.User \|\| before.Owner != after.Owner/);
-  ordered(native, 'Native.CreateProcessWithTokenW(', 'Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT', 'Native.AssignProcessToJobObject(job, process)', 'Native.OpenProcessToken(process, Native.TOKEN_QUERY', 'Token = Native.Snapshot(childToken)', 'Native.AssertPrivate(original, Token)');
+  ordered(native, 'Native.CreateProcessAsUserW(', 'Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT', 'Native.AssignProcessToJobObject(job, process)', 'Native.OpenProcessToken(process, Native.TOKEN_QUERY', 'Token = Native.Snapshot(childToken)', 'Native.AssertPrivate(original, Token)');
   assert.match(native, /catch \{ Dispose\(\); throw; \}/);
   assert.match(native, /LimitFlags = 0x00002000/);
   assert.match(native, /Native.TerminateJobObject\(job, 1\)/);
@@ -169,7 +169,7 @@ function auditReadOnlyDiagnostics({ native, parent }) {
   assert.match(native, /GetNamedSecurityInfoW\(path, 1, OWNER_GROUP_DACL,/);
   const diagnostics = native.split('public object ReadLaunchDiagnostics(')[1]?.split('public ChildProcess Start(')[0];
   assert.ok(diagnostics);
-  assert.match(diagnostics, /"phase", "beforeCreateProcessWithTokenW"/);
+  assert.match(diagnostics, /"phase", "beforeCreateProcessAsUserW"/);
   for (const token of ['original', 'duplicate']) assert.ok(diagnostics.includes(`Native.TokenContext(${token})`));
   assert.match(diagnostics, /Native.Observe\(\(\) => Native.TokenObjectSecurity\(original, true\)\)/);
   assert.match(diagnostics, /Native.Observe\(\(\) => Native.TokenObjectSecurity\(duplicate, false\)\)/);
@@ -179,7 +179,7 @@ function auditReadOnlyDiagnostics({ native, parent }) {
   for (const config of ['true', 'false']) assert.ok(diagnostics.includes(`Native.Observe(() => Native.SecLogon(${config}))`));
   assert.doesNotMatch(diagnostics, /Environment|CreateProcess\w*\(|\.Start\(|SetTokenInformation|Normalize\(/);
   // The phase string contains the API name, but there is still exactly one actual call.
-  assert.equal([...native.matchAll(/Native.CreateProcessWithTokenW\(/g)].length, 1);
+  assert.equal([...native.matchAll(/Native.CreateProcessAsUserW\(/g)].length, 1);
   const userObject = native.split('internal static object CurrentUserObject(')[1]?.split('internal static object SecLogon(')[0];
   assert.match(userObject, /GetProcessWindowStation\(\) : GetThreadDesktop\(GetCurrentThreadId\(\)\)/);
   assert.doesNotMatch(userObject, /CloseHandle\(|CloseDesktop\(|CloseWindowStation\(/);
@@ -307,9 +307,9 @@ function auditExplicitDesktop(native) {
     'throw new InvalidOperationException("Diagnostic runner/token session',
     'return @"winsta0\\default";');
   assert.doesNotMatch(preflight, /catch|Observe\(|Set\w+\(|CloseHandle\(/);
-  assert.match(native, /return new ChildProcess\(duplicate, Original, executable, worker, config, directory, Native\.VerifiedExistingDesktop\(original, duplicate\)\);/);
-  assert.match(native, /internal ChildProcess\(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop\)/);
-  ordered(native, 'startup.cb = Marshal.SizeOf(startup)', 'startup.lpDesktop = verifiedDesktop;', 'Native.CreateProcessWithTokenW(');
+  assert.match(native, /return new ChildProcess\(duplicate, Original, executable, worker, config, directory, Native\.VerifiedExistingDesktop\(original, duplicate\), LaunchPrivileges\);/);
+  assert.match(native, /internal ChildProcess\(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop, LaunchPrivilegeEvidence privileges\)/);
+  ordered(native, 'startup.cb = Marshal.SizeOf(startup)', 'startup.lpDesktop = verifiedDesktop;', 'Native.CreateProcessAsUserW(');
   assert.equal([...native.matchAll(/startup\.lpDesktop\s*=/g)].length, 1);
 }
 test('explicit desktop requires observed names and all three session identities before creation', () => auditExplicitDesktop(sources.native));
@@ -327,4 +327,67 @@ for (const [name, before, after] of [
 ]) test(`explicit desktop rejects ${name}`, () => {
   assert.ok(sources.native.includes(before), name);
   assert.throws(() => auditExplicitDesktop(sources.native.replace(before, after)), { name: 'AssertionError' });
+});
+
+function auditAsUser({ native, parent }) {
+  assert.doesNotMatch(native, /CreateProcessWithToken|CreateProcessWithLogon|CreateRestrictedToken|AdjustTokenPrivileges|LsaAddAccountRights/);
+  assert.equal([...native.matchAll(/Native.CreateProcessAsUserW\(/g)].length, 1);
+  assert.match(native, /CreateProcessAsUserW\(IntPtr token, string application, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags,/);
+  assert.match(native, /Native.CreateProcessAsUserW\(token, executable, command, IntPtr.Zero, IntPtr.Zero, false, Native.CREATE_SUSPENDED \| Native.CREATE_UNICODE_ENVIRONMENT, environment, directory, ref startup, out child\)/);
+  ordered(native, 'privileges.Before = Native.CurrentPrivileges();', 'bool created = Native.CreateProcessAsUserW(',
+    'int createError = Marshal.GetLastWin32Error();',
+    'if (created) { process = child.hProcess; thread = child.hThread; ProcessId = child.dwProcessId; }',
+    'Exception createFailure = created ? null : new Win32Exception(createError,',
+    'privileges.After = Native.CurrentPrivileges();',
+    'Native.AssertPrivilegesRestored(privileges.Before, privileges.After);', 'privileges.Restored = true;',
+    'if (createFailure != null) throw new AggregateException(', 'if (createFailure != null) throw createFailure;',
+    'Native.AssignProcessToJobObject(job, process)');
+  assert.match(native, /new AggregateException\("Acceptance creation and caller privilege readback both failed", createFailure, privilegeError\)/);
+  const compare = native.split('internal static void AssertPrivilegesRestored(')[1]?.split('internal static string Sid(')[0];
+  assert.match(compare, /expected.Add\(value.Luid, value\)/);
+  assert.match(compare, /before.Length != after.Length/);
+  assert.match(compare, /!expected.TryGetValue\(value.Luid, out prior\) \|\| prior.Name != value.Name/);
+  assert.match(compare, /expected.Remove\(value.Luid\)/);
+  assert.match(compare, /expected.Count != 0/);
+  assert.match(compare, /\(prior.Attributes & ~0x80000000u\) != \(value.Attributes & ~0x80000000u\)/);
+  assert.match(native, /Luid = unchecked\(\(uint\)luid.HighPart\).ToString\("x8"\) \+ ":" \+ luid.LowPart.ToString\("x8"\)/);
+  assert.doesNotMatch(compare, /catch|AdjustToken|SetToken/);
+  assert.match(native, /Attributes = attributes,/);
+  assert.match(parent, /finally \{\s*if \(\$null -ne \$lease\) \{ \$state.launchPrivileges = \$lease.LaunchPrivileges \}/);
+  assert.ok(parent.indexOf('$state.launchPrivileges = $lease.LaunchPrivileges') < parent.indexOf('$lease.Dispose()'));
+}
+test('AsUser preserves suspended ownership and verifies exact caller privilege restoration on either result', () => auditAsUser(sources));
+for (const [name, file, before, after] of [
+  ['handle inheritance', 'native', 'command, IntPtr.Zero, IntPtr.Zero, false, Native.CREATE_SUSPENDED', 'command, IntPtr.Zero, IntPtr.Zero, true, Native.CREATE_SUSPENDED'],
+  ['no suspension', 'native', 'false, Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT', 'false, Native.CREATE_UNICODE_ENVIRONMENT'],
+  ['fallback API', 'native', 'if (createFailure != null) throw createFailure;', 'if (createFailure != null) CreateProcessWithTokenW();'],
+  ['restricted-token substitution', 'native', 'privileges.Before = Native.CurrentPrivileges();', 'CreateRestrictedToken(); privileges.Before = Native.CurrentPrivileges();'],
+  ['self-enabled privilege', 'native', 'privileges.Before = Native.CurrentPrivileges();', 'AdjustTokenPrivileges(); privileges.Before = Native.CurrentPrivileges();'],
+  ['lost error before readback', 'native', 'int createError = Marshal.GetLastWin32Error();', 'int createError = 0;'],
+  ['unowned successful process on readback failure', 'native', 'if (created) { process = child.hProcess; thread = child.hThread; ProcessId = child.dwProcessId; }', 'if (false) { process = child.hProcess; thread = child.hThread; ProcessId = child.dwProcessId; }'],
+  ['after snapshot omitted', 'native', 'privileges.After = Native.CurrentPrivileges();', 'privileges.After = privileges.Before;'],
+  ['raw attributes discarded', 'native', 'Attributes = attributes,', 'Attributes = attributes & 2,'],
+  ['changed attributes accepted', 'native', '(prior.Attributes & ~0x80000000u) != (value.Attributes & ~0x80000000u)', 'false'],
+  ['changed privilege name accepted', 'native', 'prior.Name != value.Name', 'false'],
+  ['LUID identity replaced by name', 'native', 'expected.Add(value.Luid, value)', 'expected.Add(value.Name, value)'],
+  ['unknown permission bits ignored', 'native', '(prior.Attributes & ~0x80000000u) != (value.Attributes & ~0x80000000u)', '(prior.Attributes & 7u) != (value.Attributes & 7u)'],
+  ['changed count accepted', 'native', 'before.Length != after.Length', 'false'],
+  ['duplicate names accepted', 'native', 'expected.Remove(value.Luid);', ''],
+  ['readback check bypass', 'native', 'Native.AssertPrivilegesRestored(privileges.Before, privileges.After);', ''],
+  ['API failure swallowed', 'native', 'if (createFailure != null) throw createFailure;', ''],
+  ['combined failures lose original code', 'native', 'createFailure, privilegeError);', 'privilegeError);'],
+  ['failed launch loses privilege evidence', 'parent', '$state.launchPrivileges = $lease.LaunchPrivileges', '$state.launchPrivileges = $null'],
+]) test(`AsUser rejects ${name}`, () => {
+  assert.ok(sources[file].includes(before), name);
+  assert.throws(() => auditAsUser({ ...sources, [file]: sources[file].replace(before, after) }), { name: 'AssertionError' });
+});
+
+// Evaluate only the actual extracted mask expression; this is not C# execution.
+test('privilege restoration mask ignores usage-only evidence and preserves every permission/unknown bit', () => {
+  const match = sources.native.match(/\(prior.Attributes & (~0x[0-9a-f]+u)\) != \(value.Attributes & \1\)/i);
+  assert.ok(match);
+  const mask = ~Number(match[1].slice(1, -1));
+  const equivalent = (a, b) => (a & mask) === (b & mask);
+  assert.equal(equivalent(3, 0x80000003), true);
+  for (const bit of [1, 2, 4, 8, 0x40000000]) assert.equal(equivalent(0, bit), false);
 });

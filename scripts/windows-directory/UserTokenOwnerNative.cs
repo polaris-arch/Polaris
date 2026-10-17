@@ -20,8 +20,14 @@ namespace Polaris.WindowsAcceptance {
     }
 
     public sealed class PrivilegeSnapshot {
-        public string Name;
+        public string Name, Luid;
+        public uint Attributes;
         public bool Enabled, EnabledByDefault, Removed, UsedForAccess;
+    }
+
+    public sealed class LaunchPrivilegeEvidence {
+        public PrivilegeSnapshot[] Before, After;
+        public bool Restored;
     }
 
     public static class Native {
@@ -86,7 +92,7 @@ namespace Polaris.WindowsAcceptance {
         [DllImport("advapi32.dll", SetLastError=true)] internal static extern bool SetTokenInformation(IntPtr token, int infoClass, IntPtr info, int size);
         [DllImport("advapi32.dll", SetLastError=true)] internal static extern bool DuplicateTokenEx(IntPtr existing, uint access, IntPtr attributes, int level, int type, out IntPtr token);
         [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-        internal static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string application, StringBuilder command, uint creationFlags, IntPtr environment, string directory, ref STARTUPINFO startup, out PROCESS_INFORMATION process);
+        internal static extern bool CreateProcessAsUserW(IntPtr token, string application, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string directory, ref STARTUPINFO startup, out PROCESS_INFORMATION process);
         [DllImport("kernel32.dll", SetLastError=true)] internal static extern uint ResumeThread(IntPtr thread);
         [DllImport("kernel32.dll", SetLastError=true)] internal static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll", SetLastError=true)] internal static extern bool GetExitCodeProcess(IntPtr process, out uint code);
@@ -318,12 +324,28 @@ namespace Polaris.WindowsAcceptance {
                         if (initial || error != 122 || length <= 0) throw new Win32Exception(error, "Read privilege name size [Win32=" + error + "]: " + new Win32Exception(error).Message);
                         var name = new StringBuilder(length + 1); length = name.Capacity;
                         Check(LookupPrivilegeNameW(null, ref luid, name, ref length), "Read privilege name");
-                        values.Add(new PrivilegeSnapshot { Name = name.ToString(), Enabled = (attributes & 2) != 0, EnabledByDefault = (attributes & 1) != 0, Removed = (attributes & 4) != 0, UsedForAccess = (attributes & 0x80000000) != 0 });
+                        values.Add(new PrivilegeSnapshot { Name = name.ToString(), Luid = unchecked((uint)luid.HighPart).ToString("x8") + ":" + luid.LowPart.ToString("x8"), Attributes = attributes, Enabled = (attributes & 2) != 0, EnabledByDefault = (attributes & 1) != 0, Removed = (attributes & 4) != 0, UsedForAccess = (attributes & 0x80000000) != 0 });
                     }
                     return values.ToArray();
                 } finally { Marshal.FreeHGlobal(buffer); }
             } finally { CloseHandle(token); }
         }
+        internal static void AssertPrivilegesRestored(PrivilegeSnapshot[] before, PrivilegeSnapshot[] after) {
+            var expected = new Dictionary<string,PrivilegeSnapshot>(StringComparer.Ordinal);
+            foreach (var value in before) expected.Add(value.Luid, value);
+            if (before.Length != after.Length) throw new InvalidOperationException("Caller privilege set changed during process creation");
+            foreach (var value in after) {
+                PrivilegeSnapshot prior;
+                // USED_FOR_ACCESS is usage evidence, not an enabled/removed permission state.
+                // Retain raw masks in the receipt; all other bits, including unknown bits, must match.
+                if (!expected.TryGetValue(value.Luid, out prior) || prior.Name != value.Name
+                    || (prior.Attributes & ~0x80000000u) != (value.Attributes & ~0x80000000u))
+                    throw new InvalidOperationException("Caller privilege state not restored after process creation");
+                expected.Remove(value.Luid);
+            }
+            if (expected.Count != 0) throw new InvalidOperationException("Caller privilege identity changed during process creation");
+        }
+
         internal static string Sid(IntPtr token, int kind) {
             IntPtr buffer = Information(token, kind);
             try { return new SecurityIdentifier(Marshal.ReadIntPtr(buffer)).Value; }
@@ -389,6 +411,7 @@ namespace Polaris.WindowsAcceptance {
         public TokenSnapshot Original { get; private set; }
         public TokenSnapshot DuplicateBefore { get; private set; }
         public TokenSnapshot Normalized { get; private set; }
+        public LaunchPrivilegeEvidence LaunchPrivileges { get; private set; }
         public PrivateToken() {
             try {
                 // Crucially, this handle cannot change the caller's token owner.
@@ -418,7 +441,7 @@ namespace Polaris.WindowsAcceptance {
             // These observations cannot establish which object denied process creation,
             // or substitute for the actual child-token / owner / target result.
             return new Dictionary<string,object> {
-                { "schemaVersion", 1 }, { "phase", "beforeCreateProcessWithTokenW" },
+                { "schemaVersion", 1 }, { "phase", "beforeCreateProcessAsUserW" },
                 { "currentProcessSessionId", Native.Observe(() => Native.CurrentProcessSessionId()) },
                 { "originalToken", Native.TokenContext(original) },
                 { "privateToken", Native.TokenContext(duplicate) },
@@ -437,7 +460,8 @@ namespace Polaris.WindowsAcceptance {
         public ChildProcess Start(string executable, string worker, string config, string directory) {
             if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken");
             if (Normalized == null) throw new InvalidOperationException("Owner normalization must precede child creation");
-            return new ChildProcess(duplicate, Original, executable, worker, config, directory, Native.VerifiedExistingDesktop(original, duplicate));
+            LaunchPrivileges = new LaunchPrivilegeEvidence();
+            return new ChildProcess(duplicate, Original, executable, worker, config, directory, Native.VerifiedExistingDesktop(original, duplicate), LaunchPrivileges);
         }
         public void Dispose() {
             if (duplicate != IntPtr.Zero) { Native.CloseHandle(duplicate); duplicate = IntPtr.Zero; }
@@ -450,7 +474,7 @@ namespace Polaris.WindowsAcceptance {
         private bool assigned, resumed;
         public uint ProcessId { get; private set; }
         public TokenSnapshot Token { get; private set; }
-        internal ChildProcess(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop) {
+        internal ChildProcess(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop, LaunchPrivilegeEvidence privileges) {
             IntPtr environment = IntPtr.Zero;
             try {
                 job = Native.CreateJobObjectW(IntPtr.Zero, null);
@@ -459,16 +483,29 @@ namespace Polaris.WindowsAcceptance {
                 limits.BasicLimitInformation.LimitFlags = 0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                 Native.Check(Native.SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "Configure kill-on-close job");
                 var startup = new Native.STARTUPINFO(); startup.cb = Marshal.SizeOf(startup);
-                // Explicit existing desktop avoids the API's NULL-desktop permission adjustment.
+                // Preserve the verified existing desktop and same-session boundary.
                 startup.lpDesktop = verifiedDesktop;
                 var command = new StringBuilder(Native.Quote(executable) + " -NoLogo -NoProfile -NonInteractive -File " + Native.Quote(worker) + " -ConfigurationPath " + Native.Quote(config));
-                if (command.Length >= 1024) throw new InvalidOperationException("Acceptance child command exceeds CreateProcessWithTokenW limit");
+                if (command.Length >= 1024) throw new InvalidOperationException("Acceptance child command exceeds fixed fixture limit");
                 environment = Native.EnvironmentBlock();
                 Native.PROCESS_INFORMATION child;
-                // Requires the runner's existing SeImpersonatePrivilege. No privilege enabling,
-                // account changes, credential fallback, scheduled task, or impersonation occurs.
-                Native.Check(Native.CreateProcessWithTokenW(token, 0, executable, command, Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT, environment, directory, ref startup, out child), "Create acceptance child with private token (existing SeImpersonatePrivilege required)");
-                process = child.hProcess; thread = child.hThread; ProcessId = child.dwProcessId;
+                // AsUser may temporarily enable existing caller privileges for this call.
+                // Never grant rights, adjust privileges ourselves, or retry with another API/token.
+                privileges.Before = Native.CurrentPrivileges();
+                bool created = Native.CreateProcessAsUserW(token, executable, command, IntPtr.Zero, IntPtr.Zero, false, Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT, environment, directory, ref startup, out child);
+                int createError = Marshal.GetLastWin32Error();
+                // Retain successful suspended handles before any readback can fail, so Dispose owns them.
+                if (created) { process = child.hProcess; thread = child.hThread; ProcessId = child.dwProcessId; }
+                Exception createFailure = created ? null : new Win32Exception(createError, "Create acceptance child with private token via AsUser [Win32=" + createError + "]: " + new Win32Exception(createError).Message);
+                try {
+                    privileges.After = Native.CurrentPrivileges();
+                    Native.AssertPrivilegesRestored(privileges.Before, privileges.After);
+                    privileges.Restored = true;
+                } catch (Exception privilegeError) {
+                    if (createFailure != null) throw new AggregateException("Acceptance creation and caller privilege readback both failed", createFailure, privilegeError);
+                    throw;
+                }
+                if (createFailure != null) throw createFailure;
                 Native.Check(Native.AssignProcessToJobObject(job, process), "Assign suspended acceptance child to private job"); assigned = true;
                 IntPtr childToken;
                 Native.Check(Native.OpenProcessToken(process, Native.TOKEN_QUERY, out childToken), "Read suspended child's actual token");

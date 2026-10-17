@@ -118,6 +118,7 @@ try {
     $state.failureEvidence = Convert-ExceptionEvidence $_.Exception
     if ($exitCode -eq 0) { $exitCode = 1 }
 } finally {
+    if ($null -ne $lease) { $state.launchPrivileges = $lease.LaunchPrivileges }
     # Start can throw before returning a handle, including during native cleanup.
     # A missing handle cannot prove that constructor-time teardown succeeded.
     try { if ($null -ne $child) { $child.Dispose(); $state.cleanupConfirmed = $true } }
