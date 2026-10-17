@@ -25,8 +25,23 @@ function Invalidate-ValidationReceipt([string]$reason) {
     }
 }
 function Save-OwnerAttempt([hashtable]$value) {
-    $value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $evidence 'parent.json') -Encoding utf8NoBOM
-    $value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $attemptPointer -Encoding utf8NoBOM
+    $value | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath (Join-Path $evidence 'parent.json') -Encoding utf8NoBOM
+    $value | ConvertTo-Json -Depth 64 | Set-Content -LiteralPath $attemptPointer -Encoding utf8NoBOM
+}
+function Convert-ExceptionEvidence([System.Exception]$exception, [int]$depth = 0) {
+    if ($null -eq $exception) { return $null }
+    $item = @{type=$exception.GetType().FullName;message=$exception.Message;hresult=$exception.HResult;children=@()}
+    if ($exception -is [System.ComponentModel.Win32Exception]) {
+        $item.nativeErrorCode = $exception.NativeErrorCode
+        $item.systemMessage = [System.ComponentModel.Win32Exception]::new($exception.NativeErrorCode).Message
+    }
+    if ($depth -ge 16) { $item.truncated = $true; return $item }
+    if ($exception -is [System.AggregateException]) {
+        foreach ($inner in $exception.InnerExceptions) { $item.children += ,(Convert-ExceptionEvidence $inner ($depth + 1)) }
+    } elseif ($null -ne $exception.InnerException) {
+        $item.children += ,(Convert-ExceptionEvidence $exception.InnerException ($depth + 1))
+    }
+    return $item
 }
 $state = @{attemptId=$attemptId;result='inProgress';scope='windows-directory-acceptance-token-fixture';evidenceDirectory=$evidence;childExitCode=$null;childFailureEvidence=$null;originalUnchanged=$false;cleanupConfirmed=$false}
 $lease = $null; $child = $null; $original = $null; $failure = $null; $exitCode = 1
@@ -50,6 +65,8 @@ try {
     Add-Type -Path $native
     $original = [Polaris.WindowsAcceptance.Native]::Current()
     $state.originalToken = $original
+    # Names/flags only: no token bytes, credentials, or environment dump.
+    $state.originalPrivileges = [Polaris.WindowsAcceptance.Native]::CurrentPrivileges()
     Save-OwnerAttempt $state
     $lease = [Polaris.WindowsAcceptance.PrivateToken]::new()
     [Polaris.WindowsAcceptance.Native]::AssertUnchanged($original,$lease.Original)
@@ -91,19 +108,20 @@ try {
     if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { throw 'Acceptance child did not publish its validation receipt' }
 } catch {
     $failure = "$_"
+    $state.failureEvidence = Convert-ExceptionEvidence $_.Exception
     if ($exitCode -eq 0) { $exitCode = 1 }
 } finally {
     # Start can throw before returning a handle, including during native cleanup.
     # A missing handle cannot prove that constructor-time teardown succeeded.
     try { if ($null -ne $child) { $child.Dispose(); $state.cleanupConfirmed = $true } }
-    catch { $failure = "${failure}; process cleanup failed: $_"; $exitCode = 1 }
+    catch { $state.cleanupFailureEvidence = Convert-ExceptionEvidence $_.Exception; $failure = "${failure}; process cleanup failed: $_"; $exitCode = 1 }
     try {
         if ($null -ne $original) {
             $state.originalAfter = [Polaris.WindowsAcceptance.Native]::Current()
             [Polaris.WindowsAcceptance.Native]::AssertUnchanged($original,$state.originalAfter)
             $state.originalUnchanged = $true
         }
-    } catch { $failure = "${failure}; original token final readback failed: $_"; $exitCode = 1 }
+    } catch { $state.readbackFailureEvidence = Convert-ExceptionEvidence $_.Exception; $failure = "${failure}; original token final readback failed: $_"; $exitCode = 1 }
     finally { if ($null -ne $lease) { $lease.Dispose() } }
     if ($null -ne $failure -or -not $state.originalUnchanged -or -not $state.cleanupConfirmed) {
         $state.result = 'failed'; $state.error = $failure

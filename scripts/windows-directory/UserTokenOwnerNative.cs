@@ -18,12 +18,17 @@ namespace Polaris.WindowsAcceptance {
         public int TokenType;
     }
 
+    public sealed class PrivilegeSnapshot {
+        public string Name;
+        public bool Enabled, EnabledByDefault, Removed, UsedForAccess;
+    }
+
     public static class Native {
         internal const uint TOKEN_QUERY = 0x0008;
         internal const uint TOKEN_DUPLICATE = 0x0002;
         internal const uint TOKEN_ASSIGN_PRIMARY = 0x0001;
         internal const uint TOKEN_ADJUST_DEFAULT = 0x0080;
-        internal const int TokenUser = 1, TokenOwner = 4, TokenType = 8, TokenStatistics = 10;
+        internal const int TokenUser = 1, TokenOwner = 4, TokenType = 8, TokenStatistics = 10, TokenPrivileges = 3;
         internal const uint CREATE_SUSPENDED = 0x00000004, CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         internal const uint WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258;
 
@@ -66,6 +71,10 @@ namespace Polaris.WindowsAcceptance {
             public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct LUID { public uint LowPart; public int HighPart; }
+        [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        internal static extern bool LookupPrivilegeNameW(string system, ref LUID luid, StringBuilder name, ref int length);
         [DllImport("kernel32.dll")] internal static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll", SetLastError=true)] internal static extern bool CloseHandle(IntPtr handle);
         [DllImport("advapi32.dll", SetLastError=true)] internal static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
@@ -88,7 +97,11 @@ namespace Polaris.WindowsAcceptance {
         [DllImport("kernel32.dll")] internal static extern IntPtr LocalFree(IntPtr memory);
 
         internal static void Check(bool success, string operation) {
-            if (!success) throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
+            if (!success) {
+                // Capture before formatting or any other native call can change it.
+                int code = Marshal.GetLastWin32Error();
+                throw new Win32Exception(code, operation + " [Win32=" + code + "]: " + new Win32Exception(code).Message);
+            }
         }
         internal static IntPtr Information(IntPtr token, int kind) {
             int size;
@@ -98,6 +111,32 @@ namespace Polaris.WindowsAcceptance {
             IntPtr buffer = Marshal.AllocHGlobal(size);
             try { Check(GetTokenInformation(token, kind, buffer, size, out size), "GetTokenInformation"); return buffer; }
             catch { Marshal.FreeHGlobal(buffer); throw; }
+        }
+        public static PrivilegeSnapshot[] CurrentPrivileges() {
+            IntPtr token;
+            Check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out token), "Read current token privileges");
+            try {
+                IntPtr buffer = Information(token, TokenPrivileges);
+                try {
+                    // TOKEN_PRIVILEGES: DWORD count followed by 12-byte LUID_AND_ATTRIBUTES.
+                    int count = Marshal.ReadInt32(buffer);
+                    if (count < 0 || count > 1024) throw new InvalidOperationException("Invalid privilege count");
+                    var values = new List<PrivilegeSnapshot>();
+                    for (int i = 0; i < count; i++) {
+                        int offset = 4 + i * 12;
+                        var luid = new LUID { LowPart = unchecked((uint)Marshal.ReadInt32(buffer, offset)), HighPart = Marshal.ReadInt32(buffer, offset + 4) };
+                        uint attributes = unchecked((uint)Marshal.ReadInt32(buffer, offset + 8));
+                        int length = 0;
+                        bool initial = LookupPrivilegeNameW(null, ref luid, null, ref length);
+                        int error = Marshal.GetLastWin32Error();
+                        if (initial || error != 122 || length <= 0) throw new Win32Exception(error, "Read privilege name size [Win32=" + error + "]: " + new Win32Exception(error).Message);
+                        var name = new StringBuilder(length + 1); length = name.Capacity;
+                        Check(LookupPrivilegeNameW(null, ref luid, name, ref length), "Read privilege name");
+                        values.Add(new PrivilegeSnapshot { Name = name.ToString(), Enabled = (attributes & 2) != 0, EnabledByDefault = (attributes & 1) != 0, Removed = (attributes & 4) != 0, UsedForAccess = (attributes & 0x80000000) != 0 });
+                    }
+                    return values.ToArray();
+                } finally { Marshal.FreeHGlobal(buffer); }
+            } finally { CloseHandle(token); }
         }
         internal static string Sid(IntPtr token, int kind) {
             IntPtr buffer = Information(token, kind);
@@ -227,7 +266,11 @@ namespace Polaris.WindowsAcceptance {
                 Native.AssertPrivate(original, Token);
                 Native.AssertUnchanged(original, Native.Current());
                 // The caller persists this actual-child evidence before Resume.
-            } catch { Dispose(); throw; }
+            } catch (Exception launchError) {
+                try { Dispose(); }
+                catch (Exception cleanupError) { throw new AggregateException("Acceptance launch and constructor cleanup both failed", launchError, cleanupError); }
+                throw;
+            }
             finally { if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment); }
         }
         public void Resume() {

@@ -31,7 +31,13 @@ function audit({ parent, child, native, workflow }) {
   ordered(native, 'DuplicateBefore = Native.Snapshot(duplicate)', 'DuplicateBefore.TokenId == Original.TokenId', 'public void Normalize()', 'Native.SetTokenInformation(duplicate', 'Normalized = Native.Snapshot(duplicate)', 'Native.AssertPrivate(Original, Normalized)');
   assert.match(native, /if \(duplicate == IntPtr.Zero\) throw new ObjectDisposedException\("PrivateToken"\)/);
   assert.match(native, /if \(Normalized == null\) throw new InvalidOperationException/);
-  assert.match(native, /if \(!success\) throw new Win32Exception/);
+  ordered(native, 'if (!success) {', 'int code = Marshal.GetLastWin32Error();', 'throw new Win32Exception(code, operation + " [Win32=" + code');
+  assert.match(native, /new Win32Exception\(code\)\.Message/);
+  assert.match(native, /OpenProcessToken\(GetCurrentProcess\(\), TOKEN_QUERY, out token\), "Read current token privileges"/);
+  assert.match(native, /Information\(token, TokenPrivileges\)/);
+  assert.match(native, /Check\(LookupPrivilegeNameW\(null, ref luid, name, ref length\), "Read privilege name"\)/);
+  assert.match(native, /Enabled = \(attributes & 2\) != 0/);
+  assert.match(native, /new AggregateException\("Acceptance launch and constructor cleanup both failed", launchError, cleanupError\)/);
   assert.match(native, /child.TokenType != 1 \|\| child.TokenId == original.TokenId \|\| child.User != original.User \|\| child.Owner != child.User/);
   assert.match(native, /before.TokenId != after.TokenId \|\| before.User != after.User \|\| before.Owner != after.Owner/);
   ordered(native, 'Native.CreateProcessWithTokenW(', 'Native.CREATE_SUSPENDED | Native.CREATE_UNICODE_ENVIRONMENT', 'Native.AssignProcessToJobObject(job, process)', 'Native.OpenProcessToken(process, Native.TOKEN_QUERY', 'Token = Native.Snapshot(childToken)', 'Native.AssertPrivate(original, Token)');
@@ -61,6 +67,13 @@ function audit({ parent, child, native, workflow }) {
   assert.match(parent, /catch \{ Invalidate-ValidationReceipt 'evidence-failed'; throw \}/);
   assert.equal([...parent.matchAll(/\$child\.Resume\(\)/g)].length, 1);
   assert.match(parent, /exit \$exitCode/);
+  assert.match(parent, /\$item\.nativeErrorCode = \$exception\.NativeErrorCode/);
+  assert.match(parent, /\$item\.systemMessage = \[System.ComponentModel.Win32Exception\]::new\(\$exception\.NativeErrorCode\)\.Message/);
+  assert.match(parent, /\$exception.InnerExceptions/);
+  assert.match(parent, /Convert-ExceptionEvidence \$exception.InnerException/);
+  assert.match(parent, /\$state.failureEvidence = Convert-ExceptionEvidence \$_\.Exception/);
+  assert.match(parent, /\$state.cleanupFailureEvidence = Convert-ExceptionEvidence \$_\.Exception/);
+  ordered(parent, '$state.originalPrivileges = [Polaris.WindowsAcceptance.Native]::CurrentPrivileges()', 'Save-OwnerAttempt $state', '$lease =');
   assert.match(parent, /childEvidence.result -cne 'targetPassed'/);
   assert.match(parent, /-not \$childEvidence.probeVerified -or -not \$childEvidence.probeRemoved -or -not \$childEvidence.targetStarted/);
   assert.doesNotMatch(parent, /\[string\]\$ScriptPath|\$ScriptParameters|\[switch\]\$Skip|\[switch\]\$Bypass/);
@@ -77,13 +90,23 @@ function audit({ parent, child, native, workflow }) {
 
 test('fixed acceptance fixture is fail closed with independent actual-token and object-owner gates', () => audit(sources));
 const negatives = [
+  ['Win32 code discarded', 'native', 'int code = Marshal.GetLastWin32Error();', 'int code = 0;'],
+  ['system error text discarded', 'native', 'new Win32Exception(code).Message', 'operation'],
+  ['privilege query requests mutation access', 'native', 'GetCurrentProcess(), TOKEN_QUERY, out token', 'GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, out token'],
+  ['privilege enabled state guessed', 'native', 'Enabled = (attributes & 2) != 0', 'Enabled = true'],
+  ['constructor cleanup masks launch error', 'native', 'new AggregateException("Acceptance launch and constructor cleanup both failed", launchError, cleanupError)', 'cleanupError'],
+  ['HRESULT mislabeled as Win32 code', 'parent', '$item.nativeErrorCode = $exception.NativeErrorCode', '$item.nativeErrorCode = $exception.HResult'],
+  ['wrapped native exception lost', 'parent', 'Convert-ExceptionEvidence $exception.InnerException', 'Convert-ExceptionEvidence $exception'],
+  ['original failure evidence omitted', 'parent', '$state.failureEvidence = Convert-ExceptionEvidence $_.Exception', '# omitted'],
+  ['cleanup failure overwrites original evidence', 'parent', '$state.cleanupFailureEvidence = Convert-ExceptionEvidence $_.Exception', '$state.failureEvidence = Convert-ExceptionEvidence $_.Exception'],
+
   ['constructor cleanup failure falsely confirmed with null child', 'parent', 'try { if ($null -ne $child) { $child.Dispose(); $state.cleanupConfirmed = $true } }', 'try { if ($null -ne $child) { $child.Dispose() }; $state.cleanupConfirmed = $true }'],
   ['cleanup success assumed before launch', 'parent', 'cleanupConfirmed=$false', 'cleanupConfirmed=$true'],
   ['CI continues after failed owner gate', 'workflow', "if ($LASTEXITCODE -ne 0) { throw 'Private TokenOwner acceptance failed' }", '# missing immediate gate'],
   ['CI bypasses private owner entrypoint', 'workflow', './scripts/windows-directory/Run-WithUserTokenOwner.ps1 @args', './scripts/windows-directory/Build-And-Test.ps1 @args'],
   ['original token mutation right', 'native', 'Native.TOKEN_QUERY | Native.TOKEN_DUPLICATE, out original', 'Native.TOKEN_QUERY | Native.TOKEN_DUPLICATE | Native.TOKEN_ADJUST_DEFAULT, out original'],
   ['setter aimed at shared original token', 'native', 'SetTokenInformation(duplicate, Native.TokenOwner', 'SetTokenInformation(original, Native.TokenOwner'],
-  ['duplicate owner API failure ignored', 'native', 'if (!success) throw new Win32Exception', 'if (false) throw new Win32Exception'],
+  ['duplicate owner API failure ignored', 'native', 'if (!success) {', 'if (false) {'],
   ['closed token accepted', 'native', 'if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken")', 'if (false) throw new ObjectDisposedException("PrivateToken")', true],
   ['no normalized-token precondition', 'native', 'if (Normalized == null) throw', 'if (false) throw'],
   ['same token identity accepted', 'native', 'child.TokenId == original.TokenId', 'false'],
