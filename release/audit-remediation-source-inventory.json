@@ -1,16 +1,16 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "Appd712 complete CI: native build/tests/clippy/rustdoc, UI, Android and desktop installers passed. Windows acceptance JSON/toolchain entry and Apple Xcode budget-descriptor boundary repairs await review/new CI. Candidate/SYSTEM and Apple archive remain unaccepted.",
+  "status": "Appe22 complete CI: UI and all ReleaseRisk jobs passed, including Apple/Android and four installers. Windows kernel activation passed; native fixture owner rejection blocked ordinary interop/SYSTEM. Private duplicated-token fixture launcher awaits independent review and actual Windows owner/probe/test evidence; product checks and SYSTEM gate unchanged.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
       "owner": "validation",
       "baseBlob": "9b2baff2796bf95831b3c533a9448ff2926bfd30",
-      "newBlob": "2f31b73a7d65ca59ce8d138ac0c63d17ff353f8b",
-      "newSHA256": "f79c798c7134f3ae5a017f011a2f2e4141292ea9836571fdd2ba735b5af844f4",
+      "newBlob": "98e82d87eee77c471314dd39c26793864608134b",
+      "newSHA256": "80d23f5bf7a38d997d54940e5cc80bd7f4ca84cc3faaf2207732b69030076ba5",
       "mode": "100644",
-      "bytes": 69623
+      "bytes": 69715
     },
     {
       "path": "README.en.md",
@@ -1174,6 +1174,15 @@
       "bytes": 9676
     },
     {
+      "path": "scripts/windows-directory/Run-UserTokenOwnerChild.ps1",
+      "owner": "app-ci-round5",
+      "baseBlob": null,
+      "mode": "100644",
+      "newBlob": "f81743e43d0ba7709ce3f67b53cabed9b3bb685b",
+      "newSHA256": "efb3fa618acaa6354a3e8c543ba1b741c9194ce43bef8a20d6f27bcc268ab7af",
+      "bytes": 5498
+    },
+    {
       "path": "scripts/windows-directory/Run-WindowsDirectoryInterop.ps1",
       "owner": "windows-app",
       "baseBlob": null,
@@ -1183,6 +1192,24 @@
       "bytes": 2420
     },
     {
+      "path": "scripts/windows-directory/Run-WithUserTokenOwner.ps1",
+      "owner": "app-ci-round5",
+      "baseBlob": null,
+      "mode": "100644",
+      "newBlob": "7cd885e936143f0be1905f9b458e2a2fbf0a0325",
+      "newSHA256": "dd157f58b2bc15968b634fd64dba553fe87f231f4db84a51a0e3a92b172d0f80",
+      "bytes": 7662
+    },
+    {
+      "path": "scripts/windows-directory/UserTokenOwnerNative.cs",
+      "owner": "app-ci-round5",
+      "baseBlob": null,
+      "mode": "100644",
+      "newBlob": "fd29bd5be770581e41557c4c54071af411bd7d3a",
+      "newSHA256": "cc05098337d2ca15643fc6da64a7ee68fde7079e959e920dcf80bd3735b6583e",
+      "bytes": 19532
+    },
+    {
       "path": "scripts/windows-directory/candidate-source.json",
       "owner": "integration-candidate-binding",
       "baseBlob": null,
@@ -1190,6 +1217,15 @@
       "newSHA256": "3d02a3ff90c724a63fa11c90616955c174f2486f8c7fdf4e729cfe54d989dc77",
       "mode": "100644",
       "bytes": 168
+    },
+    {
+      "path": "scripts/windows-token-owner.test.mjs",
+      "owner": "app-ci-round5",
+      "baseBlob": null,
+      "mode": "100644",
+      "newBlob": "c824677475003c56b691d901c15f50dd91e8666f",
+      "newSHA256": "b38e2331b484fe701823fbaa5aaebbda2865567307a377f4328334c7e8a3947c",
+      "bytes": 10857
     },
     {
       "path": "src-tauri/Cargo.toml",

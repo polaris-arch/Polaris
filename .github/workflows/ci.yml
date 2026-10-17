@@ -902,7 +902,8 @@ jobs:
           if ($env:DIRECTORY_MODE -ceq 'candidate') { $args.CandidateSourceCommit = $env:DIRECTORY_SOURCE }
           elseif ($env:DIRECTORY_MODE -ceq 'formal') { $args.FormalContract = $true }
           else { throw 'Unknown validation mode' }
-          ./scripts/windows-directory/Build-And-Test.ps1 @args
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 @args
+          if ($LASTEXITCODE -ne 0) { throw 'Private TokenOwner acceptance failed' }
           $appSource = & git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve actual App source' }
           $verified = ./scripts/ci/assert-windows-directory-acceptance.ps1 -EvidenceDirectory $root -ExpectedAppSource $appSource -ExpectedKernelSource $env:DIRECTORY_SOURCE -ValidationMode $env:DIRECTORY_MODE -PreviousAttemptId $previousAttempt
