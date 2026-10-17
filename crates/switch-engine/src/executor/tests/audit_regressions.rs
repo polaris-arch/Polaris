@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 struct Api(bool);
 #[async_trait]
 impl ManagementApi for Api {

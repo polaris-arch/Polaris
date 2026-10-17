@@ -311,7 +311,3 @@ impl ManagementApi for MockManagementApi {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "executor/tests/audit_regressions.rs"]
-mod audit_regressions;

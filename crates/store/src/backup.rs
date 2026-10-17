@@ -1089,7 +1089,3 @@ pub fn build_backup_info(config: &Value, cross_platform_disabled_rules: usize) -
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "backup/tests/audit_regressions.rs"]
-mod audit_regressions;

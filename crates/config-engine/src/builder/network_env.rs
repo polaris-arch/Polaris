@@ -880,7 +880,3 @@ pub fn apply_network_canaries(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "network_env/tests/audit_regressions.rs"]
-mod audit_regressions;

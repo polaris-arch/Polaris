@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn external_matcher_values_do_not_hide_outer_policy_changes() {
     let base = serde_json::json!({"proxyMode":"smart","proxyModeType":"systemProxy","servers":[],"customRules":[{"id":"r1","type":"domain","values":["a.example"],"action":"proxy","enabled":true}]});

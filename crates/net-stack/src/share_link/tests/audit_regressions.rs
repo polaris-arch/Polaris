@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn shadowtls_share_roundtrip_preserves_outer_credentials() {
     let mut warnings = Vec::new();

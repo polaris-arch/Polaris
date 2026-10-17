@@ -392,11 +392,16 @@ pub async fn check_netflix<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
         .or_else(|| (r1.status == 200).then_some("US".to_string()));
     let d1 = r1.body.contains(NetflixEndpoints::OH_NO_MARKER);
     let d2 = r2.body.contains(NetflixEndpoints::OH_NO_MARKER);
+    // A known unavailable title (404 + Oh no!) can coexist with a watchable
+    // title. Generic errors still cannot supply positive unlock evidence.
+    let classified = |status: u16, unavailable: bool| {
+        (200..300).contains(&status) || (status == 404 && unavailable)
+    };
+    if !classified(r1.status, d1) || !classified(r2.status, d2) {
+        return UnlockResult::with_region(UnlockStatus::Timeout, region);
+    }
     if d1 && d2 {
         return UnlockResult::with_region(UnlockStatus::Partial, region); // 两非自制皆不可看 -> 仅自制剧
-    }
-    if !(200..300).contains(&r1.status) || !(200..300).contains(&r2.status) {
-        return UnlockResult::with_region(UnlockStatus::Timeout, region);
     }
     UnlockResult::with_region(UnlockStatus::Ok, region) // 任一可看 -> 完整解锁
 }
@@ -707,7 +712,3 @@ pub async fn run_checker<H: UnlockHttp + ?Sized>(id: ServiceId, http: &H) -> Unl
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "checkers/tests/audit_regressions.rs"]
-mod audit_regressions;

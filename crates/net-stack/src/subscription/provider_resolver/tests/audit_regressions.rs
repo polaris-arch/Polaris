@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn provider_filter_warnings_do_not_disclose_url_credentials() {
     let text = "proxies:\n  - {name: node, type: ss, server: host.example, port: 443, cipher: aes-256-gcm, password: pw}\n";

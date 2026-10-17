@@ -3443,10 +3443,10 @@ const CFG_REGISTRY: &[CfgSite] = &[
     // G4 source-only accounting; historical debt verdicts remain intact.
     (
         "src-tauri/src/runtime/config.rs",
-        "target_os = \"ios\"",
+        "any(target_os = \"ios\", windows)",
         1,
         IosSide::DiffersRight,
-        "G4 stages a physical, incarnation-bound iOS directory intent; other platforms retain their prior journal entries. Source accounting only; no native receipt or device acceptance is inferred.",
+        "New directory intents use platform-specific retained directory custody on iOS and Windows; historical unbound intents are not upgraded. Android keeps its prior path. This records source dispatch only, not device or protocol acceptance.",
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
@@ -3471,29 +3471,29 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
-        "not(target_os = \"ios\")",
+        "not(any(target_os = \"ios\", windows))",
         3,
         IosSide::DiffersRight,
-        "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
+        "Legacy state helpers are excluded on iOS and Windows, whose mapped directory identity and custody have separate implementations. Android keeps its existing legacy branch; no native acceptance is inferred.",
     ),
     (
         "src-tauri/src/runtime/mesh.rs",
         "target_os = \"ios\"",
-        5,
+        4,
         IosSide::DiffersRight,
         "G4 keeps iOS mapped-directory selection and opaque native deletion admission separate from other platforms. Shared mobile/test auth provenance branches stay on the same iOS/Android side; host locking and runtime behavior still require their unified gates.",
     ),
     (
         "src-tauri/src/runtime/proxy/pending_changes.rs",
-        "not(target_os = \"ios\")",
+        "not(any(target_os = \"ios\", windows))",
         1,
         IosSide::DiffersRight,
-        "G4 borrows the original iOS Stop target and scoped directory receipt through exclusive lease and durable journal acknowledgement. Other platforms retain an explicit unavailable result. This registration does not authorize global cleanup or assert a device Stop.",
+        "The explicit unsupported directory-retirement fallback is excluded on iOS and Windows only; each owns its separate bound lease path, while Android continues to reject this unavailable contract.",
     ),
     (
         "src-tauri/src/runtime/proxy/pending_changes.rs",
         "target_os = \"ios\"",
-        5,
+        3,
         IosSide::DiffersRight,
         "G4 borrows the original iOS Stop target and scoped directory receipt through exclusive lease and durable journal acknowledgement. Other platforms retain an explicit unavailable result. This registration does not authorize global cleanup or assert a device Stop.",
     ),
@@ -3548,10 +3548,10 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
-        "not(target_os = \"ios\")",
+        "not(any(target_os = \"ios\", windows))",
         1,
         IosSide::DiffersRight,
-        "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+        "Directory snapshots retain the logical path only outside iOS and Windows; those platforms resolve their own physical identity before the snapshot. This does not attest writer termination.",
     ),
     (
         "src-tauri/src/runtime/tailscale_login_core.rs",
@@ -3559,6 +3559,20 @@ const CFG_REGISTRY: &[CfgSite] = &[
         3,
         IosSide::DiffersRight,
         "G4 carries the original iOS managed directory scope and conservatively revokes the legacy domain before fallback startup. Other platforms preserve their existing path; source registration does not attest native writer termination.",
+    ),
+    (
+        "src-tauri/src/runtime/mesh.rs",
+        "any(target_os = \"ios\", windows)",
+        1,
+        IosSide::DiffersRight,
+        "Whole-directory logout requires a bound intent and custody on both iOS and Windows; Android retains its separate path. The iOS side and its existing verdict are unchanged.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/pending_changes.rs",
+        "any(target_os = \"ios\", windows)",
+        2,
+        IosSide::DiffersRight,
+        "iOS and Windows retain exclusive directory leases until durable journal acknowledgement and reject legacy unbound intents. Each has a distinct platform commit path; Android keeps its explicit unavailable result. Source registration is not a native Stop or SYSTEM interoperability receipt.",
     ),
 ];
 
@@ -3688,6 +3702,11 @@ fn eval_cfg(pred: &str, env: CfgEnv) -> Option<bool> {
             "windows" => Some(false),
             _ => None,
         },
+        "windows" => match env.target_os {
+            "windows" => Some(true),
+            "ios" | "android" | "linux" | "macos" => Some(false),
+            _ => None,
+        },
         "desktop" => Some(env.desktop),
         "mobile" => Some(env.mobile),
         _ => p
@@ -3751,6 +3770,33 @@ fn cfg_evaluator_answers_both_ways() {
         ),
         None
     );
+    assert_eq!(eval_cfg("windows", IOS_ENV), Some(false));
+    assert_eq!(eval_cfg("windows", ANDROID_ENV), Some(false));
+    for (target_os, expected) in [
+        ("windows", Some(true)),
+        ("linux", Some(false)),
+        ("macos", Some(false)),
+        ("unregistered", None),
+    ] {
+        assert_eq!(
+            eval_cfg(
+                "windows",
+                CfgEnv {
+                    target_os,
+                    ..IOS_ENV
+                }
+            ),
+            expected
+        );
+    }
+    assert_eq!(
+        cfg_side_profile("any(target_os = \"ios\", windows)"),
+        Some((false, false))
+    );
+    assert_eq!(
+        cfg_side_profile("not(any(target_os = \"ios\", windows))"),
+        Some((false, false))
+    );
     assert_eq!(eval_cfg("mobile", IOS_ENV), Some(true));
     assert_eq!(eval_cfg("desktop", IOS_ENV), Some(false));
     assert_eq!(eval_cfg("debug_assertions", IOS_ENV), Some(false));
@@ -3773,7 +3819,7 @@ fn cfg_evaluator_answers_both_ways() {
     for unknown in [
         "feature = \"x\"",
         "target_arch = \"arm\"",
-        "windows",
+        "windows_unknown",
         "any(target_os = \"ios\", feature = \"x\")",
         "not(unknown_build_mode)",
     ] {
@@ -3851,7 +3897,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.is_empty(),
         "以下 cfg 谓词里出现了本门词表之外的原子：\n    {}\n\n\
          本门**不猜**：`eval_cfg` 的词表是封闭的（`target_os = \"…\"` / `desktop` / `mobile` / \
-         `test` / `debug_assertions` / `unix` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
+         `test` / `debug_assertions` / `unix` / `windows` / `not` / `any` / `all`）。要么给词表加上这个原子并在 \
          `cfg_evaluator_answers_both_ways` 里正反各钉一条，要么这条谓词根本不该落在移动轴上。",
         unknown_atoms.join("\n    ")
     );

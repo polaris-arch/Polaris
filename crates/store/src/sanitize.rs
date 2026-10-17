@@ -966,7 +966,3 @@ pub(crate) fn validate_collection_shapes(value: &Value) -> Result<(), crate::Sto
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "sanitize/tests/audit_regressions.rs"]
-mod audit_regressions;

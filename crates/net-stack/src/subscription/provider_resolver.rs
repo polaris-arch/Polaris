@@ -922,5 +922,4 @@ fn provider_name_of(name_v: &serde_yaml::Value) -> String {
 }
 
 #[cfg(test)]
-#[path = "provider_resolver/tests/audit_regressions.rs"]
-mod audit_regressions;
+mod tests;

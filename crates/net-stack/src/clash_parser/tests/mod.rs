@@ -1083,3 +1083,5 @@ fn provider_utf8_limits_never_split_names_or_warning_patterns() {
         "one provider's warning must not abort the next provider"
     );
 }
+
+mod audit_regressions;

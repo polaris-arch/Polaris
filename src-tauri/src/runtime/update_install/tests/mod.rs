@@ -1126,3 +1126,6 @@ fn appimage_update_stages_exact_bytes_before_mutating_the_existing_image() {
 
 #[cfg(unix)]
 mod lease_recovery;
+
+#[cfg(unix)]
+mod admission_preflight_regressions;

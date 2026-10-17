@@ -310,7 +310,3 @@ pub struct RoutePolicyDefaults {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "dns_policy/tests/audit_regressions.rs"]
-mod audit_regressions;

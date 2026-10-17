@@ -384,17 +384,14 @@ impl MeshRuntime {
     pub fn tailscale_state_dir(&self, server_id: &str) -> std::io::Result<PathBuf> {
         #[cfg(target_os = "ios")]
         {
-            return crate::runtime::tailscale_directory::DirectoryLease::actual_directory(
+            crate::runtime::tailscale_directory::DirectoryLease::actual_directory(
                 &self.config_dir,
                 server_id,
-            );
+            )
         }
         #[cfg(windows)]
         {
-            return crate::runtime::windows_directory::actual_directory(
-                &self.config_dir,
-                server_id,
-            );
+            crate::runtime::windows_directory::actual_directory(&self.config_dir, server_id)
         }
         #[cfg(not(any(target_os = "ios", windows)))]
         tailscale_state_dir(&self.config_dir, server_id).map_err(|error| {

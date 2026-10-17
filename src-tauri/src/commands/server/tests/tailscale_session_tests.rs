@@ -36,7 +36,12 @@ fn cached_presentation_is_separate_from_physical_directory_cleanup() {
 async fn cached_session_disappears_after_guarded_logout_and_empty_reopen() {
     let root = TestDir::new("polaris-ts-cached-logout-");
     let mesh = crate::runtime::mesh::MeshRuntime::new(root.to_path_buf());
+    // Query/auth projection uses an explicit legacy store. Creating an unmarked
+    // physical namespace must never manufacture native retirement authority.
+    let legacy = root.join("tailscale").join("node");
+    std::fs::create_dir_all(&legacy).unwrap();
     let state = mesh.tailscale_state_dir("node").unwrap();
+    assert_eq!(state, legacy);
     std::fs::create_dir_all(state.join("taildrop")).unwrap();
     let bytes = polaris_source_probe::repo_bytes_in(
         env!("CARGO_MANIFEST_DIR"),

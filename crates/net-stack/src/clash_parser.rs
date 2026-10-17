@@ -1818,7 +1818,3 @@ pub fn apply_override(servers: &mut [ServerConfig], override_val: &Value) {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "clash_parser/tests/audit_regressions.rs"]
-mod audit_regressions;

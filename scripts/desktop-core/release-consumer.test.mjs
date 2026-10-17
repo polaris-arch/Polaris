@@ -13,7 +13,7 @@ import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
-  verifyReleaseProvenance, verifyMacPackagedCore } from './release-consumer.mjs';
+  verifyReleaseProvenance, verifyReleaseCore, verifyMacPackagedCore } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
@@ -468,7 +468,7 @@ test('actual fetch CLIs reject malformed release mode and check-only Cronet has 
 test('release notice identities are section-local and independent from mobile; old formal approval is not transferable', async () => withFixture(async (f) => {
   const mobile = { android: { sourceCommit: 'a'.repeat(40), manifestSha256: 'b'.repeat(64) },
     apple: { sourceCommit: 'd'.repeat(40), manifestSha256: 'e'.repeat(64) } };
-  const desktop = [`  - 桌面 sing-box v1.15.0-alpha.12 (GPLv3) — https://github.com/polaris-arch/polaris-box`,
+  const desktop = [`  - 桌面 sing-box v${version} (GPLv3) — https://github.com/polaris-arch/polaris-box`,
     '上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12', `桌面发布构建：${version}`,
     `固定源码：https://github.com/polaris-arch/polaris-box/tree/${commit}`, `源码 tree：${tree}`,
     `固定消费标签：https://github.com/polaris-arch/polaris-box/tree/${tag}`, `消费标签对象：${tagObject}`,
@@ -488,6 +488,10 @@ test('release notice identities are section-local and independent from mobile; o
     'Desktop selection uses src-tauri/core-manifest.json desktopRelease.',
     'asset index sourceDelivery identifies the automatic product source archive,'];
   const notice = [...desktop, ...blocks, ...guidance].join('\n'); validateReleaseNotice(notice, f.manifest, f.contract, mobile);
+  // The desktop label names the exact release; the upstream baseline remains
+  // a separate identity and must not substitute for the .polaris release.
+  assert.throws(() => validateReleaseNotice(notice.replace(desktop[0], desktop[0].replace(version, '1.15.0-alpha.12')),
+    f.manifest, f.contract, mobile), /release baseline differs/);
   for (const line of guidance) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
   for (const stale of ['desktopSourceBuild', 'scripts/desktop-core/source-manifest.json', 'Desktop v1.15.0-alpha.11',
     'Final native kernels, signatures, source archives remain pending']) {
@@ -1109,7 +1113,23 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run), /Linked release ancestor/);
         const linkedCore = join(mount, `${key}-linked-core`, 'sing-box');
         mkdirSync(dirname(linkedCore)); symlinkSync(binary, linkedCore);
-        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, f.run), /Non-regular release path/);
+        assert(fs.lstatSync(linkedCore).isSymbolicLink(), 'the adversary must remain a real filesystem link');
+        // The final-carrier gate checks lstat permissions before its core
+        // verifier, so POSIX link permissions can reject this path first.
+        // Independently exercise that verifier to retain the no-follow proof.
+        const row = f.contract.platforms[key];
+        const noInspection = () => assert.fail('A linked core must fail before Go or signature inspection');
+        verifyReleaseCore(binary, row, key, f.run, 'darwin', f.run, f.contract);
+        assert.throws(() => verifyReleaseCore(linkedCore, row, key, noInspection, 'darwin', noInspection, f.contract),
+          /Non-regular release path/);
+        const linkMode = fs.lstatSync(linkedCore).mode, sourceMode = fs.lstatSync(binary).mode;
+        const modeDiffers = ((linkMode | sourceMode) & 0o7000) !== 0 || (linkMode & 0o7777) !== (sourceMode & 0o7777);
+        const noCoreInspection = (command, args, options) => {
+          assert.equal(command, 'git', 'Final-carrier rejection must precede core inspection');
+          return f.run(command, args, options);
+        };
+        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection),
+          { message: modeDiffers ? 'Final release core permissions differ' : `Non-regular release path: ${linkedCore}` });
         const aliasBinary = join(alias, mount.slice(physical.length + 1), `${key}.app/Contents/Resources`, key, 'sing-box');
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, aliasBinary, f.run), /Linked release ancestor/);
         assert.deepEqual(readFileSync(binary), original);

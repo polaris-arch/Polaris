@@ -343,10 +343,11 @@ class ProducerCalls(unittest.TestCase):
         helper = 'scripts/mobile-core/source_policy.py'
         self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
         self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
+        link_helper = 'scripts/mobile-core/apple_tls_fingerprint.py'
         for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
             source = (producer.ROOT / project).read_text()
             for action in ('prepare', 'verify'):
-                self.assertRegex(source, re.escape(helper) + r'\\?"\s+' + action)
+                self.assertRegex(source, re.escape(link_helper) + r'\\?"\s+' + action)
 
         self.assertEqual(observed['originalProducerCandidate'], 'a'*40)
         self.assertEqual(observed['originalReceipt'], pin)

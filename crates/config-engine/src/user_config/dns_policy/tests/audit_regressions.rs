@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn user_resolver_ids_do_not_alias_after_tag_encoding() {
     let ids = ["a b", "a/b", "a-b", "a~20b", "é", "~c3~a9", "safe_ID-1"];

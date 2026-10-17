@@ -698,3 +698,52 @@ fn endpoints_constants_compile() {
     let _ = SpotifyEndpoints::SIGNUP_URL;
     let _: HttpMethod = HttpMethod::Get;
 }
+
+#[tokio::test]
+async fn netflix_mixed_generic_errors_are_not_watchable_evidence() {
+    for (status, body) in [(404, "ordinary error"), (429, "Oh no!"), (503, "Oh no!")] {
+        for reverse in [false, true] {
+            let (first, second) = if reverse {
+                (
+                    UnlockResponse::ok(status, body),
+                    UnlockResponse::ok(200, "watchable"),
+                )
+            } else {
+                (
+                    UnlockResponse::ok(200, "watchable"),
+                    UnlockResponse::ok(status, body),
+                )
+            };
+            let http = ScriptedHttp::new()
+                .on("netflix.com/title/81280792", first)
+                .on("netflix.com/title/70143836", second);
+            assert_eq!(check_netflix(&http).await.status, UnlockStatus::Timeout);
+        }
+    }
+}
+
+#[tokio::test]
+async fn netflix_explicit_unavailable_and_watchable_are_order_independent() {
+    let http = ScriptedHttp::new()
+        .on(
+            "netflix.com/title/81280792",
+            UnlockResponse::ok(404, "Oh no!"),
+        )
+        .on(
+            "netflix.com/title/70143836",
+            UnlockResponse::ok(200, "watchable"),
+        );
+    assert_eq!(check_netflix(&http).await.status, UnlockStatus::Ok);
+    for status in [429, 503] {
+        let http = ScriptedHttp::new()
+            .on(
+                "netflix.com/title/81280792",
+                UnlockResponse::ok(status, "Oh no!"),
+            )
+            .on(
+                "netflix.com/title/70143836",
+                UnlockResponse::ok(status, "Oh no!"),
+            );
+        assert_eq!(check_netflix(&http).await.status, UnlockStatus::Timeout);
+    }
+}

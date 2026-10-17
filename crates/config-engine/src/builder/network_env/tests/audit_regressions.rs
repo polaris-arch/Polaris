@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn default_dns_alone_requires_available_dhcp_resolver() {
     let config: UserConfig = serde_json::from_value(serde_json::json!({"configSchemaVersion":4,"servers":[],"proxyMode":"smart","proxyModeType":"systemProxy","dnsDefaults":{"unmatchedAction":{"type":"server","serverId":"builtin-netenv-dhcp"}}})).unwrap();

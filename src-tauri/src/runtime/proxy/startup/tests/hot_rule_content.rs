@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 use polaris_singbox_grpc::daemon::{RuleSetLoadStatus, RuleSetStatusResponse};
 
 #[test]

@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn partial_rule_restore_rejects_shared_profile_collision() {
     let current = serde_json::json!({"servers":[],"subscriptions":[],"networkProfiles":[{"id":"p","name":"current"}]});

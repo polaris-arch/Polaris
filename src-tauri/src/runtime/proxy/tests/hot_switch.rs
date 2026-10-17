@@ -3799,6 +3799,37 @@ async fn apply_pending_skipped_when_core_not_running() {
     assert_eq!(rt.apply_pending().await, "skipped");
 }
 
+#[cfg(windows)]
+fn assert_unbound_windows_tailscale_delete_is_pending(
+    rt: &ProxyRuntime,
+    server_id: &str,
+    state: &std::path::Path,
+) {
+    assert!(
+        !state
+            .parent()
+            .unwrap()
+            .join(".polaris-directory-domain")
+            .exists(),
+        "this fixture must remain outside the Windows directory retirement domain"
+    );
+    assert_eq!(std::fs::read(state.join("sentinel")).unwrap(), b"keep");
+    let journal: Value = serde_json::from_slice(
+        &std::fs::read(rt.config.dir().join("pending-config-deletions.json")).unwrap(),
+    )
+    .unwrap();
+    let entries: Vec<crate::runtime::config::DeferredConfigDeletion> =
+        serde_json::from_value(journal["entries"].clone()).unwrap();
+    assert!(
+        matches!(
+            entries.as_slice(),
+            [crate::runtime::config::DeferredConfigDeletion::TailscaleState { server_id: pending }]
+                if pending == server_id
+        ),
+        "an unbound Windows deletion must remain pending without inventing an intent"
+    );
+}
+
 #[tokio::test]
 async fn apply_pending_while_stopped_consumes_deferred_delete_side_effects() {
     let (rt, dir) = test_runtime();
@@ -3824,6 +3855,7 @@ async fn apply_pending_while_stopped_consumes_deferred_delete_side_effects() {
     std::fs::write(&resource, b"SRS").unwrap();
     let ts_state = rt.mesh.tailscale_state_dir("ts-delete").unwrap();
     std::fs::create_dir_all(&ts_state).unwrap();
+    std::fs::write(ts_state.join("sentinel"), b"keep").unwrap();
     let icon_dir = crate::icon_cache::icons_dir(&dir);
     crate::icon_cache::write_icon(&icon_dir, "app-delete", "png", b"PNG").unwrap();
 
@@ -3838,7 +3870,16 @@ async fn apply_pending_while_stopped_consumes_deferred_delete_side_effects() {
 
     assert_eq!(rt.apply_pending().await, "skipped");
     assert!(!resource.exists(), "Apply 才删除规则资源文件");
+    #[cfg(not(windows))]
     assert!(!ts_state.exists(), "Apply 才清 Tailscale state");
+    #[cfg(windows)]
+    {
+        // A manually created directory has no Windows retirement-domain proof.
+        // Ordinary cleanup may proceed, but retries must retain this TS state.
+        assert_unbound_windows_tailscale_delete_is_pending(&rt, "ts-delete", &ts_state);
+        assert_eq!(rt.apply_pending().await, "skipped");
+        assert_unbound_windows_tailscale_delete_is_pending(&rt, "ts-delete", &ts_state);
+    }
     assert!(
         !icon_dir.join("app-delete.png").exists(),
         "Apply 才驱逐应用图标"
@@ -5532,10 +5573,19 @@ async fn deferred_tailscale_state_waits_for_main_and_transient_writers_then_retr
         .login_registry_for_test()
         .deregister_inflight_for_test("ts-deferred");
     assert_eq!(rt.apply_pending().await, "skipped");
+    #[cfg(not(windows))]
     assert!(
         !state.exists(),
         "same production journal retry deletes state once no writer remains"
     );
+    #[cfg(windows)]
+    {
+        // Releasing writer ownership does not grant directory retirement rights:
+        // this raw mkdir fixture still has no identity-bound Windows intent.
+        assert_unbound_windows_tailscale_delete_is_pending(&rt, "ts-deferred", &state);
+        assert_eq!(rt.apply_pending().await, "skipped");
+        assert_unbound_windows_tailscale_delete_is_pending(&rt, "ts-deferred", &state);
+    }
     assert!(dir.exists());
 }
 
@@ -5927,23 +5977,6 @@ fn block_mode_attestation_checks_rule_selectors_without_global_member() {
     ));
 }
 
-struct RestoreConfigDirectory {
-    path: std::path::PathBuf,
-    backup: std::path::PathBuf,
-}
-impl RestoreConfigDirectory {
-    fn restore(&self) {
-        if self.backup.exists() {
-            let _ = std::fs::remove_file(&self.path);
-            std::fs::rename(&self.backup, &self.path).expect("restore config directory");
-        }
-    }
-}
-impl Drop for RestoreConfigDirectory {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
 #[tokio::test]
 async fn auto_failover_disk_rollback_failure_retains_persisted_target_for_reconciliation() {
     let (rt, _dir) = test_runtime();
@@ -5958,19 +5991,16 @@ async fn auto_failover_disk_rollback_failure_retains_persisted_target_for_reconc
     let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config)
         .remove("node-b")
         .unwrap();
-    let path = rt.config.dir().to_path_buf();
-    let backup = path.with_extension(format!(
-        "rollback-backup-{}",
-        polaris_store::fs::random_tmp_suffix()
-    ));
-    let restore = RestoreConfigDirectory {
-        path: path.clone(),
-        backup: backup.clone(),
-    };
+    let config_manager = Arc::clone(&rt.config);
     let api =
         AttestingManagementApi::rejecting("Node A", "Node B").with_on_first_select(move || {
-            std::fs::rename(&path, &backup).unwrap();
-            std::fs::write(&path, "injected directory blocker").unwrap();
+            let persisted: Value =
+                serde_json::from_slice(&std::fs::read(config_manager.path()).unwrap()).unwrap();
+            assert_eq!(persisted["selectedServerId"], "node-b");
+            // Arm only after the target reached disk. Keep that file readable:
+            // removing the directory makes rollback read defaults and skip its
+            // CAS as superseded, never exercising a rollback write failure.
+            config_manager.fail_next_config_persist_for_test();
         });
     let outcome = rt
         .auto_hot_switch_transaction_with_api(
@@ -5982,17 +6012,39 @@ async fn auto_failover_disk_rollback_failure_retains_persisted_target_for_reconc
             &api,
         )
         .await;
-    assert!(matches!(
-        outcome,
-        AutoHotSwitchOutcome::ReconcilePending { .. }
-    ));
+    assert!(
+        matches!(outcome, AutoHotSwitchOutcome::ReconcilePending { .. }),
+        "rollback persistence failure must remain recoverable: {outcome:?}"
+    );
+    assert_eq!(
+        *api.puts.lock().unwrap(),
+        vec![
+            ("proxy-selector".to_string(), "Node B".to_string()),
+            ("proxy-selector".to_string(), "Node A".to_string()),
+        ]
+    );
     assert_eq!(*api.selected.lock().unwrap(), "Node A");
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
     assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
-    assert_eq!(rt.status().error_code.as_deref(), Some(code::EXIT_MISMATCH));
-    assert_eq!(rt.status().pid, 424242);
-    restore.restore();
+    assert!(rt.selector_reconcile.is_required());
+    let status = rt.status();
+    assert_eq!(status.error_code.as_deref(), Some(code::EXIT_MISMATCH));
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected config persistence failure")),
+        "must reach the rollback write leg, not fail a disk read: {:?}",
+        status.error
+    );
+    assert_eq!(status.pid, 424242);
     let persisted: Value =
-        serde_json::from_slice(&std::fs::read(rt.config.dir().join("config.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(rt.config.path()).unwrap()).unwrap();
     assert_eq!(persisted["selectedServerId"], "node-b");
+    rt.config
+        .save_full(&persisted)
+        .expect("the injected persistence failure must be consumed exactly once");
 }

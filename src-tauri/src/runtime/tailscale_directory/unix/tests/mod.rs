@@ -8,7 +8,9 @@ impl Fixture {
         let path = std::env::temp_dir().join(format!("polaris-dir-lease-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(path.join("tailscale")).unwrap();
         std::fs::create_dir_all(path.join("tailscale-g4-v1")).unwrap();
-        Self(path)
+        // Only canonicalize the root this fixture just created: macOS temp_dir
+        // may use /var, while production walks every component with NOFOLLOW.
+        Self(path.canonicalize().unwrap())
     }
     fn create(&self) {
         let lease = acquire_physical(&self.0, "node", true).unwrap();
@@ -309,4 +311,43 @@ fn replaced_target_is_legacy_connectable_but_not_bound_to_stale_marker() {
     std::fs::create_dir(fixture.0.join("tailscale-g4-v1/node")).unwrap();
     let lease = acquire_physical(&fixture.0, "node", false).unwrap();
     assert!(lease.snapshot_intent().is_err());
+}
+
+#[test]
+fn stat_identity_compares_both_marker_fields() {
+    let fixture = Fixture::new();
+    let fd = open_absolute(&fixture.0).unwrap();
+    let mut stat = fs::fstat(&fd).unwrap();
+    stat.st_dev = 7;
+    stat.st_ino = 11;
+    assert_eq!(device_id(&stat), 7);
+    assert_eq!(inode_id(&stat), 11);
+    assert!(same(&stat, 7, 11));
+    assert!(!same(&stat, 8, 11));
+    assert!(!same(&stat, 7, 12));
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[test]
+fn apple_signed_device_keeps_existing_u64_encoding() {
+    let fixture = Fixture::new();
+    let fd = open_absolute(&fixture.0).unwrap();
+    let mut stat = fs::fstat(&fd).unwrap();
+    stat.st_dev = -1;
+    stat.st_ino = u64::MAX;
+    assert!(same(&stat, u64::MAX, u64::MAX));
+    assert!(!same(&stat, u64::from(u32::MAX), u64::MAX));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_identity_preserves_all_64_bits() {
+    let fixture = Fixture::new();
+    let fd = open_absolute(&fixture.0).unwrap();
+    let mut stat = fs::fstat(&fd).unwrap();
+    stat.st_dev = u64::MAX;
+    stat.st_ino = u64::MAX;
+    assert!(same(&stat, u64::MAX, u64::MAX));
+    assert!(!same(&stat, u64::from(u32::MAX), u64::MAX));
+    assert!(!same(&stat, u64::MAX, u64::from(u32::MAX)));
 }

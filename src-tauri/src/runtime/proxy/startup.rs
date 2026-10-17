@@ -5216,5 +5216,4 @@ fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "tests/hot_rule_content.rs"]
-mod hot_rule_content_tests;
+mod tests;

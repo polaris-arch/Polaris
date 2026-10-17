@@ -36,8 +36,19 @@ fn verify_stamp(target: &OwnedFd, incarnation: &str) -> io::Result<()> {
     }
     Ok(())
 }
+// Marker fields and lock names use the existing u64 representation. libc's
+// device/inode aliases vary by target (Apple dev_t is signed i32); preserve the
+// original casts, including signed widening, at this one conversion boundary.
+#[allow(clippy::unnecessary_cast)]
+fn device_id(stat: &fs::Stat) -> u64 {
+    stat.st_dev as u64
+}
+#[allow(clippy::unnecessary_cast)]
+fn inode_id(stat: &fs::Stat) -> u64 {
+    stat.st_ino as u64
+}
 fn same(stat: &fs::Stat, dev: u64, ino: u64) -> bool {
-    stat.st_dev as u64 == dev && stat.st_ino as u64 == ino
+    device_id(stat) == dev && inode_id(stat) == ino
 }
 fn absent(parent: &OwnedFd, name: &str) -> io::Result<bool> {
     match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -95,8 +106,8 @@ fn open_locked(control: &OwnedFd, name: &str, exclusive: bool) -> io::Result<Own
     )?;
     if !same(
         &fs::statat(control, name, AtFlags::SYMLINK_NOFOLLOW)?,
-        stat.st_dev as u64,
-        stat.st_ino as u64,
+        device_id(&stat),
+        inode_id(&stat),
     ) {
         return Err(unknown());
     }
@@ -164,7 +175,8 @@ impl DirectoryLease {
         let root_stat = fs::fstat(&root)?;
         let control_name = format!(
             ".polaris-directory-control-{}-{}",
-            root_stat.st_dev as u64, root_stat.st_ino as u64
+            device_id(&root_stat),
+            inode_id(&root_stat)
         );
         match fs::mkdirat(&parent, &control_name, Mode::RWXU) {
             Ok(()) => fs::fsync(&parent)?,
@@ -278,20 +290,21 @@ impl DirectoryLease {
         let control_stat = fs::fstat(&control)?;
         let control_name = format!(
             ".polaris-directory-control-{}-{}",
-            root_stat.st_dev as u64, root_stat.st_ino as u64
+            device_id(&root_stat),
+            inode_id(&root_stat)
         );
         if !same(
             &fs::statat(&parent, "tailscale-g4-v1", AtFlags::SYMLINK_NOFOLLOW)?,
-            root_stat.st_dev as u64,
-            root_stat.st_ino as u64,
+            device_id(&root_stat),
+            inode_id(&root_stat),
         ) || !same(
             &fs::statat(&parent, &control_name, AtFlags::SYMLINK_NOFOLLOW)?,
-            control_stat.st_dev as u64,
-            control_stat.st_ino as u64,
+            device_id(&control_stat),
+            inode_id(&control_stat),
         ) || !same(
             &fs::statat(&control, ".domain-unsafe", AtFlags::SYMLINK_NOFOLLOW)?,
-            stat.st_dev as u64,
-            stat.st_ino as u64,
+            device_id(&stat),
+            inode_id(&stat),
         ) {
             return Err(unknown());
         }
@@ -375,7 +388,7 @@ impl DirectoryLease {
                     Err(e) => return Err(e.into()),
                 };
                 if FileType::from_raw_mode(original.st_mode) != FileType::Directory
-                    || !same(&original, target.st_dev as u64, target.st_ino as u64)
+                    || !same(&original, device_id(target), inode_id(target))
                 {
                     continue;
                 }
@@ -412,10 +425,9 @@ impl DirectoryLease {
             Err(e) => return Err(e),
         };
         let lifetime_name = match (&marker, &target_stat) {
-            (None, Some(target)) => format!(
-                "legacy-{}-{}.lock",
-                target.st_dev as u64, target.st_ino as u64
-            ),
+            (None, Some(target)) => {
+                format!("legacy-{}-{}.lock", device_id(target), inode_id(target))
+            }
             _ => format!("{stem}.lock"),
         };
         let lock = open_locked(&control, &lifetime_name, exclusive)?;
@@ -510,10 +522,10 @@ impl DirectoryLease {
             server_id: self.server_id.clone(),
             incarnation: uuid::Uuid::new_v4().simple().to_string(),
             directory_epoch: uuid::Uuid::new_v4().simple().to_string(),
-            root_device: root.st_dev as u64,
-            root_inode: root.st_ino as u64,
-            directory_device: target.st_dev as u64,
-            directory_inode: target.st_ino as u64,
+            root_device: device_id(&root),
+            root_inode: inode_id(&root),
+            directory_device: device_id(&target),
+            directory_inode: inode_id(&target),
             phase: "Open".into(),
             delete_intent_nonce: String::new(),
         };
@@ -781,7 +793,7 @@ fn empty_directory(fd: &OwnedFd, device: u64, keep_stamp: bool) -> io::Result<()
             continue;
         }
         let stat = fs::statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if stat.st_dev as u64 != device {
+        if device_id(&stat) != device {
             return Err(unknown());
         }
         if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
@@ -791,7 +803,7 @@ fn empty_directory(fd: &OwnedFd, device: u64, keep_stamp: bool) -> io::Result<()
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
-            if !same(&fs::fstat(&child)?, stat.st_dev as u64, stat.st_ino as u64) {
+            if !same(&fs::fstat(&child)?, device_id(&stat), inode_id(&stat)) {
                 return Err(unknown());
             }
             empty_directory(&child, device, false)?;

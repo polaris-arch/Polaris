@@ -676,7 +676,3 @@ fn replace_bounded_ci(haystack: &str, needle: &str, replacement: &str) -> String
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "redact/tests/audit_regressions.rs"]
-mod audit_regressions;

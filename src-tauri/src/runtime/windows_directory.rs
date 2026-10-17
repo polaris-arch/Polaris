@@ -91,6 +91,10 @@ fn open_object(path: &Path, directory: bool, delete: bool, write: bool) -> io::R
             FILE_READ_ATTRIBUTES
                 | READ_CONTROL_ACCESS
                 | SYNCHRONIZE
+                // Attribute-only handles do not participate in delete sharing.
+                // FILE_LIST_DIRECTORY (the directory form of FILE_READ_DATA)
+                // makes the retained no-FILE_SHARE_DELETE handle pin its name.
+                | if directory { FILE_LIST_DIRECTORY } else { 0 }
                 | if delete { DELETE_ACCESS } else { 0 },
         );
     }
@@ -156,7 +160,18 @@ fn final_path(file: &File) -> io::Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 fn pin_chain(path: &Path) -> io::Result<Vec<File>> {
-    let (drive, parts) = path_parts(path)?;
+    // The nearest existing ancestor of a cold plan can be the drive itself.
+    // Keep this internal case separate from the stricter public config syntax.
+    let (drive, parts) = match path.to_str() {
+        Some(raw)
+            if raw.len() == 3
+                && raw.as_bytes()[0].is_ascii_alphabetic()
+                && raw.as_bytes()[1..] == *b":\\" =>
+        {
+            (raw.to_owned(), Vec::new())
+        }
+        _ => path_parts(path)?,
+    };
     let wide: Vec<u16> = drive.encode_utf16().chain(Some(0)).collect();
     if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_FIXED {
         return Err(unknown());
@@ -650,6 +665,22 @@ fn remove_children(path: &Path, depth: usize) -> io::Result<()> {
     }
     Ok(())
 }
+// Planning may precede creation of the app config directory. Validate every
+// lexical component and pin the nearest existing ancestor without creating any
+// directory, domain, marker or custody. Acquisition repeats the full-chain check.
+fn pin_existing_chain(path: &Path) -> io::Result<Vec<File>> {
+    path_parts(path)?;
+    let mut existing = path;
+    loop {
+        match pin_chain(existing) {
+            Ok(held) => return Ok(held),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(unknown)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 pub(crate) fn actual_directory(config: &Path, server_id: &str) -> io::Result<PathBuf> {
     if !valid_component(server_id) {
         return Err(unknown());
@@ -661,7 +692,11 @@ pub(crate) fn actual_directory(config: &Path, server_id: &str) -> io::Result<Pat
     if !absent(&logical)? {
         return Ok(logical);
     }
-    let _ancestors = pin_chain(config)?;
+    path_parts(config)?;
+    // Selection is not acquisition: do not reopen a live target with a mode that
+    // conflicts with its retained delete-capable lease. That lease validates the
+    // complete state-root/target chain before authorizing any mutation.
+    let _ancestors = pin_existing_chain(config)?;
     Ok(config.join(ROOT).join(server_id))
 }
 pub(crate) fn auth_lease(config: &Path, id: &str) -> io::Result<Option<DirectoryLease>> {

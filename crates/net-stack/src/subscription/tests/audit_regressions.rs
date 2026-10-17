@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn dedupe_keeps_transport_and_outer_tls_differences() {
     let node = crate::share_link::parse_share_url(

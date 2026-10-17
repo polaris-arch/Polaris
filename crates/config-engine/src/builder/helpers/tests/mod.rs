@@ -322,3 +322,5 @@ fn custom_domestic_dns_ip() {
     assert!(get_custom_domestic_dns_endpoint(Some("https://doh.pub/dns-query")).is_none());
     assert!(get_custom_domestic_dns_endpoint(None).is_none());
 }
+
+mod audit_regressions;

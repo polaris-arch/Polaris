@@ -3348,9 +3348,6 @@ impl LoginCoreRegistry {
                 .and_then(serde_json::Value::as_str)
                 .ok_or("Tailscale endpoint lacks a state_directory")?;
             let path = Path::new(dir);
-            if path.parent() != Some(state_root.as_path()) {
-                return Err("Tailscale endpoint state_directory is outside its state root".into());
-            }
             let id = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -3365,7 +3362,13 @@ impl LoginCoreRegistry {
             let actual = crate::runtime::windows_directory::actual_directory(root, &id)
                 .map_err(|error| error.to_string())?;
             #[cfg(not(any(target_os = "ios", windows)))]
-            let actual = path.to_path_buf();
+            let actual = state_root.join(&id);
+            // The kernel still accepts the logical input, then selects the same
+            // mapped candidate as MeshRuntime. Do not allow an arbitrary sibling
+            // under either namespace, or physical state shadowed by legacy state.
+            if path != state_root.join(&id).as_path() && path != actual.as_path() {
+                return Err("Tailscale endpoint state_directory is outside its state root".into());
+            }
             if directories.insert(id.clone(), actual).is_some() {
                 return Err("Tailscale endpoint state_directory is duplicated".into());
             }

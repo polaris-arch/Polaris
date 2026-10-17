@@ -1,7 +1,7 @@
-use super::*;
 #[test]
 #[cfg(unix)]
 fn warp_queue_uses_private_durable_publication() {
+    use super::MeshRuntime;
     use std::os::unix::fs::PermissionsExt;
     let temp = crate::test_support::TestDir::new("polaris-warp-private-");
     let mesh = MeshRuntime::new(temp.path().to_path_buf());

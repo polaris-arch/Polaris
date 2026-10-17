@@ -178,7 +178,9 @@ class AppleReadReuse(unittest.TestCase):
         device = single_fat_archive(archive('ios-arm64'))
         sim = single_fat_archive(archive('ios-arm64-simulator'))
         entries, binaries, headers = [], [], []
-        symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+        symbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                   'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement',
+                   'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                    'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                    'wakeNow', 'recordScreenState']
         getters = ['Cleanup', 'CleanupError', 'ConfigDigest', 'ContractVersion', 'RequestID',

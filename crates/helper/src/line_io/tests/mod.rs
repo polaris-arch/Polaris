@@ -130,3 +130,6 @@ fn terminated_reader_enforces_wire_limit_and_preserves_next_line() {
         Err(BoundedLineError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
     ));
 }
+
+#[cfg(unix)]
+mod deadline_regressions;

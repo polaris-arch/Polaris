@@ -455,7 +455,3 @@ pub fn custom_rule_selector_tag(id: &str) -> String {
     };
     format!("rule-sel-{escaped}")
 }
-
-#[cfg(test)]
-#[path = "helpers/tests/audit_regressions.rs"]
-mod audit_regressions;

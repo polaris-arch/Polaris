@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 
 #[test]
 fn same_named_root_and_child_have_distinct_src_relative_keys() {

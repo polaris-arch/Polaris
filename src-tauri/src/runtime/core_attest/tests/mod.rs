@@ -75,3 +75,6 @@ fn helper_start_requires_installed_id_before_ipc_and_has_no_content_write_rpc() 
     assert!(!helper.contains("Request::InstallCore"));
     assert!(!proxy.contains("reconcile_protected_core"));
 }
+
+#[cfg(target_os = "linux")]
+mod loaded_image_regressions;

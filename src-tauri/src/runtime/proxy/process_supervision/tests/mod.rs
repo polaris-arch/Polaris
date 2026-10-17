@@ -1,15 +1,28 @@
 use super::{verify_writer_census, WriterNodeScope, WriterRunScope};
 
+fn scope(family: &str) -> (String, String, String) {
+    // Pure census fixtures still obey the host's absolute-path syntax.
+    let root = if cfg!(windows) { r"C:\state" } else { "/state" };
+    let directory = std::path::Path::new(root).join(family).join("node");
+    let file = directory.join("tailscaled.state");
+    (
+        "ts".into(),
+        directory.to_string_lossy().into_owned(),
+        file.to_string_lossy().into_owned(),
+    )
+}
+
 fn run(nonce: char, terminal: bool) -> WriterRunScope {
+    let (tag, directory, file) = scope("tailscale");
     WriterRunScope {
         nonce: nonce.to_string().repeat(64),
         digest: "d".repeat(64),
         terminal,
         complete: true,
         nodes: vec![WriterNodeScope {
-            tag: "ts".into(),
-            directory: "/state/tailscale/node".into(),
-            file: "/state/tailscale/node/tailscaled.state".into(),
+            tag,
+            directory,
+            file,
             terminal,
         }],
     }
@@ -19,11 +32,7 @@ fn run(nonce: char, terminal: bool) -> WriterRunScope {
 fn refreshed_original_accepts_reload_stop_while_start_only_census_rejects_it() {
     let original = vec![run('a', true), run('b', false)];
     let terminal = vec![run('a', true), run('b', true)];
-    let expected = vec![(
-        "ts".into(),
-        "/state/tailscale/node".into(),
-        "/state/tailscale/node/tailscaled.state".into(),
-    )];
+    let expected = vec![scope("tailscale")];
     assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &expected).is_ok());
     assert!(verify_writer_census(&original[..1], &terminal, &"d".repeat(64), &expected).is_err());
     assert!(verify_writer_census(&original, &terminal[1..], &"d".repeat(64), &expected).is_err());
@@ -35,24 +44,17 @@ fn refreshed_original_accepts_reload_stop_while_start_only_census_rejects_it() {
 #[test]
 fn same_digest_physical_to_logical_history_keeps_each_nonce_scope() {
     let mut historical = run('a', true);
-    historical.nodes[0].directory = "/state/tailscale-g4-v1/node".into();
-    historical.nodes[0].file = "/state/tailscale-g4-v1/node/tailscaled.state".into();
+    let (_, directory, file) = scope("tailscale-g4-v1");
+    historical.nodes[0].directory = directory;
+    historical.nodes[0].file = file;
     let original = vec![historical.clone(), run('b', false)];
     let terminal = vec![historical, run('b', true)];
-    let expected = vec![(
-        "ts".into(),
-        "/state/tailscale/node".into(),
-        "/state/tailscale/node/tailscaled.state".into(),
-    )];
+    let expected = vec![scope("tailscale")];
     assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &expected).is_ok());
     let mut rewritten = terminal.clone();
     rewritten[0].nodes = rewritten[1].nodes.clone();
     assert!(verify_writer_census(&original, &rewritten, &"d".repeat(64), &expected).is_err());
-    let old_scope = vec![(
-        "ts".into(),
-        "/state/tailscale-g4-v1/node".into(),
-        "/state/tailscale-g4-v1/node/tailscaled.state".into(),
-    )];
+    let old_scope = vec![scope("tailscale-g4-v1")];
     assert!(verify_writer_census(&original, &terminal, &"d".repeat(64), &old_scope).is_err());
     let mut missing = terminal.clone();
     missing.remove(0);
@@ -66,9 +68,10 @@ fn ios_managed_start_keeps_logical_bytes_off_shared_disk_and_fallback_revokes_fi
         "runtime/proxy/startup.rs",
     );
     assert!(startup.contains("start_managed_prepared(&start)"));
-    assert!(startup.contains(
-        "#[cfg(not(target_os = \"ios\"))]\n            std::fs::write(config_path, &json)"
-    ));
+    let startup_compact: String = startup.split_whitespace().collect();
+    assert!(startup_compact
+        .contains("#[cfg(not(target_os=\"ios\"))]write_private_runtime_config(config_path,&json)"));
+    assert!(!startup_compact.contains("std::fs::write(config_path,&json)"));
     let login = polaris_source_probe::crate_source_in(
         env!("CARGO_MANIFEST_DIR"),
         "runtime/tailscale_login_core.rs",
@@ -121,7 +124,10 @@ fn failed_cleanup_refinement_still_dispatches_and_retains_claims() {
             && dispatch < retain
             && retain < release
     );
-    assert!(production[prepare..downgrade].contains(").is_err()"));
+    let refinement: String = production[prepare..downgrade].split_whitespace().collect();
+    assert!(refinement.contains(".is_err()"));
+    assert!(refinement.contains("target.cleanup_proof_eligible()"));
+    assert!(refinement.contains("bind_tailscale_main_actual_scope("));
     assert!(!production[prepare..dispatch].contains("owner.ready ="));
 }
 

@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn optional_windows_handshake_survives_typed_reserialization() {
     let plain =

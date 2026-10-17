@@ -26,3 +26,5 @@ fn hosts_first_roundtrips_without_losing_fallback() {
         action
     );
 }
+
+mod audit_regressions;

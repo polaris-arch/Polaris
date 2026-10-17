@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 struct Node(&'static str, &'static str);
 impl ServerLike for Node {
     fn id(&self) -> &str {

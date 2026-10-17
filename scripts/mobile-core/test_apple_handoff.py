@@ -467,7 +467,9 @@ class AppleHandoffControls(unittest.TestCase):
                 (lib / 'Headers').mkdir(mode=0o755)
                 (lib / 'Libbox').write_bytes(raw)
                 (lib / 'Resources/Info.plist').write_bytes(plistlib.dumps({}))
-                symbols = ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+                symbols = ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                           'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement',
+                           'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                            'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                            'wakeNow', 'recordScreenState']
                 (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' +

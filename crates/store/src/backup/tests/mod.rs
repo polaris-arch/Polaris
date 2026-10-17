@@ -1243,14 +1243,25 @@ fn network_profiles_export_all_when_any_rule_category_selected() {
     );
 }
 
-/// 导入按 id 合并：同 id 以备份为准，current 里其余场景保留，新 id 追加。
+/// 双规则平面完整导入按 id 合并；单平面必须拒绝改变另一个平面的共享依赖。
 /// 牙：合并改成整表替换 → np-local 丢失 ⇒ 转红。
 #[test]
 fn network_profiles_import_merges_by_id() {
     let mut current = cfg();
     current["networkProfiles"] = json!([profile("np-traffic", "old"), profile("np-local", "keep")]);
     let backup = pick_categories(&with_scoped_rules(), &[C::CustomRules, C::DnsRules]);
-    let merged = merge_categories(&current, &backup, &[C::CustomRules]).config;
+    let partial = merge_categories(&current, &backup, &[C::CustomRules]);
+    assert_eq!(
+        partial.config, current,
+        "a partial restore must preserve the unselected plane"
+    );
+    assert!(partial
+        .conflicts
+        .iter()
+        .any(|c| c == "networkProfiles:np-traffic"));
+    let complete = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert!(complete.conflicts.is_empty());
+    let merged = complete.config;
     let got: Vec<(String, String)> = merged["networkProfiles"]
         .as_array()
         .unwrap()
@@ -1582,3 +1593,5 @@ fn unrelated_category_restore_does_not_process_shared_dependency_conflicts() {
     assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
     assert_eq!(outcome.config["proxyMode"], "global");
 }
+
+mod audit_regressions;

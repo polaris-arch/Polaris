@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn malformed_collection_is_not_erased_by_unrelated_migration() {
     for key in ["servers", "subscriptions"] {

@@ -669,6 +669,10 @@ pub struct ConfigManager {
     /// 草稿存在位、节点遮罩与范围判据必须是同一份原子快照。拆成多个 atomic/lock 会允许自动
     /// 故障切换读到 `pending=true` 搭配旧遮罩，从而穿透刚建立的未保存节点边界。
     staged_mask: RwLock<StagedNodeMask>,
+    /// Test-only pre-publication failure, scoped to this manager. Reads stay
+    /// available so update/CAS tests can reach the write leg without changing D.
+    #[cfg(test)]
+    test_fail_before_config_persist_once: AtomicBool,
     /// Test-only post-publication failure: the file is already replaced, but
     /// the caller receives CommitUncertain and must withhold action rights.
     #[cfg(test)]
@@ -676,6 +680,14 @@ pub struct ConfigManager {
 }
 
 impl ConfigManager {
+    /// Fail only this manager's next config persistence attempt, after the
+    /// ordinary read, CAS and validation legs have completed successfully.
+    #[cfg(test)]
+    pub(crate) fn fail_next_config_persist_for_test(&self) {
+        self.test_fail_before_config_persist_once
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_write_lock_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write_lock.lock().unwrap()
@@ -714,6 +726,8 @@ impl ConfigManager {
                     .map_or_else(BTreeSet::new, |marker| marker.node_ids.clone()),
                 scope_known: staged_marker.is_some(),
             }),
+            #[cfg(test)]
+            test_fail_before_config_persist_once: AtomicBool::new(false),
             #[cfg(test)]
             test_uncertain_after_mesh_publish_once: AtomicBool::new(false),
         }
@@ -2125,6 +2139,13 @@ impl ConfigManager {
     /// An uncertain directory sync invalidates the old cache even though this
     /// method returns Err and callers must not continue Apply side effects.
     fn persist_canonical_under_write_lock(&self, canonical: &Value) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self
+            .test_fail_before_config_persist_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StoreError::Io("injected config persistence failure".into()));
+        }
         if !mesh_guard::has_managed_fields(canonical) {
             return ConfigStore::save(&StdFs, &self.path, canonical, &random_tmp_suffix());
         }

@@ -1465,7 +1465,3 @@ fn base64_decode_inner(s: &str) -> Result<String, ()> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "subscription/tests/audit_regressions.rs"]
-mod audit_regressions;

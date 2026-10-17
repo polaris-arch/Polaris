@@ -4849,7 +4849,7 @@ async fn diagnostic_archive_scrubs_actual_planner_outputs() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spawn() {
+async fn atomic_runtime_config_replaces_unwritable_old_inode_and_retires_secrets() {
     use std::os::unix::fs::PermissionsExt;
     let mut h = harness(true, false, vec![20001, 20002, 20003]);
     h.deps.log_level = "debug".into();
@@ -4866,10 +4866,14 @@ async fn failed_runtime_config_write_reclaims_raw_and_legacy_archive_before_spaw
         &mut |_: &str, _: Value| {},
     )
     .await;
-    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
-    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
     assert!(!raw.exists());
-    assert!(!kept.exists());
+    let archived = std::fs::read_to_string(&kept).unwrap();
+    assert!(!archived.contains("Q6_SYNTHETIC_RAW_SECRET"));
+    assert!(!archived.contains("Q6_SYNTHETIC_OLD_SECRET"));
+    let diagnostic: Value = serde_json::from_str(&archived).unwrap();
+    assert_eq!(diagnostic["_diagnostic"]["sanitized"], true);
     cleanup(&h.dir);
 }
 
@@ -5030,3 +5034,41 @@ fn temp_shadow_disabled_utls_uses_the_same_standard_tls_fallback_as_main() {
         assert_eq!(serde_json::to_value(node).unwrap(), before);
     }
 }
+
+#[tokio::test]
+async fn failed_runtime_config_publication_preserves_unowned_destination_before_spawn() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
+    std::fs::create_dir(&raw).unwrap();
+    std::fs::write(raw.join("sentinel"), b"unowned destination").unwrap();
+    std::fs::write(&kept, b"previous archive").unwrap();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read(raw.join("sentinel")).unwrap(),
+        b"unowned destination"
+    );
+    assert_eq!(std::fs::read(&kept).unwrap(), b"previous archive");
+    assert!(!std::fs::read_dir(&h.dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    cleanup(&h.dir);
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+mod private_temp_config_regressions;
+mod temp_config_writer_regressions;

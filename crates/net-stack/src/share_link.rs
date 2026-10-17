@@ -1897,7 +1897,3 @@ fn encode_vmess(c: &ServerConfig) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "share_link/tests/audit_regressions.rs"]
-mod audit_regressions;

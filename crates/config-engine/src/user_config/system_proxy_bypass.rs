@@ -203,7 +203,3 @@ pub fn format_bypass_for_linux(list: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "system_proxy_bypass/tests/audit_regressions.rs"]
-mod audit_regressions;

@@ -595,3 +595,5 @@ async fn execute_skip_and_snapshot_failure_paths_never_start_close_futures() {
         assert_eq!(state.active, 0);
     }
 }
+
+mod audit_regressions;

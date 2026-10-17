@@ -378,7 +378,3 @@ pub fn fix_route_dead_references(
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests;
-
-#[cfg(test)]
-#[path = "orchestration/tests/audit_regressions.rs"]
-mod audit_regressions;

@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn malformed_lan_cidr_is_not_silently_persisted() {
     for cidr in ["999.1.1.1/24", "10.0.0.1/99", "2001:db8::/129"] {

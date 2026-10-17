@@ -437,7 +437,3 @@ fn validate_port(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "validate/tests/audit_regressions.rs"]
-mod audit_regressions;

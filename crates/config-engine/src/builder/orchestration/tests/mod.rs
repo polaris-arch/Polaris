@@ -254,3 +254,5 @@ fn norm_server_projection_preserves_id_order_filter_and_duplicate_order() {
         serde_json::from_str(&config_generation_norm(&config, None)).unwrap();
     assert_eq!(actual["servers"], serde_json::json!([]));
 }
+
+mod audit_regressions;

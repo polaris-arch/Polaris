@@ -121,5 +121,4 @@ pub struct HttpClient {
 }
 
 #[cfg(test)]
-#[path = "config/tests/audit_regressions.rs"]
-mod audit_regressions;
+mod tests;

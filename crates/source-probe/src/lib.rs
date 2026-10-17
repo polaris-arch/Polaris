@@ -921,7 +921,3 @@ macro_rules! module_files_with_tests {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests/audit_regressions.rs"]
-mod audit_regressions;

@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 #[test]
 fn emitted_lan_cidrs_use_strict_shared_parser() {
     let input: Vec<String> = [

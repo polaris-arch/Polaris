@@ -85,15 +85,147 @@ fn native_path_policy_rejects_devices_ads_unc_and_traversal() {
     }
     assert!(path_parts(Path::new(r"C:\users\owner\root")).is_ok());
 }
+fn delete_open(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
 #[test]
 fn retained_directory_blocks_rename() {
     let temp = crate::test_support::TestDir::new("polaris-win-pin-");
     let path = temp.join("original");
+    let moved = temp.join("moved");
     std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("sentinel"), b"original bytes").unwrap();
+    drop(delete_open(&path).unwrap());
     let held = open_object(&path, true, false, false).unwrap();
-    assert!(std::fs::rename(&path, temp.join("moved")).is_err());
+    let reader = open_object(&path, true, false, false).unwrap();
+    assert_eq!(
+        delete_open(&path).unwrap_err().raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+    );
+    assert!(std::fs::rename(&path, &moved).is_err());
+    assert!(!moved.exists());
+    assert_eq!(
+        std::fs::read(path.join("sentinel")).unwrap(),
+        b"original bytes"
+    );
     drop(held);
-    std::fs::rename(&path, temp.join("moved")).unwrap();
+    assert!(
+        delete_open(&path).is_err(),
+        "every retained reader pins the name"
+    );
+    drop(reader);
+    drop(delete_open(&path).unwrap());
+    std::fs::rename(&path, &moved).unwrap();
+    assert_eq!(
+        std::fs::read(moved.join("sentinel")).unwrap(),
+        b"original bytes"
+    );
+}
+
+#[test]
+fn directory_share_delete_exclusion_is_symmetric_and_not_attribute_only() {
+    let temp = crate::test_support::TestDir::new("polaris-win-pin-access-");
+    let path = temp.join("original");
+    std::fs::create_dir(&path).unwrap();
+    // MS-FSA 2.1.5.1.2.1 excludes metadata-only opens from delete sharing.
+    // This control would pass with the old broken access mask; the real pin must not.
+    let attributes = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL_ACCESS | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&path)
+        .unwrap();
+    drop(delete_open(&path).unwrap());
+    drop(attributes);
+    let deleter = delete_open(&path).unwrap();
+    assert_eq!(
+        open_object(&path, true, false, false)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+    );
+    drop(deleter);
+    drop(open_object(&path, true, false, false).unwrap());
+}
+
+#[test]
+fn cold_directory_planning_does_not_create_or_authorize_a_managed_domain() {
+    let temp = crate::test_support::TestDir::new("polaris-win-cold-plan-");
+    let config = temp.join("not-created").join("app-config");
+    let expected = config.join(ROOT).join("node");
+    assert_eq!(actual_directory(&config, "node").unwrap(), expected);
+    assert!(!config.exists());
+    assert!(!expected.exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    assert!(DirectoryLease::acquire(&config, "node", false).is_err());
+    assert!(!config.exists());
+
+    // Planning a physical path and mkdir alone never mint the domain, journal,
+    // incarnation, private DACL or lifetime authority required for mutation.
+    std::fs::create_dir_all(&expected).unwrap();
+    let sentinel = expected.join("sentinel");
+    std::fs::write(&sentinel, b"unmarked bytes").unwrap();
+    // A plan must also remain readable while the target already has retained
+    // delete access; it must not attempt a conflicting second target open.
+    let exclusive_target = open_object(&expected, true, true, false).unwrap();
+    assert_eq!(actual_directory(&config, "node").unwrap(), expected);
+    drop(exclusive_target);
+    assert!(DirectoryLease::acquire(&config, "node", false).is_err());
+    assert!(DirectoryLease::acquire(&config, "node", true).is_err());
+    assert!(auth_lease(&config, "node").is_err());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unmarked bytes");
+    assert!(!config.join("tailscale").exists());
+}
+
+#[tokio::test]
+async fn unmarked_physical_auth_retirement_preserves_state_and_taildrop() {
+    let temp = crate::test_support::TestDir::new("polaris-win-unmarked-auth-");
+    let config = temp.join("config");
+    let mesh = crate::runtime::mesh::MeshRuntime::new(config.clone());
+    let directory = mesh.tailscale_state_dir("node").unwrap();
+    assert_eq!(directory, config.join(ROOT).join("node"));
+    assert!(!config.exists());
+    std::fs::create_dir_all(directory.join("taildrop")).unwrap();
+    let sealed = polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.json",
+    );
+    std::fs::write(directory.join("tailscaled.state"), &sealed).unwrap();
+    std::fs::write(directory.join("taildrop").join("sentinel"), b"user bytes").unwrap();
+    assert!(mesh
+        .logout_tailscale_safely("node", &|| false, None)
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(directory.join("tailscaled.state")).unwrap(),
+        sealed
+    );
+    assert_eq!(
+        std::fs::read(directory.join("taildrop").join("sentinel")).unwrap(),
+        b"user bytes"
+    );
+    assert!(!config.join("tailscale").exists());
+}
+
+#[test]
+fn cold_planning_rejects_invalid_components_and_existing_non_directory_ancestors() {
+    let temp = crate::test_support::TestDir::new("polaris-win-cold-invalid-");
+    let config = temp.join("missing");
+    for id in ["..", "node:stream", "CON", "node\\child", "node/child"] {
+        assert!(actual_directory(&config, id).is_err(), "{id}");
+    }
+    assert!(!config.exists());
+    let file = temp.join("ordinary-file");
+    std::fs::write(&file, b"untouched").unwrap();
+    assert!(actual_directory(&file.join("missing"), "node").is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"untouched");
+    assert!(path_parts(Path::new(r"C:\\")).is_err());
+    assert!(path_parts(Path::new(r"C:\")).is_err());
 }
 
 #[derive(serde::Deserialize)]

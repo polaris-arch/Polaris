@@ -618,6 +618,7 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",
     "scripts/mobile-core/test_native_inputs.py",
+    "scripts/mobile-core/test_delivery_boundaries.py",
     "scripts/mobile-core/ci_apple.py",
     "scripts/mobile-core/native_inputs.py",
     "scripts/mobile-core/build_apple_app.py",
@@ -650,6 +651,9 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     }
     for path in [
         "scripts/mobile-core/unknown_module.py",
+        "scripts/mobile-core/test_delivery_boundaries_extra.py",
+        "scripts/mobile-core/nested/test_delivery_boundaries.py",
+        "scripts/other/test_delivery_boundaries.py",
         "scripts/mobile-core/test_native_inputs_extra.py",
         "scripts/other/test_native_inputs.py",
         "scripts/mobile-core/nested/test_native_inputs.py",
