@@ -59,7 +59,7 @@ import {
   profileRowStatus,
   ruleProfileBadge,
 } from '@/domain/network-profile';
-import { netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
+import { dnsRealQueryFallbackChoice, netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { asMeshRouteReport, meshRouteSummaryKey, MobileMeshRouteEvidence } from '../../MobileMeshRouteEvidence';
@@ -1499,6 +1499,16 @@ export function MobileRulesScreen(): ReactElement {
     return tr('rules.dnsResolverInherit');
   }, [config?.dnsDefaults, dnsServerNameById, dnsGroupNameById, tr]);
 
+  const dnsRealQueryFallbackText = useMemo(() => {
+    const defaultAction = config?.dnsDefaults?.unmatchedAction;
+    const fakeIp = defaultAction ? defaultAction.type === 'fakeIp' : config?.dnsConfig?.enableFakeIp !== false;
+    if (!fakeIp) return undefined;
+    const choice = dnsRealQueryFallbackChoice(config?.dnsDefaults ?? {});
+    if (choice === 'reject') return tr('rules.dnsActionReject');
+    const serverId = choice.startsWith('server:') ? choice.slice(7) : choice;
+    return tr('rules.dnsActionServer', { name: dnsServerNameById.get(serverId) ?? serverId });
+  }, [config?.dnsDefaults, config?.dnsConfig, dnsServerNameById, tr]);
+
   /* ═══════════ 规则行绑定 ═══════════ */
 
   /* 规则行徽标的场景表取**展示面**（暂存中新建的场景也要认得，同桌面 `RulesScreen`）；
@@ -1790,6 +1800,7 @@ export function MobileRulesScreen(): ReactElement {
           rows={dnsRows}
           defaultActionText={dnsDefaultActionText}
           defaultFallbackText={dnsDefaultFallbackText}
+          realQueryFallbackText={dnsRealQueryFallbackText}
           systemPaneAbsentReason={tr('mobileRules.dnsSystemPaneAbsent')}
           errorOf={errorOf}
         />

@@ -56,6 +56,8 @@ pub fn migrate_all(value: &mut Value) -> MigrationDelta {
     delta.changed |= migrate_builtin_dns_resources(value);
     // v4：流量规则只决定出口；连接域名解析由 DNS 默认策略单点拥有。
     delta.changed |= migrate_dns_connection_ownership(value);
+    // Additive v4 policy: freeze the historical real-query behavior for existing installs.
+    delta.changed |= migrate_real_query_fallback_action(value);
     migrate_subscription_proxy_policy(value, &mut delta);
     migrate_tun_stack(value, &mut delta);
     migrate_tun_mtu(value, &mut delta);
@@ -223,6 +225,10 @@ pub fn migrate_dns_policy_v2(value: &mut Value) -> bool {
     );
     root.entry("dnsServerGroups")
         .or_insert_with(|| Value::Array(Vec::new()));
+    let explicit_real_query_fallback = root
+        .get("dnsDefaults")
+        .and_then(|defaults| defaults.get("realQueryFallbackAction"))
+        .cloned();
     root.insert(
         "dnsDefaults".into(),
         serde_json::json!({
@@ -235,11 +241,39 @@ pub fn migrate_dns_policy_v2(value: &mut Value) -> bool {
             }
         }),
     );
+    if let Some(action) = explicit_real_query_fallback {
+        if let Some(defaults) = root.get_mut("dnsDefaults").and_then(Value::as_object_mut) {
+            defaults.insert("realQueryFallbackAction".into(), action);
+        }
+    }
     root.insert(
         "routeDefaults".into(),
         serde_json::json!({
             "destinationResolution": if resolve_before_dial { "dnsRules" } else { "preserveDomain" }
         }),
+    );
+    true
+}
+
+/// Missing-field guard keeps this additive policy migration idempotent without a
+/// schema bump. Existing configurations retain their domestic real-query fallback,
+/// while explicit choices (including choices from a newer version) remain untouched.
+pub fn migrate_real_query_fallback_action(value: &mut Value) -> bool {
+    let Some(root) = value.as_object_mut() else {
+        return false;
+    };
+    let defaults = root
+        .entry("dnsDefaults")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(defaults) = defaults.as_object_mut() else {
+        return false;
+    };
+    if defaults.contains_key("realQueryFallbackAction") {
+        return false;
+    }
+    defaults.insert(
+        "realQueryFallbackAction".into(),
+        serde_json::json!({"type":"server","serverId":"builtin-domestic"}),
     );
     true
 }

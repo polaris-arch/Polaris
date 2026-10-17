@@ -637,6 +637,8 @@ export interface UserConfig {
     directServerId: string;
     proxyServerId: string;
     unmatchedAction?: DnsPolicyAction;
+    /** Default FakeIP non-A/AAAA queries only; server or reject. Missing = legacy domestic DNS. */
+    realQueryFallbackAction?: DnsPolicyAction;
     connectionResolution?: 'preserveDomain' | 'dnsRules';
   };
   /** @deprecated schema v4 起迁入 dnsDefaults.connectionResolution，仅兼容旧配置读取。 */

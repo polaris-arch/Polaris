@@ -773,6 +773,12 @@ pub fn merge_categories(
             if let Some(v) = backup.get("dnsDefaults").filter(|value| value.is_object()) {
                 set(&mut result, "dnsDefaults", v.clone());
             }
+            // Old DNS backups carry the historical domestic fallback. Materialize
+            // it now: selective restore is saved directly, without the load chain.
+            if crate::migrate::migrate_real_query_fallback_action(&mut result) {
+                // Match load-time protected-resource migration for sparse old backups.
+                crate::migrate::migrate_builtin_dns_resources(&mut result);
+            }
         } else {
             skipped.push(BackupCategory::DnsResources);
         }

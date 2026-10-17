@@ -18,6 +18,144 @@ fn load_missing_file_returns_default_and_marks_was_missing() {
         serde_json::json!("systemProxy")
     );
     assert_eq!(res.config["mixedPort"], serde_json::json!(7890));
+    assert_eq!(
+        res.config["dnsDefaults"]["realQueryFallbackAction"],
+        serde_json::json!({"type":"server","serverId":"builtin-remote"})
+    );
+}
+
+#[test]
+fn real_query_fallback_survives_save_load_and_new_install_migrations() {
+    for action in [
+        serde_json::json!({"type":"server","serverId":"builtin-remote"}),
+        serde_json::json!({"type":"server","serverId":"builtin-domestic"}),
+        serde_json::json!({"type":"server","serverId":"builtin-netenv-dhcp"}),
+        serde_json::json!({"type":"reject","method":"default"}),
+        serde_json::json!({"type":"reject","method":"drop"}),
+    ] {
+        let mut config = default_config();
+        config["dnsDefaults"]["realQueryFallbackAction"] = action.clone();
+        let fs = MockFs::default();
+        ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345").unwrap();
+        let loaded = ConfigStore::load(&fs, Path::new(CFG));
+        assert!(loaded.error.is_none(), "{:?}", loaded.error);
+        assert!(loaded.loaded_from_disk);
+        assert_eq!(
+            loaded.config["dnsDefaults"]["realQueryFallbackAction"],
+            action
+        );
+    }
+}
+
+#[test]
+fn legacy_real_query_fallback_loads_domestic_and_persists_idempotently() {
+    let mut config = default_config();
+    config["dnsDefaults"]
+        .as_object_mut()
+        .unwrap()
+        .remove("realQueryFallbackAction");
+    let fs = MockFs::default().with(Path::new(CFG), serde_json::to_string(&config).unwrap());
+    let first = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(first.loaded_from_disk);
+    assert!(first.migration_delta.changed);
+    assert_eq!(
+        first.config["dnsDefaults"]["realQueryFallbackAction"],
+        serde_json::json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    ConfigStore::save(&fs, Path::new(CFG), &first.config, "abcdef012345").unwrap();
+    let second = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(second.loaded_from_disk);
+    assert!(!second.migration_delta.changed);
+    assert_eq!(second.config, first.config);
+}
+
+#[test]
+fn invalid_real_query_fallback_actions_are_rejected_before_any_write() {
+    for action in [
+        serde_json::json!({"type":"fakeIp"}),
+        serde_json::json!({"type":"group","groupId":"race"}),
+        serde_json::json!({"type":"hostsFirst","hostsServerId":"hosts",
+            "fallback":{"type":"server","serverId":"builtin-remote"}}),
+        serde_json::json!({"type":"predefined","rcode":"NOERROR"}),
+        serde_json::json!({"type":"followRouteDefault"}),
+        serde_json::json!({"type":"future-action"}),
+        serde_json::json!({"type":"reject","method":"unknown"}),
+        serde_json::json!({"type":"server","serverId":7}),
+        serde_json::json!("builtin-remote"),
+    ] {
+        let mut config = default_config();
+        config["dnsDefaults"]["realQueryFallbackAction"] = action.clone();
+        let fs = MockFs::default();
+        let error = ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345")
+            .expect_err("invalid explicit fallback must not be silently discarded");
+        assert!(error.to_string().contains("realQueryFallbackAction"));
+        assert!(fs.operations().is_empty(), "{action}");
+    }
+}
+
+#[test]
+fn invalid_real_query_fallback_references_are_rejected_before_any_write() {
+    for (id, enabled) in [
+        ("missing", true),
+        ("", true),
+        ("   ", true),
+        ("builtin-remote", false),
+    ] {
+        let mut config = default_config();
+        config["dnsDefaults"]["realQueryFallbackAction"] =
+            serde_json::json!({"type":"server","serverId":id});
+        config["dnsServers"][1]["enabled"] = serde_json::json!(enabled);
+        let fs = MockFs::default();
+        let error = ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345")
+            .expect_err("missing or disabled fallback resource must fail");
+        assert!(error.to_string().contains("realQueryFallbackAction"));
+        assert!(fs.operations().is_empty());
+    }
+}
+
+#[test]
+fn hosts_only_and_malformed_real_query_fallback_resources_are_rejected() {
+    for resource in [
+        serde_json::json!({"id":"fallback","enabled":true,"type":"hosts"}),
+        serde_json::json!({"id":"fallback","enabled":true,"type":"udp",
+            "endpoint":{"host":"1.1.1.1","port":"bad"}}),
+    ] {
+        let mut config = default_config();
+        config["dnsDefaults"]["realQueryFallbackAction"] =
+            serde_json::json!({"type":"server","serverId":"fallback"});
+        config["dnsServers"].as_array_mut().unwrap().push(resource);
+        let fs = MockFs::default();
+        let error = ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345")
+            .expect_err("hosts-only or sanitized-away resolver must fail");
+        assert!(error.to_string().contains("realQueryFallbackAction"));
+        assert!(fs.operations().is_empty());
+    }
+}
+
+#[test]
+fn invalid_real_query_fallback_is_not_sanitized_into_a_legacy_migration() {
+    let mut config = default_config();
+    config["dnsDefaults"]["realQueryFallbackAction"] = serde_json::json!({"type":"future-action"});
+    let raw = serde_json::to_string(&config).unwrap();
+    let fs = MockFs::default().with(Path::new(CFG), &raw);
+    let loaded = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(!loaded.loaded_from_disk);
+    assert!(!loaded.migration_delta.changed);
+    assert!(loaded
+        .error
+        .unwrap()
+        .to_string()
+        .contains("realQueryFallbackAction"));
+    assert_eq!(fs.snapshot(Path::new(CFG)).as_deref(), Some(raw.as_str()));
+}
+
+#[test]
+fn malformed_dns_defaults_cannot_drop_an_explicit_real_query_fallback() {
+    let mut config = default_config();
+    config["dnsDefaults"]["connectionResolution"] = serde_json::json!("unknown");
+    assert!(ConfigStore::canonicalize_for_save(&config).is_err());
+    let raw = serde_json::to_string(&config).unwrap();
+    assert!(sanitize_config(&raw).is_err());
 }
 
 #[test]

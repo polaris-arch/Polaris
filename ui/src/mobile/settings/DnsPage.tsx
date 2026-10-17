@@ -44,9 +44,12 @@ import type { DnsConfig, DnsPolicyAction, UserConfig } from '@/contracts/types';
 import type { CselGroup } from '@/components/dialogs/csel-logic';
 import {
   buildDnsActionGroups,
+  buildDnsRealQueryFallbackGroups,
   dnsActionFromChoice,
   dnsDefaultActionChoice,
   dnsDefaultFallbackChoice,
+  dnsRealQueryFallbackChoice,
+  dnsRealQueryFallbackFromChoice,
   type DnsDefaults,
 } from '@/components/dialogs/dns-action-options';
 import {
@@ -729,10 +732,11 @@ function DnsDefaultsRows({
 }): ReactElement {
   const { t } = useTranslation();
   /* 同屏只许开一个面板：两个一起开是误触面（同 `forms/RuleFormPanel.tsx` 那条）。 */
-  const [sheet, setSheet] = useState<'action' | 'fallback' | null>(null);
+  const [sheet, setSheet] = useState<'action' | 'fallback' | 'realQueryFallback' | null>(null);
 
   const actionValue = dnsDefaultActionChoice(defaults);
   const fallbackValue = dnsDefaultFallbackChoice(defaults);
+  const realQueryFallbackValue = dnsRealQueryFallbackChoice(defaults);
   const resources = {
     servers: config.dnsServers ?? [],
     groups: config.dnsServerGroups ?? [],
@@ -749,6 +753,9 @@ function DnsDefaultsRows({
      是一条走不通的链。 */
   const fallbackGroups = collapsibleGroups(
     buildDnsActionGroups({ ...resources, currentValue: fallbackValue, includeHosts: false }),
+  );
+  const realQueryFallbackGroups = collapsibleGroups(
+    buildDnsRealQueryFallbackGroups({ ...resources, currentValue: realQueryFallbackValue }),
   );
   const hostsFirst = defaults.unmatchedAction?.type === 'hostsFirst';
 
@@ -768,6 +775,12 @@ function DnsDefaultsRows({
         dnsDefaults: { ...defaults, unmatchedAction },
       }),
     );
+  }
+
+  function commitRealQueryFallback(rowId: string, value: string): void {
+    const realQueryFallbackAction = dnsRealQueryFallbackFromChoice(value);
+    if (!realQueryFallbackAction) return;
+    commit(rowId, update({ dnsDefaults: { ...defaults, realQueryFallbackAction } }));
   }
 
   return (
@@ -790,6 +803,24 @@ function DnsDefaultsRows({
           />
         }
       />
+      {actionValue === 'fakeIp' && (
+        <SettingsRow
+          stacked
+          id="dns-real-query-fallback"
+          label={t('settings.dns.realQueryFallback')}
+          desc={t('settings.dns.realQueryFallbackHint')}
+          control={
+            <SelectSheetTrigger
+              label={t('settings.dns.realQueryFallback')}
+              options={[]}
+              value={realQueryFallbackValue}
+              valueLabel={labelOf(realQueryFallbackGroups, realQueryFallbackValue)}
+              open={sheet === 'realQueryFallback'}
+              onOpen={() => setSheet('realQueryFallback')}
+            />
+          }
+        />
+      )}
       {/* Hosts 优先这一档才有兜底可言（同桌面：非 hostsFirst 时整行不画，不画成禁用）。 */}
       {hostsFirst && (
         <SettingsRow
@@ -808,7 +839,20 @@ function DnsDefaultsRows({
           }
         />
       )}
-      {/* 两张面板一律渲染在行之外（`position: fixed` 的层不该嵌在行的盒里）。 */}
+      <SelectSheetPanel
+        label={t('settings.dns.realQueryFallback')}
+        groups={realQueryFallbackGroups}
+        value={realQueryFallbackValue}
+        openGroupIds={openGroupOf(realQueryFallbackGroups, realQueryFallbackValue)}
+        open={sheet === 'realQueryFallback'}
+        onClose={() => setSheet(null)}
+        onSelect={(next) => {
+          setSheet(null);
+          commitRealQueryFallback('dns-real-query-fallback', next);
+        }}
+        closeLabel={t('common.close')}
+      />
+      {/* 所有面板一律渲染在行之外（`position: fixed` 的层不该嵌在行的盒里）。 */}
       <SelectSheetPanel
         label={t('settings.dns.defaultUnmatched')}
         groups={actionGroups}

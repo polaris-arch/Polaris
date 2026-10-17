@@ -578,11 +578,24 @@ pub fn dns_rule_uses_netenv(rule: &Rule, config: &UserConfig) -> bool {
 /// Default policy participates in the same dependency traversal as explicit rules.
 pub fn default_dns_uses_netenv(config: &UserConfig) -> bool {
     config.config_schema_version.unwrap_or(0) >= 2
-        && config
-            .dns_defaults
-            .as_ref()
-            .and_then(|defaults| defaults.unmatched_action.as_ref())
-            .is_some_and(|action| action_refs_server(action, None, config, BUILTIN_NETENV_DHCP_ID))
+        && config.dns_defaults.as_ref().is_some_and(|defaults| {
+            defaults.unmatched_action.as_ref().is_some_and(|action| {
+                action_refs_server(action, None, config, BUILTIN_NETENV_DHCP_ID)
+                    || (matches!(action, DnsPolicyAction::FakeIp)
+                        && defaults
+                            .real_query_fallback_action
+                            .as_ref()
+                            .is_some_and(|fallback| {
+                                fallback.is_valid_real_query_fallback()
+                                    && action_refs_server(
+                                        fallback,
+                                        None,
+                                        config,
+                                        BUILTIN_NETENV_DHCP_ID,
+                                    )
+                            }))
+            })
+        })
 }
 
 /// 本次是否需要生成 `dns-netenv`（spec §4.2「只在需要时生成」）：某条会生成的规则挂了解析为 dhcp 的

@@ -35,6 +35,8 @@ pub fn sanitize_config(content: &str) -> SanitizeResult {
         ));
     }
     validate_collection_shapes(&value)?;
+    // Reject invalid explicit fallback policy before dnsDefaults can be discarded.
+    crate::validate::validate_raw_real_query_fallback_action(&value)?;
     // 就地清洗：坏字段剔除 / 退化，绝不 throw。
     sanitize_value_in_place(&mut value);
     Ok(value)

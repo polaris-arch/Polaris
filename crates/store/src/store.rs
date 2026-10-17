@@ -145,6 +145,8 @@ impl ConfigStore {
         crate::mesh_guard::validate_raw(config)?;
         // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
         crate::validate::validate_raw_mesh_inbound_policies(config)?;
+        // An explicit DNS fallback must never disappear during tolerant sanitization.
+        crate::validate::validate_raw_real_query_fallback_action(config)?;
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
         validate_config(&mut value)?;
@@ -343,6 +345,7 @@ pub fn default_config() -> Value {
             "directServerId":"builtin-domestic",
             "proxyServerId":"builtin-remote",
             "unmatchedAction":{"type":"fakeIp"},
+            "realQueryFallbackAction":{"type":"server","serverId":"builtin-remote"},
             "connectionResolution":"preserveDomain"
         },
         "bypassProcesses": [],

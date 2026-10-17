@@ -171,6 +171,9 @@ export function dnsServerReferences(config: UserConfig, serverId: string): DnsRe
   if (actionReferencesServer(defaults?.unmatchedAction, serverId)) {
     references.push({ scope: 'defaults', name: 'unmatched' });
   }
+  if (actionReferencesServer(defaults?.realQueryFallbackAction, serverId)) {
+    references.push({ scope: 'defaults', name: 'realQueryFallback' });
+  }
   return uniqueReferences(references);
 }
 
@@ -203,6 +206,8 @@ export function dnsResourceReferenceText(
     ? t('settings.dns.defaultDirect')
     : reference.name === 'proxy'
       ? t('settings.dns.defaultProxy')
-      : t('settings.dns.defaultUnmatched');
+      : reference.name === 'realQueryFallback'
+        ? t('settings.dns.realQueryFallback')
+        : t('settings.dns.defaultUnmatched');
   return t('settings.dns.resourceRefDefault', { name });
 }

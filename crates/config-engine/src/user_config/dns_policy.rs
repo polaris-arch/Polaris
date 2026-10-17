@@ -253,6 +253,15 @@ pub enum DnsPolicyAction {
     FollowRouteDefault,
 }
 
+impl DnsPolicyAction {
+    /// Default FakeIP's non-address queries may use one real resolver or reject.
+    /// Resource existence and availability are checked by the write/compiler layers.
+    #[must_use]
+    pub const fn is_valid_real_query_fallback(&self) -> bool {
+        matches!(self, Self::Server { .. } | Self::Reject { .. })
+    }
+}
+
 fn default_rcode() -> String {
     "NOERROR".to_string()
 }
@@ -278,6 +287,13 @@ pub struct DnsPolicyDefaults {
     pub proxy_server_id: String,
     #[serde(rename = "unmatchedAction", skip_serializing_if = "Option::is_none")]
     pub unmatched_action: Option<DnsPolicyAction>,
+    /// Default FakeIP's non-A/AAAA fallback, independent of traffic mode. Missing
+    /// values preserve the legacy domestic resolver; new installs set this explicitly.
+    #[serde(
+        rename = "realQueryFallbackAction",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub real_query_fallback_action: Option<DnsPolicyAction>,
     #[serde(rename = "connectionResolution", default)]
     pub connection_resolution: DnsConnectionResolution,
 }

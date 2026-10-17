@@ -1,0 +1,5 @@
+[
+  { "query_type": ["A", "AAAA"], "server": "fakeip", "rewrite_ttl": 5 },
+  { "query_type": ["A", "AAAA"], "server": "dns-remote" },
+  { "action": "route", "server": "dns-remote" }
+]
