@@ -999,6 +999,13 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     '统计闸门，2 处 android cfg：`probe_main_window_visible` 的 android 臂恒返 `Ok(true)`。android 臂的编译面'
     + '由 `cargo check --target aarch64-linux-android -p polaris` 覆盖，非 android 臂由三平台 `cargo test` 覆盖。'
     + '它的**行为**正确性（「窗口可见性在 Android 上不可观测」）是真机事实，CI 无任何腿能验，APK 腿也不能。',
+  'src-tauri/src/runtime/proxy/tests/startup.rs':
+    'Host-only #[cfg(test)] startup regressions. The new #[cfg(not(any(target_os = "android", '
+    + 'target_os = "ios")))] guard excludes the retained CLI-file proof test from native mobile targets. '
+    + 'The proof/eviction/atomic-replacement assertions run in desktop cargo test --workspace; '
+    + 'Android impact source-coverage contracts register this exact cfg-bearing test file. '
+    + 'APK 构建不运行这些测试 and does not include test code; the Android cargo check of polaris '
+    + 'does not compile its test targets and is not claimed as execution coverage.',
   'src-tauri/src/runtime/proxy/android_bridge/tests/mod.rs':
     '`#[cfg(test)]` 面，不进任何构建产物、不改 APK 一个字节。两条断言都写成「非 Android 上必须诚实失败」，'
     + '在三平台 `cargo test --workspace` 上真跑。APK 腿根本不构建 test target'

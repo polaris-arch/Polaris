@@ -146,17 +146,9 @@ async fn direct_capability_bytes_require_retained_run_and_replaced_files_do_not_
         rt.direct_tls_snapshot(generation).binary_sha256,
         snapshot.binary_sha256
     );
-    *rt.captured_cli_run.lock().unwrap() = Some((
-        generation,
-        RunIdentity::new(),
-        proof.clone(),
-    ));
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, RunIdentity::new(), proof.clone()));
     assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
-    *rt.captured_cli_run.lock().unwrap() = Some((
-        generation,
-        identity.clone(),
-        proof.clone(),
-    ));
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, identity.clone(), proof.clone()));
     let replacement = dir.join("next-core");
     std::fs::write(&replacement, b"unexecutable new-core identity fixture").unwrap();
     std::fs::rename(&replacement, &path).unwrap();

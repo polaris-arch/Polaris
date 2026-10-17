@@ -470,7 +470,9 @@ impl CliProbeCache {
             .retryable
             .then(|| std::time::Instant::now() + TRANSIENT_RETRY_DELAY);
         if !entry.still_current() {
-            return Err(Snapshot::unavailable("Core changed during capability query"));
+            return Err(Snapshot::unavailable(
+                "Core changed during capability query",
+            ));
         }
         if let Ok(mut cache) = self.entries.lock() {
             cache.retain(|old| old.path != path);

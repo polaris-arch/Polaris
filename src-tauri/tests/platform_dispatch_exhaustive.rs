@@ -2316,6 +2316,36 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    // Retained CLI-observation evidence, from the b84e correction batch.
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "The gate obtains mobile capabilities from the loaded native container; both mobile platforms exclude the separate CLI observation. This is source dispatch evidence, not device execution.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        4,
+        IosSide::WithAndroid,
+        "Desktop CLI observation acquisition, snapshot selection, per-iteration retained-proof validation and the proof validator exclude both mobile platforms. Actual file replacement still fails; bounded-cache eviction does not invalidate retained evidence.",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tls_capabilities.rs",
+        "any(target_os = \"linux\", target_os = \"android\", target_os = \"ios\")",
+        2,
+        IosSide::WithAndroid,
+        "The Path import and capabilities-for helper remain used by Linux and both mobile callers; macOS/Windows now consume retained CLI observations directly. Android and iOS both compile their native capability branch, not a desktop process proof.",
+    ),
+    (
+        "src-tauri/src/runtime/speedtest.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        1,
+        IosSide::WithAndroid,
+        "Desktop temporary measurement acquires and retains the exact CLI observation returned by the probe; both mobile platforms exclude this file-evidence acquisition and keep their existing native/unavailable paths.",
+    ),
+
     // Current uTLS capability/byte-identity sites; existing iOS debt verdicts remain unchanged.
     (
         "src-tauri/src/runtime/proxy.rs",
@@ -4114,7 +4144,10 @@ const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersRight", 331),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
-    ("WithAndroid", 118),
+    // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
+    // checked by eval_cfg for Android/iOS in both release/debug. No existing
+    // verdict or debt site changes; this does not claim device validation.
+    ("WithAndroid", 126),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

@@ -617,6 +617,8 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/test_apple_entry.py",
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",
+    // Python unittest discover requires test_*.py; exact source-checkout regression module.
+    "scripts/mobile-core/test_source_checkout.py",
     "scripts/mobile-core/test_native_inputs.py",
     "scripts/mobile-core/test_delivery_boundaries.py",
     "scripts/mobile-core/ci_apple.py",

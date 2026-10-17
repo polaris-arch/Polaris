@@ -4715,7 +4715,10 @@ async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement
         std::fs::write(&other, b"#!/bin/sh\n").unwrap();
         assert!(probe_cli(&other).await.binary_sha256.is_some());
     }
-    assert!(cached_cli(&binary).is_none(), "exercise actual cache eviction");
+    assert!(
+        cached_cli(&binary).is_none(),
+        "exercise actual cache eviction"
+    );
     validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)).unwrap();
     assert!(
         validate_startup_cli_proof(Some(&binary), &proof.snapshot, None).is_err(),
