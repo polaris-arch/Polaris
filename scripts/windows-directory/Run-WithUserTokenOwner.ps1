@@ -84,7 +84,14 @@ try {
     }
     $configurationPath = Join-Path $evidence 'configuration.json'
     $configuration | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $configurationPath -Encoding utf8NoBOM
-    $child = $lease.Start($executable,$worker,$configurationPath,(Get-Location).Path)
+    $workingDirectory = (Get-Location).Path
+    # Fixed launch objects only; diagnostic read failures never replace launch errors.
+    try {
+        $state.launchDiagnostics = $lease.ReadLaunchDiagnostics($executable,$worker,$configurationPath,$workingDirectory)
+        Save-OwnerAttempt $state
+    }
+    catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }
+    $child = $lease.Start($executable,$worker,$configurationPath,$workingDirectory)
     $state.suspendedChildToken = $child.Token
     $state.childProcessId = $child.ProcessId
     $configuration.actualChildToken = $child.Token

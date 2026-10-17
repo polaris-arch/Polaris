@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 
@@ -28,7 +29,10 @@ namespace Polaris.WindowsAcceptance {
         internal const uint TOKEN_DUPLICATE = 0x0002;
         internal const uint TOKEN_ASSIGN_PRIMARY = 0x0001;
         internal const uint TOKEN_ADJUST_DEFAULT = 0x0080;
+        internal const uint READ_CONTROL = 0x00020000;
+        internal const uint OWNER_GROUP_DACL = 0x00000007; // No SACL / privilege request.
         internal const int TokenUser = 1, TokenOwner = 4, TokenType = 8, TokenStatistics = 10, TokenPrivileges = 3;
+        internal const int TokenDefaultDacl = 6, TokenSessionId = 12, TokenIntegrityLevel = 25;
         internal const uint CREATE_SUSPENDED = 0x00000004, CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         internal const uint WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258;
 
@@ -95,6 +99,169 @@ namespace Polaris.WindowsAcceptance {
         [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern bool CreateDirectoryW(string path, IntPtr attributes);
         [DllImport("advapi32.dll", CharSet=CharSet.Unicode)] internal static extern uint GetNamedSecurityInfoW(string name, int objectType, uint securityInfo, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
         [DllImport("kernel32.dll")] internal static extern IntPtr LocalFree(IntPtr memory);
+        [DllImport("kernel32.dll", SetLastError=true)] internal static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess, out IntPtr target, uint access, bool inherit, uint options);
+        [DllImport("advapi32.dll")] internal static extern uint GetSecurityInfo(IntPtr handle, int objectType, uint securityInfo, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+        [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr descriptor, uint revision, uint securityInfo, out IntPtr sddl, out uint length);
+        [DllImport("user32.dll", SetLastError=true)] internal static extern IntPtr GetProcessWindowStation();
+        [DllImport("kernel32.dll")] internal static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll", SetLastError=true)] internal static extern IntPtr GetThreadDesktop(uint threadId);
+        [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern bool GetUserObjectInformationW(IntPtr handle, int index, IntPtr info, uint size, out uint needed);
+        [DllImport("user32.dll", SetLastError=true)] internal static extern bool GetUserObjectSecurity(IntPtr handle, ref uint securityInfo, IntPtr descriptor, uint size, out uint needed);
+        [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern IntPtr OpenSCManagerW(string machine, string database, uint access);
+        [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern IntPtr OpenServiceW(IntPtr manager, string name, uint access);
+        [DllImport("advapi32.dll", SetLastError=true)] internal static extern bool CloseServiceHandle(IntPtr handle);
+        [DllImport("advapi32.dll", SetLastError=true)] internal static extern bool QueryServiceStatusEx(IntPtr service, int level, IntPtr info, uint size, out uint needed);
+        [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] internal static extern bool QueryServiceConfigW(IntPtr service, IntPtr info, uint size, out uint needed);
+
+        // All diagnostics are advisory, independent reads. No ACL/service/token
+        // mutation, SACL access, impersonation, privilege enabling, or access test.
+        // Values are limited to SIDs, SDDL, fixed paths, numeric state/flags/errors.
+        internal static object Observe(Func<object> read) {
+            try { return new Dictionary<string,object> { { "result", "read" }, { "value", read() } }; }
+            catch (Exception error) {
+                var failure = new Dictionary<string,object> { { "result", "unavailable" }, { "hresult", error.HResult } };
+                var native = error as Win32Exception;
+                if (native != null) failure["nativeErrorCode"] = native.NativeErrorCode;
+                return failure;
+            }
+        }
+        internal static string Sddl(IntPtr descriptor) {
+            IntPtr text = IntPtr.Zero; uint length;
+            try {
+                Check(ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, OWNER_GROUP_DACL, out text, out length), "Read diagnostic SDDL");
+                return Marshal.PtrToStringUni(text);
+            } finally { if (text != IntPtr.Zero) LocalFree(text); }
+        }
+        internal static object TokenDefaultAcl(IntPtr token) {
+            IntPtr info = Information(token, TokenDefaultDacl);
+            try {
+                IntPtr acl = Marshal.ReadIntPtr(info);
+                // A NULL default DACL is distinct from an empty ACL or a read failure.
+                if (acl == IntPtr.Zero) return new Dictionary<string,object> { { "isNull", true }, { "sddl", null } };
+                int size = unchecked((ushort)Marshal.ReadInt16(acl, 2));
+                if (size < 8) throw new InvalidOperationException("Invalid default ACL size");
+                byte[] bytes = new byte[size]; Marshal.Copy(acl, bytes, 0, size);
+                var descriptor = new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent, null, null, null, new RawAcl(bytes, 0));
+                return new Dictionary<string,object> { { "isNull", false }, { "sddl", descriptor.GetSddlForm(AccessControlSections.Access) } };
+            } finally { Marshal.FreeHGlobal(info); }
+        }
+        internal static object TokenContext(IntPtr token) {
+            return new Dictionary<string,object> {
+                { "defaultDacl", Observe(() => TokenDefaultAcl(token)) },
+                { "sessionId", Observe(() => {
+                    IntPtr info = Information(token, TokenSessionId);
+                    try { return unchecked((uint)Marshal.ReadInt32(info)); } finally { Marshal.FreeHGlobal(info); }
+                }) },
+                { "integrity", Observe(() => {
+                    IntPtr info = Information(token, TokenIntegrityLevel);
+                    try { return new Dictionary<string,object> {
+                        { "sid", new SecurityIdentifier(Marshal.ReadIntPtr(info)).Value },
+                        { "attributes", unchecked((uint)Marshal.ReadInt32(info, IntPtr.Size)) }
+                    }; } finally { Marshal.FreeHGlobal(info); }
+                }) }
+            };
+        }
+        internal static object TokenObjectSecurity(IntPtr token, bool currentProcessToken) {
+            IntPtr readOnly = IntPtr.Zero;
+            try {
+                if (currentProcessToken)
+                    Check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | READ_CONTROL, out readOnly), "Open original token diagnostic read handle");
+                else
+                    // Same object, not a new token. Never copy mutation rights or
+                    // close/inherit the launch handle; a denied read is evidence.
+                    Check(DuplicateHandle(GetCurrentProcess(), token, GetCurrentProcess(), out readOnly, TOKEN_QUERY | READ_CONTROL, false, 0), "Open private token diagnostic read handle");
+                IntPtr owner, group, dacl, sacl, descriptor;
+                uint error = GetSecurityInfo(readOnly, 6, OWNER_GROUP_DACL, out owner, out group, out dacl, out sacl, out descriptor); // SE_KERNEL_OBJECT
+                if (error != 0) throw new Win32Exception((int)error, "Read token object security");
+                try { return Sddl(descriptor); }
+                finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
+            } finally { if (readOnly != IntPtr.Zero) CloseHandle(readOnly); }
+        }
+        internal static object PathSecurity(string path) {
+            return new Dictionary<string,object> { { "path", path }, { "security", Observe(() => {
+                IntPtr owner, group, dacl, sacl, descriptor;
+                uint error = GetNamedSecurityInfoW(path, 1, OWNER_GROUP_DACL, out owner, out group, out dacl, out sacl, out descriptor);
+                if (error != 0) throw new Win32Exception((int)error, "Read fixed launch path security");
+                try { return new Dictionary<string,object> {
+                    { "ownerSid", owner == IntPtr.Zero ? null : new SecurityIdentifier(owner).Value }, { "sddl", Sddl(descriptor) }
+                }; } finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
+            }) } };
+        }
+        internal static object UserObjectInfo(IntPtr handle, int index) {
+            uint size;
+            bool initial = GetUserObjectInformationW(handle, index, IntPtr.Zero, 0, out size);
+            int error = Marshal.GetLastWin32Error();
+            if (initial || error != 122 || size == 0 || size > 65536) throw new Win32Exception(error, "Read user object information size");
+            IntPtr buffer = Marshal.AllocHGlobal((int)size);
+            try {
+                Check(GetUserObjectInformationW(handle, index, buffer, size, out size), "Read current user object information");
+                if (index == 2) return Marshal.PtrToStringUni(buffer); // UOI_NAME
+                return new Dictionary<string,object> { // USEROBJECTFLAGS: two BOOLs then DWORD flags.
+                    { "inherit", Marshal.ReadInt32(buffer) != 0 }, { "reserved", Marshal.ReadInt32(buffer, 4) != 0 },
+                    { "flags", unchecked((uint)Marshal.ReadInt32(buffer, 8)) }
+                };
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        internal static object UserObjectSecurity(IntPtr handle) {
+            uint requested = OWNER_GROUP_DACL, size;
+            bool initial = GetUserObjectSecurity(handle, ref requested, IntPtr.Zero, 0, out size);
+            int error = Marshal.GetLastWin32Error();
+            if (initial || error != 122 || size == 0 || size > 1048576) throw new Win32Exception(error, "Read user object security size");
+            IntPtr buffer = Marshal.AllocHGlobal((int)size);
+            try {
+                Check(GetUserObjectSecurity(handle, ref requested, buffer, size, out size), "Read current user object security");
+                return Sddl(buffer);
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        internal static object CurrentUserObject(bool station) {
+            // Borrow current handles. Do not close them, switch desktop/station,
+            // enumerate other objects, or retry an access-denied security read.
+            IntPtr handle = station ? GetProcessWindowStation() : GetThreadDesktop(GetCurrentThreadId());
+            Check(handle != IntPtr.Zero, "Read current station/desktop handle");
+            return new Dictionary<string,object> {
+                { "name", Observe(() => UserObjectInfo(handle, 2)) },
+                { "flags", Observe(() => UserObjectInfo(handle, 1)) },
+                { "security", Observe(() => UserObjectSecurity(handle)) }
+            };
+        }
+        internal static object SecLogon(bool configuration) {
+            IntPtr manager = IntPtr.Zero, service = IntPtr.Zero, buffer = IntPtr.Zero;
+            try {
+                manager = OpenSCManagerW(null, null, 0x0001); // SC_MANAGER_CONNECT, local only.
+                Check(manager != IntPtr.Zero, "Read local service manager");
+                service = OpenServiceW(manager, "seclogon", configuration ? 0x0001u : 0x0004u); // SERVICE_QUERY_CONFIG or SERVICE_QUERY_STATUS only.
+                Check(service != IntPtr.Zero, "Open Secondary Logon for read only");
+                uint size;
+                if (configuration) {
+                    bool initial = QueryServiceConfigW(service, IntPtr.Zero, 0, out size);
+                    int error = Marshal.GetLastWin32Error();
+                    if (initial || error != 122 || size < 12 || size > 8192) throw new Win32Exception(error, "Read Secondary Logon configuration size");
+                    buffer = Marshal.AllocHGlobal((int)size);
+                    Check(QueryServiceConfigW(service, buffer, size, out size), "Read Secondary Logon configuration");
+                    // Only the leading DWORD flags. No account, command, or dependencies.
+                    return new Dictionary<string,object> {
+                        { "serviceType", unchecked((uint)Marshal.ReadInt32(buffer)) },
+                        { "startType", unchecked((uint)Marshal.ReadInt32(buffer, 4)) },
+                        { "errorControl", unchecked((uint)Marshal.ReadInt32(buffer, 8)) }
+                    };
+                }
+                size = 36; // SERVICE_STATUS_PROCESS: nine DWORDs.
+                buffer = Marshal.AllocHGlobal((int)size);
+                Check(QueryServiceStatusEx(service, 0, buffer, size, out size), "Read Secondary Logon status");
+                return new Dictionary<string,object> {
+                    { "serviceType", unchecked((uint)Marshal.ReadInt32(buffer)) },
+                    { "currentState", unchecked((uint)Marshal.ReadInt32(buffer, 4)) },
+                    { "controlsAccepted", unchecked((uint)Marshal.ReadInt32(buffer, 8)) },
+                    { "win32ExitCode", unchecked((uint)Marshal.ReadInt32(buffer, 12)) },
+                    { "serviceSpecificExitCode", unchecked((uint)Marshal.ReadInt32(buffer, 16)) },
+                    { "serviceFlags", unchecked((uint)Marshal.ReadInt32(buffer, 32)) }
+                };
+            } finally {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                if (service != IntPtr.Zero) CloseServiceHandle(service);
+                if (manager != IntPtr.Zero) CloseServiceHandle(manager);
+            }
+        }
 
         internal static void Check(bool success, string operation) {
             if (!success) {
@@ -225,6 +392,27 @@ namespace Polaris.WindowsAcceptance {
             Normalized = Native.Snapshot(duplicate);
             Native.AssertPrivate(Original, Normalized);
             Native.AssertUnchanged(Original, Native.Current());
+        }
+        public object ReadLaunchDiagnostics(string executable, string worker, string config, string directory) {
+            if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken");
+            if (Normalized == null) throw new InvalidOperationException("Owner normalization must precede diagnostics");
+            // These observations cannot establish which object denied process creation,
+            // or substitute for the actual child-token / owner / target result.
+            return new Dictionary<string,object> {
+                { "schemaVersion", 1 }, { "phase", "beforeCreateProcessWithTokenW" },
+                { "originalToken", Native.TokenContext(original) },
+                { "privateToken", Native.TokenContext(duplicate) },
+                { "originalTokenObjectSecurity", Native.Observe(() => Native.TokenObjectSecurity(original, true)) },
+                { "privateTokenObjectSecurity", Native.Observe(() => Native.TokenObjectSecurity(duplicate, false)) },
+                { "executable", Native.PathSecurity(executable) },
+                { "currentDirectory", Native.PathSecurity(directory) },
+                { "worker", Native.PathSecurity(worker) },
+                { "configuration", Native.PathSecurity(config) },
+                { "currentWindowStation", Native.Observe(() => Native.CurrentUserObject(true)) },
+                { "currentDesktop", Native.Observe(() => Native.CurrentUserObject(false)) },
+                { "secondaryLogonStatus", Native.Observe(() => Native.SecLogon(false)) },
+                { "secondaryLogonConfiguration", Native.Observe(() => Native.SecLogon(true)) }
+            };
         }
         public ChildProcess Start(string executable, string worker, string config, string directory) {
             if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken");

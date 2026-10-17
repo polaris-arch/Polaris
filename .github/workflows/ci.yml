@@ -63,6 +63,10 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      windows_launcher_diagnostics:
+        description: 'Fixed-branch Windows launcher diagnosis only; never satisfies full PR gates'
+        type: boolean
+        default: false
       windows_directory_mode:
         description: 'Windows directory acceptance: formal or exact candidate; release contract unchanged'
         type: choice
@@ -110,6 +114,8 @@ concurrency:
 
 jobs:
   cheap_format:
+    # Only an explicit manual diagnostic selection skips the ordinary gate DAG.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true }}
     name: Cheap Rust formatting gate
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -1071,5 +1077,74 @@ jobs:
         with:
           name: coex-runtime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ steps.coex_prepare.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+
+  windows_launcher_diagnostics:
+    name: Windows launcher diagnosis (not PR acceptance)
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true
+          && github.repository == 'polaris-arch/Polaris'
+          && github.ref == 'refs/heads/collab/dots-audit-remediation-20261017' }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact diagnostic App source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate the fixed reviewed candidate
+        id: candidate
+        shell: pwsh
+        run: |
+          $candidate = Get-Content -LiteralPath scripts/windows-directory/candidate-source.json -Raw | ConvertFrom-Json -AsHashtable
+          if ($candidate.schema -cne 'polaris-windows-directory-candidate-v1' -or
+              $candidate.repository -cne 'polaris-arch/sing-box-polaris' -or
+              $candidate.sourceCommit -cne '68ffb209ded1f9337f9115741cba24f9f4c63421') {
+            throw 'Diagnostic candidate differs from the exact reviewed source'
+          }
+          "source=$($candidate.sourceCommit)" >> $env:GITHUB_OUTPUT
+      - name: Checkout exact diagnostic kernel source
+        uses: actions/checkout@v7
+        with:
+          repository: polaris-arch/sing-box-polaris
+          ref: ${{ steps.candidate.outputs.source }}
+          path: .windows-directory-kernel
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Resolve exact diagnostic kernel toolchain
+        id: kernel_go
+        shell: pwsh
+        run: |
+          $pins = [regex]::Matches((Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw), '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
+          if ($pins.Count -ne 1) { throw 'Expected one exact source toolchain pin' }
+          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+      - name: Setup exact diagnostic Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.kernel_go.outputs.version }}
+          cache-dependency-path: .windows-directory-kernel/go.sum
+      - name: Run the existing fixed launcher and acceptance target
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+          CANDIDATE_SOURCE: ${{ steps.candidate.outputs.source }}
+        run: |
+          # No preceding Rust build/test: creation failures terminate promptly.
+          # If creation succeeds, the same fixed target continues native validation;
+          # that path can be expensive and never substitutes for full PR/SYSTEM gates.
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 -KernelRoot .windows-directory-kernel -OutputDirectory (Join-Path $env:RUNNER_TEMP 'windows-launcher-diagnostics') -CandidateSourceCommit $env:CANDIDATE_SOURCE
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed launcher diagnostic attempt failed' }
+      - name: Always preserve original launcher diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-launcher-diagnostics-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-launcher-diagnostics
           if-no-files-found: error
           retention-days: 14

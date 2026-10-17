@@ -1,16 +1,16 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending. Isolated archive.releaseName compatibility and schema-correct native Go version selection await review and real release readback; source and release pins unchanged. Targeted caaa Windows Test phase-watchdog failure blocks launcher diagnostics; narrow clock-scope fix and manual-candidate post-Test-failure collection await native CI, with failed Test/job and exact PR/SYSTEM gates preserved.",
+  "status": "App020a diagnostic failures: Windows private owner normalization succeeded but child creation failed without preserved Win32 code; macOS arm64 DMG failed without preserved subprocess output. Diagnostics-only batch records error/privilege details and full bundler output; no API, privilege, product or SYSTEM gate changes. Targeted dispatch cannot establish full PR acceptance; required checks remain pending. Isolated archive.releaseName compatibility and schema-correct native Go version selection await review and real release readback; source and release pins unchanged. Targeted caaa Windows Test phase-watchdog failure blocks launcher diagnostics; narrow clock-scope fix and manual-candidate post-Test-failure collection await native CI, with failed Test/job and exact PR/SYSTEM gates preserved. fc52 ordinary Windows Rust tests passed; actual private-token creation failed Win32=5 with SeImpersonate enabled. Read-only object diagnostics and explicit fixed-source manual launcher job await native execution; no ACL/service/privilege/API mutation and no PR/SYSTEM acceptance claim.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
-      "owner": "app-ci-round7",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": "9b2baff2796bf95831b3c533a9448ff2926bfd30",
-      "newBlob": "d40c5020f91679b5167606aad5aeb974cf402b97",
-      "newSHA256": "f926c462c5accc71cee38b5f14ccfc599d932a6ceb7a42ee9e937c68bc4de939",
+      "newBlob": "56cd53689df8d414d9667481c129e795c7f0931d",
+      "newSHA256": "7a2395a93bf4665a216a75d68ac45bb5a7db963e482db01f737718a141f8857e",
       "mode": "100644",
-      "bytes": 71637
+      "bytes": 75400
     },
     {
       "path": ".github/workflows/package.yml",
@@ -833,12 +833,12 @@
     },
     {
       "path": "docs/audit-remediation-status.md",
-      "owner": "app-ci-round7",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": "4c2b7b3e0005eb4cd3b9e0a62a0dca91e7b0a81c",
       "mode": "100644",
-      "newBlob": "58504aef58eca3709043208b3cc550b01cf38047",
-      "newSHA256": "94d7279d0d37fcd5bf5d40d9349d852c339cf9fda7e7b432d697042bfad76789",
-      "bytes": 25471
+      "newBlob": "31afe2d4b3ec485b411e74a2833121b7adb5aede",
+      "newSHA256": "22ebc2eba1635c78c424a9739a448f8420b32fdb079c139aaf153d0655ea08cd",
+      "bytes": 27524
     },
     {
       "path": "scripts/apk-permission-acquisition.test.mjs",
@@ -875,6 +875,24 @@
       "newBlob": "92967069b1639709704896a95131db557920eeb5",
       "newSHA256": "c18ce973f1c55a8ec7c6b59b935a02cdce35a3ede8bbe66c1d2caa88d7372bd6",
       "bytes": 65207
+    },
+    {
+      "path": "scripts/check-coex-runtime-export.test.mjs",
+      "mode": "100644",
+      "baseBlob": "9597b03ba4164a164eebd9c376b4a41f78cc3b44",
+      "owner": "app-ci-round8-diagnostics",
+      "bytes": 28398,
+      "newSHA256": "78d3aac0932bb28351142845b776ae5b816172bec88fc529c05c1cab4ef16090",
+      "newBlob": "09231b33d2e173e31962ad7d41b8db3979a9477a"
+    },
+    {
+      "path": "scripts/ci-workflow-efficiency.test.mjs",
+      "mode": "100644",
+      "baseBlob": "75b9067119b0ef83151f9900e90b6ee5d82929eb",
+      "owner": "app-ci-round8-diagnostics",
+      "newBlob": "55c280c45c18cb47614cdf0268cd29836fcaebc5",
+      "newSHA256": "3d6a875ccbdc20dd873e5a4f3e3ba2b50d7b956a61a001637cef002be84c7333",
+      "bytes": 29159
     },
     {
       "path": "scripts/ci/assert-windows-directory-acceptance.ps1",
@@ -1265,21 +1283,21 @@
     },
     {
       "path": "scripts/windows-directory/Run-WithUserTokenOwner.ps1",
-      "owner": "app-ci-round5",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": null,
       "mode": "100644",
-      "newBlob": "0b571bad44912ece0a9118e513feadcea916e2ab",
-      "newSHA256": "531332357e6cc0921d53fcbdea7d0aa05b27cabd46235724dd0356da3e2c3737",
-      "bytes": 8942
+      "newBlob": "6599ad687a0661bfe41782dea10b673804e70eb8",
+      "newSHA256": "6256c2d200d5691ccbdddde5b32cfef43aa86210387e0bfb67e3051fec3b98b2",
+      "bytes": 9337
     },
     {
       "path": "scripts/windows-directory/UserTokenOwnerNative.cs",
-      "owner": "app-ci-round5",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": null,
       "mode": "100644",
-      "newBlob": "80bcdd2a86a00d13e56ae58eaa6192dfe95de423",
-      "newSHA256": "118482ccab271fa872d7b0c750e06c1d636289efbb9716ce5ff8acc88085f5a4",
-      "bytes": 22502
+      "newBlob": "5158f751c73629f762812b7ef3d837b47e80f90d",
+      "newSHA256": "47c8858e20ff962dc05f70601498bb27513fe043e9664de588cd9b8a21f7c0ee",
+      "bytes": 36991
     },
     {
       "path": "scripts/windows-directory/candidate-source.json",
@@ -1292,12 +1310,12 @@
     },
     {
       "path": "scripts/windows-token-owner.test.mjs",
-      "owner": "app-ci-round7",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": null,
       "mode": "100644",
-      "newBlob": "ab9ece6e995929b47097ce41cfd942d56c2f129c",
-      "newSHA256": "af1fee2043f08e578d1fbedea52fbd4b16e5a8dac49696d35487fe521ece741a",
-      "bytes": 17861
+      "newBlob": "4c2e20a9de20aa44a43a2b517b6d9195d2fdd534",
+      "newSHA256": "cf8b68b88f31435f24378b7cce15806e72e7a37d2bf0fae6439fef275f732c80",
+      "bytes": 27666
     },
     {
       "path": "src-tauri/Cargo.toml",
@@ -1886,21 +1904,21 @@
     },
     {
       "path": "ui/src/contracts/package-ci-matrix-contract.test.ts",
-      "owner": "app-ci-round1",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": "2a7800babc5b4f06f5ff1086ab14169c9b6f9229",
-      "newBlob": "e44f3cea3f15ab4df56fa3e1b0d2f9b5638f0488",
-      "newSHA256": "67dd892ffa8eb8aa315cad4f87c83cb0e7fd534af7c9582a77602c9e18eb6aa3",
+      "newBlob": "66b7e357eb5e5908222c8b37e08d475d679bbabe",
+      "newSHA256": "13067c957fdac23b78e4a3100a2411a564683272331c2f6f13f3c79969837272",
       "mode": "100644",
-      "bytes": 92168
+      "bytes": 92989
     },
     {
       "path": "ui/src/contracts/workflow-toolchain-pin-parity.test.ts",
-      "owner": "app-ci-round1",
+      "owner": "app-ci-round8-diagnostics",
       "baseBlob": "0d25edb717cfc430e9862659cc934eb363868fea",
-      "newBlob": "5f96a5f0cd8f6e93d0f6bffe230c0a5e0d9bf1dc",
-      "newSHA256": "9095338545c6eb5f0165085629cc6393450a9825b84f6d2d3f0b8552cab54b8c",
+      "newBlob": "dea5a87f5a7feaa435163e5422afb5b274f45032",
+      "newSHA256": "9037d24583ae00a7695ba6ab635b08544b14fbd7d5c342037ba9066d4858f87d",
       "mode": "100644",
-      "bytes": 16986
+      "bytes": 17224
     },
     {
       "path": "ui/src/lib/config-write-lock.test.ts",

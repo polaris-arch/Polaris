@@ -30,7 +30,7 @@ function audit({ parent, child, native, workflow }) {
   assert.doesNotMatch(native, /SetTokenInformation\(original|AdjustTokenPrivileges\(|SetThreadToken\(|ImpersonateLoggedOnUser\(|CreateProcessAsUser\(|CreateProcessWithLogon/);
   ordered(native, 'DuplicateBefore = Native.Snapshot(duplicate)', 'DuplicateBefore.TokenId == Original.TokenId', 'public void Normalize()', 'Native.SetTokenInformation(duplicate', 'Normalized = Native.Snapshot(duplicate)', 'Native.AssertPrivate(Original, Normalized)');
   assert.match(native, /if \(duplicate == IntPtr.Zero\) throw new ObjectDisposedException\("PrivateToken"\)/);
-  assert.match(native, /if \(Normalized == null\) throw new InvalidOperationException/);
+  assert.match(native, /if \(Normalized == null\) throw new InvalidOperationException\("Owner normalization must precede child creation"\)/);
   ordered(native, 'if (!success) {', 'int code = Marshal.GetLastWin32Error();', 'throw new Win32Exception(code, operation + " [Win32=" + code');
   assert.match(native, /new Win32Exception\(code\)\.Message/);
   assert.match(native, /OpenProcessToken\(GetCurrentProcess\(\), TOKEN_QUERY, out token\), "Read current token privileges"/);
@@ -53,7 +53,7 @@ function audit({ parent, child, native, workflow }) {
   assert.match(native, /if \(process == IntPtr.Zero\) throw new ObjectDisposedException\("ChildProcess"\)/);
   assert.match(native, /Check\(CreateDirectoryW\(path, IntPtr.Zero\),/);
   assert.match(native, /GetNamedSecurityInfoW\(path, 1, 1,/);
-  assert.match(native, /if \(error != 0\) throw new Win32Exception/);
+  assert.match(native, /if \(error != 0\) throw new Win32Exception\(\(int\)error, "Read actual probe owner"\)/);
   assert.doesNotMatch(native + child, /SetNamedSecurityInfo|Set-Acl\s+-|icacls|takeown|AdjustTokenPrivileges/);
 
   ordered(parent, "Invalidate-ValidationReceipt 'start'", 'Add-Type -Path $native', '$lease.Normalize()', '$state.duplicateNormalized', '$child = $lease.Start', '$state.suspendedChildToken', '$configuration.actualChildToken', 'Save-OwnerAttempt $state', '$child.Resume()', '$exitCode = $child.Wait(3600000)');
@@ -108,7 +108,7 @@ const negatives = [
   ['setter aimed at shared original token', 'native', 'SetTokenInformation(duplicate, Native.TokenOwner', 'SetTokenInformation(original, Native.TokenOwner'],
   ['duplicate owner API failure ignored', 'native', 'if (!success) {', 'if (false) {'],
   ['closed token accepted', 'native', 'if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken")', 'if (false) throw new ObjectDisposedException("PrivateToken")', true],
-  ['no normalized-token precondition', 'native', 'if (Normalized == null) throw', 'if (false) throw'],
+  ['no normalized-token precondition', 'native', 'if (Normalized == null) throw new InvalidOperationException("Owner normalization must precede child creation")', 'if (false) throw new InvalidOperationException("Owner normalization must precede child creation")'],
   ['same token identity accepted', 'native', 'child.TokenId == original.TokenId', 'false'],
   ['wrong actual-child owner accepted', 'native', 'child.Owner != child.User', 'false'],
   ['original owner readback unchecked', 'native', 'before.Owner != after.Owner', 'false'],
@@ -119,7 +119,7 @@ const negatives = [
   ['descendant cleanup not verified', 'native', 'accounting.ActiveProcesses == 0', 'true'],
   ['timeout silently accepted', 'native', 'wait == Native.WAIT_TIMEOUT) throw new TimeoutException', 'false) throw new TimeoutException'],
   ['probe creation failure ignored', 'native', 'Check(CreateDirectoryW(path, IntPtr.Zero),', 'Check(true,'],
-  ['probe owner read failure ignored', 'native', 'if (error != 0) throw new Win32Exception', 'if (false) throw new Win32Exception'],
+  ['probe owner read failure ignored', 'native', 'if (error != 0) throw new Win32Exception((int)error, "Read actual probe owner")', 'if (false) throw new Win32Exception((int)error, "Read actual probe owner")'],
   ['old successful receipt retained', 'parent', "Invalidate-ValidationReceipt 'start'", '# omitted'],
   ['late failure keeps new successful receipt', 'parent', "Invalidate-ValidationReceipt 'failed'", '# omitted'],
   ['final evidence write failure keeps receipt', 'parent', "Invalidate-ValidationReceipt 'evidence-failed'", '# omitted'],
@@ -137,6 +137,95 @@ for (const [name, file, before, after, all] of negatives) {
     assert.throws(() => audit(mutated), { name: 'AssertionError' });
   });
 }
+
+function auditReadOnlyDiagnostics({ native, parent }) {
+  assert.match(native, /READ_CONTROL = 0x00020000/);
+  assert.match(native, /OWNER_GROUP_DACL = 0x00000007/);
+  assert.match(native, /TokenDefaultDacl = 6, TokenSessionId = 12, TokenIntegrityLevel = 25/);
+  const tokenSecurity = native.split('internal static object TokenObjectSecurity(')[1]?.split('internal static object PathSecurity(')[0];
+  assert.ok(tokenSecurity);
+  assert.match(tokenSecurity, /OpenProcessToken\(GetCurrentProcess\(\), TOKEN_QUERY \| READ_CONTROL, out readOnly\)/);
+  assert.match(tokenSecurity, /DuplicateHandle\(GetCurrentProcess\(\), token, GetCurrentProcess\(\), out readOnly, TOKEN_QUERY \| READ_CONTROL, false, 0\)/);
+  assert.match(tokenSecurity, /GetSecurityInfo\(readOnly, 6, OWNER_GROUP_DACL,/);
+  assert.match(tokenSecurity, /if \(error != 0\) throw new Win32Exception/);
+  assert.match(tokenSecurity, /finally \{ if \(readOnly != IntPtr.Zero\) CloseHandle\(readOnly\); \}/);
+  assert.doesNotMatch(tokenSecurity, /DuplicateTokenEx|TOKEN_ADJUST|TOKEN_ASSIGN|MAXIMUM_ALLOWED/);
+  const observe = native.split('internal static object Observe(')[1]?.split('internal static string Sddl(')[0];
+  assert.ok(observe);
+  assert.match(observe, /catch \(Exception error\)/);
+  assert.match(observe, /"result", "unavailable"/);
+  assert.match(observe, /failure\["nativeErrorCode"\] = native.NativeErrorCode/);
+  assert.match(observe, /return failure;/);
+  assert.doesNotMatch(observe, /throw|error.Message|error.ToString/);
+  const helpers = native.split('internal static object Observe(')[1]?.split('internal static void Check(')[0];
+  assert.ok(helpers);
+  assert.doesNotMatch(helpers, /Environment\.|SetTokenInformation\(|AdjustToken\w*\(|CreateProcess\w*\(|SetNamedSecurityInfo|SetSecurityInfo\(|SetUserObjectSecurity\(|SetKernelObjectSecurity\(/);
+  assert.equal([...native.matchAll(/\bSetTokenInformation\(/g)].length, 2); // One declaration and the existing private-owner call.
+  assert.match(native, /Information\(token, TokenDefaultDacl\)/);
+  assert.match(native, /if \(acl == IntPtr.Zero\) return new Dictionary<string,object> \{ \{ "isNull", true \}, \{ "sddl", null \} \}/);
+  assert.match(native, /descriptor.GetSddlForm\(AccessControlSections.Access\)/);
+  assert.match(native, /Information\(token, TokenSessionId\)/);
+  assert.match(native, /Information\(token, TokenIntegrityLevel\)/);
+  assert.match(native, /GetNamedSecurityInfoW\(path, 1, OWNER_GROUP_DACL,/);
+  const diagnostics = native.split('public object ReadLaunchDiagnostics(')[1]?.split('public ChildProcess Start(')[0];
+  assert.ok(diagnostics);
+  assert.match(diagnostics, /"phase", "beforeCreateProcessWithTokenW"/);
+  for (const token of ['original', 'duplicate']) assert.ok(diagnostics.includes(`Native.TokenContext(${token})`));
+  assert.match(diagnostics, /Native.Observe\(\(\) => Native.TokenObjectSecurity\(original, true\)\)/);
+  assert.match(diagnostics, /Native.Observe\(\(\) => Native.TokenObjectSecurity\(duplicate, false\)\)/);
+  for (const path of ['executable', 'directory', 'worker', 'config']) assert.ok(diagnostics.includes(`Native.PathSecurity(${path})`));
+  assert.equal([...diagnostics.matchAll(/Native.PathSecurity\(/g)].length, 4);
+  for (const station of ['true', 'false']) assert.ok(diagnostics.includes(`Native.Observe(() => Native.CurrentUserObject(${station}))`));
+  for (const config of ['true', 'false']) assert.ok(diagnostics.includes(`Native.Observe(() => Native.SecLogon(${config}))`));
+  assert.doesNotMatch(diagnostics, /Environment|CreateProcess\w*\(|\.Start\(|SetTokenInformation|Normalize\(/);
+  // The phase string contains the API name, but there is still exactly one actual call.
+  assert.equal([...native.matchAll(/Native.CreateProcessWithTokenW\(/g)].length, 1);
+  const userObject = native.split('internal static object CurrentUserObject(')[1]?.split('internal static object SecLogon(')[0];
+  assert.match(userObject, /GetProcessWindowStation\(\) : GetThreadDesktop\(GetCurrentThreadId\(\)\)/);
+  assert.doesNotMatch(userObject, /CloseHandle\(|CloseDesktop\(|CloseWindowStation\(/);
+  assert.match(native, /uint requested = OWNER_GROUP_DACL, size/);
+  assert.match(native, /GetUserObjectSecurity\(handle, ref requested, buffer, size, out size\)/);
+  assert.match(native, /OpenSCManagerW\(null, null, 0x0001\)/);
+  assert.match(native, /OpenServiceW\(manager, "seclogon", configuration \? 0x0001u : 0x0004u\)/);
+  assert.match(native, /QueryServiceStatusEx\(service, 0, buffer, size, out size\)/);
+  assert.match(native, /QueryServiceConfigW\(service, buffer, size, out size\)/);
+  assert.doesNotMatch(native + parent, /StartService\w*\(|ChangeServiceConfig\w*\(|ControlService\w*\(|SetUserObjectSecurity\(|SetSecurityInfo\(|SetKernelObjectSecurity\(|SetThreadDesktop\(|SetProcessWindowStation\(/);
+  assert.equal([...native.matchAll(/lpDesktop/g)].length, 1);
+  ordered(parent, '$lease.Normalize()', '$configuration | ConvertTo-Json', '$workingDirectory = (Get-Location).Path',
+    '$state.launchDiagnostics = $lease.ReadLaunchDiagnostics($executable,$worker,$configurationPath,$workingDirectory)', 'Save-OwnerAttempt $state',
+    'catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }',
+    '$child = $lease.Start($executable,$worker,$configurationPath,$workingDirectory)');
+  assert.match(parent, /try \{\s*\$state.launchDiagnostics = \$lease.ReadLaunchDiagnostics\([^\n]*\)\s*Save-OwnerAttempt \$state\s*\}\s*catch \{ \$state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence \$_\.Exception \}/);
+  assert.equal([...parent.matchAll(/\$lease.ReadLaunchDiagnostics\(/g)].length, 1);
+  assert.equal([...parent.matchAll(/\$lease.Start\(/g)].length, 1);
+}
+test('launch diagnostics are isolated read-only observations of fixed objects', () => auditReadOnlyDiagnostics(sources));
+for (const [name, file, before, after] of [
+  ['original SD handle lacks READ_CONTROL', 'native', 'TOKEN_QUERY | READ_CONTROL, out readOnly', 'TOKEN_QUERY, out readOnly'],
+  ['original SD handle gains mutation rights', 'native', 'TOKEN_QUERY | READ_CONTROL, out readOnly', 'TOKEN_QUERY | READ_CONTROL | TOKEN_ADJUST_DEFAULT, out readOnly'],
+  ['private SD is read with wrong token handle', 'native', 'GetSecurityInfo(readOnly, 6, OWNER_GROUP_DACL', 'GetSecurityInfo(token, 6, OWNER_GROUP_DACL'],
+  ['private diagnostic copies launch mutation rights', 'native', 'TOKEN_QUERY | READ_CONTROL, false, 0)', 'TOKEN_QUERY | READ_CONTROL, false, 2)'],
+  ['private diagnostic closes launch handle', 'native', 'TOKEN_QUERY | READ_CONTROL, false, 0)', 'TOKEN_QUERY | READ_CONTROL, false, 1)'],
+  ['token object diagnostic handle leaks', 'native', 'if (readOnly != IntPtr.Zero) CloseHandle(readOnly)', 'if (false) CloseHandle(readOnly)'],
+  ['SACL read introduced', 'native', 'OWNER_GROUP_DACL = 0x00000007', 'OWNER_GROUP_DACL = 0x0000000f'],
+  ['NULL default ACL confused with empty ACL', 'native', '{ "isNull", true }, { "sddl", null }', '{ "isNull", false }, { "sddl", "D:" }'],
+  ['diagnostic Win32 error lost', 'native', 'failure["nativeErrorCode"] = native.NativeErrorCode', 'failure["nativeErrorCode"] = native.HResult'],
+  ['diagnostic failure reported as successful read', 'native', '"result", "unavailable"', '"result", "read"'],
+  ['diagnostic failure is thrown', 'native', 'return failure;', 'throw error;'],
+  ['helper leaks environment values', 'native', 'internal static object TokenContext(IntPtr token) {', 'internal static object TokenContext(IntPtr token) { Environment.GetEnvironmentVariables();'],
+  ['helper mutates token default ACL', 'native', 'internal static object TokenContext(IntPtr token) {', 'internal static object TokenContext(IntPtr token) { SetTokenInformation(token, TokenDefaultDacl, IntPtr.Zero, 0);'],
+  ['config ACL omitted', 'native', 'Native.PathSecurity(config)', 'null'],
+  ['service mutation access introduced', 'native', 'configuration ? 0x0001u : 0x0004u', 'configuration ? 0x0002u : 0x0010u'],
+  ['service configuration status combined', 'native', 'Native.Observe(() => Native.SecLogon(true))', 'Native.SecLogon(true)'],
+  ['borrowed desktop closed', 'native', 'Check(handle != IntPtr.Zero, "Read current station/desktop handle");', 'Check(handle != IntPtr.Zero, "Read current station/desktop handle"); CloseHandle(handle);'],
+  ['diagnostic exception overwrites launch evidence', 'parent', '$state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception', '$state.failureEvidence = Convert-ExceptionEvidence $_.Exception'],
+  ['diagnostic exception skips real launch', 'parent', 'catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }', 'catch { throw }'],
+  ['diagnostic persistence failure skips real launch', 'parent', 'Save-OwnerAttempt $state\n    }\n    catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }', '}\n    catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }\n    Save-OwnerAttempt $state'],
+  ['launch uses different working directory than evidence', 'parent', '$lease.Start($executable,$worker,$configurationPath,$workingDirectory)', '$lease.Start($executable,$worker,$configurationPath,$PSScriptRoot)'],
+]) test(`read-only diagnostics reject ${name}`, () => {
+  assert.ok(sources[file].includes(before), name);
+  assert.throws(() => auditReadOnlyDiagnostics({ ...sources, [file]: sources[file].replace(before, after) }), { name: 'AssertionError' });
+});
 
 const diagnosticStages = [
   ['Select explicit formal or candidate Windows directory source', null],

@@ -182,7 +182,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     expect(jobs, 'ci.yml 的 job 集合变了 —— 新 job 要有人过目：它的缓存键、它能不能被关掉').toEqual([
-      'cheap_format', 'lint', 'cross', 'test',
+      'cheap_format', 'lint', 'cross', 'test', 'windows_launcher_diagnostics',
     ]);
 
     const cheapFormat = executable(jobBlock(ci, 'cheap_format'));
@@ -223,9 +223,21 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(cross).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
 
     // The cheap formatter is a required predecessor, never a best-effort probe.
-    // It has no compiled artifacts to cache and must run even for non-Linux dispatches.
+    // It runs for every normal gate event, including non-Linux dispatches.
+    // Only the explicit manual launcher diagnosis selects a separate non-acceptance job.
     const requireCheapFormat = (block: string) => {
-      expect(block).not.toMatch(/^ {4}(?:if|needs|continue-on-error):/m);
+      expect(block).not.toMatch(/^ {4}(?:needs|continue-on-error):/m);
+      const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
+      expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
+      expect(conditions).toHaveLength(1);
+      expect(conditions[0][1]).toBe("github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true");
+      for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
+        for (const selected of [undefined, false, true]) {
+          expect(runInNewContext(conditions[0][1], {
+            github: { event_name: event }, inputs: { windows_launcher_diagnostics: selected },
+          })).toBe(event !== 'workflow_dispatch' || selected !== true);
+        }
+      }
       expect(block).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
       expect(block).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
       expect(block).toMatch(/^ {8}run: cargo fmt --all -- --check$/m);
