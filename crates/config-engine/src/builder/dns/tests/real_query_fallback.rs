@@ -107,8 +107,8 @@ fn fakeip_real_query_tail_matches_reviewed_snapshot() {
         &BTreeMap::new(),
         &deps_false(),
     );
-    let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../fixtures/fakeip-real-query-default-tail.json"
+    let expected: serde_json::Value = serde_json::from_str(&polaris_source_probe::crate_file!(
+        "fixtures/fakeip-real-query-default-tail.json"
     ))
     .unwrap();
     assert_eq!(
@@ -307,8 +307,10 @@ fn missing_or_disabled_builtin_fallback_cannot_use_legacy_transport() {
 fn managed_mesh_owner_and_reject_still_precede_real_query_fallback() {
     use crate::builder::mesh_dns::{build_mesh_dns_overlay, MeshDnsEmittedEndpoint};
     use crate::user_config::mesh_route_state::{MeshDnsPolicy, MeshOwnerRef, MeshRouteState};
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../../../../fixtures/mesh-dns-policy.json")).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(&polaris_source_probe::crate_file!(
+        "fixtures/mesh-dns-policy.json"
+    ))
+    .unwrap();
     let policy: MeshDnsPolicy = serde_json::from_value(fixture["policy"].clone()).unwrap();
     let state: MeshRouteState = serde_json::from_value(fixture["state"].clone()).unwrap();
     let endpoints = vec![
