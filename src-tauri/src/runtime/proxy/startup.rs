@@ -3947,14 +3947,14 @@ impl ProxyRuntime {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let cli_observation = match binary {
             Some(path) => crate::runtime::tls_fingerprints::probe_cli_observation(path).await,
-            None => Err(crate::runtime::tls_fingerprints::Snapshot::unavailable(
-                "No selected core binary",
+            None => Err(Box::new(
+                crate::runtime::tls_fingerprints::Snapshot::unavailable("No selected core binary"),
             )),
         };
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let capabilities = match &cli_observation {
             Ok(observation) => &observation.snapshot,
-            Err(snapshot) => snapshot,
+            Err(snapshot) => snapshot.as_ref(),
         };
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let capabilities = self.tls_fingerprint_capabilities_for(binary).await;

@@ -3065,7 +3065,7 @@ impl TempCoreSession {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tls_capabilities = match &tls_observation {
             Ok(observation) => &observation.snapshot,
-            Err(snapshot) => snapshot,
+            Err(snapshot) => snapshot.as_ref(),
         };
         #[cfg(target_os = "android")]
         let tls_capabilities = crate::runtime::proxy::temp_tls_fingerprint_capabilities().await;

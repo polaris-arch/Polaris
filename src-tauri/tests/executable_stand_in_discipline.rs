@@ -133,8 +133,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",
         Kind::Shebang,
-        2,
-        "两项分别只验路径解析/可执行权限，均不启动该文件；权限用例只读取元数据",
+        5,
+        "两项只验路径解析/可执行权限；另三项是 TLS 证明的原文件、缓存压力文件与同长度替换文件，仅哈希/身份校验，Native 探测见 shebang 即拒绝执行",
     ),
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",
@@ -157,8 +157,14 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "src-tauri/src/runtime/speedtest/tests/mod.rs",
         Kind::Shebang,
+        3,
+        "一项起核走假 spawner；另两项是 TLS 缓存压力与原子替换字节，均无执行位，Native 探测见 shebang 即拒绝执行",
+    ),
+    (
+        "src-tauri/src/runtime/proxy/tests/process_supervision/startup_observation.rs",
+        Kind::Shebang,
         1,
-        "起核走假 spawner，文件没有执行位、从不执行",
+        "仅为测量身份捕获制造 TLS 缓存淘汰；文件无执行位，Native 探测见 shebang 即拒绝执行，只保留哈希/文件身份",
     ),
     (
         "src-tauri/src/runtime/speedtest/tests/pc_custody.rs",

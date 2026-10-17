@@ -393,13 +393,13 @@ enum ProbeFile {
 pub(crate) async fn probe_cli(path: &Path) -> Snapshot {
     match probe_cli_observation(path).await {
         Ok(entry) => entry.snapshot,
-        Err(snapshot) => snapshot,
+        Err(snapshot) => *snapshot,
     }
 }
 
 /// Return this query's retained file proof with its snapshot. A caller crossing
 /// an await must not recover that proof from the bounded, shared lookup cache.
-pub(crate) async fn probe_cli_observation(path: &Path) -> Result<CliObservation, Snapshot> {
+pub(crate) async fn probe_cli_observation(path: &Path) -> Result<CliObservation, Box<Snapshot>> {
     CLI_CACHE
         .probe_observation_at(path, std::time::Instant::now(), ProbeFile::Native)
         .await
@@ -414,7 +414,7 @@ impl CliProbeCache {
     ) -> Snapshot {
         match self.probe_observation_at(path, now, file_kind).await {
             Ok(entry) => entry.snapshot,
-            Err(snapshot) => snapshot,
+            Err(snapshot) => *snapshot,
         }
     }
 
@@ -423,7 +423,7 @@ impl CliProbeCache {
         path: &Path,
         now: std::time::Instant,
         file_kind: ProbeFile,
-    ) -> Result<CliObservation, Snapshot> {
+    ) -> Result<CliObservation, Box<Snapshot>> {
         let fresh = |entry: &CliObservation| entry.retry_at.is_none_or(|retry| now < retry);
         if let Some(entry) = self.observed(path).filter(fresh) {
             return Ok(entry);
@@ -438,7 +438,7 @@ impl CliProbeCache {
             Some(entry) => entry,
             None => match open_observation(path).await {
                 Ok(entry) => entry,
-                Err(reason) => return Err(Snapshot::unavailable(reason)),
+                Err(reason) => return Err(Box::new(Snapshot::unavailable(reason))),
             },
         };
         use std::io::{Read, Seek};
@@ -470,9 +470,9 @@ impl CliProbeCache {
             .retryable
             .then(|| std::time::Instant::now() + TRANSIENT_RETRY_DELAY);
         if !entry.still_current() {
-            return Err(Snapshot::unavailable(
+            return Err(Box::new(Snapshot::unavailable(
                 "Core changed during capability query",
-            ));
+            )));
         }
         if let Ok(mut cache) = self.entries.lock() {
             cache.retain(|old| old.path != path);

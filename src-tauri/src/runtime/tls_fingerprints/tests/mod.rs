@@ -248,3 +248,20 @@ fn only_explicit_old_cli_dispatch_rejection_is_stable_absence() {
         assert!(!unsupported_capability_command("", transient));
     }
 }
+
+#[tokio::test]
+async fn missing_cli_observation_preserves_the_unavailable_snapshot() {
+    let dir = std::env::temp_dir().join(format!("polaris-tls-missing-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("missing-core");
+    let unavailable = probe_cli_observation(&path).await.unwrap_err();
+    assert!(unavailable.unavailable_reason.is_some());
+    assert!(unavailable.binary_sha256.is_none());
+    assert!(unavailable.document.is_none());
+    assert_eq!(
+        serde_json::to_value(unavailable.as_ref()).unwrap(),
+        serde_json::to_value(probe_cli(&path).await).unwrap(),
+        "the boxed failure must retain the complete legacy Snapshot payload"
+    );
+    std::fs::remove_dir(dir).unwrap();
+}

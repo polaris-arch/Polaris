@@ -103,7 +103,7 @@ impl ProxyRuntime {
             let (snapshot, proof) =
                 match crate::runtime::tls_fingerprints::probe_cli_observation(&binary).await {
                     Ok(proof) => (proof.snapshot.clone(), Some(proof)),
-                    Err(snapshot) => (snapshot, None),
+                    Err(snapshot) => (*snapshot, None),
                 };
             let current = self.status();
             if generation != self.core_generation()
