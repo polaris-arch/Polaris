@@ -158,7 +158,9 @@ fn same_file_path(a: &Path, b: &Path) -> bool {
     if b.starts_with("/proc") {
         use std::os::unix::fs::MetadataExt;
         return match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(expected), Ok(loaded)) => expected.dev() == loaded.dev() && expected.ino() == loaded.ino(),
+            (Ok(expected), Ok(loaded)) => {
+                expected.dev() == loaded.dev() && expected.ino() == loaded.ino()
+            }
             _ => false,
         };
     }
@@ -190,7 +192,10 @@ mod loaded_image_regressions {
         let replacement = dir.join("replacement");
         std::fs::write(&replacement, b"new").unwrap();
         std::fs::rename(&replacement, &expected).unwrap();
-        assert!(!matches!(attest_core_binary(&expected, Some(&observed), "", ""), CoreBinaryAttestation::SamePath));
+        assert!(!matches!(
+            attest_core_binary(&expected, Some(&observed), "", ""),
+            CoreBinaryAttestation::SamePath
+        ));
         std::fs::remove_file(&expected).unwrap();
         assert!(!same_file_path(&expected, &observed));
         drop(loaded);

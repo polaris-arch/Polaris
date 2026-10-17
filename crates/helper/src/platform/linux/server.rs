@@ -1290,9 +1290,8 @@ impl ConnServer {
         if std_stream.set_nonblocking(false).is_err() {
             return;
         }
-        let std_stream = crate::line_io::DeadlineStream::new(
-            std_stream, Duration::from_secs(READ_TIMEOUT_SECS),
-        );
+        let std_stream =
+            crate::line_io::DeadlineStream::new(std_stream, Duration::from_secs(READ_TIMEOUT_SECS));
 
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {

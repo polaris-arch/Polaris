@@ -183,10 +183,12 @@ impl SwitchExecutor {
         // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 显式错误结果（跳过断连，不阻断热切）。
         let snapshot = match api.first_connection_snapshot().await {
             Ok(s) => s,
-            Err(error) => return PrecisionDisconnectOutcome {
-                snapshot_error: Some(error.to_string()),
-                ..PrecisionDisconnectOutcome::default()
-            },
+            Err(error) => {
+                return PrecisionDisconnectOutcome {
+                    snapshot_error: Some(error.to_string()),
+                    ..PrecisionDisconnectOutcome::default()
+                }
+            }
         };
         let outcome = select_connections_to_close(&snapshot, &pairs);
         // 复用 runtime 的 owned ID + 借用 API + buffer_unordered 模式，不调用 close-all。

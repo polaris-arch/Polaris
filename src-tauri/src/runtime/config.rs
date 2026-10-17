@@ -2191,7 +2191,8 @@ impl ConfigManager {
                     // Retry a prior unlink whose parent fsync was uncertain.
                     #[cfg(unix)]
                     if let Some(parent) = path.parent() {
-                        std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+                        std::fs::File::open(parent)
+                            .and_then(|directory| directory.sync_all())
                             .map_err(|error| StoreError::CommitUncertain(error.to_string()))?;
                     }
                     return Ok(());

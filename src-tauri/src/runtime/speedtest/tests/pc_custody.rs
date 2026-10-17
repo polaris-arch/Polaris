@@ -1580,14 +1580,21 @@ async fn cancelled_native_dispatch_compacts_only_after_real_retirement_in_either
         let dispatch = PcTempBatchDispatch(producer.clone());
         producer.factory_started.store(true, Ordering::SeqCst);
         let mut child = native_child(&h, "exit-success.sh").await;
-        assert!(Arc::ptr_eq(producer.birth.lock().unwrap().as_ref().unwrap(), &child.birth));
+        assert!(Arc::ptr_eq(
+            producer.birth.lock().unwrap().as_ref().unwrap(),
+            &child.birth
+        ));
         let old_view = custody.producer_view().unwrap();
         let weak_birth = Arc::downgrade(&child.birth);
         if retire_first {
             child.close_confirmed().await.unwrap();
             assert!(child.birth.has_native_terminal());
             custody.prune_terminal().unwrap();
-            assert_eq!(custody.producers.lock().unwrap().len(), 1, "original dispatch is still active");
+            assert_eq!(
+                custody.producers.lock().unwrap().len(),
+                1,
+                "original dispatch is still active"
+            );
             drop(dispatch);
         } else {
             drop(dispatch);
@@ -1607,9 +1614,15 @@ async fn cancelled_native_dispatch_compacts_only_after_real_retirement_in_either
         old_view.verify_surrender().unwrap();
         drop(child);
         drop(producer);
-        assert!(weak_birth.upgrade().is_some(), "old census retains exact evidence");
+        assert!(
+            weak_birth.upgrade().is_some(),
+            "old census retains exact evidence"
+        );
         drop(old_view);
-        assert!(weak_birth.upgrade().is_none(), "global history no longer owns terminal evidence");
+        assert!(
+            weak_birth.upgrade().is_none(),
+            "global history no longer owns terminal evidence"
+        );
         cleanup(&h.dir);
     }
 }
@@ -1643,11 +1656,18 @@ async fn cancelled_bound_native_factory_stays_quarantined_until_actual_return_an
         assert!(path.exists());
     }
     // The delayed original factory returns its physical Child; no fabricated ACK.
-    let mut child = booked.dispatch_native(
-        &TokioLoginCoreSpawner,
-        SpawnRequest::new(native_fixture("exit-success.sh"), path, StdioPolicy::Discard),
-        prepared,
-    ).await.unwrap();
+    let mut child = booked
+        .dispatch_native(
+            &TokioLoginCoreSpawner,
+            SpawnRequest::new(
+                native_fixture("exit-success.sh"),
+                path,
+                StdioPolicy::Discard,
+            ),
+            prepared,
+        )
+        .await
+        .unwrap();
     custody.prune_terminal().unwrap();
     assert_eq!(custody.producers.lock().unwrap().len(), 1);
     child.close_confirmed().await.unwrap();

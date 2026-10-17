@@ -851,7 +851,8 @@ mod sys {
                             .map(|(uid, _gid)| uid.as_raw());
                         let _ = process_connection_from_peer(
                             crate::line_io::DeadlineStream::new(
-                                s, READ_TIMEOUT.saturating_sub(accepted_at.elapsed()),
+                                s,
+                                READ_TIMEOUT.saturating_sub(accepted_at.elapsed()),
                             ),
                             writer,
                             svc.as_ref(),

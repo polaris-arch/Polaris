@@ -239,18 +239,24 @@ pub fn preflight_mac_admission(bundle: &Path) -> Result<(), String> {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err("更新租约不是普通文件".into());
             }
-            std::fs::OpenOptions::new().append(true).open(&lease)
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&lease)
                 .map_err(|error| error.to_string())?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let probe = parent.join(format!(".polaris-admission-preflight-{}-{}", std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let probe = parent.join(format!(
+        ".polaris-admission-preflight-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     #[allow(unused_mut)] // Only Unix provides DirBuilderExt::mode.
     let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
@@ -1134,7 +1140,10 @@ mod admission_preflight_regressions {
     use super::*;
     #[test]
     fn invalid_lease_rejects_before_exit_and_does_not_follow_symlink() {
-        let dir = std::env::temp_dir().join(format!("polaris-admission-preflight-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "polaris-admission-preflight-test-{}",
+            std::process::id()
+        ));
         std::fs::create_dir(&dir).unwrap();
         let target = dir.join("other");
         std::fs::write(&target, b"unchanged").unwrap();

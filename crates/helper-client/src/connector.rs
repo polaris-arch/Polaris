@@ -238,8 +238,14 @@ mod absolute_deadline_regressions {
             std::thread::sleep(Duration::from_millis(60));
             let _ = writer.write_all(b"\n");
         });
-        let mut conn = UnixConnStream { stream, read_timeout: Duration::from_millis(60) };
-        assert_eq!(conn.read_until_timeout(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let mut conn = UnixConnStream {
+            stream,
+            read_timeout: Duration::from_millis(60),
+        };
+        assert_eq!(
+            conn.read_until_timeout(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         producer.join().unwrap();
     }
 }

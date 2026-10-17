@@ -128,12 +128,29 @@ fn missing_custody_rejects_stop_without_requesting_it() {
     }
 }
 
-#[allow(unsafe_code, reason = "creates an isolated owned accept regression pipe")]
+#[allow(
+    unsafe_code,
+    reason = "creates an isolated owned accept regression pipe"
+)]
 fn waiting_test_pipe() -> OwnedHandle {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let name = wide_null(format!(r"\\.\pipe\polaris-stop-poll-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    let handle = unsafe { CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, std::ptr::null()) };
+    let name = wide_null(format!(
+        r"\\.\pipe\polaris-stop-poll-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let handle = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            4096,
+            4096,
+            0,
+            std::ptr::null(),
+        )
+    };
     assert_ne!(handle, INVALID_HANDLE_VALUE);
     unsafe { OwnedHandle::from_raw_handle(handle) }
 }
@@ -147,7 +164,10 @@ fn stop_requested_before_pipe_creation_needs_no_wakeup_client() {
 fn stop_after_first_empty_accept_poll_is_observed() {
     let pipe = waiting_test_pipe();
     let mut polls = 0;
-    assert!(!connect_pipe_until_stopped(pipe.as_raw_handle(), || { polls += 1; polls > 1 }));
+    assert!(!connect_pipe_until_stopped(pipe.as_raw_handle(), || {
+        polls += 1;
+        polls > 1
+    }));
     assert_eq!(polls, 2);
 }
 #[test]

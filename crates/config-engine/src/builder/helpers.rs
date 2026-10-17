@@ -450,7 +450,9 @@ pub fn custom_rule_selector_tag(id: &str) -> String {
     let escaped = id.replace('~', "~7e");
     let escaped = if let Some(rest) = escaped.strip_prefix("app-") {
         format!("~61pp-{rest}")
-    } else { escaped };
+    } else {
+        escaped
+    };
     format!("rule-sel-{escaped}")
 }
 

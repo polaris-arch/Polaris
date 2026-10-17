@@ -129,14 +129,21 @@ pub(crate) struct DeadlineStream {
 #[cfg(unix)]
 impl DeadlineStream {
     pub(crate) fn new(stream: std::os::unix::net::UnixStream, budget: std::time::Duration) -> Self {
-        Self { stream, deadline: std::time::Instant::now() + budget }
+        Self {
+            stream,
+            deadline: std::time::Instant::now() + budget,
+        }
     }
 }
 #[cfg(unix)]
 impl std::io::Read for DeadlineStream {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() { return Err(std::io::ErrorKind::TimedOut.into()); }
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
         self.stream.set_read_timeout(Some(remaining))?;
         let result = std::io::Read::read(&mut self.stream, bytes);
         if std::time::Instant::now() >= self.deadline {
@@ -147,8 +154,12 @@ impl std::io::Read for DeadlineStream {
 }
 #[cfg(unix)]
 impl Write for DeadlineStream {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.stream.write(bytes) }
-    fn flush(&mut self) -> std::io::Result<()> { self.stream.flush() }
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 #[cfg(test)]
@@ -157,13 +168,18 @@ mod tests;
 #[cfg(all(test, unix))]
 mod deadline_regressions {
     use super::*;
-    use std::{io::{BufReader, Write}, time::{Duration, Instant}};
+    use std::{
+        io::{BufReader, Write},
+        time::{Duration, Instant},
+    };
     #[test]
     fn drip_feed_cannot_restart_the_connection_budget() {
         let (read, mut write) = std::os::unix::net::UnixStream::pair().unwrap();
         let producer = std::thread::spawn(move || {
             for _ in 0..30 {
-                if write.write_all(b"x").is_err() { break; }
+                if write.write_all(b"x").is_err() {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         });

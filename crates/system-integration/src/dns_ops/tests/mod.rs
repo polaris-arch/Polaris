@@ -978,7 +978,8 @@ fn invisible_service_remains_owned_until_restore_succeeds() {
         dns_state: RefCell::new(BTreeMap::from([
             ("A".into(), vec!["10.0.0.1".into()]),
             ("B".into(), vec!["10.0.0.2".into()]),
-        ])), ..Default::default()
+        ])),
+        ..Default::default()
     });
     c.set_dns();
     c.ops.targets = vec!["B".into()];

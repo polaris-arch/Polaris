@@ -22,8 +22,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE,
-    INVALID_HANDLE_VALUE, NO_ERROR,
+    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
@@ -32,8 +32,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -279,18 +279,28 @@ fn create_pipe_instance(name_w: &[u16], sddl_w: &[u16], first: bool) -> std::io:
 #[allow(unsafe_code, reason = "owned synchronous pipe mode and accept polling")]
 fn connect_pipe_until_stopped(h: HANDLE, mut stopped: impl FnMut() -> bool) -> bool {
     let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;
-    if unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) } == 0 { return false; }
+    if unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
+        return false;
+    }
     loop {
-        if stopped() { return false; }
+        if stopped() {
+            return false;
+        }
         let available = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
         if available == 0 {
             let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             if error == ERROR_PIPE_CONNECTED {
-                if stopped() { return false; }
+                if stopped() {
+                    return false;
+                }
                 let blocking = PIPE_WAIT | PIPE_READMODE_BYTE;
-                return unsafe { SetNamedPipeHandleState(h, &blocking, std::ptr::null(), std::ptr::null()) } != 0;
+                return unsafe {
+                    SetNamedPipeHandleState(h, &blocking, std::ptr::null(), std::ptr::null())
+                } != 0;
             }
-            if error != ERROR_PIPE_LISTENING { return false; }
+            if error != ERROR_PIPE_LISTENING {
+                return false;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -362,7 +372,7 @@ where
         match helper.reap_child_on_exit() {
             Ok(()) => {
                 STOP_REQUESTED.store(true, Ordering::SeqCst);
-                }
+            }
             Err(error) => log::error!("uninstall exit unconfirmed; helper retained: {error}"),
         }
     }

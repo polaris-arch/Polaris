@@ -395,7 +395,11 @@ impl MeasurementLedger {
     pub(crate) fn evict(&self, context: &EvictContext<'_>) -> usize {
         let mut inner = self.lock();
         inner.skipped.retain(|id, _| context.nodes.contains(id));
-        let soft_cap = context.nodes.len().saturating_mul(SOFT_CAP_PER_NODE).min(HARD_CAP);
+        let soft_cap = context
+            .nodes
+            .len()
+            .saturating_mul(SOFT_CAP_PER_NODE)
+            .min(HARD_CAP);
         let excess = inner.entries.len().saturating_sub(soft_cap);
         let victims: Vec<ResultKey> = eviction_order(&inner.entries, context)
             .into_iter()
@@ -636,12 +640,17 @@ mod bounded_skip_regressions {
     #[test]
     fn skip_only_rounds_are_bounded_and_deleted_nodes_are_pruned() {
         let ledger = MeasurementLedger::new();
-        let skipped = (0..HARD_CAP * 2).map(|i| (format!("node-{i}"), "unsupported"))
+        let skipped = (0..HARD_CAP * 2)
+            .map(|i| (format!("node-{i}"), "unsupported"))
             .collect::<Vec<_>>();
         ledger.set_skipped(&[], &skipped);
         assert_eq!(ledger.lock().skipped.len(), HARD_CAP);
-        ledger.evict(&EvictContext { nodes: &BTreeSet::new(), url_digest: "u", now_ms: 0,
-            freshness_cap_ms: &|_, _| 0 });
+        ledger.evict(&EvictContext {
+            nodes: &BTreeSet::new(),
+            url_digest: "u",
+            now_ms: 0,
+            freshness_cap_ms: &|_, _| 0,
+        });
         assert!(ledger.lock().skipped.is_empty());
     }
 }

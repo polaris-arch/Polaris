@@ -428,7 +428,9 @@ fn collect_hosts_deep(obj: &Value, out: &mut Vec<String>) {
 fn collect_host_values(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::String(s) => out.push(s.clone()),
-        Value::Array(items) => out.extend(items.iter().filter_map(Value::as_str).map(str::to_owned)),
+        Value::Array(items) => {
+            out.extend(items.iter().filter_map(Value::as_str).map(str::to_owned))
+        }
         _ => {}
     }
 }

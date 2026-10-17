@@ -1746,7 +1746,9 @@ pub async fn update_install(
                 return Ok(match opened {
                     Ok(()) => ApiResponse::ok(json!({ "ok": true, "awaitingManualInstall": true,
                         "reason": format!("安装目录需要管理员权限，请从已打开的 DMG 手动安装: {error}") })),
-                    Err(open_error) => ApiResponse::err(format!("无法准备自动安装（{error}），打开 DMG 也失败: {open_error}")),
+                    Err(open_error) => ApiResponse::err(format!(
+                        "无法准备自动安装（{error}），打开 DMG 也失败: {open_error}"
+                    )),
                 });
             }
         }

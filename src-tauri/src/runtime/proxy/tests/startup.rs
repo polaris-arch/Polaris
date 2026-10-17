@@ -2062,10 +2062,20 @@ async fn sync_custom_rule_files_without_native_confirmation_never_writes_or_dele
     let cfg = smart_config_with_ext_rule();
     let expected = build_custom_rule_files(&cfg);
 
-    assert!(!rt.sync_custom_rule_files(&cfg, rt.gate.generation(), rt.selector_reconcile.intent_generation()).await);
+    assert!(
+        !rt.sync_custom_rule_files(
+            &cfg,
+            rt.gate.generation(),
+            rt.selector_reconcile.intent_generation()
+        )
+        .await
+    );
 
     for name in expected.keys() {
-        assert!(!crdir.join(name).exists(), "no confirmation capability must not publish bytes");
+        assert!(
+            !crdir.join(name).exists(),
+            "no confirmation capability must not publish bytes"
+        );
     }
     // 绝不删：本轮期望集外的既存文件仍在（删除只在起核 write_custom_rule_files 清扫）。
     assert!(

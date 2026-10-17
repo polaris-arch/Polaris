@@ -33,9 +33,18 @@ const MISC_MARKERS: [(&str, &str); 7] = [
     ),
     ("commands/misc/autostart.rs", "pub async fn auto_start_set"),
     ("commands/misc/backup.rs", "pub async fn backup_export"),
-    ("commands/misc/dashboard.rs", "pub async fn open_singbox_dashboard"),
-    ("commands/misc/ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),
-    ("commands/misc/logs.rs", "pub(crate) fn clear_log_stream_window"),
+    (
+        "commands/misc/dashboard.rs",
+        "pub async fn open_singbox_dashboard",
+    ),
+    (
+        "commands/misc/ipinfo.rs",
+        "pub(crate) fn ipinfo_probe_is_current",
+    ),
+    (
+        "commands/misc/logs.rs",
+        "pub(crate) fn clear_log_stream_window",
+    ),
     ("commands/misc/support.rs", "pub(super) fn node_platform"),
 ];
 

@@ -10,15 +10,27 @@ fn partial_rule_restore_rejects_shared_profile_collision() {
     }
     let mut empty_dns = backup.clone();
     empty_dns["dnsRules"] = serde_json::json!([]);
-    let skipped = merge_categories(&current, &empty_dns, &[BackupCategory::CustomRules, BackupCategory::DnsRules]);
+    let skipped = merge_categories(
+        &current,
+        &empty_dns,
+        &[BackupCategory::CustomRules, BackupCategory::DnsRules],
+    );
     assert_eq!(skipped.config, current);
     assert!(skipped.conflicts.iter().any(|c| c == "networkProfiles:p"));
     let mut empty_traffic = backup.clone();
     empty_traffic["trafficRules"] = serde_json::json!([]);
-    let skipped = merge_categories(&current, &empty_traffic, &[BackupCategory::CustomRules, BackupCategory::DnsRules]);
+    let skipped = merge_categories(
+        &current,
+        &empty_traffic,
+        &[BackupCategory::CustomRules, BackupCategory::DnsRules],
+    );
     assert_eq!(skipped.config, current);
     assert!(skipped.conflicts.iter().any(|c| c == "networkProfiles:p"));
-    let both = merge_categories(&current, &backup, &[BackupCategory::CustomRules, BackupCategory::DnsRules]);
+    let both = merge_categories(
+        &current,
+        &backup,
+        &[BackupCategory::CustomRules, BackupCategory::DnsRules],
+    );
     assert!(both.conflicts.is_empty());
     assert_eq!(both.config["networkProfiles"][0]["name"], "backup");
 }

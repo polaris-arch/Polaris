@@ -101,7 +101,8 @@ struct MockService {
 #[tonic::async_trait]
 impl StartedService for MockService {
     async fn get_rule_set_status(
-        &self, req: Request<daemon::RuleSetStatusRequest>,
+        &self,
+        req: Request<daemon::RuleSetStatusRequest>,
     ) -> Result<Response<daemon::RuleSetStatusResponse>, Status> {
         check_auth(&req, &self.secret)?;
         if req.get_ref().tags != ["audit-rule"] {
@@ -1809,7 +1810,10 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
         .unwrap();
     let encoded = prost::Message::encoded_len(&first);
     assert!(encoded > 4 * 1024 * 1024 && encoded < 64 * 1024 * 1024);
-    let snapshot = client.first_connection_snapshot().await.expect("bounded large snapshot");
+    let snapshot = client
+        .first_connection_snapshot()
+        .await
+        .expect("bounded large snapshot");
     assert_eq!(snapshot.len(), 6000);
 }
 
@@ -1818,10 +1822,21 @@ async fn rule_set_status_preserves_auth_and_requested_tags() {
     let (addr, _state, _handle) = spawn_server(SECRET, 0).await;
     let endpoint = Endpoint::new("127.0.0.1", addr.port());
     let client = SingBoxApiClient::connect(endpoint, SECRET).await.unwrap();
-    let response = client.get_rule_set_status(vec!["audit-rule".into()]).await.unwrap();
+    let response = client
+        .get_rule_set_status(vec!["audit-rule".into()])
+        .await
+        .unwrap();
     assert_eq!(response.instance_started_at_unix_nano, 42);
     assert!(response.rule_sets.is_empty());
-    assert!(client.get_rule_set_status(vec!["wrong-tag".into()]).await.is_err());
-    let bad = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), "wrong-secret").await.unwrap();
-    assert!(bad.get_rule_set_status(vec!["audit-rule".into()]).await.is_err());
+    assert!(client
+        .get_rule_set_status(vec!["wrong-tag".into()])
+        .await
+        .is_err());
+    let bad = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), "wrong-secret")
+        .await
+        .unwrap();
+    assert!(bad
+        .get_rule_set_status(vec!["audit-rule".into()])
+        .await
+        .is_err());
 }

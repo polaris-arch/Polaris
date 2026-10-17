@@ -390,7 +390,12 @@ impl MeshRuntime {
             );
         }
         #[cfg(windows)]
-        { return crate::runtime::windows_directory::actual_directory(&self.config_dir, server_id); }
+        {
+            return crate::runtime::windows_directory::actual_directory(
+                &self.config_dir,
+                server_id,
+            );
+        }
         #[cfg(not(any(target_os = "ios", windows)))]
         tailscale_state_dir(&self.config_dir, server_id).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
@@ -419,8 +424,15 @@ impl MeshRuntime {
                     .any(|name| name != ".polaris-directory-incarnation")
             });
             #[cfg(windows)]
-            let exists = self.tailscale_state_dir(id).ok().and_then(|path| fs.read_dir_names(&path))
-                .is_some_and(|names| names.iter().any(|name| name != ".polaris-directory-incarnation"));
+            let exists = self
+                .tailscale_state_dir(id)
+                .ok()
+                .and_then(|path| fs.read_dir_names(&path))
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name != ".polaris-directory-incarnation")
+                });
             #[cfg(not(any(target_os = "ios", windows)))]
             let exists = state_exists(&fs, &self.config_dir, id);
             out.insert(id.clone(), exists);
@@ -436,7 +448,10 @@ impl MeshRuntime {
         main_alive: bool,
     ) -> std::io::Result<()> {
         if cfg!(any(target_os = "ios", windows)) {
-            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "CleanupUnknown: whole-directory deletion requires bound intent and custody"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "CleanupUnknown: whole-directory deletion requires bound intent and custody",
+            ));
         }
         if self.login_registry.state_in_use(server_id, main_alive) {
             return Err(std::io::Error::new(
@@ -521,7 +536,8 @@ impl MeshRuntime {
         #[cfg(unix)]
         let directory = _directory_lease.directory_path();
         #[cfg(windows)]
-        let _windows_auth_lease = crate::runtime::windows_directory::auth_lease(&self.config_dir, server_id)?;
+        let _windows_auth_lease =
+            crate::runtime::windows_directory::auth_lease(&self.config_dir, server_id)?;
         #[cfg(not(unix))]
         let directory = self.tailscale_state_dir(server_id)?;
         #[cfg(any(target_os = "ios", target_os = "android", test))]
@@ -783,8 +799,12 @@ impl MeshRuntime {
         let text =
             serde_json::to_string(queue).map_err(|e| format!("warp 待注销队列序列化失败: {e}"))?;
         polaris_store::fs::durable_atomic_write(
-            &self.warp_queue_path, &text, &polaris_store::fs::random_tmp_suffix(),
-        ).map(|_| ()).map_err(|error| format!("warp 待注销队列持久写入失败: {error}"))
+            &self.warp_queue_path,
+            &text,
+            &polaris_store::fs::random_tmp_suffix(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("warp 待注销队列持久写入失败: {error}"))
     }
 
     /// WARP 节点删除时把远端自删凭据入待注销队列（防孤儿设备计费）。上游 `enqueuePendingDeregister`。

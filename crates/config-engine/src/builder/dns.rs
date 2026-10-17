@@ -1765,7 +1765,10 @@ pub fn build_dns_config(
 
     if crate::builder::network_env::default_dns_uses_netenv(config) {
         if let Some(reason) = deps.probe_facts(config).dhcp_unavailable() {
-            deps.log_warn(&format!("DNS_DEFAULT_POLICY_UNAVAILABLE:{}", reason.report_code()));
+            deps.log_warn(&format!(
+                "DNS_DEFAULT_POLICY_UNAVAILABLE:{}",
+                reason.report_code()
+            ));
         }
     }
 

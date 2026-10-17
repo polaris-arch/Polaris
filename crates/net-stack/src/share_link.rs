@@ -1735,10 +1735,16 @@ fn encode_shadowsocks(c: &ServerConfig) -> Result<String, String> {
         }
         q.push("shadow-tls-password", st.password.clone());
         q.push("shadow-tls-sni", st.sni.clone());
-        q.push_opt("shadow-tls-fp", polaris_config_engine::user_config::utls::share_fingerprint(
-            st.utls_mode, st.fingerprint.as_deref(),
-        ));
-        if let Some(port) = st.port { q.push("shadow-tls-port", port.to_string()); }
+        q.push_opt(
+            "shadow-tls-fp",
+            polaris_config_engine::user_config::utls::share_fingerprint(
+                st.utls_mode,
+                st.fingerprint.as_deref(),
+            ),
+        );
+        if let Some(port) = st.port {
+            q.push("shadow-tls-port", port.to_string());
+        }
     }
     Ok(assemble(
         "ss",

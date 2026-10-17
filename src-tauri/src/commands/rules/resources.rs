@@ -867,11 +867,21 @@ pub async fn rule_resources_download(
             mode: ProgressMode::Live,
         };
         let expected = resource_record(&initial, &plan.id).cloned();
-        let outcome = download_registered_resource(
-            &sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir,
-            |resource, staged| {
-                match state.config().update(|config| {
-                    match commit_download_resource(config, expected.as_ref(), resource, staged, &res_dir) {
+        let outcome =
+            download_registered_resource(
+                &sink,
+                http.as_ref(),
+                &SystemDnsLookup,
+                &plan,
+                &res_dir,
+                |resource, staged| match state.config().update(|config| {
+                    match commit_download_resource(
+                        config,
+                        expected.as_ref(),
+                        resource,
+                        staged,
+                        &res_dir,
+                    ) {
                         Ok(()) => Decision::Write(Ok(())),
                         Err(error) => Decision::Skip(Err(error)),
                     }
@@ -883,9 +893,9 @@ pub async fn rule_resources_download(
                     Ok((Err(error), _)) => Err(error),
                     Ok(_) => Err("资源提交未写入".into()),
                     Err(error) => Err(format!("保存资源配置失败: {error}")),
-                }
-            },
-        ).await;
+                },
+            )
+            .await;
         results.push(outcome.into_value(&plan));
     }
     Ok(ApiResponse::ok(results))
@@ -1275,7 +1285,10 @@ async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
 }
 
 fn resource_record<'a>(config: &'a Value, id: &str) -> Option<&'a Value> {
-    config.get("ruleResources")?.as_array()?.iter()
+    config
+        .get("ruleResources")?
+        .as_array()?
+        .iter()
         .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
 }
 
@@ -1292,7 +1305,11 @@ fn commit_download_resource(
         return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
     }
     let object = config.as_object_mut().ok_or("配置不是对象")?;
-    if !object.entry("ruleResources").or_insert_with(|| json!([])).is_array() {
+    if !object
+        .entry("ruleResources")
+        .or_insert_with(|| json!([]))
+        .is_array()
+    {
         return Err("规则资源列表无效".into());
     }
     std::fs::rename(staged, res_dir.join(&downloaded.file_name))
@@ -2302,28 +2319,45 @@ mod download_identity_regressions {
     use super::*;
     #[test]
     fn deleted_and_edited_records_reject_stale_staged_bytes() {
-        let dir = std::env::temp_dir().join(format!("polaris-resource-identity-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("polaris-resource-identity-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let staged = dir.join("stage");
-        let downloaded = RuleResource { id: "A".into(), name: "A".into(), category: "geoip".into(),
-            source_url: "https://example.invalid/new".into(), file_name: "A.srs".into(),
-            format: RuleResourceFormat::Binary, size: 3, downloaded_at: "new".into() };
+        let downloaded = RuleResource {
+            id: "A".into(),
+            name: "A".into(),
+            category: "geoip".into(),
+            source_url: "https://example.invalid/new".into(),
+            file_name: "A.srs".into(),
+            format: RuleResourceFormat::Binary,
+            size: 3,
+            downloaded_at: "new".into(),
+        };
         let mut original = downloaded.clone();
         original.source_url = "https://example.invalid/old".into();
         let expected = serde_json::to_value(&original).unwrap();
         let mut config = json!({ "ruleResources": [] });
         std::fs::write(&staged, b"new").unwrap();
-        assert!(commit_download_resource(&mut config, Some(&expected), &downloaded, &staged, &dir).is_err());
+        assert!(
+            commit_download_resource(&mut config, Some(&expected), &downloaded, &staged, &dir)
+                .is_err()
+        );
         assert!(config["ruleResources"].as_array().unwrap().is_empty());
         assert!(staged.exists());
         config["ruleResources"] = json!([downloaded]);
-        assert!(commit_download_resource(&mut config, Some(&expected), &downloaded, &staged, &dir).is_err());
+        assert!(
+            commit_download_resource(&mut config, Some(&expected), &downloaded, &staged, &dir)
+                .is_err()
+        );
         assert!(staged.exists());
         assert!(commit_download_resource(&mut config, None, &downloaded, &staged, &dir).is_err());
         config["ruleResources"] = json!([]);
         commit_download_resource(&mut config, None, &downloaded, &staged, &dir).unwrap();
         assert_eq!(std::fs::read(dir.join("A.srs")).unwrap(), b"new");
-        assert_eq!(config["ruleResources"][0]["sourceUrl"], downloaded.source_url);
+        assert_eq!(
+            config["ruleResources"][0]["sourceUrl"],
+            downloaded.source_url
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

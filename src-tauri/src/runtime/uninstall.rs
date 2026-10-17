@@ -784,8 +784,10 @@ impl<H: HelperUninstallOps, A: AutostartOps> UninstallOps for SystemUninstallOps
     fn disable_autostart(&self) -> StepOutcome {
         match self.autostart.is_enabled() {
             Ok(false) => return StepOutcome::skipped("未开启开机自启，无需注销"),
-            Ok(true) => {},
-            Err(error) => return StepOutcome::failed(format!("无法确认开机自启状态，卸载已中止: {error}")),
+            Ok(true) => {}
+            Err(error) => {
+                return StepOutcome::failed(format!("无法确认开机自启状态，卸载已中止: {error}"))
+            }
         }
         match self.autostart.disable() {
             Ok(()) => StepOutcome::done("已注销开机自启登录项"),

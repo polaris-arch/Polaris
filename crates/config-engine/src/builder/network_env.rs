@@ -578,7 +578,9 @@ pub fn dns_rule_uses_netenv(rule: &Rule, config: &UserConfig) -> bool {
 /// Default policy participates in the same dependency traversal as explicit rules.
 pub fn default_dns_uses_netenv(config: &UserConfig) -> bool {
     config.config_schema_version.unwrap_or(0) >= 2
-        && config.dns_defaults.as_ref()
+        && config
+            .dns_defaults
+            .as_ref()
             .and_then(|defaults| defaults.unmatched_action.as_ref())
             .is_some_and(|action| action_refs_server(action, None, config, BUILTIN_NETENV_DHCP_ID))
 }
@@ -596,9 +598,10 @@ pub fn netenv_required(config: &UserConfig, facts: &ProbeFacts) -> bool {
         .filter(|r| dns_rule_is_candidate(r))
         .collect();
     let by_action = facts.dhcp_unavailable().is_none()
-        && (default_dns_uses_netenv(config) || dns_rules
-            .iter()
-            .any(|rule| dns_rule_uses_netenv(rule, config)));
+        && (default_dns_uses_netenv(config)
+            || dns_rules
+                .iter()
+                .any(|rule| dns_rule_uses_netenv(rule, config)));
     if by_action {
         return true;
     }

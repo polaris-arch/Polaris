@@ -208,7 +208,9 @@ impl ProxyRuntime {
             added,
             modified,
             removed,
-            restart_deferred: non_node_pending || selected_pending || self.has_uncommitted_rule_content(),
+            restart_deferred: non_node_pending
+                || selected_pending
+                || self.has_uncommitted_rule_content(),
         }
     }
 
@@ -386,12 +388,23 @@ impl ProxyRuntime {
                     }
                     #[cfg(windows)]
                     {
-                        if self.mesh.directory_in_use(&intent.server_id, self.tailscale_writer_alive()) {
+                        if self
+                            .mesh
+                            .directory_in_use(&intent.server_id, self.tailscale_writer_alive())
+                        {
                             return Err("CleanupUnknown: directory is still in use".into());
                         }
-                        let mut lease = crate::runtime::windows_directory::DirectoryLease::acquire_intent(&config_dir, intent)
-                            .map_err(|error| format!("CleanupUnknown: directory custody retained: {error}"))?;
-                        lease.commit(intent, current).map_err(|error| format!("CleanupUnknown: directory commit retained: {error}"))?;
+                        let mut lease =
+                            crate::runtime::windows_directory::DirectoryLease::acquire_intent(
+                                &config_dir,
+                                intent,
+                            )
+                            .map_err(|error| {
+                                format!("CleanupUnknown: directory custody retained: {error}")
+                            })?;
+                        lease.commit(intent, current).map_err(|error| {
+                            format!("CleanupUnknown: directory commit retained: {error}")
+                        })?;
                         directory_leases.push(lease);
                         Ok(())
                     }

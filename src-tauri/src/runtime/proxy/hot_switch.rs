@@ -1417,29 +1417,52 @@ impl ProxyRuntime {
         }
 
         if self.gate.generation() != switch_generation
-            || self.selector_reconcile.intent_generation() != intent_generation { return SwitchOutcome::Pending; }
+            || self.selector_reconcile.intent_generation() != intent_generation
+        {
+            return SwitchOutcome::Pending;
+        }
         // Repair prior side effects to R, including save-only and equal projections.
         // Never let an expired owner restore bytes over a newer owner.
         if self.core_running() && self.has_uncommitted_rule_content() {
-            let applied = self.current_config.read().ok().and_then(|v| v.clone())
+            let applied = self
+                .current_config
+                .read()
+                .ok()
+                .and_then(|v| v.clone())
                 .and_then(|v| serde_json::from_value::<UserConfig>(v).ok());
             let repaired = if let Some(applied) = applied {
-                self.sync_custom_rule_files(&applied, switch_generation, intent_generation).await
-            } else { false };
+                self.sync_custom_rule_files(&applied, switch_generation, intent_generation)
+                    .await
+            } else {
+                false
+            };
             if !self.selector_operation_is_current(switch_generation, intent_generation) {
-                self.push_pending_changes(); return SwitchOutcome::Pending;
+                self.push_pending_changes();
+                return SwitchOutcome::Pending;
             }
             if !repaired {
                 self.set_nonfatal_error("规则内容尚未确认，保留待应用状态", code::EXIT_MISMATCH);
                 self.push_pending_changes();
-                if defer_restart { return SwitchOutcome::Deferred; }
+                if defer_restart {
+                    return SwitchOutcome::Deferred;
+                }
                 if scope == SwitchApplyScope::SelectedOnly {
-                    if !self.with_selected_projection_claim(&new_config, switch_generation, intent_generation, || {}) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(&new_config, switch_generation, intent_generation);
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
                 }
-                self.apply_restart(); return SwitchOutcome::Restarting;
+                self.apply_restart();
+                return SwitchOutcome::Restarting;
             }
         }
 
@@ -1508,12 +1531,18 @@ impl ProxyRuntime {
 
         // ── 腿 3：三腿分发（决策全在 switch-engine，本处只执行）──
         if defer_restart {
-            let rules_changed = self.current_config.read().ok().and_then(|v| v.clone())
+            let rules_changed = self
+                .current_config
+                .read()
+                .ok()
+                .and_then(|v| v.clone())
                 .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
-                .map(|v| build_custom_rule_files(&v) != build_custom_rule_files(&new_cfg)).unwrap_or(true);
+                .map(|v| build_custom_rule_files(&v) != build_custom_rule_files(&new_cfg))
+                .unwrap_or(true);
             if rules_changed {
                 self.restart_deferred.store(true, Ordering::SeqCst);
-                self.push_pending_changes(); return SwitchOutcome::Deferred;
+                self.push_pending_changes();
+                return SwitchOutcome::Deferred;
             }
         }
 
@@ -1523,16 +1552,30 @@ impl ProxyRuntime {
                 && (defer_restart || scope == SwitchApplyScope::SelectedOnly));
         if applies_without_restart {
             let accepted = !self.custom_rule_files_degraded()
-                && self.sync_custom_rule_files(&new_cfg, switch_generation, intent_generation).await;
-            if !self.selector_operation_is_current(switch_generation, intent_generation) { return SwitchOutcome::Pending; }
+                && self
+                    .sync_custom_rule_files(&new_cfg, switch_generation, intent_generation)
+                    .await;
+            if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                return SwitchOutcome::Pending;
+            }
             if !accepted {
                 if scope == SwitchApplyScope::SelectedOnly {
-                    if !self.with_selected_projection_claim(&new_config, switch_generation, intent_generation, || {}) {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(&new_config, switch_generation, intent_generation);
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
                 }
-                self.apply_restart(); return SwitchOutcome::Restarting;
+                self.apply_restart();
+                return SwitchOutcome::Restarting;
             }
         }
 
@@ -1832,7 +1875,10 @@ impl ProxyRuntime {
                         self.mesh
                             .exit_route_reconcile(&new_cfg, new_cfg.enable_ipv6.unwrap_or(false))
                             .await;
-                        if let Some(error) = disconnect.as_ref().and_then(|d| d.snapshot_error.as_deref()) {
+                        if let Some(error) = disconnect
+                            .as_ref()
+                            .and_then(|d| d.snapshot_error.as_deref())
+                        {
                             log::warn!("热切换完成，但精准断连快照失败：{error}");
                         }
                         log::info!(
@@ -2641,7 +2687,8 @@ impl ProxyRuntime {
             };
             // reassert 内部 panic 时展开会跳过这一行 —— 那是对的：守卫已把续延跑掉（`.finally()` 语义），
             // 而自证是**观测**，观测不到就该沉默，不该在展开路径上再造一条半截结论。
-            me.attest_runtime_selector(&outcome, my_gen, intent_generation).await;
+            me.attest_runtime_selector(&outcome, my_gen, intent_generation)
+                .await;
         });
     }
 
@@ -2727,7 +2774,10 @@ impl ProxyRuntime {
         let outcome = self
             .reassert_selector_selection_locked(&config, my_gen, intent_generation, switch_guard)
             .await;
-        if matches!(outcome.stage1, Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector) {
+        if matches!(
+            outcome.stage1,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector
+        ) {
             self.selector_reconcile.clear_required();
         } else if !matches!(outcome.stage1, Stage1Outcome::Abandoned) {
             let attestation = attest_runtime_selection(&outcome, None);
@@ -3041,14 +3091,21 @@ impl ProxyRuntime {
         // 只有「PUT 成功」这一支需要读回来对账：另外三支的结论不依赖运行期值（放弃腿本身就是结论，
         // 主动退场则不出结论），此时再去连一次管理 API 纯属多余。
         let groups = match outcome.stage1 {
-            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector => self.read_selector_groups().await,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector => {
+                self.read_selector_groups().await
+            }
             _ => None,
         };
-        if !self.selector_operation_is_current(my_gen, intent_generation) { return; }
+        if !self.selector_operation_is_current(my_gen, intent_generation) {
+            return;
+        }
         if matches!(outcome.stage1, Stage1Outcome::Abandoned) {
             return;
         }
-        if matches!(outcome.stage1, Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector) {
+        if matches!(
+            outcome.stage1,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector
+        ) {
             let complete = groups.as_deref().is_some_and(|groups| {
                 (matches!(outcome.stage1, Stage1Outcome::NoGlobalSelector)
                     || groups.iter().any(|g| g.tag == PROXY_SELECTOR_TAG))
@@ -3063,15 +3120,19 @@ impl ProxyRuntime {
             }
         }
         self.selector_reconcile.with_intent_claim(|current_intent| {
-            if current_intent != intent_generation { return; }
-            let _publication = self.gate.lock_generation_publication();
-            if !self.selector_operation_is_current(my_gen, intent_generation) { return; }
-        match attest_runtime_selection(outcome, groups.as_deref()) {
-            SelectorAttestation::Match => {
-                log::info!("运行期出口自证通过：selector 实际选择 == 校正意图");
+            if current_intent != intent_generation {
+                return;
             }
-            other => self.set_nonfatal_error(&other.user_message(), code::EXIT_MISMATCH),
-        }
+            let _publication = self.gate.lock_generation_publication();
+            if !self.selector_operation_is_current(my_gen, intent_generation) {
+                return;
+            }
+            match attest_runtime_selection(outcome, groups.as_deref()) {
+                SelectorAttestation::Match => {
+                    log::info!("运行期出口自证通过：selector 实际选择 == 校正意图");
+                }
+                other => self.set_nonfatal_error(&other.user_message(), code::EXIT_MISMATCH),
+            }
         });
     }
 
@@ -3084,11 +3145,16 @@ impl ProxyRuntime {
     async fn read_selector_groups(&self) -> Option<Vec<GroupSelection>> {
         #[cfg(test)]
         {
-            let sink = self.management_api_stub.lock().ok().and_then(|g| g.as_ref().map(Arc::clone));
+            let sink = self
+                .management_api_stub
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(Arc::clone));
             if let Some(sink) = sink {
                 let pause = sink.groups_pause.lock().unwrap().take();
                 if let Some((entered, release)) = pause {
-                    entered.notify_one(); release.notified().await;
+                    entered.notify_one();
+                    release.notified().await;
                 }
                 return sink.groups();
             }

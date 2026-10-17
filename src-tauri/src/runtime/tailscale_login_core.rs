@@ -3362,7 +3362,8 @@ impl LoginCoreRegistry {
                 crate::runtime::tailscale_directory::DirectoryLease::actual_directory(root, &id)
                     .map_err(|error| error.to_string())?;
             #[cfg(windows)]
-            let actual = crate::runtime::windows_directory::actual_directory(root, &id).map_err(|error| error.to_string())?;
+            let actual = crate::runtime::windows_directory::actual_directory(root, &id)
+                .map_err(|error| error.to_string())?;
             #[cfg(not(any(target_os = "ios", windows)))]
             let actual = path.to_path_buf();
             if directories.insert(id.clone(), actual).is_some() {
@@ -4706,7 +4707,9 @@ impl LoginCoreRegistry {
         #[allow(unused_mut)]
         let mut json_cfg = login_config_to_json(&cfg);
         #[cfg(windows)]
-        if crate::runtime::windows_directory::bind_configuration_json(&mut json_cfg, user_data).is_err() {
+        if crate::runtime::windows_directory::bind_configuration_json(&mut json_cfg, user_data)
+            .is_err()
+        {
             return StartLoginOutcome::Failed("configWriteFailed".into());
         }
         let config_path = login_config_path(user_data, &server.id, epoch);

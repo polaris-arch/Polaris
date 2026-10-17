@@ -680,7 +680,8 @@ fn write_private_temp_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err("测速配置父目录不能是重定向".into());
     }
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
@@ -691,7 +692,8 @@ fn write_private_temp_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // Store's shared helper owns the fixed twelve-hex temporary-name contract.
     let suffix = polaris_store::fs::random_tmp_suffix();
     polaris_store::fs::durable_atomic_write(path, text, &suffix)
-        .map(|_| ()).map_err(|error| error.to_string())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// 诊断档（`debug` / `trace`）下**留档**的临时核配置文件名（见 [`retire_temp_config`]）。
@@ -932,9 +934,10 @@ impl TempProducerView {
             }
         }
         for birth in &births {
-            if !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()) && !current
-                .as_ref()
-                .is_some_and(|owner| Arc::ptr_eq(owner, birth))
+            if !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some())
+                && !current
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, birth))
                 && !retired.iter().any(|owner| Arc::ptr_eq(owner, birth))
             {
                 return Err("original Temp birth responsibility disappeared".into());
@@ -1006,20 +1009,33 @@ impl PcTempCoreCustody {
     /// Prune only proven terminal ownership; existing census snapshots retain Arcs.
     /// Unknown legacy/cancelled factories are quarantined without arbitrary eviction.
     fn prune_terminal(&self) -> Result<(), String> {
-        self.producers.lock().map_err(|_| "Temp producer custody poisoned")?.retain(|producer| {
-            let Ok(birth) = producer.birth.lock() else { return true; };
-            match birth.as_ref() {
-                // Cancellation ends original dispatch, not native custody. retire()
-                // alone publishes retired after exact terminal/no-child validation.
-                // Never set finished to conceal an abandoned factory.
-                Some(birth) => !((producer.finished.load(Ordering::SeqCst)
-                    || producer.cancelled.load(Ordering::SeqCst))
-                    && birth.retired.load(Ordering::SeqCst) && birth.native.is_some()),
-                None => !((producer.finished.load(Ordering::SeqCst) || producer.cancelled.load(Ordering::SeqCst))
-                    && !producer.factory_started.load(Ordering::SeqCst)),
-            }
-        });
-        self.retired_births.lock().map_err(|_| "Temp legacy tail custody poisoned")?
+        self.producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .retain(|producer| {
+                let Ok(birth) = producer.birth.lock() else {
+                    return true;
+                };
+                match birth.as_ref() {
+                    // Cancellation ends original dispatch, not native custody. retire()
+                    // alone publishes retired after exact terminal/no-child validation.
+                    // Never set finished to conceal an abandoned factory.
+                    Some(birth) => {
+                        !((producer.finished.load(Ordering::SeqCst)
+                            || producer.cancelled.load(Ordering::SeqCst))
+                            && birth.retired.load(Ordering::SeqCst)
+                            && birth.native.is_some())
+                    }
+                    None => {
+                        !((producer.finished.load(Ordering::SeqCst)
+                            || producer.cancelled.load(Ordering::SeqCst))
+                            && !producer.factory_started.load(Ordering::SeqCst))
+                    }
+                }
+            });
+        self.retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?
             .retain(|birth| !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()));
         Ok(())
     }
@@ -3450,10 +3466,11 @@ mod tests;
 #[cfg(all(test, unix, not(target_os = "android")))]
 mod private_temp_config_regressions {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     #[test]
     fn private_publication_replaces_links_without_touching_their_targets() {
-        let dir = std::env::temp_dir().join(format!("polaris-private-speedtest-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("polaris-private-speedtest-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join(TEMP_CORE_CONFIG_NAME);
         let target = dir.join("outside");
@@ -3462,7 +3479,10 @@ mod private_temp_config_regressions {
         write_private_temp_config(&path, b"synthetic credential").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         std::fs::remove_file(&path).unwrap();
         std::fs::hard_link(&target, &path).unwrap();
         write_private_temp_config(&path, b"second synthetic credential").unwrap();
@@ -3495,19 +3515,29 @@ mod temp_config_writer_regressions {
     #[test]
     fn private_writer_obeys_store_suffix_contract_on_create_and_replace() {
         let dir = std::env::temp_dir().join(format!(
-            "polaris-speedtest-writer-contract-{}", polaris_store::fs::random_tmp_suffix(),
+            "polaris-speedtest-writer-contract-{}",
+            polaris_store::fs::random_tmp_suffix(),
         ));
         std::fs::create_dir(&dir).unwrap();
         let config = dir.join(TEMP_CORE_CONFIG_NAME);
         // Run the actual production helper and durable writer, including tmp_path's
         // debug assertion. A made-up PID/counter suffix fails here in debug tests.
-        for value in [b"first".as_slice(), b"replacement".as_slice(), b"final".as_slice()] {
+        for value in [
+            b"first".as_slice(),
+            b"replacement".as_slice(),
+            b"final".as_slice(),
+        ] {
             write_private_temp_config(&config, value).unwrap();
             assert_eq!(std::fs::read(&config).unwrap(), value);
-            let entries = std::fs::read_dir(&dir).unwrap()
-                .map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
-            assert_eq!(entries, vec![std::ffi::OsString::from(TEMP_CORE_CONFIG_NAME)],
-                "each successful publication must consume its exclusive stage");
+            let entries = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries,
+                vec![std::ffi::OsString::from(TEMP_CORE_CONFIG_NAME)],
+                "each successful publication must consume its exclusive stage"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

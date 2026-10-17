@@ -156,7 +156,10 @@ pub fn select_connections_to_close(
             closed_ids.push(c.id.clone());
         }
     }
-    PrecisionDisconnectOutcome { closed_ids, snapshot_error: None }
+    PrecisionDisconnectOutcome {
+        closed_ids,
+        snapshot_error: None,
+    }
 }
 
 #[cfg(test)]

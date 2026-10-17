@@ -689,7 +689,9 @@ pub fn merge_categories(
     if custom_applied || dns_applied {
         let mut conflicts = BTreeSet::new();
         for key in ["customRuleSets", "ruleResources", "networkProfiles"] {
-            if key == "networkProfiles" && custom_applied && dns_applied { continue; }
+            if key == "networkProfiles" && custom_applied && dns_applied {
+                continue;
+            }
             if custom_applied && dns_applied {
                 // 两个平面都真正替换时，沿用完整恢复的整表替换语义。
                 set(&mut result, key, arr_or_empty(backup, key));

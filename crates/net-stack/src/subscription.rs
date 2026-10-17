@@ -1368,11 +1368,16 @@ pub fn dedupe_by_fingerprint(servers: Vec<ServerConfig>) -> Vec<ServerConfig> {
         projection.id.clear();
         projection.name.clear();
         projection.subscription_id = None;
-        let generation = polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
+        let generation =
+            polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
         // Tailscale source identity owns persistent state and must not merge across providers.
-        let key = if s.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale {
+        let key = if s.protocol
+            == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+        {
             serde_json::to_string(&(server_fingerprint(&s), generation)).expect("string tuple")
-        } else { generation };
+        } else {
+            generation
+        };
         if seen.insert(key) {
             out.push(s);
         }

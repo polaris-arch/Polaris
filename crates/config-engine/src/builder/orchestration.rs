@@ -245,7 +245,8 @@ pub fn config_generation_norm(
                         for key in ["remarks", "targetServerId", "values", "conditions", "type"] {
                             object.remove(key);
                         }
-                        if let Some(route) = object.get_mut("effects")
+                        if let Some(route) = object
+                            .get_mut("effects")
                             .and_then(serde_json::Value::as_object_mut)
                             .and_then(|effects| effects.get_mut("route"))
                             .and_then(serde_json::Value::as_object_mut)

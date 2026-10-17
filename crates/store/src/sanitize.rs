@@ -959,7 +959,9 @@ mod tests;
 pub(crate) fn validate_collection_shapes(value: &Value) -> Result<(), crate::StoreError> {
     for key in ["servers", "subscriptions"] {
         if value.get(key).is_some_and(|v| !v.is_array()) {
-            return Err(crate::StoreError::validation(format!("{key} must be an array")));
+            return Err(crate::StoreError::validation(format!(
+                "{key} must be an array"
+            )));
         }
     }
     Ok(())

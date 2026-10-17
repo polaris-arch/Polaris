@@ -577,7 +577,7 @@ impl ProxyRuntime {
                 Decision::Write(true)
             });
             match rollback {
-                Ok((true, _)) => {},
+                Ok((true, _)) => {}
                 Ok((false, _)) => {
                     self.selector_reconcile.mark_required();
                     return AutoHotSwitchOutcome::Superseded;

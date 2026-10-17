@@ -107,10 +107,18 @@ fn load_malformed_collection_is_rejected_and_preserves_disk() {
     assert!(!res.was_missing);
     assert!(matches!(res.error, Some(StoreError::Validation(_))));
     assert!(!res.migration_delta.changed);
-    let recovery = fs.operations().into_iter().find_map(|op| match op {
-        FsOp::Copy(from, to) if from == Path::new(CFG) && to.to_string_lossy().contains("corrupt-") => Some(to),
-        _ => None,
-    }).expect("malformed collection must have a recovery copy");
+    let recovery = fs
+        .operations()
+        .into_iter()
+        .find_map(|op| match op {
+            FsOp::Copy(from, to)
+                if from == Path::new(CFG) && to.to_string_lossy().contains("corrupt-") =>
+            {
+                Some(to)
+            }
+            _ => None,
+        })
+        .expect("malformed collection must have a recovery copy");
     assert_eq!(fs.snapshot(&recovery).as_deref(), Some(original));
     // 磁盘原文件原样保留（load 不落盘；迁移落盘由调用方 best-effort 决定）
     assert_eq!(fs.snapshot(Path::new(CFG)).as_deref(), Some(original));

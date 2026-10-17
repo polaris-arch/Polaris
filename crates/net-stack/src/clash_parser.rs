@@ -1001,7 +1001,9 @@ fn apply_ss_plugin(
                 port: None,
             };
             if let Some(value) = plugin_opts.get("port") {
-                let Some(port) = port(value) else { return false; };
+                let Some(port) = port(value) else {
+                    return false;
+                };
                 st.port = Some(port);
             }
             config.shadow_tls_settings = Some(st);
