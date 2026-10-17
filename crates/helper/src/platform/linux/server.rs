@@ -1281,9 +1281,8 @@ impl ConnServer {
 
         // 1. 先取 SO_PEERCRED（转 std 后原流被消费，无法再取）。失败 → 捕获 None → handle 回 ERR peercred。
         let cred = TokioPeerCred::new(&stream).peer_cred();
-        // 2. 转 std 阻塞流 + 5s 读超时。Go SetReadDeadline 是**连接级绝对**期限，std set_read_timeout 是
-        //    **每次读** SO_RCVTIMEO —— 行数上界固定（start ≤6 行），DESIGN-REVIEW(read-deadline-per-read)，
-        //    且 socket 已受授权 uid 门限，差异可控。
+        // 2. Convert to blocking input with one absolute budget for the request.
+        // DeadlineStream tightens each read, including all pre-authentication input.
         let std_stream = match stream.into_std() {
             Ok(s) => s,
             Err(_) => return,
@@ -1291,7 +1290,9 @@ impl ConnServer {
         if std_stream.set_nonblocking(false).is_err() {
             return;
         }
-        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+        let std_stream = crate::line_io::DeadlineStream::new(
+            std_stream, Duration::from_secs(READ_TIMEOUT_SECS),
+        );
 
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {

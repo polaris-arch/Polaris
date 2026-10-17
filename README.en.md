@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · **English** · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#install)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**Polaris** — a cross-platform network proxy client built on sing-box. Tauri 2 (Rust + React).
+**Polaris** — a cross-platform network proxy client built on [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Tauri 2 (Rust + React).
 
 ![Home](docs/screenshots/home.png)
 
@@ -58,16 +58,14 @@
 
 Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
 
-### Published v1.0.0 downloads
-
-The files below are [published v1.0.0 assets](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); use the version and filenames on the selected Release. Desktop packages cover macOS Apple Silicon / Intel, Windows x64, and Linux amd64. This release provides a signed Android ARM64 APK. Check downloads against `SHA256SUMS` on the same release page.
+The current release pipeline uses the filenames defined in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the app version without the `v` prefix. macOS has separate Apple Silicon / Intel packages, Windows uses x64, and Linux uses amd64. Android packages are listed as ARM64, ARMv7, and universal; universal contains only these two ARM architectures, not x86. Download availability depends on the actual assets of the selected Release. Check files against `SHA256SUMS` on the same release page.
 
 | Platform | File |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`; portable build: `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 Desktop packages are not signed with a paid code-signing certificate, so the first launch may need manual approval.
 
@@ -92,20 +90,11 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 
 ## Build
 
-This section is for maintainers building the current source, with Linux as the example. It does not describe the build inputs or installation acceptance of the v1.0.0 downloads above. See the build guide below for platform packaging conventions.
+This section is for maintainers building the current source, with Linux as the example. A successful source build does not establish runtime acceptance of published packages. See the build guides below for platform dependencies, mobile toolchains, and packaging conventions.
 
-Source-build guides: [desktop and Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [mobile core and pinned toolchains](scripts/mobile-core/README.md). iOS has source-build documentation, not a published IPA. Unsigned compilation and personally signed device installation are separate steps; neither substitutes for runtime acceptance.
+Source-build guides: [desktop and Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [mobile core and pinned toolchains](scripts/mobile-core/README.md).
 
-### Current source packaging names
-
-The current build pipeline uses the names defined in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the application version placeholder. These packaging conventions differ from the historical v1.0.0 filenames above; download availability is determined by the actual assets on the selected Release. Android universal contains only ARM64 / ARMv7, not x86.
-
-| Platform | Packaging names |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+iOS currently has no published IPA or jailbreak package; jailbreak compatibility is unverified. Self-signing for a non-jailbroken device requires an Apple Developer Program account with Network Extension capability and [provisioning profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) matching the App, PacketTunnel, and App Group entitlements. Free [Personal Teams do not support NE providers](https://developer.apple.com/forums/thread/128767), and sideloading alone does not grant those entitlements. Successful compilation or installation does not replace runtime verification.
 
 Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
@@ -158,7 +147,8 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (official upstream)](https://github.com/SagerNet/sing-box) | Current core development repository; frozen source, version and existing polaris-box assets remain governed by the selected build manifest |
+| [sing-box-polaris (active fork)](https://github.com/polaris-arch/sing-box-polaris) | Core fork used by Polaris; frozen source, version, and polaris-box assets follow the selected build manifest |
+| [sing-box (original upstream)](https://github.com/SagerNet/sing-box) | Original upstream project and technical foundation; acknowledged here |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Built-in dashboard |

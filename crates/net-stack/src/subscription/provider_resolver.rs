@@ -228,7 +228,7 @@ fn parse_provider_text(
             filter,
             exclude_filter,
             &mut |m| warns.push(m),
-            source,
+            &super::redact_url(source),
         );
         parsed.servers = filtered;
         parsed.warnings.extend(warns);
@@ -284,7 +284,7 @@ pub fn parse_provider_request(
             request.filter.as_deref(),
             request.exclude_filter.as_deref(),
             &mut |message| warns.push(message),
-            &request.source,
+            &request.provider_name,
         );
         parsed.warnings.extend(warns);
     }
@@ -920,3 +920,7 @@ fn provider_name_of(name_v: &serde_yaml::Value) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| "(unnamed)".to_string())
 }
+
+#[cfg(test)]
+#[path = "provider_resolver/tests/audit_regressions.rs"]
+mod audit_regressions;

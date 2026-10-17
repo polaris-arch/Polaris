@@ -30,16 +30,15 @@ pub fn dns_server_tag(id: &str) -> String {
             crate::builder::network_env::NETENV_DNS_TAG.to_string()
         }
         _ => {
-            let safe: String = id
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
+            let mut safe = String::new();
+            for byte in id.bytes() {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                    safe.push(char::from(byte));
+                } else {
+                    use std::fmt::Write;
+                    write!(&mut safe, "~{byte:02x}").expect("write to String");
+                }
+            }
             format!("dns-user-{safe}")
         }
     }
@@ -311,3 +310,7 @@ pub struct RoutePolicyDefaults {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "dns_policy/tests/audit_regressions.rs"]
+mod audit_regressions;

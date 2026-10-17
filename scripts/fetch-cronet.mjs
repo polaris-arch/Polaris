@@ -46,7 +46,7 @@
  * 三个 fetch 脚本各写一遍必然各自漂，且漂了以后只在某一条 CI 腿上炸。判据本身需要单一真值点，
  * 与「省几行重复」无关。
  */
-import { execFileSync } from 'child_process';
+import { boundedDownload } from './lib/bounded-download.mjs';
 import { createHash } from 'crypto';
 
 import { extractZip, findInZipRoot } from './lib/extract-zip.mjs';
@@ -131,12 +131,12 @@ function resolveCronetVersionsFromGoMod() {
     validateSourceManifest(source, spec);
     // Preserve raw bytes. UTF-8/newline normalization must not change the hash.
     const url = `https://raw.githubusercontent.com/${kernelSourceRepository(source.sourceURL)}/${source.sourceCommit}/go.mod`;
-    const bytes = execFileSync('curl', ['-fsSL', '--retry', '3', url]);
+    const bytes = boundedDownload(url);
     requireGraph(digest(bytes) === spec.mainGoModSha256, 'Fork Cronet go.mod SHA-256 differs');
     text = bytes.toString('utf8');
   } else {
     const url = `https://raw.githubusercontent.com/SagerNet/sing-box/v${CORE_VERSION}/go.mod`;
-    text = execFileSync('curl', ['-fsSL', '--retry', '3', url], { encoding: 'utf-8' });
+    text = boundedDownload(url, { encoding: 'utf-8' });
   }
   const versions = parseCronetGoModRequires(text);
   const platformVersions = `${MODULE_BASE}/linux_amd64=${versions.linux}；` +
@@ -203,7 +203,7 @@ for (const t of PICKED) {
   try {
     const archive = join(work, 'mod.zip');
     console.log(`downloading ${MODULE_BASE}/${t.module}@${moduleVersion} → ${t.dir}/${t.out} ...`);
-    execFileSync('curl', ['-fL', '--retry', '3', '-o', archive, url], { stdio: 'inherit' });
+    boundedDownload(url, { output: archive, stdio: 'inherit' });
 
     // zip 内路径带 `<module>@<version>/` 前缀。此前用 `unzip -j '*/<member>'`（junk-paths +
     // 通配选成员）只解出要的那一个；改为全解 + JS 定位，因为那套 flag 在 Windows 唯一可用的

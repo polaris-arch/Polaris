@@ -2186,7 +2186,19 @@ impl ConfigManager {
     ) -> Result<(), StoreError> {
         let path = self.deferred_deletions_path();
         if journal.entries.is_empty() {
-            return durable_remove(&path).map(|_| ());
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Retry a prior unlink whose parent fsync was uncertain.
+                    #[cfg(unix)]
+                    if let Some(parent) = path.parent() {
+                        std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+                            .map_err(|error| StoreError::CommitUncertain(error.to_string()))?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(StoreError::Io(error.to_string())),
+                Ok(_) => return durable_remove(&path).map(|_| ()),
+            }
         }
         let content = serde_json::to_string_pretty(journal).map_err(StoreError::from)?;
         durable_atomic_write(&path, &content, &random_tmp_suffix()).map(|_| ())
@@ -2225,7 +2237,7 @@ impl ConfigManager {
         for entry in additions {
             // Bind only newly created intents, never upgrade a historical serverId-only
             // journal by guessing which current filesystem object it referred to.
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", windows))]
             let entry = match entry {
                 DeferredConfigDeletion::TailscaleState { ref server_id } => {
                     match crate::runtime::tailscale_directory::DirectoryLease::acquire(
@@ -2256,7 +2268,7 @@ impl ConfigManager {
                         if intent.server_id != id {
                             return true;
                         }
-                        #[cfg(unix)]
+                        #[cfg(any(unix, windows))]
                         {
                             // Never erase the durable recovery record of a partially
                             // committed deletion when another same-ID edit arrives.
@@ -2266,7 +2278,7 @@ impl ConfigManager {
                             .and_then(|lease| lease.committed_intent(intent))
                             .unwrap_or(true)
                         }
-                        #[cfg(not(unix))]
+                        #[cfg(not(any(unix, windows)))]
                         {
                             true
                         }
@@ -2322,7 +2334,7 @@ impl ConfigManager {
                 // A re-added node cancels an unstarted deletion, but cannot erase
                 // the only recovery record for an already quarantined old object.
                 // Commit recovery is still bound to the old filesystem identity.
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 if let DeferredConfigDeletion::TailscaleDirectory { intent } = &entry {
                     match crate::runtime::tailscale_directory::DirectoryLease::acquire_intent(
                         &self.dir, intent,
@@ -2344,7 +2356,7 @@ impl ConfigManager {
                     summary.cancelled += 1;
                     continue;
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 {
                     summary.cancelled += 1;
                     continue;
@@ -2674,3 +2686,7 @@ fn deferred_deletion_is_cancelled(entry: &DeferredConfigDeletion, current: &Valu
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "config/audit_tests.rs"]
+mod audit_tests;

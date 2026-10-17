@@ -699,7 +699,7 @@ pub trait HelperUninstallOps {
 /// 抽出来后这条腿的三态（本就没开 / 摘掉了 / 摘不掉）才能被断言。
 pub trait AutostartOps {
     /// 当前是否已注册开机自启。
-    fn is_enabled(&self) -> bool;
+    fn is_enabled(&self) -> Result<bool, String>;
     /// 注销登录项。
     fn disable(&self) -> Result<(), String>;
 }
@@ -782,8 +782,10 @@ fn spawn_uninstaller(path: &Path) -> Result<(), String> {
 
 impl<H: HelperUninstallOps, A: AutostartOps> UninstallOps for SystemUninstallOps<'_, H, A> {
     fn disable_autostart(&self) -> StepOutcome {
-        if !self.autostart.is_enabled() {
-            return StepOutcome::skipped("未开启开机自启，无需注销");
+        match self.autostart.is_enabled() {
+            Ok(false) => return StepOutcome::skipped("未开启开机自启，无需注销"),
+            Ok(true) => {},
+            Err(error) => return StepOutcome::failed(format!("无法确认开机自启状态，卸载已中止: {error}")),
         }
         match self.autostart.disable() {
             Ok(()) => StepOutcome::done("已注销开机自启登录项"),

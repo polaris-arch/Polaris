@@ -1398,3 +1398,18 @@ test('same-version repack rejects old receipts and stamps before admitting new c
     verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run);
   } finally { rmSync(next.root, { recursive: true, force: true }); }
 }));
+
+test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar and notice', async () => {
+  if (process.platform === 'win32') return;
+  for (const member of ['sing-box', 'libcronet.so', 'core-release/LICENSE']) {
+    for (const bit of [0o4000, 0o2000, 0o1000]) await withFixture(async (f) => {
+      await consumeRelease(f.root, f.manifest, ['linux'], f);
+      const carrier = join(f.root, 'mode-carrier');
+      cpSync(join(f.root, 'resources/linux'), carrier, { recursive: true });
+      const path = join(carrier, member), before = readFileSync(path);
+      fs.chmodSync(path, (fs.statSync(path).mode & 0o777) | bit);
+      assert.deepEqual(readFileSync(path), before);
+      assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /permissions/);
+    });
+  }
+});

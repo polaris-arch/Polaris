@@ -1584,6 +1584,9 @@ pub struct ProxyRuntime {
     ///
     /// [`sync_custom_rule_files`]: Self::sync_custom_rule_files
     custom_rule_files_degraded: AtomicBool,
+    rule_content_publication: Mutex<Option<startup::RuleContentPublication>>,
+    #[cfg(test)]
+    rule_content_api_stub: Mutex<Option<Arc<dyn startup::RuleContentApi>>>,
     /// **A-0b：运行期观测到的 tailnet 地址**（`serverId` → 裸地址，不带掩码）。
     ///
     /// 唯一写入点是 `tailnet_rules` 域的两条腿：STATUS 帧（
@@ -1878,6 +1881,9 @@ impl ProxyRuntime {
             helper_upgrade_prompted: AtomicBool::new(false),
             stale_sweep_runs: AtomicUsize::new(0),
             custom_rule_files_degraded: AtomicBool::new(false),
+            rule_content_publication: Mutex::new(None),
+            #[cfg(test)]
+            rule_content_api_stub: Mutex::new(None),
             observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),

@@ -108,6 +108,10 @@ impl GrpcManagementApi {
             .collect())
     }
 
+    pub async fn rule_set_status(&self, tags: Vec<String>) -> Result<polaris_singbox_grpc::daemon::RuleSetStatusResponse, ManagementError> {
+        self.client()?.get_rule_set_status(tags).await.map_err(map_err)
+    }
+
     pub async fn clash_mode_status(&self) -> Result<ClashModeStatus, ManagementError> {
         let status = self
             .client()?

@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(not(target_os = "android"))]
 use std::sync::{
@@ -673,6 +673,27 @@ const TEMP_CORE_STALL_STREAK: usize = TEMP_CORE_CONCURRENCY;
 /// 那份会被本次直接覆盖（带时间戳反而会在 config 目录里越堆越多）。
 const TEMP_CORE_CONFIG_NAME: &str = "speedtest-core.json";
 
+fn write_private_temp_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("测速配置缺少父目录")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("测速配置父目录不能是重定向".into());
+    }
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    // Admission already proved the previous exact child closed. Atomic replacement
+    // never truncates a linked target and publishes the writer's private 0600 inode.
+    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    // Store's shared helper owns the fixed twelve-hex temporary-name contract.
+    let suffix = polaris_store::fs::random_tmp_suffix();
+    polaris_store::fs::durable_atomic_write(path, text, &suffix)
+        .map(|_| ()).map_err(|error| error.to_string())
+}
+
 /// 诊断档（`debug` / `trace`）下**留档**的临时核配置文件名（见 [`retire_temp_config`]）。
 ///
 /// 与 [`TEMP_CORE_CONFIG_NAME`] 必须不同名：同名就等于「没删」，下次会话会把它当成自己的配置覆盖，
@@ -911,7 +932,7 @@ impl TempProducerView {
             }
         }
         for birth in &births {
-            if !current
+            if !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()) && !current
                 .as_ref()
                 .is_some_and(|owner| Arc::ptr_eq(owner, birth))
                 && !retired.iter().any(|owner| Arc::ptr_eq(owner, birth))
@@ -982,7 +1003,29 @@ static PC_TEMP_CORE_CUSTODY: LazyLock<Arc<PcTempCoreCustody>> =
 
 #[cfg(not(target_os = "android"))]
 impl PcTempCoreCustody {
+    /// Prune only proven terminal ownership; existing census snapshots retain Arcs.
+    /// Unknown legacy/cancelled factories are quarantined without arbitrary eviction.
+    fn prune_terminal(&self) -> Result<(), String> {
+        self.producers.lock().map_err(|_| "Temp producer custody poisoned")?.retain(|producer| {
+            let Ok(birth) = producer.birth.lock() else { return true; };
+            match birth.as_ref() {
+                // Cancellation ends original dispatch, not native custody. retire()
+                // alone publishes retired after exact terminal/no-child validation.
+                // Never set finished to conceal an abandoned factory.
+                Some(birth) => !((producer.finished.load(Ordering::SeqCst)
+                    || producer.cancelled.load(Ordering::SeqCst))
+                    && birth.retired.load(Ordering::SeqCst) && birth.native.is_some()),
+                None => !((producer.finished.load(Ordering::SeqCst) || producer.cancelled.load(Ordering::SeqCst))
+                    && !producer.factory_started.load(Ordering::SeqCst)),
+            }
+        });
+        self.retired_births.lock().map_err(|_| "Temp legacy tail custody poisoned")?
+            .retain(|birth| !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()));
+        Ok(())
+    }
+
     fn producer_view(self: &Arc<Self>) -> Result<TempProducerView, String> {
+        self.prune_terminal()?;
         let custody = Arc::clone(self);
         let producers = custody
             .producers
@@ -2910,7 +2953,12 @@ impl TempCoreSession {
         )
         .await;
         #[cfg(not(target_os = "android"))]
-        dispatch.0.finished.store(true, Ordering::SeqCst);
+        {
+            dispatch.0.finished.store(true, Ordering::SeqCst);
+            if let Err(error) = deps.pc_custody.prune_terminal() {
+                return BatchOutcome::CleanupUnknown(error);
+            }
+        }
         result
     }
 
@@ -3046,9 +3094,9 @@ impl TempCoreSession {
                 };
             }
         };
-        if let Err(e) = std::fs::write(&config_path, bytes) {
-            // A failed write may have left a partial credential-bearing config.
-            retire_temp_config(&config_path, false);
+        if let Err(e) = write_private_temp_config(&config_path, &bytes) {
+            // Secure writer removes only its exclusive stage on pre-publication failure.
+            // Never unlink a destination that may not belong to this operation.
             return BatchOutcome::Failed {
                 detail: format!("写测速临时核配置失败 {}: {e}", config_path.display()),
                 oversized: false,
@@ -3398,3 +3446,69 @@ fn retire_temp_config(path: &std::path::Path, keep_for_diagnosis: bool) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix, not(target_os = "android")))]
+mod private_temp_config_regressions {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    #[test]
+    fn private_publication_replaces_links_without_touching_their_targets() {
+        let dir = std::env::temp_dir().join(format!("polaris-private-speedtest-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(TEMP_CORE_CONFIG_NAME);
+        let target = dir.join("outside");
+        std::fs::write(&target, "untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        write_private_temp_config(&path, b"synthetic credential").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        write_private_temp_config(&path, b"second synthetic credential").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn pre_spawn_history_is_pruned_but_unknown_factory_is_retained() {
+        let custody = PcTempCoreCustody::default();
+        for _ in 0..1000 {
+            let producer = Arc::new(PcTempBatchProducer::default());
+            producer.finished.store(true, Ordering::SeqCst);
+            custody.producers.lock().unwrap().push(producer);
+            custody.prune_terminal().unwrap();
+        }
+        assert!(custody.producers.lock().unwrap().is_empty());
+        let unknown = Arc::new(PcTempBatchProducer::default());
+        unknown.cancelled.store(true, Ordering::SeqCst);
+        unknown.factory_started.store(true, Ordering::SeqCst);
+        custody.producers.lock().unwrap().push(unknown);
+        custody.prune_terminal().unwrap();
+        assert_eq!(custody.producers.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod temp_config_writer_regressions {
+    use super::*;
+
+    #[test]
+    fn private_writer_obeys_store_suffix_contract_on_create_and_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "polaris-speedtest-writer-contract-{}", polaris_store::fs::random_tmp_suffix(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join(TEMP_CORE_CONFIG_NAME);
+        // Run the actual production helper and durable writer, including tmp_path's
+        // debug assertion. A made-up PID/counter suffix fails here in debug tests.
+        for value in [b"first".as_slice(), b"replacement".as_slice(), b"final".as_slice()] {
+            write_private_temp_config(&config, value).unwrap();
+            assert_eq!(std::fs::read(&config).unwrap(), value);
+            let entries = std::fs::read_dir(&dir).unwrap()
+                .map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+            assert_eq!(entries, vec![std::ffi::OsString::from(TEMP_CORE_CONFIG_NAME)],
+                "each successful publication must consume its exclusive stage");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

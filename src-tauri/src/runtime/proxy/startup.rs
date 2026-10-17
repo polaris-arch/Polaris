@@ -3460,21 +3460,112 @@ impl ProxyRuntime {
     /// **绝不删文件**（运行中删被挂载文件会致 sing-box reload 报错；删除只在起核 `write_custom_rule_files`
     /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回是否全部成功，由调用方按
     /// Full/SelectedOnly 范围选择重启配置；此处不能自行从磁盘 D 排程。
-    pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) -> bool {
-        let dir = self.custom_rules_dir();
-        let expected = build_custom_rule_files(config);
-        for (name, content) in &expected {
-            let file_path = dir.join(name);
-            let cur = std::fs::read_to_string(&file_path).ok();
-            if cur.as_deref() == Some(content.as_str()) {
-                continue;
-            }
-            if let Err(e) = atomic_write_custom_rule(&file_path, content) {
-                log::warn!("热更外化规则文件失败，退回去抖重启：{name}（{e}）");
-                return false;
+    pub(super) async fn sync_custom_rule_files(
+        self: &Arc<Self>, config: &UserConfig, generation: u64, intent: u64,
+    ) -> bool {
+        if !self.selector_operation_is_current(generation, intent) { return false; }
+        let update = match self.rule_content_sync_target(config, generation) {
+            Ok(Some(update)) => update,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        #[cfg(test)]
+        {
+            let stub = self.rule_content_api_stub.lock().unwrap().clone();
+            if let Some(api) = stub {
+                return self.publish_rule_content(update, generation, intent, api.as_ref()).await;
             }
         }
-        true
+        let Some((port, secret)) = self.management_endpoint() else { return false; };
+        let api = Self::management_api_at(port, secret).await;
+        self.publish_rule_content(update, generation, intent, &api).await
+    }
+
+    // R is the committed projection. Overlay the outstanding side effect rather
+    // than assuming equality to R means equality to the running core.
+    fn rule_content_sync_target(&self, config: &UserConfig, generation: u64)
+        -> Result<Option<(String, String)>, ()> {
+        let expected = build_custom_rule_files(config);
+        let mut actual = self.current_config.read().map_err(|_| ())?.clone()
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v)).ok_or(())?;
+        let publication = self.rule_content_publication.lock().map_err(|_| ())?.clone()
+            .filter(|p| p.generation == generation);
+        if let Some(p) = &publication {
+            if !actual.contains_key(&p.name) || !expected.contains_key(&p.name) { return Err(()); }
+            actual.insert(p.name.clone(), p.content.clone());
+        }
+        if actual == expected {
+            return Ok(publication.map(|p| (p.name.clone(), expected[&p.name].clone())));
+        }
+        single_rule_content_update(&actual, &expected)
+            .map(|(name, content)| Some((name.to_owned(), content.to_owned())))
+            .ok_or(())
+    }
+
+    pub(super) fn has_uncommitted_rule_content(&self) -> bool {
+        let generation = self.gate.generation();
+        let publication = match self.rule_content_publication.lock() {
+            Ok(state) => state.clone().filter(|p| p.generation == generation),
+            Err(_) => return true,
+        };
+        let Some(p) = publication else { return false; };
+        if p.acknowledged_instance.is_none() { return true; }
+        let applied = self.current_config.read().ok().and_then(|v| v.clone())
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v));
+        applied.and_then(|files| files.get(&p.name).cloned()).as_ref() != Some(&p.content)
+    }
+
+    async fn publish_rule_content(self: &Arc<Self>, update: (String, String),
+        generation: u64, intent: u64, api: &dyn RuleContentApi) -> bool {
+        let (name, content) = update;
+        let Some(tag) = custom_rule_file_tag(&name) else { return false; };
+        let Ok(before) = api.status(vec![tag.clone()]).await else { return false; };
+        if !self.selector_operation_is_current(generation, intent)
+            || before.instance_started_at_unix_nano == 0
+            || !before.rule_sets.iter().any(|set| set.tag == tag && !set.closed
+                && set.watcher_state == "watching") { return false; }
+        let digest = polaris_updater::sha256_hex(content.as_bytes());
+        // Unknown BEFORE publication: cancellation/failure cannot erase evidence.
+        // Claim covers the synchronous write, never an await. Stale owners do not roll back.
+        let wrote = self.selector_reconcile.with_intent_claim(|current_intent| {
+            if current_intent != intent { return false; }
+            let _publication = self.gate.lock_generation_publication();
+            if !self.selector_operation_is_current(generation, intent) { return false; }
+            let Ok(mut state) = self.rule_content_publication.lock() else { return false; };
+            *state = Some(RuleContentPublication {
+                generation, name: name.clone(), content: content.clone(), acknowledged_instance: None,
+            });
+            atomic_write_custom_rule(&self.custom_rules_dir().join(&name), &content).is_ok()
+        });
+        self.push_pending_changes();
+        if !wrote { return false; }
+        let wait = async {
+            loop {
+                if !self.selector_operation_is_current(generation, intent) { return false; }
+                let Ok(status) = api.status(vec![tag.clone()]).await else { return false; };
+                if !self.selector_operation_is_current(generation, intent)
+                    || status.instance_started_at_unix_nano != before.instance_started_at_unix_nano { return false; }
+                if rule_content_acknowledged(&status, &tag, &digest, before.instance_started_at_unix_nano) {
+                    return self.selector_reconcile.with_intent_claim(|current_intent| {
+                        if current_intent != intent { return false; }
+                        let _publication = self.gate.lock_generation_publication();
+                        if !self.selector_operation_is_current(generation, intent) { return false; }
+                        let Ok(mut state) = self.rule_content_publication.lock() else { return false; };
+                        let Some(p) = state.as_mut() else { return false; };
+                        if p.generation != generation || p.name != name || p.content != content { return false; }
+                        p.acknowledged_instance = Some(status.instance_started_at_unix_nano);
+                        true
+                    });
+                }
+                if status.rule_sets.iter().any(|set| set.closed || set.watcher_state != "watching") { return false; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let applied = tokio::time::timeout(Duration::from_secs(3), wait).await.unwrap_or(false);
+        self.push_pending_changes();
+        applied
     }
 
     /// Capture the ordinary startup value inputs once for an unpublished
@@ -3769,13 +3860,16 @@ impl ProxyRuntime {
             // 已剥的节点从 `servers` 摘掉后重新生成（空集合时等价于原配置）。
             let mut effective = user_config.clone();
             effective.servers.retain(|s| !peeled.contains_key(&s.id));
-            let gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
+            #[allow(unused_mut)]
+            let mut gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
                 &effective,
                 &BTreeMap::new(),
                 deps,
                 runtime_bind_interfaces,
             )
             .map_err(|e| format!("sing-box 配置生成失败: {e}"))?;
+            #[cfg(windows)]
+            crate::runtime::windows_directory::bind_configuration(&mut gen_out.config, self.config.dir())?;
             capabilities.validate_config(
                 &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
             )?;
@@ -3790,7 +3884,7 @@ impl ProxyRuntime {
             // fresh original provider proves its bundled source/owner capability.
             // No runtime-config file is exposed to an older shared-profile reader.
             #[cfg(not(target_os = "ios"))]
-            std::fs::write(config_path, &json)
+            write_private_runtime_config(config_path, &json)
                 .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
@@ -4001,7 +4095,7 @@ pub(super) struct GateOutcome {
     /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
     ///
     /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
-    /// `std::fs::write(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
+    /// `write_private_runtime_config(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
     /// `runtime_config_path()` 与内核实际吃的那份不可能漂。
     ///
     /// **不可改成「从盘上读回来再交给 libbox」**：那样诊断与内核就有了两条路径，而这条链上唯一
@@ -4929,3 +5023,56 @@ pub(super) fn server_ids(config: &Value) -> std::collections::HashSet<String> {
     }
     set
 }
+
+
+#[derive(Clone)]
+pub(super) struct RuleContentPublication {
+    generation: u64,
+    name: String,
+    content: String,
+    acknowledged_instance: Option<i64>,
+}
+pub(super) trait RuleContentApi: Send + Sync {
+    fn status(&self, tags: Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<polaris_singbox_grpc::daemon::RuleSetStatusResponse, polaris_switch_engine::ManagementError>,
+    > + Send + '_>>;
+}
+impl RuleContentApi for crate::runtime::management_api::GrpcManagementApi {
+    fn status(&self, tags: Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<polaris_singbox_grpc::daemon::RuleSetStatusResponse, polaris_switch_engine::ManagementError>,
+    > + Send + '_>> { Box::pin(self.rule_set_status(tags)) }
+}
+fn single_rule_content_update<'a>(previous: &BTreeMap<String, String>, expected: &'a BTreeMap<String, String>)
+    -> Option<(&'a str, &'a str)> {
+    if previous.keys().ne(expected.keys()) { return None; }
+    let mut changed = expected.iter().filter(|(name, content)| previous.get(*name) != Some(*content));
+    let (name, content) = changed.next()?;
+    if changed.next().is_some() { return None; }
+    Some((name.as_str(), content.as_str()))
+}
+fn custom_rule_file_tag(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".json")?;
+    if !stem.starts_with("custom-rule-") || stem.contains('/') || stem.contains('\\') { return None; }
+    Some(stem.replace(".dns", "-dns"))
+}
+fn rule_content_acknowledged(status: &polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+    tag: &str, digest: &str, instance: i64) -> bool {
+    instance != 0 && status.instance_started_at_unix_nano == instance
+        && status.rule_sets.iter().any(|s| s.tag == tag && s.active_digest == digest
+            && s.revision > 0 && !s.closed && s.watcher_state == "watching")
+}
+fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or("runtime config has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let metadata = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() { return Err("runtime config parent must be a real directory".into()); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    }
+    polaris_store::fs::durable_atomic_write(path, text, &polaris_store::fs::random_tmp_suffix()).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[path = "tests/hot_rule_content.rs"]
+mod hot_rule_content_tests;

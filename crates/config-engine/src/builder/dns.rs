@@ -1763,6 +1763,12 @@ pub fn build_dns_config(
         push_bypass_bucket(&mut dns_rules, via_direct, "dns-bootstrap");
     }
 
+    if crate::builder::network_env::default_dns_uses_netenv(config) {
+        if let Some(reason) = deps.probe_facts(config).dhcp_unavailable() {
+            deps.log_warn(&format!("DNS_DEFAULT_POLICY_UNAVAILABLE:{}", reason.report_code()));
+        }
+    }
+
     // ── DNS 未命中策略。
     // v2 的默认动作独立于流量代理模式；legacy 配置仍保留 smart/global 的历史派生规则。
     // tailnet / probe 规则稍后从头插入，因此仍然高于这里的用户默认动作。

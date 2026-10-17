@@ -9,12 +9,11 @@ fn bad_json_returns_parse_err() {
 
 #[test]
 fn bad_field_skipped_good_field_kept() {
-    // servers 是 string（坏字段）→ 删除；但 customRules 合法 → 保留。
-    // 绝不因 servers 坏而丢弃整份配置（维度7 #7 核心）。
+    // 可选 mixedPort 坏值仍可剔除；合法 servers/customRules 保留。
     let json = r#"{
         "proxyMode": "global",
         "proxyModeType": "systemProxy",
-        "servers": "not-an-array",
+        "servers": [],
         "customRules": [
             {"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}
         ],
@@ -23,7 +22,7 @@ fn bad_field_skipped_good_field_kept() {
     let v = sanitize_config(json).unwrap();
     let obj = v.as_object().unwrap();
     // 坏字段已删
-    assert!(!obj.contains_key("servers"));
+    assert_eq!(obj["servers"], json!([]));
     assert!(!obj.contains_key("mixedPort"));
     // 好字段保留
     assert_eq!(obj["proxyMode"], "global");

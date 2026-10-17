@@ -34,7 +34,9 @@ case "$GRAPHICS" in
 esac
 APPDIR=/root/.config/com.polaris.app/polaris
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=/var/tmp/polaris-acceptance/$SCEN
+# Validate the shared finite scenario registry before any filesystem mutation.
+python3 "$HERE/scenario.py" --validate "$SCEN" || exit 2
+OUT=$(python3 "$HERE/scenario.py" --prepare-output "$SCEN") || exit 2
 WARMUP=75          # > 实测 60s 首帧，留余量
 # 每轮用**独占**的 display：复用上一轮的 Xvfb 会继承上一轮的 timeout 预算，
 # 那个预算短于本轮时，X server 到期 ⇒ 应用失去 X 连接跟着死 ⇒ 观测窗被悄悄截断，
@@ -42,7 +44,7 @@ WARMUP=75          # > 实测 60s 首帧，留余量
 DISP=$((90 + RANDOM % 60))
 export DISPLAY=:$DISP HOME=/root
 
-rm -rf "$OUT"; mkdir -p "$OUT"
+# Fresh run directory; never delete previous evidence.
 
 # ── 配置：补丁而非重建，保留默认配置的全部 57 个键 ──
 python3 "$HERE/scenario.py" "$SCEN" < "$APPDIR/config.json" > "$OUT/config.json" || exit 1

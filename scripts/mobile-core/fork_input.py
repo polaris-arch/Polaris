@@ -5,6 +5,7 @@ binding targets, tools and receipts are separate. An input declaration cannot
 promote a diagnostic AAR/framework or a CLI receipt into App acceptance.
 """
 import hashlib
+import os
 import json
 from pathlib import Path
 import re
@@ -104,10 +105,26 @@ def load(path=CONTRACT):
     return validate(decode(Path(path).read_bytes()))
 
 
+def git_environment(env=None):
+    """Bind Git to the real checkout, not ambient repository/config overrides."""
+    clean = {k: v for k, v in (os.environ if env is None else env).items() if not k.startswith('GIT_')}
+    clean.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                 GIT_NO_REPLACE_OBJECTS='1', GIT_TERMINAL_PROMPT='0')
+    return clean
+
+
+def require_git_root(source):
+    actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', '--show-toplevel'],
+                                     env=git_environment(), text=True, timeout=10).strip()
+    require(Path(actual).resolve(strict=True) == Path(source).resolve(strict=True),
+            'Git worktree differs from actual source root')
+
+
 def git(source, *args):
     # Read-only source verification. Do not run the upstream build helper: it
     # chooses extra platforms/legacy variants and a git-describe version.
-    return subprocess.check_output(['git', '-C', str(source), *args], text=True).strip()
+    require_git_root(source)
+    return subprocess.check_output(['git', '-C', str(source), *args], env=git_environment(), text=True, timeout=30).strip()
 
 
 def verify_source(source, value, *, generator_outputs=False):
@@ -200,7 +217,7 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
     # Caller passes explicit scoped inputs. Do not inherit GOWORK/GOTOOLCHAIN,
     # ambient Android NDK selection, global GOFLAGS or an unrelated Go on PATH.
     import os
-    env = dict(os.environ)
+    env = git_environment()
     for key in ['GOWORK', 'GOFLAGS', 'GOTOOLCHAIN', 'GOROOT', 'GOOS', 'GOARCH', 'GOARM', 'GOARM64',
                 'GOBIN', 'GOPATH', 'CGO_CFLAGS', 'CGO_CPPFLAGS', 'CGO_LDFLAGS', 'CC', 'CXX',
                 'ANDROID_HOME', 'ANDROID_SDK_ROOT', 'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT',

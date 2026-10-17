@@ -106,6 +106,11 @@ pub async fn check_chatgpt<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
 
     let cookie_dirty = has_ci(&cookie.body, ChatgptEndpoints::COOKIE_BLOCK_MARKER);
     let ios_dirty = has_ci(&ios.body, ChatgptEndpoints::IOS_BLOCK_MARKER);
+    if (!cookie_dirty && !(200..300).contains(&cookie.status))
+        || (!ios_dirty && !(200..300).contains(&ios.status))
+    {
+        return UnlockResult::with_region(UnlockStatus::Timeout, region);
+    }
     match (cookie_dirty, ios_dirty) {
         (false, false) => UnlockResult::with_region(UnlockStatus::Ok, region), // 两净
         (true, true) => UnlockResult::with_region(UnlockStatus::Blocked, region), // 两脏
@@ -217,6 +222,9 @@ pub async fn check_gemini<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
     // 命中 CF 挑战/1020 → Restricted（风控拦截，非地区不可用）。
     if any_challenged(&[&res]) {
         return UnlockResult::with_region(UnlockStatus::Restricted, region);
+    }
+    if !(200..300).contains(&res.status) {
+        return UnlockResult::with_region(UnlockStatus::Timeout, region);
     }
     if res.body.contains(GeminiEndpoints::AVAILABLE_MARKER) {
         UnlockResult::with_region(UnlockStatus::Ok, region)
@@ -386,6 +394,9 @@ pub async fn check_netflix<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
     let d2 = r2.body.contains(NetflixEndpoints::OH_NO_MARKER);
     if d1 && d2 {
         return UnlockResult::with_region(UnlockStatus::Partial, region); // 两非自制皆不可看 -> 仅自制剧
+    }
+    if !(200..300).contains(&r1.status) || !(200..300).contains(&r2.status) {
+        return UnlockResult::with_region(UnlockStatus::Timeout, region);
     }
     UnlockResult::with_region(UnlockStatus::Ok, region) // 任一可看 -> 完整解锁
 }
@@ -589,7 +600,12 @@ pub async fn check_tiktok<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
         .last()
         .map(|h| h.location.as_str())
         .unwrap_or(TiktokEndpoints::HOME_URL);
-    classify_tiktok(last, region)
+    let result = classify_tiktok(last, region.clone());
+    if result.status == UnlockStatus::Ok && !(200..300).contains(&home.status) {
+        UnlockResult::with_region(UnlockStatus::Timeout, region)
+    } else {
+        result
+    }
 }
 
 /// TikTok 纯分类器（**无 HTTP**，天然可单测）：给定首页跟随重定向后的**最终 URL** +
@@ -691,3 +707,7 @@ pub async fn run_checker<H: UnlockHttp + ?Sized>(id: ServiceId, http: &H) -> Unl
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "checkers/tests/audit_regressions.rs"]
+mod audit_regressions;

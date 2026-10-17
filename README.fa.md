@@ -4,17 +4,17 @@
 
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · **فارسی**
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#نصب)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
 <div dir="rtl">
 
-**Polaris** — یک کلاینت پروکسی شبکه چندسکویی بر پایه sing-box. ساخته‌شده با Tauri 2 (ترکیب Rust و React).
+**Polaris** — یک کلاینت پروکسی شبکه چندسکویی بر پایه [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). ساخته‌شده با Tauri 2 (ترکیب Rust و React).
 
 ![خانه](docs/screenshots/home.png)
 
@@ -64,16 +64,14 @@
 
 بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
 
-### دانلودهای منتشرشده v1.0.0
-
-فایل‌های زیر [دارایی‌های منتشرشدهٔ v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) هستند؛ نسخه و نام فایل را با انتشار انتخاب‌شده تطبیق دهید. بسته‌های دسکتاپ برای macOS Apple Silicon / Intel، ‏Windows x64 و Linux amd64 ارائه شده‌اند. این انتشار برای Android یک APK امضاشدهٔ ARM64 دارد. فایل دانلودشده را با `SHA256SUMS` در همان صفحه بررسی کنید.
+فرایند انتشار فعلی از نام فایل‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` نسخه برنامه بدون پیشوند `v` است. برای macOS بسته‌های جداگانه Apple Silicon / Intel، برای Windows بسته x64 و برای Linux بسته amd64 در نظر گرفته شده است. بسته‌های Android به‌ترتیب ARM64، ‏ARMv7 و universal آمده‌اند؛ universal فقط همین دو معماری ARM را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد. فایل‌ها را با `SHA256SUMS` در همان صفحه بررسی کنید.
 
 | سکو | فایل |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 بسته‌های دسکتاپ با گواهی پولی امضای کد امضا نمی‌شوند؛ اجرای نخست ممکن است به تأیید دستی نیاز داشته باشد.
 
@@ -103,20 +101,11 @@ xattr -cr /Applications/Polaris.app
 
 ## ساخت
 
-این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. این توضیحات ورودی‌های ساخت یا نتیجهٔ آزمون نصب دانلودهای v1.0.0 بالا را بیان نمی‌کند. قراردادهای بسته‌بندی سکوها در راهنمای ساخت پایین آمده است.
+این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. ساخت موفق کد منبع به معنی تأیید عملکرد بسته‌های منتشرشده نیست. وابستگی‌های سکوها، ابزارهای موبایل و قراردادهای بسته‌بندی در راهنماهای زیر آمده است.
 
-راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md). برای iOS راهنمای ساخت از کد وجود دارد، اما IPA منتشرشده‌ای ارائه نشده است. کامپایل بدون امضا و نصب روی دستگاه با امضای شخصی مراحل جداگانه‌اند و جایگزین آزمون عملکرد نیستند.
+راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md).
 
-### نام بسته‌های ساخت از کد فعلی
-
-فرایند ساخت فعلی از نام‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` جای‌نگهدار نسخه برنامه است. این‌ها قرارداد نام‌گذاری بسته‌ها هستند و با نام فایل‌های تاریخی v1.0.0 در بالا تفاوت دارند؛ امکان دانلود به فایل‌های واقعی Release انتخاب‌شده بستگی دارد. بسته universal اندروید فقط ARM64 / ARMv7 را شامل می‌شود، نه x86.
-
-| پلتفرم | نام بسته‌ها |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+برای iOS در حال حاضر IPA یا بسته جیلبریک منتشر نمی‌شود و سازگاری با جیلبریک تأیید نشده است. امضای شخصی برای دستگاه بدون جیلبریک به حساب Apple Developer Program با قابلیت Network Extension و [پروفایل‌های provisioning](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) منطبق با مجوزهای App، ‏PacketTunnel و App Group نیاز دارد. حساب رایگان [Personal Team از NE provider پشتیبانی نمی‌کند](https://developer.apple.com/forums/thread/128767) و نصب خارج از فروشگاه به‌تنهایی این مجوزها را اعطا نمی‌کند. کامپایل یا نصب موفق جایگزین آزمون عملکرد نیست.
 
 نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26)، pnpm 11.24.0، Go و [Tauri CLI 2](https://v2.tauri.app/).
 
@@ -181,7 +170,8 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 | پروژه | نقش |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (بالادست رسمی)](https://github.com/SagerNet/sing-box) | مخزن فعلی توسعه هسته؛ کد و نسخه ثابت و فایل‌های موجود polaris-box همچنان بر اساس مانیفست ساخت انتخاب‌شده تعیین می‌شوند |
+| [sing-box-polaris (فورک مورد استفاده)](https://github.com/polaris-arch/sing-box-polaris) | فورک هسته مورد استفاده Polaris؛ کد و نسخه ثابت و فایل‌های polaris-box بر اساس مانیفست ساخت انتخاب‌شده تعیین می‌شوند |
+| [sing-box (بالادست اصلی)](https://github.com/SagerNet/sing-box) | پروژه اصلی بالادست و پایه فنی؛ با قدردانی از توسعه‌دهندگان |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | بستر اجرای دسکتاپ |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet برای NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | پنل داخلی |

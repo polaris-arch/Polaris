@@ -128,3 +128,6 @@ pub(crate) fn commit_original_directory(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(windows)]
+pub(crate) use crate::runtime::windows_directory::DirectoryLease;

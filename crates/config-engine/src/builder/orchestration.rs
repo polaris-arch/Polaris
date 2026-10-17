@@ -239,15 +239,23 @@ pub fn config_generation_norm(
                             })
                         })
                         .collect();
-                    serde_json::json!({
-                        "__ext": 1,
-                        "id": r.id,
-                        "action": r.route_action(),
-                        "targetServerId": null,
-                        "combineMode": r.combine_mode,
-                        "bypassFakeIP": r.bypass_fakeip.unwrap_or(false),
-                        "conds": conds,
-                    })
+                    // Watchers own matcher values only; all outer rule semantics invalidate the core.
+                    let mut value = serde_json::to_value(r).expect("serializable rule");
+                    if let Some(object) = value.as_object_mut() {
+                        for key in ["remarks", "targetServerId", "values", "conditions", "type"] {
+                            object.remove(key);
+                        }
+                        if let Some(route) = object.get_mut("effects")
+                            .and_then(serde_json::Value::as_object_mut)
+                            .and_then(|effects| effects.get_mut("route"))
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            route.remove("targetServerId");
+                        }
+                        object.insert("__ext".into(), serde_json::json!(1));
+                        object.insert("conds".into(), serde_json::json!(conds));
+                    }
+                    value
                 }
             })
             .collect();
@@ -369,3 +377,7 @@ pub fn fix_route_dead_references(
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests;
+
+#[cfg(test)]
+#[path = "orchestration/tests/audit_regressions.rs"]
+mod audit_regressions;

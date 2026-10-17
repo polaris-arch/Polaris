@@ -100,6 +100,19 @@ struct MockService {
 
 #[tonic::async_trait]
 impl StartedService for MockService {
+    async fn get_rule_set_status(
+        &self, req: Request<daemon::RuleSetStatusRequest>,
+    ) -> Result<Response<daemon::RuleSetStatusResponse>, Status> {
+        check_auth(&req, &self.secret)?;
+        if req.get_ref().tags != ["audit-rule"] {
+            return Err(Status::invalid_argument("unexpected rule-set tags"));
+        }
+        Ok(Response::new(daemon::RuleSetStatusResponse {
+            instance_started_at_unix_nano: 42,
+            rule_sets: vec![],
+        }))
+    }
+
     async fn get_clash_mode_status(
         &self,
         req: Request<Empty>,
@@ -1766,8 +1779,7 @@ async fn connection_events_at_fails_on_a_wrong_secret_or_a_dead_port() {
     assert!(events_at(dead, SECRET).await.is_err(), "端口上没有服务端");
 }
 
-/// 首帧大于 tonic 默认的 4 MiB 解码上限时，这条流照样解得开。对照：同一个服务端、同一帧，走默认
-/// 上限的一次性快照读法被拒 —— 证明这一帧确实越过了默认上限。
+/// Both one-shot snapshots and streaming reads accept a bounded frame above 4 MiB.
 #[tokio::test]
 async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
     let (addr, state, _h) = spawn_server(SECRET, 0).await;
@@ -1795,9 +1807,21 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
     let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
         .await
         .unwrap();
-    let default_limit = client.first_connection_snapshot().await;
-    assert!(
-        default_limit.is_err(),
-        "对照：这一帧超过了默认解码上限，默认读法应被拒"
-    );
+    let encoded = prost::Message::encoded_len(&first);
+    assert!(encoded > 4 * 1024 * 1024 && encoded < 64 * 1024 * 1024);
+    let snapshot = client.first_connection_snapshot().await.expect("bounded large snapshot");
+    assert_eq!(snapshot.len(), 6000);
+}
+
+#[tokio::test]
+async fn rule_set_status_preserves_auth_and_requested_tags() {
+    let (addr, _state, _handle) = spawn_server(SECRET, 0).await;
+    let endpoint = Endpoint::new("127.0.0.1", addr.port());
+    let client = SingBoxApiClient::connect(endpoint, SECRET).await.unwrap();
+    let response = client.get_rule_set_status(vec!["audit-rule".into()]).await.unwrap();
+    assert_eq!(response.instance_started_at_unix_nano, 42);
+    assert!(response.rule_sets.is_empty());
+    assert!(client.get_rule_set_status(vec!["wrong-tag".into()]).await.is_err());
+    let bad = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), "wrong-secret").await.unwrap();
+    assert!(bad.get_rule_set_status(vec!["audit-rule".into()]).await.is_err());
 }

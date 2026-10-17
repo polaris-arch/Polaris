@@ -146,12 +146,22 @@ pub fn attest_core_binary(
     }
 }
 
-/// 两个路径是否指向同一文件（**纯路径判定 + 尽力 canonicalize**）。
+/// Two observations refer to the same file. Linux proc-backed observations compare
+/// device/inode identity; their canonical pathname can name a replacement or deleted file.
+/// Other platforms retain lexical/canonical path comparison.
 ///
 /// 先比字面（覆盖单测与绝大多数生产情形），再比 canonicalize 后的形（覆盖 symlink /
 /// `/var`→`/private/var` 这类 macOS 特有的等价改写）。canonicalize 失败即退回字面结论，
 /// **不因 I/O 失败就误判成"不同"**（那会平白造出一条假告警）。
 fn same_file_path(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    if b.starts_with("/proc") {
+        use std::os::unix::fs::MetadataExt;
+        return match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(expected), Ok(loaded)) => expected.dev() == loaded.dev() && expected.ino() == loaded.ino(),
+            _ => false,
+        };
+    }
     if a == b {
         return true;
     }
@@ -163,3 +173,27 @@ fn same_file_path(a: &Path, b: &Path) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod loaded_image_regressions {
+    use super::*;
+    #[test]
+    fn atomically_replaced_path_is_not_the_open_object() {
+        let dir = std::env::temp_dir().join(format!("polaris-loaded-image-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let expected = dir.join("core");
+        std::fs::write(&expected, b"old").unwrap();
+        let loaded = std::fs::File::open(&expected).unwrap();
+        use std::os::fd::AsRawFd;
+        let observed = PathBuf::from(format!("/proc/self/fd/{}", loaded.as_raw_fd()));
+        assert!(same_file_path(&expected, &observed));
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(&replacement, &expected).unwrap();
+        assert!(!matches!(attest_core_binary(&expected, Some(&observed), "", ""), CoreBinaryAttestation::SamePath));
+        std::fs::remove_file(&expected).unwrap();
+        assert!(!same_file_path(&expected, &observed));
+        drop(loaded);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

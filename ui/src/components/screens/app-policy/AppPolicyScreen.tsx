@@ -825,7 +825,7 @@ function CheckMark() {
  * `.ap-list` 有 overflow:hidden，position:absolute 在列表视图会被裁切，故不能用 CSS 默认的
  * absolute 锚定。
  */
-function PolicySelector({
+export function PolicySelector({
   appId,
   action,
   disabledRule,
@@ -847,7 +847,7 @@ function PolicySelector({
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const scheduleReveal = useRevealAfterCommit();
 
-  const anchorRef = useRef<HTMLSpanElement>(null);
+  const anchorRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
@@ -875,7 +875,11 @@ function PolicySelector({
       if (!anchorRef.current?.contains(target) && !menuRef.current?.contains(target)) close();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+        anchorRef.current?.focus();
+      }
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -902,6 +906,7 @@ function PolicySelector({
   const pick = (nextAction: RuleAction, nextTarget: string | undefined) => {
     onPick(appId, nextAction, nextTarget);
     setOpen(false);
+    anchorRef.current?.focus();
   };
 
   const view = disabledRule
@@ -911,16 +916,17 @@ function PolicySelector({
 
   return (
     <>
-      <span
+      <button
+        type="button"
         ref={anchorRef}
         className={cn('app-pol', view.cls)}
-        role="button"
-        tabIndex={0}
+        aria-haspopup="menu"
+        aria-expanded={open}
         onClick={toggleMenu}
       >
         <span className={cn('act-dot', view.dot)} />
         <span>{view.label}</span>
-      </span>
+      </button>
       {open && (
         <div
           ref={menuRef}

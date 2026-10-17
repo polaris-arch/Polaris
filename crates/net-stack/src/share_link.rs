@@ -832,7 +832,7 @@ fn parse_shadowsocks(
                     });
                 }
             }
-            None => warn(format!("解析 shadow-tls Base64 JSON 参数失败: {raw}")),
+            None => warn("解析 shadow-tls Base64 JSON 参数失败".to_string()),
         }
     }
     Ok(c)
@@ -1729,6 +1729,17 @@ fn encode_shadowsocks(c: &ServerConfig) -> Result<String, String> {
         };
         q.push("plugin", full);
     }
+    if let Some(st) = &c.shadow_tls_settings {
+        if st.password.is_empty() || st.sni.is_empty() {
+            return Err("ShadowTLS 缺少 password/sni，无法无损分享".to_string());
+        }
+        q.push("shadow-tls-password", st.password.clone());
+        q.push("shadow-tls-sni", st.sni.clone());
+        q.push_opt("shadow-tls-fp", polaris_config_engine::user_config::utls::share_fingerprint(
+            st.utls_mode, st.fingerprint.as_deref(),
+        ));
+        if let Some(port) = st.port { q.push("shadow-tls-port", port.to_string()); }
+    }
     Ok(assemble(
         "ss",
         Some(userinfo),
@@ -1880,3 +1891,7 @@ fn encode_vmess(c: &ServerConfig) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "share_link/tests/audit_regressions.rs"]
+mod audit_regressions;

@@ -65,7 +65,7 @@ export const ADAPTER_FILES = ['scripts/desktop-core/release-consumer.mjs', 'scri
   'crates/helper-proto/src/request.rs', 'crates/helper-proto/src/response.rs', 'crates/helper-proto/src/command.rs',
   'scripts/macos-nested-code.sh',
   'scripts/desktop-core/release-native-gates.mjs',
-  'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/desktop-core/bundle.mjs',
+  'scripts/fetch-core.mjs', 'scripts/fetch-cronet.mjs', 'scripts/lib/bounded-download.mjs', 'scripts/desktop-core/bundle.mjs',
   'scripts/lib/cronet-payload.mjs', 'scripts/native-payload-input.mjs', 'scripts/verify-packaging.mjs',
   'crates/updater/src/core_release.rs', 'crates/updater/src/lib.rs', 'src-tauri/src/runtime/updater.rs',
   'scripts/desktop-core/source-graph.mjs', 'scripts/lib/cronet-contract.mjs', 'scripts/assert-pc-runtime-release.mjs'];
@@ -876,12 +876,15 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     contractPublicAssets(contract)
       .map((p) => ({ name: p.name, id: p.assetId, bytes: p.bytes, url: p.url })), 'Saved public assets differ');
   // Both source and final carrier must retain the producer's bytes and permissions.
-  const source = join(root, 'resources', key, row.core.member); checkedBytes(source, row.core); verifyReleaseCore(core, row, key, run, host, undefined, contract);
-  demand((lstatSync(core).mode & 0o777) === (lstatSync(source).mode & 0o777), 'Final release core permissions differ');
+  const source = join(root, 'resources', key, row.core.member); checkedBytes(source, row.core);
+  demand(((lstatSync(core).mode | lstatSync(source).mode) & 0o7000) === 0
+      && (lstatSync(core).mode & 0o7777) === (lstatSync(source).mode & 0o7777), 'Final release core permissions differ');
+  verifyReleaseCore(core, row, key, run, host, undefined, contract);
   if (row.sidecar) {
     const lib = join(dirname(core), row.sidecar.member), original = join(root, 'resources', key, row.sidecar.member);
     checkedBytes(original, row.sidecar); inspectCronetBytes(checkedBytes(lib, row.sidecar), key);
-    demand((lstatSync(lib).mode & 0o777) === (lstatSync(original).mode & 0o777), 'Final release library permissions differ');
+    demand(((lstatSync(lib).mode | lstatSync(original).mode) & 0o7000) === 0
+      && (lstatSync(lib).mode & 0o7777) === (lstatSync(original).mode & 0o7777), 'Final release library permissions differ');
   } else demand(!readdirSync(dirname(core)).some((n) => /^libcronet\.(so|dll|dylib)$/.test(n)), 'Static carrier contains Cronet sidecar');
   const prefix = validateRow(contract, key, row) + '/';
   const payloadPins = isUpstreamRelease(contract) ? upstreamPayloadPins(contract, row)
@@ -892,7 +895,8 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     regularPath(original); regularPath(final);
     demand(digest(readFileSync(original)) === sha256 && digest(readFileSync(final)) === sha256,
       'Release notice/source/provenance bytes differ in final carrier');
-    demand((lstatSync(original).mode & 0o777) === (lstatSync(final).mode & 0o777), 'Final release notice permissions differ');
+    demand(((lstatSync(original).mode | lstatSync(final).mode) & 0o7000) === 0
+      && (lstatSync(original).mode & 0o7777) === (lstatSync(final).mode & 0o7777), 'Final release notice permissions differ');
   }
   if (isUpstreamRelease(contract)) run(process.platform === 'win32' ? 'python' : 'python3',
     ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name)],

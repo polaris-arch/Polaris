@@ -252,3 +252,6 @@ impl AppRuntime {
         &self.subscription_parse
     }
 }
+
+#[cfg(windows)]
+pub(crate) mod windows_directory;

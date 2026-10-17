@@ -211,7 +211,11 @@ fn read_response_line(
         }
         conn.set_read_timeout(remaining).map_err(ClientError::Io)?;
         let mut byte_buf = Vec::new();
-        match conn.read_until_timeout(&mut byte_buf) {
+        let result = conn.read_until_timeout(&mut byte_buf);
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        match result {
             Ok(0) => {
                 // EOF —— helper 关闭连接，返回当前已读内容（可能为空）
                 break;

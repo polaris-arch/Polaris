@@ -854,12 +854,14 @@ test('反向对照：真 aapt2 输出解析出 11 条请求 + 1 条声明，且�
   assert.equal(parsed.packageName, 'com.polaris2.app');
   assert.equal(parsed.uses.length, 11);
   assert.equal(parsed.declared.length, 1);
+  parsed.declaredProtectionLevels = { 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 };
   assert.deepEqual(permissionViolations(parsed), []);
 });
 
 test('Debug 包只重基 applicationId 权限，Release 身份与其余权限仍严格验收', () => {
   const debug = parseAapt2Permissions(AAPT2_DUMP.replaceAll('com.polaris2.app', 'com.polaris2.app.debug'));
   assert.equal(debug.packageName, 'com.polaris2.app.debug');
+  debug.declaredProtectionLevels = { 'com.polaris2.app.debug.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 };
   assert.deepEqual(permissionViolations(debug), []);
   const wrongPermission = parseAapt2Permissions(
     AAPT2_DUMP.replace('package: com.polaris2.app', 'package: com.polaris2.app.debug'),
@@ -889,6 +891,7 @@ test('M11 形态：依赖往合并 manifest 注入 QUERY_ALL_PACKAGES ⇒ 红，
       "uses-permission: name='android.permission.INTERNET'\nuses-permission: name='android.permission.QUERY_ALL_PACKAGES'",
     ),
   );
+  parsed.declaredProtectionLevels = { 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 };
   const violations = permissionViolations(parsed);
   assert.equal(violations.length, 1, `应恰 1 条违反，实为：${violations.join(' | ')}`);
   assert.match(violations[0], /没登记/);
@@ -899,6 +902,7 @@ test('M12 形态：某条腿的权限被误删 ⇒ 红，且点名那一条', ()
   const parsed = parseAapt2Permissions(
     AAPT2_DUMP.replace("uses-permission: name='android.permission.REQUEST_INSTALL_PACKAGES'\n", ''),
   );
+  parsed.declaredProtectionLevels = { 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 };
   const violations = permissionViolations(parsed);
   assert.equal(violations.length, 1, `应恰 1 条违反，实为：${violations.join(' | ')}`);
   assert.match(violations[0], /不存在/);
@@ -912,6 +916,7 @@ test('M13 形态：库悄悄多声明一条自建 permission ⇒ 红（声明面
       'permission: com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\npermission: com.polaris2.app.SOMETHING_NEW',
     ),
   );
+  parsed.declaredProtectionLevels = { 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION': 2 };
   const violations = permissionViolations(parsed);
   assert.equal(violations.length, 1, `应恰 1 条违反，实为：${violations.join(' | ')}`);
   assert.match(violations[0], /自建 permission/);

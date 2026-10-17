@@ -66,7 +66,7 @@ pub trait ManagementApi: Send + Sync {
     /// 取连接列表首帧快照（精准断连用）。
     ///
     /// 上游 `subscribeConnections(1_000_000_000, cb)` 的首帧（reset 帧 = 内核当前全量连接）。
-    /// 带 3s 兜底超时（上游 `guard = setTimeout(..., 3000)`）：首帧不来时返回空（跳过断连，
+    /// 带 3s 兜底超时（上游 `guard = setTimeout(..., 3000)`）：首帧不来时返回错误（跳过断连并报告，
     /// 宁可漏关不泄漏订阅）。返回当前全量连接快照（含已关闭的死连接历史环，由本层过滤）。
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError>;
 }
@@ -180,10 +180,13 @@ impl SwitchExecutor {
         if pairs.is_empty() {
             return PrecisionDisconnectOutcome::default();
         }
-        // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 空列表（跳过断连，不阻断热切）。
+        // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 显式错误结果（跳过断连，不阻断热切）。
         let snapshot = match api.first_connection_snapshot().await {
             Ok(s) => s,
-            Err(_) => return PrecisionDisconnectOutcome::default(),
+            Err(error) => return PrecisionDisconnectOutcome {
+                snapshot_error: Some(error.to_string()),
+                ..PrecisionDisconnectOutcome::default()
+            },
         };
         let outcome = select_connections_to_close(&snapshot, &pairs);
         // 复用 runtime 的 owned ID + 借用 API + buffer_unordered 模式，不调用 close-all。
@@ -306,3 +309,7 @@ impl ManagementApi for MockManagementApi {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "executor/tests/audit_regressions.rs"]
+mod audit_regressions;

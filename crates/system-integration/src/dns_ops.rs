@@ -542,23 +542,12 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             return self.marker.clear();
         };
 
-        let targets = self
-            .ops
-            .list_targets()
-            .unwrap_or_else(|_| original.keys().cloned().collect());
-        let restore_targets = if targets.is_empty() {
-            original.keys().cloned().collect::<Vec<_>>()
-        } else {
-            targets
-        };
-
-        // 逐服务 best-effort：单服务失败不阻断其余。
+        // Recorded custody, not today's enabled-service enumeration, owns restoration.
+        // Unavailable services retain their recovery evidence for a later retry.
         let mut all_ok = true;
-        for t in &restore_targets {
-            if let Some(ips) = original.get(t) {
-                if self.ops.apply_dns(t, ips).is_err() {
-                    all_ok = false;
-                }
+        for (target, ips) in &original {
+            if self.ops.apply_dns(target, ips).is_err() {
+                all_ok = false;
             }
         }
         if all_ok && self.marker.clear() {

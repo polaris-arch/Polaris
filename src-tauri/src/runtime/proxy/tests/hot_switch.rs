@@ -1730,19 +1730,16 @@ async fn explicit_selection_preserves_existing_apply_snapshot_fields() {
 }
 
 #[tokio::test]
-async fn selected_rule_file_write_failure_restarts_only_the_running_projection() {
-    let (rt, _dir, sink, mut running) = explicit_selection_fixture();
-    running["proxyMode"] = serde_json::json!("smart");
-    running["customRules"] = serde_json::json!([{
-        "id": "r1", "type": "domain", "values": ["synthetic.invalid"],
-        "action": "proxy", "enabled": true
-    }]);
-    rt.config.save_full(&running).unwrap();
-    let running = rt.config.current().unwrap();
-    mark_running_with_named_snapshot(&rt, &running);
-    *rt.startup_snapshot.write().unwrap() = Some(running.clone());
-    let rule_dir = rt.custom_rules_dir();
-    std::fs::create_dir_all(rule_dir.join("custom-rule-r1.json")).unwrap();
+async fn selected_rule_confirmation_failure_restarts_only_the_running_projection() {
+    let (rt, _dir, running, edited, api) = rule_debt_fixture(false);
+    let sink = rt.management_api_stub.lock().unwrap().clone().unwrap();
+    let previous_intent = rt.register_selector_intent();
+    assert!(rt.sync_custom_rule_files(&serde_json::from_value::<UserConfig>(edited).unwrap(),
+        rt.core_generation(), previous_intent).await);
+    // A preceding transaction published new rules but never committed R. The
+    // selected-only successor cannot confirm repair, and must restart only R's
+    // selected-node projection, preserving unrelated saved D edits.
+    api.fail_reads.store(true, Ordering::SeqCst);
     let mut disk = running.clone();
     disk["selectedServerId"] = serde_json::json!("node-b");
     disk["logLevel"] = serde_json::json!("debug");
@@ -1755,7 +1752,7 @@ async fn selected_rule_file_write_failure_restarts_only_the_running_projection()
             .await
             .unwrap(),
         Some(SwitchOutcome::Restarting),
-        "an actual atomic-write failure must request a restart"
+        "unconfirmed rule publication debt must request a projection-scoped restart"
     );
     let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
     assert_eq!(
@@ -4960,7 +4957,7 @@ async fn attest_runtime_selector_emits_and_keeps_running() {
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Tailscale")]);
     let my_gen = rt.gate.generation();
 
-    rt.attest_runtime_selector(&applied("A", &[]), my_gen).await;
+    rt.attest_runtime_selector(&applied("A", &[]), my_gen, rt.selector_reconcile.intent_generation()).await;
 
     let got = events.lock().unwrap().clone();
     assert_eq!(
@@ -4987,7 +4984,7 @@ async fn attest_runtime_selector_silent_when_consistent_or_superseded() {
         reassert_runtime_watching_errors(&reassert_config("node-a"), ab_tags(), BTreeMap::new());
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "A")]);
     let my_gen = rt.gate.generation();
-    rt.attest_runtime_selector(&applied("A", &[]), my_gen).await;
+    rt.attest_runtime_selector(&applied("A", &[]), my_gen, rt.selector_reconcile.intent_generation()).await;
     assert!(
         events.lock().unwrap().is_empty(),
         "运行期一致不得告警，实得 {:?}",
@@ -4996,7 +4993,7 @@ async fn attest_runtime_selector_silent_when_consistent_or_superseded() {
 
     // 世代已变：即便快照分叉、即便终局是放弃腿，也一律不报。
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Tailscale")]);
-    rt.attest_runtime_selector(&applied("A", &[]), my_gen.wrapping_add(1))
+    rt.attest_runtime_selector(&applied("A", &[]), my_gen.wrapping_add(1), rt.selector_reconcile.intent_generation())
         .await;
     rt.attest_runtime_selector(
         &ReassertOutcome {
@@ -5006,6 +5003,7 @@ async fn attest_runtime_selector_silent_when_consistent_or_superseded() {
             rule_intents: Vec::new(),
         },
         my_gen.wrapping_add(1),
+        rt.selector_reconcile.intent_generation(),
     )
     .await;
     assert!(
@@ -5631,4 +5629,215 @@ async fn owned_stop_cannot_follow_a_completed_same_generation_selector_hot_switc
     assert_eq!(rt.core_generation(), generation);
     assert_eq!(dns.writes.load(Ordering::SeqCst), writes);
     assert_eq!(std::fs::read(&dns.marker).unwrap(), dns.original_marker);
+}
+
+struct FileRuleStatusApi {
+    path: std::path::PathBuf,
+    reads: std::sync::atomic::AtomicUsize,
+    pause_second: bool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    fail_reads: std::sync::atomic::AtomicBool,
+    instances: Mutex<Vec<i64>>,
+}
+impl crate::runtime::proxy::startup::RuleContentApi for FileRuleStatusApi {
+    fn status(&self, tags: Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<polaris_singbox_grpc::daemon::RuleSetStatusResponse, ManagementError>,
+    > + Send + '_>> {
+        Box::pin(async move {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reads.load(Ordering::SeqCst) { return Err(ManagementError::NotReady); }
+            let bytes = std::fs::read(&self.path).expect("published rule file");
+            if self.pause_second && read == 1 {
+                self.entered.notify_one(); self.release.notified().await;
+            }
+            self.instances.lock().unwrap().push(42);
+            Ok(polaris_singbox_grpc::daemon::RuleSetStatusResponse {
+                instance_started_at_unix_nano: 42,
+                rule_sets: vec![polaris_singbox_grpc::daemon::RuleSetLoadStatus {
+                    tag: tags[0].clone(), active_digest: polaris_updater::sha256_hex(&bytes),
+                    revision: (read + 1) as u64, watcher_state: "watching".into(),
+                    last_error: String::new(), closed: false,
+                }],
+            })
+        })
+    }
+}
+fn rule_debt_fixture(pause_second: bool) -> (Arc<ProxyRuntime>, TestDir, Value, Value, Arc<FileRuleStatusApi>) {
+    let (rt, dir, _sink, mut a) = explicit_selection_fixture();
+    a["proxyMode"] = serde_json::json!("smart");
+    a["customRules"] = serde_json::json!([{
+        "id":"r1", "type":"domain", "values":["old.invalid"], "action":"proxy", "enabled":true
+    }]);
+    rt.config.save_full(&a).unwrap();
+    let a = rt.config.current().unwrap();
+    mark_running_with_snapshot(&rt, &a);
+    *rt.startup_snapshot.write().unwrap() = Some(a.clone());
+    let uc: UserConfig = serde_json::from_value(a.clone()).unwrap();
+    let files = build_custom_rule_files(&uc);
+    assert_eq!(files.len(), 1);
+    let (name, content) = files.iter().next().unwrap();
+    std::fs::create_dir_all(rt.custom_rules_dir()).unwrap();
+    let path = rt.custom_rules_dir().join(name);
+    crate::runtime::proxy::startup::atomic_write_custom_rule(&path, content).unwrap();
+    let api = Arc::new(FileRuleStatusApi {
+        path, reads: std::sync::atomic::AtomicUsize::new(0), pause_second,
+        entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(),
+        fail_reads: std::sync::atomic::AtomicBool::new(false), instances: Mutex::new(Vec::new()),
+    });
+    *rt.rule_content_api_stub.lock().unwrap() = Some(api.clone());
+    let mut b = a.clone();
+    b["customRules"][0]["values"] = serde_json::json!(["new.invalid"]);
+    (rt, dir, a, b, api)
+}
+fn assert_rule_bytes(api: &FileRuleStatusApi, config: &Value) {
+    let uc: UserConfig = serde_json::from_value(config.clone()).unwrap();
+    let expected = build_custom_rule_files(&uc).into_values().next().unwrap();
+    assert_eq!(polaris_updater::sha256_hex(&std::fs::read(&api.path).unwrap()),
+        polaris_updater::sha256_hex(expected.as_bytes()));
+    assert!(api.instances.lock().unwrap().iter().all(|instance| *instance == 42));
+}
+#[tokio::test]
+async fn superseded_rule_publication_then_old_r_unchanged_repairs_same_instance_digest() {
+    let (rt, _dir, a, b, api) = rule_debt_fixture(true);
+    let old = { let rt = rt.clone(); tokio::spawn(async move { rt.switch_mode_with(b, false).await }) };
+    tokio::time::timeout(Duration::from_secs(2), api.entered.notified()).await.unwrap();
+    assert!(rt.has_uncommitted_rule_content());
+    rt.register_selector_intent();
+    api.release.notify_one();
+    assert_eq!(old.await.unwrap(), SwitchOutcome::Pending);
+    assert_eq!(*rt.current_config.read().unwrap(), Some(a.clone()));
+    assert_eq!(rt.switch_mode_with(a.clone(), false).await, SwitchOutcome::Unchanged);
+    assert_rule_bytes(&api, &a);
+    assert!(!rt.has_uncommitted_rule_content());
+    assert!(api.reads.load(Ordering::SeqCst) >= 4);
+}
+#[tokio::test]
+async fn acknowledged_rules_before_later_supersession_are_debt_until_r_reconciles() {
+    let (rt, _dir, a, mut b, api) = rule_debt_fixture(false);
+    b["selectedServerId"] = serde_json::json!("node-b");
+    let sink = rt.management_api_stub.lock().unwrap().clone().unwrap();
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
+    let weak = Arc::downgrade(&rt);
+    *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+        let rt = weak.upgrade().unwrap();
+        assert!(rt.has_uncommitted_rule_content());
+        rt.register_selector_intent();
+    }));
+    assert_eq!(rt.switch_mode_with(b.clone(), false).await, SwitchOutcome::Pending);
+    assert_rule_bytes(&api, &b);
+    assert!(rt.has_uncommitted_rule_content());
+    assert_eq!(*rt.current_config.read().unwrap(), Some(a.clone()));
+    assert_eq!(rt.switch_mode_with(a.clone(), false).await, SwitchOutcome::Unchanged);
+    assert_rule_bytes(&api, &a);
+    assert!(!rt.has_uncommitted_rule_content());
+}
+#[tokio::test]
+async fn cancelled_publication_save_only_repairs_r_without_applying_saved_d() {
+    let (rt, _dir, a, mut b, api) = rule_debt_fixture(true);
+    let old = { let rt = rt.clone(); let b = b.clone(); tokio::spawn(async move { rt.switch_mode_with(b, false).await }) };
+    tokio::time::timeout(Duration::from_secs(2), api.entered.notified()).await.unwrap();
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    assert!(rt.has_uncommitted_rule_content());
+    b["logLevel"] = serde_json::json!("debug");
+    rt.config.save_full(&b).unwrap();
+    assert_eq!(rt.switch_mode_with(b.clone(), true).await, SwitchOutcome::Deferred);
+    assert_rule_bytes(&api, &a);
+    assert_eq!(*rt.current_config.read().unwrap(), Some(a));
+    assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
+    assert!(!rt.has_uncommitted_rule_content());
+}
+#[tokio::test]
+async fn failed_repair_keeps_debt_and_new_core_invalidates_old_publication() {
+    let (rt, _dir, a, b, api) = rule_debt_fixture(false);
+    let intent = rt.register_selector_intent();
+    assert!(rt.sync_custom_rule_files(&serde_json::from_value::<UserConfig>(b.clone()).unwrap(), rt.core_generation(), intent).await);
+    api.fail_reads.store(true, Ordering::SeqCst);
+    assert_eq!(rt.switch_mode_with(a.clone(), true).await, SwitchOutcome::Deferred);
+    assert!(rt.has_uncommitted_rule_content());
+    assert_eq!(*rt.current_config.read().unwrap(), Some(a));
+    assert_rule_bytes(&api, &b);
+    rt.bump_generation();
+    assert!(!rt.has_uncommitted_rule_content());
+}
+#[tokio::test]
+async fn old_rule_readback_cannot_republish_into_replacement_core_generation() {
+    let (rt, _dir, a, b, api) = rule_debt_fixture(true);
+    let old = { let rt = rt.clone(); tokio::spawn(async move { rt.switch_mode_with(b, false).await }) };
+    tokio::time::timeout(Duration::from_secs(2), api.entered.notified()).await.unwrap();
+    rt.bump_generation();
+    let content = build_custom_rule_files(&serde_json::from_value::<UserConfig>(a.clone()).unwrap()).into_values().next().unwrap();
+    crate::runtime::proxy::startup::atomic_write_custom_rule(&api.path, &content).unwrap();
+    api.release.notify_one();
+    assert_eq!(old.await.unwrap(), SwitchOutcome::Pending);
+    assert_rule_bytes(&api, &a);
+    assert!(!rt.has_uncommitted_rule_content());
+}
+
+#[tokio::test]
+async fn attest_discards_intent_or_core_replaced_while_read_is_pending() {
+    for replace_core in [false, true] {
+        let (rt, _dir, sink, events) = reassert_runtime_watching_errors(&reassert_config("node-a"), ab_tags(), BTreeMap::new());
+        let intent = rt.selector_reconcile.intent_generation();
+        let generation = rt.gate.generation();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *sink.groups_pause.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let observer = rt.clone();
+        let task = tokio::spawn(async move { observer.attest_runtime_selector(&applied("A", &[]), generation, intent).await; });
+        entered.notified().await;
+        if replace_core { rt.bump_generation(); } else {
+            let _serial = rt.switch_serial.try_lock().expect("readback must not hold switch mutex");
+            rt.register_selector_intent();
+            *rt.current_config.write().unwrap() = Some(reassert_config("node-b"));
+        }
+        *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "B")]);
+        release.notify_one(); task.await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert!(rt.status().error_code.is_none());
+    }
+}
+#[test]
+fn block_mode_attestation_checks_rule_selectors_without_global_member() {
+    let outcome = ReassertOutcome { stage1: Stage1Outcome::NoGlobalSelector, rule_intents: vec![("rule-a".into(), "A".into())] };
+    assert!(matches!(attest_runtime_selection(&outcome, Some(&[group("rule-a", "A")])), SelectorAttestation::Match));
+    assert!(matches!(attest_runtime_selection(&outcome, Some(&[group("rule-a", "B")])), SelectorAttestation::RuleDrift { .. }));
+}
+
+struct RestoreConfigDirectory { path: std::path::PathBuf, backup: std::path::PathBuf }
+impl RestoreConfigDirectory {
+    fn restore(&self) {
+        if self.backup.exists() {
+            let _ = std::fs::remove_file(&self.path);
+            std::fs::rename(&self.backup, &self.path).expect("restore config directory");
+        }
+    }
+}
+impl Drop for RestoreConfigDirectory { fn drop(&mut self) { self.restore(); } }
+#[tokio::test]
+async fn auto_failover_disk_rollback_failure_retains_persisted_target_for_reconciliation() {
+    let (rt, _dir) = test_runtime();
+    let config = two_node_config(7890, "node-a");
+    rt.config.save_full(&config).unwrap();
+    mark_running_with_snapshot(&rt, &config);
+    let candidate = RuntimeCandidate { id: "node-b".into(), name: "Node B".into(), tag: "Node B".into() };
+    let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&config).remove("node-b").unwrap();
+    let path = rt.config.dir().to_path_buf();
+    let backup = path.with_extension(format!("rollback-backup-{}", polaris_store::fs::random_tmp_suffix()));
+    let restore = RestoreConfigDirectory { path: path.clone(), backup: backup.clone() };
+    let api = AttestingManagementApi::rejecting("Node A", "Node B").with_on_first_select(move || {
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::write(&path, "injected directory blocker").unwrap();
+    });
+    let outcome = rt.auto_hot_switch_transaction_with_api(rt.core_generation(), "node-a", &candidate, &fingerprint, None, &api).await;
+    assert!(matches!(outcome, AutoHotSwitchOutcome::ReconcilePending { .. }));
+    assert_eq!(*api.selected.lock().unwrap(), "Node A");
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
+    assert_eq!(rt.status().error_code.as_deref(), Some(code::EXIT_MISMATCH));
+    assert_eq!(rt.status().pid, 424242);
+    restore.restore();
+    let persisted: Value = serde_json::from_slice(&std::fs::read(rt.config.dir().join("config.json")).unwrap()).unwrap();
+    assert_eq!(persisted["selectedServerId"], "node-b");
 }

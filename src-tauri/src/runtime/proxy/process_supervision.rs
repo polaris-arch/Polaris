@@ -1829,13 +1829,10 @@ pub(super) fn image_from_managed_status(
 /// [`running_exe_path`] 的 linux 实现：`/proc/<pid>/exe` 符号链接（内核直给）。
 #[cfg(target_os = "linux")]
 fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
-    let p = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    // 内核对「映像已被替换/删除」的进程追加 " (deleted)"，剥掉还原真实路径（否则恒判不等 = 假告警）。
-    let s = p.to_string_lossy();
-    Some(
-        s.strip_suffix(" (deleted)")
-            .map_or_else(|| p.clone(), PathBuf::from),
-    )
+    let loaded = PathBuf::from(format!("/proc/{pid}/exe"));
+    std::fs::read_link(&loaded).ok()?;
+    // Observe and execute the loaded object, never a mutable reconstructed pathname.
+    Some(loaded)
 }
 
 /// [`running_exe_path`] 的 macOS 实现：`ps -p <pid> -o comm=`（无 `/proc`）。

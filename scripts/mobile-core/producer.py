@@ -25,7 +25,7 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import ROOT, canonical, load, require, sha, verify_source, tool_environment
+from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha, verify_source, tool_environment
 from android_sdk import prepare_view
 from plan import plan
 from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
@@ -144,6 +144,10 @@ def _project_run_logs(sink, raw_sinks, starts, counts, encoding, errors):
 
 def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
         observation_fd=None, observation_phase=None, observation_slot=None):
+    if args and str(args[0]) == 'git':
+        env = git_environment(env)
+        if cwd is not None:
+            require_git_root(cwd)
     require(capture in ('full', 'none'), 'unknown tool capture mode')
     require(capture != 'none' or log is not None, 'capture none requires complete original logs')
     if observation_phase is None and BORROWED_PROGRESS_FD is not None:
@@ -933,7 +937,7 @@ def execute(args):
             print(json.dumps({'phase': 'component-native-capacity', 'platform': args.platform,
                               'capacity': capacity, 'compilerCapacityApplied': True}), flush=True)
             recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
-            from fork_input import bind_command
+            from fork_input import git_environment, require_git_root, bind_command
             command = bind_command(args.platform, value, tools['gomobile'], staged, fp, jar)
             # One direct bind; no helper API21/macOS/tvOS/git-describe side effects.
             log = work / 'stage-original-bind.log'

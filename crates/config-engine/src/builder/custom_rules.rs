@@ -297,7 +297,7 @@ pub fn apply_rule_action(
         RuleAction::Proxy => Some({
             // anti-drift：指定目标节点的规则 → 指向独立 rule-sel-<ruleId> selector，绝不直绑节点。
             if let Some(rid) = rule_id {
-                format!("rule-sel-{rid}")
+                crate::builder::helpers::custom_rule_selector_tag(rid)
             } else if let Some(tid) = target_server_id {
                 id_to_tag_map
                     .get(tid)

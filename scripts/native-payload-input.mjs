@@ -25,6 +25,7 @@ export function inspectNativePayload(root, key, core, library, run = execFileSyn
   requireGraph(basename(core) === (key === 'win' ? 'sing-box.exe' : 'sing-box')
     && basename(library) === (key === 'win' ? 'libcronet.dll' : 'libcronet.so')
     && dirname(core) === dirname(library), 'Canonical colocated payload required');
+  requireGraph(((lstatSync(core).mode | lstatSync(library).mode) & 0o7000) === 0, 'Special payload permissions forbidden');
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
   if (hasDesktopRelease(manifest)) {
     const contract = loadReleaseContract(root, manifest);

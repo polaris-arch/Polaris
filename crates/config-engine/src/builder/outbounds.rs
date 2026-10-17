@@ -1428,7 +1428,7 @@ fn generate_rule_selectors(
         }
         emit(
             &format!("custom:{}", rule.id),
-            &format!("rule-sel-{}", rule.id),
+            &crate::builder::helpers::custom_rule_selector_tag(&rule.id),
             rule.route_target_server_id(),
             &mut existing_tags,
             outbounds,

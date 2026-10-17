@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · [English](README.en.md) · **繁體中文** · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安裝)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**北極星** — 基於 sing-box 的跨平台網路代理用戶端。Tauri 2（Rust + React）。
+**北極星** — 基於 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的跨平台網路代理用戶端。Tauri 2（Rust + React）。
 
 ![首頁](docs/screenshots/home.png)
 
@@ -58,16 +58,14 @@
 
 從 [Releases](https://github.com/polaris-arch/Polaris/releases) 下載對應平台的安裝檔。
 
-### v1.0.0 已發布下載
-
-以下為 [v1.0.0 已發布資產](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0)；版本與檔名以所選 Release 為準。桌面提供 macOS Apple Silicon / Intel、Windows x64、Linux amd64；此版本 Android 提供正式簽署的 ARM64 APK。可用同頁 `SHA256SUMS` 核對下載檔案。
+目前發布流程依 [release-assets.mjs](scripts/release-assets.mjs) 使用以下檔名，`<version>` 為應用程式版本（不含 `v` 前綴）。macOS 按 Apple Silicon / Intel 分包，Windows 為 x64，Linux 為 amd64；Android 依序為 ARM64、ARMv7 和 universal，universal 僅含這兩種 ARM 架構，不含 x86。下載時以所選 Release 的實際附件為準，並用同頁 `SHA256SUMS` 核對檔案。
 
 | 平台 | 檔案 |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`；免安裝版用 `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 桌面安裝檔目前不做付費程式碼簽章，首次啟動需依平台放行。
 
@@ -96,20 +94,11 @@ SmartScreen 提示時選擇「其他資訊」→「仍要執行」。
 
 ## 建置
 
-以下供維護者建置目前原始碼，範例為 Linux；不代表上文 v1.0.0 下載包的建置輸入或安裝驗收。平台打包約定見下方建置文件。
+以下供維護者建置目前原始碼，範例為 Linux；原始碼建置成功不等於已發布安裝包通過執行驗收。平台相依套件、行動工具鏈與打包約定見下方建置文件。
 
-原始碼建置入口：[桌面與 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [行動核心與固定工具鏈](scripts/mobile-core/README.md)。iOS 提供原始碼建置說明，沒有已發布 IPA；無簽章編譯與自行簽署後安裝至實機是不同步驟，均不能取代執行驗收。
+原始碼建置入口：[桌面與 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [行動核心與固定工具鏈](scripts/mobile-core/README.md)。
 
-### 目前原始碼打包命名
-
-目前建置流程依 [release-assets.mjs](scripts/release-assets.mjs) 使用以下命名，`<version>` 為應用版本佔位符。這些是打包約定，不是上方 v1.0.0 的歷史檔名；能否下載仍以所選 Release 的實際附件為準。Android universal 僅含 ARM64 / ARMv7，不含 x86。
-
-| 平台 | 打包命名 |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+iOS 目前不提供 IPA 或越獄包，越獄相容性未驗證。非越獄裝置自行簽署需具備 Network Extension 能力的 Apple Developer Program 帳號，以及匹配 App、PacketTunnel 與 App Group 權限的 [provisioning profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)；免費 [Personal Team 不支援 NE provider](https://developer.apple.com/forums/thread/128767)，側載本身不會授予這些權限。編譯成功或安裝成功均不能取代執行驗收。
 
 需要 Rust stable、Node.js 24+（CI 目前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
@@ -166,7 +155,8 @@ Android 將 libbox 載入應用程式行程，採用行動端 VPN 整合，不�
 
 | 專案 | 用途 |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (官方上游)](https://github.com/SagerNet/sing-box) | 核心目前開發倉庫；凍結原始碼、版本與既有 polaris-box 資產仍以所選建置清單為準 |
+| [sing-box-polaris（實際使用的 fork）](https://github.com/polaris-arch/sing-box-polaris) | 實際使用的核心 fork；凍結原始碼、版本與 polaris-box 資產以所選建置清單為準 |
+| [sing-box（原始上游）](https://github.com/SagerNet/sing-box) | 原始上游專案與技術來源；保留致謝 |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | 桌面執行階段 |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | NaiveProxy 的 libcronet |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | 內建面板 |

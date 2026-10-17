@@ -15,6 +15,9 @@ use super::{
 /// sing-box 顶层配置（`singbox-config-types.ts:388 SingBoxConfig`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SingBoxConfig {
+    /// Optional capability-bound Windows directory handshake, preserved through typed serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polaris_windows_directory: Option<serde_json::Value>,
     pub log: LogConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
@@ -116,3 +119,7 @@ pub struct HttpClient {
     /// 上游出站 tag。取 `route.final`（= 核的默认出站）以逐字保持隐式回落时的拨号路径。
     pub detour: String,
 }
+
+#[cfg(test)]
+#[path = "config/tests/audit_regressions.rs"]
+mod audit_regressions;

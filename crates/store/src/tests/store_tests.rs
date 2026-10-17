@@ -89,26 +89,29 @@ fn load_corrupt_json_returns_default_and_does_not_overwrite_disk() {
 }
 
 #[test]
-fn load_bad_field_keeps_good_fields_and_preserves_disk() {
-    // 维度7 #7：坏字段（servers 非 array）被跳过，好字段（customRules）保留；
-    // 磁盘原文件原样保留（sanitize 只改内存 Value，不落盘）。
+fn load_malformed_collection_is_rejected_and_preserves_disk() {
+    // 结构损坏必须走错误备份分支，不能在无关迁移时覆盖原始数据。
     let original = r#"{
             "proxyMode": "smart",
             "proxyModeType": "systemProxy",
             "logLevel": "info",
             "mixedPort": 7890,
             "servers": "not-an-array",
+            "keepTrayMenuWarmDefaultMigrated": false,
             "customRules": [{"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}],
             "tunConfig": {"mtu":1350,"autoRoute":true,"strictRoute":true}
         }"#;
     let fs = MockFs::default().with(Path::new(CFG), original);
     let res = ConfigStore::load(&fs, Path::new(CFG));
-    assert!(res.loaded_from_disk);
-    assert!(res.error.is_none());
-    // 坏字段已从内存配置剔除（servers 缺失 → finalize 填 []）
-    assert_eq!(res.config["servers"], serde_json::json!([]));
-    // 好字段保留
-    assert_eq!(res.config["customRules"].as_array().unwrap().len(), 1);
+    assert!(!res.loaded_from_disk);
+    assert!(!res.was_missing);
+    assert!(matches!(res.error, Some(StoreError::Validation(_))));
+    assert!(!res.migration_delta.changed);
+    let recovery = fs.operations().into_iter().find_map(|op| match op {
+        FsOp::Copy(from, to) if from == Path::new(CFG) && to.to_string_lossy().contains("corrupt-") => Some(to),
+        _ => None,
+    }).expect("malformed collection must have a recovery copy");
+    assert_eq!(fs.snapshot(&recovery).as_deref(), Some(original));
     // 磁盘原文件原样保留（load 不落盘；迁移落盘由调用方 best-effort 决定）
     assert_eq!(fs.snapshot(Path::new(CFG)).as_deref(), Some(original));
 }

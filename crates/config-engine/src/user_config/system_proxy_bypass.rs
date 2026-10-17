@@ -152,7 +152,8 @@ pub fn is_ip_cidr(s: &str) -> bool {
 pub fn bypass_lan_cidrs(list: &[String]) -> Vec<String> {
     list.iter()
         .map(|s| s.trim().to_string())
-        .filter(|s| is_ip_cidr(s))
+        .filter(|s| s.contains('/'))
+        .filter_map(|s| crate::user_config::cidr::normalize_cidr(&s))
         .collect()
 }
 
@@ -202,3 +203,7 @@ pub fn format_bypass_for_linux(list: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "system_proxy_bypass/tests/audit_regressions.rs"]
+mod audit_regressions;

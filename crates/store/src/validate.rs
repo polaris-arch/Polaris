@@ -318,6 +318,12 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
 /// 规则 `networkProfileId` 指向不存在的场景**不在这里拦**：删场景、导入缺场景的备份都合法，
 /// 生成侧 fail-closed；只在规则 IPC 写入时拦（`commands::rules` 的 `RULE_INVALID`）。
 pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
+    for cidr in value.get("bypassLANList").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        if cidr.contains('/') && polaris_config_engine::user_config::cidr::normalize_cidr(cidr).is_none() {
+            return Err(crate::StoreError::validation(format!("invalid bypassLANList CIDR: {cidr}")));
+        }
+    }
+
     validate_raw_mesh_inbound_policies(value)?;
     use polaris_config_engine::user_config::{is_valid_search_domain, BUILTIN_NETENV_DHCP_ID};
     for key in ["dnsServers", "dnsServerGroups", "networkProfiles"] {
@@ -421,3 +427,7 @@ fn validate_port(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "validate/tests/audit_regressions.rs"]
+mod audit_regressions;

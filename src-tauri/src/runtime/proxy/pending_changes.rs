@@ -208,7 +208,7 @@ impl ProxyRuntime {
             added,
             modified,
             removed,
-            restart_deferred: non_node_pending || selected_pending,
+            restart_deferred: non_node_pending || selected_pending || self.has_uncommitted_rule_content(),
         }
     }
 
@@ -312,7 +312,7 @@ impl ProxyRuntime {
         });
         // Retain exclusive leases until process_deferred_deletions returns,
         // including the durable journal acknowledgement (or its failure).
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", windows))]
         let mut directory_leases = Vec::new();
         let config_dir = self.config.dir().to_path_buf();
         let result = self.config.process_deferred_deletions(|entry, current| {
@@ -345,7 +345,7 @@ impl ProxyRuntime {
                     app_id,
                 ),
                 DeferredConfigDeletion::TailscaleState { server_id } => {
-                    if cfg!(target_os = "ios") {
+                    if cfg!(any(target_os = "ios", windows)) {
                         return Err("CleanupUnknown: unbound legacy directory intent".into());
                     }
                     match self.mesh.tailscale_logout_under_gate(
@@ -384,7 +384,18 @@ impl ProxyRuntime {
                         directory_leases.push(lease);
                         Ok(())
                     }
-                    #[cfg(not(target_os = "ios"))]
+                    #[cfg(windows)]
+                    {
+                        if self.mesh.directory_in_use(&intent.server_id, self.tailscale_writer_alive()) {
+                            return Err("CleanupUnknown: directory is still in use".into());
+                        }
+                        let mut lease = crate::runtime::windows_directory::DirectoryLease::acquire_intent(&config_dir, intent)
+                            .map_err(|error| format!("CleanupUnknown: directory custody retained: {error}"))?;
+                        lease.commit(intent, current).map_err(|error| format!("CleanupUnknown: directory commit retained: {error}"))?;
+                        directory_leases.push(lease);
+                        Ok(())
+                    }
+                    #[cfg(not(any(target_os = "ios", windows)))]
                     {
                         let _ = intent;
                         Err(

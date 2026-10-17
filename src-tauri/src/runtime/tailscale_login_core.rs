@@ -3361,7 +3361,9 @@ impl LoginCoreRegistry {
             let actual =
                 crate::runtime::tailscale_directory::DirectoryLease::actual_directory(root, &id)
                     .map_err(|error| error.to_string())?;
-            #[cfg(not(target_os = "ios"))]
+            #[cfg(windows)]
+            let actual = crate::runtime::windows_directory::actual_directory(root, &id).map_err(|error| error.to_string())?;
+            #[cfg(not(any(target_os = "ios", windows)))]
             let actual = path.to_path_buf();
             if directories.insert(id.clone(), actual).is_some() {
                 return Err("Tailscale endpoint state_directory is duplicated".into());
@@ -4701,7 +4703,12 @@ impl LoginCoreRegistry {
             Ok(config) => config,
             Err(_) => return StartLoginOutcome::Failed("invalidNode".into()),
         };
-        let json_cfg = login_config_to_json(&cfg);
+        #[allow(unused_mut)]
+        let mut json_cfg = login_config_to_json(&cfg);
+        #[cfg(windows)]
+        if crate::runtime::windows_directory::bind_configuration_json(&mut json_cfg, user_data).is_err() {
+            return StartLoginOutcome::Failed("configWriteFailed".into());
+        }
         let config_path = login_config_path(user_data, &server.id, epoch);
         let bytes = match serde_json::to_vec_pretty(&json_cfg) {
             Ok(b) => b,

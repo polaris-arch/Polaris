@@ -2052,7 +2052,7 @@ async fn uncancelled_start_still_burns_the_whole_retry_budget() {
 }
 
 #[tokio::test]
-async fn sync_custom_rule_files_updates_content_but_never_deletes() {
+async fn sync_custom_rule_files_without_native_confirmation_never_writes_or_deletes() {
     let (rt, _dir) = test_runtime();
     let crdir = rt.custom_rules_dir();
     std::fs::create_dir_all(&crdir).unwrap();
@@ -2062,11 +2062,10 @@ async fn sync_custom_rule_files_updates_content_but_never_deletes() {
     let cfg = smart_config_with_ext_rule();
     let expected = build_custom_rule_files(&cfg);
 
-    rt.sync_custom_rule_files(&cfg).await;
+    assert!(!rt.sync_custom_rule_files(&cfg, rt.gate.generation(), rt.selector_reconcile.intent_generation()).await);
 
-    // 期望文件被写（内容变 → 原子替换）。
-    for (name, content) in &expected {
-        assert_eq!(&std::fs::read_to_string(crdir.join(name)).unwrap(), content);
+    for name in expected.keys() {
+        assert!(!crdir.join(name).exists(), "no confirmation capability must not publish bytes");
     }
     // 绝不删：本轮期望集外的既存文件仍在（删除只在起核 write_custom_rule_files 清扫）。
     assert!(
@@ -4592,7 +4591,10 @@ fn the_management_secret_has_a_single_reader() {
         .flat_map(|dir| {
             crate::test_support::module_files(dir)
                 .into_iter()
-                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+                .inspect(move |(path, _)| {
+                    assert!(path.starts_with(format!("{dir}/").as_str()));
+                    assert!(!path.starts_with(format!("{dir}/{dir}/").as_str()));
+                })
         })
         .filter_map(|(path, source)| {
             let code = polaris_source_probe::mask_comments(&source);
@@ -4623,7 +4625,10 @@ fn the_management_secret_has_a_single_reader() {
         .flat_map(|dir| {
             crate::test_support::module_files(dir)
                 .into_iter()
-                .map(move |(path, source)| (format!("{dir}/{path}"), source))
+                .inspect(move |(path, _)| {
+                    assert!(path.starts_with(format!("{dir}/").as_str()));
+                    assert!(!path.starts_with(format!("{dir}/{dir}/").as_str()));
+                })
         })
         .filter(|(_, source)| {
             polaris_source_probe::mask_comments(source).contains("fn management_endpoint(")

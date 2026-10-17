@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · **Русский** · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
 [![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
 [![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#установка)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**Polaris** — кроссплатформенный клиент сетевого прокси на базе sing-box. Tauri 2 (Rust + React).
+**Polaris** — кроссплатформенный клиент сетевого прокси на базе [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Tauri 2 (Rust + React).
 
 ![Главная](docs/screenshots/home.png)
 
@@ -58,16 +58,14 @@
 
 Скачайте пакет для своей платформы со страницы [Releases](https://github.com/polaris-arch/Polaris/releases).
 
-### Опубликованные файлы v1.0.0
-
-Ниже перечислены [опубликованные файлы v1.0.0](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0); версию и имена файлов сверяйте с выбранным релизом. Настольные пакеты доступны для macOS Apple Silicon / Intel, Windows x64 и Linux amd64. В этом релизе для Android опубликован подписанный APK ARM64. Проверьте загрузки по файлу `SHA256SUMS` на странице релиза.
+Текущий процесс выпуска использует имена файлов из [release-assets.mjs](scripts/release-assets.mjs); `<version>` — версия приложения без префикса `v`. Для macOS предусмотрены отдельные пакеты Apple Silicon / Intel, для Windows — x64, для Linux — amd64. Пакеты Android перечислены в порядке ARM64, ARMv7 и universal; universal содержит только эти две архитектуры ARM, без x86. Наличие загрузок определяется фактическими файлами выбранного релиза. Проверьте файлы по `SHA256SUMS` на странице релиза.
 
 | Платформа | Файл |
 |---|---|
-| macOS | `Polaris_1.0.0_aarch64-mac-arm64.dmg` / `Polaris_1.0.0_x64-mac-x64.dmg` |
-| Windows | `Polaris_1.0.0_x64-win-setup.exe`; портативная сборка — `polaris-portable-v1.0.0.zip` |
-| Linux | `Polaris_1.0.0_amd64.deb` / `Polaris_1.0.0_amd64.AppImage` |
-| Android | `polaris-1.0.0-android-arm64.apk` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
 Настольные пакеты не подписываются платным сертификатом подписи кода; при первом запуске может потребоваться ручное разрешение.
 
@@ -92,20 +90,11 @@
 
 ## Сборка
 
-Раздел предназначен для разработчиков, собирающих текущий исходный код; пример приведён для Linux. Он не описывает входные данные сборки или результаты проверки установки файлов v1.0.0 выше. Правила упаковки для платформ приведены в руководстве по сборке ниже.
+Раздел предназначен для разработчиков, собирающих текущий исходный код; пример приведён для Linux. Успешная сборка исходного кода не подтверждает проверку работы опубликованных пакетов. Зависимости платформ, мобильные инструменты и правила упаковки описаны в руководствах ниже.
 
-Сборка из исходного кода: [настольные платформы и Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [мобильное ядро и фиксированные инструменты](scripts/mobile-core/README.md). Для iOS есть инструкция по сборке, но нет опубликованного IPA. Компиляция без подписи и установка на устройство с собственной подписью — отдельные этапы; они не заменяют проверку работы приложения.
+Сборка из исходного кода: [настольные платформы и Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [мобильное ядро и фиксированные инструменты](scripts/mobile-core/README.md).
 
-### Имена пакетов текущего исходного кода
-
-Текущий процесс сборки использует имена из [release-assets.mjs](scripts/release-assets.mjs); `<version>` обозначает версию приложения. Это правила упаковки, отличающиеся от исторических имён v1.0.0 выше; доступность загрузок определяется фактическими файлами выбранного релиза. Android universal содержит только ARM64 / ARMv7, без x86.
-
-| Платформа | Имена пакетов |
-|---|---|
-| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
-| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
-| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
-| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
+Для iOS сейчас не публикуются IPA или пакеты для jailbreak; совместимость с jailbreak не проверена. Самостоятельная подпись для устройства без jailbreak требует аккаунта Apple Developer Program с возможностью Network Extension и [профилей provisioning](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles), соответствующих правам App, PacketTunnel и App Group. Бесплатная [Personal Team не поддерживает NE provider](https://developer.apple.com/forums/thread/128767), а установка вне магазина сама по себе не даёт этих прав. Успешная компиляция или установка не заменяет проверку работы.
 
 Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26), pnpm 11.24.0, Go и [Tauri CLI 2](https://v2.tauri.app/).
 
@@ -158,7 +147,8 @@ resources/   Ядро sing-box + libcronet (загружаются при сбо
 
 | Проект | Назначение |
 |---|---|
-| [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) / [sing-box (официальный апстрим)](https://github.com/SagerNet/sing-box) | Текущий репозиторий разработки ядра; фиксированные исходники, версия и существующие файлы polaris-box определяются выбранным манифестом сборки |
+| [sing-box-polaris (используемый форк)](https://github.com/polaris-arch/sing-box-polaris) | Форк ядра, используемый Polaris; фиксированные исходники, версия и файлы polaris-box определяются выбранным манифестом сборки |
+| [sing-box (исходный upstream)](https://github.com/SagerNet/sing-box) | Исходный проект и техническая основа; благодарность разработчикам |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Десктопная среда выполнения |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet для NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Встроенная панель |
