@@ -259,13 +259,16 @@ fn legacy_unmarked_directory_is_never_adopted() {
 }
 #[test]
 fn target_symlink_is_rejected_but_valid_special_ids_still_connect() {
-    let fixture = Fixture::new();
     for id in ["Node", "NÖDE", "no\u{0308}de", ".polaris-directory-control"] {
+        // Each spelling is independently valid; case/Unicode aliases may name the
+        // same directory on macOS and must not be created twice in one fixture.
+        let fixture = Fixture::new();
         let lease = acquire_physical(&fixture.0, id, true).unwrap();
         lease.create_new().unwrap();
         drop(lease);
         assert!(acquire_physical(&fixture.0, id, false).is_ok());
     }
+    let fixture = Fixture::new();
     std::os::unix::fs::symlink(&fixture.0, fixture.0.join("tailscale-g4-v1/node-link")).unwrap();
     assert!(acquire_physical(&fixture.0, "node-link", false).is_err());
 }

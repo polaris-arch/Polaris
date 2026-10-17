@@ -223,5 +223,23 @@ class ReviewedSourcePolicy(unittest.TestCase):
                         with self.assertRaises(RuntimeError): verify_source(root, value)
 
 
+def current_mobile_graph_fixture(value, source):
+    """Inert source directories and Go modinfo matching the selected contract."""
+    source = Path(source).resolve()
+    source.mkdir(parents=True, exist_ok=True)
+    graph = [{'Path': value['goModule'], 'Main': True, 'Dir': str(source)}]
+    raw = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
+    if 'sourcePolicy' in value:
+        meta = value['sourcePolicy']['metacubex']
+        for name, version, relative in [(meta['module'], meta['version'], meta['replacementPath']),
+                ('github.com/sagernet/sing-tun', 'v0.0.0-fixture', './third_party/sing-tun')]:
+            directory = source / relative[2:]
+            directory.mkdir(parents=True, exist_ok=True)
+            graph.append({'Path': name, 'Version': version,
+                          'Replace': {'Path': relative, 'Dir': str(directory)}})
+            raw += 'dep\t' + name + '\t' + version + '\n=>\t' + relative + '\t(devel)\t\n'
+    return graph, raw
+
+
 if __name__ == '__main__':
     unittest.main()

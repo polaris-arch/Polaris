@@ -4596,14 +4596,28 @@ fn the_management_secret_has_a_single_reader() {
             })
             .count()
     }
+    // module_files includes both the module root file and its descendant directory.
+    fn belongs_to_module(path: &str, dir: &str) -> bool {
+        (path == format!("{dir}.rs") || path.starts_with(format!("{dir}/").as_str()))
+            && !path.starts_with(format!("{dir}/{dir}/").as_str())
+    }
+    for dir in ["runtime", "commands"] {
+        assert!(belongs_to_module(&format!("{dir}.rs"), dir));
+        assert!(belongs_to_module(&format!("{dir}/nested/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}/{dir}/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}_other/reader.rs"), dir));
+        assert!(!belongs_to_module("other/reader.rs", dir));
+    }
     let mut found: Vec<(String, usize, usize)> = ["runtime", "commands"]
         .into_iter()
         .flat_map(|dir| {
             crate::test_support::module_files(dir)
                 .into_iter()
                 .inspect(move |(path, _)| {
-                    assert!(path.starts_with(format!("{dir}/").as_str()));
-                    assert!(!path.starts_with(format!("{dir}/{dir}/").as_str()));
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
                 })
         })
         .filter_map(|(path, source)| {
@@ -4636,8 +4650,10 @@ fn the_management_secret_has_a_single_reader() {
             crate::test_support::module_files(dir)
                 .into_iter()
                 .inspect(move |(path, _)| {
-                    assert!(path.starts_with(format!("{dir}/").as_str()));
-                    assert!(!path.starts_with(format!("{dir}/{dir}/").as_str()));
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
                 })
         })
         .filter(|(_, source)| {

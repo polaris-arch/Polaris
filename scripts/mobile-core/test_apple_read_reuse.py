@@ -261,16 +261,18 @@ class AppleReadReuse(unittest.TestCase):
         fixtures = module('final_native_platform_fixture', 'scripts/apple-carrier.test.py')
         framework, binary, header, derived, selected = self.link_fixture(root)
         current = {'candidate': 'a' * 40}
-        binding = {'producer': current, 'moduleGraph': [{'Path': value['goModule'], 'Main': True}]}
+        from test_source_policy import current_mobile_graph_fixture
+        graph, module_info = current_mobile_graph_fixture(value, root / 'source')
+        binding = {'producer': current, 'moduleGraph': graph}
         build_id = 'polaris-mobile-' + artifacts.receipt_digest(binding)
         tags = set(value['apple']['tags']) | {'ios'} | ({'iossimulator'} if simulator else set())
-        raw_info = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
+        raw_info = module_info
         raw_info += ''.join('build\t' + key + '=' + val + '\n' for key, val in {
             'GOOS': 'ios', 'GOARCH': arch, 'CGO_ENABLED': '1', '-buildmode': 'c-archive',
             '-trimpath': 'true', '-tags': ','.join(sorted(tags))}.items())
         def native_binary(role, *, load_commands=()):
             return fixtures.mach_object(target,
-                fixtures.inline(raw_info) if role == 'extension' else None,
+                fixtures.inline(raw_info, version='go' + value['goVersion']) if role == 'extension' else None,
                 build_id if role == 'extension' else None,
                 kind=2, minimum=17 << 16, sdk=sdk, load_commands=load_commands)
         native = {role: native_binary(role) for role in ('app', 'extension')}

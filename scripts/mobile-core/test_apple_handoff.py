@@ -435,7 +435,8 @@ class AppleHandoffControls(unittest.TestCase):
             source = component / 'build-view'; source.mkdir(mode=0o755)
             generated = source / 'build'; (generated / 'empty').mkdir(parents=True)
             (generated / 'marker').write_bytes(b'actual generated structural fixture')
-            graph = [{'Path': value['goModule'], 'Main': True, 'Dir': str(source)}]
+            from test_source_policy import current_mobile_graph_fixture
+            graph, module_info = current_mobile_graph_fixture(value, source)
             binding = {'sourceContract': value, 'sourceObservation': {
                 'sourceCommit': value['sourceCommit'], 'sourceTree': value['sourceTree']},
                 'sourceOverlay': 0, 'moduleGraph': graph, 'producer': self.app}
@@ -443,14 +444,14 @@ class AppleHandoffControls(unittest.TestCase):
             objects = {}
             def archive(target, arch, simulator):
                 tags = set(value['apple']['tags']) | {'ios'} | ({'iossimulator'} if simulator else set())
-                raw_info = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
+                raw_info = module_info
                 raw_info += ''.join('build\t' + k + '=' + v + '\n' for k, v in {
                     'GOOS': 'ios', 'GOARCH': arch, 'CGO_ENABLED': '1', '-buildmode': 'c-archive',
                     '-trimpath': 'true', '-tags': ','.join(sorted(tags))}.items())
                 native = fixtures.mach_object(target)
                 path = scratch / (target + '.o'); path.write_bytes(native)
                 objects[str(path)] = {'kind': 'compiler-object', **file_pin(path)}
-                return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info), build_id)),
+                return fixtures.archive([('go.o', fixtures.mach_object(target, fixtures.inline(raw_info, version='go' + value['goVersion']), build_id)),
                                          ('native.o', native)])
             device = single_fat_archive(archive('ios-arm64', 'arm64', False))
             simulator = archive('ios-arm64-simulator', 'arm64', True)

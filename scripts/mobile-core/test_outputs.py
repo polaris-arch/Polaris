@@ -733,6 +733,7 @@ class FormalOutputs(unittest.TestCase):
                 reason = 'revision/base/release differs' if admission_refuses else 'controlled source refusal'
                 with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'JAVA_HOME_17_X64': str(jdk),
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
+                        patch('ci_android.load', return_value=self.value), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
                         patch('ci_android.native_capacity', return_value=
@@ -1019,6 +1020,7 @@ class FormalOutputs(unittest.TestCase):
             # Native-origin verification is isolated; the full framework/native
             # parser, source-contract comparison and every consumer boundary run.
             with patch('artifacts.check_buildinfo'), patch('native_inputs.verify'), \
+                    patch('consume.load', return_value=self.value), \
                     patch('consume.lease', return_value=nullcontext((work, cache))), \
                     patch('consume.app_identity', return_value={'candidate': 'a' * 40}), \
                     patch('consume.apple_resources', return_value={}):

@@ -1987,7 +1987,7 @@ async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
     Ok(resp.body)
 }
 
-/// 下载 + 落盘（不写 config；config upsert 由 [`persist_resources`] 批量做）。
+/// 下载到调用方提供的暂存目录；不写 config，文件发布与配置更新由调用方事务提交。
 /// # gh 加速的回退腿
 ///
 /// 设置页对「GitHub 加速」的承诺是「留空回退直连；**下载失败自动回退直连兜底**」

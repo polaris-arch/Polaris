@@ -1,7 +1,7 @@
 {
   "schema": "audit-remediation-source-inventory-v1",
   "repository": "polaris-arch/Polaris",
-  "status": "Second complete App batch9f356015 collected all native lint/test and classifier failures; consolidated source/fixture/module-graph repair frozen for independent review and a new GitHub CI batch. Local full classifier retains one cloud socket environment failure, not PASS. Kernel68ffb209 passed all four workflows and is merged to polaris-main; App candidate/SYSTEM acceptance remains unexecuted.",
+  "status": "App44c5 complete CI collected; native clippy, UI, classifier and four desktop installers passed. Focused rustdoc/source-probe/macOS fixture repairs and exact68ff mobile source migration await independent review and new CI. App candidate/SYSTEM acceptance remains unexecuted; kernel68ff passed its workflows and is merged.",
   "files": [
     {
       "path": ".github/workflows/ci.yml",
@@ -1003,22 +1003,31 @@
       "bytes": 59345
     },
     {
+      "path": "scripts/mobile-core/source-contract.json",
+      "owner": "app-ci-round3",
+      "baseBlob": "1929325a8d27b27120066dc1bdcb036328f89ba9",
+      "mode": "100644",
+      "newBlob": "01d2b4082f46606b11f4adcae2beb9d452984d40",
+      "newSHA256": "1bc4023e1555ff1d6993875a3d68233340ae51ee52cad5abbeb81bf02a441095",
+      "bytes": 5711
+    },
+    {
       "path": "scripts/mobile-core/test_apple_handoff.py",
       "owner": "app-ci-round2",
       "baseBlob": "06797e89bae9bd12fb2a023282c7fb49175ff636",
       "mode": "100644",
-      "newBlob": "877b579a00f303a33c62992fa500f3bb569bf770",
-      "newSHA256": "1f1676db5e4276ca52f26f8f778b9783be4b4d28904e5a175a0fdf8f7ef95e46",
-      "bytes": 54710
+      "newBlob": "e5f509d642c3b01276f1af6431dddf55f57e1a21",
+      "newSHA256": "db2842749c1e9d9d2b35c300f67b0a79bd6669ad431e9be37f54bc8707979c64",
+      "bytes": 54754
     },
     {
       "path": "scripts/mobile-core/test_apple_read_reuse.py",
       "owner": "app-ci-round2",
       "baseBlob": "66936a7e1b702840d3e9b43d27b8fad44c774ba4",
       "mode": "100644",
-      "newBlob": "8283a62d7d974aa65855ab3ea9cf3afcd2eb9789",
-      "newSHA256": "bb0c3582f09e5afb16d538f67a3f433c980612c8160e1b4d0f35b804b65cd7ef",
-      "bytes": 27533
+      "newBlob": "794ceafff4ca1f18db906faca2b8efe56fbb069a",
+      "newSHA256": "1948aa1ddd236f00b1694bd2817266690f28dba8e82c3b07469de993a494f043",
+      "bytes": 27624
     },
     {
       "path": "scripts/mobile-core/test_delivery_boundaries.py",
@@ -1030,6 +1039,15 @@
       "bytes": 3717
     },
     {
+      "path": "scripts/mobile-core/test_outputs.py",
+      "owner": "app-ci-round3",
+      "baseBlob": "8193016492efa86919ac397b08bf331bbc98e3bc",
+      "mode": "100644",
+      "newBlob": "0d5e413a6db3d6cc43f873f62bc8b47849976f9b",
+      "newSHA256": "81b9e70b79a6bb966fbf853bec12f54489f95193bd57078caeb7cd1c6aeba390",
+      "bytes": 80703
+    },
+    {
       "path": "scripts/mobile-core/test_producer.py",
       "owner": "app-ci-round2",
       "baseBlob": "cc51c7df9e3da5f7c701056a22240602e9d173cb",
@@ -1037,6 +1055,15 @@
       "newBlob": "cb04f92036ab98c17153fa54380fa2d64bbf54f1",
       "newSHA256": "9648fed5d7d4908305a95f4995860c2dbe82973ef6fd44956bf514265e186e3a",
       "bytes": 47690
+    },
+    {
+      "path": "scripts/mobile-core/test_source_policy.py",
+      "owner": "app-ci-round3",
+      "baseBlob": "8918cd5a0a4a14a895f7ed8a34f3f5f97a1f48bc",
+      "mode": "100644",
+      "newBlob": "1af30bdfce0ed0dc9186a56d48e8c4f61e643d7e",
+      "newSHA256": "ca564639b44773967be069c826ca313c522a782758a468c95dc30503980bac47",
+      "bytes": 14864
     },
     {
       "path": "scripts/native-payload-input.mjs",
@@ -1132,10 +1159,10 @@
       "path": "src-tauri/src/commands/rules/resources.rs",
       "owner": "runtime",
       "baseBlob": "0a942936722e6ec01fa1728c4e79a690f14458f8",
-      "newBlob": "6763e3e04706244535262a260e385db9ce4ae064",
-      "newSHA256": "e441f65dcfd8bd176367e882c81fcbfea67de7fa43f4b6fad79b6417bec9b352",
+      "newBlob": "e56d8f93b349a61558a3250c47a353eb8d2d195d",
+      "newSHA256": "fe2c24bcec7fb6f4982d7581c20169ff189072382a4987c553f3f768fdaf0013",
       "mode": "100644",
-      "bytes": 104103
+      "bytes": 104126
     },
     {
       "path": "src-tauri/src/commands/rules/resources/tests/download_identity_regressions.rs",
@@ -1438,10 +1465,10 @@
       "path": "src-tauri/src/runtime/proxy/tests/startup.rs",
       "owner": "hot-app",
       "baseBlob": "f2bf6b216331d0dc3df4b3eda8397a0257b42a44",
-      "newBlob": "9b5a5106ca43c26e44282e488fe3527c032145f6",
-      "newSHA256": "172d0789c7f64983586ec09282ad0b9235deeb1850f787d7968d8f3c6e239cf7",
+      "newBlob": "bb3aa3ad7fd2386f636f32c8b8abad07c4f746de",
+      "newSHA256": "d4847bc2216f6d7faa192975597f5c8fd9fd42060eeef7dcb12e3c22ceec0c56",
       "mode": "100644",
-      "bytes": 208921
+      "bytes": 209637
     },
     {
       "path": "src-tauri/src/runtime/speedtest.rs",
@@ -1511,9 +1538,9 @@
       "owner": "app-ci-round2",
       "baseBlob": "b104be3d9b1aa9e9ec3e5792021da82082d4fe0f",
       "mode": "100644",
-      "newBlob": "f81df76aca431fcd436e14f57c303d37e8837fb9",
-      "newSHA256": "504b894b712aa0eaf0d6528b587ded9bd81648300629275e39df70e56c76b1d2",
-      "bytes": 14941
+      "newBlob": "bc8098862447f439e9e2b1aa98a3d0e7c12b328a",
+      "newSHA256": "7fc39c81d160a851f45e8f10cf3b0c1299c2fa04fcfd777dd57e57b0ee47c0bc",
+      "bytes": 15143
     },
     {
       "path": "src-tauri/src/runtime/tailscale_login_core.rs",
