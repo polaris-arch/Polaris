@@ -340,11 +340,9 @@ impl CliProbeCache {
 static CLI_CACHE: CliProbeCache = CliProbeCache::new();
 const TRANSIENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn cached_cli(path: &Path) -> Option<CliObservation> {
     CLI_CACHE.observed(path)
-}
-pub(crate) fn cached_digest_matches(path: &Path, expected: &str) -> bool {
-    cached_cli(path).is_some_and(|entry| entry.snapshot.binary_sha256.as_deref() == Some(expected))
 }
 
 async fn open_observation(path: &Path) -> Result<CliObservation, String> {
@@ -393,24 +391,46 @@ enum ProbeFile {
 }
 
 pub(crate) async fn probe_cli(path: &Path) -> Snapshot {
+    match probe_cli_observation(path).await {
+        Ok(entry) => entry.snapshot,
+        Err(snapshot) => snapshot,
+    }
+}
+
+/// Return this query's retained file proof with its snapshot. A caller crossing
+/// an await must not recover that proof from the bounded, shared lookup cache.
+pub(crate) async fn probe_cli_observation(path: &Path) -> Result<CliObservation, Snapshot> {
     CLI_CACHE
-        .probe_at(path, std::time::Instant::now(), ProbeFile::Native)
+        .probe_observation_at(path, std::time::Instant::now(), ProbeFile::Native)
         .await
 }
 impl CliProbeCache {
+    #[cfg(all(test, unix))]
     async fn probe_at(
         &self,
         path: &Path,
         now: std::time::Instant,
         file_kind: ProbeFile,
     ) -> Snapshot {
+        match self.probe_observation_at(path, now, file_kind).await {
+            Ok(entry) => entry.snapshot,
+            Err(snapshot) => snapshot,
+        }
+    }
+
+    async fn probe_observation_at(
+        &self,
+        path: &Path,
+        now: std::time::Instant,
+        file_kind: ProbeFile,
+    ) -> Result<CliObservation, Snapshot> {
         let fresh = |entry: &CliObservation| entry.retry_at.is_none_or(|retry| now < retry);
         if let Some(entry) = self.observed(path).filter(fresh) {
-            return entry.snapshot;
+            return Ok(entry);
         }
         let _query = self.query.lock().await;
         if let Some(entry) = self.observed(path).filter(fresh) {
-            return entry.snapshot;
+            return Ok(entry);
         }
         // A temporary query failure invalidates the result, not the proven file
         // bytes. Retry that same retained object without hashing it again.
@@ -418,7 +438,7 @@ impl CliProbeCache {
             Some(entry) => entry,
             None => match open_observation(path).await {
                 Ok(entry) => entry,
-                Err(reason) => return Snapshot::unavailable(reason),
+                Err(reason) => return Err(Snapshot::unavailable(reason)),
             },
         };
         use std::io::{Read, Seek};
@@ -450,7 +470,7 @@ impl CliProbeCache {
             .retryable
             .then(|| std::time::Instant::now() + TRANSIENT_RETRY_DELAY);
         if !entry.still_current() {
-            return Snapshot::unavailable("Core changed during capability query");
+            return Err(Snapshot::unavailable("Core changed during capability query"));
         }
         if let Ok(mut cache) = self.entries.lock() {
             cache.retain(|old| old.path != path);
@@ -459,7 +479,7 @@ impl CliProbeCache {
             }
             cache.push(entry.clone());
         }
-        entry.snapshot
+        Ok(entry)
     }
 }
 

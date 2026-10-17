@@ -3060,7 +3060,13 @@ impl TempCoreSession {
         let keep_config = matches!(deps.log_level.as_str(), "debug" | "trace");
         let cfg = build_temp_core_config(nodes, &ports, &deps.log_level);
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let tls_capabilities = crate::runtime::tls_fingerprints::probe_cli(&binary).await;
+        let tls_observation =
+            crate::runtime::tls_fingerprints::probe_cli_observation(&binary).await;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let tls_capabilities = match &tls_observation {
+            Ok(observation) => &observation.snapshot,
+            Err(snapshot) => snapshot,
+        };
         #[cfg(target_os = "android")]
         let tls_capabilities = crate::runtime::proxy::temp_tls_fingerprint_capabilities().await;
         #[cfg(target_os = "ios")]
@@ -3147,7 +3153,12 @@ impl TempCoreSession {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(expected) = tls_capabilities.binary_sha256.as_deref() {
-            if !crate::runtime::tls_fingerprints::cached_digest_matches(&binary, expected) {
+            // Retain the exact proof returned by this probe across config-check awaits.
+            // Eviction from the four-entry shared cache is not a byte replacement.
+            if !tls_observation.as_ref().is_ok_and(|observation| {
+                observation.matches(&binary)
+                    && observation.snapshot.binary_sha256.as_deref() == Some(expected)
+            }) {
                 retire_temp_config(&config_path, keep_config);
                 return BatchOutcome::Failed {
                     detail: "Core bytes changed after temporary-core validation".into(),

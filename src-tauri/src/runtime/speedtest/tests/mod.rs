@@ -4126,6 +4126,67 @@ async fn every_batch_boundary_is_bridged_by_two_heartbeats() {
     cleanup(&h.dir);
 }
 
+/// Deterministic cache pressure inside the actual pre-spawn config-check await.
+/// Script-wrapper bytes are hashed but never executed on any desktop platform.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct EvictingCapabilityChecker {
+    replace_binary: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[async_trait]
+impl ConfigChecker for EvictingCapabilityChecker {
+    async fn check(&self, binary: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        for index in 0..4 {
+            let other = binary.with_file_name(format!("cache-pressure-{index}"));
+            // Each invocation creates distinct paths even in a multi-batch round.
+            let other = other.with_extension(uuid::Uuid::new_v4().to_string());
+            std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+            let snapshot = crate::runtime::tls_fingerprints::probe_cli(&other).await;
+            assert!(snapshot.binary_sha256.is_some());
+        }
+        assert!(
+            crate::runtime::tls_fingerprints::cached_cli(binary).is_none(),
+            "the selected binary must actually be evicted before check returns"
+        );
+        if self.replace_binary {
+            let modified = std::fs::metadata(binary).unwrap().modified().unwrap();
+            let replacement = binary.with_extension("replacement");
+            // Same length and restored mtime: only the retained file identity detects it.
+            std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            std::fs::rename(&replacement, binary).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn cache_eviction_does_not_hide_a_binary_replacement_during_check() {
+    let mut h = harness(true, false, vec![20_001, 20_002, 20_003]);
+    h.deps.checker = Arc::new(EvictingCapabilityChecker {
+        replace_binary: true,
+    });
+    let (out, events) = run_round(&h, &three_nodes()).await;
+    assert!(
+        matches!(out, TempCoreOutcome::Failed(ref detail)
+            if detail == "Core bytes changed after temporary-core validation"),
+        "the retained proof must reject a real replacement even after eviction: {out:?}"
+    );
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(
+        events.is_empty(),
+        "no measurement events may escape a rejected binary"
+    );
+    cleanup(&h.dir);
+}
+
 /// 🔴 **中间某一批就绪失败时，空窗仍然被切开** —— 就绪心跳里 `|| progress.tested() > 0` 那半个判据
 /// 的**唯一**触发路径。
 ///
@@ -4166,7 +4227,7 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
     let doomed: Vec<String> = batches[1].iter().map(|n| n.id.clone()).collect();
 
     // 第 2 批：spawn 成功、走进就绪门、耗满预算后失败（**不是** spawn 失败）。
-    let h = harness_opts(
+    let mut h = harness_opts(
         true,
         false,
         (0..TEMP_CORE_BATCH_MAX_NODES)
@@ -4177,6 +4238,14 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
             ..Default::default()
         },
     );
+    // Force the shared capability lookup to forget this batch during check.
+    // The live batch must retain its own file proof and still run all three batches.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        h.deps.checker = Arc::new(EvictingCapabilityChecker {
+            replace_binary: false,
+        });
+    }
     let (out, events) = run_round(&h, &nodes).await;
 
     let TempCoreOutcome::Ran { results, outcome } = out else {

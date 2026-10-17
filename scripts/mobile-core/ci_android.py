@@ -11,18 +11,25 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import ROOT, canonical, load, require, sha, verify_source
+from fork_input import ROOT, canonical, load, require, sha, verify_source, validate, git_environment
 from producer import run, private_dir, producer_code, android_build_code
 from budget import native_capacity, native_environment
 
 
 def prepare_source(source, value):
+    value = validate(value)  # Reject invalid pins before creating/fetching a source slot.
     source = Path(source)
     if not source.exists():
-        run(['git', 'init', '--quiet', source])
+        env = git_environment()
+        run(['git', 'init', '--quiet', source], env=env)
         ref = 'refs/tags/' + value['sourceTag']
-        run(['git', '-C', source, 'fetch', '--depth=1', '--no-tags', value['sourceURL'], ref + ':' + ref])
-        run(['git', '-C', source, 'checkout', '--detach', value['sourceCommit']])
+        # The public tag name can move. Fetch the immutable annotated object,
+        # preserving its local name so verify_source checks the entire pinned
+        # tag/object/commit/tree chain. An unavailable object must fail closed;
+        # never fall back to the currently advertised tag or default branch.
+        run(['git', '-C', source, 'fetch', '--depth=1', '--no-tags', value['sourceURL'],
+             value['sourceTagObject'] + ':' + ref], env=env)
+        run(['git', '-C', source, 'checkout', '--detach', value['sourceCommit']], env=env)
     return verify_source(source, value)
 
 

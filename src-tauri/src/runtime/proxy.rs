@@ -1993,7 +1993,11 @@ impl ProxyRuntime {
     /// 返回 `Some` ⟺ 核运行且起核时成功注入了探测池（`probe_pool_ports` 非空）；否则 `None`（测速回退活跃出口）。
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
-    pub(crate) fn remember_temp_core_sha256(&self, digest: Option<String>) {
+    pub(crate) fn remember_temp_core_sha256(
+        &self,
+        digest: Option<String>,
+        _proof: Option<crate::runtime::tls_fingerprints::CliObservation>,
+    ) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             #[cfg(not(test))]
@@ -2006,8 +2010,12 @@ impl ProxyRuntime {
                 .and_then(|path| path.clone())
                 .map(core_binary::CoreSelectionObservation::fixture);
             let captured = source.and_then(|source| {
-                let cli = crate::runtime::tls_fingerprints::cached_cli(source.path())?;
-                (digest.is_some() && cli.snapshot.binary_sha256 == digest).then_some((source, cli))
+                let cli = _proof?;
+                (source.is_current()
+                    && cli.matches(source.path())
+                    && digest.is_some()
+                    && cli.snapshot.binary_sha256 == digest)
+                    .then_some((source, cli))
             });
             if let Ok(mut slot) = self.captured_temp_cli_source.lock() {
                 *slot = captured;

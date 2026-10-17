@@ -358,6 +358,13 @@ function rows(markup: string): { id: string; chunk: string }[] {
   }));
 }
 
+/** Shared row lookup for all rendered-settings suites; absence must fail the assertion. */
+function rowOf(markup: string, id: string): string {
+  const row = rows(markup).find((r) => r.id === id);
+  expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
+  return row?.chunk ?? '';
+}
+
 /** 带 `role="switch"` 的行 id（顺序即 DOM 顺序）。 */
 function switchRows(markup: string): string[] {
   return rows(markup)
@@ -2257,12 +2264,6 @@ describe('⑪ 设置页不再读 `proxyModeType`：TUN 专属的行在错的值�
  * 免得「什么都没渲染出来」把断言骗过去。
  */
 describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规则 2）', () => {
-  const rowOf = (markup: string, id: string): string => {
-    const row = rows(markup).find((r) => r.id === id);
-    expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
-    return row?.chunk ?? '';
-  };
-
   it('自检：另一份夹具真的渲染得出来，且 race 档确实被翻到了「竞速」', () => {
     const race = dnsMarkup({ resolveNodeDomainsAhead: true });
     expect(race.length).toBeGreaterThan(400);

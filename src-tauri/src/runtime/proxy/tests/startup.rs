@@ -4698,3 +4698,41 @@ fn accepted_config_cache_changes_when_core_bytes_change_with_same_path_size_and_
     assert_ne!(before.binary_sha256, after.binary_sha256);
     assert_ne!(before, after);
 }
+
+/// Use the same retained-proof validator as each production gate iteration.
+/// Eviction cannot veto unchanged bytes or allow a replacement to inherit them.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement() {
+    use crate::runtime::proxy::startup::validate_startup_cli_proof;
+    use crate::runtime::tls_fingerprints::{cached_cli, probe_cli, probe_cli_observation};
+    let (_rt, dir) = test_runtime();
+    let binary = dir.join("startup-proof");
+    std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+    let proof = probe_cli_observation(&binary).await.unwrap();
+    for index in 0..4 {
+        let other = dir.join(format!("startup-cache-pressure-{index}"));
+        std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+        assert!(probe_cli(&other).await.binary_sha256.is_some());
+    }
+    assert!(cached_cli(&binary).is_none(), "exercise actual cache eviction");
+    validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)).unwrap();
+    assert!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, None).is_err(),
+        "a missing retained proof must not be accepted merely because cache eviction is allowed"
+    );
+    let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
+    let replacement = dir.join("startup-replacement");
+    std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    assert_eq!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)),
+        Err("Core bytes changed after capability query; retry startup".into())
+    );
+}

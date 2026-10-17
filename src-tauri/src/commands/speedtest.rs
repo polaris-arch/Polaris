@@ -2128,8 +2128,9 @@ async fn run_temp_core_speed_test(
 
     let proxy = state.proxy.clone();
     let user_config = user_config_for_temp_core(config);
-    let temp_core_sha256 = proxy.tls_fingerprint_capabilities().await.binary_sha256;
-    proxy.remember_temp_core_sha256(temp_core_sha256.clone());
+    let (capabilities, proof) = proxy.tls_fingerprint_capabilities_observed().await;
+    let temp_core_sha256 = capabilities.binary_sha256;
+    proxy.remember_temp_core_sha256(temp_core_sha256.clone(), proof);
     let bind_interfaces: BTreeMap<String, String> = servers
         .iter()
         .filter_map(|server| {

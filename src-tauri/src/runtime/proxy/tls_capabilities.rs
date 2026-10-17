@@ -1,5 +1,6 @@
 use super::ProxyRuntime;
 use crate::runtime::tls_fingerprints::Snapshot;
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
 use std::path::Path;
 
 impl ProxyRuntime {
@@ -47,6 +48,17 @@ impl ProxyRuntime {
     }
 
     pub(crate) async fn tls_fingerprint_capabilities(&self) -> Snapshot {
+        self.tls_fingerprint_capabilities_observed().await.0
+    }
+
+    /// Acquisition may transfer its exact proof to a measurement identity;
+    /// an unrelated cache refresh must not erase that observation in between.
+    pub(crate) async fn tls_fingerprint_capabilities_observed(
+        &self,
+    ) -> (
+        Snapshot,
+        Option<crate::runtime::tls_fingerprints::CliObservation>,
+    ) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let generation = self.core_generation();
@@ -58,7 +70,7 @@ impl ProxyRuntime {
             {
                 let (identity, entry) = match self.direct_tls_binding(generation) {
                     Ok(bound) => bound,
-                    Err(reason) => return Snapshot::unavailable(reason),
+                    Err(reason) => return (Snapshot::unavailable(reason), None),
                 };
                 // Transient startup/query errors can recover on focus or another
                 // capability request, using the original file proof and custody.
@@ -68,48 +80,66 @@ impl ProxyRuntime {
                         if current.same_run(&identity)
                             && proof.snapshot.binary_sha256 == refreshed.binary_sha256 =>
                     {
-                        refreshed
+                        (refreshed, None)
                     }
-                    _ => Snapshot::unavailable("Core instance changed during capability retry"),
+                    _ => (
+                        Snapshot::unavailable("Core instance changed during capability retry"),
+                        None,
+                    ),
                 };
             }
             // Linux /proc/<pid>/exe identifies the loaded image even after rename.
             #[cfg(not(target_os = "linux"))]
             if status.running {
-                return Snapshot::unavailable("Helper loaded-image byte proof is unavailable");
+                return (
+                    Snapshot::unavailable("Helper loaded-image byte proof is unavailable"),
+                    None,
+                );
             }
             let binary = match self.tls_capability_binary() {
                 Ok(path) => path,
-                Err(e) => return Snapshot::unavailable(e),
+                Err(e) => return (Snapshot::unavailable(e), None),
             };
-            let snapshot = crate::runtime::tls_fingerprints::probe_cli(&binary).await;
+            let (snapshot, proof) =
+                match crate::runtime::tls_fingerprints::probe_cli_observation(&binary).await {
+                    Ok(proof) => (proof.snapshot.clone(), Some(proof)),
+                    Err(snapshot) => (snapshot, None),
+                };
             let current = self.status();
             if generation != self.core_generation()
                 || status.pid != current.pid
                 || status.running != current.running
             {
-                return Snapshot::unavailable("Core selection changed during capability query");
+                return (
+                    Snapshot::unavailable("Core selection changed during capability query"),
+                    None,
+                );
             }
-            snapshot
+            (snapshot, proof)
         }
         #[cfg(target_os = "android")]
         {
-            super::android_bridge::tls_fingerprint_capabilities().await
+            (
+                super::android_bridge::tls_fingerprint_capabilities().await,
+                None,
+            )
         }
         #[cfg(target_os = "ios")]
         {
-            match tauri_plugin_polaris_ios::tls_fingerprint_capabilities().await {
+            let snapshot = match tauri_plugin_polaris_ios::tls_fingerprint_capabilities().await {
                 Ok(reply) => Snapshot::from_native(
                     reply.document.as_deref(),
                     &reply.binary_sha256,
                     "packet-tunnel-executable",
                 ),
                 Err(reason) => Snapshot::unavailable(reason),
-            }
+            };
+            (snapshot, None)
         }
     }
 
     /// Startup supplies its exact binary, rather than a UI version probe path.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
     pub(super) async fn tls_fingerprint_capabilities_for(&self, binary: Option<&Path>) -> Snapshot {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {

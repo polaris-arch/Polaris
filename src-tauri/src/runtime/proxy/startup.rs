@@ -1499,8 +1499,9 @@ impl ProxyRuntime {
             let startup_cli_proof = if let Ok(path) = &binary_res {
                 // The gate below reuses this observation. Keep the same proof
                 // across every await; a later menu refresh cannot substitute it.
-                self.tls_fingerprint_capabilities_for(Some(path)).await;
-                crate::runtime::tls_fingerprints::cached_cli(path)
+                crate::runtime::tls_fingerprints::probe_cli_observation(path)
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -3943,6 +3944,19 @@ impl ProxyRuntime {
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let cli_observation = match binary {
+            Some(path) => crate::runtime::tls_fingerprints::probe_cli_observation(path).await,
+            None => Err(crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                "No selected core binary",
+            )),
+        };
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let capabilities = match &cli_observation {
+            Ok(observation) => &observation.snapshot,
+            Err(snapshot) => snapshot,
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let capabilities = self.tls_fingerprint_capabilities_for(binary).await;
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
@@ -3966,11 +3980,8 @@ impl ProxyRuntime {
             capabilities.validate_config(
                 &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
             )?;
-            if let (Some(bin), Some(before)) = (binary, capabilities.binary_sha256.as_deref()) {
-                if !crate::runtime::tls_fingerprints::cached_digest_matches(bin, before) {
-                    return Err("Core bytes changed after capability query; retry startup".into());
-                }
-            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            validate_startup_cli_proof(binary, capabilities, cli_observation.as_ref().ok())?;
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
             // The iOS managed Start keeps logical bytes in memory until the
@@ -4175,6 +4186,24 @@ impl ProxyRuntime {
             .ok()
             .is_some_and(|core| cronet_lib_exists_beside_core(&core, std::env::consts::OS))
     }
+}
+
+/// Validate this gate's retained query proof, including after a peel/check await.
+/// Shared lookup eviction is unrelated to whether these selected bytes changed.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(super) fn validate_startup_cli_proof(
+    binary: Option<&Path>,
+    capabilities: &crate::runtime::tls_fingerprints::Snapshot,
+    proof: Option<&crate::runtime::tls_fingerprints::CliObservation>,
+) -> Result<(), String> {
+    if let (Some(binary), Some(expected)) = (binary, capabilities.binary_sha256.as_deref()) {
+        if !proof.is_some_and(|proof| {
+            proof.matches(binary) && proof.snapshot.binary_sha256.as_deref() == Some(expected)
+        }) {
+            return Err("Core bytes changed after capability query; retry startup".into());
+        }
+    }
+    Ok(())
 }
 
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
