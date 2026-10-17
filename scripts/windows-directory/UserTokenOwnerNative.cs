@@ -148,10 +148,7 @@ namespace Polaris.WindowsAcceptance {
         internal static object TokenContext(IntPtr token) {
             return new Dictionary<string,object> {
                 { "defaultDacl", Observe(() => TokenDefaultAcl(token)) },
-                { "sessionId", Observe(() => {
-                    IntPtr info = Information(token, TokenSessionId);
-                    try { return unchecked((uint)Marshal.ReadInt32(info)); } finally { Marshal.FreeHGlobal(info); }
-                }) },
+                { "sessionId", Observe(() => SessionId(token)) },
                 { "integrity", Observe(() => {
                     IntPtr info = Information(token, TokenIntegrityLevel);
                     try { return new Dictionary<string,object> {
@@ -212,6 +209,28 @@ namespace Polaris.WindowsAcceptance {
                 Check(GetUserObjectSecurity(handle, ref requested, buffer, size, out size), "Read current user object security");
                 return Sddl(buffer);
             } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        internal static uint SessionId(IntPtr token) {
+            IntPtr info = Information(token, TokenSessionId);
+            try { return unchecked((uint)Marshal.ReadInt32(info)); }
+            finally { Marshal.FreeHGlobal(info); }
+        }
+        internal static int CurrentProcessSessionId() {
+            using (var current = Process.GetCurrentProcess()) return current.SessionId;
+        }
+        internal static string VerifiedExistingDesktop(IntPtr original, IntPtr token) {
+            // Single-variable diagnostic: use only the observed existing desktop.
+            // Never create/switch a desktop or grant access. An unexpected runner
+            // session/name stops this experiment before process creation.
+            IntPtr station = GetProcessWindowStation(), desktop = GetThreadDesktop(GetCurrentThreadId());
+            Check(station != IntPtr.Zero && desktop != IntPtr.Zero, "Read existing diagnostic desktop handles");
+            if (!String.Equals((string)UserObjectInfo(station, 2), "WinSta0", StringComparison.Ordinal)
+                || !String.Equals((string)UserObjectInfo(desktop, 2), "Default", StringComparison.Ordinal))
+                throw new InvalidOperationException("Diagnostic runner desktop differs from observed WinSta0/Default");
+            int currentSession = CurrentProcessSessionId();
+            if (currentSession < 0 || SessionId(original) != (uint)currentSession || SessionId(token) != (uint)currentSession)
+                throw new InvalidOperationException("Diagnostic runner/token sessions differ");
+            return @"winsta0\default";
         }
         internal static object CurrentUserObject(bool station) {
             // Borrow current handles. Do not close them, switch desktop/station,
@@ -400,6 +419,7 @@ namespace Polaris.WindowsAcceptance {
             // or substitute for the actual child-token / owner / target result.
             return new Dictionary<string,object> {
                 { "schemaVersion", 1 }, { "phase", "beforeCreateProcessWithTokenW" },
+                { "currentProcessSessionId", Native.Observe(() => Native.CurrentProcessSessionId()) },
                 { "originalToken", Native.TokenContext(original) },
                 { "privateToken", Native.TokenContext(duplicate) },
                 { "originalTokenObjectSecurity", Native.Observe(() => Native.TokenObjectSecurity(original, true)) },
@@ -417,7 +437,7 @@ namespace Polaris.WindowsAcceptance {
         public ChildProcess Start(string executable, string worker, string config, string directory) {
             if (duplicate == IntPtr.Zero) throw new ObjectDisposedException("PrivateToken");
             if (Normalized == null) throw new InvalidOperationException("Owner normalization must precede child creation");
-            return new ChildProcess(duplicate, Original, executable, worker, config, directory);
+            return new ChildProcess(duplicate, Original, executable, worker, config, directory, Native.VerifiedExistingDesktop(original, duplicate));
         }
         public void Dispose() {
             if (duplicate != IntPtr.Zero) { Native.CloseHandle(duplicate); duplicate = IntPtr.Zero; }
@@ -430,7 +450,7 @@ namespace Polaris.WindowsAcceptance {
         private bool assigned, resumed;
         public uint ProcessId { get; private set; }
         public TokenSnapshot Token { get; private set; }
-        internal ChildProcess(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory) {
+        internal ChildProcess(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop) {
             IntPtr environment = IntPtr.Zero;
             try {
                 job = Native.CreateJobObjectW(IntPtr.Zero, null);
@@ -439,6 +459,8 @@ namespace Polaris.WindowsAcceptance {
                 limits.BasicLimitInformation.LimitFlags = 0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                 Native.Check(Native.SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf(limits)), "Configure kill-on-close job");
                 var startup = new Native.STARTUPINFO(); startup.cb = Marshal.SizeOf(startup);
+                // Explicit existing desktop avoids the API's NULL-desktop permission adjustment.
+                startup.lpDesktop = verifiedDesktop;
                 var command = new StringBuilder(Native.Quote(executable) + " -NoLogo -NoProfile -NonInteractive -File " + Native.Quote(worker) + " -ConfigurationPath " + Native.Quote(config));
                 if (command.Length >= 1024) throw new InvalidOperationException("Acceptance child command exceeds CreateProcessWithTokenW limit");
                 environment = Native.EnvironmentBlock();

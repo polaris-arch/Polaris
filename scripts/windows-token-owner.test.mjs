@@ -190,7 +190,8 @@ function auditReadOnlyDiagnostics({ native, parent }) {
   assert.match(native, /QueryServiceStatusEx\(service, 0, buffer, size, out size\)/);
   assert.match(native, /QueryServiceConfigW\(service, buffer, size, out size\)/);
   assert.doesNotMatch(native + parent, /StartService\w*\(|ChangeServiceConfig\w*\(|ControlService\w*\(|SetUserObjectSecurity\(|SetSecurityInfo\(|SetKernelObjectSecurity\(|SetThreadDesktop\(|SetProcessWindowStation\(/);
-  assert.equal([...native.matchAll(/lpDesktop/g)].length, 1);
+  assert.equal([...native.matchAll(/lpDesktop/g)].length, 2);
+  assert.match(native, /startup\.lpDesktop = verifiedDesktop;/);
   ordered(parent, '$lease.Normalize()', '$configuration | ConvertTo-Json', '$workingDirectory = (Get-Location).Path',
     '$state.launchDiagnostics = $lease.ReadLaunchDiagnostics($executable,$worker,$configurationPath,$workingDirectory)', 'Save-OwnerAttempt $state',
     'catch { $state.launchDiagnosticsFailureEvidence = Convert-ExceptionEvidence $_.Exception }',
@@ -288,4 +289,42 @@ for (const [name, before, after] of [
 ]) test(`diagnostic scheduling rejects ${name}`, () => {
   assert.ok(sources.workflow.includes(before));
   assert.throws(() => checkDiagnosticScheduling(sources.workflow.replaceAll(before, after)));
+});
+
+// This is a bounded hypothesis test of the documented NULL-desktop branch,
+// not proof that desktop permissions caused the observed access denial.
+function auditExplicitDesktop(native) {
+  const preflight = native.split('internal static string VerifiedExistingDesktop(')[1]?.split('internal static object CurrentUserObject(')[0];
+  assert.ok(preflight);
+  assert.match(native, /"currentProcessSessionId", Native\.Observe\(\(\) => Native\.CurrentProcessSessionId\(\)\)/);
+  ordered(preflight, 'GetProcessWindowStation()', 'GetThreadDesktop(GetCurrentThreadId())',
+    'Check(station != IntPtr.Zero && desktop != IntPtr.Zero',
+    'if (!String.Equals((string)UserObjectInfo(station, 2), "WinSta0", StringComparison.Ordinal)',
+    '|| !String.Equals((string)UserObjectInfo(desktop, 2), "Default", StringComparison.Ordinal))',
+    'throw new InvalidOperationException("Diagnostic runner desktop',
+    'int currentSession = CurrentProcessSessionId();',
+    'if (currentSession < 0 || SessionId(original) != (uint)currentSession || SessionId(token) != (uint)currentSession)',
+    'throw new InvalidOperationException("Diagnostic runner/token session',
+    'return @"winsta0\\default";');
+  assert.doesNotMatch(preflight, /catch|Observe\(|Set\w+\(|CloseHandle\(/);
+  assert.match(native, /return new ChildProcess\(duplicate, Original, executable, worker, config, directory, Native\.VerifiedExistingDesktop\(original, duplicate\)\);/);
+  assert.match(native, /internal ChildProcess\(IntPtr token, TokenSnapshot original, string executable, string worker, string config, string directory, string verifiedDesktop\)/);
+  ordered(native, 'startup.cb = Marshal.SizeOf(startup)', 'startup.lpDesktop = verifiedDesktop;', 'Native.CreateProcessWithTokenW(');
+  assert.equal([...native.matchAll(/startup\.lpDesktop\s*=/g)].length, 1);
+}
+test('explicit desktop requires observed names and all three session identities before creation', () => auditExplicitDesktop(sources.native));
+for (const [name, before, after] of [
+  ['wrong station', '"WinSta0", StringComparison.Ordinal', '"Other", StringComparison.Ordinal'],
+  ['wrong desktop', '"Default", StringComparison.Ordinal', '"Other", StringComparison.Ordinal'],
+  ['missing handle validation', 'Check(station != IntPtr.Zero && desktop != IntPtr.Zero', 'Check(true'],
+  ['missing process session', 'int currentSession = CurrentProcessSessionId();', 'int currentSession = 2;'],
+  ['missing original session', 'SessionId(original) != (uint)currentSession || ', ''],
+  ['missing private session', ' || SessionId(token) != (uint)currentSession', ''],
+  ['preflight bypass', 'Native.VerifiedExistingDesktop(original, duplicate)', 'null'],
+  ['NULL desktop', 'startup.lpDesktop = verifiedDesktop;', 'startup.lpDesktop = null;'],
+  ['caller-selected desktop', 'return @"winsta0\\default";', 'return Environment.GetEnvironmentVariable("DESKTOP");'],
+  ['name failure swallowed', 'IntPtr station = GetProcessWindowStation()', 'try { } catch { } IntPtr station = GetProcessWindowStation()'],
+]) test(`explicit desktop rejects ${name}`, () => {
+  assert.ok(sources.native.includes(before), name);
+  assert.throws(() => auditExplicitDesktop(sources.native.replace(before, after)), { name: 'AssertionError' });
 });
