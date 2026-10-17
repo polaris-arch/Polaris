@@ -25,6 +25,7 @@ fn record(
 
 fn identity(run: u64, path: MeasurePath) -> ResultIdentity {
     ResultIdentity {
+        core_binary_sha256: None,
         run,
         seq: 1,
         origin: SpeedTestOrigin::Manual,
@@ -45,6 +46,7 @@ fn identity(run: u64, path: MeasurePath) -> ResultIdentity {
 
 fn context(fingerprints: &BTreeMap<String, String>) -> ReadContext<'_> {
     ReadContext {
+        core_binary_sha256: None,
         main_generation: Some(7),
         fingerprints,
         main_connections: Box::leak(Box::new(connections())),

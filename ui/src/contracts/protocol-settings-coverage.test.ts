@@ -600,6 +600,15 @@ function protoStructIndex(proto: string, struct: string): EditorIndex {
     expect(decl, `${file} 里没解析到顶层声明 ${obj} —— 解析不到必须转红`).toBeDefined();
     const span = objectPropSpan(idx.masked, idx.raw, decl as Span, obj, proto);
     take(idx.raw.slice(span.start, span.end)); // 协议自己的切片：恒计入，不过归属过滤
+    // Follow the explicit imported codec call; do not count an uncalled helper
+    // or another protocol's fields as editor coverage.
+    if ((struct === 'TlsSettings' || struct === 'ShadowTlsSettings') &&
+        /\butlsPatch\s*\(/.test(idx.masked.slice(span.start, span.end))) {
+      const helper = sourceIndex('../domain/utls.ts');
+      const patch = helper.decls.get('utlsPatch');
+      expect(patch, 'shared uTLS patch codec must remain resolvable').toBeDefined();
+      take(helper.raw.slice((patch as Span).start, (patch as Span).end));
+    }
     const seen = new Set<string>([obj]);
     const queue: string[] = [idx.masked.slice(span.start, span.end)];
     while (queue.length > 0) {
@@ -1107,6 +1116,10 @@ function verifyCite(label: string, c: Cite): void {
  * 五条依据各不相同（engine / fingerprint / fragment / spoof 分属四处门），逐条列而不是共用一条。
  */
 const QUIC_TLS_EXEMPT: Record<string, Exemption> = {
+  utlsMode: {
+    why: '明确的 uTLS 意图与 fingerprint 同属 QUIC 排除面，不改变 QUIC 自管 TLS 的握手。',
+    cite: [{ at: 'crates/config-engine/src/builder/outbound.rs', needle: 'if !is_quic_managed_tls(&protocol) {' }],
+  },
   engine: {
     why:
       'hy2/tuic 的 TLS 在 QUIC 栈内自管，`tls.engine` 有 `is_quic_managed_tls` 前置门 ⇒ 永远不下发。' +
@@ -1120,11 +1133,11 @@ const QUIC_TLS_EXEMPT: Record<string, Exemption> = {
     ],
   },
   fingerprint: {
-    why: 'uTLS 指纹同理：`is_quic_managed_tls` 前置门挡在 `final_fp != "none"` 之前 ⇒ utls 块对这两个协议永不下发。',
+    why: 'uTLS 指纹同理：`is_quic_managed_tls` 前置门挡在 node_utls 装配之前 ⇒ utls 块对这两个协议永不下发。',
     cite: [
       {
         at: 'crates/config-engine/src/builder/outbound.rs',
-        needle: '!is_quic_managed_tls(&protocol) && final_fp != "none"',
+        needle: 'if !is_quic_managed_tls(&protocol) {',
       },
     ],
   },
@@ -1194,6 +1207,7 @@ const masqueTlsNone = (needle: string, why: string): Exemption => ({
   ],
 });
 const MASQUE_TLS_EXEMPT: Record<string, Exemption> = {
+  utlsMode: masqueTlsNone('utls: None,', 'MASQUE 不消费 uTLS 意图；对应块写死 None，不因全局策略递归注入。'),
   alpn: masqueTlsNone('alpn: None,', 'ALPN 由 version 决定；用户手填会与 version 自相矛盾，构造函数写死 None。'),
   fingerprint: masqueTlsNone('utls: None,', 'uTLS 本期不下发（QUIC 路径用不了），构造函数写死 None。'),
   fragment: masqueTlsNone('fragment: None,', 'ClientHello 分片是 TCP-TLS 手法，endpoint 腿不走全局分片循环，构造函数写死 None。'),
@@ -1226,6 +1240,10 @@ const NODE_EXEMPT: Record<string, Record<string, Exemption>> = {
    * ⇒ 走同一条 ECH 装配路径。两头都通 ⇒ 已补控件，债务还清（`naive_ech_survives_the_branch_writing_none`）。
    */
   [pairKey('TlsSettings', 'naive')]: {
+    utlsMode: {
+      why: 'Naive 的 ClientHello 由 Cronet 管理；显式 uTLS 意图与指纹一样不注入该 TLS 栈。',
+      cite: [{ at: 'crates/config-engine/src/builder/outbound.rs', scope: NAIVE_ARM, needle: 'utls: None,' }],
+    },
     allowInsecure: {
       why:
         'naive 的 TLS 由 Cronet 自管，`insecure` 写死 None；内核侧另有点名拒绝' +
@@ -1386,7 +1404,7 @@ const ALL_STRUCTS: ReadonlyArray<readonly [string, string]> = [
 const MIN_FIELDS: Record<string, number> = {
   WireGuardSettings: 12,
   TailscaleSettings: 17,
-  TlsSettings: 10,
+  TlsSettings: 11,
   RealitySettings: 2,
   WebSocketSettings: 4,
   GrpcSettings: 2,
@@ -1400,7 +1418,7 @@ const MIN_FIELDS: Record<string, number> = {
   ShadowsocksSettings: 4,
   AnyTlsSettings: 3,
   SshSettings: 11,
-  ShadowTlsSettings: 4,
+  ShadowTlsSettings: 5,
   CustomSettings: 3,
   MasqueClientSettings: 4,
   TailcatSettings: 7,

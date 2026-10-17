@@ -9,8 +9,8 @@
 //!
 //! ## 平台差异（真差异，cfg 隔离）
 //!
-//! - **mac/linux**：`std::os::unix::net::UnixStream::connect` + `set_read_timeout(5s)`（移植 Go
-//!   `conn.SetReadDeadline`）。写完请求帧后 `shutdown(Write)` 半关闭 = 上游 `sock.end(frame)`，通知
+//! - **mac/linux**：`std::os::unix::net::UnixStream::connect` + 有界非阻塞读取（移植 Go
+//!   `conn.SetReadDeadline`，默认预算 5s）。写完请求帧后 `shutdown(Write)` 半关闭 = 上游 `sock.end(frame)`，通知
 //!   helper「请求发完」（helper 据此立即处理并回响应，不必等 5s 读超时）。
 //! - **win**：命名管道 `\\.\pipe\polaris-helper`。复用 helper 服务端同款同步 Win32 原语：
 //!   `CreateFileW + WriteFile + ReadFile`，逐字节读到单行响应结束。真机同帧原生 A/B 往返约
@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 /// Unix domain socket 连接器（mac/linux 生产 [`Connector`]）。
 ///
-/// 每次 [`Connector::connect`] 打开一条到 `socket_path` 的新连接并设 5s 读超时（对齐 Go
+/// 每次 [`Connector::connect`] 打开一条到 `socket_path` 的新连接并保存 5s 读预算（对齐 Go
 /// `SetReadDeadline`）。连接拒绝（socket 不存在/helper 未跑）→ [`ClientError::Connect`]。
 #[cfg(unix)]
 pub struct UnixConnector {
@@ -78,10 +78,9 @@ impl Connector for UnixConnector {
         let stream = UnixStream::connect(&self.socket_path).map_err(|e| {
             ClientError::Connect(format!("connect {}: {e}", self.socket_path.display()))
         })?;
-        // Go conn.SetReadDeadline(5s) 等价：SO_RCVTIMEO，读阻塞超时返回 WouldBlock/TimedOut。
-        stream
-            .set_read_timeout(Some(self.read_timeout))
-            .map_err(ClientError::Io)?;
+        if self.read_timeout.is_zero() {
+            return Err(ClientError::Io(io::ErrorKind::InvalidInput.into()));
+        }
         Ok(Box::new(UnixConnStream {
             stream,
             read_timeout: self.read_timeout,
@@ -105,44 +104,58 @@ struct UnixConnStream {
 impl ConnectionStream for UnixConnStream {
     fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
         use std::io::Read;
-        // 契约（transport.rs）约束的是**整段读**，而 SO_RCVTIMEO 只约束单次阻塞 read ——
-        // 逐字节滴喂的对端能把一次调用拖到预算的字节数倍。故另设整段 deadline。
+        // XNU rejects setsockopt after both halves close, even when a complete
+        // response is still buffered. Never reset SO_RCVTIMEO after shutdown:
+        // nonblocking reads + one absolute deadline also bound trickled bytes.
         let deadline = Instant::now() + self.read_timeout;
-        // 逐字节读到 `\n`（行协议每行 `\n` 结尾）；EOF 返回已读字节数（helper 关连接）。
-        let mut byte = [0u8; 1];
-        let mut total = 0;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(io::Error::from(io::ErrorKind::TimedOut));
-            }
-            match self.stream.read(&mut byte) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    buf.push(byte[0]);
-                    total += 1;
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                }
-                // SO_RCVTIMEO 超时：Linux 回 WouldBlock。归一为 TimedOut（对齐 trait 契约）。
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::Interrupted =>
-                {
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        continue; // EINTR 重试，不算超时
-                    }
+        self.stream.set_nonblocking(true)?;
+        let result = (|| {
+            let mut byte = [0u8; 1];
+            let mut total = 0;
+            loop {
+                if Instant::now() >= deadline {
                     return Err(io::Error::from(io::ErrorKind::TimedOut));
                 }
-                Err(e) => return Err(e),
+                let result = self.stream.read(&mut byte);
+                if Instant::now() >= deadline {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                match result {
+                    Ok(0) => return Ok(total),
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        total += 1;
+                        if byte[0] == b'\n' {
+                            return Ok(total);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        // Wait only when no bytes are available, never beyond
+                        // this call's remaining budget; do not busy-spin.
+                        std::thread::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(1)),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             }
+        })();
+        // This adapter exposes blocking writes. Restore that mode even on read
+        // failure so a caller reusing the stream does not inherit EWOULDBLOCK.
+        let restored = self.stream.set_nonblocking(false);
+        match result {
+            Ok(total) => restored.map(|()| total),
+            Err(error) => Err(error),
         }
-        Ok(total)
     }
 
     fn set_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
-        // 两处都要设：SO_RCVTIMEO 管单次阻塞 read，read_timeout 字段管整段读的 deadline。
-        self.stream.set_read_timeout(Some(timeout))?;
+        if timeout.is_zero() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         self.read_timeout = timeout;
         Ok(())
     }

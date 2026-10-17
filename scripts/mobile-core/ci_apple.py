@@ -425,6 +425,10 @@ def evidence(*, publish_env=False, slot=None):
             paths.update(work.glob('*.raw'))
             paths.update(work.glob('*.ipa'))
             paths.update(work.glob('wire-*.a'))
+            for name in ('PolarisTLSFingerprintLinker.args', 'PolarisTLSFingerprintLinker.json'):
+                prepared_tls = work / 'tls-link-input' / name
+                if prepared_tls.is_file():
+                    paths.add(prepared_tls)
             paths.update((work / 'derived-data').rglob('*LinkMap*.txt'))
             # A failed symbol check has no accepted Rust receipt yet. Preserve
             # its actual archive as unaccepted evidence under the same budget.

@@ -34,6 +34,9 @@ pub fn sanitize_config(content: &str) -> SanitizeResult {
             "config root must be an object",
         ));
     }
+    validate_collection_shapes(&value)?;
+    // Reject invalid explicit fallback policy before dnsDefaults can be discarded.
+    crate::validate::validate_raw_real_query_fallback_action(&value)?;
     // 就地清洗：坏字段剔除 / 退化，绝不 throw。
     sanitize_value_in_place(&mut value);
     Ok(value)
@@ -55,8 +58,8 @@ fn sanitize_value_in_place(value: &mut Value) {
     // ── 数组型字段：非数组删除（留 validate 处理必填语义）──────────────
     // servers / subscriptions / customRules / appRules / bypassProcesses / customAppPresets / rule_resources
     // TS validateConfig：servers/subscriptions 非数组 → throw（交 catch）；
-    // customRules/appRules 非数组 → 视为 []（不 throw）。这里统一：非数组删除，
-    // validate 阶段对必填的 servers 重新判定（缺失 → throw 或回落）。
+    // customRules/appRules 非数组 → 视为 []（不 throw）。servers/subscriptions 的显式坏形状
+    // 已由入口 validate_collection_shapes 拒绝，缺失的旧集合仍允许默认回填。
     ensure_array_or_remove(obj, "servers");
     ensure_array_or_remove(obj, "subscriptions");
     ensure_array_or_remove(obj, "customRules");
@@ -133,6 +136,7 @@ fn sanitize_value_in_place(value: &mut Value) {
     string_or_remove(obj, "singboxDashboardUrl", true, true);
     string_or_remove(obj, "clashApiSecret", false, false);
     string_or_remove(obj, "speedTestUrl", false, false);
+    string_or_remove(obj, "utlsPolicy", true, true);
     // subscriptionProxyPolicy：三态，非法值删除（回落 follow）
     policy_or_remove(obj, "subscriptionProxyPolicy");
     // 已退役的内核更新设置：应用内不再更新内核，旧配置里留下的键一律删掉，不随配置继续流转。
@@ -952,3 +956,15 @@ fn str_nonempty(obj: &Map<String, Value>, key: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Missing legacy collections may default; present malformed data must remain recoverable.
+pub(crate) fn validate_collection_shapes(value: &Value) -> Result<(), crate::StoreError> {
+    for key in ["servers", "subscriptions"] {
+        if value.get(key).is_some_and(|v| !v.is_array()) {
+            return Err(crate::StoreError::validation(format!(
+                "{key} must be an array"
+            )));
+        }
+    }
+    Ok(())
+}

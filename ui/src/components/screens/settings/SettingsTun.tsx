@@ -382,6 +382,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
                         ...((config.configSchemaVersion ?? 0) >= 2
                           ? {
                               dnsDefaults: {
+                                ...config.dnsDefaults,
                                 directServerId: config.dnsDefaults?.directServerId ?? 'builtin-domestic',
                                 proxyServerId: config.dnsDefaults?.proxyServerId ?? 'builtin-remote',
                                 unmatchedAction: { type: 'fakeIp' as const },

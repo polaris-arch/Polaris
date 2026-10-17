@@ -366,3 +366,55 @@ test('helper target/path controls reject old split-target mode, host drift and i
   const accepted = runHelperFixture(helperPlatforms[0], { host: 'wrong-triple', source: unchecked });
   assert.equal(accepted.status, 0); assert(accepted.calls.some(({ tool }) => tool === 'cargo'));
 });
+
+function assertLauncherDiagnosticJob(source) {
+  const job = source.split('\n  windows_launcher_diagnostics:\n')[1];
+  assert.ok(job, 'independent diagnostic job');
+  const cheap = source.split('\n  cheap_format:\n')[1].split('\n  lint:\n')[0];
+  const cheapExpression = cheap.match(/^    if: \$\{\{ (.*) \}\}$/m)?.[1];
+  const diagnosticExpression = job.match(/if: >-\s*\$\{\{([\s\S]*?)\}\}/)?.[1];
+  assert.ok(cheapExpression && diagnosticExpression);
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
+    for (const selected of [undefined, false, true])
+      for (const repository of ['polaris-arch/Polaris', 'someone/Polaris'])
+        for (const ref of ['refs/heads/collab/dots-audit-remediation-20261017', 'refs/heads/main', 'refs/tags/test']) {
+          const context = { github: { event_name: event, repository, ref }, inputs: { windows_launcher_diagnostics: selected } };
+          assert.equal(runInNewContext(cheapExpression, context), event !== 'workflow_dispatch' || selected !== true);
+          assert.equal(runInNewContext(diagnosticExpression, context), event === 'workflow_dispatch' && selected === true
+            && repository === 'polaris-arch/Polaris' && ref === 'refs/heads/collab/dots-audit-remediation-20261017');
+        }
+  assert.match(source, /windows_launcher_diagnostics:\n\s+description:.*\n\s+type: boolean\n\s+default: false/);
+  for (const name of ['lint', 'cross', 'test']) {
+    const existing = source.split(`\n  ${name}:\n`)[1].split(/\n  [a-z_]+:\n/)[0];
+    assert.match(existing, /^    needs: cheap_format$/m);
+    assert.doesNotMatch(existing.slice(0, existing.indexOf('    steps:')), /always\(\)|!cancelled\(\)|continue-on-error/);
+  }
+  assert.match(job, /runs-on: windows-2022/);
+  assert.match(job, /timeout-minutes: 60/);
+  assert.match(job, /permissions:\n      contents: read/);
+  assert.doesNotMatch(job, /\bwrite\b|continue-on-error|ApproveTemporarySystemTask|Run-SystemBootstrap|\$\{\{ inputs\./);
+  assert.equal((job.match(/persist-credentials: false/g) ?? []).length, 2);
+  assert.match(job, /ref: \$\{\{ github.sha \}\}/);
+  assert.match(job, /\$candidate.sourceCommit -cne '68ffb209ded1f9337f9115741cba24f9f4c63421'/);
+  assert.match(job, /\$candidate.repository -cne 'polaris-arch\/sing-box-polaris'/);
+  assert.match(job, /repository: polaris-arch\/sing-box-polaris/);
+  assert.match(job, /ref: \$\{\{ steps.candidate.outputs.source \}\}/);
+  assert.equal((job.match(/\.\/scripts\/windows-directory\/Run-WithUserTokenOwner.ps1/g) ?? []).length, 1);
+  assert.doesNotMatch(job, /cargo (?:build|test)|Run-UserTokenOwnerChild.ps1|Build-And-Test.ps1/);
+  assert.match(job, /if \(\$LASTEXITCODE -ne 0\) \{ throw 'Fixed launcher diagnostic attempt failed' \}/);
+  assert.match(job, /if: \$\{\{ always\(\) \}\}\n        uses: actions\/upload-artifact@v7/);
+  assert.match(job, /if-no-files-found: error/);
+}
+test('manual fixed-source launcher diagnosis has no ordinary Rust prerequisite or PR/SYSTEM bypass', () => assertLauncherDiagnosticJob(yaml('ci')));
+for (const [label, before, after] of [
+  ['PR heavy gate skipped', "github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true", 'false'],
+  ['diagnostic admits PR', "github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true", "github.event_name == 'pull_request' && inputs.windows_launcher_diagnostics == true"],
+  ['diagnostic admits other branch', "github.ref == 'refs/heads/collab/dots-audit-remediation-20261017'", 'true'],
+  ['diagnostic admits other repository', "github.repository == 'polaris-arch/Polaris'", 'true'],
+  ['candidate source is arbitrary', "-cne '68ffb209ded1f9337f9115741cba24f9f4c63421'", "-cne $env:INPUT_SOURCE"],
+  ['launcher failure ignored', "if ($LASTEXITCODE -ne 0) { throw 'Fixed launcher diagnostic attempt failed' }", '# ignored'],
+  ['failure evidence conditional', 'if: ${{ always() }}\n        uses: actions/upload-artifact@v7', 'if: ${{ success() }}\n        uses: actions/upload-artifact@v7'],
+]) test(`manual launcher diagnosis rejects ${label}`, () => {
+  const source = yaml('ci'); assert.ok(source.includes(before));
+  assert.throws(() => assertLauncherDiagnosticJob(source.replaceAll(before, after)));
+});

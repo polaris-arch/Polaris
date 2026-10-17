@@ -908,3 +908,5 @@ fn share_link_reality_pin_is_dropped_at_the_funnel() {
     assert_eq!(pin_of("r"), None, "reality 链接的 pin 必须剔除");
     assert_eq!(pin_of("t").as_deref(), Some(pin), "TLS 链接的 pin 必须保留");
 }
+
+mod audit_regressions;

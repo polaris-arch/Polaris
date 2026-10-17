@@ -836,3 +836,5 @@ fn the_scan_surface_includes_the_module_root_file() {
         "`mod.rs` 被收了两遍 —— 计数型断言会因此翻倍"
     );
 }
+
+mod audit_regressions;

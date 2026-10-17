@@ -242,8 +242,8 @@ fn the_accept_loop_only_claims_the_name_once() {
         .find("first = false;")
         .expect("first 从未被清掉 —— 每个实例都会带独占 flag");
     let connect = body
-        .find("connect_pipe(h)")
-        .expect("connect_pipe 调用点消失");
+        .find("connect_pipe_until_stopped(h,")
+        .expect("stop-aware connect 调用点消失");
     assert!(
         clear < connect,
         "first 必须在 connect_pipe **之前**清掉：否则连接失败那条腿回头重建时仍带独占 flag"
@@ -276,58 +276,48 @@ fn response_is_flushed_before_pipe_disconnect() {
     assert!(flush < disconnect, "必须先 flush 再断开管道");
 }
 
-/// SCM STOP 必须能**打断**阻塞中的 `ConnectNamedPipe`，而不只是置个标志。
-///
-/// 与 [`the_accept_loop_only_claims_the_name_once`] 同款：`service/win.rs` 整模块
-/// `cfg(windows)` 不参与 Linux 编译，但 `crate_source!` 读磁盘文本不受 cfg 影响。
-/// 这条只能是源码级 —— 行为要真机（组 E）验，编译由 CI 的 windows 交叉 check 兜。
+/// SCM STOP must end admission without waiting for any client to connect.
+/// The actual Windows service polls a nonblocking pipe; its native regressions
+/// cover stop-before-accept, stop-between-polls and successful connection.
 #[test]
-fn scm_stop_wakes_the_blocked_accept_loop() {
+fn scm_stop_is_observed_without_a_client_connection() {
     let src = polaris_source_probe::crate_source!("platform/windows/service/win.rs");
+    let src = polaris_source_probe::mask_comments(&src);
+    let handler = service_function(&src, "extern \"system\" fn ctrl_handler(");
+    assert!(handler.contains("STOP_REQUESTED.store(true"));
+    assert!(handler.contains("SERVICE_STOP_PENDING"));
 
-    // ① ctrl_handler 的 STOP 分支：置标志之外必须唤醒 + 上报中间态。
-    let at = src
-        .find("extern \"system\" fn ctrl_handler(")
-        .expect("ctrl_handler 消失");
-    let end = src[at..]
-        .find("\n/// 唤醒阻塞在")
-        .map_or(src.len(), |i| at + i);
-    let body = &src[at..end];
+    let serve = service_function(&src, "fn serve<");
     assert!(
-        body.contains("STOP_REQUESTED.store(true"),
-        "STOP 分支不再置停止标志"
+        serve.contains("connect_pipe_until_stopped(h, || STOP_REQUESTED.load(Ordering::SeqCst))")
     );
-    assert!(
-        body.contains("wake_accept_loop()"),
-        "STOP 只置了标志没唤醒 —— accept 循环仍阻塞在 ConnectNamedPipe，要等下一个客户端才退"
-    );
-    assert!(
-        body.contains("SERVICE_STOP_PENDING"),
-        "STOP 不上报中间态 —— SCM 记录仍是 RUNNING，`sc stop` 直接返回成功而进程还在跑"
-    );
+    assert!(!serve.contains("connect_pipe(h)"));
+    assert!(serve.contains("CloseHandle(h)"));
 
-    // ② 唤醒实现必须真去连自己的管道（不是空函数 / 不是 sleep）。
-    let wat = src
-        .find("fn wake_accept_loop()")
-        .expect("wake_accept_loop 消失");
-    let wend = src[wat..].find("\n}").map_or(src.len(), |i| wat + i);
-    let wbody = &src[wat..wend];
-    assert!(wbody.contains("CreateFileW("), "唤醒没有真发起连接");
-    assert!(wbody.contains("PIPE_NAME"), "唤醒连的不是本服务的管道名");
-    assert!(
-        wbody.contains("OPEN_EXISTING"),
-        "应当只连已存在的管道，不得创建"
-    );
+    let poll = service_function(&src, "fn connect_pipe_until_stopped(");
+    let mode = poll
+        .find("let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;")
+        .unwrap();
+    let apply = poll.find("SetNamedPipeHandleState(h, &mode,").unwrap();
+    let stop = poll.find("if stopped()").unwrap();
+    let connect = poll.find("ConnectNamedPipe(h,").unwrap();
+    assert!(mode < apply && apply < stop && stop < connect);
+    let connected = poll
+        .split("if error == ERROR_PIPE_CONNECTED {")
+        .nth(1)
+        .unwrap();
+    let second_stop = connected.find("if stopped()").unwrap();
+    let blocking = connected
+        .find("let blocking = PIPE_WAIT | PIPE_READMODE_BYTE;")
+        .unwrap();
+    assert!(second_stop < blocking);
+    assert!(connected.contains("SetNamedPipeHandleState(h, &blocking,"));
+    assert!(poll.contains("if error != ERROR_PIPE_LISTENING"));
+    assert!(poll.contains("std::thread::sleep(std::time::Duration::from_millis(25))"));
 
-    // ③ 次序：STATUS_HANDLE 必须在进 serve **之前**存好，否则 ctrl_handler 读到 0、
-    //    上报那步静默跳过。
-    let store = src
-        .find("STATUS_HANDLE.store(")
-        .expect("STATUS_HANDLE 没有被写入，ctrl_handler 永远拿不到句柄");
-    let serve_at = src
-        .find("let _ = serve(helper.clone());")
-        .expect("serve 调用点消失");
-    assert!(store < serve_at, "STATUS_HANDLE 存得比 serve 还晚");
+    let store = src.find("STATUS_HANDLE.store(").unwrap();
+    let serve_at = src.find("let _ = serve(helper.clone());").unwrap();
+    assert!(store < serve_at, "STATUS_HANDLE must precede the listener");
 }
 
 // Windows-only service glue is compiled by the cross-target gate; the host tests

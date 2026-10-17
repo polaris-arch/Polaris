@@ -38,7 +38,7 @@
  * sha256 来源：本机 curl 下载 GitHub Release 资产后 `sha256sum` 实测（防事后替换与传输
  * 截断，不构成对 GitHub 的独立第三方校验 —— protobuf 官方没有发布校验和文件）。
  */
-import { execFileSync } from 'child_process';
+import { boundedDownload } from './lib/bounded-download.mjs';
 import { createHash } from 'crypto';
 
 import { extractZip } from './lib/extract-zip.mjs';
@@ -167,7 +167,7 @@ if (!FORCE && completeCache(dest)) {
     // 骨架形制照 fetch-cronet，强度参数（--retry 5 / --retry-all-errors / --connect-timeout 20）
     // 承自被替掉的内联步 —— 与两个先例都不逐字同款，差异有意：不带 --retry-delay 5（curl 默认
     // 指数退避，总等待反而更长）；不带 -sS（stdio inherit 下进度条进日志，噪音不是功能差）。
-    execFileSync('curl', ['-fL', '--retry', '5', '--retry-all-errors', '--connect-timeout', '20', '-o', zip, url], {
+    boundedDownload(url, { output: zip,
       stdio: 'inherit',
     });
     const got = sha256(zip);

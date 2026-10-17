@@ -558,7 +558,7 @@ impl ProxyRuntime {
         if restored {
             let rollback_target = candidate.id.clone();
             let old_id = expected_current_id.to_string();
-            let _ = self.config.update(|latest| {
+            let rollback = self.config.update(|latest| {
                 if self.selector_reconcile.intent_generation() != intent_generation {
                     return Decision::Skip(false);
                 }
@@ -576,6 +576,22 @@ impl ProxyRuntime {
                 );
                 Decision::Write(true)
             });
+            match rollback {
+                Ok((true, _)) => {}
+                Ok((false, _)) => {
+                    self.selector_reconcile.mark_required();
+                    return AutoHotSwitchOutcome::Superseded;
+                }
+                Err(error) => {
+                    self.selector_reconcile.mark_required();
+                    self.set_nonfatal_error(
+                        &format!("运行出口已恢复，但保存原出口失败；正在对账当前配置: {error}"),
+                        code::EXIT_MISMATCH,
+                    );
+                    self.push_pending_changes();
+                    return AutoHotSwitchOutcome::ReconcilePending { intent_generation };
+                }
+            }
             self.push_pending_changes();
         } else {
             let message = "自动故障切换未能确认目标出口，恢复原出口也失败；正在后台对账运行出口";
@@ -1267,6 +1283,7 @@ impl AutoView {
         generation: Option<u64>,
         network_epoch: Option<u64>,
         platform: Platform,
+        core_binary_sha256: Option<String>,
     ) -> Self {
         let plan = plan_subscriptions(config, &BTreeSet::from([subscription.to_string()]));
         let members = auto_select::subscription_members(config, subscription);
@@ -1288,7 +1305,8 @@ impl AutoView {
             subscription: subscription.to_string(),
             members,
             tailscale,
-            view: LedgerView::new(config, generation, network_epoch, platform),
+            view: LedgerView::new(config, generation, network_epoch, platform)
+                .with_core_binary_sha256(core_binary_sha256),
             plan,
         }
     }
@@ -1355,6 +1373,7 @@ impl ProxyRuntime {
                         generation,
                         network_epoch,
                         platform,
+                        self.measurement_core_sha256(),
                     )),
                     Intent::Manual | Intent::Unrecognized => None,
                 };
@@ -1484,6 +1503,7 @@ impl ProxyRuntime {
             core_running.then_some(generation),
             self.network_epoch(),
             self.helper.platform(),
+            self.measurement_core_sha256(),
         );
         let selected = selected_of(config);
         let read = auto.read(&auto.members, readings);
@@ -1533,6 +1553,7 @@ impl ProxyRuntime {
             Some(generation),
             network_epoch,
             platform,
+            self.measurement_core_sha256(),
         );
         let read = auto.read(&auto.members, readings);
         let ranked = auto_select::rank(&read.selectable);

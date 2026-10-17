@@ -211,6 +211,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
         proxy_server_id: "builtin-remote".into(),
         unmatched_action: Some(DnsPolicyAction::FakeIp),
         connection_resolution: Default::default(),
+        real_query_fallback_action: None,
     });
     let mut rule = dns_effect_rule(
         "hosts-first",
@@ -308,6 +309,7 @@ fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
             server_id: "builtin-domestic".into(),
         }),
         connection_resolution: Default::default(),
+        real_query_fallback_action: None,
     });
     let mut rule = dns_effect_rule(
         "race",
@@ -1206,3 +1208,5 @@ fn default_dns_rule_serde_keeps_legacy_shape_without_logical_fields() {
     assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
     assert_eq!(serde_json::to_string(&DnsRule::default()).unwrap(), "{}");
 }
+
+mod real_query_fallback;

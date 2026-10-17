@@ -1736,6 +1736,24 @@ pub async fn update_install(
         )));
     }
 
+    // Protected destinations require manual DMG handoff before irreversible exit.
+    // Replacement's later elevation branch cannot repair admission failure.
+    if plan.platform == update_install::InstallPlatform::Macos {
+        if let Some(bundle) = plan.app_bundle_path.as_deref() {
+            if let Err(error) = update_install::preflight_mac_admission(bundle) {
+                #[allow(deprecated)]
+                let opened = app.shell().open(file_path.clone(), None);
+                return Ok(match opened {
+                    Ok(()) => ApiResponse::ok(json!({ "ok": true, "awaitingManualInstall": true,
+                        "reason": format!("安装目录需要管理员权限，请从已打开的 DMG 手动安装: {error}") })),
+                    Err(open_error) => ApiResponse::err(format!(
+                        "无法准备自动安装（{error}），打开 DMG 也失败: {open_error}"
+                    )),
+                });
+            }
+        }
+    }
+
     // 所有 Start admission 同步关闭，主核/登录核/测速核/check 全部确认收口，才能交付。
     // 不用 status.running 作为捷径：起核中、Unknown 与独立临时 owner 都必须经过同一准备门。
     // 便携腿同样先过这道门：内核就在程序目录里运行，它不停下，覆盖解压会因文件被占用而只换掉一部分。

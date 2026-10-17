@@ -349,6 +349,78 @@ fn pick_dns_resources_without_rules_is_supported() {
 }
 
 #[test]
+fn dns_backup_round_trips_real_query_fallback_with_both_dns_categories() {
+    for category in [C::DnsResources, C::DnsRules] {
+        for action in [
+            json!({"type":"server","serverId":"dns-custom"}),
+            json!({"type":"reject","method":"default"}),
+            json!({"type":"reject","method":"drop"}),
+        ] {
+            let mut source = cfg();
+            source["dnsDefaults"]["realQueryFallbackAction"] = action.clone();
+            let backup = pick_categories(&source, &[category]);
+            assert_eq!(backup["dnsDefaults"]["realQueryFallbackAction"], action);
+            let mut target = cfg();
+            target["dnsDefaults"]["realQueryFallbackAction"] =
+                json!({"type":"server","serverId":"builtin-remote"});
+            let restored = merge_categories(&target, &backup, &[category]);
+            assert!(restored.conflicts.is_empty());
+            assert_eq!(
+                restored.config["dnsDefaults"]["realQueryFallbackAction"],
+                action
+            );
+            assert_eq!(restored.config["trafficRules"], target["trafficRules"]);
+        }
+    }
+}
+
+#[test]
+fn old_dns_backup_materializes_domestic_real_query_fallback_on_restore() {
+    let backup = pick_categories(&cfg(), &[C::DnsResources]);
+    assert!(backup["dnsDefaults"]
+        .get("realQueryFallbackAction")
+        .is_none());
+    let current = crate::default_config();
+    let restored = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    let saved = crate::ConfigStore::canonicalize_for_save(&restored.config).unwrap();
+    assert_eq!(
+        saved["dnsDefaults"]["realQueryFallbackAction"],
+        restored.config["dnsDefaults"]["realQueryFallbackAction"]
+    );
+}
+
+#[test]
+fn restoring_other_categories_preserves_current_real_query_fallback() {
+    let mut current = cfg();
+    current["dnsDefaults"]["realQueryFallbackAction"] = json!({"type":"reject","method":"drop"});
+    let mut incoming = cfg();
+    incoming["dnsDefaults"]["realQueryFallbackAction"] =
+        json!({"type":"server","serverId":"builtin-remote"});
+    for category in [C::GeneralSettings, C::CustomRules, C::ManualNodes] {
+        let restored = merge_categories(&current, &incoming, &[category]);
+        assert_eq!(restored.config["dnsDefaults"], current["dnsDefaults"]);
+    }
+}
+
+#[test]
+fn backup_restore_preserves_invalid_explicit_fallback_for_write_validation() {
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    let invalid = json!({"type":"future-action"});
+    backup["dnsDefaults"]["realQueryFallbackAction"] = invalid.clone();
+    let restored = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        invalid
+    );
+    let error = crate::ConfigStore::canonicalize_for_save(&restored.config).unwrap_err();
+    assert!(error.to_string().contains("realQueryFallbackAction"));
+}
+
+#[test]
 fn general_settings_excludes_policy_and_dns_data() {
     let out = pick_categories(&cfg(), &[C::GeneralSettings]);
     for key in [
@@ -1243,14 +1315,25 @@ fn network_profiles_export_all_when_any_rule_category_selected() {
     );
 }
 
-/// 导入按 id 合并：同 id 以备份为准，current 里其余场景保留，新 id 追加。
+/// 双规则平面完整导入按 id 合并；单平面必须拒绝改变另一个平面的共享依赖。
 /// 牙：合并改成整表替换 → np-local 丢失 ⇒ 转红。
 #[test]
 fn network_profiles_import_merges_by_id() {
     let mut current = cfg();
     current["networkProfiles"] = json!([profile("np-traffic", "old"), profile("np-local", "keep")]);
     let backup = pick_categories(&with_scoped_rules(), &[C::CustomRules, C::DnsRules]);
-    let merged = merge_categories(&current, &backup, &[C::CustomRules]).config;
+    let partial = merge_categories(&current, &backup, &[C::CustomRules]);
+    assert_eq!(
+        partial.config, current,
+        "a partial restore must preserve the unselected plane"
+    );
+    assert!(partial
+        .conflicts
+        .iter()
+        .any(|c| c == "networkProfiles:np-traffic"));
+    let complete = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert!(complete.conflicts.is_empty());
+    let merged = complete.config;
     let got: Vec<(String, String)> = merged["networkProfiles"]
         .as_array()
         .unwrap()
@@ -1581,4 +1664,39 @@ fn unrelated_category_restore_does_not_process_shared_dependency_conflicts() {
     assert!(outcome.conflicts.is_empty());
     assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
     assert_eq!(outcome.config["proxyMode"], "global");
+}
+
+mod audit_regressions;
+
+#[test]
+fn dns_backup_without_defaults_preserves_current_fallback() {
+    let mut current = crate::default_config();
+    current["dnsDefaults"]["realQueryFallbackAction"] = json!({"type":"reject","method":"drop"});
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    backup.as_object_mut().unwrap().remove("dnsDefaults");
+    let restored = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert_eq!(restored.config["dnsDefaults"], current["dnsDefaults"]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&restored.config).is_ok());
+}
+
+#[test]
+fn sparse_old_dns_backup_restores_protected_builtin_for_compatibility_fallback() {
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    backup["dnsServers"] =
+        json!([{"id":"custom","name":"Custom","type":"udp","endpoint":{"host":"192.0.2.53"}}]);
+    let restored = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    assert!(restored.config["dnsServers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|server| server["id"] == "custom"));
+    assert!(crate::ConfigStore::canonicalize_for_save(&restored.config).is_ok());
+    backup["dnsDefaults"]["realQueryFallbackAction"] =
+        json!({"type":"server","serverId":"missing"});
+    let explicit = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&explicit.config).is_err());
 }

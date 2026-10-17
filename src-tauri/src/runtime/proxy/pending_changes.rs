@@ -208,7 +208,9 @@ impl ProxyRuntime {
             added,
             modified,
             removed,
-            restart_deferred: non_node_pending || selected_pending,
+            restart_deferred: non_node_pending
+                || selected_pending
+                || self.has_uncommitted_rule_content(),
         }
     }
 
@@ -286,16 +288,46 @@ impl ProxyRuntime {
         &self,
         gate: &tokio::sync::MutexGuard<'_, ()>,
     ) {
-        if cfg!(target_os = "ios") {
-            // NE disconnection and host running=false do not prove no Go resource owner.
-            // Keep the durable deletion journal until iOS has an admitted cleanup contract.
-            log::debug!("iOS deferred config deletions retained: CleanupUnknown");
-            return;
-        }
+        // Keep the original native owner borrowed through commit: a new session
+        // cannot replace the receipt between validation and journal persistence.
+        #[cfg(target_os = "ios")]
+        let original_owner = match self.ios_ready_session.read() {
+            Ok(owner) => owner,
+            Err(_) => return,
+        };
+        #[cfg(target_os = "ios")]
+        let directory_receipt = original_owner.as_ref().and_then(|owner| {
+            if owner.main_token.is_some() {
+                return None;
+            }
+            let ready = owner.stop_target.as_ref()?;
+            owner
+                .stopped
+                .as_ref()?
+                .directory_retirement()
+                .filter(|receipt| {
+                    receipt.start_request_id() == ready.request_id()
+                        && receipt.session_id() == ready.session_id()
+                        && receipt.config_digest() == ready.config_digest()
+                        && receipt.source_extension_generation() == ready.extension_generation()
+                })
+        });
+        // Retain exclusive leases until process_deferred_deletions returns,
+        // including the durable journal acknowledgement (or its failure).
+        #[cfg(any(target_os = "ios", windows))]
+        let mut directory_leases = Vec::new();
         let config_dir = self.config.dir().to_path_buf();
-        let result = self
-            .config
-            .process_deferred_deletions(|entry, current| match entry {
+        let result = self.config.process_deferred_deletions(|entry, current| {
+            if cfg!(target_os = "ios")
+                && !matches!(entry, DeferredConfigDeletion::TailscaleDirectory { .. })
+            {
+                // Scoped TS proof does not relax the existing guard for rule files,
+                // WARP state, icons, or legacy unbound TS directory records.
+                return Err(
+                    "CleanupUnknown: no admitted cleanup contract for this resource".into(),
+                );
+            }
+            match entry {
                 DeferredConfigDeletion::RuleResource { file_name } => {
                     if crate::commands::rules::rule_resource_file_is_referenced(current, file_name)
                     {
@@ -315,6 +347,9 @@ impl ProxyRuntime {
                     app_id,
                 ),
                 DeferredConfigDeletion::TailscaleState { server_id } => {
+                    if cfg!(any(target_os = "ios", windows)) {
+                        return Err("CleanupUnknown: unbound legacy directory intent".into());
+                    }
                     match self.mesh.tailscale_logout_under_gate(
                         server_id,
                         gate,
@@ -332,10 +367,61 @@ impl ProxyRuntime {
                         Err(error) => Err(format!("清理 Tailscale state 失败: {error}")),
                     }
                 }
+                DeferredConfigDeletion::TailscaleDirectory { intent } => {
+                    #[cfg(target_os = "ios")]
+                    {
+                        let mut lease = self
+                            .mesh
+                            .delete_original_tailscale_directory_under_gate(
+                                intent,
+                                directory_receipt,
+                                gate,
+                                self.tailscale_writer_alive(),
+                                current,
+                            )
+                            .map_err(|error| {
+                                format!("CleanupUnknown: directory commit retained: {error}")
+                            })?;
+                        lease.release_admission_after_commit();
+                        directory_leases.push(lease);
+                        Ok(())
+                    }
+                    #[cfg(windows)]
+                    {
+                        if self
+                            .mesh
+                            .directory_in_use(&intent.server_id, self.tailscale_writer_alive())
+                        {
+                            return Err("CleanupUnknown: directory is still in use".into());
+                        }
+                        let mut lease =
+                            crate::runtime::windows_directory::DirectoryLease::acquire_intent(
+                                &config_dir,
+                                intent,
+                            )
+                            .map_err(|error| {
+                                format!("CleanupUnknown: directory custody retained: {error}")
+                            })?;
+                        lease.commit(intent, current).map_err(|error| {
+                            format!("CleanupUnknown: directory commit retained: {error}")
+                        })?;
+                        directory_leases.push(lease);
+                        Ok(())
+                    }
+                    #[cfg(not(any(target_os = "ios", windows)))]
+                    {
+                        let _ = intent;
+                        Err(
+                            "CleanupUnknown: platform directory retirement admission unavailable"
+                                .into(),
+                        )
+                    }
+                }
                 DeferredConfigDeletion::WarpDevice {
                     device_id, token, ..
                 } => self.mesh.try_enqueue_warp_deregister(device_id, token),
-            });
+            }
+        });
         match result {
             Ok(summary) if summary.applied > 0 || summary.cancelled > 0 || summary.retrying > 0 => {
                 log::info!(
@@ -350,3 +436,6 @@ impl ProxyRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

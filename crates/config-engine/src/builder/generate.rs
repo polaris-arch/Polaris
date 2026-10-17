@@ -573,6 +573,7 @@ fn generate_base_config(
 
     // ── 9. 装配顶层 SingBoxConfig + experimental.cache_file（L3517-3571）────────
     let mut singbox = SingBoxConfig {
+        polaris_windows_directory: None,
         log,
         dns: Some(dns),
         inbounds,

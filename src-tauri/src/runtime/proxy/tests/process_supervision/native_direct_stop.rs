@@ -260,10 +260,10 @@ async fn real_echild_from_running_observation_blocks_all_future_native_wait_and_
     .await
     .unwrap()
     .unwrap();
-    // The first native failure occurs while Running, before a Stop booking exists.
+    // An external reaper yields ECHILD: exit is unknown, so custody remains retained.
     assert!(matches!(
         rt.child.lock().unwrap().observe_running(&identity),
-        polaris_core_supervisor::ChildObservation::Alive
+        polaris_core_supervisor::ChildObservation::Unknown
     ));
     assert!(!rt.child.lock().unwrap().running_exit_proven(&identity));
     rt.runtime_binding_state

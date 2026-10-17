@@ -119,6 +119,8 @@ pub struct ConnectionSnapshot {
 /// 精准断连结果（供上层观测 / 测试断言）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrecisionDisconnectOutcome {
+    /// A failed snapshot is not a successful empty connection table.
+    pub snapshot_error: Option<String>,
     /// 命中 pair、被关的连接 id 列表（Polaris closeOldNodeConnectionsAfterHotSwitch 累计的 closed）。
     pub closed_ids: Vec<String>,
 }
@@ -154,7 +156,10 @@ pub fn select_connections_to_close(
             closed_ids.push(c.id.clone());
         }
     }
-    PrecisionDisconnectOutcome { closed_ids }
+    PrecisionDisconnectOutcome {
+        closed_ids,
+        snapshot_error: None,
+    }
 }
 
 #[cfg(test)]

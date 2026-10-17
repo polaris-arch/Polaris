@@ -156,6 +156,68 @@ fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
     }
 }
 
+/// Captured by the existing verified resolver. This is an invalidation token
+/// for ledger reads, not an alternative resolver or launch admission.
+#[derive(Clone, Debug)]
+pub(super) struct CoreSelectionObservation {
+    path: PathBuf,
+    origin: SelectionOrigin,
+    bundle: Option<crate::runtime::core_identity::BundleObservation>,
+}
+#[derive(Clone, Debug)]
+enum SelectionOrigin {
+    Bundled(Vec<PathBuf>),
+    #[cfg(any(debug_assertions, test))]
+    Development,
+    #[cfg(test)]
+    Fixture,
+}
+static VERIFIED_SELECTION: std::sync::Mutex<Option<CoreSelectionObservation>> =
+    std::sync::Mutex::new(None);
+impl CoreSelectionObservation {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(super) fn is_current(&self) -> bool {
+        let selected = match &self.origin {
+            SelectionOrigin::Bundled(candidates) => {
+                #[cfg(any(debug_assertions, test))]
+                if !matches!(dev_core_binary_override(), Ok(None)) {
+                    return false;
+                }
+                first_existing_bundle_candidate(candidates).as_deref() == Some(self.path.as_path())
+            }
+            #[cfg(any(debug_assertions, test))]
+            SelectionOrigin::Development => {
+                dev_core_binary_override().ok().flatten().as_deref() == Some(self.path.as_path())
+            }
+            #[cfg(test)]
+            SelectionOrigin::Fixture => true, // The owning per-runtime fixture checks its selection slot.
+        };
+        selected
+            && self
+                .bundle
+                .as_ref()
+                .is_none_or(|bundle| bundle.is_current())
+    }
+    #[cfg(test)]
+    pub(super) fn fixture(path: PathBuf) -> Self {
+        Self {
+            path,
+            origin: SelectionOrigin::Fixture,
+            bundle: None,
+        }
+    }
+}
+#[cfg(not(test))]
+pub(super) fn verified_selection_observation() -> Option<CoreSelectionObservation> {
+    VERIFIED_SELECTION
+        .lock()
+        .ok()?
+        .clone()
+        .filter(CoreSelectionObservation::is_current)
+}
+
 /// 应用侧的内核解析：只认随包核（[`resolve_bundled_core_binary`]）。
 ///
 /// debug / test 构型在它之前多一级开发态超驰（见 `dev_core_binary_override`，release 不编译）。
@@ -167,6 +229,13 @@ pub(crate) fn resolve_core_binary() -> Result<PathBuf, String> {
     #[cfg(any(debug_assertions, test))]
     {
         if let Some(core) = dev_core_binary_override()? {
+            if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
+                *selected = Some(CoreSelectionObservation {
+                    path: core.clone(),
+                    origin: SelectionOrigin::Development,
+                    bundle: None,
+                });
+            }
             return Ok(core);
         }
     }
@@ -190,7 +259,14 @@ fn resolve_bundled_core_binary() -> Result<PathBuf, String> {
         filename,
     );
     if let Some(core) = first_existing_bundle_candidate(&candidates) {
-        crate::runtime::core_identity::verify_bundled(&core)?;
+        let bundle = crate::runtime::core_identity::verify_bundled(&core)?;
+        if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
+            *selected = Some(CoreSelectionObservation {
+                path: core.clone(),
+                origin: SelectionOrigin::Bundled(candidates),
+                bundle: Some(bundle),
+            });
+        }
         return Ok(core);
     }
     Err(format!(

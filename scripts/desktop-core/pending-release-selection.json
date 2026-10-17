@@ -32,5 +32,17 @@
     "parentAnonymousReadbackConfirmed": true,
     "candidateSourceSelectionWritten": true
   },
-  "migrationRequirement": "whole task-table source completion, concentrated independent review and corresponding complete App download/unpack/load/carrier validation"
+  "migrationRequirement": "whole task-table source completion, concentrated independent review and corresponding complete App download/unpack/load/carrier validation",
+  "nextDelivery": {
+    "state": "awaiting-final-fixed-kernel-source-and-assets",
+    "requestedTag": "v1.15.0-polaris-alpha.12",
+    "sourcePolicy": null,
+    "activationEligible": false,
+    "required": [
+      "final sourceCommit/sourceTree and annotated tagObject",
+      "same-run producer/native jobs and public release/asset identities",
+      "Go1.27.0 directive/Go1.27.2 actual toolchain and exact Meta355 binding/patch proof",
+      "desktop/mobile independent input and final carrier validation"
+    ]
+  }
 }

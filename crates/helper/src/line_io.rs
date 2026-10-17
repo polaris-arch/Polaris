@@ -119,5 +119,50 @@ pub fn write_line<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
     w.flush()
 }
 
+/// One absolute Unix request budget, shared across all protocol lines.
+/// SO_RCVTIMEO alone restarts its budget after each successful read.
+/// Only the Linux/macOS servers consume this adapter in production. Keep it
+/// available to Unix regression tests without compiling unused mobile-lib code.
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+pub(crate) struct DeadlineStream {
+    stream: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl DeadlineStream {
+    pub(crate) fn new(stream: std::os::unix::net::UnixStream, budget: std::time::Duration) -> Self {
+        Self {
+            stream,
+            deadline: std::time::Instant::now() + budget,
+        }
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl std::io::Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        let result = std::io::Read::read(&mut self.stream, bytes);
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        result
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl Write for DeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests;

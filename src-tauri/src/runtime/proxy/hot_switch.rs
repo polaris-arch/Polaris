@@ -19,6 +19,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::MutexGuard as AsyncMutexGuard;
 
+use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
 use polaris_config_engine::builder::helpers::ServerLike;
 use polaris_config_engine::builder::hotswitch::{
     can_skip_restart_for_added_unreferenced, plan_hot_switch, resolve_global_exit_tag,
@@ -279,6 +280,7 @@ pub(crate) struct TestPutSink {
     pub(super) on_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 在运行期 group 读回边界制造 Full restart claim 或更新意图。
     pub(super) on_groups: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(super) groups_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// 在 mode 状态读回边界抢占，覆盖 Get → Set 之间的检查点。
     pub(super) on_mode_status: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -484,6 +486,8 @@ pub(super) struct ReassertOutcome {
 pub(super) enum Stage1Outcome {
     /// PUT 成功，目标成员 tag（**已折入登录期让位**：未登录 TS 出口时这里是 `direct`，那是设计语义）。
     Applied { member_tag: String },
+    /// Block mode has no global selector; rule selectors still require attestation.
+    NoGlobalSelector,
     /// 选中节点不在运行核 tag 映射里 ⇒ 从未 PUT（上游 bug#5 的那条腿）。
     UnresolvedTag { selected_id: String },
     /// 跑满 [`ProxyRuntime::REASSERT_MAX_ROUNDS`] 轮，每轮 PUT 都失败（管理 API 不可用/恒拒）。
@@ -588,7 +592,8 @@ pub(super) fn attest_runtime_selection(
                 member_tag: member_tag.clone(),
             }
         }
-        Stage1Outcome::Applied { member_tag } => member_tag,
+        Stage1Outcome::Applied { member_tag } => Some(member_tag),
+        Stage1Outcome::NoGlobalSelector => None,
     };
     let Some(groups) = groups else {
         return SelectorAttestation::Match; // 没证据 ≠ 有问题，见上方
@@ -609,7 +614,7 @@ pub(super) fn attest_runtime_selection(
         })
         .collect();
     // 全局出口优先报：它决定「所有未命中规则的流量从哪出去」，量级压过单条规则。
-    if let Some(got) = selected_of(PROXY_SELECTOR_TAG) {
+    if let (Some(got), Some(member_tag)) = (selected_of(PROXY_SELECTOR_TAG), member_tag) {
         if got != member_tag {
             return SelectorAttestation::GlobalDrift {
                 want: member_tag.clone(),
@@ -1412,6 +1417,56 @@ impl ProxyRuntime {
             return SwitchOutcome::Pending;
         }
 
+        if self.gate.generation() != switch_generation
+            || self.selector_reconcile.intent_generation() != intent_generation
+        {
+            return SwitchOutcome::Pending;
+        }
+        // Repair prior side effects to R, including save-only and equal projections.
+        // Never let an expired owner restore bytes over a newer owner.
+        if self.core_running() && self.has_uncommitted_rule_content() {
+            let applied = self
+                .current_config
+                .read()
+                .ok()
+                .and_then(|v| v.clone())
+                .and_then(|v| serde_json::from_value::<UserConfig>(v).ok());
+            let repaired = if let Some(applied) = applied {
+                self.sync_custom_rule_files(&applied, switch_generation, intent_generation)
+                    .await
+            } else {
+                false
+            };
+            if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                self.push_pending_changes();
+                return SwitchOutcome::Pending;
+            }
+            if !repaired {
+                self.set_nonfatal_error("规则内容尚未确认，保留待应用状态", code::EXIT_MISMATCH);
+                self.push_pending_changes();
+                if defer_restart {
+                    return SwitchOutcome::Deferred;
+                }
+                if scope == SwitchApplyScope::SelectedOnly {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
+                        return SwitchOutcome::Pending;
+                    }
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
+                }
+                self.apply_restart();
+                return SwitchOutcome::Restarting;
+            }
+        }
+
         // ── 腿 0.5 起的**判定**全部下沉 [`Self::classify_switch`]（纯读，无副作用）──
         // 本方法自此只负责「执行」：判据与 `config:classifyStaged` 逐字共用同一份。
         let (decision, new_cfg) = match self.classify_switch(&new_config, defer_restart) {
@@ -1476,6 +1531,55 @@ impl ProxyRuntime {
         };
 
         // ── 腿 3：三腿分发（决策全在 switch-engine，本处只执行）──
+        if defer_restart {
+            let rules_changed = self
+                .current_config
+                .read()
+                .ok()
+                .and_then(|v| v.clone())
+                .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+                .map(|v| build_custom_rule_files(&v) != build_custom_rule_files(&new_cfg))
+                .unwrap_or(true);
+            if rules_changed {
+                self.restart_deferred.store(true, Ordering::SeqCst);
+                self.push_pending_changes();
+                return SwitchOutcome::Deferred;
+            }
+        }
+
+        // Do not commit R until exact loaded bytes are confirmed by this core.
+        let applies_without_restart = !matches!(&decision, SwitchDecision::Restart)
+            && !(matches!(&decision, SwitchDecision::Defer)
+                && (defer_restart || scope == SwitchApplyScope::SelectedOnly));
+        if applies_without_restart {
+            let accepted = !self.custom_rule_files_degraded()
+                && self
+                    .sync_custom_rule_files(&new_cfg, switch_generation, intent_generation)
+                    .await;
+            if !self.selector_operation_is_current(switch_generation, intent_generation) {
+                return SwitchOutcome::Pending;
+            }
+            if !accepted {
+                if scope == SwitchApplyScope::SelectedOnly {
+                    if !self.with_selected_projection_claim(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                        || {},
+                    ) {
+                        return SwitchOutcome::Pending;
+                    }
+                    return self.restart_selected_projection(
+                        &new_config,
+                        switch_generation,
+                        intent_generation,
+                    );
+                }
+                self.apply_restart();
+                return SwitchOutcome::Restarting;
+            }
+        }
+
         let outcome = match decision {
             SwitchDecision::HotSwitch(plan) => {
                 // Block is expressed by generated reject routes, never by selector PUT.
@@ -1772,6 +1876,12 @@ impl ProxyRuntime {
                         self.mesh
                             .exit_route_reconcile(&new_cfg, new_cfg.enable_ipv6.unwrap_or(false))
                             .await;
+                        if let Some(error) = disconnect
+                            .as_ref()
+                            .and_then(|d| d.snapshot_error.as_deref())
+                        {
+                            log::warn!("热切换完成，但精准断连快照失败：{error}");
+                        }
                         log::info!(
                             "switchMode：热切换成功（核未重启），精准断连 {} 条",
                             disconnect.map_or(0, |d| d.closed_ids.len())
@@ -1907,32 +2017,6 @@ impl ProxyRuntime {
         if !matches!(outcome, SwitchOutcome::Restarting)
             && !(defer_restart && matches!(outcome, SwitchOutcome::Deferred))
         {
-            // L3 外化规则「值」热更：norm 排除了外化规则的值 → 结构相等但值可能变（如「切节点 + 改外化规则
-            // 值」同一次 save）。非重启腿（热切/no-op/defer）补一次文件对账（通常零 diff、幂等）。降级态文件
-            // 无消费者 → 改走去抖重启重落盘（对齐 上游 三腿 :1806-1807/:1850-1851/:1877-1878）。
-            let needs_rule_file_restart = if self.custom_rule_files_degraded() {
-                true
-            } else {
-                !self.sync_custom_rule_files(&new_cfg).await
-            };
-            if needs_rule_file_restart {
-                if scope == SwitchApplyScope::SelectedOnly {
-                    if !self.with_selected_projection_claim(
-                        &new_config,
-                        switch_generation,
-                        intent_generation,
-                        || {},
-                    ) {
-                        return SwitchOutcome::Pending;
-                    }
-                    return self.restart_selected_projection(
-                        &new_config,
-                        switch_generation,
-                        intent_generation,
-                    );
-                }
-                self.schedule_restart();
-            }
             if let Some(reconcile_config) = self
                 .current_config
                 .read()
@@ -2604,7 +2688,8 @@ impl ProxyRuntime {
             };
             // reassert 内部 panic 时展开会跳过这一行 —— 那是对的：守卫已把续延跑掉（`.finally()` 语义），
             // 而自证是**观测**，观测不到就该沉默，不该在展开路径上再造一条半截结论。
-            me.attest_runtime_selector(&outcome, my_gen).await;
+            me.attest_runtime_selector(&outcome, my_gen, intent_generation)
+                .await;
         });
     }
 
@@ -2690,7 +2775,10 @@ impl ProxyRuntime {
         let outcome = self
             .reassert_selector_selection_locked(&config, my_gen, intent_generation, switch_guard)
             .await;
-        if matches!(outcome.stage1, Stage1Outcome::Applied { .. }) {
+        if matches!(
+            outcome.stage1,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector
+        ) {
             self.selector_reconcile.clear_required();
         } else if !matches!(outcome.stage1, Stage1Outcome::Abandoned) {
             let attestation = attest_runtime_selection(&outcome, None);
@@ -2764,6 +2852,10 @@ impl ProxyRuntime {
                         .and_then(|g| g.as_ref().and_then(|s| s.id_to_tag.get(id).cloned()))
                 })
             };
+            if is_block_selection(target_id.as_deref()) {
+                stage1 = Stage1Outcome::NoGlobalSelector;
+                break;
+            }
             let Some(tag) = tag else {
                 log::warn!(
                     "selector 校正放弃：选中节点 {} 不在运行核 tag 映射，待启动后对账收敛",
@@ -2991,23 +3083,33 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         outcome: &ReassertOutcome,
         my_gen: u64,
+        intent_generation: u64,
     ) {
-        if self.gate.generation() != my_gen || !self.status().running {
+        if !self.selector_operation_is_current(my_gen, intent_generation) {
             log::debug!("运行期出口自证：世代已变 / 核已停 → 退场");
             return;
         }
         // 只有「PUT 成功」这一支需要读回来对账：另外三支的结论不依赖运行期值（放弃腿本身就是结论，
         // 主动退场则不出结论），此时再去连一次管理 API 纯属多余。
         let groups = match outcome.stage1 {
-            Stage1Outcome::Applied { .. } => self.read_selector_groups().await,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector => {
+                self.read_selector_groups().await
+            }
             _ => None,
         };
+        if !self.selector_operation_is_current(my_gen, intent_generation) {
+            return;
+        }
         if matches!(outcome.stage1, Stage1Outcome::Abandoned) {
             return;
         }
-        if matches!(outcome.stage1, Stage1Outcome::Applied { .. }) {
+        if matches!(
+            outcome.stage1,
+            Stage1Outcome::Applied { .. } | Stage1Outcome::NoGlobalSelector
+        ) {
             let complete = groups.as_deref().is_some_and(|groups| {
-                groups.iter().any(|g| g.tag == PROXY_SELECTOR_TAG)
+                (matches!(outcome.stage1, Stage1Outcome::NoGlobalSelector)
+                    || groups.iter().any(|g| g.tag == PROXY_SELECTOR_TAG))
                     && outcome
                         .rule_intents
                         .iter()
@@ -3018,12 +3120,21 @@ impl ProxyRuntime {
                 return;
             }
         }
-        match attest_runtime_selection(outcome, groups.as_deref()) {
-            SelectorAttestation::Match => {
-                log::info!("运行期出口自证通过：selector 实际选择 == 校正意图");
+        self.selector_reconcile.with_intent_claim(|current_intent| {
+            if current_intent != intent_generation {
+                return;
             }
-            other => self.set_nonfatal_error(&other.user_message(), code::EXIT_MISMATCH),
-        }
+            let _publication = self.gate.lock_generation_publication();
+            if !self.selector_operation_is_current(my_gen, intent_generation) {
+                return;
+            }
+            match attest_runtime_selection(outcome, groups.as_deref()) {
+                SelectorAttestation::Match => {
+                    log::info!("运行期出口自证通过：selector 实际选择 == 校正意图");
+                }
+                other => self.set_nonfatal_error(&other.user_message(), code::EXIT_MISMATCH),
+            }
+        });
     }
 
     /// 读回各 group 的运行期选择。读不到（管理 API 连不上 / 首帧超时 / 核正在停）→ `None`
@@ -3034,13 +3145,20 @@ impl ProxyRuntime {
     /// 桩未预置 → `None` → 自证本轮不判定，与生产读失败**同一条码路**，测试环境不比生产宽容。
     async fn read_selector_groups(&self) -> Option<Vec<GroupSelection>> {
         #[cfg(test)]
-        if let Some(sink) = self
-            .management_api_stub
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(Arc::clone))
         {
-            return sink.groups();
+            let sink = self
+                .management_api_stub
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(Arc::clone));
+            if let Some(sink) = sink {
+                let pause = sink.groups_pause.lock().unwrap().take();
+                if let Some((entered, release)) = pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                return sink.groups();
+            }
         }
         match self.management_api().await.groups_snapshot().await {
             Ok(groups) => Some(groups),

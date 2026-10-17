@@ -77,6 +77,8 @@ pub fn build_id_to_tag_map<S: ServerLike>(
             let trimmed = s.name().trim();
             if trimmed.is_empty() {
                 UNNAMED_SERVER.to_string()
+            } else if trimmed.starts_with("rule-sel-") {
+                format!("node-{trimmed}")
             } else {
                 trimmed.to_string()
             }
@@ -442,3 +444,14 @@ fn prune_rules(rules: Vec<RouteRule>, unreachable: &BTreeSet<String>) -> Vec<Rou
 
 #[cfg(test)]
 mod tests;
+
+/// Injective custom-rule tags, disjoint from app selector and node namespaces.
+pub fn custom_rule_selector_tag(id: &str) -> String {
+    let escaped = id.replace('~', "~7e");
+    let escaped = if let Some(rest) = escaped.strip_prefix("app-") {
+        format!("~61pp-{rest}")
+    } else {
+        escaped
+    };
+    format!("rule-sel-{escaped}")
+}

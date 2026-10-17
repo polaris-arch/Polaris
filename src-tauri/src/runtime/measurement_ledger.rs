@@ -23,7 +23,7 @@ use crate::commands::speedtest::{
     SpeedTestOrigin, StaleReason,
 };
 
-/// 条数硬上限。按每条约 300 字节估，合计约 2.5MB。
+/// 条数硬上限；身份块长度另计，条数边界不等于实测字节或 RSS 边界。
 const HARD_CAP: usize = 8192;
 
 /// 软上限相对当前配置节点数的倍数。
@@ -109,6 +109,9 @@ pub(crate) struct Candidates {
 
 /// 读取时的对照面，由读取方在读的那一刻取。账本不缓存任何判定结果。
 pub(crate) struct ReadContext<'a> {
+    /// Outer None is an unbound pure-logic fixture; production supplies Some.
+    /// Some(None) is unknown and cannot make a measurement current.
+    pub(crate) core_binary_sha256: Option<Option<&'a str>>,
     /// 当前主核世代；核不在运行时为 `None`。
     pub(crate) main_generation: Option<u64>,
     /// 当前配置里逐节点的参数指纹。
@@ -383,12 +386,20 @@ impl MeasurementLedger {
         for (id, reason) in skipped {
             inner.skipped.insert(id.clone(), reason);
         }
+        while inner.skipped.len() > HARD_CAP {
+            inner.skipped.pop_first();
+        }
     }
 
     /// 按软上限淘汰（每轮收尾时调）。返回淘汰的条数。
     pub(crate) fn evict(&self, context: &EvictContext<'_>) -> usize {
         let mut inner = self.lock();
-        let soft_cap = (context.nodes.len() * SOFT_CAP_PER_NODE).min(HARD_CAP);
+        inner.skipped.retain(|id, _| context.nodes.contains(id));
+        let soft_cap = context
+            .nodes
+            .len()
+            .saturating_mul(SOFT_CAP_PER_NODE)
+            .min(HARD_CAP);
         let excess = inner.entries.len().saturating_sub(soft_cap);
         let victims: Vec<ResultKey> = eviction_order(&inner.entries, context)
             .into_iter()
@@ -474,6 +485,11 @@ fn ledger_stale(
     node_id: &str,
     context: &ReadContext<'_>,
 ) -> Option<LedgerStale> {
+    if let Some(expected) = context.core_binary_sha256 {
+        if expected.is_none() || entry.identity.core_binary_sha256.as_deref() != expected {
+            return Some(LedgerStale::Identity(StaleReason::Instance));
+        }
+    }
     let current = CurrentState {
         main_generation: context.main_generation,
         node_fingerprint: context.fingerprints.get(node_id).map(String::as_str),

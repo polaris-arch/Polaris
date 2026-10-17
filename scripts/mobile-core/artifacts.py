@@ -309,7 +309,32 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
         from fork_input import linker_flags
         require(settings['-ldflags'] == linker_flags(value, expected_id.removeprefix('polaris-mobile-')),
                 'reported native ldflags differ')
+    require(isinstance(graph, list) and all(isinstance(row, dict) and isinstance(row.get('Path'), str) for row in graph),
+            'actual source graph module rows differ')
     declared = {row['Path']: row for row in graph}
+    require(len(declared) == len(graph), 'duplicate actual source graph module')
+    if 'sourcePolicy' in value:
+        from source_policy import validate_source_policy
+        policy = validate_source_policy(value['sourcePolicy'], value)
+        meta = policy['metacubex']
+        local_expected = {meta['module']: meta['replacementPath'],
+                          'github.com/sagernet/sing-tun': './third_party/sing-tun'}
+        local_actual = {name: row['Replace'].get('Path') for name, row in declared.items()
+                        if row.get('Replace') and not row['Replace'].get('Version')}
+        require(local_actual == local_expected, 'actual source graph local replacement inventory differs')
+        for name, path in local_expected.items():
+            expected = declared[name]
+            replacement = expected['Replace']
+            require(expected.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
+                    replacement.get('Version', '') == '', 'local source graph must not invent version or h1')
+            local_replacement_aliases(replacement, declared.get(value['goModule'], {}).get('Dir'), path, name)
+            require(name in facts['modules'], 'required local source module absent from native carrier: ' + name)
+        require(declared[meta['module']].get('Version') == meta['version'], 'actual Meta source graph version differs')
+        actual = facts['modules'].get(meta['module'])
+        require(actual is not None and actual.get('version') == meta['version'] and
+                actual.get('sum', '') == '' and actual.get('replacement') == meta['replacementPath'] and
+                actual.get('replacementVersion') == '(devel)' and actual.get('replacementSum', '') == '',
+                'actual Meta local replacement identity differs; baseline h1 is not a local sum')
     require(value['goModule'] in facts['modules'], 'original core source module absent from native carrier')
     for name, observed in facts['modules'].items():
         # The generated gobind main package is not a source module dependency.
@@ -445,9 +470,12 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
         interfaces = {}
         for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult', 'ExchangeContext', 'LocalDNSTransport', 'Func']:
             interfaces[name] = run([tools['javap'], '-constants', '-classpath', str(classes), 'io.nekohasekai.libbox.' + name])
-        required = {'Libbox': ['newTransientCommandServer(', 'newStrictCommandServer(', 'interfaceUpdateListenerIdentity(',
+        required = {'Libbox': ['newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(', 'interfaceUpdateListenerIdentity(',
                     'checkConfigWithResult(', 'java.lang.String version()'],
                     'CommandServer': ['startOrReloadService(', 'public native java.lang.String exportTailscaleStoreRetirement();',
+                                      'public native java.lang.String exportTailscaleDirectoryCapability();',
+                                      'public native java.lang.String exportTailscaleDirectoryRetirement();',
+                                      'activateTailscaleDirectoryDomain(',
                                       'void wakeNow()', 'void recordScreenState(boolean)'],
                     'PlatformInterface': ['void bindInterfaceControl(int, java.lang.String)'],
                     'ConfigValidationResult': ['getRequestID()', 'getConfigDigest()', 'getContractVersion()', 'getValidation()',
@@ -612,7 +640,9 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
             # Match read_text's universal newline behavior in the stable output.
             headers[header_path.name] = header_raw.decode().replace('\r\n', '\n').replace('\r', '\n')
         header = '\n'.join(headers.values())
-        for symbol in ['NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
+        for symbol in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',
+                       'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement',
+                       'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                        'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                        'getTailscaleStoreRetirement', 'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
             require(symbol in header, 'generated Objective-C API missing: ' + symbol)

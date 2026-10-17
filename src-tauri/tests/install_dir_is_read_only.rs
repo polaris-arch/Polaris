@@ -35,7 +35,7 @@
 //! # 本门**不**声称什么（诚实边界）
 //!
 //! 它守的是「解析安装目录的函数自己不写」。把解析结果 `return` 出去、由**另一个**函数写进去，
-//! 本门看不见（那需要跨函数数据流）。真正兜住那一格的是登记表本身：12 条里每一条都写明了产物
+//! 本门看不见（那需要跨函数数据流）。真正兜住那一格的是登记表本身：14 条里每一条都写明了产物
 //! 交给谁、只读在哪一句上成立，新增入口必须在这里补一条同样的说明。
 
 use std::collections::BTreeSet;
@@ -70,7 +70,7 @@ const WRITE_FORMS: [&str; 14] = [
 ///
 /// 每条都必须命中至少一个探针；命中 0 次 ⇒ 它守的东西已经没了，条目本身会变成将来某个真违规的
 /// 免死金牌，故当场红。
-const REGISTRY: [(&str, &str, &str); 13] = [
+const REGISTRY: [(&str, &str, &str); 14] = [
     (
         "test_support.rs",
         "ran_in_isolated_worker",
@@ -128,6 +128,13 @@ const REGISTRY: [(&str, &str, &str); 13] = [
         "runtime/proxy/core_binary.rs",
         "first_existing_bundle_candidate",
         "候选表里取第一个真实存在的：只 stat，不创建。",
+    ),
+    (
+        "runtime/proxy/core_binary.rs",
+        "is_current",
+        "CoreSelectionObservation 只重选当前候选并比较路径；dev override 只读环境，\
+         first_existing_bundle_candidate 只 is_file，BundleObservation::is_current 只读 retained File metadata、\
+         symlink_metadata 及 Windows 文件身份；不写盘，不新增全量 hash。",
     ),
     (
         "runtime/proxy/core_binary.rs",

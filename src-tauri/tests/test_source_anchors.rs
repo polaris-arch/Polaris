@@ -612,14 +612,21 @@ fn no_file_shaped_test_modules_anywhere() {
 const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/test_producer.py",
     "scripts/mobile-core/apple_rust.py",
+    "scripts/mobile-core/apple_tls_fingerprint.py",
+    "scripts/mobile-core/test_apple_tls_fingerprint.py",
     "scripts/mobile-core/test_apple_entry.py",
     "scripts/mobile-core/ci_android.py",
     "scripts/mobile-core/test_outputs.py",
+    // Python unittest discover requires test_*.py; exact source-checkout regression module.
+    "scripts/mobile-core/test_source_checkout.py",
     "scripts/mobile-core/test_native_inputs.py",
+    "scripts/mobile-core/test_delivery_boundaries.py",
     "scripts/mobile-core/ci_apple.py",
     "scripts/mobile-core/native_inputs.py",
     "scripts/mobile-core/build_apple_app.py",
     "scripts/mobile-core/fork_input.py",
+    "scripts/mobile-core/source_policy.py",
+    "scripts/mobile-core/test_source_policy.py",
     "scripts/mobile-core/android_sdk.py",
     "scripts/mobile-core/test_inputs.py",
     "scripts/mobile-core/apple_admission.py",
@@ -646,6 +653,9 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     }
     for path in [
         "scripts/mobile-core/unknown_module.py",
+        "scripts/mobile-core/test_delivery_boundaries_extra.py",
+        "scripts/mobile-core/nested/test_delivery_boundaries.py",
+        "scripts/other/test_delivery_boundaries.py",
         "scripts/mobile-core/test_native_inputs_extra.py",
         "scripts/other/test_native_inputs.py",
         "scripts/mobile-core/nested/test_native_inputs.py",

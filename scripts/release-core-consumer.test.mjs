@@ -1,5 +1,6 @@
 // Keep the release consumer inside the existing scripts/*.test.mjs CI collection.
 import './desktop-core/release-consumer.test.mjs';
+import './desktop-core/upstream-release.test.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';

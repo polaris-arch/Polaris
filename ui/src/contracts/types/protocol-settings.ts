@@ -5,6 +5,7 @@ export interface TlsSettings {
   allowInsecure?: boolean;
   alpn?: string[];
   fingerprint?: string;
+  utlsMode?: 'default' | 'disabled' | 'profile';
   ech?: boolean; // Encrypted Client Hello（隐藏 SNI）；sing-box tls.ech.enabled
   echConfig?: string; // 可选 ECHConfigList(PEM)；空=sing-box 从 DNS(HTTPS RR type65) 自取，填=下发 tls.ech.config
   fragment?: boolean; // TLS ClientHello 分片，抗 SNI-DPI；sing-box tls.fragment
@@ -250,7 +251,8 @@ export interface SshSettings {
 export interface ShadowTlsSettings {
   password: string; // Shadow-TLS v3 密码
   sni: string; // 伪装的目标域名
-  fingerprint?: string; // uTLS 指纹，默认 chrome
+  fingerprint?: string;
+  utlsMode?: 'default' | 'disabled' | 'profile'; // uTLS 指纹，默认 chrome
   port?: number; // Shadow-TLS 监听/转发的真实端口 (可选)
 }
 

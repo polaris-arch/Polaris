@@ -482,6 +482,7 @@ fn shadow_tls_postprocess_creates_outer_outbound() {
     let mut srv = ss_server("s1", "节点1");
     srv.bind_interface = Some("en7".into());
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "stls-pass".into(),
         sni: "sni.example.com".into(),
         fingerprint: Some("firefox".into()),
@@ -525,6 +526,7 @@ fn shadow_tls_postprocess_creates_outer_outbound() {
 fn shadow_tls_empty_sni_omits_server_name() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "p".into(),
         sni: String::new(), // 空 → server_name 不输出
         fingerprint: None,  // → 默认 chrome
@@ -563,6 +565,7 @@ fn shadow_tls_empty_sni_omits_server_name() {
 fn shadow_tls_empty_credentials_still_emit_unusable_outbound_json() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: String::new(), // 旧前端「开关一开就写空壳」的原样形状
         sni: String::new(),
         fingerprint: None,
@@ -599,6 +602,7 @@ fn shadow_tls_empty_credentials_still_emit_unusable_outbound_json() {
 fn shadow_tls_full_settings_emit_expected_outbound_json() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "stls-pass".into(),
         sni: "www.microsoft.com".into(),
         fingerprint: Some("firefox".into()),
@@ -637,6 +641,7 @@ fn shadow_tls_full_settings_emit_expected_outbound_json() {
 fn shadow_tls_zero_port_falls_back_to_node_port() {
     let mut srv = ss_server("s1", "节点1");
     srv.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "p".into(),
         sni: "s.example".into(),
         fingerprint: None,
@@ -1632,6 +1637,7 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
         let mut inner = ss_server("inner", "Inner");
         inner.bind_interface = Some("en7".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: None,
             password: "wrapper-password".into(),
             sni: "cover.example.com".into(),
             fingerprint: None,
@@ -1701,6 +1707,7 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
         let mut inner = ss_server("inner", "Inner");
         inner.detour = Some("upstream".into());
         inner.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: None,
             password: "p".into(),
             sni: "cover.example".into(),
             fingerprint: None,
@@ -1725,5 +1732,164 @@ fn shadow_tls_detour_to_pruned_upstream_cascades_instead_of_dialing_direct() {
                 .any(|o| o.tag == "Inner" || o.tag == "stls-out-inner"));
             assert!(deps.gate_invalid_nodes.contains_key("inner"));
         }
+    }
+}
+
+#[test]
+fn global_utls_policy_reaches_main_and_shadow_physical_outbound() {
+    use crate::user_config::protocol_settings::{ShadowTlsSettings, TlsSettings};
+    use crate::user_config::server_config::SecurityMode;
+    let plain = ServerConfig {
+        id: "plain-utls".into(),
+        name: "plain".into(),
+        address: "example.com".into(),
+        port: 443,
+        security: Some(SecurityMode::Tls),
+        tls_settings: Some(TlsSettings::default()),
+        ..Default::default()
+    };
+    let mut wrapped = plain.clone();
+    wrapped.id = "shadow-utls".into();
+    wrapped.shadow_tls_settings = Some(ShadowTlsSettings {
+        password: "secret".into(),
+        sni: "example.com".into(),
+        ..Default::default()
+    });
+    let config = UserConfig {
+        servers: vec![plain, wrapped],
+        utls_policy: Some("safari".into()),
+        ..Default::default()
+    };
+    let before = serde_json::to_value(&config.servers).unwrap();
+    let result = build_outbounds(&config, &mut deps_default()).unwrap();
+    let nodes: Vec<_> = result
+        .outbounds
+        .iter()
+        .filter(|outbound| outbound.server.is_some())
+        .collect();
+    assert!(!nodes.is_empty());
+    for outbound in nodes {
+        assert_eq!(
+            outbound
+                .tls
+                .as_ref()
+                .unwrap()
+                .utls
+                .as_ref()
+                .unwrap()
+                .fingerprint,
+            "safari"
+        );
+    }
+    assert_eq!(serde_json::to_value(&config.servers).unwrap(), before);
+}
+
+#[test]
+fn preexcluded_node_does_not_fail_the_remaining_outbound_utls_policy() {
+    use crate::user_config::protocol_settings::TlsSettings;
+    use crate::user_config::server_config::SecurityMode;
+    let mut excluded = ServerConfig {
+        id: "excluded-utls".into(),
+        protocol: Protocol::Vless,
+        security: Some(SecurityMode::Tls),
+        tls_settings: Some(TlsSettings {
+            fingerprint: Some("unsupported-profile".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    excluded.address = "example.com".into();
+    excluded.port = 443;
+    let config = UserConfig {
+        servers: vec![excluded],
+        ..Default::default()
+    };
+    let mut deps = deps_default();
+    deps.gate_invalid_nodes
+        .insert("excluded-utls".into(), "fixture-preexcluded");
+    let generated = build_outbounds(&config, &mut deps).unwrap();
+    assert!(!generated
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == "proxy-excluded-utls"));
+    assert_eq!(
+        deps.gate_invalid_nodes["excluded-utls"],
+        "fixture-preexcluded"
+    );
+}
+
+#[test]
+fn disabled_shadow_utls_keeps_tls_and_historical_bad_reality_does_not_block_other_nodes() {
+    use crate::user_config::protocol_settings::TlsSettings;
+    use crate::user_config::utls::UtlsMode;
+    for (mode, fingerprint) in [
+        (Some(UtlsMode::Disabled), Some("chrome")),
+        (None, Some("none")),
+    ] {
+        let mut shadow = ss_server("shadow", "Shadow");
+        shadow.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: mode,
+            fingerprint: fingerprint.map(str::to_owned),
+            password: "pw".into(),
+            sni: "example.com".into(),
+            port: Some(443),
+        });
+        let before = serde_json::to_value(&shadow).unwrap();
+        let config = UserConfig {
+            servers: vec![shadow.clone()],
+            selected_server_id: Some("shadow".into()),
+            ..Default::default()
+        };
+        let output = build_outbounds(&config, &mut deps_default()).unwrap();
+        let tls = output
+            .outbounds
+            .iter()
+            .find(|out| out.type_field == "shadowtls")
+            .unwrap()
+            .tls
+            .as_ref()
+            .unwrap();
+        assert!(tls.enabled);
+        assert!(tls.utls.is_none());
+        assert_eq!(serde_json::to_value(shadow).unwrap(), before);
+    }
+    for mode in [None, Some(UtlsMode::Disabled), Some(UtlsMode::Profile)] {
+        let bad = ServerConfig {
+            id: "bad".into(),
+            name: "Historical REALITY".into(),
+            protocol: Protocol::Vless,
+            security: Some(SecurityMode::Reality),
+            address: "example.com".into(),
+            port: 443,
+            tls_settings: Some(TlsSettings {
+                utls_mode: mode,
+                fingerprint: Some("none".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = serde_json::to_value(&bad).unwrap();
+        let mut config = UserConfig {
+            servers: vec![ss_server("good", "Good"), bad],
+            selected_server_id: Some("good".into()),
+            ..Default::default()
+        };
+        let mut deps = deps_default();
+        let output = build_outbounds(&config, &mut deps).unwrap();
+        assert!(output
+            .outbounds
+            .iter()
+            .any(|out| out.type_field == "shadowsocks"));
+        assert_eq!(
+            deps.gate_invalid_nodes.get("bad"),
+            Some(&INVALID_REASON_REALITY_UTLS_DISABLED)
+        );
+        assert_eq!(serde_json::to_value(&config.servers[1]).unwrap(), before);
+        config.selected_server_id = Some("bad".into());
+        assert!(build_outbounds(&config, &mut deps_default())
+            .unwrap_err()
+            .contains("REALITY requires uTLS"));
+        config.utls_policy = Some("default".into());
+        assert!(build_outbounds(&config, &mut deps_default()).is_ok());
     }
 }

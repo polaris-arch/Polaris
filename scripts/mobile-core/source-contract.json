@@ -2,26 +2,26 @@
   "schema": "polaris-mobile-fork-input-v1",
   "state": "source-input-candidate; not-produced-or-published",
   "role": "mobile",
-  "repository": "polaris-arch/polaris-box",
-  "repositoryId": 1407705262,
-  "sourceURL": "https://github.com/polaris-arch/polaris-box",
-  "version": "1.15.0-alpha.12",
-  "sourceTag": "v1.15.0-alpha.12",
-  "sourceTagObject": "5cedbe7a54594756da544af90ebfd1f403f2e091",
-  "sourceCommit": "577d4b9a089b71d2f0a4ca334b87264b55c10478",
-  "sourceTree": "072dacb999c07c7948816f10efaaaf371da45eb9",
-  "goModSha256": "a2d3d373d50a5d1d8a98fac6c3a0393885eeabc8404dfd3435eab41d6426324b",
-  "goSumSha256": "6904f2adc151e575c3751e7bc0734ac40f3ac039b2640b6ceff4293825f68edb",
+  "repository": "polaris-arch/sing-box-polaris",
+  "repositoryId": 1421657509,
+  "sourceURL": "https://github.com/polaris-arch/sing-box-polaris",
+  "version": "1.15.0-polaris-alpha.12",
+  "sourceTag": "v1.15.0-polaris-alpha.12",
+  "sourceTagObject": "50b04bff4d35fe7e4e8f41e24bb0cfd0ab6f5a9d",
+  "sourceCommit": "68ffb209ded1f9337f9115741cba24f9f4c63421",
+  "sourceTree": "780aeae3833770877f7cb386cc1632b778473282",
+  "goModSha256": "27275444718d394dcc31040304ccea65e050c417ef8a85ea7fa6ee6a351e0915",
+  "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
   "goModule": "github.com/sagernet/sing-box",
   "sourceOverlay": 0,
   "patches": [],
   "dependencyPatches": [],
-  "goVersion": "1.25.5",
+  "goVersion": "1.27.2",
   "gomobileVersion": "v0.1.13",
   "gobindVersion": "v0.1.13",
   "declaredTagsSource": {
     "path": "cmd/internal/build_libbox/main.go",
-    "sha256": "1008b27acc8dc9ce05b76dde4a48ad2ea6eaf6d212f9001fe81893330f65f240"
+    "sha256": "f32a147fe0f3f763dd2719887a805ec0c058d87297b0cbddadeeaddfdac32d06"
   },
   "android": {
     "targets": [
@@ -72,7 +72,7 @@
       "ts_omit_synology",
       "ts_omit_bird"
     ],
-    "outputName": "polaris-box-1.15.0-alpha.12-android.aar",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12-android.aar",
     "javaPackage": "io.nekohasekai",
     "libname": "box",
     "legacyAPI21Enabled": false
@@ -122,7 +122,7 @@
     ],
     "libname": "box",
     "frameworkName": "Libbox.xcframework",
-    "outputName": "polaris-box-1.15.0-alpha.12-ios-xcframework.zip",
+    "outputName": "polaris-box-1.15.0-polaris-alpha.12-ios-xcframework.zip",
     "linkage": "static; build-time verified App and PacketTunnel link",
     "macOSTvOSIncluded": false
   },
@@ -138,5 +138,29 @@
     "buildPeakReserveBytes": 17179869184,
     "cacheMaxBytes": 21474836480,
     "workspacePolicy": "Explicit fixed caller-owned source/work/cache slots and exclusive build lease; no global Go/gomobile/NDK upgrade, no per-run full source copies"
+  },
+  "sourcePolicy": {
+    "schema": "polaris-reviewed-kernel-source-v1",
+    "sourceCommit": "68ffb209ded1f9337f9115741cba24f9f4c63421",
+    "sourceTree": "780aeae3833770877f7cb386cc1632b778473282",
+    "goVersion": "1.27.2",
+    "goModSha256": "27275444718d394dcc31040304ccea65e050c417ef8a85ea7fa6ee6a351e0915",
+    "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
+    "goDirective": "1.27.0",
+    "toolchain": "go1.27.2",
+    "metacubex": {
+      "module": "github.com/metacubex/utls",
+      "version": "v1.8.8",
+      "replacementPath": "./third_party/metacubex-utls",
+      "replacementTree": "40304faa4cfb50c928732bbbb476e22fb9119735",
+      "replacementFileCount": 355,
+      "bindingPath": "release/dependency-sources/metacubex-utls-replacement.json",
+      "bindingSha256": "bb44c0350b1d8ae65f364f986085760c024ccd9c9653bd89cb0e407de850888b",
+      "patchPath": "release/dependency-sources/metacubex-utls-reality-alpn.patch",
+      "patchSha256": "a0f7bcf8429b003e008ac38fa4a4c083f8c8397b4d75f5e3bd992e24d8fcc932",
+      "upstreamCommit": "449a38f8780006758205a60661a0bc374a182ca5",
+      "upstreamH1": "h1:7fiMYahL+tT1I/vG1MWidv88r/3A5NnPrurjzApZGyQ=",
+      "upstreamZipSha256": "2eb4a99f8d7295c16500ac215f912796deac43d8b67054d589d8ed680515747e"
+    }
   }
 }

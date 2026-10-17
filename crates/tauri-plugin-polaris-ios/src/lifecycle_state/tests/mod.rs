@@ -138,3 +138,39 @@ fn stop_after_native_terminal_before_delivery_cannot_grant_a_ready_receipt() {
     assert!(state.running()); // NE liveness remains an observation, never readiness.
     assert!(!state.accepts_receipt(a, 7));
 }
+
+#[test]
+fn stop_target_remains_addressable_after_shared_readiness_is_revoked() {
+    let mut state = LifecycleState::default();
+    let start = state.begin_start(7, "request-a".into()).unwrap();
+    assert!(state.finish(start, Some(true)));
+    assert!(state.accepts_receipt(start, 7));
+    assert!(state.accepts_stop_target(start));
+    assert_eq!(state.revoke_start_through(7), None);
+    assert!(!state.accepts_receipt(start, 7));
+    assert!(state.accepts_stop_target(start));
+}
+
+#[test]
+fn stop_target_rejects_pending_and_replaced_native_generations() {
+    let mut state = LifecycleState::default();
+    let start = state.begin_start(7, "request-a".into()).unwrap();
+    assert!(!state.accepts_stop_target(start));
+    assert!(state.finish(start, Some(true)));
+    let next = state.begin().unwrap();
+    assert!(!state.accepts_stop_target(start));
+    assert!(!state.accepts_stop_target(next));
+    assert!(state.finish(next, Some(false)));
+    assert!(!state.accepts_stop_target(start));
+    assert!(state.accepts_stop_target(next));
+}
+
+#[test]
+fn stop_target_waits_for_native_terminal_after_receiver_loss() {
+    let mut state = LifecycleState::default();
+    let start = state.begin_start(7, "request-a".into()).unwrap();
+    assert!(state.abandon(start));
+    assert!(!state.accepts_stop_target(start));
+    assert!(state.native_terminal(start));
+    assert!(state.accepts_stop_target(start));
+}

@@ -9,7 +9,51 @@ from fork_input import CONTRACT, bind_command, tool_environment, validate, verif
 
 class MobileInputs(unittest.TestCase):
     def setUp(self):
-        self.value = json.loads(CONTRACT.read_bytes())
+        from test_source_policy import future_mobile_fixture
+        self.value, _ = future_mobile_fixture()
+
+    def test_final_reviewed_toolchain_keeps_minimum_go_distinct_from_actual_compiler(self):
+        from test_source_policy import future_mobile_fixture
+        value, _ = future_mobile_fixture()
+        self.assertEqual(validate(value)['goVersion'], '1.27.2')
+        self.assertEqual(value['sourcePolicy']['goDirective'], '1.27.0')
+        for field, bad in [('sourceCommit', '0' * 40), ('sourceTree', '0' * 40), ('goVersion', '1.28.0')]:
+            changed = deepcopy(value); changed[field] = bad
+            with self.subTest(field=field), self.assertRaises(RuntimeError): validate(changed)
+        workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/apple.yml').read_text()
+        self.assertIn('fork_input.py --go-version', workflow)
+        self.assertIn('go-version: ${{ steps.mobile-go.outputs.version }}', workflow)
+        self.assertLess(workflow.index('fork_input.py --go-version'), workflow.index('actions/setup-go@'))
+
+    def test_exact_new_fork_identity_rejects_old_or_mixed_repository(self):
+        self.assertEqual(self.value['repository'], 'polaris-arch/sing-box-polaris')
+        self.assertEqual(self.value['repositoryId'], 1421657509)
+        self.assertEqual(self.value['sourceURL'], 'https://github.com/polaris-arch/sing-box-polaris')
+        validate(self.value)
+        for field, bad in [('repository', 'polaris-arch/polaris-box'),
+                           ('repositoryId', 1407705262),
+                           ('sourceURL', 'https://github.com/polaris-arch/polaris-box'),
+                           ('repository', 'SagerNet/sing-box')]:
+            value = deepcopy(self.value)
+            value[field] = bad
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, 'repository differs'):
+                validate(value)
+
+    def test_polaris_release_version_and_exact_tag_are_required(self):
+        self.assertEqual(self.value['version'], '1.15.0-polaris-alpha.12')
+        self.assertEqual(self.value['sourceTag'], 'v1.15.0-polaris-alpha.12')
+        validate(self.value)
+        for version, tag in [
+            ('1.15.0-alpha.12', 'v1.15.0-alpha.12'),
+            ('1.15.0-polaris-alpha.12', 'v1.15.0-alpha.12'),
+            ('1.15.0-polaris-alpha.12', 'v1.15.0-polaris-alpha.13'),
+            ('1.15.0-polaris-alpha.12', '1.15.0-polaris-alpha.12'),
+            ('1.15.0-polaris-alpha.12-extra', 'v1.15.0-polaris-alpha.12-extra'),
+        ]:
+            value = deepcopy(self.value)
+            value.update(version=version, sourceTag=tag)
+            with self.subTest(version=version, tag=tag), self.assertRaisesRegex(RuntimeError, 'tag/version differs'):
+                validate(value)
 
     def test_zero_overlay_does_not_require_historical_patch_inventory(self):
         self.assertEqual(validate(self.value)['patches'], [])
@@ -22,17 +66,21 @@ class MobileInputs(unittest.TestCase):
 
     def test_android_is_one_explicit_four_abi_api24_bind_without_helper_defaults(self):
         args = bind_command('android', self.value, '/isolated/gomobile', '/stage/core.aar', 'a' * 64, '/sdk/android.jar')
+        self.assertIn('-X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' +
+                      self.value['sourceCommit'], args[args.index('-ldflags') + 1])
         self.assertEqual(args[args.index('-target') + 1], 'android/arm64,android/arm,android/386,android/amd64')
         self.assertEqual(args[args.index('-androidapi') + 1], '24')
         self.assertIn('with_gvisor', args[args.index('-tags') + 1].split(','))
         self.assertIn('with_naive_outbound', args[args.index('-tags') + 1].split(','))
         self.assertNotIn('21', args)
         self.assertNotIn('build_libbox', ' '.join(args))
-        self.assertIn('constant.Version=1.15.0-alpha.12', args[args.index('-ldflags') + 1])
+        self.assertIn('constant.Version=1.15.0-polaris-alpha.12', args[args.index('-ldflags') + 1])
         self.assertNotIn('git describe', ' '.join(args))
 
     def test_apple_contains_two_arm64_ios_platform_slices_and_no_default_tv_or_macos(self):
         args = bind_command('apple', self.value, '/isolated/gomobile', '/stage/Libbox.xcframework', 'b' * 64)
+        self.assertIn('-X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' +
+                      self.value['sourceCommit'], args[args.index('-ldflags') + 1])
         self.assertEqual(args[args.index('-target') + 1], 'ios/arm64,iossimulator/arm64')
         self.assertEqual(args[args.index('-iosversion') + 1], '15.0')
         for wrong in ['macos', 'tvos', 'amd64', 'x86_64']:
@@ -91,21 +139,30 @@ class MobileInputs(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            value = deepcopy(self.value)
+            value = json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes())
             module = f"module {value['goModule']}\ngo {value['goVersion']}\nrequire (\n\tgithub.com/sagernet/gomobile {value['gomobileVersion']}\n)\n".encode()
             (root / 'go.mod').write_bytes(module); value['goModSha256'] = sha(module)
             (root / 'go.sum').write_bytes(b'fixture-sum'); value['goSumSha256'] = sha(b'fixture-sum')
             declared = root / value['declaredTagsSource']['path']; declared.parent.mkdir(parents=True)
             declared.write_bytes(b'fixture-tag-declaration'); value['declaredTagsSource']['sha256'] = sha(declared.read_bytes())
             ignored = []
+            tracked_status = ''
+            observed_head = value['sourceCommit']
             def git(_root, *args):
                 if args[0] == 'cat-file': return 'tag'
-                if args[0] == 'status': return ''
+                if args[0] == 'status': return tracked_status
                 if args[0] == 'ls-files': return '\n'.join(ignored) if '--ignored' in args else ''
                 ref = args[1]
+                if ref == 'HEAD': return observed_head
                 return value['sourceTagObject'] if ref.endswith('^{tag}') else value['sourceTree'] if ref.endswith('^{tree}') else value['sourceCommit']
             with patch('fork_input.git', side_effect=git):
                 self.assertEqual(verify_source(root, value)['sourceOverlay'], 0)
+                for tracked_status in [' M go.mod', 'M  experimental/libbox/command_server.go']:
+                    with self.assertRaises(RuntimeError): verify_source(root, value)
+                tracked_status = ''
+                observed_head = '0' * 40
+                with self.assertRaises(RuntimeError): verify_source(root, value)
+                observed_head = value['sourceCommit']
                 for name in ['experimental/libbox/extra_darwin.m', 'experimental/libbox/extra.cxx', 'experimental/libbox/embedded.data']:
                     ignored[:] = [name]
                     with self.assertRaises(RuntimeError): verify_source(root, value)

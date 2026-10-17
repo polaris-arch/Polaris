@@ -370,8 +370,10 @@ pub enum FailureOutcome {
 pub enum ChildObservation {
     /// `try_wait()==Ok(None)`：进程仍在跑。
     Alive,
-    /// `try_wait()==Ok(Some(_))` 或探活出错：进程已退出（本任务收割）。
+    /// `try_wait()==Ok(Some(_))`：明确观察到退出。
     Exited,
+    /// 观测失败，不能证明退出；保留 custody 并继续有界等待/监测。
+    Unknown,
     /// 句柄已被取走（`kill_core` 的 `take()`）→ 主动停止/重启正在进行。
     Absent,
 }
@@ -410,7 +412,7 @@ pub fn classify_child_exit(
     }
     match observation {
         ChildObservation::Absent => ExitClassification::Retire,
-        ChildObservation::Alive => ExitClassification::KeepWatching,
+        ChildObservation::Alive | ChildObservation::Unknown => ExitClassification::KeepWatching,
         ChildObservation::Exited => ExitClassification::Crash,
     }
 }

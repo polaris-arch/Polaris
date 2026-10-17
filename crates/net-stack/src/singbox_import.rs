@@ -245,8 +245,25 @@ fn apply_tls(server: &mut ServerConfig, tls: Option<&Value>) {
     let ech_enabled = ech.map(|e| bool_true(e.get("enabled"))).unwrap_or(false);
     server.tls_settings = Some(TlsSettings {
         server_name: str_val(tls.get("server_name")),
+        engine: str_ne(tls.get("engine")).and_then(|engine| normalize_token(&engine)),
         allow_insecure: Some(bool_true(tls.get("insecure"))),
         alpn,
+        utls_mode: Some(
+            if tls
+                .get("utls")
+                .and_then(|u| u.get("enabled"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                if str_ne(tls.get("utls").and_then(|u| u.get("fingerprint"))).is_some() {
+                    polaris_config_engine::user_config::utls::UtlsMode::Profile
+                } else {
+                    polaris_config_engine::user_config::utls::UtlsMode::Default
+                }
+            } else {
+                polaris_config_engine::user_config::utls::UtlsMode::Disabled
+            },
+        ),
         fingerprint: str_ne(tls.get("utls").and_then(|u| u.get("fingerprint")))
             .and_then(|f| normalize_token(&f)),
         ech: ech_enabled.then_some(true),

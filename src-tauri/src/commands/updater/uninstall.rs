@@ -49,14 +49,14 @@ struct PluginAutostart(AppHandle);
 // 移动端两个方法都回「本来就没开」/「无事可做」：应用商店的卸载由系统执行，应用无从参与，
 // 也没有需要在卸载前撤销的开机自启项（那项能力在系统手里，见 `lib.rs` 的插件注册点注释）。
 impl uninstall::AutostartOps for PluginAutostart {
-    fn is_enabled(&self) -> bool {
+    fn is_enabled(&self) -> Result<bool, String> {
         #[cfg(mobile)]
-        return false;
+        return Ok(false);
         #[cfg(desktop)]
         self.0
             .state::<tauri_plugin_autostart::AutoLaunchManager>()
             .is_enabled()
-            .unwrap_or(false)
+            .map_err(|error| error.to_string())
     }
 
     fn disable(&self) -> Result<(), String> {

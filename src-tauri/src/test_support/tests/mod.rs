@@ -28,15 +28,24 @@ use super::*;
 /// 取材面漏掉根文件就是只有一半判据（2026-08-30 修复前 `module_source` 正是只走目录）。
 const MISC_MARKERS: [(&str, &str); 7] = [
     (
-        "misc.rs",
+        "commands/misc.rs",
         "pub use autostart::{auto_start_get_status, auto_start_set}",
     ),
-    ("autostart.rs", "pub async fn auto_start_set"),
-    ("backup.rs", "pub async fn backup_export"),
-    ("dashboard.rs", "pub async fn open_singbox_dashboard"),
-    ("ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),
-    ("logs.rs", "pub(crate) fn clear_log_stream_window"),
-    ("support.rs", "pub(super) fn node_platform"),
+    ("commands/misc/autostart.rs", "pub async fn auto_start_set"),
+    ("commands/misc/backup.rs", "pub async fn backup_export"),
+    (
+        "commands/misc/dashboard.rs",
+        "pub async fn open_singbox_dashboard",
+    ),
+    (
+        "commands/misc/ipinfo.rs",
+        "pub(crate) fn ipinfo_probe_is_current",
+    ),
+    (
+        "commands/misc/logs.rs",
+        "pub(crate) fn clear_log_stream_window",
+    ),
+    ("commands/misc/support.rs", "pub(super) fn node_platform"),
 ];
 
 #[test]
@@ -193,7 +202,7 @@ fn module_source_covers_every_production_file_of_a_real_module() {
         + usize::from(src.join("commands/misc.rs").is_file());
     assert_eq!(files.len(), on_disk, "取材文件数与磁盘实况对不上");
     assert!(
-        files.iter().any(|(rel, _)| rel == "misc.rs"),
+        files.iter().any(|(rel, _)| rel == "commands/misc.rs"),
         "取材面里没有模块根 `misc.rs` —— 模块的源码有一半在根文件里"
     );
     assert_eq!(files.len(), MISC_MARKERS.len(), "夹具清单该更新了");

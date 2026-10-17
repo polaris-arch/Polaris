@@ -17,7 +17,18 @@ use polaris_updater::extract_version_token;
 ///
 /// 读版本要起一个子进程，故放到阻塞线程上，不占主线程。
 #[tauri::command]
-pub async fn core_get_version_info(app: AppHandle) -> Result<ApiResponse<Value>, ()> {
+pub async fn core_get_version_info(
+    app: AppHandle,
+    capabilities_only: Option<bool>,
+) -> Result<ApiResponse<Value>, ()> {
+    if capabilities_only.unwrap_or(false) {
+        let capabilities = app
+            .state::<AppRuntime>()
+            .proxy
+            .tls_fingerprint_capabilities()
+            .await;
+        return Ok(ApiResponse::ok(json!({"tlsFingerprints": capabilities})));
+    }
     let read = tokio::task::spawn_blocking(move || {
         let state = app.state::<AppRuntime>();
         let u = state.updater();

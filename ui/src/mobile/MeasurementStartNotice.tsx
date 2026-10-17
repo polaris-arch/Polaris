@@ -1,4 +1,5 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
+import { useSheetFocus } from './use-sheet-focus';
 import { create } from 'zustand';
 import { useTranslation } from 'react-i18next';
 import { useDismissableLayer } from './back-stack';
@@ -23,17 +24,19 @@ export function cancelMeasurementConsent(): void { consent.getState().answer?.(f
 export function MeasurementStartNotice({ disabled = false }: { disabled?: boolean }) {
   const { t } = useTranslation();
   const pending = consent(state => state.pending);
+  const panel = useRef<HTMLDivElement>(null);
+  useSheetFocus(panel, pending && !disabled, cancelMeasurementConsent);
   useDismissableLayer(pending, cancelMeasurementConsent);
   useEffect(() => () => cancelMeasurementConsent(), []);
   useEffect(() => { if (disabled) cancelMeasurementConsent(); }, [disabled]);
   if (!pending || disabled) return null;
-  return <div role="dialog" aria-modal="true" aria-labelledby="measurement-start-title"
+  return <div ref={panel} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="measurement-start-title"
     style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'grid', placeItems: 'center', background: '#0008', padding: '1rem' }}>
     <section style={{ background: 'hsl(var(--bg))', color: 'hsl(var(--text))', borderRadius: '1rem', padding: '1.25rem', maxWidth: '28rem' }}>
       <h2 id="measurement-start-title">{t('measurement.iosTitle')}</h2>
       <p>{t('measurement.iosWillStart')}</p>
       <div style={{ display: 'flex', gap: '1rem' }}>
-        <button type="button" onClick={cancelMeasurementConsent} autoFocus>{t('common.cancel')}</button>
+        <button type="button" onClick={cancelMeasurementConsent}>{t('common.cancel')}</button>
         <button type="button" onClick={() => consent.getState().answer?.(true)}>{t('common.confirm')}</button>
       </div>
     </section>

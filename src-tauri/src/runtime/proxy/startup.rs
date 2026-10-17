@@ -340,7 +340,7 @@ pub(super) fn main_core_parse_unit_count(config: &SingBoxConfig) -> usize {
 ///   一个由推导系数算出来的估算值。用一个未经多点实测的公式去否决用户的连接请求，代价与置信度
 ///   完全不匹配；
 /// · 临时核那条上限的判据是「等一个可能永远不会 bind 的核，且这段时间里进程级单飞闸挡住一切后续
-///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::is_alive`
+///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::observe_process`
 ///   当场接住；用户中途点停止/重连由 `is_superseded` 接住，且轮询 sleep 本身可被世代变化打断
 ///   （见 [`ProxyRuntime::wait_ready`]）⇒ 等待随时可取消，用户不需要一个替他做主的上限。
 ///
@@ -497,7 +497,7 @@ pub(super) const SINGBOX_STARTUP_LOG: &str = "singbox-startup.log";
 /// `sing-box check` 成功缓存。只缓存“同一核二进制 + 除运行期随机端口外完全相同的生成配置”；
 /// 任一结构字段或核身份变化都重新真跑 check。
 pub(super) const KERNEL_GATE_CACHE_FILE: &str = "singbox-check-cache.json";
-pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 1;
+pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 2;
 
 /// 一次已成功 `sing-box check` 的可持久身份。
 ///
@@ -510,6 +510,7 @@ pub(super) struct KernelGateCacheRecord {
     pub(super) schema: u32,
     pub(super) binary_path: String,
     pub(super) binary_len: u64,
+    pub(super) binary_sha256: String,
     pub(super) binary_modified_ns: u64,
     pub(super) config_sha256: String,
 }
@@ -575,9 +576,19 @@ pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
     }
 }
 
-fn kernel_gate_cache_record(
+#[cfg(test)]
+pub(super) fn kernel_gate_cache_record(
     binary: &Path,
     config: &SingBoxConfig,
+) -> Option<KernelGateCacheRecord> {
+    let digest = crate::runtime::tls_fingerprints::binary_digest(binary).ok()?;
+    kernel_gate_cache_record_with_digest(binary, config, &digest)
+}
+
+fn kernel_gate_cache_record_with_digest(
+    binary: &Path,
+    config: &SingBoxConfig,
+    digest: &str,
 ) -> Option<KernelGateCacheRecord> {
     let metadata = std::fs::metadata(binary).ok()?;
     let modified = metadata
@@ -598,6 +609,7 @@ fn kernel_gate_cache_record(
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path,
         binary_len: metadata.len(),
+        binary_sha256: digest.to_owned(),
         binary_modified_ns: modified_ns,
         config_sha256: polaris_updater::verify::sha256_hex(&normalized),
     })
@@ -799,6 +811,8 @@ impl ProxyRuntime {
     /// 只是多漏一个进程。这类「绿而带副作用」的坑不可能靠逐条 review 兜住，只能靠这道门。
     #[cfg(test)]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
+        self.core_binary_resolution_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.core_binary_override
             .lock()
             .ok()
@@ -1481,6 +1495,17 @@ impl ProxyRuntime {
             // 拿在手上，闸门按 `Ok` 与否决定跑不跑（解析不到 ⇒ 无核可问 ⇒ failOpen 跳过闸门），
             // emit 之后才在下面 `?`。每尝试解析（字面路径，成本极低）；解析不到 = 终态，不重试（非竞态失败）。
             let binary_res = self.core_binary_for_start();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let startup_cli_proof = if let Ok(path) = &binary_res {
+                // The gate below reuses this observation. Keep the same proof
+                // across every await; a later menu refresh cannot substitute it.
+                crate::runtime::tls_fingerprints::probe_cli_observation(path)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             // 起核前的内核闸门：生成 → 写盘 → check → 剥掉内核点名拒收的节点 → 重来，直到内核收下。
             // 首次/结构变更仍真跑 check；同一核 + 同一最终生成配置命中已接受身份时为 0 次。
             let gate = match self
@@ -1707,6 +1732,15 @@ impl ProxyRuntime {
             self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
             let main_claim_token = main_reservation.claim_token();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if startup_cli_proof
+                .as_ref()
+                .is_some_and(|entry| !entry.still_current())
+            {
+                return Err(StartError::from(
+                    "Core bytes changed after preflight; retry startup".to_owned(),
+                ));
+            }
             let pid = if cfg!(target_os = "android") {
                 // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
                 // 不 spawn、无 child、无 pid：核跑在**本进程内**的 libbox 里，由 `VpnService` 承载
@@ -1786,6 +1820,7 @@ impl ProxyRuntime {
                                 ),
                                 main_token: main_claim_token.clone(),
                                 ready: None,
+                                stop_target: None,
                                 stopped: None,
                             });
                             Ok(start)
@@ -1802,8 +1837,26 @@ impl ProxyRuntime {
                     // Original native request, full main token/config and callback cell
                     // are retained before the single native dispatcher can submit.
                     main_reservation.arm_external_start();
-                    match tauri_plugin_polaris_ios::start_prepared(&start).await {
+                    match async {
+                        let ready =
+                            tauri_plugin_polaris_ios::start_managed_prepared(&start).await?;
+                        // Reload can complete between Ready and host publication.
+                        // Keep the same original start while capturing its full history.
+                        tauri_plugin_polaris_ios::refresh_ready_session(&ready).await
+                    }
+                    .await
+                    {
                         Ok(receipt) => {
+                            if let Some(token) = &main_claim_token {
+                                self.mesh
+                                    .bind_tailscale_main_actual_scope(
+                                        token,
+                                        ts_gate,
+                                        receipt.config_digest(),
+                                        receipt.original_instances(),
+                                    )
+                                    .map_err(StartError::from)?;
+                            }
                             self.gate.with_current_generation(my_gen, |_live| {
                                 if let Ok(mut ready) = self.ios_ready_session.write() {
                                     if let Some(owner) = ready
@@ -1909,6 +1962,10 @@ impl ProxyRuntime {
                 // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
                 // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
                 req.working_dir = Some(self.config.dir().to_path_buf());
+                // Reuse the validated file observation; retain it across synchronous
+                // spawn and bind it to the opaque identity returned for that Child.
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                let launch_tls = startup_cli_proof.clone();
                 let direct_spawn = self.spawn_direct_native(
                     native_producer.as_ref(),
                     my_gen,
@@ -1923,6 +1980,12 @@ impl ProxyRuntime {
                 }
                 match direct_spawn {
                     Ok(Some((pid, identity))) => {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        if let Ok(mut proof) = self.captured_cli_run.lock() {
+                            *proof = launch_tls
+                                .filter(|entry| entry.still_current())
+                                .map(|entry| (my_gen, identity.clone(), entry));
+                        }
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
@@ -2242,6 +2305,36 @@ impl ProxyRuntime {
             error: None,
             error_code: None,
         };
+        // The libbox query now reaches the ready extension on iOS. Old query
+        // support stays unknown; it is never promoted to cache-eligible evidence.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let ready_tls = if !via_helper {
+            self.direct_tls_snapshot(my_gen)
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                match self.tls_ready_binary_for_pid(pid, true) {
+                    Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
+                    None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                        "Loaded core image is unavailable",
+                    ),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                    "Helper loaded-image byte proof is unavailable",
+                )
+            }
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
+        if self.gate.generation() != my_gen {
+            return Ok(self.status());
+        }
+        if let Ok(mut identity) = self.captured_core_sha256.lock() {
+            *identity = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
+        }
         // 热切换基准：**与 running 状态同生共死**（此处置、stop 清）→「快照在 ⟺ 核在跑」。
         // 上游 在生成期就回填，但那样起核失败时会留下描述「不存在的核」的快照；此处收紧到就绪后。
         #[cfg(all(target_os = "android", debug_assertions))]
@@ -2908,9 +3001,9 @@ impl ProxyRuntime {
         #[cfg(test)]
         let ready_retry_count = Arc::clone(&self.ready_retry_count);
         let deps = CoreReadyDeps {
-            // 子进程存活：直起走 try_wait 非阻塞收割（Ok(None)=仍在跑；child 被 stop 取走→不活）；
+            // 直起保留 try_wait 三态；Stop 已取走 custody 时让位，不折成进程死亡。
             // helper 核走 pid 探活（kill(pid,0)，root 核跨用户 EPERM 亦判活）。
-            is_alive: Box::new({
+            observe_process: Box::new({
                 let alive_probe_count = Arc::clone(&alive_probe_count);
                 let alive_probe_elapsed_us = Arc::clone(&alive_probe_elapsed_us);
                 move || {
@@ -2919,30 +3012,43 @@ impl ProxyRuntime {
                     // 桥的起核回执就是这条腿的真值（语义与射程见 `android_bridge::core_started`）。
                     // 不能问桥要 `BoxService.state`：本闭包是**同步**的（`Fn()->bool`），跨桥往返是
                     // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
-                    let alive = if cfg!(target_os = "android") {
-                        super::android_bridge::core_started()
+                    use polaris_core_supervisor::ChildObservation;
+                    let observed = if cfg!(target_os = "android") {
+                        if super::android_bridge::core_started() {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if cfg!(target_os = "ios") {
                         #[cfg(target_os = "ios")]
                         {
-                            tauri_plugin_polaris_ios::started()
+                            if tauri_plugin_polaris_ios::started() {
+                                ChildObservation::Alive
+                            } else {
+                                ChildObservation::Exited
+                            }
                         }
                         #[cfg(not(target_os = "ios"))]
                         {
-                            false
+                            ChildObservation::Absent
                         }
                     } else if via_helper {
-                        helper_pid.is_some_and(pid_alive)
+                        if helper_pid.is_some_and(pid_alive) {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if let Ok(mut g) = child.lock() {
-                        g.is_running_alive()
+                        g.startup_observation()
                     } else {
-                        false
+                        ChildObservation::Unknown
                     };
                     alive_probe_count.fetch_add(1, Ordering::Relaxed);
                     alive_probe_elapsed_us.fetch_add(
                         started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
-                    alive
+                    observed
                 }
             }),
             // 就绪信号：管理 API 端口 TCP 可连（core-readiness.ts 原义；该口是 h2c gRPC，无 REST 可判）。
@@ -3355,21 +3461,202 @@ impl ProxyRuntime {
     /// **绝不删文件**（运行中删被挂载文件会致 sing-box reload 报错；删除只在起核 `write_custom_rule_files`
     /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回是否全部成功，由调用方按
     /// Full/SelectedOnly 范围选择重启配置；此处不能自行从磁盘 D 排程。
-    pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) -> bool {
-        let dir = self.custom_rules_dir();
-        let expected = build_custom_rule_files(config);
-        for (name, content) in &expected {
-            let file_path = dir.join(name);
-            let cur = std::fs::read_to_string(&file_path).ok();
-            if cur.as_deref() == Some(content.as_str()) {
-                continue;
-            }
-            if let Err(e) = atomic_write_custom_rule(&file_path, content) {
-                log::warn!("热更外化规则文件失败，退回去抖重启：{name}（{e}）");
-                return false;
+    pub(super) async fn sync_custom_rule_files(
+        self: &Arc<Self>,
+        config: &UserConfig,
+        generation: u64,
+        intent: u64,
+    ) -> bool {
+        if !self.selector_operation_is_current(generation, intent) {
+            return false;
+        }
+        let update = match self.rule_content_sync_target(config, generation) {
+            Ok(Some(update)) => update,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        #[cfg(test)]
+        {
+            let stub = self.rule_content_api_stub.lock().unwrap().clone();
+            if let Some(api) = stub {
+                return self
+                    .publish_rule_content(update, generation, intent, api.as_ref())
+                    .await;
             }
         }
-        true
+        let Some((port, secret)) = self.management_endpoint() else {
+            return false;
+        };
+        let api = Self::management_api_at(port, secret).await;
+        self.publish_rule_content(update, generation, intent, &api)
+            .await
+    }
+
+    // R is the committed projection. Overlay the outstanding side effect rather
+    // than assuming equality to R means equality to the running core.
+    fn rule_content_sync_target(
+        &self,
+        config: &UserConfig,
+        generation: u64,
+    ) -> Result<Option<(String, String)>, ()> {
+        let expected = build_custom_rule_files(config);
+        let mut actual = self
+            .current_config
+            .read()
+            .map_err(|_| ())?
+            .clone()
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v))
+            .ok_or(())?;
+        let publication = self
+            .rule_content_publication
+            .lock()
+            .map_err(|_| ())?
+            .clone()
+            .filter(|p| p.generation == generation);
+        if let Some(p) = &publication {
+            if !actual.contains_key(&p.name) || !expected.contains_key(&p.name) {
+                return Err(());
+            }
+            actual.insert(p.name.clone(), p.content.clone());
+        }
+        if actual == expected {
+            return Ok(publication.map(|p| (p.name.clone(), expected[&p.name].clone())));
+        }
+        single_rule_content_update(&actual, &expected)
+            .map(|(name, content)| Some((name.to_owned(), content.to_owned())))
+            .ok_or(())
+    }
+
+    pub(super) fn has_uncommitted_rule_content(&self) -> bool {
+        let generation = self.gate.generation();
+        let publication = match self.rule_content_publication.lock() {
+            Ok(state) => state.clone().filter(|p| p.generation == generation),
+            Err(_) => return true,
+        };
+        let Some(p) = publication else {
+            return false;
+        };
+        if p.acknowledged_instance.is_none() {
+            return true;
+        }
+        let applied = self
+            .current_config
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v));
+        applied
+            .and_then(|files| files.get(&p.name).cloned())
+            .as_ref()
+            != Some(&p.content)
+    }
+
+    async fn publish_rule_content(
+        self: &Arc<Self>,
+        update: (String, String),
+        generation: u64,
+        intent: u64,
+        api: &dyn RuleContentApi,
+    ) -> bool {
+        let (name, content) = update;
+        let Some(tag) = custom_rule_file_tag(&name) else {
+            return false;
+        };
+        let Ok(before) = api.status(vec![tag.clone()]).await else {
+            return false;
+        };
+        if !self.selector_operation_is_current(generation, intent)
+            || before.instance_started_at_unix_nano == 0
+            || !before
+                .rule_sets
+                .iter()
+                .any(|set| set.tag == tag && !set.closed && set.watcher_state == "watching")
+        {
+            return false;
+        }
+        let digest = polaris_updater::sha256_hex(content.as_bytes());
+        // Unknown BEFORE publication: cancellation/failure cannot erase evidence.
+        // Claim covers the synchronous write, never an await. Stale owners do not roll back.
+        let wrote = self.selector_reconcile.with_intent_claim(|current_intent| {
+            if current_intent != intent {
+                return false;
+            }
+            let _publication = self.gate.lock_generation_publication();
+            if !self.selector_operation_is_current(generation, intent) {
+                return false;
+            }
+            let Ok(mut state) = self.rule_content_publication.lock() else {
+                return false;
+            };
+            *state = Some(RuleContentPublication {
+                generation,
+                name: name.clone(),
+                content: content.clone(),
+                acknowledged_instance: None,
+            });
+            atomic_write_custom_rule(&self.custom_rules_dir().join(&name), &content).is_ok()
+        });
+        self.push_pending_changes();
+        if !wrote {
+            return false;
+        }
+        let wait = async {
+            loop {
+                if !self.selector_operation_is_current(generation, intent) {
+                    return false;
+                }
+                let Ok(status) = api.status(vec![tag.clone()]).await else {
+                    return false;
+                };
+                if !self.selector_operation_is_current(generation, intent)
+                    || status.instance_started_at_unix_nano != before.instance_started_at_unix_nano
+                {
+                    return false;
+                }
+                if rule_content_acknowledged(
+                    &status,
+                    &tag,
+                    &digest,
+                    before.instance_started_at_unix_nano,
+                ) {
+                    return self.selector_reconcile.with_intent_claim(|current_intent| {
+                        if current_intent != intent {
+                            return false;
+                        }
+                        let _publication = self.gate.lock_generation_publication();
+                        if !self.selector_operation_is_current(generation, intent) {
+                            return false;
+                        }
+                        let Ok(mut state) = self.rule_content_publication.lock() else {
+                            return false;
+                        };
+                        let Some(p) = state.as_mut() else {
+                            return false;
+                        };
+                        if p.generation != generation || p.name != name || p.content != content {
+                            return false;
+                        }
+                        p.acknowledged_instance = Some(status.instance_started_at_unix_nano);
+                        true
+                    });
+                }
+                if status
+                    .rule_sets
+                    .iter()
+                    .any(|set| set.closed || set.watcher_state != "watching")
+                {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let applied = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .unwrap_or(false);
+        self.push_pending_changes();
+        applied
     }
 
     /// Capture the ordinary startup value inputs once for an unpublished
@@ -3657,22 +3944,51 @@ impl ProxyRuntime {
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let cli_observation = match binary {
+            Some(path) => crate::runtime::tls_fingerprints::probe_cli_observation(path).await,
+            None => Err(Box::new(
+                crate::runtime::tls_fingerprints::Snapshot::unavailable("No selected core binary"),
+            )),
+        };
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let capabilities = match &cli_observation {
+            Ok(observation) => &observation.snapshot,
+            Err(snapshot) => snapshot.as_ref(),
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let capabilities = self.tls_fingerprint_capabilities_for(binary).await;
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
         loop {
             // 已剥的节点从 `servers` 摘掉后重新生成（空集合时等价于原配置）。
             let mut effective = user_config.clone();
             effective.servers.retain(|s| !peeled.contains_key(&s.id));
-            let gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
+            #[allow(unused_mut)]
+            let mut gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
                 &effective,
                 &BTreeMap::new(),
                 deps,
                 runtime_bind_interfaces,
             )
             .map_err(|e| format!("sing-box 配置生成失败: {e}"))?;
+            #[cfg(windows)]
+            crate::runtime::windows_directory::bind_configuration(
+                &mut gen_out.config,
+                self.config.dir(),
+            )?;
+            capabilities.validate_config(
+                &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
+            )?;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            validate_startup_cli_proof(binary, capabilities, cli_observation.as_ref().ok())?;
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
-            std::fs::write(config_path, &json)
+            // The iOS managed Start keeps logical bytes in memory until the
+            // fresh original provider proves its bundled source/owner capability.
+            // No runtime-config file is exposed to an older shared-profile reader.
+            #[cfg(not(target_os = "ios"))]
+            write_private_runtime_config(config_path, &json)
                 .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
@@ -3692,8 +4008,11 @@ impl ProxyRuntime {
             // 已接受身份缓存以「哪个核 + 哪份配置」为键。Android 上没有核文件可取身份（mtime/size）
             // ⇒ 不进缓存、每次真跑一次 check。这比伪造一个身份诚实：伪造出来的键会在换核（换 aar）
             // 之后仍然命中，等于把闸门静默关掉。
-            let cache_record =
-                binary.and_then(|bin| kernel_gate_cache_record(bin, &gen_out.config));
+            let cache_record = binary.and_then(|bin| {
+                capabilities.binary_sha256.as_deref().and_then(|digest| {
+                    kernel_gate_cache_record_with_digest(bin, &gen_out.config, digest)
+                })
+            });
             if cache_record
                 .as_ref()
                 .is_some_and(|record| self.kernel_gate_cache_hit(record))
@@ -3869,6 +4188,24 @@ impl ProxyRuntime {
     }
 }
 
+/// Validate this gate's retained query proof, including after a peel/check await.
+/// Shared lookup eviction is unrelated to whether these selected bytes changed.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(super) fn validate_startup_cli_proof(
+    binary: Option<&Path>,
+    capabilities: &crate::runtime::tls_fingerprints::Snapshot,
+    proof: Option<&crate::runtime::tls_fingerprints::CliObservation>,
+) -> Result<(), String> {
+    if let (Some(binary), Some(expected)) = (binary, capabilities.binary_sha256.as_deref()) {
+        if !proof.is_some_and(|proof| {
+            proof.matches(binary) && proof.snapshot.binary_sha256.as_deref() == Some(expected)
+        }) {
+            return Err("Core bytes changed after capability query; retry startup".into());
+        }
+    }
+    Ok(())
+}
+
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
 pub(super) struct GateOutcome {
     pub(super) config: SingBoxConfig,
@@ -3880,7 +4217,7 @@ pub(super) struct GateOutcome {
     /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
     ///
     /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
-    /// `std::fs::write(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
+    /// `write_private_runtime_config(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
     /// `runtime_config_path()` 与内核实际吃的那份不可能漂。
     ///
     /// **不可改成「从盘上读回来再交给 libbox」**：那样诊断与内核就有了两条路径，而这条链上唯一
@@ -4808,3 +5145,104 @@ pub(super) fn server_ids(config: &Value) -> std::collections::HashSet<String> {
     }
     set
 }
+
+#[derive(Clone)]
+pub(super) struct RuleContentPublication {
+    generation: u64,
+    name: String,
+    content: String,
+    acknowledged_instance: Option<i64>,
+}
+pub(super) trait RuleContentApi: Send + Sync {
+    fn status(
+        &self,
+        tags: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+                        polaris_switch_engine::ManagementError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >;
+}
+impl RuleContentApi for crate::runtime::management_api::GrpcManagementApi {
+    fn status(
+        &self,
+        tags: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+                        polaris_switch_engine::ManagementError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.rule_set_status(tags))
+    }
+}
+fn single_rule_content_update<'a>(
+    previous: &BTreeMap<String, String>,
+    expected: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    if previous.keys().ne(expected.keys()) {
+        return None;
+    }
+    let mut changed = expected
+        .iter()
+        .filter(|(name, content)| previous.get(*name) != Some(*content));
+    let (name, content) = changed.next()?;
+    if changed.next().is_some() {
+        return None;
+    }
+    Some((name.as_str(), content.as_str()))
+}
+fn custom_rule_file_tag(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".json")?;
+    if !stem.starts_with("custom-rule-") || stem.contains('/') || stem.contains('\\') {
+        return None;
+    }
+    Some(stem.replace(".dns", "-dns"))
+}
+fn rule_content_acknowledged(
+    status: &polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+    tag: &str,
+    digest: &str,
+    instance: i64,
+) -> bool {
+    instance != 0
+        && status.instance_started_at_unix_nano == instance
+        && status.rule_sets.iter().any(|s| {
+            s.tag == tag
+                && s.active_digest == digest
+                && s.revision > 0
+                && !s.closed
+                && s.watcher_state == "watching"
+        })
+}
+fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or("runtime config has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let metadata = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("runtime config parent must be a real directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    polaris_store::fs::durable_atomic_write(path, text, &polaris_store::fs::random_tmp_suffix())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests;

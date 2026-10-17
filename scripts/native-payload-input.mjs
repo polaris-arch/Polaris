@@ -6,8 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
 import { validationContext, VALIDATION_SCHEMA } from './desktop-core/validation-origin.mjs';
 import { buildInfoFingerprint, canonical, desktopSourceManifestPath, digest, requireGraph,
-  sourceOwnedReplacements, validateBuildInfo, validateSourcePins, verifyHash } from './desktop-core/source-graph.mjs';
+  releaseGoVersion, sourceOwnedReplacements, validateBuildInfo, validateSourcePins, verifyHash } from './desktop-core/source-graph.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
+import { isUpstreamRelease, isUpstreamRow } from './desktop-core/upstream-release.mjs';
 import { hasDesktopRelease, loadReleaseContract, verifyPackagedRelease } from './desktop-core/release-consumer.mjs';
 
 function regular(path) {
@@ -19,12 +20,22 @@ function regular(path) {
   }
 }
 
+export function nativeReleaseGoVersion(contract, row) {
+  const upstream = isUpstreamRelease(contract);
+  requireGraph(upstream ? isUpstreamRow(row) : row?.schema === 'polaris-production-native-receipt-v1',
+    'Native release receipt schema differs');
+  const version = upstream ? row.goVersion : row.sourceFingerprint?.goVersion;
+  requireGraph(version === releaseGoVersion(contract), 'Native release receipt Go version differs');
+  return version;
+}
+
 export function inspectNativePayload(root, key, core, library, run = execFileSync) {
   requireGraph(key === 'linux' || key === 'win', 'Dynamic payload requires Linux/Windows');
   core = resolve(core); library = resolve(library); regular(core); regular(library);
   requireGraph(basename(core) === (key === 'win' ? 'sing-box.exe' : 'sing-box')
     && basename(library) === (key === 'win' ? 'libcronet.dll' : 'libcronet.so')
     && dirname(core) === dirname(library), 'Canonical colocated payload required');
+  requireGraph(((lstatSync(core).mode | lstatSync(library).mode) & 0o7000) === 0, 'Special payload permissions forbidden');
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
   if (hasDesktopRelease(manifest)) {
     const contract = loadReleaseContract(root, manifest);
@@ -36,7 +47,7 @@ export function inspectNativePayload(root, key, core, library, run = execFileSyn
     requireGraph(acquisition.length === 1, 'Release core lacks exact platform Cronet acquisition module');
     return { schema: 'polaris-native-release-payload-input-v1', candidate: receipt.adapter.facts.candidate, platform: key,
       core: { path: core, sha256: row.core.sha256, mode: lstatSync(core).mode & 0o7777,
-        buildID: row.buildID, goVersion: row.sourceFingerprint.goVersion },
+        buildID: row.buildID, goVersion: nativeReleaseGoVersion(contract, row) },
       library: { path: library, ...cronet, module, moduleIdentity: acquisition[0] },
       producer: row, consumerReceiptFingerprint: receipt.fingerprint, adapter: receipt.adapter,
       origin: { kind: 'published-fork-release', contractSha256: receipt.contractSha256,

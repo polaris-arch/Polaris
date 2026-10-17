@@ -30,6 +30,7 @@ message ClashModeStatus {
 }
 
 service StartedService {
+  rpc GetRuleSetStatus(RuleSetStatusRequest) returns (RuleSetStatusResponse);
   // SetClashMode silently ignores unknown names; callers must strictly read back.
   rpc GetClashModeStatus(Empty) returns (ClashModeStatus);
   rpc SetClashMode(ClashMode) returns (Empty);
@@ -643,4 +644,20 @@ message Log {
     LogLevel level = 1;
     string message = 2;
   }
+}
+
+// Read-only acknowledgement of already loaded rule bytes. No content is accepted
+// by this RPC and no dynamic outbound/resource graph update is implied.
+message RuleSetStatusRequest { repeated string tags = 1; }
+message RuleSetLoadStatus {
+  string tag = 1;
+  string active_digest = 2;
+  uint64 revision = 3;
+  string watcher_state = 4;
+  string last_error = 5;
+  bool closed = 6;
+}
+message RuleSetStatusResponse {
+  int64 instance_started_at_unix_nano = 1;
+  repeated RuleSetLoadStatus rule_sets = 2;
 }

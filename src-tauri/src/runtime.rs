@@ -45,8 +45,11 @@ pub mod subscription_create;
 pub mod subscription_parse;
 pub mod subscription_scheduler;
 pub mod taildrop;
+#[cfg(any(unix, windows, test))]
+mod tailscale_directory;
 pub mod tailscale_login_core;
 pub mod tailscale_status;
+pub(crate) mod tls_fingerprints;
 pub mod uninstall;
 pub mod unlock;
 pub mod update_install;
@@ -249,3 +252,6 @@ impl AppRuntime {
         &self.subscription_parse
     }
 }
+
+#[cfg(windows)]
+pub(crate) mod windows_directory;

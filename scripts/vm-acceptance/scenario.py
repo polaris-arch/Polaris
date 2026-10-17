@@ -11,6 +11,10 @@
 
 import json
 import sys
+import os
+import stat
+import tempfile
+from pathlib import Path
 
 # 不可路由：TEST-NET-2（RFC 5737）。用它制造「出口必然不通」，全程不碰宿主网络。
 DEAD = "198.51.100.1"
@@ -139,7 +143,30 @@ SCENARIOS = {
 }
 
 
+def prepare_output(name, root=Path('/var/tmp/polaris-acceptance')):
+    if name not in SCENARIOS or Path(name).name != name:
+        raise ValueError('unknown scenario')
+    root = Path(root).absolute()
+    for parent in reversed([root, *root.parents]):
+        if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+            raise ValueError('redirected/non-directory evidence ancestor')
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError('evidence directory must be owned and not writable by others')
+    run = Path(tempfile.mkdtemp(prefix='run-', dir=root))
+    output = run / name  # assert.py dispatches by this exact scenario basename.
+    output.mkdir(mode=0o700)
+    return str(output)
+
+
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] in ('--validate', '--prepare-output'):
+        if sys.argv[2] not in SCENARIOS:
+            return 2
+        if sys.argv[1] == '--prepare-output':
+            print(prepare_output(sys.argv[2]))
+        return 0
     if len(sys.argv) != 2 or sys.argv[1] not in SCENARIOS:
         print("用法: scenario.py <场景名>  < config.json > new.json", file=sys.stderr)
         print("场景: " + " ".join(sorted(SCENARIOS)), file=sys.stderr)

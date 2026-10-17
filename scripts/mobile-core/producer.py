@@ -25,7 +25,7 @@ import sys
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-from fork_input import ROOT, canonical, load, require, sha, verify_source, tool_environment
+from fork_input import git_environment, require_git_root, ROOT, canonical, load, require, sha, verify_source, tool_environment
 from android_sdk import prepare_view
 from plan import plan
 from artifacts import receipt_digest, file_pin, inspect_aar, inspect_framework, module_stream, tree_inventory, read_receipt, failure_note
@@ -144,6 +144,10 @@ def _project_run_logs(sink, raw_sinks, starts, counts, encoding, errors):
 
 def run(args, *, cwd=None, env=None, log=None, capture='full', progress_fd=None,
         observation_fd=None, observation_phase=None, observation_slot=None):
+    if args and str(args[0]) == 'git':
+        env = git_environment(env)
+        if cwd is not None:
+            require_git_root(cwd)
     require(capture in ('full', 'none'), 'unknown tool capture mode')
     require(capture != 'none' or log is not None, 'capture none requires complete original logs')
     if observation_phase is None and BORROWED_PROGRESS_FD is not None:
@@ -419,17 +423,34 @@ def compiler_fact(path, env):
     return {**identity, 'version': version}
 
 
+def generator_buildinfo(raw, name, value):
+    """Validate the actual installed command, not a module-name substring."""
+    lines = raw.splitlines()
+    require(lines and re.fullmatch(r'.+: go' + re.escape(value['goVersion']), lines[0]),
+            'actual mobile tool Go version differs: ' + name)
+    rows = [line.split() for line in lines[1:] if line.strip()]
+    paths = [row[1:] for row in rows if row[0] == 'path']
+    modules = [row[1:] for row in rows if row[0] == 'mod']
+    require(paths == [['github.com/sagernet/gomobile/cmd/' + name]] and
+            len(modules) == 1 and len(modules[0]) == 3 and
+            modules[0][0] == 'github.com/sagernet/gomobile' and
+            modules[0][1] == value[name + 'Version'] and
+            re.fullmatch(r'h1:[A-Za-z0-9+/]{43}=', modules[0][2]) and
+            not any(row[0] == '=>' for row in rows),
+            'actual mobile tool module differs: ' + name)
+
+
 def tool_facts(args, value, env):
     paths = {name: str(Path(getattr(args, name)).resolve(strict=True)) for name in ('go', 'gomobile', 'gobind')}
+    original_tools = {name: file_pin(path) for name, path in paths.items()}
     require(run([paths['go'], 'version'], env=env).strip().startswith('go version go' + value['goVersion'] + ' '),
             'actual Go tool version differs')
     observed = {}
     for name in ('gomobile', 'gobind'):
         raw = run([paths['go'], 'version', '-m', paths[name]], env=env)
-        require(re.search(r'\bgithub.com/sagernet/gomobile\s+' + re.escape(value[name + 'Version']) + r'\b', raw),
-                'actual mobile tool module differs: ' + name)
+        generator_buildinfo(raw, name, value)
         observed[name] = raw
-    result = {'executables': {name: file_pin(path) for name, path in paths.items()}, 'mobileBuildInfo': observed}
+    result = {'executables': original_tools, 'mobileBuildInfo': observed}
     if args.platform == 'android':
         jdk, ndk = Path(args.jdk).resolve(strict=True), Path(args.ndk).resolve(strict=True)
         java = run([jdk / 'bin/java', '--version'], env=env)
@@ -466,15 +487,17 @@ def tool_facts(args, value, env):
                          'compiler': file_pin(Path(compiler).resolve(strict=True)),
                          'compilerVersion': run([compiler, '--version'], env=env)}
         result.update(xcode=xcode, sdk=sdk)
+    require({name: file_pin(paths[name]) for name in original_tools} == original_tools,
+            'mobile tool bytes changed during observation')
     return paths, result
 
 
-PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py',
+PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
              'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
-             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/ci_apple.py',
+             'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py', 'scripts/mobile-core/ci_apple.py',
              'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
              'scripts/mobile-core/apple-cache.py',
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
@@ -484,7 +507,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({
     'scripts/mobile-core/apple-cache.py',
-    'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py',
+    'scripts/apple-carrier.py', 'scripts/mobile-core/apple_rust.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/build_apple_app.py',
     'scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
 })
@@ -914,7 +937,7 @@ def execute(args):
             print(json.dumps({'phase': 'component-native-capacity', 'platform': args.platform,
                               'capacity': capacity, 'compilerCapacityApplied': True}), flush=True)
             recipe = plan(args.platform, value, gomobile=tools['gomobile'], output=staged, bootclasspath=jar)
-            from fork_input import bind_command
+            from fork_input import git_environment, require_git_root, bind_command
             command = bind_command(args.platform, value, tools['gomobile'], staged, fp, jar)
             # One direct bind; no helper API21/macOS/tvOS/git-describe side effects.
             log = work / 'stage-original-bind.log'

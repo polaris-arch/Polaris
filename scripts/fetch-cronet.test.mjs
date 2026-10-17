@@ -193,7 +193,7 @@ function cronetCliFixture() {
   };
   cpSync(join(ROOT, 'scripts'), join(root, 'scripts'), { recursive: true });
   const source = { schema: 'polaris-desktop-fork-source-v1', role: 'desktop',
-    sourceURL: 'https://github.com/polaris-arch/polaris-box', sourceCommit: 'a'.repeat(40), sourceTree: 'b'.repeat(40),
+    sourceURL: 'https://github.com/polaris-arch/sing-box-polaris', sourceCommit: 'a'.repeat(40), sourceTree: 'b'.repeat(40),
     sourceTag: 'polaris-v2.0.0-alpha.11-1', sourceTagObject: 'c'.repeat(40), upstreamTag: 'v2.0.0-alpha.11',
     upstreamCommit: 'd'.repeat(40), goVersion: '1.25.5', patches: [], dependencyPatches: [] };
   write('scripts/desktop-core/source-manifest.json', JSON.stringify(source));
@@ -215,7 +215,7 @@ function cronetCliFixture() {
   manifest.cronetLibrarySha256 = { linux: digest(library), win: 'f'.repeat(64) };
   write('bin/curl', `#!/usr/bin/env node\nconst fs=require('fs'),path=require('path'); const root=${JSON.stringify(root)};\n`
     + `const args=process.argv.slice(2); fs.appendFileSync(path.join(root,'curl-calls.jsonl'), JSON.stringify(args)+'\\n');\n`
-    + `const out=args.indexOf('-o'); if(out>=0) fs.copyFileSync(path.join(root,'fixture.zip'),args[out+1]); else process.stdout.write(fs.readFileSync(path.join(root,'fixture.go.mod')));\n`, { mode: 0o755 });
+    + `const out=args.findIndex((arg)=>arg==='--output'||arg==='-o'); if(out>=0) fs.copyFileSync(path.join(root,'fixture.zip'),args[out+1]); else process.stdout.write(fs.readFileSync(path.join(root,'fixture.go.mod')));\n`, { mode: 0o755 });
   const calls = () => existsSync(join(root, 'curl-calls.jsonl')) ? readFileSync(join(root, 'curl-calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
   const run = (...args) => {
     write('src-tauri/core-manifest.json', JSON.stringify(manifest));
@@ -237,7 +237,7 @@ test('actual Cronet CLI binds raw D go.mod before check-only and cache/stamp adm
     const valid = f.run('--check-only');
     assert.equal(valid.status, 0, valid.stderr);
     assert.match(valid.stdout, /v2.0.0-alpha.11/);
-    assert.deepEqual(f.calls().map((args) => args.at(-1)), [`https://raw.githubusercontent.com/polaris-arch/polaris-box/${f.source.sourceCommit}/go.mod`]);
+    assert.deepEqual(f.calls().map((args) => args.at(-1)), [`https://raw.githubusercontent.com/polaris-arch/sing-box-polaris/${f.source.sourceCommit}/go.mod`]);
     const stamp = JSON.stringify({ 'cronet:linux': `${VERSION}|${digest(f.library)}`, unrelated: 'retained' });
     f.write('resources/linux/libcronet.so', f.library);
     f.write('resources/.fetch-stamp.json', stamp);
@@ -271,12 +271,25 @@ test('actual Cronet CLI rejects D/M source swap, bad manifest bytes and invalid 
     f.write('scripts/desktop-core/source-manifest.json', JSON.stringify({ ...f.source, role: 'mobile' }));
     assert.match(f.run('--check-only').stderr, /SHA-256/);
     assert.deepEqual(f.calls(), []);
-    for (const source of [{ ...f.source, role: 'mobile' }, { ...f.source, sourceURL: 'https://github.com/SagerNet/sing-box' }]) {
+    // A known repository reaches the schema/role gate; an unregistered
+    // repository is rejected earlier by the shared hosting-identity allowlist.
+    for (const [source, reason] of [
+      [{ ...f.source, role: 'mobile' }, 'Desktop fork repository/schema/role differs'],
+      [{ ...f.source, schema: 'polaris-mobile-fork-source-v1' }, 'Desktop fork repository/schema/role differs'],
+      [{ ...f.source, sourceURL: 'https://github.com/SagerNet/sing-box' }, 'Unknown kernel repository'],
+    ]) {
       f.write('scripts/desktop-core/source-manifest.json', JSON.stringify(source));
       spec.sourceManifestSha256 = digest(JSON.stringify(source));
-      assert.match(f.run('--check-only').stderr, /repository\/schema\/role/);
-      assert.deepEqual(f.calls(), []);
+      const rejected = f.run('--check-only');
+      assert.equal(rejected.status, 1);
+      assert.equal(rejected.stderr, `FAILED: ${reason}\n`);
+      assert.deepEqual(f.calls(), [], 'invalid source identity must fail before transport');
     }
+    f.write('scripts/desktop-core/source-manifest.json', JSON.stringify(f.source));
+    spec.sourceManifestSha256 = digest(JSON.stringify(f.source));
+    const restored = f.run('--check-only');
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.equal(f.calls().length, 1, 'the unchanged valid identity still reaches go.mod verification');
   } finally { f.close(); }
 });
 
@@ -309,6 +322,8 @@ test('actual Cronet CLI verifies cached/extracted library bytes and stamps only 
     assert.equal(rejected.status, 1, rejected.stdout);
     assert.match(rejected.stderr, /sha256 不符/);
     assert.equal(f.calls().length, 2, 'tampered cache cannot reuse matching stamp');
+    assert.ok(f.calls()[1].includes('--output'), 'archive fixture must exercise boundedDownload output');
+    assert.equal(f.calls()[1].at(-1), `https://proxy.golang.org/${LINUX}/@v/${VERSION}.zip`);
     assert.deepEqual(readFileSync(join(f.root, 'resources/linux/libcronet.so')), old);
     assert.equal(readFileSync(join(f.root, 'resources/.fetch-stamp.json'), 'utf8'), stamp);
     assert.equal(existsSync(join(f.root, 'resources/linux/libcronet.so.tmp')), false);

@@ -24,9 +24,12 @@ import {
 } from '@/components/dialogs/dns-resource-logic';
 import {
   buildDnsActionGroups,
+  buildDnsRealQueryFallbackGroups,
   dnsActionFromChoice,
   dnsDefaultActionChoice,
   dnsDefaultFallbackChoice,
+  dnsRealQueryFallbackChoice,
+  dnsRealQueryFallbackFromChoice,
   dnsServerDescription,
   dnsServerDisplayName,
 } from '@/components/dialogs/dns-action-options';
@@ -143,6 +146,20 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
     responses: ['fakeIp', 'reject'],
   });
 
+  const realQueryFallbackValue = dnsRealQueryFallbackChoice(dnsDefaults);
+  const realQueryFallbackGroups = buildDnsRealQueryFallbackGroups({
+    servers: dnsServers,
+    nodes: config.servers ?? [],
+    t,
+    currentValue: realQueryFallbackValue,
+  });
+
+  function setRealQueryFallback(value: string) {
+    const realQueryFallbackAction = dnsRealQueryFallbackFromChoice(value);
+    if (!realQueryFallbackAction) return;
+    void update({ dnsDefaults: { ...dnsDefaults, realQueryFallbackAction } });
+  }
+
   function commitDefaultAction(unmatchedAction: DnsPolicyAction) {
     void update({
       dnsConfig: {
@@ -188,6 +205,21 @@ export function DnsPolicyWorkspace({ view }: { view: DnsWorkspaceView }) {
             className="policy-default-action"
           />
         </div>
+        {defaultActionValue === 'fakeIp' && (
+          <div className="policy-default-detail">
+            <div>
+              <div>{t('settings.dns.realQueryFallback')}</div>
+              <p>{t('settings.dns.realQueryFallbackHint')}</p>
+            </div>
+            <Csel
+              value={realQueryFallbackValue}
+              onChange={setRealQueryFallback}
+              options={realQueryFallbackGroups}
+              ariaLabel={t('settings.dns.realQueryFallback')}
+              className="policy-default-action"
+            />
+          </div>
+        )}
         {dnsDefaults.unmatchedAction?.type === 'hostsFirst' && (
           <div className="policy-default-detail">
             <span>{t('rules.dnsHostsFallback')}</span>

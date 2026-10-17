@@ -166,6 +166,15 @@ pub fn config_generation_norm(
         }
     }
 
+    proj.insert(
+        "utlsPolicy".into(),
+        serde_json::json!(config
+            .utls_policy
+            .as_deref()
+            .and_then(crate::user_config::normalize::normalize_token)
+            .unwrap_or_else(|| "follow".into())),
+    );
+
     // 一等流量规则投影（缺省兼容 policyRules/customRules）。targetServerId 由 selector 热切，不进 norm。
     let traffic_rules_proj = {
         let dns_rule_active = |rule: &crate::user_config::rule::Rule| match &rule.effects {
@@ -230,15 +239,24 @@ pub fn config_generation_norm(
                             })
                         })
                         .collect();
-                    serde_json::json!({
-                        "__ext": 1,
-                        "id": r.id,
-                        "action": r.route_action(),
-                        "targetServerId": null,
-                        "combineMode": r.combine_mode,
-                        "bypassFakeIP": r.bypass_fakeip.unwrap_or(false),
-                        "conds": conds,
-                    })
+                    // Watchers own matcher values only; all outer rule semantics invalidate the core.
+                    let mut value = serde_json::to_value(r).expect("serializable rule");
+                    if let Some(object) = value.as_object_mut() {
+                        for key in ["remarks", "targetServerId", "values", "conditions", "type"] {
+                            object.remove(key);
+                        }
+                        if let Some(route) = object
+                            .get_mut("effects")
+                            .and_then(serde_json::Value::as_object_mut)
+                            .and_then(|effects| effects.get_mut("route"))
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            route.remove("targetServerId");
+                        }
+                        object.insert("__ext".into(), serde_json::json!(1));
+                        object.insert("conds".into(), serde_json::json!(conds));
+                    }
+                    value
                 }
             })
             .collect();

@@ -1,3 +1,4 @@
+import { realityUtlsError } from '@/domain/utls';
 /**
  * NodeDialog —— 节点添加/编辑弹窗（8 协议动态表单，原型 #node-dialog :2513-2547）。
  *
@@ -319,6 +320,13 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       const codecBase =
         base && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
+      const utlsError = realityUtlsError(full);
+      if (utlsError) {
+        setFormTab('connection');
+        toast.error(t('common.saveFailed'), t(utlsError));
+        return;
+      }
+
       if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId || !bindInterface) delete full.bindInterface;
       else full.bindInterface = bindInterface;

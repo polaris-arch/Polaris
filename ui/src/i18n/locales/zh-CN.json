@@ -496,6 +496,11 @@
     "switchRequiresApply": "{{node}} · 已保存，请应用待处理更改后使用"
   },
   "settings": {
+    "utls": {
+      "label": "全局 uTLS 指纹",
+      "description": "跟随节点保留原设置；其他选项仅覆盖生成配置，不修改节点。Random 在核心进程启动时选定模板，Randomized 为随机化模板。",
+      "follow": "跟随节点"
+    },
     "coex": {
       "windowsHint": "各原生来源独立展示，完整性和 compartment 可能仍为未知。不推断接口关联、路由选择或安全结论。",
       "adaptersSource": "适配器",
@@ -750,7 +755,7 @@
       "fakeIpTunOffConfirmDesc": "TUN 模式下关闭后，代理节点将收到真实 IP 而非域名。部分防滥用严格的机场可能因此拒绝连接（抛出无效证书或拦截页面），此风险无法由客户端缓解。海外域名首次连接延迟也会增加。确认关闭？",
       "fakeIpTunOffConfirmOk": "仍然关闭",
       "fakeIpFilter": "FakeIP 例外域名",
-      "fakeIpFilterDesc": "这些域名走真实 DNS、不用假 IP。建议开启。",
+      "fakeIpFilterDesc": "命中域名会在用户 DNS 规则之前交给真实解析器。建议开启。",
       "nodeResolverDnspod": "DNSPod (DoH)",
       "nodeResolverSystem": "系统 DNS",
       "takeoverSystemDns": "接管系统 DNS",
@@ -1185,6 +1190,8 @@
       "defaultDirect": "默认直连 DNS",
       "defaultProxy": "默认代理 DNS",
       "defaultUnmatched": "默认规则",
+      "realQueryFallback": "真实查询兜底",
+      "realQueryFallbackHint": "默认规则为 FakeIP 时，A/AAAA 仍返回合成地址；其他查询（HTTPS、SVCB、TXT 等）使用此服务器或拒绝动作。内部解析保持原有分流；“默认代理 DNS”不是所有查询类型的统一兜底。",
       "defaultAdvanced": "保留高级动作 · {{type}}",
       "resourceInUse": "无法删除：资源仍在使用",
       "resourceInUseDesc": "请先移除以下引用：{{refs}}",
@@ -1192,7 +1199,7 @@
       "resourceRefGroup": "服务器组“{{name}}”",
       "resourceRefServer": "DNS 服务器“{{name}}”",
       "resourceRefDefault": "默认项“{{name}}”",
-      "fakeIpDesc": "回复假 IP 规避 DNS 污染",
+      "fakeIpDesc": "对 A/AAAA 查询返回合成地址，避免 DNS 污染",
       "remoteDns": "远程 DNS",
       "remoteDnsDesc": "解析海外域名的上游",
       "domesticDns": "国内 DNS",
@@ -1219,7 +1226,7 @@
       "customDohIpOnly": "需为纯 IP 形式（如 223.5.5.5 / tls://223.5.5.5:853），域名会被拒绝",
       "raceEmptyFallback": "全部关闭时回退默认竞速 ali/dnspod",
       "fakeIpFilterFold": "不使用 FakeIP 的域名",
-      "fakeIpFilterHint": "这些域名解析真实 IP（如 NTP 授时、STUN、门户网络检测）",
+      "fakeIpFilterHint": "普通例外在用户 DNS 规则之前使用国内 DNS；门户网络检测例外仍使用内部解析器。这会指定真实解析器，并非仅跳过 FakeIP。",
       "addDomain": "添加域名",
       "browserDohTitle": "拦截浏览器内置 DoH",
       "browserDohDesc": "浏览器自带的「安全 DNS」会绕开本应用的 DNS 接管，域名分流与 FakeIP 对它不生效。开启后对清单内端点的 443/853 与 QUIC 发 reject，逼浏览器回退到系统 DNS。默认关。",
@@ -1230,7 +1237,7 @@
       "upstreamPreset": "上游预设",
       "raceCustomHint": "自定义上游必须是纯 IP 地址（它自己不能再要解析），并且占用竞速额度。",
       "raceCustomEmpty": "没有自定义上游",
-      "fakeIpFilterEmpty": "没有例外域名，所有域名都走 FakeIP",
+      "fakeIpFilterEmpty": "无自定义例外；A/AAAA 查询可使用 FakeIP",
       "browserDohEmpty": "清单为空，不会拦截任何端点"
     }
   },
@@ -1428,7 +1435,7 @@
     "dnsActionServerHeading": "DNS 服务器",
     "dnsActionHostsHeading": "Hosts",
     "dnsActionResponseHeading": "响应动作",
-    "dnsActionDescription_fakeIp": "返回合成地址；不查询上游 DNS",
+    "dnsActionDescription_fakeIp": "仅对 A/AAAA 查询返回合成地址；不查询上游 DNS",
     "dnsActionDescription_reject": "终止查询并返回拒绝响应",
     "dnsActionDescription_predefined": "返回手动配置的 RCODE 与资源记录",
     "dnsActionUnavailable": "当前不可用",
@@ -1888,6 +1895,14 @@
     "masque": "自建 IP 隧道"
   },
   "node": {
+    "utls": {
+      "legacy": "未设置（兼容原默认）",
+      "default": "核心默认指纹",
+      "disabled": "关闭 uTLS（保留 TLS）",
+      "loading": "正在读取内核指纹能力…",
+      "unavailable": "无法读取指纹能力：{{reason}}。保留现有设置，由实际内核检查。",
+      "realityRequired": "REALITY 需要 uTLS，请选择内核默认或受支持的指纹。"
+    },
     "add": "添加",
     "addTitle": "添加节点",
     "chainHint": "先经另一节点再出站（链式代理）",

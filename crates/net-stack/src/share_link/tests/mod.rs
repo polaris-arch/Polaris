@@ -1672,3 +1672,22 @@ fn unsupported_or_invalid_pin_shapes_refuse_export_instead_of_dropping_security(
     tls.certificate_sha256 = Some(format!("{},bad-pin", "ab".repeat(32)));
     assert!(encode_share_url(&source).is_err());
 }
+
+#[test]
+fn shadow_link_disabled_preserves_standard_tls_fallback_intent() {
+    let c = parse_ok(&format!(
+        "ss://{}@e.com:8388?shadow-tls-password=pw&shadow-tls-sni=st.example&shadow-tls-fp=none",
+        b64("aes-256-gcm:pw")
+    ));
+    let st = c.shadow_tls_settings.unwrap();
+    assert_eq!(st.fingerprint.as_deref(), Some("none"));
+    assert!(st.utls_mode.is_none());
+    assert!(polaris_config_engine::user_config::utls::node_utls(
+        st.utls_mode,
+        st.fingerprint.as_deref(),
+        "chrome"
+    )
+    .is_none());
+}
+
+mod audit_regressions;

@@ -66,7 +66,7 @@ export function useSubscriptionCreateDialogOperation({
   const [completionFailed, setCompletionFailed] = useState(false);
   const startInFlight = useRef(false);
   const cancelInFlight = useRef(false);
-  const handledTerminalRevision = useRef(-1);
+  const handledTerminal = useRef<{ operationId: string; revision: number } | null>(null);
   const activeOperation = useSubscriptionCreateOperationStore((s) =>
     operationId ? s.snapshots[operationId] ?? null : null,
   );
@@ -80,8 +80,10 @@ export function useSubscriptionCreateDialogOperation({
   });
 
   useEffect(() => {
-    if (!activeOperation?.terminal || handledTerminalRevision.current === activeOperation.revision) return;
-    handledTerminalRevision.current = activeOperation.revision;
+    if (!activeOperation?.terminal) return;
+    if (handledTerminal.current?.operationId === activeOperation.operationId
+        && handledTerminal.current.revision === activeOperation.revision) return;
+    handledTerminal.current = { operationId: activeOperation.operationId, revision: activeOperation.revision };
     if (activeOperation.phase === 'cancelled') {
       clearTerminal(activeOperation.operationId);
       if (clearSubscriptionCreateOperationIdAfterTerminal(activeOperation.phase)) setOperationId(null);

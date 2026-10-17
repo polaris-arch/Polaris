@@ -845,7 +845,10 @@ pub async fn rule_resources_download(
     let refreshed_catalog = read_catalog_cache(&res_dir).map_or_else(Vec::new, |(items, _)| items);
 
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
-    let mut stored: Vec<RuleResource> = Vec::new();
+    let initial = match state.config().current() {
+        Ok(config) => config,
+        Err(error) => return Ok(ApiResponse::err(format!("读取资源初始状态失败: {error}"))),
+    };
     for item in &items {
         let plan = match plan_from_item(item, &refreshed_catalog) {
             Ok(p) => p.with_gh_proxy(&gh_prefix),
@@ -863,31 +866,37 @@ pub async fn rule_resources_download(
             app: &app,
             mode: ProgressMode::Live,
         };
+        let expected = resource_record(&initial, &plan.id).cloned();
         let outcome =
-            download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir).await;
-        if let DownloadOutcome::Stored { ref resource, .. } = outcome {
-            stored.push(resource.clone());
-        }
+            download_registered_resource(
+                &sink,
+                http.as_ref(),
+                &SystemDnsLookup,
+                &plan,
+                &res_dir,
+                |resource, staged| match state.config().update(|config| {
+                    match commit_download_resource(
+                        config,
+                        expected.as_ref(),
+                        resource,
+                        staged,
+                        &res_dir,
+                    ) {
+                        Ok(()) => Decision::Write(Ok(())),
+                        Err(error) => Decision::Skip(Err(error)),
+                    }
+                }) {
+                    Ok((Ok(()), Some(config))) => {
+                        broadcast_config_changed(&app, &config);
+                        Ok(())
+                    }
+                    Ok((Err(error), _)) => Err(error),
+                    Ok(_) => Err("资源提交未写入".into()),
+                    Err(error) => Err(format!("保存资源配置失败: {error}")),
+                },
+            )
+            .await;
         results.push(outcome.into_value(&plan));
-    }
-    if !stored.is_empty() {
-        if let Err(e) = persist_resources(&app, &state, &stored, BroadcastMode::Immediate) {
-            for result in &mut results {
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    let id = result.get("id").and_then(Value::as_str).map(str::to_string);
-                    let name = result
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    *result = err_result(
-                        id.as_deref(),
-                        name.as_deref(),
-                        &e,
-                        ERR_RESOURCE_WRITE_FAILED,
-                    );
-                }
-            }
-        }
     }
     Ok(ApiResponse::ok(results))
 }
@@ -1273,6 +1282,40 @@ async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
             }
         }
     }
+}
+
+fn resource_record<'a>(config: &'a Value, id: &str) -> Option<&'a Value> {
+    config
+        .get("ruleResources")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// Existing and initially absent identities are checked before publishing staged bytes.
+/// Caller holds ConfigRuntime's writer throughout this check and publication.
+fn commit_download_resource(
+    config: &mut Value,
+    expected: Option<&Value>,
+    downloaded: &RuleResource,
+    staged: &Path,
+    res_dir: &Path,
+) -> Result<(), String> {
+    if resource_record(config, &downloaded.id) != expected {
+        return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
+    }
+    let object = config.as_object_mut().ok_or("配置不是对象")?;
+    if !object
+        .entry("ruleResources")
+        .or_insert_with(|| json!([]))
+        .is_array()
+    {
+        return Err("规则资源列表无效".into());
+    }
+    std::fs::rename(staged, res_dir.join(&downloaded.file_name))
+        .map_err(|error| format!("替换资源文件失败: {error}"))?;
+    upsert_rule_resources(config, std::slice::from_ref(downloaded));
+    Ok(())
 }
 
 /// Called only inside ConfigManager::update. An absent or changed record is never upserted,
@@ -1944,7 +1987,7 @@ async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
     Ok(resp.body)
 }
 
-/// 下载 + 落盘（不写 config；config upsert 由 [`persist_resources`] 批量做）。
+/// 下载到调用方提供的暂存目录；不写 config，文件发布与配置更新由调用方事务提交。
 /// # gh 加速的回退腿
 ///
 /// 设置页对「GitHub 加速」的承诺是「留空回退直连；**下载失败自动回退直连兜底**」
@@ -2240,34 +2283,6 @@ fn cancel_inflight(id: &str) -> usize {
 pub fn rule_resources_cancel(id: String) -> ApiResponse<Value> {
     let n = cancel_inflight(&id);
     ApiResponse::ok(json!({ "cancelled": n }))
-}
-
-/// 把成功下载的资源 upsert 进 `config.ruleResources`（按 id 覆盖/追加），保存 + 广播 `config:changed`。
-///
-/// 文件已在盘上；若 config 保存失败，如实 log（资源暂成孤儿，下次 list 不显示）——不静默吞。
-fn persist_resources(
-    app: &AppHandle,
-    state: &AppRuntime,
-    downloaded: &[RuleResource],
-    broadcast: BroadcastMode,
-) -> Result<(), String> {
-    if downloaded.is_empty() {
-        return Ok(());
-    }
-    match state.config().update(|cfg| {
-        upsert_rule_resources(cfg, downloaded);
-        Decision::Write(())
-    }) {
-        // Deferred：批次拥有者收尾统一广播（见 [`BroadcastMode`]）。落盘已完成，跳过的只是通知。
-        Ok(((), Some(cfg))) => {
-            if broadcast == BroadcastMode::Immediate {
-                broadcast_config_changed(app, &cfg);
-            }
-            Ok(())
-        }
-        Ok(_) => Err("规则资源登记事务返回非法状态".to_string()),
-        Err(e) => Err(format!("规则资源已下载但保存 config 失败（未登记）: {e}")),
-    }
 }
 
 /// upsert：按 id 覆盖既有项，否则追加。

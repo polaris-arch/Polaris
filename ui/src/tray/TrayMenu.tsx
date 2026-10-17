@@ -68,7 +68,6 @@ import { flagCodeForName } from '@/components/screens/nodes/NdFlag';
 import { FlagImg } from '@/components/FlagImg';
 // FakeIP-TUN 待纠正快照消费（纯函数）：与 HomeScreen.applyIntercept 同源，切到 TUN 时把迁移冻结的
 // enableFakeIp:false 一次性回 true（见 fakeip-tun-entry.ts 头注）。跨目录只读引用，同 shared/format 先例。
-import { applyFakeIpTunEntry } from '@/components/screens/home/fakeip-tun-entry';
 // 降级态（核在跑但流量没经核）与主窗**同一个判定**：跨窗各写一套必然分叉，而分叉的形态就是
 // 「主窗琥珀说未生效、托盘绿点说已连接」。取数走 store 的一次性取数出口（浮层不常驻轮询）。
 import {
@@ -554,14 +553,13 @@ export default function TrayMenu() {
     }
   };
 
-  // 切接管方式（systemProxy/TUN/manual）：与 HomeScreen.applyIntercept 同源——先过 applyFakeIpTunEntry
-  // 消费「FakeIP-TUN 待纠正」快照，再把本动作涉及的字段作为一个原子 patch 落盘。
+  // 与首页复用后端最新配置事务；只发送用户选择的mode，不发送托盘旧DNS快照。
   // 直接落盘不弹「已连接会重启」确认（浮层无 dialog 层，对齐 上游 托盘 onChangeProxyModeType 的直切语义；
   // 已连接切换会瞬断当前连接，属托盘直切既定取舍）。
   const setTakeover = async (modeType: ProxyModeType) => {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
-    if (!config || modeType === config.proxyModeType) {
+    if (!config) {
       hide();
       return;
     }
@@ -571,13 +569,7 @@ export default function TrayMenu() {
       // 与主窗 `HomeScreen.applyIntercept` 的 notifyDesktop 那条腿）+ 浮层内 notice 行双管——
       // 托盘切换常在主窗关闭时发生，主窗那条 toast 此刻看不到；而浮层这行只在浮层还开着时有用。
       // 开关门控由 hydrate 里的 `setDesktopNotificationsEnabled` 负责（用户关了就静默不发）。
-      const { config: next, corrected } = applyFakeIpTunEntry({ ...config, proxyModeType: modeType });
-      const patch: Partial<UserConfig> = {
-        proxyModeType: next.proxyModeType,
-        dnsConfig: next.dnsConfig,
-      };
-      if (next.dnsDefaults !== undefined) patch.dnsDefaults = next.dnsDefaults;
-      await useAppStore.getState().saveConfig(patch);
+      const { corrected } = await api.config.setTakeover(modeType);
       if (!current()) return;
       if (corrected) {
         const title = t('tray.takeoverTun');
@@ -980,7 +972,7 @@ export default function TrayMenu() {
             ))}
 
             {/* 接管方式（systemProxy/TUN/manual）——托盘内直切（审查 HIGH，对齐 上游 proxyModeTypeSubmenu）。
-                切换走 setTakeover（applyFakeIpTunEntry + config.save，与 HomeScreen.applyIntercept 同源）。 */}
+                切换走 setTakeover（后端最新配置事务，与 HomeScreen.applyIntercept 同源）。 */}
             <div className="tray-sep" />
             <div className="tray-group-h">{t('tray.groupTakeover')}</div>
             {TAKEOVERS.map((tk) => (

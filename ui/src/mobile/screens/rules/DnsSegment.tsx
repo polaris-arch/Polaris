@@ -70,6 +70,8 @@ export interface DnsSegmentProps {
   defaultActionText: string;
   /** `hostsFirst` 时的「未命中后的服务器」；其余动作为 undefined。 */
   defaultFallbackText?: string;
+  /** Effective non-address fallback while the default action is FakeIP. */
+  realQueryFallbackText?: string;
   errorOf: (key: string) => string | undefined;
   /** 桌面在这里内嵌设置面板，移动端不嵌 —— 这句是可见的缺席理由。 */
   systemPaneAbsentReason: string;
@@ -80,6 +82,7 @@ export function DnsSegment({
   rows,
   defaultActionText,
   defaultFallbackText,
+  realQueryFallbackText,
   systemPaneAbsentReason,
   errorOf,
 }: DnsSegmentProps): ReactElement {
@@ -158,6 +161,11 @@ export function DnsSegment({
         <div className="mr-row-title" style={{ marginTop: 8 }}>
           {defaultActionText}
         </div>
+        {realQueryFallbackText != null && (
+          <div className="mr-note">
+            {t('settings.dns.realQueryFallback')} · {realQueryFallbackText}
+          </div>
+        )}
         {defaultFallbackText != null && (
           <div className="mr-note">
             {t('rules.dnsHostsFallback')} · {defaultFallbackText}

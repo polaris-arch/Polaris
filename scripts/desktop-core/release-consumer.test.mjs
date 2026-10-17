@@ -13,7 +13,7 @@ import test from 'node:test';
 import { digest } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, hasDesktopRelease, loadReleaseContract, portableCanonical,
   RELEASE_TARGETS, publicBytes, releasePublicReader, recoverRelease, releasePlatforms, validateReleaseContract, validateReleaseNotice, verifyPackagedRelease,
-  verifyReleaseProvenance, verifyMacPackagedCore } from './release-consumer.mjs';
+  verifyReleaseProvenance, verifyReleaseCore, verifyMacPackagedCore } from './release-consumer.mjs';
 import { verifyManagedMeshCore } from './managed-mesh-core.mjs';
 import { inspectNativePayload } from '../native-payload-input.mjs';
 import { releaseGateContext, verifyNativeReleaseGate } from './release-native-gates.mjs';
@@ -108,6 +108,7 @@ function fixture(options = {}) {
       localReplacement: { module: 'github.com/sagernet/sing-tun', version: 'v0.9.7', h1: '' } },
       consumerAcceptance: 'pending', actualVersionOutput: `sing-box version ${version}\nRevision: ${commit}\n`, fixtureOnly: true };
     const coreBytes = coreFixture(key), sidecarBytes = t.sidecar ? cronetFixture(key) : null;
+    if (options.coreMarker !== undefined) coreBytes[255] = options.coreMarker;
     const originalArchive = { name: rootName + t.suffix, bytes: 1, sha256: 'e'.repeat(64), members: {
       [`${rootName}/${t.core}`]: digest(coreBytes), ...(t.sidecar ? { [`${rootName}/${t.sidecar}`]: digest(sidecarBytes) } : {}) } };
     const finalPackageCronetSmoke = { os: t.os, arch: t.arch, go: raw.goVersion, gvisorCompiled: true,
@@ -467,7 +468,7 @@ test('actual fetch CLIs reject malformed release mode and check-only Cronet has 
 test('release notice identities are section-local and independent from mobile; old formal approval is not transferable', async () => withFixture(async (f) => {
   const mobile = { android: { sourceCommit: 'a'.repeat(40), manifestSha256: 'b'.repeat(64) },
     apple: { sourceCommit: 'd'.repeat(40), manifestSha256: 'e'.repeat(64) } };
-  const desktop = [`  - 桌面 sing-box v1.15.0-alpha.12 (GPLv3) — https://github.com/polaris-arch/polaris-box`,
+  const desktop = [`  - 桌面 sing-box v${version} (GPLv3) — https://github.com/polaris-arch/polaris-box`,
     '上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12', `桌面发布构建：${version}`,
     `固定源码：https://github.com/polaris-arch/polaris-box/tree/${commit}`, `源码 tree：${tree}`,
     `固定消费标签：https://github.com/polaris-arch/polaris-box/tree/${tag}`, `消费标签对象：${tagObject}`,
@@ -487,6 +488,10 @@ test('release notice identities are section-local and independent from mobile; o
     'Desktop selection uses src-tauri/core-manifest.json desktopRelease.',
     'asset index sourceDelivery identifies the automatic product source archive,'];
   const notice = [...desktop, ...blocks, ...guidance].join('\n'); validateReleaseNotice(notice, f.manifest, f.contract, mobile);
+  // The desktop label names the exact release; the upstream baseline remains
+  // a separate identity and must not substitute for the .polaris release.
+  assert.throws(() => validateReleaseNotice(notice.replace(desktop[0], desktop[0].replace(version, '1.15.0-alpha.12')),
+    f.manifest, f.contract, mobile), /release baseline differs/);
   for (const line of guidance) assert.throws(() => validateReleaseNotice(notice.replace(line, ''), f.manifest, f.contract, mobile));
   for (const stale of ['desktopSourceBuild', 'scripts/desktop-core/source-manifest.json', 'Desktop v1.15.0-alpha.11',
     'Final native kernels, signatures, source archives remain pending']) {
@@ -1108,7 +1113,23 @@ test('DMG trusted temporary roots use physical paths while final Mac payload lin
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, join(linkedDirectory, 'sing-box'), f.run), /Linked release ancestor/);
         const linkedCore = join(mount, `${key}-linked-core`, 'sing-box');
         mkdirSync(dirname(linkedCore)); symlinkSync(binary, linkedCore);
-        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, f.run), /Non-regular release path/);
+        assert(fs.lstatSync(linkedCore).isSymbolicLink(), 'the adversary must remain a real filesystem link');
+        // The final-carrier gate checks lstat permissions before its core
+        // verifier, so POSIX link permissions can reject this path first.
+        // Independently exercise that verifier to retain the no-follow proof.
+        const row = f.contract.platforms[key];
+        const noInspection = () => assert.fail('A linked core must fail before Go or signature inspection');
+        verifyReleaseCore(binary, row, key, f.run, 'darwin', f.run, f.contract);
+        assert.throws(() => verifyReleaseCore(linkedCore, row, key, noInspection, 'darwin', noInspection, f.contract),
+          /Non-regular release path/);
+        const linkMode = fs.lstatSync(linkedCore).mode, sourceMode = fs.lstatSync(binary).mode;
+        const modeDiffers = ((linkMode | sourceMode) & 0o7000) !== 0 || (linkMode & 0o7777) !== (sourceMode & 0o7777);
+        const noCoreInspection = (command, args, options) => {
+          assert.equal(command, 'git', 'Final-carrier rejection must precede core inspection');
+          return f.run(command, args, options);
+        };
+        assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, linkedCore, noCoreInspection),
+          { message: modeDiffers ? 'Final release core permissions differ' : `Non-regular release path: ${linkedCore}` });
         const aliasBinary = join(alias, mount.slice(physical.length + 1), `${key}.app/Contents/Resources`, key, 'sing-box');
         assert.throws(() => verifyMacPackagedCore(f.root, f.manifest, key, aliasBinary, f.run), /Linked release ancestor/);
         assert.deepEqual(readFileSync(binary), original);
@@ -1351,3 +1372,64 @@ test('default native consumer captures codesign stderr/status without exposing t
     else process.env.POLARIS_RELEASE_API_TOKEN = previous;
   }
 }));
+
+
+test('historical producer Go remains closed and cannot be relabeled as final-source policy', () => {
+  const { root, contract } = fixture();
+  try {
+    assert.equal(validateReleaseContract(contract), contract);
+    const wrongGo = structuredClone(contract);
+    wrongGo.platforms.linux.sourceFingerprint.goVersion = 'go1.27.2';
+    assert.throws(() => validateReleaseContract(wrongGo), /source facts|toolchain/);
+    const relabeled = structuredClone(contract);
+    relabeled.sourcePolicy = { sourceCommit: contract.sourceCommit, sourceTree: contract.sourceTree };
+    assert.throws(() => validateReleaseContract(relabeled), /Historical release/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Same tag/version is intentionally insufficient: actual contract, archived
+// bytes and acquisition receipts must change together. Native payloads are inert.
+test('same-version repack rejects old receipts and stamps before admitting new core bytes', async () => withFixture(async old => {
+  const next = fixture({ coreMarker: 7 });
+  try {
+    await consumeRelease(old.root, old.manifest, ['linux'], old);
+    const core = join(old.root, 'resources/linux/sing-box');
+    const previousBytes = readFileSync(core);
+    const stamp = JSON.stringify({ 'core:linux': old.contract.version, 'cronet:linux': old.contract.version });
+    write(join(old.root, 'resources/.fetch-stamp.json'), stamp);
+    assert.equal(next.contract.version, old.contract.version);
+    assert.equal(next.contract.tag, old.contract.tag);
+    assert.notEqual(next.contract.platforms.linux.core.sha256, old.contract.platforms.linux.core.sha256);
+    const contractBytes = readFileSync(join(next.root, next.manifest.desktopRelease.contractPath));
+    write(join(old.root, old.manifest.desktopRelease.contractPath), contractBytes);
+    assert.throws(() => verifyPackagedRelease(old.root, old.manifest, 'linux', core, old.run), /contract SHA/);
+    assert.throws(() => verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run), /consumption receipt/);
+    const before = resources(old);
+    const staleArchive = async (...args) => args[0] === next.contract.platforms.linux.releaseAsset.url
+      ? old.read(...args) : next.read(...args);
+    await assert.rejects(consumeRelease(old.root, next.manifest, ['linux'], { ...next, read: staleArchive }), /archive SHA/);
+    assert.deepEqual(resources(old), before, 'failed repack preserves all previous resources');
+    const receipts = await consumeRelease(old.root, next.manifest, ['linux'], next);
+    assert.equal(receipts.linux.contractSha256, next.manifest.desktopRelease.contractSha256);
+    assert.notDeepEqual(readFileSync(core), previousBytes);
+    assert.equal(digest(readFileSync(core)), next.contract.platforms.linux.core.sha256);
+    assert.equal(readFileSync(join(old.root, 'resources/.fetch-stamp.json'), 'utf8'), stamp,
+      'legacy version stamps are neither authority nor silently rewritten');
+    verifyPackagedRelease(old.root, next.manifest, 'linux', core, next.run);
+  } finally { rmSync(next.root, { recursive: true, force: true }); }
+}));
+
+test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar and notice', async () => {
+  if (process.platform === 'win32') return;
+  for (const member of ['sing-box', 'libcronet.so', 'core-release/LICENSE']) {
+    for (const bit of [0o4000, 0o2000, 0o1000]) await withFixture(async (f) => {
+      await consumeRelease(f.root, f.manifest, ['linux'], f);
+      const carrier = join(f.root, 'mode-carrier');
+      cpSync(join(f.root, 'resources/linux'), carrier, { recursive: true });
+      const path = join(carrier, member), before = readFileSync(path);
+      fs.chmodSync(path, (fs.statSync(path).mode & 0o777) | bit);
+      assert.deepEqual(readFileSync(path), before);
+      assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /permissions/);
+    });
+  }
+});

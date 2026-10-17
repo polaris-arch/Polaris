@@ -373,7 +373,7 @@ export const APK_PERMISSION_REGISTRY = Object.freeze([
  * 而「今天只有一条」这件事本身要有人守，否则下一条进来时没有任何东西会说话。
  */
 export const APK_DECLARED_PERMISSIONS = Object.freeze([
-  { name: 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION', from: 'androidx.core:core:1.13.1', why: 'androidx.core 的动态广播接收器保护，protectionLevel=signature。' },
+  { name: 'com.polaris2.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION', protectionLevel: 2, from: 'androidx.core:core:1.13.1', why: 'androidx.core 的动态广播接收器保护，protectionLevel=signature。' },
 ]);
 
 /**
@@ -410,6 +410,50 @@ export function parseAapt2Permissions(text) {
     }
   }
   return { packageName, uses, declared };
+}
+
+/** AAPT2 XmlPrinter emits namespace URI and BinaryPrimitive::PrettyPrint emits
+ * decimal or 0x-prefixed numbers, optionally followed by Raw. The compiled
+ * value is authoritative. AOSP frameworks/base 4466434976a21434bc44e4d97c7168b464ac1e01.
+ */
+export function parseDeclaredPermissionLevels(text) {
+  const result = Object.create(null);
+  let entry = null, sawManifest = false;
+  const finish = () => {
+    if (!entry) return true;
+    if (typeof entry.name !== 'string' || !Number.isInteger(entry.level)
+        || Object.hasOwn(result, entry.name)) return false;
+    result[entry.name] = entry.level; entry = null; return true;
+  };
+  for (const line of String(text).split('\n')) {
+    const element = /^(\s*)E:\s+([^\s(]+)/.exec(line);
+    if (element) {
+      if (entry && element[1].length > entry.depth) return null;
+      if (entry && !finish()) return null;
+      if (element[2] === 'manifest') sawManifest = true;
+      if (element[2] === 'permission') {
+        if (!sawManifest) return null;
+        entry = { depth: element[1].length };
+      }
+      continue;
+    }
+    if (!entry) continue;
+    const attribute = /^(\s*)A:\s+http:\/\/schemas\.android\.com\/apk\/res\/android:(name|protectionLevel)(?:\((0x[0-9a-f]+)\))?=(.*)$/i.exec(line);
+    if (!attribute || attribute[1].length <= entry.depth) continue;
+    if (attribute[3] !== undefined && Number(attribute[3]) !==
+        (attribute[2] === 'name' ? 0x01010003 : 0x01010009)) return null;
+    if (attribute[2] === 'name') {
+      const name = /^"([^"\r\n]+)"(?:\s+\(Raw: "[^"\r\n]*"\))?\s*$/.exec(attribute[4]);
+      if (entry.name !== undefined || !name) return null;
+      entry.name = name[1];
+    } else {
+      const value = /^(0x[0-9a-f]{1,8}|0|[1-9][0-9]*)(?:\s+\(Raw: "[^"\r\n]*"\))?\s*$/i.exec(attribute[4]);
+      if (entry.level !== undefined || !value) return null;
+      entry.level = Number(value[1]);
+      if (!Number.isSafeInteger(entry.level) || entry.level > 0xffffffff) return null;
+    }
+  }
+  return sawManifest && finish() ? result : null;
 }
 
 const RELEASE_APP_ID = 'com.polaris2.app';
@@ -482,6 +526,17 @@ export function permissionViolations(parsed) {
   }
   errors.push(...permissionSetViolations('uses-permission', parsed.uses, registries.uses));
   errors.push(...permissionSetViolations('自建 permission', parsed.declared, registries.declared));
+  const levels = parsed.declaredProtectionLevels;
+  if (!levels || typeof levels !== 'object') {
+    errors.push('Missing/unparseable compiled permission protectionLevel evidence');
+  } else {
+    errors.push(...permissionSetViolations('compiled permission', Object.keys(levels), registries.declared));
+    for (const expected of registries.declared) {
+      if (levels[expected.name] !== expected.protectionLevel) {
+        errors.push(`Declared permission ${expected.name} must have exact signature protectionLevel=2`);
+      }
+    }
+  }
   return errors;
 }
 
@@ -1002,7 +1057,7 @@ function apkMember(apk, name) {
  * 不猜 PATH 之外的位置、不静默降级到「跳过这条判据」—— `null` 会一路走到
  * [`permissionViolations`] 变成一条**红**，因为「没跑」与「跑过且通过」在退出码上必须可分辨。
  */
-function aapt2Path() {
+export function aapt2Path() {
   const home = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
   if (!home) return null;
   const dir = join(home, 'build-tools');
@@ -1026,12 +1081,16 @@ function aapt2Path() {
  * 问 aapt2 要这个 APK 的权限集。拿不到（工具缺席 / 调用失败 / 输出读不出）一律 `null`，
  * 由判据 ⑦ 红在取材面。
  */
-function apkPermissions(apk) {
-  const bin = aapt2Path();
+export function apkPermissions(apk, { bin = aapt2Path(), run = execFileSync } = {}) {
   if (bin === null) return null;
   try {
-    const out = execFileSync(bin, ['dump', 'permissions', apk], { maxBuffer: 8 * 1024 * 1024 });
-    return parseAapt2Permissions(out.toString('utf8'));
+    const out = run(bin, ['dump', 'permissions', apk], { maxBuffer: 8 * 1024 * 1024 });
+    const parsed = parseAapt2Permissions(out.toString('utf8'));
+    if (parsed === null) return null;
+    const xml = run(bin, ['dump', 'xmltree', '--file', 'AndroidManifest.xml', apk],
+      { maxBuffer: 8 * 1024 * 1024 });
+    parsed.declaredProtectionLevels = parseDeclaredPermissionLevels(xml.toString('utf8'));
+    return parsed;
   } catch {
     return null;
   }

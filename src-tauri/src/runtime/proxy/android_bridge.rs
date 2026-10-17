@@ -2155,3 +2155,35 @@ pub(crate) async fn transient_login_running(instance_id: &str) -> Result<bool, S
 /// checks never promote ordinary/global close to owner or SDK disposal proof.
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod tailscale_store;
+
+#[cfg(target_os = "android")]
+pub(super) async fn tls_fingerprint_capabilities() -> crate::runtime::tls_fingerprints::Snapshot {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct TLSFingerprintCapabilitiesResponse {
+        document: Option<String>,
+        binary_sha256: String,
+    }
+    let plugin = match plugin_handle() {
+        Ok(plugin) => plugin,
+        Err((reason, _)) => return crate::runtime::tls_fingerprints::Snapshot::unavailable(reason),
+    };
+    match call_with_budget::<TLSFingerprintCapabilitiesResponse, _>(
+        plugin,
+        "tlsFingerprintCapabilities",
+        (),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    {
+        Ok(reply) => crate::runtime::tls_fingerprints::Snapshot::from_native(
+            reply.document.as_deref(),
+            &reply.binary_sha256,
+            "loaded-jni-so",
+        ),
+        Err(_) => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+            "Loaded libbox TLS capabilities unavailable",
+        ),
+    }
+}

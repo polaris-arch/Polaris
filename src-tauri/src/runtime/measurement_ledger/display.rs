@@ -250,7 +250,8 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         generation,
         network,
         polaris_helper_proto::Platform::current(),
-    );
+    )
+    .with_core_binary_sha256(proxy.measurement_core_sha256());
     let auto_scope = config["selectionIntent"]["subscriptionId"]
         .as_str()
         .map_or_else(BTreeSet::new, |id| BTreeSet::from([id.to_owned()]));

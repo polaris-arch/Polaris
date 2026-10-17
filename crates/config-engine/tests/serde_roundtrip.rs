@@ -211,6 +211,7 @@ fn dns_final_keyword_field_renamed() {
 fn full_config_roundtrip() {
     // 最小顶层 config 序列化 → 反序列化 → 相等（验证 derive 一致性）。
     let cfg = SingBoxConfig {
+        polaris_windows_directory: None,
         log: LogConfig {
             level: "info".into(),
             timestamp: true,

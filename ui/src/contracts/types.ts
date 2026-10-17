@@ -637,6 +637,8 @@ export interface UserConfig {
     directServerId: string;
     proxyServerId: string;
     unmatchedAction?: DnsPolicyAction;
+    /** Default FakeIP non-A/AAAA queries only; server or reject. Missing = legacy domestic DNS. */
+    realQueryFallbackAction?: DnsPolicyAction;
     connectionResolution?: 'preserveDomain' | 'dnsRules';
   };
   /** @deprecated schema v4 起迁入 dnsDefaults.connectionResolution，仅兼容旧配置读取。 */
@@ -760,6 +762,7 @@ export interface UserConfig {
   // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
   bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
+  utlsPolicy?: string; // follow (legacy default), default, or a supported core profile
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // WebRTC 防泄露（仅 TUN 模式生效）：off=关；proxy=对 STUN 经协议嗅探强制走代理（srflx=代理 IP，WebRTC 正常）；
   // block=reject STUN（断 P2P、零公网 IP 泄露）。默认 undefined=off（零行为变化）。系统代理模式拦不住（浏览器 WebRTC

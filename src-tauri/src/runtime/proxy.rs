@@ -37,6 +37,7 @@ mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
+mod tls_capabilities;
 // `pub(crate)`：`pipe_to_log` 是全 app 唯一一份子进程排空实现，瞬态登录核
 // （`runtime::tailscale_login_core`）与测速临时核（`runtime::speedtest`）都用它。
 pub(crate) mod core_log;
@@ -1356,6 +1357,7 @@ struct IosMainCustody {
     config_digest: String,
     main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     ready: Option<tauri_plugin_polaris_ios::ReadySessionReceipt>,
+    stop_target: Option<Arc<tauri_plugin_polaris_ios::StopSessionTarget>>,
     stopped: Option<Arc<tauri_plugin_polaris_ios::StoppedSessionReceipt>>,
 }
 
@@ -1582,6 +1584,9 @@ pub struct ProxyRuntime {
     ///
     /// [`sync_custom_rule_files`]: Self::sync_custom_rule_files
     custom_rule_files_degraded: AtomicBool,
+    rule_content_publication: Mutex<Option<startup::RuleContentPublication>>,
+    #[cfg(test)]
+    rule_content_api_stub: Mutex<Option<Arc<dyn startup::RuleContentApi>>>,
     /// **A-0b：运行期观测到的 tailnet 地址**（`serverId` → 裸地址，不带掩码）。
     ///
     /// 唯一写入点是 `tailnet_rules` 域的两条腿：STATUS 帧（
@@ -1684,6 +1689,30 @@ pub struct ProxyRuntime {
             HelperLinuxResolvedOps,
             polaris_system_integration::StdMarkerFs,
         >,
+    >,
+    /// Actual ready-core bytes, scoped to the generation which observed them.
+    captured_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    captured_temp_core_sha256: Mutex<Option<String>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_temp_cli_source: Mutex<
+        Option<(
+            core_binary::CoreSelectionObservation,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
+    >,
+    #[cfg(test)]
+    core_binary_resolution_calls: AtomicU32,
+
+    #[cfg(test)]
+    test_measurement_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_cli_run: Mutex<
+        Option<(
+            u64,
+            process_supervision::RunIdentity,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
     >,
     /// 起核用的核二进制路径覆盖（**仅单测置位**，同 `stale_sweep_disabled` 的先例；生产恒 `None`）。
     ///
@@ -1852,6 +1881,9 @@ impl ProxyRuntime {
             helper_upgrade_prompted: AtomicBool::new(false),
             stale_sweep_runs: AtomicUsize::new(0),
             custom_rule_files_degraded: AtomicBool::new(false),
+            rule_content_publication: Mutex::new(None),
+            #[cfg(test)]
+            rule_content_api_stub: Mutex::new(None),
             observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),
@@ -1877,6 +1909,17 @@ impl ProxyRuntime {
             test_restart_after_claim: Mutex::new(None),
             network_watcher: Mutex::new(None),
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_cli_run: Mutex::new(None),
+            #[cfg(test)]
+            test_measurement_core_sha256: Mutex::new(None),
+            captured_core_sha256: Mutex::new(None),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            captured_temp_core_sha256: Mutex::new(None),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_temp_cli_source: Mutex::new(None),
+            #[cfg(test)]
+            core_binary_resolution_calls: AtomicU32::new(0),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
@@ -1950,6 +1993,97 @@ impl ProxyRuntime {
     /// 返回 `Some` ⟺ 核运行且起核时成功注入了探测池（`probe_pool_ports` 非空）；否则 `None`（测速回退活跃出口）。
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
+    pub(crate) fn remember_temp_core_sha256(
+        &self,
+        digest: Option<String>,
+        _proof: Option<crate::runtime::tls_fingerprints::CliObservation>,
+    ) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            #[cfg(not(test))]
+            let source = core_binary::verified_selection_observation();
+            #[cfg(test)]
+            let source = self
+                .core_binary_override
+                .lock()
+                .ok()
+                .and_then(|path| path.clone())
+                .map(core_binary::CoreSelectionObservation::fixture);
+            let captured = source.and_then(|source| {
+                let cli = _proof?;
+                (source.is_current()
+                    && cli.matches(source.path())
+                    && digest.is_some()
+                    && cli.snapshot.binary_sha256 == digest)
+                    .then_some((source, cli))
+            });
+            if let Ok(mut slot) = self.captured_temp_cli_source.lock() {
+                *slot = captured;
+            }
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        if let Ok(mut value) = self.captured_temp_core_sha256.lock() {
+            *value = digest;
+        }
+    }
+
+    pub(crate) fn measurement_core_sha256(&self) -> Option<String> {
+        let status = self.status();
+        #[cfg(test)]
+        if status.running {
+            if let Some((generation, digest)) =
+                self.test_measurement_core_sha256.lock().ok()?.as_ref()
+            {
+                if *generation == self.core_generation() {
+                    return Some(digest.clone());
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            if status.running {
+                // Direct Windows/Mac use the actual retained Child identity and
+                // the file proof bracketed around that Child's synchronous birth.
+                if !self
+                    .core_via_helper
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return self
+                        .direct_tls_snapshot(self.core_generation())
+                        .binary_sha256;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let image = std::path::PathBuf::from(format!("/proc/{}/exe", status.pid));
+                    let cached = crate::runtime::tls_fingerprints::cached_cli(&image)?;
+                    return cached.snapshot.binary_sha256;
+                }
+                #[cfg(not(target_os = "linux"))]
+                return None; // A helper-reported pathname alone cannot identify loaded bytes.
+            }
+            let observed = self.captured_temp_cli_source.lock().ok()?;
+            let (source, cli) = observed.as_ref()?;
+            #[cfg(test)]
+            if self.core_binary_override.lock().ok()?.as_deref() != Some(source.path()) {
+                return None;
+            }
+            // Metadata/handle checks only. Launch and acquisition still go through
+            // the original resolver's full installation content verification.
+            (source.is_current() && cli.matches(source.path()))
+                .then(|| cli.snapshot.binary_sha256.clone())
+                .flatten()
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            if !status.running {
+                return self.captured_temp_core_sha256.lock().ok()?.clone();
+            }
+            let captured = self.captured_core_sha256.lock().ok()?;
+            let (generation, digest) = captured.as_ref()?;
+            (*generation == self.core_generation()).then(|| digest.clone())
+        }
+    }
+
     pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
         self.switch_snapshot
             .read()
@@ -2090,3 +2224,9 @@ impl ProxyRuntime {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(target_os = "android")]
+pub(crate) async fn temp_tls_fingerprint_capabilities() -> crate::runtime::tls_fingerprints::Snapshot
+{
+    android_bridge::tls_fingerprint_capabilities().await
+}

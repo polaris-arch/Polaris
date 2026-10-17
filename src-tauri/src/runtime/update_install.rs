@@ -229,6 +229,41 @@ impl InstallReject {
     }
 }
 
+/// Probe destination-side admission before irreversibly draining the app.
+/// The script must repeat ownership and lease checks; this is only preflight.
+pub fn preflight_mac_admission(bundle: &Path) -> Result<(), String> {
+    let parent = bundle.parent().ok_or("应用目录没有父目录")?;
+    let lease = parent.join(".polaris-update.lease");
+    match std::fs::symlink_metadata(&lease) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("更新租约不是普通文件".into());
+            }
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&lease)
+                .map_err(|error| error.to_string())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let probe = parent.join(format!(
+        ".polaris-admission-preflight-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    #[allow(unused_mut)] // Only Unix provides DirBuilderExt::mode.
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&probe).map_err(|error| error.to_string())?;
+    std::fs::remove_dir(&probe).map_err(|error| error.to_string())
+}
+
 /// 从可执行路径推导 `.app` 包路径（**纯函数**，= 上游 `macAppBundleFromExe`）。
 ///
 /// `/Applications/Polaris.app/Contents/MacOS/polaris` → `/Applications/Polaris.app`；不匹配返 `None`。
@@ -646,6 +681,7 @@ LEASED=0
 initial_cleanup() {{
   rc=$?
   trap - EXIT HUP INT TERM
+  if [ "$rc" -ne 0 ] && command -v admission_failure >/dev/null 2>&1; then admission_failure; fi
   if [ -n "$ADMISSION" ]; then rm -rf "$ADMISSION"; fi
   if [ "$LEASED" -eq 1 ]; then "$LOCK_HELPER" lease-release --lock "$LOCK" --fd 9 || rc=1; fi
   exec 9>&-
@@ -712,6 +748,12 @@ fn build_mac_script(plan: &InstallPlan) -> String {
     };
     let dest = sh_quote(&bundle.to_string_lossy());
     ["#!/bin/bash", UNIX_EXIT_WAIT, &format!("DMG={dmg}"), &format!("DEST={dest}"), r#"
+admission_failure() {
+  printf '%s\n' 'Polaris update admission failed; manual installation required.' > "$(dirname "$POLARIS_LOCK_HELPER")/admission-failure.txt"
+  open "$DMG"
+  if [ -d "$DEST" ]; then open "$DEST"; fi
+}
+trap 'admission_failure' EXIT
 candidate_identity() {
   codesign -dv --verbose=4 "$1" 2>&1 | awk -F= '/^CDHash=/ {print $2}'
 }
