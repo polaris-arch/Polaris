@@ -133,7 +133,9 @@ jobs:
           ${{ github.event_name == 'pull_request'
               && github.repository == 'polaris-arch/Polaris'
               && github.event.pull_request.head.repo.full_name == github.repository
-              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017' }}
+              && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                  || (github.event.pull_request.number == 15
+                      && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018')) }}
         id: pr_candidate
         shell: bash
         run: |
@@ -146,7 +148,7 @@ jobs:
               or data.get('repository') != 'polaris-arch/sing-box-polaris'
               or not isinstance(data.get('sourceCommit'), str)
               or not re.fullmatch(r'[0-9a-f]{40}', data['sourceCommit'])
-              or data['sourceCommit'] == '0' * 40):
+              or data['sourceCommit'] != '68ffb209ded1f9337f9115741cba24f9f4c63421'):
               raise SystemExit('Missing or invalid explicit batch PR candidate source')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write('mode=candidate\nsource=' + data['sourceCommit'] + '\n')
@@ -942,14 +944,16 @@ jobs:
           "app_manifest_sha256=$($verified.AppManifestSHA256)" >> $env:GITHUB_OUTPUT
           "kernel_manifest_sha256=$($verified.KernelManifestSHA256)" >> $env:GITHUB_OUTPUT
           "activation_manifest_sha256=$($verified.ActivationManifestSHA256)" >> $env:GITHUB_OUTPUT
-      # Explicit owner approval is limited to this batch's temporary CI SYSTEM task.
+      # Owner approval covers these two batches' temporary CI SYSTEM tasks only.
       - name: Approved batch SYSTEM producer — fresh
         if: >-
           ${{ runner.os == 'Windows'
               && github.event_name == 'pull_request'
               && github.repository == 'polaris-arch/Polaris'
               && github.event.pull_request.head.repo.full_name == github.repository
-              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+              && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                  || (github.event.pull_request.number == 15
+                      && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018'))
               && steps.windows_directory_source.outputs.mode == 'candidate' }}
         shell: pwsh
         env:
@@ -998,14 +1002,16 @@ jobs:
           & git diff --quiet HEAD --
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
           @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
-      # Explicit owner approval is limited to this batch's temporary CI SYSTEM task.
+      # Owner approval covers these two batches' temporary CI SYSTEM tasks only.
       - name: Approved batch SYSTEM producer — prebuilt-user
         if: >-
           ${{ runner.os == 'Windows'
               && github.event_name == 'pull_request'
               && github.repository == 'polaris-arch/Polaris'
               && github.event.pull_request.head.repo.full_name == github.repository
-              && github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+              && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                  || (github.event.pull_request.number == 15
+                      && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018'))
               && steps.windows_directory_source.outputs.mode == 'candidate' }}
         shell: pwsh
         env:

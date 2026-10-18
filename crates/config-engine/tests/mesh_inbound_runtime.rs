@@ -44,10 +44,12 @@ const DNS_NAME: &str = "warm.mesh.polaris.invalid";
 // this coordination: the core accepts port numbers, not inherited sockets.
 static PORT_HANDOFF: Mutex<()> = Mutex::new(());
 
+fn lock_port_handoff(lock: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock()
+        .expect("port handoff panicked while holding the allocation lock")
+}
 fn port_handoff() -> std::sync::MutexGuard<'static, ()> {
-    PORT_HANDOFF
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+    lock_port_handoff(&PORT_HANDOFF)
 }
 fn bind_tcp(address: impl std::net::ToSocketAddrs) -> std::io::Result<TcpListener> {
     let _guard = port_handoff();
@@ -64,58 +66,63 @@ fn connect_tcp_timeout(address: &SocketAddr, timeout: Duration) -> std::io::Resu
     let _guard = port_handoff();
     TcpStream::connect_timeout(address, timeout)
 }
-fn handoff<T>(reservations: impl Sized, start: impl FnOnce() -> T) -> T {
-    let _guard = port_handoff();
+fn handoff_with<T>(lock: &Mutex<()>, reservations: impl Sized, start: impl FnOnce() -> T) -> T {
+    let _guard = lock_port_handoff(lock);
     drop(reservations);
     start()
+}
+fn handoff<T>(reservations: impl Sized, start: impl FnOnce() -> T) -> T {
+    handoff_with(&PORT_HANDOFF, reservations, start)
+}
+
+// Observe ownership release without claiming the OS cannot immediately reuse a
+// closed socket. Drop the actual resource before publishing the receipt.
+struct DropReceipt<T>(Option<T>, Arc<AtomicBool>);
+impl<T> Drop for DropReceipt<T> {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        self.1.store(true, Ordering::Release);
+    }
 }
 
 #[test]
 fn port_handoff_blocks_competing_allocation_until_child_owns_sockets() {
-    // Negative control: releasing a reservation without handoff coordination
-    // permits an explicitly scheduled competing allocator to steal it.
-    let reservation = bind_tcp("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    let stolen = handoff(reservation, || {
-        // Bypass the allocation gate deliberately. Holding the gate keeps real
-        // parallel fixtures out of this deterministic negative control.
-        thread::spawn(move || TcpListener::bind(address).unwrap())
+    let lock = Arc::new(Mutex::new(()));
+    let released = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    // Negative control: an allocator that bypasses the lock can enter the
+    // post-drop/pre-ready gap. No freed OS port is assumed to remain available.
+    handoff_with(&lock, DropReceipt(Some(()), released.clone()), || {
+        assert!(released.load(Ordering::Acquire));
+        let ready = ready.clone();
+        let observed_ready = thread::spawn(move || ready.load(Ordering::Acquire))
             .join()
-            .unwrap()
+            .unwrap();
+        assert!(!observed_ready);
     });
-    assert_eq!(stolen.local_addr().unwrap(), address);
-    drop(stolen);
 
-    let tcp = bind_tcp("127.0.0.1:0").unwrap();
-    let udp = bind_udp("127.0.0.1:0").unwrap();
-    let tcp_address = tcp.local_addr().unwrap();
-    let udp_address = udp.local_addr().unwrap();
-    let ((owned_tcp, owned_udp), competitor) = handoff((tcp, udp), || {
+    released.store(false, Ordering::Release);
+    let competitor = handoff_with(&lock, DropReceipt(Some(()), released.clone()), || {
+        assert!(released.load(Ordering::Acquire));
         let (attempted, observed) = std::sync::mpsc::channel();
+        let competing_lock = lock.clone();
+        let competing_ready = ready.clone();
         let competitor = thread::spawn(move || {
-            // Schedule the competitor inside the actual post-drop gap, not
-            // while an un-released reservation still protects the socket.
             assert!(matches!(
-                PORT_HANDOFF.try_lock(),
+                competing_lock.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ));
             attempted.send(()).unwrap();
-            let tcp_error = bind_tcp(tcp_address).unwrap_err().kind();
-            let udp_error = bind_udp(udp_address).unwrap_err().kind();
-            (tcp_error, udp_error)
+            let _guard = lock_port_handoff(&competing_lock);
+            assert!(competing_ready.load(Ordering::Acquire));
         });
         observed.recv_timeout(Duration::from_secs(5)).unwrap();
-        // Model the child process, which intentionally does not use our mutex.
-        let owned_tcp = TcpListener::bind(tcp_address).unwrap();
-        let owned_udp = UdpSocket::bind(udp_address).unwrap();
-        ((owned_tcp, owned_udp), competitor)
+        // Model the child-ready receipt before the allocation gate opens.
+        ready.store(true, Ordering::Release);
+        competitor
     });
-    let errors = competitor.join().unwrap();
-    assert_eq!(
-        errors,
-        (std::io::ErrorKind::AddrInUse, std::io::ErrorKind::AddrInUse)
-    );
-    drop((owned_tcp, owned_udp));
+    competitor.join().unwrap();
+    assert!(!lock.is_poisoned());
 }
 
 // Spawn this test executable to exercise real child exit and timeout cleanup
@@ -134,10 +141,11 @@ fn startup_receipt_child_fixture() {
 
 #[test]
 fn startup_handoff_releases_lock_on_ready_exit_timeout_and_spawn_error() {
+    let lock = Mutex::new(());
     for mode in ["ready", "exit", "timeout"] {
         let temp = tempfile::tempdir().unwrap();
         let log = temp.path().join("startup.stderr");
-        let result = handoff((), || {
+        let result = handoff_with(&lock, (), || {
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "startup_receipt_child_fixture", "--nocapture"])
                 .env("POLARIS_MESH_STARTUP_TEST", mode)
@@ -156,15 +164,15 @@ fn startup_handoff_releases_lock_on_ready_exit_timeout_and_spawn_error() {
             }));
         }
         drop(result); // successful fixture is also killed/reaped
-        assert!(!PORT_HANDOFF.is_poisoned());
-        // Acquire rather than try_lock: other parallel tests may be allocating.
-        drop(port_handoff());
+        assert!(!lock.is_poisoned());
+        // This control owns its mutex; unrelated test panics cannot poison it.
+        drop(lock_port_handoff(&lock));
     }
     let missing = tempfile::tempdir().unwrap().path().join("missing-core");
-    let result = handoff((), || std::process::Command::new(missing).spawn());
+    let result = handoff_with(&lock, (), || std::process::Command::new(missing).spawn());
     assert!(result.is_err());
-    assert!(!PORT_HANDOFF.is_poisoned());
-    drop(port_handoff());
+    assert!(!lock.is_poisoned());
+    drop(lock_port_handoff(&lock));
 }
 
 // Match the direct inbounds' IPv4 loopback bind. Keep sockets alive through
@@ -236,18 +244,12 @@ fn inbound_port_reservations_isolate_fixtures_and_keep_waiting_peer_bound() {
             std::io::ErrorKind::AddrInUse
         );
     }
-    // Isolate release/rebind from other parallel fixtures as well. Raw binds
-    // model the receiving child while the handoff gate is already held.
-    let (_tcp, _udp) = handoff(b, || {
-        let tcp: Vec<_> = b_tcp
-            .into_iter()
-            .map(|port| TcpListener::bind(local(port)).unwrap())
-            .collect();
-        let udp: Vec<_> = b_udp
-            .into_iter()
-            .map(|port| UdpSocket::bind(local(port)).unwrap())
-            .collect();
-        (tcp, udp)
+    // Observe actual lease destruction, not reacquisition of its old numbers:
+    // another process or the OS may allocate them immediately after close.
+    let released = Arc::new(AtomicBool::new(false));
+    let lock = Mutex::new(());
+    handoff_with(&lock, DropReceipt(Some(b), released.clone()), || {
+        assert!(released.load(Ordering::Acquire));
     });
 }
 
