@@ -159,6 +159,11 @@ mockIPC((cmd, payload) => {
       return Promise.resolve(null);
     }
     case 'server_get_all': return Promise.resolve(demoConfig.servers);
+    case 'tailscale_state_exists': {
+      const { serverIds } = payload as { serverIds: string[] };
+      // Synthetic nodes have no native state directory or persisted account.
+      return Promise.resolve(Object.fromEntries(serverIds.map(id => [id, false])));
+    }
     case 'system_list_network_interfaces': return Promise.resolve([]);
     case 'server_update': {
       const server = (payload as { server?: typeof DEMO_SERVERS[number] } | null)?.server;
