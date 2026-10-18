@@ -482,6 +482,19 @@ the full/reuse/fallback workflow result combinations. The existing strict
 same-run consumer/import and aggregate controls remain in the test gate.
 
 
+Execution-input collection and the complete host test gate require Python 3.11+
+with standard-library `tomllib`; both the Release Risk classifier and Apple
+producer explicitly select Python 3.12 and check/report the actual interpreter
+and parser before use. The Apple setup stays after Xcode/SDK host admission.
+The Linux resolver/sealer validates recorded configuration pins and does not
+parse ambient Cargo configuration. A standalone producer without `tomllib`
+remains explicitly ineligible and completes its ordinary full build; it never
+creates a reusable execution sidecar. Unsupported-input controls exercise that
+path separately; the supported snapshot/profile controls require real parsed
+inputs and cannot pass merely because both snapshots became unavailable.
+See https://docs.python.org/3.12/library/tomllib.html . Historical and ordinary
+build-entry requirements are unchanged.
+
 Revision closure and Cargo admission:
 
 - The verifier joins each native receipt pin to both the transported payload and

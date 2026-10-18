@@ -146,7 +146,8 @@ fi
 # Apple changes existing Node cases (+0); Android adds no Node cases (+0).
 # Static registration count only; unified CI must verify actual TAP passes. Python/Vitest excluded.
 # 493 → 498: five fail-closed Apple same-tree evidence/DAG controls.
-if [ "$pass" -lt 498 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 498）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+# 498 → 499: explicit Python/parser runtime and ordering negative controls.
+if [ "$pass" -lt 499 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 499）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

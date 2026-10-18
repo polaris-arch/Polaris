@@ -408,8 +408,12 @@ esac
 
   it('Apple aggregate 先拒绝上游失败，再验证显式 scope 的 summary 完整集', () => {
     const apple = read('apple.yml');
-    const chain = apple.slice(apple.indexOf('\n  unsigned-chain:\n'));
-    expect(chain).toContain('needs: component\n    if: always()');
+    const chainStart = apple.indexOf('\n  unsigned-chain:\n');
+    expect(chainStart).toBeGreaterThan(0);
+    const chain = apple.slice(chainStart);
+    // The final job must observe both the optional resolver and the full-build
+    // component, including the deliberately skipped component on verified reuse.
+    expect(chain).toContain('needs: [resolve, component]\n    if: always()');
     expect(chain).toContain('COMPONENT_RESULT: ${{ needs.component.result }}');
     const blocks = chain.split(/^ {6}- /m).slice(1);
     const simDownload = blocks.find((block) => block.includes('name: apple-carrier-summary-sim-arm64'))!;
@@ -420,6 +424,93 @@ esac
     expect(aggregate).toContain('aggregate --scope "$POLARIS_APPLE_SCOPE"');
     expect(aggregate).toContain('sim-arm64: not requested.');
     expect(aggregate).not.toContain('continue-on-error');
+  });
+
+  it('Apple resolver 未完成就回退实编译，复用与全量聚合互斥且最终判据不能被跳过', () => {
+    const apple = read('apple.yml');
+    const check = (source: string) => {
+      const resolver = jobSection(source, 'resolve', 'apple.yml');
+      const component = jobSection(source, 'component', 'apple.yml');
+      const chainStart = source.indexOf('\n  unsigned-chain:\n');
+      expect(chainStart).toBeGreaterThan(0);
+      const chain = source.slice(chainStart);
+      expect(chain.match(/^ {2}[\w-]+:/gm)).toEqual(['  unsigned-chain:']);
+      expect(chain).toMatch(/^    needs: \[resolve, component\]\n    if: always\(\)$/m);
+      expect(component).toMatch(/^    needs: resolve$/m);
+      const blocks = chain.split(/^ {6}- /m).slice(1);
+      const step = (needle: string) => {
+        const matches = blocks.filter((block) => block.includes(needle));
+        expect(matches, `unsigned-chain step missing or ambiguous: ${needle}`).toHaveLength(1);
+        return matches[0];
+      };
+      const expression = (block: string, indent: number, key = 'if') => {
+        const match = block.match(new RegExp(`^ {${indent}}${key}: \\$\\{\\{ (.+) \\}\\}$`, 'm'));
+        expect(match, `missing ${key} expression`).not.toBeNull();
+        return match![1];
+      };
+      const componentIf = expression(component, 4);
+      const reusedOutput = expression(resolver, 6, 'reused');
+      const reuseSteps = [
+        step('name: Download the exact resolver receipt for this attempt\n'),
+        step('id: reuse_verified\n'),
+      ];
+      const buildSteps = [
+        step('name: apple-component-manifest-'),
+        step('name: apple-carrier-summary-device-arm64-'),
+        step('id: aggregate\n'),
+      ];
+      const chainUpload = expression(step('id: chain\n'), 8);
+      const result = step('id: result\n');
+      expect(result).toMatch(/^        if: always\(\)$/m);
+      expect(result).not.toContain('continue-on-error');
+      // A status function is required here: GitHub's implicit success() would
+      // otherwise suppress fallback after a failed resolver or failed aggregate.
+      expect(componentIf).toContain('!cancelled()');
+      expect(chainUpload).toContain('always()');
+      const statuses = ['success', 'failure', 'cancelled', 'skipped', '', 'unknown'];
+      for (const status of statuses) {
+        for (const reused of ['true', 'false', '', 'unknown']) {
+          const hit = status === 'success' && reused === 'true';
+          const context = { needs: { resolve: { result: status, outputs: { reused } } }, always: () => true };
+          for (const cancelled of [false, true]) {
+            expect(runInNewContext(componentIf, { ...context, cancelled: () => cancelled }))
+              .toBe(!cancelled && !hit);
+          }
+          for (const block of reuseSteps) expect(runInNewContext(expression(block, 8), context)).toBe(hit);
+          for (const block of buildSteps) expect(runInNewContext(expression(block, 8), context)).toBe(!hit);
+          expect(runInNewContext(chainUpload, context)).toBe(!hit);
+          // continue-on-error changes conclusion to success, but cannot turn a
+          // resolver/receipt failure into the published reused=true output.
+          for (const receipt of statuses) {
+            expect(runInNewContext(reusedOutput, { steps: {
+              resolve: { outcome: status, conclusion: 'success', outputs: { reused } },
+              receipt: { outcome: receipt, conclusion: 'success' },
+            } })).toBe(hit && receipt === 'success' ? 'true' : 'false');
+          }
+        }
+      }
+    };
+    check(apple);
+    // Replay dependency removal, skipped final gates, masked resolver failures,
+    // and overlapping or missing evidence branches against the same predicates.
+    for (const [before, after] of [
+      ['needs: [resolve, component]', 'needs: component'],
+      ['needs: [resolve, component]', 'needs: resolve'],
+      ['needs: resolve\n    if:', 'needs: []\n    if:'],
+      ['needs: [resolve, component]\n    if: always()', 'needs: [resolve, component]\n    if: success()'],
+      ['id: result\n        if: always()', 'id: result\n        if: success()'],
+      ["!cancelled() && !(needs.resolve.result == 'success'", "!(needs.resolve.result == 'success'"],
+      ['steps.resolve.outcome', 'steps.resolve.conclusion'],
+      ['steps.receipt.outcome', 'steps.receipt.conclusion'],
+      ["needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true'", "needs.resolve.outputs.reused == 'true'"],
+      ["id: reuse_verified\n        if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true' }}", 'id: reuse_verified\n        if: ${{ true }}'],
+      ["id: aggregate\n        if: ${{ !(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true') }}", 'id: aggregate\n        if: ${{ true }}'],
+      ["always() && !(needs.resolve.result == 'success'", "!(needs.resolve.result == 'success'"],
+    ]) {
+      const changed = apple.replace(before, after);
+      expect(changed).not.toBe(apple);
+      expect(() => check(changed), `mutation escaped: ${before}`).toThrow();
+    }
   });
 
   it('Android 复用调用 job 满足嵌套发布 job 的权限上限', () => {

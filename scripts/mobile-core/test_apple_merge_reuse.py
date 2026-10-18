@@ -586,7 +586,7 @@ class AppleMergeReuseControls(unittest.TestCase):
                 return actual(phase, slot)
             try:
                 with mock.patch.object(reuse, 'snapshot', side_effect=collect):
-                    case.test_snapshot_collects_actual_binary_and_sdk_bytes_before_and_after()
+                    case.collect_snapshot_fixture(unavailable=name != 'CARGO_PROFILE_RELEASE_OPT_LEVEL')
                     root = Path(case.temp.name) / 'snapshot-root/device-arm64'
                     before = reuse.safe_json((root / 'execution-carrier-before.json').read_bytes())
                     after = reuse.safe_json((root / 'execution-carrier-after.json').read_bytes())
@@ -597,10 +597,46 @@ class AppleMergeReuseControls(unittest.TestCase):
                                 reuse.validate_snapshot(row, phase, self.fx.ctx,
                                     reuse.source_summary(self.fx.source), self.fx.source['contract'])
                     else:
+                        self.assertEqual(before['schema'], reuse.SNAPSHOT_SCHEMA)
+                        self.assertEqual(after['schema'], reuse.SNAPSHOT_SCHEMA)
                         with self.assertRaisesRegex(RuntimeError, 'changed during'):
                             reuse.snapshot_pair(before, after)
             finally:
                 case.doCleanups()
+
+    def test_missing_standard_library_parser_is_ineligible_without_masking_corruption(self):
+        # Reproduce the actual Python 3.10 module-absence condition without a
+        # replacement parser, test skip or weakening the supported-input tests.
+        with mock.patch.dict(reuse.sys.modules, {'tomllib': None}):
+            with self.assertRaisesRegex(reuse.UnsupportedCargoInputs, 'parser unavailable'):
+                reuse.cargo_configuration({})
+            self.assertEqual(reuse.observe_cargo_execution_inputs({}),
+                             {'unavailable': reuse.UNAVAILABLE_REASON})
+            self.collect_snapshot_fixture(unavailable=True)
+        snapshot_root = Path(self.temp.name) / 'snapshot-root'
+        for corrupted in (False, True):
+            with tempfile.TemporaryDirectory() as folder, self.subTest(corrupted=corrupted):
+                fx = Fixture(folder)
+                def install_actual(component, carrier):
+                    for phase in reuse.PHASES:
+                        prefix = 'device-arm64/' if phase.startswith('carrier-') else ''
+                        path = prefix + 'execution-' + phase + '.json'
+                        (carrier if prefix else component)[path] = (snapshot_root / path).read_bytes()
+                    if corrupted:
+                        carrier['device-arm64/original-linked-rust-archive.a'] = b'corrupted original'
+                self.install_qualification_case(fx, execution=True, corrupt=install_actual)
+                if corrupted:
+                    with self.assertRaises(RuntimeError) as failure:
+                        self.seal_qualification_case(fx)
+                    self.assertNotIsInstance(failure.exception, reuse.UnsupportedCargoInputs)
+                    self.assertFalse((fx.folder / 'ghout').exists())
+                else:
+                    output, fields = self.seal_qualification_case(fx)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(fields, 'eligible=false\nreason=' + reuse.UNAVAILABLE_REASON + '\n')
+                self.assertFalse((fx.folder / 'new-contract.json').exists())
+                with self.assertRaises(RuntimeError):
+                    fx.resolve()
 
     def test_actual_cargo_execution_receipt_is_required_and_matches_admission(self):
         original = reuse.safe_json(self.fx.carrier_files['device-arm64/rust-aarch64-apple-ios.json'])['executionInputs']
@@ -1006,6 +1042,9 @@ class AppleMergeReuseControls(unittest.TestCase):
             reuse.check_result(path, '0' * 64)
 
     def test_snapshot_collects_actual_binary_and_sdk_bytes_before_and_after(self):
+        self.collect_snapshot_fixture()
+
+    def collect_snapshot_fixture(self, *, unavailable=False):
         root = Path(self.temp.name) / 'snapshot-root'
         root.mkdir()
         (root / 'device-arm64').mkdir()
@@ -1041,8 +1080,12 @@ class AppleMergeReuseControls(unittest.TestCase):
             path = root / ('device-arm64' if phase.startswith('carrier-') else '') / ('execution-' + phase + '.json')
             row = reuse.safe_json(path.read_bytes())
             self.assertEqual(row['context'], self.fx.ctx)
-            if row['schema'] == reuse.UNAVAILABLE_SCHEMA:
+            self.assertEqual(row['schema'], reuse.UNAVAILABLE_SCHEMA if unavailable else reuse.SNAPSHOT_SCHEMA)
+            if unavailable:
                 self.assertEqual(row['reason'], reuse.UNAVAILABLE_REASON)
+                with self.assertRaises(reuse.UnsupportedCargoInputs):
+                    reuse.validate_snapshot(row, phase, self.fx.ctx,
+                        reuse.source_summary(self.fx.source), self.fx.source['contract'])
                 continue
             self.assertEqual(row['tools']['go']['sha256'], file_pin(binaries / 'go')['sha256'])
             self.assertEqual(row['sdk']['iphoneos']['settings'], file_pin(root / 'iphoneos/SDKSettings.json'))

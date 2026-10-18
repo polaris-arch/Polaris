@@ -631,6 +631,8 @@ const PYTHON_MODULE_FILES: &[&str] = &[
     "scripts/mobile-core/test_inputs.py",
     "scripts/mobile-core/apple_admission.py",
     "scripts/mobile-core/apple_handoff.py",
+    "scripts/mobile-core/apple_merge_reuse.py",
+    "scripts/mobile-core/test_apple_merge_reuse.py",
     "scripts/mobile-core/test_apple_admission.py",
     "scripts/mobile-core/test_apple_handoff.py",
     "scripts/mobile-core/test_apple_progress.py",

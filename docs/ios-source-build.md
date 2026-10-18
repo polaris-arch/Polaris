@@ -4,6 +4,8 @@
 
 在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.25.5、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
 
+完整主机测试与同树合入复用的执行输入采集要求 Python 3.11+ 及标准库 `tomllib`；CI 显式使用 Python 3.12 并检查实际解释器/模块。缺少该模块时普通构建仍可继续，但证据不具复用资格且不生成 execution sidecar。此要求不追溯改变下文历史构建入口。
+
 当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)；下述移动端 alpha.12 固定来源仍以现有 source-contract 为准。新仓导航不表示来源清单已经迁移，也不提供新的已发布移动组件或 IPA 下载。
 
 核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 polaris-box v1.15.0-alpha.12 的固定 commit 577d4b9a089b71d2f0a4ca334b87264b55c10478。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。

@@ -109,6 +109,53 @@ test('Apple workflow keeps one admitted host, mandatory device and optional isol
   assert.match(hook, /mobile-core\/apple_rust\.py/);
 });
 
+test('Cargo snapshot producers and the complete test gate select and verify Python before parsing', () => {
+  const apple = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  const section = (text, name) => text.split(`\n  ${name}:\n`)[1]?.split(/\n  [\w-]+:\n/)[0] ?? '';
+  const check = (text, name, consumer, admitted = false) => {
+    const job = section(text, name);
+    const blocks = job.split(/^ {6}- /m).slice(1);
+    const setup = blocks.find(block => block.startsWith('uses: actions/setup-python@v6\n'));
+    const probe = blocks.find(block => block.startsWith('name: Verify Python and Cargo configuration parser\n'));
+    assert.ok(setup && probe);
+    assert.equal(blocks.filter(block => /uses: actions\/setup-python@/.test(block)).length, 1);
+    assert.match(setup, /with:\n\s+python-version: '3\.12'/);
+    assert.doesNotMatch(setup + probe, /\bif:|continue-on-error:/);
+    assert.match(probe, /import sys, tomllib/);
+    assert.match(probe, /sys\.version, sys\.executable/);
+    assert.match(probe, /tomllib\.__file__/);
+    assert.match(probe, /if sys\.version_info\[:2\] != \(3, 12\) or tomllib\.loads\(/);
+    assert.match(probe, /raise SystemExit\(/);
+    assert.ok(job.indexOf(setup) < job.indexOf(probe));
+    assert.ok(job.indexOf(probe) < job.indexOf(consumer));
+    if (admitted) assert.ok(job.indexOf('ci_apple.py admit') >= 0 &&
+      job.indexOf('ci_apple.py admit') < job.indexOf(setup));
+  };
+  for (const [text, name, consumer, admitted] of [
+    [risk, 'classify', 'run: bash scripts/gate-node-test.sh', false],
+    [apple, 'component', 'run: python3 -B scripts/mobile-core/ci_apple.py prepare', true],
+  ]) {
+    check(text, name, consumer, admitted);
+    for (const mutation of [
+      text.replace('actions/setup-python@v6', 'actions/setup-python-removed@v6'),
+      text.replace("python-version: '3.12'", "python-version: '3.10'"),
+      text.replace('uses: actions/setup-python@v6', 'if: false\n        uses: actions/setup-python@v6'),
+      text.replace('name: Verify Python and Cargo configuration parser',
+        'continue-on-error: true\n        name: Verify Python and Cargo configuration parser'),
+      text.replace('import sys, tomllib', 'import sys'),
+      text.replace('if sys.version_info[:2] != (3, 12)', 'if False'),
+      text.replace('raise SystemExit(', 'print('),
+    ]) {
+      assert.notEqual(mutation, text);
+      assert.throws(() => check(mutation, name, consumer, admitted));
+    }
+  }
+  const moved = apple.replace('      - uses: actions/setup-python@v6',
+    '      - name: premature Cargo parsing\n        run: python3 -B scripts/mobile-core/ci_apple.py prepare\n      - uses: actions/setup-python@v6');
+  assert.throws(() => check(moved, 'component', 'run: python3 -B scripts/mobile-core/ci_apple.py prepare', true));
+});
+
 test('shared failure builds no carriers; optional simulator requires safe device retirement, not device success', () => {
   const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
   const blocks = workflow.split(/^ {6}- /m).slice(1);

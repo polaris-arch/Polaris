@@ -93,6 +93,19 @@ jobs:
           ref: ${{ inputs.candidate || github.sha }}
       - name: Reject a mismatched runner before installing tools or transporting inputs
         run: python3 -B scripts/mobile-core/ci_apple.py admit
+      # tomllib is standard-library only on Python 3.11+; never inherit runner defaults.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify Python and Cargo configuration parser
+        run: |
+          python3 - <<'PYTHON'
+          import sys, tomllib
+          print('Apple evidence Python:', sys.version, sys.executable)
+          print('Cargo configuration parser:', tomllib.__file__)
+          if sys.version_info[:2] != (3, 12) or tomllib.loads('[profile.release]\nopt-level=3')['profile']['release']['opt-level'] != 3:
+              raise SystemExit('Python 3.12 with working standard-library tomllib is required')
+          PYTHON
       - name: Select the validated mobile Go toolchain
         id: mobile-go
         run: |

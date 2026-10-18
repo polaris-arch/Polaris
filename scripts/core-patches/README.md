@@ -159,6 +159,10 @@ authentication by itself.
 
 Light verification (no sing-box build or execution):
 
+The complete gate includes Apple execution-input tests and requires Python 3.11+
+with standard-library `tomllib` (Release Risk selects and verifies Python 3.12).
+This does not change the historical producer requirements above.
+
 ```sh
 bash scripts/gate-node-test.sh
 POLARIS_REAL_GO_BUILDINFO_TEST=1 POLARIS_BUILDINFO_GO=/path/to/pinned/go node --test \
