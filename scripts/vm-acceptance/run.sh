@@ -26,6 +26,7 @@ set -u
 
 SCEN=${1:?缺场景名}
 OBS=${2:?缺观测秒数}
+[[ "$OBS" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: OBS 必须为正整数"; exit 2; }
 GRAPHICS=${GRAPHICS:-escape}
 case "$GRAPHICS" in
   escape|default) ;;
@@ -33,7 +34,9 @@ case "$GRAPHICS" in
 esac
 APPDIR=/root/.config/com.polaris.app/polaris
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=/var/tmp/polaris-acceptance/$SCEN
+# Validate the shared finite scenario registry before any filesystem mutation.
+python3 "$HERE/scenario.py" --validate "$SCEN" || exit 2
+OUT=$(python3 "$HERE/scenario.py" --prepare-output "$SCEN") || exit 2
 WARMUP=75          # > 实测 60s 首帧，留余量
 # 每轮用**独占**的 display：复用上一轮的 Xvfb 会继承上一轮的 timeout 预算，
 # 那个预算短于本轮时，X server 到期 ⇒ 应用失去 X 连接跟着死 ⇒ 观测窗被悄悄截断，
@@ -41,7 +44,7 @@ WARMUP=75          # > 实测 60s 首帧，留余量
 DISP=$((90 + RANDOM % 60))
 export DISPLAY=:$DISP HOME=/root
 
-rm -rf "$OUT"; mkdir -p "$OUT"
+# Fresh run directory; never delete previous evidence.
 
 # ── 配置：补丁而非重建，保留默认配置的全部 57 个键 ──
 python3 "$HERE/scenario.py" "$SCEN" < "$APPDIR/config.json" > "$OUT/config.json" || exit 1
@@ -64,32 +67,68 @@ else
   GFX_ENV=()
 fi
 printf 'graphics=%s\nenv=%s\n' "$GRAPHICS" "${GFX_ENV[*]:-<none>}" > "$OUT/graphics.txt"
+monotonic() { python3 -c 'import time; print(time.monotonic())'; }
+app_identity() {
+  python3 - "$OUT/app.pid" <<'PYID'
+import pathlib, sys
+try:
+    pid = int(pathlib.Path(sys.argv[1]).read_text())
+    fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    if fields[0] not in ("Z", "X"):
+        print(f"{pid}:{fields[19]}")  # starttime, not just a reusable PID
+except (OSError, ValueError, IndexError):
+    pass
+PYID
+}
 # `${a[@]+"${a[@]}"}`：bash < 4.4 在 `set -u` 下展开空数组会报 unbound，VM 的 bash 版本不由本仓决定。
 env ${GFX_ENV[@]+"${GFX_ENV[@]}"} \
-  timeout $((WARMUP + OBS)) /usr/bin/polaris > "$OUT/stdout.log" 2>&1 &
+  timeout $((WARMUP + OBS + 45)) bash -c 'echo $$ > "$1"; exec /usr/bin/polaris' _ "$OUT/app.pid" > "$OUT/stdout.log" 2>&1 &
 APP=$!
+for _ in $(seq 1 100); do [ -s "$OUT/app.pid" ] && break; sleep 0.05; done
+IDENTITY=$(app_identity)
+START=$(monotonic)
+COMPLETED=false
+FINAL_IDENTITY=""
+END=$START
 
 echo "场景=$SCEN 图形腿=$GRAPHICS 预热=${WARMUP}s 观测=${OBS}s 起于 $(date -Is)"
 : > "$OUT/timeline.tsv"
-printf 't\twebproc\twindow\tcolors\tlog_lines\n' >> "$OUT/timeline.tsv"
+printf 't\twebproc\twindow\tcolors\tlog_lines\tidentity\n' >> "$OUT/timeline.tsv"
 
-t=0
-while [ $t -lt $((WARMUP + OBS)) ]; do
-  sleep 15; t=$((t + 15))
-  [ -d /proc/$APP ] || { echo "应用在 t=${t}s 退出"; break; }
-  # pgrep -c 无匹配时**既打印 0 又退非零** ⇒ `|| echo 0` 会追加第二个 0 把 TSV 撑成两行。
+while true; do
+  sleep 15
+  NOW=$(monotonic)
+  t=$(python3 -c 'import sys; print(float(sys.argv[1])-float(sys.argv[2]))' "$NOW" "$START")
+  CURRENT=$(app_identity)
+  [ -n "$IDENTITY" ] && [ "$CURRENT" = "$IDENTITY" ] || { echo "应用在 t=${t}s 退出或身份改变"; break; }
   wp=$(pgrep -c -f WebKitWebProcess 2>/dev/null); wp=${wp:-0}
   win=$(xwininfo -root -tree 2>/dev/null | grep -oE '"Polaris":.*' | grep -oE '[0-9]+x[0-9]+\+[0-9-]+\+[0-9-]+' | head -1)
-  import -window root "$OUT/t${t}.png" 2>/dev/null
+  import -window root "$OUT/t${t}.png" 2>/dev/null || break
   col=$(identify -format '%k' "$OUT/t${t}.png" 2>/dev/null)
   ll=$(wc -l < "$APPDIR/logs/polaris.log")
-  printf '%s\t%s\t%s\t%s\t%s\n' "$t" "$wp" "${win:-none}" "${col:-0}" "$ll" >> "$OUT/timeline.tsv"
-  # 首帧之前的截图恒为纯色（占位窗 10x10），不是故障 —— 见 WARMUP 注释。
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$t" "$wp" "${win:-none}" "${col:-0}" "$ll" "$CURRENT" >> "$OUT/timeline.tsv"
+  END=$(monotonic)
+  FINAL_IDENTITY=$(app_identity)
+  [ "$FINAL_IDENTITY" = "$IDENTITY" ] || break
+  if python3 -c 'import sys; sys.exit(float(sys.argv[1]) < int(sys.argv[2])+int(sys.argv[3]))' "$t" "$WARMUP" "$OBS"; then
+    COMPLETED=true
+    break
+  fi
 done
 
 wait $APP 2>/dev/null
 cp "$APPDIR/logs/polaris.log" "$OUT/polaris.log" 2>/dev/null
 cp "$APPDIR/logs/singbox.log" "$OUT/singbox.log" 2>/dev/null
+python3 - "$OUT" "$START" "$END" "$WARMUP" "$OBS" "$IDENTITY" "$FINAL_IDENTITY" "$COMPLETED" <<'PYRECORD'
+import hashlib, json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+record = dict(start=float(sys.argv[2]), end=float(sys.argv[3]), warmup=int(sys.argv[4]),
+              requested=int(sys.argv[5]), identity=sys.argv[6], final_identity=sys.argv[7],
+              completed=sys.argv[8] == "true")
+record["sha256"] = {name: hashlib.sha256((out / name).read_bytes()).hexdigest()
+                    for name in ("polaris.log", "timeline.tsv")}
+(out / "observation.json").write_text(json.dumps(record) + "\n")
+PYRECORD
 # ── G0 自曝闸：配置被校验拒掉会**静默回落默认配置**，场景根本没应用而日志一切正常。
 # 这是「自动化必须让『没执行』自曝」那条要防的形态，故做成硬失败而不是让人去日志里找。
 if grep -q "config validation failed\|config load fallback" "$APPDIR/logs/polaris.log"; then
@@ -109,9 +148,8 @@ if grep -q "sing-box 已就绪" "$APPDIR/logs/polaris.log"; then G1=ok; else
   G1=fail
 fi
 # ── G2 自曝闸：观测窗被截断（应用没活满）⇒ 任何「N 秒内没发生 X」的结论都不成立。
-LIVED=$(($(ls "$OUT"/t*.png 2>/dev/null | wc -l) * 15))
-if [ $LIVED -lt $((WARMUP + OBS - 15)) ]; then
-  echo "G2 FAIL: 应用只活了约 ${LIVED}s（预期 $((WARMUP + OBS))s）⇒ 观测窗被截断，禁止据此下「未发生」结论"
+if [ "$COMPLETED" != true ]; then
+  echo "G2 FAIL: 观测窗或进程身份不完整"
   G2=fail
 else
   G2=ok
@@ -137,3 +175,7 @@ echo "=== 证据包 $OUT ==="
 cat "$OUT/timeline.tsv"
 echo "--- polaris.log ($(wc -l < "$OUT/polaris.log") 行) ---"
 cat "$OUT/polaris.log"
+
+# A printed gate is not a result: the same consumer owns the final exit status.
+python3 "$HERE/assert.py" "$OUT"
+exit $?

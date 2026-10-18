@@ -21,10 +21,10 @@
  * 产物落 `docs/screenshots/<name>.png`。需要先 `cd ui && npx vite build`。
  */
 import { createServer } from 'node:http';
-import { readFile, mkdir } from 'node:fs/promises';
+import { readFile, mkdir, realpath, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { extname, join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { extname, join, dirname, resolve, relative, isAbsolute } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -35,7 +35,7 @@ const PORT = 4731;
 // playwright 是 `ui/` 的 devDep，本脚本在仓根跑 ⇒ ESM 解析不到。从 ui 的 node_modules 显式解析，
 // 而不是把脚本挪进 ui/（它产出的是仓库文档资产，不属于前端构建）。
 const require_ = createRequire(join(ROOT, 'ui/package.json'));
-const { chromium } = require_('@playwright/test');
+
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -85,13 +85,29 @@ const SHOTS = [
   { name: 'settings', nav: '设置' },
 ];
 
-function serve() {
-  return new Promise((ok) => {
+export async function screenshotFile(dist, rawUrl) {
+  // Decode before resolving; URL() would normalize away raw dot segments.
+  const pathname = decodeURIComponent((rawUrl || '/').split('?')[0]);
+  if (!pathname.startsWith('/') || pathname.includes('\\') || pathname.includes('\0') ||
+      pathname.split('/').includes('..')) throw new Error('invalid asset path');
+  const root = await realpath(dist);
+  const inside = (path) => { const rel = relative(root, path); return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(rel); };
+  let file = resolve(root, `.${pathname === '/' ? '/index.html' : pathname}`);
+  if (!inside(file)) throw new Error('asset outside dist');
+  try { file = await realpath(file); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    file = await realpath(join(root, 'index.html')); // SPA fallback still passes containment/type checks.
+  }
+  if (!inside(file) || !(await stat(file)).isFile()) throw new Error('invalid asset file');
+  return file;
+}
+
+export function serve(dist = DIST, port = PORT) {
+  return new Promise((ok, reject) => {
     const s = createServer(async (req, res) => {
-      const url = (req.url || '/').split('?')[0];
-      let file = join(DIST, url === '/' ? 'index.html' : url);
-      if (!existsSync(file)) file = join(DIST, 'index.html'); // SPA 回落
       try {
+        const file = await screenshotFile(dist, req.url);
         const buf = await readFile(file);
         res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
         res.end(buf);
@@ -99,7 +115,8 @@ function serve() {
         res.writeHead(404).end();
       }
     });
-    s.listen(PORT, () => ok(s));
+    s.once('error', reject);
+    s.listen(port, '127.0.0.1', () => ok(s));
   });
 }
 
@@ -116,6 +133,7 @@ const initScript = (stub) => `
 `;
 
 async function main() {
+  const { chromium } = require_('@playwright/test');
   if (!existsSync(DIST)) {
     console.error(`缺 ${DIST} —— 先跑 \`cd ui && npx vite build\``);
     process.exit(2);
@@ -170,4 +188,4 @@ async function main() {
   if (failed) process.exit(1);
 }
 
-main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();

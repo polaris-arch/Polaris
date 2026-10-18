@@ -1,17 +1,44 @@
 name: CI
 
-# B0 验证门禁：Rust 单链（fmt + clippy + build + test），无 Go 工具链（§D.1 day-1 全 Rust）。
+# B0 验证门禁：Rust 链（fmt + clippy + rustdoc + 跨目标检查 + build + test）。
+# Go verifies the committed desktop default or an explicit manual candidate on each actual test host.
 # 职责 = 「改动是否正确」，快速反馈。打包（出安装包）拆到 package.yml（B10 发布工程批补）。
+#
+# ── 并行拓扑（2026-10-07）：一条串行链拆成三个并行 job ──
+#   · `lint`  （矩阵）fmt + clippy；Linux 腿另跑 rustdoc 与 Cronet 来源解析
+#   · `cross` （仅 ubuntu）四个交叉 target 的 clippy + 随仓路径源零诊断 + Android 影响面 dep-info 对差
+#     + 豁免反腐烂
+#   · `test`  （矩阵）build + test
+# 拆之前 ubuntu 单腿实测（run 37642138266）：缓存 52s、clippy 66s、rustdoc 105s、Build 150s、
+# Cross-check 120s，再加 dep-info 对差与 `cargo test --workspace`，全部串行，墙钟 10 分钟以上；
+# 排在最后的 test 要等前面全部跑完才开始，前面任何一步红了它就**一次都不跑**（上面那次 run
+# 正是这样：Cross-check 红 ⇒ Test skipped，一次 run 只看得见第一个失败）。
+#
+# 为什么拆开不损失编译复用（判据是 cargo 的指纹，不是直觉）：clippy（经 clippy-driver wrapper，
+# 只出 metadata）、交叉 target 的 check 单元（各在 `target/<triple>/` 下）、build/test（dev 构型
+# 全量 codegen）三类产物的指纹本来就互不共享 —— 串在一个 job 里时它们也是各编各的，只是排着队。
+# 真正共享产物的两对仍放在同一个 job：Build 与 Test（同一批 rlib）、交叉 clippy 与紧随的
+# android `cargo check`（同一批 android check 单元）。
+#
+# 代价（如实记）：
+#   · 每个 job 各付一次环境准备（checkout / Node / rustup / 缓存恢复 / apt / protoc，ubuntu 约 1.5–2 分钟），
+#     总 runner 分钟数上升；公开仓标准 runner 不计额度，换的是墙钟。
+#   · Rust 缓存由一份变三份（键各自独立，见各 job 的 `Setup Rust cache`）。仓库缓存总额度有上限，
+#     超出后按最久未用淘汰；若观察到缓存频繁 miss，先查这里。
+#   · 全矩阵事件下 windows / macos 各起两个 job（lint、test），两边都要冷编同一批 C 依赖。
 #
 # ── 反馈架构（2026-08-26 按公开仓实况更新）──
 #    标准 GitHub-hosted runner 对公开仓不计分钟额度；仍需控制等待、并发与无信息量重跑。
 #    此前每次 push main = 3-OS CI + 4 平台 Package 并行，反馈噪声与 artifact 体积都过高。
-#   · push main（调试热路径）：只跑 ubuntu-22.04 单腿 —— 最便宜、最快反馈；
+#   · push main（调试热路径）：矩阵 job 只跑 ubuntu-22.04 一条腿 —— 最便宜、最快反馈；
 #   · pull_request / workflow_dispatch / 被 package.yml workflow_call（发布）：完整 3-OS 矩阵；
 #   · 发布质量不降级：tag 发布经 package.yml 的 `ci` gate job 调回本 workflow 跑满 3-OS，
 #     CI 不绿不发布（见 package.yml jobs.release）。2026-09-04 起打包腿与本门**并行**开跑：
 #     门拦的是 release job，不是 package job —— 门红时安装包会被构建出来但发不出去。
-# main 应开 ruleset，把三平台本 job、UI 与 release risk gate 设为 required checks。
+# main 应开 ruleset，把本 workflow 的 `fmt + clippy (<os>)`、`build + test (<os>)` 三平台各一条与
+# `cross-target clippy + android face`，连同 UI 与 release risk gate 设为 required checks。
+# ⚠️ 2026-10-07 拆分改了 check 名（原 `fmt + clippy + test (<os>)` 不再存在）：已按旧名配过
+#    required checks 的话必须同步改，否则那条 check 永远 Pending。
 on:
   push:
     branches: [main]
@@ -37,6 +64,31 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      native_dns_candidate:
+        description: 'Optional exact App SHA on the fixed native-DNS branch; validation only'
+        type: string
+        default: ''
+      windows_system_candidate:
+        description: 'Explicit final App SHA for approved fresh/prebuilt-user SYSTEM checks on this hosted Windows runner'
+        type: string
+        default: ''
+      windows_launcher_diagnostics:
+        description: 'Fixed-branch Windows launcher diagnosis only; never satisfies full PR gates'
+        type: boolean
+        default: false
+      windows_directory_mode:
+        description: 'Windows directory acceptance: formal or exact candidate; release contract unchanged'
+        type: choice
+        default: formal
+        options: [formal, candidate]
+      windows_directory_candidate_source:
+        description: 'Candidate mode only: exact lowercase 40-hex kernel source commit'
+        type: string
+        default: ''
+      preserve_run:
+        description: '保留固定源码审计运行；不被后续普通手动运行取消'
+        type: boolean
+        default: false
       os:
         # 单平台确认专用（2026-08-05）：要回答的是「**这一个**平台还能不能编/跑」时，另外两条腿
         # 不增加目标平台的信息且延长反馈。缺省仍是 `all`，不改任何既有语义。
@@ -53,19 +105,166 @@ on:
           - macos-14
   # 供 package.yml 复用作发布前置门（与打包并行跑，门不绿则 release job 不起），零重复定义。
   workflow_call:
+    inputs:
+      windows_system_candidate:
+        description: 'Explicit exact final App SHA forwarded by the complete manual Package campaign'
+        type: string
+        default: ''
+      native_dns_candidate:
+        description: 'Optional exact App SHA; the caller must pass the same strict manual CI context'
+        type: string
+        default: ''
+      preserve_run:
+        type: boolean
+        default: false
 
 # 同一 ref 上新跑取消在途旧跑。
 # 2026-07-31 把 main push 也纳入取消：连着推几笔时，被顶掉的旧 tip 没有消费者，照跑只会计费。
 # `workflow_call` 里的 `github.workflow` 取**调用方**名称（GitHub 官方语义），故把它纳入组：
 # 独立 CI 与 Package 内复用的 CI 门互不取消；同一调用方/ref 的旧跑仍会被新跑顶掉。
 # tag ref 是 refs/tags/*，走不进下面的 cancel 条件。
+# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 jobs:
-  lint-and-test:
-    name: fmt + clippy + test (${{ matrix.os }})
+  cheap_format:
+    # Only an explicit manual diagnostic selection skips the ordinary gate DAG.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
+    name: Cheap Rust formatting gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      native_dns_candidate: ${{ steps.native_dns_admission.outputs.candidate }}
+      native_dns_default: ${{ steps.native_dns_admission.outputs.temporary_default }}
+      native_dns_formal: ${{ steps.native_dns_admission.outputs.formal_default }}
+      native_dns_formal_app: ${{ steps.native_dns_admission.outputs.formal_app }}
+      candidate_mode: ${{ steps.pr_candidate.outputs.mode }}
+      candidate_source: ${{ steps.pr_candidate.outputs.source }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup candidate admission Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Admit exact final candidate SYSTEM request
+        shell: bash
+        env:
+          SYSTEM_CANDIDATE: ${{ inputs.windows_system_candidate || '' }}
+          SYSTEM_OS: ${{ inputs.os || 'all' }}
+          SYSTEM_MODE: ${{ inputs.windows_directory_mode || 'formal' }}
+          SYSTEM_DIAGNOSTIC: ${{ inputs.windows_launcher_diagnostics && 'true' || 'false' }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const e = process.env;
+          if (e.SYSTEM_CANDIDATE !== '') {
+            if (e.GITHUB_EVENT_NAME !== 'workflow_dispatch' || e.GITHUB_REPOSITORY !== 'polaris-arch/Polaris'
+                || !['refs/heads/main', 'refs/heads/ci/governance'].includes(e.GITHUB_REF)
+                || !/^[0-9a-f]{40}$/.test(e.SYSTEM_CANDIDATE) || e.SYSTEM_CANDIDATE !== e.GITHUB_SHA
+                || !['all', 'windows-2022'].includes(e.SYSTEM_OS) || e.SYSTEM_MODE !== 'formal'
+                || e.SYSTEM_DIAGNOSTIC !== 'false'
+                || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== e.SYSTEM_CANDIDATE)
+              throw Error('SYSTEM acceptance requires an explicit exact final App SHA, formal source and hosted Windows scope');
+          }
+          NODE
+      - name: Admit explicit native DNS ordinary CI selection
+        id: native_dns_admission
+        shell: bash
+        env:
+          NATIVE_DNS_INPUT: ${{ inputs.native_dns_candidate || '' }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './scripts/desktop-core/native-dns-candidate.mjs';
+          import { loadFormalGateSelection, formalGateContext } from './scripts/desktop-core/native-dns-gates.mjs';
+          const e = process.env;
+          for (const key of ['CORE_CANDIDATE', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_FORMAL'])
+            if (Object.hasOwn(e, key)) throw Error(`Candidate environment must not precede admission: ${key}`);
+          if (e.NATIVE_DNS_INPUT !== '') {
+            if (Object.hasOwn(e, 'POLARIS_SINGBOX_PATH')) throw Error('Candidate lifecycle must not inherit a core path override');
+            const context = candidateContext(e.NATIVE_DNS_INPUT,
+              { ...e, CORE_CANDIDATE: e.NATIVE_DNS_INPUT, POLARIS_NATIVE_DNS_CANDIDATE: '1' }, process.cwd());
+            const binding = loadCandidate(process.cwd());
+            if (binding.sourcePolicy.goVersion !== '1.27.2') throw Error('Reviewed candidate Go version differs');
+            appendFileSync(e.GITHUB_OUTPUT, `candidate=${context.candidate}\n`);
+          } else {
+            const manifest = JSON.parse(readFileSync('src-tauri/core-manifest.json', 'utf8'));
+            if (hasTemporaryDesktop(manifest)) {
+              if (Object.hasOwn(e, 'POLARIS_SINGBOX_PATH')) throw Error('Default lifecycle must not inherit a core path override');
+              loadTemporaryDesktopSelection(process.cwd(), manifest);
+              selectedCandidateContext(process.cwd(), e);
+              appendFileSync(e.GITHUB_OUTPUT, 'temporary_default=true\n');
+            } else if (loadFormalGateSelection(process.cwd(), manifest)) {
+              const context = formalGateContext(process.cwd(), e);
+              appendFileSync(e.GITHUB_OUTPUT, `formal_default=true\nformal_app=${context.candidate}\n`);
+            }
+          }
+          NODE
+      - name: Read explicit reviewed batch PR candidate before native compilation
+        if: >-
+          ${{ github.event_name == 'pull_request'
+              && github.repository == 'polaris-arch/Polaris'
+              && github.event.pull_request.head.repo.full_name == github.repository
+              && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                  || (github.event.pull_request.number == 15
+                      && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018')) }}
+        id: pr_candidate
+        shell: bash
+        run: |
+          python3 - <<'PYCANDIDATE'
+          import json, os, re
+          from pathlib import Path
+          data = json.loads(Path('scripts/windows-directory/candidate-source.json').read_text())
+          if (not isinstance(data, dict)
+              or data.get('schema') != 'polaris-windows-directory-candidate-v1'
+              or data.get('repository') != 'polaris-arch/sing-box-polaris'
+              or not isinstance(data.get('sourceCommit'), str)
+              or not re.fullmatch(r'[0-9a-f]{40}', data['sourceCommit'])
+              or data['sourceCommit'] != '68ffb209ded1f9337f9115741cba24f9f4c63421'):
+              raise SystemExit('Missing or invalid explicit batch PR candidate source')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('mode=candidate\nsource=' + data['sourceCommit'] + '\n')
+          PYCANDIDATE
+      - name: Install existing Rust formatting toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+          rustc -Vv
+          cargo fmt --version
+      - name: Check workspace formatting before native compilation
+        run: cargo fmt --all -- --check
+
+  native_dns_candidate_gates:
+    needs: cheap_format
+    # Local reuse selects this same App commit, including before the new workflow is on main.
+    # Manual diagnostics retain their fixed context. Committed formal defaults use
+    # the same caller/App SHA and four-host gate plan without a second dispatch.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+          && github.workflow_ref == 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/collab/native-node-dns-20261018'
+          && inputs.native_dns_candidate != ''
+          && needs.cheap_format.outputs.native_dns_candidate == inputs.native_dns_candidate
+          || needs.cheap_format.outputs.native_dns_formal == 'true' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/native-dns-candidate.yml
+    with:
+      candidate: ${{ needs.cheap_format.outputs.native_dns_candidate || needs.cheap_format.outputs.native_dns_formal_app }}
+      formal_release: ${{ needs.cheap_format.outputs.native_dns_formal == 'true' }}
+
+  # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══
+  lint:
+    needs: cheap_format
+    name: fmt + clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       # 为什么不改成 fail-fast: true 缩短失败反馈（2026-07-31 复核，**这条别优化掉**）：
@@ -134,7 +333,7 @@ jobs:
       #     漏掉会静默改变增量编译行为与缓存体积，属于「删掉也不报错」的那类回归，故必须带上
       #   · CARGO_TERM_COLOR=always（仅当未设置）
       #   · 打印 `rustc -Vv`
-      # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓两处 rust-cache 都没引用）、
+      # 确认无消费者、故意不复刻的三项：`cachekey` output（本仓各处 rust-cache 都没引用）、
       # 显式导出 `CARGO_HOME`（不设时 rust-cache 自己回落到同一个 ~/.cargo）、
       # 「rustup 缺失就下载安装」（三镜像都自带；真缺了应该红，不该静默补装掩盖镜像变更）。
       #
@@ -152,8 +351,15 @@ jobs:
           cargo fmt --version
           cargo clippy --version
 
+      # 三个 job 的缓存键各自独立（`key` 追加在 rust-cache 的默认键之后），互不恢复、互不覆盖：
+      # 三者的 `target/` 内容不同（clippy metadata / 交叉 target 的 check 单元 / dev 全量 codegen），
+      # 共用一个键时谁最后跑完谁覆盖，另外两个 job 下次恢复到的就是别人的产物 —— 等于次次冷编。
+      # 显式写键而不依赖默认键里的 job id：本 workflow 还会被 package.yml 以 workflow_call 复用，
+      # 键里只留本文件自己写下的字面量，才谈得上稳定。
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
 
       # 原生构建前置：protoc（singbox-grpc build.rs 三平台都要）、Windows NASM（喂 btls-sys
       # 的 BoringSSL 汇编；曾名 boring-sys2，grep "boring" 会扑空——2026-08-18 探针实测移除本步
@@ -163,7 +369,8 @@ jobs:
       #
       # ── protoc：钉扎常量与版本依据的唯一真值在 scripts/fetch-protoc.mjs（2026-08-18，CI-4）──
       # 此前「固定版本 + 四平台 URL + sha256」在本文件与 package.yml 各内联一份、靠对拍测试防漂；
-      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联两份，对拍照旧）。
+      # 收敛到脚本后只剩一处，对拍测试的 protoc 部分随之退休（NASM 仍内联：本文件 lint / test 两个
+      # job 各一份 + package.yml 一份，三份对拍照旧）。
       # 版本为什么是 35.1、为什么升版本零行为差、sha256 从哪来、被替掉的 arduino/setup-protoc@v3
       # 两个外部失效点 —— 全部在脚本头注，改版本先读它。sha 校验走 node createHash、解压走
       # lib/extract-zip.mjs（三平台 CI 已绿），与 shell 是 bash 还是 pwsh 彻底解耦。
@@ -176,7 +383,7 @@ jobs:
       # `github.com/ilammy/setup-nasm/raw/mirror/...` 取 nasm-<ver>-win64.zip（取不到再退 www.nasm.us）、
       # 解出 nasm.exe/ndisasm.exe、addPath —— **全程零校验**（一个 hash 都没有）。
       # 版本取 nasm.us 官方 releasebuilds 当前最新稳定版 3.02；实际下载 win64 zip 后计算 sha256，
-      # 与 package.yml 同常量对拍。
+      # 与本文件 test job、package.yml 的同名步同常量对拍。
       # 代价说清楚：镜像那条腿去掉了，现在只有 www.nasm.us 一个源（本机实测那个 GitHub 镜像
       # 当时正好也在 429，拿不到字节 ⇒ 无法核对它的 sha256，不写未验证的常量进来）。
       # curl 带重试兜瞬时抖动；真下不来会红，不会静默跳过。
@@ -285,8 +492,86 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links"
         run: cargo doc --no-deps --workspace --bins --lib --document-private-items
 
-      - name: Build
-        run: cargo build --workspace --verbose
+  # ══ 检查类之二：交叉 target clippy + Android 影响面 dep-info 对差 + 豁免反腐烂（仅 ubuntu）══
+  #
+  # 这三步原本以 `if: runner.os == 'Linux'` 挂在矩阵 job 的 ubuntu 腿上；独立成 job 后直接钉
+  # `runs-on: ubuntu-22.04`，步级的 Linux 条件随之去掉（在这里它恒真，留着只是噪声）。
+  #
+  # job 级 `if` 只为保住手动 dispatch 的单平台语义（见上方 `on.workflow_dispatch.inputs.os`）：
+  # 选了 windows-2022 / macos-14 时，原先这三步因 `runner.os != 'Linux'` 不跑，现在等价地整个
+  # job 不起。其余一切入口（push / PR / merge queue / package.yml 的 workflow_call / dispatch 选
+  # all 或 ubuntu-22.04）本条件恒真。`os != ''` 那一项与矩阵表达式同源：package.yml 的
+  # workflow_dispatch 经 workflow_call 传进来的 payload 没有 `os`，空串必须落到「跑」这一侧。
+  # 判据由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 逐入口求值钉住（含反向对照）。
+  cross:
+    needs: cheap_format
+    name: cross-target clippy + android face
+    if: >-
+      !(github.event_name == 'workflow_dispatch'
+        && github.event.inputs.os != ''
+        && github.event.inputs.os != 'all'
+        && github.event.inputs.os != 'ubuntu-22.04')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # 与 lint job 同口径钉 Node 26；本 job 的 dep-info 对差步要跑 `scripts/check-android-only-face.mjs`。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # 判据与逐条理由见 lint job 同名步上方那段。本 job 只要 clippy 这一个组件（不跑 fmt）。
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal \
+            --component clippy --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+          cargo clippy --version
+
+      # 键独立的理由见 lint job 同名步。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cross
+
+      # protoc：singbox-grpc 的 build.rs 在每个 target 上都要它。钉扎真值与版本依据见 lint job 同名步。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      # 断言的理由见 lint job 同名步：安装步静默 no-op 时，这里因 `set -u` 取不到期望值而直接红。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+
+      # 交叉 target 那几格用不到 webkit/gtk；要它的是 dep-info 对差步的 **host 侧**
+      # `cargo check --workspace`（含 src-tauri，Linux 上经 Tauri 拉进 webkit/gtk 的 -sys crate）。
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。本 job 两处会编到
+      # src-tauri（android 上的 `cargo check -p polaris` 与 dep-info 对差的两侧）。
+      - name: Create resource placeholder dirs (tauri build.rs 路径校验)
+        shell: bash
+        run: |
+          for d in dashboard linux win mac-arm64 mac-x64; do
+            mkdir -p "resources/$d" && touch "resources/$d/.keep"
+          done
 
       # 平台特定代码在 Linux 腿上的**唯一**检出通道（2026-08-09 新增）。
       #
@@ -317,15 +602,21 @@ jobs:
       # 剩下的全是纯 Rust；android 这边我们**要**覆盖 wreq 那条 C 依赖链，所以真的需要一套工具链。
       #
       # 🔴 **不写 GITHUB_PATH**：NDK 的 bin 目录里有 `clang` / `ld.lld` / `llvm-*`，进了 job 级 PATH
-      #    会影响同 job 后面 Build / Test 两步的**宿主**编译。只导出目录，由用它的两步各自局部前置。
+      #    会影响同 job 后面 dep-info 对差步里 **host 侧** `cargo check --workspace` 的宿主编译。
+      #    只导出目录，由用它的几步各自局部前置。
       - name: Resolve Android NDK
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          ndk="${ANDROID_NDK_LATEST_HOME:-}"
-          [ -n "$ndk" ] || {
-            echo "::error::runner 未暴露预装 NDK（ANDROID_NDK_LATEST_HOME）—— 镜像变了；"
+          # 🔴 不取镜像的「最新 NDK」：2026-10 镜像把它换成 NDK 30 稳定版，`btls-sys` 的 bindgen 同样炸在
+          #    `Unversioned target triples are not supported`。与 android.yml 共用同一份已验版本，缺则安装。
+          ndk_version="$(cat scripts/android-rust-ndk.version)"
+          ndk="${ANDROID_HOME:-}/ndk/$ndk_version"
+          if [ ! -f "$ndk/source.properties" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
+          fi
+          [ -f "$ndk/source.properties" ] || {
+            echo "::error::Android NDK 未安装：$ndk"
             echo "::error::Cross-check 的 aarch64-linux-android 腿要它编 zstd-sys / btls-sys，先确认再改本步"
             exit 1; }
           bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -348,7 +639,6 @@ jobs:
           echo "NDK: $ndk"
 
       - name: Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -433,6 +723,19 @@ jobs:
           #    是另外 17 个纯 Rust 包的 iOS 编译面，别把它读成「整仓 iOS 面已验」。
           PATH="$ANDROID_NDK_BIN:$PATH" cargo check --target aarch64-linux-android -p polaris
 
+      # ── 随仓第三方副本（`[patch]` 的路径源）不在上一步的派生清单里（2026-10-08）──
+      #
+      # 上一步的覆盖面取自 workspace 成员；`vendor/` 下的路径源不是成员，却同样不享受 Cargo 给
+      # 注册表依赖的 lint 上限 —— 原生腿的 `RUSTFLAGS="-D warnings"` 会直接审它。实证（run
+      # 37760266821）：`vendor/swift-rs` 在 macos-14 的 clippy 步红了两条上游原文里的 lint，而它只在
+      # macOS 宿主的构建依赖与 iOS 目标的依赖图里，Linux 腿此前一行都编不到。
+      #
+      # 判据、对象怎么派生、射程与已知上限（`build` 特性那一段这里编不到）全在脚本头注，本处不复述。
+      # 目标清单与上一步逐字相同：两处、连同 scripts/gate-rust.sh 的镜像，由
+      # scripts/gate-rust-ci-parity.test.mjs 对拍。排在上一步之后，是因为目标由上一步 `rustup target add`。
+      - name: Vendored path sources stay diagnostic-free
+        run: bash scripts/check-vendored-path-sources.sh x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-linux-android aarch64-apple-ios
+
       # ── Android 影响面的**产物级**完备性门（2026-09-05）──
       #
       # `ANDROID_IMPACT_SCOPES`（scripts/classify-ci-impact.mjs）是 `android.yml` 的**唯一**触发面，
@@ -447,7 +750,8 @@ jobs:
       # rustc 解析的是真模块图，字符串里的文本结构上就进不来）。射程与已知上限见那个脚本的头注。
       #
       # 🔴 两侧选择器必须**逐字对称**，都是 `cargo check --workspace`（lib + bins）：
-      #  · 不能拿上面的 `cargo clippy --workspace --all-targets` 当 host 侧省钱（那是零额外编译）——
+      #  · 不能拿 lint job 的 `cargo clippy --workspace --all-targets` 的编译面当 host 侧（那看上去
+      #    是现成的一份 host 编译面）——
       #    host 侧一旦更宽，`#[cfg(any(target_os = "android", test))]` 的文件会同时落进 host 的 test
       #    单元、从差集里掉出去，方向是 **fail-open**（门说全绿而实际漏了）。这个 pattern 仓里真的
       #    在用：`src-tauri/src/runtime/stats/source.rs` 的三个通道常量就是这么写的。
@@ -456,8 +760,9 @@ jobs:
       #
       # 成本：android 侧接近零 —— 上一步的 `cargo check --target aarch64-linux-android -p polaris`
       # 已把 20 个成员里 19 个的 check 单元编热，本步只多一个 `polaris-source-probe`。host 侧是本
-      # 方案**唯一**的实质代价：check 单元与本 job 已有的 clippy（走 clippy-driver wrapper）、
-      # build（出 rlib）、test（test 构型）指纹都不共享，是一趟真的增量编译。若哪天它进不了每个 PR
+      # 方案**唯一**的实质代价：check 单元与 lint job 的 clippy（走 clippy-driver wrapper）、test job
+      # 的 build（出 rlib）与 test（test 构型）指纹都不共享，是一趟真的编译（2026-10-07 拆成并行
+      # job 之前同样不共享，拆分没有让它变贵）。若哪天它进不了每个 PR
       # 的关键路径，退路是加 `github.event_name != 'pull_request'`（与下一步「豁免反腐烂」同一取舍）：
       # 代价是延迟到合入后一次 run 才发现，不是漏检。
       #
@@ -465,7 +770,6 @@ jobs:
       # **之前**产出的（rustc 对有类型错误的代码照样写出正确 `.d`），「.d 是对的」与「代码编得过」
       # 是两件事 —— 两条 cargo 的 rc 必须真的拦住这一步，故 errexit 全程有效。
       - name: Android impact face must be registered (dep-info 对差)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -477,7 +781,7 @@ jobs:
       # 只在非 PR 事件上跑：两个被豁免的包都在 build script 阶段就失败，成本低但不为零，
       # 而豁免腐烂最多延迟到合入后一次 run 被发现，不值得给每个 PR 加时。
       - name: Cross-target exemptions must still be necessary
-        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -uo pipefail
@@ -495,10 +799,768 @@ jobs:
           done
           exit $rot
 
+  # ══ 构建加测试类：build + test（矩阵）══
+  #
+  # 与 lint job 并行开跑：此前 Test 排在串行链的最后，前面任何一步红了它就不跑。
+  # Build 与 Test 留在同一个 job：`cargo test` 复用 `cargo build` 出的依赖 rlib，拆开就是编两遍。
+  test:
+    needs: cheap_format
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      # 维持 false 的理由见 lint job 的同名字段（那段别优化掉；两个矩阵 job 取同一判据）。
+      fail-fast: false
+      matrix:
+        # 与 lint job 的矩阵表达式**逐字相同**（事件条件矩阵 + dispatch 单平台分支，逐条理由写在那边）。
+        # 两份必须一起改：只改一份，同一事件下「lint 跑了哪些平台」与「test 跑了哪些平台」就分家了。
+        # 逐字相等由 `ui/src/contracts/package-ci-matrix-contract.test.ts` 钉住。
+        os: >-
+          ${{ (github.event_name == 'workflow_dispatch'
+              && github.event.inputs.os != ''
+              && github.event.inputs.os != 'all')
+              && fromJSON(format('["{0}"]', github.event.inputs.os))
+              || ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+                  && fromJSON('["ubuntu-22.04"]')
+                  || fromJSON('["ubuntu-22.04","windows-2022","macos-14"]')) }}
+
+    steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
+
+      - uses: actions/checkout@v7
+
+      # 与 lint job 同口径钉 Node 26（测试会读仓库脚本；不借 runner 镜像的浮动预装版本）。
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+
+      # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
+      - name: Windows installer cleanup fixtures (native PowerShell)
+        if: runner.os == 'Windows'
+        run: node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs
+
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+
+      - name: Activate admitted native DNS test inputs for the actual host
+        id: native_dns_host
+        shell: bash
+        env:
+          ADMITTED_CANDIDATE: ${{ needs.cheap_format.outputs.native_dns_candidate }}
+          ADMITTED_DEFAULT: ${{ needs.cheap_format.outputs.native_dns_default }}
+          ADMITTED_FORMAL: ${{ needs.cheap_format.outputs.native_dns_formal }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './scripts/desktop-core/native-dns-candidate.mjs';
+          import { TARGETS } from './scripts/desktop-core/native-dns-gates.mjs';
+          import { loadFormalGateSelection, formalGateContext } from './scripts/desktop-core/native-dns-gates.mjs';
+          import { releaseGoVersion } from './scripts/desktop-core/source-graph.mjs';
+          const e = process.env;
+          for (const key of ['CORE_CANDIDATE', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_FORMAL'])
+            if (Object.hasOwn(e, key)) throw Error(`Candidate environment must not precede admission: ${key}`);
+          const manifest = JSON.parse(readFileSync('src-tauri/core-manifest.json', 'utf8'));
+          const temporaryDefault = e.ADMITTED_DEFAULT === 'true';
+          const formalDefault = e.ADMITTED_FORMAL === 'true';
+          if (e.ADMITTED_FORMAL && !formalDefault) throw Error('Unknown admitted formal default');
+          const formalContract = loadFormalGateSelection(process.cwd(), manifest);
+          if (formalDefault && (temporaryDefault || e.ADMITTED_CANDIDATE !== '' || !formalContract))
+            throw Error('Committed formal default admission differs');
+          if (!formalDefault && e.ADMITTED_CANDIDATE === '' && formalContract)
+            throw Error('Committed formal default was not admitted');
+          if (e.ADMITTED_DEFAULT && !temporaryDefault) throw Error('Unknown admitted desktop default');
+          if (temporaryDefault && (e.ADMITTED_CANDIDATE !== '' || !hasTemporaryDesktop(manifest)))
+            throw Error('Committed desktop default admission differs');
+          if (!temporaryDefault && e.ADMITTED_CANDIDATE === '' && hasTemporaryDesktop(manifest))
+            throw Error('Committed desktop default was not admitted');
+          if (e.ADMITTED_CANDIDATE !== '' || temporaryDefault || formalDefault) {
+            if (Object.hasOwn(e, 'POLARIS_SINGBOX_PATH')) throw Error('Candidate lifecycle must not inherit a core path override');
+            if (temporaryDefault) loadTemporaryDesktopSelection(process.cwd(), manifest);
+            const context = formalDefault ? formalGateContext(process.cwd(), e)
+              : temporaryDefault ? selectedCandidateContext(process.cwd(), e)
+              : candidateContext(e.ADMITTED_CANDIDATE,
+                { ...e, CORE_CANDIDATE: e.ADMITTED_CANDIDATE, POLARIS_NATIVE_DNS_CANDIDATE: '1' }, process.cwd());
+            const binding = formalDefault ? formalContract : loadCandidate(process.cwd());
+            const goVersion = formalDefault ? releaseGoVersion(binding).replace(/^go/, '') : binding.sourcePolicy.goVersion;
+            if (!formalDefault && goVersion !== '1.27.2') throw Error('Reviewed candidate Go version differs');
+            const matches = Object.entries(TARGETS).filter(([, value]) => value.host === process.platform && value.arch === process.arch);
+            if (matches.length !== 1) throw Error('Exactly one native candidate host required');
+            const [platform, target] = matches[0];
+            const triple = { linux: 'x86_64-unknown-linux-gnu', win: 'x86_64-pc-windows-msvc',
+              'mac-x64': 'x86_64-apple-darwin', 'mac-arm64': 'aarch64-apple-darwin' }[platform];
+            const rustHost = /^host: (.+)$/m.exec(execFileSync('rustc', ['-vV'], { encoding: 'utf8' }))?.[1];
+            if (rustHost !== triple) throw Error('Rust host differs from native candidate architecture');
+            if (process.platform === 'darwin') execFileSync('xcrun', ['--sdk', 'macosx', '--show-sdk-path'], { stdio: 'inherit' });
+            mkdirSync('native-dns-ci-evidence', { recursive: true });
+            writeFileSync('native-dns-ci-evidence/context.json', JSON.stringify({ context, platform, rustHost,
+              selection: formalDefault ? 'formal-default' : temporaryDefault ? 'temporary-default' : 'manual-candidate',
+              kernelSourceCommit: binding.sourceCommit, kernelSourceTree: binding.sourceTree,
+              goVersion, AppAccepted: false, publicationEligible: false }, null, 2) + '\n');
+            const activated = { CORE_CANDIDATE: context.candidate, CORE_PLATFORM: platform, POLARIS_NATIVE_DNS_PLATFORM: platform,
+              ...(formalDefault ? { POLARIS_NATIVE_DNS_FORMAL: '1' } : temporaryDefault ? {} : { POLARIS_NATIVE_DNS_CANDIDATE: '1', POLARIS_NATIVE_PAYLOAD_VALIDATION: '1' }),
+              POLARIS_CORE_CARRIER_DIR: resolve(formalDefault || temporaryDefault ? 'resources' : 'resources/.native-dns-app', platform),
+              POLARIS_REQUIRE_KERNEL_GATE: '1', POLARIS_KERNEL_GATE_TARGET: target.target,
+              POLARIS_TEST_CORE: resolve(target.core), GOTOOLCHAIN: 'local' };
+            for (const [key, value] of Object.entries(activated)) appendFileSync(e.GITHUB_ENV, `${key}=${value}\n`);
+            appendFileSync(e.GITHUB_OUTPUT, `platform=${platform}\ngo_version=${goVersion}\n`);
+          }
+          NODE
+
+      - name: Setup candidate archive verifier Python
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup verified candidate Go metadata reader
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.native_dns_host.outputs.go_version }}
+          cache: false
+
+      - name: Verify exact candidate Go toolchain
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        shell: bash
+        env:
+          EXPECTED_GO: ${{ steps.native_dns_host.outputs.go_version }}
+        run: |
+          set -euo pipefail
+          [ "$(go env GOVERSION)" = "go$EXPECTED_GO" ]
+          go version
+
+      - name: Acquire all four explicit candidate payloads before placeholders
+        id: native_dns_acquire
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        shell: bash
+        env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${POLARIS_NATIVE_DNS_CANDIDATE:-}" = 1 ]; then
+            node scripts/fetch-core.mjs --native-dns-candidate="$CORE_CANDIDATE" 2>&1 | tee native-dns-ci-evidence/acquisition.log
+          else
+            node scripts/fetch-core.mjs 2>&1 | tee native-dns-ci-evidence/acquisition.log
+          fi
+
+      # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      # protoc / NASM：钉扎真值、版本依据与「活步，勿删」的实证都在 lint job 同名步上方。
+      # NASM 常量现在全仓三处内联（本文件 lint / test 两处 + package.yml 一处），必须同时改；
+      # 三处逐字相等由 `ui/src/contracts/workflow-toolchain-pin-parity.test.ts` 对拍。
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+
+      - name: Install NASM (Windows — pinned URL + sha256)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          NASM_VERSION: '3.02'
+        run: |
+          set -euo pipefail
+          sha256='161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+          tmp="$(cygpath -u "$RUNNER_TEMP")"
+          zip="${tmp}/nasm-${NASM_VERSION}-win64.zip"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$zip" \
+            "https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/win64/nasm-${NASM_VERSION}-win64.zip"
+          echo "${sha256}  ${zip}" | sha256sum -c -
+          rm -rf "${tmp}/nasm-${NASM_VERSION}"
+          # zip 内已带 `nasm-<ver>/` 顶层目录，解到 tmp 即得 `<tmp>/nasm-<ver>/nasm.exe`。
+          # 落点是 `$tmp`（= RUNNER_TEMP，runner 保证存在；bsdtar 的 -C 要求目录已在，故成立）。
+          echo 'extractor: /c/Windows/System32/tar.exe (bsdtar)'
+          /c/Windows/System32/tar.exe -xf "$(cygpath -w "$zip")" -C "$(cygpath -w "$tmp")"
+          cygpath -w "${tmp}/nasm-${NASM_VERSION}" >> "$GITHUB_PATH"
+          echo "NASM_EXPECT=${NASM_VERSION}" >> "$GITHUB_ENV"
+
+      # 断言的理由与写法同 lint job 同名步。
+      - name: Assert pinned tools resolve on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+          if [ "$RUNNER_OS" = 'Windows' ]; then
+            echo "nasm → $(command -v nasm)"
+            got="$(nasm -v)"
+            case "$got" in
+              "NASM version ${NASM_EXPECT} "*) ;;
+              *) echo "::error::nasm on PATH is '$got', expected NASM version ${NASM_EXPECT}"; exit 1 ;;
+            esac
+          fi
+
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      # 理由同 lint job 同名步：tauri build.rs 校验 bundle.resources 路径存在。
+      - name: Create resource placeholder dirs (tauri build.rs 路径校验)
+        shell: bash
+        run: |
+          if [ -n "${CORE_CANDIDATE:-}" ]; then
+            # Exact candidate desktop archives cannot gain a .keep or helper file.
+            mkdir -p resources/dashboard && touch resources/dashboard/.keep
+          else
+            for d in dashboard linux win mac-arm64 mac-x64; do
+              mkdir -p "resources/$d" && touch "resources/$d/.keep"
+            done
+          fi
+
+      - name: Build actual candidate helper bytes and freeze the separate App identity
+        id: native_dns_identity
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export POLARIS_BUILD_ID="$CORE_CANDIDATE"
+          cargo build --locked -p polaris-helper --bin polaris-helper 2>&1 | tee native-dns-ci-evidence/helper-build.log
+          if [ "$RUNNER_OS" = Windows ]; then
+            cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner 2>&1 | tee native-dns-ci-evidence/cleaner-build.log
+          fi
+          if [ "${POLARIS_NATIVE_DNS_CANDIDATE:-}" != 1 ]; then
+            helper=polaris-helper
+            [ "$RUNNER_OS" != Windows ] || helper=polaris-helper.exe
+            cp "target/debug/$helper" "$POLARIS_CORE_CARRIER_DIR/$helper"
+            if [ "$RUNNER_OS" = Windows ]; then
+              cp target/debug/polaris-cleaner.exe "$POLARIS_CORE_CARRIER_DIR/polaris-cleaner.exe"
+            fi
+            if [ "$RUNNER_OS" = macOS ]; then
+              if ! codesign --verify --strict "$POLARIS_CORE_CARRIER_DIR/$helper"; then
+                codesign --force --sign - --timestamp=none "$POLARIS_CORE_CARRIER_DIR/$helper"
+              fi
+              codesign --verify --strict "$POLARIS_CORE_CARRIER_DIR/$helper"
+            fi
+          fi
+          node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM" --directory="$POLARIS_CORE_CARRIER_DIR" 2>&1 | tee native-dns-ci-evidence/identity-prepare.log
+          node --input-type=module - <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { resolve } from 'node:path';
+          appendFileSync(process.env.GITHUB_ENV, `POLARIS_BUILD_ID=${process.env.CORE_CANDIDATE}\n`
+            + `POLARIS_CORE_IDENTITY_FILE=${resolve(process.env.POLARIS_CORE_CARRIER_DIR, 'core-manifest.json')}\n`);
+          NODE
+
+      - name: Verify all candidate payloads and compiled identity before workspace build
+        id: native_dns_before
+        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          selection=()
+          [ "${POLARIS_NATIVE_DNS_CANDIDATE:-}" != 1 ] || selection=(--candidate="$CORE_CANDIDATE")
+          if [ "${POLARIS_NATIVE_DNS_FORMAL:-}" = 1 ]; then
+            node scripts/desktop-core/native-dns-gates.mjs verify-formal --platform="$CORE_PLATFORM" 2>&1 | tee native-dns-ci-evidence/payloads-before.log
+          else
+            node scripts/desktop-core/native-dns-candidate.mjs verify "${selection[@]}" 2>&1 | tee native-dns-ci-evidence/payloads-before.log
+          fi
+          node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM" --directory="$POLARIS_CORE_CARRIER_DIR" --mode=verify 2>&1 | tee native-dns-ci-evidence/identity-before.log
+
+      - name: Build
+        id: workspace_build
+        run: cargo build --workspace --verbose
+
+      - name: Coex export checker fixtures
+        if: runner.os == 'Linux'
+        run: node --test scripts/check-coex-runtime-export.test.mjs
+
+      - name: Prepare current Coex source evidence
+        if: runner.os == 'Linux'
+        id: coex_prepare
+        run: node scripts/check-coex-runtime-export.mjs prepare
+
       - name: Test
+        id: workspace_tests
+        # Keep the actual gate command byte-identical to gate-rust.sh. Linux capture
+        # supplies the fresh export env to this one existing full-workspace execution.
+        # The static shell routes macOS/Windows to bash/pwsh with native failure propagation.
+        shell: node scripts/check-coex-runtime-export.mjs capture {0}
+        env:
+          COEX_EVIDENCE_DIR: ${{ steps.coex_prepare.outputs.directory }}
         # `--no-fail-fast`（2026-08-05）：默认行为是**某个 crate 挂了就不再跑后面的 crate**，
         # 于是一次 run 只能看见「第一个」失败。修 Windows 腿时这一条把成本放大成 N 倍——
         # 每修一条要再等一整轮（Windows 冷编译约 20 分钟），而那一轮又只暴露下一条。
         # 实测连剥四层（checkout 保留名 → uninstall+dns → launchd → helper-client）才见底。
         # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
         run: cargo test --workspace --no-fail-fast
+
+      - name: Run exact controlled App lifecycle hot-switch and stats tests
+        id: native_dns_app_runtime
+        if: ${{ !cancelled() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test scripts/native-dns-ci-routing.test.mjs scripts/run-native-dns-controlled-tests.test.mjs scripts/windows-directory-toolchain.test.mjs
+          tests=(
+            runtime::proxy::tests::lifecycle::real_core_full_lifecycle
+            runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop
+            runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid
+            runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt
+            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart
+            runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames
+          )
+          node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"
+
+      - name: Verify all candidate payloads after workspace and controlled App tests
+        id: native_dns_after
+        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.native_dns_acquire.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          selection=()
+          [ "${POLARIS_NATIVE_DNS_CANDIDATE:-}" != 1 ] || selection=(--candidate="$CORE_CANDIDATE")
+          if [ "${POLARIS_NATIVE_DNS_FORMAL:-}" = 1 ]; then
+            node scripts/desktop-core/native-dns-gates.mjs verify-formal --platform="$CORE_PLATFORM" 2>&1 | tee native-dns-ci-evidence/payloads-after.log
+          else
+            node scripts/desktop-core/native-dns-candidate.mjs verify "${selection[@]}" 2>&1 | tee native-dns-ci-evidence/payloads-after.log
+          fi
+          if [ -n "${POLARIS_CORE_IDENTITY_FILE:-}" ]; then
+            node scripts/prepare-core-identity.mjs --platform="$POLARIS_NATIVE_DNS_PLATFORM" --directory="$POLARIS_CORE_CARRIER_DIR" --mode=verify 2>&1 | tee native-dns-ci-evidence/identity-after.log
+          fi
+
+      # Temporary default uses the same exact-source native protocol tests.
+      # Explicit manual candidate diagnostics may continue after Test fails, but
+      # never after Build/setup failure or cancellation. The failed Test still
+      # fails this job; PR/SYSTEM gates retain their existing success requirement.
+      - name: Select explicit formal or candidate Windows directory source
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure')) }}
+        id: windows_directory_source
+        shell: pwsh
+        env:
+          DIRECTORY_MODE: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' && 'candidate') || (github.event_name == 'workflow_dispatch' && inputs.windows_directory_mode) || needs.cheap_format.outputs.candidate_mode || 'formal' }}
+          CANDIDATE_SOURCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.windows_directory_candidate_source) || needs.cheap_format.outputs.candidate_source || '' }}
+        run: |
+          if (Test-Path Env:POLARIS_NATIVE_DNS_CANDIDATE) {
+            if ($env:POLARIS_NATIVE_DNS_CANDIDATE -cne '1' -or $env:DIRECTORY_MODE -cne 'candidate') { throw 'Admitted native DNS candidate mode required' }
+            $source = & node --input-type=module -e 'import {candidateContext,loadCandidate} from "./scripts/desktop-core/native-dns-candidate.mjs"; candidateContext(process.env.CORE_CANDIDATE,process.env,process.cwd()); console.log(loadCandidate(process.cwd()).sourceCommit)'
+            if ($LASTEXITCODE -ne 0) { throw 'Verified candidate source unavailable' }
+            if (-not [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE) -and $env:CANDIDATE_SOURCE -cne $source) { throw 'Separate Windows source must match the admitted candidate' }
+          } elseif ((Get-Content src-tauri/core-manifest.json -Raw | ConvertFrom-Json -AsHashtable).ContainsKey('desktopTemporary')) {
+            $source = & node --input-type=module -e 'import {selectedCandidateContext,loadTemporaryDesktopSelection} from "./scripts/desktop-core/native-dns-candidate.mjs"; const context=selectedCandidateContext(process.cwd()); if(context.mode!=="temporary-default") throw Error("Committed desktop default required"); console.log(loadTemporaryDesktopSelection(process.cwd()).sourceCommit)'
+            if ($LASTEXITCODE -ne 0) { throw 'Verified committed default source unavailable' }
+            if (-not [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE) -and $env:CANDIDATE_SOURCE -cne $source) { throw 'Separate Windows source must match the committed default' }
+            $env:DIRECTORY_MODE = 'candidate'
+          } elseif ($env:POLARIS_NATIVE_DNS_FORMAL -ceq '1') {
+            $source = & node --input-type=module -e 'import {formalGateContext} from "./scripts/desktop-core/native-dns-gates.mjs"; console.log(formalGateContext(process.cwd()).kernelSourceCommit)'
+            if ($LASTEXITCODE -ne 0) { throw 'Verified committed formal source unavailable' }
+            if (-not [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE) -and $env:CANDIDATE_SOURCE -cne $source) { throw 'Separate Windows source must match the committed formal release' }
+            $env:DIRECTORY_MODE = 'formal'
+          } elseif ($env:DIRECTORY_MODE -ceq 'candidate') {
+            $source = $env:CANDIDATE_SOURCE
+          } elseif ($env:DIRECTORY_MODE -ceq 'formal' -and [string]::IsNullOrEmpty($env:CANDIDATE_SOURCE)) {
+            $source = (Get-Content scripts/desktop-core/release-contract.json -Raw | ConvertFrom-Json -AsHashtable).platforms.win.sourceCommit
+          } else { throw 'Explicit mutually exclusive formal/candidate validation inputs required' }
+          if ($source -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact lowercase source SHA missing' }
+          "source=$source" >> $env:GITHUB_OUTPUT
+          "mode=$env:DIRECTORY_MODE" >> $env:GITHUB_OUTPUT
+      - name: Checkout exact Windows directory producer source
+        id: windows_directory_checkout
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_source.outcome == 'success' }}
+        uses: actions/checkout@v7
+        with:
+          repository: polaris-arch/sing-box-polaris
+          ref: ${{ steps.windows_directory_source.outputs.source }}
+          path: .windows-directory-kernel
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Resolve exact checked-out kernel toolchain
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_checkout.outcome == 'success' }}
+        id: windows_directory_go
+        shell: pwsh
+        run: |
+          python scripts/windows-directory/resolve-toolchain.py --kernel-root .windows-directory-kernel --mode '${{ steps.windows_directory_source.outputs.mode }}' --source '${{ steps.windows_directory_source.outputs.source }}' --github-output $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Exact kernel compiler policy resolution failed' }
+      - name: Setup exact kernel Go toolchain
+        id: windows_directory_go_setup
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go.outcome == 'success' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.windows_directory_go.outputs.version }}
+          cache-dependency-path: .windows-directory-kernel/go.sum
+      - name: Build and run native Windows directory producer and consumer acceptance
+        id: windows_directory_acceptance
+        if: >-
+          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
+          && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
+          && steps.windows_directory_go_setup.outcome == 'success' }}
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+          DIRECTORY_MODE: ${{ steps.windows_directory_source.outputs.mode }}
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $previousAttempt = ''
+          $attemptPath = Join-Path $root 'validation-attempt.json'
+          if (Test-Path -LiteralPath $attemptPath) {
+            $previousAttempt = (Get-Content -LiteralPath $attemptPath -Raw | ConvertFrom-Json).attemptId
+            if ($previousAttempt -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous attempt identity' }
+          }
+          $args = @{KernelRoot='.windows-directory-kernel'; OutputDirectory=$root}
+          if ($env:DIRECTORY_MODE -ceq 'candidate') { $args.CandidateSourceCommit = $env:DIRECTORY_SOURCE }
+          elseif ($env:DIRECTORY_MODE -ceq 'formal') { $args.FormalContract = $true }
+          else { throw 'Unknown validation mode' }
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 @args
+          if ($LASTEXITCODE -ne 0) { throw 'Private TokenOwner acceptance failed' }
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve actual App source' }
+          $verified = ./scripts/ci/assert-windows-directory-acceptance.ps1 -EvidenceDirectory $root -ExpectedAppSource $appSource -ExpectedKernelSource $env:DIRECTORY_SOURCE -ValidationMode $env:DIRECTORY_MODE -PreviousAttemptId $previousAttempt
+          "attempt_id=$($verified.AttemptId)" >> $env:GITHUB_OUTPUT
+          "receipt_sha256=$($verified.ReceiptSHA256)" >> $env:GITHUB_OUTPUT
+          "app_manifest_sha256=$($verified.AppManifestSHA256)" >> $env:GITHUB_OUTPUT
+          "kernel_manifest_sha256=$($verified.KernelManifestSHA256)" >> $env:GITHUB_OUTPUT
+          "activation_manifest_sha256=$($verified.ActivationManifestSHA256)" >> $env:GITHUB_OUTPUT
+      # Reuse the approved PR checks or explicit exact final-candidate hosted-runner approval.
+      - name: Approved batch SYSTEM producer — fresh
+        id: windows_system_fresh
+        if: >-
+          ${{ runner.os == 'Windows'
+              && github.repository == 'polaris-arch/Polaris'
+              && steps.windows_directory_acceptance.outcome == 'success'
+              && ((github.event_name == 'pull_request'
+                  && github.event.pull_request.head.repo.full_name == github.repository
+                  && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                      || (github.event.pull_request.number == 15
+                          && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018'))
+                  && steps.windows_directory_source.outputs.mode == 'candidate')
+                || (github.event_name == 'workflow_dispatch'
+                    && inputs.windows_system_candidate != ''
+                    && inputs.windows_system_candidate == github.sha
+                    && inputs.windows_launcher_diagnostics != true
+                    && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/governance')
+                    && steps.windows_directory_source.outputs.mode == 'formal')) }}
+        shell: pwsh
+        env:
+          DIRECTORY_MODE: ${{ steps.windows_directory_source.outputs.mode }}
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+          ACCEPTANCE_ATTEMPT: ${{ steps.windows_directory_acceptance.outputs.attempt_id }}
+          ACCEPTANCE_RECEIPT_SHA256: ${{ steps.windows_directory_acceptance.outputs.receipt_sha256 }}
+          APP_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.app_manifest_sha256 }}
+          KERNEL_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.kernel_manifest_sha256 }}
+          ACTIVATION_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.activation_manifest_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'SYSTEM acceptance requires an ephemeral GitHub-hosted runner' }
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $appSource -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact App source unavailable' }
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $binding = @{
+            EvidenceDirectory = $root
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = $env:DIRECTORY_MODE
+            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
+            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
+            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
+            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
+            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
+          }
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $args = @{
+            AppArtifactManifest = (Join-Path $root 'app-artifact.json')
+            KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = $env:DIRECTORY_MODE
+            EvidenceDirectory = (Join-Path $root 'system-fresh')
+          }
+          $previousSystemNonce = ''
+          $systemReceipt = Join-Path $args.EvidenceDirectory 'system-bootstrap-receipt.json'
+          if (Test-Path -LiteralPath $systemReceipt) {
+            $previousSystemNonce = (Get-Content -LiteralPath $systemReceipt -Raw | ConvertFrom-Json).nonce
+            if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
+          }
+          ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask
+          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
+          @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
+      # Reuse the approved PR checks or explicit exact final-candidate hosted-runner approval.
+      - name: Approved batch SYSTEM producer — prebuilt-user
+        id: windows_system_prebuilt
+        if: >-
+          ${{ runner.os == 'Windows'
+              && github.repository == 'polaris-arch/Polaris'
+              && steps.windows_directory_acceptance.outcome == 'success'
+              && ((github.event_name == 'pull_request'
+                  && github.event.pull_request.head.repo.full_name == github.repository
+                  && (github.event.pull_request.head.ref == 'collab/dots-audit-remediation-20261017'
+                      || (github.event.pull_request.number == 15
+                          && github.event.pull_request.head.ref == 'collab/apple-evidence-reuse-20261018'))
+                  && steps.windows_directory_source.outputs.mode == 'candidate')
+                || (github.event_name == 'workflow_dispatch'
+                    && inputs.windows_system_candidate != ''
+                    && inputs.windows_system_candidate == github.sha
+                    && inputs.windows_launcher_diagnostics != true
+                    && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/governance')
+                    && steps.windows_directory_source.outputs.mode == 'formal')) }}
+        shell: pwsh
+        env:
+          DIRECTORY_MODE: ${{ steps.windows_directory_source.outputs.mode }}
+          DIRECTORY_SOURCE: ${{ steps.windows_directory_source.outputs.source }}
+          ACCEPTANCE_ATTEMPT: ${{ steps.windows_directory_acceptance.outputs.attempt_id }}
+          ACCEPTANCE_RECEIPT_SHA256: ${{ steps.windows_directory_acceptance.outputs.receipt_sha256 }}
+          APP_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.app_manifest_sha256 }}
+          KERNEL_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.kernel_manifest_sha256 }}
+          ACTIVATION_MANIFEST_SHA256: ${{ steps.windows_directory_acceptance.outputs.activation_manifest_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'SYSTEM acceptance requires an ephemeral GitHub-hosted runner' }
+          $appSource = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $appSource -cnotmatch '^[0-9a-f]{40}$') { throw 'Exact App source unavailable' }
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed before SYSTEM acceptance' }
+          $root = Join-Path $env:RUNNER_TEMP 'windows-directory-acceptance'
+          $binding = @{
+            EvidenceDirectory = $root
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = $env:DIRECTORY_MODE
+            ExpectedAttemptId = $env:ACCEPTANCE_ATTEMPT
+            ExpectedReceiptSHA256 = $env:ACCEPTANCE_RECEIPT_SHA256
+            ExpectedAppManifestSHA256 = $env:APP_MANIFEST_SHA256
+            ExpectedKernelManifestSHA256 = $env:KERNEL_MANIFEST_SHA256
+            ExpectedActivationManifestSHA256 = $env:ACTIVATION_MANIFEST_SHA256
+          }
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          $args = @{
+            AppArtifactManifest = (Join-Path $root 'app-artifact.json')
+            KernelArtifactManifest = (Join-Path $root 'kernel-artifact.json')
+            ExpectedAppSource = $appSource
+            ExpectedKernelSource = $env:DIRECTORY_SOURCE
+            ValidationMode = $env:DIRECTORY_MODE
+            EvidenceDirectory = (Join-Path $root 'system-prebuilt-user')
+          }
+          $previousSystemNonce = ''
+          $systemReceipt = Join-Path $args.EvidenceDirectory 'system-bootstrap-receipt.json'
+          if (Test-Path -LiteralPath $systemReceipt) {
+            $previousSystemNonce = (Get-Content -LiteralPath $systemReceipt -Raw | ConvertFrom-Json).nonce
+            if ($previousSystemNonce -cnotmatch '^[0-9a-f]{32}$') { throw 'Malformed previous SYSTEM nonce' }
+          }
+          ./scripts/windows-directory/Run-SystemBootstrap.ps1 @args -ApproveTemporarySystemTask -PrebuildUserDomain
+          $systemVerified = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding -SystemEvidenceDirectory $args.EvidenceDirectory -PreviousSystemNonce $previousSystemNonce -PrebuildUserDomain
+          $null = ./scripts/ci/assert-windows-directory-acceptance.ps1 @binding
+          & git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
+          @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
+      - name: Require both explicitly requested SYSTEM checks
+        if: ${{ always() && runner.os == 'Windows' && inputs.windows_system_candidate != '' }}
+        shell: pwsh
+        env:
+          SYSTEM_FRESH_OUTCOME: ${{ steps.windows_system_fresh.outcome }}
+          SYSTEM_PREBUILT_OUTCOME: ${{ steps.windows_system_prebuilt.outcome }}
+        run: |
+          if ($env:SYSTEM_FRESH_OUTCOME -cne 'success' -or $env:SYSTEM_PREBUILT_OUTCOME -cne 'success') {
+            throw 'Explicit SYSTEM request requires fresh and prebuilt-user success in this attempt'
+          }
+      - name: Preserve Windows directory artifact identities and build evidence
+        if: >-
+          ${{ always() && runner.os == 'Windows'
+              && (steps.windows_directory_acceptance.outcome == 'success'
+                  || steps.windows_directory_acceptance.outcome == 'failure'
+                  || steps.windows_directory_acceptance.outcome == 'cancelled') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-directory-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-directory-acceptance
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record ordinary candidate outcomes without claiming skipped acceptance
+        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        shell: bash
+        env:
+          ADMITTED_CANDIDATE: ${{ needs.cheap_format.outputs.native_dns_candidate }}
+          ADMITTED_DEFAULT: ${{ needs.cheap_format.outputs.native_dns_default }}
+          ADMITTED_FORMAL: ${{ needs.cheap_format.outputs.native_dns_formal }}
+          HOST_OUTCOME: ${{ steps.native_dns_host.outcome }}
+          ACQUIRE_OUTCOME: ${{ steps.native_dns_acquire.outcome }}
+          IDENTITY_OUTCOME: ${{ steps.native_dns_identity.outcome }}
+          BEFORE_OUTCOME: ${{ steps.native_dns_before.outcome }}
+          BUILD_OUTCOME: ${{ steps.workspace_build.outcome }}
+          WORKSPACE_OUTCOME: ${{ steps.workspace_tests.outcome }}
+          RUNTIME_OUTCOME: ${{ steps.native_dns_app_runtime.outcome }}
+          AFTER_OUTCOME: ${{ steps.native_dns_after.outcome }}
+          DIRECTORY_OUTCOME: ${{ steps.windows_directory_acceptance.outcome }}
+          SYSTEM_FRESH_OUTCOME: ${{ steps.windows_system_fresh.outcome }}
+          SYSTEM_PREBUILT_OUTCOME: ${{ steps.windows_system_prebuilt.outcome }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          const e = process.env, directory = 'native-dns-ci-evidence';
+          mkdirSync(directory, { recursive: true });
+          const outcomes = Object.fromEntries(Object.entries(e).filter(([key]) => key.endsWith('_OUTCOME')));
+          const proxyTests = [
+            'runtime::proxy::tests::lifecycle::real_core_full_lifecycle',
+            'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
+            'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
+            'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
+            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart',
+          ];
+          const statusPath = `${directory}/runtime-status.txt`;
+          const statuses = existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n') : [];
+          const tests = proxyTests.map((name) => {
+            const log = `${directory}/${name.split('::').at(-1)}.log`;
+            const exactPass = existsSync(log) && readFileSync(log, 'utf8').includes('test result: ok. 1 passed; 0 failed; 0 ignored;');
+            const passed = statuses.includes(`${name}: passed`) && exactPass;
+            return { name, state: passed ? 'passed' : statuses.includes(`${name}: started`) ? 'failed-or-incomplete' : 'unexecuted', log };
+          });
+          const passed = tests.every((test) => test.state === 'passed');
+          const windowsProxyRuntimeTests = e.RUNNER_OS === 'Windows' ? {
+            state: passed ? 'passed' : tests.some((test) => test.state !== 'unexecuted') ? 'failed-or-incomplete' : 'unexecuted',
+            requirementState: passed ? 'satisfied' : 'open',
+            scope: 'Five exact controlled compiled-carrier loopback/manual lifecycle and hot-switch tests; no SYSTEM or packaged acceptance',
+            tests,
+          } : { state: 'see exact runtime logs' };
+          const value = { schema: 'polaris-native-dns-ordinary-ci-v1', candidate: e.CORE_CANDIDATE ?? e.ADMITTED_CANDIDATE,
+            selection: e.ADMITTED_FORMAL === 'true' ? 'formal-default' : e.ADMITTED_DEFAULT === 'true' ? 'temporary-default' : 'manual-candidate',
+            runId: e.GITHUB_RUN_ID, attempt: e.GITHUB_RUN_ATTEMPT, workflowRef: e.GITHUB_WORKFLOW_REF,
+            platform: e.CORE_PLATFORM ?? null, outcomes,
+            systemAcceptance: {
+              state: [e.SYSTEM_FRESH_OUTCOME, e.SYSTEM_PREBUILT_OUTCOME].every((v) => v === 'success') ? 'passed'
+                : [e.SYSTEM_FRESH_OUTCOME, e.SYSTEM_PREBUILT_OUTCOME].some((v) => ['success', 'failure', 'cancelled'].includes(v)) ? 'failed-or-incomplete' : 'unexecuted',
+              scope: 'system-producer-user-consumer-bootstrap-only',
+              fresh: e.SYSTEM_FRESH_OUTCOME || 'unexecuted', prebuiltUser: e.SYSTEM_PREBUILT_OUTCOME || 'unexecuted',
+              evidence: 'Separate Windows directory artifact: system-fresh and system-prebuilt-user current attempt bindings; excludes packaged and device acceptance',
+            },
+            windowsProxyRuntimeTests,
+            AppAccepted: false, packagedAcceptance: false, publicationEligible: false };
+          writeFileSync(`${directory}/summary.json`, JSON.stringify(value, null, 2) + '\n');
+          const receipt = e.ADMITTED_FORMAL === 'true' ? `resources/.release-receipts/${e.CORE_PLATFORM}.json` : 'resources/.native-dns-candidate/receipt.json';
+          if (existsSync(receipt)) copyFileSync(receipt, `${directory}/acquisition-receipt.json`);
+          if (e.POLARIS_CORE_IDENTITY_FILE && existsSync(e.POLARIS_CORE_IDENTITY_FILE))
+            copyFileSync(e.POLARIS_CORE_IDENTITY_FILE, `${directory}/compiled-core-manifest.json`);
+          NODE
+
+      - name: Always preserve exact ordinary candidate evidence
+        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-dns-ordinary-ci-${{ matrix.os }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: native-dns-ci-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Verify current Coex serializer evidence
+        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        env:
+          COEX_EVIDENCE_DIR: ${{ steps.coex_prepare.outputs.directory }}
+        run: node scripts/check-coex-runtime-export.mjs verify
+
+      - name: Preserve current Coex export and original test logs
+        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coex-runtime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.coex_prepare.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+
+  windows_launcher_diagnostics:
+    name: Windows launcher diagnosis (not PR acceptance)
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true && (inputs.windows_system_candidate || '') == ''
+          && github.repository == 'polaris-arch/Polaris'
+          && github.ref == 'refs/heads/collab/dots-audit-remediation-20261017' }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact diagnostic App source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate the fixed reviewed candidate
+        id: candidate
+        shell: pwsh
+        run: |
+          $candidate = Get-Content -LiteralPath scripts/windows-directory/candidate-source.json -Raw | ConvertFrom-Json -AsHashtable
+          if ($candidate.schema -cne 'polaris-windows-directory-candidate-v1' -or
+              $candidate.repository -cne 'polaris-arch/sing-box-polaris' -or
+              $candidate.sourceCommit -cne '68ffb209ded1f9337f9115741cba24f9f4c63421') {
+            throw 'Diagnostic candidate differs from the exact reviewed source'
+          }
+          "source=$($candidate.sourceCommit)" >> $env:GITHUB_OUTPUT
+      - name: Checkout exact diagnostic kernel source
+        uses: actions/checkout@v7
+        with:
+          repository: polaris-arch/sing-box-polaris
+          ref: ${{ steps.candidate.outputs.source }}
+          path: .windows-directory-kernel
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Resolve exact diagnostic kernel toolchain
+        id: kernel_go
+        shell: pwsh
+        run: |
+          python scripts/windows-directory/resolve-toolchain.py --kernel-root .windows-directory-kernel --mode candidate --source '${{ steps.candidate.outputs.source }}' --github-output $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Exact diagnostic compiler policy resolution failed' }
+      - name: Setup exact diagnostic Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.kernel_go.outputs.version }}
+          cache-dependency-path: .windows-directory-kernel/go.sum
+      - name: Run the existing fixed launcher and acceptance target
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+          CANDIDATE_SOURCE: ${{ steps.candidate.outputs.source }}
+        run: |
+          # No preceding Rust build/test: creation failures terminate promptly.
+          # If creation succeeds, the same fixed target continues native validation;
+          # that path can be expensive and never substitutes for full PR/SYSTEM gates.
+          ./scripts/windows-directory/Run-WithUserTokenOwner.ps1 -KernelRoot .windows-directory-kernel -OutputDirectory (Join-Path $env:RUNNER_TEMP 'windows-launcher-diagnostics') -CandidateSourceCommit $env:CANDIDATE_SOURCE
+          if ($LASTEXITCODE -ne 0) { throw 'Fixed launcher diagnostic attempt failed' }
+      - name: Always preserve original launcher diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-launcher-diagnostics-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-launcher-diagnostics
+          if-no-files-found: error
+          retention-days: 14

@@ -31,10 +31,14 @@ if [[ "$revision" != "$rust_ndk_version" ]]; then
 fi
 export ANDROID_NDK_HOME="$selected" NDK_HOME="$selected" ANDROID_NDK_ROOT="$selected"
 
-cli="$repo_root/ui/node_modules/@tauri-apps/cli/tauri.js"
-if [[ ! -f "$cli" ]]; then
-  echo "Tauri CLI is missing at $cli; install the ui/ dependencies first" >&2
+cli_version="$(cat "$repo_root/scripts/tauri-cli.version")"
+if ! command -v tauri >/dev/null 2>&1; then
+  echo "Global Tauri CLI is missing; run npm install -g @tauri-apps/cli@$cli_version" >&2
+  exit 1
+fi
+if [[ "$(tauri --version)" != "tauri-cli $cli_version" ]]; then
+  echo "Global Tauri CLI must be $cli_version; run npm install -g @tauri-apps/cli@$cli_version" >&2
   exit 1
 fi
 cd "$repo_root"
-exec node "$cli" android build "$@"
+exec tauri android build "$@"

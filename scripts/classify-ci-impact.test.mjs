@@ -288,6 +288,11 @@ test('Android 面点亮 android 腿，且不误伤桌面腿', () => {
     'src-tauri/tauri.android.conf.json',
     'src-tauri/src/runtime/proxy/android_capacity.rs',
     'scripts/build-libbox.sh',
+    'scripts/build-mobile-core.sh',
+    'scripts/mobile-source-unit.test.mjs',
+    'scripts/mobile-core/producer.py',
+    'scripts/mobile-core/carriers.py',
+    'scripts/mobile-core/source-contract.json',
     'scripts/libbox-patches/source-manifest.json',
     'scripts/libbox-patches/build.py',
     'scripts/libbox-patches/verify-receipt.py',
@@ -346,4 +351,32 @@ test('未登记 scope 与 --full 都把 Android 腿 fail-closed 为真', () => {
   assert.equal(classifyImpact(['crates/__not_registered__/src/lib.rs']).android, true);
   assert.equal(classifyImpact(['src-tauri/__not_registered__.json']).android, true);
   assert.equal(classifyImpact([], { forceFull: true }).android, true);
+});
+
+test('fixed native cleaner requires Windows package validation without a real kernel', () => {
+  const result = classifyImpact(['crates/windows-cleaner/src/windows.rs']);
+  assert.equal(result.kernel, false);
+  assert.deepEqual(result.platforms, ['windows']);
+  assert.equal(result.hasPackage, true);
+  assert.deepEqual(result.unregisteredScopes, []);
+});
+
+// Frozen helper/cleaner metadata changes every desktop carrier, not Android.
+test('compiled core identity entry selects all four desktop packaging targets', () => {
+  const result = classifyImpact(['scripts/prepare-core-identity.mjs']);
+  assert.deepEqual(result.platforms, [...ALL_PACKAGE_PLATFORMS]);
+  assert.equal(result.hasPackage, true);
+  assert.equal(result.android, false);
+  assert.deepEqual(result.unregisteredScopes, []);
+});
+
+
+test('workflow efficiency contract alone triggers all desktop installers without widening kernel or Android scope', () => {
+  assert.deepEqual(compact(['scripts/ci-workflow-efficiency.test.mjs']), {
+    kernel: false, platforms: [...ALL_PACKAGE_PLATFORMS], preflight: true, hasPackage: true,
+  });
+  assert.equal(classifyImpact(['scripts/ci-workflow-efficiency.test.mjs']).android, false);
+  for (const path of ['scripts/ci-workflow-efficiency.test.mjs.bak', 'docs/ci-workflow-efficiency.test.mjs']) {
+    assert.deepEqual(compact([path]), { kernel: false, platforms: [], preflight: false, hasPackage: false });
+  }
 });

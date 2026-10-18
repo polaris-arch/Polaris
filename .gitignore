@@ -11,7 +11,7 @@ dist/
 dist-package/
 *.tsbuildinfo
 
-# 下载的内核 / 资源二进制（由 scripts/ 拉取，不入库）
+# 固定发布消费的内核与 helper/cleaner/安装身份资源（由 scripts/ 物化，不入库）
 /resources/*
 !/resources/.gitkeep
 # geo 规则集随包入库（对齐 上游 resources/data/）：28 个 .srs ≈ 472K（= builtin_geo_rulesets()
@@ -74,3 +74,13 @@ src-tauri/gen/schemas/
 # `~/docs/polaris/design/mobile-kit/`，仓内不再有 design/；本行作为守卫保留，
 # 防止设计产物重新落回仓内。**不要因为「目录不存在了」就删掉它。**
 /design/
+
+# 本地调试与验收工具：只在本机使用，不入库
+/scripts/pc-owner-stop-acceptance-*/
+/scripts/pc-mac-masque-next-observation-*/
+/scripts/pc-lan-debug-*/
+/scripts/debug-pc-echo-driver-*/
+/scripts/ios-simulator-acceptance/
+/scripts/acc01-local-acceptance-*/
+/scripts/mobile-core/android-consumption.json
+/scripts/mobile-core/android-consumption.json.tmp

@@ -7,37 +7,40 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+// Keep FK-A cases inside the existing scripts/*.test.mjs CI collection.
+import './desktop-core/fork-source.test.mjs';
 import { buildDesktopCore, produceDesktopCore } from './desktop-core/build-core.mjs';
 import { consumeDesktopBundle, coreFilename, verifyPackagedSource, writeBundleInventory } from './desktop-core/bundle.mjs';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, frozenSourceVersion, platformSourceIdentity,
   validateBuildInfo, validateSourcePins, validateSourceReceipt } from './desktop-core/source-graph.mjs';
+import { writeValidationBundle, validateBundleOrigin, validationContext } from './desktop-core/validation-origin.mjs';
 import { classifyImpact, androidRegistrationOf } from './classify-ci-impact.mjs';
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), '..');
 const candidate = 'c'.repeat(40);
 const tree = 'd'.repeat(40);
 const windowsTree = 'e'.repeat(40);
-const TUN_MODULE = 'github.com/sagernet/sing-tun';
-const NFT_MODULE = 'github.com/sagernet/nftables';
-const PATCHED_MODULES = ['example.com/tiny', TUN_MODULE, NFT_MODULE];
+const PATCHED = [['tiny', 'example.com/tiny'], ['patched', 'example.com/patched'], ['second', 'example.com/second']];
+const PATCHED_MODULES = PATCHED.map(([, module]) => module);
+const [, FIRST_MODULE, SECOND_MODULE] = PATCHED_MODULES;
 const TRANSPORT_MODULES = ['example.com/transport', 'example.com/linux-transport'];
-const platformPolicies = (key) => ({
-  patchedModules: { requiredLinked: PATCHED_MODULES.filter((module) => key === 'linux' || module !== NFT_MODULE),
-    allowedAbsent: key === 'linux' ? [] : [NFT_MODULE] },
+const EMPTY_GRAPH_SHA256 = '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945';
+const platformPolicies = (key, modules = PATCHED_MODULES) => ({
+  patchedModules: { requiredLinked: [...modules], allowedAbsent: [] },
   transportModules: { requiredLinked: TRANSPORT_MODULES.filter((module) => key === 'linux' || module !== 'example.com/linux-transport'),
     confirmedAbsent: key === 'linux' ? [] : ['example.com/linux-transport'] },
 });
 const write = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
 const signed = (facts) => ({ ...facts, fingerprint: digest(canonical(facts)) });
-function fixture() {
+function fixture(patched = PATCHED) {
+  const modules = patched.map(([, module]) => module);
   const root = mkdtempSync(join(tmpdir(), 'polaris-graph-logic-'));
   const patch = 'synthetic core patch';
   const depPatch = 'synthetic dependency patch';
   const overlay = 'synthetic Windows overlay';
   const provider = 'synthetic provider; never executed';
   const source = { sourceCommit: 'a'.repeat(40), goVersion: '1.25.5',
-    patches: [{ file: 'core.patch', sha256: digest(patch) }], dependencyPatches: PATCHED_MODULES.map((module, index) => {
-      const name = ['tiny', 'sing-tun', 'nftables'][index];
+    patches: [{ file: 'core.patch', sha256: digest(patch) }], dependencyPatches: patched.map(([name, module]) => {
       return { name, module, upstreamVersion: 'v1.0.0',
         upstreamCommit: 'b'.repeat(40), sourceURL: `https://github.com/example/${name}`,
         patchFile: `${name}.patch`, patchSha256: digest(depPatch), patchedTree: 'f'.repeat(40) };
@@ -46,7 +49,8 @@ function fixture() {
   const graph = source.dependencyPatches.map((dep) => ({ Path: dep.module, Version: dep.upstreamVersion,
     Replace: { Path: `./polaris-dependencies/${dep.name}` } }));
   const receipt = signed({ schema: 'polaris-core-source-v1', sourceCommit: source.sourceCommit, sourceURL: 'https://github.com/SagerNet/sing-box',
-    graphScope: 'declared-patched-modules', sourceGraphState: 'dependencies-patched', moduleGraphQueries: [...PATCHED_MODULES].sort(),
+    graphScope: patched.length ? 'declared-patched-modules' : 'core-source-only',
+    sourceGraphState: patched.length ? 'dependencies-patched' : 'source-only', moduleGraphQueries: [...modules].sort(),
     mainGoModSha256: digest('synthetic full main go.mod'), mainGoSumSha256: digest('synthetic full main go.sum'),
     upstreamTree: '1'.repeat(40), patchedSourceTree: '2'.repeat(40), buildTree: tree,
     sourceManifestSha256: digest(manifestBytes), provisionerSha256: digest(provider), patches: source.patches,
@@ -56,23 +60,23 @@ function fixture() {
     sourceManifestSha256: receipt.sourceManifestSha256, provisionerSha256: receipt.provisionerSha256,
     sourceReceiptFingerprint: receipt.fingerprint, moduleGraphSha256: receipt.moduleGraphSha256,
     patchedSourceTree: receipt.patchedSourceTree, buildTree: tree, version: '1.0.0.polaris.1',
-    dependencyModules: PATCHED_MODULES, transportPins: { 'example.com/transport': 'v0.47.0', 'example.com/linux-transport': 'v1.2.0' },
+    dependencyModules: modules, transportPins: { 'example.com/transport': 'v0.47.0', 'example.com/linux-transport': 'v1.2.0' },
     platforms: Object.fromEntries(Object.keys(DESKTOP_TARGETS)
-      .map((key) => [key, { buildTree: key === 'win' ? windowsTree : tree, ...platformPolicies(key), binarySha256: null }])) },
+      .map((key) => [key, { buildTree: key === 'win' ? windowsTree : tree, ...platformPolicies(key, modules), binarySha256: null }])) },
   windowsBuild: { sourceCommit: source.sourceCommit, goVersion: source.goVersion, version: '1.0.0.polaris.1', patchSha256: digest(overlay) } };
   write(join(root, 'scripts/libbox-patches/source-manifest.json'), manifestBytes);
   write(join(root, 'scripts/libbox-patches/core.patch'), patch);
   for (const dep of source.dependencyPatches) write(join(root, 'scripts/libbox-patches', dep.patchFile), depPatch);
   write(join(root, 'scripts/core-source-provision.py'), provider);
   write(join(root, 'scripts/core-patches/windows-dns-refresh.patch'), overlay);
-  return { root, manifest, source, receipt, dispose: () => rmSync(root, { recursive: true, force: true }) };
+  write(join(root, 'src-tauri/core-manifest.json'), JSON.stringify(manifest));
+  return { root, manifest, source, receipt, patched, dispose: () => rmSync(root, { recursive: true, force: true }) };
 }
-function metadata(key, path = '/synthetic/core', { nft = key === 'linux', linuxTransport = key === 'linux' } = {}) {
+const patchedRow = (name, module) => `\tdep\t${module}\tv1.0.0\t\n\t=>\t./polaris-dependencies/${name}\t(devel)\t\n\t\n`;
+function metadata(key, path = '/synthetic/core', { patched = PATCHED, linuxTransport = key === 'linux' } = {}) {
   const target = DESKTOP_TARGETS[key];
   return `${path}: go1.25.5\n\tpath\texample.com/probe\n\tmod\texample.com/probe\t(devel)\t\n`
-    + '\tdep\texample.com/tiny\tv1.0.0\t\n\t=>\t./polaris-dependencies/tiny\t(devel)\t\n\t\n'
-    + '\tdep\tgithub.com/sagernet/sing-tun\tv1.0.0\t\n\t=>\t./polaris-dependencies/sing-tun\t(devel)\t\n\t\n'
-    + (nft ? '\tdep\tgithub.com/sagernet/nftables\tv1.0.0\t\n\t=>\t./polaris-dependencies/nftables\t(devel)\t\n\t\n' : '')
+    + patched.map(([name, module]) => patchedRow(name, module)).join('')
     + '\tdep\texample.com/transport\tv0.47.0\th1:synthetic\n'
     + (linuxTransport ? '\tdep\texample.com/linux-transport\tv1.2.0\th1:synthetic-linux\n' : '')
     + `\tbuild\tGOOS=${target.goos}\n\tbuild\tGOARCH=${target.goarch}\n\tbuild\tCGO_ENABLED=${target.cgo}\n`
@@ -83,6 +87,13 @@ function stub(f, key, change = {}) {
   const fetched = new Map();
   const run = (command, args, options) => {
     calls.push({ command, args, options });
+    if (command === 'codesign') {
+      const state = change.signature ?? 'signed';
+      return { status: state === 'signed' ? 0 : 1, stdout: '', stderr: state === 'signed'
+        ? (args[0] === '--display' ? `CDHash=${change.cdHash ?? 'a'.repeat(40)}\n` : '')
+        : state === 'unsigned' ? 'core: code object is not signed at all' : 'core: invalid signature' };
+    }
+    if (command === 'file') return `Mach-O 64-bit executable ${key === 'mac-x64' ? 'x86_64' : 'arm64'}`;
     if (command === 'git') {
       if (args[0] === 'rev-parse') return change.rootHead ?? candidate;
       if (args[0] === 'status') return change.status ?? '';
@@ -114,8 +125,8 @@ function stub(f, key, change = {}) {
     if (args[0]?.endsWith('core-source-provision.py')) {
       const checkout = args[args.indexOf('--checkout') + 1];
       write(join(checkout, '.polaris-source-receipt.json'), JSON.stringify(change.receipt ?? f.receipt));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), expectedTags('mac-arm64').join(','));
-      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), expectedTags('win').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS'), change.preset ?? expectedTags('mac-arm64').join(','));
+      write(join(checkout, 'release/DEFAULT_BUILD_TAGS_WINDOWS'), change.windowsPreset ?? expectedTags('win').join(','));
       write(join(checkout, 'release/LDFLAGS'), '-checklinkname=0');
       write(join(checkout, 'go.mod'), 'synthetic full main go.mod');
       write(join(checkout, 'go.sum'), 'synthetic full main go.sum');
@@ -123,7 +134,7 @@ function stub(f, key, change = {}) {
     }
     if (args[0] === 'env') return '/synthetic-go';
     if (args[0] === 'version' && args.length === 1) return 'go version go1.25.5 linux/amd64';
-    if (args[0] === 'version' && args[1] === '-m') return change.metadata ?? metadata(key, args[2]);
+    if (args[0] === 'version' && args[1] === '-m') return change.metadata ?? metadata(key, args[2], { patched: f.patched });
     if (args[0] === 'tool' && args[1] === 'buildid') return change.buildID ?? platformSourceIdentity(f.receipt, f.source, f.manifest.sourceBuild, key, f.manifest.windowsBuild.patchSha256).buildID;
     if (args[0] === 'build') { write(args[args.indexOf('-o') + 1], `synthetic binary ${key}`); return ''; }
     if (args[0] === 'test') return '';
@@ -139,10 +150,12 @@ function produceAll(f) {
   writeBundleInventory(directory, candidate);
   return directory;
 }
-const inspectStub = (command, args) => command === 'git'
+const inspector = (patched) => (command, args) => command === 'codesign'
+  ? { status: 0, stdout: '', stderr: args[0] === '--display' ? `CDHash=${'a'.repeat(40)}\n` : '' } : command === 'git'
   ? (args[0] === 'rev-parse' ? candidate : '') : args[0] === 'tool'
     ? JSON.parse(readFileSync(`${args[2]}.source-receipt.json`)).buildID
-    : metadata(args[2].split(/[/\\]/).at(-2), args[2]);
+    : metadata(args[2].split(/[/\\]/).at(-2), args[2], { patched });
+const inspectStub = inspector(PATCHED);
 
 test('frozen production inputs still require exact pins; force and old outputs cannot bypass', () => {
   const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
@@ -150,7 +163,10 @@ test('frozen production inputs still require exact pins; force and old outputs c
   try {
     for (const key of Object.keys(DESKTOP_TARGETS)) validateSourcePins(manifest, key, false);
     const missingPin = structuredClone(manifest);
-    missingPin.sourceBuild.sourceReceiptFingerprint = null;
+    delete missingPin.desktopRelease; // This fixture exercises the retained source producer.
+    delete missingPin.desktopTemporary;
+    const selected = Object.hasOwn(missingPin, 'desktopSourceBuild') ? missingPin.desktopSourceBuild : missingPin.sourceBuild;
+    selected.sourceReceiptFingerprint = null;
     for (const key of Object.keys(DESKTOP_TARGETS)) {
       const dest = join(f.root, 'resources', key, coreFilename(key));
       write(dest, 'old cached core');
@@ -165,7 +181,11 @@ test('frozen production inputs still require exact pins; force and old outputs c
     // product checkout: --force must reject before any source/tool execution.
     write(join(f.root, 'src-tauri/core-manifest.json'), JSON.stringify(missingPin));
     for (const path of ['scripts/fetch-core.mjs', 'scripts/desktop-core/build-core.mjs',
-      'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs']) {
+      'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/validation-origin.mjs',
+      'scripts/desktop-core/native-dns-gates.mjs',
+      'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs',
+      'scripts/desktop-core/release-native-gates.mjs', 'scripts/desktop-core/native-dns-candidate.mjs',
+      'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', 'scripts/lib/core-identity.mjs']) {
       write(join(f.root, path), readFileSync(join(repo, path)));
     }
     const cli = spawnSync(process.execPath, ['scripts/fetch-core.mjs', '--force', '--platform=linux'],
@@ -198,6 +218,27 @@ test('first source producer needs input pins but no unknown output hash', () => 
     assert.equal(receipt.candidate, candidate);
     assert.ok(s.calls.some(({ args }) => args.includes('--module-source') && args.includes('--go')));
   } finally { f.dispose(); }
+  // An empty dependency declaration is a frozen graph of its own: the real
+  // producer and consumer entrypoints pass and no module repository is supplied.
+  const empty = fixture([]);
+  try {
+    assert.deepEqual(empty.source.dependencyPatches, []);
+    assert.equal(empty.receipt.moduleGraphSha256, EMPTY_GRAPH_SHA256);
+    assert.equal(frozenSourceVersion(empty.manifest), empty.manifest.sourceBuild.version);
+    const directory = join(empty.root, 'bundle');
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const s = stub(empty, key);
+      const receipt = produceDesktopCore(empty.root, empty.manifest, key, join(directory, key, coreFilename(key)), candidate, s.run);
+      assert.equal(Object.values(receipt.linkedModules).some((module) => module.replacement), false);
+      const provision = s.calls.filter(({ args }) => args[0]?.endsWith('core-source-provision.py'));
+      assert.equal(provision.length, 1);
+      assert.equal(provision[0].args.includes('--module-source'), false);
+      assert.equal(s.calls.filter(({ command, args }) => command === 'git' && args[2] === 'fetch').length, 1);
+    }
+    writeBundleInventory(directory, candidate);
+    consumeDesktopBundle(empty.root, empty.manifest, directory, candidate, ['linux'], inspector([]));
+    assert.equal(readFileSync(join(empty.root, 'resources/linux/sing-box'), 'utf8'), 'synthetic binary linux');
+  } finally { empty.dispose(); }
 });
 
 test('all four targets retain the existing platform feature and CGO faces', () => {
@@ -231,25 +272,43 @@ test('all four targets retain the existing platform feature and CGO faces', () =
   } finally { f.dispose(); }
 });
 
-test('non-Linux NFT absence and strictly patched presence pass the real producer and consumer entrypoints', () => {
+test('alpha.11 platform additions retain gvisor without accepting unrelated preset drift', () => {
+  const f = fixture();
+  const preset = expectedTags('mac-arm64').filter((tag) => tag !== 'with_gvisor');
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const dest = join(f.root, key, 'alpha11-core');
+      const change = { preset: preset.join(','), windowsPreset: expectedTags('win').filter((tag) => tag !== 'with_gvisor').join(',') };
+      const s = stub(f, key, change);
+      const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, s.run);
+      const build = s.calls.find(({ args }) => args[0] === 'build');
+      assert.deepEqual(build.args[build.args.indexOf('-tags') + 1].split(','), expectedTags(key));
+      assert.deepEqual(receipt.tags, expectedTags(key));
+      assert.equal(receipt.tags.includes('with_gvisor'), true, `${key}: explicit gvisor capability retained`);
+      if (key === 'win') {
+        assert.equal(receipt.cgo, '0');
+        assert.equal(receipt.tags.includes('with_purego'), true, 'purego and gvisor are independent capabilities');
+      }
+      const selectedPreset = key === 'win' ? change.windowsPreset.split(',') : preset;
+      for (const bad of [selectedPreset.filter((tag) => tag !== 'with_quic'), [...selectedPreset, 'with_unreviewed']]) {
+        const r = stub(f, key, { ...change, [key === 'win' ? 'windowsPreset' : 'preset']: bad.join(',') });
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate, r.run), /feature tag preset differs/);
+        assert.equal(r.calls.some(({ args }) => args[0] === 'build'), false);
+        assert.equal(readFileSync(dest, 'utf8'), `synthetic binary ${key}`, 'rejection preserves the prior output');
+      }
+    }
+  } finally { f.dispose(); }
+});
+
+test('missing embedded gvisor rejects every desktop producer and consumer face', () => {
   const f = fixture();
   try {
-    const directory = produceAll(f);
-    for (const key of ['win', 'mac-x64', 'mac-arm64']) {
-      const receipt = JSON.parse(readFileSync(join(directory, key, `${coreFilename(key)}.source-receipt.json`)));
-      assert.equal(Object.hasOwn(receipt.linkedModules, NFT_MODULE), false);
-      assert.equal(Object.hasOwn(receipt.linkedModules, TUN_MODULE), true);
-      const present = metadata(key, undefined, { nft: true });
-      produceDesktopCore(f.root, f.manifest, key, join(directory, key, coreFilename(key)), candidate,
-        stub(f, key, { metadata: present }).run);
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      const tags = expectedTags(key);
+      assert.ok(tags.includes('with_gvisor'));
+      const raw = metadata(key).replace(`-tags=${tags.join(',')}`, `-tags=${tags.filter((tag) => tag !== 'with_gvisor').join(',')}`);
+      rejectProducerAndConsumerMetadata(f, key, raw, /Embedded feature tags differ/);
     }
-    writeBundleInventory(directory, candidate);
-    consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['win'], (command, args, options) =>
-      command !== 'git' && args[0] === 'version'
-        ? metadata(args[2].split(/[/\\]/).at(-2), args[2], { nft: true }) : inspectStub(command, args, options));
-    assert.equal(existsSync(join(f.root, 'resources/win/sing-box.exe')), true);
-    assert.equal(f.manifest.sourceBuild.dependencyModules.length, 3);
-    assert.equal(f.receipt.moduleGraph.length, 3);
   } finally { f.dispose(); }
 });
 
@@ -259,42 +318,47 @@ function rejectProducerAndConsumerMetadata(f, key, raw, error) {
     stub(f, key, { metadata: raw }).run), error);
   assert.equal(existsSync(dest), false);
   const directory = produceAll(f);
+  const inspect = inspector(f.patched);
   assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'],
     (command, args, options) => command !== 'git' && args[0] === 'version'
-      && args[2].split(/[/\\]/).at(-2) === key ? raw : inspectStub(command, args, options)), error);
+      && args[2].split(/[/\\]/).at(-2) === key ? raw : inspect(command, args, options)), error);
   assert.equal(existsSync(join(f.root, 'resources')), false);
 }
 
 test('patched module omissions, stock rows and wrong replacement identities reject both entrypoints', () => {
   const f = fixture();
-  const omit = (raw, module, name) => raw.replace(
-    `\tdep\t${module}\tv1.0.0\t\n\t=>\t./polaris-dependencies/${name}\t(devel)\t\n\t\n`, '');
   try {
-    rejectProducerAndConsumerMetadata(f, 'linux', metadata('linux', undefined, { nft: false }), /patched dependency/);
     for (const key of Object.keys(DESKTOP_TARGETS)) {
-      rejectProducerAndConsumerMetadata(f, key, omit(metadata(key), TUN_MODULE, 'sing-tun'), /patched dependency/);
-      rejectProducerAndConsumerMetadata(f, key, omit(metadata(key), 'example.com/tiny', 'tiny'), /patched dependency/);
-      const present = metadata(key, undefined, { nft: true });
-      for (const bad of [present.replace('\t=>\t./polaris-dependencies/nftables\t(devel)\t\n\t\n', ''),
-        present.replace(`${NFT_MODULE}\tv1.0.0`, `${NFT_MODULE}\tv2.0.0`),
-        present.replace('./polaris-dependencies/nftables', './polaris-dependencies/stock-nftables')]) {
+      const present = metadata(key);
+      for (const [name, module] of PATCHED) {
+        assert.ok(present.includes(patchedRow(name, module)));
+        rejectProducerAndConsumerMetadata(f, key, present.replace(patchedRow(name, module), ''), /patched dependency/);
+      }
+      for (const bad of [present.replace('\t=>\t./polaris-dependencies/second\t(devel)\t\n\t\n', ''),
+        present.replace(`${SECOND_MODULE}\tv1.0.0`, `${SECOND_MODULE}\tv2.0.0`),
+        present.replace('./polaris-dependencies/second', './polaris-dependencies/stock-second')]) {
+        assert.notEqual(bad, present);
         rejectProducerAndConsumerMetadata(f, key, bad, /patched dependency/);
       }
     }
   } finally { f.dispose(); }
 });
 
-test('every platform module policy is complete, disjoint and limited to the reviewed NFT omission', () => {
+test('every platform module policy is complete, disjoint and never absent', () => {
   const f = fixture();
   try {
     for (const key of Object.keys(DESKTOP_TARGETS)) {
+      validateSourcePins(f.manifest, key, false);
       for (const mutate of [
         (p) => { p.patchedModules = null; }, (p) => { p.transportModules = null; },
-        (p) => { p.patchedModules.requiredLinked.push(TUN_MODULE); },
-        (p) => { p.patchedModules.allowedAbsent.push(TUN_MODULE); },
-        (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== TUN_MODULE); },
-        (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== TUN_MODULE);
-          p.patchedModules.allowedAbsent.push(TUN_MODULE); },
+        (p) => { p.patchedModules.requiredLinked.push(FIRST_MODULE); },
+        (p) => { p.patchedModules.allowedAbsent.push(FIRST_MODULE); },
+        (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== FIRST_MODULE); },
+        (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== FIRST_MODULE);
+          p.patchedModules.allowedAbsent.push(FIRST_MODULE); },
+        // A complete, disjoint partition is still refused once anything is absent.
+        (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== SECOND_MODULE);
+          p.patchedModules.allowedAbsent.push(SECOND_MODULE); },
         (p) => { p.patchedModules.requiredLinked = p.patchedModules.requiredLinked.filter((m) => m !== 'example.com/tiny');
           p.patchedModules.allowedAbsent.push('example.com/tiny'); },
         (p) => { p.patchedModules.allowedAbsent.push('unknown/module'); },
@@ -316,10 +380,6 @@ test('every platform module policy is complete, disjoint and limited to the revi
         assert.equal(calls, 0);
       }
     }
-    const manifest = structuredClone(f.manifest);
-    manifest.sourceBuild.platforms.linux.patchedModules = {
-      requiredLinked: PATCHED_MODULES.filter((m) => m !== NFT_MODULE), allowedAbsent: [NFT_MODULE] };
-    assert.throws(() => validateSourcePins(manifest, 'linux', false), /not frozen/);
   } finally { f.dispose(); }
 });
 
@@ -350,7 +410,7 @@ test('changing a valid platform policy changes only platform identity and reject
     const directory = produceAll(f);
     const spec = f.manifest.sourceBuild;
     const identity = platformSourceIdentity(f.receipt, f.source, spec, 'win', f.manifest.windowsBuild.patchSha256);
-    spec.platforms.win.patchedModules = { requiredLinked: [...PATCHED_MODULES], allowedAbsent: [] };
+    spec.platforms.win.transportModules = { requiredLinked: [...TRANSPORT_MODULES], confirmedAbsent: [] };
     validateSourcePins(f.manifest, 'win', false);
     const changed = platformSourceIdentity(f.receipt, f.source, spec, 'win', f.manifest.windowsBuild.patchSha256);
     assert.equal(changed.sourceFingerprint, identity.sourceFingerprint);
@@ -359,12 +419,7 @@ test('changing a valid platform policy changes only platform identity and reject
     assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'], inspectStub), /Platform source fingerprint/);
     assert.equal(existsSync(join(f.root, 'resources')), false);
     assert.throws(() => produceDesktopCore(f.root, f.manifest, 'win', join(f.root, 'rejected/core'), candidate,
-      stub(f, 'win', { metadata: metadata('win', undefined, { nft: true }), buildID: identity.buildID }).run), /buildID/);
-    const transportIdentity = platformSourceIdentity(f.receipt, f.source, spec, 'win', f.manifest.windowsBuild.patchSha256);
-    spec.platforms.win.transportModules = { requiredLinked: [...TRANSPORT_MODULES], confirmedAbsent: [] };
-    const changedTransport = platformSourceIdentity(f.receipt, f.source, spec, 'win', f.manifest.windowsBuild.patchSha256);
-    assert.notEqual(changedTransport.platformInputFingerprint, transportIdentity.platformInputFingerprint);
-    assert.equal(changedTransport.sourceFingerprint, transportIdentity.sourceFingerprint);
+      stub(f, 'win', { metadata: metadata('win', undefined, { linuxTransport: true }), buildID: identity.buildID }).run), /buildID/);
   } finally { f.dispose(); }
 });
 
@@ -415,6 +470,21 @@ test('receipt verification checks identity beyond a self-consistent fingerprint'
     assert.throws(() => validateSourceReceipt(wrong, f.source, { ...f.manifest.sourceBuild, sourceReceiptFingerprint: wrong.fingerprint }), /dependency binding/);
     assert.throws(() => validateSourceReceipt({ ...f.receipt, schema: 'unknown' }, f.source, f.manifest.sourceBuild), /Unsupported/);
     assert.throws(() => validateSourceReceipt({ ...f.receipt, graphScope: 'all' }, f.source, f.manifest.sourceBuild), /scope/);
+    // The scope pair follows whether dependencies are declared; both mismatches reject.
+    const empty = fixture([]);
+    try {
+      validateSourceReceipt(empty.receipt, empty.source, empty.manifest.sourceBuild);
+      for (const [receipt, source, manifest, field, value] of [
+        [f.receipt, f.source, f.manifest, 'graphScope', 'core-source-only'],
+        [f.receipt, f.source, f.manifest, 'sourceGraphState', 'source-only'],
+        [empty.receipt, empty.source, empty.manifest, 'graphScope', 'declared-patched-modules'],
+        [empty.receipt, empty.source, empty.manifest, 'sourceGraphState', 'dependencies-patched']]) {
+        const { fingerprint: _stale, ...rest } = receipt;
+        const mismatched = signed({ ...rest, [field]: value });
+        assert.throws(() => validateSourceReceipt(mismatched, source, { ...manifest.sourceBuild,
+          sourceReceiptFingerprint: mismatched.fingerprint }), /module graph scope/);
+      }
+    } finally { empty.dispose(); }
     assert.throws(() => validateSourceReceipt({ ...f.receipt, moduleGraphQueries: ['stock/module'] }, f.source, f.manifest.sourceBuild), /scope/);
     const wrongURL = signed({ ...facts, sourceURL: 'https://github.com/example/stock' });
     assert.throws(() => validateSourceReceipt(wrongURL, f.source, { ...f.manifest.sourceBuild,
@@ -434,6 +504,21 @@ test('actual embedded stock replacement or feature loss rejects producer output'
       assert.equal(existsSync(dest), false);
     }
   } finally { f.dispose(); }
+  // With no declared dependency, any linked replacement row is refused by both entrypoints.
+  const empty = fixture([]);
+  try {
+    for (const key of Object.keys(DESKTOP_TARGETS)) {
+      validateBuildInfo(metadata(key, undefined, { patched: [] }), empty.source, key, empty.manifest.sourceBuild);
+      rejectProducerAndConsumerMetadata(empty, key, metadata(key, undefined, { patched: [['sing-tun', 'github.com/sagernet/sing-tun']] }),
+        /Undeclared embedded module replacement/);
+    }
+  } finally { empty.dispose(); }
+  // A declared graph also refuses a replacement on a module outside the declaration.
+  const declared = fixture();
+  try {
+    rejectProducerAndConsumerMetadata(declared, 'linux', metadata('linux', undefined, { patched: [...PATCHED, ['extra', 'example.com/extra']] }),
+      /Undeclared embedded module replacement/);
+  } finally { declared.dispose(); }
 });
 
 test('complete synthetic bundle is consistent after transport, never native proof', () => {
@@ -473,6 +558,9 @@ test('bundle byte mismatch and unknown receipt fail closed', () => {
     const receiptFile = join(directory, 'linux/sing-box.source-receipt.json');
     const receipt = JSON.parse(readFileSync(receiptFile));
     write(receiptFile, JSON.stringify({ ...receipt, schema: 'Unknown' }));
+    assert.throws(() => writeBundleInventory(directory, candidate), /fingerprint/);
+    const { fingerprint: _old, ...facts } = receipt;
+    write(receiptFile, JSON.stringify(signed({ ...facts, schema: 'Unknown' })));
     writeBundleInventory(directory, candidate);
     assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'], inspectStub), /receipt binding/);
     assert.equal(existsSync(join(f.root, 'resources')), false);
@@ -643,7 +731,9 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
     assert cli.returncode != 0
     assert not (root / 'invalid-cli-checkout').exists()
     cli_error = cli.stderr.decode()
-    print(json.dumps({'lfManifestEqual': linux_plain == windows_plain, 'sourceOnlyRawSums': [linux_plain['mainGoSumSha256'], windows_plain['mainGoSumSha256']],
+    print(json.dumps({'lfManifestEqual': linux_plain == windows_plain,
+        'sourceOnly': {key: linux_plain[key] for key in ('moduleGraph', 'moduleGraphSha256', 'moduleGraphQueries', 'dependencies', 'graphScope', 'sourceGraphState')},
+        'sourceOnlyRawSums': [linux_plain['mainGoSumSha256'], windows_plain['mainGoSumSha256']],
         'fullReceiptEqual': linux == windows, 'windowsError': windows_error, 'expectedTree': expected_tree,
         'linuxTree': linux['dependencies'][0]['patchedTree'], 'rejected': rejected,
         'cliNonzeroDiagnostics': {'nonzero': cli.returncode != 0,
@@ -653,6 +743,9 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
     encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
   }));
   assert.equal(result.lfManifestEqual, true, JSON.stringify(result));
+  assert.deepEqual(result.sourceOnly, { moduleGraph: [], moduleGraphSha256: EMPTY_GRAPH_SHA256, moduleGraphQueries: [],
+    dependencies: [], graphScope: 'core-source-only', sourceGraphState: 'source-only' });
+  assert.equal(digest(canonical([])), EMPTY_GRAPH_SHA256);
   assert.equal(result.fullReceiptEqual, true, JSON.stringify(result));
   assert.equal(result.windowsError, null);
   assert.equal(result.linuxTree, result.expectedTree);
@@ -663,7 +756,7 @@ with tempfile.TemporaryDirectory(prefix='polaris-provider-index-') as directory:
 
 test('shared source provider and desktop-only producers retain explicit platform impact', () => {
   assert.equal(digest(readFileSync(join(repo, 'scripts/core-source-provision.py'))),
-    '5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b');
+    'a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d');
   const provider = 'scripts/core-source-provision.py';
   const sharedImpact = classifyImpact([provider]);
   assert.equal(sharedImpact.kernel, true, provider);
@@ -671,7 +764,7 @@ test('shared source provider and desktop-only producers retain explicit platform
   assert.equal(sharedImpact.android, true, provider);
   assert.deepEqual(androidRegistrationOf(provider), { key: provider, table: 'ANDROID_IMPACT_SCOPES' });
   for (const path of ['scripts/build-desktop-core.test.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/build-core.mjs', 'scripts/desktop-core/bundle.mjs']) {
+    'scripts/desktop-core/build-core.mjs', 'scripts/desktop-core/bundle.mjs', 'scripts/desktop-core/fork-source.test.mjs']) {
     const impact = classifyImpact([path]);
     assert.equal(impact.kernel, true, path);
     assert.equal(impact.platforms.length, 4, path);
@@ -681,17 +774,16 @@ test('shared source provider and desktop-only producers retain explicit platform
   assert.match(readFileSync(join(repo, 'scripts/gate-node-test.sh'), 'utf8'), /scripts\/build-desktop-core\.test\.mjs/);
 });
 
-test('real tiny local Go cross-platform replacements preserve the graph while omitting Linux-only linked rows', {
+test('real tiny local Go cross-platform replacements enter every target BuildInfo', {
   skip: process.env.POLARIS_REAL_GO_BUILDINFO_TEST !== '1' ? 'explicit light Go fixture opt-in; default tests use stubs' : false,
 }, () => {
   const work = mkdtempSync(join(tmpdir(), 'polaris-real-buildinfo-'));
   try {
     const source = { goVersion: JSON.parse(readFileSync(join(repo, 'scripts/libbox-patches/source-manifest.json'))).goVersion,
-      dependencyPatches: PATCHED_MODULES.map((module, index) => ({ module, name: ['tiny', 'sing-tun', 'nftables'][index], upstreamVersion: 'v1.0.0' })) };
+      dependencyPatches: PATCHED.map(([name, module]) => ({ module, name, upstreamVersion: 'v1.0.0' })) };
     write(join(work, 'go.mod'), 'module example.com/probe\ngo 1.23\n' + source.dependencyPatches.map((dep) =>
       `require ${dep.module} v1.0.0\nreplace ${dep.module} => ./polaris-dependencies/${dep.name}\n`).join(''));
-    write(join(work, 'main.go'), 'package main\nimport ("example.com/tiny"; tun "github.com/sagernet/sing-tun")\nfunc main(){ println(tiny.Value()+tun.Value()) }\n');
-    write(join(work, 'main_linux.go'), 'package main\nimport nft "github.com/sagernet/nftables"\nfunc init(){ println(nft.Value()) }\n');
+    write(join(work, 'main.go'), 'package main\nimport ("example.com/tiny"; first "example.com/patched"; second "example.com/second")\nfunc main(){ println(tiny.Value()+first.Value()+second.Value()) }\n');
     for (const dep of source.dependencyPatches) {
       write(join(work, 'polaris-dependencies', dep.name, 'go.mod'), `module ${dep.module}\ngo 1.23\n`);
       write(join(work, 'polaris-dependencies', dep.name, 'value.go'), 'package tiny\nfunc Value() int { return 7 }\n');
@@ -702,8 +794,7 @@ test('real tiny local Go cross-platform replacements preserve the graph while om
     const spec = { dependencyModules: PATCHED_MODULES, transportPins: Object.fromEntries(PATCHED_MODULES.map((module) => [module, 'v1.0.0'])),
       platforms: Object.fromEntries(Object.keys(DESKTOP_TARGETS).map((key) => [key, {
         patchedModules: platformPolicies(key).patchedModules,
-        transportModules: { requiredLinked: PATCHED_MODULES.filter((module) => key === 'linux' || module !== NFT_MODULE),
-          confirmedAbsent: key === 'linux' ? [] : [NFT_MODULE] } }])) };
+        transportModules: { requiredLinked: [...PATCHED_MODULES], confirmedAbsent: [] } }])) };
     const goModSha256 = digest(readFileSync(join(work, 'go.mod')));
     for (const [key, target] of Object.entries(DESKTOP_TARGETS)) {
       const binary = join(work, key, coreFilename(key));
@@ -715,12 +806,237 @@ test('real tiny local Go cross-platform replacements preserve the graph while om
       assert.equal(execFileSync(go, ['tool', 'buildid', binary], targetOptions).trim(), buildID);
       const raw = execFileSync(go, ['version', '-m', binary], targetOptions);
       const facts = validateBuildInfo(raw, source, key, spec);
-      for (const dep of source.dependencyPatches.filter((dep) => key === 'linux' || dep.module !== NFT_MODULE)) {
+      for (const dep of source.dependencyPatches) {
         assert.equal(facts.modules.get(dep.module)?.version, 'v1.0.0');
         assert.equal(facts.modules.get(dep.module)?.replacement, `./polaris-dependencies/${dep.name}`);
       }
-      assert.equal(facts.modules.has(NFT_MODULE), key === 'linux');
       assert.equal(digest(readFileSync(join(work, 'go.mod'))), goModSha256);
     }
   } finally { rmSync(work, { recursive: true, force: true }); }
+});
+
+test('Mac producer observes final signature bytes before hashing, and rejects missing/bad signatures', () => {
+  const f = fixture();
+  try {
+    for (const key of ['mac-x64', 'mac-arm64']) {
+      const s = stub(f, key);
+      const run = (command, args, options) => {
+        // Synthetic signing-byte boundary only, not a real codesign verdict.
+        if (command === 'codesign' && args[0] === '--verify') write(args.at(-1), `final signed bytes ${key}`);
+        return s.run(command, args, options);
+      };
+      const dest = join(f.root, 'observed', key, 'sing-box');
+      const receipt = produceDesktopCore(f.root, f.manifest, key, dest, candidate, run);
+      assert.equal(receipt.binarySha256, digest(`final signed bytes ${key}`));
+      assert.deepEqual(receipt.macCodeSignature, { state: 'signed', cdHash: 'a'.repeat(40) });
+      assert.equal(digest(readFileSync(dest)), receipt.binarySha256);
+      for (const state of ['invalid', ...(key === 'mac-arm64' ? ['unsigned'] : [])]) {
+        const blocked = join(f.root, 'blocked', key, state);
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, blocked, candidate,
+          stub(f, key, { signature: state }).run), /signature invalid or missing/);
+        assert.equal(existsSync(blocked), false);
+      }
+      for (const cdHash of ['', 'not-a-cdhash', 'a'.repeat(64)]) {
+        assert.throws(() => produceDesktopCore(f.root, f.manifest, key, dest, candidate,
+          stub(f, key, { cdHash }).run), /unique actual CDHash/);
+      }
+    }
+    const unsigned = produceDesktopCore(f.root, f.manifest, 'mac-x64', join(f.root, 'intel/core'), candidate,
+      stub(f, 'mac-x64', { signature: 'unsigned' }).run);
+    assert.deepEqual(unsigned.macCodeSignature, { state: 'unsigned', cdHash: null });
+  } finally { f.dispose(); }
+});
+
+test('Mac signature state/CDHash must match actual consumer observations and immutable transport bytes', () => {
+  for (const mutation of ['state', 'cdHash', 'fingerprint', 'bytes']) {
+    const f = fixture();
+    try {
+      const directory = produceAll(f);
+      // Explicit mock host exercises the actual Mac consumer branch on Linux.
+      consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['mac-arm64'], inspectStub, 'darwin');
+      const packaged = join(f.root, 'resources/mac-arm64/sing-box');
+      verifyPackagedSource(f.root, f.manifest, 'mac-arm64', packaged, inspectStub, 'darwin');
+      const wrongActualSignature = (command, args) => command === 'codesign' && args[0] === '--display'
+        ? { status: 0, stderr: `CDHash=${'b'.repeat(40)}\n` } : inspectStub(command, args);
+      assert.throws(() => verifyPackagedSource(f.root, f.manifest, 'mac-arm64', packaged,
+        wrongActualSignature, 'darwin'), /Actual Mac signature/);
+      const file = join(directory, 'mac-x64', 'sing-box.source-receipt.json');
+      const receipt = JSON.parse(readFileSync(file));
+      if (mutation === 'bytes') write(join(directory, 'mac-x64', 'sing-box'), 'modified after signature');
+      else {
+        if (mutation === 'state') receipt.macCodeSignature = { state: 'unsigned', cdHash: null };
+        if (mutation === 'cdHash') receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        if (mutation !== 'fingerprint') {
+          const { fingerprint: _old, ...facts } = receipt;
+          receipt.fingerprint = digest(canonical(facts));
+        } else receipt.macCodeSignature.cdHash = 'b'.repeat(40);
+        write(file, JSON.stringify(receipt));
+      }
+      if (mutation === 'fingerprint' || mutation === 'bytes') assert.throws(() => writeBundleInventory(directory, candidate), /fingerprint|SHA-256/);
+      else {
+        writeBundleInventory(directory, candidate);
+        assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate, ['linux'], inspectStub, 'darwin'), /Actual Mac signature/);
+      }
+    } finally { f.dispose(); }
+  }
+});
+
+test('producer refuses a byte change after receipt hash and before publishing staged output', () => {
+  const f = fixture();
+  try {
+    const s = stub(f, 'mac-arm64');
+    const run = (command, args, options) => {
+      if (command === 'git' && args[0] === 'add') {
+        const build = s.calls.find((x) => x.args[0] === 'build');
+        if (build) write(build.args[build.args.indexOf('-o') + 1], 'modified after final digest');
+      }
+      return s.run(command, args, options);
+    };
+    const dest = join(f.root, 'must-not-publish/core');
+    assert.throws(() => produceDesktopCore(f.root, f.manifest, 'mac-arm64', dest, candidate, run), /SHA-256/);
+    assert.equal(existsSync(dest), false);
+  } finally { f.dispose(); }
+});
+
+test('consumer rejects a selected artifact changed after all inspections but before staging', () => {
+  const f = fixture();
+  try {
+    const directory = produceAll(f);
+    const run = (command, args) => {
+      const answer = inspectStub(command, args);
+      if (args[0] === 'tool' && args[1] === 'buildid' && args[2].split(/[/\\]/).at(-2) === 'mac-arm64') {
+        write(join(directory, 'mac-x64/sing-box'), 'changed after inspection');
+      }
+      return answer;
+    };
+    assert.throws(() => consumeDesktopBundle(f.root, f.manifest, directory, candidate,
+      ['mac-x64'], run, 'darwin'), /SHA-256/);
+    assert.equal(existsSync(join(f.root, 'resources/mac-x64/sing-box')), false);
+  } finally { f.dispose(); }
+});
+
+
+test('legacy source remains selected only when desktopSourceBuild is absent', () => {
+  const f = fixture([]);
+  try {
+    assert.equal(validateSourcePins(f.manifest, 'linux', false), f.manifest.sourceBuild);
+    const baseline = frozenSourceVersion(f.manifest);
+    assert.ok(baseline);
+    for (const invalid of [null, [], {}, f.manifest.sourceBuild]) {
+      const manifest = { ...f.manifest, desktopSourceBuild: invalid };
+      assert.equal(frozenSourceVersion(manifest), undefined);
+      for (const key of Object.keys(DESKTOP_TARGETS)) assert.throws(() => validateSourcePins(manifest, key, false));
+    }
+    assert.equal(frozenSourceVersion(f.manifest), baseline);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+// Synthetic bridge cases run no kernel, loader, producer API or installer.
+const validationEnv = {
+  POLARIS_NATIVE_PAYLOAD_VALIDATION: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'workflow_dispatch',
+  GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_SHA: candidate, GITHUB_RUN_ID: '900', GITHUB_RUN_ATTEMPT: '1',
+  GITHUB_REF: 'refs/heads/collab/fk02-native-payload-validation-20261010',
+  GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/collab/fk02-native-payload-validation-20261010',
+};
+function withValidationEnv(callback) {
+  const names = [...Object.keys(validationEnv), 'POLARIS_NO_KERNEL_RUN'];
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, validationEnv); delete process.env.POLARIS_NO_KERNEL_RUN;
+  try { return callback(); } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+}
+function bridgeFixture() {
+  const f = fixture(), directory = produceAll(f), old = 'b'.repeat(40);
+  const policy = { schema: 'polaris-desktop-validation-origin-v1', repository: 'polaris-arch/Polaris', repositoryId: 1347028220,
+    runId: 800, attempt: 1, workflowHead: 'a'.repeat(40), candidate: old, platforms: {} };
+  const transport = { repository: policy.repository, run: { id: 800, run_attempt: 1, head_sha: policy.workflowHead,
+    status: 'completed', conclusion: 'success', event: 'workflow_dispatch', repository: { id: policy.repositoryId },
+    head_repository: { id: policy.repositoryId } }, artifacts: {} };
+  for (const [index, key] of ['linux', 'mac-x64', 'mac-arm64'].entries()) {
+    const receiptFile = join(directory, key, `${coreFilename(key)}.source-receipt.json`);
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(receiptFile));
+    const receipt = signed({ ...facts, candidate: old });
+    write(receiptFile, JSON.stringify(receipt));
+    const pin = policy.platforms[key] = { artifactId: 100 + index,
+      artifactName: `desktop-core-producer-${old}-800-1-${key}`, archiveSha256: 'e'.repeat(64),
+      binarySha256: receipt.binarySha256, receiptSha256: digest(readFileSync(receiptFile)),
+      platformInputFingerprint: receipt.platformInputFingerprint, sourceFingerprint: receipt.sourceFingerprint,
+      buildID: receipt.buildID, buildInfoSha256: receipt.buildInfoSha256, macCodeSignature: receipt.macCodeSignature ?? null };
+    transport.artifacts[key] = { archiveSha256: pin.archiveSha256, api: { id: pin.artifactId, name: pin.artifactName,
+      expired: false, digest: `sha256:${pin.archiveSha256}`, workflow_run: { id: 800, head_sha: policy.workflowHead,
+        repository_id: policy.repositoryId, head_repository_id: policy.repositoryId } } };
+  }
+  write(join(f.root, 'scripts/desktop-core/validation-origin.json'), JSON.stringify(policy));
+  write(join(directory, 'origin-transport.json'), JSON.stringify(transport));
+  return { ...f, directory, policy, transport };
+}
+test('validation bridge preserves original receipts and still verifies four actual inputs before a subset', () => {
+  const f = bridgeFixture();
+  try {
+    withValidationEnv(() => {
+      const before = Object.fromEntries(Object.keys(DESKTOP_TARGETS).map((key) => [key,
+        readFileSync(join(f.directory, key, `${coreFilename(key)}.source-receipt.json`))]));
+      const inventory = writeValidationBundle(f.root, f.directory, candidate);
+      consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub);
+      assert.equal(inventory.candidate, candidate);
+      assert.equal(inventory.origins.linux.candidate, f.policy.candidate);
+      assert.equal(inventory.origins.win.candidate, candidate);
+      for (const key of Object.keys(DESKTOP_TARGETS)) {
+        assert.deepEqual(readFileSync(join(f.root, `resources/.source-receipts/${key}.json`)), before[key]);
+      }
+      verifyPackagedSource(f.root, f.manifest, 'linux', join(f.root, 'resources/linux/sing-box'), inspectStub);
+    });
+  } finally { f.dispose(); }
+});
+for (const [name, change] of [
+  ['local host', { GITHUB_ACTIONS: 'false' }], ['tag', { GITHUB_REF: 'refs/tags/v1' }],
+  ['PR event', { GITHUB_EVENT_NAME: 'pull_request' }], ['other candidate', { GITHUB_SHA: 'a'.repeat(40) }],
+  ['ordinary mode', { POLARIS_NATIVE_PAYLOAD_VALIDATION: '0' }], ['local no-kernel override', { POLARIS_NO_KERNEL_RUN: '1' }],
+  ['other workflow', { GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/package.yml@refs/heads/x' }],
+  ['missing run', { GITHUB_RUN_ID: '' }], ['bad attempt', { GITHUB_RUN_ATTEMPT: '0' }],
+]) test(`validation context refuses ${name}`, () => {
+  const f = fixture();
+  try { assert.throws(() => validationContext(candidate, { ...validationEnv, ...change }, f.root), /exact non-tag/); }
+  finally { f.dispose(); }
+});
+for (const [name, mutate] of [
+  ['failed origin run', (f) => { f.transport.run.conclusion = 'failure'; }],
+  ['origin rerun', (f) => { f.transport.run.run_attempt = 2; }],
+  ['wrong workflow head', (f) => { f.transport.run.head_sha = 'f'.repeat(40); }],
+  ['foreign repository', (f) => { f.transport.run.head_repository.id = 123; }],
+  ['expired artifact', (f) => { f.transport.artifacts.linux.api.expired = true; }],
+  ['archive tamper', (f) => { f.transport.artifacts.linux.archiveSha256 = 'f'.repeat(64); }],
+  ['wrong artifact id', (f) => { f.transport.artifacts.linux.api.id = 999; }],
+  ['source input drift', (f) => { f.manifest.sourceBuild.transportPins['example.com/transport'] = 'v9.0.0'; }],
+  ['new current relabel of old receipt', (f) => {
+    const path = join(f.directory, 'linux/sing-box.source-receipt.json');
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(path)); write(path, JSON.stringify(signed({ ...facts, candidate })));
+  }],
+  ['old Windows candidate', (f) => {
+    const path = join(f.directory, 'win/sing-box.exe.source-receipt.json');
+    const { fingerprint: _, ...facts } = JSON.parse(readFileSync(path)); write(path, JSON.stringify(signed({ ...facts, candidate: f.policy.candidate })));
+  }],
+  ['unselected Mac bytes corrupt', (f) => { write(join(f.directory, 'mac-x64/sing-box'), 'tamper'); }],
+]) test(`validation bridge refuses ${name} before publishing resources`, () => {
+  const f = bridgeFixture();
+  try {
+    mutate(f); write(join(f.directory, 'origin-transport.json'), JSON.stringify(f.transport));
+    withValidationEnv(() => assert.throws(() => {
+      writeValidationBundle(f.root, f.directory, candidate);
+      consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub);
+    }));
+    assert.equal(existsSync(join(f.root, 'resources/linux/sing-box')), false);
+  } finally { f.dispose(); }
+});
+test('validation bundle cannot be relabeled into strict production v1', () => {
+  const f = bridgeFixture();
+  try {
+    const inventory = writeValidationBundle(f.root, f.directory, candidate, validationEnv);
+    inventory.schema = 'polaris-desktop-bundle-v1'; write(join(f.directory, 'bundle.json'), JSON.stringify(inventory));
+    assert.throws(() => consumeDesktopBundle(f.root, f.manifest, f.directory, candidate, ['linux'], inspectStub), /candidate differs/);
+  } finally { f.dispose(); }
 });

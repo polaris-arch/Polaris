@@ -39,6 +39,8 @@ import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { basename, dirname, join, relative, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
+import { verifyCronetPayload } from './lib/cronet-payload.mjs';
+import { hasTemporaryDesktop, verifiedCandidateSource, verifyCandidateAppCarrier } from './desktop-core/native-dns-candidate.mjs';
 
 export const APPIMAGE_HOST_WAYLAND_LIBS = Object.freeze([
   'libwayland-client.so.0',
@@ -52,6 +54,9 @@ const GIO_DIR_PREFIX = 'export GIO_MODULE_DIR=';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const APPIMAGE_CORE_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/sing-box';
 const CRONET_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/libcronet.so';
+export const APPIMAGE_HELPER_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/polaris-helper';
+const INSTALL_MANIFEST_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/core-manifest.json';
+export const APPIMAGE_CARRIER_MEMBER = 'usr/lib/Polaris/_up_/resources/linux/candidate-carrier.json';
 
 function regularMember(root, member) {
   let path = resolve(root);
@@ -72,37 +77,74 @@ function identity(path) {
   return { sha256: createHash('sha256').update(readFileSync(path)).digest('hex'), mode: lstatSync(path).mode & 0o7777 };
 }
 
-// linuxdeploy may rewrite ELF resources without a GNU Build ID. The bundled
-// fallback core must retain the verified fetch-core seed, including its mode.
-// Cronet stays beside it; the pinned loader searches the executable directory.
+// The caller must obtain source from verifiedCandidateSource. Binding this exact
+// receipt also covers the final SquashFS, whose bytes can differ from AppDir.
+export function verifyTemporaryCarrierReceipt(sourceRoot, appDir, source) {
+  const original = regularMember(sourceRoot, 'resources/linux/candidate-carrier.json');
+  const installed = regularMember(appDir, APPIMAGE_CARRIER_MEMBER);
+  verifyCandidateAppCarrier(dirname(original), source, 'linux');
+  verifyCandidateAppCarrier(dirname(installed), source, 'linux');
+  if (!readFileSync(original).equals(readFileSync(installed)))
+    throw new Error('AppDir temporary carrier receipt differs from compiled input');
+  return { [APPIMAGE_CARRIER_MEMBER]: identity(original) };
+}
+
+// Restore both canonical seeds before repacking. Cronet's fixed source library
+// has only system NEEDED entries and no RPATH/RUNPATH; no transform is allowed.
+// Validate all inputs before replacement and bind final SquashFS bytes to these
+// source identities, never to a processed AppDir or an unchanged GNU Build ID.
 export function restoreCoreSeed(appDir, sourceRoot = ROOT) {
   const source = regularMember(sourceRoot, 'resources/linux/sing-box');
   const target = regularMember(appDir, APPIMAGE_CORE_MEMBER);
-  const cronet = regularMember(appDir, CRONET_MEMBER);
-  const matches = [];
+  const cronetSource = regularMember(sourceRoot, 'resources/linux/libcronet.so');
+  const cronetTarget = regularMember(appDir, CRONET_MEMBER);
+  const helperSource = regularMember(sourceRoot, 'resources/linux/polaris-helper');
+  const helperTarget = regularMember(appDir, APPIMAGE_HELPER_MEMBER);
+  const installationSource = regularMember(sourceRoot, 'resources/linux/core-manifest.json');
+  const installationTarget = regularMember(appDir, INSTALL_MANIFEST_MEMBER);
+  const manifest = JSON.parse(readFileSync(regularMember(sourceRoot, 'src-tauri/core-manifest.json'), 'utf8'));
+  const verifiedCronet = verifyCronetPayload(cronetSource, cronetSource, 'linux', manifest);
+  const matches = new Map([['sing-box', []], ['libcronet.so', []], ['polaris-helper', []]]);
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
-      if (entry.name === 'sing-box') matches.push(path);
+      if (matches.has(entry.name)) matches.get(entry.name).push(path);
       if (entry.isDirectory()) visit(path);
     }
   };
   visit(appDir);
-  if (matches.length !== 1 || matches[0] !== target) throw new Error(`AppDir 核心成员必须唯一且位于 ${APPIMAGE_CORE_MEMBER}`);
+  for (const [name, wanted] of [['sing-box', target], ['libcronet.so', cronetTarget], ['polaris-helper', helperTarget]]) {
+    const found = matches.get(name);
+    if (found.length !== 1 || found[0] !== wanted) throw new Error(`AppDir ${name} 成员必须唯一且位于 ${wanted}`);
+  }
   const expected = identity(source);
   if ((expected.mode & 0o111) === 0) throw new Error('源内核不可执行');
+  const cronetIdentity = { sha256: verifiedCronet.sha256, mode: verifiedCronet.mode };
+  const helperIdentity = identity(helperSource), installationIdentity = identity(installationSource);
+  const installation = JSON.parse(readFileSync(installationSource));
+  if (installation.core?.helperSha256 !== helperIdentity.sha256) throw new Error('source helper differs from compiled installation pin');
+  if (!readFileSync(installationSource).equals(readFileSync(installationTarget))) throw new Error('AppDir installation manifest differs from compiled input');
+  const seeds = [[source, target, expected], [cronetSource, cronetTarget, cronetIdentity],
+    [helperSource, helperTarget, helperIdentity]];
   const staging = mkdtempSync(join(dirname(target), '.core-seed-'));
   try {
-    const copy = join(staging, 'sing-box');
-    copyFileSync(source, copy);
-    chmodSync(copy, expected.mode);
-    if (JSON.stringify(identity(copy)) !== JSON.stringify(expected)) throw new Error('源内核副本 SHA/权限不符');
-    renameSync(copy, target); // never overwrite through a pre-existing hardlink
+    for (const [input, output, wanted] of seeds) {
+      const copy = join(staging, basename(output));
+      copyFileSync(input, copy); chmodSync(copy, wanted.mode);
+      if (JSON.stringify(identity(copy)) !== JSON.stringify(wanted)) throw new Error('源种子副本 SHA/权限不符');
+    }
+    for (const [, output, wanted] of seeds) {
+      renameSync(join(staging, basename(output)), output); // no write through former hardlinks
+      if (JSON.stringify(identity(output)) !== JSON.stringify(wanted)) throw new Error('AppDir 种子 SHA/权限不符');
+    }
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
-  if (JSON.stringify(identity(target)) !== JSON.stringify(expected)) throw new Error('AppDir 内核 SHA/权限不符');
-  return { [APPIMAGE_CORE_MEMBER]: expected, [CRONET_MEMBER]: identity(cronet) };
+  verifyCronetPayload(cronetSource, cronetTarget, 'linux', manifest);
+  const carrier = hasTemporaryDesktop(manifest)
+    ? verifyTemporaryCarrierReceipt(sourceRoot, appDir, verifiedCandidateSource(sourceRoot)) : {};
+  return { [APPIMAGE_CORE_MEMBER]: expected, [CRONET_MEMBER]: cronetIdentity,
+    [APPIMAGE_HELPER_MEMBER]: helperIdentity, [INSTALL_MANIFEST_MEMBER]: installationIdentity, ...carrier };
 }
 
 // Read SquashFS with a host tool, never execute the AppImage runtime. A magic
@@ -278,7 +320,7 @@ function main() {
   const violations = appImageRuntimeViolations(appDir);
   if (violations.length > 0) throw new Error(`AppDir 兼容契约未成立：\n  - ${violations.join('\n  - ')}`);
   const members = restoreCoreSeed(appDir);
-  console.log(`AppDir core seed: SHA256=${members[APPIMAGE_CORE_MEMBER].sha256}`);
+  console.log(`AppDir canonical seeds: core SHA256=${members[APPIMAGE_CORE_MEMBER].sha256}; Cronet SHA256=${members[CRONET_MEMBER].sha256}; policy=original-bytes`);
 
   const temporary = join(dirname(artifact), `.${basename(artifact)}.postprocess.AppImage`);
   if (existsSync(temporary)) throw new Error(`拒绝覆盖上次失败残件：${temporary}`);

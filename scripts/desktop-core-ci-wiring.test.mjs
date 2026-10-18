@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { ANDROID_IMPACT_SCOPES, androidRegistrationOf, classifyImpact } from './classify-ci-impact.mjs';
+import { desktopProducerPlan } from './desktop-core/validation-origin.mjs';
+import { desktopSourceGoVersion } from './desktop-core/source-graph.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const files = Object.fromEntries(['desktop-core', 'release-risk', 'package'].map((name) =>
@@ -21,16 +23,24 @@ function kernelCoverage(source) {
   assert.doesNotMatch(source, /POLARIS_NO_KERNEL_RUN/, 'CI must retain kernel coverage; only the local gate sets this switch');
 }
 function packageFetchStep(source) {
-  const marker = '      - name: Fetch sing-box core (SHA256-pinned)\n';
+  const marker = '      - name: Consume sing-box core bundle\n';
   const body = job(source, 'package');
   assert.ok(body.includes(marker), 'Package requires its exact source consumption step');
   return body.split(marker)[1].split('\n      - ')[0];
+}
+function replacePackageFetchShell(source, replacement) {
+  const body = job(source, 'package'), before = packageFetchStep(source);
+  assert.match(before, /^        shell: bash$/m, 'mutation requires the actual consumption shell');
+  const after = before.replace(/^        shell: bash\n/m, replacement);
+  assert.notEqual(after, before, 'shell negative control must alter the selected step');
+  assert.equal(body.split(before).length, 2, 'selected consumption step must be unique in Package');
+  return source.replace(body, body.replace(before, after));
 }
 function candidates(source) {
   const producer = source['desktop-core'];
   const risk = source['release-risk'];
   const pkg = source.package;
-  assert.equal((producer.match(/ref: \$\{\{ inputs.candidate \}\}/g) ?? []).length, 2, 'both producer and assembly checkout candidate');
+  assert.equal((producer.match(/ref: \$\{\{ inputs.candidate \}\}/g) ?? []).length, 3, 'plan, producer and assembly checkout candidate');
   assert.match(producer, /CORE_CANDIDATE: \$\{\{ inputs.candidate \}\}/);
   assert.match(producer, /git rev-parse HEAD\)" = "\$CORE_CANDIDATE"/);
   assert.match(producer, /git status --porcelain --untracked-files=no/);
@@ -49,9 +59,11 @@ function bundles(source) {
   const assemble = job(source['desktop-core'], 'assemble');
   const preflight = job(source['release-risk'], 'preflight');
   const packageJob = job(source.package, 'package');
+  // The host-independent wire gate consumes the same exact bundle in its own job.
+  const wireJob = job(source.package, 'core_wire');
   assert.match(producer, /name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-\$\{\{ matrix.platform \}\}/);
   assert.match(producer, /path: \$\{\{ runner.temp \}\}\/desktop-core-bundle\n/, 'upload bundle root retains platform directories');
-  assert.match(assemble, /needs: produce/);
+  assert.match(assemble, /needs: \[plan, produce\]/);
   const names = [...assemble.matchAll(/name: desktop-core-producer-\$\{\{ inputs.candidate \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}-([^\n]+)/g)].map((match) => match[1]);
   assert.deepEqual(names, ['linux', 'win', 'mac-x64', 'mac-arm64'], 'exact four downloads from the current candidate/run/attempt');
   assert.equal((assemble.match(/actions\/download-artifact@v8/g) ?? []).length, 4);
@@ -60,7 +72,7 @@ function bundles(source) {
   assert.match(source['desktop-core'], /CORE_RUN_ID: \$\{\{ github.run_id \}\}/);
   assert.match(source['desktop-core'], /CORE_RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}/);
   assert.match(assemble, /name: \$\{\{ steps.bundle.outputs.artifact_name \}\}/);
-  for (const body of [assemble, preflight, packageJob]) {
+  for (const body of [assemble, preflight, packageJob, wireJob]) {
     assert.match(body, /actions\/download-artifact@v8/);
     assert.doesNotMatch(body, /^\s+(?:run-id|github-token|repository):/m, 'artifact download must remain within this run');
     assert.match(body, /go-version: \$\{\{ steps.(?:go-pin|core-go).outputs.version \}\}/);
@@ -79,54 +91,129 @@ function bundles(source) {
   assert.match(job(source.package, 'setup'), /CORE_RUN_ATTEMPT: \$\{\{ github.run_attempt \}\}/);
   assert.match(packageJob, /CORE_BUNDLE_ARTIFACT: \$\{\{ inputs.core_bundle_artifact \|\| needs.desktop_core.outputs.artifact_name \}\}/);
   assert.match(packageJob, /name: \$\{\{ env.CORE_BUNDLE_ARTIFACT \}\}/);
+  assert.match(wireJob, /CORE_BUNDLE_ARTIFACT: \$\{\{ inputs.core_bundle_artifact \|\| needs.desktop_core.outputs.artifact_name \}\}/);
+  assert.match(wireJob, /name: \$\{\{ env.CORE_BUNDLE_ARTIFACT \}\}/);
+  assert.match(wireJob, /ref: \$\{\{ needs.setup.outputs.candidate \}\}/);
+  assert.match(wireJob, /CORE_CANDIDATE: \$\{\{ needs.setup.outputs.candidate \}\}/);
   const fetch = packageFetchStep(source.package);
   assert.match(fetch, /^        shell: bash$/m, 'Windows consumption must expand the declared environment with Bash');
   assert.match(fetch, /^        run: node scripts\/fetch-core.mjs --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"$/m);
 }
-function packageAllows(source, setup, core, provided) {
-  const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, 'package'));
-  assert.ok(block, 'package needs explicit reusable-source skip allowlist');
+// `always` is deliberately not supplied: an expression that still calls always()
+// throws here. always() keeps an in-flight installer leg alive after its run is
+// cancelled (GitHub re-evaluates `if` on cancellation), which is what made a
+// superseded Release Risk run hold its concurrency group to the end.
+function jobAllows(source, name, setup, core, provided, runCancelled = false) {
+  const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, name));
+  assert.ok(block, `${name} needs explicit reusable-source skip allowlist`);
   const expression = block[1].split('\n').map((line) => line.trim()).join(' ');
   // The actual allowlist is a boolean expression shared by JS and Actions.
   // Only immutable status/input dictionaries are supplied; no workflow is run.
-  return Boolean(Function('needs', 'inputs', 'always', `return (${expression});`)(
+  return Boolean(Function('needs', 'inputs', 'cancelled', `return (${expression});`)(
     { setup: { result: setup }, desktop_core: { result: core } },
-    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => true));
+    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => runCancelled));
 }
 function checkAllowlist(source) {
   assert.match(job(source, 'desktop_core'), /if: inputs.core_bundle_artifact == ''/);
-  for (const [setup, core, provided, allowed] of [
-    ['success', 'success', false, true], ['success', 'skipped', true, true],
-    ['success', 'skipped', false, false], ['success', 'failure', true, false],
-    ['success', 'cancelled', true, false], ['failure', 'success', false, false],
-    ['cancelled', 'skipped', true, false], ['skipped', 'success', false, false],
-  ]) assert.equal(packageAllows(source, setup, core, provided), allowed, `${setup}/${core}/provided=${provided}`);
+  // Installer legs and the single wire job share one allowlist.
+  for (const name of ['package', 'core_wire']) {
+    for (const [setup, core, provided, allowed] of [
+      ['success', 'success', false, true], ['success', 'skipped', true, true],
+      ['success', 'skipped', false, false], ['success', 'failure', true, false],
+      ['success', 'cancelled', true, false], ['failure', 'success', false, false],
+      ['cancelled', 'skipped', true, false], ['skipped', 'success', false, false],
+    ]) {
+      assert.equal(jobAllows(source, name, setup, core, provided), allowed, `${name}: ${setup}/${core}/provided=${provided}`);
+      // A cancelled run stops the job on every row, including the two allowed ones.
+      assert.equal(jobAllows(source, name, setup, core, provided, true), false, `${name}: cancelled run ${setup}/${core}/provided=${provided}`);
+    }
+  }
 }
 
 test('four source producers use exact native hosts, source Go pin and real Darwin SDK', () => {
   const workflow = files['desktop-core'];
   kernelCoverage(workflow);
   assert.throws(() => kernelCoverage(workflow.replace('env:\n', "env:\n  POLARIS_NO_KERNEL_RUN: '1'\n")));
-  const rows = job(workflow, 'produce').split('\n').filter((line) => /^\s+- \{"platform"/.test(line))
-    .map((line) => JSON.parse(line.slice(line.indexOf('{'))));
-  assert.deepEqual(rows, [
-    { platform: 'linux', os: 'ubuntu-22.04', host: 'linux', arch: 'x64' },
-    { platform: 'win', os: 'windows-2022', host: 'win32', arch: 'x64' },
-    { platform: 'mac-x64', os: 'macos-15-intel', host: 'darwin', arch: 'x64' },
-    { platform: 'mac-arm64', os: 'macos-15', host: 'darwin', arch: 'arm64' },
-  ]);
+  assert.match(workflow, /include: \$\{\{ fromJSON\(needs.plan.outputs.matrix\) \}\}/);
+  assert.match(job(workflow, 'produce'), /needs: plan/);
+  const planning = job(workflow, 'plan');
+  assert.match(planning, /git rev-parse HEAD/);
+  assert.match(planning, /git status --porcelain --untracked-files=no/);
+  assert.match(planning, /desktopProducerPlan\(process.cwd\(\),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"\)/);
+  assert.match(planning, /legacy_origins="\+p.legacyOrigins/);
+  assert.match(job(workflow, 'assemble'), /Retrieve reviewed unchanged native origins\n        if: needs.plan.outputs.legacy_origins == 'true'/);
+  assert.equal((job(workflow, 'assemble').match(/if: needs.plan.outputs.legacy_origins != 'true'/g) ?? []).length, 3);
+  assert.match(workflow, /native_validation:[\s\S]*?default: false/);
   assert.match(workflow, /process.platform !== process.env.CORE_HOST \|\| process.arch !== process.env.CORE_ARCH/);
   assert.match(workflow, /xcrun --sdk macosx --show-sdk-path/);
   assert.match(workflow, /\[ -d "\$sdk" \]/);
   assert.match(workflow, /xcrun --sdk macosx --find clang\+\+/);
   assert.match(workflow, /echo "SDKROOT=\$sdk"/);
   assert.match(workflow, /echo "CC=\$cc"/);
-  assert.match(workflow, /require\("\.\/scripts\/libbox-patches\/source-manifest.json"\).goVersion/);
+  const requireGoSelection = (text) => {
+    const pins = text.split('\n').filter((line) => line.includes('run: node') && line.includes('version='));
+    assert.equal(pins.length, 2);
+    for (const pin of pins) {
+      assert.match(pin, /desktopSourceGoVersion\(process.cwd\(\), JSON.parse\(readFileSync\("src-tauri\/core-manifest.json"/);
+      assert.doesNotMatch(pin, /libbox-patches|ios|gomobile/);
+    }
+  };
+  requireGoSelection(workflow);
+  assert.throws(() => requireGoSelection(workflow.replaceAll('desktopSourceGoVersion(process.cwd(),', 'mobileGoVersion(process.cwd(),')));
   assert.match(job(workflow, 'produce'), /--producer --platform="\$CORE_PLATFORM"/);
   assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
 });
 
+test('all five producer and consumer Go setup steps select the pinned desktop source', () => {
+  const scopes = [
+    ['desktop-core', 'produce'], ['desktop-core', 'assemble'],
+    ['release-risk', 'preflight'], ['package', 'package'], ['package', 'core_wire'],
+  ];
+  const requireSelection = (body) => {
+    const pins = body.split('\n').filter((line) => line.includes('run: node') && line.includes('version='));
+    assert.equal(pins.length, 1, 'each source job has exactly one Go pin command');
+    assert.match(pins[0], /desktopSourceGoVersion\(process.cwd\(\), JSON.parse\(readFileSync\("src-tauri\/core-manifest.json"/);
+    assert.doesNotMatch(pins[0], /windowsBuild|libbox-patches|ios|gomobile/);
+    assert.ok(body.indexOf(pins[0]) < body.indexOf('uses: actions/setup-go@v6'));
+  };
+  for (const [workflow, name] of scopes) {
+    const body = job(files[workflow], name);
+    requireSelection(body);
+    for (const replacement of ['mobileGoVersion', 'windowsBuildGoVersion']) {
+      assert.throws(() => requireSelection(body.replace('desktopSourceGoVersion(process.cwd(),', `${replacement}(process.cwd(),`)), `${workflow}/${name}`);
+    }
+    assert.throws(() => requireSelection(body.replace(/^.*run: node.*version=.*\n/m, '')), `${workflow}/${name}: missing selection`);
+  }
+});
+
 test('candidate checkout and App/helper identity follow PR head instead of a default merge or old source', () => {
+  // Windows directory acceptance reads the full contract, which legitimately
+  // contains empty source-policy keys; PSCustomObject cannot represent them.
+  const contract = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/historical-release-contract-577d4b9.json'), 'utf8'));
+  const hasEmptyKey = (value) => value && typeof value === 'object'
+    && (Object.hasOwn(value, '') || Object.values(value).some(hasEmptyKey));
+  assert.ok(hasEmptyKey(contract), 'exercise the actual contract shape that broke PowerShell parsing');
+  function requireDirectoryInputs(ci, producer) {
+    for (const source of [ci, producer]) {
+      const read = source.split('\n').filter((line) => line.includes('release-contract.json') && line.includes('ConvertFrom-Json'));
+      assert.equal(read.length, 1, 'one full contract read per acceptance entry');
+      assert.match(read[0], /ConvertFrom-Json -AsHashtable\)\.platforms\.win/);
+    }
+    assert.match(ci, /go-version: \$\{\{ steps\.windows_directory_go\.outputs\.version \}\}/);
+    assert.match(ci, /python scripts\/windows-directory\/resolve-toolchain\.py/);
+    assert.match(ci, /--github-output \$env:GITHUB_OUTPUT/);
+    assert.match(producer, /resolve-toolchain\.py.*--actual-go \$actualGo/);
+    assert.doesNotMatch(ci, /go-version-file: \.windows-directory-kernel\/go\.mod/);
+    assert.match(producer, /\$actualGo -cne \$expectedGo/);
+  }
+  const ci = readFileSync(join(root, '.github/workflows/ci.yml'), 'utf8');
+  const producer = readFileSync(join(root, 'scripts/windows-directory/Build-And-Test.ps1'), 'utf8');
+  requireDirectoryInputs(ci, producer);
+  const formalRead = ci.split('\n').find(line => line.includes('release-contract.json') && line.includes('ConvertFrom-Json'));
+  assert.throws(() => requireDirectoryInputs(ci.replace(formalRead, formalRead.replace('ConvertFrom-Json -AsHashtable', 'ConvertFrom-Json')), producer));
+  assert.throws(() => requireDirectoryInputs(ci, producer.replace('ConvertFrom-Json -AsHashtable', 'ConvertFrom-Json')));
+  assert.throws(() => requireDirectoryInputs(ci.replace('go-version: ${{ steps.windows_directory_go.outputs.version }}',
+    'go-version-file: .windows-directory-kernel/go.mod'), producer));
   candidates(files);
   assert.throws(() => candidates({ ...files, 'desktop-core': files['desktop-core'].replace('ref: ${{ inputs.candidate }}', 'ref: ${{ github.sha }}') }));
   assert.throws(() => candidates({ ...files, package: files.package.replace('POLARIS_BUILD_ID: ${{ needs.setup.outputs.candidate }}', 'POLARIS_BUILD_ID: ${{ github.sha }}') }));
@@ -141,9 +228,12 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
     { ...files, 'release-risk': files['release-risk'].replace(' --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"', '') },
     { ...files, package: files.package.replace('name: ${{ env.CORE_BUNDLE_ARTIFACT }}', 'name: old-source-artifact') },
     { ...files, package: files.package.replace('desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" ]', 'desktop-core-bundle-$CORE_CANDIDATE" ]') },
-    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n') },
-    { ...files, package: files.package.replace('      - name: Fetch sing-box core (SHA256-pinned)\n        shell: bash\n', '      - name: Fetch sing-box core (SHA256-pinned)\n        shell: pwsh\n') },
-  ]) assert.throws(() => bundles(changed));
+    { ...files, package: replacePackageFetchShell(files.package, '') },
+    { ...files, package: replacePackageFetchShell(files.package, '        shell: pwsh\n') },
+  ]) {
+    assert.notEqual(JSON.stringify(changed), JSON.stringify(files), 'negative control must actually mutate source');
+    assert.throws(() => bundles(changed));
+  }
   // Exercise the unchanged run line's quoting with actual Bash and a Node argv
   // reporter. This invokes neither the consumer nor any Go/core command.
   const invocation = /^        run: (.+)$/m.exec(packageFetchStep(files.package))[1];
@@ -160,7 +250,17 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
 test('Package reuses the provided bundle without a second producer and rejects failed or cancelled source jobs', () => {
   checkAllowlist(files.package);
   assert.throws(() => checkAllowlist(files.package.replace("needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'")));
+  assert.throws(() => checkAllowlist(files.package.replaceAll(" && inputs.core_bundle_artifact != ''", '')));
+  // Each job is held to the allowlist on its own: weakening only one of the two must fail.
   assert.throws(() => checkAllowlist(files.package.replace(" && inputs.core_bundle_artifact != ''", '')));
+  assert.throws(() => checkAllowlist(files.package.replace(
+    /(\n  core_wire:\n[\s\S]*?)needs\.desktop_core\.result == 'success'/, "$1needs.desktop_core.result != 'failure'")));
+  // Restoring always() on either job must fail, not silently pass.
+  assert.throws(() => checkAllowlist(files.package.replace('!cancelled() && needs.setup.result', 'always() && needs.setup.result')));
+  assert.throws(() => checkAllowlist(files.package.replace(
+    /(\n  core_wire:\n[\s\S]*?)!cancelled\(\) && needs\.setup\.result/, '$1always() && needs.setup.result')));
+  // A status function that ignores cancellation in a different spelling fails the cancelled rows.
+  assert.throws(() => checkAllowlist(files.package.replace('!cancelled() && needs.setup.result', '(cancelled() || !cancelled()) && needs.setup.result')));
 });
 
 test('new desktop source workflow and pure wiring contracts trigger all four desktop consumers', () => {
@@ -181,4 +281,43 @@ test('actual Android-only PC admission and speedtest files retain exact positive
     assert.equal(classifyImpact([path]).android, true, path);
     assert.ok(ANDROID_IMPACT_SCOPES[path].why.length > 50);
   }
+});
+
+
+test('committed formal desktop default reuses four native hosts and all existing consumption commands', () => {
+  const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
+  assert.equal(manifest.desktopRelease.schema, 'polaris-app-release-selection-v1');
+  assert.equal(Object.hasOwn(manifest, 'desktopTemporary'), false, 'temporary history must not remain the active default');
+  const plan = desktopProducerPlan(root, false);
+  assert.equal(plan.mode, 'published-release-v1');
+  assert.equal(plan.release, true, 'published-input acquisition branch must run rather than historical source producers');
+  assert.equal(plan.legacyOrigins, false);
+  assert.deepEqual(plan.matrix.map(row => row.platform), ['linux', 'win', 'mac-x64', 'mac-arm64']);
+  assert.equal(desktopSourceGoVersion(root, manifest), '1.27.2');
+  const producer = job(files['desktop-core'], 'produce'), assembly = job(files['desktop-core'], 'assemble');
+  assert.match(producer, /release-native-gates\.mjs acquire --platform="\$CORE_PLATFORM" --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"/);
+  assert.match(assembly, /release-native-gates\.mjs assemble --bundle-dir="\$CORE_BUNDLE" --candidate="\$CORE_CANDIDATE"/);
+  for (const yaml of [files.package, files['desktop-core']])
+    assert.doesNotMatch(yaml, /POLARIS_NATIVE_DNS_CANDIDATE|--native-dns-candidate=/);
+  const pkg = job(files.package, 'package');
+  const helper = pkg.indexOf('      - name: Build and stage privileged helper');
+  const prepare = pkg.indexOf('node scripts/prepare-core-identity.mjs --platform="$res_dir"');
+  const build = pkg.indexOf('      - name: Build installers');
+  assert.ok(helper >= 0 && helper < prepare && prepare < build);
+  assert.ok(pkg.indexOf('codesign --verify --strict "resources/$res_dir/$bin"', helper) < prepare);
+  assert.ok(pkg.indexOf('cp "$output_dir/polaris-cleaner.exe" resources/win/polaris-cleaner.exe', helper) < prepare);
+  assert.match(pkg.slice(prepare, build), /POLARIS_CORE_IDENTITY_FILE=%s\/resources\/%s\/core-manifest\.json/);
+});
+
+test('upstream directory test recipe reads exact selected source flags without inventing a producer command', () => {
+  const source = readFileSync(join(root, 'scripts/windows-directory/Build-And-Test.ps1'), 'utf8');
+  const branch = source.slice(source.indexOf("if ($win.schema -ceq 'polaris-upstream-native-receipt-v1')"), source.indexOf("$key = 'github.com/sagernet/sing-box/constant.SourceRevision='"));
+  const check = text => {
+    for (const marker of ['loadReleaseContract(process.cwd()', "$flagsPath = Join-Path $kernelRoot 'release/LDFLAGS'",
+      '(Get-Item -LiteralPath $flagsPath).LinkType', "$sharedFlags.Contains('SourceRevision=')", "scope='directory-test-build-only'",
+      "sharedFlagsPath='release/LDFLAGS'", 'Get-FileHash -LiteralPath $flagsPath -Algorithm SHA256', '$win.buildCommand']) assert.ok(text.includes(marker), marker);
+  };
+  check(branch);
+  for (const marker of ['loadReleaseContract(process.cwd()', '(Get-Item -LiteralPath $flagsPath).LinkType', "sharedFlagsPath='release/LDFLAGS'"])
+    assert.throws(() => check(branch.replace(marker, 'REMOVED')));
 });
