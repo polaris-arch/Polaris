@@ -11,8 +11,8 @@
 # # 生效面与刻意的不生效面
 #
 # - **package.yml（出包腿）生效**：它不设 `RUSTFLAGS` env ⇒ 本文件rustflags 参与链接
-#   （helper 的 `cargo build --target` 产物在 `target/<triple>/release/`；tauri build 仅 mac 腿带
-#   --target，windows 腿产物在 `target/release/`——两处同被本 rustflags 覆盖）。
+#   （Windows helper/cleaner 校验 rustc host 后与 tauri build 共用 `target/release/`；
+#   mac 两腿仍显式 --target。Windows 的 host 模式仍被本 target rustflags 覆盖）。
 #   生效性由 package.yml 的 `Assert statically linked CRT` 步逐字节断言（导入表不得再出现
 #   msvcp140 / vcruntime140，大小写不敏感——实测名字是混合大小写）。
 # - **ci.yml 只有 clippy 步不生效（step 级 `RUSTFLAGS: "-D warnings"` env 覆盖本文件；clippy

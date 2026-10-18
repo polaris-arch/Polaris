@@ -7,8 +7,8 @@
 
 vendor 进仓、随产物分发、但不由包管理器管理的第三方资产（如随包字体）生态列标 `vendored`。
 
-本文件由 `scripts/gen-third-party-licenses.mjs` 生成，请勿手改。共 594 个包，
-238 份互不相同的许可文本（多数包共用逐字相同的文本，故按文本分组，每份只出现一次）。
+本文件由 `scripts/gen-third-party-licenses.mjs` 生成，请勿手改。共 595 个包，
+239 份互不相同的许可文本（多数包共用逐字相同的文本，故按文本分组，每份只出现一次）。
 
 ## 清单
 
@@ -16,6 +16,7 @@ vendor 进仓、随产物分发、但不由包管理器管理的第三方资产�
 |---|---|---|---|
 | @babel/runtime | 7.29.7 | npm | MIT |
 | @tauri-apps/api | 2.11.1 | npm | Apache-2.0 OR MIT |
+| @tauri-apps/api | 2.12.0 | npm | Apache-2.0 OR MIT |
 | @tauri-apps/plugin-os | 2.3.2 | npm | MIT OR Apache-2.0 |
 | @types/react | 19.2.18 | npm | MIT |
 | @typescript/typescript-aix-ppc64 | 7.0.2 | npm | 未声明 |
@@ -937,6 +938,240 @@ SOFTWARE.
 
 <details><summary>包清单</summary>
 
+- @tauri-apps/api 2.12.0 — git+https://github.com/tauri-apps/tauri.git
+
+</details>
+
+```text
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+```
+
+```text
+MIT License
+
+Copyright (c) 2017 - Present Tauri Apps Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+```text
+SPDXVersion: SPDX-2.1
+DataLicense: CC0-1.0
+PackageName: tauri
+DataFormat: SPDXRef-1
+PackageSupplier: Organization: The Tauri Programme in the Commons Conservancy
+PackageHomePage: https://tauri.app
+PackageLicenseDeclared: Apache-2.0
+PackageLicenseDeclared: MIT
+PackageCopyrightText: 2019-2025, The Tauri Programme in the Commons Conservancy
+PackageSummary: <text>Tauri is a rust project that enables developers to make secure
+and small desktop applications using a web frontend.
+                </text>
+PackageComment: <text>The package includes the following libraries; see
+Relationship information.
+                </text>
+Created: 2019-05-20T09:00:00Z
+PackageDownloadLocation: git://github.com/tauri-apps/tauri
+PackageDownloadLocation: git+https://github.com/tauri-apps/tauri.git
+PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
+Creator: Person: Daniel Thompson-Yvetot
+```
+
+### 4. 适用于 1 个包
+
+<details><summary>包清单</summary>
+
 - @tauri-apps/plugin-os 2.3.2 — https://github.com/tauri-apps/plugins-workspace
 
 </details>
@@ -964,7 +1199,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 4. 适用于 1 个包
+### 5. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -996,7 +1231,7 @@ MIT License
     SOFTWARE
 ```
 
-### 5. 适用于 2 个包
+### 6. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -1501,7 +1736,7 @@ SOFTWARE.
 ---------------------------------------------------------
 ```
 
-### 6. 适用于 1 个包
+### 7. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1521,7 +1756,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 7. 适用于 1 个包
+### 8. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1551,7 +1786,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 8. 适用于 1 个包
+### 9. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1584,7 +1819,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 9. 适用于 1 个包
+### 10. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1616,7 +1851,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 10. 适用于 4 个包
+### 11. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -1651,7 +1886,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 11. 适用于 1 个包
+### 12. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1683,7 +1918,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 12. 适用于 1 个包
+### 13. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1715,7 +1950,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 13. 适用于 1 个包
+### 14. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -1747,7 +1982,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 14. 适用于 1 个包
+### 15. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -2000,7 +2235,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 15. 适用于 4 个包
+### 16. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -2068,7 +2303,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 ```
 
-### 16. 适用于 2 个包
+### 17. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -2092,7 +2327,7 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 17. 适用于 30 个包
+### 18. 适用于 30 个包
 
 <details><summary>包清单</summary>
 
@@ -2334,7 +2569,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 18. 适用于 1 个包
+### 19. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -2381,7 +2616,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 19. 适用于 1 个包
+### 20. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -2606,7 +2841,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 20. 适用于 25 个包
+### 21. 适用于 25 个包
 
 <details><summary>包清单</summary>
 
@@ -2868,7 +3103,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 21. 适用于 3 个包
+### 22. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -3106,7 +3341,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 22. 适用于 22 个包
+### 23. 适用于 22 个包
 
 <details><summary>包清单</summary>
 
@@ -3155,7 +3390,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 23. 适用于 2 个包
+### 24. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -3442,7 +3677,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 24. 适用于 1 个包
+### 25. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -3474,7 +3709,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 25. 适用于 2 个包
+### 26. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -3711,7 +3946,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 26. 适用于 2 个包
+### 27. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -3952,7 +4187,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 27. 适用于 8 个包
+### 28. 适用于 8 个包
 
 <details><summary>包清单</summary>
 
@@ -4199,7 +4434,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 28. 适用于 1 个包
+### 29. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -4439,7 +4674,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 29. 适用于 1 个包
+### 30. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -4679,7 +4914,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 30. 适用于 1 个包
+### 31. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -4724,7 +4959,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 31. 适用于 1 个包
+### 32. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -4959,7 +5194,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 32. 适用于 1 个包
+### 33. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -4987,7 +5222,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 33. 适用于 1 个包
+### 34. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5025,7 +5260,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 34. 适用于 1 个包
+### 35. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5265,7 +5500,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 35. 适用于 1 个包
+### 36. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5363,7 +5598,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 36. 适用于 1 个包
+### 37. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5422,7 +5657,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 ```
 
-### 37. 适用于 1 个包
+### 38. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5458,7 +5693,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 38. 适用于 1 个包
+### 39. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -5691,7 +5926,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 39. 适用于 7 个包
+### 40. 适用于 7 个包
 
 <details><summary>包清单</summary>
 
@@ -5731,7 +5966,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 40. 适用于 4 个包
+### 41. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -5972,7 +6207,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 41. 适用于 1 个包
+### 42. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -6004,7 +6239,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 42. 适用于 11 个包
+### 43. 适用于 11 个包
 
 <details><summary>包清单</summary>
 
@@ -6254,7 +6489,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 43. 适用于 1 个包
+### 44. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -6504,7 +6739,7 @@ limitations under the License.
 ~~~~
 ```
 
-### 44. 适用于 1 个包
+### 45. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -6744,7 +6979,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 45. 适用于 1 个包
+### 46. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -6984,7 +7219,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 46. 适用于 1 个包
+### 47. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -7016,7 +7251,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 47. 适用于 2 个包
+### 48. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -7257,7 +7492,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 48. 适用于 1 个包
+### 49. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -7499,7 +7734,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 49. 适用于 5 个包
+### 50. 适用于 5 个包
 
 <details><summary>包清单</summary>
 
@@ -7743,7 +7978,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 50. 适用于 1 个包
+### 51. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -7983,7 +8218,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 51. 适用于 1 个包
+### 52. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -8219,7 +8454,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 52. 适用于 1 个包
+### 53. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -9057,7 +9292,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 53. 适用于 1 个包
+### 54. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -9299,7 +9534,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 54. 适用于 1 个包
+### 55. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -9539,7 +9774,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 55. 适用于 1 个包
+### 56. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -9779,7 +10014,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 56. 适用于 3 个包
+### 57. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -10165,7 +10400,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-### 57. 适用于 4 个包
+### 58. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -10388,7 +10623,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 58. 适用于 1 个包
+### 59. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -10628,7 +10863,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 59. 适用于 3 个包
+### 60. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -10662,7 +10897,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 60. 适用于 2 个包
+### 61. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -10897,7 +11132,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 61. 适用于 1 个包
+### 62. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -11131,7 +11366,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 62. 适用于 2 个包
+### 63. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -11164,7 +11399,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 63. 适用于 2 个包
+### 64. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -11405,7 +11640,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 64. 适用于 1 个包
+### 65. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -11646,7 +11881,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 65. 适用于 4 个包
+### 66. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -11856,7 +12091,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 66. 适用于 1 个包
+### 67. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -11894,7 +12129,7 @@ derived from the "nipper" project (https://github.com/importcjj/nipper),
 developed by Chen Jiaju, licensed under the MIT License and the Apache License 2.0 (dual licensed).
 ```
 
-### 67. 适用于 1 个包
+### 68. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -12160,7 +12395,7 @@ have been licensed under extremely permissive terms.
 ------------------------------------------------------------------------------
 ```
 
-### 68. 适用于 1 个包
+### 69. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -12292,7 +12527,7 @@ express Statement of Purpose.
     this CC0 or use of the Work.
 ```
 
-### 69. 适用于 4 个包
+### 70. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -12535,7 +12770,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 70. 适用于 1 个包
+### 71. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -12771,7 +13006,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 71. 适用于 1 个包
+### 72. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -13040,7 +13275,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 72. 适用于 1 个包
+### 73. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -13147,7 +13382,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 73. 适用于 1 个包
+### 74. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -13254,7 +13489,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 74. 适用于 1 个包
+### 75. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -13494,7 +13729,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 75. 适用于 1 个包
+### 76. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -13734,7 +13969,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 76. 适用于 2 个包
+### 77. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -13950,7 +14185,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 77. 适用于 1 个包
+### 78. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -14161,7 +14396,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 78. 适用于 1 个包
+### 79. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -14401,7 +14636,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 79. 适用于 1 个包
+### 80. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -14641,7 +14876,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 80. 适用于 1 个包
+### 81. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -14671,7 +14906,7 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 81. 适用于 3 个包
+### 82. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -14907,7 +15142,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 82. 适用于 1 个包
+### 83. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -15147,7 +15382,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 83. 适用于 9 个包
+### 84. 适用于 9 个包
 
 <details><summary>包清单</summary>
 
@@ -15397,7 +15632,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 84. 适用于 1 个包
+### 85. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -15429,7 +15664,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 85. 适用于 3 个包
+### 86. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -15643,7 +15878,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 86. 适用于 1 个包
+### 87. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -15884,7 +16119,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 87. 适用于 1 个包
+### 88. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -16125,7 +16360,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 88. 适用于 1 个包
+### 89. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -16366,7 +16601,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 89. 适用于 2 个包
+### 90. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -16403,7 +16638,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 90. 适用于 2 个包
+### 91. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -16644,7 +16879,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 91. 适用于 3 个包
+### 92. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -16886,7 +17121,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 92. 适用于 1 个包
+### 93. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -17121,7 +17356,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 93. 适用于 3 个包
+### 94. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -17363,7 +17598,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 94. 适用于 1 个包
+### 95. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -17603,7 +17838,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 95. 适用于 2 个包
+### 96. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -17640,7 +17875,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 96. 适用于 1 个包
+### 97. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -17874,7 +18109,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 97. 适用于 1 个包
+### 98. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -18108,7 +18343,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 98. 适用于 1 个包
+### 99. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -18348,7 +18583,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 99. 适用于 1 个包
+### 100. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -18378,7 +18613,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 100. 适用于 2 个包
+### 101. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -18637,7 +18872,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 101. 适用于 1 个包
+### 102. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -18873,7 +19108,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 102. 适用于 1 个包
+### 103. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -18903,7 +19138,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 103. 适用于 2 个包
+### 104. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -19144,7 +19379,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 104. 适用于 1 个包
+### 105. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -19176,7 +19411,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 105. 适用于 18 个包
+### 106. 适用于 18 个包
 
 <details><summary>包清单</summary>
 
@@ -19250,7 +19485,7 @@ Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
-### 106. 适用于 1 个包
+### 107. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -19280,7 +19515,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 107. 适用于 3 个包
+### 108. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -19522,7 +19757,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 108. 适用于 1 个包
+### 109. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -19762,7 +19997,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 109. 适用于 2 个包
+### 110. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -20003,7 +20238,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 110. 适用于 1 个包
+### 111. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -20035,7 +20270,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 111. 适用于 1 个包
+### 112. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -20276,7 +20511,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 112. 适用于 1 个包
+### 113. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -20498,7 +20733,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 113. 适用于 2 个包
+### 114. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -20531,7 +20766,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 114. 适用于 1 个包
+### 115. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -20564,7 +20799,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 115. 适用于 3 个包
+### 116. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -20598,7 +20833,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 116. 适用于 1 个包
+### 117. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -20834,7 +21069,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 117. 适用于 2 个包
+### 118. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -21069,7 +21304,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 118. 适用于 1 个包
+### 119. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -21305,7 +21540,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 119. 适用于 1 个包
+### 120. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -21541,7 +21776,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 120. 适用于 1 个包
+### 121. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -21775,7 +22010,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 121. 适用于 1 个包
+### 122. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -22012,7 +22247,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 122. 适用于 1 个包
+### 123. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -22227,7 +22462,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 123. 适用于 1 个包
+### 124. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -22250,7 +22485,7 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-### 124. 适用于 1 个包
+### 125. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -22282,7 +22517,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 125. 适用于 5 个包
+### 126. 适用于 5 个包
 
 <details><summary>包清单</summary>
 
@@ -22745,7 +22980,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 126. 适用于 3 个包
+### 127. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -22987,7 +23222,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 127. 适用于 1 个包
+### 128. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -23019,7 +23254,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 128. 适用于 1 个包
+### 129. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -23049,7 +23284,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 129. 适用于 1 个包
+### 130. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -23283,7 +23518,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 130. 适用于 1 个包
+### 131. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -23542,7 +23777,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 131. 适用于 1 个包
+### 132. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -23572,7 +23807,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 132. 适用于 2 个包
+### 133. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -23814,7 +24049,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 133. 适用于 1 个包
+### 134. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24072,7 +24307,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/muda.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 134. 适用于 1 个包
+### 135. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24108,7 +24343,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 135. 适用于 1 个包
+### 136. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24140,7 +24375,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 136. 适用于 1 个包
+### 137. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24376,7 +24611,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 137. 适用于 2 个包
+### 138. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -24620,7 +24855,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 138. 适用于 1 个包
+### 139. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24829,7 +25064,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 139. 适用于 1 个包
+### 140. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -24865,7 +25100,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 140. 适用于 1 个包
+### 141. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -25099,7 +25334,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 141. 适用于 1 个包
+### 142. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -25483,7 +25718,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-### 142. 适用于 1 个包
+### 143. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -25515,7 +25750,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 143. 适用于 2 个包
+### 144. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -25546,7 +25781,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 144. 适用于 1 个包
+### 145. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -25796,7 +26031,7 @@ option. All files in the project carrying such notice may not be
 copied, modified, or distributed except according to those terms.
 ```
 
-### 145. 适用于 1 个包
+### 146. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -26037,7 +26272,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 146. 适用于 4 个包
+### 147. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -26071,7 +26306,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 147. 适用于 3 个包
+### 148. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -26286,7 +26521,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 148. 适用于 1 个包
+### 149. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -26316,7 +26551,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 149. 适用于 2 个包
+### 150. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -26557,7 +26792,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 150. 适用于 1 个包
+### 151. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -26791,7 +27026,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 151. 适用于 1 个包
+### 152. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -27031,7 +27266,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 152. 适用于 1 个包
+### 153. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -27063,7 +27298,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 153. 适用于 2 个包
+### 154. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -27300,7 +27535,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 154. 适用于 1 个包
+### 155. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -27334,7 +27569,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 155. 适用于 2 个包
+### 156. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -27551,7 +27786,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 156. 适用于 1 个包
+### 157. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -27778,7 +28013,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 157. 适用于 1 个包
+### 158. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28003,7 +28238,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 158. 适用于 1 个包
+### 159. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28036,7 +28271,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 159. 适用于 2 个包
+### 160. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -28069,7 +28304,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 160. 适用于 1 个包
+### 161. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28303,7 +28538,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 161. 适用于 1 个包
+### 162. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28335,7 +28570,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 162. 适用于 1 个包
+### 163. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28645,7 +28880,7 @@ OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 163. 适用于 1 个包
+### 164. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -28915,7 +29150,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 164. 适用于 1 个包
+### 165. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29155,7 +29390,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 165. 适用于 1 个包
+### 166. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29391,7 +29626,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 166. 适用于 1 个包
+### 167. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29421,7 +29656,7 @@ The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
 ```
 
-### 167. 适用于 1 个包
+### 168. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29634,7 +29869,7 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 168. 适用于 1 个包
+### 169. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29875,7 +30110,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 169. 适用于 2 个包
+### 170. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -29941,7 +30176,7 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 ```
 
-### 170. 适用于 1 个包
+### 171. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -29959,7 +30194,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 171. 适用于 4 个包
+### 172. 适用于 4 个包
 
 <details><summary>包清单</summary>
 
@@ -29994,7 +30229,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 172. 适用于 1 个包
+### 173. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -30234,7 +30469,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 173. 适用于 1 个包
+### 174. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -30474,7 +30709,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 174. 适用于 2 个包
+### 175. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -30710,7 +30945,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 175. 适用于 9 个包
+### 176. 适用于 9 个包
 
 <details><summary>包清单</summary>
 
@@ -30952,7 +31187,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 176. 适用于 2 个包
+### 177. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -31189,7 +31424,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 177. 适用于 2 个包
+### 178. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -31433,7 +31668,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 178. 适用于 1 个包
+### 179. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -31675,7 +31910,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 179. 适用于 2 个包
+### 180. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -31916,7 +32151,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 180. 适用于 1 个包
+### 181. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -31948,7 +32183,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 181. 适用于 1 个包
+### 182. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32157,7 +32392,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 182. 适用于 1 个包
+### 183. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32175,7 +32410,7 @@ http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
 option.
 ```
 
-### 183. 适用于 1 个包
+### 184. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32211,7 +32446,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 184. 适用于 1 个包
+### 185. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32451,7 +32686,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 185. 适用于 1 个包
+### 186. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32685,7 +32920,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 186. 适用于 1 个包
+### 187. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32925,7 +33160,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 187. 适用于 1 个包
+### 188. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32959,7 +33194,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 188. 适用于 1 个包
+### 189. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -32999,7 +33234,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 189. 适用于 1 个包
+### 190. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -33233,7 +33468,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 190. 适用于 1 个包
+### 191. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -33420,7 +33655,7 @@ Apache License
    END OF TERMS AND CONDITIONS
 ```
 
-### 191. 适用于 1 个包
+### 192. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -33438,7 +33673,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 192. 适用于 1 个包
+### 193. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -33674,7 +33909,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 193. 适用于 1 个包
+### 194. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -33907,7 +34142,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tao.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 194. 适用于 8 个包
+### 195. 适用于 8 个包
 
 <details><summary>包清单</summary>
 
@@ -34148,7 +34383,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 195. 适用于 1 个包
+### 196. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -34382,7 +34617,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 196. 适用于 1 个包
+### 197. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -34615,7 +34850,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 197. 适用于 1 个包
+### 198. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -34855,7 +35090,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 198. 适用于 1 个包
+### 199. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -35095,7 +35330,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 199. 适用于 3 个包
+### 200. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -35306,7 +35541,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 200. 适用于 1 个包
+### 201. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -35540,7 +35775,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 201. 适用于 1 个包
+### 202. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -35798,7 +36033,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 202. 适用于 3 个包
+### 203. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -35832,7 +36067,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 203. 适用于 1 个包
+### 204. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36075,7 +36310,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 204. 适用于 1 个包
+### 205. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36108,7 +36343,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 205. 适用于 1 个包
+### 206. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36348,7 +36583,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 206. 适用于 1 个包
+### 207. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36378,7 +36613,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 207. 适用于 3 个包
+### 208. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -36416,7 +36651,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 208. 适用于 1 个包
+### 209. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36452,7 +36687,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 209. 适用于 3 个包
+### 210. 适用于 3 个包
 
 <details><summary>包清单</summary>
 
@@ -36490,7 +36725,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 210. 适用于 1 个包
+### 211. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36748,7 +36983,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tray-icon.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 211. 适用于 1 个包
+### 212. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -36779,7 +37014,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 212. 适用于 1 个包
+### 213. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37019,7 +37254,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 213. 适用于 1 个包
+### 214. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37051,7 +37286,7 @@ MIT License
     SOFTWARE
 ```
 
-### 214. 适用于 1 个包
+### 215. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37306,7 +37541,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### 215. 适用于 1 个包
+### 216. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37330,7 +37565,7 @@ authorization of the copyright holder.
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-### 216. 适用于 1 个包
+### 217. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37362,7 +37597,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 217. 适用于 1 个包
+### 218. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37602,7 +37837,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 218. 适用于 1 个包
+### 219. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37843,7 +38078,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 219. 适用于 1 个包
+### 220. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37873,7 +38108,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 220. 适用于 1 个包
+### 221. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37904,7 +38139,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 221. 适用于 1 个包
+### 222. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -37933,7 +38168,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 222. 适用于 1 个包
+### 223. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -38005,7 +38240,7 @@ of Data, including for example machine learning models and models'
 insights.
 ```
 
-### 223. 适用于 1 个包
+### 224. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -38239,7 +38474,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 224. 适用于 2 个包
+### 225. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -38498,7 +38733,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/window-vibrancy.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 225. 适用于 47 个包
+### 226. 适用于 47 个包
 
 <details><summary>包清单</summary>
 
@@ -38780,7 +39015,7 @@ MIT License
     SOFTWARE
 ```
 
-### 226. 适用于 2 个包
+### 227. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -38810,7 +39045,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 227. 适用于 1 个包
+### 228. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -38840,7 +39075,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 228. 适用于 1 个包
+### 229. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -39053,7 +39288,7 @@ Apache License
    limitations under the License.
 ```
 
-### 229. 适用于 1 个包
+### 230. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -39266,7 +39501,7 @@ Apache License
    limitations under the License.
 ```
 
-### 230. 适用于 2 个包
+### 231. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -39479,7 +39714,7 @@ Apache License
    limitations under the License.
 ```
 
-### 231. 适用于 1 个包
+### 232. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -39738,7 +39973,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/wry.git
 Creator: Person: Daniel Thompson-Yvetot
 ```
 
-### 232. 适用于 5 个包
+### 233. 适用于 5 个包
 
 <details><summary>包清单</summary>
 
@@ -39778,7 +40013,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 233. 适用于 2 个包
+### 234. 适用于 2 个包
 
 <details><summary>包清单</summary>
 
@@ -40046,7 +40281,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 234. 适用于 1 个包
+### 235. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -40286,7 +40521,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 235. 适用于 1 个包
+### 236. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -40305,7 +40540,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 236. 适用于 1 个包
+### 237. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -40507,7 +40742,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 237. 适用于 1 个包
+### 238. 适用于 1 个包
 
 <details><summary>包清单</summary>
 
@@ -40744,7 +40979,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 238. 适用于 1 个包
+### 239. 适用于 1 个包
 
 <details><summary>包清单</summary>
 

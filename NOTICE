@@ -12,31 +12,42 @@ next to this file as LICENSE.
    **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - 桌面 sing-box v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
-        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
-        （代理内核，以独立 sidecar 子进程运行）
-        桌面源码修复构建：1.15.0-alpha.8.polaris.2（Linux、Windows、macOS x64 / arm64）
-        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
-        共同 source manifest SHA-256：1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a
-        共享补丁与依赖源码指引：https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches
-        固定共享补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/libbox-patches
-        Windows 修复构建：1.15.0-alpha.8.polaris.2（共同修复加 DNS-only 变更缓存刷新）
-        Windows 附加补丁与构建说明：https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches
-        固定 Windows 附加补丁：https://github.com/polaris-arch/Polaris/tree/d69f3d1eccac1f6a3b1ee66aa4c7407fe6b3eefa/scripts/core-patches
-        构建脚本：scripts/fetch-core.mjs；完整 pin：src-tauri/core-manifest.json
+  - 桌面 sing-box v1.15.0-polaris-alpha.12 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12
+        桌面发布构建：1.15.0-polaris-alpha.12
+        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae
+        源码 tree：830f7256af499e5ad3e7da9a79f0a377ca38fc77
+        固定消费标签：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12
+        消费标签对象：916d9533ba0a6092e34bc53f63dace63e11fa85e
+        消费合同 SHA-256：f99daa91345df468b18e9c61451cc6465ffdce137fb1adc33829053ab2b194f3
+        受审原始 index SHA-256：458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3
+        桌面发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12
+        Linux SO / Windows DLL 随核同包；macOS 静态链接，无独立 sidecar。
+        原 producer/native smoke 证据不代表 App 运行、最终载体或签名信任验收。
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
-        （以 libbox 形态载入应用进程，见下）
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
+  - Apple libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
+        上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.8
+        固定源码：https://github.com/SagerNet/sing-box/tree/b609f959f57ce34416c51c7b87ce4a76f2e1df56
+        source manifest SHA-256：1468d594ca51c4ae82823fae0a4d363453962b1c3ab0a15a8c14963d6589f942
+        移动端共同源码与独立补丁输入以对应随仓manifest固定，不由桌面fork标签替代。
   - cronet-go               — https://github.com/SagerNet/cronet-go     （NaiveProxy 核心，libcronet 动态库）
   - sing-box-dashboard      — https://github.com/SagerNet/sing-box-dashboard（面板 UI，桌面专属）
   - meta-rules-dat          — https://github.com/MetaCubeX/meta-rules-dat（规则集 / 地理数据 .srs）
 
-桌面随包 sing-box 的上游基线是 `src-tauri/core-manifest.json` 的 `bundledCoreVersion`；
-四平台共同修复版本及来源记录在同文件的 `sourceBuild`，Windows 附加输入记录在 `windowsBuild`。
-共享 `source-manifest.json` 固定 sing-box、sing-tun、nftables 的上游 commit、补丁顺序与摘要；
-Android libbox 也消费这些共同源码与补丁，构建说明见上述共享补丁目录。
-上面写死的桌面版本号与 tag 链接由 `scripts/verify-packaging.mjs confs` 与该真值对拍，
-两边不一致即构建转红 —— 版本号写在这里是因为法律声明不该让读者去翻另一个文件。
+桌面来源记录在 `src-tauri/core-manifest.json` 的 `desktopRelease`，
+正式消费合同为 `scripts/desktop-core/release-contract.json`；四平台保持原公开包的完整身份与字节。
+原始同批 index 保存在 `scripts/desktop-core/release-asset-index.json`，内容与原 producer 原件 hash 一致。
+`sourceArchive` 指向固定 commit 的 GitHub 自动源码归档，按实际传输 hash 与完整 Git tree 核验。
+原 producer 自定义 source tar 的身份单独保留，不把两种 gzip 字节当作相同文件。
+Android/iOS 源码输入固定 a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae，
+正式 annotated tag object 为 916d9533ba0a6092e34bc53f63dace63e11fa85e；
+新 AAR/XCFramework 的 App producer/ABI/SDK 收据仍待独立生成与核验。
+上述移动旧基线仅为历史对应源码记录，不证明新移动产物或设备验收。
+版本、来源及摘要由 `scripts/verify-packaging.mjs confs` 按各组件独立核验。
 
 **链进产物的源码级依赖**（Tauri / React / 数百个 Rust crate 等）不属 mere aggregation，
 其许可与版权声明随二进制分发，逐包登记在 `THIRD-PARTY-LICENSES.md`
@@ -99,25 +110,38 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-sing-box 的上游基线在上述 tag / 固定 commit 链接处获取；修复构建的完整对应源码还包括
-上述固定共享补丁目录中的 source-manifest.json、各依赖的固定上游源码及补丁，Windows 另加
-固定 Windows 附加补丁目录中的补丁。按 manifest 中的 SHA-256 核对输入，并按随附构建说明重放。
-GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，本段即该指引。Polaris **不自建上游归档
-或镜像**；上游源码在其各自仓库，Polaris 补丁与构建脚本在本项目仓库。若链接失效，请在本项目 issue 中提出。
+桌面固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae
+桌面固定发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12
+完整对应源码：https://github.com/polaris-arch/sing-box-polaris/archive/a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae.tar.gz
+实际传输 SHA-256：b0f0a3b85affa1cbc6d54cada961cd871f0e48ac982af52e0b898d23ea12e02f
+源码 Git tree：830f7256af499e5ad3e7da9a79f0a377ca38fc77
+原始 index、Go 模块与替换目录、Cronet 来源和逐文件 legal 内容随受审合同固定。
+安装载体保留这些原始说明和固定源码原包；源码、逐叶和 legal 检查不依赖额外公开 index/source 资产。
 
-**对 Android 产物，GPLv3 §6 的对应源码还包括 Polaris 自身的完整源码**，它在本项目仓库公开：
-https://github.com/polaris-arch/Polaris
+历史桌面 577d 合同原字节保存在 scripts/desktop-core/historical-release-contract-577d4b9.json，
+SHA-256 0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d。
+历史 fe182 临时合同仍为 scripts/desktop-core/native-dns-candidate.json，
+SHA-256 62ab483f37da5a7cb44c213722e0b92736da3bd232986641dc7e65d87dc7ce8d。
+这两份旧证据不改写为当前源码的运行证明。
 
-The upstream baseline is available at the tag and fixed commit linked above.
-The complete Corresponding Source for the patched build also includes the
-source-manifest.json, pinned dependency sources and patches in the fixed shared
-patch directory; Windows additionally uses the fixed Windows overlay directory.
-Verify the inputs against the manifest's SHA-256 values and follow the included
-build instructions. GPLv3 §6 requires clear directions next to the object code,
-and this paragraph provides those directions. Polaris keeps no upstream archive
-or mirror; upstream sources remain in their respective repositories, and Polaris
-patches and build scripts are in this project's repository. If a link stops
-working, please open an issue on this project.
+Android/Apple 旧基线、补丁及构建说明分别保留在 scripts/libbox-patches 与 scripts/libbox-ios-patches。
+当前移动输入、工具与 ABI 规则见 scripts/mobile-core/source-contract.json；桌面包不能代替移动收据。
+对 Android 产物，完整对应源码还包括 Polaris 自身：https://github.com/polaris-arch/Polaris
 
-For the Android artifact, the Corresponding Source under GPLv3 §6 also
-includes Polaris's own complete source, published at the repository above.
+Desktop release: 1.15.0-polaris-alpha.12 — https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12
+Desktop source: https://github.com/polaris-arch/sing-box-polaris/tree/a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae
+Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 f99daa91345df468b18e9c61451cc6465ffdce137fb1adc33829053ab2b194f3)
+Committed original index SHA-256: 458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3
+Desktop selection uses src-tauri/core-manifest.json desktopRelease.
+The committed original index retains the producer archive identity; sourceArchive pins the independently verified fixed-commit GitHub source archive,
+including its actual transport SHA-256 and complete Git tree. Original legal files,
+module/replacement facts and native archive bytes remain verified. The source
+archive and original notices ship with the installed carrier; no extra public
+index or custom source asset is required.
+Historical 577d and fe182 contracts retain their original bytes and do not attest
+this release. Native signature observations do not establish trust. Actual App
+loading, functionality, sealed check and final carrier acceptance remain separate.
+Mobile source/tool/ABI/component receipts and SDK validation remain independent;
+old mobile pins do not establish new outputs or physical-device acceptance.
+For Android, Corresponding Source also includes Polaris's own complete source
+at the repository above. If a source link stops working, please open a project issue.
