@@ -78,7 +78,7 @@ targets:
         ENABLE_BITCODE: false
         ARCHS: [arm64]
         VALID_ARCHS: arm64
-        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        VALID_ARCHS[sdk=iphonesimulator*]: arm64
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
@@ -96,11 +96,17 @@ targets:
       - sdk: UIKit.framework
       - sdk: WebKit.framework
     preBuildScripts:
-      - script: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; "$SRCROOT/../../../ui/node_modules/.bin/tauri" ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
+      - script: |
+          if [ "${POLARIS_FORMAL_APP_BUILD:-0}" = 1 ]; then
+            python3 "$SRCROOT/../../../scripts/mobile-core/apple_rust.py" verify
+          else
+            export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+            "$SRCROOT/../../../ui/node_modules/.bin/tauri" ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
+          fi
+
         name: Build Rust Code
         basedOnDependencyAnalysis: false
         outputFiles:
-          - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
   polaris_PacketTunnel:
     type: app-extension
@@ -110,8 +116,14 @@ targets:
         excludes: [Info.plist, PacketTunnel.entitlements]
     settings:
       base:
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64
+        VALID_ARCHS[sdk=iphonesimulator*]: arm64
+        LD_GENERATE_MAP_FILE: YES
+        LD_MAP_FILE_PATH: $(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt
         PRODUCT_BUNDLE_IDENTIFIER: $(POLARIS_BUNDLE_ID).PacketTunnel
         PRODUCT_NAME: PolarisPacketTunnel
+        OTHER_LDFLAGS: $(inherited) "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args"
         APPLICATION_EXTENSION_API_ONLY: true
         FRAMEWORK_SEARCH_PATHS: $(inherited) "$(POLARIS_LIBBOX_GENERATION_ROOT)"
         SKIP_INSTALL: true
@@ -142,12 +154,21 @@ targets:
     preBuildScripts:
       - name: Verify iOS Core
         script: |
-          python3 "$SRCROOT/../../../scripts/ios-libbox.py" verify --component-for-link \
-            --generation-root "${POLARIS_LIBBOX_GENERATION_ROOT:?approved immutable Libbox generation required}" \
-            --output-fingerprint "${POLARIS_LIBBOX_OUTPUT_FINGERPRINT:?approved component fingerprint required}" \
-            --receipt-sha256 "${POLARIS_LIBBOX_RECEIPT_SHA256:?approved receipt SHA256 required}" \
-            --build-policy "${POLARIS_LIBBOX_BUILD_POLICY:?approved M1 policy required}" \
-            --build-policy-sha256 "${POLARIS_LIBBOX_BUILD_POLICY_SHA256:?approved M1 policy SHA256 required}" \
-            --tools "${POLARIS_LIBBOX_TOOLS:?approved tools required}" \
-            --tools-sha256 "${POLARIS_LIBBOX_TOOLS_SHA256:?approved tools SHA256 required}"
+          set -e
+          python3 "$SRCROOT/../../../scripts/mobile-core/consume.py" verify-link \
+            --link-input "${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}" \
+            --link-input-sha256 "${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}" \
+            --scratch "${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}"
+          python3 "$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py" install
         basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json
+    postBuildScripts:
+      - name: Verify TLS Capability Link
+        script: |
+          python3 "$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py" verify-installed
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)
+          - $(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json

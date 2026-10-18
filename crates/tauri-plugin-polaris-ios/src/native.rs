@@ -66,12 +66,68 @@ pub struct TunnelStatus {
     pub uncertain_settings_generation: Option<u64>,
     pub tailscale_store_scope: Option<TailscaleStoreExport>,
     tailscale_store_retirement: Option<NativeScopedRetirement>,
+    tailscale_directory_retirement: Option<NativeDirectoryRetirement>,
 }
 
 pub use polaris_mesh::tailscale_state::retirement::{
     TailscaleProfileState, TailscaleStateFileState, TailscaleStoreExport,
     TailscaleStoreRetirementInstance, TailscaleStoreRetirementNode, TailscaleWriterState,
 };
+
+pub use polaris_mesh::tailscale_state::directory_retirement::{
+    TailscaleDirectoryExport, TailscaleDirectoryInstance,
+};
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeDirectoryRetirement {
+    contract_version: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    #[serde(rename = "startRequestID")]
+    start_request_id: String,
+    config_digest: String,
+    source_extension_generation: u64,
+    stop_extension_generation: u64,
+    #[serde(rename = "stopRequestID")]
+    stop_request_id: String,
+    observation_nonce: String,
+    global_cleanup_evidence: String,
+    original_scope: TailscaleDirectoryExport,
+    directory_retirement: TailscaleDirectoryExport,
+}
+
+/// Original native Stop custody, separate from authentication projection.
+/// This is not a deletion permit: consumers must still bind the durable intent,
+/// acquire the exclusive incarnation lease and recheck the directory object.
+#[derive(Clone, Debug)]
+pub struct TailscaleDirectoryRetirementReceipt(NativeDirectoryRetirement);
+impl TailscaleDirectoryRetirementReceipt {
+    pub fn instances(&self) -> &[TailscaleDirectoryInstance] {
+        self.0.directory_retirement.instances()
+    }
+    pub fn session_id(&self) -> &str {
+        &self.0.session_id
+    }
+    pub fn start_request_id(&self) -> &str {
+        &self.0.start_request_id
+    }
+    pub fn config_digest(&self) -> &str {
+        &self.0.config_digest
+    }
+    pub fn source_extension_generation(&self) -> u64 {
+        self.0.source_extension_generation
+    }
+    pub fn stop_extension_generation(&self) -> u64 {
+        self.0.stop_extension_generation
+    }
+    pub fn stop_request_id(&self) -> &str {
+        &self.0.stop_request_id
+    }
+    pub fn observation_nonce(&self) -> &str {
+        &self.0.observation_nonce
+    }
+}
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -126,6 +182,7 @@ impl TailscaleStoreRetirementReceipt {
 pub struct StoppedSessionReceipt {
     snapshot: TunnelStatus,
     retirement: Option<TailscaleStoreRetirementReceipt>,
+    directory_retirement: Option<TailscaleDirectoryRetirementReceipt>,
 }
 impl StoppedSessionReceipt {
     fn from_stop(snapshot: TunnelStatus, request_id: &str, nonce: &str) -> Self {
@@ -160,18 +217,68 @@ impl StoppedSessionReceipt {
                     && !nonce.is_empty()
                     && wire
                         .store_retirement
-                        .validate(&wire.config_digest, true)
+                        .validate_history(&wire.config_digest, true)
                         .is_ok()
             })
             .cloned()
             .map(TailscaleStoreRetirementReceipt);
+        let directory_retirement = snapshot
+            .tailscale_directory_retirement
+            .as_ref()
+            .filter(|wire| {
+                wire.contract_version == "polaris-ios-ts-directory-retirement-v1"
+                    && wire.global_cleanup_evidence == "CleanupUnknown"
+                    && snapshot.cleanup_evidence == "CleanupUnknown"
+                    && !snapshot.active
+                    && !snapshot.running
+                    && matches!(snapshot.status, 0 | 1)
+                    && snapshot.runtime_stopped == Some(true)
+                    && snapshot.lifecycle.as_deref() == Some("stopped")
+                    && snapshot.ownership == "ownedSessionReported"
+                    && snapshot.cleanup_error.is_none()
+                    && snapshot.last_error.is_none()
+                    && snapshot.uncertain_settings_generation.is_none()
+                    && !wire.session_id.is_empty()
+                    && !wire.start_request_id.is_empty()
+                    && snapshot.session_id.as_deref() == Some(wire.session_id.as_str())
+                    && snapshot.request_id.as_deref() == Some(wire.start_request_id.as_str())
+                    && snapshot.config_digest.as_deref() == Some(wire.config_digest.as_str())
+                    && snapshot.extension_generation == Some(wire.stop_extension_generation)
+                    && wire.source_extension_generation > 0
+                    && wire.source_extension_generation.checked_add(1)
+                        == Some(wire.stop_extension_generation)
+                    && wire.stop_request_id == request_id
+                    && !request_id.is_empty()
+                    && wire.observation_nonce == nonce
+                    && !nonce.is_empty()
+                    && wire
+                        .directory_retirement
+                        .instances()
+                        .iter()
+                        .any(|run| !run.nodes.is_empty())
+                    && wire
+                        .original_scope
+                        .validate(&wire.config_digest, false)
+                        .is_ok()
+                    && wire.original_scope.observed_runs().is_ok_and(|originals| {
+                        wire.directory_retirement
+                            .validate_observed_runs(&originals, true)
+                            .is_ok()
+                    })
+            })
+            .cloned()
+            .map(TailscaleDirectoryRetirementReceipt);
         Self {
             snapshot,
             retirement,
+            directory_retirement,
         }
     }
     pub fn snapshot(&self) -> &TunnelStatus {
         &self.snapshot
+    }
+    pub fn directory_retirement(&self) -> Option<&TailscaleDirectoryRetirementReceipt> {
+        self.directory_retirement.as_ref()
     }
     pub fn retirement(&self) -> Option<&TailscaleStoreRetirementReceipt> {
         self.retirement.as_ref()
@@ -278,6 +385,81 @@ pub struct ReadySessionReceipt {
     original_instances: Vec<TailscaleStoreRetirementInstance>,
 }
 
+// Shared validation does not construct either kind of native custody.
+fn validate_reload_scope(
+    session_id: &str,
+    request_id: &str,
+    config_digest: &str,
+    extension_generation: u64,
+    original_instances: &[TailscaleStoreRetirementInstance],
+    snapshot: &TunnelStatus,
+) -> Result<(u64, Vec<TailscaleStoreRetirementInstance>), String> {
+    snapshot.require_ready()?;
+    let mismatch =
+        || "ReadyUnknown: Reload changed the original native owner or run census".to_owned();
+    if snapshot.session_id.as_deref() != Some(session_id)
+        || snapshot.request_id.as_deref() != Some(request_id)
+        || snapshot.config_digest.as_deref() != Some(config_digest)
+    {
+        return Err(mismatch());
+    }
+    let generation = snapshot.extension_generation.ok_or_else(mismatch)?;
+    let advance = generation
+        .checked_sub(extension_generation)
+        .ok_or_else(mismatch)?;
+    let scope = snapshot
+        .tailscale_store_scope
+        .as_ref()
+        .ok_or_else(mismatch)?;
+    scope.validate_history(config_digest, false)?;
+    let current = scope.instances();
+    if advance == 0 {
+        if current != original_instances {
+            return Err(mismatch());
+        }
+        return Ok((generation, current.to_vec()));
+    }
+    let added = current
+        .len()
+        .checked_sub(original_instances.len())
+        .ok_or_else(mismatch)?;
+    if original_instances.is_empty() || added == 0 || u64::try_from(added).ok() != Some(advance) {
+        return Err(mismatch());
+    }
+    let originals: std::collections::BTreeMap<_, _> = original_instances
+        .iter()
+        .map(|run| (run.run_nonce.as_str(), run))
+        .collect();
+    if originals.len() != original_instances.len() {
+        return Err(mismatch());
+    }
+    for original in original_instances {
+        let run = current
+            .iter()
+            .find(|run| run.run_nonce == original.run_nonce)
+            .ok_or_else(mismatch)?;
+        if run.config_digest != original.config_digest || run.nodes.len() != original.nodes.len() {
+            return Err(mismatch());
+        }
+        // Mutable terminal/file revisions are not readiness custody. Compare
+        // the immutable scope metadata; actual Stop still validates retirement.
+        let scopes = |nodes: &[TailscaleStoreRetirementNode]| -> std::collections::BTreeSet<(String, String, String)> {
+                nodes.iter().map(|node| (node.tag.clone(), node.state_directory.clone(), node.state_file.clone())).collect()
+            };
+        if scopes(&run.nodes) != scopes(&original.nodes) {
+            return Err(mismatch());
+        }
+    }
+    if current
+        .iter()
+        .filter(|run| !originals.contains_key(run.run_nonce.as_str()))
+        .any(|run| run.config_digest != config_digest)
+    {
+        return Err(mismatch());
+    }
+    Ok((generation, current.to_vec()))
+}
+
 impl ReadySessionReceipt {
     fn from_start(
         snapshot: &TunnelStatus,
@@ -293,7 +475,7 @@ impl ReadySessionReceipt {
             .tailscale_store_scope
             .as_ref()
             .ok_or("ReadyUnknown: Original Go instance scope is absent")?;
-        scope.validate(snapshot.config_digest.as_deref().unwrap_or(""), false)?;
+        scope.validate_history(snapshot.config_digest.as_deref().unwrap_or(""), false)?;
         Ok(Self {
             native_generation,
             shared_generation,
@@ -311,6 +493,21 @@ impl ReadySessionReceipt {
                 .ok_or("ReadyUnknown: missing extension generation")?,
             original_instances: scope.instances().to_vec(),
         })
+    }
+
+    fn from_reload_observation(&self, snapshot: &TunnelStatus) -> Result<Self, String> {
+        let (generation, instances) = validate_reload_scope(
+            &self.session_id,
+            &self.request_id,
+            &self.config_digest,
+            self.extension_generation,
+            &self.original_instances,
+            snapshot,
+        )?;
+        let mut updated = self.clone();
+        updated.extension_generation = generation;
+        updated.original_instances = instances;
+        Ok(updated)
     }
 
     pub fn request_id(&self) -> &str {
@@ -354,7 +551,7 @@ impl ObservedSessionReceipt {
             .tailscale_store_scope
             .as_ref()
             .ok_or("ReadyUnknown: Current original Go scope is absent")?;
-        scope.validate(snapshot.config_digest.as_deref().unwrap_or(""), false)?;
+        scope.validate_history(snapshot.config_digest.as_deref().unwrap_or(""), false)?;
         Ok(Self {
             session_id: snapshot
                 .session_id
@@ -374,6 +571,21 @@ impl ObservedSessionReceipt {
             original_instances: scope.instances().to_vec(),
         })
     }
+    fn from_reload_observation(&self, snapshot: &TunnelStatus) -> Result<Self, String> {
+        let (generation, instances) = validate_reload_scope(
+            &self.session_id,
+            &self.request_id,
+            &self.config_digest,
+            self.extension_generation,
+            &self.original_instances,
+            snapshot,
+        )?;
+        let mut updated = self.clone();
+        updated.extension_generation = generation;
+        updated.original_instances = instances;
+        Ok(updated)
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -502,6 +714,22 @@ async fn call<T: DeserializeOwned + Send + 'static>(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceConditions {
+    /// Required: old/malformed native replies fail closed.
+    pub app_active: bool,
+    pub metered: Option<bool>,
+    pub power_save: bool,
+}
+
+/// Read only App conditions; does not observe or mutate the NE custody cache.
+pub async fn device_conditions() -> Result<DeviceConditions, String> {
+    call("deviceConditions", serde_json::json!({}), 3, None, None)
+        .await
+        .map_err(NativeCallFailure::message)
+}
+
 pub async fn status() -> Result<TunnelStatus, String> {
     let generation = state()
         .lock()
@@ -529,13 +757,39 @@ fn fresh_request_id() -> Result<String, String> {
 }
 
 async fn stop_call(expected: serde_json::Value) -> Result<StoppedSessionReceipt, String> {
+    stop_call_bound(expected, None).await
+}
+
+fn begin_bound_stop(
+    state: &mut LifecycleState,
+    expected_host_generation: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<u64, String> {
+    if expected_host_generation.is_some_and(|expected| {
+        !state.accepts_stop_target(expected.load(std::sync::atomic::Ordering::SeqCst))
+    }) {
+        return Err("CleanupUnknown: Stop target was superseded before dispatch".into());
+    }
+    let generation = state.begin()?;
+    // Retry custody advances atomically with this dispatch, never with Ready.
+    // All clones share it; successor dispatch still invalidates this generation.
+    if let Some(target) = expected_host_generation {
+        target.store(generation, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(generation)
+}
+
+async fn stop_call_bound(
+    expected: serde_json::Value,
+    expected_host_generation: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<StoppedSessionReceipt, String> {
     let request_id = fresh_request_id()?;
     let nonce = fresh_request_id()?;
     let generation = {
         let mut state = state().lock().map_err(|_| "iOS VPN state lock poisoned")?;
-        state.begin()?
+        begin_bound_stop(&mut state, expected_host_generation)?
     };
     let _receipt = RequestReceipt(generation);
+    let allow_cleanup = expected["stopOnly"] != true;
     let mut payload = expected;
     payload["requestID"] = serde_json::json!(request_id);
     payload["observationNonce"] = serde_json::json!(nonce);
@@ -558,7 +812,17 @@ async fn stop_call(expected: serde_json::Value) -> Result<StoppedSessionReceipt,
         return Err("StartCancelled: iOS lifecycle receipt was superseded or revoked".into());
     }
     result
-        .map(|snapshot| StoppedSessionReceipt::from_stop(snapshot, &request_id, &nonce))
+        .map(|snapshot| {
+            if allow_cleanup {
+                StoppedSessionReceipt::from_stop(snapshot, &request_id, &nonce)
+            } else {
+                StoppedSessionReceipt {
+                    snapshot,
+                    retirement: None,
+                    directory_retirement: None,
+                }
+            }
+        })
         .map_err(NativeCallFailure::message)
 }
 
@@ -595,6 +859,54 @@ pub fn prepare_start(config: &str, shared_generation: u64) -> Result<StartSessio
 }
 
 pub async fn start_prepared(custody: &StartSessionCustody) -> Result<ReadySessionReceipt, String> {
+    start_prepared_mode(custody, false).await
+}
+
+fn expected_directory_source_identity() -> Result<String, String> {
+    let source: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../scripts/mobile-core/source-contract.json"
+    ))
+    .map_err(|_| "StartupFailed: Bundled mobile producer contract is invalid")?;
+    directory_source_identity(&source)
+}
+
+fn directory_source_identity(source: &serde_json::Value) -> Result<String, String> {
+    let commit = source["sourceCommit"].as_str().unwrap_or("");
+    if source["schema"] != "polaris-mobile-fork-input-v1"
+        || source["repository"] != "polaris-arch/sing-box-polaris"
+        || source["repositoryId"].as_u64() != Some(1421657509)
+        || source["sourceURL"] != "https://github.com/polaris-arch/sing-box-polaris"
+        || source["sourceOverlay"] != 0
+        || source["patches"]
+            .as_array()
+            .is_none_or(|patches| !patches.is_empty())
+        || commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("StartupFailed: Bundled mobile producer identity is unsupported".into());
+    }
+    Ok(commit.to_owned())
+}
+
+/// The selected App-only bootstrap protocol never sends managed physical paths
+/// or configuration bytes to an unverified provider instance.
+pub async fn start_managed_prepared(
+    custody: &StartSessionCustody,
+) -> Result<ReadySessionReceipt, String> {
+    start_prepared_mode(custody, true).await
+}
+
+async fn start_prepared_mode(
+    custody: &StartSessionCustody,
+    managed: bool,
+) -> Result<ReadySessionReceipt, String> {
+    let expected_source = if managed {
+        Some(expected_directory_source_identity()?)
+    } else {
+        None
+    };
     let generation = custody.native_generation();
     if state()
         .lock()
@@ -616,6 +928,7 @@ pub async fn start_prepared(custody: &StartSessionCustody) -> Result<ReadySessio
         "start",
         serde_json::json!({
             "configContent": custody.0.config, "requestID": custody.request_id(),
+            "managedBootstrap": managed, "expectedDirectorySourceIdentity": expected_source,
         }),
         45,
         Some(generation),
@@ -727,6 +1040,228 @@ pub async fn revoke_pending_start_through(
     Ok(())
 }
 
+/// Stop-only custody. There is deliberately no conversion to Ready or Observed
+/// readiness; revoked original starts cannot be revived through this capability.
+#[derive(Clone, Debug)]
+pub struct StopSessionTarget {
+    host_generation: Arc<std::sync::atomic::AtomicU64>,
+    cleanup_proof_eligible: Arc<std::sync::atomic::AtomicBool>,
+    session_id: String,
+    request_id: String,
+    config_digest: String,
+    extension_generation: u64,
+    original_instances: Vec<TailscaleStoreRetirementInstance>,
+}
+impl StopSessionTarget {
+    pub fn cleanup_proof_eligible(&self) -> bool {
+        self.cleanup_proof_eligible
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn without_cleanup_proof(&self) -> Self {
+        self.cleanup_proof_eligible
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.clone()
+    }
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn config_digest(&self) -> &str {
+        &self.config_digest
+    }
+    pub fn extension_generation(&self) -> u64 {
+        self.extension_generation
+    }
+    pub fn original_instances(&self) -> &[TailscaleStoreRetirementInstance] {
+        &self.original_instances
+    }
+}
+
+fn refine_stop_scope(
+    session_id: &str,
+    request_id: &str,
+    config_digest: &str,
+    extension_generation: u64,
+    original_instances: &[TailscaleStoreRetirementInstance],
+    nonce: &str,
+    observed: Option<(&str, &TunnelStatus)>,
+) -> Option<(u64, Vec<TailscaleStoreRetirementInstance>)> {
+    let (returned_nonce, snapshot) = observed?;
+    if returned_nonce != nonce {
+        return None;
+    }
+    validate_reload_scope(
+        session_id,
+        request_id,
+        config_digest,
+        extension_generation,
+        original_instances,
+        snapshot,
+    )
+    .ok()
+}
+
+async fn prepare_stop_target(
+    session_id: &str,
+    request_id: &str,
+    config_digest: &str,
+    extension_generation: u64,
+    original_instances: &[TailscaleStoreRetirementInstance],
+    required_host_generation: Option<u64>,
+) -> Result<StopSessionTarget, String> {
+    let host_generation = {
+        let state = state().lock().map_err(|_| "iOS VPN state lock poisoned")?;
+        let generation = required_host_generation.unwrap_or_else(|| state.generation());
+        if !state.accepts_stop_target(generation) {
+            return Err(
+                "CleanupUnknown: Original stop owner was replaced or has an active dispatch".into(),
+            );
+        }
+        generation
+    };
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Observation {
+        observation_nonce: String,
+        snapshot: TunnelStatus,
+    }
+    let nonce = fresh_request_id()?;
+    let observed: Result<Observation, NativeCallFailure> = call(
+        "observeReloadSession",
+        serde_json::json!({
+            "sessionID": session_id, "requestID": request_id, "configDigest": config_digest,
+            "extensionGeneration": extension_generation, "observationNonce": nonce,
+        }),
+        12,
+        None,
+        None,
+    )
+    .await;
+    if !state()
+        .lock()
+        .map_err(|_| "iOS VPN state lock poisoned")?
+        .accepts_stop_target(host_generation)
+    {
+        return Err("CleanupUnknown: Original stop observation was superseded".into());
+    }
+    // Failed observation is not failed Stop authority. Only exact positive
+    // refinement may carry cleanup evidence; the original identity remains
+    // addressable during reloadAccepted, reasserting, or an unresponsive worker.
+    let refined = refine_stop_scope(
+        session_id,
+        request_id,
+        config_digest,
+        extension_generation,
+        original_instances,
+        &nonce,
+        observed
+            .as_ref()
+            .ok()
+            .map(|value| (value.observation_nonce.as_str(), &value.snapshot)),
+    );
+    let eligible = refined.is_some();
+    let (generation, instances) =
+        refined.unwrap_or_else(|| (extension_generation, original_instances.to_vec()));
+    Ok(StopSessionTarget {
+        host_generation: Arc::new(std::sync::atomic::AtomicU64::new(host_generation)),
+        cleanup_proof_eligible: Arc::new(std::sync::atomic::AtomicBool::new(eligible)),
+        session_id: session_id.to_owned(),
+        request_id: request_id.to_owned(),
+        config_digest: config_digest.to_owned(),
+        extension_generation: generation,
+        original_instances: instances,
+    })
+}
+
+pub async fn prepare_ready_stop(
+    receipt: &ReadySessionReceipt,
+) -> Result<StopSessionTarget, String> {
+    prepare_stop_target(
+        &receipt.session_id,
+        &receipt.request_id,
+        &receipt.config_digest,
+        receipt.extension_generation,
+        &receipt.original_instances,
+        Some(receipt.native_generation),
+    )
+    .await
+}
+pub async fn prepare_observed_stop(
+    receipt: &ObservedSessionReceipt,
+) -> Result<StopSessionTarget, String> {
+    prepare_stop_target(
+        &receipt.session_id,
+        &receipt.request_id,
+        &receipt.config_digest,
+        receipt.extension_generation,
+        &receipt.original_instances,
+        None,
+    )
+    .await
+}
+pub async fn stop_target(target: &StopSessionTarget) -> Result<StoppedSessionReceipt, String> {
+    let mut expected = serde_json::json!({"expectedStartRequestID": target.request_id,
+        "expectedSessionID": target.session_id, "expectedConfigDigest": target.config_digest});
+    let eligible = target
+        .cleanup_proof_eligible
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    expected["stopOnly"] = serde_json::json!(!eligible);
+    if eligible {
+        expected["expectedExtensionGeneration"] = serde_json::json!(target.extension_generation);
+    }
+    let mut stopped = stop_call_bound(expected, Some(target.host_generation.as_ref())).await?;
+    if !eligible {
+        // Even a coincidental positive wire response cannot upgrade this
+        // explicitly unrefined Stop into cleanup authority.
+        stopped.retirement = None;
+        stopped.directory_retirement = None;
+    } else {
+        target
+            .cleanup_proof_eligible
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(stopped)
+}
+
+/// Refresh the existing same-process original owner after a provider reload.
+/// This does not create custody from a cold-host observation or weaken the
+/// generation checks used by ordinary observe_session / stop_session.
+pub async fn refresh_ready_session(
+    receipt: &ReadySessionReceipt,
+) -> Result<ReadySessionReceipt, String> {
+    let accepts = || -> Result<bool, String> {
+        Ok(state()
+            .lock()
+            .map_err(|_| "iOS VPN state lock poisoned")?
+            .accepts_receipt(receipt.native_generation, receipt.shared_generation))
+    };
+    if !accepts()? {
+        return Err("ReadyUnknown: Original reload custody was superseded".into());
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Observation {
+        observation_nonce: String,
+        snapshot: TunnelStatus,
+    }
+    let nonce = fresh_request_id()?;
+    let observed: Observation = call(
+        "observeReloadSession",
+        receipt.payload(&nonce),
+        12,
+        None,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message)?;
+    if !accepts()? || observed.observation_nonce != nonce {
+        return Err("ReadyUnknown: Reload observation nonce or original custody changed".into());
+    }
+    receipt.from_reload_observation(&observed.snapshot)
+}
+
 pub async fn observe_session(receipt: &ReadySessionReceipt) -> Result<(), String> {
     let accepts = || -> Result<bool, String> {
         Ok(state()
@@ -759,7 +1294,9 @@ pub async fn observe_session(receipt: &ReadySessionReceipt) -> Result<(), String
             .tailscale_store_scope
             .as_ref()
             .is_none_or(|scope| {
-                scope.validate(&receipt.config_digest, false).is_err()
+                scope
+                    .validate_history(&receipt.config_digest, false)
+                    .is_err()
                     || scope.instances() != receipt.original_instances.as_slice()
             })
     {
@@ -767,6 +1304,39 @@ pub async fn observe_session(receipt: &ReadySessionReceipt) -> Result<(), String
     }
     Ok(())
 }
+/// Refresh a previously observed original manager without manufacturing local
+/// start custody. Its same owner and complete original run history stay bound.
+pub async fn refresh_observed_session(
+    receipt: &ObservedSessionReceipt,
+) -> Result<ObservedSessionReceipt, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Observation {
+        observation_nonce: String,
+        snapshot: TunnelStatus,
+    }
+    let generation = state()
+        .lock()
+        .map_err(|_| "iOS VPN state lock poisoned")?
+        .generation();
+    let nonce = fresh_request_id()?;
+    let observed: Observation = call("observeReloadSession", serde_json::json!({
+        "sessionID": receipt.session_id, "requestID": receipt.request_id,
+        "configDigest": receipt.config_digest, "extensionGeneration": receipt.extension_generation,
+        "observationNonce": nonce,
+    }), 12, None, None).await.map_err(NativeCallFailure::message)?;
+    if observed.observation_nonce != nonce
+        || state()
+            .lock()
+            .map_err(|_| "iOS VPN state lock poisoned")?
+            .generation()
+            != generation
+    {
+        return Err("ReadyUnknown: Observed reload custody was superseded".into());
+    }
+    receipt.from_reload_observation(&observed.snapshot)
+}
+
 pub async fn observe_current_session() -> Result<ObservedSessionReceipt, String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -805,3 +1375,26 @@ pub fn started() -> bool {
 
 #[cfg(test)]
 mod retirement_tests;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TLSFingerprintCapabilitiesResponse {
+    pub document: Option<String>,
+    pub binary_sha256: String,
+}
+
+/// Queries the actual PacketTunnel extension; disconnected/old extensions are unknown.
+pub async fn tls_fingerprint_capabilities() -> Result<TLSFingerprintCapabilitiesResponse, String> {
+    call(
+        "tlsFingerprintCapabilities",
+        serde_json::json!({}),
+        5,
+        None,
+        None,
+    )
+    .await
+    .map_err(NativeCallFailure::message)
+}
+
+#[cfg(test)]
+mod directory_retirement_tests;

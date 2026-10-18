@@ -99,7 +99,9 @@ def macho(data, helper):
     require(0 < count <= command_bytes // 8, 'load-command count')
     limit, position = 32 + command_bytes, 32
     sections, segments, vm_segments, platforms, commands, auxiliary = [], [], [], [], [], []
-    symbols, dynamic = None, None
+    symbols, dynamic, optimization_hint = None, None, None
+    rpaths = set()
+    linkedit_segments, code_signature = [], None
     for ordinal in range(count):
         bounds(position, 8, limit, 'load-command header')
         command, size = struct.unpack_from('<II', data, position)
@@ -118,6 +120,8 @@ def macho(data, helper):
             require(address + vm_size <= 1 << 64, 'segment address overflow')
             segments.append((offset, offset + length))
             vm_segments.append((address, address + vm_size))
+            if segment_name == '__LINKEDIT':
+                linkedit_segments.append((offset, offset + length))
             for index in range(nsections):
                 start = position + 72 + index * 80
                 section_raw, segment_raw, addr, length_s, off, align, reloc, nreloc, sflags, r1, r2, r3 = struct.unpack_from('<16s16sQQ8I', data, start)
@@ -125,8 +129,19 @@ def macho(data, helper):
                 require(not segment_name or segment_name == segment, 'section segment differs')
                 require(addr >= address and length_s <= address + vm_size - addr
                         and align <= 31 and addr % (1 << align) == 0, 'section address/alignment')
-                zero = sflags & 255 == 1
-                require(sflags & 255 in (0, 1, 2, 6, 8, 9, 11, 22), 'unsupported section type')
+                section_type = sflags & 255
+                # The real three-slice SDK also contains literal pools,
+                # Objective-C literal pointers and the three TLV section kinds.
+                # Only these defined encodings extend the original inventory.
+                require(section_type in (0, 1, 2, 3, 4, 5, 6, 8, 9, 11, 14, 17, 18, 19, 22),
+                        'unsupported section type')
+                if section_type in (3, 4, 5, 14, 17, 18, 19):
+                    require(r1 == r2 == r3 == 0, 'literal/TLV reserved fields')
+                    width = {3: 4, 4: 8, 5: 8, 14: 16, 19: 24}.get(section_type)
+                    require(width is None or length_s % width == 0, 'literal/TLV element width')
+                    if section_type == 18:
+                        require(nreloc == 0, 'TLV zero-fill relocation')
+                zero = section_type in (1, 18)
                 row = {'segment': segment, 'section': section, 'address': addr, 'offset': off,
                        'bytes': length_s, 'flags': sflags, 'zeroFill': zero,
                        'relocationOffset': reloc, 'relocationCount': nreloc}
@@ -149,6 +164,30 @@ def macho(data, helper):
             platform, minimum, sdk, ntools = struct.unpack_from('<4I', data, position + 8)
             require(size == 24 + ntools * 8 and platform in (2, 7), 'platform command layout')
             platforms.append({'platform': platform, 'minOSRaw': minimum, 'sdkRaw': sdk})
+        elif command == 0x2d:
+            # LC_LINKER_OPTION is an MH_OBJECT command with count NUL-terminated
+            # UTF-8 strings and zero alignment padding. Admit the observed
+            # framework pairs, never path flags or arbitrary linker arguments.
+            require(kind == 1 and size in (32, 40), 'linker option object/size')
+            option_count = struct.unpack_from('<I', data, position + 8)[0]
+            require(option_count == 2, 'linker option count')
+            cursor, options = position + 12, []
+            for _ in range(option_count):
+                stop = data.find(b'\0', cursor, position + size)
+                require(stop > cursor, 'linker option string termination')
+                try:
+                    option = data[cursor:stop].decode('utf-8', errors='strict')
+                except UnicodeDecodeError as error:
+                    raise RuntimeError('Apple carrier: linker option UTF-8') from error
+                options.append(option)
+                cursor = stop + 1
+            require(options[0] == '-framework' and options[1] in
+                    ('Foundation', 'CFNetwork', 'Security', 'CoreFoundation'), 'unsupported linker option pair')
+            require(0 <= position + size - cursor < 8 and not data[cursor:position + size].strip(b'\0'),
+                    'linker option padding')
+            commands[-1].update(count=option_count, options=options,
+                                paddingBytes=position + size - cursor,
+                                payloadHex=data[position:position + size].hex())
         elif command == 2:
             require(size == 24 and symbols is None, 'symbol command size/duplicate')
             symoff, nsyms, stroff, strsize = struct.unpack_from('<4I', data, position + 8)
@@ -168,6 +207,33 @@ def macho(data, helper):
                 if entries:
                     require(off >= limit, 'dynamic symbol table in headers')
                     auxiliary.append((off, off + entries * width))
+        elif command == 0x2e:
+            # LC_LINKER_OPTIMIZATION_HINT: one MH_OBJECT linkedit_data_command,
+            # bounded outside headers and disjoint from sections/other tables.
+            require(kind == 1 and size == 16 and optimization_hint is None,
+                    'optimization hint object/size/duplicate')
+            off, length = struct.unpack_from('<2I', data, position + 8)
+            bounds(off, length, len(data), 'optimization hint data')
+            require(not length or off >= limit, 'optimization hint in headers')
+            optimization_hint = (off, length)
+            if length:
+                auxiliary.append((off, off + length))
+            commands[-1].update(dataOffset=off, dataBytes=length,
+                                payloadSha256=helper.digest(data[off:off + length]))
+        elif command == 0x1d:
+            # Simulator MH_EXECUTE images carry the linker's code-signature
+            # blob. Preserve its bounded opaque bytes; this is not a codesign
+            # inspection, CodeDirectory/CDHash calculation or trust decision.
+            require(kind == 2 and size == 16 and code_signature is None,
+                    'code signature executable/size/duplicate')
+            off, length = struct.unpack_from('<2I', data, position + 8)
+            bounds(off, length, len(data), 'code signature data')
+            require(length > 0 and off >= limit, 'code signature empty/in headers')
+            code_signature = (off, off + length)
+            auxiliary.append(code_signature)
+            commands[-1].update(dataOffset=off, dataBytes=length,
+                                payloadSha256=helper.digest(data[off:off + length]),
+                                payloadKind='opaque-code-signature', trustValidated=False)
         elif command in (0x80000033, 0x80000034, 0x26, 0x29):
             require(size == 16, 'linkedit command size')
             off, length = struct.unpack_from('<2I', data, position + 8)
@@ -175,6 +241,41 @@ def macho(data, helper):
             if length:
                 require(off >= limit, 'linkedit data in headers')
                 auxiliary.append((off, off + length))
+        elif command in (0x80000018, 0x8000001c):
+            # Real device App/PacketTunnel outputs use LC_LOAD_WEAK_DYLIB and
+            # LC_RPATH (Apple mach-o/loader.h). These are linked-image commands,
+            # not MH_OBJECT linker options; retain exact fields and payload.
+            require(kind == 2, 'weak dylib/rpath requires linked executable')
+            base = 24 if command == 0x80000018 else 12
+            require(base + 1 <= size <= 160, 'weak dylib/rpath command size')
+            off = struct.unpack_from('<I', data, position + 8)[0]
+            require(off == base and off < size,
+                    'weak dylib/rpath string offset/prefix')
+            stop = data.find(b'\0', position + off, position + size)
+            require(position + off < stop <= position + off + 128,
+                    'weak dylib/rpath string termination/length')
+            padding = position + size - stop - 1
+            require(padding < 8 and not data[stop + 1:position + size].strip(b'\0'),
+                    'weak dylib/rpath string padding')
+            try:
+                name = data[position + off:stop].decode('utf-8', errors='strict')
+            except UnicodeDecodeError as error:
+                raise RuntimeError('Apple carrier: weak dylib/rpath UTF-8') from error
+            row = {'name': name, 'nameOffset': off, 'paddingBytes': padding,
+                   'payloadHex': data[position:position + size].hex()}
+            if command == 0x80000018:
+                require(re.fullmatch(r'/usr/lib/swift/libswift[A-Za-z0-9_]{1,64}\.dylib', name),
+                        'weak dylib must be an observed system Swift library')
+                timestamp, current, compatibility = struct.unpack_from('<3I', data, position + 12)
+                require(current >= compatibility, 'weak dylib version relationship')
+                row.update(weak=True, timestamp=timestamp, currentVersionRaw=current,
+                           compatibilityVersionRaw=compatibility)
+            else:
+                require(name in ('/usr/lib/swift', '@executable_path/Frameworks',
+                                 '@executable_path/../../Frameworks') and name not in rpaths,
+                        'unobserved or duplicate executable rpath')
+                rpaths.add(name)
+            commands[-1].update(row)
         elif command in (12, 14):
             base = 24 if command == 12 else 12
             require(size >= base, 'dylib/dylinker command size')
@@ -198,6 +299,10 @@ def macho(data, helper):
         for index in (0, 2, 4):
             bounds(dynamic[index], dynamic[index + 1], symbols, 'dynamic symbol index')
     require(len(platforms) <= 1, 'duplicate platform command')
+    if code_signature is not None:
+        require(len(linkedit_segments) == 1 and
+                linkedit_segments[0][0] <= code_signature[0] < code_signature[1] <= linkedit_segments[0][1],
+                'code signature outside unique __LINKEDIT segment')
     require(len({(s['segment'], s['section']) for s in sections}) == len(sections), 'duplicate section')
     disjoint(segments, 'segment file')
     disjoint(vm_segments, 'segment address')
@@ -257,7 +362,9 @@ def archive(data, helper):
         row = {'ordinal': len(members), 'headerOffset': position, 'rawName': raw_name,
                'name': name, 'nameBytes': name_length, 'payloadOffset': payload_start,
                'bytes': len(payload), 'sha256': helper.digest(payload)}
-        if name == '__.SYMDEF SORTED':
+        if name in ('__.SYMDEF', '__.SYMDEF SORTED'):
+            # The observed Apple BSD tables differ only in declared sorting.
+            # Both take the same bounded table/string/member-offset predicate.
             require(not members and not payload.startswith(MACHO), 'ar symbol table position/payload')
             row['classification'] = 'symbol-table'
             symbol_payload = payload
@@ -279,13 +386,13 @@ def archive(data, helper):
         string_bytes = struct.unpack_from('<I', symbol_payload, 4 + table_bytes)[0]
         string_offset = 8 + table_bytes
         bounds(string_offset, string_bytes, len(symbol_payload), 'BSD symbol strings')
-        strings = symbol_payload[string_offset:string_offset + string_bytes]
         tail = symbol_payload[string_offset + string_bytes:]
         require(len(tail) < 8 and not tail.strip(b'\0'), 'BSD symbol table padding')
         code_offsets = {m['headerOffset'] for m in members if m['classification'] == 'code'}
         for offset in range(4, 4 + table_bytes, 8):
             name_offset, member_offset = struct.unpack_from('<2I', symbol_payload, offset)
-            require(name_offset < len(strings) and b'\0' in strings[name_offset:]
+            require(name_offset < string_bytes and
+                    symbol_payload.find(b'\0', string_offset + name_offset, string_offset + string_bytes) != -1
                     and member_offset in code_offsets, 'BSD symbol/member binding')
     return {'kind': 'bsd-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'members': members}
 
@@ -294,7 +401,10 @@ def container(data, helper):
     if data.startswith(FAT):
         bounds(0, 8, len(data), 'fat header')
         count = struct.unpack_from('>I', data, 4)[0]
-        require(count == 2, 'unsupported fat slice count')
+        # A valid single-target fat wrapper has one entry. Historical/diagnostic
+        # wrappers may have two; formal consumers require their exact arm64
+        # platform inventory, never merely an arbitrary bounded count.
+        require(count in (1, 2), 'unsupported fat slice count')
         header_end = 8 + count * 20
         bounds(8, count * 20, len(data), 'fat table')
         slices, ranges = [], []
@@ -315,6 +425,9 @@ def container(data, helper):
         require(cursor == len(data), 'fat trailing bytes')
         for row in slices:
             row['archive'] = archive(data[row['offset']:row['offset'] + row['bytes']], helper)
+            code = [member['machO'] for member in row['archive']['members'] if member['classification'] == 'code']
+            require(code and all((obj['cpu'], obj['subCPU']) == (row['cpu'], row['subCPU']) for obj in code),
+                    'fat header/payload CPU differs')
         return {'kind': 'fat-ar', 'sha256': helper.digest(data), 'bytes': len(data), 'slices': slices}
     if data.startswith(AR):
         return archive(data, helper)

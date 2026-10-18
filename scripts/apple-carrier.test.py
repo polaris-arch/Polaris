@@ -33,7 +33,7 @@ def inline(raw, version='go1.25.5'):
     return payload + bytes(-len(payload) % 16)
 
 
-def mach_object(target, metadata=None, build_id=None, extra=(), platform=True, kind=1, sdk=None, load_commands=(), text_payload=None):
+def mach_object(target, metadata=None, build_id=None, extra=(), platform=True, kind=1, sdk=None, load_commands=(), text_payload=None, minimum=15 << 16):
     """Small structural fixture in the observed encoding, never compiler evidence."""
     cpu, subcpu, platform_id, _, _, _ = carrier.TARGETS[target]
     text = carrier.ID_START + build_id.encode() + carrier.ID_END if build_id is not None else b'native-A'
@@ -54,7 +54,7 @@ def mach_object(target, metadata=None, build_id=None, extra=(), platform=True, k
         offset += len(payload)
     segment = struct.pack('<II16s4Q4I', 0x19, segment_size, b'', 0, offset,
         32 + commands_size, len(body), 7, 7, len(payloads), 0) + b''.join(section_rows)
-    command = struct.pack('<6I', 0x32, 24, platform_id, 15 << 16, (27 << 16) | (1 << 8) if sdk is None else sdk, 0) if platform else b''
+    command = struct.pack('<6I', 0x32, 24, platform_id, minimum, (27 << 16) | (1 << 8) if sdk is None else sdk, 0) if platform else b''
     return struct.pack('<8I', 0xfeedfacf, cpu, subcpu, kind, 1 + int(platform) + len(load_commands), commands_size, 0, 0) + segment + command + b''.join(load_commands) + body
 
 
@@ -79,13 +79,27 @@ def fat(first, second):
     return header + first + bytes(offset2 - offset1 - len(first)) + second
 
 
-def fixture():
+def declare_dependencies(source, core):
+    """Fixture-only declarations: the committed manifest patches no dependency module."""
+    source['dependencyPatches'] = [{'name': name, 'module': 'example.com/' + name, 'upstreamVersion': 'v1.0.0',
+                                    'sourceURL': 'https://github.com/example/' + name, 'upstreamCommit': '2' * 40,
+                                    'patchFile': name + '.patch', 'patchSha256': '3' * 64, 'patchedTree': '4' * 40,
+                                    'candidateCommit': '5' * 40} for name in ('patched', 'second')]
+    core['sourceBuild'].update(dependencyModules=[dep['module'] for dep in source['dependencyPatches']],
+                               graphScope='declared-patched-modules')
+
+
+def fixture(declared=True):
     helper = carrier.source_helpers()
     root = Path(__file__).parent.parent
     source = json.loads((root / 'scripts/libbox-patches/source-manifest.json').read_bytes())
     core = json.loads((root / 'src-tauri/core-manifest.json').read_bytes())
-    receipt = {'schema': 'polaris-core-source-v1', 'sourceGraphState': 'dependencies-patched',
-        'graphScope': 'declared-patched-modules', 'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
+    if declared:
+        declare_dependencies(source, core)
+    receipt = {'schema': 'polaris-core-source-v1',
+        'sourceGraphState': 'dependencies-patched' if source['dependencyPatches'] else 'source-only',
+        'graphScope': 'declared-patched-modules' if source['dependencyPatches'] else 'core-source-only',
+        'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
         'sourceCommit': source['sourceCommit'], 'sourceURL': 'https://github.com/SagerNet/sing-box',
         'upstreamTree': '1' * 40, 'patches': source['patches'],
         'dependencies': [{**d, 'upstreamTree': '1' * 40, 'replacement': './polaris-dependencies/' + d['name']}
@@ -314,7 +328,7 @@ def run_tests():
     receipt = copy.deepcopy(f['receipt']); receipt['fingerprint'] = '0' * 64
     rejected(lambda: inspect(base, receipt=receipt), 'receipt fingerprint')
     # Rule checks cannot be bypassed by updating synthetic expected facts too.
-    for raw, reason in ((f['raw'][device].replace('./polaris-dependencies/sing-tun', './foreign'), 'patched module provenance'),
+    for raw, reason in ((f['raw'][device].replace('./polaris-dependencies/patched', './foreign'), 'patched module provenance'),
                         (f['raw'][device] + 'dep\tforeign/module\tv1.0.0\n=>\t./foreign\n', 'undeclared module replacement')):
         p = copy.deepcopy(f['policy'])
         p['targets'][device]['buildInfo'] = helper.parse_build_info('section: go1.25.5\n' + ''.join('\t' + r + '\n' for r in raw.splitlines()))
@@ -372,6 +386,47 @@ def run_tests():
                         (changed(sym_payload, 8, '<I', 99), 'symbol/member binding'),
                         (sym_payload + b'x', 'symbol table padding')):
         rejected(lambda bad=bad: inspect(archive([('__.SYMDEF SORTED', bad), ('carrier.o', base)])), reason)
+    # Search only the declared string table. A NUL in alignment padding must
+    # not terminate a name, and an offset at the table end remains invalid.
+    # Repeated/shared offsets and an empty terminal name remain parser-valid.
+    for table_name in ('__.SYMDEF', '__.SYMDEF SORTED'):
+        names = [b'symbol_' + str(index).zfill(2).encode() for index in range(64)]
+        strings = b'\0'.join(names) + b'\0'
+        offsets = [index * 10 for index in range(len(names))] + [0, len(strings) - 1]
+        table_bytes = len(offsets) * 8
+        string_offset = 8 + table_bytes
+        def symbol_table(name_offsets, text=strings, padding=b'\0' * 4):
+            def payload(member_offset):
+                return (struct.pack('<I', table_bytes) + b''.join(struct.pack('<2I', name_offset, member_offset)
+                        for name_offset in name_offsets) + struct.pack('<I', len(text)) + text + padding)
+            provisional = archive([(table_name, payload(0))])
+            return payload(len(provisional))
+        table = symbol_table(offsets)
+        raw = archive([(table_name, table), ('carrier.o', base)])
+        expected = positive(lambda: inspect(raw))
+        searches = []
+        class NoStringCopies(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.start == string_offset and key.stop == string_offset + len(strings):
+                    raise AssertionError('symbol string table copied before per-symbol suffix slicing')
+                return super().__getitem__(key)
+
+            def find(self, needle, start=0, end=None):
+                check(needle == b'\0' and string_offset <= start < string_offset + len(strings)
+                      and end == string_offset + len(strings), 'symbol search escaped declared strings')
+                searches.append((start, end))
+                return super().find(needle, start, end)
+
+        class SymbolArchive(bytes):
+            def __getitem__(self, key):
+                result = super().__getitem__(key)
+                return NoStringCopies(result) if isinstance(result, bytes) and result == table else result
+
+        actual = positive(lambda: inspect(SymbolArchive(raw)))
+        check(actual == expected and len(searches) == len(offsets), 'bounded symbol search changed parser output')
+        for bad in (symbol_table([len(strings)] + offsets[1:]),
+                    symbol_table(offsets, text=strings[:-1] + b'x')):
+            rejected(lambda bad=bad: inspect(archive([(table_name, bad), ('carrier.o', base)])), 'symbol/member binding')
     # Supported section types are exactly those retained in C0 inventories.
     for s_type in (2, 6, 8, 9, 11, 22):
         native = mach_object(device)
@@ -427,6 +482,24 @@ def run_tests():
         member = row['goCarriers'][0]['memberIdentity']
         check(locus['buildInfo']['containerOffset'] == row['sliceOffset'] + member['payloadOffset'] + locus['buildInfo']['offset'], 'absolute BuildInfo locus')
         check(two[locus['buildID']['containerOffset']:].startswith(carrier.ID_START), 'absolute compiler ID locus')
+    # The committed declaration (no patched dependency) is accepted as it is,
+    # and any replacement row in such a carrier is refused.
+    actual = fixture(declared=False)
+    check(actual['source']['dependencyPatches'] == [] and actual['core']['sourceBuild']['dependencyModules'] == []
+          and actual['receipt']['graphScope'] == 'core-source-only' and '=>' not in actual['raw'][device], 'committed empty graph fixture')
+    def inspect_actual(data, target, policy=None):
+        return carrier.inspect_carrier(data, [target], actual['receipt'], actual['source'], actual['core'],
+                                       actual['policy'] if policy is None else policy, actual['tools'])
+    for target in carrier.TARGETS:
+        for data in (actual['objects'][target], actual['archives'][target]):
+            row = positive(lambda data=data, target=target: inspect_actual(data, target))['targets'][target]
+            check(row['goCarriers'][0]['buildID'] == actual['id'], 'committed graph provider identity mismatch')
+    raw = actual['raw'][device] + 'dep\tgithub.com/sagernet/sing-tun\tv1.0.0\n=>\t./polaris-dependencies/sing-tun\t(devel)\t\n'
+    p = copy.deepcopy(actual['policy'])
+    p['targets'][device]['buildInfo'] = helper.parse_build_info('section: go1.25.5\n' + ''.join('\t' + r + '\n' for r in raw.splitlines()))
+    rejected(lambda: inspect_actual(mach_object(device, inline(raw), actual['id']), device, p), 'undeclared module replacement')
+    p = copy.deepcopy(actual['policy']); p['targets'][device]['patchedModules']['allowedAbsent'].append('example.com/patched')
+    rejected(lambda: inspect_actual(actual['objects'][device], device, p), 'partition inventory')
     print(f'{count} Apple carrier unit cases passed; no Framework or App built.')
     return count
 

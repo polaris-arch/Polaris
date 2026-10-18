@@ -60,10 +60,13 @@ impl LifecycleState {
     }
 
     pub(crate) fn accepts_receipt(&self, generation: u64, shared_generation: u64) -> bool {
-        self.generation == generation
-            && !self.pending
-            && self.pending_start.is_none()
-            && shared_generation > self.revoked_shared_generation
+        self.accepts_stop_target(generation) && shared_generation > self.revoked_shared_generation
+    }
+
+    /// Stop-only admission may address a revoked original readiness owner, but
+    /// never a replaced generation or a pending native dispatch.
+    pub(crate) fn accepts_stop_target(&self, generation: u64) -> bool {
+        self.generation == generation && !self.pending && self.pending_start.is_none()
     }
 
     /// Losing the Rust receiver cannot undo native work. Keep its exact request

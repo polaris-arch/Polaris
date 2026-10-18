@@ -31,6 +31,9 @@ def load(name, file):
 builder = load('fixture_builder', HERE / 'build.py')
 android = builder.android
 verifier = load('fixture_verifier', HERE / 'verify-receipt.py')
+FIXTURE_PATCHED = ['example.com/patched', 'example.com/second']
+HISTORICAL_CI = json.loads((HERE / 'historical-ci-fragments.json').read_bytes())
+EMPTY_GRAPH_SHA256 = '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945'
 
 
 def git(*args, cwd):
@@ -88,8 +91,8 @@ class AndroidSourceFixture(unittest.TestCase):
         self.source['patches'] = [{'file': 'fixture-core.patch', 'sha256': android.digest(core_patch.encode())}]
         self.repositories = {}
         self.source['dependencyPatches'] = []
-        for index, module in enumerate(android.REQUIRED_PATCHED):
-            name = ('tun', 'nft')[index]
+        for index, module in enumerate(FIXTURE_PATCHED):
+            name = ('patched', 'second')[index]
             path = self.root / name
             commit = repository(path, {'go.mod': 'module ' + module + '\n\ngo 1.25.5\n', 'input.go': 'package input\nconst value = 1\n'})
             content = 'diff --git a/input.go b/input.go\n--- a/input.go\n+++ b/input.go\n@@ -1,2 +1,2 @@\n package input\n-const value = 1\n+const value = 2\n'
@@ -137,15 +140,31 @@ class AndroidSourceFixture(unittest.TestCase):
         for field in ('sourceManifestSha256', 'provisionerSha256', 'moduleGraphSha256', 'patchedSourceTree', 'buildTree'):
             spec[field] = self.source_receipt[field]
         spec.update(sourceReceiptFingerprint=self.source_receipt['fingerprint'], version=self.core['bundledCoreVersion'] + '.polaris.1',
-                    dependencyModules=list(android.REQUIRED_PATCHED), transportPins={'github.com/sagernet/gomobile': 'v0.1.12'})
+                    dependencyModules=list(FIXTURE_PATCHED), transportPins={'github.com/sagernet/gomobile': 'v0.1.12'})
+        self.policy['requiredPatchedModules'] = list(FIXTURE_PATCHED)
         for target in self.policy['abis'].values():
-            target['patchedModules'] = {'requiredLinked': list(android.REQUIRED_PATCHED), 'allowedAbsent': []}
+            target['patchedModules'] = {'requiredLinked': list(FIXTURE_PATCHED), 'allowedAbsent': []}
             target['transportModules'] = {'requiredLinked': ['github.com/sagernet/gomobile'], 'confirmedAbsent': []}
         self.write_configuration()
         self.tool = {'go': self.go, 'jdk': self.root / 'jdk', 'ndk': self.root / 'ndk', 'gomobile': self.root / 'gomobile',
                      'jar': self.root / 'android.jar', 'env': {}, 'identity': {'toolStub': True, 'sdkBootclasspath': self.policy['sdkBootclasspath']}}
         self.identity = android.input_identity(self.source, self.core, self.policy, self.tool['identity'])
         self.calls.clear()
+
+    def use_empty_dependencies(self):
+        self.source['dependencyPatches'], self.repositories = [], {}
+        self.core['sourceBuild']['dependencyModules'] = []
+        self.policy['requiredPatchedModules'] = []
+        for target in self.policy['abis'].values():
+            target['patchedModules'] = {'requiredLinked': [], 'allowedAbsent': []}
+        self.write_configuration()
+        self.source_receipt = self.shared.provision(self.patches / 'source-manifest.json', self.upstream, self.root / 'baseline-empty', {}, None)
+        spec = self.core['sourceBuild']
+        for field in ('sourceManifestSha256', 'provisionerSha256', 'moduleGraphSha256', 'patchedSourceTree', 'buildTree'):
+            spec[field] = self.source_receipt[field]
+        spec['sourceReceiptFingerprint'] = self.source_receipt['fingerprint']
+        self.write_configuration()
+        self.identity = android.input_identity(self.source, self.core, self.policy, self.tool['identity'])
 
     def write_configuration(self):
         (self.patches / 'source-manifest.json').write_text(json.dumps(self.source))
@@ -219,17 +238,25 @@ class AndroidSourceFixture(unittest.TestCase):
                 verifier.main()
         self.assertEqual(self.calls, [])
 
-    def test_empty_dependencies_partial_policy_and_provider_hash(self):
-        self.source['dependencyPatches'] = []
+    def test_dependency_inventory_partial_policy_and_provider_hash(self):
+        android.admit()
+        # Declarations, the common inventory and the Android policy name one module set.
+        declared = self.source['dependencyPatches']
+        for dependencies, expected in [([], 'Dependency inventory differs'), (declared[:1], 'Dependency inventory differs'),
+                                       (None, 'dependency graph')]:
+            self.source['dependencyPatches'] = dependencies
+            self.write_configuration()
+            with self.assertRaisesRegex(RuntimeError, expected):
+                android.admit()
+        self.source['dependencyPatches'] = declared
+        for required in ([], FIXTURE_PATCHED[:1], FIXTURE_PATCHED + FIXTURE_PATCHED[:1], FIXTURE_PATCHED + ['example.com/extra'], None):
+            self.policy['requiredPatchedModules'] = required
+            self.write_configuration()
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported Android source policy'):
+                android.admit()
+        self.policy['requiredPatchedModules'] = list(FIXTURE_PATCHED)
         self.write_configuration()
-        with self.assertRaisesRegex(RuntimeError, 'dependency graph'):
-            android.admit()
-        self.source['dependencyPatches'] = self.source_receipt['dependencies']
-        # Restore exact declarations without provider-added fields.
-        self.source['dependencyPatches'] = [{key: value for key, value in dep.items() if key not in ('upstreamTree','replacement')} for dep in self.source['dependencyPatches']]
-        self.core['sourceBuild']['sourceManifestSha256'] = android.file_hash(self.patches / 'source-manifest.json')
-        self.write_configuration()
-        self.core['sourceBuild']['sourceManifestSha256'] = android.file_hash(self.patches / 'source-manifest.json')
+        android.admit()
         self.policy['abis']['x86']['patchedModules'] = None
         self.write_configuration()
         with self.assertRaisesRegex(RuntimeError, 'partition'):
@@ -240,9 +267,71 @@ class AndroidSourceFixture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'provider hash'):
             android.admit()
 
+    def test_empty_dependency_graph_admits_replays_and_builds_without_module_sources(self):
+        self.use_empty_dependencies()
+        self.assertEqual([row for row in self.calls if row[0] == 'provider-go-stub'], [], 'empty replay must not need Go')
+        self.calls.clear()
+        android.admit()
+        receipt = self.source_receipt
+        self.assertEqual((receipt['dependencies'], receipt['moduleGraph'], receipt['moduleGraphQueries'], receipt['moduleGraphSha256'],
+                          receipt['graphScope'], receipt['sourceGraphState']),
+                         ([], [], [], EMPTY_GRAPH_SHA256, 'core-source-only', 'source-only'))
+        self.assertEqual(android.digest(android.canonical([])), EMPTY_GRAPH_SHA256)
+        android.validate_source_receipt(receipt, self.source, self.core)
+        for field, value in [('graphScope', 'declared-patched-modules'), ('sourceGraphState', 'dependencies-patched')]:
+            broken = copy.deepcopy(receipt)
+            broken[field] = value
+            with self.assertRaisesRegex(RuntimeError, 'scope', msg=field):
+                android.validate_source_receipt(broken, self.source, self.core)
+        self.assertEqual(android.module_sources([], self.source), {})
+        with self.assertRaisesRegex(RuntimeError, 'exactly cover'):
+            android.module_sources([FIXTURE_PATCHED[0] + '=' + str(self.upstream)], self.source)
+        for abi in android.ABIS:
+            raw = self.build_info(abi)
+            self.assertNotIn('=>', raw)
+            android.validate_binary(raw, abi, self.source, self.core, self.policy)
+            replaced = raw.replace('\tdep\tgithub.com/sagernet/gomobile\tv0.1.12',
+                                   '\tdep\tgithub.com/sagernet/sing-tun\tv1.0.0\n\t=>\t./polaris-dependencies/sing-tun\t(devel)\t\n\t\n\tdep\tgithub.com/sagernet/gomobile\tv0.1.12')
+            self.assertNotEqual(replaced, raw)
+            with self.assertRaisesRegex(RuntimeError, 'Undeclared target module replacement'):
+                android.validate_binary(replaced, abi, self.source, self.core, self.policy)
+        # A policy or inventory that still names a module is refused for an empty declaration.
+        self.policy['requiredPatchedModules'] = FIXTURE_PATCHED[:1]
+        self.write_configuration()
+        with self.assertRaisesRegex(RuntimeError, 'Unsupported Android source policy'):
+            android.admit()
+        self.policy['requiredPatchedModules'] = []
+        self.core['sourceBuild']['dependencyModules'] = FIXTURE_PATCHED[:1]
+        self.write_configuration()
+        with self.assertRaisesRegex(RuntimeError, 'Dependency inventory differs'):
+            android.admit()
+        self.core['sourceBuild']['dependencyModules'] = []
+        self.write_configuration()
+        android.admit()
+        temporary = tempfile.TemporaryDirectory
+        def checkout_directory(**kwargs):
+            return temporary(prefix='actual-builder-checkout-', dir=self.root)
+        with patch.object(android, 'provider', return_value=self.shared), patch.object(android, 'tools', return_value=self.tool), patch.object(android, 'candidate', return_value=self.source['sourceCommit']), patch.object(builder, 'run', side_effect=self.callee), patch.object(builder.tempfile, 'TemporaryDirectory', side_effect=checkout_directory), patch.object(sys, 'argv', ['build.py', str(self.upstream)]):
+            builder.main()
+            built = json.loads((self.patches / 'build-receipt.json').read_bytes())
+            self.assertEqual(len([row for row in self.calls if row[0] == 'builder-callee-stub' and 'bind' in row[1]]), 1)
+            scratch = self.root / 'verify-empty'
+            scratch.mkdir()
+            builder.verify_component(self.app / 'src-tauri/gen/android/app/libs/libbox.aar', built, self.source, self.core,
+                                     self.policy, self.tool, self.identity, scratch)
+        with patch.object(sys, 'argv', ['build.py', str(self.upstream), '']):
+            with self.assertRaises(SystemExit) as refused:
+                builder.main()
+            self.assertEqual(refused.exception.code, 2)
+
     def test_source_receipt_scope_query_manifest_and_buildtree(self):
         android.admit()
         android.validate_source_receipt(self.source_receipt, self.source, self.core)
+        for field, value in [('graphScope', 'core-source-only'), ('sourceGraphState', 'source-only')]:
+            broken = copy.deepcopy(self.source_receipt)
+            broken[field] = value
+            with self.assertRaisesRegex(RuntimeError, 'scope', msg=field):
+                android.validate_source_receipt(broken, self.source, self.core)
         for field, value in [('graphScope','complete-graph'),('moduleGraphQueries',[]),('mainGoModSha256',''),('buildTree','0'*40),('patches',[]),('fingerprint','0'*64)]:
             broken = copy.deepcopy(self.source_receipt)
             broken[field] = value
@@ -254,18 +343,23 @@ class AndroidSourceFixture(unittest.TestCase):
             facts = android.validate_binary(self.build_info(abi), abi, self.source, self.core, self.policy)
             self.assertEqual(facts['modules']['github.com/sagernet/gomobile']['version'], 'v0.1.12')
         raw = self.build_info('arm64-v8a')
-        for before, after in [('GOOS=android','GOOS=linux'),('CGO_ENABLED=1','CGO_ENABLED=0'),('GOARM64=v8.0','GOARM64=v9.0'),('v0.1.12','v0.1.13'),('./polaris-dependencies/tun','v1.0.0')]:
+        for before, after in [('GOOS=android','GOOS=linux'),('CGO_ENABLED=1','CGO_ENABLED=0'),('GOARM64=v8.0','GOARM64=v9.0'),('v0.1.12','v0.1.13'),('./polaris-dependencies/patched','v1.0.0')]:
             with self.assertRaises(RuntimeError):
                 android.validate_binary(raw.replace(before, after), 'arm64-v8a', self.source, self.core, self.policy)
         policy = copy.deepcopy(self.policy)
         policy['abis']['arm64-v8a']['transportModules'] = {'requiredLinked': [], 'confirmedAbsent': ['github.com/sagernet/gomobile']}
         with self.assertRaisesRegex(RuntimeError, 'absent transport'):
             android.validate_binary(raw, 'arm64-v8a', self.source, self.core, policy)
-        self.policy['abis']['x86']['patchedModules']['requiredLinked'].remove('github.com/sagernet/nftables')
-        self.policy['abis']['x86']['patchedModules']['allowedAbsent'].append('github.com/sagernet/nftables')
+        # A complete, disjoint partition is refused once any declared module is absent, in every ABI.
+        for abi in android.ABIS:
+            for module in FIXTURE_PATCHED:
+                changed = copy.deepcopy(self.policy)
+                changed['abis'][abi]['patchedModules'] = {'requiredLinked': [item for item in FIXTURE_PATCHED if item != module], 'allowedAbsent': [module]}
+                (self.patches / 'android-source-policy.json').write_text(json.dumps(changed))
+                with self.assertRaisesRegex(RuntimeError, 'must link', msg=abi + ' ' + module):
+                    android.admit()
         self.write_configuration()
-        with self.assertRaisesRegex(RuntimeError, 'must link'):
-            android.admit()
+        android.admit()
 
     def test_ignored_and_generated_source_boundary(self):
         checkout = self.root / 'baseline'
@@ -400,6 +494,45 @@ class AndroidSourceFixture(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '16K'):
                 builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
 
+    def test_host_libbox_registry_tags_match_file_selection_and_test(self):
+        self.test_real_provider_to_original_tests_bind_and_shared_cache_predicate()
+        expected = ['with_tailscale', 'with_tailscale,with_ccm',
+                    'with_tailscale,with_ocm', 'with_tailscale,with_ccm,with_ocm']
+        calls = [row[1] for row in self.calls if row[0] == 'builder-callee-stub']
+        lists = [args for args in calls if args[1] == 'list' and './experimental/libbox' in args]
+        tests = [args for args in calls if args[1] == 'test' and
+                 any(str(value).endswith('/config_validation_test.go') for value in args)]
+        self.assertEqual(len(lists), 4)
+        self.assertEqual(len(tests), 4)
+        for commands in (lists, tests):
+            self.assertEqual([args[args.index('-tags') + 1] if '-tags' in args else ''
+                              for args in commands], expected)
+        for args in tests:
+            self.assertIn('-race', args)
+            self.assertIn('-ldflags=-checklinkname=0', args)
+            self.assertEqual(args[args.index('-count=1')], '-count=1')
+        ordinary = [args for args in calls if args[1] == 'test' and args not in tests]
+        self.assertEqual(len(ordinary), 3)
+        self.assertTrue(all('-tags' not in args for args in ordinary))
+        bind = next(args for args in calls if 'bind' in args)
+        self.assertEqual(bind[bind.index('-tags') + 1], ','.join(self.source['buildTags']))
+
+    def test_host_libbox_tags_reject_missing_capability_and_unknown_optionals(self):
+        self.assertEqual(builder.libbox_test_tags(self.source), 'with_tailscale')
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ccm,with_ocm'),
+                         'with_tailscale,with_ccm,with_ocm')
+        for tags in ([], ['with_ccm'], ['with_tailscale', 'with_tailscale']):
+            with self.subTest(tags=tags), self.assertRaisesRegex(RuntimeError, 'Tailscale registry capability'):
+                builder.libbox_test_tags({'buildTags': tags})
+        for optional in ('with_quic', 'with_tailscale', 'with_ocm,with_ccm',
+                         'with_ccm,with_ccm', 'with_ccm,', 'with_ccm,with_ocm,with_quic'):
+            with self.subTest(optional=optional), self.assertRaisesRegex(RuntimeError, 'optional registry test profile'):
+                builder.libbox_test_tags(self.source, optional)
+        self.assertNotIn('with_ccm', self.source['buildTags'])
+        self.assertNotIn('with_ocm', self.source['buildTags'])
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ccm'), 'with_tailscale,with_ccm')
+        self.assertEqual(builder.libbox_test_tags(self.source, 'with_ocm'), 'with_tailscale,with_ocm')
+
     def test_scoped_tailscale_java_methods_fresh_and_forged_cache(self):
         aar, scratch = self.root / 'scoped.aar', self.root / 'scoped-inspection'
         scratch.mkdir()
@@ -474,7 +607,7 @@ class AndroidSourceFixture(unittest.TestCase):
         receipt_path = self.patches / 'build-receipt.json'
         receipt_path.write_text(json.dumps(receipt))
         original = receipt_path.read_bytes()
-        for file in ('verify-apk.mjs','assert-r8-evidence.mjs'):
+        for file in ('verify-apk.mjs','assert-r8-evidence.mjs','release-assets.mjs'):
             (self.app / 'scripts' / file).write_text('fixture verifier identity')
         calls = []
         with patch.object(verifier.android, 'candidate', return_value='a' * 40), patch.object(verifier.builder, 'run', side_effect=lambda args, **kwargs: calls.append(args)):
@@ -483,15 +616,53 @@ class AndroidSourceFixture(unittest.TestCase):
             self.assertEqual(facts['componentProducerCandidate'], 'b' * 40)
             self.assertEqual(facts['apk']['sha256'], android.file_hash(apk))
             self.assertEqual(facts['componentReceiptSha256'], android.file_hash(receipt_path))
-            self.assertEqual(len(calls), 2)
-            self.assertTrue(calls[0][1].endswith('verify-apk.mjs'))
-            self.assertTrue(calls[1][1].endswith('assert-r8-evidence.mjs'))
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(calls[0][1].endswith('release-assets.mjs'))
+            self.assertTrue(calls[1][1].endswith('verify-apk.mjs'))
+            self.assertTrue(calls[2][1].endswith('assert-r8-evidence.mjs'))
             self.assertEqual(receipt_path.read_bytes(), original)
             with zipfile.ZipFile(apk, 'w') as package:
                 package.writestr('lib/arm64-v8a/libbox.so', b'stock replacement')
             with self.assertRaisesRegex(RuntimeError, 'embedded libbox differs'):
                 verifier.consumption(apk, 'arm64-v8a', r8, receipt, receipt_path)
         self.assertEqual(receipt_path.read_bytes(), original)
+
+    def test_universal_consumption_binds_both_aar_abis_and_rejects_extra_or_replaced_library(self):
+        apk = self.root / 'universal.apk'
+        r8 = self.root / 'r8'
+        r8.mkdir()
+        (r8 / 'mapping.txt').write_text('fixture R8 evidence')
+        native = {'arm64-v8a': b'fixture arm64 libbox', 'armeabi-v7a': b'fixture armv7 libbox'}
+        receipt = {'componentProducerCandidate': 'b' * 40, 'androidInput': {'fingerprint': 'c' * 64},
+                   'sourceReceipt': {'fingerprint': 'd' * 64}, 'aar': {'sha256': 'e' * 64},
+                   'nativeLibraries': {f'jni/{abi}/libbox.so': {'sha256': android.digest(data)} for abi, data in native.items()}}
+        receipt_path = self.patches / 'build-receipt.json'
+        receipt_path.write_text(json.dumps(receipt))
+        for file in ('verify-apk.mjs', 'assert-r8-evidence.mjs', 'release-assets.mjs'):
+            (self.app / 'scripts' / file).write_text('fixture verifier identity')
+        def package(values):
+            with zipfile.ZipFile(apk, 'w') as archive:
+                for abi, data in values.items():
+                    archive.writestr(f'lib/{abi}/libbox.so', data)
+        calls = []
+        with patch.object(verifier.android, 'candidate', return_value='a' * 40), patch.object(verifier.builder, 'run', side_effect=lambda args, **kwargs: calls.append(args)):
+            package(native)
+            facts = verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            self.assertEqual(facts['selectedABIs'], ['arm64-v8a', 'armeabi-v7a'])
+            self.assertEqual(facts['embeddedLibboxSha256'], {abi: android.digest(data) for abi, data in native.items()})
+            self.assertEqual([call[-1] for call in calls[1:3]], ['arm64-v8a', 'armeabi-v7a'])
+            for abi in native:
+                changed = dict(native)
+                changed[abi] = b'replacement'
+                package(changed)
+                with self.assertRaisesRegex(RuntimeError, 'embedded libbox differs'):
+                    verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            package({**native, 'x86_64': b'forbidden'})
+            with self.assertRaisesRegex(RuntimeError, 'selected libbox ABI differs'):
+                verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
+            package({'arm64-v8a': native['arm64-v8a']})
+            with self.assertRaisesRegex(RuntimeError, 'selected libbox ABI differs'):
+                verifier.consumption(apk, 'universal', r8, receipt, receipt_path)
 
     def test_publish_failure_preserves_original_pair(self):
         output, receipt_output, aar = self.root / 'output.aar', self.root / 'receipt.json', self.root / 'fresh.aar'
@@ -513,19 +684,18 @@ class AndroidSourceFixture(unittest.TestCase):
 
     def test_workflow_prelookup_mirrors(self):
         text = (ROOT / '.github/workflows/android.yml').read_text()
-        mirrors = text.split('      - name: Cache libbox.aar')
+        mirrors = text.split('      - name: Restore formal component and fixed Go cache')
         self.assertEqual(len(mirrors), 3)
         for before, after in zip(mirrors, mirrors[1:]):
-            preparation = before[before.rindex('      - name: Prepare libbox tools'):]
+            preparation = before[before.rindex('      - name: Prepare formal mobile source and isolated tools'):]
             self.assertIn('id: libbox_input', preparation)
-            self.assertIn('android-source.py identity', preparation)
-            prior = before[:before.rindex('      - name: Prepare libbox tools')]
-            self.assertIn('android-source.py admit', prior)
-            cache, remaining = after.split('      - name: Build libbox.aar', 1)
-            self.assertIn('key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', cache)
+            self.assertIn('ci_android.py prepare', preparation)
+            prior = before[:before.rindex('      - name: Prepare formal mobile source and isolated tools')]
+            self.assertIn('from fork_input import load; load()', prior)
+            cache, remaining = after.split('      - name: Build or revalidate formal four-ABI component and App input', 1)
+            self.assertIn('key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', cache)
             self.assertNotIn('restore-keys:', cache)
-            self.assertIn('verify-receipt.py', remaining)
-        # Shell syntax is verified without executing tool/fetch/build commands.
+            self.assertIn('ci_android.py verify', remaining)
         for block in re.findall(r'(?m)^        run: \|\n((?:^          .*\n|^\n)+)', text):
             shell = '\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines())
             shell = re.sub(r'\$\{\{.*?\}\}', 'fixture', shell)
@@ -534,92 +704,125 @@ class AndroidSourceFixture(unittest.TestCase):
 
 class CISourceFetchFixture(unittest.TestCase):
     def programs(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        blocks = re.findall(r'(?m)^          python3 - "\$RUNNER_TEMP" <<\'PYDEPS\'\n(.*?)^          PYDEPS$', text, re.S)
-        self.assertEqual(len(blocks), 2)
-        programs = ['\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines()) for block in blocks]
-        self.assertEqual(programs[0], programs[1])
-        self.assertGreater(len(programs[0]), 1000)
-        return programs
+        # Fixed exact historical YAML, retained for alpha8 compatibility tests.
+        block = HISTORICAL_CI['fetch']
+        program = '\n'.join(line[10:] if line.startswith('          ') else '' for line in block.splitlines())
+        self.assertGreater(len(program), 1000)
+        return [program, program]
 
-    def test_actual_yaml_exact_fetch_and_refusal_controls(self):
-        source = json.loads((HERE / 'source-manifest.json').read_text())
+    def test_historical_yaml_exact_fetch_and_refusal_controls(self):
+        actual = json.loads((HERE / 'source-manifest.json').read_text())
         core = json.loads((ROOT / 'src-tauri/core-manifest.json').read_text())
-        core_url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
-        declarations = {'sing-box': (core_url, source['sourceCommit'])}
-        declarations.update({'polaris-upstream-' + dep['name']: (dep['sourceURL'], dep['upstreamCommit']) for dep in source['dependencyPatches']})
+        # The committed manifest decides the product fetch set; a synthetic
+        # declaration keeps the retained dependency branch of the YAML covered.
+        declared = copy.deepcopy(actual)
+        declared['dependencyPatches'] = [{'name': 'fixture', 'module': 'example.com/fixture',
+                                          'sourceURL': 'https://github.com/fixture/fixture', 'upstreamCommit': 'd' * 40}]
         cases = ['lightweight-tag', 'annotated-tag', 'fetch-failure', 'wrong-object', 'wrong-ref', 'missing-ref', 'wrong-tag', 'missing-tag']
         checked = 0
-        for mirror, program in enumerate(self.programs()):
-            for case in cases:
-                with self.subTest(mirror=mirror, case=case), tempfile.TemporaryDirectory(prefix='polaris-ci-source-fetch-fixture-') as temporary:
-                    directory = Path(temporary)
-                    calls, refs = [], {}
-                    tag = 'refs/tags/v' + core['bundledCoreVersion']
-                    def run(arguments, **kwargs):
-                        self.assertTrue(kwargs.get('check'), 'Git failures must stop source preparation')
-                        calls.append(arguments)
-                        if arguments[:3] == ['git', 'init', '--quiet']:
-                            refs[arguments[3]] = {}
-                        else:
-                            self.assertEqual(arguments[:2], ['git', '-C'])
-                            repository, command = arguments[2], arguments[3]
-                            url, commit = declarations[Path(repository).name]
-                            if command == 'fetch':
-                                self.assertEqual(arguments[4:6], ['--no-tags', '--depth=1'])
-                                self.assertEqual(arguments[6], url)
-                                target = arguments[7]
-                                if target == tag + ':' + tag:
-                                    self.assertEqual(Path(repository).name, 'sing-box')
-                                    if case != 'missing-tag':
-                                        refs[repository][tag] = 'e' * 40 if case == 'annotated-tag' else source['sourceCommit']
-                                        refs[repository][tag + '^{commit}'] = 'f' * 40 if case == 'wrong-tag' else source['sourceCommit']
+        for label, source in (('actual', actual), ('declared-dependency', declared)):
+            core_url = source.get('sourceURL', 'https://github.com/SagerNet/sing-box')
+            declarations = {'sing-box': (core_url, source['sourceCommit'])}
+            declarations.update({'polaris-upstream-' + dep['name']: (dep['sourceURL'], dep['upstreamCommit']) for dep in source['dependencyPatches']})
+            failing = sorted(declarations)[0]
+            self.assertEqual(failing, 'polaris-upstream-fixture' if source['dependencyPatches'] else 'sing-box')
+            for mirror, program in enumerate(self.programs()):
+                for case in cases:
+                    with self.subTest(manifest=label, mirror=mirror, case=case), tempfile.TemporaryDirectory(prefix='polaris-ci-source-fetch-fixture-') as temporary:
+                        directory = Path(temporary) / 'runner'
+                        workspace = Path(temporary) / 'workspace'
+                        directory.mkdir()
+                        for relative, value in [('scripts/libbox-patches/source-manifest.json', source), ('src-tauri/core-manifest.json', core)]:
+                            (workspace / relative).parent.mkdir(parents=True)
+                            (workspace / relative).write_text(json.dumps(value))
+                        calls, refs = [], {}
+                        tag = 'refs/tags/v' + core['bundledCoreVersion']
+                        def run(arguments, **kwargs):
+                            self.assertTrue(kwargs.get('check'), 'Git failures must stop source preparation')
+                            calls.append(arguments)
+                            if arguments[:3] == ['git', 'init', '--quiet']:
+                                refs[arguments[3]] = {}
+                            else:
+                                self.assertEqual(arguments[:2], ['git', '-C'])
+                                repository, command = arguments[2], arguments[3]
+                                url, commit = declarations[Path(repository).name]
+                                if command == 'fetch':
+                                    self.assertEqual(arguments[4:6], ['--no-tags', '--depth=1'])
+                                    self.assertEqual(arguments[6], url)
+                                    target = arguments[7]
+                                    if target == tag + ':' + tag:
+                                        self.assertEqual(Path(repository).name, 'sing-box')
+                                        if case != 'missing-tag':
+                                            refs[repository][tag] = 'e' * 40 if case == 'annotated-tag' else source['sourceCommit']
+                                            refs[repository][tag + '^{commit}'] = 'f' * 40 if case == 'wrong-tag' else source['sourceCommit']
+                                    else:
+                                        self.assertEqual(target, commit + ':refs/heads/polaris-source')
+                                        if case == 'fetch-failure' and Path(repository).name == failing:
+                                            raise subprocess.CalledProcessError(128, arguments)
+                                        refs[repository][commit + '^{commit}'] = 'f' * 40 if case == 'wrong-object' else commit
+                                        if case != 'missing-ref':
+                                            refs[repository]['refs/heads/polaris-source'] = 'f' * 40 if case == 'wrong-ref' else commit
                                 else:
-                                    self.assertEqual(target, commit + ':refs/heads/polaris-source')
-                                    if case == 'fetch-failure' and Path(repository).name == 'polaris-upstream-sing-tun':
-                                        raise subprocess.CalledProcessError(128, arguments)
-                                    refs[repository][commit + '^{commit}'] = 'f' * 40 if case == 'wrong-object' else commit
-                                    if case != 'missing-ref':
-                                        refs[repository]['refs/heads/polaris-source'] = 'f' * 40 if case == 'wrong-ref' else commit
-                            else:
-                                self.assertEqual(command, 'checkout')
-                                self.assertEqual(Path(repository).name, 'sing-box')
-                                self.assertEqual(arguments[4:], ['--detach', source['sourceCommit']])
-                        return subprocess.CompletedProcess(arguments, 0)
-                    def check_output(arguments, **kwargs):
-                        self.assertEqual(arguments[:2], ['git', '-C'])
-                        self.assertEqual(arguments[3], 'rev-parse')
-                        self.assertTrue(kwargs.get('text'))
-                        value = refs[arguments[2]].get(arguments[4])
-                        if value is None:
-                            raise subprocess.CalledProcessError(128, arguments)
-                        return value + '\n'
-                    cwd = Path.cwd()
-                    try:
-                        os.chdir(ROOT)
-                        with patch.object(sys, 'argv', ['yaml-source-fixture', temporary]), patch.object(subprocess, 'run', side_effect=run), patch.object(subprocess, 'check_output', side_effect=check_output):
-                            if case in ('lightweight-tag', 'annotated-tag'):
-                                exec(compile(program, '<actual-android-yaml-source>', 'exec'), {})
-                            else:
-                                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                                    self.assertEqual(command, 'checkout')
+                                    self.assertEqual(Path(repository).name, 'sing-box')
+                                    self.assertEqual(arguments[4:], ['--detach', source['sourceCommit']])
+                            return subprocess.CompletedProcess(arguments, 0)
+                        def check_output(arguments, **kwargs):
+                            self.assertEqual(arguments[:2], ['git', '-C'])
+                            self.assertEqual(arguments[3], 'rev-parse')
+                            self.assertTrue(kwargs.get('text'))
+                            value = refs[arguments[2]].get(arguments[4])
+                            if value is None:
+                                raise subprocess.CalledProcessError(128, arguments)
+                            return value + '\n'
+                        cwd = Path.cwd()
+                        try:
+                            os.chdir(workspace)
+                            with patch.object(sys, 'argv', ['yaml-source-fixture', str(directory)]), patch.object(subprocess, 'run', side_effect=run), patch.object(subprocess, 'check_output', side_effect=check_output):
+                                if case in ('lightweight-tag', 'annotated-tag'):
                                     exec(compile(program, '<actual-android-yaml-source>', 'exec'), {})
-                    finally:
-                        os.chdir(cwd)
-                    output = directory / 'polaris-module-sources.json'
-                    if case in ('lightweight-tag', 'annotated-tag'):
-                        self.assertEqual(json.loads(output.read_text()), ['--module-source=' + dep['module'] + '=' + str(directory / ('polaris-upstream-' + dep['name'])) for dep in source['dependencyPatches']])
-                        self.assertEqual(len([args for args in calls if len(args) > 3 and args[3] == 'fetch']), len(declarations) + 1)
-                    else:
-                        self.assertFalse(output.exists(), 'A failed source fetch must not publish a builder handoff')
+                                else:
+                                    with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                                        exec(compile(program, '<actual-android-yaml-source>', 'exec'), {})
+                        finally:
+                            os.chdir(cwd)
+                        output = directory / 'polaris-module-sources.json'
+                        if case in ('lightweight-tag', 'annotated-tag'):
+                            self.assertEqual(json.loads(output.read_text()), ['--module-source=' + dep['module'] + '=' + str(directory / ('polaris-upstream-' + dep['name'])) for dep in source['dependencyPatches']])
+                            self.assertEqual(len([args for args in calls if len(args) > 3 and args[3] == 'fetch']), len(declarations) + 1)
+                        else:
+                            self.assertFalse(output.exists(), 'A failed source fetch must not publish a builder handoff')
+                        checked += 1
+        self.assertEqual(checked, 32)
+        print('Historical YAML source fetch controls: 32/32 PASS (two mirrors, committed and declared-dependency manifests; Git/Go/network callees not executed)')
+
+    def test_historical_yaml_module_source_handoff_passes_no_empty_argument(self):
+        text = '          ' + HISTORICAL_CI['handoff'].replace('\nbash ', '\n          bash ')
+        handoffs = re.findall(r'(?m)^          (mapfile -t module_sources < <\(.*\)\n)          (bash scripts/build-libbox\.sh "\$src" "\$\{module_sources\[@\]\}"\n)', text)
+        self.assertEqual(len(handoffs), 1)
+        handoffs *= 2
+        self.assertEqual(handoffs[0], handoffs[1])
+        # Only the builder entry is replaced; the expansion itself is the YAML's.
+        callee = 'bash() { printf "%s\\n" "$#"; printf "<%s>\\n" "$@"; }\nsrc=SOURCE\n'
+        checked = 0
+        for mirror, handoff in enumerate(handoffs):
+            for values in ([], ['--module-source=example.com/one=/runner/one'],
+                           ['--module-source=example.com/one=/runner/one', '--module-source=example.com/two=/runner/with space']):
+                with self.subTest(mirror=mirror, values=values), tempfile.TemporaryDirectory(prefix='polaris-ci-module-handoff-fixture-') as directory:
+                    (Path(directory) / 'polaris-module-sources.json').write_text(json.dumps(values))
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + callee + ''.join(handoff)], text=True,
+                                            env=os.environ | {'RUNNER_TEMP': directory}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = ['scripts/build-libbox.sh', 'SOURCE', *values]
+                    self.assertEqual(result.stdout, str(len(arguments)) + '\n' + ''.join('<' + value + '>\n' for value in arguments))
                     checked += 1
-        self.assertEqual(checked, 16)
-        print('Actual YAML source fetch controls: 16/16 PASS (two mirrors; Git/Go/network callees not executed)')
+        self.assertEqual(checked, 6)
 
     def test_two_preludes_and_actual_shell_syntax(self):
         text = (ROOT / '.github/workflows/android.yml').read_text()
         check, signed = text.split('\n  release-apk:\n', 1)
         start = '      - uses: actions/setup-node@v7'
-        end = '          python3 scripts/libbox-patches/verify-receipt.py'
+        end = '          python3 scripts/mobile-core/ci_android.py verify'
         preludes = [body[body.index(start):body.index(end) + len(end)] for body in (check, signed)]
         self.assertGreater(len(preludes[0]), 2000)
         self.assertEqual(preludes[0], preludes[1])
@@ -629,12 +832,9 @@ class CISourceFetchFixture(unittest.TestCase):
             subprocess.run(['bash', '-n'], input=shell, text=True, check=True)
 
 
-class CIIdentityFixture(unittest.TestCase):
-    def test_actual_yaml_identity_refusal_before_output_and_lookup(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        preparation_blocks = re.findall(
-            r'(?m)^      - name: Prepare libbox tools and source cache identity\n((?:^        .*\n|^\n)+)', text)
-        self.assertEqual(len(preparation_blocks), 2)
+class HistoricalCIIdentityFixture(unittest.TestCase):
+    def test_historical_yaml_identity_refusal_before_output_and_lookup(self):
+        preparation_blocks = [HISTORICAL_CI['identity']] * 2
         cases = [('exit7', '', 7, 7), ('empty', '', 0, 1), ('uppercase64', 'A' * 64, 0, 1),
                  ('nonhex64', 'g' * 64, 0, 1), ('short63', 'a' * 63, 0, 1),
                  ('long65', 'a' * 65, 0, 1), ('valid64', '0123456789abcdef' * 4, 0, 0)]
@@ -663,7 +863,7 @@ class CIIdentityFixture(unittest.TestCase):
                     self.assertEqual(result.stdout, 'cache_lookup_reached\n' if expected_exit == 0 else '')
                     checked += 1
         self.assertEqual(checked, 14)
-        print('Actual YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
+        print('Historical YAML identity shell controls: 14/14 PASS (two mirrors; no tool/cache execution)')
 
 
 class CIAppCleanFixture(unittest.TestCase):
@@ -735,10 +935,8 @@ print(module.candidate(run))
                 self.assertIn('App source candidate must be clean', result.stderr)
                 self.assertEqual(git('status', '--porcelain', '--untracked-files=all', cwd=app), before)
 
-    def test_actual_build_preludes_diagnose_exact_dirty_paths_and_stop(self):
-        text = (ROOT / '.github/workflows/android.yml').read_text()
-        blocks = re.findall(r'(?m)^      - name: Build libbox.aar \(缓存未命中\)\n((?:^        .*\n|^\n)+)', text)
-        self.assertEqual(len(blocks), 2)
+    def test_historical_build_preludes_diagnose_exact_dirty_paths_and_stop(self):
+        blocks = [HISTORICAL_CI['build']] * 2
         for mirror, block in enumerate(blocks):
             body = block.split('        run: |\n', 1)[1]
             shell = '\n'.join(line[10:] for line in body.splitlines() if line.startswith('          '))
@@ -851,23 +1049,23 @@ class CIVerifiedCacheFixture(unittest.TestCase):
 
     def cache_steps(self, steps):
         names = [name for name, _ in steps]
-        restore_index = names.index('Cache libbox.aar')
+        restore_index = names.index('Restore formal component and fixed Go cache')
         verify_index = names.index('libbox.aar 必须在位')
         save_index = names.index('Save verified libbox.aar')
-        self.assertLess(restore_index, names.index('Build libbox.aar (缓存未命中)'))
+        self.assertLess(restore_index, names.index('Build or revalidate formal four-ABI component and App input'))
         self.assertEqual(save_index, verify_index + 1)
         self.assertLess(save_index, next(i for i, name in enumerate(names) if 'APK' in name and name.startswith('Build')))
         restore, verify, save = [steps[i][1] for i in (restore_index, verify_index, save_index)]
         self.assertIn('uses: actions/cache/restore@v6', restore)
         self.assertIn('id: libbox\n', restore)
-        self.assertIn('key: libbox-source-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', restore)
+        self.assertIn('key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}', restore)
         self.assertNotIn('restore-keys:', restore)
         self.assertIn('id: libbox_verified\n', verify)
         self.assertNotIn('continue-on-error:', verify)
-        self.assertIn('python3 scripts/libbox-patches/verify-receipt.py', verify)
+        self.assertIn('python3 scripts/mobile-core/ci_android.py verify', verify)
         self.assertIn('uses: actions/cache/save@v6', save)
         self.assertIn('key: ${{ steps.libbox.outputs.cache-primary-key }}', save)
-        expected_paths = ['src-tauri/gen/android/app/libs/libbox.aar', 'scripts/libbox-patches/build-receipt.json']
+        expected_paths = ['${{ steps.libbox_input.outputs.work }}', '${{ steps.libbox_input.outputs.cache }}']
         for block in (restore, save):
             paths = re.search(r'(?m)^          path: \|\n((?:^            .*\n)+)', block).group(1)
             self.assertEqual([line.strip() for line in paths.splitlines()], expected_paths)
@@ -906,7 +1104,7 @@ class CIVerifiedCacheFixture(unittest.TestCase):
                     environment.update(VERIFY_EXIT=str(verify_exit), VERIFY_TRACE=str(trace))
                     run = '\n'.join(line[10:] if line.startswith('          ') else '' for line in body.splitlines())
                     run = run.replace('${{ steps.libbox.outputs.cache-hit }}', hit)
-                    callee = ('python3() { [[ "$*" == "scripts/libbox-patches/verify-receipt.py" ]] || return 97; '
+                    callee = ('python3() { [[ "$*" == "scripts/mobile-core/ci_android.py verify" ]] || return 97; '
                               'printf "actual verifier invocation\\n" >> "$VERIFY_TRACE"; return "$VERIFY_EXIT"; }\n')
                     result = subprocess.run(['bash', '-c', callee + run], cwd=app, env=environment,
                                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

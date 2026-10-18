@@ -24,8 +24,10 @@ function runSuite(script, args, summary, minimum, optimized = false) {
 }
 
 test('Apple source admission keeps its existing pure predicates in the host CI gate', () => {
+  // Frozen b66 total 503 - 114 retired build-entry matrix cases + 15 retirement/history
+  // cases = 404. Python guards the complete named groups and successful execution deltas.
   runSuite('scripts/ios-libbox-verify.test.py', ['--preflight-only'],
-    /^(\d+) source-admission\/producer\/structure unit cases passed; no Framework or App built\.$/m, 477);
+    /^(\d+) source-admission\/producer\/structure unit cases passed; no Framework or App built\.$/m, 404);
   const impact = classifyImpact([
     'scripts/ios-libbox.py', 'scripts/ios-libbox-verify.test.py',
     'scripts/apple-carrier.py', 'scripts/apple-carrier.test.py',

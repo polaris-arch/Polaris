@@ -287,6 +287,13 @@ class MainActivity : TauriActivity() {
    */
   private var webViewTarget: WebView? = null
 
+  fun notifyLibboxReady() {
+    runOnUiThread {
+      webViewTarget?.evaluateJavascript("window.dispatchEvent(new Event('polaris-libbox-ready'))", null)
+    }
+  }
+
+
   /**
    * 最近一次从 web 层收到的生效主题（`true` = 深）。`null` = **一次都还没收到过** ——
    * 此时不去猜：`enableEdgeToEdge()` 按窗口背景那一档给的值仍然成立（见类头注「冷启动那一格」），
