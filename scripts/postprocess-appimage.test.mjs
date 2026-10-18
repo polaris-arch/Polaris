@@ -232,6 +232,7 @@ test('CLI repairs both hook layouts and reaches repack only after the runtime co
     const script = join(root, 'scripts/postprocess-appimage.mjs');
     copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
     cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
+    cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
     // The plugin is a fixture, but its output is a real SquashFS behind a dummy
     // runtime header. The verifier never executes that header or the core.
     const tool = join(root, 'fixture-output-plugin');
@@ -361,6 +362,7 @@ for (const component of ['core', 'cronet']) test(`CLI refuses a repacker changin
   const script = join(root, 'scripts/postprocess-appimage.mjs');
   copyFileSync(new URL('./postprocess-appimage.mjs', import.meta.url), script);
   cpSync(new URL('./lib', import.meta.url), join(root, 'scripts/lib'), { recursive: true });
+  cpSync(new URL('./desktop-core', import.meta.url), join(root, 'scripts/desktop-core'), { recursive: true });
   const artifact = join(root, 'Polaris.AppImage');
   writeFileSync(artifact, 'previous-artifact');
   const tool = join(root, 'fixture-output-plugin');
