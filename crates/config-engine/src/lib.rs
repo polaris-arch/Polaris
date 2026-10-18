@@ -22,3 +22,5 @@ pub mod legacy_keys;
 pub mod singbox;
 pub mod user_config;
 pub mod warp;
+
+pub mod node_dns;

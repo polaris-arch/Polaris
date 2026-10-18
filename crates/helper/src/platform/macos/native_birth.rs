@@ -8,7 +8,7 @@ use polaris_helper_proto::HelperBirthTarget;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 const STOP_CACHE_LIMIT: usize = 16;
@@ -42,10 +42,19 @@ struct OwnedChild {
 pub(super) struct NativeBirth {
     pub(super) target: HelperBirthTarget,
     owned: Mutex<OwnedChild>,
+    // Installed once before the worker starts. Authorization under slot never
+    // borrows the child/tail mutex, so exit cannot form slot/owned ABBA.
+    core: OnceLock<(Arc<crate::core_store::VerifiedCore>, u32)>,
     stop_requested: AtomicBool,
 }
 
 impl NativeBirth {
+    pub(super) fn attach_core(&self, core: Arc<crate::core_store::VerifiedCore>, uid: u32) {
+        assert!(
+            self.core.set((core, uid)).is_ok(),
+            "native core identity already attached"
+        );
+    }
     /// Attach before starting the worker. Registry custody retains the writer capability if
     /// that worker disappears; Poison is retained and can never become a stopped receipt.
     pub(super) fn attach_log_custody(&self, log_custody: polaris_log_budget::PipeLogCustody) {
@@ -59,7 +68,7 @@ impl NativeBirth {
 #[derive(Default)]
 struct Slot {
     current: Option<Arc<NativeBirth>>,
-    stopped: VecDeque<HelperBirthTarget>,
+    stopped: VecDeque<(HelperBirthTarget, Option<u32>)>,
     starting: bool,
     closing: bool,
 }
@@ -70,6 +79,55 @@ pub(super) struct NativeCustody {
 }
 
 impl NativeCustody {
+    pub(super) fn caller_may_stop(&self, uid: Option<u32>, target: HelperBirthTarget) -> bool {
+        let Some(uid) = uid else {
+            return false;
+        };
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        if let Some((_, owner)) = slot.stopped.iter().find(|(birth, _)| *birth == target) {
+            return uid == 0 || *owner == Some(uid);
+        }
+        let Some(birth) = &slot.current else {
+            return uid == 0;
+        };
+        uid == 0 || birth.core.get().is_some_and(|(_, owner)| *owner == uid)
+    }
+    pub(super) fn upgrade_admission(&self, close: bool) -> bool {
+        let Ok(mut slot) = self.slot.lock() else {
+            return false;
+        };
+        if slot.current.is_some() || slot.starting {
+            return false;
+        }
+        slot.closing = close;
+        true
+    }
+    pub(super) fn caller_allowed(
+        &self,
+        uid: Option<u32>,
+        id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        let Some(uid) = uid else {
+            return false;
+        };
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        if slot.starting || slot.closing {
+            return false;
+        }
+        let Some(current) = &slot.current else {
+            return true;
+        };
+        match current.core.get() {
+            Some((core, owner)) => {
+                (uid == 0 || uid == *owner) && id.is_none_or(|id| core.manifest.id == id.as_str())
+            }
+            None => uid == 0 && id.is_none(),
+        }
+    }
     fn slot(&self) -> MutexGuard<'_, Slot> {
         self.slot
             .lock()
@@ -94,7 +152,23 @@ impl NativeCustody {
     }
 
     /// Reserve before forwarding/cache/spawn. Failure does not authorize any write.
+    #[cfg(test)]
     pub(super) fn admit(&self) -> Result<(), NativeBirthStart> {
+        self.admit_for(None)
+    }
+
+    pub(super) fn admit_pinned(
+        &self,
+        uid: u32,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> Result<(), NativeBirthStart> {
+        self.admit_for(Some((uid, id)))
+    }
+
+    fn admit_for(
+        &self,
+        selected: Option<(u32, &polaris_helper_proto::core_manifest::CoreId)>,
+    ) -> Result<(), NativeBirthStart> {
         let current = {
             let mut slot =
                 self.slot
@@ -108,7 +182,16 @@ impl NativeCustody {
                 });
             }
             match slot.current.clone() {
-                Some(current) => current,
+                Some(current) => {
+                    if let Some((uid, id)) = selected {
+                        if !current.core.get().is_some_and(|(core, owner)| {
+                            (uid == 0 || uid == *owner) && core.manifest.id == id.as_str()
+                        }) {
+                            return Err(NativeBirthStart::NotAdmittedUnknown { target: None });
+                        }
+                    }
+                    current
+                }
                 None => {
                     slot.starting = true;
                     return Ok(());
@@ -156,6 +239,7 @@ impl NativeCustody {
                 kill_sent: false,
             }),
             stop_requested: AtomicBool::new(slot.closing),
+            core: OnceLock::new(),
         });
         slot.current = Some(Arc::clone(&birth));
         slot.starting = false;
@@ -169,7 +253,7 @@ impl NativeCustody {
                 Err(poison) => {
                     return NativeBirthStatus::Unknown {
                         target: poison.get_ref().current.as_ref().map(|birth| birth.target),
-                    }
+                    };
                 }
             };
             (slot.current.clone(), slot.starting)
@@ -224,7 +308,7 @@ impl NativeCustody {
                     return NativeBirthStop::Unknown { target };
                 }
             };
-            if slot.stopped.contains(&target) {
+            if slot.stopped.iter().any(|(birth, _)| *birth == target) {
                 return NativeBirthStop::Stopped { target };
             }
             slot.current.clone()
@@ -355,7 +439,8 @@ impl NativeCustody {
             }
         };
         if slot.current.as_ref().is_some_and(|c| Arc::ptr_eq(c, birth)) {
-            slot.stopped.push_back(birth.target);
+            slot.stopped
+                .push_back((birth.target, birth.core.get().map(|(_, owner)| *owner)));
             if slot.stopped.len() > STOP_CACHE_LIMIT {
                 slot.stopped.pop_front();
             }

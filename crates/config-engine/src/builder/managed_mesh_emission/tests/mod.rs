@@ -720,7 +720,7 @@ fn real_generator_normal_two_tailscale_config_emits_managed_rules() {
     let deps = GenerateConfigDeps {
         platform: "linux".into(),
         arch: "x86_64".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_direct_port: Some(21001),
         probe_proxy_port: Some(21002),
         debug_probe_mixed_udp: false,
@@ -729,8 +729,7 @@ fn real_generator_normal_two_tailscale_config_emits_managed_rules() {
         loopback_auth: None,
         probe_pool_ports: vec![21004],
         lan_resolver_for_dns: None,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         has_cronet: true,
         cronet_copy_failed: false,
         has_management_api: false,
@@ -1089,9 +1088,23 @@ fn ambiguous_tag_and_unmanaged_scoped_override_block_emission() {
 }
 
 #[test]
-fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
-    let repo_core =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/linux/sing-box");
+fn selected_core_accepts_managed_dns_and_route_shape() {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux",
+        ("windows", "x86_64") => "win",
+        ("macos", "x86_64") => "mac-x64",
+        ("macos", "aarch64") => "mac-arm64",
+        other => panic!("managed config check has no selected native payload for {other:?}"),
+    };
+    let file = if platform == "win" {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    };
+    let repo_core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../resources")
+        .join(platform)
+        .join(file);
     let core = std::env::var_os("POLARIS_TEST_CORE")
         .map(std::path::PathBuf::from)
         .unwrap_or(repo_core);
@@ -1100,15 +1113,43 @@ fn fixed_b609_core_accepts_managed_dns_and_route_shape() {
             std::env::var("POLARIS_REQUIRE_KERNEL_GATE").as_deref(),
             Ok("1")
         );
-        eprintln!("fixed b609 core absent; set POLARIS_TEST_CORE or fetch package core");
+        eprintln!("selected core absent; set POLARIS_TEST_CORE or fetch package core");
         return;
     }
-    let version = std::process::Command::new(&core)
-        .arg("version")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&version.stdout)
-        .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.join("src-tauri/core-manifest.json")).unwrap())
+            .unwrap();
+    if let Some(selection) = manifest
+        .get("desktopTemporary")
+        .or_else(|| manifest.get("desktopRelease"))
+    {
+        // Validate exact selected bytes/receipt/provider/BuildID before execution;
+        // the same gate then checks successful version and full Version/Revision.
+        let identity = std::process::Command::new("node")
+            .arg("scripts/desktop-core/managed-mesh-core.mjs")
+            .arg(&core)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            identity.status.success(),
+            "selected managed core identity failed: {}",
+            String::from_utf8_lossy(&identity.stderr)
+        );
+        let verified: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
+        assert_eq!(verified["sourceCommit"], selection["sourceCommit"]);
+        assert_eq!(verified["sourceTree"], selection["sourceTree"]);
+    } else {
+        // Preserve the separately selected legacy b609 fixture contract.
+        let version = std::process::Command::new(&core)
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert!(String::from_utf8_lossy(&version.stdout)
+            .contains("b609f959f57ce34416c51c7b87ce4a76f2e1df56"));
+    }
     let mut input = input();
     input.policy.overrides.push(MeshOverride {
         rule_id: "corp-only".into(),

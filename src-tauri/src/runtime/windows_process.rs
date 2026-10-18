@@ -106,4 +106,4 @@ pub(crate) fn creation_identity(pid: u32) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

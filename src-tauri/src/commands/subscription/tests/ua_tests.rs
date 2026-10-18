@@ -46,7 +46,7 @@ fn ua_changed_uses_the_same_falsy_normalisation_as_resolution() {
     assert!(ua_changed(&with(json!("a")), &with(json!("b"))));
     assert!(ua_changed(&json!({ "id": "s1" }), &with(json!("a"))));
     assert!(ua_changed(&with(json!("a")), &json!({ "id": "s1" })));
-    // 同值不算变（编辑名字/URL 不该白扔验证器 → 白丢一次条件 GET 的省流）。
+    // UA 同值不算 UA 变化；URL 变化由独立响应身份判据处理。
     assert!(!ua_changed(&with(json!("a")), &with(json!("a"))));
     // 归一口径与 `resolve_subscription_ua` 一致：缺省/空串/纯空白三者互相之间**不算变更**
     //（它们求值出的实际 UA 完全相同，清验证器纯属白扔）。
@@ -167,4 +167,112 @@ fn count_reflects_actually_dropped_validators_and_tolerates_missing_array() {
     assert_eq!(invalidate_validators_on_global_ua_change(&old, &mut new), 0);
     let mut new = json!({ "subscriptionUserAgent": "b", "subscriptions": [] });
     assert_eq!(invalidate_validators_on_global_ua_change(&old, &mut new), 0);
+}
+
+#[test]
+fn refresh_identity_rejects_late_url_and_effective_ua_changes_but_accepts_renames() {
+    use super::super::SubscriptionFetchIdentity;
+    let original = json!({"subscriptionUserAgent":"global/1", "subscriptions":[{
+        "id":"s", "name":"before", "url":"https://example.com/a", "etag":"old"
+    }]});
+    let identity = SubscriptionFetchIdentity::new(&original, &original["subscriptions"][0]);
+    let mut current = original.clone();
+    current["subscriptions"][0]["name"] = json!("after");
+    assert!(identity.check_current(&current, "s").is_ok());
+    for (key, value) in [("url", "https://example.com/b"), ("userAgent", "own/2")] {
+        let mut changed = current.clone();
+        changed["subscriptions"][0][key] = json!(value);
+        assert!(identity.check_current(&changed, "s").is_err(), "{key}");
+    }
+    current["subscriptionUserAgent"] = json!("global/2");
+    assert!(identity.check_current(&current, "s").is_err());
+    current["subscriptions"] = json!([]);
+    assert!(identity.check_current(&current, "s").is_err());
+}
+
+#[test]
+fn refresh_identity_uses_resolved_ua_not_raw_preference_fields() {
+    use super::super::SubscriptionFetchIdentity;
+    let mut config = json!({"subscriptionUserAgent":"global/1", "subscriptions":[{
+        "id":"s", "url":"https://example.com/a", "userAgent":"own/1"
+    }]});
+    let own = SubscriptionFetchIdentity::new(&config, &config["subscriptions"][0]);
+    config["subscriptionUserAgent"] = json!("global/2");
+    assert!(own.check_current(&config, "s").is_ok());
+    config["subscriptionUserAgent"] = json!("");
+    config["subscriptions"][0]["userAgent"] = json!("");
+    let default = SubscriptionFetchIdentity::new(&config, &config["subscriptions"][0]);
+    config["subscriptionUserAgent"] = json!("   ");
+    config["subscriptions"][0]["userAgent"] = json!("   ");
+    assert!(default.check_current(&config, "s").is_ok());
+    config["subscriptions"][0]["userAgent"] = json!(
+        polaris_net_stack::subscription::default_subscription_user_agent(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(default.check_current(&config, "s").is_ok());
+}
+
+#[test]
+fn late_response_guard_skips_both_candidate_mutation_and_persistence() {
+    use super::super::SubscriptionFetchIdentity;
+    use crate::runtime::config::{ConfigManager, Decision};
+    use crate::test_support::TestDir;
+    let dir = TestDir::new("polaris-refresh-identity-");
+    let manager = ConfigManager::new(dir.clone());
+    manager
+        .update(|cfg| {
+            cfg["subscriptions"] = json!([{"id":"s", "name":"A", "url":"https://example.com/a"}]);
+            Decision::Write(())
+        })
+        .unwrap();
+    let original = manager.load_full().unwrap();
+    let identity = SubscriptionFetchIdentity::new(&original, &original["subscriptions"][0]);
+    manager
+        .update(|cfg| {
+            cfg["subscriptions"][0]["url"] = json!("https://example.com/b");
+            Decision::Write(())
+        })
+        .unwrap();
+    let current = manager.load_full().unwrap();
+    // The production 200 and 304 branches use this same pre-mutation guard.
+    for _response_kind in [200, 304] {
+        let (result, saved) = manager
+            .update(|cfg| {
+                if let Err(error) = identity.check_current(cfg, "s") {
+                    return Decision::Skip(Err(error));
+                }
+                cfg["subscriptions"][0]["etag"] = json!("stale-response");
+                cfg["servers"] = json!([]);
+                Decision::Write(Ok(()))
+            })
+            .unwrap();
+        assert!(result.is_err());
+        assert!(saved.is_none());
+        assert_eq!(manager.load_full().unwrap(), current);
+    }
+}
+
+#[test]
+fn both_refresh_commit_branches_guard_identity_and_url_edits_drop_validators() {
+    use super::super::subscription_url_changed;
+    assert!(subscription_url_changed(
+        &json!({"url":"a"}),
+        &json!({"url":"b"})
+    ));
+    assert!(!subscription_url_changed(
+        &json!({"url":"a", "name":"old"}),
+        &json!({"url":"a", "name":"new"})
+    ));
+    let source = crate::test_support::crate_code("commands/subscription.rs");
+    assert_eq!(
+        source
+            .matches("fetch_identity.check_current(cfg, subscription_id)")
+            .count(),
+        2
+    );
+    assert!(source.contains("subscription_url_changed(&arr[idx], &subscription)"));
+    let update =
+        crate::commands::guard_scan::top_level_fn_body(&source, "pub fn subscription_update(");
+    assert!(
+        update.find("subscription_url_changed(").unwrap() < update.find("set_or_remove(").unwrap()
+    );
 }

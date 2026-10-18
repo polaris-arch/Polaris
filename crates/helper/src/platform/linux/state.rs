@@ -31,6 +31,8 @@ pub struct CoreHandle {
     pub pid: u32,
     birth: Arc<()>,
     mode: BirthMode,
+    pub(crate) owner_uid: Option<u32>,
+    pub(crate) core: Option<Arc<crate::core_store::VerifiedCore>>,
 }
 
 impl CoreHandle {
@@ -42,6 +44,8 @@ impl CoreHandle {
             pid,
             birth: Arc::new(()),
             mode: BirthMode::Legacy,
+            owner_uid: None,
+            core: None,
         }
     }
 
@@ -51,7 +55,23 @@ impl CoreHandle {
             pid: pid.get(),
             birth: Arc::new(()),
             mode: BirthMode::Exact(token),
+            owner_uid: None,
+            core: None,
         }
+    }
+
+    pub(crate) fn with_core(
+        mut self,
+        core: Arc<crate::core_store::VerifiedCore>,
+        owner_uid: u32,
+    ) -> Self {
+        self.core = Some(core);
+        self.owner_uid = Some(owner_uid);
+        self
+    }
+
+    pub(crate) fn caller_allowed(&self, uid: u32) -> bool {
+        uid == 0 || self.owner_uid == Some(uid)
     }
 
     #[must_use]
@@ -159,11 +179,48 @@ pub enum StopReap {
 ///
 /// 对照 Go 源 start 分支的 `c.Start()`（:452）+ stop 的 `terminateChild`（:246-256）+ cleanup 的 `Kill`（:383）。
 pub trait CoreSpawner: Send + Sync {
-    /// Validate the shared deployment only for a genuinely new Start, after
-    /// parameter checks and before forwarding/spawn effects. Stop never calls
-    /// this gate. Test spawners have no shared filesystem dependency.
-    fn validate_start_environment(&self) -> Result<(), SpawnError> {
-        Ok(())
+    /// Ownership comes from retained physical births and reap receipts. A hidden
+    /// registry slot must not disappear from authorization when HandlerState clears.
+    fn caller_allowed(
+        &self,
+        uid: u32,
+        current: Option<&CoreHandle>,
+        target: Option<&HelperBirthTarget>,
+    ) -> bool {
+        uid == 0
+            || match (current, target) {
+                (Some(current), Some(target)) => {
+                    current.target().as_ref() == Some(target) && current.caller_allowed(uid)
+                }
+                (Some(current), None) => current.caller_allowed(uid),
+                (None, None) => true,
+                (None, Some(_)) => false,
+            }
+    }
+    /// A retained physical birth must attest its own installed content id.
+    /// Matching ownership or PID alone cannot bind a new Start receipt.
+    fn birth_core_matches(
+        &self,
+        target: &HelperBirthTarget,
+        current: Option<&CoreHandle>,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> bool {
+        current.is_some_and(|handle| {
+            handle.target().as_ref() == Some(target)
+                && handle
+                    .core
+                    .as_ref()
+                    .is_some_and(|core| core.manifest.id == id.as_str())
+        })
+    }
+    fn spawn_pinned(
+        &self,
+        _req: &SpawnCoreRequest,
+        _core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        Err(SpawnError::Spawn {
+            detail: "pinned spawn unavailable".into(),
+        })
     }
     /// Inspect every physical birth before a Start can reuse or spawn.
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
@@ -234,15 +291,47 @@ impl ManagedChild {
 /// Handler 进程状态（对应 Go 全局 `child`/`childDone`，实例化可测）。
 #[derive(Debug)]
 pub struct HandlerState {
+    pub upgrade_closed: bool,
+    pub dns_owner: Option<u32>,
+    /// Physical birth responsible for the DNS reservation or retained state.
+    pub dns_birth: Option<CoreHandle>,
+    pub dns_busy: bool,
+    pub dns_cleanup_pending: bool,
     /// Exact current birth. `Stopping` remains present through Pending/Unknown.
     pub child: Option<ManagedChild>,
 }
 
 impl HandlerState {
+    /// Retire upper custody without discarding the DNS responsibility that the
+    /// native reaper must discharge, including a synchronous Stop acknowledgement.
+    pub(crate) fn retire_birth(&mut self, birth: &CoreHandle) {
+        if self
+            .child
+            .as_ref()
+            .is_some_and(|child| child.handle().same_birth(birth))
+        {
+            self.child = None;
+        }
+        if self
+            .dns_birth
+            .as_ref()
+            .is_some_and(|dns| dns.same_birth(birth))
+        {
+            self.dns_cleanup_pending = true;
+        }
+    }
+
     /// 构造空状态（无 child）。
     #[must_use]
     pub fn new() -> Self {
-        Self { child: None }
+        Self {
+            child: None,
+            upgrade_closed: false,
+            dns_owner: None,
+            dns_birth: None,
+            dns_busy: false,
+            dns_cleanup_pending: false,
+        }
     }
 }
 

@@ -35,7 +35,7 @@ use crate::commands::config::config_version;
 use crate::runtime::proxy::mesh_apply::{self, ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
 
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
-const DEFERRED_DELETIONS_VERSION: u8 = 1;
+const DEFERRED_DELETIONS_VERSION: u8 = 2;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
 const STAGED_PENDING_VERSION: u8 = 1;
 
@@ -274,15 +274,23 @@ fn reconcile_tailscale_credentials(
     let Some(nodes) = incoming.get_mut("servers").and_then(Value::as_array_mut) else {
         return Ok(());
     };
+    // Keep a duplicate marker instead of silently choosing a credential owner.
+    // None is a real key here: absent/non-string IDs matched one another before.
+    let mut previous_by_id: std::collections::HashMap<Option<&str>, Option<&Value>> =
+        std::collections::HashMap::new();
+    for old in previous
+        .get("servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        previous_by_id
+            .entry(old.get("id").and_then(Value::as_str))
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(old));
+    }
     for node in nodes {
         let id = node.get("id").and_then(Value::as_str).map(str::to_owned);
-        let current: Vec<_> = previous
-            .get("servers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|old| old.get("id").and_then(Value::as_str) == id.as_deref())
-            .collect();
         let intent = node
             .as_object_mut()
             .and_then(|object| object.remove("tailscaleCredentialIntent"));
@@ -293,10 +301,10 @@ fn reconcile_tailscale_credentials(
             settings.remove("retainedAuthKeyAvailable");
             settings.remove("tailscaleCredentialRevision");
         }
-        let current = match current.as_slice() {
-            [current] => Some(*current),
-            [] => None,
-            _ => return Err(StoreError::validation("credentialRevisionChanged")),
+        let current = match previous_by_id.get(&id.as_deref()) {
+            Some(Some(current)) => Some(*current),
+            None => None,
+            Some(None) => return Err(StoreError::validation("credentialRevisionChanged")),
         };
         if let Some(intent) = intent {
             let object = intent
@@ -598,6 +606,9 @@ pub(crate) enum DeferredConfigDeletion {
     TailscaleState {
         server_id: String,
     },
+    TailscaleDirectory {
+        intent: polaris_mesh::tailscale_state::directory_retirement::DirectoryDeletionIntent,
+    },
     WarpDevice {
         server_id: String,
         device_id: String,
@@ -658,6 +669,10 @@ pub struct ConfigManager {
     /// 草稿存在位、节点遮罩与范围判据必须是同一份原子快照。拆成多个 atomic/lock 会允许自动
     /// 故障切换读到 `pending=true` 搭配旧遮罩，从而穿透刚建立的未保存节点边界。
     staged_mask: RwLock<StagedNodeMask>,
+    /// Test-only pre-publication failure, scoped to this manager. Reads stay
+    /// available so update/CAS tests can reach the write leg without changing D.
+    #[cfg(test)]
+    test_fail_before_config_persist_once: AtomicBool,
     /// Test-only post-publication failure: the file is already replaced, but
     /// the caller receives CommitUncertain and must withhold action rights.
     #[cfg(test)]
@@ -665,6 +680,14 @@ pub struct ConfigManager {
 }
 
 impl ConfigManager {
+    /// Fail only this manager's next config persistence attempt, after the
+    /// ordinary read, CAS and validation legs have completed successfully.
+    #[cfg(test)]
+    pub(crate) fn fail_next_config_persist_for_test(&self) {
+        self.test_fail_before_config_persist_once
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_write_lock_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write_lock.lock().unwrap()
@@ -703,6 +726,8 @@ impl ConfigManager {
                     .map_or_else(BTreeSet::new, |marker| marker.node_ids.clone()),
                 scope_known: staged_marker.is_some(),
             }),
+            #[cfg(test)]
+            test_fail_before_config_persist_once: AtomicBool::new(false),
             #[cfg(test)]
             test_uncertain_after_mesh_publish_once: AtomicBool::new(false),
         }
@@ -1992,8 +2017,13 @@ impl ConfigManager {
             // identity is (serverId, epoch); deleting by the old journal can
             // erase a newly bound epoch after replacement/recovery. S3c owns
             // exact-epoch effects, so this path must not stage TS state work.
-            additions
-                .retain(|entry| !matches!(entry, DeferredConfigDeletion::TailscaleState { .. }));
+            additions.retain(|entry| {
+                !matches!(
+                    entry,
+                    DeferredConfigDeletion::TailscaleState { .. }
+                        | DeferredConfigDeletion::TailscaleDirectory { .. }
+                )
+            });
         }
         self.stage_deferred_deletion_entries_locked(additions)?;
         self.save_canonical_with_icon_reconcile(canonical, false)
@@ -2109,6 +2139,13 @@ impl ConfigManager {
     /// An uncertain directory sync invalidates the old cache even though this
     /// method returns Err and callers must not continue Apply side effects.
     fn persist_canonical_under_write_lock(&self, canonical: &Value) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self
+            .test_fail_before_config_persist_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(StoreError::Io("injected config persistence failure".into()));
+        }
         if !mesh_guard::has_managed_fields(canonical) {
             return ConfigStore::save(&StdFs, &self.path, canonical, &random_tmp_suffix());
         }
@@ -2155,7 +2192,7 @@ impl ConfigManager {
         let text = StdFs.read_to_string(&path)?;
         let journal: DeferredDeletionJournal =
             serde_json::from_str(&text).map_err(StoreError::from_parse)?;
-        if journal.version != DEFERRED_DELETIONS_VERSION {
+        if journal.version != 1 && journal.version != DEFERRED_DELETIONS_VERSION {
             return Err(StoreError::validation(format!(
                 "unsupported deferred deletion journal version: {}",
                 journal.version
@@ -2170,10 +2207,23 @@ impl ConfigManager {
     ) -> Result<(), StoreError> {
         let path = self.deferred_deletions_path();
         if journal.entries.is_empty() {
-            return StdFs.remove(&path);
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Retry a prior unlink whose parent fsync was uncertain.
+                    #[cfg(unix)]
+                    if let Some(parent) = path.parent() {
+                        std::fs::File::open(parent)
+                            .and_then(|directory| directory.sync_all())
+                            .map_err(|error| StoreError::CommitUncertain(error.to_string()))?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(StoreError::Io(error.to_string())),
+                Ok(_) => return durable_remove(&path).map(|_| ()),
+            }
         }
         let content = serde_json::to_string_pretty(journal).map_err(StoreError::from)?;
-        polaris_store::atomic_write_plan(&path, &random_tmp_suffix(), &content).execute(&StdFs)
+        durable_atomic_write(&path, &content, &random_tmp_suffix()).map(|_| ())
     }
 
     #[cfg(test)]
@@ -2207,10 +2257,62 @@ impl ConfigManager {
         }
         let mut journal = self.load_deferred_deletions_locked()?;
         for entry in additions {
+            // Bind only newly created intents, never upgrade a historical serverId-only
+            // journal by guessing which current filesystem object it referred to.
+            #[cfg(any(target_os = "ios", windows))]
+            let entry = match entry {
+                DeferredConfigDeletion::TailscaleState { ref server_id } => {
+                    match crate::runtime::tailscale_directory::DirectoryLease::acquire(
+                        &self.dir, server_id, false,
+                    )
+                    .and_then(|lease| lease.snapshot_intent())
+                    {
+                        Ok(intent) => DeferredConfigDeletion::TailscaleDirectory { intent },
+                        Err(_) => entry,
+                    }
+                }
+                other => other,
+            };
+            let new_ts_id = match &entry {
+                DeferredConfigDeletion::TailscaleState { server_id } => Some(server_id.as_str()),
+                DeferredConfigDeletion::TailscaleDirectory { intent } => {
+                    Some(intent.server_id.as_str())
+                }
+                _ => None,
+            };
+            if let Some(id) = new_ts_id {
+                // A fresh explicit deletion supersedes older same-ID intent,
+                // including delete/re-add/delete before the next Apply boundary.
+                // Never reuse the old intent nonce for a new deletion decision.
+                journal.entries.retain(|old| match old {
+                    DeferredConfigDeletion::TailscaleState { server_id } => server_id != id,
+                    DeferredConfigDeletion::TailscaleDirectory { intent } => {
+                        if intent.server_id != id {
+                            return true;
+                        }
+                        #[cfg(any(unix, windows))]
+                        {
+                            // Never erase the durable recovery record of a partially
+                            // committed deletion when another same-ID edit arrives.
+                            crate::runtime::tailscale_directory::DirectoryLease::acquire_intent(
+                                &self.dir, intent,
+                            )
+                            .and_then(|lease| lease.committed_intent(intent))
+                            .unwrap_or(true)
+                        }
+                        #[cfg(not(any(unix, windows)))]
+                        {
+                            true
+                        }
+                    }
+                    _ => true,
+                });
+            }
             if !journal.entries.contains(&entry) {
                 journal.entries.push(entry);
             }
         }
+        journal.version = DEFERRED_DELETIONS_VERSION;
         self.save_deferred_deletions_locked(&journal)
     }
 
@@ -2238,7 +2340,11 @@ impl ConfigManager {
         let mut remaining = Vec::new();
         for entry in journal.entries {
             if mesh_guard::has_managed_fields(&current)
-                && matches!(&entry, DeferredConfigDeletion::TailscaleState { .. })
+                && matches!(
+                    &entry,
+                    DeferredConfigDeletion::TailscaleState { .. }
+                        | DeferredConfigDeletion::TailscaleDirectory { .. }
+                )
             {
                 // A pre-opt-in journal may still contain old serverId-only
                 // entries. Retain, but never execute them under managed mode.
@@ -2247,8 +2353,36 @@ impl ConfigManager {
                 continue;
             }
             if deferred_deletion_is_cancelled(&entry, &current) {
-                summary.cancelled += 1;
-                continue;
+                // A re-added node cancels an unstarted deletion, but cannot erase
+                // the only recovery record for an already quarantined old object.
+                // Commit recovery is still bound to the old filesystem identity.
+                #[cfg(any(unix, windows))]
+                if let DeferredConfigDeletion::TailscaleDirectory { intent } = &entry {
+                    match crate::runtime::tailscale_directory::DirectoryLease::acquire_intent(
+                        &self.dir, intent,
+                    )
+                    .and_then(|lease| lease.committed_intent(intent))
+                    {
+                        Ok(false) => {
+                            summary.cancelled += 1;
+                            continue;
+                        }
+                        Ok(true) => {}
+                        Err(_) => {
+                            summary.retrying += 1;
+                            remaining.push(entry);
+                            continue;
+                        }
+                    }
+                } else {
+                    summary.cancelled += 1;
+                    continue;
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    summary.cancelled += 1;
+                    continue;
+                }
             }
             match apply(&entry, &current) {
                 Ok(()) => summary.applied += 1,
@@ -2556,6 +2690,9 @@ fn deferred_deletion_is_cancelled(entry: &DeferredConfigDeletion, current: &Valu
                             .is_some_and(|protocol| protocol.eq_ignore_ascii_case("tailscale"))
                 })
             }),
+        DeferredConfigDeletion::TailscaleDirectory { intent } => {
+            collection_ids(current, "servers").contains(&intent.server_id)
+        }
         DeferredConfigDeletion::WarpDevice {
             device_id, token, ..
         } => current
@@ -2571,3 +2708,7 @@ fn deferred_deletion_is_cancelled(entry: &DeferredConfigDeletion, current: &Valu
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "config/audit_tests.rs"]
+mod audit_tests;

@@ -30,6 +30,17 @@ macro_rules! request_samples {
 }
 
 request_samples! {
+    PrepareHelperUpgrade => Request::PrepareHelperUpgrade,
+    CancelHelperUpgrade => Request::CancelHelperUpgrade,
+    CoreStatus => Request::CoreStatus { id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap() },
+    LinuxStartPinned => Request::LinuxStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams { cfg: "/home/u/config.json".into(), log: String::new(), fwd: false, parent_pid: None },
+    }),
+    NativeStartPinned => Request::NativeStartPinned(polaris_helper_proto::core_protocol::PinnedStartParams {
+        id: polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams { cfg: r"C:\Users\polaris\config\config.json".into(), log: String::new(), fwd: false, parent_pid: None },
+    }),
     Ping => Request::Ping,
     Version => Request::Version,
     Status => Request::Status,
@@ -84,7 +95,7 @@ request_samples! {
     }),
     // src 指向不存在的目录：分派会在读 sing-box.exe 那步失败，一个字节都不写（且 support 是 tempdir）。
     InstallCore => Request::InstallCore(InstallCoreParams {
-        src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\core_promote".to_owned(),
+        src_dir: r"C:\Users\polaris\AppData\Roaming\Polaris\retired-upload".to_owned(),
         want_hash: "ab".repeat(32),
     }),
     LinuxDnsSet => Request::LinuxDnsSet(polaris_helper_proto::LinuxDnsSetParams {
@@ -98,6 +109,7 @@ request_samples! {
         gateway_ipv4: "192.168.1.1".to_owned(),
     },
     FlushDns => Request::FlushDns,
+    WindowsFlushDnsNative => Request::WindowsFlushDnsNative,
     MacProxyTransaction => Request::MacProxyTransaction {
         payload_hex: "7b7d".to_owned(),
     },
@@ -114,9 +126,9 @@ request_samples! {
 
 /// 每次调用一个全新 helper：start 会记账 pid，留着会让后面的 install-core 回 busy。
 fn fresh_helper(
-    support: &std::path::Path,
+    _support: &std::path::Path,
 ) -> WinHelper<StaticTokenStore, MockProcOps, MockNetTableOps> {
-    make_helper_with_support(MockProcOps::new(), &support.to_string_lossy())
+    make_helper_defaults()
 }
 
 fn is_unknown(out: &HandleOutcome) -> bool {
@@ -276,7 +288,10 @@ fn authed_unknown_command_is_delivered_with_wait_peer() {
     }
 }
 
-/// 帧行数不足（连 token/命令都凑不齐）维持现状：`ERR unknown` + NoWait。
+/// 帧行数不足（连 token/命令都凑不齐）：`ERR unknown bad-frame` + NoWait。
+///
+/// 带尾文是为了与「已鉴权而命令未知」的裸 `ERR unknown` 分开 —— 客户端只把裸的那一行当作
+/// 「helper 不认识这条命令」。
 #[test]
 fn short_frame_keeps_the_no_wait_unknown_reply() {
     let h = make_helper_defaults();
@@ -284,7 +299,7 @@ fn short_frame_keeps_the_no_wait_unknown_reply() {
         assert_eq!(
             h.handle_frame(raw),
             FrameReply {
-                line: "ERR unknown\n".to_owned(),
+                line: "ERR unknown bad-frame\n".to_owned(),
                 flush: FlushMode::NoWait,
                 exit_after: false,
             },
@@ -293,7 +308,7 @@ fn short_frame_keeps_the_no_wait_unknown_reply() {
     }
 }
 
-/// 正面：已鉴权的已知命令照常分派、WaitPeer；uninstall 带上自退标志（其余不带）。
+/// 已鉴权命令照常分派；SYSTEM uninstall 明确要求 bundled UAC 且不自退。
 #[test]
 fn authed_known_commands_are_dispatched_with_wait_peer() {
     let h = make_helper_defaults();
@@ -304,9 +319,15 @@ fn authed_known_commands_are_dispatched_with_wait_peer() {
     assert!(!ping.exit_after);
 
     let uninstall = make_helper_defaults().handle_frame("real-token\nuninstall\n");
-    assert_eq!(uninstall.line, "OK uninstalling\n");
+    assert_eq!(
+        uninstall.line,
+        "ERR native-cleaner-uac-required; use bundled cleaner UAC fallback\n"
+    );
     assert_eq!(uninstall.flush, FlushMode::WaitPeer);
-    assert!(uninstall.exit_after, "uninstall 必须让 service 层自退");
+    assert!(
+        !uninstall.exit_after,
+        "UAC fallback 必须由调用方同步完成，不能先退出 helper"
+    );
 }
 
 /// 生产的 `handle_connection` 真的走 `handle_frame`，且没有第二条自己切行 / 解码 / 分派的旁路。
@@ -333,9 +354,32 @@ fn production_handle_connection_goes_through_handle_frame() {
     assert!(body.contains("cleanup_pipe(h)"), "窗口没盖住断开");
 
     assert_eq!(
-        body.matches("helper.handle_frame(&raw)").count(),
+        body.matches("helper.handle_frame_from_peer(&raw, Some(&peer))")
+            .count(),
         1,
-        "handle_connection 不再经 handle_frame 处理整帧"
+        "handle_connection must dispatch the entire frame with its captured native peer"
+    );
+    let peer_capture = body
+        .find("native_caller::from_pipe(h)")
+        .expect("connected pipe peer must be captured before dispatch");
+    let dispatch = body
+        .find("helper.handle_frame_from_peer(&raw, Some(&peer))")
+        .unwrap();
+    let auth_window = &body[peer_capture..dispatch];
+    assert!(auth_window.contains("Err(_) =>"));
+    assert!(auth_window.contains("cleanup_pipe(h)"));
+    assert!(
+        auth_window.contains("return;"),
+        "failed native peer capture cannot reach dispatch"
+    );
+    assert!(body.find("read_frame(h, &mut buf)").unwrap() < peer_capture);
+    assert!(
+        !body.contains("NativePeer {"),
+        "service cannot manufacture a caller identity"
+    );
+    assert!(
+        !body.contains("handle_frame(&raw)"),
+        "missing-peer dispatch bypass is forbidden"
     );
     assert!(
         body.contains("write_response(h, reply.line.as_bytes(), reply.flush)"),
@@ -358,4 +402,48 @@ fn production_handle_connection_goes_through_handle_frame() {
         !code.contains("fn parse_request"),
         "service/win.rs 又长出了自己的 parse_request"
     );
+}
+
+#[test]
+fn captured_native_peer_and_registered_token_are_both_required_for_pinned_start_frame() {
+    let ops = MockProcOps::new();
+    let h = make_helper(ops.clone(), MockNetTableOps::new());
+    let request = pinned_start(
+        &h,
+        StartParams {
+            cfg: r"C:\Users\polaris\config\c.json".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    );
+    let peer = &h.test_context.as_ref().unwrap().peer;
+    let raw = String::from_utf8(codec::encode(Platform::Win, TOKEN, &request)).unwrap();
+    let bad_token =
+        String::from_utf8(codec::encode(Platform::Win, "wrong-token", &request)).unwrap();
+    assert_eq!(
+        h.handle_frame_from_peer(&bad_token, Some(peer)).line,
+        "ERR auth\n"
+    );
+    assert_eq!(ops.snapshot().start_calls, 0);
+    let mut missing_peer = make_helper(ops.clone(), MockNetTableOps::new());
+    // Disable the test-only peer fallback to exercise production's absent-peer
+    // path; native admission must refuse even with the correct token.
+    missing_peer.test_context = None;
+    assert_eq!(
+        missing_peer.handle_frame_from_peer(&raw, None).line,
+        "ERR auth\n"
+    );
+    assert_eq!(ops.snapshot().start_calls, 0);
+    let reply = h.handle_frame_from_peer(&raw, Some(peer));
+    assert!(matches!(
+        Response::parse(reply.line.trim_end()),
+        Response::Ok(ResponseKind::PinnedStart {
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Native(
+                polaris_helper_proto::NativeBirthStart::Started { .. }
+            ),
+            ..
+        })
+    ));
+    assert_eq!(ops.snapshot().start_calls, 1);
 }

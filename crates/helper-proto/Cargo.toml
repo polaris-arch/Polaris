@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Shared installation manifests need strict JSON, independently of the existing
+# std-only line protocol codec. Both packages already exist in the workspace lockfile.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lib]
 path = "src/lib.rs"

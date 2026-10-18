@@ -194,19 +194,28 @@ fn seed_one(src: &Path, dest: &Path, overwrite_valid_dest: bool) -> bool {
 fn bundled_data_candidates() -> Vec<PathBuf> {
     let exe = std::env::current_exe().ok();
     let manifest = crate::runtime::proxy::dev_manifest_dir();
-    let candidates = crate::runtime::proxy::bundle_resource_candidates(
+    bundled_data_candidates_for(
         exe.as_deref().and_then(Path::parent),
         manifest,
-        &["data"],
-        "",
-    );
+        !cfg!(debug_assertions),
+    )
+}
+
+#[cfg(not(target_os = "android"))]
+fn bundled_data_candidates_for(
+    exe_dir: Option<&Path>,
+    manifest: Option<&Path>,
+    is_release: bool,
+) -> Vec<PathBuf> {
+    let candidates =
+        crate::runtime::proxy::bundle_resource_candidates(exe_dir, manifest, &["data"], "");
     // `cfg!` 在测试构建里恒为 debug ⇒ 剔除腿在原地写死就**永远测不到**。抽成取显式布尔的纯函数，
     // 让 release 那条语义有门（`drops_repo_candidate_only_in_release`）。
     //
     // 与 `dev_manifest_dir()` 的 `None` **重复守一次是刻意的**：那条断的是「候选压根不生成」，
     // 这条断的是「万一生成了也不许留」。判据不同、失效方式不同，任一独立成立即可，
     // 而这个纯函数的门（`drops_repo_candidate_only_in_release`）不受构型影响，永远测得到。
-    filter_repo_candidate(candidates, manifest, !cfg!(debug_assertions))
+    filter_repo_candidate(candidates, manifest, is_release)
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -243,7 +252,11 @@ fn filter_repo_candidate(
 
 /// 解析随包 `resources/data/` 目录（`.srs` 出厂副本所在）：取首个真实存在的候选目录。
 pub fn resolve_bundled_data_dir() -> Option<PathBuf> {
-    bundled_data_candidates().into_iter().find(|c| c.is_dir())
+    resolve_data_candidates(bundled_data_candidates())
+}
+
+fn resolve_data_candidates(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|c| c.is_dir())
 }
 
 /// 从 `config.json` 原文本抽「已网络更新过」的内置 geo tag 集（`builtinGeoMeta[tag].updatedAt` 存在）。

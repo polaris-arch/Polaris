@@ -20,8 +20,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::Read;
-use std::process::Stdio;
+use std::io::{self, Read};
+use std::process::{Child, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// 一条待执行命令（程序 + argv）。argv 参数化下发，不经 shell 插值（杜绝注入 —— 上游 execFileAsync 口径）。
@@ -95,65 +96,358 @@ pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdCommandRunner;
 
-impl CommandRunner for StdCommandRunner {
-    fn run(&self, cmd: &Command, timeout: Duration) -> Result<CommandOutput, String> {
+/// 仅这次原命令构造的资源观察；不是宿主全局 NoOwner。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCleanup {
+    NotSpawned,
+    NativeAndReadersReturned,
+    Unknown,
+}
+
+/// 两条原排空线程分别记录实际 join 的结果，不用空字符串代替失败事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandReaderDisposition {
+    Pending,
+    Returned(String),
+    ReadFailed(String),
+    Panicked,
+    NotStarted(String),
+}
+
+struct CommandReader {
+    handle: Option<JoinHandle<io::Result<String>>>,
+    disposition: CommandReaderDisposition,
+}
+
+impl CommandReader {
+    fn start(pipe: Option<impl Read + Send + 'static>) -> Self {
+        match std::thread::Builder::new().spawn(move || drain(pipe)) {
+            Ok(handle) => Self {
+                handle: Some(handle),
+                disposition: CommandReaderDisposition::Pending,
+            },
+            Err(error) => Self {
+                handle: None,
+                disposition: CommandReaderDisposition::NotStarted(error.to_string()),
+            },
+        }
+    }
+
+    fn join_returned(&mut self) {
+        if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.join();
+        }
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.disposition = match handle.join() {
+                Ok(Ok(output)) => CommandReaderDisposition::Returned(output),
+                Ok(Err(error)) => CommandReaderDisposition::ReadFailed(error.to_string()),
+                Err(_) => CommandReaderDisposition::Panicked,
+            };
+        }
+    }
+
+    fn legacy_output(&self) -> String {
+        match &self.disposition {
+            CommandReaderDisposition::Returned(output) => output.clone(),
+            // 原 run 的 best-effort 输出行为；此转换不返回 cleanup 资格。
+            _ => String::new(),
+        }
+    }
+
+    fn observed_output(&self) -> Result<String, String> {
+        match &self.disposition {
+            CommandReaderDisposition::Returned(output) => Ok(output.clone()),
+            CommandReaderDisposition::ReadFailed(error) => Err(format!("读取输出失败: {error}")),
+            CommandReaderDisposition::Panicked => Err("排空线程 panic".to_owned()),
+            CommandReaderDisposition::NotStarted(error) => {
+                Err(format!("排空线程启动失败: {error}"))
+            }
+            CommandReaderDisposition::Pending => Err("排空线程尚未返回".to_owned()),
+        }
+    }
+}
+
+/// 原 Child 和两条原 reader 的独占 custody。没有 Clone/serde 或可由 mock 构造的 public 字段。
+/// 预算耗尽、wait/kill 错误和 reader 未返回时，调用者保留此对象，后继 poll 仍观察同一批资源。
+#[must_use = "retain the original command custody until cleanup is observed"]
+pub struct PendingCommand {
+    child: Child,
+    program: String,
+    status: Option<ExitStatus>,
+    stdout: CommandReader,
+    stderr: CommandReader,
+    operation_error: Option<String>,
+    cleanup_error: Option<String>,
+    termination_requested: bool,
+}
+
+impl PendingCommand {
+    /// 仅记录这个原 Child 的实际 wait 返回；两个 reader 均须实际成功 join/read 返回才为闭合。
+    #[must_use]
+    pub fn cleanup(&self) -> CommandCleanup {
+        if self.status.is_some()
+            && matches!(
+                self.stdout.disposition,
+                CommandReaderDisposition::Returned(_)
+            )
+            && matches!(
+                self.stderr.disposition,
+                CommandReaderDisposition::Returned(_)
+            )
+        {
+            CommandCleanup::NativeAndReadersReturned
+        } else {
+            CommandCleanup::Unknown
+        }
+    }
+
+    #[must_use]
+    pub fn native_status(&self) -> Option<ExitStatus> {
+        self.status
+    }
+
+    #[must_use]
+    pub fn stdout_disposition(&self) -> &CommandReaderDisposition {
+        &self.stdout.disposition
+    }
+
+    #[must_use]
+    pub fn stderr_disposition(&self) -> &CommandReaderDisposition {
+        &self.stderr.disposition
+    }
+
+    #[must_use]
+    pub fn cleanup_error(&self) -> Option<&str> {
+        self.cleanup_error.as_deref()
+    }
+
+    /// 操作失败与资源闭合独立：timeout/nonzero 仍是 Err；未知输出尚不产生成功操作结果。
+    pub fn operation(&self) -> Option<Result<CommandOutput, String>> {
+        if let Some(error) = &self.operation_error {
+            return Some(Err(error.clone()));
+        }
+        let status = self.status?;
+        if matches!(self.stdout.disposition, CommandReaderDisposition::Pending)
+            || matches!(self.stderr.disposition, CommandReaderDisposition::Pending)
+        {
+            return None;
+        }
+        Some((|| {
+            let stdout = self.stdout.observed_output()?;
+            let stderr = self.stderr.observed_output()?;
+            command_result(&self.program, status, stdout, stderr)
+        })())
+    }
+
+    /// 请求关闭同一个原 Child；不是 kill ACK/资源闭合证明。
+    pub fn request_stop(&mut self) {
+        self.termination_requested = true;
+        self.operation_error
+            .get_or_insert_with(|| format!("{} 停止请求", self.program));
+    }
+
+    /// 有界观察，不把仍在等待的 handle 移走，也不另建后台 reaper。
+    /// read/panic 错误为 sticky Unknown；wait/kill 不确定时仍保留原 Child 供后继重试。
+    pub fn poll_cleanup(&mut self, budget: Duration) -> CommandCleanup {
+        if self.termination_requested && self.status.is_none() {
+            if let Err(error) = self.child.kill() {
+                self.cleanup_error = Some(format!("{} kill 失败: {error}", self.program));
+            }
+        }
+        let deadline = Instant::now() + budget;
+        let mut poll_interval = INITIAL_POLL_INTERVAL;
+        loop {
+            if self.status.is_none() {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => self.status = Some(status),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.cleanup_error = Some(format!("{} 等待失败: {error}", self.program));
+                    }
+                }
+            }
+            // 两条都执行；stdout 失败不得跳过 stderr 的真实 join。
+            self.stdout.join_returned();
+            self.stderr.join_returned();
+            let cleanup = self.cleanup();
+            if cleanup != CommandCleanup::Unknown
+                || (self.status.is_some()
+                    && self.stdout.handle.is_none()
+                    && self.stderr.handle.is_none())
+                || Instant::now() >= deadline
+            {
+                return cleanup;
+            }
+            std::thread::sleep(
+                poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+            );
+            poll_interval = next_poll_interval(poll_interval, MAX_POLL_INTERVAL);
+        }
+    }
+}
+
+/// 只能由生产 StdCommandRunner 的原 spawn engine 生成；普通注入 CommandRunner 没有 proof 入口。
+#[must_use = "observed command owns its original child and readers"]
+pub struct ObservedCommand {
+    spawn_error: Option<String>,
+    pending: Option<PendingCommand>,
+}
+
+impl ObservedCommand {
+    #[must_use]
+    pub fn cleanup(&self) -> CommandCleanup {
+        self.pending
+            .as_ref()
+            .map_or(CommandCleanup::NotSpawned, PendingCommand::cleanup)
+    }
+
+    pub fn operation(&self) -> Option<Result<CommandOutput, String>> {
+        match &self.pending {
+            Some(pending) => pending.operation(),
+            None => self.spawn_error.as_ref().map(|error| Err(error.clone())),
+        }
+    }
+
+    pub fn pending_mut(&mut self) -> Option<&mut PendingCommand> {
+        self.pending.as_mut()
+    }
+
+    /// 原始资源随对象交还调用者；不跨线程/全局登记，也没有 Drop 自签 completion。
+    pub fn into_pending(self) -> Option<PendingCommand> {
+        self.pending
+    }
+
+    fn into_legacy_result(self) -> Result<CommandOutput, String> {
+        let Some(mut pending) = self.pending else {
+            return Err(self
+                .spawn_error
+                .unwrap_or_else(|| "missing command result".to_owned()));
+        };
+        if let Some(error) = pending.operation_error {
+            // Root 批准的兼容边界：保旧 timeout/error 返回时机，历史未知尾部没有 completion 授权。
+            // 保留旧 timeout 的原 Child wait 尝试；它不代表两条 reader 已返回。
+            if pending.termination_requested && pending.status.is_none() {
+                match pending.child.wait() {
+                    Ok(status) => pending.status = Some(status),
+                    Err(wait_error) => {
+                        pending.cleanup_error =
+                            Some(format!("{} 等待失败: {wait_error}", pending.program));
+                    }
+                }
+            }
+            return Err(error);
+        }
+        let Some(status) = pending.status else {
+            return Err(format!("{} 等待结果未知", pending.program));
+        };
+        pending.stdout.join();
+        pending.stderr.join();
+        command_result(
+            &pending.program,
+            status,
+            pending.stdout.legacy_output(),
+            pending.stderr.legacy_output(),
+        )
+    }
+}
+
+impl StdCommandRunner {
+    /// 同一个原 spawn；操作预算结束后返回原资源 custody，cleanup 需调用者显式观察。
+    pub fn run_observed(&self, cmd: &Command, timeout: Duration) -> ObservedCommand {
         let mut builder = std::process::Command::new(&cmd.program);
         builder
             .args(&cmd.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Windows：抑制新控制台窗口（见 [`CREATE_NO_WINDOW`]）。本 runner 是本 crate 与 OS 的唯一缝，
-        // 故 `reg.exe` / `netsh` / `tasklist` 等全部平台命令在此一处收口。
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             builder.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = builder
-            .spawn()
-            .map_err(|e| format!("{} 启动失败: {e}", cmd.program))?;
-
-        // 先接管管道并起排空线程（见结构体 doc：防写阻塞死锁）。
-        let out_pipe = child.stdout.take();
-        let err_pipe = child.stderr.take();
-        let out_thread = std::thread::spawn(move || drain(out_pipe));
-        let err_thread = std::thread::spawn(move || drain(err_pipe));
-
+        let mut child = match builder.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return ObservedCommand {
+                    spawn_error: Some(format!("{} 启动失败: {error}", cmd.program)),
+                    pending: None,
+                }
+            }
+        };
+        let stdout = CommandReader::start(child.stdout.take());
+        let stderr = CommandReader::start(child.stderr.take());
+        let reader_start_failed =
+            matches!(stdout.disposition, CommandReaderDisposition::NotStarted(_))
+                || matches!(stderr.disposition, CommandReaderDisposition::NotStarted(_));
+        let mut pending = PendingCommand {
+            child,
+            program: cmd.program.clone(),
+            status: None,
+            stdout,
+            stderr,
+            operation_error: reader_start_failed
+                .then(|| format!("{} 排空线程启动失败", cmd.program)),
+            cleanup_error: None,
+            termination_requested: reader_start_failed,
+        };
         let deadline = Instant::now() + timeout;
         let mut poll_interval = INITIAL_POLL_INTERVAL;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
+        while pending.operation_error.is_none() {
+            match pending.child.try_wait() {
+                Ok(Some(status)) => {
+                    pending.status = Some(status);
+                    break;
+                }
                 Ok(None) => {}
-                Err(e) => return Err(format!("{} 等待失败: {e}", cmd.program)),
+                Err(error) => {
+                    pending.operation_error = Some(format!("{} 等待失败: {error}", cmd.program));
+                    pending.termination_requested = true;
+                    break;
+                }
             }
             if Instant::now() >= deadline {
-                // 硬超时：kill + 收割（防僵尸）。kill 后管道关闭 → 排空线程自然退出。
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{} 超时（{:?}）", cmd.program, timeout));
+                pending.operation_error = Some(format!("{} 超时（{:?}）", cmd.program, timeout));
+                pending.termination_requested = true;
+                break;
             }
             std::thread::sleep(poll_interval);
             poll_interval = next_poll_interval(poll_interval, MAX_POLL_INTERVAL);
-        };
-
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
-
-        if !status.success() {
-            // 对齐 execFileAsync：非零退出 = reject。stderr 带进错误便于诊断。
-            return Err(format!(
-                "{} 退出码 {}: {}",
-                cmd.program,
-                status
-                    .code()
-                    .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-                stderr.trim()
-            ));
         }
-        Ok(CommandOutput { stdout, stderr })
+        pending.poll_cleanup(Duration::ZERO);
+        ObservedCommand {
+            spawn_error: None,
+            pending: Some(pending),
+        }
     }
+}
+
+impl CommandRunner for StdCommandRunner {
+    fn run(&self, cmd: &Command, timeout: Duration) -> Result<CommandOutput, String> {
+        // 操作结果兼容层，不提供 NoOwner；后续 S1 必须直接消费 run_observed 并保原 pending。
+        self.run_observed(cmd, timeout).into_legacy_result()
+    }
+}
+
+fn command_result(
+    program: &str,
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+) -> Result<CommandOutput, String> {
+    if !status.success() {
+        return Err(format!(
+            "{} 退出码 {}: {}",
+            program,
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            stderr.trim()
+        ));
+    }
+    Ok(CommandOutput { stdout, stderr })
 }
 
 // ── Windows System32 绝对路径（移植自 上游 `utils/win-system32.ts`）──
@@ -189,16 +483,17 @@ pub fn system32_from_env(binary: &str) -> String {
     system32(binary, sr.as_deref(), wd.as_deref())
 }
 
-/// 读干一个管道；读失败按空串（best-effort，输出只用于解析/诊断）。
-fn drain(pipe: Option<impl Read>) -> String {
+/// 原管道真正读到 EOF 才返回输出；读失败保留错误，不替换成已完成事实。
+fn drain(pipe: Option<impl Read>) -> io::Result<String> {
     let Some(mut pipe) = pipe else {
-        return String::new();
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "missing captured output pipe",
+        ));
     };
     let mut buf = Vec::new();
-    if pipe.read_to_end(&mut buf).is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&buf).into_owned()
+    pipe.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// 测试辅助：跨模块共享的命令执行 mock。

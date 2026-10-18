@@ -86,6 +86,29 @@ impl ProducerCell {
         Ok(factory)
     }
 
+    pub(in crate::runtime::proxy) fn census(self: &Arc<Self>) -> Result<MainProducerView, String> {
+        let factories = self
+            .factories
+            .lock()
+            .map_err(|_| "Main producer metadata poisoned")?
+            .clone();
+        Ok(MainProducerView {
+            producer: Arc::clone(self),
+            factories,
+        })
+    }
+
+    pub(in crate::runtime::proxy) fn has_native_tail(&self) -> bool {
+        self.factories.lock().map_or(true, |factories| {
+            factories.iter().any(|factory| {
+                matches!(
+                    factory.phase.load(Ordering::SeqCst),
+                    ATTACHED | NATIVE_EXITED | RETIRED
+                )
+            })
+        })
+    }
+
     #[cfg(test)]
     pub(in crate::runtime::proxy) fn observation(&self) -> (u64, u64, bool, Vec<u8>) {
         (
@@ -99,6 +122,60 @@ impl ProducerCell {
                 .map(|factory| factory.phase.load(Ordering::SeqCst))
                 .collect(),
         )
+    }
+}
+
+/// Keeps the original producer and each original factory, including native-only retirement.
+pub(in crate::runtime::proxy) struct MainProducerView {
+    producer: Arc<ProducerCell>,
+    factories: Vec<Arc<NativeFactory>>,
+}
+
+impl MainProducerView {
+    pub(in crate::runtime::proxy) fn phases(&self) -> Vec<u8> {
+        self.factories
+            .iter()
+            .map(|factory| factory.phase.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    pub(in crate::runtime::proxy) fn verify_surrender(
+        &self,
+        slot: &crate::runtime::proxy::process_supervision::direct_custody::DirectCoreSlot,
+    ) -> Result<(), String> {
+        if !self.producer.dispatch_finished.load(Ordering::SeqCst) {
+            return Err("original Main dispatch has not returned".into());
+        }
+        let current = self
+            .producer
+            .factories
+            .lock()
+            .map_err(|_| "Main producer metadata poisoned")?;
+        if current.len() != self.factories.len()
+            || !current
+                .iter()
+                .zip(&self.factories)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+            || self
+                .factories
+                .iter()
+                .any(|factory| factory.phase.load(Ordering::SeqCst) == FACTORY_ENTERED)
+        {
+            return Err("original Main factory membership is unresolved".into());
+        }
+        if self.factories.iter().any(|factory| {
+            matches!(
+                factory.phase.load(Ordering::SeqCst),
+                ATTACHED | NATIVE_EXITED
+            ) && !slot.running_matches(&factory.run)
+        }) {
+            return Err("original Main Child is not back in its physical custody".into());
+        }
+        Ok(())
+    }
+
+    pub(in crate::runtime::proxy) fn queue_base(&self) -> u64 {
+        self.producer.queue_base
     }
 }
 

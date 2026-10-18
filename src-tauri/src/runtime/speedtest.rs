@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(not(target_os = "android"))]
 use std::sync::{
@@ -58,6 +58,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+mod diagnostic;
 
 use polaris_config_engine::builder::endpoints::{
     build_masque_endpoint, build_vpn_client_endpoint, build_wireguard_endpoint,
@@ -80,9 +82,12 @@ use polaris_core_supervisor::{
     CORE_STARTUP_PER_NODE_US,
 };
 
-use crate::events::channel::{
-    EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS, EVENT_SPEED_TEST_RESULT,
+use crate::commands::speedtest::{
+    Binding, Measured, MeasurementEvents, NodeResult, RoundResults, SpeedTestCancel,
 };
+#[cfg(test)]
+use crate::events::channel::EVENT_SPEED_TEST_RESULT;
+use crate::events::channel::{EVENT_SPEED_TEST_DONE, EVENT_SPEED_TEST_PROGRESS};
 use crate::logging::SPEEDTEST_CORE_TARGET;
 use crate::runtime::proxy::core_log::pipe_to_log;
 #[cfg(target_os = "android")]
@@ -193,10 +198,10 @@ const TEMP_CORE_READY_TIMEOUT_FLOOR_MS: u64 = 10_000;
 /// · 上界：一分钟是「这东西是不是死了」的普遍心理阈值，再往上等只是把无解的等待拉长。
 ///
 /// **真会吃满这 60s 的只有一种形态：核活着、但一直不 bind 的僵核。** 另外两条腿都提前返回，
-/// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::is_alive` 接住
+/// 不要把它们算进这个上限的依据里：核**崩掉**由 `CoreReadyDeps::observe_process` 接住
 /// （本模块传的是 `pid == 0 || pid_alive(pid)`，进程一没就停等）；用户中途点「连接」由
 /// `is_superseded` 接住（命中即停等 + 杀核）。剩下的那种僵核形态确实**没有取消按钮**
-/// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_IN_FLIGHT`）在此期间挡住
+/// （登记项 L2-e），且进程级单飞闸（`commands::speedtest::SPEED_TEST_GATE`）在此期间挡住
 /// 一切后续测速请求 ⇒ 上限必须有限，且不能定得太大。
 ///
 /// # ⚠️ T1-R1（分批）之后：这条腿**在生产路径上已经不可达**，但它不是死代码
@@ -644,8 +649,8 @@ const TEMP_CORE_READY_POLL_MS: u64 = 200;
 /// 只在「发新活之前 / 每节点测完」两处查是不够的：窗口里的节点**全部不可达**时（真机上就是订阅里
 /// 有 ≥16 个死节点），那两处一个都醒不过来 —— supersede 信号出现后临时核（及其**已建立的 WG/WARP
 /// 会话**）还要活满一整个测量超时。Linux/macOS 靠主核 `start()` 入口的 stale sweep 顺带杀掉——那是
-/// **副作用缓解、不是设计保证**；Windows 无 sweep（`scan_running_cores` 恒返空）⇒ 全程重叠。
-/// 故按本间隔独立轮询（`timeout(poll, join_next())`，**不依赖任何测量返回**），命中即 `abort_all` +
+/// **副作用缓解、不是设计保证**（在飞的临时核在清扫的排除表里，本就不该指望它被杀）。
+/// 故按本间隔独立轮询（`timeout(poll, join_next())`，**不依赖任何测量返回**），命中即中止并收回在飞任务（`JoinSet::shutdown`）+
 /// 立即返回（调用方紧接着 `terminate()`）。
 const TEMP_CORE_SUPERSEDE_POLL_MS: u64 = 200;
 
@@ -668,6 +673,29 @@ const TEMP_CORE_STALL_STREAK: usize = TEMP_CORE_CONCURRENCY;
 /// 那份会被本次直接覆盖（带时间戳反而会在 config 目录里越堆越多）。
 const TEMP_CORE_CONFIG_NAME: &str = "speedtest-core.json";
 
+fn write_private_temp_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("测速配置缺少父目录")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("测速配置父目录不能是重定向".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    // Admission already proved the previous exact child closed. Atomic replacement
+    // never truncates a linked target and publishes the writer's private 0600 inode.
+    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    // Store's shared helper owns the fixed twelve-hex temporary-name contract.
+    let suffix = polaris_store::fs::random_tmp_suffix();
+    polaris_store::fs::durable_atomic_write(path, text, &suffix)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// 诊断档（`debug` / `trace`）下**留档**的临时核配置文件名（见 [`retire_temp_config`]）。
 ///
 /// 与 [`TEMP_CORE_CONFIG_NAME`] 必须不同名：同名就等于「没删」，下次会话会把它当成自己的配置覆盖，
@@ -682,9 +710,8 @@ const TEMP_CORE_LAST_CONFIG_NAME: &str = "speedtest-core.last.json";
 /// 临时核 child 由本模块的会话 future 独占持有，`TokioLoginCoreChild` 的 Drop 守卫只覆盖「future 被
 /// 丢弃 / panic 展开」。**应用退出**走的是 `RunEvent::ExitRequested → run_exit_cleanup → 进程退出`，
 /// 在飞的 tokio task **根本不会被 drop** ⇒ 临时核不随父进程死，留下一个持续持有 N 个回环端口 +
-/// WG/WARP peer 会话的孤儿 sing-box。而兜底 sweep 只在**下次** `start()` 才跑，且 Windows 的
-/// `scan_running_cores` 恒返空（`core-supervisor/src/stale_core.rs`：`tasklist` 不输出命令行，无从
-/// 施加「只杀本 app 起的核」判据）⇒ **Windows 孤儿永不被清**。
+/// WG/WARP peer 会话的孤儿 sing-box。而兜底 sweep 只在**下次** `start()` 才跑。Windows 上另有
+/// 作业对象：主程序一消失，内核就结束它直起的全部核（`polaris_core_supervisor::job_object`）。
 ///
 /// PC shutdown requests its retained birth and waits for native close. Android keeps its
 /// existing shutdown path; PID snapshots alone supply no cleanup receipt on either platform.
@@ -815,8 +842,126 @@ impl Drop for TempCorePidGuard {
 struct PcTempCoreCustody {
     admission: tokio::sync::Mutex<()>,
     birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
+    producers: Mutex<Vec<Arc<PcTempBatchProducer>>>,
+    retired_births: Mutex<Vec<Arc<PcTempCoreBirth>>>,
     closing: AtomicBool,
     identity: Arc<()>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct PcTempBatchProducer {
+    finished: AtomicBool,
+    cancelled: AtomicBool,
+    factory_started: AtomicBool,
+    birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcTempBatchDispatch(Arc<PcTempBatchProducer>);
+
+#[cfg(not(target_os = "android"))]
+impl Drop for PcTempBatchDispatch {
+    fn drop(&mut self) {
+        if !self.0.finished.load(Ordering::SeqCst) {
+            self.0.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) struct TempProducerView {
+    custody: Arc<PcTempCoreCustody>,
+    producers: Vec<Arc<PcTempBatchProducer>>,
+    births: Vec<Arc<PcTempCoreBirth>>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl TempProducerView {
+    pub(crate) fn member_count(&self) -> usize {
+        self.producers.len() + self.births.len()
+    }
+
+    pub(crate) fn verify_surrender(&self) -> Result<(), String> {
+        let current = self.custody.current()?;
+        let retired = self
+            .custody
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?;
+        for producer in &self.producers {
+            if !producer.finished.load(Ordering::SeqCst) {
+                if !producer.cancelled.load(Ordering::SeqCst) {
+                    return Err("original Temp batch dispatch has not returned".into());
+                }
+                if producer.factory_started.load(Ordering::SeqCst) {
+                    let birth = producer
+                        .birth
+                        .lock()
+                        .map_err(|_| "Temp batch birth binding poisoned")?
+                        .clone()
+                        .ok_or("cancelled unqualified Temp factory remains unknown")?;
+                    let native = birth
+                        .native
+                        .as_ref()
+                        .ok_or("cancelled legacy Temp factory remains unknown")?;
+                    native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
+                    if !birth.retired.load(Ordering::SeqCst)
+                        && birth
+                            .child
+                            .try_lock()
+                            .map_err(|_| "Temp child dispatch unresolved")?
+                            .is_none()
+                    {
+                        return Err(
+                            "cancelled Temp dispatch has not returned a physical Child".into()
+                        );
+                    }
+                }
+                // This original Rust body was dropped before factory, or its private
+                // factory returned to the retained exact birth. Uncovered tails stay typed.
+            }
+        }
+        let mut births = self.births.clone();
+        for producer in &self.producers {
+            if let Some(birth) = producer
+                .birth
+                .lock()
+                .map_err(|_| "Temp batch birth binding poisoned")?
+                .clone()
+            {
+                births.push(birth);
+            }
+        }
+        for birth in &births {
+            if !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some())
+                && !current
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, birth))
+                && !retired.iter().any(|owner| Arc::ptr_eq(owner, birth))
+            {
+                return Err("original Temp birth responsibility disappeared".into());
+            }
+            if let Some(native) = &birth.native {
+                native.verify_census_dispatch(&self.custody.identity, &birth.identity)?;
+            } else if birth.retired.load(Ordering::SeqCst) {
+                // Legacy native-only close carries explicit uncovered tails, never full terminal.
+            } else if birth
+                .child
+                .try_lock()
+                .map_err(|_| "Temp child dispatch unresolved")?
+                .is_none()
+            {
+                return Err("legacy Temp factory return is not known".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn pc_temp_producer_view() -> Result<TempProducerView, String> {
+    PC_TEMP_CORE_CUSTODY.producer_view()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -861,6 +1006,63 @@ static PC_TEMP_CORE_CUSTODY: LazyLock<Arc<PcTempCoreCustody>> =
 
 #[cfg(not(target_os = "android"))]
 impl PcTempCoreCustody {
+    /// Prune only proven terminal ownership; existing census snapshots retain Arcs.
+    /// Unknown legacy/cancelled factories are quarantined without arbitrary eviction.
+    fn prune_terminal(&self) -> Result<(), String> {
+        self.producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .retain(|producer| {
+                let Ok(birth) = producer.birth.lock() else {
+                    return true;
+                };
+                match birth.as_ref() {
+                    // Cancellation ends original dispatch, not native custody. retire()
+                    // alone publishes retired after exact terminal/no-child validation.
+                    // Never set finished to conceal an abandoned factory.
+                    Some(birth) => {
+                        !((producer.finished.load(Ordering::SeqCst)
+                            || producer.cancelled.load(Ordering::SeqCst))
+                            && birth.retired.load(Ordering::SeqCst)
+                            && birth.native.is_some())
+                    }
+                    None => {
+                        !((producer.finished.load(Ordering::SeqCst)
+                            || producer.cancelled.load(Ordering::SeqCst))
+                            && !producer.factory_started.load(Ordering::SeqCst))
+                    }
+                }
+            });
+        self.retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?
+            .retain(|birth| !(birth.retired.load(Ordering::SeqCst) && birth.native.is_some()));
+        Ok(())
+    }
+
+    fn producer_view(self: &Arc<Self>) -> Result<TempProducerView, String> {
+        self.prune_terminal()?;
+        let custody = Arc::clone(self);
+        let producers = custody
+            .producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .clone();
+        let mut births = custody
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?
+            .clone();
+        if let Some(current) = custody.current()? {
+            births.push(current);
+        }
+        Ok(TempProducerView {
+            custody,
+            producers,
+            births,
+        })
+    }
+
     fn current(&self) -> Result<Option<Arc<PcTempCoreBirth>>, String> {
         self.birth
             .lock()
@@ -914,6 +1116,21 @@ impl PcTempCoreCustody {
         });
         // Admission remains held from the initial empty-slot check through publication.
         // No other path can install a successor before this synchronous assignment.
+        if let Some(producer) = self
+            .producers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .filter(|producer| {
+                !producer.finished.load(Ordering::SeqCst)
+                    && !producer.cancelled.load(Ordering::SeqCst)
+            })
+        {
+            *producer
+                .birth
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&birth));
+        }
         *self.birth.lock().unwrap_or_else(PoisonError::into_inner) = Some(birth.clone());
         // Shutdown may have observed an empty slot immediately before spawn returned.
         // Publish first, then compensate for that lost notification under the closing fence.
@@ -953,6 +1170,25 @@ impl PcTempCoreCustody {
             identity,
             native: Some(native),
         });
+        if let Some(producer) = self
+            .producers
+            .lock()
+            .map_err(|_| "Temp producer custody poisoned")?
+            .last()
+            .filter(|producer| {
+                !producer.finished.load(Ordering::SeqCst)
+                    && !producer.cancelled.load(Ordering::SeqCst)
+            })
+        {
+            let mut original = producer
+                .birth
+                .lock()
+                .map_err(|_| "Temp batch birth binding poisoned")?;
+            if original.is_some() {
+                return Err("Temp batch already owns an original birth".into());
+            }
+            *original = Some(Arc::clone(&birth));
+        }
         *current = Some(birth.clone());
         Ok(PcCustodiedChild {
             custody: self.clone(),
@@ -1001,11 +1237,16 @@ impl PcTempCoreCustody {
                 return Err("测速临时核没有 native factory 返回事实".into());
             }
         };
+        let mut retired_births = self
+            .retired_births
+            .lock()
+            .map_err(|_| "Temp legacy tail custody poisoned")?;
         // Every fallible lock/validation and sealed-reference clone precedes this commit.
         // File cleanup retains its ordinary best-effort diagnostic policy, outside native scope.
         retire_temp_config(&birth.config_path, birth.keep_config);
         pid_guard.pid_guard.take();
         current.take();
+        retired_births.push(Arc::clone(birth));
         if let Some(validated) = validated {
             pid_guard.native_terminal = Some(validated.retire());
         } else if let Some(native) = &birth.native {
@@ -1105,16 +1346,22 @@ impl LoginCoreChild for PcCustodiedChild {
         }
     }
     async fn close_confirmed(&mut self) -> Result<(), String> {
-        let mut child = self.birth.child.lock().await;
+        let mut owned_child = self.birth.child.lock().await;
         if self.birth.retired.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let child = child
+        let child = owned_child
             .as_mut()
             .ok_or("测速临时核 native factory 责任尚未确认")?;
         child.close_confirmed().await?;
         self.custody
-            .retire(&self.birth, PcTempRetirement::Close(child.native_exit()))
+            .retire(&self.birth, PcTempRetirement::Close(child.native_exit()))?;
+        // Keep the private native Child's cached facts on the same original birth.
+        // Legacy close ACKs retain uncovered tails, while preserving their old release.
+        if self.birth.native.is_none() {
+            owned_child.take();
+        }
+        Ok(())
     }
 }
 
@@ -1147,7 +1394,7 @@ pub async fn shutdown_for_exit() -> Result<(), String> {
     PC_TEMP_CORE_CUSTODY.retry_close().await
 }
 
-/// 临时核**入站→出站** 1:1 绑定的一个节点（[`plan_temp_core_with_bindings`] 产出，[`build_temp_core_config`] 消费）。
+/// 临时核**入站→出站** 1:1 绑定的一个节点（[`plan_temp_core_with_utls_policy`] 产出，[`build_temp_core_config`] 消费）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TempNode {
     /// 节点 id（结果回填键 + `event:speedTestResult` 的 serverId）。
@@ -1189,7 +1436,7 @@ pub enum UnusableReason {
     BuildFailed(&'static str),
 }
 
-/// [`plan_temp_core_with_bindings`] 的产出：可测节点（保序）+ 各原因的缺席列表（保序）。
+/// [`plan_temp_core_with_utls_policy`] 的产出：可测节点（保序）+ 各原因的缺席列表（保序）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TempCorePlan {
     /// 进临时核真测的节点。
@@ -1258,15 +1505,40 @@ pub fn plan_temp_core(servers: &[ServerConfig], env: &CoreBuildEnv) -> TempCoreP
 ///
 /// 临时核只在主核停止时运行，不需要 TUN 启动前的按目的路由推导；但显式策略属于用户配置，测速路径
 /// 必须与真实连接一致。映射只按节点 id 取值，空值继续交给操作系统逐目的选路。
+#[cfg(test)]
 #[must_use]
 pub fn plan_temp_core_with_bindings(
     servers: &[ServerConfig],
     env: &CoreBuildEnv,
     bind_interfaces: &BTreeMap<String, String>,
 ) -> TempCorePlan {
+    plan_temp_core_with_utls_policy(servers, env, bind_interfaces, None)
+}
+
+#[must_use]
+pub fn plan_temp_core_with_utls_policy(
+    servers: &[ServerConfig],
+    env: &CoreBuildEnv,
+    bind_interfaces: &BTreeMap<String, String>,
+    utls_policy: Option<&str>,
+) -> TempCorePlan {
     let mut out = TempCorePlan::default();
     let mut seen_tags: BTreeSet<String> = BTreeSet::new();
     for s in servers {
+        let effective =
+            match polaris_config_engine::user_config::utls::effective_server_for_platform(
+                s,
+                utls_policy,
+                &env.platform,
+            ) {
+                Ok(effective) => effective,
+                Err(reason) => {
+                    out.unusable
+                        .push((s.id.clone(), UnusableReason::BuildFailed(reason)));
+                    continue;
+                }
+            };
+        let s = effective.as_ref();
         // Custom endpoints can carry a raw tailscale type even when the typed
         // protocol is Custom. Reject before constructing a node: constructing
         // a second tsnet identity could initialize its state_directory.
@@ -1302,10 +1574,10 @@ pub fn plan_temp_core_with_bindings(
     out
 }
 
-/// 缺席节点的**按原因汇总**日志（唯一出口，[`plan_temp_core_with_bindings`] 收尾调一次）。
+/// 缺席节点的**按原因汇总**日志（唯一出口，[`plan_temp_core_with_utls_policy`] 收尾调一次）。
 ///
 /// 全量列 id 在 116 节点的订阅上是一行几 KB，而排查只需要「是不是集中在某一类」——故只报两类计数
-/// 加前 5 个带原因的样本，与 [`log_speed_test_summary`] 的取样口径同源。
+/// 加前 5 个带原因的样本，与每轮汇总行的取样口径同源。
 ///
 /// 级别取 `warn`：真机常态 `logLevel=info`（`warn` 及以上才落盘的场景另说），而「某些节点每轮都不
 /// 被测」正是用户会来问、且此前磁盘上零线索的那一类。
@@ -1749,9 +2021,9 @@ pub const fn is_temp_core_superseded(
 /// 只排除 control/http/mixed，会抢走主核尚未 bind 的口 ⇒ 主核起核 FATAL。所以「主核来了就立刻停」
 /// 不是优化，是**正确性**。三个检查点覆盖全程，缺一即静默重叠：
 ///
-/// 1. **发新活之前**（每轮补位一次）：主核已起 → 停发新活 + `abort_all` 已在飞的，未测节点缺席。
+/// 1. **发新活之前**（每轮补位一次）：主核已起 → 停发新活 + 中止并收回已在飞的（`JoinSet::shutdown`），未测节点缺席。
 ///    这条替代了旧的「批首」检查，粒度**更细**：旧的是每 K 个节点一次，现在是每次补位一次。
-/// 2. **在飞轮询**（每 [`TEMP_CORE_SUPERSEDE_POLL_MS`] 一次）：命中即 `abort_all` + 立刻返回。
+/// 2. **在飞轮询**（每 [`TEMP_CORE_SUPERSEDE_POLL_MS`] 一次）：命中即中止并收回在飞任务后返回（不等它们各自测完）。
 ///    **这条是唯一不依赖任何测量返回的腿** —— 窗口里 16 个全挂死（真机上就是 16 个不可达节点）时，
 ///    上面两条都醒不过来，只有它按间隔醒。批屏障时代它挂在「批内」，现在挂在整轮，覆盖面只增不减：
 ///    以前批与批之间那一小段没有轮询（靠批首查兜），现在全程都在轮询窗口里。
@@ -1850,10 +2122,10 @@ impl RoundProgress {
         self.tested
     }
 
-    /// 落一个节点的账（[`record_measured`] 专用；`Some` 计进 `ok`）。
-    fn record(&mut self, latency: Option<u32>) {
+    /// 落一个节点的账（[`record_measured`] 专用；测出值的计进 `ok`）。
+    fn record(&mut self, measured: &Measured) {
         self.tested += 1;
-        if latency.is_some() {
+        if measured.is_ok() {
             self.ok += 1;
         }
     }
@@ -1878,8 +2150,8 @@ impl RoundProgress {
     /// 把方法名写成 `heartbeat` 会让读到 `record_measured` 的人以为逐节点进度也是心跳（反过来
     /// 也一样），而这两者对「进度到底动没动」的含义完全相反。心跳复用同一个通道
     /// （不新起事件通道）：对前端这就是「还在测，进度没变」，reducer 与 toast 一行都不用改。
-    fn emit_progress(&self, emit: &mut (dyn FnMut(&str, Value) + Send)) {
-        emit(EVENT_SPEED_TEST_PROGRESS, self.payload());
+    fn emit_progress(&self, emit: &mut dyn MeasurementEvents) {
+        emit.emit(EVENT_SPEED_TEST_PROGRESS, self.payload());
     }
 
     /// 登记一个中断成因。
@@ -1909,16 +2181,16 @@ pub async fn drive_temp_core_measures<Meas, MeasFut>(
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     progress: &mut RoundProgress,
-) -> (serde_json::Map<String, Value>, &'static str)
+) -> (RoundResults, &'static str)
 where
     Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Option<u32>> + Send + 'static,
+    MeasFut: Future<Output = Measured> + Send + 'static,
 {
     // `results` 由**本薄壳**持有：内核的每一条中断腿（含 `select!` 的核退出臂）都要能把「已落账的那些」
     // 交出来，而返回值持有的话，中断臂那一刻还没有返回值可交。
-    let mut results = serde_json::Map::new();
+    let mut results = RoundResults::new();
     let reason = drive_temp_core_measures_inner(
         &mut results,
         nodes,
@@ -1946,19 +2218,19 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_temp_core_measures_inner<Meas, MeasFut>(
-    results: &mut serde_json::Map<String, Value>,
+    results: &mut RoundResults,
     nodes: &[TempNode],
     ports: &[u16],
     concurrency: usize,
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     progress: &mut RoundProgress,
 ) -> Option<InterruptReason>
 where
     Meas: Fn(u16) -> MeasFut,
-    MeasFut: Future<Output = Option<u32>> + Send + 'static,
+    MeasFut: Future<Output = Measured> + Send + 'static,
 {
     // `total` 是**本批**的调度上界（`nodes`/`ports` 逐位 1:1，多出的一侧不测）——它只管这个循环该
     // 派多少活。事件里那个 `total` 是**轮**级的，由 [`RoundProgress`] 持有，两者不是一回事：
@@ -1977,7 +2249,7 @@ where
         if next < total {
             // ── 让位①（发新活之前）：主核已起/已跃迁 → 停发新活 + 中止在飞，未测节点缺席 ──
             if superseded() {
-                set.abort_all();
+                set.shutdown().await;
                 return Some(InterruptReason::Superseded);
             }
             // 补位：起手补满窗口，此后回来一个补一个。
@@ -2017,7 +2289,7 @@ where
         let joined = tokio::select! {
             biased;
             () = &mut watch.exited => {
-                set.abort_all();
+                set.shutdown().await;
                 log::error!(
                     "测速临时核异常退出：pid={}，已出值 {}/{total}，检测到退出之后未出值的节点本轮缺席；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                     watch.pid,
@@ -2030,13 +2302,13 @@ where
         match joined {
             // 窗口已空且无待发（上面刚补过位）⇒ 全部收尾。
             Ok(None) => break,
-            Ok(Some(Ok((id, latency)))) => {
+            Ok(Some(Ok((id, measured)))) => {
                 // ── 让位③（每节点测完即查）──
                 if superseded() {
-                    set.abort_all();
+                    set.shutdown().await;
                     return Some(InterruptReason::Superseded);
                 }
-                if latency.is_some() {
+                if measured.is_ok() {
                     failure_streak = 0;
                 } else {
                     // ── 落账前对核再探一次（`biased` 的兜底）──
@@ -2053,7 +2325,7 @@ where
                     })
                     .await;
                     if exited_now {
-                        set.abort_all();
+                        set.shutdown().await;
                         log::error!(
                             "测速临时核已退出（落账前复查命中）：pid={}，已出值 {}/{total}，含本次在内的未出值节点一律缺席；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                             watch.pid,
@@ -2063,7 +2335,15 @@ where
                     }
                     failure_streak += 1;
                 }
-                record_measured(results, progress, emit, &id, latency);
+                // 临时核没有运行期读回：绑定由「逐节点入站钉到该节点出站」的配置结构保证。
+                let binding = nodes.iter().find(|node| node.id == id).map(|node| {
+                    Binding::static_node_pin(
+                        &node.tag,
+                        node.is_endpoint,
+                        node.node.get("detour").and_then(Value::as_str),
+                    )
+                });
+                record_measured(results, progress, emit, &id, &measured, binding.as_ref());
 
                 // ── A3 腿二（核**不再接受连接**）：连败满一窗 → 对 `ports[0]` 复探一次 ──
                 //
@@ -2083,7 +2363,7 @@ where
                         .await
                         .unwrap_or(false);
                     if !responding {
-                        set.abort_all();
+                        set.shutdown().await;
                         log::error!(
                             "测速临时核连续 {TEMP_CORE_STALL_STREAK} 个节点判 -1 且复探 127.0.0.1:{port} 无响应：pid={}，已出值 {}/{total}，本轮就地终止（检测到之后未出值的节点一律缺席；此前那一整窗的 -1 同样可能是核致的，见 `InterruptReason::CoreUnresponsive` 的射程说明）；核侧日志见 target={SPEEDTEST_CORE_TARGET}",
                             watch.pid,
@@ -2098,7 +2378,7 @@ where
             // ── 让位②（在飞轮询）：**不依赖任何测量返回**，窗口全挂死时也照样醒 ──
             Err(_elapsed) => {
                 if superseded() {
-                    set.abort_all();
+                    set.shutdown().await;
                     return Some(InterruptReason::Superseded);
                 }
             }
@@ -2113,28 +2393,24 @@ where
 /// 与主核池路径 [`crate::commands::speedtest`] 的同名函数逐字同义 —— 两条腿的事件形状必须一致，
 /// 前端 `use-latency-store` / `NodesScreen` 只有一套消费逻辑。
 ///
-/// `latency == None` ⇒ 记 -1（**真实**不可测：超时 / 传输错）。「让位未测」的节点根本不会走到这里。
+/// 失败 ⇒ 记 -1（**真实**不可测，阶段与成因随事件带出）。「让位未测」的节点根本不会走到这里。
+/// 网络代次在本腿恒为未知：它只在主核运行期间计数。
 fn record_measured(
-    results: &mut serde_json::Map<String, Value>,
+    results: &mut RoundResults,
     progress: &mut RoundProgress,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     node_id: &str,
-    latency: Option<u32>,
+    measured: &Measured,
+    binding: Option<&Binding>,
 ) {
-    let latency_val = latency.map_or(-1_i64, i64::from);
-    if latency.is_none() {
-        log::debug!(
-            "临时核测速未取得有效延迟：nodeId={node_id}（可能为冷建链/复用请求超时、传输错误或测速端点非 2xx）"
-        );
+    if let Err(failure) = measured {
+        log::debug!("临时核测速未取得有效延迟：nodeId={node_id} {failure:?}");
     }
-    results.insert(node_id.to_string(), json!(latency_val));
-    emit(
-        EVENT_SPEED_TEST_RESULT,
-        json!({ "serverId": node_id, "latency": latency_val }),
-    );
+    results.insert(node_id.to_string(), *measured);
+    emit.result(NodeResult::new(node_id, measured, None, binding));
     // 计数与口径都由**轮**级的账持有（跨批累加、`total` 恒全局）：批级计数一旦出到事件里，
     // 前端会在每批测完那一帧收口（判据见 [`RoundProgress`]）。
-    progress.record(latency);
+    progress.record(measured);
     progress.emit_progress(emit);
 }
 
@@ -2177,6 +2453,10 @@ pub enum InterruptReason {
     /// 「核不再 listen / 已消失」那一类，抓不到「listen 着但线程全堵住」那一类；后者的证据由 A1 的
     /// 排空腿从根上消掉（那才是那条形态的根治），本腿是兜底而非替代。
     CoreUnresponsive,
+    /// 本轮经取消句柄被取消（[`SpeedTestCancel`]）。未出值的节点缺席，处置与让位相同。
+    Cancelled,
+    /// 更高优先级的请求到来，本轮被取消以让出单飞闸。不是节点失败。
+    Preempted,
 }
 
 impl InterruptReason {
@@ -2187,11 +2467,13 @@ impl InterruptReason {
             Self::Superseded => "superseded",
             Self::CoreExited => "core_exited",
             Self::CoreUnresponsive => "core_unresponsive",
+            Self::Cancelled => "cancelled",
+            Self::Preempted => "preempted",
         }
     }
 }
 
-/// 一轮测速的结果口径三分（供 [`log_speed_test_summary`]；纯函数，可单测）。
+/// 一轮测速的结果口径三分（纯函数，可单测）。
 ///
 /// **`-1` 与「缺席」是两件不同的事，混起来就没法排查**：
 /// - `ok`：真测出了值（毫秒 ≥ 0）；
@@ -2202,7 +2484,7 @@ impl InterruptReason {
 /// 下一步动作完全不同，见 [`InterruptReason`]。`None` = 本轮没被中断（`absent` 若非零，来源是波前
 /// 预筛那几类「起测即知不可测」，不是中断）。
 ///
-/// 非数值 / 越界的值一律计入 `failed`（宁可报多也不静默丢：这一层不该有非数值，出现即是缺陷信号）。
+/// Typed outcomes distinguish real failures from absent nodes; invalid wire values cannot enter.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SpeedTestSummary {
     pub ok: usize,
@@ -2213,15 +2495,12 @@ pub struct SpeedTestSummary {
 
 #[must_use]
 pub fn summarize_speed_test(
-    results: &serde_json::Map<String, Value>,
+    results: &RoundResults,
     intended: &[String],
     absent: usize,
     absent_reason: Option<InterruptReason>,
 ) -> SpeedTestSummary {
-    let ok = results
-        .values()
-        .filter(|v| v.as_i64().is_some_and(|ms| ms >= 0))
-        .count();
+    let ok = results.values().filter(|measured| measured.is_ok()).count();
     SpeedTestSummary {
         ok,
         failed: results.len() - ok,
@@ -2243,48 +2522,6 @@ impl SpeedTestSummary {
     }
 }
 
-/// 一轮测速的**结果级**日志（唯一出口，三条腿共用 —— 挂在 [`emit_speed_test_done`] 里）。
-///
-/// # 这条补的是什么洞
-///
-/// 本链此前**零结果级日志**：机器上只有「测速临时核已 spawn：126 个节点」和「已回收：
-/// outcome=completed」两行，中间什么都没有。陈先生 2026-08-02 报「全部测速全部显示 -1，跟实际不符」
-/// 时，磁盘上拿不出任何东西能分辨三种完全不同的成因 ——
-/// ① 网络真的全失败；② 本轮被让位/中断（节点根本没测，前端把**缺席**画成了 `-1`）；
-/// ③ 少数失败但 UI 全渲染成 `-1`。`latency` 又不落 `config.json`（纯渲染端 map），
-/// 事后无从复盘。汇总一行即可把三者分开。
-///
-/// 失败样本只带前 5 个 id：全量在 126 节点时是一行几 KB 的日志，而排查只需要「是不是集中在某一类」。
-fn log_speed_test_summary(
-    outcome: &str,
-    results: &serde_json::Map<String, Value>,
-    intended: &[String],
-    pending: &[&String],
-    reason: Option<InterruptReason>,
-) {
-    let s = summarize_speed_test(results, intended, pending.len(), reason);
-    let samples: Vec<&str> = results
-        .iter()
-        .filter(|(_, v)| !v.as_i64().is_some_and(|ms| ms >= 0))
-        .map(|(k, _)| k.as_str())
-        .take(5)
-        .collect();
-    let tail = if samples.is_empty() {
-        String::new()
-    } else {
-        format!("；失败样本 {}", samples.join(", "))
-    };
-    // 缺席成因进汇总行：此前这里只写「未测（让位或中断）N」，而那个「或」正是排查时要分开的那一刀。
-    let why = s.absent_reason.map_or("", InterruptReason::as_str);
-    log::info!(
-        "测速一轮完成：outcome={outcome}，reason={why}，请求 {}，成功 {}，超时/失败 {}，未测 {}{tail}",
-        intended.len(),
-        s.ok,
-        s.failed,
-        s.absent
-    );
-}
-
 /// 一轮测速的**终态事件**（[`EVENT_SPEED_TEST_DONE`]）——三条腿各自在**唯一出口**调一次。
 ///
 /// # 为什么放在这里、并且只有一个调用点/腿
@@ -2304,9 +2541,9 @@ fn log_speed_test_summary(
 /// 判据与「差集为什么必须由后端算 / 波前缺席的三类为什么不算 pending」见
 /// [`EVENT_SPEED_TEST_DONE`] 的常量文档。
 pub fn emit_speed_test_done(
-    emit: &mut (dyn FnMut(&str, Value) + Send),
+    emit: &mut dyn MeasurementEvents,
     outcome: &str,
-    results: &serde_json::Map<String, Value>,
+    results: &RoundResults,
     intended: &[String],
     reason: Option<InterruptReason>,
 ) {
@@ -2315,7 +2552,8 @@ pub fn emit_speed_test_done(
         .iter()
         .filter(|id| !results.contains_key(id.as_str()))
         .collect();
-    log_speed_test_summary(outcome, results, intended, &pending, reason);
+    // 口径自检（成功 + 失败 + 未测 = 请求数）留在这里；每轮汇总行由该轮的事件发布口出。
+    let _ = summarize_speed_test(results, intended, pending.len(), reason);
     let mut payload = json!({
         "outcome": outcome,
         "tested": results.len(),
@@ -2328,7 +2566,7 @@ pub fn emit_speed_test_done(
     if let Some(reason) = reason {
         payload["reason"] = Value::from(reason.as_str());
     }
-    emit(EVENT_SPEED_TEST_DONE, payload);
+    emit.emit(EVENT_SPEED_TEST_DONE, payload);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2337,6 +2575,7 @@ pub fn emit_speed_test_done(
 
 /// 临时核会话的注入依赖（生产 [`TempCoreDeps::production`]，测试注入 mock spawner / 假核路径）。
 pub struct TempCoreDeps {
+    pub expected_core_sha256: Option<String>,
     #[cfg(not(target_os = "android"))]
     pc_custody: Arc<PcTempCoreCustody>,
     /// 瞬态 sing-box spawn（复用 `tailscale_login_core` 的瞬态核进程抽象）。
@@ -2364,6 +2603,8 @@ pub struct TempCoreDeps {
     /// 生产恒 `None` 是本改动的**要点本身**：门是规模的函数，不再是一个常数。任何把它写成
     /// `Some(<定值>)` 的改动都会被 `production_ready_gate_is_scale_derived_not_a_constant` 拦下。
     pub ready_timeout_override_ms: Option<u64>,
+    /// 本轮运行的取消句柄。并入让位判据：命中后的处置与让位相同，只是终态的中断成因不同。
+    pub cancel: SpeedTestCancel,
 }
 
 impl TempCoreDeps {
@@ -2376,6 +2617,7 @@ impl TempCoreDeps {
         Self {
             #[cfg(not(target_os = "android"))]
             pc_custody: PC_TEMP_CORE_CUSTODY.clone(),
+            expected_core_sha256: None,
             spawner: Arc::new(TokioLoginCoreSpawner),
             checker: Arc::new(SingBoxConfigChecker),
             resolve_binary: Arc::new(crate::runtime::proxy::resolve_core_binary),
@@ -2392,7 +2634,20 @@ impl TempCoreDeps {
             }),
             log_level,
             ready_timeout_override_ms: None,
+            cancel: SpeedTestCancel::default(),
         }
+    }
+
+    /// 换上本轮运行的取消句柄（命令层在准入后调）。
+    #[must_use]
+    pub fn with_expected_core_sha256(mut self, digest: Option<String>) -> Self {
+        self.expected_core_sha256 = digest;
+        self
+    }
+
+    pub fn with_cancel(mut self, cancel: SpeedTestCancel) -> Self {
+        self.cancel = cancel;
+        self
     }
 }
 
@@ -2404,7 +2659,7 @@ pub enum TempCoreOutcome {
     SystemInterfaceRequired(String),
     /// 跑完了（可能部分节点 `-1` = 真实不可测）。`outcome` 同主核路径语义。
     Ran {
-        results: serde_json::Map<String, Value>,
+        results: RoundResults,
         outcome: &'static str,
     },
     /// 起核前/就绪前失败（解析不到核 / 端口分配失败 / 写配置失败 / spawn 失败 / 未就绪）。
@@ -2442,7 +2697,7 @@ enum BatchOutcome {
     SystemInterfaceRequired(String),
     /// 走到了测量阶段。载荷是**本批**的结果（可能部分节点真实 `-1`，也可能中途被中断 ——
     /// 成因已记进 [`RoundProgress`]，不在这里重复）。
-    Ran(serde_json::Map<String, Value>),
+    Ran(RoundResults),
     /// 起核前/就绪前失败 ⇒ **本批一个数值都不产出**，节点缺席（绝不写假 `-1`），后续批照跑。
     ///
     /// `oversized` = 本批规模越过 [`TEMP_CORE_READY_TIMEOUT_CAP_MS`]。分批之后它在生产上不可达
@@ -2456,13 +2711,35 @@ enum BatchOutcome {
     Superseded,
 }
 
+/// 轮出口的 outcome 与成因，**由同一处决定**（纯函数）。
+///
+/// 取消并入了让位判据：检查点只知道「该停了」，分不出是让位还是取消，所以检查点记下让位、而取消
+/// 句柄已置位时，成因以句柄为准。除此之外句柄不参与——一轮已经测完才被置位的取消不能把它改写成
+/// 「completed 却带成因」，核退出 / 核无响应也不被取消盖掉（那是排查线索）。
+fn round_exit(
+    interrupt: Option<InterruptReason>,
+    cancel: Option<InterruptReason>,
+    failed_batches: usize,
+) -> (&'static str, Option<InterruptReason>) {
+    let reason = match (interrupt, cancel) {
+        (Some(InterruptReason::Superseded), Some(cancel)) => Some(cancel),
+        (interrupt, _) => interrupt,
+    };
+    let outcome = if reason.is_some() || failed_batches > 0 {
+        "interrupted"
+    } else {
+        "completed"
+    };
+    (outcome, reason)
+}
+
 /// 一次临时核测速会话：分批 → 每批（起核 → 就绪门 → 编排 → **无条件**收尾）→ 一条终态事件。
 pub struct TempCoreSession;
 
 impl TempCoreSession {
     /// 跑一**轮**临时核测速：把可测集切成规模有界的批，逐批起一个自己的核，最后发**唯一**一条终态事件。
     ///
-    /// - `nodes`：[`plan_temp_core_with_bindings`] 裁出的可测节点（保序）；空 → 调用方不该进来（此处防御性返 `Ran` 空）。
+    /// - `nodes`：[`plan_temp_core_with_utls_policy`] 裁出的可测节点（保序）；空 → 调用方不该进来（此处防御性返 `Ran` 空）。
     /// - `superseded`：让位判据（生产 = [`is_temp_core_superseded`] 闭包，见模块文档）。
     /// - `measure`：按端口量 warm-TTFB（命令层注入，复用与主核路径**同一个**测量口径 ⇒ 两条腿的数值可比）。
     /// - `emit`：逐节点事件 + 心跳 + 终态（命令层注入 `AppHandle::emit`）。
@@ -2512,22 +2789,26 @@ impl TempCoreSession {
         nodes: &[TempNode],
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
     ) -> TempCoreOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         if nodes.is_empty() {
             return TempCoreOutcome::Ran {
-                results: serde_json::Map::new(),
+                results: RoundResults::new(),
                 outcome: "completed",
             };
         }
+        // 取消并入让位判据：起核前、在飞轮询、每节点测完这几处检查点因此都认它，
+        // 命中后同样停发新活、收掉在飞任务、按无条件收尾路径关核。
+        let superseded: &(dyn Fn() -> bool + Sync) =
+            &|| deps.cancel.reason().is_some() || superseded();
 
         let intended: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let mut progress = RoundProgress::new(nodes.len());
-        let mut results = serde_json::Map::new();
+        let mut results = RoundResults::new();
         // 「有没有任何一批走到过测量阶段」——终态事件发不发的判据（见函数文档）。
         let mut measured_any_batch = false;
         // 起核阶段失败的批：数量 + **第一条**诊断原文与它的成因分档（整轮零测量时，它就是失败
@@ -2622,12 +2903,8 @@ impl TempCoreSession {
             };
         }
         // 一批都没起成功时不发终态（同分批之前）；只要测过就必须发，且载荷是**轮**级口径。
-        let outcome = if progress.reason().is_some() || failed_batches > 0 {
-            "interrupted"
-        } else {
-            "completed"
-        };
-        emit_speed_test_done(emit, outcome, &results, &intended, progress.reason());
+        let (outcome, reason) = round_exit(progress.reason(), deps.cancel.reason(), failed_batches);
+        emit_speed_test_done(emit, outcome, &results, &intended, reason);
         TempCoreOutcome::Ran { results, outcome }
     }
 
@@ -2648,15 +2925,15 @@ impl TempCoreSession {
         nodes: &[TempNode],
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
         progress: &mut RoundProgress,
     ) -> BatchOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         if nodes.is_empty() {
-            return BatchOutcome::Ran(serde_json::Map::new());
+            return BatchOutcome::Ran(RoundResults::new());
         }
         // ── 让位（起核前）：主核已在跑/已跃迁 → 根本不起临时核（双会话从源头掐掉）──
         if superseded() {
@@ -2665,6 +2942,55 @@ impl TempCoreSession {
 
         #[cfg(not(target_os = "android"))]
         let _admission = deps.pc_custody.admission.lock().await;
+        #[cfg(not(target_os = "android"))]
+        let dispatch =
+            match polaris_core_supervisor::config_gate::with_check_producer_registration(|| {
+                let producer = Arc::new(PcTempBatchProducer::default());
+                deps.pc_custody
+                    .producers
+                    .lock()
+                    .map_err(|_| "Temp producer custody poisoned".to_owned())?
+                    .push(Arc::clone(&producer));
+                Ok::<_, String>(PcTempBatchDispatch(producer))
+            }) {
+                Ok(Ok(dispatch)) => dispatch,
+                Ok(Err(error)) => return BatchOutcome::CleanupUnknown(error),
+                Err(error) => return BatchOutcome::CleanupUnknown(error.to_string()),
+            };
+        let result = Self::run_admitted_batch(
+            deps,
+            nodes,
+            superseded,
+            measure,
+            emit,
+            progress,
+            #[cfg(not(target_os = "android"))]
+            &dispatch.0,
+        )
+        .await;
+        #[cfg(not(target_os = "android"))]
+        {
+            dispatch.0.finished.store(true, Ordering::SeqCst);
+            if let Err(error) = deps.pc_custody.prune_terminal() {
+                return BatchOutcome::CleanupUnknown(error);
+            }
+        }
+        result
+    }
+
+    async fn run_admitted_batch<Meas, MeasFut>(
+        deps: &TempCoreDeps,
+        nodes: &[TempNode],
+        superseded: &(dyn Fn() -> bool + Sync),
+        measure: Meas,
+        emit: &mut dyn MeasurementEvents,
+        progress: &mut RoundProgress,
+        #[cfg(not(target_os = "android"))] producer: &Arc<PcTempBatchProducer>,
+    ) -> BatchOutcome
+    where
+        Meas: Fn(u16) -> MeasFut,
+        MeasFut: Future<Output = Measured> + Send + 'static,
+    {
         #[cfg(not(target_os = "android"))]
         {
             if deps.pc_custody.closing.load(Ordering::SeqCst) {
@@ -2733,6 +3059,34 @@ impl TempCoreSession {
         // 而不是另读一次配置 —— 它就是本次真正下发给核的那一档（`temp_core_log_level` 的产出）。
         let keep_config = matches!(deps.log_level.as_str(), "debug" | "trace");
         let cfg = build_temp_core_config(nodes, &ports, &deps.log_level);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let tls_observation =
+            crate::runtime::tls_fingerprints::probe_cli_observation(&binary).await;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let tls_capabilities = match &tls_observation {
+            Ok(observation) => &observation.snapshot,
+            Err(snapshot) => snapshot.as_ref(),
+        };
+        #[cfg(target_os = "android")]
+        let tls_capabilities = crate::runtime::proxy::temp_tls_fingerprint_capabilities().await;
+        #[cfg(target_os = "ios")]
+        let tls_capabilities = crate::runtime::tls_fingerprints::Snapshot::unavailable(
+            "iOS temporary CLI is unavailable",
+        );
+        if deps.expected_core_sha256.is_some()
+            && deps.expected_core_sha256 != tls_capabilities.binary_sha256
+        {
+            return BatchOutcome::Failed {
+                detail: "Temporary-core bytes differ from the measurement identity".into(),
+                oversized: false,
+            };
+        }
+        if let Err(detail) = tls_capabilities.validate_config(&cfg) {
+            return BatchOutcome::Failed {
+                detail,
+                oversized: false,
+            };
+        }
         // Defense at the actual final config boundary, even for callers that bypass the planner.
         let system_tags: Vec<String> = cfg
             .get("endpoints")
@@ -2762,7 +3116,9 @@ impl TempCoreSession {
                 };
             }
         };
-        if let Err(e) = std::fs::write(&config_path, bytes) {
+        if let Err(e) = write_private_temp_config(&config_path, &bytes) {
+            // Secure writer removes only its exclusive stage on pre-publication failure.
+            // Never unlink a destination that may not belong to this operation.
             return BatchOutcome::Failed {
                 detail: format!("写测速临时核配置失败 {}: {e}", config_path.display()),
                 oversized: false,
@@ -2795,6 +3151,21 @@ impl TempCoreSession {
             };
         }
 
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(expected) = tls_capabilities.binary_sha256.as_deref() {
+            // Retain the exact proof returned by this probe across config-check awaits.
+            // Eviction from the four-entry shared cache is not a byte replacement.
+            if !tls_observation.as_ref().is_ok_and(|observation| {
+                observation.matches(&binary)
+                    && observation.snapshot.binary_sha256.as_deref() == Some(expected)
+            }) {
+                retire_temp_config(&config_path, keep_config);
+                return BatchOutcome::Failed {
+                    detail: "Core bytes changed after temporary-core validation".into(),
+                    oversized: false,
+                };
+            }
+        }
         // ── 两条流的去向写在请求里（**必填**，见 `StdioPolicy`）────────────────────────────
         //
         // # 这几行补的是全仓唯一一条「管道被 piped 却从不排空」的腿
@@ -2837,24 +3208,27 @@ impl TempCoreSession {
         #[cfg(not(target_os = "android"))]
         let native_bound = prepared.is_some();
         #[cfg(not(target_os = "android"))]
-        let spawned = match prepared {
-            Some(prepared) => {
-                let booked =
-                    match deps
-                        .pc_custody
-                        .book_native(&prepared, config_path.clone(), keep_config)
-                    {
+        let spawned = {
+            producer.factory_started.store(true, Ordering::SeqCst);
+            match prepared {
+                Some(prepared) => {
+                    let booked = match deps.pc_custody.book_native(
+                        &prepared,
+                        config_path.clone(),
+                        keep_config,
+                    ) {
                         Ok(booked) => booked,
                         Err(detail) => return BatchOutcome::CleanupUnknown(detail),
                     };
-                // The original slot takes config responsibility before any factory await/effect.
-                config_guard.armed = false;
-                booked
-                    .dispatch_native(deps.spawner.as_ref(), req, prepared)
-                    .await
-                    .map(|child| Box::new(child) as Box<dyn LoginCoreChild>)
+                    // The original slot takes config responsibility before any factory await/effect.
+                    config_guard.armed = false;
+                    booked
+                        .dispatch_native(deps.spawner.as_ref(), req, prepared)
+                        .await
+                        .map(|child| Box::new(child) as Box<dyn LoginCoreChild>)
+                }
+                None => deps.spawner.spawn(req).await,
             }
-            None => deps.spawner.spawn(req).await,
         };
         #[cfg(target_os = "android")]
         let spawned = deps.spawner.spawn(req).await;
@@ -2924,13 +3298,13 @@ impl TempCoreSession {
         naive_count: usize,
         superseded: &(dyn Fn() -> bool + Sync),
         measure: Meas,
-        emit: &mut (dyn FnMut(&str, Value) + Send),
+        emit: &mut dyn MeasurementEvents,
         progress: &mut RoundProgress,
         mut child: Box<dyn LoginCoreChild>,
     ) -> BatchOutcome
     where
         Meas: Fn(u16) -> MeasFut,
-        MeasFut: Future<Output = Option<u32>> + Send + 'static,
+        MeasFut: Future<Output = Measured> + Send + 'static,
     {
         let pid = child.pid().unwrap_or(0);
         // Desktop's persistent birth already owns its exclusion token. Android keeps its
@@ -2956,7 +3330,13 @@ impl TempCoreSession {
         let probe = Arc::clone(&deps.probe_port);
         let first_port = ports[0];
         let ready_deps = CoreReadyDeps {
-            is_alive: Box::new(move || pid == 0 || pid_alive(pid)),
+            observe_process: Box::new(move || {
+                if pid == 0 || pid_alive(pid) {
+                    polaris_core_supervisor::ChildObservation::Alive
+                } else {
+                    polaris_core_supervisor::ChildObservation::Exited
+                }
+            }),
             is_ready: Box::new(move || {
                 let probe = Arc::clone(&probe);
                 Box::pin(async move {
@@ -2978,8 +3358,13 @@ impl TempCoreSession {
             },
             &ready_deps,
         );
+        // `biased`：关核请求先于就绪结果判定。`select!` 默认随机挑先轮询的分支，而就绪探测
+        // 可能在第一次轮询时就已完成（探测跑在阻塞线程池里，线程被抢占一下就够）——
+        // 那时一个**起核途中就已被要求关闭**的批会有一半概率被当成就绪，走进测量再被打断，
+        // 结局从 `Superseded` 变成一条空的 `Ran`。
         #[cfg(not(target_os = "android"))]
         let ready = tokio::select! {
+            biased;
             () = deps.pc_custody.close_requested() => CoreReadyOutcome::Superseded,
             ready = ready => ready,
         };
@@ -3059,7 +3444,7 @@ impl TempCoreSession {
                 Some(measured) => measured,
                 None => {
                     progress.note_interrupt(InterruptReason::Superseded);
-                    (serde_json::Map::new(), "interrupted")
+                    (RoundResults::new(), "interrupted")
                 }
             }
             #[cfg(target_os = "android")]
@@ -3075,51 +3460,14 @@ impl TempCoreSession {
     }
 }
 
-/// 收尾处置临时配置。
-///
-/// - **常规档**：删掉，并顺手收掉上一次的留档。
-/// - **诊断档**（`debug` / `trace`）：改名成固定的 [`TEMP_CORE_LAST_CONFIG_NAME`] 留一份。
-///
-/// # 为什么诊断档要留、且留固定名
-///
-/// 排查临时核绕不开「这一轮到底给核喂了什么」——出站条数、有几条 `type:"naive"`、某个节点的形态。
-/// 而收尾是**无条件**删除，于是任何事后复盘都只能靠抢在删除前 `cp`（真机上抢不住）。用户已经把级别
-/// 拨到诊断档，就是在说「这次我要证据」，留一份配置正是最便宜的那份证据。
-///
-/// 固定名（覆盖式）而非带时间戳：理由同 [`TEMP_CORE_CONFIG_NAME`] —— 带时间戳会在 config 目录里越堆
-/// 越多，而排查只关心**最后一次**。改名而非复制：`rename` 是同目录内的元数据操作，不复制字节、不新增
-/// 失败面，且原路径当场消失（与「删掉」对下次运行的语义完全一致）。
+/// Q6: retain a sanitized diagnostic projection at the fixed last-config path.
+/// The raw runtime config is never renamed/copied into an archive. Retirement
+/// still occurs only at the existing lifecycle boundaries (including confirmed
+/// desktop close); this does not claim crash/startup cleanup or device acceptance.
 fn retire_temp_config(path: &std::path::Path, keep_for_diagnosis: bool) {
-    let kept = path.with_file_name(TEMP_CORE_LAST_CONFIG_NAME);
-    if keep_for_diagnosis {
-        match std::fs::rename(path, &kept) {
-            // 留档成功即收尾结束：原路径已经不在了，不需要再删一次。
-            Ok(()) => {
-                log::debug!("诊断档：测速临时核配置已留档 {}", kept.display());
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            // 改名失败（跨设备 / 权限 / 目标被占）→ 退回删除。留不下证据是可惜，留下一份**没被删掉的
-            // 活配置**才是真问题：这份文件里有全部被测节点的凭证（密码 / uuid / WG 私钥）。
-            Err(e) => log::warn!("留档测速临时核配置失败 {}: {e}（退回删除）", kept.display()),
-        }
-    } else {
-        // **非诊断档顺手收掉上一次的留档**（`NotFound` 即常态，忽略）。
-        //
-        // 留档里含**全部被测节点的凭证**（密码 / uuid / WG 私钥）。它与运行期配置的泄露等级相同，
-        // 但有一个决定性差别：`singbox-runtime.json` **有主**（核在跑就该在、停核换配置就被覆盖），
-        // 而这份**无主** —— 用户为排查把级别拨到 debug 跑一轮、随后拨回 info，这份带凭证的文件就
-        // 永远躺在 config 目录里，没有任何路径会再碰它。故把「回到非诊断档」当作它的回收点。
-        if let Err(e) = std::fs::remove_file(&kept) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("清理测速临时核留档失败 {}: {e}", kept.display());
-            }
-        }
-    }
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("删测速临时核配置失败 {}: {e}", path.display());
-        }
+    if let Err(error) = diagnostic::retire(path, keep_for_diagnosis) {
+        // Parser errors/custom values can contain credentials; log only the kind.
+        log::warn!("测速临时配置收尾/去凭据留档失败: {:?}", error.kind());
     }
 }
 

@@ -1,0 +1,215 @@
+#![cfg(not(any(target_os = "android", target_os = "ios")))]
+
+use super::*;
+use polaris_core_supervisor::{
+    classify_child_exit, ChildObservation, CoreReadyOutcome, ExitClassification,
+};
+
+fn install_observed_run(rt: &Arc<ProxyRuntime>) -> RunIdentity {
+    let run = DirectCoreRun::new(spawn_custody_stand_in());
+    let identity = run.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(run);
+    identity
+}
+
+#[tokio::test]
+async fn unknown_native_observation_reaches_real_readiness_without_releasing_child() {
+    let (rt, _dir) = test_runtime();
+    let identity = install_observed_run(&rt);
+    // Reserve a loopback port without listening. The first failed TCP probe
+    // must traverse startup's actual Child observation before API readiness.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let ready = observed.clone();
+    let done = release.clone();
+    let listener = tokio::spawn(async move {
+        ready.notified().await;
+        let listener = socket.listen(8).unwrap();
+        done.notified().await;
+        drop(listener);
+    });
+    rt.child
+        .lock()
+        .unwrap()
+        .inject_observation_wait_for_test(Box::new(move |_| {
+            observed.notify_one();
+            Err(std::io::Error::other("injected transient try_wait error"))
+        }));
+    assert_eq!(
+        rt.wait_ready(port, rt.gate.generation(), 1_000).await,
+        CoreReadyOutcome::Ready
+    );
+    let observation = rt.child.lock().unwrap().observe_running(&identity);
+    assert_eq!(observation, ChildObservation::Unknown);
+    assert_eq!(
+        classify_child_exit(1, 1, observation),
+        ExitClassification::KeepWatching
+    );
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    // Real cleanup remains possible; Unknown never extracted or killed custody.
+    release.notify_one();
+    listener.await.unwrap();
+    rt.kill_core().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_unknown_is_bounded_timeout_and_preserves_custody_until_stop() {
+    let (rt, _dir) = test_runtime();
+    let identity = install_observed_run(&rt);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    rt.child
+        .lock()
+        .unwrap()
+        .inject_observation_wait_for_test(Box::new(|_| {
+            Err(std::io::Error::other("persistent unknown"))
+        }));
+    assert_eq!(
+        rt.wait_ready(port, rt.gate.generation(), 100).await,
+        CoreReadyOutcome::Timeout
+    );
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    rt.kill_core().await.unwrap();
+}
+
+#[tokio::test]
+async fn generation_takeover_during_unknown_is_superseded_and_keeps_the_run() {
+    let (rt, _dir) = test_runtime();
+    let identity = install_observed_run(&rt);
+    let generation = rt.gate.generation();
+    let gate = rt.gate.clone();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    rt.child
+        .lock()
+        .unwrap()
+        .inject_observation_wait_for_test(Box::new(move |_| {
+            gate.bump_generation();
+            Err(std::io::Error::other("observation raced Stop/new Start"))
+        }));
+    assert_eq!(
+        rt.wait_ready(port, generation, 100).await,
+        CoreReadyOutcome::Superseded
+    );
+    assert!(rt.child.lock().unwrap().running_matches(&identity));
+    rt.kill_core().await.unwrap();
+}
+
+#[tokio::test]
+async fn confirmed_exit_remains_dead_and_absent_run_yields_to_owner() {
+    let (rt, _dir) = test_runtime();
+    install_observed_run(&rt);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    rt.child
+        .lock()
+        .unwrap()
+        .inject_observation_wait_for_test(Box::new(|_| {
+            #[cfg(unix)]
+            use std::os::unix::process::ExitStatusExt;
+            #[cfg(windows)]
+            use std::os::windows::process::ExitStatusExt;
+            Ok(Some(std::process::ExitStatus::from_raw(0)))
+        }));
+    assert_eq!(
+        rt.wait_ready(port, rt.gate.generation(), 100).await,
+        CoreReadyOutcome::Dead
+    );
+    rt.kill_core().await.unwrap();
+    assert_eq!(
+        rt.wait_ready(port, rt.gate.generation(), 100).await,
+        CoreReadyOutcome::Superseded
+    );
+}
+
+#[tokio::test]
+async fn direct_capability_bytes_require_retained_run_and_replaced_files_do_not_become_running_bytes(
+) {
+    let (rt, dir) = test_runtime();
+    let path = dir.join("proof-core");
+    std::fs::write(&path, b"unexecutable old-core identity fixture").unwrap();
+    // Even an old core with no report has a proven file digest.
+    let proof = crate::runtime::tls_fingerprints::probe_cli_observation(&path)
+        .await
+        .unwrap();
+    let snapshot = proof.snapshot.clone();
+    let identity = install_observed_run(&rt);
+    let generation = rt.core_generation();
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, identity.clone(), proof.clone()));
+    assert_eq!(
+        rt.direct_tls_snapshot(generation).binary_sha256,
+        snapshot.binary_sha256
+    );
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, RunIdentity::new(), proof.clone()));
+    assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
+    *rt.captured_cli_run.lock().unwrap() = Some((generation, identity.clone(), proof.clone()));
+    let replacement = dir.join("next-core");
+    std::fs::write(&replacement, b"unexecutable new-core identity fixture").unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(rt.direct_tls_snapshot(generation).binary_sha256.is_none());
+    rt.captured_cli_run.lock().unwrap().take();
+    let mut run = rt
+        .child
+        .lock()
+        .unwrap()
+        .take_running_legacy()
+        .unwrap()
+        .expect("the retained direct child must remain owned for cleanup");
+    let child = run.child_for_test();
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_measurements_invalidate_when_actual_selected_source_is_replaced_or_changed() {
+    let (rt, dir) = test_runtime();
+    let path = dir.join("temp-proof-core");
+    std::fs::write(&path, b"not executable A").unwrap();
+    *rt.core_binary_override.lock().unwrap() = Some(path.clone());
+    let (observed, proof) = rt.tls_fingerprint_capabilities_observed().await;
+    assert!(proof.is_some());
+    for index in 0..4 {
+        let other = dir.join(format!("measurement-cache-pressure-{index}"));
+        std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+        assert!(crate::runtime::tls_fingerprints::probe_cli(&other)
+            .await
+            .binary_sha256
+            .is_some());
+    }
+    assert!(crate::runtime::tls_fingerprints::cached_cli(&path).is_none());
+    // Acquisition uses the existing full resolver. Ledger reads must never
+    // re-enter it (production does core+sidecar content hashing there).
+    assert_eq!(rt.core_binary_for_start().unwrap(), path);
+    let resolution_calls = rt.core_binary_resolution_calls.load(Ordering::SeqCst);
+    rt.remember_temp_core_sha256(observed.binary_sha256.clone(), proof);
+    for _ in 0..64 {
+        assert_eq!(rt.measurement_core_sha256(), observed.binary_sha256);
+    }
+    assert_eq!(
+        rt.core_binary_resolution_calls.load(Ordering::SeqCst),
+        resolution_calls
+    );
+    let next = dir.join("next-core");
+    std::fs::write(&next, b"not executable B").unwrap();
+    *rt.core_binary_override.lock().unwrap() = Some(next.clone());
+    assert!(
+        rt.measurement_core_sha256().is_none(),
+        "source selection changes invalidate old results immediately"
+    );
+    *rt.core_binary_override.lock().unwrap() = Some(path.clone());
+    std::fs::rename(&next, &path).unwrap();
+    assert!(
+        rt.measurement_core_sha256().is_none(),
+        "same-path replacement does not reuse the previous measurement hash"
+    );
+    assert_eq!(
+        rt.core_binary_resolution_calls.load(Ordering::SeqCst),
+        resolution_calls
+    );
+}

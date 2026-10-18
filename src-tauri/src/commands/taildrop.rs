@@ -748,56 +748,84 @@ pub fn taildrop_task_cancel(
     })
 }
 
-/// 取件：把收件箱里的一个文件写到用户选定的路径。
-///
-/// # 为什么先写 `.part` 再改名
-///
-/// 下载流**不重连**（见 [`SingBoxApiClient::download_taildrop_file`]）：中途断开会让已写出的字节
-/// 成为半截文件。直接写目标路径的话，用户在文件管理器里看到的是一个大小对不上、却完全像回事的
-/// 文件；写 `.part` + 成功才改名，则失败路径上目标位置**从来没有出现过**这个名字。
-/// 临时文件与目标**同目录**（同卷），改名才是原子的；失败路径必删。
+/// Each save owns an exclusively created sibling. Drop closes its handle before cleanup,
+/// including when the download future is cancelled or publication fails on Windows.
+struct TaildropStagedFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    published: bool,
+}
+
+impl TaildropStagedFile {
+    fn create(dest: &std::path::Path) -> std::io::Result<Self> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let parent = dest.parent().unwrap_or_else(|| std::path::Path::new("."));
+        loop {
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = parent.join(format!(".taildrop-{}-{seq}.part", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        published: false,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn publish(mut self, dest: &std::path::Path) -> std::io::Result<()> {
+        drop(self.file.take());
+        std::fs::rename(&self.path, dest)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for TaildropStagedFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Stream into an exclusive sibling, then publish atomically. Neither an existing `.part`
+/// neighbour nor another in-flight save is ever opened or truncated.
 async fn write_stream_to(
     mut stream: TaildropDownload,
     dest: &std::path::Path,
 ) -> std::io::Result<u64> {
     use std::io::Write;
 
-    let part = dest.with_extension(format!(
-        "{}part",
-        dest.extension()
-            .map(|e| format!("{}.", e.to_string_lossy()))
-            .unwrap_or_default()
-    ));
-    let mut file = std::fs::File::create(&part)?;
+    let mut staged = TaildropStagedFile::create(dest)?;
+    let file = staged
+        .file
+        .as_mut()
+        .expect("unpublished stage owns its file");
     let mut written = 0u64;
-    let outcome = async {
-        // 首帧只带 size（总字节、data 空）—— 把它当数据块写进去会在文件头多出内容。
-        while let Some(chunk) = stream
-            .message()
-            .await
-            .map_err(|e| std::io::Error::other(format!("DownloadTaildropFile stream: {e}")))?
-        {
-            if chunk.data.is_empty() {
-                continue;
-            }
-            file.write_all(&chunk.data)?;
-            written += chunk.data.len() as u64;
+    while let Some(chunk) = stream
+        .message()
+        .await
+        .map_err(|e| std::io::Error::other(format!("DownloadTaildropFile stream: {e}")))?
+    {
+        if chunk.data.is_empty() {
+            continue;
         }
-        file.flush()?;
-        Ok::<(), std::io::Error>(())
+        file.write_all(&chunk.data)?;
+        written += chunk.data.len() as u64;
     }
-    .await;
-    drop(file);
-    match outcome {
-        Ok(()) => {
-            std::fs::rename(&part, dest)?;
-            Ok(written)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&part);
-            Err(e)
-        }
-    }
+    file.flush()?;
+    staged.publish(dest)?;
+    Ok(written)
 }
 
 /// 取件结果。`canceled` = 用户在原生保存框里按了取消（**不是错误**）。

@@ -14,6 +14,7 @@ mod capacity;
 #[cfg(unix)]
 mod config_checker_process;
 mod process_exit;
+mod stale;
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};

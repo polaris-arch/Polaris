@@ -10,7 +10,7 @@ use crate::builder::outbound_helpers::{
 };
 use crate::singbox::{
     DomainResolver, Ech, Hysteria2Obfs, Multiplex, OneOrMany, Outbound, OutboundTls, Reality,
-    Transport, Utls,
+    Transport,
 };
 use crate::user_config::normalize::normalize_token;
 use crate::user_config::protocol_settings::custom_outbound_type;
@@ -609,26 +609,17 @@ pub fn build_proxy_outbound(
             ob.tls.as_mut().unwrap().engine = tls_engine.map(String::from);
         }
 
-        // uTLS fingerprint（非 QUIC）。消费点归一（理由同 flow：绕过 serde 的字段赋值兜底）。
-        // 未归一的 `"Chrome"` / `"NONE"` 会让 sing-box `unknown uTLS fingerprint` FATAL；
-        // 尤其 `"None"` 本意是禁用 utls，不归一则反而下发非法指纹 → 核起不来。
-        let fingerprint = server
-            .tls_settings
-            .as_ref()
-            .and_then(|t| t.fingerprint.as_deref())
-            .and_then(normalize_token);
-        let final_fp = fingerprint.unwrap_or_else(|| {
-            if server.protocol == Protocol::Vless || server.protocol == Protocol::Anytls {
-                "chrome".to_string()
-            } else {
-                "none".to_string()
-            }
-        });
-        if !is_quic_managed_tls(&protocol) && final_fp != "none" {
-            ob.tls.as_mut().unwrap().utls = Some(Utls {
-                enabled: true,
-                fingerprint: final_fp,
-            });
+        if !is_quic_managed_tls(&protocol) {
+            let tls = server.tls_settings.as_ref();
+            ob.tls.as_mut().unwrap().utls = crate::user_config::utls::node_utls(
+                tls.and_then(|t| t.utls_mode),
+                tls.and_then(|t| t.fingerprint.as_deref()),
+                if matches!(server.protocol, Protocol::Vless | Protocol::Anytls) {
+                    "chrome"
+                } else {
+                    "none"
+                },
+            );
         }
     }
 
@@ -681,15 +672,14 @@ pub fn build_proxy_outbound(
                 engine: None,
                 spoof: None,
                 spoof_method: None,
-                utls: Some(Utls {
-                    enabled: true,
-                    fingerprint: server
+                utls: crate::user_config::utls::node_utls(
+                    server.tls_settings.as_ref().and_then(|t| t.utls_mode),
+                    server
                         .tls_settings
                         .as_ref()
-                        .and_then(|t| t.fingerprint.as_deref())
-                        .and_then(normalize_token)
-                        .unwrap_or_else(|| "chrome".into()),
-                }),
+                        .and_then(|t| t.fingerprint.as_deref()),
+                    "chrome",
+                ),
                 reality: Some(Reality {
                     enabled: true,
                     public_key: r.public_key.clone(),

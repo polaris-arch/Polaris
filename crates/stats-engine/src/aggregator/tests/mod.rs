@@ -1549,3 +1549,112 @@ fn aggregate与detail是同一张表的两种投影() {
     assert_eq!(topo.at, 42);
     assert_eq!(agg.snapshot().active_connections as usize, detail.len());
 }
+
+#[test]
+fn repeated_evictions_keep_recent_connections_in_order() {
+    let mut agg = StatsAggregator::with_max_conn_map_size(2);
+    for (id, evicted) in [("A", None), ("B", None), ("C", Some("A")), ("D", Some("B"))] {
+        let change = agg.on_connection_events(
+            &SingBoxConnectionEvents {
+                events: vec![new_ev(id)],
+                ..Default::default()
+            },
+            0,
+        );
+        if let Some(evicted) = evicted {
+            assert!(change.removed_ids.contains(evicted));
+        } else {
+            assert!(change.removed_ids.is_empty());
+        }
+    }
+    assert_eq!(
+        agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["C", "D"]
+    );
+    assert_eq!(agg.conn_count(), 2);
+}
+
+#[test]
+fn close_keeps_remaining_recency_for_later_eviction() {
+    let mut agg = StatsAggregator::with_max_conn_map_size(3);
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![new_ev("A"), new_ev("B"), new_ev("C")],
+            ..Default::default()
+        },
+        0,
+    );
+    let closed = agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::Closed,
+                id: "A".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        0,
+    );
+    assert!(closed.removed_ids.contains("A"));
+    let change = agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![new_ev("D"), new_ev("E")],
+            ..Default::default()
+        },
+        0,
+    );
+    assert!(change.removed_ids.contains("B"));
+    assert_eq!(
+        agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["C", "D", "E"]
+    );
+}
+
+#[test]
+fn update_recency_survives_repeated_eviction_and_bulk_reset() {
+    let mut agg = StatsAggregator::with_max_conn_map_size(2);
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![new_ev("A"), new_ev("B")],
+            ..Default::default()
+        },
+        0,
+    );
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            events: vec![SingBoxConnectionEvent {
+                kind: ConnectionEventType::Update,
+                id: "A".into(),
+                uplink_delta: 7,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        0,
+    );
+    for (id, evicted) in [("C", "B"), ("D", "A")] {
+        let change = agg.on_connection_events(
+            &SingBoxConnectionEvents {
+                events: vec![new_ev(id)],
+                ..Default::default()
+            },
+            0,
+        );
+        assert!(change.removed_ids.contains(evicted));
+    }
+    assert_eq!(
+        agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["C", "D"]
+    );
+    agg.on_connection_events(
+        &SingBoxConnectionEvents {
+            reset: true,
+            events: vec![new_ev("W"), new_ev("X"), new_ev("Y"), new_ev("Z")],
+        },
+        0,
+    );
+    assert_eq!(
+        agg.conn_map.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["Y", "Z"]
+    );
+}

@@ -10,6 +10,44 @@
 
 use std::collections::HashMap;
 
+/// Service argv has an exact allowlist. Retired source/config flags and malformed
+/// frames must fail before a daemon opens its socket or changes network state.
+pub fn validate_flags(
+    argv: &[String],
+    values: &[&str],
+    booleans: &[&str],
+) -> Result<(), &'static str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens = argv.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        let key = token
+            .strip_prefix("--")
+            .or_else(|| token.strip_prefix('-'))
+            .ok_or("unexpected daemon argument")?;
+        let (key, inline) = key
+            .split_once('=')
+            .map_or((key, None), |(key, value)| (key, Some(value)));
+        if key.is_empty() || !seen.insert(key) {
+            return Err("duplicate or empty daemon flag");
+        }
+        if booleans.contains(&key) {
+            if inline.is_some() {
+                return Err("boolean daemon flag has a value");
+            }
+        } else if values.contains(&key) {
+            let value = inline
+                .or_else(|| tokens.next().map(String::as_str))
+                .ok_or("missing daemon flag value")?;
+            if value.is_empty() || value.starts_with('-') || value.contains(['\0', '\n', '\r']) {
+                return Err("invalid daemon flag value");
+            }
+        } else {
+            return Err("unknown or retired daemon flag");
+        }
+    }
+    Ok(())
+}
+
 /// 解析 daemon flag：`--key value` / `-key value` / `--key=value` / 布尔 `--flag`。
 ///
 /// - `argv` 应含 argv\[0]（程序名，内部跳过），与 [`std::env::args`] 直接对接。

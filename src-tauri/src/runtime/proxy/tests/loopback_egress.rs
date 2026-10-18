@@ -215,7 +215,8 @@ fn runtime_local_http_proxy_follows_the_running_snapshot() {
         rt.local_http_proxy(),
         Some(LocalHttpProxy {
             port: 31002,
-            auth: Some(auth.clone())
+            auth: Some(auth.clone()),
+            inbound: LocalInbound::ProbeProxy,
         })
     );
     assert_eq!(rt.loopback_auth(), Some(auth));
@@ -226,7 +227,8 @@ fn runtime_local_http_proxy_follows_the_running_snapshot() {
         rt.local_http_proxy(),
         Some(LocalHttpProxy {
             port: 7890,
-            auth: None
+            auth: None,
+            inbound: LocalInbound::Mixed,
         })
     );
 }
@@ -260,7 +262,7 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "src-tauri/src/runtime/speedtest_tunnel.rs",
-        "open_tunnel",
+        "open_tunnel_with_tls_config",
         Some("connect_request(auth)"),
         "测速 CONNECT 隧道（probe-in-k / probe-proxy-in / mixed / 临时核入站）",
     ),
@@ -284,9 +286,9 @@ const PRIMITIVE_REGISTRY: &[(&str, &str, Option<&str>, &str)] = &[
     ),
     (
         "crates/singbox-grpc/src/h2c.rs",
-        "call",
+        "connect_h2c",
         None,
-        "管理 API gRPC 传输（带 secret 的管理口，不是代理入站）",
+        "管理 API gRPC 传输的生产拨号器（带 secret 的管理口，不是代理入站）",
     ),
 ];
 
@@ -295,7 +297,10 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
     ("via_local_proxy", 1),
     ("via_local_socks_proxy", 1),
     ("measure_via_local_proxy", 1),
+    ("measure_inbound", 3),
+    ("measure_slot", 3),
     ("open_tunnel", 1),
+    ("open_tunnel_with_tls_config", 1),
     ("probe_through_proxy", 1),
     ("probe_proxy_connectivity", 1),
 ];
@@ -303,7 +308,7 @@ const CREDENTIALED_CALLEES: &[(&str, usize)] = &[
 /// 允许凭据实参为字面 `None` 的生产调用点：(路径, 折叠空白后的调用原文, 理由)。
 const NONE_AUTH_ALLOWED: &[(&str, &str, &str)] = &[(
     "src-tauri/src/commands/speedtest.rs",
-    "measure_via_local_proxy(port, None, &url)",
+    "measure_via_local_proxy(port, None, &url, &|_| {})",
     "临时核腿：临时核自建的 `in-<tag>` 入站零认证（`build_temp_core_config`），且临时核只在桌面跑\
      （Android 核在进程内，没有可 spawn 的临时核二进制）。",
 )];

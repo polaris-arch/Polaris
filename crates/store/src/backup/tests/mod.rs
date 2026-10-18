@@ -349,6 +349,78 @@ fn pick_dns_resources_without_rules_is_supported() {
 }
 
 #[test]
+fn dns_backup_round_trips_real_query_fallback_with_both_dns_categories() {
+    for category in [C::DnsResources, C::DnsRules] {
+        for action in [
+            json!({"type":"server","serverId":"dns-custom"}),
+            json!({"type":"reject","method":"default"}),
+            json!({"type":"reject","method":"drop"}),
+        ] {
+            let mut source = cfg();
+            source["dnsDefaults"]["realQueryFallbackAction"] = action.clone();
+            let backup = pick_categories(&source, &[category]);
+            assert_eq!(backup["dnsDefaults"]["realQueryFallbackAction"], action);
+            let mut target = cfg();
+            target["dnsDefaults"]["realQueryFallbackAction"] =
+                json!({"type":"server","serverId":"builtin-remote"});
+            let restored = merge_categories(&target, &backup, &[category]);
+            assert!(restored.conflicts.is_empty());
+            assert_eq!(
+                restored.config["dnsDefaults"]["realQueryFallbackAction"],
+                action
+            );
+            assert_eq!(restored.config["trafficRules"], target["trafficRules"]);
+        }
+    }
+}
+
+#[test]
+fn old_dns_backup_materializes_domestic_real_query_fallback_on_restore() {
+    let backup = pick_categories(&cfg(), &[C::DnsResources]);
+    assert!(backup["dnsDefaults"]
+        .get("realQueryFallbackAction")
+        .is_none());
+    let current = crate::default_config();
+    let restored = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    let saved = crate::ConfigStore::canonicalize_for_save(&restored.config).unwrap();
+    assert_eq!(
+        saved["dnsDefaults"]["realQueryFallbackAction"],
+        restored.config["dnsDefaults"]["realQueryFallbackAction"]
+    );
+}
+
+#[test]
+fn restoring_other_categories_preserves_current_real_query_fallback() {
+    let mut current = cfg();
+    current["dnsDefaults"]["realQueryFallbackAction"] = json!({"type":"reject","method":"drop"});
+    let mut incoming = cfg();
+    incoming["dnsDefaults"]["realQueryFallbackAction"] =
+        json!({"type":"server","serverId":"builtin-remote"});
+    for category in [C::GeneralSettings, C::CustomRules, C::ManualNodes] {
+        let restored = merge_categories(&current, &incoming, &[category]);
+        assert_eq!(restored.config["dnsDefaults"], current["dnsDefaults"]);
+    }
+}
+
+#[test]
+fn backup_restore_preserves_invalid_explicit_fallback_for_write_validation() {
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    let invalid = json!({"type":"future-action"});
+    backup["dnsDefaults"]["realQueryFallbackAction"] = invalid.clone();
+    let restored = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        invalid
+    );
+    let error = crate::ConfigStore::canonicalize_for_save(&restored.config).unwrap_err();
+    assert!(error.to_string().contains("realQueryFallbackAction"));
+}
+
+#[test]
 fn general_settings_excludes_policy_and_dns_data() {
     let out = pick_categories(&cfg(), &[C::GeneralSettings]);
     for key in [
@@ -494,20 +566,18 @@ fn merge_subscriptions_empty_is_skipped() {
 }
 
 #[test]
-fn merge_custom_rules_family_replaced_together() {
+fn merge_traffic_rules_preserves_shared_tables_when_dns_is_retained() {
     let current = cfg();
     let backup = json!({ "customRules": [{ "id": "nr1", "type": "domain" }] });
     let out = merge_categories(&current, &backup, &[C::CustomRules]);
     assert_eq!(out.config["customRules"][0]["id"], json!("nr1"));
     assert_eq!(
-        out.config["customRuleSets"],
-        json!([]),
-        "同族整类替换（备份无 → 置空）"
+        out.config["customRuleSets"], current["customRuleSets"],
+        "未选 DNS 平面的共享规则集必须保留"
     );
     assert_eq!(
-        out.config["ruleResources"],
-        json!([]),
-        "同族整类替换（备份无 → 置空）"
+        out.config["ruleResources"], current["ruleResources"],
+        "未选 DNS 平面的共享资源必须保留"
     );
     assert_eq!(out.config["policyRules"][0]["id"], json!("nr1"));
     assert_eq!(out.config["customRules"], out.config["policyRules"]);
@@ -533,8 +603,14 @@ fn merge_v2_dns_rules_and_dns_resources_together() {
     assert_eq!(out.config["dnsRules"][0]["id"], json!("dns-only"));
     assert_eq!(out.config["dnsRuleOrder"], json!(["dns-only"]));
     assert_eq!(out.config["trafficRules"][0]["id"], json!("r1"));
-    assert_eq!(out.config["customRuleSets"][0]["id"], json!("dns-rs"));
-    assert_eq!(out.config["ruleResources"][0]["id"], json!("dns-res"));
+    assert_eq!(
+        out.config["customRuleSets"],
+        json!([{"id":"rs1"}, {"id":"dns-rs"}])
+    );
+    assert_eq!(
+        out.config["ruleResources"],
+        json!([{"id":"res1"}, {"id":"dns-res"}])
+    );
     assert_eq!(out.config["dnsServers"][0]["id"], json!("dns-new"));
     assert_eq!(
         out.config["dnsDefaults"]["directServerId"],
@@ -573,7 +649,10 @@ fn merge_custom_rules_via_rule_sets_only() {
     let backup = json!({ "customRuleSets": [{ "id": "nrs1" }] });
     let out = merge_categories(&current, &backup, &[C::CustomRules]);
     assert_eq!(out.config["customRules"], json!([]));
-    assert_eq!(out.config["customRuleSets"][0]["id"], json!("nrs1"));
+    assert_eq!(
+        out.config["customRuleSets"],
+        json!([{"id":"rs1"}, {"id":"nrs1"}])
+    );
     assert!(out.skipped.is_empty());
 }
 
@@ -635,7 +714,10 @@ fn skipped_traffic_rules_still_import_explicit_dns_rule_dependencies() {
     assert_eq!(out.skipped, vec![C::CustomRules]);
     assert_eq!(out.config["trafficRules"], current["trafficRules"]);
     assert_eq!(out.config["dnsRules"][0]["id"], json!("dns-imported"));
-    assert_eq!(out.config["ruleResources"][0]["id"], json!("dns-resource"));
+    assert_eq!(
+        out.config["ruleResources"],
+        json!([{"id":"res1"}, {"id":"dns-resource"}])
+    );
 }
 
 #[test]
@@ -1233,14 +1315,25 @@ fn network_profiles_export_all_when_any_rule_category_selected() {
     );
 }
 
-/// 导入按 id 合并：同 id 以备份为准，current 里其余场景保留，新 id 追加。
+/// 双规则平面完整导入按 id 合并；单平面必须拒绝改变另一个平面的共享依赖。
 /// 牙：合并改成整表替换 → np-local 丢失 ⇒ 转红。
 #[test]
 fn network_profiles_import_merges_by_id() {
     let mut current = cfg();
     current["networkProfiles"] = json!([profile("np-traffic", "old"), profile("np-local", "keep")]);
     let backup = pick_categories(&with_scoped_rules(), &[C::CustomRules, C::DnsRules]);
-    let merged = merge_categories(&current, &backup, &[C::CustomRules]).config;
+    let partial = merge_categories(&current, &backup, &[C::CustomRules]);
+    assert_eq!(
+        partial.config, current,
+        "a partial restore must preserve the unselected plane"
+    );
+    assert!(partial
+        .conflicts
+        .iter()
+        .any(|c| c == "networkProfiles:np-traffic"));
+    let complete = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert!(complete.conflicts.is_empty());
+    let merged = complete.config;
     let got: Vec<(String, String)> = merged["networkProfiles"]
         .as_array()
         .unwrap()
@@ -1322,4 +1415,288 @@ fn explicit_backup_retains_node_owned_inactive_credential_and_replace_drops_old_
     let summary = serde_json::to_string(&build_backup_info(&parsed.config, 0)).unwrap();
     assert!(!summary.contains("legal-backup-sentinel"));
     assert!(!summary.contains("retainedAuthKey"));
+}
+
+/// 周期测速的五个键经备份导出再恢复后逐字段相同：逐订阅的两个随订阅对象整体带出，
+/// 顶层的三个属于通用设置。
+#[test]
+fn periodic_speed_test_settings_survive_export_and_restore() {
+    let source = json!({
+        "servers": [],
+        "subscriptions": [
+            { "id": "s1", "name": "one", "url": "https://a.example/x",
+              "periodicSpeedTest": true, "speedTestIntervalMinutes": 45 },
+            { "id": "s2", "name": "two", "url": "https://b.example/x",
+              "periodicSpeedTest": false },
+        ],
+        "periodicSpeedTestEnabled": false,
+        "speedTestConcurrency": 8,
+        "speedTestMeteredPolicy": "pause",
+    });
+    let selected = [C::Subscriptions, C::GeneralSettings];
+    let exported = pick_categories(&source, &selected);
+    let empty = json!({ "servers": [], "subscriptions": [] });
+    let mut restored = merge_categories(&empty, &exported, &selected).config;
+    crate::sanitize::sanitize_value_in_place_pub(&mut restored);
+    for key in [
+        "subscriptions",
+        "periodicSpeedTestEnabled",
+        "speedTestConcurrency",
+        "speedTestMeteredPolicy",
+    ] {
+        assert_eq!(restored[key], source[key], "{key}");
+    }
+}
+
+/// 选择意图的归类跟随 `selectedServerId`：不导出、不随通用设置导入。带意图的配置导出全部类别
+/// 再恢复到自身，逐字段相同；恢复到别处时意图不被带过去；导入把意图指向的订阅整类替换掉之后，
+/// 意图被移除。
+#[test]
+fn the_selection_intent_follows_the_selected_server_through_backup() {
+    let intent = crate::selection_intent_auto("s1");
+    let source = json!({
+        "servers": [{ "id": "n1", "subscriptionId": "s1" }],
+        "subscriptions": [{ "id": "s1", "name": "one", "url": "https://a.example/x" }],
+        "selectedServerId": "n1",
+        "selectionIntent": intent,
+        "logLevel": "info",
+    });
+    let exported = pick_categories(&source, &BACKUP_CATEGORIES);
+    assert!(
+        exported.get("selectionIntent").is_none(),
+        "意图不进备份文件"
+    );
+    assert!(exported.get("selectedServerId").is_none());
+
+    let restored = merge_categories(&source, &exported, &BACKUP_CATEGORIES).config;
+    assert_eq!(restored, source, "导出再恢复到自身逐字段相同");
+
+    // 恢复到另一份配置：对方的意图（这里是手动）不被备份改写。
+    let elsewhere = json!({ "servers": [], "subscriptions": [], "selectedServerId": null });
+    let merged = merge_categories(&elsewhere, &exported, &BACKUP_CATEGORIES).config;
+    assert!(merged.get("selectionIntent").is_none());
+
+    // 导入别处的订阅类，把本机意图指向的订阅整类替换掉：意图移除，选中节点归零。
+    let foreign = json!({
+        "servers": [{ "id": "x1", "subscriptionId": "sx" }],
+        "subscriptions": [{ "id": "sx", "name": "x", "url": "https://x.example/x" }],
+    });
+    let replaced = merge_categories(&source, &foreign, &[C::Subscriptions]).config;
+    assert!(replaced.get("selectionIntent").is_none());
+    assert_eq!(replaced["selectedServerId"], Value::Null);
+    // 对照：只导入通用设置，订阅还在，意图保留。
+    let general = merge_categories(
+        &source,
+        &json!({ "logLevel": "debug" }),
+        &[C::GeneralSettings],
+    );
+    assert_eq!(general.config["selectionIntent"], source["selectionIntent"]);
+    assert_eq!(general.config["logLevel"], "debug");
+}
+
+fn shared_dependency_config(prefix: &str) -> Value {
+    let resource_id = format!("{prefix}-resource");
+    let set_id = format!("{prefix}-set");
+    json!({
+        "servers": [], "configSchemaVersion": 4,
+        "trafficRules": [{
+            "id": format!("{prefix}-traffic"), "type": "ruleSet", "values": [format!("res:{resource_id}")],
+            "enabled": true, "action": "direct",
+            "conditions": [{"type": "ruleSet", "values": [format!("res:{resource_id}")]}],
+            "effects": {"route": {"enabled": true, "action": "direct"}}
+        }],
+        "dnsRules": [{
+            "id": format!("{prefix}-dns"), "type": "ruleSet", "values": [format!("res:{resource_id}")],
+            "enabled": true, "action": "direct",
+            "conditions": [{"type": "ruleSet", "values": [format!("res:{resource_id}")]}],
+            "effects": {"dns": {"enabled": true, "resolver": "direct", "answerMode": "real"}}
+        }],
+        "customRuleSets": [{"id": set_id, "tag": format!("{prefix}-tag"), "format": "binary", "url": format!("https://{prefix}.example/set.srs")}],
+        "ruleResources": [{"id": resource_id, "name": prefix, "format": "binary", "fileName": format!("{prefix}.srs")}],
+        "routeRuleOrder": [format!("{prefix}-traffic")], "dnsRuleOrder": [format!("{prefix}-dns")]
+    })
+}
+
+#[test]
+fn partial_rule_restore_preserves_both_planes_shared_resource_dependencies() {
+    let current = shared_dependency_config("local");
+    let backup = shared_dependency_config("incoming");
+    for (selected, retained, replaced) in [
+        (C::DnsRules, "trafficRules", "dnsRules"),
+        (C::CustomRules, "dnsRules", "trafficRules"),
+    ] {
+        let outcome = merge_categories(&current, &backup, &[selected]);
+        assert!(outcome.conflicts.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert_eq!(outcome.config[retained], current[retained]);
+        assert_eq!(outcome.config[replaced], backup[replaced]);
+        for key in ["ruleResources", "customRuleSets"] {
+            assert_eq!(
+                outcome.config[key],
+                json!([current[key][0], backup[key][0]])
+            );
+        }
+        assert_eq!(
+            outcome.config[retained][0]["conditions"][0]["values"][0],
+            "res:local-resource"
+        );
+        assert_eq!(
+            outcome.config[replaced][0]["conditions"][0]["values"][0],
+            "res:incoming-resource"
+        );
+    }
+}
+
+#[test]
+fn partial_restore_reuses_identical_shared_ids_without_duplicates() {
+    let current = shared_dependency_config("shared");
+    let mut backup = current.clone();
+    backup["dnsRules"][0]["id"] = json!("replacement-dns");
+    for selected in [C::DnsRules, C::CustomRules] {
+        let outcome = merge_categories(&current, &backup, &[selected]);
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
+        assert_eq!(outcome.config["customRuleSets"], current["customRuleSets"]);
+        let again = merge_categories(&outcome.config, &backup, &[selected]);
+        assert_eq!(
+            again.config, outcome.config,
+            "same backup remains idempotent"
+        );
+        assert!(again.conflicts.is_empty());
+    }
+}
+
+#[test]
+fn partial_restore_dependency_conflict_keeps_the_entire_transaction_unchanged() {
+    let mut current = shared_dependency_config("shared");
+    current["servers"] = json!([{"id":"local-node", "protocol":"trojan"}]);
+    current["proxyMode"] = json!("rule");
+    let mut backup = shared_dependency_config("shared");
+    backup["servers"] = json!([{"id":"incoming-node", "protocol":"trojan"}]);
+    backup["proxyMode"] = json!("global");
+    backup["ruleResources"][0]["fileName"] = json!("different.srs");
+    backup["customRuleSets"][0]["url"] = json!("https://different.example/set.srs");
+    for selected in [C::DnsRules, C::CustomRules] {
+        let outcome = merge_categories(
+            &current,
+            &backup,
+            &[selected, C::ManualNodes, C::GeneralSettings],
+        );
+        assert_eq!(
+            outcome.config, current,
+            "no partial node, settings, or rule import on conflict"
+        );
+        assert!(
+            outcome.skipped.is_empty(),
+            "conflict is not an empty-category skip"
+        );
+        assert_eq!(
+            outcome.conflicts,
+            ["customRuleSets:shared-set", "ruleResources:shared-resource"]
+        );
+    }
+}
+
+#[test]
+fn full_rule_restore_replaces_shared_tables_and_resolves_same_id_conflicts() {
+    let current = shared_dependency_config("shared");
+    let mut backup = shared_dependency_config("shared");
+    backup["ruleResources"][0]["fileName"] = json!("replacement.srs");
+    backup["customRuleSets"][0]["url"] = json!("https://replacement.example/set.srs");
+    backup["trafficRules"][0]["id"] = json!("replacement-traffic");
+    backup["dnsRules"][0]["id"] = json!("replacement-dns");
+    let outcome = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert!(outcome.conflicts.is_empty());
+    assert!(outcome.skipped.is_empty());
+    for key in [
+        "trafficRules",
+        "dnsRules",
+        "customRuleSets",
+        "ruleResources",
+    ] {
+        assert_eq!(outcome.config[key], backup[key]);
+    }
+}
+
+#[test]
+fn skipped_rule_plane_does_not_allow_shared_dependency_overwrite() {
+    let current = shared_dependency_config("shared");
+    let mut backup = shared_dependency_config("shared");
+    backup["dnsRules"] = json!([]);
+    backup["ruleResources"][0]["fileName"] = json!("conflicting.srs");
+    let outcome = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+    assert_eq!(outcome.config, current);
+    assert_eq!(outcome.conflicts, ["ruleResources:shared-resource"]);
+}
+
+#[test]
+fn partial_restore_missing_or_empty_shared_tables_keeps_current_dependencies() {
+    let current = shared_dependency_config("local");
+    for empty in [false, true] {
+        let mut backup = shared_dependency_config("incoming");
+        for key in ["customRuleSets", "ruleResources"] {
+            if empty {
+                backup[key] = json!([]);
+            } else {
+                backup.as_object_mut().unwrap().remove(key);
+            }
+        }
+        for selected in [C::DnsRules, C::CustomRules] {
+            let outcome = merge_categories(&current, &backup, &[selected]);
+            assert!(outcome.conflicts.is_empty());
+            assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
+            assert_eq!(outcome.config["customRuleSets"], current["customRuleSets"]);
+        }
+        let full = merge_categories(&current, &backup, &[C::CustomRules, C::DnsRules]);
+        assert!(full.conflicts.is_empty());
+        assert_eq!(full.config["ruleResources"], json!([]));
+        assert_eq!(full.config["customRuleSets"], json!([]));
+    }
+}
+
+#[test]
+fn unrelated_category_restore_does_not_process_shared_dependency_conflicts() {
+    let current = shared_dependency_config("shared");
+    let mut backup = current.clone();
+    backup["ruleResources"][0]["fileName"] = json!("different.srs");
+    backup["proxyMode"] = json!("global");
+    let outcome = merge_categories(&current, &backup, &[C::GeneralSettings]);
+    assert!(outcome.conflicts.is_empty());
+    assert_eq!(outcome.config["ruleResources"], current["ruleResources"]);
+    assert_eq!(outcome.config["proxyMode"], "global");
+}
+
+mod audit_regressions;
+
+#[test]
+fn dns_backup_without_defaults_preserves_current_fallback() {
+    let mut current = crate::default_config();
+    current["dnsDefaults"]["realQueryFallbackAction"] = json!({"type":"reject","method":"drop"});
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    backup.as_object_mut().unwrap().remove("dnsDefaults");
+    let restored = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert_eq!(restored.config["dnsDefaults"], current["dnsDefaults"]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&restored.config).is_ok());
+}
+
+#[test]
+fn sparse_old_dns_backup_restores_protected_builtin_for_compatibility_fallback() {
+    let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
+    backup["dnsServers"] =
+        json!([{"id":"custom","name":"Custom","type":"udp","endpoint":{"host":"192.0.2.53"}}]);
+    let restored = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert_eq!(
+        restored.config["dnsDefaults"]["realQueryFallbackAction"],
+        json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    assert!(restored.config["dnsServers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|server| server["id"] == "custom"));
+    assert!(crate::ConfigStore::canonicalize_for_save(&restored.config).is_ok());
+    backup["dnsDefaults"]["realQueryFallbackAction"] =
+        json!({"type":"server","serverId":"missing"});
+    let explicit = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&explicit.config).is_err());
 }

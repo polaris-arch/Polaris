@@ -216,11 +216,47 @@ pub(super) struct NormalStart {
 pub(super) struct NormalStarts {
     current: Option<NormalStart>,
     retained: Vec<NormalStart>,
+    pub(super) pause: Option<Arc<super::mesh_apply::pc_owner_census::PcPauseCustody>>,
 }
 
 impl NormalStarts {
     pub(super) fn as_ref(&self) -> Option<&NormalStart> {
         self.current.as_ref()
+    }
+
+    pub(super) fn assert_unpaused(&self) -> Result<(), String> {
+        if self.pause.is_some() {
+            Err("PC producers are paused".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn producer_refs(&self) -> Vec<Arc<ProducerCell>> {
+        self.retained
+            .iter()
+            .map(|start| Arc::clone(&start.identity))
+            .collect()
+    }
+
+    pub(super) fn book_restart(
+        &mut self,
+        domain: Arc<crate::runtime::config::StopRuntimeDomain>,
+        base: u64,
+        claimed: Option<u64>,
+    ) -> Arc<ProducerCell> {
+        let identity = ProducerCell::queued(domain, base);
+        let (completion, _) = watch::channel(claimed.map_or(
+            NormalStartCompletion::Pending(base),
+            NormalStartCompletion::Starting,
+        ));
+        self.retained.push(NormalStart {
+            digest: "restart-dispatch".into(),
+            completion,
+            identity: Arc::clone(&identity),
+            attempt: None,
+        });
+        identity
     }
 
     fn replace(&mut self, start: NormalStart) {
@@ -230,14 +266,17 @@ impl NormalStarts {
     }
 
     fn prune(&mut self) {
-        self.retained
-            .retain(|producer| !producer.identity.reclaimable());
+        self.retained.retain(|producer| {
+            !producer.identity.reclaimable() || producer.identity.has_native_tail()
+        });
     }
 
     fn admitted(&self, generation: u64) -> Option<Arc<ProducerCell>> {
         self.retained
             .iter()
-            .find(|producer| producer.identity.has_generation(generation))
+            .find(|producer| {
+                producer.identity.has_generation(generation) && !producer.identity.reclaimable()
+            })
             .map(|producer| Arc::clone(&producer.identity))
     }
 }
@@ -476,7 +515,7 @@ async fn validate_with_probe(
 impl MainReadinessProbe for ProxyRuntime {
     async fn observe(&self, core: &ReadyMainCore) -> Result<(), MainPrerequisiteError> {
         #[cfg(target_os = "ios")]
-        tauri_plugin_polaris_ios::observe_session(&core.ios_receipt)
+        tauri_plugin_polaris_ios::refresh_ready_session(&core.ios_receipt)
             .await
             .map_err(|_| MainPrerequisiteError::ReadyUnknown)?;
         // A fresh actual unary RPC is required. TCP/channel construction alone grants nothing.
@@ -516,8 +555,11 @@ impl ProxyRuntime {
             .last()
             .filter(|run| run.config_digest == actual_digest)
             .ok_or("profileBindingUnknown")?;
-        let file = std::path::Path::new(directory).join("tailscaled.state");
-        let file = file.to_str().ok_or("profileBindingUnknown")?;
+        // The scope strings follow the export's own grammar, which
+        // `validate_observed_runs` has just enforced as `<directory>/tailscaled.state`.
+        // Joining through the host path type would spell the separator differently
+        // wherever this selection is exercised off-device.
+        let file = format!("{directory}/tailscaled.state");
         let selected: Vec<_> = current
             .scopes
             .iter()
@@ -730,6 +772,11 @@ impl ProxyRuntime {
     pub(crate) fn tailscale_action_lease(
         &self,
     ) -> Result<crate::runtime::config::LegacyStartLease, String> {
+        let starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| "Main admission poisoned")?;
+        starts.assert_unpaused()?;
         self.config
             .lease_legacy_start()
             .map_err(|_| "Managed mesh account retirement requires its managed proof".into())
@@ -801,6 +848,11 @@ impl ProxyRuntime {
         attempt: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
         commit: impl FnOnce(&mut Value) -> Result<(), String>,
     ) -> Result<Value, String> {
+        let starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| "Main admission poisoned")?;
+        starts.assert_unpaused()?;
         let action = || {
             self.gate
                 .with_current_generation(generation, |_| {
@@ -832,6 +884,8 @@ impl ProxyRuntime {
         attempt: &Arc<crate::runtime::tailscale_login_core::Attempt>,
         poll: impl FnOnce() -> T,
     ) -> Option<T> {
+        let starts = self.normal_start.lock().ok()?;
+        starts.assert_unpaused().ok()?;
         attempt
             .while_active(|| self.gate.with_current_generation(generation, |_| poll()))
             .flatten()
@@ -895,6 +949,7 @@ impl ProxyRuntime {
                         origin: super::IosMainOrigin::Observed(observed),
                         main_token: None,
                         ready: None,
+                        stop_target: None,
                         stopped: None,
                     });
                     Ok(())
@@ -926,7 +981,7 @@ impl ProxyRuntime {
             .retire_tailscale_other_attempts_under_gate(id, &gate, attempt)
             .await?;
         let tag = ticket.target_tag(id).ok_or("profileBindingUnknown")?;
-        let (fingerprint, revision) = {
+        let (fingerprint, revision, sealed_directory) = {
             use tauri_plugin_polaris_ios::{
                 TailscaleProfileState, TailscaleStateFileState, TailscaleWriterState,
             };
@@ -941,7 +996,7 @@ impl ProxyRuntime {
                 })
                 .ok_or("nativeRetirementUnknown")?;
             let ready = owner
-                .ready
+                .stop_target
                 .as_ref()
                 .filter(|ready| ready.request_id() == ticket.core.ios_receipt.request_id())
                 .ok_or("nativeRetirementUnknown")?;
@@ -1003,7 +1058,11 @@ impl ProxyRuntime {
             } else {
                 None
             };
-            (fingerprint, node.state_file_revision.clone())
+            (
+                fingerprint,
+                node.state_file_revision.clone(),
+                node.state_directory.clone(),
+            )
         };
         attempt
             .while_active(|| {
@@ -1025,12 +1084,13 @@ impl ProxyRuntime {
                         .update_tailscale_credential(saved, id, |current| {
                             if self
                                 .mesh
-                                .tailscale_retire_auth_under_gate(
+                                .tailscale_retire_auth_at_directory_under_gate(
                                     id,
                                     &gate,
                                     Some(attempt),
                                     provenance,
                                     Some(&revision),
+                                    Some(&sealed_directory),
                                 )
                                 .is_err()
                             {
@@ -1177,21 +1237,32 @@ impl ProxyRuntime {
             watch::Receiver<NormalStartCompletion>,
             Option<NormalStartClaim>,
         ),
-        StartLeg,
+        Box<StartLeg>,
     > {
-        let config_digest = digest(config)
-            .map_err(|error| StartLeg::Finished(Err(StartError::from(error.to_string())), None))?;
+        let config_digest = digest(config).map_err(|error| {
+            Box::new(StartLeg::Finished(
+                Err(StartError::from(error.to_string())),
+                None,
+            ))
+        })?;
         let mut current = self.normal_start.lock().map_err(|_| {
-            StartLeg::Finished(
+            Box::new(StartLeg::Finished(
                 Err(StartError::from(
                     "normal Start completion poisoned".to_owned(),
                 )),
                 None,
-            )
+            ))
         })?;
+        current
+            .assert_unpaused()
+            .and_then(|_| {
+                polaris_core_supervisor::config_gate::assert_check_producer_registration()
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| Box::new(StartLeg::Finished(Err(StartError::from(e)), None)))?;
         let base = self.core_generation();
         if expected.is_some_and(|expected| expected != base) {
-            return Err(StartLeg::Superseded);
+            return Err(Box::new(StartLeg::Superseded));
         }
         if let Some(start) = current.as_ref() {
             let active = matches!(&*start.completion.borrow(), NormalStartCompletion::Pending(generation) | NormalStartCompletion::Starting(generation) if *generation == base);
@@ -1199,7 +1270,7 @@ impl ProxyRuntime {
                 return if start.digest == config_digest {
                     Ok((start.completion.subscribe(), None))
                 } else {
-                    Err(StartLeg::Superseded)
+                    Err(Box::new(StartLeg::Superseded))
                 };
             }
         }
@@ -1261,11 +1332,7 @@ impl ProxyRuntime {
                 .map_err(|error| StartError::from(error.to_string()))?,
             targets: final_targets(effective, emitted),
             status: status.clone(),
-            api_secret: saved
-                .get("clashApiSecret")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            api_secret: crate::runtime::management_api::clash_api_secret_in(saved),
             probe_ports: self
                 .speed_probe_targets()
                 .map(|targets| targets.pool_ports)
@@ -1345,6 +1412,9 @@ impl ProxyRuntime {
             .normal_start
             .lock()
             .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))?;
+        current.assert_unpaused().map_err(StartError::from)?;
+        polaris_core_supervisor::config_gate::assert_check_producer_registration()
+            .map_err(|e| StartError::from(e.to_string()))?;
         let attempt = scope.as_ref().map(|(_, attempt)| Arc::clone(attempt));
         let register = || {
             // Capture under the same short lock held by admission/claim/Starting publication.
@@ -1459,6 +1529,45 @@ impl ProxyRuntime {
     }
 
     /// Capture before entering native custody; overwritten admitted A stays discoverable.
+    pub(super) fn restart_dispatch(
+        &self,
+        claimed: Option<u64>,
+    ) -> Result<Arc<ProducerCell>, StartError> {
+        let mut starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| StartError::from("Main admission poisoned".to_owned()))?;
+        let original = claimed.and_then(|generation| starts.retained.iter().find(|start|
+            start.digest == "restart-dispatch" && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation))
+            .map(|start| Arc::clone(&start.identity)));
+        if let Err(error) = starts.assert_unpaused() {
+            // This is the original timer continuation returning, not observer Drop.
+            if let Some(original) = original {
+                original.finish_dispatch();
+            }
+            return Err(StartError::from(error));
+        }
+        if let Some(original) = original {
+            return Ok(original);
+        }
+        polaris_core_supervisor::config_gate::assert_check_producer_registration()
+            .map_err(|e| StartError::from(e.to_string()))?;
+        let base = self.core_generation();
+        Ok(starts.book_restart(Arc::clone(&self.stop_domain), base, claimed))
+    }
+
+    pub(super) fn finish_preclaimed_restart(&self, generation: u64) {
+        if let Ok(starts) = self.normal_start.lock() {
+            for start in &starts.retained {
+                if start.digest == "restart-dispatch"
+                    && matches!(&*start.completion.borrow(), NormalStartCompletion::Starting(g) if *g == generation)
+                {
+                    start.identity.finish_dispatch();
+                }
+            }
+        }
+    }
+
     pub(super) fn admitted_native_producer(
         &self,
         generation: u64,
@@ -1623,6 +1732,17 @@ impl ProxyRuntime {
         let ticket = ReadyMainTicket { core, binding };
         self.validate_ready_main(&ticket).await?;
         Ok(Some(ticket))
+    }
+
+    /// 起核就绪时捕获的**已发射配置**摘要（只读）。只在就绪凭据仍属于 `generation` 那一代核时
+    /// 给出：换代之后旧摘要不得被当成新核的。
+    pub(crate) fn ready_main_emission_digest(&self, generation: u64) -> Option<String> {
+        self.ready_main
+            .read()
+            .ok()?
+            .as_ref()
+            .filter(|core| core.generation == generation)
+            .map(|core| core.emission_digest.clone())
     }
 
     pub(crate) fn check_ready_main(

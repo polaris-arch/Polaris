@@ -190,9 +190,9 @@ fn clash_cert_pin(m: &Value) -> Option<String> {
 /// 数字规整。上游 `num`。返回 u32（对齐 ServerConfig.port=u16 / alterId=u32 等）。
 fn num(v: &Value) -> Option<u32> {
     match v {
-        Value::Number(n) => n.as_u64().map(|x| x as u32).or_else(|| {
+        Value::Number(n) => n.as_u64().and_then(|x| u32::try_from(x).ok()).or_else(|| {
             n.as_f64().and_then(|f| {
-                if f.fract() == 0.0 && f >= 0.0 {
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= u32::MAX as f64 {
                     Some(f as u32)
                 } else {
                     None
@@ -202,6 +202,10 @@ fn num(v: &Value) -> Option<u32> {
         Value::String(s) => s.trim().parse::<u32>().ok(),
         _ => None,
     }
+}
+
+fn port(v: &Value) -> Option<u16> {
+    u16::try_from(num(v)?).ok().filter(|port| *port != 0)
 }
 
 /// 布尔规整。上游 `bool`。
@@ -693,8 +697,8 @@ fn resolve_merge_keys_limited(
                         }
                     }
                     Value::Sequence(seq) => {
-                        // 列表形式：逆序合并（靠前优先级高，与 js-yaml 一致）。
-                        for item in seq.into_iter().rev() {
+                        // First mapping wins; explicit keys already in m retain highest priority.
+                        for item in seq {
                             if let Value::Mapping(src) = item {
                                 for (k, v) in src {
                                     if !m.contains_key(&k) {
@@ -990,13 +994,17 @@ fn apply_ss_plugin(
                 return false;
             }
             let mut st = ShadowTlsSettings {
+                utls_mode: None,
                 password: password.unwrap(),
                 sni: host.unwrap(),
                 fingerprint: Some("chrome".to_string()),
                 port: None,
             };
-            if let Some(port) = plugin_opts.get("port").and_then(num) {
-                st.port = Some(port as u16);
+            if let Some(value) = plugin_opts.get("port") {
+                let Some(port) = port(value) else {
+                    return false;
+                };
+                st.port = Some(port);
             }
             config.shadow_tls_settings = Some(st);
             true
@@ -1025,7 +1033,7 @@ fn build_base(
     id: String,
 ) -> Option<ServerConfig> {
     let server = p.get("server").and_then(str)?;
-    let port = p.get("port").and_then(num)? as u16;
+    let port = p.get("port").and_then(port)?;
     let name = p
         .get("name")
         .and_then(str)
@@ -1155,7 +1163,7 @@ fn map_node(
     }
 
     let server = m.get("server").and_then(str);
-    let port = m.get("port").and_then(num);
+    let port = m.get("port").and_then(port);
     if server.is_none() || port.is_none() {
         return NodeOutcome::Fail {
             reason: format!("节点 \"{name}\" 缺 server/port"),
@@ -1731,7 +1739,7 @@ pub fn apply_provider_filters(
             }
             None => warn(format!(
                 "provider [{provider_name}] filter 非法或超长正则，已忽略该过滤: {}",
-                &filter[..filter.len().min(80)]
+                utf8_prefix(filter, 80)
             )),
         }
     }
@@ -1746,7 +1754,7 @@ pub fn apply_provider_filters(
             }
             None => warn(format!(
                 "provider [{provider_name}] exclude-filter 非法或超长正则，已忽略该过滤: {}",
-                &exclude_filter[..exclude_filter.len().min(80)]
+                utf8_prefix(exclude_filter, 80)
             )),
         }
     }
@@ -1756,11 +1764,16 @@ pub fn apply_provider_filters(
 
 /// 被匹配 name 截断到 MAX_FILTER_NAME_LEN（ReDoS 护栏：界定回溯输入规模）。
 fn safe_name(s: &str) -> String {
-    if s.len() > MAX_FILTER_NAME_LEN {
-        s[..MAX_FILTER_NAME_LEN].to_string()
-    } else {
-        s.to_string()
+    utf8_prefix(s, MAX_FILTER_NAME_LEN).to_string()
+}
+
+/// Retain the byte budget without ever slicing inside a UTF-8 character.
+fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while !s.is_char_boundary(end) {
+        end -= 1;
     }
+    &s[..end]
 }
 
 /// override 白名单 3 键（浅合并到解析后的 ServerConfig）。上游 `applyOverride`：

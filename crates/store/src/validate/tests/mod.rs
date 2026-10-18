@@ -289,3 +289,5 @@ fn save_rejects_reserved_netenv_id_but_load_validation_tolerates_it() {
     let clean = crate::store::default_config();
     assert!(crate::ConfigStore::canonicalize_for_save(&clean).is_ok());
 }
+
+mod audit_regressions;

@@ -22,6 +22,8 @@ use serde_json::Value;
 use polaris_config_engine::builder::route::mesh_selected_exit_falls_back_to_direct;
 use polaris_config_engine::user_config::app_config::UserConfig;
 
+use crate::runtime::auto_select::{Cause, Leg};
+
 /// 心跳检测间隔（上游 `HEARTBEAT_INTERVAL_MS`，:29）。
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// 连续失败触发换节点的阈值（上游 `MAX_CONSECUTIVE_FAILURES`，:30）。
@@ -157,6 +159,13 @@ impl AutoSwitchMachine {
     #[must_use]
     pub fn is_switching(&self) -> bool {
         self.is_switching
+    }
+
+    /// 最近一次换点尝试的时刻（成败都算，见 [`begin_switch`](Self::begin_switch)）。择优腿与故障腿
+    /// 共用这一个冷却起点。
+    #[must_use]
+    pub fn last_switch_time(&self) -> Option<u64> {
+        self.last_switch_time
     }
 
     /// 核未运行时只复位失败计数、**不动熔断计数**（上游 `runHeartbeat` 的 `!running` 分支，:107-110）。
@@ -404,6 +413,64 @@ pub fn decide_tick(input: TickInput) -> TickAction {
     }
 }
 
+/// 一个候选在一轮真实代理链探测里的结局。
+///
+/// 「读回不符被跳过」与「没通」分开：前者是读回判定量到的不是这个节点，数值与失败都不属于它。
+/// 其余拿不到值的情形（本机探针口连不上、测量任务异常）与引入读回之前一样算没通。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateProbe {
+    /// 测出了延迟（毫秒）。
+    Measured(u32),
+    /// 真测了，没通。
+    Failed,
+    /// 读回判定量到的不是它，被「强制」档跳过：本轮没有属于它的结果。
+    MismatchSkipped,
+}
+
+/// 一轮候选探测的裁定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// 有可用候选，取延迟最低的。
+    Best(CandidateLatency),
+    /// 每个候选都真测了，没有一个通。
+    AllFailed,
+    /// 没有测出可用候选，但有 `mismatch_skipped` 个候选因读回不符被跳过：不能据此说它们不可用。
+    Inconclusive { mismatch_skipped: usize },
+}
+
+/// 由逐候选的结局裁定这一轮（纯函数）。`candidates` 是 `(id, name)`，按候选原序；表里没有的
+/// 候选按没通算。
+#[must_use]
+pub fn judge_probes(
+    candidates: &[(String, String)],
+    probes: &BTreeMap<String, CandidateProbe>,
+) -> ProbeVerdict {
+    let outcome = |id: &str| probes.get(id).copied().unwrap_or(CandidateProbe::Failed);
+    let measured: Vec<CandidateLatency> = candidates
+        .iter()
+        .filter_map(|(id, name)| match outcome(id) {
+            CandidateProbe::Measured(ms) => Some(CandidateLatency {
+                id: id.clone(),
+                name: name.clone(),
+                latency_ms: Some(ms),
+            }),
+            CandidateProbe::Failed | CandidateProbe::MismatchSkipped => None,
+        })
+        .collect();
+    if let Some(best) = select_best_candidate(&measured) {
+        return ProbeVerdict::Best(best.clone());
+    }
+    let mismatch_skipped = candidates
+        .iter()
+        .filter(|(id, _)| outcome(id) == CandidateProbe::MismatchSkipped)
+        .count();
+    if mismatch_skipped > 0 {
+        ProbeVerdict::Inconclusive { mismatch_skipped }
+    } else {
+        ProbeVerdict::AllFailed
+    }
+}
+
 /// 候选节点及其测得延迟（上游 `{ server, latency }`）。`latency_ms=None` = 不可达。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateLatency {
@@ -461,11 +528,17 @@ pub struct RuntimeCandidatePlan {
 /// - 不在渲染端未保存的节点草稿遮罩里；
 /// - 已作为当前核 selector 成员加载；
 /// - D 的连接指纹与起核快照一致（未编辑、未被订阅替换）；
-/// - 协议运行态已就绪（目前用于排除未登录/过期的 Tailscale endpoint）。
+/// - 协议运行态已就绪（目前用于排除未登录/过期的 Tailscale endpoint）；
+/// - 给了 `scope` 时在它里面（自动选择意图下是意图指向的订阅的成员）。范围外的节点压根不是
+///   这一轮的考察对象，不计入任何排除计数。
 ///
 /// 这样候选可以经主核 probe-selector 做真实协议链探测并只走 `SelectOutbound`；D-only/dirty 节点
 /// 绝不会靠裸 TCP 猜测可用，也不会为了自动切换把未 Apply 的配置带进一次整核重启。
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "逐项都是规划的独立输入（D、R 的两张表、草稿遮罩、未就绪集合、范围），收成结构体只是换个地方列"
+)]
 pub fn plan_runtime_candidates(
     config: &Value,
     current_id: Option<&str>,
@@ -474,6 +547,7 @@ pub fn plan_runtime_candidates(
     current_fingerprints: &BTreeMap<String, String>,
     staged_node_ids: &BTreeSet<String>,
     not_ready_ids: &BTreeSet<String>,
+    scope: Option<&BTreeSet<String>>,
 ) -> RuntimeCandidatePlan {
     let Some(servers) = config.get("servers").and_then(Value::as_array) else {
         return RuntimeCandidatePlan::default();
@@ -484,6 +558,9 @@ pub fn plan_runtime_candidates(
             continue;
         };
         if Some(id) == current_id {
+            continue;
+        }
+        if scope.is_some_and(|scope| !scope.contains(id)) {
             continue;
         }
         if staged_node_ids.contains(id) {
@@ -556,6 +633,7 @@ pub fn select_best_candidate(candidates: &[CandidateLatency]) -> Option<&Candida
 }
 
 /// 前端 `autoNodeSwitched` 事件 payload（上游 :243-247 `{ reason, newServerName, latency }`）。
+/// 后三个字段是自动选点加的，只增不改：哪条腿换的、原因枚举、旧出口的显示名。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoNodeSwitchedPayload {
@@ -565,9 +643,15 @@ pub struct AutoNodeSwitchedPayload {
     pub new_server_name: String,
     /// 目标节点测得延迟（ms）。
     pub latency: u32,
+    /// 哪条腿换的：故障切换，或自动选择的择优。
+    pub(crate) leg: Leg,
+    pub(crate) cause: Cause,
+    /// 换点前的出口显示名；旧出口不是节点（直连、阻断）或已不在配置里时为空。
+    pub old_server_name: Option<String>,
 }
 
-/// 由选中的最优候选 + reason 构造切换成功事件（纯函数，上游 :243-247）。
+/// 由选中的最优候选 + reason 构造切换成功事件（纯函数，上游 :243-247）。产出的是故障腿的载荷；
+/// 旧出口的显示名由调用方补。
 ///
 /// 配置写入已由运行时 selector 事务单点负责，此处不得再克隆、改写整份配置。
 /// `best.latency_ms` 必为 `Some`（[`select_best_candidate`] 已过滤不可达）；理论不可达的 `None`
@@ -579,6 +663,9 @@ pub fn switch_payload(best: &CandidateLatency, reason: &str) -> Option<AutoNodeS
         reason: reason.to_string(),
         new_server_name: best.name.clone(),
         latency,
+        leg: Leg::Failover,
+        cause: Cause::Failover,
+        old_server_name: None,
     })
 }
 

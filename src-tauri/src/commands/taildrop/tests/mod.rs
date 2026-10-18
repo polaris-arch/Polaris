@@ -240,3 +240,59 @@ fn the_uri_legs_are_wired_through_the_tested_functions() {
         "声明给对端的名字必须就是 SelectedFile.name"
     );
 }
+
+#[test]
+fn concurrent_staging_owns_unique_files_and_never_touches_a_part_neighbor() {
+    use super::TaildropStagedFile;
+    use std::io::Write as _;
+    let dir = TestDir::new("polaris-taildrop-exclusive-");
+    let destination = dir.path().join("report.txt");
+    let neighbor = dir.path().join("report.txt.part");
+    std::fs::write(&neighbor, b"unrelated document").unwrap();
+    let mut first = TaildropStagedFile::create(&destination).unwrap();
+    let mut second = TaildropStagedFile::create(&destination).unwrap();
+    assert_ne!(first.path, second.path);
+    first.file.as_mut().unwrap().write_all(b"first").unwrap();
+    first.publish(&destination).unwrap();
+    second.file.as_mut().unwrap().write_all(b"second").unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"first");
+    let abandoned = second.path.clone();
+    drop(second);
+    assert!(!abandoned.exists());
+    assert_eq!(std::fs::read(&neighbor).unwrap(), b"unrelated document");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"first");
+}
+
+#[test]
+fn failed_rename_and_dropped_unfinished_transfer_clean_only_owned_staging() {
+    use super::TaildropStagedFile;
+    let dir = TestDir::new("polaris-taildrop-rename-failure-");
+    let destination = dir.path().join("nonempty-directory");
+    std::fs::create_dir(&destination).unwrap();
+    let keep = destination.join("keep");
+    std::fs::write(&keep, b"keep").unwrap();
+    let staged = TaildropStagedFile::create(&destination).unwrap();
+    let path = staged.path.clone();
+    assert!(staged.publish(&destination).is_err());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&keep).unwrap(), b"keep");
+    let staged = TaildropStagedFile::create(&dir.path().join("unfinished")).unwrap();
+    let path = staged.path.clone();
+    // Dropping a transfer future drops the same owner, including read/write error paths.
+    let never_polled = async move {
+        let _owned = staged;
+        std::future::pending::<()>().await;
+    };
+    drop(never_polled);
+    assert!(!path.exists());
+}
+
+#[test]
+fn streamed_path_saves_use_exclusive_raii_staging() {
+    let code = crate_code("commands/taildrop.rs");
+    let body = top_level_fn_body(&code, "async fn write_stream_to(");
+    assert!(body.contains("TaildropStagedFile::create(dest)"));
+    assert!(body.contains("staged.publish(dest)"));
+    assert!(!body.contains("with_extension"));
+    assert!(code.contains(".create_new(true)"));
+}

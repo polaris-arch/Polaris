@@ -194,7 +194,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// hex → 字节。非偶长度 / 非法字符 → `None`。
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())

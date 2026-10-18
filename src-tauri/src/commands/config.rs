@@ -16,9 +16,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use polaris_config_engine::user_config::ProxyModeType;
 use polaris_store::backup::{
     merge_categories, sanitize_cross_platform_rules, sanitize_unavailable_interface_bindings,
-    BackupCategory,
+    BackupCategory, SHARED_DEPENDENCY_CONFLICT,
 };
 use polaris_store::fs::StdFs;
 use serde::Deserialize;
@@ -31,7 +32,7 @@ use crate::events::channel::{
 };
 use crate::response::{ok_void, ApiResponse};
 use crate::runtime::config::{ConfigManager, Decision};
-use crate::runtime::proxy::StagedClassification;
+use crate::runtime::proxy::{ProxyRuntime, StagedClassification, SwitchOutcome};
 use crate::runtime::unlock::{
     selected_exit_changed, BroadcastSink, UnlockEventSink, UnlockRuntime,
 };
@@ -79,7 +80,7 @@ pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
 ///
 /// **新增注入一律加进 `ensure_effective_config`，不要在这里再并列一行** —— 那份表
 /// （`INJECTED_FIELD_PATHS`）同时是前端 SoT 守卫的取材面，绕过它注入的字段守卫管不到。
-fn apply_frontend_view(cfg: &mut Value) {
+pub(crate) fn apply_frontend_view(cfg: &mut Value) {
     // F29：绝不下发隐私密码（历史残留明文 `privacyPassword` + salted hash `privacyPasswordHash`）。
     strip_privacy_secrets(cfg);
     // 本机 mesh 账本是后端权威状态；排除于前端快照和 configVersion。
@@ -473,22 +474,49 @@ fn config_patch_core(
     config: &ConfigManager,
     patch: serde_json::Map<String, Value>,
 ) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_edit_core(config, move |next| {
+        if patch.is_empty() {
+            return false;
+        }
+        next.as_object_mut()
+            .expect("validated UserConfig root must be an object")
+            .extend(patch);
+        true
+    })
+}
+
+fn config_takeover_core(
+    config: &ConfigManager,
+    mode: ProxyModeType,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_takeover_edit(config, mode, &std::cell::Cell::new(false))
+}
+
+fn config_takeover_edit(
+    config: &ConfigManager,
+    mode: ProxyModeType,
+    corrected: &std::cell::Cell<bool>,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
+    config_edit_core(config, move |next| {
+        next["proxyModeType"] = json!(mode);
+        corrected.set(crate::tray::apply_fake_ip_tun_entry(next));
+        true
+    })
+}
+
+fn config_edit_core(
+    config: &ConfigManager,
+    edit: impl FnOnce(&mut Value) -> bool,
+) -> Result<(Option<String>, Value, bool), polaris_store::StoreError> {
     let ((old_selected, changed, transaction_view), saved) =
         config.update_deferred_cleanup(|current| {
             let old_selected = current
                 .get("selectedServerId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            if patch.is_empty() {
-                return Decision::Skip((old_selected, false, current.clone()));
-            }
-
             let mut next = current.clone();
-            let root = next
-                .as_object_mut()
-                .expect("validated UserConfig root must be an object");
-            for (key, value) in patch {
-                root.insert(key, value);
+            if !edit(&mut next) {
+                return Decision::Skip((old_selected, false, current.clone()));
             }
 
             // 补丁入口同样经过全量保存的字段所有权与派生投影规则；否则换一个写入口就能绕过隐私保护、
@@ -533,14 +561,52 @@ pub fn config_patch(
             crate::i18n::key::NATIVE_UNKNOWN_ERROR,
         ));
     };
-    match config_patch_core(state.config(), patch) {
+    let result = config_patch_core(state.config(), patch);
+    config_edit_response(&app, &state, result)
+}
+
+pub(crate) fn config_takeover(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    mode: &str,
+) -> ApiResponse<Value> {
+    let result = serde_json::from_value::<ProxyModeType>(json!(mode))
+        .map_err(|_| polaris_store::StoreError::validation("invalid takeover mode"))
+        .and_then(|mode| config_takeover_core(state.config(), mode));
+    config_edit_response(&app, &state, result)
+}
+
+/// Home and native tray share the same lock-local takeover edit.
+#[allow(clippy::needless_pass_by_value, reason = "Tauri IPC owns its payload")]
+#[tauri::command]
+pub fn config_set_takeover(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    mode: ProxyModeType,
+) -> ApiResponse<Value> {
+    let corrected = std::cell::Cell::new(false);
+    let result = config_takeover_edit(state.config(), mode, &corrected);
+    let response = config_edit_response(&app, &state, result);
+    if response.success {
+        ApiResponse::ok(json!({"config": response.data, "corrected": corrected.get()}))
+    } else {
+        response
+    }
+}
+
+fn config_edit_response(
+    app: &AppHandle,
+    state: &AppRuntime,
+    result: Result<(Option<String>, Value, bool), polaris_store::StoreError>,
+) -> ApiResponse<Value> {
+    match result {
         Ok((old_selected, cfg, changed)) => {
             if changed {
-                broadcast_config_changed(&app, &cfg);
+                broadcast_config_changed(app, &cfg);
             }
             invalidate_unlock_on_exit_change(
                 state.unlock(),
-                &BroadcastSink::new(&app),
+                &BroadcastSink::new(app),
                 state.proxy().status().running,
                 old_selected.as_deref(),
                 cfg.get("selectedServerId").and_then(Value::as_str),
@@ -837,6 +903,11 @@ pub(crate) fn backup_import_save_core(
             .and_then(Value::as_str)
             .map(str::to_string);
         let outcome = merge_categories(latest, backup, selected);
+        if !outcome.conflicts.is_empty() {
+            return Decision::Skip(Err(polaris_store::StoreError::validation(
+                SHARED_DEPENDENCY_CONFLICT,
+            )));
+        }
         let mut next = outcome.config;
         let effective_selected: Vec<BackupCategory> = selected
             .iter()
@@ -1145,7 +1216,7 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
 ///
 /// `appRulesSeeded` 同样**不收**：它在 `polaris_store::backup` 的 `DATA_FIELDS` 里，随 appRules 类
 /// 被备份导入合法写入 ⇒ 所有权有争议，不满足「零写入权」。
-const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
+const BACKEND_AUTHORITATIVE_KEYS: [&str; 5] = [
     // 托盘「节点·最近」MRU。只由 `server_switch` 写；ui 全仓仅 TrayMenu 读。
     "recentServerIds",
     // 内置 geo 元数据（随包）。只由 geo seed 写；ui 全仓零读零写。
@@ -1153,6 +1224,10 @@ const BACKEND_AUTHORITATIVE_KEYS: [&str; 4] = [
     // 仅专用后端 revision-CAS mutation 可以修改；普通全量保存/patch/导入按盘上真值镜像。
     polaris_store::mesh_guard::POLICY_KEY,
     polaris_store::mesh_guard::STATE_KEY,
+    // 选择意图（自动选择）。只由 `commands/server.rs` 的三处显式选择写：点节点清掉，点某订阅的
+    // 「自动选择」置上。前端零写入权：全量保存与补丁带来的值一律以盘上为准，既冲不掉、也造不出
+    // 一个意图；指向的订阅被删掉时由保存前的清洗移除。
+    polaris_store::SELECTION_INTENT_KEY,
     // 曾有第三项 `diagnosticCapture`（诊断采集态）。整条机制已删除（核日志改由 `SubscribeLog` 全级别
     // 送达、级别筛在客户端，不再需要「临时把核提级到 debug」的会话），故该键不再是任何人的权威字段。
     // 旧配置里的残留由 `polaris_store::migrate::migrate_diagnostic_capture` 还原级别后清除。
@@ -1383,7 +1458,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// hex → 字节。非偶长度/非法字符 → None。
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
@@ -1392,13 +1467,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// **legacy** salted SHA-256：`sha256(salt || password)` → hex。复用 `polaris_helper::core_install::sha256_hex`。
+/// **legacy** salted SHA-256：`sha256(salt || password)` → hex。复用 `polaris_helper::core_hash::sha256_hex`。
 /// 新密码已改用 scrypt 独立文件（见 `store::privacy_lock`）；本函数仅供**存量 SHA-256 用户的解锁校验**
 /// （经 [`verify_password`] → [`unlock_core`] legacy 分支）复算比对，production 不再用它**创建**新哈希。
 fn hash_password(salt: &[u8], password: &str) -> String {
     let mut data = salt.to_vec();
     data.extend_from_slice(password.as_bytes());
-    polaris_helper::core_install::sha256_hex(&data)
+    polaris_helper::core_hash::sha256_hex(&data)
 }
 
 /// 常量时间比较（等长逐字节 XOR 累加，无早退时序泄漏）。长度不等直接 false（hash 恒等长，不泄信息）。
@@ -1724,6 +1799,18 @@ pub(crate) fn broadcast_config_changed_with(
     new_value: &Value,
     defer_restart: bool,
 ) {
+    broadcast_config_changed_with_completion(app, new_value, defer_restart, |_, _| {});
+}
+
+/// Completion is tied to the accepted runtime receipt, never to saving or spawning Apply.
+pub(crate) fn broadcast_config_changed_with_completion<F>(
+    app: &AppHandle,
+    new_value: &Value,
+    defer_restart: bool,
+    completion: F,
+) where
+    F: FnOnce(&std::sync::Arc<ProxyRuntime>, Option<SwitchOutcome>) + Send + 'static,
+{
     // F29 defense-in-depth：隐私密码（legacy 明文 + salted hash）绝不经**任何**前端可见路径下发。
     // 本事件已不带载荷（见下），故这份剥离服务的是**入核**那一份 —— `cfg` 一路 move 进
     // `switch_mode_with`；剥在源头，将来谁把它接回某条前端可见路径也带不出 hash。
@@ -1747,21 +1834,41 @@ pub(crate) fn broadcast_config_changed_with(
         let intent_generation = proxy.register_selector_intent();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = proxy
-                .switch_persisted_config_if_current(
-                    cfg,
-                    defer_restart,
-                    intent_generation,
-                    move |current| {
-                        apply_process_config_projections(&app, current);
-                    },
-                )
-                .await;
+            apply_config_broadcast_core(
+                &proxy,
+                cfg,
+                defer_restart,
+                intent_generation,
+                move |current| apply_process_config_projections(&app, current),
+                completion,
+            )
+            .await;
         });
     } else {
         // 早期启动/单测没有 AppRuntime，无法做磁盘版本复核；保留历史的 best-effort 投影行为。
         apply_process_config_projections(app, &cfg);
     }
+}
+
+/// The production broadcast task and behavior tests share the actual Apply/settle boundary.
+pub(crate) async fn apply_config_broadcast_core<F, C>(
+    proxy: &std::sync::Arc<ProxyRuntime>,
+    cfg: Value,
+    defer_restart: bool,
+    intent_generation: u64,
+    on_current: F,
+    completion: C,
+) where
+    F: FnOnce(&Value) + Send,
+    C: FnOnce(&std::sync::Arc<ProxyRuntime>, Option<SwitchOutcome>) + Send,
+{
+    let starting_generation = proxy.core_generation();
+    let outcome = proxy
+        .switch_persisted_config_if_current(cfg, defer_restart, intent_generation, on_current)
+        .await;
+    let accepted =
+        proxy.settle_selected_switch_receipt(outcome, starting_generation, intent_generation);
+    completion(proxy, accepted);
 }
 
 #[cfg(test)]

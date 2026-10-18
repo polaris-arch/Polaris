@@ -72,3 +72,64 @@ fn write_line_propagates_io_error() {
     }
     assert!(write_line(&mut Broken, "x").is_err());
 }
+
+#[test]
+fn terminated_reader_distinguishes_eof_empty_and_truncated_lines() {
+    let mut empty = Cursor::new(b"");
+    assert!(read_line_terminated_bounded(&mut empty, 8)
+        .unwrap()
+        .is_none());
+    let mut blank = Cursor::new(b"\n");
+    assert_eq!(
+        read_line_terminated_bounded(&mut blank, 8).unwrap(),
+        Some(String::new())
+    );
+    for input in [b"ping".as_slice(), b"ping\r".as_slice()] {
+        let mut reader = Cursor::new(input);
+        assert!(matches!(
+            read_line_terminated_bounded(&mut reader, 8),
+            Err(BoundedLineError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+    // The existing non-command API intentionally retains partial-EOF semantics.
+    assert_eq!(
+        read_line_trimmed_bounded(&mut Cursor::new(b"ping"), 8).unwrap(),
+        Some("ping".into())
+    );
+}
+
+#[test]
+fn terminated_reader_enforces_wire_limit_and_preserves_next_line() {
+    for (input, limit, expected) in [
+        (b"ping\nnext\n".as_slice(), 4, "ping"),
+        (b"ping\r\nnext\n".as_slice(), 5, "ping"),
+    ] {
+        let mut reader = BufReader::with_capacity(2, Cursor::new(input));
+        assert_eq!(
+            read_line_terminated_bounded(&mut reader, limit)
+                .unwrap()
+                .as_deref(),
+            Some(expected)
+        );
+        assert_eq!(
+            read_line_terminated_bounded(&mut reader, 4)
+                .unwrap()
+                .as_deref(),
+            Some("next")
+        );
+    }
+    let mut overlong = Cursor::new(b"12345TAIL\n");
+    assert!(matches!(
+        read_line_terminated_bounded(&mut overlong, 4),
+        Err(BoundedLineError::TooLong { limit: 4 })
+    ));
+    assert_eq!(overlong.position(), 5);
+    let mut invalid = Cursor::new(b"\xff\n");
+    assert!(matches!(
+        read_line_terminated_bounded(&mut invalid, 4),
+        Err(BoundedLineError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+}
+
+#[cfg(unix)]
+mod deadline_regressions;

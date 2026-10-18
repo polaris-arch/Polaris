@@ -66,6 +66,28 @@ fn birth_target(pid: u32, wire: &str) -> HelperBirthTarget {
 }
 
 #[test]
+fn pinned_receipt_family_is_explicit_for_every_platform() {
+    use polaris_helper_proto::core_protocol::PinnedBirthStart;
+    let target = birth_target(4242, "00112233445566778899aabbccddeeff");
+    let linux = LinuxBirthStart::Already { target };
+    let native = NativeBirthStart::Already { target };
+    for &platform in Platform::ALL {
+        let linux_result = pinned_receipt_response(platform, PinnedBirthStart::Linux(linux));
+        let native_result = pinned_receipt_response(platform, PinnedBirthStart::Native(native));
+        assert_eq!(linux_result.is_ok(), platform == Platform::Linux);
+        assert_eq!(
+            native_result.is_ok(),
+            matches!(platform, Platform::Mac | Platform::Win)
+        );
+        for result in [linux_result, native_result] {
+            if let Err(error) = result {
+                assert!(error.starts_with("HELPER_CORE_MISMATCH:"));
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_start_accepts_only_birth_receipts_and_never_promotes_already() {
     let target = birth_target(4242, "00112233445566778899aabbccddeeff");
     assert_eq!(
@@ -223,14 +245,25 @@ fn linux_exact_capability_probe_is_read_only_and_old_helper_fails_before_start()
         (b"OK birth-status empty\n".to_vec(), true),
         (b"ERR unknown\n".to_vec(), false),
         (b"OK stopped\n".to_vec(), false),
+        // 新助手认识探测命令、但这一次没答上来：带尾文的 `ERR unknown` 不是「助手太旧」。
+        (b"ERR unknown birth-custody-unidentified\n".to_vec(), false),
+        (
+            b"ERR unknown poisoned lock: another task failed inside\n".to_vec(),
+            false,
+        ),
+        (b"ERR unauthorized\n".to_vec(), false),
     ] {
+        let unknown_command = wire == b"ERR unknown\n";
         let (client, connects, frames) = stop_test_client_with_frames(
             Platform::Linux,
             vec![polaris_helper_client::MockStream::with_response(wire)],
         );
+        let probed = require_linux_birth_capability_with_client(&client);
+        assert_eq!(probed.is_ok(), capable);
+        // 只有「不认识这条命令」的确定回答算助手太旧；别的不通过只是此刻不可用。
         assert_eq!(
-            require_linux_birth_capability_with_client(&client).is_ok(),
-            capable
+            matches!(probed, Err(BirthCapabilityError::HelperOutdated(_))),
+            unknown_command
         );
         assert_eq!(connects.load(Ordering::SeqCst), 1);
         assert_eq!(*frames.lock().unwrap(), ["status-birth-safe\n".to_owned()]);
@@ -254,6 +287,10 @@ fn native_platform_capability_and_stop_require_their_own_exact_receipt_family() 
             ("OK stopped", false),
             ("OK birth-status empty", false),
             ("ERR unknown", false),
+            // Windows 收到行数不足的帧、协议层折进来的任意错误：都带尾文，都不是「助手太旧」。
+            ("ERR unknown bad-frame", false),
+            ("ERR unknown pipe closed before reply", false),
+            ("ERR auth", false),
         ] {
             let (client, _, frames) = stop_test_client_with_frames(
                 platform,
@@ -261,9 +298,13 @@ fn native_platform_capability_and_stop_require_their_own_exact_receipt_family() 
                     format!("{wire}\n").into_bytes(),
                 )],
             );
+            let probed = require_native_birth_capability_with_client(&client);
+            assert_eq!(probed.is_ok(), capable);
+            // 同上：`ERR unknown` 才是「助手太旧」；应答了别的协议族、custody 未清都不是。
             assert_eq!(
-                require_native_birth_capability_with_client(&client).is_ok(),
-                capable
+                matches!(probed, Err(BirthCapabilityError::HelperOutdated(_))),
+                wire == "ERR unknown",
+                "{wire}"
             );
             assert_eq!(*frames.lock().unwrap(), ["TOK\nstatus-native-birth-safe\n"]);
         }
@@ -418,6 +459,70 @@ fn old_linux_helper_start_refusal_has_an_upgrade_path() {
     );
     assert!(error.contains("已拒绝起核"), "{error}");
     assert!(error.contains("升级或修复"), "{error}");
+    // 带尾文的 `ERR unknown` 是这一次的故障，不引导用户去升级助手。
+    let error = format_helper_mutation_error(
+        Platform::Linux,
+        "起核",
+        &polaris_helper_proto::Error::with_detail(
+            polaris_helper_proto::ErrorCode::Unknown,
+            "poisoned lock",
+        ),
+    );
+    assert!(!error.contains("升级或修复"), "{error}");
+    assert!(error.contains("poisoned lock"), "{error}");
+}
+
+/// 🔴 只有**裸的** `ERR unknown` 说明助手不认识这条命令；每一种来源各钉一行。
+///
+/// 左列是服务端实际写出的那一行（Linux `dispatch_locked` / `handle` / `handle_birth_status`，
+/// macOS `server.rs` 的解码失败臂，Windows `handle_frame`，`core_install::to_response`，以及
+/// 协议层的 `From<Box<dyn Error>>`），各自在 helper 侧另有用例钉住字面。
+///
+/// **变异探针**：把判据退回只比错误码 ⇒ 带尾文的五行全部转红。
+#[test]
+fn only_a_bare_unknown_reply_means_the_helper_lacks_the_command() {
+    for (wire, lacks_command, source) in [
+        ("ERR unknown", true, "三平台：命令名不在解码表 / 分派表里"),
+        ("ERR unknown ", true, "尾随空白不算尾文"),
+        (
+            "ERR unknown poisoned lock: another task failed inside",
+            false,
+            "Linux：处理器的状态锁中毒",
+        ),
+        (
+            "ERR unknown birth-custody-unidentified",
+            false,
+            "Linux：状态探测遇到认不出归属的 custody",
+        ),
+        ("ERR unknown bad-frame", false, "Windows：帧行数不足"),
+        (
+            "ERR unknown install-result",
+            false,
+            "install-core：结果行解析不出",
+        ),
+        (
+            "ERR unknown connection reset by peer",
+            false,
+            "协议层把任意错误折成 unknown",
+        ),
+        ("ERR auth", false, "别的错误码"),
+        ("ERR bad-args", false, "别的错误码"),
+    ] {
+        let error = polaris_helper_proto::Error::parse(wire).expect("ERR 行");
+        assert_eq!(
+            is_unknown_command_reply(&error),
+            lacks_command,
+            "{source}：{wire}"
+        );
+    }
+    // 协议层的折叠确实带尾文（否则上面那一行钉的是一个不存在的形态）。
+    let folded: polaris_helper_proto::Error =
+        (Box::<dyn std::error::Error + Send + Sync>::from("connection reset by peer")).into();
+    assert_eq!(
+        folded.to_wire_line(),
+        "ERR unknown connection reset by peer"
+    );
+    assert!(!is_unknown_command_reply(&folded));
 }
 
 #[test]
@@ -550,7 +655,8 @@ fn platform_supported_maps_all_platforms() {
 /// 全 false，蕴含会平凡成立，那种绿没有信息量。
 #[test]
 fn protected_core_platforms_are_a_subset_of_helper_platforms() {
-    use crate::runtime::core_promote::platform_has_protected_core;
+    let platform_has_protected_core =
+        |platform| matches!(platform, Platform::Linux | Platform::Mac | Platform::Win);
 
     let mut both = Vec::new();
     for platform in Platform::ALL.iter().copied() {
@@ -572,13 +678,31 @@ fn protected_core_platforms_are_a_subset_of_helper_platforms() {
 }
 
 #[test]
-fn helper_install_success_requires_the_expected_build() {
+fn helper_install_success_requires_compatible_protocol_and_selected_content() {
     let current = HelperStatusSnapshot {
+        selected_core: Some(SelectedCoreSnapshot {
+            id: "a".repeat(64),
+            version: "1.15.0-alpha.12".into(),
+            provider_fingerprint: "b".repeat(64),
+            state: SelectedCoreState::Present,
+        }),
         ready: true,
         upgradeable: false,
         ..Default::default()
     };
     assert!(helper_install_reached_expected_build(&current));
+    let mut unknown = current.clone();
+    unknown.selected_core = None;
+    assert!(!helper_install_reached_expected_build(&unknown));
+    for state in [
+        SelectedCoreState::Absent,
+        SelectedCoreState::Invalid,
+        SelectedCoreState::Unavailable,
+    ] {
+        let mut bad = current.clone();
+        bad.selected_core.as_mut().unwrap().state = state;
+        assert!(!helper_install_reached_expected_build(&bad));
+    }
 
     let old_same_proto = HelperStatusSnapshot {
         ready: true,
@@ -748,6 +872,7 @@ fn action_result_serializes_stable_code_diagnostic_and_status() {
 fn helper_action_error_codes_serialize_as_frontend_contract() {
     let cases = [
         (HelperActionErrorCode::Cancelled, "cancelled"),
+        (HelperActionErrorCode::PartialCleanup, "partialCleanup"),
         (
             HelperActionErrorCode::AuthorizationUnavailable,
             "authorizationUnavailable",
@@ -755,6 +880,7 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::ProxyRunning, "proxyRunning"),
         (HelperActionErrorCode::Unsupported, "unsupported"),
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
+        (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
         (HelperActionErrorCode::NotReady, "notReady"),
         (HelperActionErrorCode::Failed, "failed"),
     ];
@@ -967,7 +1093,7 @@ fn start_core_records_the_identity_baseline_on_both_response_legs() {
 }
 
 #[test]
-fn production_start_selects_exact_linux_and_native_desktop_birth_wire() {
+fn production_start_selects_compiled_id_on_linux_and_native_desktop_birth_wire() {
     let body = impl_method_body(
         &crate_code("runtime/helper.rs"),
         concat!(
@@ -980,138 +1106,17 @@ fn production_start_selects_exact_linux_and_native_desktop_birth_wire() {
             "    ) -> Result<HelperStartResult, String> {"
         ),
     );
-    assert!(body.contains("Platform::Mac | Platform::Win => Request::NativeStartBirth(common)"));
+    assert!(body.contains("Platform::Mac | Platform::Win => Request::NativeStartPinned(params)"));
+    assert!(body.contains("Platform::Linux => Request::LinuxStartPinned(params)"));
+    assert!(body.contains("crate::runtime::core_identity::selected_id("));
+    assert!(body.contains("id: id.clone()"));
+    assert!(body.contains("if actual == id"));
+    assert!(!body.contains("Request::LinuxStartBirth("));
+    assert!(!body.contains("Request::NativeStartBirth("));
     assert!(body.contains("if self.platform == Platform::Linux"));
-    assert!(body.contains("Request::LinuxStartBirth(params)"));
     assert!(body.contains("return classify_linux_birth_start_response(resp)"));
 }
 
-/// **S-2 记号语义**：失效键取「探到的那次身份」，`Unreachable` 一律不记（也不留旧值）。
-///
-/// 「探不到就不记」这条以前写在 `reconcile_protected_core` 的闭包里，够不着任何行为测试；
-/// 搬到 `HelperRuntime` 之后它有了直接判据。**第三条最要紧**：探不到时若只是「不覆盖」，
-/// 旧记号会原地留着 —— 那正是「没有失效键的缓存」的另一种长相。
-#[test]
-fn install_core_note_keys_on_the_probed_build_and_drops_on_an_unreachable_probe() {
-    let (rt, _dir) = runtime();
-    assert!(
-        rt.install_core_unsupported_note().is_none(),
-        "初始必须无记号，否则首次起核直接跳过对账 = 加固整条不生效"
-    );
-
-    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(Some("build-A".to_owned())));
-    assert_eq!(
-        rt.install_core_unsupported_note(),
-        Some(InstallCoreUnsupportedRecord {
-            helper_build_id: Some("build-A".to_owned())
-        }),
-        "记号必须带上探到的构建身份（那是它唯一的失效键）"
-    );
-
-    // 探不到 ≠ 还是那个 helper：不记新的，**也不许把旧的留着**。
-    rt.note_install_core_unsupported(&HelperBuildProbe::Unreachable);
-    assert!(
-        rt.install_core_unsupported_note().is_none(),
-        "探不到身份时留着旧记号 = 一个永不失效的缓存"
-    );
-
-    // 旧 helper 如实不带 build_identity：`Reported(None)` 本身是稳定身份，照记。
-    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(None));
-    assert_eq!(
-        rt.install_core_unsupported_note(),
-        Some(InstallCoreUnsupportedRecord {
-            helper_build_id: None
-        }),
-        "`Reported(None)` 与 `Unreachable` 必须分得开"
-    );
-}
-
-/// 🔴 **S-2 反向对照：失败的 install 绝不清记号。**
-///
-/// 清记号挂的是「提权脚本真跑成功 ⇒ 磁盘上的 helper 已换一份」，不是「`install()` 被调了一次」。
-/// 没有这一条，把清除挪到方法开头（每次点一下就清，哪怕缺二进制早返）也照样全绿 ——
-/// 那等于把能力缓存变成「用户每点一次修复就白跑一轮 80MB 对账」。
-#[test]
-fn a_failed_install_never_clears_the_capability_note() {
-    std::env::remove_var("POLARIS_HELPER_PATH");
-    let (rt, _dir) = runtime();
-    rt.note_install_core_unsupported(&HelperBuildProbe::Reported(Some("build-A".to_owned())));
-
-    let r = rt.install();
-    assert!(!r.success, "无 bundled helper 必须早返失败（不弹提权框）");
-    assert_eq!(
-        rt.install_core_unsupported_note(),
-        Some(InstallCoreUnsupportedRecord {
-            helper_build_id: Some("build-A".to_owned())
-        }),
-        "install 失败却把记号清了 —— 清除被挂在了「调用发生」而不是「二进制被替换」上"
-    );
-}
-
-/// 🔴 **S-2 接线：`install()` 的成功分支必须清掉能力记号。**
-///
-/// # 为什么这条非有不可
-///
-/// 记号的失效键是 helper 自报的 `build_identity`，而
-/// `polaris_helper_proto::build_identity::current()` 在 `POLARIS_BUILD_ID` 未注入时落
-/// `CARGO_PKG_VERSION` —— **开源项目的源码构建、CI 的非发布产物都不注入**。于是这条链上失效键
-/// 恒不变：旧 helper 回 `ERR unknown` → 记号 `{build=0.x.y}` → 拉新源码重编 helper → 设置页点
-/// 「升级/修复」（同一个 app 进程）→ 新 helper 仍自报 `0.x.y` → 缓存**命中** → 本会话内
-/// install-core 永不再试，受保护目录停在旧核，现场只有一句 warn 可查。
-/// app 自己刚把 helper 装了一遍，这是能拿到的最精确的失效事件。
-///
-/// # 为什么是源码级
-///
-/// `EscalationOutcome::Success` 那一臂要真跑一次提权脚本（UAC/osascript/pkexec）才到得了，
-/// 属真机门；本机能测的只有失败腿（上面那条反向对照）。
-///
-/// 变异锁：删掉臂里的 `clear_install_core_unsupported()` → 第一条红；
-/// 挪到 `wait_until_ready` 之后 → 第三条红；挪出 Success 臂（例如方法开头）→ 第一条红
-/// 且上面那条行为对照同时红。
-#[test]
-fn a_successful_install_clears_the_install_core_capability_note() {
-    let body = impl_method_body(
-        &crate_code("runtime/helper.rs"),
-        "    pub fn install(&self) -> HelperActionResult {",
-    );
-    let arm = crate::commands::guard_scan::match_arm_body(
-        &body,
-        "Ok(EscalationOutcome::Success) => {",
-        "Ok(EscalationOutcome::",
-    );
-    // 切点自检：臂体不是空的、且确实是那条成功臂（含就绪轮询）。空切片上的正面断言必然假红，
-    // 但「臂体里混进了别的臂」会造成**假绿** —— 后者由 `match_arm_body` 自己的输出自检兜。
-    assert!(
-        arm.contains("wait_until_ready"),
-        "切点自检失败：切出来的不是 Success 臂（里面没有就绪轮询）"
-    );
-    assert!(
-        arm.contains(concat!("clear_install_core_unsupported", "()")),
-        "install 成功后没清「helper 不支持 install-core」的记号 —— 源码构建下 build_identity \
-         不变，失效键指望不上，重装 helper 也唤不醒受保护核对账"
-    );
-    // 只有一个调用点：散在多处会让「射程到底覆盖哪条腿」取决于书写顺序。
-    assert_eq!(
-        body.matches(concat!("clear_install_core_unsupported", "()"))
-            .count(),
-        1,
-        "install() 里出现了不止一个清除调用点"
-    );
-    // 顺序：清除挂在**二进制已被替换**这个事实上，不是挂在「新 helper 就绪」上 ——
-    // 回退粒度要等于故障粒度。就绪轮询可能超时（NotReady），而那时二进制早就换过了。
-    let clear_at = arm
-        .find(concat!("clear_install_core_unsupported", "()"))
-        .expect("上面刚断言过");
-    let ready_at = arm.find("wait_until_ready").expect("上面刚断言过");
-    assert!(
-        clear_at < ready_at,
-        "清记号必须先于就绪轮询：轮询超时走 NotReady 分支，而那时 helper 二进制已经换了一份"
-    );
-}
-
-// ===== install-core：Windows 上「写出了、0 字节就断开」的归类 =====
-
-/// 把 client 写出的帧记下来，供 Stop capability 与 install-core 复核帧断言共用。
 struct RecordingStream {
     inner: polaris_helper_client::MockStream,
     frames: Arc<Mutex<Vec<String>>>,
@@ -1136,167 +1141,165 @@ impl ConnectionStream for RecordingStream {
     }
 }
 
-struct RecordingConnector {
-    streams: Mutex<Vec<polaris_helper_client::MockStream>>,
-    frames: Arc<Mutex<Vec<String>>>,
-    connects: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Connector for RecordingConnector {
-    fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
-        self.connects.fetch_add(1, Ordering::SeqCst);
-        let mut streams = self.streams.lock().unwrap();
-        if streams.is_empty() {
-            return Err(ClientError::Connect("测试连接已耗尽".to_owned()));
-        }
-        Ok(Box::new(RecordingStream {
-            inner: streams.remove(0),
-            frames: Arc::clone(&self.frames),
-        }))
-    }
-}
-
-struct InstallCoreRun {
-    result: Result<(), InstallCoreError>,
-    connects: usize,
-    frames: Vec<String>,
-}
-
-fn run_install_core(
-    platform: Platform,
-    streams: Vec<polaris_helper_client::MockStream>,
-) -> InstallCoreRun {
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let connector = RecordingConnector {
-        streams: Mutex::new(streams),
-        frames: Arc::clone(&frames),
-        connects: Arc::clone(&connects),
-    };
-    let client = HelperClient::new(Box::new(connector), platform, "TOK");
-    let result = install_core_with_client(&client, Path::new(r"C:\stage"), &"ab".repeat(32));
-    let frames = frames.lock().unwrap().clone();
-    InstallCoreRun {
-        result,
-        connects: connects.load(Ordering::SeqCst),
-        frames,
-    }
-}
-
-fn silent() -> polaris_helper_client::MockStream {
-    // 连上、收下整帧、一个字节不回就断开（= 旧 Windows helper 对不认识命令的真机表现）。
-    polaris_helper_client::MockStream::with_response(Vec::new())
-}
-
-fn replying(line: &str) -> polaris_helper_client::MockStream {
-    polaris_helper_client::MockStream::with_response(line.as_bytes().to_vec())
-}
-
-/// 旧 Windows helper：装核帧 0 字节、复核帧也 0 字节 ⇒ `Unsupported`（能力缓存得以记号）；
-/// 复核帧必须是空参 install-core（认识它的 helper 在落盘前就回 bad-args，不产生任何写）。
 #[test]
-fn windows_install_core_silent_twice_is_unsupported() {
-    let run = run_install_core(Platform::Win, vec![silent(), silent()]);
-    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
-    assert_eq!(run.connects, 2, "0 字节之后必须复核恰好一帧");
-    assert_eq!(
-        run.frames,
-        vec![
-            format!("TOK\ninstall-core\nC:\\stage\n{}\n", "ab".repeat(32)),
-            "TOK\ninstall-core\n\n\n".to_owned(),
-        ],
-        "复核帧不是空参 install-core"
-    );
-}
-
-/// 旧 helper 偶尔来得及把 `ERR unknown` 送到（NoWait 竞态的另一面）⇒ 同样 `Unsupported`。
-#[test]
-fn windows_install_core_silent_then_err_unknown_is_unsupported() {
-    let run = run_install_core(Platform::Win, vec![silent(), replying("ERR unknown\n")]);
-    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
-    assert_eq!(run.connects, 2);
-}
-
-/// 永久误记号的防线：**新** helper 装核途中偶发断开，复核帧得到任何文本应答（它认识
-/// install-core）⇒ `Failed`，不记号。
-#[test]
-fn windows_install_core_silent_then_any_reply_is_a_transient_failure() {
-    for reply in [
-        "ERR bad-args\n",
-        "ERR busy\n",
-        "ERR coredir-acl-weakened C:\\x\n",
-    ] {
-        let run = run_install_core(Platform::Win, vec![silent(), replying(reply)]);
-        let Err(InstallCoreError::Failed(msg)) = &run.result else {
-            panic!("{reply:?} ⇒ {:?}", run.result);
-        };
-        assert!(msg.contains("复核帧得到应答"), "{msg}");
-        assert_eq!(run.connects, 2);
-    }
-    // 复核连不上（helper 正被 SCM 重启）同样判不了能力 ⇒ Failed。
-    let run = run_install_core(Platform::Win, vec![silent()]);
-    assert!(
-        matches!(&run.result, Err(InstallCoreError::Failed(m)) if m.contains("复核帧也失败")),
-        "{:?}",
-        run.result
-    );
-}
-
-/// 连不上 / 请求没写出 ⇒ `Failed`，且不发复核帧（那不是「写出了、0 字节」）。
-#[test]
-fn windows_install_core_connect_or_write_failure_stays_failed_without_probe() {
-    let run = run_install_core(Platform::Win, vec![]);
-    assert!(
-        matches!(run.result, Err(InstallCoreError::Failed(_))),
-        "{:?}",
-        run.result
-    );
-    assert_eq!(run.connects, 1, "连不上不得复核");
-
-    let run = run_install_core(
+fn core_status_has_only_an_id_frame_and_does_not_upload_source_bytes() {
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    let reply = format!("OK core-present {} 1.15.0-alpha.12\n", id.as_str());
+    let (client, connects, frames) = stop_test_client_with_frames(
         Platform::Win,
-        vec![polaris_helper_client::MockStream::broken(
-            std::io::ErrorKind::BrokenPipe,
+        vec![polaris_helper_client::MockStream::with_response(
+            reply.into_bytes(),
         )],
     );
-    assert!(
-        matches!(run.result, Err(InstallCoreError::Failed(_))),
-        "{:?}",
-        run.result
+    assert!(matches!(
+        query_core_status(&client, &id),
+        Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. })
+    ));
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    let frames = frames.lock().unwrap();
+    assert_eq!(
+        frames[0].lines().collect::<Vec<_>>(),
+        ["TOK", "core-status", id.as_str()]
     );
-    assert_eq!(run.connects, 1, "请求没写出不得复核");
 }
 
-/// 只对 Windows：mac/linux 的旧 helper 会如实回 `ERR unknown`，0 字节在那里是真故障。
 #[test]
-fn non_windows_install_core_silence_is_a_plain_failure() {
-    for platform in [Platform::Mac, Platform::Linux] {
-        let run = run_install_core(platform, vec![silent(), silent()]);
-        assert!(
-            matches!(run.result, Err(InstallCoreError::Failed(_))),
-            "{platform:?} ⇒ {:?}",
-            run.result
-        );
-        assert_eq!(run.connects, 1, "{platform:?} 不得复核");
+fn absent_invalid_unknown_empty_and_wrong_id_never_attest_a_selected_core() {
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    for reply in [
+        format!("OK core-absent {}\n", id.as_str()),
+        format!("OK core-invalid {} hash-differs\n", id.as_str()),
+    ] {
+        let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
+            reply.into_bytes(),
+        )]);
+        assert!(!matches!(
+            query_core_status(&client, &id),
+            Ok(polaris_helper_proto::core_protocol::CoreStatus::Present { .. })
+        ));
+    }
+    for reply in [
+        "ERR unknown\n".to_owned(),
+        String::new(),
+        format!("OK core-present {} 1.0.0\n", "b".repeat(64)),
+    ] {
+        let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
+            reply.into_bytes(),
+        )]);
+        assert!(query_core_status(&client, &id).is_err());
     }
 }
 
-/// 正面对照：有文本应答时照旧分类（`OK installed` / `ERR unknown` / 其它 `ERR`），不复核。
 #[test]
-fn install_core_textual_replies_are_classified_without_probe() {
-    let run = run_install_core(Platform::Win, vec![replying("OK installed\n")]);
-    assert_eq!(run.result, Ok(()));
-    assert_eq!(run.connects, 1);
+fn windows_cache_request_never_selects_the_old_helpers_console_command() {
+    let request = flush_dns_request(Platform::Win);
+    assert_eq!(request, Request::WindowsFlushDnsNative);
+    let raw = String::from_utf8(polaris_helper_proto::codec::encode(
+        Platform::Win,
+        "fixture-token",
+        &request,
+    ))
+    .unwrap();
+    assert_eq!(raw.lines().nth(1), Some("flush-dns-native"));
+    assert_eq!(flush_dns_request(Platform::Mac), Request::FlushDns);
+}
 
-    let run = run_install_core(Platform::Win, vec![replying("ERR unknown\n")]);
-    assert_eq!(run.result, Err(InstallCoreError::Unsupported));
-    assert_eq!(run.connects, 1);
-
-    let run = run_install_core(Platform::Win, vec![replying("ERR hash-mismatch\n")]);
-    assert!(
-        matches!(run.result, Err(InstallCoreError::Failed(_))),
-        "{:?}",
-        run.result
+#[test]
+fn native_partial_cleanup_is_only_an_uninstall_failure_code() {
+    assert_eq!(
+        uninstall_failure_code(Platform::Win, 3),
+        HelperActionErrorCode::PartialCleanup
     );
-    assert_eq!(run.connects, 1);
+    assert_eq!(
+        escalation_failure_code(Platform::Win, 3),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Win, 2),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Linux, 3),
+        HelperActionErrorCode::Failed
+    );
+    assert_eq!(
+        uninstall_failure_code(Platform::Linux, 127),
+        HelperActionErrorCode::AuthorizationUnavailable
+    );
+}
+
+#[test]
+fn selected_core_status_projection_keeps_identity_and_native_state_read_only() {
+    let status = HelperStatusSnapshot {
+        selected_core: Some(SelectedCoreSnapshot {
+            id: "a".repeat(64),
+            version: "1.15.0-alpha.12".into(),
+            provider_fingerprint: "b".repeat(64),
+            state: SelectedCoreState::Absent,
+        }),
+        supported: true,
+        installed: true,
+        upgradeable: true,
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["selectedCore"]["id"], "a".repeat(64));
+    assert_eq!(wire["selectedCore"]["providerFingerprint"], "b".repeat(64));
+    assert_eq!(wire["selectedCore"]["state"], "absent");
+    assert!(!helper_install_reached_expected_build(&status));
+}
+
+#[test]
+fn native_slot_denial_is_not_an_authentication_or_node_configuration_hint() {
+    use polaris_helper_proto::{Error, ErrorCode};
+    for error in [
+        Error::with_detail(ErrorCode::Auth, "slot-owned-by-other-user"),
+        Error::with_detail(ErrorCode::Auth, "slot-owned-or-core-occupied"),
+        Error::with_detail(ErrorCode::Start, "core-occupied"),
+        Error::parse("ERR slot-owned-by-other-user").unwrap(),
+    ] {
+        assert!(is_helper_slot_occupied(&error));
+        assert!(format_helper_mutation_error(Platform::Win, "start", &error)
+            .starts_with("HELPER_CORE_OCCUPIED:"));
+    }
+    for error in [
+        Error::new(ErrorCode::Auth),
+        Error::with_detail(ErrorCode::Other, "arbitrary native error"),
+        Error::new(ErrorCode::Unknown),
+    ] {
+        assert!(!is_helper_slot_occupied(&error));
+    }
+    let (client, _) = stop_test_client(vec![polaris_helper_client::MockStream::with_response(
+        b"ERR auth slot-owned-by-other-user\n".to_vec(),
+    )]);
+    assert!(matches!(
+        require_native_birth_capability_with_client(&client),
+        Err(BirthCapabilityError::SlotOccupied(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn installer_uid_matches_the_native_nonroot_app_user() {
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let observed: u32 = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(current_uid(), observed);
+    let identity = polaris_helper_proto::core_protocol::CallerIdentity::Unix(current_uid());
+    assert_eq!(
+        identity,
+        polaris_helper_proto::core_protocol::CallerIdentity::Unix(observed)
+    );
+    #[cfg(target_os = "macos")]
+    assert_ne!(
+        observed, 0,
+        "Mac App/admin-CLI regression must run as the actual nonroot runner"
+    );
 }

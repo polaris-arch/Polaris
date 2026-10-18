@@ -144,8 +144,8 @@ impl Script {
                 &h.deps,
                 &three_nodes(),
                 &|| false,
-                |_| std::future::pending::<Option<u32>>(),
-                &mut |_, _| {},
+                |_| std::future::pending::<Measured>(),
+                &mut |_: &str, _: Value| {},
             )
             .await
         })
@@ -274,11 +274,14 @@ async fn shutdown_notification_keeps_custody_until_same_child_close_and_prevents
     cleanup(&script.harness.dir);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn shutdown_timeout_retains_unknown_child_config_and_closed_admission() {
     let script = Script::new(true);
     let running = script.run();
     acquire(&script.wait_entered).await;
+    // Let startup finish on real time: the shared CLI probe cache may be held
+    // by another test runtime. Only the controlled close budget uses paused time.
+    tokio::time::pause();
     let custody = script.harness.deps.pc_custody.clone();
     let shutdown =
         tokio::spawn(
@@ -761,8 +764,8 @@ async fn actual_native_production_batches_retire_exit_zero_and_seven_and_admit_s
                 &h.deps,
                 &three_nodes(),
                 &|| false,
-                |_| std::future::pending::<Option<u32>>(),
-                &mut |event, payload| events.push((event.to_owned(), payload)),
+                |_| std::future::pending::<Measured>(),
+                &mut |event: &str, payload: Value| events.push((event.to_owned(), payload)),
             )
             .await;
             assert!(
@@ -1168,7 +1171,10 @@ async fn native_shutdown_during_dispatch_notifies_same_booked_birth_before_publi
     assert!(!shutdown.is_finished());
     release.add_permits(1);
     let (outcome, _) = running.await.unwrap();
-    assert!(matches!(outcome, TempCoreOutcome::Superseded));
+    assert!(
+        matches!(outcome, TempCoreOutcome::Superseded),
+        "关核期间的派发应被取代，实得 {outcome:?}"
+    );
     shutdown.await.unwrap().unwrap();
     assert!(h.deps.pc_custody.current().unwrap().is_none());
     assert!(birth.has_native_terminal());
@@ -1480,5 +1486,199 @@ async fn central_admission_rejection_is_pre_factory_no_child_in_isolated_worker(
     assert!(birth.retired.load(Ordering::SeqCst));
     assert!(h.deps.pc_custody.current().unwrap().is_none());
     assert!(!birth.config_path.exists());
+    cleanup(&h.dir);
+}
+
+#[tokio::test]
+async fn f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory() {
+    const MARKER: &str = "POLARIS_F1_TEMP_WAITER_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let test = format!(
+            "{}::f1_temp_waiter_wakes_under_cutoff_before_ports_config_or_factory",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    let ports = Arc::new(AtomicUsize::new(0));
+    h.deps.allocate_ports = {
+        let calls = Arc::clone(&ports);
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            vec![20001, 20002, 20003]
+        })
+    };
+    let admission = h.deps.pc_custody.admission.lock().await;
+    let nodes = three_nodes();
+    let mut emit = |_: &str, _: Value| {};
+    let future = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |_| std::future::ready(Ok(1)),
+        &mut emit,
+    );
+    tokio::pin!(future);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let pause = polaris_core_supervisor::config_gate::pause_check_producers().unwrap();
+    drop(admission);
+    assert!(matches!(future.await, TempCoreOutcome::CleanupUnknown(_)));
+    assert_eq!(ports.load(Ordering::SeqCst), 0);
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    assert!(h.deps.pc_custody.producers.lock().unwrap().is_empty());
+    pause.surrender().unwrap();
+    assert!(matches!(
+        TempCoreSession::run(
+            &h.deps,
+            &nodes,
+            &|| false,
+            |_| std::future::ready(Ok(1)),
+            &mut |_: &str, _: Value| {}
+        )
+        .await,
+        TempCoreOutcome::Ran { .. }
+    ));
+    let view = h.deps.pc_custody.producer_view().unwrap();
+    assert!(
+        view.member_count() >= 2,
+        "original admitted producer and retired native-only birth remain visible"
+    );
+    assert!(
+        view.births.iter().all(|birth| birth.native.is_none()),
+        "ordinary mock close cannot mint native proof"
+    );
+    view.verify_surrender().unwrap();
+    cleanup(&h.dir);
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serialize process-wide PID projection for owned native fixtures"
+)]
+#[tokio::test]
+async fn cancelled_native_dispatch_compacts_only_after_real_retirement_in_either_order() {
+    let _registry = registry_guard();
+    for retire_first in [false, true] {
+        let h = native_harness("exit-success.sh");
+        let custody = &h.deps.pc_custody;
+        let producer = Arc::new(PcTempBatchProducer::default());
+        custody.producers.lock().unwrap().push(producer.clone());
+        let dispatch = PcTempBatchDispatch(producer.clone());
+        producer.factory_started.store(true, Ordering::SeqCst);
+        let mut child = native_child(&h, "exit-success.sh").await;
+        assert!(Arc::ptr_eq(
+            producer.birth.lock().unwrap().as_ref().unwrap(),
+            &child.birth
+        ));
+        let old_view = custody.producer_view().unwrap();
+        let weak_birth = Arc::downgrade(&child.birth);
+        if retire_first {
+            child.close_confirmed().await.unwrap();
+            assert!(child.birth.has_native_terminal());
+            custody.prune_terminal().unwrap();
+            assert_eq!(
+                custody.producers.lock().unwrap().len(),
+                1,
+                "original dispatch is still active"
+            );
+            drop(dispatch);
+        } else {
+            drop(dispatch);
+            custody.prune_terminal().unwrap();
+            assert_eq!(custody.producers.lock().unwrap().len(), 1);
+            assert!(!child.birth.retired.load(Ordering::SeqCst));
+            custody.retry_close().await.unwrap();
+            assert!(child.birth.has_native_terminal());
+        }
+        assert!(producer.cancelled.load(Ordering::SeqCst));
+        assert!(!producer.finished.load(Ordering::SeqCst));
+        custody.prune_terminal().unwrap();
+        custody.prune_terminal().unwrap();
+        assert!(custody.producers.lock().unwrap().is_empty());
+        assert!(custody.retired_births.lock().unwrap().is_empty());
+        assert!(custody.current().unwrap().is_none());
+        old_view.verify_surrender().unwrap();
+        drop(child);
+        drop(producer);
+        assert!(
+            weak_birth.upgrade().is_some(),
+            "old census retains exact evidence"
+        );
+        drop(old_view);
+        assert!(
+            weak_birth.upgrade().is_none(),
+            "global history no longer owns terminal evidence"
+        );
+        cleanup(&h.dir);
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "serialize process-wide PID projection for owned native fixtures"
+)]
+#[tokio::test]
+async fn cancelled_bound_native_factory_stays_quarantined_until_actual_return_and_retirement() {
+    let _registry = registry_guard();
+    let h = native_harness("exit-success.sh");
+    let custody = &h.deps.pc_custody;
+    let producer = Arc::new(PcTempBatchProducer::default());
+    custody.producers.lock().unwrap().push(producer.clone());
+    let dispatch = PcTempBatchDispatch(producer.clone());
+    producer.factory_started.store(true, Ordering::SeqCst);
+    let path = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    std::fs::write(&path, "owned native stand-in config").unwrap();
+    let prepared = TokioLoginCoreSpawner.prepare_temp_native_birth().unwrap();
+    let booked = custody.book_native(&prepared, path.clone(), false).unwrap();
+    let old_view = custody.producer_view().unwrap();
+    drop(dispatch);
+    for _ in 0..3 {
+        custody.prune_terminal().unwrap();
+        assert_eq!(custody.producers.lock().unwrap().len(), 1);
+        assert!(custody.current().unwrap().is_some());
+        assert!(old_view.verify_surrender().is_err());
+        assert!(custody.retry_close().await.is_err());
+        assert!(path.exists());
+    }
+    // The delayed original factory returns its physical Child; no fabricated ACK.
+    let mut child = booked
+        .dispatch_native(
+            &TokioLoginCoreSpawner,
+            SpawnRequest::new(
+                native_fixture("exit-success.sh"),
+                path,
+                StdioPolicy::Discard,
+            ),
+            prepared,
+        )
+        .await
+        .unwrap();
+    custody.prune_terminal().unwrap();
+    assert_eq!(custody.producers.lock().unwrap().len(), 1);
+    child.close_confirmed().await.unwrap();
+    assert!(child.birth.has_native_terminal());
+    custody.prune_terminal().unwrap();
+    assert!(custody.producers.lock().unwrap().is_empty());
+    assert!(custody.retired_births.lock().unwrap().is_empty());
+    assert!(!producer.finished.load(Ordering::SeqCst));
+    old_view.verify_surrender().unwrap();
     cleanup(&h.dir);
 }

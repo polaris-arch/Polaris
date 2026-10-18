@@ -2,8 +2,6 @@
 //! managed permit, mutable writer handoff, or generic check-to-run conversion.
 
 use super::check::CheckedCandidate;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::check::CHECK_PROFILE;
 use crate::runtime::config::ApplyInputSnapshot;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::runtime::proxy::mesh_apply::candidate::{CandidateProfile, CheckSupport};
@@ -45,14 +43,14 @@ pub(crate) fn prepare_checked_linux_inputs(
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         use polaris_core_supervisor::exact_spawn::{
-            prepare_linux_protected_inputs, read_linux_binary_source, LinuxInputProfile,
-            MutableObligation,
+            prepare_linux_protected_inputs, read_linux_binary_source, MutableObligation,
         };
         let candidate = checked.candidate();
         candidate
             .validate_same_candidate(snapshot, plan, CandidateProfile::DesktopNonTunDirectVlessV1)
             .map_err(|_| ProtectedCandidateError::CandidateMismatch)?;
-        if checked.execution_profile() != CHECK_PROFILE
+        let profile = checked.profile();
+        if checked.binary_sha256() != profile.binary_sha256()
             || candidate.metadata().check_support != CheckSupport::LinuxX8664PinnedPlainTcpOnly
         {
             return Err(ProtectedCandidateError::Unsupported);
@@ -61,7 +59,7 @@ pub(crate) fn prepare_checked_linux_inputs(
             read_linux_binary_source(binary_path).map_err(|_| ProtectedCandidateError::Source)?,
             candidate.materialized.closure.config_bytes.clone(),
             &candidate.materialized.closure.rule_files,
-            LinuxInputProfile::B609PlainTcpCheckV1,
+            profile.input_profile(),
             vec![MutableObligation::CacheWriterLeaseAndSelectorReadback],
         )
         .map_err(|_| ProtectedCandidateError::Protection)?;

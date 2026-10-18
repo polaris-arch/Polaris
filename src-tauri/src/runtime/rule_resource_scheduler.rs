@@ -354,6 +354,8 @@ impl RuleResourceScheduler {
             // 往资源页推 `EVENT_RULE_RESOURCE_PROGRESS`，表现为「没点更新，行却自己转起圈/变红」。
             // 静默由函数内部写死（无 bool 形参可传错，见该函数文档）。
             let state = app.state::<AppRuntime>();
+            // The shared core stages bytes and verifies the original record in its config
+            // commit; a delete/source edit during await cannot resurrect or overwrite it.
             let resp =
                 crate::commands::rules::rule_resources_redownload_silent(app, &state, id.clone())
                     .await;

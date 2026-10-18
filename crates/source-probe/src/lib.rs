@@ -204,7 +204,7 @@ fn read_bytes(path: &Path, what: &str) -> Vec<u8> {
 // ── 目录取材 ──────────────────────────────────────────────────────────────
 
 /// 模块 `<dir_rel>` 的**全部生产 `.rs`**（递归，排除 `tests/`），按相对路径升序返回
-/// `(相对 dir 的路径, 全文)`。
+/// `(相对 src/ 根的路径, 全文)`。
 ///
 /// **取材面 = 模块根文件 + 目录**：一个 Rust 模块 `foo` 的源码天然分布在 `foo.rs`
 /// （或 `foo/mod.rs`）与目录 `foo/` 两处，只取其一就是只有一半判据。
@@ -272,14 +272,11 @@ fn collect_module(
 
     let mut files = Vec::new();
     for root in &roots {
-        let rel = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let rel = relative_key(&src_root, root, what);
         files.push((rel, read(root, what)));
     }
     if dir.is_dir() {
-        collect_rs(&dir, &dir, include_tests, &mut files);
+        collect_rs(&src_root, &dir, include_tests, &mut files);
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files.dedup_by(|a, b| a.0 == b.0);
@@ -367,7 +364,7 @@ fn relative_key(root: &Path, path: &Path, what: &str) -> String {
 }
 
 /// `<manifest_dir>/src/<dir_rel>` 下**全部 `.rs`：生产 + `tests/` 里的测试**（递归），
-/// 按相对路径升序返回 `(相对 dir 的路径, 全文)`。
+/// 按相对路径升序返回 `(相对 src/ 根的路径, 全文)`。
 ///
 /// 与 [`module_files_in`] 的分工按**取材面的性质**划，不按方便程度划：
 ///
@@ -409,7 +406,7 @@ pub fn module_source_with_tests_in(manifest_dir: impl AsRef<Path>, dir_rel: &str
 ///
 /// # 相对路径的基准是 workspace 根，不是 `dir_rel`
 ///
-/// 与 [`module_files_in`]（相对 `dir_rel`）刻意不同：本函数的消费方要把返回的键直接当**仓库内
+/// 与 [`module_files_in`]（相对调用方 crate 的 `src/` 根）刻意不同：本函数的消费方要把返回的键直接当**仓库内
 /// 路径**用（写进豁免名单、写进失败信息、与别处的配置对拍），相对 `dir_rel` 的裸
 /// `index.html` 既定位不到文件，也没法和那些以 `ui/` 起手的清单逐字相等。
 ///
@@ -447,6 +444,21 @@ pub fn repo_dir_files_in(
         dir.display()
     );
     files
+}
+
+/// Exact downloaded desktop legal roots, relative to the workspace with `/`
+/// separators. These preserve upstream filenames/content (including source-like
+/// extensions); they are archive-verified notices, not App-owned source. Only
+/// callers that census App-owned source/names prune these roots. Sibling resources
+/// and unknown platforms remain in scope; general source readers are unchanged.
+pub fn is_downloaded_core_legal_root(relative: &str) -> bool {
+    matches!(
+        relative,
+        "resources/linux/core-release/licenses"
+            | "resources/win/core-release/licenses"
+            | "resources/mac-x64/core-release/licenses"
+            | "resources/mac-arm64/core-release/licenses"
+    )
 }
 
 /// 非源码目录：依赖缓存与构建产物（仓库根 `.gitignore` 已登记的那两个名字）。

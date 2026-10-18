@@ -24,6 +24,23 @@ fn tray_rs() -> String {
     module_code("tray")
 }
 
+#[test]
+fn explicit_cold_dismiss_cancels_ready_but_cold_blur_preserves_first_open() {
+    for explicit in [false, true] {
+        let mut lifecycle = OverlayLifecycle::default();
+        let OverlayOpenAction::QueueBuild { generation } = lifecycle.request_open(false) else {
+            panic!("cold open must queue a build");
+        };
+        lifecycle.dismiss(false, explicit);
+        assert_eq!(lifecycle.mark_ready(generation), !explicit);
+        assert_eq!(lifecycle.should_show(generation), !explicit);
+    }
+    let mut warm = OverlayLifecycle::default();
+    let _ = warm.request_open(false);
+    warm.dismiss(true, false);
+    assert!(!warm.show_requested);
+}
+
 /// 同上：crate 根侧的 `matches(..).count() == 1` 同样可被注释充数 —— 生产接线删掉、注释里
 /// 留一处，计数仍是 1。
 fn main_rs() -> String {
@@ -356,7 +373,7 @@ fn screen_change_is_pushed_by_the_host_over_the_existing_eval_bridge() {
 fn tray_retention_is_independent_from_main_lightweight_setting() {
     let tray_rs = tray_rs();
     let hide =
-        crate::commands::guard_scan::top_level_fn_body(&tray_rs, "pub(super) fn hide_overlay(");
+        crate::commands::guard_scan::top_level_fn_body(&tray_rs, "fn hide_overlay_with_reason(");
     let reclaim_branch = hide
         .split_once("if should_reclaim && !overlay_keeps_warm(app) {")
         .and_then(|(_, rest)| rest.split_once("\n    }"))

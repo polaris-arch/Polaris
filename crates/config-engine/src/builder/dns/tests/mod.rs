@@ -19,7 +19,7 @@ fn deps_false() -> DnsConfigDeps {
         pending_endpoints: vec![],
         log: |_, _| {},
         selected_server_tag: "proxy-selector".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_pool_ports: vec![],
         probe_proxy_port: None,
         platform: "linux".into(),
@@ -170,22 +170,27 @@ fn native_dns_and_conditions_share_one_rule_and_fakeip_is_native() {
         .as_ref()
         .unwrap()
         .iter()
-        .filter(|rule| {
-            rule.domain
-                .as_ref()
-                .is_some_and(|domains| domains.contains(&"api.example.com".to_string()))
-        })
+        .filter(|rule| rule.type_field.as_deref() == Some("logical"))
         .collect();
-    assert_eq!(effect_rules.len(), 1, "AND 条件必须合成同一条 DNS matcher");
-    assert_eq!(effect_rules[0].server.as_deref(), Some("fakeip"));
+    assert_eq!(effect_rules.len(), 1);
+    let actual = serde_json::to_value(effect_rules[0]).unwrap();
+    // Fixed core 577d4b9a: destinationAddressItems uses Any; logical AND requires every
+    // child (rule_abstract.go:126-129,204-221). api.example.com satisfies both children;
+    // api.other.com satisfies only the regex and therefore must not select FakeIP.
     assert_eq!(
-        effect_rules[0].domain_regex.as_deref(),
-        Some(&["^api\\.".to_string()][..])
+        actual,
+        serde_json::json!({
+            "type": "logical", "mode": "and",
+            "rules": [
+                {"domain": ["api.example.com"]},
+                {"domain_regex": ["^api\\."]},
+                {"query_type": ["A", "AAAA"]}
+            ],
+            "action": "route", "server": "fakeip"
+        })
     );
-    assert_eq!(
-        effect_rules[0].query_type.as_deref(),
-        Some(&["A".to_string(), "AAAA".to_string()][..])
-    );
+    let restored: DnsRule = serde_json::from_value(actual).unwrap();
+    assert_eq!(&restored, effect_rules[0]);
 }
 
 #[test]
@@ -206,6 +211,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
         proxy_server_id: "builtin-remote".into(),
         unmatched_action: Some(DnsPolicyAction::FakeIp),
         connection_resolution: Default::default(),
+        real_query_fallback_action: None,
     });
     let mut rule = dns_effect_rule(
         "hosts-first",
@@ -303,6 +309,7 @@ fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
             server_id: "builtin-domestic".into(),
         }),
         connection_resolution: Default::default(),
+        real_query_fallback_action: None,
     });
     let mut rule = dns_effect_rule(
         "race",
@@ -329,11 +336,11 @@ fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
     let rules = built.rules.as_ref().unwrap();
     let evaluates: Vec<_> = rules
         .iter()
-        .filter(|rule| rule.action.as_deref() == Some("evaluate"))
+        .filter(|rule| rule.resolver_policy.is_none() && rule.action.as_deref() == Some("evaluate"))
         .collect();
     let responds: Vec<_> = rules
         .iter()
-        .filter(|rule| rule.action.as_deref() == Some("respond"))
+        .filter(|rule| rule.resolver_policy.is_none() && rule.action.as_deref() == Some("respond"))
         .collect();
     assert_eq!(evaluates.len(), 2);
     assert_eq!(evaluates[0].speculative, None);
@@ -778,29 +785,32 @@ fn timeout_rounds_to_int_ms() {
 }
 
 #[test]
-fn race_server_emitted_when_port_positive_and_race_on() {
-    // raceServerPort>0 + resolveNodeDomainsAhead!==false → dns-node-race server。
-    let mut deps = deps_false();
-    deps.race_server_port = 5353;
-    let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps);
-    let race = c.servers.iter().find(|s| s.tag == DNS_NODE_RACE_TAG);
-    assert!(race.is_some());
-    assert_eq!(race.unwrap().server_port, Some(5353));
-    assert_eq!(race.unwrap().type_field.as_deref(), Some("udp"));
+fn native_candidate_servers_exist_without_runtime_port() {
+    let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps_false());
+    let candidate = c
+        .servers
+        .iter()
+        .find(|s| s.tag == "dns-node-native-1-0")
+        .unwrap();
+    assert_eq!(candidate.type_field.as_deref(), Some("https"));
+    assert_eq!(candidate.server.as_deref(), Some("223.5.5.5"));
+    assert!(candidate.detour.is_none());
 }
 
 #[test]
 fn race_server_skipped_when_resolve_disabled() {
-    // raceServerPort>0 + resolveNodeDomainsAhead=false → 不生成 race server。
+    // 保存配置显式关闭原生节点策略。
     let mut cfg = base_config();
     cfg.dns_config = Some(UserDnsConfig {
         resolve_node_domains_ahead: Some(false),
         ..Default::default()
     });
-    let mut deps = deps_false();
-    deps.race_server_port = 5353;
+    let deps = deps_false();
     let c = build_dns_config(&cfg, &BTreeMap::new(), &deps);
-    assert!(c.servers.iter().all(|s| s.tag != DNS_NODE_RACE_TAG));
+    assert!(c
+        .servers
+        .iter()
+        .all(|s| !s.tag.starts_with("dns-node-native-")));
 }
 
 #[test]
@@ -1028,3 +1038,178 @@ fn rules_always_set_non_empty() {
     let c = build_dns_config(&base_config(), &BTreeMap::new(), &deps_false());
     assert!(!c.rules.as_ref().unwrap().is_empty());
 }
+
+#[test]
+fn dns_and_preserves_same_type_conditions_and_actions_only_at_root() {
+    let mut config = base_config();
+    let mut rule = dns_effect_rule(
+        "same-type-and",
+        RuleType::Domain,
+        &["a.example"],
+        RuleDnsResolver::Direct,
+        RuleDnsAnswerMode::Real,
+    );
+    rule.combine_mode = Some(CombineMode::And);
+    rule.conditions = Some(vec![
+        RuleCondition {
+            type_field: RuleType::Domain,
+            values: vec!["a.example".into(), "b.example".into()],
+        },
+        RuleCondition {
+            type_field: RuleType::Domain,
+            values: vec!["b.example".into(), "c.example".into()],
+        },
+    ]);
+    rule.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(DnsPolicyAction::Reject {
+        method: DnsRejectMethod::Default,
+    });
+    config.custom_rules = vec![rule];
+    let built = build_dns_config(&config, &BTreeMap::new(), &deps_false());
+    let logical = built
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|r| r.type_field.as_deref() == Some("logical"))
+        .unwrap();
+    assert_eq!(logical.action.as_deref(), Some("reject"));
+    assert_eq!(logical.mode.as_deref(), Some("and"));
+    let children = logical.rules.as_ref().unwrap();
+    assert_eq!(children.len(), 2);
+    assert!(children
+        .iter()
+        .all(|r| r.action.is_none() && r.server.is_none()));
+    // Same-type condition intersection must be {b}, not the flattened union {a,b,c}.
+    for (domain, expected) in [
+        ("a.example", false),
+        ("b.example", true),
+        ("c.example", false),
+    ] {
+        assert_eq!(
+            children
+                .iter()
+                .all(|r| r.domain.as_ref().unwrap().iter().any(|v| v == domain)),
+            expected
+        );
+    }
+    config.custom_rules[0].combine_mode = Some(CombineMode::Or);
+    let or = build_dns_config(&config, &BTreeMap::new(), &deps_false());
+    let branches: Vec<_> = or
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|r| r.action.as_deref() == Some("reject"))
+        .collect();
+    assert_eq!(branches.len(), 2);
+    assert!(branches
+        .iter()
+        .all(|r| r.type_field.is_none() && r.rules.is_none()));
+}
+
+#[test]
+fn dns_and_hosts_first_and_group_keep_matcher_children_headless() {
+    let mut config = base_config();
+    config.dns_servers = vec![DnsServerResource {
+        id: "hosts".into(),
+        name: "Hosts".into(),
+        enabled: true,
+        kind: DnsServerKind::Hosts,
+        predefined: BTreeMap::from([("api.example.com".into(), vec!["10.0.0.8".into()])]),
+        ..Default::default()
+    }];
+    config.dns_server_groups = vec![DnsServerGroup {
+        id: "race".into(),
+        name: "Race".into(),
+        enabled: true,
+        mode: DnsServerGroupMode::Race,
+        members: vec!["builtin-domestic".into(), "builtin-remote".into()],
+        fallback_server_id: Some("builtin-domestic".into()),
+    }];
+    let mut rule = dns_effect_rule(
+        "dns-and-actions",
+        RuleType::Domain,
+        &["api.example.com"],
+        RuleDnsResolver::Direct,
+        RuleDnsAnswerMode::Real,
+    );
+    rule.combine_mode = Some(CombineMode::And);
+    rule.conditions = Some(vec![
+        RuleCondition {
+            type_field: RuleType::Domain,
+            values: vec!["api.example.com".into()],
+        },
+        RuleCondition {
+            type_field: RuleType::DomainRegex,
+            values: vec!["^api\\.".into()],
+        },
+    ]);
+    for action in [
+        DnsPolicyAction::HostsFirst {
+            hosts_server_id: "hosts".into(),
+            fallback: Box::new(DnsPolicyAction::Server {
+                server_id: "builtin-remote".into(),
+            }),
+        },
+        DnsPolicyAction::Group {
+            group_id: "race".into(),
+        },
+    ] {
+        rule.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(action);
+        config.custom_rules = vec![rule.clone()];
+        let built = build_dns_config(&config, &BTreeMap::new(), &deps_false());
+        let logical: Vec<_> = built
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| r.type_field.as_deref() == Some("logical"))
+            .collect();
+        assert!(!logical.is_empty());
+        for root in logical {
+            assert!(root.action.is_some());
+            assert!(
+                root.domain.is_none() && root.domain_regex.is_none() && root.preferred_by.is_none()
+            );
+            assert!(root
+                .rules
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|child| child.action.is_none() && child.server.is_none()));
+            if root.server.as_deref() == Some("dns-user-hosts") {
+                assert!(root
+                    .rules
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|child| child.preferred_by == Some(vec!["dns-user-hosts".into()])));
+            }
+        }
+        for response in built
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| r.resolver_policy.is_none() && r.action.as_deref() == Some("respond"))
+        {
+            assert!(response.rules.is_none());
+            assert!(response.match_response.is_some());
+        }
+    }
+}
+
+#[test]
+fn default_dns_rule_serde_keeps_legacy_shape_without_logical_fields() {
+    let legacy = serde_json::json!({
+        "domain": ["legacy.example"],
+        "action": "route",
+        "server": "dns-domestic"
+    });
+    let decoded: DnsRule = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(decoded.mode.is_none() && decoded.rules.is_none());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+    assert_eq!(serde_json::to_string(&DnsRule::default()).unwrap(), "{}");
+}
+
+mod real_query_fallback;

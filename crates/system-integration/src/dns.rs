@@ -297,7 +297,7 @@ pub fn compute_original_to_save(
     controlled_ip: &str,
     existing_marker_original: Option<&BTreeMap<String, Vec<String>>>,
 ) -> BTreeMap<String, Vec<String>> {
-    let mut out = BTreeMap::new();
+    let mut out = existing_marker_original.cloned().unwrap_or_default();
     for (svc, ips) in current {
         let is_ours = match existing_marker_original {
             Some(existing) => {

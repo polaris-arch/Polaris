@@ -134,7 +134,9 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             5,
             5,
         ),
-        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 3, 2),
+        // Five socket/process controls and one config check do not run a core;
+        // the WireGuard and MASQUE runtime tests still require both kernel gates.
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 8, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             2,
@@ -142,7 +144,7 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
         ),
         (
             "crates/config-engine/tests/managed_mesh_emission_runtime.rs",
-            10,
+            11,
             1,
         ),
         ("crates/singbox-grpc/tests/native_clash_mode.rs", 1, 1),
@@ -204,6 +206,27 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
     );
 }
 
+/// CI 可以只读拒绝继承的禁核开关，但不能设置或注入它。
+/// 只识别现有 admission 的严格相等 + 立即 throw 形态；其它引用仍保守拒收，
+/// 不按工作流名字豁免整份文件，也不让一处合法拒绝掩盖同文件的写入。
+fn workflow_no_kernel_run_violations(text: &str) -> Vec<usize> {
+    let lines: Vec<_> = text.lines().map(str::trim).collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            if !line.contains("POLARIS_NO_KERNEL_RUN") {
+                return None;
+            }
+            let read_only_rejection = *line == "|| e.POLARIS_NO_KERNEL_RUN === '1')"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.starts_with("throw Error(") && next.ends_with(");"));
+            (!read_only_rejection).then_some(i + 1)
+        })
+        .collect()
+}
+
 /// 本机门禁设开关、CI 不设：开关只能出现在 gate-rust.sh 的非 CI 分支里。
 #[test]
 fn only_the_local_gate_sets_the_no_kernel_run_switch() {
@@ -232,9 +255,57 @@ fn only_the_local_gate_sets_the_no_kernel_run_switch() {
         "工作流取材面没有读到 ci.yml —— 目录或扩展名判据坏了（防空跑）"
     );
     for (rel, text) in &workflows {
+        let violations = workflow_no_kernel_run_violations(text);
         assert!(
-            !text.contains("POLARIS_NO_KERNEL_RUN"),
-            "{rel} 出现了 POLARIS_NO_KERNEL_RUN —— CI 必须照常起核（覆盖交给 CI 的前提）"
+            violations.is_empty(),
+            "{rel}:{violations:?} 出现了 POLARIS_NO_KERNEL_RUN 的设置/注入或未认可引用 —— \
+             CI 必须照常起核；仅允许严格只读检查后立即拒绝继承的禁核开关"
+        );
+    }
+}
+
+#[test]
+fn workflow_switch_check_allows_only_read_only_rejection() {
+    let reject = "const e = process.env;\nif (e.GITHUB_ACTIONS !== 'true'\n  || e.POLARIS_NO_KERNEL_RUN === '1')\n  throw Error('Forbidden inherited switch');\n";
+    assert!(workflow_no_kernel_run_violations(reject).is_empty());
+    for invalid in [
+        reject.replace(" === ", " = "),
+        reject.replace("throw Error(", "console.log("),
+        reject.replace("throw Error(", "// throw Error("),
+        reject.replace("  throw Error('Forbidden inherited switch');\n", ""),
+        reject.replace(
+            "=== '1')",
+            "=== '1') process.env.POLARIS_NO_KERNEL_RUN = '1';",
+        ),
+    ] {
+        assert!(
+            !workflow_no_kernel_run_violations(&invalid).is_empty(),
+            "赋值、非拒绝或混入写入不得被当成只读拒绝：{invalid}"
+        );
+    }
+}
+
+#[test]
+fn workflow_switch_check_rejects_assignments_even_beside_valid_rejection() {
+    let reject = "if (false\n  || e.POLARIS_NO_KERNEL_RUN === '1')\n  throw Error('Forbidden inherited switch');\n";
+    for injection in [
+        "env:\n  POLARIS_NO_KERNEL_RUN: '1'",
+        "export POLARIS_NO_KERNEL_RUN=1",
+        "POLARIS_NO_KERNEL_RUN=1 cargo test --workspace",
+        "echo 'POLARIS_NO_KERNEL_RUN=1' >> \"$GITHUB_ENV\"",
+        "$env:POLARIS_NO_KERNEL_RUN = '1'",
+        "process.env.POLARIS_NO_KERNEL_RUN = '1';",
+        "process.env['POLARIS_NO_KERNEL_RUN'] = '1';",
+        "Object.assign(process.env, { POLARIS_NO_KERNEL_RUN: '1' });",
+        "process.env.POLARIS_NO_KERNEL_RUN ??= '1';",
+    ] {
+        assert!(
+            !workflow_no_kernel_run_violations(injection).is_empty(),
+            "CI 设置/注入必须失败：{injection}"
+        );
+        assert!(
+            !workflow_no_kernel_run_violations(&format!("{reject}{injection}")).is_empty(),
+            "合法只读拒绝不能豁免同文件设置/注入：{injection}"
         );
     }
 }

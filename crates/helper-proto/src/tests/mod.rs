@@ -12,18 +12,18 @@ use super::*;
 // 故三平台共用一个 `CURRENT`，下面两测锁的是**统一**而非互异。
 
 #[test]
-fn proto_version_is_unified_v1() {
+fn proto_version_is_unified_v2() {
     assert_eq!(
         proto_version::CURRENT,
-        1,
-        "首次正式发布前的兼容命令扩展不构成协议断代"
+        2,
+        "immutable core ids and retired executable-path Start require protocol v2"
     );
 }
 
 // 曾有一条 `proto_version_does_not_vary_by_platform`：遍历四个 `Platform` 反复断言
 // `Response::Ok(Pong{ proto_version: CURRENT, .. }).to_wire_line()` 的版本段。**已删** ——
 // 循环变量只出现在断言消息里，`advertised` 由常量 `CURRENT` 算出、与平台无关 ⇒ 四次迭代是同一
-// 个断言的四份副本，语义等价于 `CURRENT == 1`（上面那条已覆盖）；它自称能拦「有人按 Platform
+// 个断言的四份副本，语义等价于 `CURRENT == 2`（上面那条已覆盖）；它自称能拦「有人按 Platform
 // match 返不同值」，可新增的那个函数**根本不会被它调用**，拦不住。
 //
 // 「不得 per-platform 分叉」的真锚点在**分叉真会发生的地方** —— 三个平台各自的 `PROTO_VERSION`
@@ -57,6 +57,72 @@ fn windows_helper_rendezvous_is_pinned() {
         windows_helper::DEFAULT_SUPPORT_DIR,
         r"C:\ProgramData\Polaris"
     );
+}
+
+/// 受保护核目录的文件名白名单：每个平台只有核与配套库两个**精确名**。字面量写死在这里：
+/// 它们同时是打包脚本落位的文件名、安装脚本播种的文件名。
+#[test]
+fn core_payload_names_are_exact_per_platform() {
+    use core_payload::{core_filename, is_sidecar_name, name_allowed, sidecar_filename};
+
+    assert_eq!(core_filename(Platform::Linux), "sing-box");
+    assert_eq!(core_filename(Platform::Mac), "sing-box");
+    assert_eq!(core_filename(Platform::Win), "sing-box.exe");
+    assert_eq!(sidecar_filename(Platform::Linux), Some("libcronet.so"));
+    assert_eq!(sidecar_filename(Platform::Win), Some("libcronet.dll"));
+    assert_eq!(sidecar_filename(Platform::Mac), None);
+    for platform in [Platform::Android, Platform::Ios, Platform::Other] {
+        assert_eq!(sidecar_filename(platform), None, "{platform:?}");
+    }
+
+    for platform in Platform::ALL.iter().copied() {
+        assert!(name_allowed(core_filename(platform), platform));
+        if let Some(sidecar) = sidecar_filename(platform) {
+            assert!(name_allowed(sidecar, platform));
+            assert!(is_sidecar_name(sidecar, platform));
+        }
+        // 核文件名不是配套库名。
+        assert!(!is_sidecar_name(core_filename(platform), platform));
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "libcronet",
+            "libcronet.",
+            "libcronet.so.",
+            "libcronet.dll.",
+            "libcronet.so.119",
+            "libcronet.dylib",
+            ".libcronet.so",
+            ".sing-box",
+            "sing-box.",
+            "sing-box.exe.",
+            "sing-box.bak",
+            "sing-box.new",
+            "LIBCRONET.so",
+            "libcronet..so",
+            "libcronet.so/..",
+            "libcronet.a/b",
+            r"libcronet.a\b",
+            "../libcronet.so",
+            "libcronet.dll:stream",
+            "libcronet.so copy",
+            "libcronet.so\n",
+            "libcronet.s\u{f6}",
+            ".core-seed.json",
+        ] {
+            assert!(!name_allowed(bad, platform), "{bad:?} on {platform:?}");
+            assert!(!is_sidecar_name(bad, platform), "{bad:?} on {platform:?}");
+        }
+    }
+
+    // 别的平台的名字在本平台就是白名单外的名字。
+    assert!(!name_allowed("sing-box.exe", Platform::Linux));
+    assert!(!name_allowed("sing-box", Platform::Win));
+    assert!(!name_allowed("libcronet.dll", Platform::Linux));
+    assert!(!name_allowed("libcronet.so", Platform::Win));
+    assert!(!name_allowed("libcronet.so", Platform::Mac));
 }
 
 #[test]

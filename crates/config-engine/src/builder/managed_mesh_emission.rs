@@ -306,7 +306,7 @@ fn internal_pin_resolver(rule: &RouteRule) -> Option<(String, String)> {
     let outbound = rule.outbound.as_deref()?;
     let resolver = match tag {
         "probe-direct-in" if outbound == "direct" => "dns-bootstrap".to_owned(),
-        "probe-proxy-in" => "dns-probe-exit-proxy".to_owned(),
+        crate::builder::helpers::PROBE_PROXY_INBOUND_TAG => "dns-probe-exit-proxy".to_owned(),
         "update-in" if outbound == "direct" => "dns-bootstrap".to_owned(),
         "update-in" => "dns-remote".to_owned(),
         _ => {

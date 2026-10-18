@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+use polaris_config_engine::builder::Platform;
 use serde_json::{Map, Value};
 
 /// 解析结果：成功得到清洗后的 Value（可直接 into 强类型），或结构错误。
@@ -33,6 +34,9 @@ pub fn sanitize_config(content: &str) -> SanitizeResult {
             "config root must be an object",
         ));
     }
+    validate_collection_shapes(&value)?;
+    // Reject invalid explicit fallback policy before dnsDefaults can be discarded.
+    crate::validate::validate_raw_real_query_fallback_action(&value)?;
     // 就地清洗：坏字段剔除 / 退化，绝不 throw。
     sanitize_value_in_place(&mut value);
     Ok(value)
@@ -54,8 +58,8 @@ fn sanitize_value_in_place(value: &mut Value) {
     // ── 数组型字段：非数组删除（留 validate 处理必填语义）──────────────
     // servers / subscriptions / customRules / appRules / bypassProcesses / customAppPresets / rule_resources
     // TS validateConfig：servers/subscriptions 非数组 → throw（交 catch）；
-    // customRules/appRules 非数组 → 视为 []（不 throw）。这里统一：非数组删除，
-    // validate 阶段对必填的 servers 重新判定（缺失 → throw 或回落）。
+    // customRules/appRules 非数组 → 视为 []（不 throw）。servers/subscriptions 的显式坏形状
+    // 已由入口 validate_collection_shapes 拒绝，缺失的旧集合仍允许默认回填。
     ensure_array_or_remove(obj, "servers");
     ensure_array_or_remove(obj, "subscriptions");
     ensure_array_or_remove(obj, "customRules");
@@ -105,6 +109,7 @@ fn sanitize_value_in_place(value: &mut Value) {
         "autoUpdateSubscriptionOnStart",
         "ruleResourceAutoUpdate",
         "autoPrivacyMode",
+        "periodicSpeedTestEnabled",
     ] {
         bool_or_remove(obj, key);
     }
@@ -131,12 +136,29 @@ fn sanitize_value_in_place(value: &mut Value) {
     string_or_remove(obj, "singboxDashboardUrl", true, true);
     string_or_remove(obj, "clashApiSecret", false, false);
     string_or_remove(obj, "speedTestUrl", false, false);
+    string_or_remove(obj, "utlsPolicy", true, true);
     // subscriptionProxyPolicy：三态，非法值删除（回落 follow）
     policy_or_remove(obj, "subscriptionProxyPolicy");
-    // coreUpdateChannel：二态，非法值删除（回落 stable = 只看正式版，与改动前行为一致）
-    update_channel_or_remove(obj, "coreUpdateChannel");
-    // appUpdateChannel：与内核通道同一值域；缺省 stable，存量用户行为不变。
+    // 已退役的内核更新设置：应用内不再更新内核，旧配置里留下的键一律删掉，不随配置继续流转。
+    for key in [
+        "autoUpdateCore",
+        "coreUpdateChannel",
+        "restrictCoreUpdateToCompatibleMinor",
+    ] {
+        obj.remove(key);
+    }
+    // appUpdateChannel：二态（stable / prerelease），非法值删除；缺省 stable。
     update_channel_or_remove(obj, "appUpdateChannel");
+    // 测速并发：`"auto"` 或 4 到本平台上限的整数，其余删除（回落自动）。上限随平台不同，
+    // 所以一份在桌面设为 48 的配置拿到手机上会被清成自动。
+    speed_test_concurrency_or_remove(obj, Platform::current());
+    // 计费网络下的周期测速：三态，非法值删除（回落降频）。
+    if obj
+        .get("speedTestMeteredPolicy")
+        .is_some_and(|v| !matches!(v.as_str(), Some("pause" | "reduced" | "normal")))
+    {
+        obj.remove("speedTestMeteredPolicy");
+    }
 
     // ── 对象字段：非对象删除 ─────────────────────────────────────
     // tunConfig / dnsConfig / regionRouting / builtinGeoMeta
@@ -166,6 +188,8 @@ fn sanitize_value_in_place(value: &mut Value) {
     // ── 嵌套：逐节点 / 逐订阅 / 逐规则清洗 ─────────────────────────
     sanitize_servers(obj);
     sanitize_subscriptions(obj);
+    // 订阅清洗之后再判：意图指向的订阅必须在清洗后的订阅表里。
+    sanitize_selection_intent(obj);
     sanitize_network_interfaces(obj);
     sanitize_custom_rules(obj);
     sanitize_policy_rules(obj);
@@ -253,6 +277,48 @@ fn update_channel_or_remove(obj: &mut Map<String, Value>, key: &str) {
         }
     } else if obj.contains_key(key) {
         obj.remove(key);
+    }
+}
+
+/// 探针池的槽位上限，也是「测速并发」可填的最大值。槽位在起核时一次建好，实际并发在上限内
+/// 每轮另定。全部改回 16 即回到改动前的池大小。
+#[must_use]
+pub const fn speed_test_slot_cap(platform: Platform) -> usize {
+    match platform {
+        Platform::Mac | Platform::Win | Platform::Linux => 64,
+        Platform::Android => 32,
+        Platform::Ios | Platform::Other => 16,
+    }
+}
+
+/// 周期测速的全局总开关缺省值。关掉后任何订阅都不建周期计划。
+pub const PERIODIC_SPEED_TEST_ENABLED_DEFAULT: bool = true;
+
+/// 逐订阅「周期测速」开关的缺省值。读取侧、类型默认与测试都从这一处取，改默认只动这里。
+pub const PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT: bool = false;
+
+/// 计费网络下周期测速的缺省行为：`reduced`（周期乘 4）。另两个取值是 `pause` 与 `normal`。
+pub const SPEED_TEST_METERED_POLICY_DEFAULT: &str = "reduced";
+
+/// 逐订阅测速周期留空时的取值（分钟）。
+pub const SPEED_TEST_INTERVAL_MINUTES_DEFAULT: u64 = 30;
+
+/// 「测速并发」可填的最小值。
+pub const SPEED_TEST_CONCURRENCY_MIN: u64 = 4;
+
+/// 逐订阅测速周期（分钟）的取值范围。
+pub const SPEED_TEST_INTERVAL_MINUTES: std::ops::RangeInclusive<u64> = 5..=360;
+
+fn speed_test_concurrency_or_remove(obj: &mut Map<String, Value>, platform: Platform) {
+    let ok = match obj.get("speedTestConcurrency") {
+        None => return,
+        Some(Value::String(s)) => s == "auto",
+        Some(v) => v.as_u64().is_some_and(|n| {
+            (SPEED_TEST_CONCURRENCY_MIN..=speed_test_slot_cap(platform) as u64).contains(&n)
+        }),
+    };
+    if !ok {
+        obj.remove("speedTestConcurrency");
     }
 }
 
@@ -353,6 +419,93 @@ fn sanitize_servers(obj: &mut Map<String, Value>) {
     *servers = kept;
 }
 
+/// 选择意图的顶层键。缺席即手动选择；自动选择时存 `{ mode, scope, subscriptionId }`。
+/// `selectedServerId` 始终是实际出口，自动选择下即当前胜出节点。
+pub const SELECTION_INTENT_KEY: &str = "selectionIntent";
+
+/// 自动选择意图指向的订阅 id。键缺席、形状损坏或本版本不认识时为 `None`。
+///
+/// 读取与清洗共用这一套解析。本版本认识的形状只有一种：`mode == "auto"`、
+/// `scope == "subscription"`、`subscriptionId` 为非空字符串。
+#[must_use]
+pub fn selection_intent_subscription(config: &Value) -> Option<&str> {
+    match classify_selection_intent(config.get(SELECTION_INTENT_KEY)?) {
+        IntentShape::Subscription(id) => Some(id),
+        IntentShape::Unrecognized | IntentShape::Broken => None,
+    }
+}
+
+/// 配置里是否存着一个结构完好、但本版本不认识的选择意图（更新的版本写的模式或作用域）。
+/// 它原样留在盘上，本版本不据它做任何事；读状态时如实报出。
+#[must_use]
+pub fn selection_intent_unrecognized(config: &Value) -> bool {
+    config
+        .get(SELECTION_INTENT_KEY)
+        .is_some_and(|intent| classify_selection_intent(intent) == IntentShape::Unrecognized)
+}
+
+/// 意图键的值属于哪一种形状。
+#[derive(Debug, PartialEq, Eq)]
+enum IntentShape<'a> {
+    /// 本版本认识：自动选择，作用域是一个订阅。
+    Subscription(&'a str),
+    /// 结构完好（对象，`mode` 与 `scope` 都是非空字符串），但取值本版本不认识。
+    Unrecognized,
+    /// 损坏：不是对象、缺 `mode` 或 `scope`、类型不对，或认识的形状缺了它必需的字段。
+    Broken,
+}
+
+fn classify_selection_intent(intent: &Value) -> IntentShape<'_> {
+    let field = |name: &str| {
+        intent
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(mode), Some(scope)) = (field("mode"), field("scope")) else {
+        return IntentShape::Broken;
+    };
+    if mode != "auto" || scope != "subscription" {
+        return IntentShape::Unrecognized;
+    }
+    field("subscriptionId").map_or(IntentShape::Broken, IntentShape::Subscription)
+}
+
+/// 自动选择意图的规范形（写入方只经这里造值）。
+#[must_use]
+pub fn selection_intent_auto(subscription_id: &str) -> Value {
+    serde_json::json!({
+        "mode": "auto",
+        "scope": "subscription",
+        "subscriptionId": subscription_id,
+    })
+}
+
+/// 选择意图的清洗：
+/// - 形状损坏 → 移除（回到手动选择）；
+/// - 本版本认识、但指向的订阅不在订阅表里 → 移除；
+/// - 结构完好而取值本版本不认识 → **原样保留**。它多半是更新的版本写的（新的模式或作用域）：
+///   在这里删掉，用户回到新版本时意图就丢了。本版本读取时按不生效处理。
+pub(crate) fn sanitize_selection_intent(obj: &mut Map<String, Value>) {
+    let Some(intent) = obj.get(SELECTION_INTENT_KEY) else {
+        return;
+    };
+    let keep = match classify_selection_intent(intent) {
+        IntentShape::Subscription(id) => obj
+            .get("subscriptions")
+            .and_then(Value::as_array)
+            .is_some_and(|subs| {
+                subs.iter()
+                    .any(|sub| sub.get("id").and_then(Value::as_str) == Some(id))
+            }),
+        IntentShape::Unrecognized => true,
+        IntentShape::Broken => false,
+    };
+    if !keep {
+        obj.remove(SELECTION_INTENT_KEY);
+    }
+}
+
 /// 逐订阅清洗（subscriptions[]）：缺 id/name/url → 剔除。
 fn sanitize_subscriptions(obj: &mut Map<String, Value>) {
     let Some(Value::Array(subs)) = obj.get_mut("subscriptions") else {
@@ -367,6 +520,14 @@ fn sanitize_subscriptions(obj: &mut Map<String, Value>) {
             let mut sub = s;
             if let Some(map) = sub.as_object_mut() {
                 string_or_remove(map, "proxyBindInterface", true, true);
+                bool_or_remove(map, "periodicSpeedTest");
+                // 越界的周期删除而不是钳到边界：钳位会让用户以为自己填的值在生效。
+                if map.get("speedTestIntervalMinutes").is_some_and(|v| {
+                    !v.as_u64()
+                        .is_some_and(|n| SPEED_TEST_INTERVAL_MINUTES.contains(&n))
+                }) {
+                    map.remove("speedTestIntervalMinutes");
+                }
             }
             kept.push(sub);
         }
@@ -795,3 +956,15 @@ fn str_nonempty(obj: &Map<String, Value>, key: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Missing legacy collections may default; present malformed data must remain recoverable.
+pub(crate) fn validate_collection_shapes(value: &Value) -> Result<(), crate::StoreError> {
+    for key in ["servers", "subscriptions"] {
+        if value.get(key).is_some_and(|v| !v.is_array()) {
+            return Err(crate::StoreError::validation(format!(
+                "{key} must be an array"
+            )));
+        }
+    }
+    Ok(())
+}

@@ -17,7 +17,7 @@
 //!
 //! - `helper-client` 不依赖 `helper-common`（本 crate 带 `sha2`/`hex`，非特权侧不该为一个
 //!   比对函数牵连进来）——这条依赖图取舍与该符号是否存在无关，仍然成立。
-//! - `helper-common` 不依赖 `helper-proto`（见 [`crate::core_install`] 里 `is_valid_sha256_hex`
+//! - `helper-common` 不依赖 `helper-proto`（见 shared token framing
 //!   同款取舍）—— 故也无法借零依赖的 proto 作公共落点。
 //!
 //! ## 威胁模型（逐字对照 Go 源 `helper.go:4-9` / `helper-win/helper.go:8-13`）

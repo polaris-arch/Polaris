@@ -22,8 +22,16 @@ pub const RESERVED_OUTBOUND_TAGS: &[&str] = &[
     "block",
     "direct-loopback",
     "probe-direct-in",
-    "probe-proxy-in",
+    PROBE_PROXY_INBOUND_TAG,
 ];
+
+/// 用户流量的本机混合入站 tag。不钉死，走用户的全部路由规则与 DNS 规则。
+///
+/// **单一真值**：生成端建入站用它；App 侧按入站 tag 在内核的连接记录里认连接时引用同一个常量。
+pub const MIXED_INBOUND_TAG: &str = "mixed-in";
+
+/// 出口探针入站 tag。被路由钉到 `proxy-selector`。单一真值，理由同 [`MIXED_INBOUND_TAG`]。
+pub const PROBE_PROXY_INBOUND_TAG: &str = "probe-proxy-in";
 
 /// 主核测速探测池入站 tag 前缀（§15，`probe-in-{k}`）。
 ///
@@ -69,6 +77,8 @@ pub fn build_id_to_tag_map<S: ServerLike>(
             let trimmed = s.name().trim();
             if trimmed.is_empty() {
                 UNNAMED_SERVER.to_string()
+            } else if trimmed.starts_with("rule-sel-") {
+                format!("node-{trimmed}")
             } else {
                 trimmed.to_string()
             }
@@ -270,9 +280,6 @@ pub fn apply_rule_set_prune(
     dropped
 }
 
-/// issue #147 本地 race DNS server tag。迁移后只供节点 **dial-side** `domain_resolver` 使用。
-pub const DNS_NODE_RACE_TAG: &str = "dns-node-race";
-
 /// race 总开关：resolveNodeDomainsAhead !== false。上游 `isNodeRaceOn`。
 pub fn is_node_race_on(resolve_node_domains_ahead: Option<bool>) -> bool {
     resolve_node_domains_ahead != Some(false)
@@ -296,7 +303,7 @@ fn effective_single_resolver_id(
 }
 
 /// 节点域名解析器 → DNS server tag。上游 `getNodeResolverTag`。
-/// race on：dial → dns-node-race，DNS rule → dns-domestic（原生规则路径，不再借 sidecar）。
+/// 原生竞速由 outbounds 直接绑定 policy；此函数只为显式 server 型解析器选 tag。
 /// race off → 按 single id（dnspod→dns-node / system→dns-local[TUN rule→dns-node] / ali→dial/rule 各基线）。
 pub fn get_node_resolver_tag(
     resolve_node_domains_ahead: Option<bool>,
@@ -307,7 +314,7 @@ pub fn get_node_resolver_tag(
 ) -> String {
     if is_node_race_on(resolve_node_domains_ahead) {
         return match ctx {
-            NodeResolverCtx::Dial => DNS_NODE_RACE_TAG.to_string(),
+            NodeResolverCtx::Dial => "dns-bootstrap".to_string(),
             NodeResolverCtx::Rule => "dns-domestic".to_string(),
         };
     }
@@ -361,7 +368,7 @@ pub fn get_node_dial_domain_resolver(tag: &str, enable_ipv6: bool) -> DomainReso
     }
 }
 
-/// 国内内容解析器 → server tag。节点 sidecar 不再承担普通内容解析，恒返回调用方基线。
+/// 国内内容解析器 → server tag。普通内容不进入节点策略，恒返回调用方基线。
 pub fn get_domestic_resolver_tag(
     _resolve_node_domains_ahead: Option<bool>,
     fallback: &str,
@@ -434,3 +441,14 @@ fn prune_rules(rules: Vec<RouteRule>, unreachable: &BTreeSet<String>) -> Vec<Rou
 
 #[cfg(test)]
 mod tests;
+
+/// Injective custom-rule tags, disjoint from app selector and node namespaces.
+pub fn custom_rule_selector_tag(id: &str) -> String {
+    let escaped = id.replace('~', "~7e");
+    let escaped = if let Some(rest) = escaped.strip_prefix("app-") {
+        format!("~61pp-{rest}")
+    } else {
+        escaped
+    };
+    format!("rule-sel-{escaped}")
+}

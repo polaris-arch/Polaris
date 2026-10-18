@@ -8,12 +8,12 @@ use crate::user_config::rule::{
 };
 use crate::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
 
-/// 构造最小 GenerateConfigDeps（Linux、race off、无 probe、FS 全 false）。
+/// 构造最小 GenerateConfigDeps（Linux、无 probe、FS 全 false）。
 fn deps_default() -> GenerateConfigDeps {
     GenerateConfigDeps {
         platform: "linux".into(),
         arch: "x64".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
         debug_probe_mixed_udp: false,
@@ -22,8 +22,7 @@ fn deps_default() -> GenerateConfigDeps {
         loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         has_cronet: true,
         cronet_copy_failed: false,
         has_management_api: false,
@@ -122,6 +121,24 @@ fn android_single_no_exit_ts_precompiles_both_policies_with_dashboard() {
     );
     assert_eq!(ordinary.route, mesh.route);
     assert_eq!(ordinary.dns, mesh.dns);
+    let scoped = |value: &SingBoxConfig| {
+        value
+            .dns
+            .as_ref()
+            .unwrap()
+            .rules
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule.resolver_policy.is_some())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(scoped(&ordinary), scoped(&ordinary_base));
+    assert!(scoped(&ordinary)
+        .iter()
+        .all(|rule| rule.clash_mode.is_none()));
+
     assert!(compiled_projection_matches_base(
         &ordinary,
         &ordinary_base,
@@ -167,6 +184,58 @@ fn existing_third_clash_mode_rejects_compilation_without_mutating_config() {
         "normal"
     ));
     assert_eq!(normal, before);
+}
+
+#[test]
+fn differing_node_policy_rejects_dual_mode_without_partial_mutation() {
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "ts".into(),
+        name: "Tailnet".into(),
+        protocol: Protocol::Tailscale,
+        tailscale_settings: Some(Box::default()),
+        ..Default::default()
+    });
+    let mut deps = deps_default();
+    deps.platform = "android".into();
+    deps.has_management_api = true;
+    let normal = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    config.selected_server_id = Some("ts".into());
+    let mesh = generate_base_config(&config, &BTreeMap::new(), &deps, &BTreeMap::new())
+        .unwrap()
+        .config;
+    for mutation in ["timeout", "protection", "missing"] {
+        let mut changed = mesh.clone();
+        let rules = changed.dns.as_mut().unwrap().rules.as_mut().unwrap();
+        let position = rules
+            .iter()
+            .position(|rule| {
+                rule.resolver_policy.is_some() && rule.action.as_deref() == Some("evaluate")
+            })
+            .unwrap();
+        match mutation {
+            "timeout" => rules[position].timeout = Some("1s".into()),
+            "protection" => {
+                rules
+                    .iter_mut()
+                    .find(|rule| rule.resolver_policy.is_some())
+                    .unwrap()
+                    .server = Some("dns-domestic".into())
+            }
+            "missing" => {
+                rules.remove(position);
+            }
+            _ => unreachable!(),
+        }
+        let mut actual = normal.clone();
+        assert!(
+            !super::super::mesh_mode::try_compile(&mut actual, &normal, &changed, "normal"),
+            "{mutation}"
+        );
+        assert_eq!(actual, normal, "{mutation}");
+    }
 }
 
 #[test]
@@ -442,14 +511,7 @@ fn dns_references_rule_set(config: &SingBoxConfig, tag: &str) -> bool {
     config
         .dns
         .as_ref()
-        .and_then(|dns| dns.rules.as_deref())
-        .unwrap_or(&[])
-        .iter()
-        .any(|rule| match rule.rule_set.as_ref() {
-            Some(OneOrMany::One(value)) => value == tag,
-            Some(OneOrMany::Many(values)) => values.iter().any(|value| value == tag),
-            None => false,
-        })
+        .is_some_and(|dns| dns_rule_set_references(dns).contains(tag))
 }
 
 /// DNS 规则与流量规则的作用域不同：前者在 smart/global/direct 都生效，后者只在 smart
@@ -472,8 +534,23 @@ fn dns_local_rule_set_definitions_follow_dns_across_modes_without_preloading_unu
                         .custom_rules
                         .push(traffic_rule_set_rule("traffic-rule", "dns-resource"));
                 }
+                let dir = tempfile::tempdir().unwrap();
+                // Actual JSON bytes cannot satisfy the SRS magic callback. This used to
+                // be hidden by an unconditional true stub for both resource formats.
+                let content: &[u8] = match format {
+                    RuleResourceFormat::Source => {
+                        br#"{"version":3,"rules":[{"domain":["api.example.com"]}]}"#
+                    }
+                    RuleResourceFormat::Binary => b"SRS\x03",
+                };
+                std::fs::write(dir.path().join("dns-resource.srs"), content).unwrap();
                 let mut deps = deps_default();
-                deps.is_valid_srs_fn = |_| true;
+                deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
+                deps.is_valid_srs_fn = |path| {
+                    crate::user_config::builtin_geo_rulesets::is_valid_srs_file(
+                        std::path::Path::new(path),
+                    )
+                };
 
                 let outcome =
                     generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps)
@@ -900,37 +977,42 @@ fn naive_with_cronet_is_usable() {
 }
 
 #[test]
-fn race_off_forces_resolve_node_domains_ahead_false() {
-    // raceServerPort=0 → withRaceOff → dnsConfig.resolveNodeDomainsAhead=false。
-    // 不应有 dns-node-race server（race off）。
+fn snapshots_emit_native_policy_without_runtime_listener() {
     let result =
         generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps_default()).unwrap();
     let dns = result.dns.as_ref().unwrap();
-    assert!(
-        dns.servers.iter().all(|s| s.tag != "dns-node-race"),
-        "race off 不生成 dns-node-race"
-    );
+    assert!(dns
+        .rules
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|r| r.resolver_policy.as_deref() == Some(crate::node_dns::POLICY)));
+    assert!(!dns
+        .servers
+        .iter()
+        .any(|s| s.server.as_deref() == Some("127.0.0.1")));
 }
 
 #[test]
-fn race_on_emits_race_server() {
-    // raceServerPort>0 → dns-node-race server。
-    let mut deps = deps_default();
-    deps.race_server_port = 5353;
-    let result = generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps).unwrap();
-    let dns = result.dns.as_ref().unwrap();
-    assert!(
-        dns.servers.iter().any(|s| s.tag == "dns-node-race"),
-        "race on 生成 dns-node-race"
-    );
+fn saved_explicit_disable_keeps_single_resolver() {
+    let mut cfg = base_config();
+    cfg.dns_config = Some(crate::user_config::dns_config::DnsConfig {
+        resolve_node_domains_ahead: Some(false),
+        ..Default::default()
+    });
+    let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
+    assert!(result
+        .dns
+        .unwrap()
+        .rules
+        .unwrap()
+        .iter()
+        .all(|r| r.resolver_policy.is_none()));
 }
 
 #[test]
-fn race_sidecar_is_referenced_only_by_node_dial_resolution() {
-    use crate::singbox::DomainResolver;
-
-    let mut deps = deps_default();
-    deps.race_server_port = 5353;
+fn native_policy_is_referenced_only_by_node_dial_resolution() {
+    let deps = deps_default();
     let result = generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps).unwrap();
 
     let node_outbound = result
@@ -938,16 +1020,9 @@ fn race_sidecar_is_referenced_only_by_node_dial_resolution() {
         .iter()
         .find(|outbound| outbound.server.as_deref() == Some("hk.example.com"))
         .expect("节点出站应存在");
-    let dial_resolver_server = match node_outbound.domain_resolver.as_ref() {
-        Some(DomainResolver::Tag(server)) | Some(DomainResolver::Detailed { server, .. }) => {
-            Some(server.as_str())
-        }
-        None => None,
-    };
     assert_eq!(
-        dial_resolver_server,
-        Some("dns-node-race"),
-        "sidecar 只服务节点拨号前的服务器域名解析"
+        node_outbound.domain_resolver,
+        Some(crate::node_dns::resolver())
     );
 
     let node_dns_rule = result
@@ -995,61 +1070,32 @@ fn dns_direct_ports(result: &SingBoxConfig) -> Vec<u32> {
     }
 }
 
-/// 【不变式：`race_server_port == 0` 时上游两轴一律不透传】
-///
-/// race off 与「起 sidecar 失败」在生成侧是同一种状态（port=0）。此时哪怕 deps 里还残留着上一轮的
-/// 上游 IP/端口（运行期状态翻转与 config 生成之间有窗口），也不得放行 —— 放行一个没人在监听的
-/// 端口是白开口子，且会让金样输出随残留值漂移。
-///
-/// **变异锁**：把 `deps.race_server_port > 0` 的门去掉（两轴无条件透传）→ 本测的
-/// 「`8443` 不得出现」转红；只对 IP 轴留门、端口轴直传 → 同样转红。
 #[test]
-fn race_off_drops_both_upstream_axes() {
-    let mut deps = deps_default();
-    deps.race_server_port = 0; // race off
-    deps.race_upstream_ips = vec!["9.9.9.9".to_string()]; // 残留值
-    deps.race_upstream_ports = vec![8443];
-    let result = generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps).unwrap();
-
-    assert_eq!(
-        dns_direct_ports(&result),
-        vec![53, 443],
-        "race off → 端口集回基线"
-    );
-    let route = result.route.as_ref().unwrap();
-    assert!(
-        !route.rules.iter().any(|r| r
-            .ip_cidr
-            .as_ref()
-            .is_some_and(|c| c.contains(&"9.9.9.9/32".to_string()))),
-        "race off → 残留的上游 IP 同样不得放行"
-    );
+fn native_dns_keeps_only_independent_bootstrap_route_exemptions() {
+    let result =
+        generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps_default()).unwrap();
+    assert_eq!(dns_direct_ports(&result), vec![53, 443]);
 }
 
-/// 【不变式：race on 时上游两轴**一起**透传到 route】
-///
-/// **变异锁**：把 `race_upstream_ports` 那路改成恒 `Vec::new()`（只传 IP）→ `8443` 断言转红。
 #[test]
-fn race_on_forwards_both_upstream_axes_to_route() {
-    let mut deps = deps_default();
-    deps.race_server_port = 5353;
-    deps.race_upstream_ips = vec!["9.9.9.9".to_string()];
-    deps.race_upstream_ports = vec![8443];
-    let result = generate_sing_box_config(&base_config(), &BTreeMap::new(), &deps).unwrap();
-
-    let ports = dns_direct_ports(&result);
-    assert!(
-        ports.contains(&8443),
-        "上游端口须随 IP 一起进直连放行（两轴缺一规则匹配不上），实得 {ports:?}"
-    );
-    let route = result.route.as_ref().unwrap();
-    assert!(
-        route.rules.iter().any(|r| r
-            .ip_cidr
-            .as_ref()
-            .is_some_and(|c| c.contains(&"9.9.9.9/32".to_string()))),
-        "上游 IP 须进直连放行"
-    );
+fn native_custom_upstream_does_not_add_route_exemptions() {
+    let mut cfg = base_config();
+    cfg.dns_config = Some(crate::user_config::dns_config::DnsConfig {
+        node_resolver_pool: Some(vec!["custom".into()]),
+        node_resolver_custom: Some(vec![crate::user_config::dns_config::CustomDnsUpstream {
+            id: "custom".into(),
+            spec: "https://9.9.9.9:8443/q".into(),
+        }]),
+        ..Default::default()
+    });
+    let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
+    assert_eq!(dns_direct_ports(&result), vec![53, 443]);
+    assert!(result
+        .dns
+        .unwrap()
+        .servers
+        .iter()
+        .any(|s| s.server_port == Some(8443) && s.detour.is_none()));
 }
 
 #[test]
@@ -1982,33 +2028,20 @@ fn fix_route_dead_references_applied() {
 }
 
 #[test]
-fn with_race_off_sets_resolve_ahead_false() {
-    let mut cfg = UserConfig::default();
-    cfg.dns_config = Some(crate::user_config::dns_config::DnsConfig {
-        resolve_node_domains_ahead: Some(true),
-        ..Default::default()
-    });
-    let off = with_race_off(&cfg);
-    assert_eq!(
-        off.dns_config.as_ref().unwrap().resolve_node_domains_ahead,
-        Some(false)
-    );
-}
-
-#[test]
-fn with_race_off_preserves_other_dns_fields() {
-    let mut cfg = UserConfig::default();
+fn generation_preserves_saved_node_dns_preferences() {
+    let mut cfg = base_config();
     cfg.dns_config = Some(crate::user_config::dns_config::DnsConfig {
         resolve_node_domains_ahead: Some(true),
         optimistic_cache: Some(true),
         ..Default::default()
     });
-    let off = with_race_off(&cfg);
-    // optimistic_cache 原样保留。
+    let before = cfg.clone();
+    let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
     assert_eq!(
-        off.dns_config.as_ref().unwrap().optimistic_cache,
-        Some(true)
+        serde_json::to_value(&cfg).unwrap(),
+        serde_json::to_value(&before).unwrap()
     );
+    assert_eq!(result.dns.unwrap().optimistic, Some(true));
 }
 
 #[test]
@@ -2185,4 +2218,134 @@ fn inbound_exclude_warn_survives_full_assembly() {
         warns.iter().any(|m| m.contains("非法/过宽网段")),
         "InboundsDeps.log 透传断裂：完整装配路径下未见「连入来源排除」非法段告警。实际: {warns:?}"
     );
+}
+
+#[test]
+fn dns_and_source_rule_set_closes_graph_across_modes_and_missing_binary_fails_closed() {
+    use crate::user_config::rule::{CombineMode, RuleCondition};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("source.srs"),
+        br#"{"version":3,"rules":[{"domain_suffix":["example.com"]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.srs"), b"corrupt").unwrap();
+    for mode in [ProxyMode::Smart, ProxyMode::Global, ProxyMode::Direct] {
+        let mut config = base_config();
+        config.proxy_mode = mode;
+        config.rule_resources = vec![
+            rule_resource("source", RuleResourceFormat::Source),
+            rule_resource("broken", RuleResourceFormat::Binary),
+        ];
+        let mut rule = dns_rule_set_rule("dns-and-source", "source");
+        rule.combine_mode = Some(CombineMode::And);
+        rule.conditions = Some(vec![
+            RuleCondition {
+                type_field: RuleType::Domain,
+                values: vec!["api.example.com".into()],
+            },
+            RuleCondition {
+                type_field: RuleType::RuleSet,
+                values: vec!["res:source".into()],
+            },
+        ]);
+        config.custom_rules = vec![rule.clone()];
+        let mut deps = deps_default();
+        deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
+        deps.is_valid_srs_fn = |path| {
+            crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path))
+        };
+        let built = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert!(
+            dns_references_rule_set(&built, "local-rs-source"),
+            "{mode:?}"
+        );
+        assert_eq!(route_rule_set_count(&built, "local-rs-source"), 1);
+        config.custom_rules[0].conditions.as_mut().unwrap()[1].values = vec!["res:broken".into()];
+        let broken = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert!(!dns_references_rule_set(&broken, "local-rs-broken"));
+        assert_eq!(route_rule_set_count(&broken, "local-rs-broken"), 0);
+        assert!(
+            !broken
+                .dns
+                .unwrap()
+                .rules
+                .unwrap()
+                .iter()
+                .any(|rule| rule.type_field.as_deref() == Some("logical")),
+            "missing AND resource must remove the entire predicate, not broaden it"
+        );
+    }
+}
+
+#[test]
+fn unresolved_nested_dns_rules_preserve_and_or_fail_closed_semantics() {
+    let child = |tag: &str| DnsRule {
+        rule_set: Some(OneOrMany::One(tag.into())),
+        ..Default::default()
+    };
+    let logical = |mode: &str| DnsRule {
+        type_field: Some("logical".into()),
+        mode: Some(mode.into()),
+        rules: Some(vec![child("present"), child("missing")]),
+        action: Some("reject".into()),
+        ..Default::default()
+    };
+    let defined = BTreeSet::from(["present".to_string()]);
+    let mut pruned = BTreeSet::new();
+    let mut and = logical("and");
+    assert!(!retain_defined_dns_rule_sets(
+        &mut and,
+        &defined,
+        &mut pruned
+    ));
+    assert!(pruned.contains("missing"));
+    let mut or = logical("or");
+    assert!(retain_defined_dns_rule_sets(&mut or, &defined, &mut pruned));
+    assert_eq!(or.rules.as_ref().unwrap().len(), 1);
+    assert_eq!(or.action.as_deref(), Some("reject"));
+    let mut empty = logical("or");
+    assert!(!retain_defined_dns_rule_sets(
+        &mut empty,
+        &BTreeSet::new(),
+        &mut pruned
+    ));
+}
+
+#[test]
+fn dns_geosite_source_fallback_keeps_its_declared_format_across_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("geosite-cn.srs"),
+        br#"{"version":3,"rules":[{"domain_suffix":["example.cn"]}]}"#,
+    )
+    .unwrap();
+    for mode in [ProxyMode::Smart, ProxyMode::Global, ProxyMode::Direct] {
+        let mut config = base_config();
+        config.proxy_mode = mode;
+        config.rule_resources = vec![rule_resource("geosite-cn", RuleResourceFormat::Source)];
+        let mut rule = dns_rule_set_rule("dns-source-geo", "unused");
+        rule.type_field = RuleType::Geosite;
+        rule.values = vec!["cn".into()];
+        config.custom_rules = vec![rule];
+        let mut deps = deps_default();
+        deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
+        deps.is_valid_srs_fn = |path| {
+            crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path))
+        };
+        let built = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap();
+        assert!(dns_references_rule_set(&built, "geosite-cn"), "{mode:?}");
+        let definitions: Vec<_> = built
+            .route
+            .as_ref()
+            .unwrap()
+            .rule_set
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|rule_set| rule_set.tag == "geosite-cn")
+            .collect();
+        assert_eq!(definitions.len(), 1, "{mode:?}");
+        assert_eq!(definitions[0].format, "source");
+    }
 }

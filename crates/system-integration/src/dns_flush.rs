@@ -1,8 +1,8 @@
-//! OS 级 DNS 缓存刷新命令构造（三平台，best-effort）。
+//! OS DNS cache flushing: native Windows API, commands on macOS/Linux (best-effort).
 //!
-//! 1:1 移植自 上游 `os-dns-flush.ts`。模块只构造命令 + 编排降级；真实 exec 经 trait 注入（不触碰宿主）。
+//! Execution is injected so orchestration tests never touch the host resolver.
 //!
-//! 不变量（对齐 Polaris）：永不抛——刷缓存是增益项，绝不阻塞代理生命周期；每个命令 3s 硬超时。
+//! Cache failure is advisory. Commands have a 3s kill budget; native RPC has a 3s caller wait.
 
 #![forbid(unsafe_code)]
 
@@ -22,7 +22,53 @@ pub type FlushCommand = Command;
 /// 命令执行器（注入便于 mock；真实实现带超时）。
 /// 失败返回 Err（调用方降级为告警，不抛）。
 pub trait FlushExec {
+    /// Queried at execution time, again after any blocking helper request.
+    /// A cancelled Windows session end must permit subsequent ordinary flushes.
+    fn windows_session_ending(&self) -> bool {
+        false
+    }
+
+    /// Native Windows cache operation. An executor must explicitly provide it;
+    /// an arbitrary CommandRunner must never silently fall back to a console child.
+    fn windows_flush(&self, _timeout: Duration) -> Result<(), String> {
+        Err("native Windows DNS cache executor unavailable".into())
+    }
+
     fn exec(&self, cmd: &FlushCommand, timeout: Duration) -> Result<(), String>;
+}
+
+pub(crate) struct ProductionFlushExec;
+
+impl FlushExec for ProductionFlushExec {
+    fn windows_session_ending(&self) -> bool {
+        #[cfg(windows)]
+        {
+            crate::windows_session::is_ending()
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn windows_flush(&self, timeout: Duration) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            crate::windows_dns::begin_flush()?.wait(timeout)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            Err("native Windows DNS cache executor unavailable on this platform".into())
+        }
+    }
+
+    fn exec(&self, cmd: &FlushCommand, timeout: Duration) -> Result<(), String> {
+        // A worker can have been queued before the OS started ending the session.
+        // Recheck on the local execution leg, not only when the task was queued.
+        if self.windows_session_ending() {
+            return Err("Windows session ending; DNS flush not launched".into());
+        }
+        crate::exec::StdCommandRunner.run(cmd, timeout).map(|_| ())
+    }
 }
 
 /// [`FlushExec`] 的生产实现：委托 [`CommandRunner`]（硬超时在其中落实）。
@@ -40,17 +86,6 @@ impl<R: CommandRunner> FlushExec for R {
 /// 上游 `flushOsDnsCache` darwin 降级腿。
 pub fn mac_user_flush_command() -> FlushCommand {
     Command::new("/usr/bin/dscacheutil", ["-flushcache"])
-}
-
-/// Windows 命令：`ipconfig /flushdns`。
-///
-/// 用 System32 绝对路径（上游 `WindowsSystemProxy` 的 `ipconfigExe = system32('ipconfig.exe')` 同因）：
-/// 部分设备 PATH 缺 `C:\Windows\System32` → 裸 `ipconfig` 报「不是内部或外部命令」。见 [`crate::exec::system32`]。
-pub fn windows_flush_command() -> FlushCommand {
-    Command::new(
-        crate::exec::system32_from_env("ipconfig.exe"),
-        ["/flushdns"],
-    )
 }
 
 /// Linux 命令：`resolvectl flush-caches`。
@@ -105,8 +140,8 @@ fn helper_flush_succeeded(
 /// 刷 OS DNS 缓存。best-effort、永不抛（失败仅 on_warn）。
 ///
 /// - mac：helper 可用且 ok → 用 helper；否则降级 `dscacheutil -flushcache`。
-/// - win：**helper ready 且** ok → 用 helper（SYSTEM 下 `ipconfig /flushdns`）；否则降级本地
-///   `ipconfig /flushdns`（Medium IL 多半 rc=1，best-effort）。
+/// - win：helper ready 且 ok → 用 SYSTEM 原生 DNS API；否则只试本地原生 API。
+///   不可用/无权限仅告警，绝不回退创建命令行进程。
 /// - linux：`resolvectl flush-caches`。
 /// - android：no-op（见下方臂上注释）。
 /// - 其它：no-op。
@@ -119,7 +154,7 @@ fn helper_flush_succeeded(
 /// 它说的是「你装了 helper，但它这次没干成」）。
 ///
 /// mac 腿蓄意不走这个门：那边的降级目标 `dscacheutil` 在用户级**真的能刷**，多试一次的成本与
-/// Windows 腿（降级目标 Medium IL 下几乎恒 rc=1）不是一回事，改它属于另一个取舍，不在本条射程。
+/// Windows 腿（本地原生 API 仍可能被权限拒绝）不是一回事。
 ///
 /// 上游 `flushOsDnsCache`。
 pub fn flush_os_dns_cache<E: FlushExec>(
@@ -142,20 +177,23 @@ pub fn flush_os_dns_cache<E: FlushExec>(
                     false
                 })
         }
-        // D4：Windows 与 mac 同形。app 是 Medium IL，`ipconfig /flushdns` 在该权限下 rc=1 ——
-        // 这条腿此前**恒失败**，停核后 FakeIP（198.18.x）留在系统缓存里继续命中。装了 helper 就走
-        // SYSTEM 那条；旧 helper 回 `ERR unknown` / 通信失败 → 仍跑本地 ipconfig（best-effort，
-        // 不比改动前差），降级判定就地完成，不外溢给调用方。
-        //
-        // `helper_ready` 是**前置**判据（spec §3.1「if helper ready」）：没装 helper 的机器直接走
-        // 降级腿，一条 warn 都不发 —— 见本函数头注「只门住装没装，不门住失败」。
+        // The separate native helper command cannot execute an old helper's ipconfig leg.
+        // Both fallback and helper paths use DNS API calls, including queued/in-flight work.
         Platform::Win => {
-            if helper_ready
-                && helper_flush_succeeded(helper_flush, "Medium IL ipconfig（多半无权限）", on_warn)
+            if exec.windows_session_ending() {
+                on_warn("Windows session ending; skipping DNS flush");
+                return false;
+            }
+            if helper_ready && helper_flush_succeeded(helper_flush, "本地原生 DNS API", on_warn)
             {
                 return true;
             }
-            exec.exec(&windows_flush_command(), EXEC_TIMEOUT)
+            // Recheck after blocking IPC; optional cache work must not extend session end.
+            if exec.windows_session_ending() {
+                on_warn("Windows session ending; skipping local DNS flush fallback");
+                return false;
+            }
+            exec.windows_flush(EXEC_TIMEOUT)
                 .map(|()| true)
                 .unwrap_or_else(|e| {
                     on_warn(&format!("刷新系统 DNS 缓存失败（忽略）: {e}"));

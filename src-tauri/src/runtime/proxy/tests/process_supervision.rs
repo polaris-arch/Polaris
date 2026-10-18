@@ -2,6 +2,7 @@ use super::*;
 
 mod direct_stop;
 mod native_direct_stop;
+mod startup_observation;
 
 #[cfg(target_os = "linux")]
 struct BirthDaemonStream {
@@ -72,6 +73,28 @@ fn birth_daemon_runtime(
         Arc::new(connector),
     );
     (test_runtime_in_on(dir.clone(), helper), dir, frames)
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_birth_started_reply(pid: u32, birth: &str) -> String {
+    let id = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    let target = exact_helper_target(pid, birth);
+    format!(
+        "{}\n",
+        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::PinnedStart {
+            id,
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(
+                polaris_helper_proto::LinuxBirthStart::Started {
+                    target,
+                    timing: None
+                },
+            ),
+        },)
+        .to_wire_line()
+    )
 }
 
 fn android_target(run_id: &str) -> super::super::android_bridge::AndroidExactTarget {
@@ -186,6 +209,59 @@ async fn legacy_helper_ack_keeps_main_birth_and_backend_custody() {
     assert!(rt.child.lock().unwrap().has_helper_start());
     assert_eq!(*rt.pid.lock().unwrap(), Some(7123));
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
+}
+
+/// The desktop "stop, then log out" flow calls logout as soon as Stop returns. Stop releases
+/// the main claim before it returns, so that logout is admitted without waiting.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn confirmed_stop_releases_the_main_claim_before_it_returns_so_logout_is_admitted() {
+    use super::super::startup::HelperStartCompletion;
+    use crate::runtime::helper::HelperStartResult;
+    let pid = 7124;
+    let hex = "ffeeddccbbaa99887766554433221100";
+    let (rt, _dir, _frames) = birth_daemon_runtime([format!("OK birth-stopped {pid} {hex}\n")]);
+    let registry = rt.mesh.login_registry_for_test();
+    let admitted = || async {
+        registry
+            .logout(
+                "stop-then-logout",
+                &|| rt.tailscale_writer_alive(),
+                None,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap()
+    };
+    {
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let state = rt.mesh.tailscale_state_dir("stop-then-logout").unwrap();
+        let token = rt.mesh.mint_tailscale_main_birth();
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+                &gate,
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        let attempt = rt
+            .register_helper_start_backend_with_main(Some(token))
+            .unwrap();
+        HelperStartCompletion::for_test(&rt, attempt)
+            .publish(&Ok(HelperStartResult::BirthStarted(exact_helper_target(
+                pid, hex,
+            ))))
+            .unwrap();
+        reservation.arm_external_start();
+    }
+    assert!(!admitted().await, "the running main core holds the node");
+    {
+        let gate = rt.mesh.tailscale_state_gate().await;
+        rt.kill_core_and_release_main(&gate).await.unwrap();
+    }
+    assert!(admitted().await, "logout right after the confirmed Stop");
 }
 
 #[cfg(target_os = "linux")]
@@ -864,7 +940,10 @@ async fn direct_stopping_custody_keeps_real_child_and_retires_legacy_observers()
         rt.child.lock().unwrap().take_running_legacy(),
         Err(TakeRunningError::Stopping)
     ));
-    assert!(!rt.child.lock().unwrap().is_running_alive());
+    assert_eq!(
+        rt.child.lock().unwrap().startup_observation(),
+        ChildObservation::Absent
+    );
     assert!(!rt.child.lock().unwrap().running_matches(&identity));
     assert!(!rt.child.lock().unwrap().running_exit_proven(&identity));
 
@@ -910,7 +989,7 @@ async fn occupied_direct_slot_rejects_start_before_retiring_old_session() {
         running: true,
         ..Default::default()
     };
-    rt.set_race_server(5353, vec!["1.1.1.1".into()], vec![443]);
+
     rt.core_via_helper.store(true, Ordering::SeqCst);
     let old_generation = rt.gate.generation();
     let starter = {
@@ -938,7 +1017,6 @@ async fn occupied_direct_slot_rejects_start_before_retiring_old_session() {
     assert!(error.admission_denied);
     assert_eq!(rt.gate.generation(), old_generation);
     assert_eq!(clearer_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(rt.race_server_port(), 5353);
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     assert!(rt.status().running);
     assert!(rt.child.lock().unwrap().running_matches(&identity));
@@ -1011,7 +1089,7 @@ async fn occupied_direct_slot_rechecks_after_waiting_for_ts_gate() {
         running: true,
         ..Default::default()
     };
-    rt.set_race_server(5353, vec!["1.1.1.1".into()], vec![443]);
+
     drop(held_gate);
 
     let error = starter
@@ -1020,7 +1098,6 @@ async fn occupied_direct_slot_rechecks_after_waiting_for_ts_gate() {
         .expect_err("late occupied slot must reject before preflight");
     assert!(error.admission_denied);
     assert_eq!(clearer_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(rt.race_server_port(), 5353);
     assert!(rt.status().running);
     assert!(rt.child.lock().unwrap().running_matches(&identity));
     assert!(pid_alive(pid));
@@ -1069,19 +1146,417 @@ async fn newly_claimed_start_supersedes_an_old_direct_spawn() {
     let _ = starter.await.expect("new start task completes");
 }
 
+/// 太旧的提权助手：起核前的能力探测得到「不认识这条命令」⇒ 这次起核落「去装 / 升级助手」的码，
+/// 两个出口（状态 + 返回值）一致，且没有发出任何起核命令。
+///
+/// 守的是这条链：上一代助手要执行的内核文件已不在（配置根下的旧内核目录在启动时被清掉），
+/// 而那一代助手必然答不上这条探测。用户看到的必须是指向助手的引导，不是「检查服务器配置」。
+///
+/// **变异探针**：把 `birth_capability_error_code` 里 `HelperOutdated` 改落 `STARTUP_FAILED` ⇒
+/// 两条码断言转红。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_outdated_helper_fails_the_start_with_the_helper_code_before_any_start_command() {
+    let (rt, _dir, frames) = birth_daemon_runtime(["ERR unknown\n".to_owned()]);
+    let error = rt.start(tun_config()).await.unwrap_err();
+    assert_eq!(error.code, Some(code::HELPER_NOT_INSTALLED), "{error}");
+    assert_eq!(
+        rt.status().error_code.as_deref(),
+        Some(code::HELPER_NOT_INSTALLED)
+    );
+    assert_eq!(
+        *frames.lock().unwrap(),
+        ["status-birth-safe\n"],
+        "只应发出只读的能力探测"
+    );
+    assert!(!rt.child.lock().unwrap().has_helper_start());
+}
+
+/// Windows 上结束一个本用户的进程：清扫的结束原语之后它确实退出，探活原语随之判不活。
+///
+/// 走的是生产的 [`NativeStaleCoreIo`]，候选取自真实扫描（带着扫描时留住的句柄）。替身用系统
+/// 自带的 PowerShell 睡眠（不读标准输入、不碰网络；本仓别的 Windows 夹具也用它）。
+/// 自己持有 `Child` 句柄到断言结束 ⇒ 这个 pid 在此期间不会被别的进程复用。
+#[cfg(windows)]
+#[test]
+fn windows_stale_core_io_ends_the_scanned_process_and_liveness_follows() {
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("起替身进程");
+    let pid = child.id();
+    assert!(pid_alive(pid), "前提：替身在跑");
+    let scanned = polaris_core_supervisor::scan_running_cores()
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .expect("扫描结果里应有替身进程");
+    assert_eq!(
+        scanned.owner,
+        polaris_core_supervisor::ProcessOwner::SameUser,
+        "自己起的进程，属主是本用户"
+    );
+    assert!(NativeStaleCoreIo.alive(&scanned), "前提：经句柄看它在跑");
+
+    NativeStaleCoreIo.end(&scanned, Signal::Sigterm);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let exited = loop {
+        if child.try_wait().expect("查询替身状态").is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(exited, "结束原语之后替身必须在上界内退出");
+    assert!(!NativeStaleCoreIo.alive(&scanned), "已退出的进程必须判不活");
+    // 没带句柄的候选（不是扫描出来的）不结束任何进程。
+    NativeStaleCoreIo.end(
+        &polaris_core_supervisor::CoreProcess {
+            pid: std::process::id(),
+            ..Default::default()
+        },
+        Signal::Sigkill,
+    );
+}
+
+/// 自证结论的处置：经提权助手起的核上，版本**确定不同**即停核；其余照旧。
+///
+/// 第二个循环钉住告警的单一真值：应用直起的核上，「落告警」当且仅当 `is_alarm()`。
+///
+/// 版本字符串不符、版本不可读均是非终态诊断，不得升级为停核判据。
+#[test]
+fn version_attestation_remains_a_nonfatal_runtime_diagnostic() {
+    use crate::runtime::core_attest::CoreBinaryAttestation as Attestation;
+    let running = PathBuf::from("/var/lib/polaris/core/sing-box");
+    let mismatch = Attestation::VersionMismatch {
+        running: running.clone(),
+        running_version: "sing-box version 1.14.0-alpha.45".into(),
+        expected_version: "sing-box version 1.14.0-beta.3".into(),
+    };
+    let unreadable = Attestation::VersionUnreadable {
+        running: running.clone(),
+        running_version: String::new(),
+        expected_version: "sing-box version 1.14.0-beta.3".into(),
+    };
+    let same_version = Attestation::SameVersion {
+        running,
+        version: "sing-box version 1.14.0-beta.3".into(),
+    };
+    for (attestation, want) in [
+        (&mismatch, AttestationDisposition::Alarm),
+        (&unreadable, AttestationDisposition::Alarm),
+        (
+            &Attestation::Unobservable,
+            AttestationDisposition::Unobserved,
+        ),
+        (&same_version, AttestationDisposition::Pass),
+        (&Attestation::SamePath, AttestationDisposition::Pass),
+    ] {
+        let got = attestation_disposition(attestation);
+        assert_eq!(got, want, "{attestation:?}");
+        assert_eq!(
+            got == AttestationDisposition::Alarm,
+            attestation.is_alarm(),
+            "告警与否只有 is_alarm 一处真值：{attestation:?}"
+        );
+    }
+}
+
+/// 生产自证只发布诊断；不得通过 stop/kill 改变运行出口或内核状态。
+#[test]
+fn runtime_version_diagnostics_do_not_stop_the_proxy() {
+    let attest = method_body(
+        &module_code("runtime/proxy"),
+        "    async fn attest_running_core_binary(",
+    );
+    assert!(attest.contains("match attestation_disposition(&attestation)"));
+    assert!(attest.contains("self.set_nonfatal_error("));
+    assert!(!attest.contains("stop_inner("));
+    assert!(!attest.contains("stop_mismatched_helper_core("));
+    assert!(!attest.contains("kill_core("));
+}
+
+/// 清扫用例里核二进制的路径：文件名是核文件名、写法随宿主（配置目录是宿主上的临时目录，
+/// 判据按配置目录的写法选腿）。
+fn sweep_test_core() -> &'static str {
+    static CORE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CORE.get_or_init(|| {
+        let root = if cfg!(windows) {
+            Path::new(r"C:\Program Files\Polaris\resources\win")
+        } else {
+            Path::new("/opt/polaris/resources/linux")
+        };
+        root.join(crate::runtime::core_paths::core_filename())
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+fn assert_sweep_candidate(rt: &ProxyRuntime, process: &polaris_core_supervisor::CoreProcess) {
+    assert!(
+        polaris_core_supervisor::is_our_core(
+            process,
+            crate::runtime::core_paths::core_filename(),
+            rt.config.dir(),
+        ),
+        "清扫安全用例的前提：pid={} 必须先命中生产核文件名及本 app 配置形态",
+        process.pid,
+    );
+}
+
+/// 清扫的记录桩：记下对谁动过手；`immortal` 里的 pid 怎么结束都还在，其余的一结束就没了。
+#[derive(Default)]
+struct RecordingStaleIo {
+    ended: Mutex<Vec<(u32, Signal)>>,
+    immortal: Vec<u32>,
+}
+
+impl StaleCoreIo for RecordingStaleIo {
+    fn end(&self, process: &polaris_core_supervisor::CoreProcess, signal: Signal) {
+        self.ended.lock().unwrap().push((process.pid, signal));
+    }
+
+    fn alive(&self, process: &polaris_core_supervisor::CoreProcess) -> bool {
+        self.immortal.contains(&process.pid)
+            || !self
+                .ended
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(pid, _)| *pid == process.pid)
+    }
+}
+
+/// 一个运行着本 app 配置目录下 `singbox-runtime.json` 的同形进程，属主由调用方给。
+fn core_shaped(
+    rt: &ProxyRuntime,
+    pid: u32,
+    owner: polaris_core_supervisor::ProcessOwner,
+) -> polaris_core_supervisor::CoreProcess {
+    let process = polaris_core_supervisor::CoreProcess {
+        pid,
+        cmdline: vec![
+            sweep_test_core().to_owned(),
+            "run".to_owned(),
+            "-c".to_owned(),
+            rt.config
+                .dir()
+                .join("singbox-runtime.json")
+                .to_string_lossy()
+                .into_owned(),
+        ],
+        owner,
+        ..Default::default()
+    };
+    assert_sweep_candidate(rt, &process);
+    process
+}
+
+/// 🔴 **别的用户照着写一条同形命令行，起核不受影响**。
+///
+/// 同机另一个用户常驻 `<…/核名> run -c <本用户配置目录>/<x>.json`。属主不是本用户也不是
+/// root / SYSTEM ⇒ 不结束它、不升级到提权清扫、不落 `ROOT_ORPHAN_BLOCKED`，清扫照常返回。
+/// 属主读不到者保持不结束、不升级、不阻断，但单列未知，不能记作其他用户或已清扫。
+///
+/// 时间是暂停的虚拟时钟；本条里没有清扫对象，本就一次等待都不该发生。
+///
+/// **变异探针**：`stale_cores` 不按属主分拨（同形即清扫）⇒ 这个进程被发信号、杀不动、升级，
+/// 本条以 `ROOT_ORPHAN_BLOCKED` 转红。
+#[tokio::test(start_paused = true)]
+async fn a_lookalike_owned_by_another_user_does_not_block_startup() {
+    use polaris_core_supervisor::ProcessOwner;
+    let (rt, _dir) = test_runtime();
+    const FORGED: u32 = 960_001;
+    const UNREADABLE: u32 = 960_002;
+    let io = RecordingStaleIo {
+        immortal: vec![FORGED, UNREADABLE],
+        ..Default::default()
+    };
+    let started = tokio::time::Instant::now();
+    let outcome = rt
+        .sweep_scanned_cores(
+            vec![
+                core_shaped(&rt, FORGED, ProcessOwner::Other),
+                core_shaped(&rt, UNREADABLE, ProcessOwner::Unknown),
+            ],
+            &[],
+            &io,
+        )
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "别人的同形进程不得阻断起核：{:?}",
+        outcome.err().map(|error| error.message)
+    );
+    assert!(
+        io.ended.lock().unwrap().is_empty(),
+        "不得对别人的进程动手：{:?}",
+        io.ended.lock().unwrap()
+    );
+    assert_eq!(rt.status().error_code, None, "不得落任何错误码");
+    assert_eq!(started.elapsed(), Duration::ZERO, "没有清扫对象 ⇒ 不等宽限");
+}
+
+/// 本用户的孤儿照常被清，旁边别人的同形进程原样不动；清完即返回成功。
+///
+/// **变异探针**：把 `sweep_scanned_cores` 里的结束动作删掉 ⇒ 孤儿仍在 ⇒ 升级 ⇒ 本条转红。
+#[tokio::test(start_paused = true)]
+async fn sweep_ends_own_orphans_and_leaves_foreign_lookalikes_alone() {
+    use polaris_core_supervisor::ProcessOwner;
+    let (rt, _dir) = test_runtime();
+    const ORPHAN: u32 = 961_001;
+    const FORGED: u32 = 961_002;
+    const MANAGED: u32 = 961_003;
+    let io = RecordingStaleIo {
+        immortal: vec![FORGED],
+        ..Default::default()
+    };
+    let outcome = rt
+        .sweep_scanned_cores(
+            vec![
+                core_shaped(&rt, ORPHAN, ProcessOwner::SameUser),
+                core_shaped(&rt, FORGED, ProcessOwner::Other),
+                core_shaped(&rt, MANAGED, ProcessOwner::SameUser),
+            ],
+            &[MANAGED],
+            &io,
+        )
+        .await;
+    assert!(outcome.is_ok());
+    assert_eq!(
+        *io.ended.lock().unwrap(),
+        [(ORPHAN, Signal::Sigterm)],
+        "只对本用户的孤儿动手，且它一退就不再补第二级；排除表里的与别人的都不碰"
+    );
+    assert_eq!(rt.status().error_code, None);
+}
+
+/// 提权助手留下的核（root / SYSTEM）杀不动 ⇒ 升级；升级名单里只有它，没有别人的同形进程。
+///
+/// 替身 helper 恒未装 ⇒ 升级腿不发任何 IPC，直接落终态。
+///
+/// **变异探针**：把升级名单换成「全部同形进程」⇒ 消息里出现别人的 pid ⇒ 末条断言转红。
+#[tokio::test(start_paused = true)]
+async fn only_elevated_orphans_reach_the_escalation() {
+    use polaris_core_supervisor::ProcessOwner;
+    let (rt, _dir) = test_runtime();
+    const ROOT_ORPHAN: u32 = 962_001;
+    const FORGED: u32 = 962_002;
+    let io = RecordingStaleIo {
+        immortal: vec![ROOT_ORPHAN, FORGED],
+        ..Default::default()
+    };
+    let error = rt
+        .sweep_scanned_cores(
+            vec![
+                core_shaped(&rt, ROOT_ORPHAN, ProcessOwner::Elevated),
+                core_shaped(&rt, FORGED, ProcessOwner::Other),
+            ],
+            &[],
+            &io,
+        )
+        .await
+        .expect_err("杀不动的提权孤儿必须阻断起核");
+    assert_eq!(error.code, Some(code::ROOT_ORPHAN_BLOCKED));
+    assert_eq!(
+        *io.ended.lock().unwrap(),
+        [
+            (ROOT_ORPHAN, Signal::Sigterm),
+            (ROOT_ORPHAN, Signal::Sigkill)
+        ],
+        "两级都只发给提权孤儿"
+    );
+    assert!(error.message.contains(&ROOT_ORPHAN.to_string()));
+    assert!(
+        !error.message.contains(&FORGED.to_string()),
+        "别人的进程不得出现在让用户去结束的名单里：{}",
+        error.message
+    );
+}
+
+/// 手动收拾的办法随平台：Windows 上没有 `sudo kill`。
+#[test]
+fn manual_orphan_kill_hint_matches_the_platform() {
+    let windows = manual_orphan_kill_hint(Platform::Win, &[11, 22]);
+    assert!(windows.contains("taskkill /F /PID 11 /PID 22"), "{windows}");
+    assert!(!windows.contains("sudo") && !windows.contains("kill -9"));
+    for platform in [Platform::Linux, Platform::Mac] {
+        let unix = manual_orphan_kill_hint(platform, &[11, 22]);
+        assert!(unix.contains("sudo kill -9 11 22"), "{unix}");
+        assert!(!unix.contains("taskkill"));
+    }
+}
+
+/// **接线门**：Windows 上清扫结束进程认的是扫描时留住的句柄，不按号码、不起外部程序。
+///
+/// 取材面是剥掉注释的代码（注释里提到旧写法不算）。`taskkill` 只许出现在给用户看的那句
+/// 手动办法里（字符串字面量，不是被执行的命令）。
+#[test]
+fn windows_sweep_ends_processes_by_held_handle_not_by_pid() {
+    let code = module_code("runtime/proxy");
+    let io = code
+        .split("impl StaleCoreIo for NativeStaleCoreIo")
+        .nth(2)
+        .expect("两份实现（unix / windows），第二份是 Windows 的");
+    let io = &io[..io.find("\n}\n").expect("impl 块结尾")];
+    assert!(
+        io.contains("process.hold.terminate()") && io.contains(".is_running()"),
+        "Windows 的结束与探活必须经扫描时留住的句柄：{io}"
+    );
+    assert!(!io.contains("Command::new"), "不得起外部程序结束进程");
+    assert_eq!(
+        code.matches("taskkill").count(),
+        1,
+        "`taskkill` 只出现在手动办法那一句文案里"
+    );
+    assert!(manual_orphan_kill_hint(Platform::Win, &[1]).contains("taskkill"));
+}
+
 /// ⑩ stale-core 清扫：**本 app** 孤儿被清 + **非本 app** 的 sing-box **不被误杀**（最关键的安全点）。
 ///
-/// - 「本 app 孤儿」= 用 `POLARIS_SINGBOX_PATH` 指向的核二进制直接 spawn（不经 ProxyRuntime → 无句柄管理）。
-/// - 「非本 app」= 把同一核**复制到另一路径**再起 → argv[0] 路径不同 → `is_our_core` 判 false → 存活。
+/// 判据是命令行形状（`polaris_core_supervisor::app_run_config_name`）：绝对路径且文件名为核文件名的
+/// 程序，`run -c`，配置是本 app 配置目录的**直接子项**。两个进程用同一个核文件名、同一个核：
+/// - 「本 app 孤儿」跑配置目录下的 `orphan-ours.json` → 命中 → 被清；
+/// - 「非本 app」跑配置目录**子目录**里的配置 → 不是直接子项 → 不命中 → 存活。
+///
+/// 两者只差配置所在的那一层目录，所以存活的那个不能归因于文件名或子命令不同。
+///
+/// **判据语义于改为「按运行配置归属」之后未实跑**：本机禁止起内核，CI 也不跑 `#[ignore]`。
+/// 下面的断言是对着新判据逐条复核写下的，不是执行结果。
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
+#[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门。判据改为按运行配置归属后未实跑"]
 async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     let _real_core_guard = lock_real_core_tests().await;
     use std::process::Stdio;
-    let (rt, dir, core) = real_core_runtime();
+    let (rt, dir, real_core) = real_core_runtime();
     crate::logging::init(&dir);
+    // 清扫按这个目录认归属；孤儿的配置必须是它的直接子项。
+    assert_eq!(rt.config.dir(), dir.as_path());
+    let core_filename = crate::runtime::core_paths::core_filename();
+    // `POLARIS_SINGBOX_PATH` 指向的文件可以叫任何名字、也可以是相对路径，而判据要求「绝对路径 +
+    // 核文件名」。复制成核文件名再起，否则「本 app 孤儿」那一半根本不会命中。
+    let core_home = dir.join("orphan-core");
+    std::fs::create_dir_all(&core_home).expect("建孤儿核目录");
+    let core = core_home.join(core_filename);
+    #[cfg(unix)]
+    crate::test_support::write_executable_stand_in(
+        &core,
+        std::fs::read(&real_core).expect("读出核以复制到孤儿路径"),
+    );
+    #[cfg(not(unix))]
+    std::fs::copy(&real_core, &core).expect("复制核（非 Unix 无 fork 写句柄继承）");
+    assert!(core.is_absolute(), "判据要求程序是绝对路径");
 
-    // ── 孤儿①（本 app）：用本 app 核路径直接 spawn，不经 ProxyRuntime → 成孤儿 ──
+    // ── 孤儿①（本 app）：直接 spawn，不经 ProxyRuntime → 成孤儿 ──
     let ours_cfg = dir.join("orphan-ours.json");
     write_bare_singbox_config(&ours_cfg, free_port());
     let mut ours_orphan = tokio::process::Command::from(crate::runtime::kernel_run::with_run(
@@ -1099,10 +1574,21 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     // 独立 reaper 从一开始就等待：既不参与杀进程，也能在清扫杀掉它后立即收割。
     let ours_reaper = tokio::spawn(async move { ours_orphan.wait().await });
 
-    // ── 「非本 app」sing-box：复制核到异路径再起 → 路径不同 → 绝不该被误杀 ──
-    let foreign_bin = dir.join("foreign-sing-box");
-    std::fs::copy(&core, &foreign_bin).expect("复制核到异路径（std::fs::copy 保留可执行位）");
-    let foreign_cfg = dir.join("foreign.json");
+    // ── 「非本 app」sing-box：同名核 + 配置目录**子目录**里的配置 → 不是配置目录的直接子项
+    //    ⇒ 不归本 app ⇒ 绝不该被误杀 ──
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("建子目录");
+    let foreign_bin = elsewhere.join(core_filename);
+    #[cfg(unix)]
+    crate::test_support::write_executable_stand_in(
+        &foreign_bin,
+        std::fs::read(&core).expect("读出核以复制到异路径"),
+    );
+    #[cfg(not(unix))]
+    std::fs::copy(&core, &foreign_bin).expect("复制核到异路径");
+    let foreign_cfg = elsewhere.join("foreign.json");
+    assert_eq!(foreign_cfg.parent(), Some(elsewhere.as_path()));
+    assert_ne!(elsewhere.as_path(), rt.config.dir());
     write_bare_singbox_config(&foreign_cfg, free_port());
     let mut foreign = tokio::process::Command::from(crate::runtime::kernel_run::with_run(
         std::process::Command::new(&foreign_bin),
@@ -1112,20 +1598,23 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .spawn()
-    .expect("spawn 非本 app sing-box（异路径）");
+    .expect("spawn 非本 app sing-box（配置在子目录）");
     let foreign_pid = foreign.id().expect("非本 app sing-box pid");
 
     // 等两个核都真正起来。
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(ps_alive(ours_pid), "[⑩] 前提：本 app 孤儿在跑");
     assert!(ps_alive(foreign_pid), "[⑩] 前提：非本 app sing-box 在跑");
-    println!("[⑩] 本 app 孤儿 pid={ours_pid}（{}）", core.display());
     println!(
-        "[⑩] 非本 app sing-box pid={foreign_pid}（{}）",
-        foreign_bin.display()
+        "[⑩] 本 app 孤儿 pid={ours_pid}（配置 {}）",
+        ours_cfg.display()
+    );
+    println!(
+        "[⑩] 非本 app sing-box pid={foreign_pid}（配置 {}）",
+        foreign_cfg.display()
     );
 
-    // ── stale 清扫：按本 app 二进制路径精确判定 ──
+    // ── stale 清扫：按「运行着本 app 配置目录下的配置」判定 ──
     // 同用户起的孤儿用户态就杀得动 → 不该走到 T3 提权腿，必须干净返回 Ok。
     assert!(
         rt.cleanup_stale_cores().await.is_ok(),
@@ -1139,10 +1628,10 @@ async fn real_core_stale_cleanup_kills_own_orphan_spares_foreign() {
         .expect("[⑩] 本 app 孤儿必须在清扫后被 reaper 收割（超时=仍在跑）")
         .expect("[⑩] reaper 任务不应 panic")
         .expect("[⑩] wait 本 app 孤儿不应失败");
-    // 非本 app sing-box（异路径）genuinely 存活（未被杀、非 zombie）→ ps_alive 判据可靠。
+    // 非本 app sing-box genuinely 存活（未被杀、非 zombie）→ ps_alive 判据可靠。
     assert!(
         ps_alive(foreign_pid),
-        "[⑩] **核心安全点**：非本 app 的 sing-box pid={foreign_pid}（异路径）绝不能被误杀"
+        "[⑩] **核心安全点**：非本 app 的 sing-box pid={foreign_pid}（配置不在配置目录直下）绝不能被误杀"
     );
     println!(
         "[⑩] 本 app 孤儿已清（wait 收割确认退出）+ 非本 app sing-box 存活 → 只杀自己、不误杀他人 ✓"
@@ -1637,13 +2126,13 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
     let a_hex = "00112233445566778899aabbccddeeff";
     let b_hex = "11112222333344445555666677778888";
     let (rt, dir, frames) = birth_daemon_runtime([
-        format!("OK birth-started {a_pid} {a_hex}\n"),
+        pinned_birth_started_reply(a_pid, a_hex),
         format!("OK birth-stopped {a_pid} {a_hex}\n"),
-        format!("OK birth-started {b_pid} {b_hex}\n"),
+        pinned_birth_started_reply(b_pid, b_hex),
     ]);
     let gate = rt.mesh.tailscale_state_gate().await;
     let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
-    let binary = dir.join("missing-test-core"); // Reconcile is best effort; no host helper.
+    let binary = dir.join("missing-test-core"); // Selected readiness is an isolated fixture; no host helper.
     let config_path = dir.join("test-core.json");
     let mut a_reservation = rt
         .mesh
@@ -1716,9 +2205,13 @@ async fn mock_daemon_exact_start_stop_start_uses_production_transport_and_custod
             3,
             "only Start A, Stop A, Start B may reach the daemon"
         );
-        assert!(sent[0].starts_with("start-birth-safe\n"));
+        let id = crate::runtime::core_identity::selected_id(
+            crate::runtime::core_identity::current_platform().unwrap(),
+        )
+        .unwrap();
+        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
         assert_eq!(sent[1], format!("stop-birth-safe\n{a_pid}\n{a_hex}\n"));
-        assert!(sent[2].starts_with("start-birth-safe\n"));
+        assert!(sent[2].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
     }
     b_process.start_kill().unwrap();
     b_process.wait().await.unwrap();
@@ -1730,7 +2223,7 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     let pid = u32::MAX; // checked_pid rejects it without probing any host process.
     let hex = "00112233445566778899aabbccddeeff";
     let (rt, dir, frames) = birth_daemon_runtime([
-        format!("OK birth-started {pid} {hex}\n"),
+        pinned_birth_started_reply(pid, hex),
         format!("OK birth-stopped {pid} {hex}\n"),
     ]);
     let gate = rt.mesh.tailscale_state_gate().await;
@@ -1756,7 +2249,8 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
             &mut reservation,
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .message;
     assert!(err.contains("进程不存在"), "{err}");
     drop(reservation);
     assert!(!rt.mesh.main_owns_tailscale("ts-dead-exact-spawn", true));
@@ -1764,8 +2258,69 @@ async fn dead_exact_start_spawn_branch_releases_reserved_main_claim_after_stop_a
     assert!(rt.core_via_helper.load(Ordering::SeqCst));
     let sent = frames.lock().unwrap();
     assert_eq!(sent.len(), 2);
-    assert!(sent[0].starts_with("start-birth-safe\n"));
+    let id = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", id.as_str())));
     assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{hex}\n"));
+}
+
+/// A legacy birth receipt or a different CoreID may identify a process to stop,
+/// but cannot attest a selected Start. Keep the production rejection/cleanup leg
+/// as the negative control for the pinned positive transport fixtures above.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unpinned_and_wrong_id_birth_receipts_are_rejected_and_exact_stopped() {
+    let pid = u32::MAX; // checked_pid refuses this value without a host process probe.
+    let birth = "00112233445566778899aabbccddeeff";
+    let selected = crate::runtime::core_identity::selected_id(
+        crate::runtime::core_identity::current_platform().unwrap(),
+    )
+    .unwrap();
+    let wrong = if selected.as_str() == "b".repeat(64) {
+        "a".repeat(64)
+    } else {
+        "b".repeat(64)
+    };
+    for reply in [
+        format!("OK birth-started {pid} {birth}\n"),
+        format!("OK birth-started {pid} {birth} core={wrong}\n"),
+    ] {
+        let (rt, dir, frames) =
+            birth_daemon_runtime([reply, format!("OK birth-stopped {pid} {birth}\n")]);
+        let gate = rt.mesh.tailscale_state_gate().await;
+        let mut reservation = rt
+            .mesh
+            .reserve_tailscale_main_states(
+                &serde_json::json!({"endpoints": []}),
+                &gate,
+                rt.mesh.mint_tailscale_main_birth(),
+            )
+            .await
+            .unwrap();
+        let user_config: UserConfig = serde_json::from_value(tun_config()).unwrap();
+        let error = rt
+            .spawn_core_via_helper(
+                &dir.join("not-executed-core"),
+                &dir.join("config.json"),
+                &user_config,
+                rt.gate.generation(),
+                &mut reservation,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Some(code::HELPER_CORE_MISMATCH));
+        assert!(error
+            .message
+            .starts_with("helper content identity mismatch;"));
+        assert!(!rt.child.lock().unwrap().has_helper_start());
+        assert!(rt.pid.lock().unwrap().is_none());
+        let sent = frames.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].starts_with(&format!("start-pinned-birth-safe\n{}\n", selected.as_str())));
+        assert_eq!(sent[1], format!("stop-birth-safe\n{pid}\n{birth}\n"));
+    }
 }
 
 #[tokio::test]
@@ -2465,46 +3020,102 @@ async fn stale_sweep_runs_on_every_start_not_only_the_first() {
 /// panic 展开上，无论断言在哪一条失败都清得干净；④ 那一格改用显式 `drop()` 表达「此刻出表」。
 #[test]
 fn stale_sweep_spares_inflight_temp_cores_but_still_kills_real_orphans() {
-    use polaris_core_supervisor::{stale_pids, CoreProcess};
+    use polaris_core_supervisor::{stale_pids, CoreProcess, ProcessOwner};
     // 与在飞 pid 表的其它用例串行：那张表是进程级共享状态，退出清理的用例会**整表排空**。
     let _registry = crate::runtime::speedtest::registry_guard();
     let (rt, _dir) = test_runtime();
 
-    const OURS: &str = "/opt/polaris/resources/linux/sing-box";
+    let ours = sweep_test_core();
     const MANAGED: u32 = 940_001;
     const INFLIGHT: u32 = 940_002;
     const ORPHAN: u32 = 940_003;
     const FOREIGN: u32 = 940_004;
-    let binary = std::path::PathBuf::from(OURS);
+    // 清扫按「核文件名 + 本 app 配置目录下的运行配置」认孤儿；裸文件名的配置落在配置目录下。
+    let config_dir = rt.config.dir().to_path_buf();
     let proc = |pid: u32, args: &[&str]| CoreProcess {
         pid,
-        cmdline: args.iter().map(|s| (*s).to_string()).collect(),
+        cmdline: args
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 3 && !Path::new(s).is_absolute() {
+                    config_dir.join(s).to_string_lossy().into_owned()
+                } else {
+                    (*s).to_string()
+                }
+            })
+            .collect(),
+        owner: ProcessOwner::SameUser,
         ..Default::default()
     };
+    let foreign_bin_dir = if cfg!(windows) {
+        "C:/Program Files/OtherProxy"
+    } else {
+        "/usr/bin"
+    };
+    let foreign_core =
+        PathBuf::from(foreign_bin_dir).join(crate::runtime::core_paths::core_filename());
+    let foreign_config = PathBuf::from(if cfg!(windows) {
+        "C:/ProgramData/OtherProxy/config.json"
+    } else {
+        "/etc/sing-box/config.json"
+    });
+    assert!(foreign_core.is_absolute());
+    assert!(foreign_config.is_absolute());
+    let foreign_core = foreign_core.to_string_lossy();
+    let foreign_config = foreign_config.to_string_lossy();
     let candidates = vec![
-        proc(MANAGED, &[OURS, "run", "-c", "singbox-runtime.json"]),
+        proc(MANAGED, &[ours, "run", "-c", "singbox-runtime.json"]),
         // 临时核那一行逐字对齐 `SpawnRequest::argv()` + `speedtest.rs` 的 extra_args。
         proc(
             INFLIGHT,
-            &[OURS, "run", "-c", "speedtest-core.json", "--disable-color"],
+            &[ours, "run", "-c", "speedtest-core.json", "--disable-color"],
         ),
-        proc(ORPHAN, &[OURS, "run", "-c", "singbox-runtime.json"]),
+        proc(ORPHAN, &[ours, "run", "-c", "singbox-runtime.json"]),
         // 用户系统装的 sing-box（异路径）：任何时候都不该动它（本清扫的安全底线）。
         proc(
             FOREIGN,
-            &[
-                "/usr/bin/sing-box",
-                "run",
-                "-c",
-                "/etc/sing-box/config.json",
-            ],
+            &[foreign_core.as_ref(), "run", "-c", foreign_config.as_ref()],
         ),
     ];
+
+    for process in &candidates {
+        if process.pid != FOREIGN {
+            assert_sweep_candidate(&rt, process);
+        } else {
+            assert_eq!(
+                Path::new(&process.cmdline[0]).file_name(),
+                Some(std::ffi::OsStr::new(
+                    crate::runtime::core_paths::core_filename()
+                ))
+            );
+            assert!(
+                !polaris_core_supervisor::is_our_core(
+                    process,
+                    crate::runtime::core_paths::core_filename(),
+                    &config_dir
+                ),
+                "外来核同名但配置不在本 app 目录；安全排除不得靠错误的核文件名空过"
+            );
+            // 只换配置路径即命中：反例实际覆盖配置目录边界，不借非法平台路径被提前拒绝。
+            let mut our_config_control = process.clone();
+            our_config_control.cmdline[3] = config_dir
+                .join("singbox-runtime.json")
+                .to_string_lossy()
+                .into_owned();
+            assert_sweep_candidate(&rt, &our_config_control);
+        }
+    }
 
     *rt.pid.lock().unwrap() = Some(MANAGED);
     let inflight_guard = crate::runtime::speedtest::TempCorePidGuard::register(INFLIGHT)
         .expect("非 0 pid 必须登记成功（`register` 只对 pid==0 返 None）");
-    let victims = stale_pids(&candidates, &binary, &rt.sweep_exclusions());
+    let victims = stale_pids(
+        &candidates,
+        crate::runtime::core_paths::core_filename(),
+        &config_dir,
+        &rt.sweep_exclusions(),
+    );
     assert!(
         !victims.contains(&INFLIGHT),
         "[①] 在飞测速临时核 pid={INFLIGHT} 被选成孤儿 victim —— 起核会掐断正在跑的测速并白等两段宽限"
@@ -2525,7 +3136,12 @@ fn stale_sweep_spares_inflight_temp_cores_but_still_kills_real_orphans() {
     // ④ 会话收尾/被丢弃 → pid 出表（`TempCorePidGuard` 的 Drop 跑在 terminate 收割之后）。
     // 它若真的留成了孤儿，下一轮清扫必须能杀掉它。
     drop(inflight_guard);
-    let after = stale_pids(&candidates, &binary, &rt.sweep_exclusions());
+    let after = stale_pids(
+        &candidates,
+        crate::runtime::core_paths::core_filename(),
+        &config_dir,
+        &rt.sweep_exclusions(),
+    );
     assert!(
         after.contains(&INFLIGHT),
         "[④] 出表之后同一个 pid 必须重新落进 victims —— 排除的是「此刻在飞」，不是永久豁免"
@@ -2556,20 +3172,32 @@ fn stale_sweep_spares_inflight_temp_cores_but_still_kills_real_orphans() {
 /// `tailscale_login_core` 的 `inflight_login_pid_comes_from_the_child_handle` 钉。
 #[test]
 fn stale_sweep_spares_inflight_tailscale_login_cores() {
-    use polaris_core_supervisor::{stale_pids, CoreProcess};
+    use polaris_core_supervisor::{stale_pids, CoreProcess, ProcessOwner};
     // `rt.sweep_exclusions()` 顺带读**进程级**的在飞测速临时核表（`INFLIGHT_TEMP_CORES`），
     // 而那张表另有用例会整表排空 ⇒ 与上一条一样串行到同一把闸上。
     // 登录注册表本身是 `test_runtime()` 造的**每实例**状态，不需要串行，但读侧同一次调用两张表都碰。
     let _registry = crate::runtime::speedtest::registry_guard();
     let (rt, _dir) = test_runtime();
 
-    const OURS: &str = "/opt/polaris/resources/linux/sing-box";
+    let ours = sweep_test_core();
     const LOGIN: u32 = 950_001;
     const ORPHAN: u32 = 950_002;
-    let binary = std::path::PathBuf::from(OURS);
+    // 清扫按「核文件名 + 本 app 配置目录下的运行配置」认孤儿；裸文件名的配置落在配置目录下。
+    let config_dir = rt.config.dir().to_path_buf();
     let proc = |pid: u32, args: &[&str]| CoreProcess {
         pid,
-        cmdline: args.iter().map(|s| (*s).to_string()).collect(),
+        cmdline: args
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 3 && !s.starts_with('/') {
+                    config_dir.join(s).to_string_lossy().into_owned()
+                } else {
+                    (*s).to_string()
+                }
+            })
+            .collect(),
+        owner: ProcessOwner::SameUser,
         ..Default::default()
     };
     let candidates = vec![
@@ -2577,20 +3205,29 @@ fn stale_sweep_spares_inflight_tailscale_login_cores() {
         proc(
             LOGIN,
             &[
-                OURS,
+                ours,
                 "run",
                 "-c",
                 "tailscale-login-s1-7.json",
                 "--disable-color",
             ],
         ),
-        proc(ORPHAN, &[OURS, "run", "-c", "singbox-runtime.json"]),
+        proc(ORPHAN, &[ours, "run", "-c", "singbox-runtime.json"]),
     ];
+
+    for process in &candidates {
+        assert_sweep_candidate(&rt, process);
+    }
 
     rt.mesh
         .login_registry_for_test()
         .register_inflight_for_test("s1", LOGIN);
-    let victims = stale_pids(&candidates, &binary, &rt.sweep_exclusions());
+    let victims = stale_pids(
+        &candidates,
+        crate::runtime::core_paths::core_filename(),
+        &config_dir,
+        &rt.sweep_exclusions(),
+    );
     assert!(
         !victims.contains(&LOGIN),
         "[①] 在飞 Tailscale 登录核 pid={LOGIN} 被选成孤儿 victim —— 起核会掐断正在进行的登录"
@@ -2603,7 +3240,12 @@ fn stale_sweep_spares_inflight_tailscale_login_cores() {
     rt.mesh
         .login_registry_for_test()
         .deregister_inflight_for_test("s1");
-    let after = stale_pids(&candidates, &binary, &rt.sweep_exclusions());
+    let after = stale_pids(
+        &candidates,
+        crate::runtime::core_paths::core_filename(),
+        &config_dir,
+        &rt.sweep_exclusions(),
+    );
     assert!(
         after.contains(&LOGIN),
         "[③] 出表之后同一个 pid 必须重新落进 victims —— 排除的是「此刻在飞」，不是永久豁免"
@@ -2991,8 +3633,7 @@ fn attestation_only_trusts_the_helper_image_for_its_own_pid() {
 /// 把 `attest_core_binary` 的实参换成 `None` → 第四条红。
 #[test]
 fn attestation_consults_the_helper_reported_image() {
-    const HEAD: &str =
-        "    async fn attest_running_core_binary(&self, pid: u32, expected: &Path, my_gen: u64) {";
+    const HEAD: &str = "    async fn attest_running_core_binary(";
     let src = module_code("runtime/proxy");
     let at = src
         .find(HEAD)
@@ -3225,14 +3866,26 @@ fn local_native_birth_and_terminal_facts_follow_actual_production_edges() {
     );
 }
 
+/// The census judges `directory` and `file` with the host path type, so the fixture
+/// spells them as the host does: absolute here, and joined by the host separator.
+fn writer_node_fixture(tag: &str, terminal: bool) -> WriterNodeScope {
+    let directory = std::env::temp_dir().join("polaris-writer-census").join(tag);
+    assert!(directory.is_absolute());
+    WriterNodeScope {
+        tag: tag.into(),
+        directory: directory.to_str().unwrap().to_owned(),
+        file: directory
+            .join("tailscaled.state")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        terminal,
+    }
+}
+
 #[test]
 fn writer_retirement_requires_every_original_run_and_node() {
-    let node = |tag: &str| WriterNodeScope {
-        tag: tag.into(),
-        directory: format!("/private/state/{tag}"),
-        file: format!("/private/state/{tag}/tailscaled.state"),
-        terminal: false,
-    };
+    let node = |tag: &str| writer_node_fixture(tag, false);
     let original = vec![
         WriterRunScope {
             nonce: "a".repeat(64),
@@ -3288,7 +3941,7 @@ fn writer_retirement_requires_every_original_run_and_node() {
                 bad[0].digest = "3".repeat(64);
             }
             7 => {
-                bad[0].nodes[0].directory = "/private/other".into();
+                bad[0].nodes[0].directory = writer_node_fixture("elsewhere", true).directory;
             }
             _ => {
                 bad.push(bad[0].clone());
@@ -3306,12 +3959,7 @@ fn writer_retirement_requires_every_original_run_and_node() {
 
 #[test]
 fn pre_ready_retirement_uses_original_full_claim_without_a_ready_baseline() {
-    let node = |tag: &str| WriterNodeScope {
-        tag: tag.into(),
-        directory: format!("/private/state/{tag}"),
-        file: format!("/private/state/{tag}/tailscaled.state"),
-        terminal: true,
-    };
+    let node = |tag: &str| writer_node_fixture(tag, true);
     let retired = vec![WriterRunScope {
         nonce: "a".repeat(64),
         digest: "1".repeat(64),
@@ -3342,7 +3990,7 @@ fn pre_ready_retirement_uses_original_full_claim_without_a_ready_baseline() {
                 bad.push(historic);
             }
             6 => bad.push(bad[0].clone()),
-            7 => bad[0].nodes[0].file = "/private/other/tailscaled.state".into(),
+            7 => bad[0].nodes[0].file = writer_node_fixture("elsewhere", true).file,
             _ => bad[0].nodes[0].directory = "relative/path".into(),
         }
         assert!(
@@ -3389,8 +4037,22 @@ fn ios_cold_and_pre_ready_consumers_keep_original_custody_and_strict_stop() {
         &module_code("runtime/proxy/process_supervision"),
         "    pub(super) async fn kill_core_and_release_main(",
     );
-    assert!(stop.contains("stop_observed(observed).await"));
     let stop_compact: String = stop.split_whitespace().collect();
+    let prepare_observed = stop_compact
+        .find("prepare_observed_stop(observed).await?")
+        .expect("observed custody must produce its own stop target");
+    let persist = stop_compact[prepare_observed..]
+        .find("*current=owner.clone()")
+        .expect("stop target must persist for same-owner retry")
+        + prepare_observed;
+    let dispatch = stop_compact[persist..]
+        .find("stop_target(target).await?")
+        .expect("persisted target must dispatch the native Stop")
+        + persist;
+    assert!(prepare_observed < persist && persist < dispatch);
+    assert!(stop_compact.contains("current.same_origin(&original_owner)"));
+    assert!(stop_compact.contains("owner.stop_target=target.map("));
+    assert!(!stop_compact.contains("stop_observed(observed).await"));
     assert!(stop_compact.contains("source_extension_generation()!=observed.extension_generation()"));
     assert!(stop_compact
         .contains("verify_pre_ready_writer_census(&retired,&owner.config_digest,&expected,)"));

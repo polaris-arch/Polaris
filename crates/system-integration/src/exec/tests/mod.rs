@@ -205,3 +205,188 @@ fn std_runner_drains_large_output_without_deadlock() {
         .expect("大输出须正常收完");
     assert_eq!(out.stdout.len(), 300_000);
 }
+
+#[test]
+fn observed_spawn_failure_is_distinct_from_unknown_cleanup() {
+    let observed = StdCommandRunner.run_observed(
+        &Command::new("polaris-no-such-binary-xyz", [] as [&str; 0]),
+        COMMAND_SMOKE_TIMEOUT,
+    );
+    assert_eq!(observed.cleanup(), CommandCleanup::NotSpawned);
+    assert!(observed
+        .operation()
+        .unwrap()
+        .unwrap_err()
+        .contains("启动失败"));
+    assert!(observed.into_pending().is_none());
+}
+
+#[test]
+fn observed_nonzero_operation_still_requires_both_actual_reader_returns() {
+    #[cfg(unix)]
+    let cmd = Command::new("/bin/sh", ["-c", "printf out; printf err >&2; exit 3"]);
+    #[cfg(windows)]
+    let cmd = Command::new(
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", "echo out&echo err>&2&exit /b 3"],
+    );
+    let observed = StdCommandRunner.run_observed(&cmd, COMMAND_SMOKE_TIMEOUT);
+    let mut pending = observed.into_pending().expect("original child custody");
+    assert_eq!(
+        pending.poll_cleanup(COMMAND_SMOKE_TIMEOUT),
+        CommandCleanup::NativeAndReadersReturned,
+    );
+    assert!(pending.native_status().is_some());
+    assert!(
+        matches!(pending.stdout_disposition(), CommandReaderDisposition::Returned(output) if output.contains("out"))
+    );
+    assert!(
+        matches!(pending.stderr_disposition(), CommandReaderDisposition::Returned(output) if output.contains("err"))
+    );
+    let error = pending.operation().unwrap().unwrap_err();
+    assert!(error.contains('3') && error.contains("err"));
+}
+
+#[cfg(unix)]
+#[test]
+fn observed_timeout_retains_same_child_and_reader_handles_until_actual_return() {
+    let cmd = Command::new("/bin/sh", ["-c", "exec sleep 30"]);
+    let observed = StdCommandRunner.run_observed(&cmd, Duration::from_millis(30));
+    let mut pending = observed
+        .into_pending()
+        .expect("timeout keeps original resources");
+    let child_id = pending.child.id();
+    assert!(pending.operation().unwrap().unwrap_err().contains("超时"));
+    assert_eq!(
+        pending.poll_cleanup(Duration::from_secs(2)),
+        CommandCleanup::NativeAndReadersReturned,
+    );
+    assert_eq!(
+        pending.child.id(),
+        child_id,
+        "poll cannot replace original child"
+    );
+    assert!(pending.native_status().is_some());
+    assert!(pending.stdout.handle.is_none() && pending.stderr.handle.is_none());
+    assert!(
+        pending.operation().unwrap().unwrap_err().contains("超时"),
+        "cleanup cannot rewrite the failed operation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exited_child_does_not_imply_inherited_reader_eof() {
+    let cmd = Command::new("/bin/sh", ["-c", "sleep 0.2 & printf out; printf err >&2"]);
+    let observed = StdCommandRunner.run_observed(&cmd, COMMAND_SMOKE_TIMEOUT);
+    let mut pending = observed.into_pending().unwrap();
+    assert!(pending.native_status().is_some());
+    assert_eq!(pending.cleanup(), CommandCleanup::Unknown);
+    assert!(pending.stdout.handle.is_some() || pending.stderr.handle.is_some());
+    assert!(pending.operation().is_none());
+    assert_eq!(
+        pending.poll_cleanup(Duration::ZERO),
+        CommandCleanup::Unknown
+    );
+    assert_eq!(
+        pending.poll_cleanup(Duration::from_secs(2)),
+        CommandCleanup::NativeAndReadersReturned
+    );
+    assert_eq!(pending.operation().unwrap().unwrap().stdout, "out");
+}
+
+#[test]
+fn actual_reader_join_preserves_read_error_and_missing_pipe() {
+    struct FailingRead;
+    impl Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture read denied",
+            ))
+        }
+    }
+    let mut reader = CommandReader::start(Some(FailingRead));
+    reader.join();
+    assert!(
+        matches!(reader.disposition, CommandReaderDisposition::ReadFailed(ref error) if error.contains("fixture read denied"))
+    );
+    assert!(reader.observed_output().is_err());
+    assert_eq!(
+        reader.legacy_output(),
+        "",
+        "legacy conversion provides no completion"
+    );
+    let mut missing = CommandReader::start(None::<io::Cursor<Vec<u8>>>);
+    missing.join();
+    assert!(matches!(
+        missing.disposition,
+        CommandReaderDisposition::ReadFailed(_)
+    ));
+}
+
+#[test]
+fn pending_reader_is_retained_and_successor_joins_same_thread() {
+    struct HeldRead(std::sync::mpsc::Receiver<()>);
+    impl Read for HeldRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.0.recv().unwrap();
+            Ok(0)
+        }
+    }
+    let (release, receiver) = std::sync::mpsc::channel();
+    let mut reader = CommandReader::start(Some(HeldRead(receiver)));
+    let thread_id = reader.handle.as_ref().unwrap().thread().id();
+    reader.join_returned();
+    assert_eq!(reader.disposition, CommandReaderDisposition::Pending);
+    assert_eq!(reader.handle.as_ref().unwrap().thread().id(), thread_id);
+    release.send(()).unwrap();
+    reader.join();
+    assert_eq!(
+        reader.disposition,
+        CommandReaderDisposition::Returned(String::new())
+    );
+    assert!(reader.handle.is_none());
+}
+
+#[test]
+fn reader_panic_does_not_skip_second_join_or_mint_cleanup() {
+    #[cfg(unix)]
+    let cmd = Command::new("/bin/sh", ["-c", "printf out; printf err >&2"]);
+    #[cfg(windows)]
+    let cmd = Command::new(
+        system32_from_env("cmd.exe"),
+        ["/D", "/Q", "/C", "echo out&echo err>&2"],
+    );
+    let mut pending = StdCommandRunner
+        .run_observed(&cmd, COMMAND_SMOKE_TIMEOUT)
+        .into_pending()
+        .unwrap();
+    assert_eq!(
+        pending.poll_cleanup(COMMAND_SMOKE_TIMEOUT),
+        CommandCleanup::NativeAndReadersReturned
+    );
+    // Negative-only fault: original native wait is real; injected readers cannot create a positive receipt.
+    pending.stdout = CommandReader {
+        handle: Some(std::thread::spawn(|| panic!("fixture reader panic"))),
+        disposition: CommandReaderDisposition::Pending,
+    };
+    pending.stderr = CommandReader::start(Some(io::Cursor::new(b"second".to_vec())));
+    assert_eq!(
+        pending.poll_cleanup(Duration::from_millis(100)),
+        CommandCleanup::Unknown
+    );
+    assert_eq!(
+        pending.stdout.disposition,
+        CommandReaderDisposition::Panicked
+    );
+    assert_eq!(
+        pending.stderr.disposition,
+        CommandReaderDisposition::Returned("second".to_owned())
+    );
+    assert!(pending.operation().unwrap().unwrap_err().contains("panic"));
+    assert_eq!(
+        pending.poll_cleanup(Duration::ZERO),
+        CommandCleanup::Unknown
+    );
+}

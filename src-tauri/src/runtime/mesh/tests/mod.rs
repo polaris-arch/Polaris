@@ -9,6 +9,14 @@ mod warp_tests;
 /// 变异有牙：从「全命中」基线出发，逐一翻转每个入参 → 结果必翻假（覆盖 6 条逃逸路径，防碰巧真数据对）。
 mod login_fallback_predicate_tests;
 
+/// The registry only sweeps leftover login cores when the runtime installs the sweeper.
+#[test]
+fn production_runtime_installs_the_leftover_login_core_sweeper() {
+    let root = crate::test_support::TestDir::new("polaris-stale-login-sweeper-");
+    let mesh = super::MeshRuntime::new(root.join("config"));
+    assert!(mesh.login_registry_for_test().has_stale_login_sweeper());
+}
+
 #[tokio::test]
 async fn scoped_android_fs_body_rejects_unbound_changed_revision_and_missing_reappearance() {
     use super::MeshRuntime;
@@ -17,8 +25,14 @@ async fn scoped_android_fs_body_rejects_unbound_changed_revision_and_missing_rea
         TailscaleWriterState,
     };
     let root = crate::test_support::TestDir::new("polaris-android-scoped-auth-fs-");
-    let mesh = MeshRuntime::new(root.join("config"));
+    let config = root.join("config");
+    let mesh = MeshRuntime::new(config.clone());
+    // This Android/PC projection test deliberately uses legacy state; a bare
+    // mkdir in the Windows physical namespace is not a native producer lease.
+    let legacy = config.join("tailscale").join("node");
+    std::fs::create_dir_all(&legacy).unwrap();
     let directory = mesh.tailscale_state_dir("node").unwrap();
+    assert_eq!(directory, legacy);
     std::fs::create_dir_all(directory.join("taildrop")).unwrap();
     std::fs::write(
         directory.join("taildrop/kept"),

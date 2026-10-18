@@ -1,0 +1,794 @@
+use super::*;
+use crate::commands::speedtest::{FailKind, FailPhase};
+
+const URL: &str = "url-digest";
+const CAP_MS: u64 = 60 * 60_000;
+
+fn identity(run: u64, seq: u64, measured_at: u64) -> ResultIdentity {
+    ResultIdentity {
+        core_binary_sha256: None,
+        run,
+        seq,
+        origin: SpeedTestOrigin::Schedule,
+        scope: None,
+        path: MeasurePath::Candidate,
+        url_digest: URL.to_string(),
+        instance: CoreInstance::Main {
+            generation: 7,
+            start_time: None,
+        },
+        config_digest: None,
+        node_fingerprint: Some("fp".to_string()),
+        network_epoch: Some(3),
+        measured_at,
+        binding: None,
+    }
+}
+
+const TIMED_OUT: MeasureFailure = MeasureFailure::new(FailPhase::Measure, FailKind::Timeout);
+
+fn fingerprints(ids: &[&str]) -> BTreeMap<String, String> {
+    ids.iter()
+        .map(|id| ((*id).to_string(), "fp".to_string()))
+        .collect()
+}
+
+fn ids(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| (*id).to_string()).collect()
+}
+
+/// 读取对照面：世代 7、网络代次 3、此刻 `now_ms`，新鲜期上限一小时。
+fn context<'a>(
+    fingerprints: &'a BTreeMap<String, String>,
+    now_ms: u64,
+    foreground_epoch: Option<u64>,
+) -> ReadContext<'a> {
+    ReadContext {
+        core_binary_sha256: None,
+        main_generation: Some(7),
+        fingerprints,
+        main_connections: fingerprints,
+        network_epoch: Some(3),
+        url_digest: URL,
+        now_ms,
+        foreground_epoch,
+        freshness_cap_ms: &|_, _| CAP_MS,
+    }
+}
+
+fn exclusion_of(candidates: &Candidates, id: &str) -> Exclusion {
+    candidates
+        .excluded
+        .iter()
+        .find(|(node, _)| node == id)
+        .map(|(_, exclusion)| exclusion.clone())
+        .unwrap_or_else(|| panic!("{id} 不在被排除的列表里：{candidates:?}"))
+}
+
+#[test]
+fn a_wall_clock_rollback_expires_candidates_and_old_url_eviction_together() {
+    let ledger = MeasurementLedger::new();
+    ledger.record_at("a", Ok(25), identity(1, 1, CAP_MS * 2), 100);
+    let fps = fingerprints(&["a"]);
+    let nodes = ids(&["a"]);
+    let rolled_back = ledger.candidates(&nodes, &context(&fps, CAP_MS * 2 - 1, None));
+    assert_eq!(
+        exclusion_of(&rolled_back, "a"),
+        Exclusion::Stale(LedgerStale::Expired)
+    );
+    assert!(ledger
+        .candidates(&nodes, &context(&fps, CAP_MS * 2, None))
+        .excluded
+        .is_empty());
+    assert!(ledger
+        .candidates(&nodes, &context(&fps, CAP_MS * 3, None))
+        .excluded
+        .is_empty());
+    assert_eq!(
+        exclusion_of(
+            &ledger.candidates(&nodes, &context(&fps, CAP_MS * 3 + 1, None)),
+            "a"
+        ),
+        Exclusion::Stale(LedgerStale::Expired)
+    );
+
+    // Both have another URL; rollback-invalidated data takes priority over
+    // an older but still fresh entry when the soft-cap eviction ranks them.
+    let mut future = identity(2, 1, CAP_MS * 2);
+    future.url_digest = "future-url".into();
+    ledger.record_at("a", Ok(10), future, 200);
+    let mut fresh = identity(3, 1, CAP_MS);
+    fresh.url_digest = "fresh-url".into();
+    ledger.record_at("a", Ok(20), fresh, 300);
+    let inner = ledger.lock();
+    let order = eviction_order(
+        &inner.entries,
+        &EvictContext {
+            nodes: &BTreeSet::from(["a".to_string()]),
+            url_digest: URL,
+            now_ms: CAP_MS,
+            freshness_cap_ms: &|_, _| CAP_MS,
+        },
+    );
+    assert_eq!(order[0].url_digest, "future-url");
+}
+
+/// 入账：运行号更大的取代已有记录；更旧的被拒并计数，已有记录原样保留。
+#[test]
+fn an_older_run_is_rejected_and_counted() {
+    let ledger = MeasurementLedger::new();
+    assert!(ledger.record("a", Ok(120), identity(5, 1, 1_000)));
+    assert!(
+        !ledger.record("a", Ok(999), identity(4, 9, 2_000)),
+        "旧运行号"
+    );
+    assert!(
+        !ledger.record("a", Ok(999), identity(5, 1, 2_000)),
+        "同号同序"
+    );
+    assert_eq!(ledger.rejected_not_newer(), 2);
+    assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(120));
+    assert!(
+        ledger.record("a", Ok(80), identity(5, 2, 3_000)),
+        "同号序号更大"
+    );
+    assert_eq!(ledger.len(), 1);
+}
+
+/// 版本：入账与淘汰各加一，被拒的入账不加；等待方在版本越过所见值时被唤醒。
+#[tokio::test]
+async fn the_version_advances_on_every_accepted_record() {
+    let ledger: &'static MeasurementLedger = Box::leak(Box::new(MeasurementLedger::new()));
+    assert_eq!(ledger.version(), 0);
+    let waiter = tokio::spawn(ledger.changed_since(0));
+    tokio::task::yield_now().await;
+    ledger.record("a", Ok(1), identity(2, 1, 0));
+    assert_eq!(waiter.await.unwrap(), 1);
+    ledger.record("a", Ok(1), identity(1, 1, 0));
+    assert_eq!(ledger.version(), 1, "被拒的入账不改版本");
+}
+
+/// 读取判据表：同一批记录，对照面每变一项，对应节点从可选点变成带原因的排除。
+#[test]
+fn reading_classifies_every_node_with_a_reason() {
+    let ledger = MeasurementLedger::new();
+    ledger.record_at("ok", Ok(120), identity(1, 1, 10_000), 42);
+    ledger.record("failed", Err(TIMED_OUT), identity(1, 2, 10_000));
+    ledger.record(
+        "system",
+        Ok(50),
+        ResultIdentity {
+            path: MeasurePath::System,
+            ..identity(1, 3, 10_000)
+        },
+    );
+    ledger.record(
+        "temp",
+        Ok(60),
+        ResultIdentity {
+            instance: CoreInstance::Temp,
+            ..identity(1, 4, 10_000)
+        },
+    );
+    ledger.set_skipped(&ids(&["skipped"]), &[("skipped".to_string(), "notInPool")]);
+    let all = ids(&["ok", "failed", "system", "temp", "skipped", "never"]);
+    let fps = fingerprints(&["ok", "failed", "system", "temp", "skipped", "never"]);
+
+    let now = ledger.candidates(&all, &context(&fps, 20_000, None));
+    assert_eq!(
+        now.selectable,
+        vec![Candidate {
+            node_id: "ok".to_string(),
+            latency_ms: 120,
+            measured_at: 10_000,
+            measured_mono: 42,
+            run: 1,
+        }],
+        "停止态与 system 路径的结果不进可选点"
+    );
+    // 失败与没测是两类：只有真测了没通的才带失败次数。
+    assert_eq!(
+        exclusion_of(&now, "failed"),
+        Exclusion::Failed {
+            failure: TIMED_OUT,
+            consecutive: 1
+        }
+    );
+    assert_eq!(exclusion_of(&now, "never"), Exclusion::NeverMeasured);
+    assert_eq!(
+        exclusion_of(&now, "skipped"),
+        Exclusion::Skipped("notInPool")
+    );
+    assert_eq!(exclusion_of(&now, "system"), Exclusion::NonCandidatePath);
+    assert_eq!(exclusion_of(&now, "temp"), Exclusion::Disconnected);
+
+    let only = ids(&["ok"]);
+    // 核换代：旧世代的结果过期，不可选点。
+    let regenerated = ReadContext {
+        main_generation: Some(8),
+        ..context(&fps, 20_000, None)
+    };
+    assert_eq!(
+        exclusion_of(&ledger.candidates(&only, &regenerated), "ok"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+    );
+    // 桌面切网：网络代次变了。
+    let moved = ReadContext {
+        network_epoch: Some(4),
+        ..context(&fps, 20_000, None)
+    };
+    assert_eq!(
+        exclusion_of(&ledger.candidates(&only, &moved), "ok"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::NetworkEpoch))
+    );
+    // 新鲜期上限：刚好到上限仍可用，超过一毫秒即过期。
+    let at_cap = ledger.candidates(&only, &context(&fps, 10_000 + CAP_MS, None));
+    assert_eq!(at_cap.selectable.len(), 1);
+    let past_cap = ledger.candidates(&only, &context(&fps, 10_001 + CAP_MS, None));
+    assert_eq!(
+        exclusion_of(&past_cap, "ok"),
+        Exclusion::Stale(LedgerStale::Expired)
+    );
+}
+
+/// 前台代次只在给出时判（移动端）：代次变了，此前入账的结果不可选点；桌面不看它。
+#[test]
+fn a_foreground_epoch_change_voids_earlier_results_on_mobile_only() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a"]);
+    let only = ids(&["a"]);
+    ledger.record("a", Ok(120), identity(1, 1, 10_000));
+    assert_eq!(
+        ledger
+            .candidates(&only, &context(&fps, 20_000, Some(0)))
+            .selectable
+            .len(),
+        1
+    );
+    ledger.set_foreground_epoch(1);
+    assert_eq!(
+        exclusion_of(
+            &ledger.candidates(&only, &context(&fps, 20_000, Some(1))),
+            "a"
+        ),
+        Exclusion::Stale(LedgerStale::ForegroundEpoch)
+    );
+    assert_eq!(
+        ledger
+            .candidates(&only, &context(&fps, 20_000, None))
+            .selectable
+            .len(),
+        1,
+        "桌面不按前台代次判"
+    );
+    // 新代次下重测即恢复。
+    ledger.record("a", Ok(90), identity(2, 1, 20_000));
+    assert_eq!(
+        ledger
+            .candidates(&only, &context(&fps, 20_000, Some(1)))
+            .selectable[0]
+            .latency_ms,
+        90
+    );
+}
+
+/// 连续失败计数：失败累加，成功归零；手动测过即从头数。
+#[test]
+fn consecutive_failures_reset_on_success_or_a_manual_run() {
+    let ledger = MeasurementLedger::new();
+    let failures = |ledger: &MeasurementLedger| {
+        ledger
+            .candidate_entry("a", URL)
+            .unwrap()
+            .consecutive_failures
+    };
+    for run in 1..=3 {
+        ledger.record("a", Err(TIMED_OUT), identity(run, 1, run));
+    }
+    assert_eq!(failures(&ledger), 3);
+    ledger.record(
+        "a",
+        Err(TIMED_OUT),
+        ResultIdentity {
+            origin: SpeedTestOrigin::Manual,
+            ..identity(4, 1, 4)
+        },
+    );
+    assert_eq!(failures(&ledger), 1, "手动测过：从头数");
+    ledger.record("a", Ok(100), identity(5, 1, 5));
+    assert_eq!(failures(&ledger), 0);
+    ledger.record("a", Err(TIMED_OUT), identity(6, 1, 6));
+    let entry = ledger.candidate_entry("a", URL).unwrap();
+    assert_eq!(
+        (entry.consecutive_failures, entry.last_ok_at),
+        (1, Some(5)),
+        "最近一次成功的时刻跨过随后的失败保留"
+    );
+}
+
+/// 清零连续失败数：全部记录归零并通知读取方，结果本身与最近成功时刻不动；此后的失败从 1 数起。
+/// 没有可清的即不改版本。
+#[test]
+fn forgiving_failures_zeroes_every_count_and_keeps_the_results() {
+    let ledger = MeasurementLedger::new();
+    let failures = |id: &str| {
+        ledger
+            .candidate_entry(id, URL)
+            .unwrap()
+            .consecutive_failures
+    };
+    ledger.record("a", Ok(100), identity(1, 1, 1));
+    for run in 2..=4 {
+        ledger.record("a", Err(TIMED_OUT), identity(run, 1, run));
+        ledger.record("b", Err(TIMED_OUT), identity(run, 2, run));
+    }
+    assert_eq!((failures("a"), failures("b")), (3, 3));
+
+    let before = ledger.version();
+    ledger.forgive_failures();
+    assert_eq!((failures("a"), failures("b")), (0, 0));
+    assert_eq!(ledger.version(), before + 1);
+    let entry = ledger.candidate_entry("a", URL).unwrap();
+    assert_eq!(
+        (entry.measured, entry.last_ok_at),
+        (Err(TIMED_OUT), Some(1))
+    );
+
+    ledger.forgive_failures();
+    assert_eq!(ledger.version(), before + 1, "没有可清的：版本不动");
+    ledger.record("a", Err(TIMED_OUT), identity(5, 1, 5));
+    assert_eq!(failures("a"), 1);
+}
+
+/// 已有当前结果的节点 = 测出了值的 + 真测了没通的；过期、被跳过、从未测过的都不算。
+#[test]
+fn current_results_exclude_stale_skipped_and_unmeasured_nodes() {
+    let ledger = MeasurementLedger::new();
+    ledger.record("ok", Ok(120), identity(1, 1, 10_000));
+    ledger.record("failed", Err(TIMED_OUT), identity(1, 2, 10_000));
+    ledger.record("old", Ok(120), identity(1, 3, 0));
+    let all = ids(&["ok", "failed", "old", "never"]);
+    let fps = fingerprints(&["ok", "failed", "old", "never"]);
+    let current = ledger.current_results(&all, &context(&fps, CAP_MS + 5_000, None));
+    assert_eq!(current, ids(&["failed", "ok"]).into_iter().collect());
+}
+
+/// 淘汰顺序：先是节点已不在配置里的键，再是旧测速 URL 且已过新鲜期的键，最后按测量时刻从旧到新。
+#[test]
+fn eviction_follows_the_documented_order() {
+    let ledger = MeasurementLedger::new();
+    let other_url = |run, at| ResultIdentity {
+        url_digest: "old-url".to_string(),
+        ..identity(run, 1, at)
+    };
+    ledger.record("gone", Ok(1), identity(1, 1, 9_000_000));
+    ledger.record("a", Ok(1), other_url(2, 0)); // 旧 URL，已过新鲜期
+    ledger.record("a", Ok(1), identity(3, 1, 5_000_000));
+    ledger.record("b", Ok(1), other_url(4, 9_000_000)); // 旧 URL，但还新鲜
+    ledger.record("b", Ok(1), identity(5, 1, 4_000_000));
+    let nodes: BTreeSet<String> = ids(&["a", "b"]).into_iter().collect();
+    let context = EvictContext {
+        nodes: &nodes,
+        url_digest: URL,
+        now_ms: 9_000_000,
+        freshness_cap_ms: &|_, _| CAP_MS,
+    };
+    let order: Vec<(String, String, u64)> = {
+        let inner = ledger.lock();
+        eviction_order(&inner.entries, &context)
+            .into_iter()
+            .map(|key| {
+                let at = inner.entries[&key].identity.measured_at;
+                (key.node_id, key.url_digest, at)
+            })
+            .collect()
+    };
+    assert_eq!(
+        order,
+        vec![
+            ("gone".to_string(), URL.to_string(), 9_000_000),
+            ("a".to_string(), "old-url".to_string(), 0),
+            ("b".to_string(), URL.to_string(), 4_000_000),
+            ("a".to_string(), URL.to_string(), 5_000_000),
+            ("b".to_string(), "old-url".to_string(), 9_000_000),
+        ]
+    );
+
+    // 软上限 = 节点数的 4 倍 = 8，五条都留；节点只剩一个时软上限为 4，按上面的顺序淘汰一条。
+    assert_eq!(ledger.evict(&context), 0);
+    let one: BTreeSet<String> = ids(&["a"]).into_iter().collect();
+    let version = ledger.version();
+    assert_eq!(
+        ledger.evict(&EvictContext {
+            nodes: &one,
+            ..context
+        }),
+        1
+    );
+    assert_eq!(ledger.len(), 4);
+    // 此时 b 与 gone 都已不在配置里，同属第一类；类内按测量时刻，最旧的是 b 的那条。
+    assert!(ledger.candidate_entry("b", URL).is_none());
+    assert!(ledger.candidate_entry("gone", URL).is_some());
+    assert_eq!(ledger.version(), version + 1, "淘汰后版本加一");
+}
+
+/// 条数不超过硬上限：越过时淘汰测量时刻最旧的一条。
+#[test]
+fn the_ledger_never_grows_past_the_hard_cap() {
+    let ledger = MeasurementLedger::new();
+    for index in 0..=HARD_CAP as u64 {
+        ledger.record(&format!("n{index}"), Ok(1), identity(index + 1, 1, index));
+    }
+    assert_eq!(ledger.len(), HARD_CAP);
+    assert!(
+        ledger.candidate_entry("n0", URL).is_none(),
+        "最旧的一条被淘汰"
+    );
+    assert!(ledger.candidate_entry("n1", URL).is_some());
+}
+
+/// 首轮是否完成：一轮被抢占（还有节点没测到）为否，补发完成后为是。起测前被预筛跳过的
+/// 节点不算欠账；失败也算覆盖到了。
+#[test]
+fn a_round_covers_a_subscription_only_once_every_testable_member_has_a_result() {
+    let ledger = MeasurementLedger::new();
+    let members = ids(&["a", "b", "c", "skipped"]);
+    let fps = fingerprints(&["a", "b", "c", "skipped"]);
+    let covered = |ledger: &MeasurementLedger| {
+        ledger
+            .candidates(&members, &context(&fps, 20_000, Some(0)))
+            .covers_all_testable()
+    };
+    ledger.set_skipped(&members, &[("skipped".to_string(), "dirty")]);
+    assert!(!covered(&ledger), "还没测过");
+    // 周期一轮测完 a 之后被手动测速抢占。
+    ledger.record("a", Ok(120), identity(1, 1, 10_000));
+    assert!(!covered(&ledger), "被抢占：b、c 还没有结果");
+    // 补发完成（b 没通也算测到了）。
+    ledger.record("b", Err(TIMED_OUT), identity(2, 1, 11_000));
+    ledger.record("c", Ok(90), identity(2, 2, 11_000));
+    assert!(covered(&ledger));
+    // 前台代次变了：旧结果不再算数，要重新覆盖。
+    ledger.set_foreground_epoch(1);
+    assert!(!ledger
+        .candidates(&members, &context(&fps, 20_000, Some(1)))
+        .covers_all_testable());
+}
+
+/// 主核探针槽与停止态临时核的结果各占一个键，读取时取两者中较新的一条：断开后用临时核测过，
+/// 读到的是「未连接测量」；再连上测过，读到的又是主核那条。
+#[test]
+fn main_and_temp_results_keep_separate_keys_and_the_newer_one_is_read() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a"]);
+    let temp = |run| ResultIdentity {
+        instance: CoreInstance::Temp,
+        ..identity(run, 1, 10_000)
+    };
+    ledger.record("a", Ok(120), identity(1, 1, 10_000));
+    ledger.record("a", Ok(60), temp(2));
+    assert_eq!(ledger.len(), 2, "两条互不覆盖");
+    let read = ledger.candidates(&ids(&["a"]), &context(&fps, 20_000, None));
+    assert_eq!(exclusion_of(&read, "a"), Exclusion::Disconnected);
+    assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(60));
+
+    ledger.record("a", Ok(90), identity(3, 1, 10_000));
+    let read = ledger.candidates(&ids(&["a"]), &context(&fps, 20_000, None));
+    assert_eq!(read.selectable.len(), 1);
+    assert_eq!(read.selectable[0].latency_ms, 90);
+    assert_eq!(read.unverified, ids(&["a"]), "没有读回的结果可选，但被计数");
+}
+
+/// 读回的结论随记录读出：不符的测出了值也不可选（原因单列，不并进「非候选路径」）；证实的不计入
+/// 未验证；钉到选中出口的结果与走用户规则的一样，不是候选。
+#[test]
+fn binding_verdicts_are_read_back_with_the_entry() {
+    let ledger = MeasurementLedger::new();
+    let with = |seq, binding| ResultIdentity {
+        binding: Some(binding),
+        ..identity(1, seq, 10_000)
+    };
+    ledger.record("confirmed", Ok(10), with(1, BindingVerdict::Confirmed));
+    ledger.record("unverified", Ok(20), with(2, BindingVerdict::Unverified));
+    ledger.record("mismatch", Ok(30), with(3, BindingVerdict::Mismatch));
+    ledger.record(
+        "selected",
+        Ok(40),
+        ResultIdentity {
+            path: MeasurePath::Selected,
+            ..identity(1, 4, 10_000)
+        },
+    );
+    let all = ids(&["confirmed", "unverified", "mismatch", "selected"]);
+    let fps = fingerprints(&["confirmed", "unverified", "mismatch", "selected"]);
+    let read = ledger.candidates(&all, &context(&fps, 20_000, None));
+    assert_eq!(
+        read.selectable
+            .iter()
+            .map(|candidate| candidate.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["confirmed", "unverified"]
+    );
+    assert_eq!(read.unverified, ids(&["unverified"]));
+    assert_eq!(exclusion_of(&read, "mismatch"), Exclusion::BindingMismatch);
+    assert_eq!(exclusion_of(&read, "selected"), Exclusion::NonCandidatePath);
+    assert!(
+        ledger
+            .current_results(&all, &context(&fps, 20_000, None))
+            .contains("mismatch"),
+        "读回不符的节点有当前结果，不算欠测"
+    );
+}
+
+/// 键里加了路由策略之后，一个节点在两个测速 URL 下最多有六条（主核探针槽、停止态临时核、回退腿
+/// 或伴测各一，乘以两个 URL）。软上限仍是节点数的 4 倍：超出的两条按淘汰顺序去掉——先是旧 URL
+/// 下已过新鲜期的，再是最旧的；当前 URL 下主核探针槽那条（选点用的）留着。
+#[test]
+fn the_soft_cap_holds_with_the_wider_key_space() {
+    let ledger = MeasurementLedger::new();
+    let at = |run, measured_at, url: &str, path, instance| ResultIdentity {
+        url_digest: url.to_string(),
+        path,
+        instance,
+        ..identity(run, 1, measured_at)
+    };
+    let main = CoreInstance::Main {
+        generation: 7,
+        start_time: None,
+    };
+    // 旧 URL 下三条（都已过新鲜期），当前 URL 下三条。
+    ledger.record(
+        "a",
+        Ok(1),
+        at(1, 100, "old-url", MeasurePath::Candidate, main),
+    );
+    ledger.record(
+        "a",
+        Ok(1),
+        at(
+            2,
+            200,
+            "old-url",
+            MeasurePath::Candidate,
+            CoreInstance::Temp,
+        ),
+    );
+    ledger.record("a", Ok(1), at(3, 300, "old-url", MeasurePath::System, main));
+    ledger.record(
+        "a",
+        Ok(1),
+        at(
+            4,
+            9_000_000,
+            URL,
+            MeasurePath::Candidate,
+            CoreInstance::Temp,
+        ),
+    );
+    ledger.record("a", Ok(1), at(5, 9_000_100, URL, MeasurePath::System, main));
+    ledger.record(
+        "a",
+        Ok(42),
+        at(6, 9_000_200, URL, MeasurePath::Candidate, main),
+    );
+    assert_eq!(ledger.len(), 6, "六个键互不覆盖");
+
+    let nodes: BTreeSet<String> = ids(&["a"]).into_iter().collect();
+    let evicted = ledger.evict(&EvictContext {
+        nodes: &nodes,
+        url_digest: URL,
+        now_ms: 9_000_300,
+        freshness_cap_ms: &|_, _| CAP_MS,
+    });
+    assert_eq!(evicted, 2);
+    assert_eq!(ledger.len(), 4, "软上限 = 1 个节点 × 4");
+    let left: Vec<(String, u64)> = {
+        let inner = ledger.lock();
+        inner
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.url_digest.clone(), entry.identity.run))
+            .collect()
+    };
+    assert_eq!(
+        left.iter().filter(|(url, _)| url == URL).count(),
+        3,
+        "当前 URL 下的三条都留着：{left:?}"
+    );
+    assert!(
+        left.contains(&("old-url".to_string(), 3)),
+        "旧 URL 下只剩最新的那条：{left:?}"
+    );
+    assert_eq!(ledger.candidate_entry("a", URL).unwrap().measured, Ok(42));
+}
+
+/// 入账时记下两样此后不变的东西：单调时刻，与那一刻的降频倍数。倍数此后再变，已入账的记录
+/// 不跟着变；新入账的记录带新值。
+#[test]
+fn an_entry_keeps_the_monotonic_time_and_period_factor_it_was_recorded_with() {
+    let ledger = MeasurementLedger::new();
+    ledger.record_at("a", Ok(1), identity(1, 1, 0), 1_000);
+    ledger.set_period_factor(4);
+    ledger.record_at("b", Ok(1), identity(1, 2, 0), 2_000);
+    let entry = |id: &str| ledger.candidate_entry(id, URL).unwrap();
+    assert_eq!(
+        (entry("a").recorded_mono, entry("a").period_factor),
+        (1_000, 1)
+    );
+    assert_eq!(
+        (entry("b").recorded_mono, entry("b").period_factor),
+        (2_000, 4)
+    );
+    // 上限由读取方按记录本身折算：同一份读取，两条记录各用各的倍数。
+    let fps = fingerprints(&["a", "b"]);
+    let read = ledger.candidates(
+        &ids(&["a", "b"]),
+        &ReadContext {
+            freshness_cap_ms: &|_, entry| 100 * entry.period_factor,
+            ..context(&fps, 300, None)
+        },
+    );
+    let selectable: Vec<&str> = read.selectable.iter().map(|c| c.node_id.as_str()).collect();
+    assert_eq!(selectable, ["b"], "a 按 1 倍已过期，b 按 4 倍仍新鲜");
+    assert_eq!(read.selectable[0].measured_mono, 2_000);
+    ledger.set_period_factor(0);
+    ledger.record_at("c", Ok(1), identity(1, 3, 0), 3_000);
+    assert_eq!(entry("c").period_factor, 1, "倍数不低于 1");
+}
+
+#[test]
+fn saved_unapplied_connection_edits_exclude_main_receipts_in_the_same_generation() {
+    use crate::commands::speedtest::current_server_fingerprints;
+    use crate::runtime::node_fingerprints::measurement_table_json;
+    use serde_json::json;
+    let base = json!({"servers": [{"id":"a", "name":"A", "protocol":"trojan",
+        "address":"example.test", "port":443, "password":"fixture", "network":"ws",
+        "security":"tls", "tlsSettings":{"serverName":"old.test"}, "wsSettings":{"path":"/old"}}]});
+    let legacy = current_server_fingerprints(&base);
+    let running = measurement_table_json(&base);
+    let ledger = MeasurementLedger::new();
+    let mut receipt = identity(1, 1, 100);
+    receipt.node_fingerprint = legacy.get("a").cloned();
+    ledger.record_connection_at("a", Ok(25), receipt, running.get("a").cloned(), 100);
+    let mut read = context(&legacy, 101, None);
+    read.main_connections = &running;
+    assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    for (key, value) in [
+        ("security", json!("none")),
+        ("tlsSettings", json!({"serverName":"new.test"})),
+        ("wsSettings", json!({"path":"/new"})),
+    ] {
+        // Models persisted D with deferRestart; R, generation, network and all
+        // receipt timing gates stay unchanged. No staged draft is consulted.
+        let mut desired = base.clone();
+        desired["servers"][0][key] = value;
+        let current = current_server_fingerprints(&desired);
+        assert_eq!(
+            current, legacy,
+            "subscription dedup semantics stay unchanged"
+        );
+        let connections = measurement_table_json(&desired);
+        let read = ReadContext {
+            main_connections: &connections,
+            ..context(&current, 101, None)
+        };
+        assert_eq!(
+            exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+            Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint))
+        );
+        assert!(
+            ledger.current_results(&ids(&["a"]), &read).is_empty(),
+            "an old running receipt cannot satisfy desired-configuration coverage"
+        );
+    }
+    for key in ["name", "providerName", "updatedAt", "subscriptionId"] {
+        let mut desired = base.clone();
+        desired["servers"][0][key] = json!("display-only");
+        let connections = measurement_table_json(&desired);
+        let read = ReadContext {
+            main_connections: &connections,
+            ..context(&legacy, 101, None)
+        };
+        assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    }
+    // Full Apply still invalidates the receipt even when the connection digest
+    // is unchanged: the existing generation gate remains authoritative.
+    let read = ReadContext {
+        main_generation: Some(8),
+        main_connections: &running,
+        ..context(&legacy, 101, None)
+    };
+    assert_eq!(
+        exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+        Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+    );
+}
+
+#[test]
+fn unknown_or_changed_connection_identity_is_not_a_current_candidate_or_failure() {
+    for measured in [Ok(20), Err(TIMED_OUT)] {
+        for recorded in [None, Some("old-connection".to_owned())] {
+            let ledger = MeasurementLedger::new();
+            ledger.record_connection_at("a", measured, identity(1, 1, 100), recorded, 100);
+            let legacy = fingerprints(&["a"]);
+            for current in [
+                BTreeMap::new(),
+                BTreeMap::from([("a".to_owned(), "desired-connection".to_owned())]),
+            ] {
+                let read = ReadContext {
+                    main_connections: &current,
+                    ..context(&legacy, 101, None)
+                };
+                let result = ledger.candidates(&ids(&["a"]), &read);
+                assert!(result.selectable.is_empty());
+                assert_eq!(
+                    exclusion_of(&result, "a"),
+                    Exclusion::Stale(LedgerStale::Identity(StaleReason::NodeFingerprint))
+                );
+                assert!(ledger.current_results(&ids(&["a"]), &read).is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn main_candidate_identity_includes_detour_connections_and_rejects_temp_scope() {
+    use crate::commands::speedtest::current_server_fingerprints;
+    use crate::runtime::node_fingerprints::measurement_connections_json;
+    use serde_json::json;
+    let base = json!({"servers": [
+        {"id":"a", "name":"A", "protocol":"trojan", "address":"a.test", "port":443,
+         "password":"fixture", "detour":"b"},
+        {"id":"b", "name":"B", "protocol":"trojan", "address":"b.test", "port":443,
+         "password":"fixture", "security":"tls", "tlsSettings":{"serverName":"old.test"}}
+    ]});
+    let legacy = current_server_fingerprints(&base);
+    let running = measurement_connections_json(&base);
+    assert_ne!(running.main.get("a"), running.temp.get("a"));
+    let ledger = MeasurementLedger::new();
+    let mut receipt = identity(1, 1, 100);
+    receipt.node_fingerprint = legacy.get("a").cloned();
+    ledger.record_connection_at("a", Ok(20), receipt, running.main.get("a").cloned(), 100);
+    let mut desired = base.clone();
+    desired["servers"][1]["tlsSettings"]["serverName"] = json!("new.test");
+    let current = measurement_connections_json(&desired);
+    let read = ReadContext {
+        main_connections: &current.main,
+        ..context(&legacy, 101, None)
+    };
+    assert!(ledger.candidates(&ids(&["a"]), &read).selectable.is_empty());
+    let wrong_scope = ReadContext {
+        main_connections: &running.temp,
+        ..context(&legacy, 101, None)
+    };
+    assert!(
+        ledger
+            .candidates(&ids(&["a"]), &wrong_scope)
+            .selectable
+            .is_empty(),
+        "temp identities cannot validate main receipts"
+    );
+}
+
+#[test]
+fn actual_core_bytes_gate_cache_reuse_even_without_a_generation_or_node_change() {
+    let ledger = MeasurementLedger::new();
+    let fps = fingerprints(&["a"]);
+    let mut receipt = identity(1, 1, 100);
+    receipt.core_binary_sha256 = Some("a".repeat(64));
+    ledger.record_connection_at("a", Ok(25), receipt, fps.get("a").cloned(), 100);
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let mut read = context(&fps, 101, None);
+    read.core_binary_sha256 = Some(Some(&a));
+    assert_eq!(ledger.candidates(&ids(&["a"]), &read).selectable.len(), 1);
+    for digest in [Some(b.as_str()), None] {
+        read.core_binary_sha256 = Some(digest);
+        assert_eq!(
+            exclusion_of(&ledger.candidates(&ids(&["a"]), &read), "a"),
+            Exclusion::Stale(LedgerStale::Identity(StaleReason::Instance))
+        );
+    }
+}
+
+mod bounded_skip_regressions;

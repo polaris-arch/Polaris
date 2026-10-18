@@ -303,6 +303,12 @@ struct ChildSlot {
     cv: Condvar,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReapedOwner {
+    target: HelperBirthTarget,
+    uid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildWaitOutcome {
     Reaped,
@@ -498,14 +504,11 @@ impl ReapGroup {
 ///
 /// 持共享 [`HandlerState`]（收割/看护线程清 child）+ 在途 child 槽（terminate 按 pid 查）+ reapWG。
 pub struct AmbientCapsSpawner {
-    // Pin once for this helper lifetime. A valid-looking replacement cannot be
-    // adopted by an older helper; failed initialization never blocks Stop.
-    claims: Result<super::claims::ClaimsDeployment, String>,
     state: Arc<Mutex<HandlerState>>,
     /// 在途 child 槽。Start 会扫描全部槽；只有 native reap 后才移除对应 birth。
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
     /// Published under the slots lock, so removal and proof are atomic to readers.
-    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: Arc<Mutex<VecDeque<ReapedOwner>>>,
     /// 在途后台 terminate 计数（SIGTERM 退出前 waitReaps 等它归零）。
     reaps: Arc<ReapGroup>,
 }
@@ -557,21 +560,9 @@ impl<R: Read> Read for PinnedReader<R> {
 }
 
 impl AmbientCapsSpawner {
-    #[cfg(test)]
     #[must_use]
     pub fn new(state: Arc<Mutex<HandlerState>>) -> Self {
-        Self::with_claims_provision(
-            state,
-            Err(std::io::Error::other("test deployment not initialized")),
-        )
-    }
-
-    fn with_claims_provision(
-        state: Arc<Mutex<HandlerState>>,
-        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
-    ) -> Self {
         Self {
-            claims: claims_provision.map_err(|error| error.to_string()),
             state,
             slots: Arc::new(Mutex::new(Vec::new())),
             tombstones: Arc::new(Mutex::new(VecDeque::new())),
@@ -708,16 +699,53 @@ impl AmbientCapsSpawner {
 }
 
 impl CoreSpawner for AmbientCapsSpawner {
-    fn validate_start_environment(&self) -> Result<(), SpawnError> {
-        self.claims
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|deployment| deployment.validate().map_err(|error| error.to_string()))
-            .map_err(|detail| SpawnError::Spawn {
-                detail: format!("claims deployment unavailable: {detail}"),
-            })
+    fn caller_allowed(
+        &self,
+        uid: u32,
+        _current: Option<&CoreHandle>,
+        target: Option<&HelperBirthTarget>,
+    ) -> bool {
+        if uid == 0 {
+            return true;
+        }
+        let Ok(slots) = self.slots.lock() else {
+            return false;
+        };
+        if let Some(target) = target {
+            if let Some(slot) = slots
+                .iter()
+                .find(|slot| slot.handle.target().as_ref() == Some(target))
+            {
+                return slot.handle.caller_allowed(uid);
+            }
+            return self.tombstones.lock().is_ok_and(|proofs| {
+                proofs
+                    .iter()
+                    .any(|proof| proof.target == *target && proof.uid == Some(uid))
+            });
+        }
+        slots.iter().all(|slot| {
+            matches!(slot.reap_fact(), LocalReapFact::Reaped(_)) || slot.handle.caller_allowed(uid)
+        })
     }
-
+    fn birth_core_matches(
+        &self,
+        target: &polaris_helper_proto::HelperBirthTarget,
+        _current: Option<&CoreHandle>,
+        id: &polaris_helper_proto::core_manifest::CoreId,
+    ) -> bool {
+        self.slots.lock().is_ok_and(|slots| {
+            slots.iter().any(|slot| {
+                slot.handle.target().as_ref() == Some(target)
+                    && slot
+                        .handle
+                        .core
+                        .as_ref()
+                        .is_some_and(|core| core.manifest.id == id.as_str())
+                    && !matches!(slot.reap_fact(), LocalReapFact::Reaped(_))
+            })
+        })
+    }
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.scan_start_admission(current_running)
     }
@@ -745,7 +773,7 @@ impl CoreSpawner for AmbientCapsSpawner {
             .cloned();
         if slot.is_none() {
             return self.tombstones.lock().map_or(StopReap::Unknown, |proofs| {
-                if proofs.contains(target) {
+                if proofs.iter().any(|proof| proof.target == *target) {
                     StopReap::Reaped
                 } else {
                     StopReap::Unknown
@@ -778,11 +806,36 @@ impl CoreSpawner for AmbientCapsSpawner {
         }
         self.tombstones
             .lock()
-            .is_ok_and(|proofs| proofs.contains(target))
+            .is_ok_and(|proofs| proofs.iter().any(|proof| proof.target == *target))
     }
 
     fn spawn(&self, req: &SpawnCoreRequest) -> Result<SpawnedCore, SpawnError> {
-        self.validate_start_environment()?;
+        self.spawn_verified(req, None)
+    }
+
+    fn spawn_pinned(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        self.spawn_verified(req, Some(core))
+    }
+
+    fn terminate(&self, h: &CoreHandle) -> StopReap {
+        self.terminate_owned(h)
+    }
+
+    fn kill(&self, h: &CoreHandle) {
+        self.kill_owned(h)
+    }
+}
+
+impl AmbientCapsSpawner {
+    fn spawn_verified(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Option<Arc<crate::core_store::VerifiedCore>>,
+    ) -> Result<SpawnedCore, SpawnError> {
         let pinned_log = req
             .log
             .as_deref()
@@ -792,7 +845,19 @@ impl CoreSpawner for AmbientCapsSpawner {
                 detail: format!("secure log path: {error}"),
             })?;
         // Go: exec.Command(coreBin(), "run", "-c", cfg)（:431）。
-        let mut cmd = std::process::Command::new(&req.binary);
+        // /proc/self/fd is resolved by exec while the verified original fd is
+        // still open. It is never a second open of a user-supplied executable.
+        use std::os::fd::AsRawFd;
+        let executable = core.as_ref().map_or_else(
+            || req.binary.clone(),
+            |core| PathBuf::from(format!("/proc/self/fd/{}", core.binary.as_raw_fd())),
+        );
+        let mut cmd = std::process::Command::new(executable);
+        if let Some(core) = &core {
+            cmd.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LD_LIBRARY_PATH", &core.directory);
+        }
         cmd.arg("run").arg("-c").arg(&req.config);
 
         // CWD = 配置文件所在目录（= 用户可写 config 目录）：helper daemon（systemd）CWD=`/`，spawn 的核继承 `/`
@@ -867,6 +932,10 @@ impl CoreSpawner for AmbientCapsSpawner {
             ),
             None => CoreHandle::new(pid),
         };
+        let handle = match core {
+            Some(core) => handle.with_core(core, req.uid),
+            None => handle,
+        };
         let slot = ChildSlot::from_child(child, handle.clone());
         self.slots
             .lock()
@@ -900,7 +969,7 @@ impl CoreSpawner for AmbientCapsSpawner {
         })
     }
 
-    fn terminate(&self, h: &CoreHandle) -> StopReap {
+    fn terminate_owned(&self, h: &CoreHandle) -> StopReap {
         // The wire request never waits through the five-second escalation. One
         // exact-birth worker owns it; later Stop requests only poll native reap.
         let Some(slot) = self.find_slot(h) else {
@@ -918,7 +987,7 @@ impl CoreSpawner for AmbientCapsSpawner {
         outcome
     }
 
-    fn kill(&self, h: &CoreHandle) {
+    fn kill_owned(&self, h: &CoreHandle) {
         // Go cleanup：child.Process.Kill()（SIGKILL 即时；收割线程随后收尸，:383）。
         // 身份判据与 terminate 同源（slot 在册 + 尚未被收割）：cleanup 拿到的 `h.pid` 来自 state.child，
         // 而收割线程清 state.child 那一步会被「全程持 state 锁」的 handler 挡住 ⇒ 这里完全可能拿到一个
@@ -988,16 +1057,59 @@ fn clear_reaped_birth(
     proof: &HelperBirthReaped,
     state: &Arc<Mutex<HandlerState>>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
-    {
+    clear_reaped_birth_with_dns(
+        proof,
+        state,
+        slots,
+        tombstones,
+        &crate::platform::linux::resolved_dns::ResolvectlDnsOps::new(),
+    );
+}
+
+fn clear_reaped_birth_with_dns(
+    proof: &HelperBirthReaped,
+    state: &Arc<Mutex<HandlerState>>,
+    slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
+    dns: &dyn crate::platform::linux::resolved_dns::ResolvedDnsOps,
+) {
+    let revert_dns = {
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-        if g.child
+        g.retire_birth(&proof.birth);
+        // Synchronous Stop may already have cleared the upper child slot.
+        // DNS custody remains attached to its physical birth until restored.
+        if g.dns_birth
             .as_ref()
-            .is_some_and(|child| child.handle().same_birth(&proof.birth))
+            .is_some_and(|birth| birth.same_birth(&proof.birth))
         {
-            g.child = None;
+            if g.dns_busy {
+                g.dns_cleanup_pending = true;
+                false
+            } else if g.dns_owner.is_some() {
+                g.dns_busy = true;
+                true
+            } else {
+                g.dns_birth = None;
+                g.dns_cleanup_pending = false;
+                false
+            }
+        } else {
+            false
         }
+    };
+    if revert_dns {
+        let cleared = dns
+            .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
+            .is_ok();
+        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if cleared {
+            g.dns_owner = None;
+            g.dns_birth = None;
+        }
+        g.dns_cleanup_pending = !cleared;
+        g.dns_busy = false;
     }
     let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
     let before = slots.len();
@@ -1008,7 +1120,10 @@ fn clear_reaped_birth(
             if tombstones.len() == REAP_TOMBSTONES {
                 tombstones.pop_front();
             }
-            tombstones.push_back(target);
+            tombstones.push_back(ReapedOwner {
+                target,
+                uid: proof.birth.owner_uid,
+            });
         }
     }
 }
@@ -1019,7 +1134,7 @@ fn spawn_reaper(
     state: Arc<Mutex<HandlerState>>,
     slot: Arc<ChildSlot>,
     slots: Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
     std::thread::spawn(move || run_reaper(&handle, &state, &slot, &slots, &tombstones));
 }
@@ -1029,7 +1144,7 @@ fn run_reaper(
     state: &Arc<Mutex<HandlerState>>,
     slot: &Arc<ChildSlot>,
     slots: &Arc<Mutex<Vec<Arc<ChildSlot>>>>,
-    tombstones: &Arc<Mutex<VecDeque<HelperBirthTarget>>>,
+    tombstones: &Arc<Mutex<VecDeque<ReapedOwner>>>,
 ) {
     let proof = loop {
         match slot.reap_fact() {
@@ -1124,28 +1239,10 @@ pub struct ConnServer {
 
 impl ConnServer {
     /// 由 [`ServerConfig`] 建服务（单一共享 state + spawner）。
-    #[cfg(test)]
     #[must_use]
     pub fn new(cfg: &ServerConfig) -> Arc<Self> {
-        Self::with_claims_provision(
-            cfg,
-            Err(std::io::Error::other("test deployment not initialized")),
-        )
-    }
-
-    /// Consume this startup's exact provisioning result, retaining successful
-    /// original FDs or the failure for the whole helper lifetime. Never reopen
-    /// a statically valid directory to erase a provisioning error.
-    #[must_use]
-    pub fn with_claims_provision(
-        cfg: &ServerConfig,
-        claims_provision: std::io::Result<super::claims::ClaimsDeployment>,
-    ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(HandlerState::new()));
-        let spawner = Arc::new(AmbientCapsSpawner::with_claims_provision(
-            Arc::clone(&state),
-            claims_provision,
-        ));
+        let spawner = Arc::new(AmbientCapsSpawner::new(Arc::clone(&state)));
         Arc::new(Self {
             state,
             spawner,
@@ -1157,11 +1254,6 @@ impl ConnServer {
             limiter: ConnLimiter::new(MAX_CONCURRENT_CONNECTIONS),
             limit_log: LogThrottle::new(ACCEPT_LOG_INTERVAL),
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn validate_start_environment_for_test(&self) -> Result<(), SpawnError> {
-        self.spawner.validate_start_environment()
     }
 
     /// 处理一个连接（Go: `go handle(conn)`）。捕获 SO_PEERCRED → 转 std 阻塞流（5s 读超时）→
@@ -1189,9 +1281,8 @@ impl ConnServer {
 
         // 1. 先取 SO_PEERCRED（转 std 后原流被消费，无法再取）。失败 → 捕获 None → handle 回 ERR peercred。
         let cred = TokioPeerCred::new(&stream).peer_cred();
-        // 2. 转 std 阻塞流 + 5s 读超时。Go SetReadDeadline 是**连接级绝对**期限，std set_read_timeout 是
-        //    **每次读** SO_RCVTIMEO —— 行数上界固定（start ≤6 行），DESIGN-REVIEW(read-deadline-per-read)，
-        //    且 socket 已受授权 uid 门限，差异可控。
+        // 2. Convert to blocking input with one absolute budget for the request.
+        // DeadlineStream tightens each read, including all pre-authentication input.
         let std_stream = match stream.into_std() {
             Ok(s) => s,
             Err(_) => return,
@@ -1199,7 +1290,8 @@ impl ConnServer {
         if std_stream.set_nonblocking(false).is_err() {
             return;
         }
-        let _ = std_stream.set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT_SECS)));
+        let std_stream =
+            crate::line_io::DeadlineStream::new(std_stream, Duration::from_secs(READ_TIMEOUT_SECS));
 
         let this = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -1211,6 +1303,8 @@ impl ConnServer {
             let ss: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &ss_fn;
             let fwd: &(dyn Fn(bool) + Send + Sync) = &fwd_fn;
             let deps = HandlerDeps {
+                #[cfg(test)]
+                test_core: None,
                 core_dir: this.core_dir.as_deref(),
                 auth_file: &this.auth_file,
                 peer_cred: &peer,

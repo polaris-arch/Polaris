@@ -49,21 +49,36 @@ impl<Fs: MarkerFs> DnsMarker<Fs> {
         &self.path
     }
 
-    /// 写 marker（setDns 前置 intent）。失败仅告警绝不抛（Polaris writeMarker try/catch）。
-    pub fn write(&self, original: &BTreeMap<String, Vec<String>>) {
+    /// Durable intent must exist before any OS mutation.
+    pub fn write(&self, original: &BTreeMap<String, Vec<String>>) -> bool {
         let marker = SystemDnsMarker {
             controlled_ip: self.controlled_ip.clone(),
             original: original.clone(),
             at: now_ms(),
         };
         let Ok(json) = serde_json::to_string(&marker) else {
-            return;
+            return false;
         };
-        let _ = self.fs.write_marker(&self.path, &json);
+        self.fs.write_marker(&self.path, &json).is_ok()
     }
 
-    pub fn clear(&self) {
-        let _ = self.fs.remove_marker(&self.path);
+    pub fn clear(&self) -> bool {
+        self.fs.remove_marker(&self.path).is_ok()
+    }
+
+    fn read_checked(&self) -> std::io::Result<Option<SystemDnsMarker>> {
+        let Some(raw) = self.fs.read_marker_checked(&self.path)? else {
+            return Ok(None);
+        };
+        let marker: SystemDnsMarker = serde_json::from_str(&raw)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if !is_controlled_dns_ip_valid(&marker.controlled_ip) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid DNS marker",
+            ));
+        }
+        Ok(Some(marker))
     }
 
     /// 读 marker；不存在 / 损坏 / 结构非法 → None。
@@ -77,7 +92,7 @@ impl<Fs: MarkerFs> DnsMarker<Fs> {
     }
 
     pub fn exists(&self) -> bool {
-        self.read().is_some()
+        self.read_checked().map_or(true, |marker| marker.is_some())
     }
 }
 
@@ -409,14 +424,17 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         &self.displaced_resolvers
     }
 
-    /// 读各服务当前 DNS（best-effort：单服务读失败按 `[]`）。
-    fn snapshot_current(&self, targets: &[String]) -> BTreeMap<String, Vec<String>> {
+    /// DHCP is an observed empty list; read failure cannot authorize takeover.
+    fn snapshot_current(
+        &self,
+        targets: &[String],
+    ) -> Result<BTreeMap<String, Vec<String>>, SystemIntegrationError> {
         let mut current = BTreeMap::new();
         for t in targets {
-            let ips = self.ops.read_dns(t).unwrap_or_default();
+            let ips = self.ops.read_dns(t)?;
             current.insert(t.clone(), ips);
         }
-        current
+        Ok(current)
     }
 
     /// TUN 启动接管系统 DNS。**best-effort**：失败仅告警 + 回滚，绝不抛（不阻断 TUN 启动）。
@@ -441,8 +459,12 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         }
 
         // 读当前 DNS + 防自指计算原始值。
-        let current = self.snapshot_current(&targets);
-        let existing = self.marker.read();
+        let Ok(current) = self.snapshot_current(&targets) else {
+            return;
+        };
+        let Ok(existing) = self.marker.read_checked() else {
+            return;
+        };
         let original = compute_original_to_save(
             &current,
             &self.marker.controlled_ip,
@@ -468,8 +490,11 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         }
 
         // marker 前置写（intent）。
+        if !self.marker.write(&original) {
+            log::warn!("DNS recovery intent could not be persisted; takeover skipped");
+            return;
+        }
         self.original = Some(original.clone());
-        self.marker.write(&original);
 
         // apply（整循环重试，非逐 target 单独重试——上游 `setDns` 的 `retry()` 包裹的是整个
         // for-loop：单条 target 抖动失败即整轮重跑，幂等安全，重复 apply 受控 IP 无害）。
@@ -487,10 +512,8 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             self.sleeper,
         );
         if result.is_err() {
-            // 失败兜底：还原以免半接管残留；还原失败补清 marker。
-            if !self.restore_dns_inner() {
-                self.marker.clear();
-            }
+            // A failed rollback still owns recovery work; retain both sources.
+            self.restore_dns_inner();
         }
     }
 
@@ -508,42 +531,29 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
     }
 
     fn restore_dns_inner(&mut self) -> bool {
-        // 还原即观测作废：那份清单描述的是"接管期间被挤掉了谁"，接管一结束它就不再成立，
-        // 留着会让 UI 在没接管时仍显示告警。
-        self.displaced_resolvers.clear();
-        self.original_lan_resolver = None;
-        let marker = self.marker.read();
+        let Ok(marker) = self.marker.read_checked() else {
+            return false;
+        };
         let original = self
             .original
             .clone()
             .or_else(|| marker.as_ref().map(|m| m.original.clone()));
         let Some(original) = original else {
-            self.marker.clear();
-            return true;
+            return self.marker.clear();
         };
 
-        let targets = self
-            .ops
-            .list_targets()
-            .unwrap_or_else(|_| original.keys().cloned().collect());
-        let restore_targets = if targets.is_empty() {
-            original.keys().cloned().collect::<Vec<_>>()
-        } else {
-            targets
-        };
-
-        // 逐服务 best-effort：单服务失败不阻断其余。
+        // Recorded custody, not today's enabled-service enumeration, owns restoration.
+        // Unavailable services retain their recovery evidence for a later retry.
         let mut all_ok = true;
-        for t in &restore_targets {
-            if let Some(ips) = original.get(t) {
-                if self.ops.apply_dns(t, ips).is_err() {
-                    all_ok = false;
-                }
+        for (target, ips) in &original {
+            if self.ops.apply_dns(target, ips).is_err() {
+                all_ok = false;
             }
         }
-        if all_ok {
+        if all_ok && self.marker.clear() {
             self.original = None;
-            self.marker.clear();
+            self.displaced_resolvers.clear();
+            self.original_lan_resolver = None;
             true
         } else {
             // 部分失败 → 保留 marker 交下次启动重试。
@@ -564,7 +574,7 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         if !is_controlled_dns_ip_valid(&self.marker.controlled_ip) {
             return;
         }
-        let Some(marker) = self.marker.read() else {
+        let Ok(Some(marker)) = self.marker.read_checked() else {
             // marker 不在 = 接管未激活 → 绝不擅自接管。
             return;
         };
@@ -576,7 +586,9 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
             return;
         }
 
-        let current = self.snapshot_current(&targets);
+        let Ok(current) = self.snapshot_current(&targets) else {
+            return;
+        };
 
         // 以既有 marker.original 为底，并入当前各服务的应保存原始（防自指）。
         let mut merged = marker.original.clone();
@@ -599,8 +611,11 @@ impl<Ops: SystemDnsOps, Fs: MarkerFs> SystemDnsController<Ops, Fs> {
         }
 
         // 先写 marker 再 apply（崩溃留 intent）。
+        if !self.marker.write(&merged) {
+            log::warn!("DNS recovery intent update failed; reconcile skipped");
+            return;
+        }
         self.original = Some(merged.clone());
-        self.marker.write(&merged);
 
         for t in to_apply {
             let _ = self

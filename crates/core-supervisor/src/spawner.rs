@@ -302,6 +302,10 @@ impl SingBoxSpawner for TokioSpawner {
             bin: binary.clone(),
             source,
         })?;
+        // 主程序被强杀时没有任何代码能跑，直起的核只能靠内核连坐：纳入本进程的作业对象。
+        // 紧跟在进程创建之后，把「已起未纳入」的窗口压到最小；失败只记日志，不影响起核。
+        #[cfg(windows)]
+        crate::job_object::enroll_spawned_core(&child);
         // **在返回之前**把两个读端交出去。放在这里而不是交给调用方，是本次收口的全部内容：
         // 管道从此不会带着「还没人读」的状态离开 spawner，起核到就绪那一整段窗口里也不会有
         // 「已经在写、还没人读」的空档。

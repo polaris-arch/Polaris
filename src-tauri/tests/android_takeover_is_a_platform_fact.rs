@@ -13,7 +13,6 @@
 //!
 //! | 站点 | Android 照裸值分流会怎样 |
 //! |---|---|
-//! | `proxy/dns_race.rs` 的 `plan_upstreams` | INV-1「TUN 期把 `system` 上游从竞速池摘除」不生效 ⇒ sidecar 的 `system` 上游经 OS resolver 明文 `:53` 出去、被 `hijack-dns` 抓回来 ⇒ 自递归（第二道防线仍在，故是降级不是熔毁） |
 //! | `proxy/system_takeover.rs` 的 `should_enable_system_proxy` | 起核后去调 `enable_system_proxy`，而 `proxy_ops` 的 Android 臂显式返 `Err` ⇒ **用户当场看到一条「系统代理启用失败，流量未经代理」的假错误** |
 //! | `proxy/connection_flush.rs` + `proxy/hot_switch.rs` 的 flush 守卫 | 起隧道后旧连接不被 RST（真实 IP 已泄漏且此后不自愈），且 `network_settle` 门少一段 |
 //! | `proxy/system_takeover.rs` 的残留提示 | 第三方系统代理残留 advisory 在非 TUN 早退 |
@@ -45,9 +44,9 @@
 //!
 //! # 不在本面之内的（显式声明边界，否则「扫到 0 处也叫全绿」）
 //!
-//! - `crates/**`：`config-engine` 侧由它自己那道整份产物门守；`dns-race` 的 `plan_upstreams`
+//! - `crates/**`：`config-engine` 侧由它自己那道整份产物门守；`config-engine::node_dns` 的 `plan_upstreams`
 //!   与 `system-integration` 的 `should_reconcile_dns` 是**被喂**判据的纯函数（入参已由
-//!   `src-tauri` 侧过完生效值），它们不知道也不该知道平台。
+//!   调用侧过完生效值），它们不知道也不该知道平台。
 //! - `src-tauri/src/**/tests/`：测试里按档位分叉是**构造输入**，不是判据。
 //! - `proxy/dns_takeover.rs` 的 `Some("tun")`：那是把已经过完生效值的 `is_tun: bool` 翻译成
 //!   `should_reconcile_dns` 的字符串入参，是**构造**不是判别（它的 `is_tun` 由面①管着）。
@@ -105,20 +104,10 @@ const RAW_READ_EXEMPTIONS: &[Exemption] = &[];
 type RawJsonSite = (&'static str, &'static str, usize, &'static str);
 const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     (
-        "src-tauri/src/app_tray.rs",
-        "cfg[\"proxyModeType\"] = serde_json::Value::String(kind.to_string())",
+        "src-tauri/src/commands/config.rs",
+        "next[\"proxyModeType\"] = json!(mode)",
         1,
-        "原生兜底托盘菜单「切接管方式」的落盘腿 —— 这是**写**不是读，写的是用户在菜单里点的那一档。\
-         Android 不可达：`MenuAction::Takeover` 与整棵原生菜单都在 `#[cfg(desktop)]` 之下\
-         （移动端 `tauri::menu` 模块整个不存在），且该平台上「系统代理 vs TUN」这个维度不存在\
-         （见 app_tray.rs 头注那张能力裁定表）。",
-    ),
-    (
-        "src-tauri/src/app_tray.rs",
-        "for key in [\"proxyModeType\", \"dnsConfig\", \"dnsDefaults\"]",
-        1,
-        "同上那条落盘腿的原子补丁键清单（proxyModeType + FakeIP-TUN 纠正一起落盘，不许拆）。\
-         `#[cfg(desktop)]`，Android 不可达。",
+        "config_takeover_edit 把已解析的 ProxyModeType 用户输入写入最新配置，不是从原始状态作平台判据；Android 运行态仍由 effective_on 强制 TUN。",
     ),
     (
         "src-tauri/src/app_tray.rs",

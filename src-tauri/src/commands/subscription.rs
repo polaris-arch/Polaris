@@ -20,7 +20,7 @@ use polaris_config_engine::builder::endpoint_routes::{
     is_mesh_node_unroutable, mesh_node_carries_full_tunnel,
 };
 use polaris_config_engine::builder::route::subscription_update_route_uses_proxy;
-use polaris_config_engine::user_config::dns_constants::{is_direct_selection, DIRECT_SERVER_ID};
+use polaris_config_engine::user_config::dns_constants::{is_sentinel_selection, DIRECT_SERVER_ID};
 use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
 use polaris_config_engine::user_config::UserConfig;
 use polaris_net_stack::singbox_import::ImportOrigin;
@@ -30,15 +30,17 @@ use polaris_net_stack::subscription::default_subscription_user_agent;
 use polaris_net_stack::subscription::{Conditional, ProviderFetchError, SubscriptionParseLimits};
 use polaris_net_stack::subscription_error::SubscriptionErrorKind;
 
-use crate::commands::config::broadcast_config_changed;
+use crate::commands::config::{broadcast_config_changed, broadcast_config_changed_with_completion};
 use crate::commands::picked_file::{
     classify, file_name_of, open_picked_for_read, PickedTarget, PluginFiles,
 };
 use crate::events::{broadcast, channel::EVENT_SUBSCRIPTION_UPDATE_PROGRESS};
 use crate::i18n::{key, t};
 use crate::response::{ok_void, ApiResponse};
+use crate::runtime::auto_select::{Cause, Leg, SwitchRecord};
 use crate::runtime::config::Decision;
 use crate::runtime::http::{HttpRuntime, SystemDnsLookup};
+use crate::runtime::proxy::{ProxyRuntime, SwitchOutcome};
 use crate::runtime::subscription_parse::SubscriptionParseExecutor;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
 use crate::runtime::AppRuntime;
@@ -80,8 +82,8 @@ fn primary_fetch_retry_delay(kind: SubscriptionErrorKind, retries_done: u8) -> O
 /// 我们短路 parse/reconcile，**新格式永远拿不到**，用户只看到「无变化」且无从排查。
 ///
 /// 判据只看 UA 是否**真的变了**（`None`/`""`/纯空白按同一口径归一，与
-/// [`resolve_subscription_ua`] 的 falsy 语义一致）：URL/名字等其它字段的编辑不该白扔验证器。
-/// URL 变了不需要在此处理 —— 那是另一个资源，服务端本来就不会拿旧 ETag 判 304。
+/// [`resolve_subscription_ua`] 的 falsy 语义一致）：名字等不影响响应身份的编辑不该白扔验证器。
+/// URL 变化也必须清除验证器；不同来源可能使用相同的 ETag，不能跨源复用。
 ///
 /// **本函数只管 per-sub 那一级**。全局 `config.subscriptionUserAgent` 改动走 config 写命令、
 /// 不经本函数 → 那条腿由 [`invalidate_validators_on_global_ua_change`] 在 config 写入侧收口
@@ -162,7 +164,7 @@ pub(crate) fn invalidate_validators_on_global_ua_change(
 /// 上游 `SUBSCRIPTION_UPDATE`：更新订阅元数据（按 id）。
 ///
 /// **前端整体替换该记录**（`SubDialog` 用 `{...base, …}` 回传），故 etag/lastModified 等后端字段
-/// 靠 spread 幸存 —— 唯独 UA 变更必须主动作废验证器，见 [`ua_changed`]。
+/// 靠 spread 幸存 —— URL 或 UA 变更必须主动作废验证器，见 [`ua_changed`]。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -197,8 +199,10 @@ pub fn subscription_update(
             .get_mut("subscriptions")
             .and_then(Value::as_array_mut)
             .expect("subscription index came from the same array");
-        if ua_changed(&arr[idx], &subscription) {
-            // UA 换了 = 响应变体可能整个换掉 → 旧验证器作废，下次走全量 GET。
+        if ua_changed(&arr[idx], &subscription)
+            || subscription_url_changed(&arr[idx], &subscription)
+        {
+            // URL 或 UA 换了 = 响应身份变化 → 旧验证器作废，下次走全量 GET。
             set_or_remove(&mut subscription, "etag", None);
             set_or_remove(&mut subscription, "lastModified", None);
         }
@@ -240,11 +244,18 @@ fn apply_subscription_delete(cfg: &mut Value, subscription_id: &str) -> Result<(
     if let Some(arr) = cfg.get_mut("servers").and_then(Value::as_array_mut) {
         arr.retain(|s| s.get("subscriptionId").and_then(Value::as_str) != Some(subscription_id));
     }
+    // 自动选择意图指向被删的订阅 → 清回手动，不留悬空意图。
+    if polaris_store::selection_intent_subscription(cfg) == Some(subscription_id) {
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.remove(polaris_store::SELECTION_INTENT_KEY);
+        }
+    }
     // 选中被删 → 置 direct 哨兵（订阅删除路径：直连终态，对齐 上游 删订阅 null→direct 语义，
     // 但用哨兵避开 generate 对裸 null 的 `Selected server not found` 回归）。
     let selected_gone = cfg
         .get("selectedServerId")
         .and_then(Value::as_str)
+        .filter(|sid| !is_sentinel_selection(Some(sid)))
         .map(|sid| {
             cfg.get("servers")
                 .and_then(Value::as_array)
@@ -280,12 +291,18 @@ pub fn subscription_delete(
             .get("selectedServerId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let intent_pointed_here =
+            polaris_store::selection_intent_subscription(cfg) == Some(subscription_id.as_str());
         if apply_subscription_delete(cfg, &subscription_id).is_err() {
             return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
         }
-        Decision::Write(Ok(old_selected))
+        Decision::Write(Ok((old_selected, intent_pointed_here)))
     }) {
-        Ok((Ok(old_selected), Some(cfg))) => {
+        Ok((Ok((old_selected, intent_cleared)), Some(cfg))) => {
+            if intent_cleared {
+                log::info!("自动选择：意图指向的订阅 {subscription_id} 已删除，意图回到手动");
+                state.proxy().auto_select_disarmed();
+            }
             broadcast_config_changed(&app, &cfg);
             // A7：删订阅令选中节点从列表消失 → selectedServerId 变 null = 出口变 → 作废旧出口解锁探测缓存
             // （否则解锁角标最长陈旧 30min）。选中不属该订阅（仍存活）→ 出口不动、不失效。
@@ -665,6 +682,7 @@ async fn perform_subscription_update_inner(
         None => return update_failure("订阅缺少 URL"),
     };
     let user_agent = resolve_subscription_ua(&cfg, &sub);
+    let fetch_identity = SubscriptionFetchIdentity::new(&cfg, &sub);
     let want_proxy = want_proxy_for_sub(&cfg, &sub);
     // 条件 GET：provider 型订阅豁免（主正文 304 掩盖 provider 独立变化）；否则带上次验证器。
     let conditional = if sub.get("hasProviders").and_then(Value::as_bool) == Some(true) {
@@ -734,6 +752,9 @@ async fn perform_subscription_update_inner(
         let apply_started = std::time::Instant::now();
         let transaction_started = std::time::Instant::now();
         let result = state.config().update(|cfg| {
+            if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
+                return Decision::Skip(Err(error));
+            }
             let Some(s) = find_subscription_mut(cfg, subscription_id) else {
                 return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
             };
@@ -781,8 +802,8 @@ async fn perform_subscription_update_inner(
     // 拉取期间可能已有别的写入落盘；对账、删除 journal 与保存必须在同一写临界区，以最新配置为基准。
     // 这里统一走 deferred-cleanup 形态：无删除时不会生成 journal，有删除时则保证旧核退出前不清理资产。
     let transaction = state.config().update_deferred_cleanup(|cfg| {
-        if find_subscription(cfg, subscription_id).is_none() {
-            return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
+        if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
+            return Decision::Skip(Err(error));
         }
         let old_selected = cfg
             .get("selectedServerId")
@@ -797,6 +818,14 @@ async fn perform_subscription_update_inner(
             &outcome.failed_providers,
         );
         let content_changed = recon.added > 0 || recon.updated > 0 || recon.deleted > 0;
+        // 自动选择意图下，这次刷新删掉了当前胜出节点：对账给出的兜底出口不分订阅，这里改取意图
+        // 指向的订阅里仍存在且未改动的最优候选；没有则沿用兜底（状态里会标出出口不在订阅内）。
+        prefer_auto_exit_after_removal(cfg, old_selected.as_deref(), |cfg| {
+            state
+                .proxy()
+                .auto_select_fallback(cfg)
+                .map(|candidate| candidate.node_id)
+        });
 
         // 6) 元数据回写到 sub 记录（lastUpdated + userInfo + 验证器 + hasProviders）。
         write_sub_metadata(
@@ -842,7 +871,11 @@ async fn perform_subscription_update_inner(
     }
 
     // 8) 内容变 / partial → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
-    broadcast_config_changed(app, &cfg);
+    let record_config = cfg.clone();
+    let record_from = old_selected.clone();
+    broadcast_config_changed_with_completion(app, &cfg, false, move |proxy, outcome| {
+        record_auto_exit_after_removal(proxy, &record_config, record_from.as_deref(), outcome);
+    });
     if selected_exit_changed(
         old_selected.as_deref(),
         cfg.get("selectedServerId").and_then(Value::as_str),
@@ -863,6 +896,39 @@ async fn perform_subscription_update_inner(
         false,
         user_info.as_ref(),
     )
+}
+
+/// Response identity is captured before await and checked under the configuration writer lock.
+/// Labels, timestamps and unrelated preferences may change without invalidating a response.
+#[derive(Debug, PartialEq, Eq)]
+struct SubscriptionFetchIdentity {
+    url: Option<String>,
+    user_agent: String,
+}
+
+impl SubscriptionFetchIdentity {
+    fn new(cfg: &Value, sub: &Value) -> Self {
+        Self {
+            url: sub.get("url").and_then(Value::as_str).map(str::to_owned),
+            user_agent: resolve_subscription_ua(cfg, sub).unwrap_or_else(|| {
+                polaris_net_stack::subscription::default_subscription_user_agent(env!(
+                    "CARGO_PKG_VERSION"
+                ))
+            }),
+        }
+    }
+
+    fn check_current(&self, cfg: &Value, id: &str) -> Result<(), String> {
+        let current = find_subscription(cfg, id).ok_or_else(|| format!("订阅不存在: {id}"))?;
+        if self != &Self::new(cfg, &current) {
+            return Err("拉取期间订阅 URL 或生效 UA 已变化，旧响应未写入，请重试更新".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn subscription_url_changed(old: &Value, new: &Value) -> bool {
+    old.get("url").and_then(Value::as_str) != new.get("url").and_then(Value::as_str)
 }
 
 /// 按 id 取订阅记录（只读克隆）。
@@ -1109,6 +1175,96 @@ fn node_content_eq(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// 订阅刷新删掉当前出口之后的改选，自动选择意图下的那一步：`old_selected` 已不在 `cfg.servers`
+/// 里（对账刚把出口换成了不分订阅的兜底）时，改取 `preferred(cfg)` 给出的节点 —— 意图指向的
+/// 订阅里仍存在且未改动的最优候选。`preferred` 给不出、或给出的节点不在配置里，则保留兜底。
+/// 返回改选到的节点 id。意图本身不动：这是系统代选，不是用户的选择。
+fn prefer_auto_exit_after_removal(
+    cfg: &mut Value,
+    old_selected: Option<&str>,
+    preferred: impl FnOnce(&Value) -> Option<String>,
+) -> Option<String> {
+    let exists = |cfg: &Value, id: &str| {
+        cfg.get("servers")
+            .and_then(Value::as_array)
+            .is_some_and(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server.get("id").and_then(Value::as_str) == Some(id))
+            })
+    };
+    let old = old_selected.filter(|id| !id.is_empty() && !is_sentinel_selection(Some(id)))?;
+    if exists(cfg, old) || cfg.get("selectedServerId").and_then(Value::as_str) == Some(old) {
+        return None;
+    }
+    let preferred = preferred(cfg).filter(|id| exists(cfg, id))?;
+    cfg.as_object_mut()?
+        .insert("selectedServerId".to_string(), json!(preferred));
+    Some(preferred)
+}
+
+/// 订阅刷新改了出口、而自动选择意图在：把这次系统代选记进选择状态（落在订阅内记一次换点；
+/// 落在订阅外不记，状态读取时会标出出口不在订阅内）。意图是手动时什么都不做。
+pub(crate) fn record_auto_exit_after_removal(
+    proxy: &ProxyRuntime,
+    cfg: &Value,
+    old_selected: Option<&str>,
+    outcome: Option<SwitchOutcome>,
+) {
+    let Some(subscription) = polaris_store::selection_intent_subscription(cfg) else {
+        return;
+    };
+    let new_selected = cfg.get("selectedServerId").and_then(Value::as_str);
+    if !selected_exit_changed(old_selected, new_selected) {
+        return;
+    }
+    // A stopped, stale, queued, deferred or failed Apply did not move the live exit.
+    // NoOp/Unchanged did not perform a new switch either.
+    if !matches!(
+        outcome,
+        Some(SwitchOutcome::HotSwitched | SwitchOutcome::Restarting)
+    ) {
+        proxy.auto_select_announce();
+        return;
+    }
+    let landed = new_selected.and_then(|id| {
+        cfg.get("servers")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|server| server.get("id").and_then(Value::as_str) == Some(id))
+            .filter(|server| {
+                server.get("subscriptionId").and_then(Value::as_str) == Some(subscription)
+            })
+            .map(|server| {
+                let name = server.get("name").and_then(Value::as_str).unwrap_or(id);
+                (id.to_string(), name.to_string())
+            })
+    });
+    match landed {
+        Some((to_id, to_name)) => {
+            log::info!("自动选择：订阅刷新删掉了胜出节点，改选同订阅的 {to_name}");
+            proxy.auto_select_record(SwitchRecord {
+                at: crate::runtime::subscription_scheduler::now_ms(),
+                leg: Leg::Select,
+                cause: Cause::WinnerRemoved,
+                from_id: old_selected.map(str::to_string),
+                from_name: None,
+                to_id,
+                to_name,
+                from_latency_ms: None,
+                to_latency_ms: None,
+                unverified: None,
+            });
+        }
+        None => {
+            log::warn!(
+                "自动选择：订阅刷新删掉了胜出节点，订阅 {subscription} 里没有可用候选，出口沿用兜底"
+            );
+            proxy.auto_select_announce();
+        }
+    }
+}
+
 /// 破坏性对账：以拉取的新节点集为准，对本订阅节点做差集（add/update/remove），
 /// **他订阅节点与自建节点（subscriptionId 不匹配）一律不动**。
 ///
@@ -1225,13 +1381,13 @@ fn reconcile_subscription_servers(
 
     // 悬挂 selectedServerId：按**实际结果 id 集**校验，仅当选中 id 真不在最终 servers 才兜底。
     // 此前按「指纹缺失」判：碰撞丢 id 时选中项指纹仍在却指向已消失 id → 漏判、留悬空引用。直连哨兵
-    // `__direct__` 与空值不是节点 id，不参与存在性校验（否则会被误兜底）。
+    // direct / block 哨兵与空值不是节点 id，不参与存在性校验（否则会被误兜底）。
     let selected = cfg
         .get("selectedServerId")
         .and_then(Value::as_str)
         .map(str::to_owned);
     if let Some(sid) = selected {
-        if !sid.is_empty() && !is_direct_selection(Some(&sid)) {
+        if !sid.is_empty() && !is_sentinel_selection(Some(&sid)) {
             let fallback = cfg
                 .get("servers")
                 .and_then(Value::as_array)

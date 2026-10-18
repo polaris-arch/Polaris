@@ -87,8 +87,8 @@
 //!   `domain_resolver` 改为 `dns-domestic`；代理出站、endpoint、DNS server 自身 bootstrap 与
 //!   `route.default_domain_resolver` 均不改。
 //! - **计数**：恰好 37 处，每个 case 一处；变换前 37/37 case 的第一个且唯一类别差异都是该字段。
-//! - **验收**：生成侧由 `builder::generate::tests::race_sidecar_is_referenced_only_by_node_dial_resolution`
-//!   钉住 sidecar 的唯一消费者；本门继续要求全量 37/37 diff=0。
+//! - **历史验收**：当时的 sidecar 消费者测试已随原生节点策略退位替换；
+//!   当前由生成器的节点作用域测试承接，本门继续要求全量 37/37 diff=0。
 //!
 //! **第六次例外（2026-08-25，Bootstrap 提升为显式受保护资源）**：生成器不再私藏
 //! `223.5.5.5` 与额外 provider 域名表；三个内置 DNS 都从 `UserConfig.dnsServers` 进入同一资源编译链。
@@ -162,6 +162,13 @@
 //! 的路径。等 上游 主树可用时，应以真正重生的导出覆盖，届时本次变换应当被逐字复现（若不能，说明有漂移）。
 
 #![allow(clippy::field_reassign_with_default)]
+
+// Native node-DNS migration (2026-10-17): expected snapshots intentionally
+// replace node dial resolvers (including ShadowTLS outer carriers), append the
+// isolated native policy and its IP-only candidates, and retain explicit DNS
+// bootstrap/ordinary client rules. These are intentional expected-output edits;
+// the separate native-node-dns-fixture example must be executed to produce the
+// real App-generated artifact consumed by core Dial/Listen integration tests.
 
 use polaris_config_engine::builder::{
     generate_sing_box_config, generate_sing_box_config_with_report, GenerateConfigDeps,
@@ -295,7 +302,7 @@ fn generate_config_matches_polaris_snapshot() {
         let deps = GenerateConfigDeps {
             platform: case.platform.clone(),
             arch: "x86_64".into(),
-            race_server_port: 0, // race off（snap 默认）
+            node_dns_decoy_override: None,
             probe_direct_port,
             probe_proxy_port,
             debug_probe_mixed_udp: false,
@@ -304,8 +311,7 @@ fn generate_config_matches_polaris_snapshot() {
             loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
-            race_upstream_ips: vec![],
-            race_upstream_ports: vec![],
+
             has_cronet: true, // naive 绕过 isNodeUsable（snap mock）
             cronet_copy_failed: false,
             has_management_api: false, // 1.13.0 无 services
@@ -450,7 +456,7 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
         let deps = GenerateConfigDeps {
             platform: case.platform.clone(),
             arch: "x86_64".into(),
-            race_server_port: 0,
+            node_dns_decoy_override: None,
             probe_direct_port,
             probe_proxy_port,
             debug_probe_mixed_udp: false,
@@ -459,8 +465,7 @@ fn resource_missing_world_never_falls_back_to_plaintext_direct() {
             loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
-            race_upstream_ips: vec![],
-            race_upstream_ports: vec![],
+
             has_cronet: true,
             cronet_copy_failed: false,
             has_management_api: false,
@@ -826,7 +831,7 @@ fn scenario_deps_base() -> GenerateConfigDeps {
     GenerateConfigDeps {
         platform: "linux".into(),
         arch: "x86_64".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
         debug_probe_mixed_udp: false,
@@ -835,8 +840,7 @@ fn scenario_deps_base() -> GenerateConfigDeps {
         loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         has_cronet: true,
         cronet_copy_failed: false,
         has_management_api: false,
@@ -962,7 +966,13 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
                         let tag = match child {
                             serde_json::Value::String(s) => Some(s.clone()),
                             serde_json::Value::Object(o) => {
-                                o.get("server").and_then(|s| s.as_str()).map(String::from)
+                                if o.get("mode").and_then(|s| s.as_str()) == Some("rules") {
+                                    o.get("policy")
+                                        .and_then(|s| s.as_str())
+                                        .map(|scope| format!("policy:{scope}"))
+                                } else {
+                                    o.get("server").and_then(|s| s.as_str()).map(String::from)
+                                }
                             }
                             _ => None,
                         };
@@ -990,7 +1000,7 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
         let deps = GenerateConfigDeps {
             platform: case.platform.clone(),
             arch: "x86_64".into(),
-            race_server_port: 0,
+            node_dns_decoy_override: None,
             probe_direct_port,
             probe_proxy_port,
             debug_probe_mixed_udp: false,
@@ -999,8 +1009,7 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
             loopback_auth: None,
             probe_pool_ports: vec![],
             lan_resolver_for_dns,
-            race_upstream_ips: vec![],
-            race_upstream_ports: vec![],
+
             has_cronet: true,
             cronet_copy_failed: false,
             has_management_api: false,
@@ -1039,7 +1048,17 @@ fn every_domain_resolver_reference_resolves_to_a_dns_server_tag() {
         let known: std::collections::BTreeSet<String> = cfg
             .dns
             .as_ref()
-            .map(|d| d.servers.iter().map(|s| s.tag.clone()).collect())
+            .map(|d| {
+                d.servers
+                    .iter()
+                    .map(|s| s.tag.clone())
+                    .chain(d.rules.iter().flatten().filter_map(|r| {
+                        r.resolver_policy
+                            .as_ref()
+                            .map(|scope| format!("policy:{scope}"))
+                    }))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let value = serde_json::to_value(&cfg).expect("config 序列化失败");

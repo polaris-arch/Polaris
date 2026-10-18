@@ -493,10 +493,22 @@ pub fn mesh_forced_route_cidrs(
     servers: &[ServerConfig],
     observed: &ObservedTailnetAddresses,
 ) -> Vec<String> {
-    let all: Vec<String> = mesh_force_routed_servers(servers, None, &BTreeSet::new())
-        .iter()
-        .flat_map(|s| endpoint_forced_route_cidrs(s, observed))
-        .collect();
+    engaged_mesh_forced_route_cidrs(servers, None, &BTreeSet::new(), observed)
+}
+
+/// Select eligible nodes once, then expand their routes without reapplying an empty engagement.
+/// TUN exclusions and route diagnostics must use the same selected/rule-targeted context.
+pub fn engaged_mesh_forced_route_cidrs(
+    servers: &[ServerConfig],
+    selected_server_id: Option<&str>,
+    rule_targeted_server_ids: &BTreeSet<String>,
+    observed: &ObservedTailnetAddresses,
+) -> Vec<String> {
+    let all: Vec<String> =
+        mesh_force_routed_servers(servers, selected_server_id, rule_targeted_server_ids)
+            .iter()
+            .flat_map(|server| endpoint_forced_route_cidrs(server, observed))
+            .collect();
     dedupe(all)
 }
 

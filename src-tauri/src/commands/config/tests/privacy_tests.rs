@@ -32,6 +32,14 @@ fn verify_rejects_malformed_stored_fail_closed() {
         "非法盐 hex → fail-closed"
     );
     assert!(!verify_password("$", "x"));
+    for salt in ["a", "zz", "+1", "aéa", "💡", "éé"] {
+        assert!(
+            hex_decode(salt).is_none(),
+            "invalid salt must fail closed: {salt}"
+        );
+        assert!(!verify_password(&format!("{salt}$deadbeef"), "x"));
+    }
+    assert_eq!(hex_decode("aB01"), Some(vec![0xab, 1]));
 }
 
 #[test]

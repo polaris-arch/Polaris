@@ -4,6 +4,34 @@ use serde_json::json;
 #[path = "../../../../config-engine/tests/support/core_locator.rs"]
 mod core_locator;
 
+// Outbound-only checks omit ordinary rules that depend on route.rule_set, but
+// scoped rules are resolver definitions and must travel with their callers.
+fn outbound_dns_surface(cfg: &Value) -> Value {
+    let rules: Vec<Value> = cfg["dns"]["rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|rule| rule.get("resolver_policy").is_some())
+        .cloned()
+        .collect();
+    json!({"servers": cfg["dns"]["servers"], "rules": rules})
+}
+
+#[test]
+fn outbound_dns_surface_retains_scoped_rules_verbatim() {
+    let cfg = json!({"dns": {"servers": [{"tag": "dns-bootstrap"}], "rules": [
+        {"rule_set": ["not-in-outbound-surface"], "action": "route", "server": "dns-bootstrap"},
+        {"resolver_policy": "node-bootstrap", "domain_suffix": [".lan"], "action": "reject"},
+        {"resolver_policy": "node-bootstrap", "action": "respond", "mode": "fallback", "fallback_rcode": "SERVFAIL"}
+    ]}});
+    let surface = outbound_dns_surface(&cfg);
+    assert_eq!(surface["servers"], cfg["dns"]["servers"]);
+    assert_eq!(
+        surface["rules"],
+        json!([cfg["dns"]["rules"][1], cfg["dns"]["rules"][2]])
+    );
+}
+
 fn id_gen() -> impl FnMut() -> String {
     let mut n = 0;
     move || {
@@ -1476,9 +1504,7 @@ fn remote_openvpn_static_key_mode_omits_tls_and_checks_with_core() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("static.json");
     let mut surface = json!({"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":endpoints});
-    if let Some(servers) = cfg.get("dns").and_then(|dns| dns.get("servers")) {
-        surface["dns"] = json!({"servers":servers});
-    }
+    surface["dns"] = outbound_dns_surface(&cfg);
     surface["route"] = json!({"default_domain_resolver":"dns-bootstrap"});
     std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();
     let output = core_locator::command_for_core(&core)
@@ -1589,7 +1615,7 @@ fn generate_import(
     let deps = GenerateConfigDeps {
         platform: "linux".into(),
         arch: "x86_64".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
         debug_probe_mixed_udp: false,
@@ -1598,8 +1624,7 @@ fn generate_import(
         loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         has_cronet: true,
         cronet_copy_failed: false,
         has_management_api: false,
@@ -1725,9 +1750,7 @@ fn local_import_round_trips_through_the_bundled_core() {
         // the earlier outbound-only test surface omitted it and was not a valid TS config.
         "route": { "default_domain_resolver": cfg["route"]["default_domain_resolver"] },
     });
-    if let Some(servers) = cfg.get("dns").and_then(|d| d.get("servers")) {
-        surface["dns"] = json!({ "servers": servers });
-    }
+    surface["dns"] = outbound_dns_surface(&cfg);
     let dir = std::env::temp_dir().join(format!("polaris-i1-import-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let check = |name: &str, v: &Value| -> (bool, String) {
@@ -1876,9 +1899,7 @@ fn remote_subscription_protocol_parity_round_trips_through_the_bundled_core() {
     let path = dir.join("remote-import.json");
     let mut surface = json!({"log":{"disabled":true},"outbounds":outs,"endpoints":eps,
         "route":{"default_domain_resolver":cfg["route"]["default_domain_resolver"]}});
-    if let Some(servers) = cfg.get("dns").and_then(|dns| dns.get("servers")) {
-        surface["dns"] = json!({"servers": servers});
-    }
+    surface["dns"] = outbound_dns_surface(&cfg);
     std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();
     let output = core_locator::command_for_core(&core)
         .args(["--disable-color", "check", "-c"])
@@ -2007,4 +2028,110 @@ fn wireguard_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() {
         .collect();
     assert!(got.contains(&(json!(true), json!("eth7"))), "{got:?}");
     assert!(got.contains(&(json!(false), json!("eth6"))), "{got:?}");
+}
+
+#[test]
+fn utls_enabled_intent_survives_import_save_share_and_generation() {
+    use polaris_config_engine::user_config::utls::{effective_server, UtlsMode};
+    for protocol in ["vless", "vmess", "trojan", "anytls"] {
+        for (input, mode, expected) in [
+            (
+                json!({"enabled":false,"fingerprint":"chrome"}),
+                UtlsMode::Disabled,
+                None,
+            ),
+            (json!({"enabled":false}), UtlsMode::Disabled, None),
+            (Value::Null, UtlsMode::Disabled, None),
+            (json!({"enabled":true}), UtlsMode::Default, Some("")),
+            (
+                json!({"enabled":true,"fingerprint":""}),
+                UtlsMode::Default,
+                Some(""),
+            ),
+            (
+                json!({"enabled":true,"fingerprint":"FiReFox"}),
+                UtlsMode::Profile,
+                Some("firefox"),
+            ),
+        ] {
+            let mut tls = json!({"enabled":true,"server_name":"example.com"});
+            if !input.is_null() {
+                tls["utls"] = input;
+            }
+            let parsed = parse(json!({"outbounds":[{
+                "type":protocol,"tag":"node","server":"example.com","server_port":443,
+                "uuid":"11111111-1111-1111-1111-111111111111","password":"secret","tls":tls,
+            }]}));
+            assert_eq!(parsed.servers.len(), 1);
+            let node = &parsed.servers[0];
+            assert_eq!(node.tls_settings.as_ref().unwrap().utls_mode, Some(mode));
+            let saved: ServerConfig =
+                serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
+            let effective = effective_server(&saved, Some("follow")).unwrap();
+            let built = serde_json::to_value(build_proxy_outbound(
+                effective.as_ref(),
+                "p",
+                &DomainResolver::Tag("dns-bootstrap".into()),
+                "x64",
+                "linux",
+            ))
+            .unwrap();
+            assert_eq!(built["tls"]["enabled"], true);
+            match expected {
+                Some(profile) => assert_eq!(built["tls"]["utls"]["fingerprint"], profile),
+                None => assert!(built["tls"].get("utls").is_none()),
+            }
+            // Share formats use fp=none/chrome to represent off/core Auto.
+            let link = crate::share_link::encode_share_url(&saved).unwrap();
+            let round =
+                crate::share_link::parse_share_url(&link, &mut || "round".into(), &mut |_| {})
+                    .unwrap();
+            let effective = effective_server(&round, None).unwrap();
+            let shared = serde_json::to_value(build_proxy_outbound(
+                effective.as_ref(),
+                "p",
+                &DomainResolver::Tag("dns-bootstrap".into()),
+                "x64",
+                "linux",
+            ))
+            .unwrap();
+            match expected {
+                Some("") => assert_eq!(shared["tls"]["utls"]["fingerprint"], "chrome"),
+                Some(profile) => assert_eq!(shared["tls"]["utls"]["fingerprint"], profile),
+                None => assert!(shared["tls"].get("utls").is_none()),
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_native_tls_engine_keeps_disabled_utls_and_rejects_an_active_conflict() {
+    use polaris_config_engine::user_config::utls::effective_server_for_platform;
+    let parsed = parse(
+        json!({"outbounds":[{"type":"vless","tag":"native","server":"example.com","server_port":443,
+        "uuid":"11111111-1111-1111-1111-111111111111",
+        "tls":{"enabled":true,"engine":"apple","utls":{"enabled":false,"fingerprint":"chrome"}}}]}),
+    );
+    assert_eq!(parsed.servers.len(), 1);
+    let node = &parsed.servers[0];
+    assert_eq!(
+        node.tls_settings.as_ref().unwrap().engine.as_deref(),
+        Some("apple")
+    );
+    let effective = effective_server_for_platform(node, None, "darwin").unwrap();
+    let built = serde_json::to_value(build_proxy_outbound(
+        effective.as_ref(),
+        "p",
+        &DomainResolver::Tag("dns-bootstrap".into()),
+        "x64",
+        "darwin",
+    ))
+    .unwrap();
+    assert_eq!(built["tls"]["engine"], "apple");
+    assert!(built["tls"].get("utls").is_none());
+    assert!(effective_server_for_platform(node, Some("default"), "darwin").is_err());
+    assert!(
+        effective_server_for_platform(node, Some("default"), "linux").is_ok(),
+        "foreign engine remains dormant according to the original platform gate"
+    );
 }

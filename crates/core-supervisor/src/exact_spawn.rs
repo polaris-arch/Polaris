@@ -15,16 +15,53 @@ pub const MAX_BINARY_BYTES: usize = 96 * 1024 * 1024;
 pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 pub const PINNED_B609_LINUX_X86_64_SHA256: &str =
     "64f6d8613f9c7d42ef9a8e90dd9fca7290f176c5b482714915c04353911559c0";
+pub const PINNED_FE182_LINUX_X86_64_SHA256: &str =
+    "7420d9777154754b9182a4269d12348544d925269b700a4f34a29647a4155399";
 const SEALS: SealFlag = SealFlag::F_SEAL_WRITE
     .union(SealFlag::F_SEAL_GROW)
     .union(SealFlag::F_SEAL_SHRINK)
     .union(SealFlag::F_SEAL_SEAL);
 
+/// Opaque byte identity from the private reviewed set. There is no public
+/// constructor accepting a digest, and this value grants no launch permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewedPlainTcpCheckIdentity {
+    binary_sha256: &'static str,
+}
+
+const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 4] = [
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: PINNED_B609_LINUX_X86_64_SHA256,
+    },
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: PINNED_FE182_LINUX_X86_64_SHA256,
+    },
+    // Exact c002 release ELF; sealed-runtime evidence remains pending. This
+    // identity admits the existing check-only path, never a production launch.
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: "b754ac8223b27f4c20b40ced82d9ad5d58fee8fb4c5bfa48c38566e805c570ae",
+    },
+    // Exact a4d085 producer ELF, verified without executing product code.
+    // The actual public contract is bound; sealed-runtime observation remains pending.
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: "2a7495faeb18d2666dfcc77f678057c35cc7a7bb36b03a8a16ff9ac6249b4db8",
+    },
+];
+
+/// One fixed check-only semantic profile with separately reviewed byte identity.
+/// New source revisions do not acquire an identity without exact ELF evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxInputProfile {
-    B609PlainTcpCheckV1,
+    PlainTcpCheckV1(ReviewedPlainTcpCheckIdentity),
     #[cfg(test)]
     NoNetworkUnitFixtureV1,
+}
+
+impl LinuxInputProfile {
+    pub const B609: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[0]);
+    pub const FE182: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[1]);
+    pub const C002: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[2]);
+    pub const A4D085: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[3]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,9 +220,9 @@ pub fn prepare_linux_protected_inputs(
     validate_elf(&binary_bytes)?;
     let binary_digest = digest(&binary_bytes);
     match profile {
-        LinuxInputProfile::B609PlainTcpCheckV1 => {
+        LinuxInputProfile::PlainTcpCheckV1(identity) => {
             if std::env::consts::ARCH != "x86_64"
-                || hex_digest(&binary_digest) != PINNED_B609_LINUX_X86_64_SHA256
+                || hex_digest(&binary_digest) != identity.binary_sha256
             {
                 return Err(PrepareError::BinaryMismatch);
             }

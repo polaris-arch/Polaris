@@ -211,6 +211,18 @@ utun5: flags=8051<UP> mtu 1280
     assert_eq!(got[1].1, vec!["10.0.0.2"]);
 }
 
+#[test]
+fn non_utun_headers_end_address_ownership_even_when_their_address_is_tailnet() {
+    let text = "utun4: flags=1\n\tinet6 fe80::1\nen9: flags=1\n\tinet 100.64.1.2 netmask 0xffffffff\nutun5: flags=1\n\tinet 100.64.2.3 netmask 0xffffffff\nbridge0: flags=1\n\tinet 100.64.3.4 netmask 0xffffffff\n";
+    assert_eq!(
+        parse_ifconfig_ifaces(text),
+        vec![
+            ("utun4".into(), Vec::<String>::new()),
+            ("utun5".into(), vec!["100.64.2.3".into()]),
+        ]
+    );
+}
+
 /// tailnet 100.64.0.0/10 边界（100.64–100.127 命中；100.63/100.128/非 100 不命中）。
 /// 变异：把范围写成 (64..=126) 或 0..=127 → 边界 case 转红。
 #[test]

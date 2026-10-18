@@ -839,3 +839,206 @@ fn tailcat_derp_server_ips_join_route_exclude_on_non_linux() {
         "Linux 恒不发射 route_exclude_address（与节点 IP 排除的非 Linux 条件一致）"
     );
 }
+
+// One JSON predicate is shared by positive cases and adversarial mutations.
+fn dns_contract_holds(value: &serde_json::Value, desktop_tun: bool, auto_route: bool) -> bool {
+    value.get("auto_route") == Some(&serde_json::json!(auto_route))
+        && if desktop_tun && !auto_route {
+            value.get("dns_mode") == Some(&serde_json::json!("hijack"))
+        } else {
+            value.get("dns_mode").is_none()
+        }
+}
+
+#[test]
+fn tun_dns_contract_all_platforms_and_missing_config() {
+    for (platform, name) in tun_platform_axis() {
+        let desktop = matches!(platform, Platform::Linux | Platform::Mac | Platform::Win);
+        for configured in [None, Some(true), Some(false)] {
+            let mut config = UserConfig {
+                proxy_mode_type: ProxyModeType::Tun,
+                ..Default::default()
+            };
+            config.tun_config =
+                configured.map(|auto_route| crate::user_config::tun_config::TunModeConfig {
+                    auto_route,
+                    ..Default::default()
+                });
+            let tun = tun_json_on(&config, name);
+            assert!(
+                dns_contract_holds(&tun, desktop, configured.unwrap_or(true)),
+                "{name}/{configured:?}: {tun}"
+            );
+            // Every mixed, direct, authenticated probe and update inbound stays unchanged.
+            let mut deps = deps_linux();
+            deps.platform = name.into();
+            deps.probe_direct_port = Some(21001);
+            deps.probe_proxy_port = Some(21002);
+            deps.update_in_port = Some(21003);
+            deps.loopback_auth = Some(InboundUser {
+                username: "test".into(),
+                password: "b".repeat(32),
+            });
+            for inbound in build_inbounds(&config, None, &deps) {
+                if inbound.type_field != "tun" {
+                    assert!(serde_json::to_value(inbound)
+                        .unwrap()
+                        .get("dns_mode")
+                        .is_none());
+                }
+            }
+            config.proxy_mode_type = ProxyModeType::SystemProxy;
+            for inbound in build_inbounds(&config, None, &deps) {
+                assert!(serde_json::to_value(inbound)
+                    .unwrap()
+                    .get("dns_mode")
+                    .is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn tun_dns_contract_rejects_old_output_and_wrong_modes() {
+    let config = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        tun_config: Some(crate::user_config::tun_config::TunModeConfig {
+            auto_route: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for name in ["linux", "darwin", "win32"] {
+        let tun = tun_json_on(&config, name);
+        assert!(dns_contract_holds(&tun, true, false));
+        let mut old_output = tun.clone();
+        old_output.as_object_mut().unwrap().remove("dns_mode");
+        assert!(
+            !dns_contract_holds(&old_output, true, false),
+            "old77 manual-route output must fail"
+        );
+        for wrong in ["disabled", "native", "typo"] {
+            let mut bad = tun.clone();
+            bad["dns_mode"] = serde_json::json!(wrong);
+            assert!(!dns_contract_holds(&bad, true, false));
+        }
+        let mut forced_route = tun;
+        forced_route["auto_route"] = serde_json::json!(true);
+        assert!(!dns_contract_holds(&forced_route, true, false));
+    }
+    for name in ["android", "ios", "freebsd"] {
+        let mut bad = tun_json_on(&config, name);
+        bad["dns_mode"] = serde_json::json!("hijack");
+        assert!(!dns_contract_holds(&bad, false, false));
+    }
+}
+
+#[test]
+fn tun_dns_mode_is_typed_and_omission_roundtrips() {
+    for (mode, spelling) in [
+        (TunDnsMode::Disabled, "disabled"),
+        (TunDnsMode::Native, "native"),
+        (TunDnsMode::Hijack, "hijack"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(mode).unwrap(),
+            serde_json::json!(spelling)
+        );
+        assert_eq!(
+            serde_json::from_value::<TunDnsMode>(serde_json::json!(spelling)).unwrap(),
+            mode
+        );
+    }
+    assert!(serde_json::from_value::<TunDnsMode>(serde_json::json!("unexpected")).is_err());
+    let config = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        ..Default::default()
+    };
+    let original = tun_json_on(&config, "linux");
+    let roundtrip: Inbound = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(roundtrip.dns_mode, None);
+    assert_eq!(serde_json::to_value(roundtrip).unwrap(), original);
+}
+
+#[test]
+fn engaged_mesh_carves_tun_exclusion_once_and_keeps_platform_lan_guards() {
+    use crate::user_config::server_config::{Protocol, ServerConfig, WireGuardSettings};
+    let node = ServerConfig {
+        id: "wg".into(),
+        name: "mesh".into(),
+        protocol: Protocol::Wireguard,
+        address: "203.0.113.1".into(),
+        port: 51820,
+        wireguard_settings: Some(Box::new(WireGuardSettings {
+            allowed_ips: vec!["10.20.0.0/16".into()],
+            always_route_subnets: Some(false),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    for platform in ["win32", "darwin", "linux"] {
+        for engagement in ["selected", "targeted", "unused", "always"] {
+            let mut config = UserConfig {
+                servers: vec![node.clone()],
+                proxy_mode_type: ProxyModeType::Tun,
+                selected_server_id: Some(
+                    if engagement == "selected" {
+                        "wg"
+                    } else {
+                        "__direct__"
+                    }
+                    .into(),
+                ),
+                tun_config: Some(crate::user_config::tun_config::TunModeConfig {
+                    inbound_exclude_cidrs: Some(vec!["10.20.0.0/16".into()]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if engagement == "always" {
+                config.servers[0]
+                    .wireguard_settings
+                    .as_mut()
+                    .unwrap()
+                    .always_route_subnets = Some(true);
+            }
+            if engagement == "targeted" {
+                config.custom_rules = vec![serde_json::from_value(serde_json::json!({
+                    "id":"target", "type":"domain", "values":["example.com"],
+                    "action":"proxy", "targetServerId":"wg", "enabled":true
+                }))
+                .unwrap()];
+            }
+            let mut deps = deps_linux();
+            deps.platform = platform.into();
+            let inbounds = build_inbounds(&config, None, &deps);
+            let exclude = inbounds
+                .iter()
+                .find(|i| i.tag == "tun-in")
+                .unwrap()
+                .route_exclude_address
+                .clone()
+                .unwrap_or_default();
+            assert_eq!(
+                crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/16", &exclude),
+                platform != "linux" && engagement == "unused",
+                "{platform}/{engagement}: {exclude:?}"
+            );
+            if platform == "win32" && engagement != "unused" {
+                deps.own_lan_cidrs = vec!["10.20.0.0/24".into()];
+                let physical = build_inbounds(&config, None, &deps);
+                let exclude = physical
+                    .iter()
+                    .find(|i| i.tag == "tun-in")
+                    .unwrap()
+                    .route_exclude_address
+                    .clone()
+                    .unwrap_or_default();
+                assert!(
+                    crate::user_config::cidr::cidr_overlaps_any("10.20.0.0/24", &exclude),
+                    "real physical LAN must keep its existing bypass protection"
+                );
+            }
+        }
+    }
+}

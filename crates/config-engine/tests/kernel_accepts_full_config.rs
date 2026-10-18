@@ -763,3 +763,168 @@ fn bundled_core_accepts_network_profile_rules_in_every_shape() {
         assert!(ok, "{name} 被随包核拒绝：{diag}");
     }
 }
+
+fn manual_route_case(platform: &str, ipv6: bool, fake_ip: bool) -> SnapshotCase {
+    let mut input = load_cases()
+        .into_iter()
+        .find(|c| c.name == "TUN+trojan-linux")
+        .unwrap()
+        .input;
+    input
+        .tun_config
+        .get_or_insert_with(Default::default)
+        .auto_route = false;
+    input.enable_ipv6 = Some(ipv6);
+    input
+        .dns_config
+        .get_or_insert_with(Default::default)
+        .enable_fake_ip = Some(fake_ip);
+    SnapshotCase {
+        name: format!("manual-dns-{platform}-{ipv6}-{fake_ip}"),
+        platform: platform.into(),
+        input,
+    }
+}
+
+#[test]
+fn generated_manual_route_dns_preserves_full_dns_and_route() {
+    for platform in ["linux", "darwin", "win32", "android", "ios", "freebsd"] {
+        for ipv6 in [false, true] {
+            for fake_ip in [false, true] {
+                let mut case = manual_route_case(platform, ipv6, fake_ip);
+                let deps = support::kernel_gate::outbound_deps_for(platform);
+                let manual = serde_json::to_value(
+                    generate_sing_box_config(&case.input, &BTreeMap::new(), &deps).unwrap(),
+                )
+                .unwrap();
+                case.input.tun_config.as_mut().unwrap().auto_route = true;
+                let automatic = serde_json::to_value(
+                    generate_sing_box_config(&case.input, &BTreeMap::new(), &deps).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(manual["dns"], automatic["dns"], "{} DNS drift", case.name);
+                assert_eq!(
+                    manual["route"], automatic["route"],
+                    "{} route drift",
+                    case.name
+                );
+                let tun = manual["inbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|i| i["type"] == "tun")
+                    .unwrap();
+                assert_eq!(tun["auto_route"], false);
+                if ["linux", "darwin", "win32"].contains(&platform) {
+                    assert_eq!(tun["dns_mode"], "hijack");
+                } else {
+                    assert!(tun.get("dns_mode").is_none());
+                }
+                assert!(automatic["inbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|i| i.get("dns_mode").is_none()));
+            }
+        }
+    }
+}
+
+/// CI schema/decode/initialize coverage only; does not Start or prove SetDNS.
+#[test]
+fn bundled_core_accepts_manual_route_hijack_full_configs() {
+    if std::env::var("POLARIS_NO_KERNEL_RUN").is_ok_and(|v| v == "1") {
+        assert!(
+            !std::env::var("POLARIS_REQUIRE_KERNEL_GATE").is_ok_and(|v| v == "1"),
+            "mandatory CI cannot skip a core gate"
+        );
+        eprintln!("manual-route core check not executed: explicit local no-kernel boundary");
+        return;
+    }
+    let Some(core) = core_or_skip("manual-route hijack 完整配置门") else {
+        return;
+    };
+    let temp = tempdir().unwrap();
+    let mut checked = 0;
+    for platform in ["linux", "darwin", "win32"] {
+        for ipv6 in [false, true] {
+            for fake_ip in [false, true] {
+                let case = manual_route_case(platform, ipv6, fake_ip);
+                let deps = full_config_deps(&case, &temp);
+                let value = serde_json::to_value(
+                    generate_sing_box_config(&case.input, &BTreeMap::new(), &deps).unwrap(),
+                )
+                .unwrap();
+                let tun = value["inbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|i| i["type"] == "tun")
+                    .unwrap();
+                assert_eq!(tun["auto_route"], false);
+                assert_eq!(tun["dns_mode"], "hijack");
+                let path = temp.path().join(format!("{}.json", case.name));
+                std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+                let (ok, diag) = check(&core, &path);
+                assert!(ok, "{} rejected: {diag}", case.name);
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 12);
+}
+
+/// The default native policy must reach the actual kernel as generated. A
+/// changed policy reference must fail for that reference, not an unrelated
+/// fixture credential. This check does not start DNS, TUN or listener services.
+#[test]
+fn full_builder_native_node_policy_accepts_and_rejects_unknown_reference() {
+    let Some(core) = core_or_skip("native node DNS policy positive/negative control") else {
+        return;
+    };
+    let temp = tempdir().expect("create native policy fixture directory");
+    let mut case = load_cases()
+        .into_iter()
+        .next()
+        .expect("full fixture exists");
+    // Public fixture value, not a real credential. Preserve the frozen fixture.
+    case.input.servers[0].uuid = Some("00000000-0000-4000-8000-000000000001".into());
+    let deps = full_config_deps(&case, &temp);
+    let cfg = generate_sing_box_config(&case.input, &BTreeMap::new(), &deps)
+        .expect("generate full native-policy configuration");
+    let mut value = serde_json::to_value(&cfg).expect("serialize native policy");
+    let rules = value["dns"]["rules"]
+        .as_array()
+        .expect("full DNS rules remain");
+    assert!(rules.iter().any(|rule| {
+        rule["resolver_policy"] == "node-bootstrap" && rule["action"] == "evaluate"
+    }));
+    assert!(rules.iter().any(|rule| {
+        rule["resolver_policy"] == "node-bootstrap" && rule["action"] == "respond"
+    }));
+    let index = value["outbounds"]
+        .as_array()
+        .expect("full outbounds remain")
+        .iter()
+        .position(|outbound| {
+            outbound["type"] == "vless"
+                && outbound["domain_resolver"]["mode"] == "rules"
+                && outbound["domain_resolver"]["policy"] == "node-bootstrap"
+        })
+        .expect("generated domain node must use the native policy");
+    let path = temp.path().join("native-node-policy.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let (ok, diag) = check(&core, &path);
+    assert!(ok, "actual kernel rejected generated native policy: {diag}");
+
+    value["outbounds"][index]["domain_resolver"]["policy"] =
+        json!("native-dns-negative-control-missing");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let (ok, diag) = check(&core, &path);
+    assert!(!ok, "unknown native policy was silently accepted");
+    assert!(
+        diag.contains("unknown DNS resolver policy")
+            && diag.contains("native-dns-negative-control-missing"),
+        "negative control failed for a different reason: {diag}"
+    );
+}

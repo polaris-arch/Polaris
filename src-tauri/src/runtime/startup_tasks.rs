@@ -1,38 +1,28 @@
 //! 启动期延迟任务（上游 `src/main/startup-tasks.ts` 1:1 移植）。
 //!
-//! 五条腿，全部 fire-and-forget、绝不阻断启动（**各占各的时刻**，见
+//! 四条腿，全部 fire-and-forget、绝不阻断启动（**各占各的时刻**，见
 //! `startup_leg_delays_are_all_distinct`）：
 //! - **2s：启动时自动连接**（`config.autoConnect` + `selectedServerId`）；Android 上另有一条
 //!   **收编**腿：系统（always-on / 开机自动连接）在 Rust 不在时拉起的核，由同一条 `proxy_start` 收编。
 //! - **3s：首次出口 IP 探测**。
 //! - **5s：启动后自动检查更新**（`config.autoCheckUpdate !== false`）→ 有更新走既有 mini 弹窗；
 //!   若 `config.autoDownloadUpdate` 也开着，**顺带后台下载安装包但绝不安装**（见 [`spawn_auto_download`]）。
-//! - **6s：内核基线兼容提醒**（#17，非官方核且版本 ≤ 随包基线 → 发 `EVENT_CORE_BASELINE_WARNING`）。
 //! - **7s：helper 可升级探测**（proto < 本 build 期望 → 发 `EVENT_HELPER_UPGRADEABLE`）。
 //!
-//! 上游 里同文件还有 staged 内核落位 / 随包核 reseed / WARP drain 三段：staged 落位与内核自动更新
-//! 已由 `runtime/core_update_scheduler.rs`（T+30s 起）承接，随包核 reseed 在 `lib.rs` setup 的
-//! `ensure_writable_core`，WARP drain 亦在 setup 单独接（`spawn_warp_drain`）——故本模块**只**接
-//! 上述五条腿，不重复接线。
+//! WARP drain 在 `lib.rs` setup 单独接（`spawn_warp_drain`），不在本模块。
 //!
 //! **纯决策 / 副作用分离**（与 `subscription_scheduler` 同纪律）：能判定的全收在
 //! [`decide_auto_connect`] / [`should_auto_check_update`] / [`should_auto_download_update`] /
-//! [`auto_download_applicable`] / [`should_warn_core_baseline`] / [`should_notify_helper_upgradeable`]
-//! 六个纯函数（环境真值由调用方注入，全单测覆盖）；[`spawn`] 只剩「睡多久 + 调哪个既有命令 +
+//! [`auto_download_applicable`] / [`should_notify_helper_upgradeable`]
+//! 五个纯函数（环境真值由调用方注入，全单测覆盖）；[`spawn`] 只剩「睡多久 + 调哪个既有命令 +
 //! 记什么日志」的薄壳。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
-use polaris_updater::version::compare_semver;
-use polaris_updater::{
-    classify_core_build, extract_version_token, ComparableVersion, CoreBuildKind,
-};
-
-use crate::events::channel::{EVENT_CORE_BASELINE_WARNING, EVENT_HELPER_UPGRADEABLE};
+use crate::events::channel::EVENT_HELPER_UPGRADEABLE;
 use crate::runtime::helper::HelperStatusSnapshot;
 use crate::runtime::update_install::{decide_install_plan, detect_run_form as decide_run_form};
 use crate::runtime::AppRuntime;
@@ -41,11 +31,8 @@ use crate::runtime::AppRuntime;
 const AUTO_CONNECT_DELAY_MS: u64 = 2_000;
 /// 启动后自动检查更新延迟（上游 `setTimeout(..., 5000)`：避开启动高峰）。
 const AUTO_CHECK_UPDATE_DELAY_MS: u64 = 5_000;
-/// 内核基线提醒延迟：错开上面 2s/5s 两个高峰（探测要 spawn 一次 `sing-box version`）。
-const CORE_BASELINE_DELAY_MS: u64 = 6_000;
 /// 首次出口 IP 探测延迟。上游 启动腿是 2s，本仓**刻意错开到 3s**——2s 已被自动连接占着
-/// （[`AUTO_CONNECT_DELAY_MS`]），撞点会让两条腿同刻触发，违反本文件既定的错峰约定
-/// （见 [`CORE_BASELINE_DELAY_MS`]「错开上面 2s/5s 两个高峰」）。
+/// （[`AUTO_CONNECT_DELAY_MS`]），撞点会让两条腿同刻触发，违反本文件既定的错峰约定。
 ///
 /// **为什么不改成「自动连接成功后就不排这条腿」**（那样能省掉一条冗余腿，起核腿本就会重探）：
 /// 自动连接**默认关**（[`decide_auto_connect`] 要求 `autoConnect` 显式为 true），且开了也可能失败
@@ -55,12 +42,8 @@ const CORE_BASELINE_DELAY_MS: u64 = 6_000;
 /// 落地顺序的正确性另有保证：`commands::misc` 的世代闸保证「后领世代的腿胜」，本腿在起核腿之前领
 /// 世代，故无论谁先探完，最终落地的都是起核腿那份带代理出口的快照。
 const EXIT_IP_PROBE_DELAY_MS: u64 = 3_000;
-/// helper 可升级探测延迟：错开上面 2s/3s/5s/6s 四个高峰。探测会连一次 helper socket（已装时），
-/// 故不与内核基线探测（6s，要 spawn `sing-box version`）同刻。
+/// helper 可升级探测延迟：错开上面 2s/3s/5s 三个高峰。探测会连一次 helper socket（已装时）。
 const HELPER_UPGRADEABLE_DELAY_MS: u64 = 7_000;
-
-/// 基线提醒进程级 once 闸：提醒是「装了非官方核」的一次性告知，不是状态推送，重复发 = 骚扰。
-static BASELINE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// 启动时自动连接决策。
 #[derive(Debug, PartialEq, Eq)]
@@ -113,65 +96,10 @@ pub fn should_auto_check_update(config: &Value) -> bool {
     config.get("autoCheckUpdate").and_then(Value::as_bool) != Some(false)
 }
 
-/// 纯决策：是否发内核基线兼容风险提醒（#17，上游 `use-native-events.ts` 附近 `#40` 语义）。
-///
-/// 官方核恒不提醒；fork / unknown 核**且**版本 ≤ 随包基线 → 提醒（第三方核落后于随包基线时，
-/// 本仓生成的新配置形态可能它还不认，是真实兼容风险）。高于基线的 fork 不提醒——它比我们新。
-///
-/// **版本串不可解析 → 不提醒**（宁可漏报不误报）：`compare_semver` 对非版本串会按 `0.0.0` 处理，
-/// 直接喂进去会把「读不出版本」判成「远低于基线」而误报。故先用 [`ComparableVersion::normalize`]
-/// 规范化（非版本输入原样返回），再要求结果确实长得像版本串才比较。
-///
-/// # 与 `CoreOverrideDecision::warn` 的关系（别把那个接上来）
-///
-/// `polaris_updater::CoreOverrideDecision` 也有一个 `warn`，形状看着一样但**故意不同构**：
-/// 那个字段是 上游 `decideCoreOverride` 的**逐字对照件**（golden 对拍在
-/// `crates/updater/tests/core_build_golden.rs`），把解析失败折成「比基线旧」⇒ 读不出版本时恒 `warn`。
-/// **本函数才是本仓这条提醒腿的权威**，上面那段不可解析守卫就是两者唯一的实质差别。
-///
-/// # 为什么不改成「问二进制」而仍用版本带
-///
-/// 2026-08-09 评估过三条「问二进制」的路，结论是**现状已经是更强的那个**，不动：
-/// - `sing-box version` 的 **Tags 行不可靠** —— 已知 fork（reF1nd）的 Tags 与官方同构，
-///   且 snell 无条件编入、不产生 `with_snell` tag（见 `ui/src/domain/core-build.ts` 模块头）。
-/// - `sing-box check` 的**真值判定已经在跑**：每次起核都用 `core_binary_for_start()`（即将要启动的
-///   那个核，含用户的 fork）对真实生成的配置跑一次 check 并剥掉被点名拒收的节点
-///   （`runtime/proxy::generate_and_gate`，实测 26–29ms）。本提醒只是它之前的一句廉价预告。
-/// - `sing-box schema` 只描述**形状**不描述取值域，够不着「这个核认不认这份配置」。
-#[must_use]
-pub fn should_warn_core_baseline(build: CoreBuildKind, current: &str, bundled: &str) -> bool {
-    if matches!(build, CoreBuildKind::Official | CoreBuildKind::Polaris) {
-        return false;
-    }
-    let cur = ComparableVersion::normalize(current);
-    let bun = ComparableVersion::normalize(bundled);
-    if !looks_like_version(&cur) || !looks_like_version(&bun) {
-        return false;
-    }
-    compare_semver(cur.as_str(), bun.as_str()).is_ok_and(|ord| ord <= 0)
-}
-
-/// `normalize` 对非版本输入原样返回 → 用「首字符是数字且含 `.`」判它是否真产出了版本串
-/// （normalize 已剥前导 `v`，故首字符必为数字）。
-fn looks_like_version(v: &ComparableVersion) -> bool {
-    let s = v.as_str();
-    s.as_bytes().first().is_some_and(u8::is_ascii_digit) && s.contains('.')
-}
-
-/// `CoreBuildKind` → 事件 payload 的 `kind` 字符串（前端 `onCoreBaselineWarning` 契约）。
-/// Official 不会走到这里（[`should_warn_core_baseline`] 已挡），兜底按 unknown。
-fn kind_label(build: CoreBuildKind) -> &'static str {
-    match build {
-        CoreBuildKind::Fork => "fork",
-        _ => "unknown",
-    }
-}
-
-/// 挂上五条启动期延迟任务。在 `lib.rs` setup 内、主窗建好之后调用一次。
+/// 挂上四条启动期延迟任务。在 `lib.rs` setup 内、主窗建好之后调用一次。
 pub fn spawn(app: AppHandle) {
     spawn_auto_connect(app.clone());
     spawn_auto_check_update(app.clone());
-    spawn_core_baseline_warning(app.clone());
     spawn_helper_upgradeable_probe(app.clone());
     spawn_exit_ip_probe(app);
 }
@@ -375,11 +303,9 @@ pub fn auto_download_applicable(
 /// 这三件事一件都不该在用户没点确认时发生 —— 后台悄悄把用户的代理停了并重启 App，
 /// 是比「没自动更新」严重得多的问题。故本腿止于「包已就位」，安装仍由用户点。
 ///
-/// # 与内核自动更新调度器的错峰
+/// # 起始时刻
 ///
 /// 本腿不占固定时刻：它排在自动检查腿（T+5s）**返回之后**，起始时刻由那次 HTTP 往返决定。
-/// 内核调度器固定 T+30s 起，且它自己也要先跑一次检查才可能下载。两条腿都不在启动瞬间发车，
-/// 且各自的下载都在各自的检查之后 —— 不存在「启动即两个大下载同刻起跑」的形态。
 ///
 /// # 弹窗不受影响
 ///
@@ -442,50 +368,6 @@ fn spawn_auto_download(app: &AppHandle, config: &Value, update_info: Option<Valu
             ),
             Err(()) => log::warn!("自动下载更新异常：命令层返回错误"),
         }
-    });
-}
-
-/// 6s：#17 内核基线兼容提醒发射端。
-///
-/// **刻意不用 [`crate::runtime::updater::UpdaterRuntime::read_core_version`]**：它在探测失败时
-/// **回落随包基线**（见该函数文档的「双读法陷阱」），于是「读不出核版本」会被伪装成「核版本 ==
-/// 基线」→ 恰好落进 `<=` 分支误报。这里改用原始版本行 `read_core_version_line()` 单次探测：
-/// 空串 = 探测失败 → 直接不提醒（无证据不发警告），非空再派生 kind + version token（顺带省掉
-/// 一次 `sing-box version` 子进程 spawn）。
-fn spawn_core_baseline_warning(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(CORE_BASELINE_DELAY_MS)).await;
-        let Some(state) = app.try_state::<AppRuntime>() else {
-            return;
-        };
-        let updater = state.updater();
-        let line = updater.read_core_version_line();
-        if line.is_empty() {
-            log::debug!("活核版本探测失败 → 跳过内核基线兼容提醒（无证据不告警）");
-            return;
-        }
-        let build = classify_core_build(&line);
-        let current = extract_version_token(&line);
-        let bundled = updater.bundled_core_version().to_string();
-        if !should_warn_core_baseline(build, &current, &bundled) {
-            return;
-        }
-        if BASELINE_WARNED.swap(true, Ordering::SeqCst) {
-            return; // 已发过（进程级 once）
-        }
-        log::warn!(
-            "内核基线兼容提醒：活核 {current}（{kind}）≤ 随包基线 {bundled}",
-            kind = kind_label(build)
-        );
-        crate::events::broadcast(
-            &app,
-            EVENT_CORE_BASELINE_WARNING,
-            json!({
-                "current": current,
-                "bundled": bundled,
-                "kind": kind_label(build),
-            }),
-        );
     });
 }
 

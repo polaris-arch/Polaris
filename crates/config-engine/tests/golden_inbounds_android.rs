@@ -858,26 +858,54 @@ fn mobile_policy_picks_reach_exclude_package_exactly_for_direct() {
 
 /// 从 TS 侧那份**单一枚举**里数出「可写」有几档。
 ///
-/// 取材面是 `ui/src/mobile/screens/rules/app-policy-write.ts` 里 `APP_POLICY_WRITABLE`
+/// 取材面是移动入口实际re-export的共享 `ui/src/components/screens/app-policy/app-policy-logic.ts` 里的真实声明
 /// 那个 `new Set<AppPolicyWritablePick>([...])` 的字面量体。读不到、或数出 0 档时**直接 panic**：
 /// 那意味着这条跨语言对拍失去了它的另一端，而不是「今天恰好零档可写」。
 fn app_policy_writable_count() -> usize {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ui/src/mobile/screens/rules/app-policy-write.ts");
+        .join("../../ui/src/components/screens/app-policy/app-policy-logic.ts");
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("读不到 {}：{e} —— 本门的另一端没了", path.display()));
-    let head = src
-        .find("APP_POLICY_WRITABLE")
-        .unwrap_or_else(|| panic!("{} 里找不到 APP_POLICY_WRITABLE", path.display()));
-    let open = src[head..]
-        .find('[')
-        .unwrap_or_else(|| panic!("APP_POLICY_WRITABLE 后面没有数组字面量"))
-        + head;
-    let close = src[open..]
-        .find(']')
-        .unwrap_or_else(|| panic!("APP_POLICY_WRITABLE 的数组字面量没闭合"))
-        + open;
-    let n = src[open + 1..close]
+    let src = polaris_source_probe::mask_comments(&src);
+    let declarations: Vec<_> = src
+        .match_indices("export const APP_POLICY_WRITABLE")
+        .collect();
+    assert_eq!(
+        declarations.len(),
+        1,
+        "{} 必须有且仅有真实 APP_POLICY_WRITABLE 声明",
+        path.display()
+    );
+    let head = declarations[0].0;
+    let declaration = src[head..]
+        .split_once(';')
+        .map(|(declaration, _)| declaration)
+        .expect("APP_POLICY_WRITABLE 声明未终结");
+    let initializer = declaration
+        .split_once('=')
+        .expect("APP_POLICY_WRITABLE 声明没有初始化")
+        .1
+        .trim();
+    assert!(
+        initializer.starts_with("new Set"),
+        "APP_POLICY_WRITABLE 必须使用真实 Set 初始化"
+    );
+    let array = initializer
+        .split_once('(')
+        .expect("Set 初始化没有参数")
+        .1
+        .trim_start();
+    assert!(
+        array.starts_with('['),
+        "APP_POLICY_WRITABLE 的 Set 参数必须是数组字面量"
+    );
+    let close = array.find(']').expect("APP_POLICY_WRITABLE 数组未闭合");
+    assert_eq!(
+        array[close + 1..].trim(),
+        ")",
+        "APP_POLICY_WRITABLE 数组不属于该 Set 初始化"
+    );
+    let n = array[1..close]
         .split(',')
         .filter(|s| s.trim().starts_with('\''))
         .count();

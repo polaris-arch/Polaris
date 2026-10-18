@@ -52,6 +52,8 @@ pub const INVALID_REASON_DETOUR_CASCADE: &str = "detour-cascade";
 /// 渲染端 `ui/src/domain/invalid-node-reason.ts` 未登记本 token 时**只渲染通用句**（「节点配置无效，
 /// 已在启动时跳过」），绝不把 token 原样拼给用户——那张表的回落语义就是为这种情况留的。补人话文案
 /// 需要动 `ui/src/i18n/locales/*.json`，不在本批射程内。
+pub const INVALID_REASON_REALITY_UTLS_DISABLED: &str = "reality-utls-disabled";
+
 pub const INVALID_REASON_CUSTOM_MALFORMED: &str = "custom-outbound-malformed";
 
 /// Tailscale `control_url` 非法（IP 字面量 / 缺 scheme / host 畸形）的 reason token 前缀族。
@@ -248,7 +250,7 @@ pub fn build_shadow_tls_outbound(
     server: &ServerConfig,
     bind_interface: Option<&str>,
 ) -> Option<Outbound> {
-    use crate::singbox::outbound::{OutboundTls, Utls};
+    use crate::singbox::outbound::OutboundTls;
 
     let stls = server.shadow_tls_settings.as_ref()?;
     let stls_port = match stls.port {
@@ -269,14 +271,11 @@ pub fn build_shadow_tls_outbound(
         engine: None,
         spoof: None,
         spoof_method: None,
-        utls: Some(Utls {
-            enabled: true,
-            fingerprint: stls
-                .fingerprint
-                .as_deref()
-                .and_then(crate::user_config::normalize::normalize_token)
-                .unwrap_or_else(|| "chrome".to_string()),
-        }),
+        utls: crate::user_config::utls::node_utls(
+            stls.utls_mode,
+            stls.fingerprint.as_deref(),
+            "chrome",
+        ),
         reality: None,
         ech: None,
         fragment: None,
@@ -311,10 +310,14 @@ pub fn build_outbounds_with_runtime_bindings(
     let mut node_tags: Vec<String> = Vec::new();
     // 节点 dial 解析器：tag 选谁（race / dnspod / system / 基线）与「要不要覆盖 strategy」是两件事——
     // 前者按 DNS 设置选，后者只看 enableIPv6（#335）。故在此合成一次，逐 outbound / endpoint 透传。
-    let dial_resolver = get_node_dial_domain_resolver(
-        &node_resolver_dial_tag(config),
-        config.enable_ipv6 == Some(true),
-    );
+    let dial_resolver = if crate::node_dns::enabled(config) {
+        crate::node_dns::resolver()
+    } else {
+        get_node_dial_domain_resolver(
+            &node_resolver_dial_tag(config),
+            config.enable_ipv6 == Some(true),
+        )
+    };
 
     // id→tag 映射（build_id_to_tag_map 的副本，buildOutbounds 内可变——detour 死引用剔除时删 entry）。
     let mut id_to_tag: BTreeMap<String, String> = BTreeMap::new();
@@ -363,6 +366,28 @@ pub fn build_outbounds_with_runtime_bindings(
         if deps.gate_invalid_nodes.contains_key(&server.id) {
             continue;
         }
+
+        let effective = match crate::user_config::utls::effective_server_for_platform(
+            server,
+            config.utls_policy.as_deref(),
+            &deps.platform,
+        ) {
+            Ok(effective) => effective,
+            Err(crate::user_config::utls::REALITY_UTLS_REQUIRED) => {
+                if config.selected_server_id.as_deref() == Some(server.id.as_str()) {
+                    return Err(format!(
+                        "uTLS: {} ({})",
+                        server.id,
+                        crate::user_config::utls::REALITY_UTLS_REQUIRED
+                    ));
+                }
+                deps.gate_invalid_nodes
+                    .insert(server.id.clone(), INVALID_REASON_REALITY_UTLS_DISABLED);
+                continue;
+            }
+            Err(reason) => return Err(format!("uTLS: {} ({reason})", server.id)),
+        };
+        let server = effective.as_ref();
 
         let downgrade_mesh = crate::builder::endpoint_routes::mesh_uses_system_interface(server)
             && !deps.system_interface_available;
@@ -856,7 +881,7 @@ pub fn build_outbounds_with_runtime_bindings(
     // ── Shadow-TLS 后处理（Polaris L1055-1093）──
     // 遍历已生成 outbounds，有 shadowTlsSettings 的节点 → 创建外层 `stls-out-<id>` shadowtls outbound，
     // 主 outbound 的 detour 指向它（内层 SS 经 detour 走 shadowtls 拨号）。
-    apply_shadow_tls_postprocess(config, &id_to_tag, &mut outbounds);
+    apply_shadow_tls_postprocess(config, &id_to_tag, &mut outbounds, &deps.platform)?;
 
     // ── detour 死引用迭代修剪（Polaris L1095-1178）──
     // 任何 outbound.detour / endpoint.detour 指向「生成集合内不存在的 tag」→ 剔除引用方 +
@@ -976,7 +1001,8 @@ fn apply_shadow_tls_postprocess(
     config: &UserConfig,
     id_to_tag: &BTreeMap<String, String>,
     outbounds: &mut Vec<Outbound>,
-) {
+    platform: &str,
+) -> Result<(), String> {
     let mut stls_outbounds: Vec<Outbound> = Vec::new();
     for ob in outbounds.iter_mut() {
         // 根据 tag 反查 ServerConfig（selector/direct/block 等非节点出站匹配不到 → 跳过）。
@@ -999,8 +1025,21 @@ fn apply_shadow_tls_postprocess(
             .extra
             .remove("bind_interface")
             .and_then(|value| value.as_str().map(str::to_owned));
-        let stls_outbound = build_shadow_tls_outbound(srv, bind_interface.as_deref())
+        let effective = crate::user_config::utls::effective_server_for_platform(
+            srv,
+            config.utls_policy.as_deref(),
+            platform,
+        )
+        .map_err(|reason| format!("uTLS: {} ({reason})", srv.id))?;
+        let srv = effective.as_ref();
+        let mut stls_outbound = build_shadow_tls_outbound(srv, bind_interface.as_deref())
             .expect("shadow_tls_settings was checked above");
+        // The wrapper owns the TCP dial, including the already-resolved proxy chain.
+        // Move it rather than resolving again; existing cycle/dangling pruning stays authoritative.
+        stls_outbound.detour = ob.detour.take();
+        // The outer wrapper owns the actual node socket, so it must own the
+        // same scoped resolver as the inner node (not inherit global DNS).
+        stls_outbound.domain_resolver = ob.domain_resolver.clone();
         let stls_tag = stls_outbound.tag.clone();
         stls_outbounds.push(stls_outbound);
 
@@ -1008,6 +1047,7 @@ fn apply_shadow_tls_postprocess(
         ob.detour = Some(stls_tag);
     }
     outbounds.extend(stls_outbounds);
+    Ok(())
 }
 
 /// 把某个已被剔除的 tag 从所有 selector（proxy-selector + 各 rule-sel）的成员表里摘掉，
@@ -1395,7 +1435,7 @@ fn generate_rule_selectors(
         }
         emit(
             &format!("custom:{}", rule.id),
-            &format!("rule-sel-{}", rule.id),
+            &crate::builder::helpers::custom_rule_selector_tag(&rule.id),
             rule.route_target_server_id(),
             &mut existing_tags,
             outbounds,

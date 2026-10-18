@@ -285,10 +285,15 @@ fn trim_lossy(o: &std::process::Output) -> String {
 ///
 /// 抽象为闭包注入便于测试；生产用 [`set_forward_prod`]。
 pub fn set_forward_prod(on: bool) {
-    let v = if on { b"1" } else { b"0" };
-    // best-effort：忽略失败（非 root / proc 未挂载等）。
-    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", v);
-    let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", v);
+    set_forward_with(on, |path, value| std::fs::write(path, value));
+}
+
+/// Keep the production best-effort contract while tests inject an inert writer.
+/// In particular, a failed IPv4 write must not prevent the IPv6 attempt.
+fn set_forward_with(on: bool, mut write: impl FnMut(&str, &[u8]) -> std::io::Result<()>) {
+    let value = if on { b"1" } else { b"0" };
+    let _ = write("/proc/sys/net/ipv4/ip_forward", value);
+    let _ = write("/proc/sys/net/ipv6/conf/all/forwarding", value);
 }
 
 #[cfg(test)]

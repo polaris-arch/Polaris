@@ -18,8 +18,7 @@
 //! `ProxyErrorEmitter::emit_mesh_login_fallback` 发，前端 `App.tsx` 订阅 → toast）**
 //! 与 **`EVENT_AUTO_NODE_SWITCHED`（C3 自动换节点，`runtime/proxy::do_switch_io` 经
 //! `ProxyErrorEmitter::emit_auto_node_switched` 发，前端订阅由 W1-ui 批接）**（runtime 层）
-//! 与 **`EVENT_CORE_AUTO_UPDATE_STATUS`（内核自动更新状态，`runtime/core_update_scheduler.rs` 在
-//! 检查完成 / 跨带提示 / 暂存 / 落位四个时刻发）** 与 **`EVENT_HELPER_UPGRADEABLE`
+//! 与 **`EVENT_HELPER_UPGRADEABLE`
 //! （启动 T+7s 探测，`runtime/startup_tasks.rs::spawn_helper_upgradeable_probe` 发）**。
 
 #![forbid(unsafe_code)]
@@ -32,6 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// 与 `polaris-ipc-channels.ts`（B6 前端移植）保持同名，前端 `listen(EVENT_PROXY_STARTED, ...)` 直连。
 /// 这些是「事件推送」单向通道（区别于 `command_*` 双向 invoke），语义不变式见 Polaris ipc-channels.ts 注释。
 pub mod channel {
+    pub const EVENT_COEX_RUNTIME_STATE: &str = "event:coexRuntimeState";
     // 代理生命周期
     pub const EVENT_PROXY_STARTED: &str = "event:proxyStarted";
     pub const EVENT_PROXY_STOPPED: &str = "event:proxyStopped";
@@ -48,10 +48,10 @@ pub mod channel {
     /// `EVENT_PROXY_STARTED`/`STOPPED` 的发射点在**命令层**（`commands/proxy.rs` 的
     /// proxy_start/stop/restart）—— 后端**自驱**的核起停（去抖重启 /「立即应用」/ drain 排空 /
     /// 崩溃自愈）一个都不发。把它们收口到 runtime 状态跃迁点确实更正确，但代价不可接受：
-    /// `subscription_scheduler` 听 `proxyStarted` 会**真联网**做订阅补更、`core_update_scheduler`
-    /// 听 `proxyStopped` 会排换核 —— 收口后每次内部重启都多跑一遍这两件事。
+    /// `subscription_scheduler` 听 `proxyStarted` 会**真联网**做订阅补更 —— 收口后每次内部重启
+    /// 都多跑一遍。
     ///
-    /// 故新开一条**只给 UI 的**通道：那两条与两个 scheduler 的语义一字不动，本通道由
+    /// 故新开一条**只给 UI 的**通道：那两条与 scheduler 的语义一字不动，本通道由
     /// `runtime/proxy.rs` 在真状态跃迁点发，订阅方仅待应用操作条 + 连接态显示。
     /// **托盘刻意不订阅**（托盘图标语汇另有待拍板项，不捆进来）。
     pub const EVENT_PROXY_LIFECYCLE: &str = "event:proxyLifecycle";
@@ -131,16 +131,13 @@ pub mod channel {
     // 想加第二个目标屏 → 必须同时改白名单 + 补 `tray/tests/mod.rs` 的白名单单测，成本落在该落的地方。
     pub const EVENT_TRAY_OPEN_SCREEN: &str = "event:trayOpenScreen";
 
-    // 内核版本 / 自动更新状态
-    pub const EVENT_CORE_VERSION_CHANGED: &str = "event:coreVersionChanged";
-    pub const EVENT_CORE_AUTO_UPDATE_STATUS: &str = "event:coreAutoUpdateStatus";
-    pub const EVENT_CORE_BASELINE_WARNING: &str = "event:coreBaselineWarning";
-
     // helper 可升级
     pub const EVENT_HELPER_UPGRADEABLE: &str = "event:helperUpgradeable";
 
     // 自动换节点
     pub const EVENT_AUTO_NODE_SWITCHED: &str = "event:autoNodeSwitched";
+    /// 自动选择的选择状态（载荷与状态命令 `auto_select_status` 的返回同形）。状态变化时发一次。
+    pub const EVENT_AUTO_SELECT_STATUS: &str = "event:autoSelectStatus";
 
     // IP 信息
     pub const EVENT_IP_INFO_UPDATED: &str = "event:ipInfoUpdated";
@@ -165,6 +162,20 @@ pub mod channel {
     // 故能力契约 L131 的「托盘测速结果**合并非替换**」这条要求**已由逐节点通道结构性满足**，汇总通道在这个
     // 架构里没有承担任何独有语义：补它等于给同一事实造第二个真值源（两条通道谁先到、谁覆盖谁），删它则
     // 零行为变化。两端皆零 emit / 零订阅，保留只会诱导后人为「对齐 上游」重造假接线。
+    //
+    // 三个通道的既有字段与取值不变；下列都是**新增的可选字段**（旧消费方不读它们）：
+    //  - 逐节点结果：`status`（`ok` / `failed`）、`failure`（`{phase, kind, httpStatus?}`，仅失败时）、
+    //    `identity`（身份块：运行号、序号、来源、路径、口径、URL 摘要、已连接/未连接、核实例、
+    //    配置摘要、节点指纹、网络代次、出结果时刻）、`binding`（这条测量连接受的路由策略、请求的
+    //    节点、读回的结论与实际承载的出站）。路径多一个取值 `selected`：钉到当前选中的出口、
+    //    不经用户规则；
+    //    走用户规则的测量被规则分流到别处时，结果不属于选中节点，这条事件不发；
+    //  - 进度与终态：`seq`。一轮内三类事件共用一个严格递增的序号，终态带最后一个；
+    //  - 终态的 `reason` 多两个取值：`cancelled` / `preempted`（前端的联合类型尚未收这两项）。
+    //
+    // **只有手动发起的前台运行**才在事件顶层带 `runId`、才发进度与终态。其余来源（周期计划、出口伴测）
+    // 只发逐节点结果，运行号放在 `identity.run`：既有消费方把「顶层有 `runId`」当作「这是一轮前台任务」。
+    // 盖章的单一出口是 `commands::speedtest::RunEvents`。
     pub const EVENT_SPEED_TEST_RESULT: &str = "event:speedTestResult";
     pub const EVENT_SPEED_TEST_PROGRESS: &str = "event:speedTestProgress";
     /// **一轮测速的终态**（`{outcome,tested,total,serverIds:[serverId],pending:[serverId]}`）。
@@ -190,6 +201,10 @@ pub mod channel {
     /// ——它们不是「没轮到测」，而是「本轮结构上就不该测」，各自有独立的返回字段与各自的修法
     /// （重启纳入 / 应用更改 / 去登录），混进续测集合只会让「继续」原地再失败一次。
     pub const EVENT_SPEED_TEST_DONE: &str = "event:speedTestDone";
+
+    /// 周期测速的计划状态（载荷与状态命令 `speed_test_schedule_status` 的返回同形）。状态或其原因
+    /// 变化、以及每轮收尾时发一次。独立通道：周期一轮自己只发逐节点结果，不占上面三个通道的形态。
+    pub const EVENT_SPEED_TEST_SCHEDULE: &str = "event:speedTestSchedule";
 
     // Tailscale
     pub const EVENT_TAILSCALE_AUTH_URL: &str = "event:tailscaleAuthUrl";

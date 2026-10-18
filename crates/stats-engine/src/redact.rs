@@ -15,9 +15,9 @@
 //! 键名黑名单（命中即整值打码）+ url 仅留 origin + custom 协议 `secretKeys` 叠加；**未命中键原样保留**
 //! （诊断需看形态）。
 //!
-//! 注意：**无值层启发式**（不按 base64 / 熵猜密钥）。custom 协议（raw-JSON 透传）的自定义密钥键若既不在
-//! 黑名单、用户又未在表单声明 `secretKeys`，则不会被打码 —— 故 custom 节点务必声明 `secretKeys`
-//! （snell psk 等常见键已黑名单兜底）。
+//! 值层仅兜底识别明确的 PEM 私钥块（复用日志侧规则，不按 base64 / 熵猜密钥）。custom 协议
+//! （raw-JSON 透传）的未知非 PEM 密钥若不在黑名单、用户又未在表单声明 `secretKeys`，仍不会被打码。
+//! 故 custom 节点务必声明 `secretKeys`（snell psk 等常见键已黑名单兜底）。
 //!
 //! # 两层脱敏的分工
 //!
@@ -46,10 +46,15 @@ pub const REDACTED: &str = "<redacted>";
 /// `username` 保留（naive 用户名单独不可用，且有助定位），仅 password 类打码。
 ///
 /// **改这张表 = 改红线**。新增协议若引入新密钥键，必须同步加进来 + 补 `tests` 里的穷举用例。
-pub const SECRET_KEYS: [&str; 18] = [
+pub const SECRET_KEYS: [&str; 23] = [
     "password",
     "uuid",
     "privatekey",
+    "clientkeypassword",
+    "mcakey",
+    "mcakeypassword",
+    "clientkey", // 原生 OpenVPN TLS 私钥（PEM string / string[]）
+    "statickey", // OpenVPN 静态共享密钥（非公钥）
     "privatekeypassphrase",
     "presharedkey",
     "authkey",
@@ -247,15 +252,51 @@ pub fn redact_log_secrets(raw: &str) -> String {
 /// `extra_secret_keys`：额外打码的「**已归一**」键名（custom 协议 `secretKeys` 叠加用）。
 #[must_use]
 pub fn redact_deep(value: &Value, extra_secret_keys: &BTreeSet<String>) -> Value {
+    redact_deep_in_context(value, extra_secret_keys, SecretContext::Other)
+}
+
+/// 原生协议里歧义字段的上下文：`key` 仅在 OpenVPN TLS control_wrap 内私密，
+/// OpenConnect 的 cookie / form_entries 是认证材料；普通同名诊断字段仍保留。
+#[derive(Clone, Copy)]
+enum SecretContext {
+    Other,
+    OpenVpn,
+    OpenConnect,
+    OpenVpnTls,
+    OpenVpnControlWrap,
+}
+
+fn redact_deep_in_context(
+    value: &Value,
+    extra_secret_keys: &BTreeSet<String>,
+    context: SecretContext,
+) -> Value {
     match value {
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|v| redact_deep(v, extra_secret_keys))
-                .collect(),
-        ),
+        Value::Array(items) => {
+            // 透传袋可能用未知字段存 PEM 行数组；逐行递归看不到完整块，先复用日志规则整块识别。
+            let pem_lines: Option<Vec<&str>> = items.iter().map(Value::as_str).collect();
+            if pem_lines.is_some_and(|lines| log_private_key_re().is_match(&lines.join("\n"))) {
+                return Value::String(REDACTED.to_string());
+            }
+            Value::Array(
+                items
+                    .iter()
+                    .map(|v| redact_deep_in_context(v, extra_secret_keys, context))
+                    .collect(),
+            )
+        }
         Value::Object(src) => {
             let mut out = Map::new();
+            let context = if matches!(
+                src.get("type").and_then(Value::as_str),
+                Some("openvpn-client" | "openvpn-server")
+            ) {
+                SecretContext::OpenVpn
+            } else if src.get("type").and_then(Value::as_str) == Some("openconnect") {
+                SecretContext::OpenConnect
+            } else {
+                context
+            };
 
             // custom 协议：outbound 内按该节点声明的 secretKeys 额外打码（归一化后并入黑名单传给子层）。
             let mut child_extra = extra_secret_keys.clone();
@@ -275,7 +316,11 @@ pub fn redact_deep(value: &Value, extra_secret_keys: &BTreeSet<String>) -> Value
                 let nk = normalize_key(k);
                 if v.is_null() {
                     out.insert(k.clone(), Value::Null);
-                } else if is_secret_key(&nk, extra_secret_keys) {
+                } else if is_secret_key(&nk, extra_secret_keys)
+                    || (matches!(context, SecretContext::OpenVpnControlWrap) && nk == "key")
+                    || (matches!(context, SecretContext::OpenConnect)
+                        && matches!(nk.as_str(), "cookie" | "formentries"))
+                {
                     // 命中密钥：标量打码；**对象 / 数组整体打码**（不向下递归，杜绝嵌套泄漏）。
                     out.insert(k.clone(), Value::String(REDACTED.to_string()));
                 } else if URL_KEYS.contains(&nk.as_str()) && v.is_string() {
@@ -283,13 +328,26 @@ pub fn redact_deep(value: &Value, extra_secret_keys: &BTreeSet<String>) -> Value
                         k.clone(),
                         Value::String(redact_url_value(v.as_str().unwrap_or_default())),
                     );
-                } else if v.is_object() || v.is_array() {
-                    out.insert(k.clone(), redact_deep(v, &child_extra));
                 } else {
-                    out.insert(k.clone(), v.clone());
+                    let child_context = match (context, nk.as_str()) {
+                        (_, "openvpnclientsettings") => SecretContext::OpenVpn,
+                        (_, "openconnectsettings") => SecretContext::OpenConnect,
+                        (SecretContext::OpenVpn, "tls") => SecretContext::OpenVpnTls,
+                        (SecretContext::OpenVpnTls, "controlwrap") => {
+                            SecretContext::OpenVpnControlWrap
+                        }
+                        _ => SecretContext::Other,
+                    };
+                    out.insert(
+                        k.clone(),
+                        redact_deep_in_context(v, &child_extra, child_context),
+                    );
                 }
             }
             Value::Object(out)
+        }
+        Value::String(raw) => {
+            Value::String(log_private_key_re().replace_all(raw, REDACTED).into_owned())
         }
         other => other.clone(),
     }
@@ -353,11 +411,10 @@ fn collect_hosts_deep(obj: &Value, out: &mut Vec<String>) {
         }
         Value::Object(m) => {
             for (k, v) in m {
-                if let Some(s) = v.as_str() {
-                    if HOST_KEYS.contains(&normalize_key(k).as_str()) {
-                        out.push(s.to_string());
-                    }
-                } else if v.is_object() || v.is_array() {
+                if HOST_KEYS.contains(&normalize_key(k).as_str()) {
+                    collect_host_values(v, out);
+                }
+                if v.is_object() || v.is_array() {
                     collect_hosts_deep(v, out);
                 }
             }
@@ -368,6 +425,16 @@ fn collect_hosts_deep(obj: &Value, out: &mut Vec<String>) {
 
 /// 收集 transport headers 里的 Host 值（节点伪装域名）。大小写不敏感匹配 `host` 键；值兼容
 /// string（`WebSocketSettings.headers`）与 string[]（`HttpSettings.headers`）。ws / http 共用。
+fn collect_host_values(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => {
+            out.extend(items.iter().filter_map(Value::as_str).map(str::to_owned))
+        }
+        _ => {}
+    }
+}
+
 fn add_host_headers(headers: Option<&Value>, out: &mut Vec<String>) {
     let Some(Value::Object(m)) = headers else {
         return;
@@ -376,17 +443,7 @@ fn add_host_headers(headers: Option<&Value>, out: &mut Vec<String>) {
         if !k.eq_ignore_ascii_case("host") {
             continue;
         }
-        match v {
-            Value::String(s) => out.push(s.clone()),
-            Value::Array(items) => {
-                for x in items {
-                    if let Some(s) = x.as_str() {
-                        out.push(s.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        collect_host_values(v, out);
     }
 }
 
@@ -547,48 +604,73 @@ fn replace_bounded_ci(haystack: &str, needle: &str, replacement: &str) -> String
     if needle.is_empty() {
         return haystack.to_string();
     }
-    let hay_lower = haystack.to_lowercase();
+    // Unicode 小写映射会扩长（İ）或缩短（K），总长度碰巧相同也不代表偏移相同。
+    // 仅记录长度改变的字符区间，避免每个标识符都为整份报告分配逐字符索引。
+    // ASCII 快路保持长度；Unicode 路径的结果必须映射回完整的原字符边界。
+    let mut shifts = Vec::new();
+    let hay_lower = if haystack.is_ascii() {
+        haystack.to_ascii_lowercase()
+    } else {
+        let mut folded_end = 0;
+        for (original, ch) in haystack.char_indices() {
+            let start = folded_end;
+            folded_end += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+            if folded_end - start != ch.len_utf8() {
+                shifts.push((start, folded_end, original + ch.len_utf8()));
+            }
+        }
+        // 逐字符映射仅计算字节偏移；比较仍用整串小写以保留末尾 Σ → ς 的上下文语义。
+        // 标准库唯一依赖上下文的小写映射是 Σ → σ/ς，两种结果的 UTF-8 长度相同。
+        haystack.to_lowercase()
+    };
     let need_lower = needle.to_lowercase();
-    // to_lowercase 可能改变字节长度（如 'İ'）→ 会让 lower 上的下标对不回原串。
-    // 主机名/IP 是 ASCII，退化到「不替」比错切安全（占位符没打上顶多多留一个已在别处覆盖的主机名，
-    // 而错切会破坏报告结构）。
-    if hay_lower.len() != haystack.len() || need_lower.len() != needle.len() {
-        return haystack.to_string();
-    }
+    let original_offset = |offset| {
+        let preceding = shifts.partition_point(|&(start, _, _)| start < offset);
+        let original = if preceding == 0 {
+            offset
+        } else {
+            let (_, end, original_end) = shifts[preceding - 1];
+            if offset < end {
+                return None; // lower 的展开字符内部没有可对应的原文边界。
+            }
+            original_end + (offset - end)
+        };
+        haystack.is_char_boundary(original).then_some(original)
+    };
 
-    let bytes = haystack.as_bytes();
     let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0usize;
-    while let Some(rel) = hay_lower[cursor..].find(&need_lower) {
-        let start = cursor + rel;
-        let end = start + needle.len();
-        // 前边界：start 前一个字符不得是主机字符
-        let prev_ok = start == 0
-            || !haystack[..start]
+    let mut emitted = 0;
+    let mut search = 0;
+    while let Some(rel) = hay_lower[search..].find(&need_lower) {
+        let folded_start = search + rel;
+        let folded_end = folded_start + need_lower.len();
+        if let (Some(start), Some(end)) =
+            (original_offset(folded_start), original_offset(folded_end))
+        {
+            let prev_ok = !haystack[..start]
                 .chars()
                 .next_back()
                 .is_some_and(is_host_boundary_char);
-        // 后边界：end 处字符不得是主机字符
-        let next_ok = end >= bytes.len()
-            || !haystack[end..]
+            let next_ok = !haystack[end..]
                 .chars()
                 .next()
                 .is_some_and(is_host_boundary_char);
-        if prev_ok && next_ok {
-            out.push_str(&haystack[cursor..start]);
-            out.push_str(replacement);
-            cursor = end;
-        } else {
-            // 不满足边界 → 原样保留到 start+1，从 start+1 继续找（避免死循环）
-            let step = haystack[start..].chars().next().map_or(1, char::len_utf8);
-            out.push_str(&haystack[cursor..start + step]);
-            cursor = start + step;
+            if prev_ok && next_ok {
+                out.push_str(&haystack[emitted..start]);
+                out.push_str(replacement);
+                emitted = end;
+                search = folded_end;
+                continue;
+            }
         }
-        if cursor >= haystack.len() {
-            break;
-        }
+        // 拒绝落在展开字符内部或主机子串的匹配；按 lower 自己的字符边界推进，仍可找重叠候选。
+        search = folded_start
+            + hay_lower[folded_start..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
     }
-    out.push_str(&haystack[cursor.min(haystack.len())..]);
+    out.push_str(&haystack[emitted..]);
     out
 }
 

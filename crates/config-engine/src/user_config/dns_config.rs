@@ -24,12 +24,10 @@ pub struct DnsConfig {
     pub node_resolver_single: Option<String>,
     /// race on 的多选上游池 id 列表（内置 `ali`/`dnspod`/`system` + 自定义 id）。缺省 `["ali","dnspod"]`。
     ///
-    /// **本字段不参与 sing-box config 生成**（生成侧只看 `race_server_port` 是否 >0），它由
-    /// `polaris-dns-race` 的 `plan_upstreams` 消费来决定 sidecar 起哪些上游。放在这里而非另建投影，
-    /// 是因为 UserConfig 是 Rust 侧读 `config.json` 的**唯一**投影：同一份 JSON 解两遍 = 双真值。
+    /// 由 config-engine 的纯规划器生成内核原生节点策略；旧保存字段与默认值不变。
     #[serde(rename = "nodeResolverPool")]
     pub node_resolver_pool: Option<Vec<String>>,
-    /// 自定义上游定义（强制纯 IP，见 [`CustomDnsUpstream`]）。同上，由 sidecar 消费、不进生成侧。
+    /// 自定义上游定义（强制纯 IP，见 [`CustomDnsUpstream`]）。由同一纯规划器消费。
     #[serde(rename = "nodeResolverCustom")]
     pub node_resolver_custom: Option<Vec<CustomDnsUpstream>>,
     /// legacy 单选档位（迁移读取）。
@@ -45,9 +43,9 @@ pub struct DnsConfig {
 
 /// 用户自定义节点解析上游。上游 `shared/types.ts CustomDnsUpstream`。
 ///
-/// `spec` 形态 = DoH URL / `tls://ip:853` / 裸 IP，且**强制纯 IP**（域名会被
+/// `spec` 形态 = 纯 IP DoH URL / UDP URL / 裸 IP（不支持 DoT），且**强制纯 IP**（域名会被
 /// [`parse_dns_server_spec`](crate::user_config::dns_spec::parse_dns_server_spec) 的 `is_domain`
-/// 判出并拒绝）—— 纯 IP 上游零 bootstrap 依赖，且 route 侧「直连放行」的目标地址是确定的。
+/// 判出并拒绝）—— 纯 IP 上游零 bootstrap 依赖，由内核直接建立候选连接。
 /// `id` 是稳定引用键，被 [`DnsConfig::node_resolver_pool`] / [`DnsConfig::node_resolver_single`] 指向。
 ///
 /// # 两个字段都 `#[serde(default)]`：缺键不得炸掉整份配置
@@ -60,7 +58,7 @@ pub struct DnsConfig {
 ///
 /// 加了 default，缺键退化为空串，由 [`parse_custom_upstream`](
 /// crate::user_config::dns_config::CustomDnsUpstream) 的既有消费方拒绝腿兜住
-/// （`polaris-dns-race` 的 `parse_custom_upstream` 首行就是 `id.is_empty() || spec.is_empty() → None`）：
+/// （`node_dns::upstream` 的 `parse_custom_upstream` 首行就是 `id.is_empty() || spec.is_empty() → None`）：
 /// **坏条目被跳过，其余配置照常生效** —— 失效范围与用户的错误范围一致。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustomDnsUpstream {

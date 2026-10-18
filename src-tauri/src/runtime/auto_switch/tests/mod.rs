@@ -235,6 +235,7 @@ fn plan_runtime_candidates_excludes_current() {
         &BTreeMap::from([(String::from("b"), String::from("fp-b"))]),
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     );
     assert_eq!(plan.candidates.len(), 1);
     assert_eq!(plan.candidates[0].id, "b");
@@ -253,6 +254,7 @@ fn plan_runtime_candidates_missing_servers_is_empty() {
             &BTreeMap::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            None,
         ),
         RuntimeCandidatePlan::default()
     );
@@ -269,6 +271,7 @@ fn plan_runtime_candidates_name_falls_back_to_id() {
         &BTreeMap::from([(String::from("x"), String::from("fp-x"))]),
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     );
     assert_eq!(plan.candidates[0].name, "x");
 }
@@ -283,6 +286,7 @@ fn plan_runtime_candidates_staged_is_excluded() {
         &BTreeMap::new(),
         &BTreeSet::from([String::from("staged")]),
         &BTreeSet::new(),
+        None,
     );
     assert!(plan.candidates.is_empty());
     assert_eq!(plan.staged, 1);
@@ -298,6 +302,7 @@ fn plan_runtime_candidates_not_loaded_is_excluded() {
         &BTreeMap::new(),
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     );
     assert!(plan.candidates.is_empty());
     assert_eq!(plan.not_loaded, 1);
@@ -313,6 +318,7 @@ fn plan_runtime_candidates_dirty_is_excluded() {
         &BTreeMap::from([(String::from("dirty"), String::from("current-fp"))]),
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     );
     assert!(plan.candidates.is_empty());
     assert_eq!(plan.dirty, 1);
@@ -328,6 +334,7 @@ fn plan_runtime_candidates_not_ready_is_excluded() {
         &BTreeMap::from([(String::from("not-ready"), String::from("same-fp"))]),
         &BTreeSet::new(),
         &BTreeSet::from([String::from("not-ready")]),
+        None,
     );
     assert!(plan.candidates.is_empty());
     assert_eq!(plan.not_ready, 1);
@@ -343,6 +350,7 @@ fn plan_runtime_candidates_clean_is_included() {
         &BTreeMap::from([(String::from("clean"), String::from("same-fp"))]),
         &BTreeSet::new(),
         &BTreeSet::new(),
+        None,
     );
     assert_eq!(
         plan.candidates,
@@ -424,6 +432,9 @@ fn payload_serializes_camel_case() {
         reason: "连通性检测".to_string(),
         new_server_name: "东京-01".to_string(),
         latency: 88,
+        leg: Leg::Failover,
+        cause: Cause::Failover,
+        old_server_name: None,
     };
     let v = serde_json::to_value(&p).unwrap();
     assert_eq!(
@@ -1046,7 +1057,7 @@ fn probe_all_failed_early_exit_reports_with_the_same_code_and_latch() {
         "两处共用同一份文案常量，防措辞漂移（一处说得对、另一处还留着「或重启代理」这种空操作建议）",
     );
     let probe_exit = body
-        .find("select_best_candidate(&measured)")
+        .find("ProbeVerdict::AllFailed => {")
         .expect("探测早退锚点：本门若因改名找不到它，必须转红而不是静默放行");
     let tail = &body[probe_exit..];
     assert!(
@@ -1054,5 +1065,148 @@ fn probe_all_failed_early_exit_reports_with_the_same_code_and_latch() {
             && tail.contains("machine.claim_restart_blocked_report()")
             && tail.contains("code::AUTO_SWITCH_NEEDS_RESTART"),
         "探测全败的早退必须带上报：判据 `needs_restart > 0` + 同一个锁存 + 同一个码",
+    );
+}
+
+// ── judge_probes：读回不符被跳过与没通分开裁定 ──
+
+#[test]
+fn probe_verdict_separates_mismatch_skipped_from_failed() {
+    use CandidateProbe::{Failed, Measured, MismatchSkipped};
+    let named = |ids: &[&str]| -> Vec<(String, String)> {
+        ids.iter()
+            .map(|id| ((*id).to_string(), format!("name-{id}")))
+            .collect()
+    };
+    let probes = |list: &[(&str, CandidateProbe)]| -> BTreeMap<String, CandidateProbe> {
+        list.iter()
+            .map(|(id, probe)| ((*id).to_string(), *probe))
+            .collect()
+    };
+    // 有测出值的：取最低；并列取候选原序靠前的。被跳过与没通的都不参选。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b", "c", "d"]),
+            &probes(&[
+                ("a", Failed),
+                ("b", Measured(90)),
+                ("c", Measured(40)),
+                ("d", MismatchSkipped)
+            ])
+        ),
+        ProbeVerdict::Best(cand("c", Some(40)))
+    );
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b"]),
+            &probes(&[("a", Measured(40)), ("b", Measured(40))])
+        ),
+        ProbeVerdict::Best(cand("a", Some(40)))
+    );
+    // 全部没通。表里没有的候选（没拿到任何结果）与引入读回之前一样按没通算。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b"]),
+            &probes(&[("a", Failed), ("b", Failed)])
+        ),
+        ProbeVerdict::AllFailed
+    );
+    assert_eq!(
+        judge_probes(&named(&["a", "b", "c"]), &probes(&[("a", Failed)])),
+        ProbeVerdict::AllFailed
+    );
+    assert_eq!(
+        judge_probes(&named(&[]), &probes(&[])),
+        ProbeVerdict::AllFailed
+    );
+    // 有因读回不符被跳过的：不下「全部不可用」的结论。
+    assert_eq!(
+        judge_probes(
+            &named(&["a", "b", "c"]),
+            &probes(&[
+                ("a", Failed),
+                ("b", MismatchSkipped),
+                ("c", MismatchSkipped)
+            ])
+        ),
+        ProbeVerdict::Inconclusive {
+            mismatch_skipped: 2
+        }
+    );
+}
+
+// ── 候选范围（自动选择意图下收窄到该订阅）──
+
+/// 给了范围时候选只含范围内的节点，范围外的不进候选、也不计入任何排除计数；不给范围时与原先
+/// 逐项相同（全部节点）。范围内的节点照样受那几道资格筛选。
+#[test]
+fn plan_runtime_candidates_keeps_only_members_of_the_scope() {
+    let cfg = json!({
+        "selectedServerId": "cur",
+        "servers": [
+            { "id": "cur", "name": "Cur" },
+            { "id": "in-ok", "name": "In" },
+            { "id": "in-dirty", "name": "Dirty" },
+            { "id": "out-ok", "name": "Out" },
+            { "id": "out-staged", "name": "OutStaged" },
+        ]
+    });
+    let all = ["cur", "in-ok", "in-dirty", "out-ok", "out-staged"];
+    let tags: BTreeMap<String, String> = all
+        .iter()
+        .map(|id| ((*id).to_string(), format!("{id}-tag")))
+        .collect();
+    let running: BTreeMap<String, String> = all
+        .iter()
+        .map(|id| ((*id).to_string(), "fp".to_string()))
+        .collect();
+    let mut current = running.clone();
+    current.insert("in-dirty".to_string(), "edited".to_string());
+    let staged = BTreeSet::from(["out-staged".to_string()]);
+    let plan_with = |scope: Option<&BTreeSet<String>>| {
+        plan_runtime_candidates(
+            &cfg,
+            Some("cur"),
+            &tags,
+            &running,
+            &current,
+            &staged,
+            &BTreeSet::new(),
+            scope,
+        )
+    };
+    let ids = |plan: &RuntimeCandidatePlan| -> Vec<String> {
+        plan.candidates.iter().map(|c| c.id.clone()).collect()
+    };
+
+    let unscoped = plan_with(None);
+    assert_eq!(ids(&unscoped), ["in-ok", "out-ok"]);
+    assert_eq!((unscoped.dirty, unscoped.staged), (1, 1));
+
+    let scope = BTreeSet::from(["in-ok".to_string(), "in-dirty".to_string()]);
+    let scoped = plan_with(Some(&scope));
+    assert_eq!(ids(&scoped), ["in-ok"], "不借别的订阅的节点");
+    assert_eq!(
+        (scoped.dirty, scoped.staged),
+        (1, 0),
+        "范围外的草稿节点不是这一轮的考察对象"
+    );
+
+    // 范围里没有能用的：候选为空（调用方据此不换，不转直连）。
+    let none = plan_with(Some(&BTreeSet::from(["in-dirty".to_string()])));
+    assert!(none.candidates.is_empty());
+}
+
+/// 冷却起点对外可读：择优腿与故障腿共用它。成败都在放行那一刻置上。
+#[test]
+fn the_last_attempt_time_is_shared_through_the_machine() {
+    let mut m = AutoSwitchMachine::new();
+    assert_eq!(m.last_switch_time(), None);
+    m.begin_switch(1_000);
+    m.end_switch();
+    assert_eq!(m.last_switch_time(), Some(1_000));
+    assert_eq!(
+        m.evaluate_switch(1_000 + SWITCH_COOLDOWN_MS - 1),
+        SwitchGate::Cooldown { remaining_ms: 1 }
     );
 }

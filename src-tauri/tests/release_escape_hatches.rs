@@ -160,42 +160,21 @@ const ALLOWED: &[Entry] = &[
 ///
 /// `validator` 不是文档而是**判据**：[`validated_read_sites_must_call_their_validator`] 会去
 /// 读取点所在的函数体里找这个串，找不到当场红。这一条是本类别与「一句承诺」的全部差别。
-const VALIDATED: &[Validated] = &[
-    Validated {
-        name: "POLARIS_SINGBOX_PATH",
-        validator: "adopt_trusted_env_path(",
-        reason: "【L1 喂代码执行链】喂给谁：`runtime/proxy/core_binary.rs::core_binary_env_override` —— 它是\
-                 `resolve_core_binary`（内核二进制解析链第 1 级）与 `UpdaterRuntime::new`\
-                 （版本双读法的探测目标）的**唯一**共用实现；解析出来的路径会被 spawn 成活核，\
-                 并经 `HelperRuntime::install_params` 作为 `bundled_core` / `--singbox` 播进\
-                 root 受管核目录。最坏能做什么（若无判据）：把 app 拉起的 sing-box 换成任意可\
-                 执行文件，以 app 身份 + 代理配置运行。\
-                 由哪个函数校验：`runtime/env_trust::adopt_trusted_env_path`，\
-                 `TrustScope::AppDataOrBundle`（canonicalize 后须落在 app 自有数据目录或随包\
-                 资源目录之内；目录穿越 / symlink / junction 逃逸、路径不存在、canonicalize\
-                 失败一律不过）。\
-                 不通过时怎么办：**不采纳**，记 `ENV_PATH_UNTRUSTED`（`log::warn`，带 path 与\
-                 roots）并回落既有优先级（可写现役核 → 随包种子）—— 绝不静默，也绝不因为逃生门\
-                 越界就让 app 起不来。\
-                 debug / test 构型不受本判据影响（`cfg!(any(debug_assertions, test))`）：逃生门\
-                 仍是原样的第一优先级，本地开发与全部 `#[ignore]` 真机验证逐字不变。",
-    },
-    Validated {
-        name: "POLARIS_HELPER_PATH",
-        validator: "adopt_trusted_env_path(",
-        reason: "【L2 喂提权安装链】喂给谁：`runtime/helper.rs::resolve_helper_binary` → \
+const VALIDATED: &[Validated] = &[Validated {
+    name: "POLARIS_HELPER_PATH",
+    validator: "adopt_trusted_env_path(",
+    reason: "【喂提权安装链】喂给谁：`runtime/helper.rs::resolve_helper_binary` → \
                  `install_params.src_binary` → 提权安装链，该文件随后被以管理员 / root 权限装成\
                  系统服务（systemd unit / launchd plist / Windows 服务）。最坏能做什么（若无\
                  判据）：把任意二进制喂进提权安装链，得到一个开机自启的 root 级常驻进程 —— \
-                 比 L1 更硬（L1 拿 app 权限，L2 拿系统权限）。\
-                 由哪个函数校验：同一个 `adopt_trusted_env_path`，但 scope 是\
-                 `TrustScope::AppDataOnly` —— 比 L1 严一档，**随包资源目录也不接受**。\
+                 \
+                 由哪个函数校验：`runtime/env_trust::adopt_trusted_env_path` —— canonicalize \
+                 后须落在 app 自有数据目录之内，**随包资源目录也不接受**。\
                  随包 helper 本就由兜底腿解析得到，逃生门再指一次只多一个入口、不多一分能力。\
                  不通过时怎么办：不采纳，记 `ENV_PATH_UNTRUSTED` 并回落随包 helper 兜底腿；\
                  兜底腿也找不到就是既有的「二进制缺失」早返（**不触发提权**）。\
                  debug / test 构型同样不受影响：helper 的本地迭代仍靠它装自编产物。",
-    },
-];
+}];
 
 /// 临时清单：**已知违规**，下一批修。
 ///
@@ -207,10 +186,13 @@ const VALIDATED: &[Validated] = &[
 ///
 /// # 当前为空 —— 以及上一版本条目里那句**错的**「修完就删掉」
 ///
-/// L1 `POLARIS_SINGBOX_PATH` 与 L2 `POLARIS_HELPER_PATH` 曾登记在这里，条目末尾写着
+/// `POLARIS_HELPER_PATH` 曾登记在这里，条目末尾写着
 /// 「修完之后 release 侧不再读它 ⇒ 命中 0 次 ⇒ 删掉本条」。**那个前提是错的**：信任级修复
-/// 并没有让 release 侧停止读这两个变量，只是给读到的路径加了一道可信来源判据。它们因此
+/// 并没有让 release 侧停止读它，只是给读到的路径加了一道可信来源判据。它因此
 /// 移进了 [`VALIDATED`]（release 可读 + 必须过校验），而不是消失。
+///
+/// 内核路径那个变量走的是另一条路：它在 release 构型里**完全不读**，四张清单都不登记，
+/// 由 [`core_path_env_override_is_dev_only`] 单独钉着。
 ///
 /// 这条经验值得留在这里：给一个逃生门「修复」不等于「删除」。判断一条 PENDING 该往哪去，
 /// 要看修完之后 **release 侧还读不读它**，而不是看有没有人动过那段代码。
@@ -241,14 +223,20 @@ const TEXT_ONLY: &[Entry] = &[
                  决定，后者的值由用户机的进程环境决定。改成后者即转红。",
     },
     Entry {
-        name: "POLARIS_UNIT_EOF",
-        reason: "`crates/helper-client/src/manager.rs` 里 systemd unit 安装脚本的 shell heredoc \
-                 定界符（`cat > … <<'POLARIS_UNIT_EOF'`）。是被生成的 shell 脚本的语法成分，\
-                 与进程环境无关。",
+        name: "POLARIS_DESCRIPTOR_EOF",
+        reason: "helper-client install_unix 的 Linux unit / Mac plist 共用 quoted descriptor heredoc 定界符；旧 UNIT_EOF / PLIST_EOF 随原生成器移除，不读取进程环境。",
     },
     Entry {
-        name: "POLARIS_PLIST_EOF",
-        reason: "同上，launchd plist 安装脚本的 heredoc 定界符。",
+        name: "POLARIS_ELEVATE",
+        reason: "update_install 的 quoted installer heredoc 定界符，不读取进程环境。",
+    },
+    Entry {
+        name: "POLARIS_LOCK_HELPER",
+        reason: "生成的 Unix shell 读子进程参数；spawn_detached_script 用已冻结的随包 helper 路径覆盖该环境键，非 ambient Rust env::var 入口。接线另由 frozen_lease_inputs_are_explicit_child_environment 守住。",
+    },
+    Entry {
+        name: "POLARIS_LOCK_HELPER_SHA256",
+        reason: "生成的 Unix shell 验子进程 helper 摘要；spawn_detached_script 用 compiled selected_manifest.helper_sha256 覆盖该键，非 ambient Rust env::var 入口。",
     },
 ];
 
@@ -435,7 +423,44 @@ fn mark_release_off_files(root: &Path, files: &mut [SourceFile]) {
 /// 属性内层文本取**原文**：`feature = "test-utils"` 的判据在字符串字面量里，取净化面会读成空。
 fn preceding_cfg_is_release_off(masked: &str, raw: &str, at: usize) -> bool {
     let bytes = masked.as_bytes();
+    // Visibility belongs to the same item. Stop before its `pub` token so an
+    // adjacent cfg on `pub(crate) mod child;` is not lost at the closing `)`.
     let mut i = at;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b')' {
+        let end = i;
+        let mut depth = 1usize;
+        i -= 1;
+        while i > 0 && depth > 0 {
+            i -= 1;
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return false;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i >= 3
+            && &masked[i - 3..i] == "pub"
+            && (i == 3 || !(bytes[i - 4].is_ascii_alphanumeric() || bytes[i - 4] == b'_'))
+        {
+            i -= 3;
+        } else {
+            i = end;
+        }
+    } else if i >= 3
+        && &masked[i - 3..i] == "pub"
+        && (i == 3 || !(bytes[i - 4].is_ascii_alphanumeric() || bytes[i - 4] == b'_'))
+    {
+        i -= 3;
+    }
     loop {
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
             i -= 1;
@@ -971,11 +996,15 @@ struct Scan {
 }
 
 fn scan() -> Scan {
+    scan_files(scan_surface())
+}
+
+fn scan_files(files: Vec<SourceFile>) -> Scan {
     let mut hits = Vec::new();
     let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut off_regions = 0usize;
 
-    for file in scan_surface() {
+    for file in files {
         let raw = std::fs::read_to_string(&file.path)
             .unwrap_or_else(|err| panic!("读不到 `{}`（{err}）", file.path.display()));
         let masked = polaris_source_probe::mask_comments_and_strings(&raw);
@@ -993,11 +1022,8 @@ fn scan() -> Scan {
                 if !name.starts_with(PREFIX) {
                     continue;
                 }
-                let (why, release) = if file.in_tests_dir {
-                    (
-                        "文件在 `tests/` 目录下（本仓约定：`<dir>/tests/` 恒为测试）",
-                        false,
-                    )
+                let (why, release) = if file.in_tests_dir || file.release_off_file {
+                    ("文件属于测试目录或 release 恒假的父模块子树", false)
                 } else if regions.iter().any(|(a, b)| *a <= at && at <= *b) {
                     (
                         "位于「任何 release 构型下都不编译」的 `#[cfg(..)]` 块内",
@@ -1023,7 +1049,7 @@ fn scan() -> Scan {
         }
 
         // ── 探测器 ②：生产文本里的 `POLARIS_*` 名字（与调用形态无关）──
-        if !file.in_tests_dir {
+        if !file.in_tests_dir && !file.release_off_file {
             off_regions += regions.len();
             let production = blank_regions(&raw, &regions);
             for (at, name) in polaris_names_in(&production) {
@@ -1128,9 +1154,9 @@ fn release_reachable_env_reads_are_all_registered() {
 /// [`PENDING_TRUST_GATE`] 的条目在下一批修完后正是靠这一条自动转红，把清理逼出来。
 /// 命中多次 = 一条豁免覆盖了它没打算覆盖的地方（今天只会由「两表登记了同一个名字」造成）。
 ///
-/// **变异探针**：删掉 `PENDING_TRUST_GATE` 里 `POLARIS_SINGBOX_PATH` 那条
+/// **变异探针**：删掉 `VALIDATED` 里 `POLARIS_HELPER_PATH` 那条
 /// ⇒ [`release_reachable_env_reads_are_all_registered`] 转红点名它的全部 release 侧读取点；
-/// 把 `POLARIS_SINGBOX_PATH` 同时写进 `ALLOWED` ⇒ 本条以「命中 2 次」转红。
+/// 把 `POLARIS_HELPER_PATH` 同时写进 `ALLOWED` ⇒ 本条以「命中 2 次」转红。
 #[test]
 fn registry_entries_must_all_match_exactly_once() {
     let scan = scan();
@@ -1178,10 +1204,9 @@ fn registry_entries_must_all_match_exactly_once() {
 /// 注释里写一句 `adopt_trusted_env_path(...)` 不算数（被剥掉了）；
 /// 隔壁函数里调了也不算数（不在同一层函数体内）。
 ///
-/// **变异探针**：把 `runtime/proxy/core_binary.rs::core_binary_env_override` 里的
-/// `adopt_trusted_env_path(..)` 换回裸的 `std::env::var("POLARIS_SINGBOX_PATH")` 解析
-/// ⇒ 本条转红并点名 `src-tauri/src/runtime/proxy/core_binary.rs:<行号> · POLARIS_SINGBOX_PATH`；
-/// 对 `runtime/helper.rs::resolve_helper_binary` 做同样的事 ⇒ 点名 L2 那条腿。
+/// **变异探针**：把 `runtime/helper.rs::resolve_helper_binary` 里的
+/// `adopt_trusted_env_path(..)` 换回裸的 `std::env::var("POLARIS_HELPER_PATH")` 解析
+/// ⇒ 本条转红并点名 `src-tauri/src/runtime/helper.rs:<行号> · POLARIS_HELPER_PATH`。
 #[test]
 fn validated_read_sites_must_call_their_validator() {
     let scan = scan();
@@ -1239,6 +1264,67 @@ fn validated_read_sites_must_call_their_validator() {
          本门在 `src-tauri/tests/release_escape_hatches.rs`。",
         missing.len(),
         missing.join("\n")
+    );
+}
+
+/// 内核路径的环境超驰变量名（不在任何一张清单里）。
+const CORE_PATH_ENV: &str = "POLARIS_SINGBOX_PATH";
+
+/// 🔴 **内核路径的环境超驰只存在于 debug / test 构型**：release 构型零读取。
+///
+/// 应用应当运行与本应用版本配套的内核。「路径落在某个可信目录内」不等于「内容配套」，
+/// 所以这个变量在 release 里没有「校验后采纳」这一档 —— 不读，也不登记进任何一张清单。
+///
+/// 三条判据，缺一条都留得下缝：
+///
+/// 1. **探测器①**：release 侧没有任何 `env::var*("…")` 读取点叫这个名字；
+/// 2. **探测器②**：release 构型会编译的文本（代码 + 注释 + 字面量）里**根本不出现**这个名字 ——
+///    堵 `const H: &str = "…"; env::var(H)` 这类间接读取。代价是 release 侧的注释与报错文案
+///    也不能点它的名，要讲就讲「内核路径的开发态超驰」；
+/// 3. **正面对照**：生产源码里确有一处读取点叫这个名字，且它被判成「release 不编译」。
+///    没有这一条，前两条在「读取点整体换了写法、两个探测器都看不见它」时照样全绿。
+///
+/// **变异探针**：把 `runtime/proxy/core_binary.rs::dev_core_binary_override` 上的
+/// `#[cfg(any(debug_assertions, test))]` 删掉，或把那个 `cfg` 改成 `cfg(unix)` ⇒ 第 1、2 条转红；
+/// 把读取点的字面量提成 release 侧的 `const` ⇒ 第 2、3 条转红。
+#[test]
+fn core_path_env_override_is_dev_only() {
+    let name = CORE_PATH_ENV;
+    let scan = scan();
+
+    let release_reads = scan.release_reads();
+    assert!(
+        !release_reads.contains_key(name),
+        "`{name}` 在 release 构型下可读：\n{}\n\n\
+         发行包不得从进程环境接受内核路径。读取点必须整个罩在\
+         `#[cfg(any(debug_assertions, test))]` 之内。",
+        describe(release_reads.get(name).map_or(&[][..], Vec::as_slice))
+    );
+
+    assert!(
+        !scan.names.contains_key(name),
+        "`{name}` 出现在 release 构型会编译的文本里：{:?}\n\
+         注释、报错文案、常量都算：名字一旦留在 release 侧，「零读取」就只剩调用形态这一道判据，\
+         而间接读取恰好逃得过它。",
+        scan.names.get(name)
+    );
+
+    let dev_only: Vec<&Hit> = scan
+        .hits
+        .iter()
+        .filter(|hit| hit.name == name && !hit.release && hit.file.contains("/src/"))
+        .filter(|hit| !hit.file.contains("/tests/"))
+        .collect();
+    assert_eq!(
+        dev_only.len(),
+        1,
+        "生产源码里应恰有一处 `{name}` 读取点且被判成 release 不编译，实得：\n{}\n\
+         0 处 = 读取点换了写法，上面两条断言正在对着空集成立；多处 = 开发态超驰长出了第二条腿。",
+        describe(&dev_only)
+    );
+    assert_eq!(
+        dev_only[0].file, "src-tauri/src/runtime/proxy/core_binary.rs",
+        "开发态超驰的读取点应只在内核解析的单点里"
     );
 }
 
@@ -1649,7 +1735,7 @@ fn assert_feature_gate_read_off(found: &BTreeMap<String, bool>) {
 const FN_SCOPE_FIXTURE: &str = r####"
 fn guarded() {
     let _ = std::env::var("POLARIS_FIXTURE_GUARDED");
-    let _ = adopt_trusted_env_path("POLARIS_FIXTURE_GUARDED", None, TrustScope::AppDataOnly);
+    let _ = adopt_trusted_env_path("POLARIS_FIXTURE_GUARDED", None);
 }
 
 fn bare() {
@@ -1663,7 +1749,7 @@ impl Thing {
             let _ = std::env::var("POLARIS_FIXTURE_INNER");
         }
         inner();
-        let _ = adopt_trusted_env_path("POLARIS_FIXTURE_OUTER", None, TrustScope::AppDataOnly);
+        let _ = adopt_trusted_env_path("POLARIS_FIXTURE_OUTER", None);
         Ok(())
     }
 }
@@ -1925,8 +2011,8 @@ fn release_profiles_must_not_enable_debug_assertions() {
         offenders.is_empty(),
         "以下 release 构型打开了 `debug-assertions`：\n{}\n\
          这会让 `runtime/env_trust.rs::dev_build()` 的 `cfg!(any(debug_assertions, test))` \
-         在**发行包里恒真** ⇒ POLARIS_SINGBOX_PATH / POLARIS_HELPER_PATH 的信任级校验整条失效，\
-         逃生门退回裸信任。要在 release 保留断言，先把 `dev_build()` 的判据换成不依赖它的东西\
+         在**发行包里恒真** ⇒ POLARIS_HELPER_PATH 的信任级校验整条失效，逃生门退回裸信任；\
+         内核路径的开发态超驰（`cfg(any(debug_assertions, test))`）也会被编进发行包。要在 release 保留断言，先把 `dev_build()` 的判据换成不依赖它的东西\
          （例如构建期注入的显式标记），再改 profile。",
         offenders.join("\n")
     );
@@ -1987,4 +2073,176 @@ fn release_profile_must_enable_lto_without_panic_abort() {
          `commands/subscription/create.rs:86` 两处生产 catch_unwind 会被静默废掉，一 panic 直接崩 App。\
          当前段内容：\n{release_body}"
     );
+}
+
+#[test]
+fn external_module_cfg_survives_item_visibility_without_borrowing_neighbor_cfg() {
+    for visibility in [
+        "",
+        "pub ",
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(in crate::runtime) ",
+    ] {
+        for (cfg, want) in [
+            ("debug_assertions", true),
+            ("test", true),
+            ("unix", false),
+            ("not(test)", false),
+        ] {
+            let raw = format!("#[cfg({cfg})]\n{visibility}mod child;");
+            let masked = polaris_source_probe::mask_comments_and_strings(&raw);
+            let declarations = mod_declarations(&masked);
+            assert_eq!(declarations.len(), 1);
+            assert_eq!(
+                preceding_cfg_is_release_off(&masked, &raw, declarations[0].0),
+                want,
+                "{raw}"
+            );
+        }
+    }
+    for raw in [
+        "#[cfg(test)] fn prior() {} pub(crate) mod child;",
+        "pub(crate) mod child;",
+    ] {
+        let masked = polaris_source_probe::mask_comments_and_strings(raw);
+        assert!(!preceding_cfg_is_release_off(
+            &masked,
+            raw,
+            mod_declarations(&masked)[0].0
+        ));
+    }
+}
+
+#[test]
+fn release_off_child_file_excludes_both_reads_and_names_but_live_file_does_not() {
+    // Reuse the actual two-read debug child as the controlled source input.
+    // Toggling only its inherited release gate tests both classifications
+    // without creating a temporary file or adding a dev dependency.
+    let rel = "src-tauri/src/runtime/http/local_acceptance.rs";
+    let path = workspace_root().join(rel);
+    let expected = ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"];
+    for off in [false, true] {
+        let result = scan_files(vec![SourceFile {
+            rel: rel.to_owned(),
+            path: path.clone(),
+            in_tests_dir: false,
+            release_off_file: off,
+        }]);
+        assert_eq!(result.hits.len(), expected.len());
+        for name in expected {
+            assert!(result
+                .hits
+                .iter()
+                .any(|hit| hit.name == name && hit.release != off));
+            assert_eq!(result.names.contains_key(name), !off);
+        }
+    }
+    let surface = scan_surface();
+    let child = surface
+        .iter()
+        .find(|f| f.rel == "src-tauri/src/runtime/http/local_acceptance.rs")
+        .unwrap();
+    assert!(
+        child.release_off_file,
+        "actual debug-only module declaration must propagate"
+    );
+    let result = scan();
+    for name in ["POLARIS_ACC01_UPDATE_ORIGIN", "POLARIS_ACC01_UPDATE_TOKEN"] {
+        assert!(!result.names.contains_key(name));
+        assert!(result.hits.iter().any(|h| h.name == name && !h.release));
+    }
+}
+
+fn frozen_lease_input_binding_is_complete(body: &str) -> bool {
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let binding = "cmd.env(\"POLARIS_LOCK_HELPER\",frozen.path()).env(\"POLARIS_LOCK_HELPER_SHA256\",expected);";
+    if compact.matches(binding).count() != 1 {
+        return false;
+    }
+    let Some(freeze) = compact
+        .find("freeze_lease_helper(&crate::runtime::helper::resolve_helper_binary()?,&expected)?")
+    else {
+        return false;
+    };
+    let Some(selected) = compact.find("crate::runtime::core_identity::selected_manifest(") else {
+        return false;
+    };
+    let Some(spawn) = compact.find("spawn_with_lifetime_pipe(&mutcmd)") else {
+        return false;
+    };
+    let bind = compact.find(binding).unwrap();
+    selected < freeze
+        && freeze < bind
+        && bind < spawn
+        && compact[selected..freeze].contains(".helper_sha256")
+}
+
+#[test]
+fn frozen_lease_inputs_are_explicit_child_environment() {
+    let raw = polaris_source_probe::repo_file!("src-tauri/src/runtime/update_install.rs");
+    let literals = polaris_source_probe::mask_comments(&raw);
+    let masked = polaris_source_probe::mask_comments_and_strings(&raw);
+    let at = masked
+        .find("cmd.env(")
+        .expect("explicit lease input binding");
+    let body = enclosing_fn_body(&masked, at).expect("binding belongs to spawn_detached_script");
+    let start = body.as_ptr() as usize - masked.as_ptr() as usize;
+    let body = &literals[start..start + body.len()];
+    assert!(frozen_lease_input_binding_is_complete(body));
+    for broken in [
+        body.replace("frozen.path()", "ambient.path()"),
+        body.replace(".helper_sha256", ".untrusted_hash"),
+        body.replace("POLARIS_LOCK_HELPER_SHA256", "IGNORED_CHILD_KEY"),
+        body.replace("freeze_lease_helper(", "skip_freeze("),
+        body.replace("selected_manifest(", "ambient_manifest("),
+        format!("spawn_with_lifetime_pipe(&mut cmd);{body}"),
+    ] {
+        assert!(!frozen_lease_input_binding_is_complete(&broken));
+    }
+}
+
+fn unix_descriptor_delimiters_are_complete(source: &str) -> bool {
+    source
+        .matches("cat > \"$TXDIR/descriptor\" <<'POLARIS_DESCRIPTOR_EOF'")
+        .count()
+        == 2
+        && source.matches("{plist}\nPOLARIS_DESCRIPTOR_EOF").count() == 1
+        && source.matches("{unit}POLARIS_DESCRIPTOR_EOF").count() == 1
+        && !source.contains("POLARIS_UNIT_EOF")
+        && !source.contains("POLARIS_PLIST_EOF")
+}
+
+#[test]
+fn current_unix_descriptor_delimiter_is_live_in_both_branches_and_retired_names_are_absent() {
+    let source =
+        polaris_source_probe::repo_file!("crates/helper-client/src/manager/install_unix.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    assert!(unix_descriptor_delimiters_are_complete(&source));
+    for broken in [
+        source.replacen("<<'POLARIS_DESCRIPTOR_EOF'", "<<'OTHER_EOF'", 1),
+        source.replace("{plist}\nPOLARIS_DESCRIPTOR_EOF", "{plist}\nOTHER_EOF"),
+        source.replace("{unit}POLARIS_DESCRIPTOR_EOF", "{unit}OTHER_EOF"),
+        source.replace("POLARIS_DESCRIPTOR_EOF", "POLARIS_UNIT_EOF"),
+    ] {
+        assert!(!unix_descriptor_delimiters_are_complete(&broken));
+    }
+    let surface = scan_surface();
+    let owner = surface
+        .iter()
+        .find(|file| file.rel == "crates/helper-client/src/manager/install_unix.rs")
+        .unwrap();
+    assert!(
+        !owner.in_tests_dir && !owner.release_off_file,
+        "live production generator cannot be swallowed by parent cfg"
+    );
+    let observed = scan();
+    assert!(observed.names.contains_key("POLARIS_DESCRIPTOR_EOF"));
+    assert!(!observed
+        .release_reads()
+        .contains_key("POLARIS_DESCRIPTOR_EOF"));
+    for old in ["POLARIS_UNIT_EOF", "POLARIS_PLIST_EOF"] {
+        assert!(!observed.names.contains_key(old));
+        assert!(!TEXT_ONLY.iter().any(|entry| entry.name == old));
+    }
 }

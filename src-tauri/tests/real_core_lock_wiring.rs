@@ -55,7 +55,7 @@ const MINIMUM_COVERAGE: [&str; 3] = ["runtime/proxy", "runtime/speedtest", "runt
 /// 文件相对路径 → 它所属的模块路径。
 ///
 /// - `runtime/proxy.rs`            → `runtime/proxy`
-/// - `runtime/proxy/dns_race.rs`   → `runtime/proxy/dns_race`
+/// - `runtime/proxy/startup.rs`   → `runtime/proxy/startup`
 /// - `runtime/proxy/tests/mod.rs`  → `runtime/proxy`
 /// - `runtime/stats/tests/live.rs` → `runtime/stats`
 fn owning_module(rel: &str) -> String {

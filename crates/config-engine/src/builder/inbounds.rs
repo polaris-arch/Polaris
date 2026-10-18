@@ -6,14 +6,14 @@
 #![forbid(unsafe_code)]
 
 use crate::builder::endpoint_routes::{
-    collect_rule_targeted_server_ids, mesh_force_routed_servers, mesh_forced_route_cidrs,
-    ObservedTailnetAddresses,
+    collect_rule_targeted_server_ids, engaged_mesh_forced_route_cidrs, ObservedTailnetAddresses,
 };
 use crate::builder::helpers::{
     effective_app_rules, effective_custom_rules, get_custom_domestic_dns_endpoint,
     host_to_exclude_cidr, is_ipv4_host, is_ipv6_host, probe_pool_inbound_tag,
 };
 use crate::builder::tun_route_exclude::{compute_user_tun_exclude, UserTunExcludeInput};
+use crate::singbox::inbound::TunDnsMode;
 use crate::singbox::{HttpProxyPlatform, Inbound, InboundPlatform, InboundUser, UdpNatBehavior};
 use crate::user_config::cidr::cidr_overlaps_any;
 use crate::user_config::collections::dedupe;
@@ -168,7 +168,7 @@ pub fn build_inbounds(
     if emits_mixed_inbound(platform) {
         inbounds.push(Inbound {
             type_field: "mixed".into(),
-            tag: "mixed-in".into(),
+            tag: crate::builder::helpers::MIXED_INBOUND_TAG.into(),
             listen: Some(listen_addr.into()),
             listen_port: Some(local_proxy_port(config)),
             network: None,
@@ -176,6 +176,7 @@ pub fn build_inbounds(
             address: None,
             mtu: None,
             auto_route: None,
+            dns_mode: None,
             auto_redirect: None,
             strict_route: None,
             udp_mapping: None,
@@ -221,7 +222,11 @@ pub fn build_inbounds(
             inbounds.push(http_loopback("probe-direct-in", dp, users.clone()));
         }
         if let Some(pp) = deps.probe_proxy_port {
-            let mut probe = http_loopback("probe-proxy-in", pp, users.clone());
+            let mut probe = http_loopback(
+                crate::builder::helpers::PROBE_PROXY_INBOUND_TAG,
+                pp,
+                users.clone(),
+            );
             // Same authenticated tag/selector and HTTP behavior; SOCKS5 adds UDP only in Debug.
             if cfg!(debug_assertions) && deps.platform == "android" && deps.debug_probe_mixed_udp {
                 probe.type_field = "mixed".into();
@@ -273,6 +278,7 @@ fn http_loopback(tag: &str, port: u16, users: Option<Vec<InboundUser>>) -> Inbou
         address: None,
         mtu: None,
         auto_route: None,
+        dns_mode: None,
         auto_redirect: None,
         strict_route: None,
         udp_mapping: None,
@@ -309,6 +315,7 @@ fn socks_loopback(tag: &str, port: u16, users: Option<Vec<InboundUser>>) -> Inbo
         address: None,
         mtu: None,
         auto_route: None,
+        dns_mode: None,
         auto_redirect: None,
         strict_route: None,
         udp_mapping: None,
@@ -385,12 +392,10 @@ fn build_tun_inbound(
             }
         }
     }
-    let engaged_mesh = mesh_forced_route_cidrs(
-        &mesh_force_routed_servers(
-            &config.servers,
-            config.selected_server_id.as_deref(),
-            &rule_targeted,
-        ),
+    let engaged_mesh = engaged_mesh_forced_route_cidrs(
+        &config.servers,
+        config.selected_server_id.as_deref(),
+        &rule_targeted,
         &deps.observed_tailnet_addresses,
     );
 
@@ -701,6 +706,23 @@ fn build_tun_inbound(
     let user_mtu = tun_cfg.and_then(|t| t.mtu);
 
     let auto_route = tun_cfg.map(|t| t.auto_route).unwrap_or(true);
+    // Audited sing-tun 5c2edb183cc9: unset + auto_route=true is hijack,
+    // unset + false is disabled. Preserve the user's flag and compensate only
+    // known desktop manual-routing TUNs. Mobile stays on its alpha.8 contract.
+    // Windows delivery additionally requires the source-owner fix restoring
+    // both family AutoRoute guards and SetDNS(family, nil, nil) else branches;
+    // unmodified D052 + explicit hijack changes interface DNS. The dependency
+    // fingerprint gate remains closed until that source closure is signed.
+    let dns_mode = match Platform::parse(&deps.platform) {
+        Platform::Linux | Platform::Mac | Platform::Win => {
+            if auto_route {
+                None
+            } else {
+                Some(TunDnsMode::Hijack)
+            }
+        }
+        Platform::Android | Platform::Ios | Platform::Other => None,
+    };
 
     // 🔴 `strict_route`：**Android 上一个键都不发**（其余平台逐字下发用户档位）。
     //
@@ -786,6 +808,7 @@ fn build_tun_inbound(
         address: Some(tun_address),
         mtu: user_mtu,
         auto_route: Some(auto_route),
+        dns_mode,
         auto_redirect: None,
         strict_route,
         udp_mapping,
@@ -964,8 +987,9 @@ fn drop_mobile_loopback_excludes(platform: &str, extra: &mut Vec<String>) -> Vec
 /// 调用方只在开关开着时调用；清单取 [`effective_bypass_lan`]（缺省即 `DEFAULT_BYPASS_LAN`）的网段子集。
 /// 依次过四步，每一步都有一条不做就出事的理由：
 ///
-/// 1. **严格校验**（[`is_valid_ip_cidr`]）+ **拒 `/0`**：`bypass_lan_cidrs` 只做形状粗判，
-///    `256.1.1.1/24` 会放行进内核 ⇒ sing-box `netip.ParsePrefix` 启动 FATAL；`0.0.0.0/0` / `::/0`
+/// 1. **严格校验**（[`is_valid_ip_cidr`]）+ **拒 `/0`**：在 CIDR 规范化过滤前统计原始网段，
+///    避免共享提取器先丢弃坏网段而漏报 warn。若 `256.1.1.1/24` 放行进内核，sing-box
+///    `netip.ParsePrefix` 会启动 FATAL；`0.0.0.0/0` / `::/0`
 ///    放行 ⇒ 整个地址空间排出 VPN、流量全部绕过隧道而界面仍显示已连接。剔掉的条目 warn。
 ///    **不用** [`normalize_tun_exclude_cidr`](crate::builder::tun_route_exclude::normalize_tun_exclude_cidr)：它的过宽下限（v4 < /8）会把默认清单里的
 ///    `224.0.0.0/4`（组播，mDNS/SSDP 局域网发现靠它）与 `240.0.0.0/4` 每次起核都剔掉并告警。
@@ -987,18 +1011,19 @@ fn mobile_bypass_lan_exclude(
     fakeip_ranges: &[String],
     tun_address: &[String],
 ) -> Vec<String> {
-    let raw = bypass_lan_cidrs(&effective_bypass_lan(&UConfigBypass(config)));
+    let raw = effective_bypass_lan(&UConfigBypass(config));
     let mut dropped_invalid = 0usize;
     let normalized: Vec<String> = raw
         .iter()
+        .map(|c| c.trim())
+        .filter(|c| c.contains('/'))
         .filter_map(|c| {
-            let catch_all = c.split('/').nth(1).map(str::trim) == Some("0");
-            if is_valid_ip_cidr(c) && !catch_all {
-                Some(c.clone())
-            } else {
+            let normalized = crate::user_config::cidr::normalize_cidr(c)
+                .filter(|value| is_valid_ip_cidr(value) && !value.ends_with("/0"));
+            if normalized.is_none() {
                 dropped_invalid += 1;
-                None
             }
+            normalized
         })
         .collect();
     if dropped_invalid > 0 {

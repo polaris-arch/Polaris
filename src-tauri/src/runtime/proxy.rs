@@ -37,10 +37,10 @@ mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
+mod tls_capabilities;
 // `pub(crate)`：`pipe_to_log` 是全 app 唯一一份子进程排空实现，瞬态登录核
 // （`runtime::tailscale_login_core`）与测速临时核（`runtime::speedtest`）都用它。
 pub(crate) mod core_log;
-mod dns_race;
 mod dns_takeover;
 mod hot_switch;
 mod lifecycle;
@@ -48,6 +48,7 @@ mod login_fallback;
 mod management_api;
 // S4 journal, artifact, and guarded CAS contract. The managed coordinator is
 // deliberately not wired until core ownership and platform receipts exist.
+pub(crate) mod coex_observer;
 #[allow(dead_code)]
 pub(crate) mod mesh_apply;
 mod mesh_route_report;
@@ -76,8 +77,8 @@ mod tunnel_conflict;
 mod unlock_refresh;
 
 pub(crate) use core_binary::{
-    bundle_resource_candidates, bundle_resource_roots, core_binary_env_override, dev_manifest_dir,
-    first_existing_bundle_candidate, resolve_bundled_core_binary, resolve_core_binary,
+    bundle_resource_candidates, dev_manifest_dir, first_existing_bundle_candidate,
+    resolve_core_binary,
 };
 // B9 跟随面：`resolve_dashboard_serve_dir` 的**唯一**消费者是 `start_inner`，本批随它进
 // `startup.rs`（改走 `super::core_binary::` 直取）⇒ façade 侧再导出零命中。§B.3 把它列进「必须
@@ -85,7 +86,6 @@ pub(crate) use core_binary::{
 // （见回报「登记缺陷」）⇒ 保留再导出以守住 §B.3 的路径承诺，用 allow 标注它现在没有 crate 内命中。
 #[allow(unused_imports)]
 pub(crate) use core_binary::resolve_dashboard_serve_dir;
-use dns_race::DnsRaceRuntime;
 // B9 跟随面：`dns_takeover_enabled` 的生产消费点是 `start_inner` 的起核 DNS 接管闸，随本批进
 // `startup.rs`；façade 只剩 `proxy/tests/` 经 `use super::*;` 取用 —— 不 gate 即非测试编译单元的
 // `unused_imports`（同 B4 / B7 / B8 的既有形态，下同）。
@@ -104,7 +104,9 @@ pub use hot_switch::{StagedClassification, SwitchOutcome};
 // §C 例外② 钉死在 façade），按 §A.3 由 façade `pub use` 再导出。
 // B9：同批注释里的 `now_ms` / `sleep_unless_superseded_on` 随 `start_inner` / `wait_ready`
 // 进 `startup.rs`，façade 侧已如期下线。
-pub use lifecycle::ProxyLifecycleEvent;
+pub use lifecycle::{
+    ExpectedCoreStopRequest, ExpectedCoreStopResult, OwnedStopContext, ProxyLifecycleEvent,
+};
 use login_fallback::LoginFallbackState;
 use mesh_route_report::MeshRouteRunEvidence;
 use network_settle::NetworkSettleGate;
@@ -129,13 +131,12 @@ use selector_reconcile::SelectorReconcileOwner;
 use selector_reconcile::SelectorReconcileOutcome;
 // B9：`startup` 域搬出后 façade 侧仍在消费的六项——`HelperGateDecision` 是
 // `ProxyErrorEmitter::prompt_helper_gate` 的返回类型（trait 定义按 §C 例外② 钉死在 façade），
-// 按 §A.3 由 façade `pub use` 再导出；`KernelGateCacheRecord` / `ProtectedCoreCacheRecord` 是
+// 按 §A.3 由 façade `pub use` 再导出；`KernelGateCacheRecord` 是
 // `ProxyRuntime` 的字段类型、`load_kernel_gate_cache` / `KERNEL_GATE_CACHE_FILE` / `cronet_available`
 // 供仍留在 façade 的 `new` / `core_build_env` 使用（结构体与这 6 个方法按 §A.5 钉死在 façade）。
 pub use startup::HelperGateDecision;
 use startup::{
-    cronet_available, load_kernel_gate_cache, KernelGateCacheRecord, ProtectedCoreCacheRecord,
-    KERNEL_GATE_CACHE_FILE,
+    cronet_available, load_kernel_gate_cache, KernelGateCacheRecord, KERNEL_GATE_CACHE_FILE,
 };
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -201,7 +202,6 @@ use polaris_core_supervisor::CrashRecoveryMachine;
 use polaris_core_supervisor::LifecycleGate;
 #[cfg(all(test, unix))]
 use polaris_core_supervisor::INVALID_REASON_KERNEL_REJECTED;
-use polaris_dns_race::DohPost;
 // 双侧搬出跟随面：façade 的最后消费者（TS/核日志 relay）随 B6 搬进 `ts_exit.rs`/`core_log.rs`，
 // 仅 `proxy/tests/hot_switch.rs` 经 `use super::*` 仍用这两名；`ReconnectConfig` 已无消费者。
 #[cfg(test)]
@@ -213,9 +213,7 @@ use polaris_switch_engine::DebouncedRestart;
 #[cfg(test)]
 use polaris_switch_engine::{ManagementApi, ManagementError};
 use serde_json::Value;
-// B7 跟随面：同上，仅 `proxy/tests/` 消费。
-#[cfg(test)]
-use crate::commands::speedtest::current_server_fingerprints;
+
 use crate::runtime::auto_switch::AutoNodeSwitchedPayload;
 // B7 跟随面：同上，仅 `proxy/tests/` 消费。
 #[cfg(test)]
@@ -251,13 +249,18 @@ use polaris_platform_events::RuntimeBindingPlan;
 use crate::runtime::tailscale_status::TailscaleStatusEvent;
 use crate::runtime::vpn_status::{OpenConnectStatusEvent, OpenVpnStatusEvent};
 
-/// **§15 主核测速探测池槽数 K**（上游 `shared/speed-test.ts PROBE_POOL_SIZE`，单一真值）。
+/// **§15 主核测速探测池槽数 K**（上游 `shared/speed-test.ts PROBE_POOL_SIZE`）。
 ///
 /// 起核时分配 K 个空闲回环端口注入 `probe_pool_ports` → config-engine 据此建 K 个 `probe-in-k`（http 入站）
 /// `probe-selector-k`（成员=全量 nodeTags）、`probe-in-k→probe-selector-k` 路由、`dns-probe-exit-k`。
 /// 测速时按波经 gRPC `select_outbound` 把各槽热切到被测节点、经 `probe-in-k` 端口量 warm-TTFB（同核单会话，
-/// 结构性消除 WG/WARP 双会话超时）。K=16 对齐 上游；**分配失败 → 空池（回退当前活跃出口测速）**，`=0` 为回滚锚点。
-const PROBE_POOL_SIZE: usize = 16;
+/// 结构性消除 WG/WARP 双会话超时）。**分配失败 → 空池（回退当前活跃出口测速）**，`=0` 为回滚锚点。
+///
+/// 这是槽位**上限**，起核时定、按平台取值（[`polaris_store::speed_test_slot_cap`]：桌面 64、
+/// Android 32、iOS 16）；每轮实际用几个槽由测速侧在上限内另定。
+fn probe_pool_size() -> usize {
+    polaris_store::speed_test_slot_cap(polaris_helper_proto::Platform::current())
+}
 
 /// sing-box 运行态快照（上游 `ProxyStatus` 镜像，序列化字段名与前端一致）。
 ///
@@ -279,6 +282,8 @@ pub struct ProxyStatus {
     /// Read-time projection of the shared lifecycle generation for action attribution.
     #[serde(rename = "mainGeneration", default)]
     pub main_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_stop_context: Option<OwnedStopContext>,
     /// **是否有起核腿在飞**（`running:false` 期间也可能正在起核——重试预算内一轮可达数十秒）。
     ///
     /// **读时投影**（同 `uptime`）：存储态恒 `false`，真值是 [`ProxyRuntime::start_inflight`] 计数，
@@ -367,6 +372,9 @@ pub mod code {
     pub const AUTO_RESTART_FAILED: &str = "AUTO_RESTART_FAILED";
     /// TUN 经提权 helper 起核，但 helper 未安装（起核前置校验拦截）——「权限/环境」轴。控制流位置可
     /// 诚实断言（判定点直接读到 helper 未装），非猜 message；渲染端据此引导去「设置 › Helper」安装。
+    ///
+    /// 「装着但太旧、起不了核」也落本码（`startup::birth_capability_error_code`）：助手对起核前的
+    /// 能力探测明确回了「不认识这条命令」。用户要做的是同一件事（去同一页装 / 升级），重试同样无用。
     pub const HELPER_NOT_INSTALLED: &str = "HELPER_NOT_INSTALLED";
     /// **Android**：起核被拒是因为用户没给 VPN 授权（`VpnService.prepare()` 返回非 null）
     /// ——「权限/环境」轴。控制流位置可诚实断言：判定点是 Kotlin 侧起核前的那次 `prepare()`，
@@ -383,7 +391,7 @@ pub mod code {
     /// **为什么必须是一个诚实终态而不是继续起核**：活着的孤儿核一直独占 `cache.db`，此时起任何新核
     /// 都会 `initialize cache-file: timeout` 而失败，且**连切回 systemProxy 模式也起不来**。若在此静默
     /// 放行，用户看到的是一串莫名其妙的启动失败、无从下手；报出本码才能指向真正的动作
-    /// （装/修 helper，或手动 `sudo kill` 掉残留 pid）。控制流位置可诚实断言（清扫腿直接观察到
+    /// （装/修 helper，或手动结束残留 pid）。控制流位置可诚实断言（清扫腿直接观察到
     /// 「杀过了、仍存活、且提权腿不可用」），非猜 message。
     pub const ROOT_ORPHAN_BLOCKED: &str = "ROOT_ORPHAN_BLOCKED";
     /// **A1**：核已就绪，但把 OS 系统代理指向本地 mixed 入站失败（`networksetup`/`gsettings`/`reg` 报错）
@@ -402,7 +410,7 @@ pub mod code {
     /// 实际默认出口，与用户落盘的 `selectedServerId` 对账（见 [`attest_effective_exit`](super::startup::attest_effective_exit)）。
     /// 非终态（核在跑），同走 `set_nonfatal_error`。这是「用户以为走代理、实则明文直连」的唯一告警通道。
     pub const EXIT_MISMATCH: &str = "EXIT_MISMATCH";
-    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「换核没生效」轴。
+    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「提权助手里的内核与本应用不配套」轴。
     ///
     /// 与 [`EXIT_MISMATCH`] 的判据形态**刻意相反**：那一条是纯静态对账（两个输入都源自「意图」），
     /// 本条只吃**事实**——`running` 取自内核对该 pid 的记账（linux `/proc/<pid>/exe`、mac `ps -o comm=`），
@@ -412,6 +420,22 @@ pub mod code {
     ///
     /// 非终态（核确在跑，只是版本不对），同走 `set_nonfatal_error`。
     pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
+    /// The pinned Start/status receipt differs from the selected immutable CoreID.
+    /// Runtime version strings are diagnostic and never establish this verdict.
+    pub const HELPER_CORE_MISMATCH: &str = "HELPER_CORE_MISMATCH";
+    /// Another content id/user or pending native custody occupies the helper.
+    pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
+    /// The package payload does not match its compiled content identity.
+    pub const CORE_BUNDLE_MISMATCH: &str = "CORE_BUNDLE_MISMATCH";
+    /// The selected content id has not been installed by an administrator.
+    pub const HELPER_CORE_ABSENT: &str = "HELPER_CORE_ABSENT";
+    /// Installed content failed the protected store's file verification.
+    pub const HELPER_CORE_INVALID: &str = "HELPER_CORE_INVALID";
+    /// **随包内核不可执行**：安装包里的内核文件没有可执行权限，应用直起内核前即拒绝。
+    ///
+    /// 终态（核没起）。单列一个码而不落进 [`STARTUP_FAILED`]：成因是安装包损坏或被改过权限，
+    /// 重试无用，要给用户的动作是重新安装；笼统的「启动失败」指不出这一步。
+    pub const CORE_NOT_EXECUTABLE: &str = "CORE_NOT_EXECUTABLE";
     /// **规则资源缺失**：本次生成有 rule_set tag 因本地 `.srs` 缺失/损坏被 fail-closed 剪枝
     /// ——「分流规则整段没了」轴。控制流位置可诚实断言（剪枝点直接交回悬空 tag 清单，见
     /// `RouteConfigOutcome::pruned_rule_set_tags`），非猜 message；**资源齐全时该清单恒空 ⇒ 不发 = 零噪音**。
@@ -517,8 +541,11 @@ pub mod code {
 /// [`code::HELPER_NOT_INSTALLED`] 的用户可见兜底文案（zh）。command 前置拦截与 runtime preflight
 /// 共用同一串 → 「点连接」与「托盘/自动连接」两路给出一致提示。渲染端另有 i18n key
 /// (`errors.helperNotInstalled*`) 覆写多语，此常量为无 emitter / 极早期失败时的兜底。
+///
+/// 本码也表示「装着但太旧」（见 [`code::HELPER_NOT_INSTALLED`]），故文案两种情形都要说到，动作
+/// 也是两个：安装，或升级。
 pub const HELPER_NOT_INSTALLED_MSG: &str =
-    "TUN 模式需要提权 helper，但 helper 尚未安装。请到「设置 › Helper」安装后重试。";
+    "TUN 模式需要提权 helper，但 helper 尚未安装或版本过旧。请到「设置 › Helper」安装或升级后重试。";
 
 /// [`code::HELPER_GATE_ABORTED`] 的用户可见兜底文案（zh）。渲染端另有 i18n key
 /// (`errors.helperGateAborted`) 覆写多语，此常量为无 emitter / 极早期失败时的兜底。
@@ -564,7 +591,7 @@ pub struct StartError {
     /// 本次失败的结构化码（[`code`] 模块常量）。`None` = 无可诚实断言的分类。
     pub code: Option<&'static str>,
     /// A rejected admission has not started a replacement. Its caller
-    /// must preserve the existing core's OS proxy and race sidecar.
+    /// must preserve the existing core and its OS proxy state.
     pub(crate) admission_denied: bool,
 }
 
@@ -690,6 +717,9 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// lib.rs**（本批禁区）；语义上它本就是「ProxyRuntime 的事件出口」（见 trait 头注）。
     fn emit_auto_node_switched(&self, payload: &AutoNodeSwitchedPayload);
 
+    /// 选择状态变了（`event:autoSelectStatus`，载荷与状态命令 `auto_select_status` 的返回同形）。
+    fn emit_auto_select_status(&self, status: &serde_json::Value);
+
     /// 只发“磁盘配置/运行投影需重拉”信号，不再次进入普通 config switch 流水线。用于 selector
     /// 双不自证后的受限对账完成通知；若走普通广播会把 D 中未 Apply 的其它字段夹带入核。
     fn emit_config_changed(&self);
@@ -758,6 +788,8 @@ pub trait ProxyErrorEmitter: Send + Sync {
     /// 复用本 trait 的理由同 [`emit_pending_changes`](Self::emit_pending_changes)：
     /// `AppHandleProxyErrorEmitter` 已持 `AppHandle`、已在 `lib.rs` setup 一次接线，扩方法无需动 lib.rs。
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent);
+
+    fn emit_coex_state(&self, _state: serde_json::Value) {}
 
     /// **网络场景命中态变更信号**（`event:networkProfileMatchChanged`，**无载荷** `{}`）。
     ///
@@ -926,6 +958,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
         );
     }
 
+    fn emit_auto_select_status(&self, status: &serde_json::Value) {
+        crate::events::broadcast(
+            &self.app,
+            crate::events::channel::EVENT_AUTO_SELECT_STATUS,
+            status,
+        );
+    }
+
     fn emit_config_changed(&self) {
         crate::commands::config::emit_config_changed_signal(&self.app);
     }
@@ -980,6 +1020,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             &self.app,
             crate::events::channel::EVENT_PROXY_PENDING_CHANGES,
             summary,
+        );
+    }
+
+    fn emit_coex_state(&self, state: serde_json::Value) {
+        crate::events::emit_to_main(
+            &self.app,
+            crate::events::channel::EVENT_COEX_RUNTIME_STATE,
+            state,
         );
     }
 
@@ -1179,6 +1227,28 @@ pub struct LocalHttpProxy {
     pub port: u16,
     /// 该入站要求的凭据；`mixed-in` 恒零认证 ⇒ 恒 `None`。
     pub auth: Option<InboundUser>,
+    /// 取到的是哪一个入站。两者在内核里受的路由策略不同，测速据此标注结果。
+    pub inbound: LocalInbound,
+}
+
+/// [`LocalHttpProxy`] 背后的入站。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalInbound {
+    /// `mixed-in`：不钉死，走用户的全部路由规则与 DNS 规则。
+    Mixed,
+    /// `probe-proxy-in`：被路由钉到 `proxy-selector`，用户规则不参与。
+    ProbeProxy,
+}
+
+impl LocalInbound {
+    /// 该入站在运行核里的 tag。
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Mixed => polaris_config_engine::builder::helpers::MIXED_INBOUND_TAG,
+            Self::ProbeProxy => polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG,
+        }
+    }
 }
 
 /// 选「经本机 http 代理入站出网」用哪个口（**纯函数**，单测与对拍门的取材点）。
@@ -1200,6 +1270,7 @@ pub fn select_local_http_proxy(
         return Some(LocalHttpProxy {
             port: mixed_port,
             auth: None,
+            inbound: LocalInbound::Mixed,
         });
     }
     probe_proxy_port
@@ -1207,7 +1278,20 @@ pub fn select_local_http_proxy(
         .map(|port| LocalHttpProxy {
             port,
             auth: loopback_auth,
+            inbound: LocalInbound::ProbeProxy,
         })
+}
+
+/// 测速结果 `binding` 块的静态取材（[`ProxyRuntime::speed_binding_context`] 产出）：全部来自
+/// **起核那一刻的生成产物**，不从当前磁盘配置重算。不依赖探针池，池未注入时同样有值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeedBindingContext {
+    /// 落在 `endpoints[]` 的 tag。
+    pub endpoint_tags: std::collections::BTreeSet<String>,
+    /// 带前置出站的 tag → 它的 `detour`。
+    pub static_detours: BTreeMap<String, String>,
+    /// 内核的规则描述 → 用户给规则起的名字。
+    pub rule_names: BTreeMap<String, String>,
 }
 
 /// **§15**：主核测速探测池目标（[`ProxyRuntime::speed_probe_targets`] 产出，`server_speed_test` 消费）。
@@ -1270,6 +1354,7 @@ struct IosMainCustody {
     config_digest: String,
     main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
     ready: Option<tauri_plugin_polaris_ios::ReadySessionReceipt>,
+    stop_target: Option<Arc<tauri_plugin_polaris_ios::StopSessionTarget>>,
     stopped: Option<Arc<tauri_plugin_polaris_ios::StoppedSessionReceipt>>,
 }
 
@@ -1303,6 +1388,11 @@ impl IosMainCustody {
                 _ => false,
             }
     }
+}
+
+/// 进程内的单调毫秒（换点冷却、驻留、账本入账共用的时钟）。
+pub(crate) fn mono_now_ms() -> u64 {
+    lifecycle::monotonic_now_ms()
 }
 
 pub struct ProxyRuntime {
@@ -1396,6 +1486,12 @@ pub struct ProxyRuntime {
     /// selector 意图代次、强制重申脏位与后台单飞交接的唯一 owner。
     /// 它与 `switch_serial` 正交：前者给出跨 await 的所有权事实，后者仍串行真实入核 I/O。
     selector_reconcile: Arc<SelectorReconcileOwner>,
+    /// 自动选点的状态槽：决策记忆、上次换点、最近一次评估。进程级，不随核世代清空，不落盘。
+    auto_select: std::sync::Mutex<crate::runtime::auto_select::Slot>,
+    /// 唤醒心跳任务立即评估一次（意图刚被写入时）。
+    auto_select_wake: tokio::sync::Notify,
+    /// 最近一次发给前端的选择状态摘要。取状态、比对、发射都在这把锁里：并发播报先后有序。
+    auto_select_announced: std::sync::Mutex<Option<String>>,
     /// 「保存不重启」欠下的账：本次运行核起来之后，是否发生过被 `defer_restart` 降级的结构性变更。
     ///
     /// # 为什么是一个记账标记而不是现算的差集
@@ -1443,7 +1539,6 @@ pub struct ProxyRuntime {
     /// readiness / FATAL / 出口自证不依赖此字段。
     kernel_gate_cache: Mutex<Option<KernelGateCacheRecord>>,
     /// 受保护核完整 hash 对账的进程内热缓存。任何 payload 元数据变化即 miss；app 重启后首次连接必重验。
-    protected_core_cache: Arc<Mutex<Option<ProtectedCoreCacheRecord>>>,
     /// 单测同步屏障：记录就绪探测已经真实失败并进入 `on_retry` 的次数。
     ///
     /// 不能用固定 sleep 代替：Windows hosted runner 上 PowerShell 占位核启动/任务调度可能超过监听延时，
@@ -1466,8 +1561,7 @@ pub struct ProxyRuntime {
     ///
     /// [`run_helper_gate`](Self::run_helper_gate) 是**每次 TUN 起核**都要跑的汇流点（托盘切模式 /
     /// 启动自动连接 / switchMode 去抖重启 / 崩溃自愈重启），而「可升级」是一条**一次性告知**、
-    /// 不是状态推送。不去重就是「每次重启弹一次原生模态」，比它要修的缺陷坏得多
-    /// （语义同 `startup_tasks::BASELINE_WARNED`）。
+    /// 不是状态推送。不去重就是「每次重启弹一次原生模态」，比它要修的缺陷坏得多。
     ///
     /// **挂在运行时实例上而不是写成 `static`**：生产进程里 `AppRuntime` 只造一个 `ProxyRuntime`
     /// （`runtime.rs` 的 `AppRuntime::new`），两者在生产上完全等价；而 `static` 在单测里是
@@ -1487,6 +1581,9 @@ pub struct ProxyRuntime {
     ///
     /// [`sync_custom_rule_files`]: Self::sync_custom_rule_files
     custom_rule_files_degraded: AtomicBool,
+    rule_content_publication: Mutex<Option<startup::RuleContentPublication>>,
+    #[cfg(test)]
+    rule_content_api_stub: Mutex<Option<Arc<dyn startup::RuleContentApi>>>,
     /// **A-0b：运行期观测到的 tailnet 地址**（`serverId` → 裸地址，不带掩码）。
     ///
     /// 唯一写入点是 `tailnet_rules` 域的两条腿：STATUS 帧（
@@ -1505,6 +1602,10 @@ pub struct ProxyRuntime {
     /// 本进程 tailnet 文件成功写入/失败尝试的单调代；变更后不再宣称 startupReady。
     tailnet_file_write_epoch: AtomicU64,
     tailnet_file_write_lock: Mutex<()>,
+    /// 网络代次：每处置一次去抖后的网络变化自增一次（见 `network_monitor`）。
+    /// 只读面是 [`Self::network_epoch`]。
+    network_epoch: AtomicU64,
+    coex: Arc<coex_observer::Observer>,
     /// 系统代理 controller + marker 生命周期 + residual 会话门闩的唯一 owner。
     /// 同步 OS 操作的 blocking 隔离与幂等门控全部收敛在 `proxy/system_takeover.rs`。
     system_proxy: SystemProxyTakeover,
@@ -1529,7 +1630,7 @@ pub struct ProxyRuntime {
     /// `AppRuntime::new(config_dir)` 里就得造出来 → 只能「先构造、后接线」（`lib.rs` setup 内
     /// [`set_error_emitter`](Self::set_error_emitter)）。未接线（单测 / setup 前的极早期失败）→
     /// `set_error` 只记日志 + 落状态码，不 panic：**发不出事件绝不能反过来打断错误处理本身**。
-    error_emitter: std::sync::OnceLock<Box<dyn ProxyErrorEmitter>>,
+    error_emitter: std::sync::OnceLock<Arc<dyn ProxyErrorEmitter>>,
     /// A4 登录期出口让位内存态（上游 `bootstrapFallbackEngaged` + `bootstrapFallbackServerId`）。
     ///
     /// engaged=当前 proxy-selector 是否被临时热切到 direct；server_id=让位所服务的选中出口 id（用户中途
@@ -1560,9 +1661,6 @@ pub struct ProxyRuntime {
     /// 不会重来 ⇒ 卡在「出口已恢复但没人去重探」直到下一次真跨态或用户手点。故在飞期间记 pending，
     /// 收尾若仍是 `none` 则补跑一轮。
     ts_exit_recover_pending: AtomicBool,
-    /// C11 DNS race sidecar 的唯一 owner：活 sidecar、config 投影与 DoH transport
-    /// 在子模块内按固定锁序同刻翻转，并共享本 facade 的 lifecycle generation。
-    dns_race: Arc<DnsRaceRuntime>,
     /// C7 系统 DNS 接管控制器（生产装 `production_dns_controller(<userData>/system-dns.marker.json)`）。
     ///
     /// **装配（本机可验）**：在 `new` 里从 `config.dir()` 构造；该字段负责 macOS/Windows，Linux 由
@@ -1574,6 +1672,10 @@ pub struct ProxyRuntime {
     /// **真机门**：真正的 mac `networksetup` 与 Linux helper→`resolvectl` 都触碰宿主 DNS，只能在明确
     /// 授权后真机验证；普通 gate 只跑 mock/只读检查。
     dns_controller: Mutex<polaris_system_integration::ProdDnsController>,
+    #[cfg(test)]
+    test_dns_restore: Mutex<Option<dns_takeover::TestDnsRestore>>,
+    #[cfg(test)]
+    test_restart_after_claim: Mutex<Option<lifecycle::TestRestartAfterClaim>>,
     /// Linux `systemd-resolved` per-link 生命周期；实际 root 写入全部经共享 helper，marker 独立于 macOS
     /// 物理网卡 DNS 快照，避免两种恢复语义互相污染。
     linux_resolved_controller: Mutex<
@@ -1582,10 +1684,34 @@ pub struct ProxyRuntime {
             polaris_system_integration::StdMarkerFs,
         >,
     >,
+    /// Actual ready-core bytes, scoped to the generation which observed them.
+    captured_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    captured_temp_core_sha256: Mutex<Option<String>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_temp_cli_source: Mutex<
+        Option<(
+            core_binary::CoreSelectionObservation,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
+    >,
+    #[cfg(test)]
+    core_binary_resolution_calls: AtomicU32,
+
+    #[cfg(test)]
+    test_measurement_core_sha256: Mutex<Option<(u64, String)>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    captured_cli_run: Mutex<
+        Option<(
+            u64,
+            process_supervision::RunIdentity,
+            crate::runtime::tls_fingerprints::CliObservation,
+        )>,
+    >,
     /// 起核用的核二进制路径覆盖（**仅单测置位**，同 `stale_sweep_disabled` 的先例；生产恒 `None`）。
     ///
     /// 「起核可取消」的门必须有个**真能 spawn 的**假核（起来就死 / 起来但永不就绪），否则退避中断与
-    /// 孤儿收割都测不到。唯一的现成注入点 `POLARIS_SINGBOX_PATH` 是**进程级**的：并发跑的其它单测会
+    /// 孤儿收割都测不到。唯一的现成注入点（开发态的内核路径环境超驰）是**进程级**的：并发跑的其它单测会
     /// 读到它（`runtime::updater` 那条 `core_binary_path().is_none()` 就被这样打红过），等于把测试间
     /// 耦合做成 flaky 源。故改用 per-runtime 覆盖 —— 作用域随实例，绝不外溢到别的测试。
     #[cfg(test)]
@@ -1594,6 +1720,10 @@ pub struct ProxyRuntime {
     #[cfg(test)]
     metadata_validation_admission:
         Mutex<Option<Result<(), polaris_core_supervisor::ValidationLifecycleError>>>,
+    /// 受保护核对账结论的桩（**仅单测置位**；生产没有这个字段）。经替身 helper 起核的用例没有
+    /// 受保护核目录可对账，由测试工厂置成「已确认」；验配套闸本身的用例把它清掉走真对账。
+    #[cfg(test)]
+    selected_core_ready_fixture: Mutex<Option<Result<(), String>>>,
     /// 管理 API PUT 的落点桩（**仅单测置位**，同 `core_binary_override` 的先例；生产恒 `None`）。
     ///
     /// 生产的 PUT 出口是 [`ProxyRuntime::management_api`] → 真 gRPC；单测里核不起、`clash_api_port` 为 0
@@ -1632,23 +1762,6 @@ struct AndroidGlobalCustody {
     stop_inflight: Option<Arc<()>>,
 }
 
-/// 单测用 DoH 桩：**永远 FAIL**。
-///
-/// 单测绝不许碰宿主网络（禁向真实 DoH 上游发查询），故这里不是「假成功」而是「明确失败」——
-/// 竞速层对 FAIL 的处置本身就有覆盖（Tier2 兜底 / 全 FAIL → SERVFAIL），假成功反而会掩盖问题。
-/// 真 DoH 端到端属**真机门**。
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct NoNetworkDoh;
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl DohPost for NoNetworkDoh {
-    async fn post_dns_message(&self, _url: &str, _body: Vec<u8>) -> Result<Vec<u8>, String> {
-        Err("单测桩：不发真实 DoH".into())
-    }
-}
-
 /// `RecordingErrorEmitter` 的解锁失效记录句柄（与 tests 模块的 `UnlockInvalidations` 同型）。
 #[cfg(test)]
 type UnlockInvalidationProbe = Arc<Mutex<Vec<(bool, bool)>>>;
@@ -1666,14 +1779,11 @@ impl ProxyRuntime {
     /// 新建（注入 config / helper / mesh 运行时 + 系统代理清理收口器）。
     ///
     /// `proxy_clearer` 生产传 `production_proxy_controller(...)`（见 `runtime.rs`），测试传 mock。
-    /// `doh` 生产传 `HttpRuntime`（唯一真实 HTTP/TLS 客户端），测试传 stub。
-    /// **二者皆必传**：见各自字段文档（编译期强制接线）。
     pub(crate) fn new(
         config: Arc<ConfigManager>,
         helper: Arc<HelperRuntime>,
         mesh: Arc<MeshRuntime>,
         proxy_clearer: Box<dyn SystemProxyClearer>,
-        doh: Arc<dyn DohPost>,
     ) -> Self {
         let gate = Arc::new(LifecycleGate::default());
         let stop_domain = crate::runtime::config::StopRuntimeDomain::new(Arc::clone(&gate));
@@ -1700,7 +1810,6 @@ impl ProxyRuntime {
                 linux_resolved_marker_path,
             );
         let kernel_gate_cache = load_kernel_gate_cache(&config.dir().join(KERNEL_GATE_CACHE_FILE));
-        let dns_race = Arc::new(DnsRaceRuntime::new(Arc::clone(&gate), doh));
         Self {
             config,
             helper,
@@ -1730,22 +1839,29 @@ impl ProxyRuntime {
             switch_seq: AtomicU64::new(1),
             switch_serial: AsyncMutex::new(()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
+            auto_select: std::sync::Mutex::default(),
+            auto_select_wake: tokio::sync::Notify::new(),
+            auto_select_announced: std::sync::Mutex::default(),
             restart_deferred: AtomicBool::new(false),
             netenv_dhcp_suppressed: AtomicBool::new(false),
             network_canary: Arc::default(),
             crash_recovery: Mutex::new(recovery::CrashRecoveryState::default()),
             diagnostics: Mutex::new(DiagnosticCounters::new()),
             kernel_gate_cache: Mutex::new(kernel_gate_cache),
-            protected_core_cache: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             ready_retry_count: Arc::new(AtomicU32::new(0)),
             stale_sweep_disabled: AtomicBool::new(false),
             helper_upgrade_prompted: AtomicBool::new(false),
             stale_sweep_runs: AtomicUsize::new(0),
             custom_rule_files_degraded: AtomicBool::new(false),
+            rule_content_publication: Mutex::new(None),
+            #[cfg(test)]
+            rule_content_api_stub: Mutex::new(None),
             observed_tailnet: RwLock::new(std::collections::BTreeMap::new()),
             mesh_route_run: RwLock::new(None),
             tailnet_file_write_epoch: AtomicU64::new(0),
+            network_epoch: AtomicU64::new(0),
+            coex: Arc::default(),
             tailnet_file_write_lock: Mutex::new(()),
             system_proxy: SystemProxyTakeover::new(proxy_clearer),
             tunnel_conflicts: RwLock::new(tunnel_conflict::TunnelConflictSnapshot::NotProbed),
@@ -1755,17 +1871,33 @@ impl ProxyRuntime {
             last_ts_exit_block: Mutex::new(None),
             ts_exit_recovering: AtomicBool::new(false),
             ts_exit_recover_pending: AtomicBool::new(false),
-            dns_race,
             dns_controller: Mutex::new(polaris_system_integration::production_dns_controller(
                 dns_marker_path,
             )),
             linux_resolved_controller: Mutex::new(linux_resolved_controller),
+            #[cfg(test)]
+            test_dns_restore: Mutex::new(None),
+            #[cfg(test)]
+            test_restart_after_claim: Mutex::new(None),
             network_watcher: Mutex::new(None),
             runtime_binding_state: Mutex::new(RuntimeBindingState::default()),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_cli_run: Mutex::new(None),
+            #[cfg(test)]
+            test_measurement_core_sha256: Mutex::new(None),
+            captured_core_sha256: Mutex::new(None),
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            captured_temp_core_sha256: Mutex::new(None),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            captured_temp_cli_source: Mutex::new(None),
+            #[cfg(test)]
+            core_binary_resolution_calls: AtomicU32::new(0),
             #[cfg(test)]
             core_binary_override: Mutex::new(None),
             #[cfg(test)]
             metadata_validation_admission: Mutex::new(None),
+            #[cfg(test)]
+            selected_core_ready_fixture: Mutex::new(None),
             #[cfg(test)]
             management_api_stub: Mutex::new(None),
         }
@@ -1797,8 +1929,34 @@ impl ProxyRuntime {
     /// 幂等：已接线则忽略重复接线（`OnceLock::set` 的 Err 腿）——重复接线是编程错误而非运行期状况，
     /// 记 warn 让它可见，但不 panic（不为一个诊断通道搭上 App 启动）。
     pub fn set_error_emitter(&self, emitter: Box<dyn ProxyErrorEmitter>) {
+        let emitter: Arc<dyn ProxyErrorEmitter> = Arc::from(emitter);
+        let coex_emitter = Arc::clone(&emitter);
         if self.error_emitter.set(emitter).is_err() {
             log::warn!("proxy error emitter 重复接线 → 忽略（保留首次）");
+        } else {
+            self.coex
+                .set_sink(Arc::new(move |state| coex_emitter.emit_coex_state(state)));
+        }
+    }
+
+    fn coex_committed_ready(&self, generation: u64) {
+        if self.gate.generation() == generation {
+            self.coex.ready(generation);
+        }
+    }
+    fn coex_network_receipt(&self, generation: u64, token: u64) {
+        self.coex.receipt(generation, token);
+    }
+    pub(crate) fn coex_state(&self) -> Value {
+        self.coex.get()
+    }
+    pub(crate) fn coex_refresh(&self, revision: u64) -> Value {
+        self.coex.manual(revision)
+    }
+    fn commit_coex_current_config(&self, value: Value) {
+        match self.current_config.write() {
+            Ok(mut current) => self.coex.commit_config(&mut current, value),
+            Err(_) => self.coex.config_unavailable(),
         }
     }
 
@@ -1807,6 +1965,109 @@ impl ProxyRuntime {
     /// 返回 `Some` ⟺ 核运行且起核时成功注入了探测池（`probe_pool_ports` 非空）；否则 `None`（测速回退活跃出口）。
     /// 与 `switch_snapshot` 同源（起核就绪置、停核清）→ 池端口与运行核 config 逐槽一致，`id_to_tag` 即
     /// `probe-selector-k` 的成员命名空间（`hasTag(id)` = `id ∈ id_to_tag` = 已入运行核池；新增未重启的节点不在其中）。
+    pub(crate) fn remember_temp_core_sha256(
+        &self,
+        digest: Option<String>,
+        _proof: Option<crate::runtime::tls_fingerprints::CliObservation>,
+    ) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            #[cfg(not(test))]
+            let source = core_binary::verified_selection_observation();
+            #[cfg(test)]
+            let source = self
+                .core_binary_override
+                .lock()
+                .ok()
+                .and_then(|path| path.clone())
+                .map(core_binary::CoreSelectionObservation::fixture);
+            let captured = source.and_then(|source| {
+                let cli = _proof?;
+                (source.is_current()
+                    && cli.matches(source.path())
+                    && digest.is_some()
+                    && cli.snapshot.binary_sha256 == digest)
+                    .then_some((source, cli))
+            });
+            if let Ok(mut slot) = self.captured_temp_cli_source.lock() {
+                *slot = captured;
+            }
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        if let Ok(mut value) = self.captured_temp_core_sha256.lock() {
+            *value = digest;
+        }
+    }
+
+    pub(crate) fn measurement_core_sha256(&self) -> Option<String> {
+        let status = self.status();
+        #[cfg(test)]
+        if status.running {
+            if let Some((generation, digest)) =
+                self.test_measurement_core_sha256.lock().ok()?.as_ref()
+            {
+                if *generation == self.core_generation() {
+                    return Some(digest.clone());
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            if status.running {
+                // Direct Windows/Mac use the actual retained Child identity and
+                // the file proof bracketed around that Child's synchronous birth.
+                if !self
+                    .core_via_helper
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return self
+                        .direct_tls_snapshot(self.core_generation())
+                        .binary_sha256;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let image = std::path::PathBuf::from(format!("/proc/{}/exe", status.pid));
+                    let cached = crate::runtime::tls_fingerprints::cached_cli(&image)?;
+                    return cached.snapshot.binary_sha256;
+                }
+                #[cfg(not(target_os = "linux"))]
+                return None; // A helper-reported pathname alone cannot identify loaded bytes.
+            }
+            let observed = self.captured_temp_cli_source.lock().ok()?;
+            let (source, cli) = observed.as_ref()?;
+            #[cfg(test)]
+            if self.core_binary_override.lock().ok()?.as_deref() != Some(source.path()) {
+                return None;
+            }
+            // Metadata/handle checks only. Launch and acquisition still go through
+            // the original resolver's full installation content verification.
+            (source.is_current() && cli.matches(source.path()))
+                .then(|| cli.snapshot.binary_sha256.clone())
+                .flatten()
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            if !status.running {
+                return self.captured_temp_core_sha256.lock().ok()?.clone();
+            }
+            let captured = self.captured_core_sha256.lock().ok()?;
+            let (generation, digest) = captured.as_ref()?;
+            (*generation == self.core_generation()).then(|| digest.clone())
+        }
+    }
+
+    pub(crate) fn speed_measurement_fingerprints(&self) -> BTreeMap<String, String> {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|snapshot| snapshot.measurement_fingerprints.clone())
+            })
+            .unwrap_or_default()
+    }
+
     pub fn speed_probe_targets(&self) -> Option<SpeedProbeTargets> {
         if !self.status().running {
             return None;
@@ -1824,6 +2085,37 @@ impl ProxyRuntime {
             // modified），与测速「新」一侧的 5 维公式不同 ⇒ 恒不等 ⇒ 全员恒 dirty、整个波前恒被免测。
             fingerprints: snap.dirty_fingerprints,
         })
+    }
+
+    /// 测速 `binding` 块的静态取材。核未运行或没有快照 → 空。
+    #[must_use]
+    pub fn speed_binding_context(&self) -> SpeedBindingContext {
+        self.switch_snapshot
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|snap| SpeedBindingContext {
+                    endpoint_tags: snap.endpoint_tags.clone(),
+                    static_detours: snap.static_detours.clone(),
+                    rule_names: snap
+                        .named_rule_by_raw
+                        .iter()
+                        .map(|(raw, rule)| (raw.clone(), rule.name.clone()))
+                        .collect(),
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// 当前网络代次。`None` = **未知**（不是「未变」）。
+    ///
+    /// 只有起了通用网络变化 watcher 的平台才有来源；Android / iOS 的网络变化由原生侧直接喂给进程内
+    /// libbox、没有推到 Rust 的腿，故恒为 `None`。测速侧用它判「一次测量有没有跨过网络变化」；
+    /// 让本函数恒返 `None` 即关掉那条判据。
+    #[must_use]
+    pub fn network_epoch(&self) -> Option<u64> {
+        cfg!(any(target_os = "macos", target_os = "linux", windows))
+            .then(|| self.network_epoch.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// 运行核回环探针/更新入站的一次性凭据（Android：本次起核生成；桌面 / 未运行：`None`）。
@@ -1903,4 +2195,10 @@ impl ProxyRuntime {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(target_os = "android")]
+pub(crate) async fn temp_tls_fingerprint_capabilities() -> crate::runtime::tls_fingerprints::Snapshot
+{
+    android_bridge::tls_fingerprint_capabilities().await
+}

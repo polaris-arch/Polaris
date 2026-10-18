@@ -268,7 +268,8 @@ pub fn build_mesh_dns_overlay(
         .iter()
         .enumerate()
         .filter_map(|(index, rule)| {
-            (rule.server.as_deref() == Some("dns-mdns")
+            (rule.resolver_policy.is_none()
+                && rule.server.as_deref() == Some("dns-mdns")
                 && rule
                     .domain_suffix
                     .as_ref()
@@ -280,8 +281,9 @@ pub fn build_mesh_dns_overlay(
         .iter()
         .enumerate()
         .filter_map(|(index, rule)| {
-            ((rule.server.as_deref() == Some("dns-lan")
-                || rule.action.as_deref() == Some("predefined"))
+            (rule.resolver_policy.is_none()
+                && (rule.server.as_deref() == Some("dns-lan")
+                    || rule.action.as_deref() == Some("predefined"))
                 && rule
                     .domain_regex
                     .as_ref()
@@ -351,7 +353,11 @@ pub fn build_mesh_dns_overlay(
         );
         overlay_rules.push(rule);
     }
+    let mut node_protections = vec![rules[mdns_positions[0]].clone()];
+    node_protections.extend(overlay_rules.iter().cloned());
+    node_protections.push(rules[short_positions[0]].clone());
     rules.splice(short_positions[0]..short_positions[0], overlay_rules);
+    crate::node_dns::replace_protections(&mut dns, &node_protections);
 
     Ok(MeshDnsBuild {
         dns,

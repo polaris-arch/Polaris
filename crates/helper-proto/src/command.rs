@@ -19,6 +19,10 @@ pub mod common {
     pub const PING: &str = "ping";
     /// `OK <ver>`（mac/win/linux，纯协议版本查询）。
     pub const VERSION: &str = "version";
+    pub const CORE_STATUS: &str = "core-status";
+    pub const PREPARE_HELPER_UPGRADE: &str = "prepare-helper-upgrade";
+    pub const CANCEL_HELPER_UPGRADE: &str = "cancel-helper-upgrade";
+    pub const NATIVE_START_PINNED_BIRTH: &str = "start-native-pinned-birth-safe";
     /// `OK started <pid>` / `OK already <pid>` / `ERR ...`（启核，参数最多）。
     pub const START: &str = "start";
     /// `OK stopped <pid>` / `OK notrunning`（停核，TERM→等→KILL 后台收割）。
@@ -67,6 +71,8 @@ pub mod mac {
 
 /// Windows 专属命令（移植自 `helper-win/helper.go`）。
 pub mod win {
+    /// Native DNS API only. Old helpers reject instead of entering their ipconfig leg.
+    pub const FLUSH_DNS_NATIVE: &str = "flush-dns-native";
     /// `OK uninstalling`（自卸载：收割 child → 派生 SYSTEM 旁路停删 SCM 服务 + 删 supportDir 含 helper.exe 自身；
     /// 零 UAC 主路径，`helper-win/helper.go:276-294`）。
     pub const UNINSTALL: &str = "uninstall";
@@ -80,6 +86,7 @@ pub mod win {
 
 /// Linux 专属命令（移植自 `helper-linux/helper.go`）。
 pub mod linux {
+    pub const START_PINNED_BIRTH: &str = "start-pinned-birth-safe";
     /// Exact helper-owned birth admission. Old helpers reject before spawning.
     pub const START_BIRTH_SAFE: &str = "start-birth-safe";
     /// Read the exact helper-owned birth, including its opaque birth token.

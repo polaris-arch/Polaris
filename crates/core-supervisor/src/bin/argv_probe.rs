@@ -14,6 +14,8 @@
 //! | `--pwd` | 打印当前工作目录 | `working_dir` 接线 |
 //! | `--sleep` | 常驻 30s | pid 可读 + 进程可被 kill |
 //! | `--flood-stderr[:<字节数>]` | 往 stderr 灌指定字节（默认 1 MiB）后退出 0 | `StdioPolicy` 真的把管道排空了 |
+//! | `--spawn-enrolled` | 起一个 `--sleep` 的自己并纳入本进程的作业对象，打印其 pid，常驻 30s | 冒充主程序：它被强杀后，作业里的子进程随之结束（仅 Windows 有作业对象；别处等同下一条） |
+//! | `--spawn-plain` | 起一个 `--sleep` 的自己（不纳入），打印其 pid，常驻 30s | 上一条的反向对照：没纳入的子进程照常活着 |
 //! | 其余 | 把 `argv[1..]` 空格连接打回 stdout | argv 完整传递（含 `run` 子命令） |
 //!
 //! `--flood-stderr` 是 stdio 收口那道进程级门的被测对象：字节数远大于任何平台的管道容量
@@ -25,7 +27,11 @@ const DEFAULT_FLOOD_BYTES: usize = 1024 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--pwd") {
+    if args.iter().any(|a| a == "--spawn-enrolled") {
+        act_as_parent(true);
+    } else if args.iter().any(|a| a == "--spawn-plain") {
+        act_as_parent(false);
+    } else if args.iter().any(|a| a == "--pwd") {
         println!(
             "{}",
             std::env::current_dir().expect("读当前工作目录").display()
@@ -41,6 +47,35 @@ fn main() {
     } else {
         println!("{}", args.join(" "));
     }
+}
+
+/// 冒充主程序：起一个 `--sleep` 的自己，把它的 pid 打到 stdout，然后常驻等着被杀。
+///
+/// `enroll` 为真时把子进程交给生产的纳入函数（`TokioSpawner` 起核后调的就是它）。两条腿只差这
+/// 一处，测试据此分辨「子进程的去留取决于它在不在本进程的作业里」。
+fn act_as_parent(enroll: bool) {
+    let me = std::env::current_exe().expect("读自身路径");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("建 tokio runtime");
+    let _guard = runtime.enter();
+    // 子进程句柄留到本函数结束：不 wait、不 kill，本进程被杀时它是否跟着走正是被测对象。
+    let child = tokio::process::Command::new(&me)
+        .arg("--sleep")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("起子进程");
+    #[cfg(windows)]
+    if enroll {
+        polaris_core_supervisor::job_object::enroll_child(&child).expect("纳入本进程的作业");
+    }
+    #[cfg(not(windows))]
+    let _ = enroll;
+    println!("{}", child.id().expect("子进程 pid"));
+    std::thread::sleep(std::time::Duration::from_secs(30));
 }
 
 /// 往 stderr 灌 `total` 字节（逐行 1 KiB，与真核「每连接若干行」的产出形态同构）后正常退出。

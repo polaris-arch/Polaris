@@ -3,6 +3,7 @@
 //! 增量移植中（按 B1 计划）。每个 builder 纯函数 + 依赖注入（路径/实例态经参数传入，
 //! 不硬编码 → 金样对拍可注入固定假路径）。
 
+pub mod coexistence;
 pub mod custom_rule_files;
 pub mod custom_rules;
 pub mod dns;

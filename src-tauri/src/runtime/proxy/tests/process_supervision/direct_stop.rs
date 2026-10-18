@@ -1246,7 +1246,6 @@ async fn shared_helper_marks_all_registered_runtime_slots() {
         Box::new(RecordingClearer {
             calls: Arc::new(AtomicUsize::new(0)),
         }),
-        Arc::new(NoNetworkDoh),
     ));
     let prepared = prepare_direct_stop(&first, &identity).await.unwrap();
     second.register_helper_backend().unwrap();
@@ -1265,7 +1264,6 @@ async fn shared_helper_marks_all_registered_runtime_slots() {
         Box::new(RecordingClearer {
             calls: Arc::new(AtomicUsize::new(0)),
         }),
-        Arc::new(NoNetworkDoh),
     ));
     let run = DirectCoreRun::new(spawn_custody_stand_in());
     let identity = run.identity.clone();
@@ -1478,7 +1476,6 @@ fn helper_registry_prunes_dead_child_slots_during_runtime_churn() {
             Box::new(RecordingClearer {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
-            Arc::new(NoNetworkDoh),
         );
         assert!(helper.core_fence_count_for_test() <= 2);
         drop(temporary);
@@ -1514,6 +1511,50 @@ async fn already_exited_child_reaps_without_a_kill_request() {
         observation.wait_for(Duration::from_secs(5)).await,
         StopWaitOutcome::Reaped
     );
+    assert_eq!(signals.load(Ordering::SeqCst), 0);
+    assert!(rt.child.lock().unwrap().is_reaped_for_test());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_worker_rechecks_terminal_custody_after_stale_view() {
+    let (rt, _dir) = test_runtime();
+    let mut child = spawn_custody_stand_in();
+    child.kill().await.expect("exit before exact stop");
+    let run = DirectCoreRun::new(child);
+    let identity = run.identity.clone();
+    rt.child.lock().unwrap().install_running_for_test(run);
+    let (io, signals) = ScriptedIo::new(Fault::None);
+    let prepared = prepare_with_io_for_test(
+        &rt,
+        &identity,
+        io,
+        Duration::from_millis(10),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap();
+    let observation = {
+        let mut slot = rt.child.lock().unwrap();
+        commit_for_test(&mut slot, &identity, prepared).unwrap()
+    };
+    wait_view(&observation, StopView::Reaped).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while observation.worker_alive() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed worker must publish its exit");
+    // Deterministically replay the observer interleaving: its first view was
+    // Armed/KillRequested, but the worker reaped and exited before the alive load.
+    for stale_view in [StopView::Armed, StopView::KillRequested] {
+        assert_eq!(
+            observation.wait_outcome_for_view(stale_view),
+            Some(StopWaitOutcome::Reaped),
+            "a stale pre-terminal view must not erase the exact reap proof"
+        );
+    }
     assert_eq!(signals.load(Ordering::SeqCst), 0);
     assert!(rt.child.lock().unwrap().is_reaped_for_test());
 }

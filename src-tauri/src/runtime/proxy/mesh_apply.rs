@@ -12,6 +12,11 @@ mod file_snapshot;
 pub(crate) mod materialize;
 pub(in crate::runtime::proxy) mod owner_proof;
 pub(crate) mod owner_scope;
+#[allow(
+    dead_code,
+    reason = "F1 membership is consumed by the later managed coordinator"
+)]
+pub(crate) mod pc_owner_census;
 pub(crate) mod preflight;
 // Managed opt-in is off; the birth permit intentionally has no producer yet.
 #[allow(dead_code)]

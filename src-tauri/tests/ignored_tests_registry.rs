@@ -14,7 +14,7 @@
 //!    改名/删了，条目成了下一个真违规的免死金牌）；源码里有而表里没有 = 新增未登记。
 //! 3. **类别受控**（[`Class`]），且**理由串必须与类别自洽**（见 [`Class::reason_must_mention`]）
 //!    —— 否则类别只是装饰，随手写个理由就能把测试塞进任意类别。
-//! 4. **跑法必须指得到真文档**：`docs/ignored-tests.md` 必须存在，且**逐个测试名**在里面能找到
+//! 4. **跑法必须指得到真文档**：`src-tauri/tests/ignored-tests.md` 必须存在，且**逐个测试名**在里面能找到
 //!    对应的执行段落。这治的是本门建立时发现的那个硬伤 —— 全仓 `grep -- --ignored` 零命中、
 //!    `POLARIS_SINGBOX_PATH` 零命中：12 条真核测试写好了、编得过、**一次都没被执行过**。
 //!
@@ -49,12 +49,15 @@ enum Class {
     LiveHostState,
     /// 根本不是测试，是打印工具。用 `#[ignore]` 只为不进默认门。
     NotAGate,
-    /// 需要 root 的隔离私有文件系统门；只写临时目录，不操作真实 claims 或网络。
-    /// 与 LiveHostState 不同：权限是真实前提，被测布局始终由夹具拥有。
-    PrivilegedPrivateFs,
     /// 被父测试以精确过滤器起出的私有子测试进程，不是可独立验收的门。
     /// 与 NotAGate 打印工具不同：它是父门负责输入、身份与收尾的执行夹具。
     PrivateChildFixture,
+    /// Native NTFS protocol interoperability with a separately built, pinned Go producer.
+    /// This is not a generic sing-box lifecycle test or an ordinary host-state probe.
+    NativeWindowsInterop,
+    /// Cross-identity interoperability creates an explicitly approved, one-shot SYSTEM task.
+    /// The privileged runner and its cleanup must own execution; ordinary tests cannot.
+    PrivilegedWindowsInterop,
 }
 
 impl Class {
@@ -68,8 +71,9 @@ impl Class {
             Class::PublicNetwork => &["公网"],
             Class::LiveHostState => &["route", "proxy"],
             Class::NotAGate => &["非门"],
-            Class::PrivilegedPrivateFs => &["root-only"],
-            Class::PrivateChildFixture => &["private child fixture", "isolated root peer UID gate"],
+            Class::PrivateChildFixture => &["private child fixture"],
+            Class::NativeWindowsInterop => &["pinned real Go test producer"],
+            Class::PrivilegedWindowsInterop => &["explicit one-shot SYSTEM task runner"],
         }
     }
 
@@ -79,8 +83,9 @@ impl Class {
             Class::PublicNetwork => "PublicNetwork",
             Class::LiveHostState => "LiveHostState",
             Class::NotAGate => "NotAGate",
-            Class::PrivilegedPrivateFs => "PrivilegedPrivateFs",
             Class::PrivateChildFixture => "PrivateChildFixture",
+            Class::NativeWindowsInterop => "NativeWindowsInterop",
+            Class::PrivilegedWindowsInterop => "PrivilegedWindowsInterop",
         }
     }
 }
@@ -167,6 +172,11 @@ const REGISTRY: &[Entry] = &[
     },
     // ── LiveHostState ──
     Entry {
+        file: "crates/helper/src/platform/windows/wintun/win_impl/tests/enumeration.rs",
+        test: "live_existing_polaris_adapter_is_visible",
+        class: Class::LiveHostState,
+    },
+    Entry {
         file: "src-tauri/src/runtime/route_binding/tests/mod.rs",
         test: "live_route_planner_returns_a_real_interface",
         class: Class::LiveHostState,
@@ -192,7 +202,7 @@ const REGISTRY: &[Entry] = &[
         test: "inventory",
         class: Class::NotAGate,
     },
-    // 新增私有 root/子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
+    // 新增私有子进程夹具与原生 gRPC 契约；每条单独登记，绝不按路径豁免。
     Entry {
         file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
         test: "no_network_fixture",
@@ -204,84 +214,35 @@ const REGISTRY: &[Entry] = &[
         class: Class::PrivateChildFixture,
     },
     Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_provision_publishes_exact_v2_without_rewriting_existing_claims",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_old_private_or_partial_layout_is_never_repaired",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_concurrent_initializers_only_accept_the_completed_layout",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_existing_wrong_base_modes_and_owner_are_refused",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_symlink_and_untrusted_parent_are_refused",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_marker_bytes_links_mode_owner_and_allocator_size_are_strict",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_marker_and_allocator_replacements_do_not_rebind_old_fds",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_base_and_parent_replacements_are_detected",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_symlink_and_fifo_marker_never_block_or_publish",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_publication_sync_errors_survive_statically_valid_reopen",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_successful_handoff_keeps_the_original_deployment_fds",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_fresh_held_base_replacement_with_moved_files_is_not_published",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "root_peer_uids_with_original_ambient_caps_share_the_sticky_store",
-        class: Class::PrivilegedPrivateFs,
-    },
-    Entry {
-        file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
-        test: "uid_worker",
-        class: Class::PrivateChildFixture,
-    },
-    Entry {
         file: "crates/singbox-grpc/tests/native_clash_mode.rs",
         test: "native_core_lists_and_switches_the_two_compiled_modes",
         class: Class::RealCore,
     },
+    // Existing native interop tests remain explicit, pinned-artifact opt-ins.
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_writer_retirement_and_stale_intent",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_crash_reopen_and_revocation",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_replaced_identity_is_retained",
+        class: Class::NativeWindowsInterop,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/windows_directory/tests/mod.rs",
+        test: "interop_system_producer_user_consumer",
+        class: Class::PrivilegedWindowsInterop,
+    },
 ];
 
 /// 跑法文档。本门断言它存在，且每个登记的测试名都能在里面找到。
-const RUNBOOK: &str = "docs/ignored-tests.md";
+const RUNBOOK: &str = "src-tauri/tests/ignored-tests.md";
 
 // ============================================================================
 // 扫描
@@ -559,8 +520,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        35,
-        "默认不跑的测试数从 35 变成了 {} —— 这不是自动放行的事：\
+        26,
+        "默认不跑的测试数从 26 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );
@@ -611,7 +572,6 @@ fn class_matches_the_stated_reason() {
         Class::PublicNetwork,
         Class::LiveHostState,
         Class::NotAGate,
-        Class::PrivilegedPrivateFs,
         Class::PrivateChildFixture,
     ] {
         assert!(
@@ -629,7 +589,7 @@ fn class_matches_the_stated_reason() {
 /// 12 条真核测试写好了、编得过、**一次都没被执行过**。`#[ignore]` 的形态没错（它不冒充通过），
 /// 错的是没有任何地方写着「谁在什么条件下跑它」。这条把那份说明钉成必需品。
 ///
-/// **变异探针**：删掉 `docs/ignored-tests.md` 里任一测试名 ⇒ 本条转红并点名它。
+/// **变异探针**：删掉 `src-tauri/tests/ignored-tests.md` 里任一测试名 ⇒ 本条转红并点名它。
 #[test]
 fn runbook_covers_every_registered_test() {
     let root = workspace_root();

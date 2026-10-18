@@ -459,6 +459,79 @@ fn open_socks_flow(proxy: SocketAddr, host: &str) -> Result<SocksFlow, String> {
     })
 }
 
+fn open_socks_flow_diagnosed(
+    proxy: SocketAddr,
+    host: &str,
+    diagnostics: impl FnOnce() -> String,
+) -> SocksFlow {
+    let started = Instant::now();
+    open_socks_flow(proxy, host).unwrap_or_else(|error| {
+        panic!(
+            "{host} SOCKS CONNECT failed before application payload: {error}; \
+             elapsed={:?}; {}",
+            started.elapsed(),
+            diagnostics(),
+        )
+    })
+}
+
+#[test]
+fn connect_failure_preserves_reply_error_and_lazy_diagnostics() {
+    for reply_available in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            stream.write_all(&[5, 0]).unwrap();
+            let mut request = [0; 5];
+            stream.read_exact(&mut request).unwrap();
+            let mut target = vec![0; request[4] as usize + 2];
+            stream.read_exact(&mut target).unwrap();
+            if reply_available {
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                    .unwrap();
+            }
+            // Closing before a reply reproduces the early read-error path without
+            // running a core, retrying or changing the original two-second deadline.
+        });
+        let diagnosed = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            open_socks_flow_diagnosed(addr, "same-owner.test", || {
+                diagnosed.set(true);
+                "dns-queries=fixture-dns; a-events=fixture-a; b-events=fixture-b; \
+                 wire-route=fixture-route; core-route-logs=fixture-core"
+                    .into()
+            })
+        }));
+        server.join().unwrap();
+        assert_eq!(diagnosed.get(), !reply_available);
+        if reply_available {
+            assert_eq!(result.ok().unwrap().status, 0);
+        } else {
+            let panic = result.err().unwrap().downcast::<String>().unwrap();
+            for required in [
+                "same-owner.test",
+                "reply header read:",
+                "before application payload",
+                "elapsed=",
+                "fixture-dns",
+                "fixture-a",
+                "fixture-b",
+                "fixture-route",
+                "fixture-core",
+            ] {
+                assert!(panic.contains(required), "missing {required}: {panic}");
+            }
+        }
+    }
+}
+
 fn drive_sniff(flow: &mut SocksFlow, host: &str) -> Result<(), String> {
     if flow.status != 0 {
         return Err(format!("SOCKS reply rejected with status {}", flow.status));
@@ -1001,7 +1074,23 @@ fn b609_connect_observes_managed_multi_answer_guards() {
     wait_listening(inbound);
 
     observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
-    let mut same_owner = open_socks_flow(inbound, "same-owner.test").unwrap();
+    // Collect existing failure evidence even if the SOCKS reply fails before
+    // drive_sniff and the later route assertions. Successful flows do not drain it.
+    let open_flow = |name: &str| {
+        open_socks_flow_diagnosed(inbound, name, || {
+            format!(
+                "observer-a={:?}; observer-b={:?}; dns-queries={:?}; \
+                 a-events={:?}; b-events={:?}; wire-route={routes}; core-route-logs={:?}",
+                a_rx.try_iter().collect::<Vec<_>>(),
+                b_rx.try_iter().collect::<Vec<_>>(),
+                dns_rx.try_iter().collect::<Vec<_>>(),
+                a_events.try_iter().collect::<Vec<_>>(),
+                b_events.try_iter().collect::<Vec<_>>(),
+                core_route_logs(&log_path),
+            )
+        })
+    };
+    let mut same_owner = open_flow("same-owner.test");
     let reply = same_owner.status;
     let probe = drive_sniff(&mut same_owner, "same-owner.test");
     let observed_a = a_rx.recv_timeout(Duration::from_secs(2));
@@ -1049,7 +1138,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         "ipv6-cross.test",
     ] {
         observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
-        let mut flow = open_socks_flow(inbound, name).unwrap();
+        let mut flow = open_flow(name);
         if flow.status == 0 {
             drive_sniff(&mut flow, name).unwrap();
         }
@@ -1078,7 +1167,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
     }
     for name in ["override-atoms.test", "override-domain.test"] {
         observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
-        let mut flow = open_socks_flow(inbound, name).unwrap();
+        let mut flow = open_flow(name);
         assert_eq!(flow.status, 0, "{name} must keep its valid override");
         drive_sniff(&mut flow, name).unwrap();
         let target = b_rx
@@ -1120,7 +1209,7 @@ fn b609_connect_observes_managed_multi_answer_guards() {
         drop(flow);
     }
     observers_quiet(&a_rx, &b_rx, &a_events, &b_events, Duration::ZERO).unwrap();
-    let mut ipv6_owner = open_socks_flow(inbound, "ipv6-owner.test").unwrap();
+    let mut ipv6_owner = open_flow("ipv6-owner.test");
     assert_eq!(ipv6_owner.status, 0);
     drive_sniff(&mut ipv6_owner, "ipv6-owner.test").unwrap();
     let ipv6_target = a_rx

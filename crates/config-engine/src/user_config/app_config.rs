@@ -119,6 +119,13 @@ pub struct UserConfig {
     #[serde(rename = "tlsFragment", skip_serializing_if = "Option::is_none")]
     pub tls_fragment: Option<bool>,
     #[serde(
+        rename = "utlsPolicy",
+        default,
+        deserialize_with = "crate::user_config::normalize::de_opt_token",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub utls_policy: Option<String>,
+    #[serde(
         rename = "interruptConnectionsOnSwitch",
         skip_serializing_if = "Option::is_none"
     )]
@@ -242,6 +249,7 @@ impl Default for UserConfig {
             dns_config: None,
             rule_resources: Vec::new(),
             tls_fragment: None,
+            utls_policy: None,
             interrupt_connections_on_switch: None,
             resolve_before_dial: None,
             region_routing: None,
@@ -360,6 +368,7 @@ impl UserConfig {
         "dnsConfig",
         "ruleResources",
         "tlsFragment",
+        "utlsPolicy",
         "interruptConnectionsOnSwitch",
         "resolveBeforeDial",
         "regionRouting",

@@ -31,12 +31,36 @@ pub fn read_line_trimmed_bounded<R: BufRead>(
     buf: &mut R,
     limit: usize,
 ) -> Result<Option<String>, BoundedLineError> {
+    read_line_bounded(buf, limit, false)
+}
+
+/// Read a bounded, newline-terminated protocol line. A partial line at EOF is an
+/// error, while EOF before any bytes is `None`. The limit counts bytes before LF,
+/// including the optional CR; no caller may dispatch a truncated command.
+pub fn read_line_terminated_bounded<R: BufRead>(
+    buf: &mut R,
+    limit: usize,
+) -> Result<Option<String>, BoundedLineError> {
+    read_line_bounded(buf, limit, true)
+}
+
+fn read_line_bounded<R: BufRead>(
+    buf: &mut R,
+    limit: usize,
+    require_terminator: bool,
+) -> Result<Option<String>, BoundedLineError> {
     let mut line = Vec::with_capacity(limit.min(8 * 1024));
     loop {
         let available = buf.fill_buf().map_err(BoundedLineError::Io)?;
         if available.is_empty() {
             if line.is_empty() {
                 return Ok(None);
+            }
+            if require_terminator {
+                return Err(BoundedLineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "protocol line is missing its newline",
+                )));
             }
             break;
         }
@@ -73,8 +97,8 @@ pub fn read_line_trimmed_bounded<R: BufRead>(
 ///   空行（仅 `\n`）返回 `Some("")`，与 EOF 的 `None` **可区分**（Go 源同样区分：
 ///   EOF 时 `ReadString` 带 err，空行不带）。
 ///
-/// 需要「EOF 与空行都当空串」的调用方（linux `Conn::read_line` 的契约）用
-/// `read_line_trimmed(..).unwrap_or_default()`。
+/// Legacy callers may collapse EOF and an empty line with `unwrap_or_default()`.
+/// Socket protocol entry points must use the bounded readers above instead.
 #[must_use]
 pub fn read_line_trimmed<R: BufRead>(buf: &mut R) -> Option<String> {
     let mut line = String::new();
@@ -93,6 +117,51 @@ pub fn write_line<W: Write>(w: &mut W, line: &str) -> std::io::Result<()> {
     w.write_all(line.as_bytes())?;
     w.write_all(b"\n")?;
     w.flush()
+}
+
+/// One absolute Unix request budget, shared across all protocol lines.
+/// SO_RCVTIMEO alone restarts its budget after each successful read.
+/// Only the Linux/macOS servers consume this adapter in production. Keep it
+/// available to Unix regression tests without compiling unused mobile-lib code.
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+pub(crate) struct DeadlineStream {
+    stream: std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl DeadlineStream {
+    pub(crate) fn new(stream: std::os::unix::net::UnixStream, budget: std::time::Duration) -> Self {
+        Self {
+            stream,
+            deadline: std::time::Instant::now() + budget,
+        }
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl std::io::Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        let result = std::io::Read::read(&mut self.stream, bytes);
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        result
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+impl Write for DeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 #[cfg(test)]

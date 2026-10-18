@@ -159,8 +159,8 @@ impl FakeAutostart {
     }
 }
 impl AutostartOps for FakeAutostart {
-    fn is_enabled(&self) -> bool {
-        self.enabled
+    fn is_enabled(&self) -> Result<bool, String> {
+        Ok(self.enabled)
     }
     fn disable(&self) -> Result<(), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1036,4 +1036,55 @@ fn report_serializes_the_frontend_contract() {
     assert_eq!(steps[6]["step"], "appBundle");
     assert_eq!(steps[6]["outcome"]["kind"], "unsupported");
     assert_eq!(steps[6]["outcome"]["detail"], "便携版");
+}
+
+#[test]
+fn missing_windows_service_still_enters_fixed_native_cleanup() {
+    let helper = FakeHelper {
+        installed: false,
+        ..FakeHelper::ready()
+    };
+    let autostart = FakeAutostart::off();
+    let ops = SystemUninstallOps {
+        helper: &helper,
+        autostart: &autostart,
+        os: "windows",
+        config_dir: PathBuf::from("/unused/polaris"),
+        cache_updates_dir: None,
+        bundle_identifier: "com.polaris.app".to_owned(),
+        exe: None,
+        appimage: None,
+    };
+    assert!(matches!(ops.uninstall_helper(), StepOutcome::Done { .. }));
+    assert_eq!(helper.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unknown_autostart_blocks_all_destructive_steps() {
+    struct Unknown;
+    impl AutostartOps for Unknown {
+        fn is_enabled(&self) -> Result<bool, String> {
+            Err("query denied".into())
+        }
+        fn disable(&self) -> Result<(), String> {
+            panic!("unknown is not enabled")
+        }
+    }
+    let scratch = Scratch::new("unknown-autostart");
+    let dir = fake_config_dir(scratch.path());
+    let helper = FakeHelper::ready();
+    let ops = SystemUninstallOps {
+        helper: &helper,
+        autostart: &Unknown,
+        os: "linux",
+        config_dir: dir.clone(),
+        cache_updates_dir: None,
+        bundle_identifier: "com.polaris.app".into(),
+        exe: None,
+        appimage: None,
+    };
+    let report = run_uninstall(&ops, StepOutcome::done("already stopped"));
+    assert!(outcome_of(&report, UninstallStep::Autostart).is_failure());
+    assert!(dir.exists());
+    assert_eq!(helper.calls.load(Ordering::SeqCst), 0);
 }

@@ -30,18 +30,10 @@ fn local_only_config(mixed: u16) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
+#[ignore = "显式真核验证：candidate CI 走编译载体；手动模式需 POLARIS_SINGBOX_PATH"]
 async fn real_core_aggregate_relay_emits_real_frames() {
     let _real_core_guard = crate::runtime::REAL_CORE_TEST_LOCK.lock().await;
-    let core =
-        std::path::PathBuf::from(std::env::var("POLARIS_SINGBOX_PATH").expect(
-            "真机验证需 POLARIS_SINGBOX_PATH 指向真实 sing-box（前置缺失即失败，不静默跳过）",
-        ));
-    assert!(
-        core.is_file(),
-        "POLARIS_SINGBOX_PATH 必须指向真实文件，实得 {}",
-        core.display()
-    );
+    let core = crate::runtime::proxy::tests::require_core();
 
     let dir = std::env::temp_dir().join(format!(
         "polaris-agg-test-{}",
@@ -67,9 +59,10 @@ async fn real_core_aggregate_relay_emits_real_frames() {
         mesh,
         proxy_clearer,
         // C11：真机验证用不到 DoH 竞速（本地 direct config，无节点域名）→ 桩即可。
-        Arc::new(crate::runtime::proxy::NoNetworkDoh),
     ));
     proxy.inject_real_core_for_test(core);
+    let _cleanup =
+        crate::runtime::proxy::tests::real_core_cleanup::RealCoreCleanupGuard::new(&proxy);
 
     let mixed = free_port();
 

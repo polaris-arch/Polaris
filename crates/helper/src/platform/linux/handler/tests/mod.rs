@@ -7,6 +7,7 @@ use crate::platform::linux::state::{
     BirthAdmission, CoreHandle, CoreSpawner, ManagedChild, ReapBlockerState, SpawnedCore,
     StartAdmission, StopReap,
 };
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tempfile::tempdir;
 
@@ -30,6 +31,9 @@ impl MockConn {
 }
 
 impl Conn for MockConn {
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+        self.read_line_strict()
+    }
     fn read_line(&mut self) -> String {
         self.reads.lock().unwrap().pop_front().unwrap_or_default()
     }
@@ -45,8 +49,6 @@ impl Conn for MockConn {
 // ===== Mock Spawner =====
 
 struct MockSpawner {
-    provision_gate: Option<Arc<crate::platform::linux::server::ConnServer>>,
-    deployment_error: bool,
     next_pid: u32,
     fail: bool,
     spawn_calls: StdMutex<Vec<SpawnCoreRequest>>,
@@ -63,8 +65,6 @@ struct MockSpawner {
 impl MockSpawner {
     fn succeeding(start_pid: u32) -> Self {
         Self {
-            provision_gate: None,
-            deployment_error: false,
             next_pid: start_pid,
             fail: false,
             spawn_calls: StdMutex::new(Vec::new()),
@@ -81,17 +81,14 @@ impl MockSpawner {
 }
 
 impl CoreSpawner for MockSpawner {
-    fn validate_start_environment(&self) -> Result<(), SpawnError> {
-        if let Some(gate) = &self.provision_gate {
-            return gate.validate_start_environment_for_test();
-        }
-        if self.deployment_error {
-            Err(SpawnError::Spawn {
-                detail: "claims deployment unavailable".into(),
-            })
-        } else {
-            Ok(())
-        }
+    fn spawn_pinned(
+        &self,
+        req: &SpawnCoreRequest,
+        core: Arc<crate::core_store::VerifiedCore>,
+    ) -> Result<SpawnedCore, SpawnError> {
+        let mut spawned = self.spawn(req)?;
+        spawned.handle = spawned.handle.with_core(core, req.uid);
+        Ok(spawned)
     }
     fn start_admission(&self, current_running: Option<&CoreHandle>) -> StartAdmission {
         self.start_admission.lock().unwrap().unwrap_or_else(|| {
@@ -219,6 +216,7 @@ static NOOP_RESOLVED_DNS: NoopResolvedDns = NoopResolvedDns;
 struct MockResolvedDns {
     calls: StdMutex<Vec<Vec<String>>>,
     error: Option<String>,
+    revert_error: Option<String>,
 }
 
 impl ResolvedDnsOps for MockResolvedDns {
@@ -236,7 +234,7 @@ impl ResolvedDnsOps for MockResolvedDns {
             .lock()
             .unwrap()
             .push(vec!["revert".into(), interface_name.into()]);
-        self.error.clone().map_or(Ok(()), Err)
+        self.revert_error.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -279,6 +277,7 @@ fn make_deps_with_resolved<'a, PE: PeerCredProvider>(
     resolved_dns: &'a dyn ResolvedDnsOps,
 ) -> HandlerDeps<'a, PE, MockSpawner, MockFreePort, MockSystemd> {
     HandlerDeps {
+        test_core: core_dir.map(native_fixture),
         core_dir,
         auth_file,
         peer_cred: peer,
@@ -305,7 +304,65 @@ fn setup_env() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let core_dir = dir.path().join("core");
     std::fs::create_dir_all(&core_dir).unwrap();
     std::fs::write(core_dir.join("sing-box"), b"#!bin\nfake sing-box").unwrap();
+    std::fs::write(core_dir.join("libcronet.so"), b"inert-sidecar").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&core_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     (dir, auth, core_dir)
+}
+
+fn native_fixture(directory: &Path) -> Arc<crate::core_store::VerifiedCore> {
+    use polaris_helper_proto::core_manifest::{CoreFile, CoreManifest, InstalledCoreManifest};
+    let files = ["sing-box", "libcronet.so"]
+        .into_iter()
+        .map(|name| {
+            let raw = std::fs::read(directory.join(name)).unwrap();
+            CoreFile {
+                name: name.into(),
+                bytes: raw.len() as u64,
+                sha256: crate::core_hash::sha256_hex(&raw),
+            }
+        })
+        .collect();
+    let core = CoreManifest {
+        platform: "linux".into(),
+        version: "1.15.0-alpha.12".into(),
+        provider_fingerprint: "a".repeat(64),
+        files,
+        helper_sha256: None,
+        cleaner_sha256: None,
+    };
+    let manifest = InstalledCoreManifest {
+        schema: "polaris-core-manifest-v1".into(),
+        id: core
+            .id(crate::core_hash::sha256_hex)
+            .unwrap()
+            .as_str()
+            .into(),
+        app_version: "1.0.0".into(),
+        core,
+    };
+    Arc::new(
+        crate::core_store::VerifiedCore::fixture(
+            directory,
+            &directory.join("fixture.lease"),
+            manifest,
+        )
+        .unwrap(),
+    )
+}
+fn selected_start(response: &str, expected: &str) -> LinuxBirthStart {
+    let Response::Ok(ResponseKind::PinnedStart {
+        id,
+        start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start),
+    }) = Response::parse(response)
+    else {
+        panic!("missing selected core receipt: {response}")
+    };
+    assert_eq!(id.as_str(), expected);
+    start
 }
 
 fn no_op_fwd() -> impl Fn(bool) {
@@ -351,13 +408,17 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
         &fwd,
     );
     let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
+    let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg = cfg.to_string_lossy().into_owned();
     let mut start = MockConn::new(vec![&sb, &cfg, "", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
-    let Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started { target, .. })) =
-        Response::parse(&start.writes()[0])
-    else {
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
+    let LinuxBirthStart::Started { target, .. } = selected_start(&start.writes()[0], &sb) else {
         panic!("exact start did not return target")
     };
     assert_eq!(target.pid.get(), 7777);
@@ -375,14 +436,12 @@ fn exact_start_status_and_stop_keep_a_single_birth_identity() {
         &mut state,
         &deps,
         &cred,
-        lcmd::START_BIRTH_SAFE,
+        lcmd::START_PINNED_BIRTH,
         &mut already,
     );
     assert_eq!(
-        Response::parse(&already.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
-            target
-        }))
+        selected_start(&already.writes()[0], &sb),
+        LinuxBirthStart::Already { target }
     );
     assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
 
@@ -464,6 +523,7 @@ fn exact_stop_rejects_mismatch_and_bad_frames_without_mutation() {
     let current = exact_handle(42, BIRTH_ONE);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(current.clone())),
+        ..HandlerState::new()
     };
     for args in [
         vec!["0", BIRTH_ONE],
@@ -515,6 +575,7 @@ fn reaped_exact_birth_ack_survives_a_legacy_successor() {
     let legacy = CoreHandle::new(42);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(legacy.clone())),
+        ..HandlerState::new()
     };
     let old = exact_handle(42, BIRTH_ONE).target().unwrap();
     spawner.reaped_births.lock().unwrap().push(old);
@@ -555,7 +616,7 @@ fn reaped_exact_birth_ack_survives_a_legacy_successor() {
 
 #[test]
 fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
-    let (_dir, auth, _core_dir) = setup_env();
+    let (_dir, auth, core_dir) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let cred = PeerCred { uid: 0, gid: 0 };
     let spawner = MockSpawner::succeeding(100);
@@ -564,19 +625,35 @@ fn stopping_exact_birth_cannot_be_reused_as_already_or_admitted() {
     let ss = no_op_ss();
     let forwards = StdMutex::new(Vec::new());
     let fwd = |value| forwards.lock().unwrap().push(value);
-    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
-    let old = exact_handle(42, BIRTH_ONE);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let old =
+        exact_handle(42, BIRTH_ONE).with_core(Arc::clone(deps.test_core.as_ref().unwrap()), 0);
     let target = old.target().unwrap();
     let mut state = HandlerState {
         child: Some(ManagedChild::Stopping(old)),
+        ..HandlerState::new()
     };
-    let mut conn = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut conn);
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
     assert_eq!(
-        Response::parse(&conn.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(
-            LinuxBirthStart::NotAdmittedPending { target }
-        ))
+        selected_start(&conn.writes()[0], &id),
+        LinuxBirthStart::NotAdmittedPending { target }
     );
     assert!(matches!(state.child, Some(ManagedChild::Stopping(_))));
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
@@ -608,14 +685,20 @@ fn hidden_legacy_custody_never_reports_exact_empty_or_spawns() {
         lcmd::STATUS_BIRTH_SAFE,
         &mut status,
     );
-    assert_eq!(status.writes(), ["ERR unknown"]);
-    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", ""]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    // 带尾文，与「不认识这条命令」的裸 `ERR unknown` 区分开（客户端据裸形判 helper 过旧）。
+    assert_eq!(status.writes(), ["ERR unknown birth-custody-unidentified"]);
+    let id = "a".repeat(64);
+    let mut start = MockConn::new(vec![&id, "/cfg.json", "", "0", ""]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
     assert_eq!(
-        Response::parse(&start.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(
-            LinuxBirthStart::NotAdmittedUnknown { target: None }
-        ))
+        selected_start(&start.writes()[0], &id),
+        LinuxBirthStart::NotAdmittedUnknown { target: None }
     );
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
     assert!(forwards.lock().unwrap().is_empty());
@@ -643,8 +726,21 @@ fn exact_commands_reject_extra_lines_before_custody_changes() {
         &mut status,
     );
     assert_eq!(status.writes(), ["ERR bad-args"]);
-    let mut start = MockConn::new(vec!["/core/sing-box", "/cfg.json", "", "0", "", "extra"]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::START_BIRTH_SAFE, &mut start);
+    let mut start = MockConn::new(vec![
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "/cfg.json",
+        "",
+        "0",
+        "",
+        "extra",
+    ]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut start,
+    );
     assert_eq!(start.writes(), ["ERR bad-args"]);
     assert!(state.child.is_none());
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
@@ -670,6 +766,7 @@ fn legacy_mutating_commands_cannot_touch_exact_birth() {
     let current = exact_handle(42, BIRTH_ONE);
     let mut state = HandlerState {
         child: Some(ManagedChild::Running(current.clone())),
+        ..HandlerState::new()
     };
     for command in [
         cmd::START,
@@ -893,6 +990,7 @@ fn reap_safe_stop_retains_stopping_birth_until_exact_reap() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(555))),
+        ..HandlerState::new()
     });
 
     let mut pending = MockConn::new(vec![lcmd::STOP_REAP_SAFE, "555"]);
@@ -932,6 +1030,7 @@ fn stop_unknown_retains_custody_and_never_claims_success() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(556))),
+        ..HandlerState::new()
     });
     let mut conn = MockConn::new(vec!["stop", "556"]);
     handle(&state, &deps, &mut conn);
@@ -1157,28 +1256,9 @@ fn freeport_kills_own_singbox() {
     assert_eq!(*fp.killed.lock().unwrap(), vec![1234]);
 }
 
-// ===== install-core =====
-
 #[test]
-fn install_core_coredir_unset() {
-    let (_dir, auth, _core) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
-    let state = Mutex::new(HandlerState::new());
-    let hash = "a".repeat(64);
-    let mut conn = MockConn::new(vec!["install-core", "/tmp/src", &hash]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR coredir-unset"]);
-}
-
-#[test]
-fn install_core_bad_args_for_short_hash() {
-    let (_dir, auth, core_dir) = setup_env();
+fn retired_start_and_upload_frames_never_read_sources_or_change_custody() {
+    let (_dir, auth, core) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let spawner = MockSpawner::succeeding(100);
     let fp = MockFreePort::empty();
@@ -1186,7 +1266,7 @@ fn install_core_bad_args_for_short_hash() {
     let ss = no_op_ss();
     let fwd = no_op_fwd();
     let deps = make_deps(
-        Some(&core_dir),
+        Some(&core),
         &auth,
         &peer,
         &spawner,
@@ -1195,352 +1275,24 @@ fn install_core_bad_args_for_short_hash() {
         &ss,
         &fwd,
     );
-    let state = Mutex::new(HandlerState::new());
-    let mut conn = MockConn::new(vec!["install-core", "/tmp/src", "abc"]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR bad-args"]);
-}
-
-// ===== start =====
-
-#[test]
-fn start_bad_args_when_cfg_empty() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    // singbox / cfg="" / log / fwd / ppid
-    let mut conn = MockConn::new(vec!["start", &sb, "", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR bad-args"]);
-}
-
-#[test]
-fn start_core_path_denied_when_singbox_mismatch() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    // singbox 传一个错误路径（!= coreDir/sing-box）。
-    let mut conn = MockConn::new(vec![
-        "start",
-        "/tmp/evil/sing-box",
-        "/tmp/cfg.json",
-        "",
-        "0",
-        "",
-    ]);
-    handle(&state, &deps, &mut conn);
-    let w = &conn.writes()[0];
-    assert!(w.starts_with("ERR core-path-denied"), "got {w}");
-}
-
-#[test]
-fn start_core_missing_when_binary_absent() {
-    // coreDir 存在但 sing-box 不存在 → core-missing。
-    let dir = tempdir().unwrap();
-    let auth = dir.path().join("auth");
-    std::fs::write(&auth, "1000\n").unwrap();
-    let core_dir = dir.path().join("core");
-    std::fs::create_dir_all(&core_dir).unwrap();
-    // 不建 sing-box 二进制。
-
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR core-missing"]);
-}
-
-#[test]
-fn start_config_not_owned_rejected() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    // cfg 路径不存在 → owned_by 返回 err → config-not-owned。
-    let state = Mutex::new(HandlerState::new());
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/nonexistent/cfg.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    let w = &conn.writes()[0];
-    assert!(w.starts_with("ERR config-not-owned"), "got {w}");
-}
-
-#[test]
-fn start_spawns_and_reports_pid() {
-    let (dir, auth, core_dir) = setup_env();
-    // 造一个属主 = 本进程 uid 的 cfg。
-    let cfg = dir.path().join("cfg.json");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    let writes = conn.writes();
-    assert_eq!(writes.len(), 1);
-    assert!(matches!(
-        Response::parse(&writes[0]),
-        Response::Ok(ResponseKind::Start(Start::StartedTimed { pid: 7777, .. }))
-    ));
-    let calls = spawner.spawn_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].binary, core_dir.join("sing-box"));
-}
-
-/// log 必须与 cfg 同父目录 —— 不校验就是「root 在任意位置建文件、再 fchown 给调用者」。
-#[test]
-fn start_log_path_denied_when_outside_cfg_dir() {
-    let (dir, auth, core_dir) = setup_env();
-    let cfg = dir.path().join("cfg.json");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    // cfg 合法（属主对、目录对），只有 log 越界。
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, "/etc/cron.d/pwn", "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    assert_eq!(conn.writes(), vec!["ERR log-path-denied"]);
-    // 越界就不该 spawn —— 只看错误行不够，恒拒的实现也会让上一条通过。
-    assert!(
-        spawner.spawn_calls.lock().unwrap().is_empty(),
-        "被拒了却仍然起了核"
-    );
-}
-
-/// 生产形态（log 与 cfg 同目录）必须放行，且 log 被原样下发给 spawner。
-#[test]
-fn start_ok_when_log_beside_cfg() {
-    let (dir, auth, core_dir) = setup_env();
-    let cfg = dir.path().join("singbox-runtime.json");
-    let log = dir.path().join("singbox-startup.log");
-    let self_uid = nix::unistd::getuid().as_raw();
-    std::fs::write(&cfg, b"{}").unwrap();
-    let peer = StaticPeerCred::new(self_uid, self_uid);
-    let spawner = MockSpawner::succeeding(7777);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let log_s = log.to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec![&sb, &cfg_s, &log_s, "0", ""]);
-    // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
-    // （非 root），而可信 authfile 必须 root 属主 + 无 group/other 位，非特权测试进程造不出；鉴权门本身
-    // 由 unauthorized_uid_rejected_for_status / root_always_authorized 与 auth 模块判据测试独立覆盖。
-    let cred = PeerCred {
-        uid: self_uid,
-        gid: self_uid,
-    };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
-    let writes = conn.writes();
-    assert_eq!(writes.len(), 1);
-    assert!(
-        matches!(
-            Response::parse(&writes[0]),
-            Response::Ok(ResponseKind::Start(Start::StartedTimed { pid: 7777, .. }))
-        ),
-        "生产形态被误拒: {writes:?}"
-    );
-    let calls = spawner.spawn_calls.lock().unwrap();
-    assert_eq!(calls[0].log.as_deref(), Some(log.as_path()));
-}
-
-#[test]
-fn start_already_when_child_present() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    state.child = Some(ManagedChild::Running(CoreHandle::new(8888)));
-    let state = Mutex::new(state);
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let mut conn = MockConn::new(vec!["start", &sb, "/tmp/c.json", "", "0", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["OK already 8888"]);
-    // 已有 child → 不再 spawn。
+    for command in [
+        cmd::START,
+        lcmd::START_REAP_SAFE,
+        lcmd::START_BIRTH_SAFE,
+        lcmd::INSTALL_CORE,
+    ] {
+        let state = Mutex::new(HandlerState::new());
+        let mut conn = MockConn::new(vec![command, "/tmp/untrusted", "not-a-hash"]);
+        handle(&state, &deps, &mut conn);
+        assert_eq!(conn.writes(), ["ERR unknown"]);
+        assert!(state.lock().unwrap().child.is_none());
+        assert_eq!(
+            std::fs::read(core.join("sing-box")).unwrap(),
+            b"#!bin\nfake sing-box"
+        );
+    }
     assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn start_blocker_precedes_already_validation_forwarding_and_spawn() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let spawner = MockSpawner::succeeding(100);
-    *spawner.start_admission.lock().unwrap() = Some(StartAdmission::Blocked {
-        pid: 7007,
-        state: ReapBlockerState::Unknown,
-    });
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd_called = Arc::new(StdMutex::new(Vec::new()));
-    let fwd = {
-        let calls = Arc::clone(&fwd_called);
-        move |on| calls.lock().unwrap().push(on)
-    };
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let state = Mutex::new(HandlerState {
-        child: Some(ManagedChild::Running(CoreHandle::new(8888))),
-    });
-    // Deliberately invalid arguments: admission must run before validation too.
-    let mut conn = MockConn::new(vec![lcmd::START_REAP_SAFE, "/wrong", "", "", "1", ""]);
-    handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), ["OK start-not-admitted unknown 7007"]);
-    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-    assert!(fwd_called.lock().unwrap().is_empty());
-    assert_eq!(
-        state
-            .lock()
-            .unwrap()
-            .child
-            .as_ref()
-            .map(|child| child.handle().pid),
-        Some(8888)
-    );
+    assert!(spawner.kill_calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1559,6 +1311,7 @@ fn unknown_command_is_rejected_before_arguments_or_child_mutation() {
     let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
     let state = Mutex::new(HandlerState {
         child: Some(ManagedChild::Running(CoreHandle::new(9001))),
+        ..HandlerState::new()
     });
     let mut conn = MockConn::new(vec!["future-mutating-command", "9001"]);
 
@@ -1586,8 +1339,6 @@ fn start_failure_reports_err_start_and_resets_forward() {
     let self_uid = nix::unistd::getuid().as_raw();
     let peer = StaticPeerCred::new(self_uid, self_uid);
     let spawner = MockSpawner {
-        provision_gate: None,
-        deployment_error: false,
         next_pid: 0,
         fail: true,
         spawn_calls: StdMutex::new(Vec::new()),
@@ -1621,7 +1372,7 @@ fn start_failure_reports_err_start_and_resets_forward() {
     let cfg = dir.path().join("cfg.json");
     std::fs::write(&cfg, b"{}").unwrap();
     let mut state = HandlerState::new();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
+    let sb = deps.test_core.as_ref().unwrap().manifest.id.clone();
     let cfg_s = cfg.to_string_lossy().into_owned();
     let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
     // 直调 `dispatch_locked` 跳过 `handle` 的 authfile 鉴权门：本例的被测判据要求对端 uid == cfg 属主
@@ -1631,7 +1382,13 @@ fn start_failure_reports_err_start_and_resets_forward() {
         uid: self_uid,
         gid: self_uid,
     };
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut conn);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
     let w = &conn.writes()[0];
     assert!(w.starts_with("ERR start"), "got {w}");
     // fwd=1 先设，spawn 失败后复位为 false。
@@ -1639,243 +1396,6 @@ fn start_failure_reports_err_start_and_resets_forward() {
 }
 
 // ===== cleanup =====
-
-#[test]
-fn claims_deployment_failure_rejects_only_new_start_before_forwarding() {
-    let (dir, auth, core_dir) = setup_env();
-    let uid = nix::unistd::getuid().as_raw();
-    let peer = StaticPeerCred::new(uid, uid);
-    let mut spawner = MockSpawner::succeeding(7777);
-    spawner.deployment_error = true;
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let forwarded = StdMutex::new(Vec::new());
-    let fwd = |on| forwarded.lock().unwrap().push(on);
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let cfg = dir.path().join("cfg.json");
-    std::fs::write(&cfg, b"{}").unwrap();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let cred = PeerCred { uid, gid: uid };
-    for command in [cmd::START, lcmd::START_BIRTH_SAFE] {
-        let mut state = HandlerState::new();
-        let mut conn = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
-        dispatch_locked(&mut state, &deps, &cred, command, &mut conn);
-        assert_eq!(conn.writes(), ["ERR start claims deployment unavailable"]);
-        assert!(state.child.is_none());
-    }
-    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-    assert!(forwarded.lock().unwrap().is_empty());
-}
-
-#[test]
-fn claims_failure_preserves_invalid_parameter_and_already_start_responses() {
-    let (dir, auth, core_dir) = setup_env();
-    let uid = nix::unistd::getuid().as_raw();
-    let peer = StaticPeerCred::new(uid, uid);
-    let mut spawner = MockSpawner::succeeding(7777);
-    spawner.deployment_error = true;
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let fwd = no_op_fwd();
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let cfg = dir.path().join("cfg.json");
-    std::fs::write(&cfg, b"{}").unwrap();
-    let sb = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let cfg_s = cfg.to_string_lossy().into_owned();
-    let cred = PeerCred { uid, gid: uid };
-    let mut state = HandlerState::new();
-    let mut invalid = MockConn::new(vec![&sb, "", "", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut invalid);
-    assert_eq!(invalid.writes(), ["ERR bad-args"]);
-    let mut invalid_log = MockConn::new(vec![&sb, &cfg_s, "/outside/log", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut invalid_log);
-    assert_eq!(invalid_log.writes(), ["ERR log-path-denied"]);
-    state.child = Some(ManagedChild::Running(CoreHandle::new(7777)));
-    let mut already = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut already);
-    assert_eq!(already.writes(), ["OK already 7777"]);
-    let exact = exact_handle(7777, BIRTH_ONE);
-    let target = exact.target().unwrap();
-    state.child = Some(ManagedChild::Running(exact));
-    let mut exact_already = MockConn::new(vec![&sb, &cfg_s, "", "1", ""]);
-    dispatch_locked(
-        &mut state,
-        &deps,
-        &cred,
-        lcmd::START_BIRTH_SAFE,
-        &mut exact_already,
-    );
-    assert_eq!(
-        Response::parse(&exact_already.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
-            target
-        }))
-    );
-    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-}
-
-#[test]
-fn claims_failure_does_not_block_existing_status_or_stop() {
-    let (_dir, auth, core_dir) = setup_env();
-    let peer = StaticPeerCred::new(0, 0);
-    let mut spawner = MockSpawner::succeeding(7777);
-    spawner.deployment_error = true;
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let forwarded = StdMutex::new(Vec::new());
-    let fwd = |on| forwarded.lock().unwrap().push(on);
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let mut state = HandlerState::new();
-    state.child = Some(ManagedChild::Running(CoreHandle::new(7777)));
-    let cred = PeerCred { uid: 0, gid: 0 };
-    let mut status = MockConn::new(Vec::new());
-    dispatch_locked(&mut state, &deps, &cred, cmd::STATUS, &mut status);
-    assert_eq!(status.writes(), ["OK running 7777"]);
-    let mut stop = MockConn::new(vec!["7777"]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::STOP, &mut stop);
-    assert_eq!(stop.writes(), ["OK stopped 7777"]);
-    assert!(state.child.is_none());
-    assert_eq!(*spawner.terminate_calls.lock().unwrap(), [7777]);
-    assert_eq!(*forwarded.lock().unwrap(), [false]);
-}
-
-#[test]
-fn actual_provision_handoff_error_stays_on_new_start_and_preserves_control_paths() {
-    let (dir, auth, core_dir) = setup_env();
-    let uid = nix::unistd::geteuid().as_raw();
-    let peer = StaticPeerCred::new(uid, uid);
-    let cred = PeerCred { uid, gid: uid };
-    let cfg = crate::platform::linux::server::ServerConfig::default();
-    let gate = crate::platform::linux::server::ConnServer::with_claims_provision(
-        &cfg,
-        Err(std::io::Error::other("post-publication sync failed")),
-    );
-    let mut spawner = MockSpawner::succeeding(7777);
-    spawner.provision_gate = Some(gate);
-    let fp = MockFreePort::empty();
-    let systemd = MockSystemd::default();
-    let ss = no_op_ss();
-    let forwarded = StdMutex::new(Vec::new());
-    let fwd = |on| forwarded.lock().unwrap().push(on);
-    let deps = make_deps(
-        Some(&core_dir),
-        &auth,
-        &peer,
-        &spawner,
-        &fp,
-        &systemd,
-        &ss,
-        &fwd,
-    );
-    let config = dir.path().join("cfg.json");
-    std::fs::write(&config, b"{}").unwrap();
-    let binary = core_dir.join("sing-box").to_string_lossy().into_owned();
-    let config = config.to_string_lossy().into_owned();
-    for command in [cmd::START, lcmd::START_BIRTH_SAFE] {
-        let mut state = HandlerState::new();
-        let mut invalid = MockConn::new(vec![&binary, "", "", "1", ""]);
-        dispatch_locked(&mut state, &deps, &cred, command, &mut invalid);
-        assert_eq!(invalid.writes(), ["ERR bad-args"]);
-        let mut start = MockConn::new(vec![&binary, &config, "", "1", ""]);
-        dispatch_locked(&mut state, &deps, &cred, command, &mut start);
-        assert_eq!(
-            start.writes(),
-            ["ERR start claims deployment unavailable: post-publication sync failed"]
-        );
-        assert!(forwarded.lock().unwrap().is_empty());
-        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
-    }
-    let mut state = HandlerState::new();
-    state.child = Some(ManagedChild::Running(CoreHandle::new(7777)));
-    let mut already = MockConn::new(vec![&binary, &config, "", "1", ""]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::START, &mut already);
-    assert_eq!(already.writes(), ["OK already 7777"]);
-    let mut status = MockConn::new(Vec::new());
-    dispatch_locked(&mut state, &deps, &cred, cmd::STATUS, &mut status);
-    assert_eq!(status.writes(), ["OK running 7777"]);
-    let mut stop = MockConn::new(vec!["7777"]);
-    dispatch_locked(&mut state, &deps, &cred, cmd::STOP, &mut stop);
-    assert_eq!(stop.writes(), ["OK stopped 7777"]);
-    let handle = exact_handle(7777, BIRTH_ONE);
-    let target = handle.target().unwrap();
-    state.child = Some(ManagedChild::Running(handle));
-    let mut already = MockConn::new(vec![&binary, &config, "", "1", ""]);
-    dispatch_locked(
-        &mut state,
-        &deps,
-        &cred,
-        lcmd::START_BIRTH_SAFE,
-        &mut already,
-    );
-    assert_eq!(
-        Response::parse(&already.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Already {
-            target
-        }))
-    );
-    let mut status = MockConn::new(Vec::new());
-    dispatch_locked(
-        &mut state,
-        &deps,
-        &cred,
-        lcmd::STATUS_BIRTH_SAFE,
-        &mut status,
-    );
-    assert_eq!(
-        Response::parse(&status.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStatus(LinuxBirthStatus::Running {
-            target
-        }))
-    );
-    spawner
-        .birth_stop_results
-        .lock()
-        .unwrap()
-        .push_back(StopReap::Reaped);
-    let pid = target.pid.to_string();
-    let birth = target.birth.to_wire();
-    let mut stop = MockConn::new(vec![&pid, &birth]);
-    dispatch_locked(&mut state, &deps, &cred, lcmd::STOP_BIRTH_SAFE, &mut stop);
-    assert_eq!(
-        Response::parse(&stop.writes()[0]),
-        Response::Ok(ResponseKind::LinuxBirthStop(LinuxBirthStop::Stopped {
-            target
-        }))
-    );
-    assert!(state.child.is_none());
-    assert_eq!(*forwarded.lock().unwrap(), [false, false]);
-}
 
 #[test]
 fn cleanup_kills_child_and_reports_cleaned() {
@@ -1966,15 +1486,15 @@ fn resolved_dns_failure_keeps_structured_error_detail() {
 #[test]
 fn wire_forms_match_go_source() {
     // v1 是 wire 断代真值；build 字段是尾部向后兼容扩展（旧 app 忽略）。
-    assert_eq!(PROTO_VERSION, 1);
+    assert_eq!(PROTO_VERSION, 2);
     assert_eq!(
         Response::Ok(ResponseKind::Pong(polaris_helper_proto::Pong::current(0))).to_wire_line(),
         format!(
-            "OK pong uid=0 v1 build={}",
+            "OK pong uid=0 v2 build={}",
             polaris_helper_proto::build_identity::current()
         )
     );
-    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 1");
+    assert_eq!(format!("OK {PROTO_VERSION}"), "OK 2");
     assert_eq!("OK stopped", "OK stopped");
     assert_eq!("OK running 12345", "OK running 12345");
     assert_eq!("OK notrunning", "OK notrunning");
@@ -1999,4 +1519,651 @@ fn wire_forms_match_go_source() {
     assert_eq!("ERR config-not-owned", "ERR config-not-owned");
     assert_eq!("ERR coredir-unset", "ERR coredir-unset");
     assert_eq!("ERR start boom", "ERR start boom");
+}
+
+#[test]
+fn pinned_content_and_native_owner_are_checked_before_start_side_effects() {
+    let (dir, auth, core_dir) = setup_env();
+    let cfg = dir.path().join("cfg.json");
+    std::fs::write(&cfg, b"{}").unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let cred = PeerCred { uid, gid: uid };
+    let peer = StaticPeerCred::new(uid, uid);
+    let spawner = MockSpawner::succeeding(7777);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let cfg = cfg.to_string_lossy().into_owned();
+    let mut state = HandlerState::new();
+    let other_id = "b".repeat(64);
+    let mut bad = MockConn::new(vec![&other_id, &cfg, "", "1"]);
+    dispatch_locked(&mut state, &deps, &cred, lcmd::START_PINNED_BIRTH, &mut bad);
+    assert_eq!(bad.writes(), ["ERR core-invalid"]);
+    std::fs::write(core_dir.join("libcronet.so"), b"changed-sidecar").unwrap();
+    let mut corrupt = MockConn::new(vec![&id, &cfg, "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut corrupt,
+    );
+    assert_eq!(corrupt.writes(), ["ERR core-invalid"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+    std::fs::write(core_dir.join("libcronet.so"), b"inert-sidecar").unwrap();
+    let mut good = MockConn::new(vec![&id, &cfg, "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut good,
+    );
+    assert!(matches!(
+        selected_start(&good.writes()[0], &id),
+        LinuxBirthStart::Started { .. }
+    ));
+    assert_eq!(state.child.as_ref().unwrap().handle().owner_uid, Some(uid));
+    let other_uid = if uid == 1001 { 1002 } else { 1001 };
+    let other = PeerCred {
+        uid: other_uid,
+        gid: other_uid,
+    };
+    for command in [lcmd::START_PINNED_BIRTH, lcmd::STATUS_BIRTH_SAFE] {
+        let mut denied = MockConn::new(if command == lcmd::START_PINNED_BIRTH {
+            vec![&id, &cfg, "", "1"]
+        } else {
+            vec![]
+        });
+        dispatch_locked(&mut state, &deps, &other, command, &mut denied);
+        assert_eq!(denied.writes(), ["ERR slot-owned-by-other-user"]);
+    }
+    assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
+    assert_eq!(*forwards.lock().unwrap(), [true]);
+}
+
+#[test]
+fn hidden_already_birth_cannot_be_relabeled_with_a_requested_core_id() {
+    let (_dir, auth, core_dir) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let cred = PeerCred { uid: 0, gid: 0 };
+    let spawner = MockSpawner::succeeding(100);
+    let target = exact_handle(42, BIRTH_ONE).target().unwrap();
+    *spawner.birth_admission.lock().unwrap() = Some(BirthAdmission::Already(target));
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(
+        Some(&core_dir),
+        &auth,
+        &peer,
+        &spawner,
+        &fp,
+        &systemd,
+        &ss,
+        &fwd,
+    );
+    let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+    let mut state = HandlerState::new();
+    let mut conn = MockConn::new(vec![&id, "/cfg.json", "", "1"]);
+    dispatch_locked(
+        &mut state,
+        &deps,
+        &cred,
+        lcmd::START_PINNED_BIRTH,
+        &mut conn,
+    );
+    assert_eq!(conn.writes(), ["ERR core-occupied"]);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failed_dns_set_releases_reservation_only_after_confirmed_rollback() {
+    for rollback_error in [None, Some("rollback failed".to_string())] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let resolved = MockResolvedDns {
+            error: Some("set failed".into()),
+            revert_error: rollback_error.clone(),
+            ..Default::default()
+        };
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let state = Mutex::new(HandlerState::new());
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_cleanup_pending, rollback_error.is_some());
+        assert_eq!(state.dns_owner, rollback_error.map(|_| 0));
+        assert_eq!(resolved.calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn refused_dns_request_preserves_previous_state_but_real_rollback_clears_it() {
+    for invalid in [true, false] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let resolved = MockResolvedDns {
+            error: Some("set failed".into()),
+            ..Default::default()
+        };
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        initial.dns_owner = Some(1000);
+        initial.dns_birth = Some(birth.clone());
+        let state = Mutex::new(initial);
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            if invalid {
+                "other-interface"
+            } else {
+                polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME
+            },
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        assert!(conn.writes()[0].starts_with("ERR resolved-dns "));
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        if invalid {
+            assert_eq!(state.dns_owner, Some(1000));
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+            assert!(resolved.calls.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(state.dns_owner, None);
+            assert!(state.dns_birth.is_none());
+            assert_eq!(resolved.calls.lock().unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn synchronous_stop_ack_hands_dns_custody_to_the_same_birth_reaper() {
+    for exact in [false, true] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        spawner
+            .birth_stop_results
+            .lock()
+            .unwrap()
+            .push_back(StopReap::Reaped);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+        let birth = if exact {
+            exact_handle(77, BIRTH_ONE)
+        } else {
+            CoreHandle::new(77)
+        };
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        initial.dns_owner = Some(0);
+        initial.dns_birth = Some(birth.clone());
+        let state = Mutex::new(initial);
+        let mut conn = MockConn::new(if exact {
+            vec![lcmd::STOP_BIRTH_SAFE, "77", BIRTH_ONE]
+        } else {
+            vec!["stop"]
+        });
+        handle(&state, &deps, &mut conn);
+        assert!(conn.writes()[0].starts_with("OK "));
+        let mut state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(state.dns_cleanup_pending);
+        assert_eq!(state.dns_owner, Some(0));
+        assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        let mut next = MockConn::new(vec![]);
+        handle_start(&mut state, &deps, &PeerCred { uid: 0, gid: 0 }, &mut next);
+        assert_eq!(next.writes(), ["ERR slot-owned-or-control-busy"]);
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn reap_during_dns_set_hands_restoration_back_to_the_reserved_operation() {
+    struct ReapDuringSet<'a> {
+        state: &'a Mutex<HandlerState>,
+        fail_revert: bool,
+        calls: StdMutex<usize>,
+    }
+    impl ResolvedDnsOps for ReapDuringSet<'_> {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            assert!(state.dns_busy);
+            let birth = state.child.as_ref().unwrap().handle().clone();
+            state.retire_birth(&birth);
+            Ok(())
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            if self.fail_revert {
+                Err("restore unknown".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for fail_revert in [false, true] {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        let state = Mutex::new(initial);
+        let resolved = ReapDuringSet {
+            state: &state,
+            fail_revert,
+            calls: StdMutex::new(0),
+        };
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let mut conn = MockConn::new(vec![
+            lcmd::RESOLVED_DNS_SET,
+            polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+            polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+        ]);
+        handle(&state, &deps, &mut conn);
+        let state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_cleanup_pending, fail_revert);
+        assert_eq!(state.dns_owner, fail_revert.then_some(0));
+        assert_eq!(state.dns_birth.is_some(), fail_revert);
+        if fail_revert {
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        }
+        assert_eq!(*resolved.calls.lock().unwrap(), 1);
+    }
+}
+
+#[test]
+fn successful_dns_retry_keeps_live_birth_takeover_but_reaped_retry_is_restored() {
+    struct RetryDns<'a> {
+        state: &'a Mutex<HandlerState>,
+        retire_during_retry: bool,
+        takeover_calls: StdMutex<usize>,
+        revert_calls: StdMutex<usize>,
+        applied: StdMutex<bool>,
+    }
+    impl ResolvedDnsOps for RetryDns<'_> {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            let mut calls = self.takeover_calls.lock().unwrap();
+            *calls += 1;
+            *self.applied.lock().unwrap() = true;
+            if *calls == 1 {
+                Err("initial SET readback failed".into())
+            } else {
+                if self.retire_during_retry {
+                    let mut state = self.state.lock().unwrap();
+                    assert!(state.dns_busy);
+                    let birth = state.child.as_ref().unwrap().handle().clone();
+                    state.retire_birth(&birth);
+                }
+                Ok(())
+            }
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            let mut calls = self.revert_calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Err("initial rollback failed".into())
+            } else {
+                *self.applied.lock().unwrap() = false;
+                Ok(())
+            }
+        }
+    }
+    for (retire_during_retry, refused_retry) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let (_dir, auth, _core) = setup_env();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let fwd = no_op_fwd();
+        let birth = CoreHandle::new(77);
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(birth.clone()));
+        let state = Mutex::new(initial);
+        let resolved = RetryDns {
+            state: &state,
+            retire_during_retry,
+            takeover_calls: StdMutex::new(0),
+            revert_calls: StdMutex::new(0),
+            applied: StdMutex::new(false),
+        };
+        let deps = make_deps_with_resolved(
+            None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd, &resolved,
+        );
+        let request = || {
+            MockConn::new(vec![
+                lcmd::RESOLVED_DNS_SET,
+                polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+                polaris_helper_proto::linux_dns::CONTROLLED_DNS_IP,
+            ])
+        };
+        let mut first = request();
+        handle(&state, &deps, &mut first);
+        assert_eq!(
+            first.writes(),
+            ["ERR resolved-dns initial SET readback failed"]
+        );
+        {
+            let mut state = state.lock().unwrap();
+            assert!(state.dns_cleanup_pending);
+            assert_eq!(state.dns_owner, Some(0));
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+            assert!(!state.dns_busy);
+            let mut next = MockConn::new(vec![]);
+            handle_start(&mut state, &deps, &PeerCred { uid: 0, gid: 0 }, &mut next);
+            assert_eq!(next.writes(), ["ERR slot-owned-or-control-busy"]);
+        }
+        if refused_retry {
+            // A rejected retry is unmodified: it must retain responsibility and
+            // may not turn the live birth's unknown DNS into exit cleanup.
+            let mut denied =
+                MockConn::new(vec![lcmd::RESOLVED_DNS_SET, "other-interface", "8.8.8.8"]);
+            handle(&state, &deps, &mut denied);
+            assert!(denied.writes()[0].starts_with("ERR resolved-dns "));
+            assert!(state.lock().unwrap().dns_cleanup_pending);
+            assert_eq!(*resolved.takeover_calls.lock().unwrap(), 1);
+            assert_eq!(*resolved.revert_calls.lock().unwrap(), 1);
+        }
+        let mut second = request();
+        handle(&state, &deps, &mut second);
+        assert_eq!(second.writes(), ["OK resolved-dns-set"]);
+        let state = state.lock().unwrap();
+        assert!(!state.dns_busy);
+        assert!(!state.dns_cleanup_pending);
+        assert_eq!(state.child.is_none(), retire_during_retry);
+        assert_eq!(state.dns_owner, (!retire_during_retry).then_some(0));
+        assert_eq!(state.dns_birth.is_some(), !retire_during_retry);
+        assert_eq!(*resolved.applied.lock().unwrap(), !retire_during_retry);
+        assert_eq!(*resolved.takeover_calls.lock().unwrap(), 2);
+        assert_eq!(
+            *resolved.revert_calls.lock().unwrap(),
+            if retire_during_retry { 2 } else { 1 }
+        );
+        if !retire_during_retry {
+            assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+        }
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn refused_dns_frame_retiring_only_a_reservation_does_not_block_the_next_start() {
+    struct RetireWhileReading<'a> {
+        state: &'a Mutex<HandlerState>,
+        inner: MockConn,
+        reads: usize,
+        retire_at: usize,
+    }
+    impl Conn for RetireWhileReading<'_> {
+        fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+            Ok(Some(self.read_line()))
+        }
+        fn read_line(&mut self) -> String {
+            if self.reads == self.retire_at {
+                let mut state = self.state.lock().unwrap();
+                assert!(state.dns_busy);
+                assert_eq!(state.dns_owner, None);
+                let birth = state.child.as_ref().unwrap().handle().clone();
+                assert!(state.dns_birth.as_ref().unwrap().same_birth(&birth));
+                state.retire_birth(&birth);
+                assert!(state.child.is_none());
+                assert!(state.dns_cleanup_pending);
+            }
+            self.reads += 1;
+            self.inner.read_line()
+        }
+        fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
+            self.inner.read_line_strict()
+        }
+        fn write_line(&mut self, line: &str) -> bool {
+            self.inner.write_line(line)
+        }
+    }
+    // Retire before either parameter read, including the missing IP read.
+    for (truncated, retire_at) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+        let (dir, auth, core_dir) = setup_env();
+        let cfg = dir.path().join("cfg.json");
+        std::fs::write(&cfg, b"{}").unwrap();
+        let peer = StaticPeerCred::new(0, 0);
+        let spawner = MockSpawner::succeeding(100);
+        let fp = MockFreePort::empty();
+        let systemd = MockSystemd::default();
+        let ss = no_op_ss();
+        let forwards = StdMutex::new(Vec::new());
+        let fwd = |value| forwards.lock().unwrap().push(value);
+        let resolved = MockResolvedDns::default();
+        let deps = make_deps_with_resolved(
+            Some(&core_dir),
+            &auth,
+            &peer,
+            &spawner,
+            &fp,
+            &systemd,
+            &ss,
+            &fwd,
+            &resolved,
+        );
+        let mut initial = HandlerState::new();
+        initial.child = Some(ManagedChild::Running(exact_handle(77, BIRTH_ONE)));
+        assert!(initial.dns_owner.is_none() && initial.dns_birth.is_none());
+        let state = Mutex::new(initial);
+        let mut denied = RetireWhileReading {
+            state: &state,
+            inner: MockConn::new(if truncated {
+                vec![
+                    lcmd::RESOLVED_DNS_SET,
+                    polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME,
+                ]
+            } else {
+                vec![lcmd::RESOLVED_DNS_SET, "other-interface", "8.8.8.8"]
+            }),
+            reads: 0,
+            retire_at,
+        };
+        handle(&state, &deps, &mut denied);
+        assert_eq!(
+            denied.inner.writes(),
+            ["ERR resolved-dns request denied by Polaris resolved whitelist"]
+        );
+        assert!(resolved.calls.lock().unwrap().is_empty());
+        assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+        assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+        assert!(spawner.kill_calls.lock().unwrap().is_empty());
+        assert!(spawner.birth_stop_calls.lock().unwrap().is_empty());
+        assert!(fp.killed.lock().unwrap().is_empty());
+        assert!(systemd.calls.lock().unwrap().is_empty());
+        assert!(forwards.lock().unwrap().is_empty());
+        let mut state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(state.dns_owner.is_none() && state.dns_birth.is_none());
+        assert!(!state.dns_busy && !state.dns_cleanup_pending);
+
+        // Use the existing selected-core admission fixture and actual dispatch
+        // with the config's owner, rather than only checking the pending bit.
+        let uid = nix::unistd::getuid().as_raw();
+        let id = deps.test_core.as_ref().unwrap().manifest.id.clone();
+        let cfg = cfg.to_string_lossy().into_owned();
+        let mut next = MockConn::new(vec![&id, &cfg, "", "1", ""]);
+        dispatch_locked(
+            &mut state,
+            &deps,
+            &PeerCred { uid, gid: uid },
+            lcmd::START_PINNED_BIRTH,
+            &mut next,
+        );
+        assert!(matches!(
+            selected_start(&next.writes()[0], &id),
+            LinuxBirthStart::Started { .. }
+        ));
+        assert_eq!(spawner.spawn_calls.lock().unwrap().len(), 1);
+        assert!(resolved.calls.lock().unwrap().is_empty());
+    }
+}
+
+// Exercise the real LineConn framing instead of the pre-split command mock.
+struct CommandIo<R> {
+    input: R,
+    output: Vec<u8>,
+}
+
+impl<R: Read> Read for CommandIo<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.input.read(bytes)
+    }
+}
+
+impl<R> Write for CommandIo<R> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn handle_unauthorized_wire<R: Read + Send>(input: R) -> LineConn<CommandIo<R>> {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(9999, 9999);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let forwards = StdMutex::new(Vec::new());
+    let fwd = |value| forwards.lock().unwrap().push(value);
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState::new());
+    let mut conn = LineConn::new(CommandIo {
+        input,
+        output: Vec::new(),
+    });
+    handle(&state, &deps, &mut conn);
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+    assert!(spawner.terminate_calls.lock().unwrap().is_empty());
+    assert!(systemd.calls.lock().unwrap().is_empty());
+    assert!(fp.killed.lock().unwrap().is_empty());
+    assert!(forwards.lock().unwrap().is_empty());
+    conn
+}
+
+#[test]
+fn real_command_framing_preserves_ping_version_and_authorization() {
+    use std::io::Cursor;
+    for ending in ["\n", "\r\n"] {
+        let ping = handle_unauthorized_wire(Cursor::new(format!("ping{ending}")));
+        assert!(
+            String::from_utf8_lossy(&ping.inner.get_ref().output).starts_with("OK pong uid=9999 ")
+        );
+        let version = handle_unauthorized_wire(Cursor::new(format!("version{ending}")));
+        assert_eq!(
+            version.inner.get_ref().output,
+            format!("OK {PROTO_VERSION}\n").as_bytes()
+        );
+    }
+    for frame in [b"status\n".as_slice(), b"\n".as_slice()] {
+        let conn = handle_unauthorized_wire(Cursor::new(frame));
+        assert_eq!(conn.inner.get_ref().output, b"ERR unauthorized\n");
+    }
+    let eof = handle_unauthorized_wire(Cursor::new(b""));
+    assert!(eof.inner.get_ref().output.is_empty());
+    for frame in [
+        b"ping".as_slice(),
+        b"version\r".as_slice(),
+        b"\xff\n".as_slice(),
+    ] {
+        let conn = handle_unauthorized_wire(Cursor::new(frame));
+        assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
+    }
+}
+
+#[test]
+fn command_limit_is_enforced_before_auth_and_does_not_dispatch_a_suffix() {
+    use std::io::Cursor;
+    let mut exact = vec![b'x'; MAX_COMMAND_LINE_BYTES];
+    exact.extend_from_slice(b"\n");
+    let conn = handle_unauthorized_wire(Cursor::new(exact));
+    assert_eq!(conn.inner.get_ref().output, b"ERR unauthorized\n");
+    let mut overlong = vec![b'x'; MAX_COMMAND_LINE_BYTES + 1];
+    overlong.extend_from_slice(b"\nping\n");
+    let conn = handle_unauthorized_wire(Cursor::new(overlong));
+    assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
+}
+
+#[test]
+fn continuous_unterminated_command_stops_after_limit_plus_one_bytes() {
+    struct Continuous {
+        supplied: usize,
+    }
+    impl Read for Continuous {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            // No EOF and no timeout: a bound must stop this continuously ready stream.
+            assert!(
+                self.supplied <= MAX_COMMAND_LINE_BYTES,
+                "reader exceeded the command budget"
+            );
+            bytes[0] = b'x';
+            self.supplied += 1;
+            Ok(1)
+        }
+    }
+    let conn = handle_unauthorized_wire(Continuous { supplied: 0 });
+    assert_eq!(
+        conn.inner.get_ref().input.supplied,
+        MAX_COMMAND_LINE_BYTES + 1
+    );
+    assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
 }

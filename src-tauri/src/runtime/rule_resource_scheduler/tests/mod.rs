@@ -555,7 +555,7 @@ fn catalog_leg_cannot_short_circuit_the_resource_leg() {
 /// （即挪到 `lock_inner(&self.inner)` 之后）⇒ 本条转红。
 #[test]
 fn catalog_refresh_reads_disk_before_taking_the_lock() {
-    use crate::runtime::core_update_scheduler::method_scan::method_body;
+    use crate::test_support::method_body;
     let src = crate_code("runtime/rule_resource_scheduler.rs");
     let body = method_body(&src, "    async fn refresh_catalog_if_due(");
     let read_at = body
@@ -588,4 +588,47 @@ fn catalog_cache_file_name_mirrors_rules_rs() {
         )),
         "commands/rules/resources.rs 的 catalog 缓存文件名已变，本文件的只读镜像常量必须同步"
     );
+}
+
+#[test]
+fn background_external_refresh_uses_the_same_guarded_core_as_manual_refresh() {
+    let scheduler = crate::test_support::crate_code("runtime/rule_resource_scheduler.rs");
+    assert!(scheduler.contains("rule_resources_redownload_silent("));
+    let commands = crate::test_support::crate_code("commands/rules/resources.rs");
+    let silent = crate::commands::guard_scan::top_level_fn_body(
+        &commands,
+        "pub async fn rule_resources_redownload_silent(",
+    );
+    assert!(silent.contains("redownload_with_mode("));
+    let shared =
+        crate::commands::guard_scan::top_level_fn_body(&commands, "async fn redownload_with_mode(");
+    assert!(shared.contains("download_registered_resource("));
+    assert!(shared.contains("persist_registered_resource("));
+    assert!(!shared.contains("persist_resources("));
+}
+
+#[test]
+fn background_and_builtin_downloads_acquire_exclusive_staging_before_fetch() {
+    use crate::commands::guard_scan::{impl_method_body, top_level_fn_body};
+    let code = crate_code("commands/rules/resources.rs");
+    for (signature, creation) in [
+        (
+            "async fn download_registered_resource<H: HttpClient, L: DnsLookup>(",
+            "ResourceStageDir::create(res_dir)",
+        ),
+        (
+            "async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(",
+            "ResourceStageDir::create(runtime_dir)",
+        ),
+    ] {
+        let body = top_level_fn_body(&code, signature);
+        assert!(body.find(creation).unwrap() < body.find("download_with_progress(").unwrap());
+        assert!(!body.contains("let stage = ResourceStageDir("));
+    }
+    let create = impl_method_body(&code,
+        "    fn create_with(res_dir: &Path, mut next_name: impl FnMut() -> String) -> std::io::Result<Self> {");
+    assert!(create.contains("std::fs::create_dir(&path)"));
+    assert!(create.contains("ErrorKind::AlreadyExists => continue"));
+    assert!(!create.contains("create_dir_all(&path)"));
+    assert!(create.contains("Ok(()) => return Ok(Self(path))"));
 }

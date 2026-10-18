@@ -2,10 +2,10 @@
 //!
 //! 装配六 builder（log/dns/inbounds/outbounds/route）+ experimental.cache_file + 1.14 services
 //! （management API / dashboard）。纯函数 + 依赖注入：Polaris 所有 `this.*` 实例态经 `GenerateConfigDeps`
-//! 注入（raceServerPort / probe 端口 / lanResolverForDns / hasCronet / hasManagementApi / FS 路径 …）。
+//! 注入（node_dns_decoy_override / probe 端口 / lanResolverForDns / hasCronet / hasManagementApi / FS 路径 …）。
 //!
 //! 装配顺序（Polaris 时序严格保持）：
-//!  1. withRaceOff：raceServerPort==0 → clone config 清 dnsConfig.resolveNodeDomainsAhead。
+//!  1. 使用保存配置原值；原生节点 DNS 不依赖本地服务端口。
 //!  2. selectedServer 校验：isDirect 跳过；naive 缺 libcronet → Err。
 //!  3. buildOutbounds（先）→ 产 pendingEndpoints / pendingRuleSelectors（route/dns 消费）。
 //!  4. buildLogConfig / buildDnsConfig / buildInbounds / buildRouteConfig（消费 pendingEndpoints）。
@@ -67,25 +67,6 @@ use crate::user_config::server_config::Protocol;
 /// `if !(common.Contains(bucketNameList, bucketName) || strings.HasPrefix(bucketName, fakeipBucketPrefix))`
 /// —— fakeip 前缀被**显式豁免**，且 `bucketNameList` 本就不含它们。三个桶是顶层桶，不经 `cacheID`。
 const CACHE_ID: &str = "polaris-dns-v2";
-
-/// 上游 `ProxyManager.withRaceOff`：race off 时 clone config，强制 dnsConfig.resolveNodeDomainsAhead=false。
-///
-/// race server 未就绪（off/起失败/snapshot/preflight/诊断）→ getNodeResolverTag/buildDnsConfig 一致走
-/// 单上游、不引用 dns-node-race（防 FATAL，快照零变化）。clone 后仅清该字段，其余 dns_config 原样保留。
-fn with_race_off(config: &UserConfig) -> UserConfig {
-    let mut cfg = config.clone();
-    if let Some(dns) = cfg.dns_config.as_mut() {
-        dns.resolve_node_domains_ahead = Some(false);
-    } else {
-        // 上游 `{ ...config.dnsConfig, resolveNodeDomainsAhead: false }`：dnsConfig 为 undefined 时
-        // spread 空对象 → 结果 { resolveNodeDomainsAhead: false }。Rust 侧 Some(默认 + 该字段)。
-        cfg.dns_config = Some(crate::user_config::dns_config::DnsConfig {
-            resolve_node_domains_ahead: Some(false),
-            ..Default::default()
-        });
-    }
-    cfg
-}
 
 /// 选中节点不可用（naive 缺 libcronet）的用户可见原因。上游 `naiveUnavailableReason`。
 ///
@@ -154,8 +135,8 @@ pub struct GenerateConfigDeps {
     pub platform: String,
     /// 编译目标 arch（outbound tls_spoof 门控）。
     pub arch: String,
-    /// 本地 race DNS server 端口（>0 = race 就绪；0 = race off → withRaceOff）。
-    pub race_server_port: u16,
+    /// Optional replacement decoy CIDR file contents, loaded by the caller.
+    pub node_dns_decoy_override: Option<String>,
     pub probe_direct_port: Option<u16>,
     pub probe_proxy_port: Option<u16>,
     /// Trusted runtime Debug Android capability; never a user-config/serialized approval.
@@ -168,12 +149,6 @@ pub struct GenerateConfigDeps {
     /// §15 主核测速探测池：K 个 probe-selector-k 端口。空 = 不注入池。
     pub probe_pool_ports: Vec<u16>,
     pub lan_resolver_for_dns: Option<String>,
-    /// race 就绪时的自定义上游 IP（route 直连放行防 TUN 回环）。Polaris L3556 raceServerPort>0 才传。
-    pub race_upstream_ips: Vec<String>,
-    /// 上面那些上游**实际在用的端口**（`polaris-dns-race` 的 `ResolvedUpstreams::direct_ports` 下发）。
-    /// 与 [`race_upstream_ips`](Self::race_upstream_ips) 同源同命：同样只在 `race_server_port > 0` 时透传，
-    /// 缺省空 = race off。route 侧只消费不复算（见 `RouteConfigDeps::race_upstream_ports`）。
-    pub race_upstream_ports: Vec<u16>,
     /// libcronet 库已内置（naive 协议可用性）。has_cronet=false 时选中 naive 节点 → Err。
     pub has_cronet: bool,
     /// libcronet 拷贝失败（copy-failed 状态）：naive_unavailable_reason 选对应文案。
@@ -354,13 +329,7 @@ fn generate_base_config(
     deps: &GenerateConfigDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
-    // ── 1. withRaceOff（L3473）──────────────────────────────────────────────────
-    // race server 就绪（raceServerPort>0）才走 race 解析；否则强制 race off。
-    let cfg = if deps.race_server_port > 0 {
-        config.clone()
-    } else {
-        with_race_off(config)
-    };
+    let cfg = config.clone();
 
     // ── 2. selectedServer 校验（L3475-3487）─────────────────────────────────────
     // direct / block 哨兵都不是节点 id：其出口由 proxy-selector 的 default 直接接到内置出站
@@ -479,7 +448,7 @@ fn generate_base_config(
         } else {
             "proxy-selector".to_string()
         },
-        race_server_port: deps.race_server_port,
+        node_dns_decoy_override: deps.node_dns_decoy_override.clone(),
         probe_pool_ports: deps.probe_pool_ports.clone(),
         probe_proxy_port: deps.probe_proxy_port,
         platform: deps.platform.clone(),
@@ -529,16 +498,6 @@ fn generate_base_config(
     let inbounds = build_inbounds(config, Some(resolved_ips), &inbounds_deps);
 
     // ── 8. buildRouteConfig（L3543-3557）────────────────────────────────────────
-    // race 就绪时把上游 IP **与端口**一起传 route 直连放行（防 TUN 回环，两轴缺一规则匹配不上）；
-    // 未就绪两轴恒 []（`race_server_port == 0` ⟺ race off ⟺ 端口集回 `[53,443]` 基线，金样不动）。
-    let (race_upstream, race_upstream_ports) = if deps.race_server_port > 0 {
-        (
-            deps.race_upstream_ips.clone(),
-            deps.race_upstream_ports.clone(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
     let route_deps = RouteConfigDeps {
         probe_direct_port: deps.probe_direct_port,
         probe_proxy_port: deps.probe_proxy_port,
@@ -549,8 +508,6 @@ fn generate_base_config(
         pending_endpoints: &pending_endpoints,
         log: deps.log,
         on_degraded: deps.on_degraded,
-        race_upstream_ips: race_upstream,
-        race_upstream_ports,
         runtime_rules_dir: deps.runtime_rules_dir.clone(),
         rule_resources_path: deps.rule_resources_path.clone(),
         custom_rules_dir: deps.custom_rules_dir.clone(),
@@ -573,6 +530,7 @@ fn generate_base_config(
 
     // ── 9. 装配顶层 SingBoxConfig + experimental.cache_file（L3517-3571）────────
     let mut singbox = SingBoxConfig {
+        polaris_windows_directory: None,
         log,
         dns: Some(dns),
         inbounds,
@@ -798,16 +756,23 @@ fn close_dns_rule_set_graph(
 
 /// 收集 DNS 规则实际引用的 tag；只看已生成的结果，因而天然遵守 DNS builder 的模式/条件/文件有效性门。
 fn dns_rule_set_references(dns: &DnsConfig) -> BTreeSet<String> {
-    dns.rules
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .flat_map(|rule| match rule.rule_set.as_ref() {
-            Some(OneOrMany::One(tag)) => vec![tag.clone()],
-            Some(OneOrMany::Many(tags)) => tags.clone(),
-            None => vec![],
-        })
-        .collect()
+    fn collect(rule: &DnsRule, tags: &mut BTreeSet<String>) {
+        match &rule.rule_set {
+            Some(OneOrMany::One(tag)) => {
+                tags.insert(tag.clone());
+            }
+            Some(OneOrMany::Many(values)) => tags.extend(values.iter().cloned()),
+            None => {}
+        }
+        for child in rule.rules.iter().flatten() {
+            collect(child, tags);
+        }
+    }
+    let mut tags = BTreeSet::new();
+    for rule in dns.rules.iter().flatten() {
+        collect(rule, &mut tags);
+    }
+    tags
 }
 
 /// 最后一层 fail-closed：若今后 DNS builder 新增了无法投影的引用，也只能丢掉该 DNS 规则，
@@ -826,6 +791,15 @@ fn retain_defined_dns_rule_sets(
     defined: &BTreeSet<String>,
     pruned: &mut BTreeSet<String>,
 ) -> bool {
+    if let Some(children) = rule.rules.as_mut() {
+        let before = children.len();
+        children.retain_mut(|child| retain_defined_dns_rule_sets(child, defined, pruned));
+        // Same fail-closed policy as route logical pruning: an incomplete AND cannot
+        // become a broader matcher; an empty OR cannot become unconditional.
+        if children.is_empty() || (rule.mode.as_deref() == Some("and") && children.len() < before) {
+            return false;
+        }
+    }
     let Some(rule_set) = rule.rule_set.as_ref() else {
         return true;
     };

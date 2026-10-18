@@ -1,4 +1,7 @@
 use super::*;
+use crate::runtime::proxy::startup::kernel_gate_cache_record;
+use polaris_config_engine::singbox::RouteRule;
+use polaris_config_engine::user_config::dns_constants::{BLOCK_SERVER_ID, BLOCK_TAG};
 use polaris_core_supervisor::{PortAllocator, PortExclusions};
 use polaris_singbox_grpc::tonic;
 use tonic::codegen::{http, Body as HttpBody, BoxFuture, Service};
@@ -354,13 +357,17 @@ async fn retired_primary_api_mock_rpc_witness_blocks_lazy_selector_from_successo
     tokio::time::timeout(Duration::from_secs(2), resume_rpc.wait())
         .await
         .unwrap();
-    assert!(
-        !tokio::time::timeout(Duration::from_secs(2), stale.join_next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-    );
+    // The obsolete RPC dials a port nobody listens on any more. How soon the host
+    // reports that refusal varies (Windows retransmits the SYN first), but the call
+    // as a whole, dial included, is bound by the client's unary deadline.
+    assert!(!tokio::time::timeout(
+        polaris_singbox_grpc::UNARY_DEADLINE + Duration::from_secs(1),
+        stale.join_next()
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap());
     assert!(
         writes_b.lock().unwrap().is_empty(),
         "an obsolete lazy RPC must never mutate successor B"
@@ -472,6 +479,88 @@ fn resolve_core_binary_env_override_accepts_real_file() {
     let _ = std::fs::remove_file(&f);
 }
 
+/// 内核文件的可执行位：没有任何可执行位即拒，带上「重新安装」这个动作；有即放行；文件不在
+/// 也是 Err（由前一步的解析兜住，这里不把「读不到」当成「可执行」）。
+///
+/// **变异探针**：把 `ensure_core_executable` 的判据改成恒 `Ok` ⇒ 第 1、3 条转红。
+#[cfg(unix)]
+#[test]
+fn core_without_any_exec_bit_is_refused_before_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_support::TestDir::new("polaris-core-exec-bit-");
+    let core = dir.join("sing-box");
+    std::fs::write(&core, b"#!/bin/sh\n").unwrap();
+
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let refused = super::core_binary::ensure_core_executable(&core).unwrap_err();
+    assert!(refused.contains("没有可执行权限"), "{refused}");
+    assert!(refused.contains("重新安装"), "{refused}");
+
+    for mode in [0o755, 0o700, 0o544] {
+        std::fs::set_permissions(&core, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            super::core_binary::ensure_core_executable(&core).is_ok(),
+            "{mode:o}"
+        );
+    }
+    assert!(super::core_binary::ensure_core_executable(&dir.join("missing")).is_err());
+}
+
+/// 调用点守卫：应用直起腿在 spawn 之前过可执行位检查，且失败落专用码而非笼统的启动失败。
+#[test]
+fn direct_start_checks_the_exec_bit_and_reports_a_dedicated_code() {
+    let src = crate::test_support::crate_code("runtime/proxy/startup.rs");
+    let check = src
+        .find("ensure_core_executable(&binary)")
+        .expect("起核路径不再检查内核可执行位");
+    let spawn = src[check..]
+        .find("spawn_core_via_helper(")
+        .or_else(|| src[check..].find(".spawn("))
+        .expect("检查之后找不到起核调用 —— 守卫已失去判据");
+    let between = &src[check..check + spawn];
+    assert!(
+        between.contains("code::CORE_NOT_EXECUTABLE"),
+        "可执行位检查失败必须落 CORE_NOT_EXECUTABLE"
+    );
+    assert_eq!(
+        src.matches("StartError::coded(msg, code::CORE_NOT_EXECUTABLE)")
+            .count(),
+        1
+    );
+    // 两个出口都在，且事件在前：托盘 / 自动连接没有人等这次调用的结果，只有 `set_error` 广播的
+    // `event:proxyError` 到得了用户；发起方在等时，前端按「认领」去重，不是后端少发一个。
+    let event = between
+        .find("self.set_error(&msg, code::CORE_NOT_EXECUTABLE)")
+        .expect("可执行位检查失败必须经 set_error 广播，否则无人等待的入口一个字都看不到");
+    let reject = between
+        .find("return Err(StartError::coded(msg, code::CORE_NOT_EXECUTABLE))")
+        .expect("可执行位检查失败必须把同一个码带回给发起方");
+    assert!(event < reject);
+}
+
+/// 起核前能力探测没通过时落哪个码：只有「助手明确不认识探测命令」才导向装 / 升级助手的引导。
+///
+/// **变异探针**：把 `HelperOutdated` 也映射成 `STARTUP_FAILED` ⇒ 第一条转红（用户看到的是
+/// 「检查服务器配置」）；把 `Unavailable` 映射成 `HELPER_NOT_INSTALLED` ⇒ 第二条转红
+/// （一次通信抖动就让崩溃自愈当成终态收手）。
+#[test]
+fn an_outdated_helper_is_reported_as_a_helper_problem_not_a_generic_start_failure() {
+    use crate::runtime::helper::BirthCapabilityError;
+    assert_eq!(
+        birth_capability_error_code(&BirthCapabilityError::HelperOutdated("x".into())),
+        code::HELPER_NOT_INSTALLED
+    );
+    assert_eq!(
+        birth_capability_error_code(&BirthCapabilityError::Unavailable("x".into())),
+        code::STARTUP_FAILED
+    );
+    // 落的码必须是崩溃自愈认的终态：太旧的助手重试多少轮都一样。
+    assert!(is_unrecoverable_restart_error(&StartError::coded(
+        "x",
+        birth_capability_error_code(&BirthCapabilityError::HelperOutdated("x".into())),
+    )));
+}
+
 /// **门：单测态起核只认注入的假核**（本门存在的理由见 [`ProxyRuntime::core_binary_for_start`]
 /// 的 cfg(test) 版文档——单测漏出真 sing-box 进程的那个坑）。
 ///
@@ -498,28 +587,26 @@ fn test_mode_start_refuses_real_core_unless_injected() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// C11 DNS race sidecar 注入面（`generate_deps` 据运行期 race_server 状态喂 config-engine）。
-//
-// 生成侧（port>0 → dns-node-race server；race off → withRaceOff 单上游）已由 config-engine
-// `builder::dns` / `builder::generate` 单测覆盖；此处专测**注入接线**：`generate_deps` 是否真把
-// DnsRaceRuntime 的投影透传下去。变异验证：把 generate_deps 里 race 两轴改回硬编码 0/`[]`
-// 会让 `injects_positive_port` 转红。
-// ══════════════════════════════════════════════════════════════════════════════
+// Native node-DNS configuration is independent of live App listeners.
 
 #[test]
-fn race_server_default_is_off_zero_port() {
+fn native_dns_generation_needs_no_runtime_listener() {
     let (rt, _dir) = test_runtime();
-    assert_eq!(rt.race_server_port(), 0, "未起 sidecar → race off");
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
-    assert_eq!(deps.race_server_port, 0, "注入面回落 0（race off）");
-    assert!(
-        deps.race_upstream_ips.is_empty(),
-        "race off → 无上游直连放行"
-    );
-    assert!(
-        deps.race_upstream_ports.is_empty(),
-        "race off → 端口轴同样空（route 端口集回 [53,443] 基线，金样不动）"
-    );
+    assert!(deps.node_dns_decoy_override.is_none());
+    // A real selected test node exercises native bootstrap DNS; the resolved-IP
+    // map is intentionally empty because generation must need no App listener.
+    let config: UserConfig = serde_json::from_value(two_node_config(17890, "node-a")).unwrap();
+    let generated =
+        polaris_config_engine::builder::generate_sing_box_config(&config, &BTreeMap::new(), &deps)
+            .unwrap();
+    assert!(generated
+        .dns
+        .unwrap()
+        .rules
+        .unwrap()
+        .iter()
+        .any(|rule| rule.resolver_policy.as_deref() == Some("node-bootstrap")));
 }
 
 #[test]
@@ -550,125 +637,33 @@ fn subscription_update_port_is_independent_and_flows_into_generate_deps() {
 }
 
 #[test]
-fn race_server_injects_positive_port_and_upstreams() {
+fn decoy_override_file_is_captured_for_native_generation() {
     let (rt, _dir) = test_runtime();
-    // 模拟 sidecar 起成功回调（真起 sidecar 属真机门；此处只验注入接线）。
-    rt.set_race_server(
-        5353,
-        vec!["1.1.1.1".into(), "8.8.8.8".into()],
-        vec![443, 8443],
-    );
-    assert_eq!(rt.race_server_port(), 5353);
+    let resources = rule_resource_dir(rt.config.dir());
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(resources.join("gfw-decoy-cidr.txt"), "192.0.2.0/24\n").unwrap();
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(
-        deps.race_server_port, 5353,
-        "端口须透传进 GenerateConfigDeps"
+        deps.node_dns_decoy_override.as_deref(),
+        Some("192.0.2.0/24\n")
     );
+    let generated = polaris_config_engine::builder::generate_sing_box_config(
+        &serde_json::from_value::<UserConfig>(two_node_config(17890, "node-a")).unwrap(),
+        &BTreeMap::new(),
+        &deps,
+    )
+    .unwrap();
+    let hit = generated
+        .dns
+        .unwrap()
+        .rules
+        .unwrap()
+        .into_iter()
+        .find(|r| r.response_class.as_deref() == Some("hit"))
+        .unwrap();
     assert_eq!(
-        deps.race_upstream_ips,
-        vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-        "上游直连 IP 须透传（route 直连放行防 TUN 回环）"
-    );
-    assert_eq!(
-        deps.race_upstream_ports,
-        vec![443u16, 8443],
-        "上游端口须与 IP 同轴透传（缺端口 → ip_cidr×port 规则匹配不上，issue #147）"
-    );
-    // clear → 回落 race off。
-    rt.clear_race_server();
-    let deps2 = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
-    assert_eq!(deps2.race_server_port, 0);
-    assert!(deps2.race_upstream_ips.is_empty());
-    assert!(deps2.race_upstream_ports.is_empty(), "清理须两轴一起翻");
-}
-
-/// 把 `dnsConfig` 片段塞进最小 UserConfig（起 sidecar 只读 dnsConfig；`servers` 无 serde default，必带）。
-fn user_config_with_dns(dns: serde_json::Value) -> UserConfig {
-    serde_json::from_value(serde_json::json!({ "servers": [], "dnsConfig": dns }))
-        .expect("最小 UserConfig")
-}
-
-/// 【不变式：竞速 off 不走池】总开关关 → **不起 sidecar** → 注入面恒 (0, []) →
-/// config-engine `with_race_off` 走 `nodeResolverSingle` 单上游。
-///
-/// 变异验证：删掉 owner `start` 里的 `plan_upstreams(..) else { return }` 早退
-/// （或把 `plan_upstreams` 的 `resolve_node_domains_ahead == Some(false)` 判断去掉）→
-/// sidecar 会照起、端口 >0 → 本测试转红。
-#[tokio::test]
-async fn race_off_starts_no_sidecar_and_keeps_generate_deps_at_zero() {
-    let (rt, _dir) = test_runtime();
-    rt.dns_race
-        .start(
-            &user_config_with_dns(serde_json::json!({
-            "resolveNodeDomainsAhead": false,
-            // 池里塞满上游也不该生效 —— 总开关优先级高于上游选择。
-            "nodeResolverPool": ["ali", "dnspod", "system"],
-            })),
-            rt.config.dir(),
-            rt.gate.generation(),
-            Platform::Linux,
-        )
-        .await;
-    assert_eq!(rt.race_server_port(), 0, "竞速关 → 端口恒 0");
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
-    assert_eq!(deps.race_server_port, 0);
-    assert!(
-        deps.race_upstream_ips.is_empty(),
-        "竞速关 → 不放行任何上游直连"
-    );
-    assert!(deps.race_upstream_ports.is_empty(), "竞速关 → 端口轴同样空");
-}
-
-/// 竞速开（含缺省）→ sidecar 真绑回环口，端口与自定义上游的 **IP + 端口两轴**一并进
-/// `GenerateConfigDeps`。
-///
-/// **只绑 127.0.0.1、不发任何真实上游查询**（DoH 走 [`NoNetworkDoh`] 桩，池里不含 system）。
-///
-/// 自定义上游刻意用**非标端口** `:8443` —— 这正是 issue #147 的形态：端口若不随 IP 下发，
-/// route 只放行 IP、端口集仍是 `[53,443]`，规则匹配不上 ⇒ TUN 下该上游经代理出站/回环。
-///
-/// **变异锁**：把 `generate_deps` 的 `race_upstream_ports` 改回硬编码 `vec![]`（或删掉
-/// owner `commit` 里 `state.upstream_ports = …` 那行）→ `8443` 断言转红。
-#[tokio::test]
-async fn race_on_starts_sidecar_and_feeds_port_and_custom_upstream_ips() {
-    let (rt, _dir) = test_runtime();
-    rt.dns_race
-        .start(
-            &user_config_with_dns(serde_json::json!({
-            "nodeResolverPool": ["ali", "my-doh"],
-            "nodeResolverCustom": [{ "id": "my-doh", "spec": "https://9.9.9.9:8443/dns-query" }],
-            })),
-            rt.config.dir(),
-            rt.gate.generation(),
-            Platform::Linux,
-        )
-        .await;
-    let port = rt.race_server_port();
-    assert!(port > 0, "竞速开 → sidecar 应绑到回环口");
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
-    assert_eq!(deps.race_server_port, port, "端口须与 sidecar 实际监听一致");
-    assert!(
-        deps.race_upstream_ips.contains(&"9.9.9.9".to_string()),
-        "自定义上游 IP 须进 route 直连放行（否则 TUN 下 sidecar 的 DoH 会回环）：{:?}",
-        deps.race_upstream_ips
-    );
-    assert!(
-        deps.race_upstream_ports.contains(&8443),
-        "自定义上游的**非标端口**须与 IP 同轴下发（issue #147）：{:?}",
-        deps.race_upstream_ports
-    );
-    assert!(
-        deps.race_upstream_ports.contains(&443),
-        "内置 ali 的 :443 也在真实上游集里：{:?}",
-        deps.race_upstream_ports
-    );
-    // 停 → 端口与放行清零（生成侧回落单上游）。
-    rt.clear_race_server();
-    assert_eq!(rt.race_server_port(), 0);
-    let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
-    assert!(
-        deps.race_upstream_ports.is_empty(),
-        "停 sidecar 后端口轴须一起清（否则 config 会放行一个已无人使用的端口）"
+        hit.response_reject_ip_cidr,
+        Some(vec!["192.0.2.0/24".into()])
     );
 }
 
@@ -1352,13 +1347,7 @@ async fn upgrade_prompt_is_silent_without_emitter() {
                 .to_string_lossy()
                 .into_owned(),
         ));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     // 刻意不接 emitter。
     rt.run_helper_gate(ProxyModeType::Tun)
         .await
@@ -1486,9 +1475,11 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     let r = rt
         .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
         .await;
-    let error = r.expect_err("无 helper daemon → 起核必失败（不静默直起）");
+    let error = r
+        .expect_err("无 helper daemon → 起核必失败（不静默直起）")
+        .message;
     assert!(
-        error.starts_with("helper 起核通信失败："),
+        error.starts_with("helper pinned 起核通信失败："),
         "必须抵达所测的起核通信失败分支：{error}"
     );
     assert!(
@@ -1497,6 +1488,81 @@ async fn helper_start_without_daemon_keeps_unconfirmed_route() {
     );
     assert!(rt.pid.lock().unwrap().is_none(), "未知结果不得伪造 pid");
     assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// The current daemon must attest the compiled selected CoreID before Start
+/// custody is reserved. Clear the isolated readiness fixture to exercise the
+/// real CoreStatus preflight: NeverConnect cannot confirm that installed ID.
+/// No binary path, runtime install-core fallback, privileged IPC, or native core
+/// is admitted by this fixture. Its positive control restores readiness only.
+/// Removing this preflight would reach Start communication and retain custody.
+#[tokio::test]
+async fn helper_start_is_refused_when_the_protected_core_cannot_be_confirmed() {
+    let (rt, dir) = test_runtime_on(Platform::Linux);
+    *rt.selected_core_ready_fixture.lock().unwrap() = None;
+    let cfg_path = dir.join("singbox-runtime.json");
+    std::fs::write(&cfg_path, "{}").unwrap();
+    let binary = dir.join("bundle-that-is-not-there").join("sing-box");
+    let user_config: UserConfig = serde_json::from_value(polaris_store::default_config()).unwrap();
+    let my_gen = rt.gate.generation();
+    let ts_gate = rt.mesh.tailscale_state_gate().await;
+    let mut main = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints": []}),
+            &ts_gate,
+            rt.mesh.mint_tailscale_main_birth(),
+        )
+        .await
+        .unwrap();
+    let error = rt
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+        .await
+        .expect_err("确认不了配套 ⇒ 必须拒绝");
+    assert_eq!(error.code, Some(code::HELPER_CORE_MISMATCH), "{error}");
+    assert!(
+        error.message.contains("设置 › Helper") && error.message.contains("重新安装或升级"),
+        "诊断文案须带可执行的下一步：{error}"
+    );
+    assert!(
+        !rt.child.lock().unwrap().has_helper_start(),
+        "不得建立 Start custody：起核请求根本不该发出"
+    );
+    assert!(rt.pid.lock().unwrap().is_none());
+
+    // 正面对照：同一条腿、同一个替身，结论换成「已确认」⇒ 走到起核通信（替身恒失败）。
+    // 没有这一半，上面的红绿可能只是因为这条腿本来就走不通。
+    *rt.selected_core_ready_fixture.lock().unwrap() = Some(Ok(()));
+    let error = rt
+        .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
+        .await
+        .expect_err("替身 helper 不可连接");
+    assert_eq!(error.code, None, "{error}");
+    assert!(
+        error.message.starts_with("helper pinned 起核通信失败："),
+        "{error}"
+    );
+    assert!(rt.child.lock().unwrap().has_helper_start());
+}
+
+/// 配套闸的码经起核汇流点原样出栈：`spawn_core_via_helper` 的失败不再一律折成 `STARTUP_FAILED`。
+#[test]
+fn helper_start_failure_keeps_its_own_code_at_the_start_leg() {
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(super) async fn start_inner(",
+    );
+    let at = body
+        .find(".spawn_core_via_helper(")
+        .expect("切点自检：起核汇流点里应有经 helper 起核的调用");
+    let leg = &body[at..];
+    let leg = &leg[..leg.find("} else {").expect("helper 腿的结尾")];
+    assert!(
+        leg.contains("let error_code = e.code.unwrap_or(code::STARTUP_FAILED);")
+            && leg.contains("self.set_error(&e.message, error_code);")
+            && leg.contains("StartError::coded(e.message, error_code)"),
+        "失败码必须取自这一次的错误，状态与返回值落同一个码：{leg}"
+    );
 }
 
 /// Mac/Win 的只读能力门失败发生在 Start custody 建立前；同一个通信替身不得被当作已发 Start。
@@ -1523,7 +1589,8 @@ async fn helper_start_native_capability_failure_keeps_route_unarmed() {
         let error = rt
             .spawn_core_via_helper(&binary, &cfg_path, &user_config, my_gen, &mut main)
             .await
-            .expect_err("未连接 helper → native capability 不可确认");
+            .expect_err("未连接 helper → native capability 不可确认")
+            .message;
         assert!(
             error.contains("已安装的 helper 未提供 native birth 安全能力"),
             "必须抵达 native capability 拒绝分支：{error}"
@@ -1721,7 +1788,7 @@ async fn start_lands_custom_rule_files_before_generate() {
 fn public_start_arms_network_settle_before_any_await() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(super) async fn start_guarded_with_completion(",
+        "    async fn start_guarded_with_attribution(",
     );
     let arm = body
         .find("let _network_settle = self.network_settle.begin(\"proxy-start\")")
@@ -1885,7 +1952,7 @@ async fn uncancelled_start_still_burns_the_whole_retry_budget() {
 }
 
 #[tokio::test]
-async fn sync_custom_rule_files_updates_content_but_never_deletes() {
+async fn sync_custom_rule_files_without_native_confirmation_never_writes_or_deletes() {
     let (rt, _dir) = test_runtime();
     let crdir = rt.custom_rules_dir();
     std::fs::create_dir_all(&crdir).unwrap();
@@ -1895,11 +1962,20 @@ async fn sync_custom_rule_files_updates_content_but_never_deletes() {
     let cfg = smart_config_with_ext_rule();
     let expected = build_custom_rule_files(&cfg);
 
-    rt.sync_custom_rule_files(&cfg).await;
+    assert!(
+        !rt.sync_custom_rule_files(
+            &cfg,
+            rt.gate.generation(),
+            rt.selector_reconcile.intent_generation()
+        )
+        .await
+    );
 
-    // 期望文件被写（内容变 → 原子替换）。
-    for (name, content) in &expected {
-        assert_eq!(&std::fs::read_to_string(crdir.join(name)).unwrap(), content);
+    for name in expected.keys() {
+        assert!(
+            !crdir.join(name).exists(),
+            "no confirmation capability must not publish bytes"
+        );
     }
     // 绝不删：本轮期望集外的既存文件仍在（删除只在起核 write_custom_rule_files 清扫）。
     assert!(
@@ -2318,6 +2394,312 @@ fn singbox_fixture(final_tag: &str, selector_default: Option<&str>) -> SingBoxCo
         "route": { "rules": [], "final": final_tag }
     }))
     .expect("fixture sing-box config 应可解析")
+}
+
+/// Positives come from the real production generator, including its log,
+/// selector membership, exemption rules and matcher-less reject representation.
+fn generated_block_exit(mode: &str, reverse: bool) -> (UserConfig, SingBoxConfig) {
+    let mut raw = polaris_store::store::default_config();
+    raw["selectedServerId"] = serde_json::json!(BLOCK_SERVER_ID);
+    raw["proxyMode"] = serde_json::json!(mode);
+    raw["proxyModeType"] = serde_json::json!("systemProxy");
+    raw["servers"] = serde_json::json!([{
+        "id": "fixture-node", "name": "fixture-node", "protocol": "socks",
+        "address": "192.0.2.1", "port": 1080
+    }]);
+    if reverse {
+        raw["regionRouting"] =
+            serde_json::json!({"enabled": true, "region": "cn", "reverse": true});
+    }
+    let user: UserConfig = serde_json::from_value(raw).expect("real default UserConfig");
+    let core = polaris_config_engine::builder::generate_sing_box_config(
+        &user,
+        &BTreeMap::new(),
+        &probe_pool_generate_deps(0),
+    )
+    .expect("production block configuration generates without starting a core");
+    (user, core)
+}
+
+#[test]
+fn intentional_block_is_not_an_unknown_node_but_wrong_and_stale_exits_still_fail() {
+    for mode in ["global", "smart"] {
+        let (user, core) = generated_block_exit(mode, false);
+        let route = core.route.as_ref().unwrap();
+        assert_eq!(route.final_outbound.as_deref(), Some(DIRECT_TAG));
+        let mut tail = serde_json::to_value(route.rules.last().unwrap()).unwrap();
+        tail.as_object_mut().unwrap().remove("no_drop");
+        assert_eq!(tail, serde_json::json!({"action": "reject"}));
+        assert!(core.outbounds.iter().all(|outbound| {
+            outbound.type_field != "block"
+                && outbound.tag != BLOCK_TAG
+                && outbound.default.as_deref() != Some(BLOCK_TAG)
+                && outbound
+                    .outbounds
+                    .as_ref()
+                    .is_none_or(|members| !members.iter().any(|tag| tag == BLOCK_TAG))
+        }));
+        assert_eq!(
+            attest_effective_exit(&user, &core, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+        for no_drop in [None, Some(false), Some(true)] {
+            let mut rejection_method = core.clone();
+            rejection_method
+                .route
+                .as_mut()
+                .unwrap()
+                .rules
+                .last_mut()
+                .unwrap()
+                .no_drop = no_drop;
+            assert_eq!(
+                attest_effective_exit(&user, &rejection_method, Some(BLOCK_SERVER_ID)),
+                ExitAttestation::Match
+            );
+        }
+        for tag in [DIRECT_TAG, "HK01"] {
+            assert!(matches!(
+                attest_effective_exit(&user, &singbox_fixture(tag, None), Some(BLOCK_SERVER_ID)),
+                ExitAttestation::WrongExit { .. }
+            ));
+        }
+        assert!(matches!(
+            attest_effective_exit(&user, &core, Some("other")),
+            ExitAttestation::StaleSelection { .. }
+        ));
+        let mut unknown = user.clone();
+        unknown.selected_server_id = Some("missing".to_string());
+        assert!(matches!(
+            attest_effective_exit(&unknown, &core, Some("missing")),
+            ExitAttestation::UnknownSelection { .. }
+        ));
+        let mut direct = user.clone();
+        direct.selected_server_id = Some(DIRECT_SERVER_ID.to_string());
+        assert_eq!(
+            attest_effective_exit(
+                &direct,
+                &singbox_fixture(DIRECT_TAG, None),
+                Some(DIRECT_SERVER_ID)
+            ),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_requires_the_unconditional_reject_and_rejects_legacy_final_tags() {
+    for mode in ["global", "smart"] {
+        let (user, core) = generated_block_exit(mode, false);
+        let mut missing_tail = core.clone();
+        missing_tail.route.as_mut().unwrap().rules.pop();
+        assert_ne!(
+            attest_effective_exit(&user, &missing_tail, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+        for (field, value) in [
+            ("domain", serde_json::json!(["example.invalid"])),
+            ("port", serde_json::json!(443)),
+            ("inbound", serde_json::json!("mixed-in")),
+            ("clash_mode", serde_json::json!("Global")),
+        ] {
+            let mut raw = serde_json::to_value(&core).unwrap();
+            raw["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap()[field] = value;
+            let conditional: SingBoxConfig = serde_json::from_value(raw).unwrap();
+            assert_ne!(
+                attest_effective_exit(&user, &conditional, Some(BLOCK_SERVER_ID)),
+                ExitAttestation::Match,
+                "conditional reject: {field}"
+            );
+        }
+        let mut absent_route = core.clone();
+        absent_route.route = None;
+        assert!(matches!(
+            attest_effective_exit(&user, &absent_route, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::UnresolvedExit { .. }
+        ));
+        let forged_legacy = singbox_fixture(BLOCK_TAG, None);
+        assert_ne!(
+            attest_effective_exit(&user, &forged_legacy, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_rejects_selector_leaks_and_earlier_unconditional_routes() {
+    let (user, core) = generated_block_exit("global", false);
+    for rule in [
+        RouteRule {
+            domain: Some(vec!["example.invalid".into()]),
+            action: Some("route".into()),
+            outbound: Some(PROXY_SELECTOR_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            type_field: Some("logical".into()),
+            mode: Some("or".into()),
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            rules: Some(vec![RouteRule {
+                domain: Some(vec!["example.invalid".into()]),
+                outbound: Some(PROXY_SELECTOR_TAG.into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        RouteRule {
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            action: Some("route".into()),
+            outbound: Some("fixture-node".into()),
+            override_address: Some("192.0.2.2".into()),
+            ..Default::default()
+        },
+        RouteRule {
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+        RouteRule {
+            clash_mode: Some("Global".into()),
+            action: Some("route".into()),
+            outbound: Some(DIRECT_TAG.into()),
+            ..Default::default()
+        },
+    ] {
+        let mut leaking = core.clone();
+        let rules = &mut leaking.route.as_mut().unwrap().rules;
+        rules.insert(rules.len() - 1, rule);
+        assert_ne!(
+            attest_effective_exit(&user, &leaking, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+    // Explicitly matched direct/management/custom-node exemptions remain valid;
+    // block is the selected-exit policy, not a whole-device kill switch.
+    assert!(core
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == "fixture-node"));
+    for tag in [DIRECT_TAG, "fixture-node"] {
+        let mut exempted = core.clone();
+        let rules = &mut exempted.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            RouteRule {
+                domain: Some(vec!["explicit-exemption.invalid".into()]),
+                action: Some("route".into()),
+                outbound: Some(tag.into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            attest_effective_exit(&user, &exempted, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match
+        );
+    }
+}
+
+#[test]
+fn generated_block_rejects_semantically_unconditional_and_unproved_route_scopes() {
+    let (user, core) = generated_block_exit("global", false);
+    // These are real RouteRule values inserted into a generated block config,
+    // including the pinned engine's empty-before-invert and P-or-not-P cases.
+    for raw in [
+        serde_json::json!({"action":"route", "outbound":"direct", "invert":false}),
+        serde_json::json!({"action":"route", "outbound":"direct", "invert":true}),
+        serde_json::json!({"action":"route", "outbound":"direct", "domain":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "network":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "rule_set":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "port":[]}),
+        serde_json::json!({"type":"default", "action":"route", "outbound":"direct"}),
+        serde_json::json!({"type":"logical", "mode":"or", "action":"route", "outbound":"direct", "rules":[
+            {"protocol":"tcp"}, {"protocol":"tcp", "invert":true}
+        ]}),
+        serde_json::json!({"type":"logical", "mode":"or", "action":"route", "outbound":"direct", "rules":[
+            {"domain":["example.invalid"]}, {"domain":["other.invalid"]}
+        ]}),
+        serde_json::json!({"type":"logical", "mode":"and", "invert":true, "action":"route", "outbound":"direct", "rules":[
+            {"domain":["example.invalid"]}, {"port":443}
+        ]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "domain_regex":[".*"]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["0.0.0.0/0"]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["::/0"]}),
+    ] {
+        let mut bypass = core.clone();
+        let rules = &mut bypass.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            serde_json::from_value(raw.clone()).unwrap(),
+        );
+        assert_ne!(
+            attest_effective_exit(&user, &bypass, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match,
+            "unconditional or unproved preceding route: {raw}"
+        );
+    }
+}
+
+#[test]
+fn generated_block_preserves_positive_leaf_and_bounded_logical_exemptions() {
+    let (user, core) = generated_block_exit("global", false);
+    for raw in [
+        serde_json::json!({"action":"route", "outbound":"direct", "type":"default", "invert":false,
+            "domain":["example.invalid"], "network":[], "rule_set":[]}),
+        serde_json::json!({"action":"route", "outbound":"direct", "inbound":"management-in"}),
+        serde_json::json!({"action":"route", "outbound":"direct", "ip_cidr":["192.168.0.0/16", "fc00::/7"]}),
+        serde_json::json!({"action":"route", "outbound":"fixture-node", "rule_set":"geosite-private"}),
+        serde_json::json!({"action":"route", "outbound":"direct", "type":"logical", "mode":"and", "rules":[
+            {"domain":["example.invalid"]}, {"protocol":"tcp", "invert":true}
+        ]}),
+        serde_json::json!({"action":"route", "outbound":"fixture-node", "type":"logical", "mode":"or", "rules":[
+            {"type":"logical", "mode":"and", "rules":[{"domain":["example.invalid"]}, {"port":443}]},
+            {"type":"logical", "mode":"and", "rules":[{"domain":["example.invalid"]}, {"port":8443}]}
+        ]}),
+    ] {
+        let mut exempted = core.clone();
+        let rules = &mut exempted.route.as_mut().unwrap().rules;
+        rules.insert(
+            rules.len() - 1,
+            serde_json::from_value(raw.clone()).unwrap(),
+        );
+        assert_eq!(
+            attest_effective_exit(&user, &exempted, Some(BLOCK_SERVER_ID)),
+            ExitAttestation::Match,
+            "proved positive preceding route: {raw}"
+        );
+    }
+}
+
+#[test]
+fn reverse_geo_exemption_cannot_hide_block_shape_or_stale_selection() {
+    let (user, core) = generated_block_exit("smart", true);
+    assert!(region_reverse_rule_sets_intact(&user, &core));
+    assert_eq!(
+        attest_effective_exit(&user, &core, Some(BLOCK_SERVER_ID)),
+        ExitAttestation::Match
+    );
+    assert!(matches!(
+        attest_effective_exit(&user, &core, Some("fixture-node")),
+        ExitAttestation::StaleSelection { .. }
+    ));
+    let mut unblocked = core.clone();
+    unblocked.route.as_mut().unwrap().rules.pop();
+    assert_ne!(
+        attest_effective_exit(&user, &unblocked, Some(BLOCK_SERVER_ID)),
+        ExitAttestation::Match
+    );
+    assert!(matches!(
+        attest_effective_exit(&user, &unblocked, Some("fixture-node")),
+        ExitAttestation::StaleSelection { .. }
+    ));
 }
 
 /// 造 UserConfig：两个节点（HK01/JP01），选中 `selected`。
@@ -3077,7 +3459,7 @@ fn kernel_gate_cache_normalizes_only_known_runtime_ports() {
             { "type": "other", "listen_port": 21004 }
         ],
         "dns": { "servers": [
-            { "tag": "dns-node-race", "server_port": 21005 },
+            { "tag": "dns-node-native-2-0", "server_port": 5353 },
             { "tag": "dns-user", "server_port": 53 }
         ]},
         "secret": "stable-secret"
@@ -3086,7 +3468,6 @@ fn kernel_gate_cache_normalizes_only_known_runtime_ports() {
     different_runtime_ports["inbounds"][0]["listen_port"] = Value::from(31001);
     different_runtime_ports["inbounds"][1]["listen_port"] = Value::from(31002);
     different_runtime_ports["services"][0]["listen_port"] = Value::from(31003);
-    different_runtime_ports["dns"]["servers"][0]["server_port"] = Value::from(31005);
 
     let mut normalized_original = original.clone();
     normalize_kernel_gate_config(&mut normalized_original);
@@ -3098,11 +3479,14 @@ fn kernel_gate_cache_normalizes_only_known_runtime_ports() {
 
     let mut changed_mixed = original.clone();
     changed_mixed["inbounds"][2]["listen_port"] = Value::from(17891);
+    let mut changed_dns = original.clone();
+    changed_dns["dns"]["servers"][0]["server_port"] = Value::from(5354);
     let mut changed_secret = original;
     changed_secret["secret"] = Value::from("changed-secret");
     for (path, mut changed) in [
         ("用户 mixed 端口", changed_mixed),
         ("管理 API secret", changed_secret),
+        ("原生 DNS 上游端口", changed_dns),
     ] {
         normalize_kernel_gate_config(&mut changed);
         assert_ne!(normalized_original, changed, "{path} 改变必须 cache miss");
@@ -3117,6 +3501,7 @@ fn kernel_gate_cache_round_trips_atomically_and_corruption_is_a_miss() {
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path: dir.join("sing-box").to_string_lossy().into_owned(),
         binary_len: 42,
+        binary_sha256: "b".repeat(64),
         binary_modified_ns: 123,
         config_sha256: "a".repeat(64),
     };
@@ -3153,97 +3538,6 @@ fn background_attestation_only_commits_to_the_same_running_generation_and_pid() 
 
     let stopped = ProxyStatus::default();
     assert!(!attestation_commit_allowed(7, 7, &stopped, 4245));
-}
-
-/// **P4 能力缓存**：「这个 helper 不支持 install-core」的记号必须能失效，且「探不到」不算命中。
-///
-/// 它治的是纯性能坑（旧 Windows helper 回 `ERR unknown` 那条腿此前一个缓存都不记，于是每次起核
-/// 都白跑两个 80MB 的 sha256 + 一次暂存）。但缓存**只要永不失效就变成缺陷**：helper 升级后能力
-/// 会变，而缓存还在替旧 helper 回答。失效键取 helper 自报的 `build_identity` —— 它与
-/// `HelperManager` 判 `upgradeable` 用的是同一个字段，「helper 换了一版而 build_id 没变」与
-/// 「app 判不出可升级」是同一个前提，不会只坏一边。
-#[test]
-fn install_core_capability_cache_keys_on_helper_build_and_never_hits_on_a_failed_probe() {
-    use crate::runtime::helper::{HelperBuildProbe, InstallCoreUnsupportedRecord};
-
-    let recorded = InstallCoreUnsupportedRecord {
-        helper_build_id: Some("build-A".to_owned()),
-    };
-
-    // 同一个 helper 构建 → 命中（这是它存在的理由：省掉重复的 80MB 空转）。
-    assert!(install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-    // helper 升级（build_id 必变）→ 失效，重新真试一次 install-core。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Reported(Some("build-B".to_owned()))
-    ));
-    // 探不到 ≠ 还是那个 helper：宁可白跑一轮完整对账，也不能让缓存永不失效。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&recorded),
-        &HelperBuildProbe::Unreachable
-    ));
-    // 没记过就不许命中（否则首次起核直接跳过对账 = 加固整条不生效）。
-    assert!(!install_core_unsupported_cache_hit(
-        None,
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-
-    // 旧 helper 如实不带 build_identity：`Reported(None)` 本身是个稳定身份，可命中；
-    // 但它与 `Unreachable` 必须分得开 —— 折在一起就等于「探测失败也算命中」。
-    let legacy = InstallCoreUnsupportedRecord {
-        helper_build_id: None,
-    };
-    assert!(install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Reported(None)
-    ));
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Unreachable
-    ));
-    // 旧 helper（无 build_id）升级成本批的新 helper（必带 build_id）→ None ⇒ Some 也要失效。
-    assert!(!install_core_unsupported_cache_hit(
-        Some(&legacy),
-        &HelperBuildProbe::Reported(Some("build-A".to_owned()))
-    ));
-}
-
-#[test]
-fn protected_core_cache_requires_both_unchanged_payloads() {
-    let dir = fresh_test_dir();
-    let active_dir = dir.join("active");
-    let protected_dir = dir.join("protected");
-    std::fs::create_dir_all(&active_dir).unwrap();
-    std::fs::create_dir_all(&protected_dir).unwrap();
-    std::fs::write(active_dir.join("sing-box"), b"CORE").unwrap();
-    std::fs::write(protected_dir.join("sing-box"), b"CORE").unwrap();
-
-    let active = crate::runtime::core_promote::payload_stamp(&active_dir, "sing-box").unwrap();
-    let protected =
-        crate::runtime::core_promote::payload_stamp(&protected_dir, "sing-box").unwrap();
-    let cached = ProtectedCoreCacheRecord {
-        active: active.clone(),
-        protected: protected.clone(),
-    };
-    assert!(protected_core_cache_hit(
-        Some(&cached),
-        &active,
-        Some(&protected)
-    ));
-    assert!(!protected_core_cache_hit(Some(&cached), &active, None));
-
-    std::fs::write(active_dir.join("libcronet.so"), b"CRONET").unwrap();
-    let changed_active =
-        crate::runtime::core_promote::payload_stamp(&active_dir, "sing-box").unwrap();
-    assert!(!protected_core_cache_hit(
-        Some(&cached),
-        &changed_active,
-        Some(&protected)
-    ));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(unix)]
@@ -3836,50 +4130,41 @@ fn start_inner_feeds_wait_ready_the_scale_derived_budget() {
     );
 }
 
-/// 🔴 **S-6：能力记号的身份必须在**发 `install-core` 之前**探到。**
-///
-/// 事后再探会把「回 `ERR unknown` 的那个 helper」与「此刻在管道那头的 helper」混为一谈：
-/// UAC 重装是秒级操作，两者之间完全可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒
-/// 失效键立刻就是最新值 ⇒ 本会话内永久跳过受保护核对账，而新 helper 其实是支持的。
-/// 反过来（探完才换代）只会让记号挂在旧身份上，下次探到新身份即失效、重试 —— 方向安全。
-///
-/// 源码级的理由：这一格要一个「回 `ERR unknown` 且在两次调用之间被换掉」的真 helper，本机造不出。
-///
-/// 变异锁：把 `helper_build_probe()` 挪到 `install_core(` 之后 → 第二/第三条转红；
-/// 在 `install_core` 之后再探一次（哪怕前面那次留着）→ 第三条转红。
+/// Runtime never uploads an executable or caches an obsolete install-core
+/// capability. Each Start reads the current daemon's selected CoreID status
+/// before reserving Start custody or sending its pinned mutation.
 #[test]
-fn install_core_capability_note_uses_the_identity_probed_before_the_call() {
-    let body = method_body(
-        &module_code("runtime/proxy"),
-        "    async fn reconcile_protected_core(&self, active_core: &Path) {",
-    );
-    // 切点自检：切出来的确实是那个方法（含它的两个锚点），否则下面全是空断言。
-    let install_at = body
-        .find("helper.install_core(")
-        .expect("切点自检失败：方法体里没有 install_core 调用");
-    let probe_at = body
-        .find("let build_before = helper.helper_build_probe();")
-        .expect("能力记号的身份没有单独探一次并存下来（事后再探 = 记号可能挂到新 helper 身上）");
-    assert!(
-        probe_at < install_at,
-        "身份必须在发 install-core **之前**探：两者之间 helper 可能已被重装换代"
-    );
-    // `install_core` 之后不许再出现探测调用 —— 留一条事后腿等于把上面那条顺序断言架空。
-    let after = &body[install_at..];
-    assert!(
-        !after.contains("helper_build_probe()"),
-        "install-core 之后还在探身份：那次探到的可能是刚换上的新 helper"
-    );
-    // 正面断言：记下去的就是 `build_before` 那一份（只钉顺序会被「探了但没用」骗过）。
-    assert!(
-        after.contains("note_install_core_unsupported(&build_before)"),
-        "Unsupported 臂没有拿 `build_before` 去记号"
-    );
-    // 命中判定那一路的探测（缓存命中检查）是另一回事，必须仍在 —— 它探的就是「此刻的 helper」。
-    assert!(
-        body[..install_at].contains("&helper.helper_build_probe()"),
-        "缓存命中判定的即时探测被一起删了：那一路要的恰恰是「此刻在管道那头的是谁」"
-    );
+fn selected_content_preflight_rechecks_current_daemon_before_start_custody() {
+    let proxy = module_code("runtime/proxy");
+    let body = method_body(&proxy, "    pub(super) async fn spawn_core_via_helper(");
+    let status = body.find("helper.require_selected_core()").unwrap();
+    for mutation in [
+        "self.lease_legacy_start()",
+        "self.register_helper_start_backend_with_main(",
+        "helper.start_core(",
+    ] {
+        assert!(
+            status < body.find(mutation).unwrap(),
+            "selected content preflight must precede {mutation}"
+        );
+    }
+    assert!(body.contains("if let Err(why) = selected_ready"));
+    assert!(body.contains("return Err(StartError::coded(message, error_code))"));
+    for retired in [
+        "reconcile_protected_core",
+        "note_install_core_unsupported",
+        "helper.install_core(",
+    ] {
+        assert!(
+            !proxy.contains(retired),
+            "retired runtime content mutation/cache: {retired}"
+        );
+    }
+    let helper = crate::test_support::crate_code("runtime/helper.rs");
+    let status_body = method_body(&helper, "    pub(crate) fn core_status(");
+    assert!(status_body.contains("crate::runtime::core_identity::selected_id("));
+    assert!(status_body.contains("query_core_status(&self.build_client()?, &id)"));
+    assert!(!helper.contains("Request::InstallCore"));
 }
 
 /// 取值函数单测不能覆盖历史漏接；从真实 controller marker 穿过生产 generate_deps。
@@ -3901,4 +4186,486 @@ fn lan_resolver_flows_from_controller_into_generated_dependencies() {
     let deps = rt.generate_deps(9090, 0, 0, None, &[], &serde_json::json!({}), false);
     assert_eq!(deps.lan_resolver_for_dns.as_deref(), Some("192.168.42.1"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// 循环发出 `distinct` 个互异端口的桩：要的口数超过它就必然撞上已选端口。
+struct CyclingPorts {
+    distinct: u16,
+    next: std::sync::atomic::AtomicU16,
+}
+
+impl polaris_core_supervisor::port_bookkeeping::FreePortProvider for CyclingPorts {
+    fn try_allocate(&self) -> Option<u16> {
+        let n = self.next.fetch_add(1, Ordering::SeqCst);
+        Some(30_000 + n % self.distinct)
+    }
+}
+
+/// 探针池的端口申请：按槽位上限要得到就用上限；要不到降到 16 个槽再要一次；仍要不到才是空池。
+/// 上限本身不高于 16 时没有可降的一级。
+#[test]
+fn probe_pool_allocation_falls_back_to_sixteen_slots_before_giving_up() {
+    let excluded = PortExclusions::for_primary_api(Some(9090), None, None, None);
+    let allocate = |distinct, slots| {
+        allocate_probe_ports(
+            &PortAllocator::new(CyclingPorts {
+                distinct,
+                next: std::sync::atomic::AtomicU16::new(0),
+            }),
+            &excluded,
+            slots,
+        )
+        .len()
+    };
+    assert_eq!(allocate(200, 64), 65, "出口探针口 + 64 个槽");
+    assert_eq!(allocate(30, 64), 17, "只有 30 个口可用：降到 16 个槽");
+    assert_eq!(allocate(10, 64), 0, "连 17 个也凑不齐：空池");
+    assert_eq!(allocate(30, 32), 17);
+    assert_eq!(allocate(10, 16), 0, "上限就是 16：不重试");
+    assert_eq!(allocate(200, 16), 17);
+}
+
+fn probe_pool_generate_deps(slots: u16) -> polaris_config_engine::builder::GenerateConfigDeps {
+    polaris_config_engine::builder::GenerateConfigDeps {
+        platform: "linux".into(),
+        arch: "x64".into(),
+        node_dns_decoy_override: None,
+        probe_direct_port: None,
+        probe_proxy_port: Some(39_000),
+        debug_probe_mixed_udp: false,
+        update_in_port: None,
+        subscription_update_in_port: None,
+        loopback_auth: None,
+        probe_pool_ports: (0..slots).map(|k| 40_000 + k).collect(),
+        lan_resolver_for_dns: None,
+
+        has_cronet: true,
+        cronet_copy_failed: false,
+        has_management_api: false,
+        privacy_mode: false,
+        log_level: polaris_config_engine::user_config::LogLevel::Info,
+        disable_log_file: false,
+        dashboard_serve_dir: None,
+        tailscale_api_port: 15490,
+        cache_path: "/fake/cache.db".into(),
+        log_file_path: None,
+        runtime_rules_dir: "/fake/runtime-rules".into(),
+        rule_resources_path: "/fake/rule-resources".into(),
+        custom_rules_dir: "/fake/custom-rules".into(),
+        tailnet_rules_dir: "/fake/tailnet-rules".into(),
+        tailscale_state_dir_prefix: "/fake/ts".into(),
+        observed_tailnet_addresses: Default::default(),
+        is_valid_srs_fn: |_| true,
+        own_lan_cidrs: vec![],
+        log: |_, _| {},
+        on_degraded: || {},
+        system_dns_takeover_active: false,
+        netenv_dhcp_suppressed: false,
+        network_canary_port: None,
+    }
+}
+
+/// 把生成的配置里属于探针池的条目摘出来按类计数，返回（各类条数，摘掉之后的配置）。
+fn split_probe_pool(config: serde_json::Value) -> ([usize; 5], serde_json::Value) {
+    fn slot_of<'a>(value: &'a serde_json::Value, key: &str, prefix: &str) -> Option<&'a str> {
+        let text = match &value[key] {
+            serde_json::Value::String(text) => text.as_str(),
+            serde_json::Value::Array(items) if items.len() == 1 => items[0].as_str()?,
+            _ => return None,
+        };
+        text.strip_prefix(prefix)
+            .filter(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    }
+    let mut config = config;
+    let mut counts = [0usize; 5];
+    let mut strip = |pointer: &str, index: usize, key: &str, prefix: &str| {
+        let items = config
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap_or_else(|| panic!("生成的配置里没有 {pointer}"));
+        let before = items.len();
+        items.retain(|item| slot_of(item, key, prefix).is_none());
+        counts[index] = before - items.len();
+    };
+    strip("/inbounds", 0, "tag", "probe-in-");
+    strip("/route/rules", 1, "outbound", "probe-selector-");
+    strip("/outbounds", 2, "tag", "probe-selector-");
+    strip("/dns/servers", 3, "tag", "dns-probe-exit-");
+    strip("/dns/rules", 4, "server", "dns-probe-exit-");
+    (counts, config)
+}
+
+/// 配置生成器对槽位数没有写死的假设：上限 64 时探针入站、钉死路由、选择器、DNS 服务器、DNS 规则
+/// 各 64 个，其余部分与上限 16 时逐字节相同。
+#[test]
+fn sixty_four_probe_slots_only_add_probe_pool_entries_to_the_config() {
+    let user: polaris_config_engine::user_config::app_config::UserConfig =
+        serde_json::from_value(serde_json::json!({
+            "proxyMode": "smart", "proxyModeType": "systemProxy", "mixedPort": 17890,
+            "selectedServerId": "n1",
+            "servers": [
+                { "id": "n1", "name": "n1", "protocol": "shadowsocks", "address": "192.0.2.1",
+                  "port": 8388, "password": "p", "method": "aes-128-gcm" },
+                { "id": "n2", "name": "n2", "protocol": "shadowsocks", "address": "192.0.2.2",
+                  "port": 8388, "password": "p", "method": "aes-128-gcm" },
+            ],
+        }))
+        .expect("夹具配置可解析");
+    let generate = |slots| {
+        let outcome = polaris_config_engine::builder::generate_sing_box_config_with_report(
+            &user,
+            &BTreeMap::new(),
+            &probe_pool_generate_deps(slots),
+        )
+        .expect("夹具配置可生成");
+        split_probe_pool(serde_json::to_value(&outcome.config).unwrap())
+    };
+    let (sixteen, rest_of_sixteen) = generate(16);
+    let (sixty_four, rest_of_sixty_four) = generate(64);
+    assert_eq!(sixteen, [16; 5]);
+    assert_eq!(sixty_four, [64; 5]);
+    assert_eq!(
+        serde_json::to_string(&rest_of_sixty_four).unwrap(),
+        serde_json::to_string(&rest_of_sixteen).unwrap(),
+        "探针池之外的部分不随槽位数变化"
+    );
+}
+
+/// 一轮测速的读回流连哪个管理端点：持票据时恒是票据里的那一个（端口与 secret 都是），哪怕当前
+/// 运行态已经换了端口与 secret；没有票据时才取此刻运行核的。
+#[cfg(not(target_os = "ios"))]
+#[tokio::test]
+async fn readback_endpoint_stays_on_the_ticket_when_the_runtime_moves_on() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_port = listener.local_addr().unwrap().port();
+    let _server =
+        SelectorRpcServer::start(listener, "saved-secret", SelectorRpcCalls::default()).await;
+    let (runtime, _directory) = test_runtime();
+    let mut saved = two_node_config(7890, "node-a");
+    saved["clashApiSecret"] = serde_json::json!("saved-secret");
+    runtime.config.save_full(&saved).unwrap();
+    let (ticket, _emitted) = ticket_at_mock_rpc(&runtime, bound_port).await;
+    assert_eq!(
+        runtime.readback_endpoint(None),
+        Some((bound_port, "saved-secret".to_string())),
+        "对照：票据生成那一刻两者相同"
+    );
+
+    // 运行态换了端口与 secret（核换代）。
+    runtime.status.write().unwrap().clash_api_port = 30_202;
+    saved["clashApiSecret"] = serde_json::json!("next-secret");
+    runtime.config.save_full(&saved).unwrap();
+    assert_eq!(
+        runtime.readback_endpoint(Some(&ticket)),
+        Some((bound_port, "saved-secret".to_string()))
+    );
+    assert_eq!(
+        runtime.readback_endpoint(None),
+        Some((30_202, "next-secret".to_string()))
+    );
+    assert_eq!(
+        runtime.management_endpoint(),
+        runtime.readback_endpoint(None)
+    );
+
+    // 核停了：没有票据就没有端点；票据里的那一个不受影响。
+    runtime.status.write().unwrap().running = false;
+    assert_eq!(runtime.readback_endpoint(None), None);
+    assert!(runtime.readback_endpoint(Some(&ticket)).is_some());
+}
+
+/// 起核快照从**生成产物**里带出 endpoint 归类与各 tag 的前置出站，测速的静态取材原样读到它们
+/// 与规则名映射。
+#[cfg(not(target_os = "ios"))]
+#[test]
+fn switch_snapshot_carries_endpoint_tags_and_static_detours() {
+    let (runtime, _directory) = test_runtime();
+    let saved = two_node_config(7890, "node-a");
+    runtime.config.save_full(&saved).unwrap();
+    let effective: UserConfig = serde_json::from_value(saved.clone()).unwrap();
+    let deps = runtime.generate_deps(30_101, 0, 0, None, &[20_010], &saved, false);
+    let emitted = polaris_config_engine::builder::generate_sing_box_config(
+        &effective,
+        &BTreeMap::new(),
+        &deps,
+    )
+    .unwrap();
+    let baseline = ProxyRuntime::build_switch_snapshot(&effective, &emitted, &deps);
+    assert!(
+        baseline.endpoint_tags.is_empty(),
+        "对照：两个 ss 节点都不是 endpoint"
+    );
+    assert!(
+        baseline.static_detours.is_empty(),
+        "对照：没有节点带前置出站"
+    );
+
+    // 在产物上加一个带前置出站的 endpoint，并给 Node A 挂一个前置出站。
+    let mut raw = serde_json::to_value(&emitted).unwrap();
+    raw["endpoints"] = serde_json::json!([
+        { "type": "wireguard", "tag": "WG", "detour": "Node B" }
+    ]);
+    let node_a = raw["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| outbound["tag"] == "Node A")
+        .expect("产物里有 Node A");
+    node_a["detour"] = serde_json::json!("front");
+    let shaped = serde_json::from_value(raw).unwrap();
+    let mut snapshot = ProxyRuntime::build_switch_snapshot(&effective, &shaped, &deps);
+    assert_eq!(snapshot.endpoint_tags, BTreeSet::from(["WG".to_string()]));
+    assert_eq!(
+        snapshot.static_detours,
+        BTreeMap::from([
+            ("Node A".to_string(), "front".to_string()),
+            ("WG".to_string(), "Node B".to_string()),
+        ])
+    );
+
+    assert_eq!(
+        runtime.speed_binding_context(),
+        SpeedBindingContext::default(),
+        "没有快照 → 空"
+    );
+    snapshot.named_rule_by_raw.insert(
+        "domain=example.com => route(Node A)".to_string(),
+        polaris_stats_engine::RuleIdentity {
+            id: "rule-1".to_string(),
+            name: "我的规则".to_string(),
+        },
+    );
+    *runtime.switch_snapshot.write().unwrap() = Some(snapshot);
+    let context = runtime.speed_binding_context();
+    assert_eq!(context.endpoint_tags, BTreeSet::from(["WG".to_string()]));
+    assert_eq!(
+        context.static_detours.get("Node A").map(String::as_str),
+        Some("front")
+    );
+    assert_eq!(
+        context.rule_names,
+        BTreeMap::from([(
+            "domain=example.com => route(Node A)".to_string(),
+            "我的规则".to_string()
+        )])
+    );
+}
+
+/// 🔵 **源门**：管理 API secret 的读取点全部登记在案。取材面是运行时与命令层的全部生产源码，
+/// 两种读法都算：按键名读原始配置 JSON（字符串字面量），与读类型化配置上的同名字段。
+///
+/// 多出一处未登记的读取点、或某一处的次数变了，都转红：新读法要么并到单点上，要么带着
+/// 「取值源为什么不同」的理由登记进来。
+#[test]
+fn the_management_secret_has_a_single_reader() {
+    /// (路径, 字面量次数, 字段读取次数, 理由)
+    const READERS: &[(&str, usize, usize, &str)] = &[
+        (
+            "commands/config.rs",
+            5,
+            0,
+            "secret 的生成与回填方：读它是为了判断要不要生成，另有后端独写键的名单，都不是取来用。",
+        ),
+        (
+            "commands/server.rs",
+            0,
+            1,
+            "Tailscale 登录核的快照：读的是运行核**起核时**的那份配置（`running_config_snapshot`），\
+             登录核要连的是正在跑的那个核；当前已保存的配置在改了 secret 未重启时与它不同。",
+        ),
+        (
+            "runtime/management_api.rs",
+            1,
+            0,
+            "从原始配置 JSON 取这个键的单点。",
+        ),
+        (
+            "runtime/proxy/startup.rs",
+            0,
+            1,
+            "起核流程确认网格模式：读的是**正在起**的这份配置，此刻它还不是任何已提交的运行态。",
+        ),
+    ];
+    /// 类型化字段的读取：`.clash_api_secret` 后面不跟 `(`（那是同名方法的调用）。
+    fn field_reads(code: &str) -> usize {
+        code.match_indices(".clash_api_secret")
+            .filter(|(at, needle)| {
+                let rest = &code[at + needle.len()..];
+                let next = rest.chars().find(|ch| !ch.is_whitespace());
+                !rest.starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                    && next != Some('(')
+            })
+            .count()
+    }
+    // module_files includes both the module root file and its descendant directory.
+    fn belongs_to_module(path: &str, dir: &str) -> bool {
+        (path == format!("{dir}.rs") || path.starts_with(format!("{dir}/").as_str()))
+            && !path.starts_with(format!("{dir}/{dir}/").as_str())
+    }
+    for dir in ["runtime", "commands"] {
+        assert!(belongs_to_module(&format!("{dir}.rs"), dir));
+        assert!(belongs_to_module(&format!("{dir}/nested/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}/{dir}/reader.rs"), dir));
+        assert!(!belongs_to_module(&format!("{dir}_other/reader.rs"), dir));
+        assert!(!belongs_to_module("other/reader.rs", dir));
+    }
+    let mut found: Vec<(String, usize, usize)> = ["runtime", "commands"]
+        .into_iter()
+        .flat_map(|dir| {
+            crate::test_support::module_files(dir)
+                .into_iter()
+                .inspect(move |(path, _)| {
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
+                })
+        })
+        .filter_map(|(path, source)| {
+            let code = polaris_source_probe::mask_comments(&source);
+            let literals = code.matches("\"clashApiSecret\"").count();
+            let fields = field_reads(&code);
+            (literals + fields > 0).then_some((path, literals, fields))
+        })
+        .collect();
+    found.sort();
+    let registered: Vec<(String, usize, usize)> = READERS
+        .iter()
+        .map(|(path, literals, fields, _)| ((*path).to_string(), *literals, *fields))
+        .collect();
+    assert_eq!(found, registered, "管理 API secret 的读取点与登记不符");
+
+    // 切点自检：字段读取的判法认得出读取、认得出方法调用不是读取。
+    assert_eq!(field_reads("c.clash_api_secret.clone()"), 1);
+    assert_eq!(
+        field_reads("user_config.clash_api_secret\n    .as_deref()"),
+        1
+    );
+    assert_eq!(field_reads("self.clash_api_secret()"), 0);
+    assert_eq!(field_reads("x.clash_api_secret_in(saved)"), 0);
+
+    // 端点取法的单点：命令层不再自己拼端点。
+    let endpoints: Vec<String> = ["runtime", "commands"]
+        .into_iter()
+        .flat_map(|dir| {
+            crate::test_support::module_files(dir)
+                .into_iter()
+                .inspect(move |(path, _)| {
+                    assert!(
+                        belongs_to_module(path, dir),
+                        "unexpected module path: {path}"
+                    );
+                })
+        })
+        .filter(|(_, source)| {
+            polaris_source_probe::mask_comments(source).contains("fn management_endpoint(")
+        })
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        endpoints,
+        vec!["runtime/proxy/management_api.rs".to_string()]
+    );
+}
+
+#[test]
+fn occupied_helper_capability_has_a_dedicated_content_resource_error() {
+    let error = crate::runtime::helper::BirthCapabilityError::SlotOccupied("occupied".into());
+    assert_eq!(
+        birth_capability_error_code(&error),
+        code::HELPER_CORE_OCCUPIED
+    );
+}
+
+#[test]
+fn accepted_config_cache_changes_when_core_bytes_change_with_same_path_size_and_mtime() {
+    let dir = fresh_test_dir();
+    let core = dir.join("core");
+    std::fs::write(&core, b"original").unwrap();
+    let modified = std::fs::metadata(&core).unwrap().modified().unwrap();
+    let config = test_singbox_config(vec![], vec![]);
+    let before = kernel_gate_cache_record(&core, &config).unwrap();
+    std::fs::write(&core, b"replaced").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&core)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let after = kernel_gate_cache_record(&core, &config).unwrap();
+    assert_eq!(before.binary_path, after.binary_path);
+    assert_eq!(before.binary_len, after.binary_len);
+    assert_eq!(before.binary_modified_ns, after.binary_modified_ns);
+    assert_ne!(before.binary_sha256, after.binary_sha256);
+    assert_ne!(before, after);
+}
+
+thread_local! {
+    static DECOY_READ_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[test]
+fn decoy_override_read_diagnostics_distinguish_absent_invalid_and_valid_files() {
+    let (_runtime, dir) = test_runtime();
+    let path = dir.path().join("private-sensitive-name");
+    let logger = |_: polaris_config_engine::user_config::LogLevel, message: &str| {
+        DECOY_READ_LOGS.with(|logs| logs.borrow_mut().push(message.into()));
+    };
+    DECOY_READ_LOGS.with(|logs| logs.borrow_mut().clear());
+    assert!(crate::runtime::proxy::startup::read_node_dns_decoy_override(&path, logger).is_none());
+    DECOY_READ_LOGS.with(|logs| assert!(logs.borrow().is_empty()));
+    std::fs::write(&path, [0xff, 0xfe]).unwrap();
+    assert!(crate::runtime::proxy::startup::read_node_dns_decoy_override(&path, logger).is_none());
+    DECOY_READ_LOGS.with(|logs| {
+        let logs = logs.borrow();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("read failed (InvalidData)"));
+        assert!(!logs[0].contains("private-sensitive-name"));
+    });
+    std::fs::write(&path, "192.0.2.0/24").unwrap();
+    assert_eq!(
+        crate::runtime::proxy::startup::read_node_dns_decoy_override(&path, logger).as_deref(),
+        Some("192.0.2.0/24")
+    );
+    DECOY_READ_LOGS.with(|logs| assert_eq!(logs.borrow().len(), 1));
+}
+
+/// Use the same retained-proof validator as each production gate iteration.
+/// Eviction cannot veto unchanged bytes or allow a replacement to inherit them.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement() {
+    use crate::runtime::proxy::startup::validate_startup_cli_proof;
+    use crate::runtime::tls_fingerprints::{cached_cli, probe_cli, probe_cli_observation};
+    let (_rt, dir) = test_runtime();
+    let binary = dir.join("startup-proof");
+    std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+    let proof = probe_cli_observation(&binary).await.unwrap();
+    for index in 0..4 {
+        let other = dir.join(format!("startup-cache-pressure-{index}"));
+        std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+        assert!(probe_cli(&other).await.binary_sha256.is_some());
+    }
+    assert!(
+        cached_cli(&binary).is_none(),
+        "exercise actual cache eviction"
+    );
+    validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)).unwrap();
+    assert!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, None).is_err(),
+        "a missing retained proof must not be accepted merely because cache eviction is allowed"
+    );
+    let modified = std::fs::metadata(&binary).unwrap().modified().unwrap();
+    let replacement = dir.join("startup-replacement");
+    std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    assert_eq!(
+        validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)),
+        Err("Core bytes changed after capability query; retry startup".into())
+    );
 }

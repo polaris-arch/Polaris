@@ -75,6 +75,25 @@ pub struct DnsServer {
 /// `dns.rules[]`（`singbox-config-types.ts:41 SingBoxDnsRule`）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DnsRule {
+    /// Explicit, isolated native resolver policy. Omitted for ordinary DNS rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_reject_ip_cidr: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_rcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_optimistic_cache: Option<bool>,
+    /// Logical matcher mode, or scoped respond mode (defer/fallback).
+    /// Actions belong only to the outer rule; logical children are headless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<DnsRule>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clash_mode: Option<String>,
     /// `rule_set`：sing-box DNS rule 是 `string | string[]`（OneOrMany）。
@@ -171,31 +190,19 @@ pub enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-/// **dial 侧** `domain_resolver`（`outbounds[]` / `endpoints[]`）：`"<tag>"` 或 `{server, strategy}`。
-/// 对齐 上游 `SingBoxDomainResolver`（`a942c60`，#335）。
-///
-/// # 为什么需要「结构化」这一形态（#335 根因）
-///
-/// 顶层 `dns.strategy` 在 `enableIPv6=false` 时是 `ipv4_only`（`builder/dns.rs` §B，为 #57 抑制
-/// **目标站点** AAAA 而设）。但内核解析**节点自身域名**走的也是同一条 dial 路径 ⇒ AAAA-only 的节点
-/// 域名永远解析不出地址，整个代理不可用。本类型让 dial 侧**逐 outbound / endpoint** 用
-/// `prefer_ipv4` 覆盖顶层策略：目标站点仍 v4 only（#57 收益原样保留），节点域名则 v4 优先但可回落 v6。
-///
-/// # 为什么必须逐载体下发，改 `route.default_domain_resolver` 一处不够（loopback 实测定论）
-///
-/// per-outbound 只要是**纯 tag 字符串**，就整个覆盖掉 `route.default_domain_resolver`，**不继承**
-/// 它的 strategy。三组对照（随包 sing-box 1.14.0-beta.5，零包出网）：
-/// - default 带 strategy + per-outbound 纯字符串 → `dns: lookup failed for probe.test: empty result`
-/// - default 带 strategy + 完全不写 per-outbound → `lookup succeed`
-/// - per-outbound 写 `{"server":"h","strategy":"prefer_ipv4"}` → `lookup succeed for probe.test: ::1`
-///
-/// # 为什么 `server` 恒填
-///
-/// `{strategy}` 无 `server` 会被**解析期硬拒**（`empty domain_resolver.server`）；`{server, strategy}`
-/// 在 outbound / endpoint / `route.default_domain_resolver` 三处都被 `sing-box check` 接受。
+/// Dial resolver for node outbounds/endpoints: a server tag, explicit server
+/// and strategy, or an isolated native rules policy with its own lookup budget.
+/// DNS transport bootstrap remains server-only and cannot invoke a policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DomainResolver {
+    /// Scoped native node lookup; one budget shared by both address families.
+    Rules {
+        mode: String,
+        policy: String,
+        strategy: DomainStrategy,
+        timeout: String,
+    },
     /// 纯 tag：继承顶层 `dns.strategy`。
     /// `enableIPv6=true` 分支恒走这支——那时顶层已是 `prefer_ipv4`，无需覆盖，且**保证该分支
     /// config 字节零变化**（金样 delta 只落在 IPv6 关闭的场景上）。

@@ -17,6 +17,36 @@ use crate::platform::windows::coreacl::ObjectSecurity;
 use crate::platform::windows::logic::{self, ListenEntry};
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartTiming};
 
+/// Serialize optional native DNS worker creation with helper shutdown.
+/// The mutex is never held while waiting for the native cache call.
+#[derive(Default)]
+pub struct DnsFlushAdmission(std::sync::Mutex<bool>);
+
+impl DnsFlushAdmission {
+    pub fn close(&self) -> Result<(), String> {
+        match self.0.lock() {
+            Ok(mut closed) => {
+                *closed = true;
+                Ok(())
+            }
+            Err(poison) => {
+                *poison.into_inner() = true;
+                Err("DNS flush admission poisoned".into())
+            }
+        }
+    }
+
+    pub fn launch<T>(&self, spawn: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let closed = self.0.lock().map_err(|_| "DNS flush admission poisoned")?;
+        if *closed {
+            return Err("helper shutting down; DNS flush not launched".into());
+        }
+        let result = spawn();
+        drop(closed);
+        result
+    }
+}
+
 /// Windows helper 已创建的核心及其关键路径耗时。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreStart {
@@ -130,11 +160,9 @@ pub trait ProcOps: Send + Sync {
     /// 本方法封装「对指定 pid 的收割序列」，宽限窗口由实现决定（生产 = 2s，测试可缩短）。
     fn reap_child(&self, pid: u32);
 
-    /// 派生自卸载旁路 cmd（`winproc.go:233-245` `spawnSelfUninstall`）。
-    ///
-    /// best-effort：失败只记日志（Go `_ = c.Start()`）。旁路须比 helper 活得久（DETACHED_PROCESS、
-    /// 不 assignToJob、继承 SYSTEM token）。
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str);
+    /// Launch a fixed native cleaner; success only acknowledges worker creation.
+    /// Failure must keep the helper alive so the app can use bundled UAC fallback.
+    fn spawn_self_uninstall(&self) -> Result<(), String>;
 
     /// 受管核的进程身份（D2/D3）：`pid` 是当前受管核时返回其 created/image，否则全 `None`。
     ///
@@ -142,11 +170,9 @@ pub trait ProcOps: Send + Sync {
     /// 复用，读到的必是同一个进程；按 pid 现开句柄则可能读到复用者，那正是本条要消除的假象。
     fn managed_identity(&self, pid: u32) -> ManagedIdentity;
 
-    /// 以 SYSTEM 刷系统 DNS 缓存（D4）：跑 `ipconfig /flushdns`。
-    ///
-    /// 成功 `Ok(())`；失败 `Err(<合并 stdout+stderr 的诊断串>)` —— ipconfig 把错误文字写在 stdout，
-    /// 故本腿局部自捕两条流（判据见 [`logic::flush_dns_result`]），不改共用 exec 的全局错误格式。
-    fn flush_dns(&self) -> Result<(), String>;
+    /// Optional native resolver-cache operation as SYSTEM. No console child is created.
+    /// Admission covers worker creation; the caller has a bounded wait, not cancellation.
+    fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String>;
 
     /// 开 IP 转发（`winproc.go:414-427` `enableIPForwarding`）。
     ///
@@ -246,6 +272,8 @@ struct MockProcOpsInner {
     native_retire_allowed: std::sync::atomic::AtomicBool,
     native_start_pause:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    route_pause:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     birth_count: std::sync::atomic::AtomicU32,
     /// `start_singbox` 累计调用次数。
     pub start_calls: std::sync::atomic::AtomicUsize,
@@ -269,8 +297,7 @@ struct MockProcOpsInner {
     pub start_error: std::sync::Mutex<Option<std::io::Error>>,
     /// 最近一次 `reap_child` 的 pid（断言用）。
     pub last_reaped_pid: std::sync::atomic::AtomicU32,
-    /// 最近一次 `spawn_self_uninstall` 的参数（断言用）。
-    pub last_spawn_args: std::sync::Mutex<Option<(String, String)>>,
+    pub uninstall_error: std::sync::Mutex<Option<String>>,
     /// `apply_route` 累计调用次数（W9 netsh route 断言用）。
     pub route_calls: std::sync::atomic::AtomicUsize,
     /// 最近一次 `apply_route` 的参数（iface, cidr, del）（断言用）。
@@ -357,6 +384,14 @@ impl MockProcOps {
         *self.inner.native_start_pause.lock().unwrap() = Some((entered, resume));
     }
 
+    pub fn pause_route(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.route_pause.lock().unwrap() = Some((entered, resume));
+    }
+
     /// 预设 pid → 映像路径（freeport 测试用）。
     pub fn set_image(&self, pid: u32, image: &str) {
         self.inner
@@ -414,10 +449,8 @@ impl MockProcOps {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 最近一次 `spawn_self_uninstall` 的参数（测试断言）。
-    #[must_use]
-    pub fn last_spawn_args(&self) -> Option<(String, String)> {
-        self.inner.last_spawn_args.lock().unwrap().clone()
+    pub fn set_uninstall_error(&self, error: &str) {
+        *self.inner.uninstall_error.lock().unwrap() = Some(error.to_owned());
     }
 
     /// 预设受管核身份（D2/D3；`start_singbox` 之后按新 pid 生效）。
@@ -428,7 +461,7 @@ impl MockProcOps {
         };
     }
 
-    /// 预设 `flush_dns` 失败（模拟 ipconfig 非零退出；串即 helper 侧自捕的 stdout+stderr）。
+    /// 预设 `flush_dns` 失败（模拟原生 DNS API 失败；保留诊断原因）。
     pub fn set_flush_dns_error(&self, detail: &str) {
         *self.inner.flush_dns_error.lock().unwrap() = Some(detail.to_owned());
     }
@@ -690,12 +723,16 @@ impl ProcOps for MockProcOps {
             .store(pid, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str) {
+    fn spawn_self_uninstall(&self) -> Result<(), String> {
         self.inner
             .spawn_uninstall_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self.inner.last_spawn_args.lock().unwrap() =
-            Some((service_name.to_owned(), support_dir.to_owned()));
+        self.inner
+            .uninstall_error
+            .lock()
+            .unwrap()
+            .clone()
+            .map_or(Ok(()), Err)
     }
 
     fn enable_ip_forwarding(&self) {
@@ -704,17 +741,23 @@ impl ProcOps for MockProcOps {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn flush_dns(&self) -> Result<(), String> {
-        self.inner
-            .flush_dns_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match self.inner.flush_dns_error.lock().unwrap().clone() {
-            Some(detail) => Err(detail),
-            None => Ok(()),
-        }
+    fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String> {
+        admission.launch(|| {
+            self.inner
+                .flush_dns_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.inner.flush_dns_error.lock().unwrap().clone() {
+                Some(detail) => Err(detail),
+                None => Ok(()),
+            }
+        })
     }
 
     fn apply_route(&self, iface: &str, cidr: &str, del: bool) {
+        if let Some((entered, resume)) = self.inner.route_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
         self.inner
             .route_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

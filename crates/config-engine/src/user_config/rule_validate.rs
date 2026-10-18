@@ -84,7 +84,8 @@ fn is_strict_ipv6(addr: &str) -> bool {
     let mut ipv4_suffix = false;
     for (i, g) in groups.iter().enumerate() {
         if i == groups.len() - 1 && g.contains('.') {
-            if !is_strict_ipv4(g) {
+            // An embedded IPv4 must be the textual suffix, never before trailing ::.
+            if !addr.ends_with(*g) || !is_strict_ipv4(g) {
                 return false;
             }
             ipv4_suffix = true;

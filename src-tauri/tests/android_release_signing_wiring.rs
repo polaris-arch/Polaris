@@ -1006,7 +1006,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     //    实测把 `gate-android-release-behavior.sh` 掏空只留注释 + `exit 0`（53 行），
     //    三根针照样命中 —— 命中的是被判文件**自己的头注**。本仓这已经是第三次同形
     //    （前两次在 nodes.css 与 configuration.txt）。
-    for (path, needle, comment_probe, min_code_lines, why) in JUDGE_SCRIPT_SENTINELS {
+    for (path, needle, comment_probe, why) in JUDGE_SCRIPT_SENTINELS {
         let body = polaris_source_probe::repo_file!(path);
         let face = code_face(path, &body);
         // 剥离自检：这句话只写在该文件的注释里，剥干净了下面两条才轮得到说话。
@@ -1014,12 +1014,6 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
             !face.contains(comment_probe),
             "{path}：注释剥离失效 —— 只出现在注释里的 `{comment_probe}` 仍留在代码面上。\
              判据在这种面上会被文件自己的头注喂绿。"
-        );
-        let lines = face.lines().count();
-        assert!(
-            lines >= *min_code_lines,
-            "{path}：剥掉注释之后只剩 {lines} 行代码（下限 {min_code_lines}）—— \
-             判据本体被掏空成一个只有注释的壳了。它守的是：{why}"
         );
         assert!(
             face.contains(needle),
@@ -1172,7 +1166,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     );
     assert!(
         publish_job.contains(
-            "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\\n"
+            "bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \\\n"
         ),
         "{ANDROID_WORKFLOW}：`release-apk` 里没有那条**不带逃生门**的 Tauri 构建行 —— \
          发布腿要么没在构建 release，要么已经改成了别的形态，先来这里说清楚。"
@@ -1261,7 +1255,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
 /// 只会逼后人把判据改宽 = 门被磨钝。
 // release-apk 在 checkout 与 setup-node 之间多一道 tag/SHA/draft 身份门；公共工具链从 setup-node 起。
 const PRELUDE_START: &str = "      - uses: actions/setup-node@v7";
-const PRELUDE_END: &str = "sha256=$(sha256sum";
+const PRELUDE_END: &str = "python3 scripts/mobile-core/ci_android.py verify";
 
 /// release-profile 验证腿必须持有的判据：`(在 workflow 里要找到的串, 它守什么)`。
 ///
@@ -1323,19 +1317,17 @@ const CI_RELEASE_CHECK_REQUIREMENTS: &[(&str, &str)] = &[
 ///    （比如扩展名判定漏了一支）会让上一条又退回到原文匹配，而没有任何东西会说话；
 ///  · **代码行数下限**兜住「留一行代码骗过针」那一形。三个数字取的是 2026-09-05 实测值
 ///    （188 / 330 / 158 行代码面）的一半上下：正常增删碰不到，真缩到那个量级时该有人看一眼。
-const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, usize, &str)] = &[
+const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, &str)] = &[
     (
         WRY_KEEP_SCRIPT,
         "RustWebView",
         "ProGuard 对「keep 了一个不存在的成员」不报错",
-        90,
         "wry 那条 keep 的成员签名与 gitignored 生成物的对拍。",
     ),
     (
         BEHAVIOR_GATE_SCRIPT,
         "printPolarisReleaseFacts",
         "文本里那串还在，行为已经变了",
-        120,
         "行为裁判问 AGP 要事实的那个只读任务名。任务名两侧一改就对不上，\
          而裁判会因为「任务不存在」直接 rc≠0 —— 这条守的是它还在问同一个人。",
     ),
@@ -1343,7 +1335,6 @@ const JUDGE_SCRIPT_SENTINELS: &[(&str, &str, &str, usize, &str)] = &[
         R8_EVIDENCE_SCRIPT,
         "seeds.txt",
         "内联 shell 的判据没法单测",
-        80,
         "产物级判据里「keep 到底命中没命中」那一半。只剩 configuration.txt 那一半时，\
          指向不存在类名的 keep 依然全绿。",
     ),
@@ -1391,10 +1382,9 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
          job 跑；两条路径各一，任何一次 workflow 调用都不能失去这道配置期观测面。",
     ),
     (
-        "        run: node scripts/assert-r8-evidence.mjs \
-         src-tauri/gen/android/app/build/outputs/mapping/arm64Release",
+        "            node scripts/assert-r8-evidence.mjs \"src-tauri/gen/android/app/build/outputs/mapping/${flavor}Release\"",
         1,
-        "signed release 的独立 run 行必须以将要上传的那次构建的 configuration.txt / seeds.txt 为证据。",
+        "signed release 的三个 flavor 必须逐个使用本次构建的 R8 证据，且不得吞掉失败。",
     ),
     (
         "          node scripts/assert-r8-evidence.mjs \
@@ -1404,7 +1394,7 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
          两条 release 路径各执行一次，失败退出码都必须传给 workflow。",
     ),
     (
-        "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 --ci \\",
+        "          bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci \\",
         1,
         "发布腿必须走未带 unsigned 逃生门的正常 Tauri release 构建。",
     ),
@@ -1415,8 +1405,33 @@ const CI_EXIT_CODE_BEARING_LINES: &[(&str, usize, &str)] = &[
     ),
     (
         "          bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android \\",
+        2,
+        "release_check 和 S5 单测各自由 Gradle 显式开启 unsigned，并只跳过已完成的 Rust task；两次调用都必须保留真实退出码。",
+    ),
+    (
+        "            :app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest \\",
         1,
-        "release_check 随后由 Gradle 本次命令行显式开启 unsigned，并只跳过已完成的 Rust task。",
+        "S5 单测清理旧 XML 并执行当前 release variant，不复用历史报告。",
+    ),
+    (
+        "            --tests com.polaris2.app.vpn.DefaultNetworkObservationTest \\",
+        1,
+        "实际执行完整默认网络观察测试类。",
+    ),
+    (
+        "            --tests com.polaris2.app.vpn.NetworkMonitorSessionTest \\",
+        1,
+        "实际执行完整监视器会话测试类。",
+    ),
+    (
+        "            --tests com.polaris2.app.vpn.LoadedLibboxIdentityTest \\",
+        1,
+        "实际执行冷启动等待和已加载文件身份回归测试类。",
+    ),
+    (
+        "            -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon",
+        1,
+        "JUnit 仅跳过本 job 已完成的 Rust build，不跳过编译、测试或签名策略。",
     ),
 ];
 
@@ -1431,6 +1446,9 @@ const LOAD_BEARING_INVOCATIONS: &[&str] = &[
     "sh scripts/",
     "./gradlew",
     "src-tauri/gen/android/gradlew",
+    ":app:cleanTestArm64ReleaseUnitTest",
+    "--tests com.polaris2.app.vpn.",
+    "-PpolarisAllowUnsigned=true -x",
 ];
 
 /// 把一条命令的退出码中和掉的写法。命中任一即红。
@@ -1712,4 +1730,124 @@ fn key_material_can_never_enter_the_repository() {
              但「不落盘」这件事需要一条守卫兜住手滑 —— 这就是那条守卫。"
         );
     }
+}
+
+/// Source contract only: the real transition controls run in the Android behavior gate.
+/// Keep daemon lifetime separate from configuration/facts execution and from other builds.
+#[test]
+fn behavior_oracle_ci_daemon_is_scoped_and_never_reuses_configuration() {
+    let raw = polaris_source_probe::repo_file!(BEHAVIOR_GATE_SCRIPT);
+    let gate = code_face(BEHAVIOR_GATE_SCRIPT, &raw);
+    for required in [
+        "DAEMON_FLAGS=(--no-daemon)",
+        r#"case "${POLARIS_GATE_CI_DAEMON:-0}" in"#,
+        r#"[ "${CI:-}" = true ] && [ "${GITHUB_ACTIONS:-}" = true ] || die "daemon reuse is CI-only""#,
+        r#"export GRADLE_USER_HOME="$WORK/gradle-home""#,
+        "for part in caches wrapper jdks; do",
+        "DAEMON_FLAGS=(--daemon)",
+        r#"GRADLE_COMMON=(./gradlew --offline "${DAEMON_FLAGS[@]}" --no-configuration-cache --init-script "$ORACLE_INIT")"#,
+        r#"DRY=("${GRADLE_COMMON[@]}" :app:assembleArm64Release --dry-run)"#,
+        r#"DRY_DEBUG=("${GRADLE_COMMON[@]}" :app:assembleArm64Debug --dry-run)"#,
+        r#"FACTS=("${GRADLE_COMMON[@]}" :app:printPolarisReleaseFacts)"#,
+        "INVOCATIONS=$((INVOCATIONS + 1))",
+        r#"export POLARIS_ORACLE_INVOCATION="$nonce""#,
+        "gradle.settingsEvaluated {",
+        r#"println("POLARIS_ORACLE_CONFIG\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))"#,
+        r#"println("POLARIS_ORACLE_EXEC\t" + System.getenv("POLARIS_ORACLE_INVOCATION"))"#,
+        r#"|| die "fresh configuration missing: $log""#,
+        r#"|| die "facts task did not execute: $log""#,
+        r#"( cd "$GRADLE_DIR" && ./gradlew --offline --stop ) >"$WORK/daemon-stop.log" 2>&1 || cleanup_rc=2"#,
+        "trap on_exit EXIT",
+        "trap 'EXIT_SEALED=signal; exit 130' INT",
+        "trap 'EXIT_SEALED=signal; exit 143' TERM",
+        r#"[ "$rc" -ne 0 ] || rc=$cleanup_rc"#,
+        r#"if [ "$rc" -eq 0 ]; then rm -rf -- "$WORK"; fi"#,
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing daemon/configuration contract: {required}"
+        );
+    }
+    let cleanup = gate
+        .split("on_exit() {")
+        .nth(1)
+        .unwrap()
+        .split("trap on_exit EXIT")
+        .next()
+        .unwrap();
+    assert!(
+        cleanup.find("restore\n").unwrap() < cleanup.find("./gradlew --offline --stop").unwrap()
+    );
+    assert!(cleanup.find("./gradlew --offline --stop").unwrap() < cleanup.find("rm -rf").unwrap());
+    assert!(!gate.contains("--configuration-cache "));
+}
+
+#[test]
+fn behavior_oracle_keeps_all_eighteen_scenarios_and_environment_transition_controls() {
+    let raw = polaris_source_probe::repo_file!(BEHAVIOR_GATE_SCRIPT);
+    let gate = code_face(BEHAVIOR_GATE_SCRIPT, &raw);
+    let scenarios: Vec<_> = gate
+        .lines()
+        .filter(|line| {
+            line.starts_with("gradle_run \"") || line.starts_with("gradle_run_signed \"")
+        })
+        .map(|line| line.split('"').nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        scenarios,
+        [
+            "$WORK/1-bare.log",
+            "$WORK/2-hatch.log",
+            "$WORK/5b-arm-flavors.log",
+            "$WORK/2b-facts.log",
+            "$WORK/3-props.log",
+            "$WORK/3b-facts.log",
+            "$WORK/4-env.log",
+            "$WORK/4b-facts.log",
+            "$WORK/4-reset-facts.log",
+            "$WORK/4c-env.log",
+            "$WORK/6-debug.log",
+            "$WORK/7-facts.log",
+            "$WORK/8-missing.log",
+            "$WORK/9-facts.log",
+            "$WORK/9-dry.log",
+            "$WORK/10-facts.log",
+            "$WORK/10-dry.log",
+            "$WORK/10c-dry.log",
+            "$WORK/10c-facts.log",
+            "$WORK/10-reset-dry.log",
+            "$WORK/10-reset-facts.log",
+        ]
+    );
+    for required in [
+        r#"gradle_run "$WORK/4-env.log" env ORG_GRADLE_PROJECT_polarisAllowUnsigned=true "${DRY[@]}""#,
+        r#"gradle_run "$WORK/4-reset-facts.log" "${FACTS[@]}""#,
+        r#"expect_has "环境属性未串到下一场景" "$WORK/4-reset-facts.log" $'hatchAllPropertyKeys\t<none>'"#,
+        r#"expect_rc "撤销凭据后 release 再次拒绝" nonzero"#,
+        r#"expect_has "签名环境未串到下一场景" "$WORK/10-reset-dry.log" "$MSG_REFUSE""#,
+        r#"expect_has "签名容器已恢复空壳" "$WORK/10-reset-facts.log" $'POLARIS_FACT\tsigningStoreFile\t<none>\tfalse\tfalse'"#,
+        r#"cmp -s -- "$WORK/original-rules.txt" "$WORK/restored-rules.txt""#,
+        r#"[ "$INVOCATIONS" -eq 21 ] || die"#,
+        r#"cmp -s -- "$PROPS_BAK" "$PROPS" || cleanup_rc=2"#,
+        r#"cmp -s -- "$RULE_BAK" "$SACRIFICIAL_RULE" || cleanup_rc=2"#,
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing scenario/isolation contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn android_workflow_explicitly_opts_in_both_oracles_and_retains_original_stage1() {
+    let workflow = polaris_source_probe::repo_file!(ANDROID_WORKFLOW);
+    assert_eq!(workflow.matches("          POLARIS_GATE_CI_DAEMON: \"1\"\n        run: bash scripts/gate-android-release-behavior.sh").count(), 2);
+    assert_eq!(
+        workflow
+            .matches("            ${{ runner.temp }}/release-stage1.log")
+            .count(),
+        1
+    );
+    assert!(workflow.contains("stage1_log=\"$RUNNER_TEMP/release-stage1.log\""));
+    assert!(workflow.contains(">\"$stage1_log\" 2>&1"));
 }

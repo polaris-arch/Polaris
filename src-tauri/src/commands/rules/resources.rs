@@ -54,12 +54,11 @@ const RULE_RESOURCE_TIMEOUT_MS: u64 = 30_000;
 /// 可经 gh 镜像加速的 GitHub 域名表。
 ///
 /// **与 `runtime/http.rs::GITHUB_ASSET_HOSTS` 的关系**：那张 2 域名表是 updater 专用的**release 资产**
-/// 判定面（核下载只经 `github.com` / `objects.githubusercontent.com`），本表是 gh-proxy 的通用判定面
-/// （5 域，与前端 `ui/src/domain/gh-proxy.ts` `GH_HOSTS` 同表 —— 两侧对「哪些地址值得加速」必须同口径，
-/// 否则设置页说加速、后端不加速）。规则资源恰恰只走 `raw.githubusercontent.com`，**不在** updater 那张表里，
+/// 判定面（安装包下载只经 `github.com` / `objects.githubusercontent.com`），本表是 gh-proxy 的通用判定面
+/// （5 域；是「哪些地址值得加速」在本仓的唯一一张表）。规则资源恰恰只走 `raw.githubusercontent.com`，**不在** updater 那张表里，
 /// 所以不能直接复用它。
 ///
-/// DESIGN-REVIEW(gh-proxy-single-source)：审计 §C9 裁决「5 域名表 + applyGhProxy」应落 net-stack 纯函数
+/// DESIGN-REVIEW(gh-proxy-single-source)：审计 §C9 裁决「5 域名表 + 前缀拼接」应落 net-stack 纯函数
 /// 模块，由 http.rs 与本文件共同消费（同一待办亦登记在 `runtime/http.rs` 的 `GITHUB_ASSET_HOSTS` 文档上）。net-stack 不在本批改动面内，故本表
 /// 暂落此处；模块落地后本表与 `is_github_asset` 一并改为调它。**拼接口径刻意与 `CoreDownloader::candidates`
 /// 逐字一致**（`prefix.trim_end_matches('/')` + `/` + 完整原 URL），不另立一套。
@@ -167,17 +166,12 @@ pub fn rule_resources_list(state: State<'_, AppRuntime>) -> ApiResponse<Vec<Rule
     };
     let res_dir = state.config().dir().join("rule-resource");
     let runtime_dir = builtin_runtime_dir(&state);
-    let scan = RefScanInput {
-        custom_rules: &uc.custom_rules,
-        app_rules: &uc.app_rules,
-        custom_app_presets: &uc.custom_app_presets,
-    };
     let mut items: Vec<RuleResourceListItem> = uc
         .rule_resources
         .iter()
         .map(|r| RuleResourceListItem {
             file_exists: resource_file_usable(&res_dir.join(&r.file_name), r.format),
-            referenced_by: enumerate_resource_refs(&r.id, &scan).len(),
+            referenced_by: resource_refs(&uc, &r.id).len(),
             builtin: None,
             resource: r.clone(),
         })
@@ -187,7 +181,7 @@ pub fn rule_resources_list(state: State<'_, AppRuntime>) -> ApiResponse<Vec<Rule
         let id = builtin_id_for(&b.tag);
         RuleResourceListItem {
             file_exists: is_valid_srs_file(&live),
-            referenced_by: enumerate_resource_refs(&id, &scan).len(),
+            referenced_by: resource_refs(&uc, &id).len(),
             builtin: Some(true),
             resource: RuleResource {
                 name: b.tag.clone(),
@@ -303,8 +297,8 @@ async fn fetch_catalog_json_once<H: HttpClient, L: DnsLookup>(
 /// 带 gh 加速的清单拉取：**复用下载腿那一套**（[`apply_gh_proxy`] + 失败回退原址），不另立一份判定。
 ///
 /// 现状诚实登记：`GH_PROXY_HOSTS` 是 5 域表、**不含 `api.github.com`**，故对本函数实际请求的 trees API
-/// 地址而言这是一次**文档化的空转**（`ui/src/domain/gh-proxy.ts:56` 与 上游 `shared/gh-proxy.ts:58`
-/// 都明写「api.github.com 不在 GH_HOSTS，Trees API 刷新不走加速」——gh-proxy 类镜像普遍只代理
+/// 地址而言这是一次**文档化的空转**（上游 `shared/gh-proxy.ts:58`
+/// 明写「api.github.com 不在 GH_HOSTS，Trees API 刷新不走加速」——gh-proxy 类镜像普遍只代理
 /// raw/releases/archive，不代理 API）。仍然走这条腿而不是直接裸调，是为了**只有一个加速决策点**：
 /// 哪天那张表补上 `api.github.com`（前后端两侧同步改），清单刷新自动吃上，不需要再改本文件。
 async fn fetch_catalog_json<H: HttpClient, L: DnsLookup>(
@@ -704,18 +698,17 @@ async fn redownload_with_mode(
     let res_dir = state.config().dir().join("rule-resource");
     let http = state.http().clone();
     let sink = BroadcastSink { app, mode };
-    let result =
-        download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir).await;
-    if let DownloadOutcome::Stored { ref resource, .. } = result {
-        if let Err(e) = persist_resources(app, state, std::slice::from_ref(resource), broadcast) {
-            return Ok(ApiResponse::ok(err_result(
-                Some(&plan.id),
-                Some(&plan.name),
-                &e,
-                ERR_RESOURCE_WRITE_FAILED,
-            )));
-        }
-    }
+    let result = download_registered_resource(
+        &sink,
+        http.as_ref(),
+        &SystemDnsLookup,
+        &plan,
+        &res_dir,
+        |resource, staged| {
+            persist_registered_resource(app, state, &existing, resource, staged, broadcast)
+        },
+    )
+    .await;
     Ok(ApiResponse::ok(result.into_value(&plan)))
 }
 
@@ -742,9 +735,9 @@ pub async fn rule_resources_update_all(
 
     let (raw_entries, builtins) = manual_update_targets(raw_entries);
     let mut results: Vec<Value> = Vec::with_capacity(raw_entries.len() + builtins.len());
-    let mut stored: Vec<RuleResource> = Vec::new();
+    let mut changed = false;
     for entry in &raw_entries {
-        // 结构非法的条目**如实报失败**（P8）——旧实现 `filter_map(.ok())` 静默丢弃：既不更新也不出现在结果里。
+        // Preserve a truthful per-item failure for malformed entries.
         let existing = match parse_resource_entry(entry) {
             Ok(r) => r,
             Err(err_value) => {
@@ -757,36 +750,26 @@ pub async fn rule_resources_update_all(
             app: &app,
             mode: ProgressMode::Live,
         };
-        let outcome =
-            download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir).await;
-        if let DownloadOutcome::Stored { ref resource, .. } = outcome {
-            stored.push(resource.clone());
-        }
+        let outcome = download_registered_resource(
+            &sink,
+            http.as_ref(),
+            &SystemDnsLookup,
+            &plan,
+            &res_dir,
+            |resource, staged| {
+                persist_registered_resource(
+                    &app,
+                    &state,
+                    &existing,
+                    resource,
+                    staged,
+                    BroadcastMode::Deferred,
+                )
+            },
+        )
+        .await;
+        changed |= matches!(&outcome, DownloadOutcome::Stored { .. });
         results.push(outcome.into_value(&plan));
-    }
-    let mut changed = false;
-    if !stored.is_empty() {
-        match persist_resources(&app, &state, &stored, BroadcastMode::Deferred) {
-            Ok(()) => changed = true,
-            Err(e) => {
-                // 下载后的登记失败不能让调用者收到假成功。保留原有逐项失败结果。
-                for result in &mut results {
-                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                        let id = result.get("id").and_then(Value::as_str).map(str::to_string);
-                        let name = result
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        *result = err_result(
-                            id.as_deref(),
-                            name.as_deref(),
-                            &e,
-                            ERR_RESOURCE_WRITE_FAILED,
-                        );
-                    }
-                }
-            }
-        }
     }
     for builtin in builtins {
         let tag = builtin.tag;
@@ -862,7 +845,10 @@ pub async fn rule_resources_download(
     let refreshed_catalog = read_catalog_cache(&res_dir).map_or_else(Vec::new, |(items, _)| items);
 
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
-    let mut stored: Vec<RuleResource> = Vec::new();
+    let initial = match state.config().current() {
+        Ok(config) => config,
+        Err(error) => return Ok(ApiResponse::err(format!("读取资源初始状态失败: {error}"))),
+    };
     for item in &items {
         let plan = match plan_from_item(item, &refreshed_catalog) {
             Ok(p) => p.with_gh_proxy(&gh_prefix),
@@ -880,33 +866,73 @@ pub async fn rule_resources_download(
             app: &app,
             mode: ProgressMode::Live,
         };
+        let expected = resource_record(&initial, &plan.id).cloned();
         let outcome =
-            download_with_progress(&sink, http.as_ref(), &SystemDnsLookup, &plan, &res_dir).await;
-        if let DownloadOutcome::Stored { ref resource, .. } = outcome {
-            stored.push(resource.clone());
-        }
+            download_registered_resource(
+                &sink,
+                http.as_ref(),
+                &SystemDnsLookup,
+                &plan,
+                &res_dir,
+                |resource, staged| match state.config().update(|config| {
+                    match commit_download_resource(
+                        config,
+                        expected.as_ref(),
+                        resource,
+                        staged,
+                        &res_dir,
+                    ) {
+                        Ok(()) => Decision::Write(Ok(())),
+                        Err(error) => Decision::Skip(Err(error)),
+                    }
+                }) {
+                    Ok((Ok(()), Some(config))) => {
+                        broadcast_config_changed(&app, &config);
+                        Ok(())
+                    }
+                    Ok((Err(error), _)) => Err(error),
+                    Ok(_) => Err("资源提交未写入".into()),
+                    Err(error) => Err(format!("保存资源配置失败: {error}")),
+                },
+            )
+            .await;
         results.push(outcome.into_value(&plan));
     }
-    if !stored.is_empty() {
-        if let Err(e) = persist_resources(&app, &state, &stored, BroadcastMode::Immediate) {
-            for result in &mut results {
-                if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                    let id = result.get("id").and_then(Value::as_str).map(str::to_string);
-                    let name = result
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    *result = err_result(
-                        id.as_deref(),
-                        name.as_deref(),
-                        &e,
-                        ERR_RESOURCE_WRITE_FAILED,
-                    );
-                }
-            }
-        }
-    }
     Ok(ApiResponse::ok(results))
+}
+
+/// Both planes use the config-engine scanner and its enabled/condition semantics. Legacy
+/// shared rules are counted once; explicit independent DNS rules retain a DNS label in the
+/// existing route-reference DTO, so this does not add a renderer-only reference protocol.
+fn resource_refs(config: &UserConfig, id: &str) -> Vec<RuleResourceRef> {
+    let traffic = config.effective_traffic_rules();
+    let dns = config.effective_dns_rules();
+    let mut refs = enumerate_resource_refs(
+        id,
+        &RefScanInput {
+            custom_rules: traffic,
+            app_rules: &config.app_rules,
+            custom_app_presets: &config.custom_app_presets,
+        },
+    );
+    if !std::ptr::eq(traffic, dns) {
+        refs.extend(
+            enumerate_resource_refs(
+                id,
+                &RefScanInput {
+                    custom_rules: dns,
+                    app_rules: &[],
+                    custom_app_presets: &[],
+                },
+            )
+            .into_iter()
+            .map(|mut reference| {
+                reference.label = format!("DNS · {}", reference.label);
+                reference
+            }),
+        );
+    }
+    refs
 }
 
 /// 资源删除计划（纯决策，与 IO 分离便于单测）。上游 `RuleResourceDeleteResult` 的判定核心。
@@ -935,12 +961,7 @@ fn plan_resource_delete(cfg: &Value, id: &str, force: bool) -> ResourceDeletePla
     }
     // 引用扫描：结构非法的 config 回落空配置 → 视作无引用（删除放行，不因扫描失败卡住删除）。
     let uc: UserConfig = serde_json::from_value(cfg.clone()).unwrap_or_default();
-    let scan = RefScanInput {
-        custom_rules: &uc.custom_rules,
-        app_rules: &uc.app_rules,
-        custom_app_presets: &uc.custom_app_presets,
-    };
-    let refs = enumerate_resource_refs(id, &scan);
+    let refs = resource_refs(&uc, id);
     if !refs.is_empty() && !force {
         return ResourceDeletePlan::NeedConfirm(refs);
     }
@@ -969,6 +990,7 @@ pub fn rule_resources_delete(
         if !matches!(plan, ResourceDeletePlan::Proceed) {
             return Decision::Skip(plan);
         }
+        cancel_inflight(&id);
         if let Some(arr) = cfg.get_mut("ruleResources").and_then(Value::as_array_mut) {
             arr.retain(|v| v.get("id").and_then(Value::as_str) != Some(id.as_str()));
         }
@@ -1196,6 +1218,165 @@ async fn update_builtin_with_mode(
     Ok(ApiResponse::ok(outcome.into_value(&plan)))
 }
 
+/// Existing resources are downloaded into an isolated directory. The config writer decides
+/// whether the original record is still current before any live path is touched.
+async fn download_registered_resource<H: HttpClient, L: DnsLookup>(
+    sink: &dyn ProgressSink,
+    client: &H,
+    lookup: &L,
+    plan: &ResourcePlan,
+    res_dir: &Path,
+    commit: impl FnOnce(&RuleResource, &Path) -> Result<(), String>,
+) -> DownloadOutcome {
+    let stage = match ResourceStageDir::create(res_dir) {
+        Ok(stage) => stage,
+        Err(error) => {
+            let message = format!("创建资源暂存目录失败: {error}");
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            return DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            };
+        }
+    };
+    let outcome =
+        download_with_progress(&PendingResourceCommit(sink), client, lookup, plan, &stage.0).await;
+    let DownloadOutcome::Stored { resource, .. } = outcome else {
+        return outcome;
+    };
+    let existed_before = res_dir.join(&plan.file_name).is_file();
+    match commit(&resource, &stage.0.join(&plan.file_name)) {
+        Ok(()) => {
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": resource.size, "total": resource.size,
+                    "percent": 100.0, "status": "done",
+                }),
+            );
+            DownloadOutcome::Stored {
+                resource,
+                existed_before,
+            }
+        }
+        Err(message) => {
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            }
+        }
+    }
+}
+
+fn resource_record<'a>(config: &'a Value, id: &str) -> Option<&'a Value> {
+    config
+        .get("ruleResources")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+}
+
+/// Existing and initially absent identities are checked before publishing staged bytes.
+/// Caller holds ConfigRuntime's writer throughout this check and publication.
+fn commit_download_resource(
+    config: &mut Value,
+    expected: Option<&Value>,
+    downloaded: &RuleResource,
+    staged: &Path,
+    res_dir: &Path,
+) -> Result<(), String> {
+    if resource_record(config, &downloaded.id) != expected {
+        return Err("资源在下载期间已变化，旧下载已丢弃，请重试".into());
+    }
+    let object = config.as_object_mut().ok_or("配置不是对象")?;
+    if !object
+        .entry("ruleResources")
+        .or_insert_with(|| json!([]))
+        .is_array()
+    {
+        return Err("规则资源列表无效".into());
+    }
+    std::fs::rename(staged, res_dir.join(&downloaded.file_name))
+        .map_err(|error| format!("替换资源文件失败: {error}"))?;
+    upsert_rule_resources(config, std::slice::from_ref(downloaded));
+    Ok(())
+}
+
+/// Called only inside ConfigManager::update. An absent or changed record is never upserted,
+/// and rejection leaves the currently published file intact. Comparing the full record also
+/// rejects an older response after a newer refresh has committed.
+fn commit_registered_resource(
+    config: &mut Value,
+    expected: &RuleResource,
+    downloaded: &RuleResource,
+    staged: &Path,
+    res_dir: &Path,
+) -> Result<(), String> {
+    let resources = config
+        .get_mut("ruleResources")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "资源已删除，旧下载已丢弃".to_owned())?;
+    let current = resources
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(expected.id.as_str()))
+        .ok_or_else(|| "资源已删除，旧下载已丢弃".to_owned())?;
+    if serde_json::from_value::<RuleResource>(current.clone())
+        .ok()
+        .as_ref()
+        != Some(expected)
+    {
+        return Err("资源在下载期间已变化，旧下载已丢弃，请重试".to_owned());
+    }
+    let replacement = serde_json::to_value(downloaded).map_err(|error| error.to_string())?;
+    std::fs::rename(staged, res_dir.join(&downloaded.file_name))
+        .map_err(|error| format!("替换资源文件失败: {error}"))?;
+    *current = replacement;
+    Ok(())
+}
+
+fn persist_registered_resource(
+    app: &AppHandle,
+    state: &AppRuntime,
+    expected: &RuleResource,
+    downloaded: &RuleResource,
+    staged: &Path,
+    broadcast: BroadcastMode,
+) -> Result<(), String> {
+    let res_dir = state.config().dir().join("rule-resource");
+    match state.config().update(|config| {
+        match commit_registered_resource(config, expected, downloaded, staged, &res_dir) {
+            Ok(()) => Decision::Write(Ok(())),
+            Err(error) => Decision::Skip(Err(error)),
+        }
+    }) {
+        Ok((Ok(()), Some(config))) => {
+            if broadcast == BroadcastMode::Immediate {
+                broadcast_config_changed(app, &config);
+            }
+            Ok(())
+        }
+        Ok((Err(error), None)) => Err(error),
+        Ok(_) => Err("规则资源更新事务返回非法状态".to_owned()),
+        Err(error) => Err(format!("资源文件已更新，但保存配置失败: {error}")),
+    }
+}
+
 /// 同 tag 的手动、后台和 all 更新共用这把锁，覆盖下载、替换与元数据保存。
 fn builtin_update_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     type Locks = Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
@@ -1213,19 +1394,38 @@ fn builtin_update_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
-struct BuiltinStageDir(std::path::PathBuf);
-impl Drop for BuiltinStageDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-        if let Some(parent) = self.0.parent() {
-            let _ = std::fs::remove_dir(parent); // 只清空的 .update，不干扰其他 tag。
+struct ResourceStageDir(std::path::PathBuf);
+impl ResourceStageDir {
+    fn create(res_dir: &Path) -> std::io::Result<Self> {
+        Self::create_with(res_dir, new_uuid)
+    }
+
+    fn create_with(res_dir: &Path, mut next_name: impl FnMut() -> String) -> std::io::Result<Self> {
+        let parent = res_dir.join(".update");
+        std::fs::create_dir_all(&parent)?;
+        loop {
+            let path = parent.join(next_name());
+            // A guessed name is not ownership. Only successful exclusive creation may
+            // construct the cleanup guard; collisions never open or remove that path.
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
     }
 }
 
+impl Drop for ResourceStageDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        // The shared .update parent was not exclusively acquired. Leave it alone.
+    }
+}
+
 /// 暂存下载的 done 帧要等 live 替换和元数据持久化后再发，防止保存失败仍显示成功。
-struct PendingBuiltinCommit<'a>(&'a dyn ProgressSink);
-impl ProgressSink for PendingBuiltinCommit<'_> {
+struct PendingResourceCommit<'a>(&'a dyn ProgressSink);
+impl ProgressSink for PendingResourceCommit<'_> {
     fn emit(&self, frame: Value) {
         if frame.get("status").and_then(Value::as_str) != Some("done") {
             self.0.emit(frame);
@@ -1244,9 +1444,26 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     let lock = builtin_update_lock(&plan.id);
     let _guard = lock.lock().await;
     // 同盘且每次独立目录；取消/失败/函数退出均清理自己的暂存，不碰其他在途下载。
-    let stage = BuiltinStageDir(runtime_dir.join(".update").join(new_uuid()));
+    let stage = match ResourceStageDir::create(runtime_dir) {
+        Ok(stage) => stage,
+        Err(error) => {
+            let message = format!("创建资源暂存目录失败: {error}");
+            emit_resource_progress(
+                sink,
+                plan,
+                json!({
+                    "received": 0, "total": null, "percent": null, "status": "error",
+                    "error": message, "errorCode": ERR_RESOURCE_WRITE_FAILED,
+                }),
+            );
+            return DownloadOutcome::Failed {
+                message,
+                code: ERR_RESOURCE_WRITE_FAILED,
+            };
+        }
+    };
     let outcome =
-        download_with_progress(&PendingBuiltinCommit(sink), client, lookup, plan, &stage.0).await;
+        download_with_progress(&PendingResourceCommit(sink), client, lookup, plan, &stage.0).await;
     let DownloadOutcome::Stored { resource, .. } = outcome else {
         return outcome;
     };
@@ -1360,7 +1577,7 @@ struct ResourcePlan {
     /// 为什么与 `url` 分开而不是就地改写 `url`：`url` 会被持久化成 `sourceUrl`，把镜像址写进去就等于
     /// 把「当前这台加速器」焊死进配置 —— 用户改 / 清 `ghProxyPrefix` 之后，重下载仍走旧镜像，设置项形同
     /// 虚设；镜像停服还会变成永久坏源。对齐 上游 `RuleResourceManager.fetchSrsToFile`
-    /// （`applyGhProxy` 只作用于本次请求，登记的 `sourceUrl` 恒为原址）。
+    /// （加速前缀只作用于本次请求，登记的 `sourceUrl` 恒为原址）。
     fetch_url: String,
     file_name: String,
     format: RuleResourceFormat,
@@ -1770,7 +1987,7 @@ async fn fetch_resource_bytes<H: HttpClient, L: DnsLookup>(
     Ok(resp.body)
 }
 
-/// 下载 + 落盘（不写 config；config upsert 由 [`persist_resources`] 批量做）。
+/// 下载到调用方提供的暂存目录；不写 config，文件发布与配置更新由调用方事务提交。
 /// # gh 加速的回退腿
 ///
 /// 设置页对「GitHub 加速」的承诺是「留空回退直连；**下载失败自动回退直连兜底**」
@@ -2066,34 +2283,6 @@ fn cancel_inflight(id: &str) -> usize {
 pub fn rule_resources_cancel(id: String) -> ApiResponse<Value> {
     let n = cancel_inflight(&id);
     ApiResponse::ok(json!({ "cancelled": n }))
-}
-
-/// 把成功下载的资源 upsert 进 `config.ruleResources`（按 id 覆盖/追加），保存 + 广播 `config:changed`。
-///
-/// 文件已在盘上；若 config 保存失败，如实 log（资源暂成孤儿，下次 list 不显示）——不静默吞。
-fn persist_resources(
-    app: &AppHandle,
-    state: &AppRuntime,
-    downloaded: &[RuleResource],
-    broadcast: BroadcastMode,
-) -> Result<(), String> {
-    if downloaded.is_empty() {
-        return Ok(());
-    }
-    match state.config().update(|cfg| {
-        upsert_rule_resources(cfg, downloaded);
-        Decision::Write(())
-    }) {
-        // Deferred：批次拥有者收尾统一广播（见 [`BroadcastMode`]）。落盘已完成，跳过的只是通知。
-        Ok(((), Some(cfg))) => {
-            if broadcast == BroadcastMode::Immediate {
-                broadcast_config_changed(app, &cfg);
-            }
-            Ok(())
-        }
-        Ok(_) => Err("规则资源登记事务返回非法状态".to_string()),
-        Err(e) => Err(format!("规则资源已下载但保存 config 失败（未登记）: {e}")),
-    }
 }
 
 /// upsert：按 id 覆盖既有项，否则追加。

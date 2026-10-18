@@ -89,9 +89,9 @@ const GUARDED: &[Guarded] = &[
     // `no_console_window_async`（tokio 版）已随它仅有的两个调用点一起删除：那两处是自己写了一遍的
     // `sing-box check`，已折叠进 `core-supervisor::config_gate::run_check_raw`（本表下方单独守）。
     // 本 crate 于是不再有 Windows 可达的 tokio 子进程构造点。
-    // Phase 2 拆分：两点随 `send_signal` / `core_version_first_line` 进
-    // `proxy/process_supervision.rs`（façade 仍 `pub(crate) use` 再导出 `send_signal`，
-    // 但**构造点**在这里，源码级门取的是构造点）。
+    // Phase 2 拆分：`core_version_first_line` 进 `proxy/process_supervision.rs`。同文件原先还有
+    // Windows 版 `send_signal`（起 `taskkill`）：孤儿清扫改为经扫描时留住的句柄结束进程后，
+    // 那个子进程构造点已不存在，条目随之删除。
     Guarded {
         file: "src-tauri/src/runtime/proxy/process_supervision.rs",
         anchor: "fn core_version_first_line(",
@@ -101,27 +101,11 @@ const GUARDED: &[Guarded] = &[
         before: None,
     },
     Guarded {
-        file: "src-tauri/src/runtime/proxy/process_supervision.rs",
-        anchor: "#[cfg(windows)]\npub(crate) fn send_signal(",
-        suppressor: "no_console_window(",
-        self_check: "Command::new(",
-        window: 8,
-        before: None,
-    },
-    Guarded {
         file: "src-tauri/src/runtime/updater.rs",
         anchor: "pub fn read_core_version_line(",
         suppressor: "no_console_window(",
         self_check: "Command::new(",
         window: 10,
-        before: None,
-    },
-    Guarded {
-        file: "src-tauri/src/runtime/core_swap.rs",
-        anchor: "pub fn extract_archive(",
-        suppressor: "no_console_window(",
-        self_check: "Command::new(",
-        window: 20,
         before: None,
     },
     // 这里曾有两条 `sing-box check` 的构造点（`tailscale_login_core.rs::SingBoxConfigChecker` 与
@@ -135,7 +119,8 @@ const GUARDED: &[Guarded] = &[
     // ---- 另外三个 crate：与本 crate 无共同依赖，各自持等价实现 ----
     Guarded {
         file: "crates/system-integration/src/exec.rs",
-        anchor: "impl CommandRunner for StdCommandRunner {",
+        // 构造点搬进了固有方法 `run_observed`；`CommandRunner::run` 只转调它，不再有 `Command::new(`。
+        anchor: "impl StdCommandRunner {",
         suppressor: "creation_flags(CREATE_NO_WINDOW)",
         self_check: "Command::new(",
         window: 20,
@@ -328,24 +313,17 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
         scanned > 50,
         "只扫到 {scanned} 个文件 —— 遍历坏了，绿没有信息量"
     );
-    // 具名自检比数量更有信息量：锁住两个仍真实存在、来自不同 crate 的 console 调用点，
-    // 防遍历/匹配坏掉后「零命中也绿」。旧 1Hz `tasklist` 探活已改为 Win32 原生 API，
-    // 不再把性能问题本身当成本门必须存在的自检锚点。
-    for (file, program) in [
-        (
-            "src-tauri/src/runtime/proxy/process_supervision.rs",
-            "\"taskkill\"",
-        ),
-        ("crates/helper-client/src/manager.rs", "\"sc\""),
-    ] {
-        assert!(
-            sighted
-                .iter()
-                .any(|s| s.starts_with(file) && s.contains(program)),
-            "扫描面里没有 `{file}` 的 {program} 调用——遍历或匹配坏了。实际命中 {hits} 处：\n{}",
-            sighted.join("\n")
-        );
-    }
+    // 具名自检比数量更有信息量：锁住仍真实存在的 console 调用点，防遍历/匹配坏掉后「零命中也绿」。
+    // 旧 1Hz `tasklist` 探活与孤儿清扫的 `taskkill` 都已改为 Win32 原生 API，扫描面里按程序名
+    // 起 console 程序的只剩下面这一处。
+    let (file, program) = ("crates/helper-client/src/manager.rs", "\"sc\"");
+    assert!(
+        sighted
+            .iter()
+            .any(|s| s.starts_with(file) && s.contains(program)),
+        "扫描面里没有 `{file}` 的 {program} 调用——遍历或匹配坏了。实际命中 {hits} 处：\n{}",
+        sighted.join("\n")
+    );
     assert!(
         offenders.is_empty(),
         "以下 console 程序调用点没有窗口抑制（Windows 上会弹黑框）：\n{}",
@@ -418,7 +396,7 @@ fn only_one_production_site_spawns_sing_box_check() {
         sites.join("\n")
     );
     for (file, argv) in [
-        (HOME, ".arg(\"check\")"),
+        (HOME, ".args([\"--disable-color\", \"check\", \"-c\"])"),
         (
             LINUX,
             ".args([\"--disable-color\", \"check\", \"-c\", \"/proc/self/fd/0\"])",
@@ -444,7 +422,6 @@ fn only_one_production_site_spawns_sing_box_check() {
         "/proc/self/fd/",
         ".env_clear()",
         ".current_dir(\"/\")",
-        ".stdin(Stdio::from(child_stdin))",
         ".stdout(Stdio::null())",
         ".stderr(Stdio::null())",
         ".kill_on_drop(true)",
@@ -453,6 +430,42 @@ fn only_one_production_site_spawns_sing_box_check() {
         assert!(
             run.contains(required),
             "Linux-only protected check 失去严格构造条件：{required}"
+        );
+    }
+    // fd 0 的接线不在 `run_check` 里了：sealed config 的原子 CLOEXEC 复制与 `.stdin(…)` 随 Child 的
+    // 保管一起搬进了 CheckCustody 的入队处。沿「run_check → supervise → 入队」逐跳钉住，中间任何
+    // 一跳改道，上面那串 argv 里的 `/proc/self/fd/0` 就指向一个没人接的 fd。
+    let relay = braced_block(module, "pub(super) async fn supervise(");
+    assert!(
+        relay.contains(
+            "supervise_owned_sealed_check(command, binary, config, timeout, spawned).await"
+        ),
+        "Linux-only protected check 不再把命令与两份 sealed 输入交给 CheckCustody"
+    );
+    let home = strip_comments(&read(HOME));
+    for (anchor, required) in [
+        (
+            "pub async fn supervise_owned_sealed_check(",
+            ".supervise_owned_sealed(command, binary, config, timeout, spawned)",
+        ),
+        (
+            "async fn supervise_owned_sealed(",
+            "self.queue_owned_sealed(command, binary, config, Arc::new(NativeIo))",
+        ),
+        ("fn queue_owned_sealed(", "validate_sealed_file(&binary)?"),
+        ("fn queue_owned_sealed(", "validate_sealed_file(&config)?"),
+        (
+            "fn queue_owned_sealed(",
+            "rustix::io::fcntl_dupfd_cloexec(&config, 3)",
+        ),
+        (
+            "fn queue_owned_sealed(",
+            ".stdin(std::process::Stdio::from(stdin))",
+        ),
+    ] {
+        assert!(
+            braced_block(&home, anchor).contains(required),
+            "Linux-only protected check 在 `{anchor}` 失去严格构造条件：{required}"
         );
     }
 }
@@ -496,6 +509,54 @@ fn linux_check_scope_does_not_borrow_a_function_outside_its_cfg() {
         std::panic::catch_unwind(|| braced_block(braced_block(&outside, MODULE), RUN)).is_err()
     );
     assert!(std::panic::catch_unwind(|| braced_block("mod linux {", "mod linux {")).is_err());
+}
+
+/// 主程序直起的核必须被纳入「主程序消失即结束」的作业对象 —— 同样是只有 Windows 才编得到的一行。
+///
+/// # 为什么也放在这里
+///
+/// 与控制台抑制是同一种形状：`#[cfg(windows)]` 的一行接线，Linux 编译单元里根本没有它，删掉之后
+/// 本机全绿。行为门在 `crates/core-supervisor/tests/windows_process.rs`（真起进程、真杀父进程），
+/// 但它只在 Windows 上跑；这一条让「接线还在」在任何平台上都看得见。
+///
+/// 判据三条：纳入调用在 `TokioSpawner::spawn` 里、位于进程创建**之后**与返回**之前**；它确实受
+/// `#[cfg(windows)]` 管着（否则别的平台编不过，或者有人为了编过把它整个删了）；作业确实带
+/// 「句柄关闭即结束」那个限制，且主程序没有把自己放进去（放进去会连带结束它起的所有子进程）。
+#[test]
+fn direct_spawned_cores_join_the_kill_on_close_job() {
+    let spawner = strip_comments(&read("crates/core-supervisor/src/spawner.rs"));
+    let block = braced_block(&spawner, "impl SingBoxSpawner for TokioSpawner {");
+    let created = block
+        .find("cmd.spawn()")
+        .expect("spawn 方法里找不到进程创建点");
+    let returned = block
+        .find("Ok(SpawnedChild { child })")
+        .expect("spawn 方法里找不到返回点");
+    const ENROLL: &str = "#[cfg(windows)]\n        crate::job_object::enroll_spawned_core(&child);";
+    assert_eq!(
+        spawner.matches("enroll_spawned_core(").count(),
+        1,
+        "纳入作业的调用点应恰有一处"
+    );
+    let enrolled = block
+        .find(ENROLL)
+        .expect("TokioSpawner::spawn 不再把子进程纳入作业对象（或那一行不再受 cfg(windows) 管）");
+    assert!(
+        created < enrolled && enrolled < returned,
+        "纳入必须在进程创建之后、返回之前"
+    );
+
+    let job = strip_comments(&read("crates/core-supervisor/src/job_object.rs"));
+    assert!(
+        job.contains("LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;"),
+        "作业不再带「句柄关闭即结束」的限制"
+    );
+    assert!(
+        !job.contains("GetCurrentProcess"),
+        "主程序不得把自己放进这个作业：那会连带结束安装脚本、卸载程序等它起的其它子进程"
+    );
+    let lib = strip_comments(&read("crates/core-supervisor/src/lib.rs"));
+    assert!(lib.contains("#[cfg(windows)]\npub mod job_object;"));
 }
 
 /// 四份实现散在四个无共同依赖的 crate 里 —— 值必须逐字一致，否则「改了一处以为全改了」。

@@ -18,7 +18,8 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -27,14 +28,12 @@ use polaris_helper_proto::command::{common as cmd, linux as lcmd};
 use polaris_helper_proto::{
     parse_linux_birth_stop_args, parse_stop_pid, stop_pid_matches, Error as ProtoError, ErrorCode,
     HelperBirthToken, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns, Response,
-    ResponseKind, Start, StartNotAdmitted, StartTiming, Stop,
+    ResponseKind, StartTiming, Stop,
 };
 
-use crate::core_install::InstallResult;
 use crate::platform::linux::auth::{
     is_authorized, owned_by, supplementary_groups, AuthError, PeerCred, PeerCredProvider,
 };
-use crate::platform::linux::core_installer::install_core;
 use crate::platform::linux::freeport::{free_port, parse_ss_pids, FreePortDeps};
 use crate::platform::linux::ops::SystemdOps;
 use crate::platform::linux::resolved_dns::ResolvedDnsOps;
@@ -49,10 +48,16 @@ pub const PROTO_VERSION: u32 = polaris_helper_proto::proto_version::CURRENT;
 /// 5 秒读超时（移植自 Go `conn.SetReadDeadline(time.Now().Add(5 * time.Second))`，:335）。
 pub const READ_TIMEOUT_SECS: u64 = polaris_helper_proto::codec::READ_TIMEOUT_SECS;
 
+/// Commands are short protocol keywords, not argument frames. Bound this line
+/// before authentication; include room for CRLF and future command names.
+const MAX_COMMAND_LINE_BYTES: usize = 64;
+
 /// handler 依赖（注入所有外部副作用，便于测试 mock）。
 pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps, SD: SystemdOps> {
     /// 锁定的 root-owned 受管核目录（start 只跑 coreDir/sing-box）。
     pub core_dir: Option<&'a Path>,
+    #[cfg(test)]
+    pub(crate) test_core: Option<Arc<crate::core_store::VerifiedCore>>,
     /// 授权 uid 列表文件。
     pub auth_file: &'a Path,
     /// SO_PEERCRED 凭据提供者。
@@ -76,6 +81,9 @@ pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps,
 ///
 /// 对应 Go `handle(conn net.Conn)`：读行 + 写行 + 取对端凭据。
 pub trait Conn: Send {
+    /// Read a complete command with a small bound before UID authorization.
+    /// EOF, malformed UTF-8, truncation and overflow cannot become commands.
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError>;
     /// 读一行（trim 尾部 \n/\r）。EOF / 读失败返回 ""（对齐 Go readLine 的 ReadString 行为）。
     fn read_line(&mut self) -> String;
     /// Exact-birth framing distinguishes EOF from an empty/extra line and
@@ -109,9 +117,20 @@ impl<RW: Read + Write> LineConn<RW> {
 }
 
 impl<RW: Read + Write + Send> Conn for LineConn<RW> {
+    fn read_command_line(&mut self) -> Result<Option<String>, StrictReadError> {
+        line_io::read_line_terminated_bounded(&mut self.inner, MAX_COMMAND_LINE_BYTES)
+            .map_err(|_| StrictReadError)
+    }
+
     fn read_line(&mut self) -> String {
         // Conn 契约：EOF/读失败与空行一律 ""（对齐 Go readLine 的 ReadString 行为）。
-        line_io::read_line_trimmed(&mut self.inner).unwrap_or_default()
+        line_io::read_line_trimmed_bounded(
+            &mut self.inner,
+            polaris_helper_proto::codec::MAX_FRAME_BYTES,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 
     fn read_line_strict(&mut self) -> Result<Option<String>, StrictReadError> {
@@ -149,7 +168,14 @@ pub fn handle<P, S, D, SD>(
     };
 
     // 2. 读 command 行（linux 无 token 行，:343）。
-    let command = conn.read_line();
+    let command = match conn.read_command_line() {
+        Ok(Some(command)) => command,
+        Ok(None) => return,
+        Err(_) => {
+            let _ = conn.write_line("ERR unknown");
+            return;
+        }
+    };
 
     // 3. ping / version 在鉴权前（任何持 socket 者可探活，:345-352）。
     match command.as_str() {
@@ -175,17 +201,100 @@ pub fn handle<P, S, D, SD>(
         return;
     }
 
-    // resolved 操作不依赖受管核状态，且可能等待多个有界子进程；不能持有全局 child 锁阻塞 stop/status。
-    match command.as_str() {
-        lcmd::RESOLVED_DNS_SET => {
-            handle_resolved_dns_set(deps.resolved_dns, conn);
+    // Reserve native ownership before a slow DNS operation, then release the
+    // child mutex so the owner can still stop/status its retained birth.
+    if matches!(
+        command.as_str(),
+        lcmd::RESOLVED_DNS_SET | lcmd::RESOLVED_DNS_REVERT
+    ) {
+        let Ok(mut guard) = state.lock() else {
+            let _ = conn.write_line("ERR unknown");
+            return;
+        };
+        if guard.upgrade_closed
+            || guard.dns_busy
+            || guard
+                .dns_owner
+                .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+            || !deps.spawner.caller_allowed(
+                cred.uid,
+                guard.child.as_ref().map(ManagedChild::handle),
+                None,
+            )
+        {
+            let _ = conn.write_line("ERR slot-owned-or-control-busy");
             return;
         }
-        lcmd::RESOLVED_DNS_REVERT => {
-            handle_resolved_dns_revert(deps.resolved_dns, conn);
-            return;
+        let previous_owner = guard.dns_owner;
+        let previous_birth = guard.dns_birth.clone();
+        let reservation_birth = guard.child.as_ref().map(|child| child.handle().clone());
+        guard.dns_birth = reservation_birth.clone().or(previous_birth.clone());
+        guard.dns_busy = true; // reservation, not proof that DNS was modified
+        drop(guard);
+        let outcome = if command == lcmd::RESOLVED_DNS_REVERT {
+            handle_resolved_dns_revert(deps.resolved_dns, conn)
+        } else {
+            handle_resolved_dns_set(deps.resolved_dns, conn)
+        };
+        if let Ok(mut guard) = state.lock() {
+            match outcome {
+                DnsChange::Applied => {
+                    guard.dns_owner = Some(cred.uid);
+                    guard.dns_birth = reservation_birth;
+                }
+                DnsChange::Restored => {
+                    guard.dns_owner = None;
+                    guard.dns_birth = None;
+                }
+                DnsChange::Unmodified => {
+                    guard.dns_owner = previous_owner;
+                    guard.dns_birth = previous_birth;
+                }
+                DnsChange::Unconfirmed => {
+                    guard.dns_owner = previous_owner.or(Some(cred.uid));
+                }
+            }
+            // The same flag also retains an unconfirmed live-birth SET.
+            // Only a retired/replaced birth hands DNS restoration to this
+            // completion; a successful retry on the retained birth keeps DNS.
+            let dns_birth_current = guard
+                .dns_birth
+                .as_ref()
+                .zip(guard.child.as_ref())
+                .is_some_and(|(birth, child)| birth.same_birth(child.handle()));
+            if guard.dns_cleanup_pending && !dns_birth_current && guard.dns_owner.is_some() {
+                drop(guard);
+                let cleanup_cleared = deps
+                    .resolved_dns
+                    .revert(polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME)
+                    .is_ok();
+                if let Ok(mut guard) = state.lock() {
+                    if cleanup_cleared {
+                        guard.dns_owner = None;
+                        guard.dns_birth = None;
+                    }
+                    guard.dns_cleanup_pending = !cleanup_cleared;
+                    guard.dns_busy = false;
+                }
+            } else {
+                // A failed rollback/revert leaves retained DNS responsibility;
+                // another Start cannot reuse the slot until a real restore.
+                guard.dns_cleanup_pending = match outcome {
+                    DnsChange::Applied | DnsChange::Restored => false,
+                    // A reaper can mark the temporary reservation pending
+                    // while an invalid/truncated frame is being read. After
+                    // restoring the previous custody, keep pending only when
+                    // there is actual DNS responsibility left to discharge.
+                    DnsChange::Unmodified => {
+                        guard.dns_cleanup_pending
+                            && (guard.dns_owner.is_some() || guard.dns_birth.is_some())
+                    }
+                    DnsChange::Unconfirmed => true,
+                };
+                guard.dns_busy = false;
+            }
         }
-        _ => {}
+        return;
     }
 
     // 5. 持锁按 command 分发（Go: mu.Lock(); defer mu.Unlock()）。
@@ -214,9 +323,65 @@ fn dispatch_locked<P, S, D, SD>(
     SD: SystemdOps,
 {
     match command {
-        lcmd::STATUS_BIRTH_SAFE => handle_birth_status(state, deps, conn),
-        lcmd::STOP_BIRTH_SAFE => handle_birth_stop(state, deps, conn),
-        lcmd::START_BIRTH_SAFE => handle_start(state, deps, cred, conn, true),
+        cmd::PREPARE_HELPER_UPGRADE | cmd::CANCEL_HELPER_UPGRADE => {
+            if cred.uid != 0 {
+                let _ = conn.write_line("ERR unauthorized");
+                return;
+            }
+            if !matches!(conn.read_line_strict(), Ok(None)) {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            }
+            if state.dns_busy
+                || state.dns_cleanup_pending
+                || state.dns_owner.is_some()
+                || !matches!(
+                    deps.spawner
+                        .birth_admission(state.child.as_ref().map(ManagedChild::handle)),
+                    BirthAdmission::Admitted
+                )
+            {
+                let _ = conn.write_line("ERR helper-upgrade-busy");
+                return;
+            }
+            state.child = None;
+            state.upgrade_closed = command == cmd::PREPARE_HELPER_UPGRADE;
+            let _ = conn.write_line(if state.upgrade_closed {
+                "OK helper-upgrade-admitted"
+            } else {
+                "OK helper-upgrade-cancelled"
+            });
+        }
+        cmd::CORE_STATUS => {
+            let (Ok(Some(id)), Ok(None)) = (conn.read_line_strict(), conn.read_line_strict())
+            else {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            };
+            let Ok(id) = polaris_helper_proto::core_manifest::CoreId::parse(&id) else {
+                let _ = conn.write_line("ERR bad-args");
+                return;
+            };
+            let response = Response::Ok(ResponseKind::CoreStatus(crate::pinned_core::status(
+                deps.core_dir,
+                &id,
+            )));
+            let _ = conn.write_line(&response.to_wire_line());
+        }
+        lcmd::STATUS_BIRTH_SAFE => {
+            if caller_owns_slot(state, deps.spawner, cred, conn) {
+                handle_birth_status(state, deps, conn);
+            }
+        }
+        lcmd::STOP_BIRTH_SAFE => {
+            handle_birth_stop(state, deps, cred, conn);
+        }
+        lcmd::START_PINNED_BIRTH => handle_start(state, deps, cred, conn),
+        // Retired executable-path/content-write commands never dispatch, even
+        // when no child is running. Only administrative CLI installs bytes.
+        cmd::START | lcmd::START_REAP_SAFE | lcmd::START_BIRTH_SAFE | lcmd::INSTALL_CORE => {
+            let _ = conn.write_line("ERR unknown");
+        }
         _ if legacy_command_rejected(command, state, deps.spawner) => {
             let _ = conn.write_line("ERR unknown");
         }
@@ -224,13 +389,42 @@ fn dispatch_locked<P, S, D, SD>(
         cmd::STOP | lcmd::STOP_REAP_SAFE => handle_stop(state, deps, conn),
         cmd::CLEANUP => handle_cleanup(state, deps, cred, conn),
         cmd::FREEPORT => handle_freeport(deps, cred, conn),
-        // install-core 是 linux 专属命令名（lcmd::INSTALL_CORE == "install-core"）。
-        lcmd::INSTALL_CORE => handle_install_core(deps, conn),
-        cmd::START | lcmd::START_REAP_SAFE => handle_start(state, deps, cred, conn, false),
         _ => {
             let _ = conn.write_line("ERR unknown");
         }
     }
+}
+
+fn caller_owns_slot(
+    state: &HandlerState,
+    spawner: &impl CoreSpawner,
+    cred: &PeerCred,
+    conn: &mut impl Conn,
+) -> bool {
+    if !spawner.caller_allowed(
+        cred.uid,
+        state.child.as_ref().map(ManagedChild::handle),
+        None,
+    ) {
+        let _ = conn.write_line("ERR slot-owned-by-other-user");
+        false
+    } else {
+        true
+    }
+}
+
+fn birth_start_line(
+    id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    start: LinuxBirthStart,
+) -> String {
+    let kind = match id {
+        Some(id) => ResponseKind::PinnedStart {
+            id: id.clone(),
+            start: polaris_helper_proto::core_protocol::PinnedBirthStart::Linux(start),
+        },
+        None => ResponseKind::LinuxBirthStart(start),
+    };
+    Response::Ok(kind).to_wire_line()
 }
 
 fn legacy_command_rejected(
@@ -257,29 +451,67 @@ fn legacy_command_rejected(
 
 // ===== 各命令处理（逐分支对照 Go 源）=====
 
-fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
-    let interface_name = conn.read_line();
-    let server_ip = conn.read_line();
-    let response = match ops.takeover(&interface_name, &server_ip) {
-        Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Set)),
-        Err(error) => Response::Err(ProtoError::with_detail(
-            ErrorCode::ResolvedDns,
-            single_line_wire_detail(&error),
-        )),
-    };
-    let _ = conn.write_line(&response.to_wire_line());
+/// A refused request is distinct from a confirmed rollback of existing DNS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsChange {
+    Applied,
+    Unmodified,
+    Restored,
+    Unconfirmed,
 }
 
-fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) {
+fn handle_resolved_dns_set(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> DnsChange {
     let interface_name = conn.read_line();
-    let response = match ops.revert(&interface_name) {
-        Ok(()) => Response::Ok(ResponseKind::LinuxDns(LinuxDns::Reverted)),
-        Err(error) => Response::Err(ProtoError::with_detail(
-            ErrorCode::ResolvedDns,
-            single_line_wire_detail(&error),
-        )),
+    let server_ip = conn.read_line();
+    if !polaris_helper_proto::linux_dns::takeover_request_allowed(&interface_name, &server_ip) {
+        let _ = conn.write_line("ERR resolved-dns request denied by Polaris resolved whitelist");
+        return DnsChange::Unmodified;
+    }
+    let (response, outcome) = match ops.takeover(&interface_name, &server_ip) {
+        Ok(()) => (
+            Response::Ok(ResponseKind::LinuxDns(LinuxDns::Set)),
+            DnsChange::Applied,
+        ),
+        Err(error) => {
+            let outcome = if ops.revert(&interface_name).is_ok() {
+                DnsChange::Restored
+            } else {
+                DnsChange::Unconfirmed
+            };
+            (
+                Response::Err(ProtoError::with_detail(
+                    ErrorCode::ResolvedDns,
+                    single_line_wire_detail(&error),
+                )),
+                outcome,
+            )
+        }
     };
     let _ = conn.write_line(&response.to_wire_line());
+    outcome
+}
+
+fn handle_resolved_dns_revert(ops: &dyn ResolvedDnsOps, conn: &mut impl Conn) -> DnsChange {
+    let interface_name = conn.read_line();
+    if interface_name != polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME {
+        let _ = conn.write_line("ERR resolved-dns request denied by Polaris resolved whitelist");
+        return DnsChange::Unmodified;
+    }
+    let (response, outcome) = match ops.revert(&interface_name) {
+        Ok(()) => (
+            Response::Ok(ResponseKind::LinuxDns(LinuxDns::Reverted)),
+            DnsChange::Restored,
+        ),
+        Err(error) => (
+            Response::Err(ProtoError::with_detail(
+                ErrorCode::ResolvedDns,
+                single_line_wire_detail(&error),
+            )),
+            DnsChange::Unconfirmed,
+        ),
+    };
+    let _ = conn.write_line(&response.to_wire_line());
+    outcome
 }
 
 /// helper wire 一次响应只能占一行；resolvectl stderr 可能含换行，必须先压平，避免截断诊断或注入伪帧。
@@ -327,8 +559,10 @@ fn handle_birth_status<P, S, D, SD>(
             target: Some(target),
             ..
         } => LinuxBirthStatus::Unknown { target },
+        // 带尾文：裸的 `ERR unknown` 在客户端眼里是「这个 helper 不认识本命令」，而这里是认识
+        // 命令、只是手里的 custody 认不出归属。
         BirthAdmission::Blocked { target: None, .. } => {
-            let _ = conn.write_line("ERR unknown");
+            let _ = conn.write_line("ERR unknown birth-custody-unidentified");
             return;
         }
     };
@@ -338,6 +572,7 @@ fn handle_birth_status<P, S, D, SD>(
 fn handle_birth_stop<P, S, D, SD>(
     state: &mut HandlerState,
     deps: &HandlerDeps<'_, P, S, D, SD>,
+    cred: &PeerCred,
     conn: &mut impl Conn,
 ) where
     P: PeerCredProvider,
@@ -357,6 +592,14 @@ fn handle_birth_stop<P, S, D, SD>(
         let _ = conn.write_line("ERR bad-args");
         return;
     };
+    if !deps.spawner.caller_allowed(
+        cred.uid,
+        state.child.as_ref().map(ManagedChild::handle),
+        Some(&target),
+    ) {
+        let _ = conn.write_line("ERR slot-owned-by-other-user");
+        return;
+    }
     if let Some(current) = state.child.as_ref().map(ManagedChild::handle) {
         match current.target() {
             Some(current) if current != target => {
@@ -401,7 +644,8 @@ fn handle_birth_stop<P, S, D, SD>(
     let outcome = match deps.spawner.stop_birth(&target) {
         StopReap::Reaped => {
             if same_current {
-                state.child = None;
+                let handle = state.child.as_ref().unwrap().handle().clone();
+                state.retire_birth(&handle);
                 (deps.set_forward)(false);
             }
             LinuxBirthStop::Stopped { target }
@@ -471,7 +715,7 @@ fn handle_stop<P, S, D, SD>(
                 .as_ref()
                 .is_some_and(|child| child.handle().same_birth(&handle))
             {
-                state.child = None;
+                state.retire_birth(&handle);
             }
             (deps.set_forward)(false);
             let response = Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }));
@@ -547,278 +791,203 @@ fn handle_freeport<P, S, D, SD>(
     let _ = conn.write_line(&resp.to_wire_line());
 }
 
-/// install-core（:396-399）：校验 sha256 + 原子写入 coreDir。
-fn handle_install_core<P, S, D, SD>(deps: &HandlerDeps<'_, P, S, D, SD>, conn: &mut impl Conn)
+fn verified_selected<P, S, D, SD>(
+    deps: &HandlerDeps<'_, P, S, D, SD>,
+    root: &Path,
+    id: &polaris_helper_proto::core_manifest::CoreId,
+) -> std::io::Result<Arc<crate::core_store::VerifiedCore>>
 where
     P: PeerCredProvider,
     S: CoreSpawner,
     D: FreePortDeps,
     SD: SystemdOps,
 {
-    // :397-398: 读 srcDir 行 + wantHash 行。
-    let src = conn.read_line();
-    let want_hash = conn.read_line();
-    let outcome: InstallResult = install_core(deps.core_dir, src.trim(), want_hash.trim());
-    let _ = conn.write_line(&outcome.to_wire_line());
+    #[cfg(test)]
+    if let Some(core) = &deps.test_core {
+        if core.manifest.id != id.as_str() {
+            return Err(std::io::Error::other("fixture selected id differs"));
+        }
+        core.recheck_fixture()?;
+        return Ok(Arc::clone(core));
+    }
+    #[cfg(not(test))]
+    let _ = deps;
+    crate::pinned_core::verify(root, id).map(Arc::new)
 }
 
-/// start（:400-478）：核路径锁 + config 属主校验 + AmbientCaps 拉核。
-#[allow(clippy::too_many_lines)]
+/// The only executable admission route: a strict selected-id frame and a
+/// verified immutable object, followed by native custody and caller checks.
 fn handle_start<P, S, D, SD>(
     state: &mut HandlerState,
     deps: &HandlerDeps<'_, P, S, D, SD>,
     cred: &PeerCred,
     conn: &mut impl Conn,
-    exact: bool,
 ) where
     P: PeerCredProvider,
     S: CoreSpawner,
     D: FreePortDeps,
     SD: SystemdOps,
 {
-    // :401-405: 读 singbox / cfg / log / fwd / ppid 行。
-    let (singbox, cfg, log_path, fwd, ppid_str) = if exact {
-        let (Ok(Some(singbox)), Ok(Some(cfg)), Ok(Some(log)), Ok(Some(fwd))) = (
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-            conn.read_line_strict(),
-        ) else {
-            let _ = conn.write_line("ERR bad-args");
-            return;
-        };
-        let ppid = match conn.read_line_strict() {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(_) => {
+    if state.upgrade_closed {
+        let _ = conn.write_line("ERR helper-upgrade-admission-closed");
+        return;
+    }
+    if state.dns_busy
+        || state.dns_cleanup_pending
+        || state
+            .dns_owner
+            .is_some_and(|owner| cred.uid != 0 && owner != cred.uid)
+    {
+        let _ = conn.write_line("ERR slot-owned-or-control-busy");
+        return;
+    }
+    let mut lines = Vec::new();
+    for _ in 0..4 {
+        match conn.read_line_strict() {
+            Ok(Some(line)) => lines.push(line),
+            _ => {
                 let _ = conn.write_line("ERR bad-args");
                 return;
             }
-        };
-        if !matches!(conn.read_line_strict(), Ok(None)) {
+        }
+    }
+    match conn.read_line_strict() {
+        Ok(Some(line)) => lines.push(line),
+        Ok(None) => {}
+        Err(_) => {
             let _ = conn.write_line("ERR bad-args");
             return;
         }
-        (singbox, cfg, log, fwd, ppid)
-    } else {
-        (
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-            conn.read_line(),
-        )
-    };
-    let ppid: u32 = ppid_str.trim().parse().unwrap_or(0);
-
-    // Admission precedes `already`, validation, forwarding, and spawn. The
-    // production spawner inspects every retained native slot, including births
-    // no longer represented by this handler state.
-    let current_running = state.child.as_ref().and_then(ManagedChild::running);
-    if exact {
-        // Include Stopping in the custody scan. A state-held birth whose
-        // registry slot vanished without native proof must block admission.
-        let current = state.child.as_ref().map(ManagedChild::handle);
-        match deps.spawner.birth_admission(current) {
-            BirthAdmission::Admitted => state.child = None,
-            BirthAdmission::Already(target)
-                if state.child.as_ref().is_some_and(|child| {
-                    matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))
-                }) =>
-            {
-                let response = LinuxBirthStart::NotAdmittedPending { target };
-                let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
-                );
-                return;
-            }
-            BirthAdmission::Already(target) => {
-                let response = LinuxBirthStart::Already { target };
-                let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
-                );
-                return;
-            }
-            BirthAdmission::Blocked {
-                target,
-                state: blocker,
-            } => {
-                let response = match (target, blocker) {
-                    (Some(target), ReapBlockerState::Pending) => {
-                        LinuxBirthStart::NotAdmittedPending { target }
-                    }
-                    (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
-                };
-                let _ = conn.write_line(
-                    &Response::Ok(ResponseKind::LinuxBirthStart(response)).to_wire_line(),
-                );
-                return;
-            }
-        }
-    } else {
-        match deps.spawner.start_admission(current_running) {
-            StartAdmission::Admitted => {
-                // A stale Running/Stopping state can be cleared only because the
-                // admission scan observed its exact slot as Reaped.
-                state.child = None;
-            }
-            StartAdmission::Already { pid } => {
-                let response = Response::Ok(ResponseKind::Start(Start::Already { pid }));
-                let _ = conn.write_line(&response.to_wire_line());
-                return;
-            }
-            StartAdmission::Blocked { pid, state } => {
-                let blocked = match state {
-                    ReapBlockerState::Pending => StartNotAdmitted::Pending { pid },
-                    ReapBlockerState::Unknown => StartNotAdmitted::Unknown { pid },
-                };
-                let response = Response::Ok(ResponseKind::Start(Start::NotAdmitted(blocked)));
-                let _ = conn.write_line(&response.to_wire_line());
-                return;
-            }
-        }
     }
-    // :411-413: cfg 空 → bad-args。
-    let cfg = cfg.trim();
-    if cfg.is_empty() {
+    if !matches!(conn.read_line_strict(), Ok(None)) {
         let _ = conn.write_line("ERR bad-args");
         return;
     }
-    // :417-420: 核路径锁 —— singbox 必须 == coreDir/sing-box。
-    let Some(core_dir) = deps.core_dir else {
+    let Some(params) = polaris_helper_proto::core_protocol::PinnedStartParams::parse(&lines) else {
+        let _ = conn.write_line("ERR bad-args");
+        return;
+    };
+    if !caller_owns_slot(state, deps.spawner, cred, conn) {
+        return;
+    }
+    let id = &params.id;
+    let current = state.child.as_ref().map(ManagedChild::handle);
+    match deps.spawner.birth_admission(current) {
+        BirthAdmission::Admitted => state.child = None,
+        BirthAdmission::Already(target) => {
+            // This proof comes from the retained native registry, including
+            // hidden slots. Never relabel a different core as this request's id.
+            if !deps.spawner.birth_core_matches(&target, current, id) {
+                let _ = conn.write_line("ERR core-occupied");
+                return;
+            }
+            let Some(root) = deps.core_dir else {
+                let _ = conn.write_line("ERR coredir-unset");
+                return;
+            };
+            if verified_selected(deps, root, id).is_err() {
+                let _ = conn.write_line("ERR core-invalid");
+                return;
+            }
+            let result = if state.child.as_ref().is_some_and(|child|
+                matches!(child, ManagedChild::Stopping(handle) if handle.target() == Some(target))) {
+                LinuxBirthStart::NotAdmittedPending { target }
+            } else { LinuxBirthStart::Already { target } };
+            let _ = conn.write_line(&birth_start_line(Some(id), result));
+            return;
+        }
+        BirthAdmission::Blocked {
+            target,
+            state: blocker,
+        } => {
+            let result = match (target, blocker) {
+                (Some(target), ReapBlockerState::Pending) => {
+                    LinuxBirthStart::NotAdmittedPending { target }
+                }
+                (target, _) => LinuxBirthStart::NotAdmittedUnknown { target },
+            };
+            let _ = conn.write_line(&birth_start_line(Some(id), result));
+            return;
+        }
+    }
+    let Some(root) = deps.core_dir else {
         let _ = conn.write_line("ERR coredir-unset");
         return;
     };
-    let core_bin: PathBuf = core_dir.join("sing-box");
-    if Path::new(singbox.trim()) != core_bin.as_path() {
-        let _ = conn.write_line(&format!(
-            "ERR core-path-denied (want {})",
-            core_bin.display()
-        ));
-        return;
-    }
-    // :421-424: 锁定核二进制必须存在。
-    if !core_bin.exists() {
-        let _ = conn.write_line("ERR core-missing");
-        return;
-    }
-    // :425-428: config 必须属于对端 uid（防读别人配置）。
-    match owned_by(Path::new(cfg), cred.uid) {
-        Ok(true) => {}
-        Ok(false) => {
-            let _ = conn.write_line("ERR config-not-owned");
+    let core = match verified_selected(deps, root, id) {
+        Ok(core) => core,
+        Err(_) => {
+            let _ = conn.write_line("ERR core-invalid");
             return;
         }
-        Err(e) => {
-            let _ = conn.write_line(&format!("ERR config-not-owned {e}"));
-            return;
-        }
-    }
-    // **Polaris 新增（上游无）**：log 必须与 cfg **同一父目录**。
-    //
-    // 上游只校验 cfg 的属主，而 `spawn` 会以 **root** 身份 `O_CREATE|O_APPEND|0644` 打开这个 log
-    // 路径、**并 `fchown` 给对端 uid**（`linux/server.rs`）⇒ 不校验就是「root 在任意位置建文件、
-    // 再把属主给调用者」——比单纯的任意追加写更强，`/etc/cron.d/` 之类落一个文件即完全提权。
-    //
-    // 判据取「同父目录」而非 conf_dir 白名单：linux 腿没有 `--confdir`（它用属主校验代替），
-    // 而生产下发的 cfg 与 log 恒是同目录的 `singbox-runtime.json` / `singbox-startup.log`
-    //（`runtime/proxy.rs`）⇒ 这条收紧**零行为变更**。含 `..` 的路径会让父目录字面不等，自然被拒。
-    //
-    // 🔴 **未覆盖：符号链接**。判据是纯路径比较，若攻击者在该目录里放一个指向 `/etc/...` 的符号
-    // 链接，root 打开时仍会跟随。要堵死得上 `O_NOFOLLOW`（只管最后一段）或 openat2 RESOLVE_BENEATH；
-    // 更彻底的修法是**根本不接受客户端下发 log 路径**（helper 自己按 conf_dir 拼）。均已登记，见
-    // `~/docs/polaris/design/polaris-platform-code-sweep-2026-08-09.md`。
-    let log_trimmed = log_path.trim();
-    if !log_trimmed.is_empty() && Path::new(log_trimmed).parent() != Path::new(cfg).parent() {
-        let _ = conn.write_line("ERR log-path-denied");
-        return;
-    }
-    if let Err(error) = deps.spawner.validate_start_environment() {
-        let _ = conn.write_line(&format!(
-            "ERR {}",
-            single_line_wire_detail(&error.to_string())
-        ));
-        return;
-    }
-    let birth = if exact {
-        match mint_birth_token() {
-            Ok(token) => Some(token),
-            Err(error) => {
-                log::error!("Linux helper could not mint birth token: {error}");
-                let _ = conn.write_line("ERR start birth-entropy");
-                return;
-            }
-        }
-    } else {
-        None
     };
-    // 从已通过参数/路径/属主校验后开始计时：拒绝腿不伪装成“起核耗时”。
+    let cfg = Path::new(&params.common.cfg);
+    if !matches!(owned_by(cfg, cred.uid), Ok(true)) {
+        let _ = conn.write_line("ERR config-not-owned");
+        return;
+    }
+    let log = if params.common.log.is_empty() {
+        None
+    } else {
+        let log = Path::new(&params.common.log);
+        if log.parent() != cfg.parent() {
+            let _ = conn.write_line("ERR log-path-denied");
+            return;
+        }
+        Some(log.to_path_buf())
+    };
+    let birth = match mint_birth_token() {
+        Ok(birth) => birth,
+        Err(error) => {
+            log::error!("Linux helper birth entropy unavailable: {error}");
+            let _ = conn.write_line("ERR start birth-entropy");
+            return;
+        }
+    };
     let total_started = Instant::now();
-    // :429: 显式跟随本次会话的转发态。
     let forwarding_started = Instant::now();
-    (deps.set_forward)(fwd.trim() == "1");
+    (deps.set_forward)(params.common.fwd);
     let forwarding_ms = crate::elapsed_ms(forwarding_started);
-
-    // :431-478: AmbientCaps 拉核（setuid 回对端登录用户 + CAP_NET_ADMIN/RAW/BIND_SERVICE）。
-    // 经 CoreSpawner trait 抽象：生产实现做 fork+setuid+AmbientCaps+execve（§helper-rust-evaluation B3 真机项）；
-    // 测试 mock 返回固定 pid。
     let process_prepare_started = Instant::now();
     let req = SpawnCoreRequest {
-        birth,
-        binary: core_bin.clone(),
-        config: PathBuf::from(cfg),
-        log: if log_path.trim().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(log_path.trim()))
-        },
-        fwd: fwd.trim() == "1",
-        parent_pid: if ppid > 0 { Some(ppid) } else { None },
+        birth: Some(birth),
+        binary: core.directory.join("sing-box"),
+        config: cfg.to_path_buf(),
+        log,
+        fwd: params.common.fwd,
+        parent_pid: params.common.parent_pid,
         uid: cred.uid,
         gid: cred.gid,
-        // 补充组在 fork 前于父进程解析（Go SysProcAttr.Credential.Groups），随 request 下发给 pre_exec 的
-        // setgroups（拉核子进程不碰 NSS）。对照 Go start 分支 `Groups: supplementaryGroups(cred.Uid)`，:439。
         groups: supplementary_groups(cred.uid),
     };
     let process_prepare_ms = crate::elapsed_ms(process_prepare_started);
-    match deps.spawner.spawn(&req) {
+    match deps.spawner.spawn_pinned(&req, core) {
         Ok(started) => {
-            let pid = started.handle.pid;
             let target = started.handle.target();
             state.child = Some(ManagedChild::Running(started.handle));
-            let process_ms = started.process_ms.saturating_add(process_prepare_ms);
-            let timing = StartTiming {
-                forwarding_ms,
-                process_ms,
-                job_ms: 0,
-                log_handoff_ms: started.log_handoff_ms,
-                total_ms: crate::elapsed_ms(total_started),
-            };
-            let response = if exact {
-                match target {
-                    Some(target) => {
-                        Response::Ok(ResponseKind::LinuxBirthStart(LinuxBirthStart::Started {
+            match target {
+                Some(target) => {
+                    let timing = StartTiming {
+                        forwarding_ms,
+                        process_ms: started.process_ms.saturating_add(process_prepare_ms),
+                        job_ms: 0,
+                        log_handoff_ms: started.log_handoff_ms,
+                        total_ms: crate::elapsed_ms(total_started),
+                    };
+                    let _ = conn.write_line(&birth_start_line(
+                        Some(id),
+                        LinuxBirthStart::Started {
                             target,
                             timing: Some(timing),
-                        }))
-                    }
-                    None => {
-                        // A broken spawner cannot publish a successful exact birth.
-                        let _ = conn.write_line("ERR start missing-birth");
-                        return;
-                    }
+                        },
+                    ));
                 }
-            } else {
-                Response::Ok(ResponseKind::Start(Start::StartedTimed {
-                    pid,
-                    timing,
-                    created: None,
-                }))
-            };
-            let _ = conn.write_line(&response.to_wire_line());
+                None => {
+                    let _ = conn.write_line("ERR start missing-birth");
+                }
+            }
         }
         Err(SpawnError::Spawn { detail }) => {
-            // :456: 复位转发态（拉核失败不留全局转发）。
             (deps.set_forward)(false);
             let _ = conn.write_line(&format!("ERR start {detail}"));
         }

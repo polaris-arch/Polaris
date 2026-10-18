@@ -94,7 +94,7 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
     ));
     assert_eq!(saved.load(Ordering::SeqCst), 1);
     assert_eq!(sink.statuses(), ["downloading", "done"]);
-    assert!(!dir.join(".update").exists());
+    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -114,7 +114,7 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
             b"SRS-old"
         );
         assert_eq!(sink.statuses(), ["downloading", "error"]);
-        assert!(!dir.join(".update").exists());
+        assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -136,7 +136,7 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
     assert_eq!(result["ok"], false);
     assert_eq!(result["errorCode"], ERR_RESOURCE_WRITE_FAILED);
     assert_eq!(sink.statuses(), ["downloading", "error"]);
-    assert!(!dir.join(".update").exists());
+    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -163,7 +163,7 @@ async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
         std::fs::read(dir.join(&plan.file_name)).unwrap(),
         b"SRS-new"
     );
-    assert!(!dir.join(".update").exists());
+    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -186,7 +186,9 @@ fn manual_all_wires_real_builtin_registry_and_one_deferred_batch_broadcast() {
     assert!(!body.contains("BroadcastMode::Immediate"));
     assert_eq!(body.matches("broadcast_config_changed(").count(), 1);
     assert!(body.contains("let mut changed = false"));
-    assert!(body.contains("Ok(()) => changed = true"));
+    assert!(body.contains("download_registered_resource("));
+    assert!(body.contains("persist_registered_resource("));
+    assert!(body.contains("changed |= matches!(&outcome, DownloadOutcome::Stored { .. })"));
     assert!(body.contains("changed |= result.get(\"ok\").and_then(Value::as_bool) == Some(true)"));
     assert!(body.contains("if changed {"));
     // 空外置表没有 return，全部内置项仍需出现在逐项结果数组中。

@@ -37,6 +37,7 @@ pub mod system_proxy_bypass;
 pub mod tls_pin;
 pub mod tls_spoof;
 pub mod tun_config;
+pub mod utls;
 
 pub use app_config::UserConfig;
 

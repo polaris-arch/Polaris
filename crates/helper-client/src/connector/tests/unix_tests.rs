@@ -133,3 +133,49 @@ fn caller_budget_is_the_real_bound_when_helper_is_slow() {
     );
     server.join().unwrap();
 }
+
+#[test]
+fn buffered_response_survives_peer_close_after_write_shutdown() {
+    let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    peer.write_all(b"OK pong uid=0 v9\n").unwrap();
+    drop(peer);
+    let mut conn = UnixConnStream {
+        stream,
+        read_timeout: Duration::from_secs(1),
+    };
+    // Both halves are closed before setting the caller budget. macOS refuses
+    // SO_RCVTIMEO here, but must still deliver the complete buffered response.
+    conn.set_read_timeout(Duration::from_millis(200)).unwrap();
+    let mut response = Vec::new();
+    assert_eq!(
+        conn.read_until_timeout(&mut response).unwrap(),
+        b"OK pong uid=0 v9\n".len()
+    );
+    assert_eq!(response, b"OK pong uid=0 v9\n");
+}
+
+#[test]
+fn closed_peer_without_a_response_reports_eof_not_a_socket_option_error() {
+    let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(peer);
+    let mut conn = UnixConnStream {
+        stream,
+        read_timeout: Duration::from_secs(1),
+    };
+    conn.set_read_timeout(Duration::from_millis(200)).unwrap();
+    assert_eq!(conn.read_until_timeout(&mut Vec::new()).unwrap(), 0);
+}
+
+#[test]
+fn zero_read_budget_is_rejected_without_replacing_the_current_budget() {
+    let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut conn = UnixConnStream {
+        stream,
+        read_timeout: Duration::from_secs(1),
+    };
+    let error = conn.set_read_timeout(Duration::ZERO).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(conn.read_timeout, Duration::from_secs(1));
+}
